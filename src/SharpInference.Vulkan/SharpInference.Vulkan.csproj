@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\SharpInference.Core\SharpInference.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Silk.NET.Vulkan" Version="*" />
+  </ItemGroup>
+
+  <PropertyGroup>  </PropertyGroup>
+
+</Project>

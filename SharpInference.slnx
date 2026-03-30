@@ -1,0 +1,22 @@
+<Solution>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/SharpInference.Benchmarks/SharpInference.Benchmarks.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/SharpInference.Cli/SharpInference.Cli.csproj" />
+    <Project Path="src/SharpInference.Core/SharpInference.Core.csproj" />
+    <Project Path="src/SharpInference.Cpu/SharpInference.Cpu.csproj" />
+    <Project Path="src/SharpInference.Engine/SharpInference.Engine.csproj" />
+    <Project Path="src/SharpInference.Pipeline/SharpInference.Pipeline.csproj" />
+    <Project Path="src/SharpInference.Server/SharpInference.Server.csproj" />
+    <Project Path="src/SharpInference.TurboQuant/SharpInference.TurboQuant.csproj" />
+    <Project Path="src/SharpInference.Vulkan/SharpInference.Vulkan.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SharpInference.Tests.Core/SharpInference.Tests.Core.csproj" />
+    <Project Path="tests/SharpInference.Tests.ForwardPass/SharpInference.Tests.ForwardPass.csproj" />
+    <Project Path="tests/SharpInference.Tests.Pipeline/SharpInference.Tests.Pipeline.csproj" />
+    <Project Path="tests/SharpInference.Tests.Server/SharpInference.Tests.Server.csproj" />
+    <Project Path="tests/SharpInference.Tests.TurboQuant/SharpInference.Tests.TurboQuant.csproj" />
+  </Folder>
+</Solution>
