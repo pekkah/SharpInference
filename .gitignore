@@ -427,6 +427,12 @@ FodyWeavers.xsd
 *.msm
 *.msp
 
+# JetBrains Rider / IntelliJ
+.idea/
+
+# Claude Code
+.claude/
+
 # SharpInference specific
 shaders/*.spv
 codebooks/*.bin
