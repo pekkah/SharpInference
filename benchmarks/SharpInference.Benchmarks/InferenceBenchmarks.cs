@@ -4,7 +4,7 @@ using SharpInference.Engine;
 
 namespace SharpInference.Benchmarks;
 
-[SimpleJob(RuntimeMoniker.Net100)]
+[SimpleJob]
 [MemoryDiagnoser]
 [HideColumns("Error", "StdDev", "Median", "RatioSD")]
 public class InferenceBenchmarks

@@ -10,8 +10,10 @@ namespace SharpInference.Vulkan;
 public sealed unsafe class VulkanBackend : IComputeBackend
 {
     private readonly Vk _vk;
-    private Device _device;
-    private Queue _computeQueue;
+#pragma warning disable CS0414 // Assigned but never used — scaffold fields for Phase 2
+    private Device _device = default;
+    private Queue _computeQueue = default;
+#pragma warning restore CS0414
 
     public string Name => "Vulkan GPU";
 

@@ -4,7 +4,6 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.ML.Tokenizers" Version="*" />
-    <PackageReference Include="System.IO.Pipelines" Version="*" />
   </ItemGroup>
 
 </Project>

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace SharpInference.TurboQuant;
 
@@ -31,7 +32,7 @@ public sealed class LloydMaxCodebook
     public static LloydMaxCodebook LoadFromJson(string path)
     {
         using var stream = File.OpenRead(path);
-        var doc = JsonSerializer.Deserialize<CodebookJson>(stream)
+        var doc = JsonSerializer.Deserialize(stream, CodebookJsonContext.Default.CodebookJson)
             ?? throw new InvalidDataException($"Failed to deserialise codebook from {path}");
         return new LloydMaxCodebook
         {
@@ -40,9 +41,12 @@ public sealed class LloydMaxCodebook
         };
     }
 
-    private sealed class CodebookJson
+    internal sealed class CodebookJson
     {
         public float[] Boundaries { get; set; } = [];
         public float[] Centroids { get; set; } = [];
     }
 }
+
+[JsonSerializable(typeof(LloydMaxCodebook.CodebookJson))]
+internal sealed partial class CodebookJsonContext : JsonSerializerContext;

@@ -436,3 +436,5 @@ FodyWeavers.xsd
 # SharpInference specific
 shaders/*.spv
 codebooks/*.bin
+models/
+tools/

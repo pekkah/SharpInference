@@ -1,4 +1,3 @@
-using System.IO.Pipelines;
 using SharpInference.Core;
 
 namespace SharpInference.Pipeline;
@@ -8,7 +7,7 @@ namespace SharpInference.Pipeline;
 /// Manages tensor placement, eviction, and asynchronous prefetching
 /// to keep hot weights resident on the fastest available tier.
 /// </summary>
-public sealed class MemoryHierarchy : IDisposable
+public sealed class MemoryHierarchy : IAsyncDisposable
 {
     private readonly TierConfig _gpu;
     private readonly TierConfig _cpu;
@@ -35,7 +34,7 @@ public sealed class MemoryHierarchy : IDisposable
         throw new NotImplementedException();
     }
 
-    public void Dispose() { }
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }
 
 public sealed record TierConfig(string Name, long CapacityBytes, string? MmapPath = null);
