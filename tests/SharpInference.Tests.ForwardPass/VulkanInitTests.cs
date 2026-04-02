@@ -59,6 +59,57 @@ public sealed class VulkanInitTests
     }
 
     [Fact]
+    public unsafe void ComputeShaderVectorAdd()
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        const string shaderSource = """
+            #version 450
+            layout(local_size_x = 256) in;
+            layout(binding = 0) buffer BufA { float a[]; };
+            layout(binding = 1) buffer BufB { float b[]; };
+            layout(binding = 2) buffer BufC { float c[]; };
+            layout(push_constant) uniform Params { uint n; };
+            void main() {
+                uint i = gl_GlobalInvocationID.x;
+                if (i < n) c[i] = a[i] + b[i];
+            }
+            """;
+
+        const int N = 1024;
+        var srcA = new float[N];
+        var srcB = new float[N];
+        for (int i = 0; i < N; i++) { srcA[i] = i; srcB[i] = i * 2; }
+
+        var gpuA = backend.Upload(srcA, TensorShape.D1(N));
+        var gpuB = backend.Upload(srcB, TensorShape.D1(N));
+        var gpuC = backend.Allocate(TensorShape.D1(N));
+
+        using var pipeline = new Vulkan.ComputePipeline(backend, shaderSource,
+            bindingCount: 3, pushConstantSize: sizeof(uint));
+
+        var ds = pipeline.AllocateDescriptorSet();
+        pipeline.UpdateDescriptorSet(ds,
+            backend.GetBuffer(gpuA),
+            backend.GetBuffer(gpuB),
+            backend.GetBuffer(gpuC));
+
+        uint n = N;
+        uint groups = (N + 255) / 256;
+        pipeline.Dispatch(backend.TransferCmd, ds, groups, pushConstants: &n);
+
+        var result = new float[N];
+        backend.Download(gpuC, result);
+
+        for (int i = 0; i < N; i++)
+            Assert.Equal(srcA[i] + srcB[i], result[i], 3);
+
+        backend.Free(gpuA);
+        backend.Free(gpuB);
+        backend.Free(gpuC);
+    }
+
+    [Fact]
     public void UploadDownloadLargeBuffer()
     {
         using var backend = new Vulkan.VulkanBackend();

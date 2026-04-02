@@ -29,6 +29,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     public VkInstanceApi Vki => _vki;
     public VkDeviceApi Vkd => _vkd;
     public VkDevice Device => _device;
+    public VkQueue ComputeQueue => _computeQueue;
+    public VkCommandBuffer TransferCmd => _transferCmd;
 
     public VulkanBackend()
     {
@@ -197,12 +199,12 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private readonly Dictionary<nint, GpuBuffer> _buffers = new();
     private nint _nextHandle = 1;
 
-    internal GpuBuffer GetBuffer(Tensor tensor) =>
+    public GpuBuffer GetBuffer(Tensor tensor) =>
         _buffers.TryGetValue(tensor.Handle, out var buf)
             ? buf
             : throw new InvalidOperationException($"Tensor handle {tensor.Handle} not found");
 
-    internal GpuBuffer GetBuffer(nint handle) =>
+    public GpuBuffer GetBuffer(nint handle) =>
         _buffers.TryGetValue(handle, out var buf)
             ? buf
             : throw new InvalidOperationException($"Handle {handle} not found");
