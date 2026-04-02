@@ -550,21 +550,21 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     {
         var p = new MatVecParams { rows = (uint)output.ElementCount, cols = (uint)vector.ElementCount };
         var bufs = (ReadOnlySpan<GpuBuffer>)[GetBuffer(matrix), GetBuffer(vector), GetBuffer(output)];
-        uint groups = (uint)output.ElementCount;
+        uint totalRows = (uint)output.ElementCount;
 
         switch (weightDType)
         {
             case DType.Float32:
                 _matVecF32Pipeline ??= new ComputePipeline(this, Shaders.MatVecF32, 3, pushConstantSize: sizeof(MatVecParams));
-                DispatchOrRecord(_matVecF32Pipeline, bufs, groups, &p);
+                DispatchOrRecord(_matVecF32Pipeline, bufs, totalRows, &p);
                 break;
             case DType.Q6_K:
                 _matVecQ6KPipeline ??= new ComputePipeline(this, Shaders.MatVecQ6K, 3, pushConstantSize: sizeof(MatVecParams));
-                DispatchOrRecord(_matVecQ6KPipeline, bufs, groups, &p);
+                DispatchOrRecord(_matVecQ6KPipeline, bufs, totalRows, &p);
                 break;
-            default: // Q4_K and others
+            default: // Q4_K and others — N_ROWS=4 per workgroup
                 _matVecQ4KPipeline ??= new ComputePipeline(this, Shaders.MatVecQ4K, 3, pushConstantSize: sizeof(MatVecParams));
-                DispatchOrRecord(_matVecQ4KPipeline, bufs, groups, &p);
+                DispatchOrRecord(_matVecQ4KPipeline, bufs, (totalRows + 3) / 4, &p);
                 break;
         }
     }

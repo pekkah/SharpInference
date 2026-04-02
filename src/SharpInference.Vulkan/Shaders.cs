@@ -689,6 +689,12 @@ internal static class Shaders
     internal const string MatVecQ4K = """
         #version 450
         #extension GL_EXT_control_flow_attributes : enable
+        #extension GL_KHR_shader_subgroup_arithmetic : enable
+
+        // Process N_ROWS per workgroup to increase arithmetic intensity.
+        // 64 threads per row, 4 rows per workgroup = 256 threads.
+        #define N_ROWS 4
+        #define THREADS_PER_ROW 64
 
         layout(local_size_x = 256) in;
 
@@ -724,8 +730,10 @@ internal static class Shaders
         }
 
         void main() {
-            uint row = gl_WorkGroupID.x;
             uint tid = gl_LocalInvocationID.x;
+            uint row_in_wg = tid / THREADS_PER_ROW;  // 0..N_ROWS-1
+            uint lane = tid % THREADS_PER_ROW;        // 0..63
+            uint row = gl_WorkGroupID.x * N_ROWS + row_in_wg;
             if (row >= rows) return;
 
             uint num_blocks = cols >> 8;
@@ -734,41 +742,49 @@ internal static class Shaders
 
             float acc = 0.0;
 
-            // Each thread processes multiple blocks — no barriers, no shared mem for weights.
-            // Thread tid handles elements tid, tid+256, tid+512, ... across blocks.
-            // Within each block: tid maps to one element position.
+            // Each thread processes multiple elements across blocks.
+            // 64 threads per row: each thread handles 4 elements per block (256/64).
             for (uint block = 0; block < num_blocks; block++) {
                 uint word_base = word_row_base + ((block * 144) >> 2);
 
                 float d = gReadHalf(word_base, 0);
                 float dmin = gReadHalf(word_base, 2);
 
-                uint chunk = tid >> 6;
-                uint sub = tid & 63;
-                bool is_upper = sub >= 32;
-                uint byte_pos = sub & 31;
+                // 64 threads handle 256 elements: each thread does 4 elements
+                // lane 0-15: chunk 0 low, lane 16-31: chunk 0 high,
+                // lane 32-47: chunk 1 low (remap to chunks 2,3)
+                // Simpler: each thread handles elements lane, lane+64, lane+128, lane+192
+                [[unroll]] for (uint e = 0; e < 4; e++) {
+                    uint elem_idx = lane + e * 64;
+                    uint chunk = elem_idx >> 6;
+                    uint sub = elem_idx & 63;
+                    bool is_upper = sub >= 32;
+                    uint byte_pos = sub & 31;
 
-                uint si = chunk * 2 + (is_upper ? 1u : 0u);
-                float sc, mn;
-                gGetScaleMin(word_base, si, sc, mn);
+                    uint si = chunk * 2 + (is_upper ? 1u : 0u);
+                    float sc, mn;
+                    gGetScaleMin(word_base, si, sc, mn);
 
-                uint qbyte = gReadByte(word_base, 16 + chunk * 32 + byte_pos);
-                uint nibble = is_upper ? (qbyte >> 4) : (qbyte & 0xF);
+                    uint qbyte = gReadByte(word_base, 16 + chunk * 32 + byte_pos);
+                    uint nibble = is_upper ? (qbyte >> 4) : (qbyte & 0xF);
 
-                uint elem = block * 256 + tid;
-                acc += (d * sc * float(nibble) - dmin * mn) * input_data[elem];
+                    uint elem = block * 256 + elem_idx;
+                    acc += (d * sc * float(nibble) - dmin * mn) * input_data[elem];
+                }
             }
 
-            // Parallel reduction in shared memory
+            // Reduction within each row's 64 threads using shared memory
             sdata[tid] = acc;
             barrier();
 
-            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
-                if (tid < s) sdata[tid] += sdata[tid + s];
+            // Reduce within each row's 64-thread group
+            uint base_idx = row_in_wg * THREADS_PER_ROW;
+            [[unroll]] for (uint s = 32; s > 0; s >>= 1) {
+                if (lane < s) sdata[base_idx + lane] += sdata[base_idx + lane + s];
                 barrier();
             }
 
-            if (tid == 0) output_data[row] = sdata[0];
+            if (lane == 0) output_data[row] = sdata[base_idx];
         }
         """;
 
