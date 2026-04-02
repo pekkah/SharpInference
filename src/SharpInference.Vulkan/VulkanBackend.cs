@@ -556,7 +556,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         {
             case DType.Float32:
                 _matVecF32Pipeline ??= new ComputePipeline(this, Shaders.MatVecF32, 3, pushConstantSize: sizeof(MatVecParams));
-                DispatchOrRecord(_matVecF32Pipeline, bufs, totalRows, &p);
+                DispatchOrRecord(_matVecF32Pipeline, bufs, (totalRows + 7) / 8, &p);
                 break;
             case DType.Q6_K:
                 _matVecQ6KPipeline ??= new ComputePipeline(this, Shaders.MatVecQ6K, 3, pushConstantSize: sizeof(MatVecParams));

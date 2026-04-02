@@ -532,7 +532,10 @@ internal static class Shaders
     internal const string MatVecQ6K = """
         #version 450
         #extension GL_EXT_control_flow_attributes : enable
+        #extension GL_KHR_shader_subgroup_arithmetic : enable
 
+        // 1 row per workgroup, 256 threads. Shared memory block cache for
+        // aligned reads of Q6_K's 210-byte blocks. subgroupAdd reduction.
         layout(local_size_x = 256) in;
 
         layout(binding = 0) readonly buffer Weights { uint weights_data[]; };
@@ -544,17 +547,11 @@ internal static class Shaders
             uint cols;
         };
 
-        shared float sdata[256];
-        shared uint blk[53]; // 210 bytes = 52.5 uint32s → 53 (last uint covers bytes 208-211, we only use 208-209)
+        shared uint blk[53];
+        shared float sdata[8]; // for cross-subgroup reduction
 
         uint sReadByte(uint byteOffset) {
             return (blk[byteOffset >> 2] >> ((byteOffset & 3) * 8)) & 0xFF;
-        }
-
-        float sReadHalf(uint byteOffset) {
-            uint lo = sReadByte(byteOffset);
-            uint hi = sReadByte(byteOffset + 1);
-            return unpackHalf2x16(lo | (hi << 8)).x;
         }
 
         int sReadInt8(uint byteOffset) {
@@ -574,13 +571,10 @@ internal static class Shaders
             float acc = 0.0;
 
             for (uint block = 0; block < num_blocks; block++) {
-                // Cooperatively load 53 uint32s (212 bytes ≥ 210) into shared memory
                 uint global_byte_off = boff_base + block * 210;
                 uint global_word_base = global_byte_off >> 2;
                 uint byte_shift = (global_byte_off & 3) * 8;
 
-                // 210 bytes at arbitrary alignment: we need to handle unaligned reads
-                // Load 54 words to cover possible misalignment, then shift
                 if (tid < 54) {
                     uint raw = weights_data[global_word_base + tid];
                     if (byte_shift == 0) {
@@ -592,12 +586,10 @@ internal static class Shaders
                 }
                 barrier();
 
-                // Each thread dequantizes element tid within the block
-                uint within = tid; // 0-255
-                float d = sReadHalf(208);
+                float d = unpackHalf2x16(sReadByte(208) | (sReadByte(209) << 8)).x;
 
-                uint half_idx = within >> 7;
-                uint in_half = within & 127;
+                uint half_idx = tid >> 7;
+                uint in_half = tid & 127;
                 uint group = in_half >> 5;
                 uint l = in_half & 31;
 
@@ -608,38 +600,33 @@ internal static class Shaders
                 uint isc = l >> 4;
                 int scale_val = sReadInt8(sc_base + isc + group * 2);
 
-                uint ql_byte, qh_byte;
                 int quant;
-
                 if (group < 2) {
                     uint ql_off = (group == 0) ? l : (32 + l);
-                    ql_byte = sReadByte(ql_base + ql_off);
-                    qh_byte = sReadByte(qh_base + l);
-                    uint shift = group * 2;
-                    quant = int(((ql_byte & 0xF) | (((qh_byte >> shift) & 3) << 4))) - 32;
+                    uint ql_byte = sReadByte(ql_base + ql_off);
+                    uint qh_byte = sReadByte(qh_base + l);
+                    quant = int(((ql_byte & 0xF) | (((qh_byte >> (group * 2)) & 3) << 4))) - 32;
                 } else {
                     uint ql_off = (group == 2) ? l : (32 + l);
-                    ql_byte = sReadByte(ql_base + ql_off);
-                    qh_byte = sReadByte(qh_base + l);
-                    uint shift = group * 2;
-                    quant = int((((ql_byte >> 4) & 0xF) | (((qh_byte >> shift) & 3) << 4))) - 32;
+                    uint ql_byte = sReadByte(ql_base + ql_off);
+                    uint qh_byte = sReadByte(qh_base + l);
+                    quant = int((((ql_byte >> 4) & 0xF) | (((qh_byte >> (group * 2)) & 3) << 4))) - 32;
                 }
 
-                uint elem = block * 256 + tid;
-                acc += d * float(scale_val) * float(quant) * input_data[elem];
-
+                acc += d * float(scale_val) * float(quant) * input_data[block * 256 + tid];
                 barrier();
             }
 
-            sdata[tid] = acc;
+            // 256 threads = 8 subgroups of 32. subgroupAdd within each, then combine.
+            float sg_sum = subgroupAdd(acc);
+            if (subgroupElect())
+                sdata[gl_SubgroupID] = sg_sum;
             barrier();
-
-            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
-                if (tid < s) sdata[tid] += sdata[tid + s];
-                barrier();
+            if (tid == 0) {
+                float total = 0.0;
+                for (uint i = 0; i < gl_NumSubgroups; i++) total += sdata[i];
+                output_data[row] = total;
             }
-
-            if (tid == 0) output_data[row] = sdata[0];
         }
         """;
 
@@ -652,6 +639,11 @@ internal static class Shaders
     internal const string MatVecF32 = """
         #version 450
         #extension GL_EXT_control_flow_attributes : enable
+        #extension GL_KHR_shader_subgroup_arithmetic : enable
+
+        // 8 rows per workgroup, 32 threads per row = 256 threads.
+        #define N_ROWS 8
+        #define THREADS_PER_ROW 32
 
         layout(local_size_x = 256) in;
 
@@ -664,27 +656,21 @@ internal static class Shaders
             uint cols;
         };
 
-        shared float sdata[256];
-
         void main() {
-            uint row = gl_WorkGroupID.x;
             uint tid = gl_LocalInvocationID.x;
+            uint row_in_wg = tid / THREADS_PER_ROW;
+            uint lane = tid % THREADS_PER_ROW;
+            uint row = gl_WorkGroupID.x * N_ROWS + row_in_wg;
             if (row >= rows) return;
 
             float acc = 0.0;
             uint base_off = row * cols;
-            for (uint i = tid; i < cols; i += 256)
+            for (uint i = lane; i < cols; i += THREADS_PER_ROW)
                 acc += weights_data[base_off + i] * input_data[i];
 
-            sdata[tid] = acc;
-            barrier();
-
-            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
-                if (tid < s) sdata[tid] += sdata[tid + s];
-                barrier();
-            }
-
-            if (tid == 0) output_data[row] = sdata[0];
+            float result = subgroupAdd(acc);
+            if (subgroupElect())
+                output_data[row] = result;
         }
         """;
 
