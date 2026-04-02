@@ -5,7 +5,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Silk.NET.Vulkan" Version="*" />
+    <PackageReference Include="Vortice.Vulkan" Version="*" />
   </ItemGroup>
 
   <PropertyGroup>  </PropertyGroup>

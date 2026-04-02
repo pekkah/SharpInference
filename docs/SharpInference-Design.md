@@ -54,7 +54,7 @@ SharpInference is an experimental LLM inference engine written entirely in moder
 │ Manager  │  KV Cache     │  ┌─────────┐  ┌──────────────┐  │
 │          │  Compression  │  │ Vulkan   │  │ CPU (SIMD)   │  │
 │ Tier L1  │               │  │ Compute  │  │ AVX2/AVX-512 │  │
-│ Tier L2  │  3-bit keys   │  │ Silk.NET │  │ Fallback     │  │
+│ Tier L2  │  3-bit keys   │  │ Vortice  │  │ Fallback     │  │
 │ Tier L3  │  2-bit values │  └─────────┘  └──────────────┘  │
 ├──────────┴──────────────┴───────────────────────────────────┤
 │                     Core Layer                               │
@@ -66,7 +66,7 @@ SharpInference is an experimental LLM inference engine written entirely in moder
 
 **Core Layer** — Model loading, tokenization, tensor storage, and the abstract computation graph. No hardware-specific code. Pure C# with `Span<T>` and `NativeMemory`.
 
-**Compute Backends** — Pluggable backends that execute tensor operations. The Vulkan backend handles GPU dispatch via Silk.NET. The CPU backend provides a SIMD-optimized fallback using `System.Runtime.Intrinsics`. Both implement the same `IComputeBackend` interface.
+**Compute Backends** — Pluggable backends that execute tensor operations. The Vulkan backend handles GPU dispatch via Vortice.Vulkan. The CPU backend provides a SIMD-optimized fallback using `System.Runtime.Intrinsics`. Both implement the same `IComputeBackend` interface.
 
 **TurboQuant** — KV cache compression using the TurboQuant algorithm (ICLR 2026). Precomputed Lloyd-Max codebooks, randomized Hadamard rotation, 3-bit packing. Both CPU and Vulkan shader implementations.
 
@@ -244,7 +244,7 @@ public static class MatVec
 
 ### 4.3 Vulkan Compute Backend
 
-GPU acceleration via Silk.NET Vulkan. All inference operations are compute shaders dispatched from C#.
+GPU acceleration via Vortice.Vulkan Vulkan. All inference operations are compute shaders dispatched from C#.
 
 ```
 SharpInference.Vulkan/
@@ -1380,7 +1380,7 @@ SPIR-V bytecode is embedded as assembly resources and loaded at runtime.
 
 | Package | Purpose |
 |---------|---------|
-| `Silk.NET.Vulkan` | GPU compute dispatch |
+| `Vortice.Vulkan` | GPU compute dispatch (zero-dependency, includes VMA bindings) |
 | `Microsoft.ML.Tokenizers` | BPE / SentencePiece tokenization |
 | `System.IO.Pipelines` | Async data flow primitives |
 | `BenchmarkDotNet` | Performance measurement |
@@ -1409,7 +1409,7 @@ SPIR-V bytecode is embedded as assembly resources and loaded at runtime.
 
 **Goal:** Competitive single-GPU speed for VRAM-fitting models.
 
-- [ ] Silk.NET Vulkan device initialization and compute queue setup
+- [ ] Vortice.Vulkan device initialization and compute queue setup
 - [ ] Storage buffer pool with suballocator
 - [ ] Bindless descriptor management
 - [ ] Compute shaders: matmul, dequant Q4_K_M, RMSNorm, RoPE, softmax, SiLU, attention

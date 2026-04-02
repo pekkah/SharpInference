@@ -1,26 +1,28 @@
-using Silk.NET.Vulkan;
+using Vortice.Vulkan;
 using SharpInference.Core;
+using static Vortice.Vulkan.Vulkan;
 
 namespace SharpInference.Vulkan;
 
 /// <summary>
-/// Vulkan compute backend. Dispatches GLSL compute shaders via Silk.NET.Vulkan.
+/// Vulkan compute backend. Dispatches GLSL compute shaders via Vortice.Vulkan.
 /// Shaders are compiled from <c>shaders/</c> at build time (glslc) and loaded as SPIR-V.
 /// </summary>
 public sealed unsafe class VulkanBackend : IComputeBackend
 {
-    private readonly Vk _vk;
-#pragma warning disable CS0414 // Assigned but never used — scaffold fields for Phase 2
-    private Device _device = default;
-    private Queue _computeQueue = default;
-#pragma warning restore CS0414
+#pragma warning disable CS0169 // Never used — scaffold fields for Phase 2
+    private VkInstance _instance;
+    private VkPhysicalDevice _physicalDevice;
+    private VkDevice _device;
+    private VkQueue _computeQueue;
+    private uint _computeQueueFamily;
+#pragma warning restore CS0169
 
     public string Name => "Vulkan GPU";
 
     public VulkanBackend()
     {
-        _vk = Vk.GetApi();
-        // TODO: create Vulkan instance, pick physical device, create logical device
+        // TODO Phase 2: create Vulkan instance, pick physical device, create logical device
     }
 
     public Tensor Allocate(TensorShape shape, DType dtype = DType.Float32)
@@ -97,6 +99,6 @@ public sealed unsafe class VulkanBackend : IComputeBackend
 
     public void Dispose()
     {
-        _vk.Dispose();
+        // TODO Phase 2: destroy device, instance
     }
 }
