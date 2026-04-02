@@ -1474,9 +1474,8 @@ SmolLM2 1.7B unchanged: CPU 48.5 t/s, GPU 88.7 t/s. Zero managed allocations on 
 - [x] GPU TQ end-to-end: GpuForwardPass TQ mode with compressed VRAM KV cache, TqRotateQuery + TqAttention shaders
 - [ ] Needle-in-a-haystack test at 8K / 16K / 32K / 64K (requires long-context model run)
 
-**Results:** CPU TQ3 decode: 12.7 t/s (< 0.1% overhead vs FP32 12.8 t/s). GPU FP32: 24.2 t/s at 17K ctx.
-GPU TQ3 context estimate: 40,960 tokens vs 17,085 FP32 — 2.4x more context on same 12GB VRAM.
-DequantDot micro: 87 ns (3-bit scalar), 69 ns (4-bit scalar). Zero managed allocations. 25 TQ tests passing.
+**Results:** CPU: FP32 12.8 t/s, TQ3 12.7 t/s (< 0.1% overhead). GPU: FP32 24.1 t/s at 17K ctx, TQ3 24.0 t/s at 40K ctx (0.4% overhead, 2.4x context).
+DequantDot micro: 87 ns (3-bit scalar), 69 ns (4-bit scalar). Zero managed allocations on all paths. 25 TQ tests passing.
 
 **Target model:** Qwen3 8B with 64K context
 
@@ -1609,7 +1608,7 @@ Based on the reference benchmarks above, these are concrete targets per phase:
 | 1 | SmolLM2 1.7B Q4_K_M | CPU only | 45.1 TG t/s | Match llama.cpp | **48.6 TG t/s** ✅ | AVX2 SIMD, fused dequant-matvec |
 | 2 | SmolLM2 1.7B Q4_K_M | Full VRAM, RTX 4070 Ti | ~40–52 TG t/s | ≥ 35 TG t/s (≥80%) | **88.7 TG t/s** ✅ | Vulkan compute shaders, 253% of target |
 | 2b | Qwen3 8B Q4_K_M | Full VRAM, RTX 4070 Ti | ~38–52 TG t/s (8B class) | Scale gracefully | **23.5 TG t/s** ✅ | GPU 23.5, CPU 13.0. QK-norm, quantized embedding, auto VRAM ctx |
-| 3 | Qwen3 8B Q4_K_M + TQ3 | Full VRAM, 64K ctx | N/A (doesn't fit with FP16 KV) | ≥ 30 TG t/s | **CPU 12.7 t/s, GPU est. 40K ctx (2.4x)** ✅ | TQ3 < 0.1% CPU overhead, GPU context 17K→40K |
+| 3 | Qwen3 8B Q4_K_M + TQ3 | Full VRAM, RTX 4070 Ti | N/A (doesn't fit with FP16 KV) | ≥ 30 TG t/s | **GPU 24.0 t/s at 40K ctx** ✅ | CPU 12.7, GPU 24.0. TQ3 < 0.5% overhead, context 17K→40K (2.4x) |
 | 4 | Llama 3.1 70B Q4_K_M | Hybrid GPU+CPU | ~3–5 TG t/s (naive offload) | ≥ 5 TG t/s | Pipelined streaming should match or beat naive split |
 | 5 | Qwen3 30B-A3B Q4_K_M | MoE offload, 12GB + 64GB RAM | ~12 TG t/s (estimated) | ≥ 15 TG t/s | Prefetch + expert cache should beat naive offload |
 | 5+6 | Qwen3 30B-A3B + speculative | MoE + SmolLM2 draft | ~12 TG t/s (no spec) | ≥ 25 effective TG t/s | ~2x from speculative decoding on top of Phase 5 |

@@ -79,7 +79,11 @@ public sealed unsafe class GpuForwardPass : IDisposable
     private Tensor? _gpuCodebook;      // [8] centroids (3-bit)
     private Tensor? _gpuBoundaries;    // [7] decision boundaries
     private Tensor? _rotatedQ;         // [numHeads * headDim] WHT-rotated query
+    private Tensor? _evictK;           // [numKvHeads * headDim] scratch for evicted FP32 entry
+    private Tensor? _evictV;
     private int _tqCompressedLen;      // positions in TQ storage
+    private int _fp32WriteIdx;         // ring buffer write position in FP32 window
+    private int _fp32Count;            // number of FP32 positions currently stored
 
     private readonly int _embDim, _headDim, _numHeads, _numKvHeads, _headsPerKvGroup, _intermDim;
 
@@ -176,6 +180,8 @@ public sealed unsafe class GpuForwardPass : IDisposable
             _gpuBoundaries = gpu.Upload(boundaries, TensorShape.D1(boundaries.Length));
 
             _rotatedQ = gpu.Allocate(TensorShape.D1(_numHeads * _headDim));
+            _evictK = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
+            _evictV = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
         }
         else
         {
@@ -273,6 +279,8 @@ public sealed unsafe class GpuForwardPass : IDisposable
     {
         _kvLength = 0;
         _tqCompressedLen = 0;
+        _fp32WriteIdx = 0;
+        _fp32Count = 0;
     }
 
     /// <summary>
@@ -329,17 +337,29 @@ public sealed unsafe class GpuForwardPass : IDisposable
 
             if (_tqEnabled)
             {
-                // TQ path: compute FP32 window position
-                int fp32Pos = position - _tqCompressedLen;
+                int kvDimLocal = _numKvHeads * _headDim;
+                long rowBytes = (long)kvDimLocal * sizeof(float);
 
-                // Append to FP32 window (always — compression happens when window overflows)
+                // If FP32 window is full, compress the oldest entry before overwriting
+                if (_fp32Count >= _tqFp32Window)
+                {
+                    // Copy oldest FP32 row (at _fp32WriteIdx) to evict buffers
+                    CopyBufferRegion(_evictK!, 0, _gpuKCache[layer], (long)_fp32WriteIdx * rowBytes, rowBytes);
+                    CopyBufferRegion(_evictV!, 0, _gpuVCache[layer], (long)_fp32WriteIdx * rowBytes, rowBytes);
+                    _gpu.RecordTransferBarrier();
+
+                    // Compress evicted entry into TQ cache
+                    _gpu.TqKvAppend(_evictK!, _evictV!, _gpuTqKCache![layer], _gpuTqVCache![layer],
+                        _gpuSignPatterns!, _gpuCodebook!, _gpuBoundaries!,
+                        (uint)kvDimLocal, (uint)_headDim, (uint)_tqCompressedLen,
+                        (uint)_maxSeqLen, (uint)_numKvHeads, (uint)_tqBlockBytes);
+                    _gpu.RecordBarrier();
+                }
+
+                // Write new K/V into FP32 ring buffer at _fp32WriteIdx
                 _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer],
-                    (uint)(_numKvHeads * _headDim), (uint)fp32Pos, (uint)_tqFp32Window);
+                    (uint)kvDimLocal, (uint)_fp32WriteIdx, (uint)_tqFp32Window);
                 _gpu.RecordBarrier();
-
-                // TODO: When fp32 window is full, compress oldest entry to TQ cache
-                // For now, the FP32 window holds up to _tqFp32Window positions
-                // and TQ compression is deferred to a future iteration.
 
                 // Rotate query for TQ attention
                 _gpu.TqRotateQuery(_q, _rotatedQ!, _gpuSignPatterns!,
@@ -347,7 +367,7 @@ public sealed unsafe class GpuForwardPass : IDisposable
                 _gpu.RecordBarrier();
 
                 // TQ Attention: handles both compressed and FP32 regions
-                uint fp32SeqLen = (uint)(position + 1 - _tqCompressedLen);
+                uint fp32SeqLen = (uint)Math.Min(_fp32Count + 1, _tqFp32Window);
                 _gpu.TqAttention(_q, _rotatedQ!, _gpuTqKCache![layer], _gpuTqVCache![layer],
                     _gpuKCache[layer], _gpuVCache[layer], _attnOut, _gpuCodebook!,
                     (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
@@ -395,6 +415,17 @@ public sealed unsafe class GpuForwardPass : IDisposable
 
             _gpu.AddInPlace(_hidden, _residual);
             // No barrier needed here — next layer starts with CopyBuffer which is a transfer
+        }
+
+        // Update TQ ring buffer state (after all layers used the same indices)
+        if (_tqEnabled)
+        {
+            if (_fp32Count >= _tqFp32Window)
+                _tqCompressedLen++;
+
+            _fp32WriteIdx = (_fp32WriteIdx + 1) % _tqFp32Window;
+            if (_fp32Count < _tqFp32Window)
+                _fp32Count++;
         }
 
         // Final norm + output projection
@@ -476,6 +507,15 @@ public sealed unsafe class GpuForwardPass : IDisposable
         var srcBuf = _gpu.GetBuffer(src);
         var dstBuf = _gpu.GetBuffer(dst);
         VkBufferCopy region = new() { size = srcBuf.Size };
+        _gpu.Vkd.vkCmdCopyBuffer(_gpu.TransferCmd, srcBuf.Buffer, dstBuf.Buffer, 1, &region);
+    }
+
+    /// <summary>Copy a sub-region from src to dst (both in VRAM).</summary>
+    private void CopyBufferRegion(Tensor dst, long dstOffsetBytes, Tensor src, long srcOffsetBytes, long sizeBytes)
+    {
+        var srcBuf = _gpu.GetBuffer(src);
+        var dstBuf = _gpu.GetBuffer(dst);
+        VkBufferCopy region = new() { srcOffset = (ulong)srcOffsetBytes, dstOffset = (ulong)dstOffsetBytes, size = (ulong)sizeBytes };
         _gpu.Vkd.vkCmdCopyBuffer(_gpu.TransferCmd, srcBuf.Buffer, dstBuf.Buffer, 1, &region);
     }
 

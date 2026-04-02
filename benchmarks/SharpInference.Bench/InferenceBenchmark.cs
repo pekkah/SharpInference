@@ -475,10 +475,8 @@ public class Qwen3TqGpuBenchmark
         _gpu = new Vulkan.VulkanBackend();
         _gpuFwd = new GpuForwardPass(_model, _gpu, _hp);
 
-        // Report estimated context sizes for comparison
-        int fp32Ctx = _gpuFwd.MaxSeqLen;
         int tqCtx = GpuForwardPass.EstimateMaxContextTq(_model, _gpu, _hp);
-        Console.Error.WriteLine($"[Qwen3TqGpuBenchmark] FP32 auto context: {fp32Ctx}, TQ3 estimated context: {tqCtx}");
+        Console.Error.WriteLine($"[Qwen3TqGpuBenchmark] FP32 context: {_gpuFwd.MaxSeqLen}, TQ3 estimated context: {tqCtx}");
 
         _promptTokens = _tokenizer.Encode(
             "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n");
@@ -495,7 +493,7 @@ public class Qwen3TqGpuBenchmark
         _gpuDecodePos = _promptTokens.Count;
     }
 
-    [Benchmark(Baseline = true, Description = "Qwen3-8B GPU Decode 32t (FP32 KV)")]
+    [Benchmark(Description = "Qwen3-8B GPU Decode 32t (FP32 KV)")]
     public int GpuDecodeFp32()
     {
         ReadOnlySpan<float> logits = _gpuFwd.Forward(_gpuLastToken, _gpuDecodePos++);
@@ -512,6 +510,75 @@ public class Qwen3TqGpuBenchmark
     public void Cleanup()
     {
         _gpuFwd?.Dispose();
+        _gpu?.Dispose();
+        _model?.Dispose();
+    }
+}
+
+/// <summary>
+/// Qwen3 8B GPU decode with TurboQuant — separate class to avoid VRAM contention.
+/// </summary>
+[MemoryDiagnoser]
+[WarmupCount(1)]
+[IterationCount(5)]
+public class Qwen3TqGpuDecodeBenchmark
+{
+    private GgufModel _model = null!;
+    private ModelHyperparams _hp = null!;
+    private GgufTokenizer _tokenizer = null!;
+    private Vulkan.VulkanBackend _gpu = null!;
+    private GpuForwardPass _gpuFwdTq = null!;
+    private IReadOnlyList<int> _promptTokens = null!;
+    private int _gpuDecodePos;
+    private int _gpuLastToken;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        var path = BenchmarkHelper.FindModelPath("Qwen3-8B-Q4_K_M.gguf")
+            ?? throw new FileNotFoundException("Qwen3-8B-Q4_K_M.gguf not found");
+
+        _model = GgufModel.Open(path);
+        _hp = ModelHyperparams.FromGgufMetadata(_model.Metadata);
+        _tokenizer = GgufTokenizer.FromGgufModel(_model);
+
+        _gpu = new Vulkan.VulkanBackend();
+        _gpuFwdTq = new GpuForwardPass(_model, _gpu, _hp, enableTurboQuant: true);
+
+        Console.Error.WriteLine($"[Qwen3TqGpuDecodeBenchmark] TQ3 context: {_gpuFwdTq.MaxSeqLen}");
+
+        _promptTokens = _tokenizer.Encode(
+            "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n");
+    }
+
+    [IterationSetup]
+    public void IterSetup()
+    {
+        _gpuFwdTq.ResetCache();
+        ReadOnlySpan<float> logits = default;
+        for (int i = 0; i < _promptTokens.Count; i++)
+            logits = _gpuFwdTq.Forward(_promptTokens[i], i);
+        _gpuLastToken = Sampler.Greedy(logits);
+        _gpuDecodePos = _promptTokens.Count;
+    }
+
+    [Benchmark(Description = "Qwen3-8B GPU Decode 32t (TQ3 KV)")]
+    public int GpuDecodeTq3()
+    {
+        ReadOnlySpan<float> logits = _gpuFwdTq.Forward(_gpuLastToken, _gpuDecodePos++);
+        int lastToken = Sampler.Greedy(logits);
+        for (int i = 1; i < 32; i++)
+        {
+            logits = _gpuFwdTq.Forward(lastToken, _gpuDecodePos++);
+            lastToken = Sampler.Greedy(logits);
+        }
+        return lastToken;
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        _gpuFwdTq?.Dispose();
         _gpu?.Dispose();
         _model?.Dispose();
     }
