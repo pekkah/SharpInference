@@ -14,7 +14,7 @@
     .\download-model.ps1 -Model qwen3-30b-a3b      # Qwen3 30B-A3B MoE (17.2 GB) - Phase 5
 #>
 param(
-    [ValidateSet("smollm2", "qwen3-8b", "llama31-70b", "qwen3-30b-a3b")]
+    [ValidateSet("smollm2", "qwen3-8b", "llama31-70b", "qwen3-30b-a3b", "llama4-scout")]
     [string]$Model
 )
 
@@ -40,8 +40,14 @@ $Models = @{
     "qwen3-30b-a3b" = @{
         File  = "Qwen3-30B-A3B-Q4_K_M.gguf"
         Url   = "https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf"
-        Size  = "17.2 GB"
-        Phase = "5"
+        Size  = "6.2 GB"
+        Phase = "5a"
+    }
+    "llama4-scout" = @{
+        File  = "Llama-4-Scout-17B-16E-Instruct-Q2_K.gguf"
+        Url   = "https://huggingface.co/unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF/resolve/main/Llama-4-Scout-17B-16E-Instruct-Q2_K.gguf"
+        Size  = "39.6 GB"
+        Phase = "5b"
     }
 }
 

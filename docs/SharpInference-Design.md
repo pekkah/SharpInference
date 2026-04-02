@@ -1554,15 +1554,20 @@ After Phase 4a, a dedicated optimization pass targeting CPU and GPU throughput:
 
 **Goal:** Fast MoE inference exploiting routing sparsity.
 
-- [ ] MoE router computation on GPU
+Phase 5a — Basic MoE support (Qwen3 30B-A3B, 6.2 GB, fits VRAM):
+- [ ] Detect MoE architecture from GGUF metadata (expert count, active experts)
+- [ ] MoE router computation (top-k expert selection per token)
+- [ ] Sparse expert FFN execution (only compute active experts)
+- [ ] Correct end-to-end output on Qwen3 30B-A3B
+
+Phase 5b — Expert offloading (Llama 4 Scout 109B/16E, ~40 GB Q2_K):
 - [ ] Expert slot cache in VRAM with SLRU eviction
-- [ ] `Channel<T>` async prefetch pipeline
+- [ ] `Channel<T>` async prefetch pipeline from pinned RAM → VRAM
 - [ ] Router-driven predictive prefetching (1-token lookahead)
-- [ ] CPU fallback for expert cache misses (PCIe round-trip activation)
-- [ ] NVMe cold expert promotion path
+- [ ] CPU fallback for expert cache misses
 - [ ] Expert access frequency profiling and cache hit rate metrics
 
-**Target model:** Qwen3 30B-A3B → GPT-OSS 120B
+**Target models:** Qwen3 30B-A3B (5a) → Llama 4 Scout 109B/16E Q2_K (5b)
 
 ### Phase 6: Speculative Decoding (Weeks 21–23)
 
@@ -1668,8 +1673,9 @@ Based on the reference benchmarks above, these are concrete targets per phase:
 | 2b | Qwen3 8B Q4_K_M | Full VRAM, RTX 4070 Ti | ~38–52 TG t/s (8B class) | Scale gracefully | **43.5 TG t/s** ✅ | GPU 43.5 (0.52x llama.cpp), CPU 13.5 (1.23x llama.cpp) |
 | 3 | Qwen3 8B Q4_K_M + TQ3 | Full VRAM, RTX 4070 Ti | N/A (doesn't fit with FP16 KV) | ≥ 30 TG t/s | **GPU 24.0 t/s at 40K ctx** ✅ | TQ3 < 0.5% overhead, context 17K→40K (2.4x) |
 | 4a | Llama 3.1 70B Q4_K_M | Hybrid GPU+CPU, RTX 4070 Ti | ~3–5 TG t/s (naive offload) | ≥ 5 TG t/s | **1.8 t/s (18 GPU + 62 CPU)** | Q5_K AVX2+512, matches llama.cpp CPU (1.54). Phase 4b for streaming |
-| 5 | Qwen3 30B-A3B Q4_K_M | MoE offload, 12GB + 64GB RAM | ~12 TG t/s (estimated) | ≥ 15 TG t/s | Prefetch + expert cache should beat naive offload |
-| 5+6 | Qwen3 30B-A3B + speculative | MoE + SmolLM2 draft | ~12 TG t/s (no spec) | ≥ 25 effective TG t/s | ~2x from speculative decoding on top of Phase 5 |
+| 5a | Qwen3 30B-A3B Q4_K_M | Full VRAM (6.2 GB), MoE routing | N/A (new arch) | Correct output | Basic MoE: detect, route, sparse FFN |
+| 5b | Llama 4 Scout 109B Q2_K | MoE offload, 12GB + 64GB RAM | ~12 TG t/s (llama.cpp) | ≥ 15 TG t/s | 16 experts, SLRU cache, async prefetch from RAM |
+| 5b+6 | Llama 4 Scout + speculative | MoE + SmolLM2 draft | ~12 TG t/s (no spec) | ≥ 25 effective TG t/s | ~2x from speculative decoding on top of Phase 5b |
 
 **Stretch targets (if all optimizations compose well):**
 
