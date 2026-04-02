@@ -3,10 +3,22 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <AssemblyName>sharpi-cli</AssemblyName>
+
+    <!-- NativeAOT -->
     <PublishAot>true</PublishAot>
     <TrimMode>full</TrimMode>
     <IlcTrimMetadata>true</IlcTrimMetadata>
-    <!-- Spectre.Console.Cli uses reflection but works correctly with NativeAOT -->
+    <IlcFoldIdenticalMethodBodies>true</IlcFoldIdenticalMethodBodies>
+
+    <!-- Reduce binary size -->
+    <StackTraceSupport>false</StackTraceSupport>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <EventSourceSupport>false</EventSourceSupport>
+    <MetricsSupport>false</MetricsSupport>
+    <DebuggerSupport>false</DebuggerSupport>
+    <HttpActivityPropagationSupport>false</HttpActivityPropagationSupport>
+
+    <!-- Spectre.Console.Cli uses reflection but works with NativeAOT at runtime -->
     <NoWarn>IL3050;IL2026</NoWarn>
   </PropertyGroup>
 
