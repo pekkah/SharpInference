@@ -7,7 +7,7 @@ namespace SharpInference.Bench;
 
 [MemoryDiagnoser]
 [WarmupCount(2)]
-[IterationCount(20)]
+[IterationCount(10)]
 public class InferenceBenchmark
 {
     private GgufModel _model = null!;
@@ -16,8 +16,6 @@ public class InferenceBenchmark
     private CpuBackend _backend = null!;
     private ForwardPass _fwd = null!;
     private IReadOnlyList<int> _promptTokens = null!;
-    private int _decodePos;
-    private int _lastToken;
 
     [GlobalSetup]
     public void Setup()
@@ -33,32 +31,45 @@ public class InferenceBenchmark
 
         _promptTokens = _tokenizer.Encode(
             "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n");
+    }
 
-        // Prefill prompt
+    // ================================================================
+    //  Decode N tokens — measures realistic sustained throughput
+    //  as KV cache grows, attention cost increases per token.
+    // ================================================================
+
+    [Params(1, 32, 128)]
+    public int TokenCount { get; set; }
+
+    [IterationSetup(Target = nameof(DecodeTokens))]
+    public void DecodeIterSetup()
+    {
+        _fwd.Cache.Reset();
         for (int i = 0; i < _promptTokens.Count; i++)
             _fwd.Forward(_promptTokens[i], i);
     }
 
-    [IterationSetup(Target = nameof(DecodeOneToken))]
-    public void DecodeIterSetup()
+    [Benchmark(Description = "Decode N tokens")]
+    public int DecodeTokens()
     {
-        _fwd.Cache.Reset();
-        ReadOnlySpan<float> logits = default;
-        for (int i = 0; i < _promptTokens.Count; i++)
-            logits = _fwd.Forward(_promptTokens[i], i);
-        _lastToken = Sampler.Greedy(logits);
-        _decodePos = _promptTokens.Count;
+        ReadOnlySpan<float> logits = _fwd.Forward(
+            Sampler.Greedy(_fwd.Forward(_promptTokens[^1], _promptTokens.Count - 1)),
+            _promptTokens.Count);
+
+        int lastToken = Sampler.Greedy(logits);
+        int pos = _promptTokens.Count + 1;
+
+        for (int i = 1; i < TokenCount; i++)
+        {
+            logits = _fwd.Forward(lastToken, pos++);
+            lastToken = Sampler.Greedy(logits);
+        }
+        return lastToken;
     }
 
-    /// <summary>
-    /// Benchmark a single decode step. To get tokens/sec: 1000 / Mean(ms).
-    /// </summary>
-    [Benchmark(Description = "Decode 1 token")]
-    public int DecodeOneToken()
-    {
-        var logits = _fwd.Forward(_lastToken, _decodePos++);
-        return Sampler.Greedy(logits);
-    }
+    // ================================================================
+    //  Prefill
+    // ================================================================
 
     [IterationSetup(Target = nameof(PrefillPrompt))]
     public void PrefillIterSetup()
@@ -66,9 +77,6 @@ public class InferenceBenchmark
         _fwd.Cache.Reset();
     }
 
-    /// <summary>
-    /// Benchmark prefill of 10-token prompt. Tokens/sec = 10 * 1000 / Mean(ms).
-    /// </summary>
     [Benchmark(Description = "Prefill 10 tokens")]
     public int PrefillPrompt()
     {
