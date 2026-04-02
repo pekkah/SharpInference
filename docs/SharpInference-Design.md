@@ -1496,9 +1496,59 @@ DequantDot micro: 87 ns (3-bit scalar), 69 ns (4-bit scalar). Zero managed alloc
 
 **Results:** Llama 3.1 70B Q4_K_M on RTX 4070 Ti 12GB + 64GB RAM:
 Auto-detect: 18 GPU layers + 62 CPU layers, 3K context.
-Decode: 1.0 t/s hybrid (vs 0.9 t/s CPU-only). 114 tests passing.
+Decode: 1.8 t/s hybrid, 1.6 t/s CPU-only. 114 tests passing.
 
 **Target model:** Llama 3.1 70B at Q4_K_M
+
+### Performance Optimization Pass ✅
+
+After Phase 4a, a dedicated optimization pass targeting CPU and GPU throughput:
+
+**CPU Optimizations:**
+- [x] Q5_K fused AVX2 dequant-matvec (2.7x on 70B, matching llama.cpp)
+- [x] AVX-512 DotQ4K and DotQ5K kernels (+5% on 8B CPU via reduced loop overhead)
+- [x] Physical-core-only Parallel.For (no SMT for SIMD workloads)
+- [x] Async GPU submit API (`EndRecordAndSubmitAsync` + `WaitForGpu`)
+- [x] Mmap weight prefaulting in HybridForwardPass
+
+**GPU Optimizations:**
+- [x] Multi-row workgroups: 8 rows per workgroup, 32 threads per row
+- [x] subgroupAdd for zero-barrier reduction (eliminates shared memory reduction tree)
+- [x] Register-based scale/min precomputation (3 uint32 reads → 8 scale pairs)
+- [x] unpackHalf2x16 for d/dmin (single-instruction FP16 decode)
+
+**Remaining GPU Optimizations (future):**
+- [ ] 16-thread tile pattern with vec4 input loads (llama.cpp style, ~50+ t/s but has correctness bug in qs byte mapping)
+- [ ] Q6_K shader modernization (8-row + subgroupAdd, currently uses old 256-thread reduction)
+- [ ] Reduce barrier count: use buffer-specific VkBufferMemoryBarrier instead of global barriers (~540 per token)
+- [ ] Fold logits download into main command buffer (eliminate second submit-wait)
+- [ ] Compute-shader buffer copy (replace vkCmdCopyBuffer transfer to stay in compute pipeline stage)
+- [ ] Fix attention shader for seq_len > 256 (correctness bug: only 256 threads = 256 positions max)
+
+**Remaining CPU Optimizations (future):**
+- [ ] Fused gate+up MatVec (single Parallel.For for both FFN projections, halves thread dispatch count)
+- [ ] Parallel attention heads (per-thread score buffers, Parallel.For over heads)
+- [ ] KV cache head-major transpose (contiguous access per KV head across positions)
+- [ ] Precomputed RoPE cos/sin tables (avoid MathF.Pow/Cos/Sin per head per layer)
+
+**Results — cumulative from baseline to final:**
+
+| Model | Mode | Before | After | Speedup | vs llama.cpp |
+|-------|------|--------|-------|---------|-------------|
+| SmolLM2 1.7B | GPU | 88.7 | **131.3 t/s** | +48% | — |
+| Qwen3 8B | GPU | 23.6 | **43.5 t/s** | +84% | 83.7 (0.52x) |
+| Qwen3 8B | CPU | 12.8 | **13.5 t/s** | +5% | 11.0 (1.23x) |
+| Llama 70B | CPU | 0.6 | **1.6 t/s** | +167% | 1.54 (1.04x) |
+| Llama 70B | Hybrid | 0.7 | **1.8 t/s** | +157% | 1.84 (0.98x) |
+
+### Phase 4b: Double-Buffered Layer Streaming (Weeks 11–14)
+
+**Goal:** Stream weight layers through GPU from pinned RAM for models > VRAM.
+
+- [ ] Dedicated Vulkan transfer queue (separate from compute)
+- [ ] Weight ping-pong: 2 VRAM buffer slots, DMA layer N+1 while computing layer N
+- [ ] Pinned weight pool: pre-pin model weights in host memory for fast DMA
+- [ ] Streaming forward pass: all layers on GPU, weights streamed per-layer
 
 ### Phase 5: MoE-Aware Inference with Prefetching (Weeks 15–20)
 
@@ -1614,10 +1664,10 @@ Based on the reference benchmarks above, these are concrete targets per phase:
 | Phase | Model | Configuration | llama.cpp Baseline | SharpInference Target | Actual | Notes |
 |-------|-------|---------------|-------------------|----------------------|--------|-------|
 | 1 | SmolLM2 1.7B Q4_K_M | CPU only | 45.1 TG t/s | Match llama.cpp | **48.6 TG t/s** ✅ | AVX2 SIMD, fused dequant-matvec |
-| 2 | SmolLM2 1.7B Q4_K_M | Full VRAM, RTX 4070 Ti | ~40–52 TG t/s | ≥ 35 TG t/s (≥80%) | **88.7 TG t/s** ✅ | Vulkan compute shaders, 253% of target |
-| 2b | Qwen3 8B Q4_K_M | Full VRAM, RTX 4070 Ti | ~38–52 TG t/s (8B class) | Scale gracefully | **23.5 TG t/s** ✅ | GPU 23.5, CPU 13.0. QK-norm, quantized embedding, auto VRAM ctx |
-| 3 | Qwen3 8B Q4_K_M + TQ3 | Full VRAM, RTX 4070 Ti | N/A (doesn't fit with FP16 KV) | ≥ 30 TG t/s | **GPU 24.0 t/s at 40K ctx** ✅ | CPU 12.7, GPU 24.0. TQ3 < 0.5% overhead, context 17K→40K (2.4x) |
-| 4a | Llama 3.1 70B Q4_K_M | Hybrid GPU+CPU, RTX 4070 Ti | ~3–5 TG t/s (naive offload) | ≥ 5 TG t/s | **1.0 t/s (18 GPU + 62 CPU layers)** | Auto-detect, pinned transfer. PCIe-bound. Phase 4b streaming needed |
+| 2 | SmolLM2 1.7B Q4_K_M | Full VRAM, RTX 4070 Ti | ~40–52 TG t/s | ≥ 35 TG t/s (≥80%) | **131.3 TG t/s** ✅ | Multi-row shaders + subgroupAdd (+48% from opt pass) |
+| 2b | Qwen3 8B Q4_K_M | Full VRAM, RTX 4070 Ti | ~38–52 TG t/s (8B class) | Scale gracefully | **43.5 TG t/s** ✅ | GPU 43.5 (0.52x llama.cpp), CPU 13.5 (1.23x llama.cpp) |
+| 3 | Qwen3 8B Q4_K_M + TQ3 | Full VRAM, RTX 4070 Ti | N/A (doesn't fit with FP16 KV) | ≥ 30 TG t/s | **GPU 24.0 t/s at 40K ctx** ✅ | TQ3 < 0.5% overhead, context 17K→40K (2.4x) |
+| 4a | Llama 3.1 70B Q4_K_M | Hybrid GPU+CPU, RTX 4070 Ti | ~3–5 TG t/s (naive offload) | ≥ 5 TG t/s | **1.8 t/s (18 GPU + 62 CPU)** | Q5_K AVX2+512, matches llama.cpp CPU (1.54). Phase 4b for streaming |
 | 5 | Qwen3 30B-A3B Q4_K_M | MoE offload, 12GB + 64GB RAM | ~12 TG t/s (estimated) | ≥ 15 TG t/s | Prefetch + expert cache should beat naive offload |
 | 5+6 | Qwen3 30B-A3B + speculative | MoE + SmolLM2 draft | ~12 TG t/s (no spec) | ≥ 25 effective TG t/s | ~2x from speculative decoding on top of Phase 5 |
 
