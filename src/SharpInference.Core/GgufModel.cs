@@ -105,6 +105,16 @@ public sealed unsafe class GgufModel : IDisposable
                 tensors[i] = new GgufTensorInfo(name, (int)nDims, dims, dtype, offset);
             }
 
+            // Detect attention bias tensors and inject synthetic metadata
+            for (int i = 0; i < tensors.Length; i++)
+            {
+                if (tensors[i].Name == "blk.0.attn_q.bias")
+                {
+                    metadata["_sharpi.has_attn_bias"] = true;
+                    break;
+                }
+            }
+
             // Data section starts at alignment boundary after all header/metadata/tensor-info
             var dataStartOffset = AlignUp(reader.Position, alignment);
 

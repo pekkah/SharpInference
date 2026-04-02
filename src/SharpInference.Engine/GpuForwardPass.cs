@@ -47,6 +47,10 @@ public sealed unsafe class GpuForwardPass : IDisposable
     private readonly Tensor _wOutputNorm;
     private readonly Tensor _wOutput;
 
+    // Optional attention biases in VRAM (Qwen models)
+    private readonly bool _hasAttnBias;
+    private readonly Tensor[]? _bq, _bk, _bv, _bo;
+
     // KV cache in VRAM: per-layer K and V buffers [maxSeqLen, kvDim]
     private readonly Tensor[] _gpuKCache;  // per layer
     private readonly Tensor[] _gpuVCache;  // per layer
@@ -102,6 +106,13 @@ public sealed unsafe class GpuForwardPass : IDisposable
         _wq = new Tensor[L]; _wk = new Tensor[L]; _wv = new Tensor[L]; _wo = new Tensor[L];
         _wGate = new Tensor[L]; _wUp = new Tensor[L]; _wDown = new Tensor[L];
 
+        _hasAttnBias = hp.HasAttnBias;
+        if (_hasAttnBias)
+        {
+            _bq = new Tensor[L]; _bk = new Tensor[L];
+            _bv = new Tensor[L]; _bo = new Tensor[L];
+        }
+
         Console.Error.Write($"[GpuForwardPass] Uploading {L} layers to VRAM...");
         for (int i = 0; i < L; i++)
         {
@@ -114,6 +125,15 @@ public sealed unsafe class GpuForwardPass : IDisposable
             _wGate[i] = UploadWeight($"blk.{i}.ffn_gate.weight");
             _wUp[i] = UploadWeight($"blk.{i}.ffn_up.weight");
             _wDown[i] = UploadWeight($"blk.{i}.ffn_down.weight");
+
+            if (_hasAttnBias)
+            {
+                _bq![i] = UploadWeight($"blk.{i}.attn_q.bias");
+                _bk![i] = UploadWeight($"blk.{i}.attn_k.bias");
+                _bv![i] = UploadWeight($"blk.{i}.attn_v.bias");
+                _bo![i] = UploadWeight($"blk.{i}.attn_output.bias");
+            }
+
             Console.Error.Write(".");
         }
         _wOutputNorm = UploadWeight("output_norm.weight");
@@ -162,7 +182,15 @@ public sealed unsafe class GpuForwardPass : IDisposable
             GpuMatMul(_q, _wq[layer], _normBuf);
             GpuMatMul(_k, _wk[layer], _normBuf);
             GpuMatMul(_v, _wv[layer], _normBuf);
-            _gpu.RecordBarrier(); // Q/K/V done → RoPE + KV append + attention
+            _gpu.RecordBarrier(); // Q/K/V done → bias + RoPE
+
+            if (_hasAttnBias)
+            {
+                _gpu.AddInPlace(_q, _bq![layer]);
+                _gpu.AddInPlace(_k, _bk![layer]);
+                _gpu.AddInPlace(_v, _bv![layer]);
+                _gpu.RecordBarrier();
+            }
 
             // RoPE on Q and K (write different buffers, no conflict)
             _gpu.RoPE(_q, position, _headDim, _hp.RopeTheta);
@@ -180,6 +208,11 @@ public sealed unsafe class GpuForwardPass : IDisposable
             _gpu.RecordBarrier(); // attnOut done → output projection
 
             GpuMatMul(_hidden, _wo[layer], _attnOut);
+            if (_hasAttnBias)
+            {
+                _gpu.RecordBarrier();
+                _gpu.AddInPlace(_hidden, _bo![layer]);
+            }
             _gpu.RecordBarrier(); // hidden written → add
 
             _gpu.AddInPlace(_hidden, _residual);
@@ -336,6 +369,12 @@ public sealed unsafe class GpuForwardPass : IDisposable
             _gpu.Free(_wAttnNorm[i]); _gpu.Free(_wFfnNorm[i]);
             _gpu.Free(_wq[i]); _gpu.Free(_wk[i]); _gpu.Free(_wv[i]); _gpu.Free(_wo[i]);
             _gpu.Free(_wGate[i]); _gpu.Free(_wUp[i]); _gpu.Free(_wDown[i]);
+
+            if (_hasAttnBias)
+            {
+                _gpu.Free(_bq![i]); _gpu.Free(_bk![i]);
+                _gpu.Free(_bv![i]); _gpu.Free(_bo![i]);
+            }
         }
         _gpu.Free(_wOutputNorm); _gpu.Free(_wOutput); _gpu.Free(_gpuEmbedding);
 

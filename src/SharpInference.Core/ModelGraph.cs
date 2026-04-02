@@ -26,6 +26,12 @@ public sealed class ModelHyperparams
     public float RopeTheta { get; init; } = 10_000f;
 
     /// <summary>
+    /// Whether the model has bias terms on Q/K/V/O attention projections (e.g. Qwen models).
+    /// Detected at load time by probing for "blk.0.attn_q.bias" in the GGUF tensor index.
+    /// </summary>
+    public bool HasAttnBias { get; init; }
+
+    /// <summary>
     /// Extract hyperparameters from GGUF metadata using the model's architecture prefix.
     /// Supports llama-family models (llama, mistral, qwen, smollm, etc.).
     /// </summary>
@@ -45,6 +51,7 @@ public sealed class ModelHyperparams
             IntermediateDim = GetInt(metadata, $"{arch}.feed_forward_length"),
             RmsNormEps = GetFloat(metadata, $"{arch}.attention.layer_norm_rms_epsilon", 1e-5f),
             RopeTheta = GetFloat(metadata, $"{arch}.rope.freq_base", 10_000f),
+            HasAttnBias = metadata.ContainsKey("_sharpi.has_attn_bias"),
         };
     }
 

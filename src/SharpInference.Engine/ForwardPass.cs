@@ -49,6 +49,10 @@ public sealed unsafe class ForwardPass : IDisposable
     private readonly TensorRef _outputNorm;
     private readonly TensorRef _outputWeight;
 
+    // Optional attention biases (Qwen models)
+    private readonly bool _hasAttnBias;
+    private readonly float*[] _bq, _bk, _bv, _bo;
+
     public ForwardPass(GgufModel model, IComputeBackend backend, ModelHyperparams hp)
     {
         _model = model;
@@ -85,6 +89,10 @@ public sealed unsafe class ForwardPass : IDisposable
         _ffnNorm = new TensorRef[L];
         _wGate = new TensorRef[L]; _wUp = new TensorRef[L]; _wDown = new TensorRef[L];
 
+        _hasAttnBias = hp.HasAttnBias;
+        _bq = new float*[L]; _bk = new float*[L];
+        _bv = new float*[L]; _bo = new float*[L];
+
         for (int i = 0; i < L; i++)
         {
             _attnNorm[i] = ResolveTensor($"blk.{i}.attn_norm.weight");
@@ -96,6 +104,14 @@ public sealed unsafe class ForwardPass : IDisposable
             _wGate[i] = ResolveTensor($"blk.{i}.ffn_gate.weight");
             _wUp[i] = ResolveTensor($"blk.{i}.ffn_up.weight");
             _wDown[i] = ResolveTensor($"blk.{i}.ffn_down.weight");
+
+            if (_hasAttnBias)
+            {
+                _bq[i] = LoadBias($"blk.{i}.attn_q.bias", _numHeads * _headDim);
+                _bk[i] = LoadBias($"blk.{i}.attn_k.bias", _numKvHeads * _headDim);
+                _bv[i] = LoadBias($"blk.{i}.attn_v.bias", _numKvHeads * _headDim);
+                _bo[i] = LoadBias($"blk.{i}.attn_output.bias", _embDim);
+            }
         }
 
         _outputNorm = ResolveTensor("output_norm.weight");
@@ -162,6 +178,17 @@ public sealed unsafe class ForwardPass : IDisposable
                 SimdKernels.MatMulBatched(batchV, _wv[layer].DataPtr, batchNorm,
                     N, kvDim, _embDim, _wv[layer].DType);
 
+                // Apply QKV biases per token (Qwen models)
+                if (_hasAttnBias)
+                {
+                    for (int n = 0; n < N; n++)
+                    {
+                        SimdKernels.AddInPlace(batchQ + (long)n * qDim, _bq[layer], qDim);
+                        SimdKernels.AddInPlace(batchK + (long)n * kvDim, _bk[layer], kvDim);
+                        SimdKernels.AddInPlace(batchV + (long)n * kvDim, _bv[layer], kvDim);
+                    }
+                }
+
                 // Per-token: RoPE, KV cache append, attention
                 for (int n = 0; n < N; n++)
                 {
@@ -188,6 +215,13 @@ public sealed unsafe class ForwardPass : IDisposable
                 // Batched output projection
                 SimdKernels.MatMulBatched(batchNorm, _wo[layer].DataPtr, batchAttnOut,
                     N, _embDim, qDim, _wo[layer].DType);
+
+                // Apply output projection bias (Qwen models)
+                if (_hasAttnBias)
+                {
+                    for (int n = 0; n < N; n++)
+                        SimdKernels.AddInPlace(batchNorm + (long)n * _embDim, _bo[layer], _embDim);
+                }
 
                 // Add output projection + residual → batchHidden
                 for (int n = 0; n < N; n++)
@@ -285,6 +319,13 @@ public sealed unsafe class ForwardPass : IDisposable
             FusedMatVec(_k, _wk[layer], _normBuf, _numKvHeads * _headDim, _embDim);
             FusedMatVec(_v, _wv[layer], _normBuf, _numKvHeads * _headDim, _embDim);
 
+            if (_hasAttnBias)
+            {
+                SimdKernels.AddInPlace(_q, _bq[layer], _numHeads * _headDim);
+                SimdKernels.AddInPlace(_k, _bk[layer], _numKvHeads * _headDim);
+                SimdKernels.AddInPlace(_v, _bv[layer], _numKvHeads * _headDim);
+            }
+
             // RoPE
             SimdKernels.ApplyRoPE(_q, position, _numHeads, _headDim, _hp.RopeTheta);
             SimdKernels.ApplyRoPE(_k, position, _numKvHeads, _headDim, _hp.RopeTheta);
@@ -299,6 +340,8 @@ public sealed unsafe class ForwardPass : IDisposable
 
             // Output projection
             FusedMatVec(_hidden, _wo[layer], _attnOut, _embDim, _numHeads * _headDim);
+            if (_hasAttnBias)
+                SimdKernels.AddInPlace(_hidden, _bo[layer], _embDim);
 
             // Residual
             SimdKernels.AddInPlace(_hidden, _residual, _embDim);
@@ -455,6 +498,19 @@ public sealed unsafe class ForwardPass : IDisposable
         return new TensorRef(name, info, info.DType, _model.GetTensorDataPtr(info));
     }
 
+    private float* LoadBias(string name, int count)
+    {
+        var info = _model.FindTensor(name)
+            ?? throw new InvalidOperationException($"Missing bias tensor: {name}");
+        var data = _model.GetTensorData(info);
+        var buf = Alloc(count);
+        if (info.DType == DType.Float32)
+            MemoryMarshal.Cast<byte, float>(data).Slice(0, count).CopyTo(new Span<float>(buf, count));
+        else
+            Dequantize.ToFloat32(data, new Span<float>(buf, count), info.DType, count);
+        return buf;
+    }
+
     private readonly unsafe struct TensorRef
     {
         public readonly string Name;
@@ -495,6 +551,17 @@ public sealed unsafe class ForwardPass : IDisposable
         foreach (var ptr in _normCache.Values)
             NativeMemory.Free((void*)ptr);
         _normCache.Clear();
+
+        if (_hasAttnBias)
+        {
+            for (int i = 0; i < _hp.NumLayers; i++)
+            {
+                NativeMemory.Free(_bq[i]);
+                NativeMemory.Free(_bk[i]);
+                NativeMemory.Free(_bv[i]);
+                NativeMemory.Free(_bo[i]);
+            }
+        }
 
         _kvCache.Dispose();
     }

@@ -1435,6 +1435,22 @@ atomic-free attention reduction, descriptor set caching, fence-based sync, and s
 
 **Target model:** SmolLM2 1.7B ✅ (Qwen3 8B scaling — Phase 2b)
 
+### Phase 2b: Qwen3 8B Scaling
+
+**Goal:** Generalize the inference engine from SmolLM2-only to support Qwen3 8B and other architectures.
+
+- [x] Architecture-agnostic hyperparameter extraction (arch-prefixed GGUF metadata keys)
+- [x] Attention bias support: optional Q/K/V/O bias tensors (detected via `_sharpi.has_attn_bias` synthetic metadata)
+- [x] CPU forward pass: bias addition after Q/K/V/O MatVec projections (both single-token and batched prefill)
+- [x] GPU forward pass: bias tensors uploaded to VRAM, applied via AddInPlace shader dispatches
+- [x] Dynamic RoPE theta from GGUF metadata (supports Qwen3's 1M+ base frequency)
+- [x] All shaders dimension-agnostic via push constants (no hardcoded sizes)
+- [x] KV cache scales to any head count/dim configuration
+- [ ] End-to-end validation: Qwen3 8B Q4_K_M greedy decode matches llama.cpp token-for-token
+- [ ] Performance benchmark: decode t/s on RTX 4070 Ti (12GB VRAM, ~8.3 GB total with 4K context)
+
+**Target model:** Qwen3 8B Q4_K_M (~4.9 GB weights, fits 12GB VRAM with 4K context)
+
 ### Phase 3: TurboQuant KV Cache Compression (Weeks 7–10)
 
 **Goal:** 4–6x KV cache reduction, enabling 64K+ context on 12GB VRAM.
