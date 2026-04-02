@@ -107,6 +107,104 @@ public sealed unsafe class ForwardPass : IDisposable
     public KvCache Cache => _kvCache;
 
     /// <summary>
+    /// Prefill: process all prompt tokens layer-by-layer.
+    /// Weights stay hot in L3 cache across tokens within each layer,
+    /// amortizing DRAM reads ~N× vs sequential Forward() calls.
+    /// Returns logits for the last token.
+    /// </summary>
+    public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens)
+    {
+        int N = tokens.Count;
+        if (N == 0) throw new ArgumentException("Token list is empty");
+        if (N == 1) return Forward(tokens[0], 0);
+
+        // Batch hidden states: [N, embDim]
+        var batchHidden = (float*)NativeMemory.AllocZeroed((nuint)((long)N * _embDim * sizeof(float)));
+        var batchResidual = (float*)NativeMemory.AllocZeroed((nuint)((long)N * _embDim * sizeof(float)));
+        try
+        {
+            // 1. Embed all tokens
+            for (int n = 0; n < N; n++)
+                EmbedTokenInto(tokens[n], batchHidden + (long)n * _embDim);
+
+            // 2. Process layer-by-layer (weights stay in L3 cache across all N tokens)
+            for (int layer = 0; layer < _hp.NumLayers; layer++)
+            {
+                // Reset KV cache position so this layer fills positions 0..N-1.
+                // Each layer writes to its own _keys[layer]/_values[layer] arrays,
+                // so resetting the shared position counter is safe.
+                _kvCache.Reset();
+
+                var normW = GetNormWeight(_attnNorm[layer]);
+
+                // Attention pass: Q/K/V projections + RoPE + causal attention
+                // Weight data for wq/wk/wv/wo stays hot in L3 across all N tokens
+                for (int n = 0; n < N; n++)
+                {
+                    float* h = batchHidden + (long)n * _embDim;
+                    float* r = batchResidual + (long)n * _embDim;
+
+                    Copy(r, h, _embDim);
+                    SimdKernels.RmsNorm(_normBuf, h, normW, _embDim, _hp.RmsNormEps);
+
+                    FusedMatVec(_q, _wq[layer], _normBuf, _numHeads * _headDim, _embDim);
+                    FusedMatVec(_k, _wk[layer], _normBuf, _numKvHeads * _headDim, _embDim);
+                    FusedMatVec(_v, _wv[layer], _normBuf, _numKvHeads * _headDim, _embDim);
+
+                    SimdKernels.ApplyRoPE(_q, n, _numHeads, _headDim, _hp.RopeTheta);
+                    SimdKernels.ApplyRoPE(_k, n, _numKvHeads, _headDim, _hp.RopeTheta);
+
+                    _kvCache.Append(layer,
+                        new ReadOnlySpan<float>(_k, _numKvHeads * _headDim),
+                        new ReadOnlySpan<float>(_v, _numKvHeads * _headDim));
+                    _kvCache.IncrementPosition();
+
+                    Attention(layer, n);
+
+                    FusedMatVec(h, _wo[layer], _attnOut, _embDim, _numHeads * _headDim);
+                    SimdKernels.AddInPlace(h, r, _embDim);
+                }
+
+                // FFN pass: gate/up/down weights stay hot in L3 across all N tokens
+                var ffnNormW = GetNormWeight(_ffnNorm[layer]);
+
+                for (int n = 0; n < N; n++)
+                {
+                    float* h = batchHidden + (long)n * _embDim;
+                    float* r = batchResidual + (long)n * _embDim;
+
+                    Copy(r, h, _embDim);
+                    SimdKernels.RmsNorm(_normBuf, h, ffnNormW, _embDim, _hp.RmsNormEps);
+
+                    FusedMatVec(_ffnGate, _wGate[layer], _normBuf, _intermDim, _embDim);
+                    FusedMatVec(_ffnUp, _wUp[layer], _normBuf, _intermDim, _embDim);
+                    SimdKernels.SiLuMul(_ffnGate, _ffnUp, _intermDim);
+                    FusedMatVec(h, _wDown[layer], _ffnGate, _embDim, _intermDim);
+
+                    SimdKernels.AddInPlace(h, r, _embDim);
+                }
+            }
+
+            // Set final KV cache length to N for subsequent decode calls
+            _kvCache.Reset();
+            for (int i = 0; i < N; i++) _kvCache.IncrementPosition();
+
+            // 3. Final norm + output projection on last token only
+            float* lastHidden = batchHidden + (long)(N - 1) * _embDim;
+            var outNormW = GetNormWeight(_outputNorm);
+            SimdKernels.RmsNorm(lastHidden, lastHidden, outNormW, _embDim, _hp.RmsNormEps);
+            FusedMatVec(_logits, _outputWeight, lastHidden, _hp.VocabSize, _embDim);
+
+            return new ReadOnlySpan<float>(_logits, _hp.VocabSize);
+        }
+        finally
+        {
+            NativeMemory.Free(batchHidden);
+            NativeMemory.Free(batchResidual);
+        }
+    }
+
+    /// <summary>
     /// Run one token through the full transformer. Returns logits span.
     /// </summary>
     public ReadOnlySpan<float> Forward(int token, int position)
@@ -238,7 +336,9 @@ public sealed unsafe class ForwardPass : IDisposable
     //  Embedding lookup (single-row dequant)
     // ================================================================
 
-    private void EmbedToken(int token)
+    private void EmbedToken(int token) => EmbedTokenInto(token, _hidden);
+
+    private void EmbedTokenInto(int token, float* dest)
     {
         int bytesPerRow = (_embDim / DTypeInfo.BlockSize(_embTensor.DType))
                         * DTypeInfo.BytesPerBlock(_embTensor.DType);
@@ -246,11 +346,11 @@ public sealed unsafe class ForwardPass : IDisposable
         if (_embTensor.DType == DType.Float32)
         {
             new ReadOnlySpan<float>((float*)rowPtr, _embDim)
-                .CopyTo(new Span<float>(_hidden, _embDim));
+                .CopyTo(new Span<float>(dest, _embDim));
         }
         else
         {
-            SimdKernels.DequantRow(rowPtr, _hidden, _embDim, _embTensor.DType);
+            SimdKernels.DequantRow(rowPtr, dest, _embDim, _embTensor.DType);
         }
     }
 

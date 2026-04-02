@@ -71,18 +71,25 @@ public class InferenceBenchmark
     //  Prefill
     // ================================================================
 
-    [IterationSetup(Target = nameof(PrefillPrompt))]
+    [IterationSetup(Targets = new[] { nameof(PrefillSequential), nameof(PrefillBatched) })]
     public void PrefillIterSetup()
     {
         _fwd.Cache.Reset();
     }
 
-    [Benchmark(Description = "Prefill 10 tokens")]
-    public int PrefillPrompt()
+    [Benchmark(Description = "Prefill 10 sequential")]
+    public int PrefillSequential()
     {
         ReadOnlySpan<float> logits = default;
         for (int i = 0; i < _promptTokens.Count; i++)
             logits = _fwd.Forward(_promptTokens[i], i);
+        return Sampler.Greedy(logits);
+    }
+
+    [Benchmark(Description = "Prefill 10 batched")]
+    public int PrefillBatched()
+    {
+        var logits = _fwd.Prefill(_promptTokens);
         return Sampler.Greedy(logits);
     }
 

@@ -77,13 +77,11 @@ public sealed class DebugForwardPass
         var tokens = tokenizer.Encode(prompt);
         Console.WriteLine($"Prompt tokens ({tokens.Count}): {string.Join(", ", tokens)}");
 
-        // Prefill with timing
+        // Prefill with batched method (layer-by-layer, weights stay in L3)
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        ReadOnlySpan<float> logits = default;
-        for (int i = 0; i < tokens.Count; i++)
-            logits = fwd.Forward(tokens[i], i);
+        ReadOnlySpan<float> logits = fwd.Prefill(tokens);
         var prefillMs = sw.Elapsed.TotalMilliseconds;
-        Console.WriteLine($"Prefill: {tokens.Count} tokens in {prefillMs:F0}ms ({tokens.Count / (prefillMs / 1000):F1} t/s)");
+        Console.WriteLine($"Prefill (batched): {tokens.Count} tokens in {prefillMs:F0}ms ({tokens.Count / (prefillMs / 1000):F1} t/s)");
 
         // Generate 30 tokens with timing
         sw.Restart();
