@@ -293,13 +293,14 @@ internal static class Shaders
     internal const string Attention = """
         #version 450
         #extension GL_EXT_control_flow_attributes : enable
+        #extension GL_EXT_shader_atomic_float : enable
 
         layout(local_size_x = 256) in;
 
         layout(binding = 0) readonly buffer Q     { float q_data[]; };
         layout(binding = 1) readonly buffer KCache { float k_cache[]; };
         layout(binding = 2) readonly buffer VCache { float v_cache[]; };
-        layout(binding = 3) writeonly buffer Out   { float out_data[]; };
+        layout(binding = 3) buffer Out             { float out_data[]; };
 
         layout(push_constant) uniform Params {
             uint num_heads;
@@ -312,96 +313,58 @@ internal static class Shaders
         shared float sdata[256];
 
         void main() {
-            uint h = gl_WorkGroupID.x;      // query head index
+            uint h = gl_WorkGroupID.x;
             uint tid = gl_LocalInvocationID.x;
             if (h >= num_heads) return;
 
             uint kv_head = h / (num_heads / num_kv_heads);
             uint kv_dim = num_kv_heads * head_dim;
             float scale = inversesqrt(float(head_dim));
+            uint q_off = h * head_dim;
+            uint out_off = h * head_dim;
 
-            // Phase 1: compute attention scores Q·K^T / sqrt(d)
-            // Each thread computes scores for a subset of positions
-            // Store scores in shared memory (limited to 256 positions at a time)
-            // For simplicity, process seqLen <= 256 in one pass
+            // Zero output first (threads cooperate)
+            for (uint d = tid; d < head_dim; d += 256)
+                out_data[out_off + d] = 0.0;
+            barrier();
 
-            // First, compute all scores (tid maps to position t)
-            float score = -1.0/0.0; // -inf for positions beyond seqLen
+            // Phase 1: each thread computes score for position tid
+            float score = -1.0/0.0;
             if (tid < seq_len) {
                 float dot = 0.0;
-                uint q_off = h * head_dim;
                 uint k_off = tid * kv_dim + kv_head * head_dim;
                 for (uint d = 0; d < head_dim; d++)
                     dot += q_data[q_off + d] * k_cache[k_off + d];
                 score = dot * scale;
             }
+
+            // Phase 2: softmax — max reduction
             sdata[tid] = score;
             barrier();
-
-            // Phase 2: softmax over scores[0..seqLen)
-            // Find max
-            float local_max = sdata[tid];
-            barrier();
-            // Parallel reduction for max
-            for (uint s = 128; s > 0; s >>= 1) {
-                if (tid < s && tid + s < 256)
-                    sdata[tid] = max(sdata[tid], sdata[tid + s]);
+            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
                 barrier();
             }
             float max_val = sdata[0];
             barrier();
 
-            // Exp and sum
-            float exp_val = 0.0;
-            if (tid < seq_len) {
-                exp_val = exp(local_max * scale / scale - max_val); // using original score
-                // Recompute: we lost the original score during max reduction
-            }
-
-            // Actually, let's recompute the score since sdata was overwritten
-            if (tid < seq_len) {
-                float dot = 0.0;
-                uint q_off = h * head_dim;
-                uint k_off = tid * kv_dim + kv_head * head_dim;
-                for (uint d = 0; d < head_dim; d++)
-                    dot += q_data[q_off + d] * k_cache[k_off + d];
-                exp_val = exp(dot * scale - max_val);
-            }
+            // Exp + sum
+            float exp_val = (tid < seq_len) ? exp(score - max_val) : 0.0;
             sdata[tid] = exp_val;
             barrier();
-
-            // Sum reduction
-            for (uint s = 128; s > 0; s >>= 1) {
+            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
                 if (tid < s) sdata[tid] += sdata[tid + s];
                 barrier();
             }
-            float sum_val = sdata[0];
+            float weight = exp_val / sdata[0];
             barrier();
 
-            // Normalize
-            float weight = (tid < seq_len) ? exp_val / sum_val : 0.0;
-
-            // Phase 3: weighted sum of values
-            // Each thread holds weight for position tid
-            // Need to compute output[d] = sum_t(weight_t * V[t,d]) for d=0..headDim
-            // Use shared memory: for each d, accumulate weight * V[tid, d]
-            uint v_off = tid * kv_dim + kv_head * head_dim;
-            uint out_off = h * head_dim;
-
-            // Process headDim elements sequentially (headDim typically 64-128)
-            for (uint d = 0; d < head_dim; d++) {
-                float val = (tid < seq_len) ? weight * v_cache[v_off + d] : 0.0;
-                sdata[tid] = val;
-                barrier();
-
-                // Reduce
-                for (uint s = 128; s > 0; s >>= 1) {
-                    if (tid < s) sdata[tid] += sdata[tid + s];
-                    barrier();
-                }
-
-                if (tid == 0) out_data[out_off + d] = sdata[0];
-                barrier();
+            // Phase 3: weighted value sum — each thread atomically adds weight*V[tid]
+            // For short seqLen (decode), this is efficient: few threads, no contention
+            if (tid < seq_len) {
+                uint v_off = tid * kv_dim + kv_head * head_dim;
+                for (uint d = 0; d < head_dim; d++)
+                    atomicAdd(out_data[out_off + d], weight * v_cache[v_off + d]);
             }
         }
         """;
@@ -465,7 +428,6 @@ internal static class Shaders
     /// </summary>
     internal const string MatVecQ4K = """
         #version 450
-        #extension GL_EXT_shader_16bit_storage : enable
         #extension GL_EXT_control_flow_attributes : enable
 
         layout(local_size_x = 256) in;
@@ -481,18 +443,24 @@ internal static class Shaders
 
         shared float sdata[256];
 
-        // Read a byte from the weights buffer (packed as uint32)
         uint readByte(uint byteOffset) {
-            uint wordIdx = byteOffset >> 2;
-            uint byteIdx = byteOffset & 3;
-            return (weights_data[wordIdx] >> (byteIdx * 8)) & 0xFF;
+            return (weights_data[byteOffset >> 2] >> ((byteOffset & 3) * 8)) & 0xFF;
         }
 
-        // Read FP16 from two bytes, convert to float
         float readHalf(uint byteOffset) {
             uint lo = readByte(byteOffset);
             uint hi = readByte(byteOffset + 1);
             return unpackHalf2x16(lo | (hi << 8)).x;
+        }
+
+        void getScaleMin(uint scale_off, uint j, out float sc, out float m) {
+            if (j < 4) {
+                sc = float(readByte(scale_off + j) & 63);
+                m  = float(readByte(scale_off + j + 4) & 63);
+            } else {
+                sc = float((readByte(scale_off + j + 4) & 0xF) | ((readByte(scale_off + j - 4) >> 6) << 4));
+                m  = float((readByte(scale_off + j + 4) >> 4) | ((readByte(scale_off + j) >> 6) << 4));
+            }
         }
 
         void main() {
@@ -501,67 +469,35 @@ internal static class Shaders
             if (row >= rows) return;
 
             uint bytes_per_row = (cols / 256) * 144;
-            uint row_offset = row * bytes_per_row;
-            uint num_blocks = cols / 256;
+            uint boff_base = row * bytes_per_row;
 
             float acc = 0.0;
 
-            // Each thread processes a stride of elements across all blocks
-            for (uint block = 0; block < num_blocks; block++) {
-                uint boff = row_offset + block * 144;
+            // ALL 256 threads process elements with stride
+            // Each thread handles cols/256 elements total
+            for (uint elem = tid; elem < cols; elem += 256) {
+                uint block = elem >> 8;  // elem / 256
+                uint within = elem & 255; // elem % 256
+                uint chunk = within >> 6; // within / 64
+                uint sub = within & 63;   // within % 64
+                bool is_upper = sub >= 32;
+                uint byte_pos = sub & 31;
+
+                uint boff = boff_base + block * 144;
                 float d = readHalf(boff);
                 float dmin = readHalf(boff + 2);
 
-                uint elem_base = block * 256;
+                uint si = chunk * 2 + (is_upper ? 1u : 0u);
+                float sc, mn;
+                getScaleMin(boff + 4, si, sc, mn);
 
-                // Process 4 chunks of 64 elements per block
-                for (uint chunk = 0; chunk < 4; chunk++) {
-                    uint scale_off = boff + 4;
-                    uint qs_off = boff + 16 + chunk * 32;
-                    uint j = chunk * 2;
+                uint qbyte = readByte(boff + 16 + chunk * 32 + byte_pos);
+                uint nibble = is_upper ? (qbyte >> 4) : (qbyte & 0xF);
 
-                    // Decode 6-bit scales and mins
-                    float sc1, m1, sc2, m2;
-                    if (j < 4) {
-                        sc1 = float(readByte(scale_off + j) & 63);
-                        m1  = float(readByte(scale_off + j + 4) & 63);
-                        sc2 = float(readByte(scale_off + j + 1) & 63);
-                        m2  = float(readByte(scale_off + j + 5) & 63);
-                    } else {
-                        uint j4 = j - 4;
-                        sc1 = float((readByte(scale_off + j + 4) & 0xF) | ((readByte(scale_off + j4) >> 6) << 4));
-                        m1  = float((readByte(scale_off + j + 4) >> 4) | ((readByte(scale_off + j) >> 6) << 4));
-                        uint j41 = j - 3;
-                        sc2 = float((readByte(scale_off + j + 5) & 0xF) | ((readByte(scale_off + j41) >> 6) << 4));
-                        m2  = float((readByte(scale_off + j + 5) >> 4) | ((readByte(scale_off + j + 1) >> 6) << 4));
-                    }
-
-                    float d1 = d * sc1;
-                    float dm1 = dmin * m1;
-                    float d2 = d * sc2;
-                    float dm2 = dmin * m2;
-
-                    uint co = elem_base + chunk * 64;
-
-                    // Lower nibbles: elements [co .. co+31]
-                    for (uint l = tid & 31; l < 32; l += 32) {
-                        if (tid < 32 || (tid >= 32 && l + (tid/32)*32 < 32)) {
-                            // Simplified: each thread handles elements based on tid
-                        }
-                    }
-
-                    // Process elements assigned to this thread
-                    for (uint l = tid; l < 32; l += 256) {
-                        uint qbyte = readByte(qs_off + l);
-                        float lo_val = d1 * float(qbyte & 0xF) - dm1;
-                        float hi_val = d2 * float(qbyte >> 4) - dm2;
-                        acc += lo_val * input_data[co + l];
-                        acc += hi_val * input_data[co + 32 + l];
-                    }
-                }
+                acc += (d * sc * float(nibble) - dmin * mn) * input_data[elem];
             }
 
-            // Reduce across workgroup
+            // Parallel reduction
             sdata[tid] = acc;
             barrier();
 
