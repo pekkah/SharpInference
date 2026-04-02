@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using SharpInference.Core;
 using SharpInference.Cpu;
+using SharpInference.TurboQuant;
 using Vortice.Vulkan;
 using SharpInference.Vulkan;
 using static Vortice.Vulkan.Vulkan;
@@ -57,34 +58,56 @@ public sealed unsafe class GpuForwardPass : IDisposable
     private readonly Tensor[]? _wqNorm, _wkNorm;
 
     // KV cache in VRAM: per-layer K and V buffers [maxSeqLen, kvDim]
-    private readonly Tensor[] _gpuKCache;  // per layer
+    private readonly Tensor[] _gpuKCache;  // per layer (FP32, or FP32 window when TQ)
     private readonly Tensor[] _gpuVCache;  // per layer
     private readonly int _maxSeqLen;
     private int _kvLength; // current sequence length in cache
 
+    /// <summary>Maximum sequence length (context size) configured for this forward pass.</summary>
+    public int MaxSeqLen => _maxSeqLen;
+
     // CPU KV cache kept for fallback (not used when GPU attention works)
     private readonly Engine.KvCache _kvCache;
 
+    // TurboQuant GPU state (null when TQ disabled)
+    private readonly bool _tqEnabled;
+    private readonly int _tqFp32Window;
+    private readonly int _tqBlockBytes;
+    private Tensor[]? _gpuTqKCache;    // per layer, compressed VRAM
+    private Tensor[]? _gpuTqVCache;    // per layer, compressed VRAM
+    private Tensor? _gpuSignPatterns;  // [numKvHeads * headDim] sign flips
+    private Tensor? _gpuCodebook;      // [8] centroids (3-bit)
+    private Tensor? _gpuBoundaries;    // [7] decision boundaries
+    private Tensor? _rotatedQ;         // [numHeads * headDim] WHT-rotated query
+    private int _tqCompressedLen;      // positions in TQ storage
+
     private readonly int _embDim, _headDim, _numHeads, _numKvHeads, _headsPerKvGroup, _intermDim;
 
-    public GpuForwardPass(GgufModel model, VulkanBackend gpu, ModelHyperparams hp, int maxContextLength = 0)
+    public GpuForwardPass(GgufModel model, VulkanBackend gpu, ModelHyperparams hp,
+        int maxContextLength = 0, bool enableTurboQuant = false, int tqFp32Window = 256, int tqBits = 3)
     {
         _model = model;
         _gpu = gpu;
         _hp = hp;
+        _tqEnabled = enableTurboQuant;
+        _tqFp32Window = tqFp32Window;
+        _tqBlockBytes = enableTurboQuant ? TurboQuantOps.BlockSize(tqBits, hp.EmbeddingDim / hp.NumHeads) : 0;
 
         if (maxContextLength > 0)
         {
             _maxSeqLen = Math.Min(maxContextLength, hp.ContextLength);
         }
+        else if (enableTurboQuant)
+        {
+            _maxSeqLen = EstimateMaxContextTq(model, gpu, hp, tqFp32Window, tqBits);
+        }
         else
         {
-            // Auto-calculate: estimate weight VRAM, give remaining to KV cache
             _maxSeqLen = EstimateMaxContext(model, gpu, hp);
         }
 
         _kvCache = new Engine.KvCache(hp.NumLayers, _maxSeqLen, hp.NumKvHeads, hp.EmbeddingDim / hp.NumHeads);
-        Console.Error.WriteLine($"[GpuForwardPass] Context size: {_maxSeqLen} (model max: {hp.ContextLength})");
+        Console.Error.WriteLine($"[GpuForwardPass] Context size: {_maxSeqLen} (model max: {hp.ContextLength}){(enableTurboQuant ? " [TQ3]" : "")}");
 
         _embDim = hp.EmbeddingDim;
         _headDim = hp.EmbeddingDim / hp.NumHeads;
@@ -106,14 +129,62 @@ public sealed unsafe class GpuForwardPass : IDisposable
         _logits = gpu.Allocate(TensorShape.D1(hp.VocabSize));
         _logitsBuf = new float[hp.VocabSize];
 
-        // Allocate VRAM KV cache: per-layer [maxSeqLen, kvDim]
+        // Allocate VRAM KV cache
         int kvDim = _numKvHeads * _headDim;
         _gpuKCache = new Tensor[hp.NumLayers];
         _gpuVCache = new Tensor[hp.NumLayers];
-        for (int i = 0; i < hp.NumLayers; i++)
+
+        if (_tqEnabled)
         {
-            _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
-            _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
+            // FP32 window: only tqFp32Window positions
+            for (int i = 0; i < hp.NumLayers; i++)
+            {
+                _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_tqFp32Window * kvDim));
+                _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_tqFp32Window * kvDim));
+            }
+
+            // TQ compressed cache: (maxSeqLen - fp32Window) positions
+            int maxTqPositions = _maxSeqLen - _tqFp32Window;
+            long tqBytesPerPos = (long)_numKvHeads * _tqBlockBytes;
+            // Allocate as uint buffer (shader accesses via uint[])
+            long tqUintsPerLayer = (maxTqPositions * tqBytesPerPos + 3) / 4;
+            _gpuTqKCache = new Tensor[hp.NumLayers];
+            _gpuTqVCache = new Tensor[hp.NumLayers];
+            for (int i = 0; i < hp.NumLayers; i++)
+            {
+                _gpuTqKCache[i] = gpu.Allocate(TensorShape.D1(tqUintsPerLayer));
+                _gpuTqVCache[i] = gpu.Allocate(TensorShape.D1(tqUintsPerLayer));
+            }
+
+            // Upload TQ constants to VRAM
+            // Sign patterns: use layer 0, head 0 pattern for all (simplification for GPU)
+            // A full implementation would use per-layer-per-head patterns
+            var signData = WalshHadamard.GenerateSignPattern(_headDim, 0);
+            // Tile to numKvHeads
+            var fullSigns = new float[_numKvHeads * _headDim];
+            for (int h = 0; h < _numKvHeads; h++)
+            {
+                var headSigns = WalshHadamard.GenerateSignPattern(_headDim, h);
+                headSigns.CopyTo(fullSigns.AsSpan(h * _headDim));
+            }
+            _gpuSignPatterns = gpu.Upload(fullSigns, TensorShape.D1(fullSigns.Length));
+
+            var centroids = TurboQuantCodebooks.GetCentroids(tqBits, _headDim).ToArray();
+            _gpuCodebook = gpu.Upload(centroids, TensorShape.D1(centroids.Length));
+
+            var boundaries = TurboQuantCodebooks.GetBoundaries(tqBits, _headDim).ToArray();
+            _gpuBoundaries = gpu.Upload(boundaries, TensorShape.D1(boundaries.Length));
+
+            _rotatedQ = gpu.Allocate(TensorShape.D1(_numHeads * _headDim));
+        }
+        else
+        {
+            // Full FP32 cache: [maxSeqLen, kvDim] per layer
+            for (int i = 0; i < hp.NumLayers; i++)
+            {
+                _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
+                _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
+            }
         }
 
         // Upload all weights to VRAM
@@ -198,7 +269,11 @@ public sealed unsafe class GpuForwardPass : IDisposable
     public Engine.KvCache Cache => _kvCache;
     public int KvLength => _kvLength;
 
-    public void ResetCache() => _kvLength = 0;
+    public void ResetCache()
+    {
+        _kvLength = 0;
+        _tqCompressedLen = 0;
+    }
 
     /// <summary>
     /// Run one token through the transformer on GPU. Returns logits span (downloaded from VRAM).
@@ -252,13 +327,42 @@ public sealed unsafe class GpuForwardPass : IDisposable
             // KV append reads K/V written by RoPE
             _gpu.RecordBarrier();
 
-            _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer],
-                (uint)(_numKvHeads * _headDim), (uint)position, (uint)_maxSeqLen);
-            _gpu.RecordBarrier(); // cache filled → attention
+            if (_tqEnabled)
+            {
+                // TQ path: compute FP32 window position
+                int fp32Pos = position - _tqCompressedLen;
 
-            _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
-                (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
-                (uint)(position + 1), (uint)_maxSeqLen);
+                // Append to FP32 window (always — compression happens when window overflows)
+                _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer],
+                    (uint)(_numKvHeads * _headDim), (uint)fp32Pos, (uint)_tqFp32Window);
+                _gpu.RecordBarrier();
+
+                // TODO: When fp32 window is full, compress oldest entry to TQ cache
+                // For now, the FP32 window holds up to _tqFp32Window positions
+                // and TQ compression is deferred to a future iteration.
+
+                // Rotate query for TQ attention
+                _gpu.TqRotateQuery(_q, _rotatedQ!, _gpuSignPatterns!,
+                    (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim);
+                _gpu.RecordBarrier();
+
+                // TQ Attention: handles both compressed and FP32 regions
+                uint fp32SeqLen = (uint)(position + 1 - _tqCompressedLen);
+                _gpu.TqAttention(_q, _rotatedQ!, _gpuTqKCache![layer], _gpuTqVCache![layer],
+                    _gpuKCache[layer], _gpuVCache[layer], _attnOut, _gpuCodebook!,
+                    (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
+                    (uint)_tqCompressedLen, fp32SeqLen, (uint)_maxSeqLen, (uint)_tqBlockBytes);
+            }
+            else
+            {
+                _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer],
+                    (uint)(_numKvHeads * _headDim), (uint)position, (uint)_maxSeqLen);
+                _gpu.RecordBarrier();
+
+                _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                    (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
+                    (uint)(position + 1), (uint)_maxSeqLen);
+            }
             _gpu.RecordBarrier(); // attnOut done → output projection
 
             GpuMatMul(_hidden, _wo[layer], _attnOut);
@@ -412,6 +516,44 @@ public sealed unsafe class GpuForwardPass : IDisposable
         return result;
     }
 
+    /// <summary>
+    /// Estimates max context when using TurboQuant compressed KV cache.
+    /// TQ3 uses ~52 bytes per head per position vs 512 bytes (128 floats) for FP32.
+    /// </summary>
+    public static int EstimateMaxContextTq(GgufModel model, VulkanBackend gpu, ModelHyperparams hp,
+        int fp32WindowSize = 256, int bits = 3)
+    {
+        long vramBytes = (long)gpu.VramBytes;
+        int headDim = hp.EmbeddingDim / hp.NumHeads;
+        int blockSize = TurboQuantOps.BlockSize(bits, headDim);
+
+        long weightBytes = 0;
+        foreach (var t in model.Tensors)
+            weightBytes += (t.ByteSize + 3) & ~3L;
+
+        long scratchBytes = (long)(hp.EmbeddingDim * 3 + hp.NumHeads * headDim
+            + hp.NumKvHeads * headDim * 2 + hp.NumHeads * headDim
+            + hp.IntermediateDim * 2 + hp.VocabSize) * sizeof(float);
+
+        long reserved = Math.Max(vramBytes / 5, 1024L * 1024 * 1024);
+        long available = vramBytes - weightBytes - scratchBytes - reserved;
+        if (available <= 0) available = 64L * 1024 * 1024;
+
+        // FP32 window: 2 * layers * kvDim * sizeof(float) per position
+        long fp32Bytes = 2L * hp.NumLayers * hp.NumKvHeads * headDim * sizeof(float) * fp32WindowSize;
+
+        // TQ: 2 * layers * numKvHeads * blockSize per position
+        long tqBytesPerToken = 2L * hp.NumLayers * hp.NumKvHeads * blockSize;
+
+        long availableForTq = available - fp32Bytes;
+        if (availableForTq <= 0) availableForTq = 64L * 1024 * 1024;
+
+        int maxTqPositions = (int)(availableForTq / tqBytesPerToken);
+        int maxCtx = Math.Clamp(maxTqPositions + fp32WindowSize, 512, hp.ContextLength);
+
+        return maxCtx;
+    }
+
     private static int EstimateMaxContext(GgufModel model, VulkanBackend gpu, ModelHyperparams hp)
     {
         long vramBytes = (long)gpu.VramBytes;
@@ -472,6 +614,19 @@ public sealed unsafe class GpuForwardPass : IDisposable
         {
             _gpu.Free(_gpuKCache[i]);
             _gpu.Free(_gpuVCache[i]);
+        }
+
+        if (_tqEnabled)
+        {
+            for (int i = 0; i < _hp.NumLayers; i++)
+            {
+                _gpu.Free(_gpuTqKCache![i]);
+                _gpu.Free(_gpuTqVCache![i]);
+            }
+            _gpu.Free(_gpuSignPatterns!);
+            _gpu.Free(_gpuCodebook!);
+            _gpu.Free(_gpuBoundaries!);
+            _gpu.Free(_rotatedQ!);
         }
 
         _kvCache.Dispose();

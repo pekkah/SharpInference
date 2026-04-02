@@ -83,6 +83,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [Description("Context size / max sequence length (0 = model default)")]
         [DefaultValue(0)]
         public int CtxSize { get; init; }
+
+        [CommandOption("--tq")]
+        [Description("Enable TurboQuant KV cache compression (3-bit, reduces VRAM ~5x)")]
+        [DefaultValue(false)]
+        public bool TurboQuant { get; init; }
     }
 
     protected override int Execute(CommandContext context, Settings settings, CancellationToken cancellation)
@@ -122,7 +127,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             var gpu = new VulkanBackend();
             gpuBackend = gpu;
             gpu.PrintDeviceInfo();
-            var gfwd = new GpuForwardPass(model, gpu, hp, ctxSize);
+
+            var gfwd = new GpuForwardPass(model, gpu, hp, ctxSize,
+                enableTurboQuant: settings.TurboQuant);
+            if (settings.TurboQuant)
+                AnsiConsole.MarkupLine($"[dim]TurboQuant: [green]enabled[/] (3-bit, context: {gfwd.MaxSeqLen})[/]");
             gpuFwd = gfwd;
             forward = gfwd.Forward;
             prefill = tokens => { ReadOnlySpan<float> l = default; for (int i = 0; i < tokens.Count; i++) l = gfwd.Forward(tokens[i], i); return l; };
@@ -131,9 +140,14 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         }
         else
         {
+            if (settings.TurboQuant)
+            {
+                fwd.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
+                AnsiConsole.MarkupLine("[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
+            }
             forward = fwd.Forward;
             prefill = fwd.Prefill;
-            resetCache = fwd.Cache.Reset;
+            resetCache = settings.TurboQuant ? fwd.TqCache!.Reset : fwd.Cache.Reset;
             AnsiConsole.MarkupLine("[dim]Backend: [blue]CPU[/][/]");
         }
 

@@ -411,6 +411,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private ComputePipeline? _attentionPipeline;
     private ComputePipeline? _embedLookupPipeline;
     private ComputePipeline? _embedLookupQ4KPipeline;
+    private ComputePipeline? _tqRotateQueryPipeline;
+    private ComputePipeline? _tqKvAppendPipeline;
+    private ComputePipeline? _tqAttentionPipeline;
 
     private struct RmsNormParams { public uint n; public float eps; }
     private struct HeadNormParams { public uint headDim; public uint numHeads; public float eps; }
@@ -420,6 +423,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private struct EmbedParams { public uint tokenId; public uint embDim; }
     private struct KvAppendParams { public uint kvDim; public uint position; public uint maxSeqLen; }
     private struct AttentionParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint seqLen; public uint maxSeqLen; }
+    private struct TqRotateQueryParams { public uint numHeads; public uint numKvHeads; public uint headDim; }
+    private struct TqKvAppendParams { public uint kvDim; public uint headDim; public uint position; public uint maxSeqLen; public uint numKvHeads; public uint blockBytes; }
+    private struct TqAttentionParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint tqSeqLen; public uint fp16SeqLen; public uint maxSeqLen; public uint blockBytes; }
 
     private void DispatchOrRecord(ComputePipeline pipe, ReadOnlySpan<GpuBuffer> buffers,
         uint groupX, void* push, uint groupY = 1, uint groupZ = 1)
@@ -551,6 +557,53 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         };
         DispatchOrRecord(_attentionPipeline,
             [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(output)],
+            numHeads, &p);
+    }
+
+    // ================================================================
+    //  TurboQuant KV Cache Operations
+    // ================================================================
+
+    public void TqRotateQuery(Tensor qInput, Tensor rotatedQ, Tensor signPatterns,
+        uint numHeads, uint numKvHeads, uint headDim)
+    {
+        _tqRotateQueryPipeline ??= new ComputePipeline(this, Shaders.TqRotateQuery, 3, pushConstantSize: sizeof(TqRotateQueryParams));
+        var p = new TqRotateQueryParams { numHeads = numHeads, numKvHeads = numKvHeads, headDim = headDim };
+        DispatchOrRecord(_tqRotateQueryPipeline,
+            [GetBuffer(qInput), GetBuffer(rotatedQ), GetBuffer(signPatterns)],
+            numHeads, &p);
+    }
+
+    public void TqKvAppend(Tensor kInput, Tensor vInput, Tensor kCacheTq, Tensor vCacheTq,
+        Tensor signPatterns, Tensor codebook, Tensor boundaries,
+        uint kvDim, uint headDim, uint position, uint maxSeqLen, uint numKvHeads, uint blockBytes)
+    {
+        _tqKvAppendPipeline ??= new ComputePipeline(this, Shaders.TqKvAppend, 7, pushConstantSize: sizeof(TqKvAppendParams));
+        var p = new TqKvAppendParams
+        {
+            kvDim = kvDim, headDim = headDim, position = position,
+            maxSeqLen = maxSeqLen, numKvHeads = numKvHeads, blockBytes = blockBytes
+        };
+        DispatchOrRecord(_tqKvAppendPipeline,
+            [GetBuffer(kInput), GetBuffer(vInput), GetBuffer(kCacheTq), GetBuffer(vCacheTq),
+             GetBuffer(signPatterns), GetBuffer(codebook), GetBuffer(boundaries)],
+            numKvHeads, &p);
+    }
+
+    public void TqAttention(Tensor q, Tensor rotatedQ, Tensor kCacheTq, Tensor vCacheTq,
+        Tensor kCacheFp16, Tensor vCacheFp16, Tensor output, Tensor codebook,
+        uint numHeads, uint numKvHeads, uint headDim,
+        uint tqSeqLen, uint fp16SeqLen, uint maxSeqLen, uint blockBytes)
+    {
+        _tqAttentionPipeline ??= new ComputePipeline(this, Shaders.TqAttention, 8, pushConstantSize: sizeof(TqAttentionParams));
+        var p = new TqAttentionParams
+        {
+            numHeads = numHeads, numKvHeads = numKvHeads, headDim = headDim,
+            tqSeqLen = tqSeqLen, fp16SeqLen = fp16SeqLen, maxSeqLen = maxSeqLen, blockBytes = blockBytes
+        };
+        DispatchOrRecord(_tqAttentionPipeline,
+            [GetBuffer(q), GetBuffer(rotatedQ), GetBuffer(kCacheTq), GetBuffer(vCacheTq),
+             GetBuffer(kCacheFp16), GetBuffer(vCacheFp16), GetBuffer(output), GetBuffer(codebook)],
             numHeads, &p);
     }
 

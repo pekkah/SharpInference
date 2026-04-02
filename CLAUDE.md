@@ -11,7 +11,7 @@ SharpInference is a high-performance LLM inference engine in C# 14 / .NET 10. It
 ```bash
 dotnet build                # Debug build
 dotnet build -c Release     # Release (NativeAOT opts: IlcOptimizationPreference=Speed)
-dotnet test                 # Run all tests (85 tests across 5 projects)
+dotnet test                 # Run all tests (114 tests across 5 projects)
 dotnet test --filter "FullyQualifiedName~SomeTest"  # Run a single test
 
 # Run CLI inference

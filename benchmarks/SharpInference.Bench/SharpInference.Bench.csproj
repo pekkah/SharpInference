@@ -14,6 +14,8 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\SharpInference.Engine\SharpInference.Engine.csproj" />
     <ProjectReference Include="..\..\src\SharpInference.Cpu\SharpInference.Cpu.csproj" />
+    <ProjectReference Include="..\..\src\SharpInference.TurboQuant\SharpInference.TurboQuant.csproj" />
+    <ProjectReference Include="..\..\src\SharpInference.Vulkan\SharpInference.Vulkan.csproj" />
   </ItemGroup>
 
 </Project>

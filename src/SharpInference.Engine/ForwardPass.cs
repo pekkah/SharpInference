@@ -4,6 +4,7 @@ using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using SharpInference.Core;
 using SharpInference.Cpu;
+using SharpInference.TurboQuant;
 
 namespace SharpInference.Engine;
 
@@ -56,6 +57,11 @@ public sealed unsafe class ForwardPass : IDisposable
     // Optional per-head Q/K RMSNorm (Qwen3)
     private readonly bool _hasQkNorm;
     private readonly float*[] _qNorm, _kNorm;
+
+    // Optional TurboQuant KV cache (Phase 3)
+    private TurboQuantKvCache? _tqKvCache;
+    private float* _rotatedQuery;  // scratch for WHT-rotated query [headDim]
+    private float* _decompBuf;     // scratch for decompressed TQ value [headDim]
 
     public ForwardPass(GgufModel model, IComputeBackend backend, ModelHyperparams hp)
     {
@@ -134,6 +140,20 @@ public sealed unsafe class ForwardPass : IDisposable
     }
 
     public KvCache Cache => _kvCache;
+
+    /// <summary>
+    /// Enables TurboQuant KV cache compression. Must be called before any forward pass.
+    /// </summary>
+    public void EnableTurboQuant(int fp32WindowSize = 256, int bits = 3)
+    {
+        _tqKvCache = new TurboQuantKvCache(
+            _hp.NumLayers, _hp.ContextLength, _numKvHeads, _headDim, fp32WindowSize, bits);
+        _rotatedQuery = Alloc(_headDim);
+        _decompBuf = Alloc(_headDim);
+    }
+
+    /// <summary>The TurboQuant KV cache, if enabled.</summary>
+    public TurboQuantKvCache? TqCache => _tqKvCache;
 
     /// <summary>
     /// Prefill: process all prompt tokens layer-by-layer.
@@ -361,12 +381,24 @@ public sealed unsafe class ForwardPass : IDisposable
             SimdKernels.ApplyRoPE(_k, position, _numKvHeads, _headDim, _hp.RopeTheta);
 
             // Store K, V in cache
-            _kvCache.Append(layer,
-                new ReadOnlySpan<float>(_k, _numKvHeads * _headDim),
-                new ReadOnlySpan<float>(_v, _numKvHeads * _headDim));
+            if (_tqKvCache != null)
+            {
+                _tqKvCache.Append(layer,
+                    new ReadOnlySpan<float>(_k, _numKvHeads * _headDim),
+                    new ReadOnlySpan<float>(_v, _numKvHeads * _headDim));
+            }
+            else
+            {
+                _kvCache.Append(layer,
+                    new ReadOnlySpan<float>(_k, _numKvHeads * _headDim),
+                    new ReadOnlySpan<float>(_v, _numKvHeads * _headDim));
+            }
 
             // Attention
-            Attention(layer, position);
+            if (_tqKvCache != null)
+                TqAttention(layer, position);
+            else
+                Attention(layer, position);
 
             // Output projection
             FusedMatVec(_hidden, _wo[layer], _attnOut, _embDim, _numHeads * _headDim);
@@ -397,7 +429,10 @@ public sealed unsafe class ForwardPass : IDisposable
         }
 
         // Increment KV cache position
-        _kvCache.IncrementPosition();
+        if (_tqKvCache != null)
+            _tqKvCache.IncrementPosition();
+        else
+            _kvCache.IncrementPosition();
 
         // 3. Final RMS norm
         var outNormW = GetNormWeight(_outputNorm);
@@ -440,6 +475,93 @@ public sealed unsafe class ForwardPass : IDisposable
             for (int t = 0; t < seqLen; t++)
             {
                 float* vVec = _kvCache.ValueAt(layer, t) + kvHead * _headDim;
+                float w = _attnScores[t];
+                if (Fma.IsSupported && _headDim >= 8)
+                {
+                    var wv = Vector256.Create(w);
+                    int d = 0;
+                    for (; d + 8 <= _headDim; d += 8)
+                    {
+                        var o = Avx.LoadVector256(outHead + d);
+                        var v = Avx.LoadVector256(vVec + d);
+                        Avx.Store(outHead + d, Fma.MultiplyAdd(wv, v, o));
+                    }
+                    for (; d < _headDim; d++)
+                        outHead[d] += w * vVec[d];
+                }
+                else
+                {
+                    for (int d = 0; d < _headDim; d++)
+                        outHead[d] += w * vVec[d];
+                }
+            }
+        }
+    }
+
+    // ================================================================
+    //  TurboQuant Attention
+    // ================================================================
+
+    private void TqAttention(int layer, int position)
+    {
+        var tq = _tqKvCache!;
+        int seqLen = position + 1;
+        int tqLen = tq.TqLength;
+        int fp32Start = tqLen;
+        float scale = 1.0f / MathF.Sqrt(_headDim);
+
+        for (int h = 0; h < _numHeads; h++)
+        {
+            int kvHead = h / _headsPerKvGroup;
+            float* qHead = _q + h * _headDim;
+            float* outHead = _attnOut + h * _headDim;
+
+            // Rotate query once per head for TQ dot products
+            var keyCompressor = tq.GetKeyCompressor(layer, kvHead);
+            keyCompressor.RotateQuery(
+                new ReadOnlySpan<float>(qHead, _headDim),
+                new Span<float>(_rotatedQuery, _headDim));
+
+            // Phase 1a: TQ-compressed positions (fused dequant-dot)
+            for (int t = 0; t < tqLen; t++)
+            {
+                byte* tqKey = tq.TqKeyAt(layer, t, kvHead);
+                float dot = TurboQuantOps.DequantDot3Avx2(
+                    tqKey, _rotatedQuery, (float*)Unsafe.AsPointer(ref MemoryMarshal.GetReference(keyCompressor.Centroids)), _headDim);
+                _attnScores[t] = dot * scale;
+            }
+
+            // Phase 1b: FP32 window positions (standard dot product)
+            for (int t = fp32Start; t < seqLen; t++)
+            {
+                float* kVec = tq.Fp32KeyAt(layer, t) + kvHead * _headDim;
+                _attnScores[t] = SimdKernels.DotF32(qHead, kVec, _headDim) * scale;
+            }
+
+            // Phase 2: Softmax over all positions
+            SimdKernels.SoftmaxInPlace(_attnScores, seqLen);
+
+            // Phase 3: Weighted value sum
+            for (int d = 0; d < _headDim; d++) outHead[d] = 0;
+
+            // TQ values: decompress and accumulate
+            var valCompressor = tq.GetValueCompressor(layer, kvHead);
+
+            for (int t = 0; t < tqLen; t++)
+            {
+                byte* tqVal = tq.TqValueAt(layer, t, kvHead);
+                var decompSpan = new Span<float>(_decompBuf, _headDim);
+                valCompressor.Decompress(
+                    new ReadOnlySpan<byte>(tqVal, tq.TqBlockSize), decompSpan);
+                float w = _attnScores[t];
+                for (int d = 0; d < _headDim; d++)
+                    outHead[d] += w * _decompBuf[d];
+            }
+
+            // FP32 values: standard weighted sum
+            for (int t = fp32Start; t < seqLen; t++)
+            {
+                float* vVec = tq.Fp32ValueAt(layer, t) + kvHead * _headDim;
                 float w = _attnScores[t];
                 if (Fma.IsSupported && _headDim >= 8)
                 {
