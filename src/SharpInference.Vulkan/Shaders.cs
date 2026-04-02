@@ -691,10 +691,10 @@ internal static class Shaders
         #extension GL_EXT_control_flow_attributes : enable
         #extension GL_KHR_shader_subgroup_arithmetic : enable
 
-        // 4 rows per workgroup, 64 threads per row = 256 threads.
-        // unpackHalf2x16 for d/dmin, shared memory reduction per row.
-        #define N_ROWS 4
-        #define THREADS_PER_ROW 64
+        // 8 rows per workgroup, 32 threads per row = 256 threads.
+        // subgroupAdd for reduction (32 threads = 1 subgroup = no barrier).
+        #define N_ROWS 8
+        #define THREADS_PER_ROW 32
 
         layout(local_size_x = 256) in;
 
@@ -707,7 +707,7 @@ internal static class Shaders
             uint cols;
         };
 
-        shared float sdata[256];
+        shared float sdata[8];  // N_ROWS * 2 subgroup leaders
 
         uint gReadByte(uint word_base, uint byteOffset) {
             return (weights_data[word_base + (byteOffset >> 2)] >> ((byteOffset & 3) * 8)) & 0xFF;
@@ -743,9 +743,9 @@ internal static class Shaders
                 float d = dm.x;
                 float dmin = dm.y;
 
-                // Each thread handles 4 elements: lane, lane+64, lane+128, lane+192
-                [[unroll]] for (uint e = 0; e < 4; e++) {
-                    uint elem_idx = lane + e * 64;
+                // Each of 32 threads handles 8 elements: lane, lane+32, lane+64, ...
+                [[unroll]] for (uint e = 0; e < 8; e++) {
+                    uint elem_idx = lane + e * 32;
                     uint chunk = elem_idx >> 6;
                     uint sub = elem_idx & 63;
                     bool is_upper = sub >= 32;
@@ -763,15 +763,10 @@ internal static class Shaders
                 }
             }
 
-            // Reduction: 64 threads per row
-            sdata[tid] = acc;
-            barrier();
-            uint base_idx = row_in_wg * THREADS_PER_ROW;
-            [[unroll]] for (uint s = 32; s > 0; s >>= 1) {
-                if (lane < s) sdata[base_idx + lane] += sdata[base_idx + lane + s];
-                barrier();
-            }
-            if (lane == 0) output_data[row] = sdata[base_idx];
+            // 32 threads/row = exactly 1 subgroup: subgroupAdd gives final result, no barrier
+            float result = subgroupAdd(acc);
+            if (subgroupElect())
+                output_data[row] = result;
         }
         """;
 

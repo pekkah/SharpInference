@@ -562,9 +562,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
                 _matVecQ6KPipeline ??= new ComputePipeline(this, Shaders.MatVecQ6K, 3, pushConstantSize: sizeof(MatVecParams));
                 DispatchOrRecord(_matVecQ6KPipeline, bufs, totalRows, &p);
                 break;
-            default: // Q4_K and others — N_ROWS=4 per workgroup
+            default: // Q4_K and others — N_ROWS=8 per workgroup
                 _matVecQ4KPipeline ??= new ComputePipeline(this, Shaders.MatVecQ4K, 3, pushConstantSize: sizeof(MatVecParams));
-                DispatchOrRecord(_matVecQ4KPipeline, bufs, (totalRows + 3) / 4, &p);
+                DispatchOrRecord(_matVecQ4KPipeline, bufs, (totalRows + 7) / 8, &p);
                 break;
         }
     }
