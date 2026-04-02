@@ -308,6 +308,38 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
             buf.Dispose();
     }
 
+    /// <summary>
+    /// Allocate a pinned host-visible buffer accessible from both CPU and GPU.
+    /// The buffer can be mapped for CPU read/write and used as a GPU storage buffer.
+    /// Ideal for small, frequently-transferred data like hidden states.
+    /// </summary>
+    public Tensor AllocatePinned(TensorShape shape, DType dtype = DType.Float32)
+    {
+        ulong byteSize = (ulong)(shape.ElementCount * DTypeInfo.BytesPerElement(dtype));
+        var gpuBuf = GpuBuffer.CreatePinned(this, byteSize, VkBufferUsageFlags.StorageBuffer);
+
+        var handle = _nextHandle++;
+        _buffers[handle] = gpuBuf;
+        return new Tensor(shape, dtype, handle);
+    }
+
+    /// <summary>
+    /// Map a pinned tensor for CPU access. Returns a float pointer.
+    /// Only valid for tensors created with AllocatePinned.
+    /// </summary>
+    public unsafe float* MapPinned(Tensor tensor)
+    {
+        var buf = GetBuffer(tensor);
+        return (float*)buf.Map();
+    }
+
+    /// <summary>Unmap a previously mapped pinned tensor.</summary>
+    public void UnmapPinned(Tensor tensor)
+    {
+        var buf = GetBuffer(tensor);
+        buf.Unmap();
+    }
+
     // Cached staging buffer for uploads (avoids per-call alloc/free)
     private GpuBuffer? _uploadStaging;
     private ulong _uploadStagingSize;

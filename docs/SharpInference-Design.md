@@ -1479,16 +1479,24 @@ DequantDot micro: 87 ns (3-bit scalar), 69 ns (4-bit scalar). Zero managed alloc
 
 **Target model:** Qwen3 8B with 64K context
 
-### Phase 4: Hybrid GPU/CPU Offloading (Weeks 11–14)
+### Phase 4a: Hybrid GPU/CPU Offloading ✅
 
-**Goal:** Run dense models larger than VRAM.
+**Goal:** Run dense models larger than VRAM with auto-adaptive layer placement.
 
-- [ ] Tier placement planner (auto-assign tensors to VRAM / RAM / NVMe)
-- [ ] Pinned memory pool (`cuMemAllocHost` or Vulkan host-visible)
-- [ ] Double-buffered layer streaming (DMA overlapped with compute)
-- [ ] CPU backend with AVX2/AVX-512 SIMD matmul for overflow layers
-- [ ] `io_uring` interop for async NVMe reads (Linux)
+- [x] HardwareProfile: auto-detect VRAM, RAM, CPU cores, PCIe bandwidth, AVX-512
+- [x] TierPlanner: greedy layer placement (embedding+output always GPU, layers packed until VRAM full)
+- [x] Pinned host memory (`VkMemoryPropertyFlags.HostVisible | HostCoherent`, BAR fallback)
+- [x] HybridForwardPass: GPU layers + CPU layers + hidden state transfer via pinned buffer
+- [x] CLI `-g N` three-way dispatch: CPU-only / all-GPU / hybrid, `-g -1` auto-detect
+- [x] Q5_K dequantization support (scalar fallback for Llama 3.1 70B mixed quantization)
+- [x] BpeTokenizer fallback for Llama 3.1 tokenizer compatibility
+- [ ] Double-buffered layer streaming (DMA overlapped with compute) — Phase 4b
+- [ ] `io_uring` interop for async NVMe reads (Linux) — deferred
 - [ ] Profiling: measure PCIe utilization, GPU stall time
+
+**Results:** Llama 3.1 70B Q4_K_M on RTX 4070 Ti 12GB + 64GB RAM:
+Auto-detect: 18 GPU layers + 62 CPU layers, 3K context.
+Decode: 1.0 t/s hybrid (vs 0.9 t/s CPU-only). 114 tests passing.
 
 **Target model:** Llama 3.1 70B at Q4_K_M
 
@@ -1609,7 +1617,7 @@ Based on the reference benchmarks above, these are concrete targets per phase:
 | 2 | SmolLM2 1.7B Q4_K_M | Full VRAM, RTX 4070 Ti | ~40–52 TG t/s | ≥ 35 TG t/s (≥80%) | **88.7 TG t/s** ✅ | Vulkan compute shaders, 253% of target |
 | 2b | Qwen3 8B Q4_K_M | Full VRAM, RTX 4070 Ti | ~38–52 TG t/s (8B class) | Scale gracefully | **23.5 TG t/s** ✅ | GPU 23.5, CPU 13.0. QK-norm, quantized embedding, auto VRAM ctx |
 | 3 | Qwen3 8B Q4_K_M + TQ3 | Full VRAM, RTX 4070 Ti | N/A (doesn't fit with FP16 KV) | ≥ 30 TG t/s | **GPU 24.0 t/s at 40K ctx** ✅ | CPU 12.7, GPU 24.0. TQ3 < 0.5% overhead, context 17K→40K (2.4x) |
-| 4 | Llama 3.1 70B Q4_K_M | Hybrid GPU+CPU | ~3–5 TG t/s (naive offload) | ≥ 5 TG t/s | Pipelined streaming should match or beat naive split |
+| 4a | Llama 3.1 70B Q4_K_M | Hybrid GPU+CPU, RTX 4070 Ti | ~3–5 TG t/s (naive offload) | ≥ 5 TG t/s | **1.0 t/s (18 GPU + 62 CPU layers)** | Auto-detect, pinned transfer. PCIe-bound. Phase 4b streaming needed |
 | 5 | Qwen3 30B-A3B Q4_K_M | MoE offload, 12GB + 64GB RAM | ~12 TG t/s (estimated) | ≥ 15 TG t/s | Prefetch + expert cache should beat naive offload |
 | 5+6 | Qwen3 30B-A3B + speculative | MoE + SmolLM2 draft | ~12 TG t/s (no spec) | ≥ 25 effective TG t/s | ~2x from speculative decoding on top of Phase 5 |
 

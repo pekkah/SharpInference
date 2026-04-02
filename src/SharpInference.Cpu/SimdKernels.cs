@@ -125,7 +125,40 @@ public static unsafe class SimdKernels
                 MatVecQ6K(output, weights, input, rows, cols);
                 break;
             default:
-                throw new NotSupportedException($"Fused MatVec not implemented for {dtype}");
+                // Fallback: dequantize entire weight matrix to F32, then F32 MatVec.
+                // Slow but correct for unsupported quantization types (e.g. Q5_K).
+                MatVecDequantFallback(output, weights, input, rows, cols, dtype);
+                break;
+        }
+    }
+
+    private static void MatVecDequantFallback(float* output, byte* weights, float* input,
+        int rows, int cols, DType dtype)
+    {
+        int blockSize = DTypeInfo.BlockSize(dtype);
+        int bytesPerBlock = DTypeInfo.BytesPerBlock(dtype);
+        int blocksPerRow = cols / blockSize;
+        int bytesPerRow = blocksPerRow * bytesPerBlock;
+
+        // Dequantize one row at a time to avoid allocating the full weight matrix
+        float* rowBuf = (float*)NativeMemory.Alloc((nuint)(cols * sizeof(float)));
+        try
+        {
+            for (int r = 0; r < rows; r++)
+            {
+                byte* rowPtr = weights + (long)r * bytesPerRow;
+                Dequantize.ToFloat32(new ReadOnlySpan<byte>(rowPtr, bytesPerRow),
+                    new Span<float>(rowBuf, cols), dtype, cols);
+
+                float sum = 0f;
+                for (int c = 0; c < cols; c++)
+                    sum += rowBuf[c] * input[c];
+                output[r] = sum;
+            }
+        }
+        finally
+        {
+            NativeMemory.Free(rowBuf);
         }
     }
 

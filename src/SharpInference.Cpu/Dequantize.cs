@@ -25,6 +25,9 @@ public static class Dequantize
             case DType.Q6_K:
                 DequantQ6K(src, dst, elementCount);
                 break;
+            case DType.Q5_K:
+                DequantQ5K(src, dst, elementCount);
+                break;
             default:
                 throw new NotSupportedException($"Dequantization not implemented for {dtype}");
         }
@@ -147,6 +150,66 @@ public static class Dequantize
                 qlOff += 64;
                 qhOff += 32;
                 scBase += 8;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Q5_K dequantization. Block size = 256, type size = 176 bytes.
+    /// Layout per block (block_q5_K in ggml):
+    ///   - 2 bytes: FP16 d (super-block scale)
+    ///   - 2 bytes: FP16 dmin (super-block min)
+    ///   - 12 bytes: packed 6-bit scales and mins (same as Q4_K)
+    ///   - 32 bytes: qh — high bits (one bit per element, packed)
+    ///   - 128 bytes: ql — lower 4 bits (two elements per byte)
+    ///
+    /// Reference: dequantize_row_q5_K in ggml-quants.c
+    /// </summary>
+    private static void DequantQ5K(ReadOnlySpan<byte> src, Span<float> dst, long elementCount)
+    {
+        const int QK_K = 256;
+        const int bytesPerBlock = 176;
+        long numBlocks = elementCount / QK_K;
+
+        for (long block = 0; block < numBlocks; block++)
+        {
+            var x = src.Slice((int)(block * bytesPerBlock), bytesPerBlock);
+            var y = dst.Slice((int)(block * QK_K), QK_K);
+
+            float d = HalfToFloat(x[0], x[1]);
+            float dmin = HalfToFloat(x[2], x[3]);
+
+            var scales = x.Slice(4, 12);  // K_SCALE_SIZE = 12
+            var qh = x.Slice(16, 32);     // high bits: 256 bits = 32 bytes
+            var ql = x.Slice(48, 128);    // QK_K/2 = 128
+
+            int qIdx = 0;
+            int scaleIdx = 0;
+
+            // qh: 256 bits packed into 32 bytes. Bit i corresponds to element i.
+            // For element e: high bit = (qh[e/8] >> (e%8)) & 1
+            for (int j = 0; j < QK_K; j += 64)
+            {
+                GetScaleMinK4(scaleIdx, scales, out byte sc1, out byte m1);
+                float d1 = d * sc1;
+                float dm1 = dmin * m1;
+                GetScaleMinK4(scaleIdx + 1, scales, out byte sc2, out byte m2);
+                float d2 = d * sc2;
+                float dm2 = dmin * m2;
+
+                for (int l = 0; l < 32; l++)
+                {
+                    int eLo = j + l;
+                    int eHi = j + l + 32;
+                    int hLo = (qh[eLo >> 3] >> (eLo & 7)) & 1;
+                    int hHi = (qh[eHi >> 3] >> (eHi & 7)) & 1;
+                    int q5Lo = (ql[qIdx + l] & 0xF) | (hLo << 4);
+                    int q5Hi = (ql[qIdx + l] >> 4) | (hHi << 4);
+                    y[j + l] = d1 * q5Lo - dm1;
+                    y[j + l + 32] = d2 * q5Hi - dm2;
+                }
+                qIdx += 32;
+                scaleIdx += 2;
             }
         }
     }

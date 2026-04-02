@@ -10,7 +10,7 @@ namespace SharpInference.Core;
 /// </summary>
 public sealed class GgufTokenizer : ITokenizer
 {
-    private readonly CodeGenTokenizer _inner;
+    private readonly Tokenizer _inner;
     private readonly Dictionary<string, int> _specialTokens;
 
     public int VocabSize { get; }
@@ -21,7 +21,7 @@ public sealed class GgufTokenizer : ITokenizer
     public bool AddBosToken { get; }
 
     private GgufTokenizer(
-        CodeGenTokenizer inner,
+        Tokenizer inner,
         Dictionary<string, int> specialTokens,
         int vocabSize,
         int bosTokenId,
@@ -95,10 +95,17 @@ public sealed class GgufTokenizer : ITokenizer
         }
         mergesStream.Position = 0;
 
-        // Get token strings for special tokens
-        string? unknownToken = unknownTokenId >= 0 && unknownTokenId < tokensArray.Length
-            ? (string)tokensArray[unknownTokenId]
-            : null;
+        // Get token strings for special tokens.
+        // If the unknown token is a control/special token (type 3), don't pass it to
+        // CodeGenTokenizer as it won't be in the BPE vocab and will throw.
+        string? unknownToken = null;
+        if (unknownTokenId >= 0 && unknownTokenId < tokensArray.Length)
+        {
+            bool isControl = model.Metadata.TryGetValue("tokenizer.ggml.token_type", out var ttObj)
+                && Convert.ToInt32(((object[])ttObj)[unknownTokenId]) == 3;
+            if (!isControl)
+                unknownToken = (string)tokensArray[unknownTokenId];
+        }
         string? bosToken = bosTokenId >= 0 && bosTokenId < tokensArray.Length
             ? (string)tokensArray[bosTokenId]
             : null;
@@ -109,12 +116,29 @@ public sealed class GgufTokenizer : ITokenizer
         IReadOnlyDictionary<string, int>? specialTokensDict =
             specialTokens.Count > 0 ? specialTokens : null;
 
-        var inner = CodeGenTokenizer.Create(
-            vocabStream,
-            mergesStream,
-            addPrefixSpace: false,
-            addBeginOfSentence: false,
-            addEndOfSentence: false);
+        // Try CodeGenTokenizer first (better decode quality for GPT-2 style models).
+        // Fall back to BpeTokenizer if CodeGenTokenizer fails (e.g., Llama 3.1 where
+        // the default unknown token <|endoftext|> is not in the BPE vocab).
+        Tokenizer inner;
+        try
+        {
+            inner = CodeGenTokenizer.Create(
+                vocabStream,
+                mergesStream,
+                addPrefixSpace: false,
+                addBeginOfSentence: false,
+                addEndOfSentence: false);
+        }
+        catch
+        {
+            vocabStream.Position = 0;
+            mergesStream.Position = 0;
+            inner = BpeTokenizer.Create(
+                vocabStream,
+                mergesStream,
+                specialTokens: specialTokensDict,
+                unknownToken: unknownToken);
+        }
 
         return new GgufTokenizer(
             inner,

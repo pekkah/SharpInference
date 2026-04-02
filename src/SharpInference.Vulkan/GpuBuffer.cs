@@ -46,6 +46,30 @@ public sealed unsafe class GpuBuffer : IDisposable
     }
 
     /// <summary>
+    /// Create a pinned host-visible buffer accessible from both CPU and GPU.
+    /// Tries BAR memory (HostVisible + DeviceLocal) first for zero-copy GPU access,
+    /// falls back to plain host-visible if BAR is not available.
+    /// Used for small, frequently-transferred data like hidden states at GPU↔CPU boundaries.
+    /// </summary>
+    public static GpuBuffer CreatePinned(VulkanBackend backend, ulong size, VkBufferUsageFlags usage)
+    {
+        // Try resizable BAR: host-visible + device-local (best perf, zero-copy from GPU)
+        try
+        {
+            return Create(backend, size,
+                usage | VkBufferUsageFlags.TransferSrc | VkBufferUsageFlags.TransferDst,
+                VkMemoryPropertyFlags.HostVisible | VkMemoryPropertyFlags.HostCoherent | VkMemoryPropertyFlags.DeviceLocal);
+        }
+        catch
+        {
+            // Fallback: plain host-visible (requires staging for GPU access)
+            return Create(backend, size,
+                usage | VkBufferUsageFlags.TransferSrc | VkBufferUsageFlags.TransferDst,
+                VkMemoryPropertyFlags.HostVisible | VkMemoryPropertyFlags.HostCoherent);
+        }
+    }
+
+    /// <summary>
     /// Map the buffer memory for CPU access. Only valid for host-visible buffers.
     /// Returns a pointer to the mapped region.
     /// </summary>

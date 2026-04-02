@@ -121,25 +121,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         Func<IReadOnlyList<int>, ReadOnlySpan<float>> prefill;
         Action resetCache;
 
-        bool useGpu = settings.NGpuLayers != 0;
-        if (useGpu)
+        int nGpuLayers = settings.NGpuLayers;
+        if (nGpuLayers == 0)
         {
-            var gpu = new VulkanBackend();
-            gpuBackend = gpu;
-            gpu.PrintDeviceInfo();
-
-            var gfwd = new GpuForwardPass(model, gpu, hp, ctxSize,
-                enableTurboQuant: settings.TurboQuant);
-            if (settings.TurboQuant)
-                AnsiConsole.MarkupLine($"[dim]TurboQuant: [green]enabled[/] (3-bit, context: {gfwd.MaxSeqLen})[/]");
-            gpuFwd = gfwd;
-            forward = gfwd.Forward;
-            prefill = tokens => { ReadOnlySpan<float> l = default; for (int i = 0; i < tokens.Count; i++) l = gfwd.Forward(tokens[i], i); return l; };
-            resetCache = gfwd.ResetCache;
-            AnsiConsole.MarkupLine($"[dim]Backend: [green]GPU[/] ({gpu.Name})[/]");
-        }
-        else
-        {
+            // CPU only
             if (settings.TurboQuant)
             {
                 fwd.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
@@ -149,6 +134,52 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             prefill = fwd.Prefill;
             resetCache = settings.TurboQuant ? fwd.TqCache!.Reset : fwd.Cache.Reset;
             AnsiConsole.MarkupLine("[dim]Backend: [blue]CPU[/][/]");
+        }
+        else
+        {
+            var gpu = new VulkanBackend();
+            gpuBackend = gpu;
+            gpu.PrintDeviceInfo();
+
+            var hwProfile = HardwareProfile.Detect(gpu);
+            AnsiConsole.MarkupLine($"[dim]Hardware: {hwProfile.Summary()}[/]");
+
+            // Auto-detect layer count when -g -1
+            if (nGpuLayers == -1)
+            {
+                var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant, requestedCtxSize: ctxSize);
+                nGpuLayers = placement.GpuLayers;
+            }
+
+            if (nGpuLayers >= hp.NumLayers)
+            {
+                // All layers on GPU
+                var gfwd = new GpuForwardPass(model, gpu, hp, ctxSize,
+                    enableTurboQuant: settings.TurboQuant);
+                if (settings.TurboQuant)
+                    AnsiConsole.MarkupLine($"[dim]TurboQuant: [green]enabled[/] (3-bit, context: {gfwd.MaxSeqLen})[/]");
+                gpuFwd = gfwd;
+                forward = gfwd.Forward;
+                prefill = tokens => { ReadOnlySpan<float> l = default; for (int i = 0; i < tokens.Count; i++) l = gfwd.Forward(tokens[i], i); return l; };
+                resetCache = gfwd.ResetCache;
+                AnsiConsole.MarkupLine($"[dim]Backend: [green]GPU[/] ({gpu.Name}, all {hp.NumLayers} layers)[/]");
+            }
+            else
+            {
+                // Hybrid: N layers GPU, rest CPU
+                var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant,
+                    requestedCtxSize: ctxSize);
+                // Override with explicit -g N if user specified it
+                if (settings.NGpuLayers > 0)
+                    placement = placement with { GpuLayers = nGpuLayers, CpuLayers = hp.NumLayers - nGpuLayers };
+
+                var hfwd = new HybridForwardPass(model, gpu, hp, placement, settings.TurboQuant);
+                gpuFwd = hfwd;
+                forward = hfwd.Forward;
+                prefill = tokens => { ReadOnlySpan<float> l = default; for (int i = 0; i < tokens.Count; i++) l = hfwd.Forward(tokens[i], i); return l; };
+                resetCache = hfwd.ResetCache;
+                AnsiConsole.MarkupLine($"[dim]Backend: [yellow]Hybrid[/] ({gpu.Name}, {placement.GpuLayers} GPU + {placement.CpuLayers} CPU layers)[/]");
+            }
         }
 
         AnsiConsole.MarkupLine($"[dim]Model loaded in {sw.Elapsed.TotalSeconds:F1}s — " +
