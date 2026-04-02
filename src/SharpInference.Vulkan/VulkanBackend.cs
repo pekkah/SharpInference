@@ -313,6 +313,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private ComputePipeline? _ropePipeline;
     private ComputePipeline? _softmaxPipeline;
     private ComputePipeline? _matVecQ4KPipeline;
+    private ComputePipeline? _matVecF32Pipeline;
 
     private struct RmsNormParams { public uint n; public float eps; }
     private struct CountParams { public uint n; }
@@ -372,10 +373,25 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
 
     public void MatMul(Tensor output, Tensor matrix, Tensor vector)
     {
-        _matVecQ4KPipeline ??= new ComputePipeline(this, Shaders.MatVecQ4K, 3, pushConstantSize: sizeof(MatVecParams));
+        // Default: assume Q4_K weights
+        MatMul(output, matrix, vector, DType.Q4_K);
+    }
+
+    public void MatMul(Tensor output, Tensor matrix, Tensor vector, DType weightDType)
+    {
         var p = new MatVecParams { rows = (uint)output.ElementCount, cols = (uint)vector.ElementCount };
-        _matVecQ4KPipeline.DispatchWith(_transferCmd,
-            [GetBuffer(matrix), GetBuffer(vector), GetBuffer(output)], (uint)output.ElementCount, pushConstants: &p);
+        if (weightDType == DType.Float32)
+        {
+            _matVecF32Pipeline ??= new ComputePipeline(this, Shaders.MatVecF32, 3, pushConstantSize: sizeof(MatVecParams));
+            _matVecF32Pipeline.DispatchWith(_transferCmd,
+                [GetBuffer(matrix), GetBuffer(vector), GetBuffer(output)], (uint)output.ElementCount, pushConstants: &p);
+        }
+        else
+        {
+            _matVecQ4KPipeline ??= new ComputePipeline(this, Shaders.MatVecQ4K, 3, pushConstantSize: sizeof(MatVecParams));
+            _matVecQ4KPipeline.DispatchWith(_transferCmd,
+                [GetBuffer(matrix), GetBuffer(vector), GetBuffer(output)], (uint)output.ElementCount, pushConstants: &p);
+        }
     }
 
     // ================================================================
@@ -397,6 +413,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _ropePipeline?.Dispose();
         _softmaxPipeline?.Dispose();
         _matVecQ4KPipeline?.Dispose();
+        _matVecF32Pipeline?.Dispose();
 
         // Free all tracked GPU buffers
         foreach (var buf in _buffers.Values)

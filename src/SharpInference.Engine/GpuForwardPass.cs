@@ -118,10 +118,10 @@ public sealed unsafe class GpuForwardPass : IDisposable
             // Pre-attention RmsNorm (GPU)
             _gpu.RmsNorm(_normBuf, _hidden, _wAttnNorm[layer], _hp.RmsNormEps);
 
-            // Q/K/V projections (GPU MatVec with Q4_K dequant)
-            _gpu.MatMul(_q, _wq[layer], _normBuf);
-            _gpu.MatMul(_k, _wk[layer], _normBuf);
-            _gpu.MatMul(_v, _wv[layer], _normBuf);
+            // Q/K/V projections (GPU MatVec, dispatches Q4_K or F32 shader per weight)
+            GpuMatMul(_q, _wq[layer], _normBuf);
+            GpuMatMul(_k, _wk[layer], _normBuf);
+            GpuMatMul(_v, _wv[layer], _normBuf);
 
             // RoPE (GPU)
             _gpu.RoPE(_q, position, _headDim, _hp.RopeTheta);
@@ -132,7 +132,7 @@ public sealed unsafe class GpuForwardPass : IDisposable
             AttentionCpuFallback(layer, position);
 
             // Output projection (GPU)
-            _gpu.MatMul(_hidden, _wo[layer], _attnOut);
+            GpuMatMul(_hidden, _wo[layer], _attnOut);
 
             // Residual add (GPU)
             _gpu.AddInPlace(_hidden, _residual);
@@ -144,10 +144,10 @@ public sealed unsafe class GpuForwardPass : IDisposable
             _gpu.RmsNorm(_normBuf, _hidden, _wFfnNorm[layer], _hp.RmsNormEps);
 
             // SwiGLU FFN (GPU)
-            _gpu.MatMul(_ffnGate, _wGate[layer], _normBuf);
-            _gpu.MatMul(_ffnUp, _wUp[layer], _normBuf);
+            GpuMatMul(_ffnGate, _wGate[layer], _normBuf);
+            GpuMatMul(_ffnUp, _wUp[layer], _normBuf);
             _gpu.SiLuMul(_ffnGate, _ffnUp);
-            _gpu.MatMul(_hidden, _wDown[layer], _ffnGate);
+            GpuMatMul(_hidden, _wDown[layer], _ffnGate);
 
             // Residual add (GPU)
             _gpu.AddInPlace(_hidden, _residual);
@@ -157,7 +157,7 @@ public sealed unsafe class GpuForwardPass : IDisposable
 
         // Final norm + output projection (GPU)
         _gpu.RmsNorm(_hidden, _hidden, _wOutputNorm, _hp.RmsNormEps);
-        _gpu.MatMul(_logits, _wOutput, _hidden);
+        GpuMatMul(_logits, _wOutput, _hidden);
 
         // Download logits to CPU
         var logits = new float[_hp.VocabSize];
@@ -233,6 +233,12 @@ public sealed unsafe class GpuForwardPass : IDisposable
     //  Helpers
     // ================================================================
 
+    private void GpuMatMul(Tensor output, Tensor weights, Tensor input)
+    {
+        var dtype = _weightDTypes.GetValueOrDefault(weights.Handle, DType.Q4_K);
+        _gpu.MatMul(output, weights, input, dtype);
+    }
+
     private void EmbedToken(int token)
     {
         // Dequantize embedding row on CPU, upload to GPU
@@ -307,26 +313,42 @@ public sealed unsafe class GpuForwardPass : IDisposable
         vkd.vkQueueWaitIdle(_gpu.ComputeQueue);
     }
 
+    // Track quantization type per weight tensor for MatMul dispatch
+    private readonly Dictionary<nint, DType> _weightDTypes = new();
+
     private Tensor UploadWeight(string name)
     {
         var info = _model.FindTensor(name)
             ?? throw new InvalidOperationException($"Missing tensor: {name}");
         var data = _model.GetTensorData(info);
 
-        // Upload raw bytes as floats (reinterpret for storage buffer)
+        Tensor result;
         if (info.DType == DType.Float32)
         {
             var floats = MemoryMarshal.Cast<byte, float>(data);
-            return _gpu.Upload(floats, TensorShape.D1(floats.Length));
+            result = _gpu.Upload(floats, TensorShape.D1(floats.Length));
+            _weightDTypes[result.Handle] = DType.Float32;
         }
-
-        // Quantized: upload raw bytes (reinterpret as float array for the storage buffer)
-        int floatCount = data.Length / 4;
-        if (data.Length % 4 != 0)
-            floatCount++; // pad
-        var rawFloats = new float[floatCount];
-        data.CopyTo(MemoryMarshal.AsBytes(rawFloats.AsSpan()));
-        return _gpu.Upload(rawFloats, TensorShape.D1(floatCount));
+        else if (info.DType == DType.Q4_K)
+        {
+            // Upload raw Q4_K bytes (reinterpret as floats for storage buffer)
+            int floatCount = data.Length / 4;
+            var rawFloats = new float[floatCount];
+            data.CopyTo(MemoryMarshal.AsBytes(rawFloats.AsSpan()));
+            result = _gpu.Upload(rawFloats, TensorShape.D1(floatCount));
+            _weightDTypes[result.Handle] = DType.Q4_K;
+        }
+        else
+        {
+            // Q6_K and other types: dequantize to F32 on CPU, upload as F32
+            // (GPU Q6_K shader TBD — this is correct but slower)
+            int count = (int)info.ElementCount;
+            var f32 = new float[count];
+            Dequantize.ToFloat32(data, f32, info.DType, count);
+            result = _gpu.Upload(f32, TensorShape.D1(count));
+            _weightDTypes[result.Handle] = DType.Float32;
+        }
+        return result;
     }
 
     public void Dispose()

@@ -228,6 +228,51 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Matrix-vector multiply with F32 weights.
+    /// Each workgroup computes one output row.
+    /// Push constants: { uint rows, uint cols }.
+    /// Bindings: 0=weights (float), 1=input (float), 2=output (float).
+    /// </summary>
+    internal const string MatVecF32 = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Weights { float weights_data[]; };
+        layout(binding = 1) readonly buffer Input   { float input_data[]; };
+        layout(binding = 2) writeonly buffer Output  { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint rows;
+            uint cols;
+        };
+
+        shared float sdata[256];
+
+        void main() {
+            uint row = gl_WorkGroupID.x;
+            uint tid = gl_LocalInvocationID.x;
+            if (row >= rows) return;
+
+            float acc = 0.0;
+            uint base_off = row * cols;
+            for (uint i = tid; i < cols; i += 256)
+                acc += weights_data[base_off + i] * input_data[i];
+
+            sdata[tid] = acc;
+            barrier();
+
+            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] += sdata[tid + s];
+                barrier();
+            }
+
+            if (tid == 0) output_data[row] = sdata[0];
+        }
+        """;
+
+    /// <summary>
     /// Matrix-vector multiply with Q4_K dequantization.
     /// Each workgroup computes one output row.
     /// Push constants: { uint rows, uint cols }.

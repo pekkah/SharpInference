@@ -248,6 +248,143 @@ public sealed unsafe class VulkanShaderTests
     }
 
     [Fact]
+    public void GpuEmbedThenRmsNormMatchesCpu()
+    {
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        using var gpu = new Vulkan.VulkanBackend();
+
+        // Dequantize embedding for token 1 on CPU
+        var embInfo = model.FindTensor("token_embd.weight")!.Value;
+        var embData = model.GetTensorData(embInfo);
+        int bytesPerRow = (hp.EmbeddingDim / DTypeInfo.BlockSize(embInfo.DType)) * DTypeInfo.BytesPerBlock(embInfo.DType);
+        var cpuEmb = new float[hp.EmbeddingDim];
+        Cpu.Dequantize.ToFloat32(embData.Slice(1 * bytesPerRow, bytesPerRow), cpuEmb, embInfo.DType, hp.EmbeddingDim);
+
+        Console.WriteLine($"CPU emb [0..4]: {cpuEmb[0]:F4} {cpuEmb[1]:F4} {cpuEmb[2]:F4} {cpuEmb[3]:F4} {cpuEmb[4]:F4}");
+
+        // Upload embedding to GPU
+        var gpuHidden = gpu.Upload(cpuEmb, TensorShape.D1(hp.EmbeddingDim));
+
+        // Upload norm weight
+        var normInfo = model.FindTensor("blk.0.attn_norm.weight")!.Value;
+        var normData = model.GetTensorData(normInfo);
+        var cpuNorm = new float[hp.EmbeddingDim];
+        Cpu.Dequantize.ToFloat32(normData, cpuNorm, normInfo.DType, hp.EmbeddingDim);
+        var gpuNorm = gpu.Upload(cpuNorm, TensorShape.D1(hp.EmbeddingDim));
+
+        // RmsNorm on GPU
+        var gpuOutput = gpu.Allocate(TensorShape.D1(hp.EmbeddingDim));
+        gpu.RmsNorm(gpuOutput, gpuHidden, gpuNorm, hp.RmsNormEps);
+
+        var gpuResult = new float[hp.EmbeddingDim];
+        gpu.Download(gpuOutput, gpuResult);
+
+        // RmsNorm on CPU
+        float sumSq = 0;
+        for (int i = 0; i < hp.EmbeddingDim; i++) sumSq += cpuEmb[i] * cpuEmb[i];
+        float scale = 1f / MathF.Sqrt(sumSq / hp.EmbeddingDim + hp.RmsNormEps);
+        var cpuResult = new float[hp.EmbeddingDim];
+        for (int i = 0; i < hp.EmbeddingDim; i++) cpuResult[i] = cpuEmb[i] * scale * cpuNorm[i];
+
+        Console.WriteLine($"CPU norm [0..4]: {cpuResult[0]:F4} {cpuResult[1]:F4} {cpuResult[2]:F4}");
+        Console.WriteLine($"GPU norm [0..4]: {gpuResult[0]:F4} {gpuResult[1]:F4} {gpuResult[2]:F4}");
+
+        int mismatches = 0;
+        for (int i = 0; i < hp.EmbeddingDim; i++)
+        {
+            if (MathF.Abs(gpuResult[i] - cpuResult[i]) > 0.01f)
+            {
+                if (mismatches < 3) Console.WriteLine($"  Mismatch [{i}]: gpu={gpuResult[i]:F4} cpu={cpuResult[i]:F4}");
+                mismatches++;
+            }
+        }
+        Assert.True(mismatches == 0, $"RmsNorm after embed: {mismatches} mismatches");
+
+        gpu.Free(gpuHidden); gpu.Free(gpuNorm); gpu.Free(gpuOutput);
+    }
+
+    [Fact]
+    public void GpuEmbedNormMatVecChain()
+    {
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        using var gpu = new Vulkan.VulkanBackend();
+
+        // Step 1: embed token 1
+        var embInfo = model.FindTensor("token_embd.weight")!.Value;
+        var embData = model.GetTensorData(embInfo);
+        int bytesPerRow = (hp.EmbeddingDim / DTypeInfo.BlockSize(embInfo.DType)) * DTypeInfo.BytesPerBlock(embInfo.DType);
+        var cpuEmb = new float[hp.EmbeddingDim];
+        Cpu.Dequantize.ToFloat32(embData.Slice(1 * bytesPerRow, bytesPerRow), cpuEmb, embInfo.DType, hp.EmbeddingDim);
+        var gpuHidden = gpu.Upload(cpuEmb, TensorShape.D1(hp.EmbeddingDim));
+
+        // Step 2: RmsNorm
+        var normInfo = model.FindTensor("blk.0.attn_norm.weight")!.Value;
+        var normData = model.GetTensorData(normInfo);
+        var cpuNormW = new float[hp.EmbeddingDim];
+        Cpu.Dequantize.ToFloat32(normData, cpuNormW, normInfo.DType, hp.EmbeddingDim);
+        var gpuNormW = gpu.Upload(cpuNormW, TensorShape.D1(hp.EmbeddingDim));
+        var gpuNormOut = gpu.Allocate(TensorShape.D1(hp.EmbeddingDim));
+        gpu.RmsNorm(gpuNormOut, gpuHidden, gpuNormW, hp.RmsNormEps);
+
+        // Step 3: MatVec with attn_q weight
+        var qInfo = model.FindTensor("blk.0.attn_q.weight")!.Value;
+        var qRaw = model.GetTensorData(qInfo);
+        int floatCount = qRaw.Length / 4;
+        var rawFloats = new float[floatCount];
+        System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(qRaw).CopyTo(rawFloats);
+        var gpuWq = gpu.Upload(rawFloats, TensorShape.D1(floatCount));
+
+        int qDim = hp.NumHeads * (hp.EmbeddingDim / hp.NumHeads);
+        var gpuQ = gpu.Allocate(TensorShape.D1(qDim));
+        gpu.MatMul(gpuQ, gpuWq, gpuNormOut);
+
+        var gpuResult = new float[qDim];
+        gpu.Download(gpuQ, gpuResult);
+
+        // CPU reference: dequant weights, matmul manually
+        var f32Wq = new float[(int)qInfo.ElementCount];
+        Cpu.Dequantize.ToFloat32(qRaw, f32Wq, qInfo.DType, qInfo.ElementCount);
+
+        // Get the GPU norm output for CPU reference
+        var cpuNormResult = new float[hp.EmbeddingDim];
+        gpu.Download(gpuNormOut, cpuNormResult);
+
+        var cpuQ = new float[qDim];
+        int cols = hp.EmbeddingDim;
+        for (int r = 0; r < qDim; r++)
+        {
+            float sum = 0;
+            for (int c = 0; c < cols; c++)
+                sum += f32Wq[r * cols + c] * cpuNormResult[c];
+            cpuQ[r] = sum;
+        }
+
+        Console.WriteLine($"GPU Q [0..4]: {gpuResult[0]:F4} {gpuResult[1]:F4} {gpuResult[2]:F4} {gpuResult[3]:F4}");
+        Console.WriteLine($"CPU Q [0..4]: {cpuQ[0]:F4} {cpuQ[1]:F4} {cpuQ[2]:F4} {cpuQ[3]:F4}");
+
+        int mismatches = 0;
+        for (int i = 0; i < qDim; i++)
+        {
+            float diff = MathF.Abs(gpuResult[i] - cpuQ[i]);
+            float rel = diff / (MathF.Abs(cpuQ[i]) + 1e-6f);
+            if (rel > 0.1f) mismatches++;
+        }
+        Console.WriteLine($"Chain mismatches: {mismatches}/{qDim}");
+        Assert.True(mismatches < qDim / 10);
+
+        gpu.Free(gpuHidden); gpu.Free(gpuNormW); gpu.Free(gpuNormOut);
+        gpu.Free(gpuWq); gpu.Free(gpuQ);
+    }
+
+    [Fact]
     public void GpuForwardPassMatchesCpuOutput()
     {
         var path = FindModelPath();
