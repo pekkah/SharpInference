@@ -191,15 +191,7 @@ public sealed unsafe class ComputePipeline : IDisposable
         };
         vkd.vkBeginCommandBuffer(cmd, &beginInfo).CheckResult();
 
-        vkd.vkCmdBindPipeline(cmd, VkPipelineBindPoint.Compute, _pipeline);
-        vkd.vkCmdBindDescriptorSets(cmd, VkPipelineBindPoint.Compute, _pipelineLayout,
-            0, 1, &ds, 0, null);
-
-        if (pushConstants != null && _pushConstantSize > 0)
-            vkd.vkCmdPushConstants(cmd, _pipelineLayout, VkShaderStageFlags.Compute,
-                0, (uint)_pushConstantSize, pushConstants);
-
-        vkd.vkCmdDispatch(cmd, groupCountX, groupCountY, groupCountZ);
+        RecordDispatch(cmd, ds, groupCountX, groupCountY, groupCountZ, pushConstants);
 
         vkd.vkEndCommandBuffer(cmd).CheckResult();
 
@@ -210,6 +202,33 @@ public sealed unsafe class ComputePipeline : IDisposable
         };
         vkd.vkQueueSubmit(_backend.ComputeQueue, 1, &submitInfo, VkFence.Null).CheckResult();
         vkd.vkQueueWaitIdle(_backend.ComputeQueue);
+    }
+
+    /// <summary>
+    /// Record a dispatch into an already-recording command buffer (no submit/wait).
+    /// Used for batching multiple dispatches into one submission.
+    /// </summary>
+    public void RecordDispatch(VkCommandBuffer cmd, VkDescriptorSet ds,
+        uint groupCountX, uint groupCountY = 1, uint groupCountZ = 1,
+        void* pushConstants = null)
+    {
+        var vkd = _backend.Vkd;
+        vkd.vkCmdBindPipeline(cmd, VkPipelineBindPoint.Compute, _pipeline);
+        vkd.vkCmdBindDescriptorSets(cmd, VkPipelineBindPoint.Compute, _pipelineLayout,
+            0, 1, &ds, 0, null);
+        if (pushConstants != null && _pushConstantSize > 0)
+            vkd.vkCmdPushConstants(cmd, _pipelineLayout, VkShaderStageFlags.Compute,
+                0, (uint)_pushConstantSize, pushConstants);
+        vkd.vkCmdDispatch(cmd, groupCountX, groupCountY, groupCountZ);
+    }
+
+    /// <summary>Record a dispatch using the reusable descriptor set (no submit).</summary>
+    public void RecordWith(VkCommandBuffer cmd, ReadOnlySpan<GpuBuffer> buffers,
+        uint groupCountX, uint groupCountY = 1, uint groupCountZ = 1,
+        void* pushConstants = null)
+    {
+        UpdateDescriptorSet(_reusableDs, buffers);
+        RecordDispatch(cmd, _reusableDs, groupCountX, groupCountY, groupCountZ, pushConstants);
     }
 
     /// <summary>

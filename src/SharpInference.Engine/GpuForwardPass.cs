@@ -129,58 +129,77 @@ public sealed unsafe class GpuForwardPass : IDisposable
         // 1. Embed token (CPU dequant → upload to GPU)
         EmbedToken(token);
 
-        // 2. Transformer layers
+        // 2. Record ALL transformer layers into ONE command buffer
+        _gpu.BeginRecord();
+
         for (int layer = 0; layer < _hp.NumLayers; layer++)
         {
-            // Copy hidden → residual (GPU)
+            // Copy hidden → residual
             CopyBuffer(_residual, _hidden);
+            _gpu.RecordTransferBarrier();
 
-            // Pre-attention RmsNorm (GPU)
+            // Pre-attention RmsNorm
             _gpu.RmsNorm(_normBuf, _hidden, _wAttnNorm[layer], _hp.RmsNormEps);
+            _gpu.RecordBarrier();
 
-            // Q/K/V projections (GPU MatVec, dispatches Q4_K or F32 shader per weight)
+            // Q/K/V projections
             GpuMatMul(_q, _wq[layer], _normBuf);
             GpuMatMul(_k, _wk[layer], _normBuf);
             GpuMatMul(_v, _wv[layer], _normBuf);
+            _gpu.RecordBarrier();
 
-            // RoPE (GPU)
+            // RoPE
             _gpu.RoPE(_q, position, _headDim, _hp.RopeTheta);
             _gpu.RoPE(_k, position, _headDim, _hp.RopeTheta);
+            _gpu.RecordBarrier();
 
-            // Append K, V to VRAM KV cache
+            // KV cache append
             _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer],
                 (uint)(_numKvHeads * _headDim), (uint)position, (uint)_maxSeqLen);
+            _gpu.RecordBarrier();
 
-            // GPU Attention (no PCIe round-trips)
+            // Attention
             _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
                 (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
                 (uint)(position + 1), (uint)_maxSeqLen);
+            _gpu.RecordBarrier();
 
-            // Output projection (GPU)
+            // Output projection
             GpuMatMul(_hidden, _wo[layer], _attnOut);
+            _gpu.RecordBarrier();
 
-            // Residual add (GPU)
+            // Residual add
             _gpu.AddInPlace(_hidden, _residual);
+            _gpu.RecordBarrier();
 
-            // Save residual for FFN
+            // FFN: save residual, norm, gate/up, SiLU, down, residual add
             CopyBuffer(_residual, _hidden);
+            _gpu.RecordTransferBarrier();
 
-            // Pre-FFN RmsNorm (GPU)
             _gpu.RmsNorm(_normBuf, _hidden, _wFfnNorm[layer], _hp.RmsNormEps);
+            _gpu.RecordBarrier();
 
-            // SwiGLU FFN (GPU)
             GpuMatMul(_ffnGate, _wGate[layer], _normBuf);
             GpuMatMul(_ffnUp, _wUp[layer], _normBuf);
-            _gpu.SiLuMul(_ffnGate, _ffnUp);
-            GpuMatMul(_hidden, _wDown[layer], _ffnGate);
+            _gpu.RecordBarrier();
 
-            // Residual add (GPU)
+            _gpu.SiLuMul(_ffnGate, _ffnUp);
+            _gpu.RecordBarrier();
+
+            GpuMatMul(_hidden, _wDown[layer], _ffnGate);
+            _gpu.RecordBarrier();
+
             _gpu.AddInPlace(_hidden, _residual);
+            _gpu.RecordBarrier();
         }
 
-        // Final norm + output projection (GPU)
+        // Final norm + output projection
         _gpu.RmsNorm(_hidden, _hidden, _wOutputNorm, _hp.RmsNormEps);
+        _gpu.RecordBarrier();
         GpuMatMul(_logits, _wOutput, _hidden);
+
+        // Submit ALL dispatches at once — single GPU submission for the entire token
+        _gpu.EndRecordAndSubmit();
 
         // Download logits to CPU
         var logits = new float[_hp.VocabSize];
@@ -245,31 +264,13 @@ public sealed unsafe class GpuForwardPass : IDisposable
         vkd.vkQueueWaitIdle(_gpu.ComputeQueue);
     }
 
+    /// <summary>Record a buffer copy into the current command buffer (must be in recording mode).</summary>
     private void CopyBuffer(Tensor dst, Tensor src)
     {
         var srcBuf = _gpu.GetBuffer(src);
         var dstBuf = _gpu.GetBuffer(dst);
-        ulong size = srcBuf.Size;
-
-        var vkd = _gpu.Vkd;
-        var cmd = _gpu.TransferCmd;
-        Vortice.Vulkan.VkCommandBufferBeginInfo beginInfo = new()
-        {
-            flags = Vortice.Vulkan.VkCommandBufferUsageFlags.OneTimeSubmit,
-        };
-        vkd.vkBeginCommandBuffer(cmd, &beginInfo).CheckResult();
-
-        Vortice.Vulkan.VkBufferCopy region = new() { size = size };
-        vkd.vkCmdCopyBuffer(cmd, srcBuf.Buffer, dstBuf.Buffer, 1, &region);
-
-        vkd.vkEndCommandBuffer(cmd).CheckResult();
-        Vortice.Vulkan.VkSubmitInfo submit = new()
-        {
-            commandBufferCount = 1,
-            pCommandBuffers = &cmd,
-        };
-        vkd.vkQueueSubmit(_gpu.ComputeQueue, 1, &submit, Vortice.Vulkan.VkFence.Null).CheckResult();
-        vkd.vkQueueWaitIdle(_gpu.ComputeQueue);
+        VkBufferCopy region = new() { size = srcBuf.Size };
+        _gpu.Vkd.vkCmdCopyBuffer(_gpu.TransferCmd, srcBuf.Buffer, dstBuf.Buffer, 1, &region);
     }
 
     // Track quantization type per weight tensor for MatMul dispatch

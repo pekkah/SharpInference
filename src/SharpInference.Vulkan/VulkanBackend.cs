@@ -32,6 +32,54 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     public VkQueue ComputeQueue => _computeQueue;
     public VkCommandBuffer TransferCmd => _transferCmd;
 
+    // Batched recording mode: record multiple dispatches, submit once
+    private bool _recording;
+
+    /// <summary>Begin recording a batch of compute dispatches.</summary>
+    public void BeginRecord()
+    {
+        VkCommandBufferBeginInfo begin = new() { flags = VkCommandBufferUsageFlags.OneTimeSubmit };
+        _vkd.vkBeginCommandBuffer(_transferCmd, &begin).CheckResult();
+        _recording = true;
+    }
+
+    /// <summary>Insert a compute→compute memory barrier (all writes visible to reads).</summary>
+    public void RecordBarrier()
+    {
+        VkMemoryBarrier barrier = new()
+        {
+            srcAccessMask = VkAccessFlags.ShaderWrite,
+            dstAccessMask = VkAccessFlags.ShaderRead,
+        };
+        _vkd.vkCmdPipelineBarrier(_transferCmd,
+            VkPipelineStageFlags.ComputeShader, VkPipelineStageFlags.ComputeShader,
+            0, 1, &barrier, 0, null, 0, null);
+    }
+
+    /// <summary>Insert a transfer→compute barrier (copy finished before shader reads).</summary>
+    public void RecordTransferBarrier()
+    {
+        VkMemoryBarrier barrier = new()
+        {
+            srcAccessMask = VkAccessFlags.TransferWrite,
+            dstAccessMask = VkAccessFlags.ShaderRead,
+        };
+        _vkd.vkCmdPipelineBarrier(_transferCmd,
+            VkPipelineStageFlags.Transfer, VkPipelineStageFlags.ComputeShader,
+            0, 1, &barrier, 0, null, 0, null);
+    }
+
+    /// <summary>End recording and submit all dispatches. Synchronous wait.</summary>
+    public void EndRecordAndSubmit()
+    {
+        _recording = false;
+        _vkd.vkEndCommandBuffer(_transferCmd).CheckResult();
+        VkCommandBuffer cmd = _transferCmd;
+        VkSubmitInfo submit = new() { commandBufferCount = 1, pCommandBuffers = &cmd };
+        _vkd.vkQueueSubmit(_computeQueue, 1, &submit, VkFence.Null).CheckResult();
+        _vkd.vkQueueWaitIdle(_computeQueue);
+    }
+
     public VulkanBackend()
     {
         // 1. Initialize Vulkan loader
@@ -324,12 +372,20 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private struct KvAppendParams { public uint kvDim; public uint position; public uint maxSeqLen; }
     private struct AttentionParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint seqLen; public uint maxSeqLen; }
 
+    private void DispatchOrRecord(ComputePipeline pipe, ReadOnlySpan<GpuBuffer> buffers,
+        uint groupX, void* push, uint groupY = 1, uint groupZ = 1)
+    {
+        if (_recording)
+            pipe.RecordWith(_transferCmd, buffers, groupX, groupY, groupZ, push);
+        else
+            pipe.DispatchWith(_transferCmd, buffers, groupX, groupY, groupZ, push);
+    }
+
     public void RmsNorm(Tensor output, Tensor x, Tensor weight, float eps = 1e-5f)
     {
         _rmsNormPipeline ??= new ComputePipeline(this, Shaders.RmsNorm, 3, pushConstantSize: sizeof(RmsNormParams));
         var p = new RmsNormParams { n = (uint)x.ElementCount, eps = eps };
-        _rmsNormPipeline.DispatchWith(_transferCmd,
-            [GetBuffer(x), GetBuffer(weight), GetBuffer(output)], 1, pushConstants: &p);
+        DispatchOrRecord(_rmsNormPipeline, [GetBuffer(x), GetBuffer(weight), GetBuffer(output)], 1, &p);
     }
 
     public void SiLU(Tensor x) => throw new NotImplementedException("Use SiLuMul for fused SiLU*gate");
@@ -338,24 +394,21 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     {
         _siluMulPipeline ??= new ComputePipeline(this, Shaders.SiLuMul, 2, pushConstantSize: sizeof(CountParams));
         var p = new CountParams { n = (uint)gate.ElementCount };
-        _siluMulPipeline.DispatchWith(_transferCmd,
-            [GetBuffer(gate), GetBuffer(up)], ((uint)gate.ElementCount + 255) / 256, pushConstants: &p);
+        DispatchOrRecord(_siluMulPipeline, [GetBuffer(gate), GetBuffer(up)], ((uint)gate.ElementCount + 255) / 256, &p);
     }
 
     public void AddInPlace(Tensor dst, Tensor src)
     {
         _addInPlacePipeline ??= new ComputePipeline(this, Shaders.AddInPlace, 2, pushConstantSize: sizeof(CountParams));
         var p = new CountParams { n = (uint)dst.ElementCount };
-        _addInPlacePipeline.DispatchWith(_transferCmd,
-            [GetBuffer(dst), GetBuffer(src)], ((uint)dst.ElementCount + 255) / 256, pushConstants: &p);
+        DispatchOrRecord(_addInPlacePipeline, [GetBuffer(dst), GetBuffer(src)], ((uint)dst.ElementCount + 255) / 256, &p);
     }
 
     public void ElementwiseMul(Tensor output, Tensor a, Tensor b)
     {
         _elementwiseMulPipeline ??= new ComputePipeline(this, Shaders.ElementwiseMul, 3, pushConstantSize: sizeof(CountParams));
         var p = new CountParams { n = (uint)a.ElementCount };
-        _elementwiseMulPipeline.DispatchWith(_transferCmd,
-            [GetBuffer(a), GetBuffer(b), GetBuffer(output)], ((uint)a.ElementCount + 255) / 256, pushConstants: &p);
+        DispatchOrRecord(_elementwiseMulPipeline, [GetBuffer(a), GetBuffer(b), GetBuffer(output)], ((uint)a.ElementCount + 255) / 256, &p);
     }
 
     public void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f)
@@ -364,15 +417,14 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         uint numHeads = (uint)(x.ElementCount / headDim);
         uint totalPairs = numHeads * (uint)(headDim / 2);
         var p = new RoPEParams { numHeads = numHeads, headDim = (uint)headDim, position = position, theta = ropeTheta };
-        _ropePipeline.DispatchWith(_transferCmd,
-            [GetBuffer(x)], (totalPairs + 255) / 256, pushConstants: &p);
+        DispatchOrRecord(_ropePipeline, [GetBuffer(x)], (totalPairs + 255) / 256, &p);
     }
 
     public void Softmax(Tensor x)
     {
         _softmaxPipeline ??= new ComputePipeline(this, Shaders.Softmax, 1, pushConstantSize: sizeof(CountParams));
         var p = new CountParams { n = (uint)x.ElementCount };
-        _softmaxPipeline.DispatchWith(_transferCmd, [GetBuffer(x)], 1, pushConstants: &p);
+        DispatchOrRecord(_softmaxPipeline, [GetBuffer(x)], 1, &p);
     }
 
     public void MatMul(Tensor output, Tensor matrix, Tensor vector)
@@ -387,14 +439,14 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         if (weightDType == DType.Float32)
         {
             _matVecF32Pipeline ??= new ComputePipeline(this, Shaders.MatVecF32, 3, pushConstantSize: sizeof(MatVecParams));
-            _matVecF32Pipeline.DispatchWith(_transferCmd,
-                [GetBuffer(matrix), GetBuffer(vector), GetBuffer(output)], (uint)output.ElementCount, pushConstants: &p);
+            DispatchOrRecord(_matVecF32Pipeline,
+                [GetBuffer(matrix), GetBuffer(vector), GetBuffer(output)], (uint)output.ElementCount, &p);
         }
         else
         {
             _matVecQ4KPipeline ??= new ComputePipeline(this, Shaders.MatVecQ4K, 3, pushConstantSize: sizeof(MatVecParams));
-            _matVecQ4KPipeline.DispatchWith(_transferCmd,
-                [GetBuffer(matrix), GetBuffer(vector), GetBuffer(output)], (uint)output.ElementCount, pushConstants: &p);
+            DispatchOrRecord(_matVecQ4KPipeline,
+                [GetBuffer(matrix), GetBuffer(vector), GetBuffer(output)], (uint)output.ElementCount, &p);
         }
     }
 
@@ -407,9 +459,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     {
         _kvAppendPipeline ??= new ComputePipeline(this, Shaders.KvAppend, 4, pushConstantSize: sizeof(KvAppendParams));
         var p = new KvAppendParams { kvDim = kvDim, position = position, maxSeqLen = maxSeqLen };
-        _kvAppendPipeline.DispatchWith(_transferCmd,
+        DispatchOrRecord(_kvAppendPipeline,
             [GetBuffer(kInput), GetBuffer(vInput), GetBuffer(kCache), GetBuffer(vCache)],
-            (kvDim + 255) / 256, pushConstants: &p);
+            (kvDim + 255) / 256, &p);
     }
 
     public void Attention(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
@@ -421,9 +473,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
             numHeads = numHeads, numKvHeads = numKvHeads,
             headDim = headDim, seqLen = seqLen, maxSeqLen = maxSeqLen
         };
-        _attentionPipeline.DispatchWith(_transferCmd,
+        DispatchOrRecord(_attentionPipeline,
             [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(output)],
-            numHeads, pushConstants: &p); // one workgroup per head
+            numHeads, &p);
     }
 
     // ================================================================
