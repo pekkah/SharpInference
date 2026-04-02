@@ -8,29 +8,42 @@ public interface IComputeBackend : IDisposable
 {
     string Name { get; }
 
-    /// <summary>Perform matrix multiplication: out = lhs @ rhs.</summary>
-    void MatMul(Tensor lhs, Tensor rhs, Tensor output);
+    // --- Memory management ---
 
-    /// <summary>Element-wise addition in-place: dst += src.</summary>
-    void AddInPlace(Tensor dst, Tensor src);
+    /// <summary>Allocate a tensor of the given shape, initialized to zero.</summary>
+    Tensor Allocate(TensorShape shape, DType dtype = DType.Float32);
 
-    /// <summary>Apply RMS-norm in-place.</summary>
-    void RmsNorm(Tensor x, Tensor weight, float eps = 1e-5f);
+    /// <summary>Free a tensor's backing memory.</summary>
+    void Free(Tensor tensor);
 
-    /// <summary>Softmax in-place along the last dimension.</summary>
-    void Softmax(Tensor x);
-
-    /// <summary>Apply SiLU activation in-place.</summary>
-    void SiLU(Tensor x);
-
-    /// <summary>Rope positional embedding in-place.</summary>
-    void RoPE(Tensor x, int position, int headDim);
-
-    /// <summary>Copy data to the backend device.</summary>
+    /// <summary>Copy data to the backend device, returning a new tensor.</summary>
     Tensor Upload(ReadOnlySpan<float> data, TensorShape shape);
 
     /// <summary>Copy data back from the backend device.</summary>
     void Download(Tensor src, Span<float> dst);
+
+    // --- Core math operations ---
+
+    /// <summary>Matrix-vector multiply: output[i] = sum_j(matrix[i,j] * vector[j]).</summary>
+    void MatMul(Tensor output, Tensor matrix, Tensor vector);
+
+    /// <summary>Element-wise addition in-place: dst += src.</summary>
+    void AddInPlace(Tensor dst, Tensor src);
+
+    /// <summary>Element-wise multiplication: output = a * b.</summary>
+    void ElementwiseMul(Tensor output, Tensor a, Tensor b);
+
+    /// <summary>Apply RMS-norm: x = (x / rms(x)) * weight.</summary>
+    void RmsNorm(Tensor output, Tensor x, Tensor weight, float eps = 1e-5f);
+
+    /// <summary>Softmax in-place along the last dimension.</summary>
+    void Softmax(Tensor x);
+
+    /// <summary>Apply SiLU (x * sigmoid(x)) activation in-place.</summary>
+    void SiLU(Tensor x);
+
+    /// <summary>Apply rotary positional embedding in-place.</summary>
+    void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f);
 
     /// <summary>Wait for all queued operations to complete.</summary>
     void Synchronize();

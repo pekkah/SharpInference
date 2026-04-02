@@ -23,6 +23,18 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         // TODO: create Vulkan instance, pick physical device, create logical device
     }
 
+    public Tensor Allocate(TensorShape shape, DType dtype = DType.Float32)
+    {
+        // TODO: allocate VkBuffer on device-local memory
+        throw new NotImplementedException();
+    }
+
+    public void Free(Tensor tensor)
+    {
+        // TODO: free VkBuffer and device memory
+        throw new NotImplementedException();
+    }
+
     public Tensor Upload(ReadOnlySpan<float> data, TensorShape shape)
     {
         // TODO: allocate VkBuffer on device-local memory, stage-copy via transfer queue
@@ -35,7 +47,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         throw new NotImplementedException();
     }
 
-    public void MatMul(Tensor lhs, Tensor rhs, Tensor output)
+    public void MatMul(Tensor output, Tensor matrix, Tensor vector)
     {
         // TODO: dispatch matmul.comp shader
         throw new NotImplementedException();
@@ -47,7 +59,13 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         throw new NotImplementedException();
     }
 
-    public void RmsNorm(Tensor x, Tensor weight, float eps = 1e-5f)
+    public void ElementwiseMul(Tensor output, Tensor a, Tensor b)
+    {
+        // TODO: dispatch elementwise_mul.comp shader
+        throw new NotImplementedException();
+    }
+
+    public void RmsNorm(Tensor output, Tensor x, Tensor weight, float eps = 1e-5f)
     {
         // TODO: dispatch rmsnorm.comp shader
         throw new NotImplementedException();
@@ -65,7 +83,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         throw new NotImplementedException();
     }
 
-    public void RoPE(Tensor x, int position, int headDim)
+    public void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f)
     {
         // TODO: dispatch rope.comp shader
         throw new NotImplementedException();
