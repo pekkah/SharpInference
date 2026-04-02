@@ -58,16 +58,30 @@ public sealed unsafe class ForwardPass : IDisposable
     private readonly bool _hasQkNorm;
     private readonly float*[] _qNorm, _kNorm;
 
+    // MoE (Mixture of Experts) — Phase 5
+    private readonly TensorRef[]? _wGateInp;      // router weights [numExperts, embDim] per layer
+    private readonly TensorRef[]? _wGateShexp, _wUpShexp, _wDownShexp; // shared expert per layer
+    private readonly TensorRef[]? _wGateExps, _wUpExps, _wDownExps;   // packed expert weights per layer
+    private readonly float* _routerLogits;  // [numExperts] scratch
+    private readonly float* _sharedOut;     // [embDim] shared expert output
+    private readonly float* _expertGate;    // [expertIntermDim] expert gate scratch
+    private readonly float* _expertUp;      // [expertIntermDim] expert up scratch
+
     // Optional TurboQuant KV cache (Phase 3)
     private TurboQuantKvCache? _tqKvCache;
     private float* _rotatedQuery;  // scratch for WHT-rotated query [headDim]
     private float* _decompBuf;     // scratch for decompressed TQ value [headDim]
 
-    public ForwardPass(GgufModel model, IComputeBackend backend, ModelHyperparams hp)
+    public ForwardPass(GgufModel model, IComputeBackend backend, ModelHyperparams hp,
+        int maxContextLength = 0)
     {
         _model = model;
         _hp = hp;
-        _kvCache = new KvCache(hp);
+        // Cap context length to avoid OOM (e.g., Llama 4 Scout has 10M context)
+        int ctxLen = maxContextLength > 0
+            ? Math.Min(maxContextLength, hp.ContextLength)
+            : Math.Min(hp.ContextLength, 32768); // sensible default cap
+        _kvCache = new KvCache(hp.NumLayers, ctxLen, hp.NumKvHeads, hp.EmbeddingDim / hp.NumHeads);
 
         _embDim = hp.EmbeddingDim;
         _headDim = hp.EmbeddingDim / hp.NumHeads;
@@ -87,7 +101,7 @@ public sealed unsafe class ForwardPass : IDisposable
         _ffnGate = Alloc(_intermDim);
         _ffnUp = Alloc(_intermDim);
         _logits = Alloc(hp.VocabSize);
-        _attnScores = Alloc(hp.ContextLength);
+        _attnScores = Alloc(ctxLen);
 
         // Pre-resolve all tensor references (avoids dictionary lookups in hot loop)
         _embTensor = ResolveTensor("token_embd.weight");
@@ -106,6 +120,21 @@ public sealed unsafe class ForwardPass : IDisposable
         _hasQkNorm = hp.HasQkNorm;
         _qNorm = new float*[L]; _kNorm = new float*[L];
 
+        // MoE weight arrays
+        if (hp.IsMoE)
+        {
+            _wGateInp = new TensorRef[L];
+            _wGateExps = new TensorRef[L]; _wUpExps = new TensorRef[L]; _wDownExps = new TensorRef[L];
+            if (hp.HasSharedExpert)
+            {
+                _wGateShexp = new TensorRef[L]; _wUpShexp = new TensorRef[L]; _wDownShexp = new TensorRef[L];
+            }
+            _routerLogits = Alloc(hp.NumExperts);
+            _sharedOut = Alloc(_embDim);
+            _expertGate = Alloc(hp.ExpertIntermediateDim);
+            _expertUp = Alloc(hp.ExpertIntermediateDim);
+        }
+
         for (int i = 0; i < L; i++)
         {
             _attnNorm[i] = ResolveTensor($"blk.{i}.attn_norm.weight");
@@ -114,9 +143,26 @@ public sealed unsafe class ForwardPass : IDisposable
             _wv[i] = ResolveTensor($"blk.{i}.attn_v.weight");
             _wo[i] = ResolveTensor($"blk.{i}.attn_output.weight");
             _ffnNorm[i] = ResolveTensor($"blk.{i}.ffn_norm.weight");
-            _wGate[i] = ResolveTensor($"blk.{i}.ffn_gate.weight");
-            _wUp[i] = ResolveTensor($"blk.{i}.ffn_up.weight");
-            _wDown[i] = ResolveTensor($"blk.{i}.ffn_down.weight");
+
+            if (hp.IsMoE)
+            {
+                _wGateInp![i] = ResolveTensor($"blk.{i}.ffn_gate_inp.weight");
+                _wGateExps![i] = ResolveTensor($"blk.{i}.ffn_gate_exps.weight");
+                _wUpExps![i] = ResolveTensor($"blk.{i}.ffn_up_exps.weight");
+                _wDownExps![i] = ResolveTensor($"blk.{i}.ffn_down_exps.weight");
+                if (hp.HasSharedExpert)
+                {
+                    _wGateShexp![i] = ResolveTensor($"blk.{i}.ffn_gate_shexp.weight");
+                    _wUpShexp![i] = ResolveTensor($"blk.{i}.ffn_up_shexp.weight");
+                    _wDownShexp![i] = ResolveTensor($"blk.{i}.ffn_down_shexp.weight");
+                }
+            }
+            else
+            {
+                _wGate[i] = ResolveTensor($"blk.{i}.ffn_gate.weight");
+                _wUp[i] = ResolveTensor($"blk.{i}.ffn_up.weight");
+                _wDown[i] = ResolveTensor($"blk.{i}.ffn_down.weight");
+            }
 
             if (_hasAttnBias)
             {
@@ -166,6 +212,15 @@ public sealed unsafe class ForwardPass : IDisposable
         int N = tokens.Count;
         if (N == 0) throw new ArgumentException("Token list is empty");
         if (N == 1) return Forward(tokens[0], 0);
+
+        // MoE models: sequential prefill (batched FFN not yet supported for MoE)
+        if (_hp.IsMoE)
+        {
+            ReadOnlySpan<float> logits = default;
+            for (int i = 0; i < N; i++)
+                logits = Forward(tokens[i], i);
+            return logits;
+        }
 
         // Batch hidden states: [N, embDim]
         var batchHidden = (float*)NativeMemory.AllocZeroed((nuint)((long)N * _embDim * sizeof(float)));
@@ -415,14 +470,10 @@ public sealed unsafe class ForwardPass : IDisposable
             var ffnNormW = GetNormWeight(_ffnNorm[layer]);
             SimdKernels.RmsNorm(_normBuf, _hidden, ffnNormW, _embDim, _hp.RmsNormEps);
 
-            // SwiGLU FFN
-            FusedMatVec(_ffnGate, _wGate[layer], _normBuf, _intermDim, _embDim);
-            FusedMatVec(_ffnUp, _wUp[layer], _normBuf, _intermDim, _embDim);
-
-            // Fused SiLU(gate) * up
-            SimdKernels.SiLuMul(_ffnGate, _ffnUp, _intermDim);
-
-            FusedMatVec(_hidden, _wDown[layer], _ffnGate, _embDim, _intermDim);
+            if (_hp.IsMoE)
+                MoeFfn(layer);
+            else
+                DenseFfn(layer);
 
             // Residual
             SimdKernels.AddInPlace(_hidden, _residual, _embDim);
@@ -583,6 +634,141 @@ public sealed unsafe class ForwardPass : IDisposable
                 }
             }
         }
+    }
+
+    // ================================================================
+    //  Dense FFN (non-MoE)
+    // ================================================================
+
+    private void DenseFfn(int layer)
+    {
+        FusedMatVec(_ffnGate, _wGate[layer], _normBuf, _intermDim, _embDim);
+        FusedMatVec(_ffnUp, _wUp[layer], _normBuf, _intermDim, _embDim);
+        SimdKernels.SiLuMul(_ffnGate, _ffnUp, _intermDim);
+        FusedMatVec(_hidden, _wDown[layer], _ffnGate, _embDim, _intermDim);
+    }
+
+    // ================================================================
+    //  MoE FFN (Mixture of Experts)
+    // ================================================================
+
+    private void MoeFfn(int layer)
+    {
+        int numExperts = _hp.NumExperts;
+        int numActive = _hp.NumActiveExperts;
+        int expertDim = _hp.ExpertIntermediateDim;
+
+        // Step 1: Router — compute expert logits and select top-k
+        FusedMatVec(_routerLogits, _wGateInp![layer], _normBuf, numExperts, _embDim);
+
+        // Softmax over expert logits
+        SimdKernels.SoftmaxInPlace(_routerLogits, numExperts);
+
+        // Find top-k experts (for k=1, just argmax)
+        Span<int> selectedExperts = stackalloc int[numActive];
+        Span<float> expertWeights = stackalloc float[numActive];
+        SelectTopK(_routerLogits, numExperts, numActive, selectedExperts, expertWeights);
+
+        // Step 2: Shared expert (runs on every token if present)
+        // Shared expert uses the same dim as routed experts (ExpertIntermediateDim)
+        if (_hp.HasSharedExpert)
+        {
+            FusedMatVec(_expertGate, _wGateShexp![layer], _normBuf, expertDim, _embDim);
+            FusedMatVec(_expertUp, _wUpShexp![layer], _normBuf, expertDim, _embDim);
+            SimdKernels.SiLuMul(_expertGate, _expertUp, expertDim);
+            FusedMatVec(_sharedOut, _wDownShexp![layer], _expertGate, _embDim, expertDim);
+        }
+
+        // Step 3: Selected expert(s) — sparse execution
+        // Zero the output accumulator
+        new Span<float>(_hidden, _embDim).Clear();
+
+        for (int k = 0; k < numActive; k++)
+        {
+            int expertIdx = selectedExperts[k];
+            float weight = expertWeights[k];
+
+            // Expert weights are packed: all experts concatenated in one tensor.
+            // Each expert's gate/up is [expertDim, embDim], down is [embDim, expertDim].
+            // Expert slice offset in packed tensor: expertIdx * expertDim * (bytes per row)
+            ExpertMatVec(_expertGate, _wGateExps![layer], expertIdx, expertDim, _embDim, _normBuf);
+            ExpertMatVec(_expertUp, _wUpExps![layer], expertIdx, expertDim, _embDim, _normBuf);
+            SimdKernels.SiLuMul(_expertGate, _expertUp, expertDim);
+            ExpertMatVecDown(_hidden, _wDownExps![layer], expertIdx, _embDim, expertDim, _expertGate, weight);
+        }
+
+        // Step 4: Add shared expert output
+        if (_hp.HasSharedExpert)
+            SimdKernels.AddInPlace(_hidden, _sharedOut, _embDim);
+    }
+
+    /// <summary>
+    /// MatVec for a single expert slice from a packed expert tensor.
+    /// The packed tensor has shape [numExperts * rows, cols]. Expert i's slice
+    /// starts at row offset (i * rows).
+    /// </summary>
+    private void ExpertMatVec(float* output, in TensorRef packedTensor,
+        int expertIdx, int rows, int cols, float* input)
+    {
+        int bytesPerRow = (cols / DTypeInfo.BlockSize(packedTensor.DType))
+                        * DTypeInfo.BytesPerBlock(packedTensor.DType);
+        long expertOffset = (long)expertIdx * rows * bytesPerRow;
+        byte* expertData = packedTensor.DataPtr + expertOffset;
+        SimdKernels.MatVec(output, expertData, input, rows, cols, packedTensor.DType);
+    }
+
+    /// <summary>
+    /// MatVec for expert down projection, with weighted accumulation into output.
+    /// output += weight * (expertDown[expertIdx] × input)
+    /// </summary>
+    private void ExpertMatVecDown(float* output, in TensorRef packedTensor,
+        int expertIdx, int rows, int cols, float* input, float weight)
+    {
+        int bytesPerRow = (cols / DTypeInfo.BlockSize(packedTensor.DType))
+                        * DTypeInfo.BytesPerBlock(packedTensor.DType);
+        long expertOffset = (long)expertIdx * rows * bytesPerRow;
+        byte* expertData = packedTensor.DataPtr + expertOffset;
+
+        // Compute into a temp buffer, then weighted-add to output
+        // Reuse _ffnGate as temp (it's expertDim-sized but we need embDim here, use _ffnUp)
+        // Actually for down projection: rows=embDim, cols=expertDim. Use stackalloc for small sizes.
+        float* temp = _ffnUp; // reuse buffer (embDim is always <= intermDim)
+        SimdKernels.MatVec(temp, expertData, input, rows, cols, packedTensor.DType);
+
+        // Weighted accumulate: output += weight * temp
+        for (int i = 0; i < rows; i++)
+            output[i] += weight * temp[i];
+    }
+
+    private static void SelectTopK(float* logits, int n, int k,
+        Span<int> indices, Span<float> weights)
+    {
+        // Simple selection for small k (typically 1 or 2)
+        for (int ki = 0; ki < k; ki++)
+        {
+            int bestIdx = 0;
+            float bestVal = float.MinValue;
+            for (int i = 0; i < n; i++)
+            {
+                bool alreadySelected = false;
+                for (int j = 0; j < ki; j++)
+                    if (indices[j] == i) { alreadySelected = true; break; }
+                if (!alreadySelected && logits[i] > bestVal)
+                { bestVal = logits[i]; bestIdx = i; }
+            }
+            indices[ki] = bestIdx;
+            weights[ki] = bestVal;
+        }
+
+        // Renormalize weights for selected experts
+        if (k > 1)
+        {
+            float sum = 0;
+            for (int i = 0; i < k; i++) sum += weights[i];
+            if (sum > 0)
+                for (int i = 0; i < k; i++) weights[i] /= sum;
+        }
+        // For k=1, weight is the softmax probability (already normalized)
     }
 
     // ================================================================

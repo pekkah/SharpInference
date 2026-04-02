@@ -202,6 +202,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 return RunSinglePrompt(settings, forward, prefill, tokenizer, sp, rng);
             return RunInteractive(settings, forward, prefill, resetCache, tokenizer, sp, rng);
         }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex);
+            return 1;
+        }
         finally
         {
             gpuFwd?.Dispose();
