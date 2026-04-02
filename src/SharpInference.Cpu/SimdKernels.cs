@@ -15,9 +15,7 @@ public static unsafe class SimdKernels
     private const int MinRowsForParallel = 64;
     private static readonly ParallelOptions s_parallelOpts = new()
     {
-        // Physical cores only: SMT adds no benefit for AVX2/512 SIMD workloads
-        // and doubles cache pollution + scheduling overhead
-        MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 2)
+        MaxDegreeOfParallelism = Environment.ProcessorCount
     };
 
     // ================================================================
