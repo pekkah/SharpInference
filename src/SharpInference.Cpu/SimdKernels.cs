@@ -124,9 +124,10 @@ public static unsafe class SimdKernels
             case DType.Q6_K:
                 MatVecQ6K(output, weights, input, rows, cols);
                 break;
+            case DType.Q5_K:
+                MatVecQ5K(output, weights, input, rows, cols);
+                break;
             default:
-                // Fallback: dequantize entire weight matrix to F32, then F32 MatVec.
-                // Slow but correct for unsupported quantization types (e.g. Q5_K).
                 MatVecDequantFallback(output, weights, input, rows, cols, dtype);
                 break;
         }
@@ -364,6 +365,165 @@ public static unsafe class SimdKernels
                 }
                 qIdx += 32;
                 scIdx += 2;
+            }
+            elemOff += 256;
+        }
+        return acc;
+    }
+
+    // ================================================================
+    //  Q5_K Fused MatVec
+    // ================================================================
+
+    public static void MatVecQ5K(float* output, byte* weights, float* input, int rows, int cols)
+    {
+        int bytesPerRow = (cols / 256) * 176;
+
+        if (rows >= MinRowsForParallel)
+        {
+            var w = weights; var inp = input; var outp = output;
+            Parallel.For(0, rows, s_parallelOpts, i =>
+            {
+                outp[i] = DotQ5K(w + (long)i * bytesPerRow, inp, cols);
+            });
+        }
+        else
+        {
+            for (int i = 0; i < rows; i++)
+                output[i] = DotQ5K(weights + (long)i * bytesPerRow, input, cols);
+        }
+    }
+
+    // ================================================================
+    //  Q5_K Fused Dequant-Dot  (one row)
+    // ================================================================
+
+    /// <summary>
+    /// Fused Q5_K dequantize-dot product using AVX2 FMA.
+    /// Q5_K block (176 bytes per 256 elements):
+    ///   [0:1] FP16 d, [2:3] FP16 dmin, [4:15] scales (12 bytes),
+    ///   [16:47] qh (32 bytes, 1 high bit per element), [48:175] ql (128 bytes, 4 bits).
+    /// </summary>
+    public static float DotQ5K(byte* row, float* input, int cols)
+    {
+        int numBlocks = cols / 256;
+
+        if (!Fma.IsSupported)
+            return DotQ5K_Scalar(row, input, cols);
+
+        var accLo = Vector256<float>.Zero;
+        var accHi = Vector256<float>.Zero;
+        var mask0F = Vector256.Create(0x0F);
+        var bit16 = Vector256.Create(16);
+        int elemOff = 0;
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            byte* x = row + b * 176;
+            float d = HalfToFloat(x[0], x[1]);
+            float dmin = HalfToFloat(x[2], x[3]);
+            byte* sc = x + 4;
+            byte* qh = x + 16;
+            byte* ql = x + 48;
+
+            int qIdx = 0;
+            int scIdx = 0;
+            byte u1 = 1, u2 = 2;
+
+            for (int chunk = 0; chunk < 4; chunk++)
+            {
+                GetScaleMinK4(scIdx, sc, out byte sc1, out byte m1);
+                GetScaleMinK4(scIdx + 1, sc, out byte sc2, out byte m2);
+
+                var d1 = Vector256.Create(d * sc1);
+                var negDm1 = Vector256.Create(-(dmin * m1));
+                var d2 = Vector256.Create(d * sc2);
+                var negDm2 = Vector256.Create(-(dmin * m2));
+
+                int bo = elemOff + chunk * 64;
+
+                for (int l = 0; l < 32; l += 8)
+                {
+                    // Load 8 ql bytes and extract nibbles
+                    var bytes = LoadBytes8(ql + qIdx + l);
+                    var ints = Avx2.ConvertToVector256Int32(bytes);
+                    var loNibble = Avx2.And(ints, mask0F);
+                    var hiNibble = Avx2.And(Avx2.ShiftRightLogical(ints, 4), mask0F);
+
+                    // Load 8 qh bytes and extract high bits for this chunk
+                    var qhBytes = LoadBytes8(qh + l);
+                    var qhInts = Avx2.ConvertToVector256Int32(qhBytes);
+
+                    // High bit for low nibble: (qh & u1) != 0 → 16
+                    var hLoMask = Avx2.And(qhInts, Vector256.Create((int)u1));
+                    var hLo = Avx2.And(
+                        Avx2.CompareGreaterThan(hLoMask, Vector256<int>.Zero),
+                        bit16);
+                    var q5Lo = Avx2.Add(loNibble, hLo);
+
+                    // High bit for high nibble: (qh & u2) != 0 → 16
+                    var hHiMask = Avx2.And(qhInts, Vector256.Create((int)u2));
+                    var hHi = Avx2.And(
+                        Avx2.CompareGreaterThan(hHiMask, Vector256<int>.Zero),
+                        bit16);
+                    var q5Hi = Avx2.Add(hiNibble, hHi);
+
+                    // Dequant: d1 * q5Lo - dm1
+                    var deqLo = Fma.MultiplyAdd(d1, Avx.ConvertToVector256Single(q5Lo), negDm1);
+                    accLo = Fma.MultiplyAdd(deqLo, Avx.LoadVector256(input + bo + l), accLo);
+
+                    // Dequant: d2 * q5Hi - dm2
+                    var deqHi = Fma.MultiplyAdd(d2, Avx.ConvertToVector256Single(q5Hi), negDm2);
+                    accHi = Fma.MultiplyAdd(deqHi, Avx.LoadVector256(input + bo + 32 + l), accHi);
+                }
+
+                qIdx += 32;
+                scIdx += 2;
+                u1 <<= 2;
+                u2 <<= 2;
+            }
+            elemOff += 256;
+        }
+
+        return HSum256(Avx.Add(accLo, accHi));
+    }
+
+    private static float DotQ5K_Scalar(byte* row, float* input, int cols)
+    {
+        int numBlocks = cols / 256;
+        float acc = 0;
+        int elemOff = 0;
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            byte* x = row + b * 176;
+            float d = HalfToFloat(x[0], x[1]);
+            float dmin = HalfToFloat(x[2], x[3]);
+            byte* sc = x + 4;
+            byte* qh = x + 16;
+            byte* ql = x + 48;
+            int qIdx = 0, scIdx = 0;
+            byte u1 = 1, u2 = 2;
+
+            for (int chunk = 0; chunk < 4; chunk++)
+            {
+                GetScaleMinK4(scIdx, sc, out byte sc1, out byte m1);
+                GetScaleMinK4(scIdx + 1, sc, out byte sc2, out byte m2);
+                float d1 = d * sc1, dm1 = dmin * m1;
+                float d2 = d * sc2, dm2 = dmin * m2;
+                int bo = elemOff + chunk * 64;
+
+                for (int l = 0; l < 32; l++)
+                {
+                    int hLo = (qh[l] & u1) != 0 ? 16 : 0;
+                    int hHi = (qh[l] & u2) != 0 ? 16 : 0;
+                    acc += (d1 * ((ql[qIdx + l] & 0xF) + hLo) - dm1) * input[bo + l];
+                    acc += (d2 * ((ql[qIdx + l] >> 4) + hHi) - dm2) * input[bo + 32 + l];
+                }
+                qIdx += 32;
+                scIdx += 2;
+                u1 <<= 2;
+                u2 <<= 2;
             }
             elemOff += 256;
         }
