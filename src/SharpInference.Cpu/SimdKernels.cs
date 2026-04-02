@@ -279,6 +279,9 @@ public static unsafe class SimdKernels
     {
         int numBlocks = cols / 256;
 
+        if (Avx512F.IsSupported)
+            return DotQ4K_Avx512(row, input, cols, numBlocks);
+
         if (!Fma.IsSupported)
             return DotQ4K_Scalar(row, input, cols);
 
@@ -335,6 +338,71 @@ public static unsafe class SimdKernels
         }
 
         return HSum256(Avx.Add(accLo, accHi));
+    }
+
+    private static float DotQ4K_Avx512(byte* row, float* input, int cols, int numBlocks)
+    {
+        var accLo = Vector512<float>.Zero;
+        var accHi = Vector512<float>.Zero;
+        var mask0F = Vector512.Create(0x0F);
+        int elemOff = 0;
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            byte* x = row + b * 144;
+            float d = HalfToFloat(x[0], x[1]);
+            float dmin = HalfToFloat(x[2], x[3]);
+            byte* sc = x + 4;
+            byte* qs = x + 16;
+
+            int qIdx = 0;
+            int scIdx = 0;
+
+            for (int chunk = 0; chunk < 4; chunk++)
+            {
+                GetScaleMinK4(scIdx, sc, out byte sc1, out byte m1);
+                GetScaleMinK4(scIdx + 1, sc, out byte sc2, out byte m2);
+
+                var d1 = Vector512.Create(d * sc1);
+                var negDm1 = Vector512.Create(-(dmin * m1));
+                var d2 = Vector512.Create(d * sc2);
+                var negDm2 = Vector512.Create(-(dmin * m2));
+
+                int bo = elemOff + chunk * 64;
+
+                // Process 16 elements per iteration (vs 8 with AVX2)
+                for (int l = 0; l < 32; l += 16)
+                {
+                    // Load 16 quantized bytes → 16 int32s via vpmovzxbd
+                    var bytes16 = Vector128.LoadUnsafe(ref *(qs + qIdx + l));
+                    var ints = Avx512F.ConvertToVector512Int32(bytes16);
+
+                    // Lower nibble → accLo
+                    var lo = Avx512F.And(ints, mask0F);
+                    var deqLo = Avx512F.FusedMultiplyAdd(d1, Avx512F.ConvertToVector512Single(lo), negDm1);
+                    accLo = Avx512F.FusedMultiplyAdd(deqLo, Vector512.LoadUnsafe(ref *(input + bo + l)), accLo);
+
+                    // Upper nibble → accHi
+                    var hi = Avx512F.And(Avx512F.ShiftRightLogical(ints, 4), mask0F);
+                    var deqHi = Avx512F.FusedMultiplyAdd(d2, Avx512F.ConvertToVector512Single(hi), negDm2);
+                    accHi = Avx512F.FusedMultiplyAdd(deqHi, Vector512.LoadUnsafe(ref *(input + bo + 32 + l)), accHi);
+                }
+
+                qIdx += 32;
+                scIdx += 2;
+            }
+            elemOff += 256;
+        }
+
+        return HSum512(Avx512F.Add(accLo, accHi));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float HSum512(Vector512<float> v)
+    {
+        var lo = v.GetLower();
+        var hi = v.GetUpper();
+        return HSum256(Avx.Add(lo, hi));
     }
 
     private static float DotQ4K_Scalar(byte* row, float* input, int cols)
@@ -409,6 +477,9 @@ public static unsafe class SimdKernels
     public static float DotQ5K(byte* row, float* input, int cols)
     {
         int numBlocks = cols / 256;
+
+        if (Avx512F.IsSupported)
+            return DotQ5K_Avx512(row, input, cols, numBlocks);
 
         if (!Fma.IsSupported)
             return DotQ5K_Scalar(row, input, cols);
@@ -488,6 +559,78 @@ public static unsafe class SimdKernels
         }
 
         return HSum256(Avx.Add(accLo, accHi));
+    }
+
+    private static float DotQ5K_Avx512(byte* row, float* input, int cols, int numBlocks)
+    {
+        var accLo = Vector512<float>.Zero;
+        var accHi = Vector512<float>.Zero;
+        var mask0F = Vector512.Create(0x0F);
+        var bit16 = Vector512.Create(16);
+        int elemOff = 0;
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            byte* x = row + b * 176;
+            float d = HalfToFloat(x[0], x[1]);
+            float dmin = HalfToFloat(x[2], x[3]);
+            byte* sc = x + 4;
+            byte* qh = x + 16;
+            byte* ql = x + 48;
+
+            int qIdx = 0, scIdx = 0;
+            byte u1 = 1, u2 = 2;
+
+            for (int chunk = 0; chunk < 4; chunk++)
+            {
+                GetScaleMinK4(scIdx, sc, out byte sc1, out byte m1);
+                GetScaleMinK4(scIdx + 1, sc, out byte sc2, out byte m2);
+
+                var d1 = Vector512.Create(d * sc1);
+                var negDm1 = Vector512.Create(-(dmin * m1));
+                var d2 = Vector512.Create(d * sc2);
+                var negDm2 = Vector512.Create(-(dmin * m2));
+
+                int bo = elemOff + chunk * 64;
+
+                for (int l = 0; l < 32; l += 16)
+                {
+                    var qlBytes = Vector128.LoadUnsafe(ref *(ql + qIdx + l));
+                    var qlInts = Avx512F.ConvertToVector512Int32(qlBytes);
+
+                    var qhBytes = Vector128.LoadUnsafe(ref *(qh + l));
+                    var qhInts = Avx512F.ConvertToVector512Int32(qhBytes);
+
+                    // Low nibble + high bit
+                    var loNib = Avx512F.And(qlInts, mask0F);
+                    var hLoMask = Avx512F.And(qhInts, Vector512.Create((int)u1));
+                    var hLo = Avx512F.And(
+                        Avx512F.CompareGreaterThan(hLoMask, Vector512<int>.Zero).AsInt32(),
+                        bit16);
+                    var q5Lo = Avx512F.Add(loNib, hLo);
+                    var deqLo = Avx512F.FusedMultiplyAdd(d1, Avx512F.ConvertToVector512Single(q5Lo), negDm1);
+                    accLo = Avx512F.FusedMultiplyAdd(deqLo, Vector512.LoadUnsafe(ref *(input + bo + l)), accLo);
+
+                    // High nibble + high bit
+                    var hiNib = Avx512F.And(Avx512F.ShiftRightLogical(qlInts, 4), mask0F);
+                    var hHiMask = Avx512F.And(qhInts, Vector512.Create((int)u2));
+                    var hHi = Avx512F.And(
+                        Avx512F.CompareGreaterThan(hHiMask, Vector512<int>.Zero).AsInt32(),
+                        bit16);
+                    var q5Hi = Avx512F.Add(hiNib, hHi);
+                    var deqHi = Avx512F.FusedMultiplyAdd(d2, Avx512F.ConvertToVector512Single(q5Hi), negDm2);
+                    accHi = Avx512F.FusedMultiplyAdd(deqHi, Vector512.LoadUnsafe(ref *(input + bo + 32 + l)), accHi);
+                }
+
+                qIdx += 32;
+                scIdx += 2;
+                u1 <<= 2;
+                u2 <<= 2;
+            }
+            elemOff += 256;
+        }
+
+        return HSum512(Avx512F.Add(accLo, accHi));
     }
 
     private static float DotQ5K_Scalar(byte* row, float* input, int cols)
