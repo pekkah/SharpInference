@@ -273,8 +273,10 @@ public sealed unsafe class GpuForwardPass : IDisposable
             commandBufferCount = 1,
             pCommandBuffers = &cmd,
         };
-        vkd.vkQueueSubmit(_gpu.ComputeQueue, 1, &submit, Vortice.Vulkan.VkFence.Null).CheckResult();
-        vkd.vkQueueWaitIdle(_gpu.ComputeQueue);
+        var fence = _gpu.Fence;
+        vkd.vkResetFences(1, &fence).CheckResult();
+        vkd.vkQueueSubmit(_gpu.ComputeQueue, 1, &submit, fence).CheckResult();
+        vkd.vkWaitForFences(1, &fence, true, ulong.MaxValue).CheckResult();
     }
 
     /// <summary>Record a buffer copy into the current command buffer (must be in recording mode).</summary>

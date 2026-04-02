@@ -22,6 +22,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private readonly VkPhysicalDeviceMemoryProperties _memoryProperties;
     private readonly VkCommandPool _commandPool;
     private readonly VkCommandBuffer _transferCmd; // single-use for staging transfers
+    private readonly VkFence _fence; // reusable fence for submission synchronization
     private bool _disposed;
 
     public string Name { get; }
@@ -69,15 +70,23 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
             0, 1, &barrier, 0, null, 0, null);
     }
 
-    /// <summary>End recording and submit all dispatches. Synchronous wait.</summary>
+    /// <summary>End recording and submit all dispatches. Synchronous wait via fence.</summary>
     public void EndRecordAndSubmit()
     {
         _recording = false;
         _vkd.vkEndCommandBuffer(_transferCmd).CheckResult();
+        SubmitAndWait();
+    }
+
+    /// <summary>Submit the transfer command buffer and wait for completion via fence.</summary>
+    private void SubmitAndWait()
+    {
         VkCommandBuffer cmd = _transferCmd;
         VkSubmitInfo submit = new() { commandBufferCount = 1, pCommandBuffers = &cmd };
-        _vkd.vkQueueSubmit(_computeQueue, 1, &submit, VkFence.Null).CheckResult();
-        _vkd.vkQueueWaitIdle(_computeQueue);
+        var fence = _fence;
+        _vkd.vkResetFences(1, &fence).CheckResult();
+        _vkd.vkQueueSubmit(_computeQueue, 1, &submit, _fence).CheckResult();
+        _vkd.vkWaitForFences(1, &fence, true, ulong.MaxValue).CheckResult();
     }
 
     public VulkanBackend()
@@ -150,6 +159,12 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         VkCommandBuffer cmd;
         _vkd.vkAllocateCommandBuffers(&cmdAllocInfo, &cmd).CheckResult();
         _transferCmd = cmd;
+
+        // 8. Create reusable fence for submission synchronization
+        VkFenceCreateInfo fenceCI = new();
+        VkFence fence;
+        _vkd.vkCreateFence(&fenceCI, null, &fence).CheckResult();
+        _fence = fence;
     }
 
     /// <summary>Print device info to console.</summary>
@@ -278,6 +293,10 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
             buf.Dispose();
     }
 
+    // Cached staging buffer for uploads (avoids per-call alloc/free)
+    private GpuBuffer? _uploadStaging;
+    private ulong _uploadStagingSize;
+
     public Tensor Upload(ReadOnlySpan<float> data, TensorShape shape)
     {
         ulong byteSize = (ulong)(data.Length * sizeof(float));
@@ -286,17 +305,22 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         var gpuBuf = GpuBuffer.CreateDeviceLocal(this, byteSize,
             VkBufferUsageFlags.StorageBuffer | VkBufferUsageFlags.TransferDst);
 
-        // Create staging buffer, copy data, transfer to VRAM
-        using var staging = GpuBuffer.CreateStaging(this, byteSize,
-            VkBufferUsageFlags.TransferSrc);
+        // Reuse or grow staging buffer
+        if (_uploadStaging == null || _uploadStagingSize < byteSize)
+        {
+            _uploadStaging?.Dispose();
+            _uploadStaging = GpuBuffer.CreateStaging(this, byteSize,
+                VkBufferUsageFlags.TransferSrc);
+            _uploadStagingSize = byteSize;
+        }
 
         // Map staging, copy data
-        float* mapped = (float*)staging.Map();
+        float* mapped = (float*)_uploadStaging.Map();
         data.CopyTo(new Span<float>(mapped, data.Length));
-        staging.Unmap();
+        _uploadStaging.Unmap();
 
         // Record and submit copy command
-        CopyBuffer(staging, gpuBuf, byteSize);
+        CopyBuffer(_uploadStaging, gpuBuf, byteSize);
 
         var handle = _nextHandle++;
         _buffers[handle] = gpuBuf;
@@ -328,9 +352,11 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _downloadStaging.Unmap();
     }
 
+    public VkFence Fence => _fence;
+
     public void Synchronize()
     {
-        _vkd.vkQueueWaitIdle(_computeQueue);
+        _vkd.vkDeviceWaitIdle();
     }
 
     // ================================================================
@@ -349,15 +375,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _vkd.vkCmdCopyBuffer(_transferCmd, src.Buffer, dst.Buffer, 1, &copyRegion);
 
         _vkd.vkEndCommandBuffer(_transferCmd).CheckResult();
-
-        VkCommandBuffer cmd = _transferCmd;
-        VkSubmitInfo submitInfo = new()
-        {
-            commandBufferCount = 1,
-            pCommandBuffers = &cmd,
-        };
-        _vkd.vkQueueSubmit(_computeQueue, 1, &submitInfo, VkFence.Null).CheckResult();
-        _vkd.vkQueueWaitIdle(_computeQueue); // synchronous for now
+        SubmitAndWait();
     }
 
     // ================================================================
@@ -530,12 +548,14 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _embedLookupPipeline?.Dispose();
 
         _downloadStaging?.Dispose();
+        _uploadStaging?.Dispose();
 
         // Free all tracked GPU buffers
         foreach (var buf in _buffers.Values)
             buf.Dispose();
         _buffers.Clear();
 
+        _vkd.vkDestroyFence(_fence, null);
         _vkd.vkDestroyCommandPool(_commandPool, null);
         _vkd.vkDestroyDevice(null);
         _vki.vkDestroyInstance(null);

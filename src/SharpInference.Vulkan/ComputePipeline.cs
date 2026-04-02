@@ -24,6 +24,9 @@ public sealed unsafe class ComputePipeline : IDisposable
     private readonly int _pushConstantSize;
     private bool _disposed;
 
+    // Descriptor set caching: skip vkUpdateDescriptorSets when bindings unchanged
+    private ulong _cachedBindingHash;
+
     /// <summary>
     /// Create a compute pipeline from GLSL source.
     /// </summary>
@@ -195,13 +198,15 @@ public sealed unsafe class ComputePipeline : IDisposable
 
         vkd.vkEndCommandBuffer(cmd).CheckResult();
 
+        var fence = _backend.Fence;
+        vkd.vkResetFences(1, &fence).CheckResult();
         VkSubmitInfo submitInfo = new()
         {
             commandBufferCount = 1,
             pCommandBuffers = &cmd,
         };
-        vkd.vkQueueSubmit(_backend.ComputeQueue, 1, &submitInfo, VkFence.Null).CheckResult();
-        vkd.vkQueueWaitIdle(_backend.ComputeQueue);
+        vkd.vkQueueSubmit(_backend.ComputeQueue, 1, &submitInfo, fence).CheckResult();
+        vkd.vkWaitForFences(1, &fence, true, ulong.MaxValue).CheckResult();
     }
 
     /// <summary>
@@ -227,7 +232,16 @@ public sealed unsafe class ComputePipeline : IDisposable
         uint groupCountX, uint groupCountY = 1, uint groupCountZ = 1,
         void* pushConstants = null)
     {
-        UpdateDescriptorSet(_reusableDs, buffers);
+        // Hash buffer handles to detect binding changes
+        ulong hash = (ulong)buffers.Length * 2654435761ul;
+        for (int i = 0; i < buffers.Length; i++)
+            hash ^= ((ulong)buffers[i].Buffer.Handle * 2654435761ul) << (i & 3);
+
+        if (hash != _cachedBindingHash)
+        {
+            UpdateDescriptorSet(_reusableDs, buffers);
+            _cachedBindingHash = hash;
+        }
         RecordDispatch(cmd, _reusableDs, groupCountX, groupCountY, groupCountZ, pushConstants);
     }
 
@@ -239,7 +253,15 @@ public sealed unsafe class ComputePipeline : IDisposable
         uint groupCountX, uint groupCountY = 1, uint groupCountZ = 1,
         void* pushConstants = null)
     {
-        UpdateDescriptorSet(_reusableDs, buffers);
+        ulong hash = (ulong)buffers.Length * 2654435761ul;
+        for (int i = 0; i < buffers.Length; i++)
+            hash ^= ((ulong)buffers[i].Buffer.Handle * 2654435761ul) << (i & 3);
+
+        if (hash != _cachedBindingHash)
+        {
+            UpdateDescriptorSet(_reusableDs, buffers);
+            _cachedBindingHash = hash;
+        }
         Dispatch(cmd, _reusableDs, groupCountX, groupCountY, groupCountZ, pushConstants);
     }
 

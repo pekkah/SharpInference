@@ -1423,13 +1423,15 @@ SPIR-V bytecode is embedded as assembly resources and loaded at runtime.
 - [x] Compute shaders: MatVecQ4K, MatVecQ6K, MatVecF32, RMSNorm, RoPE, softmax, SiLU, attention, embedding lookup, KV append
 - [x] Batched command buffer: all ~240 dispatches per token in one submission with memory barriers
 - [x] FP32 KV cache in VRAM (per-layer, device-local)
-- [x] GPU attention with atomicAdd value accumulation (no PCIe round-trips)
+- [x] GPU attention with shared-memory parallel reduction (no atomics, no PCIe round-trips)
 - [x] All weights resident in VRAM (Q4_K raw, Q6_K raw, F32 norms)
 - [x] Zero managed allocation per decode token
 - [x] GPU forward pass validated against CPU token-for-token
 - [x] NativeAOT-ready CLI with IlcOptimizationPreference=Speed, IlcInstructionSet=native
 
-**Results:** 68.7 t/s decode on RTX 4070 Ti (1.42× faster than CPU, 196% of ≥35 t/s target).
+**Results:** 87.4 t/s decode on RTX 4070 Ti (1.80× faster than CPU, 250% of ≥35 t/s target).
+Optimized from initial 68.7 t/s (+28%) via shared-memory block caching in Q4_K/Q6_K shaders,
+atomic-free attention reduction, descriptor set caching, fence-based sync, and staging buffer reuse.
 
 **Target model:** SmolLM2 1.7B ✅ (Qwen3 8B scaling — Phase 2b)
 
@@ -1575,7 +1577,7 @@ Based on the reference benchmarks above, these are concrete targets per phase:
 | Phase | Model | Configuration | llama.cpp Baseline | SharpInference Target | Actual | Notes |
 |-------|-------|---------------|-------------------|----------------------|--------|-------|
 | 1 | SmolLM2 1.7B Q4_K_M | CPU only | 45.1 TG t/s | Match llama.cpp | **48.6 TG t/s** ✅ | AVX2 SIMD, fused dequant-matvec |
-| 2 | SmolLM2 1.7B Q4_K_M | Full VRAM, RTX 4070 Ti | ~40–52 TG t/s | ≥ 35 TG t/s (≥80%) | **68.7 TG t/s** ✅ | Vulkan compute shaders, 196% of target |
+| 2 | SmolLM2 1.7B Q4_K_M | Full VRAM, RTX 4070 Ti | ~40–52 TG t/s | ≥ 35 TG t/s (≥80%) | **87.4 TG t/s** ✅ | Vulkan compute shaders, 250% of target |
 | 3 | Qwen3 8B Q4_K_M + TQ3 | Full VRAM, 64K ctx | N/A (doesn't fit with FP16 KV) | ≥ 30 TG t/s | TurboQuant enables what llama.cpp can't do at this context on 12GB |
 | 4 | Llama 3.1 70B Q4_K_M | Hybrid GPU+CPU | ~3–5 TG t/s (naive offload) | ≥ 5 TG t/s | Pipelined streaming should match or beat naive split |
 | 5 | Qwen3 30B-A3B Q4_K_M | MoE offload, 12GB + 64GB RAM | ~12 TG t/s (estimated) | ≥ 15 TG t/s | Prefetch + expert cache should beat naive offload |

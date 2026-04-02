@@ -52,7 +52,7 @@ Benchmarked on AMD Zen 4 (12c/24t) + RTX 4070 Ti, SmolLM2-1.7B Q4_K_M:
 | Backend | Decode (t/s) | Notes |
 |---------|-------------|-------|
 | CPU (AVX2 SIMD) | 48.6 | Fused dequant-matvec, multi-threaded |
-| GPU (Vulkan) | 68.7 | Compute shaders, VRAM-resident weights |
+| GPU (Vulkan) | 87.4 | Compute shaders, VRAM-resident weights |
 | llama.cpp (reference) | 45.1 | CPU decode on same hardware |
 
 ## Projects

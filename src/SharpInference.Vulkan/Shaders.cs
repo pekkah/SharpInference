@@ -201,7 +201,8 @@ internal static class Shaders
                 barrier();
             }
             float max_val = sdata[0];
-            barrier();
+            // No extra barrier needed — last reduction iteration's barrier
+            // guarantees sdata[0] is visible to all threads
 
             // Pass 2: exp(x - max) and sum
             float local_sum = 0.0;
@@ -218,7 +219,6 @@ internal static class Shaders
                 barrier();
             }
             float sum_val = sdata[0];
-            barrier();
 
             // Pass 3: normalize
             float inv_sum = 1.0 / sum_val;
@@ -293,7 +293,6 @@ internal static class Shaders
     internal const string Attention = """
         #version 450
         #extension GL_EXT_control_flow_attributes : enable
-        #extension GL_EXT_shader_atomic_float : enable
 
         layout(local_size_x = 256) in;
 
@@ -323,11 +322,6 @@ internal static class Shaders
             uint q_off = h * head_dim;
             uint out_off = h * head_dim;
 
-            // Zero output first (threads cooperate)
-            for (uint d = tid; d < head_dim; d += 256)
-                out_data[out_off + d] = 0.0;
-            barrier();
-
             // Phase 1: each thread computes score for position tid
             float score = -1.0/0.0;
             if (tid < seq_len) {
@@ -346,7 +340,6 @@ internal static class Shaders
                 barrier();
             }
             float max_val = sdata[0];
-            barrier();
 
             // Exp + sum
             float exp_val = (tid < seq_len) ? exp(score - max_val) : 0.0;
@@ -357,14 +350,20 @@ internal static class Shaders
                 barrier();
             }
             float weight = exp_val / sdata[0];
+
+            // Store all weights in shared memory for Phase 3
+            sdata[tid] = weight;
             barrier();
 
-            // Phase 3: weighted value sum — each thread atomically adds weight*V[tid]
-            // For short seqLen (decode), this is efficient: few threads, no contention
-            if (tid < seq_len) {
-                uint v_off = tid * kv_dim + kv_head * head_dim;
-                for (uint d = 0; d < head_dim; d++)
-                    atomicAdd(out_data[out_off + d], weight * v_cache[v_off + d]);
+            // Phase 3: weighted value sum — each thread handles output dimensions
+            // Thread tid computes out[d] = sum_t(sdata[t] * V[t,d]) for d = tid, tid+256, ...
+            for (uint d = tid; d < head_dim; d += 256) {
+                float sum = 0.0;
+                for (uint t = 0; t < seq_len; t++) {
+                    uint v_off = t * kv_dim + kv_head * head_dim;
+                    sum += sdata[t] * v_cache[v_off + d];
+                }
+                out_data[out_off + d] = sum;
             }
         }
         """;
@@ -394,20 +393,21 @@ internal static class Shaders
         };
 
         shared float sdata[256];
+        shared uint blk[53]; // 210 bytes = 52.5 uint32s → 53 (last uint covers bytes 208-211, we only use 208-209)
 
-        uint readByte(uint byteOffset) {
-            return (weights_data[byteOffset >> 2] >> ((byteOffset & 3) * 8)) & 0xFF;
+        uint sReadByte(uint byteOffset) {
+            return (blk[byteOffset >> 2] >> ((byteOffset & 3) * 8)) & 0xFF;
         }
 
-        float readHalf(uint byteOffset) {
-            uint lo = readByte(byteOffset);
-            uint hi = readByte(byteOffset + 1);
+        float sReadHalf(uint byteOffset) {
+            uint lo = sReadByte(byteOffset);
+            uint hi = sReadByte(byteOffset + 1);
             return unpackHalf2x16(lo | (hi << 8)).x;
         }
 
-        int readInt8(uint byteOffset) {
-            int val = int(readByte(byteOffset));
-            return val >= 128 ? val - 256 : val; // sign extend
+        int sReadInt8(uint byteOffset) {
+            int val = int(sReadByte(byteOffset));
+            return val >= 128 ? val - 256 : val;
         }
 
         void main() {
@@ -415,57 +415,68 @@ internal static class Shaders
             uint tid = gl_LocalInvocationID.x;
             if (row >= rows) return;
 
-            uint bytes_per_row = (cols / 256) * 210;
+            uint num_blocks = cols >> 8;
+            uint bytes_per_row = num_blocks * 210;
             uint boff_base = row * bytes_per_row;
 
             float acc = 0.0;
 
-            for (uint elem = tid; elem < cols; elem += 256) {
-                uint block = elem >> 8;
-                uint within = elem & 255;
+            for (uint block = 0; block < num_blocks; block++) {
+                // Cooperatively load 53 uint32s (212 bytes ≥ 210) into shared memory
+                uint global_byte_off = boff_base + block * 210;
+                uint global_word_base = global_byte_off >> 2;
+                uint byte_shift = (global_byte_off & 3) * 8;
 
-                uint boff = boff_base + block * 210;
-                float d = readHalf(boff + 208);
+                // 210 bytes at arbitrary alignment: we need to handle unaligned reads
+                // Load 54 words to cover possible misalignment, then shift
+                if (tid < 54) {
+                    uint raw = weights_data[global_word_base + tid];
+                    if (byte_shift == 0) {
+                        if (tid < 53) blk[tid] = raw;
+                    } else {
+                        uint next = (tid < 53) ? weights_data[global_word_base + tid + 1] : 0u;
+                        if (tid < 53) blk[tid] = (raw >> byte_shift) | (next << (32 - byte_shift));
+                    }
+                }
+                barrier();
 
-                // Determine which half-block (0-127 or 128-255)
-                uint half_idx = within >> 7; // 0 or 1
+                // Each thread dequantizes element tid within the block
+                uint within = tid; // 0-255
+                float d = sReadHalf(208);
+
+                uint half_idx = within >> 7;
                 uint in_half = within & 127;
-
-                // 4 groups of 32 within each 128-element half:
-                //   group 0: elements 0-31   — ql lower, qh bits 0-1, scale[+0/+1]
-                //   group 1: elements 32-63  — qlB lower, qh bits 2-3, scale[+2/+3]
-                //   group 2: elements 64-95  — ql upper,  qh bits 4-5, scale[+4/+5]
-                //   group 3: elements 96-127 — qlB upper, qh bits 6-7, scale[+6/+7]
-                uint group = in_half >> 5; // 0-3
+                uint group = in_half >> 5;
                 uint l = in_half & 31;
 
-                uint ql_base = boff + half_idx * 64;
-                uint qh_base = boff + 128 + half_idx * 32;
-                uint sc_base = boff + 192 + half_idx * 8;
+                uint ql_base = half_idx * 64;
+                uint qh_base = 128 + half_idx * 32;
+                uint sc_base = 192 + half_idx * 8;
 
-                uint isc = l >> 4; // 0 for l<16, 1 for l>=16
-                int scale_val = readInt8(sc_base + isc + group * 2);
+                uint isc = l >> 4;
+                int scale_val = sReadInt8(sc_base + isc + group * 2);
 
                 uint ql_byte, qh_byte;
                 int quant;
 
                 if (group < 2) {
-                    // groups 0,1: lower nibble
                     uint ql_off = (group == 0) ? l : (32 + l);
-                    ql_byte = readByte(ql_base + ql_off);
-                    qh_byte = readByte(qh_base + l);
+                    ql_byte = sReadByte(ql_base + ql_off);
+                    qh_byte = sReadByte(qh_base + l);
                     uint shift = group * 2;
                     quant = int(((ql_byte & 0xF) | (((qh_byte >> shift) & 3) << 4))) - 32;
                 } else {
-                    // groups 2,3: upper nibble
                     uint ql_off = (group == 2) ? l : (32 + l);
-                    ql_byte = readByte(ql_base + ql_off);
-                    qh_byte = readByte(qh_base + l);
+                    ql_byte = sReadByte(ql_base + ql_off);
+                    qh_byte = sReadByte(qh_base + l);
                     uint shift = group * 2;
                     quant = int((((ql_byte >> 4) & 0xF) | (((qh_byte >> shift) & 3) << 4))) - 32;
                 }
 
+                uint elem = block * 256 + tid;
                 acc += d * float(scale_val) * float(quant) * input_data[elem];
+
+                barrier();
             }
 
             sdata[tid] = acc;
@@ -553,24 +564,26 @@ internal static class Shaders
         };
 
         shared float sdata[256];
+        shared uint blk[36]; // 144 bytes = 36 uint32s — one Q4_K block cached in shared memory
 
-        uint readByte(uint byteOffset) {
-            return (weights_data[byteOffset >> 2] >> ((byteOffset & 3) * 8)) & 0xFF;
+        uint sReadByte(uint byteOffset) {
+            return (blk[byteOffset >> 2] >> ((byteOffset & 3) * 8)) & 0xFF;
         }
 
-        float readHalf(uint byteOffset) {
-            uint lo = readByte(byteOffset);
-            uint hi = readByte(byteOffset + 1);
+        float sReadHalf(uint byteOffset) {
+            uint lo = sReadByte(byteOffset);
+            uint hi = sReadByte(byteOffset + 1);
             return unpackHalf2x16(lo | (hi << 8)).x;
         }
 
-        void getScaleMin(uint scale_off, uint j, out float sc, out float m) {
+        void sGetScaleMin(uint j, out float sc, out float m) {
+            // scales start at byte offset 4 within block
             if (j < 4) {
-                sc = float(readByte(scale_off + j) & 63);
-                m  = float(readByte(scale_off + j + 4) & 63);
+                sc = float(sReadByte(4 + j) & 63);
+                m  = float(sReadByte(4 + j + 4) & 63);
             } else {
-                sc = float((readByte(scale_off + j + 4) & 0xF) | ((readByte(scale_off + j - 4) >> 6) << 4));
-                m  = float((readByte(scale_off + j + 4) >> 4) | ((readByte(scale_off + j) >> 6) << 4));
+                sc = float((sReadByte(4 + j + 4) & 0xF) | ((sReadByte(4 + j - 4) >> 6) << 4));
+                m  = float((sReadByte(4 + j + 4) >> 4) | ((sReadByte(4 + j) >> 6) << 4));
             }
         }
 
@@ -579,33 +592,40 @@ internal static class Shaders
             uint tid = gl_LocalInvocationID.x;
             if (row >= rows) return;
 
-            uint bytes_per_row = (cols / 256) * 144;
+            uint num_blocks = cols >> 8;
+            uint bytes_per_row = num_blocks * 144;
             uint boff_base = row * bytes_per_row;
 
             float acc = 0.0;
 
-            // ALL 256 threads process elements with stride
-            // Each thread handles cols/256 elements total
-            for (uint elem = tid; elem < cols; elem += 256) {
-                uint block = elem >> 8;  // elem / 256
-                uint within = elem & 255; // elem % 256
-                uint chunk = within >> 6; // within / 64
-                uint sub = within & 63;   // within % 64
+            // Process one block at a time; all 256 threads cooperate per block
+            for (uint block = 0; block < num_blocks; block++) {
+                // Cooperatively load 36 uint32s (144 bytes) into shared memory
+                uint global_word_base = (boff_base + block * 144) >> 2;
+                if (tid < 36)
+                    blk[tid] = weights_data[global_word_base + tid];
+                barrier();
+
+                // Each thread dequantizes its own element (tid = within-block index)
+                uint chunk = tid >> 6;   // 0-3
+                uint sub = tid & 63;
                 bool is_upper = sub >= 32;
                 uint byte_pos = sub & 31;
 
-                uint boff = boff_base + block * 144;
-                float d = readHalf(boff);
-                float dmin = readHalf(boff + 2);
+                float d = sReadHalf(0);
+                float dmin = sReadHalf(2);
 
                 uint si = chunk * 2 + (is_upper ? 1u : 0u);
                 float sc, mn;
-                getScaleMin(boff + 4, si, sc, mn);
+                sGetScaleMin(si, sc, mn);
 
-                uint qbyte = readByte(boff + 16 + chunk * 32 + byte_pos);
+                uint qbyte = sReadByte(16 + chunk * 32 + byte_pos);
                 uint nibble = is_upper ? (qbyte >> 4) : (qbyte & 0xF);
 
+                uint elem = block * 256 + tid;
                 acc += (d * sc * float(nibble) - dmin * mn) * input_data[elem];
+
+                barrier(); // ensure blk[] not overwritten before all threads done
             }
 
             // Parallel reduction
