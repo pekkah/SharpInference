@@ -691,8 +691,8 @@ internal static class Shaders
         #extension GL_EXT_control_flow_attributes : enable
         #extension GL_KHR_shader_subgroup_arithmetic : enable
 
-        // Process N_ROWS per workgroup to increase arithmetic intensity.
-        // 64 threads per row, 4 rows per workgroup = 256 threads.
+        // 4 rows per workgroup, 64 threads per row = 256 threads.
+        // unpackHalf2x16 for d/dmin, shared memory reduction per row.
         #define N_ROWS 4
         #define THREADS_PER_ROW 64
 
@@ -713,12 +713,6 @@ internal static class Shaders
             return (weights_data[word_base + (byteOffset >> 2)] >> ((byteOffset & 3) * 8)) & 0xFF;
         }
 
-        float gReadHalf(uint word_base, uint byteOffset) {
-            uint lo = gReadByte(word_base, byteOffset);
-            uint hi = gReadByte(word_base, byteOffset + 1);
-            return unpackHalf2x16(lo | (hi << 8)).x;
-        }
-
         void gGetScaleMin(uint word_base, uint j, out float sc, out float m) {
             if (j < 4) {
                 sc = float(gReadByte(word_base, 4 + j) & 63);
@@ -731,29 +725,25 @@ internal static class Shaders
 
         void main() {
             uint tid = gl_LocalInvocationID.x;
-            uint row_in_wg = tid / THREADS_PER_ROW;  // 0..N_ROWS-1
-            uint lane = tid % THREADS_PER_ROW;        // 0..63
+            uint row_in_wg = tid / THREADS_PER_ROW;
+            uint lane = tid % THREADS_PER_ROW;
             uint row = gl_WorkGroupID.x * N_ROWS + row_in_wg;
             if (row >= rows) return;
 
             uint num_blocks = cols >> 8;
-            uint bytes_per_row = num_blocks * 144;
-            uint word_row_base = (row * bytes_per_row) >> 2;
+            uint word_row_base = (row * num_blocks * 36) >> 0;  // 36 words per block
 
             float acc = 0.0;
 
-            // Each thread processes multiple elements across blocks.
-            // 64 threads per row: each thread handles 4 elements per block (256/64).
             for (uint block = 0; block < num_blocks; block++) {
-                uint word_base = word_row_base + ((block * 144) >> 2);
+                uint word_base = word_row_base + block * 36;
 
-                float d = gReadHalf(word_base, 0);
-                float dmin = gReadHalf(word_base, 2);
+                // Read d and dmin as packed FP16 pair
+                vec2 dm = unpackHalf2x16(weights_data[word_base]);
+                float d = dm.x;
+                float dmin = dm.y;
 
-                // 64 threads handle 256 elements: each thread does 4 elements
-                // lane 0-15: chunk 0 low, lane 16-31: chunk 0 high,
-                // lane 32-47: chunk 1 low (remap to chunks 2,3)
-                // Simpler: each thread handles elements lane, lane+64, lane+128, lane+192
+                // Each thread handles 4 elements: lane, lane+64, lane+128, lane+192
                 [[unroll]] for (uint e = 0; e < 4; e++) {
                     uint elem_idx = lane + e * 64;
                     uint chunk = elem_idx >> 6;
@@ -773,17 +763,14 @@ internal static class Shaders
                 }
             }
 
-            // Reduction within each row's 64 threads using shared memory
+            // Reduction: 64 threads per row
             sdata[tid] = acc;
             barrier();
-
-            // Reduce within each row's 64-thread group
             uint base_idx = row_in_wg * THREADS_PER_ROW;
             [[unroll]] for (uint s = 32; s > 0; s >>= 1) {
                 if (lane < s) sdata[base_idx + lane] += sdata[base_idx + lane + s];
                 barrier();
             }
-
             if (lane == 0) output_data[row] = sdata[base_idx];
         }
         """;
