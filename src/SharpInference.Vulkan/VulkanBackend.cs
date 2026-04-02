@@ -78,6 +78,25 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         SubmitAndWait();
     }
 
+    /// <summary>End recording and submit without waiting. Call <see cref="WaitForGpu"/> before reading results.</summary>
+    public void EndRecordAndSubmitAsync()
+    {
+        _recording = false;
+        _vkd.vkEndCommandBuffer(_transferCmd).CheckResult();
+        VkCommandBuffer cmd = _transferCmd;
+        VkSubmitInfo submit = new() { commandBufferCount = 1, pCommandBuffers = &cmd };
+        var fence = _fence;
+        _vkd.vkResetFences(1, &fence).CheckResult();
+        _vkd.vkQueueSubmit(_computeQueue, 1, &submit, _fence).CheckResult();
+    }
+
+    /// <summary>Wait for a previously submitted async batch to complete.</summary>
+    public void WaitForGpu()
+    {
+        var fence = _fence;
+        _vkd.vkWaitForFences(1, &fence, true, ulong.MaxValue).CheckResult();
+    }
+
     /// <summary>Submit the transfer command buffer and wait for completion via fence.</summary>
     private void SubmitAndWait()
     {

@@ -208,6 +208,23 @@ public sealed unsafe class HybridForwardPass : IDisposable
 
         _cpuKvCache = new KvCache(_nCpuLayers, _maxSeqLen, _numKvHeads, _headDim);
 
+        // Pre-fault mmap pages for CPU layers: touch the first byte of each weight tensor
+        // to ensure OS pages them into RAM before the first forward pass.
+        if (_nCpuLayers > 0)
+        {
+            Console.Error.Write($"[HybridForwardPass] Pre-faulting CPU weight pages...");
+            long touchSum = 0;
+            foreach (var wRef in _cpuWq.Concat(_cpuWk).Concat(_cpuWv).Concat(_cpuWo)
+                .Concat(_cpuWGate).Concat(_cpuWUp).Concat(_cpuWDown))
+            {
+                // Touch first and last cache line of each weight tensor
+                touchSum += wRef.DataPtr[0];
+                long size = wRef.Info.ByteSize;
+                if (size > 64) touchSum += wRef.DataPtr[size - 1];
+            }
+            Console.Error.WriteLine($" done. (touch={touchSum})");
+        }
+
         if (_tqEnabled && _nCpuLayers > 0)
         {
             _cpuTqKvCache = new TurboQuantKvCache(_nCpuLayers, _maxSeqLen, _numKvHeads, _headDim);
