@@ -170,6 +170,23 @@ public static class DTypeInfo
     };
 
     /// <summary>
+    /// Returns the byte size of one element for non-quantized types.
+    /// For quantized types, use ByteSize() instead.
+    /// </summary>
+    public static int BytesPerElement(DType dtype) => dtype switch
+    {
+        DType.Float32  => 4,
+        DType.Float16  => 2,
+        DType.BFloat16 => 2,
+        DType.Float64  => 8,
+        DType.Int8     => 1,
+        DType.Int16    => 2,
+        DType.Int32    => 4,
+        DType.Int64    => 8,
+        _ => throw new ArgumentException($"BytesPerElement not supported for quantized type {dtype}")
+    };
+
+    /// <summary>
     /// Computes the total byte size for a tensor with the given element count and dtype.
     /// </summary>
     public static long ByteSize(long elementCount, DType dtype)
