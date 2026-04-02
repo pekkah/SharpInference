@@ -303,19 +303,29 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         return new Tensor(shape, DType.Float32, handle);
     }
 
+    // Cached staging buffer for downloads (avoids per-call alloc/free)
+    private GpuBuffer? _downloadStaging;
+    private ulong _downloadStagingSize;
+
     public void Download(Tensor src, Span<float> dst)
     {
         var gpuBuf = GetBuffer(src);
         ulong byteSize = (ulong)(dst.Length * sizeof(float));
 
-        using var staging = GpuBuffer.CreateStaging(this, byteSize,
-            VkBufferUsageFlags.TransferDst);
+        // Reuse or grow staging buffer
+        if (_downloadStaging == null || _downloadStagingSize < byteSize)
+        {
+            _downloadStaging?.Dispose();
+            _downloadStaging = GpuBuffer.CreateStaging(this, byteSize,
+                VkBufferUsageFlags.TransferDst);
+            _downloadStagingSize = byteSize;
+        }
 
-        CopyBuffer(gpuBuf, staging, byteSize);
+        CopyBuffer(gpuBuf, _downloadStaging, byteSize);
 
-        float* mapped = (float*)staging.Map();
+        float* mapped = (float*)_downloadStaging.Map();
         new Span<float>(mapped, dst.Length).CopyTo(dst);
-        staging.Unmap();
+        _downloadStaging.Unmap();
     }
 
     public void Synchronize()
@@ -361,6 +371,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private ComputePipeline? _ropePipeline;
     private ComputePipeline? _softmaxPipeline;
     private ComputePipeline? _matVecQ4KPipeline;
+    private ComputePipeline? _matVecQ6KPipeline;
     private ComputePipeline? _matVecF32Pipeline;
     private ComputePipeline? _kvAppendPipeline;
     private ComputePipeline? _attentionPipeline;
@@ -438,17 +449,23 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     public void MatMul(Tensor output, Tensor matrix, Tensor vector, DType weightDType)
     {
         var p = new MatVecParams { rows = (uint)output.ElementCount, cols = (uint)vector.ElementCount };
-        if (weightDType == DType.Float32)
+        var bufs = (ReadOnlySpan<GpuBuffer>)[GetBuffer(matrix), GetBuffer(vector), GetBuffer(output)];
+        uint groups = (uint)output.ElementCount;
+
+        switch (weightDType)
         {
-            _matVecF32Pipeline ??= new ComputePipeline(this, Shaders.MatVecF32, 3, pushConstantSize: sizeof(MatVecParams));
-            DispatchOrRecord(_matVecF32Pipeline,
-                [GetBuffer(matrix), GetBuffer(vector), GetBuffer(output)], (uint)output.ElementCount, &p);
-        }
-        else
-        {
-            _matVecQ4KPipeline ??= new ComputePipeline(this, Shaders.MatVecQ4K, 3, pushConstantSize: sizeof(MatVecParams));
-            DispatchOrRecord(_matVecQ4KPipeline,
-                [GetBuffer(matrix), GetBuffer(vector), GetBuffer(output)], (uint)output.ElementCount, &p);
+            case DType.Float32:
+                _matVecF32Pipeline ??= new ComputePipeline(this, Shaders.MatVecF32, 3, pushConstantSize: sizeof(MatVecParams));
+                DispatchOrRecord(_matVecF32Pipeline, bufs, groups, &p);
+                break;
+            case DType.Q6_K:
+                _matVecQ6KPipeline ??= new ComputePipeline(this, Shaders.MatVecQ6K, 3, pushConstantSize: sizeof(MatVecParams));
+                DispatchOrRecord(_matVecQ6KPipeline, bufs, groups, &p);
+                break;
+            default: // Q4_K and others
+                _matVecQ4KPipeline ??= new ComputePipeline(this, Shaders.MatVecQ4K, 3, pushConstantSize: sizeof(MatVecParams));
+                DispatchOrRecord(_matVecQ4KPipeline, bufs, groups, &p);
+                break;
         }
     }
 
@@ -506,10 +523,13 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _ropePipeline?.Dispose();
         _softmaxPipeline?.Dispose();
         _matVecQ4KPipeline?.Dispose();
+        _matVecQ6KPipeline?.Dispose();
         _matVecF32Pipeline?.Dispose();
         _kvAppendPipeline?.Dispose();
         _attentionPipeline?.Dispose();
         _embedLookupPipeline?.Dispose();
+
+        _downloadStaging?.Dispose();
 
         // Free all tracked GPU buffers
         foreach (var buf in _buffers.Values)

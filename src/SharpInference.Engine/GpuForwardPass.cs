@@ -21,6 +21,9 @@ public sealed unsafe class GpuForwardPass : IDisposable
     private readonly GgufModel _model;
     private readonly ModelHyperparams _hp;
 
+    // Pre-allocated logits download buffer (avoids GC allocation per token)
+    private readonly float[] _logitsBuf;
+
     // GPU scratch buffers
     private readonly Tensor _hidden;     // [embDim]
     private readonly Tensor _residual;   // [embDim]
@@ -81,6 +84,7 @@ public sealed unsafe class GpuForwardPass : IDisposable
         _ffnGate = gpu.Allocate(TensorShape.D1(_intermDim));
         _ffnUp = gpu.Allocate(TensorShape.D1(_intermDim));
         _logits = gpu.Allocate(TensorShape.D1(hp.VocabSize));
+        _logitsBuf = new float[hp.VocabSize];
 
         // Allocate VRAM KV cache: per-layer [maxSeqLen, kvDim]
         int kvDim = _numKvHeads * _headDim;
@@ -138,7 +142,7 @@ public sealed unsafe class GpuForwardPass : IDisposable
     /// </summary>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
-        // 1 + 2. Record everything into ONE command buffer
+        // Record ALL dispatches into ONE command buffer
         _gpu.BeginRecord();
 
         // Embed token (GPU lookup from cached table — no PCIe transfer)
@@ -147,77 +151,73 @@ public sealed unsafe class GpuForwardPass : IDisposable
 
         for (int layer = 0; layer < _hp.NumLayers; layer++)
         {
-            // Copy hidden → residual
+            // Copy hidden → residual + RmsNorm (barrier after both)
             CopyBuffer(_residual, _hidden);
             _gpu.RecordTransferBarrier();
 
-            // Pre-attention RmsNorm
             _gpu.RmsNorm(_normBuf, _hidden, _wAttnNorm[layer], _hp.RmsNormEps);
             _gpu.RecordBarrier();
 
-            // Q/K/V projections
+            // Q/K/V all read normBuf (no conflict between them)
             GpuMatMul(_q, _wq[layer], _normBuf);
             GpuMatMul(_k, _wk[layer], _normBuf);
             GpuMatMul(_v, _wv[layer], _normBuf);
-            _gpu.RecordBarrier();
+            _gpu.RecordBarrier(); // Q/K/V done → RoPE + KV append + attention
 
-            // RoPE
+            // RoPE on Q and K (write different buffers, no conflict)
             _gpu.RoPE(_q, position, _headDim, _hp.RopeTheta);
             _gpu.RoPE(_k, position, _headDim, _hp.RopeTheta);
+            // KV append reads K/V written by RoPE
             _gpu.RecordBarrier();
 
-            // KV cache append
             _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer],
                 (uint)(_numKvHeads * _headDim), (uint)position, (uint)_maxSeqLen);
-            _gpu.RecordBarrier();
+            _gpu.RecordBarrier(); // cache filled → attention
 
-            // Attention
             _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
                 (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
                 (uint)(position + 1), (uint)_maxSeqLen);
-            _gpu.RecordBarrier();
+            _gpu.RecordBarrier(); // attnOut done → output projection
 
-            // Output projection
             GpuMatMul(_hidden, _wo[layer], _attnOut);
-            _gpu.RecordBarrier();
+            _gpu.RecordBarrier(); // hidden written → add
 
-            // Residual add
             _gpu.AddInPlace(_hidden, _residual);
-            _gpu.RecordBarrier();
+            // hidden done → FFN starts (copy + norm)
 
-            // FFN: save residual, norm, gate/up, SiLU, down, residual add
             CopyBuffer(_residual, _hidden);
             _gpu.RecordTransferBarrier();
 
             _gpu.RmsNorm(_normBuf, _hidden, _wFfnNorm[layer], _hp.RmsNormEps);
             _gpu.RecordBarrier();
 
+            // gate and up both read normBuf (no conflict)
             GpuMatMul(_ffnGate, _wGate[layer], _normBuf);
             GpuMatMul(_ffnUp, _wUp[layer], _normBuf);
-            _gpu.RecordBarrier();
+            _gpu.RecordBarrier(); // gate/up done → SiLU
 
             _gpu.SiLuMul(_ffnGate, _ffnUp);
-            _gpu.RecordBarrier();
+            _gpu.RecordBarrier(); // SiLU done → down projection
 
             GpuMatMul(_hidden, _wDown[layer], _ffnGate);
-            _gpu.RecordBarrier();
+            _gpu.RecordBarrier(); // hidden written → add
 
             _gpu.AddInPlace(_hidden, _residual);
-            _gpu.RecordBarrier();
+            // No barrier needed here — next layer starts with CopyBuffer which is a transfer
         }
 
         // Final norm + output projection
+        _gpu.RecordBarrier(); // last layer's AddInPlace → final norm
         _gpu.RmsNorm(_hidden, _hidden, _wOutputNorm, _hp.RmsNormEps);
         _gpu.RecordBarrier();
         GpuMatMul(_logits, _wOutput, _hidden);
 
-        // Submit ALL dispatches at once — single GPU submission for the entire token
+        // Submit ALL dispatches at once
         _gpu.EndRecordAndSubmit();
 
-        // Download logits to CPU
-        var logits = new float[_hp.VocabSize];
-        _gpu.Download(_logits, logits);
-        return logits;
+        // Download logits to CPU (reuse pre-allocated buffer)
+        _gpu.Download(_logits, _logitsBuf);
+        return _logitsBuf;
     }
 
     // ================================================================
@@ -302,19 +302,18 @@ public sealed unsafe class GpuForwardPass : IDisposable
             result = _gpu.Upload(floats, TensorShape.D1(floats.Length));
             _weightDTypes[result.Handle] = DType.Float32;
         }
-        else if (info.DType == DType.Q4_K)
+        else if (info.DType == DType.Q4_K || info.DType == DType.Q6_K)
         {
-            // Upload raw Q4_K bytes (reinterpret as floats for storage buffer)
+            // Upload raw quantized bytes (reinterpret as floats for storage buffer)
             int floatCount = data.Length / 4;
             var rawFloats = new float[floatCount];
             data.CopyTo(MemoryMarshal.AsBytes(rawFloats.AsSpan()));
             result = _gpu.Upload(rawFloats, TensorShape.D1(floatCount));
-            _weightDTypes[result.Handle] = DType.Q4_K;
+            _weightDTypes[result.Handle] = info.DType;
         }
         else
         {
-            // Q6_K and other types: dequantize to F32 on CPU, upload as F32
-            // (GPU Q6_K shader TBD — this is correct but slower)
+            // Other types: dequantize to F32 on CPU
             int count = (int)info.ElementCount;
             var f32 = new float[count];
             Dequantize.ToFloat32(data, f32, info.DType, count);

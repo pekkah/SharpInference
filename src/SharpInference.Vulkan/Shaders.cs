@@ -370,6 +370,117 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Matrix-vector multiply with Q6_K dequantization.
+    /// Same pattern as Q4_K but different block layout.
+    /// Q6_K block (210 bytes per 256 elements):
+    ///   [0:128]   ql — lower 4 bits
+    ///   [128:192] qh — upper 2 bits
+    ///   [192:208] 16 int8 scales
+    ///   [208:210] FP16 d (super-block scale)
+    /// </summary>
+    internal const string MatVecQ6K = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Weights { uint weights_data[]; };
+        layout(binding = 1) readonly buffer Input   { float input_data[]; };
+        layout(binding = 2) writeonly buffer Output  { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint rows;
+            uint cols;
+        };
+
+        shared float sdata[256];
+
+        uint readByte(uint byteOffset) {
+            return (weights_data[byteOffset >> 2] >> ((byteOffset & 3) * 8)) & 0xFF;
+        }
+
+        float readHalf(uint byteOffset) {
+            uint lo = readByte(byteOffset);
+            uint hi = readByte(byteOffset + 1);
+            return unpackHalf2x16(lo | (hi << 8)).x;
+        }
+
+        int readInt8(uint byteOffset) {
+            int val = int(readByte(byteOffset));
+            return val >= 128 ? val - 256 : val; // sign extend
+        }
+
+        void main() {
+            uint row = gl_WorkGroupID.x;
+            uint tid = gl_LocalInvocationID.x;
+            if (row >= rows) return;
+
+            uint bytes_per_row = (cols / 256) * 210;
+            uint boff_base = row * bytes_per_row;
+
+            float acc = 0.0;
+
+            for (uint elem = tid; elem < cols; elem += 256) {
+                uint block = elem >> 8;
+                uint within = elem & 255;
+
+                uint boff = boff_base + block * 210;
+                float d = readHalf(boff + 208);
+
+                // Determine which half-block (0-127 or 128-255)
+                uint half_idx = within >> 7; // 0 or 1
+                uint in_half = within & 127;
+
+                // 4 groups of 32 within each 128-element half:
+                //   group 0: elements 0-31   — ql lower, qh bits 0-1, scale[+0/+1]
+                //   group 1: elements 32-63  — qlB lower, qh bits 2-3, scale[+2/+3]
+                //   group 2: elements 64-95  — ql upper,  qh bits 4-5, scale[+4/+5]
+                //   group 3: elements 96-127 — qlB upper, qh bits 6-7, scale[+6/+7]
+                uint group = in_half >> 5; // 0-3
+                uint l = in_half & 31;
+
+                uint ql_base = boff + half_idx * 64;
+                uint qh_base = boff + 128 + half_idx * 32;
+                uint sc_base = boff + 192 + half_idx * 8;
+
+                uint isc = l >> 4; // 0 for l<16, 1 for l>=16
+                int scale_val = readInt8(sc_base + isc + group * 2);
+
+                uint ql_byte, qh_byte;
+                int quant;
+
+                if (group < 2) {
+                    // groups 0,1: lower nibble
+                    uint ql_off = (group == 0) ? l : (32 + l);
+                    ql_byte = readByte(ql_base + ql_off);
+                    qh_byte = readByte(qh_base + l);
+                    uint shift = group * 2;
+                    quant = int(((ql_byte & 0xF) | (((qh_byte >> shift) & 3) << 4))) - 32;
+                } else {
+                    // groups 2,3: upper nibble
+                    uint ql_off = (group == 2) ? l : (32 + l);
+                    ql_byte = readByte(ql_base + ql_off);
+                    qh_byte = readByte(qh_base + l);
+                    uint shift = group * 2;
+                    quant = int((((ql_byte >> 4) & 0xF) | (((qh_byte >> shift) & 3) << 4))) - 32;
+                }
+
+                acc += d * float(scale_val) * float(quant) * input_data[elem];
+            }
+
+            sdata[tid] = acc;
+            barrier();
+
+            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] += sdata[tid + s];
+                barrier();
+            }
+
+            if (tid == 0) output_data[row] = sdata[0];
+        }
+        """;
+
+    /// <summary>
     /// Matrix-vector multiply with F32 weights.
     /// Each workgroup computes one output row.
     /// Push constants: { uint rows, uint cols }.
