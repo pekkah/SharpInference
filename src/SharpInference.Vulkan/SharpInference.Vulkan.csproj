@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\SharpInference.Core\SharpInference.Core.csproj" />
+    <ProjectReference Include="..\SharpInference.Cpu\SharpInference.Cpu.csproj" />
   </ItemGroup>
 
   <ItemGroup>

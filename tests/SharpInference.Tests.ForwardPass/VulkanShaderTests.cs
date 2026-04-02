@@ -247,6 +247,71 @@ public sealed unsafe class VulkanShaderTests
         backend.Free(gpuOutput);
     }
 
+    [Fact]
+    public void GpuForwardPassMatchesCpuOutput()
+    {
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+
+        // CPU reference
+        using var cpuBackend = new SharpInference.Cpu.CpuBackend();
+        using var cpuFwd = new SharpInference.Engine.ForwardPass(model, cpuBackend, hp);
+
+        // GPU
+        using var gpu = new Vulkan.VulkanBackend();
+        using var gpuFwd = new SharpInference.Engine.GpuForwardPass(model, gpu, hp);
+
+        var prompt = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n";
+        var tokens = tokenizer.Encode(prompt);
+
+        // Run both forward passes
+        ReadOnlySpan<float> cpuLogits = default, gpuLogits = default;
+        for (int i = 0; i < tokens.Count; i++)
+        {
+            cpuLogits = cpuFwd.Forward(tokens[i], i);
+            gpuLogits = gpuFwd.Forward(tokens[i], i);
+        }
+
+        // Compare top prediction
+        int cpuTop = SharpInference.Engine.Sampler.Greedy(cpuLogits);
+        int gpuTop = SharpInference.Engine.Sampler.Greedy(gpuLogits);
+        Console.WriteLine($"CPU top: {cpuTop} ({tokenizer.Decode([cpuTop])})");
+        Console.WriteLine($"GPU top: {gpuTop} ({tokenizer.Decode([gpuTop])})");
+
+        // Check first token's logits aren't all zero
+        float gpuMax = float.MinValue, gpuMin = float.MaxValue;
+        for (int i = 0; i < gpuLogits.Length; i++)
+        {
+            if (gpuLogits[i] > gpuMax) gpuMax = gpuLogits[i];
+            if (gpuLogits[i] < gpuMin) gpuMin = gpuLogits[i];
+        }
+        Console.WriteLine($"GPU logits range: [{gpuMin:F2}, {gpuMax:F2}]");
+        Console.WriteLine($"CPU logits range: [{cpuLogits.ToArray().Min():F2}, {cpuLogits.ToArray().Max():F2}]");
+
+        // Generate 5 tokens with each
+        var cpuTokens = new List<int>();
+        var gpuTokens = new List<int>();
+        for (int i = 0; i < 5; i++)
+        {
+            int cpuNext = SharpInference.Engine.Sampler.Greedy(cpuLogits);
+            int gpuNext = SharpInference.Engine.Sampler.Greedy(gpuLogits);
+            cpuTokens.Add(cpuNext);
+            gpuTokens.Add(gpuNext);
+            cpuLogits = cpuFwd.Forward(cpuNext, tokens.Count + i);
+            gpuLogits = gpuFwd.Forward(gpuNext, tokens.Count + i);
+        }
+
+        Console.WriteLine($"CPU: {tokenizer.Decode(cpuTokens)}");
+        Console.WriteLine($"GPU: {tokenizer.Decode(gpuTokens)}");
+
+        // The outputs should match (greedy decode should produce identical tokens)
+        Assert.Equal(cpuTokens, gpuTokens);
+    }
+
     private static string? FindModelPath()
     {
         var dir = Directory.GetCurrentDirectory();

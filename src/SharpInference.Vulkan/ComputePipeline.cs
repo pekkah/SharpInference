@@ -20,6 +20,7 @@ public sealed unsafe class ComputePipeline : IDisposable
     private readonly VkPipelineLayout _pipelineLayout;
     private readonly VkPipeline _pipeline;
     private readonly VkDescriptorPool _descriptorPool;
+    private readonly VkDescriptorSet _reusableDs; // single pre-allocated descriptor set
     private readonly int _pushConstantSize;
     private bool _disposed;
 
@@ -126,6 +127,9 @@ public sealed unsafe class ComputePipeline : IDisposable
         VkDescriptorPool pool;
         vkd.vkCreateDescriptorPool(&poolCI, null, &pool).CheckResult();
         _descriptorPool = pool;
+
+        // Pre-allocate one reusable descriptor set
+        _reusableDs = AllocateDescriptorSet();
     }
 
     /// <summary>Allocate a descriptor set from the pool.</summary>
@@ -206,6 +210,18 @@ public sealed unsafe class ComputePipeline : IDisposable
         };
         vkd.vkQueueSubmit(_backend.ComputeQueue, 1, &submitInfo, VkFence.Null).CheckResult();
         vkd.vkQueueWaitIdle(_backend.ComputeQueue);
+    }
+
+    /// <summary>
+    /// Update the reusable descriptor set, record, and submit a dispatch. Synchronous.
+    /// Convenience method for the common pattern of bind-then-dispatch.
+    /// </summary>
+    public void DispatchWith(VkCommandBuffer cmd, ReadOnlySpan<GpuBuffer> buffers,
+        uint groupCountX, uint groupCountY = 1, uint groupCountZ = 1,
+        void* pushConstants = null)
+    {
+        UpdateDescriptorSet(_reusableDs, buffers);
+        Dispatch(cmd, _reusableDs, groupCountX, groupCountY, groupCountZ, pushConstants);
     }
 
     public void Dispose()

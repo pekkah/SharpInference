@@ -322,10 +322,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     public void RmsNorm(Tensor output, Tensor x, Tensor weight, float eps = 1e-5f)
     {
         _rmsNormPipeline ??= new ComputePipeline(this, Shaders.RmsNorm, 3, pushConstantSize: sizeof(RmsNormParams));
-        var ds = _rmsNormPipeline.AllocateDescriptorSet();
-        _rmsNormPipeline.UpdateDescriptorSet(ds, GetBuffer(x), GetBuffer(weight), GetBuffer(output));
         var p = new RmsNormParams { n = (uint)x.ElementCount, eps = eps };
-        _rmsNormPipeline.Dispatch(_transferCmd, ds, 1, pushConstants: &p);
+        _rmsNormPipeline.DispatchWith(_transferCmd,
+            [GetBuffer(x), GetBuffer(weight), GetBuffer(output)], 1, pushConstants: &p);
     }
 
     public void SiLU(Tensor x) => throw new NotImplementedException("Use SiLuMul for fused SiLU*gate");
@@ -333,64 +332,50 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     public void SiLuMul(Tensor gate, Tensor up)
     {
         _siluMulPipeline ??= new ComputePipeline(this, Shaders.SiLuMul, 2, pushConstantSize: sizeof(CountParams));
-        var ds = _siluMulPipeline.AllocateDescriptorSet();
-        _siluMulPipeline.UpdateDescriptorSet(ds, GetBuffer(gate), GetBuffer(up));
         var p = new CountParams { n = (uint)gate.ElementCount };
-        uint groups = ((uint)gate.ElementCount + 255) / 256;
-        _siluMulPipeline.Dispatch(_transferCmd, ds, groups, pushConstants: &p);
+        _siluMulPipeline.DispatchWith(_transferCmd,
+            [GetBuffer(gate), GetBuffer(up)], ((uint)gate.ElementCount + 255) / 256, pushConstants: &p);
     }
 
     public void AddInPlace(Tensor dst, Tensor src)
     {
         _addInPlacePipeline ??= new ComputePipeline(this, Shaders.AddInPlace, 2, pushConstantSize: sizeof(CountParams));
-        var ds = _addInPlacePipeline.AllocateDescriptorSet();
-        _addInPlacePipeline.UpdateDescriptorSet(ds, GetBuffer(dst), GetBuffer(src));
         var p = new CountParams { n = (uint)dst.ElementCount };
-        uint groups = ((uint)dst.ElementCount + 255) / 256;
-        _addInPlacePipeline.Dispatch(_transferCmd, ds, groups, pushConstants: &p);
+        _addInPlacePipeline.DispatchWith(_transferCmd,
+            [GetBuffer(dst), GetBuffer(src)], ((uint)dst.ElementCount + 255) / 256, pushConstants: &p);
     }
 
     public void ElementwiseMul(Tensor output, Tensor a, Tensor b)
     {
         _elementwiseMulPipeline ??= new ComputePipeline(this, Shaders.ElementwiseMul, 3, pushConstantSize: sizeof(CountParams));
-        var ds = _elementwiseMulPipeline.AllocateDescriptorSet();
-        _elementwiseMulPipeline.UpdateDescriptorSet(ds, GetBuffer(a), GetBuffer(b), GetBuffer(output));
         var p = new CountParams { n = (uint)a.ElementCount };
-        uint groups = ((uint)a.ElementCount + 255) / 256;
-        _elementwiseMulPipeline.Dispatch(_transferCmd, ds, groups, pushConstants: &p);
+        _elementwiseMulPipeline.DispatchWith(_transferCmd,
+            [GetBuffer(a), GetBuffer(b), GetBuffer(output)], ((uint)a.ElementCount + 255) / 256, pushConstants: &p);
     }
 
     public void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f)
     {
         _ropePipeline ??= new ComputePipeline(this, Shaders.RoPE, 1, pushConstantSize: sizeof(RoPEParams));
         uint numHeads = (uint)(x.ElementCount / headDim);
-        uint halfDim = (uint)(headDim / 2);
-        uint totalPairs = numHeads * halfDim;
-        var ds = _ropePipeline.AllocateDescriptorSet();
-        _ropePipeline.UpdateDescriptorSet(ds, GetBuffer(x));
+        uint totalPairs = numHeads * (uint)(headDim / 2);
         var p = new RoPEParams { numHeads = numHeads, headDim = (uint)headDim, position = position, theta = ropeTheta };
-        uint groups = (totalPairs + 255) / 256;
-        _ropePipeline.Dispatch(_transferCmd, ds, groups, pushConstants: &p);
+        _ropePipeline.DispatchWith(_transferCmd,
+            [GetBuffer(x)], (totalPairs + 255) / 256, pushConstants: &p);
     }
 
     public void Softmax(Tensor x)
     {
         _softmaxPipeline ??= new ComputePipeline(this, Shaders.Softmax, 1, pushConstantSize: sizeof(CountParams));
-        var ds = _softmaxPipeline.AllocateDescriptorSet();
-        _softmaxPipeline.UpdateDescriptorSet(ds, GetBuffer(x));
         var p = new CountParams { n = (uint)x.ElementCount };
-        _softmaxPipeline.Dispatch(_transferCmd, ds, 1, pushConstants: &p);
+        _softmaxPipeline.DispatchWith(_transferCmd, [GetBuffer(x)], 1, pushConstants: &p);
     }
 
     public void MatMul(Tensor output, Tensor matrix, Tensor vector)
     {
         _matVecQ4KPipeline ??= new ComputePipeline(this, Shaders.MatVecQ4K, 3, pushConstantSize: sizeof(MatVecParams));
-        long rows = output.ElementCount;
-        long cols = vector.ElementCount;
-        var ds = _matVecQ4KPipeline.AllocateDescriptorSet();
-        _matVecQ4KPipeline.UpdateDescriptorSet(ds, GetBuffer(matrix), GetBuffer(vector), GetBuffer(output));
-        var p = new MatVecParams { rows = (uint)rows, cols = (uint)cols };
-        _matVecQ4KPipeline.Dispatch(_transferCmd, ds, (uint)rows, pushConstants: &p);
+        var p = new MatVecParams { rows = (uint)output.ElementCount, cols = (uint)vector.ElementCount };
+        _matVecQ4KPipeline.DispatchWith(_transferCmd,
+            [GetBuffer(matrix), GetBuffer(vector), GetBuffer(output)], (uint)output.ElementCount, pushConstants: &p);
     }
 
     // ================================================================
