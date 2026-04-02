@@ -93,6 +93,65 @@ public class InferenceBenchmark
         return Sampler.Greedy(logits);
     }
 
+    // ================================================================
+    //  GPU Decode
+    // ================================================================
+
+    private Vulkan.VulkanBackend _gpu = null!;
+    private Engine.GpuForwardPass _gpuFwd = null!;
+    private int _gpuDecodePos;
+    private int _gpuLastToken;
+
+    [GlobalSetup(Targets = new[] { nameof(GpuDecodeTokens) })]
+    public void GpuSetup()
+    {
+        var path = FindModelPath()
+            ?? throw new FileNotFoundException("Model not found");
+
+        _model = GgufModel.Open(path);
+        _hp = ModelHyperparams.FromGgufMetadata(_model.Metadata);
+        _tokenizer = GgufTokenizer.FromGgufModel(_model);
+
+        _gpu = new Vulkan.VulkanBackend();
+        _gpuFwd = new Engine.GpuForwardPass(_model, _gpu, _hp);
+
+        _promptTokens = _tokenizer.Encode(
+            "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n");
+    }
+
+    [IterationSetup(Target = nameof(GpuDecodeTokens))]
+    public void GpuDecodeIterSetup()
+    {
+        _gpuFwd.Cache.Reset();
+        ReadOnlySpan<float> logits = default;
+        for (int i = 0; i < _promptTokens.Count; i++)
+            logits = _gpuFwd.Forward(_promptTokens[i], i);
+        _gpuLastToken = Sampler.Greedy(logits);
+        _gpuDecodePos = _promptTokens.Count;
+    }
+
+    [Benchmark(Description = "GPU Decode 32 tokens")]
+    [Arguments(32)]
+    public int GpuDecodeTokens(int tokenCount)
+    {
+        ReadOnlySpan<float> logits = _gpuFwd.Forward(_gpuLastToken, _gpuDecodePos++);
+        int lastToken = Sampler.Greedy(logits);
+        for (int i = 1; i < tokenCount; i++)
+        {
+            logits = _gpuFwd.Forward(lastToken, _gpuDecodePos++);
+            lastToken = Sampler.Greedy(logits);
+        }
+        return lastToken;
+    }
+
+    [GlobalCleanup(Targets = new[] { nameof(GpuDecodeTokens) })]
+    public void GpuCleanup()
+    {
+        _gpuFwd?.Dispose();
+        _gpu?.Dispose();
+        _model?.Dispose();
+    }
+
     [GlobalCleanup]
     public void Cleanup()
     {
