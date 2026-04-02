@@ -120,6 +120,13 @@ public sealed unsafe class GgufModel : IDisposable
     }
 
     /// <summary>
+    /// Returns a raw pointer to the tensor data in the memory-mapped file. Zero-copy, no span overhead.
+    /// The pointer is valid for the lifetime of this GgufModel instance.
+    /// </summary>
+    public unsafe byte* GetTensorDataPtr(GgufTensorInfo tensor) =>
+        _basePtr + _dataStartOffset + (long)tensor.DataOffset;
+
+    /// <summary>
     /// Returns a read-only span directly into the memory-mapped file for the given tensor. Zero-copy.
     /// </summary>
     public ReadOnlySpan<byte> GetTensorData(GgufTensorInfo tensor)

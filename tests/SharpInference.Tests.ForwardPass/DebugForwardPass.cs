@@ -77,30 +77,26 @@ public sealed class DebugForwardPass
         var tokens = tokenizer.Encode(prompt);
         Console.WriteLine($"Prompt tokens ({tokens.Count}): {string.Join(", ", tokens)}");
 
-        // Prefill
+        // Prefill with timing
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         ReadOnlySpan<float> logits = default;
         for (int i = 0; i < tokens.Count; i++)
-        {
             logits = fwd.Forward(tokens[i], i);
-            if (i == 0)
-            {
-                int top = Engine.Sampler.Greedy(logits);
-                Console.WriteLine($"After token 0 ({tokens[0]}): top prediction = {top} ({tokenizer.Decode([top])})");
-            }
-        }
+        var prefillMs = sw.Elapsed.TotalMilliseconds;
+        Console.WriteLine($"Prefill: {tokens.Count} tokens in {prefillMs:F0}ms ({tokens.Count / (prefillMs / 1000):F1} t/s)");
 
-        // Generate 15 tokens (enough for "Hello! How can I assist you today?")
+        // Generate 30 tokens with timing
+        sw.Restart();
         var generated = new List<int>();
-        Console.Write("Generated: ");
-        for (int i = 0; i < 15; i++)
+        for (int i = 0; i < 30; i++)
         {
             int next = Engine.Sampler.Greedy(logits);
             generated.Add(next);
-            Console.Write($"[{next}:{tokenizer.Decode([next])}]");
             logits = fwd.Forward(next, tokens.Count + i);
         }
-        Console.WriteLine();
-        Console.WriteLine($"Full text: {tokenizer.Decode(generated)}");
+        var decodeMs = sw.Elapsed.TotalMilliseconds;
+        Console.WriteLine($"Decode: {generated.Count} tokens in {decodeMs:F0}ms ({generated.Count / (decodeMs / 1000):F1} t/s)");
+        Console.WriteLine($"Output: {tokenizer.Decode(generated)}");
     }
 
     [Fact]
