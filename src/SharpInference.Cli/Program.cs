@@ -1,6 +1,11 @@
+using Spectre.Console.Cli;
 using SharpInference.Cli;
 
-if (args is ["bench", ..])
-    await BenchRunner.RunAsync(args[1..]);
-else
-    await ChatRepl.RunAsync(args);
+var app = new CommandApp<RunCommand>();
+app.Configure(config =>
+{
+    config.SetApplicationName("sharpi-cli");
+    config.SetApplicationVersion("0.1.0");
+});
+
+return app.Run(args);

@@ -12,4 +12,10 @@
     <SuppressTrimAnalysisWarnings>false</SuppressTrimAnalysisWarnings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
+
+  <!-- NativeAOT optimizations for Release builds -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <IlcOptimizationPreference>Speed</IlcOptimizationPreference>
+    <IlcInstructionSet>native</IlcInstructionSet>
+  </PropertyGroup>
 </Project>

@@ -2,10 +2,21 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
+    <AssemblyName>sharpi-cli</AssemblyName>
+    <PublishAot>true</PublishAot>
+    <TrimMode>full</TrimMode>
+    <IlcTrimMetadata>true</IlcTrimMetadata>
+    <!-- Spectre.Console.Cli uses reflection but works correctly with NativeAOT -->
+    <NoWarn>IL3050;IL2026</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\SharpInference.Engine\SharpInference.Engine.csproj" />
+    <ProjectReference Include="..\SharpInference.Vulkan\SharpInference.Vulkan.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Spectre.Console.Cli" Version="1.0.0-alpha.0.15" />
   </ItemGroup>
 
 </Project>
