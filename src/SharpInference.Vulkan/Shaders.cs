@@ -692,10 +692,7 @@ internal static class Shaders
         #extension GL_KHR_shader_subgroup_arithmetic : enable
 
         // 8 rows per workgroup, 32 threads per row = 256 threads.
-        // Optimizations:
-        // 1. Scales/mins preloaded into registers from 3 uint32 words (no per-element global reads)
-        // 2. unpackHalf2x16 for d/dmin
-        // 3. subgroupAdd for zero-barrier reduction
+        // Register-based scale precomputation. subgroupAdd for reduction.
         #define N_ROWS 8
         #define THREADS_PER_ROW 32
 
@@ -729,18 +726,18 @@ internal static class Shaders
                 float d = dm.x;
                 float dmin = dm.y;
 
-                // Preload scale/min region into registers (3 reads vs ~32 per-element reads)
+                // Preload scale/min into registers (3 global reads instead of ~32)
                 uint sm0 = weights_data[word_base + 1];
                 uint sm1 = weights_data[word_base + 2];
                 uint sm2 = weights_data[word_base + 3];
 
                 float dsc[8], dmn[8];
-                dsc[0] = d * float((sm0 >>  0) & 63); dmn[0] = dmin * float((sm1 >>  0) & 63);
-                dsc[1] = d * float((sm0 >>  8) & 63); dmn[1] = dmin * float((sm1 >>  8) & 63);
-                dsc[2] = d * float((sm0 >> 16) & 63); dmn[2] = dmin * float((sm1 >> 16) & 63);
-                dsc[3] = d * float((sm0 >> 24) & 63); dmn[3] = dmin * float((sm1 >> 24) & 63);
-                dsc[4] = d * float((sm2 & 0xF) | (((sm0 >>  6) & 3) << 4));
-                dmn[4] = dmin * float(((sm2 >> 4) & 0xF) | (((sm1 >>  6) & 3) << 4));
+                dsc[0] = d * float((sm0) & 63);         dmn[0] = dmin * float((sm1) & 63);
+                dsc[1] = d * float((sm0 >> 8) & 63);    dmn[1] = dmin * float((sm1 >> 8) & 63);
+                dsc[2] = d * float((sm0 >> 16) & 63);   dmn[2] = dmin * float((sm1 >> 16) & 63);
+                dsc[3] = d * float((sm0 >> 24) & 63);   dmn[3] = dmin * float((sm1 >> 24) & 63);
+                dsc[4] = d * float((sm2 & 0xF) | (((sm0 >> 6) & 3) << 4));
+                dmn[4] = dmin * float(((sm2 >> 4) & 0xF) | (((sm1 >> 6) & 3) << 4));
                 dsc[5] = d * float(((sm2 >> 8) & 0xF) | (((sm0 >> 14) & 3) << 4));
                 dmn[5] = dmin * float(((sm2 >> 12) & 0xF) | (((sm1 >> 14) & 3) << 4));
                 dsc[6] = d * float(((sm2 >> 16) & 0xF) | (((sm0 >> 22) & 3) << 4));
@@ -748,6 +745,7 @@ internal static class Shaders
                 dsc[7] = d * float(((sm2 >> 24) & 0xF) | (((sm0 >> 30) & 3) << 4));
                 dmn[7] = dmin * float(((sm2 >> 28) & 0xF) | (((sm1 >> 30) & 3) << 4));
 
+                // Each of 32 threads handles 8 elements: lane, lane+32, ..., lane+224
                 [[unroll]] for (uint e = 0; e < 8; e++) {
                     uint elem_idx = lane + e * 32;
                     uint chunk = elem_idx >> 6;
