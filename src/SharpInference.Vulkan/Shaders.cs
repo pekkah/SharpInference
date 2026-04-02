@@ -692,7 +692,10 @@ internal static class Shaders
         #extension GL_KHR_shader_subgroup_arithmetic : enable
 
         // 8 rows per workgroup, 32 threads per row = 256 threads.
-        // subgroupAdd for reduction (32 threads = 1 subgroup = no barrier).
+        // Optimizations:
+        // 1. Scales/mins preloaded into registers from 3 uint32 words (no per-element global reads)
+        // 2. unpackHalf2x16 for d/dmin
+        // 3. subgroupAdd for zero-barrier reduction
         #define N_ROWS 8
         #define THREADS_PER_ROW 32
 
@@ -707,22 +710,6 @@ internal static class Shaders
             uint cols;
         };
 
-        shared float sdata[8];  // N_ROWS * 2 subgroup leaders
-
-        uint gReadByte(uint word_base, uint byteOffset) {
-            return (weights_data[word_base + (byteOffset >> 2)] >> ((byteOffset & 3) * 8)) & 0xFF;
-        }
-
-        void gGetScaleMin(uint word_base, uint j, out float sc, out float m) {
-            if (j < 4) {
-                sc = float(gReadByte(word_base, 4 + j) & 63);
-                m  = float(gReadByte(word_base, 4 + j + 4) & 63);
-            } else {
-                sc = float((gReadByte(word_base, 4 + j + 4) & 0xF) | ((gReadByte(word_base, 4 + j - 4) >> 6) << 4));
-                m  = float((gReadByte(word_base, 4 + j + 4) >> 4) | ((gReadByte(word_base, 4 + j) >> 6) << 4));
-            }
-        }
-
         void main() {
             uint tid = gl_LocalInvocationID.x;
             uint row_in_wg = tid / THREADS_PER_ROW;
@@ -731,19 +718,36 @@ internal static class Shaders
             if (row >= rows) return;
 
             uint num_blocks = cols >> 8;
-            uint word_row_base = (row * num_blocks * 36) >> 0;  // 36 words per block
+            uint word_row_base = row * num_blocks * 36;
 
             float acc = 0.0;
 
             for (uint block = 0; block < num_blocks; block++) {
                 uint word_base = word_row_base + block * 36;
 
-                // Read d and dmin as packed FP16 pair
                 vec2 dm = unpackHalf2x16(weights_data[word_base]);
                 float d = dm.x;
                 float dmin = dm.y;
 
-                // Each of 32 threads handles 8 elements: lane, lane+32, lane+64, ...
+                // Preload scale/min region into registers (3 reads vs ~32 per-element reads)
+                uint sm0 = weights_data[word_base + 1];
+                uint sm1 = weights_data[word_base + 2];
+                uint sm2 = weights_data[word_base + 3];
+
+                float dsc[8], dmn[8];
+                dsc[0] = d * float((sm0 >>  0) & 63); dmn[0] = dmin * float((sm1 >>  0) & 63);
+                dsc[1] = d * float((sm0 >>  8) & 63); dmn[1] = dmin * float((sm1 >>  8) & 63);
+                dsc[2] = d * float((sm0 >> 16) & 63); dmn[2] = dmin * float((sm1 >> 16) & 63);
+                dsc[3] = d * float((sm0 >> 24) & 63); dmn[3] = dmin * float((sm1 >> 24) & 63);
+                dsc[4] = d * float((sm2 & 0xF) | (((sm0 >>  6) & 3) << 4));
+                dmn[4] = dmin * float(((sm2 >> 4) & 0xF) | (((sm1 >>  6) & 3) << 4));
+                dsc[5] = d * float(((sm2 >> 8) & 0xF) | (((sm0 >> 14) & 3) << 4));
+                dmn[5] = dmin * float(((sm2 >> 12) & 0xF) | (((sm1 >> 14) & 3) << 4));
+                dsc[6] = d * float(((sm2 >> 16) & 0xF) | (((sm0 >> 22) & 3) << 4));
+                dmn[6] = dmin * float(((sm2 >> 20) & 0xF) | (((sm1 >> 22) & 3) << 4));
+                dsc[7] = d * float(((sm2 >> 24) & 0xF) | (((sm0 >> 30) & 3) << 4));
+                dmn[7] = dmin * float(((sm2 >> 28) & 0xF) | (((sm1 >> 30) & 3) << 4));
+
                 [[unroll]] for (uint e = 0; e < 8; e++) {
                     uint elem_idx = lane + e * 32;
                     uint chunk = elem_idx >> 6;
@@ -751,19 +755,15 @@ internal static class Shaders
                     bool is_upper = sub >= 32;
                     uint byte_pos = sub & 31;
 
-                    uint si = chunk * 2 + (is_upper ? 1u : 0u);
-                    float sc, mn;
-                    gGetScaleMin(word_base, si, sc, mn);
-
-                    uint qbyte = gReadByte(word_base, 16 + chunk * 32 + byte_pos);
+                    uint qs_off = word_base + 4 + (chunk * 8 + (byte_pos >> 2));
+                    uint qbyte = (weights_data[qs_off] >> ((byte_pos & 3) * 8)) & 0xFF;
                     uint nibble = is_upper ? (qbyte >> 4) : (qbyte & 0xF);
 
-                    uint elem = block * 256 + elem_idx;
-                    acc += (d * sc * float(nibble) - dmin * mn) * input_data[elem];
+                    uint si = chunk * 2 + (is_upper ? 1u : 0u);
+                    acc += (dsc[si] * float(nibble) - dmn[si]) * input_data[block * 256 + elem_idx];
                 }
             }
 
-            // 32 threads/row = exactly 1 subgroup: subgroupAdd gives final result, no barrier
             float result = subgroupAdd(acc);
             if (subgroupElect())
                 output_data[row] = result;
