@@ -745,6 +745,146 @@ public unsafe class TurboQuantMicroBenchmarks
 //  Shared helper
 // ================================================================
 
+// ================================================================
+//  Llama 3.1 70B Benchmarks — CPU only
+// ================================================================
+
+[MemoryDiagnoser]
+[WarmupCount(1)]
+[IterationCount(3)]
+public class Llama70bCpuBenchmark
+{
+    private GgufModel _model = null!;
+    private ModelHyperparams _hp = null!;
+    private GgufTokenizer _tokenizer = null!;
+    private CpuBackend _backend = null!;
+    private ForwardPass _fwd = null!;
+    private IReadOnlyList<int> _promptTokens = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        var path = BenchmarkHelper.FindModelPath("Meta-Llama-3.1-70B-Instruct-Q4_K_M.gguf")
+            ?? throw new FileNotFoundException("Meta-Llama-3.1-70B-Instruct-Q4_K_M.gguf not found");
+
+        _model = GgufModel.Open(path);
+        _hp = ModelHyperparams.FromGgufMetadata(_model.Metadata);
+        _tokenizer = GgufTokenizer.FromGgufModel(_model);
+        _backend = new CpuBackend();
+        _fwd = new ForwardPass(_model, _backend, _hp);
+
+        _promptTokens = _tokenizer.Encode(
+            "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n");
+    }
+
+    [IterationSetup]
+    public void IterSetup()
+    {
+        _fwd.Cache.Reset();
+        for (int i = 0; i < _promptTokens.Count; i++)
+            _fwd.Forward(_promptTokens[i], i);
+    }
+
+    [Benchmark(Description = "Llama-70B CPU Decode 10t")]
+    public int Decode()
+    {
+        ReadOnlySpan<float> logits = _fwd.Forward(
+            Sampler.Greedy(_fwd.Forward(_promptTokens[^1], _promptTokens.Count - 1)),
+            _promptTokens.Count);
+        int lastToken = Sampler.Greedy(logits);
+        int pos = _promptTokens.Count + 1;
+        for (int i = 1; i < 10; i++)
+        {
+            logits = _fwd.Forward(lastToken, pos++);
+            lastToken = Sampler.Greedy(logits);
+        }
+        return lastToken;
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        _fwd.Dispose();
+        _backend.Dispose();
+        _model.Dispose();
+    }
+}
+
+// ================================================================
+//  Llama 3.1 70B Benchmarks — Hybrid (auto GPU + CPU split)
+// ================================================================
+
+[MemoryDiagnoser]
+[WarmupCount(1)]
+[IterationCount(3)]
+public class Llama70bHybridBenchmark
+{
+    private GgufModel _model = null!;
+    private ModelHyperparams _hp = null!;
+    private GgufTokenizer _tokenizer = null!;
+    private Vulkan.VulkanBackend _gpu = null!;
+    private HybridForwardPass _hfwd = null!;
+    private IReadOnlyList<int> _promptTokens = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        var path = BenchmarkHelper.FindModelPath("Meta-Llama-3.1-70B-Instruct-Q4_K_M.gguf")
+            ?? throw new FileNotFoundException("Meta-Llama-3.1-70B-Instruct-Q4_K_M.gguf not found");
+
+        _model = GgufModel.Open(path);
+        _hp = ModelHyperparams.FromGgufMetadata(_model.Metadata);
+        _tokenizer = GgufTokenizer.FromGgufModel(_model);
+        _gpu = new Vulkan.VulkanBackend();
+
+        var hwProfile = HardwareProfile.Detect(_gpu);
+        var placement = TierPlanner.Plan(_model, _hp, hwProfile);
+
+        _hfwd = new HybridForwardPass(_model, _gpu, _hp, placement);
+
+        Console.Error.WriteLine($"[Llama70bHybridBenchmark] {placement.Summary()}");
+
+        _promptTokens = _tokenizer.Encode(
+            "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n");
+    }
+
+    [IterationSetup]
+    public void IterSetup()
+    {
+        _hfwd.ResetCache();
+        for (int i = 0; i < _promptTokens.Count; i++)
+            _hfwd.Forward(_promptTokens[i], i);
+    }
+
+    [Benchmark(Description = "Llama-70B Hybrid Decode 10t")]
+    public int Decode()
+    {
+        ReadOnlySpan<float> logits = _hfwd.Forward(
+            Sampler.Greedy(_hfwd.Forward(_promptTokens[^1], _promptTokens.Count - 1)),
+            _promptTokens.Count);
+        int lastToken = Sampler.Greedy(logits);
+        int pos = _promptTokens.Count + 1;
+        for (int i = 1; i < 10; i++)
+        {
+            logits = _hfwd.Forward(lastToken, pos++);
+            lastToken = Sampler.Greedy(logits);
+        }
+        return lastToken;
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        _hfwd?.Dispose();
+        _gpu?.Dispose();
+        _model?.Dispose();
+    }
+}
+
+// ================================================================
+//  Shared helper
+// ================================================================
+
 internal static class BenchmarkHelper
 {
     public static string? FindModelPath(string filename)
