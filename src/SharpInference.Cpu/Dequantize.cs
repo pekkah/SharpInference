@@ -186,8 +186,10 @@ public static class Dequantize
             int qIdx = 0;
             int scaleIdx = 0;
 
-            // qh: 256 bits packed into 32 bytes. Bit i corresponds to element i.
-            // For element e: high bit = (qh[e/8] >> (e%8)) & 1
+            // qh bit layout per byte: bits 0,1 for j=0; bits 2,3 for j=64;
+            // bits 4,5 for j=128; bits 6,7 for j=192.
+            // u1 masks the low-nibble high bit, u2 masks the high-nibble high bit.
+            byte u1 = 1, u2 = 2;
             for (int j = 0; j < QK_K; j += 64)
             {
                 GetScaleMinK4(scaleIdx, scales, out byte sc1, out byte m1);
@@ -199,17 +201,15 @@ public static class Dequantize
 
                 for (int l = 0; l < 32; l++)
                 {
-                    int eLo = j + l;
-                    int eHi = j + l + 32;
-                    int hLo = (qh[eLo >> 3] >> (eLo & 7)) & 1;
-                    int hHi = (qh[eHi >> 3] >> (eHi & 7)) & 1;
-                    int q5Lo = (ql[qIdx + l] & 0xF) | (hLo << 4);
-                    int q5Hi = (ql[qIdx + l] >> 4) | (hHi << 4);
-                    y[j + l] = d1 * q5Lo - dm1;
-                    y[j + l + 32] = d2 * q5Hi - dm2;
+                    int hLo = (qh[l] & u1) != 0 ? 16 : 0;
+                    int hHi = (qh[l] & u2) != 0 ? 16 : 0;
+                    y[j + l] = d1 * ((ql[qIdx + l] & 0xF) + hLo) - dm1;
+                    y[j + l + 32] = d2 * ((ql[qIdx + l] >> 4) + hHi) - dm2;
                 }
                 qIdx += 32;
                 scaleIdx += 2;
+                u1 <<= 2;
+                u2 <<= 2;
             }
         }
     }

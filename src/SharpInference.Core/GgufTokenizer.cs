@@ -75,25 +75,30 @@ public sealed class GgufTokenizer : ITokenizer
             }
         }
 
-        // Build vocab JSON stream: {"token": id, ...}
-        using var vocabStream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(vocabStream))
+        // Build vocab and merges as byte arrays (tokenizer constructors may dispose streams)
+        byte[] vocabBytes;
         {
-            writer.WriteStartObject();
-            for (int i = 0; i < tokensArray.Length; i++)
-                writer.WriteNumber((string)tokensArray[i], i);
-            writer.WriteEndObject();
+            using var vocabStream = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(vocabStream))
+            {
+                writer.WriteStartObject();
+                for (int i = 0; i < tokensArray.Length; i++)
+                    writer.WriteNumber((string)tokensArray[i], i);
+                writer.WriteEndObject();
+            }
+            vocabBytes = vocabStream.ToArray();
         }
-        vocabStream.Position = 0;
 
-        // Build merges text stream: one merge per line
-        using var mergesStream = new MemoryStream();
-        using (var sw = new StreamWriter(mergesStream, Encoding.UTF8, leaveOpen: true))
+        byte[] mergesBytes;
         {
-            for (int i = 0; i < mergesArray.Length; i++)
-                sw.WriteLine((string)mergesArray[i]);
+            using var mergesStream = new MemoryStream();
+            using (var sw = new StreamWriter(mergesStream, Encoding.UTF8, leaveOpen: true))
+            {
+                for (int i = 0; i < mergesArray.Length; i++)
+                    sw.WriteLine((string)mergesArray[i]);
+            }
+            mergesBytes = mergesStream.ToArray();
         }
-        mergesStream.Position = 0;
 
         // Get token strings for special tokens.
         // If the unknown token is a control/special token (type 3), don't pass it to
@@ -122,20 +127,18 @@ public sealed class GgufTokenizer : ITokenizer
         Tokenizer inner;
         try
         {
-            inner = CodeGenTokenizer.Create(
-                vocabStream,
-                mergesStream,
+            using var vs1 = new MemoryStream(vocabBytes);
+            using var ms1 = new MemoryStream(mergesBytes);
+            inner = CodeGenTokenizer.Create(vs1, ms1,
                 addPrefixSpace: false,
                 addBeginOfSentence: false,
                 addEndOfSentence: false);
         }
         catch
         {
-            vocabStream.Position = 0;
-            mergesStream.Position = 0;
-            inner = BpeTokenizer.Create(
-                vocabStream,
-                mergesStream,
+            using var vs2 = new MemoryStream(vocabBytes);
+            using var ms2 = new MemoryStream(mergesBytes);
+            inner = BpeTokenizer.Create(vs2, ms2,
                 specialTokens: specialTokensDict,
                 unknownToken: unknownToken);
         }
