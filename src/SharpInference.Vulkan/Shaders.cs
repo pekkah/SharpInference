@@ -460,46 +460,60 @@ internal static class Shaders
             uint q_off = h * head_dim;
             uint out_off = h * head_dim;
 
-            // Phase 1: each thread computes score for position tid
-            float score = -1.0/0.0;
-            if (tid < seq_len) {
+            // Tiled attention: process positions in chunks of 256.
+            // Phase 1: compute all scores (tiled), softmax
+            // Phase 2: accumulate weighted values (tiled)
+
+            // Phase 1a: compute scores and find global max (tiled)
+            float local_max = -1.0/0.0;
+            for (uint t = tid; t < seq_len; t += 256) {
                 float dot = 0.0;
-                uint k_off = tid * kv_dim + kv_head * head_dim;
+                uint k_off = t * kv_dim + kv_head * head_dim;
                 for (uint d = 0; d < head_dim; d++)
                     dot += q_data[q_off + d] * k_cache[k_off + d];
-                score = dot * scale;
+                local_max = max(local_max, dot * scale);
             }
-
-            // Phase 2: softmax — max reduction
-            sdata[tid] = score;
+            sdata[tid] = local_max;
             barrier();
             [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
                 if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
                 barrier();
             }
             float max_val = sdata[0];
+            barrier();
 
-            // Exp + sum
-            float exp_val = (tid < seq_len) ? exp(score - max_val) : 0.0;
-            sdata[tid] = exp_val;
+            // Phase 1b: compute exp(score - max) and sum
+            float local_sum = 0.0;
+            for (uint t = tid; t < seq_len; t += 256) {
+                float dot = 0.0;
+                uint k_off = t * kv_dim + kv_head * head_dim;
+                for (uint d = 0; d < head_dim; d++)
+                    dot += q_data[q_off + d] * k_cache[k_off + d];
+                local_sum += exp(dot * scale - max_val);
+            }
+            sdata[tid] = local_sum;
             barrier();
             [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
                 if (tid < s) sdata[tid] += sdata[tid + s];
                 barrier();
             }
-            float weight = exp_val / sdata[0];
-
-            // Store all weights in shared memory for Phase 3
-            sdata[tid] = weight;
+            float sum_exp = sdata[0];
             barrier();
 
-            // Phase 3: weighted value sum — each thread handles output dimensions
-            // Thread tid computes out[d] = sum_t(sdata[t] * V[t,d]) for d = tid, tid+256, ...
+            // Phase 2: weighted value sum
+            // Each thread handles output dims d = tid, tid+256, ...
             for (uint d = tid; d < head_dim; d += 256) {
                 float sum = 0.0;
                 for (uint t = 0; t < seq_len; t++) {
+                    // Recompute weight for position t
+                    float dot = 0.0;
+                    uint k_off = t * kv_dim + kv_head * head_dim;
+                    for (uint dd = 0; dd < head_dim; dd++)
+                        dot += q_data[q_off + dd] * k_cache[k_off + dd];
+                    float weight = exp(dot * scale - max_val) / sum_exp;
+
                     uint v_off = t * kv_dim + kv_head * head_dim;
-                    sum += sdata[t] * v_cache[v_off + d];
+                    sum += weight * v_cache[v_off + d];
                 }
                 out_data[out_off + d] = sum;
             }
