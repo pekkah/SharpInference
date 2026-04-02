@@ -33,6 +33,9 @@ public sealed unsafe class GpuForwardPass : IDisposable
     private readonly Tensor _ffnUp;      // [intermDim]
     private readonly Tensor _logits;     // [vocabSize]
 
+    // Embedding table: dequantized to F32 and cached in VRAM
+    private readonly Tensor _gpuEmbedding; // [vocabSize * embDim] F32
+
     // GPU weight tensors (Q4_K/Q6_K bytes uploaded to VRAM)
     private readonly Tensor[] _wAttnNorm;
     private readonly Tensor[] _wq, _wk, _wv, _wo;
@@ -113,6 +116,15 @@ public sealed unsafe class GpuForwardPass : IDisposable
 
         var outputName = model.FindTensor("output.weight") is not null ? "output.weight" : "token_embd.weight";
         _wOutput = UploadWeight(outputName);
+
+        // Dequantize and upload full embedding table to VRAM (avoids per-token CPU dequant + upload)
+        Console.Error.Write(" emb...");
+        var embInfo = model.FindTensor("token_embd.weight")!.Value;
+        var embData = model.GetTensorData(embInfo);
+        var embF32 = new float[(int)embInfo.ElementCount];
+        Dequantize.ToFloat32(embData, embF32, embInfo.DType, embInfo.ElementCount);
+        _gpuEmbedding = gpu.Upload(embF32, TensorShape.D1(embF32.Length));
+
         Console.Error.WriteLine(" done.");
     }
 
@@ -126,11 +138,12 @@ public sealed unsafe class GpuForwardPass : IDisposable
     /// </summary>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
-        // 1. Embed token (CPU dequant → upload to GPU)
-        EmbedToken(token);
-
-        // 2. Record ALL transformer layers into ONE command buffer
+        // 1 + 2. Record everything into ONE command buffer
         _gpu.BeginRecord();
+
+        // Embed token (GPU lookup from cached table — no PCIe transfer)
+        _gpu.EmbedLookup(_gpuEmbedding, _hidden, (uint)token, (uint)_embDim);
+        _gpu.RecordBarrier();
 
         for (int layer = 0; layer < _hp.NumLayers; layer++)
         {
@@ -323,7 +336,7 @@ public sealed unsafe class GpuForwardPass : IDisposable
             _gpu.Free(_wq[i]); _gpu.Free(_wk[i]); _gpu.Free(_wv[i]); _gpu.Free(_wo[i]);
             _gpu.Free(_wGate[i]); _gpu.Free(_wUp[i]); _gpu.Free(_wDown[i]);
         }
-        _gpu.Free(_wOutputNorm); _gpu.Free(_wOutput);
+        _gpu.Free(_wOutputNorm); _gpu.Free(_wOutput); _gpu.Free(_gpuEmbedding);
 
         for (int i = 0; i < _hp.NumLayers; i++)
         {

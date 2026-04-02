@@ -228,6 +228,30 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Embedding lookup: copy one row from embedding table to output.
+    /// Push constants: { uint token_id, uint emb_dim }.
+    /// Bindings: 0=embedding_table[vocab_size*emb_dim], 1=output[emb_dim].
+    /// </summary>
+    internal const string EmbedLookup = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer EmbTable { float emb_table[]; };
+        layout(binding = 1) writeonly buffer Output  { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint token_id;
+            uint emb_dim;
+        };
+
+        void main() {
+            uint i = gl_GlobalInvocationID.x;
+            if (i >= emb_dim) return;
+            output_data[i] = emb_table[token_id * emb_dim + i];
+        }
+        """;
+
+    /// <summary>
     /// Copy K and V vectors into the KV cache at the given position.
     /// Push constants: { uint kv_dim, uint position, uint max_seq_len }.
     /// Bindings: 0=k_input[kv_dim], 1=v_input[kv_dim], 2=k_cache[max_seq_len*kv_dim], 3=v_cache[max_seq_len*kv_dim].

@@ -364,11 +364,13 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private ComputePipeline? _matVecF32Pipeline;
     private ComputePipeline? _kvAppendPipeline;
     private ComputePipeline? _attentionPipeline;
+    private ComputePipeline? _embedLookupPipeline;
 
     private struct RmsNormParams { public uint n; public float eps; }
     private struct CountParams { public uint n; }
     private struct RoPEParams { public uint numHeads; public uint headDim; public int position; public float theta; }
     private struct MatVecParams { public uint rows; public uint cols; }
+    private struct EmbedParams { public uint tokenId; public uint embDim; }
     private struct KvAppendParams { public uint kvDim; public uint position; public uint maxSeqLen; }
     private struct AttentionParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint seqLen; public uint maxSeqLen; }
 
@@ -454,6 +456,13 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     //  KV Cache + Attention (GPU-resident)
     // ================================================================
 
+    public void EmbedLookup(Tensor embTable, Tensor output, uint tokenId, uint embDim)
+    {
+        _embedLookupPipeline ??= new ComputePipeline(this, Shaders.EmbedLookup, 2, pushConstantSize: sizeof(EmbedParams));
+        var p = new EmbedParams { tokenId = tokenId, embDim = embDim };
+        DispatchOrRecord(_embedLookupPipeline, [GetBuffer(embTable), GetBuffer(output)], (embDim + 255) / 256, &p);
+    }
+
     public void KvAppend(Tensor kInput, Tensor vInput, Tensor kCache, Tensor vCache,
         uint kvDim, uint position, uint maxSeqLen)
     {
@@ -500,6 +509,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _matVecF32Pipeline?.Dispose();
         _kvAppendPipeline?.Dispose();
         _attentionPipeline?.Dispose();
+        _embedLookupPipeline?.Dispose();
 
         // Free all tracked GPU buffers
         foreach (var buf in _buffers.Values)
