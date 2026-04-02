@@ -314,11 +314,15 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private ComputePipeline? _softmaxPipeline;
     private ComputePipeline? _matVecQ4KPipeline;
     private ComputePipeline? _matVecF32Pipeline;
+    private ComputePipeline? _kvAppendPipeline;
+    private ComputePipeline? _attentionPipeline;
 
     private struct RmsNormParams { public uint n; public float eps; }
     private struct CountParams { public uint n; }
     private struct RoPEParams { public uint numHeads; public uint headDim; public int position; public float theta; }
     private struct MatVecParams { public uint rows; public uint cols; }
+    private struct KvAppendParams { public uint kvDim; public uint position; public uint maxSeqLen; }
+    private struct AttentionParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint seqLen; public uint maxSeqLen; }
 
     public void RmsNorm(Tensor output, Tensor x, Tensor weight, float eps = 1e-5f)
     {
@@ -395,6 +399,34 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     }
 
     // ================================================================
+    //  KV Cache + Attention (GPU-resident)
+    // ================================================================
+
+    public void KvAppend(Tensor kInput, Tensor vInput, Tensor kCache, Tensor vCache,
+        uint kvDim, uint position, uint maxSeqLen)
+    {
+        _kvAppendPipeline ??= new ComputePipeline(this, Shaders.KvAppend, 4, pushConstantSize: sizeof(KvAppendParams));
+        var p = new KvAppendParams { kvDim = kvDim, position = position, maxSeqLen = maxSeqLen };
+        _kvAppendPipeline.DispatchWith(_transferCmd,
+            [GetBuffer(kInput), GetBuffer(vInput), GetBuffer(kCache), GetBuffer(vCache)],
+            (kvDim + 255) / 256, pushConstants: &p);
+    }
+
+    public void Attention(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen)
+    {
+        _attentionPipeline ??= new ComputePipeline(this, Shaders.Attention, 4, pushConstantSize: sizeof(AttentionParams));
+        var p = new AttentionParams
+        {
+            numHeads = numHeads, numKvHeads = numKvHeads,
+            headDim = headDim, seqLen = seqLen, maxSeqLen = maxSeqLen
+        };
+        _attentionPipeline.DispatchWith(_transferCmd,
+            [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(output)],
+            numHeads, pushConstants: &p); // one workgroup per head
+    }
+
+    // ================================================================
     //  Disposal
     // ================================================================
 
@@ -414,6 +446,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _softmaxPipeline?.Dispose();
         _matVecQ4KPipeline?.Dispose();
         _matVecF32Pipeline?.Dispose();
+        _kvAppendPipeline?.Dispose();
+        _attentionPipeline?.Dispose();
 
         // Free all tracked GPU buffers
         foreach (var buf in _buffers.Values)

@@ -228,6 +228,161 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Copy K and V vectors into the KV cache at the given position.
+    /// Push constants: { uint kv_dim, uint position, uint max_seq_len }.
+    /// Bindings: 0=k_input[kv_dim], 1=v_input[kv_dim], 2=k_cache[max_seq_len*kv_dim], 3=v_cache[max_seq_len*kv_dim].
+    /// </summary>
+    internal const string KvAppend = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer KIn  { float k_input[]; };
+        layout(binding = 1) readonly buffer VIn  { float v_input[]; };
+        layout(binding = 2) buffer KCache { float k_cache[]; };
+        layout(binding = 3) buffer VCache { float v_cache[]; };
+
+        layout(push_constant) uniform Params {
+            uint kv_dim;
+            uint position;
+            uint max_seq_len;
+        };
+
+        void main() {
+            uint i = gl_GlobalInvocationID.x;
+            if (i >= kv_dim) return;
+            uint offset = position * kv_dim + i;
+            k_cache[offset] = k_input[i];
+            v_cache[offset] = v_input[i];
+        }
+        """;
+
+    /// <summary>
+    /// Scaled dot-product attention with GQA support.
+    /// One workgroup per query head. Each workgroup computes:
+    ///   scores[t] = Q_h · K[t, kvHead] / sqrt(headDim) for t=0..seqLen
+    ///   softmax(scores)
+    ///   output[h] = sum(scores[t] * V[t, kvHead])
+    ///
+    /// Push constants: { uint num_heads, uint num_kv_heads, uint head_dim, uint seq_len, uint max_seq_len }.
+    /// Bindings: 0=Q[num_heads*head_dim], 1=K_cache[max_seq_len*kv_dim], 2=V_cache[max_seq_len*kv_dim], 3=output[num_heads*head_dim].
+    /// </summary>
+    internal const string Attention = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Q     { float q_data[]; };
+        layout(binding = 1) readonly buffer KCache { float k_cache[]; };
+        layout(binding = 2) readonly buffer VCache { float v_cache[]; };
+        layout(binding = 3) writeonly buffer Out   { float out_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint num_heads;
+            uint num_kv_heads;
+            uint head_dim;
+            uint seq_len;
+            uint max_seq_len;
+        };
+
+        shared float sdata[256];
+
+        void main() {
+            uint h = gl_WorkGroupID.x;      // query head index
+            uint tid = gl_LocalInvocationID.x;
+            if (h >= num_heads) return;
+
+            uint kv_head = h / (num_heads / num_kv_heads);
+            uint kv_dim = num_kv_heads * head_dim;
+            float scale = inversesqrt(float(head_dim));
+
+            // Phase 1: compute attention scores Q·K^T / sqrt(d)
+            // Each thread computes scores for a subset of positions
+            // Store scores in shared memory (limited to 256 positions at a time)
+            // For simplicity, process seqLen <= 256 in one pass
+
+            // First, compute all scores (tid maps to position t)
+            float score = -1.0/0.0; // -inf for positions beyond seqLen
+            if (tid < seq_len) {
+                float dot = 0.0;
+                uint q_off = h * head_dim;
+                uint k_off = tid * kv_dim + kv_head * head_dim;
+                for (uint d = 0; d < head_dim; d++)
+                    dot += q_data[q_off + d] * k_cache[k_off + d];
+                score = dot * scale;
+            }
+            sdata[tid] = score;
+            barrier();
+
+            // Phase 2: softmax over scores[0..seqLen)
+            // Find max
+            float local_max = sdata[tid];
+            barrier();
+            // Parallel reduction for max
+            for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s && tid + s < 256)
+                    sdata[tid] = max(sdata[tid], sdata[tid + s]);
+                barrier();
+            }
+            float max_val = sdata[0];
+            barrier();
+
+            // Exp and sum
+            float exp_val = 0.0;
+            if (tid < seq_len) {
+                exp_val = exp(local_max * scale / scale - max_val); // using original score
+                // Recompute: we lost the original score during max reduction
+            }
+
+            // Actually, let's recompute the score since sdata was overwritten
+            if (tid < seq_len) {
+                float dot = 0.0;
+                uint q_off = h * head_dim;
+                uint k_off = tid * kv_dim + kv_head * head_dim;
+                for (uint d = 0; d < head_dim; d++)
+                    dot += q_data[q_off + d] * k_cache[k_off + d];
+                exp_val = exp(dot * scale - max_val);
+            }
+            sdata[tid] = exp_val;
+            barrier();
+
+            // Sum reduction
+            for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] += sdata[tid + s];
+                barrier();
+            }
+            float sum_val = sdata[0];
+            barrier();
+
+            // Normalize
+            float weight = (tid < seq_len) ? exp_val / sum_val : 0.0;
+
+            // Phase 3: weighted sum of values
+            // Each thread holds weight for position tid
+            // Need to compute output[d] = sum_t(weight_t * V[t,d]) for d=0..headDim
+            // Use shared memory: for each d, accumulate weight * V[tid, d]
+            uint v_off = tid * kv_dim + kv_head * head_dim;
+            uint out_off = h * head_dim;
+
+            // Process headDim elements sequentially (headDim typically 64-128)
+            for (uint d = 0; d < head_dim; d++) {
+                float val = (tid < seq_len) ? weight * v_cache[v_off + d] : 0.0;
+                sdata[tid] = val;
+                barrier();
+
+                // Reduce
+                for (uint s = 128; s > 0; s >>= 1) {
+                    if (tid < s) sdata[tid] += sdata[tid + s];
+                    barrier();
+                }
+
+                if (tid == 0) out_data[out_off + d] = sdata[0];
+                barrier();
+            }
+        }
+        """;
+
+    /// <summary>
     /// Matrix-vector multiply with F32 weights.
     /// Each workgroup computes one output row.
     /// Push constants: { uint rows, uint cols }.

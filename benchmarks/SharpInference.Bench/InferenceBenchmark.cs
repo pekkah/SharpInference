@@ -122,7 +122,7 @@ public class InferenceBenchmark
     [IterationSetup(Target = nameof(GpuDecodeTokens))]
     public void GpuDecodeIterSetup()
     {
-        _gpuFwd.Cache.Reset();
+        _gpuFwd.ResetCache();
         ReadOnlySpan<float> logits = default;
         for (int i = 0; i < _promptTokens.Count; i++)
             logits = _gpuFwd.Forward(_promptTokens[i], i);

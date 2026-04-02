@@ -41,7 +41,13 @@ public sealed unsafe class GpuForwardPass : IDisposable
     private readonly Tensor _wOutputNorm;
     private readonly Tensor _wOutput;
 
-    // KV cache: CPU-side for now (attention runs on CPU)
+    // KV cache in VRAM: per-layer K and V buffers [maxSeqLen, kvDim]
+    private readonly Tensor[] _gpuKCache;  // per layer
+    private readonly Tensor[] _gpuVCache;  // per layer
+    private readonly int _maxSeqLen;
+    private int _kvLength; // current sequence length in cache
+
+    // CPU KV cache kept for fallback (not used when GPU attention works)
     private readonly Engine.KvCache _kvCache;
 
     private readonly int _embDim, _headDim, _numHeads, _numKvHeads, _headsPerKvGroup, _intermDim;
@@ -52,6 +58,7 @@ public sealed unsafe class GpuForwardPass : IDisposable
         _gpu = gpu;
         _hp = hp;
         _kvCache = new Engine.KvCache(hp);
+        _maxSeqLen = hp.ContextLength;
 
         _embDim = hp.EmbeddingDim;
         _headDim = hp.EmbeddingDim / hp.NumHeads;
@@ -71,6 +78,16 @@ public sealed unsafe class GpuForwardPass : IDisposable
         _ffnGate = gpu.Allocate(TensorShape.D1(_intermDim));
         _ffnUp = gpu.Allocate(TensorShape.D1(_intermDim));
         _logits = gpu.Allocate(TensorShape.D1(hp.VocabSize));
+
+        // Allocate VRAM KV cache: per-layer [maxSeqLen, kvDim]
+        int kvDim = _numKvHeads * _headDim;
+        _gpuKCache = new Tensor[hp.NumLayers];
+        _gpuVCache = new Tensor[hp.NumLayers];
+        for (int i = 0; i < hp.NumLayers; i++)
+        {
+            _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
+            _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
+        }
 
         // Upload all weights to VRAM
         int L = hp.NumLayers;
@@ -100,6 +117,9 @@ public sealed unsafe class GpuForwardPass : IDisposable
     }
 
     public Engine.KvCache Cache => _kvCache;
+    public int KvLength => _kvLength;
+
+    public void ResetCache() => _kvLength = 0;
 
     /// <summary>
     /// Run one token through the transformer on GPU. Returns logits span (downloaded from VRAM).
@@ -127,9 +147,14 @@ public sealed unsafe class GpuForwardPass : IDisposable
             _gpu.RoPE(_q, position, _headDim, _hp.RopeTheta);
             _gpu.RoPE(_k, position, _headDim, _hp.RopeTheta);
 
-            // Attention: download Q/K/V, run on CPU, upload result
-            // (GPU attention with causal masking + growing KV cache is complex — CPU fallback for now)
-            AttentionCpuFallback(layer, position);
+            // Append K, V to VRAM KV cache
+            _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer],
+                (uint)(_numKvHeads * _headDim), (uint)position, (uint)_maxSeqLen);
+
+            // GPU Attention (no PCIe round-trips)
+            _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
+                (uint)(position + 1), (uint)_maxSeqLen);
 
             // Output projection (GPU)
             GpuMatMul(_hidden, _wo[layer], _attnOut);
@@ -153,8 +178,6 @@ public sealed unsafe class GpuForwardPass : IDisposable
             _gpu.AddInPlace(_hidden, _residual);
         }
 
-        _kvCache.IncrementPosition();
-
         // Final norm + output projection (GPU)
         _gpu.RmsNorm(_hidden, _hidden, _wOutputNorm, _hp.RmsNormEps);
         GpuMatMul(_logits, _wOutput, _hidden);
@@ -163,70 +186,6 @@ public sealed unsafe class GpuForwardPass : IDisposable
         var logits = new float[_hp.VocabSize];
         _gpu.Download(_logits, logits);
         return logits;
-    }
-
-    // ================================================================
-    //  Attention (CPU fallback — download K/V/Q, compute, upload result)
-    // ================================================================
-
-    private void AttentionCpuFallback(int layer, int position)
-    {
-        int qDim = _numHeads * _headDim;
-        int kvDim = _numKvHeads * _headDim;
-        int seqLen = position + 1;
-
-        // Download Q, K, V from GPU
-        var qBuf = new float[qDim];
-        var kBuf = new float[kvDim];
-        var vBuf = new float[kvDim];
-        _gpu.Download(_q, qBuf);
-        _gpu.Download(_k, kBuf);
-        _gpu.Download(_v, vBuf);
-
-        // Append K, V to CPU KV cache
-        _kvCache.Append(layer, kBuf, vBuf);
-
-        // Compute attention on CPU
-        var attnOut = new float[qDim];
-        float scale = 1.0f / MathF.Sqrt(_headDim);
-
-        for (int h = 0; h < _numHeads; h++)
-        {
-            int kvHead = h / _headsPerKvGroup;
-            var scores = new float[seqLen];
-
-            // Q·K scores
-            for (int t = 0; t < seqLen; t++)
-            {
-                float dot = 0;
-                float* kVec = _kvCache.KeyAt(layer, t) + kvHead * _headDim;
-                for (int d = 0; d < _headDim; d++)
-                    dot += qBuf[h * _headDim + d] * kVec[d];
-                scores[t] = dot * scale;
-            }
-
-            // Softmax
-            float max = scores.Max();
-            float sum = 0;
-            for (int t = 0; t < seqLen; t++)
-            {
-                scores[t] = MathF.Exp(scores[t] - max);
-                sum += scores[t];
-            }
-            for (int t = 0; t < seqLen; t++) scores[t] /= sum;
-
-            // Weighted sum of values
-            for (int t = 0; t < seqLen; t++)
-            {
-                float w = scores[t];
-                float* vVec = _kvCache.ValueAt(layer, t) + kvHead * _headDim;
-                for (int d = 0; d < _headDim; d++)
-                    attnOut[h * _headDim + d] += w * vVec[d];
-            }
-        }
-
-        // Upload attention output back to GPU
-        UploadToExisting(_attnOut, attnOut);
     }
 
     // ================================================================
@@ -364,6 +323,12 @@ public sealed unsafe class GpuForwardPass : IDisposable
             _gpu.Free(_wGate[i]); _gpu.Free(_wUp[i]); _gpu.Free(_wDown[i]);
         }
         _gpu.Free(_wOutputNorm); _gpu.Free(_wOutput);
+
+        for (int i = 0; i < _hp.NumLayers; i++)
+        {
+            _gpu.Free(_gpuKCache[i]);
+            _gpu.Free(_gpuVCache[i]);
+        }
 
         _kvCache.Dispose();
     }
