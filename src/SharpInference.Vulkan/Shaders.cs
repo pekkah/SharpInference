@@ -105,6 +105,63 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Per-head RMSNorm: applies RMSNorm independently to each head-sized chunk.
+    /// data[h*head_dim + i] = data[h*head_dim + i] / rms_h * weight[i]
+    /// where rms_h = sqrt(mean(data[h*head_dim .. (h+1)*head_dim]^2) + eps).
+    ///
+    /// One workgroup per head. Weight is [head_dim] shared across all heads.
+    /// Push constants: { uint head_dim, uint num_heads, float eps }.
+    /// Bindings: 0=data (in/out), 1=weight (in).
+    /// Dispatch: num_heads workgroups of 256 threads.
+    /// </summary>
+    internal const string HeadNorm = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer Data   { float data_buf[]; };
+        layout(binding = 1) readonly buffer Weight { float weight_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint head_dim;
+            uint num_heads;
+            float eps;
+        };
+
+        shared float sdata[256];
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint head = gl_WorkGroupID.x;
+            if (head >= num_heads) return;
+
+            uint base_off = head * head_dim;
+
+            // Phase 1: accumulate sum of squares
+            float sum = 0.0;
+            for (uint i = tid; i < head_dim; i += 256) {
+                float v = data_buf[base_off + i];
+                sum += v * v;
+            }
+            sdata[tid] = sum;
+            barrier();
+
+            // Phase 2: parallel reduction
+            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] += sdata[tid + s];
+                barrier();
+            }
+
+            // Phase 3: normalize in-place with weight
+            float scale = inversesqrt(sdata[0] / float(head_dim) + eps);
+            for (uint i = tid; i < head_dim; i += 256) {
+                data_buf[base_off + i] = data_buf[base_off + i] * scale * weight_data[i];
+            }
+        }
+        """;
+
+    /// <summary>
     /// Element-wise multiply: output[i] = a[i] * b[i]
     /// Push constants: { uint n }.
     /// Bindings: 0=a, 1=b, 2=output.
@@ -228,7 +285,7 @@ internal static class Shaders
         """;
 
     /// <summary>
-    /// Embedding lookup: copy one row from embedding table to output.
+    /// Embedding lookup: copy one row from F32 embedding table to output.
     /// Push constants: { uint token_id, uint emb_dim }.
     /// Bindings: 0=embedding_table[vocab_size*emb_dim], 1=output[emb_dim].
     /// </summary>
@@ -248,6 +305,87 @@ internal static class Shaders
             uint i = gl_GlobalInvocationID.x;
             if (i >= emb_dim) return;
             output_data[i] = emb_table[token_id * emb_dim + i];
+        }
+        """;
+
+    /// <summary>
+    /// Embedding lookup from Q4_K quantized table: dequantize one row to F32 output.
+    /// 256 threads cooperate: each processes one block (256 elements) sequentially,
+    /// with each thread handling one element per block.
+    ///
+    /// Push constants: { uint token_id, uint emb_dim }.
+    /// Bindings: 0=quantized_table (uint8 via uint32[]), 1=output[emb_dim].
+    /// Dispatch: 1 workgroup.
+    /// </summary>
+    internal const string EmbedLookupQ4K = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer EmbTable { uint emb_data[]; };
+        layout(binding = 1) writeonly buffer Output  { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint token_id;
+            uint emb_dim;
+        };
+
+        shared uint blk[36]; // 144 bytes = one Q4_K block in shared memory
+
+        uint sReadByte(uint byteOffset) {
+            return (blk[byteOffset >> 2] >> ((byteOffset & 3) * 8)) & 0xFF;
+        }
+
+        float sReadHalf(uint byteOffset) {
+            uint lo = sReadByte(byteOffset);
+            uint hi = sReadByte(byteOffset + 1);
+            return unpackHalf2x16(lo | (hi << 8)).x;
+        }
+
+        void sGetScaleMin(uint j, out float sc, out float m) {
+            if (j < 4) {
+                sc = float(sReadByte(4 + j) & 63);
+                m  = float(sReadByte(4 + j + 4) & 63);
+            } else {
+                sc = float((sReadByte(4 + j + 4) & 0xF) | ((sReadByte(4 + j - 4) >> 6) << 4));
+                m  = float((sReadByte(4 + j + 4) >> 4) | ((sReadByte(4 + j) >> 6) << 4));
+            }
+        }
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint num_blocks = emb_dim >> 8; // emb_dim / 256
+
+            // Byte offset to the start of this token's row
+            uint bytes_per_row = num_blocks * 144;
+            uint row_base = token_id * (bytes_per_row >> 2); // in uint32 units
+
+            for (uint block = 0; block < num_blocks; block++) {
+                // Cooperatively load 36 uint32s (144 bytes) into shared memory
+                uint blk_word_base = row_base + (block * 144 >> 2);
+                if (tid < 36)
+                    blk[tid] = emb_data[blk_word_base + tid];
+                barrier();
+
+                // Each thread dequantizes its element
+                uint chunk = tid >> 6;
+                uint sub = tid & 63;
+                bool is_upper = sub >= 32;
+                uint byte_pos = sub & 31;
+
+                float d = sReadHalf(0);
+                float dmin = sReadHalf(2);
+
+                uint si = chunk * 2 + (is_upper ? 1u : 0u);
+                float sc, mn;
+                sGetScaleMin(si, sc, mn);
+
+                uint qbyte = sReadByte(16 + chunk * 32 + byte_pos);
+                uint nibble = is_upper ? (qbyte >> 4) : (qbyte & 0xF);
+
+                output_data[block * 256 + tid] = d * sc * float(nibble) - dmin * mn;
+
+                barrier();
+            }
         }
         """;
 

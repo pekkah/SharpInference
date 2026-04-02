@@ -32,6 +32,12 @@ public sealed class ModelHyperparams
     public bool HasAttnBias { get; init; }
 
     /// <summary>
+    /// Whether the model has per-head Q/K RMSNorm (e.g. Qwen3).
+    /// Detected at load time by probing for "blk.0.attn_q_norm.weight" in the GGUF tensor index.
+    /// </summary>
+    public bool HasQkNorm { get; init; }
+
+    /// <summary>
     /// Extract hyperparameters from GGUF metadata using the model's architecture prefix.
     /// Supports llama-family models (llama, mistral, qwen, smollm, etc.).
     /// </summary>
@@ -52,6 +58,7 @@ public sealed class ModelHyperparams
             RmsNormEps = GetFloat(metadata, $"{arch}.attention.layer_norm_rms_epsilon", 1e-5f),
             RopeTheta = GetFloat(metadata, $"{arch}.rope.freq_base", 10_000f),
             HasAttnBias = metadata.ContainsKey("_sharpi.has_attn_bias"),
+            HasQkNorm = metadata.ContainsKey("_sharpi.has_qk_norm"),
         };
     }
 

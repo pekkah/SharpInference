@@ -181,6 +181,21 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         }
     }
 
+    /// <summary>Total device-local (VRAM) heap size in bytes.</summary>
+    public ulong VramBytes
+    {
+        get
+        {
+            ulong total = 0;
+            for (int i = 0; i < (int)_memoryProperties.memoryHeapCount; i++)
+            {
+                if ((_memoryProperties.memoryHeaps[i].flags & VkMemoryHeapFlags.DeviceLocal) != 0)
+                    total += _memoryProperties.memoryHeaps[i].size;
+            }
+            return total;
+        }
+    }
+
     /// <summary>Find the memory type index matching the requested flags.</summary>
     public uint FindMemoryType(uint typeFilter, VkMemoryPropertyFlags properties)
     {
@@ -383,6 +398,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     // ================================================================
 
     private ComputePipeline? _rmsNormPipeline;
+    private ComputePipeline? _headNormPipeline;
     private ComputePipeline? _siluMulPipeline;
     private ComputePipeline? _addInPlacePipeline;
     private ComputePipeline? _elementwiseMulPipeline;
@@ -394,8 +410,10 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private ComputePipeline? _kvAppendPipeline;
     private ComputePipeline? _attentionPipeline;
     private ComputePipeline? _embedLookupPipeline;
+    private ComputePipeline? _embedLookupQ4KPipeline;
 
     private struct RmsNormParams { public uint n; public float eps; }
+    private struct HeadNormParams { public uint headDim; public uint numHeads; public float eps; }
     private struct CountParams { public uint n; }
     private struct RoPEParams { public uint numHeads; public uint headDim; public int position; public float theta; }
     private struct MatVecParams { public uint rows; public uint cols; }
@@ -417,6 +435,13 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _rmsNormPipeline ??= new ComputePipeline(this, Shaders.RmsNorm, 3, pushConstantSize: sizeof(RmsNormParams));
         var p = new RmsNormParams { n = (uint)x.ElementCount, eps = eps };
         DispatchOrRecord(_rmsNormPipeline, [GetBuffer(x), GetBuffer(weight), GetBuffer(output)], 1, &p);
+    }
+
+    public void HeadNorm(Tensor data, Tensor weight, uint numHeads, uint headDim, float eps = 1e-6f)
+    {
+        _headNormPipeline ??= new ComputePipeline(this, Shaders.HeadNorm, 2, pushConstantSize: sizeof(HeadNormParams));
+        var p = new HeadNormParams { headDim = headDim, numHeads = numHeads, eps = eps };
+        DispatchOrRecord(_headNormPipeline, [GetBuffer(data), GetBuffer(weight)], numHeads, &p);
     }
 
     public void SiLU(Tensor x) => throw new NotImplementedException("Use SiLuMul for fused SiLU*gate");
@@ -498,6 +523,13 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         DispatchOrRecord(_embedLookupPipeline, [GetBuffer(embTable), GetBuffer(output)], (embDim + 255) / 256, &p);
     }
 
+    public void EmbedLookupQ4K(Tensor embTable, Tensor output, uint tokenId, uint embDim)
+    {
+        _embedLookupQ4KPipeline ??= new ComputePipeline(this, Shaders.EmbedLookupQ4K, 2, pushConstantSize: sizeof(EmbedParams));
+        var p = new EmbedParams { tokenId = tokenId, embDim = embDim };
+        DispatchOrRecord(_embedLookupQ4KPipeline, [GetBuffer(embTable), GetBuffer(output)], 1, &p);
+    }
+
     public void KvAppend(Tensor kInput, Tensor vInput, Tensor kCache, Tensor vCache,
         uint kvDim, uint position, uint maxSeqLen)
     {
@@ -535,6 +567,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
 
         // Dispose compute pipelines
         _rmsNormPipeline?.Dispose();
+        _headNormPipeline?.Dispose();
         _siluMulPipeline?.Dispose();
         _addInPlacePipeline?.Dispose();
         _elementwiseMulPipeline?.Dispose();
@@ -546,6 +579,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _kvAppendPipeline?.Dispose();
         _attentionPipeline?.Dispose();
         _embedLookupPipeline?.Dispose();
+        _embedLookupQ4KPipeline?.Dispose();
 
         _downloadStaging?.Dispose();
         _uploadStaging?.Dispose();

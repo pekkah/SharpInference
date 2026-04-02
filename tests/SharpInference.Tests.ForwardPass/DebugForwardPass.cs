@@ -5,12 +5,12 @@ namespace SharpInference.Tests.ForwardPass;
 
 public sealed class DebugForwardPass
 {
-    private static string? FindModelPath()
+    private static string? FindModelPath(string filename = "SmolLM2-1.7B-Instruct-Q4_K_M.gguf")
     {
         var dir = Directory.GetCurrentDirectory();
         for (int i = 0; i < 8; i++)
         {
-            var candidate = Path.Combine(dir, "models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf");
+            var candidate = Path.Combine(dir, "models", filename);
             if (File.Exists(candidate)) return candidate;
             var parent = Directory.GetParent(dir);
             if (parent == null) break;
@@ -18,6 +18,8 @@ public sealed class DebugForwardPass
         }
         return null;
     }
+
+    private static string? FindQwen3Path() => FindModelPath("Qwen3-8B-Q4_K_M.gguf");
 
     [Fact]
     public void ListLayer0TensorNames()
@@ -95,6 +97,81 @@ public sealed class DebugForwardPass
         var decodeMs = sw.Elapsed.TotalMilliseconds;
         Console.WriteLine($"Decode: {generated.Count} tokens in {decodeMs:F0}ms ({generated.Count / (decodeMs / 1000):F1} t/s)");
         Console.WriteLine($"Output: {tokenizer.Decode(generated)}");
+    }
+
+    [Fact]
+    public void Qwen3_ParsesHyperparams()
+    {
+        var path = FindQwen3Path();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+
+        Assert.Equal(151936, hp.VocabSize);
+        Assert.Equal(4096, hp.EmbeddingDim);
+        Assert.Equal(36, hp.NumLayers);
+        Assert.Equal(32, hp.NumHeads);
+        Assert.Equal(8, hp.NumKvHeads);
+        Assert.Equal(12288, hp.IntermediateDim);
+        Assert.Equal(1_000_000f, hp.RopeTheta);
+        Assert.True(hp.HasQkNorm);
+        Assert.False(hp.HasAttnBias);
+    }
+
+    [Fact]
+    public void Qwen3_ListLayer0TensorNames()
+    {
+        var path = FindQwen3Path();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        foreach (var t in model.Tensors.Where(t => t.Name.StartsWith("blk.0.") || !t.Name.StartsWith("blk.")))
+            Console.WriteLine($"{t.Name}: [{string.Join(",", t.Dimensions.Take(t.NDimensions))}] {t.DType}");
+
+        // Verify Qwen3-specific tensors exist
+        Assert.NotNull(model.FindTensor("blk.0.attn_q_norm.weight"));
+        Assert.NotNull(model.FindTensor("blk.0.attn_k_norm.weight"));
+    }
+
+    [Fact]
+    public void Qwen3_CpuGeneration()
+    {
+        var path = FindQwen3Path();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var backend = new CpuBackend();
+        using var fwd = new SharpInference.Engine.ForwardPass(model, backend, hp);
+
+        var prompt = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n";
+        var tokens = tokenizer.Encode(prompt);
+        Console.WriteLine($"Prompt tokens ({tokens.Count}): {string.Join(", ", tokens)}");
+
+        // Prefill
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        ReadOnlySpan<float> logits = fwd.Prefill(tokens);
+        var prefillMs = sw.Elapsed.TotalMilliseconds;
+        Console.WriteLine($"Prefill: {tokens.Count} tokens in {prefillMs:F0}ms ({tokens.Count / (prefillMs / 1000):F1} t/s)");
+
+        // Generate 10 tokens
+        sw.Restart();
+        var generated = new List<int>();
+        for (int i = 0; i < 10; i++)
+        {
+            int next = Engine.Sampler.Greedy(logits);
+            generated.Add(next);
+            logits = fwd.Forward(next, tokens.Count + i);
+        }
+        var decodeMs = sw.Elapsed.TotalMilliseconds;
+        Console.WriteLine($"Decode: {generated.Count} tokens in {decodeMs:F0}ms ({generated.Count / (decodeMs / 1000):F1} t/s)");
+        Console.WriteLine($"Output: {tokenizer.Decode(generated)}");
+
+        // Should produce non-empty, non-garbage output
+        Assert.True(generated.Count == 10);
+        Assert.True(generated.Any(t => t != generated[0]), "All tokens identical — likely broken");
     }
 
     [Fact]

@@ -36,8 +36,9 @@ public sealed unsafe class GpuForwardPass : IDisposable
     private readonly Tensor _ffnUp;      // [intermDim]
     private readonly Tensor _logits;     // [vocabSize]
 
-    // Embedding table: dequantized to F32 and cached in VRAM
-    private readonly Tensor _gpuEmbedding; // [vocabSize * embDim] F32
+    // Embedding table in VRAM (quantized for large vocabs, F32 for small)
+    private readonly Tensor _gpuEmbedding;
+    private readonly bool _embIsQuantized;
 
     // GPU weight tensors (Q4_K/Q6_K bytes uploaded to VRAM)
     private readonly Tensor[] _wAttnNorm;
@@ -51,6 +52,10 @@ public sealed unsafe class GpuForwardPass : IDisposable
     private readonly bool _hasAttnBias;
     private readonly Tensor[]? _bq, _bk, _bv, _bo;
 
+    // Optional per-head Q/K RMSNorm weights in VRAM (Qwen3)
+    private readonly bool _hasQkNorm;
+    private readonly Tensor[]? _wqNorm, _wkNorm;
+
     // KV cache in VRAM: per-layer K and V buffers [maxSeqLen, kvDim]
     private readonly Tensor[] _gpuKCache;  // per layer
     private readonly Tensor[] _gpuVCache;  // per layer
@@ -62,13 +67,24 @@ public sealed unsafe class GpuForwardPass : IDisposable
 
     private readonly int _embDim, _headDim, _numHeads, _numKvHeads, _headsPerKvGroup, _intermDim;
 
-    public GpuForwardPass(GgufModel model, VulkanBackend gpu, ModelHyperparams hp)
+    public GpuForwardPass(GgufModel model, VulkanBackend gpu, ModelHyperparams hp, int maxContextLength = 0)
     {
         _model = model;
         _gpu = gpu;
         _hp = hp;
-        _kvCache = new Engine.KvCache(hp);
-        _maxSeqLen = hp.ContextLength;
+
+        if (maxContextLength > 0)
+        {
+            _maxSeqLen = Math.Min(maxContextLength, hp.ContextLength);
+        }
+        else
+        {
+            // Auto-calculate: estimate weight VRAM, give remaining to KV cache
+            _maxSeqLen = EstimateMaxContext(model, gpu, hp);
+        }
+
+        _kvCache = new Engine.KvCache(hp.NumLayers, _maxSeqLen, hp.NumKvHeads, hp.EmbeddingDim / hp.NumHeads);
+        Console.Error.WriteLine($"[GpuForwardPass] Context size: {_maxSeqLen} (model max: {hp.ContextLength})");
 
         _embDim = hp.EmbeddingDim;
         _headDim = hp.EmbeddingDim / hp.NumHeads;
@@ -113,6 +129,12 @@ public sealed unsafe class GpuForwardPass : IDisposable
             _bv = new Tensor[L]; _bo = new Tensor[L];
         }
 
+        _hasQkNorm = hp.HasQkNorm;
+        if (_hasQkNorm)
+        {
+            _wqNorm = new Tensor[L]; _wkNorm = new Tensor[L];
+        }
+
         Console.Error.Write($"[GpuForwardPass] Uploading {L} layers to VRAM...");
         for (int i = 0; i < L; i++)
         {
@@ -134,6 +156,12 @@ public sealed unsafe class GpuForwardPass : IDisposable
                 _bo![i] = UploadWeight($"blk.{i}.attn_output.bias");
             }
 
+            if (_hasQkNorm)
+            {
+                _wqNorm![i] = UploadWeight($"blk.{i}.attn_q_norm.weight");
+                _wkNorm![i] = UploadWeight($"blk.{i}.attn_k_norm.weight");
+            }
+
             Console.Error.Write(".");
         }
         _wOutputNorm = UploadWeight("output_norm.weight");
@@ -141,13 +169,28 @@ public sealed unsafe class GpuForwardPass : IDisposable
         var outputName = model.FindTensor("output.weight") is not null ? "output.weight" : "token_embd.weight";
         _wOutput = UploadWeight(outputName);
 
-        // Dequantize and upload full embedding table to VRAM (avoids per-token CPU dequant + upload)
+        // Upload embedding table to VRAM — keep quantized for Q4_K to save VRAM
         Console.Error.Write(" emb...");
         var embInfo = model.FindTensor("token_embd.weight")!.Value;
-        var embData = model.GetTensorData(embInfo);
-        var embF32 = new float[(int)embInfo.ElementCount];
-        Dequantize.ToFloat32(embData, embF32, embInfo.DType, embInfo.ElementCount);
-        _gpuEmbedding = gpu.Upload(embF32, TensorShape.D1(embF32.Length));
+        if (embInfo.DType == DType.Q4_K)
+        {
+            // Upload raw quantized bytes (reinterpret as uint32 for storage buffer)
+            var embData = model.GetTensorData(embInfo);
+            int floatCount = embData.Length / 4;
+            var raw = new float[floatCount];
+            embData.CopyTo(MemoryMarshal.AsBytes(raw.AsSpan()));
+            _gpuEmbedding = gpu.Upload(raw, TensorShape.D1(floatCount));
+            _embIsQuantized = true;
+        }
+        else
+        {
+            // Small vocab or F32: dequantize to F32
+            var embData = model.GetTensorData(embInfo);
+            var embF32 = new float[(int)embInfo.ElementCount];
+            Dequantize.ToFloat32(embData, embF32, embInfo.DType, embInfo.ElementCount);
+            _gpuEmbedding = gpu.Upload(embF32, TensorShape.D1(embF32.Length));
+            _embIsQuantized = false;
+        }
 
         Console.Error.WriteLine(" done.");
     }
@@ -166,7 +209,10 @@ public sealed unsafe class GpuForwardPass : IDisposable
         _gpu.BeginRecord();
 
         // Embed token (GPU lookup from cached table — no PCIe transfer)
-        _gpu.EmbedLookup(_gpuEmbedding, _hidden, (uint)token, (uint)_embDim);
+        if (_embIsQuantized)
+            _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, (uint)token, (uint)_embDim);
+        else
+            _gpu.EmbedLookup(_gpuEmbedding, _hidden, (uint)token, (uint)_embDim);
         _gpu.RecordBarrier();
 
         for (int layer = 0; layer < _hp.NumLayers; layer++)
@@ -189,6 +235,14 @@ public sealed unsafe class GpuForwardPass : IDisposable
                 _gpu.AddInPlace(_q, _bq![layer]);
                 _gpu.AddInPlace(_k, _bk![layer]);
                 _gpu.AddInPlace(_v, _bv![layer]);
+                _gpu.RecordBarrier();
+            }
+
+            // Per-head Q/K RMSNorm (Qwen3)
+            if (_hasQkNorm)
+            {
+                _gpu.HeadNorm(_q, _wqNorm![layer], (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps);
+                _gpu.HeadNorm(_k, _wkNorm![layer], (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps);
                 _gpu.RecordBarrier();
             }
 
@@ -358,6 +412,37 @@ public sealed unsafe class GpuForwardPass : IDisposable
         return result;
     }
 
+    private static int EstimateMaxContext(GgufModel model, VulkanBackend gpu, ModelHyperparams hp)
+    {
+        long vramBytes = (long)gpu.VramBytes;
+
+        // Estimate weight VRAM: raw quantized bytes padded to 4-byte alignment per tensor
+        long weightBytes = 0;
+        foreach (var t in model.Tensors)
+            weightBytes += (t.ByteSize + 3) & ~3L;
+
+        // Scratch buffers (F32): hidden, residual, norm, Q, K, V, attnOut, ffnGate, ffnUp, logits
+        int headDim = hp.EmbeddingDim / hp.NumHeads;
+        long scratchBytes = (long)(hp.EmbeddingDim * 3 + hp.NumHeads * headDim
+            + hp.NumKvHeads * headDim * 2 + hp.NumHeads * headDim
+            + hp.IntermediateDim * 2 + hp.VocabSize) * sizeof(float);
+
+        // Reserve for Vulkan overhead, staging buffers, OS/desktop compositor
+        // Use 20% of VRAM or 1 GB, whichever is larger
+        long reserved = Math.Max(vramBytes / 5, 1024L * 1024 * 1024);
+
+        long available = vramBytes - weightBytes - scratchBytes - reserved;
+        if (available <= 0) available = 64L * 1024 * 1024; // minimum fallback
+
+        // KV cache: 2 (K+V) * numLayers * numKvHeads * headDim * sizeof(float) per token
+        long bytesPerToken = 2L * hp.NumLayers * hp.NumKvHeads * headDim * sizeof(float);
+
+        int maxCtx = (int)(available / bytesPerToken);
+        maxCtx = Math.Clamp(maxCtx, 512, hp.ContextLength);
+
+        return maxCtx;
+    }
+
     public void Dispose()
     {
         _gpu.Free(_hidden); _gpu.Free(_residual); _gpu.Free(_normBuf);
@@ -374,6 +459,11 @@ public sealed unsafe class GpuForwardPass : IDisposable
             {
                 _gpu.Free(_bq![i]); _gpu.Free(_bk![i]);
                 _gpu.Free(_bv![i]); _gpu.Free(_bo![i]);
+            }
+
+            if (_hasQkNorm)
+            {
+                _gpu.Free(_wqNorm![i]); _gpu.Free(_wkNorm![i]);
             }
         }
         _gpu.Free(_wOutputNorm); _gpu.Free(_wOutput); _gpu.Free(_gpuEmbedding);

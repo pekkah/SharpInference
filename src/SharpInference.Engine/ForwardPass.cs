@@ -53,6 +53,10 @@ public sealed unsafe class ForwardPass : IDisposable
     private readonly bool _hasAttnBias;
     private readonly float*[] _bq, _bk, _bv, _bo;
 
+    // Optional per-head Q/K RMSNorm (Qwen3)
+    private readonly bool _hasQkNorm;
+    private readonly float*[] _qNorm, _kNorm;
+
     public ForwardPass(GgufModel model, IComputeBackend backend, ModelHyperparams hp)
     {
         _model = model;
@@ -93,6 +97,9 @@ public sealed unsafe class ForwardPass : IDisposable
         _bq = new float*[L]; _bk = new float*[L];
         _bv = new float*[L]; _bo = new float*[L];
 
+        _hasQkNorm = hp.HasQkNorm;
+        _qNorm = new float*[L]; _kNorm = new float*[L];
+
         for (int i = 0; i < L; i++)
         {
             _attnNorm[i] = ResolveTensor($"blk.{i}.attn_norm.weight");
@@ -111,6 +118,12 @@ public sealed unsafe class ForwardPass : IDisposable
                 _bk[i] = LoadBias($"blk.{i}.attn_k.bias", _numKvHeads * _headDim);
                 _bv[i] = LoadBias($"blk.{i}.attn_v.bias", _numKvHeads * _headDim);
                 _bo[i] = LoadBias($"blk.{i}.attn_output.bias", _embDim);
+            }
+
+            if (_hasQkNorm)
+            {
+                _qNorm[i] = LoadBias($"blk.{i}.attn_q_norm.weight", _headDim);
+                _kNorm[i] = LoadBias($"blk.{i}.attn_k_norm.weight", _headDim);
             }
         }
 
@@ -186,6 +199,16 @@ public sealed unsafe class ForwardPass : IDisposable
                         SimdKernels.AddInPlace(batchQ + (long)n * qDim, _bq[layer], qDim);
                         SimdKernels.AddInPlace(batchK + (long)n * kvDim, _bk[layer], kvDim);
                         SimdKernels.AddInPlace(batchV + (long)n * kvDim, _bv[layer], kvDim);
+                    }
+                }
+
+                // Per-head Q/K RMSNorm (Qwen3)
+                if (_hasQkNorm)
+                {
+                    for (int n = 0; n < N; n++)
+                    {
+                        PerHeadRmsNorm(batchQ + (long)n * qDim, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
+                        PerHeadRmsNorm(batchK + (long)n * kvDim, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
                     }
                 }
 
@@ -324,6 +347,13 @@ public sealed unsafe class ForwardPass : IDisposable
                 SimdKernels.AddInPlace(_q, _bq[layer], _numHeads * _headDim);
                 SimdKernels.AddInPlace(_k, _bk[layer], _numKvHeads * _headDim);
                 SimdKernels.AddInPlace(_v, _bv[layer], _numKvHeads * _headDim);
+            }
+
+            // Per-head Q/K RMSNorm (Qwen3)
+            if (_hasQkNorm)
+            {
+                PerHeadRmsNorm(_q, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
+                PerHeadRmsNorm(_k, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
             }
 
             // RoPE
@@ -528,6 +558,16 @@ public sealed unsafe class ForwardPass : IDisposable
     //  Utilities
     // ================================================================
 
+    /// <summary>
+    /// Apply RMSNorm independently to each head-sized chunk.
+    /// weight has [headDim] elements and is shared across all heads.
+    /// </summary>
+    private static void PerHeadRmsNorm(float* data, float* weight, int numHeads, int headDim, float eps)
+    {
+        for (int h = 0; h < numHeads; h++)
+            SimdKernels.RmsNorm(data + h * headDim, data + h * headDim, weight, headDim, eps);
+    }
+
     private static float* Alloc(int count) =>
         (float*)NativeMemory.AllocZeroed((nuint)(count * sizeof(float)));
 
@@ -560,6 +600,15 @@ public sealed unsafe class ForwardPass : IDisposable
                 NativeMemory.Free(_bk[i]);
                 NativeMemory.Free(_bv[i]);
                 NativeMemory.Free(_bo[i]);
+            }
+        }
+
+        if (_hasQkNorm)
+        {
+            for (int i = 0; i < _hp.NumLayers; i++)
+            {
+                NativeMemory.Free(_qNorm[i]);
+                NativeMemory.Free(_kNorm[i]);
             }
         }
 

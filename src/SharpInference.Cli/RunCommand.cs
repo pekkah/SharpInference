@@ -78,6 +78,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [Description("Layers on GPU (0=CPU only, -1=all, default: 0)")]
         [DefaultValue(0)]
         public int NGpuLayers { get; init; }
+
+        [CommandOption("-c|--ctx-size")]
+        [Description("Context size / max sequence length (0 = model default)")]
+        [DefaultValue(0)]
+        public int CtxSize { get; init; }
     }
 
     protected override int Execute(CommandContext context, Settings settings, CancellationToken cancellation)
@@ -98,6 +103,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         var sw = Stopwatch.StartNew();
         using var model = GgufModel.Open(modelPath);
         var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        int ctxSize = settings.CtxSize; // 0 = auto (GPU will estimate from VRAM, CPU uses model default)
         var tokenizer = GgufTokenizer.FromGgufModel(model);
         using var cpuBackend = new CpuBackend();
         using var fwd = new ForwardPass(model, cpuBackend, hp);
@@ -116,7 +122,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             var gpu = new VulkanBackend();
             gpuBackend = gpu;
             gpu.PrintDeviceInfo();
-            var gfwd = new GpuForwardPass(model, gpu, hp);
+            var gfwd = new GpuForwardPass(model, gpu, hp, ctxSize);
             gpuFwd = gfwd;
             forward = gfwd.Forward;
             prefill = tokens => { ReadOnlySpan<float> l = default; for (int i = 0; i < tokens.Count; i++) l = gfwd.Forward(tokens[i], i); return l; };
@@ -132,7 +138,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         }
 
         AnsiConsole.MarkupLine($"[dim]Model loaded in {sw.Elapsed.TotalSeconds:F1}s — " +
-            $"{hp.NumLayers}L, {hp.EmbeddingDim}d, {hp.VocabSize} vocab[/]");
+            $"{hp.NumLayers}L, {hp.EmbeddingDim}d, {hp.VocabSize} vocab, ctx={hp.ContextLength}[/]");
 
         var sp = new SamplingParams
         {
