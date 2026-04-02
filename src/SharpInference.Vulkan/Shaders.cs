@@ -702,26 +702,24 @@ internal static class Shaders
         };
 
         shared float sdata[256];
-        shared uint blk[36]; // 144 bytes = 36 uint32s — one Q4_K block cached in shared memory
 
-        uint sReadByte(uint byteOffset) {
-            return (blk[byteOffset >> 2] >> ((byteOffset & 3) * 8)) & 0xFF;
+        uint gReadByte(uint word_base, uint byteOffset) {
+            return (weights_data[word_base + (byteOffset >> 2)] >> ((byteOffset & 3) * 8)) & 0xFF;
         }
 
-        float sReadHalf(uint byteOffset) {
-            uint lo = sReadByte(byteOffset);
-            uint hi = sReadByte(byteOffset + 1);
+        float gReadHalf(uint word_base, uint byteOffset) {
+            uint lo = gReadByte(word_base, byteOffset);
+            uint hi = gReadByte(word_base, byteOffset + 1);
             return unpackHalf2x16(lo | (hi << 8)).x;
         }
 
-        void sGetScaleMin(uint j, out float sc, out float m) {
-            // scales start at byte offset 4 within block
+        void gGetScaleMin(uint word_base, uint j, out float sc, out float m) {
             if (j < 4) {
-                sc = float(sReadByte(4 + j) & 63);
-                m  = float(sReadByte(4 + j + 4) & 63);
+                sc = float(gReadByte(word_base, 4 + j) & 63);
+                m  = float(gReadByte(word_base, 4 + j + 4) & 63);
             } else {
-                sc = float((sReadByte(4 + j + 4) & 0xF) | ((sReadByte(4 + j - 4) >> 6) << 4));
-                m  = float((sReadByte(4 + j + 4) >> 4) | ((sReadByte(4 + j) >> 6) << 4));
+                sc = float((gReadByte(word_base, 4 + j + 4) & 0xF) | ((gReadByte(word_base, 4 + j - 4) >> 6) << 4));
+                m  = float((gReadByte(word_base, 4 + j + 4) >> 4) | ((gReadByte(word_base, 4 + j) >> 6) << 4));
             }
         }
 
@@ -732,41 +730,36 @@ internal static class Shaders
 
             uint num_blocks = cols >> 8;
             uint bytes_per_row = num_blocks * 144;
-            uint boff_base = row * bytes_per_row;
+            uint word_row_base = (row * bytes_per_row) >> 2;
 
             float acc = 0.0;
 
-            // Process one block at a time; all 256 threads cooperate per block
+            // Each thread processes multiple blocks — no barriers, no shared mem for weights.
+            // Thread tid handles elements tid, tid+256, tid+512, ... across blocks.
+            // Within each block: tid maps to one element position.
             for (uint block = 0; block < num_blocks; block++) {
-                // Cooperatively load 36 uint32s (144 bytes) into shared memory
-                uint global_word_base = (boff_base + block * 144) >> 2;
-                if (tid < 36)
-                    blk[tid] = weights_data[global_word_base + tid];
-                barrier();
+                uint word_base = word_row_base + ((block * 144) >> 2);
 
-                // Each thread dequantizes its own element (tid = within-block index)
-                uint chunk = tid >> 6;   // 0-3
+                float d = gReadHalf(word_base, 0);
+                float dmin = gReadHalf(word_base, 2);
+
+                uint chunk = tid >> 6;
                 uint sub = tid & 63;
                 bool is_upper = sub >= 32;
                 uint byte_pos = sub & 31;
 
-                float d = sReadHalf(0);
-                float dmin = sReadHalf(2);
-
                 uint si = chunk * 2 + (is_upper ? 1u : 0u);
                 float sc, mn;
-                sGetScaleMin(si, sc, mn);
+                gGetScaleMin(word_base, si, sc, mn);
 
-                uint qbyte = sReadByte(16 + chunk * 32 + byte_pos);
+                uint qbyte = gReadByte(word_base, 16 + chunk * 32 + byte_pos);
                 uint nibble = is_upper ? (qbyte >> 4) : (qbyte & 0xF);
 
                 uint elem = block * 256 + tid;
                 acc += (d * sc * float(nibble) - dmin * mn) * input_data[elem];
-
-                barrier(); // ensure blk[] not overwritten before all threads done
             }
 
-            // Parallel reduction
+            // Parallel reduction in shared memory
             sdata[tid] = acc;
             barrier();
 
