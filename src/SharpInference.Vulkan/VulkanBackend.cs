@@ -303,16 +303,95 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     }
 
     // ================================================================
-    //  Compute shader stubs (Phase 2 — next steps)
+    //  Compute shader pipelines (created lazily on first use)
     // ================================================================
 
-    public void MatMul(Tensor output, Tensor matrix, Tensor vector) => throw new NotImplementedException();
-    public void AddInPlace(Tensor dst, Tensor src) => throw new NotImplementedException();
-    public void ElementwiseMul(Tensor output, Tensor a, Tensor b) => throw new NotImplementedException();
-    public void RmsNorm(Tensor output, Tensor x, Tensor weight, float eps = 1e-5f) => throw new NotImplementedException();
-    public void Softmax(Tensor x) => throw new NotImplementedException();
-    public void SiLU(Tensor x) => throw new NotImplementedException();
-    public void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f) => throw new NotImplementedException();
+    private ComputePipeline? _rmsNormPipeline;
+    private ComputePipeline? _siluMulPipeline;
+    private ComputePipeline? _addInPlacePipeline;
+    private ComputePipeline? _elementwiseMulPipeline;
+    private ComputePipeline? _ropePipeline;
+    private ComputePipeline? _softmaxPipeline;
+    private ComputePipeline? _matVecQ4KPipeline;
+
+    private struct RmsNormParams { public uint n; public float eps; }
+    private struct CountParams { public uint n; }
+    private struct RoPEParams { public uint numHeads; public uint headDim; public int position; public float theta; }
+    private struct MatVecParams { public uint rows; public uint cols; }
+
+    public void RmsNorm(Tensor output, Tensor x, Tensor weight, float eps = 1e-5f)
+    {
+        _rmsNormPipeline ??= new ComputePipeline(this, Shaders.RmsNorm, 3, pushConstantSize: sizeof(RmsNormParams));
+        var ds = _rmsNormPipeline.AllocateDescriptorSet();
+        _rmsNormPipeline.UpdateDescriptorSet(ds, GetBuffer(x), GetBuffer(weight), GetBuffer(output));
+        var p = new RmsNormParams { n = (uint)x.ElementCount, eps = eps };
+        _rmsNormPipeline.Dispatch(_transferCmd, ds, 1, pushConstants: &p);
+    }
+
+    public void SiLU(Tensor x) => throw new NotImplementedException("Use SiLuMul for fused SiLU*gate");
+
+    public void SiLuMul(Tensor gate, Tensor up)
+    {
+        _siluMulPipeline ??= new ComputePipeline(this, Shaders.SiLuMul, 2, pushConstantSize: sizeof(CountParams));
+        var ds = _siluMulPipeline.AllocateDescriptorSet();
+        _siluMulPipeline.UpdateDescriptorSet(ds, GetBuffer(gate), GetBuffer(up));
+        var p = new CountParams { n = (uint)gate.ElementCount };
+        uint groups = ((uint)gate.ElementCount + 255) / 256;
+        _siluMulPipeline.Dispatch(_transferCmd, ds, groups, pushConstants: &p);
+    }
+
+    public void AddInPlace(Tensor dst, Tensor src)
+    {
+        _addInPlacePipeline ??= new ComputePipeline(this, Shaders.AddInPlace, 2, pushConstantSize: sizeof(CountParams));
+        var ds = _addInPlacePipeline.AllocateDescriptorSet();
+        _addInPlacePipeline.UpdateDescriptorSet(ds, GetBuffer(dst), GetBuffer(src));
+        var p = new CountParams { n = (uint)dst.ElementCount };
+        uint groups = ((uint)dst.ElementCount + 255) / 256;
+        _addInPlacePipeline.Dispatch(_transferCmd, ds, groups, pushConstants: &p);
+    }
+
+    public void ElementwiseMul(Tensor output, Tensor a, Tensor b)
+    {
+        _elementwiseMulPipeline ??= new ComputePipeline(this, Shaders.ElementwiseMul, 3, pushConstantSize: sizeof(CountParams));
+        var ds = _elementwiseMulPipeline.AllocateDescriptorSet();
+        _elementwiseMulPipeline.UpdateDescriptorSet(ds, GetBuffer(a), GetBuffer(b), GetBuffer(output));
+        var p = new CountParams { n = (uint)a.ElementCount };
+        uint groups = ((uint)a.ElementCount + 255) / 256;
+        _elementwiseMulPipeline.Dispatch(_transferCmd, ds, groups, pushConstants: &p);
+    }
+
+    public void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f)
+    {
+        _ropePipeline ??= new ComputePipeline(this, Shaders.RoPE, 1, pushConstantSize: sizeof(RoPEParams));
+        uint numHeads = (uint)(x.ElementCount / headDim);
+        uint halfDim = (uint)(headDim / 2);
+        uint totalPairs = numHeads * halfDim;
+        var ds = _ropePipeline.AllocateDescriptorSet();
+        _ropePipeline.UpdateDescriptorSet(ds, GetBuffer(x));
+        var p = new RoPEParams { numHeads = numHeads, headDim = (uint)headDim, position = position, theta = ropeTheta };
+        uint groups = (totalPairs + 255) / 256;
+        _ropePipeline.Dispatch(_transferCmd, ds, groups, pushConstants: &p);
+    }
+
+    public void Softmax(Tensor x)
+    {
+        _softmaxPipeline ??= new ComputePipeline(this, Shaders.Softmax, 1, pushConstantSize: sizeof(CountParams));
+        var ds = _softmaxPipeline.AllocateDescriptorSet();
+        _softmaxPipeline.UpdateDescriptorSet(ds, GetBuffer(x));
+        var p = new CountParams { n = (uint)x.ElementCount };
+        _softmaxPipeline.Dispatch(_transferCmd, ds, 1, pushConstants: &p);
+    }
+
+    public void MatMul(Tensor output, Tensor matrix, Tensor vector)
+    {
+        _matVecQ4KPipeline ??= new ComputePipeline(this, Shaders.MatVecQ4K, 3, pushConstantSize: sizeof(MatVecParams));
+        long rows = output.ElementCount;
+        long cols = vector.ElementCount;
+        var ds = _matVecQ4KPipeline.AllocateDescriptorSet();
+        _matVecQ4KPipeline.UpdateDescriptorSet(ds, GetBuffer(matrix), GetBuffer(vector), GetBuffer(output));
+        var p = new MatVecParams { rows = (uint)rows, cols = (uint)cols };
+        _matVecQ4KPipeline.Dispatch(_transferCmd, ds, (uint)rows, pushConstants: &p);
+    }
 
     // ================================================================
     //  Disposal
@@ -324,6 +403,15 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _disposed = true;
 
         _vkd.vkDeviceWaitIdle();
+
+        // Dispose compute pipelines
+        _rmsNormPipeline?.Dispose();
+        _siluMulPipeline?.Dispose();
+        _addInPlacePipeline?.Dispose();
+        _elementwiseMulPipeline?.Dispose();
+        _ropePipeline?.Dispose();
+        _softmaxPipeline?.Dispose();
+        _matVecQ4KPipeline?.Dispose();
 
         // Free all tracked GPU buffers
         foreach (var buf in _buffers.Values)
