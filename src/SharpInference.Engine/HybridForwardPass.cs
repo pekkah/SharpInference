@@ -4,6 +4,7 @@ using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using SharpInference.Core;
 using SharpInference.Cpu;
+using SharpInference.TurboQuant;
 using SharpInference.Vulkan;
 
 namespace SharpInference.Engine;
@@ -48,12 +49,16 @@ public sealed unsafe class HybridForwardPass : IDisposable
     private readonly float*[] _cpuBq, _cpuBk, _cpuBv, _cpuBo;
     private readonly float*[] _cpuQNorm, _cpuKNorm;
     private readonly KvCache _cpuKvCache;
+    private readonly TurboQuantKvCache? _cpuTqKvCache;
+    private readonly float* _cpuRotatedQuery; // scratch for TQ query rotation [headDim]
+    private readonly float* _cpuDecompBuf;    // scratch for TQ value decompress [headDim]
     private readonly Dictionary<string, nint> _cpuNormCache = new();
 
     // ── Shared ──
     private readonly Tensor _pinnedHidden; // host-visible buffer for GPU↔CPU transfer
     private readonly float[] _logitsBuf;
     private readonly bool _hasAttnBias, _hasQkNorm;
+    private readonly bool _tqEnabled;
     private int _kvLength;
     private readonly int _maxSeqLen;
 
@@ -79,8 +84,9 @@ public sealed unsafe class HybridForwardPass : IDisposable
         _intermDim = hp.IntermediateDim;
         _hasAttnBias = hp.HasAttnBias;
         _hasQkNorm = hp.HasQkNorm;
+        _tqEnabled = enableTq;
 
-        Console.Error.WriteLine($"[HybridForwardPass] {placement.Summary()}");
+        Console.Error.WriteLine($"[HybridForwardPass] {placement.Summary()}{(enableTq ? " [TQ3]" : "")}");
 
         // ── Allocate GPU scratch buffers ──
         _gpuHidden = gpu.Allocate(TensorShape.D1(_embDim));
@@ -201,6 +207,13 @@ public sealed unsafe class HybridForwardPass : IDisposable
         }
 
         _cpuKvCache = new KvCache(_nCpuLayers, _maxSeqLen, _numKvHeads, _headDim);
+
+        if (_tqEnabled && _nCpuLayers > 0)
+        {
+            _cpuTqKvCache = new TurboQuantKvCache(_nCpuLayers, _maxSeqLen, _numKvHeads, _headDim);
+            _cpuRotatedQuery = Alloc(_headDim);
+            _cpuDecompBuf = Alloc(_headDim);
+        }
     }
 
     // ================================================================
@@ -247,7 +260,10 @@ public sealed unsafe class HybridForwardPass : IDisposable
             }
 
             // Increment CPU KV cache
-            _cpuKvCache.IncrementPosition();
+            if (_cpuTqKvCache != null)
+                _cpuTqKvCache.IncrementPosition();
+            else
+                _cpuKvCache.IncrementPosition();
 
             // ── Phase 4: Transfer CPU hidden → GPU ──
             pinned = _gpu.MapPinned(_pinnedHidden);
@@ -280,7 +296,10 @@ public sealed unsafe class HybridForwardPass : IDisposable
     public void ResetCache()
     {
         _kvLength = 0;
-        _cpuKvCache.Reset();
+        if (_cpuTqKvCache != null)
+            _cpuTqKvCache.Reset();
+        else
+            _cpuKvCache.Reset();
     }
 
     // ================================================================
@@ -392,12 +411,24 @@ public sealed unsafe class HybridForwardPass : IDisposable
         SimdKernels.ApplyRoPE(_cpuK, position, _numKvHeads, _headDim, _hp.RopeTheta);
 
         // KV cache append (ci = CPU layer index)
-        _cpuKvCache.Append(ci,
-            new ReadOnlySpan<float>(_cpuK, _numKvHeads * _headDim),
-            new ReadOnlySpan<float>(_cpuV, _numKvHeads * _headDim));
+        if (_cpuTqKvCache != null)
+        {
+            _cpuTqKvCache.Append(ci,
+                new ReadOnlySpan<float>(_cpuK, _numKvHeads * _headDim),
+                new ReadOnlySpan<float>(_cpuV, _numKvHeads * _headDim));
+        }
+        else
+        {
+            _cpuKvCache.Append(ci,
+                new ReadOnlySpan<float>(_cpuK, _numKvHeads * _headDim),
+                new ReadOnlySpan<float>(_cpuV, _numKvHeads * _headDim));
+        }
 
         // Attention
-        CpuAttention(ci, position);
+        if (_cpuTqKvCache != null)
+            CpuTqAttention(ci, position);
+        else
+            CpuAttention(ci, position);
 
         // Output projection
         SimdKernels.MatVec(_cpuHidden, _cpuWo[ci].DataPtr, _cpuAttnOut, _embDim, _numHeads * _headDim, _cpuWo[ci].DType);
@@ -450,6 +481,88 @@ public sealed unsafe class HybridForwardPass : IDisposable
             for (int t = 0; t < seqLen; t++)
             {
                 float* vVec = _cpuKvCache.ValueAt(ci, t) + kvHead * _headDim;
+                float w = _cpuAttnScores[t];
+                if (Fma.IsSupported && _headDim >= 8)
+                {
+                    var wv = Vector256.Create(w);
+                    int d = 0;
+                    for (; d + 8 <= _headDim; d += 8)
+                    {
+                        var o = Avx.LoadVector256(outHead + d);
+                        var v = Avx.LoadVector256(vVec + d);
+                        Avx.Store(outHead + d, Fma.MultiplyAdd(wv, v, o));
+                    }
+                    for (; d < _headDim; d++)
+                        outHead[d] += w * vVec[d];
+                }
+                else
+                {
+                    for (int d = 0; d < _headDim; d++)
+                        outHead[d] += w * vVec[d];
+                }
+            }
+        }
+    }
+
+    private void CpuTqAttention(int ci, int position)
+    {
+        var tq = _cpuTqKvCache!;
+        int seqLen = position + 1;
+        int tqLen = tq.TqLength;
+        int fp32Start = tqLen;
+        float scale = 1.0f / MathF.Sqrt(_headDim);
+
+        for (int h = 0; h < _numHeads; h++)
+        {
+            int kvHead = h / _headsPerKvGroup;
+            float* qHead = _cpuQ + h * _headDim;
+            float* outHead = _cpuAttnOut + h * _headDim;
+
+            // Rotate query once per head for TQ dot products
+            var keyCompressor = tq.GetKeyCompressor(ci, kvHead);
+            keyCompressor.RotateQuery(
+                new ReadOnlySpan<float>(qHead, _headDim),
+                new Span<float>(_cpuRotatedQuery, _headDim));
+
+            // TQ-compressed positions
+            for (int t = 0; t < tqLen; t++)
+            {
+                byte* tqKey = tq.TqKeyAt(ci, t, kvHead);
+                float dot = TurboQuantOps.DequantDot3Scalar(
+                    tqKey, _cpuRotatedQuery,
+                    (float*)Unsafe.AsPointer(ref MemoryMarshal.GetReference(keyCompressor.Centroids)),
+                    _headDim);
+                _cpuAttnScores[t] = dot * scale;
+            }
+
+            // FP32 window positions
+            for (int t = fp32Start; t < seqLen; t++)
+            {
+                float* kVec = tq.Fp32KeyAt(ci, t) + kvHead * _headDim;
+                _cpuAttnScores[t] = SimdKernels.DotF32(qHead, kVec, _headDim) * scale;
+            }
+
+            SimdKernels.SoftmaxInPlace(_cpuAttnScores, seqLen);
+
+            for (int d = 0; d < _headDim; d++) outHead[d] = 0;
+
+            // TQ values: decompress and accumulate
+            var valCompressor = tq.GetValueCompressor(ci, kvHead);
+            for (int t = 0; t < tqLen; t++)
+            {
+                byte* tqVal = tq.TqValueAt(ci, t, kvHead);
+                var decompSpan = new Span<float>(_cpuDecompBuf, _headDim);
+                valCompressor.Decompress(
+                    new ReadOnlySpan<byte>(tqVal, tq.TqBlockSize), decompSpan);
+                float w = _cpuAttnScores[t];
+                for (int d = 0; d < _headDim; d++)
+                    outHead[d] += w * _cpuDecompBuf[d];
+            }
+
+            // FP32 values
+            for (int t = fp32Start; t < seqLen; t++)
+            {
+                float* vVec = tq.Fp32ValueAt(ci, t) + kvHead * _headDim;
                 float w = _cpuAttnScores[t];
                 if (Fma.IsSupported && _headDim >= 8)
                 {
@@ -609,6 +722,9 @@ public sealed unsafe class HybridForwardPass : IDisposable
         NativeMemory.Free(_cpuHidden); NativeMemory.Free(_cpuResidual); NativeMemory.Free(_cpuNormBuf);
         NativeMemory.Free(_cpuQ); NativeMemory.Free(_cpuK); NativeMemory.Free(_cpuV); NativeMemory.Free(_cpuAttnOut);
         NativeMemory.Free(_cpuFfnGate); NativeMemory.Free(_cpuFfnUp); NativeMemory.Free(_cpuAttnScores);
+        if (_cpuRotatedQuery != null) NativeMemory.Free(_cpuRotatedQuery);
+        if (_cpuDecompBuf != null) NativeMemory.Free(_cpuDecompBuf);
         _cpuKvCache.Dispose();
+        _cpuTqKvCache?.Dispose();
     }
 }

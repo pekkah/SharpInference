@@ -62,21 +62,8 @@ public static class TierPlanner
         }
 
         // KV cache: remaining VRAM budget
-        long kvBytesPerToken;
-        if (turboQuant)
-        {
-            int blockSize = TurboQuantOps.BlockSize(tqBits, headDim);
-            // FP32 window (256 tokens) + TQ compressed rest
-            long fp32WindowBytes = 2L * gpuLayers * hp.NumKvHeads * headDim * sizeof(float) * 256;
-            long tqPerToken = 2L * gpuLayers * hp.NumKvHeads * blockSize;
-            // Approximate: assume most tokens are TQ-compressed
-            kvBytesPerToken = tqPerToken;
-            vramBudget -= fp32WindowBytes;
-        }
-        else
-        {
-            kvBytesPerToken = 2L * gpuLayers * hp.NumKvHeads * headDim * sizeof(float);
-        }
+        // GPU layers always use FP32 KV cache in VRAM (TQ only applies to CPU layers)
+        long kvBytesPerToken = 2L * gpuLayers * hp.NumKvHeads * headDim * sizeof(float);
 
         int gpuCtxSize;
         if (requestedCtxSize > 0)
