@@ -553,6 +553,49 @@ public static unsafe class SimdKernels
     //  RoPE (precomputed sin/cos, SIMD rotation)
     // ================================================================
 
+    /// <summary>
+    /// Apply RoPE using precomputed cos/sin tables (avoids recomputing trig 48× per token).
+    /// </summary>
+    public static void ApplyRoPECached(float* x, float* cosTab, float* sinTab, int numHeads, int headDim)
+    {
+        int halfDim = headDim / 2;
+        for (int h = 0; h < numHeads; h++)
+        {
+            float* head = x + h * headDim;
+            if (Avx.IsSupported && halfDim >= 4)
+            {
+                int i = 0;
+                for (; i + 4 <= halfDim; i += 4)
+                {
+                    var v = Avx.LoadVector256(head + 2 * i);
+                    var c = Vector256.Create(cosTab[i], cosTab[i], cosTab[i + 1], cosTab[i + 1],
+                                             cosTab[i + 2], cosTab[i + 2], cosTab[i + 3], cosTab[i + 3]);
+                    var s = Vector256.Create(sinTab[i], sinTab[i], sinTab[i + 1], sinTab[i + 1],
+                                             sinTab[i + 2], sinTab[i + 2], sinTab[i + 3], sinTab[i + 3]);
+                    var swapped = Avx.Shuffle(v, v, 0b10_11_00_01);
+                    var signMask = Vector256.Create(-1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f);
+                    var result = Fma.MultiplyAdd(v, c, Avx.Multiply(swapped, Avx.Multiply(s, signMask)));
+                    Avx.Store(head + 2 * i, result);
+                }
+                for (; i < halfDim; i++)
+                {
+                    float x0 = head[2 * i], x1 = head[2 * i + 1];
+                    head[2 * i] = x0 * cosTab[i] - x1 * sinTab[i];
+                    head[2 * i + 1] = x0 * sinTab[i] + x1 * cosTab[i];
+                }
+            }
+            else
+            {
+                for (int i = 0; i < halfDim; i++)
+                {
+                    float x0 = head[2 * i], x1 = head[2 * i + 1];
+                    head[2 * i] = x0 * cosTab[i] - x1 * sinTab[i];
+                    head[2 * i + 1] = x0 * sinTab[i] + x1 * cosTab[i];
+                }
+            }
+        }
+    }
+
     public static void ApplyRoPE(float* x, int position, int numHeads, int headDim, float theta)
     {
         int halfDim = headDim / 2;
