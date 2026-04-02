@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\SharpInference.Engine\SharpInference.Engine.csproj" />
+    <ProjectReference Include="..\..\src\SharpInference.Vulkan\SharpInference.Vulkan.csproj" />
   </ItemGroup>
 
 </Project>

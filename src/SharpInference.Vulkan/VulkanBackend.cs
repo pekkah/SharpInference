@@ -5,100 +5,197 @@ using static Vortice.Vulkan.Vulkan;
 namespace SharpInference.Vulkan;
 
 /// <summary>
-/// Vulkan compute backend. Dispatches GLSL compute shaders via Vortice.Vulkan.
-/// Shaders are compiled from <c>shaders/</c> at build time (glslc) and loaded as SPIR-V.
+/// Vulkan compute backend using Vortice.Vulkan.
+/// Selects a discrete GPU, creates a compute-only queue, and manages
+/// VRAM buffers for inference tensor operations.
 /// </summary>
-public sealed unsafe class VulkanBackend : IComputeBackend
+public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
 {
-#pragma warning disable CS0169 // Never used — scaffold fields for Phase 2
-    private VkInstance _instance;
-    private VkPhysicalDevice _physicalDevice;
-    private VkDevice _device;
-    private VkQueue _computeQueue;
-    private uint _computeQueueFamily;
-#pragma warning restore CS0169
+    private readonly VkInstance _instance;
+    private readonly VkInstanceApi _vki;
+    private readonly VkPhysicalDevice _physicalDevice;
+    private readonly VkDevice _device;
+    private readonly VkDeviceApi _vkd;
+    private readonly VkQueue _computeQueue;
+    private readonly uint _computeQueueFamily;
+    private readonly VkPhysicalDeviceProperties _deviceProperties;
+    private readonly VkPhysicalDeviceMemoryProperties _memoryProperties;
+    private bool _disposed;
 
-    public string Name => "Vulkan GPU";
+    public string Name { get; }
+    public uint ComputeQueueFamily => _computeQueueFamily;
+    public VkInstanceApi Vki => _vki;
+    public VkDeviceApi Vkd => _vkd;
+    public VkDevice Device => _device;
 
     public VulkanBackend()
     {
-        // TODO Phase 2: create Vulkan instance, pick physical device, create logical device
+        // 1. Initialize Vulkan loader
+        vkInitialize().CheckResult();
+
+        // 2. Create instance (Vulkan 1.3, no extensions for compute-only)
+        VkApplicationInfo appInfo = new()
+        {
+            apiVersion = VkVersion.Version_1_3,
+        };
+        VkInstanceCreateInfo instanceCI = new()
+        {
+            pApplicationInfo = &appInfo,
+        };
+        vkCreateInstance(in instanceCI, out _instance).CheckResult();
+        _vki = new VkInstanceApi(in _instance);
+
+        // 3. Select physical device (prefer discrete GPU)
+        _physicalDevice = SelectPhysicalDevice();
+        _vki.vkGetPhysicalDeviceProperties(_physicalDevice, out _deviceProperties);
+        VkPhysicalDeviceMemoryProperties memProps;
+        _vki.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, &memProps);
+        _memoryProperties = memProps;
+
+        fixed (byte* namePtr = _deviceProperties.deviceName)
+            Name = $"Vulkan GPU ({new string((sbyte*)namePtr)})";
+
+        // 4. Find best compute queue family (prefer dedicated compute over shared graphics+compute)
+        _computeQueueFamily = FindComputeQueueFamily();
+
+        // 5. Create logical device with one compute queue
+        float queuePriority = 1.0f;
+        VkDeviceQueueCreateInfo queueCI = new()
+        {
+            queueFamilyIndex = _computeQueueFamily,
+            queueCount = 1,
+            pQueuePriorities = &queuePriority,
+        };
+        VkDeviceCreateInfo deviceCI = new()
+        {
+            queueCreateInfoCount = 1,
+            pQueueCreateInfos = &queueCI,
+        };
+        _vki.vkCreateDevice(_physicalDevice, in deviceCI, out _device).CheckResult();
+        _vkd = new VkDeviceApi(_vki, in _device);
+
+        // 6. Get the compute queue handle
+        VkQueue queue;
+        _vkd.vkGetDeviceQueue(_computeQueueFamily, 0, &queue);
+        _computeQueue = queue;
     }
 
-    public Tensor Allocate(TensorShape shape, DType dtype = DType.Float32)
+    /// <summary>Print device info to console.</summary>
+    public void PrintDeviceInfo()
     {
-        // TODO: allocate VkBuffer on device-local memory
-        throw new NotImplementedException();
+        Console.WriteLine($"Device: {Name}");
+        Console.WriteLine($"  API: {_deviceProperties.apiVersion}");
+        Console.WriteLine($"  Compute queue family: {_computeQueueFamily}");
+        for (int i = 0; i < (int)_memoryProperties.memoryHeapCount; i++)
+        {
+            var heap = _memoryProperties.memoryHeaps[i];
+            var flags = (heap.flags & VkMemoryHeapFlags.DeviceLocal) != 0 ? "VRAM" : "RAM";
+            Console.WriteLine($"  Heap {i}: {heap.size / 1024 / 1024}MB ({flags})");
+        }
     }
 
-    public void Free(Tensor tensor)
+    /// <summary>Find the memory type index matching the requested flags.</summary>
+    public uint FindMemoryType(uint typeFilter, VkMemoryPropertyFlags properties)
     {
-        // TODO: free VkBuffer and device memory
-        throw new NotImplementedException();
+        for (int i = 0; i < (int)_memoryProperties.memoryTypeCount; i++)
+        {
+            if ((typeFilter & (1u << i)) != 0 &&
+                (_memoryProperties.memoryTypes[i].propertyFlags & properties) == properties)
+                return (uint)i;
+        }
+        throw new InvalidOperationException($"No memory type found for filter={typeFilter}, properties={properties}");
     }
 
-    public Tensor Upload(ReadOnlySpan<float> data, TensorShape shape)
+    // ================================================================
+    //  Physical device selection
+    // ================================================================
+
+    private VkPhysicalDevice SelectPhysicalDevice()
     {
-        // TODO: allocate VkBuffer on device-local memory, stage-copy via transfer queue
-        throw new NotImplementedException();
+        uint count = 0;
+        _vki.vkEnumeratePhysicalDevices(&count, null);
+        if (count == 0) throw new InvalidOperationException("No Vulkan-capable GPU found");
+
+        var devices = new VkPhysicalDevice[count];
+        fixed (VkPhysicalDevice* p = devices)
+            _vki.vkEnumeratePhysicalDevices(&count, p);
+
+        // Prefer discrete GPU, fall back to any compute-capable device
+        VkPhysicalDevice fallback = default;
+        foreach (var gpu in devices)
+        {
+            var props = _vki.vkGetPhysicalDeviceProperties(gpu);
+            if (props.deviceType == VkPhysicalDeviceType.DiscreteGpu)
+                return gpu;
+            if (fallback.IsNull && HasComputeQueue(gpu))
+                fallback = gpu;
+        }
+        return fallback.IsNull
+            ? throw new InvalidOperationException("No compute-capable GPU found")
+            : fallback;
     }
 
-    public void Download(Tensor src, Span<float> dst)
+    private bool HasComputeQueue(VkPhysicalDevice gpu)
     {
-        // TODO: copy from device-local buffer to host via staging buffer
-        throw new NotImplementedException();
+        uint count = 0;
+        _vki.vkGetPhysicalDeviceQueueFamilyProperties(gpu, &count, null);
+        var families = new VkQueueFamilyProperties[count];
+        fixed (VkQueueFamilyProperties* p = families)
+            _vki.vkGetPhysicalDeviceQueueFamilyProperties(gpu, &count, p);
+        return families.Any(f => (f.queueFlags & VkQueueFlags.Compute) != 0);
     }
 
-    public void MatMul(Tensor output, Tensor matrix, Tensor vector)
+    private uint FindComputeQueueFamily()
     {
-        // TODO: dispatch matmul.comp shader
-        throw new NotImplementedException();
+        uint count = 0;
+        _vki.vkGetPhysicalDeviceQueueFamilyProperties(_physicalDevice, &count, null);
+        var families = new VkQueueFamilyProperties[count];
+        fixed (VkQueueFamilyProperties* p = families)
+            _vki.vkGetPhysicalDeviceQueueFamilyProperties(_physicalDevice, &count, p);
+
+        // Prefer dedicated compute queue (no graphics bit) for async compute
+        uint dedicated = uint.MaxValue;
+        uint shared = uint.MaxValue;
+        for (uint i = 0; i < count; i++)
+        {
+            if ((families[i].queueFlags & VkQueueFlags.Compute) == 0) continue;
+            if ((families[i].queueFlags & VkQueueFlags.Graphics) == 0)
+                dedicated = i;  // Pure compute queue — best for async dispatch
+            else if (shared == uint.MaxValue)
+                shared = i;
+        }
+        return dedicated != uint.MaxValue ? dedicated : shared != uint.MaxValue ? shared
+            : throw new InvalidOperationException("No compute queue family found");
     }
 
-    public void AddInPlace(Tensor dst, Tensor src)
-    {
-        // TODO: dispatch add_inplace.comp shader
-        throw new NotImplementedException();
-    }
+    // ================================================================
+    //  IComputeBackend stubs (Phase 2 implementation)
+    // ================================================================
 
-    public void ElementwiseMul(Tensor output, Tensor a, Tensor b)
-    {
-        // TODO: dispatch elementwise_mul.comp shader
-        throw new NotImplementedException();
-    }
+    public Tensor Allocate(TensorShape shape, DType dtype = DType.Float32) => throw new NotImplementedException();
+    public void Free(Tensor tensor) => throw new NotImplementedException();
+    public Tensor Upload(ReadOnlySpan<float> data, TensorShape shape) => throw new NotImplementedException();
+    public void Download(Tensor src, Span<float> dst) => throw new NotImplementedException();
+    public void MatMul(Tensor output, Tensor matrix, Tensor vector) => throw new NotImplementedException();
+    public void AddInPlace(Tensor dst, Tensor src) => throw new NotImplementedException();
+    public void ElementwiseMul(Tensor output, Tensor a, Tensor b) => throw new NotImplementedException();
+    public void RmsNorm(Tensor output, Tensor x, Tensor weight, float eps = 1e-5f) => throw new NotImplementedException();
+    public void Softmax(Tensor x) => throw new NotImplementedException();
+    public void SiLU(Tensor x) => throw new NotImplementedException();
+    public void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f) => throw new NotImplementedException();
+    public void Synchronize() => throw new NotImplementedException();
 
-    public void RmsNorm(Tensor output, Tensor x, Tensor weight, float eps = 1e-5f)
-    {
-        // TODO: dispatch rmsnorm.comp shader
-        throw new NotImplementedException();
-    }
-
-    public void Softmax(Tensor x)
-    {
-        // TODO: dispatch softmax.comp shader
-        throw new NotImplementedException();
-    }
-
-    public void SiLU(Tensor x)
-    {
-        // TODO: dispatch silu.comp shader
-        throw new NotImplementedException();
-    }
-
-    public void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f)
-    {
-        // TODO: dispatch rope.comp shader
-        throw new NotImplementedException();
-    }
-
-    public void Synchronize()
-    {
-        // TODO: vkQueueWaitIdle or fence
-        throw new NotImplementedException();
-    }
+    // ================================================================
+    //  Disposal
+    // ================================================================
 
     public void Dispose()
     {
-        // TODO Phase 2: destroy device, instance
+        if (_disposed) return;
+        _disposed = true;
+
+        _vkd.vkDeviceWaitIdle();
+        _vkd.vkDestroyDevice(null);
+        _vki.vkDestroyInstance(null);
     }
 }
