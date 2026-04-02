@@ -107,7 +107,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         AnsiConsole.MarkupLine($"[dim]Loading model:[/] {modelPath}");
         var sw = Stopwatch.StartNew();
         using var model = GgufModel.Open(modelPath);
-        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
         int ctxSize = settings.CtxSize; // 0 = auto (GPU will estimate from VRAM, CPU uses model default)
         var tokenizer = GgufTokenizer.FromGgufModel(model);
         using var cpuBackend = new CpuBackend();

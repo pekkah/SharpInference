@@ -37,13 +37,46 @@ public sealed class ModelHyperparams
     /// </summary>
     public bool HasQkNorm { get; init; }
 
+    // ── MoE (Mixture of Experts) ──
+
+    /// <summary>Whether this model uses Mixture of Experts architecture.</summary>
+    public bool IsMoE { get; init; }
+
+    /// <summary>Total number of experts per layer (e.g. 16 for Llama 4 Scout).</summary>
+    public int NumExperts { get; init; }
+
+    /// <summary>Number of experts activated per token (e.g. 1 for Llama 4 Scout, 2 for Mixtral).</summary>
+    public int NumActiveExperts { get; init; }
+
+    /// <summary>FFN dimension per expert (may differ from IntermediateDim which is the shared FFN dim).</summary>
+    public int ExpertIntermediateDim { get; init; }
+
+    /// <summary>Whether the model has a shared expert that runs on every token (e.g. Llama 4, DeepSeek-V2).</summary>
+    public bool HasSharedExpert { get; init; }
+
     /// <summary>
     /// Extract hyperparameters from GGUF metadata using the model's architecture prefix.
-    /// Supports llama-family models (llama, mistral, qwen, smollm, etc.).
+    /// Supports llama-family models (llama, mistral, qwen, smollm, etc.) and MoE variants.
     /// </summary>
     public static ModelHyperparams FromGgufMetadata(IReadOnlyDictionary<string, object> metadata)
+        => FromGgufMetadata(metadata, null);
+
+    public static ModelHyperparams FromGgufMetadata(IReadOnlyDictionary<string, object> metadata,
+        GgufModel? model)
     {
         var arch = metadata.TryGetValue("general.architecture", out var a) ? (string)a : "llama";
+
+        int numExperts = GetInt(metadata, $"{arch}.expert_count");
+        int numActiveExperts = GetInt(metadata, $"{arch}.expert_used_count");
+        bool isMoE = numExperts > 0;
+
+        // Detect features by probing tensor names
+        bool hasAttnBias = metadata.ContainsKey("_sharpi.has_attn_bias")
+            || (model?.FindTensor("blk.0.attn_q.bias") is not null);
+        bool hasQkNorm = metadata.ContainsKey("_sharpi.has_qk_norm")
+            || (model?.FindTensor("blk.0.attn_q_norm.weight") is not null);
+        bool hasSharedExpert = isMoE
+            && (model?.FindTensor("blk.0.ffn_gate_shexp.weight") is not null);
 
         return new ModelHyperparams
         {
@@ -57,8 +90,14 @@ public sealed class ModelHyperparams
             IntermediateDim = GetInt(metadata, $"{arch}.feed_forward_length"),
             RmsNormEps = GetFloat(metadata, $"{arch}.attention.layer_norm_rms_epsilon", 1e-5f),
             RopeTheta = GetFloat(metadata, $"{arch}.rope.freq_base", 10_000f),
-            HasAttnBias = metadata.ContainsKey("_sharpi.has_attn_bias"),
-            HasQkNorm = metadata.ContainsKey("_sharpi.has_qk_norm"),
+            HasAttnBias = hasAttnBias,
+            HasQkNorm = hasQkNorm,
+            IsMoE = isMoE,
+            NumExperts = numExperts,
+            NumActiveExperts = numActiveExperts,
+            ExpertIntermediateDim = GetInt(metadata, $"{arch}.expert_feed_forward_length",
+                                       GetInt(metadata, $"{arch}.feed_forward_length")),
+            HasSharedExpert = hasSharedExpert,
         };
     }
 
