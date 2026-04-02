@@ -19,6 +19,90 @@ public static unsafe class SimdKernels
     };
 
     // ================================================================
+    //  Batched GEMM (for prefill)
+    // ================================================================
+
+    // Reusable dequant buffer for GEMM (one weight matrix at a time)
+    [ThreadStatic] private static nint t_dequantBuf;
+    [ThreadStatic] private static int t_dequantBufSize;
+
+    private static bool s_blasLogged;
+
+    /// <summary>
+    /// Batched matrix multiply: output[batchSize, rows] = input[batchSize, cols] × W[rows, cols]^T
+    /// Uses OpenBLAS sgemm when available (dequant weights to F32 temp buffer, then GEMM).
+    /// Falls back to sequential MatVec per batch element.
+    /// </summary>
+    public static void MatMulBatched(float* output, byte* weights, float* input,
+        int batchSize, int rows, int cols, DType dtype)
+    {
+        if (!s_blasLogged)
+        {
+            Console.Error.WriteLine($"[SharpInference] OpenBLAS: {(BlasInterop.IsAvailable ? "LOADED" : "not found (fallback to sequential)")}");
+            s_blasLogged = true;
+        }
+        // For small batches, fused MatVec is faster (no dequant overhead)
+        // BLAS only wins when N is large enough to amortize F32 dequantization
+        const int MinBatchForBlas = 32;
+
+        if (batchSize < MinBatchForBlas || !BlasInterop.IsAvailable)
+        {
+            // Sequential fused MatVec (dequant in registers, no temp buffer)
+            for (int n = 0; n < batchSize; n++)
+                MatVec(output + n * rows, weights, input + n * cols, rows, cols, dtype);
+            return;
+        }
+
+        // OpenBLAS GEMM path for large batches: dequant weights to F32, then sgemm
+        if (dtype != DType.Float32)
+        {
+            int weightElements = rows * cols;
+
+            // Ensure thread-local dequant buffer is large enough
+            if (t_dequantBufSize < weightElements)
+            {
+                if (t_dequantBuf != 0) NativeMemory.Free((void*)t_dequantBuf);
+                t_dequantBuf = (nint)NativeMemory.AllocZeroed((nuint)(weightElements * sizeof(float)));
+                t_dequantBufSize = weightElements;
+            }
+            var wf32 = (float*)t_dequantBuf;
+
+            // Dequantize full weight matrix to F32
+            long totalBytes = DTypeInfo.ByteSize(weightElements, dtype);
+            Dequantize.ToFloat32(
+                new ReadOnlySpan<byte>(weights, (int)totalBytes),
+                new Span<float>(wf32, weightElements),
+                dtype, weightElements);
+
+            // sgemm: C[M,N] = A[M,K] * B[K,N]
+            // We want: output[batchSize, rows] = input[batchSize, cols] * W[rows, cols]^T
+            // In row-major: C = input * W^T
+            // sgemm(RowMajor, NoTrans, Trans, M=batchSize, N=rows, K=cols,
+            //        alpha=1, A=input, lda=cols, B=W, ldb=cols, beta=0, C=output, ldc=rows)
+            BlasInterop.Sgemm(
+                BlasInterop.RowMajor, BlasInterop.NoTrans, BlasInterop.Trans,
+                batchSize, rows, cols,
+                1.0f, input, cols,
+                wf32, cols,
+                0.0f, output, rows);
+            return;
+        }
+
+        // F32 weights with BLAS
+        if (BlasInterop.IsAvailable && dtype == DType.Float32)
+        {
+            BlasInterop.Sgemm(
+                BlasInterop.RowMajor, BlasInterop.NoTrans, BlasInterop.Trans,
+                batchSize, rows, cols,
+                1.0f, input, cols,
+                (float*)weights, cols,
+                0.0f, output, rows);
+            return;
+        }
+
+    }
+
+    // ================================================================
     //  Dispatchers
     // ================================================================
 

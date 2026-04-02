@@ -77,7 +77,7 @@ public sealed class DebugForwardPass
         var tokens = tokenizer.Encode(prompt);
         Console.WriteLine($"Prompt tokens ({tokens.Count}): {string.Join(", ", tokens)}");
 
-        // Prefill with batched method (layer-by-layer, weights stay in L3)
+        // Prefill with batched method (uses OpenBLAS GEMM when available)
         var sw = System.Diagnostics.Stopwatch.StartNew();
         ReadOnlySpan<float> logits = fwd.Prefill(tokens);
         var prefillMs = sw.Elapsed.TotalMilliseconds;

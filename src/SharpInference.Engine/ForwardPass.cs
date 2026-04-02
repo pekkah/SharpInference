@@ -127,67 +127,125 @@ public sealed unsafe class ForwardPass : IDisposable
             for (int n = 0; n < N; n++)
                 EmbedTokenInto(tokens[n], batchHidden + (long)n * _embDim);
 
-            // 2. Process layer-by-layer (weights stay in L3 cache across all N tokens)
+            // Temp buffers for batched operations
+            int qDim = _numHeads * _headDim;
+            int kvDim = _numKvHeads * _headDim;
+            var batchNorm = (float*)NativeMemory.AllocZeroed((nuint)((long)N * _embDim * sizeof(float)));
+            var batchQ = (float*)NativeMemory.AllocZeroed((nuint)((long)N * qDim * sizeof(float)));
+            var batchK = (float*)NativeMemory.AllocZeroed((nuint)((long)N * kvDim * sizeof(float)));
+            var batchV = (float*)NativeMemory.AllocZeroed((nuint)((long)N * kvDim * sizeof(float)));
+            var batchAttnOut = (float*)NativeMemory.AllocZeroed((nuint)((long)N * qDim * sizeof(float)));
+            var batchFfnGate = (float*)NativeMemory.AllocZeroed((nuint)((long)N * _intermDim * sizeof(float)));
+            var batchFfnUp = (float*)NativeMemory.AllocZeroed((nuint)((long)N * _intermDim * sizeof(float)));
+
+            try
+            {
+            // 2. Process layer-by-layer
             for (int layer = 0; layer < _hp.NumLayers; layer++)
             {
-                // Reset KV cache position so this layer fills positions 0..N-1.
-                // Each layer writes to its own _keys[layer]/_values[layer] arrays,
-                // so resetting the shared position counter is safe.
                 _kvCache.Reset();
-
                 var normW = GetNormWeight(_attnNorm[layer]);
 
-                // Attention pass: Q/K/V projections + RoPE + causal attention
-                // Weight data for wq/wk/wv/wo stays hot in L3 across all N tokens
+                // Batch RMS norm for all tokens
+                for (int n = 0; n < N; n++)
+                {
+                    Copy(batchResidual + (long)n * _embDim, batchHidden + (long)n * _embDim, _embDim);
+                    SimdKernels.RmsNorm(batchNorm + (long)n * _embDim,
+                        batchHidden + (long)n * _embDim, normW, _embDim, _hp.RmsNormEps);
+                }
+
+                // Batched Q/K/V projections (single GEMM per weight matrix)
+                SimdKernels.MatMulBatched(batchQ, _wq[layer].DataPtr, batchNorm,
+                    N, qDim, _embDim, _wq[layer].DType);
+                SimdKernels.MatMulBatched(batchK, _wk[layer].DataPtr, batchNorm,
+                    N, kvDim, _embDim, _wk[layer].DType);
+                SimdKernels.MatMulBatched(batchV, _wv[layer].DataPtr, batchNorm,
+                    N, kvDim, _embDim, _wv[layer].DType);
+
+                // Per-token: RoPE, KV cache append, attention
+                for (int n = 0; n < N; n++)
+                {
+                    float* qn = batchQ + (long)n * qDim;
+                    float* kn = batchK + (long)n * kvDim;
+                    float* vn = batchV + (long)n * kvDim;
+
+                    SimdKernels.ApplyRoPE(qn, n, _numHeads, _headDim, _hp.RopeTheta);
+                    SimdKernels.ApplyRoPE(kn, n, _numKvHeads, _headDim, _hp.RopeTheta);
+
+                    _kvCache.Append(layer,
+                        new ReadOnlySpan<float>(kn, kvDim),
+                        new ReadOnlySpan<float>(vn, kvDim));
+                    _kvCache.IncrementPosition();
+
+                    // Copy Q to scratch for Attention (it reads from _q)
+                    Copy(_q, qn, qDim);
+                    Attention(layer, n);
+
+                    // Copy attention output for batched output projection
+                    Copy(batchAttnOut + (long)n * qDim, _attnOut, qDim);
+                }
+
+                // Batched output projection
+                SimdKernels.MatMulBatched(batchNorm, _wo[layer].DataPtr, batchAttnOut,
+                    N, _embDim, qDim, _wo[layer].DType);
+
+                // Add output projection + residual → batchHidden
                 for (int n = 0; n < N; n++)
                 {
                     float* h = batchHidden + (long)n * _embDim;
+                    float* proj = batchNorm + (long)n * _embDim;
                     float* r = batchResidual + (long)n * _embDim;
-
-                    Copy(r, h, _embDim);
-                    SimdKernels.RmsNorm(_normBuf, h, normW, _embDim, _hp.RmsNormEps);
-
-                    FusedMatVec(_q, _wq[layer], _normBuf, _numHeads * _headDim, _embDim);
-                    FusedMatVec(_k, _wk[layer], _normBuf, _numKvHeads * _headDim, _embDim);
-                    FusedMatVec(_v, _wv[layer], _normBuf, _numKvHeads * _headDim, _embDim);
-
-                    SimdKernels.ApplyRoPE(_q, n, _numHeads, _headDim, _hp.RopeTheta);
-                    SimdKernels.ApplyRoPE(_k, n, _numKvHeads, _headDim, _hp.RopeTheta);
-
-                    _kvCache.Append(layer,
-                        new ReadOnlySpan<float>(_k, _numKvHeads * _headDim),
-                        new ReadOnlySpan<float>(_v, _numKvHeads * _headDim));
-                    _kvCache.IncrementPosition();
-
-                    Attention(layer, n);
-
-                    FusedMatVec(h, _wo[layer], _attnOut, _embDim, _numHeads * _headDim);
+                    // h = proj + residual
+                    Copy(h, proj, _embDim);
                     SimdKernels.AddInPlace(h, r, _embDim);
                 }
 
-                // FFN pass: gate/up/down weights stay hot in L3 across all N tokens
+                // FFN: batch norm, batched gate/up GEMM, per-token SiLU, batched down GEMM
                 var ffnNormW = GetNormWeight(_ffnNorm[layer]);
+                for (int n = 0; n < N; n++)
+                {
+                    Copy(batchResidual + (long)n * _embDim, batchHidden + (long)n * _embDim, _embDim);
+                    SimdKernels.RmsNorm(batchNorm + (long)n * _embDim,
+                        batchHidden + (long)n * _embDim, ffnNormW, _embDim, _hp.RmsNormEps);
+                }
 
+                SimdKernels.MatMulBatched(batchFfnGate, _wGate[layer].DataPtr, batchNorm,
+                    N, _intermDim, _embDim, _wGate[layer].DType);
+                SimdKernels.MatMulBatched(batchFfnUp, _wUp[layer].DataPtr, batchNorm,
+                    N, _intermDim, _embDim, _wUp[layer].DType);
+
+                // Per-token SiLU(gate) * up
+                for (int n = 0; n < N; n++)
+                    SimdKernels.SiLuMul(batchFfnGate + (long)n * _intermDim,
+                        batchFfnUp + (long)n * _intermDim, _intermDim);
+
+                SimdKernels.MatMulBatched(batchNorm, _wDown[layer].DataPtr, batchFfnGate,
+                    N, _embDim, _intermDim, _wDown[layer].DType);
+
+                // Residual add
                 for (int n = 0; n < N; n++)
                 {
                     float* h = batchHidden + (long)n * _embDim;
-                    float* r = batchResidual + (long)n * _embDim;
-
-                    Copy(r, h, _embDim);
-                    SimdKernels.RmsNorm(_normBuf, h, ffnNormW, _embDim, _hp.RmsNormEps);
-
-                    FusedMatVec(_ffnGate, _wGate[layer], _normBuf, _intermDim, _embDim);
-                    FusedMatVec(_ffnUp, _wUp[layer], _normBuf, _intermDim, _embDim);
-                    SimdKernels.SiLuMul(_ffnGate, _ffnUp, _intermDim);
-                    FusedMatVec(h, _wDown[layer], _ffnGate, _embDim, _intermDim);
-
-                    SimdKernels.AddInPlace(h, r, _embDim);
+                    Copy(h, batchNorm + (long)n * _embDim, _embDim);
+                    SimdKernels.AddInPlace(h, batchResidual + (long)n * _embDim, _embDim);
                 }
             }
 
             // Set final KV cache length to N for subsequent decode calls
             _kvCache.Reset();
             for (int i = 0; i < N; i++) _kvCache.IncrementPosition();
+
+            }
+            finally
+            {
+                NativeMemory.Free(batchNorm);
+                NativeMemory.Free(batchQ);
+                NativeMemory.Free(batchK);
+                NativeMemory.Free(batchV);
+                NativeMemory.Free(batchAttnOut);
+                NativeMemory.Free(batchFfnGate);
+                NativeMemory.Free(batchFfnUp);
+            }
 
             // 3. Final norm + output projection on last token only
             float* lastHidden = batchHidden + (long)(N - 1) * _embDim;
