@@ -229,6 +229,11 @@ public static class Dequantize
     ///   - 2 bytes: FP16 dmin (super-block min)
     /// Reference: dequantize_row_q2_K in ggml-quants.c
     /// </summary>
+    /// <summary>
+    /// Q2_K: matches ggml dequantize_row_q2_K exactly.
+    /// Layout: [scales:16][qs:64][d:FP16][dmin:FP16] = 84 bytes / 256 elements.
+    /// The 64 qs bytes are read 4 times with shifts 0,2,4,6 per 128-element group.
+    /// </summary>
     private static void DequantQ2K(ReadOnlySpan<byte> src, Span<float> dst, long elementCount)
     {
         const int QK_K = 256;
@@ -238,29 +243,33 @@ public static class Dequantize
         for (long block = 0; block < numBlocks; block++)
         {
             var x = src.Slice((int)(block * bytesPerBlock), bytesPerBlock);
-            var y = dst.Slice((int)(block * QK_K), QK_K);
+            int yOff = (int)(block * QK_K);
 
-            var scales = x.Slice(0, 16);
-            var qs = x.Slice(16, 64);
             float d = HalfToFloat(x[80], x[81]);
-            float dmin = HalfToFloat(x[82], x[83]);
+            float min = HalfToFloat(x[82], x[83]);
 
-            int qIdx = 0;
-            for (int group = 0; group < QK_K; group += 16)
+            int qOff = 16; // qs at byte 16
+            int isIdx = 0;
+            for (int n = 0; n < QK_K; n += 128)
             {
-                int scaleIdx = group / 16;
-                byte scaleByte = scales[scaleIdx];
-                float sc = d * (scaleByte & 0xF);
-                float mn = dmin * (scaleByte >> 4);
-
-                for (int l = 0; l < 16; l++)
+                int shift = 0;
+                for (int j = 0; j < 4; j++)
                 {
-                    int byteIdx = qIdx + l / 4;
-                    int shift = (l % 4) * 2;
-                    int q = (qs[byteIdx] >> shift) & 3;
-                    y[group + l] = sc * q - mn;
+                    byte sc = x[isIdx++]; // scales at byte 0
+                    float dl = d * (sc & 0xF);
+                    float ml = min * (sc >> 4);
+                    for (int l = 0; l < 16; l++)
+                        dst[yOff++] = dl * ((x[qOff + l] >> shift) & 3) - ml;
+
+                    sc = x[isIdx++];
+                    dl = d * (sc & 0xF);
+                    ml = min * (sc >> 4);
+                    for (int l = 0; l < 16; l++)
+                        dst[yOff++] = dl * ((x[qOff + l + 16] >> shift) & 3) - ml;
+
+                    shift += 2;
                 }
-                qIdx += 4; // 16 elements / 4 per byte = 4 bytes
+                qOff += 32;
             }
         }
     }
@@ -275,77 +284,70 @@ public static class Dequantize
     /// Reference: dequantize_row_q3_K in ggml-quants.c
     /// </summary>
     /// <summary>
-    /// Q3_K dequantization. Block = 110 bytes per 256 elements.
-    /// [0:31] hmask, [32:95] qs (2-bit), [96:107] scales (12 bytes), [108:109] FP16 d.
-    /// Follows ggml dequantize_row_q3_K reference.
+    /// Q3_K: matches ggml dequantize_row_q3_K exactly.
+    /// Layout: [hmask:32][qs:64][scales:12][d:FP16] = 110 bytes / 256 elements.
+    /// Uses the aux[] uint32 manipulation for scale unpacking.
     /// </summary>
     private static void DequantQ3K(ReadOnlySpan<byte> src, Span<float> dst, long elementCount)
     {
         const int QK_K = 256;
         const int bytesPerBlock = 110;
+        const uint kmask1 = 0x03030303;
+        const uint kmask2 = 0x0f0f0f0f;
         long numBlocks = elementCount / QK_K;
 
-        Span<int> scales = stackalloc int[16];
+        Span<uint> aux = stackalloc uint[4];
 
         for (long block = 0; block < numBlocks; block++)
         {
             var x = src.Slice((int)(block * bytesPerBlock), bytesPerBlock);
-            var y = dst.Slice((int)(block * QK_K), QK_K);
+            int yOff = (int)(block * QK_K);
 
-            float d = HalfToFloat(x[108], x[109]);
+            float dAll = HalfToFloat(x[108], x[109]);
 
-            // Decode 16 scales from 12 packed bytes (matching ggml)
-            // Bytes 96-103: low 4 bits of scales 0-7 (low nibble) and 8-15 (high nibble)
-            // Bytes 104-107: high 2 bits of scales
-            for (int i = 0; i < 8; i++)
+            // Unpack scales: copy 12 bytes at offset 96 into aux[0..2], then manipulate
+            aux[0] = (uint)(x[96] | (x[97] << 8) | (x[98] << 16) | (x[99] << 24));
+            aux[1] = (uint)(x[100] | (x[101] << 8) | (x[102] << 16) | (x[103] << 24));
+            uint tmp = (uint)(x[104] | (x[105] << 8) | (x[106] << 16) | (x[107] << 24));
+
+            aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+            aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+            aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+            aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+            // aux now contains 16 signed 6-bit scales as bytes (subtract 32 when used)
+            int isIdx = 0;
+            int qOff = 32; // qs at byte 32
+            byte m = 1;    // hmask bit
+
+            for (int n = 0; n < QK_K; n += 128)
             {
-                scales[i] = x[96 + i] & 0xF;
-                scales[8 + i] = x[96 + i] >> 4;
-            }
-            scales[0] |= ((x[104] >> 0) & 3) << 4; scales[1] |= ((x[104] >> 2) & 3) << 4;
-            scales[2] |= ((x[104] >> 4) & 3) << 4; scales[3] |= ((x[104] >> 6) & 3) << 4;
-            scales[4] |= ((x[105] >> 0) & 3) << 4; scales[5] |= ((x[105] >> 2) & 3) << 4;
-            scales[6] |= ((x[105] >> 4) & 3) << 4; scales[7] |= ((x[105] >> 6) & 3) << 4;
-            scales[8]  |= ((x[106] >> 0) & 3) << 4; scales[9]  |= ((x[106] >> 2) & 3) << 4;
-            scales[10] |= ((x[106] >> 4) & 3) << 4; scales[11] |= ((x[106] >> 6) & 3) << 4;
-            scales[12] |= ((x[107] >> 0) & 3) << 4; scales[13] |= ((x[107] >> 2) & 3) << 4;
-            scales[14] |= ((x[107] >> 4) & 3) << 4; scales[15] |= ((x[107] >> 6) & 3) << 4;
-            for (int i = 0; i < 16; i++) scales[i] -= 32;
-
-            // Dequantize: qs has lower 2 bits, hmask has the 3rd bit
-            // qs: 64 bytes at offset 32 (4 elements per byte, 2 bits each)
-            // hmask: 32 bytes at offset 0 (1 bit per element, packed)
-            int yOff = 0;
-            int qsOff = 32;
-            byte u1 = 1;
-
-            for (int j = 0; j < QK_K; j += 128)
-            {
-                for (int l = 0; l < 32; l++)
+                int shift = 0;
+                for (int j = 0; j < 4; j++)
                 {
-                    byte ql = x[qsOff + l];
-                    byte hm = x[l]; // hmask byte
+                    // Scale as signed int8 from aux bytes
+                    int scByte = (int)(byte)((aux[isIdx / 4] >> ((isIdx % 4) * 8)) & 0xFF);
+                    float dl = dAll * (scByte - 32);
+                    isIdx++;
+                    for (int l = 0; l < 16; l++)
+                    {
+                        int q = ((x[qOff + l] >> shift) & 3) - ((x[l] & m) != 0 ? 0 : 4);
+                        dst[yOff++] = dl * q;
+                    }
 
-                    int is0 = j / 16 + (l < 16 ? 0 : 1);
-                    int is1 = j / 16 + 2 + (l < 16 ? 0 : 1);
-                    int is2 = j / 16 + 4 + (l < 16 ? 0 : 1);
-                    int is3 = j / 16 + 6 + (l < 16 ? 0 : 1);
+                    scByte = (int)(byte)((aux[isIdx / 4] >> ((isIdx % 4) * 8)) & 0xFF);
+                    dl = dAll * (scByte - 32);
+                    isIdx++;
+                    for (int l = 0; l < 16; l++)
+                    {
+                        int q = ((x[qOff + l + 16] >> shift) & 3) - ((x[l + 16] & m) != 0 ? 0 : 4);
+                        dst[yOff++] = dl * q;
+                    }
 
-                    int q0 = ((ql >> 0) & 3) - ((hm & u1) != 0 ? 0 : 4);
-                    y[yOff + l] = d * scales[is0] * q0;
-
-                    int q1 = ((ql >> 2) & 3) - ((hm & (u1 << 1)) != 0 ? 0 : 4);
-                    y[yOff + l + 32] = d * scales[is1] * q1;
-
-                    int q2 = ((ql >> 4) & 3) - ((hm & (u1 << 2)) != 0 ? 0 : 4);
-                    y[yOff + l + 64] = d * scales[is2] * q2;
-
-                    int q3 = ((ql >> 6) & 3) - ((hm & (u1 << 3)) != 0 ? 0 : 4);
-                    y[yOff + l + 96] = d * scales[is3] * q3;
+                    shift += 2;
+                    m <<= 1;
                 }
-                qsOff += 32;
-                yOff += 128;
-                u1 <<= 4;
+                qOff += 32;
             }
         }
     }
