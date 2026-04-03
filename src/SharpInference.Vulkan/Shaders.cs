@@ -105,6 +105,50 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Vector add in-place with scalar weight: dst[i] += scale * src[i]
+    /// Push constants: { uint n, float scale }.
+    /// Bindings: 0=dst (in/out), 1=src (in).
+    /// </summary>
+    internal const string AddScaledInPlace = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer Dst { float dst_data[]; };
+        layout(binding = 1) readonly buffer Src { float src_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint n;
+            float scale;
+        };
+
+        void main() {
+            uint i = gl_GlobalInvocationID.x;
+            if (i >= n) return;
+            dst_data[i] += scale * src_data[i];
+        }
+        """;
+
+    /// <summary>
+    /// Fill a buffer with zeros.
+    /// Push constants: { uint n }.
+    /// Bindings: 0=dst (in/out).
+    /// </summary>
+    internal const string Clear = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer Dst { float dst_data[]; };
+
+        layout(push_constant) uniform Params { uint n; };
+
+        void main() {
+            uint i = gl_GlobalInvocationID.x;
+            if (i >= n) return;
+            dst_data[i] = 0.0;
+        }
+        """;
+
+    /// <summary>
     /// Per-head RMSNorm: applies RMSNorm independently to each head-sized chunk.
     /// data[h*head_dim + i] = data[h*head_dim + i] / rms_h * weight[i]
     /// where rms_h = sqrt(mean(data[h*head_dim .. (h+1)*head_dim]^2) + eps).
@@ -925,8 +969,8 @@ internal static class Shaders
             return bin;
         }
 
-        // Quantize shared memory data and write compressed block to output
-        void quantize_and_pack(uint cache_offset, inout uint cache_buf[]) {
+        // Quantize shared memory data and write a compressed block to the key cache.
+        void quantize_and_pack_k(uint cache_offset) {
             uint tid = gl_LocalInvocationID.x;
 
             // Compute L2 norm via parallel reduction
@@ -998,7 +1042,63 @@ internal static class Shaders
                 uint base_idx = cache_offset / 4; // uint offset
                 uint num_uints = (block_bytes + 3) / 4;
                 for (uint w = 0; w < num_uints; w++)
-                    cache_buf[base_idx + w] = (w < 13) ? packed[w] : 0u;
+                    k_cache_tq[base_idx + w] = (w < 13) ? packed[w] : 0u;
+            }
+        }
+
+        // Quantize shared memory data and write a compressed block to the value cache.
+        void quantize_and_pack_v(uint cache_offset) {
+            uint tid = gl_LocalInvocationID.x;
+
+            float val = sdata[tid];
+            sdata[tid] = val * val;
+            barrier();
+            [[unroll]] for (uint s = 64; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] += sdata[tid + s];
+                barrier();
+            }
+            float norm = sqrt(sdata[0]);
+
+            barrier();
+            sdata[tid] = val;
+            barrier();
+            float inv_norm = (norm > 0.0) ? (1.0 / norm) : 0.0;
+            float normalized = sdata[tid] * inv_norm;
+
+            int idx = find_bin(normalized);
+
+            barrier();
+            sdata[tid] = float(idx);
+            barrier();
+
+            if (tid == 0) {
+                uint norm_bits = packHalf2x16(vec2(norm, 0.0));
+                uint packed[13];
+                packed[0] = norm_bits & 0xFFFFu;
+
+                uint bit_pos = 16;
+                for (uint i = 0; i < 128; i++) {
+                    uint index3 = uint(sdata[i]) & 0x7u;
+                    uint word_idx = bit_pos / 32;
+                    uint bit_off = bit_pos % 32;
+                    if (i == 0 && word_idx == 0) {
+                        packed[word_idx] |= (index3 << bit_off);
+                    } else {
+                        if (bit_off == 0 && (i == 0 || (bit_pos % 32) == 0))
+                            packed[word_idx] = 0;
+                        packed[word_idx] |= (index3 << bit_off);
+                    }
+                    if (bit_off > 29) {
+                        uint next_word = word_idx + 1;
+                        if (bit_off > 29) packed[next_word] |= (index3 >> (32 - bit_off));
+                    }
+                    bit_pos += 3;
+                }
+
+                uint base_idx = cache_offset / 4;
+                uint num_uints = (block_bytes + 3) / 4;
+                for (uint w = 0; w < num_uints; w++)
+                    v_cache_tq[base_idx + w] = (w < 13) ? packed[w] : 0u;
             }
         }
 
@@ -1017,7 +1117,7 @@ internal static class Shaders
             // Apply sign flip
             sdata[tid] *= sign_patterns[head_offset + tid];
             barrier();
-            quantize_and_pack(byte_offset, k_cache_tq);
+            quantize_and_pack_k(byte_offset);
 
             barrier();
 
@@ -1027,7 +1127,7 @@ internal static class Shaders
             wht_128();
             sdata[tid] *= sign_patterns[head_offset + tid];
             barrier();
-            quantize_and_pack(byte_offset, v_cache_tq);
+            quantize_and_pack_v(byte_offset);
         }
         """;
 

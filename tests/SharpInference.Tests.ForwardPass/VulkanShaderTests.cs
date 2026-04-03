@@ -1,4 +1,5 @@
 using SharpInference.Core;
+using SharpInference.TurboQuant;
 
 namespace SharpInference.Tests.ForwardPass;
 
@@ -449,13 +450,121 @@ public sealed unsafe class VulkanShaderTests
         Assert.Equal(cpuTokens, gpuTokens);
     }
 
+    [Fact]
+    public void TurboQuantKvCache_UsesLayerIndexBaseForCompressors()
+    {
+        const int numLayers = 2;
+        const int numKvHeads = 4;
+        const int headDim = 128;
+        const int layerIndexBase = 3;
+        const int totalLayerCount = 8;
+
+        using var cache = new SharpInference.Engine.TurboQuantKvCache(
+            numLayers, maxSeqLen: 16, numKvHeads, headDim,
+            layerIndexBase: layerIndexBase, totalLayerCountForSeeds: totalLayerCount);
+
+        for (int layer = 0; layer < numLayers; layer++)
+        {
+            for (int head = 0; head < numKvHeads; head++)
+            {
+                int globalLayer = layer + layerIndexBase;
+
+                var expectedKey = WalshHadamard.GenerateSignPattern(headDim, globalLayer * numKvHeads + head);
+                var actualKey = cache.GetKeyCompressor(layer, head).SignPattern;
+                for (int i = 0; i < headDim; i++)
+                    Assert.Equal(expectedKey[i], actualKey[i]);
+
+                var expectedValue = WalshHadamard.GenerateSignPattern(headDim, (globalLayer + totalLayerCount) * numKvHeads + head);
+                var actualValue = cache.GetValueCompressor(layer, head).SignPattern;
+                for (int i = 0; i < headDim; i++)
+                    Assert.Equal(expectedValue[i], actualValue[i]);
+            }
+        }
+    }
+
+    [Fact]
+    public void GpuForwardPassTurboQuantRunsPastFp32Window()
+    {
+        var path = FindTurboQuantModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var gpu = new Vulkan.VulkanBackend();
+        using var gpuFwd = new SharpInference.Engine.GpuForwardPass(
+            model, gpu, hp, maxContextLength: 32, enableTurboQuant: true, tqFp32Window: 2);
+
+        var prompt = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n";
+        var tokens = tokenizer.Encode(prompt);
+
+        ReadOnlySpan<float> logits = default;
+        for (int i = 0; i < tokens.Count; i++)
+            logits = gpuFwd.Forward(tokens[i], i);
+
+        Assert.Equal(hp.VocabSize, logits.Length);
+        for (int i = 0; i < logits.Length; i++)
+            Assert.True(float.IsFinite(logits[i]), $"Non-finite logit at [{i}]: {logits[i]}");
+    }
+
+    [Fact]
+    public void HybridForwardPassTurboQuantRunsPastFp32Window()
+    {
+        var path = FindTurboQuantModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        if (hp.NumLayers < 2) return;
+
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var gpu = new Vulkan.VulkanBackend();
+        var placement = new SharpInference.Engine.LayerPlacement(
+            GpuLayers: 1,
+            CpuLayers: hp.NumLayers - 1,
+            GpuWeightBytes: 0,
+            GpuKvBytes: 0,
+            RecommendedCtxSize: 32);
+        using var hybridFwd = new SharpInference.Engine.HybridForwardPass(
+            model, gpu, hp, placement, enableTq: true, tqFp32Window: 2);
+
+        var prompt = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n";
+        var tokens = tokenizer.Encode(prompt);
+
+        ReadOnlySpan<float> logits = default;
+        for (int i = 0; i < tokens.Count; i++)
+            logits = hybridFwd.Forward(tokens[i], i);
+
+        Assert.Equal(hp.VocabSize, logits.Length);
+        for (int i = 0; i < logits.Length; i++)
+            Assert.True(float.IsFinite(logits[i]), $"Non-finite logit at [{i}]: {logits[i]}");
+    }
+
     private static string? FindModelPath()
+    {
+        return FindModelPath(
+            "models\\SmolLM2-1.7B-Instruct-Q4_K_M.gguf");
+    }
+
+    private static string? FindTurboQuantModelPath()
+    {
+        return FindModelPath(
+            "models\\Qwen3-8B-Q4_K_M.gguf",
+            "models\\Llama-4-Scout-17B-16E-Instruct-Q2_K.gguf",
+            "models\\Meta-Llama-3.1-70B-Instruct-Q4_K_M.gguf");
+    }
+
+    private static string? FindModelPath(params string[] candidates)
     {
         var dir = Directory.GetCurrentDirectory();
         for (int i = 0; i < 8; i++)
         {
-            var candidate = Path.Combine(dir, "models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf");
-            if (File.Exists(candidate)) return candidate;
+            foreach (var candidate in candidates)
+            {
+                var fullPath = Path.Combine(dir, candidate);
+                if (File.Exists(fullPath))
+                    return fullPath;
+            }
             var parent = Directory.GetParent(dir);
             if (parent == null) break;
             dir = parent.FullName;

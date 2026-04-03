@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using BenchmarkDotNet.Attributes;
 using SharpInference.Core;
 using SharpInference.Cpu;
@@ -777,8 +778,534 @@ public class Llama70bHybridBenchmark
     }
 }
 
+[MemoryDiagnoser]
+[WarmupCount(1)]
+[IterationCount(3)]
+public class Llama4ScoutCpuBenchmark
+{
+    private GgufModel _model = null!;
+    private CpuBackend _backend = null!;
+    private ForwardPass _fwd = null!;
+    private IReadOnlyList<int> _promptTokens = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        var path = BenchmarkHelper.FindModelPath(BenchmarkHelper.Llama4ScoutModelFile)
+            ?? throw new FileNotFoundException($"{BenchmarkHelper.Llama4ScoutModelFile} not found");
+
+        _model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(_model.Metadata, _model);
+        _backend = new CpuBackend();
+        _fwd = new ForwardPass(_model, _backend, hp, maxContextLength: BenchmarkHelper.ScoutBenchmarkContext);
+        _promptTokens = GgufTokenizer.FromGgufModel(_model).Encode(BenchmarkHelper.LlamaChatPrompt);
+    }
+
+    [IterationSetup]
+    public void IterSetup()
+    {
+        _fwd.Cache.Reset();
+        for (int i = 0; i < _promptTokens.Count; i++)
+            _fwd.Forward(_promptTokens[i], i);
+    }
+
+    [Benchmark(Description = "Llama-4-Scout CPU Decode 10t")]
+    public int Decode()
+    {
+        ReadOnlySpan<float> logits = _fwd.Forward(
+            Sampler.Greedy(_fwd.Forward(_promptTokens[^1], _promptTokens.Count - 1)),
+            _promptTokens.Count);
+        int lastToken = Sampler.Greedy(logits);
+        int pos = _promptTokens.Count + 1;
+        for (int i = 1; i < 10; i++)
+        {
+            logits = _fwd.Forward(lastToken, pos++);
+            lastToken = Sampler.Greedy(logits);
+        }
+
+        return lastToken;
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        _fwd.Dispose();
+        _backend.Dispose();
+        _model.Dispose();
+    }
+}
+
+[MemoryDiagnoser]
+[WarmupCount(1)]
+[IterationCount(3)]
+public class Llama4ScoutCpuTqBenchmark
+{
+    private GgufModel _model = null!;
+    private CpuBackend _backend = null!;
+    private ForwardPass _fwd = null!;
+    private IReadOnlyList<int> _promptTokens = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        var path = BenchmarkHelper.FindModelPath(BenchmarkHelper.Llama4ScoutModelFile)
+            ?? throw new FileNotFoundException($"{BenchmarkHelper.Llama4ScoutModelFile} not found");
+
+        _model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(_model.Metadata, _model);
+        _backend = new CpuBackend();
+        _fwd = new ForwardPass(_model, _backend, hp, maxContextLength: BenchmarkHelper.ScoutBenchmarkContext);
+        _fwd.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
+        _promptTokens = GgufTokenizer.FromGgufModel(_model).Encode(BenchmarkHelper.LlamaChatPrompt);
+    }
+
+    [IterationSetup]
+    public void IterSetup()
+    {
+        _fwd.TqCache!.Reset();
+        for (int i = 0; i < _promptTokens.Count; i++)
+            _fwd.Forward(_promptTokens[i], i);
+    }
+
+    [Benchmark(Description = "Llama-4-Scout CPU Decode 10t (TQ3 KV)")]
+    public int Decode()
+    {
+        ReadOnlySpan<float> logits = _fwd.Forward(
+            Sampler.Greedy(_fwd.Forward(_promptTokens[^1], _promptTokens.Count - 1)),
+            _promptTokens.Count);
+        int lastToken = Sampler.Greedy(logits);
+        int pos = _promptTokens.Count + 1;
+        for (int i = 1; i < 10; i++)
+        {
+            logits = _fwd.Forward(lastToken, pos++);
+            lastToken = Sampler.Greedy(logits);
+        }
+
+        return lastToken;
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        _fwd.Dispose();
+        _backend.Dispose();
+        _model.Dispose();
+    }
+}
+
+[MemoryDiagnoser]
+[WarmupCount(1)]
+[IterationCount(3)]
+public class Llama4ScoutHybridBenchmark
+{
+    private GgufModel _model = null!;
+    private CpuBackend? _cpuBackend;
+    private ForwardPass? _cpuFwd;
+    private Vulkan.VulkanBackend? _gpu;
+    private HybridForwardPass? _hfwd;
+    private IReadOnlyList<int> _promptTokens = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        var path = BenchmarkHelper.FindModelPath(BenchmarkHelper.Llama4ScoutModelFile)
+            ?? throw new FileNotFoundException($"{BenchmarkHelper.Llama4ScoutModelFile} not found");
+
+        _model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(_model.Metadata, _model);
+        _gpu = new Vulkan.VulkanBackend();
+
+        var hwProfile = HardwareProfile.Detect(_gpu);
+        var placement = TierPlanner.Plan(_model, hp, hwProfile, requestedCtxSize: BenchmarkHelper.ScoutBenchmarkContext);
+        if (placement.GpuLayers == 0)
+        {
+            _gpu.Dispose();
+            _gpu = null;
+            _cpuBackend = new CpuBackend();
+            _cpuFwd = new ForwardPass(_model, _cpuBackend, hp, maxContextLength: BenchmarkHelper.ScoutBenchmarkContext);
+            Console.Error.WriteLine("[Llama4ScoutHybridBenchmark] Auto fallback to CPU (no GPU-capable MoE layers yet)");
+        }
+        else
+        {
+            _hfwd = new HybridForwardPass(_model, _gpu, hp, placement);
+            Console.Error.WriteLine($"[Llama4ScoutHybridBenchmark] {placement.Summary()}");
+        }
+
+        _promptTokens = GgufTokenizer.FromGgufModel(_model).Encode(BenchmarkHelper.LlamaChatPrompt);
+    }
+
+    [IterationSetup]
+    public void IterSetup()
+    {
+        if (_cpuFwd is not null)
+            _cpuFwd.Cache.Reset();
+        else
+            _hfwd!.ResetCache();
+
+        for (int i = 0; i < _promptTokens.Count; i++)
+        {
+            if (_cpuFwd is not null)
+                _cpuFwd.Forward(_promptTokens[i], i);
+            else
+                _hfwd!.Forward(_promptTokens[i], i);
+        }
+    }
+
+    [Benchmark(Description = "Llama-4-Scout Auto Decode 10t")]
+    public int Decode()
+    {
+        ReadOnlySpan<float> logits = _cpuFwd is not null
+            ? _cpuFwd.Forward(
+                Sampler.Greedy(_cpuFwd.Forward(_promptTokens[^1], _promptTokens.Count - 1)),
+                _promptTokens.Count)
+            : _hfwd!.Forward(
+                Sampler.Greedy(_hfwd.Forward(_promptTokens[^1], _promptTokens.Count - 1)),
+                _promptTokens.Count);
+        int lastToken = Sampler.Greedy(logits);
+        int pos = _promptTokens.Count + 1;
+        for (int i = 1; i < 10; i++)
+        {
+            logits = _cpuFwd is not null
+                ? _cpuFwd.Forward(lastToken, pos++)
+                : _hfwd!.Forward(lastToken, pos++);
+            lastToken = Sampler.Greedy(logits);
+        }
+
+        return lastToken;
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        _cpuFwd?.Dispose();
+        _cpuBackend?.Dispose();
+        _hfwd?.Dispose();
+        _gpu?.Dispose();
+        _model?.Dispose();
+    }
+}
+
+[MemoryDiagnoser]
+[WarmupCount(1)]
+[IterationCount(3)]
+public class Llama4ScoutHybridTqBenchmark
+{
+    private GgufModel _model = null!;
+    private CpuBackend? _cpuBackend;
+    private ForwardPass? _cpuFwd;
+    private Vulkan.VulkanBackend? _gpu;
+    private HybridForwardPass? _hfwd;
+    private IReadOnlyList<int> _promptTokens = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        var path = BenchmarkHelper.FindModelPath(BenchmarkHelper.Llama4ScoutModelFile)
+            ?? throw new FileNotFoundException($"{BenchmarkHelper.Llama4ScoutModelFile} not found");
+
+        _model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(_model.Metadata, _model);
+        _gpu = new Vulkan.VulkanBackend();
+
+        var hwProfile = HardwareProfile.Detect(_gpu);
+        var placement = TierPlanner.Plan(_model, hp, hwProfile, turboQuant: true, requestedCtxSize: BenchmarkHelper.ScoutBenchmarkContext);
+        if (placement.GpuLayers == 0)
+        {
+            _gpu.Dispose();
+            _gpu = null;
+            _cpuBackend = new CpuBackend();
+            _cpuFwd = new ForwardPass(_model, _cpuBackend, hp, maxContextLength: BenchmarkHelper.ScoutBenchmarkContext);
+            _cpuFwd.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
+            Console.Error.WriteLine("[Llama4ScoutHybridTqBenchmark] Auto fallback to CPU [TQ3] (no GPU-capable MoE layers yet)");
+        }
+        else
+        {
+            _hfwd = new HybridForwardPass(_model, _gpu, hp, placement, enableTq: true);
+            Console.Error.WriteLine($"[Llama4ScoutHybridTqBenchmark] {placement.Summary()} [TQ3]");
+        }
+
+        _promptTokens = GgufTokenizer.FromGgufModel(_model).Encode(BenchmarkHelper.LlamaChatPrompt);
+    }
+
+    [IterationSetup]
+    public void IterSetup()
+    {
+        if (_cpuFwd is not null)
+            _cpuFwd.TqCache!.Reset();
+        else
+            _hfwd!.ResetCache();
+
+        for (int i = 0; i < _promptTokens.Count; i++)
+        {
+            if (_cpuFwd is not null)
+                _cpuFwd.Forward(_promptTokens[i], i);
+            else
+                _hfwd!.Forward(_promptTokens[i], i);
+        }
+    }
+
+    [Benchmark(Description = "Llama-4-Scout Auto Decode 10t (TQ3 KV)")]
+    public int Decode()
+    {
+        ReadOnlySpan<float> logits = _cpuFwd is not null
+            ? _cpuFwd.Forward(
+                Sampler.Greedy(_cpuFwd.Forward(_promptTokens[^1], _promptTokens.Count - 1)),
+                _promptTokens.Count)
+            : _hfwd!.Forward(
+                Sampler.Greedy(_hfwd.Forward(_promptTokens[^1], _promptTokens.Count - 1)),
+                _promptTokens.Count);
+        int lastToken = Sampler.Greedy(logits);
+        int pos = _promptTokens.Count + 1;
+        for (int i = 1; i < 10; i++)
+        {
+            logits = _cpuFwd is not null
+                ? _cpuFwd.Forward(lastToken, pos++)
+                : _hfwd!.Forward(lastToken, pos++);
+            lastToken = Sampler.Greedy(logits);
+        }
+
+        return lastToken;
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        _cpuFwd?.Dispose();
+        _cpuBackend?.Dispose();
+        _hfwd?.Dispose();
+        _gpu?.Dispose();
+        _model?.Dispose();
+    }
+}
+
+[MemoryDiagnoser]
+[WarmupCount(1)]
+[IterationCount(5)]
+public unsafe class Llama4ScoutMoeMicroBenchmarks
+{
+    private GgufModel _model = null!;
+    private ModelHyperparams _hp = null!;
+    private ScoutTensorRef _routerWeight;
+    private ScoutTensorRef _sharedGate;
+    private ScoutTensorRef _sharedUp;
+    private ScoutTensorRef _sharedDown;
+    private ScoutTensorRef _expertGate;
+    private ScoutTensorRef _expertUp;
+    private ScoutTensorRef _expertDown;
+
+    private float* _normBuf;
+    private float* _routerLogits;
+    private float* _sharedGateBuf;
+    private float* _sharedUpBuf;
+    private float* _sharedOutBuf;
+    private float* _expertGateBuf;
+    private float* _expertUpBuf;
+    private float* _expertOutBuf;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        var path = BenchmarkHelper.FindModelPath(BenchmarkHelper.Llama4ScoutModelFile)
+            ?? throw new FileNotFoundException($"{BenchmarkHelper.Llama4ScoutModelFile} not found");
+
+        _model = GgufModel.Open(path);
+        _hp = ModelHyperparams.FromGgufMetadata(_model.Metadata, _model);
+        if (!_hp.IsMoE)
+            throw new InvalidOperationException("Llama 4 Scout microbenchmarks require an MoE model.");
+
+        _routerWeight = ResolveTensor("blk.0.ffn_gate_inp.weight");
+        _expertGate = ResolveTensor("blk.0.ffn_gate_exps.weight");
+        _expertUp = ResolveTensor("blk.0.ffn_up_exps.weight");
+        _expertDown = ResolveTensor("blk.0.ffn_down_exps.weight");
+        if (_hp.HasSharedExpert)
+        {
+            _sharedGate = ResolveTensor("blk.0.ffn_gate_shexp.weight");
+            _sharedUp = ResolveTensor("blk.0.ffn_up_shexp.weight");
+            _sharedDown = ResolveTensor("blk.0.ffn_down_shexp.weight");
+        }
+
+        _normBuf = Alloc(_hp.EmbeddingDim);
+        _routerLogits = Alloc(_hp.NumExperts);
+        _sharedGateBuf = Alloc(_hp.ExpertIntermediateDim);
+        _sharedUpBuf = Alloc(_hp.ExpertIntermediateDim);
+        _sharedOutBuf = Alloc(_hp.EmbeddingDim);
+        _expertGateBuf = Alloc(_hp.ExpertIntermediateDim);
+        _expertUpBuf = Alloc(_hp.ExpertIntermediateDim);
+        _expertOutBuf = Alloc(_hp.EmbeddingDim);
+
+        var rng = new Random(42);
+        for (int i = 0; i < _hp.EmbeddingDim; i++)
+            _normBuf[i] = (float)(rng.NextDouble() * 2 - 1);
+    }
+
+    [Benchmark(Description = "Llama-4-Scout MoE Router+TopK")]
+    public int RouterTopK()
+    {
+        SimdKernels.MatVec(_routerLogits, _routerWeight.DataPtr, _normBuf, _hp.NumExperts, _hp.EmbeddingDim, _routerWeight.DType);
+        SimdKernels.SoftmaxInPlace(_routerLogits, _hp.NumExperts);
+
+        Span<int> selectedExperts = stackalloc int[_hp.NumActiveExperts];
+        Span<float> expertWeights = stackalloc float[_hp.NumActiveExperts];
+        SelectTopK(_routerLogits, _hp.NumExperts, _hp.NumActiveExperts, selectedExperts, expertWeights);
+        return selectedExperts[0];
+    }
+
+    [Benchmark(Description = "Llama-4-Scout MoE FFN layer")]
+    public float MoeFfnLayer()
+    {
+        SimdKernels.MatVec(_routerLogits, _routerWeight.DataPtr, _normBuf, _hp.NumExperts, _hp.EmbeddingDim, _routerWeight.DType);
+        SimdKernels.SoftmaxInPlace(_routerLogits, _hp.NumExperts);
+
+        Span<int> selectedExperts = stackalloc int[_hp.NumActiveExperts];
+        Span<float> expertWeights = stackalloc float[_hp.NumActiveExperts];
+        SelectTopK(_routerLogits, _hp.NumExperts, _hp.NumActiveExperts, selectedExperts, expertWeights);
+
+        new Span<float>(_expertOutBuf, _hp.EmbeddingDim).Clear();
+
+        if (_hp.HasSharedExpert)
+        {
+            SimdKernels.MatVec(_sharedGateBuf, _sharedGate.DataPtr, _normBuf, _hp.ExpertIntermediateDim, _hp.EmbeddingDim, _sharedGate.DType);
+            SimdKernels.MatVec(_sharedUpBuf, _sharedUp.DataPtr, _normBuf, _hp.ExpertIntermediateDim, _hp.EmbeddingDim, _sharedUp.DType);
+            SimdKernels.SiLuMul(_sharedGateBuf, _sharedUpBuf, _hp.ExpertIntermediateDim);
+            SimdKernels.MatVec(_sharedOutBuf, _sharedDown.DataPtr, _sharedGateBuf, _hp.EmbeddingDim, _hp.ExpertIntermediateDim, _sharedDown.DType);
+        }
+
+        for (int i = 0; i < _hp.NumActiveExperts; i++)
+        {
+            int expertIdx = selectedExperts[i];
+            float expertWeight = expertWeights[i];
+            ExpertMatVec(_expertGateBuf, _expertGate, expertIdx, _hp.ExpertIntermediateDim, _hp.EmbeddingDim, _normBuf);
+            ExpertMatVec(_expertUpBuf, _expertUp, expertIdx, _hp.ExpertIntermediateDim, _hp.EmbeddingDim, _normBuf);
+            SimdKernels.SiLuMul(_expertGateBuf, _expertUpBuf, _hp.ExpertIntermediateDim);
+            ExpertMatVecDown(_expertOutBuf, _expertDown, expertIdx, _hp.EmbeddingDim, _hp.ExpertIntermediateDim, _expertGateBuf, expertWeight);
+        }
+
+        if (_hp.HasSharedExpert)
+            SimdKernels.AddInPlace(_expertOutBuf, _sharedOutBuf, _hp.EmbeddingDim);
+
+        return _expertOutBuf[0];
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        if (_normBuf != null) NativeMemory.Free(_normBuf);
+        if (_routerLogits != null) NativeMemory.Free(_routerLogits);
+        if (_sharedGateBuf != null) NativeMemory.Free(_sharedGateBuf);
+        if (_sharedUpBuf != null) NativeMemory.Free(_sharedUpBuf);
+        if (_sharedOutBuf != null) NativeMemory.Free(_sharedOutBuf);
+        if (_expertGateBuf != null) NativeMemory.Free(_expertGateBuf);
+        if (_expertUpBuf != null) NativeMemory.Free(_expertUpBuf);
+        if (_expertOutBuf != null) NativeMemory.Free(_expertOutBuf);
+        _model.Dispose();
+    }
+
+    private ScoutTensorRef ResolveTensor(string name)
+    {
+        var info = _model.FindTensor(name)
+            ?? throw new InvalidOperationException($"Missing tensor: {name}");
+        return new ScoutTensorRef(info.Name, info, info.DType, _model.GetTensorDataPtr(info));
+    }
+
+    private static void ExpertMatVec(float* output, in ScoutTensorRef packedTensor,
+        int expertIdx, int rows, int cols, float* input)
+    {
+        int bytesPerRow = (cols / DTypeInfo.BlockSize(packedTensor.DType))
+                        * DTypeInfo.BytesPerBlock(packedTensor.DType);
+        long expertOffset = (long)expertIdx * rows * bytesPerRow;
+        byte* expertData = packedTensor.DataPtr + expertOffset;
+        SimdKernels.MatVec(output, expertData, input, rows, cols, packedTensor.DType);
+    }
+
+    private static void ExpertMatVecDown(float* output, in ScoutTensorRef packedTensor,
+        int expertIdx, int rows, int cols, float* input, float weight)
+    {
+        int bytesPerRow = (cols / DTypeInfo.BlockSize(packedTensor.DType))
+                        * DTypeInfo.BytesPerBlock(packedTensor.DType);
+        long expertOffset = (long)expertIdx * rows * bytesPerRow;
+        byte* expertData = packedTensor.DataPtr + expertOffset;
+
+        float* temp = Alloc(rows);
+        try
+        {
+            SimdKernels.MatVec(temp, expertData, input, rows, cols, packedTensor.DType);
+            for (int i = 0; i < rows; i++)
+                output[i] += weight * temp[i];
+        }
+        finally
+        {
+            NativeMemory.Free(temp);
+        }
+    }
+
+    private static void SelectTopK(float* logits, int n, int k, Span<int> indices, Span<float> weights)
+    {
+        for (int ki = 0; ki < k; ki++)
+        {
+            int bestIdx = 0;
+            float bestVal = float.MinValue;
+            for (int i = 0; i < n; i++)
+            {
+                bool alreadySelected = false;
+                for (int j = 0; j < ki; j++)
+                {
+                    if (indices[j] != i)
+                        continue;
+
+                    alreadySelected = true;
+                    break;
+                }
+
+                if (!alreadySelected && logits[i] > bestVal)
+                {
+                    bestVal = logits[i];
+                    bestIdx = i;
+                }
+            }
+
+            indices[ki] = bestIdx;
+            weights[ki] = bestVal;
+        }
+
+        if (k <= 1)
+            return;
+
+        float sum = 0;
+        for (int i = 0; i < k; i++)
+            sum += weights[i];
+        if (sum <= 0)
+            return;
+        for (int i = 0; i < k; i++)
+            weights[i] /= sum;
+    }
+
+    private readonly unsafe struct ScoutTensorRef
+    {
+        public readonly string Name;
+        public readonly GgufTensorInfo Info;
+        public readonly DType DType;
+        public readonly byte* DataPtr;
+
+        public ScoutTensorRef(string name, GgufTensorInfo info, DType dtype, byte* dataPtr)
+        {
+            Name = name;
+            Info = info;
+            DType = dtype;
+            DataPtr = dataPtr;
+        }
+    }
+
+    private static float* Alloc(int count) =>
+        (float*)NativeMemory.AllocZeroed((nuint)count, (nuint)sizeof(float));
+}
+
 internal static class BenchmarkHelper
 {
+    public const string Llama4ScoutModelFile = "Llama-4-Scout-17B-16E-Instruct-Q2_K.gguf";
+    public const int ScoutBenchmarkContext = 2048;
+    public const string LlamaChatPrompt =
+        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+
     public static string? FindModelPath(string filename)
     {
         var dir = Directory.GetCurrentDirectory();

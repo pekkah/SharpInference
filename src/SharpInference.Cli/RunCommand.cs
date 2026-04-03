@@ -150,6 +150,20 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             {
                 var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant, requestedCtxSize: ctxSize);
                 nGpuLayers = placement.GpuLayers;
+                if (nGpuLayers == 0)
+                {
+                    if (settings.TurboQuant)
+                    {
+                        fwd.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
+                        AnsiConsole.MarkupLine("[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
+                    }
+
+                    forward = fwd.Forward;
+                    prefill = fwd.Prefill;
+                    resetCache = settings.TurboQuant ? fwd.TqCache!.Reset : fwd.Cache.Reset;
+                    AnsiConsole.MarkupLine("[dim]Backend: [blue]CPU[/] (auto fallback: no GPU-capable layers for this model/path)[/]");
+                    goto backendConfigured;
+                }
             }
 
             if (nGpuLayers >= hp.NumLayers)
@@ -183,6 +197,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             }
         }
 
+    backendConfigured:
         AnsiConsole.MarkupLine($"[dim]Model loaded in {sw.Elapsed.TotalSeconds:F1}s — " +
             $"{hp.NumLayers}L, {hp.EmbeddingDim}d, {hp.VocabSize} vocab, ctx={hp.ContextLength}[/]");
 

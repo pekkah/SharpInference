@@ -33,17 +33,17 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     private readonly int _bits;
 
     private int _totalLength;    // total positions stored (TQ + FP32)
-    private int _tqLength;       // positions in TQ storage
+    private readonly int[] _layerTqLengths; // positions in TQ storage per layer
     private bool _disposed;
 
     /// <summary>Total positions stored in the cache (compressed + FP32).</summary>
     public int Length => _totalLength;
 
     /// <summary>Number of compressed positions.</summary>
-    public int TqLength => _tqLength;
+    public int TqLength => _numLayers > 0 ? _layerTqLengths[0] : 0;
 
     /// <summary>Number of FP32 positions.</summary>
-    public int Fp32Length => _totalLength - _tqLength;
+    public int Fp32Length => _totalLength - TqLength;
 
     /// <summary>FP32 window size.</summary>
     public int Fp32WindowSize => _fp32WindowSize;
@@ -56,7 +56,7 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     public int Bits => _bits;
 
     public TurboQuantKvCache(int numLayers, int maxSeqLen, int numKvHeads, int headDim,
-        int fp32WindowSize = 256, int bits = 3)
+        int fp32WindowSize = 256, int bits = 3, int layerIndexBase = 0, int totalLayerCountForSeeds = 0)
     {
         _numLayers = numLayers;
         _maxSeqLen = maxSeqLen;
@@ -67,6 +67,9 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
         _bits = bits;
         _tqBlockSize = TurboQuantOps.BlockSize(bits, headDim);
         _tqBytesPerPosition = _tqBlockSize * numKvHeads;
+        if (totalLayerCountForSeeds == 0)
+            totalLayerCountForSeeds = numLayers;
+        _layerTqLengths = new int[numLayers];
 
         // FP32 window storage per layer
         _fp32Keys = new float*[numLayers];
@@ -103,16 +106,17 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
             _valueCompressors[layer] = new KvCacheCompressor[numKvHeads];
             for (int head = 0; head < numKvHeads; head++)
             {
-                int seed = layer * numKvHeads + head;
-                _keyCompressors[layer][head] = new KvCacheCompressor(bits, headDim, seed);
-                _valueCompressors[layer][head] = new KvCacheCompressor(bits, headDim, seed + numLayers * numKvHeads);
+                int globalLayer = layer + layerIndexBase;
+                _keyCompressors[layer][head] = new KvCacheCompressor(bits, headDim, globalLayer * numKvHeads + head);
+                _valueCompressors[layer][head] = new KvCacheCompressor(bits, headDim, (globalLayer + totalLayerCountForSeeds) * numKvHeads + head);
             }
         }
     }
 
-    public TurboQuantKvCache(ModelHyperparams hp, int fp32WindowSize = 256, int bits = 3)
+    public TurboQuantKvCache(ModelHyperparams hp, int fp32WindowSize = 256, int bits = 3,
+        int layerIndexBase = 0, int totalLayerCountForSeeds = 0)
         : this(hp.NumLayers, hp.ContextLength, hp.NumKvHeads, hp.EmbeddingDim / hp.NumHeads,
-               fp32WindowSize, bits)
+               fp32WindowSize, bits, layerIndexBase, totalLayerCountForSeeds)
     {
     }
 
@@ -126,16 +130,17 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
             throw new InvalidOperationException(
                 $"TQ KV cache full: {_totalLength} >= {_maxSeqLen}");
 
-        int fp32Count = _totalLength - _tqLength;
+        int fp32Count = _totalLength - _layerTqLengths[layer];
 
         // If FP32 window is full, compress the oldest FP32 entry
         if (fp32Count >= _fp32WindowSize)
         {
             CompressOldestFp32(layer);
+            fp32Count = _totalLength - _layerTqLengths[layer];
         }
 
         // Write to FP32 window at the current FP32 slot
-        int fp32Slot = (_totalLength - _tqLength) % _fp32WindowSize;
+        int fp32Slot = fp32Count;
         long offset = (long)fp32Slot * _kvDim;
         key[.._kvDim].CopyTo(new Span<float>(_fp32Keys[layer] + offset, _kvDim));
         value[.._kvDim].CopyTo(new Span<float>(_fp32Values[layer] + offset, _kvDim));
@@ -149,7 +154,10 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     /// <summary>
     /// Returns true if the given position is in the TQ-compressed region.
     /// </summary>
-    public bool IsCompressed(int position) => position < _tqLength;
+    public bool IsCompressed(int position) => position < TqLength;
+
+    /// <summary>Returns the number of compressed positions for the given layer.</summary>
+    public int GetTqLength(int layer) => _layerTqLengths[layer];
 
     /// <summary>
     /// Returns a pointer to a FP32 key at the given position for a given layer.
@@ -157,7 +165,7 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     /// </summary>
     public float* Fp32KeyAt(int layer, int position)
     {
-        int fp32Idx = position - _tqLength;
+        int fp32Idx = position - _layerTqLengths[layer];
         return _fp32Keys[layer] + (long)fp32Idx * _kvDim;
     }
 
@@ -167,7 +175,7 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     /// </summary>
     public float* Fp32ValueAt(int layer, int position)
     {
-        int fp32Idx = position - _tqLength;
+        int fp32Idx = position - _layerTqLengths[layer];
         return _fp32Values[layer] + (long)fp32Idx * _kvDim;
     }
 
@@ -207,7 +215,7 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     public void Reset()
     {
         _totalLength = 0;
-        _tqLength = 0;
+        Array.Clear(_layerTqLengths);
     }
 
     /// <summary>
@@ -235,7 +243,7 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
             var keySpan = new ReadOnlySpan<float>(_fp32Keys[layer] + fp32Offset + headOffset, _headDim);
             var valSpan = new ReadOnlySpan<float>(_fp32Values[layer] + fp32Offset + headOffset, _headDim);
 
-            long tqOffset = (long)_tqLength * _tqBytesPerPosition + head * _tqBlockSize;
+            long tqOffset = (long)_layerTqLengths[layer] * _tqBytesPerPosition + head * _tqBlockSize;
             var keyDest = new Span<byte>(_tqKeys[layer] + tqOffset, _tqBlockSize);
             var valDest = new Span<byte>(_tqValues[layer] + tqOffset, _tqBlockSize);
 
@@ -244,7 +252,7 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
         }
 
         // Shift FP32 window: move remaining entries down by 1
-        int fp32Count = _totalLength - _tqLength;
+        int fp32Count = _totalLength - _layerTqLengths[layer];
         if (fp32Count > 1)
         {
             long copyBytes = (long)(fp32Count - 1) * _kvDim * sizeof(float);
@@ -252,11 +260,7 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
             Buffer.MemoryCopy(_fp32Values[layer] + _kvDim, _fp32Values[layer], copyBytes, copyBytes);
         }
 
-        // Only increment TQ length after ALL layers have compressed for this position.
-        // The caller (IncrementPosition after full layer pass) handles the coordination.
-        // For single-layer compression, we track it per-call.
-        if (layer == _numLayers - 1)
-            _tqLength++;
+        _layerTqLengths[layer]++;
     }
 
     public void Dispose()

@@ -193,7 +193,9 @@ public sealed unsafe class ForwardPass : IDisposable
     public void EnableTurboQuant(int fp32WindowSize = 256, int bits = 3)
     {
         _tqKvCache = new TurboQuantKvCache(
-            _hp.NumLayers, _hp.ContextLength, _numKvHeads, _headDim, fp32WindowSize, bits);
+            _hp.NumLayers, _kvCache.MaxSeqLen, _numKvHeads, _headDim,
+            Math.Min(fp32WindowSize, _kvCache.MaxSeqLen), bits,
+            layerIndexBase: 0, totalLayerCountForSeeds: _hp.NumLayers);
         _rotatedQuery = Alloc(_headDim);
         _decompBuf = Alloc(_headDim);
     }
@@ -557,7 +559,7 @@ public sealed unsafe class ForwardPass : IDisposable
     {
         var tq = _tqKvCache!;
         int seqLen = position + 1;
-        int tqLen = tq.TqLength;
+        int tqLen = tq.GetTqLength(layer);
         int fp32Start = tqLen;
         float scale = 1.0f / MathF.Sqrt(_headDim);
 
@@ -577,8 +579,9 @@ public sealed unsafe class ForwardPass : IDisposable
             for (int t = 0; t < tqLen; t++)
             {
                 byte* tqKey = tq.TqKeyAt(layer, t, kvHead);
-                float dot = TurboQuantOps.DequantDot3Avx2(
-                    tqKey, _rotatedQuery, (float*)Unsafe.AsPointer(ref MemoryMarshal.GetReference(keyCompressor.Centroids)), _headDim);
+                float dot = keyCompressor.DequantDot(
+                    new ReadOnlySpan<byte>(tqKey, tq.TqBlockSize),
+                    new ReadOnlySpan<float>(_rotatedQuery, _headDim));
                 _attnScores[t] = dot * scale;
             }
 

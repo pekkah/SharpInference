@@ -488,6 +488,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private ComputePipeline? _headNormPipeline;
     private ComputePipeline? _siluMulPipeline;
     private ComputePipeline? _addInPlacePipeline;
+    private ComputePipeline? _addScaledInPlacePipeline;
+    private ComputePipeline? _clearPipeline;
     private ComputePipeline? _elementwiseMulPipeline;
     private ComputePipeline? _ropePipeline;
     private ComputePipeline? _softmaxPipeline;
@@ -505,6 +507,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private struct RmsNormParams { public uint n; public float eps; }
     private struct HeadNormParams { public uint headDim; public uint numHeads; public float eps; }
     private struct CountParams { public uint n; }
+    private struct ScaleParams { public uint n; public float scale; }
     private struct RoPEParams { public uint numHeads; public uint headDim; public int position; public float theta; }
     private struct MatVecParams { public uint rows; public uint cols; }
     private struct EmbedParams { public uint tokenId; public uint embDim; }
@@ -551,6 +554,20 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _addInPlacePipeline ??= new ComputePipeline(this, Shaders.AddInPlace, 2, pushConstantSize: sizeof(CountParams));
         var p = new CountParams { n = (uint)dst.ElementCount };
         DispatchOrRecord(_addInPlacePipeline, [GetBuffer(dst), GetBuffer(src)], ((uint)dst.ElementCount + 255) / 256, &p);
+    }
+
+    public void AddScaledInPlace(Tensor dst, Tensor src, float scale)
+    {
+        _addScaledInPlacePipeline ??= new ComputePipeline(this, Shaders.AddScaledInPlace, 2, pushConstantSize: sizeof(ScaleParams));
+        var p = new ScaleParams { n = (uint)dst.ElementCount, scale = scale };
+        DispatchOrRecord(_addScaledInPlacePipeline, [GetBuffer(dst), GetBuffer(src)], ((uint)dst.ElementCount + 255) / 256, &p);
+    }
+
+    public void Clear(Tensor dst)
+    {
+        _clearPipeline ??= new ComputePipeline(this, Shaders.Clear, 1, pushConstantSize: sizeof(CountParams));
+        var p = new CountParams { n = (uint)dst.ElementCount };
+        DispatchOrRecord(_clearPipeline, [GetBuffer(dst)], ((uint)dst.ElementCount + 255) / 256, &p);
     }
 
     public void ElementwiseMul(Tensor output, Tensor a, Tensor b)
@@ -710,6 +727,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _headNormPipeline?.Dispose();
         _siluMulPipeline?.Dispose();
         _addInPlacePipeline?.Dispose();
+        _addScaledInPlacePipeline?.Dispose();
+        _clearPipeline?.Dispose();
         _elementwiseMulPipeline?.Dispose();
         _ropePipeline?.Dispose();
         _softmaxPipeline?.Dispose();

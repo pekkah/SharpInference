@@ -14,7 +14,7 @@ public static class TierPlanner
     /// </summary>
     public static LayerPlacement Plan(GgufModel model, ModelHyperparams hp,
         HardwareProfile hardware, bool turboQuant = false, int tqBits = 3,
-        int requestedCtxSize = 0)
+        int requestedCtxSize = 0, int tqFp32Window = 256)
     {
         if (hardware.VramBytes <= 0)
             return new LayerPlacement(0, hp.NumLayers, 0, 0, requestedCtxSize > 0 ? requestedCtxSize : hp.ContextLength);
@@ -25,16 +25,22 @@ public static class TierPlanner
         // Reserve for Vulkan overhead + scratch buffers
         long scratchBytes = (long)(hp.EmbeddingDim * 3 + hp.NumHeads * headDim
             + hp.NumKvHeads * headDim * 2 + hp.NumHeads * headDim
-            + hp.IntermediateDim * 2 + hp.VocabSize) * sizeof(float);
+            + Math.Max(hp.IntermediateDim, hp.IsMoE ? hp.ExpertIntermediateDim : hp.IntermediateDim) * 2
+            + hp.VocabSize + (hp.IsMoE ? hp.NumExperts + hp.EmbeddingDim * 2 : 0)) * sizeof(float);
         long reserved = Math.Max(vramTotal / 10, 512L * 1024 * 1024); // 10% or 512 MB min
         long vramBudget = vramTotal - scratchBytes - reserved;
 
         // Priority 1: Embedding + output projection (always on GPU)
-        long embBytes = MeasureTensorBytes(model, "token_embd.weight");
-        long outputBytes = model.FindTensor("output.weight") != null
-            ? MeasureTensorBytes(model, "output.weight")
-            : 0; // tied embeddings — shared with token_embd
-        long outputNormBytes = MeasureTensorBytes(model, "output_norm.weight");
+        bool cpuFixedWeights = ShouldKeepFixedWeightsOnCpu(
+            model.FindTensor("token_embd.weight")!.Value,
+            model.FindTensor("output.weight"));
+        long embBytes = cpuFixedWeights ? 0 : MeasureGpuTensorBytes(model, "token_embd.weight");
+        long outputBytes = cpuFixedWeights
+            ? 0
+            : model.FindTensor("output.weight") != null
+                ? MeasureGpuTensorBytes(model, "output.weight")
+                : 0; // tied embeddings — shared with token_embd
+        long outputNormBytes = cpuFixedWeights ? 0 : MeasureGpuTensorBytes(model, "output_norm.weight");
 
         long fixedGpuBytes = embBytes + outputBytes + outputNormBytes;
         vramBudget -= fixedGpuBytes;
@@ -61,26 +67,55 @@ public static class TierPlanner
             }
         }
 
-        // KV cache: remaining VRAM budget
-        // GPU layers always use FP32 KV cache in VRAM (TQ only applies to CPU layers)
-        long kvBytesPerToken = 2L * gpuLayers * hp.NumKvHeads * headDim * sizeof(float);
-
         int gpuCtxSize;
+        int autoCtxCap = Math.Min(hp.ContextLength, 32768);
         if (requestedCtxSize > 0)
         {
             gpuCtxSize = requestedCtxSize;
         }
-        else if (kvBytesPerToken > 0 && vramBudget > 0)
+        else if (gpuLayers > 0 && turboQuant)
         {
+            int fp32Window = Math.Min(tqFp32Window, autoCtxCap);
+            int tqBlockSize = TurboQuantOps.BlockSize(tqBits, headDim);
+            long fp32WindowBytes = 2L * gpuLayers * hp.NumKvHeads * headDim * sizeof(float) * fp32Window;
+            long tqBytesPerToken = 2L * gpuLayers * hp.NumKvHeads * tqBlockSize;
+
+            long availableForTq = vramBudget - fp32WindowBytes;
+            if (availableForTq <= 0) availableForTq = 64L * 1024 * 1024;
+
+            int maxTqPositions = tqBytesPerToken > 0 ? (int)(availableForTq / tqBytesPerToken) : 0;
+            gpuCtxSize = Math.Clamp(maxTqPositions + fp32Window, 512, autoCtxCap);
+        }
+        else if (gpuLayers > 0 && vramBudget > 0)
+        {
+            long kvBytesPerToken = 2L * gpuLayers * hp.NumKvHeads * headDim * sizeof(float);
             gpuCtxSize = (int)(vramBudget / kvBytesPerToken);
-            gpuCtxSize = Math.Clamp(gpuCtxSize, 512, hp.ContextLength);
+            gpuCtxSize = Math.Clamp(gpuCtxSize, 512, autoCtxCap);
         }
         else
         {
-            gpuCtxSize = Math.Min(2048, hp.ContextLength);
+            gpuCtxSize = Math.Min(2048, autoCtxCap);
         }
 
-        long gpuKvBytes = kvBytesPerToken * gpuCtxSize;
+        long gpuKvBytes;
+        if (gpuLayers == 0)
+        {
+            gpuKvBytes = 0;
+        }
+        else if (turboQuant)
+        {
+            int fp32Window = Math.Min(tqFp32Window, gpuCtxSize);
+            int tqBlockSize = TurboQuantOps.BlockSize(tqBits, headDim);
+            long fp32WindowBytes = 2L * gpuLayers * hp.NumKvHeads * headDim * sizeof(float) * fp32Window;
+            long tqBytesPerToken = 2L * gpuLayers * hp.NumKvHeads * tqBlockSize;
+            long tqPositions = Math.Max(0, gpuCtxSize - fp32Window);
+            gpuKvBytes = fp32WindowBytes + tqBytesPerToken * tqPositions;
+        }
+        else
+        {
+            long kvBytesPerToken = 2L * gpuLayers * hp.NumKvHeads * headDim * sizeof(float);
+            gpuKvBytes = kvBytesPerToken * gpuCtxSize;
+        }
 
         return new LayerPlacement(
             gpuLayers,
@@ -96,35 +131,73 @@ public static class TierPlanner
         return info is not null ? ((info.Value.ByteSize + 3) & ~3L) : 0;
     }
 
+    private static long MeasureGpuTensorBytes(GgufModel model, string name)
+    {
+        var info = model.FindTensor(name);
+        return info is not null ? EstimateGpuTensorBytes(info.Value) : 0;
+    }
+
     private static long MeasureLayerBytes(GgufModel model, ModelHyperparams hp, int layer)
     {
         long total = 0;
-        string[] suffixes =
-        [
-            "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
-            "attn_output.weight", "ffn_norm.weight", "ffn_gate.weight", "ffn_up.weight",
-            "ffn_down.weight"
-        ];
+        string[] suffixes = hp.IsMoE
+            ?
+            [
+                "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
+                "attn_output.weight", "ffn_norm.weight", "ffn_gate_inp.weight",
+                "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"
+            ]
+            :
+            [
+                "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
+                "attn_output.weight", "ffn_norm.weight", "ffn_gate.weight", "ffn_up.weight",
+                "ffn_down.weight"
+            ];
 
         foreach (var suffix in suffixes)
-            total += MeasureTensorBytes(model, $"blk.{layer}.{suffix}");
+            total += MeasureGpuTensorBytes(model, $"blk.{layer}.{suffix}");
+
+        if (hp.IsMoE && hp.HasSharedExpert)
+        {
+            total += MeasureGpuTensorBytes(model, $"blk.{layer}.ffn_gate_shexp.weight");
+            total += MeasureGpuTensorBytes(model, $"blk.{layer}.ffn_up_shexp.weight");
+            total += MeasureGpuTensorBytes(model, $"blk.{layer}.ffn_down_shexp.weight");
+        }
 
         // Optional biases
         if (hp.HasAttnBias)
         {
-            total += MeasureTensorBytes(model, $"blk.{layer}.attn_q.bias");
-            total += MeasureTensorBytes(model, $"blk.{layer}.attn_k.bias");
-            total += MeasureTensorBytes(model, $"blk.{layer}.attn_v.bias");
-            total += MeasureTensorBytes(model, $"blk.{layer}.attn_output.bias");
+            total += MeasureGpuTensorBytes(model, $"blk.{layer}.attn_q.bias");
+            total += MeasureGpuTensorBytes(model, $"blk.{layer}.attn_k.bias");
+            total += MeasureGpuTensorBytes(model, $"blk.{layer}.attn_v.bias");
+            total += MeasureGpuTensorBytes(model, $"blk.{layer}.attn_output.bias");
         }
 
         if (hp.HasQkNorm)
         {
-            total += MeasureTensorBytes(model, $"blk.{layer}.attn_q_norm.weight");
-            total += MeasureTensorBytes(model, $"blk.{layer}.attn_k_norm.weight");
+            total += MeasureGpuTensorBytes(model, $"blk.{layer}.attn_q_norm.weight");
+            total += MeasureGpuTensorBytes(model, $"blk.{layer}.attn_k_norm.weight");
         }
 
         return total;
+    }
+
+    private static long EstimateGpuTensorBytes(GgufTensorInfo tensor)
+    {
+        if (tensor.DType == DType.Float32 || tensor.DType == DType.Q4_K || tensor.DType == DType.Q6_K)
+            return (tensor.ByteSize + 3) & ~3L;
+
+        return tensor.ElementCount * sizeof(float);
+    }
+
+    private static bool ShouldKeepFixedWeightsOnCpu(GgufTensorInfo embedding, GgufTensorInfo? output)
+    {
+        const long maxStorageBufferBytes = 2L * 1024 * 1024 * 1024 - 1;
+        if (EstimateGpuTensorBytes(embedding) > maxStorageBufferBytes)
+            return true;
+        if (output is not null && EstimateGpuTensorBytes(output.Value) > maxStorageBufferBytes)
+            return true;
+        return false;
     }
 }
 

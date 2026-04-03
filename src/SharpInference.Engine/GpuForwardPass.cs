@@ -46,6 +46,8 @@ public sealed unsafe class GpuForwardPass : IDisposable
     private readonly Tensor[] _wq, _wk, _wv, _wo;
     private readonly Tensor[] _wFfnNorm;
     private readonly Tensor[] _wGate, _wUp, _wDown;
+    private readonly Tensor[]? _wGateInp, _wGateShexp, _wUpShexp, _wDownShexp;
+    private readonly Tensor[][]? _wGateExps, _wUpExps, _wDownExps;
     private readonly Tensor _wOutputNorm;
     private readonly Tensor _wOutput;
 
@@ -75,17 +77,22 @@ public sealed unsafe class GpuForwardPass : IDisposable
     private readonly int _tqBlockBytes;
     private Tensor[]? _gpuTqKCache;    // per layer, compressed VRAM
     private Tensor[]? _gpuTqVCache;    // per layer, compressed VRAM
-    private Tensor? _gpuSignPatterns;  // [numKvHeads * headDim] sign flips
+    private Tensor[]? _gpuSignPatterns;  // [numKvHeads * headDim] sign flips, per layer
     private Tensor? _gpuCodebook;      // [8] centroids (3-bit)
     private Tensor? _gpuBoundaries;    // [7] decision boundaries
     private Tensor? _rotatedQ;         // [numHeads * headDim] WHT-rotated query
     private Tensor? _evictK;           // [numKvHeads * headDim] scratch for evicted FP32 entry
     private Tensor? _evictV;
+    private Tensor? _routerLogits;
+    private Tensor? _moeSharedOut;
+    private Tensor? _moeExpertOut;
     private int _tqCompressedLen;      // positions in TQ storage
     private int _fp32WriteIdx;         // ring buffer write position in FP32 window
     private int _fp32Count;            // number of FP32 positions currently stored
 
-    private readonly int _embDim, _headDim, _numHeads, _numKvHeads, _headsPerKvGroup, _intermDim;
+    private readonly int _embDim, _headDim, _numHeads, _numKvHeads, _headsPerKvGroup, _intermDim, _expertDim;
+    private readonly bool _isMoE, _hasSharedExpert;
+    private readonly float[]? _routerBuf;
 
     public GpuForwardPass(GgufModel model, VulkanBackend gpu, ModelHyperparams hp,
         int maxContextLength = 0, bool enableTurboQuant = false, int tqFp32Window = 256, int tqBits = 3)
@@ -94,8 +101,6 @@ public sealed unsafe class GpuForwardPass : IDisposable
         _gpu = gpu;
         _hp = hp;
         _tqEnabled = enableTurboQuant;
-        _tqFp32Window = tqFp32Window;
-        _tqBlockBytes = enableTurboQuant ? TurboQuantOps.BlockSize(tqBits, hp.EmbeddingDim / hp.NumHeads) : 0;
 
         if (maxContextLength > 0)
         {
@@ -110,6 +115,9 @@ public sealed unsafe class GpuForwardPass : IDisposable
             _maxSeqLen = EstimateMaxContext(model, gpu, hp);
         }
 
+        _tqFp32Window = enableTurboQuant ? Math.Min(tqFp32Window, _maxSeqLen) : 0;
+        _tqBlockBytes = enableTurboQuant ? TurboQuantOps.BlockSize(tqBits, hp.EmbeddingDim / hp.NumHeads) : 0;
+
         _kvCache = new Engine.KvCache(hp.NumLayers, _maxSeqLen, hp.NumKvHeads, hp.EmbeddingDim / hp.NumHeads);
         Console.Error.WriteLine($"[GpuForwardPass] Context size: {_maxSeqLen} (model max: {hp.ContextLength}){(enableTurboQuant ? " [TQ3]" : "")}");
 
@@ -119,6 +127,12 @@ public sealed unsafe class GpuForwardPass : IDisposable
         _numKvHeads = hp.NumKvHeads;
         _headsPerKvGroup = hp.NumHeads / hp.NumKvHeads;
         _intermDim = hp.IntermediateDim;
+        _expertDim = hp.IsMoE ? hp.ExpertIntermediateDim : 0;
+        _isMoE = hp.IsMoE;
+        _hasSharedExpert = hp.HasSharedExpert;
+        if (_tqEnabled && _headDim is not 128 and not 256)
+            throw new NotSupportedException($"TurboQuant currently supports head dimensions 128 and 256; model head dim is {_headDim}.");
+        _routerBuf = _isMoE ? new float[hp.NumExperts] : null;
 
         // Allocate GPU scratch buffers
         _hidden = gpu.Allocate(TensorShape.D1(_embDim));
@@ -128,9 +142,13 @@ public sealed unsafe class GpuForwardPass : IDisposable
         _k = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
         _v = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
         _attnOut = gpu.Allocate(TensorShape.D1(_numHeads * _headDim));
-        _ffnGate = gpu.Allocate(TensorShape.D1(_intermDim));
-        _ffnUp = gpu.Allocate(TensorShape.D1(_intermDim));
+        int ffnScratchDim = Math.Max(_intermDim, _expertDim);
+        _ffnGate = gpu.Allocate(TensorShape.D1(ffnScratchDim));
+        _ffnUp = gpu.Allocate(TensorShape.D1(ffnScratchDim));
         _logits = gpu.Allocate(TensorShape.D1(hp.VocabSize));
+        _routerLogits = _isMoE ? gpu.Allocate(TensorShape.D1(hp.NumExperts)) : null;
+        _moeSharedOut = _isMoE && _hasSharedExpert ? gpu.Allocate(TensorShape.D1(_embDim)) : null;
+        _moeExpertOut = _isMoE ? gpu.Allocate(TensorShape.D1(_embDim)) : null;
         _logitsBuf = new float[hp.VocabSize];
 
         // Allocate VRAM KV cache
@@ -148,31 +166,21 @@ public sealed unsafe class GpuForwardPass : IDisposable
             }
 
             // TQ compressed cache: (maxSeqLen - fp32Window) positions
-            int maxTqPositions = _maxSeqLen - _tqFp32Window;
+            int maxTqPositions = Math.Max(0, _maxSeqLen - _tqFp32Window);
             long tqBytesPerPos = (long)_numKvHeads * _tqBlockBytes;
             // Allocate as uint buffer (shader accesses via uint[])
             long tqUintsPerLayer = (maxTqPositions * tqBytesPerPos + 3) / 4;
             _gpuTqKCache = new Tensor[hp.NumLayers];
             _gpuTqVCache = new Tensor[hp.NumLayers];
+            _gpuSignPatterns = new Tensor[hp.NumLayers];
             for (int i = 0; i < hp.NumLayers; i++)
             {
                 _gpuTqKCache[i] = gpu.Allocate(TensorShape.D1(tqUintsPerLayer));
                 _gpuTqVCache[i] = gpu.Allocate(TensorShape.D1(tqUintsPerLayer));
+                _gpuSignPatterns[i] = UploadTqSignPatterns(i);
             }
 
             // Upload TQ constants to VRAM
-            // Sign patterns: use layer 0, head 0 pattern for all (simplification for GPU)
-            // A full implementation would use per-layer-per-head patterns
-            var signData = WalshHadamard.GenerateSignPattern(_headDim, 0);
-            // Tile to numKvHeads
-            var fullSigns = new float[_numKvHeads * _headDim];
-            for (int h = 0; h < _numKvHeads; h++)
-            {
-                var headSigns = WalshHadamard.GenerateSignPattern(_headDim, h);
-                headSigns.CopyTo(fullSigns.AsSpan(h * _headDim));
-            }
-            _gpuSignPatterns = gpu.Upload(fullSigns, TensorShape.D1(fullSigns.Length));
-
             var centroids = TurboQuantCodebooks.GetCentroids(tqBits, _headDim).ToArray();
             _gpuCodebook = gpu.Upload(centroids, TensorShape.D1(centroids.Length));
 
@@ -198,6 +206,13 @@ public sealed unsafe class GpuForwardPass : IDisposable
         _wAttnNorm = new Tensor[L]; _wFfnNorm = new Tensor[L];
         _wq = new Tensor[L]; _wk = new Tensor[L]; _wv = new Tensor[L]; _wo = new Tensor[L];
         _wGate = new Tensor[L]; _wUp = new Tensor[L]; _wDown = new Tensor[L];
+        _wGateInp = _isMoE ? new Tensor[L] : null;
+        _wGateExps = _isMoE ? new Tensor[L][] : null;
+        _wUpExps = _isMoE ? new Tensor[L][] : null;
+        _wDownExps = _isMoE ? new Tensor[L][] : null;
+        _wGateShexp = _isMoE && _hasSharedExpert ? new Tensor[L] : null;
+        _wUpShexp = _isMoE && _hasSharedExpert ? new Tensor[L] : null;
+        _wDownShexp = _isMoE && _hasSharedExpert ? new Tensor[L] : null;
 
         _hasAttnBias = hp.HasAttnBias;
         if (_hasAttnBias)
@@ -221,9 +236,25 @@ public sealed unsafe class GpuForwardPass : IDisposable
             _wv[i] = UploadWeight($"blk.{i}.attn_v.weight");
             _wo[i] = UploadWeight($"blk.{i}.attn_output.weight");
             _wFfnNorm[i] = UploadWeight($"blk.{i}.ffn_norm.weight");
-            _wGate[i] = UploadWeight($"blk.{i}.ffn_gate.weight");
-            _wUp[i] = UploadWeight($"blk.{i}.ffn_up.weight");
-            _wDown[i] = UploadWeight($"blk.{i}.ffn_down.weight");
+            if (_isMoE)
+            {
+                _wGateInp![i] = UploadWeight($"blk.{i}.ffn_gate_inp.weight");
+                _wGateExps![i] = UploadExpertWeights($"blk.{i}.ffn_gate_exps.weight", _expertDim, _embDim, hp.NumExperts);
+                _wUpExps![i] = UploadExpertWeights($"blk.{i}.ffn_up_exps.weight", _expertDim, _embDim, hp.NumExperts);
+                _wDownExps![i] = UploadExpertWeights($"blk.{i}.ffn_down_exps.weight", _embDim, _expertDim, hp.NumExperts);
+                if (_hasSharedExpert)
+                {
+                    _wGateShexp![i] = UploadWeight($"blk.{i}.ffn_gate_shexp.weight");
+                    _wUpShexp![i] = UploadWeight($"blk.{i}.ffn_up_shexp.weight");
+                    _wDownShexp![i] = UploadWeight($"blk.{i}.ffn_down_shexp.weight");
+                }
+            }
+            else
+            {
+                _wGate[i] = UploadWeight($"blk.{i}.ffn_gate.weight");
+                _wUp[i] = UploadWeight($"blk.{i}.ffn_up.weight");
+                _wDown[i] = UploadWeight($"blk.{i}.ffn_down.weight");
+            }
 
             if (_hasAttnBias)
             {
@@ -241,11 +272,6 @@ public sealed unsafe class GpuForwardPass : IDisposable
 
             Console.Error.Write(".");
         }
-        _wOutputNorm = UploadWeight("output_norm.weight");
-
-        var outputName = model.FindTensor("output.weight") is not null ? "output.weight" : "token_embd.weight";
-        _wOutput = UploadWeight(outputName);
-
         // Upload embedding table to VRAM — keep quantized for Q4_K to save VRAM
         Console.Error.Write(" emb...");
         var embInfo = model.FindTensor("token_embd.weight")!.Value;
@@ -258,6 +284,7 @@ public sealed unsafe class GpuForwardPass : IDisposable
             embData.CopyTo(MemoryMarshal.AsBytes(raw.AsSpan()));
             _gpuEmbedding = gpu.Upload(raw, TensorShape.D1(floatCount));
             _embIsQuantized = true;
+            _weightDTypes[_gpuEmbedding.Handle] = DType.Q4_K;
         }
         else
         {
@@ -267,7 +294,13 @@ public sealed unsafe class GpuForwardPass : IDisposable
             Dequantize.ToFloat32(embData, embF32, embInfo.DType, embInfo.ElementCount);
             _gpuEmbedding = gpu.Upload(embF32, TensorShape.D1(embF32.Length));
             _embIsQuantized = false;
+            _weightDTypes[_gpuEmbedding.Handle] = DType.Float32;
         }
+
+        _wOutputNorm = UploadWeight("output_norm.weight");
+        _wOutput = model.FindTensor("output.weight") is not null
+            ? UploadWeight("output.weight")
+            : _gpuEmbedding;
 
         Console.Error.WriteLine(" done.");
     }
@@ -350,7 +383,7 @@ public sealed unsafe class GpuForwardPass : IDisposable
 
                     // Compress evicted entry into TQ cache
                     _gpu.TqKvAppend(_evictK!, _evictV!, _gpuTqKCache![layer], _gpuTqVCache![layer],
-                        _gpuSignPatterns!, _gpuCodebook!, _gpuBoundaries!,
+                        _gpuSignPatterns![layer], _gpuCodebook!, _gpuBoundaries!,
                         (uint)kvDimLocal, (uint)_headDim, (uint)_tqCompressedLen,
                         (uint)_maxSeqLen, (uint)_numKvHeads, (uint)_tqBlockBytes);
                     _gpu.RecordBarrier();
@@ -362,7 +395,7 @@ public sealed unsafe class GpuForwardPass : IDisposable
                 _gpu.RecordBarrier();
 
                 // Rotate query for TQ attention
-                _gpu.TqRotateQuery(_q, _rotatedQ!, _gpuSignPatterns!,
+                _gpu.TqRotateQuery(_q, _rotatedQ!, _gpuSignPatterns![layer],
                     (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim);
                 _gpu.RecordBarrier();
 
@@ -402,15 +435,10 @@ public sealed unsafe class GpuForwardPass : IDisposable
             _gpu.RmsNorm(_normBuf, _hidden, _wFfnNorm[layer], _hp.RmsNormEps);
             _gpu.RecordBarrier();
 
-            // gate and up both read normBuf (no conflict)
-            GpuMatMul(_ffnGate, _wGate[layer], _normBuf);
-            GpuMatMul(_ffnUp, _wUp[layer], _normBuf);
-            _gpu.RecordBarrier(); // gate/up done → SiLU
-
-            _gpu.SiLuMul(_ffnGate, _ffnUp);
-            _gpu.RecordBarrier(); // SiLU done → down projection
-
-            GpuMatMul(_hidden, _wDown[layer], _ffnGate);
+            if (_isMoE)
+                GpuMoeFfn(layer);
+            else
+                GpuDenseFfn(layer);
             _gpu.RecordBarrier(); // hidden written → add
 
             _gpu.AddInPlace(_hidden, _residual);
@@ -450,6 +478,68 @@ public sealed unsafe class GpuForwardPass : IDisposable
     {
         var dtype = _weightDTypes.GetValueOrDefault(weights.Handle, DType.Q4_K);
         _gpu.MatMul(output, weights, input, dtype);
+    }
+
+    private void GpuDenseFfn(int layer)
+    {
+        GpuMatMul(_ffnGate, _wGate[layer], _normBuf);
+        GpuMatMul(_ffnUp, _wUp[layer], _normBuf);
+        _gpu.RecordBarrier();
+
+        _gpu.SiLuMul(_ffnGate, _ffnUp);
+        _gpu.RecordBarrier();
+
+        GpuMatMul(_hidden, _wDown[layer], _ffnGate);
+    }
+
+    private void GpuMoeFfn(int layer)
+    {
+        int numActive = _hp.NumActiveExperts;
+
+        GpuMatMul(_routerLogits!, _wGateInp![layer], _normBuf);
+        _gpu.RecordBarrier();
+        _gpu.Softmax(_routerLogits!);
+        _gpu.EndRecordAndSubmit();
+        _gpu.Download(_routerLogits!, _routerBuf!);
+
+        Span<int> selectedExperts = stackalloc int[numActive];
+        Span<float> expertWeights = stackalloc float[numActive];
+        SelectTopK(_routerBuf!, numActive, selectedExperts, expertWeights);
+
+        _gpu.BeginRecord();
+
+        if (_hasSharedExpert)
+        {
+            GpuMatMul(_ffnGate, _wGateShexp![layer], _normBuf);
+            GpuMatMul(_ffnUp, _wUpShexp![layer], _normBuf);
+            _gpu.RecordBarrier();
+            _gpu.SiLuMul(_ffnGate, _ffnUp);
+            _gpu.RecordBarrier();
+            GpuMatMul(_moeSharedOut!, _wDownShexp![layer], _ffnGate);
+            _gpu.RecordBarrier();
+        }
+
+        _gpu.Clear(_hidden);
+        _gpu.RecordBarrier();
+
+        for (int i = 0; i < numActive; i++)
+        {
+            int expertIdx = selectedExperts[i];
+            float expertWeight = expertWeights[i];
+
+            GpuMatMul(_ffnGate, _wGateExps![layer][expertIdx], _normBuf);
+            GpuMatMul(_ffnUp, _wUpExps![layer][expertIdx], _normBuf);
+            _gpu.RecordBarrier();
+            _gpu.SiLuMul(_ffnGate, _ffnUp);
+            _gpu.RecordBarrier();
+            GpuMatMul(_moeExpertOut!, _wDownExps![layer][expertIdx], _ffnGate);
+            _gpu.RecordBarrier();
+            _gpu.AddScaledInPlace(_hidden, _moeExpertOut!, expertWeight);
+            _gpu.RecordBarrier();
+        }
+
+        if (_hasSharedExpert)
+            _gpu.AddInPlace(_hidden, _moeSharedOut!);
     }
 
     private void EmbedToken(int token)
@@ -556,6 +646,109 @@ public sealed unsafe class GpuForwardPass : IDisposable
         return result;
     }
 
+    private Tensor[] UploadExpertWeights(string name, int rows, int cols, int expertCount)
+    {
+        var tensors = new Tensor[expertCount];
+        for (int expertIdx = 0; expertIdx < expertCount; expertIdx++)
+            tensors[expertIdx] = UploadExpertWeight(name, rows, cols, expertIdx);
+        return tensors;
+    }
+
+    private Tensor UploadTqSignPatterns(int layerIndex)
+    {
+        var fullSigns = new float[_numKvHeads * _headDim];
+        for (int h = 0; h < _numKvHeads; h++)
+        {
+            var headSigns = WalshHadamard.GenerateSignPattern(_headDim, layerIndex * _numKvHeads + h);
+            headSigns.CopyTo(fullSigns.AsSpan(h * _headDim));
+        }
+
+        return _gpu.Upload(fullSigns, TensorShape.D1(fullSigns.Length));
+    }
+
+    private Tensor UploadExpertWeight(string name, int rows, int cols, int expertIdx)
+    {
+        var info = _model.FindTensor(name)
+            ?? throw new InvalidOperationException($"Missing tensor: {name}");
+        var data = _model.GetTensorData(info);
+
+        if (info.DType == DType.Float32)
+        {
+            int elemOffset = expertIdx * rows * cols;
+            var floats = MemoryMarshal.Cast<byte, float>(data).Slice(elemOffset, rows * cols);
+            var result = _gpu.Upload(floats, TensorShape.D1(floats.Length));
+            _weightDTypes[result.Handle] = DType.Float32;
+            return result;
+        }
+
+        int bytesPerRow = (cols / DTypeInfo.BlockSize(info.DType))
+                        * DTypeInfo.BytesPerBlock(info.DType);
+        int expertBytes = rows * bytesPerRow;
+        int byteOffset = expertIdx * expertBytes;
+        var expertData = data.Slice(byteOffset, expertBytes);
+
+        if (info.DType == DType.Q4_K || info.DType == DType.Q6_K)
+        {
+            int floatCount = expertData.Length / 4;
+            var rawFloats = new float[floatCount];
+            expertData.CopyTo(MemoryMarshal.AsBytes(rawFloats.AsSpan()));
+            var result = _gpu.Upload(rawFloats, TensorShape.D1(floatCount));
+            _weightDTypes[result.Handle] = info.DType;
+            return result;
+        }
+        else
+        {
+            int count = rows * cols;
+            var f32 = new float[count];
+            Dequantize.ToFloat32(expertData, f32, info.DType, count);
+            var result = _gpu.Upload(f32, TensorShape.D1(count));
+            _weightDTypes[result.Handle] = DType.Float32;
+            return result;
+        }
+    }
+
+    private static void SelectTopK(ReadOnlySpan<float> logits, int k,
+        Span<int> indices, Span<float> weights)
+    {
+        for (int ki = 0; ki < k; ki++)
+        {
+            int bestIdx = 0;
+            float bestVal = float.MinValue;
+            for (int i = 0; i < logits.Length; i++)
+            {
+                bool alreadySelected = false;
+                for (int j = 0; j < ki; j++)
+                {
+                    if (indices[j] != i)
+                        continue;
+
+                    alreadySelected = true;
+                    break;
+                }
+
+                if (!alreadySelected && logits[i] > bestVal)
+                {
+                    bestVal = logits[i];
+                    bestIdx = i;
+                }
+            }
+
+            indices[ki] = bestIdx;
+            weights[ki] = bestVal;
+        }
+
+        if (k <= 1)
+            return;
+
+        float sum = 0;
+        for (int i = 0; i < k; i++)
+            sum += weights[i];
+        if (sum <= 0)
+            return;
+        for (int i = 0; i < k; i++)
+            weights[i] /= sum;
+    }
+
     /// <summary>
     /// Estimates max context when using TurboQuant compressed KV cache.
     /// TQ3 uses ~52 bytes per head per position vs 512 bytes (128 floats) for FP32.
@@ -569,7 +762,7 @@ public sealed unsafe class GpuForwardPass : IDisposable
 
         long weightBytes = 0;
         foreach (var t in model.Tensors)
-            weightBytes += (t.ByteSize + 3) & ~3L;
+            weightBytes += EstimateGpuTensorBytes(t);
 
         long scratchBytes = (long)(hp.EmbeddingDim * 3 + hp.NumHeads * headDim
             + hp.NumKvHeads * headDim * 2 + hp.NumHeads * headDim
@@ -601,7 +794,7 @@ public sealed unsafe class GpuForwardPass : IDisposable
         // Estimate weight VRAM: raw quantized bytes padded to 4-byte alignment per tensor
         long weightBytes = 0;
         foreach (var t in model.Tensors)
-            weightBytes += (t.ByteSize + 3) & ~3L;
+            weightBytes += EstimateGpuTensorBytes(t);
 
         // Scratch buffers (F32): hidden, residual, norm, Q, K, V, attnOut, ffnGate, ffnUp, logits
         int headDim = hp.EmbeddingDim / hp.NumHeads;
@@ -630,12 +823,31 @@ public sealed unsafe class GpuForwardPass : IDisposable
         _gpu.Free(_hidden); _gpu.Free(_residual); _gpu.Free(_normBuf);
         _gpu.Free(_q); _gpu.Free(_k); _gpu.Free(_v); _gpu.Free(_attnOut);
         _gpu.Free(_ffnGate); _gpu.Free(_ffnUp); _gpu.Free(_logits);
+        if (_routerLogits is not null) _gpu.Free(_routerLogits);
+        if (_moeSharedOut is not null) _gpu.Free(_moeSharedOut);
+        if (_moeExpertOut is not null) _gpu.Free(_moeExpertOut);
 
         for (int i = 0; i < _hp.NumLayers; i++)
         {
             _gpu.Free(_wAttnNorm[i]); _gpu.Free(_wFfnNorm[i]);
             _gpu.Free(_wq[i]); _gpu.Free(_wk[i]); _gpu.Free(_wv[i]); _gpu.Free(_wo[i]);
-            _gpu.Free(_wGate[i]); _gpu.Free(_wUp[i]); _gpu.Free(_wDown[i]);
+            if (_isMoE)
+            {
+                _gpu.Free(_wGateInp![i]);
+                foreach (var t in _wGateExps![i]) _gpu.Free(t);
+                foreach (var t in _wUpExps![i]) _gpu.Free(t);
+                foreach (var t in _wDownExps![i]) _gpu.Free(t);
+                if (_hasSharedExpert)
+                {
+                    _gpu.Free(_wGateShexp![i]);
+                    _gpu.Free(_wUpShexp![i]);
+                    _gpu.Free(_wDownShexp![i]);
+                }
+            }
+            else
+            {
+                _gpu.Free(_wGate[i]); _gpu.Free(_wUp[i]); _gpu.Free(_wDown[i]);
+            }
 
             if (_hasAttnBias)
             {
@@ -648,7 +860,10 @@ public sealed unsafe class GpuForwardPass : IDisposable
                 _gpu.Free(_wqNorm![i]); _gpu.Free(_wkNorm![i]);
             }
         }
-        _gpu.Free(_wOutputNorm); _gpu.Free(_wOutput); _gpu.Free(_gpuEmbedding);
+        _gpu.Free(_wOutputNorm);
+        if (_wOutput.Handle != _gpuEmbedding.Handle)
+            _gpu.Free(_wOutput);
+        _gpu.Free(_gpuEmbedding);
 
         for (int i = 0; i < _hp.NumLayers; i++)
         {
@@ -662,13 +877,23 @@ public sealed unsafe class GpuForwardPass : IDisposable
             {
                 _gpu.Free(_gpuTqKCache![i]);
                 _gpu.Free(_gpuTqVCache![i]);
+                _gpu.Free(_gpuSignPatterns![i]);
             }
-            _gpu.Free(_gpuSignPatterns!);
             _gpu.Free(_gpuCodebook!);
             _gpu.Free(_gpuBoundaries!);
             _gpu.Free(_rotatedQ!);
+            _gpu.Free(_evictK!);
+            _gpu.Free(_evictV!);
         }
 
         _kvCache.Dispose();
+    }
+
+    private static long EstimateGpuTensorBytes(GgufTensorInfo tensor)
+    {
+        if (tensor.DType == DType.Float32 || tensor.DType == DType.Q4_K || tensor.DType == DType.Q6_K)
+            return (tensor.ByteSize + 3) & ~3L;
+
+        return tensor.ElementCount * sizeof(float);
     }
 }
