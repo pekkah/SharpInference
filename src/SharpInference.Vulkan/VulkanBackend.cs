@@ -113,10 +113,10 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         // 1. Initialize Vulkan loader
         vkInitialize().CheckResult();
 
-        // 2. Create instance (Vulkan 1.3, no extensions for compute-only)
+        // 2. Create instance (Vulkan 1.3+)
         VkApplicationInfo appInfo = new()
         {
-            apiVersion = VkVersion.Version_1_3,
+            apiVersion = VkVersion.Version_1_3, // Vortice may not have 1.4 constant yet
         };
         VkInstanceCreateInfo instanceCI = new()
         {
@@ -187,6 +187,13 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     }
 
     /// <summary>Print device info to console.</summary>
+    // Capability flags detected at init
+    public bool Has8BitStorage { get; private set; }
+    public bool Has16BitStorage { get; private set; }
+    public bool HasShaderFloat16Int8 { get; private set; }
+    public bool HasCooperativeMatrix { get; private set; }
+    public bool HasSubgroupSizeControl { get; private set; }
+
     public void PrintDeviceInfo()
     {
         Console.WriteLine($"Device: {Name}");
@@ -198,6 +205,35 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
             var flags = (heap.flags & VkMemoryHeapFlags.DeviceLocal) != 0 ? "VRAM" : "RAM";
             Console.WriteLine($"  Heap {i}: {heap.size / 1024 / 1024}MB ({flags})");
         }
+
+        // Query compute-relevant extensions
+        uint extCount = 0;
+        _vki.vkEnumerateDeviceExtensionProperties(_physicalDevice, null, &extCount, null);
+        var exts = new VkExtensionProperties[extCount];
+        fixed (VkExtensionProperties* p = exts)
+            _vki.vkEnumerateDeviceExtensionProperties(_physicalDevice, null, &extCount, p);
+
+        var extNames = new HashSet<string>();
+        for (int i = 0; i < extCount; i++)
+        {
+            fixed (byte* namePtr = exts[i].extensionName)
+                extNames.Add(new string((sbyte*)namePtr));
+        }
+
+        Has8BitStorage = extNames.Contains("VK_KHR_8bit_storage");
+        Has16BitStorage = extNames.Contains("VK_KHR_16bit_storage");
+        HasShaderFloat16Int8 = extNames.Contains("VK_KHR_shader_float16_int8");
+        HasCooperativeMatrix = extNames.Contains("VK_KHR_cooperative_matrix");
+        HasSubgroupSizeControl = extNames.Contains("VK_EXT_subgroup_size_control");
+
+        var found = new List<string>();
+        if (Has8BitStorage) found.Add("8bit_storage");
+        if (Has16BitStorage) found.Add("16bit_storage");
+        if (HasShaderFloat16Int8) found.Add("float16_int8");
+        if (HasCooperativeMatrix) found.Add("cooperative_matrix");
+        if (HasSubgroupSizeControl) found.Add("subgroup_size_control");
+        if (found.Count > 0)
+            Console.WriteLine($"  Compute extensions: {string.Join(", ", found)}");
     }
 
     /// <summary>Total device-local (VRAM) heap size in bytes.</summary>
