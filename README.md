@@ -78,8 +78,11 @@ dotnet test               # Run all tests (85 tests)
 # Publish NativeAOT binary
 dotnet publish src/SharpInference.Cli -c Release -r win-x64
 
-# Run benchmarks
+# Run all benchmarks (requires every benchmark model to be present)
 dotnet run --project benchmarks/SharpInference.Bench -c Release -- --filter '*'
+
+# Run one model/backend suite (only that model is needed)
+dotnet run --project benchmarks/SharpInference.Bench -c Release -- --filter '*SmolLM2CpuBenchmarks*'
 ```
 
 ## Setup
