@@ -141,25 +141,38 @@ public static unsafe class SimdKernels
         int blocksPerRow = cols / blockSize;
         int bytesPerRow = blocksPerRow * bytesPerBlock;
 
-        // Dequantize one row at a time to avoid allocating the full weight matrix
-        float* rowBuf = (float*)NativeMemory.Alloc((nuint)(cols * sizeof(float)));
-        try
+        if (rows >= MinRowsForParallel)
         {
-            for (int r = 0; r < rows; r++)
+            var w = weights; var inp = input; var outp = output;
+            int bpr = bytesPerRow;
+            Parallel.For(0, rows, s_parallelOpts, r =>
             {
-                byte* rowPtr = weights + (long)r * bytesPerRow;
-                Dequantize.ToFloat32(new ReadOnlySpan<byte>(rowPtr, bytesPerRow),
-                    new Span<float>(rowBuf, cols), dtype, cols);
-
-                float sum = 0f;
-                for (int c = 0; c < cols; c++)
-                    sum += rowBuf[c] * input[c];
-                output[r] = sum;
-            }
+                // Thread-local dequant buffer (avoid contention)
+                float* rowBuf = (float*)NativeMemory.Alloc((nuint)(cols * sizeof(float)));
+                try
+                {
+                    byte* rowPtr = w + (long)r * bpr;
+                    Dequantize.ToFloat32(new ReadOnlySpan<byte>(rowPtr, bpr),
+                        new Span<float>(rowBuf, cols), dtype, cols);
+                    outp[r] = DotF32(rowBuf, inp, cols);
+                }
+                finally { NativeMemory.Free(rowBuf); }
+            });
         }
-        finally
+        else
         {
-            NativeMemory.Free(rowBuf);
+            float* rowBuf = (float*)NativeMemory.Alloc((nuint)(cols * sizeof(float)));
+            try
+            {
+                for (int r = 0; r < rows; r++)
+                {
+                    byte* rowPtr = weights + (long)r * bytesPerRow;
+                    Dequantize.ToFloat32(new ReadOnlySpan<byte>(rowPtr, bytesPerRow),
+                        new Span<float>(rowBuf, cols), dtype, cols);
+                    output[r] = DotF32(rowBuf, input, cols);
+                }
+            }
+            finally { NativeMemory.Free(rowBuf); }
         }
     }
 
