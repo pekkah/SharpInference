@@ -4,6 +4,7 @@ using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using SharpInference.Core;
 using SharpInference.Cpu;
+using SharpInference.Pipeline;
 using SharpInference.TurboQuant;
 using SharpInference.Vulkan;
 
@@ -14,7 +15,7 @@ namespace SharpInference.Engine;
 /// First N layers run on GPU (Vulkan compute shaders), remaining layers on CPU (AVX2 SIMD).
 /// Hidden state transfers via pinned host memory at GPU↔CPU boundaries.
 /// </summary>
-public sealed unsafe class HybridForwardPass : IDisposable
+public sealed unsafe class HybridForwardPass : IForwardPass
 {
     private readonly GgufModel _model;
     private readonly VulkanBackend _gpu;
@@ -36,7 +37,6 @@ public sealed unsafe class HybridForwardPass : IDisposable
     private readonly Tensor[] _gpuAttnNorm, _gpuWq, _gpuWk, _gpuWv, _gpuWo;
     private readonly Tensor[] _gpuFfnNorm, _gpuWGate, _gpuWUp, _gpuWDown;
     private readonly Tensor[]? _gpuWGateInp, _gpuWGateShexp, _gpuWUpShexp, _gpuWDownShexp;
-    private readonly Tensor[][]? _gpuWGateExps, _gpuWUpExps, _gpuWDownExps;
     private readonly Tensor[]? _gpuBq, _gpuBk, _gpuBv, _gpuBo;
     private readonly Tensor[]? _gpuQNorm, _gpuKNorm;
     private readonly Tensor[] _gpuKCache, _gpuVCache;
@@ -81,11 +81,43 @@ public sealed unsafe class HybridForwardPass : IDisposable
     private int _kvLength;
     private readonly int _maxSeqLen;
 
+    // ── Expert slot cache (for MoE GPU layers with lazy/evictable expert loading) ──
+    private ExpertSlotManager? _expertSlotManager;
+    private MoEPrefetcher? _prefetcher;
+    // Pinned host-visible GPU tensor for uploading CPU fallback contributions to GPU hidden state.
+    private Tensor? _gpuFallbackContrib;
+    // Pinned host-visible GPU tensor for reading the norm buffer on CPU without a separate Download.
+    // The GPU session copies _gpuNormBuf into this buffer before EndRecordAndSubmit, so MapPinned
+    // after the submit gives the CPU a zero-copy view of the norm data.
+    private Tensor? _gpuPinnedNorm;
+    // Lazily-allocated CPU scratch arrays for the expert cache-miss CPU fallback path.
+    private float[]? _cpuFallbackBuf;  // [embDim] accumulated contribution from missed experts
+    private float[]? _cpuFallbackGate; // [expertDim] scratch for expert gate projection
+    private float[]? _cpuFallbackUp;   // [expertDim] scratch for expert up projection
+
     public int MaxSeqLen => _maxSeqLen;
     public LayerPlacement Placement => _placement;
 
+    /// <summary>Vocabulary size of this model.</summary>
+    public int VocabSize => _hp.VocabSize;
+
+    /// <summary>
+    /// Truncate the KV cache to the given length, discarding positions >= length.
+    /// Used by speculative decoding to rewind rejected draft tokens.
+    /// </summary>
+    public void TruncateTo(int length)
+    {
+        _kvLength = length;
+        _gpuTqCompressedLen = Math.Min(_gpuTqCompressedLen, length);
+        if (_cpuTqKvCache != null)
+            _cpuTqKvCache.TruncateTo(length);
+        else
+            _cpuKvCache.TruncateTo(length);
+    }
+
     public HybridForwardPass(GgufModel model, VulkanBackend gpu, ModelHyperparams hp,
-        LayerPlacement placement, bool enableTq = false, int tqFp32Window = 256, int tqBits = 3)
+        LayerPlacement placement, bool enableTq = false, int tqFp32Window = 256, int tqBits = 3,
+        int expertSlotCapacity = -1)
     {
         _model = model;
         _gpu = gpu;
@@ -169,9 +201,6 @@ public sealed unsafe class HybridForwardPass : IDisposable
         _gpuFfnNorm = new Tensor[_nGpuLayers];
         _gpuWGate = new Tensor[_nGpuLayers]; _gpuWUp = new Tensor[_nGpuLayers]; _gpuWDown = new Tensor[_nGpuLayers];
         _gpuWGateInp = _isMoE ? new Tensor[_nGpuLayers] : null;
-        _gpuWGateExps = _isMoE ? new Tensor[_nGpuLayers][] : null;
-        _gpuWUpExps = _isMoE ? new Tensor[_nGpuLayers][] : null;
-        _gpuWDownExps = _isMoE ? new Tensor[_nGpuLayers][] : null;
         _gpuWGateShexp = _isMoE && _hasSharedExpert ? new Tensor[_nGpuLayers] : null;
         _gpuWUpShexp = _isMoE && _hasSharedExpert ? new Tensor[_nGpuLayers] : null;
         _gpuWDownShexp = _isMoE && _hasSharedExpert ? new Tensor[_nGpuLayers] : null;
@@ -212,9 +241,7 @@ public sealed unsafe class HybridForwardPass : IDisposable
             if (_isMoE)
             {
                 _gpuWGateInp![i] = UploadWeight($"blk.{i}.ffn_gate_inp.weight");
-                _gpuWGateExps![i] = UploadExpertWeights($"blk.{i}.ffn_gate_exps.weight", _expertDim, _embDim, hp.NumExperts);
-                _gpuWUpExps![i] = UploadExpertWeights($"blk.{i}.ffn_up_exps.weight", _expertDim, _embDim, hp.NumExperts);
-                _gpuWDownExps![i] = UploadExpertWeights($"blk.{i}.ffn_down_exps.weight", _embDim, _expertDim, hp.NumExperts);
+                // Expert weights (gate/up/down exps) are loaded lazily by ExpertSlotManager
                 if (_hasSharedExpert)
                 {
                     _gpuWGateShexp![i] = UploadWeight($"blk.{i}.ffn_gate_shexp.weight");
@@ -258,6 +285,20 @@ public sealed unsafe class HybridForwardPass : IDisposable
             Console.Error.Write(".");
         }
         Console.Error.WriteLine(" done.");
+
+        // ── Create expert slot manager for GPU MoE layers ──
+        if (_isMoE && _nGpuLayers > 0)
+        {
+            int totalExperts = hp.NumExperts * _nGpuLayers;
+            int capacity = expertSlotCapacity > 0
+                ? Math.Min(expertSlotCapacity, totalExperts)
+                : totalExperts;
+            _expertSlotManager = new ExpertSlotManager(gpu, model, hp, capacity, _gpuWeightDTypes);
+            _prefetcher = new MoEPrefetcher(_expertSlotManager);
+            _gpuFallbackContrib = gpu.AllocatePinned(TensorShape.D1(_embDim));
+            _gpuPinnedNorm      = gpu.AllocatePinned(TensorShape.D1(_embDim));
+            Console.Error.WriteLine($"[HybridForwardPass] MoE expert slot cache: {capacity} slots ({hp.NumExperts} experts × {_nGpuLayers} layers), SLRU lazy-load.");
+        }
 
         // ── Resolve CPU weights (layers nGpuLayers..numLayers-1) ──
         _cpuHidden = Alloc(_embDim);
@@ -1099,12 +1140,46 @@ public sealed unsafe class HybridForwardPass : IDisposable
         GpuMatMul(_gpuRouterLogits!, _gpuWGateInp![layer], _gpuNormBuf);
         _gpu.RecordBarrier();
         _gpu.Softmax(_gpuRouterLogits!);
+        // Copy norm buf to pinned memory while still recording so the CPU can
+        // read it after submit via MapPinned — avoids a second CopyBuffer call.
+        CopyGpuBuffer(_gpuPinnedNorm!, _gpuNormBuf);
+        _gpu.RecordTransferBarrier();
         _gpu.EndRecordAndSubmit();
         _gpu.Download(_gpuRouterLogits!, _gpuRouterBuf!);
 
         Span<int> selectedExperts = stackalloc int[numActive];
         Span<float> expertWeights = stackalloc float[numActive];
         SelectTopK(_gpuRouterBuf!, numActive, selectedExperts, expertWeights);
+
+        // ── CPU fallback for cache misses ──
+        // Experts not yet in the slot cache are computed on CPU while the GPU
+        // is idle (between EndRecordAndSubmit and the next BeginRecord).
+        // Their weighted outputs are accumulated in _cpuFallbackBuf and
+        // uploaded to the pre-allocated pinned tensor for GPU AddInPlace.
+        // Prefetch the same experts for the next token (1-token lookahead).
+        _prefetcher?.EnqueuePrefetch(layer, selectedExperts);
+        Span<bool> isGpu = stackalloc bool[numActive];
+        // ExpertGpuSlot contains Tensor (managed reference type fields) — heap-allocate.
+        ExpertGpuSlot[] cachedSlots = new ExpertGpuSlot[numActive];
+        bool hasCpuFallback = false;
+
+        for (int i = 0; i < numActive; i++)
+        {
+            isGpu[i] = _expertSlotManager!.TryGetCached(layer, selectedExperts[i], out cachedSlots[i]);
+            if (!isGpu[i]) hasCpuFallback = true;
+        }
+
+        if (hasCpuFallback)
+        {
+            // _gpuPinnedNorm was populated by the GPU session above — map it directly,
+            // no extra Download / CopyBuffer call needed.
+            unsafe
+            {
+                float* normPtr = _gpu.MapPinned(_gpuPinnedNorm!);
+                GpuMoeFfnCpuFallback(layer, selectedExperts, expertWeights, isGpu, numActive, normPtr);
+                _gpu.UnmapPinned(_gpuPinnedNorm!);
+            }
+        }
 
         _gpu.BeginRecord();
 
@@ -1124,22 +1199,74 @@ public sealed unsafe class HybridForwardPass : IDisposable
 
         for (int i = 0; i < numActive; i++)
         {
-            int expertIdx = selectedExperts[i];
-            float expertWeight = expertWeights[i];
+            if (!isGpu[i]) continue; // handled by CPU fallback
 
-            GpuMatMul(_gpuFfnGate, _gpuWGateExps![layer][expertIdx], _gpuNormBuf);
-            GpuMatMul(_gpuFfnUp, _gpuWUpExps![layer][expertIdx], _gpuNormBuf);
+            float expertWeight = expertWeights[i];
+            GpuMatMul(_gpuFfnGate, cachedSlots[i].Gate, _gpuNormBuf);
+            GpuMatMul(_gpuFfnUp, cachedSlots[i].Up, _gpuNormBuf);
             _gpu.RecordBarrier();
             _gpu.SiLuMul(_gpuFfnGate, _gpuFfnUp);
             _gpu.RecordBarrier();
-            GpuMatMul(_gpuMoeExpertOut!, _gpuWDownExps![layer][expertIdx], _gpuFfnGate);
+            GpuMatMul(_gpuMoeExpertOut!, cachedSlots[i].Down, _gpuFfnGate);
             _gpu.RecordBarrier();
             _gpu.AddScaledInPlace(_gpuHidden, _gpuMoeExpertOut!, expertWeight);
             _gpu.RecordBarrier();
         }
 
+        // Add CPU-computed contributions (if any) via pre-allocated pinned buffer.
+        if (hasCpuFallback)
+        {
+            unsafe
+            {
+                fixed (float* srcPtr = _cpuFallbackBuf)
+                {
+                    float* mapped = _gpu.MapPinned(_gpuFallbackContrib!);
+                    new ReadOnlySpan<float>(srcPtr, _embDim).CopyTo(new Span<float>(mapped, _embDim));
+                    _gpu.UnmapPinned(_gpuFallbackContrib!);
+                }
+            }
+            // _gpuFallbackContrib is HOST_COHERENT — host writes are visible to device.
+            // A compute barrier ensures any prior GPU writes complete before we add the fallback.
+            _gpu.RecordBarrier();
+            _gpu.AddInPlace(_gpuHidden, _gpuFallbackContrib!);
+            _gpu.RecordBarrier();
+        }
+
         if (_hasSharedExpert)
             _gpu.AddInPlace(_gpuHidden, _gpuMoeSharedOut!);
+    }
+
+    private unsafe void GpuMoeFfnCpuFallback(int layer, ReadOnlySpan<int> selectedExperts,
+        ReadOnlySpan<float> expertWeights, ReadOnlySpan<bool> isGpu, int numActive, float* normPtr)
+    {
+        // Lazily allocate CPU scratch arrays.
+        _cpuFallbackBuf ??= new float[_embDim];
+        _cpuFallbackGate ??= new float[_expertDim];
+        _cpuFallbackUp ??= new float[_expertDim];
+
+        Array.Clear(_cpuFallbackBuf);
+
+        // Resolve mmap weight refs for this layer's expert tensors.
+        var wGateExps = ResolveCpuWeight($"blk.{layer}.ffn_gate_exps.weight");
+        var wUpExps   = ResolveCpuWeight($"blk.{layer}.ffn_up_exps.weight");
+        var wDownExps = ResolveCpuWeight($"blk.{layer}.ffn_down_exps.weight");
+
+        fixed (float* fallbackPtr = _cpuFallbackBuf)
+        fixed (float* gatePtr = _cpuFallbackGate)
+        fixed (float* upPtr = _cpuFallbackUp)
+        {
+            for (int i = 0; i < numActive; i++)
+            {
+                if (isGpu[i]) continue;
+                int expertIdx = selectedExperts[i];
+                float weight = expertWeights[i];
+
+                ExpertMatVec(gatePtr, wGateExps, expertIdx, _expertDim, _embDim, normPtr);
+                ExpertMatVec(upPtr,   wUpExps,   expertIdx, _expertDim, _embDim, normPtr);
+                SimdKernels.SiLuMul(gatePtr, upPtr, _expertDim);
+                ExpertMatVecDown(fallbackPtr, wDownExps, expertIdx, _embDim, _expertDim, gatePtr, weight);
+            }
+        }
     }
 
     private Tensor[] UploadExpertWeights(string name, int rows, int cols, int expertCount)
@@ -1300,9 +1427,7 @@ public sealed unsafe class HybridForwardPass : IDisposable
             if (_isMoE)
             {
                 _gpu.Free(_gpuWGateInp![i]);
-                foreach (var t in _gpuWGateExps![i]) _gpu.Free(t);
-                foreach (var t in _gpuWUpExps![i]) _gpu.Free(t);
-                foreach (var t in _gpuWDownExps![i]) _gpu.Free(t);
+                // Expert tensors are managed by ExpertSlotManager — freed in _expertSlotManager.Dispose()
                 if (_hasSharedExpert)
                 {
                     _gpu.Free(_gpuWGateShexp![i]);
@@ -1353,5 +1478,9 @@ public sealed unsafe class HybridForwardPass : IDisposable
         if (_cpuDecompBuf != null) NativeMemory.Free(_cpuDecompBuf);
         _cpuKvCache.Dispose();
         _cpuTqKvCache?.Dispose();
+        _prefetcher?.Dispose();
+        _expertSlotManager?.Dispose();
+        if (_gpuFallbackContrib is not null) _gpu.Free(_gpuFallbackContrib);
+        if (_gpuPinnedNorm is not null) _gpu.Free(_gpuPinnedNorm);
     }
 }

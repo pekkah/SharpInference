@@ -11,8 +11,8 @@ namespace SharpInference.Bench;
 // only keeps one large model resident at a time.
 
 [MemoryDiagnoser]
-[WarmupCount(2)]
-[IterationCount(10)]
+[WarmupCount(1)]
+[IterationCount(3)]
 public class SmolLM2CpuBenchmarks
 {
     private GgufModel _model = null!;
@@ -95,7 +95,7 @@ public class SmolLM2CpuBenchmarks
 
 [MemoryDiagnoser]
 [WarmupCount(1)]
-[IterationCount(5)]
+[IterationCount(3)]
 public class SmolLM2GpuDecodeBenchmark
 {
     private GgufModel _model = null!;
@@ -158,7 +158,7 @@ public class SmolLM2GpuDecodeBenchmark
 
 [MemoryDiagnoser]
 [WarmupCount(1)]
-[IterationCount(5)]
+[IterationCount(3)]
 public class Qwen3CpuBenchmarks
 {
     private GgufModel _model = null!;
@@ -231,7 +231,7 @@ public class Qwen3CpuBenchmarks
 
 [MemoryDiagnoser]
 [WarmupCount(1)]
-[IterationCount(5)]
+[IterationCount(3)]
 public class Qwen3GpuDecodeBenchmark
 {
     private GgufModel _model = null!;
@@ -294,7 +294,7 @@ public class Qwen3GpuDecodeBenchmark
 
 [MemoryDiagnoser]
 [WarmupCount(1)]
-[IterationCount(5)]
+[IterationCount(3)]
 public class Qwen3TqCpuBenchmark
 {
     private GgufModel _model = null!;
@@ -388,7 +388,7 @@ public class Qwen3TqCpuBenchmark
 
 [MemoryDiagnoser]
 [WarmupCount(1)]
-[IterationCount(5)]
+[IterationCount(3)]
 public class Qwen3TqGpuBenchmark
 {
     private GgufModel _model = null!;
@@ -456,7 +456,7 @@ public class Qwen3TqGpuBenchmark
 
 [MemoryDiagnoser]
 [WarmupCount(1)]
-[IterationCount(5)]
+[IterationCount(3)]
 public class Qwen3TqGpuDecodeBenchmark
 {
     private GgufModel _model = null!;
@@ -1080,7 +1080,7 @@ public class Llama4ScoutHybridTqBenchmark
 
 [MemoryDiagnoser]
 [WarmupCount(1)]
-[IterationCount(5)]
+[IterationCount(3)]
 public unsafe class Llama4ScoutMoeMicroBenchmarks
 {
     private GgufModel _model = null!;
@@ -1297,6 +1297,206 @@ public unsafe class Llama4ScoutMoeMicroBenchmarks
 
     private static float* Alloc(int count) =>
         (float*)NativeMemory.AllocZeroed((nuint)count, (nuint)sizeof(float));
+}
+
+/// <summary>
+/// Speculative decoding benchmark: SmolLM2-1.7B as target, SmolLM2-360M as draft.
+/// Sweeps lookahead k and MinBatchForBlas threshold to find the best configuration.
+/// Skipped automatically when either model file is not present in models/.
+/// </summary>
+[MemoryDiagnoser]
+[WarmupCount(1)]
+[IterationCount(3)]
+public class SpeculativeDecodingBenchmark
+{
+    private GgufModel _targetModel = null!;
+    private GgufModel _draftModel = null!;
+    private CpuBackend _backend = null!;
+    private ForwardPass _target = null!;
+    private ForwardPass _draft = null!;
+    private IReadOnlyList<int> _promptTokens = null!;
+    private bool _skip;
+
+    private const string TargetModelFile = "SmolLM2-1.7B-Instruct-Q4_K_M.gguf";
+    private const string DraftModelFile  = "SmolLM2-360M-Instruct-Q4_K_M.gguf";
+
+    [Params(4, 8)]
+    public int Lookahead { get; set; }
+
+    [Params(1, 4, 8, 32)]
+    public int MinBatchBlas { get; set; }
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        var targetPath = BenchmarkHelper.FindModelPath(TargetModelFile);
+        var draftPath  = BenchmarkHelper.FindModelPath(DraftModelFile);
+
+        if (targetPath is null || draftPath is null)
+        {
+            Console.Error.WriteLine(
+                $"[SpeculativeDecodingBenchmark] Skipping: {TargetModelFile} or {DraftModelFile} not found in models/");
+            _skip = true;
+            return;
+        }
+
+        _backend = new CpuBackend();
+
+        _targetModel = GgufModel.Open(targetPath);
+        var targetHp = ModelHyperparams.FromGgufMetadata(_targetModel.Metadata);
+        _target = new ForwardPass(_targetModel, _backend, targetHp);
+
+        _draftModel = GgufModel.Open(draftPath);
+        var draftHp = ModelHyperparams.FromGgufMetadata(_draftModel.Metadata);
+        _draft = new ForwardPass(_draftModel, _backend, draftHp);
+
+        _promptTokens = GgufTokenizer.FromGgufModel(_targetModel).Encode(
+            "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n");
+
+        Console.Error.WriteLine(
+            $"[SpeculativeDecodingBenchmark] Target: {targetHp.NumLayers}L {targetHp.EmbeddingDim}d, " +
+            $"Draft: {draftHp.NumLayers}L {draftHp.EmbeddingDim}d");
+    }
+
+    [IterationSetup(Targets = [nameof(DecodeBaseline), nameof(DecodeSpeculative)])]
+    public void IterSetup()
+    {
+        if (_skip) return;
+        SimdKernels.MinBatchForBlas = MinBatchBlas;
+        _target.Cache.Reset();
+        _draft.Cache.Reset();
+        for (int i = 0; i < _promptTokens.Count; i++)
+        {
+            _target.Forward(_promptTokens[i], i);
+            _draft.Forward(_promptTokens[i], i);
+        }
+    }
+
+    [Benchmark(Baseline = true, Description = "Greedy baseline 32t")]
+    public int DecodeBaseline()
+    {
+        if (_skip) return -1;
+        ReadOnlySpan<float> logits = _target.Forward(
+            Sampler.Greedy(_target.Forward(_promptTokens[^1], _promptTokens.Count - 1)),
+            _promptTokens.Count);
+        int token = Sampler.Greedy(logits);
+        int pos = _promptTokens.Count + 1;
+        for (int i = 1; i < 32; i++)
+        {
+            logits = _target.Forward(token, pos++);
+            token = Sampler.Greedy(logits);
+        }
+        return token;
+    }
+
+    [Benchmark(Description = "Speculative 32t")]
+    public int DecodeSpeculative()
+    {
+        if (_skip) return -1;
+
+        var targetLogits = _target.Forward(_promptTokens[^1], _promptTokens.Count - 1);
+        var draftLogits  = _draft.Forward(_promptTokens[^1], _promptTokens.Count - 1);
+
+        var spec = new SpeculativeDecoder(_target, _draft, lookahead: Lookahead);
+        spec.Initialize(_promptTokens.Count, targetLogits, draftLogits);
+
+        int lastToken = -1;
+        spec.Decode(32, [], token => { lastToken = token; });
+        return lastToken;
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        if (_skip) return;
+        _target.Dispose();
+        _draft.Dispose();
+        _backend.Dispose();
+        _targetModel.Dispose();
+        _draftModel.Dispose();
+    }
+}
+
+/// <summary>
+/// Micro-benchmark for MatMulBatched at typical transformer weight dimensions.
+/// Compares sequential MatVec vs OpenBLAS SGEMM path at different batch sizes.
+/// Uses SmolLM2-1.7B FFN gate weight: [8192 × 2048] Q4_K_M.
+/// </summary>
+[WarmupCount(2)]
+[IterationCount(5)]
+public unsafe class MatMulBatchedThresholdBenchmark
+{
+    private GgufModel _model = null!;
+    private CpuBackend _backend = null!;
+    private byte* _weights;
+    private float* _input;
+    private float* _output;
+    private int _rows, _cols;
+    private DType _dtype;
+    private bool _skip;
+
+    private const string ModelFile = "SmolLM2-1.7B-Instruct-Q4_K_M.gguf";
+
+    [Params(1, 2, 4, 8, 16, 32)]
+    public int BatchSize { get; set; }
+
+    [Params(false, true)]
+    public bool UseBlas { get; set; }
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        var path = BenchmarkHelper.FindModelPath(ModelFile);
+        if (path is null) { _skip = true; return; }
+
+        _model = GgufModel.Open(path);
+        _backend = new CpuBackend();
+
+        // Use FFN gate weight of first layer: [intermediate_dim × embed_dim]
+        const string tensorName = "blk.0.ffn_gate.weight";
+        var info = _model.FindTensor(tensorName);
+        if (info is null) { _skip = true; return; }
+
+        _weights = _model.GetTensorDataPtr(info.Value);
+        _dtype   = info.Value.DType;
+        _rows    = (int)info.Value.Dimensions[0];
+        _cols    = (int)info.Value.Dimensions[1];
+
+        _input  = (float*)NativeMemory.AllocZeroed((nuint)(32 * _cols * sizeof(float)));
+        _output = (float*)NativeMemory.AllocZeroed((nuint)(32 * _rows * sizeof(float)));
+
+        // Fill input with small values
+        var rng = new Random(42);
+        for (int i = 0; i < 32 * _cols; i++)
+            _input[i] = (float)(rng.NextDouble() * 0.1);
+
+        Console.Error.WriteLine($"[MatMulBatched] {tensorName}: [{_rows}×{_cols}] {_dtype}");
+    }
+
+    [IterationSetup]
+    public void IterSetup()
+    {
+        if (_skip) return;
+        SimdKernels.MinBatchForBlas = UseBlas ? 1 : int.MaxValue;
+    }
+
+    [Benchmark]
+    public float MatMulBatch()
+    {
+        if (_skip) return 0f;
+        SimdKernels.MatMulBatched(_output, _weights, _input, BatchSize, _rows, _cols, _dtype);
+        return _output[0];
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        if (_skip) return;
+        if (_input  != null) NativeMemory.Free(_input);
+        if (_output != null) NativeMemory.Free(_output);
+        _backend.Dispose();
+        _model.Dispose();
+    }
 }
 
 internal static class BenchmarkHelper

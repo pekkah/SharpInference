@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Threading;
 using Vortice.Vulkan;
 using SharpInference.Core;
 using static Vortice.Vulkan.Vulkan;
@@ -21,8 +23,22 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private readonly VkPhysicalDeviceProperties _deviceProperties;
     private readonly VkPhysicalDeviceMemoryProperties _memoryProperties;
     private readonly VkCommandPool _commandPool;
-    private readonly VkCommandBuffer _transferCmd; // single-use for staging transfers
-    private readonly VkFence _fence; // reusable fence for submission synchronization
+    private readonly VkCommandBuffer _transferCmd; // main-thread staging transfers
+    private readonly VkFence _fence; // main-thread fence
+
+    // Separate command pool/buffer/fence for background (prefetcher) uploads.
+    // Vulkan requires all cmd buffer operations from a single thread per pool;
+    // giving the prefetcher its own pool makes concurrent uploads safe.
+    private readonly VkCommandPool _asyncPool;
+    private readonly VkCommandBuffer _asyncCmd;
+    private readonly VkFence _asyncFence;
+    private GpuBuffer? _asyncStaging;
+    private ulong _asyncStagingSize;
+    private readonly object _asyncCmdLock = new(); // serializes concurrent UploadBackground calls
+
+    // Serializes vkQueueSubmit from both main and background threads.
+    private readonly object _queueLock = new();
+
     private bool _disposed;
 
     public string Name { get; }
@@ -103,8 +119,25 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         VkCommandBuffer cmd = _transferCmd;
         VkSubmitInfo submit = new() { commandBufferCount = 1, pCommandBuffers = &cmd };
         var fence = _fence;
-        _vkd.vkResetFences(1, &fence).CheckResult();
-        _vkd.vkQueueSubmit(_computeQueue, 1, &submit, _fence).CheckResult();
+        lock (_queueLock)
+        {
+            _vkd.vkResetFences(1, &fence).CheckResult();
+            _vkd.vkQueueSubmit(_computeQueue, 1, &submit, _fence).CheckResult();
+        }
+        _vkd.vkWaitForFences(1, &fence, true, ulong.MaxValue).CheckResult();
+    }
+
+    /// <summary>Submit the async command buffer (background thread) and wait via its fence.</summary>
+    private void SubmitAndWaitAsync()
+    {
+        VkCommandBuffer cmd = _asyncCmd;
+        VkSubmitInfo submit = new() { commandBufferCount = 1, pCommandBuffers = &cmd };
+        var fence = _asyncFence;
+        lock (_queueLock)
+        {
+            _vkd.vkResetFences(1, &fence).CheckResult();
+            _vkd.vkQueueSubmit(_computeQueue, 1, &submit, _asyncFence).CheckResult();
+        }
         _vkd.vkWaitForFences(1, &fence, true, ulong.MaxValue).CheckResult();
     }
 
@@ -184,6 +217,31 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         VkFence fence;
         _vkd.vkCreateFence(&fenceCI, null, &fence).CheckResult();
         _fence = fence;
+
+        // 9. Create a separate command pool + buffer + fence for background (prefetcher) uploads.
+        VkCommandPoolCreateInfo asyncPoolCI = new()
+        {
+            flags = VkCommandPoolCreateFlags.ResetCommandBuffer,
+            queueFamilyIndex = _computeQueueFamily,
+        };
+        VkCommandPool asyncPool;
+        _vkd.vkCreateCommandPool(&asyncPoolCI, null, &asyncPool).CheckResult();
+        _asyncPool = asyncPool;
+
+        VkCommandBufferAllocateInfo asyncCmdAllocInfo = new()
+        {
+            commandPool = _asyncPool,
+            level = VkCommandBufferLevel.Primary,
+            commandBufferCount = 1,
+        };
+        VkCommandBuffer asyncCmd;
+        _vkd.vkAllocateCommandBuffers(&asyncCmdAllocInfo, &asyncCmd).CheckResult();
+        _asyncCmd = asyncCmd;
+
+        VkFenceCreateInfo asyncFenceCI = new();
+        VkFence asyncFence;
+        _vkd.vkCreateFence(&asyncFenceCI, null, &asyncFence).CheckResult();
+        _asyncFence = asyncFence;
     }
 
     /// <summary>Print device info to console.</summary>
@@ -329,8 +387,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     //  Buffer tracking: Tensor.Handle → GpuBuffer
     // ================================================================
 
-    private readonly Dictionary<nint, GpuBuffer> _buffers = new();
-    private nint _nextHandle = 1;
+    private readonly ConcurrentDictionary<nint, GpuBuffer> _buffers = new();
+    private long _nextHandle = 1;
 
     public GpuBuffer GetBuffer(Tensor tensor) =>
         _buffers.TryGetValue(tensor.Handle, out var buf)
@@ -352,14 +410,14 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         var gpuBuf = GpuBuffer.CreateDeviceLocal(this, byteSize,
             VkBufferUsageFlags.StorageBuffer | VkBufferUsageFlags.TransferSrc | VkBufferUsageFlags.TransferDst);
 
-        var handle = _nextHandle++;
+        var handle = (nint)Interlocked.Increment(ref _nextHandle);
         _buffers[handle] = gpuBuf;
         return new Tensor(shape, dtype, handle);
     }
 
     public void Free(Tensor tensor)
     {
-        if (_buffers.Remove(tensor.Handle, out var buf))
+        if (_buffers.TryRemove(tensor.Handle, out var buf))
             buf.Dispose();
     }
 
@@ -373,15 +431,12 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         ulong byteSize = (ulong)(shape.ElementCount * DTypeInfo.BytesPerElement(dtype));
         var gpuBuf = GpuBuffer.CreatePinned(this, byteSize, VkBufferUsageFlags.StorageBuffer);
 
-        var handle = _nextHandle++;
+        var handle = (nint)Interlocked.Increment(ref _nextHandle);
         _buffers[handle] = gpuBuf;
         return new Tensor(shape, dtype, handle);
     }
 
-    /// <summary>
-    /// Map a pinned tensor for CPU access. Returns a float pointer.
-    /// Only valid for tensors created with AllocatePinned.
-    /// </summary>
+    /// <summary>Unmap a previously mapped pinned tensor.</summary>
     public unsafe float* MapPinned(Tensor tensor)
     {
         var buf = GetBuffer(tensor);
@@ -424,7 +479,45 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         // Record and submit copy command
         CopyBuffer(_uploadStaging, gpuBuf, byteSize);
 
-        var handle = _nextHandle++;
+        var handle = (nint)Interlocked.Increment(ref _nextHandle);
+        _buffers[handle] = gpuBuf;
+        return new Tensor(shape, DType.Float32, handle);
+    }
+
+    /// <summary>
+    /// Upload data to a new device-local GPU buffer using the background (async) command buffer.
+    /// Safe to call from a background thread concurrently with the main thread's recording session.
+    /// Uses a dedicated command pool isolated from the main-thread <c>_transferCmd</c>.
+    /// </summary>
+    public unsafe Tensor UploadBackground(ReadOnlySpan<float> data, TensorShape shape)
+    {
+        ulong byteSize = (ulong)(data.Length * sizeof(float));
+
+        var gpuBuf = GpuBuffer.CreateDeviceLocal(this, byteSize,
+            VkBufferUsageFlags.StorageBuffer | VkBufferUsageFlags.TransferDst);
+
+        lock (_asyncCmdLock)
+        {
+            if (_asyncStaging == null || _asyncStagingSize < byteSize)
+            {
+                _asyncStaging?.Dispose();
+                _asyncStaging = GpuBuffer.CreateStaging(this, byteSize, VkBufferUsageFlags.TransferSrc);
+                _asyncStagingSize = byteSize;
+            }
+
+            float* mapped = (float*)_asyncStaging.Map();
+            data.CopyTo(new Span<float>(mapped, data.Length));
+            _asyncStaging.Unmap();
+
+            VkCommandBufferBeginInfo beginInfo = new() { flags = VkCommandBufferUsageFlags.OneTimeSubmit };
+            _vkd.vkBeginCommandBuffer(_asyncCmd, &beginInfo).CheckResult();
+            VkBufferCopy region = new() { size = byteSize };
+            _vkd.vkCmdCopyBuffer(_asyncCmd, _asyncStaging.Buffer, gpuBuf.Buffer, 1, &region);
+            _vkd.vkEndCommandBuffer(_asyncCmd).CheckResult();
+            SubmitAndWaitAsync();
+        }
+
+        var handle = (nint)Interlocked.Increment(ref _nextHandle);
         _buffers[handle] = gpuBuf;
         return new Tensor(shape, DType.Float32, handle);
     }
@@ -742,6 +835,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
 
         _downloadStaging?.Dispose();
         _uploadStaging?.Dispose();
+        _asyncStaging?.Dispose();
 
         // Free all tracked GPU buffers
         foreach (var buf in _buffers.Values)
@@ -749,7 +843,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _buffers.Clear();
 
         _vkd.vkDestroyFence(_fence, null);
+        _vkd.vkDestroyFence(_asyncFence, null);
         _vkd.vkDestroyCommandPool(_commandPool, null);
+        _vkd.vkDestroyCommandPool(_asyncPool, null);
         _vkd.vkDestroyDevice(null);
         _vki.vkDestroyInstance(null);
     }

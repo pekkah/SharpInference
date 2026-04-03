@@ -219,6 +219,21 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     }
 
     /// <summary>
+    /// Truncates the cache to the given length, which must fall within the FP32 window
+    /// (i.e., length >= TqLength). Positions in the compressed TQ region cannot be undone.
+    /// Throws <see cref="NotSupportedException"/> if length would truncate into TQ-compressed data.
+    /// </summary>
+    public void TruncateTo(int length)
+    {
+        int tqLen = TqLength;
+        if (length < tqLen)
+            throw new NotSupportedException(
+                $"TruncateTo({length}) cannot truncate into TQ-compressed region (tqLength={tqLen}). " +
+                "Speculative decoding is not supported when truncation would enter the compressed range.");
+        _totalLength = length;
+    }
+
+    /// <summary>
     /// Reports estimated memory usage in bytes.
     /// </summary>
     public long EstimatedMemoryBytes()

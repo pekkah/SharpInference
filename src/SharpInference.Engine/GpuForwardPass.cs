@@ -16,7 +16,7 @@ namespace SharpInference.Engine;
 /// For operations not yet GPU-accelerated (attention scoring/aggregation),
 /// falls back to CPU with download/upload round-trips.
 /// </summary>
-public sealed unsafe class GpuForwardPass : IDisposable
+public sealed unsafe class GpuForwardPass : IForwardPass
 {
     private readonly VulkanBackend _gpu;
     private readonly GgufModel _model;
@@ -67,6 +67,22 @@ public sealed unsafe class GpuForwardPass : IDisposable
 
     /// <summary>Maximum sequence length (context size) configured for this forward pass.</summary>
     public int MaxSeqLen => _maxSeqLen;
+
+    /// <summary>Vocabulary size of this model.</summary>
+    public int VocabSize => _hp.VocabSize;
+
+    /// <summary>
+    /// Truncate the KV cache to the given length, discarding positions >= length.
+    /// Used by speculative decoding to rewind rejected draft tokens.
+    /// The GPU K/V cache is updated via the length counter (_kvLength); no VRAM data is erased
+    /// since subsequent appends will overwrite those positions.
+    /// </summary>
+    public void TruncateTo(int length)
+    {
+        _kvLength = length;
+        _tqCompressedLen = Math.Min(_tqCompressedLen, length);
+        _kvCache.TruncateTo(length);
+    }
 
     // CPU KV cache kept for fallback (not used when GPU attention works)
     private readonly Engine.KvCache _kvCache;

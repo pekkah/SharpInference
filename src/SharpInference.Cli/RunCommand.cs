@@ -88,10 +88,27 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [Description("Enable TurboQuant KV cache compression (3-bit, reduces VRAM ~5x)")]
         [DefaultValue(false)]
         public bool TurboQuant { get; init; }
+
+        [CommandOption("--draft-model")]
+        [Description("Path to a smaller draft model for speculative decoding (greedy only, requires --temp 0)")]
+        public string? DraftModelPath { get; init; }
+
+        [CommandOption("--spec-lookahead")]
+        [Description("Number of draft tokens per speculative step (default: 4)")]
+        [DefaultValue(4)]
+        public int SpecLookahead { get; init; }
+
+        [CommandOption("--min-batch-blas")]
+        [Description("Minimum batch size to use OpenBLAS SGEMM in MatMulBatched (default: 16, crossover for Q4_K_M weights). Also settable via SHARPI_MIN_BATCH_BLAS env var.")]
+        [DefaultValue(0)]
+        public int MinBatchBlas { get; init; }
     }
 
     protected override int Execute(CommandContext context, Settings settings, CancellationToken cancellation)
     {
+        if (settings.MinBatchBlas > 0)
+            SimdKernels.MinBatchForBlas = settings.MinBatchBlas;
+
         var modelPath = settings.ModelPath;
         if (modelPath is null)
         {
@@ -212,6 +229,50 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         };
         var rng = settings.Seed >= 0 ? new Random(settings.Seed) : new Random();
 
+        // Speculative decoding path (requires --draft-model and --temp 0)
+        if (settings.DraftModelPath is not null)
+        {
+            if (settings.Temperature > 0f)
+            {
+                AnsiConsole.MarkupLine("[yellow]Warning:[/] Speculative decoding requires greedy sampling (--temp 0). Falling back to normal generation.");
+            }
+            else if (nGpuLayers != 0)
+            {
+                AnsiConsole.MarkupLine("[yellow]Warning:[/] Speculative decoding is only supported for CPU (--n-gpu-layers 0). Falling back to normal generation.");
+            }
+            else if (!File.Exists(settings.DraftModelPath))
+            {
+                AnsiConsole.MarkupLine($"[red]Error:[/] Draft model not found: {settings.DraftModelPath}");
+                return 1;
+            }
+            else
+            {
+                try
+                {
+                    AnsiConsole.MarkupLine($"[dim]Loading draft model:[/] {settings.DraftModelPath}");
+                    using var draftModel = GgufModel.Open(settings.DraftModelPath);
+                    var draftHp = ModelHyperparams.FromGgufMetadata(draftModel.Metadata, draftModel);
+                    using var draftCpuBackend = new CpuBackend();
+                    using var draftFwd = new ForwardPass(draftModel, draftCpuBackend, draftHp);
+                    AnsiConsole.MarkupLine($"[dim]Draft model: {draftHp.NumLayers}L, {draftHp.EmbeddingDim}d | Lookahead k={settings.SpecLookahead}[/]");
+
+                    if (settings.Prompt is not null)
+                        return RunSpeculativeSinglePrompt(settings, fwd, draftFwd, tokenizer, sp);
+                    return RunSpeculativeInteractive(settings, fwd, draftFwd, tokenizer, sp);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine(ex);
+                    return 1;
+                }
+                finally
+                {
+                    gpuFwd?.Dispose();
+                    gpuBackend?.Dispose();
+                }
+            }
+        }
+
         try
         {
             if (settings.Prompt is not null)
@@ -228,6 +289,94 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             gpuFwd?.Dispose();
             gpuBackend?.Dispose();
         }
+    }
+
+    private static int RunSpeculativeSinglePrompt(Settings s,
+        ForwardPass target, ForwardPass draft,
+        GgufTokenizer tok, SamplingParams sp)
+    {
+        var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt);
+        var tokens = tok.Encode(prompt);
+
+        if (!s.NoDisplayPrompt)
+            Console.Write(s.Prompt);
+
+        var sw = Stopwatch.StartNew();
+        // Prefill both models with the same prompt
+        ReadOnlySpan<float> targetLogits = default;
+        ReadOnlySpan<float> draftLogits = default;
+        for (int i = 0; i < tokens.Count; i++)
+        {
+            targetLogits = target.Forward(tokens[i], i);
+            draftLogits = draft.Forward(tokens[i], i);
+        }
+        var prefillMs = sw.Elapsed.TotalMilliseconds;
+
+        var spec = new SpeculativeDecoder(target, draft, s.SpecLookahead);
+        spec.Initialize(tokens.Count, targetLogits, draftLogits);
+
+        sw.Restart();
+        int generated = 0;
+        spec.Decode(sp.MaxNewTokens, sp.StopTokenIds ?? [], token =>
+        {
+            Console.Write(tok.Decode([token]));
+            generated++;
+        });
+        var decodeMs = sw.Elapsed.TotalMilliseconds;
+
+        Console.WriteLine();
+        AnsiConsole.MarkupLine($"\n[dim]Prefill: {tokens.Count} tokens, {tokens.Count / (prefillMs / 1000):F1} t/s | " +
+            $"Decode: {generated} tokens, {generated / (decodeMs / 1000):F1} t/s | " +
+            $"Acceptance rate: {spec.AcceptanceRate:P0}[/]");
+        return 0;
+    }
+
+    private static int RunSpeculativeInteractive(Settings s,
+        ForwardPass target, ForwardPass draft,
+        GgufTokenizer tok, SamplingParams sp)
+    {
+        AnsiConsole.MarkupLine("[green]Interactive chat (speculative decoding).[/] Type a message, or [yellow]/exit[/] to quit.\n");
+        var spec = new SpeculativeDecoder(target, draft, s.SpecLookahead);
+
+        while (true)
+        {
+            AnsiConsole.Markup("[bold]> [/]");
+            var input = Console.ReadLine();
+            if (input is null or "/exit" or "/quit") break;
+            if (string.IsNullOrWhiteSpace(input)) continue;
+
+            var prompt = FormatPrompt(input, s.SystemPrompt);
+            var tokens = tok.Encode(prompt);
+
+            target.Cache.Reset();
+            draft.Cache.Reset();
+
+            ReadOnlySpan<float> targetLogits = default;
+            ReadOnlySpan<float> draftLogits = default;
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < tokens.Count; i++)
+            {
+                targetLogits = target.Forward(tokens[i], i);
+                draftLogits = draft.Forward(tokens[i], i);
+            }
+
+            spec.Initialize(tokens.Count, targetLogits, draftLogits);
+
+            sw.Restart();
+            int generated = 0;
+            spec.Decode(sp.MaxNewTokens, sp.StopTokenIds ?? [], token =>
+            {
+                Console.Write(tok.Decode([token]));
+                generated++;
+            });
+            var decodeMs = sw.Elapsed.TotalMilliseconds;
+
+            Console.WriteLine();
+            AnsiConsole.MarkupLine($"[dim]{generated} tokens, {generated / (decodeMs / 1000):F1} t/s | Accept: {spec.AcceptanceRate:P0}[/]\n");
+
+            if (s.SingleTurn) break;
+        }
+        return 0;
     }
 
     private static int RunSinglePrompt(Settings s,

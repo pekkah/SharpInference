@@ -94,6 +94,13 @@ public sealed unsafe class KvCache : IDisposable
     /// <summary>Resets the cache for a new generation.</summary>
     public void Reset() => _length = 0;
 
+    /// <summary>
+    /// Truncates (or restores) the cache to the given length.
+    /// Data at positions >= length is implicitly discarded and will be overwritten on next append.
+    /// Also used internally by batched verification to set the starting position per layer.
+    /// </summary>
+    public void TruncateTo(int length) => _length = length;
+
     public void Dispose()
     {
         if (_disposed) return;

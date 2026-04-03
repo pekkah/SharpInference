@@ -1,0 +1,105 @@
+using System.Text;
+
+namespace SharpInference.Pipeline;
+
+/// <summary>
+/// Tracks per-(layer, expert) hit and miss counts for the expert slot cache.
+/// Used to identify hot experts and measure cache effectiveness.
+/// All counter updates are thread-safe via Interlocked.
+/// </summary>
+public sealed class ExpertAccessProfiler
+{
+    private readonly int _numLayers;
+    private readonly int _numExperts;
+    private readonly long[] _hits;   // [layer * numExperts + expertId]
+    private readonly long[] _misses; // same layout
+    private long _totalHits;
+    private long _totalMisses;
+
+    public ExpertAccessProfiler(int numLayers, int numExperts)
+    {
+        if (numLayers <= 0) throw new ArgumentOutOfRangeException(nameof(numLayers));
+        if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
+        _numLayers = numLayers;
+        _numExperts = numExperts;
+        _hits = new long[numLayers * numExperts];
+        _misses = new long[numLayers * numExperts];
+    }
+
+    public void RecordHit(int layer, int expertId)
+    {
+        Interlocked.Increment(ref _hits[layer * _numExperts + expertId]);
+        Interlocked.Increment(ref _totalHits);
+    }
+
+    public void RecordMiss(int layer, int expertId)
+    {
+        Interlocked.Increment(ref _misses[layer * _numExperts + expertId]);
+        Interlocked.Increment(ref _totalMisses);
+    }
+
+    public long TotalHits => Interlocked.Read(ref _totalHits);
+    public long TotalMisses => Interlocked.Read(ref _totalMisses);
+
+    public double OverallHitRate
+    {
+        get
+        {
+            long total = TotalHits + TotalMisses;
+            return total == 0 ? 0.0 : (double)TotalHits / total;
+        }
+    }
+
+    /// <summary>Hit rate for a specific layer (all experts combined).</summary>
+    public double GetLayerHitRate(int layer)
+    {
+        long hits = 0, misses = 0;
+        int offset = layer * _numExperts;
+        for (int e = 0; e < _numExperts; e++)
+        {
+            hits += Interlocked.Read(ref _hits[offset + e]);
+            misses += Interlocked.Read(ref _misses[offset + e]);
+        }
+        return (hits + misses) == 0 ? 0.0 : (double)hits / (hits + misses);
+    }
+
+    /// <summary>
+    /// Returns the <paramref name="n"/> most-accessed expert IDs for <paramref name="layer"/>,
+    /// sorted descending by total access count (hits + misses).
+    /// </summary>
+    public int[] GetTopExperts(int layer, int n)
+    {
+        int offset = layer * _numExperts;
+        var counts = new (int expertId, long count)[_numExperts];
+        for (int e = 0; e < _numExperts; e++)
+        {
+            long total = Interlocked.Read(ref _hits[offset + e])
+                       + Interlocked.Read(ref _misses[offset + e]);
+            counts[e] = (e, total);
+        }
+        Array.Sort(counts, static (a, b) => b.count.CompareTo(a.count));
+        int take = Math.Min(n, _numExperts);
+        var result = new int[take];
+        for (int i = 0; i < take; i++) result[i] = counts[i].expertId;
+        return result;
+    }
+
+    /// <summary>Write a human-readable summary to <paramref name="output"/>.</summary>
+    public void PrintStats(TextWriter output)
+    {
+        var sb = new StringBuilder();
+        long th = TotalHits, tm = TotalMisses;
+        double rate = (th + tm) == 0 ? 0.0 : (double)th / (th + tm);
+        sb.AppendLine($"[ExpertAccessProfiler] overall hit rate: {rate:P1} ({th} hits / {th + tm} accesses)");
+
+        for (int layer = 0; layer < _numLayers; layer++)
+        {
+            double lr = GetLayerHitRate(layer);
+            var top = GetTopExperts(layer, 3);
+            string topStr = string.Join(", ", top);
+            sb.AppendLine($"  layer {layer,3}: hit {lr:P1}  top experts: [{topStr}]");
+        }
+
+        output.Write(sb.ToString());
+    }
+}

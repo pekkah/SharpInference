@@ -1,43 +1,64 @@
-using SharpInference.Core;
-
 namespace SharpInference.Pipeline;
 
 /// <summary>
-/// LRU cache for Mixture-of-Experts expert weights.
-/// Tracks access frequency across recent tokens to keep hot experts GPU-resident.
+/// SLRU cache for Mixture-of-Experts expert weights.
+/// Maps (layer, expertId) keys to cached values of type <typeparamref name="T"/>.
+/// Exploits MoE routing skew (~20% of experts handle ~80% of tokens):
+/// frequently accessed experts migrate to the protected segment and resist eviction.
 /// </summary>
-public sealed class ExpertCache : IDisposable
+/// <typeparam name="T">Cached value type (e.g. a GPU tensor handle struct).</typeparam>
+public sealed class ExpertCache<T> : IDisposable
 {
-    private readonly int _capacity;
-    private readonly Dictionary<int, CachedExpert> _cache = [];
-    private readonly LinkedList<int> _lruList = [];
+    private readonly SlruCache<(int Layer, int ExpertId), T> _slru;
+    private Action<T>? _onEvict;
 
-    public ExpertCache(int capacity) => _capacity = capacity;
-
-    public bool TryGet(int expertId, out Tensor? weights)
+    /// <param name="capacity">Total number of expert slots the cache can hold.</param>
+    /// <param name="onEvict">
+    /// Optional callback invoked with the evicted value so the caller can release
+    /// any associated GPU resources.
+    /// </param>
+    public ExpertCache(int capacity, Action<T>? onEvict = null)
     {
-        if (_cache.TryGetValue(expertId, out var entry))
-        {
-            _lruList.Remove(entry.LruNode);
-            _lruList.AddFirst(entry.LruNode);
-            weights = entry.Weights;
-            return true;
-        }
-        weights = null;
-        return false;
+        if (capacity <= 0) throw new ArgumentOutOfRangeException(nameof(capacity));
+        // Split: 25% probationary, 75% protected — biased toward retention since routing is skewed.
+        int probCap = Math.Max(1, capacity / 4);
+        int protCap = Math.Max(1, capacity - probCap);
+        _slru = new SlruCache<(int, int), T>(probCap, protCap);
+        _onEvict = onEvict;
     }
 
-    public void Put(int expertId, Tensor weights)
+    public int Count => _slru.Count;
+
+    /// <summary>Look up the cached value for (<paramref name="layer"/>, <paramref name="expertId"/>).</summary>
+    public bool TryGet(int layer, int expertId, out T value) =>
+        _slru.TryGet((layer, expertId), out value);
+
+    /// <summary>
+    /// Insert a value for (<paramref name="layer"/>, <paramref name="expertId"/>).
+    /// If capacity is exceeded the LRU probationary entry is evicted; the <see cref="onEvict"/>
+    /// callback is invoked so callers can release GPU resources.
+    /// </summary>
+    public void Put(int layer, int expertId, T value)
     {
-        // TODO: evict LRU expert if at capacity
-        throw new NotImplementedException();
+        if (_slru.Put((layer, expertId), value, out _, out var evicted))
+            _onEvict?.Invoke(evicted);
     }
+
+    public bool Contains(int layer, int expertId) =>
+        _slru.Contains((layer, expertId));
+
+    /// <summary>
+    /// Invoke <paramref name="action"/> for every currently-cached value, then clear the cache.
+    /// Use this in dispose paths to release GPU resources without skipping the evict callback.
+    /// </summary>
+    public void Drain(Action<T> action)
+    {
+        foreach (var value in _slru.Values.ToArray())
+            action(value);
+        _slru.Clear();
+    }
+
+    public void Clear() => _slru.Clear();
 
     public void Dispose() { }
-
-    private sealed class CachedExpert
-    {
-        public required Tensor Weights { get; init; }
-        public required LinkedListNode<int> LruNode { get; init; }
-    }
 }

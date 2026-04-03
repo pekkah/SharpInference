@@ -29,6 +29,18 @@ public static unsafe class SimdKernels
     private static bool s_blasLogged;
 
     /// <summary>
+    /// Minimum batch size to engage OpenBLAS SGEMM in MatMulBatched.
+    /// Below this threshold, sequential fused MatVec (dequant in registers) is used.
+    /// Default 16 is the empirical crossover where SGEMM amortizes F32 dequantization cost
+    /// over the per-token compute (measured on Ryzen 9 7900X with Q4_K_M 8192×2048 weights).
+    /// Override via SHARPI_MIN_BATCH_BLAS environment variable.
+    /// </summary>
+    public static int MinBatchForBlas { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPI_MIN_BATCH_BLAS"), out var v) && v >= 1
+            ? v
+            : 16;
+
+    /// <summary>
     /// Batched matrix multiply: output[batchSize, rows] = input[batchSize, cols] × W[rows, cols]^T
     /// Uses OpenBLAS sgemm when available (dequant weights to F32 temp buffer, then GEMM).
     /// Falls back to sequential MatVec per batch element.
@@ -43,7 +55,6 @@ public static unsafe class SimdKernels
         }
         // For small batches, fused MatVec is faster (no dequant overhead)
         // BLAS only wins when N is large enough to amortize F32 dequantization
-        const int MinBatchForBlas = 32;
 
         if (batchSize < MinBatchForBlas || !BlasInterop.IsAvailable)
         {

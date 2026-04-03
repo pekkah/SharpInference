@@ -19,6 +19,21 @@ public static class Dequantize
             case DType.Float32:
                 MemoryMarshal.Cast<byte, float>(src).Slice(0, (int)elementCount).CopyTo(dst);
                 break;
+            case DType.Float16:
+                DequantF16(src, dst, elementCount);
+                break;
+            case DType.BFloat16:
+                DequantBF16(src, dst, elementCount);
+                break;
+            case DType.Q8_0:
+                DequantQ8_0(src, dst, elementCount);
+                break;
+            case DType.Q4_0:
+                DequantQ4_0(src, dst, elementCount);
+                break;
+            case DType.Q5_0:
+                DequantQ5_0(src, dst, elementCount);
+                break;
             case DType.Q4_K:
                 DequantQ4K(src, dst, elementCount);
                 break;
@@ -349,6 +364,100 @@ public static class Dequantize
                 }
                 qOff += 32;
             }
+        }
+    }
+
+    /// <summary>
+    /// Q4_0 dequantization. Block size = 32, bytes per block = 18.
+    /// Layout: [d:FP16][qs:16 × uint8] — two 4-bit values per byte, signed nibbles.
+    /// Value = (nibble - 8) * d   (range -8..7)
+    /// Reference: dequantize_row_q4_0 in ggml-quants.c
+    /// </summary>
+    private static void DequantQ4_0(ReadOnlySpan<byte> src, Span<float> dst, long elementCount)
+    {
+        const int QK = 32;
+        const int bytesPerBlock = 18; // 2 (FP16 scale) + 16 (32 * 4-bit / 8)
+        long numBlocks = elementCount / QK;
+
+        for (long block = 0; block < numBlocks; block++)
+        {
+            var x = src.Slice((int)(block * bytesPerBlock), bytesPerBlock);
+            float d = HalfToFloat(x[0], x[1]);
+            var y = dst.Slice((int)(block * QK), QK);
+            for (int j = 0; j < QK / 2; j++)
+            {
+                y[j]          = ((x[2 + j] & 0xF) - 8) * d;
+                y[j + QK / 2] = ((x[2 + j] >>  4) - 8) * d;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Q5_0 dequantization. Block size = 32, bytes per block = 22.
+    /// Layout: [d:FP16][qh:4 bytes (high bits)][qs:16 × uint8 (low 4 bits)]
+    /// Value = ((low4 | highBit&lt;&lt;4) - 16) * d   (range -16..15)
+    /// Reference: dequantize_row_q5_0 in ggml-quants.c
+    /// </summary>
+    private static void DequantQ5_0(ReadOnlySpan<byte> src, Span<float> dst, long elementCount)
+    {
+        const int QK = 32;
+        const int bytesPerBlock = 22; // 2 (FP16) + 4 (qh) + 16 (qs)
+        long numBlocks = elementCount / QK;
+
+        for (long block = 0; block < numBlocks; block++)
+        {
+            var x = src.Slice((int)(block * bytesPerBlock), bytesPerBlock);
+            float d = HalfToFloat(x[0], x[1]);
+            uint qh = (uint)(x[2] | (x[3] << 8) | (x[4] << 16) | (x[5] << 24));
+            var y = dst.Slice((int)(block * QK), QK);
+            for (int j = 0; j < QK / 2; j++)
+            {
+                int xh0 = (int)((qh >> j) & 1) << 4;
+                int xh1 = (int)((qh >> (j + 16)) & 1) << 4;
+                int x0 = (x[6 + j] & 0xF) | xh0;
+                int x1 = (x[6 + j] >>  4) | xh1;
+                y[j]          = (x0 - 16) * d;
+                y[j + QK / 2] = (x1 - 16) * d;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Q8_0 dequantization. Block size = 32, bytes per block = 34.
+    /// Layout: [d:FP16][qs:32 × int8]
+    /// Reference: dequantize_row_q8_0 in ggml-quants.c
+    /// </summary>
+    private static void DequantQ8_0(ReadOnlySpan<byte> src, Span<float> dst, long elementCount)
+    {
+        const int QK = 32;
+        const int bytesPerBlock = 34; // 2 (FP16 scale) + 32 (int8 values)
+        long numBlocks = elementCount / QK;
+
+        for (long block = 0; block < numBlocks; block++)
+        {
+            var x = src.Slice((int)(block * bytesPerBlock), bytesPerBlock);
+            float d = HalfToFloat(x[0], x[1]);
+            var y = dst.Slice((int)(block * QK), QK);
+            for (int j = 0; j < QK; j++)
+                y[j] = (sbyte)x[2 + j] * d;
+        }
+    }
+
+    /// <summary>FP16 (IEEE 754 half-precision) dequantization.</summary>
+    private static void DequantF16(ReadOnlySpan<byte> src, Span<float> dst, long elementCount)
+    {
+        var halves = MemoryMarshal.Cast<byte, Half>(src);
+        for (int i = 0; i < (int)elementCount; i++)
+            dst[i] = (float)halves[i];
+    }
+
+    /// <summary>BFloat16 dequantization.</summary>
+    private static void DequantBF16(ReadOnlySpan<byte> src, Span<float> dst, long elementCount)
+    {
+        for (int i = 0; i < (int)elementCount; i++)
+        {
+            ushort bits = (ushort)(src[i * 2] | (src[i * 2 + 1] << 8));
+            dst[i] = BitConverter.Int32BitsToSingle(bits << 16);
         }
     }
 
