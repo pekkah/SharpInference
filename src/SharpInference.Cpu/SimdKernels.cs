@@ -144,20 +144,21 @@ public static unsafe class SimdKernels
         if (rows >= MinRowsForParallel)
         {
             var w = weights; var inp = input; var outp = output;
-            int bpr = bytesPerRow;
-            Parallel.For(0, rows, s_parallelOpts, r =>
-            {
-                // Thread-local dequant buffer (avoid contention)
-                float* rowBuf = (float*)NativeMemory.Alloc((nuint)(cols * sizeof(float)));
-                try
+            int bpr = bytesPerRow; int c = cols;
+            var dt = dtype;
+            Parallel.For(0, rows, s_parallelOpts, () =>
+                (nint)NativeMemory.Alloc((nuint)(c * sizeof(float))),
+                (r, _, bufPtr) =>
                 {
+                    float* rowBuf = (float*)bufPtr;
                     byte* rowPtr = w + (long)r * bpr;
                     Dequantize.ToFloat32(new ReadOnlySpan<byte>(rowPtr, bpr),
-                        new Span<float>(rowBuf, cols), dtype, cols);
-                    outp[r] = DotF32(rowBuf, inp, cols);
-                }
-                finally { NativeMemory.Free(rowBuf); }
-            });
+                        new Span<float>(rowBuf, c), dt, c);
+                    outp[r] = DotF32(rowBuf, inp, c);
+                    return bufPtr;
+                },
+                bufPtr => NativeMemory.Free((void*)bufPtr)
+            );
         }
         else
         {
