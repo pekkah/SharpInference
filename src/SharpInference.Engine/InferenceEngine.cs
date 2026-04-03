@@ -1,62 +1,111 @@
+using System.Runtime.CompilerServices;
+using System.Threading.Channels;
 using SharpInference.Core;
-using SharpInference.Pipeline;
 
 namespace SharpInference.Engine;
 
 /// <summary>
-/// Top-level inference engine. Orchestrates the forward pass, speculative decoding,
-/// sampling, and token streaming across the memory hierarchy.
+/// Top-level inference engine. Wraps a forward pass + tokenizer, applies pre-formatted
+/// prompts (caller applies chat template), and provides serialized async generation.
+/// One request runs at a time; concurrent callers block in arrival order.
 /// </summary>
-public sealed class InferenceEngine : IAsyncDisposable
+public sealed class InferenceEngine : IInferenceEngine, IDisposable
 {
-    private readonly ModelGraph _model;
-    private readonly IComputeBackend _backend;
-    private readonly MemoryHierarchy _memory;
-    private readonly Prefetcher _prefetcher;
-    private readonly KvCache _kvCache;
+    private readonly IForwardPass _fwd;
+    private readonly ITokenizer _tokenizer;
+    private readonly IDisposable[] _owned;
+    private readonly SemaphoreSlim _gate = new(1, 1);
+    private bool _disposed;
 
+    public string ModelId { get; }
+
+    /// <param name="fwd">Forward pass implementation (CPU / GPU / Hybrid). Owned by this engine.</param>
+    /// <param name="tokenizer">Tokenizer matching the model vocabulary.</param>
+    /// <param name="modelId">Human-readable model identifier returned in API responses.</param>
+    /// <param name="owned">Additional disposable resources owned by this engine (backend, model handle, etc.).</param>
     public InferenceEngine(
-        ModelGraph model,
-        IComputeBackend backend,
-        MemoryHierarchy memory)
+        IForwardPass fwd,
+        ITokenizer tokenizer,
+        string modelId,
+        params IDisposable[] owned)
     {
-        _model = model;
-        _backend = backend;
-        _memory = memory;
-        _prefetcher = new Prefetcher(memory);
-        _kvCache = new KvCache(model.Hyperparams);
+        _fwd = fwd;
+        _tokenizer = tokenizer;
+        ModelId = modelId;
+        _owned = owned;
     }
 
-    /// <summary>
-    /// Run a single forward pass and return logits for the last token position.
-    /// </summary>
-    public ValueTask<Tensor> ForwardAsync(
-        ReadOnlyMemory<int> tokens,
-        int position,
-        CancellationToken ct = default)
+    /// <inheritdoc/>
+    public async IAsyncEnumerable<string> GenerateAsync(
+        string prompt,
+        SamplingParams sp,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
-        // TODO: embed ? n × transformer layers ? norm ? unembed
-        throw new NotImplementedException();
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var channel = Channel.CreateUnbounded<string>(
+                new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+
+            // Run the blocking CPU generation on a thread-pool thread.
+            var genTask = Task.Run(() =>
+            {
+                try
+                {
+                    _fwd.ResetCache();
+                    var tokens = _tokenizer.Encode(prompt);
+                    var rng = new Random();
+                    var stopIds = sp.StopTokenIds ?? [_tokenizer.EosTokenId];
+
+                    // Prefill â€” sequential forward on all prompt tokens
+                    ReadOnlySpan<float> logits = default;
+                    for (int i = 0; i < tokens.Count; i++)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        logits = _fwd.Forward(tokens[i], i);
+                    }
+
+                    // Decode loop
+                    for (int i = 0; i < sp.MaxNewTokens; i++)
+                    {
+                        ct.ThrowIfCancellationRequested();
+
+                        int next = sp.Temperature <= 0f
+                            ? Sampler.Greedy(logits)
+                            : Sampler.Sample(logits, sp, rng);
+
+                        if (stopIds.Contains(next)) break;
+
+                        channel.Writer.TryWrite(_tokenizer.Decode([next]));
+                        logits = _fwd.Forward(next, tokens.Count + i);
+                    }
+
+                    channel.Writer.TryComplete();
+                }
+                catch (Exception ex)
+                {
+                    channel.Writer.TryComplete(ex);
+                }
+            }, ct);
+
+            await foreach (var chunk in channel.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+                yield return chunk;
+
+            await genTask.ConfigureAwait(false); // re-throw any generation exception
+        }
+        finally
+        {
+            _gate.Release();
+        }
     }
 
-    /// <summary>
-    /// Generate tokens autoregressively, yielding each token ID as it is sampled.
-    /// </summary>
-    public async IAsyncEnumerable<int> GenerateAsync(
-        ReadOnlyMemory<int> prompt,
-        SamplingParams sampling,
-        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    public void Dispose()
     {
-        // TODO: prefill phase + decode loop with speculative decoding
-        await Task.CompletedTask;
-        yield break;
-    }
-
-    public async ValueTask DisposeAsync()
-    {
-        _prefetcher.Dispose();
-        _kvCache.Dispose();
-        _backend.Dispose();
-        await _memory.DisposeAsync();
+        if (_disposed) return;
+        _disposed = true;
+        _fwd.Dispose();
+        foreach (var d in _owned)
+            d.Dispose();
+        _gate.Dispose();
     }
 }

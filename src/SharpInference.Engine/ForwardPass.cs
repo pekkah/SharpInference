@@ -206,6 +206,14 @@ public sealed unsafe class ForwardPass : IForwardPass
             _kvCache.TruncateTo(length);
     }
 
+    public void ResetCache()
+    {
+        if (_tqKvCache != null)
+            _tqKvCache.Reset();
+        else
+            _kvCache.Reset();
+    }
+
     /// <summary>
     /// Enables TurboQuant KV cache compression. Must be called before any forward pass.
     /// </summary>

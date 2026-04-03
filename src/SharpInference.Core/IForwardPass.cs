@@ -20,4 +20,7 @@ public interface IForwardPass : IDisposable
 
     /// <summary>Maximum supported sequence length.</summary>
     int MaxSeqLen { get; }
+
+    /// <summary>Reset the KV cache to empty (start of a new conversation).</summary>
+    void ResetCache();
 }

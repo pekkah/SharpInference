@@ -1685,14 +1685,44 @@ A much smaller draft model (SmolLM2-135M, ~1.8ms/token → 0.086 ratio) would br
 Incorporates key techniques from vLLM (PagedAttention, continuous batching) that provide
 the biggest gains for server workloads, combined with our existing TurboQuant compression.
 
+#### Phase 7a: Working API Server (✅ Complete)
+
 Core server:
-- [ ] ASP.NET Core Minimal API with NativeAOT compatibility
-- [ ] Anthropic Messages API: `POST /v1/messages` (streaming + non-streaming)
-- [ ] OpenAI Chat Completions API: `POST /v1/chat/completions`
-- [ ] SSE streaming with proper event types
-- [ ] Model listing: `GET /v1/models`
-- [ ] Source-generated JSON serialization throughout
-- [ ] Configuration via `appsettings.json` and CLI arguments
+- [x] ASP.NET Core Minimal API with NativeAOT compatibility
+- [x] Anthropic Messages API: `POST /v1/messages` (streaming SSE + non-streaming)
+- [x] OpenAI Chat Completions API: `POST /v1/chat/completions` (streaming SSE + non-streaming)
+- [x] Model listing: `GET /v1/models`
+- [x] Health endpoint: `GET /health` with model ID and uptime
+- [x] Prometheus-format metrics: `GET /metrics` (request counts, tokens generated, uptime)
+- [x] Source-generated JSON serialization throughout (NativeAOT-compatible)
+- [x] Configuration via `SHARPI_MODEL` / `SHARPI_N_GPU_LAYERS` env vars and `appsettings.json`
+- [x] `IInferenceEngine` interface for testability; `WebApplicationFactory` integration tests (8 tests)
+- [x] Chat templates: ChatML (Qwen2/SmolLM2), Llama 3.x, Llama 4
+- [x] Serialized single-request via `SemaphoreSlim`; concurrent callers block in arrival order
+
+**Architecture:**
+- `IInferenceEngine` (Engine project) — interface for generation, used by all endpoints
+- `InferenceEngine` — concrete implementation wrapping `IForwardPass` + `ITokenizer`; runs blocking CPU generation on a thread-pool thread, streams results via `Channel<string>`
+- `ChatTemplate` — formats message arrays to prompt string per model arch
+- `AppJsonContext` — source-gen JSON with snake_case naming for all OpenAI/Anthropic wire types
+
+**Usage:**
+```bash
+# Start server (CPU)
+SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf dotnet run --project src/SharpInference.Server
+
+# OpenAI-compatible chat
+curl http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"smollm2","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+
+# Anthropic-compatible messages
+curl http://localhost:5000/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{"model":"smollm2","messages":[{"role":"user","content":"Hello"}],"max_tokens":256}'
+```
+
+#### Phase 7b: PagedAttention (Planned)
 
 PagedAttention (inspired by vLLM):
 - [ ] Paged KV cache: allocate KV blocks on demand (not pre-allocated for max_seq_len)
@@ -1711,11 +1741,6 @@ Prefix caching:
 - [ ] Share KV cache blocks across requests with identical system prompts
 - [ ] Hash-based prefix matching for common prompt templates
 - [ ] Reduces redundant computation for API workloads with shared system prompts
-
-Monitoring:
-- [ ] Health and Prometheus metrics endpoints
-- [ ] Tokens/second, active requests, KV cache utilization, expert cache hit rate
-- [ ] Integration tests validating wire format compatibility
 
 ---
 
