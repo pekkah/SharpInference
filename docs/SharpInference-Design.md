@@ -3,7 +3,7 @@
 **A .NET 10 / C# 14 LLM inference engine optimized for consumer desktop hardware**
 
 Version: 0.1.0-draft
-Date: 2026-03-30
+Date: 2026-04-03
 Author: Pekka (with Claude)
 
 ---
@@ -54,8 +54,8 @@ SharpInference is an experimental LLM inference engine written entirely in moder
 │ Manager  │  KV Cache     │  ┌─────────┐  ┌──────────────┐  │
 │          │  Compression  │  │ Vulkan   │  │ CPU (SIMD)   │  │
 │ Tier L1  │               │  │ Compute  │  │ AVX2/AVX-512 │  │
-│ Tier L2  │  3-bit keys   │  │ Vortice  │  │ Fallback     │  │
-│ Tier L3  │  2-bit values │  └─────────┘  └──────────────┘  │
+│ Tier L2  │  3-bit KV     │  │ Vortice  │  │ Fallback     │  │
+│ Tier L3  │  compression  │  └─────────┘  └──────────────┘  │
 ├──────────┴──────────────┴───────────────────────────────────┤
 │                     Core Layer                               │
 │     GGUF parser · Tokenizer · Tensor types · Model graphs    │
@@ -427,30 +427,29 @@ Not all tokens and not all tensor types need the same precision.
 
 | Data | Precision | Rationale |
 |------|-----------|-----------|
-| Recent tokens (last 128–256) | Full FP16 | Attention focuses heavily on recent context |
-| Older key vectors | TQ 3–4 bit | Keys have higher magnitude variance, need more bits |
-| Older value vectors | TQ 2–3 bit | Values are more uniform, tolerate aggressive compression |
+| Recent tokens (last 256 by default) | Full FP32 | Preserve exact recent-context attention and simplify append/update |
+| Older key vectors | TQ3 | Current shipped runtime path |
+| Older value vectors | TQ3 | Current shipped runtime path |
 | Residual window | Configurable | Trade memory for quality on a per-model basis |
 
-The K/V magnitude ratio is profiled per model during warmup. Community findings (llama.cpp #20969) show:
-- K/V ratio < 10x → 3-bit uniform works well
-- K/V ratio 10–60x → 4-bit keys, 3-bit values
-- K/V ratio > 100x → 5+ bit keys or mixed precision
+The current runtime ships a uniform 3-bit TurboQuant path for both keys and values. The
+K/V magnitude profiler remains useful for research and model-specific tuning, but mixed
+key/value bit-width layouts are not the default production path today.
 
 ```csharp
 public sealed class TurboQuantKvCache
 {
-    private readonly int _fullPrecisionWindow;   // recent tokens in FP16
-    private readonly int _keyBits;               // 3 or 4
-    private readonly int _valueBits;             // 2 or 3
+    private readonly int _fp32WindowSize;   // recent tokens in FP32
+    private readonly int _bits;             // current shipped path: 3
 
-    // FP16 ring buffer for recent tokens
-    private readonly FP16RingBuffer _recentKeys;
-    private readonly FP16RingBuffer _recentValues;
+    // Per-layer recent-token buffers
+    private readonly float*[] _fp32Keys;
+    private readonly float*[] _fp32Values;
 
-    // Compressed storage for older tokens
-    private readonly PackedBuffer _compressedKeys;
-    private readonly PackedBuffer _compressedValues;
+    // Per-layer compressed history
+    private readonly byte*[] _tqKeys;
+    private readonly byte*[] _tqValues;
+    private readonly int[] _layerTqLengths; // compressed/FP32 split tracked per layer
 }
 ```
 
@@ -469,7 +468,7 @@ Example: Qwen3 8B at Q4_K_M weights, 32K context:
 | Configuration | KV Cache Size | Total VRAM (weights + KV + overhead) |
 |--------------|---------------|--------------------------------------|
 | FP16 KV cache | ~4.6 GB | ~9.8 GB (tight on 12GB) |
-| TQ3 keys + TQ2 values | ~0.9 GB | ~6.1 GB (room for 64K+ context) |
+| TQ3 KV cache | ~0.9 GB | ~6.1 GB (room for 64K+ context) |
 
 This is the difference between "barely fits at 32K" and "comfortably runs 64K+ with VRAM to spare for expert caching."
 
@@ -1471,7 +1470,8 @@ SmolLM2 1.7B unchanged: CPU 48.5 t/s, GPU 88.7 t/s. Zero managed allocations on 
 - [x] Adaptive precision: FP32 recent window (256 tokens) + TQ compressed history (`TurboQuantKvCache.cs`)
 - [x] K/V magnitude profiler for per-model bit budget selection (`MagnitudeProfiler.cs`)
 - [x] MSE validation tests (25 tests covering round-trip, WHT, bit packing, dequant-dot accuracy)
-- [x] GPU TQ end-to-end: GpuForwardPass TQ mode with compressed VRAM KV cache, TqRotateQuery + TqAttention shaders
+- [x] GPU TQ end-to-end: `GpuForwardPass` TQ mode with compressed VRAM KV cache, `TqRotateQuery` + `TqAttention` shaders
+- [x] Hybrid TQ end-to-end: `HybridForwardPass` TQ mode for GPU-resident layers plus CPU-side TQ cache for offloaded layers
 - [ ] Needle-in-a-haystack test at 8K / 16K / 32K / 64K (requires long-context model run)
 
 **Results:** CPU: FP32 12.8 t/s, TQ3 12.7 t/s (< 0.1% overhead). GPU: FP32 24.1 t/s at 17K ctx, TQ3 24.0 t/s at 40K ctx (0.4% overhead, 2.4x context).
@@ -1545,18 +1545,28 @@ After Phase 4a, a dedicated optimization pass targeting CPU and GPU throughput:
 
 Deferred: analysis showed PCIe 4.0 bandwidth (25 GB/s) is slower than DDR5 (50 GB/s) for weight reads, making streaming slower than the current hybrid CPU path for our hardware class. Only valuable for PCIe 5.0 or systems with slow CPUs.
 
-### Phase 5: MoE Inference — Llama 4 Scout (Weeks 11–16)
+### Phase 5: MoE Inference — Llama 4 Scout 🚧
 
-**Goal:** Run Llama 4 Scout (109B total, 17B active, 16 experts) with expert caching and prefetching.
+**Goal:** Run Llama 4 Scout (109B total, 17B active, 16 experts) on a practical
+12GB-class GPU + 64GB RAM desktop, then iterate toward expert caching and prefetching.
 
 Architecture:
-- [ ] Detect MoE architecture from GGUF metadata (`{arch}.expert_count`, `{arch}.expert_used_count`)
-- [ ] Parse expert tensor naming: `blk.{i}.ffn_gate_exps.weight`, `blk.{i}.ffn_up_exps.weight`, `blk.{i}.ffn_down_exps.weight`, `blk.{i}.ffn_gate_inp.weight` (router)
-- [ ] Extend `ModelHyperparams` with `NumExperts`, `NumActiveExperts`, `IsMoE`
+- [x] Detect MoE architecture from GGUF metadata (`{arch}.expert_count`, `{arch}.expert_used_count`)
+- [x] Parse expert tensor naming: `blk.{i}.ffn_gate_exps.weight`, `blk.{i}.ffn_up_exps.weight`, `blk.{i}.ffn_down_exps.weight`, `blk.{i}.ffn_gate_inp.weight` (router)
+- [x] Extend `ModelHyperparams` with `NumExperts`, `NumActiveExperts`, `IsMoE`
 
 Routing:
-- [ ] MoE router: compute `ffn_gate_inp` MatVec → top-k softmax → expert indices + weights
-- [ ] Sparse expert FFN: only execute selected experts, weighted-sum outputs
+- [x] MoE router: compute `ffn_gate_inp` MatVec → top-k softmax → expert indices + weights
+- [x] Sparse expert FFN: only execute selected experts, weighted-sum outputs
+
+Execution and placement:
+- [x] CPU MoE reference path for correctness and fallback
+- [x] True GPU MoE FFN execution for GPU-resident layers
+- [x] True hybrid MoE execution for GPU-resident layers with CPU execution for offloaded layers
+- [x] MoE-aware `TierPlanner` placement using actual uploaded weight size rather than raw GGUF bytes
+- [x] Smart defaults for Scout-class models: cap auto context to practical VRAM defaults and keep giant fixed tensors on CPU when that improves placement
+- [x] Scout decode benchmarks: CPU, CPU+TQ3, auto hybrid, auto hybrid+TQ3
+- [x] Scout microbenchmarks: router/top-k and MoE FFN layer
 
 Expert memory management:
 - [ ] Expert slot cache in VRAM: N slots (sized to fit available VRAM after attention weights + KV cache)
@@ -1566,9 +1576,16 @@ Expert memory management:
 - [ ] CPU fallback for expert cache misses: compute on CPU via mmap while GPU handles cached experts
 - [ ] Expert access frequency profiler: per-layer hit rate metrics, hot expert identification
 
+**Current state:** Scout now runs on both the CPU path and the real hybrid GPU/CPU path.
+On an RTX 4070 Ti 12GB-class system, auto placement currently keeps only a small subset
+of Scout layers on GPU, so decode remains CPU-dominated. Local decode benchmarks are
+roughly 4.6 t/s on CPU and 3.1 t/s on auto hybrid, with hybrid TQ3 giving a small
+improvement while primarily reducing KV memory pressure. The next major performance step
+is expert-slot caching and prefetch so hybrid Scout no longer pays most of the cost on CPU.
+
 **Target model:** Llama 4 Scout 109B/16E Q2_K (~37 GB)
 
-### Phase 6: Speculative Decoding (Weeks 17–19)
+### Phase 6: Speculative Decoding
 
 **Goal:** 2–3x throughput improvement via draft-verify pipeline.
 
@@ -1580,7 +1597,7 @@ Expert memory management:
 
 **Draft model:** SmolLM2 1.7B
 
-### Phase 7: API Server with PagedAttention (Weeks 20–24)
+### Phase 7: API Server with PagedAttention
 
 **Goal:** Production-ready API server with vLLM-inspired optimizations for multi-user throughput.
 
