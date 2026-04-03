@@ -11,7 +11,7 @@ SharpInference is a high-performance LLM inference engine in C# 14 / .NET 10. It
 ```bash
 dotnet build                # Debug build
 dotnet build -c Release     # Release (NativeAOT opts: IlcOptimizationPreference=Speed)
-dotnet test                 # Run all tests (114 tests across 5 projects)
+dotnet test                 # Run all tests (132 tests across 5 projects)
 dotnet test --filter "FullyQualifiedName~SomeTest"  # Run a single test
 
 # Run CLI inference
@@ -22,8 +22,13 @@ dotnet run --project src/SharpInference.Cli -c Release -- \
 dotnet run --project src/SharpInference.Cli -c Release -- \
   -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -p "prompt" --temp 0 -g -1
 
+# Start API server (OpenAI + Anthropic compatible)
+SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
+  dotnet run --project src/SharpInference.Server -c Release
+
 # NativeAOT publish
 dotnet publish src/SharpInference.Cli -c Release -r win-x64
+dotnet publish src/SharpInference.Server -c Release -r win-x64
 
 # Benchmarks
 dotnet run --project benchmarks/SharpInference.Bench -c Release -- --filter '*'
@@ -47,6 +52,8 @@ Supporting libraries:
 ## Key Interfaces & Patterns
 
 - `IComputeBackend` (in Core) is the central abstraction — defines MatMul, RmsNorm, RoPE, Softmax, SiLU, Attention, and memory management. CPU and Vulkan backends implement it.
+- `IForwardPass` (in Core) — per-token forward pass; implemented by `ForwardPass` (CPU), `GpuForwardPass`, `HybridForwardPass`. Has `Forward`, `TruncateTo`, `ResetCache`, `VocabSize`, `MaxSeqLen`.
+- `IInferenceEngine` (in Engine) — top-level generation interface used by the server: `GenerateAsync(prompt, sp, ct) → IAsyncEnumerable<string>`. Serializes concurrent requests.
 - `ForwardPass` / `GpuForwardPass` in Engine dispatch the transformer layer sequence.
 - Hot paths use `NativeMemory`, `Span<T>`, and Vulkan buffers — no managed heap allocations.
 - Unsafe code is used throughout for performance. `AllowUnsafeBlocks` is enabled globally.

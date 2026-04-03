@@ -2,6 +2,7 @@
 
 A high-performance LLM inference engine written in C# 14 / .NET 10.
 Runs GGUF models on CPU (AVX2/AVX-512 SIMD) and GPU (Vulkan compute shaders).
+Includes an OpenAI- and Anthropic-compatible API server.
 
 ## Quick Start
 
@@ -22,6 +23,10 @@ dotnet run --project src/SharpInference.Cli -c Release -- \
 # Interactive chat
 dotnet run --project src/SharpInference.Cli -c Release -- \
   -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
+
+# Start API server
+SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
+  dotnet run --project src/SharpInference.Server -c Release
 ```
 
 ## CLI Usage (llama.cpp-compatible flags)
@@ -43,7 +48,48 @@ OPTIONS:
         --system-prompt     System prompt
         --no-display-prompt Don't echo the prompt
         --verbose-prompt    Print token IDs before generating
+        --draft-model       Draft model path for speculative decoding (requires --temp 0)
+        --spec-lookahead    Draft tokens per speculative step (default: 4)
+        --min-batch-blas    Min batch size for BLAS GEMM (default: 16)
 ```
+
+## API Server
+
+Starts an HTTP server compatible with OpenAI and Anthropic clients:
+
+```bash
+# Set model path and start
+SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
+  dotnet run --project src/SharpInference.Server -c Release
+# Defaults to http://localhost:5000
+
+# OpenAI — chat completions (streaming)
+curl http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"smollm2","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+
+# Anthropic — messages (non-streaming)
+curl http://localhost:5000/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{"model":"smollm2","messages":[{"role":"user","content":"Hello"}],"max_tokens":256}'
+
+# List loaded model
+curl http://localhost:5000/v1/models
+
+# Health check
+curl http://localhost:5000/health
+
+# Prometheus metrics
+curl http://localhost:5000/metrics
+```
+
+### Server environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SHARPI_MODEL` | `model.gguf` | Path to GGUF model file |
+| `SHARPI_N_GPU_LAYERS` | `0` | GPU layers (0 = CPU only) |
+| `SHARPI_MIN_BATCH_BLAS` | `16` | BLAS GEMM threshold for batched MatMul |
 
 ## Performance
 
@@ -62,39 +108,28 @@ Benchmarked on AMD Zen 4 (12c/24t) + RTX 4070 Ti, SmolLM2-1.7B Q4_K_M:
 | SharpInference.Core | classlib | GGUF parser, tokenizer, tensor types, model graph |
 | SharpInference.Cpu | classlib | CPU backend: AVX2/AVX-512 SIMD, fused dequant-matvec |
 | SharpInference.Vulkan | classlib | GPU backend: Vulkan compute shaders via Vortice.Vulkan |
-| SharpInference.Engine | classlib | Forward pass (CPU + GPU), KV cache, sampling |
+| SharpInference.Engine | classlib | Forward pass (CPU + GPU), KV cache, sampling, speculative decoding |
 | SharpInference.Cli | console | CLI tool (`sharpi-cli`) with NativeAOT support |
-| SharpInference.TurboQuant | classlib | KV-cache compression (Phase 3) |
-| SharpInference.Pipeline | classlib | Memory hierarchy, tier placement (Phase 4) |
-| SharpInference.Server | web | API server (Phase 7) |
+| SharpInference.TurboQuant | classlib | KV-cache compression (3-bit Lloyd-Max codebooks) |
+| SharpInference.Pipeline | classlib | Memory hierarchy, SLRU expert cache, async prefetcher |
+| SharpInference.Server | web | OpenAI + Anthropic API server with NativeAOT support |
 
 ## Build & Test
 
 ```bash
 dotnet build              # Debug build
 dotnet build -c Release   # Release build (enables IlcOptimizationPreference=Speed)
-dotnet test               # Run all tests (85 tests)
+dotnet test               # Run all tests (132 tests across 5 projects)
 
 # Publish NativeAOT binary
 dotnet publish src/SharpInference.Cli -c Release -r win-x64
+dotnet publish src/SharpInference.Server -c Release -r win-x64
 
 # Run all benchmarks (requires every benchmark model to be present)
 dotnet run --project benchmarks/SharpInference.Bench -c Release -- --filter '*'
-
-# Run one model/backend suite (only that model is needed)
-dotnet run --project benchmarks/SharpInference.Bench -c Release -- --filter '*SmolLM2CpuBenchmarks*'
-```
-
-## Setup
-
-```bash
-# Download OpenBLAS (optional, for batched prefill GEMM)
-powershell scripts/setup-openblas.ps1
-
-# Download a model
-# Place GGUF files in the models/ directory
 ```
 
 ## Architecture
 
 See [docs/SharpInference-Design.md](docs/SharpInference-Design.md).
+
