@@ -127,6 +127,9 @@ public static unsafe class SimdKernels
             case DType.Q5_K:
                 MatVecQ5K(output, weights, input, rows, cols);
                 break;
+            case DType.Q2_K:
+                MatVecQ2K(output, weights, input, rows, cols);
+                break;
             default:
                 MatVecDequantFallback(output, weights, input, rows, cols, dtype);
                 break;
@@ -681,6 +684,153 @@ public static unsafe class SimdKernels
                 scIdx += 2;
                 u1 <<= 2;
                 u2 <<= 2;
+            }
+            elemOff += 256;
+        }
+        return acc;
+    }
+
+    // ================================================================
+    //  Q2_K Fused MatVec
+    // ================================================================
+
+    public static void MatVecQ2K(float* output, byte* weights, float* input, int rows, int cols)
+    {
+        int bytesPerRow = (cols / 256) * 84;
+
+        if (rows >= MinRowsForParallel)
+        {
+            var w = weights; var inp = input; var outp = output;
+            Parallel.For(0, rows, s_parallelOpts, i =>
+            {
+                outp[i] = DotQ2K(w + (long)i * bytesPerRow, inp, cols);
+            });
+        }
+        else
+        {
+            for (int i = 0; i < rows; i++)
+                output[i] = DotQ2K(weights + (long)i * bytesPerRow, input, cols);
+        }
+    }
+
+    // ================================================================
+    //  Q2_K Fused Dequant-Dot  (one row)
+    // ================================================================
+
+    /// <summary>
+    /// Fused Q2_K dequant-dot with AVX2. Block = 84 bytes / 256 elements.
+    /// Layout: [scales:16][qs:64][d:FP16][dmin:FP16].
+    /// The 64 qs bytes are read 4 times with shifts 0,2,4,6 per 128-element group.
+    /// </summary>
+    public static float DotQ2K(byte* row, float* input, int cols)
+    {
+        int numBlocks = cols / 256;
+
+        if (!Fma.IsSupported)
+            return DotQ2K_Scalar(row, input, cols, numBlocks);
+
+        var acc = Vector256<float>.Zero;
+        var mask03 = Vector256.Create(0x03);
+        int elemOff = 0;
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            byte* x = row + b * 84;
+            float d = HalfToFloat(x[80], x[81]);
+            float min = HalfToFloat(x[82], x[83]);
+            byte* sc = x;       // scales at byte 0
+            byte* qs = x + 16;  // qs at byte 16
+
+            int qOff = 0;
+            int isIdx = 0;
+            for (int n = 0; n < 256; n += 128)
+            {
+                // Unrolled: 4 shifts (0, 2, 4, 6) as constants
+                for (int j = 0; j < 4; j++)
+                {
+                    byte scByte = sc[isIdx++];
+                    var dl = Vector256.Create(d * (scByte & 0xF));
+                    var negMl = Vector256.Create(-(min * (scByte >> 4)));
+
+                    for (int l = 0; l < 16; l += 8)
+                    {
+                        var bytes = LoadBytes8(qs + qOff + l);
+                        var ints = Avx2.ConvertToVector256Int32(bytes);
+                        // Shift by constant: j=0→0, j=1→2, j=2→4, j=3→6
+                        var shifted = j switch {
+                            0 => ints,
+                            1 => Avx2.ShiftRightLogical(ints, 2),
+                            2 => Avx2.ShiftRightLogical(ints, 4),
+                            _ => Avx2.ShiftRightLogical(ints, 6),
+                        };
+                        var q = Avx2.And(shifted, mask03);
+                        var deq = Fma.MultiplyAdd(dl, Avx.ConvertToVector256Single(q), negMl);
+                        acc = Fma.MultiplyAdd(deq, Avx.LoadVector256(input + elemOff + n + j * 32 + l), acc);
+                    }
+
+                    scByte = sc[isIdx++];
+                    dl = Vector256.Create(d * (scByte & 0xF));
+                    negMl = Vector256.Create(-(min * (scByte >> 4)));
+
+                    for (int l = 0; l < 16; l += 8)
+                    {
+                        var bytes = LoadBytes8(qs + qOff + 16 + l);
+                        var ints = Avx2.ConvertToVector256Int32(bytes);
+                        var shifted = j switch {
+                            0 => ints,
+                            1 => Avx2.ShiftRightLogical(ints, 2),
+                            2 => Avx2.ShiftRightLogical(ints, 4),
+                            _ => Avx2.ShiftRightLogical(ints, 6),
+                        };
+                        var q = Avx2.And(shifted, mask03);
+                        var deq = Fma.MultiplyAdd(dl, Avx.ConvertToVector256Single(q), negMl);
+                        acc = Fma.MultiplyAdd(deq, Avx.LoadVector256(input + elemOff + n + j * 32 + 16 + l), acc);
+                    }
+                }
+                qOff += 32;
+            }
+            elemOff += 256;
+        }
+
+        return HSum256(acc);
+    }
+
+    private static float DotQ2K_Scalar(byte* row, float* input, int cols, int numBlocks)
+    {
+        float acc = 0;
+        int elemOff = 0;
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            byte* x = row + b * 84;
+            float d = HalfToFloat(x[80], x[81]);
+            float min = HalfToFloat(x[82], x[83]);
+            byte* sc = x;
+            byte* qs = x + 16;
+
+            int qOff = 0;
+            int isIdx = 0;
+            int yOff = elemOff;
+            for (int n = 0; n < 256; n += 128)
+            {
+                int shift = 0;
+                for (int j = 0; j < 4; j++)
+                {
+                    byte scByte = sc[isIdx++];
+                    float dl = d * (scByte & 0xF);
+                    float ml = min * (scByte >> 4);
+                    for (int l = 0; l < 16; l++)
+                        acc += (dl * ((qs[qOff + l] >> shift) & 3) - ml) * input[yOff++];
+
+                    scByte = sc[isIdx++];
+                    dl = d * (scByte & 0xF);
+                    ml = min * (scByte >> 4);
+                    for (int l = 0; l < 16; l++)
+                        acc += (dl * ((qs[qOff + l + 16] >> shift) & 3) - ml) * input[yOff++];
+
+                    shift += 2;
+                }
+                qOff += 32;
             }
             elemOff += 256;
         }
