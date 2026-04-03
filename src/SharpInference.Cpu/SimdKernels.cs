@@ -130,6 +130,9 @@ public static unsafe class SimdKernels
             case DType.Q2_K:
                 MatVecQ2K(output, weights, input, rows, cols);
                 break;
+            case DType.Q3_K:
+                MatVecQ3K(output, weights, input, rows, cols);
+                break;
             default:
                 MatVecDequantFallback(output, weights, input, rows, cols, dtype);
                 break;
@@ -686,6 +689,200 @@ public static unsafe class SimdKernels
                 u2 <<= 2;
             }
             elemOff += 256;
+        }
+        return acc;
+    }
+
+    // ================================================================
+    //  Q3_K Fused MatVec
+    // ================================================================
+
+    public static void MatVecQ3K(float* output, byte* weights, float* input, int rows, int cols)
+    {
+        int bytesPerRow = (cols / 256) * 110;
+
+        if (rows >= MinRowsForParallel)
+        {
+            var w = weights; var inp = input; var outp = output;
+            Parallel.For(0, rows, s_parallelOpts, i =>
+            {
+                outp[i] = DotQ3K(w + (long)i * bytesPerRow, inp, cols);
+            });
+        }
+        else
+        {
+            for (int i = 0; i < rows; i++)
+                output[i] = DotQ3K(weights + (long)i * bytesPerRow, input, cols);
+        }
+    }
+
+    /// <summary>
+    /// Fused Q3_K dequant-dot with AVX2.
+    /// Block = 110 bytes / 256 elements: [hmask:32][qs:64][scales:12][d:FP16].
+    /// Uses aux[] uint32 scale unpacking matching ggml exactly.
+    /// </summary>
+    public static float DotQ3K(byte* row, float* input, int cols)
+    {
+        int numBlocks = cols / 256;
+
+        if (!Fma.IsSupported)
+            return DotQ3K_Scalar(row, input, cols, numBlocks);
+
+        const uint kmask1 = 0x03030303;
+        const uint kmask2 = 0x0f0f0f0f;
+
+        var acc = Vector256<float>.Zero;
+        var mask03 = Vector256.Create(0x03);
+        var four = Vector256.Create(4);
+        int elemOff = 0;
+
+        Span<uint> aux = stackalloc uint[4];
+        Span<sbyte> scales = stackalloc sbyte[16];
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            byte* x = row + b * 110;
+            float dAll = HalfToFloat(x[108], x[109]);
+
+            // Unpack scales using aux[] manipulation (matching ggml)
+            aux[0] = *(uint*)(x + 96);
+            aux[1] = *(uint*)(x + 100);
+            uint tmp = *(uint*)(x + 104);
+            aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+            aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+            aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+            aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+            // Extract 16 scale bytes from aux
+            for (int i = 0; i < 4; i++)
+            {
+                scales[i * 4 + 0] = (sbyte)(byte)(aux[i] >> 0);
+                scales[i * 4 + 1] = (sbyte)(byte)(aux[i] >> 8);
+                scales[i * 4 + 2] = (sbyte)(byte)(aux[i] >> 16);
+                scales[i * 4 + 3] = (sbyte)(byte)(aux[i] >> 24);
+            }
+
+            byte* qs = x + 32; // qs at byte 32
+            byte* hm = x;       // hmask at byte 0
+            int qOff = 0;
+            int isIdx = 0;
+            byte m = 1;
+
+            for (int n = 0; n < 256; n += 128)
+            {
+                for (int j = 0; j < 4; j++)
+                {
+                    float dl = dAll * (scales[isIdx++] - 32);
+                    var vDl = Vector256.Create(dl);
+
+                    // First 16 elements
+                    for (int l = 0; l < 16; l += 8)
+                    {
+                        var qBytes = LoadBytes8(qs + qOff + l);
+                        var qInts = Avx2.ConvertToVector256Int32(qBytes);
+                        var shifted = j switch {
+                            0 => qInts,
+                            1 => Avx2.ShiftRightLogical(qInts, 2),
+                            2 => Avx2.ShiftRightLogical(qInts, 4),
+                            _ => Avx2.ShiftRightLogical(qInts, 6),
+                        };
+                        var q2 = Avx2.And(shifted, mask03);
+
+                        // High bit from hmask: subtract 4 if hmask bit is NOT set
+                        var hmBytes = LoadBytes8(hm + l);
+                        var hmInts = Avx2.ConvertToVector256Int32(hmBytes);
+                        var hmBit = Avx2.And(hmInts, Vector256.Create((int)m));
+                        // If bit set → 0, if not set → 4
+                        var sub = Avx2.And(Avx2.CompareEqual(hmBit, Vector256<int>.Zero), four);
+                        var q3 = Avx2.Subtract(q2, sub);
+
+                        var deq = Avx.Multiply(vDl, Avx.ConvertToVector256Single(q3));
+                        acc = Fma.MultiplyAdd(deq, Avx.LoadVector256(input + elemOff), acc);
+                        elemOff += 8;
+                    }
+
+                    // Second 16 elements (qs + 16, hm + 16)
+                    dl = dAll * (scales[isIdx++] - 32);
+                    vDl = Vector256.Create(dl);
+
+                    for (int l = 0; l < 16; l += 8)
+                    {
+                        var qBytes = LoadBytes8(qs + qOff + 16 + l);
+                        var qInts = Avx2.ConvertToVector256Int32(qBytes);
+                        var shifted = j switch {
+                            0 => qInts,
+                            1 => Avx2.ShiftRightLogical(qInts, 2),
+                            2 => Avx2.ShiftRightLogical(qInts, 4),
+                            _ => Avx2.ShiftRightLogical(qInts, 6),
+                        };
+                        var q2 = Avx2.And(shifted, mask03);
+
+                        var hmBytes = LoadBytes8(hm + 16 + l);
+                        var hmInts = Avx2.ConvertToVector256Int32(hmBytes);
+                        var hmBit = Avx2.And(hmInts, Vector256.Create((int)m));
+                        var sub = Avx2.And(Avx2.CompareEqual(hmBit, Vector256<int>.Zero), four);
+                        var q3 = Avx2.Subtract(q2, sub);
+
+                        var deq = Avx.Multiply(vDl, Avx.ConvertToVector256Single(q3));
+                        acc = Fma.MultiplyAdd(deq, Avx.LoadVector256(input + elemOff), acc);
+                        elemOff += 8;
+                    }
+
+                    m <<= 1;
+                }
+                qOff += 32;
+            }
+        }
+
+        return HSum256(acc);
+    }
+
+    private static float DotQ3K_Scalar(byte* row, float* input, int cols, int numBlocks)
+    {
+        const uint kmask1 = 0x03030303;
+        const uint kmask2 = 0x0f0f0f0f;
+        float acc = 0;
+        int elemOff = 0;
+        Span<uint> aux = stackalloc uint[4];
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            byte* x = row + b * 110;
+            float dAll = HalfToFloat(x[108], x[109]);
+
+            aux[0] = *(uint*)(x + 96); aux[1] = *(uint*)(x + 100);
+            uint tmp = *(uint*)(x + 104);
+            aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+            aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+            aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+            aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+            byte* qs = x + 32; byte* hm = x;
+            int qOff = 0; int isIdx = 0; byte m = 1;
+
+            for (int n = 0; n < 256; n += 128)
+            {
+                int shift = 0;
+                for (int j = 0; j < 4; j++)
+                {
+                    int scByte = (int)(byte)((aux[isIdx / 4] >> ((isIdx % 4) * 8)) & 0xFF);
+                    float dl = dAll * (scByte - 32); isIdx++;
+                    for (int l = 0; l < 16; l++)
+                    {
+                        int q = ((qs[qOff + l] >> shift) & 3) - ((hm[l] & m) != 0 ? 0 : 4);
+                        acc += dl * q * input[elemOff++];
+                    }
+                    scByte = (int)(byte)((aux[isIdx / 4] >> ((isIdx % 4) * 8)) & 0xFF);
+                    dl = dAll * (scByte - 32); isIdx++;
+                    for (int l = 0; l < 16; l++)
+                    {
+                        int q = ((qs[qOff + l + 16] >> shift) & 3) - ((hm[l + 16] & m) != 0 ? 0 : 4);
+                        acc += dl * q * input[elemOff++];
+                    }
+                    shift += 2; m <<= 1;
+                }
+                qOff += 32;
+            }
         }
         return acc;
     }
