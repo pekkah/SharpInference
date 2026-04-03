@@ -199,7 +199,48 @@ public sealed class GgufTokenizer : ITokenizer
 
     public string Decode(IEnumerable<int> tokens)
     {
-        return _inner.Decode(tokens) ?? string.Empty;
+        var text = _inner.Decode(tokens) ?? string.Empty;
+
+        // BpeTokenizer may output GPT-2 byte-level BPE artifacts:
+        // Ġ (U+0120) = space, Ċ (U+010A) = newline, etc.
+        // Convert them back to actual bytes if present.
+        if (text.Contains('\u0120') || text.Contains('\u010A'))
+            text = DecodeGpt2Bytes(text);
+
+        return text;
+    }
+
+    /// <summary>
+    /// Convert GPT-2 byte-level BPE Unicode characters back to actual bytes.
+    /// GPT-2 maps bytes 0x00-0xFF to Unicode chars starting at various offsets.
+    /// The most common: Ġ (U+0120) = space (0x20), Ċ (U+010A) = newline (0x0A).
+    /// </summary>
+    private static string DecodeGpt2Bytes(string text)
+    {
+        var bytes = new List<byte>(text.Length);
+        foreach (char c in text)
+        {
+            if (c < 256)
+            {
+                bytes.Add((byte)c);
+            }
+            else
+            {
+                // GPT-2 byte mapping: chars 0x100-0x1FF map to bytes via lookup
+                // The mapping: printable ASCII stays as-is, non-printable gets offset
+                // Simplified: U+0100+n maps to byte n for n < 256
+                int mapped = c - 0x100;
+                if (mapped >= 0 && mapped < 256)
+                    bytes.Add((byte)mapped);
+                else
+                {
+                    // Not a byte token — encode as UTF-8
+                    foreach (byte b in System.Text.Encoding.UTF8.GetBytes(new[] { c }))
+                        bytes.Add(b);
+                }
+            }
+        }
+        return System.Text.Encoding.UTF8.GetString(bytes.ToArray());
     }
 
     private static int GetMetadataInt(GgufModel model, string key, int defaultValue)

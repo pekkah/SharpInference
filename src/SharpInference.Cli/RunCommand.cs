@@ -108,6 +108,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         var sw = Stopwatch.StartNew();
         using var model = GgufModel.Open(modelPath);
         var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        s_arch = model.Metadata.TryGetValue("general.architecture", out var archVal) ? (string)archVal : "qwen2";
         int ctxSize = settings.CtxSize; // 0 = auto (GPU will estimate from VRAM, CPU uses model default)
         var tokenizer = GgufTokenizer.FromGgufModel(model);
         using var cpuBackend = new CpuBackend();
@@ -292,12 +293,38 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         return 0;
     }
 
+    private static string s_arch = "qwen2"; // set during model load
+
     private static string FormatPrompt(string userMessage, string? systemPrompt)
     {
         var sb = new System.Text.StringBuilder();
-        if (systemPrompt is not null)
-            sb.Append($"<|im_start|>system\n{systemPrompt}<|im_end|>\n");
-        sb.Append($"<|im_start|>user\n{userMessage}<|im_end|>\n<|im_start|>assistant\n");
+
+        if (s_arch is "llama4")
+        {
+            // Llama 4: <|begin_of_text|><|header_start|>role<|header_end|>\n\nmessage<|eot_id|>
+            sb.Append("<|begin_of_text|>");
+            if (systemPrompt is not null)
+                sb.Append($"<|header_start|>system<|header_end|>\n\n{systemPrompt}<|eot_id|>");
+            sb.Append($"<|header_start|>user<|header_end|>\n\n{userMessage}<|eot_id|>");
+            sb.Append("<|header_start|>assistant<|header_end|>\n\n");
+        }
+        else if (s_arch is "llama")
+        {
+            // Llama 3/3.1: <|begin_of_text|><|start_header_id|>role<|end_header_id|>\n\nmessage<|eot_id|>
+            sb.Append("<|begin_of_text|>");
+            if (systemPrompt is not null)
+                sb.Append($"<|start_header_id|>system<|end_header_id|>\n\n{systemPrompt}<|eot_id|>");
+            sb.Append($"<|start_header_id|>user<|end_header_id|>\n\n{userMessage}<|eot_id|>");
+            sb.Append("<|start_header_id|>assistant<|end_header_id|>\n\n");
+        }
+        else
+        {
+            // ChatML (Qwen, SmolLM, default): <|im_start|>role\nmessage<|im_end|>
+            if (systemPrompt is not null)
+                sb.Append($"<|im_start|>system\n{systemPrompt}<|im_end|>\n");
+            sb.Append($"<|im_start|>user\n{userMessage}<|im_end|>\n<|im_start|>assistant\n");
+        }
+
         return sb.ToString();
     }
 }
