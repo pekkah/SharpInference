@@ -360,7 +360,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         {
             // Copy hidden → residual + RmsNorm (barrier after both)
             CopyBuffer(_residual, _hidden);
-            _gpu.RecordTransferBarrier();
+            _gpu.RecordBarrier();
 
             _gpu.RmsNorm(_normBuf, _hidden, _wAttnNorm[layer], _hp.RmsNormEps);
             _gpu.RecordBarrier();
@@ -404,7 +404,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                     // Copy oldest FP32 row (at _fp32WriteIdx) to evict buffers
                     CopyBufferRegion(_evictK!, 0, _gpuKCache[layer], (long)_fp32WriteIdx * rowBytes, rowBytes);
                     CopyBufferRegion(_evictV!, 0, _gpuVCache[layer], (long)_fp32WriteIdx * rowBytes, rowBytes);
-                    _gpu.RecordTransferBarrier();
+                    _gpu.RecordBarrier();
 
                     // Compress evicted entry into TQ cache
                     _gpu.TqKvAppend(_evictK!, _evictV!, _gpuTqKCache![layer], _gpuTqVCache![layer],
@@ -452,10 +452,10 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             _gpu.RecordBarrier(); // hidden written → add
 
             _gpu.AddInPlace(_hidden, _residual);
-            // hidden done → FFN starts (copy + norm)
+            _gpu.RecordBarrier(); // hidden done → FFN copy reads it
 
             CopyBuffer(_residual, _hidden);
-            _gpu.RecordTransferBarrier();
+            _gpu.RecordBarrier();
 
             _gpu.RmsNorm(_normBuf, _hidden, _wFfnNorm[layer], _hp.RmsNormEps);
             _gpu.RecordBarrier();
@@ -467,7 +467,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             _gpu.RecordBarrier(); // hidden written → add
 
             _gpu.AddInPlace(_hidden, _residual);
-            // No barrier needed here — next layer starts with CopyBuffer which is a transfer
+            _gpu.RecordBarrier(); // hidden done → next layer's compute copy reads it
         }
 
         // Update TQ ring buffer state (after all layers used the same indices)
@@ -621,19 +621,13 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     /// <summary>Record a buffer copy into the current command buffer (must be in recording mode).</summary>
     private void CopyBuffer(Tensor dst, Tensor src)
     {
-        var srcBuf = _gpu.GetBuffer(src);
-        var dstBuf = _gpu.GetBuffer(dst);
-        VkBufferCopy region = new() { size = srcBuf.Size };
-        _gpu.Vkd.vkCmdCopyBuffer(_gpu.TransferCmd, srcBuf.Buffer, dstBuf.Buffer, 1, &region);
+        _gpu.RecordComputeCopy(dst, src);
     }
 
     /// <summary>Copy a sub-region from src to dst (both in VRAM).</summary>
     private void CopyBufferRegion(Tensor dst, long dstOffsetBytes, Tensor src, long srcOffsetBytes, long sizeBytes)
     {
-        var srcBuf = _gpu.GetBuffer(src);
-        var dstBuf = _gpu.GetBuffer(dst);
-        VkBufferCopy region = new() { srcOffset = (ulong)srcOffsetBytes, dstOffset = (ulong)dstOffsetBytes, size = (ulong)sizeBytes };
-        _gpu.Vkd.vkCmdCopyBuffer(_gpu.TransferCmd, srcBuf.Buffer, dstBuf.Buffer, 1, &region);
+        _gpu.RecordComputeCopyRegion(dst, dstOffsetBytes, src, srcOffsetBytes, sizeBytes);
     }
 
     // Track quantization type per weight tensor for MatMul dispatch

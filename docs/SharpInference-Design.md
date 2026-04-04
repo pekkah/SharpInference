@@ -1522,7 +1522,7 @@ After Phase 4a, a dedicated optimization pass targeting CPU and GPU throughput:
 - [x] Q6_K shader modernization (8-row + subgroupAdd, currently uses old 256-thread reduction)
 - [x] Reduce barrier count: use buffer-specific VkBufferMemoryBarrier instead of global barriers (~540 per token)
 - [x] Fold logits download into main command buffer (eliminate second submit-wait)
-- [ ] Compute-shader buffer copy (replace vkCmdCopyBuffer transfer to stay in compute pipeline stage)
+- [x] Compute-shader buffer copy (replace vkCmdCopyBuffer transfer to stay in compute pipeline stage)
 - [x] Fix attention shader for seq_len > 256: replaced fast/tiled split with stored-scores path (shared float scores[4096]) matching TqAttention; triple-pass retained only for seq_len > 4096
 
 **Remaining CPU Optimizations (future):**
@@ -1806,6 +1806,25 @@ curl http://localhost:5000/v1/messages \
 - [x] String → int key conversion in endpoint handler; `Dictionary<string, float>` registered in `AppJsonContext`
 
 **Tests**: 7 new tests — 3 server tests (metrics recording counters increment, new Prometheus metrics present, logit_bias accepted) + 4 sampler tests (negative bias blocks token, positive bias forces token, out-of-range IDs ignored, null bias). All 169 tests pass.
+
+---
+
+#### Phase 9: Compute-Shader Buffer Copy (✅ Complete)
+
+**Goal:** Replace `vkCmdCopyBuffer` (Transfer pipeline stage) with a compute shader for device-local-to-device-local copies, keeping the entire forward pass in the Compute pipeline stage and eliminating Transfer→Compute pipeline stage transitions.
+
+**Changes:**
+
+- `Shaders.BufferCopy` — new GLSL compute shader (`local_size_x=256`): reads uint32 words from `binding=0` (src), writes to `binding=1` (dst). Push constants: `{uint count, uint src_offset, uint dst_offset}` (offsets in uint32 words). Handles both full copies and sub-region copies with nonzero offsets.
+- `VulkanBackend.RecordComputeCopy(Tensor dst, Tensor src)` — full-tensor compute copy; queries `GpuBuffer.Size` for word count.
+- `VulkanBackend.RecordComputeCopyRegion(Tensor dst, long dstOffsetBytes, Tensor src, long srcOffsetBytes, long sizeBytes)` — sub-region copy; converts byte offsets to uint32 word offsets (always 4-byte aligned for float tensors).
+- `VulkanBackend._bufCopyPipeline` — lazy-initialized `ComputePipeline` for the `BufferCopy` shader.
+- `GpuForwardPass.CopyBuffer` / `CopyBufferRegion` — now call `_gpu.RecordComputeCopy` / `_gpu.RecordComputeCopyRegion` instead of `vkCmdCopyBuffer`.
+- All 3 `RecordTransferBarrier()` calls that followed device-local copies replaced with `RecordBarrier()` (Compute→Compute).
+- Added explicit `RecordBarrier()` after attention `AddInPlace(_hidden, _residual)` before FFN `CopyBuffer` (previously the Transfer stage provided implicit ordering — with compute copy, the barrier must be explicit).
+- `RecordDownloadToStaging()` and the staging upload path in `UploadToGpu` are unchanged — staging buffers lack `StorageBuffer` usage and must use `vkCmdCopyBuffer`.
+
+**Tests**: All 169 tests pass.
 
 ---
 

@@ -129,6 +129,33 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Raw buffer copy: dst_data[dst_offset + i] = src_data[src_offset + i] for i in [0, count).
+    /// Operates on uint32 words (4-byte aligned). All offsets are in uint32 units.
+    /// Push constants: { uint count, uint src_offset, uint dst_offset }.
+    /// Bindings: 0=src (readonly), 1=dst (writeonly).
+    /// Dispatch: ceil(count / 256) workgroups of 256 threads.
+    /// </summary>
+    internal const string BufferCopy = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Src { uint src_data[]; };
+        layout(binding = 1) writeonly buffer Dst { uint dst_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint count;
+            uint src_offset;
+            uint dst_offset;
+        };
+
+        void main() {
+            uint i = gl_GlobalInvocationID.x;
+            if (i >= count) return;
+            dst_data[dst_offset + i] = src_data[src_offset + i];
+        }
+        """;
+
+    /// <summary>
     /// Fill a buffer with zeros.
     /// Push constants: { uint n }.
     /// Bindings: 0=dst (in/out).

@@ -638,8 +638,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private ComputePipeline? _tqRotateQueryPipeline;
     private ComputePipeline? _tqKvAppendPipeline;
     private ComputePipeline? _tqAttentionPipeline;
+    private ComputePipeline? _bufCopyPipeline;
 
-    private struct RmsNormParams { public uint n; public float eps; }
+    private struct RmsNormParams{ public uint n; public float eps; }
     private struct HeadNormParams { public uint headDim; public uint numHeads; public float eps; }
     private struct CountParams { public uint n; }
     private struct ScaleParams { public uint n; public float scale; }
@@ -651,6 +652,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private struct TqRotateQueryParams { public uint numHeads; public uint numKvHeads; public uint headDim; }
     private struct TqKvAppendParams { public uint kvDim; public uint headDim; public uint position; public uint maxSeqLen; public uint numKvHeads; public uint blockBytes; }
     private struct TqAttentionParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint tqSeqLen; public uint fp16SeqLen; public uint maxSeqLen; public uint blockBytes; }
+    private struct BufCopyParams { public uint count; public uint srcOffset; public uint dstOffset; }
 
     private void DispatchOrRecord(ComputePipeline pipe, ReadOnlySpan<GpuBuffer> buffers,
         uint groupX, void* push, uint groupY = 1, uint groupZ = 1)
@@ -696,6 +698,28 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _addScaledInPlacePipeline ??= new ComputePipeline(this, Shaders.AddScaledInPlace, 2, pushConstantSize: sizeof(ScaleParams));
         var p = new ScaleParams { n = (uint)dst.ElementCount, scale = scale };
         DispatchOrRecord(_addScaledInPlacePipeline, [GetBuffer(dst), GetBuffer(src)], ((uint)dst.ElementCount + 255) / 256, &p);
+    }
+
+    /// <summary>Copy an entire device-local tensor using a compute shader (stays in compute pipeline stage).</summary>
+    public void RecordComputeCopy(Tensor dst, Tensor src)
+    {
+        var srcBuf = GetBuffer(src);
+        RecordComputeCopyWords(GetBuffer(dst), 0, srcBuf, 0, (uint)(srcBuf.Size / 4));
+    }
+
+    /// <summary>Copy a sub-region between device-local tensors using a compute shader.</summary>
+    public void RecordComputeCopyRegion(Tensor dst, long dstOffsetBytes, Tensor src, long srcOffsetBytes, long sizeBytes)
+    {
+        RecordComputeCopyWords(GetBuffer(dst), (uint)(dstOffsetBytes / 4),
+                               GetBuffer(src), (uint)(srcOffsetBytes / 4),
+                               (uint)(sizeBytes / 4));
+    }
+
+    private void RecordComputeCopyWords(GpuBuffer dst, uint dstOffset, GpuBuffer src, uint srcOffset, uint wordCount)
+    {
+        _bufCopyPipeline ??= new ComputePipeline(this, Shaders.BufferCopy, 2, pushConstantSize: sizeof(BufCopyParams));
+        var p = new BufCopyParams { count = wordCount, srcOffset = srcOffset, dstOffset = dstOffset };
+        DispatchOrRecord(_bufCopyPipeline, [src, dst], (wordCount + 255) / 256, &p);
     }
 
     public void Clear(Tensor dst)
@@ -874,6 +898,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _attentionPipeline?.Dispose();
         _embedLookupPipeline?.Dispose();
         _embedLookupQ4KPipeline?.Dispose();
+        _bufCopyPipeline?.Dispose();
 
         _downloadStaging?.Dispose();
         _uploadStaging?.Dispose();
