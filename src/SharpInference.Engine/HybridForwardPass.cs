@@ -616,16 +616,24 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             _gpu.RecordBarrier();
         }
 
-        if (_hasQkNorm)
         {
-            _gpu.HeadNorm(_gpuQ, _gpuQNorm![i], (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps);
-            _gpu.HeadNorm(_gpuK, _gpuKNorm![i], (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps);
-            _gpu.RecordBarrier();
-        }
+            // NoPE: skip RoPE and QK-norm for NoPE layers
+            bool useRoPE = _hp.NoRopeLayerStep == 0
+                || (i + 1) % _hp.NoRopeLayerStep != 0;
+            if (useRoPE)
+            {
+                _gpu.RoPE(_gpuQ, position, _headDim, _hp.RopeTheta);
+                _gpu.RoPE(_gpuK, position, _headDim, _hp.RopeTheta);
+                _gpu.RecordBarrier();
 
-        _gpu.RoPE(_gpuQ, position, _headDim, _hp.RopeTheta);
-        _gpu.RoPE(_gpuK, position, _headDim, _hp.RopeTheta);
-        _gpu.RecordBarrier();
+                if (_hasQkNorm)
+                {
+                    _gpu.HeadNorm(_gpuQ, _gpuQNorm![i], (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps);
+                    _gpu.HeadNorm(_gpuK, _gpuKNorm![i], (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps);
+                    _gpu.RecordBarrier();
+                }
+            }
+        }
 
         if (_tqEnabled)
         {
@@ -720,15 +728,24 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             SimdKernels.AddInPlace(_cpuV, _cpuBv[ci], _numKvHeads * _headDim);
         }
 
-        if (_hasQkNorm)
-        {
-            PerHeadRmsNorm(_cpuQ, _cpuQNorm[ci], _numHeads, _headDim, _hp.RmsNormEps);
-            PerHeadRmsNorm(_cpuK, _cpuKNorm[ci], _numKvHeads, _headDim, _hp.RmsNormEps);
-        }
+        // NoPE: actual layer index = ci + _nGpuLayers
+        int actualLayer = ci + _nGpuLayers;
+        bool useRoPE = _hp.NoRopeLayerStep == 0
+            || (actualLayer + 1) % _hp.NoRopeLayerStep != 0;
 
-        // RoPE
-        SimdKernels.ApplyRoPECached(_cpuQ, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numHeads, _headDim);
-        SimdKernels.ApplyRoPECached(_cpuK, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numKvHeads, _headDim);
+        if (useRoPE)
+        {
+            // RoPE
+            SimdKernels.ApplyRoPECached(_cpuQ, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numHeads, _headDim);
+            SimdKernels.ApplyRoPECached(_cpuK, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numKvHeads, _headDim);
+
+            // QK-norm after RoPE, only for RoPE layers
+            if (_hasQkNorm)
+            {
+                PerHeadRmsNorm(_cpuQ, _cpuQNorm[ci], _numHeads, _headDim, _hp.RmsNormEps);
+                PerHeadRmsNorm(_cpuK, _cpuKNorm[ci], _numKvHeads, _headDim, _hp.RmsNormEps);
+            }
+        }
 
         // KV cache append (ci = CPU layer index)
         if (_cpuTqKvCache != null)
@@ -788,7 +805,10 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         int numActive = _hp.NumActiveExperts;
 
         SimdKernels.MatVec(_cpuRouterLogits, _cpuWGateInp![ci].DataPtr, _cpuNormBuf, numExperts, _embDim, _cpuWGateInp[ci].DType);
-        SimdKernels.SoftmaxInPlace(_cpuRouterLogits, numExperts);
+        if (_hp.UseSigmoidGating)
+            SimdKernels.SigmoidInPlace(_cpuRouterLogits, numExperts);
+        else
+            SimdKernels.SoftmaxInPlace(_cpuRouterLogits, numExperts);
 
         Span<int> selectedExperts = stackalloc int[numActive];
         Span<float> expertWeights = stackalloc float[numActive];
@@ -811,6 +831,14 @@ public sealed unsafe class HybridForwardPass : IForwardPass
 
             ExpertMatVec(_cpuExpertGate, _cpuWGateExps![ci], expertIdx, _expertDim, _embDim, _cpuNormBuf);
             ExpertMatVec(_cpuExpertUp, _cpuWUpExps![ci], expertIdx, _expertDim, _embDim, _cpuNormBuf);
+
+            if (_hp.UseSigmoidGating)
+            {
+                SimdKernels.ScaleInPlace(_cpuExpertGate, weight, _expertDim);
+                SimdKernels.ScaleInPlace(_cpuExpertUp, weight, _expertDim);
+                weight = 1.0f;
+            }
+
             SimdKernels.SiLuMul(_cpuExpertGate, _cpuExpertUp, _expertDim);
             ExpertMatVecDown(_cpuHidden, _cpuWDownExps![ci], expertIdx, _embDim, _expertDim, _cpuExpertGate, weight);
         }
@@ -1167,7 +1195,10 @@ public sealed unsafe class HybridForwardPass : IForwardPass
 
         GpuMatMul(_gpuRouterLogits!, _gpuWGateInp![layer], _gpuNormBuf);
         _gpu.RecordBarrier();
-        _gpu.Softmax(_gpuRouterLogits!);
+        if (_hp.UseSigmoidGating)
+            _gpu.Sigmoid(_gpuRouterLogits!);
+        else
+            _gpu.Softmax(_gpuRouterLogits!);
         // Copy norm buf to pinned memory while still recording so the CPU can
         // read it after submit via MapPinned — avoids a second CopyBuffer call.
         CopyGpuBuffer(_gpuPinnedNorm!, _gpuNormBuf);
@@ -1233,11 +1264,23 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             GpuMatMul(_gpuFfnGate, cachedSlots[i].Gate, _gpuNormBuf);
             GpuMatMul(_gpuFfnUp, cachedSlots[i].Up, _gpuNormBuf);
             _gpu.RecordBarrier();
+
+            if (_hp.UseSigmoidGating)
+            {
+                _gpu.ScaleInPlace(_gpuFfnGate, expertWeight);
+                _gpu.ScaleInPlace(_gpuFfnUp, expertWeight);
+                _gpu.RecordBarrier();
+            }
+
             _gpu.SiLuMul(_gpuFfnGate, _gpuFfnUp);
             _gpu.RecordBarrier();
             GpuMatMul(_gpuMoeExpertOut!, cachedSlots[i].Down, _gpuFfnGate);
             _gpu.RecordBarrier();
-            _gpu.AddScaledInPlace(_gpuHidden, _gpuMoeExpertOut!, expertWeight);
+
+            if (_hp.UseSigmoidGating)
+                _gpu.AddInPlace(_gpuHidden, _gpuMoeExpertOut!);
+            else
+                _gpu.AddScaledInPlace(_gpuHidden, _gpuMoeExpertOut!, expertWeight);
             _gpu.RecordBarrier();
         }
 
@@ -1291,6 +1334,14 @@ public sealed unsafe class HybridForwardPass : IForwardPass
 
                 ExpertMatVec(gatePtr, wGateExps, expertIdx, _expertDim, _embDim, normPtr);
                 ExpertMatVec(upPtr,   wUpExps,   expertIdx, _expertDim, _embDim, normPtr);
+
+                if (_hp.UseSigmoidGating)
+                {
+                    SimdKernels.ScaleInPlace(gatePtr, weight, _expertDim);
+                    SimdKernels.ScaleInPlace(upPtr, weight, _expertDim);
+                    weight = 1.0f;
+                }
+
                 SimdKernels.SiLuMul(gatePtr, upPtr, _expertDim);
                 ExpertMatVecDown(fallbackPtr, wDownExps, expertIdx, _embDim, _expertDim, gatePtr, weight);
             }

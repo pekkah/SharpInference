@@ -12,6 +12,7 @@ public sealed class GgufTokenizer : ITokenizer
 {
     private readonly Tokenizer _inner;
     private readonly Dictionary<string, int> _specialTokens;
+    private readonly Dictionary<string, int> _vocab;
 
     public int VocabSize { get; }
     public int BosTokenId { get; }
@@ -20,9 +21,13 @@ public sealed class GgufTokenizer : ITokenizer
     public int PadTokenId { get; }
     public bool AddBosToken { get; }
 
+    /// <summary>All special (control) tokens keyed by their string representation.</summary>
+    public IReadOnlyDictionary<string, int> SpecialTokens => _specialTokens;
+
     private GgufTokenizer(
         Tokenizer inner,
         Dictionary<string, int> specialTokens,
+        Dictionary<string, int> vocab,
         int vocabSize,
         int bosTokenId,
         int eosTokenId,
@@ -32,6 +37,7 @@ public sealed class GgufTokenizer : ITokenizer
     {
         _inner = inner;
         _specialTokens = specialTokens;
+        _vocab = vocab;
         VocabSize = vocabSize;
         BosTokenId = bosTokenId;
         EosTokenId = eosTokenId;
@@ -146,6 +152,7 @@ public sealed class GgufTokenizer : ITokenizer
         return new GgufTokenizer(
             inner,
             specialTokens,
+            BuildVocabLookup(tokensArray),
             tokensArray.Length,
             bosTokenId,
             eosTokenId,
@@ -154,10 +161,18 @@ public sealed class GgufTokenizer : ITokenizer
             addBosToken);
     }
 
+    private static Dictionary<string, int> BuildVocabLookup(object[] tokensArray)
+    {
+        var vocab = new Dictionary<string, int>(tokensArray.Length, StringComparer.Ordinal);
+        for (int i = 0; i < tokensArray.Length; i++)
+            vocab.TryAdd((string)tokensArray[i], i);
+        return vocab;
+    }
+
     public IReadOnlyList<int> Encode(string text)
     {
         if (_specialTokens.Count == 0)
-            return _inner.EncodeToIds(text);
+            return EncodeTextSegment(text);
 
         // Split text on special token boundaries and encode each segment,
         // inserting special token IDs directly.
@@ -182,19 +197,50 @@ public sealed class GgufTokenizer : ITokenizer
             {
                 // No more special tokens — encode the rest
                 if (pos < text.Length)
-                    result.AddRange(_inner.EncodeToIds(text[pos..]));
+                    result.AddRange(EncodeTextSegment(text[pos..]));
                 break;
             }
 
             // Encode text before the special token
             if (bestStart > pos)
-                result.AddRange(_inner.EncodeToIds(text[pos..bestStart]));
+                result.AddRange(EncodeTextSegment(text[pos..bestStart]));
 
             // Insert the special token ID
             result.Add(_specialTokens[bestToken]);
             pos = bestStart + bestToken.Length;
         }
         return result;
+    }
+
+    private IReadOnlyList<int> EncodeTextSegment(string text)
+    {
+        if (text.Length == 0) return [];
+
+        var ids = _inner.EncodeToIds(text);
+
+        if (ids.Count > 0) return ids;
+
+        var result = new List<int>(text.Length);
+        foreach (char c in text)
+        {
+            char bpe = EncodeByteToGpt2(c);
+            if (_vocab.TryGetValue(bpe.ToString(), out int id))
+                result.Add(id);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Maps a single character to its GPT-2 byte-level BPE Unicode representation.
+    /// Printable ASCII (0x21–0x7E) and extended printable (0xA1–0xFF) are unchanged.
+    /// Control and non-printable bytes map to U+0100–U+0142.
+    /// </summary>
+    private static char EncodeByteToGpt2(char c)
+    {
+        if (c is >= '!' and <= '~') return c;   // printable ASCII: unchanged
+        if (c >= '\u00A1') return c;             // extended printable: unchanged
+        if (c <= '\u0020') return (char)(c + 0x100); // 0x00–0x20 → U+0100–U+0120
+        return (char)(c - 0x7F + 0x121);        // 0x7F–0xA0 → U+0121–U+0142
     }
 
     public string Decode(IEnumerable<int> tokens)

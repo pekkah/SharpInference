@@ -129,6 +129,29 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// In-place scalar multiply: data[i] *= scale for i in [0, n).
+    /// Push constants: { uint n, float scale }.
+    /// Bindings: 0=data (in/out).
+    /// </summary>
+    internal const string ScaleInPlace = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer Data { float data[]; };
+
+        layout(push_constant) uniform Params {
+            uint n;
+            float scale;
+        };
+
+        void main() {
+            uint i = gl_GlobalInvocationID.x;
+            if (i >= n) return;
+            data[i] *= scale;
+        }
+        """;
+
+    /// <summary>
     /// Raw buffer copy: dst_data[dst_offset + i] = src_data[src_offset + i] for i in [0, count).
     /// Operates on uint32 words (4-byte aligned). All offsets are in uint32 units.
     /// Push constants: { uint count, uint src_offset, uint dst_offset }.
@@ -352,6 +375,27 @@ internal static class Shaders
             float inv_sum = 1.0 / sum_val;
             for (uint i = tid; i < n; i += 256)
                 x_data[i] *= inv_sum;
+        }
+        """;
+
+    /// <summary>
+    /// Element-wise sigmoid in-place: x[i] = 1 / (1 + exp(-x[i])).
+    /// Used for Llama-4 MoE router gating.
+    /// Push constants: { uint n }.
+    /// Bindings: 0=x (in/out).
+    /// </summary>
+    internal const string Sigmoid = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer X { float x_data[]; };
+
+        layout(push_constant) uniform Params { uint n; };
+
+        void main() {
+            uint i = gl_GlobalInvocationID.x;
+            if (i >= n) return;
+            x_data[i] = 1.0 / (1.0 + exp(-x_data[i]));
         }
         """;
 

@@ -85,10 +85,11 @@ public sealed class SpeculativeDecoder
 
             foreach (int token in emitted)
             {
+                // Check stop before emitting — avoids printing the stop token itself.
+                if (IsStop(token, stopTokenIds)) return;
                 emitToken(token);
                 generated++;
-                if (IsStop(token, stopTokenIds) || generated >= maxTokens)
-                    return;
+                if (generated >= maxTokens) return;
             }
         }
     }

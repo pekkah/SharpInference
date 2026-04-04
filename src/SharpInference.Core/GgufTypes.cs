@@ -37,7 +37,8 @@ public readonly record struct GgufTensorInfo(
     int NDimensions,
     long[] Dimensions,
     DType DType,
-    ulong DataOffset)
+    ulong DataOffset,
+    int ShardIndex = 0)
 {
     /// <summary>Total number of elements in the tensor.</summary>
     public long ElementCount

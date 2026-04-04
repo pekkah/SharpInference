@@ -31,6 +31,22 @@ public static class Sampler
                     probs[id] += bias;
         }
 
+        // Repetition penalty (applied in logit space before temperature)
+        if (p.RepetitionPenalty != 1.0f && p.PreviousTokens is { Count: > 0 })
+        {
+            foreach (int id in p.PreviousTokens)
+            {
+                if ((uint)id < (uint)vocabSize)
+                {
+                    // Positive logits are divided; negative logits are multiplied
+                    if (probs[id] > 0f)
+                        probs[id] /= p.RepetitionPenalty;
+                    else
+                        probs[id] *= p.RepetitionPenalty;
+                }
+            }
+        }
+
         // Temperature scaling
         if (p.Temperature != 1.0f)
         {
@@ -232,4 +248,10 @@ public sealed record SamplingParams
     /// Use -100 to effectively prevent a token; +100 to strongly favour it.
     /// </summary>
     public IReadOnlyDictionary<int, float>? LogitBias { get; init; }
+
+    /// <summary>
+    /// Recently generated token IDs for repetition penalty.
+    /// Typically a sliding window of the last N generated tokens.
+    /// </summary>
+    public IReadOnlyList<int>? PreviousTokens { get; init; }
 }

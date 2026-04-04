@@ -329,15 +329,9 @@ public sealed unsafe class ForwardPass : IForwardPass
                         }
                     }
 
-                    // Per-head Q/K RMSNorm (Qwen3)
-                    if (_hasQkNorm)
-                    {
-                        for (int n = 0; n < N; n++)
-                        {
-                            PerHeadRmsNorm(batchQ + (long)n * qDim, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
-                            PerHeadRmsNorm(batchK + (long)n * kvDim, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
-                        }
-                    }
+                    // Per-head Q/K RMSNorm and RoPE — ordering and NoPE layers
+                    bool useRoPE = _hp.NoRopeLayerStep == 0
+                        || (layer + 1) % _hp.NoRopeLayerStep != 0;
 
                     // Per-token: RoPE, KV cache append, attention
                     for (int n = 0; n < N; n++)
@@ -346,8 +340,18 @@ public sealed unsafe class ForwardPass : IForwardPass
                         float* kn = batchK + (long)n * kvDim;
                         float* vn = batchV + (long)n * kvDim;
 
-                        SimdKernels.ApplyRoPECached(qn, _ropeCosTable + (long)(startPos + n) * _ropeHalfDim, _ropeSinTable + (long)(startPos + n) * _ropeHalfDim, _numHeads, _headDim);
-                        SimdKernels.ApplyRoPECached(kn, _ropeCosTable + (long)(startPos + n) * _ropeHalfDim, _ropeSinTable + (long)(startPos + n) * _ropeHalfDim, _numKvHeads, _headDim);
+                        if (useRoPE)
+                        {
+                            SimdKernels.ApplyRoPECached(qn, _ropeCosTable + (long)(startPos + n) * _ropeHalfDim, _ropeSinTable + (long)(startPos + n) * _ropeHalfDim, _numHeads, _headDim);
+                            SimdKernels.ApplyRoPECached(kn, _ropeCosTable + (long)(startPos + n) * _ropeHalfDim, _ropeSinTable + (long)(startPos + n) * _ropeHalfDim, _numKvHeads, _headDim);
+                        }
+
+                        // QK-norm after RoPE, only for RoPE layers
+                        if (_hasQkNorm && useRoPE)
+                        {
+                            PerHeadRmsNorm(qn, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
+                            PerHeadRmsNorm(kn, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+                        }
 
                         cache.Append(layer,
                             new ReadOnlySpan<float>(kn, kvDim),
@@ -522,14 +526,8 @@ public sealed unsafe class ForwardPass : IForwardPass
                         }
                     }
 
-                    if (_hasQkNorm)
-                    {
-                        for (int n = 0; n < N; n++)
-                        {
-                            PerHeadRmsNorm(batchQ + (long)n * qDim, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
-                            PerHeadRmsNorm(batchK + (long)n * kvDim, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
-                        }
-                    }
+                    bool useRoPE = _hp.NoRopeLayerStep == 0
+                        || (layer + 1) % _hp.NoRopeLayerStep != 0;
 
                     // Sequential: RoPE (at startPos+n), K/V append, causal attention
                     for (int n = 0; n < N; n++)
@@ -539,8 +537,18 @@ public sealed unsafe class ForwardPass : IForwardPass
                         float* vn = batchV + (long)n * kvDim;
 
                         int pos = startPos + n;
-                        SimdKernels.ApplyRoPECached(qn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numHeads, _headDim);
-                        SimdKernels.ApplyRoPECached(kn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numKvHeads, _headDim);
+
+                        if (useRoPE)
+                        {
+                            SimdKernels.ApplyRoPECached(qn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numHeads, _headDim);
+                            SimdKernels.ApplyRoPECached(kn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numKvHeads, _headDim);
+                        }
+
+                        if (_hasQkNorm && useRoPE)
+                        {
+                            PerHeadRmsNorm(qn, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
+                            PerHeadRmsNorm(kn, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+                        }
 
                         _kvCache.Append(layer,
                             new ReadOnlySpan<float>(kn, kvDim),
@@ -664,16 +672,23 @@ public sealed unsafe class ForwardPass : IForwardPass
                 SimdKernels.AddInPlace(_v, _bv[layer], _numKvHeads * _headDim);
             }
 
-            // Per-head Q/K RMSNorm (Qwen3)
-            if (_hasQkNorm)
-            {
-                PerHeadRmsNorm(_q, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
-                PerHeadRmsNorm(_k, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
-            }
+            // NoPE: skip RoPE and QK-norm for NoPE layers
+            bool useRoPE = _hp.NoRopeLayerStep == 0
+                || (layer + 1) % _hp.NoRopeLayerStep != 0;
 
-            // RoPE
-            SimdKernels.ApplyRoPECached(_q, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numHeads, _headDim);
-            SimdKernels.ApplyRoPECached(_k, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numKvHeads, _headDim);
+            if (useRoPE)
+            {
+                // RoPE
+                SimdKernels.ApplyRoPECached(_q, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numHeads, _headDim);
+                SimdKernels.ApplyRoPECached(_k, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numKvHeads, _headDim);
+
+                // QK-norm after RoPE, only for RoPE layers
+                if (_hasQkNorm)
+                {
+                    PerHeadRmsNorm(_q, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
+                    PerHeadRmsNorm(_k, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+                }
+            }
 
             // Store K, V in cache
             if (_tqKvCache != null)
@@ -903,8 +918,11 @@ public sealed unsafe class ForwardPass : IForwardPass
         // Step 1: Router — compute expert logits and select top-k
         FusedMatVec(_routerLogits, _wGateInp![layer], _normBuf, numExperts, _embDim);
 
-        // Softmax over expert logits
-        SimdKernels.SoftmaxInPlace(_routerLogits, numExperts);
+        // Gating: sigmoid for Llama-4, softmax for others
+        if (_hp.UseSigmoidGating)
+            SimdKernels.SigmoidInPlace(_routerLogits, numExperts);
+        else
+            SimdKernels.SoftmaxInPlace(_routerLogits, numExperts);
 
         // Find top-k experts (for k=1, just argmax)
         Span<int> selectedExperts = stackalloc int[numActive];
@@ -935,6 +953,15 @@ public sealed unsafe class ForwardPass : IForwardPass
             // Expert slice offset in packed tensor: expertIdx * expertDim * (bytes per row)
             ExpertMatVec(_expertGate, _wGateExps![layer], expertIdx, expertDim, _embDim, _normBuf);
             ExpertMatVec(_expertUp, _wUpExps![layer], expertIdx, expertDim, _embDim, _normBuf);
+
+            if (_hp.UseSigmoidGating)
+            {
+                // Llama-4: apply sigmoid weight before FFN (scale gate/up ≡ scaling input)
+                SimdKernels.ScaleInPlace(_expertGate, weight, expertDim);
+                SimdKernels.ScaleInPlace(_expertUp, weight, expertDim);
+                weight = 1.0f;
+            }
+
             SimdKernels.SiLuMul(_expertGate, _expertUp, expertDim);
             ExpertMatVecDown(_hidden, _wDownExps![layer], expertIdx, _embDim, expertDim, _expertGate, weight);
         }
@@ -1156,13 +1183,20 @@ public sealed unsafe class ForwardPass : IForwardPass
                 SimdKernels.AddInPlace(_k, _bk[layer], _numKvHeads * _headDim);
                 SimdKernels.AddInPlace(_v, _bv[layer], _numKvHeads * _headDim);
             }
-            if (_hasQkNorm)
             {
-                PerHeadRmsNorm(_q, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
-                PerHeadRmsNorm(_k, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+                bool useRoPE = _hp.NoRopeLayerStep == 0
+                    || (layer + 1) % _hp.NoRopeLayerStep != 0;
+                if (useRoPE)
+                {
+                    SimdKernels.ApplyRoPECached(_q, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numHeads, _headDim);
+                    SimdKernels.ApplyRoPECached(_k, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numKvHeads, _headDim);
+                    if (_hasQkNorm)
+                    {
+                        PerHeadRmsNorm(_q, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
+                        PerHeadRmsNorm(_k, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+                    }
+                }
             }
-            SimdKernels.ApplyRoPECached(_q, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numHeads, _headDim);
-            SimdKernels.ApplyRoPECached(_k, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numKvHeads, _headDim);
             cache.Append(layer,
                 new ReadOnlySpan<float>(_k, _numKvHeads * _headDim),
                 new ReadOnlySpan<float>(_v, _numKvHeads * _headDim));
@@ -1270,14 +1304,8 @@ public sealed unsafe class ForwardPass : IForwardPass
                             SimdKernels.AddInPlace(batchV + (long)n * kvDim, _bv[layer], kvDim);
                         }
                     }
-                    if (_hasQkNorm)
-                    {
-                        for (int n = 0; n < N; n++)
-                        {
-                            PerHeadRmsNorm(batchQ + (long)n * qDim, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
-                            PerHeadRmsNorm(batchK + (long)n * kvDim, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
-                        }
-                    }
+                    bool useRoPE = _hp.NoRopeLayerStep == 0
+                        || (layer + 1) % _hp.NoRopeLayerStep != 0;
                     // Per-sequence: RoPE, KV append to individual cache, causal attention
                     for (int n = 0; n < N; n++)
                     {
@@ -1287,8 +1315,16 @@ public sealed unsafe class ForwardPass : IForwardPass
                         int pos = positions[n];
                         // Soft-reset this layer's position so the Append lands at pos
                         caches[n].TruncateTo(pos);
-                        SimdKernels.ApplyRoPECached(qn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numHeads, _headDim);
-                        SimdKernels.ApplyRoPECached(kn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numKvHeads, _headDim);
+                        if (useRoPE)
+                        {
+                            SimdKernels.ApplyRoPECached(qn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numHeads, _headDim);
+                            SimdKernels.ApplyRoPECached(kn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numKvHeads, _headDim);
+                        }
+                        if (_hasQkNorm && useRoPE)
+                        {
+                            PerHeadRmsNorm(qn, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
+                            PerHeadRmsNorm(kn, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+                        }
                         caches[n].Append(layer,
                             new ReadOnlySpan<float>(kn, kvDim),
                             new ReadOnlySpan<float>(vn, kvDim));

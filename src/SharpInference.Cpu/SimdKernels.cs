@@ -1450,6 +1450,34 @@ public static unsafe class SimdKernels
         }
     }
 
+    /// <summary>
+    /// In-place element-wise sigmoid: x[i] = 1 / (1 + exp(-x[i])).
+    /// Used for Llama-4 MoE router gating.
+    /// </summary>
+    public static void SigmoidInPlace(float* x, int size)
+    {
+        if (Fma.IsSupported && size >= 8)
+        {
+            var one = Vector256.Create(1.0f);
+            int i = 0;
+            for (; i + 8 <= size; i += 8)
+            {
+                var v = Avx.LoadVector256(x + i);
+                var negV = Avx.Subtract(Vector256<float>.Zero, v);
+                var expNeg = ExpApprox256(negV);
+                var sig = Avx.Divide(one, Avx.Add(one, expNeg));
+                Avx.Store(x + i, sig);
+            }
+            for (; i < size; i++)
+                x[i] = 1.0f / (1.0f + MathF.Exp(-x[i]));
+        }
+        else
+        {
+            for (int i = 0; i < size; i++)
+                x[i] = 1.0f / (1.0f + MathF.Exp(-x[i]));
+        }
+    }
+
     // ================================================================
     //  Fused SiLU(gate) * up  (AVX2)
     // ================================================================
@@ -1503,6 +1531,23 @@ public static unsafe class SimdKernels
         else
         {
             for (int i = 0; i < size; i++) dst[i] += src[i];
+        }
+    }
+
+    /// <summary>Multiply every element of <paramref name="x"/> by a scalar.</summary>
+    public static void ScaleInPlace(float* x, float scale, int size)
+    {
+        if (Avx.IsSupported)
+        {
+            var sv = Vector256.Create(scale);
+            int i = 0;
+            for (; i + 8 <= size; i += 8)
+                Avx.Store(x + i, Avx.Multiply(Avx.LoadVector256(x + i), sv));
+            for (; i < size; i++) x[i] *= scale;
+        }
+        else
+        {
+            for (int i = 0; i < size; i++) x[i] *= scale;
         }
     }
 

@@ -624,10 +624,12 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private ComputePipeline? _siluMulPipeline;
     private ComputePipeline? _addInPlacePipeline;
     private ComputePipeline? _addScaledInPlacePipeline;
+    private ComputePipeline? _scaleInPlacePipeline;
     private ComputePipeline? _clearPipeline;
     private ComputePipeline? _elementwiseMulPipeline;
     private ComputePipeline? _ropePipeline;
     private ComputePipeline? _softmaxPipeline;
+    private ComputePipeline? _sigmoidPipeline;
     private ComputePipeline? _matVecQ4KPipeline;
     private ComputePipeline? _matVecQ6KPipeline;
     private ComputePipeline? _matVecF32Pipeline;
@@ -700,6 +702,13 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         DispatchOrRecord(_addScaledInPlacePipeline, [GetBuffer(dst), GetBuffer(src)], ((uint)dst.ElementCount + 255) / 256, &p);
     }
 
+    public void ScaleInPlace(Tensor x, float scale)
+    {
+        _scaleInPlacePipeline ??= new ComputePipeline(this, Shaders.ScaleInPlace, 1, pushConstantSize: sizeof(ScaleParams));
+        var p = new ScaleParams { n = (uint)x.ElementCount, scale = scale };
+        DispatchOrRecord(_scaleInPlacePipeline, [GetBuffer(x)], ((uint)x.ElementCount + 255) / 256, &p);
+    }
+
     /// <summary>Copy an entire device-local tensor using a compute shader (stays in compute pipeline stage).</summary>
     public void RecordComputeCopy(Tensor dst, Tensor src)
     {
@@ -750,6 +759,13 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _softmaxPipeline ??= new ComputePipeline(this, Shaders.Softmax, 1, pushConstantSize: sizeof(CountParams));
         var p = new CountParams { n = (uint)x.ElementCount };
         DispatchOrRecord(_softmaxPipeline, [GetBuffer(x)], 1, &p);
+    }
+
+    public void Sigmoid(Tensor x)
+    {
+        _sigmoidPipeline ??= new ComputePipeline(this, Shaders.Sigmoid, 1, pushConstantSize: sizeof(CountParams));
+        var p = new CountParams { n = (uint)x.ElementCount };
+        DispatchOrRecord(_sigmoidPipeline, [GetBuffer(x)], ((uint)x.ElementCount + 255) / 256, &p);
     }
 
     public void MatMul(Tensor output, Tensor matrix, Tensor vector)
@@ -887,10 +903,12 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _siluMulPipeline?.Dispose();
         _addInPlacePipeline?.Dispose();
         _addScaledInPlacePipeline?.Dispose();
+        _scaleInPlacePipeline?.Dispose();
         _clearPipeline?.Dispose();
         _elementwiseMulPipeline?.Dispose();
         _ropePipeline?.Dispose();
         _softmaxPipeline?.Dispose();
+        _sigmoidPipeline?.Dispose();
         _matVecQ4KPipeline?.Dispose();
         _matVecQ6KPipeline?.Dispose();
         _matVecF32Pipeline?.Dispose();

@@ -102,6 +102,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [Description("Minimum batch size to use OpenBLAS SGEMM in MatMulBatched (default: 16, crossover for Q4_K_M weights). Also settable via SHARPI_MIN_BATCH_BLAS env var.")]
         [DefaultValue(0)]
         public int MinBatchBlas { get; init; }
+
+        [CommandOption("--rep-penalty")]
+        [Description("Repetition penalty (1.0 = disabled, >1.0 penalizes repeated tokens, default: 1.1)")]
+        [DefaultValue(1.1f)]
+        public float RepPenalty { get; init; }
     }
 
     protected override int Execute(CommandContext context, Settings settings, CancellationToken cancellation)
@@ -139,6 +144,17 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         Func<IReadOnlyList<int>, ReadOnlySpan<float>> prefill;
         Action resetCache;
 
+        // Validate TurboQuant head-dimension compatibility before any GPU allocation
+        if (settings.TurboQuant)
+        {
+            int headDim = hp.EmbeddingDim / hp.NumHeads;
+            if (headDim is not 128 and not 256)
+            {
+                AnsiConsole.MarkupLine($"[red]Error:[/] TurboQuant requires head dimension 128 or 256; this model has head dim {headDim}. Remove [yellow]--tq[/] to run without KV compression.");
+                return 1;
+            }
+        }
+
         int nGpuLayers = settings.NGpuLayers;
         if (nGpuLayers == 0)
         {
@@ -157,60 +173,71 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         {
             var gpu = new VulkanBackend();
             gpuBackend = gpu;
-            gpu.PrintDeviceInfo();
-
-            var hwProfile = HardwareProfile.Detect(gpu);
-            AnsiConsole.MarkupLine($"[dim]Hardware: {hwProfile.Summary()}[/]");
-
-            // Auto-detect layer count when -g -1
-            if (nGpuLayers == -1)
+            try
             {
-                var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant, requestedCtxSize: ctxSize);
-                nGpuLayers = placement.GpuLayers;
-                if (nGpuLayers == 0)
-                {
-                    if (settings.TurboQuant)
-                    {
-                        fwd.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
-                        AnsiConsole.MarkupLine("[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
-                    }
+                gpu.PrintDeviceInfo();
 
-                    forward = fwd.Forward;
-                    prefill = tokens => fwd.Prefill(tokens);
-                    resetCache = settings.TurboQuant ? fwd.TqCache!.Reset : fwd.Cache.Reset;
-                    AnsiConsole.MarkupLine("[dim]Backend: [blue]CPU[/] (auto fallback: no GPU-capable layers for this model/path)[/]");
-                    goto backendConfigured;
+                var hwProfile = HardwareProfile.Detect(gpu);
+                AnsiConsole.MarkupLine($"[dim]Hardware: {hwProfile.Summary()}[/]");
+
+                // Auto-detect layer count when -g -1
+                if (nGpuLayers == -1)
+                {
+                    var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant, requestedCtxSize: ctxSize);
+                    nGpuLayers = placement.GpuLayers;
+                    if (nGpuLayers == 0)
+                    {
+                        if (settings.TurboQuant)
+                        {
+                            fwd.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
+                            AnsiConsole.MarkupLine("[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
+                        }
+
+                        forward = fwd.Forward;
+                        prefill = tokens => fwd.Prefill(tokens);
+                        resetCache = settings.TurboQuant ? fwd.TqCache!.Reset : fwd.Cache.Reset;
+                        AnsiConsole.MarkupLine("[dim]Backend: [blue]CPU[/] (auto fallback: no GPU-capable layers for this model/path)[/]");
+                        goto backendConfigured;
+                    }
+                }
+
+                if (nGpuLayers >= hp.NumLayers)
+                {
+                    // All layers on GPU
+                    var gfwd = new GpuForwardPass(model, gpu, hp, ctxSize,
+                        enableTurboQuant: settings.TurboQuant);
+                    if (settings.TurboQuant)
+                        AnsiConsole.MarkupLine($"[dim]TurboQuant: [green]enabled[/] (3-bit, context: {gfwd.MaxSeqLen})[/]");
+                    gpuFwd = gfwd;
+                    forward = gfwd.Forward;
+                    prefill = tokens => gfwd.Prefill(tokens);
+                    resetCache = gfwd.ResetCache;
+                    AnsiConsole.MarkupLine($"[dim]Backend: [green]GPU[/] ({gpu.Name}, all {hp.NumLayers} layers)[/]");
+                }
+                else
+                {
+                    // Hybrid: N layers GPU, rest CPU
+                    var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant,
+                        requestedCtxSize: ctxSize);
+                    // Override with explicit -g N if user specified it
+                    if (settings.NGpuLayers > 0)
+                        placement = placement with { GpuLayers = nGpuLayers, CpuLayers = hp.NumLayers - nGpuLayers };
+
+                    var hfwd = new HybridForwardPass(model, gpu, hp, placement, settings.TurboQuant);
+                    gpuFwd = hfwd;
+                    forward = hfwd.Forward;
+                    prefill = tokens => hfwd.Prefill(tokens);
+                    resetCache = hfwd.ResetCache;
+                    AnsiConsole.MarkupLine($"[dim]Backend: [yellow]Hybrid[/] ({gpu.Name}, {placement.GpuLayers} GPU + {placement.CpuLayers} CPU layers)[/]");
                 }
             }
-
-            if (nGpuLayers >= hp.NumLayers)
+            catch
             {
-                // All layers on GPU
-                var gfwd = new GpuForwardPass(model, gpu, hp, ctxSize,
-                    enableTurboQuant: settings.TurboQuant);
-                if (settings.TurboQuant)
-                    AnsiConsole.MarkupLine($"[dim]TurboQuant: [green]enabled[/] (3-bit, context: {gfwd.MaxSeqLen})[/]");
-                gpuFwd = gfwd;
-                forward = gfwd.Forward;
-                prefill = tokens => gfwd.Prefill(tokens);
-                resetCache = gfwd.ResetCache;
-                AnsiConsole.MarkupLine($"[dim]Backend: [green]GPU[/] ({gpu.Name}, all {hp.NumLayers} layers)[/]");
-            }
-            else
-            {
-                // Hybrid: N layers GPU, rest CPU
-                var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant,
-                    requestedCtxSize: ctxSize);
-                // Override with explicit -g N if user specified it
-                if (settings.NGpuLayers > 0)
-                    placement = placement with { GpuLayers = nGpuLayers, CpuLayers = hp.NumLayers - nGpuLayers };
-
-                var hfwd = new HybridForwardPass(model, gpu, hp, placement, settings.TurboQuant);
-                gpuFwd = hfwd;
-                forward = hfwd.Forward;
-                prefill = tokens => hfwd.Prefill(tokens);
-                resetCache = hfwd.ResetCache;
-                AnsiConsole.MarkupLine($"[dim]Backend: [yellow]Hybrid[/] ({gpu.Name}, {placement.GpuLayers} GPU + {placement.CpuLayers} CPU layers)[/]");
+                gpuFwd?.Dispose();
+                gpuBackend?.Dispose();
+                gpuFwd = null;
+                gpuBackend = null;
+                throw;
             }
         }
 
@@ -225,7 +252,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             TopP = settings.TopP,
             MinP = settings.MinP,
             MaxNewTokens = settings.NPredict,
-            StopTokenIds = [tokenizer.EosTokenId],
+            StopTokenIds = [.. BuildStopTokenIds(tokenizer)],
+            RepetitionPenalty = settings.RepPenalty,
         };
         var rng = settings.Seed >= 0 ? new Random(settings.Seed) : new Random();
 
@@ -388,7 +416,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         var tokens = tok.Encode(prompt);
 
         if (s.VerbosePrompt)
+        {
+            var escaped = prompt.Replace("\n", "\\n").Replace("\r", "\\r");
+            AnsiConsole.MarkupLine($"[dim]Prompt (escaped): {Markup.Escape(escaped)}[/]");
             AnsiConsole.MarkupLine($"[dim]Prompt tokens ({tokens.Count}): {string.Join(", ", tokens)}[/]");
+        }
 
         var sw = Stopwatch.StartNew();
         var logits = prefill(tokens);
@@ -399,12 +431,18 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         sw.Restart();
         int generated = 0;
+        var recentTokens = new List<int>(64);
         for (int i = 0; i < sp.MaxNewTokens; i++)
         {
-            int next = sp.Temperature <= 0 ? Sampler.Greedy(logits) : Sampler.Sample(logits, sp, rng);
+            var spWithHistory = sp.RepetitionPenalty != 1.0f && recentTokens.Count > 0
+                ? sp with { PreviousTokens = recentTokens }
+                : sp;
+            int next = sp.Temperature <= 0 ? Sampler.Greedy(logits) : Sampler.Sample(logits, spWithHistory, rng);
             if (sp.StopTokenIds.Contains(next)) break;
             Console.Write(tok.Decode([next]));
             generated++;
+            recentTokens.Add(next);
+            if (recentTokens.Count > 64) recentTokens.RemoveAt(0);
             logits = forward(next, tokens.Count + i);
         }
         var decodeMs = sw.Elapsed.TotalMilliseconds;
@@ -439,12 +477,18 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
             sw.Restart();
             int generated = 0;
+            var recentTokens = new List<int>(64);
             for (int i = 0; i < sp.MaxNewTokens; i++)
             {
-                int next = sp.Temperature <= 0 ? Sampler.Greedy(logits) : Sampler.Sample(logits, sp, rng);
+                var spWithHistory = sp.RepetitionPenalty != 1.0f && recentTokens.Count > 0
+                    ? sp with { PreviousTokens = recentTokens }
+                    : sp;
+                int next = sp.Temperature <= 0 ? Sampler.Greedy(logits) : Sampler.Sample(logits, spWithHistory, rng);
                 if (sp.StopTokenIds.Contains(next)) break;
                 Console.Write(tok.Decode([next]));
                 generated++;
+                recentTokens.Add(next);
+                if (recentTokens.Count > 64) recentTokens.RemoveAt(0);
                 logits = forward(next, tokens.Count + i);
             }
             var decodeMs = sw.Elapsed.TotalMilliseconds;
@@ -459,17 +503,31 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
     private static string s_arch = "qwen2"; // set during model load
 
+    /// <summary>
+    /// Builds the stop token ID list: EOS plus any end-of-turn special tokens
+    /// (<|eot_id|>, <|eom_id|>, <|end|>, <|im_end|>) present in the model vocabulary.
+    /// </summary>
+    private static IReadOnlyList<int> BuildStopTokenIds(GgufTokenizer tokenizer)
+    {
+        var stops = new HashSet<int> { tokenizer.EosTokenId };
+        // End-of-turn tokens used by Llama 3/4, Mistral, Phi, etc.
+        foreach (var name in new[] { "<|eot_id|>", "<|eom_id|>", "<|eot|>", "<|eom|>", "<|end|>", "<|im_end|>", "<|endoftext|>" })
+            if (tokenizer.SpecialTokens.TryGetValue(name, out int id) && id != tokenizer.EosTokenId)
+                stops.Add(id);
+        return [.. stops];
+    }
+
     private static string FormatPrompt(string userMessage, string? systemPrompt)
     {
         var sb = new System.Text.StringBuilder();
 
         if (s_arch is "llama4")
         {
-            // Llama 4: <|begin_of_text|><|header_start|>role<|header_end|>\n\nmessage<|eot_id|>
+            // Llama 4: <|begin_of_text|><|header_start|>role<|header_end|>\n\nmessage<|eot|>
             sb.Append("<|begin_of_text|>");
             if (systemPrompt is not null)
-                sb.Append($"<|header_start|>system<|header_end|>\n\n{systemPrompt}<|eot_id|>");
-            sb.Append($"<|header_start|>user<|header_end|>\n\n{userMessage}<|eot_id|>");
+                sb.Append($"<|header_start|>system<|header_end|>\n\n{systemPrompt}<|eot|>");
+            sb.Append($"<|header_start|>user<|header_end|>\n\n{userMessage}<|eot|>");
             sb.Append("<|header_start|>assistant<|header_end|>\n\n");
         }
         else if (s_arch is "llama")

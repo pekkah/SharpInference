@@ -379,19 +379,27 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                 _gpu.RecordBarrier();
             }
 
-            // Per-head Q/K RMSNorm (Qwen3)
-            if (_hasQkNorm)
+            // NoPE: skip RoPE and QK-norm for NoPE layers
             {
-                _gpu.HeadNorm(_q, _wqNorm![layer], (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps);
-                _gpu.HeadNorm(_k, _wkNorm![layer], (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps);
-                _gpu.RecordBarrier();
-            }
+                bool useRoPE = _hp.NoRopeLayerStep == 0
+                    || (layer + 1) % _hp.NoRopeLayerStep != 0;
+                if (useRoPE)
+                {
+                    // RoPE on Q and K
+                    _gpu.RoPE(_q, position, _headDim, _hp.RopeTheta);
+                    _gpu.RoPE(_k, position, _headDim, _hp.RopeTheta);
+                    _gpu.RecordBarrier();
 
-            // RoPE on Q and K (write different buffers, no conflict)
-            _gpu.RoPE(_q, position, _headDim, _hp.RopeTheta);
-            _gpu.RoPE(_k, position, _headDim, _hp.RopeTheta);
-            // KV append reads K/V written by RoPE
-            _gpu.RecordBarrier();
+                    // QK-norm after RoPE, only for RoPE layers
+                    if (_hasQkNorm)
+                    {
+                        _gpu.HeadNorm(_q, _wqNorm![layer], (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps);
+                        _gpu.HeadNorm(_k, _wkNorm![layer], (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps);
+                        _gpu.RecordBarrier();
+                    }
+                }
+            }
+            // KV append reads K/V (with or without RoPE)
 
             if (_tqEnabled)
             {
@@ -525,7 +533,10 @@ public sealed unsafe class GpuForwardPass : IForwardPass
 
         GpuMatMul(_routerLogits!, _wGateInp![layer], _normBuf);
         _gpu.RecordBarrier();
-        _gpu.Softmax(_routerLogits!);
+        if (_hp.UseSigmoidGating)
+            _gpu.Sigmoid(_routerLogits!);
+        else
+            _gpu.Softmax(_routerLogits!);
         _gpu.EndRecordAndSubmit();
         _gpu.Download(_routerLogits!, _routerBuf!);
 
@@ -557,11 +568,23 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             GpuMatMul(_ffnGate, _wGateExps![layer][expertIdx], _normBuf);
             GpuMatMul(_ffnUp, _wUpExps![layer][expertIdx], _normBuf);
             _gpu.RecordBarrier();
+
+            if (_hp.UseSigmoidGating)
+            {
+                _gpu.ScaleInPlace(_ffnGate, expertWeight);
+                _gpu.ScaleInPlace(_ffnUp, expertWeight);
+                _gpu.RecordBarrier();
+            }
+
             _gpu.SiLuMul(_ffnGate, _ffnUp);
             _gpu.RecordBarrier();
             GpuMatMul(_moeExpertOut!, _wDownExps![layer][expertIdx], _ffnGate);
             _gpu.RecordBarrier();
-            _gpu.AddScaledInPlace(_hidden, _moeExpertOut!, expertWeight);
+
+            if (_hp.UseSigmoidGating)
+                _gpu.AddInPlace(_hidden, _moeExpertOut!);
+            else
+                _gpu.AddScaledInPlace(_hidden, _moeExpertOut!, expertWeight);
             _gpu.RecordBarrier();
         }
 

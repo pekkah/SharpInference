@@ -54,6 +54,19 @@ public sealed class ModelHyperparams
     /// <summary>Whether the model has a shared expert that runs on every token (e.g. Llama 4, DeepSeek-V2).</summary>
     public bool HasSharedExpert { get; init; }
 
+    // ── NoPE (No Positional Encoding) ──
+
+    /// <summary>
+    /// Every Nth layer skips RoPE (NoPE). 0 = all layers use RoPE.
+    /// Llama-4: step=4 → layers 3,7,11,... (0-indexed where (layer+1)%4==0) use NoPE.
+    /// </summary>
+    public int NoRopeLayerStep { get; init; }
+
+    /// <summary>
+    /// Whether the MoE router uses sigmoid gating instead of softmax (e.g. Llama-4).
+    /// </summary>
+    public bool UseSigmoidGating { get; init; }
+
     /// <summary>
     /// Extract hyperparameters from GGUF metadata using the model's architecture prefix.
     /// Supports llama-family models (llama, mistral, qwen, smollm, etc.) and MoE variants.
@@ -78,6 +91,15 @@ public sealed class ModelHyperparams
         bool hasSharedExpert = isMoE
             && (model?.FindTensor("blk.0.ffn_gate_shexp.weight") is not null);
 
+        // Llama-4 (arch "llama4") uses NoPE: every 4th layer skips RoPE.
+        // This is hardcoded in llama.cpp (not stored in GGUF metadata).
+        bool isLlama4 = arch.Equals("llama4", StringComparison.OrdinalIgnoreCase);
+        int noRopeStep = isLlama4 ? 4 : 0;
+        // TODO: Llama-4 uses sigmoid gating with weight-before-FFN per Meta's reference impl.
+        // Currently using softmax (works but incorrect). Sigmoid produces magnitude divergence
+        // through the 48-layer stack despite matching the reference math. Root cause unknown.
+        bool useSigmoidGating = false;
+
         return new ModelHyperparams
         {
             VocabSize = GetInt(metadata, $"{arch}.vocab_size"),
@@ -98,6 +120,8 @@ public sealed class ModelHyperparams
             ExpertIntermediateDim = GetInt(metadata, $"{arch}.expert_feed_forward_length",
                                        GetInt(metadata, $"{arch}.feed_forward_length")),
             HasSharedExpert = hasSharedExpert,
+            NoRopeLayerStep = noRopeStep,
+            UseSigmoidGating = useSigmoidGating,
         };
     }
 

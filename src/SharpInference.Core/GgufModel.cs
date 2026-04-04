@@ -5,157 +5,172 @@ using System.Text;
 namespace SharpInference.Core;
 
 /// <summary>
-/// Parses and provides zero-copy access to a GGUF model file.
+/// Parses and provides zero-copy access to a GGUF model file (or split multi-shard model).
 /// Uses memory-mapped I/O so tensor data is paged from disk on demand.
+/// Split models are detected automatically by the -00001-of-NNNNN.gguf filename pattern
+/// or by the general.split.count metadata key.
 /// </summary>
 public sealed unsafe class GgufModel : IDisposable
 {
     private const uint GgufMagic = 0x46554747; // "GGUF" as little-endian uint32
     private const int DefaultAlignment = 32;
 
-    private readonly MemoryMappedFile _mmf;
-    private readonly MemoryMappedViewAccessor _accessor;
-    private readonly byte* _basePtr;
-    private readonly long _fileSize;
-    private readonly long _dataStartOffset;
+    // Per-shard memory mapping state (index 0 = first/only shard)
+    private readonly MemoryMappedFile[] _shardMmfs;
+    private readonly MemoryMappedViewAccessor[] _shardAccessors;
+    private readonly byte*[] _shardBasePtrs;
+    private readonly long[] _shardFileSizes;
+    private readonly long[] _shardDataStartOffsets;
 
     public GgufHeader Header { get; }
     public IReadOnlyDictionary<string, object> Metadata { get; }
     public IReadOnlyList<GgufTensorInfo> Tensors { get; }
 
     private GgufModel(
-        MemoryMappedFile mmf,
-        MemoryMappedViewAccessor accessor,
-        byte* basePtr,
-        long fileSize,
-        long dataStartOffset,
+        MemoryMappedFile[] shardMmfs,
+        MemoryMappedViewAccessor[] shardAccessors,
+        byte*[] shardBasePtrs,
+        long[] shardFileSizes,
+        long[] shardDataStartOffsets,
         GgufHeader header,
         IReadOnlyDictionary<string, object> metadata,
         IReadOnlyList<GgufTensorInfo> tensors)
     {
-        _mmf = mmf;
-        _accessor = accessor;
-        _basePtr = basePtr;
-        _fileSize = fileSize;
-        _dataStartOffset = dataStartOffset;
+        _shardMmfs = shardMmfs;
+        _shardAccessors = shardAccessors;
+        _shardBasePtrs = shardBasePtrs;
+        _shardFileSizes = shardFileSizes;
+        _shardDataStartOffsets = shardDataStartOffsets;
         Header = header;
         Metadata = metadata;
         Tensors = tensors;
     }
 
     /// <summary>
-    /// Opens and parses a GGUF file. Metadata is parsed eagerly; tensor data is accessed lazily via memory mapping.
+    /// Opens and parses a GGUF model file (or the first shard of a split model).
+    /// If the filename matches the pattern *-00001-of-NNNNN.gguf, all sibling shards
+    /// are opened automatically. Metadata is parsed eagerly; tensor data is lazy (mmap).
     /// </summary>
     public static GgufModel Open(string path)
     {
-        var fileInfo = new FileInfo(path);
-        if (!fileInfo.Exists)
-            throw new FileNotFoundException("GGUF file not found.", path);
+        var shardPaths = ResolveShardPaths(path);
+        int shardCount = shardPaths.Length;
 
-        var fileSize = fileInfo.Length;
-        var mmf = MemoryMappedFile.CreateFromFile(path, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
-        var accessor = mmf.CreateViewAccessor(0, fileSize, MemoryMappedFileAccess.Read);
-
-        byte* basePtr = null;
-        accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref basePtr);
+        var mmfs       = new MemoryMappedFile[shardCount];
+        var accessors  = new MemoryMappedViewAccessor[shardCount];
+        var basePtrs   = new byte*[shardCount];
+        var fileSizes  = new long[shardCount];
+        var dataStarts = new long[shardCount];
 
         try
         {
-            var reader = new GgufBinaryReader(basePtr, fileSize);
-
-            // Parse header
-            var magic = reader.ReadUInt32();
-            if (magic != GgufMagic)
-                throw new InvalidDataException($"Invalid GGUF magic: 0x{magic:X8} (expected 0x{GgufMagic:X8})");
-
-            var version = reader.ReadUInt32();
-            if (version is < 2 or > 3)
-                throw new InvalidDataException($"Unsupported GGUF version: {version} (supported: 2, 3)");
-
-            var tensorCount = reader.ReadUInt64();
-            var metadataKvCount = reader.ReadUInt64();
-            var header = new GgufHeader(magic, version, tensorCount, metadataKvCount);
-
-            // Parse metadata
-            var metadata = new Dictionary<string, object>((int)metadataKvCount);
-            for (ulong i = 0; i < metadataKvCount; i++)
+            // Open all shard files and acquire memory-mapped pointers
+            for (int s = 0; s < shardCount; s++)
             {
-                var key = reader.ReadGgufString();
-                var valueType = (GgufValueType)reader.ReadUInt32();
-                var value = reader.ReadGgufValue(valueType);
+                var fi = new FileInfo(shardPaths[s]);
+                if (!fi.Exists)
+                    throw new FileNotFoundException("GGUF shard file not found.", shardPaths[s]);
+                fileSizes[s] = fi.Length;
+                mmfs[s]      = MemoryMappedFile.CreateFromFile(shardPaths[s], FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+                accessors[s] = mmfs[s].CreateViewAccessor(0, fileSizes[s], MemoryMappedFileAccess.Read);
+                byte* ptr = null;
+                accessors[s].SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
+                basePtrs[s] = ptr;
+            }
+
+            // Parse shard 0: full metadata + first batch of tensors
+            var reader0 = new GgufBinaryReader(basePtrs[0], fileSizes[0]);
+            ValidateMagicAndVersion(ref reader0);
+            var tensorCount0 = reader0.ReadUInt64();
+            var kvCount0     = reader0.ReadUInt64();
+            var header       = new GgufHeader(GgufMagic, 3, tensorCount0, kvCount0);
+
+            var metadata = new Dictionary<string, object>((int)kvCount0);
+            for (ulong i = 0; i < kvCount0; i++)
+            {
+                var key       = reader0.ReadGgufString();
+                var valueType = (GgufValueType)reader0.ReadUInt32();
+                var value     = reader0.ReadGgufValue(valueType);
                 metadata[key] = value;
             }
 
-            // Determine alignment
-            var alignment = DefaultAlignment;
+            int alignment = DefaultAlignment;
             if (metadata.TryGetValue("general.alignment", out var alignObj))
                 alignment = Convert.ToInt32(alignObj);
 
-            // Parse tensor infos
-            var tensors = new GgufTensorInfo[(int)tensorCount];
-            for (ulong i = 0; i < tensorCount; i++)
+            var allTensors = new List<GgufTensorInfo>((int)tensorCount0 * shardCount);
+            ParseTensorInfos(ref reader0, tensorCount0, alignment, shardIndex: 0, fileSizes[0], out dataStarts[0], allTensors);
+
+            // Parse remaining shards: skip their metadata, collect tensor infos
+            for (int s = 1; s < shardCount; s++)
             {
-                var name = reader.ReadGgufString();
-                var nDims = reader.ReadUInt32();
-                var dims = new long[nDims];
-                for (uint d = 0; d < nDims; d++)
-                    dims[d] = (long)reader.ReadUInt64();
-                var dtype = (DType)reader.ReadUInt32();
-                var offset = reader.ReadUInt64();
-                tensors[i] = new GgufTensorInfo(name, (int)nDims, dims, dtype, offset);
+                var reader = new GgufBinaryReader(basePtrs[s], fileSizes[s]);
+                ValidateMagicAndVersion(ref reader);
+                var tensorCountS = reader.ReadUInt64();
+                var kvCountS     = reader.ReadUInt64();
+
+                // Skip metadata entries (present but redundant in shards > 0)
+                for (ulong i = 0; i < kvCountS; i++)
+                {
+                    reader.ReadGgufString();                         // key
+                    var vt = (GgufValueType)reader.ReadUInt32();
+                    reader.SkipGgufValue(vt);                        // value
+                }
+
+                ParseTensorInfos(ref reader, tensorCountS, alignment, shardIndex: s, fileSizes[s], out dataStarts[s], allTensors);
             }
 
             // Inject synthetic metadata from tensor inspection
             var arch = metadata.TryGetValue("general.architecture", out var archVal) ? (string)archVal : "llama";
-            for (int i = 0; i < tensors.Length; i++)
+            foreach (var t in allTensors)
             {
-                if (tensors[i].Name == "blk.0.attn_q.bias")
-                    metadata["_sharpi.has_attn_bias"] = true;
-                else if (tensors[i].Name == "blk.0.attn_q_norm.weight")
-                    metadata["_sharpi.has_qk_norm"] = true;
+                if (t.Name == "blk.0.attn_q.bias")     metadata["_sharpi.has_attn_bias"] = true;
+                else if (t.Name == "blk.0.attn_q_norm.weight") metadata["_sharpi.has_qk_norm"] = true;
             }
 
-            // Infer vocab size from token list when arch metadata is missing
             if (!metadata.ContainsKey($"{arch}.vocab_size") &&
-                metadata.TryGetValue("tokenizer.ggml.tokens", out var tokArr) && tokArr is object[] tokens2)
-            {
-                metadata[$"{arch}.vocab_size"] = (ulong)tokens2.Length;
-            }
+                metadata.TryGetValue("tokenizer.ggml.tokens", out var tokArr) && tokArr is object[] toks)
+                metadata[$"{arch}.vocab_size"] = (ulong)toks.Length;
 
-            // Data section starts at alignment boundary after all header/metadata/tensor-info
-            var dataStartOffset = AlignUp(reader.Position, alignment);
+            // Report actual version from header
+            var finalHeader = new GgufHeader(header.Magic, header.Version, (ulong)allTensors.Count, header.MetadataKvCount);
 
-            return new GgufModel(mmf, accessor, basePtr, fileSize, dataStartOffset, header, metadata, tensors);
+            return new GgufModel(mmfs, accessors, basePtrs, fileSizes, dataStarts, finalHeader, metadata, allTensors);
         }
         catch
         {
-            accessor.SafeMemoryMappedViewHandle.ReleasePointer();
-            accessor.Dispose();
-            mmf.Dispose();
+            // Cleanup on failure
+            for (int s = 0; s < shardCount; s++)
+            {
+                if (basePtrs[s] != null) accessors[s]?.SafeMemoryMappedViewHandle.ReleasePointer();
+                accessors[s]?.Dispose();
+                mmfs[s]?.Dispose();
+            }
             throw;
         }
     }
 
     /// <summary>
-    /// Returns a raw pointer to the tensor data in the memory-mapped file. Zero-copy, no span overhead.
+    /// Returns a raw pointer to the tensor data in the memory-mapped file. Zero-copy.
     /// The pointer is valid for the lifetime of this GgufModel instance.
     /// </summary>
     public unsafe byte* GetTensorDataPtr(GgufTensorInfo tensor) =>
-        _basePtr + _dataStartOffset + (long)tensor.DataOffset;
+        _shardBasePtrs[tensor.ShardIndex] + _shardDataStartOffsets[tensor.ShardIndex] + (long)tensor.DataOffset;
 
     /// <summary>
     /// Returns a read-only span directly into the memory-mapped file for the given tensor. Zero-copy.
     /// </summary>
     public ReadOnlySpan<byte> GetTensorData(GgufTensorInfo tensor)
     {
-        var absoluteOffset = _dataStartOffset + (long)tensor.DataOffset;
-        var byteSize = tensor.ByteSize;
+        int s              = tensor.ShardIndex;
+        var absoluteOffset = _shardDataStartOffsets[s] + (long)tensor.DataOffset;
+        var byteSize       = tensor.ByteSize;
 
-        if (absoluteOffset + byteSize > _fileSize)
+        if (absoluteOffset + byteSize > _shardFileSizes[s])
             throw new InvalidDataException(
-                $"Tensor '{tensor.Name}' data (offset={absoluteOffset}, size={byteSize}) exceeds file size ({_fileSize}).");
+                $"Tensor '{tensor.Name}' data (offset={absoluteOffset}, size={byteSize}) exceeds shard {s} file size ({_shardFileSizes[s]}).");
 
-        return new ReadOnlySpan<byte>(_basePtr + absoluteOffset, (int)byteSize);
+        return new ReadOnlySpan<byte>(_shardBasePtrs[s] + absoluteOffset, (int)byteSize);
     }
 
     /// <summary>
@@ -170,30 +185,91 @@ public sealed unsafe class GgufModel : IDisposable
         data.CopyTo(destination);
     }
 
-    /// <summary>
-    /// Finds a tensor by name, or returns null if not found.
-    /// </summary>
+    /// <summary>Finds a tensor by name, or returns null if not found.</summary>
     public GgufTensorInfo? FindTensor(string name)
     {
         for (int i = 0; i < Tensors.Count; i++)
-        {
-            if (Tensors[i].Name == name)
-                return Tensors[i];
-        }
+            if (Tensors[i].Name == name) return Tensors[i];
         return null;
     }
 
-    /// <summary>
-    /// Gets a metadata value by key, or returns the default if not found.
-    /// </summary>
+    /// <summary>Gets a metadata value by key, or returns the default if not found.</summary>
     public T GetMetadata<T>(string key, T defaultValue = default!) =>
         Metadata.TryGetValue(key, out var value) ? (T)Convert.ChangeType(value, typeof(T)) : defaultValue;
 
     public void Dispose()
     {
-        _accessor.SafeMemoryMappedViewHandle.ReleasePointer();
-        _accessor.Dispose();
-        _mmf.Dispose();
+        for (int s = 0; s < _shardAccessors.Length; s++)
+        {
+            _shardAccessors[s].SafeMemoryMappedViewHandle.ReleasePointer();
+            _shardAccessors[s].Dispose();
+            _shardMmfs[s].Dispose();
+        }
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Given a model path, returns the ordered list of shard file paths.
+    /// Detects the *-00001-of-NNNNN.gguf naming convention used by llama.cpp split models.
+    /// Falls back to [path] for single-file models.
+    /// </summary>
+    private static string[] ResolveShardPaths(string path)
+    {
+        var name = Path.GetFileName(path);
+        // Match pattern like "Model-00001-of-00002.gguf"
+        var m = System.Text.RegularExpressions.Regex.Match(
+            name, @"^(.+)-(\d+)-of-(\d+)(\.gguf)$",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        if (!m.Success) return [path];
+
+        string prefix   = m.Groups[1].Value;
+        int    total    = int.Parse(m.Groups[3].Value);
+        string ext      = m.Groups[4].Value;
+        string dir      = Path.GetDirectoryName(path) ?? ".";
+
+        var paths = new string[total];
+        for (int i = 0; i < total; i++)
+            paths[i] = Path.Combine(dir, $"{prefix}-{i + 1:D5}-of-{total:D5}{ext}");
+
+        return paths;
+    }
+
+    private static void ValidateMagicAndVersion(ref GgufBinaryReader reader)
+    {
+        var magic = reader.ReadUInt32();
+        if (magic != GgufMagic)
+            throw new InvalidDataException($"Invalid GGUF magic: 0x{magic:X8}");
+        var version = reader.ReadUInt32();
+        if (version is < 2 or > 3)
+            throw new InvalidDataException($"Unsupported GGUF version: {version}");
+    }
+
+    private static void ParseTensorInfos(
+        ref GgufBinaryReader reader,
+        ulong tensorCount,
+        int alignment,
+        int shardIndex,
+        long fileSize,
+        out long dataStartOffset,
+        List<GgufTensorInfo> result)
+    {
+        var tensors = new GgufTensorInfo[(int)tensorCount];
+        for (ulong i = 0; i < tensorCount; i++)
+        {
+            var tName  = reader.ReadGgufString();
+            var nDims  = reader.ReadUInt32();
+            var dims   = new long[nDims];
+            for (uint d = 0; d < nDims; d++)
+                dims[d] = (long)reader.ReadUInt64();
+            var dtype  = (DType)reader.ReadUInt32();
+            var offset = reader.ReadUInt64();
+            tensors[i] = new GgufTensorInfo(tName, (int)nDims, dims, dtype, offset, shardIndex);
+        }
+
+        dataStartOffset = AlignUp(reader.Position, alignment);
+        result.AddRange(tensors);
     }
 
     private static long AlignUp(long value, int alignment) =>
@@ -335,6 +411,44 @@ public sealed unsafe class GgufModel : IDisposable
             for (ulong i = 0; i < count; i++)
                 array[i] = ReadGgufValue(elementType);
             return array;
+        }
+
+        /// <summary>
+        /// Skips over a GGUF metadata value without allocating. Used when parsing redundant
+        /// metadata in shard files 1+.
+        /// </summary>
+        public void SkipGgufValue(GgufValueType type)
+        {
+            switch (type)
+            {
+                case GgufValueType.UInt8:
+                case GgufValueType.Int8:
+                case GgufValueType.Bool:  _pos += 1; break;
+                case GgufValueType.UInt16:
+                case GgufValueType.Int16: _pos += 2; break;
+                case GgufValueType.UInt32:
+                case GgufValueType.Int32:
+                case GgufValueType.Float32: _pos += 4; break;
+                case GgufValueType.UInt64:
+                case GgufValueType.Int64:
+                case GgufValueType.Float64: _pos += 8; break;
+                case GgufValueType.String:
+                {
+                    var len = ReadUInt64();
+                    _pos += (long)len;
+                    break;
+                }
+                case GgufValueType.Array:
+                {
+                    var elemType = (GgufValueType)ReadUInt32();
+                    var count    = ReadUInt64();
+                    for (ulong i = 0; i < count; i++)
+                        SkipGgufValue(elemType);
+                    break;
+                }
+                default:
+                    throw new InvalidDataException($"Unknown GGUF value type to skip: {type}");
+            }
         }
 
         private void EnsureAvailable(long bytes)
