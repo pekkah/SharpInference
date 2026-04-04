@@ -46,6 +46,7 @@ var app = builder.Build();
 
 app.MapOpenAiEndpoints();
 app.MapAnthropicEndpoints();
+app.MapResponsesEndpoints();
 app.MapHealthEndpoints();
 
 app.Run();
@@ -70,6 +71,7 @@ public partial class Program { }
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.ModelsResponse))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.ModelInfo[]))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.ErrorResponse))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.ResponseFormat))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.AnthropicMessageRequest))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.AnthropicMessage[]))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.AnthropicMessageResponse))]
@@ -82,5 +84,19 @@ public partial class Program { }
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.ATypeOnly))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.AErrorResponse))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.HealthStatus))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.ResponsesRequest))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.RespObject))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.RespOutputItem))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.RespOutputItem[]))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.RespContentPart))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.RespContentPart[]))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.RespUsage))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.RespCreatedEvent))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.RespOutputItemAddedEvent))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.RespContentPartAddedEvent))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.RespOutputTextDeltaEvent))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.RespOutputTextDoneEvent))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.RespOutputItemDoneEvent))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.RespCompletedEvent))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(System.Collections.Generic.Dictionary<string, float>))]
 internal partial class AppJsonContext : System.Text.Json.Serialization.JsonSerializerContext { }

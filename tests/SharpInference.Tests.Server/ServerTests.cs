@@ -235,6 +235,120 @@ public sealed class ServerTests : IClassFixture<WebApplicationFactory<Program>>
         var json = await response.Content.ReadAsStringAsync();
         Assert.Contains("chat.completion", json);
     }
+
+    // ── response_format (structured outputs) ─────────────────────────────────
+
+    [Fact]
+    public async Task ChatCompletion_WithResponseFormatJsonObject_AcceptsRequest()
+    {
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Give me JSON" } },
+            max_tokens = 5,
+            stream = false,
+            response_format = new { type = "json_object" }
+        };
+        var response = await _client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var json = await response.Content.ReadAsStringAsync();
+        Assert.Contains("chat.completion", json);
+    }
+
+    [Fact]
+    public async Task ChatCompletion_WithResponseFormatText_AcceptsRequest()
+    {
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            max_tokens = 5,
+            stream = false,
+            response_format = new { type = "text" }
+        };
+        var response = await _client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    // ── OpenAI Responses API (/v1/responses) ─────────────────────────────────
+
+    [Fact]
+    public async Task Responses_NonStreaming_StringInput_ReturnsResponseObject()
+    {
+        var req = new { model = "test-model", input = "Hello!", max_output_tokens = 10, stream = false };
+        var response = await _client.PostAsJsonAsync("/v1/responses", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var json = await response.Content.ReadAsStringAsync();
+        Assert.Contains("\"object\":\"response\"", json.Replace(" ", ""));
+        Assert.Contains("completed", json);
+        Assert.Contains("output_text", json);
+        Assert.Contains("Hello", json); // from FakeEngine output
+    }
+
+    [Fact]
+    public async Task Responses_NonStreaming_ArrayInput_ReturnsResponseObject()
+    {
+        var req = new
+        {
+            model = "test-model",
+            input = new[] { new { role = "user", content = "Hi" } },
+            max_output_tokens = 10,
+            stream = false
+        };
+        var response = await _client.PostAsJsonAsync("/v1/responses", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var json = await response.Content.ReadAsStringAsync();
+        Assert.Contains("completed", json);
+        Assert.Contains("output_text", json);
+    }
+
+    [Fact]
+    public async Task Responses_NonStreaming_WithInstructions_ReturnsOk()
+    {
+        var req = new
+        {
+            model = "test-model",
+            input = "Say hello",
+            instructions = "Be concise.",
+            max_output_tokens = 10,
+            stream = false
+        };
+        var response = await _client.PostAsJsonAsync("/v1/responses", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var json = await response.Content.ReadAsStringAsync();
+        Assert.Contains("completed", json);
+    }
+
+    [Fact]
+    public async Task Responses_Streaming_ReturnsSseEvents()
+    {
+        var req = new
+        {
+            model = "test-model",
+            input = "Hello",
+            max_output_tokens = 10,
+            stream = true
+        };
+        var response = await _client.PostAsJsonAsync("/v1/responses", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("text/event-stream", response.Content.Headers.ContentType?.MediaType);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.Contains("event: response.created", body);
+        Assert.Contains("event: response.output_text.delta", body);
+        Assert.Contains("event: response.output_text.done", body);
+        Assert.Contains("event: response.completed", body);
+        Assert.Contains("in_progress", body);
+        Assert.Contains("completed", body);
+    }
+
+    [Fact]
+    public async Task Responses_MissingInput_ReturnsEmptyCompletion()
+    {
+        // Null input → treated as empty user message, should still return 200
+        var req = new { model = "test-model", max_output_tokens = 5, stream = false };
+        var response = await _client.PostAsJsonAsync("/v1/responses", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
 }
 
 /// <summary>

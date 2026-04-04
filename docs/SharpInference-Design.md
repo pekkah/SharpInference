@@ -1828,6 +1828,26 @@ curl http://localhost:5000/v1/messages \
 
 ---
 
+#### Phase 10: OpenAI Responses API + Structured Outputs (✅ Complete)
+
+**Goal:** Add OpenAI Responses API compatibility (`/v1/responses`) and `response_format: {type: "json_object"}` structured output support to the Chat Completions endpoint.
+
+**OpenAI Responses API** (`ResponsesEndpoints.cs`):
+- New `POST /v1/responses` endpoint accepting `{ model, input, instructions?, max_output_tokens?, temperature?, top_p?, stream? }`
+- `input` accepts either a plain string or an array of message objects `[{role, content}]`; content can itself be a string or array of `{type, text}` content parts
+- `instructions` maps to a system message prepended before the input messages
+- Non-streaming: returns a `RespObject` with `status: "completed"`, `output: [{type: "message", role: "assistant", content: [{type: "output_text", text: "..."}]}]`, and `usage` with token counts
+- Streaming: SSE with the full event sequence: `response.created` → `response.output_item.added` → `response.content_part.added` → `response.output_text.delta` (one per token) → `response.output_text.done` → `response.output_item.done` → `response.completed`
+
+**Structured outputs** (`ChatCompletionRequest` + `OpenAiEndpoints.cs`):
+- New `ResponseFormat? ResponseFormat` field on `ChatCompletionRequest` (maps from `response_format: {type: "..."}`)
+- `ResponseFormat` record: `{ string? Type }` — supports `"text"` (no-op), `"json_object"`, and future `"json_schema"`
+- When `type == "json_object"`, a system message is prepended: `"Respond with valid JSON only. Do not include any text outside the JSON object."` — ensures the model is instructed to produce JSON (grammar-constrained sampling is a future direction)
+
+**Tests**: 7 new server tests — non-streaming Responses API with string input, array input, with instructions; streaming Responses API SSE events; `response_format: json_object` accepted; `response_format: text` accepted; missing input returns 200. All 176 tests pass.
+
+---
+
 ### 13.1 Correctness
 
 Every phase validates against llama.cpp as the reference implementation:
@@ -1949,8 +1969,8 @@ These are explicitly out of scope for the initial implementation but are noted a
 - **Weight quantization with TurboQuant** in addition to KV cache (the `turboquant-model` project demonstrates this path).
 - **Apple Silicon / Metal backend** via MoltenVK or a native Metal compute backend.
 - **Tool use / function calling** in the API server layer (JSON schema constrained logit masking, `tools` parameter).
-- **OpenAI Responses API** compatibility.
-- **Structured outputs** (`response_format: {type: "json_object"}`) via grammar-constrained sampling.
+- **OpenAI Responses API** compatibility. *(Implemented in Phase 10)*
+- **Structured outputs** (`response_format: {type: "json_object"}`) via grammar-constrained sampling. *(Basic system-prompt injection implemented in Phase 10; grammar-constrained sampling remains future work)*
 
 ---
 

@@ -43,7 +43,7 @@ public static class OpenAiEndpoints
         HealthEndpoints.RecordRequest();
 
         var modelArch = arch ?? Environment.GetEnvironmentVariable("SHARPI_ARCH") ?? "qwen2";
-        var messages = BuildMessageList(req.Messages, modelArch);
+        var messages = BuildMessageList(req.Messages, modelArch, req.ResponseFormat?.Type);
         var prompt = ChatTemplate.Format(messages, modelArch);
 
         // Parse logit_bias: OpenAI sends {"tokenId": biasValue} with string keys
@@ -131,9 +131,12 @@ public static class OpenAiEndpoints
             ctx.RequestAborted);
     }
 
-    private static List<(string role, string content)> BuildMessageList(OaiMessage[] messages, string arch)
+    private static List<(string role, string content)> BuildMessageList(
+        OaiMessage[] messages, string arch, string? responseFormatType = null)
     {
-        var list = new List<(string, string)>(messages.Length);
+        var list = new List<(string, string)>(messages.Length + 1);
+        if (responseFormatType == "json_object")
+            list.Add(("system", "Respond with valid JSON only. Do not include any text outside the JSON object."));
         foreach (var m in messages)
             list.Add((m.Role ?? "user", m.Content ?? ""));
         return list;
@@ -155,7 +158,8 @@ public sealed record ChatCompletionRequest(
     float? Temperature,
     float? TopP,
     bool? Stream,
-    Dictionary<string, float>? LogitBias);
+    Dictionary<string, float>? LogitBias,
+    ResponseFormat? ResponseFormat);
 
 public sealed record OaiMessage(string? Role, string? Content);
 
@@ -183,5 +187,7 @@ public sealed record ChunkDelta(string? Role, string? Content);
 
 public sealed record ModelsResponse(string Object, ModelInfo[] Data);
 public sealed record ModelInfo(string Id, string Object, long Created, string OwnedBy);
+
+public sealed record ResponseFormat(string? Type);
 
 public sealed record ErrorResponse(string Type, string Message);
