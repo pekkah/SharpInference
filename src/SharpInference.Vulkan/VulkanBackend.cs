@@ -621,6 +621,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
 
     private ComputePipeline? _rmsNormPipeline;
     private ComputePipeline? _headNormPipeline;
+    private ComputePipeline? _headNormPurePipeline;
     private ComputePipeline? _siluMulPipeline;
     private ComputePipeline? _addInPlacePipeline;
     private ComputePipeline? _addScaledInPlacePipeline;
@@ -677,6 +678,17 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _headNormPipeline ??= new ComputePipeline(this, Shaders.HeadNorm, 2, pushConstantSize: sizeof(HeadNormParams));
         var p = new HeadNormParams { headDim = headDim, numHeads = numHeads, eps = eps };
         DispatchOrRecord(_headNormPipeline, [GetBuffer(data), GetBuffer(weight)], numHeads, &p);
+    }
+
+    /// <summary>
+    /// Per-head RMS normalization without learned weights (L2 normalize).
+    /// Used for Llama4TextL2Norm in QK-norm.
+    /// </summary>
+    public void HeadNormPure(Tensor data, uint numHeads, uint headDim, float eps = 1e-6f)
+    {
+        _headNormPurePipeline ??= new ComputePipeline(this, Shaders.HeadNormPure, 1, pushConstantSize: sizeof(HeadNormParams));
+        var p = new HeadNormParams { headDim = headDim, numHeads = numHeads, eps = eps };
+        DispatchOrRecord(_headNormPurePipeline, [GetBuffer(data)], numHeads, &p);
     }
 
     public void SiLU(Tensor x) => throw new NotImplementedException("Use SiLuMul for fused SiLU*gate");
@@ -900,6 +912,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         // Dispose compute pipelines
         _rmsNormPipeline?.Dispose();
         _headNormPipeline?.Dispose();
+        _headNormPurePipeline?.Dispose();
         _siluMulPipeline?.Dispose();
         _addInPlacePipeline?.Dispose();
         _addScaledInPlacePipeline?.Dispose();

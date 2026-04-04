@@ -1390,6 +1390,43 @@ public static unsafe class SimdKernels
         }
     }
 
+    /// <summary>
+    /// RMS normalization without learned weights (pure L2 normalize).
+    /// Used for Llama4TextL2Norm in QK-norm.
+    /// </summary>
+    public static void PureRmsNorm(float* output, float* input, int size, float eps)
+    {
+        if (Fma.IsSupported && size >= 8)
+        {
+            var sumSq = Vector256<float>.Zero;
+            int i = 0;
+            for (; i + 8 <= size; i += 8)
+            {
+                var v = Avx.LoadVector256(input + i);
+                sumSq = Fma.MultiplyAdd(v, v, sumSq);
+            }
+            float ss = HSum256(sumSq);
+            for (; i < size; i++) ss += input[i] * input[i];
+
+            float scale = 1.0f / MathF.Sqrt(ss / size + eps);
+            var scaleV = Vector256.Create(scale);
+
+            i = 0;
+            for (; i + 8 <= size; i += 8)
+                Avx.Store(output + i, Avx.Multiply(Avx.LoadVector256(input + i), scaleV));
+            for (; i < size; i++)
+                output[i] = input[i] * scale;
+        }
+        else
+        {
+            float ss = 0;
+            for (int i = 0; i < size; i++) ss += input[i] * input[i];
+            float scale = 1.0f / MathF.Sqrt(ss / size + eps);
+            for (int i = 0; i < size; i++)
+                output[i] = input[i] * scale;
+        }
+    }
+
     // ================================================================
     //  Softmax (AVX2 with scalar exp)
     // ================================================================
@@ -1785,13 +1822,13 @@ public static unsafe class SimdKernels
         var f = Avx.Subtract(t, ti);
 
         // Polynomial approximation of 2^f on [-0.5, 0.5]
-        // Coefficients from minimax fit
-        var p = Vector256.Create(1.3534167e-3f);
-        p = Fma.MultiplyAdd(p, f, Vector256.Create(8.3742266e-3f));
-        p = Fma.MultiplyAdd(p, f, Vector256.Create(4.1665859e-2f));
-        p = Fma.MultiplyAdd(p, f, Vector256.Create(1.6666288e-1f));
-        p = Fma.MultiplyAdd(p, f, Vector256.Create(4.9999994e-1f));
-        p = Fma.MultiplyAdd(p, f, Vector256.Create(1.0f));
+        // Coefficients: Taylor series of 2^x = e^(x·ln2), i.e. (ln2)^k / k!
+        var p = Vector256.Create(1.5403530e-4f);
+        p = Fma.MultiplyAdd(p, f, Vector256.Create(1.3333558e-3f));
+        p = Fma.MultiplyAdd(p, f, Vector256.Create(9.6181291e-3f));
+        p = Fma.MultiplyAdd(p, f, Vector256.Create(5.5504109e-2f));
+        p = Fma.MultiplyAdd(p, f, Vector256.Create(2.4022651e-1f));
+        p = Fma.MultiplyAdd(p, f, Vector256.Create(6.9314718e-1f));
         p = Fma.MultiplyAdd(p, f, Vector256.Create(1.0f));
 
         // 2^n via IEEE 754 exponent manipulation

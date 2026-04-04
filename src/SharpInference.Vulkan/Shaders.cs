@@ -256,6 +256,54 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Per-head RMS normalization without learned weights (L2 normalize).
+    /// Used for Llama4TextL2Norm in QK-norm.
+    /// Push constants: { uint head_dim, uint num_heads, float eps }.
+    /// </summary>
+    internal const string HeadNormPure = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer Data { float data_buf[]; };
+
+        layout(push_constant) uniform Params {
+            uint head_dim;
+            uint num_heads;
+            float eps;
+        };
+
+        shared float sdata[256];
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint head = gl_WorkGroupID.x;
+            if (head >= num_heads) return;
+
+            uint base_off = head * head_dim;
+
+            float sum = 0.0;
+            for (uint i = tid; i < head_dim; i += 256) {
+                float v = data_buf[base_off + i];
+                sum += v * v;
+            }
+            sdata[tid] = sum;
+            barrier();
+
+            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] += sdata[tid + s];
+                barrier();
+            }
+
+            float scale = inversesqrt(sdata[0] / float(head_dim) + eps);
+            for (uint i = tid; i < head_dim; i += 256) {
+                data_buf[base_off + i] = data_buf[base_off + i] * scale;
+            }
+        }
+        """;
+
+    /// <summary>
     /// Element-wise multiply: output[i] = a[i] * b[i]
     /// Push constants: { uint n }.
     /// Bindings: 0=a, 1=b, 2=output.
