@@ -268,7 +268,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
                 _gpuBv![i] = UploadWeight($"blk.{i}.attn_v.bias");
                 _gpuBo![i] = UploadWeight($"blk.{i}.attn_output.bias");
             }
-            if (_hasQkNorm)
+            if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
                 _gpuQNorm![i] = UploadWeight($"blk.{i}.attn_q_norm.weight");
                 _gpuKNorm![i] = UploadWeight($"blk.{i}.attn_k_norm.weight");
@@ -385,7 +385,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
                 _cpuBv[ci] = LoadCpuBias($"blk.{li}.attn_v.bias", _numKvHeads * _headDim);
                 _cpuBo[ci] = LoadCpuBias($"blk.{li}.attn_output.bias", _embDim);
             }
-            if (_hasQkNorm)
+            if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
                 _cpuQNorm[ci] = LoadCpuBias($"blk.{li}.attn_q_norm.weight", _headDim);
                 _cpuKNorm[ci] = LoadCpuBias($"blk.{li}.attn_k_norm.weight", _headDim);
@@ -617,7 +617,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         }
 
         {
-            // NoPE: skip RoPE and QK-norm for NoPE layers
+            // NoPE: skip RoPE for NoPE layers
             bool useRoPE = _hp.NoRopeLayerStep == 0
                 || (i + 1) % _hp.NoRopeLayerStep != 0;
             if (useRoPE)
@@ -625,13 +625,22 @@ public sealed unsafe class HybridForwardPass : IForwardPass
                 _gpu.RoPE(_gpuQ, position, _headDim, _hp.RopeTheta);
                 _gpu.RoPE(_gpuK, position, _headDim, _hp.RopeTheta);
                 _gpu.RecordBarrier();
+            }
 
-                if (_hasQkNorm)
+            // QK-norm: for L2 (Llama-4), only on RoPE layers per llama.cpp
+            if (_hasQkNorm && (_hp.UseL2QkNorm ? useRoPE : true))
+            {
+                if (_hp.UseL2QkNorm)
+                {
+                    _gpu.HeadNormPure(_gpuQ, (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps);
+                    _gpu.HeadNormPure(_gpuK, (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps);
+                }
+                else
                 {
                     _gpu.HeadNorm(_gpuQ, _gpuQNorm![i], (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps);
                     _gpu.HeadNorm(_gpuK, _gpuKNorm![i], (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps);
-                    _gpu.RecordBarrier();
                 }
+                _gpu.RecordBarrier();
             }
         }
 
@@ -738,9 +747,17 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             // RoPE
             SimdKernels.ApplyRoPECached(_cpuQ, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numHeads, _headDim);
             SimdKernels.ApplyRoPECached(_cpuK, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numKvHeads, _headDim);
+        }
 
-            // QK-norm after RoPE, only for RoPE layers
-            if (_hasQkNorm)
+        // QK-norm: for L2 (Llama-4), only on RoPE layers per llama.cpp
+        if (_hasQkNorm && (_hp.UseL2QkNorm ? useRoPE : true))
+        {
+            if (_hp.UseL2QkNorm)
+            {
+                PerHeadPureRmsNorm(_cpuQ, _numHeads, _headDim, _hp.RmsNormEps);
+                PerHeadPureRmsNorm(_cpuK, _numKvHeads, _headDim, _hp.RmsNormEps);
+            }
+            else
             {
                 PerHeadRmsNorm(_cpuQ, _cpuQNorm[ci], _numHeads, _headDim, _hp.RmsNormEps);
                 PerHeadRmsNorm(_cpuK, _cpuKNorm[ci], _numKvHeads, _headDim, _hp.RmsNormEps);
@@ -1482,6 +1499,12 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             SimdKernels.RmsNorm(data + h * headDim, data + h * headDim, weight, headDim, eps);
     }
 
+    private static void PerHeadPureRmsNorm(float* data, int numHeads, int headDim, float eps)
+    {
+        for (int h = 0; h < numHeads; h++)
+            SimdKernels.PureRmsNorm(data + h * headDim, data + h * headDim, headDim, eps);
+    }
+
     private static float* Alloc(int count) =>
         (float*)NativeMemory.AllocZeroed((nuint)count, (nuint)sizeof(float));
 
@@ -1528,7 +1551,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
 
             if (_hasAttnBias)
             { _gpu.Free(_gpuBq![i]); _gpu.Free(_gpuBk![i]); _gpu.Free(_gpuBv![i]); _gpu.Free(_gpuBo![i]); }
-            if (_hasQkNorm)
+            if (_hasQkNorm && !_hp.UseL2QkNorm)
             { _gpu.Free(_gpuQNorm![i]); _gpu.Free(_gpuKNorm![i]); }
         }
         if (_tqEnabled)

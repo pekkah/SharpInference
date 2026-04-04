@@ -280,7 +280,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                 _bo![i] = UploadWeight($"blk.{i}.attn_output.bias");
             }
 
-            if (_hasQkNorm)
+            if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
                 _wqNorm![i] = UploadWeight($"blk.{i}.attn_q_norm.weight");
                 _wkNorm![i] = UploadWeight($"blk.{i}.attn_k_norm.weight");
@@ -379,7 +379,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                 _gpu.RecordBarrier();
             }
 
-            // NoPE: skip RoPE and QK-norm for NoPE layers
+            // NoPE: skip RoPE for NoPE layers
             {
                 bool useRoPE = _hp.NoRopeLayerStep == 0
                     || (layer + 1) % _hp.NoRopeLayerStep != 0;
@@ -389,14 +389,22 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                     _gpu.RoPE(_q, position, _headDim, _hp.RopeTheta);
                     _gpu.RoPE(_k, position, _headDim, _hp.RopeTheta);
                     _gpu.RecordBarrier();
+                }
 
-                    // QK-norm after RoPE, only for RoPE layers
-                    if (_hasQkNorm)
+                // QK-norm: for L2 (Llama-4), only on RoPE layers per llama.cpp
+                if (_hasQkNorm && (_hp.UseL2QkNorm ? useRoPE : true))
+                {
+                    if (_hp.UseL2QkNorm)
+                    {
+                        _gpu.HeadNormPure(_q, (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps);
+                        _gpu.HeadNormPure(_k, (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps);
+                    }
+                    else
                     {
                         _gpu.HeadNorm(_q, _wqNorm![layer], (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps);
                         _gpu.HeadNorm(_k, _wkNorm![layer], (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps);
-                        _gpu.RecordBarrier();
                     }
+                    _gpu.RecordBarrier();
                 }
             }
             // KV append reads K/V (with or without RoPE)
@@ -899,7 +907,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                 _gpu.Free(_bv![i]); _gpu.Free(_bo![i]);
             }
 
-            if (_hasQkNorm)
+            if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
                 _gpu.Free(_wqNorm![i]); _gpu.Free(_wkNorm![i]);
             }

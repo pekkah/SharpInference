@@ -173,7 +173,7 @@ public static class TierPlanner
             total += MeasureGpuTensorBytes(model, $"blk.{layer}.attn_output.bias");
         }
 
-        if (hp.HasQkNorm)
+        if (hp.HasQkNorm && !hp.UseL2QkNorm)
         {
             total += MeasureGpuTensorBytes(model, $"blk.{layer}.attn_q_norm.weight");
             total += MeasureGpuTensorBytes(model, $"blk.{layer}.attn_k_norm.weight");
