@@ -149,7 +149,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 AnsiConsole.MarkupLine("[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
             }
             forward = fwd.Forward;
-            prefill = fwd.Prefill;
+            prefill = tokens => fwd.Prefill(tokens);
             resetCache = settings.TurboQuant ? fwd.TqCache!.Reset : fwd.Cache.Reset;
             AnsiConsole.MarkupLine("[dim]Backend: [blue]CPU[/][/]");
         }
@@ -176,7 +176,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     }
 
                     forward = fwd.Forward;
-                    prefill = fwd.Prefill;
+                    prefill = tokens => fwd.Prefill(tokens);
                     resetCache = settings.TurboQuant ? fwd.TqCache!.Reset : fwd.Cache.Reset;
                     AnsiConsole.MarkupLine("[dim]Backend: [blue]CPU[/] (auto fallback: no GPU-capable layers for this model/path)[/]");
                     goto backendConfigured;
@@ -192,7 +192,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     AnsiConsole.MarkupLine($"[dim]TurboQuant: [green]enabled[/] (3-bit, context: {gfwd.MaxSeqLen})[/]");
                 gpuFwd = gfwd;
                 forward = gfwd.Forward;
-                prefill = tokens => { ReadOnlySpan<float> l = default; for (int i = 0; i < tokens.Count; i++) l = gfwd.Forward(tokens[i], i); return l; };
+                prefill = tokens => gfwd.Prefill(tokens);
                 resetCache = gfwd.ResetCache;
                 AnsiConsole.MarkupLine($"[dim]Backend: [green]GPU[/] ({gpu.Name}, all {hp.NumLayers} layers)[/]");
             }
@@ -208,7 +208,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 var hfwd = new HybridForwardPass(model, gpu, hp, placement, settings.TurboQuant);
                 gpuFwd = hfwd;
                 forward = hfwd.Forward;
-                prefill = tokens => { ReadOnlySpan<float> l = default; for (int i = 0; i < tokens.Count; i++) l = hfwd.Forward(tokens[i], i); return l; };
+                prefill = tokens => hfwd.Prefill(tokens);
                 resetCache = hfwd.ResetCache;
                 AnsiConsole.MarkupLine($"[dim]Backend: [yellow]Hybrid[/] ({gpu.Name}, {placement.GpuLayers} GPU + {placement.CpuLayers} CPU layers)[/]");
             }

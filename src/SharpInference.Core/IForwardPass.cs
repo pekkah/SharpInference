@@ -10,6 +10,18 @@ public interface IForwardPass : IDisposable
     ReadOnlySpan<float> Forward(int token, int position);
 
     /// <summary>
+    /// Batch-process prompt tokens and return logits for the last token.
+    /// Faster than sequential Forward() calls for long prompts due to batched GEMM.
+    /// </summary>
+    /// <param name="tokens">Prompt token IDs to process.</param>
+    /// <param name="startPos">
+    /// Position at which to begin writing into the KV cache (default 0).
+    /// Set to the prefix length when reusing a cached prefix (cache must already have
+    /// K/V for positions 0..startPos-1 from a previous call).
+    /// </param>
+    ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0);
+
+    /// <summary>
     /// Truncate the KV cache to the given length, discarding positions >= length.
     /// Used by speculative decoding to rewind rejected draft tokens.
     /// </summary>

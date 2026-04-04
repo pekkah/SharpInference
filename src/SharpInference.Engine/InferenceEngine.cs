@@ -8,6 +8,10 @@ namespace SharpInference.Engine;
 /// Top-level inference engine. Wraps a forward pass + tokenizer, applies pre-formatted
 /// prompts (caller applies chat template), and provides serialized async generation.
 /// One request runs at a time; concurrent callers block in arrival order.
+///
+/// Prefix caching: if successive prompts share a page-aligned token prefix, the KV cache
+/// for those positions is reused and only the new suffix is prefilled — eliminating
+/// redundant computation for repeated system prompts.
 /// </summary>
 public sealed class InferenceEngine : IInferenceEngine, IDisposable
 {
@@ -15,6 +19,10 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
     private readonly ITokenizer _tokenizer;
     private readonly IDisposable[] _owned;
     private readonly SemaphoreSlim _gate = new(1, 1);
+
+    // Prefix caching state (guarded by _gate — only accessed during generation).
+    private int[]? _prevTokens;
+
     private bool _disposed;
 
     public string ModelId { get; }
@@ -35,6 +43,26 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
         _owned = owned;
     }
 
+    /// <summary>
+    /// Finds the longest page-aligned prefix shared between the new token array and the cached
+    /// previous token array, returning its length (0 if no reusable prefix exists).
+    /// </summary>
+    private int FindCacheablePrefix(int[] tokens)
+    {
+        if (_prevTokens == null || tokens.Length <= PagedKvCache.PageSize)
+            return 0;
+
+        // Compare up to all-but-last-page tokens (need at least one page to bother).
+        int maxCompare = Math.Min(tokens.Length - 1, _prevTokens.Length);
+        int match = 0;
+        while (match < maxCompare && tokens[match] == _prevTokens[match])
+            match++;
+
+        // Align down to page boundary (must be at least one full page).
+        int aligned = (match / PagedKvCache.PageSize) * PagedKvCache.PageSize;
+        return aligned;
+    }
+
     /// <inheritdoc/>
     public async IAsyncEnumerable<string> GenerateAsync(
         string prompt,
@@ -52,18 +80,31 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
             {
                 try
                 {
-                    _fwd.ResetCache();
-                    var tokens = _tokenizer.Encode(prompt);
+                    var tokens = _tokenizer.Encode(prompt).ToArray();
                     var rng = new Random();
                     var stopIds = sp.StopTokenIds ?? [_tokenizer.EosTokenId];
 
-                    // Prefill — sequential forward on all prompt tokens
-                    ReadOnlySpan<float> logits = default;
-                    for (int i = 0; i < tokens.Count; i++)
+                    // Prefix cache check: reuse K/V for matching prefix, skip its prefill.
+                    int prefixLen = FindCacheablePrefix(tokens);
+                    if (prefixLen > 0)
                     {
-                        ct.ThrowIfCancellationRequested();
-                        logits = _fwd.Forward(tokens[i], i);
+                        // Soft-truncate: discard positions >= prefixLen, keep prefix K/V.
+                        _fwd.TruncateTo(prefixLen);
                     }
+                    else
+                    {
+                        _fwd.ResetCache();
+                    }
+
+                    // Prefill: process all prompt tokens (or just the suffix after the cached prefix).
+                    ReadOnlySpan<float> logits;
+                    int[] suffixTokens = prefixLen > 0 ? tokens[prefixLen..] : tokens;
+                    if (suffixTokens.Length > 0)
+                        logits = _fwd.Prefill(suffixTokens, prefixLen);
+                    else
+                        logits = _fwd.Forward(tokens[^1], tokens.Length - 1);
+
+                    _prevTokens = tokens;
 
                     // Decode loop
                     for (int i = 0; i < sp.MaxNewTokens; i++)
@@ -77,7 +118,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                         if (stopIds.Contains(next)) break;
 
                         channel.Writer.TryWrite(_tokenizer.Decode([next]));
-                        logits = _fwd.Forward(next, tokens.Count + i);
+                        logits = _fwd.Forward(next, tokens.Length + i);
                     }
 
                     channel.Writer.TryComplete();

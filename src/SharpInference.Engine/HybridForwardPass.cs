@@ -569,6 +569,15 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             _cpuKvCache.Reset();
     }
 
+    /// <inheritdoc/>
+    public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0)
+    {
+        ReadOnlySpan<float> logits = default;
+        for (int i = 0; i < tokens.Count; i++)
+            logits = Forward(tokens[i], startPos + i);
+        return logits;
+    }
+
     // ================================================================
     //  GPU Layer (same pattern as GpuForwardPass)
     // ================================================================

@@ -16,7 +16,8 @@ public sealed unsafe class ForwardPass : IForwardPass
 {
     private readonly GgufModel _model;
     private readonly ModelHyperparams _hp;
-    private readonly KvCache _kvCache;
+    private readonly PagedKvCache _kvCache;
+    private readonly int _ctxLen; // scratch buffer sizing (attnScores, TurboQuant)
 
     // Norm weight cache: only tiny F32 weights (2048 floats = 8KB each)
     private readonly Dictionary<string, nint> _normCache = new();
@@ -77,11 +78,12 @@ public sealed unsafe class ForwardPass : IForwardPass
     {
         _model = model;
         _hp = hp;
-        // Cap context length to avoid OOM (e.g., Llama 4 Scout has 10M context)
+        // ctxLen only governs scratch buffer sizes; PagedKvCache allocates pages lazily.
         int ctxLen = maxContextLength > 0
             ? Math.Min(maxContextLength, hp.ContextLength)
-            : Math.Min(hp.ContextLength, 32768); // sensible default cap
-        _kvCache = new KvCache(hp.NumLayers, ctxLen, hp.NumKvHeads, hp.EmbeddingDim / hp.NumHeads);
+            : Math.Min(hp.ContextLength, 32768);
+        _ctxLen = ctxLen;
+        _kvCache = new PagedKvCache(hp.NumLayers, hp.NumKvHeads, hp.EmbeddingDim / hp.NumHeads);
 
         _embDim = hp.EmbeddingDim;
         _headDim = hp.EmbeddingDim / hp.NumHeads;
@@ -185,7 +187,7 @@ public sealed unsafe class ForwardPass : IForwardPass
             : _embTensor; // tied embeddings
     }
 
-    public KvCache Cache => _kvCache;
+    public PagedKvCache Cache => _kvCache;
 
     /// <summary>Vocabulary size of this model.</summary>
     public int VocabSize => _hp.VocabSize;
@@ -220,8 +222,8 @@ public sealed unsafe class ForwardPass : IForwardPass
     public void EnableTurboQuant(int fp32WindowSize = 256, int bits = 3)
     {
         _tqKvCache = new TurboQuantKvCache(
-            _hp.NumLayers, _kvCache.MaxSeqLen, _numKvHeads, _headDim,
-            Math.Min(fp32WindowSize, _kvCache.MaxSeqLen), bits,
+            _hp.NumLayers, _ctxLen, _numKvHeads, _headDim,
+            Math.Min(fp32WindowSize, _ctxLen), bits,
             layerIndexBase: 0, totalLayerCountForSeeds: _hp.NumLayers);
         _rotatedQuery = Alloc(_headDim);
         _decompBuf = Alloc(_headDim);
@@ -236,18 +238,18 @@ public sealed unsafe class ForwardPass : IForwardPass
     /// amortizing DRAM reads ~N× vs sequential Forward() calls.
     /// Returns logits for the last token.
     /// </summary>
-    public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens)
+    public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0)
     {
         int N = tokens.Count;
         if (N == 0) throw new ArgumentException("Token list is empty");
-        if (N == 1) return Forward(tokens[0], 0);
+        if (N == 1) return Forward(tokens[0], startPos);
 
         // MoE models: sequential prefill (batched FFN not yet supported for MoE)
         if (_hp.IsMoE)
         {
             ReadOnlySpan<float> logits = default;
             for (int i = 0; i < N; i++)
-                logits = Forward(tokens[i], i);
+                logits = Forward(tokens[i], startPos + i);
             return logits;
         }
 
@@ -276,7 +278,7 @@ public sealed unsafe class ForwardPass : IForwardPass
             // 2. Process layer-by-layer
             for (int layer = 0; layer < _hp.NumLayers; layer++)
             {
-                _kvCache.Reset();
+                _kvCache.TruncateTo(startPos);
                 var normW = GetNormWeight(_attnNorm[layer]);
 
                 // Batch RMS norm for all tokens
@@ -323,8 +325,8 @@ public sealed unsafe class ForwardPass : IForwardPass
                     float* kn = batchK + (long)n * kvDim;
                     float* vn = batchV + (long)n * kvDim;
 
-                    SimdKernels.ApplyRoPE(qn, n, _numHeads, _headDim, _hp.RopeTheta);
-                    SimdKernels.ApplyRoPE(kn, n, _numKvHeads, _headDim, _hp.RopeTheta);
+                    SimdKernels.ApplyRoPE(qn, startPos + n, _numHeads, _headDim, _hp.RopeTheta);
+                    SimdKernels.ApplyRoPE(kn, startPos + n, _numKvHeads, _headDim, _hp.RopeTheta);
 
                     _kvCache.Append(layer,
                         new ReadOnlySpan<float>(kn, kvDim),
@@ -333,7 +335,7 @@ public sealed unsafe class ForwardPass : IForwardPass
 
                     // Copy Q to scratch for Attention (it reads from _q)
                     Copy(_q, qn, qDim);
-                    Attention(layer, n);
+                    Attention(layer, startPos + n);
 
                     // Copy attention output for batched output projection
                     Copy(batchAttnOut + (long)n * qDim, _attnOut, qDim);
@@ -392,9 +394,8 @@ public sealed unsafe class ForwardPass : IForwardPass
                 }
             }
 
-            // Set final KV cache length to N for subsequent decode calls
-            _kvCache.Reset();
-            for (int i = 0; i < N; i++) _kvCache.IncrementPosition();
+            // Set KV cache length to startPos + N for subsequent decode calls.
+            _kvCache.TruncateTo(startPos + N);
 
             }
             finally

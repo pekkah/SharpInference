@@ -332,6 +332,15 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         _fp32Count = 0;
     }
 
+    /// <inheritdoc/>
+    public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0)
+    {
+        ReadOnlySpan<float> logits = default;
+        for (int i = 0; i < tokens.Count; i++)
+            logits = Forward(tokens[i], startPos + i);
+        return logits;
+    }
+
     /// <summary>
     /// Run one token through the transformer on GPU. Returns logits span (downloaded from VRAM).
     /// </summary>
