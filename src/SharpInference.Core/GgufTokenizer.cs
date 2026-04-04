@@ -13,6 +13,7 @@ public sealed class GgufTokenizer : ITokenizer
     private readonly Tokenizer _inner;
     private readonly Dictionary<string, int> _specialTokens;
     private readonly Dictionary<string, int> _vocab;
+    private readonly bool _needsByteEncoding;
 
     public int VocabSize { get; }
     public int BosTokenId { get; }
@@ -24,6 +25,9 @@ public sealed class GgufTokenizer : ITokenizer
     /// <summary>All special (control) tokens keyed by their string representation.</summary>
     public IReadOnlyDictionary<string, int> SpecialTokens => _specialTokens;
 
+    /// <summary>The type name of the inner tokenizer (for diagnostics).</summary>
+    public string InnerTokenizerType => _inner.GetType().Name;
+
     private GgufTokenizer(
         Tokenizer inner,
         Dictionary<string, int> specialTokens,
@@ -33,11 +37,13 @@ public sealed class GgufTokenizer : ITokenizer
         int eosTokenId,
         int unknownTokenId,
         int padTokenId,
-        bool addBosToken)
+        bool addBosToken,
+        bool needsByteEncoding)
     {
         _inner = inner;
         _specialTokens = specialTokens;
         _vocab = vocab;
+        _needsByteEncoding = needsByteEncoding;
         VocabSize = vocabSize;
         BosTokenId = bosTokenId;
         EosTokenId = eosTokenId;
@@ -128,9 +134,12 @@ public sealed class GgufTokenizer : ITokenizer
             specialTokens.Count > 0 ? specialTokens : null;
 
         // Try CodeGenTokenizer first (better decode quality for GPT-2 style models).
+        // CodeGenTokenizer handles GPT-2 byte-level BPE encoding internally.
         // Fall back to BpeTokenizer if CodeGenTokenizer fails (e.g., Llama 3.1 where
         // the default unknown token <|endoftext|> is not in the BPE vocab).
+        // BpeTokenizer requires us to pre-encode text to GPT-2 byte-level Unicode.
         Tokenizer inner;
+        bool needsByteEncoding = false;
         try
         {
             using var vs1 = new MemoryStream(vocabBytes);
@@ -147,6 +156,7 @@ public sealed class GgufTokenizer : ITokenizer
             inner = BpeTokenizer.Create(vs2, ms2,
                 specialTokens: specialTokensDict,
                 unknownToken: unknownToken);
+            needsByteEncoding = true;
         }
 
         return new GgufTokenizer(
@@ -158,7 +168,8 @@ public sealed class GgufTokenizer : ITokenizer
             eosTokenId,
             unknownTokenId,
             padTokenId,
-            addBosToken);
+            addBosToken,
+            needsByteEncoding);
     }
 
     private static Dictionary<string, int> BuildVocabLookup(object[] tokensArray)
@@ -216,6 +227,12 @@ public sealed class GgufTokenizer : ITokenizer
     {
         if (text.Length == 0) return [];
 
+        // BpeTokenizer doesn't do GPT-2 byte-level encoding internally —
+        // we must convert raw bytes to GPT-2 Unicode before BPE lookup.
+        // CodeGenTokenizer handles this automatically.
+        if (_needsByteEncoding)
+            text = EncodeToGpt2Bytes(text);
+
         var ids = _inner.EncodeToIds(text);
 
         if (ids.Count > 0) return ids;
@@ -223,11 +240,25 @@ public sealed class GgufTokenizer : ITokenizer
         var result = new List<int>(text.Length);
         foreach (char c in text)
         {
-            char bpe = EncodeByteToGpt2(c);
+            // Text is already in GPT-2 encoding if _needsByteEncoding was true
+            char bpe = _needsByteEncoding ? c : EncodeByteToGpt2(c);
             if (_vocab.TryGetValue(bpe.ToString(), out int id))
                 result.Add(id);
         }
         return result;
+    }
+
+    /// <summary>
+    /// Converts a UTF-8 string to GPT-2 byte-level BPE Unicode representation.
+    /// Each byte in the UTF-8 encoding is mapped to its GPT-2 Unicode codepoint.
+    /// </summary>
+    private static string EncodeToGpt2Bytes(string text)
+    {
+        byte[] utf8 = Encoding.UTF8.GetBytes(text);
+        var sb = new StringBuilder(utf8.Length);
+        foreach (byte b in utf8)
+            sb.Append(EncodeByteToGpt2((char)b));
+        return sb.ToString();
     }
 
     /// <summary>

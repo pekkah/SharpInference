@@ -13,7 +13,7 @@ public sealed class ModelGraph
         new Dictionary<string, GgufTensorInfo>();
 }
 
-public sealed class ModelHyperparams
+public sealed record ModelHyperparams
 {
     public int VocabSize { get; init; }
     public int ContextLength { get; init; }
@@ -68,6 +68,12 @@ public sealed class ModelHyperparams
     public bool UseSigmoidGating { get; init; }
 
     /// <summary>
+    /// Whether QK-norm uses pure RMS norm (L2 normalize) without learned weights.
+    /// Llama-4 uses Llama4TextL2Norm (pure RMS norm); Qwen3 uses weighted RMS norm.
+    /// </summary>
+    public bool UseL2QkNorm { get; init; }
+
+    /// <summary>
     /// Extract hyperparameters from GGUF metadata using the model's architecture prefix.
     /// Supports llama-family models (llama, mistral, qwen, smollm, etc.) and MoE variants.
     /// </summary>
@@ -95,10 +101,12 @@ public sealed class ModelHyperparams
         // This is hardcoded in llama.cpp (not stored in GGUF metadata).
         bool isLlama4 = arch.Equals("llama4", StringComparison.OrdinalIgnoreCase);
         int noRopeStep = isLlama4 ? 4 : 0;
-        // TODO: Llama-4 uses sigmoid gating with weight-before-FFN per Meta's reference impl.
-        // Currently using softmax (works but incorrect). Sigmoid produces magnitude divergence
-        // through the 48-layer stack despite matching the reference math. Root cause unknown.
-        bool useSigmoidGating = false;
+        // Llama-4 uses sigmoid gating with weight-before-FFN per Meta's reference impl.
+        bool useSigmoidGating = isLlama4;
+        // Llama-4 uses Llama4TextL2Norm for QK-norm: pure RMS norm without learned weights.
+        // No attn_q_norm.weight tensor exists, so force hasQkNorm for Llama-4.
+        bool useL2QkNorm = isLlama4;
+        if (isLlama4) hasQkNorm = true;
 
         return new ModelHyperparams
         {
@@ -122,6 +130,7 @@ public sealed class ModelHyperparams
             HasSharedExpert = hasSharedExpert,
             NoRopeLayerStep = noRopeStep,
             UseSigmoidGating = useSigmoidGating,
+            UseL2QkNorm = useL2QkNorm,
         };
     }
 
