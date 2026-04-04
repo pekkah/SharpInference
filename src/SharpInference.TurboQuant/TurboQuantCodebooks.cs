@@ -4,6 +4,10 @@ namespace SharpInference.TurboQuant;
 /// Precomputed Lloyd-Max codebooks for TurboQuant KV cache compression.
 /// Generated offline by tools/CodebookGen for the Beta(d/2, d/2) distribution
 /// induced by Walsh-Hadamard rotation of unit vectors.
+///
+/// Reference: Zandieh et al., "TurboQuant: Online Vector Quantization with
+/// Near-optimal Distortion Rate" (arXiv:2504.19874), Section 3.1.
+/// See also: docs/research/TurboQuant-arXiv-2504.19874.pdf
 /// </summary>
 public static class TurboQuantCodebooks
 {

@@ -7,11 +7,20 @@ using System.Runtime.Intrinsics.X86;
 namespace SharpInference.TurboQuant;
 
 /// <summary>
-/// TurboQuant block format for one head_dim-sized vector:
+/// Core quantization/dequantization operations implementing TurboQuant Algorithm 1
+/// (MSE-optimal) from Zandieh et al., "TurboQuant: Online Vector Quantization with
+/// Near-optimal Distortion Rate" (arXiv:2504.19874).
+///
+/// Block format for one head_dim-sized vector:
 ///   [FP16 norm (2 bytes)] [packed N-bit indices] [padding to align]
 ///
 /// For 3-bit, dim=128: 2 + 48 + 2 = 52 bytes per block.
 /// For 4-bit, dim=128: 2 + 64 + 2 = 68 bytes per block.
+///
+/// NOTE: This implements only Algorithm 1 (TurboQuant_mse). The paper's Algorithm 2
+/// (TurboQuant_prod) adds a 1-bit QJL correction on the residual for unbiased inner
+/// product estimation. At 3-4 bits the MSE-optimal bias is small (~2-5%), but adding
+/// QJL would improve long-context fidelity at the cost of ~1 extra bit per channel.
 /// </summary>
 public static class TurboQuantOps
 {
