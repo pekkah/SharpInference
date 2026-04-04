@@ -1722,25 +1722,34 @@ curl http://localhost:5000/v1/messages \
   -d '{"model":"smollm2","messages":[{"role":"user","content":"Hello"}],"max_tokens":256}'
 ```
 
-#### Phase 7b: PagedAttention (Planned)
+#### Phase 7b: PagedKvCache + Batched Prefill + Prefix Caching (✅ Complete)
 
-PagedAttention (inspired by vLLM):
-- [ ] Paged KV cache: allocate KV blocks on demand (not pre-allocated for max_seq_len)
-- [ ] Block table per sequence: maps logical KV positions → physical blocks in VRAM
-- [ ] Dynamic block allocation/deallocation as sequences start/finish
-- [ ] Combined with TurboQuant: paged TQ3 blocks for ~5x memory savings over vLLM's FP16 pages
-- [ ] Eliminates 60-80% KV cache memory waste from pre-allocation
+**PagedKvCache** (`src/SharpInference.Engine/PagedKvCache.cs`):
+- [x] Lazy page allocation: pages (16 positions each) allocated on first write, not upfront
+- [x] Per-layer pool: `_pool[layer][slot]` — each slot is `PageSize × kvDim × 2 floats` (keys + values)
+- [x] Free-list warm pool: returned pages are reused across requests without `NativeMemory.Free`
+- [x] Soft `TruncateTo(n)`: moves length pointer without freeing pages — enables zero-copy prefix reuse
+- [x] Full `Reset()`: returns all slots to warm pool — use at start of unrelated request
+- [x] Eliminates GBs-upfront pre-allocation (Llama 4 Scout's 10M context would have been 40TB+)
+- [x] Replaces `KvCache` in `ForwardPass`; `KvCache` retained for `HybridForwardPass` compatibility
 
-Continuous batching:
-- [ ] Request queue with dynamic batch formation
-- [ ] Add new requests to running batch without waiting for others to finish
-- [ ] Per-sequence KV cache management (page in/out individual sequences)
-- [ ] Iteration-level scheduling: each decode step can serve different requests
+**Batched Prefill via `IForwardPass.Prefill(tokens, startPos = 0)`**:
+- [x] Added to `IForwardPass` interface — all implementations provide it
+- [x] `ForwardPass`: existing per-layer batched GEMM path; updated to accept `startPos` for prefix reuse
+- [x] `GpuForwardPass`, `HybridForwardPass`: sequential `Forward()` fallback
+- [x] `InferenceEngine` now uses `Prefill()` instead of a loop of `Forward()` calls
 
-Prefix caching:
-- [ ] Share KV cache blocks across requests with identical system prompts
-- [ ] Hash-based prefix matching for common prompt templates
-- [ ] Reduces redundant computation for API workloads with shared system prompts
+**Prefix caching in `InferenceEngine`**:
+- [x] `FindCacheablePrefix()`: compares new prompt tokens against previous request, finds longest page-aligned common prefix
+- [x] On hit: `TruncateTo(prefixLen)` keeps cached K/V, then `Prefill(suffix, prefixLen)` fills only the new portion
+- [x] On miss: `ResetCache()` (full reset) + `Prefill(allTokens)`
+- [x] Eliminates repeated system-prompt prefill cost for multi-turn chat API workloads
+
+**Memory savings example** — SmolLM2-1.7B (24 layers, kvDim=512):
+- Before: `32768 × 512 × 2 × 4B × 24L = 3.2GB` pre-allocated per engine instance
+- After: only allocates pages actually written; 4K context = `256 × 512 × 2 × 4B × 24 = 402MB`
+
+**Tests**: 13 new tests in `PagedKvCacheTests` covering cross-page access, soft truncate, page reuse, and prefix reuse semantics. All 145 tests pass.
 
 ---
 
@@ -1822,7 +1831,9 @@ Based on the reference benchmarks above, these are concrete targets per phase:
 | 4a | Llama 3.1 70B Q4_K_M | Hybrid GPU+CPU, RTX 4070 Ti | ~3–5 TG t/s (naive offload) | ≥ 5 TG t/s | **1.8 t/s (18 GPU + 62 CPU)** | Q5_K AVX2+512, matches llama.cpp CPU (1.54). Phase 4b for streaming |
 | 5 | Llama 4 Scout 109B Q2_K | MoE offload, 12GB + 64GB RAM | ~12 TG t/s (llama.cpp est.) | ≥ 15 TG t/s | CPU: **4.6 t/s**, Hybrid 1-layer+prefetch: **3.1 t/s** ✅ — SLRU slot cache + CPU fallback + background prefetcher (dedicated async VkCommandPool). |
 | 5+6 | Llama 4 Scout + speculative | MoE + SmolLM2 draft | ~12 TG t/s (no spec) | ≥ 25 effective TG t/s | ~2x from speculative decoding on top of Phase 5 |
-| 7 | Multi-user server | PagedAttention + continuous batching | vLLM ~485 tot t/s @10 users | ≥ 300 tot t/s | Paged TQ3 KV = ~5x more sequences than vLLM FP16 |
+| 7a | API server (single-user) | CPU/GPU, any model | N/A | Correct wire format | ✅ OpenAI + Anthropic compatible, 8 integration tests |
+| 7b | API server (prefix cache) | CPU, SmolLM2 1.7B | N/A (new feature) | Eliminate repeated prefill | ✅ PagedKvCache + prefix cache; 3.2GB→402MB at 4K ctx |
+| 7c | Multi-user server | PagedAttention + continuous batching | vLLM ~485 tot t/s @10 users | ≥ 300 tot t/s | Paged TQ3 KV = ~5x more sequences than vLLM FP16 |
 
 **Stretch targets (if all optimizations compose well):**
 
