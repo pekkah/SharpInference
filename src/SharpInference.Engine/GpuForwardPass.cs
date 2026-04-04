@@ -487,11 +487,13 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         _gpu.RecordBarrier();
         GpuMatMul(_logits, _wOutput, _hidden);
 
-        // Submit ALL dispatches at once
+        // Fold the logits download into the main submit: no second command buffer needed.
+        _gpu.RecordComputeToTransferBarrier();
+        _gpu.RecordDownloadToStaging(_logits, _logitsBuf.Length);
+
         _gpu.EndRecordAndSubmit();
 
-        // Download logits to CPU (reuse pre-allocated buffer)
-        _gpu.Download(_logits, _logitsBuf);
+        _gpu.ReadFromStaging(_logitsBuf);
         return _logitsBuf;
     }
 

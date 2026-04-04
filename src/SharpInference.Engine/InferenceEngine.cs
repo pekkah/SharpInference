@@ -23,9 +23,19 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
     // Prefix caching state (guarded by _gate — only accessed during generation).
     private int[]? _prevTokens;
 
+    // Observability counters (updated via Interlocked).
+    private int _pendingCount;
+    private int _activeCount;
+
     private bool _disposed;
 
     public string ModelId { get; }
+
+    /// <summary>Number of callers blocked waiting to acquire the generation gate.</summary>
+    public int QueueDepth => _pendingCount;
+
+    /// <summary>1 while a generation is in progress, 0 otherwise.</summary>
+    public int ActiveRequests => _activeCount;
 
     /// <param name="fwd">Forward pass implementation (CPU / GPU / Hybrid). Owned by this engine.</param>
     /// <param name="tokenizer">Tokenizer matching the model vocabulary.</param>
@@ -69,7 +79,10 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
         SamplingParams sp,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
+        Interlocked.Increment(ref _pendingCount);
         await _gate.WaitAsync(ct).ConfigureAwait(false);
+        Interlocked.Decrement(ref _pendingCount);
+        Interlocked.Increment(ref _activeCount);
         try
         {
             var channel = Channel.CreateUnbounded<string>(
@@ -136,6 +149,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
         }
         finally
         {
+            Interlocked.Decrement(ref _activeCount);
             _gate.Release();
         }
     }

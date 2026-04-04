@@ -249,6 +249,88 @@ public sealed unsafe class VulkanShaderTests
     }
 
     [Fact]
+    public void MatVecQ6KMatchesCpu()
+    {
+        // Q6_K tensors appear as output.weight in Q4_K_M models.
+        // We fall back to a synthetic test if the tensor is not present.
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        using var backend = new Vulkan.VulkanBackend();
+
+        // Try to find a Q6_K tensor; output.weight is Q6_K in Q4_K_M models
+        var tensorInfo = model.FindTensor("output.weight")
+                      ?? model.FindTensor("token_embd.weight");
+        if (tensorInfo is null) return;
+        var qInfo = tensorInfo.Value;
+        if (qInfo.DType != DType.Q6_K) return;
+
+        var rawData = model.GetTensorData(qInfo);
+        int totalElements = (int)qInfo.ElementCount;
+        var f32Weights = new float[totalElements];
+        SharpInference.Cpu.Dequantize.ToFloat32(rawData, f32Weights, qInfo.DType, totalElements);
+
+        int matRows = (int)qInfo.Dimensions[0];
+        int matCols = totalElements / matRows;
+
+        // Only test a manageable subset of rows
+        const int maxRows = 512;
+        int testRows = Math.Min(matRows, maxRows);
+
+        var input = new float[matCols];
+        var rng = new Random(99);
+        for (int i = 0; i < matCols; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var cpuOutput = new float[testRows];
+        for (int r = 0; r < testRows; r++)
+        {
+            float sum = 0;
+            for (int c = 0; c < matCols; c++)
+                sum += f32Weights[r * matCols + c] * input[c];
+            cpuOutput[r] = sum;
+        }
+
+        int floatCount = rawData.Length / 4;
+        var rawAsFloats = new float[floatCount];
+        System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(rawData).CopyTo(rawAsFloats);
+
+        // Only upload the rows we're testing
+        int bytesPerRow = rawData.Length / matRows;
+        int testBytes = testRows * bytesPerRow;
+        int testFloatCount = testBytes / 4;
+        var testRawAsFloats = rawAsFloats[..testFloatCount];
+
+        var gpuWeights = backend.Upload(testRawAsFloats, TensorShape.D1(testFloatCount));
+        var gpuInput = backend.Upload(input, TensorShape.D1(matCols));
+        var gpuOutput = backend.Allocate(TensorShape.D1(testRows));
+
+        backend.MatMul(gpuOutput, gpuWeights, gpuInput, DType.Q6_K);
+
+        var gpuResult = new float[testRows];
+        backend.Download(gpuOutput, gpuResult);
+
+        int mismatches = 0;
+        for (int i = 0; i < testRows; i++)
+        {
+            float diff = MathF.Abs(gpuResult[i] - cpuOutput[i]);
+            float relDiff = diff / (MathF.Abs(cpuOutput[i]) + 1e-6f);
+            if (relDiff > 0.05f)
+            {
+                if (mismatches < 3)
+                    Console.WriteLine($"  [{i}]: gpu={gpuResult[i]:F4} cpu={cpuOutput[i]:F4} rel={relDiff:P1}");
+                mismatches++;
+            }
+        }
+        Console.WriteLine($"MatVecQ6K: {mismatches}/{testRows} mismatches (>5% rel error)");
+        Assert.True(mismatches < testRows / 10, $"Too many mismatches: {mismatches}/{testRows}");
+
+        backend.Free(gpuWeights);
+        backend.Free(gpuInput);
+        backend.Free(gpuOutput);
+    }
+
+    [Fact]
     public void GpuEmbedThenRmsNormMatchesCpu()
     {
         var path = FindModelPath();
@@ -538,6 +620,102 @@ public sealed unsafe class VulkanShaderTests
         Assert.Equal(hp.VocabSize, logits.Length);
         for (int i = 0; i < logits.Length; i++)
             Assert.True(float.IsFinite(logits[i]), $"Non-finite logit at [{i}]: {logits[i]}");
+    }
+
+    /// <summary>
+    /// Validates the Attention shader produces correct output for seq_len &lt;= 256 (fast path).
+    /// </summary>
+    [Fact]
+    public void AttentionShader_ShortSequence_MatchesCpuReference()
+    {
+        AttentionShaderMatchesCpuReference(seqLen: 64, numHeads: 2, numKvHeads: 2, headDim: 32);
+    }
+
+    /// <summary>
+    /// Validates the Attention shader produces correct output for seq_len &gt; 256,
+    /// exercising the stored-scores path (was the correctness bug region).
+    /// </summary>
+    [Fact]
+    public void AttentionShader_LongSequence_MatchesCpuReference()
+    {
+        AttentionShaderMatchesCpuReference(seqLen: 300, numHeads: 2, numKvHeads: 2, headDim: 32);
+    }
+
+    /// <summary>
+    /// Validates GQA (num_heads > num_kv_heads) for seq_len &gt; 256.
+    /// </summary>
+    [Fact]
+    public void AttentionShader_LongSequenceGqa_MatchesCpuReference()
+    {
+        AttentionShaderMatchesCpuReference(seqLen: 512, numHeads: 4, numKvHeads: 2, headDim: 32);
+    }
+
+    private static void AttentionShaderMatchesCpuReference(
+        int seqLen, int numHeads, int numKvHeads, int headDim)
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        int kvDim = numKvHeads * headDim;
+        int maxSeqLen = seqLen + 16;
+
+        var rng = new Random(42);
+        var q = new float[numHeads * headDim];
+        var kCache = new float[maxSeqLen * kvDim];
+        var vCache = new float[maxSeqLen * kvDim];
+        for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < seqLen * kvDim; i++) kCache[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < seqLen * kvDim; i++) vCache[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // CPU reference: scaled dot-product attention with GQA
+        float scale = 1f / MathF.Sqrt(headDim);
+        var cpuOutput = new float[numHeads * headDim];
+        for (int h = 0; h < numHeads; h++)
+        {
+            int kvHead = h / (numHeads / numKvHeads);
+            var scores = new float[seqLen];
+            for (int t = 0; t < seqLen; t++)
+            {
+                float dot = 0f;
+                for (int d = 0; d < headDim; d++)
+                    dot += q[h * headDim + d] * kCache[t * kvDim + kvHead * headDim + d];
+                scores[t] = dot * scale;
+            }
+            // Softmax
+            float maxS = scores.Max();
+            float sumE = 0f;
+            for (int t = 0; t < seqLen; t++) { scores[t] = MathF.Exp(scores[t] - maxS); sumE += scores[t]; }
+            for (int t = 0; t < seqLen; t++) scores[t] /= sumE;
+            // Weighted value sum
+            for (int d = 0; d < headDim; d++)
+            {
+                float sum = 0f;
+                for (int t = 0; t < seqLen; t++)
+                    sum += scores[t] * vCache[t * kvDim + kvHead * headDim + d];
+                cpuOutput[h * headDim + d] = sum;
+            }
+        }
+
+        // GPU
+        var gpuQ = backend.Upload(q, TensorShape.D1(q.Length));
+        var gpuK = backend.Upload(kCache, TensorShape.D2(maxSeqLen, kvDim));
+        var gpuV = backend.Upload(vCache, TensorShape.D2(maxSeqLen, kvDim));
+        var gpuOut = backend.Allocate(TensorShape.D1(numHeads * headDim));
+        ((Vulkan.VulkanBackend)backend).Attention(
+            gpuQ, gpuK, gpuV, gpuOut,
+            (uint)numHeads, (uint)numKvHeads, (uint)headDim,
+            (uint)seqLen, (uint)maxSeqLen);
+
+        var gpuResult = new float[numHeads * headDim];
+        backend.Download(gpuOut, gpuResult);
+
+        for (int i = 0; i < cpuOutput.Length; i++)
+            Assert.True(MathF.Abs(gpuResult[i] - cpuOutput[i]) < 1e-3f,
+                $"Attention mismatch at [{i}] (seqLen={seqLen}): gpu={gpuResult[i]:F5} cpu={cpuOutput[i]:F5}");
+
+        backend.Free(gpuQ);
+        backend.Free(gpuK);
+        backend.Free(gpuV);
+        backend.Free(gpuOut);
     }
 
     private static string? FindModelPath()

@@ -81,6 +81,11 @@ public sealed unsafe class HybridForwardPass : IForwardPass
     private int _kvLength;
     private readonly int _maxSeqLen;
 
+    // Precomputed RoPE cos/sin tables for CPU layers [maxSeqLen * halfDim]
+    private readonly float* _ropeCosTable;
+    private readonly float* _ropeSinTable;
+    private readonly int _ropeHalfDim;
+
     // ── Expert slot cache (for MoE GPU layers with lazy/evictable expert loading) ──
     private ExpertSlotManager? _expertSlotManager;
     private MoEPrefetcher? _prefetcher;
@@ -310,11 +315,17 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         _cpuAttnOut = Alloc(_numHeads * _headDim);
         _cpuFfnGate = Alloc(_intermDim);
         _cpuFfnUp = Alloc(_intermDim);
-        _cpuAttnScores = Alloc(_maxSeqLen);
+        _cpuAttnScores = Alloc(_numHeads * _maxSeqLen);
         _cpuRouterLogits = _isMoE ? Alloc(hp.NumExperts) : null;
         _cpuSharedOut = _isMoE && _hasSharedExpert ? Alloc(_embDim) : null;
         _cpuExpertGate = _isMoE ? Alloc(_expertDim) : null;
         _cpuExpertUp = _isMoE ? Alloc(_expertDim) : null;
+
+        // Precompute RoPE cos/sin tables for CPU layers
+        _ropeHalfDim = _headDim / 2;
+        _ropeCosTable = (float*)NativeMemory.Alloc((nuint)((long)_maxSeqLen * _ropeHalfDim * sizeof(float)));
+        _ropeSinTable = (float*)NativeMemory.Alloc((nuint)((long)_maxSeqLen * _ropeHalfDim * sizeof(float)));
+        SimdKernels.BuildRopeTable(_ropeCosTable, _ropeSinTable, _maxSeqLen, _headDim, hp.RopeTheta);
 
         _cpuAttnNorm = new CpuWeightRef[_nCpuLayers];
         _cpuWq = new CpuWeightRef[_nCpuLayers]; _cpuWk = new CpuWeightRef[_nCpuLayers];
@@ -429,8 +440,8 @@ public sealed unsafe class HybridForwardPass : IForwardPass
                 _nCpuLayers, _maxSeqLen, _numKvHeads, _headDim,
                 _tqFp32Window, tqBits,
                 layerIndexBase: _nGpuLayers, totalLayerCountForSeeds: _hp.NumLayers);
-            _cpuRotatedQuery = Alloc(_headDim);
-            _cpuDecompBuf = Alloc(_headDim);
+            _cpuRotatedQuery = Alloc(_numHeads * _headDim);
+            _cpuDecompBuf = Alloc(_numHeads * _headDim);
         }
     }
 
@@ -550,8 +561,10 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         _gpu.RecordBarrier();
         GpuMatMul(_gpuLogits, _gpuOutputWeight!, _gpuHidden);
 
+        _gpu.RecordComputeToTransferBarrier();
+        _gpu.RecordDownloadToStaging(_gpuLogits, _logitsBuf.Length);
         _gpu.EndRecordAndSubmit();
-        _gpu.Download(_gpuLogits, _logitsBuf);
+        _gpu.ReadFromStaging(_logitsBuf);
 
         _kvLength = position + 1;
         return _logitsBuf;
@@ -714,8 +727,8 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         }
 
         // RoPE
-        SimdKernels.ApplyRoPE(_cpuQ, position, _numHeads, _headDim, _hp.RopeTheta);
-        SimdKernels.ApplyRoPE(_cpuK, position, _numKvHeads, _headDim, _hp.RopeTheta);
+        SimdKernels.ApplyRoPECached(_cpuQ, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numHeads, _headDim);
+        SimdKernels.ApplyRoPECached(_cpuK, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numKvHeads, _headDim);
 
         // KV cache append (ci = CPU layer index)
         if (_cpuTqKvCache != null)
@@ -763,8 +776,8 @@ public sealed unsafe class HybridForwardPass : IForwardPass
 
     private void CpuDenseFfn(int ci)
     {
-        SimdKernels.MatVec(_cpuFfnGate, _cpuWGate[ci].DataPtr, _cpuNormBuf, _intermDim, _embDim, _cpuWGate[ci].DType);
-        SimdKernels.MatVec(_cpuFfnUp, _cpuWUp[ci].DataPtr, _cpuNormBuf, _intermDim, _embDim, _cpuWUp[ci].DType);
+        SimdKernels.MatVecDual(_cpuFfnGate, _cpuWGate[ci].DataPtr, _cpuFfnUp, _cpuWUp[ci].DataPtr,
+            _cpuNormBuf, _intermDim, _embDim, _cpuWGate[ci].DType, _cpuWUp[ci].DType);
         SimdKernels.SiLuMul(_cpuFfnGate, _cpuFfnUp, _intermDim);
         SimdKernels.MatVec(_cpuHidden, _cpuWDown[ci].DataPtr, _cpuFfnGate, _embDim, _intermDim, _cpuWDown[ci].DType);
     }
@@ -810,47 +823,51 @@ public sealed unsafe class HybridForwardPass : IForwardPass
     {
         int seqLen = position + 1;
         float scale = 1.0f / MathF.Sqrt(_headDim);
+        int maxSeqLen = _maxSeqLen; int hd = _headDim; int hpkg = _headsPerKvGroup;
+        var q = _cpuQ; var attnOut = _cpuAttnOut; var scores = _cpuAttnScores;
+        var kvCache = _cpuKvCache;
 
-        for (int h = 0; h < _numHeads; h++)
+        Parallel.For(0, _numHeads, h =>
         {
-            int kvHead = h / _headsPerKvGroup;
-            float* qHead = _cpuQ + h * _headDim;
-            float* outHead = _cpuAttnOut + h * _headDim;
+            int kvHead = h / hpkg;
+            float* qHead = q + h * hd;
+            float* outHead = attnOut + h * hd;
+            float* headScores = scores + (long)h * maxSeqLen;
 
             for (int t = 0; t < seqLen; t++)
             {
-                float* kVec = _cpuKvCache.KeyAt(ci, t) + kvHead * _headDim;
-                _cpuAttnScores[t] = SimdKernels.DotF32(qHead, kVec, _headDim) * scale;
+                float* kVec = kvCache.KeyAt(ci, t) + kvHead * hd;
+                headScores[t] = SimdKernels.DotF32(qHead, kVec, hd) * scale;
             }
 
-            SimdKernels.SoftmaxInPlace(_cpuAttnScores, seqLen);
+            SimdKernels.SoftmaxInPlace(headScores, seqLen);
 
-            for (int d = 0; d < _headDim; d++) outHead[d] = 0;
+            for (int d = 0; d < hd; d++) outHead[d] = 0;
 
             for (int t = 0; t < seqLen; t++)
             {
-                float* vVec = _cpuKvCache.ValueAt(ci, t) + kvHead * _headDim;
-                float w = _cpuAttnScores[t];
-                if (Fma.IsSupported && _headDim >= 8)
+                float* vVec = kvCache.ValueAt(ci, t) + kvHead * hd;
+                float w = headScores[t];
+                if (Fma.IsSupported && hd >= 8)
                 {
                     var wv = Vector256.Create(w);
                     int d = 0;
-                    for (; d + 8 <= _headDim; d += 8)
+                    for (; d + 8 <= hd; d += 8)
                     {
                         var o = Avx.LoadVector256(outHead + d);
                         var v = Avx.LoadVector256(vVec + d);
                         Avx.Store(outHead + d, Fma.MultiplyAdd(wv, v, o));
                     }
-                    for (; d < _headDim; d++)
+                    for (; d < hd; d++)
                         outHead[d] += w * vVec[d];
                 }
                 else
                 {
-                    for (int d = 0; d < _headDim; d++)
+                    for (int d = 0; d < hd; d++)
                         outHead[d] += w * vVec[d];
                 }
             }
-        }
+        });
     }
 
     private void CpuTqAttention(int ci, int position)
@@ -860,78 +877,80 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         int tqLen = tq.GetTqLength(ci);
         int fp32Start = tqLen;
         float scale = 1.0f / MathF.Sqrt(_headDim);
+        int maxSeqLen = _maxSeqLen; int hd = _headDim; int hpkg = _headsPerKvGroup;
+        int tqBlkSz = tq.TqBlockSize;
+        var q = _cpuQ; var attnOut = _cpuAttnOut; var scores = _cpuAttnScores;
+        var rotated = _cpuRotatedQuery; var decomp = _cpuDecompBuf;
 
-        for (int h = 0; h < _numHeads; h++)
+        Parallel.For(0, _numHeads, h =>
         {
-            int kvHead = h / _headsPerKvGroup;
-            float* qHead = _cpuQ + h * _headDim;
-            float* outHead = _cpuAttnOut + h * _headDim;
+            int kvHead = h / hpkg;
+            float* qHead = q + h * hd;
+            float* outHead = attnOut + h * hd;
+            float* headScores = scores + (long)h * maxSeqLen;
+            float* headRotated = rotated + h * hd;
+            float* headDecomp = decomp + h * hd;
 
-            // Rotate query once per head for TQ dot products
             var keyCompressor = tq.GetKeyCompressor(ci, kvHead);
             keyCompressor.RotateQuery(
-                new ReadOnlySpan<float>(qHead, _headDim),
-                new Span<float>(_cpuRotatedQuery, _headDim));
+                new ReadOnlySpan<float>(qHead, hd),
+                new Span<float>(headRotated, hd));
 
-            // TQ-compressed positions
             for (int t = 0; t < tqLen; t++)
             {
                 byte* tqKey = tq.TqKeyAt(ci, t, kvHead);
                 float dot = keyCompressor.DequantDot(
-                    new ReadOnlySpan<byte>(tqKey, tq.TqBlockSize),
-                    new ReadOnlySpan<float>(_cpuRotatedQuery, _headDim));
-                _cpuAttnScores[t] = dot * scale;
+                    new ReadOnlySpan<byte>(tqKey, tqBlkSz),
+                    new ReadOnlySpan<float>(headRotated, hd));
+                headScores[t] = dot * scale;
             }
 
-            // FP32 window positions
             for (int t = fp32Start; t < seqLen; t++)
             {
-                float* kVec = tq.Fp32KeyAt(ci, t) + kvHead * _headDim;
-                _cpuAttnScores[t] = SimdKernels.DotF32(qHead, kVec, _headDim) * scale;
+                float* kVec = tq.Fp32KeyAt(ci, t) + kvHead * hd;
+                headScores[t] = SimdKernels.DotF32(qHead, kVec, hd) * scale;
             }
 
-            SimdKernels.SoftmaxInPlace(_cpuAttnScores, seqLen);
+            SimdKernels.SoftmaxInPlace(headScores, seqLen);
 
-            for (int d = 0; d < _headDim; d++) outHead[d] = 0;
+            for (int d = 0; d < hd; d++) outHead[d] = 0;
 
-            // TQ values: decompress and accumulate
             var valCompressor = tq.GetValueCompressor(ci, kvHead);
             for (int t = 0; t < tqLen; t++)
             {
                 byte* tqVal = tq.TqValueAt(ci, t, kvHead);
-                var decompSpan = new Span<float>(_cpuDecompBuf, _headDim);
                 valCompressor.Decompress(
-                    new ReadOnlySpan<byte>(tqVal, tq.TqBlockSize), decompSpan);
-                float w = _cpuAttnScores[t];
-                for (int d = 0; d < _headDim; d++)
-                    outHead[d] += w * _cpuDecompBuf[d];
+                    new ReadOnlySpan<byte>(tqVal, tqBlkSz),
+                    new Span<float>(headDecomp, hd));
+                float w = headScores[t];
+                for (int d = 0; d < hd; d++)
+                    outHead[d] += w * headDecomp[d];
             }
 
-            // FP32 values
             for (int t = fp32Start; t < seqLen; t++)
             {
-                float* vVec = tq.Fp32ValueAt(ci, t) + kvHead * _headDim;
-                float w = _cpuAttnScores[t];
-                if (Fma.IsSupported && _headDim >= 8)
+                float* vVec = tq.Fp32ValueAt(ci, t) + kvHead * hd;
+                float w = headScores[t];
+                if (Fma.IsSupported && hd >= 8)
                 {
                     var wv = Vector256.Create(w);
                     int d = 0;
-                    for (; d + 8 <= _headDim; d += 8)
+                    for (; d + 8 <= hd; d += 8)
                     {
                         var o = Avx.LoadVector256(outHead + d);
                         var v = Avx.LoadVector256(vVec + d);
                         Avx.Store(outHead + d, Fma.MultiplyAdd(wv, v, o));
                     }
-                    for (; d < _headDim; d++)
+                    for (; d < hd; d++)
                         outHead[d] += w * vVec[d];
                 }
                 else
                 {
-                    for (int d = 0; d < _headDim; d++)
+                    for (int d = 0; d < hd; d++)
                         outHead[d] += w * vVec[d];
                 }
             }
-        }
+        });
     }
 
     private void ExpertMatVec(float* output, in CpuWeightRef packedTensor,
@@ -1479,6 +1498,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         NativeMemory.Free(_cpuHidden); NativeMemory.Free(_cpuResidual); NativeMemory.Free(_cpuNormBuf);
         NativeMemory.Free(_cpuQ); NativeMemory.Free(_cpuK); NativeMemory.Free(_cpuV); NativeMemory.Free(_cpuAttnOut);
         NativeMemory.Free(_cpuFfnGate); NativeMemory.Free(_cpuFfnUp); NativeMemory.Free(_cpuAttnScores);
+        NativeMemory.Free(_ropeCosTable); NativeMemory.Free(_ropeSinTable);
         if (_cpuRouterLogits != null) NativeMemory.Free(_cpuRouterLogits);
         if (_cpuSharedOut != null) NativeMemory.Free(_cpuSharedOut);
         if (_cpuExpertGate != null) NativeMemory.Free(_cpuExpertGate);

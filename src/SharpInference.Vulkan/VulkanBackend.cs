@@ -73,6 +73,48 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
             0, 1, &barrier, 0, null, 0, null);
     }
 
+    /// <summary>Insert a compute→transfer barrier (shader writes visible to transfer reads).</summary>
+    public void RecordComputeToTransferBarrier()
+    {
+        VkMemoryBarrier barrier = new()
+        {
+            srcAccessMask = VkAccessFlags.ShaderWrite,
+            dstAccessMask = VkAccessFlags.TransferRead,
+        };
+        _vkd.vkCmdPipelineBarrier(_transferCmd,
+            VkPipelineStageFlags.ComputeShader, VkPipelineStageFlags.Transfer,
+            0, 1, &barrier, 0, null, 0, null);
+    }
+
+    /// <summary>
+    /// Record a GPU→staging copy into the current command buffer.
+    /// Call before <see cref="EndRecordAndSubmit"/>, then <see cref="ReadFromStaging"/>
+    /// after the fence fires — eliminates a second command-buffer submission for logits download.
+    /// </summary>
+    public void RecordDownloadToStaging(Tensor src, int floatCount)
+    {
+        var gpuBuf = GetBuffer(src);
+        ulong byteSize = (ulong)((long)floatCount * sizeof(float));
+
+        if (_downloadStaging == null || _downloadStagingSize < byteSize)
+        {
+            _downloadStaging?.Dispose();
+            _downloadStaging = GpuBuffer.CreateStaging(this, byteSize, VkBufferUsageFlags.TransferDst);
+            _downloadStagingSize = byteSize;
+        }
+
+        VkBufferCopy copyRegion = new() { size = byteSize };
+        _vkd.vkCmdCopyBuffer(_transferCmd, gpuBuf.Buffer, _downloadStaging.Buffer, 1, &copyRegion);
+    }
+
+    /// <summary>CPU map-and-copy from the staging buffer populated by <see cref="RecordDownloadToStaging"/>.</summary>
+    public void ReadFromStaging(Span<float> dst)
+    {
+        float* mapped = (float*)_downloadStaging!.Map();
+        new Span<float>(mapped, dst.Length).CopyTo(dst);
+        _downloadStaging.Unmap();
+    }
+
     /// <summary>Insert a transfer→compute barrier (copy finished before shader reads).</summary>
     public void RecordTransferBarrier()
     {
@@ -706,7 +748,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
                 break;
             case DType.Q6_K:
                 _matVecQ6KPipeline ??= new ComputePipeline(this, Shaders.MatVecQ6K, 3, pushConstantSize: sizeof(MatVecParams));
-                DispatchOrRecord(_matVecQ6KPipeline, bufs, totalRows, &p);
+                DispatchOrRecord(_matVecQ6KPipeline, bufs, (totalRows + 7) / 8, &p);
                 break;
             default: // Q4_K — 256 threads, 8 rows per workgroup, subgroupAdd reduction
                 _matVecQ4KPipeline ??= new ComputePipeline(this, Shaders.MatVecQ4K, 3, pushConstantSize: sizeof(MatVecParams));

@@ -27,6 +27,10 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
     private readonly Task _batcherTask;
     private volatile bool _disposed;
 
+    // Observability counters (updated via Interlocked).
+    private int _pendingCount;
+    private int _activeCount;
+
     private sealed class PendingRequest(string prompt, SamplingParams sp, CancellationToken ct, Channel<string> output)
     {
         public readonly string Prompt = prompt;
@@ -63,6 +67,12 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
 
     public string ModelId { get; }
 
+    /// <summary>Number of requests queued but not yet being generated.</summary>
+    public int QueueDepth => _pendingCount;
+
+    /// <summary>Number of requests currently in the active decode batch.</summary>
+    public int ActiveRequests => _activeCount;
+
     /// <inheritdoc/>
     public async IAsyncEnumerable<string> GenerateAsync(
         string prompt,
@@ -72,6 +82,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         var channel = Channel.CreateUnbounded<string>(
             new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
 
+        Interlocked.Increment(ref _pendingCount);
         await _queue.Writer.WriteAsync(new PendingRequest(prompt, sp, ct, channel), ct)
             .ConfigureAwait(false);
 
@@ -91,6 +102,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             // Admit pending requests into available batch slots
             while (active.Count < _maxBatchSize && _queue.Reader.TryRead(out var req))
             {
+                Interlocked.Decrement(ref _pendingCount);
                 try
                 {
                     AdmitRequest(req, active);
@@ -146,6 +158,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                     seq.Output.Writer.TryComplete();
                     seq.Cache.Dispose();
                     active.RemoveAt(i);
+                    Interlocked.Decrement(ref _activeCount);
                 }
                 else
                 {
@@ -162,6 +175,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         {
             seq.Output.Writer.TryComplete();
             seq.Cache.Dispose();
+            Interlocked.Decrement(ref _activeCount);
         }
         active.Clear();
     }
@@ -212,6 +226,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             Ct = req.Ct,
             TokenCount = 1,
         });
+        Interlocked.Increment(ref _activeCount);
     }
 
     public void Dispose()

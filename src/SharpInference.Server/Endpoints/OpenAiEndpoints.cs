@@ -40,15 +40,28 @@ public static class OpenAiEndpoints
             return;
         }
 
+        HealthEndpoints.RecordRequest();
+
         var modelArch = arch ?? Environment.GetEnvironmentVariable("SHARPI_ARCH") ?? "qwen2";
         var messages = BuildMessageList(req.Messages, modelArch);
         var prompt = ChatTemplate.Format(messages, modelArch);
+
+        // Parse logit_bias: OpenAI sends {"tokenId": biasValue} with string keys
+        IReadOnlyDictionary<int, float>? logitBias = null;
+        if (req.LogitBias is { Count: > 0 })
+        {
+            var d = new Dictionary<int, float>(req.LogitBias.Count);
+            foreach (var (k, v) in req.LogitBias)
+                if (int.TryParse(k, out int id)) d[id] = v;
+            if (d.Count > 0) logitBias = d;
+        }
 
         var sp = new SamplingParams
         {
             Temperature = req.Temperature ?? 1.0f,
             TopP = req.TopP ?? 1.0f,
             MaxNewTokens = req.MaxTokens ?? 512,
+            LogitBias = logitBias,
         };
 
         var requestId = $"chatcmpl-{Guid.NewGuid():N}";
@@ -66,8 +79,10 @@ public static class OpenAiEndpoints
                 [new ChunkChoice(0, new ChunkDelta("assistant", null), null)]);
             await WriteEvent(ctx.Response, JsonSerializer.Serialize(firstChunk, AppJsonContext.Default.ChatCompletionChunk));
 
+            long tokenCount = 0;
             await foreach (var token in engine.GenerateAsync(prompt, sp, ctx.RequestAborted))
             {
+                tokenCount++;
                 var chunk = new ChatCompletionChunk(
                     requestId, "chat.completion.chunk", created, engine.ModelId,
                     [new ChunkChoice(0, new ChunkDelta(null, token), null)]);
@@ -81,12 +96,16 @@ public static class OpenAiEndpoints
             await WriteEvent(ctx.Response, JsonSerializer.Serialize(finalChunk, AppJsonContext.Default.ChatCompletionChunk));
             await ctx.Response.WriteAsync("data: [DONE]\n\n", ctx.RequestAborted);
             await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+
+            HealthEndpoints.RecordTokens(tokenCount);
         }
         else
         {
             var sb = new StringBuilder();
             await foreach (var token in engine.GenerateAsync(prompt, sp, ctx.RequestAborted))
                 sb.Append(token);
+
+            HealthEndpoints.RecordTokens(sb.Length);
 
             var response = new ChatCompletionResponse(
                 requestId, "chat.completion", created, engine.ModelId,
@@ -135,7 +154,8 @@ public sealed record ChatCompletionRequest(
     int? MaxTokens,
     float? Temperature,
     float? TopP,
-    bool? Stream);
+    bool? Stream,
+    Dictionary<string, float>? LogitBias);
 
 public sealed record OaiMessage(string? Role, string? Content);
 

@@ -150,6 +150,171 @@ public static unsafe class SimdKernels
         }
     }
 
+    /// <summary>
+    /// Compute two matrix-vector products sharing the same input in a single Parallel.For,
+    /// halving thread-dispatch overhead for fused gate+up FFN projections.
+    /// Both weight matrices must have the same dtype, rows, and cols.
+    /// Falls back to two sequential MatVec calls if dtypes differ.
+    /// </summary>
+    public static void MatVecDual(
+        float* output1, byte* weights1,
+        float* output2, byte* weights2,
+        float* input, int rows, int cols, DType dtype1, DType dtype2)
+    {
+        if (dtype1 != dtype2)
+        {
+            MatVec(output1, weights1, input, rows, cols, dtype1);
+            MatVec(output2, weights2, input, rows, cols, dtype2);
+            return;
+        }
+
+        switch (dtype1)
+        {
+            case DType.Q4_K:
+            {
+                int bpr = (cols / 256) * 144;
+                if (rows >= MinRowsForParallel)
+                {
+                    var w1 = weights1; var w2 = weights2; var inp = input;
+                    var o1 = output1; var o2 = output2; int c = cols;
+                    Parallel.For(0, rows, s_parallelOpts, r =>
+                    {
+                        o1[r] = DotQ4K(w1 + (long)r * bpr, inp, c);
+                        o2[r] = DotQ4K(w2 + (long)r * bpr, inp, c);
+                    });
+                }
+                else
+                {
+                    for (int r = 0; r < rows; r++)
+                    {
+                        output1[r] = DotQ4K(weights1 + (long)r * bpr, input, cols);
+                        output2[r] = DotQ4K(weights2 + (long)r * bpr, input, cols);
+                    }
+                }
+                break;
+            }
+            case DType.Q6_K:
+            {
+                int bpr = (cols / 256) * 210;
+                if (rows >= MinRowsForParallel)
+                {
+                    var w1 = weights1; var w2 = weights2; var inp = input;
+                    var o1 = output1; var o2 = output2; int c = cols;
+                    Parallel.For(0, rows, s_parallelOpts, r =>
+                    {
+                        o1[r] = DotQ6K(w1 + (long)r * bpr, inp, c);
+                        o2[r] = DotQ6K(w2 + (long)r * bpr, inp, c);
+                    });
+                }
+                else
+                {
+                    for (int r = 0; r < rows; r++)
+                    {
+                        output1[r] = DotQ6K(weights1 + (long)r * bpr, input, cols);
+                        output2[r] = DotQ6K(weights2 + (long)r * bpr, input, cols);
+                    }
+                }
+                break;
+            }
+            case DType.Q5_K:
+            {
+                int bpr = (cols / 256) * 176;
+                if (rows >= MinRowsForParallel)
+                {
+                    var w1 = weights1; var w2 = weights2; var inp = input;
+                    var o1 = output1; var o2 = output2; int c = cols;
+                    Parallel.For(0, rows, s_parallelOpts, r =>
+                    {
+                        o1[r] = DotQ5K(w1 + (long)r * bpr, inp, c);
+                        o2[r] = DotQ5K(w2 + (long)r * bpr, inp, c);
+                    });
+                }
+                else
+                {
+                    for (int r = 0; r < rows; r++)
+                    {
+                        output1[r] = DotQ5K(weights1 + (long)r * bpr, input, cols);
+                        output2[r] = DotQ5K(weights2 + (long)r * bpr, input, cols);
+                    }
+                }
+                break;
+            }
+            case DType.Q3_K:
+            {
+                int bpr = (cols / 256) * 110;
+                if (rows >= MinRowsForParallel)
+                {
+                    var w1 = weights1; var w2 = weights2; var inp = input;
+                    var o1 = output1; var o2 = output2; int c = cols;
+                    Parallel.For(0, rows, s_parallelOpts, r =>
+                    {
+                        o1[r] = DotQ3K(w1 + (long)r * bpr, inp, c);
+                        o2[r] = DotQ3K(w2 + (long)r * bpr, inp, c);
+                    });
+                }
+                else
+                {
+                    for (int r = 0; r < rows; r++)
+                    {
+                        output1[r] = DotQ3K(weights1 + (long)r * bpr, input, cols);
+                        output2[r] = DotQ3K(weights2 + (long)r * bpr, input, cols);
+                    }
+                }
+                break;
+            }
+            case DType.Q2_K:
+            {
+                int bpr = (cols / 256) * 84;
+                if (rows >= MinRowsForParallel)
+                {
+                    var w1 = weights1; var w2 = weights2; var inp = input;
+                    var o1 = output1; var o2 = output2; int c = cols;
+                    Parallel.For(0, rows, s_parallelOpts, r =>
+                    {
+                        o1[r] = DotQ2K(w1 + (long)r * bpr, inp, c);
+                        o2[r] = DotQ2K(w2 + (long)r * bpr, inp, c);
+                    });
+                }
+                else
+                {
+                    for (int r = 0; r < rows; r++)
+                    {
+                        output1[r] = DotQ2K(weights1 + (long)r * bpr, input, cols);
+                        output2[r] = DotQ2K(weights2 + (long)r * bpr, input, cols);
+                    }
+                }
+                break;
+            }
+            case DType.Float32:
+            {
+                if (rows >= MinRowsForParallel)
+                {
+                    var m1 = (float*)weights1; var m2 = (float*)weights2; var inp = input;
+                    var o1 = output1; var o2 = output2; int c = cols;
+                    Parallel.For(0, rows, s_parallelOpts, r =>
+                    {
+                        o1[r] = DotF32(m1 + (long)r * c, inp, c);
+                        o2[r] = DotF32(m2 + (long)r * c, inp, c);
+                    });
+                }
+                else
+                {
+                    var m1 = (float*)weights1; var m2 = (float*)weights2;
+                    for (int r = 0; r < rows; r++)
+                    {
+                        output1[r] = DotF32(m1 + (long)r * cols, input, cols);
+                        output2[r] = DotF32(m2 + (long)r * cols, input, cols);
+                    }
+                }
+                break;
+            }
+            default:
+                MatVec(output1, weights1, input, rows, cols, dtype1);
+                MatVec(output2, weights2, input, rows, cols, dtype2);
+                break;
+        }
+    }
+
     private static void MatVecDequantFallback(float* output, byte* weights, float* input,
         int rows, int cols, DType dtype)
     {
@@ -1453,6 +1618,30 @@ public static unsafe class SimdKernels
                     head[2 * i] = x0 * cosTab[i] - x1 * sinTab[i];
                     head[2 * i + 1] = x0 * sinTab[i] + x1 * cosTab[i];
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Precompute RoPE cos/sin tables for all positions [0, maxSeqLen).
+    /// cosOut and sinOut must each point to maxSeqLen * (headDim / 2) floats.
+    /// </summary>
+    public static void BuildRopeTable(float* cosOut, float* sinOut, int maxSeqLen, int headDim, float theta)
+    {
+        int halfDim = headDim / 2;
+        float* freqs = stackalloc float[halfDim];
+        for (int i = 0; i < halfDim; i++)
+            freqs[i] = 1.0f / MathF.Pow(theta, 2.0f * i / headDim);
+
+        for (int p = 0; p < maxSeqLen; p++)
+        {
+            float* c = cosOut + (long)p * halfDim;
+            float* s = sinOut + (long)p * halfDim;
+            for (int i = 0; i < halfDim; i++)
+            {
+                float angle = p * freqs[i];
+                c[i] = MathF.Cos(angle);
+                s[i] = MathF.Sin(angle);
             }
         }
     }

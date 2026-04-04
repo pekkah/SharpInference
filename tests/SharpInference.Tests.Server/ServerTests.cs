@@ -50,6 +50,70 @@ public sealed class ServerTests : IClassFixture<WebApplicationFactory<Program>>
         Assert.Contains("sharpi_requests_total", body);
         Assert.Contains("sharpi_tokens_generated_total", body);
         Assert.Contains("sharpi_uptime_seconds", body);
+        Assert.Contains("sharpi_tokens_per_second", body);
+        Assert.Contains("sharpi_queue_depth", body);
+        Assert.Contains("sharpi_active_requests", body);
+    }
+
+    [Fact]
+    public async Task Metrics_RequestCountIncrements_AfterChatRequest()
+    {
+        // Make one request then verify the counter went up.
+        // Note: this test uses its own factory to get an isolated counter state.
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(new FakeInferenceEngine("m"))));
+        var client = factory.CreateClient();
+
+        var before = await GetMetricValue(client, "sharpi_requests_total");
+
+        var req = new
+        {
+            model = "m",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            max_tokens = 5,
+            stream = false
+        };
+        await client.PostAsJsonAsync("/v1/chat/completions", req);
+
+        var after = await GetMetricValue(client, "sharpi_requests_total");
+        Assert.True(after > before, $"Expected counter to increment, got before={before} after={after}");
+    }
+
+    [Fact]
+    public async Task Metrics_TokenCountIncrements_AfterChatRequest()
+    {
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(new FakeInferenceEngine("m"))));
+        var client = factory.CreateClient();
+
+        var before = await GetMetricValue(client, "sharpi_tokens_generated_total");
+
+        var req = new
+        {
+            model = "m",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            max_tokens = 10,
+            stream = false
+        };
+        await client.PostAsJsonAsync("/v1/chat/completions", req);
+
+        var after = await GetMetricValue(client, "sharpi_tokens_generated_total");
+        Assert.True(after > before, $"Expected token counter to increment, got before={before} after={after}");
+    }
+
+    private static async Task<double> GetMetricValue(HttpClient client, string metricName)
+    {
+        var body = await (await client.GetAsync("/metrics")).Content.ReadAsStringAsync();
+        foreach (var line in body.Split('\n'))
+        {
+            if (line.StartsWith(metricName + ' ') || line.StartsWith(metricName + '{'))
+            {
+                var parts = line.Split(' ');
+                if (parts.Length >= 2 && double.TryParse(parts[^1], out double val))
+                    return val;
+            }
+        }
+        return double.NaN;
     }
 
     // ── OpenAI models ─────────────────────────────────────────────────────────
@@ -150,6 +214,27 @@ public sealed class ServerTests : IClassFixture<WebApplicationFactory<Program>>
         Assert.Contains("event: content_block_delta", body);
         Assert.Contains("event: message_stop", body);
     }
+
+    // ── logit_bias ────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task ChatCompletion_WithLogitBias_AcceptsRequest()
+    {
+        // Verifies that logit_bias is accepted and does not cause a 400/500.
+        // The FakeEngine ignores it, so output is the same — we only check wire format.
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            max_tokens = 5,
+            stream = false,
+            logit_bias = new Dictionary<string, float> { { "5", -100f }, { "42", 10f } }
+        };
+        var response = await _client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var json = await response.Content.ReadAsStringAsync();
+        Assert.Contains("chat.completion", json);
+    }
 }
 
 /// <summary>
@@ -158,6 +243,8 @@ public sealed class ServerTests : IClassFixture<WebApplicationFactory<Program>>
 internal sealed class FakeInferenceEngine : IInferenceEngine
 {
     public string ModelId { get; }
+    public int QueueDepth => 0;
+    public int ActiveRequests => 0;
 
     public FakeInferenceEngine(string modelId) => ModelId = modelId;
 

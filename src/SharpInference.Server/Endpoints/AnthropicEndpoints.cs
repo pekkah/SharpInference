@@ -38,6 +38,8 @@ public static class AnthropicEndpoints
             return;
         }
 
+        HealthEndpoints.RecordRequest();
+
         var modelArch = Environment.GetEnvironmentVariable("SHARPI_ARCH") ?? "qwen2";
         var messages = BuildMessageList(req);
         var prompt = ChatTemplate.Format(messages, modelArch);
@@ -96,18 +98,25 @@ public static class AnthropicEndpoints
                 JsonSerializer.Serialize(new ATypeOnly("message_stop"), AppJsonContext.Default.ATypeOnly));
 
             await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+            HealthEndpoints.RecordTokens(outputTokens);
         }
         else
         {
             var sb = new StringBuilder();
+            int nonStreamTokens = 0;
             await foreach (var token in engine.GenerateAsync(prompt, sp, ctx.RequestAborted))
+            {
+                nonStreamTokens++;
                 sb.Append(token);
+            }
+
+            HealthEndpoints.RecordTokens(nonStreamTokens);
 
             var response = new AnthropicMessageResponse(
                 msgId, "message", "assistant",
                 [new AContent("text", sb.ToString())],
                 modelId, "end_turn",
-                new AUsage(0, sb.Length));
+                new AUsage(0, nonStreamTokens));
 
             ctx.Response.ContentType = "application/json";
             await ctx.Response.WriteAsync(

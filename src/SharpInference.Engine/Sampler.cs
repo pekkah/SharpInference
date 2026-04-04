@@ -23,6 +23,14 @@ public static class Sampler
             : new float[vocabSize];
         logits.CopyTo(probs);
 
+        // Apply logit bias (additive in logit space, before temperature scaling)
+        if (p.LogitBias is { Count: > 0 })
+        {
+            foreach (var (id, bias) in p.LogitBias)
+                if ((uint)id < (uint)vocabSize)
+                    probs[id] += bias;
+        }
+
         // Temperature scaling
         if (p.Temperature != 1.0f)
         {
@@ -217,4 +225,11 @@ public sealed record SamplingParams
     public float RepetitionPenalty { get; init; } = 1.0f;
     public int MaxNewTokens { get; init; } = 512;
     public int[]? StopTokenIds { get; init; }
+
+    /// <summary>
+    /// Additive logit bias applied before temperature scaling.
+    /// Maps token IDs to bias values in the range [-100, 100].
+    /// Use -100 to effectively prevent a token; +100 to strongly favour it.
+    /// </summary>
+    public IReadOnlyDictionary<int, float>? LogitBias { get; init; }
 }

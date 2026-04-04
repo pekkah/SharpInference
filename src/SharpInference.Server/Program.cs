@@ -82,4 +82,5 @@ public partial class Program { }
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.ATypeOnly))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.AErrorResponse))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.HealthStatus))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(System.Collections.Generic.Dictionary<string, float>))]
 internal partial class AppJsonContext : System.Text.Json.Serialization.JsonSerializerContext { }

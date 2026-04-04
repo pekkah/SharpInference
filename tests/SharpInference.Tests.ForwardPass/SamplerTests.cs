@@ -145,4 +145,66 @@ public sealed class SamplerTests
 
         Assert.Equal(4, sampled.Count);
     }
+
+    // ── LogitBias ─────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Sample_LogitBias_NegativeHundred_BlocksToken()
+    {
+        // Token 0 has the highest base logit, but bias -100 should prevent it.
+        float[] logits = [10f, 1f, 1f, 1f];
+        var bias = new Dictionary<int, float> { { 0, -100f } };
+        var p = new SamplingParams { Temperature = 1f, LogitBias = bias };
+        var rng = new Random(42);
+
+        var sampled = new HashSet<int>();
+        for (int i = 0; i < 200; i++)
+            sampled.Add(Sampler.Sample(logits, p, rng));
+
+        Assert.DoesNotContain(0, sampled);
+    }
+
+    [Fact]
+    public void Sample_LogitBias_PositiveHundred_ForcesToken()
+    {
+        // All tokens equal, but token 2 gets +100 bias — should always win.
+        float[] logits = [0f, 0f, 0f, 0f];
+        var bias = new Dictionary<int, float> { { 2, 100f } };
+        var p = new SamplingParams { Temperature = 1f, LogitBias = bias };
+        var rng = new Random(42);
+
+        var sampled = new HashSet<int>();
+        for (int i = 0; i < 200; i++)
+            sampled.Add(Sampler.Sample(logits, p, rng));
+
+        Assert.True(sampled.IsSubsetOf(new[] { 2 }),
+            $"Expected only token 2, got: {string.Join(",", sampled)}");
+    }
+
+    [Fact]
+    public void Sample_LogitBias_OutOfRangeId_IsIgnored()
+    {
+        float[] logits = [1f, 2f, 3f];
+        var bias = new Dictionary<int, float> { { 999, 100f }, { -1, 100f } };
+        var p = new SamplingParams { Temperature = 1f, LogitBias = bias };
+        var rng = new Random(42);
+
+        // Should not throw; out-of-range IDs are silently skipped.
+        int token = Sampler.Sample(logits, p, rng);
+        Assert.InRange(token, 0, logits.Length - 1);
+    }
+
+    [Fact]
+    public void Sample_NullLogitBias_BehavesNormally()
+    {
+        float[] logits = [0f, 0f, 0f, 0f];
+        var p = new SamplingParams { Temperature = 1f, LogitBias = null };
+        var rng = new Random(42);
+
+        var sampled = new HashSet<int>();
+        for (int i = 0; i < 1000; i++)
+            sampled.Add(Sampler.Sample(logits, p, rng));
+
+        Assert.Equal(4, sampled.Count);
+    }
 }

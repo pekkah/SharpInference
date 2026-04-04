@@ -33,7 +33,7 @@ public sealed unsafe class ForwardPass : IForwardPass
     private readonly float* _ffnGate;    // [intermDim]
     private readonly float* _ffnUp;      // [intermDim]
     private readonly float* _logits;     // [vocabSize]
-    private readonly float* _attnScores; // [maxSeqLen] per head (single head at a time)
+    private readonly float* _attnScores; // [numHeads * ctxLen] per-head score scratch
 
     private readonly int _embDim;
     private readonly int _headDim;
@@ -73,6 +73,11 @@ public sealed unsafe class ForwardPass : IForwardPass
     private float* _rotatedQuery;  // scratch for WHT-rotated query [headDim]
     private float* _decompBuf;     // scratch for decompressed TQ value [headDim]
 
+    // Precomputed RoPE cos/sin tables [maxSeqLen * halfDim]
+    private readonly float* _ropeCosTable;
+    private readonly float* _ropeSinTable;
+    private readonly int _ropeHalfDim;
+
     public ForwardPass(GgufModel model, IComputeBackend backend, ModelHyperparams hp,
         int maxContextLength = 0)
     {
@@ -103,7 +108,13 @@ public sealed unsafe class ForwardPass : IForwardPass
         _ffnGate = Alloc(_intermDim);
         _ffnUp = Alloc(_intermDim);
         _logits = Alloc(hp.VocabSize);
-        _attnScores = Alloc(ctxLen);
+        _attnScores = Alloc(_numHeads * ctxLen);
+
+        // Precompute RoPE cos/sin tables for all positions [0, ctxLen)
+        _ropeHalfDim = _headDim / 2;
+        _ropeCosTable = (float*)NativeMemory.Alloc((nuint)((long)ctxLen * _ropeHalfDim * sizeof(float)));
+        _ropeSinTable = (float*)NativeMemory.Alloc((nuint)((long)ctxLen * _ropeHalfDim * sizeof(float)));
+        SimdKernels.BuildRopeTable(_ropeCosTable, _ropeSinTable, ctxLen, _headDim, hp.RopeTheta);
 
         // Pre-resolve all tensor references (avoids dictionary lookups in hot loop)
         _embTensor = ResolveTensor("token_embd.weight");
@@ -225,8 +236,8 @@ public sealed unsafe class ForwardPass : IForwardPass
             _hp.NumLayers, _ctxLen, _numKvHeads, _headDim,
             Math.Min(fp32WindowSize, _ctxLen), bits,
             layerIndexBase: 0, totalLayerCountForSeeds: _hp.NumLayers);
-        _rotatedQuery = Alloc(_headDim);
-        _decompBuf = Alloc(_headDim);
+        _rotatedQuery = Alloc(_numHeads * _headDim);
+        _decompBuf = Alloc(_numHeads * _headDim);
     }
 
     /// <summary>The TurboQuant KV cache, if enabled.</summary>
@@ -335,8 +346,8 @@ public sealed unsafe class ForwardPass : IForwardPass
                         float* kn = batchK + (long)n * kvDim;
                         float* vn = batchV + (long)n * kvDim;
 
-                        SimdKernels.ApplyRoPE(qn, startPos + n, _numHeads, _headDim, _hp.RopeTheta);
-                        SimdKernels.ApplyRoPE(kn, startPos + n, _numKvHeads, _headDim, _hp.RopeTheta);
+                        SimdKernels.ApplyRoPECached(qn, _ropeCosTable + (long)(startPos + n) * _ropeHalfDim, _ropeSinTable + (long)(startPos + n) * _ropeHalfDim, _numHeads, _headDim);
+                        SimdKernels.ApplyRoPECached(kn, _ropeCosTable + (long)(startPos + n) * _ropeHalfDim, _ropeSinTable + (long)(startPos + n) * _ropeHalfDim, _numKvHeads, _headDim);
 
                         cache.Append(layer,
                             new ReadOnlySpan<float>(kn, kvDim),
@@ -528,8 +539,8 @@ public sealed unsafe class ForwardPass : IForwardPass
                         float* vn = batchV + (long)n * kvDim;
 
                         int pos = startPos + n;
-                        SimdKernels.ApplyRoPE(qn, pos, _numHeads, _headDim, _hp.RopeTheta);
-                        SimdKernels.ApplyRoPE(kn, pos, _numKvHeads, _headDim, _hp.RopeTheta);
+                        SimdKernels.ApplyRoPECached(qn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numHeads, _headDim);
+                        SimdKernels.ApplyRoPECached(kn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numKvHeads, _headDim);
 
                         _kvCache.Append(layer,
                             new ReadOnlySpan<float>(kn, kvDim),
@@ -661,8 +672,8 @@ public sealed unsafe class ForwardPass : IForwardPass
             }
 
             // RoPE
-            SimdKernels.ApplyRoPE(_q, position, _numHeads, _headDim, _hp.RopeTheta);
-            SimdKernels.ApplyRoPE(_k, position, _numKvHeads, _headDim, _hp.RopeTheta);
+            SimdKernels.ApplyRoPECached(_q, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numHeads, _headDim);
+            SimdKernels.ApplyRoPECached(_k, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numKvHeads, _headDim);
 
             // Store K, V in cache
             if (_tqKvCache != null)
@@ -732,50 +743,50 @@ public sealed unsafe class ForwardPass : IForwardPass
     {
         int seqLen = position + 1;
         float scale = 1.0f / MathF.Sqrt(_headDim);
+        int ctxLen = _ctxLen; int hd = _headDim; int hpkg = _headsPerKvGroup;
+        var q = _q; var attnOut = _attnOut; var scores = _attnScores;
 
-        for (int h = 0; h < _numHeads; h++)
+        Parallel.For(0, _numHeads, h =>
         {
-            int kvHead = h / _headsPerKvGroup;
-            float* qHead = _q + h * _headDim;
-            float* outHead = _attnOut + h * _headDim;
+            int kvHead = h / hpkg;
+            float* qHead = q + h * hd;
+            float* outHead = attnOut + h * hd;
+            float* headScores = scores + (long)h * ctxLen;
 
-            // Compute attention scores with SIMD dot product
             for (int t = 0; t < seqLen; t++)
             {
-                float* kVec = cache.KeyAt(layer, t) + kvHead * _headDim;
-                _attnScores[t] = SimdKernels.DotF32(qHead, kVec, _headDim) * scale;
+                float* kVec = cache.KeyAt(layer, t) + kvHead * hd;
+                headScores[t] = SimdKernels.DotF32(qHead, kVec, hd) * scale;
             }
 
-            // Softmax
-            SimdKernels.SoftmaxInPlace(_attnScores, seqLen);
+            SimdKernels.SoftmaxInPlace(headScores, seqLen);
 
-            // Weighted sum of values
-            for (int d = 0; d < _headDim; d++) outHead[d] = 0;
+            for (int d = 0; d < hd; d++) outHead[d] = 0;
 
             for (int t = 0; t < seqLen; t++)
             {
-                float* vVec = cache.ValueAt(layer, t) + kvHead * _headDim;
-                float w = _attnScores[t];
-                if (Fma.IsSupported && _headDim >= 8)
+                float* vVec = cache.ValueAt(layer, t) + kvHead * hd;
+                float w = headScores[t];
+                if (Fma.IsSupported && hd >= 8)
                 {
                     var wv = Vector256.Create(w);
                     int d = 0;
-                    for (; d + 8 <= _headDim; d += 8)
+                    for (; d + 8 <= hd; d += 8)
                     {
                         var o = Avx.LoadVector256(outHead + d);
                         var v = Avx.LoadVector256(vVec + d);
                         Avx.Store(outHead + d, Fma.MultiplyAdd(wv, v, o));
                     }
-                    for (; d < _headDim; d++)
+                    for (; d < hd; d++)
                         outHead[d] += w * vVec[d];
                 }
                 else
                 {
-                    for (int d = 0; d < _headDim; d++)
+                    for (int d = 0; d < hd; d++)
                         outHead[d] += w * vVec[d];
                 }
             }
-        }
+        });
     }
 
     // ================================================================
@@ -789,81 +800,82 @@ public sealed unsafe class ForwardPass : IForwardPass
         int tqLen = tq.GetTqLength(layer);
         int fp32Start = tqLen;
         float scale = 1.0f / MathF.Sqrt(_headDim);
+        int ctxLen = _ctxLen; int hd = _headDim; int hpkg = _headsPerKvGroup;
+        int tqBlkSz = tq.TqBlockSize;
+        var q = _q; var attnOut = _attnOut; var scores = _attnScores;
+        var rotated = _rotatedQuery; var decomp = _decompBuf;
 
-        for (int h = 0; h < _numHeads; h++)
+        Parallel.For(0, _numHeads, h =>
         {
-            int kvHead = h / _headsPerKvGroup;
-            float* qHead = _q + h * _headDim;
-            float* outHead = _attnOut + h * _headDim;
+            int kvHead = h / hpkg;
+            float* qHead = q + h * hd;
+            float* outHead = attnOut + h * hd;
+            float* headScores = scores + (long)h * ctxLen;
+            float* headRotated = rotated + h * hd;
+            float* headDecomp = decomp + h * hd;
 
-            // Rotate query once per head for TQ dot products
             var keyCompressor = tq.GetKeyCompressor(layer, kvHead);
             keyCompressor.RotateQuery(
-                new ReadOnlySpan<float>(qHead, _headDim),
-                new Span<float>(_rotatedQuery, _headDim));
+                new ReadOnlySpan<float>(qHead, hd),
+                new Span<float>(headRotated, hd));
 
-            // Phase 1a: TQ-compressed positions (fused dequant-dot)
+            // Phase 1a: TQ-compressed positions
             for (int t = 0; t < tqLen; t++)
             {
                 byte* tqKey = tq.TqKeyAt(layer, t, kvHead);
                 float dot = keyCompressor.DequantDot(
-                    new ReadOnlySpan<byte>(tqKey, tq.TqBlockSize),
-                    new ReadOnlySpan<float>(_rotatedQuery, _headDim));
-                _attnScores[t] = dot * scale;
+                    new ReadOnlySpan<byte>(tqKey, tqBlkSz),
+                    new ReadOnlySpan<float>(headRotated, hd));
+                headScores[t] = dot * scale;
             }
 
-            // Phase 1b: FP32 window positions (standard dot product)
+            // Phase 1b: FP32 window positions
             for (int t = fp32Start; t < seqLen; t++)
             {
-                float* kVec = tq.Fp32KeyAt(layer, t) + kvHead * _headDim;
-                _attnScores[t] = SimdKernels.DotF32(qHead, kVec, _headDim) * scale;
+                float* kVec = tq.Fp32KeyAt(layer, t) + kvHead * hd;
+                headScores[t] = SimdKernels.DotF32(qHead, kVec, hd) * scale;
             }
 
-            // Phase 2: Softmax over all positions
-            SimdKernels.SoftmaxInPlace(_attnScores, seqLen);
+            SimdKernels.SoftmaxInPlace(headScores, seqLen);
 
-            // Phase 3: Weighted value sum
-            for (int d = 0; d < _headDim; d++) outHead[d] = 0;
+            for (int d = 0; d < hd; d++) outHead[d] = 0;
 
-            // TQ values: decompress and accumulate
             var valCompressor = tq.GetValueCompressor(layer, kvHead);
-
             for (int t = 0; t < tqLen; t++)
             {
                 byte* tqVal = tq.TqValueAt(layer, t, kvHead);
-                var decompSpan = new Span<float>(_decompBuf, _headDim);
                 valCompressor.Decompress(
-                    new ReadOnlySpan<byte>(tqVal, tq.TqBlockSize), decompSpan);
-                float w = _attnScores[t];
-                for (int d = 0; d < _headDim; d++)
-                    outHead[d] += w * _decompBuf[d];
+                    new ReadOnlySpan<byte>(tqVal, tqBlkSz),
+                    new Span<float>(headDecomp, hd));
+                float w = headScores[t];
+                for (int d = 0; d < hd; d++)
+                    outHead[d] += w * headDecomp[d];
             }
 
-            // FP32 values: standard weighted sum
             for (int t = fp32Start; t < seqLen; t++)
             {
-                float* vVec = tq.Fp32ValueAt(layer, t) + kvHead * _headDim;
-                float w = _attnScores[t];
-                if (Fma.IsSupported && _headDim >= 8)
+                float* vVec = tq.Fp32ValueAt(layer, t) + kvHead * hd;
+                float w = headScores[t];
+                if (Fma.IsSupported && hd >= 8)
                 {
                     var wv = Vector256.Create(w);
                     int d = 0;
-                    for (; d + 8 <= _headDim; d += 8)
+                    for (; d + 8 <= hd; d += 8)
                     {
                         var o = Avx.LoadVector256(outHead + d);
                         var v = Avx.LoadVector256(vVec + d);
                         Avx.Store(outHead + d, Fma.MultiplyAdd(wv, v, o));
                     }
-                    for (; d < _headDim; d++)
+                    for (; d < hd; d++)
                         outHead[d] += w * vVec[d];
                 }
                 else
                 {
-                    for (int d = 0; d < _headDim; d++)
+                    for (int d = 0; d < hd; d++)
                         outHead[d] += w * vVec[d];
                 }
             }
-        }
+        });
     }
 
     // ================================================================
@@ -872,8 +884,8 @@ public sealed unsafe class ForwardPass : IForwardPass
 
     private void DenseFfn(int layer)
     {
-        FusedMatVec(_ffnGate, _wGate[layer], _normBuf, _intermDim, _embDim);
-        FusedMatVec(_ffnUp, _wUp[layer], _normBuf, _intermDim, _embDim);
+        SimdKernels.MatVecDual(_ffnGate, _wGate[layer].DataPtr, _ffnUp, _wUp[layer].DataPtr,
+            _normBuf, _intermDim, _embDim, _wGate[layer].DType, _wUp[layer].DType);
         SimdKernels.SiLuMul(_ffnGate, _ffnUp, _intermDim);
         FusedMatVec(_hidden, _wDown[layer], _ffnGate, _embDim, _intermDim);
     }
@@ -1149,8 +1161,8 @@ public sealed unsafe class ForwardPass : IForwardPass
                 PerHeadRmsNorm(_q, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
                 PerHeadRmsNorm(_k, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
             }
-            SimdKernels.ApplyRoPE(_q, pos, _numHeads, _headDim, _hp.RopeTheta);
-            SimdKernels.ApplyRoPE(_k, pos, _numKvHeads, _headDim, _hp.RopeTheta);
+            SimdKernels.ApplyRoPECached(_q, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numHeads, _headDim);
+            SimdKernels.ApplyRoPECached(_k, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numKvHeads, _headDim);
             cache.Append(layer,
                 new ReadOnlySpan<float>(_k, _numKvHeads * _headDim),
                 new ReadOnlySpan<float>(_v, _numKvHeads * _headDim));
@@ -1275,8 +1287,8 @@ public sealed unsafe class ForwardPass : IForwardPass
                         int pos = positions[n];
                         // Soft-reset this layer's position so the Append lands at pos
                         caches[n].TruncateTo(pos);
-                        SimdKernels.ApplyRoPE(qn, pos, _numHeads, _headDim, _hp.RopeTheta);
-                        SimdKernels.ApplyRoPE(kn, pos, _numKvHeads, _headDim, _hp.RopeTheta);
+                        SimdKernels.ApplyRoPECached(qn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numHeads, _headDim);
+                        SimdKernels.ApplyRoPECached(kn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numKvHeads, _headDim);
                         caches[n].Append(layer,
                             new ReadOnlySpan<float>(kn, kvDim),
                             new ReadOnlySpan<float>(vn, kvDim));
@@ -1365,6 +1377,8 @@ public sealed unsafe class ForwardPass : IForwardPass
         NativeMemory.Free(_ffnUp);
         NativeMemory.Free(_logits);
         NativeMemory.Free(_attnScores);
+        NativeMemory.Free(_ropeCosTable);
+        NativeMemory.Free(_ropeSinTable);
 
         foreach (var ptr in _normCache.Values)
             NativeMemory.Free((void*)ptr);

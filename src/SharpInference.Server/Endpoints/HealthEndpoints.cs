@@ -26,10 +26,11 @@ public static class HealthEndpoints
     internal static void RecordTokens(long count) =>
         System.Threading.Interlocked.Add(ref s_totalTokens, count);
 
-    private static Task HandleMetrics(HttpContext ctx)
+    private static Task HandleMetrics(HttpContext ctx, IInferenceEngine engine)
     {
         ctx.Response.ContentType = "text/plain; version=0.0.4";
-        var uptime = (long)s_uptime.Elapsed.TotalSeconds;
+        var uptime = s_uptime.Elapsed.TotalSeconds;
+        double tps = uptime > 0 ? s_totalTokens / uptime : 0;
         return ctx.Response.WriteAsync(
             $"# HELP sharpi_requests_total Total inference requests served\n" +
             $"# TYPE sharpi_requests_total counter\n" +
@@ -39,7 +40,16 @@ public static class HealthEndpoints
             $"sharpi_tokens_generated_total {s_totalTokens}\n" +
             $"# HELP sharpi_uptime_seconds Server uptime in seconds\n" +
             $"# TYPE sharpi_uptime_seconds gauge\n" +
-            $"sharpi_uptime_seconds {uptime}\n",
+            $"sharpi_uptime_seconds {(long)uptime}\n" +
+            $"# HELP sharpi_tokens_per_second Lifetime-average tokens generated per second\n" +
+            $"# TYPE sharpi_tokens_per_second gauge\n" +
+            $"sharpi_tokens_per_second {tps:F2}\n" +
+            $"# HELP sharpi_queue_depth Number of requests waiting to start generation\n" +
+            $"# TYPE sharpi_queue_depth gauge\n" +
+            $"sharpi_queue_depth {engine.QueueDepth}\n" +
+            $"# HELP sharpi_active_requests Number of requests currently generating tokens\n" +
+            $"# TYPE sharpi_active_requests gauge\n" +
+            $"sharpi_active_requests {engine.ActiveRequests}\n",
             ctx.RequestAborted);
     }
 }

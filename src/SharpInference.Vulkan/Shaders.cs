@@ -469,6 +469,10 @@ internal static class Shaders
     ///   softmax(scores)
     ///   output[h] = sum(scores[t] * V[t, kvHead])
     ///
+    /// For seq_len &lt;= 4096: stores all scores in shared memory — single Q·K pass,
+    /// then softmax, then value accumulation. Matches the TqAttention approach.
+    /// For seq_len &gt; 4096: triple-pass with Q·K recomputation (correctness over performance).
+    ///
     /// Push constants: { uint num_heads, uint num_kv_heads, uint head_dim, uint seq_len, uint max_seq_len }.
     /// Bindings: 0=Q[num_heads*head_dim], 1=K_cache[max_seq_len*kv_dim], 2=V_cache[max_seq_len*kv_dim], 3=output[num_heads*head_dim].
     /// </summary>
@@ -491,7 +495,8 @@ internal static class Shaders
             uint max_seq_len;
         };
 
-        shared float sdata[256];
+        shared float scores[4096]; // stored Q·K scores for all positions
+        shared float sdata[256];   // reduction scratch
 
         void main() {
             uint h = gl_WorkGroupID.x;
@@ -504,51 +509,64 @@ internal static class Shaders
             uint q_off = h * head_dim;
             uint out_off = h * head_dim;
 
-            if (seq_len <= 256) {
-                // ── Fast path: seq_len fits in one tile (256 threads) ──
-                // Single pass: compute score, softmax, value accumulation
-                float score = -1.0/0.0;
-                if (tid < seq_len) {
+            if (seq_len <= 4096) {
+                // ── Stored-scores path ──
+                // Phase 1: compute all Q·K scores and store in shared memory
+                for (uint t = tid; t < seq_len; t += 256) {
                     float dot = 0.0;
-                    uint k_off = tid * kv_dim + kv_head * head_dim;
+                    uint k_off = t * kv_dim + kv_head * head_dim;
                     for (uint d = 0; d < head_dim; d++)
                         dot += q_data[q_off + d] * k_cache[k_off + d];
-                    score = dot * scale;
+                    scores[t] = dot * scale;
                 }
+                for (uint t = seq_len + tid; t < 4096; t += 256)
+                    scores[t] = -1.0/0.0;
+                barrier();
 
-                // Max reduction
-                sdata[tid] = score;
+                // Phase 2: softmax over stored scores
+                float local_max = -1.0/0.0;
+                for (uint t = tid; t < seq_len; t += 256)
+                    local_max = max(local_max, scores[t]);
+                sdata[tid] = local_max;
                 barrier();
                 [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
                     if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
                     barrier();
                 }
                 float max_val = sdata[0];
+                barrier();
 
-                // Exp + sum
-                float exp_val = (tid < seq_len) ? exp(score - max_val) : 0.0;
-                sdata[tid] = exp_val;
+                float local_sum = 0.0;
+                for (uint t = tid; t < seq_len; t += 256) {
+                    float e = exp(scores[t] - max_val);
+                    scores[t] = e;
+                    local_sum += e;
+                }
+                sdata[tid] = local_sum;
                 barrier();
                 [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
                     if (tid < s) sdata[tid] += sdata[tid + s];
                     barrier();
                 }
-                float weight = exp_val / sdata[0];
-                sdata[tid] = weight;
+                float sum_exp = sdata[0];
                 barrier();
 
-                // Weighted value sum
+                for (uint t = tid; t < seq_len; t += 256)
+                    scores[t] /= sum_exp;
+                barrier();
+
+                // Phase 3: weighted value accumulation using stored weights
                 for (uint d = tid; d < head_dim; d += 256) {
                     float sum = 0.0;
                     for (uint t = 0; t < seq_len; t++) {
                         uint v_off = t * kv_dim + kv_head * head_dim;
-                        sum += sdata[t] * v_cache[v_off + d];
+                        sum += scores[t] * v_cache[v_off + d];
                     }
                     out_data[out_off + d] = sum;
                 }
 
             } else {
-                // ── Tiled path: seq_len > 256 — triple pass with recompute ──
+                // ── Long-context path (seq_len > 4096): triple pass with recompute ──
 
                 // Pass 1: find global max
                 float local_max = -1.0/0.0;
@@ -586,7 +604,7 @@ internal static class Shaders
                 float sum_exp = sdata[0];
                 barrier();
 
-                // Pass 3: weighted value sum (recompute weights)
+                // Pass 3: weighted value sum (recompute weights on the fly)
                 for (uint d = tid; d < head_dim; d += 256) {
                     float sum = 0.0;
                     for (uint t = 0; t < seq_len; t++) {
@@ -616,8 +634,17 @@ internal static class Shaders
         #extension GL_EXT_control_flow_attributes : enable
         #extension GL_KHR_shader_subgroup_arithmetic : enable
 
-        // 1 row per workgroup, 256 threads. Shared memory block cache for
-        // aligned reads of Q6_K's 210-byte blocks. subgroupAdd reduction.
+        // 8 rows per workgroup, 32 threads per row = 256 threads.
+        // Q6_K block layout (210 bytes per 256 elements):
+        //   [0:128]   ql — lower 4-bit nibbles (two 64-byte halves)
+        //   [128:192] qh — upper 2-bit pairs (two 32-byte halves)
+        //   [192:208] 16 int8 scale values
+        //   [208:210] FP16 super-block scale d
+        // Thread layout: each lane handles 8 elements (lane, lane+32, ..., lane+224)
+        // which all share l = lane within their respective groups — no shared memory needed.
+        #define N_ROWS 8
+        #define THREADS_PER_ROW 32
+
         layout(local_size_x = 256) in;
 
         layout(binding = 0) readonly buffer Weights { uint weights_data[]; };
@@ -629,86 +656,62 @@ internal static class Shaders
             uint cols;
         };
 
-        shared uint blk[53];
-        shared float sdata[8]; // for cross-subgroup reduction
-
-        uint sReadByte(uint byteOffset) {
-            return (blk[byteOffset >> 2] >> ((byteOffset & 3) * 8)) & 0xFF;
-        }
-
-        int sReadInt8(uint byteOffset) {
-            int val = int(sReadByte(byteOffset));
-            return val >= 128 ? val - 256 : val;
-        }
+        uint gByte(uint b) { return (weights_data[b >> 2] >> ((b & 3) * 8)) & 0xFF; }
+        int  gInt8(uint b) { int v = int(gByte(b)); return v >= 128 ? v - 256 : v; }
 
         void main() {
-            uint row = gl_WorkGroupID.x;
             uint tid = gl_LocalInvocationID.x;
+            uint row_in_wg = tid / THREADS_PER_ROW;
+            uint lane = tid % THREADS_PER_ROW;
+            uint row = gl_WorkGroupID.x * N_ROWS + row_in_wg;
             if (row >= rows) return;
 
             uint num_blocks = cols >> 8;
-            uint bytes_per_row = num_blocks * 210;
-            uint boff_base = row * bytes_per_row;
+            uint boff_base = row * num_blocks * 210;
 
             float acc = 0.0;
 
             for (uint block = 0; block < num_blocks; block++) {
-                uint global_byte_off = boff_base + block * 210;
-                uint global_word_base = global_byte_off >> 2;
-                uint byte_shift = (global_byte_off & 3) * 8;
+                uint b0 = boff_base + block * 210;
 
-                if (tid < 54) {
-                    uint raw = weights_data[global_word_base + tid];
-                    if (byte_shift == 0) {
-                        if (tid < 53) blk[tid] = raw;
-                    } else {
-                        uint next = (tid < 53) ? weights_data[global_word_base + tid + 1] : 0u;
-                        if (tid < 53) blk[tid] = (raw >> byte_shift) | (next << (32 - byte_shift));
-                    }
-                }
-                barrier();
+                float d = unpackHalf2x16(gByte(b0 + 208) | (gByte(b0 + 209) << 8)).x;
 
-                float d = unpackHalf2x16(sReadByte(208) | (sReadByte(209) << 8)).x;
+                // Precompute the 8 scale floats needed by this lane.
+                // isc = lane>>4 selects lower (0) or upper (1) sub-scale row per group.
+                uint isc = lane >> 4;
+                float sc0 = d * float(gInt8(b0 + 192 + isc));
+                float sc1 = d * float(gInt8(b0 + 194 + isc));
+                float sc2 = d * float(gInt8(b0 + 196 + isc));
+                float sc3 = d * float(gInt8(b0 + 198 + isc));
+                float sc4 = d * float(gInt8(b0 + 200 + isc));
+                float sc5 = d * float(gInt8(b0 + 202 + isc));
+                float sc6 = d * float(gInt8(b0 + 204 + isc));
+                float sc7 = d * float(gInt8(b0 + 206 + isc));
 
-                uint half_idx = tid >> 7;
-                uint in_half = tid & 127;
-                uint group = in_half >> 5;
-                uint l = in_half & 31;
+                // Load the 6 quantized bytes needed by this lane.
+                // Byte layout: groups 0,1 share nibbles from the same byte; 2,3 use upper nibble.
+                uint ql0 = gByte(b0 + lane);          // half=0, ql[lane]
+                uint ql1 = gByte(b0 + 32 + lane);     // half=0, ql[32+lane]
+                uint ql2 = gByte(b0 + 64 + lane);     // half=1, ql[64+lane]
+                uint ql3 = gByte(b0 + 96 + lane);     // half=1, ql[96+lane]
+                uint qh0 = gByte(b0 + 128 + lane);    // half=0, qh[lane]
+                uint qh1 = gByte(b0 + 160 + lane);    // half=1, qh[32+lane]
 
-                uint ql_base = half_idx * 64;
-                uint qh_base = 128 + half_idx * 32;
-                uint sc_base = 192 + half_idx * 8;
+                uint base_elem = block * 256;
 
-                uint isc = l >> 4;
-                int scale_val = sReadInt8(sc_base + isc + group * 2);
-
-                int quant;
-                if (group < 2) {
-                    uint ql_off = (group == 0) ? l : (32 + l);
-                    uint ql_byte = sReadByte(ql_base + ql_off);
-                    uint qh_byte = sReadByte(qh_base + l);
-                    quant = int(((ql_byte & 0xF) | (((qh_byte >> (group * 2)) & 3) << 4))) - 32;
-                } else {
-                    uint ql_off = (group == 2) ? l : (32 + l);
-                    uint ql_byte = sReadByte(ql_base + ql_off);
-                    uint qh_byte = sReadByte(qh_base + l);
-                    quant = int((((ql_byte >> 4) & 0xF) | (((qh_byte >> (group * 2)) & 3) << 4))) - 32;
-                }
-
-                acc += d * float(scale_val) * float(quant) * input_data[block * 256 + tid];
-                barrier();
+                acc += sc0 * float(int((ql0 & 0xF)        | (((qh0 >> 0) & 3) << 4)) - 32) * input_data[base_elem +       lane];
+                acc += sc1 * float(int((ql1 & 0xF)        | (((qh0 >> 2) & 3) << 4)) - 32) * input_data[base_elem +  32 + lane];
+                acc += sc2 * float(int(((ql0 >> 4) & 0xF) | (((qh0 >> 4) & 3) << 4)) - 32) * input_data[base_elem +  64 + lane];
+                acc += sc3 * float(int(((ql1 >> 4) & 0xF) | (((qh0 >> 6) & 3) << 4)) - 32) * input_data[base_elem +  96 + lane];
+                acc += sc4 * float(int((ql2 & 0xF)        | (((qh1 >> 0) & 3) << 4)) - 32) * input_data[base_elem + 128 + lane];
+                acc += sc5 * float(int((ql3 & 0xF)        | (((qh1 >> 2) & 3) << 4)) - 32) * input_data[base_elem + 160 + lane];
+                acc += sc6 * float(int(((ql2 >> 4) & 0xF) | (((qh1 >> 4) & 3) << 4)) - 32) * input_data[base_elem + 192 + lane];
+                acc += sc7 * float(int(((ql3 >> 4) & 0xF) | (((qh1 >> 6) & 3) << 4)) - 32) * input_data[base_elem + 224 + lane];
             }
 
-            // 256 threads = 8 subgroups of 32. subgroupAdd within each, then combine.
-            float sg_sum = subgroupAdd(acc);
+            float result = subgroupAdd(acc);
             if (subgroupElect())
-                sdata[gl_SubgroupID] = sg_sum;
-            barrier();
-            if (tid == 0) {
-                float total = 0.0;
-                for (uint i = 0; i < gl_NumSubgroups; i++) total += sdata[i];
-                output_data[row] = total;
-            }
+                output_data[row] = result;
         }
         """;
 
