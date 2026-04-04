@@ -33,6 +33,12 @@ builder.Services.AddSingleton<IInferenceEngine>(sp =>
     var fwd = new ForwardPass(model, cpuBackend, hp);
     var modelId = Path.GetFileNameWithoutExtension(modelPath);
 
+    int maxBatch = 1;
+    if (int.TryParse(Environment.GetEnvironmentVariable("SHARPI_MAX_BATCH"), out int mb) && mb > 1)
+        maxBatch = mb;
+
+    if (maxBatch > 1)
+        return new ContinuousBatchingEngine(fwd, tokenizer, modelId, maxBatch);
     return new InferenceEngine(fwd, tokenizer, modelId, cpuBackend, model);
 });
 

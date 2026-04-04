@@ -1751,6 +1751,34 @@ curl http://localhost:5000/v1/messages \
 
 **Tests**: 13 new tests in `PagedKvCacheTests` covering cross-page access, soft truncate, page reuse, and prefix reuse semantics. All 145 tests pass.
 
+#### Phase 7c: Continuous Batching (✅ Complete)
+
+**`BatchForwardMulti`** in `ForwardPass`:
+- [x] Batched decode step for N sequences simultaneously — one token per sequence
+- [x] Shared weight reads (Q/K/V/FFN GEMMs) amortized across N sequences per decode step
+- [x] Per-sequence `PagedKvCache` — each sequence has its own independent KV cache
+- [x] Per-sequence: individual RoPE, cache append at `positions[n]`, and causal attention against `caches[n]`
+- [x] Not supported for MoE models or with TurboQuant (throws `NotSupportedException`)
+
+**`PrefillWithCache`** / **`ForwardCore`** / **`CreateCache`** in `ForwardPass`:
+- [x] `PrefillWithCache(tokens, cache, startPos)` — prefills a given sequence's cache (used during admission)
+- [x] `ForwardCore(token, pos, cache)` — single-token forward into explicit cache (supports MoE)
+- [x] `CreateCache()` — factory method returns a compatible `PagedKvCache` for the model's dimensions
+
+**`ContinuousBatchingEngine`** (`src/SharpInference.Engine/ContinuousBatchingEngine.cs`):
+- [x] Implements `IInferenceEngine` — drop-in replacement for `InferenceEngine`
+- [x] Unbounded request channel — callers enqueue via `GenerateAsync`, stream results back via `IAsyncEnumerable<string>`
+- [x] Background batcher loop:
+  1. Admits pending requests up to `_maxBatchSize` (prefills each individually with own `PagedKvCache`)
+  2. Batched decode: `BatchForwardMulti` processes all active sequences in one forward pass per step
+  3. Samples next token per sequence; writes to that sequence's output channel
+  4. Retires sequences that hit EOS, `MaxNewTokens`, or cancellation; disposes cache
+- [x] Enabled via `SHARPI_MAX_BATCH` environment variable (server `Program.cs`); `> 1` activates continuous batching
+
+**Throughput model**: with batch size N, weight reads are amortized N×. For N=8 on a memory-bandwidth-bound decode, expect up to 8× total throughput (tokens/s across all users) vs single-user baseline.
+
+**Tests**: 7 new tests in `ContinuousBatchingTests` covering `PrefillWithCache` correctness, `BatchForwardMulti` equivalence to sequential decode, concurrent engine requests, and dispose lifecycle. All 152 tests pass.
+
 ---
 
 ## 13. Validation Strategy
@@ -1833,7 +1861,7 @@ Based on the reference benchmarks above, these are concrete targets per phase:
 | 5+6 | Llama 4 Scout + speculative | MoE + SmolLM2 draft | ~12 TG t/s (no spec) | ≥ 25 effective TG t/s | ~2x from speculative decoding on top of Phase 5 |
 | 7a | API server (single-user) | CPU/GPU, any model | N/A | Correct wire format | ✅ OpenAI + Anthropic compatible, 8 integration tests |
 | 7b | API server (prefix cache) | CPU, SmolLM2 1.7B | N/A (new feature) | Eliminate repeated prefill | ✅ PagedKvCache + prefix cache; 3.2GB→402MB at 4K ctx |
-| 7c | Multi-user server | PagedAttention + continuous batching | vLLM ~485 tot t/s @10 users | ≥ 300 tot t/s | Paged TQ3 KV = ~5x more sequences than vLLM FP16 |
+| 7c | Multi-user server | PagedAttention + continuous batching | vLLM ~485 tot t/s @10 users | ≥ 300 tot t/s | ✅ `ContinuousBatchingEngine` + `BatchForwardMulti`; SHARPI_MAX_BATCH controls batch size |
 
 **Stretch targets (if all optimizations compose well):**
 

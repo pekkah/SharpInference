@@ -11,7 +11,7 @@ SharpInference is a high-performance LLM inference engine in C# 14 / .NET 10. It
 ```bash
 dotnet build                # Debug build
 dotnet build -c Release     # Release (NativeAOT opts: IlcOptimizationPreference=Speed)
-dotnet test                 # Run all tests (145 tests across 5 projects)
+dotnet test                 # Run all tests (152 tests across 5 projects)
 dotnet test --filter "FullyQualifiedName~SomeTest"  # Run a single test
 
 # Run CLI inference
@@ -54,7 +54,9 @@ Supporting libraries:
 - `IComputeBackend` (in Core) is the central abstraction — defines MatMul, RmsNorm, RoPE, Softmax, SiLU, Attention, and memory management. CPU and Vulkan backends implement it.
 - `IForwardPass` (in Core) — per-token forward pass; implemented by `ForwardPass` (CPU), `GpuForwardPass`, `HybridForwardPass`. Has `Forward`, `Prefill`, `TruncateTo`, `ResetCache`, `VocabSize`, `MaxSeqLen`.
 - `PagedKvCache` (in Engine) — lazily allocated paged KV cache used by `ForwardPass`. Pages (16 positions) allocated on first write; `TruncateTo` is a soft operation (enables prefix reuse); `Reset` returns pages to warm pool.
-- `IInferenceEngine` (in Engine) — top-level generation interface used by the server: `GenerateAsync(prompt, sp, ct) → IAsyncEnumerable<string>`. Serializes concurrent requests.
+- `IInferenceEngine` (in Engine) — top-level generation interface used by the server: `GenerateAsync(prompt, sp, ct) → IAsyncEnumerable<string>`. Implemented by `InferenceEngine` (single-user, prefix caching) and `ContinuousBatchingEngine` (multi-user batching, activated via `SHARPI_MAX_BATCH`).
+- `ForwardPass.BatchForwardMulti(tokens[], positions[], caches[])` — batched multi-sequence decode; amortizes weight reads N× across concurrent users. Each sequence has its own `PagedKvCache`. Not supported for MoE or TurboQuant.
+- `ForwardPass.PrefillWithCache(tokens, cache, startPos)` — prefills a per-sequence cache (used by `ContinuousBatchingEngine` during request admission).
 - `ForwardPass` / `GpuForwardPass` in Engine dispatch the transformer layer sequence.
 - Hot paths use `NativeMemory`, `Span<T>`, and Vulkan buffers — no managed heap allocations.
 - Unsafe code is used throughout for performance. `AllowUnsafeBlocks` is enabled globally.
