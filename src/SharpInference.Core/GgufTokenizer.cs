@@ -29,6 +29,12 @@ public sealed class GgufTokenizer : ITokenizer
     /// <summary>The type name of the inner tokenizer (for diagnostics).</summary>
     public string InnerTokenizerType => _inner.GetType().Name;
 
+    /// <summary>
+    /// Jinja2 chat template parsed from GGUF tokenizer.chat_template metadata, if present.
+    /// Use this to format messages into a prompt string for any model without hardcoding templates.
+    /// </summary>
+    public JinjaChatTemplate? ChatTemplate { get; private set; }
+
     private GgufTokenizer(
         Tokenizer inner,
         Dictionary<string, int> specialTokens,
@@ -163,7 +169,7 @@ public sealed class GgufTokenizer : ITokenizer
             needsByteEncoding = true;
         }
 
-        return new GgufTokenizer(
+        var tokenizer = new GgufTokenizer(
             inner,
             specialTokens,
             specialTokens.ToDictionary(kv => kv.Value, kv => kv.Key),
@@ -175,6 +181,14 @@ public sealed class GgufTokenizer : ITokenizer
             padTokenId,
             addBosToken,
             needsByteEncoding);
+
+        if (model.Metadata.TryGetValue("tokenizer.chat_template", out var tmpl) && tmpl is string tmplStr)
+        {
+            try { tokenizer.ChatTemplate = new JinjaChatTemplate(tmplStr); }
+            catch { /* malformed template — ChatTemplate stays null */ }
+        }
+
+        return tokenizer;
     }
 
     private static Dictionary<string, int> BuildVocabLookup(object[] tokensArray)

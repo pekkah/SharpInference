@@ -133,6 +133,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         s_arch = model.Metadata.TryGetValue("general.architecture", out var archVal) ? (string)archVal : "qwen2";
         int ctxSize = settings.CtxSize; // 0 = auto (GPU will estimate from VRAM, CPU uses model default)
         var tokenizer = GgufTokenizer.FromGgufModel(model);
+        s_jinja = tokenizer.ChatTemplate;
 
         // Look up Qwen3 thinking-mode tokens for use in the decode loops
         if (s_arch is "qwen3moe" or "qwen3")
@@ -550,6 +551,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     private static string s_arch = "qwen2"; // set during model load
     private static int s_thinkTokenId = -1;    // <think> token for Qwen3 thinking mode
     private static int s_endThinkTokenId = -1; // </think> token for Qwen3 thinking mode
+    private static JinjaChatTemplate? s_jinja;  // parsed from GGUF tokenizer.chat_template
 
     /// <summary>
     /// Builds the stop token ID list: EOS plus any end-of-turn special tokens
@@ -567,6 +569,19 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
     private static string FormatPrompt(string userMessage, string? systemPrompt)
     {
+        // Use the model's own Jinja2 chat template when available (read from GGUF metadata).
+        if (s_jinja != null)
+        {
+            var messages = JinjaChatTemplate.BuildMessages(userMessage, systemContent: systemPrompt);
+            return s_jinja.Render(new Dictionary<string, object?>
+            {
+                ["messages"]             = messages,
+                ["add_generation_prompt"] = true,
+                ["tools"]                = null,
+            });
+        }
+
+        // Fallback: hardcoded templates for known architectures.
         var sb = new System.Text.StringBuilder();
 
         if (s_arch is "llama4")
@@ -590,7 +605,6 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         else
         {
             // ChatML (Qwen, SmolLM, default): <|im_start|>role\nmessage<|im_end|>
-            // Qwen3 models need a system prompt to avoid confused output; add a default when none given.
             string? effectiveSystemPrompt = systemPrompt
                 ?? (s_arch is "qwen3moe" or "qwen3" ? "You are a helpful assistant." : null);
             if (effectiveSystemPrompt is not null)

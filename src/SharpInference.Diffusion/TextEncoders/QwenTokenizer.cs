@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using SharpInference.Core;
 
 namespace SharpInference.Diffusion.TextEncoders;
 
@@ -7,8 +8,9 @@ namespace SharpInference.Diffusion.TextEncoders;
 /// Minimal Qwen3 BPE tokenizer for Z-Image text encoding.
 ///
 /// Loads a HuggingFace tokenizer.json (ByteLevel BPE format as used by Qwen3).
-/// Applies the Qwen3 thinking-mode chat template before tokenization:
-///   &lt;|im_start|&gt;user\n{prompt}&lt;|im_end|&gt;\n&lt;|im_start|&gt;assistant\n&lt;think&gt;\n
+/// If tokenizer_config.json (same directory) contains a chat_template key,
+/// it is parsed as a Jinja2 template via <see cref="JinjaChatTemplate"/> and used in
+/// <see cref="EncodeWithTemplate"/>. Otherwise falls back to the hardcoded Qwen3 ChatML template.
 ///
 /// Download tokenizer.json from:
 ///   https://huggingface.co/Tongyi-MAI/Z-Image-Turbo  →  tokenizer/tokenizer.json
@@ -25,12 +27,16 @@ public sealed class QwenTokenizer
     private readonly Dictionary<string, int> _vocab;
     // merge → rank for O(1) lookup during BPE
     private readonly Dictionary<(string, string), int> _mergeRanks;
+    // Optional parsed Jinja2 chat template from tokenizer_config.json
+    private readonly JinjaChatTemplate? _chatTemplate;
 
     private QwenTokenizer(Dictionary<string, int> vocab,
-                          Dictionary<(string, string), int> mergeRanks)
+                          Dictionary<(string, string), int> mergeRanks,
+                          JinjaChatTemplate? chatTemplate)
     {
-        _vocab      = vocab;
-        _mergeRanks = mergeRanks;
+        _vocab        = vocab;
+        _mergeRanks   = mergeRanks;
+        _chatTemplate = chatTemplate;
     }
 
     public static QwenTokenizer FromFile(string path)
@@ -80,17 +86,58 @@ public sealed class QwenTokenizer
             mergeRanks.TryAdd((a, b), rank++);
         }
 
-        return new QwenTokenizer(vocab, mergeRanks);
+        // Try to load the Jinja2 chat template from tokenizer_config.json (same directory)
+        JinjaChatTemplate? chatTemplate = null;
+        var configPath = Path.Combine(Path.GetDirectoryName(path)!, "tokenizer_config.json");
+        if (File.Exists(configPath))
+        {
+            try
+            {
+                using var cfgStream = File.OpenRead(configPath);
+                using var cfgDoc    = JsonDocument.Parse(cfgStream);
+                if (cfgDoc.RootElement.TryGetProperty("chat_template", out var tmplEl))
+                {
+                    var tmplStr = tmplEl.GetString();
+                    if (!string.IsNullOrWhiteSpace(tmplStr))
+                        chatTemplate = new JinjaChatTemplate(tmplStr);
+                }
+            }
+            catch { /* ignore — will use hardcoded fallback */ }
+        }
+
+        return new QwenTokenizer(vocab, mergeRanks, chatTemplate);
     }
 
     /// <summary>
-    /// Encode a text prompt using the Qwen3 chat template with thinking mode.
+    /// Encode a text prompt using the model's chat template with thinking mode enabled.
+    /// If a Jinja2 template is available (from tokenizer_config.json), it is used.
+    /// Otherwise falls back to the hardcoded Qwen3 ChatML + &lt;think&gt; format.
     /// Returns token IDs (excludes the final EOS that the LLM would generate).
     /// </summary>
     public int[] EncodeWithTemplate(string prompt)
     {
-        // <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n
-        string text = $"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n";
+        string text;
+        if (_chatTemplate != null)
+        {
+            // Render via Jinja2 with add_generation_prompt=true
+            var messages = JinjaChatTemplate.BuildMessages(prompt, systemContent: null);
+            text = _chatTemplate.Render(new Dictionary<string, object?>
+            {
+                ["messages"]              = messages,
+                ["add_generation_prompt"] = true,
+                ["tools"]                 = null,
+            });
+            // Z-Image encoder always runs in thinking mode: append <think>\n so the model
+            // produces structured reasoning that the vision head can use.
+            if (!text.Contains("<think>"))
+                text += "<think>\n";
+        }
+        else
+        {
+            // Hardcoded Qwen3 ChatML with thinking mode
+            text = $"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n";
+        }
+
         return Encode(text);
     }
 

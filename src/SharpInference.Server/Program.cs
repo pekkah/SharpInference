@@ -1,6 +1,7 @@
 using SharpInference.Core;
 using SharpInference.Cpu;
 using SharpInference.Engine;
+using SharpInference.Server;
 using SharpInference.Server.Endpoints;
 
 var builder = WebApplication.CreateSlimBuilder(args);
@@ -28,6 +29,9 @@ builder.Services.AddSingleton<IInferenceEngine>(sp =>
 
     // Publish arch so endpoints can apply the right chat template
     Environment.SetEnvironmentVariable("SHARPI_ARCH", arch);
+
+    // Use the model's own Jinja2 chat template when available
+    ChatTemplate.Template = tokenizer.ChatTemplate;
 
     var cpuBackend = new CpuBackend();
     var fwd = new ForwardPass(model, cpuBackend, hp);
