@@ -1,5 +1,15 @@
 namespace SharpInference.Core;
 
+/// <summary>Reduced-precision variants available for SGEMM dispatch.</summary>
+public enum SgemmPrecision
+{
+    Fp32,
+    Fp16,
+    Bf16,
+    Int8Fp16,
+    Fp8E4M3,
+}
+
 /// <summary>
 /// Abstraction over a compute device (CPU, Vulkan GPU, etc.).
 /// Implementations perform tensor operations on their respective hardware.
@@ -7,6 +17,9 @@ namespace SharpInference.Core;
 public interface IComputeBackend : IDisposable
 {
     string Name { get; }
+
+    /// <summary>Best SGEMM precision the backend supports for ZImage DiT.</summary>
+    SgemmPrecision BestSgemmPrecision { get; }
 
     // --- Memory management ---
 
@@ -21,6 +34,12 @@ public interface IComputeBackend : IDisposable
 
     /// <summary>Copy data back from the backend device.</summary>
     void Download(Tensor src, Span<float> dst);
+
+    /// <summary>Copy fp16 data to the backend device, returning a Float16 tensor.</summary>
+    Tensor UploadHalf(ReadOnlySpan<Half> data, TensorShape shape);
+
+    /// <summary>Copy fp16 data back from a Float16 tensor on the backend device.</summary>
+    void DownloadHalf(Tensor src, Span<Half> dst);
 
     // --- Core math operations ---
 

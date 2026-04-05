@@ -367,32 +367,82 @@ public sealed class ZImageDiT : IDisposable
         {
             if (_backend != null && n >= MinGpuBatch)
             {
-                // GPU path: dequantize weight on CPU, upload A + B, run SGEMM, download C
-                int wCount = rows * cols;
-                float[] wBuf = ArrayPool<float>.Shared.Rent(wCount);
-                try
+                if (_backend.BestSgemmPrecision == SgemmPrecision.Fp16)
                 {
-                    Dequantize.ToFloat32(
-                        new ReadOnlySpan<byte>((byte*)ptr, (int)byteLen),
-                        wBuf.AsSpan(0, wCount), dtype, wCount);
-
-                    var xGpu = _backend.Upload(x.AsSpan(0, n * cols), TensorShape.D1(n * cols));
-                    var wGpu = _backend.Upload(wBuf.AsSpan(0, wCount), TensorShape.D1(wCount));
-                    var cGpu = _backend.Allocate(TensorShape.D1(n * rows));
+                    // fp16 GPU path: dequantize weight to Half, upload as fp16, run fp16 SGEMM
+                    int wCount = rows * cols;
+                    float[] wBuf32 = ArrayPool<float>.Shared.Rent(wCount);
+                    Half[] xHalf   = ArrayPool<Half>.Shared.Rent(n * cols);
+                    Half[] wHalf   = ArrayPool<Half>.Shared.Rent(wCount);
+                    Half[] cHalf   = ArrayPool<Half>.Shared.Rent(n * rows);
                     try
                     {
-                        _backend.Sgemm(cGpu, xGpu, wGpu, n, cols, rows);
-                        _backend.Synchronize();
-                        _backend.Download(cGpu, result.AsSpan());
+                        Dequantize.ToFloat32(
+                            new ReadOnlySpan<byte>((byte*)ptr, (int)byteLen),
+                            wBuf32.AsSpan(0, wCount), dtype, wCount);
+
+                        // Convert fp32 activations and weights to fp16
+                        int xCount = n * cols;
+                        for (int i = 0; i < xCount; i++)   xHalf[i] = (Half)x[i];
+                        for (int i = 0; i < wCount; i++)   wHalf[i] = (Half)wBuf32[i];
+
+                        var xGpu = _backend.UploadHalf(xHalf.AsSpan(0, xCount), TensorShape.D1(xCount));
+                        var wGpu = _backend.UploadHalf(wHalf.AsSpan(0, wCount), TensorShape.D1(wCount));
+                        var cGpu = _backend.Allocate(TensorShape.D1(n * rows), DType.Float16);
+                        try
+                        {
+                            _backend.Sgemm(cGpu, xGpu, wGpu, n, cols, rows);
+                            _backend.Synchronize();
+                            _backend.DownloadHalf(cGpu, cHalf.AsSpan(0, n * rows));
+                        }
+                        finally
+                        {
+                            _backend.Free(xGpu);
+                            _backend.Free(wGpu);
+                            _backend.Free(cGpu);
+                        }
+
+                        // Convert fp16 output back to fp32
+                        int cCount = n * rows;
+                        for (int i = 0; i < cCount; i++)  result[i] = (float)cHalf[i];
                     }
                     finally
                     {
-                        _backend.Free(xGpu);
-                        _backend.Free(wGpu);
-                        _backend.Free(cGpu);
+                        ArrayPool<float>.Shared.Return(wBuf32);
+                        ArrayPool<Half>.Shared.Return(xHalf);
+                        ArrayPool<Half>.Shared.Return(wHalf);
+                        ArrayPool<Half>.Shared.Return(cHalf);
                     }
                 }
-                finally { ArrayPool<float>.Shared.Return(wBuf); }
+                else
+                {
+                    // fp32 GPU path: dequantize weight on CPU, upload A + B, run SGEMM, download C
+                    int wCount = rows * cols;
+                    float[] wBuf = ArrayPool<float>.Shared.Rent(wCount);
+                    try
+                    {
+                        Dequantize.ToFloat32(
+                            new ReadOnlySpan<byte>((byte*)ptr, (int)byteLen),
+                            wBuf.AsSpan(0, wCount), dtype, wCount);
+
+                        var xGpu = _backend.Upload(x.AsSpan(0, n * cols), TensorShape.D1(n * cols));
+                        var wGpu = _backend.Upload(wBuf.AsSpan(0, wCount), TensorShape.D1(wCount));
+                        var cGpu = _backend.Allocate(TensorShape.D1(n * rows));
+                        try
+                        {
+                            _backend.Sgemm(cGpu, xGpu, wGpu, n, cols, rows);
+                            _backend.Synchronize();
+                            _backend.Download(cGpu, result.AsSpan());
+                        }
+                        finally
+                        {
+                            _backend.Free(xGpu);
+                            _backend.Free(wGpu);
+                            _backend.Free(cGpu);
+                        }
+                    }
+                    finally { ArrayPool<float>.Shared.Return(wBuf); }
+                }
             }
             else
             {

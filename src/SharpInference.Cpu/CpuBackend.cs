@@ -11,6 +11,7 @@ namespace SharpInference.Cpu;
 public sealed unsafe class CpuBackend : IComputeBackend
 {
     public string Name => "CPU (Scalar)";
+    public SgemmPrecision BestSgemmPrecision => SgemmPrecision.Fp32;
 
     // --- Memory management ---
 
@@ -49,6 +50,12 @@ public sealed unsafe class CpuBackend : IComputeBackend
 
         new ReadOnlySpan<float>((void*)src.Handle, count).CopyTo(dst);
     }
+
+    public Tensor UploadHalf(ReadOnlySpan<Half> data, TensorShape shape) =>
+        throw new NotSupportedException("CpuBackend does not support fp16 upload");
+
+    public void DownloadHalf(Tensor src, Span<Half> dst) =>
+        throw new NotSupportedException("CpuBackend does not support fp16 download");
 
     // --- Core math operations ---
 

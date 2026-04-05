@@ -1487,4 +1487,140 @@ internal static class Shaders
                 c_data[row * pc.N + col] = acc;
         }
         """;
+
+    /// <summary>
+    /// Tiled fp16 SGEMM: C[M,N] = A[M,K] × B[N,K]^T
+    /// All inputs and output are float16_t.  Accumulation is done in fp32 for numerical stability.
+    ///
+    /// Requires: VK_KHR_shader_float16_int8 + VK_KHR_16bit_storage
+    ///
+    /// Push constants: { uint M, uint N, uint K }.
+    /// Bindings: 0=A (readonly fp16), 1=B (readonly fp16), 2=C (writeonly fp16).
+    /// Dispatch: (ceil(M/16), ceil(N/16), 1) with local_size=(16,16,1).
+    /// </summary>
+    internal const string SgemmF16 = """
+        #version 450
+        #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+        #extension GL_EXT_shader_16bit_storage : require
+
+        layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+        layout(push_constant) uniform PC {
+            uint M;
+            uint N;
+            uint K;
+        } pc;
+
+        layout(binding = 0) readonly  buffer BufA { float16_t a_data[]; };
+        layout(binding = 1) readonly  buffer BufB { float16_t b_data[]; };
+        layout(binding = 2) writeonly buffer BufC { float16_t c_data[]; };
+
+        shared float16_t tileA[16][17];
+        shared float16_t tileB[16][17];
+
+        void main() {
+            uint row = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+            uint col = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+
+            float acc = 0.0;
+            uint numTiles = (pc.K + 15u) / 16u;
+
+            for (uint t = 0u; t < numTiles; t++) {
+                uint aCol = t * 16u + gl_LocalInvocationID.y;
+                uint bCol = t * 16u + gl_LocalInvocationID.x;
+
+                tileA[gl_LocalInvocationID.x][gl_LocalInvocationID.y] =
+                    (row < pc.M && aCol < pc.K) ? a_data[row * pc.K + aCol] : float16_t(0.0);
+
+                tileB[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+                    (col < pc.N && bCol < pc.K) ? b_data[col * pc.K + bCol] : float16_t(0.0);
+
+                barrier();
+
+                for (uint k = 0u; k < 16u; k++)
+                    acc += float(tileA[gl_LocalInvocationID.x][k]) *
+                           float(tileB[gl_LocalInvocationID.y][k]);
+
+                barrier();
+            }
+
+            if (row < pc.M && col < pc.N)
+                c_data[row * pc.N + col] = float16_t(acc);
+        }
+        """;
+
+    /// <summary>
+    /// Tiled int8-weight × fp16-activation SGEMM: C[M,N] = A[M,K] × (scale * B)[N,K]^T
+    /// A is fp16 activations, B is int8 weights (per-row quantized with fp16 scales).
+    /// Accumulation is done in fp32.
+    ///
+    /// Requires: VK_KHR_shader_float16_int8 + VK_KHR_16bit_storage + VK_KHR_8bit_storage
+    ///
+    /// Push constants: { uint M, uint N, uint K }.
+    /// Bindings: 0=A (fp16 activations [M,K]), 1=B (int8 weights [N,K]),
+    ///           2=scale (fp16 per-row scales [N]), 3=C (fp16 output [M,N]).
+    /// Dispatch: (ceil(M/16), ceil(N/16), 1) with local_size=(16,16,1).
+    /// </summary>
+    internal const string SgemmInt8Fp16 = """
+        #version 450
+        #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+        #extension GL_EXT_shader_explicit_arithmetic_types_int8    : require
+        #extension GL_EXT_shader_16bit_storage : require
+        #extension GL_EXT_shader_8bit_storage  : require
+
+        layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+        layout(push_constant) uniform PC {
+            uint M;
+            uint N;
+            uint K;
+        } pc;
+
+        layout(binding = 0) readonly  buffer BufA  { float16_t a_data[]; };
+        layout(binding = 1) readonly  buffer BufB  { int8_t    b_data[]; };
+        layout(binding = 2) readonly  buffer BufS  { float16_t b_scale[]; };
+        layout(binding = 3) writeonly buffer BufC  { float16_t c_data[]; };
+
+        shared float16_t tileA[16][17];
+        shared int8_t    tileB[16][17];
+
+        void main() {
+            uint row = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+            uint col = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+
+            float acc = 0.0;
+            uint numTiles = (pc.K + 15u) / 16u;
+
+            for (uint t = 0u; t < numTiles; t++) {
+                uint aCol = t * 16u + gl_LocalInvocationID.y;
+                uint bCol = t * 16u + gl_LocalInvocationID.x;
+
+                tileA[gl_LocalInvocationID.x][gl_LocalInvocationID.y] =
+                    (row < pc.M && aCol < pc.K) ? a_data[row * pc.K + aCol] : float16_t(0.0);
+
+                tileB[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+                    (col < pc.N && bCol < pc.K) ? b_data[col * pc.K + bCol] : int8_t(0);
+
+                barrier();
+
+                for (uint k = 0u; k < 16u; k++)
+                    acc += float(tileA[gl_LocalInvocationID.x][k]) *
+                           float(tileB[gl_LocalInvocationID.y][k]);
+
+                barrier();
+            }
+
+            if (row < pc.M && col < pc.N) {
+                float scale = float(b_scale[col]);
+                c_data[row * pc.N + col] = float16_t(acc * scale);
+            }
+        }
+        """;
+
+    // TODO: SgemmBf16 — requires VK_KHR_shader_bfloat16 (present in Vortice 3.2.1,
+    //       struct: VkPhysicalDeviceShaderBfloat16FeaturesKHR, field: shaderBFloat16Type).
+    //       Shader extension: GL_KHR_shader_bfloat16. Enable once driver support is broad.
+
+    // TODO: SgemmFp8E4M3 — requires VK_EXT_shader_float8_e4m3.
+    //       Not yet in Vortice.Vulkan 3.2.1; add once bindings are available.
 }
