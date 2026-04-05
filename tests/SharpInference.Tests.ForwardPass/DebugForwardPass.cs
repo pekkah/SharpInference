@@ -20,6 +20,7 @@ public sealed class DebugForwardPass
     }
 
     private static string? FindQwen3Path() => FindModelPath("Qwen3-8B-Q4_K_M.gguf");
+    private static string? FindQwen3CoderPath() => FindModelPath("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf");
 
     [Fact]
     public void ListLayer0TensorNames()
@@ -215,5 +216,97 @@ public sealed class DebugForwardPass
 
         // The normed values should be reasonable (not all zeros, not huge)
         Assert.True(normed.Any(v => MathF.Abs(v) > 0.001f), "Normed output should not be all near-zero");
+    }
+
+    [Fact]
+    public void Qwen3Coder_ListLayer0TensorNames()
+    {
+        var path = FindQwen3CoderPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        foreach (var t in model.Tensors.Where(t => t.Name.StartsWith("blk.0.") || !t.Name.StartsWith("blk.")))
+            Console.WriteLine($"{t.Name}: [{string.Join(",", t.Dimensions.Take(t.NDimensions))}] {t.DType}");
+
+        // Verify MoE-specific tensors exist
+        Assert.NotNull(model.FindTensor("blk.0.ffn_gate_exps.weight"));
+        Assert.NotNull(model.FindTensor("blk.0.ffn_gate_inp.weight"));
+    }
+
+    [Fact]
+    public void Qwen3Coder_ParsesHyperparams()
+    {
+        var path = FindQwen3CoderPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        Console.WriteLine($"IsMoE={hp.IsMoE}, NumExperts={hp.NumExperts}, NumActive={hp.NumActiveExperts}");
+        Console.WriteLine($"ExpertIntermediateDim={hp.ExpertIntermediateDim}, IntermediateDim={hp.IntermediateDim}");
+        Console.WriteLine($"EmbDim={hp.EmbeddingDim}, HeadDim={hp.HeadDim}, NumHeads={hp.NumHeads}, NumKvHeads={hp.NumKvHeads}");
+        Console.WriteLine($"HasQkNorm={hp.HasQkNorm}, UseL2QkNorm={hp.UseL2QkNorm}, RopeTheta={hp.RopeTheta}");
+
+        Assert.True(hp.IsMoE);
+        Assert.Equal(128, hp.NumExperts);
+        Assert.Equal(8, hp.NumActiveExperts);
+        Assert.Equal(768, hp.ExpertIntermediateDim);
+        Assert.Equal(2048, hp.EmbeddingDim);
+        Assert.Equal(128, hp.HeadDim);
+        Assert.Equal(32, hp.NumHeads);
+        Assert.Equal(4, hp.NumKvHeads);
+        Assert.True(hp.HasQkNorm);
+        Assert.False(hp.UseL2QkNorm);
+    }
+
+    [Fact]
+    public void Qwen3Coder_CpuFirstToken()
+    {
+        var path = FindQwen3CoderPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var backend = new CpuBackend();
+        using var fwd = new SharpInference.Engine.ForwardPass(model, backend, hp);
+
+        var prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n";
+        var tokens = tokenizer.Encode(prompt);
+        Console.WriteLine($"Prompt tokens ({tokens.Count}): {string.Join(", ", tokens)}");
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        ReadOnlySpan<float> logits = fwd.Prefill(tokens);
+        Console.WriteLine($"Prefill: {tokens.Count} tokens in {sw.Elapsed.TotalMilliseconds:F0}ms");
+
+        var logitsArr = logits.ToArray();
+        var top10 = Enumerable.Range(0, logitsArr.Length).OrderByDescending(j => logitsArr[j]).Take(10).ToArray();
+        Console.WriteLine("Top-10 logits after prefill:");
+        foreach (var idx in top10)
+        {
+            string decoded = tokenizer.Decode([idx]);
+            Console.WriteLine($"  token {idx} ('{decoded}') = {logitsArr[idx]:F4}");
+        }
+
+        // First generated token
+        int firstToken = Engine.Sampler.Greedy(logits);
+        Console.WriteLine($"First token: {firstToken} ('{tokenizer.Decode([firstToken])}')");
+
+        // Generate 10 tokens
+        sw.Restart();
+        var generated = new List<int> { firstToken };
+        var curLogits = fwd.Forward(firstToken, tokens.Count);
+        for (int i = 1; i < 10; i++)
+        {
+            int next = Engine.Sampler.Greedy(curLogits);
+            generated.Add(next);
+            curLogits = fwd.Forward(next, tokens.Count + i);
+        }
+        Console.WriteLine($"Decode: {generated.Count} tokens in {sw.Elapsed.TotalMilliseconds:F0}ms");
+        Console.WriteLine($"Output: '{tokenizer.Decode(generated)}'");
+        Console.WriteLine($"Token IDs: {string.Join(", ", generated)}");
+
+        // The model should generate something reasonable (not all same token)
+        Assert.True(generated.Count == 10);
+        Assert.True(generated.Any(t => t != generated[0]), "All tokens identical — likely broken");
     }
 }

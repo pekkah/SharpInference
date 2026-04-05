@@ -35,7 +35,7 @@ public sealed unsafe class KvCache : IDisposable
     }
 
     public KvCache(ModelHyperparams hp)
-        : this(hp.NumLayers, hp.ContextLength, hp.NumKvHeads, hp.EmbeddingDim / hp.NumHeads)
+        : this(hp.NumLayers, hp.ContextLength, hp.NumKvHeads, hp.HeadDim)
     {
     }
 

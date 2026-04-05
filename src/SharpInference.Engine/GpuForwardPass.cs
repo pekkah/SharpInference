@@ -132,13 +132,13 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         }
 
         _tqFp32Window = enableTurboQuant ? Math.Min(tqFp32Window, _maxSeqLen) : 0;
-        _tqBlockBytes = enableTurboQuant ? TurboQuantOps.BlockSize(tqBits, hp.EmbeddingDim / hp.NumHeads) : 0;
+        _tqBlockBytes = enableTurboQuant ? TurboQuantOps.BlockSize(tqBits, hp.HeadDim) : 0;
 
-        _kvCache = new Engine.KvCache(hp.NumLayers, _maxSeqLen, hp.NumKvHeads, hp.EmbeddingDim / hp.NumHeads);
+        _kvCache = new Engine.KvCache(hp.NumLayers, _maxSeqLen, hp.NumKvHeads, hp.HeadDim);
         Console.Error.WriteLine($"[GpuForwardPass] Context size: {_maxSeqLen} (model max: {hp.ContextLength}){(enableTurboQuant ? " [TQ3]" : "")}");
 
         _embDim = hp.EmbeddingDim;
-        _headDim = hp.EmbeddingDim / hp.NumHeads;
+        _headDim = hp.HeadDim;
         _numHeads = hp.NumHeads;
         _numKvHeads = hp.NumKvHeads;
         _headsPerKvGroup = hp.NumHeads / hp.NumKvHeads;
@@ -809,7 +809,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         int fp32WindowSize = 256, int bits = 3)
     {
         long vramBytes = (long)gpu.VramBytes;
-        int headDim = hp.EmbeddingDim / hp.NumHeads;
+        int headDim = hp.HeadDim;
         int blockSize = TurboQuantOps.BlockSize(bits, headDim);
 
         long weightBytes = 0;
@@ -849,7 +849,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             weightBytes += EstimateGpuTensorBytes(t);
 
         // Scratch buffers (F32): hidden, residual, norm, Q, K, V, attnOut, ffnGate, ffnUp, logits
-        int headDim = hp.EmbeddingDim / hp.NumHeads;
+        int headDim = hp.HeadDim;
         long scratchBytes = (long)(hp.EmbeddingDim * 3 + hp.NumHeads * headDim
             + hp.NumKvHeads * headDim * 2 + hp.NumHeads * headDim
             + hp.IntermediateDim * 2 + hp.VocabSize) * sizeof(float);

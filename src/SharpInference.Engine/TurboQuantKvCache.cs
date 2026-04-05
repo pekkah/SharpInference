@@ -115,7 +115,7 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
 
     public TurboQuantKvCache(ModelHyperparams hp, int fp32WindowSize = 256, int bits = 3,
         int layerIndexBase = 0, int totalLayerCountForSeeds = 0)
-        : this(hp.NumLayers, hp.ContextLength, hp.NumKvHeads, hp.EmbeddingDim / hp.NumHeads,
+        : this(hp.NumLayers, hp.ContextLength, hp.NumKvHeads, hp.HeadDim,
                fp32WindowSize, bits, layerIndexBase, totalLayerCountForSeeds)
     {
     }

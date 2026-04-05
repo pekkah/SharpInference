@@ -3,18 +3,19 @@
     Downloads GGUF models for SharpInference development.
 .DESCRIPTION
     Downloads from HuggingFace to the models/ directory. Skips if already present.
-    Supports: smollm2, qwen3-8b, llama31-70b, qwen3-30b-a3b, llama4-scout
+    Supports: smollm2, qwen3-8b, llama31-70b, qwen3-coder-30b-a3b, llama4-scout
 .PARAMETER Model
     Which model to download. Default: downloads all.
 .EXAMPLE
-    .\download-model.ps1                           # All models
-    .\download-model.ps1 -Model smollm2            # SmolLM2 1.7B (1.1 GB)
-    .\download-model.ps1 -Model qwen3-8b           # Qwen3 8B (4.9 GB)
-    .\download-model.ps1 -Model llama31-70b        # Llama 3.1 70B (40.8 GB)
-    .\download-model.ps1 -Model llama4-scout       # Llama 4 Scout Q4_K_M (60.9 GB, 2 shards)
+    .\download-model.ps1                                # All models
+    .\download-model.ps1 -Model smollm2                 # SmolLM2 1.7B (1.1 GB)
+    .\download-model.ps1 -Model qwen3-8b                # Qwen3 8B (4.9 GB)
+    .\download-model.ps1 -Model llama31-70b             # Llama 3.1 70B (40.8 GB)
+    .\download-model.ps1 -Model qwen3-coder-30b-a3b     # Qwen3-Coder 30B-A3B Q4_K_M (18.6 GB)
+    .\download-model.ps1 -Model llama4-scout            # Llama 4 Scout Q4_K_M (60.9 GB, 2 shards)
 #>
 param(
-    [ValidateSet("smollm2", "qwen3-8b", "llama31-70b", "qwen3-30b-a3b", "llama4-scout")]
+    [ValidateSet("smollm2", "qwen3-8b", "llama31-70b", "qwen3-coder-30b-a3b", "llama4-scout")]
     [string]$Model
 )
 
@@ -37,10 +38,10 @@ $Models = @{
         Size  = "40.8 GB"
         Phase = "4"
     }
-    "qwen3-30b-a3b" = @{
-        Files = @("Qwen3-30B-A3B-Q4_K_M.gguf")
-        Urls  = @("https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf")
-        Size  = "6.2 GB"
+    "qwen3-coder-30b-a3b" = @{
+        Files = @("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf")
+        Urls  = @("https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/main/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf")
+        Size  = "18.6 GB"
         Phase = "5a"
     }
     "llama4-scout" = @{

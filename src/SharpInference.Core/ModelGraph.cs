@@ -22,6 +22,14 @@ public sealed record ModelHyperparams
     public int NumHeads { get; init; }
     public int NumKvHeads { get; init; }
     public int IntermediateDim { get; init; }
+
+    /// <summary>
+    /// Attention head dimension. For most models this equals EmbeddingDim / NumHeads,
+    /// but some architectures (e.g. Qwen3-MoE) use a larger head dim stored in
+    /// {arch}.attention.key_length metadata.
+    /// </summary>
+    public int HeadDim { get; init; }
+
     public float RmsNormEps { get; init; } = 1e-5f;
     public float RopeTheta { get; init; } = 10_000f;
 
@@ -108,16 +116,24 @@ public sealed record ModelHyperparams
         bool useL2QkNorm = isLlama4;
         if (isLlama4) hasQkNorm = true;
 
+        int embDim = GetInt(metadata, $"{arch}.embedding_length");
+        int numHeads = GetInt(metadata, $"{arch}.attention.head_count");
+        // Some models (e.g. Qwen3-MoE) use a head dim that differs from embDim/numHeads.
+        // Read from metadata if available; fall back to computed value.
+        int headDimFromMeta = GetInt(metadata, $"{arch}.attention.key_length");
+        int headDim = headDimFromMeta > 0 ? headDimFromMeta : (numHeads > 0 ? embDim / numHeads : embDim);
+
         return new ModelHyperparams
         {
             VocabSize = GetInt(metadata, $"{arch}.vocab_size"),
             ContextLength = GetInt(metadata, $"{arch}.context_length"),
-            EmbeddingDim = GetInt(metadata, $"{arch}.embedding_length"),
+            EmbeddingDim = embDim,
             NumLayers = GetInt(metadata, $"{arch}.block_count"),
-            NumHeads = GetInt(metadata, $"{arch}.attention.head_count"),
+            NumHeads = numHeads,
             NumKvHeads = GetInt(metadata, $"{arch}.attention.head_count_kv",
                             GetInt(metadata, $"{arch}.attention.head_count")),
             IntermediateDim = GetInt(metadata, $"{arch}.feed_forward_length"),
+            HeadDim = headDim,
             RmsNormEps = GetFloat(metadata, $"{arch}.attention.layer_norm_rms_epsilon", 1e-5f),
             RopeTheta = GetFloat(metadata, $"{arch}.rope.freq_base", 10_000f),
             HasAttnBias = hasAttnBias,

@@ -20,7 +20,7 @@ public static class TierPlanner
             return new LayerPlacement(0, hp.NumLayers, 0, 0, requestedCtxSize > 0 ? requestedCtxSize : hp.ContextLength);
 
         long vramTotal = hardware.VramBytes;
-        int headDim = hp.EmbeddingDim / hp.NumHeads;
+        int headDim = hp.HeadDim;
 
         // Reserve for Vulkan overhead + scratch buffers
         long scratchBytes = (long)(hp.EmbeddingDim * 3 + hp.NumHeads * headDim

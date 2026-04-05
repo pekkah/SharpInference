@@ -88,10 +88,10 @@ public sealed unsafe class ForwardPass : IForwardPass
             ? Math.Min(maxContextLength, hp.ContextLength)
             : Math.Min(hp.ContextLength, 32768);
         _ctxLen = ctxLen;
-        _kvCache = new PagedKvCache(hp.NumLayers, hp.NumKvHeads, hp.EmbeddingDim / hp.NumHeads);
+        _kvCache = new PagedKvCache(hp.NumLayers, hp.NumKvHeads, hp.HeadDim);
 
         _embDim = hp.EmbeddingDim;
-        _headDim = hp.EmbeddingDim / hp.NumHeads;
+        _headDim = hp.HeadDim;
         _numHeads = hp.NumHeads;
         _numKvHeads = hp.NumKvHeads;
         _headsPerKvGroup = hp.NumHeads / hp.NumKvHeads;
@@ -389,26 +389,24 @@ public sealed unsafe class ForwardPass : IForwardPass
                         float* kn = batchK + (long)n * kvDim;
                         float* vn = batchV + (long)n * kvDim;
 
+                        // Qwen3 (weighted QK-norm): norm BEFORE RoPE
+                        if (_hasQkNorm && !_hp.UseL2QkNorm)
+                        {
+                            PerHeadRmsNorm(qn, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
+                            PerHeadRmsNorm(kn, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+                        }
+
                         if (useRoPE)
                         {
                             SimdKernels.ApplyRoPECached(qn, _ropeCosTable + (long)(startPos + n) * _ropeHalfDim, _ropeSinTable + (long)(startPos + n) * _ropeHalfDim, _numHeads, _headDim);
                             SimdKernels.ApplyRoPECached(kn, _ropeCosTable + (long)(startPos + n) * _ropeHalfDim, _ropeSinTable + (long)(startPos + n) * _ropeHalfDim, _numKvHeads, _headDim);
                         }
 
-                        // QK-norm: for L2 (Llama-4), only on RoPE layers (matches llama.cpp)
-                        // For weighted QK-norm (Qwen3), applied to all layers
-                        if (_hasQkNorm && (_hp.UseL2QkNorm ? useRoPE : true))
+                        // L2 QK-norm (Llama-4): norm AFTER RoPE, only on RoPE layers
+                        if (_hasQkNorm && _hp.UseL2QkNorm && useRoPE)
                         {
-                            if (_hp.UseL2QkNorm)
-                            {
-                                PerHeadPureRmsNorm(qn, _numHeads, _headDim, _hp.RmsNormEps);
-                                PerHeadPureRmsNorm(kn, _numKvHeads, _headDim, _hp.RmsNormEps);
-                            }
-                            else
-                            {
-                                PerHeadRmsNorm(qn, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
-                                PerHeadRmsNorm(kn, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
-                            }
+                            PerHeadPureRmsNorm(qn, _numHeads, _headDim, _hp.RmsNormEps);
+                            PerHeadPureRmsNorm(kn, _numKvHeads, _headDim, _hp.RmsNormEps);
                         }
 
                         cache.Append(layer,
@@ -596,24 +594,24 @@ public sealed unsafe class ForwardPass : IForwardPass
 
                         int pos = startPos + n;
 
+                        // Qwen3 (weighted QK-norm): norm BEFORE RoPE
+                        if (_hasQkNorm && !_hp.UseL2QkNorm)
+                        {
+                            PerHeadRmsNorm(qn, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
+                            PerHeadRmsNorm(kn, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+                        }
+
                         if (useRoPE)
                         {
                             SimdKernels.ApplyRoPECached(qn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numHeads, _headDim);
                             SimdKernels.ApplyRoPECached(kn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numKvHeads, _headDim);
                         }
 
-                        if (_hasQkNorm && (_hp.UseL2QkNorm ? useRoPE : true))
+                        // L2 QK-norm (Llama-4): norm AFTER RoPE, only on RoPE layers
+                        if (_hasQkNorm && _hp.UseL2QkNorm && useRoPE)
                         {
-                            if (_hp.UseL2QkNorm)
-                            {
-                                PerHeadPureRmsNorm(qn, _numHeads, _headDim, _hp.RmsNormEps);
-                                PerHeadPureRmsNorm(kn, _numKvHeads, _headDim, _hp.RmsNormEps);
-                            }
-                            else
-                            {
-                                PerHeadRmsNorm(qn, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
-                                PerHeadRmsNorm(kn, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
-                            }
+                            PerHeadPureRmsNorm(qn, _numHeads, _headDim, _hp.RmsNormEps);
+                            PerHeadPureRmsNorm(kn, _numKvHeads, _headDim, _hp.RmsNormEps);
                         }
 
                         _kvCache.Append(layer,
@@ -742,26 +740,25 @@ public sealed unsafe class ForwardPass : IForwardPass
             bool useRoPE = _hp.NoRopeLayerStep == 0
                 || (layer + 1) % _hp.NoRopeLayerStep != 0;
 
+            // Qwen3 (weighted QK-norm): apply norm BEFORE RoPE (per reference implementation)
+            // Llama-4 (L2 QK-norm): apply norm AFTER RoPE (per llama.cpp)
+            if (_hasQkNorm && !_hp.UseL2QkNorm)
+            {
+                PerHeadRmsNorm(_q, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
+                PerHeadRmsNorm(_k, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+            }
+
             if (useRoPE)
             {
-                // RoPE
                 SimdKernels.ApplyRoPECached(_q, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numHeads, _headDim);
                 SimdKernels.ApplyRoPECached(_k, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numKvHeads, _headDim);
             }
 
-            // QK-norm: for L2 (Llama-4), only on RoPE layers per llama.cpp
-            if (_hasQkNorm && (_hp.UseL2QkNorm ? useRoPE : true))
+            // L2 QK-norm (Llama-4): only on RoPE layers, applied after RoPE
+            if (_hasQkNorm && _hp.UseL2QkNorm && useRoPE)
             {
-                if (_hp.UseL2QkNorm)
-                {
-                    PerHeadPureRmsNorm(_q, _numHeads, _headDim, _hp.RmsNormEps);
-                    PerHeadPureRmsNorm(_k, _numKvHeads, _headDim, _hp.RmsNormEps);
-                }
-                else
-                {
-                    PerHeadRmsNorm(_q, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
-                    PerHeadRmsNorm(_k, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
-                }
+                PerHeadPureRmsNorm(_q, _numHeads, _headDim, _hp.RmsNormEps);
+                PerHeadPureRmsNorm(_k, _numKvHeads, _headDim, _hp.RmsNormEps);
             }
 
             // Store K, V in cache
@@ -1263,23 +1260,20 @@ public sealed unsafe class ForwardPass : IForwardPass
             {
                 bool useRoPE = _hp.NoRopeLayerStep == 0
                     || (layer + 1) % _hp.NoRopeLayerStep != 0;
+                if (_hasQkNorm && !_hp.UseL2QkNorm)
+                {
+                    PerHeadRmsNorm(_q, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
+                    PerHeadRmsNorm(_k, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+                }
                 if (useRoPE)
                 {
                     SimdKernels.ApplyRoPECached(_q, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numHeads, _headDim);
                     SimdKernels.ApplyRoPECached(_k, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numKvHeads, _headDim);
                 }
-                if (_hasQkNorm && (_hp.UseL2QkNorm ? useRoPE : true))
+                if (_hasQkNorm && _hp.UseL2QkNorm && useRoPE)
                 {
-                    if (_hp.UseL2QkNorm)
-                    {
-                        PerHeadPureRmsNorm(_q, _numHeads, _headDim, _hp.RmsNormEps);
-                        PerHeadPureRmsNorm(_k, _numKvHeads, _headDim, _hp.RmsNormEps);
-                    }
-                    else
-                    {
-                        PerHeadRmsNorm(_q, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
-                        PerHeadRmsNorm(_k, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
-                    }
+                    PerHeadPureRmsNorm(_q, _numHeads, _headDim, _hp.RmsNormEps);
+                    PerHeadPureRmsNorm(_k, _numKvHeads, _headDim, _hp.RmsNormEps);
                 }
             }
             cache.Append(layer,

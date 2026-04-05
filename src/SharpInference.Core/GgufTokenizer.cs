@@ -12,6 +12,7 @@ public sealed class GgufTokenizer : ITokenizer
 {
     private readonly Tokenizer _inner;
     private readonly Dictionary<string, int> _specialTokens;
+    private readonly Dictionary<int, string> _specialTokensById;
     private readonly Dictionary<string, int> _vocab;
     private readonly bool _needsByteEncoding;
 
@@ -31,6 +32,7 @@ public sealed class GgufTokenizer : ITokenizer
     private GgufTokenizer(
         Tokenizer inner,
         Dictionary<string, int> specialTokens,
+        Dictionary<int, string> specialTokensById,
         Dictionary<string, int> vocab,
         int vocabSize,
         int bosTokenId,
@@ -42,6 +44,7 @@ public sealed class GgufTokenizer : ITokenizer
     {
         _inner = inner;
         _specialTokens = specialTokens;
+        _specialTokensById = specialTokensById;
         _vocab = vocab;
         _needsByteEncoding = needsByteEncoding;
         VocabSize = vocabSize;
@@ -75,14 +78,15 @@ public sealed class GgufTokenizer : ITokenizer
         var padTokenId = GetMetadataInt(model, "tokenizer.ggml.padding_token_id", eosTokenId);
         var addBosToken = GetMetadataBool(model, "tokenizer.ggml.add_bos_token", false);
 
-        // Identify special tokens (control tokens, type 3)
+        // Identify special tokens (control tokens type 3, and user-defined type 4 like <think>)
         var specialTokens = new Dictionary<string, int>();
         if (model.Metadata.TryGetValue("tokenizer.ggml.token_type", out var tokenTypeObj))
         {
             var tokenTypes = (object[])tokenTypeObj;
             for (int i = 0; i < tokenTypes.Length && i < tokensArray.Length; i++)
             {
-                if (Convert.ToInt32(tokenTypes[i]) == 3)
+                int ttype = Convert.ToInt32(tokenTypes[i]);
+                if (ttype == 3 || ttype == 4)
                     specialTokens[(string)tokensArray[i]] = i;
             }
         }
@@ -162,6 +166,7 @@ public sealed class GgufTokenizer : ITokenizer
         return new GgufTokenizer(
             inner,
             specialTokens,
+            specialTokens.ToDictionary(kv => kv.Value, kv => kv.Key),
             BuildVocabLookup(tokensArray),
             tokensArray.Length,
             bosTokenId,
@@ -276,6 +281,12 @@ public sealed class GgufTokenizer : ITokenizer
 
     public string Decode(IEnumerable<int> tokens)
     {
+        // For single-token decode of a special token, bypass the inner tokenizer
+        // which doesn't know about special token IDs (type 3/4).
+        if (tokens is IReadOnlyList<int> list && list.Count == 1 &&
+            _specialTokensById.TryGetValue(list[0], out var specialStr))
+            return specialStr;
+
         var text = _inner.Decode(tokens) ?? string.Empty;
 
         // BpeTokenizer may output GPT-2 byte-level BPE artifacts:

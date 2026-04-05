@@ -133,6 +133,15 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         s_arch = model.Metadata.TryGetValue("general.architecture", out var archVal) ? (string)archVal : "qwen2";
         int ctxSize = settings.CtxSize; // 0 = auto (GPU will estimate from VRAM, CPU uses model default)
         var tokenizer = GgufTokenizer.FromGgufModel(model);
+
+        // Look up Qwen3 thinking-mode tokens for use in the decode loops
+        if (s_arch is "qwen3moe" or "qwen3")
+        {
+            tokenizer.SpecialTokens.TryGetValue("<think>", out int thinkId);
+            tokenizer.SpecialTokens.TryGetValue("</think>", out int endThinkId);
+            s_thinkTokenId = thinkId > 0 ? thinkId : -1;
+            s_endThinkTokenId = endThinkId > 0 ? endThinkId : -1;
+        }
         using var cpuBackend = new CpuBackend();
         using var fwd = new ForwardPass(model, cpuBackend, hp);
 
@@ -147,7 +156,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         // Validate TurboQuant head-dimension compatibility before any GPU allocation
         if (settings.TurboQuant)
         {
-            int headDim = hp.EmbeddingDim / hp.NumHeads;
+            int headDim = hp.HeadDim;
             if (headDim is not 128 and not 256)
             {
                 AnsiConsole.MarkupLine($"[red]Error:[/] TurboQuant requires head dimension 128 or 256; this model has head dim {headDim}. Remove [yellow]--tq[/] to run without KV compression.");
@@ -243,7 +252,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
     backendConfigured:
         AnsiConsole.MarkupLine($"[dim]Model loaded in {sw.Elapsed.TotalSeconds:F1}s — " +
-            $"{hp.NumLayers}L, {hp.EmbeddingDim}d, {hp.VocabSize} vocab, ctx={hp.ContextLength}[/]");
+            $"{hp.NumLayers}L, {hp.EmbeddingDim}d, headDim={hp.HeadDim}, {hp.VocabSize} vocab, ctx={hp.ContextLength}[/]");
 
         var sp = new SamplingParams
         {
@@ -431,6 +440,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         sw.Restart();
         int generated = 0;
+        bool inThinking = false;
         var recentTokens = new List<int>(64);
         for (int i = 0; i < sp.MaxNewTokens; i++)
         {
@@ -438,13 +448,34 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 ? sp with { PreviousTokens = recentTokens }
                 : sp;
             int next = sp.Temperature <= 0 ? Sampler.Greedy(logits) : Sampler.Sample(logits, spWithHistory, rng);
+            if (s.VerbosePrompt)
+            {
+                var logitsArr = logits.ToArray();
+                var top5 = Enumerable.Range(0, logitsArr.Length).OrderByDescending(j => logitsArr[j]).Take(5)
+                    .Select(j => $"{j}({logitsArr[j]:F2})");
+                Console.Error.WriteLine($"[DBG] tok={i} next={next}('{tok.Decode([next])}') stop={sp.StopTokenIds.Contains(next)} top5:{string.Join(" ", top5)}");
+            }
             if (sp.StopTokenIds.Contains(next)) break;
-            Console.Write(tok.Decode([next]));
-            generated++;
+            if (next == s_thinkTokenId)
+            {
+                inThinking = true;
+                Console.Write("\x1b[2m[Thinking...]\n");
+            }
+            else if (next == s_endThinkTokenId && inThinking)
+            {
+                inThinking = false;
+                Console.Write("\x1b[0m\n");
+            }
+            else if (!inThinking)
+            {
+                Console.Write(tok.Decode([next]));
+                generated++;
+            }
             recentTokens.Add(next);
             if (recentTokens.Count > 64) recentTokens.RemoveAt(0);
             logits = forward(next, tokens.Count + i);
         }
+        if (inThinking) Console.Write("\x1b[0m"); // reset if thinking was never closed
         var decodeMs = sw.Elapsed.TotalMilliseconds;
 
         Console.WriteLine();
@@ -477,6 +508,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
             sw.Restart();
             int generated = 0;
+            bool inThinking = false;
             var recentTokens = new List<int>(64);
             for (int i = 0; i < sp.MaxNewTokens; i++)
             {
@@ -485,12 +517,26 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     : sp;
                 int next = sp.Temperature <= 0 ? Sampler.Greedy(logits) : Sampler.Sample(logits, spWithHistory, rng);
                 if (sp.StopTokenIds.Contains(next)) break;
-                Console.Write(tok.Decode([next]));
-                generated++;
+                if (next == s_thinkTokenId)
+                {
+                    inThinking = true;
+                    Console.Write("\x1b[2m[Thinking...]\n");
+                }
+                else if (next == s_endThinkTokenId && inThinking)
+                {
+                    inThinking = false;
+                    Console.Write("\x1b[0m\n");
+                }
+                else if (!inThinking)
+                {
+                    Console.Write(tok.Decode([next]));
+                    generated++;
+                }
                 recentTokens.Add(next);
                 if (recentTokens.Count > 64) recentTokens.RemoveAt(0);
                 logits = forward(next, tokens.Count + i);
             }
+            if (inThinking) Console.Write("\x1b[0m"); // reset if thinking was never closed
             var decodeMs = sw.Elapsed.TotalMilliseconds;
 
             Console.WriteLine();
@@ -502,6 +548,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     }
 
     private static string s_arch = "qwen2"; // set during model load
+    private static int s_thinkTokenId = -1;    // <think> token for Qwen3 thinking mode
+    private static int s_endThinkTokenId = -1; // </think> token for Qwen3 thinking mode
 
     /// <summary>
     /// Builds the stop token ID list: EOS plus any end-of-turn special tokens
@@ -511,7 +559,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     {
         var stops = new HashSet<int> { tokenizer.EosTokenId };
         // End-of-turn tokens used by Llama 3/4, Mistral, Phi, etc.
-        foreach (var name in new[] { "<|eot_id|>", "<|eom_id|>", "<|eot|>", "<|eom|>", "<|end|>", "<|im_end|>", "<|endoftext|>" })
+        foreach (var name in new[] { "<|eot_id|>", "<|eom_id|>", "<|eot|>", "<|eom|>", "<|end|>", "<|im_end|>" })
             if (tokenizer.SpecialTokens.TryGetValue(name, out int id) && id != tokenizer.EosTokenId)
                 stops.Add(id);
         return [.. stops];
@@ -542,8 +590,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         else
         {
             // ChatML (Qwen, SmolLM, default): <|im_start|>role\nmessage<|im_end|>
-            if (systemPrompt is not null)
-                sb.Append($"<|im_start|>system\n{systemPrompt}<|im_end|>\n");
+            // Qwen3 models need a system prompt to avoid confused output; add a default when none given.
+            string? effectiveSystemPrompt = systemPrompt
+                ?? (s_arch is "qwen3moe" or "qwen3" ? "You are a helpful assistant." : null);
+            if (effectiveSystemPrompt is not null)
+                sb.Append($"<|im_start|>system\n{effectiveSystemPrompt}<|im_end|>\n");
             sb.Append($"<|im_start|>user\n{userMessage}<|im_end|>\n<|im_start|>assistant\n");
         }
 

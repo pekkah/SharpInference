@@ -133,7 +133,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         _maxSeqLen = placement.RecommendedCtxSize;
 
         _embDim = hp.EmbeddingDim;
-        _headDim = hp.EmbeddingDim / hp.NumHeads;
+        _headDim = hp.HeadDim;
         _numHeads = hp.NumHeads;
         _numKvHeads = hp.NumKvHeads;
         _headsPerKvGroup = hp.NumHeads / hp.NumKvHeads;
