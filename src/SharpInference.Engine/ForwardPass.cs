@@ -196,6 +196,55 @@ public sealed unsafe class ForwardPass : IForwardPass
         _outputWeight = model.FindTensor("output.weight") is not null
             ? ResolveTensor("output.weight")
             : _embTensor; // tied embeddings
+
+        PrefaultWeights();
+    }
+
+    /// <summary>
+    /// Touch every 4KB page of all weight tensors to force OS page-in,
+    /// eliminating soft page faults during inference.
+    /// </summary>
+    private void PrefaultWeights()
+    {
+        var tensors = new List<TensorRef> { _embTensor, _outputNorm, _outputWeight };
+        int L = _hp.NumLayers;
+        for (int i = 0; i < L; i++)
+        {
+            tensors.Add(_attnNorm[i]);
+            tensors.Add(_wq[i]); tensors.Add(_wk[i]);
+            tensors.Add(_wv[i]); tensors.Add(_wo[i]);
+            tensors.Add(_ffnNorm[i]);
+
+            if (_hp.IsMoE)
+            {
+                tensors.Add(_wGateInp![i]);
+                tensors.Add(_wGateExps![i]); tensors.Add(_wUpExps![i]); tensors.Add(_wDownExps![i]);
+                if (_hp.HasSharedExpert)
+                {
+                    tensors.Add(_wGateShexp![i]); tensors.Add(_wUpShexp![i]); tensors.Add(_wDownShexp![i]);
+                }
+            }
+            else
+            {
+                tensors.Add(_wGate[i]); tensors.Add(_wUp[i]); tensors.Add(_wDown[i]);
+            }
+        }
+
+        long touchSum = 0;
+        Parallel.ForEach(tensors, tensor =>
+        {
+            long size = tensor.Info.ByteSize;
+            byte* ptr = tensor.DataPtr;
+            long localSum = 0;
+            for (long off = 0; off < size; off += 4096)
+                localSum += ptr[off];
+            if (size > 0)
+                localSum += ptr[size - 1];
+            Interlocked.Add(ref touchSum, localSum);
+        });
+
+        // Prevent dead-code elimination
+        if (touchSum == long.MinValue) Console.Write(touchSum);
     }
 
     public PagedKvCache Cache => _kvCache;
