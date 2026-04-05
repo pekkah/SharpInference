@@ -20,7 +20,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
 
     public string Name => "CUDA GPU (cuBLAS)";
 
-    public SgemmPrecision BestSgemmPrecision => SgemmPrecision.Fp16;
+    // fp32 accumulation avoids fp16 overflow in DiT activations (which can exceed ±65504).
+    // Fp16 cuBLAS Hgemm produced all-zero output due to NaN propagation from overflow.
+    public SgemmPrecision BestSgemmPrecision => SgemmPrecision.Fp32;
 
     public bool SupportsGpuDequant => false;
 
