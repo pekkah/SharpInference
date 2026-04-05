@@ -440,7 +440,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         sw.Restart();
         int generated = 0;
-        bool inThinking = false;
+        bool inThinking = false; // set to true when model generates <think> token
         var recentTokens = new List<int>(64);
         for (int i = 0; i < sp.MaxNewTokens; i++)
         {
@@ -508,7 +508,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
             sw.Restart();
             int generated = 0;
-            bool inThinking = false;
+            bool inThinking = false; // set to true when model generates <think> token
             var recentTokens = new List<int>(64);
             for (int i = 0; i < sp.MaxNewTokens; i++)
             {
@@ -559,7 +559,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     {
         var stops = new HashSet<int> { tokenizer.EosTokenId };
         // End-of-turn tokens used by Llama 3/4, Mistral, Phi, etc.
-        foreach (var name in new[] { "<|eot_id|>", "<|eom_id|>", "<|eot|>", "<|eom|>", "<|end|>", "<|im_end|>" })
+        foreach (var name in new[] { "<|eot_id|>", "<|eom_id|>", "<|eot|>", "<|eom|>", "<|end|>", "<|im_end|>", "<|endoftext|>" })
             if (tokenizer.SpecialTokens.TryGetValue(name, out int id) && id != tokenizer.EosTokenId)
                 stops.Add(id);
         return [.. stops];
