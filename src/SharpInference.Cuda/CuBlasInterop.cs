@@ -57,6 +57,9 @@ internal static partial class CuBlasInterop
     [LibraryImport("cudart64_110", EntryPoint = "cudaDeviceSynchronize")]
     internal static partial int DeviceSync();
 
+    [LibraryImport("cudart64_110", EntryPoint = "cudaRuntimeGetVersion")]
+    internal static partial int RuntimeGetVersion(out int version);
+
     [LibraryImport("cudart64_110", EntryPoint = "cudaDeviceGetAttribute")]
     internal static partial int DeviceGetAttribute(out int value, int attr, int device);
 

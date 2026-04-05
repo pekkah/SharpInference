@@ -99,13 +99,15 @@ public sealed class ZImagePipeline : IDisposable
     /// <param name="seed">RNG seed for reproducibility (-1 = random).</param>
     /// <param name="outputPath">Path to write the output PNG file.</param>
     /// <param name="progress">Optional progress callback (step, totalSteps).</param>
+    /// <param name="statusCallback">Optional status text callback for spinner updates.</param>
     public void Generate(string prompt,
                           int width  = 512,
                           int height = 512,
                           int steps  = -1,
                           int seed   = -1,
                           string outputPath = "output.png",
-                          Action<int, int>? progress = null)
+                          Action<int, int>? progress = null,
+                          Action<string>? statusCallback = null)
     {
         if (steps < 0) steps = _p.DefaultSteps;
 
@@ -117,8 +119,12 @@ public sealed class ZImagePipeline : IDisposable
 
         // ── 1. Encode text ────────────────────────────────────────────────
         progress?.Invoke(0, steps + 2);
+        statusCallback?.Invoke("Encoding text prompt (Qwen3-4B)…");
         int[] tokenIds = _tokenizer.EncodeWithTemplate(prompt);
-        float[] txtEmbeds = _encoder.Encode(tokenIds);  // [nTxt, 2560]
+        int totalEncLayers = _p.QwenEncoderLayer + 1;
+        float[] txtEmbeds = _encoder.Encode(tokenIds,
+            encodeProgress: (layer, _) =>
+                statusCallback?.Invoke($"Encoding text: layer {layer + 1}/{totalEncLayers}…"));
         int nTxt = tokenIds.Length;
 
         // ── 2. Build position IDs ─────────────────────────────────────────
@@ -137,7 +143,11 @@ public sealed class ZImagePipeline : IDisposable
         var resultPacked = scheduler.Denoise(noisePacked, (patches, t) =>
         {
             return _dit.Forward(patches, imgPosIds, txtEmbeds, txtPosIds, t);
-        }, (step, total) => progress?.Invoke(step + 1, steps + 2));
+        }, (step, total) =>
+        {
+            progress?.Invoke(step + 1, steps + 2);
+            statusCallback?.Invoke($"Denoising step {step + 1}/{total}…");
+        });
 
         // ── 5. Unpack and decode through VAE ──────────────────────────────
         progress?.Invoke(steps + 1, steps + 2);

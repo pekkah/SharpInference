@@ -238,7 +238,8 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                                 {
                                     ctx.Status($"Step {step}/{total} — {stepSw.Elapsed.TotalSeconds:F1}s elapsed…");
                                     stepSw.Restart();
-                                });
+                                },
+                                statusCallback: s => ctx.Status(s));
                         }
 
                         AnsiConsole.MarkupLine($"[green]✓[/] Done in [cyan]{sw.Elapsed.TotalSeconds:F1}s[/]");

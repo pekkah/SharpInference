@@ -49,7 +49,7 @@ public sealed class QwenTextEncoder : IDisposable
     /// Encode token IDs and return hidden states [nTokens, hiddenSize].
     /// Runs layers 0..QwenEncoderLayer (35 layers, hidden_states[-2]).
     /// </summary>
-    public float[] Encode(int[] tokenIds)
+    public float[] Encode(int[] tokenIds, Action<int, int>? encodeProgress = null)
     {
         int seqLen     = tokenIds.Length;
         int hidden     = _p.QwenHiddenSize;      // 2560
@@ -66,6 +66,7 @@ public sealed class QwenTextEncoder : IDisposable
 
         for (int l = 0; l < nLayers; l++)
         {
+            encodeProgress?.Invoke(l, nLayers);
             string blk = $"blk.{l}";
 
             // ── Attention ─────────────────────────────────────────────────

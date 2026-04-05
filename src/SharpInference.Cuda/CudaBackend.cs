@@ -51,22 +51,34 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
         if (status != 0)
             throw new InvalidOperationException($"cublasCreate failed: {status}");
 
-        var precision = DetectBestPrecision();
+        var precision = DetectBestPrecision(handle);
         return new CudaBackend(handle, precision);
     }
 
-    private static SgemmPrecision DetectBestPrecision()
+    private static unsafe SgemmPrecision DetectBestPrecision(nint handle)
     {
         // Query compute capability of device 0
         if (CuBlasInterop.DeviceGetAttribute(out int major, CuBlasInterop.CudaDevAttrComputeCapabilityMajor, 0) == 0 &&
             CuBlasInterop.DeviceGetAttribute(out int minor, CuBlasInterop.CudaDevAttrComputeCapabilityMinor, 0) == 0)
         {
             int sm = major * 10 + minor;
-            if (sm >= 89) return SgemmPrecision.Fp8E4M3; // Ada Lovelace+ (RTX 40xx) has fp8 tensor cores
+            if (sm >= 89 && IsCuda12OrNewer())
+                return SgemmPrecision.Fp8E4M3; // Ada Lovelace+ with CUDA 12+ fp8 tensor cores
             if (sm >= 80) return SgemmPrecision.Bf16;    // Ampere+ has native bf16
             if (sm >= 53) return SgemmPrecision.Fp16;    // Pascal+ supports fp16 GemmEx
         }
         return SgemmPrecision.Fp32;
+    }
+
+    /// <summary>
+    /// Returns true when the loaded CUDA runtime is version 12 or newer.
+    /// fp8 via cublasGemmEx requires CUDA 12+ (CUDA 11 returns NOT_SUPPORTED or hangs).
+    /// Runtime version is encoded as major*1000 + minor*10 (e.g. 12010 = CUDA 12.1).
+    /// </summary>
+    private static bool IsCuda12OrNewer()
+    {
+        if (CuBlasInterop.RuntimeGetVersion(out int ver) != 0) return false;
+        return ver >= 12000;
     }
 
     // ── Memory management ─────────────────────────────────────────────────
