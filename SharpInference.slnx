@@ -5,6 +5,7 @@
   <Folder Name="/src/">
     <Project Path="src/SharpInference.Cli/SharpInference.Cli.csproj" />
     <Project Path="src/SharpInference.Core/SharpInference.Core.csproj" />
+    <Project Path="src/SharpInference.Diffusion/SharpInference.Diffusion.csproj" />
     <Project Path="src/SharpInference.Cpu/SharpInference.Cpu.csproj" />
     <Project Path="src/SharpInference.Engine/SharpInference.Engine.csproj" />
     <Project Path="src/SharpInference.Pipeline/SharpInference.Pipeline.csproj" />

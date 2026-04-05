@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- NativeAOT-compatible; AOT analyzers inherited from Directory.Build.props -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SharpInference.Cpu\SharpInference.Cpu.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Numerics.Tensors" Version="10.0.5" />
+  </ItemGroup>
+
+</Project>
