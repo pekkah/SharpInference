@@ -1024,14 +1024,11 @@ public sealed unsafe class ForwardPass : IForwardPass
         byte* expertData = packedTensor.DataPtr + expertOffset;
 
         // Compute into a temp buffer, then weighted-add to output
-        // Reuse _ffnGate as temp (it's expertDim-sized but we need embDim here, use _ffnUp)
-        // Actually for down projection: rows=embDim, cols=expertDim. Use stackalloc for small sizes.
         float* temp = _ffnUp; // reuse buffer (embDim is always <= intermDim)
         SimdKernels.MatVec(temp, expertData, input, rows, cols, packedTensor.DType);
 
-        // Weighted accumulate: output += weight * temp
-        for (int i = 0; i < rows; i++)
-            output[i] += weight * temp[i];
+        // Weighted accumulate: output += weight * temp (SIMD)
+        SimdKernels.WeightedAddInPlace(output, temp, weight, rows);
     }
 
     private static void SelectTopK(float* logits, int n, int k,

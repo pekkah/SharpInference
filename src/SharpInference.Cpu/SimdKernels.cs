@@ -1218,6 +1218,9 @@ public static unsafe class SimdKernels
     {
         int numBlocks = cols / 256;
 
+        if (Avx512F.IsSupported)
+            return DotQ6K_Avx512(row, input, cols, numBlocks);
+
         if (!Fma.IsSupported)
             return DotQ6K_Scalar(row, input, cols);
 
@@ -1305,6 +1308,90 @@ public static unsafe class SimdKernels
         }
 
         return HSum256(Avx.Add(Avx.Add(acc1, acc2), Avx.Add(acc3, acc4)));
+    }
+
+    private static float DotQ6K_Avx512(byte* row, float* input, int cols, int numBlocks)
+    {
+        var acc1 = Vector512<float>.Zero;
+        var acc2 = Vector512<float>.Zero;
+        var acc3 = Vector512<float>.Zero;
+        var acc4 = Vector512<float>.Zero;
+        var mask0F = Vector512.Create(0x0F);
+        var mask03 = Vector512.Create(0x03);
+        var sub32 = Vector512.Create(32);
+        int elemOff = 0;
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            byte* x = row + b * 210;
+            byte* ql = x;
+            byte* qh = x + 128;
+            byte* sc = x + 192;
+            float d = HalfToFloat(x[208], x[209]);
+
+            int qlOff = 0, qhOff = 0, scBase = 0;
+
+            for (int half = 0; half < 2; half++)
+            {
+                for (int phase = 0; phase < 2; phase++)
+                {
+                    int lStart = phase * 16;
+                    var s1v = Vector512.Create(d * (sbyte)sc[scBase + phase]);
+                    var s2v = Vector512.Create(d * (sbyte)sc[scBase + phase + 2]);
+                    var s3v = Vector512.Create(d * (sbyte)sc[scBase + phase + 4]);
+                    var s4v = Vector512.Create(d * (sbyte)sc[scBase + phase + 6]);
+
+                    // 16 elements per Vector512 — entire phase in one iteration
+                    var qlA = Avx512F.ConvertToVector512Int32(
+                        Vector128.LoadUnsafe(ref *(ql + qlOff + lStart)));
+                    var qlB = Avx512F.ConvertToVector512Int32(
+                        Vector128.LoadUnsafe(ref *(ql + qlOff + 32 + lStart)));
+                    var qhV = Avx512F.ConvertToVector512Int32(
+                        Vector128.LoadUnsafe(ref *(qh + qhOff + lStart)));
+
+                    var g1 = Avx512F.Subtract(
+                        Avx512F.Or(Avx512F.And(qlA, mask0F),
+                            Avx512F.ShiftLeftLogical(Avx512F.And(qhV, mask03), 4)),
+                        sub32);
+                    acc1 = Avx512F.FusedMultiplyAdd(
+                        Avx512F.Multiply(s1v, Avx512F.ConvertToVector512Single(g1)),
+                        Vector512.LoadUnsafe(ref *(input + elemOff + lStart)), acc1);
+
+                    var g2 = Avx512F.Subtract(
+                        Avx512F.Or(Avx512F.And(qlB, mask0F),
+                            Avx512F.ShiftLeftLogical(Avx512F.And(
+                                Avx512F.ShiftRightLogical(qhV, 2), mask03), 4)),
+                        sub32);
+                    acc2 = Avx512F.FusedMultiplyAdd(
+                        Avx512F.Multiply(s2v, Avx512F.ConvertToVector512Single(g2)),
+                        Vector512.LoadUnsafe(ref *(input + elemOff + 32 + lStart)), acc2);
+
+                    var g3 = Avx512F.Subtract(
+                        Avx512F.Or(Avx512F.And(Avx512F.ShiftRightLogical(qlA, 4), mask0F),
+                            Avx512F.ShiftLeftLogical(Avx512F.And(
+                                Avx512F.ShiftRightLogical(qhV, 4), mask03), 4)),
+                        sub32);
+                    acc3 = Avx512F.FusedMultiplyAdd(
+                        Avx512F.Multiply(s3v, Avx512F.ConvertToVector512Single(g3)),
+                        Vector512.LoadUnsafe(ref *(input + elemOff + 64 + lStart)), acc3);
+
+                    var g4 = Avx512F.Subtract(
+                        Avx512F.Or(Avx512F.And(Avx512F.ShiftRightLogical(qlB, 4), mask0F),
+                            Avx512F.ShiftLeftLogical(Avx512F.And(
+                                Avx512F.ShiftRightLogical(qhV, 6), mask03), 4)),
+                        sub32);
+                    acc4 = Avx512F.FusedMultiplyAdd(
+                        Avx512F.Multiply(s4v, Avx512F.ConvertToVector512Single(g4)),
+                        Vector512.LoadUnsafe(ref *(input + elemOff + 96 + lStart)), acc4);
+                }
+                elemOff += 128;
+                qlOff += 64;
+                qhOff += 32;
+                scBase += 8;
+            }
+        }
+
+        return HSum512(Avx512F.Add(Avx512F.Add(acc1, acc2), Avx512F.Add(acc3, acc4)));
     }
 
     private static float DotQ6K_Scalar(byte* row, float* input, int cols)
@@ -1585,6 +1672,25 @@ public static unsafe class SimdKernels
         else
         {
             for (int i = 0; i < size; i++) x[i] *= scale;
+        }
+    }
+
+    /// <summary>Weighted accumulate in-place: dst[i] += weight * src[i].</summary>
+    public static void WeightedAddInPlace(float* dst, float* src, float weight, int size)
+    {
+        if (Fma.IsSupported && size >= 8)
+        {
+            var wv = Vector256.Create(weight);
+            int i = 0;
+            for (; i + 8 <= size; i += 8)
+                Avx.Store(dst + i, Fma.MultiplyAdd(wv, Avx.LoadVector256(src + i), Avx.LoadVector256(dst + i)));
+            for (; i < size; i++)
+                dst[i] += weight * src[i];
+        }
+        else
+        {
+            for (int i = 0; i < size; i++)
+                dst[i] += weight * src[i];
         }
     }
 
