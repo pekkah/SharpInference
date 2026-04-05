@@ -47,6 +47,12 @@ public interface IComputeBackend : IDisposable
     /// <summary>Copy bf16 data back from a BFloat16 tensor on the backend device.</summary>
     void DownloadBf16(Tensor src, Span<ushort> dst);
 
+    /// <summary>Copy fp8 E4M3 data (one byte per element) to the backend device, returning a Float8E4M3 tensor.</summary>
+    Tensor UploadFp8(ReadOnlySpan<byte> data, TensorShape shape);
+
+    /// <summary>Copy fp8 E4M3 data back from a Float8E4M3 tensor on the backend device.</summary>
+    void DownloadFp8(Tensor src, Span<byte> dst);
+
     /// <summary>Upload raw quantized bytes to a device-local GPU buffer.</summary>
     Tensor UploadRaw(ReadOnlySpan<byte> data, TensorShape shape, DType dtype);
 

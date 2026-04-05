@@ -63,6 +63,12 @@ public sealed unsafe class CpuBackend : IComputeBackend
     public void DownloadBf16(Tensor src, Span<ushort> dst) =>
         throw new NotSupportedException("CpuBackend does not support bf16 download");
 
+    public Tensor UploadFp8(ReadOnlySpan<byte> data, TensorShape shape) =>
+        throw new NotSupportedException("CpuBackend does not support fp8 upload");
+
+    public void DownloadFp8(Tensor src, Span<byte> dst) =>
+        throw new NotSupportedException("CpuBackend does not support fp8 download");
+
     public Tensor UploadRaw(ReadOnlySpan<byte> data, TensorShape shape, DType dtype) =>
         throw new NotSupportedException("CpuBackend does not support raw quantized upload");
 

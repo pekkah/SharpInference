@@ -29,6 +29,10 @@ public sealed class ZImageDiT : IDisposable
     private readonly Dictionary<string, float[]> _cache = new(StringComparer.Ordinal);
     /// <summary>Raw quantized weight buffers cached on the GPU (lazy-populated by GPU dequant path).</summary>
     private readonly Dictionary<string, Core.Tensor>? _gpuWeights;
+    /// <summary>bf16 dequantized weights cached on GPU — uploaded once on first use, reused every step.</summary>
+    private readonly Dictionary<string, Core.Tensor>? _gpuWeightsBf16;
+    /// <summary>fp8 E4M3 weights cached on GPU — uploaded once on first use, reused every step (sm_89+).</summary>
+    private readonly Dictionary<string, Core.Tensor>? _gpuWeightsFp8;
     private bool _disposed;
 
     /// <summary>Minimum batch size to route a MatQ call through the GPU backend.</summary>
@@ -42,6 +46,12 @@ public sealed class ZImageDiT : IDisposable
         _backend = backend;
         if (backend?.SupportsGpuDequant == true)
             _gpuWeights = new Dictionary<string, Core.Tensor>(StringComparer.Ordinal);
+        // Cache bf16 weights on GPU so each weight is uploaded only once across all denoising steps.
+        if (backend?.BestSgemmPrecision == SgemmPrecision.Bf16)
+            _gpuWeightsBf16 = new Dictionary<string, Core.Tensor>(StringComparer.Ordinal);
+        // Cache fp8 weights on GPU (sm_89+, 2× smaller than bf16, use fp8 tensor cores).
+        if (backend?.BestSgemmPrecision == SgemmPrecision.Fp8E4M3)
+            _gpuWeightsFp8 = new Dictionary<string, Core.Tensor>(StringComparer.Ordinal);
     }
 
     // ── Main forward pass ─────────────────────────────────────────────────
@@ -371,34 +381,122 @@ public sealed class ZImageDiT : IDisposable
         {
             if (_backend != null && n >= MinGpuBatch)
             {
-                if (_backend.BestSgemmPrecision == SgemmPrecision.Bf16)
+                if (_backend.BestSgemmPrecision == SgemmPrecision.Fp8E4M3)
                 {
-                    // bf16 GPU path: dequant → bf16 (as ushort bits), upload, run bf16 SGEMM
+                    // fp8 E4M3 GPU path (sm_89+): weights stored as fp8 (1 byte/element, 2× smaller than fp16).
+                    // Both A (activations) and B (weights) must be fp8 for cublasGemmEx; output C is fp32.
+                    // Weights are uploaded once on first call and cached; reused on subsequent steps.
                     int wCount = rows * cols;
-                    float[] wBuf32 = ArrayPool<float>.Shared.Rent(wCount);
+                    byte[] xFp8 = ArrayPool<byte>.Shared.Rent(n * cols);
+                    try
+                    {
+                        // Convert activations to fp8
+                        int xCount = n * cols;
+                        for (int i = 0; i < xCount; i++)
+                            xFp8[i] = Fp8Converter.FloatToFp8E4M3(x[i]);
+
+                        // Get or upload the fp8 weight (cached after first call)
+                        Core.Tensor wGpu;
+                        if (_gpuWeightsFp8 != null && (dtype == DType.Q5_K || dtype == DType.Q4_K) &&
+                            _gpuWeightsFp8.TryGetValue(wName, out var cachedW))
+                        {
+                            wGpu = cachedW;
+                        }
+                        else
+                        {
+                            float[] wBuf32 = ArrayPool<float>.Shared.Rent(wCount);
+                            byte[] wFp8 = ArrayPool<byte>.Shared.Rent(wCount);
+                            try
+                            {
+                                Dequantize.ToFloat32(
+                                    new ReadOnlySpan<byte>((byte*)ptr, (int)byteLen),
+                                    wBuf32.AsSpan(0, wCount), dtype, wCount);
+                                for (int i = 0; i < wCount; i++)
+                                    wFp8[i] = Fp8Converter.FloatToFp8E4M3(wBuf32[i]);
+                                wGpu = _backend.UploadFp8(wFp8.AsSpan(0, wCount), TensorShape.D1(wCount));
+                            }
+                            finally
+                            {
+                                ArrayPool<float>.Shared.Return(wBuf32);
+                                ArrayPool<byte>.Shared.Return(wFp8);
+                            }
+                            if (_gpuWeightsFp8 != null && (dtype == DType.Q5_K || dtype == DType.Q4_K))
+                                _gpuWeightsFp8[wName] = wGpu;
+                        }
+
+                        bool ownW = _gpuWeightsFp8 == null || !_gpuWeightsFp8.ContainsKey(wName);
+                        var xGpu = _backend.UploadFp8(xFp8.AsSpan(0, xCount), TensorShape.D1(xCount));
+                        // Output as fp32 to avoid bf16→fp32 conversion step on download
+                        var cGpu = _backend.Allocate(TensorShape.D1(n * rows), DType.Float32);
+                        try
+                        {
+                            _backend.Sgemm(cGpu, xGpu, wGpu, n, cols, rows);
+                            _backend.Synchronize();
+                            _backend.Download(cGpu, result.AsSpan());
+                        }
+                        finally
+                        {
+                            _backend.Free(xGpu);
+                            if (ownW) _backend.Free(wGpu);
+                            _backend.Free(cGpu);
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(xFp8);
+                    }
+                }
+                else if (_backend.BestSgemmPrecision == SgemmPrecision.Bf16)
+                {
+                    // bf16 GPU path: dequant weight to bf16, upload once and cache on GPU.
+                    // Each weight matrix is uploaded only on first call; reused every subsequent step.
+                    int wCount = rows * cols;
                     ushort[] xBf16 = ArrayPool<ushort>.Shared.Rent(n * cols);
-                    ushort[] wBf16 = ArrayPool<ushort>.Shared.Rent(wCount);
                     ushort[] cBf16 = ArrayPool<ushort>.Shared.Rent(n * rows);
                     try
                     {
-                        Dequantize.ToFloat32(
-                            new ReadOnlySpan<byte>((byte*)ptr, (int)byteLen),
-                            wBuf32.AsSpan(0, wCount), dtype, wCount);
-
+                        // Convert activations to bf16
                         int xCount = n * cols;
                         for (int i = 0; i < xCount; i++)
                         {
                             uint bits = BitConverter.SingleToUInt32Bits(x[i]);
                             xBf16[i] = (ushort)(bits >> 16);
                         }
-                        for (int i = 0; i < wCount; i++)
+
+                        // Get or upload the bf16 weight (cached after first call)
+                        Core.Tensor wGpu;
+                        if (_gpuWeightsBf16 != null && (dtype == DType.Q5_K || dtype == DType.Q4_K) &&
+                            _gpuWeightsBf16.TryGetValue(wName, out var cachedW))
                         {
-                            uint bits = BitConverter.SingleToUInt32Bits(wBuf32[i]);
-                            wBf16[i] = (ushort)(bits >> 16);
+                            wGpu = cachedW;
+                        }
+                        else
+                        {
+                            float[] wBuf32 = ArrayPool<float>.Shared.Rent(wCount);
+                            ushort[] wBf16 = ArrayPool<ushort>.Shared.Rent(wCount);
+                            try
+                            {
+                                Dequantize.ToFloat32(
+                                    new ReadOnlySpan<byte>((byte*)ptr, (int)byteLen),
+                                    wBuf32.AsSpan(0, wCount), dtype, wCount);
+                                for (int i = 0; i < wCount; i++)
+                                {
+                                    uint bits = BitConverter.SingleToUInt32Bits(wBuf32[i]);
+                                    wBf16[i] = (ushort)(bits >> 16);
+                                }
+                                wGpu = _backend.UploadBf16(wBf16.AsSpan(0, wCount), TensorShape.D1(wCount));
+                            }
+                            finally
+                            {
+                                ArrayPool<float>.Shared.Return(wBuf32);
+                                ArrayPool<ushort>.Shared.Return(wBf16);
+                            }
+                            if (_gpuWeightsBf16 != null && (dtype == DType.Q5_K || dtype == DType.Q4_K))
+                                _gpuWeightsBf16[wName] = wGpu;
                         }
 
+                        bool ownW = _gpuWeightsBf16 == null || !_gpuWeightsBf16.ContainsKey(wName);
                         var xGpu = _backend.UploadBf16(xBf16.AsSpan(0, xCount), TensorShape.D1(xCount));
-                        var wGpu = _backend.UploadBf16(wBf16.AsSpan(0, wCount), TensorShape.D1(wCount));
                         var cGpu = _backend.Allocate(TensorShape.D1(n * rows), DType.BFloat16);
                         try
                         {
@@ -409,7 +507,7 @@ public sealed class ZImageDiT : IDisposable
                         finally
                         {
                             _backend.Free(xGpu);
-                            _backend.Free(wGpu);
+                            if (ownW) _backend.Free(wGpu);
                             _backend.Free(cGpu);
                         }
 
@@ -422,9 +520,7 @@ public sealed class ZImageDiT : IDisposable
                     }
                     finally
                     {
-                        ArrayPool<float>.Shared.Return(wBuf32);
                         ArrayPool<ushort>.Shared.Return(xBf16);
-                        ArrayPool<ushort>.Shared.Return(wBf16);
                         ArrayPool<ushort>.Shared.Return(cBf16);
                     }
                 }
@@ -609,6 +705,18 @@ public sealed class ZImageDiT : IDisposable
                 foreach (var t in _gpuWeights.Values)
                     _backend.Free(t);
                 _gpuWeights.Clear();
+            }
+            if (_gpuWeightsBf16 != null && _backend != null)
+            {
+                foreach (var t in _gpuWeightsBf16.Values)
+                    _backend.Free(t);
+                _gpuWeightsBf16.Clear();
+            }
+            if (_gpuWeightsFp8 != null && _backend != null)
+            {
+                foreach (var t in _gpuWeightsFp8.Values)
+                    _backend.Free(t);
+                _gpuWeightsFp8.Clear();
             }
             _cache.Clear();
             _st.Dispose();

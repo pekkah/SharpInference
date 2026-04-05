@@ -1,4 +1,3 @@
-using System.Buffers;
 using System.Collections.Concurrent;
 using System.Threading;
 using SharpInference.Core;
@@ -7,59 +6,67 @@ namespace SharpInference.Cuda;
 
 /// <summary>
 /// CUDA/cuBLAS compute backend for DiT SGEMM acceleration.
-/// Manages CUDA device memory and dispatches cuBLAS GEMM kernels.
-/// All LLM transformer operations (RmsNorm, RoPE, Attention etc.) are
-/// not implemented — this backend is exclusively for the DiT SGEMM path.
+/// Manages CUDA device memory and dispatches cuBLAS GemmEx kernels.
+/// Precision is auto-detected at creation time:
+///   sm_80+ (Ampere/RTX 30xx) → bf16 inputs, fp32 accumulation (no overflow, 2× smaller than fp32)
+///   sm_53+ (Pascal/any CUDA GPU) → fp16 inputs, fp32 accumulation (avoids fp16 accum overflow)
+///   fallback → fp32
+/// All LLM transformer operations throw NotSupportedException; this backend is DiT-only.
 /// </summary>
 public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
 {
     private readonly nint _handle;
+    private readonly SgemmPrecision _precision;
     private readonly ConcurrentDictionary<nint, nint> _devPtrs = new();
     private long _nextHandle = 1;
     private bool _disposed;
 
-    public string Name => "CUDA GPU (cuBLAS)";
+    public string Name => $"CUDA GPU (cuBLAS, {_precision})";
 
-    // fp32 accumulation avoids fp16 overflow in DiT activations (which can exceed ±65504).
-    // Fp16 cuBLAS Hgemm produced all-zero output due to NaN propagation from overflow.
-    public SgemmPrecision BestSgemmPrecision => SgemmPrecision.Fp32;
+    public SgemmPrecision BestSgemmPrecision => _precision;
 
     public bool SupportsGpuDequant => false;
 
-    private CudaBackend(nint handle) => _handle = handle;
+    private CudaBackend(nint handle, SgemmPrecision precision)
+    {
+        _handle    = handle;
+        _precision = precision;
+    }
 
-    /// <summary>
-    /// Returns true if a CUDA device and cuBLAS are available on this system.
-    /// </summary>
     public static bool IsAvailable()
     {
         try
         {
             int status = CuBlasInterop.Create(out nint h);
-            if (status == 0)
-            {
-                CuBlasInterop.Destroy(h);
-                return true;
-            }
+            if (status == 0) { CuBlasInterop.Destroy(h); return true; }
             return false;
         }
-        catch (DllNotFoundException)
-        {
-            return false;
-        }
-        catch (Exception)
-        {
-            return false;
-        }
+        catch { return false; }
     }
 
-    /// <summary>Create a new CudaBackend. Throws if cuBLAS is unavailable.</summary>
+    /// <summary>Create a CudaBackend, auto-detecting the best supported precision.</summary>
     public static CudaBackend Create()
     {
         int status = CuBlasInterop.Create(out nint handle);
         if (status != 0)
-            throw new InvalidOperationException($"cublasCreate failed with status {status}");
-        return new CudaBackend(handle);
+            throw new InvalidOperationException($"cublasCreate failed: {status}");
+
+        var precision = DetectBestPrecision();
+        return new CudaBackend(handle, precision);
+    }
+
+    private static SgemmPrecision DetectBestPrecision()
+    {
+        // Query compute capability of device 0
+        if (CuBlasInterop.DeviceGetAttribute(out int major, CuBlasInterop.CudaDevAttrComputeCapabilityMajor, 0) == 0 &&
+            CuBlasInterop.DeviceGetAttribute(out int minor, CuBlasInterop.CudaDevAttrComputeCapabilityMinor, 0) == 0)
+        {
+            int sm = major * 10 + minor;
+            if (sm >= 89) return SgemmPrecision.Fp8E4M3; // Ada Lovelace+ (RTX 40xx) has fp8 tensor cores
+            if (sm >= 80) return SgemmPrecision.Bf16;    // Ampere+ has native bf16
+            if (sm >= 53) return SgemmPrecision.Fp16;    // Pascal+ supports fp16 GemmEx
+        }
+        return SgemmPrecision.Fp32;
     }
 
     // ── Memory management ─────────────────────────────────────────────────
@@ -69,8 +76,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
         nuint byteSize = (nuint)(shape.ElementCount * DTypeInfo.BytesPerElement(dtype));
         int status = CuBlasInterop.CudaMalloc(out nint devPtr, byteSize);
         if (status != 0)
-            throw new InvalidOperationException($"cudaMalloc failed with status {status}");
-
+            throw new InvalidOperationException($"cudaMalloc failed: {status}");
         var handle = (nint)Interlocked.Increment(ref _nextHandle);
         _devPtrs[handle] = devPtr;
         return new Tensor(shape, dtype, handle);
@@ -87,15 +93,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
         nuint byteSize = (nuint)(data.Length * sizeof(float));
         int status = CuBlasInterop.CudaMalloc(out nint devPtr, byteSize);
         if (status != 0)
-            throw new InvalidOperationException($"cudaMalloc failed with status {status}");
-
+            throw new InvalidOperationException($"cudaMalloc failed: {status}");
         fixed (float* src = data)
         {
             status = CuBlasInterop.CudaMemcpy(devPtr, (nint)src, byteSize, CuBlasInterop.HostToDevice);
             if (status != 0)
-                throw new InvalidOperationException($"cudaMemcpy H2D failed with status {status}");
+                throw new InvalidOperationException($"cudaMemcpy H2D failed: {status}");
         }
-
         var handle = (nint)Interlocked.Increment(ref _nextHandle);
         _devPtrs[handle] = devPtr;
         return new Tensor(shape, DType.Float32, handle);
@@ -109,24 +113,22 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
         {
             int status = CuBlasInterop.CudaMemcpy((nint)d, devPtr, byteSize, CuBlasInterop.DeviceToHost);
             if (status != 0)
-                throw new InvalidOperationException($"cudaMemcpy D2H failed with status {status}");
+                throw new InvalidOperationException($"cudaMemcpy D2H failed: {status}");
         }
     }
 
     public Tensor UploadHalf(ReadOnlySpan<Half> data, TensorShape shape)
     {
-        nuint byteSize = (nuint)(data.Length * sizeof(ushort));
+        nuint byteSize = (nuint)(data.Length * 2);
         int status = CuBlasInterop.CudaMalloc(out nint devPtr, byteSize);
         if (status != 0)
-            throw new InvalidOperationException($"cudaMalloc failed with status {status}");
-
+            throw new InvalidOperationException($"cudaMalloc failed: {status}");
         fixed (Half* src = data)
         {
             status = CuBlasInterop.CudaMemcpy(devPtr, (nint)src, byteSize, CuBlasInterop.HostToDevice);
             if (status != 0)
-                throw new InvalidOperationException($"cudaMemcpy H2D (fp16) failed with status {status}");
+                throw new InvalidOperationException($"cudaMemcpy H2D (fp16) failed: {status}");
         }
-
         var handle = (nint)Interlocked.Increment(ref _nextHandle);
         _devPtrs[handle] = devPtr;
         return new Tensor(shape, DType.Float16, handle);
@@ -135,23 +137,72 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
     public void DownloadHalf(Tensor src, Span<Half> dst)
     {
         nint devPtr = GetDevPtr(src);
-        nuint byteSize = (nuint)(dst.Length * sizeof(ushort));
         fixed (Half* d = dst)
         {
-            int status = CuBlasInterop.CudaMemcpy((nint)d, devPtr, byteSize, CuBlasInterop.DeviceToHost);
+            int status = CuBlasInterop.CudaMemcpy((nint)d, devPtr, (nuint)(dst.Length * 2), CuBlasInterop.DeviceToHost);
             if (status != 0)
-                throw new InvalidOperationException($"cudaMemcpy D2H (fp16) failed with status {status}");
+                throw new InvalidOperationException($"cudaMemcpy D2H (fp16) failed: {status}");
         }
     }
 
-    public Tensor UploadBf16(ReadOnlySpan<ushort> data, TensorShape shape) =>
-        throw new NotSupportedException("CudaBackend does not support bf16");
+    public Tensor UploadBf16(ReadOnlySpan<ushort> data, TensorShape shape)
+    {
+        nuint byteSize = (nuint)(data.Length * 2);
+        int status = CuBlasInterop.CudaMalloc(out nint devPtr, byteSize);
+        if (status != 0)
+            throw new InvalidOperationException($"cudaMalloc failed: {status}");
+        fixed (ushort* src = data)
+        {
+            status = CuBlasInterop.CudaMemcpy(devPtr, (nint)src, byteSize, CuBlasInterop.HostToDevice);
+            if (status != 0)
+                throw new InvalidOperationException($"cudaMemcpy H2D (bf16) failed: {status}");
+        }
+        var handle = (nint)Interlocked.Increment(ref _nextHandle);
+        _devPtrs[handle] = devPtr;
+        return new Tensor(shape, DType.BFloat16, handle);
+    }
 
-    public void DownloadBf16(Tensor src, Span<ushort> dst) =>
-        throw new NotSupportedException("CudaBackend does not support bf16");
+    public void DownloadBf16(Tensor src, Span<ushort> dst)
+    {
+        nint devPtr = GetDevPtr(src);
+        fixed (ushort* d = dst)
+        {
+            int status = CuBlasInterop.CudaMemcpy((nint)d, devPtr, (nuint)(dst.Length * 2), CuBlasInterop.DeviceToHost);
+            if (status != 0)
+                throw new InvalidOperationException($"cudaMemcpy D2H (bf16) failed: {status}");
+        }
+    }
+
+    public Tensor UploadFp8(ReadOnlySpan<byte> data, TensorShape shape)
+    {
+        nuint byteSize = (nuint)data.Length;
+        int status = CuBlasInterop.CudaMalloc(out nint devPtr, byteSize);
+        if (status != 0)
+            throw new InvalidOperationException($"cudaMalloc failed: {status}");
+        fixed (byte* src = data)
+        {
+            status = CuBlasInterop.CudaMemcpy(devPtr, (nint)src, byteSize, CuBlasInterop.HostToDevice);
+            if (status != 0)
+                throw new InvalidOperationException($"cudaMemcpy H2D (fp8) failed: {status}");
+        }
+        var handle = (nint)Interlocked.Increment(ref _nextHandle);
+        _devPtrs[handle] = devPtr;
+        return new Tensor(shape, DType.Float8E4M3, handle);
+    }
+
+    public void DownloadFp8(Tensor src, Span<byte> dst)
+    {
+        nint devPtr = GetDevPtr(src);
+        fixed (byte* d = dst)
+        {
+            int status = CuBlasInterop.CudaMemcpy((nint)d, devPtr, (nuint)dst.Length, CuBlasInterop.DeviceToHost);
+            if (status != 0)
+                throw new InvalidOperationException($"cudaMemcpy D2H (fp8) failed: {status}");
+        }
+    }
 
     public Tensor UploadRaw(ReadOnlySpan<byte> data, TensorShape shape, DType dtype) =>
-        throw new NotSupportedException("CudaBackend does not support raw quantized upload");
+        throw new NotSupportedException("CudaBackend does not support raw quantized upload (GPU dequant not implemented)");
 
     public void DequantQ5KM(Tensor src, Tensor dst, int numBlocks) =>
         throw new NotSupportedException("CudaBackend does not support GPU dequantization");
@@ -162,61 +213,69 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
     // ── SGEMM ─────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// GEMM: C[M,N] = A[M,K] × B[N,K]^T using cuBLAS.
-    /// Uses Hgemm for fp16 tensors, Sgemm for fp32.
-    /// Row-major inputs are handled via the column-major transpose trick.
+    /// GEMM: C[M,N] = A[M,K] × B[N,K]^T using cublasGemmEx with fp32 accumulation.
+    /// fp16 and bf16 inputs both accumulate in fp32 — prevents the overflow that plagued
+    /// pure cublasHgemm (fp16 accum overflows for deep DiT layers with large residuals).
+    /// Row-major layout is handled via the column-major transpose identity:
+    ///   row-major C=A*B^T  ≡  col-major C^T = B*A^T
     /// </summary>
     public void Sgemm(Tensor C, Tensor A, Tensor B, int M, int K, int N)
     {
         nint aPtr = GetDevPtr(A);
         nint bPtr = GetDevPtr(B);
         nint cPtr = GetDevPtr(C);
+        float alpha = 1.0f, beta = 0.0f;
 
-        if (A.DType == DType.Float16 && B.DType == DType.Float16)
+        int cudaTypeA = ToCudaDataType(A.DType);
+        int cudaTypeB = ToCudaDataType(B.DType);
+        int cudaTypeC = ToCudaDataType(C.DType);
+
+        if (cudaTypeA != CuBlasInterop.CUDA_R_32F || cudaTypeB != CuBlasInterop.CUDA_R_32F)
         {
-            // fp16: cublasHgemm
-            // Row-major C[M,N] = A[M,K] * B[N,K]^T
-            // → cuBLAS col-major: swap A/B, use Op_T for B, Op_N for A
-            ushort alpha = CuBlasInterop.FP16One;
-            ushort beta  = CuBlasInterop.FP16Zero;
-            int status = CuBlasInterop.Hgemm(
+            // fp16, bf16, or fp8: use GemmEx with fp32 accumulation.
+            // fp8 E4M3 requires both A and B to be fp8 (mixed fp8+bf16 needs cublasLt).
+            // fp16/bf16 use fp32 accumulation to avoid overflow on large DiT residuals.
+            int status = CuBlasInterop.GemmEx(
                 _handle,
-                CuBlasInterop.OpT,  // transa: transpose B (B is N×K row-major → Op_T)
-                CuBlasInterop.OpN,  // transb: no transpose A (A is M×K row-major → Op_N)
-                N, M, K,            // m=N, n=M (swapped for col-major)
+                CuBlasInterop.OpT, CuBlasInterop.OpN,
+                N, M, K,
                 ref alpha,
-                bPtr, K,            // A_cublas = B_ptr, lda = K
-                aPtr, K,            // B_cublas = A_ptr, ldb = K
+                bPtr, cudaTypeB, K,
+                aPtr, cudaTypeA, K,
                 ref beta,
-                cPtr, N);           // C_cublas = C_ptr, ldc = N
+                cPtr, cudaTypeC, N,
+                CuBlasInterop.CUBLAS_COMPUTE_32F,
+                CuBlasInterop.CUBLAS_GEMM_DEFAULT);
             if (status != 0)
-                throw new InvalidOperationException($"cublasHgemm failed with status {status}");
+                throw new InvalidOperationException($"cublasGemmEx failed: {status}");
         }
         else
         {
-            // fp32: cublasSgemm
-            float alpha = 1.0f;
-            float beta  = 0.0f;
             int status = CuBlasInterop.Sgemm(
                 _handle,
-                CuBlasInterop.OpT,
-                CuBlasInterop.OpN,
+                CuBlasInterop.OpT, CuBlasInterop.OpN,
                 N, M, K,
-                ref alpha,
-                bPtr, K,
-                aPtr, K,
-                ref beta,
-                cPtr, N);
+                ref alpha, bPtr, K, aPtr, K,
+                ref beta, cPtr, N);
             if (status != 0)
-                throw new InvalidOperationException($"cublasSgemm failed with status {status}");
+                throw new InvalidOperationException($"cublasSgemm failed: {status}");
         }
     }
+
+    private static int ToCudaDataType(DType dtype) => dtype switch
+    {
+        DType.Float32    => CuBlasInterop.CUDA_R_32F,
+        DType.Float16    => CuBlasInterop.CUDA_R_16F,
+        DType.BFloat16   => CuBlasInterop.CUDA_R_16BF,
+        DType.Float8E4M3 => CuBlasInterop.CUDA_R_8F_E4M3,
+        _ => CuBlasInterop.CUDA_R_32F,
+    };
 
     public void Synchronize()
     {
         int status = CuBlasInterop.DeviceSync();
         if (status != 0)
-            throw new InvalidOperationException($"cudaDeviceSynchronize failed with status {status}");
+            throw new InvalidOperationException($"cudaDeviceSynchronize failed: {status}");
     }
 
     // ── Unsupported LLM ops ───────────────────────────────────────────────

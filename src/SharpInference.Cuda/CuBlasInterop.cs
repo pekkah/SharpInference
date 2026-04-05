@@ -17,7 +17,6 @@ internal static partial class CuBlasInterop
     internal static partial int Destroy(nint handle);
 
     // ── cublasSgemm: C = alpha*op(A)*op(B) + beta*C (fp32) ──────────────
-    // cuBLAS uses column-major convention; callers must transpose appropriately.
     [LibraryImport("cublas64_11", EntryPoint = "cublasSgemm_v2")]
     internal static partial int Sgemm(
         nint handle,
@@ -29,18 +28,20 @@ internal static partial class CuBlasInterop
         ref float beta,
         nint C, int ldc);
 
-    // ── cublasHgemm: fp16 GEMM ────────────────────────────────────────────
-    // alpha and beta are __half* (16-bit float) passed as ref ushort.
-    [LibraryImport("cublas64_11", EntryPoint = "cublasHgemm")]
-    internal static partial int Hgemm(
+    // ── cublasGemmEx: mixed-precision GEMM (fp16/bf16 in, fp32 accum) ────
+    // alpha and beta are float* when computeType == CUBLAS_COMPUTE_32F.
+    [LibraryImport("cublas64_11", EntryPoint = "cublasGemmEx")]
+    internal static partial int GemmEx(
         nint handle,
         int transa, int transb,
         int m, int n, int k,
-        ref ushort alpha,
-        nint A, int lda,
-        nint B, int ldb,
-        ref ushort beta,
-        nint C, int ldc);
+        ref float alpha,
+        nint A, int Atype, int lda,
+        nint B, int Btype, int ldb,
+        ref float beta,
+        nint C, int Ctype, int ldc,
+        int computeType,
+        int algo);
 
     // ── CUDA memory management ────────────────────────────────────────────
 
@@ -56,20 +57,31 @@ internal static partial class CuBlasInterop
     [LibraryImport("cudart64_110", EntryPoint = "cudaDeviceSynchronize")]
     internal static partial int DeviceSync();
 
+    [LibraryImport("cudart64_110", EntryPoint = "cudaDeviceGetAttribute")]
+    internal static partial int DeviceGetAttribute(out int value, int attr, int device);
+
     // ── Constants ─────────────────────────────────────────────────────────
 
-    /// <summary>cudaMemcpyHostToDevice</summary>
     internal const int HostToDevice = 1;
-    /// <summary>cudaMemcpyDeviceToHost</summary>
     internal const int DeviceToHost = 2;
 
-    /// <summary>CUBLAS_OP_N — no transpose</summary>
     internal const int OpN = 0;
-    /// <summary>CUBLAS_OP_T — transpose</summary>
     internal const int OpT = 1;
 
-    /// <summary>IEEE 754 fp16 bit pattern for 1.0f</summary>
-    internal const ushort FP16One  = 0x3C00;
-    /// <summary>IEEE 754 fp16 bit pattern for 0.0f</summary>
-    internal const ushort FP16Zero = 0x0000;
+    // cudaDataType values
+    internal const int CUDA_R_32F      = 0;   // float
+    internal const int CUDA_R_16F      = 2;   // half (fp16)
+    internal const int CUDA_R_16BF     = 14;  // bfloat16
+    internal const int CUDA_R_8F_E4M3  = 28;  // fp8 E4M3FN (sm_89+, CUDA 11.8+)
+
+    // cublasComputeType_t
+    internal const int CUBLAS_COMPUTE_32F = 68;  // fp32 accumulator (no tensor cores)
+    internal const int CUBLAS_COMPUTE_32F_FAST_TF32 = 74; // tf32 tensor cores
+
+    // cublasGemmAlgo_t
+    internal const int CUBLAS_GEMM_DEFAULT = -1;
+
+    // cudaDeviceAttr: compute capability
+    internal const int CudaDevAttrComputeCapabilityMajor = 75;
+    internal const int CudaDevAttrComputeCapabilityMinor = 76;
 }

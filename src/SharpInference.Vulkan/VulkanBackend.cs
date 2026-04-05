@@ -772,6 +772,50 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _downloadStaging.Unmap();
     }
 
+    public unsafe Tensor UploadFp8(ReadOnlySpan<byte> data, TensorShape shape)
+    {
+        ulong byteSize = (ulong)data.Length;
+
+        var gpuBuf = GpuBuffer.CreateDeviceLocal(this, byteSize,
+            VkBufferUsageFlags.StorageBuffer | VkBufferUsageFlags.TransferDst);
+
+        if (_uploadStaging == null || _uploadStagingSize < byteSize)
+        {
+            _uploadStaging?.Dispose();
+            _uploadStaging = GpuBuffer.CreateStaging(this, byteSize, VkBufferUsageFlags.TransferSrc);
+            _uploadStagingSize = byteSize;
+        }
+
+        byte* mapped = (byte*)_uploadStaging.Map();
+        data.CopyTo(new Span<byte>(mapped, data.Length));
+        _uploadStaging.Unmap();
+
+        CopyBuffer(_uploadStaging, gpuBuf, byteSize);
+
+        var handle = (nint)Interlocked.Increment(ref _nextHandle);
+        _buffers[handle] = gpuBuf;
+        return new Tensor(shape, DType.Float8E4M3, handle);
+    }
+
+    public unsafe void DownloadFp8(Tensor src, Span<byte> dst)
+    {
+        var gpuBuf = GetBuffer(src);
+        ulong byteSize = (ulong)dst.Length;
+
+        if (_downloadStaging == null || _downloadStagingSize < byteSize)
+        {
+            _downloadStaging?.Dispose();
+            _downloadStaging = GpuBuffer.CreateStaging(this, byteSize, VkBufferUsageFlags.TransferDst);
+            _downloadStagingSize = byteSize;
+        }
+
+        CopyBuffer(gpuBuf, _downloadStaging, byteSize);
+
+        byte* mapped = (byte*)_downloadStaging.Map();
+        new ReadOnlySpan<byte>(mapped, dst.Length).CopyTo(dst);
+        _downloadStaging.Unmap();
+    }
+
     /// <summary>
     /// Upload raw quantized bytes to a device-local GPU buffer.
     /// The returned tensor's shape is D1(byteLen) and its DType reflects the quantized format.
