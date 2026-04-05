@@ -20,6 +20,16 @@ dotnet run --project src/SharpInference.Cli -c Release -- \
   -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
   -p "What is 2+2?" --temp 0 -g -1
 
+# Qwen3-Coder-30B-A3B (MoE coding model, ~17 GB, ~20 t/s CPU)
+dotnet run --project src/SharpInference.Cli -c Release -- \
+  -m models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf \
+  -p "Implement a binary search tree in C#" --temp 0
+
+# Llama 4 Scout (CPU, ~5 t/s on DDR4-3200)
+dotnet run --project src/SharpInference.Cli -c Release -- \
+  -m models/Llama-4-Scout-17B-16E-Instruct-Q4_K_M.gguf \
+  -p "Explain transformers" --temp 0
+
 # Interactive chat
 dotnet run --project src/SharpInference.Cli -c Release -- \
   -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
@@ -91,15 +101,31 @@ curl http://localhost:5000/metrics
 | `SHARPI_N_GPU_LAYERS` | `0` | GPU layers (0 = CPU only) |
 | `SHARPI_MIN_BATCH_BLAS` | `16` | BLAS GEMM threshold for batched MatMul |
 
+## Supported Models
+
+| Model | Architecture | Size | Notes |
+|-------|-------------|------|-------|
+| SmolLM2 1.7B | Dense (LLaMA-style) | ~1 GB | Fast, small, good for testing |
+| Qwen3 8B | Dense (ChatML) | ~5 GB | General purpose, GPU-friendly |
+| Llama 3.1 70B | Dense (Llama 3) | ~40 GB | High quality, needs large RAM |
+| Llama 4 Scout 109B-16E | MoE (Llama 4) | ~17 GB active / 65 GB total | 16 experts, CPU-only ~5 t/s on DDR4 |
+| Qwen3-Coder 30B-A3B | MoE (Qwen3-MoE) | ~17 GB | 128 experts / 8 active, coding-focused, ~20 t/s CPU |
+
+Any GGUF model with a supported architecture (llama, llama4, qwen3, qwen3moe) works.
+
 ## Performance
 
-Benchmarked on AMD Zen 4 (12c/24t) + RTX 4070 Ti, SmolLM2-1.7B Q4_K_M:
+Benchmarked on AMD Zen 4 (12c/24t) + RTX 4070 Ti:
 
-| Backend | Decode (t/s) | Notes |
-|---------|-------------|-------|
-| CPU (AVX2 SIMD) | 48.6 | Fused dequant-matvec, multi-threaded |
-| GPU (Vulkan) | 87.4 | Compute shaders, VRAM-resident weights |
-| llama.cpp (reference) | 45.1 | CPU decode on same hardware |
+| Model | Backend | Decode (t/s) | Notes |
+|-------|---------|-------------|-------|
+| SmolLM2 1.7B Q4_K_M | GPU (Vulkan) | 131.3 | Multi-row compute shaders + subgroupAdd |
+| SmolLM2 1.7B Q4_K_M | CPU (AVX2) | 48.6 | Fused dequant-matvec, multi-threaded |
+| Qwen3 8B Q4_K_M | GPU (Vulkan) | 43.5 | Full VRAM fit |
+| Qwen3 8B Q4_K_M | CPU | 13.5 | 1.23× llama.cpp |
+| Llama 4 Scout Q4_K_M | CPU | 5.3 | DDR4-3200, 65 GB; bandwidth-limited |
+| Qwen3-Coder 30B-A3B Q4_K_M | CPU | 20.8 | MoE: only 8/128 experts active per token |
+| llama.cpp SmolLM2 1.7B | CPU reference | 45.1 | Same hardware |
 
 ## Projects
 
@@ -119,7 +145,7 @@ Benchmarked on AMD Zen 4 (12c/24t) + RTX 4070 Ti, SmolLM2-1.7B Q4_K_M:
 ```bash
 dotnet build              # Debug build
 dotnet build -c Release   # Release build (enables IlcOptimizationPreference=Speed)
-dotnet test               # Run all tests (132 tests across 5 projects)
+dotnet test               # Run all tests (207 tests across 5 projects)
 
 # Publish NativeAOT binary
 dotnet publish src/SharpInference.Cli -c Release -r win-x64

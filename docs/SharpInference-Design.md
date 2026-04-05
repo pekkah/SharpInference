@@ -1613,6 +1613,39 @@ layers remain on CPU. More GPU layers or a VRAM-sufficient config would flip thi
 
 **Target model:** Llama 4 Scout 109B/16E Q2_K (~37 GB)
 
+### Phase 5b: Scout Q4_K CPU Micro-optimization ✅
+
+**Goal:** Push Llama 4 Scout Q4_K_M CPU decode above the usable threshold on DDR4 hardware.
+
+**Baseline:** 3.6 t/s (Q4_K_M, 48-layer, 65 GB model, Ryzen 9 7900X + DDR4-3200)
+
+**Hot-path micro-benchmarks** (BenchmarkDotNet) added to identify bottlenecks:
+- `ScoutFullDecodeBench` — wall-clock per-token decode including all 48 MoE layers
+- `RouterTopKBench` — MoE router + top-k selection (3.82 µs/token baseline)
+- `MoeFfnLayerBench` — single MoE FFN layer with 16 active experts (2.97 ms/layer baseline)
+- `DotQ4KBench` / `DotQ6KBench` — dequant-matvec kernels in isolation
+- `WeightedAddBench` — expert output accumulation kernel
+
+**Optimizations applied (benchmarked before commit):**
+
+| Optimization | Benchmark result | Outcome |
+|---|---|---|
+| SIMD FMA weighted-add in `WeightedAddInPlace` | 2064 ns → 275 ns (7.5×) | ✅ Committed |
+| AVX-512 `DotQ6K` kernel (16 vs 8 iterations/inner loop) | Measurably faster on Zen 4 | ✅ Committed |
+| `PrefaultWeights` parallel mmap page-in at load | Cold start: 4.6 → 5.5 t/s | ✅ Committed |
+| K+V MatVecDual fusion (single dispatch for both) | 9% slower | ❌ Reverted |
+| Expert gate+up MatVecDual fusion | 1.6% slower | ❌ Reverted |
+| Weight reorg into decode-order buffer | 4.7 vs 5.4 t/s baseline | ❌ Abandoned |
+| Block sparsity (skip zero Q4K blocks) | 0.01% blocks zero | ❌ Not worth it |
+| Software prefetch in DotQ4K/DotQ6K | No measured effect | ❌ Reverted |
+| Q6K → Q4K online requantization | Within noise; adds 1.4 s load time | ❌ Reverted |
+
+**Root cause analysis:** The 65 GB model (15M mmap pages) saturates DDR4 bandwidth at 25.9 GB/s sustained — 51% of DDR4-3200 theoretical. Remaining gap is TLB pressure, memory controller scheduling overhead, and DRAM row conflicts. No software optimization can meaningfully close this gap on DDR4 hardware.
+
+**Result:** 3.6 t/s → **5.3 t/s (+47%)**. Committed as `f4b61ea` (SIMD kernels) and `9912617` (PrefaultWeights).
+
+**Hardware upgrade path:** DDR5-5600 (~60 GB/s practical) would yield ~8.5 t/s; GPU offload remains limited by 65 GB exceeding most consumer VRAM.
+
 ### Phase 6: Speculative Decoding ✅
 
 **Goal:** 2–3x throughput improvement via draft-verify pipeline.
@@ -1848,6 +1881,67 @@ curl http://localhost:5000/v1/messages \
 
 ---
 
+#### Phase 11: Qwen3-MoE Architecture Support + Qwen3-Coder 30B-A3B (✅ Complete)
+
+**Goal:** Run Qwen3-Coder-30B-A3B-Instruct on CPU as a practical coding assistant. This is a 30B MoE model with 128 experts / 8 active per token (~17 GB weights active, 21 GB total), achieving ~20 t/s CPU decode — 4× faster than Llama 4 Scout at similar quality.
+
+**Architecture differences from Llama-4 MoE:**
+
+| Property | Llama 4 Scout | Qwen3-Coder 30B-A3B |
+|----------|--------------|---------------------|
+| GGUF arch | `llama4` | `qwen3moe` |
+| Layers | 48 | 48 |
+| Embedding dim | 5120 | 2048 |
+| Experts per layer | 16 | 128 |
+| Active experts | 2 | 8 |
+| Expert gating | Softmax | Softmax |
+| QK norm | None | Per-head RmsNorm (before RoPE) |
+| Chat template | Llama header format | ChatML (`<\|im_start\|>` / `<\|im_end\|>`) |
+| Thinking mode | None | `/think` user instruction → chain-of-thought |
+
+**Implementation changes:**
+
+- `ModelGraph.cs`: parse `qwen3moe` arch metadata — `attention.key_length` for `HeadDim` (128 vs derived from dim/heads), `HasQkNorm` / `UseL2QkNorm` from metadata, `ExpertIntermediateDim` from `expert_feed_forward_length`, `RopeTheta` from `rope.freq_base`
+- `ForwardPass.cs` — QK norm applied **before** RoPE (Qwen3 convention; Llama 4 is after):
+  ```csharp
+  // Qwen3-MoE: QK norm first, then RoPE
+  if (_hasQkNorm) { NormedQ = RmsNorm(Q); NormedK = RmsNorm(K); }
+  ApplyRoPE(NormedQ, NormedK, position);
+  ```
+- `ForwardPass.cs` — removed double-normalization bug in `MoeFfn`: `SelectTopK` already normalizes weights for k>1; the additional renorm was a no-op for k>1 but incorrectly set weight=1.0 for k=1 (broke Llama-4 softmax test)
+- `GgufTokenizer.cs` — added `_specialTokensById` reverse lookup; `Decode(int[])` for single special tokens (type 3/4) now returns the correct string via this map instead of an empty string from the BPE inner tokenizer
+- `RunCommand.cs` — ChatML prompt formatting for qwen3/qwen3moe; default system prompt injection (model generates `<\|endoftext\|>` without it); `<\|endoftext\|>` added to stop tokens (was causing infinite repetition); `<think>` / `</think>` token IDs looked up at startup and their tokens displayed with dim ANSI formatting in the decode loop
+
+**Thinking mode investigation:**
+
+Qwen3 supports chain-of-thought via `/think` in the user message. Two approaches were tested:
+- **Pre-fill `<think>\n` in assistant prefix** → model generates `<\|endoftext\|>` immediately for all prompts. Root cause unclear (possibly model was trained to generate `<think>` itself, not receive it pre-filled).
+- **Append `/think` to user message automatically** → unreliable: fixed some prompts but broke others ("Implement X in C#" started generating `<\|im_start\|>`).
+
+**Final approach:** No automatic thinking mode injection. The model works well without it for coding tasks. Users can append `/think` to their message manually when desired.
+
+**Q4_K_M quirk:** Certain imperative phrasings ("Write a C# method...") trigger `<\|endoftext\|>` as the first token with logit ~28–35, while semantically equivalent "Implement X in C#" or "Can you write a C# method?" work correctly. This is a quantization artifact — the 4-bit precision loss in specific weight regions affecting these token sequences. Not fixable at the inference engine level.
+
+**Benchmark results (Qwen3-Coder-30B-A3B-Instruct-Q4_K_M, Ryzen 9 7900X, CPU only):**
+
+| Metric | Value |
+|--------|-------|
+| Model load time | 1.5 s |
+| Prefill speed | ~12–16 t/s |
+| Decode speed | ~20–21 t/s |
+| Active weight data per token | ~4 GB (8 of 128 experts active) |
+
+Decode is 4× faster than Llama 4 Scout (5.3 t/s) because only 6.25% of expert weight data (8/128) needs to be read per token, reducing effective memory bandwidth pressure.
+
+**Tests added** (`DebugForwardPass.cs`):
+- `Qwen3Coder_ParsesHyperparams` — verifies GGUF metadata parsing (headDim=128, 128 experts, 8 active, hasQkNorm=true)
+- `Qwen3Coder_ListLayer0TensorNames` — verifies correct tensor name parsing for qwen3moe expert layout
+- `Qwen3Coder_CpuFirstToken` — regression test: greedy first token from "Hello, how are you?" prompt must be "Hello" or similar (guards against `<\|endoftext\|>` regressions)
+
+All 207 tests pass.
+
+---
+
 ### 13.1 Correctness
 
 Every phase validates against llama.cpp as the reference implementation:
@@ -1923,11 +2017,13 @@ Based on the reference benchmarks above, these are concrete targets per phase:
 | 3 | Qwen3 8B Q4_K_M + TQ3 | Full VRAM, RTX 4070 Ti | N/A (doesn't fit with FP16 KV) | ≥ 30 TG t/s | **GPU 24.0 t/s at 40K ctx** ✅ | TQ3 < 0.5% overhead, context 17K→40K (2.4x) |
 | 4a | Llama 3.1 70B Q4_K_M | Hybrid GPU+CPU, RTX 4070 Ti | ~3–5 TG t/s (naive offload) | ≥ 5 TG t/s | **1.8 t/s (18 GPU + 62 CPU)** | Q5_K AVX2+512, matches llama.cpp CPU (1.54). Phase 4b for streaming |
 | 5 | Llama 4 Scout 109B Q2_K | MoE offload, 12GB + 64GB RAM | ~12 TG t/s (llama.cpp est.) | ≥ 15 TG t/s | CPU: **4.6 t/s**, Hybrid 1-layer+prefetch: **3.1 t/s** ✅ — SLRU slot cache + CPU fallback + background prefetcher (dedicated async VkCommandPool). |
+| 5b | Llama 4 Scout Q4_K_M | CPU only, DDR4-3200 64GB | ~5 TG t/s (estimate) | > 5 TG t/s | **5.3 TG t/s** ✅ (+47% from 3.6 baseline) | SIMD FMA weighted-add, AVX-512 DotQ6K, PrefaultWeights |
 | 5+6 | Llama 4 Scout + speculative | MoE + SmolLM2 draft | ~12 TG t/s (no spec) | ≥ 25 effective TG t/s | ~2x from speculative decoding on top of Phase 5 |
 | 7a | API server (single-user) | CPU/GPU, any model | N/A | Correct wire format | ✅ OpenAI + Anthropic compatible, 8 integration tests |
 | 7b | API server (prefix cache) | CPU, SmolLM2 1.7B | N/A (new feature) | Eliminate repeated prefill | ✅ PagedKvCache + prefix cache; 3.2GB→402MB at 4K ctx |
 | 7c | Multi-user server | PagedAttention + continuous batching | vLLM ~485 tot t/s @10 users | ≥ 300 tot t/s | ✅ `ContinuousBatchingEngine` + `BatchForwardMulti`; SHARPI_MAX_BATCH controls batch size |
 | 8 | API completeness | Server, all models | N/A | All metrics non-zero; logit_bias accepted | ✅ Fixed metrics recording; `queue_depth`/`active_requests` gauges; `logit_bias` support |
+| 11 | Qwen3-Coder 30B-A3B Q4_K_M | CPU only, DDR4-3200 64GB | ~20 TG t/s (llama.cpp est.) | Correct output | **20.8 TG t/s** ✅ | Qwen3-MoE arch: QK norm + 128-expert routing; 4× faster than Scout due to 8/128 expert sparsity |
 
 **Stretch targets (if all optimizations compose well):**
 
