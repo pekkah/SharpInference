@@ -57,6 +57,23 @@ public sealed unsafe class CpuBackend : IComputeBackend
     public void DownloadHalf(Tensor src, Span<Half> dst) =>
         throw new NotSupportedException("CpuBackend does not support fp16 download");
 
+    public Tensor UploadBf16(ReadOnlySpan<ushort> data, TensorShape shape) =>
+        throw new NotSupportedException("CpuBackend does not support bf16 upload");
+
+    public void DownloadBf16(Tensor src, Span<ushort> dst) =>
+        throw new NotSupportedException("CpuBackend does not support bf16 download");
+
+    public Tensor UploadRaw(ReadOnlySpan<byte> data, TensorShape shape, DType dtype) =>
+        throw new NotSupportedException("CpuBackend does not support raw quantized upload");
+
+    public bool SupportsGpuDequant => false;
+
+    public void DequantQ5KM(Tensor src, Tensor dst, int numBlocks) =>
+        throw new NotSupportedException("CpuBackend does not support GPU dequantization");
+
+    public void DequantQ4KM(Tensor src, Tensor dst, int numBlocks) =>
+        throw new NotSupportedException("CpuBackend does not support GPU dequantization");
+
     // --- Core math operations ---
 
     /// <summary>

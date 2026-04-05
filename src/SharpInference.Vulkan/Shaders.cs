@@ -1617,10 +1617,220 @@ internal static class Shaders
         }
         """;
 
-    // TODO: SgemmBf16 — requires VK_KHR_shader_bfloat16 (present in Vortice 3.2.1,
-    //       struct: VkPhysicalDeviceShaderBfloat16FeaturesKHR, field: shaderBFloat16Type).
-    //       Shader extension: GL_KHR_shader_bfloat16. Enable once driver support is broad.
+    /// <summary>
+    /// Tiled bf16 SGEMM: C[M,N] = A[M,K] × B[N,K]^T
+    /// All inputs and output are bfloat16_t. Accumulation in fp32.
+    /// Requires: VK_KHR_shader_bfloat16 + VK_KHR_16bit_storage
+    /// Push constants: { uint M, uint N, uint K }.
+    /// Bindings: 0=A (readonly bf16), 1=B (readonly bf16), 2=C (writeonly bf16).
+    /// </summary>
+    internal const string SgemmBf16 = """
+        #version 450
+        #extension GL_KHR_shader_bfloat16 : require
+        #extension GL_EXT_shader_16bit_storage : require
 
-    // TODO: SgemmFp8E4M3 — requires VK_EXT_shader_float8_e4m3.
-    //       Not yet in Vortice.Vulkan 3.2.1; add once bindings are available.
+        layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+        layout(push_constant) uniform PC { uint M; uint N; uint K; } pc;
+        layout(binding = 0) readonly  buffer BufA { bfloat16_t a_data[]; };
+        layout(binding = 1) readonly  buffer BufB { bfloat16_t b_data[]; };
+        layout(binding = 2) writeonly buffer BufC { bfloat16_t c_data[]; };
+        shared bfloat16_t tileA[16][17];
+        shared bfloat16_t tileB[16][17];
+        void main() {
+            uint row = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+            uint col = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+            float acc = 0.0;
+            uint numTiles = (pc.K + 15u) / 16u;
+            for (uint t = 0u; t < numTiles; t++) {
+                uint aCol = t * 16u + gl_LocalInvocationID.y;
+                uint bCol = t * 16u + gl_LocalInvocationID.x;
+                tileA[gl_LocalInvocationID.x][gl_LocalInvocationID.y] =
+                    (row < pc.M && aCol < pc.K) ? a_data[row * pc.K + aCol] : bfloat16_t(0.0);
+                tileB[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+                    (col < pc.N && bCol < pc.K) ? b_data[col * pc.K + bCol] : bfloat16_t(0.0);
+                barrier();
+                for (uint k = 0u; k < 16u; k++)
+                    acc += float(tileA[gl_LocalInvocationID.x][k]) * float(tileB[gl_LocalInvocationID.y][k]);
+                barrier();
+            }
+            if (row < pc.M && col < pc.N)
+                c_data[row * pc.N + col] = bfloat16_t(acc);
+        }
+        """;
+
+    /// <summary>
+    /// Tiled fp8 × fp16 SGEMM: C[M,N] = A[M,K] × B[N,K]^T
+    /// A is fp16 activations, B is fp8 E4M3 weights, C is fp16 output.
+    /// Requires: VK_EXT_shader_float8 + VK_KHR_shader_float16_int8 + VK_KHR_16bit_storage
+    /// Push constants: { uint M, uint N, uint K }.
+    /// Bindings: 0=A (fp16), 1=B (fp8 e4m3), 2=C (fp16).
+    /// </summary>
+    internal const string SgemmFp8 = """
+        #version 450
+        #extension GL_EXT_shader_explicit_arithmetic_types_float8_e4m3 : require
+        #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+        #extension GL_EXT_shader_16bit_storage : require
+
+        layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+        layout(push_constant) uniform PC { uint M; uint N; uint K; } pc;
+        layout(binding = 0) readonly  buffer BufA { float16_t a_data[]; };
+        layout(binding = 1) readonly  buffer BufB { float8_e4m3_t b_data[]; };
+        layout(binding = 2) writeonly buffer BufC { float16_t c_data[]; };
+        shared float16_t tileA[16][17];
+        shared float16_t tileB[16][17];
+        void main() {
+            uint row = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+            uint col = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+            float acc = 0.0;
+            uint numTiles = (pc.K + 15u) / 16u;
+            for (uint t = 0u; t < numTiles; t++) {
+                uint aCol = t * 16u + gl_LocalInvocationID.y;
+                uint bCol = t * 16u + gl_LocalInvocationID.x;
+                tileA[gl_LocalInvocationID.x][gl_LocalInvocationID.y] =
+                    (row < pc.M && aCol < pc.K) ? a_data[row * pc.K + aCol] : float16_t(0.0);
+                tileB[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+                    (col < pc.N && bCol < pc.K) ? float16_t(b_data[col * pc.K + bCol]) : float16_t(0.0);
+                barrier();
+                for (uint k = 0u; k < 16u; k++)
+                    acc += float(tileA[gl_LocalInvocationID.x][k]) * float(tileB[gl_LocalInvocationID.y][k]);
+                barrier();
+            }
+            if (row < pc.M && col < pc.N)
+                c_data[row * pc.N + col] = float16_t(acc);
+        }
+        """;
+
+    /// <summary>
+    /// GPU-side Q5_K_M dequantization: one workgroup per block, 256 threads per workgroup.
+    /// Q5_K block layout (176 bytes / 256 elements):
+    ///   [0:2]   FP16 d (super-block scale)
+    ///   [2:4]   FP16 dmin
+    ///   [4:16]  12 bytes packed 6-bit scales/mins
+    ///   [16:48] 32 bytes qh (1 high bit per element)
+    ///   [48:176] 128 bytes ql (4-bit nibbles, 2 per byte)
+    /// Requires: VK_KHR_shader_float16_int8 + VK_KHR_16bit_storage
+    /// Push constants: { uint numBlocks }.
+    /// Bindings: 0=src (raw uint32 array), 1=dst (fp16 array).
+    /// Dispatch: (numBlocks, 1, 1).
+    /// </summary>
+    internal const string DequantQ5KM = """
+        #version 450
+        #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+        #extension GL_EXT_shader_16bit_storage : require
+
+        layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+        layout(push_constant) uniform PC { uint numBlocks; } pc;
+        layout(binding = 0) readonly  buffer SrcBuf { uint src[]; };
+        layout(binding = 1) writeonly buffer DstBuf { float16_t dst[]; };
+
+        uint byteAt(uint bi) { return (src[bi >> 2u] >> ((bi & 3u) << 3u)) & 0xFFu; }
+
+        void getScaleMinK4(uint j, uint scBase, out uint sc, out uint mn) {
+            if (j < 4u) { sc = byteAt(scBase + j) & 63u; mn = byteAt(scBase + j + 4u) & 63u; }
+            else {
+                sc = (byteAt(scBase + j + 4u) & 0xFu) | ((byteAt(scBase + j - 4u) >> 6u) << 4u);
+                mn = (byteAt(scBase + j + 4u) >> 4u)  | ((byteAt(scBase + j)       >> 6u) << 4u);
+            }
+        }
+
+        void main() {
+            uint blockIdx = gl_WorkGroupID.x;
+            if (blockIdx >= pc.numBlocks) return;
+
+            uint elem  = gl_LocalInvocationID.x;
+            uint bBase = blockIdx * 176u;
+
+            uint dBits    = byteAt(bBase + 0u) | (byteAt(bBase + 1u) << 8u);
+            uint dminBits = byteAt(bBase + 2u) | (byteAt(bBase + 3u) << 8u);
+            float d    = unpackHalf2x16(dBits).x;
+            float dmin = unpackHalf2x16(dminBits).x;
+
+            uint scBase = bBase + 4u;
+            uint qhBase = bBase + 16u;
+            uint qlBase = bBase + 48u;
+
+            uint grp  = elem / 64u;
+            uint loc  = elem % 64u;
+            uint half = loc  / 32u;
+            uint l    = loc  % 32u;
+
+            uint scaleIdx = grp * 2u + half;
+            uint sc, mn;
+            getScaleMinK4(scaleIdx, scBase, sc, mn);
+            float df  = d    * float(sc);
+            float dmf = dmin * float(mn);
+
+            uint u      = 1u << (grp * 2u + half);
+            uint hBit   = ((byteAt(qhBase + l) & u) != 0u) ? 16u : 0u;
+            uint qlByte = byteAt(qlBase + grp * 32u + l);
+            uint q5     = (half == 0u ? (qlByte & 0xFu) : (qlByte >> 4u)) + hBit;
+
+            dst[blockIdx * 256u + elem] = float16_t(df * float(q5) - dmf);
+        }
+        """;
+
+    /// <summary>
+    /// GPU-side Q4_K_M dequantization: one workgroup per block, 256 threads per workgroup.
+    /// Q4_K block layout (144 bytes / 256 elements):
+    ///   [0:2]   FP16 d
+    ///   [2:4]   FP16 dmin
+    ///   [4:16]  12 bytes packed 6-bit scales/mins
+    ///   [16:144] 128 bytes ql (4-bit nibbles, 2 per byte)
+    /// Requires: VK_KHR_shader_float16_int8 + VK_KHR_16bit_storage
+    /// Push constants: { uint numBlocks }.
+    /// Bindings: 0=src (raw uint32 array), 1=dst (fp16 array).
+    /// Dispatch: (numBlocks, 1, 1).
+    /// </summary>
+    internal const string DequantQ4KM = """
+        #version 450
+        #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+        #extension GL_EXT_shader_16bit_storage : require
+
+        layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+        layout(push_constant) uniform PC { uint numBlocks; } pc;
+        layout(binding = 0) readonly  buffer SrcBuf { uint src[]; };
+        layout(binding = 1) writeonly buffer DstBuf { float16_t dst[]; };
+
+        uint byteAt(uint bi) { return (src[bi >> 2u] >> ((bi & 3u) << 3u)) & 0xFFu; }
+
+        void getScaleMinK4(uint j, uint scBase, out uint sc, out uint mn) {
+            if (j < 4u) { sc = byteAt(scBase + j) & 63u; mn = byteAt(scBase + j + 4u) & 63u; }
+            else {
+                sc = (byteAt(scBase + j + 4u) & 0xFu) | ((byteAt(scBase + j - 4u) >> 6u) << 4u);
+                mn = (byteAt(scBase + j + 4u) >> 4u)  | ((byteAt(scBase + j)       >> 6u) << 4u);
+            }
+        }
+
+        void main() {
+            uint blockIdx = gl_WorkGroupID.x;
+            if (blockIdx >= pc.numBlocks) return;
+
+            uint elem  = gl_LocalInvocationID.x;
+            uint bBase = blockIdx * 144u;
+
+            uint dBits    = byteAt(bBase + 0u) | (byteAt(bBase + 1u) << 8u);
+            uint dminBits = byteAt(bBase + 2u) | (byteAt(bBase + 3u) << 8u);
+            float d    = unpackHalf2x16(dBits).x;
+            float dmin = unpackHalf2x16(dminBits).x;
+
+            uint scBase = bBase + 4u;
+            uint qlBase = bBase + 16u;
+
+            uint grp  = elem / 64u;
+            uint loc  = elem % 64u;
+            uint half = loc  / 32u;
+            uint l    = loc  % 32u;
+
+            uint scaleIdx = grp * 2u + half;
+            uint sc, mn;
+            getScaleMinK4(scaleIdx, scBase, sc, mn);
+            float df  = d    * float(sc);
+            float dmf = dmin * float(mn);
+
+            uint qlByte = byteAt(qlBase + grp * 32u + l);
+            uint q4     = (half == 0u) ? (qlByte & 0xFu) : (qlByte >> 4u);
+
+            dst[blockIdx * 256u + elem] = float16_t(df * float(q4) - dmf);
+        }
+        """;
 }

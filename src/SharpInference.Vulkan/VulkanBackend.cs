@@ -231,6 +231,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         bool has8BitStorage   = extNames.Contains("VK_KHR_8bit_storage");
         bool hasIntDot        = extNames.Contains("VK_KHR_shader_integer_dot_product");
         bool hasBfloat16      = extNames.Contains("VK_KHR_shader_bfloat16");
+        bool hasFloat8        = extNames.Contains("VK_EXT_shader_float8");
         HasShaderFloat16Int8    = hasFloat16Int8;
         Has16BitStorage         = has16BitStorage;
         Has8BitStorage          = has8BitStorage;
@@ -238,6 +239,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         HasCooperativeMatrix    = extNames.Contains("VK_KHR_cooperative_matrix");
         HasSubgroupSizeControl  = extNames.Contains("VK_EXT_subgroup_size_control");
         HasShaderBfloat16       = hasBfloat16;
+        HasShaderFloat8         = hasFloat8;
 
         // 6. Create logical device with one compute queue, enabling detected extensions
         float queuePriority = 1.0f;
@@ -254,17 +256,19 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         byte[] storage8NameBytes  = System.Text.Encoding.UTF8.GetBytes("VK_KHR_8bit_storage\0");
         byte[] intDotNameBytes    = System.Text.Encoding.UTF8.GetBytes("VK_KHR_shader_integer_dot_product\0");
         byte[] bf16NameBytes      = System.Text.Encoding.UTF8.GetBytes("VK_KHR_shader_bfloat16\0");
+        byte[] fp8NameBytes       = System.Text.Encoding.UTF8.GetBytes("VK_EXT_shader_float8\0");
 
         int enabledExtCount = (hasFloat16Int8 ? 1 : 0) + (has16BitStorage ? 1 : 0)
                             + (has8BitStorage ? 1 : 0) + (hasIntDot ? 1 : 0)
-                            + (hasBfloat16 ? 1 : 0);
+                            + (hasBfloat16 ? 1 : 0) + (hasFloat8 ? 1 : 0);
         int extIdx = 0;
 
         fixed (byte* pF16Int8   = f16Int8NameBytes,
                      pStorage16 = storage16NameBytes,
                      pStorage8  = storage8NameBytes,
                      pIntDot    = intDotNameBytes,
-                     pBf16      = bf16NameBytes)
+                     pBf16      = bf16NameBytes,
+                     pFp8       = fp8NameBytes)
         {
             byte** extPtrs = stackalloc byte*[enabledExtCount > 0 ? enabledExtCount : 1];
             if (hasFloat16Int8)  extPtrs[extIdx++] = pF16Int8;
@@ -272,6 +276,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
             if (has8BitStorage)  extPtrs[extIdx++] = pStorage8;
             if (hasIntDot)       extPtrs[extIdx++] = pIntDot;
             if (hasBfloat16)     extPtrs[extIdx++] = pBf16;
+            if (hasFloat8)       extPtrs[extIdx++] = pFp8;
 
             // Build pNext feature chain (back to front so earlier structs point to later ones)
             VkPhysicalDevice8BitStorageFeatures storage8Features = new()
@@ -290,11 +295,28 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
                 pNext = has16BitStorage ? &storage16Features : (has8BitStorage ? &storage8Features : null),
             };
 
-            void* pNextChain =
+            void* baseChain =
                 hasFloat16Int8  ? (void*)&f16Features :
                 has16BitStorage ? (void*)&storage16Features :
                 has8BitStorage  ? (void*)&storage8Features :
                 null;
+
+            // Prepend fp8 and bf16 feature structs to the chain
+            VkPhysicalDeviceShaderFloat8FeaturesEXT fp8Features = new()
+            {
+                shaderFloat8 = VkBool32.True,
+                pNext = baseChain,
+            };
+            VkPhysicalDeviceShaderBfloat16FeaturesKHR bf16Features = new()
+            {
+                shaderBFloat16Type = VkBool32.True,
+                pNext = hasFloat8 ? (void*)&fp8Features : baseChain,
+            };
+
+            void* pNextChain =
+                hasBfloat16 ? (void*)&bf16Features :
+                hasFloat8   ? (void*)&fp8Features :
+                baseChain;
 
             VkDeviceCreateInfo deviceCI = new()
             {
@@ -365,7 +387,6 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _asyncFence = asyncFence;
     }
 
-    /// <summary>Print device info to console.</summary>
     // Capability flags detected at init (before device creation)
     public bool Has8BitStorage { get; private set; }
     public bool Has16BitStorage { get; private set; }
@@ -374,10 +395,15 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     public bool HasSubgroupSizeControl { get; private set; }
     public bool HasShaderIntegerDotProduct { get; private set; }
     public bool HasShaderBfloat16 { get; private set; }
+    public bool HasShaderFloat8 { get; private set; }
 
     public SgemmPrecision BestSgemmPrecision =>
+        HasShaderFloat8 && HasShaderFloat16Int8 && Has16BitStorage ? SgemmPrecision.Fp8E4M3 :
+        HasShaderBfloat16 ? SgemmPrecision.Bf16 :
         HasShaderFloat16Int8 && Has16BitStorage ? SgemmPrecision.Fp16 :
         SgemmPrecision.Fp32;
+
+    public bool SupportsGpuDequant => HasShaderFloat16Int8 && Has16BitStorage;
 
     public void PrintDeviceInfo()
     {
@@ -399,6 +425,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         if (HasSubgroupSizeControl) found.Add("subgroup_size_control");
         if (HasShaderIntegerDotProduct) found.Add("integer_dot_product");
         if (HasShaderBfloat16) found.Add("bfloat16");
+        if (HasShaderFloat8) found.Add("float8_e4m3");
         if (found.Count > 0)
             Console.WriteLine($"  Compute extensions: {string.Join(", ", found)}");
         Console.WriteLine($"  Best SGEMM precision: {BestSgemmPrecision}");
@@ -701,6 +728,79 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _downloadStaging.Unmap();
     }
 
+    public unsafe Tensor UploadBf16(ReadOnlySpan<ushort> data, TensorShape shape)
+    {
+        ulong byteSize = (ulong)(data.Length * sizeof(ushort));
+
+        var gpuBuf = GpuBuffer.CreateDeviceLocal(this, byteSize,
+            VkBufferUsageFlags.StorageBuffer | VkBufferUsageFlags.TransferDst);
+
+        if (_uploadStaging == null || _uploadStagingSize < byteSize)
+        {
+            _uploadStaging?.Dispose();
+            _uploadStaging = GpuBuffer.CreateStaging(this, byteSize, VkBufferUsageFlags.TransferSrc);
+            _uploadStagingSize = byteSize;
+        }
+
+        ushort* mapped = (ushort*)_uploadStaging.Map();
+        data.CopyTo(new Span<ushort>(mapped, data.Length));
+        _uploadStaging.Unmap();
+
+        CopyBuffer(_uploadStaging, gpuBuf, byteSize);
+
+        var handle = (nint)Interlocked.Increment(ref _nextHandle);
+        _buffers[handle] = gpuBuf;
+        return new Tensor(shape, DType.BFloat16, handle);
+    }
+
+    public unsafe void DownloadBf16(Tensor src, Span<ushort> dst)
+    {
+        var gpuBuf = GetBuffer(src);
+        ulong byteSize = (ulong)(dst.Length * sizeof(ushort));
+
+        if (_downloadStaging == null || _downloadStagingSize < byteSize)
+        {
+            _downloadStaging?.Dispose();
+            _downloadStaging = GpuBuffer.CreateStaging(this, byteSize, VkBufferUsageFlags.TransferDst);
+            _downloadStagingSize = byteSize;
+        }
+
+        CopyBuffer(gpuBuf, _downloadStaging, byteSize);
+
+        ushort* mapped = (ushort*)_downloadStaging.Map();
+        new ReadOnlySpan<ushort>(mapped, dst.Length).CopyTo(dst);
+        _downloadStaging.Unmap();
+    }
+
+    /// <summary>
+    /// Upload raw quantized bytes to a device-local GPU buffer.
+    /// The returned tensor's shape is D1(byteLen) and its DType reflects the quantized format.
+    /// </summary>
+    public unsafe Tensor UploadRaw(ReadOnlySpan<byte> data, TensorShape shape, DType dtype)
+    {
+        ulong byteSize = (ulong)data.Length;
+
+        var gpuBuf = GpuBuffer.CreateDeviceLocal(this, byteSize,
+            VkBufferUsageFlags.StorageBuffer | VkBufferUsageFlags.TransferDst);
+
+        if (_uploadStaging == null || _uploadStagingSize < byteSize)
+        {
+            _uploadStaging?.Dispose();
+            _uploadStaging = GpuBuffer.CreateStaging(this, byteSize, VkBufferUsageFlags.TransferSrc);
+            _uploadStagingSize = byteSize;
+        }
+
+        byte* mapped = (byte*)_uploadStaging.Map();
+        data.CopyTo(new Span<byte>(mapped, data.Length));
+        _uploadStaging.Unmap();
+
+        CopyBuffer(_uploadStaging, gpuBuf, byteSize);
+
+        var handle = (nint)Interlocked.Increment(ref _nextHandle);
+        _buffers[handle] = gpuBuf;
+        return new Tensor(shape, dtype, handle);
+    }
+
     public VkFence Fence => _fence;
 
     public void Synchronize()
@@ -756,6 +856,10 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private ComputePipeline? _bufCopyPipeline;
     private ComputePipeline? _sgemmF32Pipeline;
     private ComputePipeline? _sgemmF16Pipeline;
+    private ComputePipeline? _sgemmBf16Pipeline;
+    private ComputePipeline? _sgemmFp8Pipeline;
+    private ComputePipeline? _dequantQ5KMPipeline;
+    private ComputePipeline? _dequantQ4KMPipeline;
 
     private struct RmsNormParams{ public uint n; public float eps; }
     private struct HeadNormParams { public uint headDim; public uint numHeads; public float eps; }
@@ -771,6 +875,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private struct TqAttentionParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint tqSeqLen; public uint fp16SeqLen; public uint maxSeqLen; public uint blockBytes; }
     private struct BufCopyParams { public uint count; public uint srcOffset; public uint dstOffset; }
     private struct SgemmParams { public uint M; public uint N; public uint K; }
+    private struct DequantParams { public uint numBlocks; }
 
     private void DispatchOrRecord(ComputePipeline pipe, ReadOnlySpan<GpuBuffer> buffers,
         uint groupX, void* push, uint groupY = 1, uint groupZ = 1)
@@ -1019,16 +1124,48 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
 
     /// <summary>
     /// Tiled GEMM: C[M,N] = A[M,K] × B[N,K]^T.
-    /// Dispatches the fp16 shader when A is Float16 and the device supports it;
-    /// falls back to fp32 otherwise.
-    /// A, B, C must already be GPU-resident tensors (use <see cref="Upload"/> or
-    /// <see cref="UploadHalf"/> first).
+    /// Dispatches the best available precision shader (fp8 > bf16 > fp16 > fp32).
+    /// A, B, C must already be GPU-resident tensors.
     /// </summary>
     public unsafe void Sgemm(Tensor C, Tensor A, Tensor B, int M, int K, int N)
     {
         var p = new SgemmParams { M = (uint)M, N = (uint)N, K = (uint)K };
         uint gx = ((uint)M + 15u) / 16u;
         uint gy = ((uint)N + 15u) / 16u;
+
+        if (A.DType == DType.Float8E4M3 && HasShaderFloat8 && HasShaderFloat16Int8 && Has16BitStorage)
+        {
+            try
+            {
+                _sgemmFp8Pipeline ??= new ComputePipeline(this, Shaders.SgemmFp8, 3,
+                    pushConstantSize: sizeof(SgemmParams));
+                DispatchOrRecord(_sgemmFp8Pipeline, [GetBuffer(A), GetBuffer(B), GetBuffer(C)], gx, &p, gy);
+                return;
+            }
+            catch (Exception)
+            {
+                HasShaderFloat8 = false;
+                _sgemmFp8Pipeline?.Dispose();
+                _sgemmFp8Pipeline = null;
+            }
+        }
+
+        if (A.DType == DType.BFloat16 && HasShaderBfloat16)
+        {
+            try
+            {
+                _sgemmBf16Pipeline ??= new ComputePipeline(this, Shaders.SgemmBf16, 3,
+                    pushConstantSize: sizeof(SgemmParams));
+                DispatchOrRecord(_sgemmBf16Pipeline, [GetBuffer(A), GetBuffer(B), GetBuffer(C)], gx, &p, gy);
+                return;
+            }
+            catch (Exception)
+            {
+                HasShaderBfloat16 = false;
+                _sgemmBf16Pipeline?.Dispose();
+                _sgemmBf16Pipeline = null;
+            }
+        }
 
         if (A.DType == DType.Float16 && HasShaderFloat16Int8 && Has16BitStorage)
         {
@@ -1041,6 +1178,42 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _sgemmF32Pipeline ??= new ComputePipeline(this, Shaders.SgemmF32, 3,
             pushConstantSize: sizeof(SgemmParams));
         DispatchOrRecord(_sgemmF32Pipeline, [GetBuffer(A), GetBuffer(B), GetBuffer(C)], gx, &p, gy);
+    }
+
+    /// <summary>GPU-side dequantize Q5_K raw bytes → fp16 output.</summary>
+    public unsafe void DequantQ5KM(Tensor src, Tensor dst, int numBlocks)
+    {
+        try
+        {
+            _dequantQ5KMPipeline ??= new ComputePipeline(this, Shaders.DequantQ5KM, 2,
+                pushConstantSize: sizeof(DequantParams));
+            var p = new DequantParams { numBlocks = (uint)numBlocks };
+            DispatchOrRecord(_dequantQ5KMPipeline, [GetBuffer(src), GetBuffer(dst)], (uint)numBlocks, &p);
+        }
+        catch (Exception)
+        {
+            _dequantQ5KMPipeline?.Dispose();
+            _dequantQ5KMPipeline = null;
+            throw;
+        }
+    }
+
+    /// <summary>GPU-side dequantize Q4_K raw bytes → fp16 output.</summary>
+    public unsafe void DequantQ4KM(Tensor src, Tensor dst, int numBlocks)
+    {
+        try
+        {
+            _dequantQ4KMPipeline ??= new ComputePipeline(this, Shaders.DequantQ4KM, 2,
+                pushConstantSize: sizeof(DequantParams));
+            var p = new DequantParams { numBlocks = (uint)numBlocks };
+            DispatchOrRecord(_dequantQ4KMPipeline, [GetBuffer(src), GetBuffer(dst)], (uint)numBlocks, &p);
+        }
+        catch (Exception)
+        {
+            _dequantQ4KMPipeline?.Dispose();
+            _dequantQ4KMPipeline = null;
+            throw;
+        }
     }
 
     /// <summary>
@@ -1173,6 +1346,10 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _bufCopyPipeline?.Dispose();
         _sgemmF32Pipeline?.Dispose();
         _sgemmF16Pipeline?.Dispose();
+        _sgemmBf16Pipeline?.Dispose();
+        _sgemmFp8Pipeline?.Dispose();
+        _dequantQ5KMPipeline?.Dispose();
+        _dequantQ4KMPipeline?.Dispose();
 
         _downloadStaging?.Dispose();
         _uploadStaging?.Dispose();

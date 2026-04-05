@@ -3,6 +3,8 @@ using System.Diagnostics;
 using System.Globalization;
 using Spectre.Console;
 using Spectre.Console.Cli;
+using SharpInference.Core;
+using SharpInference.Cuda;
 using SharpInference.Diffusion;
 using SharpInference.Vulkan;
 
@@ -17,8 +19,9 @@ namespace SharpInference.Cli;
 ///                  --qwen-tokenizer tokenizer.json -p "a cat" -W 1024 -H 1024 -o out.png
 ///
 ///   Recommended models (jayn7/Z-Image-Turbo-GGUF  +  BennyDaBall abliterated encoder):
-///     DiT:     z_image_turbo-Q5_K_M.gguf  (5.52 GB)
-///     Encoder: Z-Image-AbliteratedV1.Q5_K_M.gguf  (2.89 GB, uncensored)
+///     DiT Q5_K_M: z_image_turbo-Q5_K_M.gguf  (5.52 GB, highest quality)
+///     DiT Q4_K_M: z_image_turbo-Q4_K_M.gguf  (4.50 GB, good quality, faster)
+///     Encoder:    Z-Image-AbliteratedV1.Q5_K_M.gguf  (2.89 GB, uncensored)
 ///
 ///   FLUX.1-schnell / FLUX.1-dev:
 ///     sharpi image -m flux1-schnell-q4_k.gguf --vae ae.safetensors
@@ -27,11 +30,12 @@ namespace SharpInference.Cli;
 ///                  -p "a cinematic photograph of a cat" -W 512 -H 512 -o out.png
 ///
 /// Model downloads:
-///   Z-Image-Turbo GGUF:  https://huggingface.co/unsloth/Z-Image-Turbo-GGUF
-///   Z-Image-Turbo full:  https://huggingface.co/Tongyi-MAI/Z-Image-Turbo
-///   Qwen3-4B GGUF:       https://huggingface.co/Qwen/Qwen3-4B-GGUF
-///   FLUX.1-schnell GGUF: https://huggingface.co/city96/FLUX.1-schnell-gguf
-///   VAE + CLIP + T5:     https://huggingface.co/comfyanonymous/flux_text_encoders
+///   Z-Image-Turbo GGUF (Q5_K_M + Q4_K_M): https://huggingface.co/jayn7/Z-Image-Turbo-GGUF
+///   Z-Image-Turbo full:                    https://huggingface.co/Tongyi-MAI/Z-Image-Turbo
+///   Text encoder (uncensored Q4/Q5):       https://huggingface.co/BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1
+///   Qwen3-4B GGUF:                         https://huggingface.co/Qwen/Qwen3-4B-GGUF
+///   FLUX.1-schnell GGUF:                   https://huggingface.co/city96/FLUX.1-schnell-gguf
+///   VAE + CLIP + T5:                       https://huggingface.co/comfyanonymous/flux_text_encoders
 /// </summary>
 public sealed class ImageCommand : Command<ImageCommand.Settings>
 {
@@ -187,8 +191,6 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
         AnsiConsole.MarkupLine($"[dim]Encoder:[/]  {Markup.Escape(encoderPath!)}");
         AnsiConsole.MarkupLine($"[dim]Size:[/]     {s.Width}×{s.Height}  steps={steps}  seed={s.Seed}");
         AnsiConsole.MarkupLine($"[dim]Output:[/]   {Markup.Escape(output)}");
-        if (s.NGpuLayers != 0)
-            AnsiConsole.MarkupLine("[dim]Backend:[/]  GPU (Vulkan SGEMM)");
         AnsiConsole.WriteLine();
 
         try
@@ -201,13 +203,23 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                 {
                     ctx.Status("Loading DiT + VAE + Qwen3-4B…");
 
-                    VulkanBackend? gpu = null;
+                    IComputeBackend? gpu = null;
                     try
                     {
                         if (s.NGpuLayers != 0)
                         {
-                            gpu = new VulkanBackend();
-                            gpu.PrintDeviceInfo();
+                            if (CudaBackend.IsAvailable())
+                            {
+                                gpu = CudaBackend.Create();
+                                AnsiConsole.MarkupLine("[dim]Backend:[/]  GPU (CUDA cuBLAS)");
+                            }
+                            else
+                            {
+                                var vulkan = new VulkanBackend();
+                                gpu = vulkan;
+                                vulkan.PrintDeviceInfo();
+                                AnsiConsole.MarkupLine("[dim]Backend:[/]  GPU (Vulkan SGEMM)");
+                            }
                         }
 
                         var pipeline = ZImagePipeline.Load(
@@ -232,7 +244,10 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                         AnsiConsole.MarkupLine($"[green]✓[/] Done in [cyan]{sw.Elapsed.TotalSeconds:F1}s[/]");
                         AnsiConsole.MarkupLine($"[green]✓[/] Image saved: [cyan]{Markup.Escape(Path.GetFullPath(output))}[/]");
                     }
-                    finally { gpu?.Dispose(); }
+                    finally
+                    {
+                        if (gpu is IDisposable d) d.Dispose();
+                    }
                 });
         }
         catch (Exception ex)
@@ -430,8 +445,13 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
     private static void PrintModelDownloadHint()
     {
         AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("Z-Image-Turbo GGUF:  [link]https://huggingface.co/jayn7/Z-Image-Turbo-GGUF[/]  (z_image_turbo-Q5_K_M.gguf)");
-        AnsiConsole.MarkupLine("Text encoder (uncensored): [link]https://huggingface.co/BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1[/]  (Z-Image-AbliteratedV1.Q5_K_M.gguf)");
+        AnsiConsole.MarkupLine("Z-Image-Turbo GGUF (Q5_K_M + Q4_K_M):");
+        AnsiConsole.MarkupLine("  [link]https://huggingface.co/jayn7/Z-Image-Turbo-GGUF[/]");
+        AnsiConsole.MarkupLine("  z_image_turbo-Q5_K_M.gguf  (5.52 GB, best quality)");
+        AnsiConsole.MarkupLine("  z_image_turbo-Q4_K_M.gguf  (4.50 GB, good quality, faster dequant)");
+        AnsiConsole.MarkupLine("Text encoder (uncensored):");
+        AnsiConsole.MarkupLine("  [link]https://huggingface.co/BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1[/]");
+        AnsiConsole.MarkupLine("  Z-Image-AbliteratedV1.Q5_K_M.gguf or Q4_K_M.gguf");
         AnsiConsole.MarkupLine("FLUX.1-schnell GGUF: [link]https://huggingface.co/city96/FLUX.1-schnell-gguf[/]");
     }
 

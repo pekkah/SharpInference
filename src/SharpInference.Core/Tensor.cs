@@ -77,6 +77,7 @@ public enum DType : uint
     Q4_0_8_8  = 33,
     TQ1_0     = 34,
     TQ2_0     = 35,
+    Float8E4M3 = 36,
 }
 
 /// <summary>
@@ -123,6 +124,7 @@ public static class DTypeInfo
         DType.Q4_0_8_8  => 32,
         DType.TQ1_0     => 256,
         DType.TQ2_0     => 256,
+        DType.Float8E4M3 => 1,
         _ => throw new ArgumentOutOfRangeException(nameof(dtype), dtype, "Unknown dtype")
     };
 
@@ -166,6 +168,7 @@ public static class DTypeInfo
         DType.Q4_0_8_8  => 18,
         DType.TQ1_0     => 54,
         DType.TQ2_0     => 66,
+        DType.Float8E4M3 => 1,
         _ => throw new ArgumentOutOfRangeException(nameof(dtype), dtype, "Unknown dtype")
     };
 
@@ -183,6 +186,7 @@ public static class DTypeInfo
         DType.Int16    => 2,
         DType.Int32    => 4,
         DType.Int64    => 8,
+        DType.Float8E4M3 => 1,
         _ => throw new ArgumentException($"BytesPerElement not supported for quantized type {dtype}")
     };
 

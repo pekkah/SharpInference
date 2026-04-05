@@ -41,6 +41,24 @@ public interface IComputeBackend : IDisposable
     /// <summary>Copy fp16 data back from a Float16 tensor on the backend device.</summary>
     void DownloadHalf(Tensor src, Span<Half> dst);
 
+    /// <summary>Copy bf16 data (as raw ushort bits) to the backend device, returning a BFloat16 tensor.</summary>
+    Tensor UploadBf16(ReadOnlySpan<ushort> data, TensorShape shape);
+
+    /// <summary>Copy bf16 data back from a BFloat16 tensor on the backend device.</summary>
+    void DownloadBf16(Tensor src, Span<ushort> dst);
+
+    /// <summary>Upload raw quantized bytes to a device-local GPU buffer.</summary>
+    Tensor UploadRaw(ReadOnlySpan<byte> data, TensorShape shape, DType dtype);
+
+    /// <summary>True if the backend supports GPU-side dequantization of Q4_K/Q5_K weights.</summary>
+    bool SupportsGpuDequant { get; }
+
+    /// <summary>GPU-side dequantize Q5_K raw bytes → fp16 output.</summary>
+    void DequantQ5KM(Tensor src, Tensor dst, int numBlocks);
+
+    /// <summary>GPU-side dequantize Q4_K raw bytes → fp16 output.</summary>
+    void DequantQ4KM(Tensor src, Tensor dst, int numBlocks);
+
     // --- Core math operations ---
 
     /// <summary>Matrix-vector multiply: output[i] = sum_j(matrix[i,j] * vector[j]).</summary>

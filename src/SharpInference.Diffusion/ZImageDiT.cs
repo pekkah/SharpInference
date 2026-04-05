@@ -27,6 +27,8 @@ public sealed class ZImageDiT : IDisposable
     private readonly ZImageRoPE _rope;
     private readonly IComputeBackend? _backend;
     private readonly Dictionary<string, float[]> _cache = new(StringComparer.Ordinal);
+    /// <summary>Raw quantized weight buffers cached on the GPU (lazy-populated by GPU dequant path).</summary>
+    private readonly Dictionary<string, Core.Tensor>? _gpuWeights;
     private bool _disposed;
 
     /// <summary>Minimum batch size to route a MatQ call through the GPU backend.</summary>
@@ -38,6 +40,8 @@ public sealed class ZImageDiT : IDisposable
         _p       = p;
         _rope    = new ZImageRoPE(p);
         _backend = backend;
+        if (backend?.SupportsGpuDequant == true)
+            _gpuWeights = new Dictionary<string, Core.Tensor>(StringComparer.Ordinal);
     }
 
     // ── Main forward pass ─────────────────────────────────────────────────
@@ -367,7 +371,114 @@ public sealed class ZImageDiT : IDisposable
         {
             if (_backend != null && n >= MinGpuBatch)
             {
-                if (_backend.BestSgemmPrecision == SgemmPrecision.Fp16)
+                if (_backend.BestSgemmPrecision == SgemmPrecision.Bf16)
+                {
+                    // bf16 GPU path: dequant → bf16 (as ushort bits), upload, run bf16 SGEMM
+                    int wCount = rows * cols;
+                    float[] wBuf32 = ArrayPool<float>.Shared.Rent(wCount);
+                    ushort[] xBf16 = ArrayPool<ushort>.Shared.Rent(n * cols);
+                    ushort[] wBf16 = ArrayPool<ushort>.Shared.Rent(wCount);
+                    ushort[] cBf16 = ArrayPool<ushort>.Shared.Rent(n * rows);
+                    try
+                    {
+                        Dequantize.ToFloat32(
+                            new ReadOnlySpan<byte>((byte*)ptr, (int)byteLen),
+                            wBuf32.AsSpan(0, wCount), dtype, wCount);
+
+                        int xCount = n * cols;
+                        for (int i = 0; i < xCount; i++)
+                        {
+                            uint bits = BitConverter.SingleToUInt32Bits(x[i]);
+                            xBf16[i] = (ushort)(bits >> 16);
+                        }
+                        for (int i = 0; i < wCount; i++)
+                        {
+                            uint bits = BitConverter.SingleToUInt32Bits(wBuf32[i]);
+                            wBf16[i] = (ushort)(bits >> 16);
+                        }
+
+                        var xGpu = _backend.UploadBf16(xBf16.AsSpan(0, xCount), TensorShape.D1(xCount));
+                        var wGpu = _backend.UploadBf16(wBf16.AsSpan(0, wCount), TensorShape.D1(wCount));
+                        var cGpu = _backend.Allocate(TensorShape.D1(n * rows), DType.BFloat16);
+                        try
+                        {
+                            _backend.Sgemm(cGpu, xGpu, wGpu, n, cols, rows);
+                            _backend.Synchronize();
+                            _backend.DownloadBf16(cGpu, cBf16.AsSpan(0, n * rows));
+                        }
+                        finally
+                        {
+                            _backend.Free(xGpu);
+                            _backend.Free(wGpu);
+                            _backend.Free(cGpu);
+                        }
+
+                        int cCount = n * rows;
+                        for (int i = 0; i < cCount; i++)
+                        {
+                            uint bits = (uint)cBf16[i] << 16;
+                            result[i] = BitConverter.UInt32BitsToSingle(bits);
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<float>.Shared.Return(wBuf32);
+                        ArrayPool<ushort>.Shared.Return(xBf16);
+                        ArrayPool<ushort>.Shared.Return(wBf16);
+                        ArrayPool<ushort>.Shared.Return(cBf16);
+                    }
+                }
+                else if (_backend.BestSgemmPrecision == SgemmPrecision.Fp16 &&
+                         _gpuWeights != null &&
+                         (dtype == DType.Q5_K || dtype == DType.Q4_K))
+                {
+                    // GPU dequant path: upload raw quantized bytes once, dequant on GPU each call
+                    if (!_gpuWeights.TryGetValue(wName, out var rawGpu))
+                    {
+                        rawGpu = _backend.UploadRaw(
+                            new ReadOnlySpan<byte>((byte*)ptr, (int)byteLen),
+                            TensorShape.D1((long)byteLen), dtype);
+                        _gpuWeights[wName] = rawGpu;
+                    }
+
+                    int numBlocks = rows * cols / 256;
+                    int xCount   = n * cols;
+                    int cCount   = n * rows;
+                    Half[] xHalf = ArrayPool<Half>.Shared.Rent(xCount);
+                    Half[] cHalf = ArrayPool<Half>.Shared.Rent(cCount);
+                    var wGpu = _backend.Allocate(TensorShape.D1(rows * cols), DType.Float16);
+                    try
+                    {
+                        if (dtype == DType.Q5_K)
+                            _backend.DequantQ5KM(rawGpu, wGpu, numBlocks);
+                        else
+                            _backend.DequantQ4KM(rawGpu, wGpu, numBlocks);
+
+                        for (int i = 0; i < xCount; i++) xHalf[i] = (Half)x[i];
+                        var xGpu = _backend.UploadHalf(xHalf.AsSpan(0, xCount), TensorShape.D1(xCount));
+                        var cGpu = _backend.Allocate(TensorShape.D1(cCount), DType.Float16);
+                        try
+                        {
+                            _backend.Sgemm(cGpu, xGpu, wGpu, n, cols, rows);
+                            _backend.Synchronize();
+                            _backend.DownloadHalf(cGpu, cHalf.AsSpan(0, cCount));
+                        }
+                        finally
+                        {
+                            _backend.Free(xGpu);
+                            _backend.Free(cGpu);
+                        }
+
+                        for (int i = 0; i < cCount; i++) result[i] = (float)cHalf[i];
+                    }
+                    finally
+                    {
+                        _backend.Free(wGpu);
+                        ArrayPool<Half>.Shared.Return(xHalf);
+                        ArrayPool<Half>.Shared.Return(cHalf);
+                    }
+                }
+                else if (_backend.BestSgemmPrecision == SgemmPrecision.Fp16)
                 {
                     // fp16 GPU path: dequantize weight to Half, upload as fp16, run fp16 SGEMM
                     int wCount = rows * cols;
@@ -493,6 +604,12 @@ public sealed class ZImageDiT : IDisposable
         if (!_disposed)
         {
             _disposed = true;
+            if (_gpuWeights != null && _backend != null)
+            {
+                foreach (var t in _gpuWeights.Values)
+                    _backend.Free(t);
+                _gpuWeights.Clear();
+            }
             _cache.Clear();
             _st.Dispose();
         }
