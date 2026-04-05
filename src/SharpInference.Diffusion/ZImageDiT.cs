@@ -25,14 +25,19 @@ public sealed class ZImageDiT : IDisposable
     private readonly IWeightLoader _st;
     private readonly ZImageParams _p;
     private readonly ZImageRoPE _rope;
+    private readonly IComputeBackend? _backend;
     private readonly Dictionary<string, float[]> _cache = new(StringComparer.Ordinal);
     private bool _disposed;
 
-    public ZImageDiT(IWeightLoader st, ZImageParams p)
+    /// <summary>Minimum batch size to route a MatQ call through the GPU backend.</summary>
+    private const int MinGpuBatch = 16;
+
+    public ZImageDiT(IWeightLoader st, ZImageParams p, IComputeBackend? backend = null)
     {
-        _st   = st;
-        _p    = p;
-        _rope = new ZImageRoPE(p);
+        _st      = st;
+        _p       = p;
+        _rope    = new ZImageRoPE(p);
+        _backend = backend;
     }
 
     // ── Main forward pass ─────────────────────────────────────────────────
@@ -349,6 +354,8 @@ public sealed class ZImageDiT : IDisposable
 
     /// <summary>
     /// Quantized matrix multiply using zero-copy mmap pointer from GGUF.
+    /// When a GPU backend is provided and the batch is large enough, dequantizes
+    /// the weight to float32 and uses the backend's batched SGEMM.
     /// Falls back to DiffusionOps.Linear for float32 safetensors backends.
     /// </summary>
     private unsafe float[] MatQ(float[] x, int n, int inDim, string wName, int outDim,
@@ -356,10 +363,43 @@ public sealed class ZImageDiT : IDisposable
     {
         var result = new float[n * outDim];
 
-        if (_st.TryGetRaw(wName, out nint ptr, out _, out DType dtype, out int rows, out int cols))
+        if (_st.TryGetRaw(wName, out nint ptr, out long byteLen, out DType dtype, out int rows, out int cols))
         {
-            fixed (float* xPtr = x, rPtr = result)
-                SimdKernels.MatMulBatched(rPtr, (byte*)ptr, xPtr, n, rows, cols, dtype);
+            if (_backend != null && n >= MinGpuBatch)
+            {
+                // GPU path: dequantize weight on CPU, upload A + B, run SGEMM, download C
+                int wCount = rows * cols;
+                float[] wBuf = ArrayPool<float>.Shared.Rent(wCount);
+                try
+                {
+                    Dequantize.ToFloat32(
+                        new ReadOnlySpan<byte>((byte*)ptr, (int)byteLen),
+                        wBuf.AsSpan(0, wCount), dtype, wCount);
+
+                    var xGpu = _backend.Upload(x.AsSpan(0, n * cols), TensorShape.D1(n * cols));
+                    var wGpu = _backend.Upload(wBuf.AsSpan(0, wCount), TensorShape.D1(wCount));
+                    var cGpu = _backend.Allocate(TensorShape.D1(n * rows));
+                    try
+                    {
+                        _backend.Sgemm(cGpu, xGpu, wGpu, n, cols, rows);
+                        _backend.Synchronize();
+                        _backend.Download(cGpu, result.AsSpan());
+                    }
+                    finally
+                    {
+                        _backend.Free(xGpu);
+                        _backend.Free(wGpu);
+                        _backend.Free(cGpu);
+                    }
+                }
+                finally { ArrayPool<float>.Shared.Return(wBuf); }
+            }
+            else
+            {
+                // CPU path
+                fixed (float* xPtr = x, rPtr = result)
+                    SimdKernels.MatMulBatched(rPtr, (byte*)ptr, xPtr, n, rows, cols, dtype);
+            }
         }
         else
         {

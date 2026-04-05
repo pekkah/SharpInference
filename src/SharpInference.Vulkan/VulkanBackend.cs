@@ -642,6 +642,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private ComputePipeline? _tqKvAppendPipeline;
     private ComputePipeline? _tqAttentionPipeline;
     private ComputePipeline? _bufCopyPipeline;
+    private ComputePipeline? _sgemmF32Pipeline;
 
     private struct RmsNormParams{ public uint n; public float eps; }
     private struct HeadNormParams { public uint headDim; public uint numHeads; public float eps; }
@@ -656,6 +657,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private struct TqKvAppendParams { public uint kvDim; public uint headDim; public uint position; public uint maxSeqLen; public uint numKvHeads; public uint blockBytes; }
     private struct TqAttentionParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint tqSeqLen; public uint fp16SeqLen; public uint maxSeqLen; public uint blockBytes; }
     private struct BufCopyParams { public uint count; public uint srcOffset; public uint dstOffset; }
+    private struct SgemmParams { public uint M; public uint N; public uint K; }
 
     private void DispatchOrRecord(ComputePipeline pipe, ReadOnlySpan<GpuBuffer> buffers,
         uint groupX, void* push, uint groupY = 1, uint groupZ = 1)
@@ -899,6 +901,120 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     }
 
     // ================================================================
+    //  DiT / Diffusion — batched GEMM and full-sequence attention
+    // ================================================================
+
+    /// <summary>
+    /// Tiled float32 GEMM: C[M,N] = A[M,K] × B[N,K]^T.
+    /// A, B, C must already be GPU-resident tensors (use <see cref="Upload"/> first).
+    /// </summary>
+    public unsafe void Sgemm(Tensor C, Tensor A, Tensor B, int M, int K, int N)
+    {
+        _sgemmF32Pipeline ??= new ComputePipeline(this, Shaders.SgemmF32, 3,
+            pushConstantSize: sizeof(SgemmParams));
+        var p = new SgemmParams { M = (uint)M, N = (uint)N, K = (uint)K };
+        uint gx = ((uint)M + 15u) / 16u;
+        uint gy = ((uint)N + 15u) / 16u;
+        DispatchOrRecord(_sgemmF32Pipeline, [GetBuffer(A), GetBuffer(B), GetBuffer(C)], gx, &p, gy);
+    }
+
+    /// <summary>
+    /// Full-sequence self-attention computed on CPU (attention is ~1% of DiT FLOPs).
+    /// Downloads Q/K/V from GPU, runs the attention, uploads the result.
+    /// Layout: element (tok, head, d) at index tok*nHeads*headDim + head*headDim + d.
+    /// </summary>
+    public unsafe void FullSeqAttention(Tensor output, Tensor q, Tensor k, Tensor v,
+                                        int nTok, int nHeads, int headDim, float scale)
+    {
+        int dim = nHeads * headDim;
+        int count = nTok * dim;
+        float[] qHost = new float[count];
+        float[] kHost = new float[count];
+        float[] vHost = new float[count];
+        float[] oHost = new float[count];
+        Download(q, qHost);
+        Download(k, kHost);
+        Download(v, vHost);
+
+        float[] scoresBuf = new float[nHeads * nTok * nTok];
+        float[] vhBuf     = new float[nTok * headDim];
+
+        fixed (float* qPtr = qHost, kPtr = kHost, vPtr = vHost, oPtr = oHost,
+                      sBuf = scoresBuf, vhPtr = vhBuf)
+        {
+            for (int h = 0; h < nHeads; h++)
+            {
+                int sBase = h * nTok * nTok;
+                for (int i = 0; i < nTok; i++)
+                {
+                    float* qi = qPtr + ((long)i * nHeads + h) * headDim;
+                    int sRow = sBase + i * nTok;
+                    for (int j = 0; j < nTok; j++)
+                    {
+                        float* kj = kPtr + ((long)j * nHeads + h) * headDim;
+                        float dot = 0f;
+                        for (int d = 0; d < headDim; d++)
+                            dot += qi[d] * kj[d];
+                        sBuf[sRow + j] = dot * scale;
+                    }
+                    float max = float.NegativeInfinity;
+                    for (int j = 0; j < nTok; j++)
+                        if (sBuf[sRow + j] > max) max = sBuf[sRow + j];
+                    float sum = 0f;
+                    for (int j = 0; j < nTok; j++)
+                    {
+                        sBuf[sRow + j] = MathF.Exp(sBuf[sRow + j] - max);
+                        sum += sBuf[sRow + j];
+                    }
+                    float invSum = 1f / sum;
+                    for (int j = 0; j < nTok; j++)
+                        sBuf[sRow + j] *= invSum;
+                }
+
+                // Gather V for this head
+                for (int j = 0; j < nTok; j++)
+                {
+                    float* src = vPtr + ((long)j * nHeads + h) * headDim;
+                    float* dst = vhPtr + j * headDim;
+                    for (int d = 0; d < headDim; d++)
+                        dst[d] = src[d];
+                }
+                // Weighted sum into output
+                for (int i = 0; i < nTok; i++)
+                {
+                    int sRow = sBase + i * nTok;
+                    float* outRow = oPtr + ((long)i * nHeads + h) * headDim;
+                    for (int d = 0; d < headDim; d++)
+                        outRow[d] = 0f;
+                    for (int j = 0; j < nTok; j++)
+                    {
+                        float w = sBuf[sRow + j];
+                        float* vj = vhPtr + j * headDim;
+                        for (int d = 0; d < headDim; d++)
+                            outRow[d] += w * vj[d];
+                    }
+                }
+            }
+        }
+
+        // Upload result into the pre-allocated output tensor via staging copy
+        ulong byteSize = (ulong)((long)count * sizeof(float));
+        if (_uploadStaging == null || _uploadStagingSize < byteSize)
+        {
+            _uploadStaging?.Dispose();
+            _uploadStaging = GpuBuffer.CreateStaging(this, byteSize, VkBufferUsageFlags.TransferSrc);
+            _uploadStagingSize = byteSize;
+        }
+        fixed (float* src = oHost)
+        {
+            float* mapped = (float*)_uploadStaging.Map();
+            new System.Span<float>(src, count).CopyTo(new System.Span<float>(mapped, count));
+            _uploadStaging.Unmap();
+        }
+        CopyBuffer(_uploadStaging, GetBuffer(output), byteSize);
+    }
+
+    // ================================================================
     //  Disposal
     // ================================================================
 
@@ -930,6 +1046,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _embedLookupPipeline?.Dispose();
         _embedLookupQ4KPipeline?.Dispose();
         _bufCopyPipeline?.Dispose();
+        _sgemmF32Pipeline?.Dispose();
 
         _downloadStaging?.Dispose();
         _uploadStaging?.Dispose();

@@ -58,8 +58,13 @@ public sealed class ZImagePipeline : IDisposable
     /// <param name="tokenizerPath">
     ///   Path to the Qwen3 tokenizer.json file.
     /// </param>
+    /// <param name="backend">
+    ///   Optional GPU compute backend. When supplied, large weight projections are
+    ///   accelerated via batched SGEMM on the GPU.
+    /// </param>
     public static ZImagePipeline Load(string ditPath, string vaePath,
-                                       string qwenPath, string tokenizerPath)
+                                       string qwenPath, string tokenizerPath,
+                                       IComputeBackend? backend = null)
     {
         var p = new ZImageParams();
 
@@ -74,7 +79,7 @@ public sealed class ZImagePipeline : IDisposable
         var vaeLoader  = Directory.Exists(vaePath) ? SafetensorsLoader.OpenDirectory(vaePath)
                                                    : SafetensorsLoader.Open(vaePath);
 
-        var dit       = new ZImageDiT(ditLoader, p);
+        var dit       = new ZImageDiT(ditLoader, p, backend);
         var vae       = new VaeDecoder(vaeLoader);
         var qwen      = new QwenTextEncoder(GgufModel.Open(qwenPath), p);
         var tokenizer = QwenTokenizer.FromFile(tokenizerPath);

@@ -4,6 +4,7 @@ using System.Globalization;
 using Spectre.Console;
 using Spectre.Console.Cli;
 using SharpInference.Diffusion;
+using SharpInference.Vulkan;
 
 namespace SharpInference.Cli;
 
@@ -61,6 +62,11 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
         [CommandOption("--qwen-tokenizer")]
         [Description("(Z-Image) Path to Qwen3 tokenizer.json")]
         public string? QwenTokenizerPath { get; init; }
+
+        [CommandOption("-g|--n-gpu-layers")]
+        [Description("(Z-Image) GPU acceleration: 0 = CPU only, non-zero = use GPU for DiT weight projections (default: 0)")]
+        [DefaultValue(0)]
+        public int NGpuLayers { get; init; }
 
         // ── FLUX options ──────────────────────────────────────────────────
 
@@ -181,6 +187,8 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
         AnsiConsole.MarkupLine($"[dim]Encoder:[/]  {Markup.Escape(encoderPath!)}");
         AnsiConsole.MarkupLine($"[dim]Size:[/]     {s.Width}×{s.Height}  steps={steps}  seed={s.Seed}");
         AnsiConsole.MarkupLine($"[dim]Output:[/]   {Markup.Escape(output)}");
+        if (s.NGpuLayers != 0)
+            AnsiConsole.MarkupLine("[dim]Backend:[/]  GPU (Vulkan SGEMM)");
         AnsiConsole.WriteLine();
 
         try
@@ -192,26 +200,39 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                 .Start("Loading Z-Image models…", ctx =>
                 {
                     ctx.Status("Loading DiT + VAE + Qwen3-4B…");
-                    var pipeline = ZImagePipeline.Load(
-                        modelPath,
-                        vaePath!,
-                        encoderPath!,
-                        tokenizerPath!);
 
-                    using (pipeline)
+                    VulkanBackend? gpu = null;
+                    try
                     {
-                        var stepSw = Stopwatch.StartNew();
-                        pipeline.Generate(
-                            s.Prompt!, s.Width, s.Height, steps, s.Seed, output,
-                            progress: (step, total) =>
-                            {
-                                ctx.Status($"Step {step}/{total} — {stepSw.Elapsed.TotalSeconds:F1}s elapsed…");
-                                stepSw.Restart();
-                            });
-                    }
+                        if (s.NGpuLayers != 0)
+                        {
+                            gpu = new VulkanBackend();
+                            gpu.PrintDeviceInfo();
+                        }
 
-                    AnsiConsole.MarkupLine($"[green]✓[/] Done in [cyan]{sw.Elapsed.TotalSeconds:F1}s[/]");
-                    AnsiConsole.MarkupLine($"[green]✓[/] Image saved: [cyan]{Markup.Escape(Path.GetFullPath(output))}[/]");
+                        var pipeline = ZImagePipeline.Load(
+                            modelPath,
+                            vaePath!,
+                            encoderPath!,
+                            tokenizerPath!,
+                            gpu);
+
+                        using (pipeline)
+                        {
+                            var stepSw = Stopwatch.StartNew();
+                            pipeline.Generate(
+                                s.Prompt!, s.Width, s.Height, steps, s.Seed, output,
+                                progress: (step, total) =>
+                                {
+                                    ctx.Status($"Step {step}/{total} — {stepSw.Elapsed.TotalSeconds:F1}s elapsed…");
+                                    stepSw.Restart();
+                                });
+                        }
+
+                        AnsiConsole.MarkupLine($"[green]✓[/] Done in [cyan]{sw.Elapsed.TotalSeconds:F1}s[/]");
+                        AnsiConsole.MarkupLine($"[green]✓[/] Image saved: [cyan]{Markup.Escape(Path.GetFullPath(output))}[/]");
+                    }
+                    finally { gpu?.Dispose(); }
                 });
         }
         catch (Exception ex)

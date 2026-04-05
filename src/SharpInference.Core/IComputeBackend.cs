@@ -45,6 +45,21 @@ public interface IComputeBackend : IDisposable
     /// <summary>Apply rotary positional embedding in-place.</summary>
     void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f);
 
+    /// <summary>
+    /// General matrix multiply: C[M,N] = A[M,K] × B[N,K]^T
+    /// A is activations [M rows, K cols], B is weight matrix [N rows, K cols] stored row-major.
+    /// Used for transformer projections where nBatch > 1.
+    /// </summary>
+    void Sgemm(Tensor C, Tensor A, Tensor B, int M, int K, int N);
+
+    /// <summary>
+    /// Full-sequence self-attention: softmax(Q×K^T / sqrt(headDim)) × V
+    /// q, k, v: [nTok, nHeads * headDim] with interleaved layout [tok*nHeads + head, headDim]
+    /// output: [nTok, nHeads * headDim] same layout
+    /// </summary>
+    void FullSeqAttention(Tensor output, Tensor q, Tensor k, Tensor v,
+                          int nTok, int nHeads, int headDim, float scale);
+
     /// <summary>Wait for all queued operations to complete.</summary>
     void Synchronize();
 }

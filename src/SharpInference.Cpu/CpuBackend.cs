@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Runtime.InteropServices;
 using SharpInference.Core;
 
@@ -195,6 +196,120 @@ public sealed unsafe class CpuBackend : IComputeBackend
     }
 
     public void Synchronize() { /* CPU operations are synchronous */ }
+
+    /// <summary>
+    /// General matrix multiply: C[M,N] = A[M,K] × B[N,K]^T using CBLAS SGEMM.
+    /// Falls back to a scalar loop if OpenBLAS is not available.
+    /// </summary>
+    public unsafe void Sgemm(Tensor C, Tensor A, Tensor B, int M, int K, int N)
+    {
+        var a = (float*)A.Handle;
+        var b = (float*)B.Handle;
+        var c = (float*)C.Handle;
+
+        if (BlasInterop.IsAvailable)
+        {
+            BlasInterop.Sgemm(
+                BlasInterop.RowMajor, BlasInterop.NoTrans, BlasInterop.Trans,
+                M, N, K,
+                1.0f, a, K,
+                b, K,
+                0.0f, c, N);
+        }
+        else
+        {
+            // Scalar fallback: C[i,j] = sum_k A[i,k] * B[j,k]
+            for (int i = 0; i < M; i++)
+            for (int j = 0; j < N; j++)
+            {
+                float acc = 0f;
+                for (int k = 0; k < K; k++)
+                    acc += a[i * K + k] * b[j * K + k];
+                c[i * N + j] = acc;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Full-sequence self-attention.
+    /// Layout: element (tok, head, d) at index tok*nHeads*headDim + head*headDim + d.
+    /// </summary>
+    public unsafe void FullSeqAttention(Tensor output, Tensor q, Tensor k, Tensor v,
+                                        int nTok, int nHeads, int headDim, float scale)
+    {
+        var qPtr = (float*)q.Handle;
+        var kPtr = (float*)k.Handle;
+        var vPtr = (float*)v.Handle;
+        var oPtr = (float*)output.Handle;
+
+        int scoreCount = nHeads * nTok * nTok;
+        float[] scoresBuf = ArrayPool<float>.Shared.Rent(scoreCount);
+        try
+        {
+            for (int h = 0; h < nHeads; h++)
+            {
+                int sBase = h * nTok * nTok;
+                for (int i = 0; i < nTok; i++)
+                {
+                    float* qi = qPtr + ((long)i * nHeads + h) * headDim;
+                    int sRow = sBase + i * nTok;
+                    for (int j = 0; j < nTok; j++)
+                    {
+                        float* kj = kPtr + ((long)j * nHeads + h) * headDim;
+                        float dot = 0f;
+                        for (int d = 0; d < headDim; d++)
+                            dot += qi[d] * kj[d];
+                        scoresBuf[sRow + j] = dot * scale;
+                    }
+                    // Softmax over the nTok scores for query i
+                    float max = float.NegativeInfinity;
+                    for (int j = 0; j < nTok; j++)
+                        if (scoresBuf[sRow + j] > max) max = scoresBuf[sRow + j];
+                    float sum = 0f;
+                    for (int j = 0; j < nTok; j++)
+                    {
+                        scoresBuf[sRow + j] = MathF.Exp(scoresBuf[sRow + j] - max);
+                        sum += scoresBuf[sRow + j];
+                    }
+                    float invSum = 1f / sum;
+                    for (int j = 0; j < nTok; j++)
+                        scoresBuf[sRow + j] *= invSum;
+                }
+
+                // Gather V for this head, accumulate weighted output
+                float[] vhBuf = ArrayPool<float>.Shared.Rent(nTok * headDim);
+                try
+                {
+                    fixed (float* vhPtr = vhBuf)
+                    {
+                        for (int j = 0; j < nTok; j++)
+                        {
+                            float* src = vPtr + ((long)j * nHeads + h) * headDim;
+                            float* dst = vhPtr + j * headDim;
+                            for (int d = 0; d < headDim; d++)
+                                dst[d] = src[d];
+                        }
+                        for (int i = 0; i < nTok; i++)
+                        {
+                            int sRow = sBase + i * nTok;
+                            float* outRow = oPtr + ((long)i * nHeads + h) * headDim;
+                            for (int d = 0; d < headDim; d++)
+                                outRow[d] = 0f;
+                            for (int j = 0; j < nTok; j++)
+                            {
+                                float w = scoresBuf[sRow + j];
+                                float* vj = vhPtr + j * headDim;
+                                for (int d = 0; d < headDim; d++)
+                                    outRow[d] += w * vj[d];
+                            }
+                        }
+                    }
+                }
+                finally { ArrayPool<float>.Shared.Return(vhBuf); }
+            }
+        }
+        finally { ArrayPool<float>.Shared.Return(scoresBuf); }
+    }
 
     public void Dispose() { }
 }

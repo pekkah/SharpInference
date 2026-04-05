@@ -1426,4 +1426,65 @@ internal static class Shaders
             }
         }
         """;
+
+    // ================================================================
+    //  DiT / Diffusion Shaders
+    // ================================================================
+
+    /// <summary>
+    /// Tiled SGEMM: C[M,N] = A[M,K] × B[N,K]^T
+    /// A is activations [M rows, K cols], B is weights [N rows, K cols] (row = one output neuron's weights).
+    /// Uses 16×16 shared-memory tiles with +1 column padding to avoid bank conflicts.
+    ///
+    /// Push constants: { uint M, uint N, uint K }.
+    /// Bindings: 0=A (readonly), 1=B (readonly), 2=C (writeonly).
+    /// Dispatch: (ceil(M/16), ceil(N/16), 1) with local_size=(16,16,1).
+    /// </summary>
+    internal const string SgemmF32 = """
+        #version 450
+
+        layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+        layout(push_constant) uniform PC {
+            uint M;
+            uint N;
+            uint K;
+        } pc;
+
+        layout(binding = 0) readonly  buffer BufA { float a_data[]; };   // [M, K] activations
+        layout(binding = 1) readonly  buffer BufB { float b_data[]; };   // [N, K] weights
+        layout(binding = 2) writeonly buffer BufC { float c_data[]; };   // [M, N] output
+
+        shared float tileA[16][17]; // +1 column to avoid bank conflicts
+        shared float tileB[16][17];
+
+        void main() {
+            uint row = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+            uint col = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+
+            float acc = 0.0;
+            uint numTiles = (pc.K + 15u) / 16u;
+
+            for (uint t = 0u; t < numTiles; t++) {
+                uint aCol = t * 16u + gl_LocalInvocationID.y;
+                uint bCol = t * 16u + gl_LocalInvocationID.x;
+
+                tileA[gl_LocalInvocationID.x][gl_LocalInvocationID.y] =
+                    (row < pc.M && aCol < pc.K) ? a_data[row * pc.K + aCol] : 0.0;
+
+                tileB[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+                    (col < pc.N && bCol < pc.K) ? b_data[col * pc.K + bCol] : 0.0;
+
+                barrier();
+
+                for (uint k = 0u; k < 16u; k++)
+                    acc += tileA[gl_LocalInvocationID.x][k] * tileB[gl_LocalInvocationID.y][k];
+
+                barrier();
+            }
+
+            if (row < pc.M && col < pc.N)
+                c_data[row * pc.N + col] = acc;
+        }
+        """;
 }
