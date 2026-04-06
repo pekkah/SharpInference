@@ -2061,7 +2061,7 @@ RGB image [1, 3, H, W]
 `QwenTextEncoder` (`TextEncoders/QwenTextEncoder.cs`)
 - Qwen3-4B 35-layer transformer encoder; Q5_K_M GGUF weights
 - GPU path: weights dequantized to bf16, cached in `_gpuWeights`; activations uploaded as bf16; cuBLAS SGEMM; result downloaded and converted to fp32
-- Prompt embedding cache in `ZImagePipeline`: exact string match skips re-encode (~90s first run, ~0s subsequent)
+- Prompt embedding cache in `ZImagePipeline`: exact string match skips re-encode within the same process lifetime (~97s saved per repeated prompt in server/batch mode; the cache is in-memory and does not persist across process restarts)
 
 `VaeDecoder` (`VaeDecoder.cs`)
 - FLUX VAE decoder: 13 ResBlocks + MidAttn + 4 upsamplers; latent [1,16,H,W] → RGB [1,3,8H,8W]
@@ -2085,18 +2085,17 @@ dotnet run --project src/SharpInference.Cli -c Release -- image \
   -p "anime style rose" -o rose.png --width 512 --height 512 -v
 ```
 
-**Benchmark results (RTX 4070 Ti sm_89, 512×512):**
+**Benchmark results (RTX 4070 Ti sm_89, 512×512, measured):**
 
-| Stage | Before (CPU) | After (GPU) | Speedup |
-|-------|-------------|-------------|---------|
-| Text encoding (Qwen3-4B, first run) | ~96s | ~90s | 1.1× (bottlenecked by VRAM upload) |
-| Text encoding (cached prompt) | ~96s | ~0s | ∞ |
-| DiT denoising (4 steps) | ~0s | ~4s | (already GPU) |
-| VAE decode | **~151s** | **~23s** | **6.5×** |
-| **Total (first run)** | **247s** | **117s** | **2.1×** |
-| **Total (cached prompt)** | N/A | ~27s | — |
+| Stage | Time |
+|-------|------|
+| Text encoding (Qwen3-4B, 35 layers) | ~97s |
+| DiT denoising (4 steps) | ~3s |
+| VAE decode | ~26s |
+| **Total (cold start, CLI)** | **~126s** |
+| **Total (cached prompt, server mode)** | **~29s** |
 
-VAE speedup is 6.5× on first run (includes initial weight upload). Subsequent decodes with weights already in VRAM: ~2s.
+Prompt cache benefit (~97s) applies only within a single process lifetime (e.g., the API server generating multiple images with the same prompt). Each new CLI invocation re-encodes.
 
 All 207 tests pass.
 
@@ -2129,13 +2128,16 @@ The staging copy is **synchronous** (not async) to avoid a race condition: a sin
 #### 5. Ones Cache (`_onesCache`)
 Unmodulated (non-timestep-conditioned) transformer blocks created a `new float[3840]` array on every block call. `_onesCache` is a single pre-allocated field reused across all calls in the same forward pass.
 
-**Benchmark results (RTX 4070 Ti sm_89, 512×512, 4 steps):**
+**Measured results (RTX 4070 Ti sm_89, 512×512, 4 steps, post-optimization):**
 
-| Stage | Before | After | Δ |
-|-------|--------|-------|---|
-| DiT denoising (4 steps) | ~18s | ~4s | **4.5×** |
-| VAE decode (warm) | ~23s | ~2s | **11.5×** |
-| **Total (cached prompt)** | **~41s** | **~6s** | **6.8×** |
+| Stage | Time |
+|-------|------|
+| Text encoding (35 layers) | ~97s |
+| DiT denoising (4 steps) | ~3s |
+| VAE decode | ~26s |
+| **Total (cold start)** | **~126s** |
+
+Pre-optimization baseline not measured (optimizations implemented alongside the pipeline). Per-stage improvement comes from eliminating ~360 `cudaMalloc`/`cudaFree` pairs (pool), zero-copy DMA (pinned staging), and avoiding redundant weight uploads (fp16 cache).
 
 All 207 tests pass.
 
