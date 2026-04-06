@@ -126,39 +126,48 @@ internal static class DiffusionOps
         int outW = (inW + 2 * padding - kW) / stride + 1;
         var output = new float[n * outC * outH * outW];
 
-        for (int b = 0; b < n; b++)
-        {
-            for (int oc = 0; oc < outC; oc++)
-            {
-                float biasVal = bias is not null ? bias[oc] : 0f;
-                int outBase = b * outC * outH * outW + oc * outH * outW;
+        int hw = outH * outW;
+        int inHW = inH * inW;
 
-                for (int oh = 0; oh < outH; oh++)
+        Parallel.For(0, n * outC, bo =>
+        {
+            int b  = bo / outC;
+            int oc = bo % outC;
+
+            float biasVal = bias is not null ? bias[oc] : 0f;
+            int outBase = b * outC * hw + oc * hw;
+            int kBase0  = oc * inC * kH * kW;
+            int inBatch = b * inC * inHW;
+
+            for (int oh = 0; oh < outH; oh++)
+            {
+                int ih0 = oh * stride - padding;
+                for (int ow2 = 0; ow2 < outW; ow2++)
                 {
-                    for (int ow = 0; ow < outW; ow++)
+                    int iw0 = ow2 * stride - padding;
+                    float sum = biasVal;
+                    for (int ic = 0; ic < inC; ic++)
                     {
-                        float sum = biasVal;
-                        for (int ic = 0; ic < inC; ic++)
+                        int kBase = kBase0 + ic * kH * kW;
+                        int inBase = inBatch + ic * inHW;
+                        for (int kh = 0; kh < kH; kh++)
                         {
-                            int kBase = (oc * inC + ic) * kH * kW;
-                            int inBase = b * inC * inH * inW + ic * inH * inW;
-                            for (int kh = 0; kh < kH; kh++)
+                            int ih = ih0 + kh;
+                            if ((uint)ih >= (uint)inH) continue;
+                            int inRow = inBase + ih * inW;
+                            int kRow  = kBase + kh * kW;
+                            for (int kw = 0; kw < kW; kw++)
                             {
-                                int ih = oh * stride - padding + kh;
-                                if ((uint)ih >= (uint)inH) continue;
-                                for (int kw = 0; kw < kW; kw++)
-                                {
-                                    int iw = ow * stride - padding + kw;
-                                    if ((uint)iw >= (uint)inW) continue;
-                                    sum += input[inBase + ih * inW + iw] * kernel[kBase + kh * kW + kw];
-                                }
+                                int iw = iw0 + kw;
+                                if ((uint)iw >= (uint)inW) continue;
+                                sum += input[inRow + iw] * kernel[kRow + kw];
                             }
                         }
-                        output[outBase + oh * outW + ow] = sum;
                     }
+                    output[outBase + oh * outW + ow2] = sum;
                 }
             }
-        }
+        });
         return output;
     }
 

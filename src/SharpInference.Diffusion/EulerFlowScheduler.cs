@@ -8,7 +8,7 @@ namespace SharpInference.Diffusion;
 /// The velocity field v(x,t) ≈ x_data - x_noise points from noise toward data.
 ///
 /// Euler step:  x_{t-dt} = x_t - dt * v_predicted
-/// (equivalently: x_{t-dt} = x_t + dt * (x_t - v*t), but the above is canonical)
+/// (dt > 0; equivalently, since our scheduler uses dt = tNext-t < 0: x -= dt*v)
 ///
 /// FLUX.1-schnell default: 4 steps, linear schedule from t=1 → t=0.
 /// FLUX.1-dev:             28 steps with optional time-shifting.
@@ -69,9 +69,12 @@ public sealed class EulerFlowScheduler
             // Predict velocity
             var v = ditForward(x, t);
 
-            // Euler step: x_next = x + dt * v
+            // Euler step (flow matching, backward integration):
+            //   x_{t-Δt} = x_t - Δt * v   (Δt > 0, subtracting the velocity)
+            // With dt = tNext - t < 0: x_new = x - dt * v = x + |dt| * v
+            // This moves x toward the data (clean image) direction.
             for (int j = 0; j < x.Length; j++)
-                x[j] += dt * v[j];
+                x[j] -= dt * v[j];
 
             progress?.Invoke(i + 1, n);
         }
@@ -82,6 +85,7 @@ public sealed class EulerFlowScheduler
     /// Pack image latent [1, C, H, W] into sequence of patches [nPatches, patchDim].
     /// FLUX uses 2×2 patches over the latent spatial dims.
     /// patchDim = patchSize * patchSize * latentChannels = 2*2*16 = 64.
+    /// Ordering: channel-first (ch, ky, kx) — matches FLUX patchify convention.
     /// </summary>
     public static float[] PackLatent(float[] latent, int c, int h, int w, int patchSize = 2)
     {
@@ -140,6 +144,72 @@ public sealed class EulerFlowScheduler
                             int iw = pw * patchSize + kx;
                             latent[ch * h * w + ih * w + iw] = packed[packOff + flatIdx++];
                         }
+                    }
+                }
+            }
+        }
+        return latent;
+    }
+
+    /// <summary>
+    /// Pack image latent [C, H, W] → patches [nPatches, patchDim] with spatial-first ordering.
+    /// Z-Image patchify convention: permute(0,2,4,3,5,1) → (B,H//p,W//p,p,p,C) → flatten.
+    /// Each 64-dim patch = [pos(0,0)_allC, pos(0,1)_allC, pos(1,0)_allC, pos(1,1)_allC].
+    /// </summary>
+    public static float[] PackLatentSpatialFirst(float[] latent, int c, int h, int w, int patchSize = 2)
+    {
+        int pH = h / patchSize, pW = w / patchSize;
+        int patchDim = patchSize * patchSize * c;
+        int nPatches = pH * pW;
+        var packed = new float[nPatches * patchDim];
+
+        for (int ph = 0; ph < pH; ph++)
+        {
+            for (int pw = 0; pw < pW; pw++)
+            {
+                int patchIdx = ph * pW + pw;
+                int packOff  = patchIdx * patchDim;
+                int flatIdx  = 0;
+                for (int ky = 0; ky < patchSize; ky++)
+                {
+                    for (int kx = 0; kx < patchSize; kx++)
+                    {
+                        int ih = ph * patchSize + ky;
+                        int iw = pw * patchSize + kx;
+                        for (int ch = 0; ch < c; ch++)
+                            packed[packOff + flatIdx++] = latent[ch * h * w + ih * w + iw];
+                    }
+                }
+            }
+        }
+        return packed;
+    }
+
+    /// <summary>
+    /// Unpack patches [nPatches, patchDim] → latent [C, H, W] with spatial-first ordering.
+    /// Inverse of PackLatentSpatialFirst.
+    /// </summary>
+    public static float[] UnpackLatentSpatialFirst(float[] packed, int c, int h, int w, int patchSize = 2)
+    {
+        int pH = h / patchSize, pW = w / patchSize;
+        int patchDim = patchSize * patchSize * c;
+        var latent = new float[c * h * w];
+
+        for (int ph = 0; ph < pH; ph++)
+        {
+            for (int pw = 0; pw < pW; pw++)
+            {
+                int patchIdx = ph * pW + pw;
+                int packOff  = patchIdx * patchDim;
+                int flatIdx  = 0;
+                for (int ky = 0; ky < patchSize; ky++)
+                {
+                    for (int kx = 0; kx < patchSize; kx++)
+                    {
+                        int ih = ph * patchSize + ky;
+                        int iw = pw * patchSize + kx;
+                        for (int ch = 0; ch < c; ch++)
+                            latent[ch * h * w + ih * w + iw] = packed[packOff + flatIdx++];
                     }
                 }
             }

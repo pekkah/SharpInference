@@ -134,11 +134,12 @@ public sealed class ZImagePipeline : IDisposable
         // ── 3. Sample noise latent ────────────────────────────────────────
         var noiseLatent = EulerFlowScheduler.SampleNoise(_p.LatentChannels * latH * latW, seed);
 
-        // Pack into patches [nImg, 64]
-        var noisePacked = EulerFlowScheduler.PackLatent(noiseLatent, _p.LatentChannels, latH, latW, _p.PatchSize);
+        // Pack into patches [nImg, 64] — Z-Image uses spatial-first (ky,kx,ch) ordering
+        var noisePacked = EulerFlowScheduler.PackLatentSpatialFirst(noiseLatent, _p.LatentChannels, latH, latW, _p.PatchSize);
 
         // ── 4. Denoise with Euler flow scheduler ──────────────────────────
-        var scheduler = EulerFlowScheduler.Linear(steps, shift: 1.0f);
+        // Z-Image-Turbo uses shift=3 (from scheduler_config.json)
+        var scheduler = EulerFlowScheduler.Linear(steps, shift: 3.0f);
 
         var resultPacked = scheduler.Denoise(noisePacked, (patches, t) =>
         {
@@ -151,7 +152,7 @@ public sealed class ZImagePipeline : IDisposable
 
         // ── 5. Unpack and decode through VAE ──────────────────────────────
         progress?.Invoke(steps + 1, steps + 2);
-        var latent = EulerFlowScheduler.UnpackLatent(resultPacked, _p.LatentChannels, latH, latW, _p.PatchSize);
+        var latent = EulerFlowScheduler.UnpackLatentSpatialFirst(resultPacked, _p.LatentChannels, latH, latW, _p.PatchSize);
 
         // VaeDecoder.Decode() applies the FLUX VAE scaling internally:
         //   z = latent / 0.3611 + 0.1159

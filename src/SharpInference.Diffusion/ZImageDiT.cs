@@ -79,34 +79,40 @@ public sealed class ZImageDiT : IDisposable
         var txtHid = EmbedCap(txtEmbeds, nTxt);
         var adaln  = TimestepEmbed(t);           // [256]
 
-        // ── 2. Refine separately ──────────────────────────────────────────
-        // Context refiner: 2 unmodulated blocks on text
-        for (int r = 0; r < _p.NRefinerLayers; r++)
-            ApplyBlock($"context_refiner.{r}", txtHid, nTxt, null, null, false);
+        // ── 2. Build per-group RoPE freqs ─────────────────────────────────
+        // Refiners use separate img/txt freqs; main layers use combined [img, txt].
+        var imgFreqs = _rope.BuildFreqs(imgPosIds, nImg);
+        var txtFreqs = _rope.BuildFreqs(txtPosIds, nTxt);
 
-        // Noise refiner: 2 modulated blocks on image
+        // ── 3. Refine separately ──────────────────────────────────────────
+        // Context refiner: 2 unmodulated blocks on text tokens with text RoPE
         for (int r = 0; r < _p.NRefinerLayers; r++)
-            ApplyBlock($"noise_refiner.{r}", imgHid, nImg, null, adaln, true);
+            ApplyBlock($"context_refiner.{r}", txtHid, nTxt, txtFreqs, null, false);
 
-        // ── 3. Concatenate + RoPE ─────────────────────────────────────────
-        int nTotal = nTxt + nImg;
+        // Noise refiner: 2 modulated blocks on image tokens with image RoPE
+        for (int r = 0; r < _p.NRefinerLayers; r++)
+            ApplyBlock($"noise_refiner.{r}", imgHid, nImg, imgFreqs, adaln, true);
+
+        // ── 4. Concatenate + combined RoPE ────────────────────────────────
+        // Reference order: [img, txt] — image tokens first, text tokens after.
+        int nTotal = nImg + nTxt;
         var x = new float[nTotal * dim];
-        Array.Copy(txtHid, 0, x, 0,         nTxt * dim);
-        Array.Copy(imgHid, 0, x, nTxt * dim, nImg * dim);
+        Array.Copy(imgHid, 0, x, 0,         nImg * dim);
+        Array.Copy(txtHid, 0, x, nImg * dim, nTxt * dim);
 
-        // Build combined position IDs and RoPE freqs
-        var combinedPos = new int[(nTxt + nImg) * 3];
-        Array.Copy(txtPosIds, 0, combinedPos, 0,        nTxt * 3);
-        Array.Copy(imgPosIds, 0, combinedPos, nTxt * 3, nImg * 3);
+        // Build combined position IDs and RoPE freqs: [imgPos, txtPos]
+        var combinedPos = new int[(nImg + nTxt) * 3];
+        Array.Copy(imgPosIds, 0, combinedPos, 0,        nImg * 3);
+        Array.Copy(txtPosIds, 0, combinedPos, nImg * 3, nTxt * 3);
         var freqs = _rope.BuildFreqs(combinedPos, nTotal);
 
         // ── 4. 30 main transformer blocks ─────────────────────────────────
         for (int l = 0; l < _p.NLayers; l++)
             ApplyBlock($"layers.{l}", x, nTotal, freqs, adaln, true);
 
-        // ── 5. Extract image portion and apply final layer ─────────────────
+        // ── 5. Extract image portion (first nImg tokens) and apply final layer
         var imgOut = new float[nImg * dim];
-        Array.Copy(x, nTxt * dim, imgOut, 0, nImg * dim);
+        Array.Copy(x, 0, imgOut, 0, nImg * dim);
 
         return FinalLayer(imgOut, nImg, adaln);
     }
@@ -127,13 +133,16 @@ public sealed class ZImageDiT : IDisposable
 
     private float[] TimestepEmbed(float t)
     {
-        float tScaled = t * _p.TScale;
+        // Reference convention: t_model=0 at pure noise, t_model=1 at clean image.
+        // Our scheduler sigma=t: t=1 at noise, t=0 at clean.
+        // So t_model = 1 - t.
+        float tScaled = (1f - t) * _p.TScale;
         int   freqDim = 256;
         var   sinEmb  = new float[freqDim];
         int   half    = freqDim / 2;
         for (int i = 0; i < half; i++)
         {
-            float freq = MathF.Exp(-MathF.Log(10000f) * i / (half - 1));
+            float freq = MathF.Exp(-MathF.Log(10000f) * i / half);
             float v    = tScaled * freq;
             sinEmb[i]        = MathF.Cos(v);
             sinEmb[i + half] = MathF.Sin(v);

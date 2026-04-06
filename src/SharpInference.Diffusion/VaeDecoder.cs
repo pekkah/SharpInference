@@ -1,3 +1,5 @@
+using System.Numerics.Tensors;
+
 namespace SharpInference.Diffusion;
 
 /// <summary>
@@ -141,98 +143,78 @@ public sealed class VaeDecoder : IDisposable
         DiffusionOps.GroupNorm(normed, gnW, gnB, n, ch, h, w, groups: 32);
 
         int hw = h * w;
-        // Reshape to [B, hw, ch] for attention — iterate over batch
-        var q  = new float[n * hw * ch];
-        var k  = new float[n * hw * ch];
-        var v  = new float[n * hw * ch];
 
         var wQ  = _st.ReadF32($"{prefix}.to_q.weight"); // [ch, ch]
         var wK  = _st.ReadF32($"{prefix}.to_k.weight");
         var wV  = _st.ReadF32($"{prefix}.to_v.weight");
-
-        // Linear projection: normed is [n, ch, h, w] → treat each spatial pos as a token
-        for (int b = 0; b < n; b++)
-        for (int pos = 0; pos < hw; pos++)
-        {
-            // Build input vector at (b, pos): gather from [b, :, pos//w, pos%w]
-            int inOff = b * (ch * hw) + pos;
-            int outRowQ = (b * hw + pos) * ch;
-
-            for (int oc = 0; oc < ch; oc++)
-            {
-                float sumQ = 0f, sumK = 0f, sumV = 0f;
-                int wRow = oc * ch;
-                for (int ic = 0; ic < ch; ic++)
-                {
-                    float xVal = normed[b * ch * hw + ic * hw + pos];
-                    sumQ += wQ[wRow + ic] * xVal;
-                    sumK += wK[wRow + ic] * xVal;
-                    sumV += wV[wRow + ic] * xVal;
-                }
-                q[outRowQ + oc] = sumQ;
-                k[outRowQ + oc] = sumK;
-                v[outRowQ + oc] = sumV;
-            }
-        }
-
-        // Scaled dot-product attention [n, hw, hw]
-        float scale  = 1f / MathF.Sqrt(ch);
-        var   scores = new float[hw];
-        var   attnOut = new float[n * hw * ch];
-
-        for (int b = 0; b < n; b++)
-        for (int i = 0; i < hw; i++)
-        {
-            int qi = (b * hw + i) * ch;
-            for (int j = 0; j < hw; j++)
-            {
-                int kj = (b * hw + j) * ch;
-                float s = 0f;
-                for (int d = 0; d < ch; d++) s += q[qi + d] * k[kj + d];
-                scores[j] = s * scale;
-            }
-
-            // Softmax
-            float maxS = scores[0];
-            for (int j = 1; j < hw; j++) if (scores[j] > maxS) maxS = scores[j];
-            float sumExp = 0f;
-            for (int j = 0; j < hw; j++) { scores[j] = MathF.Exp(scores[j] - maxS); sumExp += scores[j]; }
-            for (int j = 0; j < hw; j++) scores[j] /= sumExp;
-
-            // Weighted V
-            int outI = (b * hw + i) * ch;
-            for (int d = 0; d < ch; d++)
-            {
-                float acc = 0f;
-                for (int j = 0; j < hw; j++) acc += scores[j] * v[(b * hw + j) * ch + d];
-                attnOut[outI + d] = acc;
-            }
-        }
-
-        // Output projection
         var wOut  = _st.ReadF32($"{prefix}.to_out.0.weight"); // [ch, ch]
         var bOut  = _st.ReadF32($"{prefix}.to_out.0.bias");
-        var proj  = new float[n * hw * ch];
+
+        float scale = 1f / MathF.Sqrt(ch);
+        var result = x.ToArray();
+
         for (int b = 0; b < n; b++)
-        for (int pos = 0; pos < hw; pos++)
         {
-            int rowOff = (b * hw + pos) * ch;
-            for (int oc = 0; oc < ch; oc++)
+            // Build Q, K, V via matrix multiply: normedT[hw, ch] @ W[ch, ch]^T → [hw, ch]
+            // normed is NCHW; transpose to [hw, ch] for matmul
+            var tokens = new float[hw * ch]; // [hw, ch]
+            for (int pos = 0; pos < hw; pos++)
+            for (int c2 = 0; c2 < ch; c2++)
+                tokens[pos * ch + c2] = normed[b * ch * hw + c2 * hw + pos];
+
+            var q = LinearHW(tokens, wQ, hw, ch);
+            var k = LinearHW(tokens, wK, hw, ch);
+            var v = LinearHW(tokens, wV, hw, ch);
+
+            // Attention: for each query row, dot with all key rows, softmax, weighted V sum
+            var attnOut = new float[hw * ch];
+            var scores  = new float[hw];
+
+            Parallel.For(0, hw, i =>
             {
-                float s = bOut[oc];
-                int wRow = oc * ch;
-                for (int ic = 0; ic < ch; ic++) s += wOut[wRow + ic] * attnOut[rowOff + ic];
-                proj[rowOff + oc] = s;
+                var qi = q.AsSpan(i * ch, ch);
+                var localScores = new float[hw];
+                for (int j = 0; j < hw; j++)
+                    localScores[j] = TensorPrimitives.Dot(qi, k.AsSpan(j * ch, ch)) * scale;
+
+                // Softmax
+                float maxS = TensorPrimitives.Max(localScores.AsSpan());
+                TensorPrimitives.Subtract(localScores.AsSpan(), maxS, localScores.AsSpan());
+                TensorPrimitives.Exp(localScores.AsSpan(), localScores.AsSpan());
+                TensorPrimitives.Divide(localScores.AsSpan(),
+                    TensorPrimitives.Sum(localScores.AsSpan()), localScores.AsSpan());
+
+                // Weighted V sum
+                var outRow = attnOut.AsSpan(i * ch, ch);
+                outRow.Clear();
+                for (int j = 0; j < hw; j++)
+                    TensorPrimitives.MultiplyAdd<float>(v.AsSpan(j * ch, ch), localScores[j], outRow, outRow);
+            });
+
+            // Output projection + residual (convert back to NCHW)
+            var proj = LinearHW(attnOut, wOut, hw, ch);
+            for (int pos = 0; pos < hw; pos++)
+            for (int c2 = 0; c2 < ch; c2++)
+            {
+                int nchwOff = b * ch * hw + c2 * hw + pos;
+                result[nchwOff] += proj[pos * ch + c2] + bOut[c2];
             }
         }
 
-        // Residual: convert proj back to [n, ch, h, w] and add to x
-        var result = x.ToArray();
-        for (int b = 0; b < n; b++)
-        for (int c2 = 0; c2 < ch; c2++)
-        for (int pos = 0; pos < hw; pos++)
-            result[b * ch * hw + c2 * hw + pos] += proj[(b * hw + pos) * ch + c2];
+        return result;
+    }
 
+    /// <summary>Matrix multiply tokens[hw, ch] @ W[ch, ch]^T → out[hw, ch].</summary>
+    private static float[] LinearHW(float[] tokens, float[] w, int hw, int ch)
+    {
+        var result = new float[hw * ch];
+        Parallel.For(0, hw, pos =>
+        {
+            var rowIn  = tokens.AsSpan(pos * ch, ch);
+            var rowOut = result.AsSpan(pos * ch, ch);
+            for (int oc = 0; oc < ch; oc++)
+                rowOut[oc] = TensorPrimitives.Dot(rowIn, w.AsSpan(oc * ch, ch));
+        });
         return result;
     }
 
