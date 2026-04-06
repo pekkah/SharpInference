@@ -31,6 +31,8 @@ public sealed class ZImageDiT : IDisposable
     private readonly Dictionary<string, Core.Tensor>? _gpuWeights;
     /// <summary>bf16 dequantized weights cached on GPU — uploaded once on first use, reused every step.</summary>
     private readonly Dictionary<string, Core.Tensor>? _gpuWeightsBf16;
+    /// <summary>fp16 dequantized weights cached on GPU — uploaded once on first use, reused every step.</summary>
+    private readonly Dictionary<string, Core.Tensor>? _gpuWeightsFp16;
     /// <summary>fp8 E4M3 weights cached on GPU — uploaded once on first use, reused every step (sm_89+).</summary>
     private readonly Dictionary<string, Core.Tensor>? _gpuWeightsFp8;
     private bool _disposed;
@@ -41,6 +43,9 @@ public sealed class ZImageDiT : IDisposable
     private int[]?   _cachedTxtPosIds;
     private float[]? _cachedTxtFreqs;
     private float[]? _cachedCombinedFreqs;
+
+    // Cached unit-scale / unit-gate arrays (unmodulated blocks use scale=1, gate=1)
+    private float[]? _onesCache;
 
     /// <summary>Minimum batch size to route a MatQ call through the GPU backend.</summary>
     private const int MinGpuBatch = 16;
@@ -56,6 +61,9 @@ public sealed class ZImageDiT : IDisposable
         // Cache bf16 weights on GPU so each weight is uploaded only once across all denoising steps.
         if (backend?.BestSgemmPrecision == SgemmPrecision.Bf16)
             _gpuWeightsBf16 = new Dictionary<string, Core.Tensor>(StringComparer.Ordinal);
+        // Cache fp16 weights on GPU — avoids re-dequantising + re-uploading every GEMM call.
+        if (backend?.BestSgemmPrecision == SgemmPrecision.Fp16)
+            _gpuWeightsFp16 = new Dictionary<string, Core.Tensor>(StringComparer.Ordinal);
         // Cache fp8 weights on GPU (sm_89+, 2× smaller than bf16, use fp8 tensor cores).
         if (backend?.BestSgemmPrecision == SgemmPrecision.Fp8E4M3)
             _gpuWeightsFp8 = new Dictionary<string, Core.Tensor>(StringComparer.Ordinal);
@@ -201,8 +209,9 @@ public sealed class ZImageDiT : IDisposable
         }
         else
         {
-            scaleMsa = scaleMlp = Ones(dim);
-            gateMsa  = gateMlp  = Ones(dim);
+            var ones = _onesCache ??= Ones(dim);
+            scaleMsa = scaleMlp = ones;
+            gateMsa  = gateMlp  = ones;
         }
 
         // ── Attention sub-block ───────────────────────────────────────────
@@ -271,19 +280,19 @@ public sealed class ZImageDiT : IDisposable
         int nHeads  = _p.NHeads;
         int headDim = _p.HeadDim;
 
-        // Fused QKV: [nTok, 3*dim] — split into separate q, k, v
+        // Fused QKV: [nTok, 3*dim] — split into separate q, k, v in parallel
         var qkv = MatQ(x, nTok, dim, $"{prefix}.attention.qkv.weight", 3 * dim);
         var q = new float[nTok * dim];
         var k = new float[nTok * dim];
         var v = new float[nTok * dim];
-        for (int tok = 0; tok < nTok; tok++)
+        Parallel.For(0, nTok, tok =>
         {
             int srcOff = tok * 3 * dim;
             int dstOff = tok * dim;
             qkv.AsSpan(srcOff,           dim).CopyTo(q.AsSpan(dstOff));
             qkv.AsSpan(srcOff + dim,     dim).CopyTo(k.AsSpan(dstOff));
             qkv.AsSpan(srcOff + 2 * dim, dim).CopyTo(v.AsSpan(dstOff));
-        }
+        });
 
         // Per-head QK norm
         var qNormW = W($"{prefix}.attention.q_norm.weight");
@@ -624,40 +633,52 @@ public sealed class ZImageDiT : IDisposable
                 }
                 else if (_backend.BestSgemmPrecision == SgemmPrecision.Fp16)
                 {
-                    // fp16-weight GPU path: A=fp32 activations (no overflow), B=fp16 weights (bandwidth), C=fp32
+                    // fp16-weight GPU path: A=fp32 activations (no overflow), B=fp16 weights (bandwidth), C=fp32.
+                    // Weights are dequantised once and cached on GPU, reused every denoising step.
                     int wCount = rows * cols;
-                    float[] wBuf32 = ArrayPool<float>.Shared.Rent(wCount);
-                    Half[] wHalf   = ArrayPool<Half>.Shared.Rent(wCount);
-                    try
+
+                    Core.Tensor wGpu;
+                    if (_gpuWeightsFp16 != null && (dtype == DType.Q5_K || dtype == DType.Q4_K) &&
+                        _gpuWeightsFp16.TryGetValue(wName, out var cachedW16))
                     {
-                        Dequantize.ToFloat32(
-                            new ReadOnlySpan<byte>((byte*)ptr, (int)byteLen),
-                            wBuf32.AsSpan(0, wCount), dtype, wCount);
-
-                        int xCount = n * cols;
-                        for (int i = 0; i < wCount; i++) wHalf[i] = (Half)wBuf32[i];
-
-                        // Upload activations as fp32 — avoids overflow for large intermediates
-                        var xGpu = _backend.Upload(x.AsSpan(0, xCount), TensorShape.D1(xCount));
-                        var wGpu = _backend.UploadHalf(wHalf.AsSpan(0, wCount), TensorShape.D1(wCount));
-                        var cGpu = _backend.Allocate(TensorShape.D1(n * rows), DType.Float32);
+                        wGpu = cachedW16;
+                    }
+                    else
+                    {
+                        float[] wBuf32 = ArrayPool<float>.Shared.Rent(wCount);
+                        Half[]  wHalf  = ArrayPool<Half>.Shared.Rent(wCount);
                         try
                         {
-                            _backend.Sgemm(cGpu, xGpu, wGpu, n, cols, rows);
-                            _backend.Synchronize();
-                            _backend.Download(cGpu, result.AsSpan());
+                            Dequantize.ToFloat32(
+                                new ReadOnlySpan<byte>((byte*)ptr, (int)byteLen),
+                                wBuf32.AsSpan(0, wCount), dtype, wCount);
+                            for (int i = 0; i < wCount; i++) wHalf[i] = (Half)wBuf32[i];
+                            wGpu = _backend.UploadHalf(wHalf.AsSpan(0, wCount), TensorShape.D1(wCount));
                         }
                         finally
                         {
-                            _backend.Free(xGpu);
-                            _backend.Free(wGpu);
-                            _backend.Free(cGpu);
+                            ArrayPool<float>.Shared.Return(wBuf32);
+                            ArrayPool<Half>.Shared.Return(wHalf);
                         }
+                        if (_gpuWeightsFp16 != null && (dtype == DType.Q5_K || dtype == DType.Q4_K))
+                            _gpuWeightsFp16[wName] = wGpu;
+                    }
+
+                    bool ownW16 = _gpuWeightsFp16 == null || !_gpuWeightsFp16.ContainsKey(wName);
+                    int xCount16 = n * cols;
+                    var xGpu16 = _backend.Upload(x.AsSpan(0, xCount16), TensorShape.D1(xCount16));
+                    var cGpu16 = _backend.Allocate(TensorShape.D1(n * rows), DType.Float32);
+                    try
+                    {
+                        _backend.Sgemm(cGpu16, xGpu16, wGpu, n, cols, rows);
+                        _backend.Synchronize();
+                        _backend.Download(cGpu16, result.AsSpan());
                     }
                     finally
                     {
-                        ArrayPool<float>.Shared.Return(wBuf32);
-                        ArrayPool<Half>.Shared.Return(wHalf);
+                        _backend.Free(xGpu16);
+                        _backend.Free(cGpu16);
+                        if (ownW16) _backend.Free(wGpu);
                     }
                 }
                 else
@@ -750,6 +771,12 @@ public sealed class ZImageDiT : IDisposable
                 foreach (var t in _gpuWeightsBf16.Values)
                     _backend.Free(t);
                 _gpuWeightsBf16.Clear();
+            }
+            if (_gpuWeightsFp16 != null && _backend != null)
+            {
+                foreach (var t in _gpuWeightsFp16.Values)
+                    _backend.Free(t);
+                _gpuWeightsFp16.Clear();
             }
             if (_gpuWeightsFp8 != null && _backend != null)
             {

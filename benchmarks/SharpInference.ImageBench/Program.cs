@@ -1,8 +1,18 @@
 using System.Diagnostics;
+using BenchmarkDotNet.Running;
 using SharpInference.Core;
 using SharpInference.Cpu;
 using SharpInference.Cuda;
 using SharpInference.Diffusion;
+using SharpInference.ImageBench;
+
+// ── BenchmarkDotNet micro benchmarks ─────────────────────────────────────────
+if (args.Length > 0 && args[0] == "--bench")
+{
+    BenchmarkSwitcher.FromAssembly(typeof(CudaTransferBenchmarks).Assembly)
+                     .Run(args[1..]);
+    return 0;
+}
 
 // ── Locate model files ────────────────────────────────────────────────────────
 

@@ -20,7 +20,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
     private readonly SgemmPrecision _precision;
     private readonly int _smVersion;
     private readonly nint _stream;
-    private readonly ConcurrentDictionary<nint, nint> _devPtrs = new();
+    private readonly ConcurrentDictionary<nint, (nint devPtr, nuint byteSize)> _devPtrs = new();
     private long _nextHandle = 1;
 
     // Pinned host staging buffer for DMA-capable async H2D/D2H transfers.
@@ -28,6 +28,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
     private nint   _pinnedBuf;
     private nuint  _pinnedBufSize;
     private const nuint InitialPinnedSize = 32 * 1024 * 1024; // 32 MB
+
+    // GPU buffer pool: reuse device allocations by rounded size to avoid cudaMalloc overhead.
+    // Each MatQ call (GEMM) does 2 alloc+free cycles; pooling eliminates driver round-trips.
+    private readonly GpuBufferPool _pool = new();
 
     private bool _disposed;
 
@@ -121,34 +125,38 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
     public Tensor Allocate(TensorShape shape, DType dtype = DType.Float32)
     {
         nuint byteSize = (nuint)(shape.ElementCount * DTypeInfo.BytesPerElement(dtype));
-        int status = CuBlasInterop.CudaMalloc(out nint devPtr, byteSize);
-        if (status != 0)
-            throw new InvalidOperationException($"cudaMalloc failed: {status}");
+        nint devPtr = _pool.Rent(byteSize);
+        if (devPtr == nint.Zero)
+        {
+            int status = CuBlasInterop.CudaMalloc(out devPtr, byteSize);
+            if (status != 0)
+                throw new InvalidOperationException($"cudaMalloc failed: {status}");
+        }
         var handle = (nint)Interlocked.Increment(ref _nextHandle);
-        _devPtrs[handle] = devPtr;
+        _devPtrs[handle] = (devPtr, byteSize);
         return new Tensor(shape, dtype, handle);
     }
 
     public void Free(Tensor tensor)
     {
-        if (_devPtrs.TryRemove(tensor.Handle, out nint devPtr))
-            CuBlasInterop.CudaFree(devPtr);
+        if (_devPtrs.TryRemove(tensor.Handle, out var entry))
+            _pool.Return(entry.byteSize, entry.devPtr);
     }
 
     public Tensor Upload(ReadOnlySpan<float> data, TensorShape shape)
     {
         nuint byteSize = (nuint)(data.Length * sizeof(float));
-        int status = CuBlasInterop.CudaMalloc(out nint devPtr, byteSize);
-        if (status != 0)
-            throw new InvalidOperationException($"cudaMalloc failed: {status}");
-        fixed (float* src = data)
+        nint devPtr = _pool.Rent(byteSize);
+        if (devPtr == nint.Zero)
         {
-            status = CuBlasInterop.CudaMemcpy(devPtr, (nint)src, byteSize, CuBlasInterop.HostToDevice);
+            int status = CuBlasInterop.CudaMalloc(out devPtr, byteSize);
             if (status != 0)
-                throw new InvalidOperationException($"cudaMemcpy H2D failed: {status}");
+                throw new InvalidOperationException($"cudaMalloc failed: {status}");
         }
+        fixed (float* src = data)
+            UploadViaStaging(devPtr, src, byteSize);
         var handle = (nint)Interlocked.Increment(ref _nextHandle);
-        _devPtrs[handle] = devPtr;
+        _devPtrs[handle] = (devPtr, byteSize);
         return new Tensor(shape, DType.Float32, handle);
     }
 
@@ -157,27 +165,23 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
         nint devPtr = GetDevPtr(src);
         nuint byteSize = (nuint)(dst.Length * sizeof(float));
         fixed (float* d = dst)
-        {
-            int status = CuBlasInterop.CudaMemcpy((nint)d, devPtr, byteSize, CuBlasInterop.DeviceToHost);
-            if (status != 0)
-                throw new InvalidOperationException($"cudaMemcpy D2H failed: {status}");
-        }
+            DownloadViaStaging(d, devPtr, byteSize);
     }
 
     public Tensor UploadHalf(ReadOnlySpan<Half> data, TensorShape shape)
     {
         nuint byteSize = (nuint)(data.Length * 2);
-        int status = CuBlasInterop.CudaMalloc(out nint devPtr, byteSize);
-        if (status != 0)
-            throw new InvalidOperationException($"cudaMalloc failed: {status}");
-        fixed (Half* src = data)
+        nint devPtr = _pool.Rent(byteSize);
+        if (devPtr == nint.Zero)
         {
-            status = CuBlasInterop.CudaMemcpy(devPtr, (nint)src, byteSize, CuBlasInterop.HostToDevice);
+            int status = CuBlasInterop.CudaMalloc(out devPtr, byteSize);
             if (status != 0)
-                throw new InvalidOperationException($"cudaMemcpy H2D (fp16) failed: {status}");
+                throw new InvalidOperationException($"cudaMalloc failed: {status}");
         }
+        fixed (Half* src = data)
+            UploadViaStaging(devPtr, src, byteSize);
         var handle = (nint)Interlocked.Increment(ref _nextHandle);
-        _devPtrs[handle] = devPtr;
+        _devPtrs[handle] = (devPtr, byteSize);
         return new Tensor(shape, DType.Float16, handle);
     }
 
@@ -185,27 +189,23 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
     {
         nint devPtr = GetDevPtr(src);
         fixed (Half* d = dst)
-        {
-            int status = CuBlasInterop.CudaMemcpy((nint)d, devPtr, (nuint)(dst.Length * 2), CuBlasInterop.DeviceToHost);
-            if (status != 0)
-                throw new InvalidOperationException($"cudaMemcpy D2H (fp16) failed: {status}");
-        }
+            DownloadViaStaging(d, devPtr, (nuint)(dst.Length * 2));
     }
 
     public Tensor UploadBf16(ReadOnlySpan<ushort> data, TensorShape shape)
     {
         nuint byteSize = (nuint)(data.Length * 2);
-        int status = CuBlasInterop.CudaMalloc(out nint devPtr, byteSize);
-        if (status != 0)
-            throw new InvalidOperationException($"cudaMalloc failed: {status}");
-        fixed (ushort* src = data)
+        nint devPtr = _pool.Rent(byteSize);
+        if (devPtr == nint.Zero)
         {
-            status = CuBlasInterop.CudaMemcpy(devPtr, (nint)src, byteSize, CuBlasInterop.HostToDevice);
+            int status = CuBlasInterop.CudaMalloc(out devPtr, byteSize);
             if (status != 0)
-                throw new InvalidOperationException($"cudaMemcpy H2D (bf16) failed: {status}");
+                throw new InvalidOperationException($"cudaMalloc failed: {status}");
         }
+        fixed (ushort* src = data)
+            UploadViaStaging(devPtr, src, byteSize);
         var handle = (nint)Interlocked.Increment(ref _nextHandle);
-        _devPtrs[handle] = devPtr;
+        _devPtrs[handle] = (devPtr, byteSize);
         return new Tensor(shape, DType.BFloat16, handle);
     }
 
@@ -213,27 +213,23 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
     {
         nint devPtr = GetDevPtr(src);
         fixed (ushort* d = dst)
-        {
-            int status = CuBlasInterop.CudaMemcpy((nint)d, devPtr, (nuint)(dst.Length * 2), CuBlasInterop.DeviceToHost);
-            if (status != 0)
-                throw new InvalidOperationException($"cudaMemcpy D2H (bf16) failed: {status}");
-        }
+            DownloadViaStaging(d, devPtr, (nuint)(dst.Length * 2));
     }
 
     public Tensor UploadFp8(ReadOnlySpan<byte> data, TensorShape shape)
     {
         nuint byteSize = (nuint)data.Length;
-        int status = CuBlasInterop.CudaMalloc(out nint devPtr, byteSize);
-        if (status != 0)
-            throw new InvalidOperationException($"cudaMalloc failed: {status}");
-        fixed (byte* src = data)
+        nint devPtr = _pool.Rent(byteSize);
+        if (devPtr == nint.Zero)
         {
-            status = CuBlasInterop.CudaMemcpy(devPtr, (nint)src, byteSize, CuBlasInterop.HostToDevice);
+            int status = CuBlasInterop.CudaMalloc(out devPtr, byteSize);
             if (status != 0)
-                throw new InvalidOperationException($"cudaMemcpy H2D (fp8) failed: {status}");
+                throw new InvalidOperationException($"cudaMalloc failed: {status}");
         }
+        fixed (byte* src = data)
+            UploadViaStaging(devPtr, src, byteSize);
         var handle = (nint)Interlocked.Increment(ref _nextHandle);
-        _devPtrs[handle] = devPtr;
+        _devPtrs[handle] = (devPtr, byteSize);
         return new Tensor(shape, DType.Float8E4M3, handle);
     }
 
@@ -241,11 +237,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
     {
         nint devPtr = GetDevPtr(src);
         fixed (byte* d = dst)
-        {
-            int status = CuBlasInterop.CudaMemcpy((nint)d, devPtr, (nuint)dst.Length, CuBlasInterop.DeviceToHost);
-            if (status != 0)
-                throw new InvalidOperationException($"cudaMemcpy D2H (fp8) failed: {status}");
-        }
+            DownloadViaStaging(d, devPtr, (nuint)dst.Length);
     }
 
     public Tensor UploadRaw(ReadOnlySpan<byte> data, TensorShape shape, DType dtype) =>
@@ -439,8 +431,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
     // ── Helpers ───────────────────────────────────────────────────────────
 
     private nint GetDevPtr(Tensor tensor) =>
-        _devPtrs.TryGetValue(tensor.Handle, out nint ptr)
-            ? ptr
+        _devPtrs.TryGetValue(tensor.Handle, out var entry)
+            ? entry.devPtr
             : throw new InvalidOperationException($"Tensor handle {tensor.Handle} not registered in CudaBackend");
 
     // ── Disposal ──────────────────────────────────────────────────────────
@@ -450,9 +442,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
         if (_disposed) return;
         _disposed = true;
 
-        foreach (var devPtr in _devPtrs.Values)
-            CuBlasInterop.CudaFree(devPtr);
+        foreach (var entry in _devPtrs.Values)
+            CuBlasInterop.CudaFree(entry.devPtr);
         _devPtrs.Clear();
+
+        _pool.Dispose();
 
         CuBlasInterop.Destroy(_handle);
 
@@ -461,5 +455,54 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
 
         if (_pinnedBuf != nint.Zero)
             CuBlasInterop.FreeHost(_pinnedBuf);
+    }
+}
+
+/// <summary>
+/// Pool of reusable CUDA device buffers keyed by rounded allocation size.
+/// Eliminates the cudaMalloc/cudaFree overhead on the hot path (one pair per GEMM call).
+/// Sizes are rounded up to the next power-of-two to maximise reuse across different shapes.
+/// Thread-safe via per-bucket ConcurrentStack.
+/// </summary>
+internal sealed class GpuBufferPool : IDisposable
+{
+    // One stack of available device pointers per power-of-two bucket.
+    private readonly ConcurrentDictionary<nuint, ConcurrentStack<nint>> _buckets = new();
+    private bool _disposed;
+
+    /// <summary>Return a device pointer of at least <paramref name="byteSize"/> bytes, or Zero if none available.</summary>
+    public nint Rent(nuint byteSize)
+    {
+        nuint bucket = NextPow2(byteSize);
+        if (_buckets.TryGetValue(bucket, out var stack) && stack.TryPop(out nint ptr))
+            return ptr;
+        return nint.Zero;
+    }
+
+    /// <summary>Return a device pointer to the pool. <paramref name="exactSize"/> must be the original allocation size.</summary>
+    public void Return(nuint exactSize, nint devPtr)
+    {
+        if (devPtr == nint.Zero || _disposed) { CuBlasInterop.CudaFree(devPtr); return; }
+        nuint bucket = NextPow2(exactSize);
+        _buckets.GetOrAdd(bucket, _ => new ConcurrentStack<nint>()).Push(devPtr);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        foreach (var stack in _buckets.Values)
+            while (stack.TryPop(out nint ptr))
+                CuBlasInterop.CudaFree(ptr);
+        _buckets.Clear();
+    }
+
+    private static nuint NextPow2(nuint v)
+    {
+        if (v == 0) return 1;
+        v--;
+        v |= v >> 1; v |= v >> 2; v |= v >> 4;
+        v |= v >> 8; v |= v >> 16; v |= v >> 32;
+        return v + 1;
     }
 }

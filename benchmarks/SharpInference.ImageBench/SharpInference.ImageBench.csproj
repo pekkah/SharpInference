@@ -9,6 +9,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" Version="0.15.8" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\SharpInference.Diffusion\SharpInference.Diffusion.csproj" />
     <ProjectReference Include="..\..\src\SharpInference.Cuda\SharpInference.Cuda.csproj" />
     <ProjectReference Include="..\..\src\SharpInference.Cpu\SharpInference.Cpu.csproj" />
