@@ -8,6 +8,7 @@ namespace SharpInference.Cuda;
 /// CUDA/cuBLAS compute backend for DiT SGEMM acceleration.
 /// Manages CUDA device memory and dispatches cuBLAS GemmEx kernels.
 /// Precision is auto-detected at creation time:
+///   sm_90+ (Hopper/H100) + CUDA 12 → fp8 E4M3 (cublasGemmEx fp8 requires sm_90)
 ///   sm_80+ (Ampere/RTX 30xx) → bf16 inputs, fp32 accumulation (no overflow, 2× smaller than fp32)
 ///   sm_53+ (Pascal/any CUDA GPU) → fp16 inputs, fp32 accumulation (avoids fp16 accum overflow)
 ///   fallback → fp32
@@ -17,8 +18,17 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
 {
     private readonly nint _handle;
     private readonly SgemmPrecision _precision;
+    private readonly int _smVersion;
+    private readonly nint _stream;
     private readonly ConcurrentDictionary<nint, nint> _devPtrs = new();
     private long _nextHandle = 1;
+
+    // Pinned host staging buffer for DMA-capable async H2D/D2H transfers.
+    // Grows on demand; never shrinks (amortised over the pipeline lifetime).
+    private nint   _pinnedBuf;
+    private nuint  _pinnedBufSize;
+    private const nuint InitialPinnedSize = 32 * 1024 * 1024; // 32 MB
+
     private bool _disposed;
 
     public string Name => $"CUDA GPU (cuBLAS, {_precision})";
@@ -27,10 +37,15 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
 
     public bool SupportsGpuDequant => false;
 
-    private CudaBackend(nint handle, SgemmPrecision precision)
+    private CudaBackend(nint handle, SgemmPrecision precision, int smVersion, nint stream,
+                        nint pinnedBuf, nuint pinnedBufSize)
     {
-        _handle    = handle;
-        _precision = precision;
+        _handle        = handle;
+        _precision     = precision;
+        _smVersion     = smVersion;
+        _stream        = stream;
+        _pinnedBuf     = pinnedBuf;
+        _pinnedBufSize = pinnedBufSize;
     }
 
     public static bool IsAvailable()
@@ -45,28 +60,48 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
     }
 
     /// <summary>Create a CudaBackend, auto-detecting the best supported precision.</summary>
-    public static CudaBackend Create()
+    public static CudaBackend Create() => Create(precision: null);
+
+    /// <summary>
+    /// Create a CudaBackend with an explicit precision override.
+    /// Useful for benchmarking or testing a specific SGEMM path regardless of device capability.
+    /// </summary>
+    public static CudaBackend Create(SgemmPrecision forcedPrecision) => Create(precision: forcedPrecision);
+
+    private static CudaBackend Create(SgemmPrecision? precision)
     {
         int status = CuBlasInterop.Create(out nint handle);
         if (status != 0)
             throw new InvalidOperationException($"cublasCreate failed: {status}");
 
-        var precision = DetectBestPrecision(handle);
-        return new CudaBackend(handle, precision);
-    }
-
-    private static unsafe SgemmPrecision DetectBestPrecision(nint handle)
-    {
-        // Query compute capability of device 0
+        int smVersion = 0;
         if (CuBlasInterop.DeviceGetAttribute(out int major, CuBlasInterop.CudaDevAttrComputeCapabilityMajor, 0) == 0 &&
             CuBlasInterop.DeviceGetAttribute(out int minor, CuBlasInterop.CudaDevAttrComputeCapabilityMinor, 0) == 0)
-        {
-            int sm = major * 10 + minor;
-            if (sm >= 89 && IsCuda12OrNewer())
-                return SgemmPrecision.Fp8E4M3; // Ada Lovelace+ with CUDA 12+ fp8 tensor cores
-            if (sm >= 80) return SgemmPrecision.Bf16;    // Ampere+ has native bf16
-            if (sm >= 53) return SgemmPrecision.Fp16;    // Pascal+ supports fp16 GemmEx
-        }
+            smVersion = major * 10 + minor;
+
+        // Dedicated CUDA stream — all memcpy and GEMM are enqueued on this stream,
+        // so cudaStreamSynchronize(stream) waits only for our work (not the whole device).
+        if (CuBlasInterop.StreamCreate(out nint stream) != 0)
+            stream = nint.Zero; // fall back to default stream
+
+        if (stream != nint.Zero)
+            CuBlasInterop.SetStream(handle, stream);
+
+        // Pinned (page-locked) staging buffer for DMA-capable async H2D/D2H transfers.
+        CuBlasInterop.MallocHost(out nint pinnedBuf, InitialPinnedSize);
+
+        var resolvedPrecision = precision ?? DetectBestPrecision(smVersion);
+        return new CudaBackend(handle, resolvedPrecision, smVersion, stream, pinnedBuf, InitialPinnedSize);
+    }
+
+    private static SgemmPrecision DetectBestPrecision(int sm)
+    {
+        // fp8 via cublasGemmEx requires sm_90+ (Hopper). Ada Lovelace (sm_89) only supports
+        // fp8 through cublasLt (light), not the standard cublasGemmEx API.
+        if (sm >= 90 && IsCuda12OrNewer())
+            return SgemmPrecision.Fp8E4M3;
+        if (sm >= 80) return SgemmPrecision.Bf16;    // Ampere+ has native bf16
+        if (sm >= 53) return SgemmPrecision.Fp16;    // Pascal+ supports fp16 GemmEx
         return SgemmPrecision.Fp32;
     }
 
@@ -245,8 +280,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
         if (cudaTypeA != CuBlasInterop.CUDA_R_32F || cudaTypeB != CuBlasInterop.CUDA_R_32F)
         {
             // fp16, bf16, or fp8: use GemmEx with fp32 accumulation.
-            // fp8 E4M3 requires both A and B to be fp8 (mixed fp8+bf16 needs cublasLt).
+            // fp8 E4M3 requires: both A and B fp8, and C must be bf16 or fp16 (not fp32).
             // fp16/bf16 use fp32 accumulation to avoid overflow on large DiT residuals.
+            if (cudaTypeA == CuBlasInterop.CUDA_R_8F_E4M3 && cudaTypeC == CuBlasInterop.CUDA_R_32F)
+                throw new InvalidOperationException(
+                    "fp8 GemmEx: cuBLAS requires bf16/fp16 output (not fp32) when inputs are fp8. " +
+                    "Allocate C as DType.BFloat16 and use DownloadBf16.");
+
             int status = CuBlasInterop.GemmEx(
                 _handle,
                 CuBlasInterop.OpT, CuBlasInterop.OpN,
@@ -260,6 +300,24 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
                 CuBlasInterop.CUBLAS_GEMM_DEFAULT);
             if (status != 0)
                 throw new InvalidOperationException($"cublasGemmEx failed: {status}");
+        }
+        else if (_smVersion >= 80)
+        {
+            // Ampere+ with fp32 inputs: use TF32 tensor cores (~8× vs cublasSgemm).
+            // TF32 has 10-bit mantissa (same as bf16) with fp32 range — no accuracy loss for DiT inference.
+            int status = CuBlasInterop.GemmEx(
+                _handle,
+                CuBlasInterop.OpT, CuBlasInterop.OpN,
+                N, M, K,
+                ref alpha,
+                bPtr, CuBlasInterop.CUDA_R_32F, K,
+                aPtr, CuBlasInterop.CUDA_R_32F, K,
+                ref beta,
+                cPtr, CuBlasInterop.CUDA_R_32F, N,
+                CuBlasInterop.CUBLAS_COMPUTE_32F_FAST_TF32,
+                CuBlasInterop.CUBLAS_GEMM_DEFAULT);
+            if (status != 0)
+                throw new InvalidOperationException($"cublasGemmEx (TF32) failed: {status}");
         }
         else
         {
@@ -285,9 +343,70 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
 
     public void Synchronize()
     {
-        int status = CuBlasInterop.DeviceSync();
+        int status = _stream != nint.Zero
+            ? CuBlasInterop.StreamSynchronize(_stream)
+            : CuBlasInterop.DeviceSync();
         if (status != 0)
-            throw new InvalidOperationException($"cudaDeviceSynchronize failed: {status}");
+            throw new InvalidOperationException($"CUDA synchronize failed: {status}");
+    }
+
+    // ── Pinned staging buffer ─────────────────────────────────────────────
+
+    /// <summary>
+    /// Ensure the pinned staging buffer is at least <paramref name="required"/> bytes.
+    /// The buffer grows but never shrinks (amortised cost over pipeline lifetime).
+    /// </summary>
+    private unsafe void EnsurePinnedBuf(nuint required)
+    {
+        if (required <= _pinnedBufSize) return;
+        if (_pinnedBuf != nint.Zero) CuBlasInterop.FreeHost(_pinnedBuf);
+        nuint newSize = Math.Max(required, _pinnedBufSize * 2);
+        if (CuBlasInterop.MallocHost(out _pinnedBuf, newSize) != 0)
+        {
+            _pinnedBuf = nint.Zero; // allocation failed — fall back to sync copies
+            _pinnedBufSize = 0;
+            return;
+        }
+        _pinnedBufSize = newSize;
+    }
+
+    /// <summary>
+    /// Copy <paramref name="src"/> to the device pointer via the pinned staging buffer,
+    /// using async DMA when possible. Falls back to synchronous copy if pinned alloc failed.
+    /// </summary>
+    private unsafe void UploadViaStaging(nint devPtr, void* src, nuint byteSize)
+    {
+        EnsurePinnedBuf(byteSize);
+        if (_pinnedBuf != nint.Zero && _stream != nint.Zero)
+        {
+            Buffer.MemoryCopy(src, (void*)_pinnedBuf, _pinnedBufSize, byteSize);
+            CuBlasInterop.CudaMemcpyAsync(devPtr, _pinnedBuf, byteSize,
+                                          CuBlasInterop.HostToDevice, _stream);
+        }
+        else
+        {
+            CuBlasInterop.CudaMemcpy(devPtr, (nint)src, byteSize, CuBlasInterop.HostToDevice);
+        }
+    }
+
+    /// <summary>
+    /// Copy from device to <paramref name="dst"/> via the pinned staging buffer (async DMA).
+    /// Caller must call <see cref="Synchronize"/> before reading <paramref name="dst"/>.
+    /// </summary>
+    private unsafe void DownloadViaStaging(void* dst, nint devPtr, nuint byteSize)
+    {
+        EnsurePinnedBuf(byteSize);
+        if (_pinnedBuf != nint.Zero && _stream != nint.Zero)
+        {
+            CuBlasInterop.CudaMemcpyAsync(_pinnedBuf, devPtr, byteSize,
+                                          CuBlasInterop.DeviceToHost, _stream);
+            CuBlasInterop.StreamSynchronize(_stream);
+            Buffer.MemoryCopy((void*)_pinnedBuf, dst, byteSize, byteSize);
+        }
+        else
+        {
+            CuBlasInterop.CudaMemcpy((nint)dst, devPtr, byteSize, CuBlasInterop.DeviceToHost);
+        }
     }
 
     // ── Unsupported LLM ops ───────────────────────────────────────────────
@@ -336,5 +455,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
         _devPtrs.Clear();
 
         CuBlasInterop.Destroy(_handle);
+
+        if (_stream != nint.Zero)
+            CuBlasInterop.StreamDestroy(_stream);
+
+        if (_pinnedBuf != nint.Zero)
+            CuBlasInterop.FreeHost(_pinnedBuf);
     }
 }

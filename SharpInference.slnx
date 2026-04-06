@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/benchmarks/">
     <Project Path="benchmarks/SharpInference.Bench/SharpInference.Bench.csproj" />
+    <Project Path="benchmarks/SharpInference.ImageBench/SharpInference.ImageBench.csproj" />
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/SharpInference.Cli/SharpInference.Cli.csproj" />

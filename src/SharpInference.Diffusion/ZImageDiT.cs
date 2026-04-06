@@ -35,6 +35,13 @@ public sealed class ZImageDiT : IDisposable
     private readonly Dictionary<string, Core.Tensor>? _gpuWeightsFp8;
     private bool _disposed;
 
+    // ── RoPE freq cache (position IDs are constant across denoising steps) ──
+    private int[]?   _cachedImgPosIds;
+    private float[]? _cachedImgFreqs;
+    private int[]?   _cachedTxtPosIds;
+    private float[]? _cachedTxtFreqs;
+    private float[]? _cachedCombinedFreqs;
+
     /// <summary>Minimum batch size to route a MatQ call through the GPU backend.</summary>
     private const int MinGpuBatch = 16;
 
@@ -79,10 +86,19 @@ public sealed class ZImageDiT : IDisposable
         var txtHid = EmbedCap(txtEmbeds, nTxt);
         var adaln  = TimestepEmbed(t);           // [256]
 
-        // ── 2. Build per-group RoPE freqs ─────────────────────────────────
-        // Refiners use separate img/txt freqs; main layers use combined [img, txt].
-        var imgFreqs = _rope.BuildFreqs(imgPosIds, nImg);
-        var txtFreqs = _rope.BuildFreqs(txtPosIds, nTxt);
+        // ── 2. Build per-group RoPE freqs (cached: pos IDs are constant across steps) ──
+        if (!ReferenceEquals(imgPosIds, _cachedImgPosIds))
+        {
+            _cachedImgFreqs  = _rope.BuildFreqs(imgPosIds, nImg);
+            _cachedImgPosIds = imgPosIds;
+        }
+        if (!ReferenceEquals(txtPosIds, _cachedTxtPosIds))
+        {
+            _cachedTxtFreqs  = _rope.BuildFreqs(txtPosIds, nTxt);
+            _cachedTxtPosIds = txtPosIds;
+        }
+        var imgFreqs = _cachedImgFreqs!;
+        var txtFreqs = _cachedTxtFreqs!;
 
         // ── 3. Refine separately ──────────────────────────────────────────
         // Context refiner: 2 unmodulated blocks on text tokens with text RoPE
@@ -101,10 +117,17 @@ public sealed class ZImageDiT : IDisposable
         Array.Copy(txtHid, 0, x, nImg * dim, nTxt * dim);
 
         // Build combined position IDs and RoPE freqs: [imgPos, txtPos]
-        var combinedPos = new int[(nImg + nTxt) * 3];
-        Array.Copy(imgPosIds, 0, combinedPos, 0,        nImg * 3);
-        Array.Copy(txtPosIds, 0, combinedPos, nImg * 3, nTxt * 3);
-        var freqs = _rope.BuildFreqs(combinedPos, nTotal);
+        // Cache the combined freqs alongside img/txt — they change iff either input changes.
+        if (_cachedCombinedFreqs is null ||
+            !ReferenceEquals(imgPosIds, _cachedImgPosIds) ||
+            !ReferenceEquals(txtPosIds, _cachedTxtPosIds))
+        {
+            var combinedPos = new int[(nImg + nTxt) * 3];
+            Array.Copy(imgPosIds, 0, combinedPos, 0,        nImg * 3);
+            Array.Copy(txtPosIds, 0, combinedPos, nImg * 3, nTxt * 3);
+            _cachedCombinedFreqs = _rope.BuildFreqs(combinedPos, nTotal);
+        }
+        var freqs = _cachedCombinedFreqs;
 
         // ── 4. 30 main transformer blocks ─────────────────────────────────
         for (int l = 0; l < _p.NLayers; l++)
@@ -183,51 +206,61 @@ public sealed class ZImageDiT : IDisposable
         }
 
         // ── Attention sub-block ───────────────────────────────────────────
-        var normW1 = W($"{prefix}.attention_norm1.weight");
-        var attnIn = new float[nTok * dim];
-        for (int t = 0; t < nTok; t++)
+        var normW1  = W($"{prefix}.attention_norm1.weight");
+        var attnBuf = ArrayPool<float>.Shared.Rent(nTok * dim);
+        float[] attnOut;
+        try
         {
-            int off = t * dim;
-            DiffusionOps.RmsNorm(x, off, dim, normW1, _p.NormEps, attnIn, off);
-            TensorPrimitives.Multiply(attnIn.AsSpan(off, dim), scaleMsa, attnIn.AsSpan(off, dim));
+            Parallel.For(0, nTok, t =>
+            {
+                int off = t * dim;
+                DiffusionOps.RmsNorm(x, off, dim, normW1, _p.NormEps, attnBuf, off);
+                TensorPrimitives.Multiply(attnBuf.AsSpan(off, dim), scaleMsa, attnBuf.AsSpan(off, dim));
+            });
+            attnOut = SelfAttention(prefix, attnBuf, nTok, freqs);
         }
-
-        var attnOut = SelfAttention(prefix, attnIn, nTok, freqs);
+        finally { ArrayPool<float>.Shared.Return(attnBuf); }
 
         var normW2 = W($"{prefix}.attention_norm2.weight");
-        for (int t = 0; t < nTok; t++)
+        Parallel.For(0, nTok, t =>
         {
             int off = t * dim;
             DiffusionOps.RmsNorm(attnOut, off, dim, normW2, _p.NormEps, attnOut, off);
             TensorPrimitives.MultiplyAdd<float>(attnOut.AsSpan(off, dim), gateMsa,
                                                 x.AsSpan(off, dim), x.AsSpan(off, dim));
-        }
+        });
 
         // ── FFN sub-block ─────────────────────────────────────────────────
-        var normW3 = W($"{prefix}.ffn_norm1.weight");
-        var ffnIn  = new float[nTok * dim];
-        for (int t = 0; t < nTok; t++)
+        var normW3  = W($"{prefix}.ffn_norm1.weight");
+        var ffnBuf  = ArrayPool<float>.Shared.Rent(nTok * dim);
+        float[] gate, up, ffnOut;
+        try
         {
-            int off = t * dim;
-            DiffusionOps.RmsNorm(x, off, dim, normW3, _p.NormEps, ffnIn, off);
-            TensorPrimitives.Multiply(ffnIn.AsSpan(off, dim), scaleMlp, ffnIn.AsSpan(off, dim));
-        }
+            Parallel.For(0, nTok, t =>
+            {
+                int off = t * dim;
+                DiffusionOps.RmsNorm(x, off, dim, normW3, _p.NormEps, ffnBuf, off);
+                TensorPrimitives.Multiply(ffnBuf.AsSpan(off, dim), scaleMlp, ffnBuf.AsSpan(off, dim));
+            });
 
-        // SiLU-gated FFN: w2(silu(w1(x)) * w3(x))
-        var gate   = MatQ(ffnIn, nTok, dim, $"{prefix}.feed_forward.w1.weight", _p.FfnHidden);
-        var up     = MatQ(ffnIn, nTok, dim, $"{prefix}.feed_forward.w3.weight", _p.FfnHidden);
-        DiffusionOps.SiluInPlace(gate.AsSpan());                              // gate = SiLU(gate)
-        TensorPrimitives.Multiply(gate.AsSpan(), up.AsSpan(), gate.AsSpan()); // gate *= up
-        var ffnOut = MatQ(gate, nTok, _p.FfnHidden, $"{prefix}.feed_forward.w2.weight", dim);
+            // SiLU-gated FFN: w2(silu(w1(x)) * w3(x))
+            gate   = MatQ(ffnBuf, nTok, dim, $"{prefix}.feed_forward.w1.weight", _p.FfnHidden);
+            up     = MatQ(ffnBuf, nTok, dim, $"{prefix}.feed_forward.w3.weight", _p.FfnHidden);
+        }
+        finally { ArrayPool<float>.Shared.Return(ffnBuf); }
+
+        DiffusionOps.SiluInPlace(gate.AsSpan());
+        TensorPrimitives.Multiply(gate.AsSpan(), up.AsSpan(), gate.AsSpan());
+        ffnOut = MatQ(gate, nTok, _p.FfnHidden, $"{prefix}.feed_forward.w2.weight", dim);
 
         var normW4 = W($"{prefix}.ffn_norm2.weight");
-        for (int t = 0; t < nTok; t++)
+        Parallel.For(0, nTok, t =>
         {
             int off = t * dim;
             DiffusionOps.RmsNorm(ffnOut, off, dim, normW4, _p.NormEps, ffnOut, off);
             TensorPrimitives.MultiplyAdd<float>(ffnOut.AsSpan(off, dim), gateMlp,
                                                 x.AsSpan(off, dim), x.AsSpan(off, dim));
-        }
+        });
     }
 
     // ── Self-attention ────────────────────────────────────────────────────
@@ -393,10 +426,12 @@ public sealed class ZImageDiT : IDisposable
                 if (_backend.BestSgemmPrecision == SgemmPrecision.Fp8E4M3)
                 {
                     // fp8 E4M3 GPU path (sm_89+): weights stored as fp8 (1 byte/element, 2× smaller than fp16).
-                    // Both A (activations) and B (weights) must be fp8 for cublasGemmEx; output C is fp32.
+                    // Both A (activations) and B (weights) must be fp8 for cublasGemmEx.
+                    // cuBLAS requires bf16 output when inputs are fp8 — fp32 output is not supported.
                     // Weights are uploaded once on first call and cached; reused on subsequent steps.
                     int wCount = rows * cols;
                     byte[] xFp8 = ArrayPool<byte>.Shared.Rent(n * cols);
+                    ushort[] cBf16Buf = ArrayPool<ushort>.Shared.Rent(n * rows);
                     try
                     {
                         // Convert activations to fp8
@@ -435,13 +470,19 @@ public sealed class ZImageDiT : IDisposable
 
                         bool ownW = _gpuWeightsFp8 == null || !_gpuWeightsFp8.ContainsKey(wName);
                         var xGpu = _backend.UploadFp8(xFp8.AsSpan(0, xCount), TensorShape.D1(xCount));
-                        // Output as fp32 to avoid bf16→fp32 conversion step on download
-                        var cGpu = _backend.Allocate(TensorShape.D1(n * rows), DType.Float32);
+                        // fp8 GEMM output must be bf16 (cuBLAS restriction); convert to fp32 on download
+                        var cGpu = _backend.Allocate(TensorShape.D1(n * rows), DType.BFloat16);
                         try
                         {
                             _backend.Sgemm(cGpu, xGpu, wGpu, n, cols, rows);
                             _backend.Synchronize();
-                            _backend.Download(cGpu, result.AsSpan());
+                            _backend.DownloadBf16(cGpu, cBf16Buf.AsSpan(0, n * rows));
+                            int cCount = n * rows;
+                            for (int i = 0; i < cCount; i++)
+                            {
+                                uint bits = (uint)cBf16Buf[i] << 16;
+                                result[i] = BitConverter.UInt32BitsToSingle(bits);
+                            }
                         }
                         finally
                         {
@@ -453,6 +494,7 @@ public sealed class ZImageDiT : IDisposable
                     finally
                     {
                         ArrayPool<byte>.Shared.Return(xFp8);
+                        ArrayPool<ushort>.Shared.Return(cBf16Buf);
                     }
                 }
                 else if (_backend.BestSgemmPrecision == SgemmPrecision.Bf16)

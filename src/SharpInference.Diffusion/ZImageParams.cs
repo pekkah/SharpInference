@@ -66,7 +66,7 @@ public sealed class ZImageParams
     public int LatentChannels { get; init; } = 16;
 
     // ── Inference defaults ────────────────────────────────────────────────
-    /// <summary>8 NFEs (9 scheduler steps). guidance_scale = 0.</summary>
-    public int   DefaultSteps    { get; init; } = 9;
+    /// <summary>4 NFEs. Z-Image-Turbo is DMD-distilled and designed for 4-step inference.</summary>
+    public int   DefaultSteps    { get; init; } = 4;
     public float DefaultGuidance { get; init; } = 0.0f;
 }

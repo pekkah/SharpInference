@@ -103,13 +103,12 @@ public sealed class ZImageRoPE
     {
         int halfDim = _headDim / 2;
 
-        for (int t = 0; t < nTokens; t++)
+        Parallel.For(0, nHeads, h =>
         {
-            int freqBase = t * halfDim * 2; // 2 floats per pair (cos, sin)
-
-            for (int h = 0; h < nHeads; h++)
+            for (int t = 0; t < nTokens; t++)
             {
-                int qkBase = (t * nHeads + h) * _headDim;
+                int qkBase   = (t * nHeads + h) * _headDim;
+                int freqBase = t * halfDim * 2;
 
                 for (int j = 0; j < halfDim; j++)
                 {
@@ -121,7 +120,7 @@ public sealed class ZImageRoPE
                     qk[qkBase + j * 2 + 1] = a * sin + b * cos;
                 }
             }
-        }
+        });
     }
 
     /// <summary>

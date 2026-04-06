@@ -16,6 +16,9 @@ internal static partial class CuBlasInterop
     [LibraryImport("cublas64_11", EntryPoint = "cublasDestroy_v2")]
     internal static partial int Destroy(nint handle);
 
+    [LibraryImport("cublas64_11", EntryPoint = "cublasSetStream_v2")]
+    internal static partial int SetStream(nint handle, nint stream);
+
     // ── cublasSgemm: C = alpha*op(A)*op(B) + beta*C (fp32) ──────────────
     [LibraryImport("cublas64_11", EntryPoint = "cublasSgemm_v2")]
     internal static partial int Sgemm(
@@ -54,14 +57,34 @@ internal static partial class CuBlasInterop
     [LibraryImport("cudart64_110", EntryPoint = "cudaMemcpy")]
     internal static partial int CudaMemcpy(nint dst, nint src, nuint count, int kind);
 
+    [LibraryImport("cudart64_110", EntryPoint = "cudaMemcpyAsync")]
+    internal static partial int CudaMemcpyAsync(nint dst, nint src, nuint count, int kind, nint stream);
+
     [LibraryImport("cudart64_110", EntryPoint = "cudaDeviceSynchronize")]
     internal static partial int DeviceSync();
+
+    [LibraryImport("cudart64_110", EntryPoint = "cudaStreamCreate")]
+    internal static partial int StreamCreate(out nint stream);
+
+    [LibraryImport("cudart64_110", EntryPoint = "cudaStreamDestroy")]
+    internal static partial int StreamDestroy(nint stream);
+
+    [LibraryImport("cudart64_110", EntryPoint = "cudaStreamSynchronize")]
+    internal static partial int StreamSynchronize(nint stream);
 
     [LibraryImport("cudart64_110", EntryPoint = "cudaRuntimeGetVersion")]
     internal static partial int RuntimeGetVersion(out int version);
 
     [LibraryImport("cudart64_110", EntryPoint = "cudaDeviceGetAttribute")]
     internal static partial int DeviceGetAttribute(out int value, int attr, int device);
+
+    // ── Pinned host memory (enables DMA-based async transfers) ────────────
+
+    [LibraryImport("cudart64_110", EntryPoint = "cudaMallocHost")]
+    internal static partial int MallocHost(out nint ptr, nuint size);
+
+    [LibraryImport("cudart64_110", EntryPoint = "cudaFreeHost")]
+    internal static partial int FreeHost(nint ptr);
 
     // ── Constants ─────────────────────────────────────────────────────────
 

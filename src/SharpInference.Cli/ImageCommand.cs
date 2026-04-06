@@ -107,7 +107,7 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
         public int Height { get; init; }
 
         [CommandOption("--steps")]
-        [Description("Denoising steps (default: 9 for Z-Image-Turbo, 4 for FLUX schnell, 20 for dev)")]
+        [Description("Denoising steps (default: 4 for Z-Image-Turbo, 4 for FLUX schnell, 20 for dev)")]
         [DefaultValue(0)]
         public int Steps { get; init; }
 
@@ -187,7 +187,8 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
         if (!RequireFile(tokenizerPath, "--qwen-tokenizer", "models/z-image-turbo/tokenizer/tokenizer.json")) return 1;
 
         string output = s.OutputPath ?? "output.png";
-        int steps = s.Steps > 0 ? s.Steps : 9;
+        // Pass -1 when no explicit --steps given so ZImagePipeline uses ZImageParams.DefaultSteps (4)
+        int steps = s.Steps > 0 ? s.Steps : -1;
 
         AnsiConsole.MarkupLine("[bold]Z-Image-Turbo[/] (S3-DiT + Qwen3-4B)");
         AnsiConsole.MarkupLine($"[dim]DiT:[/]      {Markup.Escape(modelPath)}");

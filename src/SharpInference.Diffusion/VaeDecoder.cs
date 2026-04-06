@@ -1,4 +1,7 @@
+using System.Buffers;
 using System.Numerics.Tensors;
+using SharpInference.Core;
+using CoreTensor = SharpInference.Core.Tensor;
 
 namespace SharpInference.Diffusion;
 
@@ -18,20 +21,43 @@ namespace SharpInference.Diffusion;
 ///   decoder.norm_out: GroupNorm(32, 128) + SiLU
 ///   decoder.conv_out: Conv2D(128→3, 3×3)
 ///
+/// GPU acceleration: when an IComputeBackend is supplied, all Conv2D and linear
+/// attention projections are dispatched as cuBLAS fp32 SGEMM calls via im2col.
+/// Weights are cached in VRAM after first upload and reused across Decode() calls.
+/// GroupNorm, SiLU, and Upsample remain on CPU (memory-bound, negligible share).
+///
 /// The VAE scaling constant 0.3611 and shift 0.1159 are applied before decoding.
 /// </summary>
 public sealed class VaeDecoder : IDisposable
 {
     private readonly IWeightLoader _st;
+    private readonly IComputeBackend? _backend;
+
+    // CPU weight cache: avoids re-reading from mmap'd safetensors on every ResBlock call
+    private readonly Dictionary<string, float[]> _cpuWeights = new(StringComparer.Ordinal);
+    // GPU weight cache: fp32 tensors uploaded to VRAM once, reused across Decode() calls
+    private readonly Dictionary<string, CoreTensor>? _gpuWeights;
 
     // FLUX VAE scale/shift applied to latent before decode
     private const float VaeScale = 1f / 0.3611f;
     private const float VaeShift = 0.1159f;
 
+    // Im2col chunk size: limit each col matrix upload to 128 MB (32M fp32 values)
+    private const int MaxColChunkFloats = 32 * 1024 * 1024;
+
     public VaeDecoder(string path) => _st = SafetensorsLoader.Open(path);
 
     /// <summary>Create from a pre-opened IWeightLoader (SafetensorsLoader or GgufWeightLoader).</summary>
     public VaeDecoder(IWeightLoader st) => _st = st;
+
+    /// <summary>Create from a pre-opened IWeightLoader with optional GPU backend for acceleration.</summary>
+    public VaeDecoder(IWeightLoader st, IComputeBackend? backend = null)
+    {
+        _st      = st;
+        _backend = backend;
+        if (backend is not null)
+            _gpuWeights = new Dictionary<string, CoreTensor>(StringComparer.Ordinal);
+    }
 
     /// <summary>
     /// Decode latent [C=16, H, W] → RGB float [3, H*8, W*8], values in [0,1].
@@ -111,16 +137,16 @@ public sealed class VaeDecoder : IDisposable
         if (outCh < 0) outCh = inCh;
 
         // norm1 + silu + conv1
-        var gnW1 = _st.ReadF32($"{prefix}.norm1.weight");
-        var gnB1 = _st.ReadF32($"{prefix}.norm1.bias");
-        var h1 = x.ToArray();
+        var gnW1 = Wt($"{prefix}.norm1.weight");
+        var gnB1 = Wt($"{prefix}.norm1.bias");
+        var h1 = (float[])x.Clone();
         DiffusionOps.GroupNorm(h1, gnW1, gnB1, n, inCh, h, w, groups: 32);
         DiffusionOps.SiluInPlace(h1);
         h1 = ConvBlock($"{prefix}.conv1", h1, n, inCh, h, w, outCh, 3);
 
         // norm2 + silu + conv2
-        var gnW2 = _st.ReadF32($"{prefix}.norm2.weight");
-        var gnB2 = _st.ReadF32($"{prefix}.norm2.bias");
+        var gnW2 = Wt($"{prefix}.norm2.weight");
+        var gnB2 = Wt($"{prefix}.norm2.bias");
         DiffusionOps.GroupNorm(h1, gnW2, gnB2, n, outCh, h, w, groups: 32);
         DiffusionOps.SiluInPlace(h1);
         h1 = ConvBlock($"{prefix}.conv2", h1, n, outCh, h, w, outCh, 3);
@@ -130,34 +156,33 @@ public sealed class VaeDecoder : IDisposable
         if (inCh != outCh)
             skip = ConvBlock($"{prefix}.conv_shortcut", x, n, inCh, h, w, outCh, 1, padding: 0);
 
-        for (int i = 0; i < h1.Length; i++) h1[i] += skip[i];
+        TensorPrimitives.Add(h1.AsSpan(), skip.AsSpan(), h1.AsSpan());
         return h1;
     }
 
     private float[] MidAttn(string prefix, float[] x, int n, int ch, int h, int w)
     {
         // GroupNorm + single-head self-attention over spatial positions
-        var normed = x.ToArray();
-        var gnW = _st.ReadF32($"{prefix}.group_norm.weight");
-        var gnB = _st.ReadF32($"{prefix}.group_norm.bias");
+        var normed = (float[])x.Clone();
+        var gnW = Wt($"{prefix}.group_norm.weight");
+        var gnB = Wt($"{prefix}.group_norm.bias");
         DiffusionOps.GroupNorm(normed, gnW, gnB, n, ch, h, w, groups: 32);
 
         int hw = h * w;
 
-        var wQ  = _st.ReadF32($"{prefix}.to_q.weight"); // [ch, ch]
-        var wK  = _st.ReadF32($"{prefix}.to_k.weight");
-        var wV  = _st.ReadF32($"{prefix}.to_v.weight");
-        var wOut  = _st.ReadF32($"{prefix}.to_out.0.weight"); // [ch, ch]
-        var bOut  = _st.ReadF32($"{prefix}.to_out.0.bias");
+        var wQ   = Wt($"{prefix}.to_q.weight"); // [ch, ch]
+        var wK   = Wt($"{prefix}.to_k.weight");
+        var wV   = Wt($"{prefix}.to_v.weight");
+        var wOut = Wt($"{prefix}.to_out.0.weight"); // [ch, ch]
+        var bOut = Wt($"{prefix}.to_out.0.bias");
 
         float scale = 1f / MathF.Sqrt(ch);
-        var result = x.ToArray();
+        var result = (float[])x.Clone();
 
         for (int b = 0; b < n; b++)
         {
-            // Build Q, K, V via matrix multiply: normedT[hw, ch] @ W[ch, ch]^T → [hw, ch]
-            // normed is NCHW; transpose to [hw, ch] for matmul
-            var tokens = new float[hw * ch]; // [hw, ch]
+            // Transpose normed NCHW → [hw, ch] for matmul
+            var tokens = new float[hw * ch];
             for (int pos = 0; pos < hw; pos++)
             for (int c2 = 0; c2 < ch; c2++)
                 tokens[pos * ch + c2] = normed[b * ch * hw + c2 * hw + pos];
@@ -166,10 +191,8 @@ public sealed class VaeDecoder : IDisposable
             var k = LinearHW(tokens, wK, hw, ch);
             var v = LinearHW(tokens, wV, hw, ch);
 
-            // Attention: for each query row, dot with all key rows, softmax, weighted V sum
+            // Parallel causal-free self-attention
             var attnOut = new float[hw * ch];
-            var scores  = new float[hw];
-
             Parallel.For(0, hw, i =>
             {
                 var qi = q.AsSpan(i * ch, ch);
@@ -177,14 +200,12 @@ public sealed class VaeDecoder : IDisposable
                 for (int j = 0; j < hw; j++)
                     localScores[j] = TensorPrimitives.Dot(qi, k.AsSpan(j * ch, ch)) * scale;
 
-                // Softmax
                 float maxS = TensorPrimitives.Max(localScores.AsSpan());
                 TensorPrimitives.Subtract(localScores.AsSpan(), maxS, localScores.AsSpan());
                 TensorPrimitives.Exp(localScores.AsSpan(), localScores.AsSpan());
                 TensorPrimitives.Divide(localScores.AsSpan(),
                     TensorPrimitives.Sum(localScores.AsSpan()), localScores.AsSpan());
 
-                // Weighted V sum
                 var outRow = attnOut.AsSpan(i * ch, ch);
                 outRow.Clear();
                 for (int j = 0; j < hw; j++)
@@ -220,10 +241,130 @@ public sealed class VaeDecoder : IDisposable
 
     private float[] ConvBlock(string name, float[] x, int n, int inCh, int h, int w, int outCh, int k, int padding = -1)
     {
-        var weight = _st.ReadF32($"{name}.weight");  // [outCh, inCh, k, k]
-        var bias   = _st.Contains($"{name}.bias") ? _st.ReadF32($"{name}.bias") : null;
+        if (_backend is not null)
+            return ConvGpu(name, x, inCh, h, w, outCh, k, padding);
+        var weight = Wt($"{name}.weight");
+        var bias   = _st.Contains($"{name}.bias") ? Wt($"{name}.bias") : null;
         return DiffusionOps.Conv2D(x, weight, bias, n, inCh, h, w, outCh, k, k, stride: 1, padding: padding);
     }
 
-    public void Dispose() => _st.Dispose();
+    /// <summary>
+    /// GPU Conv2D via im2col + cuBLAS SGEMM.
+    /// Processes the output in row-chunks (≤128 MB col matrices) to stay within VRAM.
+    /// Weights are cached in GPU memory after first upload.
+    /// </summary>
+    private float[] ConvGpu(string name, float[] x, int inCh, int h, int w, int outCh, int ksize, int padding)
+    {
+        if (padding < 0) padding = (ksize - 1) / 2;
+        int outH = h, outW = w; // stride=1, same padding
+        int hw   = outH * outW;
+        int kPts = inCh * ksize * ksize;
+
+        // Cache GPU weight [outCh, kPts]
+        string wKey = $"{name}.weight";
+        if (!_gpuWeights!.TryGetValue(wKey, out var wGpu))
+        {
+            var wf = Wt(wKey);
+            wGpu = _backend!.Upload(wf.AsSpan(), TensorShape.D1(wf.Length));
+            _gpuWeights[wKey] = wGpu;
+        }
+
+        var biasArr = _st.Contains($"{name}.bias") ? Wt($"{name}.bias") : null;
+
+        // Row-chunk size: limit col matrix to MaxColChunkFloats
+        int chunkRows = kPts > 0 ? Math.Max(1, Math.Min(outH, MaxColChunkFloats / (outW * kPts))) : outH;
+        var output = new float[outCh * hw];
+
+        var colBuf    = ArrayPool<float>.Shared.Rent(chunkRows * outW * kPts);
+        var resultBuf = ArrayPool<float>.Shared.Rent(chunkRows * outW * outCh);
+        try
+        {
+            for (int rowStart = 0; rowStart < outH; rowStart += chunkRows)
+            {
+                int rowEnd  = Math.Min(rowStart + chunkRows, outH);
+                int chunkH  = rowEnd - rowStart;
+                int chunkHW = chunkH * outW;
+                int colSize = chunkHW * kPts;
+
+                Im2ColChunk(x, inCh, h, w, ksize, padding, rowStart, rowEnd, colBuf);
+
+                var colGpu = _backend!.Upload(colBuf.AsSpan(0, colSize), TensorShape.D1(colSize));
+                var cGpu   = _backend.Allocate(TensorShape.D1(chunkHW * outCh));
+                try
+                {
+                    _backend.Sgemm(cGpu, colGpu, wGpu, chunkHW, kPts, outCh);
+                    _backend.Synchronize();
+                    _backend.Download(cGpu, resultBuf.AsSpan(0, chunkHW * outCh));
+                }
+                finally
+                {
+                    _backend.Free(colGpu);
+                    _backend.Free(cGpu);
+                }
+
+                // Transpose [chunkHW, outCh] → NCHW [outCh, outH, outW] + add bias
+                int basePos = rowStart * outW;
+                for (int pos = 0; pos < chunkHW; pos++)
+                {
+                    int absPos = basePos + pos;
+                    for (int oc = 0; oc < outCh; oc++)
+                        output[oc * hw + absPos] = resultBuf[pos * outCh + oc] + (biasArr?[oc] ?? 0f);
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(colBuf);
+            ArrayPool<float>.Shared.Return(resultBuf);
+        }
+        return output;
+    }
+
+    /// <summary>
+    /// Im2col for a horizontal strip of output rows [rowStart, rowEnd).
+    /// Output col layout: [chunkHW, inCh × ksize × ksize] matching GGUF weight order.
+    /// </summary>
+    private static void Im2ColChunk(float[] x, int inCh, int h, int w,
+                                    int ksize, int padding,
+                                    int rowStart, int rowEnd, float[] col)
+    {
+        int outW = w; // stride=1
+        int idx  = 0;
+        for (int oh = rowStart; oh < rowEnd; oh++)
+        for (int ow = 0; ow < outW; ow++)
+        {
+            for (int ic = 0; ic < inCh; ic++)
+            for (int kh = 0; kh < ksize; kh++)
+            for (int kw = 0; kw < ksize; kw++)
+            {
+                int ih = oh + kh - padding;
+                int iw = ow + kw - padding;
+                col[idx++] = ((uint)ih < (uint)h && (uint)iw < (uint)w)
+                    ? x[ic * h * w + ih * w + iw]
+                    : 0f;
+            }
+        }
+    }
+
+    // ── Weight helpers ────────────────────────────────────────────────────
+
+    /// <summary>Read weight from safetensors; cached in memory after first load.</summary>
+    private float[] Wt(string name)
+    {
+        if (_cpuWeights.TryGetValue(name, out var c)) return c;
+        var w = _st.ReadF32(name);
+        _cpuWeights[name] = w;
+        return w;
+    }
+
+    public void Dispose()
+    {
+        if (_gpuWeights is not null)
+        {
+            foreach (var t in _gpuWeights.Values) _backend!.Free(t);
+            _gpuWeights.Clear();
+        }
+        _cpuWeights.Clear();
+        _st.Dispose();
+    }
 }

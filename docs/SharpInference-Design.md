@@ -273,7 +273,40 @@ Key design decisions:
 - **Compute queue separation.** If the device supports async compute queues, DMA transfers (RAM→VRAM for expert prefetching) run on the transfer queue while compute runs on the compute queue. `VkSemaphore` synchronization between them.
 - **Shader compilation at startup.** All SPIR-V shaders are compiled from GLSL at build time via `glslangValidator`, embedded as resources, and loaded into `VkPipeline` objects during initialization. No runtime shader compilation.
 
-### 4.4 Backend Selection
+### 4.4 CUDA Backend
+
+GPU acceleration via NVIDIA CUDA and cuBLAS. Targets RTX 30/40-series (sm_80+) with bf16 Tensor Cores and TF32 fp32 SGEMM.
+
+```
+SharpInference.Cuda/
+├── CudaBackend.cs          # IComputeBackend implementation
+└── CuBlasInterop.cs        # P/Invoke bindings: cublas*, cuda* runtime
+```
+
+**cuBLAS SGEMM contract:**
+`Sgemm(C, A, B, m, k, n)` computes `C[m,n] = A[m,k] @ B[n,k]ᵀ` in fp32 (TF32 on sm_80+) or bf16.
+
+**Data types supported:**
+- `Upload(float[], shape)` — fp32 device tensor
+- `UploadBf16(ushort[], shape)` — bf16 device tensor (top 16 bits of IEEE fp32)
+- `DownloadBf16(src, Span<ushort>)` — bf16 device → host
+- `Allocate(shape)` — uninitialised device tensor
+- `Free(tensor)` — return to device allocator
+- `Synchronize()` — `cudaDeviceSynchronize()`
+
+**bf16 conversion (host side):**
+- To bf16: `(ushort)(BitConverter.SingleToInt32Bits(f) >> 16)`
+- From bf16: `BitConverter.Int32BitsToSingle((int)((uint)h << 16))`
+
+**Backend selection:**
+```csharp
+// Auto: CUDA → Vulkan → CPU
+IComputeBackend backend = CudaBackend.IsAvailable()  ? new CudaBackend()
+                         : VulkanBackend.IsAvailable() ? new VulkanBackend()
+                         : new CpuBackend();
+```
+
+### 4.5 Backend Selection
 
 ```csharp
 public static class BackendFactory
@@ -282,11 +315,12 @@ public static class BackendFactory
     {
         return preference switch
         {
+            BackendPreference.Cuda   => new CudaBackend(),
             BackendPreference.Vulkan => new VulkanBackend(),
-            BackendPreference.Cpu => new CpuBackend(),
-            BackendPreference.Auto => VulkanBackend.IsAvailable()
-                ? new VulkanBackend()
-                : new CpuBackend(),
+            BackendPreference.Cpu    => new CpuBackend(),
+            BackendPreference.Auto   => CudaBackend.IsAvailable()   ? new CudaBackend()
+                                      : VulkanBackend.IsAvailable() ? new VulkanBackend()
+                                      : new CpuBackend(),
             _ => throw new ArgumentOutOfRangeException(nameof(preference))
         };
     }
@@ -1202,6 +1236,21 @@ SharpInference/
 │   │   ├── CommandScheduler.cs
 │   │   └── DescriptorManager.cs
 │   │
+│   ├── SharpInference.Cuda/
+│   │   ├── CudaBackend.cs          # IComputeBackend via cuBLAS P/Invoke
+│   │   └── CuBlasInterop.cs        # cublasSgemm, cublasGemmEx, cudaMemcpy bindings
+│   │
+│   ├── SharpInference.Diffusion/
+│   │   ├── ZImagePipeline.cs       # Top-level: encode → denoise → decode
+│   │   ├── ZImageDiT.cs            # S3-DiT transformer (Q5_K_M GGUF, GPU cuBLAS)
+│   │   ├── ZImageParams.cs         # Hyperparams: DefaultSteps=4, latent dims
+│   │   ├── ZImageRoPE.cs           # 2D RoPE for image patches
+│   │   ├── VaeDecoder.cs           # FLUX VAE: latent→RGB (GPU im2col+SGEMM, fp32)
+│   │   ├── FluxDiT.cs              # FLUX.1-schnell DiT (alternative pipeline)
+│   │   ├── DiffusionOps.cs         # Conv2D, GroupNorm, SiLU, Upsample (CPU reference)
+│   │   └── TextEncoders/
+│   │       └── QwenTextEncoder.cs  # Qwen3-4B text encoder (GPU bf16 SGEMM + weight cache)
+│   │
 │   ├── SharpInference.TurboQuant/
 │   │   ├── TurboQuantOps.cs           # Core quantize/dequant/fused-dot (scalar + AVX2)
 │   │   ├── TurboQuantCodebooks.cs     # Precomputed Lloyd-Max tables (3-bit/4-bit, d=128/256)
@@ -1937,6 +1986,91 @@ Decode is 4× faster than Llama 4 Scout (5.3 t/s) because only 6.25% of expert w
 - `Qwen3Coder_ParsesHyperparams` — verifies GGUF metadata parsing (headDim=128, 128 experts, 8 active, hasQkNorm=true)
 - `Qwen3Coder_ListLayer0TensorNames` — verifies correct tensor name parsing for qwen3moe expert layout
 - `Qwen3Coder_CpuFirstToken` — regression test: greedy first token from "Hello, how are you?" prompt must be "Hello" or similar (guards against `<\|endoftext\|>` regressions)
+
+All 207 tests pass.
+
+---
+
+### Phase 8: CUDA Backend ✅
+
+**Goal:** Replace Vulkan with NVIDIA cuBLAS for fp32/bf16 GEMM to unlock Tensor Core throughput on RTX hardware, and enable the image generation pipeline.
+
+- [x] `CuBlasInterop.cs` — P/Invoke bindings for `cublasSgemm`, `cublasGemmEx`, `cudaMalloc`, `cudaFree`, `cudaMemcpy`, `cudaDeviceSynchronize`
+- [x] `CudaBackend.cs` — `IComputeBackend` implementation: `Upload` (fp32 + bf16), `UploadBf16`, `Allocate`, `Free`, `Download`, `DownloadBf16`, `Sgemm`, `Synchronize`
+- [x] `Sgemm(C, A, B, m, k, n)` — `C[m,n] = A[m,k] @ B[n,k]ᵀ` via cuBLAS COLUMN_MAJOR row-swap trick
+- [x] bf16 SGEMM: `cublasGemmEx` with `CUDA_R_16BF` compute for Tensor Core acceleration on sm_80+
+- [x] fp32 SGEMM: `cublasSgemm` with TF32 compute on sm_80+ (automatic, no code change)
+- [x] `CudaBackend.IsAvailable()` — runtime probe via `cudaGetDeviceCount`
+- [x] Auto-select in `ImageCommand.cs`: CUDA → Vulkan → CPU
+
+**Hardware:** RTX 4070 Ti (sm_89, Ada Lovelace). fp8 requires sm_90+; bf16 and TF32 work on sm_80+.
+
+---
+
+### Phase 9: Z-Image-Turbo Image Generation ✅
+
+**Goal:** Native GPU-accelerated text-to-image pipeline with Z-Image-Turbo (S3-DiT + Qwen3-4B + FLUX VAE).
+
+**Architecture:**
+```
+Prompt
+  ↓  QwenTextEncoder (Qwen3-4B GGUF, 35 layers × 7 weights, bf16 cuBLAS)
+Text embeddings [batch, seq, 2048]
+  ↓  ZImageDiT (S3-DiT, Q5_K_M GGUF, bf16 cuBLAS, 4 denoising steps)
+Latent [1, 16, H/8, W/8]
+  ↓  VaeDecoder (FLUX VAE, fp32 safetensors, im2col+cuBLAS SGEMM)
+RGB image [1, 3, H, W]
+  ↓  PNG write
+```
+
+**Components:**
+
+`ZImageDiT` (`ZImageDiT.cs`)
+- S3-DiT (Sparse Shift-and-Scale DiT) with FLUX-style double-stream layers
+- Weights loaded from Q5_K_M / Q4_K_M GGUF; dequantized to bf16 on first forward pass
+- GPU weight cache: all tensors uploaded to VRAM once, reused across denoising steps
+- `MatQ(x, wName)`: `Sgemm(C, x[bf16], W[bf16], seq, inDim, outDim)` via `IComputeBackend`
+- 4-step default (`ZImageParams.DefaultSteps = 4`) — DMD-distilled model designed for ≤8 NFEs
+
+`QwenTextEncoder` (`TextEncoders/QwenTextEncoder.cs`)
+- Qwen3-4B 35-layer transformer encoder; Q5_K_M GGUF weights
+- GPU path: weights dequantized to bf16, cached in `_gpuWeights`; activations uploaded as bf16; cuBLAS SGEMM; result downloaded and converted to fp32
+- Prompt embedding cache in `ZImagePipeline`: exact string match skips re-encode (~90s first run, ~0s subsequent)
+
+`VaeDecoder` (`VaeDecoder.cs`)
+- FLUX VAE decoder: 13 ResBlocks + MidAttn + 4 upsamplers; latent [1,16,H,W] → RGB [1,3,8H,8W]
+- **GPU acceleration: im2col + cuBLAS fp32 SGEMM**
+  - `Im2ColChunk()`: fills patch matrix for output row-strip [rowStart,rowEnd) × [inCh×kH×kW]
+  - `ConvGpu()`: chunk loop (≤128 MB col per chunk), `Upload(col)` → `Sgemm` → `Download` → transpose HWC→NCHW + bias
+  - GPU weight cache: fp32 VAE conv weights uploaded once to VRAM, reused across `Decode()` calls
+  - CPU weight cache: `Wt(name)` helper caches `_st.ReadF32()` reads in memory
+- GroupNorm, SiLU, Upsample remain on CPU (memory-bound, negligible share of total time)
+
+**4-step default:**
+`ZImageParams.DefaultSteps = 4` (was 9). CLI passes `steps = -1` when unspecified, which the pipeline resolves to `DefaultSteps`. Z-Image-Turbo uses DMD (Distribution Matching Distillation) and is designed for 4-step inference.
+
+**CLI:**
+```bash
+dotnet run --project src/SharpInference.Cli -c Release -- image \
+  -m models/z_image_turbo-Q5_K_M.gguf \
+  --vae models/z-image-turbo/vae \
+  --qwen-encoder models/Z-Image-AbliteratedV1.Q5_K_M.gguf \
+  --qwen-tokenizer models/z-image-turbo/tokenizer/tokenizer.json \
+  -p "anime style rose" -o rose.png --width 512 --height 512 -v
+```
+
+**Benchmark results (RTX 4070 Ti sm_89, 512×512):**
+
+| Stage | Before (CPU) | After (GPU) | Speedup |
+|-------|-------------|-------------|---------|
+| Text encoding (Qwen3-4B, first run) | ~96s | ~90s | 1.1× (bottlenecked by VRAM upload) |
+| Text encoding (cached prompt) | ~96s | ~0s | ∞ |
+| DiT denoising (4 steps) | ~0s | ~4s | (already GPU) |
+| VAE decode | **~151s** | **~23s** | **6.5×** |
+| **Total (first run)** | **247s** | **117s** | **2.1×** |
+| **Total (cached prompt)** | N/A | ~27s | — |
+
+VAE speedup is 6.5× on first run (includes initial weight upload). Subsequent decodes with weights already in VRAM: ~2s.
 
 All 207 tests pass.
 

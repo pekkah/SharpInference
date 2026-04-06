@@ -29,6 +29,8 @@ public sealed class ZImagePipeline : IDisposable
     private readonly QwenTextEncoder _encoder;
     private readonly QwenTokenizer _tokenizer;
     private readonly ZImageParams _p;
+    private string? _cachedPrompt;
+    private float[]? _cachedEmbeds;
     private bool _disposed;
 
     private ZImagePipeline(ZImageDiT dit, VaeDecoder vae,
@@ -80,8 +82,8 @@ public sealed class ZImagePipeline : IDisposable
                                                    : SafetensorsLoader.Open(vaePath);
 
         var dit       = new ZImageDiT(ditLoader, p, backend);
-        var vae       = new VaeDecoder(vaeLoader);
-        var qwen      = new QwenTextEncoder(GgufModel.Open(qwenPath), p);
+        var vae       = new VaeDecoder(vaeLoader, backend);
+        var qwen      = new QwenTextEncoder(GgufModel.Open(qwenPath), p, backend);
         var tokenizer = QwenTokenizer.FromFile(tokenizerPath);
 
         return new ZImagePipeline(dit, vae, qwen, tokenizer, p);
@@ -119,12 +121,25 @@ public sealed class ZImagePipeline : IDisposable
 
         // ── 1. Encode text ────────────────────────────────────────────────
         progress?.Invoke(0, steps + 2);
-        statusCallback?.Invoke("Encoding text prompt (Qwen3-4B)…");
-        int[] tokenIds = _tokenizer.EncodeWithTemplate(prompt);
-        int totalEncLayers = _p.QwenEncoderLayer + 1;
-        float[] txtEmbeds = _encoder.Encode(tokenIds,
-            encodeProgress: (layer, _) =>
-                statusCallback?.Invoke($"Encoding text: layer {layer + 1}/{totalEncLayers}…"));
+        float[] txtEmbeds;
+        int[] tokenIds;
+        if (_cachedPrompt == prompt && _cachedEmbeds is not null)
+        {
+            statusCallback?.Invoke("Using cached text embeddings…");
+            txtEmbeds = _cachedEmbeds;
+            tokenIds  = _tokenizer.EncodeWithTemplate(prompt);
+        }
+        else
+        {
+            statusCallback?.Invoke("Encoding text prompt (Qwen3-4B)…");
+            tokenIds  = _tokenizer.EncodeWithTemplate(prompt);
+            int totalEncLayers = _p.QwenEncoderLayer + 1;
+            txtEmbeds = _encoder.Encode(tokenIds,
+                encodeProgress: (layer, _) =>
+                    statusCallback?.Invoke($"Encoding text: layer {layer + 1}/{totalEncLayers}…"));
+            _cachedPrompt  = prompt;
+            _cachedEmbeds  = txtEmbeds;
+        }
         int nTxt = tokenIds.Length;
 
         // ── 2. Build position IDs ─────────────────────────────────────────

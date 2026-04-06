@@ -1,5 +1,8 @@
+using System.Buffers;
+using System.Numerics.Tensors;
 using SharpInference.Core;
 using SharpInference.Cpu;
+using CoreTensor = SharpInference.Core.Tensor;
 
 namespace SharpInference.Diffusion;
 
@@ -28,6 +31,13 @@ public sealed class FluxDiT : IDisposable
     // Cached tensor lookups (lazy on first use)
     private readonly Dictionary<string, float[]> _weightCache = new(StringComparer.Ordinal);
 
+    /// <summary>Minimum token batch size to route a MatQ call through the GPU backend.</summary>
+    private const int MinGpuBatch = 16;
+    /// <summary>bf16 weights cached on GPU — uploaded once on first denoising step, reused every step.</summary>
+    private readonly Dictionary<string, CoreTensor>? _gpuWeightsBf16;
+    /// <summary>fp8 E4M3 weights cached on GPU — uploaded once on first step (sm_89+, 2× smaller than bf16).</summary>
+    private readonly Dictionary<string, CoreTensor>? _gpuWeightsFp8;
+
     public FluxParams Params => _p;
 
     public FluxDiT(GgufModel model, FluxParams p, IComputeBackend backend)
@@ -35,6 +45,10 @@ public sealed class FluxDiT : IDisposable
         _model   = model;
         _p       = p;
         _backend = backend;
+        if (backend?.BestSgemmPrecision == SgemmPrecision.Bf16)
+            _gpuWeightsBf16 = new Dictionary<string, CoreTensor>(StringComparer.Ordinal);
+        if (backend?.BestSgemmPrecision == SgemmPrecision.Fp8E4M3)
+            _gpuWeightsFp8 = new Dictionary<string, CoreTensor>(StringComparer.Ordinal);
     }
 
     // ── Entry point ───────────────────────────────────────────────────────
@@ -117,19 +131,13 @@ public sealed class FluxDiT : IDisposable
         return vec;
     }
 
-    private float[] ProjectImg(float[] imgLatent, int nImg)
-    {
-        var w = W("model.diffusion_model.img_in.weight");
-        var b = W("model.diffusion_model.img_in.bias");
-        return DiffusionOps.Linear(imgLatent, w, b, nImg, _p.InChannels, _p.HiddenSize);
-    }
+    private float[] ProjectImg(float[] imgLatent, int nImg) =>
+        MatQ(imgLatent, nImg, _p.InChannels, "model.diffusion_model.img_in.weight", _p.HiddenSize,
+             W("model.diffusion_model.img_in.bias"));
 
-    private float[] ProjectTxt(float[] txtEmb, int nTxt)
-    {
-        var w = W("model.diffusion_model.txt_in.weight");
-        var b = W("model.diffusion_model.txt_in.bias");
-        return DiffusionOps.Linear(txtEmb, w, b, nTxt, _p.ContextDim, _p.HiddenSize);
-    }
+    private float[] ProjectTxt(float[] txtEmb, int nTxt) =>
+        MatQ(txtEmb, nTxt, _p.ContextDim, "model.diffusion_model.txt_in.weight", _p.HiddenSize,
+             W("model.diffusion_model.txt_in.bias"));
 
     // ── Double stream block ───────────────────────────────────────────────
 
@@ -241,7 +249,7 @@ public sealed class FluxDiT : IDisposable
         // Actually linear2 weight is [d, 3d] because it takes [attn_out, mlp_geglu_out] = [d + d*2]
         // And mlp hidden = 4*d, geglu cuts that in half = 2*d
         // So linear2: weight [d, 3d]
-        var out_ = DiffusionOps.Linear(combined, W($"{p}.linear2"), null, nSeq, d + d * 2, d);
+        var out_ = MatQ(combined, nSeq, d + d * 2, $"{p}.linear2", d, null);
 
         // Gate and residual
         ScaleGateAdd(x, out_, mod, nSeq, d, gateIdx: 2);
@@ -259,7 +267,7 @@ public sealed class FluxDiT : IDisposable
         var normed = RmsNormMod(img, mod, nImg, d, shift: 0, scale: 1);
 
         // Linear(d, outChannels)
-        return DiffusionOps.Linear(normed, W($"{p}.linear"), W($"{p}.linear.bias"), nImg, d, _p.OutChannels);
+        return MatQ(normed, nImg, d, $"{p}.linear", _p.OutChannels, W($"{p}.linear.bias"));
     }
 
     // ── Attention helpers ─────────────────────────────────────────────────
@@ -269,7 +277,7 @@ public sealed class FluxDiT : IDisposable
         float[] x, int n, int d, int nh, int hd)
     {
         // Fused QKV projection [n, 3*d]
-        var qkv = DiffusionOps.Linear(x, W($"{qkvPath}.weight"), null, n, d, d * 3);
+        var qkv = MatQ(x, n, d, $"{qkvPath}.weight", d * 3, null);
 
         var q = Reshape2Heads(Slice(qkv, n, 0,     d, d * 3), n, nh, hd);
         var k = Reshape2Heads(Slice(qkv, n, d,     d, d * 3), n, nh, hd);
@@ -312,40 +320,49 @@ public sealed class FluxDiT : IDisposable
 
     private static float[] SelfAttention(float[] q, float[] k, float[] v, int n, int nh, int hd)
     {
-        float scale = 1f / MathF.Sqrt(hd);
-        var attnOut = new float[n * nh * hd];
+        float scale      = 1f / MathF.Sqrt(hd);
+        var   attnOut    = new float[n * nh * hd];
+        int   scoreCount = nh * n * n;
+        var   scoresBuf  = ArrayPool<float>.Shared.Rent(scoreCount);
 
-        for (int h = 0; h < nh; h++)
+        try
         {
-            // Compute attention scores [n, n]
-            var scores = new float[n * n];
-            for (int i = 0; i < n; i++)
+            Parallel.For(0, nh, h =>
             {
-                int qOff = (i * nh + h) * hd;
-                for (int j = 0; j < n; j++)
-                {
-                    int kOff = (j * nh + h) * hd;
-                    float dot = 0f;
-                    for (int d = 0; d < hd; d++)
-                        dot += q[qOff + d] * k[kOff + d];
-                    scores[i * n + j] = dot * scale;
-                }
-            }
-            DiffusionOps.Softmax(scores, n);
+                int sBase = h * n * n;
 
-            // Weighted sum over values
-            for (int i = 0; i < n; i++)
-            {
-                int outOff = (i * nh + h) * hd;
-                for (int j = 0; j < n; j++)
+                // SIMD QK dot products per query row
+                for (int i = 0; i < n; i++)
                 {
-                    int vOff = (j * nh + h) * hd;
-                    float w = scores[i * n + j];
-                    for (int d = 0; d < hd; d++)
-                        attnOut[outOff + d] += w * v[vOff + d];
+                    var qi   = q.AsSpan((i * nh + h) * hd, hd);
+                    int sRow = sBase + i * n;
+                    for (int j = 0; j < n; j++)
+                        scoresBuf[sRow + j] = TensorPrimitives.Dot<float>(qi, k.AsSpan((j * nh + h) * hd, hd)) * scale;
+                    DiffusionOps.Softmax(scoresBuf, sRow, n);
                 }
-            }
+
+                // Contiguous per-head V buffer for cache-friendly weighted sum
+                var vhBuf = ArrayPool<float>.Shared.Rent(n * hd);
+                try
+                {
+                    for (int j = 0; j < n; j++)
+                        v.AsSpan((j * nh + h) * hd, hd).CopyTo(vhBuf.AsSpan(j * hd));
+
+                    for (int i = 0; i < n; i++)
+                    {
+                        int sRow  = sBase + i * n;
+                        var outSl = attnOut.AsSpan((i * nh + h) * hd, hd);
+                        outSl.Clear();
+                        for (int j = 0; j < n; j++)
+                            TensorPrimitives.MultiplyAdd<float>(
+                                vhBuf.AsSpan(j * hd, hd), scoresBuf[sRow + j], outSl, outSl);
+                    }
+                }
+                finally { ArrayPool<float>.Shared.Return(vhBuf); }
+            });
         }
+        finally { ArrayPool<float>.Shared.Return(scoresBuf); }
+
         return attnOut;
     }
 
@@ -355,9 +372,9 @@ public sealed class FluxDiT : IDisposable
     {
         // Two-layer MLP: fc1(GELU) → fc2. Expansion factor 4.
         int hidden = d * 4;
-        var h = DiffusionOps.Linear(x, W($"{prefix}.0.weight"), W($"{prefix}.0.bias"), n, d, hidden);
+        var h = MatQ(x, n, d, $"{prefix}.0.weight", hidden, W($"{prefix}.0.bias"));
         DiffusionOps.GeluInPlace(h);
-        return DiffusionOps.Linear(h, W($"{prefix}.2.weight"), W($"{prefix}.2.bias"), n, hidden, d);
+        return MatQ(h, n, hidden, $"{prefix}.2.weight", d, W($"{prefix}.2.bias"));
     }
 
     private static float[] Geglu(float[] x, int n, int totalDim)
@@ -448,11 +465,11 @@ public sealed class FluxDiT : IDisposable
         return out_;
     }
 
-    private static float[] LinearNoBias(string path, float[] x, int n, int inDim, int outDim)
-        => throw new NotImplementedException(); // resolved via W() below in actual call
+    private float[] LinearNoBias(string path, float[] x, int n, int inDim, int outDim)
+        => MatQ(x, n, inDim, $"{path}.weight", outDim, null);
 
     private float[] LinearBias(string path, float[] x, int n, int inDim, int outDim)
-        => DiffusionOps.Linear(x, W($"{path}.weight"), OptW($"{path}.bias"), n, inDim, outDim);
+        => MatQ(x, n, inDim, $"{path}.weight", outDim, OptW($"{path}.bias"));
 
     // ── Timestep sinusoidal embedding ─────────────────────────────────────
 
@@ -501,12 +518,270 @@ public sealed class FluxDiT : IDisposable
         return dst;
     }
 
+    // ── GPU-accelerated matmul with weight caching ────────────────────────
+
+    /// <summary>
+    /// Multiply <paramref name="x"/> [n × inDim] by weight tensor <paramref name="wName"/>
+    /// [outDim × inDim], optionally adding bias, and return the result [n × outDim].
+    ///
+    /// On a CUDA backend: dequantizes the weight (fp8 / bf16 / fp16 / fp32 depending on
+    /// device capability), uploads it once and caches on GPU, then dispatches cuBLAS SGEMM.
+    /// Falls back to CPU (SimdKernels.MatMulBatched) when no GPU backend or n &lt; MinGpuBatch.
+    /// </summary>
+    private unsafe float[] MatQ(float[] x, int n, int inDim, string wName, int outDim,
+                                  float[]? bias)
+    {
+        var result = new float[n * outDim];
+
+        var info = _model.FindTensor(wName);
+        if (info.HasValue)
+        {
+            var ti       = info.Value;
+            int rows     = (int)ti.Dimensions[1];  // outDim — output features (ne1)
+            int cols     = (int)ti.Dimensions[0];  // inDim  — input features  (ne0)
+            var rawBytes = _model.GetTensorData(ti);
+
+            if (_backend is not CpuBackend && n >= MinGpuBatch)
+            {
+                if (_backend.BestSgemmPrecision == SgemmPrecision.Fp8E4M3)
+                {
+                    int wCount = rows * cols;
+                    int xCount = n * cols;
+                    byte[]   xFp8     = ArrayPool<byte>.Shared.Rent(xCount);
+                    ushort[] cBf16Buf = ArrayPool<ushort>.Shared.Rent(n * rows);
+                    try
+                    {
+                        for (int i = 0; i < xCount; i++)
+                            xFp8[i] = Fp8Converter.FloatToFp8E4M3(x[i]);
+
+                        CoreTensor wGpu;
+                        bool ownW;
+                        if (_gpuWeightsFp8 != null && _gpuWeightsFp8.TryGetValue(wName, out var cachedW))
+                        {
+                            wGpu = cachedW; ownW = false;
+                        }
+                        else
+                        {
+                            float[] wBuf32 = ArrayPool<float>.Shared.Rent(wCount);
+                            byte[]  wFp8   = ArrayPool<byte>.Shared.Rent(wCount);
+                            try
+                            {
+                                Dequantize.ToFloat32(rawBytes, wBuf32.AsSpan(0, wCount), ti.DType, wCount);
+                                for (int i = 0; i < wCount; i++)
+                                    wFp8[i] = Fp8Converter.FloatToFp8E4M3(wBuf32[i]);
+                                wGpu = _backend.UploadFp8(wFp8.AsSpan(0, wCount), TensorShape.D1(wCount));
+                            }
+                            finally
+                            {
+                                ArrayPool<float>.Shared.Return(wBuf32);
+                                ArrayPool<byte>.Shared.Return(wFp8);
+                            }
+                            if (_gpuWeightsFp8 != null)
+                                _gpuWeightsFp8[wName] = wGpu;
+                            ownW = _gpuWeightsFp8 == null;
+                        }
+
+                        var xGpu = _backend.UploadFp8(xFp8.AsSpan(0, xCount), TensorShape.D1(xCount));
+                        // fp8 GEMM output must be bf16 (cuBLAS restriction); convert to fp32 on download
+                        var cGpu = _backend.Allocate(TensorShape.D1(n * rows), DType.BFloat16);
+                        try
+                        {
+                            _backend.Sgemm(cGpu, xGpu, wGpu, n, cols, rows);
+                            _backend.Synchronize();
+                            _backend.DownloadBf16(cGpu, cBf16Buf.AsSpan(0, n * rows));
+                            int cCount = n * rows;
+                            for (int i = 0; i < cCount; i++)
+                            {
+                                uint bits = (uint)cBf16Buf[i] << 16;
+                                result[i] = BitConverter.UInt32BitsToSingle(bits);
+                            }
+                        }
+                        finally
+                        {
+                            _backend.Free(xGpu);
+                            if (ownW) _backend.Free(wGpu);
+                            _backend.Free(cGpu);
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(xFp8);
+                        ArrayPool<ushort>.Shared.Return(cBf16Buf);
+                    }
+                }
+                else if (_backend.BestSgemmPrecision == SgemmPrecision.Bf16)
+                {
+                    int wCount = rows * cols;
+                    int xCount = n * cols;
+                    ushort[] xBf16 = ArrayPool<ushort>.Shared.Rent(xCount);
+                    ushort[] cBf16 = ArrayPool<ushort>.Shared.Rent(n * rows);
+                    try
+                    {
+                        for (int i = 0; i < xCount; i++)
+                        {
+                            uint bits = BitConverter.SingleToUInt32Bits(x[i]);
+                            xBf16[i] = (ushort)(bits >> 16);
+                        }
+
+                        CoreTensor wGpu;
+                        bool ownW;
+                        if (_gpuWeightsBf16 != null && _gpuWeightsBf16.TryGetValue(wName, out var cachedW))
+                        {
+                            wGpu = cachedW; ownW = false;
+                        }
+                        else
+                        {
+                            float[]  wBuf32 = ArrayPool<float>.Shared.Rent(wCount);
+                            ushort[] wBf16  = ArrayPool<ushort>.Shared.Rent(wCount);
+                            try
+                            {
+                                Dequantize.ToFloat32(rawBytes, wBuf32.AsSpan(0, wCount), ti.DType, wCount);
+                                for (int i = 0; i < wCount; i++)
+                                {
+                                    uint bits = BitConverter.SingleToUInt32Bits(wBuf32[i]);
+                                    wBf16[i] = (ushort)(bits >> 16);
+                                }
+                                wGpu = _backend.UploadBf16(wBf16.AsSpan(0, wCount), TensorShape.D1(wCount));
+                            }
+                            finally
+                            {
+                                ArrayPool<float>.Shared.Return(wBuf32);
+                                ArrayPool<ushort>.Shared.Return(wBf16);
+                            }
+                            if (_gpuWeightsBf16 != null)
+                                _gpuWeightsBf16[wName] = wGpu;
+                            ownW = _gpuWeightsBf16 == null;
+                        }
+
+                        var xGpu = _backend.UploadBf16(xBf16.AsSpan(0, xCount), TensorShape.D1(xCount));
+                        var cGpu = _backend.Allocate(TensorShape.D1(n * rows), DType.BFloat16);
+                        try
+                        {
+                            _backend.Sgemm(cGpu, xGpu, wGpu, n, cols, rows);
+                            _backend.Synchronize();
+                            _backend.DownloadBf16(cGpu, cBf16.AsSpan(0, n * rows));
+                        }
+                        finally
+                        {
+                            _backend.Free(xGpu);
+                            if (ownW) _backend.Free(wGpu);
+                            _backend.Free(cGpu);
+                        }
+
+                        for (int i = 0, cnt = n * rows; i < cnt; i++)
+                        {
+                            uint bits = (uint)cBf16[i] << 16;
+                            result[i] = BitConverter.UInt32BitsToSingle(bits);
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<ushort>.Shared.Return(xBf16);
+                        ArrayPool<ushort>.Shared.Return(cBf16);
+                    }
+                }
+                else if (_backend.BestSgemmPrecision == SgemmPrecision.Fp16)
+                {
+                    int wCount = rows * cols;
+                    int xCount = n * cols;
+                    float[] wBuf32 = ArrayPool<float>.Shared.Rent(wCount);
+                    Half[]  wHalf  = ArrayPool<Half>.Shared.Rent(wCount);
+                    try
+                    {
+                        Dequantize.ToFloat32(rawBytes, wBuf32.AsSpan(0, wCount), ti.DType, wCount);
+                        for (int i = 0; i < wCount; i++) wHalf[i] = (Half)wBuf32[i];
+
+                        var xGpu = _backend.Upload(x.AsSpan(0, xCount), TensorShape.D1(xCount));
+                        var wGpu = _backend.UploadHalf(wHalf.AsSpan(0, wCount), TensorShape.D1(wCount));
+                        var cGpu = _backend.Allocate(TensorShape.D1(n * rows), DType.Float32);
+                        try
+                        {
+                            _backend.Sgemm(cGpu, xGpu, wGpu, n, cols, rows);
+                            _backend.Synchronize();
+                            _backend.Download(cGpu, result.AsSpan());
+                        }
+                        finally
+                        {
+                            _backend.Free(xGpu);
+                            _backend.Free(wGpu);
+                            _backend.Free(cGpu);
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<float>.Shared.Return(wBuf32);
+                        ArrayPool<Half>.Shared.Return(wHalf);
+                    }
+                }
+                else
+                {
+                    // fp32 GPU path
+                    int wCount = rows * cols;
+                    int xCount = n * cols;
+                    float[] wBuf = ArrayPool<float>.Shared.Rent(wCount);
+                    try
+                    {
+                        Dequantize.ToFloat32(rawBytes, wBuf.AsSpan(0, wCount), ti.DType, wCount);
+                        var xGpu = _backend.Upload(x.AsSpan(0, xCount), TensorShape.D1(xCount));
+                        var wGpu = _backend.Upload(wBuf.AsSpan(0, wCount), TensorShape.D1(wCount));
+                        var cGpu = _backend.Allocate(TensorShape.D1(n * rows));
+                        try
+                        {
+                            _backend.Sgemm(cGpu, xGpu, wGpu, n, cols, rows);
+                            _backend.Synchronize();
+                            _backend.Download(cGpu, result.AsSpan());
+                        }
+                        finally
+                        {
+                            _backend.Free(xGpu);
+                            _backend.Free(wGpu);
+                            _backend.Free(cGpu);
+                        }
+                    }
+                    finally { ArrayPool<float>.Shared.Return(wBuf); }
+                }
+            }
+            else
+            {
+                // CPU path: zero-copy via unsafe pointer into mmap'd buffer
+                fixed (byte* rawPtr = rawBytes)
+                fixed (float* xPtr = x, rPtr = result)
+                    SimdKernels.MatMulBatched(rPtr, rawPtr, xPtr, n, rows, cols, ti.DType);
+            }
+        }
+        else
+        {
+            // Fallback: dequantize + naive multiply (should not be reached in normal operation)
+            var w = W(wName);
+            DiffusionOps.Linear(x, w, null, n, inDim, outDim).AsSpan().CopyTo(result);
+        }
+
+        if (bias is not null)
+        {
+            for (int b = 0; b < n; b++)
+                TensorPrimitives.Add(result.AsSpan(b * outDim, outDim),
+                                     bias.AsSpan(), result.AsSpan(b * outDim, outDim));
+        }
+
+        return result;
+    }
+
     public void Dispose()
     {
         if (!_disposed)
         {
             _disposed = true;
             _weightCache.Clear();
+            if (_gpuWeightsBf16 != null)
+            {
+                foreach (var t in _gpuWeightsBf16.Values) _backend.Free(t);
+                _gpuWeightsBf16.Clear();
+            }
+            if (_gpuWeightsFp8 != null)
+            {
+                foreach (var t in _gpuWeightsFp8.Values) _backend.Free(t);
+                _gpuWeightsFp8.Clear();
+            }
         }
     }
 }

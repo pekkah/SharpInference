@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Numerics.Tensors;
 using SharpInference.Core;
 using SharpInference.Cpu;
+using CoreTensor = SharpInference.Core.Tensor;
 
 namespace SharpInference.Diffusion.TextEncoders;
 
@@ -19,27 +20,35 @@ namespace SharpInference.Diffusion.TextEncoders;
 ///   intermediate_size=9728, rope_theta=1e6, rms_norm_eps=1e-6
 ///   FFN: gate_proj * silu(up_proj) — standard SiLU-gated (no w3, just up+gate)
 ///
-/// Performance: quantized matmuls use SimdKernels.MatMulBatched with zero-copy mmap
-/// pointers (GgufModel.GetTensorDataPtr), so large weight matrices are never
-/// dequantized to float32 upfront — on-the-fly dequant happens in SIMD registers.
+/// Performance: when a GPU backend is provided, large weight projections are routed
+/// through cuBLAS (bf16 on sm_80+, fp32 otherwise). Without a GPU backend, quantized
+/// matmuls use SimdKernels.MatMulBatched with zero-copy mmap pointers so large weight
+/// matrices are never dequantized upfront — on-the-fly dequant in SIMD registers.
 /// </summary>
 public sealed class QwenTextEncoder : IDisposable
 {
     private readonly GgufModel _model;
     private readonly ZImageParams _p;
+    private readonly IComputeBackend? _backend;
     // Cache only small tensors (norms, q/k-norm weights). Large weight matrices are
-    // accessed via MatQ() → GetTensorDataPtr() → SimdKernels.MatMulBatched().
+    // either uploaded to GPU on-the-fly (GPU path) or accessed via GetTensorDataPtr
+    // (CPU path).
     private readonly Dictionary<string, float[]> _cache = new(StringComparer.Ordinal);
+    // GPU weight cache: dequantized bf16 tensors uploaded once and reused across calls.
+    private readonly Dictionary<string, CoreTensor>? _gpuWeights;
 
     private readonly float[] _ropeCos;
     private readonly float[] _ropeSin;
     private readonly int _maxSeqLen = 4096;
     private bool _disposed;
 
-    public QwenTextEncoder(GgufModel model, ZImageParams p)
+    public QwenTextEncoder(GgufModel model, ZImageParams p, IComputeBackend? backend = null)
     {
-        _model = model;
-        _p     = p;
+        _model   = model;
+        _p       = p;
+        _backend = backend;
+        if (backend is not null)
+            _gpuWeights = new Dictionary<string, CoreTensor>(StringComparer.Ordinal);
         (_ropeCos, _ropeSin) = BuildRopeTables(_maxSeqLen, p.QwenHeadDim, p.QwenRopeTheta);
     }
 
@@ -241,18 +250,77 @@ public sealed class QwenTextEncoder : IDisposable
     // ── Quantized matmul: x[n,k] @ W[outDim,k]^T → out[n,outDim] ─────────
 
     /// <summary>
-    /// Runs the matrix multiply using SimdKernels.MatMulBatched with a zero-copy
-    /// mmap pointer (GgufModel.GetTensorDataPtr). Dequantization happens on-the-fly
-    /// inside SIMD kernels — no large float32 allocations.
+    /// Runs the matrix multiply. When a GPU backend is available, dequantizes the
+    /// weight to bf16, uploads to VRAM (cached after first use), and calls cuBLAS.
+    /// Falls back to SimdKernels.MatMulBatched on CPU with a zero-copy mmap pointer.
     /// </summary>
     private unsafe float[] MatQ(float[] x, int n, int k, string wName, int outDim)
     {
         var result = new float[n * outDim];
         var info   = _model.FindTensor(wName)
                      ?? throw new KeyNotFoundException($"Qwen weight not found: {wName}");
+        int rows = (int)info.Dimensions[1]; // ne1 = output features
+        int cols = (int)info.Dimensions[0]; // ne0 = input features
+
+        if (_backend is not null && _gpuWeights is not null)
+        {
+            // ── GPU path (bf16 weights cached in VRAM) ─────────────────────
+            if (!_gpuWeights.TryGetValue(wName, out var wGpu))
+            {
+                int wCount = rows * cols;
+                var wBuf32 = ArrayPool<float>.Shared.Rent(wCount);
+                var wBf16  = ArrayPool<ushort>.Shared.Rent(wCount);
+                try
+                {
+                    byte* ptr = _model.GetTensorDataPtr(info);
+                    Dequantize.ToFloat32(
+                        new ReadOnlySpan<byte>((void*)ptr, (int)info.ByteSize),
+                        wBuf32, info.DType, wCount);
+                    for (int i = 0; i < wCount; i++)
+                        wBf16[i] = (ushort)(BitConverter.SingleToInt32Bits(wBuf32[i]) >> 16);
+                    wGpu = _backend.UploadBf16(wBf16.AsSpan(0, wCount), TensorShape.D1(wCount));
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(wBuf32);
+                    ArrayPool<ushort>.Shared.Return(wBf16);
+                }
+                _gpuWeights[wName] = wGpu;
+            }
+
+            int xCount = n * cols;
+            var xBf16  = ArrayPool<ushort>.Shared.Rent(xCount);
+            try
+            {
+                for (int i = 0; i < xCount; i++)
+                    xBf16[i] = (ushort)(BitConverter.SingleToInt32Bits(x[i]) >> 16);
+                var xGpu = _backend.UploadBf16(xBf16.AsSpan(0, xCount), TensorShape.D1(xCount));
+                var cGpu = _backend.Allocate(TensorShape.D1(n * rows), DType.BFloat16);
+                try
+                {
+                    _backend.Sgemm(cGpu, xGpu, wGpu, n, cols, rows);
+                    _backend.Synchronize();
+                    var cBf16 = ArrayPool<ushort>.Shared.Rent(n * rows);
+                    try
+                    {
+                        _backend.DownloadBf16(cGpu, cBf16.AsSpan(0, n * rows));
+                        for (int i = 0; i < n * rows; i++)
+                            result[i] = BitConverter.Int32BitsToSingle((int)((uint)cBf16[i] << 16));
+                    }
+                    finally { ArrayPool<ushort>.Shared.Return(cBf16); }
+                }
+                finally
+                {
+                    _backend.Free(xGpu);
+                    _backend.Free(cGpu);
+                }
+            }
+            finally { ArrayPool<ushort>.Shared.Return(xBf16); }
+            return result;
+        }
+
+        // ── CPU path: zero-copy mmap pointer + on-the-fly SIMD dequant ────
         byte* wPtr = _model.GetTensorDataPtr(info);
-        int   rows = (int)info.Dimensions[1]; // ne1 = output features
-        int   cols = (int)info.Dimensions[0]; // ne0 = input features
         fixed (float* xPtr = x, rPtr = result)
             SimdKernels.MatMulBatched(rPtr, wPtr, xPtr, n, rows, cols, info.DType);
         return result;
@@ -296,6 +364,12 @@ public sealed class QwenTextEncoder : IDisposable
         if (!_disposed)
         {
             _disposed = true;
+            if (_gpuWeights is not null)
+            {
+                foreach (var t in _gpuWeights.Values)
+                    _backend!.Free(t);
+                _gpuWeights.Clear();
+            }
             _cache.Clear();
         }
     }
