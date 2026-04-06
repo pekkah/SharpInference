@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-SharpInference is a high-performance LLM inference engine in C# 14 / .NET 10. It reads GGUF model files and runs transformer inference on CPU (AVX2/AVX-512 SIMD) and GPU (Vulkan compute shaders). Targets NativeAOT for single-binary deployment.
+SharpInference is a high-performance LLM inference engine and image generation pipeline in C# 14 / .NET 10. It reads GGUF model files and runs transformer inference on CPU (AVX2/AVX-512 SIMD) and GPU (Vulkan compute shaders, CUDA/cuBLAS). Also supports text-to-image generation via Z-Image-Turbo (S3-DiT + Qwen3-4B + FLUX VAE). Targets NativeAOT for single-binary deployment.
 
 ## Build & Test Commands
 
 ```bash
 dotnet build                # Debug build
 dotnet build -c Release     # Release (NativeAOT opts: IlcOptimizationPreference=Speed)
-dotnet test                 # Run all tests (152 tests across 5 projects)
+dotnet test                 # Run all tests (207 tests across 5 projects)
 dotnet test --filter "FullyQualifiedName~SomeTest"  # Run a single test
 
 # Run CLI inference
@@ -32,6 +32,17 @@ dotnet publish src/SharpInference.Server -c Release -r win-x64
 
 # Benchmarks
 dotnet run --project benchmarks/SharpInference.Bench -c Release -- --filter '*'
+
+# Image generation (Z-Image-Turbo)
+dotnet run --project src/SharpInference.Cli -c Release -- image \
+  -m models/z_image_turbo-Q5_K_M.gguf \
+  --vae models/z-image-turbo/vae \
+  --qwen-encoder models/Z-Image-AbliteratedV1.Q5_K_M.gguf \
+  --qwen-tokenizer models/z-image-turbo/tokenizer/tokenizer.json \
+  -p "a serene mountain lake at sunrise" -W 512 -H 512 --steps 4 -o out.png
+
+# Image generation micro-benchmarks
+dotnet run --project benchmarks/SharpInference.ImageBench -c Release -- --bench --filter '*'
 ```
 
 ## Architecture
@@ -39,9 +50,10 @@ dotnet run --project benchmarks/SharpInference.Bench -c Release -- --filter '*'
 Four-layer stack, bottom-up:
 
 1. **Core** (`SharpInference.Core`) — GGUF parser (memory-mapped), BPE tokenizer (`Microsoft.ML.Tokenizers`), tensor types, model graph. Everything depends on this.
-2. **Compute Backends** — Two implementations of `IComputeBackend`:
+2. **Compute Backends** — Three implementations of `IComputeBackend`:
    - `SharpInference.Cpu` — AVX2/AVX-512 SIMD kernels, Q4_K_M dequantization, optional OpenBLAS GEMM
    - `SharpInference.Vulkan` — Vulkan compute via `Vortice.Vulkan`, SPIR-V shaders, GPU buffer pool
+   - `SharpInference.Cuda` — cuBLAS GEMM (fp32/bf16/fp16/fp8) for image generation DiT inference; includes `GpuBufferPool` to eliminate per-GEMM `cudaMalloc`/`cudaFree` overhead
 3. **Engine** (`SharpInference.Engine`) — Forward pass orchestration, KV cache, temperature/top-k/top-p/min-p sampling, speculative decoding. Depends on Core + both backends.
 4. **Frontends** — CLI (`Spectre.Console.Cli`, llama.cpp-compatible flags) and API Server (ASP.NET Core Minimal API with `/v1/messages` Anthropic + `/v1/chat/completions` OpenAI endpoints).
 
