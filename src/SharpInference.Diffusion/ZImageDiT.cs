@@ -537,7 +537,8 @@ public sealed class ZImageDiT : IDisposable
                          _gpuWeights != null &&
                          (dtype == DType.Q5_K || dtype == DType.Q4_K))
                 {
-                    // GPU dequant path: upload raw quantized bytes once, dequant on GPU each call
+                    // GPU dequant path: upload raw quantized bytes once, dequant on GPU each call.
+                    // SgemmF16: A=fp32 activations, B=fp16 weights, C=fp32 output (no fp16 overflow).
                     if (!_gpuWeights.TryGetValue(wName, out var rawGpu))
                     {
                         rawGpu = _backend.UploadRaw(
@@ -549,8 +550,6 @@ public sealed class ZImageDiT : IDisposable
                     int numBlocks = rows * cols / 256;
                     int xCount   = n * cols;
                     int cCount   = n * rows;
-                    Half[] xHalf = ArrayPool<Half>.Shared.Rent(xCount);
-                    Half[] cHalf = ArrayPool<Half>.Shared.Rent(cCount);
                     var wGpu = _backend.Allocate(TensorShape.D1(rows * cols), DType.Float16);
                     try
                     {
@@ -559,57 +558,52 @@ public sealed class ZImageDiT : IDisposable
                         else
                             _backend.DequantQ4KM(rawGpu, wGpu, numBlocks);
 
-                        for (int i = 0; i < xCount; i++) xHalf[i] = (Half)x[i];
-                        var xGpu = _backend.UploadHalf(xHalf.AsSpan(0, xCount), TensorShape.D1(xCount));
-                        var cGpu = _backend.Allocate(TensorShape.D1(cCount), DType.Float16);
+                        // Upload activations as fp32 (not fp16) — avoids overflow for large intermediate values
+                        // (e.g. SiLU(w1) * w3 can exceed fp16 range of 65504).
+                        // SgemmF16 reads A as fp32, B as fp16 — weights get fp16 bandwidth savings only.
+                        var xGpu = _backend.Upload(x.AsSpan(0, xCount), TensorShape.D1(xCount));
+                        var cGpu = _backend.Allocate(TensorShape.D1(cCount), DType.Float32);
                         try
                         {
                             _backend.Sgemm(cGpu, xGpu, wGpu, n, cols, rows);
                             _backend.Synchronize();
-                            _backend.DownloadHalf(cGpu, cHalf.AsSpan(0, cCount));
+                            _backend.Download(cGpu, result.AsSpan());
                         }
                         finally
                         {
                             _backend.Free(xGpu);
                             _backend.Free(cGpu);
                         }
-
-                        for (int i = 0; i < cCount; i++) result[i] = (float)cHalf[i];
                     }
                     finally
                     {
                         _backend.Free(wGpu);
-                        ArrayPool<Half>.Shared.Return(xHalf);
-                        ArrayPool<Half>.Shared.Return(cHalf);
                     }
                 }
                 else if (_backend.BestSgemmPrecision == SgemmPrecision.Fp16)
                 {
-                    // fp16 GPU path: dequantize weight to Half, upload as fp16, run fp16 SGEMM
+                    // fp16-weight GPU path: A=fp32 activations (no overflow), B=fp16 weights (bandwidth), C=fp32
                     int wCount = rows * cols;
                     float[] wBuf32 = ArrayPool<float>.Shared.Rent(wCount);
-                    Half[] xHalf   = ArrayPool<Half>.Shared.Rent(n * cols);
                     Half[] wHalf   = ArrayPool<Half>.Shared.Rent(wCount);
-                    Half[] cHalf   = ArrayPool<Half>.Shared.Rent(n * rows);
                     try
                     {
                         Dequantize.ToFloat32(
                             new ReadOnlySpan<byte>((byte*)ptr, (int)byteLen),
                             wBuf32.AsSpan(0, wCount), dtype, wCount);
 
-                        // Convert fp32 activations and weights to fp16
                         int xCount = n * cols;
-                        for (int i = 0; i < xCount; i++)   xHalf[i] = (Half)x[i];
-                        for (int i = 0; i < wCount; i++)   wHalf[i] = (Half)wBuf32[i];
+                        for (int i = 0; i < wCount; i++) wHalf[i] = (Half)wBuf32[i];
 
-                        var xGpu = _backend.UploadHalf(xHalf.AsSpan(0, xCount), TensorShape.D1(xCount));
+                        // Upload activations as fp32 — avoids overflow for large intermediates
+                        var xGpu = _backend.Upload(x.AsSpan(0, xCount), TensorShape.D1(xCount));
                         var wGpu = _backend.UploadHalf(wHalf.AsSpan(0, wCount), TensorShape.D1(wCount));
-                        var cGpu = _backend.Allocate(TensorShape.D1(n * rows), DType.Float16);
+                        var cGpu = _backend.Allocate(TensorShape.D1(n * rows), DType.Float32);
                         try
                         {
                             _backend.Sgemm(cGpu, xGpu, wGpu, n, cols, rows);
                             _backend.Synchronize();
-                            _backend.DownloadHalf(cGpu, cHalf.AsSpan(0, n * rows));
+                            _backend.Download(cGpu, result.AsSpan());
                         }
                         finally
                         {
@@ -617,17 +611,11 @@ public sealed class ZImageDiT : IDisposable
                             _backend.Free(wGpu);
                             _backend.Free(cGpu);
                         }
-
-                        // Convert fp16 output back to fp32
-                        int cCount = n * rows;
-                        for (int i = 0; i < cCount; i++)  result[i] = (float)cHalf[i];
                     }
                     finally
                     {
                         ArrayPool<float>.Shared.Return(wBuf32);
-                        ArrayPool<Half>.Shared.Return(xHalf);
                         ArrayPool<Half>.Shared.Return(wHalf);
-                        ArrayPool<Half>.Shared.Return(cHalf);
                     }
                 }
                 else

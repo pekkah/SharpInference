@@ -1489,13 +1489,15 @@ internal static class Shaders
         """;
 
     /// <summary>
-    /// Tiled fp16 SGEMM: C[M,N] = A[M,K] × B[N,K]^T
-    /// All inputs and output are float16_t.  Accumulation is done in fp32 for numerical stability.
+    /// Mixed-precision SGEMM: C[M,N] = A[M,K] × B[N,K]^T
+    /// A (activations) is fp32 — avoids activation overflow (e.g. SiLU*gate &gt; 65504).
+    /// B (weights) is fp16 — bandwidth savings on large weight matrices.
+    /// Accumulation and output C are fp32 — full range, no overflow.
     ///
     /// Requires: VK_KHR_shader_float16_int8 + VK_KHR_16bit_storage
     ///
     /// Push constants: { uint M, uint N, uint K }.
-    /// Bindings: 0=A (readonly fp16), 1=B (readonly fp16), 2=C (writeonly fp16).
+    /// Bindings: 0=A (readonly fp32 activations), 1=B (readonly fp16 weights), 2=C (writeonly fp32).
     /// Dispatch: (ceil(M/16), ceil(N/16), 1) with local_size=(16,16,1).
     /// </summary>
     internal const string SgemmF16 = """
@@ -1511,11 +1513,11 @@ internal static class Shaders
             uint K;
         } pc;
 
-        layout(binding = 0) readonly  buffer BufA { float16_t a_data[]; };
+        layout(binding = 0) readonly  buffer BufA { float    a_data[]; };
         layout(binding = 1) readonly  buffer BufB { float16_t b_data[]; };
-        layout(binding = 2) writeonly buffer BufC { float16_t c_data[]; };
+        layout(binding = 2) writeonly buffer BufC { float    c_data[]; };
 
-        // fp32 shared tiles; VRAM bandwidth still saved via fp16 global reads/writes.
+        // fp32 shared tiles. A reads fp32, B reads fp16 (converted on load).
         shared float tileA[16][17];
         shared float tileB[16][17];
 
@@ -1531,7 +1533,7 @@ internal static class Shaders
                 uint bCol = t * 16u + gl_LocalInvocationID.x;
 
                 tileA[gl_LocalInvocationID.x][gl_LocalInvocationID.y] =
-                    (row < pc.M && aCol < pc.K) ? float(a_data[row * pc.K + aCol]) : 0.0;
+                    (row < pc.M && aCol < pc.K) ? a_data[row * pc.K + aCol] : 0.0;
 
                 tileB[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
                     (col < pc.N && bCol < pc.K) ? float(b_data[col * pc.K + bCol]) : 0.0;
@@ -1545,7 +1547,7 @@ internal static class Shaders
             }
 
             if (row < pc.M && col < pc.N)
-                c_data[row * pc.N + col] = float16_t(acc);
+                c_data[row * pc.N + col] = acc;
         }
         """;
 
