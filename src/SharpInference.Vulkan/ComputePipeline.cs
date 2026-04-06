@@ -24,9 +24,6 @@ public sealed unsafe class ComputePipeline : IDisposable
     private readonly int _pushConstantSize;
     private bool _disposed;
 
-    // Descriptor set caching: skip vkUpdateDescriptorSets when bindings unchanged
-    private ulong _cachedBindingHash;
-
     /// <summary>
     /// Create a compute pipeline from GLSL source.
     /// </summary>
@@ -232,16 +229,7 @@ public sealed unsafe class ComputePipeline : IDisposable
         uint groupCountX, uint groupCountY = 1, uint groupCountZ = 1,
         void* pushConstants = null)
     {
-        // Hash buffer handles to detect binding changes
-        ulong hash = (ulong)buffers.Length * 2654435761ul;
-        for (int i = 0; i < buffers.Length; i++)
-            hash ^= ((ulong)buffers[i].Buffer.Handle * 2654435761ul) << (i & 3);
-
-        if (hash != _cachedBindingHash)
-        {
-            UpdateDescriptorSet(_reusableDs, buffers);
-            _cachedBindingHash = hash;
-        }
+        UpdateDescriptorSet(_reusableDs, buffers);
         RecordDispatch(cmd, _reusableDs, groupCountX, groupCountY, groupCountZ, pushConstants);
     }
 
@@ -253,15 +241,9 @@ public sealed unsafe class ComputePipeline : IDisposable
         uint groupCountX, uint groupCountY = 1, uint groupCountZ = 1,
         void* pushConstants = null)
     {
-        ulong hash = (ulong)buffers.Length * 2654435761ul;
-        for (int i = 0; i < buffers.Length; i++)
-            hash ^= ((ulong)buffers[i].Buffer.Handle * 2654435761ul) << (i & 3);
-
-        if (hash != _cachedBindingHash)
-        {
-            UpdateDescriptorSet(_reusableDs, buffers);
-            _cachedBindingHash = hash;
-        }
+        // Always update descriptor set; VkBuffer handles can be reused after Free()
+        // causing a hash collision that would silently bind stale/freed descriptors.
+        UpdateDescriptorSet(_reusableDs, buffers);
         Dispatch(cmd, _reusableDs, groupCountX, groupCountY, groupCountZ, pushConstants);
     }
 

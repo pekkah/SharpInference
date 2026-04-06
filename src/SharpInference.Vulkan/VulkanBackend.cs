@@ -398,8 +398,13 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     public bool HasShaderFloat8 { get; private set; }
 
     public SgemmPrecision BestSgemmPrecision =>
-        HasShaderFloat8 && HasShaderFloat16Int8 && Has16BitStorage ? SgemmPrecision.Fp8E4M3 :
-        HasShaderBfloat16 ? SgemmPrecision.Bf16 :
+        // Bf16 and fp8 are disabled for Vulkan DiT inference:
+        // - Bf16: caching all DiT weights as bf16 requires ~15 GB VRAM (exceeds 12 GB RTX 4070 Ti).
+        //   This causes VK_ERROR_DEVICE_LOST (NVIDIA reports OOM as device lost).
+        // - Fp8: VK_EXT_shader_float8 storage buffer access requires additional driver features
+        //   not reliably available. fp8 is auto-selected for CUDA only (via cuBLAS GemmEx).
+        // Fp16 routes ZImageDiT to the GPU dequant path: stores raw Q5_K bytes once (~2 GB)
+        // and dequantizes on GPU per SGEMM call — correct, memory-safe, and still faster than CPU.
         HasShaderFloat16Int8 && Has16BitStorage ? SgemmPrecision.Fp16 :
         SgemmPrecision.Fp32;
 
@@ -1177,7 +1182,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         uint gx = ((uint)M + 15u) / 16u;
         uint gy = ((uint)N + 15u) / 16u;
 
-        if (A.DType == DType.Float8E4M3 && HasShaderFloat8 && HasShaderFloat16Int8 && Has16BitStorage)
+        if (A.DType == DType.Float8E4M3 && B.DType == DType.Float8E4M3 && HasShaderFloat8)
         {
             try
             {

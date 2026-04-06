@@ -1515,8 +1515,9 @@ internal static class Shaders
         layout(binding = 1) readonly  buffer BufB { float16_t b_data[]; };
         layout(binding = 2) writeonly buffer BufC { float16_t c_data[]; };
 
-        shared float16_t tileA[16][17];
-        shared float16_t tileB[16][17];
+        // fp32 shared tiles; VRAM bandwidth still saved via fp16 global reads/writes.
+        shared float tileA[16][17];
+        shared float tileB[16][17];
 
         void main() {
             uint row = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
@@ -1530,16 +1531,15 @@ internal static class Shaders
                 uint bCol = t * 16u + gl_LocalInvocationID.x;
 
                 tileA[gl_LocalInvocationID.x][gl_LocalInvocationID.y] =
-                    (row < pc.M && aCol < pc.K) ? a_data[row * pc.K + aCol] : float16_t(0.0);
+                    (row < pc.M && aCol < pc.K) ? float(a_data[row * pc.K + aCol]) : 0.0;
 
                 tileB[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
-                    (col < pc.N && bCol < pc.K) ? b_data[col * pc.K + bCol] : float16_t(0.0);
+                    (col < pc.N && bCol < pc.K) ? float(b_data[col * pc.K + bCol]) : 0.0;
 
                 barrier();
 
                 for (uint k = 0u; k < 16u; k++)
-                    acc += float(tileA[gl_LocalInvocationID.x][k]) *
-                           float(tileB[gl_LocalInvocationID.y][k]);
+                    acc += tileA[gl_LocalInvocationID.x][k] * tileB[gl_LocalInvocationID.y][k];
 
                 barrier();
             }
@@ -1634,8 +1634,10 @@ internal static class Shaders
         layout(binding = 0) readonly  buffer BufA { bfloat16_t a_data[]; };
         layout(binding = 1) readonly  buffer BufB { bfloat16_t b_data[]; };
         layout(binding = 2) writeonly buffer BufC { bfloat16_t c_data[]; };
-        shared bfloat16_t tileA[16][17];
-        shared bfloat16_t tileB[16][17];
+        // fp32 shared tiles to avoid driver issues with bf16 shared memory;
+        // global loads/stores remain bf16 so VRAM bandwidth is fully saved.
+        shared float tileA[16][17];
+        shared float tileB[16][17];
         void main() {
             uint row = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
             uint col = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
@@ -1645,12 +1647,12 @@ internal static class Shaders
                 uint aCol = t * 16u + gl_LocalInvocationID.y;
                 uint bCol = t * 16u + gl_LocalInvocationID.x;
                 tileA[gl_LocalInvocationID.x][gl_LocalInvocationID.y] =
-                    (row < pc.M && aCol < pc.K) ? a_data[row * pc.K + aCol] : bfloat16_t(0.0);
+                    (row < pc.M && aCol < pc.K) ? float(a_data[row * pc.K + aCol]) : 0.0;
                 tileB[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
-                    (col < pc.N && bCol < pc.K) ? b_data[col * pc.K + bCol] : bfloat16_t(0.0);
+                    (col < pc.N && bCol < pc.K) ? float(b_data[col * pc.K + bCol]) : 0.0;
                 barrier();
                 for (uint k = 0u; k < 16u; k++)
-                    acc += float(tileA[gl_LocalInvocationID.x][k]) * float(tileB[gl_LocalInvocationID.y][k]);
+                    acc += tileA[gl_LocalInvocationID.x][k] * tileB[gl_LocalInvocationID.y][k];
                 barrier();
             }
             if (row < pc.M && col < pc.N)
@@ -1668,16 +1670,15 @@ internal static class Shaders
     internal const string SgemmFp8 = """
         #version 450
         #extension GL_EXT_shader_explicit_arithmetic_types_float8_e4m3 : require
-        #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-        #extension GL_EXT_shader_16bit_storage : require
 
         layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
         layout(push_constant) uniform PC { uint M; uint N; uint K; } pc;
-        layout(binding = 0) readonly  buffer BufA { float16_t a_data[]; };
+        layout(binding = 0) readonly  buffer BufA { float8_e4m3_t a_data[]; };
         layout(binding = 1) readonly  buffer BufB { float8_e4m3_t b_data[]; };
-        layout(binding = 2) writeonly buffer BufC { float16_t c_data[]; };
-        shared float16_t tileA[16][17];
-        shared float16_t tileB[16][17];
+        layout(binding = 2) writeonly buffer BufC { float c_data[]; };
+        // fp32 shared tiles: avoids driver issues with fp16/fp8 shared memory
+        shared float tileA[16][17];
+        shared float tileB[16][17];
         void main() {
             uint row = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
             uint col = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
@@ -1687,16 +1688,16 @@ internal static class Shaders
                 uint aCol = t * 16u + gl_LocalInvocationID.y;
                 uint bCol = t * 16u + gl_LocalInvocationID.x;
                 tileA[gl_LocalInvocationID.x][gl_LocalInvocationID.y] =
-                    (row < pc.M && aCol < pc.K) ? a_data[row * pc.K + aCol] : float16_t(0.0);
+                    (row < pc.M && aCol < pc.K) ? float(a_data[row * pc.K + aCol]) : 0.0;
                 tileB[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
-                    (col < pc.N && bCol < pc.K) ? float16_t(b_data[col * pc.K + bCol]) : float16_t(0.0);
+                    (col < pc.N && bCol < pc.K) ? float(b_data[col * pc.K + bCol]) : 0.0;
                 barrier();
                 for (uint k = 0u; k < 16u; k++)
-                    acc += float(tileA[gl_LocalInvocationID.x][k]) * float(tileB[gl_LocalInvocationID.y][k]);
+                    acc += tileA[gl_LocalInvocationID.x][k] * tileB[gl_LocalInvocationID.y][k];
                 barrier();
             }
             if (row < pc.M && col < pc.N)
-                c_data[row * pc.N + col] = float16_t(acc);
+                c_data[row * pc.N + col] = acc;
         }
         """;
 
@@ -1749,21 +1750,21 @@ internal static class Shaders
             uint qhBase = bBase + 16u;
             uint qlBase = bBase + 48u;
 
-            uint grp  = elem / 64u;
-            uint loc  = elem % 64u;
-            uint half = loc  / 32u;
-            uint l    = loc  % 32u;
+            uint grp   = elem / 64u;
+            uint loc   = elem % 64u;
+            uint lo_hi = loc  / 32u;
+            uint l     = loc  % 32u;
 
-            uint scaleIdx = grp * 2u + half;
+            uint scaleIdx = grp * 2u + lo_hi;
             uint sc, mn;
             getScaleMinK4(scaleIdx, scBase, sc, mn);
             float df  = d    * float(sc);
             float dmf = dmin * float(mn);
 
-            uint u      = 1u << (grp * 2u + half);
+            uint u      = 1u << (grp * 2u + lo_hi);
             uint hBit   = ((byteAt(qhBase + l) & u) != 0u) ? 16u : 0u;
             uint qlByte = byteAt(qlBase + grp * 32u + l);
-            uint q5     = (half == 0u ? (qlByte & 0xFu) : (qlByte >> 4u)) + hBit;
+            uint q5     = (lo_hi == 0u ? (qlByte & 0xFu) : (qlByte >> 4u)) + hBit;
 
             dst[blockIdx * 256u + elem] = float16_t(df * float(q5) - dmf);
         }
@@ -1816,19 +1817,19 @@ internal static class Shaders
             uint scBase = bBase + 4u;
             uint qlBase = bBase + 16u;
 
-            uint grp  = elem / 64u;
-            uint loc  = elem % 64u;
-            uint half = loc  / 32u;
-            uint l    = loc  % 32u;
+            uint grp   = elem / 64u;
+            uint loc   = elem % 64u;
+            uint lo_hi = loc  / 32u;
+            uint l     = loc  % 32u;
 
-            uint scaleIdx = grp * 2u + half;
+            uint scaleIdx = grp * 2u + lo_hi;
             uint sc, mn;
             getScaleMinK4(scaleIdx, scBase, sc, mn);
             float df  = d    * float(sc);
             float dmf = dmin * float(mn);
 
             uint qlByte = byteAt(qlBase + grp * 32u + l);
-            uint q4     = (half == 0u) ? (qlByte & 0xFu) : (qlByte >> 4u);
+            uint q4     = (lo_hi == 0u) ? (qlByte & 0xFu) : (qlByte >> 4u);
 
             dst[blockIdx * 256u + elem] = float16_t(df * float(q4) - dmf);
         }

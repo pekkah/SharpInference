@@ -72,6 +72,10 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
         [DefaultValue(-1)]
         public int NGpuLayers { get; init; }
 
+        [CommandOption("--backend")]
+        [Description("(Z-Image) Force compute backend: auto (default), cuda, vulkan, cpu")]
+        public string? Backend { get; init; }
+
         // ── FLUX options ──────────────────────────────────────────────────
 
         [CommandOption("--clip-l")]
@@ -206,9 +210,18 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                     IComputeBackend? gpu = null;
                     try
                     {
-                        if (s.NGpuLayers != 0)  // 0 = explicit CPU-only; -1/positive = auto GPU
+                        // Resolve which backend to use:
+                        //   --backend cuda|vulkan|cpu  → forced
+                        //   -g 0                       → CPU only
+                        //   default (-1)               → CUDA → Vulkan → CPU fallback
+                        string backendChoice = (s.Backend ?? "auto").ToLowerInvariant();
+                        bool forceCpu    = s.NGpuLayers == 0 || backendChoice == "cpu";
+                        bool forceCuda   = backendChoice == "cuda";
+                        bool forceVulkan = backendChoice == "vulkan";
+
+                        if (!forceCpu)
                         {
-                            if (CudaBackend.IsAvailable())
+                            if (forceCuda || (!forceVulkan && CudaBackend.IsAvailable()))
                             {
                                 gpu = CudaBackend.Create();
                                 AnsiConsole.MarkupLine("[dim]Backend:[/]  GPU (CUDA cuBLAS)");
@@ -224,14 +237,13 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                                 }
                                 catch
                                 {
-                                    // No GPU available — fall back to CPU silently
                                     AnsiConsole.MarkupLine("[dim]Backend:[/]  CPU (no GPU detected)");
                                 }
                             }
                         }
                         else
                         {
-                            AnsiConsole.MarkupLine("[dim]Backend:[/]  CPU (forced via -g 0)");
+                            AnsiConsole.MarkupLine("[dim]Backend:[/]  CPU");
                         }
 
                         var pipeline = ZImagePipeline.Load(
