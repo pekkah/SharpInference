@@ -14,7 +14,7 @@ namespace SharpInference.Cuda;
 ///   fallback → fp32
 /// All LLM transformer operations throw NotSupportedException; this backend is DiT-only.
 /// </summary>
-public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
+public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDisposable
 {
     private readonly nint _handle;
     private readonly SgemmPrecision _precision;
@@ -29,11 +29,35 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
     private nuint  _pinnedBufSize;
     private const nuint InitialPinnedSize = 32 * 1024 * 1024; // 32 MB
 
+    // Maximum im2col tile buffer size. All row-aligned tile sizes fit within this bound.
+    private const long MaxTileBytes = 2560L * 1024 * 1024; // 2.5 GiB — fits all layers in a single tile
+
     // GPU buffer pool: reuse device allocations by rounded size to avoid cudaMalloc overhead.
     // Each MatQ call (GEMM) does 2 alloc+free cycles; pooling eliminates driver round-trips.
     private readonly GpuBufferPool _pool = new();
 
     private bool _disposed;
+
+    // ── NVRTC / image-ops state ────────────────────────────────────────────
+    private readonly object _kernelInitLock = new();
+    private bool   _imageKernelsInitialized;
+    private bool   _imageKernelsAvailable;
+    private nint   _nvModule;           // CUmodule loaded from compiled PTX
+    private nint   _im2colKernel;
+
+    // Persistent GPU buffer for im2col tiles — allocated once to MaxTileBytes (2.5 GiB).
+    private nint   _im2colBuf;
+    private nuint  _im2colBufSize;
+
+    private nint   _biasAddKernel;
+    private nint   _leakyReluKernel;
+    private nint   _scaleKernel;
+    private nint   _addKernel;
+    private nint   _addScaledKernel;
+    private nint   _clampKernel;
+    private nint   _pshuffleKernel;
+    private nint   _punshuffleKernel;
+    private nint   _upsample2xKernel;
 
     public string Name => $"CUDA GPU (cuBLAS, {_precision})";
 
@@ -91,11 +115,28 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
         if (stream != nint.Zero)
             CuBlasInterop.SetStream(handle, stream);
 
+        // Enable TF32 tensor cores for Sgemm on Ampere/Ada (sm_80+).
+        // TF32: on sm_80+ (Ampere+), enable TF32 tensor cores for cublasSgemm.
+        // TF32 rounds mantissa to 10 bits but uses tensor cores — ~2× faster while
+        // numerically close to FP32. No algorithm benchmarking overhead with SetMathMode.
+        if (smVersion >= 80)
+        {
+            int mmr = CuBlasInterop.SetMathMode(handle, CuBlasInterop.CUBLAS_TF32_TENSOR_OP_MATH);
+            if (mmr != 0)
+                Console.Error.WriteLine($"[CudaBackend] cublasSetMathMode(TF32) returned {mmr} — using default math");
+        }
+
         // Pinned (page-locked) staging buffer for DMA-capable async H2D/D2H transfers.
         CuBlasInterop.MallocHost(out nint pinnedBuf, InitialPinnedSize);
 
         var resolvedPrecision = precision ?? DetectBestPrecision(smVersion);
-        return new CudaBackend(handle, resolvedPrecision, smVersion, stream, pinnedBuf, InitialPinnedSize);
+        var backend = new CudaBackend(handle, resolvedPrecision, smVersion, stream, pinnedBuf, InitialPinnedSize);
+
+        // Pre-allocate im2col buffer now (2.5 GiB) so the first Conv2d call doesn't trigger
+        // a blocking cudaMalloc that would stall GPU work enqueued before it.
+        backend.EnsureIm2ColBuf(MaxTileBytes);
+
+        return backend;
     }
 
     private static SgemmPrecision DetectBestPrecision(int sm)
@@ -413,8 +454,19 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
     public void MatMul(Tensor output, Tensor matrix, Tensor vector) =>
         throw new NotSupportedException("CudaBackend is DiT-only; use VulkanBackend for full LLM inference");
 
-    public void AddInPlace(Tensor dst, Tensor src) =>
-        throw new NotSupportedException("CudaBackend is DiT-only");
+    public void AddInPlace(Tensor dst, Tensor src)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC is not available; cannot run CUDA image kernels.");
+
+        int n  = (int)dst.ElementCount;
+        nint p0 = GetDevPtr(dst);
+        nint p1 = GetDevPtr(src);
+        int  p2 = n;
+        nint* args = stackalloc nint[3] { (nint)(&p0), (nint)(&p1), (nint)(&p2) };
+        Launch1D(_addKernel, n, args);
+    }
 
     public void ElementwiseMul(Tensor output, Tensor a, Tensor b) =>
         throw new NotSupportedException("CudaBackend is DiT-only");
@@ -442,6 +494,477 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
             ? entry.devPtr
             : throw new InvalidOperationException($"Tensor handle {tensor.Handle} not registered in CudaBackend");
 
+    // ── IImageOpsBackend ──────────────────────────────────────────────────
+
+    /// <summary>
+    /// Returns true when NVRTC image kernels are available and compiled.
+    /// Triggers lazy compilation on first call.
+    /// </summary>
+    public bool ImageKernelsAvailable
+    {
+        get
+        {
+            EnsureImageKernels();
+            return _imageKernelsAvailable;
+        }
+    }
+
+    /// <summary>
+    /// Lazily compile all image-ops CUDA kernels via NVRTC and load the resulting PTX.
+    /// Idempotent: subsequent calls are a no-op once initialised (success or failure).
+    /// On failure sets <c>_imageKernelsAvailable = false</c> so callers can fall back gracefully.
+    /// </summary>
+    private void EnsureImageKernels()
+    {
+        if (_imageKernelsInitialized) return;
+        lock (_kernelInitLock)
+        {
+            if (_imageKernelsInitialized) return;
+            try
+            {
+                CompileAndLoadKernels();
+                _imageKernelsAvailable = true;
+            }
+            catch (Exception ex)
+            {
+                _imageKernelsAvailable = false;
+                // Log to stderr so the user can see NVRTC failure reason when debugging.
+                Console.Error.WriteLine($"[CudaBackend] NVRTC kernel init failed: {ex.Message}");
+            }
+            finally
+            {
+                _imageKernelsInitialized = true;
+            }
+        }
+    }
+
+    private void CompileAndLoadKernels()
+    {
+        // Ensure the CUDA Driver API context exists (shares the primary context with the runtime).
+        NvrtcInterop.CuInit(0);
+
+        // Try to load from cubin cache first (avoids both NVRTC compilation and PTX JIT overhead).
+        string cacheFile = GetCubinCachePath();
+        if (TryLoadCubinFromCache(cacheFile)) return;
+
+        byte[] srcBytes  = NvrtcInterop.ToUtf8(CudaKernels.Source);
+        byte[] nameBytes = NvrtcInterop.ToUtf8("sharpi_image_ops.cu");
+
+        nint prog = nint.Zero;
+        fixed (byte* pSrc = srcBytes)
+        fixed (byte* pName = nameBytes)
+        {
+            int r = NvrtcInterop.CreateProgram(out prog, pSrc, pName, 0, nint.Zero, nint.Zero);
+            if (r != 0) throw new InvalidOperationException($"nvrtcCreateProgram failed: {r}");
+        }
+
+        byte[]? binary = null;
+        try
+        {
+            // Compile targeting the actual GPU's SM version to get a cubin (no JIT at launch).
+            // Falls back to PTX (with JIT overhead) if the SM version is unknown or cubin fails.
+            string archFlag = _smVersion > 0 ? $"--gpu-architecture=sm_{_smVersion}" : "--gpu-architecture=compute_52";
+            byte[] archBytes = NvrtcInterop.ToUtf8(archFlag);
+            int rc;
+            fixed (byte* pArch = archBytes)
+            {
+                nint opts = (nint)(&pArch);
+                rc = NvrtcInterop.CompileProgramWithOptions(prog, 1, opts);
+            }
+            if (rc != 0)
+            {
+                NvrtcInterop.GetProgramLogSize(prog, out nuint logSize);
+                byte[] logBuf = new byte[(int)logSize];
+                string log;
+                fixed (byte* pLog = logBuf)
+                {
+                    NvrtcInterop.GetProgramLog(prog, pLog);
+                    log = System.Text.Encoding.UTF8.GetString(logBuf);
+                }
+                throw new InvalidOperationException($"nvrtcCompileProgram failed ({rc}):\n{log}");
+            }
+
+            // Prefer cubin (no JIT) over PTX (lazy JIT on first kernel launch = slow).
+            // nvrtcGetCubin requires NVRTC 11.1+; fall through to PTX on older versions.
+            try
+            {
+                if (NvrtcInterop.GetCubinSize(prog, out nuint cubinSize) == 0 && cubinSize > 0)
+                {
+                    binary = new byte[(int)cubinSize];
+                    fixed (byte* pBin = binary)
+                    {
+                        int r2 = NvrtcInterop.GetCubin(prog, pBin);
+                        if (r2 != 0) binary = null;
+                    }
+                }
+            }
+            catch { binary = null; }  // nvrtcGetCubin not available on this NVRTC version
+
+            if (binary is null)
+            {
+                // Fall back to PTX (triggers JIT at first kernel launch, slower).
+                NvrtcInterop.GetPTXSize(prog, out nuint ptxSize);
+                binary = new byte[(int)ptxSize];
+                fixed (byte* pPtx = binary)
+                {
+                    NvrtcInterop.GetPTX(prog, pPtx);
+                }
+            }
+
+            fixed (byte* pBin = binary)
+            {
+                int mr = NvrtcInterop.ModuleLoadData(out _nvModule, pBin);
+                if (mr != 0) throw new InvalidOperationException($"cuModuleLoadData failed: {mr}");
+            }
+        }
+        finally
+        {
+            NvrtcInterop.DestroyProgram(ref prog);
+        }
+
+        // Persist cubin to disk so future runs skip both NVRTC compilation and JIT.
+        if (binary is not null)
+        {
+            try { File.WriteAllBytes(cacheFile, binary); }
+            catch { /* ignore cache write failures */ }
+        }
+
+        LoadKernelFunctions();
+    }
+
+    private string GetCubinCachePath()
+    {
+        // Cache key: SHA-256 of kernel source + SM version.
+        // Any source change or GPU change invalidates the cache.
+        byte[] hash = System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(CudaKernels.Source + _smVersion));
+        string hex = Convert.ToHexString(hash)[..16];
+        return Path.Combine(Path.GetTempPath(), $"sharpi_cubin_sm{_smVersion}_{hex}.bin");
+    }
+
+    private bool TryLoadCubinFromCache(string cacheFile)
+    {
+        if (!File.Exists(cacheFile)) return false;
+        try
+        {
+            byte[] cubinBuf = File.ReadAllBytes(cacheFile);
+            fixed (byte* pBin = cubinBuf)
+            {
+                int mr = NvrtcInterop.ModuleLoadData(out _nvModule, pBin);
+                if (mr != 0) return false;
+            }
+            LoadKernelFunctions();
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void LoadKernelFunctions()
+    {
+        _im2colKernel      = GetKernelFunc("im2col");
+        _biasAddKernel     = GetKernelFunc("bias_add");
+        _leakyReluKernel   = GetKernelFunc("leaky_relu_inplace");
+        _scaleKernel       = GetKernelFunc("scale_inplace");
+        _addKernel         = GetKernelFunc("add_inplace");
+        _addScaledKernel   = GetKernelFunc("add_scaled_inplace");
+        _clampKernel       = GetKernelFunc("clamp_inplace");
+        _pshuffleKernel    = GetKernelFunc("pixel_shuffle");
+        _punshuffleKernel  = GetKernelFunc("pixel_unshuffle");
+        _upsample2xKernel  = GetKernelFunc("upsample2x");
+    }
+
+    private nint GetKernelFunc(string name)
+    {
+        byte[] nameBytes = NvrtcInterop.ToUtf8(name);
+        fixed (byte* pName = nameBytes)
+        {
+            int r = NvrtcInterop.ModuleGetFunction(out nint func, _nvModule, pName);
+            if (r != 0) throw new InvalidOperationException($"cuModuleGetFunction({name}) failed: {r}");
+            return func;
+        }
+    }
+
+    /// <summary>Launch a 1-D kernel with 1024 threads per block over <paramref name="total"/> elements.</summary>
+    private void Launch1D(nint kernel, int total, nint* args)
+    {
+        uint grid = (uint)((total + 1023) / 1024);
+        int r = NvrtcInterop.LaunchKernel(kernel, grid, 1, 1, 1024, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel failed: {r}");
+    }
+
+    /// <summary>
+    /// Ensure the GPU im2col tile buffer is at least <paramref name="minBytes"/> bytes.
+    /// On first call, allocates exactly <see cref="MaxTileBytes"/> (2.5 GiB) so that all
+    /// possible tile sizes for any RRDB or upsample layer fit in a single tile without
+    /// reallocation. Single-tile mode keeps lda=ldc=N so all cuBLAS reads/writes are
+    /// contiguous — multi-tile with strided ldc is never needed.
+    /// </summary>
+    private void EnsureIm2ColBuf(long minBytes)
+    {
+        if (_im2colBuf != nint.Zero && _im2colBufSize >= (nuint)minBytes) return;
+        if (_im2colBuf != nint.Zero)
+        {
+            CuBlasInterop.CudaFree(_im2colBuf);
+            _im2colBuf     = nint.Zero;
+            _im2colBufSize = 0;
+        }
+        // Allocate MaxTileBytes so subsequent calls never need to grow.
+        // All valid tilePixels (aligned to full rows) produce minBytes ≤ MaxTileBytes.
+        nuint newSize = (nuint)MaxTileBytes;
+        int r = CuBlasInterop.CudaMalloc(out _im2colBuf, newSize);
+        if (r != 0) throw new InvalidOperationException($"cudaMalloc({newSize / 1024 / 1024} MiB im2col buf) failed: {r}");
+        _im2colBufSize = newSize;
+    }
+
+    /// <inheritdoc/>
+    public Tensor Conv2d(Tensor input, Tensor weight, Tensor bias,
+                         int inCh, int outCh, int h, int w, int ksize, int padding = -1)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC is not available; cannot run CUDA image kernels.");
+        if (ksize != 3)
+            throw new NotSupportedException($"Conv2d CUDA only supports ksize=3 (got ksize={ksize}).");
+
+        int N = h * w;
+        int K = inCh * 9;   // im2col columns
+
+        nint inputPtr  = GetDevPtr(input);
+        nint weightPtr = GetDevPtr(weight);
+        nint biasPtr   = GetDevPtr(bias);
+
+        // ── Output allocation (CHW: [outCh, N] row-major) ──────────────────
+        var  output    = Allocate(TensorShape.D1((long)outCh * N));
+        nint outputPtr = GetDevPtr(output);
+
+        // ── Tile size ───────────────────────────────────────────────────────
+        // With MaxTileBytes=2.5 GiB, every real layer fits in a single tile:
+        //   RRDB max (K=1728, N=262144): 1.81 GiB  < 2.5 GiB ✓
+        //   Upsample  (K=576,  N=4M):   2.41 GiB  < 2.5 GiB ✓
+        // Single-tile: lda=tileN=N, ldc=N — all cuBLAS accesses are contiguous.
+        int tilePixels = (int)Math.Min((long)N, MaxTileBytes / ((long)K * sizeof(float)));
+        tilePixels = Math.Max(tilePixels, w); // at least one full row per tile
+
+        // Align tile to complete rows so ph_start = pixel_start / w is integer
+        tilePixels = (tilePixels / w) * w;
+
+        EnsureIm2ColBuf((long)tilePixels * K * sizeof(float));
+
+        float alpha = 1.0f, beta = 0.0f;
+
+        // Hoist kernel-arg pointers outside the loop (CA2014: no stackalloc in loops).
+        // Only cp5 (ph_start) and cp6 (tileN) vary per tile; we update them before each launch.
+        nint cp0 = inputPtr, cp1 = _im2colBuf;
+        int  cp2 = h, cp3 = w, cp4 = N, cp5 = 0, cp6 = 0, cp7 = inCh, cp8 = K;
+        nint* args = stackalloc nint[9]
+        {
+            (nint)(&cp0), (nint)(&cp1),
+            (nint)(&cp2), (nint)(&cp3), (nint)(&cp4),
+            (nint)(&cp5), (nint)(&cp6),
+            (nint)(&cp7), (nint)(&cp8)
+        };
+
+        for (int pixelStart = 0; pixelStart < N; pixelStart += tilePixels)
+        {
+            int tileN    = Math.Min(tilePixels, N - pixelStart);
+            cp5 = pixelStart / w;  // ph_start
+            cp6 = tileN;
+
+            // ── im2col kernel: fills _im2colBuf[K, tileN] ──────────────────
+            // Block (32=pixel, 8=k) — consecutive tx (pixel) → coalesced writes.
+            // Grid (ceil(tileN/32), ceil(K/8)).
+            {
+                uint grX = ((uint)tileN + 31) / 32;
+                uint grY = ((uint)K     +  7) / 8;
+                int er = NvrtcInterop.LaunchKernel(_im2colKernel, grX, grY, 1, 32, 8, 1, 0, _stream, args, null);
+                if (er != 0) throw new InvalidOperationException($"im2col launch failed: {er}");
+            }
+
+            // ── GEMM: C = A*B where A=col[K,tileN], B=weight[K,outCh], C=out[tileN,outCh] ─
+            // col[K, tileN]: column k starts at k*tileN → lda=tileN (contiguous columns).
+            // weight[outCh, K] row-major = [K, outCh] col-major → ldb=K.
+            // Output at outputPtr + pixelStart, ldc=N → C[pixel, oc] = out[pixelStart+pixel+oc*N].
+            nint gemmDst = outputPtr + (nint)(pixelStart * sizeof(float));
+            int gr = CuBlasInterop.Sgemm(
+                _handle,
+                CuBlasInterop.OpN, CuBlasInterop.OpN,
+                tileN, outCh, K,
+                ref alpha,
+                _im2colBuf, tileN,   // A=[K,tileN] col-major, lda=tileN
+                weightPtr,  K,       // B=[K,outCh] col-major, ldb=K
+                ref beta,
+                gemmDst, N);         // C=[tileN,outCh] col-major, ldc=N
+            if (gr != 0) throw new InvalidOperationException($"cublasSgemm (tile {pixelStart}/{N}) failed: {gr}");
+        }
+
+        // ── Bias: output[oc, pixel] += bias[oc]  (full output, one kernel) ─
+        nint bp0 = outputPtr, bp1 = biasPtr;
+        int  bp2 = N, bp3 = outCh;
+        nint* bargs = stackalloc nint[4] { (nint)(&bp0), (nint)(&bp1), (nint)(&bp2), (nint)(&bp3) };
+        uint grBias = ((uint)N + 255) / 256;
+        int br = NvrtcInterop.LaunchKernel(_biasAddKernel, grBias, 1, 1, 256, 1, 1, 0, _stream, bargs, null);
+        if (br != 0) throw new InvalidOperationException($"bias_add launch failed: {br}");
+
+        return output;
+    }
+
+    /// <inheritdoc/>
+    public void LeakyReluInPlace(Tensor x, float negSlope)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC is not available; cannot run CUDA image kernels.");
+
+        int n = (int)x.ElementCount;
+        nint p0 = GetDevPtr(x);
+        float p1 = negSlope;
+        int   p2 = n;
+        nint* args = stackalloc nint[3] { (nint)(&p0), (nint)(&p1), (nint)(&p2) };
+        Launch1D(_leakyReluKernel, n, args);
+    }
+
+    /// <inheritdoc/>
+    public void ScaleInPlace(Tensor x, float scale)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC is not available; cannot run CUDA image kernels.");
+
+        int n = (int)x.ElementCount;
+        nint  p0 = GetDevPtr(x);
+        float p1 = scale;
+        int   p2 = n;
+        nint* args = stackalloc nint[3] { (nint)(&p0), (nint)(&p1), (nint)(&p2) };
+        Launch1D(_scaleKernel, n, args);
+    }
+
+    /// <inheritdoc/>
+    public void AddScaledInPlace(Tensor dst, Tensor src, float scale)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC is not available; cannot run CUDA image kernels.");
+
+        int n = (int)dst.ElementCount;
+        nint  p0 = GetDevPtr(dst);
+        nint  p1 = GetDevPtr(src);
+        float p2 = scale;
+        int   p3 = n;
+        nint* args = stackalloc nint[4] { (nint)(&p0), (nint)(&p1), (nint)(&p2), (nint)(&p3) };
+        Launch1D(_addScaledKernel, n, args);
+    }
+
+    /// <inheritdoc/>
+    public void ClampInPlace(Tensor x, float min, float max)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC is not available; cannot run CUDA image kernels.");
+
+        int n = (int)x.ElementCount;
+        nint  p0 = GetDevPtr(x);
+        float p1 = min, p2 = max;
+        int   p3 = n;
+        nint* args = stackalloc nint[4] { (nint)(&p0), (nint)(&p1), (nint)(&p2), (nint)(&p3) };
+        Launch1D(_clampKernel, n, args);
+    }
+
+    /// <inheritdoc/>
+    public Tensor CatChannels(Tensor a, int aCh, Tensor b, int bCh, int hw)
+    {
+        var output = Allocate(TensorShape.D1((long)(aCh + bCh) * hw));
+        nint outPtr = GetDevPtr(output);
+        nint aPtr   = GetDevPtr(a);
+        nint bPtr   = GetDevPtr(b);
+        nuint aBytes = (nuint)(aCh * hw * sizeof(float));
+        nuint bBytes = (nuint)(bCh * hw * sizeof(float));
+        // Two async DMA copies on the same stream — no kernel dispatch overhead.
+        CuBlasInterop.CudaMemcpyAsync(outPtr,           aPtr, aBytes, CuBlasInterop.DeviceToDevice, _stream);
+        CuBlasInterop.CudaMemcpyAsync(outPtr + (nint)aBytes, bPtr, bBytes, CuBlasInterop.DeviceToDevice, _stream);
+        return output;
+    }
+
+    /// <inheritdoc/>
+    public Tensor PixelShuffleGpu(Tensor input, int inCh, int h, int w, int upscaleFactor)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC is not available; cannot run CUDA image kernels.");
+
+        int outCh = inCh / (upscaleFactor * upscaleFactor);
+        var output = Allocate(TensorShape.D1((long)outCh * h * upscaleFactor * w * upscaleFactor));
+        nint p0 = GetDevPtr(input), p1 = GetDevPtr(output);
+        int  p2 = outCh, p3 = h, p4 = w, p5 = upscaleFactor;
+        nint* args = stackalloc nint[6]
+        {
+            (nint)(&p0), (nint)(&p1),
+            (nint)(&p2), (nint)(&p3), (nint)(&p4), (nint)(&p5)
+        };
+        Launch1D(_pshuffleKernel, outCh * h * upscaleFactor * w * upscaleFactor, args);
+        return output;
+    }
+
+    /// <inheritdoc/>
+    public Tensor PixelUnshuffleGpu(Tensor input, int inCh, int h, int w, int downscaleFactor)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC is not available; cannot run CUDA image kernels.");
+
+        int outCh = inCh * downscaleFactor * downscaleFactor;
+        int outH  = h / downscaleFactor;
+        int outW  = w / downscaleFactor;
+        var output = Allocate(TensorShape.D1((long)outCh * outH * outW));
+        nint p0 = GetDevPtr(input), p1 = GetDevPtr(output);
+        // kernel signature: (input, output, inCh, outH, outW, r)
+        int  p2 = inCh, p3 = outH, p4 = outW, p5 = downscaleFactor;
+        nint* args = stackalloc nint[6]
+        {
+            (nint)(&p0), (nint)(&p1),
+            (nint)(&p2), (nint)(&p3), (nint)(&p4), (nint)(&p5)
+        };
+        Launch1D(_punshuffleKernel, outCh * outH * outW, args);
+        return output;
+    }
+
+    /// <inheritdoc/>
+    public Tensor Upsample2xGpu(Tensor input, int ch, int h, int w)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC is not available; cannot run CUDA image kernels.");
+
+        var output = Allocate(TensorShape.D1((long)ch * h * 2 * w * 2));
+        nint p0 = GetDevPtr(input), p1 = GetDevPtr(output);
+        int  p2 = ch, p3 = h, p4 = w;
+        nint* args = stackalloc nint[5]
+        {
+            (nint)(&p0), (nint)(&p1),
+            (nint)(&p2), (nint)(&p3), (nint)(&p4)
+        };
+        Launch1D(_upsample2xKernel, ch * h * 2 * w * 2, args);
+        return output;
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>No-op: CUDA streams are already asynchronous.</remarks>
+    public void BeginBatch() { }
+
+    /// <inheritdoc/>
+    /// <remarks>No-op: CUDA kernels on the same stream execute in order.</remarks>
+    public void BatchBarrier() { }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// No-op for CUDA: all kernels are queued on <c>_stream</c> and execute in order,
+    /// so no explicit submission or synchronisation is needed between RDB blocks.
+    /// The stream is synchronised exactly once at <see cref="Download"/> time.
+    /// </remarks>
+    public void EndBatch() { }
+
     // ── Disposal ──────────────────────────────────────────────────────────
 
     public void Dispose()
@@ -454,6 +977,18 @@ public sealed unsafe class CudaBackend : IComputeBackend, IDisposable
         _devPtrs.Clear();
 
         _pool.Dispose();
+
+        if (_nvModule != nint.Zero)
+        {
+            NvrtcInterop.ModuleUnload(_nvModule);
+            _nvModule = nint.Zero;
+        }
+
+        if (_im2colBuf != nint.Zero)
+        {
+            CuBlasInterop.CudaFree(_im2colBuf);
+            _im2colBuf = nint.Zero;
+        }
 
         CuBlasInterop.Destroy(_handle);
 
