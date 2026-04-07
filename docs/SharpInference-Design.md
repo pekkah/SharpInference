@@ -279,8 +279,9 @@ GPU acceleration via NVIDIA CUDA and cuBLAS. Targets RTX 30/40-series (sm_80+) w
 
 ```
 SharpInference.Cuda/
-├── CudaBackend.cs          # IComputeBackend implementation + GpuBufferPool
-└── CuBlasInterop.cs        # P/Invoke bindings: cublas*, cuda* runtime
+├── CudaBackend.cs          # IComputeBackend + IImageOpsBackend implementation + GpuBufferPool
+├── CuBlasInterop.cs        # P/Invoke bindings: cublas*, cuda* runtime
+└── NvrtcInterop.cs         # P/Invoke bindings: NVRTC + CUDA Driver API (runtime kernel compilation)
 ```
 
 **cuBLAS SGEMM contract:**
@@ -1241,6 +1242,7 @@ SharpInference/
 │   │   │   ├── LayerWeights.cs
 │   │   │   └── ModelLoader.cs
 │   │   └── IComputeBackend.cs
+│   │   └── IImageOpsBackend.cs         # Extended interface for convolutional image ops
 │   │
 │   ├── SharpInference.Cpu/
 │   │   ├── CpuBackend.cs
@@ -1266,13 +1268,15 @@ SharpInference/
 │   │   └── CuBlasInterop.cs        # cublasSgemm, cublasGemmEx, cudaMemcpy bindings
 │   │
 │   ├── SharpInference.Diffusion/
-│   │   ├── ZImagePipeline.cs       # Top-level: encode → denoise → decode
+│   │   ├── ZImagePipeline.cs       # Top-level: encode → denoise → decode → (optional upscale)
 │   │   ├── ZImageDiT.cs            # S3-DiT transformer (Q5_K_M GGUF, GPU cuBLAS)
 │   │   ├── ZImageParams.cs         # Hyperparams: DefaultSteps=4, latent dims
 │   │   ├── ZImageRoPE.cs           # 2D RoPE for image patches
 │   │   ├── VaeDecoder.cs           # FLUX VAE: latent→RGB (GPU im2col+SGEMM, fp32)
 │   │   ├── FluxDiT.cs              # FLUX.1-schnell DiT (alternative pipeline)
-│   │   ├── DiffusionOps.cs         # Conv2D, GroupNorm, SiLU, Upsample (CPU reference)
+│   │   ├── ImagePipeline.cs        # FLUX.1-schnell pipeline wrapper
+│   │   ├── RRDBNet.cs              # Real-ESRGAN upscaler (RRDB, GPU NVRTC+cuBLAS)
+│   │   ├── DiffusionOps.cs         # Conv2D, GroupNorm, SiLU, Upsample, UpsampleBicubic, BlendRgb
 │   │   └── TextEncoders/
 │   │       └── QwenTextEncoder.cs  # Qwen3-4B text encoder (GPU bf16 SGEMM + weight cache)
 │   │
@@ -2143,6 +2147,132 @@ All 207 tests pass.
 
 ---
 
+### Phase 12: RRDBNet Image Upscaler ✅
+
+**Goal:** 4× image upscaling via Real-ESRGAN RRDBNet, fully CUDA-accelerated with optional blend control to soften aggressive sharpening.
+
+**Architecture:**
+
+RRDBNet (Residual-in-Residual Dense Block Network) is the backbone of Real-ESRGAN / ESRGAN. Each RRDB block contains 3 Residual Dense Blocks (RDB), each with 5 convolutional layers connected via dense skip connections and a growth-channel accumulation pattern.
+
+```
+Input RGB [3, H, W]
+  ↓  conv_first  [3→64, 3×3]
+Feature map [64, H, W]
+  ↓  23× RRDB blocks
+  │   ↓  3× RDB  (5 conv layers + dense + scale×0.2)
+  │   └─ trunk skip + scale×0.2
+Feature map [64, H, W]
+  ↓  conv_body + skip from conv_first
+  ↓  2× upsample conv (nearest + conv 3×3)
+  ↓  conv_last [64→3, 3×3]
+Output RGB [3, 4H, 4W]
+```
+
+**Implementation** (`src/SharpInference.Diffusion/RRDBNet.cs`):
+
+- Loads weights from `.safetensors` format; handles both `conv_first.*` and `model.conv_first.*` weight naming prefixes
+- Auto-detects hyperparameters (num_feat, num_block, num_grow_ch, scale, upsample style) from weight tensor shapes
+- Scale-2 models: bilinear resize post-inference (matching official Real-ESRGAN pipeline convention)
+- Tiled inference for large images with configurable overlap to hide seams
+
+**IImageOpsBackend interface** (`src/SharpInference.Core/IImageOpsBackend.cs`):
+
+Extends `IComputeBackend` with the spatial operations needed for convolutional networks:
+
+```csharp
+public interface IImageOpsBackend : IComputeBackend
+{
+    // input [inCh,H,W] + weight [outCh,inCh,k,k] + bias [outCh] → [outCh,H,W]
+    Tensor Conv2d(Tensor input, Tensor weight, Tensor bias,
+                  int inCh, int outCh, int h, int w, int ksize, int padding = -1);
+    void LeakyReluInPlace(Tensor x, float negSlope);
+    void ScaleInPlace(Tensor x, float scale);
+    void AddScaledInPlace(Tensor dst, Tensor src, float scale);
+    void ClampInPlace(Tensor x, float min, float max);
+    Tensor CatChannels(Tensor a, int aCh, Tensor b, int bCh, int hw);
+    Tensor PixelShuffle(Tensor x, int ch, int h, int w, int r);
+    Tensor PixelUnshuffle(Tensor x, int ch, int h, int w, int r);
+    Tensor Upsample2x(Tensor x, int ch, int h, int w);
+}
+```
+
+**CUDA NVRTC Kernels** (`src/SharpInference.Cuda/NvrtcInterop.cs`, `CudaKernels.cs`):
+
+Custom CUDA kernels compiled at runtime via NVRTC handle all element-wise and spatial ops without CPU round-trips:
+
+| Kernel | Operation |
+|--------|-----------|
+| `im2col` | Extract `[K, N]` patch matrix (K = inCh×k×k, N = H×W) |
+| `leaky_relu` | LeakyReLU in-place (negSlope = 0.2) |
+| `scale` | Scalar multiply in-place |
+| `add` | Element-wise add in-place |
+| `clamp` | Clamp to [0, 1] |
+| `cat_channels` | Concatenate along C axis |
+| `pixel_shuffle` | Sub-pixel convolution rearrangement |
+| `pixel_unshuffle` | Inverse pixel shuffle |
+| `upsample2x` | Nearest-neighbor 2× upsampling |
+
+NVRTC compiles kernels to PTX at startup via `nvrtcCreateProgram` / `nvrtcCompileProgram`, then loads via the CUDA Driver API (`cuModuleLoadData`, `cuModuleGetFunction`). This avoids bundling a pre-compiled `.cubin` and produces optimal code for the installed GPU's compute capability.
+
+**im2col Memory Layout and cuBLAS SGEMM:**
+
+Conv2d is implemented as im2col + Sgemm:
+
+```
+im2col(input [C,H,W], ksize) → col [K, N]   K = inCh×k×k, N = H×W
+Sgemm(weight [outCh, K], col [K, N]) → output [outCh, N] = [outCh, H, W]
+```
+
+The `[K, N]` layout is critical for cuBLAS performance. In column-major representation, each "column" of `col` contains one pixel's neighborhood — N contiguous floats. cuBLAS reads these columns directly, giving coalesced memory access. The earlier `[N, K]` layout with `transa=OpT` forced cuBLAS to read stride-K rows (K=576 = 2304 bytes between elements for a 3×3×64 kernel), which is pathologically cache-unfriendly and caused a 2.5× throughput loss.
+
+**TF32 tensor cores via `cublasSetMathMode`:**
+
+`cublasSetMathMode(CUBLAS_TF32_TENSOR_OP_MATH)` enables transparent TF32 acceleration in `cublasSgemm` on sm_80+ (RTX 30/40-series). The correct `[K,N]` memory layout is a prerequisite — with the old layout, cuBLAS selected a non-tensor-core algorithm regardless of the math mode setting.
+
+**Pre-allocated 2.5 GiB im2col buffer:**
+
+A single 2.5 GiB im2col buffer is pre-allocated in `CudaBackend.Create()`. All RRDB and upsample layers fit in a single tile (largest: upsample at K=576, N=4M pixels ≈ 2.41 GiB). Single-tile processing guarantees `ldc = N = tileN` contiguous output, eliminating a secondary strided-write penalty.
+
+**`--upscale-blend` — sharpness control:**
+
+RRDB upscaling aggressively enhances textures and edges. The `--upscale-blend` option (range 0–1, default 1.0) blends RRDB output with a bicubic upscale:
+
+```
+output[i] = blend × rrdb[i] + (1 − blend) × bicubic[i]
+```
+
+`DiffusionOps.UpsampleBicubic` uses the Keys (a=−0.5) cubic kernel with half-pixel centering. `DiffusionOps.BlendRgb` performs the linear per-pixel blend. A value of `0.8` produces natural-looking portraits: retained fabric and texture detail from RRDB, with softer skin rendering.
+
+**CLI:**
+
+```bash
+dotnet run --project src/SharpInference.Cli -- image \
+  -m models/z_image_turbo-Q5_K_M.gguf \
+  --vae models/z-image-turbo/vae \
+  --qwen-encoder models/Z-Image-AbliteratedV1.Q5_K_M.gguf \
+  --qwen-tokenizer models/z-image-turbo/tokenizer/tokenizer.json \
+  --upscaler models/RealESRGAN_x4plus.pth \
+  --upscale-blend 0.8 \
+  -p "photorealistic woman with red lipstick" -W 512 -H 512 -o out.png
+```
+
+**Benchmark results (RTX 4070 Ti sm_89, 512×512 → 2048×2048):**
+
+| Stage | Time |
+|-------|------|
+| Text encoding (Qwen3-4B, 35 layers) | ~110 s |
+| DiT denoising (4 steps) | ~3 s |
+| VAE decode | ~41 s |
+| RRDBNet upscale (RRDB body ~11 s + upsample ~7 s) | **~18.5 s** |
+| **Total (cold start, CLI)** | **~173 s** |
+
+RRDB timing before optimization: ~46 s (old `[N,K]` im2col, no TF32). After `[K,N]` layout + TF32: ~18.5 s — **2.5× speedup**.
+
+All 207 tests pass.
+
+---
+
 ### 13.1 Correctness
 
 Every phase validates against llama.cpp as the reference implementation:
@@ -2225,6 +2355,7 @@ Based on the reference benchmarks above, these are concrete targets per phase:
 | 7c | Multi-user server | PagedAttention + continuous batching | vLLM ~485 tot t/s @10 users | ≥ 300 tot t/s | ✅ `ContinuousBatchingEngine` + `BatchForwardMulti`; SHARPI_MAX_BATCH controls batch size |
 | 8 | API completeness | Server, all models | N/A | All metrics non-zero; logit_bias accepted | ✅ Fixed metrics recording; `queue_depth`/`active_requests` gauges; `logit_bias` support |
 | 11 | Qwen3-Coder 30B-A3B Q4_K_M | CPU only, DDR4-3200 64GB | ~20 TG t/s (llama.cpp est.) | Correct output | **20.8 TG t/s** ✅ | Qwen3-MoE arch: QK norm + 128-expert routing; 4× faster than Scout due to 8/128 expert sparsity |
+| 12 | RRDBNet 4× upscaler | 512×512 → 2048×2048, RTX 4070 Ti | N/A | Fast GPU upscale | **18.5 s total** ✅ (was 46 s; 2.5× via [K,N] im2col + TF32); `--upscale-blend` for softness control |
 
 **Stretch targets (if all optimizations compose well):**
 

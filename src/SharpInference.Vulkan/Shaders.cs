@@ -1836,4 +1836,294 @@ internal static class Shaders
             dst[blockIdx * 256u + elem] = float16_t(df * float(q4) - dmf);
         }
         """;
+
+    // ── Image upscaler ops (RRDBNet) ──────────────────────────────────────
+
+    /// <summary>
+    /// 2D convolution: output[outCh, H, W] = conv(input[inCh, H, W], weight[outCh, inCh, k, k]) + bias[outCh]
+    /// stride=1, configurable padding (default same).
+    /// Each thread computes one output element (oc, oh, ow).
+    /// Push constants: { inCh, outCh, height, width, ksize, padding }.
+    /// Bindings: 0=input, 1=weight, 2=bias, 3=output.
+    /// Dispatch: ceil(outCh * H * W / 256).
+    /// </summary>
+    /// <summary>
+    /// Conv2d shader using a 2D workgroup dispatch: X=outCh, Y=ceil(H*W/256).
+    /// All 256 threads in a workgroup share the same output channel, so they
+    /// cooperatively load that channel's weight vector into shared memory once —
+    /// reducing weight reads from global memory by 256×.
+    ///
+    /// Dispatch: (outCh, ceil(H*W / 256), 1) — matches VulkanBackend.Conv2d.
+    /// Push constants unchanged: { inCh, outCh, height, width, ksize, padding }.
+    /// </summary>
+    internal const string Conv2d = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly  buffer Input  { float input_data[];  };
+        layout(binding = 1) readonly  buffer Weight { float weight_data[]; };
+        layout(binding = 2) readonly  buffer Bias   { float bias_data[];   };
+        layout(binding = 3) writeonly buffer Output { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint inCh;
+            uint outCh;
+            uint height;
+            uint width;
+            uint ksize;
+            uint padding;
+        };
+
+        // Shared memory for one output-channel's weight vector.
+        // Max weight per channel: 192 inCh × 3×3 kernel = 1728 floats = 6.75 KB.
+        // 2048 slots provides safe alignment margin.
+        shared float sWeights[2048];
+
+        void main() {
+            uint oc      = gl_WorkGroupID.x;           // output channel index
+            uint tileIdx = gl_WorkGroupID.y;           // spatial tile within channel
+            uint lid     = gl_LocalInvocationID.x;     // thread within tile (0..255)
+
+            uint hw  = height * width;
+            uint pos = tileIdx * 256u + lid;           // output pixel index
+
+            // Cooperatively load all weights for this output channel into shared memory.
+            // wLen ≤ 2048 for all configs in RRDBNet; each thread loads ceil(wLen/256) slots.
+            uint wLen  = inCh * ksize * ksize;
+            uint wBase = oc * wLen;
+            for (uint i = lid; i < wLen; i += 256u)
+                sWeights[i] = weight_data[wBase + i];
+
+            // Ensure all threads see the fully loaded weights before computing.
+            barrier();
+            memoryBarrierShared();
+
+            if (oc >= outCh || pos >= hw) return;
+
+            uint oh = pos / width;
+            uint ow = pos % width;
+
+            float acc = bias_data[oc];
+            for (uint ic = 0u; ic < inCh; ic++) {
+                uint iBase   = ic * hw;
+                uint wIcBase = ic * ksize * ksize;
+                for (uint kh = 0u; kh < ksize; kh++) {
+                    for (uint kw = 0u; kw < ksize; kw++) {
+                        int ih = int(oh + kh) - int(padding);
+                        int iw = int(ow + kw) - int(padding);
+                        if (uint(ih) < height && uint(iw) < width)
+                            acc += input_data[iBase + uint(ih) * width + uint(iw)]
+                                 * sWeights[wIcBase + kh * ksize + kw];
+                    }
+                }
+            }
+            output_data[oc * hw + pos] = acc;
+        }
+        """;
+
+    /// <summary>
+    /// LeakyReLU in-place: data[i] = data[i] >= 0 ? data[i] : negSlope * data[i]
+    /// Push constants: { n, negSlope }.
+    /// Bindings: 0=data (in/out).
+    /// </summary>
+    internal const string LeakyRelu = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer Data { float data[]; };
+
+        layout(push_constant) uniform Params {
+            uint  n;
+            float negSlope;
+        };
+
+        void main() {
+            uint i = gl_GlobalInvocationID.x;
+            if (i >= n) return;
+            float x = data[i];
+            data[i] = x >= 0.0 ? x : negSlope * x;
+        }
+        """;
+
+    /// <summary>
+    /// Clamp in-place: data[i] = clamp(data[i], minVal, maxVal)
+    /// Push constants: { n, minVal, maxVal }.
+    /// Bindings: 0=data (in/out).
+    /// </summary>
+    internal const string ClampInPlace = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer Data { float data[]; };
+
+        layout(push_constant) uniform Params {
+            uint  n;
+            float minVal;
+            float maxVal;
+        };
+
+        void main() {
+            uint i = gl_GlobalInvocationID.x;
+            if (i >= n) return;
+            data[i] = clamp(data[i], minVal, maxVal);
+        }
+        """;
+
+    /// <summary>
+    /// Channel concatenation: output[(aCh+bCh), hw] from a[aCh, hw] and b[bCh, hw].
+    /// Push constants: { aCh, bCh, hw }.
+    /// Bindings: 0=a, 1=b, 2=output.
+    /// Dispatch: ceil((aCh+bCh)*hw / 256).
+    /// </summary>
+    internal const string CatChannels = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly  buffer A      { float a_data[];      };
+        layout(binding = 1) readonly  buffer B      { float b_data[];      };
+        layout(binding = 2) writeonly buffer Output { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint aCh;
+            uint bCh;
+            uint hw;
+        };
+
+        void main() {
+            uint idx   = gl_GlobalInvocationID.x;
+            uint outCh = aCh + bCh;
+            if (idx >= outCh * hw) return;
+
+            uint c   = idx / hw;
+            uint pos = idx % hw;
+            output_data[idx] = (c < aCh)
+                ? a_data[c * hw + pos]
+                : b_data[(c - aCh) * hw + pos];
+        }
+        """;
+
+    /// <summary>
+    /// Pixel shuffle: [inCh, H, W] → [inCh/r², H*r, W*r]  (r = upscale)
+    /// Push constants: { inCh, h, w, upscale }.
+    /// Bindings: 0=input, 1=output.
+    /// Dispatch: ceil(outCh*outH*outW / 256).
+    /// </summary>
+    internal const string PixelShuffle = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly  buffer Input  { float input_data[];  };
+        layout(binding = 1) writeonly buffer Output { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint inCh;
+            uint h;
+            uint w;
+            uint upscale;
+        };
+
+        void main() {
+            uint r2    = upscale * upscale;
+            uint outCh = inCh / r2;
+            uint outH  = h * upscale;
+            uint outW  = w * upscale;
+
+            uint idx = gl_GlobalInvocationID.x;
+            if (idx >= outCh * outH * outW) return;
+
+            uint outHW = outH * outW;
+            uint oc    = idx / outHW;
+            uint pos   = idx % outHW;
+            uint oh    = pos / outW;
+            uint ow    = pos % outW;
+
+            uint ih = oh / upscale;
+            uint iw = ow / upscale;
+            uint rh = oh % upscale;
+            uint rw = ow % upscale;
+
+            // Input channel: oc * r² + rh * upscale + rw
+            uint ic = oc * r2 + rh * upscale + rw;
+            output_data[idx] = input_data[ic * h * w + ih * w + iw];
+        }
+        """;
+
+    /// <summary>
+    /// Pixel unshuffle (inverse): [inCh, H*r, W*r] → [inCh*r², H, W]  (r = downscale)
+    /// Push constants: { inCh, h (output), w (output), downscale }.
+    /// Bindings: 0=input, 1=output.
+    /// Dispatch: ceil(inCh*r²*h*w / 256).
+    /// </summary>
+    internal const string PixelUnshuffle = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly  buffer Input  { float input_data[];  };
+        layout(binding = 1) writeonly buffer Output { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint inCh;
+            uint h;         // output height = inputH / downscale
+            uint w;         // output width  = inputW / downscale
+            uint downscale;
+        };
+
+        void main() {
+            uint d2    = downscale * downscale;
+            uint outCh = inCh * d2;
+            uint inH   = h * downscale;
+            uint inW   = w * downscale;
+
+            uint idx = gl_GlobalInvocationID.x;
+            if (idx >= outCh * h * w) return;
+
+            uint hw  = h * w;
+            uint oc  = idx / hw;
+            uint pos = idx % hw;
+            uint oh  = pos / w;
+            uint ow  = pos % w;
+
+            uint ic  = oc / d2;
+            uint rem = oc % d2;
+            uint rh  = rem / downscale;
+            uint rw  = rem % downscale;
+
+            uint ih = oh * downscale + rh;
+            uint iw = ow * downscale + rw;
+            output_data[idx] = input_data[ic * inH * inW + ih * inW + iw];
+        }
+        """;
+
+    /// <summary>
+    /// Nearest-neighbour 2× upsample: [ch, H, W] → [ch, 2H, 2W]
+    /// Push constants: { ch, h, w }.
+    /// Bindings: 0=input, 1=output.
+    /// Dispatch: ceil(ch*2H*2W / 256).
+    /// </summary>
+    internal const string Upsample2xNearest = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly  buffer Input  { float input_data[];  };
+        layout(binding = 1) writeonly buffer Output { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint ch;
+            uint h;
+            uint w;
+        };
+
+        void main() {
+            uint idx   = gl_GlobalInvocationID.x;
+            uint outHW = 4u * h * w;   // (2h)*(2w)
+            if (idx >= ch * outHW) return;
+
+            uint c   = idx / outHW;
+            uint pos = idx % outHW;
+            uint oh  = pos / (2u * w);
+            uint ow  = pos % (2u * w);
+
+            output_data[idx] = input_data[c * h * w + (oh / 2u) * w + (ow / 2u)];
+        }
+        """;
 }

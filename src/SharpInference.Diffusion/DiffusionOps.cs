@@ -275,12 +275,197 @@ internal static class DiffusionOps
         TensorPrimitives.Add(a.AsSpan(0, n * dim), b.AsSpan(0, n * dim), a.AsSpan(0, n * dim));
     }
 
+    // ── Image upscaling primitives ────────────────────────────────────────
+
+    /// <summary>
+    /// Pixel Shuffle (sub-pixel convolution): rearranges channels into spatial extent.
+    /// Input:  [N, C×r², H, W] — Output: [N, C, H×r, W×r].
+    /// Used for learned ×2 / ×4 upsampling in ESRGAN upscalers (old-style variant).
+    /// </summary>
+    public static float[] PixelShuffle(float[] input, int n, int inC, int h, int w, int r)
+    {
+        int outC = inC / (r * r);
+        int outH = h * r, outW = w * r;
+        var output = new float[n * outC * outH * outW];
+
+        for (int b = 0; b < n; b++)
+        {
+            int bInOff  = b * inC * h * w;
+            int bOutOff = b * outC * outH * outW;
+            for (int oc = 0; oc < outC; oc++)
+            {
+                int outCOff = bOutOff + oc * outH * outW;
+                for (int oh = 0; oh < outH; oh++)
+                {
+                    int ih = oh / r, ky = oh % r;
+                    for (int ow = 0; ow < outW; ow++)
+                    {
+                        int iw = ow / r, kx = ow % r;
+                        int ic = oc * r * r + ky * r + kx;
+                        output[outCOff + oh * outW + ow] =
+                            input[bInOff + ic * h * w + ih * w + iw];
+                    }
+                }
+            }
+        }
+        return output;
+    }
+
+    /// <summary>
+    /// Pixel Unshuffle: rearranges spatial blocks into channels.
+    /// Input:  [N, C, H, W] — Output: [N, C×r², H/r, W/r].
+    /// Inverse of PixelShuffle. Used to pre-process input in ×2 ESRGAN models.
+    /// </summary>
+    public static float[] PixelUnshuffle(float[] input, int n, int c, int h, int w, int r)
+    {
+        int outC = c * r * r;
+        int outH = h / r, outW = w / r;
+        var output = new float[n * outC * outH * outW];
+
+        for (int b = 0; b < n; b++)
+        {
+            int bInOff  = b * c * h * w;
+            int bOutOff = b * outC * outH * outW;
+            for (int ic = 0; ic < c; ic++)
+            {
+                int inCOff = bInOff + ic * h * w;
+                for (int ih = 0; ih < outH; ih++)
+                for (int iw = 0; iw < outW; iw++)
+                {
+                    for (int ky = 0; ky < r; ky++)
+                    for (int kx = 0; kx < r; kx++)
+                    {
+                        int oc  = ic * r * r + ky * r + kx;
+                        int src = inCOff + (ih * r + ky) * w + (iw * r + kx);
+                        output[bOutOff + oc * outH * outW + ih * outW + iw] = input[src];
+                    }
+                }
+            }
+        }
+        return output;
+    }
+
+    /// <summary>Leaky ReLU activation in-place: x[i] = x[i] >= 0 ? x[i] : slope * x[i].</summary>
+    public static void LeakyReLUInPlace(Span<float> x, float slope = 0.2f)
+    {
+        for (int i = 0; i < x.Length; i++)
+            if (x[i] < 0f) x[i] *= slope;
+    }
+
+    /// <summary>
+    /// Bilinear upsampling from [N, C, H, W] to [N, C, outH, outW].
+    /// Used as post-process resize for ×2 ESRGAN models whose forward pass
+    /// produces the same spatial size as input.
+    /// </summary>
+    public static float[] UpsampleBilinear(float[] input, int n, int c, int h, int w, int outH, int outW)
+    {
+        var output = new float[n * c * outH * outW];
+        float scaleY = h > 1 ? (float)(h - 1) / (outH - 1) : 0f;
+        float scaleX = w > 1 ? (float)(w - 1) / (outW - 1) : 0f;
+
+        for (int b = 0; b < n; b++)
+        for (int ch = 0; ch < c; ch++)
+        {
+            int inOff  = b * c * h * w  + ch * h * w;
+            int outOff = b * c * outH * outW + ch * outH * outW;
+            for (int oy = 0; oy < outH; oy++)
+            {
+                float iy  = oy * scaleY;
+                int   iy0 = (int)iy;
+                int   iy1 = Math.Min(iy0 + 1, h - 1);
+                float wy  = iy - iy0;
+                for (int ox = 0; ox < outW; ox++)
+                {
+                    float ix  = ox * scaleX;
+                    int   ix0 = (int)ix;
+                    int   ix1 = Math.Min(ix0 + 1, w - 1);
+                    float wx  = ix - ix0;
+                    float v00 = input[inOff + iy0 * w + ix0];
+                    float v01 = input[inOff + iy0 * w + ix1];
+                    float v10 = input[inOff + iy1 * w + ix0];
+                    float v11 = input[inOff + iy1 * w + ix1];
+                    output[outOff + oy * outW + ox] =
+                        v00 * (1f - wy) * (1f - wx) + v01 * (1f - wy) * wx +
+                        v10 * wy * (1f - wx)         + v11 * wy * wx;
+                }
+            }
+        }
+        return output;
+    }
+
     // ── Aliases for consistent PascalCase naming ──────────────────────────
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static float SiLU(float x) => Silu(x);
 
     public static void SiLUInPlace(Span<float> x) => SiluInPlace(x);
+
+    /// <summary>
+    /// Bicubic upsampling from [C, H, W] to [C, outH, outW] (single image, no batch dim).
+    /// Uses the standard Keys bicubic kernel (a=-0.5). Input pixels are in [0,1] float range.
+    /// </summary>
+    public static float[] UpsampleBicubic(float[] input, int c, int h, int w, int outH, int outW)
+    {
+        var output = new float[c * outH * outW];
+        float scaleY = (float)h / outH;
+        float scaleX = (float)w / outW;
+
+        static float CubicWeight(float t)
+        {
+            // Keys a=-0.5 cubic kernel
+            float at = MathF.Abs(t);
+            if (at <= 1f) return (1.5f * at - 2.5f) * at * at + 1f;
+            if (at <  2f) return ((-0.5f * at + 2.5f) * at - 4f) * at + 2f;
+            return 0f;
+        }
+
+        static float Clamp01(float v) => v < 0f ? 0f : v > 1f ? 1f : v;
+
+        for (int ch = 0; ch < c; ch++)
+        {
+            int inOff  = ch * h * w;
+            int outOff = ch * outH * outW;
+            for (int oy = 0; oy < outH; oy++)
+            {
+                float srcY = (oy + 0.5f) * scaleY - 0.5f;
+                int   iy0  = (int)MathF.Floor(srcY);
+                for (int ox = 0; ox < outW; ox++)
+                {
+                    float srcX = (ox + 0.5f) * scaleX - 0.5f;
+                    int   ix0  = (int)MathF.Floor(srcX);
+                    float sum  = 0f;
+                    for (int ky = -1; ky <= 2; ky++)
+                    {
+                        int iy = Math.Clamp(iy0 + ky, 0, h - 1);
+                        float wy = CubicWeight(srcY - (iy0 + ky));
+                        for (int kx = -1; kx <= 2; kx++)
+                        {
+                            int ix = Math.Clamp(ix0 + kx, 0, w - 1);
+                            sum += wy * CubicWeight(srcX - (ix0 + kx)) * input[inOff + iy * w + ix];
+                        }
+                    }
+                    output[outOff + oy * outW + ox] = Clamp01(sum);
+                }
+            }
+        }
+        return output;
+    }
+
+    /// <summary>
+    /// Blend two RGB pixel buffers [C, H, W] (single image, C=3).
+    /// result[i] = factor * a[i] + (1 - factor) * b[i]
+    /// where factor=1.0 returns <paramref name="a"/> unchanged and factor=0.0 returns <paramref name="b"/>.
+    /// </summary>
+    public static float[] BlendRgb(float[] a, float[] b, float factor)
+    {
+        if (factor >= 1f) return a;
+        if (factor <= 0f) return b;
+        float inv = 1f - factor;
+        var result = new float[a.Length];
+        for (int i = 0; i < a.Length; i++)
+            result[i] = factor * a[i] + inv * b[i];
+        return result;
+    }
 
     // ── Offset-based overloads (used by ZImageDiT, QwenTextEncoder) ───────
 

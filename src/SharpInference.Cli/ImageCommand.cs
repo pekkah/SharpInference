@@ -125,6 +125,15 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
         [Description("Output PNG file path (default: output.png)")]
         public string? OutputPath { get; init; }
 
+        [CommandOption("--upscaler")]
+        [Description("Path to ESRGAN/Real-ESRGAN upscaler weights (.safetensors). Upscales the generated image by ×2 or ×4 before saving.")]
+        public string? UpscalerPath { get; init; }
+
+        [CommandOption("--upscale-blend")]
+        [Description("Blend factor for the upscaled result (0.0–1.0). 1.0 = full RRDB (sharpest), <1.0 softens by blending with bicubic. Default 1.0.")]
+        [DefaultValue(1.0f)]
+        public float UpscaleBlend { get; init; } = 1.0f;
+
         [CommandOption("-v|--verbose")]
         [Description("Show per-step timing and progress")]
         [DefaultValue(false)]
@@ -195,6 +204,8 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
         AnsiConsole.MarkupLine($"[dim]VAE:[/]      {Markup.Escape(vaePath!)}");
         AnsiConsole.MarkupLine($"[dim]Encoder:[/]  {Markup.Escape(encoderPath!)}");
         AnsiConsole.MarkupLine($"[dim]Size:[/]     {s.Width}×{s.Height}  steps={steps}  seed={s.Seed}");
+        if (s.UpscalerPath is not null)
+            AnsiConsole.MarkupLine($"[dim]Upscaler:[/] {Markup.Escape(s.UpscalerPath)}");
         AnsiConsole.MarkupLine($"[dim]Output:[/]   {Markup.Escape(output)}");
         AnsiConsole.WriteLine();
 
@@ -209,6 +220,8 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                     ctx.Status("Loading DiT + VAE + Qwen3-4B…");
 
                     IComputeBackend? gpu = null;
+                    IComputeBackend? upscalerGpu = null; // owned VulkanBackend created for upscaler (CUDA path)
+                    RRDBNet? upscaler = null;
                     try
                     {
                         // Resolve which backend to use:
@@ -247,6 +260,34 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                             AnsiConsole.MarkupLine("[dim]Backend:[/]  CPU");
                         }
 
+                        if (s.UpscalerPath is not null)
+                        {
+                            ctx.Status("Loading RRDBNet upscaler…");
+                            // Prefer CudaBackend directly when it supports IImageOpsBackend (NVRTC available).
+                            // Fall back to a separate VulkanBackend if NVRTC is unavailable.
+                            IComputeBackend? upscalerBackend = gpu;
+                            if (gpu is CudaBackend cudaGpu && cudaGpu.ImageKernelsAvailable)
+                            {
+                                upscalerBackend = gpu;
+                                AnsiConsole.MarkupLine("[dim]Upscaler backend:[/] GPU (CUDA)");
+                            }
+                            else if (gpu is not null && gpu is not IImageOpsBackend)
+                            {
+                                try
+                                {
+                                    upscalerGpu = new VulkanBackend();
+                                    upscalerBackend = upscalerGpu;
+                                    AnsiConsole.MarkupLine("[dim]Upscaler backend:[/] GPU (Vulkan, native kernels)");
+                                }
+                                catch
+                                {
+                                    upscalerBackend = gpu; // fallback: SGEMM on main backend
+                                }
+                            }
+                            upscaler = RRDBNet.Load(s.UpscalerPath, upscalerBackend);
+                            AnsiConsole.MarkupLine($"[dim]Upscaler:[/] RRDBNet ×{upscaler.Scale} loaded");
+                        }
+
                         var pipeline = ZImagePipeline.Load(
                             modelPath,
                             vaePath!,
@@ -259,12 +300,14 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                             var stepSw = Stopwatch.StartNew();
                             pipeline.Generate(
                                 s.Prompt!, s.Width, s.Height, steps, s.Seed, output,
+                                upscaler: upscaler,
+                                upscaleBlend: s.UpscaleBlend,
                                 progress: (step, total) =>
                                 {
                                     ctx.Status($"Step {step}/{total} — {stepSw.Elapsed.TotalSeconds:F1}s elapsed…");
                                     stepSw.Restart();
                                 },
-                                statusCallback: s => ctx.Status(s));
+                                statusCallback: st => ctx.Status(st));
                         }
 
                         AnsiConsole.MarkupLine($"[green]✓[/] Done in [cyan]{sw.Elapsed.TotalSeconds:F1}s[/]");
@@ -272,6 +315,8 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                     }
                     finally
                     {
+                        upscaler?.Dispose();
+                        if (upscalerGpu is IDisposable dug) dug.Dispose();
                         if (gpu is IDisposable d) d.Dispose();
                     }
                 });
@@ -303,6 +348,8 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
         AnsiConsole.MarkupLine($"[dim]CLIP-L:[/]  {Markup.Escape(s.ClipLPath!)}");
         AnsiConsole.MarkupLine($"[dim]T5-XXL:[/]  {Markup.Escape(s.T5XXLPath!)}");
         AnsiConsole.MarkupLine($"[dim]Size:[/]    {s.Width}×{s.Height}  steps={steps}  cfg={cfg:F1}  seed={s.Seed}");
+        if (s.UpscalerPath is not null)
+            AnsiConsole.MarkupLine($"[dim]Upscaler:[/] {Markup.Escape(s.UpscalerPath)}");
         AnsiConsole.MarkupLine($"[dim]Output:[/]  {Markup.Escape(output)}");
         AnsiConsole.WriteLine();
 
@@ -314,28 +361,94 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                 .SpinnerStyle(Style.Parse("blue"))
                 .Start("Loading FLUX models…", ctx =>
                 {
-                    ctx.Status("Loading DiT + VAE + CLIP-L + T5-XXL…");
-                    var pipeline = ImagePipeline.Load(
-                        modelPath,
-                        s.VaePath!,
-                        s.ClipLPath!,   s.ClipTokenizerPath!,
-                        s.T5XXLPath!,   s.T5TokenizerPath!);
-
-                    using (pipeline)
+                    RRDBNet? upscaler = null;
+                    IComputeBackend? upscalerGpu = null;
+                    try
                     {
-                        ctx.Status($"Generating {s.Width}×{s.Height} image…");
-                        var stepSw = Stopwatch.StartNew();
-                        pipeline.Generate(
-                            s.Prompt!, s.Width, s.Height, steps, cfg, s.Seed, output,
-                            progress: (step, total) =>
-                            {
-                                ctx.Status($"Step {step}/{total} — {stepSw.Elapsed.TotalSeconds:F1}s elapsed…");
-                                stepSw.Restart();
-                            });
-                    }
+                        ctx.Status("Loading DiT + VAE + CLIP-L + T5-XXL…");
+                        var pipeline = ImagePipeline.Load(
+                            modelPath,
+                            s.VaePath!,
+                            s.ClipLPath!,   s.ClipTokenizerPath!,
+                            s.T5XXLPath!,   s.T5TokenizerPath!);
 
-                    AnsiConsole.MarkupLine($"[green]✓[/] Done in [cyan]{sw.Elapsed.TotalSeconds:F1}s[/]");
-                    AnsiConsole.MarkupLine($"[green]✓[/] Image saved: [cyan]{Markup.Escape(Path.GetFullPath(output))}[/]");
+                        if (s.UpscalerPath is not null)
+                        {
+                            // Prefer CudaBackend directly when NVRTC image kernels are available.
+                            // Fall back to VulkanBackend, then CudaBackend SGEMM path.
+                            try
+                            {
+                                if (CudaBackend.IsAvailable())
+                                {
+                                    var cudaForUpscaler = CudaBackend.Create();
+                                    if (cudaForUpscaler.ImageKernelsAvailable)
+                                    {
+                                        upscalerGpu = cudaForUpscaler;
+                                        AnsiConsole.MarkupLine("[dim]Upscaler backend:[/] GPU (CUDA)");
+                                    }
+                                    else
+                                    {
+                                        ((IDisposable)cudaForUpscaler).Dispose();
+                                        throw new InvalidOperationException("NVRTC not available");
+                                    }
+                                }
+                                else
+                                {
+                                    throw new InvalidOperationException("CUDA not available");
+                                }
+                            }
+                            catch
+                            {
+                                try
+                                {
+                                    upscalerGpu = new VulkanBackend();
+                                    AnsiConsole.MarkupLine("[dim]Upscaler backend:[/] GPU (Vulkan, native kernels)");
+                                }
+                                catch
+                                {
+                                    try
+                                    {
+                                        if (CudaBackend.IsAvailable())
+                                        {
+                                            upscalerGpu = CudaBackend.Create();
+                                            AnsiConsole.MarkupLine("[dim]Upscaler backend:[/] GPU (CUDA)");
+                                        }
+                                    }
+                                    catch
+                                    {
+                                        upscalerGpu = null;
+                                        AnsiConsole.MarkupLine("[dim]Upscaler backend:[/] CPU (no GPU detected)");
+                                    }
+                                }
+                            }
+                            ctx.Status("Loading RRDBNet upscaler…");
+                            upscaler = RRDBNet.Load(s.UpscalerPath, upscalerGpu);
+                            AnsiConsole.MarkupLine($"[dim]Upscaler:[/] RRDBNet ×{upscaler.Scale} loaded");
+                        }
+
+                        using (pipeline)
+                        {
+                            ctx.Status($"Generating {s.Width}×{s.Height} image…");
+                            var stepSw = Stopwatch.StartNew();
+                            pipeline.Generate(
+                                s.Prompt!, s.Width, s.Height, steps, cfg, s.Seed, output,
+                                progress: (step, total) =>
+                                {
+                                    ctx.Status($"Step {step}/{total} — {stepSw.Elapsed.TotalSeconds:F1}s elapsed…");
+                                    stepSw.Restart();
+                                },
+                                upscaler: upscaler,
+                                upscaleBlend: s.UpscaleBlend);
+                        }
+
+                        AnsiConsole.MarkupLine($"[green]✓[/] Done in [cyan]{sw.Elapsed.TotalSeconds:F1}s[/]");
+                        AnsiConsole.MarkupLine($"[green]✓[/] Image saved: [cyan]{Markup.Escape(Path.GetFullPath(output))}[/]");
+                    }
+                    finally
+                    {
+                        upscaler?.Dispose();
+                        if (upscalerGpu is IDisposable dg) dg.Dispose();
+                    }
                 });
         }
         catch (Exception ex)

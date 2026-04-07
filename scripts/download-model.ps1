@@ -4,7 +4,7 @@
 .DESCRIPTION
     Downloads from HuggingFace to the models/ directory. Skips if already present.
     Supports: smollm2, qwen3-8b, llama31-70b, qwen3-coder-30b-a3b, llama4-scout,
-              z-image-turbo, z-image-turbo-q8
+              z-image-turbo, z-image-turbo-q8, realesrgan-x4
 .PARAMETER Model
     Which model to download. Default: downloads all text models (skips large image models).
 .EXAMPLE
@@ -16,10 +16,11 @@
     .\download-model.ps1 -Model llama4-scout            # Llama 4 Scout Q4_K_M (60.9 GB, 2 shards)
     .\download-model.ps1 -Model z-image-turbo           # Z-Image-Turbo Q5_K_M + abliterated encoder (~8.5 GB)
     .\download-model.ps1 -Model z-image-turbo-q8        # Z-Image-Turbo Q8_0 + abliterated encoder Q8_0 (~12 GB)
+    .\download-model.ps1 -Model realesrgan-x4           # Real-ESRGAN x4plus upscaler (67 MB)
 #>
 param(
     [ValidateSet("smollm2", "qwen3-8b", "llama31-70b", "qwen3-coder-30b-a3b", "llama4-scout",
-                 "z-image-turbo", "z-image-turbo-q8")]
+                 "z-image-turbo", "z-image-turbo-q8", "realesrgan-x4")]
     [string]$Model
 )
 
@@ -103,6 +104,18 @@ $Models = @{
         Size  = "~12 GB (DiT 7.22 GB + encoder 4.28 GB + VAE 0.33 GB + tokenizer)"
         Phase = "image"
         IsImage = $true
+    }
+    # ── Image upscaler ────────────────────────────────────────────────────────
+    # Real-ESRGAN x4plus — RRDBNet ×4 upscaler (23 RRDB blocks, 64 feat channels)
+    #   Trained by xinntao on synthetic degradations; works well on photos and
+    #   generated images. Source: Comfy-Org/Real-ESRGAN_repackaged (BSD-3-Clause)
+    #   Use with: sharpi image ... --upscaler models/RealESRGAN_x4plus.safetensors
+    "realesrgan-x4" = @{
+        Files = @("RealESRGAN_x4plus.safetensors")
+        Urls  = @("https://huggingface.co/Comfy-Org/Real-ESRGAN_repackaged/resolve/main/RealESRGAN_x4plus.safetensors")
+        Size  = "67 MB"
+        Phase = "upscaler"
+        IsUpscaler = $true
     }
 }
 
@@ -209,14 +222,27 @@ function Download-Model {
             Write-Host "    -p `"your prompt here`" -W 1024 -H 1024 --steps 9 -o output.png"
         }
     }
+
+    if ($info.IsUpscaler) {
+        Write-Host ""
+        Write-Host "[$key] Ready to use as upscaler (append --upscaler to any image command):"
+        Write-Host "  dotnet run --project src/SharpInference.Cli -c Release -- image \"
+        Write-Host "    -m models/z_image_turbo-Q5_K_M.gguf \"
+        Write-Host "    --vae models/z-image-turbo/vae \"
+        Write-Host "    --qwen-encoder models/Z-Image-AbliteratedV1.Q5_K_M.gguf \"
+        Write-Host "    --qwen-tokenizer models/z-image-turbo/tokenizer/tokenizer.json \"
+        Write-Host "    --upscaler models/RealESRGAN_x4plus.safetensors \"
+        Write-Host "    -p `"your prompt here`" -W 512 -H 512 -o output_4x.png"
+        Write-Host "  (output will be 2048x2048 for -W 512 -H 512 with the x4 upscaler)"
+    }
 }
 
 if ($Model) {
     Download-Model -key $Model
 }
 else {
-    # Default: download text models only (image models are large and optional)
-    $textModels = $Models.Keys | Where-Object { -not $Models[$_].IsImage } | Sort-Object
+    # Default: download text models only (image and upscaler models are large/optional)
+    $textModels = $Models.Keys | Where-Object { -not $Models[$_].IsImage -and -not $Models[$_].IsUpscaler } | Sort-Object
     foreach ($key in $textModels) {
         Download-Model -key $key
     }
@@ -224,4 +250,7 @@ else {
     Write-Host "Image models not downloaded by default (large). Run explicitly:"
     Write-Host "  .\download-model.ps1 -Model z-image-turbo      # Q5_K_M (~8.5 GB)"
     Write-Host "  .\download-model.ps1 -Model z-image-turbo-q8   # Q8_0   (~12 GB)"
+    Write-Host ""
+    Write-Host "Upscaler model (optional, enhances generated images 4×):"
+    Write-Host "  .\download-model.ps1 -Model realesrgan-x4      # Real-ESRGAN x4plus (67 MB)"
 }

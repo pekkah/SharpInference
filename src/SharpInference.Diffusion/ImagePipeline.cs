@@ -80,13 +80,24 @@ public sealed class ImagePipeline : IDisposable
     /// <param name="seed">Random seed (-1 = random).</param>
     /// <param name="outputPath">Path to write the output PNG.</param>
     /// <param name="progress">Optional progress callback (step, totalSteps).</param>
+    /// <param name="upscaler">
+    ///   Optional <see cref="RRDBNet"/> upscaler. When supplied, the decoded image is
+    ///   passed through the upscaler before being written to disk. The output PNG will
+    ///   be <c>Scale</c>× larger in each dimension (e.g. 512→2048 for a ×4 model).
+    /// </param>
+    /// <param name="upscaleBlend">
+    ///   Blend factor: 1.0 = full RRDB (sharpest), &lt;1.0 blends with bicubic to soften.
+    ///   0.8 gives a natural look for portraits.
+    /// </param>
     public void Generate(
         string prompt,
         int width = 512, int height = 512,
         int steps = 4, float guidance = 1.0f,
         int seed = -1,
         string outputPath = "output.png",
-        Action<int, int>? progress = null)
+        Action<int, int>? progress = null,
+        RRDBNet? upscaler = null,
+        float upscaleBlend = 1.0f)
     {
         if (width % 16 != 0 || height % 16 != 0)
             throw new ArgumentException("Width and height must be divisible by 16.");
@@ -131,7 +142,19 @@ public sealed class ImagePipeline : IDisposable
         var pixels  = _vae.Decode(latent, latH, latW);    // [3, H, W] in [0,1]
 
         // ── 6. Write PNG ──────────────────────────────────────────────────
-        PngWriter.Write(outputPath, pixels, width, height);
+        int outWidth = width, outHeight = height;
+        if (upscaler is not null)
+        {
+            var preUpscalePixels = pixels;
+            var (up, uw, uh) = upscaler.Upscale(pixels, width, height);
+            pixels = up; outWidth = uw; outHeight = uh;
+            if (upscaleBlend < 1f)
+            {
+                var bicubic = DiffusionOps.UpsampleBicubic(preUpscalePixels, 3, height, width, outHeight, outWidth);
+                pixels = DiffusionOps.BlendRgb(pixels, bicubic, upscaleBlend);
+            }
+        }
+        PngWriter.Write(outputPath, pixels, outWidth, outHeight);
     }
 
     public void Dispose()

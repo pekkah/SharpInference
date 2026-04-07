@@ -100,6 +100,16 @@ public sealed class ZImagePipeline : IDisposable
     /// <param name="steps">Number of denoising steps (default: 9 = 8 NFEs).</param>
     /// <param name="seed">RNG seed for reproducibility (-1 = random).</param>
     /// <param name="outputPath">Path to write the output PNG file.</param>
+    /// <param name="upscaler">
+    ///   Optional <see cref="RRDBNet"/> upscaler. When supplied, the decoded image is
+    ///   passed through the upscaler before being written to disk. The output PNG will
+    ///   be <c>Scale</c>× larger in each dimension (e.g. 512→2048 for a ×4 model).
+    /// </param>
+    /// <param name="upscaleBlend">
+    ///   Blend factor for the upscaled result: 1.0 = full RRDB (default, sharpest),
+    ///   values below 1.0 blend with a bicubic upscale to soften the output.
+    ///   0.8 gives a natural look for portraits; 0.0 = pure bicubic.
+    /// </param>
     /// <param name="progress">Optional progress callback (step, totalSteps).</param>
     /// <param name="statusCallback">Optional status text callback for spinner updates.</param>
     public void Generate(string prompt,
@@ -108,6 +118,8 @@ public sealed class ZImagePipeline : IDisposable
                           int steps  = -1,
                           int seed   = -1,
                           string outputPath = "output.png",
+                          RRDBNet? upscaler = null,
+                          float upscaleBlend = 1.0f,
                           Action<int, int>? progress = null,
                           Action<string>? statusCallback = null)
     {
@@ -175,7 +187,20 @@ public sealed class ZImagePipeline : IDisposable
         float[] rgb = _vae.Decode(latent, latH, latW);
 
         // ── 6. Write PNG ──────────────────────────────────────────────────
-        PngWriter.Write(outputPath, rgb, width, height);
+        int outWidth = width, outHeight = height;
+        if (upscaler is not null)
+        {
+            statusCallback?.Invoke($"Upscaling {width}×{height} → {width * upscaler.Scale}×{height * upscaler.Scale} (RRDBNet ×{upscaler.Scale})…");
+            var preUpscaleRgb = rgb;
+            (rgb, outWidth, outHeight) = upscaler.Upscale(rgb, width, height);
+            if (upscaleBlend < 1f)
+            {
+                // Blend RRDB output with bicubic to soften aggressive texture enhancement.
+                var bicubic = DiffusionOps.UpsampleBicubic(preUpscaleRgb, 3, height, width, outHeight, outWidth);
+                rgb = DiffusionOps.BlendRgb(rgb, bicubic, upscaleBlend);
+            }
+        }
+        PngWriter.Write(outputPath, rgb, outWidth, outHeight);
         progress?.Invoke(steps + 2, steps + 2);
     }
 

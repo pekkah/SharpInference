@@ -11,7 +11,7 @@ namespace SharpInference.Vulkan;
 /// Selects a discrete GPU, creates a compute-only queue, and manages
 /// VRAM buffers for inference tensor operations.
 /// </summary>
-public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
+public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, IDisposable
 {
     private readonly VkInstance _instance;
     private readonly VkInstanceApi _vki;
@@ -51,6 +51,11 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
 
     // Batched recording mode: record multiple dispatches, submit once
     private bool _recording;
+
+    // Deferred-free support for image-ops batch recording:
+    // Frees issued while _deferringFrees=true are held until EndBatch() completes the submit.
+    private bool _deferringFrees;
+    private readonly List<Tensor> _deferredFrees = [];
 
     /// <summary>Begin recording a batch of compute dispatches.</summary>
     public void BeginRecord()
@@ -153,6 +158,41 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     {
         var fence = _fence;
         _vkd.vkWaitForFences(1, &fence, true, ulong.MaxValue).CheckResult();
+    }
+
+    // ── Image-ops batch recording (IImageOpsBackend) ──────────────────────
+
+    /// <summary>
+    /// Begin recording an image-ops batch. All dispatches until <see cref="EndBatch"/> are
+    /// recorded into one command buffer and submitted together.
+    /// Free() calls during the batch are deferred until EndBatch() completes the submit.
+    /// </summary>
+    public void BeginBatch()
+    {
+        _deferringFrees = true;
+        BeginRecord();
+    }
+
+    /// <summary>
+    /// Insert a compute→compute memory barrier.
+    /// Required between dependent dispatches within a batch recording.
+    /// No-op outside batch recording.
+    /// </summary>
+    public void BatchBarrier()
+    {
+        if (_recording) RecordBarrier();
+    }
+
+    /// <summary>
+    /// End the image-ops batch: submit all recorded dispatches, wait for GPU completion,
+    /// then process all deferred frees.
+    /// </summary>
+    public void EndBatch()
+    {
+        EndRecordAndSubmit();
+        _deferringFrees = false;
+        foreach (var t in _deferredFrees) Free(t);
+        _deferredFrees.Clear();
     }
 
     /// <summary>Submit the transfer command buffer and wait for completion via fence.</summary>
@@ -552,6 +592,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
 
     public void Free(Tensor tensor)
     {
+        if (_deferringFrees) { _deferredFrees.Add(tensor); return; }
         if (_buffers.TryRemove(tensor.Handle, out var buf))
             buf.Dispose();
     }
@@ -903,6 +944,15 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private ComputePipeline? _dequantQ5KMPipeline;
     private ComputePipeline? _dequantQ4KMPipeline;
 
+    // Image ops pipelines (IImageOpsBackend)
+    private ComputePipeline? _conv2dPipeline;
+    private ComputePipeline? _leakyReluPipeline;
+    private ComputePipeline? _clampPipeline;
+    private ComputePipeline? _catChannelsPipeline;
+    private ComputePipeline? _pixelShufflePipeline;
+    private ComputePipeline? _pixelUnshufflePipeline;
+    private ComputePipeline? _upsample2xPipeline;
+
     private struct RmsNormParams{ public uint n; public float eps; }
     private struct HeadNormParams { public uint headDim; public uint numHeads; public float eps; }
     private struct CountParams { public uint n; }
@@ -919,11 +969,24 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     private struct SgemmParams { public uint M; public uint N; public uint K; }
     private struct DequantParams { public uint numBlocks; }
 
+    // Image ops push constant structs
+    private struct Conv2dParams   { public uint inCh; public uint outCh; public uint height; public uint width; public uint ksize; public uint padding; }
+    private struct LeakyReluParams { public uint n; public float negSlope; }
+    private struct ClampParams    { public uint n; public float minVal; public float maxVal; }
+    private struct CatChannelsParams { public uint aCh; public uint bCh; public uint hw; }
+    private struct PixelShuffleParams { public uint inCh; public uint h; public uint w; public uint factor; }
+    private struct SpatialParams  { public uint ch; public uint h; public uint w; }
+
     private void DispatchOrRecord(ComputePipeline pipe, ReadOnlySpan<GpuBuffer> buffers,
         uint groupX, void* push, uint groupY = 1, uint groupZ = 1)
     {
         if (_recording)
+        {
             pipe.RecordWith(_transferCmd, buffers, groupX, groupY, groupZ, push);
+            // In image-batch mode (_deferringFrees), automatically insert a compute barrier
+            // after every dispatch so dependent ops see the writes without explicit caller code.
+            if (_deferringFrees) RecordBarrier();
+        }
         else
             pipe.DispatchWith(_transferCmd, buffers, groupX, groupY, groupZ, push);
     }
@@ -1355,6 +1418,87 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
     }
 
     // ================================================================
+    //  IImageOpsBackend — GPU-native image operations for RRDBNet
+    // ================================================================
+
+    public Tensor Conv2d(Tensor input, Tensor weight, Tensor bias,
+                         int inCh, int outCh, int h, int w, int ksize, int padding = -1)
+    {
+        if (padding < 0) padding = ksize / 2;
+        var output = Allocate(TensorShape.D1(outCh * h * w));
+        _conv2dPipeline ??= new ComputePipeline(this, Shaders.Conv2d, 4, pushConstantSize: sizeof(Conv2dParams));
+        var p = new Conv2dParams { inCh = (uint)inCh, outCh = (uint)outCh, height = (uint)h, width = (uint)w, ksize = (uint)ksize, padding = (uint)padding };
+        // 2D dispatch: X=outCh (one workgroup per channel), Y=ceil(H*W/256) (spatial tiles).
+        // All 256 threads per workgroup share the same output channel → cooperative weight
+        // loading into shared memory eliminates 256× redundant global weight reads.
+        uint groupY = ((uint)(h * w) + 255u) / 256u;
+        DispatchOrRecord(_conv2dPipeline, [GetBuffer(input), GetBuffer(weight), GetBuffer(bias), GetBuffer(output)], (uint)outCh, &p, groupY);
+        return output;
+    }
+
+    public void LeakyReluInPlace(Tensor x, float negSlope)
+    {
+        _leakyReluPipeline ??= new ComputePipeline(this, Shaders.LeakyRelu, 1, pushConstantSize: sizeof(LeakyReluParams));
+        var p = new LeakyReluParams { n = (uint)x.ElementCount, negSlope = negSlope };
+        uint groups = ((uint)x.ElementCount + 255u) / 256u;
+        DispatchOrRecord(_leakyReluPipeline, [GetBuffer(x)], groups, &p);
+    }
+
+    public void ClampInPlace(Tensor x, float min, float max)
+    {
+        _clampPipeline ??= new ComputePipeline(this, Shaders.ClampInPlace, 1, pushConstantSize: sizeof(ClampParams));
+        var p = new ClampParams { n = (uint)x.ElementCount, minVal = min, maxVal = max };
+        uint groups = ((uint)x.ElementCount + 255u) / 256u;
+        DispatchOrRecord(_clampPipeline, [GetBuffer(x)], groups, &p);
+    }
+
+    public Tensor CatChannels(Tensor a, int aCh, Tensor b, int bCh, int hw)
+    {
+        var output = Allocate(TensorShape.D1((aCh + bCh) * hw));
+        _catChannelsPipeline ??= new ComputePipeline(this, Shaders.CatChannels, 3, pushConstantSize: sizeof(CatChannelsParams));
+        var p = new CatChannelsParams { aCh = (uint)aCh, bCh = (uint)bCh, hw = (uint)hw };
+        uint groups = ((uint)((aCh + bCh) * hw) + 255u) / 256u;
+        DispatchOrRecord(_catChannelsPipeline, [GetBuffer(a), GetBuffer(b), GetBuffer(output)], groups, &p);
+        return output;
+    }
+
+    public Tensor PixelShuffleGpu(Tensor input, int inCh, int h, int w, int upscaleFactor)
+    {
+        int outCh = inCh / (upscaleFactor * upscaleFactor);
+        var output = Allocate(TensorShape.D1(outCh * h * upscaleFactor * w * upscaleFactor));
+        _pixelShufflePipeline ??= new ComputePipeline(this, Shaders.PixelShuffle, 2, pushConstantSize: sizeof(PixelShuffleParams));
+        var p = new PixelShuffleParams { inCh = (uint)inCh, h = (uint)h, w = (uint)w, factor = (uint)upscaleFactor };
+        uint total = (uint)(outCh * h * upscaleFactor * w * upscaleFactor);
+        uint groups = (total + 255u) / 256u;
+        DispatchOrRecord(_pixelShufflePipeline, [GetBuffer(input), GetBuffer(output)], groups, &p);
+        return output;
+    }
+
+    public Tensor PixelUnshuffleGpu(Tensor input, int inCh, int h, int w, int downscaleFactor)
+    {
+        int outCh = inCh * downscaleFactor * downscaleFactor;
+        int oh = h / downscaleFactor;
+        int ow = w / downscaleFactor;
+        var output = Allocate(TensorShape.D1(outCh * oh * ow));
+        _pixelUnshufflePipeline ??= new ComputePipeline(this, Shaders.PixelUnshuffle, 2, pushConstantSize: sizeof(PixelShuffleParams));
+        var p = new PixelShuffleParams { inCh = (uint)inCh, h = (uint)oh, w = (uint)ow, factor = (uint)downscaleFactor };
+        uint total = (uint)(outCh * oh * ow);
+        uint groups = (total + 255u) / 256u;
+        DispatchOrRecord(_pixelUnshufflePipeline, [GetBuffer(input), GetBuffer(output)], groups, &p);
+        return output;
+    }
+
+    public Tensor Upsample2xGpu(Tensor input, int ch, int h, int w)
+    {
+        var output = Allocate(TensorShape.D1(ch * h * 2 * w * 2));
+        _upsample2xPipeline ??= new ComputePipeline(this, Shaders.Upsample2xNearest, 2, pushConstantSize: sizeof(SpatialParams));
+        var p = new SpatialParams { ch = (uint)ch, h = (uint)h, w = (uint)w };
+        uint groups = ((uint)(ch * h * 2 * w * 2) + 255u) / 256u;
+        DispatchOrRecord(_upsample2xPipeline, [GetBuffer(input), GetBuffer(output)], groups, &p);
+        return output;
+    }
+
+    // ================================================================
     //  Disposal
     // ================================================================
 
@@ -1392,6 +1536,13 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IDisposable
         _sgemmFp8Pipeline?.Dispose();
         _dequantQ5KMPipeline?.Dispose();
         _dequantQ4KMPipeline?.Dispose();
+        _conv2dPipeline?.Dispose();
+        _leakyReluPipeline?.Dispose();
+        _clampPipeline?.Dispose();
+        _catChannelsPipeline?.Dispose();
+        _pixelShufflePipeline?.Dispose();
+        _pixelUnshufflePipeline?.Dispose();
+        _upsample2xPipeline?.Dispose();
 
         _downloadStaging?.Dispose();
         _uploadStaging?.Dispose();
