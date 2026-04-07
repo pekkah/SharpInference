@@ -2,86 +2,252 @@
 
 A high-performance LLM inference engine and image generation pipeline written in C# 14 / .NET 10.
 Runs GGUF models on CPU (AVX2/AVX-512 SIMD) and GPU (Vulkan compute shaders or CUDA cuBLAS).
-Includes an OpenAI- and Anthropic-compatible API server and a native Z-Image-Turbo image generation pipeline.
+Includes an OpenAI- and Anthropic-compatible API server and native pipelines for
+[Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) and FLUX.1 image generation.
+
+## Prerequisites
+
+### Required
+
+- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
+- x86-64 CPU with **AVX2** support (Haswell / Zen 1 or newer)
+
+### Optional native dependencies
+
+| Feature | Dependency | Notes |
+|---------|-----------|-------|
+| **Faster batched GEMM (CPU)** | [OpenBLAS](https://github.com/OpenMathLib/OpenBLAS/releases) | Place `libopenblas.dll` in `tools/openblas/` or system PATH. Auto-detected at startup; silently skipped if absent. |
+| **GPU inference (Vulkan)** | Vulkan-capable GPU + drivers | Works on AMD/Intel/NVIDIA. No extra install on Windows — just up-to-date GPU drivers. The `VULKAN_SDK` env var is used for shader recompilation only. |
+| **GPU inference (CUDA)** | [CUDA Toolkit 11.x](https://developer.nvidia.com/cuda-toolkit) | Requires `cublas64_11.dll`, `cudart64_110.dll`, and `nvrtc64_11*.dll` on PATH. NVIDIA GPU only. Used for image generation pipelines. |
+| **Image upscaling (RRDBNet)** | CUDA (above) | Real-ESRGAN ×2/×4 upscaler. Falls back to bicubic if CUDA is unavailable. |
+
+## Getting Models
+
+All models use the [GGUF format](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md) and are downloaded from [Hugging Face](https://huggingface.co).
+
+### Text generation models
+
+The fastest way to download is with the [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/guides/cli):
+
+```bash
+pip install huggingface_hub
+mkdir -p models
+
+# SmolLM2 1.7B — fast, low memory, great for testing (~1 GB)
+huggingface-cli download HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF \
+  SmolLM2-1.7B-Instruct-Q4_K_M.gguf --local-dir models
+
+# Qwen3 8B — general purpose, fits in 6 GB VRAM (~5 GB)
+huggingface-cli download Qwen/Qwen3-8B-GGUF \
+  qwen3-8b-q4_k_m.gguf --local-dir models
+
+# Qwen3-Coder 30B-A3B — MoE coding model, ~20 t/s CPU (~17 GB)
+huggingface-cli download Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF \
+  Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --local-dir models
+
+# Llama 4 Scout 109B-16E — MoE, ~5 t/s CPU on DDR4-3200 (~65 GB)
+huggingface-cli download unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF \
+  Llama-4-Scout-17B-16E-Instruct-Q4_K_M.gguf --local-dir models
+```
+
+### Image generation models (Z-Image-Turbo)
+
+```bash
+# DiT model (choose one quant)
+huggingface-cli download jayn7/Z-Image-Turbo-GGUF \
+  z_image_turbo-Q5_K_M.gguf --local-dir models        # 5.5 GB, best quality
+  # z_image_turbo-Q4_K_M.gguf --local-dir models      # 4.5 GB, slightly faster
+
+# VAE + tokenizer (inside the same repo)
+huggingface-cli download jayn7/Z-Image-Turbo-GGUF \
+  --include "vae/*" "tokenizer/*" --local-dir models/z-image-turbo
+
+# Text encoder — uncensored Qwen3-4B fine-tune (~2.9 GB)
+huggingface-cli download BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1 \
+  Z-Image-AbliteratedV1.Q5_K_M.gguf --local-dir models
+```
+
+### Image generation models (FLUX.1)
+
+```bash
+# FLUX.1-schnell GGUF (~7–9 GB depending on quant)
+huggingface-cli download city96/FLUX.1-schnell-gguf \
+  flux1-schnell-Q4_K_S.gguf --local-dir models
+
+# VAE + CLIP-L + T5-XXL encoders
+huggingface-cli download comfyanonymous/flux_text_encoders \
+  ae.safetensors clip_l.safetensors t5xxl_fp16.safetensors --local-dir models/flux
+```
 
 ## Quick Start
 
 ```bash
-# Build
+# Build in release mode
 dotnet build -c Release
 
-# Run inference (CPU)
+# Single-turn inference (CPU)
 dotnet run --project src/SharpInference.Cli -c Release -- \
   -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
   -p "What is 2+2?" --temp 0
 
-# Run inference (GPU — all layers on VRAM)
+# Single-turn inference (GPU — all layers in VRAM)
 dotnet run --project src/SharpInference.Cli -c Release -- \
   -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
   -p "What is 2+2?" --temp 0 -g -1
 
-# Qwen3-Coder-30B-A3B (MoE coding model, ~17 GB, ~20 t/s CPU)
+# Interactive chat session
+dotnet run --project src/SharpInference.Cli -c Release -- \
+  -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
+
+# MoE coding model (~20 t/s CPU)
 dotnet run --project src/SharpInference.Cli -c Release -- \
   -m models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf \
   -p "Implement a binary search tree in C#" --temp 0
 
-# Llama 4 Scout (CPU, ~5 t/s on DDR4-3200)
+# Speculative decoding (draft + target model, ~2× faster at temp 0)
 dotnet run --project src/SharpInference.Cli -c Release -- \
-  -m models/Llama-4-Scout-17B-16E-Instruct-Q4_K_M.gguf \
-  -p "Explain transformers" --temp 0
-
-# Interactive chat
-dotnet run --project src/SharpInference.Cli -c Release -- \
-  -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
+  -m models/Qwen3-8B-Q4_K_M.gguf \
+  --draft-model models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
+  -p "Write a quicksort in Python" --temp 0
 
 # Start API server
 SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
   dotnet run --project src/SharpInference.Server -c Release
 ```
 
-## CLI Usage (llama.cpp-compatible flags)
+## CLI Reference
+
+The CLI is run with `dotnet run` until a NuGet package is published:
 
 ```
-sharpi-cli [OPTIONS]
-
-OPTIONS:
-    -m, --model            Path to GGUF model file
-    -p, --prompt           Input prompt (omit for interactive chat)
-    -n, --n-predict        Tokens to generate (default: 512)
-        --temp             Temperature (0 = greedy, default: 0.7)
-        --top-k            Top-k sampling (default: 40)
-        --top-p            Top-p nucleus sampling (default: 0.95)
-        --min-p            Min-p sampling (default: 0.05)
-    -s, --seed             RNG seed (-1 = random)
-    -g, --n-gpu-layers     GPU layers (0 = CPU, -1 = all on GPU)
-        --single-turn      Generate one response and exit
-        --system-prompt     System prompt
-        --no-display-prompt Don't echo the prompt
-        --verbose-prompt    Print token IDs before generating
-        --draft-model       Draft model path for speculative decoding (requires --temp 0)
-        --spec-lookahead    Draft tokens per speculative step (default: 4)
-        --min-batch-blas    Min batch size for BLAS GEMM (default: 16)
+dotnet run --project src/SharpInference.Cli -c Release -- [COMMAND] [OPTIONS]
 ```
+
+### Text inference (default command)
+
+Flag names are intentionally compatible with llama.cpp / llama-cli.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-m, --model` | auto-detect | Path to GGUF model file |
+| `-p, --prompt` | — | Input prompt; omit to enter interactive chat |
+| `-n, --n-predict` | `512` | Maximum tokens to generate |
+| `-c, --ctx-size` | model default | Context / max sequence length (0 = model default) |
+| `--temp` | `0.7` | Sampling temperature (`0` = greedy / deterministic) |
+| `--top-k` | `40` | Top-k sampling (`0` = disabled) |
+| `--top-p` | `0.95` | Top-p nucleus sampling |
+| `--min-p` | `0.05` | Min-p sampling |
+| `--rep-penalty` | `1.1` | Repetition penalty (`1.0` = disabled) |
+| `-s, --seed` | `-1` | RNG seed (`-1` = random) |
+| `-g, --n-gpu-layers` | `0` | Layers to offload to GPU (`0` = CPU only, `-1` = all) |
+| `--tq` | off | Enable TurboQuant KV-cache compression (3-bit, ~5× less VRAM) |
+| `--single-turn` | off | Generate one response and exit (non-interactive) |
+| `--system-prompt` | — | System prompt prepended to conversation |
+| `--no-display-prompt` | off | Suppress echoing the prompt |
+| `--verbose-prompt` | off | Print token IDs before generating |
+| `--draft-model` | — | Path to draft model for speculative decoding (requires `--temp 0`) |
+| `--spec-lookahead` | `4` | Draft tokens per speculative step |
+| `--min-batch-blas` | `16` | Minimum batch size to use OpenBLAS SGEMM (also: `SHARPI_MIN_BATCH_BLAS` env var) |
+
+### `image` — image generation
+
+Supports two native pipelines: **Z-Image-Turbo** (auto-detected from model filename) and **FLUX.1**.
+
+#### Z-Image-Turbo example
+
+```bash
+dotnet run --project src/SharpInference.Cli -c Release -- image \
+  -m models/z_image_turbo-Q5_K_M.gguf \
+  --vae models/z-image-turbo/vae \
+  --qwen-encoder models/Z-Image-AbliteratedV1.Q5_K_M.gguf \
+  --qwen-tokenizer models/z-image-turbo/tokenizer/tokenizer.json \
+  -p "a serene mountain lake at sunrise" \
+  -W 1024 -H 1024 --steps 4 -o landscape.png -v
+```
+
+#### FLUX.1-schnell example
+
+```bash
+dotnet run --project src/SharpInference.Cli -c Release -- image \
+  -m models/flux1-schnell-Q4_K_S.gguf \
+  --vae models/flux/ae.safetensors \
+  --clip-l models/flux/clip_l.safetensors \
+  --clip-tokenizer models/flux/tokenizer_clip.json \
+  --t5xxl models/flux/t5xxl_fp16.safetensors \
+  --t5-tokenizer models/flux/tokenizer_t5.json \
+  -p "a cinematic photograph of a mountain lake" \
+  -W 512 -H 512 --steps 4 -o out.png
+```
+
+#### All image options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-m, --model` | — | Diffusion model GGUF |
+| `-p, --prompt` | — | Text prompt describing the image |
+| `--negative-prompt` | — | What to avoid in the image |
+| `--vae` | — | VAE safetensors file or `vae/` directory |
+| `--qwen-encoder` | — | *(Z-Image)* Qwen3-4B GGUF text encoder |
+| `--qwen-tokenizer` | — | *(Z-Image)* Qwen3 `tokenizer.json` |
+| `--clip-l` | — | *(FLUX)* CLIP-L encoder safetensors |
+| `--clip-tokenizer` | — | *(FLUX)* CLIP `tokenizer.json` |
+| `--t5xxl` | — | *(FLUX)* T5-XXL encoder safetensors |
+| `--t5-tokenizer` | — | *(FLUX)* T5 `tokenizer.json` |
+| `-W, --width` | `512` | Output width in pixels (must be divisible by 16) |
+| `-H, --height` | `512` | Output height in pixels (must be divisible by 16) |
+| `--steps` | `4` | Denoising steps (4 optimal for Z-Image-Turbo/FLUX schnell) |
+| `--cfg-scale` | auto | Guidance scale (not used for distilled models) |
+| `-s, --seed` | `-1` | RNG seed (`-1` = random) |
+| `-g, --n-gpu-layers` | `-1` | GPU accel: `-1` = auto (CUDA→Vulkan→CPU), `0` = CPU only |
+| `--backend` | `auto` | Force backend: `auto`, `cuda`, `vulkan`, `cpu` |
+| `--upscaler` | — | Path to ESRGAN/Real-ESRGAN weights (`.safetensors`) for ×2/×4 upscale |
+| `--upscale-blend` | `1.0` | Blend factor for upscaling (`1.0` = sharpest, lower = softer) |
+| `-o, --output` | `output.png` | Output PNG path |
+| `-v, --verbose` | off | Show per-step timing |
+
+#### Z-Image-Turbo GPU acceleration timing
+
+Benchmarked on AMD Zen 4 + RTX 4070 Ti:
+
+| Stage | First run | Subsequent runs |
+|-------|-----------|-----------------|
+| Text encoder (Qwen3-4B, cuBLAS bf16) | ~90 s (weights cached in VRAM) | ~0 s (prompt cache) |
+| DiT denoising — 4 steps (cuBLAS bf16) | ~4 s | ~4 s |
+| VAE decoder (cuBLAS fp32 im2col) | ~23 s (weights cached in VRAM) | ~2 s |
+| **Total** | **~117 s** | **~30 s** |
+
+### `list-metadata` — inspect a GGUF file
+
+```bash
+dotnet run --project src/SharpInference.Cli -c Release -- \
+  list-metadata -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
+```
+
+Prints all GGUF metadata key/value pairs in a table (architecture, context length, rope settings, tokenizer vocab, etc.).
 
 ## API Server
 
-Starts an HTTP server compatible with OpenAI and Anthropic clients:
+Starts an HTTP server compatible with OpenAI and Anthropic clients. Defaults to `http://localhost:5000`.
 
 ```bash
-# Set model path and start
+# Start (CPU)
 SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
   dotnet run --project src/SharpInference.Server -c Release
-# Defaults to http://localhost:5000
 
-# OpenAI — chat completions (streaming)
+# OpenAI chat completions (streaming)
 curl http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"smollm2","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 
-# Anthropic — messages (non-streaming)
+# Anthropic messages (non-streaming)
 curl http://localhost:5000/v1/messages \
   -H "Content-Type: application/json" \
   -d '{"model":"smollm2","messages":[{"role":"user","content":"Hello"}],"max_tokens":256}'
+
+# OpenAI Responses API
+curl http://localhost:5000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model":"smollm2","input":"Hello"}'
 
 # List loaded model
 curl http://localhost:5000/v1/models
@@ -98,75 +264,33 @@ curl http://localhost:5000/metrics
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SHARPI_MODEL` | `model.gguf` | Path to GGUF model file |
-| `SHARPI_N_GPU_LAYERS` | `0` | GPU layers (0 = CPU only) |
-| `SHARPI_MIN_BATCH_BLAS` | `16` | BLAS GEMM threshold for batched MatMul |
+| `SHARPI_MAX_BATCH` | `1` | Enable continuous batching for N concurrent users (`> 1` activates `ContinuousBatchingEngine`) |
+| `SHARPI_MIN_BATCH_BLAS` | `16` | Minimum batch size to use OpenBLAS SGEMM in `MatMulBatched` |
 
-## Image Generation (Z-Image-Turbo)
+## Supported & Tested Models
 
-Native image generation pipeline with GPU acceleration:
+### Text generation
 
-```bash
-# Generate a 512×512 image (CUDA auto-detected)
-dotnet run --project src/SharpInference.Cli -c Release -- image \
-  -m models/z_image_turbo-Q5_K_M.gguf \
-  --vae models/z-image-turbo/vae \
-  --qwen-encoder models/Z-Image-AbliteratedV1.Q5_K_M.gguf \
-  --qwen-tokenizer models/z-image-turbo/tokenizer/tokenizer.json \
-  -p "anime style rose, vibrant colors" \
-  -o rose.png --width 512 --height 512 -v
-```
+| Model | HuggingFace repo | Architecture | Quant | File size | Notes |
+|-------|-----------------|--------------|-------|-----------|-------|
+| SmolLM2 1.7B Instruct | [HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF) | llama | Q4_K_M | ~1 GB | Fast, low RAM, great for testing |
+| Qwen3 8B | [Qwen/Qwen3-8B-GGUF](https://huggingface.co/Qwen/Qwen3-8B-GGUF) | qwen3 | Q4_K_M | ~5 GB | General purpose; fits in 6 GB VRAM |
+| Qwen3-Coder 30B-A3B Instruct | [Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF) | qwen3moe | Q4_K_M | ~17 GB | MoE, 128 experts / 8 active, ~20 t/s CPU |
+| Llama 4 Scout 109B-16E Instruct | [unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF](https://huggingface.co/unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF) | llama4 | Q4_K_M | ~65 GB | MoE, 16 experts, ~5 t/s on DDR4-3200 |
 
-### Image generation options
+Any GGUF model with architecture `llama`, `llama4`, `qwen3`, or `qwen3moe` should work.
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-m, --model` | | Z-Image-Turbo DiT GGUF |
-| `--vae` | | VAE safetensors file or `vae/` directory |
-| `--qwen-encoder` | | Qwen3-4B GGUF text encoder |
-| `--qwen-tokenizer` | | `tokenizer.json` for Qwen3 |
-| `-W, --width` | `512` | Output width (must be ÷16) |
-| `-H, --height` | `512` | Output height (must be ÷16) |
-| `--steps` | `4` | Denoising steps (DMD-distilled, 4 is optimal) |
-| `--negative-prompt` | | What to avoid in the image |
-| `-s, --seed` | `-1` | RNG seed (`-1` = random) |
-| `--backend` | `auto` | `auto` (CUDA→Vulkan→CPU), `cuda`, `vulkan`, `cpu` |
-| `-o, --output` | `output.png` | Output PNG path |
-| `-v, --verbose` | | Per-step timing |
+### Image generation
 
-### Model download links
-
-- **DiT:** [jayn7/Z-Image-Turbo-GGUF](https://huggingface.co/jayn7/Z-Image-Turbo-GGUF) — `z_image_turbo-Q5_K_M.gguf`
-- **Text encoder:** [BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1](https://huggingface.co/BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1) — `Z-Image-AbliteratedV1.Q5_K_M.gguf`
-- **VAE + tokenizer:** included in the Z-Image-Turbo GGUF repo
-
-### GPU acceleration
-
-All three pipeline stages are GPU-accelerated when CUDA is available:
-
-| Stage | GPU path | First-run (weight upload) | Subsequent runs |
-|-------|----------|--------------------------|-----------------|
-| Text encoder (Qwen3-4B) | cuBLAS bf16 SGEMM | ~90s (245 tensors cached in VRAM) | ~0s (prompt cache) |
-| DiT denoising (4 steps) | cuBLAS bf16 SGEMM | ~4s | ~4s |
-| VAE decoder | cuBLAS fp32 SGEMM (im2col) | ~23s (weights cached in VRAM) | ~2s |
-
-Total first-run: ~117s. Subsequent runs with different prompts: ~30s.
-
-## Supported Models
-
-| Model | Architecture | Size | Notes |
-|-------|-------------|------|-------|
-| SmolLM2 1.7B | Dense (LLaMA-style) | ~1 GB | Fast, small, good for testing |
-| Qwen3 8B | Dense (ChatML) | ~5 GB | General purpose, GPU-friendly |
-| Llama 3.1 70B | Dense (Llama 3) | ~40 GB | High quality, needs large RAM |
-| Llama 4 Scout 109B-16E | MoE (Llama 4) | ~17 GB active / 65 GB total | 16 experts, CPU-only ~5 t/s on DDR4 |
-| Qwen3-Coder 30B-A3B | MoE (Qwen3-MoE) | ~17 GB | 128 experts / 8 active, coding-focused, ~20 t/s CPU |
-| Z-Image-Turbo | Diffusion (S3-DiT) | 5.5 GB DiT + 2.9 GB encoder | 4-step DMD-distilled, GPU-accelerated |
-
-Any GGUF model with a supported architecture (llama, llama4, qwen3, qwen3moe) works.
+| Model | HuggingFace repo | Quant | File size | Notes |
+|-------|-----------------|-------|-----------|-------|
+| Z-Image-Turbo DiT | [jayn7/Z-Image-Turbo-GGUF](https://huggingface.co/jayn7/Z-Image-Turbo-GGUF) | Q5_K_M | 5.5 GB | Best quality; also Q4_K_M (4.5 GB) |
+| Z-Image-Turbo text encoder | [BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1](https://huggingface.co/BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1) | Q5_K_M | 2.9 GB | Uncensored fine-tune of Qwen3-4B |
+| FLUX.1-schnell | [city96/FLUX.1-schnell-gguf](https://huggingface.co/city96/FLUX.1-schnell-gguf) | Q4_K_S | ~7 GB | 4-step distilled; VAE+encoders from comfyanonymous/flux_text_encoders |
 
 ## Performance
 
-Benchmarked on AMD Zen 4 (12c/24t) + RTX 4070 Ti:
+Benchmarked on AMD Zen 4 (12c/24t, DDR4-3200) + RTX 4070 Ti:
 
 | Model | Backend | Decode (t/s) | Notes |
 |-------|---------|-------------|-------|
@@ -174,39 +298,39 @@ Benchmarked on AMD Zen 4 (12c/24t) + RTX 4070 Ti:
 | SmolLM2 1.7B Q4_K_M | CPU (AVX2) | 48.6 | Fused dequant-matvec, multi-threaded |
 | Qwen3 8B Q4_K_M | GPU (Vulkan) | 43.5 | Full VRAM fit |
 | Qwen3 8B Q4_K_M | CPU | 13.5 | 1.23× llama.cpp |
-| Llama 4 Scout Q4_K_M | CPU | 5.3 | DDR4-3200, 65 GB; bandwidth-limited |
+| Llama 4 Scout Q4_K_M | CPU | 5.3 | Bandwidth-limited on 65 GB DDR4 |
 | Qwen3-Coder 30B-A3B Q4_K_M | CPU | 20.8 | MoE: only 8/128 experts active per token |
-| llama.cpp SmolLM2 1.7B | CPU reference | 45.1 | Same hardware |
-
-## Projects
-
-| Project | Type | Description |
-|---|---|---|
-| SharpInference.Core | classlib | GGUF parser, tokenizer, tensor types, model graph |
-| SharpInference.Cpu | classlib | CPU backend: AVX2/AVX-512 SIMD, fused dequant-matvec |
-| SharpInference.Vulkan | classlib | GPU backend: Vulkan compute shaders via Vortice.Vulkan |
-| SharpInference.Cuda | classlib | GPU backend: CUDA cuBLAS via P/Invoke, bf16/fp32 SGEMM |
-| SharpInference.Engine | classlib | Forward pass (CPU + GPU), KV cache, sampling, speculative decoding |
-| SharpInference.Diffusion | classlib | Z-Image-Turbo + FLUX pipeline: DiT, VAE decoder, Qwen3 text encoder |
-| SharpInference.Cli | console | CLI tool (`sharpi-cli`) with NativeAOT support |
-| SharpInference.TurboQuant | classlib | KV-cache compression (3-bit Lloyd-Max codebooks) |
-| SharpInference.Pipeline | classlib | Memory hierarchy, SLRU expert cache, async prefetcher |
-| SharpInference.Server | web | OpenAI + Anthropic API server with NativeAOT support |
+| llama.cpp SmolLM2 1.7B | CPU (reference) | 45.1 | Same hardware |
 
 ## Build & Test
 
 ```bash
 dotnet build              # Debug build
-dotnet build -c Release   # Release build (enables IlcOptimizationPreference=Speed)
+dotnet build -c Release   # Release (IlcOptimizationPreference=Speed)
 dotnet test               # Run all tests (207 tests across 5 projects)
 
-# Publish NativeAOT binary
-dotnet publish src/SharpInference.Cli -c Release -r win-x64
+# NativeAOT single-binary publish
+dotnet publish src/SharpInference.Cli    -c Release -r win-x64
 dotnet publish src/SharpInference.Server -c Release -r win-x64
 
-# Run all benchmarks (requires every benchmark model to be present)
+# Benchmarks (requires benchmark models to be present)
 dotnet run --project benchmarks/SharpInference.Bench -c Release -- --filter '*'
 ```
+
+## Projects
+
+| Project | Description |
+|---------|-------------|
+| `SharpInference.Core` | GGUF parser, BPE tokenizer, tensor types, model graph |
+| `SharpInference.Cpu` | CPU backend: AVX2/AVX-512 SIMD, Q4_K_M dequantization, optional OpenBLAS GEMM |
+| `SharpInference.Vulkan` | GPU backend: Vulkan compute shaders via Vortice.Vulkan |
+| `SharpInference.Cuda` | GPU backend: CUDA cuBLAS P/Invoke, NVRTC custom kernels (im2col, element-wise ops) |
+| `SharpInference.Engine` | Forward pass (CPU/GPU/Hybrid), paged KV cache, sampling, speculative decoding |
+| `SharpInference.Diffusion` | Z-Image-Turbo + FLUX.1 pipeline: DiT, VAE decoder, Qwen3 + CLIP-L + T5-XXL encoders |
+| `SharpInference.TurboQuant` | KV-cache compression using 3-bit Lloyd-Max codebooks |
+| `SharpInference.Pipeline` | 3-tier memory hierarchy (VRAM → RAM → NVMe), SLRU expert cache, async prefetcher |
+| `SharpInference.Cli` | CLI tool (`sharpi-cli`) with NativeAOT support |
+| `SharpInference.Server` | OpenAI + Anthropic + Responses API server with NativeAOT support |
 
 ## Architecture
 
