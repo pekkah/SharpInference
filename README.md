@@ -317,6 +317,29 @@ dotnet publish src/SharpInference.Server -c Release -r win-x64
 dotnet run --project benchmarks/SharpInference.Bench -c Release -- --filter '*'
 ```
 
+## Helper Scripts
+
+The `scripts/` directory contains optional helpers for development and validation. The PowerShell scripts target Windows; the Python scripts require [`llama-cpp-python`](https://github.com/abetlen/llama-cpp-python).
+
+| Script | Purpose |
+|--------|---------|
+| `download-model.ps1` | Downloads GGUF models into `models/` from Hugging Face. Accepts `-Model <name>` for any of `smollm2`, `qwen3-8b`, `llama31-70b`, `qwen3-coder-30b-a3b`, `llama4-scout`, `z-image-turbo`, `z-image-turbo-q8`, `realesrgan-x4`. Skips files already present. |
+| `setup-openblas.ps1` | Downloads OpenBLAS (default `0.3.28`) and installs `libopenblas.dll` into `tools/openblas/` for the optional CPU GEMM acceleration path. |
+| `setup-llamacpp.ps1` | Downloads prebuilt llama.cpp binaries into `tools/llama.cpp/`. Variants: `cpu` (default), `vulkan`, `cuda-12.4`, `cuda-13.1`. Used as the reference implementation for forward-pass validation. |
+| `generate-reference-logits.ps1` | Runs llama.cpp with `--logits-all` on a fixed prompt and writes reference logits to `tests/reference-data/` for comparison against the SharpInference forward pass. Requires `setup-llamacpp.ps1` and `download-model.ps1 -Model smollm2` to have been run first. |
+| `compare_tokens.py` | Python helper that tokenizes a chat prompt with `llama-cpp-python` and prints top-5 logits at each step. Used to debug divergence against Llama 4 Scout. |
+| `extract_reference.py` | Python helper that prints model metadata (`n_vocab`, `n_ctx_train`, `n_embd`) and token IDs for prompt fragments. Useful when investigating tokenizer disagreements. |
+
+Typical first-time setup on Windows:
+
+```powershell
+# From repo root
+.\scripts\setup-openblas.ps1                  # optional, enables OpenBLAS GEMM
+.\scripts\download-model.ps1 -Model smollm2   # fetch a small test model
+.\scripts\setup-llamacpp.ps1                  # optional, for reference validation
+.\scripts\generate-reference-logits.ps1       # optional, regenerates tests/reference-data/
+```
+
 ## Projects
 
 | Project | Description |
