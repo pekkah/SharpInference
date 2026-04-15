@@ -230,6 +230,10 @@ Prints all GGUF metadata key/value pairs in a table (architecture, context lengt
 
 ## API Server
 
+> **Note:** The ASP.NET host hasn't been exercised end-to-end — it builds and the
+> endpoint handlers have unit tests, but running against real clients has not been
+> validated. Expect it to need fixes.
+
 Starts an HTTP server compatible with OpenAI and Anthropic clients. Defaults to `http://localhost:5000`.
 
 ```bash
