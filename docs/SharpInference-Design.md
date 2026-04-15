@@ -2252,7 +2252,7 @@ dotnet run --project src/SharpInference.Cli -- image \
   --vae models/z-image-turbo/vae \
   --qwen-encoder models/Z-Image-AbliteratedV1.Q5_K_M.gguf \
   --qwen-tokenizer models/z-image-turbo/tokenizer/tokenizer.json \
-  --upscaler models/RealESRGAN_x4plus.pth \
+  --upscaler models/RealESRGAN_x4plus.safetensors \
   --upscale-blend 0.8 \
   -p "photorealistic woman with red lipstick" -W 512 -H 512 -o out.png
 ```

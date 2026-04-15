@@ -18,7 +18,7 @@ Includes an OpenAI- and Anthropic-compatible API server and native pipelines for
 |---------|-----------|-------|
 | **Faster batched GEMM (CPU)** | [OpenBLAS](https://github.com/OpenMathLib/OpenBLAS/releases) | Place `libopenblas.dll` in `tools/openblas/` or system PATH. Auto-detected at startup; silently skipped if absent. |
 | **GPU inference (Vulkan)** | Vulkan-capable GPU + drivers | Works on AMD/Intel/NVIDIA. No extra install on Windows — just up-to-date GPU drivers. The `VULKAN_SDK` env var is used for shader recompilation only. |
-| **GPU inference (CUDA)** | [CUDA Toolkit 11.x](https://developer.nvidia.com/cuda-toolkit) | Requires `cublas64_11.dll`, `cudart64_110.dll`, and `nvrtc64_11*.dll` on PATH. NVIDIA GPU only. Used for image generation pipelines. |
+| **GPU inference (CUDA)** | [CUDA Toolkit 11.x](https://developer.nvidia.com/cuda-toolkit) | Requires `cublas64_11.dll` and `cudart64_110.dll` on PATH (CUDA 11 runtime). NVRTC resolver additionally tries `nvrtc64_120_0.dll` (CUDA 12.x), then `nvrtc64_112_0.dll`, then `nvrtc64_11*.dll`. NVIDIA GPU only. Used for image generation pipelines. |
 | **Image upscaling (RRDBNet)** | CUDA (above) | Real-ESRGAN ×2/×4 upscaler. Falls back to bicubic if CUDA is unavailable. |
 
 ## Getting Models
@@ -335,4 +335,8 @@ dotnet run --project benchmarks/SharpInference.Bench -c Release -- --filter '*'
 ## Architecture
 
 See [docs/SharpInference-Design.md](docs/SharpInference-Design.md).
+
+## License
+
+Released under the [MIT License](LICENSE).
 
