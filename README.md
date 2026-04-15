@@ -5,6 +5,12 @@ Runs GGUF models on CPU (AVX2/AVX-512 SIMD) and GPU (Vulkan compute shaders or C
 Includes an OpenAI- and Anthropic-compatible API server and native pipelines for
 [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) and FLUX.1 image generation.
 
+> ⚠️ **Status: experimental / work-in-progress.** This is a personal research project
+> shared as-is. Features documented here may be incomplete, subtly broken, or behave
+> differently than advertised on your hardware. Expect rough edges, breaking changes
+> without notice, and the occasional crash. Bug reports and PRs are welcome, but
+> please don't depend on this for anything important. No warranty — see [LICENSE](LICENSE).
+
 ## Prerequisites
 
 ### Required
