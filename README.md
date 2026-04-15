@@ -37,20 +37,20 @@ pip install huggingface_hub
 mkdir -p models
 
 # SmolLM2 1.7B — fast, low memory, great for testing (~1 GB)
-huggingface-cli download HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF \
+huggingface-cli download bartowski/SmolLM2-1.7B-Instruct-GGUF \
   SmolLM2-1.7B-Instruct-Q4_K_M.gguf --local-dir models
 
 # Qwen3 8B — general purpose, fits in 6 GB VRAM (~5 GB)
 huggingface-cli download Qwen/Qwen3-8B-GGUF \
-  qwen3-8b-q4_k_m.gguf --local-dir models
+  Qwen3-8B-Q4_K_M.gguf --local-dir models
 
 # Qwen3-Coder 30B-A3B — MoE coding model, ~20 t/s CPU (~17 GB)
-huggingface-cli download Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF \
+huggingface-cli download unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF \
   Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --local-dir models
 
-# Llama 4 Scout 109B-16E — MoE, ~5 t/s CPU on DDR4-3200 (~65 GB)
+# Llama 4 Scout 109B-16E — MoE, ~5 t/s CPU on DDR4-3200 (~61 GB, 2 shards)
 huggingface-cli download unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF \
-  Llama-4-Scout-17B-16E-Instruct-Q4_K_M.gguf --local-dir models
+  --include "Q4_K_M/*" --local-dir models
 ```
 
 ### Image generation models (Z-Image-Turbo)
@@ -61,8 +61,8 @@ huggingface-cli download jayn7/Z-Image-Turbo-GGUF \
   z_image_turbo-Q5_K_M.gguf --local-dir models        # 5.5 GB, best quality
   # z_image_turbo-Q4_K_M.gguf --local-dir models      # 4.5 GB, slightly faster
 
-# VAE + tokenizer (inside the same repo)
-huggingface-cli download jayn7/Z-Image-Turbo-GGUF \
+# VAE + tokenizer (from the original Tongyi-MAI repo)
+huggingface-cli download Tongyi-MAI/Z-Image-Turbo \
   --include "vae/*" "tokenizer/*" --local-dir models/z-image-turbo
 
 # Text encoder — uncensored Qwen3-4B fine-tune (~2.9 GB)
@@ -283,7 +283,7 @@ curl http://localhost:5000/metrics
 | SmolLM2 1.7B Instruct | [HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF) | llama | Q4_K_M | ~1 GB | Fast, low RAM, great for testing |
 | Qwen3 8B | [Qwen/Qwen3-8B-GGUF](https://huggingface.co/Qwen/Qwen3-8B-GGUF) | qwen3 | Q4_K_M | ~5 GB | General purpose; fits in 6 GB VRAM |
 | Qwen3-Coder 30B-A3B Instruct | [Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF) | qwen3moe | Q4_K_M | ~17 GB | MoE, 128 experts / 8 active, ~20 t/s CPU |
-| Llama 4 Scout 109B-16E Instruct | [unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF](https://huggingface.co/unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF) | llama4 | Q4_K_M | ~65 GB | MoE, 16 experts, ~5 t/s on DDR4-3200 |
+| Llama 4 Scout 109B-16E Instruct | [unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF](https://huggingface.co/unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF) | llama4 | Q4_K_M | ~61 GB (2 shards) | MoE, 16 experts, ~5 t/s on DDR4-3200 |
 
 Any GGUF model with architecture `llama`, `llama4`, `qwen3`, or `qwen3moe` should work.
 

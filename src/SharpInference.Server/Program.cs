@@ -18,6 +18,23 @@ builder.Services.AddSingleton<IInferenceEngine>(sp =>
         ?? builder.Configuration["SharpInference:ModelPath"]
         ?? "model.gguf";
 
+    // Resolve relative paths against common roots so `SHARPI_MODEL=models/foo.gguf`
+    // works regardless of whether the process CWD is the repo root, the project
+    // directory (as `dotnet run --project` sets it), or the published binary's dir.
+    if (!Path.IsPathRooted(modelPath) && !File.Exists(modelPath))
+    {
+        var candidates = new List<string>
+        {
+            Path.Combine(Directory.GetCurrentDirectory(), modelPath),
+            Path.Combine(AppContext.BaseDirectory, modelPath),
+        };
+        var dir = new DirectoryInfo(Directory.GetCurrentDirectory());
+        for (int i = 0; i < 5 && dir is not null; i++, dir = dir.Parent)
+            candidates.Add(Path.Combine(dir.FullName, modelPath));
+        var resolved = candidates.FirstOrDefault(File.Exists);
+        if (resolved is not null) modelPath = resolved;
+    }
+
     if (!File.Exists(modelPath))
         throw new InvalidOperationException(
             $"Model file not found: '{modelPath}'. Set SHARPI_MODEL env var or SharpInference:ModelPath in appsettings.json.");
