@@ -589,7 +589,13 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         // Use the model's own Jinja2 chat template when available (read from GGUF metadata).
         if (s_jinja != null)
         {
-            var messages = JinjaChatTemplate.BuildMessages(userMessage, systemContent: systemPrompt);
+            // Qwen3 instruction-tuned models behave poorly without a system message —
+            // they end the turn after a few tokens for short prompts. The hardcoded
+            // fallback path (below) injects this same default; mirror it here so both
+            // paths produce comparable output.
+            string? effectiveSystemPrompt = systemPrompt
+                ?? (s_arch is "qwen3moe" or "qwen3" ? "You are a helpful assistant." : null);
+            var messages = JinjaChatTemplate.BuildMessages(userMessage, systemContent: effectiveSystemPrompt);
             return s_jinja.Render(new Dictionary<string, object?>
             {
                 ["messages"]             = messages,

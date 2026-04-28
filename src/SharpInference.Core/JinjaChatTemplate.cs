@@ -129,17 +129,43 @@ public sealed class JinjaChatTemplate
 
     private static void ApplyStripping(List<Token> tokens)
     {
+        // Match HuggingFace transformers' chat-template renderer defaults:
+        //   trim_blocks=True   — strip a single \n immediately after {% ... %} or {# ... #}
+        //   lstrip_blocks=True — strip leading horizontal whitespace before {% %} on a line
+        // Plus the explicit Jinja whitespace controls: {%- / -%}, {{- / -}}, {#- / -#}.
         for (int i = 0; i < tokens.Count; i++)
         {
             var tok = tokens[i];
             if (tok.Kind is TokenKind.Text) continue;
 
+            // Left strip — explicit `{%-` strips ALL prior trailing whitespace incl. newlines.
+            // Implicit lstrip_blocks for {% %} / {# #} strips only horizontal whitespace
+            // (spaces, tabs) at the start of the line up to the tag.
             if (tok.StripL && i > 0 && tokens[i - 1].Kind == TokenKind.Text)
             {
                 var prev = tokens[i - 1];
                 tokens[i - 1] = prev with { Content = prev.Content.TrimEnd() };
             }
+            else if (tok.Kind is TokenKind.Block or TokenKind.Comment
+                     && i > 0 && tokens[i - 1].Kind == TokenKind.Text)
+            {
+                var prev = tokens[i - 1];
+                string c = prev.Content;
+                int n = c.Length;
+                while (n > 0 && (c[n - 1] == ' ' || c[n - 1] == '\t')) n--;
+                if (n < c.Length && (n == 0 || c[n - 1] == '\n'))
+                    tokens[i - 1] = prev with { Content = c[..n] };
+            }
+
+            // Right strip — explicit `-%}` strips ALL leading whitespace (incl. newlines).
+            // Implicit trim_blocks for {% %} / {# #} strips a single trailing \r? \n.
             if (tok.StripR && i + 1 < tokens.Count && tokens[i + 1].Kind == TokenKind.Text)
+            {
+                var nxt = tokens[i + 1];
+                tokens[i + 1] = nxt with { Content = nxt.Content.TrimStart() };
+            }
+            else if (tok.Kind is TokenKind.Block or TokenKind.Comment
+                     && i + 1 < tokens.Count && tokens[i + 1].Kind == TokenKind.Text)
             {
                 var nxt = tokens[i + 1];
                 string c = nxt.Content;
