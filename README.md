@@ -35,87 +35,107 @@ The fastest way to download is with the [Hugging Face CLI](https://huggingface.c
 ```bash
 pip install huggingface_hub
 mkdir -p models
+```
 
+```bash
 # SmolLM2 1.7B — fast, low memory, great for testing (~1 GB)
-huggingface-cli download bartowski/SmolLM2-1.7B-Instruct-GGUF \
-  SmolLM2-1.7B-Instruct-Q4_K_M.gguf --local-dir models
+huggingface-cli download bartowski/SmolLM2-1.7B-Instruct-GGUF SmolLM2-1.7B-Instruct-Q4_K_M.gguf --local-dir models
+```
 
+```bash
 # Qwen3 8B — general purpose, fits in 6 GB VRAM (~5 GB)
-huggingface-cli download Qwen/Qwen3-8B-GGUF \
-  Qwen3-8B-Q4_K_M.gguf --local-dir models
+huggingface-cli download Qwen/Qwen3-8B-GGUF Qwen3-8B-Q4_K_M.gguf --local-dir models
+```
 
+```bash
 # Qwen3-Coder 30B-A3B — MoE coding model, ~20 t/s CPU (~17 GB)
-huggingface-cli download unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF \
-  Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --local-dir models
+huggingface-cli download unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --local-dir models
+```
 
+```bash
 # Llama 4 Scout 109B-16E — MoE, ~5 t/s CPU on DDR4-3200 (~61 GB, 2 shards)
-huggingface-cli download unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF \
-  --include "Q4_K_M/*" --local-dir models
+huggingface-cli download unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF --include "Q4_K_M/*" --local-dir models
 ```
 
 ### Image generation models (Z-Image-Turbo)
 
 ```bash
-# DiT model (choose one quant)
-huggingface-cli download jayn7/Z-Image-Turbo-GGUF \
-  z_image_turbo-Q5_K_M.gguf --local-dir models        # 5.5 GB, best quality
-  # z_image_turbo-Q4_K_M.gguf --local-dir models      # 4.5 GB, slightly faster
+# DiT model — Q5_K_M (5.5 GB, best quality); use z_image_turbo-Q4_K_M.gguf for ~4.5 GB
+huggingface-cli download jayn7/Z-Image-Turbo-GGUF z_image_turbo-Q5_K_M.gguf --local-dir models
+```
 
+```bash
 # VAE + tokenizer (from the original Tongyi-MAI repo)
-huggingface-cli download Tongyi-MAI/Z-Image-Turbo \
-  --include "vae/*" "tokenizer/*" --local-dir models/z-image-turbo
+huggingface-cli download Tongyi-MAI/Z-Image-Turbo --include "vae/*" "tokenizer/*" --local-dir models/z-image-turbo
+```
 
+```bash
 # Text encoder — uncensored Qwen3-4B fine-tune (~2.9 GB)
-huggingface-cli download BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1 \
-  Z-Image-AbliteratedV1.Q5_K_M.gguf --local-dir models
+huggingface-cli download BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1 Z-Image-AbliteratedV1.Q5_K_M.gguf --local-dir models
 ```
 
 ### Image generation models (FLUX.1)
 
 ```bash
 # FLUX.1-schnell GGUF (~7–9 GB depending on quant)
-huggingface-cli download city96/FLUX.1-schnell-gguf \
-  flux1-schnell-Q4_K_S.gguf --local-dir models
+huggingface-cli download city96/FLUX.1-schnell-gguf flux1-schnell-Q4_K_S.gguf --local-dir models
+```
 
+```bash
 # VAE + CLIP-L + T5-XXL encoders
-huggingface-cli download comfyanonymous/flux_text_encoders \
-  ae.safetensors clip_l.safetensors t5xxl_fp16.safetensors --local-dir models/flux
+huggingface-cli download comfyanonymous/flux_text_encoders ae.safetensors clip_l.safetensors t5xxl_fp16.safetensors --local-dir models/flux
 ```
 
 ## Quick Start
 
+Build first:
+
 ```bash
-# Build in release mode
 dotnet build -c Release
+```
 
-# Single-turn inference (CPU)
-dotnet run --project src/SharpInference.Cli -c Release -- \
-  -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
-  -p "What is 2+2?" --temp 0
+Each command below is on a single line so you can copy-paste straight into your terminal.
 
-# Single-turn inference (GPU — all layers in VRAM)
-dotnet run --project src/SharpInference.Cli -c Release -- \
-  -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
-  -p "What is 2+2?" --temp 0 -g -1
+**SmolLM2 1.7B — single-turn, CPU:**
 
-# Interactive chat session
-dotnet run --project src/SharpInference.Cli -c Release -- \
-  -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
+```bash
+dotnet run --project src/SharpInference.Cli -c Release -- -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -p "What is 2+2?" --temp 0
+```
 
-# MoE coding model (~20 t/s CPU)
-dotnet run --project src/SharpInference.Cli -c Release -- \
-  -m models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf \
-  -p "Implement a binary search tree in C#" --temp 0
+**SmolLM2 1.7B — single-turn, all-GPU:**
 
-# Speculative decoding (draft + target model, ~2× faster at temp 0)
-dotnet run --project src/SharpInference.Cli -c Release -- \
-  -m models/Qwen3-8B-Q4_K_M.gguf \
-  --draft-model models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
-  -p "Write a quicksort in Python" --temp 0
+```bash
+dotnet run --project src/SharpInference.Cli -c Release -- -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -p "What is 2+2?" --temp 0 -g -1
+```
 
-# Start API server
-SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
-  dotnet run --project src/SharpInference.Server -c Release
+**SmolLM2 1.7B — interactive chat:**
+
+```bash
+dotnet run --project src/SharpInference.Cli -c Release -- -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
+```
+
+**Qwen3-Coder 30B-A3B (MoE) — CPU + KV-cache compression:**
+
+```bash
+dotnet run --project src/SharpInference.Cli -c Release -- -m models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --tq -p "Implement a binary search tree in C#" --temp 0
+```
+
+**Speculative decoding (draft + target, ~2× faster at temp 0):**
+
+```bash
+dotnet run --project src/SharpInference.Cli -c Release -- -m models/Qwen3-8B-Q4_K_M.gguf --draft-model models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -p "Write a quicksort in Python" --temp 0
+```
+
+**Start API server (CPU):**
+
+```bash
+SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf dotnet run --project src/SharpInference.Server -c Release
+```
+
+PowerShell equivalent for the server line:
+
+```powershell
+$env:SHARPI_MODEL='models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf'; dotnet run --project src/SharpInference.Server -c Release
 ```
 
 ## CLI Reference
@@ -159,27 +179,13 @@ Supports two native pipelines: **Z-Image-Turbo** (auto-detected from model filen
 #### Z-Image-Turbo example
 
 ```bash
-dotnet run --project src/SharpInference.Cli -c Release -- image \
-  -m models/z_image_turbo-Q5_K_M.gguf \
-  --vae models/z-image-turbo/vae \
-  --qwen-encoder models/Z-Image-AbliteratedV1.Q5_K_M.gguf \
-  --qwen-tokenizer models/z-image-turbo/tokenizer/tokenizer.json \
-  -p "a serene mountain lake at sunrise" \
-  -W 1024 -H 1024 --steps 4 -o landscape.png -v
+dotnet run --project src/SharpInference.Cli -c Release -- image -m models/z_image_turbo-Q5_K_M.gguf --vae models/z-image-turbo/vae --qwen-encoder models/Z-Image-AbliteratedV1.Q5_K_M.gguf --qwen-tokenizer models/z-image-turbo/tokenizer/tokenizer.json -p "a serene mountain lake at sunrise" -W 1024 -H 1024 --steps 4 -o landscape.png -v
 ```
 
 #### FLUX.1-schnell example
 
 ```bash
-dotnet run --project src/SharpInference.Cli -c Release -- image \
-  -m models/flux1-schnell-Q4_K_S.gguf \
-  --vae models/flux/ae.safetensors \
-  --clip-l models/flux/clip_l.safetensors \
-  --clip-tokenizer models/flux/tokenizer_clip.json \
-  --t5xxl models/flux/t5xxl_fp16.safetensors \
-  --t5-tokenizer models/flux/tokenizer_t5.json \
-  -p "a cinematic photograph of a mountain lake" \
-  -W 512 -H 512 --steps 4 -o out.png
+dotnet run --project src/SharpInference.Cli -c Release -- image -m models/flux1-schnell-Q4_K_S.gguf --vae models/flux/ae.safetensors --clip-l models/flux/clip_l.safetensors --clip-tokenizer models/flux/tokenizer_clip.json --t5xxl models/flux/t5xxl_fp16.safetensors --t5-tokenizer models/flux/tokenizer_t5.json -p "a cinematic photograph of a mountain lake" -W 512 -H 512 --steps 4 -o out.png
 ```
 
 #### All image options
@@ -222,8 +228,7 @@ Benchmarked on AMD Zen 4 + RTX 4070 Ti:
 ### `list-metadata` — inspect a GGUF file
 
 ```bash
-dotnet run --project src/SharpInference.Cli -c Release -- \
-  list-metadata -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
+dotnet run --project src/SharpInference.Cli -c Release -- list-metadata -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
 ```
 
 Prints all GGUF metadata key/value pairs in a table (architecture, context length, rope settings, tokenizer vocab, etc.).
@@ -236,33 +241,51 @@ Prints all GGUF metadata key/value pairs in a table (architecture, context lengt
 
 Starts an HTTP server compatible with OpenAI and Anthropic clients. Defaults to `http://localhost:5000`.
 
+Start the server (CPU):
+
 ```bash
-# Start (CPU)
-SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
-  dotnet run --project src/SharpInference.Server -c Release
+SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf dotnet run --project src/SharpInference.Server -c Release
+```
 
-# OpenAI chat completions (streaming)
-curl http://localhost:5000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"smollm2","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+PowerShell:
 
-# Anthropic messages (non-streaming)
-curl http://localhost:5000/v1/messages \
-  -H "Content-Type: application/json" \
-  -d '{"model":"smollm2","messages":[{"role":"user","content":"Hello"}],"max_tokens":256}'
+```powershell
+$env:SHARPI_MODEL='models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf'; dotnet run --project src/SharpInference.Server -c Release
+```
 
-# OpenAI Responses API
-curl http://localhost:5000/v1/responses \
-  -H "Content-Type: application/json" \
-  -d '{"model":"smollm2","input":"Hello"}'
+OpenAI chat completions (streaming):
 
-# List loaded model
+```bash
+curl http://localhost:5000/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"smollm2","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+```
+
+Anthropic messages (non-streaming):
+
+```bash
+curl http://localhost:5000/v1/messages -H "Content-Type: application/json" -d '{"model":"smollm2","messages":[{"role":"user","content":"Hello"}],"max_tokens":256}'
+```
+
+OpenAI Responses API:
+
+```bash
+curl http://localhost:5000/v1/responses -H "Content-Type: application/json" -d '{"model":"smollm2","input":"Hello"}'
+```
+
+List loaded model:
+
+```bash
 curl http://localhost:5000/v1/models
+```
 
-# Health check
+Health check:
+
+```bash
 curl http://localhost:5000/health
+```
 
-# Prometheus metrics
+Prometheus metrics:
+
+```bash
 curl http://localhost:5000/metrics
 ```
 
@@ -294,6 +317,71 @@ Any GGUF model with architecture `llama`, `llama4`, `qwen3`, or `qwen3moe` shoul
 | Z-Image-Turbo DiT | [jayn7/Z-Image-Turbo-GGUF](https://huggingface.co/jayn7/Z-Image-Turbo-GGUF) | Q5_K_M | 5.5 GB | Best quality; also Q4_K_M (4.5 GB) |
 | Z-Image-Turbo text encoder | [BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1](https://huggingface.co/BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1) | Q5_K_M | 2.9 GB | Uncensored fine-tune of Qwen3-4B |
 | FLUX.1-schnell | [city96/FLUX.1-schnell-gguf](https://huggingface.co/city96/FLUX.1-schnell-gguf) | Q4_K_S | ~7 GB | 4-step distilled; VAE+encoders from comfyanonymous/flux_text_encoders |
+
+### What works today
+
+Verified on AMD Zen 4 (12c/24t, DDR4-3200) + RTX 4070 Ti (12 GB VRAM):
+
+#### SmolLM2 1.7B Instruct (`llama`, headDim 64)
+
+| Backend | `--tq` | Status | Decode (t/s) |
+|---------|--------|--------|--------------|
+| CPU (default) | — | ✓ works | ~51 |
+| CPU | `--tq` | ✗ refused — `headDim 64 != 128/256` (clear error) | — |
+| GPU (`-g -1`) | — | ✓ works | ~159 |
+| GPU (`-g -1`) | `--tq` | ✗ refused — same headDim guard | — |
+| Hybrid (`-g N`, 1 ≤ N < layers) | — | ✓ works | ~61 (`-g 8`) |
+| Hybrid | `--tq` | ✗ refused — same headDim guard | — |
+
+Copy-paste:
+
+```bash
+dotnet run --project src/SharpInference.Cli -c Release -- -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -p "Hello" --temp 0
+```
+
+```bash
+dotnet run --project src/SharpInference.Cli -c Release -- -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -p "Hello" --temp 0 -g -1
+```
+
+#### Qwen3-Coder 30B-A3B Instruct (`qwen3moe`, headDim 128, MoE 128/8)
+
+| Backend | `--tq` | Status | Decode (t/s) |
+|---------|--------|--------|--------------|
+| CPU (default) | — | ✓ works | ~21 |
+| CPU | `--tq` | ✓ works | ~21 |
+| GPU (`-g -1`) | any | ⚠ auto-fallback to CPU with a warning (issue [#2](https://github.com/pekkah/SharpInference/issues/2)) | — |
+| Hybrid (`-g N`) | any | ✗ refused with error pointing to issue [#2](https://github.com/pekkah/SharpInference/issues/2) | — |
+
+Copy-paste (recommended config for this machine):
+
+```bash
+dotnet run --project src/SharpInference.Cli -c Release -- -m models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --tq -p "Write a Python quicksort." --temp 0
+```
+
+#### Meta-Llama-3.1-70B-Instruct-Q4_K_M.gguf
+
+The local file (`models/Meta-Llama-3.1-70B-Instruct-Q4_K_M.gguf`, 269 MB) is incomplete — a real 70B Q4_K_M is ~40 GB across multiple GGUF shards. Loading it crashes with `AccessViolationException` in `PrefaultWeights`. Re-download as a multi-shard set, e.g.:
+
+```bash
+huggingface-cli download bartowski/Meta-Llama-3.1-70B-Instruct-GGUF --include "Meta-Llama-3.1-70B-Instruct-Q4_K_M*.gguf" --local-dir models
+```
+
+#### Z-Image-Turbo (image generation)
+
+Models on disk: `models/z_image_turbo-Q5_K_M.gguf`, `models/Z-Image-AbliteratedV1.Q5_K_M.gguf`, `models/z-image-turbo/{vae,tokenizer}/`. The optional `RealESRGAN_x4plus.safetensors` is not present — upscaling falls back to bicubic unless you fetch it (`scripts/download-model.ps1 -Model realesrgan-x4`).
+
+Image generation has not been re-tested in this round; the existing example below should still work end-to-end:
+
+```bash
+dotnet run --project src/SharpInference.Cli -c Release -- image -m models/z_image_turbo-Q5_K_M.gguf --vae models/z-image-turbo/vae --qwen-encoder models/Z-Image-AbliteratedV1.Q5_K_M.gguf --qwen-tokenizer models/z-image-turbo/tokenizer/tokenizer.json -p "a serene mountain lake at sunrise" -W 1024 -H 1024 --steps 4 -o landscape.png -v
+```
+
+### Known limitations
+
+- **MoE on GPU**: any `qwen3moe`/`llama4` model with `-g N` (N > 0) is rejected with an explicit error. `-g -1` (auto) silently falls back to CPU. Tracking: [#2](https://github.com/pekkah/SharpInference/issues/2).
+- **GPU embedding lookup in `HybridForwardPass`**: works around a shader bug by always doing the per-token embedding row dequant on CPU. Cost is one row of dequant per token (negligible). Tracking: [#3](https://github.com/pekkah/SharpInference/issues/3).
+- **`--backend` flag**: does not exist — backend is selected via `-g`. Vulkan only; CUDA is wired into `image` only. Tracking: [#4](https://github.com/pekkah/SharpInference/issues/4).
+- **`--tq`** (TurboQuant): requires the model to have `headDim == 128` (most Qwen3 / Llama 3) or `256` (Llama 70B). SmolLM2's `headDim 64` is rejected with a clear error.
 
 ## Performance
 
