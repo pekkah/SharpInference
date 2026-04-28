@@ -166,6 +166,23 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         }
 
         int nGpuLayers = settings.NGpuLayers;
+
+        // MoE models are not yet supported on the hybrid GPU+CPU path. The GpuMoeFfn path
+        // produces NaN/degenerate output (see https://github.com/pekkah/SharpInference/issues/2).
+        // Fall back to CPU automatically when -g is -1 (auto), refuse explicit -g N for MoE.
+        if (hp.IsMoE && nGpuLayers != 0)
+        {
+            if (nGpuLayers > 0)
+            {
+                AnsiConsole.MarkupLine($"[red]Error:[/] MoE models (this one is [yellow]{s_arch}[/]) are not yet supported on the hybrid GPU+CPU path; output is degenerate. Tracking issue: https://github.com/pekkah/SharpInference/issues/2");
+                AnsiConsole.MarkupLine("Re-run without [yellow]-g[/] (or [yellow]-g 0[/]) to use the working CPU path. [yellow]--tq[/] is supported on CPU.");
+                return 1;
+            }
+            // -g -1 (auto) → silently fall back to CPU
+            AnsiConsole.MarkupLine("[yellow]Note:[/] [yellow]-g -1[/] requested, but MoE models run only on CPU until issue #2 is fixed. Falling back to CPU.");
+            nGpuLayers = 0;
+        }
+
         if (nGpuLayers == 0)
         {
             // CPU only

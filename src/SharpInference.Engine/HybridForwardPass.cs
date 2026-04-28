@@ -470,7 +470,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             CpuEmbedToken(token, pinned);
             _gpu.UnmapPinned(_pinnedHidden);
             CopyGpuBuffer(_gpuHidden, _pinnedHidden);
-            _gpu.RecordTransferBarrier();
+            _gpu.RecordBarrier();
         }
 
         for (int i = 0; i < _nGpuLayers; i++)
@@ -490,9 +490,9 @@ public sealed unsafe class HybridForwardPass : IForwardPass
 
         if (_nCpuLayers > 0)
         {
-            // Download hidden state to pinned buffer
+            // Download hidden state to pinned buffer.
             CopyGpuBuffer(_pinnedHidden, _gpuHidden);
-            _gpu.RecordTransferBarrier();
+            _gpu.RecordBarrier();
         }
 
         _gpu.EndRecordAndSubmit();
@@ -526,7 +526,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
                 // Upload pinned → GPU hidden, then final norm + output
                 _gpu.BeginRecord();
                 CopyGpuBuffer(_gpuHidden, _pinnedHidden);
-                _gpu.RecordTransferBarrier();
+                _gpu.RecordBarrier();
             }
             else
             {
@@ -540,7 +540,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             if (_gpuOutputWeight is null)
             {
                 CopyGpuBuffer(_pinnedHidden, _gpuHidden);
-                _gpu.RecordTransferBarrier();
+                _gpu.RecordBarrier();
                 _gpu.EndRecordAndSubmit();
 
                 float* pinned = _gpu.MapPinned(_pinnedHidden);
@@ -598,7 +598,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
     private void GpuLayer(int i, int position)
     {
         CopyGpuBuffer(_gpuResidual, _gpuHidden);
-        _gpu.RecordTransferBarrier();
+        _gpu.RecordBarrier();
 
         _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuAttnNorm[i], _hp.RmsNormEps);
         _gpu.RecordBarrier();
@@ -653,7 +653,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             {
                 CopyGpuBufferRegion(_gpuEvictK!, 0, _gpuKCache[i], (long)_gpuFp32WriteIdx * rowBytes, rowBytes);
                 CopyGpuBufferRegion(_gpuEvictV!, 0, _gpuVCache[i], (long)_gpuFp32WriteIdx * rowBytes, rowBytes);
-                _gpu.RecordTransferBarrier();
+                _gpu.RecordBarrier();
 
                 _gpu.TqKvAppend(_gpuEvictK!, _gpuEvictV!, _gpuTqKCache![i], _gpuTqVCache![i],
                     _gpuSignPatterns![i], _gpuCodebook!, _gpuBoundaries!,
@@ -696,9 +696,10 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         }
         _gpu.RecordBarrier();
         _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+        _gpu.RecordBarrier();
 
         CopyGpuBuffer(_gpuResidual, _gpuHidden);
-        _gpu.RecordTransferBarrier();
+        _gpu.RecordBarrier();
 
         _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuFfnNorm[i], _hp.RmsNormEps);
         _gpu.RecordBarrier();
@@ -710,6 +711,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         _gpu.RecordBarrier();
 
         _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+        _gpu.RecordBarrier();
     }
 
     // ================================================================
@@ -1146,12 +1148,12 @@ public sealed unsafe class HybridForwardPass : IForwardPass
 
     private static bool ShouldKeepFixedWeightsOnCpu(GgufTensorInfo embedding, GgufTensorInfo? output)
     {
-        const long maxStorageBufferBytes = 2L * 1024 * 1024 * 1024 - 1;
-        if (EstimateGpuTensorBytes(embedding) > maxStorageBufferBytes)
-            return true;
-        if (output is not null && EstimateGpuTensorBytes(output.Value) > maxStorageBufferBytes)
-            return true;
-        return false;
+        // Always keep embedding+output on CPU for the hybrid path. The GPU embedding-lookup
+        // shader produces garbage when invoked inside HybridForwardPass (root cause unclear —
+        // identical shader works in GpuForwardPass), and the embedding is one-row-per-token
+        // which is negligible vs. the layer compute, so the perf cost is near zero.
+        // TODO: investigate why EmbedLookupQ4K writes wrong values in hybrid context.
+        return true;
     }
 
     private static long EstimateGpuTensorBytes(GgufTensorInfo tensor)
@@ -1218,8 +1220,8 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             _gpu.Softmax(_gpuRouterLogits!);
         // Copy norm buf to pinned memory while still recording so the CPU can
         // read it after submit via MapPinned — avoids a second CopyBuffer call.
+        _gpu.RecordBarrier();
         CopyGpuBuffer(_gpuPinnedNorm!, _gpuNormBuf);
-        _gpu.RecordTransferBarrier();
         _gpu.EndRecordAndSubmit();
         _gpu.Download(_gpuRouterLogits!, _gpuRouterBuf!);
 
@@ -1472,25 +1474,16 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             _gpuWeightDTypes.TryGetValue(weights.Handle, out var dt) ? dt : DType.Float32);
     }
 
-    private void CopyGpuBuffer(Tensor dst, Tensor src)
-    {
-        var srcBuf = _gpu.GetBuffer(src);
-        var dstBuf = _gpu.GetBuffer(dst);
-        Vortice.Vulkan.VkBufferCopy region = new() { size = srcBuf.Size };
-        _gpu.Vkd.vkCmdCopyBuffer(_gpu.TransferCmd, srcBuf.Buffer, dstBuf.Buffer, 1, &region);
-    }
+    // Compute-shader-based buffer copies. Critical: `vkCmdCopyBuffer` runs in the Transfer
+    // pipeline stage, which is NOT synchronized with the rest of this forward pass — every
+    // RecordBarrier() in this file is a Compute→Compute memory barrier and does nothing for
+    // transfer-stage writes. Using a compute copy keeps everything in the compute stage so
+    // those barriers are correct.
+    private void CopyGpuBuffer(Tensor dst, Tensor src) => _gpu.RecordComputeCopy(dst, src);
 
     private void CopyGpuBufferRegion(Tensor dst, long dstOffsetBytes, Tensor src, long srcOffsetBytes, long sizeBytes)
     {
-        var srcBuf = _gpu.GetBuffer(src);
-        var dstBuf = _gpu.GetBuffer(dst);
-        Vortice.Vulkan.VkBufferCopy region = new()
-        {
-            srcOffset = (ulong)srcOffsetBytes,
-            dstOffset = (ulong)dstOffsetBytes,
-            size = (ulong)sizeBytes,
-        };
-        _gpu.Vkd.vkCmdCopyBuffer(_gpu.TransferCmd, srcBuf.Buffer, dstBuf.Buffer, 1, &region);
+        _gpu.RecordComputeCopyRegion(dst, dstOffsetBytes, src, srcOffsetBytes, sizeBytes);
     }
 
     private static void PerHeadRmsNorm(float* data, float* weight, int numHeads, int headDim, float eps)

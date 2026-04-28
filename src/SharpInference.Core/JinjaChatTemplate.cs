@@ -207,9 +207,21 @@ public sealed class JinjaChatTemplate
                     {
                         return nodes; // caller handles
                     }
+                    else if (tag.StartsWith("macro ", StringComparison.Ordinal)
+                          || tag.StartsWith("block ", StringComparison.Ordinal)
+                          || tag == "raw")
+                    {
+                        // Consume the body up to {% endmacro %} / {% endblock %} / {% endraw %} and discard.
+                        // Macros are only invoked from inside branches we don't enter (e.g. tool-call rendering
+                        // when tools is empty); calls to undefined macros emit "" via CallFunction's null fallback.
+                        pos++;
+                        ParseNodes(tokens, ref pos);
+                        if (pos < tokens.Count && tokens[pos].Kind == TokenKind.Block
+                            && IsEndTag(tokens[pos].Content)) pos++;
+                    }
                     else
                     {
-                        pos++; // skip unknown (raw, block, macro, …)
+                        pos++; // skip unknown single-line tag
                     }
                     break;
             }
