@@ -73,6 +73,25 @@ public sealed unsafe class ForwardPass : IForwardPass
     private float* _rotatedQuery;  // scratch for WHT-rotated query [headDim]
     private float* _decompBuf;     // scratch for decompressed TQ value [headDim]
 
+    // Diagnostic: per-layer residual L2-norm trace (env: SHARPI_TRACE_NORMS=1).
+    private static readonly bool _traceNorms =
+        Environment.GetEnvironmentVariable("SHARPI_TRACE_NORMS") == "1";
+    private float[]? _normTraceAttn;   // [numLayers] post-attn-residual L2 norm
+    private float[]? _normTraceFfn;    // [numLayers] post-ffn-residual L2 norm
+    // Optional MoE router probe (env: SHARPI_TRACE_ROUTERS=1 dumps top-k experts for every
+    // MoE layer). To restrict to a single position (large MoE models), set SHARPI_TRACE_POS=<n>.
+    private static readonly bool _traceRouters =
+        Environment.GetEnvironmentVariable("SHARPI_TRACE_ROUTERS") == "1";
+    private static readonly int _traceRouterPos = ParseInt("SHARPI_TRACE_POS", -1);
+    private static int ParseInt(string env, int def)
+    {
+        var s = Environment.GetEnvironmentVariable(env);
+        return int.TryParse(s, System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : def;
+    }
+    // Tracks the position of the in-flight forward pass so MoeFfn can decide whether to log.
+    private int _currentPos;
+
     // Precomputed RoPE cos/sin tables [maxSeqLen * halfDim]
     private readonly float* _ropeCosTable;
     private readonly float* _ropeSinTable;
@@ -109,6 +128,12 @@ public sealed unsafe class ForwardPass : IForwardPass
         _ffnUp = Alloc(_intermDim);
         _logits = Alloc(hp.VocabSize);
         _attnScores = Alloc(_numHeads * ctxLen);
+
+        if (_traceNorms)
+        {
+            _normTraceAttn = new float[hp.NumLayers];
+            _normTraceFfn = new float[hp.NumLayers];
+        }
 
         // Precompute RoPE cos/sin tables for all positions [0, ctxLen)
         _ropeHalfDim = _headDim / 2;
@@ -398,8 +423,8 @@ public sealed unsafe class ForwardPass : IForwardPass
 
                         if (useRoPE)
                         {
-                            SimdKernels.ApplyRoPECached(qn, _ropeCosTable + (long)(startPos + n) * _ropeHalfDim, _ropeSinTable + (long)(startPos + n) * _ropeHalfDim, _numHeads, _headDim);
-                            SimdKernels.ApplyRoPECached(kn, _ropeCosTable + (long)(startPos + n) * _ropeHalfDim, _ropeSinTable + (long)(startPos + n) * _ropeHalfDim, _numKvHeads, _headDim);
+                            ApplyRope(qn, startPos + n, _numHeads);
+                            ApplyRope(kn, startPos + n, _numKvHeads);
                         }
 
                         // L2 QK-norm (Llama-4): norm AFTER RoPE, only on RoPE layers
@@ -603,8 +628,8 @@ public sealed unsafe class ForwardPass : IForwardPass
 
                         if (useRoPE)
                         {
-                            SimdKernels.ApplyRoPECached(qn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numHeads, _headDim);
-                            SimdKernels.ApplyRoPECached(kn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numKvHeads, _headDim);
+                            ApplyRope(qn, pos, _numHeads);
+                            ApplyRope(kn, pos, _numKvHeads);
                         }
 
                         // L2 QK-norm (Llama-4): norm AFTER RoPE, only on RoPE layers
@@ -711,8 +736,12 @@ public sealed unsafe class ForwardPass : IForwardPass
     /// </summary>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
+        _currentPos = position;
+
         // 1. Embedding lookup (single-row dequant, no full table materialization)
         EmbedToken(token);
+
+        float embNorm = _traceNorms ? L2Norm(_hidden, _embDim) : 0f;
 
         // 2. Transformer layers
         for (int layer = 0; layer < _hp.NumLayers; layer++)
@@ -750,8 +779,8 @@ public sealed unsafe class ForwardPass : IForwardPass
 
             if (useRoPE)
             {
-                SimdKernels.ApplyRoPECached(_q, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numHeads, _headDim);
-                SimdKernels.ApplyRoPECached(_k, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numKvHeads, _headDim);
+                ApplyRope(_q, position, _numHeads);
+                ApplyRope(_k, position, _numKvHeads);
             }
 
             // L2 QK-norm (Llama-4): only on RoPE layers, applied after RoPE
@@ -789,6 +818,8 @@ public sealed unsafe class ForwardPass : IForwardPass
             // Residual
             SimdKernels.AddInPlace(_hidden, _residual, _embDim);
 
+            if (_traceNorms) _normTraceAttn![layer] = L2Norm(_hidden, _embDim);
+
             // Save residual for FFN
             Copy(_residual, _hidden, _embDim);
 
@@ -803,6 +834,8 @@ public sealed unsafe class ForwardPass : IForwardPass
 
             // Residual
             SimdKernels.AddInPlace(_hidden, _residual, _embDim);
+
+            if (_traceNorms) _normTraceFfn![layer] = L2Norm(_hidden, _embDim);
         }
 
         // Increment KV cache position
@@ -811,14 +844,64 @@ public sealed unsafe class ForwardPass : IForwardPass
         else
             _kvCache.IncrementPosition();
 
+        float preFinalNorm = _traceNorms ? L2Norm(_hidden, _embDim) : 0f;
+
         // 3. Final RMS norm
         var outNormW = GetNormWeight(_outputNorm);
         SimdKernels.RmsNorm(_hidden, _hidden, outNormW, _embDim, _hp.RmsNormEps);
 
+        float postFinalNorm = _traceNorms ? L2Norm(_hidden, _embDim) : 0f;
+
         // 4. Output projection → logits (fused, no 400MB intermediate buffer)
         FusedMatVec(_logits, _outputWeight, _hidden, _hp.VocabSize, _embDim);
 
+        if (_traceNorms)
+            EmitNormTrace(token, position, embNorm, preFinalNorm, postFinalNorm);
+
         return new ReadOnlySpan<float>(_logits, _hp.VocabSize);
+    }
+
+    private void ApplyRope(float* x, int pos, int heads)
+    {
+        var cos = _ropeCosTable + (long)pos * _ropeHalfDim;
+        var sin = _ropeSinTable + (long)pos * _ropeHalfDim;
+        if (_hp.IsNeoxRope)
+            SimdKernels.ApplyRoPECachedNeox(x, cos, sin, heads, _headDim);
+        else
+            SimdKernels.ApplyRoPECached(x, cos, sin, heads, _headDim);
+    }
+
+    private static float L2Norm(float* x, int n)
+    {
+        double s = 0;
+        for (int i = 0; i < n; i++) { double v = x[i]; s += v * v; }
+        return (float)Math.Sqrt(s);
+    }
+
+    private void EmitNormTrace(int token, int position,
+        float embNorm, float preFinalNorm, float postFinalNorm)
+    {
+        // Top-1 logit + index
+        int topIdx = 0; float topVal = float.MinValue;
+        for (int i = 0; i < _hp.VocabSize; i++)
+            if (_logits[i] > topVal) { topVal = _logits[i]; topIdx = i; }
+
+        var sb = new System.Text.StringBuilder(2048);
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        sb.Append("[norms pos=").Append(position)
+          .Append(" tok=").Append(token)
+          .Append(" emb=").Append(embNorm.ToString("F2", inv));
+        for (int i = 0; i < _hp.NumLayers; i++)
+        {
+            sb.Append(" L").Append(i).Append(":a=")
+              .Append(_normTraceAttn![i].ToString("F1", inv))
+              .Append("/f=").Append(_normTraceFfn![i].ToString("F1", inv));
+        }
+        sb.Append(" preFN=").Append(preFinalNorm.ToString("F2", inv))
+          .Append(" postFN=").Append(postFinalNorm.ToString("F2", inv))
+          .Append(" top=").Append(topIdx)
+          .Append('@').Append(topVal.ToString("F2", inv));
+        Console.Error.WriteLine(sb.ToString());
     }
 
     // ================================================================
@@ -999,6 +1082,22 @@ public sealed unsafe class ForwardPass : IForwardPass
         Span<int> selectedExperts = stackalloc int[numActive];
         Span<float> expertWeights = stackalloc float[numActive];
         SelectTopK(_routerLogits, numExperts, numActive, selectedExperts, expertWeights);
+
+        if (_traceRouters && (_traceRouterPos < 0 || _traceRouterPos == _currentPos))
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            var sb = new System.Text.StringBuilder(512);
+            sb.Append("[router pos=").Append(_currentPos).Append(" L").Append(layer).Append(']');
+            float wsum = 0;
+            for (int i = 0; i < numActive; i++)
+            {
+                sb.Append(' ').Append(selectedExperts[i]).Append('=')
+                  .Append(expertWeights[i].ToString("F4", inv));
+                wsum += expertWeights[i];
+            }
+            sb.Append(" sum=").Append(wsum.ToString("F4", inv));
+            Console.Error.WriteLine(sb.ToString());
+        }
 
         // Step 2: Shared expert (runs on every token if present)
         // Shared expert uses the same dim as routed experts (ExpertIntermediateDim)
@@ -1267,8 +1366,8 @@ public sealed unsafe class ForwardPass : IForwardPass
                 }
                 if (useRoPE)
                 {
-                    SimdKernels.ApplyRoPECached(_q, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numHeads, _headDim);
-                    SimdKernels.ApplyRoPECached(_k, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numKvHeads, _headDim);
+                    ApplyRope(_q, pos, _numHeads);
+                    ApplyRope(_k, pos, _numKvHeads);
                 }
                 if (_hasQkNorm && _hp.UseL2QkNorm && useRoPE)
                 {
@@ -1396,8 +1495,8 @@ public sealed unsafe class ForwardPass : IForwardPass
                         caches[n].TruncateTo(pos);
                         if (useRoPE)
                         {
-                            SimdKernels.ApplyRoPECached(qn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numHeads, _headDim);
-                            SimdKernels.ApplyRoPECached(kn, _ropeCosTable + (long)pos * _ropeHalfDim, _ropeSinTable + (long)pos * _ropeHalfDim, _numKvHeads, _headDim);
+                            ApplyRope(qn, pos, _numHeads);
+                            ApplyRope(kn, pos, _numKvHeads);
                         }
                         if (_hasQkNorm)
                         {

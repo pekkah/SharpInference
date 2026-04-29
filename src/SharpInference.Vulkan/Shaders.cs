@@ -326,7 +326,7 @@ internal static class Shaders
         """;
 
     /// <summary>
-    /// RoPE: interleaved pair rotation.
+    /// RoPE: interleaved pair rotation. Used by LLaMA, Mistral, SmolLM, etc.
     /// Push constants: { uint num_heads, uint head_dim, int position, float theta }.
     /// Bindings: 0=x (in/out).
     /// Each thread handles one pair (2 elements).
@@ -363,6 +363,46 @@ internal static class Shaders
             float x1 = x_data[base_idx + 1];
             x_data[base_idx]     = x0 * cos_a - x1 * sin_a;
             x_data[base_idx + 1] = x0 * sin_a + x1 * cos_a;
+        }
+        """;
+
+    /// <summary>
+    /// RoPE: NEOX/half rotation (pairs offset by head_dim/2). Used by Qwen, Phi, Gemma, Falcon, etc.
+    /// </summary>
+    internal const string RoPENeox = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer X { float x_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint num_heads;
+            uint head_dim;
+            int position;
+            float theta;
+        };
+
+        void main() {
+            uint pair_idx = gl_GlobalInvocationID.x;
+            uint half_dim = head_dim / 2;
+            uint total_pairs = num_heads * half_dim;
+            if (pair_idx >= total_pairs) return;
+
+            uint h = pair_idx / half_dim;
+            uint i = pair_idx % half_dim;
+
+            float freq = 1.0 / pow(theta, 2.0 * float(i) / float(head_dim));
+            float angle = float(position) * freq;
+            float cos_a = cos(angle);
+            float sin_a = sin(angle);
+
+            uint head_base = h * head_dim;
+            uint a_idx = head_base + i;
+            uint b_idx = head_base + i + half_dim;
+            float x0 = x_data[a_idx];
+            float x1 = x_data[b_idx];
+            x_data[a_idx] = x0 * cos_a - x1 * sin_a;
+            x_data[b_idx] = x0 * sin_a + x1 * cos_a;
         }
         """;
 

@@ -85,8 +85,12 @@ public interface IComputeBackend : IDisposable
     /// <summary>Apply SiLU (x * sigmoid(x)) activation in-place.</summary>
     void SiLU(Tensor x);
 
-    /// <summary>Apply rotary positional embedding in-place.</summary>
-    void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f);
+    /// <summary>
+    /// Apply rotary positional embedding in-place.
+    /// <paramref name="neox"/> selects rotation convention: false = LLaMA interleaved (pairs (2i, 2i+1)),
+    /// true = NEOX/half (pairs (i, i + headDim/2)) used by Qwen, Phi, Gemma, Falcon, etc.
+    /// </summary>
+    void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f, bool neox = false);
 
     /// <summary>
     /// General matrix multiply: C[M,N] = A[M,K] × B[N,K]^T

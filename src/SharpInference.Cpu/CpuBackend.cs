@@ -196,16 +196,16 @@ public sealed unsafe class CpuBackend : IComputeBackend
 
     /// <summary>
     /// Rotary positional embedding (RoPE) in-place.
-    /// Applies rotation to pairs of elements: (x[2i], x[2i+1]) rotated by position * freq_i.
+    /// neox=true: rotates pairs (x[i], x[i+halfDim]) — Qwen, Phi, Gemma, Falcon, etc.
+    /// neox=false: rotates pairs (x[2i], x[2i+1]) — LLaMA, Mistral, SmolLM, etc.
     /// freq_i = 1 / (theta ^ (2i / headDim))
     /// </summary>
-    public void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f)
+    public void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f, bool neox = false)
     {
         var count = (int)x.ElementCount;
         var px = (float*)x.Handle;
         int halfDim = headDim / 2;
 
-        // Process each head in the tensor
         int numHeads = count / headDim;
         for (int h = 0; h < numHeads; h++)
         {
@@ -217,10 +217,12 @@ public sealed unsafe class CpuBackend : IComputeBackend
                 float cos = MathF.Cos(angle);
                 float sin = MathF.Sin(angle);
 
-                float x0 = head[i];
-                float x1 = head[i + halfDim];
-                head[i] = x0 * cos - x1 * sin;
-                head[i + halfDim] = x0 * sin + x1 * cos;
+                int a = neox ? i : 2 * i;
+                int b = neox ? i + halfDim : 2 * i + 1;
+                float x0 = head[a];
+                float x1 = head[b];
+                head[a] = x0 * cos - x1 * sin;
+                head[b] = x0 * sin + x1 * cos;
             }
         }
     }

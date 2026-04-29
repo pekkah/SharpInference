@@ -82,6 +82,14 @@ public sealed record ModelHyperparams
     public bool UseL2QkNorm { get; init; }
 
     /// <summary>
+    /// True for NEOX-style RoPE (rotates dim pairs (i, i + headDim/2)).
+    /// False for LLaMA-style "normal" RoPE (rotates consecutive pairs (2i, 2i+1)).
+    /// Qwen2/Qwen3, Phi, Gemma, Falcon, and most non-LLaMA architectures use NEOX.
+    /// LLaMA, Mistral, SmolLM, Granite, and DeepSeek use the interleaved convention.
+    /// </summary>
+    public bool IsNeoxRope { get; init; }
+
+    /// <summary>
     /// Extract hyperparameters from GGUF metadata using the model's architecture prefix.
     /// Supports llama-family models (llama, mistral, qwen, smollm, etc.) and MoE variants.
     /// </summary>
@@ -116,6 +124,33 @@ public sealed record ModelHyperparams
         bool useL2QkNorm = isLlama4;
         if (isLlama4) hasQkNorm = true;
 
+        // RoPE convention: NEOX (pairs offset by headDim/2) vs NORM/interleaved (consecutive pairs).
+        // Mirrors llama.cpp's llama_model_rope_type() in src/llama-model.cpp (NEOX block).
+        // Architectures NOT listed here default to NORM (LLaMA-style interleaved).
+        // Special rope types (MROPE for QWEN2VL/PADDLEOCR, IMROPE for QWEN3VL family, conditional
+        // for GLM4/GLM4_MOE) are not currently supported and would need their own dispatch.
+        bool isNeoxRope = arch switch
+        {
+            "falcon" or "falcon-h1" or "grok" or "dbrx" or
+            "bert" or "jina-bert-v3" or "modern-bert" or "nomic-bert" or "nomic-bert-moe" or "eurobert" or
+            "stablelm" or "bitnet" or
+            "qwen" or "qwen2" or "dream" or "qwen2moe" or "qwen3" or "qwen3moe" or
+            "llada-moe" or "rnd1" or
+            "olmo2" or "olmoe" or
+            "phi2" or "phi3" or "phimoe" or
+            "plamo" or "plamo2" or "plamo3" or
+            "gemma" or "gemma2" or "gemma3" or "gemma3n" or "gemma4" or "gemma-embedding" or
+            "starcoder2" or "openelm" or "gptneox" or "codeshell" or "orion" or
+            "nemotron" or "exaone" or "exaone4" or "exaone-moe" or
+            "minicpm3" or "bailingmoe2" or "dots1" or
+            "hunyuan-moe" or "hunyuan-dense" or
+            "jais2" or "gpt-oss" or
+            "lfm2" or "lfm2moe" or "smallthinker" or "seed_oss" or "grovemoe" or
+            "apertus" or "minimax-m2" or "cogvlm" or "pangu-embedded" or "afmoe" or
+            "qwen3next" or "mimo2" or "step35" => true,
+            _ => false,
+        };
+
         int embDim = GetInt(metadata, $"{arch}.embedding_length");
         int numHeads = GetInt(metadata, $"{arch}.attention.head_count");
         // Some models (e.g. Qwen3-MoE) use a head dim that differs from embDim/numHeads.
@@ -147,6 +182,7 @@ public sealed record ModelHyperparams
             NoRopeLayerStep = noRopeStep,
             UseSigmoidGating = useSigmoidGating,
             UseL2QkNorm = useL2QkNorm,
+            IsNeoxRope = isNeoxRope,
         };
     }
 
