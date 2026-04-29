@@ -326,11 +326,11 @@ Verified on AMD Zen 4 (12c/24t, DDR4-3200) + RTX 4070 Ti (12 GB VRAM):
 
 | Backend | `--tq` | Status | Decode (t/s) |
 |---------|--------|--------|--------------|
-| CPU (default) | — | ✓ works | ~51 |
+| CPU (default) | — | ✓ works | ~49 |
 | CPU | `--tq` | ✗ refused — `headDim 64 != 128/256` (clear error) | — |
-| GPU (`-g -1`) | — | ✓ works | ~159 |
+| GPU (`-g -1`) | — | ✓ works | ~163 |
 | GPU (`-g -1`) | `--tq` | ✗ refused — same headDim guard | — |
-| Hybrid (`-g N`, 1 ≤ N < layers) | — | ✓ works | ~61 (`-g 8`) |
+| Hybrid (`-g N`, 1 ≤ N < layers) | — | ✓ works | ~53 (`-g 8`) |
 | Hybrid | `--tq` | ✗ refused — same headDim guard | — |
 
 Copy-paste:
@@ -348,7 +348,7 @@ dotnet run --project src/SharpInference.Cli -c Release -- -m models/SmolLM2-1.7B
 | Backend | `--tq` | Status | Decode (t/s) |
 |---------|--------|--------|--------------|
 | CPU (default) | — | ✓ works | ~21 |
-| CPU | `--tq` | ✓ works | ~21 |
+| CPU | `--tq` | ✓ works | ~20 |
 | GPU (`-g -1`) | any | ⚠ auto-fallback to CPU with a warning (issue [#2](https://github.com/pekkah/SharpInference/issues/2)) | — |
 | Hybrid (`-g N`) | any | ✗ refused with error pointing to issue [#2](https://github.com/pekkah/SharpInference/issues/2) | — |
 | Hybrid (`-g 1..9`, debug only) | any | ✓ works with `SHARPI_ALLOW_BROKEN_MOE_HYBRID=1` after the [#2](https://github.com/pekkah/SharpInference/issues/2) host-barrier fix | ~15 (`-g 1 --tq`) |
@@ -386,17 +386,19 @@ dotnet run --project src/SharpInference.Cli -c Release -- image -m models/z_imag
 
 ## Performance
 
-Benchmarked on AMD Zen 4 (12c/24t, DDR4-3200) + RTX 4070 Ti:
+Benchmarked on AMD Zen 4 (12c/24t, DDR4-3200) + RTX 4070 Ti.
+Each row is the median of 3 runs at `--temp 0`, `-n 256`, decoded from a short prompt. Output was verified coherent in every run.
 
 | Model | Backend | Decode (t/s) | Notes |
 |-------|---------|-------------|-------|
-| SmolLM2 1.7B Q4_K_M | GPU (Vulkan) | 131.3 | Multi-row compute shaders + subgroupAdd |
-| SmolLM2 1.7B Q4_K_M | CPU (AVX2) | 48.6 | Fused dequant-matvec, multi-threaded |
-| Qwen3 8B Q4_K_M | GPU (Vulkan) | 43.5 | Full VRAM fit |
-| Qwen3 8B Q4_K_M | CPU | 13.5 | 1.23× llama.cpp |
-| Llama 4 Scout Q4_K_M | CPU | 5.3 | Bandwidth-limited on 65 GB DDR4 |
-| Qwen3-Coder 30B-A3B Q4_K_M | CPU | 20.8 | MoE: only 8/128 experts active per token |
-| llama.cpp SmolLM2 1.7B | CPU (reference) | 45.1 | Same hardware |
+| SmolLM2 1.7B Q4_K_M | GPU (Vulkan, `-g -1`) | 162.6 | Multi-row compute shaders + subgroupAdd |
+| SmolLM2 1.7B Q4_K_M | Hybrid (`-g 8`, 8/24 layers) | 53.2 | Mixed CPU/GPU forward pass |
+| SmolLM2 1.7B Q4_K_M | CPU (AVX2) | 48.9 | Fused dequant-matvec, multi-threaded |
+| Qwen3-Coder 30B-A3B Q4_K_M | CPU | 21.3 | MoE: only 8/128 experts active per token |
+| Qwen3-Coder 30B-A3B Q4_K_M | CPU `--tq` | 20.3 | TurboQuant 3-bit KV cache (~5× less RAM for KV) |
+| Llama 4 Scout 17B-16E Q4_K_M | CPU | 4.9 | MoE 17B/109B, 16 experts. 60.9 GB on disk; mmap'd from SSD (model > RAM). |
+
+Earlier rounds also measured Qwen3 8B (~43 t/s GPU, ~13 t/s CPU) — that model is not currently on disk so the numbers were not refreshed.
 
 ## Build & Test
 

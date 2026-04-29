@@ -21,7 +21,8 @@
 param(
     [ValidateSet("smollm2", "qwen3-8b", "llama31-70b", "qwen3-coder-30b-a3b", "llama4-scout",
                  "z-image-turbo", "z-image-turbo-q8", "realesrgan-x4")]
-    [string]$Model
+    [string]$Model,
+    [string]$DestDir
 )
 
 $Models = @{
@@ -119,7 +120,7 @@ $Models = @{
     }
 }
 
-$ModelDir= Join-Path $PSScriptRoot "..\models"
+$ModelDir = if ($DestDir) { $DestDir } else { Join-Path $PSScriptRoot "..\models" }
 if (-not (Test-Path $ModelDir)) {
     New-Item -ItemType Directory -Path $ModelDir -Force | Out-Null
 }
