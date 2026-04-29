@@ -1231,6 +1231,11 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         // read it after submit via MapPinned — avoids a second CopyBuffer call.
         _gpu.RecordBarrier();
         CopyGpuBuffer(_gpuPinnedNorm!, _gpuNormBuf);
+        // Compute→Host barrier: fence-wait alone does NOT make compute-shader writes
+        // to host-coherent memory visible to host reads on all drivers (observed stale
+        // _gpuPinnedNorm reads on RTX 4070 Ti, manifesting as garbled MoE output past
+        // ~10 GPU layers — issue #2). Explicit HOST_READ barrier flushes the writes.
+        _gpu.RecordComputeToHostBarrier();
         _gpu.EndRecordAndSubmit();
         _gpu.Download(_gpuRouterLogits!, _gpuRouterBuf!);
 
@@ -1259,7 +1264,8 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         if (hasCpuFallback)
         {
             // _gpuPinnedNorm was populated by the GPU session above — map it directly,
-            // no extra Download / CopyBuffer call needed.
+            // no extra Download / CopyBuffer call needed. The compute→host barrier above
+            // ensures the shader writes are visible to host reads after fence completion.
             unsafe
             {
                 float* normPtr = _gpu.MapPinned(_gpuPinnedNorm!);
