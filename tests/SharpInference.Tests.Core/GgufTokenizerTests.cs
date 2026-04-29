@@ -122,4 +122,57 @@ public sealed class GgufTokenizerTests
 
         Assert.Equal(text, decoded);
     }
+
+    [Fact]
+    public void DecodeBytes_PerTokenStream_ReassemblesMultiByteUnicode()
+    {
+        var tokenizer = CreateTokenizer();
+        if (tokenizer is null) return;
+
+        // Multi-byte UTF-8 (3-byte CJK and curly quotes, em-dash) is the regression
+        // case for issue #13: a single character is split across token boundaries.
+        var text = "你好，世界 — “hello”";
+        var ids = tokenizer.Encode(text);
+
+        // Concat all per-token DecodeBytes output and verify it equals UTF-8 of original.
+        var bytes = new System.Collections.Generic.List<byte>();
+        foreach (var id in ids)
+            bytes.AddRange(tokenizer.DecodeBytes(id));
+
+        Assert.Equal(System.Text.Encoding.UTF8.GetBytes(text), bytes.ToArray());
+    }
+
+    [Fact]
+    public void DecodeBytes_StreamedThroughUtf8Decoder_ProducesNoReplacementChars()
+    {
+        var tokenizer = CreateTokenizer();
+        if (tokenizer is null) return;
+
+        var text = "你好世界";
+        var ids = tokenizer.Encode(text);
+
+        var dec = new Utf8StreamDecoder();
+        var sb = new System.Text.StringBuilder();
+        foreach (var id in ids)
+            sb.Append(dec.Append(tokenizer.DecodeBytes(id)));
+        sb.Append(dec.Flush());
+
+        var output = sb.ToString();
+        Assert.Equal(text, output);
+        Assert.DoesNotContain('�', output);
+    }
+
+    [Fact]
+    public void DecodeBytes_AsciiToken_RoundTripsThroughUtf8()
+    {
+        var tokenizer = CreateTokenizer();
+        if (tokenizer is null) return;
+
+        var ids = tokenizer.Encode("Hello, world!");
+        var bytes = new System.Collections.Generic.List<byte>();
+        foreach (var id in ids)
+            bytes.AddRange(tokenizer.DecodeBytes(id));
+
+        Assert.Equal("Hello, world!", System.Text.Encoding.UTF8.GetString(bytes.ToArray()));
+    }
 }

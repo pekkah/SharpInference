@@ -50,6 +50,9 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         public required Random Rng;
         public required CancellationToken Ct;
         public int TokenCount;
+        // Per-sequence stateful UTF-8 decoder: reassembles multi-byte characters
+        // split across tokens (CJK, emoji, smart quotes).
+        public Utf8StreamDecoder StreamDec = new();
     }
 
     public ContinuousBatchingEngine(
@@ -155,6 +158,9 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
 
                 if (done)
                 {
+                    var tail = seq.StreamDec.Flush();
+                    if (tail.Length > 0)
+                        seq.Output.Writer.TryWrite(tail);
                     seq.Output.Writer.TryComplete();
                     seq.Cache.Dispose();
                     active.RemoveAt(i);
@@ -162,7 +168,9 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                 }
                 else
                 {
-                    seq.Output.Writer.TryWrite(_tokenizer.Decode([next]));
+                    var chunk = seq.StreamDec.Append(_tokenizer.DecodeBytes(next));
+                    if (chunk.Length > 0)
+                        seq.Output.Writer.TryWrite(chunk);
                     seq.CurrentToken = next;
                     seq.Position++;
                     seq.TokenCount++;
@@ -173,6 +181,9 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         // Drain: complete any remaining active sequences
         foreach (var seq in active)
         {
+            var tail = seq.StreamDec.Flush();
+            if (tail.Length > 0)
+                seq.Output.Writer.TryWrite(tail);
             seq.Output.Writer.TryComplete();
             seq.Cache.Dispose();
             Interlocked.Decrement(ref _activeCount);
@@ -212,9 +223,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             return;
         }
 
-        req.Output.Writer.TryWrite(_tokenizer.Decode([firstToken]));
-
-        active.Add(new ActiveSeq
+        var seq = new ActiveSeq
         {
             CurrentToken = firstToken,
             Position = tokens.Length,
@@ -225,7 +234,12 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             Rng = rng,
             Ct = req.Ct,
             TokenCount = 1,
-        });
+        };
+        var firstChunk = seq.StreamDec.Append(_tokenizer.DecodeBytes(firstToken));
+        if (firstChunk.Length > 0)
+            req.Output.Writer.TryWrite(firstChunk);
+
+        active.Add(seq);
         Interlocked.Increment(ref _activeCount);
     }
 

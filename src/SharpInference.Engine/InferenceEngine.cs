@@ -119,7 +119,10 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
 
                     _prevTokens = tokens;
 
-                    // Decode loop
+                    // Decode loop. Stream UTF-8 through a stateful decoder so multi-byte
+                    // characters split across tokens (CJK, emoji, smart quotes) are
+                    // reassembled instead of producing U+FFFD per partial sequence.
+                    var streamDec = new Utf8StreamDecoder();
                     for (int i = 0; i < sp.MaxNewTokens; i++)
                     {
                         ct.ThrowIfCancellationRequested();
@@ -130,9 +133,14 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
 
                         if (stopIds.Contains(next)) break;
 
-                        channel.Writer.TryWrite(_tokenizer.Decode([next]));
+                        var chunk = streamDec.Append(_tokenizer.DecodeBytes(next));
+                        if (chunk.Length > 0)
+                            channel.Writer.TryWrite(chunk);
                         logits = _fwd.Forward(next, tokens.Length + i);
                     }
+                    var tail = streamDec.Flush();
+                    if (tail.Length > 0)
+                        channel.Writer.TryWrite(tail);
 
                     channel.Writer.TryComplete();
                 }

@@ -378,11 +378,13 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         sw.Restart();
         int generated = 0;
+        var streamDec = new Utf8StreamDecoder();
         spec.Decode(sp.MaxNewTokens, sp.StopTokenIds ?? [], token =>
         {
-            Console.Write(tok.Decode([token]));
+            Console.Write(streamDec.Append(tok.DecodeBytes(token)));
             generated++;
         });
+        Console.Write(streamDec.Flush());
         var decodeMs = sw.Elapsed.TotalMilliseconds;
 
         Console.WriteLine();
@@ -425,11 +427,13 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
             sw.Restart();
             int generated = 0;
+            var streamDec = new Utf8StreamDecoder();
             spec.Decode(sp.MaxNewTokens, sp.StopTokenIds ?? [], token =>
             {
-                Console.Write(tok.Decode([token]));
+                Console.Write(streamDec.Append(tok.DecodeBytes(token)));
                 generated++;
             });
+            Console.Write(streamDec.Flush());
             var decodeMs = sw.Elapsed.TotalMilliseconds;
 
             Console.WriteLine();
@@ -466,6 +470,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         int generated = 0;
         bool inThinking = false; // set to true when model generates <think> token
         var recentTokens = new List<int>(64);
+        var streamDec = new Utf8StreamDecoder();
         for (int i = 0; i < sp.MaxNewTokens; i++)
         {
             var spWithHistory = sp.RepetitionPenalty != 1.0f && recentTokens.Count > 0
@@ -492,13 +497,14 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             }
             else if (!inThinking)
             {
-                Console.Write(tok.Decode([next]));
+                Console.Write(streamDec.Append(tok.DecodeBytes(next)));
                 generated++;
             }
             recentTokens.Add(next);
             if (recentTokens.Count > 64) recentTokens.RemoveAt(0);
             logits = forward(next, tokens.Count + i);
         }
+        Console.Write(streamDec.Flush());
         if (inThinking) Console.Write("\x1b[0m"); // reset if thinking was never closed
         var decodeMs = sw.Elapsed.TotalMilliseconds;
 
@@ -534,6 +540,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             int generated = 0;
             bool inThinking = false; // set to true when model generates <think> token
             var recentTokens = new List<int>(64);
+            var streamDec = new Utf8StreamDecoder();
             for (int i = 0; i < sp.MaxNewTokens; i++)
             {
                 var spWithHistory = sp.RepetitionPenalty != 1.0f && recentTokens.Count > 0
@@ -553,13 +560,14 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 }
                 else if (!inThinking)
                 {
-                    Console.Write(tok.Decode([next]));
+                    Console.Write(streamDec.Append(tok.DecodeBytes(next)));
                     generated++;
                 }
                 recentTokens.Add(next);
                 if (recentTokens.Count > 64) recentTokens.RemoveAt(0);
                 logits = forward(next, tokens.Count + i);
             }
+            Console.Write(streamDec.Flush());
             if (inThinking) Console.Write("\x1b[0m"); // reset if thinking was never closed
             var decodeMs = sw.Elapsed.TotalMilliseconds;
 
