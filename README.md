@@ -351,6 +351,7 @@ dotnet run --project src/SharpInference.Cli -c Release -- -m models/SmolLM2-1.7B
 | CPU | `--tq` | ✓ works | ~21 |
 | GPU (`-g -1`) | any | ⚠ auto-fallback to CPU with a warning (issue [#2](https://github.com/pekkah/SharpInference/issues/2)) | — |
 | Hybrid (`-g N`) | any | ✗ refused with error pointing to issue [#2](https://github.com/pekkah/SharpInference/issues/2) | — |
+| Hybrid (`-g 1..9`, debug only) | any | ✓ works with `SHARPI_ALLOW_BROKEN_MOE_HYBRID=1` after the [#2](https://github.com/pekkah/SharpInference/issues/2) host-barrier fix | ~15 (`-g 1 --tq`) |
 
 Copy-paste (recommended config for this machine):
 
@@ -378,7 +379,7 @@ dotnet run --project src/SharpInference.Cli -c Release -- image -m models/z_imag
 
 ### Known limitations
 
-- **MoE on GPU**: any `qwen3moe`/`llama4` model with `-g N` (N > 0) is rejected with an explicit error. `-g -1` (auto) silently falls back to CPU. Tracking: [#2](https://github.com/pekkah/SharpInference/issues/2).
+- **MoE on GPU**: any `qwen3moe`/`llama4` model with `-g N` (N > 0) is rejected with an explicit error. `-g -1` (auto) silently falls back to CPU. Tracking: [#2](https://github.com/pekkah/SharpInference/issues/2). The compute→host visibility bug (Bug 1 in #2) that produced NaN at low `-g N` is fixed; the residual prefetcher-path corruption past `~-g 9` keeps the guard in place. Set `SHARPI_ALLOW_BROKEN_MOE_HYBRID=1` to bypass the guard for debugging.
 - **GPU embedding lookup in `HybridForwardPass`**: works around a shader bug by always doing the per-token embedding row dequant on CPU. Cost is one row of dequant per token (negligible). Tracking: [#3](https://github.com/pekkah/SharpInference/issues/3).
 - **`--backend` flag**: does not exist — backend is selected via `-g`. Vulkan only; CUDA is wired into `image` only. Tracking: [#4](https://github.com/pekkah/SharpInference/issues/4).
 - **`--tq`** (TurboQuant): requires the model to have `headDim == 128` (most Qwen3 / Llama 3) or `256` (Llama 70B). SmolLM2's `headDim 64` is rejected with a clear error.
