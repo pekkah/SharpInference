@@ -92,6 +92,23 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     }
 
     /// <summary>
+    /// Insert a compute→host barrier so subsequent host reads of host-visible (pinned/BAR)
+    /// memory observe the latest compute-shader writes after the next submit completes.
+    /// Fence wait alone is insufficient on some drivers; an explicit Host-stage barrier is required.
+    /// </summary>
+    public void RecordComputeToHostBarrier()
+    {
+        VkMemoryBarrier barrier = new()
+        {
+            srcAccessMask = VkAccessFlags.ShaderWrite,
+            dstAccessMask = VkAccessFlags.HostRead,
+        };
+        _vkd.vkCmdPipelineBarrier(_transferCmd,
+            VkPipelineStageFlags.ComputeShader, VkPipelineStageFlags.Host,
+            0, 1, &barrier, 0, null, 0, null);
+    }
+
+    /// <summary>
     /// Record a GPU→staging copy into the current command buffer.
     /// Call before <see cref="EndRecordAndSubmit"/>, then <see cref="ReadFromStaging"/>
     /// after the fence fires — eliminates a second command-buffer submission for logits download.

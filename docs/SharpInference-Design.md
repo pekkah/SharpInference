@@ -1692,6 +1692,28 @@ layers remain on CPU. More GPU layers or a VRAM-sufficient config would flip thi
 
 **Target model:** Llama 4 Scout 109B/16E Q2_K (~37 GB)
 
+**Compute→Host barrier for `_gpuPinnedNorm` (issue #2, partial fix):**
+`GpuMoeFfn` populates a host-coherent BAR buffer (`_gpuPinnedNorm`) with the post-RmsNorm
+hidden state via `RecordComputeCopy`, then submits and waits on a fence so the CPU can
+`MapPinned` and read it for the expert CPU fallback path. On RTX 4070 Ti, fence completion
+alone did **not** make the compute-shader writes visible to host reads — `MapPinned`
+returned stale data, the CPU fallback consumed bogus `normPtr` values, and the resulting
+`_cpuFallbackBuf` was wildly out of range (e.g. magnitudes ~1062 vs the expected O(1)),
+which propagated through residuals as garbled tokens (issue #2). Fixed by recording an
+explicit `compute→host` pipeline barrier (`SHADER_WRITE → HOST_READ`,
+`COMPUTE_SHADER → HOST` stages) immediately before `EndRecordAndSubmit`. The new helper
+is `VulkanBackend.RecordComputeToHostBarrier`. With this fix, the CPU-fallback expert
+path produces correct output for any `-g N`.
+
+**Residual issue (still tracked under #2):** Beyond `~-g 9` GPU layers on Qwen3-Coder
+30B-A3B, the *prefetcher-cached* GPU expert path still produces wrong output. Disabling
+the prefetcher entirely (forcing all experts through the CPU fallback) restores
+correctness across the full `-g` range, indicating the residual bug is in the
+GPU-expert MatMul reading prefetched weights — most likely descriptor-set reuse across
+multiple recorded dispatches in `ComputePipeline._reusableDs`. The CLI guard in
+`RunCommand.cs` therefore still refuses MoE on the hybrid path by default; set
+`SHARPI_ALLOW_BROKEN_MOE_HYBRID=1` to bypass for further investigation.
+
 ### Phase 5b: Scout Q4_K CPU Micro-optimization ✅
 
 **Goal:** Push Llama 4 Scout Q4_K_M CPU decode above the usable threshold on DDR4 hardware.

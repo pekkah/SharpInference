@@ -170,7 +170,9 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         // MoE models are not yet supported on the hybrid GPU+CPU path. The GpuMoeFfn path
         // produces NaN/degenerate output (see https://github.com/pekkah/SharpInference/issues/2).
         // Fall back to CPU automatically when -g is -1 (auto), refuse explicit -g N for MoE.
-        if (hp.IsMoE && nGpuLayers != 0)
+        // SHARPI_ALLOW_BROKEN_MOE_HYBRID=1 bypasses the guard for debugging issue #2.
+        bool allowBrokenMoeHybrid = Environment.GetEnvironmentVariable("SHARPI_ALLOW_BROKEN_MOE_HYBRID") == "1";
+        if (hp.IsMoE && nGpuLayers != 0 && !allowBrokenMoeHybrid)
         {
             if (nGpuLayers > 0)
             {
@@ -181,6 +183,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             // -g -1 (auto) → silently fall back to CPU
             AnsiConsole.MarkupLine("[yellow]Note:[/] [yellow]-g -1[/] requested, but MoE models run only on CPU until issue #2 is fixed. Falling back to CPU.");
             nGpuLayers = 0;
+        }
+        if (hp.IsMoE && nGpuLayers != 0 && allowBrokenMoeHybrid)
+        {
+            AnsiConsole.MarkupLine("[red]Warning:[/] SHARPI_ALLOW_BROKEN_MOE_HYBRID=1 set; running MoE on hybrid path despite known NaN/garbled output (issue #2 debug mode).");
         }
 
         if (nGpuLayers == 0)
