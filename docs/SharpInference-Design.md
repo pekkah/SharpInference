@@ -189,7 +189,8 @@ public interface IComputeBackend : IDisposable
     void MatVecMulDequant(TensorRef output, TensorRef quantMatrix, TensorRef vector,
                           QuantFormat format);
     void RmsNorm(TensorRef output, TensorRef input, TensorRef weight, float epsilon);
-    void RoPE(TensorRef qk, int position, int headDim, float ropeTheta);
+    // neox=false: LLaMA interleaved pairs (2i, 2i+1); neox=true: NEOX/half pairs (i, i+headDim/2)
+    void RoPE(TensorRef qk, int position, int headDim, float ropeTheta, bool neox = false);
     void Softmax(TensorRef output, TensorRef input);
     void SiLU(TensorRef output, TensorRef input);
     void ElementwiseMul(TensorRef output, TensorRef a, TensorRef b);
@@ -1986,6 +1987,7 @@ curl http://localhost:5000/v1/messages \
   if (_hasQkNorm) { NormedQ = RmsNorm(Q); NormedK = RmsNorm(K); }
   ApplyRoPE(NormedQ, NormedK, position);
   ```
+- `ModelGraph.cs` / `SimdKernels.cs` / `ForwardPass.cs` — **NEOX-style RoPE** for Qwen3 family: rotates dim pairs `(i, i + headDim/2)` instead of consecutive pairs `(2i, 2i+1)` used by LLaMA. New `IsNeoxRope` hyperparameter set per architecture (qwen, qwen2/2moe, qwen3/3moe, phi2/3, phimoe, gemma/2/3, falcon, stablelm, olmo2, olmoe, starcoder2, gptneox, openelm, exaone, nemotron). Mirrors `llama_model_rope_type()` in llama.cpp. New `ApplyRoPECachedNeox` SIMD kernel; `ForwardPass.ApplyRope()` helper dispatches based on `_hp.IsNeoxRope`.
 - `ForwardPass.cs` — removed double-normalization bug in `MoeFfn`: `SelectTopK` already normalizes weights for k>1; the additional renorm was a no-op for k>1 but incorrectly set weight=1.0 for k=1 (broke Llama-4 softmax test)
 - `GgufTokenizer.cs` — added `_specialTokensById` reverse lookup; `Decode(int[])` for single special tokens (type 3/4) now returns the correct string via this map instead of an empty string from the BPE inner tokenizer
 - `RunCommand.cs` — ChatML prompt formatting for qwen3/qwen3moe; default system prompt injection (model generates `<\|endoftext\|>` without it); `<\|endoftext\|>` added to stop tokens (was causing infinite repetition); `<think>` / `</think>` token IDs looked up at startup and their tokens displayed with dim ANSI formatting in the decode loop
@@ -1998,7 +2000,7 @@ Qwen3 supports chain-of-thought via `/think` in the user message. Two approaches
 
 **Final approach:** No automatic thinking mode injection. The model works well without it for coding tasks. Users can append `/think` to their message manually when desired.
 
-**Q4_K_M quirk:** Certain imperative phrasings ("Write a C# method...") trigger `<\|endoftext\|>` as the first token with logit ~28–35, while semantically equivalent "Implement X in C#" or "Can you write a C# method?" work correctly. This is a quantization artifact — the 4-bit precision loss in specific weight regions affecting these token sequences. Not fixable at the inference engine level.
+**RoPE convention bug (Issue #6, fixed):** Earlier versions of this engine applied LLaMA-style interleaved RoPE to all architectures. Qwen2/Qwen3 (and Phi/Gemma/Falcon/etc.) require NEOX-style rotation — pairs offset by `headDim/2`. The mismatch produced subtly-wrong attention output that compounded layer-by-layer; cumulative direction error eventually pushed the residual into a degenerate region where the LM head predicted `<\|endoftext\|>` or `<\|im_end\|>` with high confidence on many short prompts (originally misattributed as a Q4_K_M quantization artifact). Fixed by adding `IsNeoxRope` to `ModelHyperparams` and dispatching to `ApplyRoPECachedNeox` for NEOX-family architectures.
 
 **Benchmark results (Qwen3-Coder-30B-A3B-Instruct-Q4_K_M, Ryzen 9 7900X, CPU only):**
 

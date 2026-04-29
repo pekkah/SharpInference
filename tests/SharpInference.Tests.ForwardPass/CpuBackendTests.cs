@@ -301,20 +301,36 @@ public sealed class CpuBackendTests : IDisposable
     [Fact]
     public void RoPE_PreservesNorm()
     {
-        // Rotation should preserve the norm of each pair
-        float[] data = [3f, 4f, 1f, 0f]; // headDim=4: pairs are (3,1) and (4,0)
+        // Default (interleaved/LLaMA): pairs are (data[0], data[1]) and (data[2], data[3])
+        float[] data = [3f, 4f, 1f, 0f];
         var t = Upload(data, TensorShape.D1(4));
 
-        // Compute original norms for the rotated pairs
-        // Pair (data[0], data[2]) = (3, 1): norm = sqrt(9+1) = sqrt(10)
-        // Pair (data[1], data[3]) = (4, 0): norm = sqrt(16+0) = 4
-        float norm0Before = MathF.Sqrt(3f * 3f + 1f * 1f);
-        float norm1Before = MathF.Sqrt(4f * 4f + 0f * 0f);
+        float norm0Before = MathF.Sqrt(3f * 3f + 4f * 4f);  // pair (3,4)
+        float norm1Before = MathF.Sqrt(1f * 1f + 0f * 0f);  // pair (1,0)
 
         _backend.RoPE(t, position: 5, headDim: 4);
         var result = Download(t);
 
-        // After rotation: pair (result[0], result[2]) should have same norm
+        float norm0After = MathF.Sqrt(result[0] * result[0] + result[1] * result[1]);
+        float norm1After = MathF.Sqrt(result[2] * result[2] + result[3] * result[3]);
+
+        Assert.InRange(norm0After, norm0Before - 0.01f, norm0Before + 0.01f);
+        Assert.InRange(norm1After, norm1Before - 0.01f, norm1Before + 0.01f);
+    }
+
+    [Fact]
+    public void RoPE_Neox_PreservesNorm()
+    {
+        // NEOX convention: pairs are (data[0], data[halfDim]) and (data[1], data[halfDim+1])
+        float[] data = [3f, 4f, 1f, 0f];
+        var t = Upload(data, TensorShape.D1(4));
+
+        float norm0Before = MathF.Sqrt(3f * 3f + 1f * 1f);  // pair (data[0], data[2])
+        float norm1Before = MathF.Sqrt(4f * 4f + 0f * 0f);  // pair (data[1], data[3])
+
+        _backend.RoPE(t, position: 5, headDim: 4, ropeTheta: 10000f, neox: true);
+        var result = Download(t);
+
         float norm0After = MathF.Sqrt(result[0] * result[0] + result[2] * result[2]);
         float norm1After = MathF.Sqrt(result[1] * result[1] + result[3] * result[3]);
 

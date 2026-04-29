@@ -386,8 +386,8 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                 if (useRoPE)
                 {
                     // RoPE on Q and K
-                    _gpu.RoPE(_q, position, _headDim, _hp.RopeTheta);
-                    _gpu.RoPE(_k, position, _headDim, _hp.RopeTheta);
+                    _gpu.RoPE(_q, position, _headDim, _hp.RopeTheta, _hp.IsNeoxRope);
+                    _gpu.RoPE(_k, position, _headDim, _hp.RopeTheta, _hp.IsNeoxRope);
                     _gpu.RecordBarrier();
                 }
 

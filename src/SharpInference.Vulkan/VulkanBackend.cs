@@ -924,6 +924,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _clearPipeline;
     private ComputePipeline? _elementwiseMulPipeline;
     private ComputePipeline? _ropePipeline;
+    private ComputePipeline? _ropeNeoxPipeline;
     private ComputePipeline? _softmaxPipeline;
     private ComputePipeline? _sigmoidPipeline;
     private ComputePipeline? _matVecQ4KPipeline;
@@ -1082,13 +1083,23 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         DispatchOrRecord(_elementwiseMulPipeline, [GetBuffer(a), GetBuffer(b), GetBuffer(output)], ((uint)a.ElementCount + 255) / 256, &p);
     }
 
-    public void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f)
+    public void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f, bool neox = false)
     {
-        _ropePipeline ??= new ComputePipeline(this, Shaders.RoPE, 1, pushConstantSize: sizeof(RoPEParams));
+        ComputePipeline pipeline;
+        if (neox)
+        {
+            _ropeNeoxPipeline ??= new ComputePipeline(this, Shaders.RoPENeox, 1, pushConstantSize: sizeof(RoPEParams));
+            pipeline = _ropeNeoxPipeline;
+        }
+        else
+        {
+            _ropePipeline ??= new ComputePipeline(this, Shaders.RoPE, 1, pushConstantSize: sizeof(RoPEParams));
+            pipeline = _ropePipeline;
+        }
         uint numHeads = (uint)(x.ElementCount / headDim);
         uint totalPairs = numHeads * (uint)(headDim / 2);
         var p = new RoPEParams { numHeads = numHeads, headDim = (uint)headDim, position = position, theta = ropeTheta };
-        DispatchOrRecord(_ropePipeline, [GetBuffer(x)], (totalPairs + 255) / 256, &p);
+        DispatchOrRecord(pipeline, [GetBuffer(x)], (totalPairs + 255) / 256, &p);
     }
 
     public void Softmax(Tensor x)
@@ -1520,6 +1531,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _clearPipeline?.Dispose();
         _elementwiseMulPipeline?.Dispose();
         _ropePipeline?.Dispose();
+        _ropeNeoxPipeline?.Dispose();
         _softmaxPipeline?.Dispose();
         _sigmoidPipeline?.Dispose();
         _matVecQ4KPipeline?.Dispose();

@@ -622,8 +622,8 @@ public sealed unsafe class HybridForwardPass : IForwardPass
                 || (i + 1) % _hp.NoRopeLayerStep != 0;
             if (useRoPE)
             {
-                _gpu.RoPE(_gpuQ, position, _headDim, _hp.RopeTheta);
-                _gpu.RoPE(_gpuK, position, _headDim, _hp.RopeTheta);
+                _gpu.RoPE(_gpuQ, position, _headDim, _hp.RopeTheta, _hp.IsNeoxRope);
+                _gpu.RoPE(_gpuK, position, _headDim, _hp.RopeTheta, _hp.IsNeoxRope);
                 _gpu.RecordBarrier();
             }
 
@@ -746,9 +746,18 @@ public sealed unsafe class HybridForwardPass : IForwardPass
 
         if (useRoPE)
         {
-            // RoPE
-            SimdKernels.ApplyRoPECached(_cpuQ, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numHeads, _headDim);
-            SimdKernels.ApplyRoPECached(_cpuK, _ropeCosTable + (long)position * _ropeHalfDim, _ropeSinTable + (long)position * _ropeHalfDim, _numKvHeads, _headDim);
+            var cos = _ropeCosTable + (long)position * _ropeHalfDim;
+            var sin = _ropeSinTable + (long)position * _ropeHalfDim;
+            if (_hp.IsNeoxRope)
+            {
+                SimdKernels.ApplyRoPECachedNeox(_cpuQ, cos, sin, _numHeads, _headDim);
+                SimdKernels.ApplyRoPECachedNeox(_cpuK, cos, sin, _numKvHeads, _headDim);
+            }
+            else
+            {
+                SimdKernels.ApplyRoPECached(_cpuQ, cos, sin, _numHeads, _headDim);
+                SimdKernels.ApplyRoPECached(_cpuK, cos, sin, _numKvHeads, _headDim);
+            }
         }
 
         // QK-norm: for L2 (Llama-4), only on RoPE layers per llama.cpp

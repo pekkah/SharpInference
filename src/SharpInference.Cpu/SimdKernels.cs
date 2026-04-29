@@ -1741,6 +1741,40 @@ public static unsafe class SimdKernels
         }
     }
 
+    /// <summary>
+    /// NEOX-style RoPE (used by Qwen, Phi, Gemma, Falcon, etc.):
+    /// rotates dim pair (i, i + headDim/2) instead of consecutive (2i, 2i+1).
+    /// </summary>
+    public static void ApplyRoPECachedNeox(float* x, float* cosTab, float* sinTab, int numHeads, int headDim)
+    {
+        int halfDim = headDim / 2;
+        for (int h = 0; h < numHeads; h++)
+        {
+            float* head = x + h * headDim;
+            int i = 0;
+            if (Avx.IsSupported)
+            {
+                for (; i + 8 <= halfDim; i += 8)
+                {
+                    var x0 = Avx.LoadVector256(head + i);
+                    var x1 = Avx.LoadVector256(head + i + halfDim);
+                    var c = Avx.LoadVector256(cosTab + i);
+                    var s = Avx.LoadVector256(sinTab + i);
+                    var r0 = Fma.MultiplySubtract(x0, c, Avx.Multiply(x1, s));
+                    var r1 = Fma.MultiplyAdd(x0, s, Avx.Multiply(x1, c));
+                    Avx.Store(head + i, r0);
+                    Avx.Store(head + i + halfDim, r1);
+                }
+            }
+            for (; i < halfDim; i++)
+            {
+                float x0 = head[i], x1 = head[i + halfDim];
+                head[i] = x0 * cosTab[i] - x1 * sinTab[i];
+                head[i + halfDim] = x0 * sinTab[i] + x1 * cosTab[i];
+            }
+        }
+    }
+
     public static void ApplyRoPE(float* x, int position, int numHeads, int headDim, float theta)
     {
         int halfDim = headDim / 2;

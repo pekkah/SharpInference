@@ -480,7 +480,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     public void SiLU(Tensor x) =>
         throw new NotSupportedException("CudaBackend is DiT-only");
 
-    public void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f) =>
+    public void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f, bool neox = false) =>
         throw new NotSupportedException("CudaBackend is DiT-only");
 
     public void FullSeqAttention(Tensor output, Tensor q, Tensor k, Tensor v,
