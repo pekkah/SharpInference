@@ -14,6 +14,10 @@ public sealed class GgufTokenizer : ITokenizer
     private readonly Dictionary<string, int> _specialTokens;
     private readonly Dictionary<int, string> _specialTokensById;
     private readonly Dictionary<string, int> _vocab;
+    // Vocab strings indexed by token ID — for byte-level BPE these are the raw
+    // GPT-2 byte-level encoded forms, used by DecodeBytes to recover exact bytes
+    // without the inner tokenizer's lossy U+FFFD substitution on partial sequences.
+    private readonly string[] _idToToken;
     private readonly bool _needsByteEncoding;
 
     public int VocabSize { get; }
@@ -40,6 +44,7 @@ public sealed class GgufTokenizer : ITokenizer
         Dictionary<string, int> specialTokens,
         Dictionary<int, string> specialTokensById,
         Dictionary<string, int> vocab,
+        string[] idToToken,
         int vocabSize,
         int bosTokenId,
         int eosTokenId,
@@ -52,6 +57,7 @@ public sealed class GgufTokenizer : ITokenizer
         _specialTokens = specialTokens;
         _specialTokensById = specialTokensById;
         _vocab = vocab;
+        _idToToken = idToToken;
         _needsByteEncoding = needsByteEncoding;
         VocabSize = vocabSize;
         BosTokenId = bosTokenId;
@@ -169,11 +175,16 @@ public sealed class GgufTokenizer : ITokenizer
             needsByteEncoding = true;
         }
 
+        var idToToken = new string[tokensArray.Length];
+        for (int i = 0; i < tokensArray.Length; i++)
+            idToToken[i] = (string)tokensArray[i];
+
         var tokenizer = new GgufTokenizer(
             inner,
             specialTokens,
             specialTokens.ToDictionary(kv => kv.Value, kv => kv.Key),
             BuildVocabLookup(tokensArray),
+            idToToken,
             tokensArray.Length,
             bosTokenId,
             eosTokenId,
@@ -307,42 +318,61 @@ public sealed class GgufTokenizer : ITokenizer
         // Ġ (U+0120) = space, Ċ (U+010A) = newline, etc.
         // Convert them back to actual bytes if present.
         if (text.Contains('\u0120') || text.Contains('\u010A'))
-            text = DecodeGpt2Bytes(text);
+            text = Encoding.UTF8.GetString(Gpt2CharsToBytes(text));
 
         return text;
     }
 
-    /// <summary>
-    /// Convert GPT-2 byte-level BPE Unicode characters back to actual bytes.
-    /// GPT-2 maps bytes 0x00-0xFF to Unicode chars starting at various offsets.
-    /// The most common: Ġ (U+0120) = space (0x20), Ċ (U+010A) = newline (0x0A).
-    /// </summary>
-    private static string DecodeGpt2Bytes(string text)
+    /// <inheritdoc/>
+    public byte[] DecodeBytes(int token)
     {
+        // Special tokens (control / user-defined) decode to their literal UTF-8 bytes.
+        if (_specialTokensById.TryGetValue(token, out var specialStr))
+            return Encoding.UTF8.GetBytes(specialStr);
+
+        // Look up the raw vocab string by ID rather than going through _inner.Decode,
+        // which silently substitutes U+FFFD for incomplete UTF-8 sequences and so
+        // loses the exact bytes a single token contributes to the stream.
+        if ((uint)token >= (uint)_idToToken.Length)
+            return [];
+
+        return Gpt2CharsToBytes(_idToToken[token]);
+    }
+
+    /// <summary>
+    /// Convert GPT-2 byte-level BPE Unicode characters back to raw bytes.
+    /// Bytes 0x21-0x7E and 0xA1-0xFF stay as-is; 0x00-0x20 and 0x7F-0xA0 are
+    /// remapped to U+0100-U+0142 to keep them printable.
+    ///
+    /// Returns the raw byte sequence — caller is responsible for UTF-8 decoding,
+    /// which may need to span multiple tokens to assemble multi-byte characters.
+    /// </summary>
+    private static byte[] Gpt2CharsToBytes(string text)
+    {
+        // Inverse of EncodeByteToGpt2 — must match exactly:
+        //   0x21-0x7E       → identity
+        //   0xA1-0xFF       → identity
+        //   U+0100-U+0120   → 0x00-0x20  (subtract 0x100)
+        //   U+0121-U+0142   → 0x7F-0xA0  (subtract 0xA2 = 0x121 - 0x7F)
         var bytes = new List<byte>(text.Length);
         foreach (char c in text)
         {
-            if (c < 256)
-            {
+            if (c is >= '!' and <= '~')
                 bytes.Add((byte)c);
-            }
+            else if (c is >= '¡' and <= 'ÿ')
+                bytes.Add((byte)c);
+            else if (c is >= 'Ā' and <= 'Ġ')
+                bytes.Add((byte)(c - 0x100));
+            else if (c is >= 'ġ' and <= 'ł')
+                bytes.Add((byte)(c - 0xA2));
             else
             {
-                // GPT-2 byte mapping: chars 0x100-0x1FF map to bytes via lookup
-                // The mapping: printable ASCII stays as-is, non-printable gets offset
-                // Simplified: U+0100+n maps to byte n for n < 256
-                int mapped = c - 0x100;
-                if (mapped >= 0 && mapped < 256)
-                    bytes.Add((byte)mapped);
-                else
-                {
-                    // Not a byte token — encode as UTF-8
-                    foreach (byte b in System.Text.Encoding.UTF8.GetBytes(new[] { c }))
-                        bytes.Add(b);
-                }
+                // Not a byte token — encode as UTF-8 (rare fallback)
+                foreach (byte b in Encoding.UTF8.GetBytes(new[] { c }))
+                    bytes.Add(b);
             }
         }
-        return System.Text.Encoding.UTF8.GetString(bytes.ToArray());
+        return bytes.ToArray();
     }
 
     private static int GetMetadataInt(GgufModel model, string key, int defaultValue)

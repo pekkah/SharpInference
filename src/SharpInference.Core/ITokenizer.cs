@@ -11,6 +11,15 @@ public interface ITokenizer
     /// <summary>Decode token IDs back to text.</summary>
     string Decode(IEnumerable<int> tokens);
 
+    /// <summary>
+    /// Decode a single token to its raw UTF-8 bytes. For byte-level BPE tokenizers
+    /// the bytes are exactly the token's contribution to the output stream — they
+    /// may form an incomplete UTF-8 sequence on their own. Stream-decode through
+    /// <see cref="Utf8StreamDecoder"/> to reassemble multi-byte characters
+    /// split across tokens.
+    /// </summary>
+    byte[] DecodeBytes(int token);
+
     int VocabSize { get; }
     int BosTokenId { get; }
     int EosTokenId { get; }

@@ -1,5 +1,12 @@
+using System.Text;
 using Spectre.Console.Cli;
 using SharpInference.Cli;
+
+// Force UTF-8 for stdin/stdout. On Windows the console defaults to the OEM
+// code page, which mangles multi-byte UTF-8 output (CJK, emoji, smart quotes)
+// into '?' or replacement glyphs.
+Console.OutputEncoding = Encoding.UTF8;
+Console.InputEncoding = Encoding.UTF8;
 
 var app = new CommandApp<RunCommand>();
 app.Configure(config =>
