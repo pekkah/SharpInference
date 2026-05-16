@@ -4,22 +4,37 @@
     <OutputType>Exe</OutputType>
     <AssemblyName>sharpi-cli</AssemblyName>
 
-    <!-- NativeAOT -->
+    <!-- dotnet tool packaging (`dotnet tool install -g SharpInference.Cli`) -->
+    <PackageId>SharpInference.Cli</PackageId>
+    <IsPackable>true</IsPackable>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>sharpi-cli</ToolCommandName>
+    <Description>SharpInference command-line interface — LLM inference and image generation using GGUF models, with CPU/Vulkan/CUDA backends. Install with `dotnet tool install -g SharpInference.Cli`.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+
+    <!-- NativeAOT for `dotnet publish` (single-binary builds). The dotnet tool
+         install path is framework-dependent; AOT only fires on Publish. -->
     <PublishAot>true</PublishAot>
     <TrimMode>full</TrimMode>
     <IlcTrimMetadata>true</IlcTrimMetadata>
     <IlcFoldIdenticalMethodBodies>true</IlcFoldIdenticalMethodBodies>
 
-    <!-- Reduce binary size -->
+    <!-- Spectre.Console.Cli uses reflection but works with NativeAOT at runtime -->
+    <NoWarn>IL3050;IL2026</NoWarn>
+  </PropertyGroup>
+
+  <!--
+    Runtime-config switches that strip diagnostic features. Gated on _IsPublishing
+    so they only apply to AOT publish output and do NOT propagate into the dotnet
+    tool's runtimeconfig.json (where they would break stack traces / debugging).
+  -->
+  <PropertyGroup Condition="'$(_IsPublishing)' == 'true'">
     <StackTraceSupport>false</StackTraceSupport>
     <UseSystemResourceKeys>true</UseSystemResourceKeys>
     <EventSourceSupport>false</EventSourceSupport>
     <MetricsSupport>false</MetricsSupport>
     <DebuggerSupport>false</DebuggerSupport>
     <HttpActivityPropagationSupport>false</HttpActivityPropagationSupport>
-
-    <!-- Spectre.Console.Cli uses reflection but works with NativeAOT at runtime -->
-    <NoWarn>IL3050;IL2026</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -31,6 +46,10 @@
 
   <ItemGroup>
     <PackageReference Include="Spectre.Console.Cli" Version="1.0.0-alpha.0.15" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
 </Project>

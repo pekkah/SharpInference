@@ -18,4 +18,43 @@
     <IlcOptimizationPreference>Speed</IlcOptimizationPreference>
     <IlcInstructionSet>native</IlcInstructionSet>
   </PropertyGroup>
+
+  <!-- NuGet packaging: opt-in. Only the SharpInference meta-package and SharpInference.Cli pack. -->
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <Authors>Pekka Heikura</Authors>
+    <Company>Pekka Heikura</Company>
+    <Copyright>Copyright (c) 2026 Pekka Heikura</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/pekkah/SharpInference</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/pekkah/SharpInference.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>llm;inference;gguf;transformer;ai;vulkan;cuda;avx;simd;nativeaot</PackageTags>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <!--
+    MinVer derives the version from git tags. Tag `v0.2.0` -> package version `0.2.0`.
+    Untagged commits get a pre-release version like `0.2.1-alpha.0.<commit-height>`,
+    so every master build produces a unique preview package.
+  -->
+  <PropertyGroup>
+    <MinVerTagPrefix>v</MinVerTagPrefix>
+    <MinVerDefaultPreReleaseIdentifiers>alpha.0</MinVerDefaultPreReleaseIdentifiers>
+  </PropertyGroup>
+
+  <!-- SourceLink: lets nupkg consumers step into source from GitHub during debugging. -->
+  <PropertyGroup>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <DebugType>portable</DebugType>
+    <!-- Deterministic, repeatable builds when running on a CI server (GitHub Actions sets CI=true). -->
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="MinVer" Version="*" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="*" PrivateAssets="all" />
+  </ItemGroup>
 </Project>

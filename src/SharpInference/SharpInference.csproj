@@ -1,0 +1,65 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Meta-package. Bundles all SharpInference library assemblies into a single
+    NuGet (SharpInference) so consumers get the full inference + image-gen stack
+    with one PackageReference. The CLI ships separately as SharpInference.Cli
+    (dotnet tool); the Server is not published.
+  -->
+
+  <PropertyGroup>
+    <PackageId>SharpInference</PackageId>
+    <IsPackable>true</IsPackable>
+    <Description>High-performance LLM inference engine and image generation pipeline in C# / .NET. Reads GGUF models and runs transformer inference on CPU (AVX2/AVX-512 SIMD), Vulkan, and CUDA. Includes Z-Image-Turbo text-to-image and Real-ESRGAN upscaling. NativeAOT-friendly.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+
+    <!--
+      BuildOutputInPackage is the canonical channel for routing assemblies into the
+      package: .dll goes to the main .nupkg and matching .pdb goes to the .snupkg
+      automatically (with SymbolPackageFormat=snupkg). A small placeholder
+      SharpInference.dll for this meta-project also ships in lib/; that's standard
+      for meta-packages and keeps the symbol routing reliable.
+    -->
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);IncludeProjectReferenceOutputs</TargetsForTfmSpecificBuildOutput>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <Target Name="IncludeProjectReferenceOutputs" DependsOnTargets="ResolveReferences">
+    <ItemGroup>
+      <!-- DLLs are in ReferenceCopyLocalPaths; route them through BuildOutputInPackage. -->
+      <BuildOutputInPackage Include="@(ReferenceCopyLocalPaths)"
+                            Condition="'%(ReferenceCopyLocalPaths.ReferenceSourceTarget)' == 'ProjectReference' AND ('%(Extension)' == '.dll' OR '%(Extension)' == '.xml')" />
+      <!-- PDBs of project references sit next to the DLLs but aren't in ReferenceCopyLocalPaths.
+           Project them from the DLL list so they ride along to the .snupkg. -->
+      <BuildOutputInPackage Include="@(ReferenceCopyLocalPaths -> '%(RootDir)%(Directory)%(Filename).pdb')"
+                            Condition="'%(ReferenceCopyLocalPaths.ReferenceSourceTarget)' == 'ProjectReference' AND '%(Extension)' == '.dll' AND Exists('%(RootDir)%(Directory)%(Filename).pdb')" />
+    </ItemGroup>
+  </Target>
+
+  <!--
+    PrivateAssets=all keeps the referenced projects out of the package's nuget
+    dependency list (we ship their DLLs directly inside this package instead).
+    Third-party NuGet dependencies must be redeclared below.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\SharpInference.Core\SharpInference.Core.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\SharpInference.Cpu\SharpInference.Cpu.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\SharpInference.Vulkan\SharpInference.Vulkan.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\SharpInference.Cuda\SharpInference.Cuda.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\SharpInference.Engine\SharpInference.Engine.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\SharpInference.Pipeline\SharpInference.Pipeline.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\SharpInference.TurboQuant\SharpInference.TurboQuant.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\SharpInference.Diffusion\SharpInference.Diffusion.csproj" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!-- Transitive third-party deps must be redeclared because PrivateAssets=all hides them. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.ML.Tokenizers" Version="*" />
+    <PackageReference Include="Vortice.Vulkan" Version="*" />
+    <PackageReference Include="System.Numerics.Tensors" Version="10.0.5" />
+  </ItemGroup>
+
+</Project>

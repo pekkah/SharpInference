@@ -4,6 +4,7 @@
     <Project Path="benchmarks/SharpInference.ImageBench/SharpInference.ImageBench.csproj" />
   </Folder>
   <Folder Name="/src/">
+    <Project Path="src/SharpInference/SharpInference.csproj" />
     <Project Path="src/SharpInference.Cli/SharpInference.Cli.csproj" />
     <Project Path="src/SharpInference.Core/SharpInference.Core.csproj" />
     <Project Path="src/SharpInference.Cuda/SharpInference.Cuda.csproj" />

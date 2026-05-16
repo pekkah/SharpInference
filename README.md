@@ -140,7 +140,14 @@ $env:SHARPI_MODEL='models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf'; dotnet run --proje
 
 ## CLI Reference
 
-The CLI is run with `dotnet run` until a NuGet package is published:
+Install the CLI as a .NET global tool:
+
+```
+dotnet tool install -g SharpInference.Cli
+sharpi-cli [COMMAND] [OPTIONS]
+```
+
+Or run from a source checkout without installing:
 
 ```
 dotnet run --project src/SharpInference.Cli -c Release -- [COMMAND] [OPTIONS]
@@ -456,6 +463,30 @@ Typical first-time setup on Windows:
 ## Architecture
 
 See [docs/SharpInference-Design.md](docs/SharpInference-Design.md).
+
+## Releasing
+
+Two NuGet packages are published from this repo:
+
+| Package | Contents |
+|---------|----------|
+| `SharpInference` | Library: all 8 inference / image-gen assemblies in a single package |
+| `SharpInference.Cli` | `dotnet tool` exposing `sharpi-cli` |
+
+The server (`SharpInference.Server`) is not published.
+
+Versioning is handled by [MinVer](https://github.com/adamralph/minver) and driven by git tags (`v` prefix):
+
+- **Preview**: every push to `master` publishes `0.X.Y-alpha.0.N` (where `N` is the commit height since the last tag). NuGet hides prereleases by default.
+- **Release**: pushing a tag like `v0.2.0` publishes the stable version `0.2.0`.
+
+```bash
+# Cut a release
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The [`.github/workflows/release.yml`](.github/workflows/release.yml) workflow runs `dotnet pack` + `dotnet nuget push --skip-duplicate` and uses the `NUGET_KEY` repo secret.
 
 ## License
 
