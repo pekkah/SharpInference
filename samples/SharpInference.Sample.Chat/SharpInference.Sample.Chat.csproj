@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>SharpInference.Sample.Chat</RootNamespace>
+    <AssemblyName>sharpi-sample-chat</AssemblyName>
+  </PropertyGroup>
+
+  <!-- Reference only what the sample uses:
+       - Core    : GgufModel, GgufTokenizer, JinjaChatTemplate, ModelHyperparams
+       - Cpu     : CpuBackend (default, no GPU drivers required)
+       - Engine  : ForwardPass, SamplingParams, InferenceEngine -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\SharpInference.Core\SharpInference.Core.csproj" />
+    <ProjectReference Include="..\..\src\SharpInference.Cpu\SharpInference.Cpu.csproj" />
+    <ProjectReference Include="..\..\src\SharpInference.Engine\SharpInference.Engine.csproj" />
+  </ItemGroup>
+
+</Project>
