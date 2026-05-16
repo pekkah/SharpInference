@@ -1,7 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <IsPackable>true</IsPackable>
     <Description>GGUF parser, BPE tokenizer, tensor types, and model graph. The foundation library for SharpInference, the high-performance LLM inference engine for .NET.</Description>
   </PropertyGroup>
 

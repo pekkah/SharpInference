@@ -1,7 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <IsPackable>true</IsPackable>
     <Description>Forward-pass orchestration for SharpInference: paged KV cache, temperature/top-k/top-p/min-p samplers, speculative decoding, and continuous-batching engine.</Description>
   </PropertyGroup>
 

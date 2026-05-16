@@ -1,37 +1,60 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!--
-    Meta-package. Installing `SharpInference` brings in all 8 library packages
-    (Core, Cpu, Vulkan, Cuda, Engine, Pipeline, TurboQuant, Diffusion) via
-    transitive NuGet dependencies declared from the ProjectReferences below.
+    `SharpInference` is the one library NuGet. It bundles every SharpInference.*
+    assembly (Core, Cpu, Vulkan, Cuda, Engine, Pipeline, TurboQuant, Diffusion)
+    so a single `dotnet add package SharpInference` brings in the whole stack.
+    The CLI ships separately as `SharpInference.Cli` (dotnet tool); nothing else
+    is published.
   -->
 
   <PropertyGroup>
     <PackageId>SharpInference</PackageId>
     <IsPackable>true</IsPackable>
-    <Description>High-performance LLM inference engine and image generation pipeline in C# / .NET. Reads GGUF models and runs transformer inference on CPU (AVX2/AVX-512 SIMD), Vulkan, and CUDA. Includes Z-Image-Turbo text-to-image and Real-ESRGAN upscaling. NativeAOT-friendly. This meta-package pulls in every SharpInference.* sub-package.</Description>
+    <Description>High-performance LLM inference engine and image generation pipeline in C# / .NET. Reads GGUF models and runs transformer inference on CPU (AVX2/AVX-512 SIMD), Vulkan, and CUDA. Includes Z-Image-Turbo text-to-image and Real-ESRGAN upscaling. NativeAOT-friendly.</Description>
     <PackageReadmeFile>README.md</PackageReadmeFile>
 
-    <!-- No code here; this project exists only to bundle the sub-packages. -->
-    <IncludeBuildOutput>false</IncludeBuildOutput>
-    <!-- No assemblies = no symbols. Skip producing an empty .snupkg, which nuget.org rejects. -->
-    <IncludeSymbols>false</IncludeSymbols>
-    <NoWarn>$(NoWarn);NU5128</NoWarn>
+    <!--
+      Custom target below routes referenced project outputs into the package.
+      BuildOutputInPackage is the canonical channel: .dll goes to the main .nupkg
+      and matching .pdb goes to the .snupkg automatically. This requires
+      IncludeBuildOutput=true (the default), so the meta-project's own (tiny,
+      ~5 KB) stub SharpInference.dll also ships — that's standard for meta-packages.
+    -->
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);IncludeProjectReferenceOutputs</TargetsForTfmSpecificBuildOutput>
   </PropertyGroup>
 
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
+  <!-- PrivateAssets=all stops the referenced projects from being listed as nuget
+       dependencies (their DLLs ride inside this package instead). The third-party
+       package deps used by those libraries are re-declared below. -->
   <ItemGroup>
-    <ProjectReference Include="..\SharpInference.Core\SharpInference.Core.csproj" />
-    <ProjectReference Include="..\SharpInference.Cpu\SharpInference.Cpu.csproj" />
-    <ProjectReference Include="..\SharpInference.Vulkan\SharpInference.Vulkan.csproj" />
-    <ProjectReference Include="..\SharpInference.Cuda\SharpInference.Cuda.csproj" />
-    <ProjectReference Include="..\SharpInference.Engine\SharpInference.Engine.csproj" />
-    <ProjectReference Include="..\SharpInference.Pipeline\SharpInference.Pipeline.csproj" />
-    <ProjectReference Include="..\SharpInference.TurboQuant\SharpInference.TurboQuant.csproj" />
-    <ProjectReference Include="..\SharpInference.Diffusion\SharpInference.Diffusion.csproj" />
+    <ProjectReference Include="..\SharpInference.Core\SharpInference.Core.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\SharpInference.Cpu\SharpInference.Cpu.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\SharpInference.Vulkan\SharpInference.Vulkan.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\SharpInference.Cuda\SharpInference.Cuda.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\SharpInference.Engine\SharpInference.Engine.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\SharpInference.Pipeline\SharpInference.Pipeline.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\SharpInference.TurboQuant\SharpInference.TurboQuant.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\SharpInference.Diffusion\SharpInference.Diffusion.csproj" PrivateAssets="all" />
   </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.ML.Tokenizers" Version="*" />
+    <PackageReference Include="Vortice.Vulkan" Version="*" />
+    <PackageReference Include="System.Numerics.Tensors" Version="10.0.5" />
+  </ItemGroup>
+
+  <Target Name="IncludeProjectReferenceOutputs" DependsOnTargets="ResolveReferences">
+    <ItemGroup>
+      <BuildOutputInPackage Include="@(ReferenceCopyLocalPaths)"
+                            Condition="'%(ReferenceCopyLocalPaths.ReferenceSourceTarget)' == 'ProjectReference' AND ('%(Extension)' == '.dll' OR '%(Extension)' == '.xml')" />
+      <BuildOutputInPackage Include="@(ReferenceCopyLocalPaths -> '%(RootDir)%(Directory)%(Filename).pdb')"
+                            Condition="'%(ReferenceCopyLocalPaths.ReferenceSourceTarget)' == 'ProjectReference' AND '%(Extension)' == '.dll' AND Exists('%(RootDir)%(Directory)%(Filename).pdb')" />
+    </ItemGroup>
+  </Target>
 
 </Project>

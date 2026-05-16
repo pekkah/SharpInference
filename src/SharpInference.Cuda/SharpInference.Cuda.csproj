@@ -1,6 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <IsPackable>true</IsPackable>
     <Description>CUDA compute backend for SharpInference: NVIDIA GPU inference using cuBLAS (fp32/bf16/fp16/fp8 GEMM) and NVRTC custom kernels.</Description>
   </PropertyGroup>
   <ItemGroup>

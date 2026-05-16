@@ -1,7 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <IsPackable>true</IsPackable>
     <Description>Image generation pipelines for SharpInference: Z-Image-Turbo (S3-DiT + Qwen3 + FLUX VAE) and FLUX.1 text-to-image, plus Real-ESRGAN ×4 upscaling.</Description>
     <!-- NativeAOT-compatible; AOT analyzers inherited from Directory.Build.props -->
   </PropertyGroup>
