@@ -14,6 +14,8 @@
 
     <!-- No code here; this project exists only to bundle the sub-packages. -->
     <IncludeBuildOutput>false</IncludeBuildOutput>
+    <!-- No assemblies = no symbols. Skip producing an empty .snupkg, which nuget.org rejects. -->
+    <IncludeSymbols>false</IncludeSymbols>
     <NoWarn>$(NoWarn);NU5128</NoWarn>
   </PropertyGroup>
 
