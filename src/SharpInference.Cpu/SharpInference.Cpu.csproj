@@ -1,9 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <Description>CPU compute backend for SharpInference: AVX2/AVX-512 SIMD kernels, Q4_K_M dequantization, and optional OpenBLAS GEMM acceleration.</Description>
+  </PropertyGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\SharpInference.Core\SharpInference.Core.csproj" />
   </ItemGroup>
-
-  <PropertyGroup>  </PropertyGroup>
 
 </Project>

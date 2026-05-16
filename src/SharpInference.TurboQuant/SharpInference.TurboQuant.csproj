@@ -1,9 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <Description>KV-cache compression for SharpInference using 3-4 bit Lloyd-Max codebooks. Reduces KV-cache VRAM footprint roughly 5×.</Description>
+  </PropertyGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\SharpInference.Core\SharpInference.Core.csproj" />
   </ItemGroup>
-
-  <PropertyGroup>  </PropertyGroup>
 
 </Project>

@@ -1,5 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <Description>Vulkan compute backend for SharpInference: cross-vendor GPU inference (AMD / Intel / NVIDIA) using SPIR-V compute shaders via Vortice.Vulkan.</Description>
+  </PropertyGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\SharpInference.Core\SharpInference.Core.csproj" />
     <ProjectReference Include="..\SharpInference.Cpu\SharpInference.Cpu.csproj" />
@@ -8,7 +13,5 @@
   <ItemGroup>
     <PackageReference Include="Vortice.Vulkan" Version="*" />
   </ItemGroup>
-
-  <PropertyGroup>  </PropertyGroup>
 
 </Project>

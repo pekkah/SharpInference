@@ -32,18 +32,18 @@ For GPU inference, swap `CpuBackend` for `VulkanBackend` or `CudaBackend`, or us
 
 ## What's in the package
 
-All 8 SharpInference library assemblies are bundled:
+This is a **meta-package**: installing it pulls in every SharpInference sub-package via transitive NuGet dependencies. The sub-packages can also be installed individually if you only need a subset (e.g., no GPU backend).
 
-| Assembly | Purpose |
-|----------|---------|
-| `SharpInference.Core` | GGUF parsing, BPE tokenizer, tensor types, model graph |
-| `SharpInference.Cpu` | CPU backend (AVX2/AVX-512 SIMD, Q4_K_M dequant, optional OpenBLAS) |
-| `SharpInference.Vulkan` | Vulkan compute backend |
-| `SharpInference.Cuda` | CUDA / cuBLAS backend + NVRTC kernels |
-| `SharpInference.Engine` | Forward pass, paged KV cache, samplers, speculative decoding |
-| `SharpInference.Diffusion` | Z-Image-Turbo + FLUX.1 image generation |
-| `SharpInference.Pipeline` | 3-tier VRAM → RAM → NVMe memory hierarchy |
-| `SharpInference.TurboQuant` | 3-bit KV-cache compression |
+| Sub-package | Purpose |
+|-------------|---------|
+| [`SharpInference.Core`](https://www.nuget.org/packages/SharpInference.Core) | GGUF parsing, BPE tokenizer, tensor types, model graph |
+| [`SharpInference.Cpu`](https://www.nuget.org/packages/SharpInference.Cpu) | CPU backend (AVX2/AVX-512 SIMD, Q4_K_M dequant, optional OpenBLAS) |
+| [`SharpInference.Vulkan`](https://www.nuget.org/packages/SharpInference.Vulkan) | Vulkan compute backend |
+| [`SharpInference.Cuda`](https://www.nuget.org/packages/SharpInference.Cuda) | CUDA / cuBLAS backend + NVRTC kernels |
+| [`SharpInference.Engine`](https://www.nuget.org/packages/SharpInference.Engine) | Forward pass, paged KV cache, samplers, speculative decoding |
+| [`SharpInference.Diffusion`](https://www.nuget.org/packages/SharpInference.Diffusion) | Z-Image-Turbo + FLUX.1 image generation |
+| [`SharpInference.Pipeline`](https://www.nuget.org/packages/SharpInference.Pipeline) | 3-tier VRAM → RAM → NVMe memory hierarchy |
+| [`SharpInference.TurboQuant`](https://www.nuget.org/packages/SharpInference.TurboQuant) | 3-bit KV-cache compression |
 
 ## Optional native dependencies
 

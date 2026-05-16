@@ -1,9 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <Description>3-tier memory hierarchy (VRAM → pinned RAM → NVMe) with SLRU expert cache and async prefetcher. Enables inference on models larger than VRAM.</Description>
+  </PropertyGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\SharpInference.Core\SharpInference.Core.csproj" />
   </ItemGroup>
-
-  <PropertyGroup>  </PropertyGroup>
 
 </Project>
