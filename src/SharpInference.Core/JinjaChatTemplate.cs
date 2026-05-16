@@ -922,8 +922,37 @@ public sealed class JinjaChatTemplate
         }
         if (name == "range")
         {
-            long stop = args.Count > 0 ? ToLong(args[0]) : 0;
-            return Enumerable.Range(0, (int)stop).Select(i => (object?)(long)i).ToList();
+            // Python/Jinja semantics: range(stop), range(start, stop), range(start, stop, step).
+            // Out-of-direction or zero-length ranges yield an empty list rather than throwing —
+            // chat templates routinely produce range(messages|length - 1) which goes negative
+            // when the list is empty.
+            long start, stop, step;
+            if (args.Count >= 3)
+            {
+                start = ToLong(args[0]);
+                stop = ToLong(args[1]);
+                step = ToLong(args[2]);
+                if (step == 0) throw new InvalidOperationException("range() step must not be zero");
+            }
+            else if (args.Count == 2)
+            {
+                start = ToLong(args[0]);
+                stop = ToLong(args[1]);
+                step = 1;
+            }
+            else
+            {
+                start = 0;
+                stop = args.Count > 0 ? ToLong(args[0]) : 0;
+                step = 1;
+            }
+
+            var result = new List<object?>();
+            if (step > 0)
+                for (long i = start; i < stop; i += step) result.Add(i);
+            else
+                for (long i = start; i > stop; i += step) result.Add(i);
+            return result;
         }
         if (name == "dict")
         {
