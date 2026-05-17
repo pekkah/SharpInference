@@ -170,7 +170,8 @@ Flag names are intentionally compatible with llama.cpp / llama-cli.
 | `--rep-penalty` | `1.1` | Repetition penalty (`1.0` = disabled) |
 | `-s, --seed` | `-1` | RNG seed (`-1` = random) |
 | `-g, --n-gpu-layers` | `0` | Layers to offload to GPU (`0` = CPU only, `-1` = all) |
-| `--tq` | off | Enable TurboQuant KV-cache compression (3-bit, ~5× less VRAM) |
+| `--backend` | `auto` | GPU backend selection: `auto`, `cuda`, or `vulkan`. `auto` prefers CUDA on dense models with full offload, otherwise Vulkan. |
+| `--tq` | off | Enable TurboQuant KV-cache compression (3-bit, ~5× less VRAM). CPU & Vulkan only — CUDA falls back to Vulkan when set. |
 | `--single-turn` | off | Generate one response and exit (non-interactive) |
 | `--system-prompt` | — | System prompt prepended to conversation |
 | `--no-display-prompt` | off | Suppress echoing the prompt |
@@ -388,24 +389,36 @@ dotnet run --project src/SharpInference.Cli -c Release -- image -m models/z_imag
 
 - **MoE on GPU**: any `qwen3moe`/`llama4` model with `-g N` (N > 0) is rejected with an explicit error. `-g -1` (auto) silently falls back to CPU. Tracking: [#2](https://github.com/pekkah/SharpInference/issues/2). The compute→host visibility bug (Bug 1 in #2) that produced NaN at low `-g N` is fixed; the residual prefetcher-path corruption past `~-g 9` keeps the guard in place. Set `SHARPI_ALLOW_BROKEN_MOE_HYBRID=1` to bypass the guard for debugging.
 - **GPU embedding lookup in `HybridForwardPass`**: works around a shader bug by always doing the per-token embedding row dequant on CPU. Cost is one row of dequant per token (negligible). Tracking: [#3](https://github.com/pekkah/SharpInference/issues/3).
-- **`--backend` flag**: does not exist — backend is selected via `-g`. Vulkan only; CUDA is wired into `image` only. Tracking: [#4](https://github.com/pekkah/SharpInference/issues/4).
-- **`--tq`** (TurboQuant): requires the model to have `headDim == 128` (most Qwen3 / Llama 3) or `256` (Llama 70B). SmolLM2's `headDim 64` is rejected with a clear error.
+- **`--backend` flag**: now wired into text inference too — accepts `auto` (default), `cuda`, or `vulkan`. CUDA is picked automatically when the model is dense and you ask for full GPU offload (`-g -1` or `-g >= NumLayers`); MoE models stay on the Vulkan path. Tracking: [#4](https://github.com/pekkah/SharpInference/issues/4).
+- **`--tq`** (TurboQuant): requires the model to have `headDim == 128` (most Qwen3 / Llama 3) or `256` (Llama 70B). SmolLM2's `headDim 64` is rejected with a clear error. Supported on the CPU and Vulkan paths; **CUDA `--tq` is not yet implemented** and auto-falls-back to Vulkan with a warning.
 
 ## Performance
 
-Benchmarked on AMD Zen 4 (12c/24t, DDR4-3200) + RTX 4070 Ti.
-Each row is the median of 3 runs at `--temp 0`, `-n 256`, decoded from a short prompt. Output was verified coherent in every run.
+Benchmarked on AMD Zen 4 (12c/24t, DDR4-3200) + RTX 4070 Ti (12 GB).
+Each row is a single run at `--temp 0`, `-n 80`–`-n 200`, from a short prompt (`"The capital of France is"`). Coherent output verified in every run. **Prefill** is the rate at which prompt tokens are scored before generation; **Decode** is the steady-state per-token generation rate after the prompt is consumed.
 
-| Model | Backend | Decode (t/s) | Notes |
-|-------|---------|-------------|-------|
-| SmolLM2 1.7B Q4_K_M | GPU (Vulkan, `-g -1`) | 162.6 | Multi-row compute shaders + subgroupAdd |
-| SmolLM2 1.7B Q4_K_M | Hybrid (`-g 8`, 8/24 layers) | 53.2 | Mixed CPU/GPU forward pass |
-| SmolLM2 1.7B Q4_K_M | CPU (AVX2) | 48.9 | Fused dequant-matvec, multi-threaded |
-| Qwen3-Coder 30B-A3B Q4_K_M | CPU | 21.3 | MoE: only 8/128 experts active per token |
-| Qwen3-Coder 30B-A3B Q4_K_M | CPU `--tq` | 20.3 | TurboQuant 3-bit KV cache (~5× less RAM for KV) |
-| Llama 4 Scout 17B-16E Q4_K_M | CPU | 4.9 | MoE 17B/109B, 16 experts. 60.9 GB on disk; mmap'd from SSD (model > RAM). |
+| Model (Q4_K_M) | Backend | Prefill t/s | Decode t/s | Auto-ctx | Notes |
+|---|---|---:|---:|---:|---|
+| SmolLM2 1.7B | CPU | 23.6 | 53.0 | n/a | AVX2 fused dequant-matvec, multi-threaded |
+| SmolLM2 1.7B | Vulkan, `-g -1` | 35.4 | 156.7 | 8192 | GLSL compute shaders, `subgroupAdd` reduce |
+| SmolLM2 1.7B | **CUDA**, `--backend cuda -g -1` | **172.5** | **150.0** | 8192 | NVRTC `__dp4a` + Q8_1 / cuBLAS bf16 |
+| Qwen3 8B | Vulkan | 18.8 | 13.0 | 11 399 | |
+| Qwen3 8B | Vulkan, `--tq` | 17.7 | 13.0 | **40 960** | 3-bit KV → full model max-ctx |
+| Qwen3 8B | **CUDA** | **65.1** | 14.3 | 12 080 | **~3.4× Vulkan prefill** |
+| Qwen3-Coder 30B-A3B (MoE) | Vulkan | 8.8 | 22.2 | varies | 128 experts / 8 active per token |
+| Qwen3-Coder 30B-A3B (MoE) | Vulkan, `--tq` | 9.5 | 22.0 | varies | |
+| Qwen3-Coder 30B-A3B (MoE) | `--backend cuda` → falls back | 8.7 | 21.8 | varies | CUDA path doesn't yet support MoE |
 
-Earlier rounds also measured Qwen3 8B (~43 t/s GPU, ~13 t/s CPU) — that model is not currently on disk so the numbers were not refreshed.
+Notes on the CUDA path:
+
+- **Q4_K matvec** uses an `__dp4a` (int8×4 → int32) cooperative kernel with a per-call Q8_1 input quantization pre-pass, modelled on llama.cpp's `mul_mat_vec_q4_K_q8_1`. Achieves ~400–500 GB/s effective HBM bandwidth on a 4070 Ti.
+- **VRAM headroom** matters: the auto-context picker reserves `max(VRAM/3, 2 GiB)` so late weight allocations (notably the 600 MiB `lm-head` of Qwen3) stay in HBM. An earlier conservative `max(VRAM/5, 1 GiB)` left ~24 MiB free with Qwen3-8B and pushed `lm-head` into system RAM, where it streamed at ~30 GB/s over PCIe and prefill collapsed to ~4 t/s.
+- **TurboQuant on CUDA is not yet implemented**: `--tq` currently auto-falls-back to Vulkan with a warning. Vulkan + `--tq` already unlocks the full 40 960-token context on Qwen3-8B at essentially the same throughput as without `--tq`.
+- **MoE on CUDA** falls back to Vulkan; the CUDA forward pass only handles dense (`qwen3` / `llama`) architectures.
+
+The two `_BENCH` environment variables for reproducing the kernel-level numbers:
+`SHARPI_CUDA_PROFILE=1` dumps per-phase timings at process exit;
+`SHARPI_CUDA_MATVEC_BENCH=1` runs a pure-HBM memcpy baseline plus a per-shape Q4_K matvec microbench at backend init.
 
 ## Build & Test
 

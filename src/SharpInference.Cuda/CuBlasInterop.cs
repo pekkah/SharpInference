@@ -8,6 +8,18 @@ namespace SharpInference.Cuda;
 /// </summary>
 internal static partial class CuBlasInterop
 {
+    static CuBlasInterop()
+    {
+        // CUDA 11.7+ defaults to lazy module loading: SASS for each kernel is JIT'd from
+        // PTX on the first cuLaunchKernel, not at cuModuleLoadData time. For an LLM that
+        // launches ~700 kernels per token, the cold-cache JIT cost lands in the middle
+        // of the first prefill and craters throughput. Forcing EAGER moves the JIT cost
+        // back to module-load time, where it shows up as a one-shot startup delay.
+        // Must be set before any CUDA call: the driver reads it during cuInit.
+        if (Environment.GetEnvironmentVariable("CUDA_MODULE_LOADING") is null)
+            Environment.SetEnvironmentVariable("CUDA_MODULE_LOADING", "EAGER");
+    }
+
     // ── cuBLAS handle lifecycle ──────────────────────────────────────────
 
     [LibraryImport("cublas64_11", EntryPoint = "cublasCreate_v2")]
@@ -92,6 +104,10 @@ internal static partial class CuBlasInterop
 
     [LibraryImport("cudart64_110", EntryPoint = "cudaDeviceGetAttribute")]
     internal static partial int DeviceGetAttribute(out int value, int attr, int device);
+
+    /// <summary>cudaMemGetInfo: free and total VRAM on the current device, in bytes.</summary>
+    [LibraryImport("cudart64_110", EntryPoint = "cudaMemGetInfo")]
+    internal static partial int MemGetInfo(out nuint free, out nuint total);
 
     [LibraryImport("cudart64_110", EntryPoint = "cudaEventCreate")]
     internal static partial int EventCreate(out nint ev);

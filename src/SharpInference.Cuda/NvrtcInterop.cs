@@ -40,10 +40,14 @@ internal static unsafe partial class NvrtcInterop
     [LibraryImport("nvrtc", EntryPoint = "nvrtcGetPTX")]
     internal static partial int GetPTX(nint prog, byte* ptx);
 
-    [LibraryImport("nvrtc", EntryPoint = "nvrtcGetCubinSize")]
+    // Note: NVRTC exports these with UPPERCASE "CUBIN" (nvrtcGetCUBIN / nvrtcGetCUBINSize).
+    // Spelling them with lowercase "Cubin" makes the entry-point lookup throw
+    // EntryPointNotFoundException at first call, which silently routes the kernel
+    // module through the PTX fallback and pays per-kernel JIT every prefill.
+    [LibraryImport("nvrtc", EntryPoint = "nvrtcGetCUBINSize")]
     internal static partial int GetCubinSize(nint prog, out nuint cubinSize);
 
-    [LibraryImport("nvrtc", EntryPoint = "nvrtcGetCubin")]
+    [LibraryImport("nvrtc", EntryPoint = "nvrtcGetCUBIN")]
     internal static partial int GetCubin(nint prog, byte* cubin);
 
     [LibraryImport("nvrtc", EntryPoint = "nvrtcCompileProgram")]
@@ -91,6 +95,19 @@ internal static unsafe partial class NvrtcInterop
 
     [LibraryImport("nvcuda", EntryPoint = "cuModuleUnload")]
     internal static partial int ModuleUnload(nint hmod);
+
+    /// <summary>
+    /// Query an attribute of a kernel function. Calling this on a freshly loaded module
+    /// has the side-effect of forcing the driver to JIT-compile that kernel up-front,
+    /// even when CUDA's default lazy module loading would otherwise defer JIT until the
+    /// first <c>cuLaunchKernel</c> for the function.
+    /// CU_FUNC_ATTRIBUTE_NUM_REGS = 4 is queried because it is the cheapest attribute
+    /// that still requires SASS to be generated.
+    /// </summary>
+    [LibraryImport("nvcuda", EntryPoint = "cuFuncGetAttribute")]
+    internal static partial int FuncGetAttribute(out int pi, int attrib, nint hfunc);
+
+    internal const int CU_FUNC_ATTRIBUTE_NUM_REGS = 4;
 
     // ── Helpers ───────────────────────────────────────────────────────────
 

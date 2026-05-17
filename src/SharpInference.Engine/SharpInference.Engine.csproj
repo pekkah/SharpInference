@@ -8,6 +8,7 @@
     <ProjectReference Include="..\SharpInference.Core\SharpInference.Core.csproj" />
     <ProjectReference Include="..\SharpInference.Cpu\SharpInference.Cpu.csproj" />
     <ProjectReference Include="..\SharpInference.Vulkan\SharpInference.Vulkan.csproj" />
+    <ProjectReference Include="..\SharpInference.Cuda\SharpInference.Cuda.csproj" />
     <ProjectReference Include="..\SharpInference.TurboQuant\SharpInference.TurboQuant.csproj" />
     <ProjectReference Include="..\SharpInference.Pipeline\SharpInference.Pipeline.csproj" />
   </ItemGroup>

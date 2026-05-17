@@ -820,7 +820,9 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             + hp.NumKvHeads * headDim * 2 + hp.NumHeads * headDim
             + hp.IntermediateDim * 2 + hp.VocabSize) * sizeof(float);
 
-        long reserved = Math.Max(vramBytes / 5, 1024L * 1024 * 1024);
+        // See note on the non-TQ path: keep ≥ 2 GiB free so late weight allocations
+        // (notably lm-head) stay in HBM instead of getting paged to system memory.
+        long reserved = Math.Max(vramBytes / 3, 2L * 1024 * 1024 * 1024);
         long available = vramBytes - weightBytes - scratchBytes - reserved;
         if (available <= 0) available = 64L * 1024 * 1024;
 
@@ -854,9 +856,16 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             + hp.NumKvHeads * headDim * 2 + hp.NumHeads * headDim
             + hp.IntermediateDim * 2 + hp.VocabSize) * sizeof(float);
 
-        // Reserve for Vulkan overhead, staging buffers, OS/desktop compositor
-        // Use 20% of VRAM or 1 GB, whichever is larger
-        long reserved = Math.Max(vramBytes / 5, 1024L * 1024 * 1024);
+        // Reserve at least 2 GiB (or a third of total) for the driver, staging buffers,
+        // OS/desktop compositor, GPU buffer pool reuse, and any per-allocation overhead.
+        // The previous max(vram/5, 1 GiB) leaves only ~24 MiB free on a 12 GiB card for
+        // Qwen3-8B at the auto-picked context — anything allocated *late* (notably the
+        // 600 MiB lm-head weight) then gets mapped into system memory by the driver,
+        // and the kernel reads those weights at ~30 GB/s over PCIe instead of ~400 GB/s
+        // in HBM. The CUDA backend hit this hard (4 t/s on Qwen3 prefill before the fix);
+        // Vulkan currently escapes only because it has no eager image-ops buffer eating
+        // 2.5 GiB at construction. Same trapdoor though, so close it here too.
+        long reserved = Math.Max(vramBytes / 3, 2L * 1024 * 1024 * 1024);
 
         long available = vramBytes - weightBytes - scratchBytes - reserved;
         if (available <= 0) available = 64L * 1024 * 1024; // minimum fallback

@@ -4,6 +4,7 @@ using Spectre.Console;
 using Spectre.Console.Cli;
 using SharpInference.Core;
 using SharpInference.Cpu;
+using SharpInference.Cuda;
 using SharpInference.Engine;
 using SharpInference.Vulkan;
 
@@ -107,6 +108,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [Description("Repetition penalty (1.0 = disabled, >1.0 penalizes repeated tokens, default: 1.1)")]
         [DefaultValue(1.1f)]
         public float RepPenalty { get; init; }
+
+        [CommandOption("--backend")]
+        [Description("GPU backend: auto, vulkan, cuda. Default: auto (prefers CUDA when -g is set and CUDA is available, otherwise Vulkan).")]
+        [DefaultValue("auto")]
+        public string Backend { get; init; } = "auto";
     }
 
     protected override int Execute(CommandContext context, Settings settings, CancellationToken cancellation)
@@ -189,6 +195,48 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             AnsiConsole.MarkupLine("[red]Warning:[/] SHARPI_ALLOW_BROKEN_MOE_HYBRID=1 set; running MoE on hybrid path despite known NaN/garbled output (issue #2 debug mode).");
         }
 
+        // Resolve which GPU backend to use when -g is non-zero. CUDA is preferred only
+        // when the user explicitly opted in (--backend cuda) or auto-detection finds it
+        // and Vulkan is not the explicit choice. The CUDA forward pass currently covers
+        // dense (non-MoE) models with all layers on GPU; MoE and hybrid -g N stay on the
+        // Vulkan path.
+        bool wantCuda = false;
+        string backendStr = (settings.Backend ?? "auto").Trim().ToLowerInvariant();
+        if (nGpuLayers != 0)
+        {
+            switch (backendStr)
+            {
+                case "cuda":
+                    wantCuda = true;
+                    break;
+                case "vulkan":
+                    wantCuda = false;
+                    break;
+                case "auto":
+                case "":
+                    // Auto: pick CUDA when available, the model is dense, and the user asked
+                    // for full-GPU offload (the CUDA forward pass doesn't yet split layers).
+                    wantCuda = !hp.IsMoE
+                        && (nGpuLayers == -1 || nGpuLayers >= hp.NumLayers)
+                        && !settings.TurboQuant
+                        && CudaBackend.IsAvailable();
+                    break;
+                default:
+                    AnsiConsole.MarkupLine($"[red]Error:[/] Unknown --backend value '{settings.Backend}'. Expected one of: auto, vulkan, cuda.");
+                    return 1;
+            }
+            if (wantCuda && hp.IsMoE)
+            {
+                AnsiConsole.MarkupLine("[yellow]Note:[/] --backend cuda does not yet support MoE; falling back to Vulkan.");
+                wantCuda = false;
+            }
+            if (wantCuda && settings.TurboQuant)
+            {
+                AnsiConsole.MarkupLine("[yellow]Note:[/] --backend cuda does not yet support TurboQuant KV compression; falling back to Vulkan.");
+                wantCuda = false;
+            }
+        }
+
         if (nGpuLayers == 0)
         {
             // CPU only
@@ -201,6 +249,29 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             prefill = tokens => fwd.Prefill(tokens);
             resetCache = settings.TurboQuant ? fwd.TqCache!.Reset : fwd.Cache.Reset;
             AnsiConsole.MarkupLine("[dim]Backend: [blue]CPU[/][/]");
+        }
+        else if (wantCuda)
+        {
+            var cuda = CudaBackend.Create();
+            gpuBackend = cuda;
+            try
+            {
+                // CudaForwardPass loads all layers — partial offload is a Vulkan-only feature today.
+                var cfwd = new CudaForwardPass(model, cuda, hp, ctxSize);
+                gpuFwd = cfwd;
+                forward = cfwd.Forward;
+                prefill = tokens => cfwd.Prefill(tokens);
+                resetCache = cfwd.ResetCache;
+                AnsiConsole.MarkupLine($"[dim]Backend: [green]CUDA[/] ({cuda.Name}, all {hp.NumLayers} layers)[/]");
+            }
+            catch
+            {
+                gpuFwd?.Dispose();
+                gpuBackend?.Dispose();
+                gpuFwd = null;
+                gpuBackend = null;
+                throw;
+            }
         }
         else
         {

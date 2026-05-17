@@ -1,0 +1,794 @@
+namespace SharpInference.Cuda;
+
+/// <summary>
+/// CUDA C kernel source for LLM transformer operations, compiled at runtime via NVRTC.
+/// Mirrors the GLSL compute shaders in <c>SharpInference.Vulkan.Shaders</c>:
+/// RmsNorm, HeadNorm, RoPE (interleaved + NEOX), Softmax, Sigmoid, SiLuMul,
+/// EmbedLookup (F32 and Q4_K), KvAppend, scaled dot-product Attention with GQA,
+/// and Q4_K / Q6_K / F32 matrix-vector multiplies.
+///
+/// Kernels rely only on FP32 arithmetic + integer bit ops; no cuda_fp16.h header needed.
+/// FP16 decoding for Q4_K / Q6_K super-block scales is implemented inline with bit math
+/// so NVRTC can compile this in isolation (no header registration).
+/// </summary>
+internal static class CudaTextKernels
+{
+    public const string Source = @"
+// NVRTC standalone compilation: <math.h> isn't available, so define our own
+// floating-point +inf rather than relying on the C99 INFINITY macro.
+__device__ __forceinline__ float sharpi_neg_inf() { return __int_as_float(0xff800000); }
+
+// ── FP16 → FP32 decode ────────────────────────────────────────────────────
+// Hardware path: single-cycle `cvt.f32.f16` PTX instruction (CUDA core's F2F
+// unit). Earlier this code shipped a software branch-on-exp implementation
+// that NVCC expanded to ~30 SASS instructions per call — and the matvec_q4k
+// kernel called it 4× per super-block per lane (super_d, super_dmin, two Q8_1
+// d's). That single change accounted for the bulk of the kernel's instruction
+// count and was the dominant reason Q4_K matvec ran 5× slower than Vulkan.
+__device__ __forceinline__ float sharpi_fp16_to_fp32(unsigned int h)
+{
+    float result;
+    asm(""cvt.f32.f16 %0, %1;"" : ""=f""(result) : ""h""((unsigned short)h));
+    return result;
+}
+
+// Warp-level sum reduction over 32 lanes (full-warp mask).
+__device__ __forceinline__ float sharpi_warp_reduce_sum(float v)
+{
+    v += __shfl_xor_sync(0xffffffffu, v, 16);
+    v += __shfl_xor_sync(0xffffffffu, v,  8);
+    v += __shfl_xor_sync(0xffffffffu, v,  4);
+    v += __shfl_xor_sync(0xffffffffu, v,  2);
+    v += __shfl_xor_sync(0xffffffffu, v,  1);
+    return v;
+}
+
+// ── FP32 → FP16 encode ────────────────────────────────────────────────────
+// Round-to-nearest-even. Returns 16-bit pattern in the low 16 of the result.
+// Subnormals are flushed to zero (the Q8_1 path only stores scales d = amax/127
+// which are well in the normal range for any non-pathological activation).
+__device__ __forceinline__ unsigned int sharpi_fp32_to_fp16(float f)
+{
+    unsigned short h;
+    asm(""cvt.rn.f16.f32 %0, %1;"" : ""=h""(h) : ""f""(f));
+    return (unsigned int)h;
+}
+
+// Read one byte from a uint32-stride buffer at absolute byte offset B.
+__device__ __forceinline__ unsigned int sharpi_byte_at(const unsigned int* __restrict__ buf, long B)
+{
+    unsigned int w = buf[(B) >> 2];
+    return (w >> (((unsigned int)(B) & 3u) * 8u)) & 0xFFu;
+}
+
+// Same as sharpi_byte_at but interprets the byte as int8 (signed).
+__device__ __forceinline__ int sharpi_int8_at(const unsigned int* __restrict__ buf, long B)
+{
+    int v = (int)sharpi_byte_at(buf, B);
+    return v >= 128 ? v - 256 : v;
+}
+
+// ── RmsNorm ────────────────────────────────────────────────────────────────
+// output[i] = input[i] / rms * weight[i], rms = sqrt(mean(input^2) + eps).
+// 1 block of 256 threads. Push-equivalent: (n, eps).
+extern ""C"" __global__ void llm_rmsnorm(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    float* __restrict__ output,
+    int n, float eps)
+{
+    __shared__ float sdata[256];
+    unsigned int tid = threadIdx.x;
+
+    float sum = 0.f;
+    for (int i = (int)tid; i < n; i += 256) {
+        float v = input[i];
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    float scale = rsqrtf(sdata[0] / (float)n + eps);
+    for (int i = (int)tid; i < n; i += 256)
+        output[i] = input[i] * scale * weight[i];
+}
+
+// ── HeadNorm (weighted per-head RMS) ───────────────────────────────────────
+// One block per head, 256 threads.
+extern ""C"" __global__ void llm_head_norm(
+    float* __restrict__ data,
+    const float* __restrict__ weight,
+    int head_dim, int num_heads, float eps)
+{
+    __shared__ float sdata[256];
+    unsigned int tid = threadIdx.x;
+    unsigned int head = blockIdx.x;
+    if ((int)head >= num_heads) return;
+
+    int base_off = (int)head * head_dim;
+
+    float sum = 0.f;
+    for (int i = (int)tid; i < head_dim; i += 256) {
+        float v = data[base_off + i];
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);
+    for (int i = (int)tid; i < head_dim; i += 256)
+        data[base_off + i] = data[base_off + i] * scale * weight[i];
+}
+
+// ── HeadNormPure (L2 normalize per head, no weights) ───────────────────────
+extern ""C"" __global__ void llm_head_norm_pure(
+    float* __restrict__ data,
+    int head_dim, int num_heads, float eps)
+{
+    __shared__ float sdata[256];
+    unsigned int tid = threadIdx.x;
+    unsigned int head = blockIdx.x;
+    if ((int)head >= num_heads) return;
+
+    int base_off = (int)head * head_dim;
+
+    float sum = 0.f;
+    for (int i = (int)tid; i < head_dim; i += 256) {
+        float v = data[base_off + i];
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);
+    for (int i = (int)tid; i < head_dim; i += 256)
+        data[base_off + i] = data[base_off + i] * scale;
+}
+
+// ── Fused SiLU(gate) * up ──────────────────────────────────────────────────
+// gate[i] = gate[i] / (1 + exp(-gate[i])) * up[i]
+extern ""C"" __global__ void llm_silu_mul(
+    float* __restrict__ gate, const float* __restrict__ up, int n)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) return;
+    float g = gate[i];
+    gate[i] = g / (1.0f + __expf(-g)) * up[i];
+}
+
+// ── Element-wise sigmoid in-place ──────────────────────────────────────────
+extern ""C"" __global__ void llm_sigmoid_inplace(float* __restrict__ x, int n)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) return;
+    x[i] = 1.0f / (1.0f + __expf(-x[i]));
+}
+
+// ── Softmax in place ───────────────────────────────────────────────────────
+// 1 block of 256 threads. 3-pass: max, exp+sum, normalize.
+extern ""C"" __global__ void llm_softmax(float* __restrict__ x, int n)
+{
+    __shared__ float sdata[256];
+    unsigned int tid = threadIdx.x;
+
+    float local_max = sharpi_neg_inf();
+    for (int i = (int)tid; i < n; i += 256)
+        local_max = fmaxf(local_max, x[i]);
+    sdata[tid] = local_max;
+    __syncthreads();
+
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+
+    float local_sum = 0.f;
+    for (int i = (int)tid; i < n; i += 256) {
+        float e = __expf(x[i] - max_val);
+        x[i] = e;
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+
+    for (int i = (int)tid; i < n; i += 256)
+        x[i] *= inv_sum;
+}
+
+// ── Buffer clear (zero) ────────────────────────────────────────────────────
+extern ""C"" __global__ void llm_clear_f32(float* __restrict__ dst, int n)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) return;
+    dst[i] = 0.f;
+}
+
+// ── Memory-bound baseline (diagnostic only) ────────────────────────────────
+// Each thread reads/writes one uint4 (16 bytes), the access width NVIDIA's
+// own bandwidthTest uses. Saturates HBM at ~400 GB/s on RTX 4070 Ti when the
+// system is healthy.
+extern ""C"" __global__ void llm_bw_baseline(
+    const uint4* __restrict__ src,
+    uint4* __restrict__ dst,
+    int n_uint4)
+{
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= n_uint4) return;
+    dst[idx] = src[idx];   // pure streaming copy — 16 bytes/thread = 1 cache sector/lane
+}
+
+// ── RoPE (interleaved pairs (2i, 2i+1)) ────────────────────────────────────
+// Each thread handles one pair across all heads. total_pairs = num_heads * head_dim/2.
+extern ""C"" __global__ void llm_rope_interleaved(
+    float* __restrict__ x,
+    int num_heads, int head_dim, int position, float theta)
+{
+    int pair_idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int half_dim = head_dim / 2;
+    int total_pairs = num_heads * half_dim;
+    if (pair_idx >= total_pairs) return;
+
+    int h = pair_idx / half_dim;
+    int i = pair_idx % half_dim;
+
+    float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)head_dim);
+    float angle = (float)position * freq;
+    float c = cosf(angle);
+    float s = sinf(angle);
+
+    int base = h * head_dim + 2 * i;
+    float x0 = x[base];
+    float x1 = x[base + 1];
+    x[base]     = x0 * c - x1 * s;
+    x[base + 1] = x0 * s + x1 * c;
+}
+
+// ── RoPE NEOX (pairs offset by head_dim/2) ─────────────────────────────────
+extern ""C"" __global__ void llm_rope_neox(
+    float* __restrict__ x,
+    int num_heads, int head_dim, int position, float theta)
+{
+    int pair_idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int half_dim = head_dim / 2;
+    int total_pairs = num_heads * half_dim;
+    if (pair_idx >= total_pairs) return;
+
+    int h = pair_idx / half_dim;
+    int i = pair_idx % half_dim;
+
+    float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)head_dim);
+    float angle = (float)position * freq;
+    float c = cosf(angle);
+    float s = sinf(angle);
+
+    int head_base = h * head_dim;
+    int a = head_base + i;
+    int b = head_base + i + half_dim;
+    float x0 = x[a];
+    float x1 = x[b];
+    x[a] = x0 * c - x1 * s;
+    x[b] = x0 * s + x1 * c;
+}
+
+// ── KV cache append ────────────────────────────────────────────────────────
+extern ""C"" __global__ void llm_kv_append(
+    const float* __restrict__ k_in,
+    const float* __restrict__ v_in,
+    float* __restrict__ k_cache,
+    float* __restrict__ v_cache,
+    int kv_dim, int position, int max_seq_len)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= kv_dim) return;
+    long offset = (long)position * (long)kv_dim + (long)i;
+    k_cache[offset] = k_in[i];
+    v_cache[offset] = v_in[i];
+}
+
+// ── Embedding lookup (F32 table) ───────────────────────────────────────────
+extern ""C"" __global__ void llm_embed_lookup_f32(
+    const float* __restrict__ emb_table,
+    float* __restrict__ output,
+    int token_id, int emb_dim)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= emb_dim) return;
+    long src = (long)token_id * (long)emb_dim + (long)i;
+    output[i] = emb_table[src];
+}
+
+// ── Embedding lookup from Q4_K table ───────────────────────────────────────
+// One block of 256 threads dequantizes one row (= emb_dim elements).
+// emb_dim must be a multiple of 256 (Q4_K block size).
+//
+// Q4_K block (144 bytes, 36 uint32 words):
+//   words[0]      : low 16 = d (fp16), high 16 = dmin (fp16)
+//   words[1..3]   : 12 bytes of packed 6-bit (scale,min) pairs
+//   words[4..35]  : 128 bytes of 4-bit nibbles (256 elements)
+extern ""C"" __global__ void llm_embed_lookup_q4k(
+    const unsigned int* __restrict__ emb_data,
+    float* __restrict__ output,
+    int token_id, int emb_dim)
+{
+    __shared__ unsigned int blk[36];
+    unsigned int tid = threadIdx.x;
+
+    int num_blocks = emb_dim >> 8;                  // emb_dim / 256
+    int bytes_per_row = num_blocks * 144;
+    long row_word_base = (long)token_id * (long)(bytes_per_row >> 2);  // bytes_per_row / 4
+
+    for (int block = 0; block < num_blocks; block++) {
+        long blk_word_base = row_word_base + (long)((block * 144) >> 2);   // == block * 36
+        if (tid < 36)
+            blk[tid] = emb_data[blk_word_base + tid];
+        __syncthreads();
+
+        // Block-shared d, dmin
+        unsigned int w0 = blk[0];
+        float d    = sharpi_fp16_to_fp32(w0 & 0xffffu);
+        float dmin = sharpi_fp16_to_fp32(w0 >> 16);
+
+        // Compute scale/min sub-indices the same way the Vulkan shader does.
+        unsigned int chunk = tid >> 6;          // 0..3
+        unsigned int sub   = tid & 63u;         // 0..63
+        unsigned int is_upper = (sub >= 32u) ? 1u : 0u;
+        unsigned int byte_pos = sub & 31u;
+
+        // sm0/1/2 from words[1..3]
+        unsigned int sm0 = blk[1];
+        unsigned int sm1 = blk[2];
+        unsigned int sm2 = blk[3];
+
+        unsigned int si = chunk * 2u + is_upper;
+        float sc, mn;
+        if (si < 4u) {
+            sc = (float)((sm0 >> (si * 8u)) & 63u);
+            mn = (float)((sm1 >> (si * 8u)) & 63u);
+        } else {
+            unsigned int j = si - 4u;
+            sc = (float)(((sm2 >> (j * 8u)) & 0xFu)
+                       | (((sm0 >> (j * 8u + 6u)) & 3u) << 4));
+            mn = (float)(((sm2 >> (j * 8u + 4u)) & 0xFu)
+                       | (((sm1 >> (j * 8u + 6u)) & 3u) << 4));
+        }
+
+        // Read one quant byte at offset 16 + chunk*32 + byte_pos (relative to block start).
+        unsigned int qword = blk[4u + chunk * 8u + (byte_pos >> 2)];
+        unsigned int qbyte = (qword >> ((byte_pos & 3u) * 8u)) & 0xFFu;
+        unsigned int nibble = is_upper ? (qbyte >> 4) : (qbyte & 0xFu);
+
+        output[block * 256 + (int)tid] = d * sc * (float)nibble - dmin * mn;
+
+        __syncthreads();
+    }
+}
+
+// ── MatVec F32 ─────────────────────────────────────────────────────────────
+// 256 threads/block, 8 rows/block, 32 threads/row → warp reduce.
+// One grid dim x covers ceil(rows/8) blocks.
+extern ""C"" __global__ void llm_matvec_f32(
+    const float* __restrict__ weights,
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int rows, int cols)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    if (row >= rows) return;
+
+    float acc = 0.f;
+    long base = (long)row * (long)cols;
+    for (int i = lane; i < cols; i += THREADS_PER_ROW)
+        acc += weights[base + i] * input[i];
+
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output[row] = result;
+}
+
+// ── Quantize FP32 → Q8_1 (per-32-element sub-block) ───────────────────────
+// Output layout (matches ggml block_q8_1): per 32 elements:
+//   offset 0..3  : { fp16 d, fp16 _ }    (we leave the second half unused;
+//                                         the Q4_K matvec re-derives Σq via
+//                                         __dp4a(0x01010101, …))
+//   offset 4..35 : 32 × int8 quantized samples
+// One CUDA block of 32 threads quantizes one Q8_1 sub-block.
+extern ""C"" __global__ void llm_quantize_q8_1(
+    const float* __restrict__ x,
+    unsigned char* __restrict__ out,
+    int n)
+{
+    int block_id = (int)blockIdx.x;
+    int lane     = (int)threadIdx.x;
+    int elem_idx = block_id * 32 + lane;
+
+    float val = (elem_idx < n) ? x[elem_idx] : 0.f;
+
+    // amax across the 32-lane sub-block.
+    float a = fabsf(val);
+    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 16));
+    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a,  8));
+    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a,  4));
+    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a,  2));
+    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a,  1));
+
+    float d    = a / 127.f;
+    float invd = (d == 0.f) ? 0.f : (1.f / d);
+    int   q    = (int)rintf(val * invd);
+    if (q >  127) q =  127;
+    if (q < -127) q = -127;
+
+    unsigned char* dst = out + (long)block_id * 36L;
+    dst[4 + lane] = (unsigned char)(signed char)q;
+
+    if (lane == 0) {
+        // Pack {d, 0} as two fp16 halves into one uint32 at offset 0..3.
+        unsigned int d_bits = sharpi_fp32_to_fp16(d);
+        *reinterpret_cast<unsigned int*>(dst) = d_bits;
+    }
+}
+
+// ── MatVec Q4_K  —  __dp4a / Q8_1 path ────────────────────────────────────
+// Mirrors llama.cpp's mul_mat_vec_q4_K_q8_1:
+//   • 1 output row per CUDA block; 4 warps (128 threads) cooperate on it.
+//   • Input vector is pre-quantized to Q8_1 (32-element sub-blocks, one fp16 d
+//     plus 32 int8 quants per sub-block).
+//   • Each thread handles 8 weight nibbles per Q4_K super-block (32-byte chunk
+//     split into 4 low nibbles + 4 high nibbles) and the corresponding
+//     8 activations via two __dp4a instructions.
+//   • Min correction Σ_j q_y[j] is re-derived in the same dp4a pipeline via
+//     __dp4a(0x01010101, act, 0) — no second pass over the data.
+//
+// Lane layout for one super-block:
+//   chunk     = lane >> 3            ∈ {0,1,2,3}
+//   byte_off  = (lane & 7) * 4       ∈ {0,4,8,…,28}
+// Each lane reads ONE uint32 of weight bytes (4 packed bytes = 8 nibbles =
+// 4 low nibbles + 4 high nibbles), and ONE uint32 of activations per
+// nibble polarity (4 int8 each).
+#define MATVEC_Q4K_NWARPS 8
+extern ""C"" __global__ void llm_matvec_q4k(
+    const unsigned int* __restrict__ weights,
+    const unsigned char* __restrict__ y_q81,
+    float* __restrict__ output,
+    int rows, int cols)
+{
+    int row     = (int)blockIdx.x;
+    int warp_id = (int)threadIdx.y;     // 0..NWARPS-1
+    int lane    = (int)threadIdx.x;     // 0..31
+    if (row >= rows) return;
+
+    int num_blocks = cols >> 8;                       // cols / 256
+    long word_row_base = (long)row * (long)num_blocks * 36L;
+
+    int chunk    = lane >> 3;                         // 0..3
+    int byte_off = (lane & 7) * 4;                    // 0,4,8,…,28
+    int q4_offset = 4 + chunk * 8 + (lane & 7);       // weight word index within super-block
+
+    // Q8_1 layout: 36 bytes per 32-element sub-block; 8 sub-blocks per Q4_K super-block.
+    // Sub-block index 2*chunk feeds low-nibble elems, 2*chunk+1 feeds high-nibble elems.
+
+    float acc = 0.f;
+
+    for (int block = warp_id; block < num_blocks; block += MATVEC_Q4K_NWARPS) {
+        long word_base = word_row_base + (long)block * 36L;
+
+        unsigned int w0  = __ldg(&weights[word_base]);
+        unsigned int sm0 = __ldg(&weights[word_base + 1]);
+        unsigned int sm1 = __ldg(&weights[word_base + 2]);
+        unsigned int sm2 = __ldg(&weights[word_base + 3]);
+        float super_d    = sharpi_fp16_to_fp32(w0 & 0xffffu);
+        float super_dmin = sharpi_fp16_to_fp32(w0 >> 16);
+
+        // Extract this lane's two sub-block (sc, m) pairs: lo = 2*chunk, hi = 2*chunk+1.
+        unsigned int sc_lo, mn_lo, sc_hi, mn_hi;
+        switch (chunk) {
+            case 0:
+                sc_lo = (sm0)       & 63u; mn_lo = (sm1)       & 63u;
+                sc_hi = (sm0 >>  8) & 63u; mn_hi = (sm1 >>  8) & 63u;
+                break;
+            case 1:
+                sc_lo = (sm0 >> 16) & 63u; mn_lo = (sm1 >> 16) & 63u;
+                sc_hi = (sm0 >> 24) & 63u; mn_hi = (sm1 >> 24) & 63u;
+                break;
+            case 2:
+                sc_lo = (sm2        & 0xFu) | (((sm0 >>  6) & 3u) << 4);
+                mn_lo = ((sm2 >>  4) & 0xFu) | (((sm1 >>  6) & 3u) << 4);
+                sc_hi = ((sm2 >>  8) & 0xFu) | (((sm0 >> 14) & 3u) << 4);
+                mn_hi = ((sm2 >> 12) & 0xFu) | (((sm1 >> 14) & 3u) << 4);
+                break;
+            default: // chunk == 3
+                sc_lo = ((sm2 >> 16) & 0xFu) | (((sm0 >> 22) & 3u) << 4);
+                mn_lo = ((sm2 >> 20) & 0xFu) | (((sm1 >> 22) & 3u) << 4);
+                sc_hi = ((sm2 >> 24) & 0xFu) | (((sm0 >> 30) & 3u) << 4);
+                mn_hi = ((sm2 >> 28) & 0xFu) | (((sm1 >> 30) & 3u) << 4);
+                break;
+        }
+
+        // Load this lane's 4 weight bytes: 4 low nibbles + 4 high nibbles.
+        unsigned int wq    = __ldg(&weights[word_base + q4_offset]);
+        unsigned int wq_lo = wq & 0x0F0F0F0Fu;
+        unsigned int wq_hi = (wq >> 4) & 0x0F0F0F0Fu;
+
+        // Q8_1 base for this super-block.
+        long q81_base_lo = (long)(block * 8 + chunk * 2)     * 36L;
+        long q81_base_hi = (long)(block * 8 + chunk * 2 + 1) * 36L;
+
+        // Per-sub-block d (fp16 in first 2 bytes of each sub-block).
+        unsigned int d_bits_lo = __ldg(reinterpret_cast<const unsigned int*>(y_q81 + q81_base_lo)) & 0xffffu;
+        unsigned int d_bits_hi = __ldg(reinterpret_cast<const unsigned int*>(y_q81 + q81_base_hi)) & 0xffffu;
+        float d8_lo = sharpi_fp16_to_fp32(d_bits_lo);
+        float d8_hi = sharpi_fp16_to_fp32(d_bits_hi);
+
+        // 4 int8 activations per sub-block at byte offset (4 + byte_off).
+        int act_lo = *reinterpret_cast<const int*>(y_q81 + q81_base_lo + 4 + byte_off);
+        int act_hi = *reinterpret_cast<const int*>(y_q81 + q81_base_hi + 4 + byte_off);
+
+        // dp4a: dot(4 nibbles in 8-bit lanes, 4 int8 activations).
+        // Cast nibble-packed words to signed int to disambiguate the dp4a
+        // overload — nibbles are in 0..15 so the signed reinterpretation is
+        // bitwise identical and the int8×int8 lane semantics are what we want.
+        int dot_lo   = __dp4a((int)wq_lo, act_lo, 0);
+        int dot_hi   = __dp4a((int)wq_hi, act_hi, 0);
+        // Σ_j q_y[j] for the min correction — same dp4a pipeline.
+        int sum_lo   = __dp4a((int)0x01010101, act_lo, 0);
+        int sum_hi   = __dp4a((int)0x01010101, act_hi, 0);
+
+        // Per-sub-block contribution: super_d * (sc * d8 * dot) − super_dmin * (m * d8 * Σq_y).
+        float coef_d_lo = super_d    * (float)sc_lo * d8_lo;
+        float coef_m_lo = super_dmin * (float)mn_lo * d8_lo;
+        float coef_d_hi = super_d    * (float)sc_hi * d8_hi;
+        float coef_m_hi = super_dmin * (float)mn_hi * d8_hi;
+        acc += coef_d_lo * (float)dot_lo - coef_m_lo * (float)sum_lo;
+        acc += coef_d_hi * (float)dot_hi - coef_m_hi * (float)sum_hi;
+    }
+
+    // Intra-warp reduction.
+    acc = sharpi_warp_reduce_sum(acc);
+
+    // Inter-warp reduction via shared memory.
+    __shared__ float warp_acc[MATVEC_Q4K_NWARPS];
+    if (lane == 0) warp_acc[warp_id] = acc;
+    __syncthreads();
+
+    if (warp_id == 0 && lane == 0) {
+        float s = 0.f;
+        #pragma unroll
+        for (int w = 0; w < MATVEC_Q4K_NWARPS; w++) s += warp_acc[w];
+        output[row] = s;
+    }
+}
+
+// ── MatVec Q6_K ────────────────────────────────────────────────────────────
+// Q6_K block (210 bytes per 256 elements):
+//   [0:128]   ql — lower 4-bit nibbles (two 64-byte halves)
+//   [128:192] qh — upper 2-bit pairs   (two 32-byte halves)
+//   [192:208] 16 int8 scales
+//   [208:210] FP16 super-block scale d
+// Reads through uint32 words via byte gathers; mirrors Vulkan MatVecQ6K.
+extern ""C"" __global__ void llm_matvec_q6k(
+    const unsigned int* __restrict__ weights,
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int rows, int cols)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    if (row >= rows) return;
+
+    int num_blocks = cols >> 8;
+    long row_base_bytes = (long)row * (long)num_blocks * 210L;
+
+    float acc = 0.f;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long b0 = row_base_bytes + (long)block * 210L;
+
+        // d: FP16 at offset 208 (two bytes)
+        unsigned int dlo = (weights[(b0 + 208) >> 2] >> (((b0 + 208) & 3) * 8)) & 0xFFu;
+        unsigned int dhi = (weights[(b0 + 209) >> 2] >> (((b0 + 209) & 3) * 8)) & 0xFFu;
+        float d = sharpi_fp16_to_fp32(dlo | (dhi << 8));
+
+        // Eight signed-int8 scales for this lane (isc = lane >> 4 selects 0 or 1).
+        long isc = (long)(lane >> 4);
+
+        float sc0 = d * (float)sharpi_int8_at(weights, b0 + 192 + isc);
+        float sc1 = d * (float)sharpi_int8_at(weights, b0 + 194 + isc);
+        float sc2 = d * (float)sharpi_int8_at(weights, b0 + 196 + isc);
+        float sc3 = d * (float)sharpi_int8_at(weights, b0 + 198 + isc);
+        float sc4 = d * (float)sharpi_int8_at(weights, b0 + 200 + isc);
+        float sc5 = d * (float)sharpi_int8_at(weights, b0 + 202 + isc);
+        float sc6 = d * (float)sharpi_int8_at(weights, b0 + 204 + isc);
+        float sc7 = d * (float)sharpi_int8_at(weights, b0 + 206 + isc);
+
+        // Six quant bytes per lane.
+        unsigned int ql0 = sharpi_byte_at(weights, b0 +   0 + lane);
+        unsigned int ql1 = sharpi_byte_at(weights, b0 +  32 + lane);
+        unsigned int ql2 = sharpi_byte_at(weights, b0 +  64 + lane);
+        unsigned int ql3 = sharpi_byte_at(weights, b0 +  96 + lane);
+        unsigned int qh0 = sharpi_byte_at(weights, b0 + 128 + lane);
+        unsigned int qh1 = sharpi_byte_at(weights, b0 + 160 + lane);
+
+        int base_elem = block * 256;
+
+        acc += sc0 * (float)((int)((ql0 & 0xFu)        | (((qh0 >> 0) & 3u) << 4)) - 32) * input[base_elem +       lane];
+        acc += sc1 * (float)((int)((ql1 & 0xFu)        | (((qh0 >> 2) & 3u) << 4)) - 32) * input[base_elem +  32 + lane];
+        acc += sc2 * (float)((int)(((ql0 >> 4) & 0xFu) | (((qh0 >> 4) & 3u) << 4)) - 32) * input[base_elem +  64 + lane];
+        acc += sc3 * (float)((int)(((ql1 >> 4) & 0xFu) | (((qh0 >> 6) & 3u) << 4)) - 32) * input[base_elem +  96 + lane];
+        acc += sc4 * (float)((int)((ql2 & 0xFu)        | (((qh1 >> 0) & 3u) << 4)) - 32) * input[base_elem + 128 + lane];
+        acc += sc5 * (float)((int)((ql3 & 0xFu)        | (((qh1 >> 2) & 3u) << 4)) - 32) * input[base_elem + 160 + lane];
+        acc += sc6 * (float)((int)(((ql2 >> 4) & 0xFu) | (((qh1 >> 4) & 3u) << 4)) - 32) * input[base_elem + 192 + lane];
+        acc += sc7 * (float)((int)(((ql3 >> 4) & 0xFu) | (((qh1 >> 6) & 3u) << 4)) - 32) * input[base_elem + 224 + lane];
+    }
+
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output[row] = result;
+}
+
+// ── Scaled dot-product attention with GQA ─────────────────────────────────
+// One block per query head, 256 threads.
+// For seq_len <= MAX_STORED_SCORES we use a stored-scores path with shared
+// memory; otherwise we fall back to the triple-pass recompute path that
+// matches the Vulkan long-context branch (correctness over speed).
+//
+// Q layout:        [num_heads * head_dim]                — single token query
+// K_cache layout:  [max_seq_len * (num_kv_heads * head_dim)]
+// V_cache layout:  same as K_cache
+// Output layout:   [num_heads * head_dim]
+extern ""C"" __global__ void llm_attention(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ out,
+    int num_heads, int num_kv_heads, int head_dim,
+    int seq_len, int max_seq_len)
+{
+    const int MAX_STORED_SCORES = 4096;
+    __shared__ float scores[MAX_STORED_SCORES];
+    __shared__ float sdata[256];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int h = blockIdx.x;
+    if ((int)h >= num_heads) return;
+
+    int kv_head = (int)h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = rsqrtf((float)head_dim);
+    long q_off  = (long)h * (long)head_dim;
+    long out_off = q_off;
+
+    if (seq_len <= MAX_STORED_SCORES) {
+        // Phase 1: Q·K → scores[t]
+        for (int t = (int)tid; t < seq_len; t += 256) {
+            float dot = 0.f;
+            long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            for (int d = 0; d < head_dim; d++)
+                dot += q[q_off + d] * k_cache[k_off + d];
+            scores[t] = dot * scale;
+        }
+        for (int t = seq_len + (int)tid; t < MAX_STORED_SCORES; t += 256)
+            scores[t] = sharpi_neg_inf();
+        __syncthreads();
+
+        // Phase 2: softmax(scores)
+        float local_max = sharpi_neg_inf();
+        for (int t = (int)tid; t < seq_len; t += 256)
+            local_max = fmaxf(local_max, scores[t]);
+        sdata[tid] = local_max;
+        __syncthreads();
+        for (unsigned int s = 128; s > 0; s >>= 1) {
+            if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+            __syncthreads();
+        }
+        float max_val = sdata[0];
+        __syncthreads();
+
+        float local_sum = 0.f;
+        for (int t = (int)tid; t < seq_len; t += 256) {
+            float e = __expf(scores[t] - max_val);
+            scores[t] = e;
+            local_sum += e;
+        }
+        sdata[tid] = local_sum;
+        __syncthreads();
+        for (unsigned int s = 128; s > 0; s >>= 1) {
+            if (tid < s) sdata[tid] += sdata[tid + s];
+            __syncthreads();
+        }
+        float sum_exp = sdata[0];
+        __syncthreads();
+
+        float inv_sum = 1.0f / sum_exp;
+        for (int t = (int)tid; t < seq_len; t += 256)
+            scores[t] *= inv_sum;
+        __syncthreads();
+
+        // Phase 3: weighted V sum.
+        for (int d = (int)tid; d < head_dim; d += 256) {
+            float acc = 0.f;
+            for (int t = 0; t < seq_len; t++) {
+                long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+                acc += scores[t] * v_cache[v_off + d];
+            }
+            out[out_off + d] = acc;
+        }
+    } else {
+        // Long-context: triple-pass recompute (~3× the scoring work).
+        float local_max = sharpi_neg_inf();
+        for (int t = (int)tid; t < seq_len; t += 256) {
+            float dot = 0.f;
+            long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            for (int d = 0; d < head_dim; d++)
+                dot += q[q_off + d] * k_cache[k_off + d];
+            local_max = fmaxf(local_max, dot * scale);
+        }
+        sdata[tid] = local_max;
+        __syncthreads();
+        for (unsigned int s = 128; s > 0; s >>= 1) {
+            if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+            __syncthreads();
+        }
+        float max_val = sdata[0];
+        __syncthreads();
+
+        float local_sum = 0.f;
+        for (int t = (int)tid; t < seq_len; t += 256) {
+            float dot = 0.f;
+            long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            for (int d = 0; d < head_dim; d++)
+                dot += q[q_off + d] * k_cache[k_off + d];
+            local_sum += __expf(dot * scale - max_val);
+        }
+        sdata[tid] = local_sum;
+        __syncthreads();
+        for (unsigned int s = 128; s > 0; s >>= 1) {
+            if (tid < s) sdata[tid] += sdata[tid + s];
+            __syncthreads();
+        }
+        float sum_exp = sdata[0];
+        __syncthreads();
+
+        for (int d = (int)tid; d < head_dim; d += 256) {
+            float acc = 0.f;
+            for (int t = 0; t < seq_len; t++) {
+                float dot = 0.f;
+                long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+                for (int dd = 0; dd < head_dim; dd++)
+                    dot += q[q_off + dd] * k_cache[k_off + dd];
+                long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+                acc += __expf(dot * scale - max_val) / sum_exp * v_cache[v_off + d];
+            }
+            out[out_off + d] = acc;
+        }
+    }
+}
+";
+}
