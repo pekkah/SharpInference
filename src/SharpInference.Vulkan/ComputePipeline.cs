@@ -19,10 +19,19 @@ public sealed unsafe class ComputePipeline : IDisposable
     private readonly VkDescriptorSetLayout _descriptorSetLayout;
     private readonly VkPipelineLayout _pipelineLayout;
     private readonly VkPipeline _pipeline;
-    private readonly VkDescriptorPool _descriptorPool;
-    private readonly VkDescriptorSet _reusableDs; // single pre-allocated descriptor set
+    private readonly int _bindingCount;
+    private readonly int _setsPerPool;
+    private readonly List<VkDescriptorPool> _pools = [];
+    private readonly VkDescriptorPool _reusablePool;        // separate pool for DispatchWith's reusable set
+    private readonly VkDescriptorSet _reusableDs;           // for synchronous DispatchWith only
+    private readonly List<VkDescriptorSet> _recordingSets = [];
+    private long _lastSeenRecordingEpoch = -1;
+    private int _recordingIdx;
     private readonly int _pushConstantSize;
     private bool _disposed;
+
+    // Public for tests/diagnostics that need to assert per-recording DS isolation.
+    public int CurrentRecordingDispatchCount => _recordingIdx;
 
     /// <summary>
     /// Create a compute pipeline from GLSL source.
@@ -111,40 +120,82 @@ public sealed unsafe class ComputePipeline : IDisposable
             _pipeline = pipe;
         }
 
-        // 5. Descriptor pool
+        // 5. Descriptor pools.
+        // We keep two parallel pool universes:
+        //   • _reusablePool — one set, reused by the synchronous `DispatchWith` path
+        //     (no reuse hazard because it submits + waits before returning).
+        //   • _pools[] — growable set of pools used by the asynchronous
+        //     `RecordWith` path. A single Vulkan descriptor set must NOT be
+        //     updated between record-time and submit/execute if a recorded
+        //     dispatch is going to read from it (Vulkan validity rule), so the
+        //     `RecordWith` path allocates a fresh DS per dispatch and recycles
+        //     them all when the next recording session starts.
+        _bindingCount = bindingCount;
+        _setsPerPool = Math.Max(maxDescriptorSets, 64);
+
+        VkDescriptorPoolSize reusablePoolSize = new()
+        {
+            type = VkDescriptorType.StorageBuffer,
+            descriptorCount = (uint)bindingCount,
+        };
+        VkDescriptorPoolCreateInfo reusablePoolCI = new()
+        {
+            flags = VkDescriptorPoolCreateFlags.FreeDescriptorSet,
+            maxSets = 1,
+            poolSizeCount = 1,
+            pPoolSizes = &reusablePoolSize,
+        };
+        VkDescriptorPool reusablePool;
+        vkd.vkCreateDescriptorPool(&reusablePoolCI, null, &reusablePool).CheckResult();
+        _reusablePool = reusablePool;
+        _reusableDs = AllocateDescriptorSetFromPool(_reusablePool);
+
+        _pools.Add(CreateRecordingPool());
+    }
+
+    private VkDescriptorPool CreateRecordingPool()
+    {
         VkDescriptorPoolSize poolSize = new()
         {
             type = VkDescriptorType.StorageBuffer,
-            descriptorCount = (uint)(bindingCount * maxDescriptorSets),
+            descriptorCount = (uint)(_bindingCount * _setsPerPool),
         };
         VkDescriptorPoolCreateInfo poolCI = new()
         {
-            flags = VkDescriptorPoolCreateFlags.FreeDescriptorSet,
-            maxSets = (uint)maxDescriptorSets,
+            // No FreeDescriptorSet flag — we recycle the pool wholesale via
+            // vkResetDescriptorPool when a new recording session begins.
+            maxSets = (uint)_setsPerPool,
             poolSizeCount = 1,
             pPoolSizes = &poolSize,
         };
         VkDescriptorPool pool;
-        vkd.vkCreateDescriptorPool(&poolCI, null, &pool).CheckResult();
-        _descriptorPool = pool;
-
-        // Pre-allocate one reusable descriptor set
-        _reusableDs = AllocateDescriptorSet();
+        _backend.Vkd.vkCreateDescriptorPool(&poolCI, null, &pool).CheckResult();
+        return pool;
     }
 
-    /// <summary>Allocate a descriptor set from the pool.</summary>
-    public VkDescriptorSet AllocateDescriptorSet()
+    private VkDescriptorSet AllocateDescriptorSetFromPool(VkDescriptorPool pool)
     {
         var layout = _descriptorSetLayout;
         VkDescriptorSetAllocateInfo allocInfo = new()
         {
-            descriptorPool = _descriptorPool,
+            descriptorPool = pool,
             descriptorSetCount = 1,
             pSetLayouts = &layout,
         };
         VkDescriptorSet ds;
         _backend.Vkd.vkAllocateDescriptorSets(&allocInfo, &ds).CheckResult();
         return ds;
+    }
+
+    /// <summary>
+    /// Allocate a descriptor set from the recording pool, growing the pool list on demand.
+    /// </summary>
+    public VkDescriptorSet AllocateDescriptorSet()
+    {
+        int poolIdx = _recordingSets.Count / _setsPerPool;
+        if (poolIdx >= _pools.Count)
+            _pools.Add(CreateRecordingPool());
+        return AllocateDescriptorSetFromPool(_pools[poolIdx]);
     }
 
     /// <summary>
@@ -224,13 +275,45 @@ public sealed unsafe class ComputePipeline : IDisposable
         vkd.vkCmdDispatch(cmd, groupCountX, groupCountY, groupCountZ);
     }
 
-    /// <summary>Record a dispatch using the reusable descriptor set (no submit).</summary>
+    /// <summary>
+    /// Record a dispatch into the current command buffer using a fresh descriptor set.
+    ///
+    /// Vulkan §14.2.4 makes it undefined behaviour to call <c>vkUpdateDescriptorSets</c>
+    /// on a descriptor set that was bound by a recorded but not-yet-completed dispatch.
+    /// A single <c>_reusableDs</c> updated and bound N times in one command buffer means
+    /// every recorded dispatch reads the descriptor state at execution time — i.e. the
+    /// last update wins, and earlier dispatches see the wrong buffers. NVIDIA drivers
+    /// usually snapshot at bind, but Mesa / Intel do not. This per-dispatch DS allocation
+    /// fixes the reuse hazard regardless of driver behaviour.
+    /// </summary>
     public void RecordWith(VkCommandBuffer cmd, ReadOnlySpan<GpuBuffer> buffers,
         uint groupCountX, uint groupCountY = 1, uint groupCountZ = 1,
         void* pushConstants = null)
     {
-        UpdateDescriptorSet(_reusableDs, buffers);
-        RecordDispatch(cmd, _reusableDs, groupCountX, groupCountY, groupCountZ, pushConstants);
+        // If the backend started a new recording session, recycle every set allocated
+        // during the previous session by resetting all of this pipeline's recording pools.
+        long epoch = _backend.RecordingEpoch;
+        if (epoch != _lastSeenRecordingEpoch)
+        {
+            ResetRecordingPools();
+            _lastSeenRecordingEpoch = epoch;
+        }
+
+        if (_recordingIdx >= _recordingSets.Count)
+            _recordingSets.Add(AllocateDescriptorSet());
+
+        var ds = _recordingSets[_recordingIdx++];
+        UpdateDescriptorSet(ds, buffers);
+        RecordDispatch(cmd, ds, groupCountX, groupCountY, groupCountZ, pushConstants);
+    }
+
+    private void ResetRecordingPools()
+    {
+        var vkd = _backend.Vkd;
+        foreach (var pool in _pools)
+            vkd.vkResetDescriptorPool(pool, 0).CheckResult();
+        _recordingSets.Clear();
+        _recordingIdx = 0;
     }
 
     /// <summary>
@@ -252,7 +335,9 @@ public sealed unsafe class ComputePipeline : IDisposable
         if (_disposed) return;
         _disposed = true;
         var vkd = _backend.Vkd;
-        vkd.vkDestroyDescriptorPool(_descriptorPool, null);
+        foreach (var pool in _pools)
+            vkd.vkDestroyDescriptorPool(pool, null);
+        vkd.vkDestroyDescriptorPool(_reusablePool, null);
         vkd.vkDestroyPipeline(_pipeline, null);
         vkd.vkDestroyPipelineLayout(_pipelineLayout, null);
         vkd.vkDestroyDescriptorSetLayout(_descriptorSetLayout, null);

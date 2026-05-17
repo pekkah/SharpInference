@@ -1304,7 +1304,15 @@ internal static class Shaders
     /// Bindings: 0=Q[num_heads*head_dim], 1=rotated_Q[num_heads*head_dim],
     ///           2=k_cache_tq[...], 3=v_cache_tq[...],
     ///           4=k_cache_fp16[...], 5=v_cache_fp16[...],
-    ///           6=output[num_heads*head_dim], 7=codebook[8].
+    ///           6=output[num_heads*head_dim], 7=codebook[8],
+    ///           8=scores_scratch[num_heads * max_seq_len]  (long-context spill).
+    ///
+    /// Score-storage strategy mirrors the CUDA kernel `llm_tq_attention`:
+    ///   • total_seq ≤ MAX_SHARED_SCORES (4096): hot path uses shared memory.
+    ///   • total_seq > 4096: spills to `scores_scratch[h*max_seq_len .. +total_seq)`.
+    /// The fast path does not touch the scratch buffer, but Vulkan descriptor sets
+    /// require it to be bound regardless — the caller passes a 1-float placeholder
+    /// when max_seq_len ≤ 4096.
     /// </summary>
     internal const string TqAttention = """
         #version 450
@@ -1312,14 +1320,15 @@ internal static class Shaders
 
         layout(local_size_x = 256) in;
 
-        layout(binding = 0) readonly buffer Q          { float q_data[]; };
-        layout(binding = 1) readonly buffer RotQ       { float rotated_q[]; };
-        layout(binding = 2) readonly buffer KCacheTQ   { uint k_cache_tq[]; };
-        layout(binding = 3) readonly buffer VCacheTQ   { uint v_cache_tq[]; };
-        layout(binding = 4) readonly buffer KCacheFP16 { float k_cache_fp16[]; };
-        layout(binding = 5) readonly buffer VCacheFP16 { float v_cache_fp16[]; };
-        layout(binding = 6) buffer Out                 { float out_data[]; };
-        layout(binding = 7) readonly buffer Codebook   { float codebook[8]; };
+        layout(binding = 0) readonly buffer Q             { float q_data[]; };
+        layout(binding = 1) readonly buffer RotQ          { float rotated_q[]; };
+        layout(binding = 2) readonly buffer KCacheTQ      { uint k_cache_tq[]; };
+        layout(binding = 3) readonly buffer VCacheTQ      { uint v_cache_tq[]; };
+        layout(binding = 4) readonly buffer KCacheFP16    { float k_cache_fp16[]; };
+        layout(binding = 5) readonly buffer VCacheFP16    { float v_cache_fp16[]; };
+        layout(binding = 6) buffer Out                    { float out_data[]; };
+        layout(binding = 7) readonly buffer Codebook      { float codebook[8]; };
+        layout(binding = 8) buffer ScoresScratch          { float scores_scratch[]; };
 
         layout(push_constant) uniform Params {
             uint num_heads;
@@ -1331,28 +1340,23 @@ internal static class Shaders
             uint block_bytes;
         };
 
-        shared float scores[4096];  // max seq_len for score storage
+        const uint MAX_SHARED_SCORES = 4096u;
+        shared float scores[MAX_SHARED_SCORES];
         shared float sdata[256];    // reduction scratch
 
-        // Unpack a 3-bit index from packed uint buffer at given position within a block
-        int unpack3(uint base_uint, uint elem_idx) {
-            // Bit position: skip 16 bits (FP16 norm) + elem_idx * 3
-            uint bit_pos = 16 + elem_idx * 3;
-            uint word_idx = base_uint + bit_pos / 32;
-            uint bit_off = bit_pos % 32;
-            uint raw = k_cache_tq[word_idx] >> bit_off;
-            if (bit_off > 29) raw |= k_cache_tq[word_idx + 1] << (32 - bit_off);
-            return int(raw & 0x7u);
-        }
-
-        float tq_dequant_dot_k(uint block_base_uint, float norm, uint kv_head) {
+        float tq_dequant_dot_k(uint block_base_uint, uint kv_head) {
             float dot = 0.0;
             uint q_off = gl_WorkGroupID.x * head_dim;
             for (uint d = 0; d < head_dim; d++) {
-                int idx = unpack3(block_base_uint, d);
+                uint bit_pos = 16u + d * 3u;
+                uint word_idx = block_base_uint + bit_pos / 32u;
+                uint bit_off = bit_pos & 31u;
+                uint raw = k_cache_tq[word_idx] >> bit_off;
+                if (bit_off > 29u) raw |= k_cache_tq[word_idx + 1u] << (32u - bit_off);
+                int idx = int(raw & 0x7u);
                 dot += codebook[idx] * rotated_q[q_off + d];
             }
-            return dot * norm;
+            return dot;
         }
 
         void main() {
@@ -1367,40 +1371,51 @@ internal static class Shaders
             uint out_off = h * head_dim;
             uint total_seq = tq_seq_len + fp16_seq_len;
 
-            // Phase 1a: TQ-compressed positions — tiles of 256
-            for (uint t_base = tid; t_base < tq_seq_len; t_base += 256) {
-                uint block_byte_off = t_base * num_kv_heads * block_bytes + kv_head * block_bytes;
-                uint block_base_uint = block_byte_off / 4;
+            bool use_shared = (total_seq <= MAX_SHARED_SCORES);
+            uint scratch_base = h * max_seq_len;
 
-                // Read FP16 norm from first 2 bytes
+            // ─── Phase 1a: per-position scores for TQ-compressed positions ───
+            for (uint t = tid; t < tq_seq_len; t += 256) {
+                uint block_byte_off = t * num_kv_heads * block_bytes + kv_head * block_bytes;
+                uint block_base_uint = block_byte_off / 4u;
+
+                // FP16 per-block norm packed in first 2 bytes of the block.
                 uint norm_word = k_cache_tq[block_base_uint];
-                vec2 norm_unpacked = unpackHalf2x16(norm_word);
-                float norm = norm_unpacked.x;
+                float norm = unpackHalf2x16(norm_word).x;
 
-                float dot = tq_dequant_dot_k(block_base_uint, norm, kv_head);
-                scores[t_base] = dot * scale;
+                float dot = tq_dequant_dot_k(block_base_uint, kv_head);
+                float score = dot * norm * scale;
+                if (use_shared) scores[t] = score;
+                else            scores_scratch[scratch_base + t] = score;
             }
 
-            // Phase 1b: FP16 positions (stored as float for now)
+            // ─── Phase 1b: FP16 recent-window positions ───
             for (uint t = tid; t < fp16_seq_len; t += 256) {
                 float dot = 0.0;
                 uint k_off = t * kv_dim + kv_head * head_dim;
                 for (uint d = 0; d < head_dim; d++)
                     dot += q_data[q_off + d] * k_cache_fp16[k_off + d];
-                scores[tq_seq_len + t] = dot * scale;
+                float score = dot * scale;
+                if (use_shared) scores[tq_seq_len + t] = score;
+                else            scores_scratch[scratch_base + tq_seq_len + t] = score;
             }
 
-            // Set unused scores to -inf
-            for (uint t = total_seq + tid; t < 4096; t += 256)
-                scores[t] = -1.0/0.0;
+            // Pad the shared tail with -inf so the max scan ignores stale slots.
+            // The scratch path's scans iterate only [0, total_seq), so no padding needed.
+            if (use_shared) {
+                for (uint t = total_seq + tid; t < MAX_SHARED_SCORES; t += 256)
+                    scores[t] = -1.0/0.0;
+            }
 
             barrier();
 
-            // Phase 2: softmax over all positions
-            // Find max
+            // ─── Phase 2: in-place softmax over [0, total_seq) ───
+            // Max.
             float local_max = -1.0/0.0;
-            for (uint t = tid; t < total_seq; t += 256)
-                local_max = max(local_max, scores[t]);
+            for (uint t = tid; t < total_seq; t += 256) {
+                float s = use_shared ? scores[t] : scores_scratch[scratch_base + t];
+                local_max = max(local_max, s);
+            }
             sdata[tid] = local_max;
             barrier();
             [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
@@ -1410,11 +1425,13 @@ internal static class Shaders
             float max_val = sdata[0];
             barrier();
 
-            // Exp + sum
+            // Exp + sum.
             float local_sum = 0.0;
             for (uint t = tid; t < total_seq; t += 256) {
-                float e = exp(scores[t] - max_val);
-                scores[t] = e;
+                float s = use_shared ? scores[t] : scores_scratch[scratch_base + t];
+                float e = exp(s - max_val);
+                if (use_shared) scores[t] = e;
+                else            scores_scratch[scratch_base + t] = e;
                 local_sum += e;
             }
             sdata[tid] = local_sum;
@@ -1423,43 +1440,46 @@ internal static class Shaders
                 if (tid < s) sdata[tid] += sdata[tid + s];
                 barrier();
             }
-            float sum_exp = sdata[0];
+            float inv_sum = 1.0 / sdata[0];
             barrier();
 
-            // Normalize weights
-            for (uint t = tid; t < total_seq; t += 256)
-                scores[t] /= sum_exp;
+            // Normalize → softmax weight per position.
+            for (uint t = tid; t < total_seq; t += 256) {
+                if (use_shared) scores[t] *= inv_sum;
+                else            scores_scratch[scratch_base + t] *= inv_sum;
+            }
             barrier();
 
-            // Phase 3: weighted value sum
+            // ─── Phase 3: weighted V sum into output[head, :] ───
             for (uint d = tid; d < head_dim; d += 256) {
                 float sum_val = 0.0;
 
-                // TQ-compressed values
+                // TQ-compressed positions.
                 for (uint t = 0; t < tq_seq_len; t++) {
-                    uint block_byte_off = t * num_kv_heads * block_bytes + kv_head * block_bytes;
-                    uint block_base_uint = block_byte_off / 4;
-                    uint norm_word = v_cache_tq[block_base_uint];
-                    vec2 norm_unpacked = unpackHalf2x16(norm_word);
-                    float norm = norm_unpacked.x;
+                    float weight = use_shared ? scores[t] : scores_scratch[scratch_base + t];
 
-                    // Unpack index for this dimension
-                    uint bit_pos = 16 + d * 3;
-                    uint word_idx = block_base_uint + bit_pos / 32;
-                    uint bit_off = bit_pos % 32;
+                    uint block_byte_off = t * num_kv_heads * block_bytes + kv_head * block_bytes;
+                    uint block_base_uint = block_byte_off / 4u;
+                    uint norm_word = v_cache_tq[block_base_uint];
+                    float norm = unpackHalf2x16(norm_word).x;
+
+                    uint bit_pos = 16u + d * 3u;
+                    uint word_idx = block_base_uint + bit_pos / 32u;
+                    uint bit_off = bit_pos & 31u;
                     uint raw = v_cache_tq[word_idx] >> bit_off;
-                    if (bit_off > 29) raw |= v_cache_tq[word_idx + 1] << (32 - bit_off);
+                    if (bit_off > 29u) raw |= v_cache_tq[word_idx + 1u] << (32u - bit_off);
                     int idx = int(raw & 0x7u);
 
-                    // Reconstructed value in rotated domain, but we need original domain
-                    // For values, we need full dequant (not fused), so this is approximate
-                    sum_val += scores[t] * codebook[idx] * norm;
+                    sum_val += weight * codebook[idx] * norm;
                 }
 
-                // FP16 values (stored as float)
+                // FP16 recent-window positions.
                 for (uint t = 0; t < fp16_seq_len; t++) {
+                    float weight = use_shared
+                        ? scores[tq_seq_len + t]
+                        : scores_scratch[scratch_base + tq_seq_len + t];
                     uint v_off = t * kv_dim + kv_head * head_dim;
-                    sum_val += scores[tq_seq_len + t] * v_cache_fp16[v_off + d];
+                    sum_val += weight * v_cache_fp16[v_off + d];
                 }
 
                 out_data[out_off + d] = sum_val;

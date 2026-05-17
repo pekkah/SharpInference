@@ -611,15 +611,7 @@ public sealed unsafe class VulkanShaderTests
             model, gpu, hp, placement, enableTq: true, tqFp32Window: 2);
 
         var prompt = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n";
-        var tokens = tokenizer.Encode(prompt);
-
-        ReadOnlySpan<float> logits = default;
-        for (int i = 0; i < tokens.Count; i++)
-            logits = hybridFwd.Forward(tokens[i], i);
-
-        Assert.Equal(hp.VocabSize, logits.Length);
-        for (int i = 0; i < logits.Length; i++)
-            Assert.True(float.IsFinite(logits[i]), $"Non-finite logit at [{i}]: {logits[i]}");
+        AssertHybridForwardPassProducesCoherentDecode(hybridFwd, tokenizer, prompt, hp.VocabSize);
     }
 
     /// <summary>
@@ -732,6 +724,13 @@ public sealed unsafe class VulkanShaderTests
             "models\\Meta-Llama-3.1-70B-Instruct-Q4_K_M.gguf");
     }
 
+    private static string? FindMoEModelPath()
+    {
+        return FindModelPath(
+            "models\\Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+            "models\\Llama-4-Scout-17B-16E-Instruct-Q2_K.gguf");
+    }
+
     private static string? FindModelPath(params string[] candidates)
     {
         var dir = Directory.GetCurrentDirectory();
@@ -748,5 +747,243 @@ public sealed unsafe class VulkanShaderTests
             dir = parent.FullName;
         }
         return null;
+    }
+
+    /// <summary>
+    /// Regression test for issue #2 (MoE+hybrid produced NaN/garbled output) and the
+    /// underlying descriptor-set reuse hazard in <c>ComputePipeline.RecordWith</c>.
+    ///
+    /// <c>GpuMoeFfn</c> dispatches the same MatVec pipeline 3× per active expert per
+    /// layer (gate, up, down) with different weight buffers each time. Before the fix
+    /// these all shared one <c>_reusableDs</c>; at GPU execution time every dispatch
+    /// read whichever weight buffer was bound last, producing wrong activations that
+    /// cascaded into NaN logits within a few tokens. With per-dispatch DS allocation
+    /// each MatVec call has its own descriptor set and the activations stay finite.
+    ///
+    /// Silently no-ops when the MoE GGUF isn't present locally — matches the rest of
+    /// the model-dependent tests in this file.
+    /// </summary>
+    [Fact]
+    public void HybridForwardPass_MoE_ProducesCoherentDecode()
+    {
+        var path = FindMoEModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        if (!hp.IsMoE || hp.NumLayers < 2) return;
+
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var gpu = new Vulkan.VulkanBackend();
+        var placement = new SharpInference.Engine.LayerPlacement(
+            GpuLayers: 1,
+            CpuLayers: hp.NumLayers - 1,
+            GpuWeightBytes: 0,
+            GpuKvBytes: 0,
+            RecommendedCtxSize: 64);
+        using var hybridFwd = new SharpInference.Engine.HybridForwardPass(
+            model, gpu, hp, placement, enableTq: false);
+
+        AssertHybridForwardPassProducesCoherentDecode(hybridFwd, tokenizer, prompt: "Hello", hp.VocabSize);
+    }
+
+    /// <summary>
+    /// Decode coherence helper used by the hybrid forward-pass smoke tests.
+    /// Checks three things, layered from weakest to strongest:
+    ///
+    ///   1. Every logit is finite (catches NaN cascades from MoE expert MatMul wiring etc.)
+    ///   2. argmax(logits) immediately after the prompt is NOT EOS — the test that catches
+    ///      "zero logits → sampler picks token 0 → 0 decode tokens" failures, which all
+    ///      pass an <c>IsFinite</c>-only check.
+    ///   3. A short greedy decode produces some token that's neither EOS nor a repeat
+    ///      of the immediately-prior token. Catches degenerate "emit the same token
+    ///      forever" outputs from subtler corruption like KV-cache aliasing.
+    ///
+    /// Silently no-ops when the test model file isn't present locally.
+    /// </summary>
+    private static void AssertHybridForwardPassProducesCoherentDecode(
+        SharpInference.Engine.HybridForwardPass hybridFwd,
+        GgufTokenizer tokenizer,
+        string prompt,
+        int vocabSize)
+    {
+        var tokens = tokenizer.Encode(prompt);
+
+        ReadOnlySpan<float> logits = default;
+        for (int i = 0; i < tokens.Count; i++)
+            logits = hybridFwd.Forward(tokens[i], i);
+
+        Assert.Equal(vocabSize, logits.Length);
+
+        // (1) All logits finite.
+        int nonFinite = 0;
+        for (int i = 0; i < logits.Length; i++)
+            if (!float.IsFinite(logits[i])) nonFinite++;
+        Assert.True(nonFinite == 0, $"{nonFinite} non-finite logits in post-prompt output.");
+
+        // (2) argmax != EOS at first decode step.
+        int firstDecodeToken = Argmax(logits);
+        Assert.NotEqual(tokenizer.EosTokenId, firstDecodeToken);
+
+        // (3) A 4-token greedy decode produces variety. With finite-but-zero logits
+        //     argmax is deterministic (token 0) and this loop would emit "EOS, EOS, EOS, EOS"
+        //     — caught here as "all generated tokens are EOS".
+        Span<int> decoded = stackalloc int[4];
+        decoded[0] = firstDecodeToken;
+        int pos = tokens.Count;
+        for (int i = 1; i < decoded.Length; i++)
+        {
+            var step = hybridFwd.Forward(decoded[i - 1], pos++);
+            decoded[i] = Argmax(step);
+        }
+
+        int eosCount = 0;
+        for (int i = 0; i < decoded.Length; i++)
+            if (decoded[i] == tokenizer.EosTokenId) eosCount++;
+        Assert.True(eosCount < decoded.Length,
+            $"All {decoded.Length} greedy-decoded tokens were EOS — output is degenerate.");
+    }
+
+    private static int Argmax(ReadOnlySpan<float> logits)
+    {
+        int best = 0;
+        float bestVal = logits[0];
+        for (int i = 1; i < logits.Length; i++)
+            if (logits[i] > bestVal) { bestVal = logits[i]; best = i; }
+        return best;
+    }
+
+    /// <summary>
+    /// Vulkan twin of <c>CudaTurboQuantTests.TqAttention_RecomputePath_MatchesFastPath</c>.
+    /// Drives the TQ-attention shader at TqLen=4096 (fits in shared memory) and TqLen=4097
+    /// (forces the global-scratch spill path), with the first 4096 K/V identical across both
+    /// runs and a zero V at position 4096. Because that zero-V position contributes nothing
+    /// to any output dimension regardless of its softmax weight, the slow path differs from
+    /// the fast path by exactly the global softmax-rescale factor sum_fast / sum_slow. Recover
+    /// that ratio from the largest fast-path dim, then check every dim agrees under it.
+    ///
+    /// Guards against the silent OOB regression where the shader's <c>shared float scores[4096]</c>
+    /// gets written past its cap when <c>tq_seq_len + fp16_seq_len &gt; 4096</c>.
+    /// </summary>
+    [Fact]
+    public void TqAttention_LongContextScratchPath_MatchesFastPath()
+    {
+        using var gpu = new Vulkan.VulkanBackend();
+
+        const int HeadDim = 128;
+        const int NumHeads = 1;
+        const int NumKvHeads = 1;
+        const int FastLen = 4096;   // exactly at the cap → shared-memory fast path
+        const int SlowLen = 4097;   // one over → global-scratch spill path
+        int blockBytes = TurboQuantOps.BlockSize(bits: 3, HeadDim);
+        long tqBytesPerPos = (long)NumKvHeads * blockBytes;
+        long fastUints = ((long)FastLen * tqBytesPerPos + 3) / 4;
+        long slowUints = ((long)SlowLen * tqBytesPerPos + 3) / 4;
+
+        var rng = new Random(13371337);
+        var queryDir = RandomUnit(rng, HeadDim);
+
+        var kVecs = new float[SlowLen][];
+        var vVecs = new float[SlowLen][];
+        for (int p = 0; p < FastLen; p++)
+        {
+            kVecs[p] = RandomUnit(rng, HeadDim);
+            vVecs[p] = RandomUnit(rng, HeadDim);
+        }
+        kVecs[FastLen] = RandomUnit(rng, HeadDim);
+        vVecs[FastLen] = new float[HeadDim];   // zero V — doesn't perturb output dims
+
+        var compressor = new KvCacheCompressor(bits: 3, HeadDim, layerIndex: 0);
+        var signPatterns = compressor.SignPattern.ToArray();
+        var centroids    = TurboQuantCodebooks.GetCentroids(bits: 3, HeadDim).ToArray();
+        var boundaries   = TurboQuantCodebooks.GetBoundaries(bits: 3, HeadDim).ToArray();
+
+        var gpuSigns      = gpu.Upload(signPatterns, TensorShape.D1(signPatterns.Length));
+        var gpuCodebook   = gpu.Upload(centroids,    TensorShape.D1(centroids.Length));
+        var gpuBoundaries = gpu.Upload(boundaries,   TensorShape.D1(boundaries.Length));
+
+        float[] outFast = RunTqAttentionPath(gpu, NumHeads, NumKvHeads, HeadDim, FastLen, fastUints,
+            kVecs, vVecs, queryDir, blockBytes, gpuSigns, gpuCodebook, gpuBoundaries);
+        float[] outSlow = RunTqAttentionPath(gpu, NumHeads, NumKvHeads, HeadDim, SlowLen, slowUints,
+            kVecs, vVecs, queryDir, blockBytes, gpuSigns, gpuCodebook, gpuBoundaries);
+
+        int probeDim = 0;
+        float bestAbs = MathF.Abs(outFast[probeDim]);
+        for (int d = 1; d < HeadDim; d++)
+            if (MathF.Abs(outFast[d]) > bestAbs) { bestAbs = MathF.Abs(outFast[d]); probeDim = d; }
+        Assert.True(bestAbs > 1e-4f, "Fast-path output is degenerate (all near zero); test inputs are pathological.");
+
+        float ratio = outSlow[probeDim] / outFast[probeDim];
+        for (int d = 0; d < HeadDim; d++)
+        {
+            float expected = outFast[d] * ratio;
+            float diff = MathF.Abs(outSlow[d] - expected);
+            float tol = MathF.Max(1e-3f, MathF.Abs(expected) * 1e-2f);
+            Assert.True(diff < tol,
+                $"Scratch path mismatch at dim {d}: slow={outSlow[d]:E3} expected={expected:E3} " +
+                $"(fast={outFast[d]:E3}, ratio={ratio:F4}, tol={tol:E3}). " +
+                $"The two paths must agree under a single global softmax-rescale factor.");
+        }
+
+        gpu.Free(gpuSigns); gpu.Free(gpuCodebook); gpu.Free(gpuBoundaries);
+    }
+
+    private static float[] RunTqAttentionPath(Vulkan.VulkanBackend gpu,
+        int numHeads, int numKvHeads, int headDim, int tqLen, long totalUints,
+        float[][] kVecs, float[][] vVecs, float[] queryDir, int blockBytes,
+        Tensor gpuSigns, Tensor gpuCodebook, Tensor gpuBoundaries)
+    {
+        var gpuKCacheTq = gpu.Allocate(TensorShape.D1(totalUints));
+        var gpuVCacheTq = gpu.Allocate(TensorShape.D1(totalUints));
+
+        for (int p = 0; p < tqLen; p++)
+        {
+            var gpuKIn = gpu.Upload(kVecs[p], TensorShape.D1(kVecs[p].Length));
+            var gpuVIn = gpu.Upload(vVecs[p], TensorShape.D1(vVecs[p].Length));
+            gpu.TqKvAppend(gpuKIn, gpuVIn, gpuKCacheTq, gpuVCacheTq,
+                gpuSigns, gpuCodebook, gpuBoundaries,
+                (uint)(numKvHeads * headDim), (uint)headDim, (uint)p, (uint)tqLen,
+                (uint)numKvHeads, (uint)blockBytes);
+            gpu.Free(gpuKIn); gpu.Free(gpuVIn);
+        }
+
+        var gpuQ = gpu.Upload(queryDir, TensorShape.D1(queryDir.Length));
+        var gpuRotated = gpu.Allocate(TensorShape.D1(queryDir.Length));
+        gpu.TqRotateQuery(gpuQ, gpuRotated, gpuSigns, (uint)numHeads, (uint)numKvHeads, (uint)headDim);
+
+        var gpuKCacheFp16 = gpu.Allocate(TensorShape.D1(numKvHeads * headDim));
+        var gpuVCacheFp16 = gpu.Allocate(TensorShape.D1(numKvHeads * headDim));
+        var gpuOut = gpu.Allocate(TensorShape.D1(numHeads * headDim));
+
+        // Allocate the long-context scratch unconditionally so both paths exercise the
+        // same kernel; the shader ignores it on the fast path (total_seq ≤ 4096).
+        var scratch = gpu.Allocate(TensorShape.D1((long)numHeads * tqLen));
+
+        gpu.TqAttention(gpuQ, gpuRotated, gpuKCacheTq, gpuVCacheTq,
+            gpuKCacheFp16, gpuVCacheFp16, gpuOut, gpuCodebook,
+            scratch,
+            (uint)numHeads, (uint)numKvHeads, (uint)headDim,
+            (uint)tqLen, fp16SeqLen: 0u, (uint)tqLen, (uint)blockBytes);
+
+        var output = new float[numHeads * headDim];
+        gpu.Download(gpuOut, output);
+
+        gpu.Free(gpuQ); gpu.Free(gpuRotated);
+        gpu.Free(gpuKCacheTq); gpu.Free(gpuVCacheTq);
+        gpu.Free(gpuKCacheFp16); gpu.Free(gpuVCacheFp16);
+        gpu.Free(gpuOut); gpu.Free(scratch);
+
+        return output;
+    }
+
+    private static float[] RandomUnit(Random rng, int dim)
+    {
+        var v = new float[dim];
+        for (int i = 0; i < dim; i++) v[i] = (float)(rng.NextDouble() * 2 - 1);
+        float mag = 0f;
+        for (int i = 0; i < dim; i++) mag += v[i] * v[i];
+        mag = MathF.Sqrt(mag);
+        if (mag > 0f) for (int i = 0; i < dim; i++) v[i] /= mag;
+        return v;
     }
 }

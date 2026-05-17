@@ -57,12 +57,23 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private bool _deferringFrees;
     private readonly List<Tensor> _deferredFrees = [];
 
+    private long _recordingEpoch;
+
+    /// <summary>
+    /// Monotonically-increasing counter incremented on every <see cref="BeginRecord"/>.
+    /// <see cref="ComputePipeline.RecordWith"/> reads this to recycle its per-recording
+    /// descriptor sets when a new session starts — see the comment on RecordWith for why
+    /// per-dispatch descriptor sets are required for correctness.
+    /// </summary>
+    public long RecordingEpoch => _recordingEpoch;
+
     /// <summary>Begin recording a batch of compute dispatches.</summary>
     public void BeginRecord()
     {
         VkCommandBufferBeginInfo begin = new() { flags = VkCommandBufferUsageFlags.OneTimeSubmit };
         _vkd.vkBeginCommandBuffer(_transferCmd, &begin).CheckResult();
         _recording = true;
+        _recordingEpoch++;
     }
 
     /// <summary>Insert a compute→compute memory barrier (all writes visible to reads).</summary>
@@ -1234,12 +1245,21 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             numKvHeads, &p);
     }
 
+    /// <summary>
+    /// Hybrid TQ + FP16 attention. <paramref name="scoresScratch"/> is a VRAM
+    /// buffer the kernel spills per-position softmax scores into when
+    /// <c>tqSeqLen + fp16SeqLen &gt; 4096</c>; the fast path uses shared memory
+    /// instead. Vulkan descriptors require a bound buffer regardless of which
+    /// path runs, so callers pass a 1-float placeholder when the whole context
+    /// is guaranteed to fit in shared memory.
+    /// </summary>
     public void TqAttention(Tensor q, Tensor rotatedQ, Tensor kCacheTq, Tensor vCacheTq,
         Tensor kCacheFp16, Tensor vCacheFp16, Tensor output, Tensor codebook,
+        Tensor scoresScratch,
         uint numHeads, uint numKvHeads, uint headDim,
         uint tqSeqLen, uint fp16SeqLen, uint maxSeqLen, uint blockBytes)
     {
-        _tqAttentionPipeline ??= new ComputePipeline(this, Shaders.TqAttention, 8, pushConstantSize: sizeof(TqAttentionParams));
+        _tqAttentionPipeline ??= new ComputePipeline(this, Shaders.TqAttention, 9, pushConstantSize: sizeof(TqAttentionParams));
         var p = new TqAttentionParams
         {
             numHeads = numHeads, numKvHeads = numKvHeads, headDim = headDim,
@@ -1247,7 +1267,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         };
         DispatchOrRecord(_tqAttentionPipeline,
             [GetBuffer(q), GetBuffer(rotatedQ), GetBuffer(kCacheTq), GetBuffer(vCacheTq),
-             GetBuffer(kCacheFp16), GetBuffer(vCacheFp16), GetBuffer(output), GetBuffer(codebook)],
+             GetBuffer(kCacheFp16), GetBuffer(vCacheFp16), GetBuffer(output), GetBuffer(codebook),
+             GetBuffer(scoresScratch)],
             numHeads, &p);
     }
 

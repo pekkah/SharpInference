@@ -42,6 +42,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
     private readonly Tensor[] _gpuKCache, _gpuVCache;
     private readonly Tensor[]? _gpuTqKCache, _gpuTqVCache, _gpuSignPatterns;
     private readonly Tensor? _gpuCodebook, _gpuBoundaries, _gpuRotatedQ, _gpuEvictK, _gpuEvictV;
+    private readonly Tensor? _gpuTqScoresScratch;  // [numHeads * maxSeqLen] long-context softmax-score spill
     private readonly Dictionary<nint, DType> _gpuWeightDTypes = new();
 
     // ── CPU resources (layers nGpuLayers..numLayers-1) ──
@@ -232,6 +233,12 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             _gpuRotatedQ = gpu.Allocate(TensorShape.D1(_numHeads * _headDim));
             _gpuEvictK = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
             _gpuEvictV = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
+
+            // Vulkan TQ attention spills softmax scores to VRAM when total_seq > 4096;
+            // a 1-float placeholder is enough for shorter contexts but the descriptor
+            // must always be bound. See VulkanBackend.TqAttention.
+            long scratchElems = _maxSeqLen > 4096 ? (long)_numHeads * _maxSeqLen : 1L;
+            _gpuTqScoresScratch = gpu.Allocate(TensorShape.D1(scratchElems));
         }
 
         Console.Error.Write($"[HybridForwardPass] Uploading {_nGpuLayers} GPU layers...");
@@ -673,6 +680,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             uint fp32SeqLen = (uint)Math.Min(_gpuFp32Count + 1, _tqFp32Window);
             _gpu.TqAttention(_gpuQ, _gpuRotatedQ!, _gpuTqKCache![i], _gpuTqVCache![i],
                 _gpuKCache[i], _gpuVCache[i], _gpuAttnOut, _gpuCodebook!,
+                _gpuTqScoresScratch!,
                 (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
                 (uint)_gpuTqCompressedLen, fp32SeqLen, (uint)_maxSeqLen, (uint)_tqBlockBytes);
         }
@@ -1158,10 +1166,17 @@ public sealed unsafe class HybridForwardPass : IForwardPass
     private static bool ShouldKeepFixedWeightsOnCpu(GgufTensorInfo embedding, GgufTensorInfo? output)
     {
         // Always keep embedding+output on CPU for the hybrid path. The GPU embedding-lookup
-        // shader produces garbage when invoked inside HybridForwardPass (root cause unclear —
-        // identical shader works in GpuForwardPass), and the embedding is one-row-per-token
-        // which is negligible vs. the layer compute, so the perf cost is near zero.
-        // TODO: investigate why EmbedLookupQ4K writes wrong values in hybrid context.
+        // shader produces garbage when invoked inside HybridForwardPass — verified by CLI
+        // smoke tests after the ComputePipeline.RecordWith descriptor-set reuse fix landed:
+        // CPU and all-GPU give "Paris.", hybrid -g 1 with this returning false gives 0
+        // decode tokens (model emits EOS immediately). The same fix DID resolve the MoE
+        // expert-loop NaN cascade (issue #2), so the DS hazard was real, but issue #3 has
+        // a separate root cause that we couldn't localize without RenderDoc-level
+        // instrumentation. The CPU-side dequant of one embedding row per token costs ~µs
+        // vs. millisecond-scale layer compute, so the perf hit is negligible.
+        // TODO: investigate why EmbedLookupQ4K (and/or the final Phase-5 GPU norm+output)
+        // produces wrong values when invoked from HybridForwardPass even though identical
+        // shaders work in GpuForwardPass.
         return true;
     }
 
@@ -1569,6 +1584,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             _gpu.Free(_gpuRotatedQ!);
             _gpu.Free(_gpuEvictK!);
             _gpu.Free(_gpuEvictV!);
+            _gpu.Free(_gpuTqScoresScratch!);
         }
         if (_gpuOutputNorm is not null)
             _gpu.Free(_gpuOutputNorm);

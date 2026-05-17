@@ -99,6 +99,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     private Tensor? _rotatedQ;         // [numHeads * headDim] WHT-rotated query
     private Tensor? _evictK;           // [numKvHeads * headDim] scratch for evicted FP32 entry
     private Tensor? _evictV;
+    private Tensor? _tqScoresScratch;  // [numHeads * maxSeqLen] long-context softmax-score spill
     private Tensor? _routerLogits;
     private Tensor? _moeSharedOut;
     private Tensor? _moeExpertOut;
@@ -206,6 +207,13 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             _rotatedQ = gpu.Allocate(TensorShape.D1(_numHeads * _headDim));
             _evictK = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
             _evictV = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
+
+            // The TQ-attention shader uses shared memory for up to 4096 stored scores
+            // and spills to this scratch beyond that. Allocate the full long-context
+            // slot when needed; otherwise allocate a 1-float placeholder since Vulkan
+            // descriptor sets still require a bound buffer for the fast path.
+            long scratchElems = _maxSeqLen > 4096 ? (long)_numHeads * _maxSeqLen : 1L;
+            _tqScoresScratch = gpu.Allocate(TensorShape.D1(scratchElems));
         }
         else
         {
@@ -444,6 +452,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                 uint fp32SeqLen = (uint)Math.Min(_fp32Count + 1, _tqFp32Window);
                 _gpu.TqAttention(_q, _rotatedQ!, _gpuTqKCache![layer], _gpuTqVCache![layer],
                     _gpuKCache[layer], _gpuVCache[layer], _attnOut, _gpuCodebook!,
+                    _tqScoresScratch!,
                     (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
                     (uint)_tqCompressedLen, fp32SeqLen, (uint)_maxSeqLen, (uint)_tqBlockBytes);
             }
@@ -945,6 +954,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             _gpu.Free(_rotatedQ!);
             _gpu.Free(_evictK!);
             _gpu.Free(_evictV!);
+            _gpu.Free(_tqScoresScratch!);
         }
 
         _kvCache.Dispose();

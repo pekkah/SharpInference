@@ -173,27 +173,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         int nGpuLayers = settings.NGpuLayers;
 
-        // MoE models are not yet supported on the hybrid GPU+CPU path. The GpuMoeFfn path
-        // produces NaN/degenerate output (see https://github.com/pekkah/SharpInference/issues/2).
-        // Fall back to CPU automatically when -g is -1 (auto), refuse explicit -g N for MoE.
-        // SHARPI_ALLOW_BROKEN_MOE_HYBRID=1 bypasses the guard for debugging issue #2.
-        bool allowBrokenMoeHybrid = Environment.GetEnvironmentVariable("SHARPI_ALLOW_BROKEN_MOE_HYBRID") == "1";
-        if (hp.IsMoE && nGpuLayers != 0 && !allowBrokenMoeHybrid)
-        {
-            if (nGpuLayers > 0)
-            {
-                AnsiConsole.MarkupLine($"[red]Error:[/] MoE models (this one is [yellow]{s_arch}[/]) are not yet supported on the hybrid GPU+CPU path; output is degenerate. Tracking issue: https://github.com/pekkah/SharpInference/issues/2");
-                AnsiConsole.MarkupLine("Re-run without [yellow]-g[/] (or [yellow]-g 0[/]) to use the working CPU path. [yellow]--tq[/] is supported on CPU.");
-                return 1;
-            }
-            // -g -1 (auto) → silently fall back to CPU
-            AnsiConsole.MarkupLine("[yellow]Note:[/] [yellow]-g -1[/] requested, but MoE models run only on CPU until issue #2 is fixed. Falling back to CPU.");
-            nGpuLayers = 0;
-        }
-        if (hp.IsMoE && nGpuLayers != 0 && allowBrokenMoeHybrid)
-        {
-            AnsiConsole.MarkupLine("[red]Warning:[/] SHARPI_ALLOW_BROKEN_MOE_HYBRID=1 set; running MoE on hybrid path despite known NaN/garbled output (issue #2 debug mode).");
-        }
+        // Issue #2 (MoE on hybrid GPU+CPU produced NaN/garbled output) was resolved by
+        // fixing the descriptor-set reuse hazard in ComputePipeline.RecordWith.
+        // The MoE+hybrid path is now exercised by
+        // SharpInference.Tests.ForwardPass.VulkanShaderTests.HybridForwardPass_MoE_ProducesFiniteLogits.
 
         // Resolve which GPU backend to use when -g is non-zero. CUDA is preferred only
         // when the user explicitly opted in (--backend cuda) or auto-detection finds it
