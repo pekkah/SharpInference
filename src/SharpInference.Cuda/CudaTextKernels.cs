@@ -653,6 +653,373 @@ extern ""C"" __global__ void llm_matvec_q6k(
     if (lane == 0) output[row] = result;
 }
 
+// ── TurboQuant rotate_query ────────────────────────────────────────────────
+// Applies the Walsh-Hadamard transform + per-layer sign flip to each query
+// head. One block per query head, head_dim threads per block.
+//
+// head_dim must be a power of two ≤ 256 (the WHT butterfly uses head_dim/2
+// active threads per stage and `shared float sdata[256]` storage).
+extern ""C"" __global__ void llm_tq_rotate_query(
+    const float* __restrict__ q_input,
+    float* __restrict__ rotated_q,
+    const float* __restrict__ sign_patterns,
+    int num_heads, int num_kv_heads, int head_dim)
+{
+    __shared__ float sdata[256];
+
+    int h = (int)blockIdx.x;
+    int tid = (int)threadIdx.x;
+    if (h >= num_heads || tid >= head_dim) return;
+
+    int kv_head = h / (num_heads / num_kv_heads);
+    int q_off = h * head_dim;
+    int sign_off = kv_head * head_dim;
+
+    sdata[tid] = q_input[q_off + tid];
+    __syncthreads();
+
+    // WHT butterfly: dim/2 active threads per stage.
+    for (int s = head_dim >> 1; s >= 1; s >>= 1) {
+        if (tid < (head_dim >> 1)) {
+            int pos_lo = (tid / s) * (s << 1) + (tid % s);
+            int pos_hi = pos_lo + s;
+            float a = sdata[pos_lo];
+            float b = sdata[pos_hi];
+            sdata[pos_lo] = a + b;
+            sdata[pos_hi] = a - b;
+        }
+        __syncthreads();
+    }
+
+    float scale = rsqrtf((float)head_dim);
+    rotated_q[q_off + tid] = sdata[tid] * scale * sign_patterns[sign_off + tid];
+}
+
+// ── TurboQuant KV append ───────────────────────────────────────────────────
+// Compresses one K and one V vector for a single token-position into the
+// per-layer TQ caches. One block per KV head, head_dim threads per block.
+//
+// Block layout (3-bit, head_dim=128): 2-byte FP16 norm + 48 bytes packed
+// indices + 2 bytes padding = 52 bytes, stored as 13 uint32 words. The output
+// buffers are typed as uint[] (matches the Vulkan binding); the host computes
+// the byte offset as `position * num_kv_heads * block_bytes + kv_head *
+// block_bytes`, and this kernel divides by 4 to address the uint[] view.
+extern ""C"" __global__ void llm_tq_kv_append(
+    const float* __restrict__ k_input,
+    const float* __restrict__ v_input,
+    unsigned int* __restrict__ k_cache_tq,
+    unsigned int* __restrict__ v_cache_tq,
+    const float* __restrict__ sign_patterns,
+    const float* __restrict__ codebook,    // unused inside the kernel; kept for binding-layout parity with Vulkan
+    const float* __restrict__ boundaries,  // 7 boundaries for 3-bit quantization
+    int kv_dim, int head_dim, int position,
+    int max_seq_len, int num_kv_heads, int block_bytes)
+{
+    __shared__ float sdata[256];
+    __shared__ int   sidx[256];
+    __shared__ float warp_sums[8];
+    __shared__ float snorm;
+
+    int kv_head = (int)blockIdx.x;
+    int tid = (int)threadIdx.x;
+    if (kv_head >= num_kv_heads || tid >= head_dim) return;
+
+    int head_offset = kv_head * head_dim;
+    long byte_offset = (long)position * (long)num_kv_heads * (long)block_bytes
+                     + (long)kv_head * (long)block_bytes;
+    long base_uint = byte_offset >> 2;
+    int half_dim = head_dim >> 1;
+
+    float bnd0 = boundaries[0];
+    float bnd1 = boundaries[1];
+    float bnd2 = boundaries[2];
+    float bnd3 = boundaries[3];
+    float bnd4 = boundaries[4];
+    float bnd5 = boundaries[5];
+    float bnd6 = boundaries[6];
+
+    // Process K then V using the same shared-memory scratch.
+    for (int iter = 0; iter < 2; iter++) {
+        const float* input_buf = (iter == 0) ? k_input : v_input;
+        unsigned int* cache_buf = (iter == 0) ? k_cache_tq : v_cache_tq;
+
+        sdata[tid] = input_buf[head_offset + tid];
+        __syncthreads();
+
+        // In-place WHT butterfly.
+        for (int s = half_dim; s >= 1; s >>= 1) {
+            if (tid < half_dim) {
+                int pos_lo = (tid / s) * (s << 1) + (tid % s);
+                int pos_hi = pos_lo + s;
+                float a = sdata[pos_lo];
+                float b = sdata[pos_hi];
+                sdata[pos_lo] = a + b;
+                sdata[pos_hi] = a - b;
+            }
+            __syncthreads();
+        }
+
+        // Normalize (1/sqrt(dim)) and apply per-head sign flip.
+        float scale = rsqrtf((float)head_dim);
+        float v = sdata[tid] * scale * sign_patterns[head_offset + tid];
+        sdata[tid] = v;
+
+        // Parallel L2 norm reduction (squared sum), warp then inter-warp.
+        float sq = v * v;
+        sq += __shfl_xor_sync(0xffffffffu, sq, 16);
+        sq += __shfl_xor_sync(0xffffffffu, sq,  8);
+        sq += __shfl_xor_sync(0xffffffffu, sq,  4);
+        sq += __shfl_xor_sync(0xffffffffu, sq,  2);
+        sq += __shfl_xor_sync(0xffffffffu, sq,  1);
+
+        int warp_id = tid >> 5;
+        int lane    = tid & 31;
+        if (lane == 0) warp_sums[warp_id] = sq;
+        __syncthreads();
+
+        if (tid == 0) {
+            int n_warps = head_dim >> 5;
+            float total = 0.f;
+            for (int w = 0; w < n_warps; w++) total += warp_sums[w];
+            snorm = sqrtf(total);
+        }
+        __syncthreads();
+
+        float norm = snorm;
+        float inv_norm = (norm > 0.0f) ? (1.0f / norm) : 0.0f;
+        float normalized = v * inv_norm;
+
+        // 7 boundaries → 8 bins.
+        int bin = 0;
+        if (normalized >= bnd0) bin = 1;
+        if (normalized >= bnd1) bin = 2;
+        if (normalized >= bnd2) bin = 3;
+        if (normalized >= bnd3) bin = 4;
+        if (normalized >= bnd4) bin = 5;
+        if (normalized >= bnd5) bin = 6;
+        if (normalized >= bnd6) bin = 7;
+        sidx[tid] = bin;
+        __syncthreads();
+
+        // Thread 0 packs FP16 norm + head_dim × 3-bit indices into block_bytes.
+        // For head_dim=128 the block fits in 13 uint32 words (52 bytes).
+        if (tid == 0) {
+            unsigned int num_uints = (unsigned int)((block_bytes + 3) >> 2);
+            unsigned int packed[20];
+            for (unsigned int w = 0; w < num_uints; w++) packed[w] = 0;
+
+            unsigned int norm_bits = sharpi_fp32_to_fp16(norm) & 0xFFFFu;
+            packed[0] = norm_bits;   // bytes 0..1 of the block
+
+            unsigned int bit_pos = 16;   // skip the 2-byte FP16 norm
+            for (int i = 0; i < head_dim; i++) {
+                unsigned int index3 = ((unsigned int)sidx[i]) & 0x7u;
+                unsigned int word_idx = bit_pos >> 5;
+                unsigned int bit_off  = bit_pos & 31u;
+                packed[word_idx] |= (index3 << bit_off);
+                if (bit_off > 29u) {
+                    packed[word_idx + 1u] |= (index3 >> (32u - bit_off));
+                }
+                bit_pos += 3;
+            }
+
+            for (unsigned int w = 0; w < num_uints; w++)
+                cache_buf[base_uint + (long)w] = packed[w];
+        }
+        __syncthreads();
+    }
+}
+
+// ── TurboQuant attention (hybrid TQ + FP32) ───────────────────────────────
+// One workgroup per query head, 256 threads. Computes scaled dot-product
+// attention across the TQ-compressed history plus the FP32 ring-buffer window.
+//
+// Score storage strategy:
+//   • Fast path  (total_seq ≤ MAX_SHARED_SCORES = 4096): use __shared__ scores[].
+//     Hot data stays in shared memory; per-position K is dequantized once.
+//   • Slow path  (total_seq > 4096): use a caller-provided global VRAM scratch
+//     buffer `scores_scratch[h * max_seq_len .. h*max_seq_len + total_seq)`.
+//     Same single-decompress-per-position semantics — global scores reads after
+//     phase 1 land in L1, so the perf hit relative to shared mem is small.
+//     A previous design tried a triple-pass recompute (re-derive K dot for every
+//     output dim) which gave O(N²·head_dim) per token and was hours slow at 8K;
+//     never again.
+//
+// scores_scratch may be a null pointer when the caller knows total_seq ≤
+// MAX_SHARED_SCORES — the fast path won't touch it.
+extern ""C"" __global__ void llm_tq_attention(
+    const float* __restrict__ q,
+    const float* __restrict__ rotated_q,
+    const unsigned int* __restrict__ k_cache_tq,
+    const unsigned int* __restrict__ v_cache_tq,
+    const float* __restrict__ k_cache_fp32,
+    const float* __restrict__ v_cache_fp32,
+    float* __restrict__ out,
+    const float* __restrict__ codebook,    // 8 centroids for 3-bit
+    float* __restrict__ scores_scratch,    // [num_heads * max_seq_len], null when total_seq ≤ MAX_SHARED_SCORES
+    int num_heads, int num_kv_heads, int head_dim,
+    int tq_seq_len, int fp32_seq_len, int max_seq_len, int block_bytes)
+{
+    const int MAX_SHARED_SCORES = 4096;
+    __shared__ float shared_scores[MAX_SHARED_SCORES];
+    __shared__ float sdata[256];
+    __shared__ float cbook[8];
+
+    int h = (int)blockIdx.x;
+    int tid = (int)threadIdx.x;
+    if (h >= num_heads) return;
+
+    if (tid < 8) cbook[tid] = codebook[tid];
+
+    int kv_head = h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = rsqrtf((float)head_dim);
+    long q_off  = (long)h * (long)head_dim;
+    long rq_off = q_off;
+    long out_off = q_off;
+    int total_seq = tq_seq_len + fp32_seq_len;
+
+    long block_uints      = (long)block_bytes >> 2;
+    long row_stride_uints = (long)num_kv_heads * block_uints;
+    long head_uint_offset = (long)kv_head * block_uints;
+
+    // scores points at the right storage for this block. `head_scratch` is the
+    // global slot for this query head; only used when we don't fit in shared.
+    bool use_shared = (total_seq <= MAX_SHARED_SCORES);
+    float* head_scratch = scores_scratch + (long)h * (long)max_seq_len;
+    // Pseudo-pointer for the per-position score; resolves to either shared
+    // memory or global, depending on use_shared. Implemented as inline helpers
+    // below since we can't return references in NVRTC C.
+
+    __syncthreads();   // wait for cbook[] population
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Phase 1: write per-position scores to scores buffer (shared or global)
+    // ────────────────────────────────────────────────────────────────────
+
+    // 1a — TQ-compressed positions.
+    for (int t = tid; t < tq_seq_len; t += 256) {
+        long base_uint = (long)t * row_stride_uints + head_uint_offset;
+        float norm = sharpi_fp16_to_fp32(k_cache_tq[base_uint] & 0xFFFFu);
+
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            unsigned int bit_pos = 16u + (unsigned int)d * 3u;
+            unsigned int word_idx = bit_pos >> 5;
+            unsigned int bit_off  = bit_pos & 31u;
+            unsigned int raw = k_cache_tq[base_uint + (long)word_idx] >> bit_off;
+            if (bit_off > 29u)
+                raw |= k_cache_tq[base_uint + (long)word_idx + 1L] << (32u - bit_off);
+            int idx = (int)(raw & 0x7u);
+            dot += cbook[idx] * rotated_q[rq_off + d];
+        }
+        float score = dot * norm * scale;
+        if (use_shared) shared_scores[t] = score;
+        else            head_scratch[t]  = score;
+    }
+
+    // 1b — FP32 recent window.
+    for (int t = tid; t < fp32_seq_len; t += 256) {
+        float dot = 0.0f;
+        long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+        for (int d = 0; d < head_dim; d++)
+            dot += q[q_off + d] * k_cache_fp32[k_off + d];
+        float score = dot * scale;
+        if (use_shared) shared_scores[tq_seq_len + t] = score;
+        else            head_scratch[tq_seq_len + t]  = score;
+    }
+
+    // Pad shared scores with -inf so the max scan doesn't pick up garbage.
+    // Global scratch doesn't need padding — the scans iterate only [0, total_seq).
+    if (use_shared) {
+        for (int t = total_seq + tid; t < MAX_SHARED_SCORES; t += 256)
+            shared_scores[t] = sharpi_neg_inf();
+    }
+    __syncthreads();
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Phase 2: in-place softmax over [0, total_seq)
+    // ────────────────────────────────────────────────────────────────────
+
+    // Max.
+    float local_max = sharpi_neg_inf();
+    for (int t = tid; t < total_seq; t += 256) {
+        float s = use_shared ? shared_scores[t] : head_scratch[t];
+        local_max = fmaxf(local_max, s);
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if ((unsigned int)tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
+
+    // Exp + sum.
+    float local_sum = 0.0f;
+    for (int t = tid; t < total_seq; t += 256) {
+        float s = use_shared ? shared_scores[t] : head_scratch[t];
+        float e = __expf(s - max_val);
+        if (use_shared) shared_scores[t] = e;
+        else            head_scratch[t]  = e;
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if ((unsigned int)tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+    __syncthreads();
+
+    // Normalize → softmax weight per position.
+    for (int t = tid; t < total_seq; t += 256) {
+        if (use_shared) shared_scores[t] *= inv_sum;
+        else            head_scratch[t]  *= inv_sum;
+    }
+    __syncthreads();
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Phase 3: weighted V sum into output[head, :]
+    //  Each thread owns output dim `d`, iterates positions, reads weight[t]
+    //  and the V value at (t, d). K is NOT re-decompressed here.
+    // ────────────────────────────────────────────────────────────────────
+    for (int d = tid; d < head_dim; d += 256) {
+        float acc = 0.0f;
+
+        // TQ-compressed positions.
+        for (int t = 0; t < tq_seq_len; t++) {
+            float weight = use_shared ? shared_scores[t] : head_scratch[t];
+
+            long base_uint = (long)t * row_stride_uints + head_uint_offset;
+            float norm = sharpi_fp16_to_fp32(v_cache_tq[base_uint] & 0xFFFFu);
+
+            unsigned int bit_pos = 16u + (unsigned int)d * 3u;
+            unsigned int word_idx = bit_pos >> 5;
+            unsigned int bit_off  = bit_pos & 31u;
+            unsigned int raw = v_cache_tq[base_uint + (long)word_idx] >> bit_off;
+            if (bit_off > 29u)
+                raw |= v_cache_tq[base_uint + (long)word_idx + 1L] << (32u - bit_off);
+            int idx = (int)(raw & 0x7u);
+
+            acc += weight * cbook[idx] * norm;
+        }
+
+        // FP32 recent-window positions.
+        for (int t = 0; t < fp32_seq_len; t++) {
+            float weight = use_shared
+                ? shared_scores[tq_seq_len + t]
+                : head_scratch[tq_seq_len + t];
+            long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            acc += weight * v_cache_fp32[v_off + d];
+        }
+
+        out[out_off + d] = acc;
+    }
+}
+
 // ── Scaled dot-product attention with GQA ─────────────────────────────────
 // One block per query head, 256 threads.
 // For seq_len <= MAX_STORED_SCORES we use a stored-scores path with shared

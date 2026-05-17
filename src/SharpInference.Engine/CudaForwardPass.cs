@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using SharpInference.Core;
 using SharpInference.Cpu;
 using SharpInference.Cuda;
+using SharpInference.TurboQuant;
 
 namespace SharpInference.Engine;
 
@@ -14,9 +15,16 @@ namespace SharpInference.Engine;
 /// sequence on the GPU: embedding lookup, per-layer attention with paged-stride
 /// KV cache, SwiGLU FFN, output projection, and a single logits download.
 ///
+/// Optional TurboQuant 3-bit KV cache compression mirrors the Vulkan path:
+/// recent tokens stay in a small FP32 ring buffer, older tokens are compressed
+/// to TQ blocks. Limited to head_dim ∈ {128, 256}. The CUDA TQ attention kernel
+/// uses a stored-scores fast path up to 4096 positions and falls through to a
+/// triple-pass recompute branch above that, so the full model context window
+/// is supported (e.g. 40K tokens on Qwen3-8B, the unblocking step that closes
+/// the 3.4× memory advantage TurboQuant offers on a 12 GiB card).
+///
 /// Limitations (intentional, scoped for Qwen3-8B-Q4_K_M first):
 ///   • Dense FFN only (no MoE — call site must pass a non-MoE model).
-///   • No TurboQuant compressed KV cache.
 ///   • No NoPE layer skipping (NoRopeLayerStep is honored if set, but the
 ///     primary target Qwen3 uses RoPE on every layer).
 ///   • Embedding table accepted as Q4_K or F32; quantized variants are
@@ -66,7 +74,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private readonly bool _hasQkNorm;
     private readonly Tensor[]? _wqNorm, _wkNorm;
 
-    // Per-layer KV cache in VRAM (FP32, [maxSeqLen, numKvHeads*headDim])
+    // Per-layer KV cache in VRAM.
+    // Non-TQ path: full FP32 cache [maxSeqLen, numKvHeads*headDim] per layer.
+    // TQ path:     FP32 ring window [tqFp32Window, numKvHeads*headDim] per layer,
+    //              plus TurboQuant-compressed storage for older positions.
     private readonly Tensor[] _gpuKCache;
     private readonly Tensor[] _gpuVCache;
 
@@ -74,13 +85,37 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     // prefix-reuse bookkeeping. CUDA cache state advances in lockstep via _kvLength.
     private readonly KvCache _kvCache;
 
+    // TurboQuant state (null/0 when disabled).
+    private readonly bool _tqEnabled;
+    private readonly int _tqFp32Window;
+    private readonly int _tqBits;
+    private readonly int _tqBlockBytes;
+    private Tensor[]? _gpuTqKCache;
+    private Tensor[]? _gpuTqVCache;
+    private Tensor[]? _gpuSignPatterns;
+    private Tensor? _gpuCodebook;
+    private Tensor? _gpuBoundaries;
+    private Tensor? _rotatedQ;
+    private Tensor? _evictK;
+    private Tensor? _evictV;
+    // Per-query-head softmax-scores scratch in VRAM, sized [numHeads × maxSeqLen].
+    // Used by the TQ attention kernel when total_seq exceeds the shared-memory
+    // fast-path cap (4096). Allocated only when TQ is enabled and the context can
+    // grow past the cap; otherwise null.
+    private Tensor? _tqScoresScratch;
+    private int _tqCompressedLen;
+    private int _fp32WriteIdx;
+    private int _fp32Count;
+
     // Dtype dispatch for MatMul (mirrors GpuForwardPass._weightDTypes).
     private readonly Dictionary<nint, DType> _weightDTypes = new();
 
     public int VocabSize => _hp.VocabSize;
     public int MaxSeqLen => _maxSeqLen;
 
-    public CudaForwardPass(GgufModel model, CudaBackend gpu, ModelHyperparams hp, int maxContextLength = 0)
+    public CudaForwardPass(GgufModel model, CudaBackend gpu, ModelHyperparams hp,
+        int maxContextLength = 0,
+        bool enableTurboQuant = false, int tqFp32Window = 256, int tqBits = 3)
     {
         if (hp.IsMoE)
             throw new NotSupportedException("CudaForwardPass currently supports only dense (non-MoE) models. Use the Vulkan backend or CPU path for MoE.");
@@ -88,6 +123,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         _model = model;
         _gpu = gpu;
         _hp = hp;
+        _tqEnabled = enableTurboQuant;
+        _tqBits = enableTurboQuant ? tqBits : 0;
 
         _embDim = hp.EmbeddingDim;
         _headDim = hp.HeadDim;
@@ -95,13 +132,31 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         _numKvHeads = hp.NumKvHeads;
         _intermDim = hp.IntermediateDim;
 
-        _maxSeqLen = maxContextLength > 0
-            ? Math.Min(maxContextLength, hp.ContextLength)
-            : EstimateMaxContext(model, gpu, hp);
+        if (_tqEnabled && _headDim is not 128 and not 256)
+            throw new NotSupportedException(
+                $"CUDA TurboQuant requires head_dim ∈ {{128, 256}} (model head_dim={_headDim}).");
+        if (_tqEnabled && tqBits != 3)
+            throw new NotSupportedException(
+                $"CUDA TurboQuant only ships 3-bit kernels today (requested bits={tqBits}).");
+
+        if (maxContextLength > 0)
+            _maxSeqLen = Math.Min(maxContextLength, hp.ContextLength);
+        else if (_tqEnabled)
+            _maxSeqLen = EstimateMaxContextTq(model, gpu, hp, tqFp32Window, tqBits);
+        else
+            _maxSeqLen = EstimateMaxContext(model, gpu, hp);
+
+        if (_tqEnabled)
+        {
+            _tqFp32Window = Math.Min(tqFp32Window, _maxSeqLen);
+            _tqBlockBytes = TurboQuantOps.BlockSize(tqBits, _headDim);
+            // The TQ attention kernel uses a stored-scores fast path up to 4096 positions
+            // and a triple-pass recompute path above that. No per-context allocation cap.
+        }
 
         _kvCache = new KvCache(hp.NumLayers, _maxSeqLen, hp.NumKvHeads, hp.HeadDim);
 
-        Console.Error.WriteLine($"[CudaForwardPass] Context size: {_maxSeqLen} (model max: {hp.ContextLength})");
+        Console.Error.WriteLine($"[CudaForwardPass] Context size: {_maxSeqLen} (model max: {hp.ContextLength}){(_tqEnabled ? " [TQ3]" : "")}");
 
         // Scratch
         _hidden    = gpu.Allocate(TensorShape.D1(_embDim));
@@ -119,10 +174,54 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         int kvDim = _numKvHeads * _headDim;
         _gpuKCache = new Tensor[hp.NumLayers];
         _gpuVCache = new Tensor[hp.NumLayers];
-        for (int i = 0; i < hp.NumLayers; i++)
+        if (_tqEnabled)
         {
-            _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
-            _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
+            // FP32 window holds only the recent `tqFp32Window` positions per layer.
+            for (int i = 0; i < hp.NumLayers; i++)
+            {
+                _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_tqFp32Window * kvDim));
+                _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_tqFp32Window * kvDim));
+            }
+
+            // TQ-compressed storage for older positions, stored as uint[] (one block per
+            // (position, kv_head) at byte offset position*numKvHeads*blockBytes + ...).
+            int maxTqPositions = Math.Max(0, _maxSeqLen - _tqFp32Window);
+            long tqBytesPerPos = (long)_numKvHeads * _tqBlockBytes;
+            long tqUintsPerLayer = (maxTqPositions * tqBytesPerPos + 3) / 4;
+            _gpuTqKCache = new Tensor[hp.NumLayers];
+            _gpuTqVCache = new Tensor[hp.NumLayers];
+            _gpuSignPatterns = new Tensor[hp.NumLayers];
+            for (int i = 0; i < hp.NumLayers; i++)
+            {
+                _gpuTqKCache[i] = gpu.Allocate(TensorShape.D1(tqUintsPerLayer));
+                _gpuTqVCache[i] = gpu.Allocate(TensorShape.D1(tqUintsPerLayer));
+                _gpuSignPatterns[i] = UploadTqSignPatterns(i);
+            }
+
+            // Upload TQ constants to VRAM.
+            var centroids = TurboQuantCodebooks.GetCentroids(tqBits, _headDim).ToArray();
+            _gpuCodebook = gpu.Upload(centroids, TensorShape.D1(centroids.Length));
+
+            var boundaries = TurboQuantCodebooks.GetBoundaries(tqBits, _headDim).ToArray();
+            _gpuBoundaries = gpu.Upload(boundaries, TensorShape.D1(boundaries.Length));
+
+            _rotatedQ = gpu.Allocate(TensorShape.D1((long)_numHeads * _headDim));
+            _evictK   = gpu.Allocate(TensorShape.D1((long)_numKvHeads * _headDim));
+            _evictV   = gpu.Allocate(TensorShape.D1((long)_numKvHeads * _headDim));
+
+            // Long-context kernels need a per-head softmax-scores scratch buffer.
+            // Skip the allocation when the whole context fits in the kernel's shared-mem
+            // fast path (4096 stored scores) — saves a few MiB on small-context runs.
+            if (_maxSeqLen > 4096)
+                _tqScoresScratch = gpu.Allocate(TensorShape.D1((long)_numHeads * _maxSeqLen));
+        }
+        else
+        {
+            for (int i = 0; i < hp.NumLayers; i++)
+            {
+                _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
+                _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
+            }
         }
 
         // Upload weights to VRAM
@@ -347,10 +446,47 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             }
 
             int kvDim = _numKvHeads * _headDim;
-            _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer], kvDim, position, _maxSeqLen);
 
-            _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
-                _numHeads, _numKvHeads, _headDim, position + 1, _maxSeqLen);
+            if (_tqEnabled)
+            {
+                long rowBytes = (long)kvDim * sizeof(float);
+
+                // Evict the oldest FP32 row to TQ storage if the ring is full.
+                if (_fp32Count >= _tqFp32Window)
+                {
+                    _gpu.CopyDeviceRegion(_evictK!, 0,
+                        _gpuKCache[layer], (long)_fp32WriteIdx * rowBytes, rowBytes);
+                    _gpu.CopyDeviceRegion(_evictV!, 0,
+                        _gpuVCache[layer], (long)_fp32WriteIdx * rowBytes, rowBytes);
+                    _gpu.TqKvAppend(_evictK!, _evictV!,
+                        _gpuTqKCache![layer], _gpuTqVCache![layer],
+                        _gpuSignPatterns![layer], _gpuCodebook!, _gpuBoundaries!,
+                        kvDim, _headDim, _tqCompressedLen,
+                        _maxSeqLen, _numKvHeads, _tqBlockBytes);
+                }
+
+                // Append the fresh K/V into the ring buffer slot.
+                _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer],
+                    kvDim, _fp32WriteIdx, _tqFp32Window);
+
+                // Rotate the query (per-layer sign pattern) for fused dequant-dot.
+                _gpu.TqRotateQuery(_q, _rotatedQ!, _gpuSignPatterns![layer],
+                    _numHeads, _numKvHeads, _headDim);
+
+                int fp32SeqLen = Math.Min(_fp32Count + 1, _tqFp32Window);
+                _gpu.TqAttention(_q, _rotatedQ!,
+                    _gpuTqKCache![layer], _gpuTqVCache![layer],
+                    _gpuKCache[layer], _gpuVCache[layer], _attnOut, _gpuCodebook!,
+                    _tqScoresScratch,
+                    _numHeads, _numKvHeads, _headDim,
+                    _tqCompressedLen, fp32SeqLen, _maxSeqLen, _tqBlockBytes);
+            }
+            else
+            {
+                _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer], kvDim, position, _maxSeqLen);
+                _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                    _numHeads, _numKvHeads, _headDim, position + 1, _maxSeqLen);
+            }
 
             GpuMatMul(_hidden, _wo[layer], _attnOut);
             if (_hasAttnBias)
@@ -370,6 +506,17 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             _gpu.AddInPlace(_hidden, _residual);
         }
 
+        // After all layers have used the same FP32 indices for this token, advance
+        // the TQ ring-buffer state (shared across layers).
+        if (_tqEnabled)
+        {
+            if (_fp32Count >= _tqFp32Window)
+                _tqCompressedLen++;
+            _fp32WriteIdx = (_fp32WriteIdx + 1) % _tqFp32Window;
+            if (_fp32Count < _tqFp32Window)
+                _fp32Count++;
+        }
+
         _gpu.RmsNorm(_hidden, _hidden, _wOutputNorm, _hp.RmsNormEps);
         GpuMatMul(_logits, _wOutput, _hidden);
 
@@ -382,6 +529,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
     private ReadOnlySpan<float> ForwardProfiled(int token, int position)
     {
+        if (_tqEnabled)
+            throw new NotSupportedException(
+                "SHARPI_CUDA_PROFILE per-phase profiling is not wired for the TurboQuant path. " +
+                "Disable TurboQuant to use the profiler, or extend ForwardProfiled if you need per-phase TQ timings.");
+
         var sw = System.Diagnostics.Stopwatch.StartNew();
         long t0 = sw.ElapsedTicks;
 
@@ -500,6 +652,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// <inheritdoc/>
     public void TruncateTo(int length)
     {
+        if (_tqEnabled && length < _tqCompressedLen)
+            throw new NotSupportedException(
+                $"TruncateTo({length}) cannot rewind into the TQ-compressed region " +
+                $"(tqCompressedLen={_tqCompressedLen}). Speculative decoding can only " +
+                "truncate inside the FP32 recent window.");
         _kvLength = length;
         _kvCache.TruncateTo(length);
     }
@@ -509,6 +666,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     {
         _kvLength = 0;
         _kvCache.Reset();
+        _tqCompressedLen = 0;
+        _fp32WriteIdx = 0;
+        _fp32Count = 0;
     }
 
     private void GpuMatMul(Tensor output, Tensor weights, Tensor input)
@@ -549,6 +709,20 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         return result;
     }
 
+    private Tensor UploadTqSignPatterns(int layerIndex)
+    {
+        var fullSigns = new float[_numKvHeads * _headDim];
+        for (int h = 0; h < _numKvHeads; h++)
+        {
+            // Match the per-(layer × kv_head) seeding used by KvCacheCompressor and
+            // GpuForwardPass — the sign pattern is what binds a query rotation to its
+            // matching cached keys, and the seeds must align across paths.
+            var headSigns = WalshHadamard.GenerateSignPattern(_headDim, layerIndex * _numKvHeads + h);
+            headSigns.CopyTo(fullSigns.AsSpan(h * _headDim));
+        }
+        return _gpu.Upload(fullSigns, TensorShape.D1(fullSigns.Length));
+    }
+
     /// <summary>
     /// VRAM-based context-length estimator: subtract uploaded-weight bytes and a fixed
     /// scratch budget from total VRAM, then divide what's left between K and V caches
@@ -583,6 +757,42 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         long bytesPerToken = 2L * hp.NumLayers * hp.NumKvHeads * headDim * sizeof(float);
         int maxCtx = (int)(available / bytesPerToken);
         return Math.Clamp(maxCtx, 512, hp.ContextLength);
+    }
+
+    /// <summary>
+    /// Context-length estimator for the TurboQuant path: the FP32 ring buffer is fixed
+    /// at <paramref name="fp32WindowSize"/> positions, the remainder live in TQ blocks
+    /// (~52 bytes for head_dim=128 vs 512 bytes for FP32 — about 10× smaller per token).
+    /// </summary>
+    public static int EstimateMaxContextTq(GgufModel model, CudaBackend gpu, ModelHyperparams hp,
+        int fp32WindowSize = 256, int bits = 3)
+    {
+        long vramBytes = (long)gpu.VramBytes;
+        if (vramBytes <= 0) vramBytes = 8L * 1024 * 1024 * 1024;
+
+        int headDim = hp.HeadDim;
+        int blockSize = TurboQuantOps.BlockSize(bits, headDim);
+
+        long weightBytes = 0;
+        foreach (var t in model.Tensors)
+            weightBytes += EstimateGpuTensorBytes(t);
+
+        long scratchBytes = (long)(hp.EmbeddingDim * 3 + hp.NumHeads * headDim
+            + hp.NumKvHeads * headDim * 2 + hp.NumHeads * headDim
+            + hp.IntermediateDim * 2 + hp.VocabSize) * sizeof(float);
+
+        long reserved = Math.Max(vramBytes / 3, 2L * 1024 * 1024 * 1024);
+        long available = vramBytes - weightBytes - scratchBytes - reserved;
+        if (available <= 0) available = 64L * 1024 * 1024;
+
+        long fp32Bytes = 2L * hp.NumLayers * hp.NumKvHeads * headDim * sizeof(float) * fp32WindowSize;
+        long tqBytesPerToken = 2L * hp.NumLayers * hp.NumKvHeads * blockSize;
+
+        long availableForTq = available - fp32Bytes;
+        if (availableForTq <= 0) availableForTq = 64L * 1024 * 1024;
+
+        int maxTqPositions = (int)(availableForTq / tqBytesPerToken);
+        return Math.Clamp(maxTqPositions + fp32WindowSize, 512, hp.ContextLength);
     }
 
     private static long EstimateGpuTensorBytes(GgufTensorInfo tensor)
@@ -625,6 +835,22 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         {
             _gpu.Free(_gpuKCache[i]);
             _gpu.Free(_gpuVCache[i]);
+        }
+
+        if (_tqEnabled)
+        {
+            for (int i = 0; i < _hp.NumLayers; i++)
+            {
+                _gpu.Free(_gpuTqKCache![i]);
+                _gpu.Free(_gpuTqVCache![i]);
+                _gpu.Free(_gpuSignPatterns![i]);
+            }
+            _gpu.Free(_gpuCodebook!);
+            _gpu.Free(_gpuBoundaries!);
+            _gpu.Free(_rotatedQ!);
+            _gpu.Free(_evictK!);
+            _gpu.Free(_evictV!);
+            if (_tqScoresScratch is { } scratch) _gpu.Free(scratch);
         }
 
         _kvCache.Dispose();

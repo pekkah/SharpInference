@@ -216,9 +216,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 case "":
                     // Auto: pick CUDA when available, the model is dense, and the user asked
                     // for full-GPU offload (the CUDA forward pass doesn't yet split layers).
+                    // TQ on CUDA is supported for head_dim ∈ {128, 256} only.
+                    bool tqHeadDimOk = hp.HeadDim is 128 or 256;
                     wantCuda = !hp.IsMoE
                         && (nGpuLayers == -1 || nGpuLayers >= hp.NumLayers)
-                        && !settings.TurboQuant
+                        && (!settings.TurboQuant || tqHeadDimOk)
                         && CudaBackend.IsAvailable();
                     break;
                 default:
@@ -230,9 +232,9 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 AnsiConsole.MarkupLine("[yellow]Note:[/] --backend cuda does not yet support MoE; falling back to Vulkan.");
                 wantCuda = false;
             }
-            if (wantCuda && settings.TurboQuant)
+            if (wantCuda && settings.TurboQuant && hp.HeadDim is not 128 and not 256)
             {
-                AnsiConsole.MarkupLine("[yellow]Note:[/] --backend cuda does not yet support TurboQuant KV compression; falling back to Vulkan.");
+                AnsiConsole.MarkupLine($"[yellow]Note:[/] --backend cuda TurboQuant requires head_dim ∈ {{128, 256}} (model head_dim={hp.HeadDim}); falling back to Vulkan.");
                 wantCuda = false;
             }
         }
@@ -257,7 +259,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             try
             {
                 // CudaForwardPass loads all layers — partial offload is a Vulkan-only feature today.
-                var cfwd = new CudaForwardPass(model, cuda, hp, ctxSize);
+                var cfwd = new CudaForwardPass(model, cuda, hp, ctxSize,
+                    enableTurboQuant: settings.TurboQuant);
+                if (settings.TurboQuant)
+                    AnsiConsole.MarkupLine($"[dim]TurboQuant: [green]enabled[/] (3-bit, context: {cfwd.MaxSeqLen})[/]");
                 gpuFwd = cfwd;
                 forward = cfwd.Forward;
                 prefill = tokens => cfwd.Prefill(tokens);

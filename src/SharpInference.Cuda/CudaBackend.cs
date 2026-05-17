@@ -79,6 +79,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _quantizeQ81Kernel;
     private nint   _bwBaselineKernel;
 
+    // TurboQuant KV-cache compression kernels.
+    private nint   _tqRotateQueryKernel;
+    private nint   _tqKvAppendKernel;
+    private nint   _tqAttentionKernel;
+
     // Persistent Q8_1 scratch for the Q4_K matvec input. Grows on demand and
     // never shrinks. Sized in 36-byte sub-blocks (one block_q8_1 per 32 elements).
     private nint   _q81Buf;
@@ -137,6 +142,22 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         int r = CuBlasInterop.CudaMemcpyAsync(dstPtr, srcPtr, bytes, CuBlasInterop.DeviceToDevice, _stream);
         if (r != 0)
             throw new InvalidOperationException($"cudaMemcpyAsync (D2D) failed: {r}");
+    }
+
+    /// <summary>
+    /// Async device-to-device copy of a sub-region. Offsets and size are measured in bytes.
+    /// Used by the TurboQuant path to extract a single FP32 KV row out of the layer ring
+    /// buffer for compression.
+    /// </summary>
+    public void CopyDeviceRegion(Tensor dst, long dstByteOffset,
+                                 Tensor src, long srcByteOffset, long sizeBytes)
+    {
+        nint dstPtr = GetDevPtr(dst) + (nint)dstByteOffset;
+        nint srcPtr = GetDevPtr(src) + (nint)srcByteOffset;
+        int r = CuBlasInterop.CudaMemcpyAsync(dstPtr, srcPtr, (nuint)sizeBytes,
+            CuBlasInterop.DeviceToDevice, _stream);
+        if (r != 0)
+            throw new InvalidOperationException($"cudaMemcpyAsync (D2D region) failed: {r}");
     }
 
     private CudaBackend(nint handle, SgemmPrecision precision, int smVersion, nint stream,
@@ -858,6 +879,118 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention) failed: {r}");
     }
 
+    // ================================================================
+    //  TurboQuant KV-cache compression
+    // ================================================================
+
+    /// <summary>
+    /// Rotate query vectors for TurboQuant attention: applies the Walsh-Hadamard
+    /// transform and the per-(layer × kv_head) sign flip. Call once per layer
+    /// (before <see cref="TqAttention"/>), reuse the result across all cached positions.
+    /// </summary>
+    public void TqRotateQuery(Tensor qInput, Tensor rotatedQ, Tensor signPatterns,
+                              int numHeads, int numKvHeads, int headDim)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint qP  = GetDevPtr(qInput);
+        nint rqP = GetDevPtr(rotatedQ);
+        nint sP  = GetDevPtr(signPatterns);
+        int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim;
+        nint* args = stackalloc nint[6]
+        {
+            (nint)(&qP), (nint)(&rqP), (nint)(&sP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD)
+        };
+        int r = NvrtcInterop.LaunchKernel(_tqRotateQueryKernel,
+            (uint)numHeads, 1, 1, (uint)headDim, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(tq_rotate_query) failed: {r}");
+    }
+
+    /// <summary>
+    /// Compress one (K, V) token-position into the layer's TurboQuant cache.
+    /// Writes a packed 3-bit block per KV head at byte offset
+    /// <c>position * numKvHeads * blockBytes + kvHead * blockBytes</c>.
+    /// </summary>
+    public void TqKvAppend(Tensor kInput, Tensor vInput, Tensor kCacheTq, Tensor vCacheTq,
+                           Tensor signPatterns, Tensor codebook, Tensor boundaries,
+                           int kvDim, int headDim, int position, int maxSeqLen,
+                           int numKvHeads, int blockBytes)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint kP = GetDevPtr(kInput);
+        nint vP = GetDevPtr(vInput);
+        nint kc = GetDevPtr(kCacheTq);
+        nint vc = GetDevPtr(vCacheTq);
+        nint sP = GetDevPtr(signPatterns);
+        nint cP = GetDevPtr(codebook);
+        nint bP = GetDevPtr(boundaries);
+        int  pKD = kvDim, pHD = headDim, pPos = position, pMSL = maxSeqLen,
+             pNKV = numKvHeads, pBB = blockBytes;
+        nint* args = stackalloc nint[13]
+        {
+            (nint)(&kP), (nint)(&vP), (nint)(&kc), (nint)(&vc),
+            (nint)(&sP), (nint)(&cP), (nint)(&bP),
+            (nint)(&pKD), (nint)(&pHD), (nint)(&pPos),
+            (nint)(&pMSL), (nint)(&pNKV), (nint)(&pBB)
+        };
+        int r = NvrtcInterop.LaunchKernel(_tqKvAppendKernel,
+            (uint)numKvHeads, 1, 1, (uint)headDim, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(tq_kv_append) failed: {r}");
+    }
+
+    /// <summary>
+    /// Hybrid TurboQuant attention: scaled dot-product attention over the
+    /// TQ-compressed history plus the FP32 recent-window cache.
+    ///
+    /// When <c>tqSeqLen + fp32SeqLen ≤ 4096</c> the kernel keeps per-position scores
+    /// in shared memory and <paramref name="scoresScratch"/> is ignored. Above that
+    /// threshold the kernel spills the scores to <paramref name="scoresScratch"/>,
+    /// which must have room for <c>numHeads × maxSeqLen</c> floats (one slot per
+    /// (head, position) pair). Passing a non-null scratch always works regardless
+    /// of context size — callers can allocate once for the worst case.
+    /// </summary>
+    public void TqAttention(Tensor q, Tensor rotatedQ, Tensor kCacheTq, Tensor vCacheTq,
+                            Tensor kCacheFp32, Tensor vCacheFp32, Tensor output, Tensor codebook,
+                            Tensor? scoresScratch,
+                            int numHeads, int numKvHeads, int headDim,
+                            int tqSeqLen, int fp32SeqLen, int maxSeqLen, int blockBytes)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint qP   = GetDevPtr(q);
+        nint rqP  = GetDevPtr(rotatedQ);
+        nint kctP = GetDevPtr(kCacheTq);
+        nint vctP = GetDevPtr(vCacheTq);
+        nint kfP  = GetDevPtr(kCacheFp32);
+        nint vfP  = GetDevPtr(vCacheFp32);
+        nint oP   = GetDevPtr(output);
+        nint cbP  = GetDevPtr(codebook);
+        nint ssP  = scoresScratch is { } sv ? GetDevPtr(sv) : nint.Zero;
+        int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim,
+             pTQ = tqSeqLen, pFP = fp32SeqLen, pMSL = maxSeqLen, pBB = blockBytes;
+        nint* args = stackalloc nint[16]
+        {
+            (nint)(&qP), (nint)(&rqP),
+            (nint)(&kctP), (nint)(&vctP),
+            (nint)(&kfP),  (nint)(&vfP),
+            (nint)(&oP),   (nint)(&cbP),
+            (nint)(&ssP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pTQ), (nint)(&pFP),  (nint)(&pMSL), (nint)(&pBB)
+        };
+        int r = NvrtcInterop.LaunchKernel(_tqAttentionKernel,
+            (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(tq_attention) failed: {r}");
+    }
+
     /// <summary>Look up one row from an F32 embedding table into <paramref name="output"/>.</summary>
     public void EmbedLookup(Tensor embTable, Tensor output, int tokenId, int embDim)
     {
@@ -1153,6 +1286,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _embedLookupF32Kernel, _embedLookupQ4KKernel,
             _matvecF32Kernel, _matvecQ4KKernel, _matvecQ6KKernel,
             _attentionKernel, _clearF32Kernel, _quantizeQ81Kernel,
+            _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
         ];
         foreach (nint k in kernels)
         {
@@ -1193,6 +1327,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _clearF32Kernel        = GetKernelFunc("llm_clear_f32");
         _quantizeQ81Kernel     = GetKernelFunc("llm_quantize_q8_1");
         _bwBaselineKernel      = GetKernelFunc("llm_bw_baseline");
+
+        // TurboQuant kernels (loaded from the same NVRTC module).
+        _tqRotateQueryKernel = GetKernelFunc("llm_tq_rotate_query");
+        _tqKvAppendKernel    = GetKernelFunc("llm_tq_kv_append");
+        _tqAttentionKernel   = GetKernelFunc("llm_tq_attention");
     }
 
     /// <summary>
