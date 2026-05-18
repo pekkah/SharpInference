@@ -645,6 +645,7 @@ internal static class Shaders
         layout(binding = 1) readonly buffer KCache { float k_cache[]; };
         layout(binding = 2) readonly buffer VCache { float v_cache[]; };
         layout(binding = 3) buffer Out             { float out_data[]; };
+        layout(binding = 4) buffer ScoresScratch   { float scores_scratch[]; };
 
         layout(push_constant) uniform Params {
             uint num_heads;
@@ -654,7 +655,14 @@ internal static class Shaders
             uint max_seq_len;
         };
 
-        shared float scores[4096]; // stored Q·K scores for all positions
+        // Score-storage strategy mirrors the CUDA `llm_attention` kernel:
+        //   • seq_len ≤ MAX_SHARED_SCORES (4096): fast path uses shared memory.
+        //   • seq_len > 4096: spills to scores_scratch[h*max_seq_len .. +seq_len).
+        // The fast path does not touch the scratch buffer, but Vulkan descriptors
+        // require it to be bound — callers pass a 1-float placeholder when the
+        // whole context is guaranteed to fit in shared memory.
+        const uint MAX_SHARED_SCORES = 4096u;
+        shared float scores[MAX_SHARED_SCORES];
         shared float sdata[256];   // reduction scratch
 
         void main() {
@@ -668,113 +676,74 @@ internal static class Shaders
             uint q_off = h * head_dim;
             uint out_off = h * head_dim;
 
-            if (seq_len <= 4096) {
-                // ── Stored-scores path ──
-                // Phase 1: compute all Q·K scores and store in shared memory
-                for (uint t = tid; t < seq_len; t += 256) {
-                    float dot = 0.0;
-                    uint k_off = t * kv_dim + kv_head * head_dim;
-                    for (uint d = 0; d < head_dim; d++)
-                        dot += q_data[q_off + d] * k_cache[k_off + d];
-                    scores[t] = dot * scale;
-                }
-                for (uint t = seq_len + tid; t < 4096; t += 256)
+            bool use_shared = (seq_len <= MAX_SHARED_SCORES);
+            uint scratch_base = h * max_seq_len;
+
+            // ─── Phase 1: per-position Q·K scores ───
+            for (uint t = tid; t < seq_len; t += 256) {
+                float dot = 0.0;
+                uint k_off = t * kv_dim + kv_head * head_dim;
+                for (uint d = 0; d < head_dim; d++)
+                    dot += q_data[q_off + d] * k_cache[k_off + d];
+                float score = dot * scale;
+                if (use_shared) scores[t] = score;
+                else            scores_scratch[scratch_base + t] = score;
+            }
+            // Pad shared tail so the max scan ignores stale slots. The scratch
+            // scans iterate only [0, seq_len), so no padding needed.
+            if (use_shared) {
+                for (uint t = seq_len + tid; t < MAX_SHARED_SCORES; t += 256)
                     scores[t] = -1.0/0.0;
-                barrier();
+            }
+            barrier();
 
-                // Phase 2: softmax over stored scores
-                float local_max = -1.0/0.0;
-                for (uint t = tid; t < seq_len; t += 256)
-                    local_max = max(local_max, scores[t]);
-                sdata[tid] = local_max;
+            // ─── Phase 2: in-place softmax over [0, seq_len) ───
+            float local_max = -1.0/0.0;
+            for (uint t = tid; t < seq_len; t += 256) {
+                float s = use_shared ? scores[t] : scores_scratch[scratch_base + t];
+                local_max = max(local_max, s);
+            }
+            sdata[tid] = local_max;
+            barrier();
+            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
                 barrier();
-                [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
-                    if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
-                    barrier();
-                }
-                float max_val = sdata[0];
-                barrier();
+            }
+            float max_val = sdata[0];
+            barrier();
 
-                float local_sum = 0.0;
-                for (uint t = tid; t < seq_len; t += 256) {
-                    float e = exp(scores[t] - max_val);
-                    scores[t] = e;
-                    local_sum += e;
-                }
-                sdata[tid] = local_sum;
+            float local_sum = 0.0;
+            for (uint t = tid; t < seq_len; t += 256) {
+                float s = use_shared ? scores[t] : scores_scratch[scratch_base + t];
+                float e = exp(s - max_val);
+                if (use_shared) scores[t] = e;
+                else            scores_scratch[scratch_base + t] = e;
+                local_sum += e;
+            }
+            sdata[tid] = local_sum;
+            barrier();
+            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] += sdata[tid + s];
                 barrier();
-                [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
-                    if (tid < s) sdata[tid] += sdata[tid + s];
-                    barrier();
-                }
-                float sum_exp = sdata[0];
-                barrier();
+            }
+            float inv_sum = 1.0 / sdata[0];
+            barrier();
 
-                for (uint t = tid; t < seq_len; t += 256)
-                    scores[t] /= sum_exp;
-                barrier();
+            for (uint t = tid; t < seq_len; t += 256) {
+                if (use_shared) scores[t] *= inv_sum;
+                else            scores_scratch[scratch_base + t] *= inv_sum;
+            }
+            barrier();
 
-                // Phase 3: weighted value accumulation using stored weights
-                for (uint d = tid; d < head_dim; d += 256) {
-                    float sum = 0.0;
-                    for (uint t = 0; t < seq_len; t++) {
-                        uint v_off = t * kv_dim + kv_head * head_dim;
-                        sum += scores[t] * v_cache[v_off + d];
-                    }
-                    out_data[out_off + d] = sum;
+            // ─── Phase 3: weighted V sum. K is NOT re-derived here. ───
+            for (uint d = tid; d < head_dim; d += 256) {
+                float sum = 0.0;
+                for (uint t = 0; t < seq_len; t++) {
+                    float weight = use_shared ? scores[t] : scores_scratch[scratch_base + t];
+                    uint v_off = t * kv_dim + kv_head * head_dim;
+                    sum += weight * v_cache[v_off + d];
                 }
-
-            } else {
-                // ── Long-context path (seq_len > 4096): triple pass with recompute ──
-
-                // Pass 1: find global max
-                float local_max = -1.0/0.0;
-                for (uint t = tid; t < seq_len; t += 256) {
-                    float dot = 0.0;
-                    uint k_off = t * kv_dim + kv_head * head_dim;
-                    for (uint d = 0; d < head_dim; d++)
-                        dot += q_data[q_off + d] * k_cache[k_off + d];
-                    local_max = max(local_max, dot * scale);
-                }
-                sdata[tid] = local_max;
-                barrier();
-                [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
-                    if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
-                    barrier();
-                }
-                float max_val = sdata[0];
-                barrier();
-
-                // Pass 2: compute exp sum
-                float local_sum = 0.0;
-                for (uint t = tid; t < seq_len; t += 256) {
-                    float dot = 0.0;
-                    uint k_off = t * kv_dim + kv_head * head_dim;
-                    for (uint d = 0; d < head_dim; d++)
-                        dot += q_data[q_off + d] * k_cache[k_off + d];
-                    local_sum += exp(dot * scale - max_val);
-                }
-                sdata[tid] = local_sum;
-                barrier();
-                [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
-                    if (tid < s) sdata[tid] += sdata[tid + s];
-                    barrier();
-                }
-                float sum_exp = sdata[0];
-                barrier();
-
-                // Pass 3: weighted value sum (recompute weights on the fly)
-                for (uint d = tid; d < head_dim; d += 256) {
-                    float sum = 0.0;
-                    for (uint t = 0; t < seq_len; t++) {
-                        float dot = 0.0;
-                        uint k_off = t * kv_dim + kv_head * head_dim;
-                        for (uint dd = 0; dd < head_dim; dd++)
-                            dot += q_data[q_off + dd] * k_cache[k_off + dd];
-                        sum += exp(dot * scale - max_val) / sum_exp * v_cache[t * kv_dim + kv_head * head_dim + d];
-                    }
-                    out_data[out_off + d] = sum;
-                }
+                out_data[out_off + d] = sum;
             }
         }
         """;

@@ -42,7 +42,10 @@ public sealed unsafe class HybridForwardPass : IForwardPass
     private readonly Tensor[] _gpuKCache, _gpuVCache;
     private readonly Tensor[]? _gpuTqKCache, _gpuTqVCache, _gpuSignPatterns;
     private readonly Tensor? _gpuCodebook, _gpuBoundaries, _gpuRotatedQ, _gpuEvictK, _gpuEvictV;
-    private readonly Tensor? _gpuTqScoresScratch;  // [numHeads * maxSeqLen] long-context softmax-score spill
+    // Per-query-head softmax-scores scratch in VRAM, sized [numHeads × maxSeqLen]
+    // (or a 1-float placeholder when _maxSeqLen ≤ 4096). Shared by both the TQ and
+    // FP32 attention shaders when seq_len exceeds the shared-memory fast-path cap.
+    private readonly Tensor _gpuAttnScoresScratch;
     private readonly Dictionary<nint, DType> _gpuWeightDTypes = new();
 
     // ── CPU resources (layers nGpuLayers..numLayers-1) ──
@@ -237,12 +240,14 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             _gpuRotatedQ = gpu.Allocate(TensorShape.D1(_numHeads * _headDim));
             _gpuEvictK = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
             _gpuEvictV = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
+        }
 
-            // Vulkan TQ attention spills softmax scores to VRAM when total_seq > 4096;
-            // a 1-float placeholder is enough for shorter contexts but the descriptor
-            // must always be bound. See VulkanBackend.TqAttention.
+        // Both Vulkan attention shaders spill softmax scores to VRAM when seq_len
+        // exceeds the 4096-slot shared-memory fast path; a 1-float placeholder is
+        // enough for shorter contexts but the descriptor must always be bound.
+        {
             long scratchElems = _maxSeqLen > 4096 ? (long)_numHeads * _maxSeqLen : 1L;
-            _gpuTqScoresScratch = gpu.Allocate(TensorShape.D1(scratchElems));
+            _gpuAttnScoresScratch = gpu.Allocate(TensorShape.D1(scratchElems));
         }
 
         Console.Error.Write($"[HybridForwardPass] Uploading {_nGpuLayers} GPU layers...");
@@ -684,7 +689,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             uint fp32SeqLen = (uint)Math.Min(_gpuFp32Count + 1, _tqFp32Window);
             _gpu.TqAttention(_gpuQ, _gpuRotatedQ!, _gpuTqKCache![i], _gpuTqVCache![i],
                 _gpuKCache[i], _gpuVCache[i], _gpuAttnOut, _gpuCodebook!,
-                _gpuTqScoresScratch!,
+                _gpuAttnScoresScratch!,
                 (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
                 (uint)_gpuTqCompressedLen, fp32SeqLen, (uint)_maxSeqLen, (uint)_tqBlockBytes);
         }
@@ -695,6 +700,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             _gpu.RecordBarrier();
 
             _gpu.Attention(_gpuQ, _gpuKCache[i], _gpuVCache[i], _gpuAttnOut,
+                _gpuAttnScoresScratch,
                 (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
                 (uint)(position + 1), (uint)_maxSeqLen);
         }
@@ -1626,8 +1632,8 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             _gpu.Free(_gpuRotatedQ!);
             _gpu.Free(_gpuEvictK!);
             _gpu.Free(_gpuEvictV!);
-            _gpu.Free(_gpuTqScoresScratch!);
         }
+        _gpu.Free(_gpuAttnScoresScratch);
         if (_gpuOutputNorm is not null)
             _gpu.Free(_gpuOutputNorm);
         if (_gpuOutputWeight is not null && _gpuOutputWeight.Handle != _gpuEmbedding?.Handle)

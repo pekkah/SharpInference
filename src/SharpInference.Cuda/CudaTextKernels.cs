@@ -861,12 +861,23 @@ extern ""C"" __global__ void llm_tq_attention(
     int tq_seq_len, int fp32_seq_len, int max_seq_len, int block_bytes)
 {
     const int MAX_SHARED_SCORES = 4096;
+    // Max block size: 2 (norm) + ceil(256*3/8) = 98 bytes → 25 uints. Round up to 26.
+    const int MAX_BLOCK_UINTS = 26;
     __shared__ float shared_scores[MAX_SHARED_SCORES];
     __shared__ float sdata[256];
     __shared__ float cbook[8];
+    // Per-warp staging for the (K, t) block. Each warp owns one t at a time
+    // (8 warps × 256 lanes = 8 t's per round), reading 13-25 uints once
+    // cooperatively then driving its 32-lane dot-product from shared memory.
+    // Replaces the previous per-thread layout where each lane read the K block
+    // from scratch for ITS own t — that pattern fully serialized bit-unpack
+    // work behind uncoalesced global loads.
+    __shared__ unsigned int k_block_uints[8][MAX_BLOCK_UINTS];
 
     int h = (int)blockIdx.x;
     int tid = (int)threadIdx.x;
+    int warp = tid >> 5;          // 0..7
+    int lane = tid & 31;          // 0..31
     if (h >= num_heads) return;
 
     if (tid < 8) cbook[tid] = codebook[tid];
@@ -887,9 +898,6 @@ extern ""C"" __global__ void llm_tq_attention(
     // global slot for this query head; only used when we don't fit in shared.
     bool use_shared = (total_seq <= MAX_SHARED_SCORES);
     float* head_scratch = scores_scratch + (long)h * (long)max_seq_len;
-    // Pseudo-pointer for the per-position score; resolves to either shared
-    // memory or global, depending on use_shared. Implemented as inline helpers
-    // below since we can't return references in NVRTC C.
 
     __syncthreads();   // wait for cbook[] population
 
@@ -897,25 +905,54 @@ extern ""C"" __global__ void llm_tq_attention(
     //  Phase 1: write per-position scores to scores buffer (shared or global)
     // ────────────────────────────────────────────────────────────────────
 
-    // 1a — TQ-compressed positions.
-    for (int t = tid; t < tq_seq_len; t += 256) {
-        long base_uint = (long)t * row_stride_uints + head_uint_offset;
-        float norm = sharpi_fp16_to_fp32(k_cache_tq[base_uint] & 0xFFFFu);
+    // 1a — TQ-compressed positions, warp-cooperative.
+    //
+    // Each round processes 8 positions in parallel (one per warp). Within a warp:
+    //   • the 32 lanes load the t-block's 13-25 uints once into shared memory,
+    //   • each lane then decodes head_dim/32 indices from that shared block and
+    //     contributes a partial dot,
+    //   • a 5-stage __shfl_xor warp reduction collapses the 32 partials, and
+    //   • lane 0 writes the score.
+    // No __syncthreads is needed — every cross-thread interaction stays inside
+    // the warp. The previous per-thread structure was bottlenecked by
+    // uncoalesced k_cache_tq reads (256 threads, 256 unrelated blocks); the
+    // cooperative load amortizes those reads across the warp.
+    for (int t_base = 0; t_base < tq_seq_len; t_base += 8) {
+        int t = t_base + warp;
+        if (t < tq_seq_len) {
+            long base_uint = (long)t * row_stride_uints + head_uint_offset;
 
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; d++) {
-            unsigned int bit_pos = 16u + (unsigned int)d * 3u;
-            unsigned int word_idx = bit_pos >> 5;
-            unsigned int bit_off  = bit_pos & 31u;
-            unsigned int raw = k_cache_tq[base_uint + (long)word_idx] >> bit_off;
-            if (bit_off > 29u)
-                raw |= k_cache_tq[base_uint + (long)word_idx + 1L] << (32u - bit_off);
-            int idx = (int)(raw & 0x7u);
-            dot += cbook[idx] * rotated_q[rq_off + d];
+            for (int w = lane; w < (int)block_uints; w += 32)
+                k_block_uints[warp][w] = k_cache_tq[base_uint + (long)w];
+            __syncwarp();
+
+            float norm = sharpi_fp16_to_fp32(k_block_uints[warp][0] & 0xFFFFu);
+
+            float partial = 0.0f;
+            for (int d = lane; d < head_dim; d += 32) {
+                unsigned int bit_pos = 16u + (unsigned int)d * 3u;
+                unsigned int word_idx = bit_pos >> 5;
+                unsigned int bit_off  = bit_pos & 31u;
+                unsigned int raw = k_block_uints[warp][word_idx] >> bit_off;
+                if (bit_off > 29u)
+                    raw |= k_block_uints[warp][word_idx + 1u] << (32u - bit_off);
+                int idx = (int)(raw & 0x7u);
+                partial += cbook[idx] * rotated_q[rq_off + d];
+            }
+
+            unsigned int mask = 0xFFFFFFFFu;
+            partial += __shfl_xor_sync(mask, partial, 16);
+            partial += __shfl_xor_sync(mask, partial, 8);
+            partial += __shfl_xor_sync(mask, partial, 4);
+            partial += __shfl_xor_sync(mask, partial, 2);
+            partial += __shfl_xor_sync(mask, partial, 1);
+
+            if (lane == 0) {
+                float score = partial * norm * scale;
+                if (use_shared) shared_scores[t] = score;
+                else            head_scratch[t]  = score;
+            }
         }
-        float score = dot * norm * scale;
-        if (use_shared) shared_scores[t] = score;
-        else            head_scratch[t]  = score;
     }
 
     // 1b — FP32 recent window.
@@ -1022,9 +1059,20 @@ extern ""C"" __global__ void llm_tq_attention(
 
 // ── Scaled dot-product attention with GQA ─────────────────────────────────
 // One block per query head, 256 threads.
-// For seq_len <= MAX_STORED_SCORES we use a stored-scores path with shared
-// memory; otherwise we fall back to the triple-pass recompute path that
-// matches the Vulkan long-context branch (correctness over speed).
+//
+// Score storage strategy (mirrors `llm_tq_attention`):
+//   • Fast path (seq_len ≤ MAX_STORED_SCORES = 4096): keep stored scores in
+//     `__shared__ float scores[]`.
+//   • Slow path (seq_len > MAX_STORED_SCORES): spill per-position scores to a
+//     caller-provided global VRAM scratch buffer
+//     `scores_scratch[h * max_seq_len .. h*max_seq_len + seq_len)`. Each
+//     position is still scored exactly once — global loads in phase 3 hit L2
+//     after phase 1, so the slowdown vs shared memory is modest.
+//     The previous triple-pass recompute path re-derived every Q·K dot in
+//     phase 3, costing O(seq_len × head_dim²) per token; never again.
+//
+// `scores_scratch` may be a null pointer when the caller knows
+// `seq_len ≤ MAX_STORED_SCORES`.
 //
 // Q layout:        [num_heads * head_dim]                — single token query
 // K_cache layout:  [max_seq_len * (num_kv_heads * head_dim)]
@@ -1035,11 +1083,12 @@ extern ""C"" __global__ void llm_attention(
     const float* __restrict__ k_cache,
     const float* __restrict__ v_cache,
     float* __restrict__ out,
+    float* __restrict__ scores_scratch,    // [num_heads * max_seq_len], null when seq_len ≤ MAX_STORED_SCORES
     int num_heads, int num_kv_heads, int head_dim,
     int seq_len, int max_seq_len)
 {
     const int MAX_STORED_SCORES = 4096;
-    __shared__ float scores[MAX_STORED_SCORES];
+    __shared__ float shared_scores[MAX_STORED_SCORES];
     __shared__ float sdata[256];
 
     unsigned int tid = threadIdx.x;
@@ -1052,109 +1101,80 @@ extern ""C"" __global__ void llm_attention(
     long q_off  = (long)h * (long)head_dim;
     long out_off = q_off;
 
-    if (seq_len <= MAX_STORED_SCORES) {
-        // Phase 1: Q·K → scores[t]
-        for (int t = (int)tid; t < seq_len; t += 256) {
-            float dot = 0.f;
-            long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
-            for (int d = 0; d < head_dim; d++)
-                dot += q[q_off + d] * k_cache[k_off + d];
-            scores[t] = dot * scale;
-        }
+    bool use_shared = (seq_len <= MAX_STORED_SCORES);
+    float* head_scratch = scores_scratch + (long)h * (long)max_seq_len;
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Phase 1: write per-position scores to scores buffer (shared or global)
+    // ────────────────────────────────────────────────────────────────────
+    for (int t = (int)tid; t < seq_len; t += 256) {
+        float dot = 0.f;
+        long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+        for (int d = 0; d < head_dim; d++)
+            dot += q[q_off + d] * k_cache[k_off + d];
+        float score = dot * scale;
+        if (use_shared) shared_scores[t] = score;
+        else            head_scratch[t]  = score;
+    }
+    // Pad shared scores tail with -inf so the max scan skips stale slots.
+    // Global scratch doesn't need padding — scans iterate only [0, seq_len).
+    if (use_shared) {
         for (int t = seq_len + (int)tid; t < MAX_STORED_SCORES; t += 256)
-            scores[t] = sharpi_neg_inf();
-        __syncthreads();
+            shared_scores[t] = sharpi_neg_inf();
+    }
+    __syncthreads();
 
-        // Phase 2: softmax(scores)
-        float local_max = sharpi_neg_inf();
-        for (int t = (int)tid; t < seq_len; t += 256)
-            local_max = fmaxf(local_max, scores[t]);
-        sdata[tid] = local_max;
+    // ────────────────────────────────────────────────────────────────────
+    //  Phase 2: in-place softmax over [0, seq_len)
+    // ────────────────────────────────────────────────────────────────────
+    float local_max = sharpi_neg_inf();
+    for (int t = (int)tid; t < seq_len; t += 256) {
+        float s = use_shared ? shared_scores[t] : head_scratch[t];
+        local_max = fmaxf(local_max, s);
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
         __syncthreads();
-        for (unsigned int s = 128; s > 0; s >>= 1) {
-            if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
-            __syncthreads();
-        }
-        float max_val = sdata[0];
-        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
 
-        float local_sum = 0.f;
-        for (int t = (int)tid; t < seq_len; t += 256) {
-            float e = __expf(scores[t] - max_val);
-            scores[t] = e;
-            local_sum += e;
-        }
-        sdata[tid] = local_sum;
+    float local_sum = 0.f;
+    for (int t = (int)tid; t < seq_len; t += 256) {
+        float s = use_shared ? shared_scores[t] : head_scratch[t];
+        float e = __expf(s - max_val);
+        if (use_shared) shared_scores[t] = e;
+        else            head_scratch[t]  = e;
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
         __syncthreads();
-        for (unsigned int s = 128; s > 0; s >>= 1) {
-            if (tid < s) sdata[tid] += sdata[tid + s];
-            __syncthreads();
-        }
-        float sum_exp = sdata[0];
-        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+    __syncthreads();
 
-        float inv_sum = 1.0f / sum_exp;
-        for (int t = (int)tid; t < seq_len; t += 256)
-            scores[t] *= inv_sum;
-        __syncthreads();
+    for (int t = (int)tid; t < seq_len; t += 256) {
+        if (use_shared) shared_scores[t] *= inv_sum;
+        else            head_scratch[t]  *= inv_sum;
+    }
+    __syncthreads();
 
-        // Phase 3: weighted V sum.
-        for (int d = (int)tid; d < head_dim; d += 256) {
-            float acc = 0.f;
-            for (int t = 0; t < seq_len; t++) {
-                long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
-                acc += scores[t] * v_cache[v_off + d];
-            }
-            out[out_off + d] = acc;
+    // ────────────────────────────────────────────────────────────────────
+    //  Phase 3: weighted V sum. K is NOT re-derived here.
+    // ────────────────────────────────────────────────────────────────────
+    for (int d = (int)tid; d < head_dim; d += 256) {
+        float acc = 0.f;
+        for (int t = 0; t < seq_len; t++) {
+            float weight = use_shared ? shared_scores[t] : head_scratch[t];
+            long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            acc += weight * v_cache[v_off + d];
         }
-    } else {
-        // Long-context: triple-pass recompute (~3× the scoring work).
-        float local_max = sharpi_neg_inf();
-        for (int t = (int)tid; t < seq_len; t += 256) {
-            float dot = 0.f;
-            long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
-            for (int d = 0; d < head_dim; d++)
-                dot += q[q_off + d] * k_cache[k_off + d];
-            local_max = fmaxf(local_max, dot * scale);
-        }
-        sdata[tid] = local_max;
-        __syncthreads();
-        for (unsigned int s = 128; s > 0; s >>= 1) {
-            if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
-            __syncthreads();
-        }
-        float max_val = sdata[0];
-        __syncthreads();
-
-        float local_sum = 0.f;
-        for (int t = (int)tid; t < seq_len; t += 256) {
-            float dot = 0.f;
-            long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
-            for (int d = 0; d < head_dim; d++)
-                dot += q[q_off + d] * k_cache[k_off + d];
-            local_sum += __expf(dot * scale - max_val);
-        }
-        sdata[tid] = local_sum;
-        __syncthreads();
-        for (unsigned int s = 128; s > 0; s >>= 1) {
-            if (tid < s) sdata[tid] += sdata[tid + s];
-            __syncthreads();
-        }
-        float sum_exp = sdata[0];
-        __syncthreads();
-
-        for (int d = (int)tid; d < head_dim; d += 256) {
-            float acc = 0.f;
-            for (int t = 0; t < seq_len; t++) {
-                float dot = 0.f;
-                long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
-                for (int dd = 0; dd < head_dim; dd++)
-                    dot += q[q_off + dd] * k_cache[k_off + dd];
-                long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
-                acc += __expf(dot * scale - max_val) / sum_exp * v_cache[v_off + d];
-            }
-            out[out_off + d] = acc;
-        }
+        out[out_off + d] = acc;
     }
 }
 ";

@@ -99,10 +99,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private Tensor? _evictK;
     private Tensor? _evictV;
     // Per-query-head softmax-scores scratch in VRAM, sized [numHeads × maxSeqLen].
-    // Used by the TQ attention kernel when total_seq exceeds the shared-memory
-    // fast-path cap (4096). Allocated only when TQ is enabled and the context can
-    // grow past the cap; otherwise null.
-    private Tensor? _tqScoresScratch;
+    // Used by both the TQ and FP32 attention kernels when the live context exceeds
+    // their shared-memory fast-path cap (4096 positions). Allocated only when
+    // _maxSeqLen > 4096; otherwise null and never touched.
+    private Tensor? _attnScoresScratch;
     private int _tqCompressedLen;
     private int _fp32WriteIdx;
     private int _fp32Count;
@@ -209,11 +209,6 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             _evictK   = gpu.Allocate(TensorShape.D1((long)_numKvHeads * _headDim));
             _evictV   = gpu.Allocate(TensorShape.D1((long)_numKvHeads * _headDim));
 
-            // Long-context kernels need a per-head softmax-scores scratch buffer.
-            // Skip the allocation when the whole context fits in the kernel's shared-mem
-            // fast path (4096 stored scores) — saves a few MiB on small-context runs.
-            if (_maxSeqLen > 4096)
-                _tqScoresScratch = gpu.Allocate(TensorShape.D1((long)_numHeads * _maxSeqLen));
         }
         else
         {
@@ -223,6 +218,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
             }
         }
+
+        // Long-context kernels (both TQ and FP32 attention) need a per-head softmax-scores
+        // scratch buffer once seq_len exceeds the shared-memory fast-path cap (4096).
+        // Skip the allocation when the whole context fits in shared memory — CUDA's
+        // kernels accept a null pointer in that case.
+        if (_maxSeqLen > 4096)
+            _attnScoresScratch = gpu.Allocate(TensorShape.D1((long)_numHeads * _maxSeqLen));
 
         // Upload weights to VRAM
         int L = hp.NumLayers;
@@ -477,7 +479,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 _gpu.TqAttention(_q, _rotatedQ!,
                     _gpuTqKCache![layer], _gpuTqVCache![layer],
                     _gpuKCache[layer], _gpuVCache[layer], _attnOut, _gpuCodebook!,
-                    _tqScoresScratch,
+                    _attnScoresScratch,
                     _numHeads, _numKvHeads, _headDim,
                     _tqCompressedLen, fp32SeqLen, _maxSeqLen, _tqBlockBytes);
             }
@@ -485,6 +487,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             {
                 _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer], kvDim, position, _maxSeqLen);
                 _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                    _attnScoresScratch,
                     _numHeads, _numKvHeads, _headDim, position + 1, _maxSeqLen);
             }
 
@@ -583,6 +586,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             int kvDim = _numKvHeads * _headDim;
             _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer], kvDim, position, _maxSeqLen);
             _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                _attnScoresScratch,
                 _numHeads, _numKvHeads, _headDim, position + 1, _maxSeqLen);
             _gpu.Synchronize();
             AccPhase(PH_KV_ATTN, sw, ref t0);
@@ -850,7 +854,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             _gpu.Free(_rotatedQ!);
             _gpu.Free(_evictK!);
             _gpu.Free(_evictV!);
-            if (_tqScoresScratch is { } scratch) _gpu.Free(scratch);
+            if (_attnScoresScratch is { } scratch) _gpu.Free(scratch);
         }
 
         _kvCache.Dispose();

@@ -856,8 +856,16 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kv_append) failed: {r}");
     }
 
-    /// <summary>Scaled dot-product attention with GQA support. Output: [numHeads * headDim].</summary>
+    /// <summary>
+    /// Scaled dot-product attention with GQA support. Output: [numHeads * headDim].
+    ///
+    /// When <c>seqLen ≤ 4096</c> the kernel keeps per-position scores in shared memory and
+    /// <paramref name="scoresScratch"/> is ignored. Above that threshold the kernel spills
+    /// scores to <paramref name="scoresScratch"/>, which must have room for
+    /// <c>numHeads × maxSeqLen</c> floats. Passing a non-null scratch always works.
+    /// </summary>
     public void Attention(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+                          Tensor? scoresScratch,
                           int numHeads, int numKvHeads, int headDim, int seqLen, int maxSeqLen)
     {
         EnsureImageKernels();
@@ -868,10 +876,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         nint kP = GetDevPtr(kCache);
         nint vP = GetDevPtr(vCache);
         nint oP = GetDevPtr(output);
+        nint ssP = scoresScratch is { } sv ? GetDevPtr(sv) : nint.Zero;
         int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pSL = seqLen, pMSL = maxSeqLen;
-        nint* args = stackalloc nint[9]
+        nint* args = stackalloc nint[10]
         {
             (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
+            (nint)(&ssP),
             (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
             (nint)(&pSL), (nint)(&pMSL)
         };

@@ -391,6 +391,98 @@ public sealed unsafe class CudaTurboQuantTests
         gpu.Free(gpuSigns); gpu.Free(gpuCodebook); gpu.Free(gpuBoundaries);
     }
 
+    /// <summary>
+    /// Strict equivalence check between the FP32 attention kernel's shared-memory fast
+    /// path (seq_len=4096) and the global-scratch slow path (seq_len=4097, just over
+    /// MAX_STORED_SCORES). Mirrors the TQ test's strategy: both paths see identical K/V
+    /// for the first 4096 positions; position 4096 in the slow path has zero V so it
+    /// contributes nothing to any output dim regardless of its softmax weight. The two
+    /// outputs must agree under a single global softmax-rescale factor that recovers
+    /// the slow path's extra denominator contribution.
+    ///
+    /// This is the load-bearing correctness test for the FP32 long-context branch.
+    /// A wrong score, wrong softmax normalization, or wrong V indexing all show up
+    /// here as a per-dim numeric mismatch.
+    /// </summary>
+    [Fact]
+    public void Attention_LongContextScratchPath_MatchesFastPath()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        const int NumHeads = 1;
+        const int NumKvHeads = 1;
+        const int FastLen = 4096;
+        const int SlowLen = 4097;
+        int kvDim = NumKvHeads * HeadDim;
+
+        var rng = new Random(42);
+        var query = RandomUnit(rng);
+
+        // K/V layout matches the kernel: [maxSeqLen, kvDim].
+        var kCacheSlow = new float[(long)SlowLen * kvDim];
+        var vCacheSlow = new float[(long)SlowLen * kvDim];
+        for (int t = 0; t < FastLen; t++)
+        {
+            var k = RandomUnit(rng);
+            var v = RandomUnit(rng);
+            Array.Copy(k, 0, kCacheSlow, t * kvDim, HeadDim);
+            Array.Copy(v, 0, vCacheSlow, t * kvDim, HeadDim);
+        }
+        // Extra position has non-trivial K (contributes to softmax denom) but zero V.
+        var extraK = RandomUnit(rng);
+        Array.Copy(extraK, 0, kCacheSlow, FastLen * kvDim, HeadDim);
+        // V at position FastLen left as zeros.
+
+        // Fast-path uses the first FastLen rows of the same buffer.
+        var kCacheFast = new float[(long)FastLen * kvDim];
+        var vCacheFast = new float[(long)FastLen * kvDim];
+        Array.Copy(kCacheSlow, kCacheFast, (long)FastLen * kvDim);
+        Array.Copy(vCacheSlow, vCacheFast, (long)FastLen * kvDim);
+
+        float[] outFast = RunFp32Path(gpu, NumHeads, NumKvHeads, FastLen, kCacheFast, vCacheFast, query);
+        float[] outSlow = RunFp32Path(gpu, NumHeads, NumKvHeads, SlowLen, kCacheSlow, vCacheSlow, query);
+
+        int probeDim = 0;
+        float bestAbs = MathF.Abs(outFast[probeDim]);
+        for (int d = 1; d < HeadDim; d++)
+            if (MathF.Abs(outFast[d]) > bestAbs) { bestAbs = MathF.Abs(outFast[d]); probeDim = d; }
+        Assert.True(bestAbs > 1e-4f, "Fast-path output is degenerate (all near zero); test inputs are pathological.");
+
+        float ratio = outSlow[probeDim] / outFast[probeDim];
+        for (int d = 0; d < HeadDim; d++)
+        {
+            float expected = outFast[d] * ratio;
+            float diff = MathF.Abs(outSlow[d] - expected);
+            float tol = MathF.Max(1e-3f, MathF.Abs(expected) * 1e-2f);
+            Assert.True(diff < tol,
+                $"FP32 long-context path mismatch at dim {d}: slow={outSlow[d]:E3} expected={expected:E3} " +
+                $"(fast={outFast[d]:E3}, ratio={ratio:F4}, tol={tol:E3}). " +
+                $"Both paths must agree under a single global softmax-rescale factor.");
+        }
+    }
+
+    private static float[] RunFp32Path(CudaBackend gpu, int numHeads, int numKvHeads, int seqLen,
+        float[] kCache, float[] vCache, float[] query)
+    {
+        var gpuQ = gpu.Upload(query, TensorShape.D1(query.Length));
+        var gpuK = gpu.Upload(kCache, TensorShape.D1(kCache.Length));
+        var gpuV = gpu.Upload(vCache, TensorShape.D1(vCache.Length));
+        var gpuOut = gpu.Allocate(TensorShape.D1(numHeads * HeadDim));
+        var gpuScratch = gpu.Allocate(TensorShape.D1((long)numHeads * seqLen));
+
+        gpu.Attention(gpuQ, gpuK, gpuV, gpuOut, gpuScratch,
+            numHeads, numKvHeads, HeadDim, seqLen, seqLen);
+        gpu.Synchronize();
+
+        var output = new float[numHeads * HeadDim];
+        gpu.Download(gpuOut, output);
+
+        gpu.Free(gpuQ); gpu.Free(gpuK); gpu.Free(gpuV);
+        gpu.Free(gpuOut); gpu.Free(gpuScratch);
+        return output;
+    }
+
     private static float[] RunPath(CudaBackend gpu, int numHeads, int numKvHeads,
         int tqLen, long totalUints, float[][] kVecs, float[][] vVecs, float[] queryDir,
         int blockBytes,

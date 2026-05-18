@@ -1201,17 +1201,26 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             (kvDim + 255) / 256, &p);
     }
 
+    /// <summary>
+    /// Scaled dot-product attention with GQA support. <paramref name="scoresScratch"/> is a
+    /// VRAM buffer the kernel spills per-position softmax scores into when <c>seqLen &gt; 4096</c>;
+    /// the fast path uses shared memory instead. Vulkan descriptors require a bound buffer
+    /// regardless, so callers pass a 1-float placeholder when the whole context is guaranteed
+    /// to fit in shared memory.
+    /// </summary>
     public void Attention(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+        Tensor scoresScratch,
         uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen)
     {
-        _attentionPipeline ??= new ComputePipeline(this, Shaders.Attention, 4, pushConstantSize: sizeof(AttentionParams));
+        _attentionPipeline ??= new ComputePipeline(this, Shaders.Attention, 5, pushConstantSize: sizeof(AttentionParams));
         var p = new AttentionParams
         {
             numHeads = numHeads, numKvHeads = numKvHeads,
             headDim = headDim, seqLen = seqLen, maxSeqLen = maxSeqLen
         };
         DispatchOrRecord(_attentionPipeline,
-            [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(output)],
+            [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(output),
+             GetBuffer(scoresScratch)],
             numHeads, &p);
     }
 

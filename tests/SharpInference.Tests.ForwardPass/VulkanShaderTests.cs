@@ -741,8 +741,10 @@ public sealed unsafe class VulkanShaderTests
         var gpuK = backend.Upload(kCache, TensorShape.D2(maxSeqLen, kvDim));
         var gpuV = backend.Upload(vCache, TensorShape.D2(maxSeqLen, kvDim));
         var gpuOut = backend.Allocate(TensorShape.D1(numHeads * headDim));
+        long scratchElems = maxSeqLen > 4096 ? (long)numHeads * maxSeqLen : 1L;
+        var gpuScratch = backend.Allocate(TensorShape.D1(scratchElems));
         ((Vulkan.VulkanBackend)backend).Attention(
-            gpuQ, gpuK, gpuV, gpuOut,
+            gpuQ, gpuK, gpuV, gpuOut, gpuScratch,
             (uint)numHeads, (uint)numKvHeads, (uint)headDim,
             (uint)seqLen, (uint)maxSeqLen);
 
@@ -757,6 +759,7 @@ public sealed unsafe class VulkanShaderTests
         backend.Free(gpuK);
         backend.Free(gpuV);
         backend.Free(gpuOut);
+        backend.Free(gpuScratch);
     }
 
     private static string? FindModelPath()
