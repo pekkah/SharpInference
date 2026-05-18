@@ -183,22 +183,38 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             : _cpuEmbedding;
 
         // ── Upload GPU weights (embedding + output + first N layers) ──
-        if (_cpuEmbeddingOutputOnly)
-        {
-            _gpuEmbedding = null;
-            _gpuOutputNorm = null;
-            _gpuOutputWeight = null;
-            _embIsQuantized = false;
-        }
-        else
+        // Diagnostic env vars for narrowing issues #19/#3:
+        //   SHARPI_HYBRID_GPU_EMBED=1   force embed lookup onto GPU
+        //   SHARPI_HYBRID_GPU_OUTPUT=1  force final norm+output projection onto GPU
+        // Default (both unset) keeps the workaround active: embed and output stay on CPU.
+        bool uploadEmbed = !_cpuEmbeddingOutputOnly
+            || Environment.GetEnvironmentVariable("SHARPI_HYBRID_GPU_EMBED") == "1";
+        bool uploadOutput = !_cpuEmbeddingOutputOnly
+            || Environment.GetEnvironmentVariable("SHARPI_HYBRID_GPU_OUTPUT") == "1";
+
+        if (uploadEmbed)
         {
             _gpuEmbedding = UploadWeight("token_embd.weight");
             _embIsQuantized = model.FindTensor("token_embd.weight")!.Value.DType == DType.Q4_K;
             _gpuWeightDTypes[_gpuEmbedding.Handle] = _embIsQuantized ? DType.Q4_K : DType.Float32;
+        }
+        else
+        {
+            _gpuEmbedding = null;
+            _embIsQuantized = false;
+        }
+
+        if (uploadOutput)
+        {
             _gpuOutputNorm = UploadWeight("output_norm.weight");
             _gpuOutputWeight = model.FindTensor("output.weight") is not null
                 ? UploadWeight("output.weight")
-                : _gpuEmbedding;
+                : (uploadEmbed ? _gpuEmbedding : UploadWeight("token_embd.weight"));
+        }
+        else
+        {
+            _gpuOutputNorm = null;
+            _gpuOutputWeight = null;
         }
 
         _gpuAttnNorm = new Tensor[_nGpuLayers];
@@ -1165,10 +1181,12 @@ public sealed unsafe class HybridForwardPass : IForwardPass
 
     private static bool ShouldKeepFixedWeightsOnCpu(GgufTensorInfo embedding, GgufTensorInfo? output)
     {
-        // Workaround for issues #19 / #3: GPU embed-lookup and Phase-5 norm+output
-        // produce non-finite logits when invoked from HybridForwardPass (but work
-        // from GpuForwardPass). Keeping these on CPU costs ~µs/token vs ms layer
-        // compute. See the issue thread for repro and ruled-out hypotheses.
+        // Workaround for issues #19 / #3 (narrowed 2026-05-18): the GPU embed lookup
+        // writes wrong values when invoked from HybridForwardPass — Phase-5 (final
+        // RmsNorm + output projection) on GPU is fine on its own. Toggle the diagnostic
+        // env vars SHARPI_HYBRID_GPU_EMBED / SHARPI_HYBRID_GPU_OUTPUT to exercise each
+        // path independently in the smoke test. Cost of the CPU fallback is ~µs/token
+        // vs ms layer compute.
         return true;
     }
 
@@ -1580,7 +1598,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         }
         if (_gpuOutputNorm is not null)
             _gpu.Free(_gpuOutputNorm);
-        if (_gpuOutputWeight is not null && _gpuEmbedding is not null && _gpuOutputWeight.Handle != _gpuEmbedding.Handle)
+        if (_gpuOutputWeight is not null && _gpuOutputWeight.Handle != _gpuEmbedding?.Handle)
             _gpu.Free(_gpuOutputWeight);
         if (_gpuEmbedding is not null)
             _gpu.Free(_gpuEmbedding);
