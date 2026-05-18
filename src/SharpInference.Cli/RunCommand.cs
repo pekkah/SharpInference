@@ -527,6 +527,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         sw.Restart();
         int generated = 0;
+        int totalDecoded = 0; // every forward iteration, including thinking-mode tokens
         bool inThinking = false; // set to true when model generates <think> token
         var recentTokens = new List<int>(64);
         var streamDec = new Utf8StreamDecoder();
@@ -559,6 +560,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 Console.Write(streamDec.Append(tok.DecodeBytes(next)));
                 generated++;
             }
+            totalDecoded++;
             recentTokens.Add(next);
             if (recentTokens.Count > 64) recentTokens.RemoveAt(0);
             logits = forward(next, tokens.Count + i);
@@ -569,7 +571,9 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         Console.WriteLine();
         AnsiConsole.MarkupLine($"\n[dim]Prefill: {tokens.Count} tokens, {tokens.Count / (prefillMs / 1000):F1} t/s | " +
-            $"Decode: {generated} tokens, {generated / (decodeMs / 1000):F1} t/s[/]");
+            $"Decode: {totalDecoded} tokens, {totalDecoded / (decodeMs / 1000):F1} t/s" +
+            (totalDecoded > generated ? $" ({generated} visible, {totalDecoded - generated} thinking)" : "") +
+            "[/]");
         return 0;
     }
 
