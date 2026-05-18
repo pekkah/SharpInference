@@ -1165,18 +1165,10 @@ public sealed unsafe class HybridForwardPass : IForwardPass
 
     private static bool ShouldKeepFixedWeightsOnCpu(GgufTensorInfo embedding, GgufTensorInfo? output)
     {
-        // Always keep embedding+output on CPU for the hybrid path. The GPU embedding-lookup
-        // shader produces garbage when invoked inside HybridForwardPass — verified by CLI
-        // smoke tests after the ComputePipeline.RecordWith descriptor-set reuse fix landed:
-        // CPU and all-GPU give "Paris.", hybrid -g 1 with this returning false gives 0
-        // decode tokens (model emits EOS immediately). The same fix DID resolve the MoE
-        // expert-loop NaN cascade (issue #2), so the DS hazard was real, but issue #3 has
-        // a separate root cause that we couldn't localize without RenderDoc-level
-        // instrumentation. The CPU-side dequant of one embedding row per token costs ~µs
-        // vs. millisecond-scale layer compute, so the perf hit is negligible.
-        // TODO: investigate why EmbedLookupQ4K (and/or the final Phase-5 GPU norm+output)
-        // produces wrong values when invoked from HybridForwardPass even though identical
-        // shaders work in GpuForwardPass.
+        // Workaround for issues #19 / #3: GPU embed-lookup and Phase-5 norm+output
+        // produce non-finite logits when invoked from HybridForwardPass (but work
+        // from GpuForwardPass). Keeping these on CPU costs ~µs/token vs ms layer
+        // compute. See the issue thread for repro and ruled-out hypotheses.
         return true;
     }
 

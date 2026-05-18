@@ -177,6 +177,55 @@ public sealed unsafe class VulkanShaderTests
         backend.Free(gpuX);
     }
 
+    /// <summary>Issue #8: NEOX-style Vulkan RoPE shader compiled but had never been
+    /// validated against the CPU formula.</summary>
+    [Fact]
+    public void RoPENeoxMatchesCpu()
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        const int numHeads = 4;
+        const int headDim = 128;
+        const int N = numHeads * headDim;
+        const int position = 5;
+        const float theta = 10000f;
+
+        var input = new float[N];
+        var rng = new Random(42);
+        for (int i = 0; i < N; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // CPU NEOX reference: rotate pair (x[i], x[i + halfDim]) using angle position·freq_i
+        var expected = (float[])input.Clone();
+        int halfDim = headDim / 2;
+        for (int h = 0; h < numHeads; h++)
+        {
+            for (int i = 0; i < halfDim; i++)
+            {
+                float freq = 1f / MathF.Pow(theta, 2f * i / headDim);
+                float angle = position * freq;
+                float cos = MathF.Cos(angle);
+                float sin = MathF.Sin(angle);
+                int j0 = h * headDim + i;
+                int j1 = h * headDim + i + halfDim;
+                float x0 = expected[j0], x1 = expected[j1];
+                expected[j0] = x0 * cos - x1 * sin;
+                expected[j1] = x0 * sin + x1 * cos;
+            }
+        }
+
+        var gpuX = backend.Upload(input, TensorShape.D1(N));
+        backend.RoPE(gpuX, position, headDim, theta, neox: true);
+
+        var result = new float[N];
+        backend.Download(gpuX, result);
+
+        for (int i = 0; i < N; i++)
+            Assert.True(MathF.Abs(result[i] - expected[i]) < 0.01f,
+                $"NEOX RoPE mismatch at [{i}]: gpu={result[i]}, cpu={expected[i]}");
+
+        backend.Free(gpuX);
+    }
+
     [Fact]
     public void MatVecQ4KMatchesCpu()
     {
@@ -785,6 +834,34 @@ public sealed unsafe class VulkanShaderTests
             model, gpu, hp, placement, enableTq: false);
 
         AssertHybridForwardPassProducesCoherentDecode(hybridFwd, tokenizer, prompt: "Hello", hp.VocabSize);
+    }
+
+    /// <summary>Dense non-TQ hybrid smoke test (SmolLM2, 1 GPU layer + rest on CPU).
+    /// Sister to the MoE and TQ-enabled hybrid coverage; with the #19 / #3 workaround
+    /// active this exercises the CPU embed+output fallback.</summary>
+    [Fact]
+    public void HybridForwardPass_DenseSmallVocab_ProducesCoherentDecode()
+    {
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        if (hp.NumLayers < 2) return;
+
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var gpu = new Vulkan.VulkanBackend();
+        var placement = new SharpInference.Engine.LayerPlacement(
+            GpuLayers: 1,
+            CpuLayers: hp.NumLayers - 1,
+            GpuWeightBytes: 0,
+            GpuKvBytes: 0,
+            RecommendedCtxSize: 64);
+        using var hybridFwd = new SharpInference.Engine.HybridForwardPass(
+            model, gpu, hp, placement, enableTq: false);
+
+        AssertHybridForwardPassProducesCoherentDecode(
+            hybridFwd, tokenizer, prompt: "The capital of France is", hp.VocabSize);
     }
 
     /// <summary>

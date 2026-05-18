@@ -1536,6 +1536,35 @@ atomic-free attention reduction, descriptor set caching, fence-based sync, and s
 **Results:** CPU 13.0 t/s, GPU 23.5 t/s decode (RTX 4070 Ti, auto context 17K tokens).
 SmolLM2 1.7B unchanged: CPU 48.5 t/s, GPU 88.7 t/s. Zero managed allocations on GPU for both models.
 
+**Re-validation note (post PR #7 NEOX RoPE fix, issue #10):** Phase 2b was originally
+validated before the RoPE convention bug was identified and fixed in PR #7. On 2026-05-17
+the validation was redone on the same RTX 4070 Ti:
+
+- All-Vulkan-GPU (`-g -1`): "The capital of France is **Paris**." with full coherent
+  follow-up sentence after the `<think>` segment.
+- Hybrid Vulkan (`-g 8`, 8/36 GPU layers): same coherent "Paris" output.
+- CPU (`-g 0`) with `SHARPI_TRACE_NORMS=1`: per-layer residual L2 norms grow smoothly
+  L0≈3 → L35≈1070 across all 36 layers, no NaN/Inf, post-final-norm stays around 130.
+
+Regression coverage added in the same change:
+- `RoPENeoxMatchesCpu` — Vulkan `Shaders.RoPENeox` vs CPU formula (headDim=128, tol=0.01).
+- `HybridForwardPass_DenseSmallVocab_ProducesCoherentDecode` — dense non-TQ non-MoE
+  hybrid path on SmolLM2 with the existing decode-coherence assertions (finite logits,
+  argmax≠EOS at first decode, no degenerate all-EOS greedy sequence).
+
+Cross-engine top-1 diff vs llama.cpp (b8585): with matching chat template
+(`--jinja`, system prompt "You are a helpful assistant.") and greedy decode
+(`--temp 0`), the first 60 decoded tokens are **byte-identical** to
+`llama-completion.exe` on the same Q4_K_M GGUF. Both engines tokenize the
+templated prompt to the same 24-token prefill (151644, 8948, 198, 2610, 525,
+264, 10950, 17847, 13, 151645, 198, 151644, 872, 198, 785, 6722, 315, 9625,
+374, 151645, 198, 151644, 77091, 198) and produce the identical thinking-mode
+decode "&lt;think&gt;\nOkay, the user is asking for the capital of France.
+Let me think. I know that France is a country in Europe, and its capital is a
+well-known city. The most common answer is Paris. But wait, I should make
+sure there's no confusion with other cities. For" up to the n-predict budget.
+Capture script: `scripts/xcheck-llamacpp.ps1`.
+
 **Target model:** Qwen3 8B Q4_K_M (~4.9 GB weights, fits 12GB VRAM with 17K auto context)
 
 ### Phase 3: TurboQuant KV Cache Compression ✅
