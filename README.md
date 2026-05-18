@@ -15,23 +15,23 @@ OpenBLAS in `tools/openblas/` for faster batched GEMM. Build with `dotnet build 
 ## Text generation
 
 Supported architectures: `llama`, `llama4`, `qwen3`, `qwen3moe`. Benchmarked on
-AMD Zen 4 (12c/24t, DDR4-3200) + RTX 4070 Ti (12 GB) at `--temp 0`, prompt
-`"The capital of France is"`, Q4_K_M quant unless noted. Cross-engine top-1
-parity vs llama.cpp b8585 verified on Qwen3-8B (24-token prefill + 60-token
-greedy decode byte-identical with matching chat template).
+AMD Zen 4 (12c/24t, DDR4-3200) + RTX 4070 Ti (12 GB), Q4_K_M, `--temp 0`,
+`-n 80`, prompt `"Write a Python function that sorts a list using the quicksort algorithm:"`.
+Decode rate is **forward-pass iterations / decode time**, so it counts
+thinking-mode tokens too. All outputs verified coherent (`scripts/bench-all.ps1`).
+Cross-engine top-1 parity vs llama.cpp b8585 verified on Qwen3-8B (byte-identical
+60-token greedy decode with matching chat template).
 
-| Model | Repo | Size | Backend | Prefill t/s | Decode t/s | Auto-ctx | Notes |
-|---|---|---:|---|---:|---:|---:|---|
-| SmolLM2 1.7B Instruct | [HuggingFaceTB](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF) | 1 GB | CPU | 23.6 | 53.0 | — | AVX2 fused dequant-matvec |
-| SmolLM2 1.7B Instruct | (same) | 1 GB | Vulkan `-g -1` | 35.4 | 156.7 | 8 192 | GLSL `subgroupAdd` reduce |
-| SmolLM2 1.7B Instruct | (same) | 1 GB | **CUDA** `-g -1` | **172.5** | **150.0** | 8 192 | NVRTC `__dp4a` + Q8_1 |
-| Qwen3 8B | [Qwen](https://huggingface.co/Qwen/Qwen3-8B-GGUF) | 5 GB | Vulkan | 18.8 | 13.0 | 11 399 | |
-| Qwen3 8B | (same) | 5 GB | Vulkan `--tq` | 17.7 | 13.0 | **40 960** | 3-bit KV → full ctx |
-| Qwen3 8B | (same) | 5 GB | **CUDA** | **65.1** | 14.3 | 12 080 | ~3.4× Vulkan prefill |
-| Qwen3-Coder 30B-A3B (MoE) | [Qwen](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF) | 17 GB | CPU | — | 21.0 | varies | 128 experts / 8 active |
-| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | Vulkan | 8.8 | 22.2 | varies | MoE on GPU only [#2](https://github.com/pekkah/SharpInference/issues/2) |
-| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | CPU `--tq` | — | 20.0 | varies | 3-bit KV; CUDA path falls back |
-| Llama 4 Scout 109B-16E | [unsloth](https://huggingface.co/unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF) | 61 GB | CPU | — | ~5 | varies | DDR4-3200 bandwidth-bound |
+| Model | Repo | Size | Backend | Prefill t/s | Decode t/s | Notes |
+|---|---|---:|---|---:|---:|---|
+| SmolLM2 1.7B Instruct | [HuggingFaceTB](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF) | 1 GB | CPU | 16.1 | 39.9 | AVX2 fused dequant-matvec |
+| SmolLM2 1.7B Instruct | (same) | 1 GB | Vulkan `-g -1` | 44.3 | **147.9** | GLSL `subgroupAdd` reduce |
+| SmolLM2 1.7B Instruct | (same) | 1 GB | **CUDA** `-g -1` | **180.2** | **157.8** | NVRTC `__dp4a` + Q8_1 |
+| Qwen3 8B | [Qwen](https://huggingface.co/Qwen/Qwen3-8B-GGUF) | 5 GB | Vulkan `-g -1` | 22.8 | 46.8 | 11.4K auto-ctx |
+| Qwen3 8B | (same) | 5 GB | Vulkan `-g -1 --tq` | 21.5 | 45.5 | 3-bit KV → 40 960 ctx |
+| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1` | **65.4** | **58.0** | ~2.9× Vulkan prefill |
+| Qwen3-Coder 30B-A3B (MoE) | [Qwen](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF) | 17 GB | CPU | 13.0 | 20.6 | 128 experts / 8 active |
+| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | CPU `--tq` | 11.3 | 20.6 | 3-bit KV; GPU MoE gated by [#2](https://github.com/pekkah/SharpInference/issues/2) |
 
 `--backend auto` (default) picks CUDA for dense models with full offload (`-g -1`),
 Vulkan otherwise. `--tq` enables 3-bit TurboQuant KV compression (CPU + Vulkan;
@@ -70,12 +70,16 @@ SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
 ## Image generation
 
 Two pipelines, auto-detected from model filename. Benchmarked on AMD Zen 4
-+ RTX 4070 Ti (CUDA backend, 4 denoising steps, 1024×1024 output).
++ RTX 4070 Ti (CUDA backend, 4 denoising steps, 512×512 output). The CLI is
+a one-shot binary, so each invocation pays the full load + text-encoder
+warmup. The "cached" column is the steady-state cost when the same encoder
+weights stay resident — e.g., re-rendering inside the server or interactive
+loop after the first prompt.
 
-| Pipeline | Components (repo • file • size) | First run | Cached | Notes |
+| Pipeline | Components (repo • file • size) | Per-run | Cached prompt | Notes |
 |---|---|---:|---:|---|
-| **Z-Image-Turbo** | DiT: [jayn7/Z-Image-Turbo-GGUF](https://huggingface.co/jayn7/Z-Image-Turbo-GGUF) `z_image_turbo-Q5_K_M.gguf` 5.5 GB<br/>Encoder: [BennyDaBall/...-AbliteratedV1](https://huggingface.co/BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1) `Z-Image-AbliteratedV1.Q5_K_M.gguf` 2.9 GB<br/>VAE + tokenizer: [Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) `vae/` `tokenizer/` | **~117 s** | **~30 s** | First-run text-encoder warmup ~90 s; cached prompts skip it. DiT ~4 s, VAE ~2 s once cached. |
-| **FLUX.1-schnell** | DiT: [city96/FLUX.1-schnell-gguf](https://huggingface.co/city96/FLUX.1-schnell-gguf) `flux1-schnell-Q4_K_S.gguf` ~7 GB<br/>Encoders + VAE: [comfyanonymous/flux_text_encoders](https://huggingface.co/comfyanonymous/flux_text_encoders) `clip_l.safetensors` + `t5xxl_fp16.safetensors` + `ae.safetensors` | — | — | 4-step distilled; not re-benchmarked this cycle |
+| **Z-Image-Turbo** | DiT: [jayn7/Z-Image-Turbo-GGUF](https://huggingface.co/jayn7/Z-Image-Turbo-GGUF) `z_image_turbo-Q5_K_M.gguf` 5.5 GB<br/>Encoder: [BennyDaBall/...-AbliteratedV1](https://huggingface.co/BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1) `Z-Image-AbliteratedV1.Q5_K_M.gguf` 2.9 GB<br/>VAE + tokenizer: [Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) `vae/` `tokenizer/` | **~108 s** | **~30 s** | Most of the per-run cost is text-encoder warmup (~90 s); DiT ~4 s, VAE ~18 s once weights are hot. Output verified visually. |
+| **FLUX.1-schnell** | DiT: [city96/FLUX.1-schnell-gguf](https://huggingface.co/city96/FLUX.1-schnell-gguf) `flux1-schnell-Q4_K_S.gguf` ~7 GB<br/>Encoders + VAE: [comfyanonymous/flux_text_encoders](https://huggingface.co/comfyanonymous/flux_text_encoders) `clip_l.safetensors` + `t5xxl_fp16.safetensors` + `ae.safetensors` | — | — | 4-step distilled; model not on this benchmark machine |
 
 Optional **4× upscale** via Real-ESRGAN (`RealESRGAN_x4plus.safetensors`):
 runs on CUDA when available, falls back to bicubic.
