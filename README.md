@@ -5,9 +5,6 @@ Runs GGUF models on CPU (AVX2/AVX-512 SIMD) and GPU (Vulkan compute shaders or C
 Includes an OpenAI- and Anthropic-compatible API server and native pipelines for
 [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) and FLUX.1.
 
-> **Status: spike.** A quick experiment to see how LLM tooling can be built
-> from scratch in .NET. Things may be broken or not work as advertised. No warranty — see [LICENSE](LICENSE).
-
 **Requirements:** .NET 10 SDK, x86-64 CPU with AVX2.
 Optional: Vulkan-capable GPU (drivers), CUDA Toolkit 11.x/12.x for NVIDIA paths,
 OpenBLAS in `tools/openblas/` for faster batched GEMM. Build with `dotnet build -c Release`.
