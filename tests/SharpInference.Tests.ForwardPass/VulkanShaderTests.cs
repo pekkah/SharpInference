@@ -779,6 +779,7 @@ public sealed unsafe class VulkanShaderTests
     private static string? FindMoEModelPath()
     {
         return FindModelPath(
+            "models\\OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf",
             "models\\Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
             "models\\Llama-4-Scout-17B-16E-Instruct-Q2_K.gguf");
     }

@@ -23,12 +23,20 @@ namespace SharpInference.Engine;
 /// is supported (e.g. 40K tokens on Qwen3-8B, the unblocking step that closes
 /// the 3.4× memory advantage TurboQuant offers on a 12 GiB card).
 ///
-/// Limitations (intentional, scoped for Qwen3-8B-Q4_K_M first):
-///   • Dense FFN only (no MoE — call site must pass a non-MoE model).
+/// MoE (qwen3moe, olmoe, etc.) is supported as a full-VRAM offload: all expert
+/// weights for every layer are resident, decode runs the router → top-K
+/// softmax/sigmoid → per-expert SwiGLU → weighted combine pattern mirrored from
+/// `GpuForwardPass`. Won't fit on cards with insufficient VRAM (Qwen3-Coder 30B
+/// Q4_K_M needs ~17 GB just for weights — use OLMoE-1B-7B or smaller for
+/// 12 GB validation, see scripts/download-model.ps1).
+///
+/// Limitations (intentional):
 ///   • No NoPE layer skipping (NoRopeLayerStep is honored if set, but the
 ///     primary target Qwen3 uses RoPE on every layer).
 ///   • Embedding table accepted as Q4_K or F32; quantized variants are
 ///     dequantized to F32 on CPU when uploading (small one-time cost).
+///   • MoE + TurboQuant combination not validated (no test model has both;
+///     should compose but the dispatch never sees the combination today).
 /// </summary>
 public sealed unsafe class CudaForwardPass : IForwardPass
 {
@@ -62,9 +70,23 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private readonly Tensor[] _wAttnNorm;
     private readonly Tensor[] _wq, _wk, _wv, _wo;
     private readonly Tensor[] _wFfnNorm;
-    private readonly Tensor[] _wGate, _wUp, _wDown;
+    private readonly Tensor[] _wGate, _wUp, _wDown;            // dense FFN
     private readonly Tensor _wOutputNorm;
     private readonly Tensor _wOutput;
+
+    // ── MoE state (null/empty when !_isMoE) ──────────────────────────────────
+    // Mirrors GpuForwardPass: per-expert weight uploads, router projection, and
+    // scratch buffers for the per-expert FFN accumulation. Top-K selection runs
+    // on CPU after downloading router logits — the same pattern Vulkan uses.
+    private readonly bool _isMoE, _hasSharedExpert;
+    private readonly int _expertDim;
+    private readonly Tensor[]? _wGateInp;                       // router projection per layer
+    private readonly Tensor[][]? _wGateExps, _wUpExps, _wDownExps;
+    private readonly Tensor[]? _wGateShexp, _wUpShexp, _wDownShexp; // shared-expert per layer
+    private readonly Tensor? _routerLogits;                     // [numExperts]
+    private readonly Tensor? _moeSharedOut;                     // [embDim] shared-expert output
+    private readonly Tensor? _moeExpertOut;                     // [embDim] per-expert scratch
+    private readonly float[]? _routerBuf;                       // CPU-side router logits
 
     // Optional attention biases
     private readonly bool _hasAttnBias;
@@ -117,9 +139,6 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         int maxContextLength = 0,
         bool enableTurboQuant = false, int tqFp32Window = 256, int tqBits = 3)
     {
-        if (hp.IsMoE)
-            throw new NotSupportedException("CudaForwardPass currently supports only dense (non-MoE) models. Use the Vulkan backend or CPU path for MoE.");
-
         _model = model;
         _gpu = gpu;
         _hp = hp;
@@ -131,6 +150,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         _numHeads = hp.NumHeads;
         _numKvHeads = hp.NumKvHeads;
         _intermDim = hp.IntermediateDim;
+        _isMoE = hp.IsMoE;
+        _hasSharedExpert = hp.HasSharedExpert;
+        _expertDim = hp.IsMoE ? hp.ExpertIntermediateDim : 0;
 
         if (_tqEnabled && _headDim is not 128 and not 256)
             throw new NotSupportedException(
@@ -166,10 +188,20 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         _k         = gpu.Allocate(TensorShape.D1((long)_numKvHeads * _headDim));
         _v         = gpu.Allocate(TensorShape.D1((long)_numKvHeads * _headDim));
         _attnOut   = gpu.Allocate(TensorShape.D1((long)_numHeads * _headDim));
-        _ffnGate   = gpu.Allocate(TensorShape.D1(_intermDim));
-        _ffnUp     = gpu.Allocate(TensorShape.D1(_intermDim));
+        // FFN scratch sized for MoE expert dim when MoE; dense FFN uses _intermDim.
+        int ffnScratchDim = _isMoE ? _expertDim : _intermDim;
+        _ffnGate   = gpu.Allocate(TensorShape.D1(ffnScratchDim));
+        _ffnUp     = gpu.Allocate(TensorShape.D1(ffnScratchDim));
         _logits    = gpu.Allocate(TensorShape.D1(hp.VocabSize));
         _logitsBuf = new float[hp.VocabSize];
+
+        if (_isMoE)
+        {
+            _routerLogits = gpu.Allocate(TensorShape.D1(hp.NumExperts));
+            _routerBuf    = new float[hp.NumExperts];
+            _moeExpertOut = gpu.Allocate(TensorShape.D1(_embDim));
+            _moeSharedOut = _hasSharedExpert ? gpu.Allocate(TensorShape.D1(_embDim)) : null;
+        }
 
         int kvDim = _numKvHeads * _headDim;
         _gpuKCache = new Tensor[hp.NumLayers];
@@ -230,7 +262,20 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         int L = hp.NumLayers;
         _wAttnNorm = new Tensor[L]; _wFfnNorm = new Tensor[L];
         _wq = new Tensor[L]; _wk = new Tensor[L]; _wv = new Tensor[L]; _wo = new Tensor[L];
+        // Dense FFN arrays are still allocated for MoE so the layout matches; the
+        // MoE-specific arrays below carry the expert/shared weights instead.
         _wGate = new Tensor[L]; _wUp = new Tensor[L]; _wDown = new Tensor[L];
+
+        if (_isMoE)
+        {
+            _wGateInp   = new Tensor[L];
+            _wGateExps  = new Tensor[L][];
+            _wUpExps    = new Tensor[L][];
+            _wDownExps  = new Tensor[L][];
+            _wGateShexp = _hasSharedExpert ? new Tensor[L] : null;
+            _wUpShexp   = _hasSharedExpert ? new Tensor[L] : null;
+            _wDownShexp = _hasSharedExpert ? new Tensor[L] : null;
+        }
 
         _hasAttnBias = hp.HasAttnBias;
         if (_hasAttnBias)
@@ -254,9 +299,25 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             _wv[i] = UploadWeight($"blk.{i}.attn_v.weight");
             _wo[i] = UploadWeight($"blk.{i}.attn_output.weight");
             _wFfnNorm[i] = UploadWeight($"blk.{i}.ffn_norm.weight");
-            _wGate[i] = UploadWeight($"blk.{i}.ffn_gate.weight");
-            _wUp[i]   = UploadWeight($"blk.{i}.ffn_up.weight");
-            _wDown[i] = UploadWeight($"blk.{i}.ffn_down.weight");
+            if (_isMoE)
+            {
+                _wGateInp![i]  = UploadWeight($"blk.{i}.ffn_gate_inp.weight");
+                _wGateExps![i] = UploadExpertWeights($"blk.{i}.ffn_gate_exps.weight", _expertDim, _embDim,    hp.NumExperts);
+                _wUpExps![i]   = UploadExpertWeights($"blk.{i}.ffn_up_exps.weight",   _expertDim, _embDim,    hp.NumExperts);
+                _wDownExps![i] = UploadExpertWeights($"blk.{i}.ffn_down_exps.weight", _embDim,    _expertDim, hp.NumExperts);
+                if (_hasSharedExpert)
+                {
+                    _wGateShexp![i] = UploadWeight($"blk.{i}.ffn_gate_shexp.weight");
+                    _wUpShexp![i]   = UploadWeight($"blk.{i}.ffn_up_shexp.weight");
+                    _wDownShexp![i] = UploadWeight($"blk.{i}.ffn_down_shexp.weight");
+                }
+            }
+            else
+            {
+                _wGate[i] = UploadWeight($"blk.{i}.ffn_gate.weight");
+                _wUp[i]   = UploadWeight($"blk.{i}.ffn_up.weight");
+                _wDown[i] = UploadWeight($"blk.{i}.ffn_down.weight");
+            }
 
             if (_hasAttnBias)
             {
@@ -501,10 +562,17 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             CopyDevice(_residual, _hidden);
             _gpu.RmsNorm(_normBuf, _hidden, _wFfnNorm[layer], _hp.RmsNormEps);
 
-            GpuMatMul(_ffnGate, _wGate[layer], _normBuf);
-            GpuMatMul(_ffnUp,   _wUp[layer],   _normBuf);
-            _gpu.SiLuMul(_ffnGate, _ffnUp);
-            GpuMatMul(_hidden, _wDown[layer], _ffnGate);
+            if (_isMoE)
+            {
+                MoeFfn(layer);
+            }
+            else
+            {
+                GpuMatMul(_ffnGate, _wGate[layer], _normBuf);
+                GpuMatMul(_ffnUp,   _wUp[layer],   _normBuf);
+                _gpu.SiLuMul(_ffnGate, _ffnUp);
+                GpuMatMul(_hidden, _wDown[layer], _ffnGate);
+            }
 
             _gpu.AddInPlace(_hidden, _residual);
         }
@@ -683,6 +751,154 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
     private void CopyDevice(Tensor dst, Tensor src) => _gpu.CopyDevice(dst, src);
 
+    /// <summary>
+    /// MoE FFN: project to router logits, softmax/sigmoid, top-K, then sum over
+    /// the selected experts' SwiGLU outputs weighted by their router gates.
+    /// Matches the Vulkan path's `GpuMoeFfn`; the CUDA stream model means we
+    /// don't need explicit barriers between dependent ops, but the router
+    /// download still needs `Synchronize` so top-K sees finished values.
+    /// </summary>
+    private void MoeFfn(int layer)
+    {
+        int numActive = _hp.NumActiveExperts;
+
+        // Router: project hidden through gate_inp, then softmax or sigmoid in place.
+        GpuMatMul(_routerLogits!, _wGateInp![layer], _normBuf);
+        if (_hp.UseSigmoidGating) _gpu.Sigmoid(_routerLogits!);
+        else                       _gpu.Softmax(_routerLogits!);
+
+        _gpu.Download(_routerLogits!, _routerBuf!);
+        _gpu.Synchronize();
+
+        Span<int> selectedExperts = stackalloc int[numActive];
+        Span<float> expertWeights = stackalloc float[numActive];
+        SelectTopK(_routerBuf!, numActive, selectedExperts, expertWeights);
+
+        // Shared expert (always-active) runs once per layer when present.
+        if (_hasSharedExpert)
+        {
+            GpuMatMul(_ffnGate, _wGateShexp![layer], _normBuf);
+            GpuMatMul(_ffnUp,   _wUpShexp![layer],   _normBuf);
+            _gpu.SiLuMul(_ffnGate, _ffnUp);
+            GpuMatMul(_moeSharedOut!, _wDownShexp![layer], _ffnGate);
+        }
+
+        _gpu.Clear(_hidden);
+
+        for (int i = 0; i < numActive; i++)
+        {
+            int expertIdx = selectedExperts[i];
+            float expertWeight = expertWeights[i];
+
+            GpuMatMul(_ffnGate, _wGateExps![layer][expertIdx], _normBuf);
+            GpuMatMul(_ffnUp,   _wUpExps![layer][expertIdx],   _normBuf);
+
+            // Sigmoid gating: pre-scale gate/up by expertWeight so the post-SiLU
+            // accumulator picks up the gate without an extra scaled-add. Softmax
+            // gating instead uses AddScaledInPlace on the down projection.
+            if (_hp.UseSigmoidGating)
+            {
+                _gpu.ScaleInPlace(_ffnGate, expertWeight);
+                _gpu.ScaleInPlace(_ffnUp,   expertWeight);
+            }
+
+            _gpu.SiLuMul(_ffnGate, _ffnUp);
+            GpuMatMul(_moeExpertOut!, _wDownExps![layer][expertIdx], _ffnGate);
+
+            if (_hp.UseSigmoidGating)
+                _gpu.AddInPlace(_hidden, _moeExpertOut!);
+            else
+                _gpu.AddScaledInPlace(_hidden, _moeExpertOut!, expertWeight);
+        }
+
+        if (_hasSharedExpert)
+            _gpu.AddInPlace(_hidden, _moeSharedOut!);
+    }
+
+    /// <summary>
+    /// Top-K selection in descending order of logit value. Same algorithm as
+    /// <see cref="GpuForwardPass"/>: O(k × n), trivial for k=8 / n=64..128.
+    /// Selected indices stay in arrival order so weights[i] = logits[indices[i]].
+    /// </summary>
+    private static void SelectTopK(ReadOnlySpan<float> logits, int k,
+        Span<int> indices, Span<float> weights)
+    {
+        for (int ki = 0; ki < k; ki++)
+        {
+            int bestIdx = 0;
+            float bestVal = float.MinValue;
+            for (int i = 0; i < logits.Length; i++)
+            {
+                bool alreadySelected = false;
+                for (int j = 0; j < ki; j++)
+                {
+                    if (indices[j] != i) continue;
+                    alreadySelected = true;
+                    break;
+                }
+                if (!alreadySelected && logits[i] > bestVal)
+                {
+                    bestVal = logits[i];
+                    bestIdx = i;
+                }
+            }
+            indices[ki] = bestIdx;
+            weights[ki] = bestVal;
+        }
+    }
+
+    /// <summary>
+    /// Upload all <paramref name="expertCount"/> slices of a stacked expert weight
+    /// tensor — one Tensor per expert. Matches the Vulkan path so per-expert
+    /// MatMul dispatches in MoeFfn use the same indexed layout.
+    /// </summary>
+    private Tensor[] UploadExpertWeights(string name, int rows, int cols, int expertCount)
+    {
+        var tensors = new Tensor[expertCount];
+        for (int expertIdx = 0; expertIdx < expertCount; expertIdx++)
+            tensors[expertIdx] = UploadExpertWeight(name, rows, cols, expertIdx);
+        return tensors;
+    }
+
+    private Tensor UploadExpertWeight(string name, int rows, int cols, int expertIdx)
+    {
+        var info = _model.FindTensor(name)
+            ?? throw new InvalidOperationException($"Missing tensor: {name}");
+        var data = _model.GetTensorData(info);
+
+        if (info.DType == DType.Float32)
+        {
+            int elemOffset = expertIdx * rows * cols;
+            var floats = MemoryMarshal.Cast<byte, float>(data).Slice(elemOffset, rows * cols);
+            var result = _gpu.Upload(floats, TensorShape.D1(floats.Length));
+            _weightDTypes[result.Handle] = DType.Float32;
+            return result;
+        }
+
+        int bytesPerRow = (cols / DTypeInfo.BlockSize(info.DType))
+                        * DTypeInfo.BytesPerBlock(info.DType);
+        int expertBytes = rows * bytesPerRow;
+        int byteOffset = expertIdx * expertBytes;
+        var expertData = data.Slice(byteOffset, expertBytes);
+
+        if (info.DType == DType.Q4_K || info.DType == DType.Q6_K)
+        {
+            var result = _gpu.UploadRaw(expertData, TensorShape.D1(expertData.Length), info.DType);
+            _weightDTypes[result.Handle] = info.DType;
+            return result;
+        }
+        else
+        {
+            // Less-common dtypes: dequantize on CPU and upload as F32.
+            int count = rows * cols;
+            var f32 = new float[count];
+            Dequantize.ToFloat32(expertData, f32, info.DType, count);
+            var result = _gpu.Upload(f32, TensorShape.D1(count));
+            _weightDTypes[result.Handle] = DType.Float32;
+            return result;
+        }
+    }
+
     private Tensor UploadWeight(string name)
     {
         var info = _model.FindTensor(name)
@@ -817,7 +1033,26 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         {
             _gpu.Free(_wAttnNorm[i]); _gpu.Free(_wFfnNorm[i]);
             _gpu.Free(_wq[i]); _gpu.Free(_wk[i]); _gpu.Free(_wv[i]); _gpu.Free(_wo[i]);
-            _gpu.Free(_wGate[i]); _gpu.Free(_wUp[i]); _gpu.Free(_wDown[i]);
+            if (_isMoE)
+            {
+                _gpu.Free(_wGateInp![i]);
+                for (int e = 0; e < _hp.NumExperts; e++)
+                {
+                    _gpu.Free(_wGateExps![i][e]);
+                    _gpu.Free(_wUpExps![i][e]);
+                    _gpu.Free(_wDownExps![i][e]);
+                }
+                if (_hasSharedExpert)
+                {
+                    _gpu.Free(_wGateShexp![i]);
+                    _gpu.Free(_wUpShexp![i]);
+                    _gpu.Free(_wDownShexp![i]);
+                }
+            }
+            else
+            {
+                _gpu.Free(_wGate[i]); _gpu.Free(_wUp[i]); _gpu.Free(_wDown[i]);
+            }
 
             if (_hasAttnBias)
             {
@@ -829,6 +1064,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             {
                 _gpu.Free(_wqNorm![i]); _gpu.Free(_wkNorm![i]);
             }
+        }
+
+        if (_isMoE)
+        {
+            if (_routerLogits is { } rl) _gpu.Free(rl);
+            if (_moeExpertOut is { } eo) _gpu.Free(eo);
+            if (_moeSharedOut is { } so) _gpu.Free(so);
         }
         _gpu.Free(_wOutputNorm);
         if (_wOutput.Handle != _gpuEmbedding.Handle)

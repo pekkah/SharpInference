@@ -3,7 +3,7 @@
     Downloads GGUF models for SharpInference development.
 .DESCRIPTION
     Downloads from HuggingFace to the models/ directory. Skips if already present.
-    Supports: smollm2, qwen3-8b, llama31-70b, qwen3-coder-30b-a3b, llama4-scout,
+    Supports: smollm2, qwen3-8b, olmoe-1b-7b, llama31-70b, qwen3-coder-30b-a3b, llama4-scout,
               z-image-turbo, z-image-turbo-q8, realesrgan-x4
 .PARAMETER Model
     Which model to download. Default: downloads all text models (skips large image models).
@@ -11,6 +11,7 @@
     .\download-model.ps1                                # All text models
     .\download-model.ps1 -Model smollm2                 # SmolLM2 1.7B (1.1 GB)
     .\download-model.ps1 -Model qwen3-8b                # Qwen3 8B (4.9 GB)
+    .\download-model.ps1 -Model olmoe-1b-7b             # OLMoE 1B-7B Instruct Q4_K_M (~4.4 GB) — small MoE for kernel validation
     .\download-model.ps1 -Model llama31-70b             # Llama 3.1 70B (40.8 GB)
     .\download-model.ps1 -Model qwen3-coder-30b-a3b     # Qwen3-Coder 30B-A3B Q4_K_M (18.6 GB)
     .\download-model.ps1 -Model llama4-scout            # Llama 4 Scout Q4_K_M (60.9 GB, 2 shards)
@@ -19,7 +20,7 @@
     .\download-model.ps1 -Model realesrgan-x4           # Real-ESRGAN x4plus upscaler (67 MB)
 #>
 param(
-    [ValidateSet("smollm2", "qwen3-8b", "llama31-70b", "qwen3-coder-30b-a3b", "llama4-scout",
+    [ValidateSet("smollm2", "qwen3-8b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "llama4-scout",
                  "z-image-turbo", "z-image-turbo-q8", "realesrgan-x4")]
     [string]$Model,
     [string]$DestDir
@@ -37,6 +38,16 @@ $Models = @{
         Urls  = @("https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf")
         Size  = "4.9 GB"
         Phase = "2b-3"
+    }
+    # Smallest MoE model that fits in 12 GB VRAM for full-offload kernel validation.
+    # OLMoE arch (allenai) — 7B total params, 1B active, 64 experts × 8 active, softmax routing.
+    # ModelGraph maps "olmoe" → NEOX RoPE, GQA, no shared expert. Used to validate
+    # CudaForwardPass MoE kernels end-to-end on cards that can't fit Qwen3-Coder 30B (17 GB).
+    "olmoe-1b-7b" = @{
+        Files = @("OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf")
+        Urls  = @("https://huggingface.co/bartowski/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf")
+        Size  = "~4.4 GB"
+        Phase = "5a"
     }
     "llama31-70b" = @{
         Files = @("Meta-Llama-3.1-70B-Instruct-Q4_K_M.gguf")

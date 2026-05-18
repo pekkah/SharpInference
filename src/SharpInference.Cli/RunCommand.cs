@@ -197,23 +197,19 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     break;
                 case "auto":
                 case "":
-                    // Auto: pick CUDA when available, the model is dense, and the user asked
-                    // for full-GPU offload (the CUDA forward pass doesn't yet split layers).
-                    // TQ on CUDA is supported for head_dim ∈ {128, 256} only.
+                    // Auto: pick CUDA when available and the user asked for full-GPU offload
+                    // (the CUDA forward pass doesn't yet split layers, so partial offload falls
+                    // through to Vulkan hybrid). TQ on CUDA is supported for head_dim ∈ {128, 256}
+                    // only. MoE on CUDA is supported as full-offload — partial offload would
+                    // still fall through to Vulkan hybrid via the same nGpuLayers check below.
                     bool tqHeadDimOk = hp.HeadDim is 128 or 256;
-                    wantCuda = !hp.IsMoE
-                        && (nGpuLayers == -1 || nGpuLayers >= hp.NumLayers)
+                    wantCuda = (nGpuLayers == -1 || nGpuLayers >= hp.NumLayers)
                         && (!settings.TurboQuant || tqHeadDimOk)
                         && CudaBackend.IsAvailable();
                     break;
                 default:
                     AnsiConsole.MarkupLine($"[red]Error:[/] Unknown --backend value '{settings.Backend}'. Expected one of: auto, vulkan, cuda.");
                     return 1;
-            }
-            if (wantCuda && hp.IsMoE)
-            {
-                AnsiConsole.MarkupLine("[yellow]Note:[/] --backend cuda does not yet support MoE; falling back to Vulkan.");
-                wantCuda = false;
             }
             if (wantCuda && settings.TurboQuant && hp.HeadDim is not 128 and not 256)
             {
