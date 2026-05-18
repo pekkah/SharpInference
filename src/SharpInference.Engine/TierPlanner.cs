@@ -34,7 +34,7 @@ public static class TierPlanner
         bool cpuFixedWeights = ShouldKeepFixedWeightsOnCpu(
             model.FindTensor("token_embd.weight")!.Value,
             model.FindTensor("output.weight"));
-        long embBytes = cpuFixedWeights ? 0 : MeasureGpuTensorBytes(model, "token_embd.weight");
+        long embBytes = cpuFixedWeights ? 0 : MeasureGpuEmbeddingBytes(model, "token_embd.weight");
         long outputBytes = cpuFixedWeights
             ? 0
             : model.FindTensor("output.weight") != null
@@ -131,6 +131,18 @@ public static class TierPlanner
         return info is not null ? ((info.Value.ByteSize + 3) & ~3L) : 0;
     }
 
+    // Embedding-aware: only Q4_K embed stays quantized on GPU (the only quantized
+    // EmbedLookup shader). Anything else gets dequantized to F32 at upload time,
+    // so the post-upload footprint is 4 bytes per element regardless of source dtype.
+    private static long MeasureGpuEmbeddingBytes(GgufModel model, string name)
+    {
+        var info = model.FindTensor(name);
+        if (info is null) return 0;
+        if (info.Value.DType == DType.Q4_K)
+            return (info.Value.ByteSize + 3) & ~3L;
+        return info.Value.ElementCount * sizeof(float);
+    }
+
     private static long MeasureGpuTensorBytes(GgufModel model, string name)
     {
         var info = model.FindTensor(name);
@@ -193,7 +205,10 @@ public static class TierPlanner
     private static bool ShouldKeepFixedWeightsOnCpu(GgufTensorInfo embedding, GgufTensorInfo? output)
     {
         const long maxStorageBufferBytes = 2L * 1024 * 1024 * 1024 - 1;
-        if (EstimateGpuTensorBytes(embedding) > maxStorageBufferBytes)
+        long embBytes = embedding.DType == DType.Q4_K
+            ? (embedding.ByteSize + 3) & ~3L
+            : embedding.ElementCount * sizeof(float);
+        if (embBytes > maxStorageBufferBytes)
             return true;
         if (output is not null && EstimateGpuTensorBytes(output.Value) > maxStorageBufferBytes)
             return true;

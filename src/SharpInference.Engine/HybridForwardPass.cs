@@ -72,7 +72,6 @@ public sealed unsafe class HybridForwardPass : IForwardPass
     private readonly float[] _logitsBuf;
     private readonly float[]? _gpuRouterBuf;
     private readonly bool _hasAttnBias, _hasQkNorm, _isMoE, _hasSharedExpert;
-    private readonly bool _cpuEmbeddingOutputOnly;
     private readonly bool _tqEnabled;
     private readonly int _tqFp32Window;
     private readonly int _tqBlockBytes;
@@ -144,7 +143,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         _hasQkNorm = hp.HasQkNorm;
         _isMoE = hp.IsMoE;
         _hasSharedExpert = hp.HasSharedExpert;
-        _cpuEmbeddingOutputOnly = ShouldKeepFixedWeightsOnCpu(
+        bool cpuEmbeddingOutputOnly = ShouldKeepFixedWeightsOnCpu(
             model.FindTensor("token_embd.weight")!.Value,
             model.FindTensor("output.weight"));
         _tqEnabled = enableTq;
@@ -183,20 +182,9 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             : _cpuEmbedding;
 
         // ── Upload GPU weights (embedding + output + first N layers) ──
-        // Diagnostic env vars for narrowing issues #19/#3:
-        //   SHARPI_HYBRID_GPU_EMBED=1   force embed lookup onto GPU
-        //   SHARPI_HYBRID_GPU_OUTPUT=1  force final norm+output projection onto GPU
-        // Default (both unset) keeps the workaround active: embed and output stay on CPU.
-        bool uploadEmbed = !_cpuEmbeddingOutputOnly
-            || Environment.GetEnvironmentVariable("SHARPI_HYBRID_GPU_EMBED") == "1";
-        bool uploadOutput = !_cpuEmbeddingOutputOnly
-            || Environment.GetEnvironmentVariable("SHARPI_HYBRID_GPU_OUTPUT") == "1";
-
-        if (uploadEmbed)
+        if (!cpuEmbeddingOutputOnly)
         {
-            _gpuEmbedding = UploadWeight("token_embd.weight");
-            _embIsQuantized = model.FindTensor("token_embd.weight")!.Value.DType == DType.Q4_K;
-            _gpuWeightDTypes[_gpuEmbedding.Handle] = _embIsQuantized ? DType.Q4_K : DType.Float32;
+            _gpuEmbedding = UploadEmbeddingWeight("token_embd.weight", out _embIsQuantized);
         }
         else
         {
@@ -204,12 +192,12 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             _embIsQuantized = false;
         }
 
-        if (uploadOutput)
+        if (!cpuEmbeddingOutputOnly)
         {
             _gpuOutputNorm = UploadWeight("output_norm.weight");
             _gpuOutputWeight = model.FindTensor("output.weight") is not null
                 ? UploadWeight("output.weight")
-                : (uploadEmbed ? _gpuEmbedding : UploadWeight("token_embd.weight"));
+                : _gpuEmbedding;
         }
         else
         {
@@ -1181,13 +1169,15 @@ public sealed unsafe class HybridForwardPass : IForwardPass
 
     private static bool ShouldKeepFixedWeightsOnCpu(GgufTensorInfo embedding, GgufTensorInfo? output)
     {
-        // Workaround for issues #19 / #3 (narrowed 2026-05-18): the GPU embed lookup
-        // writes wrong values when invoked from HybridForwardPass — Phase-5 (final
-        // RmsNorm + output projection) on GPU is fine on its own. Toggle the diagnostic
-        // env vars SHARPI_HYBRID_GPU_EMBED / SHARPI_HYBRID_GPU_OUTPUT to exercise each
-        // path independently in the smoke test. Cost of the CPU fallback is ~µs/token
-        // vs ms layer compute.
-        return true;
+        const long maxStorageBufferBytes = 2L * 1024 * 1024 * 1024 - 1;
+        // Embedding goes through F32 dequant for any non-Q4_K format (no Q6_K embed
+        // shader exists), so its post-upload size can be much larger than the raw
+        // GGUF byte size — use the embedding-aware estimator here.
+        if (EstimateGpuEmbeddingBytes(embedding) > maxStorageBufferBytes)
+            return true;
+        if (output is not null && EstimateGpuTensorBytes(output.Value) > maxStorageBufferBytes)
+            return true;
+        return false;
     }
 
     private static long EstimateGpuTensorBytes(GgufTensorInfo tensor)
@@ -1196,6 +1186,48 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             return (tensor.ByteSize + 3) & ~3L;
 
         return tensor.ElementCount * sizeof(float);
+    }
+
+    // Embedding-table upload mirrors GpuForwardPass: only Q4_K has a quantized
+    // EmbedLookup shader, so any other dtype must be dequantized to F32 first
+    // (otherwise the F32 EmbedLookup shader reinterprets raw quantized bytes
+    // as floats — producing NaN/huge values, the cause of issues #3/#19).
+    private static long EstimateGpuEmbeddingBytes(GgufTensorInfo tensor)
+    {
+        if (tensor.DType == DType.Q4_K)
+            return (tensor.ByteSize + 3) & ~3L;
+        return tensor.ElementCount * sizeof(float);
+    }
+
+    private Tensor UploadEmbeddingWeight(string name, out bool isQuantized)
+    {
+        var info = _model.FindTensor(name)
+            ?? throw new InvalidOperationException($"Missing tensor: {name}");
+        var data = _model.GetTensorData(info);
+
+        Tensor result;
+        if (info.DType == DType.Q4_K)
+        {
+            int floatCount = data.Length / 4;
+            var rawFloats = new float[floatCount];
+            data.CopyTo(MemoryMarshal.AsBytes(rawFloats.AsSpan()));
+            result = _gpu.Upload(rawFloats, TensorShape.D1(floatCount));
+            _gpuWeightDTypes[result.Handle] = DType.Q4_K;
+            isQuantized = true;
+        }
+        else
+        {
+            int count = (int)info.ElementCount;
+            var f32 = new float[count];
+            if (info.DType == DType.Float32)
+                MemoryMarshal.Cast<byte, float>(data).CopyTo(f32);
+            else
+                Dequantize.ToFloat32(data, f32, info.DType, count);
+            result = _gpu.Upload(f32, TensorShape.D1(count));
+            _gpuWeightDTypes[result.Handle] = DType.Float32;
+            isQuantized = false;
+        }
+        return result;
     }
 
     private Tensor UploadWeight(string name)

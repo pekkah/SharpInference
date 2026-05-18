@@ -837,8 +837,10 @@ public sealed unsafe class VulkanShaderTests
     }
 
     /// <summary>Dense non-TQ hybrid smoke test (SmolLM2, 1 GPU layer + rest on CPU).
-    /// Sister to the MoE and TQ-enabled hybrid coverage; with the #19 / #3 workaround
-    /// active this exercises the CPU embed+output fallback.</summary>
+    /// Sister to the MoE and TQ-enabled hybrid coverage. Exercises the GPU embed
+    /// lookup + GPU output projection paths end-to-end (regression guard for #19/#3,
+    /// where Q6_K embed tables were uploaded as raw bytes and reinterpreted by the
+    /// F32 EmbedLookup shader, producing NaN/huge values).</summary>
     [Fact]
     public void HybridForwardPass_DenseSmallVocab_ProducesCoherentDecode()
     {
