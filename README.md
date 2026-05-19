@@ -27,7 +27,9 @@ Cross-engine top-1 parity vs llama.cpp b8585 verified on Qwen3-8B (byte-identica
 | Qwen3 8B | [Qwen](https://huggingface.co/Qwen/Qwen3-8B-GGUF) | 5 GB | Vulkan `-g -1` | 22.8 | 46.8 | 11.4K auto-ctx |
 | Qwen3 8B | (same) | 5 GB | Vulkan `-g -1 --tq` | 21.5 | 45.5 | 3-bit KV → 40 960 ctx |
 | Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1` | **65.4** | **58.0** | ~2.9× Vulkan prefill |
+| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --no-thinking` | **65.5** | **57.4** | Same per-token rate; reasoning suppressed in chat template, so all decoded tokens are visible answer |
 | Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq` | **66.1** | **65.4** | 3-bit KV → 40 960 ctx; 17 t/s @ 8K, 10 t/s @ 16K |
+| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq --no-thinking` | **65.4** | **57.2** | Same per-token rate as `--tq` alone; reasoning suppressed |
 | Qwen3-Coder 30B-A3B (MoE) | [Qwen](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF) | 17 GB | CPU | 13.0 | 20.6 | 128 experts / 8 active |
 | Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | CPU `--tq` | 11.3 | 20.6 | 3-bit KV |
 | Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | Vulkan `-g -1` (hybrid) | 0.9 | 8.8 | 29 GPU + 19 CPU layers (auto) |
