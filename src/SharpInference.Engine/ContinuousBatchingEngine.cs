@@ -9,18 +9,26 @@ namespace SharpInference.Engine;
 /// in lock-step batches, amortizing weight reads across N sequences per decode step.
 ///
 /// Flow:
-///   1. Caller enqueues requests via <see cref="GenerateAsync"/>.
+///   1. Caller enqueues requests via <see cref="GenerateChunksAsync"/>.
 ///   2. Background batcher admits pending requests one at a time (prefilling each individually).
 ///   3. All active sequences are decoded together in a single <see cref="ForwardPass.BatchForwardMulti"/> call.
 ///   4. Sequences that hit EOS or max tokens are retired; their caches are returned to the pool.
 ///
 /// Not supported for MoE models or when TurboQuant KV cache is enabled.
+///
+/// Reasoning support: when constructed with <c>thinkTokenId</c> / <c>endThinkTokenId</c>,
+/// the engine splits each sequence's output into <see cref="GenerateChunkKind.Thinking"/>
+/// and <see cref="GenerateChunkKind.Text"/> chunks. Per-sequence state tracks the current
+/// reasoning mode and uses independent UTF-8 decoders so multi-byte chars in either stream
+/// reassemble cleanly.
 /// </summary>
 public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
 {
     private readonly ForwardPass _fwd;
     private readonly ITokenizer _tokenizer;
     private readonly int _maxBatchSize;
+    private readonly int _thinkTokenId;
+    private readonly int _endThinkTokenId;
 
     private readonly Channel<PendingRequest> _queue =
         Channel.CreateUnbounded<PendingRequest>(new UnboundedChannelOptions { SingleWriter = false, SingleReader = true });
@@ -31,12 +39,12 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
     private int _pendingCount;
     private int _activeCount;
 
-    private sealed class PendingRequest(string prompt, SamplingParams sp, CancellationToken ct, Channel<string> output)
+    private sealed class PendingRequest(string prompt, SamplingParams sp, CancellationToken ct, Channel<GenerateChunk> output)
     {
         public readonly string Prompt = prompt;
         public readonly SamplingParams Sp = sp;
         public readonly CancellationToken Ct = ct;
-        public readonly Channel<string> Output = output;
+        public readonly Channel<GenerateChunk> Output = output;
     }
 
     private sealed class ActiveSeq
@@ -45,26 +53,45 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         public required int Position;       // position at which CurrentToken will be decoded
         public required PagedKvCache Cache;
         public required SamplingParams Sp;
-        public required Channel<string> Output;
+        public required Channel<GenerateChunk> Output;
         public required int[] StopIds;
         public required Random Rng;
         public required CancellationToken Ct;
         public int TokenCount;
-        // Per-sequence stateful UTF-8 decoder: reassembles multi-byte characters
-        // split across tokens (CJK, emoji, smart quotes).
-        public Utf8StreamDecoder StreamDec = new();
+        // Per-sequence stateful UTF-8 decoders: reassembles multi-byte characters
+        // split across tokens (CJK, emoji, smart quotes). Independent decoders for
+        // the answer stream and reasoning stream so neither pollutes the other.
+        public Utf8StreamDecoder TextDec = new();
+        public Utf8StreamDecoder ThinkDec = new();
+        public bool InThinking;
     }
 
+    /// <param name="fwd">Forward pass implementation. Owned externally — caller disposes.</param>
+    /// <param name="tokenizer">Tokenizer matching the model vocabulary.</param>
+    /// <param name="modelId">Human-readable model identifier returned in API responses.</param>
+    /// <param name="maxBatchSize">Maximum concurrent decode sequences. Clamped to ≥ 1.</param>
+    /// <param name="thinkTokenId">
+    /// Token ID of the model's <c>&lt;think&gt;</c> marker, or <c>-1</c> if the model has no reasoning
+    /// stream. When <c>-1</c>, all chunks are emitted as <see cref="GenerateChunkKind.Text"/>.
+    /// </param>
+    /// <param name="endThinkTokenId">
+    /// Token ID of the model's <c>&lt;/think&gt;</c> marker, or <c>-1</c>. Must be paired with
+    /// a non-negative <paramref name="thinkTokenId"/> to enable reasoning-stream splitting.
+    /// </param>
     public ContinuousBatchingEngine(
         ForwardPass fwd,
         ITokenizer tokenizer,
         string modelId,
-        int maxBatchSize = 8)
+        int maxBatchSize = 8,
+        int thinkTokenId = -1,
+        int endThinkTokenId = -1)
     {
         _fwd = fwd;
         _tokenizer = tokenizer;
         ModelId = modelId;
         _maxBatchSize = Math.Max(1, maxBatchSize);
+        _thinkTokenId = thinkTokenId;
+        _endThinkTokenId = endThinkTokenId;
         _batcherTask = Task.Run(BatcherLoop);
     }
 
@@ -76,13 +103,31 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
     /// <summary>Number of requests currently in the active decode batch.</summary>
     public int ActiveRequests => _activeCount;
 
-    /// <inheritdoc/>
+    /// <summary>
+    /// Back-compat string-stream view of <see cref="GenerateChunksAsync"/>: yields only
+    /// user-facing answer text, suppressing reasoning chunks. Equivalent to the default
+    /// interface-method implementation on <see cref="IInferenceEngine"/> but callable
+    /// directly on the concrete type.
+    /// </summary>
     public async IAsyncEnumerable<string> GenerateAsync(
         string prompt,
         SamplingParams sp,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
-        var channel = Channel.CreateUnbounded<string>(
+        await foreach (var c in GenerateChunksAsync(prompt, sp, ct).WithCancellation(ct).ConfigureAwait(false))
+        {
+            if (c.Kind == GenerateChunkKind.Text)
+                yield return c.Text;
+        }
+    }
+
+    /// <inheritdoc/>
+    public async IAsyncEnumerable<GenerateChunk> GenerateChunksAsync(
+        string prompt,
+        SamplingParams sp,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var channel = Channel.CreateUnbounded<GenerateChunk>(
             new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
 
         Interlocked.Increment(ref _pendingCount);
@@ -99,6 +144,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         var tokensBuf = new int[_maxBatchSize];
         var posBuf = new int[_maxBatchSize];
         var cacheBuf = new PagedKvCache[_maxBatchSize];
+        bool thinkingEnabled = _thinkTokenId >= 0 && _endThinkTokenId >= 0;
 
         while (!_disposed)
         {
@@ -108,7 +154,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                 Interlocked.Decrement(ref _pendingCount);
                 try
                 {
-                    AdmitRequest(req, active);
+                    AdmitRequest(req, active, thinkingEnabled);
                 }
                 catch (Exception ex)
                 {
@@ -158,19 +204,47 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
 
                 if (done)
                 {
-                    var tail = seq.StreamDec.Flush();
-                    if (tail.Length > 0)
-                        seq.Output.Writer.TryWrite(tail);
-                    seq.Output.Writer.TryComplete();
+                    FlushAndComplete(seq);
                     seq.Cache.Dispose();
                     active.RemoveAt(i);
                     Interlocked.Decrement(ref _activeCount);
                 }
                 else
                 {
-                    var chunk = seq.StreamDec.Append(_tokenizer.DecodeBytes(next));
-                    if (chunk.Length > 0)
-                        seq.Output.Writer.TryWrite(chunk);
+                    // Reasoning boundary tokens: flip state, consume the token, do NOT emit content.
+                    // Each direction requires the opposite state, so malformed double <think>
+                    // or orphan </think> falls through to the content path below.
+                    if (thinkingEnabled && next == _thinkTokenId && !seq.InThinking)
+                    {
+                        var textTail = seq.TextDec.Flush();
+                        if (textTail.Length > 0)
+                            seq.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, textTail));
+                        seq.InThinking = true;
+                    }
+                    else if (thinkingEnabled && next == _endThinkTokenId && seq.InThinking)
+                    {
+                        var thinkTail = seq.ThinkDec.Flush();
+                        if (thinkTail.Length > 0)
+                            seq.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Thinking, thinkTail));
+                        seq.InThinking = false;
+                    }
+                    else
+                    {
+                        var bytes = _tokenizer.DecodeBytes(next);
+                        if (seq.InThinking)
+                        {
+                            var chunk = seq.ThinkDec.Append(bytes);
+                            if (chunk.Length > 0)
+                                seq.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Thinking, chunk));
+                        }
+                        else
+                        {
+                            var chunk = seq.TextDec.Append(bytes);
+                            if (chunk.Length > 0)
+                                seq.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, chunk));
+                        }
+                    }
+
                     seq.CurrentToken = next;
                     seq.Position++;
                     seq.TokenCount++;
@@ -181,17 +255,25 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         // Drain: complete any remaining active sequences
         foreach (var seq in active)
         {
-            var tail = seq.StreamDec.Flush();
-            if (tail.Length > 0)
-                seq.Output.Writer.TryWrite(tail);
-            seq.Output.Writer.TryComplete();
+            FlushAndComplete(seq);
             seq.Cache.Dispose();
             Interlocked.Decrement(ref _activeCount);
         }
         active.Clear();
     }
 
-    private void AdmitRequest(PendingRequest req, List<ActiveSeq> active)
+    private static void FlushAndComplete(ActiveSeq seq)
+    {
+        var textTail = seq.TextDec.Flush();
+        if (textTail.Length > 0)
+            seq.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, textTail));
+        var thinkTail = seq.ThinkDec.Flush();
+        if (thinkTail.Length > 0)
+            seq.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Thinking, thinkTail));
+        seq.Output.Writer.TryComplete();
+    }
+
+    private void AdmitRequest(PendingRequest req, List<ActiveSeq> active, bool thinkingEnabled)
     {
         if (req.Ct.IsCancellationRequested)
         {
@@ -235,9 +317,22 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             Ct = req.Ct,
             TokenCount = 1,
         };
-        var firstChunk = seq.StreamDec.Append(_tokenizer.DecodeBytes(firstToken));
-        if (firstChunk.Length > 0)
-            req.Output.Writer.TryWrite(firstChunk);
+
+        // Route the first sampled token through the same state machine as the decode loop.
+        // It's vanishingly rare for the first sampled token to itself be `<think>`, but
+        // handle it cleanly so behavior is symmetric. A stray `</think>` here has no
+        // open block to close, so we treat it as content (same fall-through as decode).
+        if (thinkingEnabled && firstToken == _thinkTokenId)
+        {
+            seq.InThinking = true;
+        }
+        else
+        {
+            var bytes = _tokenizer.DecodeBytes(firstToken);
+            var firstChunk = seq.TextDec.Append(bytes);
+            if (firstChunk.Length > 0)
+                req.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, firstChunk));
+        }
 
         active.Add(seq);
         Interlocked.Increment(ref _activeCount);

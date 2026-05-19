@@ -54,13 +54,28 @@ builder.Services.AddSingleton<IInferenceEngine>(sp =>
     var fwd = new ForwardPass(model, cpuBackend, hp);
     var modelId = Path.GetFileNameWithoutExtension(modelPath);
 
+    // Reasoning models (Qwen3, DeepSeek-R1, SmolLM3, ...) register <think>/</think>
+    // as control/user-defined special tokens. Looking them up here lets the engine
+    // split each turn into reasoning + answer chunks. Require both > 0 — id 0 is
+    // usually <pad>/<unk> and would mis-trigger; missing tokens leave the
+    // boundary detection disabled (engine emits only Text chunks).
+    int thinkTokenId = -1;
+    int endThinkTokenId = -1;
+    if (tokenizer.SpecialTokens.TryGetValue("<think>", out int tid)
+        && tokenizer.SpecialTokens.TryGetValue("</think>", out int eid)
+        && tid > 0 && eid > 0)
+    {
+        thinkTokenId = tid;
+        endThinkTokenId = eid;
+    }
+
     int maxBatch = 1;
     if (int.TryParse(Environment.GetEnvironmentVariable("SHARPI_MAX_BATCH"), out int mb) && mb > 1)
         maxBatch = mb;
 
     if (maxBatch > 1)
-        return new ContinuousBatchingEngine(fwd, tokenizer, modelId, maxBatch);
-    return new InferenceEngine(fwd, tokenizer, modelId, cpuBackend, model);
+        return new ContinuousBatchingEngine(fwd, tokenizer, modelId, maxBatch, thinkTokenId, endThinkTokenId);
+    return new InferenceEngine(fwd, tokenizer, modelId, thinkTokenId, endThinkTokenId, cpuBackend, model);
 });
 
 var app = builder.Build();

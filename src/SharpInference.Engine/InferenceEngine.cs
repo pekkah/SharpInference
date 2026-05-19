@@ -12,6 +12,11 @@ namespace SharpInference.Engine;
 /// Prefix caching: if successive prompts share a page-aligned token prefix, the KV cache
 /// for those positions is reused and only the new suffix is prefilled — eliminating
 /// redundant computation for repeated system prompts.
+///
+/// Reasoning support: when constructed with <c>thinkTokenId</c> / <c>endThinkTokenId</c>
+/// for a model that emits <c>&lt;think&gt;...&lt;/think&gt;</c>, the engine splits output
+/// into <see cref="GenerateChunkKind.Thinking"/> and <see cref="GenerateChunkKind.Text"/>
+/// chunks. Boundary tokens themselves are consumed and never appear in chunk text.
 /// </summary>
 public sealed class InferenceEngine : IInferenceEngine, IDisposable
 {
@@ -19,6 +24,8 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
     private readonly ITokenizer _tokenizer;
     private readonly IDisposable[] _owned;
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly int _thinkTokenId;
+    private readonly int _endThinkTokenId;
 
     // Prefix caching state (guarded by _gate — only accessed during generation).
     private int[]? _prevTokens;
@@ -40,17 +47,42 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
     /// <param name="fwd">Forward pass implementation (CPU / GPU / Hybrid). Owned by this engine.</param>
     /// <param name="tokenizer">Tokenizer matching the model vocabulary.</param>
     /// <param name="modelId">Human-readable model identifier returned in API responses.</param>
+    /// <param name="thinkTokenId">
+    /// Token ID of the model's <c>&lt;think&gt;</c> marker, or <c>-1</c> if the model has no reasoning
+    /// stream. When <c>-1</c>, all chunks are emitted as <see cref="GenerateChunkKind.Text"/>.
+    /// </param>
+    /// <param name="endThinkTokenId">
+    /// Token ID of the model's <c>&lt;/think&gt;</c> marker, or <c>-1</c>. Must be paired with
+    /// a non-negative <paramref name="thinkTokenId"/> to enable reasoning-stream splitting.
+    /// </param>
     /// <param name="owned">Additional disposable resources owned by this engine (backend, model handle, etc.).</param>
     public InferenceEngine(
         IForwardPass fwd,
         ITokenizer tokenizer,
         string modelId,
+        int thinkTokenId,
+        int endThinkTokenId,
         params IDisposable[] owned)
     {
         _fwd = fwd;
         _tokenizer = tokenizer;
         ModelId = modelId;
+        _thinkTokenId = thinkTokenId;
+        _endThinkTokenId = endThinkTokenId;
         _owned = owned;
+    }
+
+    /// <summary>
+    /// Back-compat constructor preserving the original positional signature
+    /// (no reasoning-token IDs). Equivalent to passing <c>thinkTokenId = -1</c>.
+    /// </summary>
+    public InferenceEngine(
+        IForwardPass fwd,
+        ITokenizer tokenizer,
+        string modelId,
+        params IDisposable[] owned)
+        : this(fwd, tokenizer, modelId, thinkTokenId: -1, endThinkTokenId: -1, owned)
+    {
     }
 
     /// <summary>
@@ -73,8 +105,26 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
         return aligned;
     }
 
-    /// <inheritdoc/>
+    /// <summary>
+    /// Back-compat string-stream view of <see cref="GenerateChunksAsync"/>: yields only
+    /// user-facing answer text, suppressing reasoning chunks. Equivalent to the default
+    /// interface-method implementation on <see cref="IInferenceEngine"/> but callable
+    /// directly on the concrete type.
+    /// </summary>
     public async IAsyncEnumerable<string> GenerateAsync(
+        string prompt,
+        SamplingParams sp,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        await foreach (var c in GenerateChunksAsync(prompt, sp, ct).WithCancellation(ct).ConfigureAwait(false))
+        {
+            if (c.Kind == GenerateChunkKind.Text)
+                yield return c.Text;
+        }
+    }
+
+    /// <inheritdoc/>
+    public async IAsyncEnumerable<GenerateChunk> GenerateChunksAsync(
         string prompt,
         SamplingParams sp,
         [EnumeratorCancellation] CancellationToken ct = default)
@@ -85,8 +135,13 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
         Interlocked.Increment(ref _activeCount);
         try
         {
-            var channel = Channel.CreateUnbounded<string>(
+            var channel = Channel.CreateUnbounded<GenerateChunk>(
                 new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+
+            // Capture reasoning-token IDs into locals to avoid repeated field reads in the hot loop.
+            int thinkId = _thinkTokenId;
+            int endThinkId = _endThinkTokenId;
+            bool thinkingEnabled = thinkId >= 0 && endThinkId >= 0;
 
             // Run the blocking CPU generation on a thread-pool thread.
             var genTask = Task.Run(() =>
@@ -119,10 +174,13 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
 
                     _prevTokens = tokens;
 
-                    // Decode loop. Stream UTF-8 through a stateful decoder so multi-byte
-                    // characters split across tokens (CJK, emoji, smart quotes) are
-                    // reassembled instead of producing U+FFFD per partial sequence.
-                    var streamDec = new Utf8StreamDecoder();
+                    // Decode loop. Separate stateful UTF-8 decoders for the answer stream and
+                    // the thinking stream so multi-byte characters in either stream reassemble
+                    // independently — the two streams never share decoder state.
+                    var textDec = new Utf8StreamDecoder();
+                    var thinkDec = new Utf8StreamDecoder();
+                    bool inThinking = false;
+
                     for (int i = 0; i < sp.MaxNewTokens; i++)
                     {
                         ct.ThrowIfCancellationRequested();
@@ -133,14 +191,55 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
 
                         if (stopIds.Contains(next)) break;
 
-                        var chunk = streamDec.Append(_tokenizer.DecodeBytes(next));
-                        if (chunk.Length > 0)
-                            channel.Writer.TryWrite(chunk);
+                        // Reasoning boundary tokens: flip state, consume the token, do NOT emit.
+                        // Both directions require the *opposite* state — a malformed second
+                        // <think> mid-reasoning, or a stray </think> with no open block, falls
+                        // through to the content path below rather than silently corrupting state.
+                        if (thinkingEnabled && next == thinkId && !inThinking)
+                        {
+                            // Flush any pending text bytes before entering thinking mode.
+                            var textTail = textDec.Flush();
+                            if (textTail.Length > 0)
+                                channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, textTail));
+                            inThinking = true;
+                            logits = _fwd.Forward(next, tokens.Length + i);
+                            continue;
+                        }
+                        if (thinkingEnabled && next == endThinkId && inThinking)
+                        {
+                            // Flush thinking-decoder tail as a final Thinking chunk.
+                            var thinkTail = thinkDec.Flush();
+                            if (thinkTail.Length > 0)
+                                channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Thinking, thinkTail));
+                            inThinking = false;
+                            logits = _fwd.Forward(next, tokens.Length + i);
+                            continue;
+                        }
+
+                        var bytes = _tokenizer.DecodeBytes(next);
+                        if (inThinking)
+                        {
+                            var chunk = thinkDec.Append(bytes);
+                            if (chunk.Length > 0)
+                                channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Thinking, chunk));
+                        }
+                        else
+                        {
+                            var chunk = textDec.Append(bytes);
+                            if (chunk.Length > 0)
+                                channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, chunk));
+                        }
+
                         logits = _fwd.Forward(next, tokens.Length + i);
                     }
-                    var tail = streamDec.Flush();
-                    if (tail.Length > 0)
-                        channel.Writer.TryWrite(tail);
+
+                    // End-of-loop: flush both decoders defensively (whichever was active).
+                    var textFlush = textDec.Flush();
+                    if (textFlush.Length > 0)
+                        channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, textFlush));
+                    var thinkFlush = thinkDec.Flush();
+                    if (thinkFlush.Length > 0)
+                        channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Thinking, thinkFlush));
 
                     channel.Writer.TryComplete();
                 }

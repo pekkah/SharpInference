@@ -464,6 +464,8 @@ public sealed class ChatTemplateScrubTests
 
 /// <summary>
 /// Fake inference engine for integration tests. Emits "Hello world" as individual word tokens.
+/// All chunks are <see cref="GenerateChunkKind.Text"/> — the back-compat
+/// <c>GenerateAsync(string)</c> path is the default interface method on <see cref="IInferenceEngine"/>.
 /// </summary>
 internal sealed class FakeInferenceEngine : IInferenceEngine
 {
@@ -473,7 +475,7 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
 
     public FakeInferenceEngine(string modelId) => ModelId = modelId;
 
-    public async IAsyncEnumerable<string> GenerateAsync(
+    public async IAsyncEnumerable<GenerateChunk> GenerateChunksAsync(
         string prompt,
         SamplingParams sp,
         [EnumeratorCancellation] CancellationToken ct = default)
@@ -483,7 +485,7 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
         {
             ct.ThrowIfCancellationRequested();
             await Task.Yield();
-            yield return token;
+            yield return new GenerateChunk(GenerateChunkKind.Text, token);
         }
     }
 }
