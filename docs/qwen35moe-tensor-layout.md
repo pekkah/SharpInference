@@ -198,7 +198,11 @@ return x + moe_out + shexp_gate * shexp_out
 
 4. **Full-attention layers use `head_dim = 256`** (from `attention.key_length=256`); GDN layers use `head_dim = 128` (from `ssm.state_size`). The two block types have different head dimensions. Plumb both through the hyperparams.
 
-5. **The Q/K/V ordering inside `attn_qkv [8192]` is unconfirmed** — both research agents disagreed (one said `Q∥K∥V`, the other `K∥Q∥V`). Must read llama.cpp's `build_qkvz` directly when implementing Phase 4. Functionally it only matters because llama.cpp is the reference for parity testing in Phase 5.
+5. **`attn_qkv` channel order: `Q∥K∥V`** — confirmed by reading llama.cpp `src/models/qwen35moe.cpp`'s `build_layer_attn_linear` ggml_view_4d offsets (Q at offset 0, K at `head_k_dim * num_k_heads = 2048`, V at `2 * 2048 = 4096`). Layout sizes: Q is 2048 channels, K is 2048, V is 4096; total 8192 matches `attn_qkv` width.
+
+6. **L2 norm epsilon convention is `scale = 1 / max(sqrt(sum_sq), eps)`, not `sqrt(sum_sq + eps)`** — matches llama.cpp `ggml/src/ggml-cpu/ops.cpp` `ggml_compute_forward_l2_norm_f32`. Required for Phase 5 logit parity.
+
+7. **GDN recurrence index convention.** The state matrix `S` is indexed as `S[i, j]` where `i` is the "key axis" (rows) and `j` is the "value axis" (columns) — the update is `S[i, j] += k[i] * d[j]` (outer product with k on the row axis), and the readout is `o[j] = Σ_i S[i, j] * q[i]`. Confirmed against llama.cpp `delta-net-base.cpp`'s `build_delta_net_autoregressive`.
 
 4. **No `ssm_conv1d.bias`** tensor exists — conv has no bias.
 
