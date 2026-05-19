@@ -15,25 +15,29 @@ Supported architectures: `llama`, `llama4`, `qwen3`, `qwen3moe`. Benchmarked on
 AMD Zen 4 (12c/24t, DDR4-3200) + RTX 4070 Ti (12 GB), Q4_K_M, `--temp 0`,
 `-n 80`, prompt `"Write a Python function that sorts a list using the quicksort algorithm:"`.
 Decode rate is **forward-pass iterations / decode time**, so it counts
-thinking-mode tokens too. All outputs verified coherent (`scripts/bench-all.ps1`).
-Cross-engine top-1 parity vs llama.cpp b8585 verified on Qwen3-8B (byte-identical
-60-token greedy decode with matching chat template).
+thinking-mode tokens too. Outputs spot-checked for coherence
+(`scripts/bench-all.ps1`); MoE on Vulkan hybrid is currently a known
+broken row — see ⚠ note. Cross-engine top-1 parity vs llama.cpp b8585
+verified on Qwen3-8B (byte-identical 60-token greedy decode with
+matching chat template).
 
 | Model | Repo | Size | Backend | Prefill t/s | Decode t/s | Notes |
 |---|---|---:|---|---:|---:|---|
-| SmolLM2 1.7B Instruct | [HuggingFaceTB](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF) | 1 GB | CPU | 16.1 | 39.9 | AVX2 fused dequant-matvec |
-| SmolLM2 1.7B Instruct | (same) | 1 GB | Vulkan `-g -1` | 44.3 | **147.9** | GLSL `subgroupAdd` reduce |
-| SmolLM2 1.7B Instruct | (same) | 1 GB | **CUDA** `-g -1` | **180.2** | **157.8** | NVRTC `__dp4a` + Q8_1 |
-| Qwen3 8B | [Qwen](https://huggingface.co/Qwen/Qwen3-8B-GGUF) | 5 GB | Vulkan `-g -1` | 22.8 | 46.8 | 11.4K auto-ctx |
-| Qwen3 8B | (same) | 5 GB | Vulkan `-g -1 --tq` | 21.5 | 45.5 | 3-bit KV → 40 960 ctx |
-| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1` | **65.4** | **58.0** | ~2.9× Vulkan prefill |
-| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --no-thinking` | **65.5** | **57.4** | Same per-token rate; reasoning suppressed in chat template, so all decoded tokens are visible answer |
-| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq` | **66.1** | **65.4** | 3-bit KV → 40 960 ctx; 17 t/s @ 8K, 10 t/s @ 16K |
-| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq --no-thinking` | **65.4** | **57.2** | Same per-token rate as `--tq` alone; reasoning suppressed |
-| Qwen3-Coder 30B-A3B (MoE) | [Qwen](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF) | 17 GB | CPU | 13.0 | 20.6 | 128 experts / 8 active |
-| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | CPU `--tq` | 11.3 | 20.6 | 3-bit KV |
-| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | Vulkan `-g -1` (hybrid) | 0.9 | 8.8 | 29 GPU + 19 CPU layers (auto) |
-| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | **CUDA** `-g -1` (hybrid) | **15.6** | **20.9** | 29 GPU + 19 CPU layers (auto), ~2.4× Vulkan decode |
+| SmolLM2 1.7B Instruct | [HuggingFaceTB](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF) | 1 GB | CPU | 16.6 | 42.5 | AVX2 fused dequant-matvec |
+| SmolLM2 1.7B Instruct | (same) | 1 GB | Vulkan `-g -1` | 41.9 | **138.7** | GLSL `subgroupAdd` reduce |
+| SmolLM2 1.7B Instruct | (same) | 1 GB | **CUDA** `-g -1` | **180.7** | **156.7** | NVRTC `__dp4a` + Q8_1 |
+| Qwen3 8B | [Qwen](https://huggingface.co/Qwen/Qwen3-8B-GGUF) | 5 GB | Vulkan `-g -1` | 22.7 | 45.4 | 11.4K auto-ctx |
+| Qwen3 8B | (same) | 5 GB | Vulkan `-g -1 --tq` | 21.6 | 45.7 | 3-bit KV → 40 960 ctx |
+| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1` | **63.5** | **57.2** | ~2.8× Vulkan prefill |
+| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --no-thinking` | **63.4** | **57.1** | Same per-token rate; reasoning suppressed in chat template, so all decoded tokens are visible answer |
+| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq` | **64.8** | **57.3** | 3-bit KV → 40 960 ctx; 17 t/s @ 8K, 10 t/s @ 16K |
+| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq --no-thinking` | **64.9** | **56.8** | Same per-token rate as `--tq` alone; reasoning suppressed |
+| Qwen3-Coder 30B-A3B (MoE) | [Qwen](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF) | 17 GB | CPU | 13.6 | 20.6 | 128 experts / 8 active |
+| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | CPU `--tq` | 12.3 | 20.7 | 3-bit KV |
+| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | Vulkan `-g -1` (hybrid) | 1.0 | 9.1 | ⚠ output incoherent on this path — under investigation |
+| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | **CUDA** `-g -1` (hybrid) | **15.2** | **21.7** | 29 GPU + 19 CPU layers (auto), ~2.4× Vulkan decode |
+| Llama-4 Scout 17B-16E (MoE) | [meta-llama](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct) | 61 GB | CPU | 1.4 | 3.3 | 48 layers, 17B active params; split GGUF (Q4_K_M) |
+| Llama-4 Scout 17B-16E (MoE) | (same) | 61 GB | CUDA `-g -1` (hybrid) | 0.8 | 1.9 | 7 GPU + 41 CPU layers — model dwarfs the 12 GB card, PCIe cost > GPU speedup so CPU-only wins here |
 
 `--backend auto` (default) picks CUDA when available, sizing the GPU/CPU split from
 VRAM via TierPlanner; falls through to Vulkan only when CUDA isn't present.
