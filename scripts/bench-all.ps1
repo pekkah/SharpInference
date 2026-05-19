@@ -17,10 +17,12 @@ $results += .\scripts\bench-textgen.ps1 -Model $qwen -Tag "qwen3-vulkan"  -NToke
 $results += .\scripts\bench-textgen.ps1 -Model $qwen -Tag "qwen3-vk-tq"   -NTokens $NTokens -Prompt $Prompt -TimeoutSec 240 -ExtraArgs @("-g","-1","--backend","vulkan","--tq")
 $results += .\scripts\bench-textgen.ps1 -Model $qwen -Tag "qwen3-cuda"    -NTokens $NTokens -Prompt $Prompt -TimeoutSec 240 -ExtraArgs @("-g","-1","--backend","cuda")
 
-# Qwen3-Coder 30B-A3B MoE — CPU only (MoE GPU is gated by issue #2)
+# Qwen3-Coder 30B-A3B MoE — CPU + Vulkan/CUDA hybrid (17 GB model doesn't fit a 12 GB card in full offload).
 $moe = "models\Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
-$results += .\scripts\bench-textgen.ps1 -Model $moe -Tag "moe-cpu"        -NTokens $NTokens -Prompt $Prompt -TimeoutSec 360
-$results += .\scripts\bench-textgen.ps1 -Model $moe -Tag "moe-cpu-tq"     -NTokens $NTokens -Prompt $Prompt -TimeoutSec 360 -ExtraArgs @("--tq")
+$results += .\scripts\bench-textgen.ps1 -Model $moe -Tag "moe-cpu"           -NTokens $NTokens -Prompt $Prompt -TimeoutSec 360
+$results += .\scripts\bench-textgen.ps1 -Model $moe -Tag "moe-cpu-tq"        -NTokens $NTokens -Prompt $Prompt -TimeoutSec 360 -ExtraArgs @("--tq")
+$results += .\scripts\bench-textgen.ps1 -Model $moe -Tag "moe-vulkan-hybrid" -NTokens $NTokens -Prompt $Prompt -TimeoutSec 600 -ExtraArgs @("-g","-1","--backend","vulkan")
+$results += .\scripts\bench-textgen.ps1 -Model $moe -Tag "moe-cuda-hybrid"   -NTokens $NTokens -Prompt $Prompt -TimeoutSec 600 -ExtraArgs @("-g","-1","--backend","cuda")
 
 Write-Host ""
 Write-Host "=== Summary ===" -ForegroundColor Cyan

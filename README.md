@@ -29,11 +29,15 @@ Cross-engine top-1 parity vs llama.cpp b8585 verified on Qwen3-8B (byte-identica
 | Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1` | **65.4** | **58.0** | ~2.9× Vulkan prefill |
 | Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq` | **66.1** | **65.4** | 3-bit KV → 40 960 ctx; 17 t/s @ 8K, 10 t/s @ 16K |
 | Qwen3-Coder 30B-A3B (MoE) | [Qwen](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF) | 17 GB | CPU | 13.0 | 20.6 | 128 experts / 8 active |
-| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | CPU `--tq` | 11.3 | 20.6 | 3-bit KV; GPU MoE gated by [#2](https://github.com/pekkah/SharpInference/issues/2) |
+| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | CPU `--tq` | 11.3 | 20.6 | 3-bit KV |
+| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | Vulkan `-g -1` (hybrid) | 0.9 | 8.8 | 29 GPU + 19 CPU layers (auto) |
+| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | **CUDA** `-g -1` (hybrid) | **15.6** | **20.9** | 29 GPU + 19 CPU layers (auto), ~2.4× Vulkan decode |
 
-`--backend auto` (default) picks CUDA for dense models with full offload (`-g -1`),
-Vulkan otherwise. `--tq` enables 3-bit TurboQuant KV compression (CPU, Vulkan, CUDA;
-requires `headDim ∈ {128, 256}`). MoE on GPU is rejected by default — see [#2](https://github.com/pekkah/SharpInference/issues/2).
+`--backend auto` (default) picks CUDA when available, sizing the GPU/CPU split from
+VRAM via TierPlanner; falls through to Vulkan only when CUDA isn't present.
+`--tq` enables 3-bit TurboQuant KV compression (CPU, Vulkan, CUDA; requires
+`headDim ∈ {128, 256}`). MoE runs on GPU (full-offload or partial hybrid) on
+both Vulkan and CUDA backends.
 
 ### CLI examples
 

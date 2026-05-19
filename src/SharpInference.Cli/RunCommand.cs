@@ -235,18 +235,32 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             gpuBackend = cuda;
             try
             {
-                // Decide full-offload vs hybrid for CUDA: partial offload requires
-                // CudaHybridForwardPass, full offload uses CudaForwardPass.
-                bool wantHybrid =
-                    nGpuLayers > 0 && nGpuLayers < hp.NumLayers;
-                if (wantHybrid)
+                // For -g -1 (auto), run TierPlanner against CUDA's VRAM and use the
+                // resulting layer split — same logic as the Vulkan branch. Without this,
+                // a model bigger than VRAM (e.g. Qwen3-Coder 30B-A3B in 12 GB) would
+                // attempt full-offload via CudaForwardPass and silently OOM.
+                int cudaGpuLayers;
+                if (nGpuLayers == -1)
                 {
                     var hwProfile = HardwareProfile.Detect(cuda);
                     AnsiConsole.MarkupLine($"[dim]Hardware: {hwProfile.Summary()}[/]");
                     var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant,
                         requestedCtxSize: ctxSize);
-                    if (settings.NGpuLayers > 0)
-                        placement = placement with { GpuLayers = nGpuLayers, CpuLayers = hp.NumLayers - nGpuLayers };
+                    cudaGpuLayers = placement.GpuLayers;
+                }
+                else
+                {
+                    cudaGpuLayers = nGpuLayers;
+                }
+
+                bool wantHybrid = cudaGpuLayers > 0 && cudaGpuLayers < hp.NumLayers;
+                if (wantHybrid)
+                {
+                    var hwProfile = HardwareProfile.Detect(cuda);
+                    var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant,
+                        requestedCtxSize: ctxSize);
+                    if (nGpuLayers != -1)
+                        placement = placement with { GpuLayers = cudaGpuLayers, CpuLayers = hp.NumLayers - cudaGpuLayers };
 
                     var chfwd = new CudaHybridForwardPass(model, cuda, hp, placement, settings.TurboQuant);
                     gpuFwd = chfwd;
@@ -254,6 +268,21 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     prefill = tokens => chfwd.Prefill(tokens);
                     resetCache = chfwd.ResetCache;
                     AnsiConsole.MarkupLine($"[dim]Backend: [green]CUDA hybrid[/] ({cuda.Name}, {placement.GpuLayers} GPU + {placement.CpuLayers} CPU layers)[/]");
+                }
+                else if (cudaGpuLayers == 0)
+                {
+                    // Model doesn't fit any GPU layer — fall back to CPU forward pass.
+                    cuda.Dispose();
+                    gpuBackend = null;
+                    if (settings.TurboQuant)
+                    {
+                        fwd.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
+                        AnsiConsole.MarkupLine("[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
+                    }
+                    forward = fwd.Forward;
+                    prefill = tokens => fwd.Prefill(tokens);
+                    resetCache = settings.TurboQuant ? fwd.TqCache!.Reset : fwd.Cache.Reset;
+                    AnsiConsole.MarkupLine("[dim]Backend: [blue]CPU[/] (CUDA fallback: no GPU-capable layers)[/]");
                 }
                 else
                 {
