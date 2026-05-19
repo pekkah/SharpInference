@@ -277,6 +277,14 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     public void Free(Tensor tensor)
     {
         _tensorDTypes.TryRemove(tensor.Handle, out _);
+        if (_pinnedAllocs.Remove(tensor.Handle, out var pinned))
+        {
+            // Pinned allocations bypass the device pool — cudaMallocHost'd memory
+            // must be released via cudaFreeHost rather than returned to the pool.
+            _devPtrs.TryRemove(tensor.Handle, out _);
+            CuBlasInterop.FreeHost(pinned.Ptr);
+            return;
+        }
         if (_devPtrs.TryRemove(tensor.Handle, out var entry))
             _pool.Return(entry.byteSize, entry.devPtr);
     }
@@ -305,6 +313,99 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         nuint byteSize = (nuint)(dst.Length * sizeof(float));
         fixed (float* d = dst)
             DownloadViaStaging(d, devPtr, byteSize);
+    }
+
+    /// <summary>
+    /// Copy host floats into an existing device tensor (no allocation).
+    /// Mirrors <see cref="Upload"/> but reuses the destination's storage — used by
+    /// the hybrid forward pass to push CPU-produced hidden state back into the
+    /// GPU pipeline without churning tensor handles per token.
+    /// </summary>
+    public void UploadInto(Tensor dst, ReadOnlySpan<float> src)
+    {
+        if ((long)src.Length != dst.ElementCount)
+            throw new ArgumentException($"UploadInto: element-count mismatch ({src.Length} → {dst.ElementCount}).");
+        nint dstPtr = GetDevPtr(dst);
+        nuint byteSize = (nuint)(src.Length * sizeof(float));
+        fixed (float* s = src)
+            UploadViaStaging(dstPtr, s, byteSize);
+    }
+
+    // ── Vulkan-API shims (used by CudaHybridForwardPass) ──────────────────
+    //
+    // CUDA executes ops immediately on the stream and orders dependent work
+    // implicitly, so Vulkan's command-buffer recording vocabulary degenerates
+    // to either no-ops or a Synchronize. These shims let HybridForwardPass-shape
+    // code call the same names on either backend.
+    public void BeginRecord() { }
+    public void EndRecordAndSubmit() => Synchronize();
+    public void RecordBarrier() { }
+    public void RecordComputeToHostBarrier() { }
+    public void RecordComputeToTransferBarrier() { }
+    public void RecordComputeCopy(Tensor dst, Tensor src) => CopyDevice(dst, src);
+    public void RecordComputeCopyRegion(Tensor dst, long dstByteOffset,
+                                        Tensor src, long srcByteOffset, long sizeBytes)
+        => CopyDeviceRegion(dst, dstByteOffset, src, srcByteOffset, sizeBytes);
+
+    // The Vulkan staging-buffer-on-fence pattern collapses to a stream-ordered
+    // Download in CUDA. We defer the actual copy until ReadFromStaging so the
+    // call sequence still reads Record→Submit→Read at the call site, even
+    // though no separate staging buffer is needed under CUDA.
+    private Tensor? _stagingPendingSrc;
+    private int _stagingPendingCount;
+    public void RecordDownloadToStaging(Tensor src, int floatCount)
+    {
+        _stagingPendingSrc = src;
+        _stagingPendingCount = floatCount;
+    }
+    public void ReadFromStaging(Span<float> dst)
+    {
+        if (_stagingPendingSrc is not { } src)
+            throw new InvalidOperationException(
+                "ReadFromStaging called without a prior RecordDownloadToStaging.");
+        if (dst.Length < _stagingPendingCount)
+            throw new ArgumentException(
+                $"ReadFromStaging dst too small: {dst.Length} < {_stagingPendingCount}.");
+        Download(src, dst[.._stagingPendingCount]);
+        _stagingPendingSrc = null;
+    }
+
+    // ── Pinned host memory exposed as device-accessible tensors ──
+    // Vulkan exposes host-visible-device-local buffers as a single Tensor that
+    // both the GPU shaders and CPU mapped pointer can use. Under UVA, CUDA's
+    // cudaMallocHost gives the equivalent: one pointer addressable from both
+    // host and device. We track the (host = device) pointer per handle so
+    // MapPinned/Free can find it without a separate dictionary.
+    private readonly Dictionary<nint, (nint Ptr, nuint Bytes)> _pinnedAllocs = new();
+
+    public Tensor AllocatePinned(TensorShape shape, DType dtype = DType.Float32)
+    {
+        long elemBytes = DTypeInfo.BytesPerElement(dtype);
+        nuint byteSize = (nuint)(shape.ElementCount * elemBytes);
+        if (CuBlasInterop.MallocHost(out nint hostPtr, byteSize) != 0)
+            throw new InvalidOperationException($"cudaMallocHost({byteSize}) failed.");
+        // Zero the buffer so initial reads see deterministic values.
+        new Span<byte>((void*)hostPtr, (int)byteSize).Clear();
+
+        var handle = (nint)Interlocked.Increment(ref _nextHandle);
+        // UVA: the host pointer is also a valid device pointer for kernel launches.
+        _devPtrs[handle] = (hostPtr, byteSize);
+        _pinnedAllocs[handle] = (hostPtr, byteSize);
+        _tensorDTypes[handle] = dtype;
+        return new Tensor(shape, dtype, handle);
+    }
+
+    public float* MapPinned(Tensor tensor)
+    {
+        if (!_pinnedAllocs.TryGetValue(tensor.Handle, out var alloc))
+            throw new InvalidOperationException($"Tensor {tensor.Handle} was not allocated via AllocatePinned.");
+        return (float*)alloc.Ptr;
+    }
+
+    public void UnmapPinned(Tensor tensor)
+    {
+        // No-op under CUDA: cudaMallocHost memory stays mapped for its lifetime.
+        _ = tensor;
     }
 
     public Tensor UploadHalf(ReadOnlySpan<Half> data, TensorShape shape)

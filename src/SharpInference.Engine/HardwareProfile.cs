@@ -11,11 +11,20 @@ public sealed record HardwareProfile(
     bool HasAvx512)
 {
     /// <summary>
+    /// Detect hardware capabilities given a CUDA device's VRAM. Used by the CUDA hybrid
+    /// path; the underlying placement math only needs total VRAM bytes regardless of
+    /// which GPU backend reported them.
+    /// </summary>
+    public static HardwareProfile Detect(Cuda.CudaBackend gpu) => DetectFromVram((long)gpu.VramBytes);
+
+    /// <summary>
     /// Detect hardware capabilities from the current system and Vulkan device.
     /// </summary>
     public static HardwareProfile Detect(Vulkan.VulkanBackend? gpu = null)
+        => DetectFromVram(gpu != null ? (long)gpu.VramBytes : 0);
+
+    private static HardwareProfile DetectFromVram(long vram)
     {
-        long vram = gpu != null ? (long)gpu.VramBytes : 0;
 
         // System RAM: use GC info as a portable approximation
         var gcInfo = GC.GetGCMemoryInfo();

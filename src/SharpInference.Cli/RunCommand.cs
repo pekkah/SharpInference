@@ -197,13 +197,16 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     break;
                 case "auto":
                 case "":
-                    // Auto: pick CUDA when available and the user asked for full-GPU offload
-                    // (the CUDA forward pass doesn't yet split layers, so partial offload falls
-                    // through to Vulkan hybrid). TQ on CUDA is supported for head_dim ∈ {128, 256}
-                    // only. MoE on CUDA is supported as full-offload — partial offload would
-                    // still fall through to Vulkan hybrid via the same nGpuLayers check below.
+                    // Auto: pick CUDA when available. CudaForwardPass handles full-offload
+                    // (dense + MoE); CudaHybridForwardPass handles partial-offload dense
+                    // (MoE+partial falls back to Vulkan hybrid for now). TQ on CUDA requires
+                    // head_dim ∈ {128, 256}.
                     bool tqHeadDimOk = hp.HeadDim is 128 or 256;
-                    wantCuda = (nGpuLayers == -1 || nGpuLayers >= hp.NumLayers)
+                    bool cudaCanFullOffload =
+                        (nGpuLayers == -1 || nGpuLayers >= hp.NumLayers);
+                    bool cudaCanHybrid =
+                        nGpuLayers > 0 && nGpuLayers < hp.NumLayers && !hp.IsMoE;
+                    wantCuda = (cudaCanFullOffload || cudaCanHybrid)
                         && (!settings.TurboQuant || tqHeadDimOk)
                         && CudaBackend.IsAvailable();
                     break;
@@ -237,16 +240,38 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             gpuBackend = cuda;
             try
             {
-                // CudaForwardPass loads all layers — partial offload is a Vulkan-only feature today.
-                var cfwd = new CudaForwardPass(model, cuda, hp, ctxSize,
-                    enableTurboQuant: settings.TurboQuant);
-                if (settings.TurboQuant)
-                    AnsiConsole.MarkupLine($"[dim]TurboQuant: [green]enabled[/] (3-bit, context: {cfwd.MaxSeqLen})[/]");
-                gpuFwd = cfwd;
-                forward = cfwd.Forward;
-                prefill = tokens => cfwd.Prefill(tokens);
-                resetCache = cfwd.ResetCache;
-                AnsiConsole.MarkupLine($"[dim]Backend: [green]CUDA[/] ({cuda.Name}, all {hp.NumLayers} layers)[/]");
+                // Decide full-offload vs hybrid for CUDA. Hybrid requires non-MoE today —
+                // the routing above already enforces that, but defensively re-check.
+                bool wantHybrid =
+                    nGpuLayers > 0 && nGpuLayers < hp.NumLayers && !hp.IsMoE;
+                if (wantHybrid)
+                {
+                    var hwProfile = HardwareProfile.Detect(cuda);
+                    AnsiConsole.MarkupLine($"[dim]Hardware: {hwProfile.Summary()}[/]");
+                    var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant,
+                        requestedCtxSize: ctxSize);
+                    if (settings.NGpuLayers > 0)
+                        placement = placement with { GpuLayers = nGpuLayers, CpuLayers = hp.NumLayers - nGpuLayers };
+
+                    var chfwd = new CudaHybridForwardPass(model, cuda, hp, placement, settings.TurboQuant);
+                    gpuFwd = chfwd;
+                    forward = chfwd.Forward;
+                    prefill = tokens => chfwd.Prefill(tokens);
+                    resetCache = chfwd.ResetCache;
+                    AnsiConsole.MarkupLine($"[dim]Backend: [green]CUDA hybrid[/] ({cuda.Name}, {placement.GpuLayers} GPU + {placement.CpuLayers} CPU layers)[/]");
+                }
+                else
+                {
+                    var cfwd = new CudaForwardPass(model, cuda, hp, ctxSize,
+                        enableTurboQuant: settings.TurboQuant);
+                    if (settings.TurboQuant)
+                        AnsiConsole.MarkupLine($"[dim]TurboQuant: [green]enabled[/] (3-bit, context: {cfwd.MaxSeqLen})[/]");
+                    gpuFwd = cfwd;
+                    forward = cfwd.Forward;
+                    prefill = tokens => cfwd.Prefill(tokens);
+                    resetCache = cfwd.ResetCache;
+                    AnsiConsole.MarkupLine($"[dim]Backend: [green]CUDA[/] ({cuda.Name}, all {hp.NumLayers} layers)[/]");
+                }
             }
             catch
             {
