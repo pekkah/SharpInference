@@ -37,6 +37,12 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     private readonly Tensor[] _gpuAttnNorm, _gpuWq, _gpuWk, _gpuWv, _gpuWo;
     private readonly Tensor[] _gpuFfnNorm, _gpuWGate, _gpuWUp, _gpuWDown;
     private readonly Tensor[]? _gpuWGateInp, _gpuWGateShexp, _gpuWUpShexp, _gpuWDownShexp;
+    // Eager per-expert weights for CUDA GPU layers — every expert is VRAM-resident,
+    // so the per-token MoE FFN is a straight indexed lookup. Different from the Vulkan
+    // hybrid's lazy SLRU slot cache: simpler, but the model must fit in VRAM after
+    // accounting for KV cache + scratch. Sized [nGpuLayers][numExperts]; null when
+    // not MoE or there are no GPU layers.
+    private readonly Tensor[][]? _gpuWGateExps, _gpuWUpExps, _gpuWDownExps;
     private readonly Tensor[]? _gpuBq, _gpuBk, _gpuBv, _gpuBo;
     private readonly Tensor[]? _gpuQNorm, _gpuKNorm;
     private readonly Tensor[] _gpuKCache, _gpuVCache;
@@ -100,10 +106,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     private readonly Tensor? _gpuFallbackContrib;
     private readonly Tensor? _gpuPinnedNorm;
 #pragma warning restore CS0649
-    // Lazily-allocated CPU scratch arrays for the expert cache-miss CPU fallback path.
-    private float[]? _cpuFallbackBuf;  // [embDim] accumulated contribution from missed experts
-    private float[]? _cpuFallbackGate; // [expertDim] scratch for expert gate projection
-    private float[]? _cpuFallbackUp;   // [expertDim] scratch for expert up projection
+    // CUDA hybrid has no CPU expert fallback (every expert is VRAM-resident).
 
     public int MaxSeqLen => _maxSeqLen;
     public LayerPlacement Placement => _placement;
@@ -168,7 +171,12 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         _gpuK = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
         _gpuV = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
         _gpuAttnOut = gpu.Allocate(TensorShape.D1(_numHeads * _headDim));
-        int gpuFfnScratch = Math.Max(_intermDim, _expertDim);
+        // For MoE the dense FFN path is unreachable, so size scratch tightly to the
+        // expert intermediate dim. Vulkan tolerates the over-allocation via
+        // robustBufferAccess (OOB reads return 0); CUDA's Q4_K matvec doesn't —
+        // it derives `cols` from input.ElementCount and would walk past the end of
+        // expert weight tensors with `cols=max(intermDim, expertDim)`.
+        int gpuFfnScratch = _isMoE ? _expertDim : _intermDim;
         _gpuFfnGate = gpu.Allocate(TensorShape.D1(gpuFfnScratch));
         _gpuFfnUp = gpu.Allocate(TensorShape.D1(gpuFfnScratch));
         _gpuLogits = gpu.Allocate(TensorShape.D1(hp.VocabSize));
@@ -216,6 +224,9 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         _gpuFfnNorm = new Tensor[_nGpuLayers];
         _gpuWGate = new Tensor[_nGpuLayers]; _gpuWUp = new Tensor[_nGpuLayers]; _gpuWDown = new Tensor[_nGpuLayers];
         _gpuWGateInp = _isMoE ? new Tensor[_nGpuLayers] : null;
+        _gpuWGateExps = _isMoE ? new Tensor[_nGpuLayers][] : null;
+        _gpuWUpExps   = _isMoE ? new Tensor[_nGpuLayers][] : null;
+        _gpuWDownExps = _isMoE ? new Tensor[_nGpuLayers][] : null;
         _gpuWGateShexp = _isMoE && _hasSharedExpert ? new Tensor[_nGpuLayers] : null;
         _gpuWUpShexp = _isMoE && _hasSharedExpert ? new Tensor[_nGpuLayers] : null;
         _gpuWDownShexp = _isMoE && _hasSharedExpert ? new Tensor[_nGpuLayers] : null;
@@ -263,8 +274,13 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             _gpuFfnNorm[i] = UploadWeight($"blk.{i}.ffn_norm.weight");
             if (_isMoE)
             {
-                _gpuWGateInp![i] = UploadWeight($"blk.{i}.ffn_gate_inp.weight");
-                // Expert weights (gate/up/down exps) are loaded lazily by ExpertSlotManager
+                _gpuWGateInp![i]  = UploadWeight($"blk.{i}.ffn_gate_inp.weight");
+                // Eager per-expert upload — every expert is VRAM-resident. Required because
+                // CUDA hybrid does not yet ship the SLRU slot cache. The TierPlanner is
+                // expected to size nGpuLayers so the total expert footprint fits.
+                _gpuWGateExps![i] = UploadExpertWeights($"blk.{i}.ffn_gate_exps.weight", _expertDim, _embDim,    hp.NumExperts);
+                _gpuWUpExps![i]   = UploadExpertWeights($"blk.{i}.ffn_up_exps.weight",   _expertDim, _embDim,    hp.NumExperts);
+                _gpuWDownExps![i] = UploadExpertWeights($"blk.{i}.ffn_down_exps.weight", _embDim,    _expertDim, hp.NumExperts);
                 if (_hasSharedExpert)
                 {
                     _gpuWGateShexp![i] = UploadWeight($"blk.{i}.ffn_gate_shexp.weight");
@@ -309,15 +325,12 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         }
         Console.Error.WriteLine(" done.");
 
-        // CUDA hybrid does not yet ship the MoE GPU path — ExpertSlotManager is wired
-        // for VulkanBackend and the MoeFfn dispatch below assumes SLRU-cached expert
-        // tensors. For now, refuse MoE+GPU-layers up front so the failure is clear; CPU
-        // layers can still handle MoE expert FFN, so MoE with `-g 0` still works.
+        // MoE GPU layers use eager expert loading (all experts VRAM-resident).
+        // No slot manager / SLRU cache — keep it simple at the cost of slightly more
+        // VRAM per GPU layer. TierPlanner sizes nGpuLayers so the total expert footprint
+        // fits the remaining VRAM budget.
         if (_isMoE && _nGpuLayers > 0)
-            throw new NotSupportedException(
-                "CudaHybridForwardPass: MoE models with GPU layers are not yet supported. " +
-                "Use `--backend vulkan` for Qwen3-Coder/MoE partial offload, or `-g 0` to run MoE entirely on CPU. " +
-                "CUDA MoE full-offload (CudaForwardPass) is available for cards with enough VRAM.");
+            Console.Error.WriteLine($"[CudaHybridForwardPass] MoE eager expert load: {hp.NumExperts} experts × {_nGpuLayers} GPU layers (gate+up+down).");
 
         // ── Resolve CPU weights (layers nGpuLayers..numLayers-1) ──
         _cpuHidden = Alloc(_embDim);
@@ -1280,168 +1293,65 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
 
     private void GpuMoeFfn(int layer)
     {
+        // Eager-loaded variant of GpuForwardPass.GpuMoeFfn / CudaForwardPass.MoeFfn:
+        // every expert is VRAM-resident, so the per-token MoE FFN is a straight
+        // indexed lookup over (_gpuWGateExps/_gpuWUpExps/_gpuWDownExps)[layer][expertIdx].
+        // No slot manager, no CPU fallback, no host-coherent pinned norm copy — CUDA's
+        // implicit stream ordering removes the explicit barrier vocabulary the Vulkan
+        // version needs.
         int numActive = _hp.NumActiveExperts;
 
         GpuMatMul(_gpuRouterLogits!, _gpuWGateInp![layer], _gpuNormBuf);
-        _gpu.RecordBarrier();
-        if (_hp.UseSigmoidGating)
-            _gpu.Sigmoid(_gpuRouterLogits!);
-        else
-            _gpu.Softmax(_gpuRouterLogits!);
-        // Copy norm buf to pinned memory while still recording so the CPU can
-        // read it after submit via MapPinned — avoids a second CopyBuffer call.
-        _gpu.RecordBarrier();
-        CopyGpuBuffer(_gpuPinnedNorm!, _gpuNormBuf);
-        // Compute→Host barrier: fence-wait alone does NOT make compute-shader writes
-        // to host-coherent memory visible to host reads on all drivers (observed stale
-        // _gpuPinnedNorm reads on RTX 4070 Ti, manifesting as garbled MoE output past
-        // ~10 GPU layers — issue #2). Explicit HOST_READ barrier flushes the writes.
-        _gpu.RecordComputeToHostBarrier();
-        _gpu.EndRecordAndSubmit();
+        if (_hp.UseSigmoidGating) _gpu.Sigmoid(_gpuRouterLogits!);
+        else                       _gpu.Softmax(_gpuRouterLogits!);
+
         _gpu.Download(_gpuRouterLogits!, _gpuRouterBuf!);
+        _gpu.Synchronize();
 
         Span<int> selectedExperts = stackalloc int[numActive];
         Span<float> expertWeights = stackalloc float[numActive];
         SelectTopK(_gpuRouterBuf!, numActive, selectedExperts, expertWeights);
 
-        // ── CPU fallback for cache misses ──
-        // Experts not yet in the slot cache are computed on CPU while the GPU
-        // is idle (between EndRecordAndSubmit and the next BeginRecord).
-        // Their weighted outputs are accumulated in _cpuFallbackBuf and
-        // uploaded to the pre-allocated pinned tensor for GPU AddInPlace.
-        // Prefetch the same experts for the next token (1-token lookahead).
-        _prefetcher?.EnqueuePrefetch(layer, selectedExperts);
-        Span<bool> isGpu = stackalloc bool[numActive];
-        // ExpertGpuSlot contains Tensor (managed reference type fields) — heap-allocate.
-        ExpertGpuSlot[] cachedSlots = new ExpertGpuSlot[numActive];
-        bool hasCpuFallback = false;
-
-        for (int i = 0; i < numActive; i++)
-        {
-            isGpu[i] = _expertSlotManager!.TryGetCached(layer, selectedExperts[i], out cachedSlots[i]);
-            if (!isGpu[i]) hasCpuFallback = true;
-        }
-
-        if (hasCpuFallback)
-        {
-            // _gpuPinnedNorm was populated by the GPU session above — map it directly,
-            // no extra Download / CopyBuffer call needed. The compute→host barrier above
-            // ensures the shader writes are visible to host reads after fence completion.
-            unsafe
-            {
-                float* normPtr = _gpu.MapPinned(_gpuPinnedNorm!);
-                GpuMoeFfnCpuFallback(layer, selectedExperts, expertWeights, isGpu, numActive, normPtr);
-                _gpu.UnmapPinned(_gpuPinnedNorm!);
-            }
-        }
-
-        _gpu.BeginRecord();
-
         if (_hasSharedExpert)
         {
             GpuMatMul(_gpuFfnGate, _gpuWGateShexp![layer], _gpuNormBuf);
-            GpuMatMul(_gpuFfnUp, _gpuWUpShexp![layer], _gpuNormBuf);
-            _gpu.RecordBarrier();
+            GpuMatMul(_gpuFfnUp,   _gpuWUpShexp![layer],   _gpuNormBuf);
             _gpu.SiLuMul(_gpuFfnGate, _gpuFfnUp);
-            _gpu.RecordBarrier();
             GpuMatMul(_gpuMoeSharedOut!, _gpuWDownShexp![layer], _gpuFfnGate);
-            _gpu.RecordBarrier();
         }
 
         _gpu.Clear(_gpuHidden);
-        _gpu.RecordBarrier();
 
         for (int i = 0; i < numActive; i++)
         {
-            if (!isGpu[i]) continue; // handled by CPU fallback
-
+            int expertIdx = selectedExperts[i];
             float expertWeight = expertWeights[i];
-            GpuMatMul(_gpuFfnGate, cachedSlots[i].Gate, _gpuNormBuf);
-            GpuMatMul(_gpuFfnUp, cachedSlots[i].Up, _gpuNormBuf);
-            _gpu.RecordBarrier();
+
+            GpuMatMul(_gpuFfnGate, _gpuWGateExps![layer][expertIdx], _gpuNormBuf);
+            GpuMatMul(_gpuFfnUp,   _gpuWUpExps![layer][expertIdx],   _gpuNormBuf);
 
             if (_hp.UseSigmoidGating)
             {
                 _gpu.ScaleInPlace(_gpuFfnGate, expertWeight);
-                _gpu.ScaleInPlace(_gpuFfnUp, expertWeight);
-                _gpu.RecordBarrier();
+                _gpu.ScaleInPlace(_gpuFfnUp,   expertWeight);
             }
 
             _gpu.SiLuMul(_gpuFfnGate, _gpuFfnUp);
-            _gpu.RecordBarrier();
-            GpuMatMul(_gpuMoeExpertOut!, cachedSlots[i].Down, _gpuFfnGate);
-            _gpu.RecordBarrier();
+            GpuMatMul(_gpuMoeExpertOut!, _gpuWDownExps![layer][expertIdx], _gpuFfnGate);
 
             if (_hp.UseSigmoidGating)
                 _gpu.AddInPlace(_gpuHidden, _gpuMoeExpertOut!);
             else
                 _gpu.AddScaledInPlace(_gpuHidden, _gpuMoeExpertOut!, expertWeight);
-            _gpu.RecordBarrier();
-        }
-
-        // Add CPU-computed contributions (if any) via pre-allocated pinned buffer.
-        if (hasCpuFallback)
-        {
-            unsafe
-            {
-                fixed (float* srcPtr = _cpuFallbackBuf)
-                {
-                    float* mapped = _gpu.MapPinned(_gpuFallbackContrib!);
-                    new ReadOnlySpan<float>(srcPtr, _embDim).CopyTo(new Span<float>(mapped, _embDim));
-                    _gpu.UnmapPinned(_gpuFallbackContrib!);
-                }
-            }
-            // _gpuFallbackContrib is HOST_COHERENT — host writes are visible to device.
-            // A compute barrier ensures any prior GPU writes complete before we add the fallback.
-            _gpu.RecordBarrier();
-            _gpu.AddInPlace(_gpuHidden, _gpuFallbackContrib!);
-            _gpu.RecordBarrier();
         }
 
         if (_hasSharedExpert)
             _gpu.AddInPlace(_gpuHidden, _gpuMoeSharedOut!);
     }
 
-    private unsafe void GpuMoeFfnCpuFallback(int layer, ReadOnlySpan<int> selectedExperts,
-        ReadOnlySpan<float> expertWeights, ReadOnlySpan<bool> isGpu, int numActive, float* normPtr)
-    {
-        // Lazily allocate CPU scratch arrays.
-        _cpuFallbackBuf ??= new float[_embDim];
-        _cpuFallbackGate ??= new float[_expertDim];
-        _cpuFallbackUp ??= new float[_expertDim];
-
-        Array.Clear(_cpuFallbackBuf);
-
-        // Resolve mmap weight refs for this layer's expert tensors.
-        var wGateExps = ResolveCpuWeight($"blk.{layer}.ffn_gate_exps.weight");
-        var wUpExps   = ResolveCpuWeight($"blk.{layer}.ffn_up_exps.weight");
-        var wDownExps = ResolveCpuWeight($"blk.{layer}.ffn_down_exps.weight");
-
-        fixed (float* fallbackPtr = _cpuFallbackBuf)
-        fixed (float* gatePtr = _cpuFallbackGate)
-        fixed (float* upPtr = _cpuFallbackUp)
-        {
-            for (int i = 0; i < numActive; i++)
-            {
-                if (isGpu[i]) continue;
-                int expertIdx = selectedExperts[i];
-                float weight = expertWeights[i];
-
-                ExpertMatVec(gatePtr, wGateExps, expertIdx, _expertDim, _embDim, normPtr);
-                ExpertMatVec(upPtr,   wUpExps,   expertIdx, _expertDim, _embDim, normPtr);
-
-                if (_hp.UseSigmoidGating)
-                {
-                    SimdKernels.ScaleInPlace(gatePtr, weight, _expertDim);
-                    SimdKernels.ScaleInPlace(upPtr, weight, _expertDim);
-                    weight = 1.0f;
-                }
-
-                SimdKernels.SiLuMul(gatePtr, upPtr, _expertDim);
-                ExpertMatVecDown(fallbackPtr, wDownExps, expertIdx, _embDim, _expertDim, gatePtr, weight);
-            }
-        }
-    }
+    // GpuMoeFfnCpuFallback removed for CUDA hybrid: every expert is eagerly resident
+    // on the GPU, so there's no slot-cache miss to spill to CPU. ExpertMatVec is still
+    // used by CpuMoeFfn for the all-CPU layer slice.
 
     private Tensor[] UploadExpertWeights(string name, int rows, int cols, int expertCount)
     {
@@ -1598,7 +1508,13 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             if (_isMoE)
             {
                 _gpu.Free(_gpuWGateInp![i]);
-                // Expert tensors are managed by ExpertSlotManager — freed in _expertSlotManager.Dispose()
+                // Eager per-expert tensors: free every slot since there's no slot manager here.
+                for (int e = 0; e < _hp.NumExperts; e++)
+                {
+                    _gpu.Free(_gpuWGateExps![i][e]);
+                    _gpu.Free(_gpuWUpExps![i][e]);
+                    _gpu.Free(_gpuWDownExps![i][e]);
+                }
                 if (_hasSharedExpert)
                 {
                     _gpu.Free(_gpuWGateShexp![i]);

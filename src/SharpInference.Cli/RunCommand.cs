@@ -198,16 +198,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 case "auto":
                 case "":
                     // Auto: pick CUDA when available. CudaForwardPass handles full-offload
-                    // (dense + MoE); CudaHybridForwardPass handles partial-offload dense
-                    // (MoE+partial falls back to Vulkan hybrid for now). TQ on CUDA requires
+                    // (dense + MoE); CudaHybridForwardPass handles partial-offload (dense or
+                    // MoE with eager per-layer expert loading). TQ on CUDA requires
                     // head_dim ∈ {128, 256}.
                     bool tqHeadDimOk = hp.HeadDim is 128 or 256;
-                    bool cudaCanFullOffload =
-                        (nGpuLayers == -1 || nGpuLayers >= hp.NumLayers);
-                    bool cudaCanHybrid =
-                        nGpuLayers > 0 && nGpuLayers < hp.NumLayers && !hp.IsMoE;
-                    wantCuda = (cudaCanFullOffload || cudaCanHybrid)
-                        && (!settings.TurboQuant || tqHeadDimOk)
+                    wantCuda = (!settings.TurboQuant || tqHeadDimOk)
                         && CudaBackend.IsAvailable();
                     break;
                 default:
@@ -240,10 +235,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             gpuBackend = cuda;
             try
             {
-                // Decide full-offload vs hybrid for CUDA. Hybrid requires non-MoE today —
-                // the routing above already enforces that, but defensively re-check.
+                // Decide full-offload vs hybrid for CUDA: partial offload requires
+                // CudaHybridForwardPass, full offload uses CudaForwardPass.
                 bool wantHybrid =
-                    nGpuLayers > 0 && nGpuLayers < hp.NumLayers && !hp.IsMoE;
+                    nGpuLayers > 0 && nGpuLayers < hp.NumLayers;
                 if (wantHybrid)
                 {
                     var hwProfile = HardwareProfile.Detect(cuda);
