@@ -41,8 +41,12 @@ public static class AnthropicEndpoints
         HealthEndpoints.RecordRequest();
 
         var modelArch = Environment.GetEnvironmentVariable("SHARPI_ARCH") ?? "qwen2";
+        // Anthropic-style thinking control: {"type":"disabled"} turns it off; absence or any
+        // other value (including {"type":"enabled"}) leaves it on. BudgetTokens is ignored
+        // in this batch — it will map to max_thinking_tokens later.
+        bool enableThinking = req.Thinking?.Type != "disabled";
         var messages = BuildMessageList(req);
-        var prompt = ChatTemplate.Format(messages, modelArch);
+        var prompt = ChatTemplate.Format(messages, modelArch, enableThinking);
 
         var sp = new SamplingParams
         {
@@ -131,7 +135,13 @@ public static class AnthropicEndpoints
         if (req.System is { Length: > 0 })
             list.Add(("system", req.System));
         foreach (var m in req.Messages!)
-            list.Add((m.Role ?? "user", m.Content ?? ""));
+        {
+            var role = m.Role ?? "user";
+            var content = m.Content ?? "";
+            if (role == "assistant")
+                content = ChatTemplate.ScrubAssistantThinking(content);
+            list.Add((role, content));
+        }
         return list;
     }
 
@@ -152,7 +162,10 @@ public sealed record AnthropicMessageRequest(
     bool? Stream,
     float? Temperature,
     float? TopP,
-    int? TopK);
+    int? TopK,
+    AnthropicThinking? Thinking = null);
+
+public sealed record AnthropicThinking(string? Type, int? BudgetTokens);
 
 public sealed record AnthropicMessage(string? Role, string? Content);
 

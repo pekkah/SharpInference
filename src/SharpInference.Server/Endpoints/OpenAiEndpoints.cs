@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Http;
 using SharpInference.Engine;
 
@@ -43,8 +44,9 @@ public static class OpenAiEndpoints
         HealthEndpoints.RecordRequest();
 
         var modelArch = arch ?? Environment.GetEnvironmentVariable("SHARPI_ARCH") ?? "qwen2";
+        bool enableThinking = req.EnableThinking ?? true;
         var messages = BuildMessageList(req.Messages, modelArch, req.ResponseFormat?.Type);
-        var prompt = ChatTemplate.Format(messages, modelArch);
+        var prompt = ChatTemplate.Format(messages, modelArch, enableThinking);
 
         // Parse logit_bias: OpenAI sends {"tokenId": biasValue} with string keys
         IReadOnlyDictionary<int, float>? logitBias = null;
@@ -138,7 +140,13 @@ public static class OpenAiEndpoints
         if (responseFormatType == "json_object")
             list.Add(("system", "Respond with valid JSON only. Do not include any text outside the JSON object."));
         foreach (var m in messages)
-            list.Add((m.Role ?? "user", m.Content ?? ""));
+        {
+            var role = m.Role ?? "user";
+            var content = m.Content ?? "";
+            if (role == "assistant")
+                content = ChatTemplate.ScrubAssistantThinking(content);
+            list.Add((role, content));
+        }
         return list;
     }
 
@@ -159,7 +167,8 @@ public sealed record ChatCompletionRequest(
     float? TopP,
     bool? Stream,
     Dictionary<string, float>? LogitBias,
-    ResponseFormat? ResponseFormat);
+    ResponseFormat? ResponseFormat,
+    [property: JsonPropertyName("enable_thinking")] bool? EnableThinking = null);
 
 public sealed record OaiMessage(string? Role, string? Content);
 

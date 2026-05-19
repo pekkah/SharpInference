@@ -94,6 +94,7 @@ public partial class Program { }
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.ErrorResponse))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.ResponseFormat))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.AnthropicMessageRequest))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.AnthropicThinking))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.AnthropicMessage[]))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.AnthropicMessageResponse))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.AContent[]))]

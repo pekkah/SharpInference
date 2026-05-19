@@ -6,6 +6,7 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using SharpInference.Engine;
+using SharpInference.Server;
 using SharpInference.Server.Endpoints;
 
 namespace SharpInference.Tests.Server;
@@ -348,6 +349,116 @@ public sealed class ServerTests : IClassFixture<WebApplicationFactory<Program>>
         var req = new { model = "test-model", max_output_tokens = 5, stream = false };
         var response = await _client.PostAsJsonAsync("/v1/responses", req);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    // ── Thinking-mode request fields ─────────────────────────────────────────
+
+    [Fact]
+    public async Task ChatCompletion_WithEnableThinkingFalse_AcceptsRequest()
+    {
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            max_tokens = 5,
+            stream = false,
+            enable_thinking = false,
+            reasoning_effort = "low",
+        };
+        var response = await _client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task AnthropicMessages_WithThinkingDisabled_AcceptsRequest()
+    {
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            max_tokens = 10,
+            stream = false,
+            thinking = new { type = "disabled" },
+        };
+        var response = await _client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task AnthropicMessages_WithThinkingEnabledAndBudget_AcceptsRequest()
+    {
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            max_tokens = 10,
+            stream = false,
+            thinking = new { type = "enabled", budget_tokens = 1024 },
+        };
+        var response = await _client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+}
+
+public sealed class ChatTemplateScrubTests
+{
+    [Fact]
+    public void Scrub_RemovesClosedBlock()
+    {
+        var input = "<think>plan stuff</think>The answer is 42.";
+        Assert.Equal("The answer is 42.", ChatTemplate.ScrubAssistantThinking(input));
+    }
+
+    [Fact]
+    public void Scrub_RemovesMultipleBlocksGreedily()
+    {
+        // Greedy match drops everything between the first <think> and the last
+        // </think>, including text between successive blocks. Real reasoning
+        // models emit exactly one block per turn, so this only affects malformed
+        // history; greedy avoids orphan-tag leakage on nested input.
+        var input = "<think>a</think>foo<think>b</think>bar";
+        Assert.Equal("bar", ChatTemplate.ScrubAssistantThinking(input));
+    }
+
+    [Fact]
+    public void Scrub_HandlesNestedBlocks()
+    {
+        var input = "<think><think>nested</think></think>after";
+        Assert.Equal("after", ChatTemplate.ScrubAssistantThinking(input));
+    }
+
+    [Fact]
+    public void Scrub_RemovesOrphanCloseTag()
+    {
+        var input = "</think>stray close";
+        Assert.Equal("stray close", ChatTemplate.ScrubAssistantThinking(input));
+    }
+
+    [Fact]
+    public void Scrub_DropsUnclosedThinkAndEverythingAfter()
+    {
+        var input = "intro <think>started but never finished answering";
+        Assert.Equal("intro ", ChatTemplate.ScrubAssistantThinking(input));
+    }
+
+    [Fact]
+    public void Scrub_LeavesContentWithoutThinkUntouched()
+    {
+        var input = "Just a normal answer with no reasoning.";
+        Assert.Equal(input, ChatTemplate.ScrubAssistantThinking(input));
+    }
+
+    [Fact]
+    public void Scrub_HandlesEmptyAndNullSafely()
+    {
+        Assert.Equal("", ChatTemplate.ScrubAssistantThinking(""));
+    }
+
+    [Fact]
+    public void Scrub_HandlesMultilineThinkBlock()
+    {
+        var input = "<think>line 1\nline 2\nline 3</think>final answer";
+        Assert.Equal("final answer", ChatTemplate.ScrubAssistantThinking(input));
     }
 }
 

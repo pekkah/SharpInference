@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using SharpInference.Core;
 
 namespace SharpInference.Server;
@@ -7,7 +8,7 @@ namespace SharpInference.Server;
 /// When <see cref="Template"/> is set, Jinja2 rendering is used.
 /// Falls back to hardcoded arch-based formats for models without tokenizer.chat_template.
 /// </summary>
-public static class ChatTemplate
+public static partial class ChatTemplate
 {
     /// <summary>
     /// Set once at startup from <c>GgufTokenizer.ChatTemplate</c> if the model
@@ -15,9 +16,30 @@ public static class ChatTemplate
     /// </summary>
     public static JinjaChatTemplate? Template { get; set; }
 
+    // NonBacktracking keeps the regex AOT-safe and immune to pathological input.
+    // Greedy match (first `<think>` to last `</think>`) is correct for reasoning
+    // models, which produce exactly one block per turn at the start of the answer;
+    // it also collapses pathological nested/duplicated tags without orphan leakage.
+    [GeneratedRegex(@"<think>[\s\S]*</think>", RegexOptions.NonBacktracking)]
+    private static partial Regex ThinkBlockRegex();
+
+    [GeneratedRegex(@"<think>[\s\S]*$", RegexOptions.NonBacktracking)]
+    private static partial Regex UnclosedThinkRegex();
+
+    [GeneratedRegex(@"</think>", RegexOptions.NonBacktracking)]
+    private static partial Regex OrphanCloseRegex();
+
     /// <param name="messages">Messages in order (system, user, assistant, ...).</param>
     /// <param name="arch">Architecture string from GGUF metadata (e.g. "llama4", "llama", "qwen2").</param>
-    public static string Format(IReadOnlyList<(string role, string content)> messages, string arch)
+    /// <param name="enableThinking">
+    /// When false, sets <c>enable_thinking=false</c> in the Jinja context so reasoning-capable
+    /// templates (Qwen3, SmolLM3, ...) skip emitting a <c>&lt;think&gt;</c> block. Ignored by the
+    /// hardcoded fallback paths since those archs have no thinking mode.
+    /// </param>
+    public static string Format(
+        IReadOnlyList<(string role, string content)> messages,
+        string arch,
+        bool enableThinking = true)
     {
         if (Template != null)
         {
@@ -35,6 +57,7 @@ public static class ChatTemplate
                 ["messages"]              = msgList,
                 ["add_generation_prompt"] = true,
                 ["tools"]                 = null,
+                ["enable_thinking"]       = (object?)enableThinking,
             });
         }
 
@@ -64,5 +87,27 @@ public static class ChatTemplate
         }
 
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Removes <c>&lt;think&gt;...&lt;/think&gt;</c> blocks from a prior assistant turn.
+    /// Reasoning-model chat templates (Qwen3, DeepSeek-R1, ...) are trained assuming
+    /// historical assistant turns contain no reasoning, so leaving them in bloats the
+    /// context window and degrades quality.
+    /// </summary>
+    public static string ScrubAssistantThinking(string content)
+    {
+        if (string.IsNullOrEmpty(content)
+            || (content.IndexOf("<think>", StringComparison.Ordinal) < 0
+                && content.IndexOf("</think>", StringComparison.Ordinal) < 0))
+            return content;
+
+        // Greedy match handles nested/duplicated blocks in one pass.
+        string result = ThinkBlockRegex().Replace(content, string.Empty);
+        // Unclosed <think> with no matching </think>: drop the tag and everything after.
+        result = UnclosedThinkRegex().Replace(result, string.Empty);
+        // Orphan </think> with no preceding <think>: drop the stray tag.
+        result = OrphanCloseRegex().Replace(result, string.Empty);
+        return result;
     }
 }

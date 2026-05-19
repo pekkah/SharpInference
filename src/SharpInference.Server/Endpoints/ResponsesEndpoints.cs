@@ -185,6 +185,8 @@ public static class ResponsesEndpoints
                             content = sb.ToString();
                         }
                     }
+                    if (role == "assistant")
+                        content = ChatTemplate.ScrubAssistantThinking(content);
                     list.Add((role, content));
                 }
             }
