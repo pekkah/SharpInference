@@ -113,6 +113,21 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [Description("GPU backend: auto, vulkan, cuda. Default: auto (prefers CUDA when -g is set and CUDA is available, otherwise Vulkan).")]
         [DefaultValue("auto")]
         public string Backend { get; init; } = "auto";
+
+        [CommandOption("--no-thinking")]
+        [Description("Disable reasoning mode (sets enable_thinking=false in the chat template)")]
+        [DefaultValue(false)]
+        public bool NoThinking { get; init; }
+
+        [CommandOption("--hide-thinking")]
+        [Description("Hide reasoning output (the model still reasons; only the answer is shown)")]
+        [DefaultValue(false)]
+        public bool HideThinking { get; init; }
+
+        [CommandOption("--max-thinking-tokens")]
+        [Description("Maximum reasoning tokens before forcing </think>. 0 = unlimited (default). Not honored on the speculative-decode path.")]
+        [DefaultValue(0)]
+        public int MaxThinkingTokens { get; init; }
     }
 
     protected override int Execute(CommandContext context, Settings settings, CancellationToken cancellation)
@@ -141,14 +156,24 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         var tokenizer = GgufTokenizer.FromGgufModel(model);
         s_jinja = tokenizer.ChatTemplate;
 
-        // Look up Qwen3 thinking-mode tokens for use in the decode loops
-        if (s_arch is "qwen3moe" or "qwen3")
+        // Reasoning models (Qwen3, DeepSeek-R1, SmolLM3, ...) register <think>/</think>
+        // as control tokens in their GGUF. The decode loops no-op when these IDs are -1.
+        if (tokenizer.SpecialTokens.TryGetValue("<think>", out int thinkId)
+            && tokenizer.SpecialTokens.TryGetValue("</think>", out int endThinkId)
+            && thinkId > 0 && endThinkId > 0)
         {
-            tokenizer.SpecialTokens.TryGetValue("<think>", out int thinkId);
-            tokenizer.SpecialTokens.TryGetValue("</think>", out int endThinkId);
-            s_thinkTokenId = thinkId > 0 ? thinkId : -1;
-            s_endThinkTokenId = endThinkId > 0 ? endThinkId : -1;
+            s_thinkTokenId = thinkId;
+            s_endThinkTokenId = endThinkId;
         }
+
+        // Greedy on a reasoning model tends to "wait, but actually" itself into infinite
+        // loops; --no-thinking sidesteps the issue since the model won't reason at all.
+        if (s_thinkTokenId > 0 && settings.Temperature == 0f && !settings.NoThinking)
+        {
+            AnsiConsole.MarkupLine("[yellow]Warning:[/] Greedy decoding (--temp 0) on a reasoning model often produces");
+            AnsiConsole.MarkupLine("infinite \"wait, but actually\" loops. Consider [yellow]--temp 0.6 --top-p 0.95 --top-k 20[/].");
+        }
+
         using var cpuBackend = new CpuBackend();
         using var fwd = new ForwardPass(model, cpuBackend, hp);
 
@@ -460,7 +485,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         ForwardPass target, ForwardPass draft,
         GgufTokenizer tok, SamplingParams sp)
     {
-        var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt);
+        var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt, enableThinking: !s.NoThinking);
         var tokens = tok.Encode(prompt);
 
         if (!s.NoDisplayPrompt)
@@ -482,19 +507,25 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         sw.Restart();
         int generated = 0;
+        int totalDecoded = 0;
+        bool inThinking = false;
         var streamDec = new Utf8StreamDecoder();
+        bool hideThinking = s.HideThinking;
         spec.Decode(sp.MaxNewTokens, sp.StopTokenIds ?? [], token =>
         {
-            Console.Write(streamDec.Append(tok.DecodeBytes(token)));
-            generated++;
+            if (EmitToken(token, tok, streamDec, ref inThinking, hideThinking)) generated++;
+            totalDecoded++;
         });
-        Console.Write(streamDec.Flush());
+        var tail = streamDec.Flush();
+        if (!(hideThinking && inThinking)) Console.Write(tail);
+        if (inThinking) Console.Write("\x1b[0m");
         var decodeMs = sw.Elapsed.TotalMilliseconds;
 
         Console.WriteLine();
         AnsiConsole.MarkupLine($"\n[dim]Prefill: {tokens.Count} tokens, {tokens.Count / (prefillMs / 1000):F1} t/s | " +
-            $"Decode: {generated} tokens, {generated / (decodeMs / 1000):F1} t/s | " +
-            $"Acceptance rate: {spec.AcceptanceRate:P0}[/]");
+            $"Decode: {totalDecoded} tokens, {totalDecoded / (decodeMs / 1000):F1} t/s" +
+            (totalDecoded > generated ? $" ({generated} visible, {totalDecoded - generated} thinking)" : "") +
+            $" | Acceptance rate: {spec.AcceptanceRate:P0}[/]");
         return 0;
     }
 
@@ -512,7 +543,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             if (input is null or "/exit" or "/quit") break;
             if (string.IsNullOrWhiteSpace(input)) continue;
 
-            var prompt = FormatPrompt(input, s.SystemPrompt);
+            var prompt = FormatPrompt(input, s.SystemPrompt, enableThinking: !s.NoThinking);
             var tokens = tok.Encode(prompt);
 
             target.Cache.Reset();
@@ -531,17 +562,24 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
             sw.Restart();
             int generated = 0;
+            int totalDecoded = 0;
+            bool inThinking = false;
             var streamDec = new Utf8StreamDecoder();
+            bool hideThinking = s.HideThinking;
             spec.Decode(sp.MaxNewTokens, sp.StopTokenIds ?? [], token =>
             {
-                Console.Write(streamDec.Append(tok.DecodeBytes(token)));
-                generated++;
+                if (EmitToken(token, tok, streamDec, ref inThinking, hideThinking)) generated++;
+                totalDecoded++;
             });
-            Console.Write(streamDec.Flush());
+            var tail = streamDec.Flush();
+            if (!(hideThinking && inThinking)) Console.Write(tail);
+            if (inThinking) Console.Write("\x1b[0m");
             var decodeMs = sw.Elapsed.TotalMilliseconds;
 
             Console.WriteLine();
-            AnsiConsole.MarkupLine($"[dim]{generated} tokens, {generated / (decodeMs / 1000):F1} t/s | Accept: {spec.AcceptanceRate:P0}[/]\n");
+            AnsiConsole.MarkupLine($"[dim]{totalDecoded} tokens, {totalDecoded / (decodeMs / 1000):F1} t/s" +
+                (totalDecoded > generated ? $" ({generated} visible, {totalDecoded - generated} thinking)" : "") +
+                $" | Accept: {spec.AcceptanceRate:P0}[/]\n");
 
             if (s.SingleTurn) break;
         }
@@ -553,7 +591,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         Func<IReadOnlyList<int>, ReadOnlySpan<float>> prefill,
         GgufTokenizer tok, SamplingParams sp, Random rng)
     {
-        var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt);
+        var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt, enableThinking: !s.NoThinking);
         var tokens = tok.Encode(prompt);
 
         if (s.VerbosePrompt)
@@ -571,47 +609,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             Console.Write(s.Prompt);
 
         sw.Restart();
-        int generated = 0;
-        int totalDecoded = 0; // every forward iteration, including thinking-mode tokens
-        bool inThinking = false; // set to true when model generates <think> token
-        var recentTokens = new List<int>(64);
-        var streamDec = new Utf8StreamDecoder();
-        for (int i = 0; i < sp.MaxNewTokens; i++)
-        {
-            var spWithHistory = sp.RepetitionPenalty != 1.0f && recentTokens.Count > 0
-                ? sp with { PreviousTokens = recentTokens }
-                : sp;
-            int next = sp.Temperature <= 0 ? Sampler.Greedy(logits) : Sampler.Sample(logits, spWithHistory, rng);
-            if (s.VerbosePrompt)
-            {
-                var logitsArr = logits.ToArray();
-                var top5 = Enumerable.Range(0, logitsArr.Length).OrderByDescending(j => logitsArr[j]).Take(5)
-                    .Select(j => $"{j}({logitsArr[j]:F2})");
-                Console.Error.WriteLine($"[DBG] tok={i} next={next}('{tok.Decode([next])}') stop={sp.StopTokenIds.Contains(next)} top5:{string.Join(" ", top5)}");
-            }
-            if (sp.StopTokenIds.Contains(next)) break;
-            if (next == s_thinkTokenId)
-            {
-                inThinking = true;
-                Console.Write("\x1b[2m[Thinking...]\n");
-            }
-            else if (next == s_endThinkTokenId && inThinking)
-            {
-                inThinking = false;
-                Console.Write("\x1b[0m\n");
-            }
-            else if (!inThinking)
-            {
-                Console.Write(streamDec.Append(tok.DecodeBytes(next)));
-                generated++;
-            }
-            totalDecoded++;
-            recentTokens.Add(next);
-            if (recentTokens.Count > 64) recentTokens.RemoveAt(0);
-            logits = forward(next, tokens.Count + i);
-        }
-        Console.Write(streamDec.Flush());
-        if (inThinking) Console.Write("\x1b[0m"); // reset if thinking was never closed
+        var (generated, totalDecoded) = DecodeLoop(forward, logits, tokens.Count, tok, sp, rng, s.VerbosePrompt, s.HideThinking, s.MaxThinkingTokens);
         var decodeMs = sw.Elapsed.TotalMilliseconds;
 
         Console.WriteLine();
@@ -637,7 +635,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             if (input is null or "/exit" or "/quit") break;
             if (string.IsNullOrWhiteSpace(input)) continue;
 
-            var prompt = FormatPrompt(input, s.SystemPrompt);
+            var prompt = FormatPrompt(input, s.SystemPrompt, enableThinking: !s.NoThinking);
             var tokens = tok.Encode(prompt);
 
             resetCache();
@@ -645,51 +643,116 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             var logits = prefill(tokens);
 
             sw.Restart();
-            int generated = 0;
-            bool inThinking = false; // set to true when model generates <think> token
-            var recentTokens = new List<int>(64);
-            var streamDec = new Utf8StreamDecoder();
-            for (int i = 0; i < sp.MaxNewTokens; i++)
-            {
-                var spWithHistory = sp.RepetitionPenalty != 1.0f && recentTokens.Count > 0
-                    ? sp with { PreviousTokens = recentTokens }
-                    : sp;
-                int next = sp.Temperature <= 0 ? Sampler.Greedy(logits) : Sampler.Sample(logits, spWithHistory, rng);
-                if (sp.StopTokenIds.Contains(next)) break;
-                if (next == s_thinkTokenId)
-                {
-                    inThinking = true;
-                    Console.Write("\x1b[2m[Thinking...]\n");
-                }
-                else if (next == s_endThinkTokenId && inThinking)
-                {
-                    inThinking = false;
-                    Console.Write("\x1b[0m\n");
-                }
-                else if (!inThinking)
-                {
-                    Console.Write(streamDec.Append(tok.DecodeBytes(next)));
-                    generated++;
-                }
-                recentTokens.Add(next);
-                if (recentTokens.Count > 64) recentTokens.RemoveAt(0);
-                logits = forward(next, tokens.Count + i);
-            }
-            Console.Write(streamDec.Flush());
-            if (inThinking) Console.Write("\x1b[0m"); // reset if thinking was never closed
+            var (generated, totalDecoded) = DecodeLoop(forward, logits, tokens.Count, tok, sp, rng, hideThinking: s.HideThinking, maxThinkingTokens: s.MaxThinkingTokens);
             var decodeMs = sw.Elapsed.TotalMilliseconds;
 
             Console.WriteLine();
-            AnsiConsole.MarkupLine($"[dim]{generated} tokens, {generated / (decodeMs / 1000):F1} t/s[/]\n");
+            AnsiConsole.MarkupLine($"[dim]{totalDecoded} tokens, {totalDecoded / (decodeMs / 1000):F1} t/s" +
+                (totalDecoded > generated ? $" ({generated} visible, {totalDecoded - generated} thinking)" : "") +
+                "[/]\n");
 
             if (s.SingleTurn) break;
         }
         return 0;
     }
 
+    private static (int generated, int totalDecoded) DecodeLoop(
+        Func<int, int, ReadOnlySpan<float>> forward,
+        ReadOnlySpan<float> initialLogits,
+        int startPos,
+        GgufTokenizer tok,
+        SamplingParams sp,
+        Random rng,
+        bool verbosePromptLogging = false,
+        bool hideThinking = false,
+        int maxThinkingTokens = 0)
+    {
+        var logits = initialLogits;
+        int generated = 0;
+        int totalDecoded = 0;
+        bool inThinking = false;
+        int thinkingTokenCount = 0;
+        var recentTokens = new List<int>(64);
+        var streamDec = new Utf8StreamDecoder();
+        for (int i = 0; i < sp.MaxNewTokens; i++)
+        {
+            var spWithHistory = sp.RepetitionPenalty != 1.0f && recentTokens.Count > 0
+                ? sp with { PreviousTokens = recentTokens }
+                : sp;
+            int next;
+            if (inThinking && maxThinkingTokens > 0 && thinkingTokenCount >= maxThinkingTokens && s_endThinkTokenId > 0)
+            {
+                // Force </think> to exit a runaway reasoning block; the close tag still
+                // goes through forward() below so the model continues from the post-think state.
+                next = s_endThinkTokenId;
+            }
+            else
+            {
+                next = sp.Temperature <= 0 ? Sampler.Greedy(logits) : Sampler.Sample(logits, spWithHistory, rng);
+            }
+            if (verbosePromptLogging)
+            {
+                var logitsArr = logits.ToArray();
+                var top5 = Enumerable.Range(0, logitsArr.Length).OrderByDescending(j => logitsArr[j]).Take(5)
+                    .Select(j => $"{j}({logitsArr[j]:F2})");
+                Console.Error.WriteLine($"[DBG] tok={i} next={next}('{tok.Decode([next])}') stop={sp.StopTokenIds.Contains(next)} top5:{string.Join(" ", top5)}");
+            }
+            if (sp.StopTokenIds.Contains(next)) break;
+            // Counter resets on each <think> open (in case the model opens multiple blocks)
+            // and counts every token emitted while inThinking is true on entry, including
+            // the boundary tokens themselves — that keeps the budget predictable: N tokens
+            // of reasoning content trip the force-close on iteration N+1.
+            if (next == s_thinkTokenId) thinkingTokenCount = 0;
+            else if (inThinking) thinkingTokenCount++;
+            if (EmitToken(next, tok, streamDec, ref inThinking, hideThinking)) generated++;
+            totalDecoded++;
+            recentTokens.Add(next);
+            if (recentTokens.Count > 64) recentTokens.RemoveAt(0);
+            logits = forward(next, startPos + i);
+        }
+        // When hiding reasoning, the decoder may still hold an in-thinking tail —
+        // flush it through the same gate so nothing leaks to stdout.
+        var tail = streamDec.Flush();
+        if (!(hideThinking && inThinking))
+            Console.Write(tail);
+        if (inThinking) Console.Write("\x1b[0m");
+        return (generated, totalDecoded);
+    }
+
+    /// <summary>
+    /// Writes <paramref name="next"/> to stdout, handling the &lt;think&gt;/&lt;/think&gt; boundary tokens
+    /// and dim-styling everything inside. Returns true when the emitted token counts toward the
+    /// visible decode total (i.e. not a thinking-mode token and not a boundary marker).
+    /// </summary>
+    private static bool EmitToken(int next, GgufTokenizer tok, Utf8StreamDecoder streamDec, ref bool inThinking, bool hideThinking = false)
+    {
+        if (next == s_thinkTokenId)
+        {
+            inThinking = true;
+            // No trailing \n: the model often emits its own leading newline inside the block,
+            // and a double break before the reasoning starts looks noisy.
+            Console.Write("\x1b[2m[Thinking...] ");
+            return false;
+        }
+        if (next == s_endThinkTokenId && inThinking)
+        {
+            inThinking = false;
+            Console.Write("\x1b[0m\n");
+            return false;
+        }
+        // Stream through the same UTF-8 decoder regardless of mode so multibyte
+        // sequences split across thinking/visible boundaries stay intact. When
+        // hideThinking is set we still consume the bytes (so the decoder stays in
+        // sync across the boundary) but discard the rendered output.
+        var rendered = streamDec.Append(tok.DecodeBytes(next));
+        if (!(hideThinking && inThinking))
+            Console.Write(rendered);
+        return !inThinking;
+    }
+
     private static string s_arch = "qwen2"; // set during model load
-    private static int s_thinkTokenId = -1;    // <think> token for Qwen3 thinking mode
-    private static int s_endThinkTokenId = -1; // </think> token for Qwen3 thinking mode
+    private static int s_thinkTokenId = -1;    // <think> token for any model using the <think>/</think> special-token convention
+    private static int s_endThinkTokenId = -1; // </think> token for any model using the <think>/</think> special-token convention
     private static JinjaChatTemplate? s_jinja;  // parsed from GGUF tokenizer.chat_template
 
     /// <summary>
@@ -706,7 +769,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         return [.. stops];
     }
 
-    private static string FormatPrompt(string userMessage, string? systemPrompt)
+    private static string FormatPrompt(string userMessage, string? systemPrompt, bool enableThinking = true)
     {
         // Use the model's own Jinja2 chat template when available (read from GGUF metadata).
         if (s_jinja != null)
@@ -725,6 +788,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 ["messages"]             = messages,
                 ["add_generation_prompt"] = true,
                 ["tools"]                = null,
+                ["enable_thinking"]      = enableThinking,
             });
         }
 
