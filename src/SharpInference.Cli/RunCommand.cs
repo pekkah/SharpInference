@@ -175,7 +175,36 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         }
 
         using var cpuBackend = new CpuBackend();
-        using var fwd = new ForwardPass(model, cpuBackend, hp);
+
+        // Hybrid GDN models (qwen35moe) currently only have a CPU forward pass; reject
+        // GPU offload and TurboQuant up front so we don't burn the time to build a
+        // ForwardPass that the dispatch won't use.
+        if (hp.IsHybridSsm && settings.NGpuLayers != 0)
+        {
+            AnsiConsole.MarkupLine("[red]Error:[/] Hybrid GDN+MoE models (qwen35moe) currently run CPU-only. Use [yellow]-g 0[/] (the default).");
+            return 1;
+        }
+        if (hp.IsHybridSsm && settings.TurboQuant)
+        {
+            AnsiConsole.MarkupLine("[red]Error:[/] TurboQuant is not supported for hybrid GDN models (no KV cache on GDN layers).");
+            return 1;
+        }
+        if (hp.IsHybridSsm && settings.DraftModelPath is not null)
+        {
+            AnsiConsole.MarkupLine("[red]Error:[/] Speculative decoding is not supported for hybrid GDN models (GDN state is destructively updated and cannot be rewound).");
+            return 1;
+        }
+
+        // Build the dense/MoE CPU forward pass for non-hybrid models. For hybrid GDN
+        // models we use HybridGdnForwardPass below; the ForwardPass-typed `fwd` stays
+        // null so any code path that depends on it (TurboQuant, speculative decoding)
+        // is unreachable for hybrid.
+        ForwardPass? fwd = null;
+        HybridGdnForwardPass? hybridFwd = null;
+        if (hp.IsHybridSsm)
+            hybridFwd = new HybridGdnForwardPass(model, cpuBackend, hp);
+        else
+            fwd = new ForwardPass(model, cpuBackend, hp);
 
         // Create backend-specific forward pass
         IDisposable? gpuBackend = null;
@@ -244,15 +273,25 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         if (nGpuLayers == 0)
         {
             // CPU only
-            if (settings.TurboQuant)
+            if (hybridFwd is not null)
             {
-                fwd.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
-                AnsiConsole.MarkupLine("[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
+                forward = hybridFwd.Forward;
+                prefill = tokens => hybridFwd.Prefill(tokens);
+                resetCache = hybridFwd.ResetCache;
+                AnsiConsole.MarkupLine("[dim]Backend: [blue]CPU[/] (hybrid GDN+MoE)[/]");
             }
-            forward = fwd.Forward;
-            prefill = tokens => fwd.Prefill(tokens);
-            resetCache = settings.TurboQuant ? fwd.TqCache!.Reset : fwd.Cache.Reset;
-            AnsiConsole.MarkupLine("[dim]Backend: [blue]CPU[/][/]");
+            else
+            {
+                if (settings.TurboQuant)
+                {
+                    fwd!.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
+                    AnsiConsole.MarkupLine("[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
+                }
+                forward = fwd!.Forward;
+                prefill = tokens => fwd.Prefill(tokens);
+                resetCache = settings.TurboQuant ? fwd.TqCache!.Reset : fwd.Cache.Reset;
+                AnsiConsole.MarkupLine("[dim]Backend: [blue]CPU[/][/]");
+            }
         }
         else if (wantCuda)
         {
@@ -297,14 +336,15 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 else if (cudaGpuLayers == 0)
                 {
                     // Model doesn't fit any GPU layer — fall back to CPU forward pass.
+                    // (Hybrid GDN models were rejected before reaching here.)
                     cuda.Dispose();
                     gpuBackend = null;
                     if (settings.TurboQuant)
                     {
-                        fwd.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
+                        fwd!.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
                         AnsiConsole.MarkupLine("[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
                     }
-                    forward = fwd.Forward;
+                    forward = fwd!.Forward;
                     prefill = tokens => fwd.Prefill(tokens);
                     resetCache = settings.TurboQuant ? fwd.TqCache!.Reset : fwd.Cache.Reset;
                     AnsiConsole.MarkupLine("[dim]Backend: [blue]CPU[/] (CUDA fallback: no GPU-capable layers)[/]");
@@ -349,13 +389,14 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     nGpuLayers = placement.GpuLayers;
                     if (nGpuLayers == 0)
                     {
+                        // Hybrid GDN models were rejected before reaching this Vulkan branch.
                         if (settings.TurboQuant)
                         {
-                            fwd.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
+                            fwd!.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
                             AnsiConsole.MarkupLine("[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
                         }
 
-                        forward = fwd.Forward;
+                        forward = fwd!.Forward;
                         prefill = tokens => fwd.Prefill(tokens);
                         resetCache = settings.TurboQuant ? fwd.TqCache!.Reset : fwd.Cache.Reset;
                         AnsiConsole.MarkupLine("[dim]Backend: [blue]CPU[/] (auto fallback: no GPU-capable layers for this model/path)[/]");
@@ -447,8 +488,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     AnsiConsole.MarkupLine($"[dim]Draft model: {draftHp.NumLayers}L, {draftHp.EmbeddingDim}d | Lookahead k={settings.SpecLookahead}[/]");
 
                     if (settings.Prompt is not null)
-                        return RunSpeculativeSinglePrompt(settings, fwd, draftFwd, tokenizer, sp);
-                    return RunSpeculativeInteractive(settings, fwd, draftFwd, tokenizer, sp);
+                        return RunSpeculativeSinglePrompt(settings, fwd!, draftFwd, tokenizer, sp);
+                    return RunSpeculativeInteractive(settings, fwd!, draftFwd, tokenizer, sp);
                 }
                 catch (Exception ex)
                 {
@@ -459,6 +500,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 {
                     gpuFwd?.Dispose();
                     gpuBackend?.Dispose();
+                    fwd?.Dispose();
+                    hybridFwd?.Dispose();
                 }
             }
         }
@@ -478,6 +521,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         {
             gpuFwd?.Dispose();
             gpuBackend?.Dispose();
+            fwd?.Dispose();
+            hybridFwd?.Dispose();
         }
     }
 

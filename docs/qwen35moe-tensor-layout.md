@@ -69,7 +69,7 @@ gdn_conv_dim   = 8192       (= qkv_dim; depthwise conv runs over all of it)
 
 ```
 blk.0.attn_norm.weight              [2048]            F32     pre-block RMSNorm
-blk.0.attn_qkv.weight               [2048, 8192]      Q8_0    joint QKV projection (K=2048, Q=2048, V=4096 along output)
+blk.0.attn_qkv.weight               [2048, 8192]      Q8_0    joint QKV projection (Q=2048, K=2048, V=4096 along output; offsets 0/2048/4096)
 blk.0.attn_gate.weight              [2048, 4096]      Q8_0    z-gate projection (pre-activation, gated SiLU on output)
 blk.0.ssm_conv1d.weight             [4, 8192]         F32     depthwise causal conv1d over joint QKV (kernel=4)
 blk.0.ssm_alpha.weight              [2048, 32]        F32     per-v-head alpha projection (input to softplus)
@@ -122,7 +122,7 @@ qkv_c   = depthwise_conv1d(conv_in, ssm_conv1d.w)    # [8192], no bias in this m
 conv_state := conv_in[-3:]                           # roll forward
 
 qkv_c   = SiLU(qkv_c)
-k_pre, q_pre, v = split(qkv_c, [2048, 2048, 4096])   # along channel axis
+q_pre, k_pre, v = split(qkv_c, [2048, 2048, 4096])   # along channel axis (offsets 0, 2048, 4096)
 
 q = L2Norm(q_pre.reshape(Hk, D))                     # [Hk, D]  (norm per head)
 k = L2Norm(k_pre.reshape(Hk, D))                     # [Hk, D]  (norm per head)
@@ -154,25 +154,25 @@ return x + out                                       # residual
 ### Full-attention block (per token)
 
 ```
+# Full-attention head_dim = 256 (from attention.key_length); 16 Q-heads, 2 KV-heads
 x_norm = RMSNorm(x, attn_norm)
-qg = attn_q @ x_norm                                 # [8192]
-# Interleaved per head: for each head h ∈ [0,16),
-#   Q[h] = qg[h*256     : h*256+128]
-#   G[h] = qg[h*256+128 : h*256+256]
-q = qg.reshape(16, 2*128)[:, :128]                   # [16, 128]
-g = qg.reshape(16, 2*128)[:, 128:]                   # [16, 128]
-k = (attn_k @ x_norm).reshape(2, 128)                # [2, 128]
-v = (attn_v @ x_norm).reshape(2, 128)                # [2, 128]
-q = RMSNorm(q, attn_q_norm)                          # per-head over head_dim
+qg = attn_q @ x_norm                                 # [8192] = 16 heads × 2 × 256
+# Interleaved per head h ∈ [0,16): each head has a 512-wide slot of Q‖gate
+#   Q[h] = qg[h*512     : h*512+256]
+#   G[h] = qg[h*512+256 : (h+1)*512]
+q = qg.reshape(16, 2*256)[:, :256]                   # [16, 256]
+g = qg.reshape(16, 2*256)[:, 256:]                   # [16, 256]
+k = (attn_k @ x_norm).reshape(2, 256)                # [2, 256]
+v = (attn_v @ x_norm).reshape(2, 256)                # [2, 256]
+q = RMSNorm(q, attn_q_norm)                          # per-head over head_dim=256
 k = RMSNorm(k, attn_k_norm)
-q = partial_rope_neox(q, position, rope_dim=64)      # first 64 dims rotated
+q = partial_rope_neox(q, position, rope_dim=64)      # first 64 of 256 dims rotated
 k = partial_rope_neox(k, position, rope_dim=64)
-attn_out = scaled_dot_product_attn_gqa(q, k, v, kv_cache)   # [16, 128]
-attn_out = attn_out * sigmoid(g)                     # GLU gate
-out = attn_output @ attn_out.reshape(2048 wait, 4096 — see note)
+attn_out = scaled_dot_product_attn_gqa(q, k, v, kv_cache)   # [16, 256]
+attn_out = attn_out * sigmoid(g)                     # GLU gate, elementwise
+out = attn_output @ attn_out.reshape(4096)           # 4096 = 16 * 256, matches attn_output input
 return x + out
 ```
-**Note:** `attn_output` has shape `[4096, 2048]` (input 4096, output 2048). But 16 heads × 128 head_dim = 2048, not 4096. Re-check this when implementing — either head_dim is 256 (matching `key_length=256` from metadata) with K/V at 256 (matching `[2048,512]` = 2×256), OR head_dim is 128 with attn_output input including the gate-multiplied output at twice the width. The llama.cpp source is the tiebreaker; my reading of the research is that head_dim=128 for full attention here, so attn_output's input may include both rotated and unrotated halves of Q — needs re-validation.
 
 ### MoE FFN block (shared by both layer types)
 
@@ -214,7 +214,7 @@ return x + moe_out + shexp_gate * shexp_out
 
 12. **No MTP head in this checkpoint.** Verified: `blk.40` has zero tensors and no `nextn_predict_layers` metadata. The model uses exactly 40 trunk layers.
 
-8. **Full-attn `attn_q` is GLU-gated**: first 128 of each 256-wide head slot is Q, second 128 is the sigmoid gate on the attn output. M-RoPE applies to the Q half only.
+8. **Full-attn `attn_q` is GLU-gated**: full-attention `head_dim` is 256 (from `attention.key_length`). Each head's slot in `attn_q.weight` is `2 * head_dim = 512` floats, with the first 256 being Q and the next 256 being the per-head gate. The gate is `sigmoid(gate)` (not SiLU) and is multiplied into the attention output elementwise BEFORE `attn_output`. Partial NEOX RoPE applies to the first 64 dims of the Q half only.
 
 9. **TruncateTo** for GDN is fundamentally lossy (state is rank-1-updated in place; no rewind). For v1: throw unless length ∈ {0, current}. Speculative decoding is disabled for hybrid GDN+MoE in v1.
 

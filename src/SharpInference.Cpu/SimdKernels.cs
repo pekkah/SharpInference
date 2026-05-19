@@ -1775,6 +1775,48 @@ public static unsafe class SimdKernels
         }
     }
 
+    /// <summary>
+    /// NEOX-style RoPE with PARTIAL rotation. Rotates only the first <paramref name="ropeDim"/>
+    /// dims of each head; dims <c>[ropeDim, headDim)</c> pass through unchanged.
+    ///
+    /// Pair convention: for each head and <c>i ∈ [0, ropeDim/2)</c>, the pair
+    /// <c>(x[i], x[i + ropeDim/2])</c> is rotated by <c>(cosTab[i], sinTab[i])</c>.
+    /// Both <paramref name="cosTab"/> and <paramref name="sinTab"/> must point at the
+    /// per-position slice of a table sized with <c>BuildRopeTable(..., ropeDim, theta)</c>
+    /// (i.e. <c>ropeDim/2</c> entries).
+    ///
+    /// Matches llama.cpp's <c>ggml_compute_forward_rope_flt</c> NEOX path with
+    /// <c>n_dims=ropeDim</c>: the tail dims are passed through (see ggml ops.cpp:
+    /// "fill the remain channels with data from src tensor").
+    /// </summary>
+    /// <remarks>
+    /// Used by hybrid models with partial RoPE (notably qwen35moe: ropeDim=64, headDim=256).
+    /// The scalar inner loop is sufficient for the small ropeDim/2 typical for these models;
+    /// SIMD on the partial path is a future optimization.
+    /// </remarks>
+    public static void ApplyRoPECachedNeoxPartial(
+        float* x, float* cosTab, float* sinTab,
+        int heads, int headDim, int ropeDim)
+    {
+        if (ropeDim <= 0 || (ropeDim & 1) != 0)
+            throw new ArgumentException("ropeDim must be a positive even number", nameof(ropeDim));
+        if (ropeDim > headDim)
+            throw new ArgumentException("ropeDim must be <= headDim", nameof(ropeDim));
+        int halfRope = ropeDim / 2;
+        for (int h = 0; h < heads; h++)
+        {
+            float* head = x + h * headDim;
+            for (int i = 0; i < halfRope; i++)
+            {
+                float x0 = head[i];
+                float x1 = head[i + halfRope];
+                head[i]            = x0 * cosTab[i] - x1 * sinTab[i];
+                head[i + halfRope] = x0 * sinTab[i] + x1 * cosTab[i];
+            }
+            // Dims [ropeDim, headDim) pass through unchanged — nothing to do.
+        }
+    }
+
     public static void ApplyRoPE(float* x, int position, int numHeads, int headDim, float theta)
     {
         int halfDim = headDim / 2;
