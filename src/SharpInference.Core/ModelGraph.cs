@@ -90,6 +90,35 @@ public sealed record ModelHyperparams
     public bool IsNeoxRope { get; init; }
 
     /// <summary>
+    /// Number of head dims that receive RoPE rotation. Default equals HeadDim (full RoPE).
+    /// Some architectures (notably qwen35moe) use partial RoPE where only the first
+    /// <see cref="RopeDim"/> dims of each head are rotated and the rest pass through.
+    /// </summary>
+    public int RopeDim { get; init; }
+
+    // ── Hybrid Gated DeltaNet + Attention (qwen35moe) ──
+
+    /// <summary>
+    /// True for hybrid models whose trunk interleaves recurrent (Gated DeltaNet / SSM-named)
+    /// blocks with full softmax-attention blocks. Drives layer-by-layer dispatch.
+    /// </summary>
+    public bool IsHybridSsm { get; init; }
+
+    /// <summary>
+    /// Per-layer block type. <c>null</c> for non-hybrid models (every layer is Attention).
+    /// Indexed by absolute layer number (0..NumLayers-1).
+    /// </summary>
+    public IReadOnlyList<LayerType>? LayerTypes { get; init; }
+
+    /// <summary>
+    /// Gated DeltaNet configuration. Non-null iff <see cref="IsHybridSsm"/> is true.
+    /// Holds per-head dims, group count, conv kernel, and rank — the parameters of the
+    /// recurrent block. Despite the GGUF prefix <c>ssm.*</c>, the math is delta-rule
+    /// linear attention with a 2D matrix state per head, NOT Mamba selective scan.
+    /// </summary>
+    public GdnConfig? Gdn { get; init; }
+
+    /// <summary>
     /// Extract hyperparameters from GGUF metadata using the model's architecture prefix.
     /// Supports llama-family models (llama, mistral, qwen, smollm, etc.) and MoE variants.
     /// </summary>
@@ -147,7 +176,7 @@ public sealed record ModelHyperparams
             "jais2" or "gpt-oss" or
             "lfm2" or "lfm2moe" or "smallthinker" or "seed_oss" or "grovemoe" or
             "apertus" or "minimax-m2" or "cogvlm" or "pangu-embedded" or "afmoe" or
-            "qwen3next" or "mimo2" or "step35" => true,
+            "qwen3next" or "qwen35moe" or "mimo2" or "step35" => true,
             _ => false,
         };
 
@@ -157,6 +186,43 @@ public sealed record ModelHyperparams
         // Read from metadata if available; fall back to computed value.
         int headDimFromMeta = GetInt(metadata, $"{arch}.attention.key_length");
         int headDim = headDimFromMeta > 0 ? headDimFromMeta : (numHeads > 0 ? embDim / numHeads : embDim);
+
+        // Partial RoPE: rope.dimension_count, when present and smaller than headDim,
+        // rotates only the first ropeDim dims of each head. qwen35moe rotates 64 of 256.
+        int ropeDimFromMeta = GetInt(metadata, $"{arch}.rope.dimension_count");
+        int ropeDim = ropeDimFromMeta > 0 ? ropeDimFromMeta : headDim;
+
+        // Hybrid Gated-DeltaNet detection. qwen35moe (and similar future architectures)
+        // interleave recurrent and attention blocks. We rely on metadata exclusively here;
+        // the synthetic-metadata probe in GgufModel.Open injects _sharpi.is_hybrid_ssm
+        // when GDN tensors are observed.
+        bool isHybridSsm = metadata.ContainsKey("_sharpi.is_hybrid_ssm")
+                        || arch == "qwen35moe";
+
+        int numLayers = GetInt(metadata, $"{arch}.block_count");
+        IReadOnlyList<LayerType>? layerTypes = null;
+        GdnConfig? gdn = null;
+        if (isHybridSsm && numLayers > 0)
+        {
+            int fullAttnInterval = GetInt(metadata, $"{arch}.full_attention_interval", 4);
+            var types = new LayerType[numLayers];
+            for (int i = 0; i < numLayers; i++)
+            {
+                // qwen35moe: full attention when (i+1) % full_attention_interval == 0.
+                // i.e. the LAST layer of each group of full_attention_interval is full attn.
+                bool isFullAttn = fullAttnInterval > 0 && ((i + 1) % fullAttnInterval) == 0;
+                types[i] = isFullAttn ? LayerType.Attention : LayerType.GatedDeltaNet;
+            }
+            layerTypes = types;
+
+            gdn = new GdnConfig(
+                NumKHeads:    GetInt(metadata, $"{arch}.ssm.group_count"),
+                NumVHeads:    GetInt(metadata, $"{arch}.ssm.time_step_rank"),
+                HeadDim:      GetInt(metadata, $"{arch}.ssm.state_size"),
+                InnerSize:    GetInt(metadata, $"{arch}.ssm.inner_size"),
+                ConvKernel:   GetInt(metadata, $"{arch}.ssm.conv_kernel"),
+                FullAttentionInterval: fullAttnInterval);
+        }
 
         return new ModelHyperparams
         {
@@ -183,6 +249,10 @@ public sealed record ModelHyperparams
             UseSigmoidGating = useSigmoidGating,
             UseL2QkNorm = useL2QkNorm,
             IsNeoxRope = isNeoxRope,
+            RopeDim = ropeDim,
+            IsHybridSsm = isHybridSsm,
+            LayerTypes = layerTypes,
+            Gdn = gdn,
         };
     }
 
@@ -203,3 +273,51 @@ public sealed class FeedForwardLayer : ModelLayer { }
 public sealed class EmbeddingLayer : ModelLayer { }
 public sealed class NormLayer : ModelLayer { }
 public sealed class OutputLayer : ModelLayer { }
+
+/// <summary>
+/// Block type for one trunk layer. Hybrid models (qwen35moe) interleave the two
+/// types according to a fixed interval; pure transformer models are all-Attention.
+/// </summary>
+public enum LayerType
+{
+    Attention = 0,
+    GatedDeltaNet = 1,
+}
+
+/// <summary>
+/// Hyperparameters for a Gated DeltaNet recurrent block (linear attention with
+/// delta-rule rank-1 state update). Despite the GGUF prefix <c>ssm.*</c>, this
+/// is NOT Mamba selective scan — there is no per-state-dim A vector and the
+/// recurrent state is a per-head matrix.
+/// </summary>
+/// <param name="NumKHeads">Number of key heads (= <c>ssm.group_count</c>). Each K head is shared by
+/// <c>NumVHeads / NumKHeads</c> value heads (GQA-style for the GDN block).</param>
+/// <param name="NumVHeads">Number of value heads (= <c>ssm.time_step_rank</c>). The per-head decay
+/// (alpha/A) and write rate (beta) are scalars indexed by v-head.</param>
+/// <param name="HeadDim">Head dimension shared by Q, K, V, and the per-head matrix state
+/// (= <c>ssm.state_size</c>). Each head's recurrent state is a <c>[HeadDim, HeadDim]</c> matrix.</param>
+/// <param name="InnerSize">Total value channels = <c>NumVHeads * HeadDim</c> (= <c>ssm.inner_size</c>).</param>
+/// <param name="ConvKernel">Depthwise causal conv1d kernel size, applied to the joint Q‖K‖V stream
+/// (= <c>ssm.conv_kernel</c>; typically 4).</param>
+/// <param name="FullAttentionInterval">Stride between full-attention layers. With value 4,
+/// layers where <c>(i+1) % 4 == 0</c> are full attention and the rest are GDN.</param>
+public sealed record GdnConfig(
+    int NumKHeads,
+    int NumVHeads,
+    int HeadDim,
+    int InnerSize,
+    int ConvKernel,
+    int FullAttentionInterval)
+{
+    /// <summary>Total key channels = <c>NumKHeads * HeadDim</c>.</summary>
+    public int KeyDim => NumKHeads * HeadDim;
+
+    /// <summary>Total value channels = <c>NumVHeads * HeadDim</c>; equals <see cref="InnerSize"/>.</summary>
+    public int ValueDim => NumVHeads * HeadDim;
+
+    /// <summary>
+    /// Channels in the joint QKV stream that the depthwise conv1d operates on:
+    /// <c>KeyDim*2 + ValueDim</c> (Q and K share KeyDim each, V is ValueDim).
+    /// </summary>
+    public int ConvChannels => KeyDim * 2 + ValueDim;
+}

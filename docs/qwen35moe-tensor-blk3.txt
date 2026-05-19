@@ -1,0 +1,23 @@
+Qwen3.6-35B-A3B-UD-Q4_K_M.gguf  GGUF v3  |  733 tensors  |  55 metadata keys
+
+                                                                             
+  Name                               DType     Shape                  Bytes  
+─────────────────────────────────────────────────────────────────────────────
+  blk.3.attn_k.weight                Q8_0      [2048, 512]          1.1 MiB  
+  blk.3.attn_k_norm.weight           Float32   [256]                1.0 KiB  
+  blk.3.attn_norm.weight             Float32   [2048]               8.0 KiB  
+  blk.3.attn_output.weight           Q8_0      [4096, 2048]         8.5 MiB  
+  blk.3.attn_q.weight                Q8_0      [2048, 8192]        17.0 MiB  
+  blk.3.attn_q_norm.weight           Float32   [256]                1.0 KiB  
+  blk.3.attn_v.weight                Q8_0      [2048, 512]          1.1 MiB  
+  blk.3.ffn_down_exps.weight         Q5_K      [512, 2048, 256]   176.0 MiB  
+  blk.3.ffn_down_shexp.weight        Q8_0      [512, 2048]          1.1 MiB  
+  blk.3.ffn_gate_exps.weight         Q4_K      [2048, 512, 256]   144.0 MiB  
+  blk.3.ffn_gate_inp.weight          Float32   [2048, 256]          2.0 MiB  
+  blk.3.ffn_gate_inp_shexp.weight    Float32   [2048]               8.0 KiB  
+  blk.3.ffn_gate_shexp.weight        Q8_0      [2048, 512]          1.1 MiB  
+  blk.3.ffn_up_exps.weight           Q4_K      [2048, 512, 256]   144.0 MiB  
+  blk.3.ffn_up_shexp.weight          Q8_0      [2048, 512]          1.1 MiB  
+  blk.3.post_attention_norm.weight   Float32   [2048]               8.0 KiB  
+                                                                             
+16 tensors, total 496.8 MiB

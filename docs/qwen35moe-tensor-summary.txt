@@ -1,0 +1,51 @@
+Qwen3.6-35B-A3B-UD-Q4_K_M.gguf  GGUF v3  |  733 tensors  |  55 metadata keys
+
+                                                                                
+  Suffix                             Count   DType     Shape            Total   
+                                                       (sample)          bytes  
+────────────────────────────────────────────────────────────────────────────────
+  blk.*.ffn_down_exps.weight            40   Q5_K      [512,          6.97 GiB  
+                                                       2048, 256]               
+  blk.*.ffn_gate_exps.weight            40   Q4_K      [2048,         5.62 GiB  
+                                                       512, 256]                
+  blk.*.ffn_up_exps.weight              40   Q4_K      [2048,         5.62 GiB  
+                                                       512, 256]                
+  token_embd.weight                      1   Q8_0      [2048,        515.3 MiB  
+                                                       248320]                  
+  blk.*.attn_qkv.weight                 30   Q8_0      [2048,        510.0 MiB  
+                                                       8192]                    
+  output.weight                          1   Q6_K      [2048,        397.9 MiB  
+                                                       248320]                  
+  blk.*.attn_gate.weight                30   Q8_0      [2048,        255.0 MiB  
+                                                       4096]                    
+  blk.*.ssm_out.weight                  30   Q8_0      [4096,        255.0 MiB  
+                                                       2048]                    
+  blk.*.attn_q.weight                   10   Q8_0      [2048,        170.0 MiB  
+                                                       8192]                    
+  blk.*.attn_output.weight              10   Q8_0      [4096,         85.0 MiB  
+                                                       2048]                    
+  blk.*.ffn_gate_inp.weight             40   Float32   [2048,         80.0 MiB  
+                                                       256]                     
+  blk.*.ffn_down_shexp.weight           40   Q8_0      [512,          42.5 MiB  
+                                                       2048]                    
+  blk.*.ffn_gate_shexp.weight           40   Q8_0      [2048,         42.5 MiB  
+                                                       512]                     
+  blk.*.ffn_up_shexp.weight             40   Q8_0      [2048,         42.5 MiB  
+                                                       512]                     
+  blk.*.attn_k.weight                   10   Q8_0      [2048,         10.6 MiB  
+                                                       512]                     
+  blk.*.attn_v.weight                   10   Q8_0      [2048,         10.6 MiB  
+                                                       512]                     
+  blk.*.ssm_alpha.weight                30   Float32   [2048, 32]      7.5 MiB  
+  blk.*.ssm_beta.weight                 30   Float32   [2048, 32]      7.5 MiB  
+  blk.*.ssm_conv1d.weight               30   Float32   [4, 8192]       3.8 MiB  
+  blk.*.attn_norm.weight                40   Float32   [2048]        320.0 KiB  
+  blk.*.ffn_gate_inp_shexp.weight       40   Float32   [2048]        320.0 KiB  
+  blk.*.post_attention_norm.weight      40   Float32   [2048]        320.0 KiB  
+  blk.*.ssm_norm.weight                 30   Float32   [128]          15.0 KiB  
+  blk.*.attn_k_norm.weight              10   Float32   [256]          10.0 KiB  
+  blk.*.attn_q_norm.weight              10   Float32   [256]          10.0 KiB  
+  output_norm.weight                     1   Float32   [2048]          8.0 KiB  
+  blk.*.ssm_a                           30   Float32   [32]            3.8 KiB  
+  blk.*.ssm_dt.bias                     30   Float32   [32]            3.8 KiB  
+                                                                                

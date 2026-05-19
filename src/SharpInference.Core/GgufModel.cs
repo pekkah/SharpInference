@@ -126,6 +126,14 @@ public sealed unsafe class GgufModel : IDisposable
             {
                 if (t.Name == "blk.0.attn_q.bias")     metadata["_sharpi.has_attn_bias"] = true;
                 else if (t.Name == "blk.0.attn_q_norm.weight") metadata["_sharpi.has_qk_norm"] = true;
+                // Gated-DeltaNet recurrent blocks (qwen35moe and similar hybrids). The
+                // first few layers' indices depend on full_attention_interval, so probe
+                // a window of low layer indices for ssm_conv1d.weight.
+                else if (t.Name is "blk.0.ssm_conv1d.weight"
+                                 or "blk.1.ssm_conv1d.weight"
+                                 or "blk.2.ssm_conv1d.weight"
+                                 or "blk.3.ssm_conv1d.weight")
+                    metadata["_sharpi.is_hybrid_ssm"] = true;
             }
 
             if (!metadata.ContainsKey($"{arch}.vocab_size") &&
