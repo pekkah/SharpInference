@@ -532,17 +532,34 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer],
                     kvDim, _fp32WriteIdx, _tqFp32Window);
 
-                // Rotate the query (per-layer sign pattern) for fused dequant-dot.
-                _gpu.TqRotateQuery(_q, _rotatedQ!, _gpuSignPatterns![layer],
-                    _numHeads, _numKvHeads, _headDim);
-
                 int fp32SeqLen = Math.Min(_fp32Count + 1, _tqFp32Window);
-                _gpu.TqAttention(_q, _rotatedQ!,
-                    _gpuTqKCache![layer], _gpuTqVCache![layer],
-                    _gpuKCache[layer], _gpuVCache[layer], _attnOut, _gpuCodebook!,
-                    _attnScoresScratch,
-                    _numHeads, _numKvHeads, _headDim,
-                    _tqCompressedLen, fp32SeqLen, _maxSeqLen, _tqBlockBytes);
+
+                // Pre-eviction fast path: before the ring wraps, every cached row sits at
+                // its natural position-index and there's no TQ-compressed history yet, so
+                // the plain Attention kernel can read the FP32 cache directly. Skipping
+                // TqRotateQuery + the larger TqAttention kernel (its codebook init,
+                // K-block staging shared mem, and extra args) is worth several percent at
+                // short context. Once any row has been evicted (_tqCompressedLen > 0),
+                // fall through to the full hybrid TqAttention path.
+                if (_tqCompressedLen == 0)
+                {
+                    _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                        _attnScoresScratch,
+                        _numHeads, _numKvHeads, _headDim, fp32SeqLen, _tqFp32Window);
+                }
+                else
+                {
+                    // Rotate the query (per-layer sign pattern) for fused dequant-dot.
+                    _gpu.TqRotateQuery(_q, _rotatedQ!, _gpuSignPatterns![layer],
+                        _numHeads, _numKvHeads, _headDim);
+
+                    _gpu.TqAttention(_q, _rotatedQ!,
+                        _gpuTqKCache![layer], _gpuTqVCache![layer],
+                        _gpuKCache[layer], _gpuVCache[layer], _attnOut, _gpuCodebook!,
+                        _attnScoresScratch,
+                        _numHeads, _numKvHeads, _headDim,
+                        _tqCompressedLen, fp32SeqLen, _maxSeqLen, _tqBlockBytes);
+                }
             }
             else
             {

@@ -30,7 +30,7 @@ matching chat template).
 | Qwen3 8B | (same) | 5 GB | Vulkan `-g -1 --tq` | 21.6 | 45.7 | 3-bit KV → 40 960 ctx |
 | Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1` | **63.5** | **57.2** | ~2.8× Vulkan prefill |
 | Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --no-thinking` | **63.4** | **57.1** | Same per-token rate; reasoning suppressed in chat template, so all decoded tokens are visible answer |
-| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq` | **64.8** | **57.3** | 3-bit KV → 40 960 ctx; 17 t/s @ 8K, 10 t/s @ 16K |
+| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq` | **65.7** | **57.7** | 3-bit KV → 40 960 ctx; 17 t/s @ 8K, 10 t/s @ 16K |
 | Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq --no-thinking` | **64.9** | **56.8** | Same per-token rate as `--tq` alone; reasoning suppressed |
 | Qwen3-Coder 30B-A3B (MoE) | [Qwen](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF) | 17 GB | CPU | 13.6 | 20.6 | 128 experts / 8 active |
 | Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | CPU `--tq` | 12.3 | 20.7 | 3-bit KV |
