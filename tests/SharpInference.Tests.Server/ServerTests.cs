@@ -688,6 +688,99 @@ public sealed class ServerTests : IClassFixture<WebApplicationFactory<Program>>
         var response = await _client.PostAsJsonAsync("/v1/messages", req);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
+
+    // ── Thinking-token budget plumbing (SamplingParams.MaxThinkingTokens) ────
+
+    [Fact]
+    public async Task AnthropicMessages_ThinkingBudgetTokens_ReachesSamplingParams()
+    {
+        var fake = new FakeInferenceEngine("test-model");
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(fake)));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            max_tokens = 10,
+            stream = false,
+            thinking = new { type = "enabled", budget_tokens = 2 },
+        };
+        var response = await client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        Assert.NotNull(fake.LastSamplingParams);
+        Assert.Equal(2, fake.LastSamplingParams!.MaxThinkingTokens);
+    }
+
+    [Fact]
+    public async Task AnthropicMessages_NoThinkingBudget_DefaultsToZero()
+    {
+        // Absence of thinking.budget_tokens must leave MaxThinkingTokens at its 0 (unlimited) default.
+        var fake = new FakeInferenceEngine("test-model");
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(fake)));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            max_tokens = 10,
+            stream = false,
+        };
+        var response = await client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        Assert.NotNull(fake.LastSamplingParams);
+        Assert.Equal(0, fake.LastSamplingParams!.MaxThinkingTokens);
+    }
+
+    [Fact]
+    public async Task ChatCompletion_MaxThinkingTokens_ReachesSamplingParams()
+    {
+        var fake = new FakeInferenceEngine("test-model");
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(fake)));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            max_tokens = 10,
+            stream = false,
+            max_thinking_tokens = 2,
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        Assert.NotNull(fake.LastSamplingParams);
+        Assert.Equal(2, fake.LastSamplingParams!.MaxThinkingTokens);
+    }
+
+    [Fact]
+    public async Task ChatCompletion_NoMaxThinkingTokens_DefaultsToZero()
+    {
+        var fake = new FakeInferenceEngine("test-model");
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(fake)));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            max_tokens = 10,
+            stream = false,
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        Assert.NotNull(fake.LastSamplingParams);
+        Assert.Equal(0, fake.LastSamplingParams!.MaxThinkingTokens);
+    }
 }
 
 public sealed class ChatTemplateScrubTests
@@ -767,6 +860,14 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
     public int QueueDepth => 0;
     public int ActiveRequests => 0;
 
+    /// <summary>
+    /// Captures the <see cref="SamplingParams"/> handed to the most recent
+    /// <see cref="GenerateChunksAsync"/> call. Lets wire-level tests confirm that request
+    /// fields (e.g. <c>thinking.budget_tokens</c>, <c>max_thinking_tokens</c>) reach the
+    /// engine without needing the full engine plumbing.
+    /// </summary>
+    public SamplingParams? LastSamplingParams { get; private set; }
+
     public FakeInferenceEngine(string modelId)
         : this(modelId, [(GenerateChunkKind.Text, "Hello"), (GenerateChunkKind.Text, " world"), (GenerateChunkKind.Text, "!")])
     {
@@ -783,6 +884,7 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
         SamplingParams sp,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
+        LastSamplingParams = sp;
         foreach (var (kind, text) in _script)
         {
             ct.ThrowIfCancellationRequested();

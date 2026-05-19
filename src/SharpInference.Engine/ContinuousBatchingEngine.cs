@@ -64,6 +64,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         public Utf8StreamDecoder TextDec = new();
         public Utf8StreamDecoder ThinkDec = new();
         public bool InThinking;
+        public int ThinkingCount;  // tokens accumulated in the current <think> block (resets on each <think> open)
     }
 
     /// <param name="fwd">Forward pass implementation. Owned externally — caller disposes.</param>
@@ -194,9 +195,23 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             for (int i = n - 1; i >= 0; i--)
             {
                 var seq = active[i];
-                int next = seq.Sp.Temperature <= 0f
-                    ? Sampler.Greedy(logitsBatch[i])
-                    : Sampler.Sample(logitsBatch[i], seq.Sp, seq.Rng);
+
+                // Force-inject </think> on budget overrun. Mirrors InferenceEngine /
+                // RunCommand.DecodeLoop: the forced close token threads through the
+                // boundary branch below and is fed back as the next CurrentToken so the
+                // model continues from its post-think state on the next batched step.
+                int next;
+                if (thinkingEnabled && seq.InThinking && seq.Sp.MaxThinkingTokens > 0
+                    && seq.ThinkingCount >= seq.Sp.MaxThinkingTokens && _endThinkTokenId > 0)
+                {
+                    next = _endThinkTokenId;
+                }
+                else
+                {
+                    next = seq.Sp.Temperature <= 0f
+                        ? Sampler.Greedy(logitsBatch[i])
+                        : Sampler.Sample(logitsBatch[i], seq.Sp, seq.Rng);
+                }
 
                 bool done = seq.StopIds.Contains(next)
                     || seq.TokenCount >= seq.Sp.MaxNewTokens
@@ -211,6 +226,13 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                 }
                 else
                 {
+                    // Counter update mirrors RunCommand.DecodeLoop: reset on each <think>
+                    // open, otherwise increment whenever seq.InThinking was true on entry to
+                    // this step. That includes the </think> boundary token — so N reasoning
+                    // tokens trip the force-close on step N+1.
+                    if (thinkingEnabled && next == _thinkTokenId) seq.ThinkingCount = 0;
+                    else if (seq.InThinking) seq.ThinkingCount++;
+
                     // Reasoning boundary tokens: flip state, consume the token, do NOT emit content.
                     // Each direction requires the opposite state, so malformed double <think>
                     // or orphan </think> falls through to the content path below.

@@ -180,16 +180,37 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     var textDec = new Utf8StreamDecoder();
                     var thinkDec = new Utf8StreamDecoder();
                     bool inThinking = false;
+                    int thinkingCount = 0;
 
                     for (int i = 0; i < sp.MaxNewTokens; i++)
                     {
                         ct.ThrowIfCancellationRequested();
 
-                        int next = sp.Temperature <= 0f
-                            ? Sampler.Greedy(logits)
-                            : Sampler.Sample(logits, sp, rng);
+                        // Force-inject </think> when the model has burned through its reasoning
+                        // budget. Mirrors the CLI's --max-thinking-tokens path: the forced close
+                        // token still routes through the boundary branch below and is fed back
+                        // into forward(...) so the model continues from its post-think state.
+                        int next;
+                        if (inThinking && sp.MaxThinkingTokens > 0 && thinkingCount >= sp.MaxThinkingTokens
+                            && thinkingEnabled && endThinkId > 0)
+                        {
+                            next = endThinkId;
+                        }
+                        else
+                        {
+                            next = sp.Temperature <= 0f
+                                ? Sampler.Greedy(logits)
+                                : Sampler.Sample(logits, sp, rng);
+                        }
 
                         if (stopIds.Contains(next)) break;
+
+                        // Counter update mirrors RunCommand.DecodeLoop: reset on each <think>
+                        // open, otherwise increment whenever inThinking was true on entry to
+                        // this iteration. That includes the </think> boundary token itself —
+                        // so N content tokens of reasoning trips the force-close on iteration N+1.
+                        if (thinkingEnabled && next == thinkId) thinkingCount = 0;
+                        else if (inThinking) thinkingCount++;
 
                         // Reasoning boundary tokens: flip state, consume the token, do NOT emit.
                         // Both directions require the *opposite* state — a malformed second

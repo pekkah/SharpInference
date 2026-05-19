@@ -42,9 +42,9 @@ public static class AnthropicEndpoints
 
         var modelArch = Environment.GetEnvironmentVariable("SHARPI_ARCH") ?? "qwen2";
         // Anthropic-style thinking control: {"type":"disabled"} turns it off; absence or any
-        // other value (including {"type":"enabled"}) leaves it on. BudgetTokens is accepted on
-        // the wire but currently advisory — SamplingParams does not yet enforce a thinking-token
-        // ceiling. When that engine-side knob lands, plumb req.Thinking.BudgetTokens into it.
+        // other value (including {"type":"enabled"}) leaves it on. BudgetTokens, when present,
+        // maps to SamplingParams.MaxThinkingTokens — the engine force-closes the <think> block
+        // once that many reasoning tokens have streamed.
         bool enableThinking = req.Thinking?.Type != "disabled";
         var messages = BuildMessageList(req);
         var prompt = ChatTemplate.Format(messages, modelArch, enableThinking);
@@ -54,6 +54,7 @@ public static class AnthropicEndpoints
             Temperature = req.Temperature ?? 1.0f,
             TopP = req.TopP ?? 1.0f,
             MaxNewTokens = req.MaxTokens,
+            MaxThinkingTokens = req.Thinking?.BudgetTokens ?? 0,
         };
 
         var msgId = $"msg_{Guid.NewGuid():N}";

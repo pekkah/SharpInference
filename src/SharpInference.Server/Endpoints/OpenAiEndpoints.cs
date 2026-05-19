@@ -64,6 +64,7 @@ public static class OpenAiEndpoints
             TopP = req.TopP ?? 1.0f,
             MaxNewTokens = req.MaxTokens ?? 512,
             LogitBias = logitBias,
+            MaxThinkingTokens = req.MaxThinkingTokens ?? 0,
         };
 
         var requestId = $"chatcmpl-{Guid.NewGuid():N}";
@@ -193,7 +194,8 @@ public sealed record ChatCompletionRequest(
     bool? Stream,
     Dictionary<string, float>? LogitBias,
     ResponseFormat? ResponseFormat,
-    [property: JsonPropertyName("enable_thinking")] bool? EnableThinking = null);
+    [property: JsonPropertyName("enable_thinking")] bool? EnableThinking = null,
+    [property: JsonPropertyName("max_thinking_tokens")] int? MaxThinkingTokens = null);
 
 public sealed record OaiMessage(string? Role, string? Content);
 

@@ -254,4 +254,12 @@ public sealed record SamplingParams
     /// Typically a sliding window of the last N generated tokens.
     /// </summary>
     public IReadOnlyList<int>? PreviousTokens { get; init; }
+
+    /// <summary>
+    /// Maximum thinking-mode tokens before the engine forces a <c>&lt;/think&gt;</c> close.
+    /// 0 = unlimited (default). No-op on models without registered think tokens, and
+    /// also when the chat template was rendered with reasoning disabled (the engine
+    /// never enters thinking mode in that case).
+    /// </summary>
+    public int MaxThinkingTokens { get; init; } = 0;
 }
