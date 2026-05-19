@@ -118,6 +118,7 @@ public partial class Program { }
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.AContentBlockStartEvent))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.AContentBlockDeltaEvent))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.AMessageDeltaEvent))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.AContentBlockStopEvent))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.ATypeOnly))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.AErrorResponse))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.HealthStatus))]
