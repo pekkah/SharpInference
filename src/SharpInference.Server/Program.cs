@@ -101,6 +101,7 @@ public partial class Program { }
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.CompletionChoice[]))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.OaiAssistantMessage))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.ChatUsage))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.CompletionTokensDetails))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.ChatCompletionChunk))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.ChunkChoice[]))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(SharpInference.Server.Endpoints.ChunkDelta))]

@@ -376,6 +376,136 @@ public sealed class ServerTests : IClassFixture<WebApplicationFactory<Program>>
         Assert.Contains("event: message_stop", body);
     }
 
+    // ── OpenAI reasoning_content routing ──────────────────────────────────────
+
+    [Fact]
+    public async Task ChatCompletion_NonStreaming_TextOnly_OmitsReasoningContent()
+    {
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(new FakeInferenceEngine(
+                "test-model",
+                [(GenerateChunkKind.Text, "just the answer")]))));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            max_tokens = 10,
+            stream = false,
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
+        Assert.Equal("just the answer", message.GetProperty("content").GetString());
+        Assert.False(message.TryGetProperty("reasoning_content", out _));
+        Assert.False(doc.RootElement.GetProperty("usage").TryGetProperty("completion_tokens_details", out _));
+    }
+
+    [Fact]
+    public async Task ChatCompletion_NonStreaming_WithReasoning_EmitsReasoningContentAndUsageDetails()
+    {
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(new FakeInferenceEngine(
+                "test-model",
+                [
+                    (GenerateChunkKind.Thinking, "Let me "),
+                    (GenerateChunkKind.Thinking, "think."),
+                    (GenerateChunkKind.Text, "The answer is 42."),
+                ]))));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "What is 6*7?" } },
+            max_tokens = 20,
+            stream = false,
+            enable_thinking = true,
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
+        Assert.Equal("The answer is 42.", message.GetProperty("content").GetString());
+        Assert.Equal("Let me think.", message.GetProperty("reasoning_content").GetString());
+
+        var details = doc.RootElement.GetProperty("usage").GetProperty("completion_tokens_details");
+        Assert.Equal(2, details.GetProperty("reasoning_tokens").GetInt32());
+        Assert.Equal(3, doc.RootElement.GetProperty("usage").GetProperty("completion_tokens").GetInt32());
+    }
+
+    [Fact]
+    public async Task ChatCompletion_Streaming_TextOnly_NoReasoningContentDeltas()
+    {
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(new FakeInferenceEngine(
+                "test-model",
+                [(GenerateChunkKind.Text, "Hi"), (GenerateChunkKind.Text, "!")]))));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            max_tokens = 10,
+            stream = true,
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.DoesNotContain("reasoning_content", body);
+        Assert.DoesNotContain("completion_tokens_details", body);
+        Assert.Contains("\"content\":\"Hi\"", body);
+        Assert.Contains("\"content\":\"!\"", body);
+        Assert.Contains("\"finish_reason\":\"stop\"", body);
+        Assert.Contains("[DONE]", body);
+    }
+
+    [Fact]
+    public async Task ChatCompletion_Streaming_WithReasoning_SplitsReasoningThenContentDeltas()
+    {
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(new FakeInferenceEngine(
+                "test-model",
+                [
+                    (GenerateChunkKind.Thinking, "step1"),
+                    (GenerateChunkKind.Thinking, "step2"),
+                    (GenerateChunkKind.Text, "final"),
+                ]))));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Reason." } },
+            max_tokens = 30,
+            stream = true,
+            enable_thinking = true,
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+
+        int firstReasoning = body.IndexOf("\"reasoning_content\":\"step1\"", StringComparison.Ordinal);
+        int secondReasoning = body.IndexOf("\"reasoning_content\":\"step2\"", StringComparison.Ordinal);
+        int textDelta = body.IndexOf("\"content\":\"final\"", StringComparison.Ordinal);
+        Assert.True(firstReasoning > 0, "first reasoning_content delta missing\n" + body);
+        Assert.True(secondReasoning > firstReasoning, "second reasoning_content delta out of order");
+        Assert.True(textDelta > secondReasoning, "content delta must follow all reasoning_content deltas");
+
+        // A single delta must never carry both fields.
+        Assert.DoesNotContain("\"content\":\"step", body);
+        Assert.DoesNotContain("\"reasoning_content\":\"final", body);
+
+        Assert.Contains("\"finish_reason\":\"stop\"", body);
+        Assert.Contains("[DONE]", body);
+    }
+
     // ── logit_bias ────────────────────────────────────────────────────────────
 
     [Fact]

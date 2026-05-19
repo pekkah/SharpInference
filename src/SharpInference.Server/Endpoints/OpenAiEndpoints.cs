@@ -82,12 +82,15 @@ public static class OpenAiEndpoints
             await WriteEvent(ctx.Response, JsonSerializer.Serialize(firstChunk, AppJsonContext.Default.ChatCompletionChunk));
 
             long tokenCount = 0;
-            await foreach (var token in engine.GenerateAsync(prompt, sp, ctx.RequestAborted))
+            await foreach (var c in engine.GenerateChunksAsync(prompt, sp, ctx.RequestAborted))
             {
                 tokenCount++;
+                ChunkDelta delta = c.Kind == GenerateChunkKind.Thinking
+                    ? new ChunkDelta(null, null, c.Text)
+                    : new ChunkDelta(null, c.Text);
                 var chunk = new ChatCompletionChunk(
                     requestId, "chat.completion.chunk", created, engine.ModelId,
-                    [new ChunkChoice(0, new ChunkDelta(null, token), null)]);
+                    [new ChunkChoice(0, delta, null)]);
                 await WriteEvent(ctx.Response, JsonSerializer.Serialize(chunk, AppJsonContext.Default.ChatCompletionChunk));
             }
 
@@ -103,18 +106,40 @@ public static class OpenAiEndpoints
         }
         else
         {
-            var sb = new StringBuilder();
-            await foreach (var token in engine.GenerateAsync(prompt, sp, ctx.RequestAborted))
-                sb.Append(token);
+            var textSb = new StringBuilder();
+            var reasoningSb = new StringBuilder();
+            int textTokens = 0;
+            int reasoningTokens = 0;
 
-            HealthEndpoints.RecordTokens(sb.Length);
+            await foreach (var c in engine.GenerateChunksAsync(prompt, sp, ctx.RequestAborted))
+            {
+                if (c.Kind == GenerateChunkKind.Thinking)
+                {
+                    reasoningSb.Append(c.Text);
+                    reasoningTokens++;
+                }
+                else
+                {
+                    textSb.Append(c.Text);
+                    textTokens++;
+                }
+            }
+
+            int completionTokens = textTokens + reasoningTokens;
+            HealthEndpoints.RecordTokens(completionTokens);
+
+            var message = new OaiAssistantMessage(
+                "assistant",
+                textSb.ToString(),
+                reasoningSb.Length > 0 ? reasoningSb.ToString() : null);
+            var usage = new ChatUsage(
+                0, completionTokens, completionTokens,
+                reasoningTokens > 0 ? new CompletionTokensDetails(reasoningTokens) : null);
 
             var response = new ChatCompletionResponse(
                 requestId, "chat.completion", created, engine.ModelId,
-                [new CompletionChoice(0,
-                    new OaiAssistantMessage("assistant", sb.ToString()),
-                    "stop")],
-                new ChatUsage(0, sb.Length, sb.Length)); // token counts approximate
+                [new CompletionChoice(0, message, "stop")],
+                usage);
 
             ctx.Response.ContentType = "application/json";
             await ctx.Response.WriteAsync(
@@ -181,8 +206,17 @@ public sealed record ChatCompletionResponse(
     ChatUsage Usage);
 
 public sealed record CompletionChoice(int Index, OaiAssistantMessage Message, string? FinishReason);
-public sealed record OaiAssistantMessage(string Role, string Content);
-public sealed record ChatUsage(int PromptTokens, int CompletionTokens, int TotalTokens);
+public sealed record OaiAssistantMessage(
+    string Role,
+    string Content,
+    [property: JsonPropertyName("reasoning_content")] string? ReasoningContent = null);
+public sealed record ChatUsage(
+    int PromptTokens,
+    int CompletionTokens,
+    int TotalTokens,
+    [property: JsonPropertyName("completion_tokens_details")] CompletionTokensDetails? CompletionTokensDetails = null);
+public sealed record CompletionTokensDetails(
+    [property: JsonPropertyName("reasoning_tokens")] int ReasoningTokens);
 
 public sealed record ChatCompletionChunk(
     string Id,
@@ -192,7 +226,10 @@ public sealed record ChatCompletionChunk(
     ChunkChoice[] Choices);
 
 public sealed record ChunkChoice(int Index, ChunkDelta Delta, string? FinishReason);
-public sealed record ChunkDelta(string? Role, string? Content);
+public sealed record ChunkDelta(
+    string? Role,
+    string? Content,
+    [property: JsonPropertyName("reasoning_content")] string? ReasoningContent = null);
 
 public sealed record ModelsResponse(string Object, ModelInfo[] Data);
 public sealed record ModelInfo(string Id, string Object, long Created, string OwnedBy);
