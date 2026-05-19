@@ -39,6 +39,24 @@ VRAM via TierPlanner; falls through to Vulkan only when CUDA isn't present.
 `headDim ∈ {128, 256}`). MoE runs on GPU (full-offload or partial hybrid) on
 both Vulkan and CUDA backends.
 
+### Reasoning models
+
+Models that emit `<think>...</think>` (Qwen3, DeepSeek-R1, SmolLM3, …) are
+detected automatically from their special tokens — no flag needed. The CLI
+dims the reasoning stream as it generates. Use `--no-thinking` to disable
+reasoning at the chat-template level, `--hide-thinking` to keep it on but
+hide the stream, and `--max-thinking-tokens N` to force-close runaway
+reasoning. Greedy decoding (`--temp 0`) on these models often loops, so
+the CLI warns and recommends `--temp 0.6 --top-p 0.95 --top-k 20`.
+
+The API server surfaces reasoning per each protocol's convention: Anthropic
+`/v1/messages` emits a `thinking` content block before `text`; OpenAI
+`/v1/chat/completions` exposes `reasoning_content` alongside `content`
+(vLLM / DeepSeek style). Anthropic's `thinking.budget_tokens` and an OpenAI
+extension `max_thinking_tokens` both map to the same engine-side budget.
+Prior assistant turns in chat history have their `<think>` blocks stripped
+before templating (Qwen3 and friends are trained without them).
+
 ### CLI examples
 
 ```bash
@@ -62,6 +80,11 @@ dotnet run --project src/SharpInference.Cli -c Release -- \
 dotnet run --project src/SharpInference.Cli -c Release -- \
   -m models/Qwen3-8B-Q4_K_M.gguf --draft-model models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
   -p "Write a binary search in Rust" --temp 0
+
+# Reasoning model: stream shows dimmed <think>...</think>, then the answer
+dotnet run --project src/SharpInference.Cli -c Release -- \
+  -m models/Qwen3-8B-Q4_K_M.gguf -g -1 --temp 0.6 --top-p 0.95 --top-k 20 \
+  -p "What's 17 × 23?" --max-thinking-tokens 1024
 
 # API server (OpenAI /v1/chat/completions + Anthropic /v1/messages, port 5000)
 SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
@@ -119,7 +142,7 @@ dotnet run --project src/SharpInference.Cli -c Release -- image \
 - Architecture & algorithms: [docs/SharpInference-Design.md](docs/SharpInference-Design.md)
 - All CLI flags: `sharpi-cli --help`, `sharpi-cli image --help`
 - Model downloads: `scripts/download-model.ps1 -Model <smollm2|qwen3-8b|qwen3-coder-30b-a3b|llama4-scout|z-image-turbo|realesrgan-x4|…>`
-- Tests: `dotnet test` (207 tests across 5 projects)
+- Tests: `dotnet test` (282 tests across 5 projects)
 - NativeAOT publish: `dotnet publish src/SharpInference.Cli -c Release -r win-x64`
 
 ## License
