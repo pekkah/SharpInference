@@ -142,7 +142,7 @@ dotnet run --project src/SharpInference.Cli -c Release -- image \
 - Architecture & algorithms: [docs/SharpInference-Design.md](docs/SharpInference-Design.md)
 - All CLI flags: `sharpi-cli --help`, `sharpi-cli image --help`
 - Model downloads: `scripts/download-model.ps1 -Model <smollm2|qwen3-8b|qwen3-coder-30b-a3b|llama4-scout|z-image-turbo|realesrgan-x4|…>`
-- Tests: `dotnet test` (282 tests across 5 projects)
+- Tests: `dotnet test`
 - NativeAOT publish: `dotnet publish src/SharpInference.Cli -c Release -r win-x64`
 
 ## License
