@@ -147,15 +147,27 @@ public sealed class GdnKernelsTests
     // ────────────────────────────────────────────────────────────────────
 
     [Fact]
-    public void RepeatInterleaveHeads_Factor2()
+    public void TileHeads_Factor2_PairsByModularIndex()
     {
-        // 2 source heads of dim 3, repeat 2× → 4 dst heads.
+        // 2 source heads of dim 3, repeat 2× → 4 dst heads, tile pattern.
+        // Pairing: dst[0] = src[0 % 2] = src[0]; dst[1] = src[1 % 2] = src[1];
+        //          dst[2] = src[2 % 2] = src[0]; dst[3] = src[3 % 2] = src[1].
+        // (This is NOT torch's repeat_interleave — that would yield 1,2,3, 1,2,3, 4,5,6, 4,5,6.)
         float[] src = [1f, 2f, 3f,   4f, 5f, 6f];
         float[] dst = new float[4 * 3];
 
-        GdnKernels.RepeatInterleaveHeads(src, dst, srcHeads: 2, repeat: 2, headDim: 3);
+        GdnKernels.TileHeads(src, dst, srcHeads: 2, repeat: 2, headDim: 3);
 
-        Assert.Equal(new float[] { 1, 2, 3,  1, 2, 3,  4, 5, 6,  4, 5, 6 }, dst);
+        Assert.Equal(new float[] { 1, 2, 3,  4, 5, 6,  1, 2, 3,  4, 5, 6 }, dst);
+    }
+
+    [Fact]
+    public void TileHeads_Factor1_IsAStraightCopy()
+    {
+        float[] src = [1f, 2f, 3f,  4f, 5f, 6f,  7f, 8f, 9f];
+        float[] dst = new float[3 * 3];
+        GdnKernels.TileHeads(src, dst, srcHeads: 3, repeat: 1, headDim: 3);
+        Assert.Equal(src, dst);
     }
 
     // ────────────────────────────────────────────────────────────────────

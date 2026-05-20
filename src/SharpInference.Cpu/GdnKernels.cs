@@ -276,16 +276,24 @@ public static class GdnKernels
     // ────────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Repeat each head in <paramref name="src"/> <paramref name="repeat"/> times.
-    /// Used to broadcast K from <c>Hk</c> heads to <c>Hv</c> heads when
-    /// <c>Hv % Hk == 0</c> (qwen35moe: Hk=16 → Hv=32, repeat=2).
+    /// Broadcast each src head to <paramref name="repeat"/> dst heads using <b>tile</b>
+    /// semantics — i.e. dst head <c>h</c> takes its data from <c>src[h % srcHeads]</c>.
+    /// For qwen35moe (Hk=16 → Hv=32, repeat=2) this produces the pairing
+    /// <c>(0,16), (1,17), ..., (15,31)</c>, matching llama.cpp's
+    /// <c>ggml_compute_forward_gated_delta_net_one_chunk</c> (<c>iq1 = iv1 % neq1</c>)
+    /// and <c>ggml_compute_forward_repeat_f32</c> (outer rep loop × inner src loop).
     /// </summary>
+    /// <remarks>
+    /// Note this is <i>NOT</i> torch's <c>repeat_interleave</c> pattern
+    /// (<c>(0,1), (2,3), ...</c>) — that pairing would mix heads incorrectly for
+    /// GDN's GQA-style K→V broadcast.
+    /// </remarks>
     /// <param name="src">Input of shape <c>[srcHeads, headDim]</c> row-major.</param>
     /// <param name="dst">Output of shape <c>[srcHeads · repeat, headDim]</c> row-major.</param>
     /// <param name="srcHeads">Source head count.</param>
     /// <param name="repeat">Repetition factor (e.g. 2 for qwen35moe).</param>
     /// <param name="headDim">Per-head feature count.</param>
-    public static void RepeatInterleaveHeads(
+    public static void TileHeads(
         ReadOnlySpan<float> src,
         Span<float> dst,
         int srcHeads,
@@ -296,11 +304,14 @@ public static class GdnKernels
         if (src.Length != srcHeads * headDim) throw new ArgumentException("src length mismatch");
         if (dst.Length != srcHeads * repeat * headDim) throw new ArgumentException("dst length mismatch");
 
-        for (int h = 0; h < srcHeads; h++)
+        // Tile pattern: dst[h * headDim] copies from src[(h % srcHeads) * headDim]
+        // ⇒ outer loop over repetitions, inner loop over src heads.
+        for (int r = 0; r < repeat; r++)
         {
-            var srcHead = src.Slice(h * headDim, headDim);
-            for (int r = 0; r < repeat; r++)
-                srcHead.CopyTo(dst.Slice(((h * repeat) + r) * headDim, headDim));
+            int dstHeadOffset = r * srcHeads;
+            for (int h = 0; h < srcHeads; h++)
+                src.Slice(h * headDim, headDim)
+                    .CopyTo(dst.Slice((dstHeadOffset + h) * headDim, headDim));
         }
     }
 
@@ -469,6 +480,13 @@ public static class GdnKernels
         Span<float> p = stackalloc float[d];
         Span<float> dvec = stackalloc float[d];
 
+        // Readout scale: 1 / sqrt(headDim). Matches llama.cpp
+        // ggml_compute_forward_gated_delta_net_one_chunk (ops.cpp:10547,
+        // attn_data[j] = sum * scale at :10613). RMSNorm is scale-invariant
+        // EXCEPT at its eps floor, so omitting this caused per-head magnitude
+        // drift on small inner products → gibberish decode at qwen35moe scale.
+        float readoutScale = 1.0f / MathF.Sqrt((float)d);
+
         for (int h = 0; h < hv; h++)
         {
             // Per-head scalar gates.
@@ -512,7 +530,7 @@ public static class GdnKernels
                     S[rowBase + j] += ki * dvec[j];
             }
 
-            // (5) Readout: o[j] = Σ_i S[i,j] · q[i].  (S^T @ q)
+            // (5) Readout: o[j] = (Σ_i S[i,j] · q[i]) / sqrt(d).  (S^T @ q, scaled)
             oh.Clear();
             for (int i = 0; i < d; i++)
             {
@@ -521,6 +539,8 @@ public static class GdnKernels
                 for (int j = 0; j < d; j++)
                     oh[j] += qi * S[rowBase + j];
             }
+            for (int j = 0; j < d; j++)
+                oh[j] *= readoutScale;
 
             // (6) Per-head RMSNorm with shared headDim-wide gain.
             double sumSq = 0.0;

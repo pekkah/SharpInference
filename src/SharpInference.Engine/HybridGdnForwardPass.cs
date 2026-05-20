@@ -397,11 +397,13 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             }
             else if (isAttn)
             {
+                if (_traceLayers) EmitBufTrace(position, layer, "attn-pre-norm", _normBuf, _embDim);
                 AttnBlock(layer, position);
             }
             else
             {
-                GdnBlock(layer);
+                if (_traceLayers) EmitBufTrace(position, layer, "gdn-pre-norm", _normBuf, _embDim);
+                GdnBlock(layer, position);
             }
 
             // Residual add
@@ -455,19 +457,33 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
 
     private void EmitLayerTrace(int position, int layer, string blockType)
     {
+        EmitBufTrace(position, layer, blockType, _hidden, _embDim);
+    }
+
+    /// <summary>
+    /// Emits a single trace line: <c>[pos=P Llayer tag] l2=X first8=[...]</c>.
+    /// Used for both the residual stream and arbitrary intra-block scratch buffers
+    /// (q_conv_predelta, gdn_out, etc.) to allow per-tensor parity with llama.cpp's
+    /// eval-callback dump.
+    /// </summary>
+    private static void EmitBufTrace(int position, int layer, string tag, float* buf, int n)
+    {
         var inv = System.Globalization.CultureInfo.InvariantCulture;
-        float l2 = L2NormF(_hidden, _embDim);
-        var sb = new System.Text.StringBuilder(160);
+        float l2 = L2NormF(buf, n);
+        double sum = 0;
+        for (int i = 0; i < n; i++) sum += buf[i];
+        var sb = new System.Text.StringBuilder(220);
         sb.Append("[pos=").Append(position).Append(" L");
         if (layer < 0) sb.Append("--"); else sb.Append(layer);
-        sb.Append(' ').Append(blockType).Append("] l2=")
+        sb.Append(' ').Append(tag).Append("] l2=")
           .Append(l2.ToString("G6", inv))
+          .Append(" sum=").Append(((float)sum).ToString("G6", inv))
           .Append("  first8=[");
-        int n = Math.Min(8, _embDim);
-        for (int i = 0; i < n; i++)
+        int k = Math.Min(8, n);
+        for (int i = 0; i < k; i++)
         {
             if (i > 0) sb.Append(", ");
-            sb.Append(_hidden[i].ToString("G6", inv));
+            sb.Append(buf[i].ToString("G6", inv));
         }
         sb.Append(']');
         Console.Error.WriteLine(sb.ToString());
@@ -612,7 +628,7 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     //  GdnBlock — Gated DeltaNet recurrent step
     // ============================================================
 
-    private void GdnBlock(int layer)
+    private void GdnBlock(int layer, int position)
     {
         int gdnIdx = _gdnStateCache.GdnLayerOf(layer);
         float* scanState = _gdnStateCache.ScanStateAt(gdnIdx);
@@ -623,6 +639,19 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         // 1. Joint QKV projection and z (gate) projection.
         FusedMatVec(_qkv, _wQkv[layer], _normBuf, _gdnConvChannels, _embDim);
         FusedMatVec(_z, _wZGate[layer], _normBuf, _gdnValueDim, _embDim);
+        if (_traceLayers) {
+            EmitBufTrace(position, layer, "gdn-qkv-mixed",  _qkv, _gdnConvChannels);
+            EmitBufTrace(position, layer, "gdn-z",          _z,   _gdnValueDim);
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            var sb = new System.Text.StringBuilder(384);
+            sb.Append("[pos=").Append(position).Append(" L").Append(layer).Append(" gdn-z-perhead] l2=[");
+            for (int h = 0; h < _gdnNumVHeads; h++) {
+                if (h > 0) sb.Append(", ");
+                sb.Append(L2NormF(_z + h * _gdnHeadDim, _gdnHeadDim).ToString("G6", inv));
+            }
+            sb.Append(']');
+            Console.Error.WriteLine(sb.ToString());
+        }
 
         // 2. Depthwise causal conv1d over the joint QKV stream.
         //    Weight is preloaded in [kernel, channels] order (transposed from GGUF's [c, k]).
@@ -632,11 +661,13 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             new ReadOnlySpan<float>(_ssmConv1d[layer], _gdnConvKernel * _gdnConvChannels),
             new Span<float>(_qkvConv, _gdnConvChannels),
             _gdnConvChannels, _gdnConvKernel);
+        if (_traceLayers) EmitBufTrace(position, layer, "gdn-conv-raw",  _qkvConv, _gdnConvChannels);
 
         // 3. Element-wise SiLU on the conv output (q/k/v share the same activation).
         GdnKernels.SiLu(
             new Span<float>(_qkvConv, _gdnConvChannels),
             new ReadOnlySpan<float>(_qkvConv, _gdnConvChannels));
+        if (_traceLayers) EmitBufTrace(position, layer, "gdn-conv-silu", _qkvConv, _gdnConvChannels);
 
         // 4. Split Q‖K‖V at offsets 0, KeyDim, 2*KeyDim. Q and K are at K-head shape
         //    (16 heads × 128); V is at V-head shape (32 heads × 128).
@@ -647,16 +678,27 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         // 5. Per-K-head L2 norm.
         GdnKernels.L2NormPerHead(qPre, _gdnNumKHeads, _gdnHeadDim, eps: 1e-6f);
         GdnKernels.L2NormPerHead(kPre, _gdnNumKHeads, _gdnHeadDim, eps: 1e-6f);
+        if (_traceLayers) {
+            EmitBufTrace(position, layer, "gdn-q-predelta", _qkvConv, _gdnKeyDim);
+            EmitBufTrace(position, layer, "gdn-k-predelta", _qkvConv + _gdnKeyDim, _gdnKeyDim);
+            EmitBufTrace(position, layer, "gdn-v-predelta", _qkvConv + 2 * _gdnKeyDim, _gdnValueDim);
+        }
 
-        // 6. Broadcast K→V head count via repeat-interleave (Hk=16 → Hv=32 here).
-        GdnKernels.RepeatInterleaveHeads(qPre, new Span<float>(_qVHeads, _gdnNumVHeads * _gdnHeadDim),
+        // 6. Broadcast K→V head count via tile pattern (Hk=16 → Hv=32 here,
+        //    pairing (0,16), (1,17), ...). NOT torch's repeat_interleave — see
+        //    GdnKernels.TileHeads doc + ops.cpp:10553 (iq1 = iv1 % neq1).
+        GdnKernels.TileHeads(qPre, new Span<float>(_qVHeads, _gdnNumVHeads * _gdnHeadDim),
             _gdnNumKHeads, _gdnKvRepeat, _gdnHeadDim);
-        GdnKernels.RepeatInterleaveHeads(kPre, new Span<float>(_kVHeads, _gdnNumVHeads * _gdnHeadDim),
+        GdnKernels.TileHeads(kPre, new Span<float>(_kVHeads, _gdnNumVHeads * _gdnHeadDim),
             _gdnNumKHeads, _gdnKvRepeat, _gdnHeadDim);
 
         // 7. Alpha / Beta per-v-head pre-activations (F32 weights of shape [embDim, NumVHeads]).
         FusedMatVec(_alpha, _ssmAlpha[layer], _normBuf, _gdnNumVHeads, _embDim);
         FusedMatVec(_beta,  _ssmBeta[layer],  _normBuf, _gdnNumVHeads, _embDim);
+        if (_traceLayers) {
+            EmitBufTrace(position, layer, "gdn-alpha",      _alpha, _gdnNumVHeads);
+            EmitBufTrace(position, layer, "gdn-beta",       _beta,  _gdnNumVHeads);
+        }
 
         // 8. Recurrence: rank-1 state update + per-head RMSNorm + SiLU(z) gate, all fused.
         GdnKernels.GdnRecurrenceDecode(
@@ -674,9 +716,24 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             numVHeads:  _gdnNumVHeads,
             headDim:    _gdnHeadDim,
             normEps:    1e-6f);
+        if (_traceLayers) {
+            EmitBufTrace(position, layer, "gdn-out",       _gdnOut, _gdnValueDim);
+            // Per-head L2 of gdn-out (32 heads x 128 dims). Helps spot a single
+            // misbehaving head when the global L2 is off but head 0 looks fine.
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            var sb = new System.Text.StringBuilder(384);
+            sb.Append("[pos=").Append(position).Append(" L").Append(layer).Append(" gdn-out-perhead] l2=[");
+            for (int h = 0; h < _gdnNumVHeads; h++) {
+                if (h > 0) sb.Append(", ");
+                sb.Append(L2NormF(_gdnOut + h * _gdnHeadDim, _gdnHeadDim).ToString("G6", inv));
+            }
+            sb.Append(']');
+            Console.Error.WriteLine(sb.ToString());
+        }
 
         // 9. Output projection: ssm_out (input ValueDim=4096, output embDim=2048).
         FusedMatVec(_hidden, _ssmOut[layer], _gdnOut, _embDim, _gdnValueDim);
+        if (_traceLayers) EmitBufTrace(position, layer, "gdn-proj",     _hidden, _embDim);
     }
 
     // ============================================================
