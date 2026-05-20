@@ -68,6 +68,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _softmaxKernel;
     private nint   _ropeInterleavedKernel;
     private nint   _ropeNeoxKernel;
+    private nint   _ropeNeoxPartialKernel;
+    private nint   _mulKernel;
+    private nint   _sigmoidMulInPlaceKernel;
+    private nint   _splitQgKernel;
     private nint   _kvAppendKernel;
     private nint   _embedLookupF32Kernel;
     private nint   _embedLookupQ4KKernel;
@@ -798,8 +802,30 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         Launch1D(_addKernel, n, args);
     }
 
-    public void ElementwiseMul(Tensor output, Tensor a, Tensor b) =>
-        throw new NotSupportedException("CudaBackend.ElementwiseMul is not implemented (not used by the LLM forward path).");
+    /// <summary>Element-wise multiply: output[i] = a[i] * b[i]. Tensors must be 1-D with matching element counts.</summary>
+    public void ElementwiseMul(Tensor output, Tensor a, Tensor b)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        long n = output.ElementCount;
+        if (a.ElementCount != n || b.ElementCount != n)
+            throw new ArgumentException(
+                $"ElementwiseMul element-count mismatch: output={n} a={a.ElementCount} b={b.ElementCount}.");
+
+        nint oPtr = GetDevPtr(output);
+        nint aPtr = GetDevPtr(a);
+        nint bPtr = GetDevPtr(b);
+        int  pN = (int)n;
+        nint* args = stackalloc nint[4]
+        {
+            (nint)(&oPtr), (nint)(&aPtr), (nint)(&bPtr), (nint)(&pN)
+        };
+        uint grid = (uint)(((int)n + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_mulKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(mul) failed: {r}");
+    }
 
     public void RmsNorm(Tensor output, Tensor x, Tensor weight, float eps = 1e-5f)
     {
@@ -931,6 +957,102 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         nint kernel = neox ? _ropeNeoxKernel : _ropeInterleavedKernel;
         int r = NvrtcInterop.LaunchKernel(kernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(rope) failed: {r}");
+    }
+
+    /// <summary>
+    /// Partial NEOX RoPE: rotate the first <paramref name="ropeDim"/> dimensions of every
+    /// head; leave dims <c>[ropeDim, headDim)</c> untouched. Used by qwen35moe attention
+    /// (ropeDim=64, headDim=256). Mirrors the CPU reference
+    /// <see cref="Cpu.SimdKernels.ApplyRoPECachedNeoxPartial"/>.
+    /// </summary>
+    public void RoPEPartial(Tensor x, int position, int headDim, int ropeDim, float ropeTheta, bool neox)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (!neox)
+            throw new ArgumentException("RoPEPartial currently supports only neox=true.", nameof(neox));
+        if (ropeDim <= 0 || (ropeDim & 1) != 0)
+            throw new ArgumentException("ropeDim must be a positive even number.", nameof(ropeDim));
+        if (ropeDim > headDim)
+            throw new ArgumentException("ropeDim must be <= headDim.", nameof(ropeDim));
+
+        int numHeads = (int)(x.ElementCount / headDim);
+        int totalPairs = numHeads * (ropeDim / 2);
+
+        nint xPtr = GetDevPtr(x);
+        int  pNH = numHeads, pHD = headDim, pRD = ropeDim, pPos = position;
+        float pT = ropeTheta;
+        nint* args = stackalloc nint[6]
+        {
+            (nint)(&xPtr),
+            (nint)(&pNH), (nint)(&pHD), (nint)(&pRD), (nint)(&pPos), (nint)(&pT)
+        };
+        uint grid = (uint)((totalPairs + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_ropeNeoxPartialKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(rope_neox_partial) failed: {r}");
+    }
+
+    /// <summary>
+    /// Fused <c>x[i] *= sigmoid(gate[i])</c> in-place. Replaces a Sigmoid + ElementwiseMul
+    /// pair for the qwen35moe GLU attention gate.
+    /// </summary>
+    public void SigmoidMulInPlace(Tensor x, Tensor gate)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (x.ElementCount != gate.ElementCount)
+            throw new ArgumentException(
+                $"SigmoidMulInPlace element-count mismatch: x={x.ElementCount} gate={gate.ElementCount}.");
+
+        int n = (int)x.ElementCount;
+        nint xPtr = GetDevPtr(x);
+        nint gPtr = GetDevPtr(gate);
+        int  pN = n;
+        nint* args = stackalloc nint[3]
+        {
+            (nint)(&xPtr), (nint)(&gPtr), (nint)(&pN)
+        };
+        uint grid = (uint)((n + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_sigmoidMulInPlaceKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(sigmoid_mul_inplace) failed: {r}");
+    }
+
+    /// <summary>
+    /// Strided de-interleave of qwen35moe's GLU-gated Q output. Input
+    /// <paramref name="qg"/> is laid out per head as <c>[Q[headDim] ‖ G[headDim]]</c>
+    /// (output stride = <c>2*headDim</c>); this splits into contiguous
+    /// <c>q[numHeads*headDim]</c> and <c>g[numHeads*headDim]</c>.
+    /// </summary>
+    public void SplitQG(Tensor q, Tensor g, Tensor qg, int numHeads, int headDim)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        long expected = (long)numHeads * headDim * 2;
+        if (qg.ElementCount != expected)
+            throw new ArgumentException(
+                $"SplitQG: qg.ElementCount {qg.ElementCount} != numHeads*headDim*2 ({expected}).");
+        long perOut = (long)numHeads * headDim;
+        if (q.ElementCount != perOut || g.ElementCount != perOut)
+            throw new ArgumentException(
+                $"SplitQG: q/g element counts must each equal numHeads*headDim ({perOut}); got q={q.ElementCount}, g={g.ElementCount}.");
+
+        nint qgPtr = GetDevPtr(qg);
+        nint qPtr  = GetDevPtr(q);
+        nint gPtr  = GetDevPtr(g);
+        int  pNH = numHeads, pHD = headDim;
+        nint* args = stackalloc nint[5]
+        {
+            (nint)(&qgPtr), (nint)(&qPtr), (nint)(&gPtr),
+            (nint)(&pNH), (nint)(&pHD)
+        };
+        int total = numHeads * headDim;
+        uint grid = (uint)((total + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_splitQgKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(split_qg) failed: {r}");
     }
 
     /// <summary>Write fresh K and V vectors for one token into the layer KV cache at <paramref name="position"/>.</summary>
@@ -1393,7 +1515,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _im2colKernel, _biasAddKernel, _leakyReluKernel, _scaleKernel, _addKernel,
             _addScaledKernel, _clampKernel, _pshuffleKernel, _punshuffleKernel, _upsample2xKernel,
             _rmsNormKernel, _headNormKernel, _headNormPureKernel, _siluMulKernel, _sigmoidKernel,
-            _softmaxKernel, _ropeInterleavedKernel, _ropeNeoxKernel, _kvAppendKernel,
+            _softmaxKernel, _ropeInterleavedKernel, _ropeNeoxKernel, _ropeNeoxPartialKernel,
+            _mulKernel, _sigmoidMulInPlaceKernel, _splitQgKernel, _kvAppendKernel,
             _embedLookupF32Kernel, _embedLookupQ4KKernel,
             _matvecF32Kernel, _matvecQ4KKernel, _matvecQ6KKernel,
             _attentionKernel, _clearF32Kernel, _quantizeQ81Kernel,
@@ -1428,6 +1551,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _softmaxKernel         = GetKernelFunc("llm_softmax");
         _ropeInterleavedKernel = GetKernelFunc("llm_rope_interleaved");
         _ropeNeoxKernel        = GetKernelFunc("llm_rope_neox");
+        _ropeNeoxPartialKernel = GetKernelFunc("llm_rope_neox_partial");
+        _mulKernel             = GetKernelFunc("llm_mul");
+        _sigmoidMulInPlaceKernel = GetKernelFunc("llm_sigmoid_mul_inplace");
+        _splitQgKernel         = GetKernelFunc("llm_split_qg");
         _kvAppendKernel        = GetKernelFunc("llm_kv_append");
         _embedLookupF32Kernel  = GetKernelFunc("llm_embed_lookup_f32");
         _embedLookupQ4KKernel  = GetKernelFunc("llm_embed_lookup_q4k");

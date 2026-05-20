@@ -292,6 +292,85 @@ extern ""C"" __global__ void llm_rope_neox(
     x[b] = x0 * s + x1 * c;
 }
 
+// ── RoPE NEOX partial (rotate dims [0, rope_dim); pass dims [rope_dim, head_dim)) ──
+// qwen35moe rotates only the first 64 of each 256-dim head. The frequency
+// exponent uses `rope_dim` (not `head_dim`) — this matches the CPU reference
+// `SimdKernels.ApplyRoPECachedNeoxPartial`, which precomputes the table from
+// `rope_dim`. Pair layout: (i, i + rope_half_dim) for i ∈ [0, rope_half_dim).
+extern ""C"" __global__ void llm_rope_neox_partial(
+    float* __restrict__ x,
+    int num_heads, int head_dim, int rope_dim, int position, float theta)
+{
+    int pair_idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int rope_half_dim = rope_dim / 2;
+    int total_pairs = num_heads * rope_half_dim;
+    if (pair_idx >= total_pairs) return;
+
+    int h = pair_idx / rope_half_dim;
+    int i = pair_idx % rope_half_dim;
+
+    float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)rope_dim);
+    float angle = (float)position * freq;
+    float c = cosf(angle);
+    float s = sinf(angle);
+
+    int head_base = h * head_dim;
+    int a = head_base + i;
+    int b = head_base + i + rope_half_dim;
+    float x0 = x[a];
+    float x1 = x[b];
+    x[a] = x0 * c - x1 * s;
+    x[b] = x0 * s + x1 * c;
+    // Dims [rope_dim, head_dim) pass through untouched.
+}
+
+// ── Element-wise multiply (output = a * b) ─────────────────────────────────
+extern ""C"" __global__ void llm_mul(
+    float* __restrict__ output,
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    int n)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) return;
+    output[i] = a[i] * b[i];
+}
+
+// ── Fused sigmoid * mul in-place (x *= sigmoid(gate)) ──────────────────────
+// One launch replaces the previous Sigmoid(gate) + ElementwiseMul(x, x, gate)
+// pair for the qwen35moe GLU attention gate. Single elementwise pass.
+extern ""C"" __global__ void llm_sigmoid_mul_inplace(
+    float* __restrict__ x,
+    const float* __restrict__ gate,
+    int n)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) return;
+    float g = gate[i];
+    x[i] *= 1.0f / (1.0f + __expf(-g));
+}
+
+// ── Strided de-interleave of [Q‖G] → Q, G ─────────────────────────────────
+// qwen35moe's attn_q.weight emits per-head pairs `[Q[head_dim], G[head_dim]]`
+// concatenated (output stride = 2 * head_dim per head). This kernel splits
+// the interleaved buffer into two contiguous per-head outputs.
+extern ""C"" __global__ void llm_split_qg(
+    const float* __restrict__ qg,
+    float* __restrict__ q,
+    float* __restrict__ g,
+    int num_heads, int head_dim)
+{
+    int total = num_heads * head_dim;
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= total) return;
+
+    int h = idx / head_dim;
+    int j = idx % head_dim;
+    int src_base = h * head_dim * 2;
+    q[h * head_dim + j] = qg[src_base + j];
+    g[h * head_dim + j] = qg[src_base + head_dim + j];
+}
+
 // ── KV cache append ────────────────────────────────────────────────────────
 extern ""C"" __global__ void llm_kv_append(
     const float* __restrict__ k_in,

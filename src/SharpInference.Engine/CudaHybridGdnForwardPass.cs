@@ -168,13 +168,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private readonly float* _beta;             // [NumVHeads]
     private readonly float* _gdnOut;           // [ValueDim] = 4096
 
-    // CPU scratch for the per-token download/upload boundary around an attention
-    // block (we keep Q/K small de-interleave + partial-RoPE on the CPU for v1).
-    private readonly float* _hostQGate;        // [qDim * 2] = 8192
-    private readonly float* _hostQ;            // [qDim] = 4096
-    private readonly float* _hostGate;         // [qDim] = 4096
-    private readonly float* _hostK;            // [kvDim] = 512
-    private readonly float* _ropeCosTable;     // [ctxLen * (ropeDim/2)]
+    // CPU scratch used by the shared-expert scalar gate sigmoid (line ~756).
+    // The attention block now runs entirely on the GPU; no per-token CPU↔GPU
+    // round-trip remains.
+    private readonly float* _hostQ;            // [max(qDim, embDim)] scratch for shexp gate dot+sigmoid
+    private readonly float* _ropeCosTable;     // [ctxLen * (ropeDim/2)] — retained for any future CPU fallback path
     private readonly float* _ropeSinTable;
 
     // Top-K router readback (CPU side)
@@ -285,10 +283,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _alpha = Alloc(_gdnNumVHeads);
         _beta = Alloc(_gdnNumVHeads);
         _gdnOut = Alloc(_gdnValueDim);
-        _hostQGate = Alloc(qDim * 2);
-        _hostQ = Alloc(qDim);
-        _hostGate = Alloc(qDim);
-        _hostK = Alloc(kvDim);
+        // _hostQ doubles as the shexp readback buffer (~embDim) and as occasional
+        // attention-scratch for any future debugging download. Size it for whichever
+        // is larger so the same allocation serves both.
+        _hostQ = Alloc(Math.Max(qDim, _embDim));
         _cpuNormReadback = Alloc(_embDim);
 
         // RoPE tables for partial NEOX rotation (ropeDim/2 entries per position).
@@ -528,112 +526,39 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     private void GpuAttnBlock(int layer, int position)
     {
-        int qDim = _numHeads * _headDim;
         int kvDim = _numKvHeads * _headDim;
-        int twoHd = _headDim * 2;
 
         // 1. Project: attn_q → [Q‖G] interleaved per head (output qDim*2 = 8192).
         GpuMatMul(_gpuQGate, _gpuWQGate[layer], _gpuNormBuf);
         GpuMatMul(_gpuK, _gpuWK[layer], _gpuNormBuf);
         GpuMatMul(_gpuV, _gpuWV[layer], _gpuNormBuf);
-        _gpu.Synchronize();
 
-        // 2. De-interleave Q/G + per-head norm + partial NEOX RoPE.
-        //
-        // TODO(Phase6c): write a CUDA kernel for de-interleave + partial NEOX RoPE.
-        //   For v1 we download qGate + k, do the work on CPU, and upload back.
-        //   Per-token transfer: qDim*2 + kvDim = 8192 + 512 = 8.7 KiB down, qDim + kvDim = 4.5 KiB up.
-        //   At PCIe 4.0 ×16 (30 GB/s) this is ~0.5 µs round-trip — negligible vs MoE.
-        _gpu.Download(_gpuQGate, new Span<float>(_hostQGate, qDim * 2));
-        _gpu.Download(_gpuK, new Span<float>(_hostK, kvDim));
+        // 2a. GPU strided de-interleave of [Q‖G] → _gpuQ, _gpuGate.
+        _gpu.SplitQG(_gpuQ, _gpuGate, _gpuQGate, _numHeads, _headDim);
 
-        // 2a. De-interleave on CPU.
-        for (int h = 0; h < _numHeads; h++)
-        {
-            float* src = _hostQGate + h * twoHd;
-            float* dstQ = _hostQ + h * _headDim;
-            float* dstG = _hostGate + h * _headDim;
-            new ReadOnlySpan<float>(src, _headDim).CopyTo(new Span<float>(dstQ, _headDim));
-            new ReadOnlySpan<float>(src + _headDim, _headDim).CopyTo(new Span<float>(dstG, _headDim));
-        }
+        // 2b. Per-head RMSNorm on Q and K (qwen35moe attn_q_norm / attn_k_norm).
+        _gpu.HeadNorm(_gpuQ, _gpuQNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
+        _gpu.HeadNorm(_gpuK, _gpuKNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
 
-        // 2b. Upload gate to GPU (kept for the sigmoid-multiply later).
-        _gpu.UploadInto(_gpuGate, new ReadOnlySpan<float>(_hostGate, qDim));
-        // 2c. Q and K back to host for the partial-RoPE step (need per-head norm first).
-        //     We'll do norm+RoPE on host then upload _gpuQ.
-        //     (Doing per-head norm on host is cheap; CudaBackend.HeadNorm has a per-head
-        //     RMSNorm but the convention there is per-head learned gain of size headDim
-        //     which matches exactly — could move to GPU later. v1: CPU.)
-        // TODO(Phase6c): use _gpu.HeadNorm for Q/K (matches Qwen3 convention) and write
-        //   a partial-RoPE NVRTC kernel. For v1 we do both on CPU and re-upload.
-        PerHeadRmsNorm(_hostQ, _qNormBufFor(layer), _numHeads, _headDim, _hp.RmsNormEps);
-        PerHeadRmsNorm(_hostK, _kNormBufFor(layer), _numKvHeads, _headDim, _hp.RmsNormEps);
+        // 2c. Partial NEOX RoPE on Q and K (rotate first ropeDim of each head).
+        _gpu.RoPEPartial(_gpuQ, position, _headDim, _ropeDim, _hp.RopeTheta, neox: true);
+        _gpu.RoPEPartial(_gpuK, position, _headDim, _ropeDim, _hp.RopeTheta, neox: true);
 
-        float* cos = _ropeCosTable + (long)position * _ropeHalfDim;
-        float* sin = _ropeSinTable + (long)position * _ropeHalfDim;
-        SimdKernels.ApplyRoPECachedNeoxPartial(_hostQ, cos, sin, _numHeads, _headDim, _ropeDim);
-        SimdKernels.ApplyRoPECachedNeoxPartial(_hostK, cos, sin, _numKvHeads, _headDim, _ropeDim);
-
-        // 3. Upload Q and K to GPU.
-        _gpu.UploadInto(_gpuQ, new ReadOnlySpan<float>(_hostQ, qDim));
-        _gpu.UploadInto(_gpuK, new ReadOnlySpan<float>(_hostK, kvDim));
-
-        // 4. Append K/V to GPU cache (position-indexed flat layout).
+        // 3. Append K/V to GPU cache (position-indexed flat layout).
         _gpu.KvAppend(_gpuK, _gpuV, _gpuKCache[layer]!, _gpuVCache[layer]!,
             kvDim, position, _maxSeqLen);
 
-        // 5. Scaled dot-product attention.
+        // 4. Scaled dot-product attention.
         _gpu.Attention(_gpuQ, _gpuKCache[layer]!, _gpuVCache[layer]!, _gpuAttnOut,
             _gpuAttnScratch,
             _numHeads, _numKvHeads, _headDim,
             (position + 1), _maxSeqLen);
 
-        // 6. Apply GLU gate: attn_out *= sigmoid(gate).
-        //    CudaBackend has Sigmoid but no fused sigmoid-multiply, so:
-        //      Sigmoid(gate) in place, then ElementwiseMul(attn_out, attn_out, gate).
-        //    CudaBackend.ElementwiseMul is NOT implemented. SiLuMul is fused but uses SiLU.
-        //
-        // TODO(Phase6c): add a SigmoidMulInPlace NVRTC kernel ( ~5 lines of GLSL-equivalent ).
-        //   For v1: do the sigmoid-multiply on CPU after a quick download/upload.
-        _gpu.Synchronize();
-        _gpu.Download(_gpuAttnOut, new Span<float>(_hostQ, qDim));     // reuse _hostQ as scratch for attn_out
-        _gpu.Download(_gpuGate, new Span<float>(_hostGate, qDim));
-        for (int i = 0; i < qDim; i++)
-        {
-            float g = _hostGate[i];
-            float sig = 1.0f / (1.0f + MathF.Exp(-g));
-            _hostQ[i] *= sig;
-        }
-        _gpu.UploadInto(_gpuAttnOut, new ReadOnlySpan<float>(_hostQ, qDim));
+        // 5. Apply GLU gate: attn_out *= sigmoid(gate). Single fused kernel.
+        _gpu.SigmoidMulInPlace(_gpuAttnOut, _gpuGate);
 
-        // 7. Output projection.
+        // 6. Output projection.
         GpuMatMul(_gpuHidden, _gpuWO[layer], _gpuAttnOut);
-    }
-
-    // Q/K per-head norm weights live on GPU; we need them on CPU for the v1
-    // partial-RoPE workaround. Cache the F32 copies we already have at upload time
-    // (read once via the GGUF mmap; small — headDim = 256 floats per layer per direction).
-    private readonly Dictionary<int, IntPtr> _qNormHost = new();
-    private readonly Dictionary<int, IntPtr> _kNormHost = new();
-
-    private float* _qNormBufFor(int layer)
-    {
-        if (!_qNormHost.TryGetValue(layer, out var ptr))
-        {
-            ptr = (IntPtr)LoadF32Tensor($"blk.{layer}.attn_q_norm.weight", _headDim);
-            _qNormHost[layer] = ptr;
-        }
-        return (float*)ptr;
-    }
-
-    private float* _kNormBufFor(int layer)
-    {
-        if (!_kNormHost.TryGetValue(layer, out var ptr))
-        {
-            ptr = (IntPtr)LoadF32Tensor($"blk.{layer}.attn_k_norm.weight", _headDim);
-            _kNormHost[layer] = ptr;
-        }
-        return (float*)ptr;
     }
 
     // =================================================================
@@ -812,12 +737,6 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             if (sum > 0)
                 for (int i = 0; i < k; i++) weights[i] /= sum;
         }
-    }
-
-    private static void PerHeadRmsNorm(float* data, float* weight, int numHeads, int headDim, float eps)
-    {
-        for (int h = 0; h < numHeads; h++)
-            SimdKernels.RmsNorm(data + h * headDim, data + h * headDim, weight, headDim, eps);
     }
 
     // =================================================================
@@ -1122,10 +1041,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         NativeMemory.Free(_alpha);
         NativeMemory.Free(_beta);
         NativeMemory.Free(_gdnOut);
-        NativeMemory.Free(_hostQGate);
         NativeMemory.Free(_hostQ);
-        NativeMemory.Free(_hostGate);
-        NativeMemory.Free(_hostK);
         NativeMemory.Free(_cpuNormReadback);
         NativeMemory.Free(_ropeCosTable);
         NativeMemory.Free(_ropeSinTable);
@@ -1138,10 +1054,6 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             if (_ssmDtBias[i] != null) NativeMemory.Free(_ssmDtBias[i]);
             if (_ssmNormW[i] != null) NativeMemory.Free(_ssmNormW[i]);
         }
-        foreach (var kv in _qNormHost) NativeMemory.Free((void*)kv.Value);
-        foreach (var kv in _kNormHost) NativeMemory.Free((void*)kv.Value);
-        _qNormHost.Clear();
-        _kNormHost.Clear();
 
         // GPU scratch
         _gpu.Free(_gpuHidden);
