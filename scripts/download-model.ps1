@@ -3,8 +3,8 @@
     Downloads GGUF models for SharpInference development.
 .DESCRIPTION
     Downloads from HuggingFace to the models/ directory. Skips if already present.
-    Supports: smollm2, qwen3-8b, olmoe-1b-7b, llama31-70b, qwen3-coder-30b-a3b, llama4-scout,
-              z-image-turbo, z-image-turbo-q8, realesrgan-x4
+    Supports: smollm2, qwen3-8b, olmoe-1b-7b, llama31-70b, qwen3-coder-30b-a3b, qwen36-35b-a3b,
+              llama4-scout, z-image-turbo, z-image-turbo-q8, realesrgan-x4
 .PARAMETER Model
     Which model to download. Default: downloads all text models (skips large image models).
 .EXAMPLE
@@ -14,14 +14,15 @@
     .\download-model.ps1 -Model olmoe-1b-7b             # OLMoE 1B-7B Instruct Q4_K_M (~4.4 GB) — small MoE for kernel validation
     .\download-model.ps1 -Model llama31-70b             # Llama 3.1 70B (40.8 GB)
     .\download-model.ps1 -Model qwen3-coder-30b-a3b     # Qwen3-Coder 30B-A3B Q4_K_M (18.6 GB)
+    .\download-model.ps1 -Model qwen36-35b-a3b          # Qwen3.6 35B-A3B UD-Q4_K_M (22.1 GB) — recommended general MoE for 12 GB hybrid
     .\download-model.ps1 -Model llama4-scout            # Llama 4 Scout Q4_K_M (60.9 GB, 2 shards)
     .\download-model.ps1 -Model z-image-turbo           # Z-Image-Turbo Q5_K_M + abliterated encoder (~8.5 GB)
     .\download-model.ps1 -Model z-image-turbo-q8        # Z-Image-Turbo Q8_0 + abliterated encoder Q8_0 (~12 GB)
     .\download-model.ps1 -Model realesrgan-x4           # Real-ESRGAN x4plus upscaler (67 MB)
 #>
 param(
-    [ValidateSet("smollm2", "qwen3-8b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "llama4-scout",
-                 "z-image-turbo", "z-image-turbo-q8", "realesrgan-x4")]
+    [ValidateSet("smollm2", "qwen3-8b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "qwen36-35b-a3b",
+                 "llama4-scout", "z-image-turbo", "z-image-turbo-q8", "realesrgan-x4")]
     [string]$Model,
     [string]$DestDir
 )
@@ -60,6 +61,18 @@ $Models = @{
         Urls  = @("https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/resolve/main/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf")
         Size  = "18.6 GB"
         Phase = "5a"
+    }
+    # Qwen3.6-35B-A3B (April 2026) — CPU-only as of 2026-05-20.
+    # Despite the "A3B" label, this is a hybrid Gated-DeltaNet + sparse-attention MoE
+    # (arch="qwen35moe"): only 1 in 4 layers is full attention; the rest are GDN
+    # (delta-rule linear attention with a per-head 128×128 matrix state).
+    # Loads and decodes on CPU; coherence (logit parity vs llama.cpp) is pending.
+    # GPU offload, TurboQuant, and speculative decoding are rejected at CLI startup.
+    "qwen36-35b-a3b" = @{
+        Files = @("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf")
+        Urls  = @("https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf")
+        Size  = "22.1 GB"
+        Phase = "CPU-only (Phase 4 of qwen35moe port; parity + CUDA hybrid pending)"
     }
     "llama4-scout" = @{
         Files = @(
