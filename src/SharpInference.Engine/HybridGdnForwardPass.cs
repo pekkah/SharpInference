@@ -58,9 +58,6 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     private readonly float* _normBuf;       // [embDim]
     private readonly float* _logits;        // [vocabSize]
 
-    // Layer-0 dummy KV used to keep PagedKvCache's "layer 0 must allocate first" invariant
-    // happy on hybrid models where layer 0 is GDN, not Attention.
-    private readonly float* _dummyKv;       // [numKvHeads * headDim] — zeros
 
     // ── Attention scratch (full-attn layers) ───────────────────────────
     private readonly float* _qGate;         // [numHeads * headDim * 2] = 8192 — interleaved Q‖gate per head
@@ -202,7 +199,6 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         _residual = Alloc(_embDim);
         _normBuf = Alloc(_embDim);
         _logits = Alloc(hp.VocabSize);
-        _dummyKv = Alloc(_numKvHeads * _headDim);   // AllocZeroed → stays zero
 
         int qDim = _numHeads * _headDim;
         int kvDim = _numKvHeads * _headDim;
@@ -361,12 +357,11 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         // 1. Embedding lookup
         EmbedToken(token);
 
-        // 2. Reserve a KV slot at layer 0 (PagedKvCache requires the page-allocating Append
-        //    to be on layer 0; in this hybrid model layer 0 is GDN, not Attention). We write
-        //    a zero stub so the block table is set up; only attention layers (3, 7, ..., 39)
-        //    write real K/V, and only those layers read from the cache.
-        var kvDim = _numKvHeads * _headDim;
-        _kvCache.Append(0, new ReadOnlySpan<float>(_dummyKv, kvDim), new ReadOnlySpan<float>(_dummyKv, kvDim));
+        // 2. Reserve a KV block slot for this token. Layer 0 is GDN (no KV), so the first
+        //    attention layer (index 3) would otherwise hit PagedKvCache's "layer-0-must-be-first"
+        //    invariant. ReserveBlock populates the block table for all layers without
+        //    allocating any per-layer page — pages stay null until each layer's first Append.
+        _kvCache.ReserveBlock();
 
         // 3. Trunk layers
         for (int layer = 0; layer < _hp.NumLayers; layer++)
@@ -873,7 +868,6 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         NativeMemory.Free(_residual);
         NativeMemory.Free(_normBuf);
         NativeMemory.Free(_logits);
-        NativeMemory.Free(_dummyKv);
         NativeMemory.Free(_qGate);
         NativeMemory.Free(_q);
         NativeMemory.Free(_gate);

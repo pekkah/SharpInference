@@ -193,4 +193,52 @@ public sealed unsafe class PagedKvCacheTests : IDisposable
         using var small = new PagedKvCache(numLayers: 1, numKvHeads: 1, headDim: 4, maxBlocks: 4);
         Assert.Equal(4 * PagedKvCache.PageSize, small.MaxSeqLen);
     }
+
+    [Fact]
+    public void ReserveBlock_AllowsLayerOneToAppendFirst()
+    {
+        // ReserveBlock makes the "layer 0 must call Append first" invariant optional —
+        // hybrid models can call any layer's Append after a ReserveBlock at the page boundary.
+        _cache.ReserveBlock();
+        Append(_cache, 1, 7f, 11f);            // layer 1 first, no layer-0 write
+        // Layer 1 should now read back what it wrote.
+        Assert.Equal(7f,  _cache.KeyAt(1, 0)[0]);
+        Assert.Equal(11f, _cache.ValueAt(1, 0)[0]);
+        _cache.IncrementPosition();
+        Assert.Equal(1, _cache.Length);
+    }
+
+    [Fact]
+    public void ReserveBlock_IdempotentWithinSameBlock()
+    {
+        // Multiple ReserveBlock calls inside the same PageSize window should be no-ops.
+        _cache.ReserveBlock();
+        _cache.ReserveBlock();
+        _cache.ReserveBlock();
+        Append(_cache, 0, 1f, 2f);
+        _cache.IncrementPosition();
+        Append(_cache, 0, 3f, 4f);
+        _cache.IncrementPosition();
+        Assert.Equal(1f, _cache.KeyAt(0, 0)[0]);
+        Assert.Equal(3f, _cache.KeyAt(0, 1)[0]);
+        Assert.Equal(2, _cache.Length);
+    }
+
+    [Fact]
+    public void ReserveBlock_AcrossPageBoundary_AllocatesNewBlock()
+    {
+        // Fill page 0 with 16 tokens, then ReserveBlock at the boundary and verify page 1
+        // is usable from layer 1 only (layer 0's page-1 slot stays unallocated).
+        for (int i = 0; i < PagedKvCache.PageSize; i++)
+            AppendToken(_cache, i, i + 100f);
+        Assert.Equal(PagedKvCache.PageSize, _cache.Length);
+
+        _cache.ReserveBlock();                 // crosses into page 1
+        Append(_cache, 1, 42f, 99f);           // layer 1 only writes page 1
+        _cache.IncrementPosition();
+
+        Assert.Equal(PagedKvCache.PageSize + 1, _cache.Length);
+        Assert.Equal(42f, _cache.KeyAt(1, PagedKvCache.PageSize)[0]);
+        Assert.Equal(99f, _cache.ValueAt(1, PagedKvCache.PageSize)[0]);
+    }
 }

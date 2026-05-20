@@ -134,6 +134,27 @@ public sealed unsafe class PagedKvCache : IDisposable
         value[.._kvDim].CopyTo(new Span<float>(valDst, _kvDim));
     }
 
+    /// <summary>
+    /// Reserves a new block slot in the per-layer block table without allocating any page.
+    /// Use this for hybrid architectures where layer 0 does not call <see cref="Append"/>
+    /// (e.g. qwen35moe, whose layer 0 is a recurrent Gated DeltaNet block that stores no KV).
+    /// Call once per token when crossing a <see cref="PageSize"/> boundary, BEFORE any layer
+    /// in the trunk calls Append for the current token. Per-layer pages remain null until
+    /// each layer's first KV write triggers lazy allocation.
+    /// </summary>
+    public void ReserveBlock()
+    {
+        int blockIdx = _length / PageSize;
+        if (blockIdx >= _allocatedBlocks)
+        {
+            EnsureBlockTableCapacity(blockIdx);
+            int slot = AllocSlot();
+            for (int l = 0; l < _numLayers; l++)
+                _blockTable[l][blockIdx] = slot;
+            _allocatedBlocks++;
+        }
+    }
+
     /// <summary>Advances the logical length. Call once per token after all layers are appended.</summary>
     public void IncrementPosition() => _length++;
 
