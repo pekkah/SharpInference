@@ -1,0 +1,1196 @@
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using SharpInference.Core;
+using SharpInference.Cpu;
+using SharpInference.Cuda;
+
+namespace SharpInference.Engine;
+
+/// <summary>
+/// Hybrid GPU/CPU forward pass for the qwen35moe Gated-DeltaNet (GDN) + MoE
+/// architecture (Qwen3.6-35B-A3B).
+///
+/// Placement (Phase 6, option A from <c>docs/qwen35moe-plan.md</c>):
+/// <list type="bullet">
+///   <item>GDN layers (30 of 40, indices where <c>(i+1) % 4 != 0</c>): the full
+///         block — joint QKV projection, depthwise conv1d, L2-norm, delta-net
+///         recurrence, ssm-out projection — runs on the CPU via
+///         <see cref="GdnKernels"/>. Hidden state is downloaded to a pinned host
+///         buffer before the block and uploaded back after.</item>
+///   <item>Attention layers (10 of 40, indices 3, 7, …, 39): GLU-gated attention
+///         runs on the GPU via <see cref="CudaBackend"/>. Per-head Q/K RMSNorm,
+///         partial NEOX RoPE, GQA scaled-dot-product attention, sigmoid GLU gate.
+///         Q/K/V/O weights stay VRAM-resident.</item>
+///   <item>MoE FFN (every layer): 256-expert top-8 router runs on GPU; experts
+///         are served by <see cref="CudaExpertSlotManager"/> (SLRU lazy load);
+///         the shared expert and its per-token sigmoid gate run on GPU with
+///         eager-resident weights.</item>
+///   <item>Embedding / output projection: GPU if VRAM permits (mirrors
+///         <c>CudaHybridForwardPass.ShouldKeepFixedWeightsOnCpu</c>); else CPU.</item>
+///   <item>KV cache for the 10 attention layers: VRAM (<c>_gpuKCache[layer]</c>,
+///         <c>_gpuVCache[layer]</c>) — same flat layout as
+///         <see cref="CudaHybridForwardPass"/>.</item>
+///   <item>GDN state cache: CPU only (<see cref="GdnStateCache"/>).</item>
+/// </list>
+///
+/// <para>
+/// Per-token GPU↔CPU transfer cost: 30 GDN blocks × 2 directions × <c>embDim×4 B</c>
+/// = 480 KiB/token over PCIe; ~16 µs at PCIe 4.0 ×16. Negligible compared to MoE
+/// expert evaluation.
+/// </para>
+///
+/// <para>
+/// Triage policy: where an op isn't directly available on <see cref="CudaBackend"/>,
+/// this implementation prefers a download → CPU → upload fallback over adding a new
+/// NVRTC kernel. Per-token overhead is small (a few KiB transfer per layer) and adding
+/// kernels is deferred to Phase 7 (CUDA SSM kernels) and beyond. CPU-fallback sites are
+/// marked with <c>TODO(Phase6c)</c> comments to drive future kernel work.
+/// </para>
+///
+/// <para>v1 limitations (mirrors <see cref="HybridGdnForwardPass"/>):</para>
+/// <list type="bullet">
+///   <item>No speculative-decoding rewind (GDN state is destructively updated;
+///         <see cref="TruncateTo"/> accepts only 0 or current length).</item>
+///   <item>No batched prefill — <see cref="Prefill"/> walks tokens sequentially.</item>
+///   <item>No TurboQuant — KV cache is plain FP32.</item>
+///   <item>No continuous batching — single-sequence only.</item>
+/// </list>
+/// </summary>
+public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
+{
+    private readonly GgufModel _model;
+    private readonly CudaBackend _gpu;
+    private readonly ModelHyperparams _hp;
+    private readonly GdnConfig _gdn;
+    private readonly LayerPlacement _placement;
+    private readonly int _maxSeqLen;
+    private readonly int _ctxLen;
+
+    // ── Dimensions ─────────────────────────────────────────────────────
+    private readonly int _embDim;
+    private readonly int _headDim;          // attention head dim (256)
+    private readonly int _numHeads;
+    private readonly int _numKvHeads;
+    private readonly int _headsPerKvGroup;
+    private readonly int _ropeDim;          // 64 (partial NEOX RoPE)
+    private readonly int _ropeHalfDim;
+    private readonly int _gdnHeadDim;       // 128
+    private readonly int _gdnNumVHeads;
+    private readonly int _gdnNumKHeads;
+    private readonly int _gdnKvRepeat;
+    private readonly int _gdnValueDim;      // 4096
+    private readonly int _gdnKeyDim;        // 2048
+    private readonly int _gdnConvChannels;  // 8192
+    private readonly int _gdnConvKernel;
+    private readonly int _numExperts;
+    private readonly int _numActiveExperts;
+    private readonly int _expertDim;
+
+    // ── GPU scratch ────────────────────────────────────────────────────
+    private readonly Tensor _gpuHidden;
+    private readonly Tensor _gpuResidual;
+    private readonly Tensor _gpuNormBuf;
+    private readonly Tensor _gpuQGate;       // [numHeads * headDim * 2] = 8192 (Q‖gate interleaved per head)
+    private readonly Tensor _gpuQ;           // [numHeads * headDim] = 4096
+    private readonly Tensor _gpuGate;        // [numHeads * headDim] = 4096 (pre-sigmoid)
+    private readonly Tensor _gpuK;           // [numKvHeads * headDim] = 512
+    private readonly Tensor _gpuV;           // [numKvHeads * headDim] = 512
+    private readonly Tensor _gpuAttnOut;     // [numHeads * headDim] = 4096
+    private readonly Tensor _gpuAttnScratch; // attention scores spill scratch
+    private readonly Tensor _gpuRouterLogits;
+    private readonly Tensor _gpuFfnGate;
+    private readonly Tensor _gpuFfnUp;
+    private readonly Tensor _gpuExpertOut;
+    private readonly Tensor _gpuSharedOut;
+    private readonly Tensor _gpuLogits;
+    private readonly Tensor _pinnedHidden;   // host-mappable embDim float buffer for CPU↔GPU sync
+
+    // ── Per-layer GPU weights (sized [NumLayers]; null/default slots for the
+    //    block type that doesn't apply on that layer) ──────────────────────
+    private readonly Tensor[] _gpuAttnNorm;       // [L] F32
+    private readonly Tensor[] _gpuPostAttnNorm;   // [L] F32
+    private readonly Tensor[] _gpuWGateInp;       // [L] router weight F32 [embDim, NumExperts]
+    private readonly Tensor[] _gpuWGateInpShexp;  // [L] shared-expert gate F32 [embDim]
+    private readonly Tensor[] _gpuWGateShexp;     // [L]
+    private readonly Tensor[] _gpuWUpShexp;       // [L]
+    private readonly Tensor[] _gpuWDownShexp;     // [L]
+
+    // Attention-only (slots at GDN layers are unused)
+    private readonly Tensor[] _gpuWQGate;        // [L] attn_q (GLU-gated, output 8192)
+    private readonly Tensor[] _gpuWK;            // [L]
+    private readonly Tensor[] _gpuWV;            // [L]
+    private readonly Tensor[] _gpuWO;            // [L]
+    private readonly Tensor[] _gpuQNorm;         // [L] [headDim] F32
+    private readonly Tensor[] _gpuKNorm;         // [L] [headDim] F32
+
+    // GPU KV cache (sized [numLayers]; only attention slots are allocated)
+    private readonly Tensor?[] _gpuKCache;       // [L][maxSeq * kvDim] F32
+    private readonly Tensor?[] _gpuVCache;       // [L][maxSeq * kvDim] F32
+
+    // Embedding + output
+    private readonly Tensor? _gpuEmbedding;
+    private readonly bool _embIsQuantized;
+    private readonly Tensor? _gpuOutputNorm;
+    private readonly Tensor? _gpuOutputWeight;
+
+    // Dtype map shared with CudaExpertSlotManager so MatMul dispatch picks
+    // the right matvec variant for SLRU-loaded expert tensors.
+    private readonly Dictionary<nint, DType> _gpuWeightDTypes = new();
+    private readonly CudaExpertSlotManager _expertSlotManager;
+
+    // ── CPU-side state for GDN layers ──────────────────────────────────
+    private readonly GdnStateCache _gdnStateCache;
+    private readonly PagedKvCache _kvCache;     // bookkeeping (block table) for attention layers; data lives on GPU
+
+    // Per-GDN-layer F32 weights (preloaded once, decode-only)
+    // Tensor refs to GGUF mmap for the larger projections (run via SimdKernels.MatVec)
+    private readonly CpuWeightRef[] _cpuWQkv;        // [L] attn_qkv (output 8192)
+    private readonly CpuWeightRef[] _cpuWZGate;      // [L] attn_gate (output 4096)
+    private readonly CpuWeightRef[] _cpuSsmOut;      // [L] ssm_out (input 4096, output 2048)
+    private readonly CpuWeightRef[] _cpuSsmAlpha;    // [L] F32 [embDim, NumVHeads]
+    private readonly CpuWeightRef[] _cpuSsmBeta;     // [L] F32 [embDim, NumVHeads]
+
+    // Tiny preloaded F32 weights
+    private readonly float*[] _ssmConv1d;            // [L][kernel * channels] — transposed [k, c]
+    private readonly float*[] _ssmA;                 // [L][NumVHeads]
+    private readonly float*[] _ssmDtBias;            // [L][NumVHeads]
+    private readonly float*[] _ssmNormW;             // [L][gdnHeadDim]
+
+    // CPU scratch for GDN block
+    private readonly float* _cpuNormBuf;       // [embDim]
+    private readonly float* _cpuHiddenOut;     // [embDim] — output of GDN block, uploaded to _gpuHidden
+    private readonly float* _qkv;              // [ConvChannels] = 8192
+    private readonly float* _qkvConv;          // [ConvChannels] = 8192
+    private readonly float* _zVec;             // [ValueDim] = 4096
+    private readonly float* _qVHeads;          // [NumVHeads*HeadDim] = 4096
+    private readonly float* _kVHeads;          // [NumVHeads*HeadDim] = 4096
+    private readonly float* _alpha;            // [NumVHeads]
+    private readonly float* _beta;             // [NumVHeads]
+    private readonly float* _gdnOut;           // [ValueDim] = 4096
+
+    // CPU scratch for the per-token download/upload boundary around an attention
+    // block (we keep Q/K small de-interleave + partial-RoPE on the CPU for v1).
+    private readonly float* _hostQGate;        // [qDim * 2] = 8192
+    private readonly float* _hostQ;            // [qDim] = 4096
+    private readonly float* _hostGate;         // [qDim] = 4096
+    private readonly float* _hostK;            // [kvDim] = 512
+    private readonly float* _ropeCosTable;     // [ctxLen * (ropeDim/2)]
+    private readonly float* _ropeSinTable;
+
+    // Top-K router readback (CPU side)
+    private readonly float[] _routerBuf;
+    private readonly float[] _logitsBuf;
+
+    // Shared-expert per-token scalar gate is `sigmoid(ffn_gate_inp_shexp · x)`.
+    // We need a single scalar on the GPU but CudaBackend doesn't expose a
+    // dot+sigmoid op; download _gpuNormBuf and compute on CPU.
+    // This is reused across layers — embDim floats per token.
+    private readonly float* _cpuNormReadback;
+
+    // Diagnostic: per-layer activation trace (env: SHARPI_TRACE_LAYERS=1).
+    private static readonly bool _traceLayers =
+        Environment.GetEnvironmentVariable("SHARPI_TRACE_LAYERS") == "1";
+
+    private bool _disposed;
+
+    public int VocabSize => _hp.VocabSize;
+    public int MaxSeqLen => _maxSeqLen;
+    public LayerPlacement Placement => _placement;
+
+    public CudaHybridGdnForwardPass(GgufModel model, CudaBackend gpu, ModelHyperparams hp,
+        LayerPlacement placement, int maxContextLength = 0)
+    {
+        ArgumentNullException.ThrowIfNull(model);
+        ArgumentNullException.ThrowIfNull(gpu);
+        ArgumentNullException.ThrowIfNull(hp);
+        ArgumentNullException.ThrowIfNull(placement);
+        if (!hp.IsHybridSsm)
+            throw new ArgumentException("CudaHybridGdnForwardPass requires hp.IsHybridSsm=true.", nameof(hp));
+        if (hp.Gdn is null)
+            throw new ArgumentException("CudaHybridGdnForwardPass requires hp.Gdn != null.", nameof(hp));
+        if (hp.LayerTypes is null)
+            throw new ArgumentException("CudaHybridGdnForwardPass requires hp.LayerTypes != null.", nameof(hp));
+        if (!hp.IsMoE || !hp.HasSharedExpert)
+            throw new ArgumentException("CudaHybridGdnForwardPass currently requires MoE FFN with shared expert (qwen35moe).", nameof(hp));
+
+        _model = model;
+        _gpu = gpu;
+        _hp = hp;
+        _gdn = hp.Gdn;
+        _placement = placement;
+        _maxSeqLen = placement.RecommendedCtxSize > 0
+            ? placement.RecommendedCtxSize
+            : Math.Min(hp.ContextLength, 32768);
+
+        _ctxLen = _maxSeqLen;
+
+        _embDim = hp.EmbeddingDim;
+        _headDim = hp.HeadDim;
+        _numHeads = hp.NumHeads;
+        _numKvHeads = hp.NumKvHeads;
+        _headsPerKvGroup = _numHeads / _numKvHeads;
+        _ropeDim = hp.RopeDim;
+        _ropeHalfDim = _ropeDim / 2;
+        _gdnHeadDim = _gdn.HeadDim;
+        _gdnNumVHeads = _gdn.NumVHeads;
+        _gdnNumKHeads = _gdn.NumKHeads;
+        _gdnKvRepeat = _gdnNumVHeads / _gdnNumKHeads;
+        _gdnValueDim = _gdn.ValueDim;
+        _gdnKeyDim = _gdn.KeyDim;
+        _gdnConvChannels = _gdn.ConvChannels;
+        _gdnConvKernel = _gdn.ConvKernel;
+        _numExperts = hp.NumExperts;
+        _numActiveExperts = hp.NumActiveExperts;
+        _expertDim = hp.ExpertIntermediateDim;
+
+        int L = hp.NumLayers;
+        int qDim = _numHeads * _headDim;        // 4096
+        int kvDim = _numKvHeads * _headDim;     // 512
+
+        Console.Error.WriteLine($"[CudaHybridGdnForwardPass] layers={L} embDim={_embDim} headDim={_headDim} numHeads={_numHeads} ropeDim={_ropeDim} ctx={_ctxLen}");
+        Console.Error.WriteLine($"[CudaHybridGdnForwardPass] GDN: heads={_gdnNumVHeads}v×{_gdnNumKHeads}k headDim={_gdnHeadDim} conv={_gdnConvChannels}×{_gdnConvKernel} MoE: {_numExperts}exp×{_numActiveExperts}active dim={_expertDim}");
+
+        // ── Allocate GPU scratch ───────────────────────────────────────
+        _gpuHidden = gpu.Allocate(TensorShape.D1(_embDim));
+        _gpuResidual = gpu.Allocate(TensorShape.D1(_embDim));
+        _gpuNormBuf = gpu.Allocate(TensorShape.D1(_embDim));
+        _gpuQGate = gpu.Allocate(TensorShape.D1(qDim * 2));
+        _gpuQ = gpu.Allocate(TensorShape.D1(qDim));
+        _gpuGate = gpu.Allocate(TensorShape.D1(qDim));
+        _gpuK = gpu.Allocate(TensorShape.D1(kvDim));
+        _gpuV = gpu.Allocate(TensorShape.D1(kvDim));
+        _gpuAttnOut = gpu.Allocate(TensorShape.D1(qDim));
+        // Attention scores scratch — only needed when ctx > 4096; otherwise placeholder.
+        long scratchElems = _maxSeqLen > 4096 ? (long)_numHeads * _maxSeqLen : 1L;
+        _gpuAttnScratch = gpu.Allocate(TensorShape.D1(scratchElems));
+        _gpuRouterLogits = gpu.Allocate(TensorShape.D1(_numExperts));
+        _gpuFfnGate = gpu.Allocate(TensorShape.D1(_expertDim));
+        _gpuFfnUp = gpu.Allocate(TensorShape.D1(_expertDim));
+        _gpuExpertOut = gpu.Allocate(TensorShape.D1(_embDim));
+        _gpuSharedOut = gpu.Allocate(TensorShape.D1(_embDim));
+        _gpuLogits = gpu.Allocate(TensorShape.D1(hp.VocabSize));
+        _pinnedHidden = gpu.AllocatePinned(TensorShape.D1(_embDim));
+
+        _routerBuf = new float[_numExperts];
+        _logitsBuf = new float[hp.VocabSize];
+
+        // ── CPU scratch ────────────────────────────────────────────────
+        _cpuNormBuf = Alloc(_embDim);
+        _cpuHiddenOut = Alloc(_embDim);
+        _qkv = Alloc(_gdnConvChannels);
+        _qkvConv = Alloc(_gdnConvChannels);
+        _zVec = Alloc(_gdnValueDim);
+        _qVHeads = Alloc(_gdnNumVHeads * _gdnHeadDim);
+        _kVHeads = Alloc(_gdnNumVHeads * _gdnHeadDim);
+        _alpha = Alloc(_gdnNumVHeads);
+        _beta = Alloc(_gdnNumVHeads);
+        _gdnOut = Alloc(_gdnValueDim);
+        _hostQGate = Alloc(qDim * 2);
+        _hostQ = Alloc(qDim);
+        _hostGate = Alloc(qDim);
+        _hostK = Alloc(kvDim);
+        _cpuNormReadback = Alloc(_embDim);
+
+        // RoPE tables for partial NEOX rotation (ropeDim/2 entries per position).
+        _ropeCosTable = (float*)NativeMemory.Alloc((nuint)((long)_ctxLen * _ropeHalfDim * sizeof(float)));
+        _ropeSinTable = (float*)NativeMemory.Alloc((nuint)((long)_ctxLen * _ropeHalfDim * sizeof(float)));
+        SimdKernels.BuildRopeTable(_ropeCosTable, _ropeSinTable, _ctxLen, _ropeDim, hp.RopeTheta);
+
+        // ── Caches ─────────────────────────────────────────────────────
+        // PagedKvCache here is used purely for layer-0 ReserveBlock semantics +
+        // length bookkeeping. The actual KV data lives on the GPU in _gpuKCache /
+        // _gpuVCache (flat ring layout, position-indexed). We still need
+        // ReserveBlock to be called once per token before any attention layer
+        // appends, so reuse PagedKvCache rather than reimplement its accounting.
+        _kvCache = new PagedKvCache(L, _numKvHeads, _headDim);
+        _gdnStateCache = new GdnStateCache(hp.LayerTypes, _gdn);
+
+        // ── Decide embedding/output placement (mirrors CudaHybridForwardPass.ShouldKeepFixedWeightsOnCpu) ──
+        bool cpuFixedWeights = ShouldKeepFixedWeightsOnCpu(
+            model.FindTensor("token_embd.weight")!.Value,
+            model.FindTensor("output.weight"));
+
+        if (!cpuFixedWeights)
+        {
+            _gpuEmbedding = UploadEmbeddingWeight("token_embd.weight", out _embIsQuantized);
+            _gpuOutputNorm = UploadWeight("output_norm.weight");
+            _gpuOutputWeight = model.FindTensor("output.weight") is not null
+                ? UploadWeight("output.weight")
+                : _gpuEmbedding;
+        }
+        else
+        {
+            // Phase 6 limitation: this class assumes embedding+output fit on GPU.
+            // The qwen35moe model with Q8_0 embedding has F32-expanded footprint
+            // that may exceed the 2GB single-allocation limit on some drivers.
+            // If we hit this, the CPU-embedding fallback path mirrors CudaHybridForwardPass.
+            throw new NotSupportedException(
+                "CudaHybridGdnForwardPass: embedding/output do not fit on GPU; " +
+                "CPU embedding fallback is not implemented in v1. Reduce ctx size or " +
+                "use HybridGdnForwardPass for CPU-only execution.");
+        }
+
+        // ── Per-layer tensor arrays ────────────────────────────────────
+        _gpuAttnNorm = new Tensor[L];
+        _gpuPostAttnNorm = new Tensor[L];
+        _gpuWGateInp = new Tensor[L];
+        _gpuWGateInpShexp = new Tensor[L];
+        _gpuWGateShexp = new Tensor[L];
+        _gpuWUpShexp = new Tensor[L];
+        _gpuWDownShexp = new Tensor[L];
+        _gpuWQGate = new Tensor[L];
+        _gpuWK = new Tensor[L];
+        _gpuWV = new Tensor[L];
+        _gpuWO = new Tensor[L];
+        _gpuQNorm = new Tensor[L];
+        _gpuKNorm = new Tensor[L];
+        _gpuKCache = new Tensor?[L];
+        _gpuVCache = new Tensor?[L];
+
+        _cpuWQkv = new CpuWeightRef[L];
+        _cpuWZGate = new CpuWeightRef[L];
+        _cpuSsmOut = new CpuWeightRef[L];
+        _cpuSsmAlpha = new CpuWeightRef[L];
+        _cpuSsmBeta = new CpuWeightRef[L];
+        _ssmConv1d = new float*[L];
+        _ssmA = new float*[L];
+        _ssmDtBias = new float*[L];
+        _ssmNormW = new float*[L];
+
+        Console.Error.Write("[CudaHybridGdnForwardPass] Uploading per-layer weights...");
+        for (int i = 0; i < L; i++)
+        {
+            // Common (both block types): norms + MoE FFN weights live on GPU.
+            _gpuAttnNorm[i] = UploadWeight($"blk.{i}.attn_norm.weight");
+            _gpuPostAttnNorm[i] = UploadWeight($"blk.{i}.post_attention_norm.weight");
+            _gpuWGateInp[i] = UploadWeight($"blk.{i}.ffn_gate_inp.weight");
+            _gpuWGateInpShexp[i] = UploadWeight($"blk.{i}.ffn_gate_inp_shexp.weight");
+            _gpuWGateShexp[i] = UploadWeight($"blk.{i}.ffn_gate_shexp.weight");
+            _gpuWUpShexp[i] = UploadWeight($"blk.{i}.ffn_up_shexp.weight");
+            _gpuWDownShexp[i] = UploadWeight($"blk.{i}.ffn_down_shexp.weight");
+
+            if (hp.LayerTypes[i] == LayerType.Attention)
+            {
+                _gpuWQGate[i] = UploadWeight($"blk.{i}.attn_q.weight");
+                _gpuWK[i] = UploadWeight($"blk.{i}.attn_k.weight");
+                _gpuWV[i] = UploadWeight($"blk.{i}.attn_v.weight");
+                _gpuWO[i] = UploadWeight($"blk.{i}.attn_output.weight");
+                _gpuQNorm[i] = UploadWeight($"blk.{i}.attn_q_norm.weight");
+                _gpuKNorm[i] = UploadWeight($"blk.{i}.attn_k_norm.weight");
+
+                _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
+                _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
+            }
+            else
+            {
+                // GDN block — weights stay on CPU.
+                _cpuWQkv[i] = ResolveCpuWeight($"blk.{i}.attn_qkv.weight");
+                _cpuWZGate[i] = ResolveCpuWeight($"blk.{i}.attn_gate.weight");
+                _cpuSsmOut[i] = ResolveCpuWeight($"blk.{i}.ssm_out.weight");
+                _cpuSsmAlpha[i] = ResolveCpuWeight($"blk.{i}.ssm_alpha.weight");
+                _cpuSsmBeta[i] = ResolveCpuWeight($"blk.{i}.ssm_beta.weight");
+
+                _ssmA[i] = LoadF32Tensor($"blk.{i}.ssm_a", _gdnNumVHeads);
+                _ssmDtBias[i] = LoadF32Tensor($"blk.{i}.ssm_dt.bias", _gdnNumVHeads);
+                _ssmNormW[i] = LoadF32Tensor($"blk.{i}.ssm_norm.weight", _gdnHeadDim);
+                _ssmConv1d[i] = LoadConv1dTransposed($"blk.{i}.ssm_conv1d.weight",
+                    _gdnConvKernel, _gdnConvChannels);
+            }
+            if ((i % 4) == 3) Console.Error.Write(".");
+        }
+        Console.Error.WriteLine(" done.");
+
+        // ── SLRU expert slot manager ───────────────────────────────────
+        // Compute slot capacity from remaining VRAM. The plan calls for sizing
+        // capacity by (remaining VRAM) / (per-expert bytes). For qwen35moe Q4_K_M:
+        //   per expert ≈ 1.81 MiB (gate+up+down for one expert across 3 tensors)
+        // We're conservative — most of the remaining budget is reserved for the
+        // attention KV cache (10 layers × maxSeqLen × kvDim × 4 B × 2) and various
+        // scratch. Use the GpuKvBytes from placement when the planner sized it.
+        ulong vramTotal = gpu.VramBytes;
+        long allocated = EstimateUploadedVram(); // best-effort estimate of weights uploaded so far
+        long remaining = (long)vramTotal - allocated - (2L << 30); // reserve 2 GiB for headroom
+        long perExpertBytes = EstimatePerExpertBytes();
+        int capacity = perExpertBytes > 0 ? (int)Math.Max(64, remaining / perExpertBytes) : 1024;
+        // Cap at total expert count (all layers × num experts).
+        int totalExperts = L * _numExperts;
+        capacity = Math.Min(capacity, totalExperts);
+        Console.Error.WriteLine($"[CudaHybridGdnForwardPass] SLRU expert cache: {capacity} slots / {totalExperts} total experts (per-expert ≈ {perExpertBytes / 1024} KiB, remaining VRAM ≈ {remaining / (1024 * 1024)} MiB).");
+        _expertSlotManager = new CudaExpertSlotManager(gpu, model, hp, capacity, _gpuWeightDTypes);
+    }
+
+    // =================================================================
+    //  IForwardPass surface
+    // =================================================================
+
+    public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0)
+    {
+        if (tokens is null || tokens.Count == 0)
+            throw new ArgumentException("Token list is empty", nameof(tokens));
+        ReadOnlySpan<float> logits = default;
+        for (int i = 0; i < tokens.Count; i++)
+            logits = Forward(tokens[i], startPos + i);
+        return logits;
+    }
+
+    public void TruncateTo(int length)
+    {
+        if (length == _gdnStateCache.Length)
+        {
+            _kvCache.TruncateTo(length);
+            return;
+        }
+        if (length == 0)
+        {
+            ResetCache();
+            return;
+        }
+        throw new NotSupportedException(
+            $"CudaHybridGdnForwardPass.TruncateTo({length}): GDN state is destructively " +
+            $"updated and cannot be partially rewound; only length == 0 or current ({_gdnStateCache.Length}) is supported.");
+    }
+
+    public void ResetCache()
+    {
+        _kvCache.Reset();
+        _gdnStateCache.Reset();
+    }
+
+    /// <summary>Forward one token through the hybrid CUDA + CPU stack.</summary>
+    public ReadOnlySpan<float> Forward(int token, int position)
+    {
+        // 1. Embedding → _gpuHidden
+        if (_embIsQuantized)
+            _gpu.EmbedLookupQ4K(_gpuEmbedding!, _gpuHidden, token, _embDim);
+        else
+            _gpu.EmbedLookup(_gpuEmbedding!, _gpuHidden, token, _embDim);
+
+        if (_traceLayers) TraceGpuTensor(position, -1, "emb", _gpuHidden, _embDim);
+
+        // 2. Reserve KV cache page (layer-0 invariant; even if layer 0 is GDN).
+        _kvCache.ReserveBlock();
+
+        // 3. Trunk layers
+        for (int layer = 0; layer < _hp.NumLayers; layer++)
+        {
+            // ── Pre-block residual + norm on GPU ────────────────────
+            _gpu.CopyDevice(_gpuResidual, _gpuHidden);
+            _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuAttnNorm[layer], _hp.RmsNormEps);
+
+            bool isAttn = _hp.LayerTypes![layer] == LayerType.Attention;
+            if (isAttn)
+            {
+                GpuAttnBlock(layer, position);
+            }
+            else
+            {
+                CpuGdnBlock(layer, position);
+            }
+
+            // Residual add on GPU
+            _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+
+            if (_traceLayers) TraceGpuTensor(position, layer, isAttn ? "attn-resid" : "gdn-resid", _gpuHidden, _embDim);
+
+            // ── Pre-MoE residual + norm on GPU ──────────────────────
+            _gpu.CopyDevice(_gpuResidual, _gpuHidden);
+            _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuPostAttnNorm[layer], _hp.RmsNormEps);
+
+            GpuMoeFfn(layer);
+
+            // Residual add
+            _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+
+            if (_traceLayers) TraceGpuTensor(position, layer, "moe-resid", _gpuHidden, _embDim);
+        }
+
+        // 4. Advance position counters
+        _kvCache.IncrementPosition();
+        _gdnStateCache.IncrementPosition();
+
+        // 5. Final norm + output projection on GPU
+        _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuOutputNorm!, _hp.RmsNormEps);
+        _gpu.MatMul(_gpuLogits, _gpuOutputWeight!, _gpuHidden,
+            _gpuWeightDTypes.TryGetValue(_gpuOutputWeight!.Handle, out var outDt) ? outDt : DType.Float32);
+
+        // 6. Download logits to host
+        _gpu.Synchronize();
+        _gpu.Download(_gpuLogits, _logitsBuf);
+
+        if (_traceLayers) TraceLogits(position, _logitsBuf);
+
+        return _logitsBuf;
+    }
+
+    // =================================================================
+    //  GPU attention block — GLU-gated Q, partial NEOX RoPE on first 64 dims
+    // =================================================================
+
+    private void GpuAttnBlock(int layer, int position)
+    {
+        int qDim = _numHeads * _headDim;
+        int kvDim = _numKvHeads * _headDim;
+        int twoHd = _headDim * 2;
+
+        // 1. Project: attn_q → [Q‖G] interleaved per head (output qDim*2 = 8192).
+        GpuMatMul(_gpuQGate, _gpuWQGate[layer], _gpuNormBuf);
+        GpuMatMul(_gpuK, _gpuWK[layer], _gpuNormBuf);
+        GpuMatMul(_gpuV, _gpuWV[layer], _gpuNormBuf);
+        _gpu.Synchronize();
+
+        // 2. De-interleave Q/G + per-head norm + partial NEOX RoPE.
+        //
+        // TODO(Phase6c): write a CUDA kernel for de-interleave + partial NEOX RoPE.
+        //   For v1 we download qGate + k, do the work on CPU, and upload back.
+        //   Per-token transfer: qDim*2 + kvDim = 8192 + 512 = 8.7 KiB down, qDim + kvDim = 4.5 KiB up.
+        //   At PCIe 4.0 ×16 (30 GB/s) this is ~0.5 µs round-trip — negligible vs MoE.
+        _gpu.Download(_gpuQGate, new Span<float>(_hostQGate, qDim * 2));
+        _gpu.Download(_gpuK, new Span<float>(_hostK, kvDim));
+
+        // 2a. De-interleave on CPU.
+        for (int h = 0; h < _numHeads; h++)
+        {
+            float* src = _hostQGate + h * twoHd;
+            float* dstQ = _hostQ + h * _headDim;
+            float* dstG = _hostGate + h * _headDim;
+            new ReadOnlySpan<float>(src, _headDim).CopyTo(new Span<float>(dstQ, _headDim));
+            new ReadOnlySpan<float>(src + _headDim, _headDim).CopyTo(new Span<float>(dstG, _headDim));
+        }
+
+        // 2b. Upload gate to GPU (kept for the sigmoid-multiply later).
+        _gpu.UploadInto(_gpuGate, new ReadOnlySpan<float>(_hostGate, qDim));
+        // 2c. Q and K back to host for the partial-RoPE step (need per-head norm first).
+        //     We'll do norm+RoPE on host then upload _gpuQ.
+        //     (Doing per-head norm on host is cheap; CudaBackend.HeadNorm has a per-head
+        //     RMSNorm but the convention there is per-head learned gain of size headDim
+        //     which matches exactly — could move to GPU later. v1: CPU.)
+        // TODO(Phase6c): use _gpu.HeadNorm for Q/K (matches Qwen3 convention) and write
+        //   a partial-RoPE NVRTC kernel. For v1 we do both on CPU and re-upload.
+        PerHeadRmsNorm(_hostQ, _qNormBufFor(layer), _numHeads, _headDim, _hp.RmsNormEps);
+        PerHeadRmsNorm(_hostK, _kNormBufFor(layer), _numKvHeads, _headDim, _hp.RmsNormEps);
+
+        float* cos = _ropeCosTable + (long)position * _ropeHalfDim;
+        float* sin = _ropeSinTable + (long)position * _ropeHalfDim;
+        SimdKernels.ApplyRoPECachedNeoxPartial(_hostQ, cos, sin, _numHeads, _headDim, _ropeDim);
+        SimdKernels.ApplyRoPECachedNeoxPartial(_hostK, cos, sin, _numKvHeads, _headDim, _ropeDim);
+
+        // 3. Upload Q and K to GPU.
+        _gpu.UploadInto(_gpuQ, new ReadOnlySpan<float>(_hostQ, qDim));
+        _gpu.UploadInto(_gpuK, new ReadOnlySpan<float>(_hostK, kvDim));
+
+        // 4. Append K/V to GPU cache (position-indexed flat layout).
+        _gpu.KvAppend(_gpuK, _gpuV, _gpuKCache[layer]!, _gpuVCache[layer]!,
+            kvDim, position, _maxSeqLen);
+
+        // 5. Scaled dot-product attention.
+        _gpu.Attention(_gpuQ, _gpuKCache[layer]!, _gpuVCache[layer]!, _gpuAttnOut,
+            _gpuAttnScratch,
+            _numHeads, _numKvHeads, _headDim,
+            (position + 1), _maxSeqLen);
+
+        // 6. Apply GLU gate: attn_out *= sigmoid(gate).
+        //    CudaBackend has Sigmoid but no fused sigmoid-multiply, so:
+        //      Sigmoid(gate) in place, then ElementwiseMul(attn_out, attn_out, gate).
+        //    CudaBackend.ElementwiseMul is NOT implemented. SiLuMul is fused but uses SiLU.
+        //
+        // TODO(Phase6c): add a SigmoidMulInPlace NVRTC kernel ( ~5 lines of GLSL-equivalent ).
+        //   For v1: do the sigmoid-multiply on CPU after a quick download/upload.
+        _gpu.Synchronize();
+        _gpu.Download(_gpuAttnOut, new Span<float>(_hostQ, qDim));     // reuse _hostQ as scratch for attn_out
+        _gpu.Download(_gpuGate, new Span<float>(_hostGate, qDim));
+        for (int i = 0; i < qDim; i++)
+        {
+            float g = _hostGate[i];
+            float sig = 1.0f / (1.0f + MathF.Exp(-g));
+            _hostQ[i] *= sig;
+        }
+        _gpu.UploadInto(_gpuAttnOut, new ReadOnlySpan<float>(_hostQ, qDim));
+
+        // 7. Output projection.
+        GpuMatMul(_gpuHidden, _gpuWO[layer], _gpuAttnOut);
+    }
+
+    // Q/K per-head norm weights live on GPU; we need them on CPU for the v1
+    // partial-RoPE workaround. Cache the F32 copies we already have at upload time
+    // (read once via the GGUF mmap; small — headDim = 256 floats per layer per direction).
+    private readonly Dictionary<int, IntPtr> _qNormHost = new();
+    private readonly Dictionary<int, IntPtr> _kNormHost = new();
+
+    private float* _qNormBufFor(int layer)
+    {
+        if (!_qNormHost.TryGetValue(layer, out var ptr))
+        {
+            ptr = (IntPtr)LoadF32Tensor($"blk.{layer}.attn_q_norm.weight", _headDim);
+            _qNormHost[layer] = ptr;
+        }
+        return (float*)ptr;
+    }
+
+    private float* _kNormBufFor(int layer)
+    {
+        if (!_kNormHost.TryGetValue(layer, out var ptr))
+        {
+            ptr = (IntPtr)LoadF32Tensor($"blk.{layer}.attn_k_norm.weight", _headDim);
+            _kNormHost[layer] = ptr;
+        }
+        return (float*)ptr;
+    }
+
+    // =================================================================
+    //  CPU GDN block — mirror of HybridGdnForwardPass.GdnBlock
+    // =================================================================
+
+    private void CpuGdnBlock(int layer, int position)
+    {
+        // Download _gpuNormBuf → _cpuNormBuf so the CPU GDN kernels can consume it.
+        _gpu.Synchronize();
+        _gpu.Download(_gpuNormBuf, new Span<float>(_cpuNormBuf, _embDim));
+
+        int gdnIdx = _gdnStateCache.GdnLayerOf(layer);
+        float* scanState = _gdnStateCache.ScanStateAt(gdnIdx);
+        float* convState = _gdnStateCache.ConvStateAt(gdnIdx);
+        int convStateLen = _gdnStateCache.ConvStateFloatsPerLayer;
+        int scanStateLen = _gdnStateCache.ScanStateFloatsPerLayer;
+
+        // 1. Joint QKV projection and z (gate) projection — CPU via SimdKernels.
+        SimdKernels.MatVec(_qkv, _cpuWQkv[layer].DataPtr, _cpuNormBuf,
+            _gdnConvChannels, _embDim, _cpuWQkv[layer].DType);
+        SimdKernels.MatVec(_zVec, _cpuWZGate[layer].DataPtr, _cpuNormBuf,
+            _gdnValueDim, _embDim, _cpuWZGate[layer].DType);
+
+        // 2. Depthwise causal conv1d.
+        GdnKernels.CausalDepthwiseConv1dDecode(
+            new ReadOnlySpan<float>(_qkv, _gdnConvChannels),
+            new Span<float>(convState, convStateLen),
+            new ReadOnlySpan<float>(_ssmConv1d[layer], _gdnConvKernel * _gdnConvChannels),
+            new Span<float>(_qkvConv, _gdnConvChannels),
+            _gdnConvChannels, _gdnConvKernel);
+
+        // 3. SiLU on conv output.
+        GdnKernels.SiLu(
+            new Span<float>(_qkvConv, _gdnConvChannels),
+            new ReadOnlySpan<float>(_qkvConv, _gdnConvChannels));
+
+        // 4. Split Q‖K‖V.
+        var qPre = new Span<float>(_qkvConv, _gdnKeyDim);
+        var kPre = new Span<float>(_qkvConv + _gdnKeyDim, _gdnKeyDim);
+        var vV = new ReadOnlySpan<float>(_qkvConv + 2 * _gdnKeyDim, _gdnValueDim);
+
+        // 5. Per-K-head L2 norm.
+        GdnKernels.L2NormPerHead(qPre, _gdnNumKHeads, _gdnHeadDim, eps: 1e-6f);
+        GdnKernels.L2NormPerHead(kPre, _gdnNumKHeads, _gdnHeadDim, eps: 1e-6f);
+
+        // 6. Tile K→V head count.
+        GdnKernels.TileHeads(qPre, new Span<float>(_qVHeads, _gdnNumVHeads * _gdnHeadDim),
+            _gdnNumKHeads, _gdnKvRepeat, _gdnHeadDim);
+        GdnKernels.TileHeads(kPre, new Span<float>(_kVHeads, _gdnNumVHeads * _gdnHeadDim),
+            _gdnNumKHeads, _gdnKvRepeat, _gdnHeadDim);
+
+        // 7. Alpha / Beta per-v-head projections.
+        SimdKernels.MatVec(_alpha, _cpuSsmAlpha[layer].DataPtr, _cpuNormBuf,
+            _gdnNumVHeads, _embDim, _cpuSsmAlpha[layer].DType);
+        SimdKernels.MatVec(_beta, _cpuSsmBeta[layer].DataPtr, _cpuNormBuf,
+            _gdnNumVHeads, _embDim, _cpuSsmBeta[layer].DType);
+
+        // 8. Recurrence: rank-1 state update + per-head RMSNorm + SiLU(z) gate.
+        GdnKernels.GdnRecurrenceDecode(
+            q: new ReadOnlySpan<float>(_qVHeads, _gdnNumVHeads * _gdnHeadDim),
+            k: new ReadOnlySpan<float>(_kVHeads, _gdnNumVHeads * _gdnHeadDim),
+            v: vV,
+            alphaIn: new ReadOnlySpan<float>(_alpha, _gdnNumVHeads),
+            beta: new ReadOnlySpan<float>(_beta, _gdnNumVHeads),
+            ssmA: new ReadOnlySpan<float>(_ssmA[layer], _gdnNumVHeads),
+            dtBias: new ReadOnlySpan<float>(_ssmDtBias[layer], _gdnNumVHeads),
+            normWeight: new ReadOnlySpan<float>(_ssmNormW[layer], _gdnHeadDim),
+            z: new ReadOnlySpan<float>(_zVec, _gdnValueDim),
+            state: new Span<float>(scanState, scanStateLen),
+            output: new Span<float>(_gdnOut, _gdnValueDim),
+            numVHeads: _gdnNumVHeads,
+            headDim: _gdnHeadDim,
+            normEps: 1e-6f);
+
+        // 9. Output projection: ssm_out (input ValueDim, output embDim) → _cpuHiddenOut.
+        SimdKernels.MatVec(_cpuHiddenOut, _cpuSsmOut[layer].DataPtr, _gdnOut,
+            _embDim, _gdnValueDim, _cpuSsmOut[layer].DType);
+
+        // Upload back to GPU.
+        _gpu.UploadInto(_gpuHidden, new ReadOnlySpan<float>(_cpuHiddenOut, _embDim));
+    }
+
+    // =================================================================
+    //  MoE FFN on GPU (router + SLRU experts + shared expert)
+    // =================================================================
+
+    private void GpuMoeFfn(int layer)
+    {
+        // 1. Router on GPU.
+        GpuMatMul(_gpuRouterLogits, _gpuWGateInp[layer], _gpuNormBuf);
+        _gpu.Softmax(_gpuRouterLogits);
+
+        // 2. Download to host and pick top-K (256 → 8).
+        //    Per-layer cost: 1 KB readback + sync — fine.
+        _gpu.Synchronize();
+        _gpu.Download(_gpuRouterLogits, _routerBuf);
+
+        Span<int> selectedExperts = stackalloc int[_numActiveExperts];
+        Span<float> expertWeights = stackalloc float[_numActiveExperts];
+        SelectTopK(_routerBuf, _numActiveExperts, selectedExperts, expertWeights);
+
+        // 3. Shared expert: ffn_down @ (SiLU(gate @ x) * (up @ x))
+        //    then per-token sigmoid-scalar gate via ffn_gate_inp_shexp · x.
+        GpuMatMul(_gpuFfnGate, _gpuWGateShexp[layer], _gpuNormBuf);
+        GpuMatMul(_gpuFfnUp, _gpuWUpShexp[layer], _gpuNormBuf);
+        _gpu.SiLuMul(_gpuFfnGate, _gpuFfnUp);
+        GpuMatMul(_gpuSharedOut, _gpuWDownShexp[layer], _gpuFfnGate);
+
+        // 3a. Compute the shared-expert scalar gate on CPU.
+        //     ffn_gate_inp_shexp is a [embDim] vector → scalar via dot product.
+        //
+        // TODO(Phase6c): add a dot-product + sigmoid + scale-in-place kernel.
+        //   For v1: download _gpuNormBuf and the small weight, compute scalar, scale on GPU.
+        //   Note: _gpuNormBuf is already populated; just need the readback for the dot.
+        _gpu.Synchronize();
+        _gpu.Download(_gpuNormBuf, new Span<float>(_cpuNormReadback, _embDim));
+        _gpu.Download(_gpuWGateInpShexp[layer], new Span<float>(_hostQ, _embDim)); // reuse _hostQ
+        // dot product on CPU.
+        float dot = SimdKernels.DotF32(_hostQ, _cpuNormReadback, _embDim);
+        float shexpScale = 1.0f / (1.0f + MathF.Exp(-dot));
+        _gpu.ScaleInPlace(_gpuSharedOut, shexpScale);
+
+        // 4. Routed experts via SLRU.
+        _gpu.Clear(_gpuHidden);
+        for (int k = 0; k < _numActiveExperts; k++)
+        {
+            int expertIdx = selectedExperts[k];
+            float expertWeight = expertWeights[k];
+            var slot = _expertSlotManager.GetOrLoad(layer, expertIdx);
+
+            GpuMatMul(_gpuFfnGate, slot.Gate, _gpuNormBuf);
+            GpuMatMul(_gpuFfnUp, slot.Up, _gpuNormBuf);
+            _gpu.SiLuMul(_gpuFfnGate, _gpuFfnUp);
+            GpuMatMul(_gpuExpertOut, slot.Down, _gpuFfnGate);
+            _gpu.AddScaledInPlace(_gpuHidden, _gpuExpertOut, expertWeight);
+        }
+
+        // 5. Add shared expert.
+        _gpu.AddInPlace(_gpuHidden, _gpuSharedOut);
+    }
+
+    // =================================================================
+    //  Helpers — MatMul dispatch with dtype awareness
+    // =================================================================
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void GpuMatMul(Tensor output, Tensor matrix, Tensor vector)
+    {
+        _gpu.MatMul(output, matrix, vector,
+            _gpuWeightDTypes.TryGetValue(matrix.Handle, out var dt) ? dt : DType.Float32);
+    }
+
+    private static void SelectTopK(ReadOnlySpan<float> logits, int k,
+        Span<int> indices, Span<float> weights)
+    {
+        for (int ki = 0; ki < k; ki++)
+        {
+            int bestIdx = 0;
+            float bestVal = float.MinValue;
+            for (int i = 0; i < logits.Length; i++)
+            {
+                bool alreadySelected = false;
+                for (int j = 0; j < ki; j++)
+                    if (indices[j] == i) { alreadySelected = true; break; }
+                if (!alreadySelected && logits[i] > bestVal)
+                { bestVal = logits[i]; bestIdx = i; }
+            }
+            indices[ki] = bestIdx;
+            weights[ki] = bestVal;
+        }
+        if (k > 1)
+        {
+            float sum = 0;
+            for (int i = 0; i < k; i++) sum += weights[i];
+            if (sum > 0)
+                for (int i = 0; i < k; i++) weights[i] /= sum;
+        }
+    }
+
+    private static void PerHeadRmsNorm(float* data, float* weight, int numHeads, int headDim, float eps)
+    {
+        for (int h = 0; h < numHeads; h++)
+            SimdKernels.RmsNorm(data + h * headDim, data + h * headDim, weight, headDim, eps);
+    }
+
+    // =================================================================
+    //  Weight loading
+    // =================================================================
+
+    private readonly unsafe struct CpuWeightRef
+    {
+        public readonly string Name;
+        public readonly GgufTensorInfo Info;
+        public readonly DType DType;
+        public readonly byte* DataPtr;
+
+        public CpuWeightRef(string name, GgufTensorInfo info, DType dtype, byte* dataPtr)
+        { Name = name; Info = info; DType = dtype; DataPtr = dataPtr; }
+    }
+
+    private CpuWeightRef ResolveCpuWeight(string name)
+    {
+        var info = _model.FindTensor(name)
+            ?? throw new InvalidOperationException($"Missing tensor: {name}");
+        return new CpuWeightRef(name, info, info.DType, _model.GetTensorDataPtr(info));
+    }
+
+    private Tensor UploadWeight(string name)
+    {
+        var info = _model.FindTensor(name)
+            ?? throw new InvalidOperationException($"Missing tensor: {name}");
+        var data = _model.GetTensorData(info);
+
+        Tensor result;
+        if (info.DType == DType.Float32)
+        {
+            var floats = MemoryMarshal.Cast<byte, float>(data);
+            result = _gpu.Upload(floats, TensorShape.D1(floats.Length));
+            _gpuWeightDTypes[result.Handle] = DType.Float32;
+        }
+        else if (info.DType == DType.Q4_K || info.DType == DType.Q6_K)
+        {
+            // CUDA matvec dispatches on Q4_K / Q6_K via dedicated kernels.
+            result = _gpu.UploadRaw(data, TensorShape.D1(data.Length), info.DType);
+            _gpuWeightDTypes[result.Handle] = info.DType;
+        }
+        else
+        {
+            // Q5_K, Q8_0, etc. — CUDA matvec doesn't dispatch on these. Dequantize to F32.
+            int count = (int)info.ElementCount;
+            var f32 = new float[count];
+            Dequantize.ToFloat32(data, f32, info.DType, count);
+            result = _gpu.Upload(f32, TensorShape.D1(count));
+            _gpuWeightDTypes[result.Handle] = DType.Float32;
+        }
+        return result;
+    }
+
+    private Tensor UploadEmbeddingWeight(string name, out bool isQuantized)
+    {
+        var info = _model.FindTensor(name)
+            ?? throw new InvalidOperationException($"Missing tensor: {name}");
+        var data = _model.GetTensorData(info);
+
+        if (info.DType == DType.Q4_K)
+        {
+            int floatCount = data.Length / 4;
+            var rawFloats = new float[floatCount];
+            data.CopyTo(MemoryMarshal.AsBytes(rawFloats.AsSpan()));
+            var result = _gpu.Upload(rawFloats, TensorShape.D1(floatCount));
+            _gpuWeightDTypes[result.Handle] = DType.Q4_K;
+            isQuantized = true;
+            return result;
+        }
+        int count = (int)info.ElementCount;
+        var f32 = new float[count];
+        if (info.DType == DType.Float32)
+            MemoryMarshal.Cast<byte, float>(data).CopyTo(f32);
+        else
+            Dequantize.ToFloat32(data, f32, info.DType, count);
+        var t = _gpu.Upload(f32, TensorShape.D1(count));
+        _gpuWeightDTypes[t.Handle] = DType.Float32;
+        isQuantized = false;
+        return t;
+    }
+
+    private float* LoadF32Tensor(string name, int expectedCount)
+    {
+        var info = _model.FindTensor(name)
+            ?? throw new InvalidOperationException($"Missing tensor: {name}");
+        int count = (int)info.ElementCount;
+        if (count != expectedCount)
+            throw new InvalidOperationException(
+                $"Tensor {name}: expected {expectedCount} elements, got {count}.");
+        var buf = Alloc(count);
+        var data = _model.GetTensorData(info);
+        if (info.DType == DType.Float32)
+            MemoryMarshal.Cast<byte, float>(data).Slice(0, count).CopyTo(new Span<float>(buf, count));
+        else
+            Dequantize.ToFloat32(data, new Span<float>(buf, count), info.DType, count);
+        return buf;
+    }
+
+    private float* LoadConv1dTransposed(string name, int kernel, int channels)
+    {
+        // GGUF stores conv1d as [channels, kernel] row-major; GdnKernels wants [kernel, channels].
+        var info = _model.FindTensor(name)
+            ?? throw new InvalidOperationException($"Missing tensor: {name}");
+        int expected = kernel * channels;
+        int count = (int)info.ElementCount;
+        if (count != expected)
+            throw new InvalidOperationException(
+                $"Tensor {name}: expected {expected} elements ({kernel}*{channels}), got {count}.");
+        var data = _model.GetTensorData(info);
+        Span<float> src;
+        float[]? tempArr = null;
+        if (info.DType == DType.Float32)
+            src = MemoryMarshal.Cast<byte, float>(data).Slice(0, count).ToArray();
+        else
+        {
+            tempArr = new float[count];
+            Dequantize.ToFloat32(data, tempArr, info.DType, count);
+            src = tempArr;
+        }
+        var buf = Alloc(expected);
+        for (int k = 0; k < kernel; k++)
+            for (int c = 0; c < channels; c++)
+                buf[k * channels + c] = src[c * kernel + k];
+        return buf;
+    }
+
+    private static bool ShouldKeepFixedWeightsOnCpu(GgufTensorInfo embedding, GgufTensorInfo? output)
+    {
+        const long maxStorageBufferBytes = 2L * 1024 * 1024 * 1024 - 1;
+        if (EstimateGpuEmbeddingBytes(embedding) > maxStorageBufferBytes)
+            return true;
+        if (output is not null && EstimateGpuTensorBytes(output.Value) > maxStorageBufferBytes)
+            return true;
+        return false;
+    }
+
+    private static long EstimateGpuTensorBytes(GgufTensorInfo tensor)
+    {
+        if (tensor.DType == DType.Float32 || tensor.DType == DType.Q4_K || tensor.DType == DType.Q6_K)
+            return (tensor.ByteSize + 3) & ~3L;
+        return tensor.ElementCount * sizeof(float);
+    }
+
+    private static long EstimateGpuEmbeddingBytes(GgufTensorInfo tensor)
+    {
+        if (tensor.DType == DType.Q4_K)
+            return (tensor.ByteSize + 3) & ~3L;
+        return tensor.ElementCount * sizeof(float);
+    }
+
+    private long EstimateUploadedVram()
+    {
+        // Sum bytes of every GPU tensor we've allocated so far via the dtype map.
+        // This is an overestimate (Q4_K stays raw bytes) but a fine input to slot sizing.
+        long total = 0;
+        foreach (var (_, _) in _gpuWeightDTypes)
+        {
+            // We don't track byte sizes per handle here; rely on the conservative
+            // 2 GiB reservation in the slot capacity computation instead.
+        }
+        // Use a rough sum based on layer count and known tensor shapes.
+        int L = _hp.NumLayers;
+        // Per layer: norm (8KB) + post_attn_norm (8KB) + router (2KB×256=512KB F32) + shared
+        // expert (~8.4 MiB at Q8_0→F32) + 3 ffn_*_shexp matrices + ffn_gate_inp_shexp (8KB).
+        // Attention layers add ~50 MiB of Q8_0→F32 Q/K/V/O + KV cache (~ ctx × 2 × 512 × 4 B).
+        long perLayer = (long)(_embDim * sizeof(float) * 2) // attn_norm + post_attn_norm
+                     + (long)_numExperts * _embDim * sizeof(float) // ffn_gate_inp F32
+                     + (long)_embDim * sizeof(float) // ffn_gate_inp_shexp F32
+                     + (long)_embDim * _expertDim * sizeof(float) * 3; // shared expert (gate/up/down)
+        total += L * perLayer;
+        // Attention layers contribute Q/K/V/O (F32 expansion of Q8_0).
+        int attnLayers = 0;
+        for (int i = 0; i < L; i++)
+            if (_hp.LayerTypes![i] == LayerType.Attention) attnLayers++;
+        long attnPerLayer = (long)_embDim * _numHeads * _headDim * 2 * sizeof(float)  // q (output qDim*2)
+                          + (long)_embDim * _numKvHeads * _headDim * sizeof(float) * 2 // k + v
+                          + (long)_embDim * _numHeads * _headDim * sizeof(float)      // o
+                          + (long)_maxSeqLen * _numKvHeads * _headDim * sizeof(float) * 2; // kv cache
+        total += attnLayers * attnPerLayer;
+        // Embedding + output.
+        if (_gpuEmbedding is not null)
+            total += (long)_hp.VocabSize * _embDim * sizeof(float);
+        return total;
+    }
+
+    private long EstimatePerExpertBytes()
+    {
+        // Per expert: gate + up + down weight matrices. For qwen35moe Q4_K_M:
+        //   gate/up: [embDim=2048, expertDim=512] each ≈ 588 KiB raw Q4_K
+        //   down:    [expertDim=512, embDim=2048]     ≈ 588 KiB raw Q4_K (or Q5_K → F32 expansion!)
+        // Sum: ~1.81 MiB raw. With Q5_K expanded to F32 we'd hit ~4 MiB; use a safe
+        // upper bound by checking the actual tensor dtypes.
+        long bytes = 0;
+        foreach (var name in new[] { "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight", "blk.0.ffn_down_exps.weight" })
+        {
+            var info = _model.FindTensor(name);
+            if (info is null) continue;
+            // bytesPerExpert in the packed tensor — total bytes / numExperts.
+            long perExpert = info.Value.ByteSize / Math.Max(1, _numExperts);
+            // If the dtype is something CUDA matvec can't handle, the SLRU will
+            // dequantize to F32, increasing footprint. Compute conservative byte
+            // size by assuming F32 when not Q4_K/Q6_K.
+            if (info.Value.DType != DType.Q4_K && info.Value.DType != DType.Q6_K && info.Value.DType != DType.Float32)
+            {
+                int rows = (int)(info.Value.ElementCount / _numExperts);
+                perExpert = (long)rows * sizeof(float);
+            }
+            bytes += perExpert;
+        }
+        return bytes > 0 ? bytes : (long)(1.81 * 1024 * 1024);
+    }
+
+    private static float* Alloc(int count) =>
+        (float*)NativeMemory.AllocZeroed((nuint)count * (nuint)sizeof(float));
+
+    // =================================================================
+    //  Tracing (SHARPI_TRACE_LAYERS=1)
+    // =================================================================
+
+    private void TraceGpuTensor(int position, int layer, string tag, Tensor t, int n)
+    {
+        Span<float> buf = stackalloc float[Math.Min(n, 64)];
+        // Download just enough to compute l2/sum/first8 cheaply.
+        var hostBuf = new float[n];
+        _gpu.Synchronize();
+        _gpu.Download(t, hostBuf);
+        TraceHost(position, layer, tag, hostBuf, n);
+    }
+
+    private static void TraceHost(int position, int layer, string tag, float[] buf, int n)
+    {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        double s = 0, sum = 0;
+        for (int i = 0; i < n; i++) { double v = buf[i]; s += v * v; sum += v; }
+        float l2 = (float)Math.Sqrt(s);
+        var sb = new System.Text.StringBuilder(220);
+        sb.Append("[pos=").Append(position).Append(" L");
+        if (layer < 0) sb.Append("--"); else sb.Append(layer);
+        sb.Append(' ').Append(tag).Append("] l2=")
+          .Append(l2.ToString("G6", inv))
+          .Append(" sum=").Append(((float)sum).ToString("G6", inv))
+          .Append(" first8=[");
+        int k = Math.Min(8, n);
+        for (int i = 0; i < k; i++)
+        {
+            if (i > 0) sb.Append(", ");
+            sb.Append(buf[i].ToString("G6", inv));
+        }
+        sb.Append(']');
+        Console.Error.WriteLine(sb.ToString());
+    }
+
+    private static void TraceLogits(int position, float[] logits)
+    {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        const int K = 5;
+        Span<int> idx = stackalloc int[K];
+        Span<float> val = stackalloc float[K];
+        for (int i = 0; i < K; i++) { idx[i] = -1; val[i] = float.MinValue; }
+        for (int i = 0; i < logits.Length; i++)
+        {
+            float lv = logits[i];
+            for (int j = 0; j < K; j++)
+            {
+                if (lv > val[j])
+                {
+                    for (int s = K - 1; s > j; s--) { val[s] = val[s - 1]; idx[s] = idx[s - 1]; }
+                    val[j] = lv; idx[j] = i;
+                    break;
+                }
+            }
+        }
+        var sb = new System.Text.StringBuilder(160);
+        sb.Append("[pos=").Append(position).Append(" top5]");
+        for (int j = 0; j < K; j++)
+        {
+            sb.Append(' ').Append(idx[j]).Append('@')
+              .Append(val[j].ToString("G6", inv));
+        }
+        Console.Error.WriteLine(sb.ToString());
+    }
+
+    // =================================================================
+    //  Dispose
+    // =================================================================
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        // CPU buffers
+        NativeMemory.Free(_cpuNormBuf);
+        NativeMemory.Free(_cpuHiddenOut);
+        NativeMemory.Free(_qkv);
+        NativeMemory.Free(_qkvConv);
+        NativeMemory.Free(_zVec);
+        NativeMemory.Free(_qVHeads);
+        NativeMemory.Free(_kVHeads);
+        NativeMemory.Free(_alpha);
+        NativeMemory.Free(_beta);
+        NativeMemory.Free(_gdnOut);
+        NativeMemory.Free(_hostQGate);
+        NativeMemory.Free(_hostQ);
+        NativeMemory.Free(_hostGate);
+        NativeMemory.Free(_hostK);
+        NativeMemory.Free(_cpuNormReadback);
+        NativeMemory.Free(_ropeCosTable);
+        NativeMemory.Free(_ropeSinTable);
+
+        int L = _hp.NumLayers;
+        for (int i = 0; i < L; i++)
+        {
+            if (_ssmConv1d[i] != null) NativeMemory.Free(_ssmConv1d[i]);
+            if (_ssmA[i] != null) NativeMemory.Free(_ssmA[i]);
+            if (_ssmDtBias[i] != null) NativeMemory.Free(_ssmDtBias[i]);
+            if (_ssmNormW[i] != null) NativeMemory.Free(_ssmNormW[i]);
+        }
+        foreach (var kv in _qNormHost) NativeMemory.Free((void*)kv.Value);
+        foreach (var kv in _kNormHost) NativeMemory.Free((void*)kv.Value);
+        _qNormHost.Clear();
+        _kNormHost.Clear();
+
+        // GPU scratch
+        _gpu.Free(_gpuHidden);
+        _gpu.Free(_gpuResidual);
+        _gpu.Free(_gpuNormBuf);
+        _gpu.Free(_gpuQGate);
+        _gpu.Free(_gpuQ);
+        _gpu.Free(_gpuGate);
+        _gpu.Free(_gpuK);
+        _gpu.Free(_gpuV);
+        _gpu.Free(_gpuAttnOut);
+        _gpu.Free(_gpuAttnScratch);
+        _gpu.Free(_gpuRouterLogits);
+        _gpu.Free(_gpuFfnGate);
+        _gpu.Free(_gpuFfnUp);
+        _gpu.Free(_gpuExpertOut);
+        _gpu.Free(_gpuSharedOut);
+        _gpu.Free(_gpuLogits);
+        _gpu.Free(_pinnedHidden);
+
+        for (int i = 0; i < L; i++)
+        {
+            _gpu.Free(_gpuAttnNorm[i]);
+            _gpu.Free(_gpuPostAttnNorm[i]);
+            _gpu.Free(_gpuWGateInp[i]);
+            _gpu.Free(_gpuWGateInpShexp[i]);
+            _gpu.Free(_gpuWGateShexp[i]);
+            _gpu.Free(_gpuWUpShexp[i]);
+            _gpu.Free(_gpuWDownShexp[i]);
+            if (_hp.LayerTypes![i] == LayerType.Attention)
+            {
+                _gpu.Free(_gpuWQGate[i]);
+                _gpu.Free(_gpuWK[i]);
+                _gpu.Free(_gpuWV[i]);
+                _gpu.Free(_gpuWO[i]);
+                _gpu.Free(_gpuQNorm[i]);
+                _gpu.Free(_gpuKNorm[i]);
+                if (_gpuKCache[i] is { } kc) _gpu.Free(kc);
+                if (_gpuVCache[i] is { } vc) _gpu.Free(vc);
+            }
+        }
+
+        if (_gpuEmbedding is not null) _gpu.Free(_gpuEmbedding);
+        if (_gpuOutputNorm is not null) _gpu.Free(_gpuOutputNorm);
+        if (_gpuOutputWeight is not null && _gpuOutputWeight.Handle != _gpuEmbedding?.Handle)
+            _gpu.Free(_gpuOutputWeight);
+
+        _expertSlotManager.Dispose();
+        _kvCache.Dispose();
+        _gdnStateCache.Dispose();
+    }
+}
