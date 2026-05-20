@@ -176,14 +176,9 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         using var cpuBackend = new CpuBackend();
 
-        // Hybrid GDN models (qwen35moe) currently only have a CPU forward pass; reject
-        // GPU offload and TurboQuant up front so we don't burn the time to build a
-        // ForwardPass that the dispatch won't use.
-        if (hp.IsHybridSsm && settings.NGpuLayers != 0)
-        {
-            AnsiConsole.MarkupLine("[red]Error:[/] Hybrid GDN+MoE models (qwen35moe) currently run CPU-only. Use [yellow]-g 0[/] (the default).");
-            return 1;
-        }
+        // Hybrid GDN models (qwen35moe) run via the dedicated HybridGdnForwardPass
+        // (CPU) or CudaHybridGdnForwardPass (GPU). Features that touch the per-token
+        // GDN state are not supported because the rank-1 recurrence is destructive.
         if (hp.IsHybridSsm && settings.TurboQuant)
         {
             AnsiConsole.MarkupLine("[red]Error:[/] TurboQuant is not supported for hybrid GDN models (no KV cache on GDN layers).");
@@ -195,15 +190,15 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             return 1;
         }
 
-        // Build the dense/MoE CPU forward pass for non-hybrid models. For hybrid GDN
-        // models we use HybridGdnForwardPass below; the ForwardPass-typed `fwd` stays
-        // null so any code path that depends on it (TurboQuant, speculative decoding)
-        // is unreachable for hybrid.
+        // Build the appropriate CPU forward pass. The GPU branches below construct
+        // their own (CudaHybridGdnForwardPass for hybrid + CUDA; the existing Cuda/
+        // CudaHybrid paths for non-hybrid). For hybrid + GPU we still build the
+        // CPU baseline so the bridge can reuse small helpers, but it stays unused.
         ForwardPass? fwd = null;
         HybridGdnForwardPass? hybridFwd = null;
-        if (hp.IsHybridSsm)
+        if (hp.IsHybridSsm && settings.NGpuLayers == 0)
             hybridFwd = new HybridGdnForwardPass(model, cpuBackend, hp);
-        else
+        else if (!hp.IsHybridSsm)
             fwd = new ForwardPass(model, cpuBackend, hp);
 
         // Create backend-specific forward pass
@@ -299,6 +294,33 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             gpuBackend = cuda;
             try
             {
+                // qwen35moe (hybrid GDN+MoE) takes a dedicated CUDA forward pass that
+                // routes the 30 recurrent blocks to CPU and the 10 attention layers +
+                // MoE FFN to GPU via the CudaExpertSlotManager SLRU. Layer placement is
+                // implicit (driven by hp.LayerTypes), so we skip TierPlanner here.
+                if (hp.IsHybridSsm)
+                {
+                    var hwProfile = HardwareProfile.Detect(cuda);
+                    AnsiConsole.MarkupLine($"[dim]Hardware: {hwProfile.Summary()}[/]");
+                    var placement = new LayerPlacement(
+                        GpuLayers: hp.NumLayers,
+                        CpuLayers: 0,
+                        GpuWeightBytes: 0,
+                        GpuKvBytes: 0,
+                        RecommendedCtxSize: ctxSize > 0 ? ctxSize : Math.Min(hp.ContextLength, 4096));
+                    var chgdn = new CudaHybridGdnForwardPass(model, cuda, hp, placement);
+                    gpuFwd = chgdn;
+                    forward = chgdn.Forward;
+                    prefill = tokens => chgdn.Prefill(tokens);
+                    resetCache = chgdn.ResetCache;
+                    int gdnLayers = 0, attnLayers = 0;
+                    for (int i = 0; i < hp.NumLayers; i++)
+                        if (hp.LayerTypes![i] == LayerType.Attention) attnLayers++; else gdnLayers++;
+                    AnsiConsole.MarkupLine($"[dim]Backend: [green]CUDA hybrid GDN[/] ({cuda.Name}, {gdnLayers} GDN on CPU + {attnLayers} attn + MoE on GPU)[/]");
+                }
+                else
+                {
+
                 // For -g -1 (auto), run TierPlanner against CUDA's VRAM and use the
                 // resulting layer split — same logic as the Vulkan branch. Without this,
                 // a model bigger than VRAM (e.g. Qwen3-Coder 30B-A3B in 12 GB) would
@@ -361,6 +383,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     resetCache = cfwd.ResetCache;
                     AnsiConsole.MarkupLine($"[dim]Backend: [green]CUDA[/] ({cuda.Name}, all {hp.NumLayers} layers)[/]");
                 }
+                } // end !IsHybridSsm
             }
             catch
             {
@@ -373,6 +396,14 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         }
         else
         {
+            // Vulkan path. There is no Vulkan equivalent of CudaHybridGdnForwardPass yet,
+            // so qwen35moe must use --backend cuda or -g 0.
+            if (hp.IsHybridSsm)
+            {
+                AnsiConsole.MarkupLine("[red]Error:[/] Hybrid GDN models (qwen35moe) are not supported on the Vulkan backend yet. Use [yellow]--backend cuda[/] or [yellow]-g 0[/] (CPU).");
+                return 1;
+            }
+
             var gpu = new VulkanBackend();
             gpuBackend = gpu;
             try
