@@ -1001,13 +1001,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         SelectTopKPtr(_cpuRouterLogits, numExperts, numActive, selectedExperts, expertWeights);
 
         // 2. Shared expert: ffn_down @ (SiLU(ffn_gate @ x) * (ffn_up @ x)).
+        //    Gate and up share the same input — fuse into a single Parallel.For.
         var gateShexp = _cpuFfnGateShexp![layer];
         var upShexp = _cpuFfnUpShexp![layer];
         var downShexp = _cpuFfnDownShexp![layer];
-        SimdKernels.MatVec(_cpuExpertGate, gateShexp.DataPtr, _cpuNormBuf,
-            expertDim, _embDim, gateShexp.DType);
-        SimdKernels.MatVec(_cpuExpertUp, upShexp.DataPtr, _cpuNormBuf,
-            expertDim, _embDim, upShexp.DType);
+        SimdKernels.MatVecDual(
+            _cpuExpertGate, gateShexp.DataPtr,
+            _cpuExpertUp,   upShexp.DataPtr,
+            _cpuNormBuf, expertDim, _embDim, gateShexp.DType, upShexp.DType);
         SimdKernels.SiLuMul(_cpuExpertGate, _cpuExpertUp, expertDim);
         SimdKernels.MatVec(_cpuSharedOut, downShexp.DataPtr, _cpuExpertGate,
             _embDim, expertDim, downShexp.DType);
@@ -1027,8 +1028,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             int expertIdx = selectedExperts[k];
             float weight = expertWeights[k];
 
-            ExpertMatVec(_cpuExpertGate, gateExps, expertIdx, expertDim, _embDim, _cpuNormBuf);
-            ExpertMatVec(_cpuExpertUp, upExps, expertIdx, expertDim, _embDim, _cpuNormBuf);
+            ExpertMatVecDual(_cpuExpertGate, gateExps, _cpuExpertUp, upExps,
+                expertIdx, expertDim, _embDim, _cpuNormBuf);
             SimdKernels.SiLuMul(_cpuExpertGate, _cpuExpertUp, expertDim);
             ExpertMatVecDown(_cpuMoeHidden, downExps, expertIdx, _embDim, expertDim,
                 _cpuExpertGate, weight);
@@ -1046,6 +1047,28 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         long expertOffset = (long)expertIdx * rows * bytesPerRow;
         byte* expertData = packedTensor.DataPtr + expertOffset;
         SimdKernels.MatVec(output, expertData, input, rows, cols, packedTensor.DType);
+    }
+
+    /// <summary>
+    /// Routed-expert gate+up fused MatVec. Halves the Parallel.For dispatch cost
+    /// vs two sequential <see cref="ExpertMatVec"/> calls — gate and up share the
+    /// same input vector and can be computed in a single per-row loop.
+    /// </summary>
+    private void ExpertMatVecDual(
+        float* outGate, in CpuWeightRef gateTensor,
+        float* outUp,   in CpuWeightRef upTensor,
+        int expertIdx, int rows, int cols, float* input)
+    {
+        int bprG = (cols / DTypeInfo.BlockSize(gateTensor.DType))
+                 * DTypeInfo.BytesPerBlock(gateTensor.DType);
+        int bprU = (cols / DTypeInfo.BlockSize(upTensor.DType))
+                 * DTypeInfo.BytesPerBlock(upTensor.DType);
+        long offG = (long)expertIdx * rows * bprG;
+        long offU = (long)expertIdx * rows * bprU;
+        SimdKernels.MatVecDual(
+            outGate, gateTensor.DataPtr + offG,
+            outUp,   upTensor.DataPtr   + offU,
+            input, rows, cols, gateTensor.DType, upTensor.DType);
     }
 
     private void ExpertMatVecDown(float* output, in CpuWeightRef packedTensor,
