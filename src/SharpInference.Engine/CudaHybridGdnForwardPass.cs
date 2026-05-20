@@ -218,14 +218,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private static readonly bool _traceLayers =
         Environment.GetEnvironmentVariable("SHARPI_TRACE_LAYERS") == "1";
 
-    // Experimental: move the MoE FFN (routed + shared experts) back to the CPU
-    // while keeping attention on the GPU. SLRU expert thrash dominates per-token
-    // cost on the default GPU path (~87% misses), so routing MoE through CPU
-    // mmap reads can be a net win even with the extra GPU↔CPU round-trip.
-    // See docs/qwen35moe-plan.md Phase 7 part C. Read per-instance (not static)
-    // so the env var can be toggled between constructions during testing.
-    private readonly bool _cpuMoe =
-        Environment.GetEnvironmentVariable("SHARPI_CPU_MOE") == "1";
+    // CPU MoE mode: routes the MoE FFN (routed + shared experts) through CPU
+    // mmap reads instead of GPU SLRU. Auto-enabled when SLRU capacity covers
+    // less than ~half the total experts — at that VRAM ratio the per-token
+    // PCIe upload cost from SLRU misses exceeds the cost of running MoE on CPU.
+    //
+    // SHARPI_CPU_MOE override values:
+    //   "1" — force CPU MoE on; "0" — force GPU SLRU MoE on; unset — auto.
+    // Decided in the constructor after we know SLRU capacity (see _cpuMoe init).
+    private readonly bool _cpuMoe;
 
     // SHARPI_CPU_GDN=1 forces the legacy CPU GDN block path (Phase 7a baseline).
     // Default (unset) is the new full-GPU GDN block (Phase 7e+). Useful for
@@ -400,6 +401,33 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 "CudaHybridGdnForwardPass: embedding/output do not fit on GPU; " +
                 "CPU embedding fallback is not implemented in v1. Reduce ctx size or " +
                 "use HybridGdnForwardPass for CPU-only execution.");
+        }
+
+        // ── Auto-detect CPU-MoE vs GPU SLRU MoE ─────────────────────────
+        // SLRU only pays off when most experts fit in VRAM. Predict the slot
+        // count from the same formula the SLRU itself uses, before uploading
+        // any MoE weights. Threshold: route MoE through CPU when fewer than
+        // ~half of all experts can be cached on the GPU — at that point
+        // per-token miss-driven PCIe uploads cost more than CPU mmap reads.
+        // (Measured at 35 % capacity / 80 % hit rate: GPU SLRU 6.1 t/s,
+        //  CPU MoE 11.8 t/s on Qwen3.6-35B-A3B on a 4070 Ti.)
+        string? cpuMoeOverride = Environment.GetEnvironmentVariable("SHARPI_CPU_MOE");
+        if (cpuMoeOverride == "1")
+        {
+            _cpuMoe = true;
+        }
+        else if (cpuMoeOverride == "0")
+        {
+            _cpuMoe = false;
+        }
+        else
+        {
+            int predictedSlots = PredictSlruSlots(L);
+            int totalExperts = L * _numExperts;
+            double ratio = totalExperts > 0 ? (double)predictedSlots / totalExperts : 1.0;
+            _cpuMoe = ratio < 0.5;
+            Console.Error.WriteLine(
+                $"[CudaHybridGdnForwardPass] MoE auto-select: SLRU capacity ≈ {predictedSlots}/{totalExperts} ({ratio:P0}) → {(_cpuMoe ? "CPU" : "GPU SLRU")} MoE.  Override with SHARPI_CPU_MOE=0|1.");
         }
 
         // ── Per-layer tensor arrays ────────────────────────────────────
@@ -1305,6 +1333,59 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (_gpuEmbedding is not null)
             total += (long)_hp.VocabSize * _embDim * sizeof(float);
         return total;
+    }
+
+    /// <summary>
+    /// Predicts how many SLRU expert slots will fit in VRAM after the non-MoE
+    /// weights (attention, GDN, norms, embeddings) are uploaded. Uses the same
+    /// arithmetic the SLRU itself runs after the per-layer upload loop, just
+    /// hoisted so the auto-MoE-routing decision can be made up front.
+    /// </summary>
+    private int PredictSlruSlots(int numLayers)
+    {
+        long perLayerNonMoeBytes = 0;
+        // norms
+        perLayerNonMoeBytes += 2L * _embDim * sizeof(float);
+        // shared-expert weights stay on GPU regardless of routing
+        perLayerNonMoeBytes += (long)_numExperts * _embDim * sizeof(float);   // router
+        perLayerNonMoeBytes += (long)_embDim * sizeof(float);                  // shexp gate inp
+        perLayerNonMoeBytes += 3L * _embDim * _expertDim * sizeof(float);      // shared gate/up/down (Q8_0 → F32 in current path)
+
+        long attnPerLayer =
+              (long)_embDim * _numHeads * _headDim * 2 * sizeof(float)         // q (output qDim*2)
+            + (long)_embDim * _numKvHeads * _headDim * sizeof(float) * 2       // k + v
+            + (long)_embDim * _numHeads * _headDim * sizeof(float)             // o
+            + (long)_maxSeqLen * _numKvHeads * _headDim * sizeof(float) * 2;   // kv cache
+
+        long gdnPerLayer = 0;
+        if (!_cpuGdn)
+        {
+            // raw Q4_K bytes (CUDA matvec keeps these quantized)
+            gdnPerLayer += (long)_gdnConvChannels * _embDim / 256 * 144;  // attn_qkv Q4_K
+            gdnPerLayer += (long)_gdnValueDim * _embDim / 256 * 144;      // attn_gate Q4_K
+            gdnPerLayer += (long)_embDim * _gdnValueDim / 256 * 144;      // ssm_out Q4_K
+            gdnPerLayer += (long)_gdnNumVHeads * _embDim * sizeof(float); // ssm_alpha F32
+            gdnPerLayer += (long)_gdnNumVHeads * _embDim * sizeof(float); // ssm_beta F32
+            gdnPerLayer += (long)_gdnConvKernel * _gdnConvChannels * sizeof(float);  // conv1d
+            gdnPerLayer += (long)_gdnNumVHeads * _gdnHeadDim * _gdnHeadDim * sizeof(float); // scan state
+            gdnPerLayer += (long)(_gdnConvKernel - 1) * _gdnConvChannels * sizeof(float);   // conv state
+        }
+
+        int attnLayers = 0;
+        for (int i = 0; i < numLayers; i++)
+            if (_hp.LayerTypes![i] == LayerType.Attention) attnLayers++;
+        int gdnLayers = numLayers - attnLayers;
+
+        long total = numLayers * perLayerNonMoeBytes
+                   + (long)attnLayers * attnPerLayer
+                   + (long)gdnLayers * gdnPerLayer
+                   + (long)_hp.VocabSize * _embDim * sizeof(float);    // embedding/output
+
+        long vramTotal = (long)_gpu.VramBytes;
+        long remaining = vramTotal - total - (2L << 30);
+        long perExpert = EstimatePerExpertBytes();
+        if (perExpert <= 0) return 1024;
+        return (int)Math.Max(64, remaining / perExpert);
     }
 
     private long EstimatePerExpertBytes()
