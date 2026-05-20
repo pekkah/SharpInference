@@ -1370,5 +1370,215 @@ extern ""C"" __global__ void llm_attention(
         out[out_off + d] = acc;
     }
 }
+
+// ── Element-wise SiLU in place ─────────────────────────────────────────────
+// x[i] = x[i] / (1 + exp(-x[i])).  One thread per element.
+extern ""C"" __global__ void llm_silu_inplace(float* __restrict__ x, int n)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) return;
+    float v = x[i];
+    x[i] = v / (1.0f + __expf(-v));
+}
+
+// ── GDN: causal depthwise conv1d decode (single token) ─────────────────────
+// state layout: [(K-1), C] row-major, oldest first.
+// Operation:
+//   output[c] = weight[K-1,c]*x[c] + Σ_{k=0..K-2} weight[k,c]*state[k,c]
+//   shift state: state[0..K-3] = state[1..K-2]; state[K-2] = x[c]
+// One thread per channel. Kernel size K ≤ 4 in current models.
+extern ""C"" __global__ void llm_gdn_conv1d_decode(
+    const float* __restrict__ x,
+    float* __restrict__ state,
+    const float* __restrict__ weight,
+    float* __restrict__ output,
+    int channels, int kernel_size)
+{
+    int c = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (c >= channels) return;
+
+    int retained = kernel_size - 1;
+
+    // Read old state values into registers (small: ≤3 for our models).
+    float s_old[4];   // sized for K up to 5
+    #pragma unroll 4
+    for (int k = 0; k < retained; k++)
+        s_old[k] = state[(long)k * channels + c];
+
+    float x_c = x[c];
+    float sum = weight[(long)retained * channels + c] * x_c;
+    #pragma unroll 4
+    for (int k = 0; k < retained; k++)
+        sum += weight[(long)k * channels + c] * s_old[k];
+    output[c] = sum;
+
+    // Shift state forward in time (drop oldest, append x).
+    #pragma unroll 4
+    for (int k = 0; k < retained - 1; k++)
+        state[(long)k * channels + c] = s_old[k + 1];
+    if (retained >= 1)
+        state[(long)(retained - 1) * channels + c] = x_c;
+}
+
+// ── GDN: L2-norm per head (no learned weights) ─────────────────────────────
+// Matches GdnKernels.L2NormPerHead: scale = 1 / max(sqrt(Σ x²), eps).
+// Differs from llm_head_norm_pure (which divides by sqrt(mean+eps)).
+// One block per head; 256 threads.
+extern ""C"" __global__ void llm_gdn_l2_norm_per_head(
+    float* __restrict__ data,
+    int head_dim, int num_heads, float eps)
+{
+    __shared__ float sdata[256];
+    unsigned int tid = threadIdx.x;
+    unsigned int head = blockIdx.x;
+    if ((int)head >= num_heads) return;
+
+    int base_off = (int)head * head_dim;
+
+    float sum = 0.f;
+    for (int i = (int)tid; i < head_dim; i += 256) {
+        float v = data[base_off + i];
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    float norm = sqrtf(sdata[0]);
+    float divisor = norm > eps ? norm : eps;
+    float inv_div = 1.0f / divisor;
+    for (int i = (int)tid; i < head_dim; i += 256)
+        data[base_off + i] *= inv_div;
+}
+
+// ── GDN: tile heads (GQA-style broadcast) ──────────────────────────────────
+// Tile pattern: dst[h_dst, j] = src[h_dst % src_heads, j] for h_dst ∈ [0, src_heads*repeat).
+// Matches GdnKernels.TileHeads exactly (NOT torch repeat_interleave).
+extern ""C"" __global__ void llm_gdn_tile_heads(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int src_heads, int repeat, int head_dim)
+{
+    int dst_total = src_heads * repeat * head_dim;
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= dst_total) return;
+    int j = idx % head_dim;
+    int h_dst = idx / head_dim;
+    int h_src = h_dst % src_heads;
+    dst[idx] = src[(long)h_src * head_dim + j];
+}
+
+// ── GDN: recurrence decode (single token) ──────────────────────────────────
+// Implements one autoregressive step of Gated DeltaNet. Mirrors the CPU
+// reference GdnKernels.GdnRecurrenceDecode line-for-line:
+//   1. decay  = exp(softplus(alphaIn[h] + dtBias[h]) · ssmA[h])
+//   2. b      = sigmoid(beta[h])
+//   3. S     *= decay                                              (pass A)
+//   4. p[j]   = Σ_i k[i] · S[i,j]                                  (pass A, fused)
+//   5. d[j]   = b · (v[j] − p[j])
+//   6. S[i,j] += k[i] · d[j]                                       (pass B)
+//   7. o[j]   = (1/√d) · Σ_i q[i] · S[i,j]                         (pass B, fused)
+//   8. o     = RMSNorm(o) · normWeight                              (with eps floor)
+//   9. o    *= SiLU(z)
+//
+// Layout:
+//   • One thread block per v-head h ∈ [0, hv).
+//   • blockDim.x = head_dim (one thread per output column j).
+//   • Shared memory: 8 × head_dim floats (≈4 KiB for d=128).
+//   • State stored row-major: S[h*d*d + i*d + j]; coalesced over j.
+extern ""C"" __global__ void llm_gdn_recurrence_decode(
+    float* __restrict__ state,
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ alpha_in,
+    const float* __restrict__ beta,
+    const float* __restrict__ ssm_a,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ norm_weight,
+    const float* __restrict__ z,
+    float* __restrict__ output,
+    int hv, int d, float norm_eps)
+{
+    int h = (int)blockIdx.x;
+    int j = (int)threadIdx.x;
+    if (h >= hv || j >= d) return;
+
+    extern __shared__ float smem[];
+    float* sK     = smem;
+    float* sQ     = sK + d;
+    float* sV     = sQ + d;
+    float* sZ     = sV + d;
+    float* sNormW = sZ + d;
+    float* sP     = sNormW + d;   // shared p[j]
+    float* sD     = sP + d;       // shared d[j]
+    float* sRed   = sD + d;       // RMSNorm reduction scratch
+
+    // Load per-head Q, K, V, Z and per-dim norm weight into shared memory.
+    long hd_off = (long)h * d;
+    sK[j]     = k[hd_off + j];
+    sQ[j]     = q[hd_off + j];
+    sV[j]     = v[hd_off + j];
+    sZ[j]     = z[hd_off + j];
+    sNormW[j] = norm_weight[j];
+    __syncthreads();
+
+    // Per-head scalar gates.
+    float alpha_x = alpha_in[h] + dt_bias[h];
+    float dt      = alpha_x >= 20.0f ? alpha_x : __logf(1.0f + __expf(alpha_x));
+    float decay   = __expf(dt * ssm_a[h]);
+    float b_sc    = 1.0f / (1.0f + __expf(-beta[h]));
+
+    long state_base = (long)h * (long)d * (long)d;
+
+    // Pass A: decay S, then accumulate p[j] = Σ_i k[i] · S[i,j].
+    float p_local = 0.f;
+    for (int i = 0; i < d; i++) {
+        long off = state_base + (long)i * d + j;
+        float sij = state[off] * decay;
+        state[off] = sij;
+        p_local += sK[i] * sij;
+    }
+    sP[j] = p_local;
+    __syncthreads();
+
+    // Compute d[j].
+    float d_j = b_sc * (sV[j] - sP[j]);
+    sD[j] = d_j;
+    __syncthreads();
+
+    // Pass B: rank-1 update S[i,j] += k[i] · d[j], fused with readout o[j].
+    float o_local = 0.f;
+    for (int i = 0; i < d; i++) {
+        long off = state_base + (long)i * d + j;
+        float sij = state[off] + sK[i] * d_j;
+        state[off] = sij;
+        o_local += sQ[i] * sij;
+    }
+
+    // Scale by 1/sqrt(d).
+    o_local *= rsqrtf((float)d);
+
+    // RMSNorm: scale = rsqrt(sumSq/d + eps), then o = o * scale * normWeight.
+    sRed[j] = o_local * o_local;
+    __syncthreads();
+    for (int s = d / 2; s > 0; s >>= 1) {
+        if (j < s) sRed[j] += sRed[j + s];
+        __syncthreads();
+    }
+    float scale = rsqrtf(sRed[0] / (float)d + norm_eps);
+
+    float o_normed = o_local * scale * sNormW[j];
+
+    // SiLU(z) gate.
+    float zv = sZ[j];
+    float silu = zv / (1.0f + __expf(-zv));
+
+    output[hd_off + j] = o_normed * silu;
+}
 ";
 }

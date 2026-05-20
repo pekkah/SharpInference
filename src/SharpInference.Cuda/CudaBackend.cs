@@ -89,6 +89,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _tqKvAppendKernel;
     private nint   _tqAttentionKernel;
 
+    // qwen35moe Gated-DeltaNet (GDN) kernels.
+    private nint   _siluInplaceKernel;
+    private nint   _gdnConv1dDecodeKernel;
+    private nint   _gdnL2NormPerHeadKernel;
+    private nint   _gdnTileHeadsKernel;
+    private nint   _gdnRecurrenceDecodeKernel;
+
     // Persistent Q8_1 scratch for the Q4_K matvec input. Grows on demand and
     // never shrinks. Sized in 36-byte sub-blocks (one block_q8_1 per 32 elements).
     private nint   _q81Buf;
@@ -1286,6 +1293,159 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(clear) failed: {r}");
     }
 
+    /// <summary>Zero a sub-region of a tensor starting at <paramref name="elementOffset"/>
+    /// for <paramref name="elementCount"/> FP32 elements.</summary>
+    public void ClearRegion(Tensor dst, long elementOffset, int elementCount)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        nint dP = GetDevPtr(dst) + (nint)(elementOffset * sizeof(float));
+        int  pN = elementCount;
+        nint* args = stackalloc nint[2] { (nint)(&dP), (nint)(&pN) };
+        uint grid = (uint)((elementCount + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_clearF32Kernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(clear region) failed: {r}");
+    }
+
+    /// <summary>In-place SiLU activation: x[i] = x[i] / (1 + exp(-x[i])). One thread per element.</summary>
+    public void SiLUInPlace(Tensor x)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        int n = (int)x.ElementCount;
+        nint xP = GetDevPtr(x);
+        int  pN = n;
+        nint* args = stackalloc nint[2] { (nint)(&xP), (nint)(&pN) };
+        uint grid = (uint)((n + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_siluInplaceKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(silu_inplace) failed: {r}");
+    }
+
+    /// <summary>
+    /// GDN depthwise causal conv1d for a single decode token. State layout
+    /// <c>[(kernel-1), channels]</c> row-major, oldest first; updated in place.
+    /// Weight layout <c>[kernel, channels]</c>.
+    /// </summary>
+    public void GdnConv1dDecode(Tensor x, Tensor state, Tensor weight, Tensor output,
+                                int channels, int kernelSize)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint xP = GetDevPtr(x);
+        nint sP = GetDevPtr(state);
+        nint wP = GetDevPtr(weight);
+        nint oP = GetDevPtr(output);
+        int  pC = channels, pK = kernelSize;
+        nint* args = stackalloc nint[6]
+        {
+            (nint)(&xP), (nint)(&sP), (nint)(&wP), (nint)(&oP),
+            (nint)(&pC), (nint)(&pK)
+        };
+        uint grid = (uint)((channels + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_gdnConv1dDecodeKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_conv1d_decode) failed: {r}");
+    }
+
+    /// <summary>
+    /// L2 normalize each <paramref name="headDim"/>-sized slice independently
+    /// (no learned weights). Matches <c>GdnKernels.L2NormPerHead</c>:
+    /// <c>scale = 1 / max(sqrt(Σ x²), eps)</c>. Operates on the sub-region of
+    /// <paramref name="data"/> starting at <paramref name="elementOffset"/>
+    /// for <paramref name="numHeads"/> × <paramref name="headDim"/> floats.
+    /// </summary>
+    public void GdnL2NormPerHead(Tensor data, long elementOffset, int numHeads, int headDim, float eps = 1e-6f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint dP = GetDevPtr(data) + (nint)(elementOffset * sizeof(float));
+        int  pHD = headDim, pNH = numHeads;
+        float pE = eps;
+        nint* args = stackalloc nint[4]
+        {
+            (nint)(&dP),
+            (nint)(&pHD), (nint)(&pNH), (nint)(&pE)
+        };
+        int r = NvrtcInterop.LaunchKernel(_gdnL2NormPerHeadKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_l2_norm) failed: {r}");
+    }
+
+    /// <summary>
+    /// Tile pattern: dst[h_dst, j] = src[h_dst % srcHeads, j] for h_dst ∈ [0, srcHeads·repeat).
+    /// Matches <c>GdnKernels.TileHeads</c> (GQA-style broadcast, NOT torch repeat_interleave).
+    /// <paramref name="srcOffset"/> and <paramref name="dstOffset"/> are FP32 element offsets.
+    /// </summary>
+    public void GdnTileHeads(Tensor src, long srcOffset, Tensor dst, long dstOffset,
+                             int srcHeads, int repeat, int headDim)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint sP = GetDevPtr(src) + (nint)(srcOffset * sizeof(float));
+        nint dP = GetDevPtr(dst) + (nint)(dstOffset * sizeof(float));
+        int  pSH = srcHeads, pR = repeat, pHD = headDim;
+        nint* args = stackalloc nint[5]
+        {
+            (nint)(&sP), (nint)(&dP),
+            (nint)(&pSH), (nint)(&pR), (nint)(&pHD)
+        };
+        int total = srcHeads * repeat * headDim;
+        uint grid = (uint)((total + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_gdnTileHeadsKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_tile_heads) failed: {r}");
+    }
+
+    /// <summary>
+    /// Single-token Gated DeltaNet recurrence. Updates per-head state matrices in
+    /// place and writes per-head post-norm, post-gate output. Mirrors
+    /// <c>GdnKernels.GdnRecurrenceDecode</c>.
+    /// State layout: <c>[numVHeads, headDim, headDim]</c> row-major (i = key axis,
+    /// j = value/output axis).
+    /// </summary>
+    public void GdnRecurrenceDecode(
+        Tensor state, Tensor q, Tensor k, Tensor v,
+        Tensor alphaIn, Tensor beta, Tensor ssmA, Tensor dtBias,
+        Tensor normWeight, Tensor z, Tensor output,
+        int numVHeads, int headDim, float normEps = 1e-6f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint sP = GetDevPtr(state);
+        nint qP = GetDevPtr(q);
+        nint kP = GetDevPtr(k);
+        nint vP = GetDevPtr(v);
+        nint aP = GetDevPtr(alphaIn);
+        nint bP = GetDevPtr(beta);
+        nint aaP = GetDevPtr(ssmA);
+        nint dbP = GetDevPtr(dtBias);
+        nint nwP = GetDevPtr(normWeight);
+        nint zP = GetDevPtr(z);
+        nint oP = GetDevPtr(output);
+        int  pHV = numVHeads, pD = headDim;
+        float pE = normEps;
+        nint* args = stackalloc nint[14]
+        {
+            (nint)(&sP), (nint)(&qP), (nint)(&kP), (nint)(&vP),
+            (nint)(&aP), (nint)(&bP), (nint)(&aaP), (nint)(&dbP),
+            (nint)(&nwP), (nint)(&zP), (nint)(&oP),
+            (nint)(&pHV), (nint)(&pD), (nint)(&pE)
+        };
+        // Shared memory: 8 × headDim × 4 bytes (sK, sQ, sV, sZ, sNormW, sP, sD, sRed).
+        uint sharedBytes = (uint)(8 * headDim * sizeof(float));
+        int r = NvrtcInterop.LaunchKernel(_gdnRecurrenceDecodeKernel,
+            (uint)numVHeads, 1, 1, (uint)headDim, 1, 1, sharedBytes, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_recurrence_decode) failed: {r}");
+    }
+
     public void FullSeqAttention(Tensor output, Tensor q, Tensor k, Tensor v,
                                  int nTok, int nHeads, int headDim, float scale) =>
         throw new NotSupportedException("CudaBackend.FullSeqAttention is not implemented (LLM path uses single-token Attention).");
@@ -1523,6 +1683,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _matvecF32Kernel, _matvecQ4KKernel, _matvecQ5KKernel, _matvecQ6KKernel,
             _attentionKernel, _clearF32Kernel, _quantizeQ81Kernel,
             _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
+            _siluInplaceKernel, _gdnConv1dDecodeKernel, _gdnL2NormPerHeadKernel,
+            _gdnTileHeadsKernel, _gdnRecurrenceDecodeKernel,
         ];
         foreach (nint k in kernels)
         {
@@ -1573,6 +1735,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _tqRotateQueryKernel = GetKernelFunc("llm_tq_rotate_query");
         _tqKvAppendKernel    = GetKernelFunc("llm_tq_kv_append");
         _tqAttentionKernel   = GetKernelFunc("llm_tq_attention");
+
+        // qwen35moe GDN kernels.
+        _siluInplaceKernel        = GetKernelFunc("llm_silu_inplace");
+        _gdnConv1dDecodeKernel    = GetKernelFunc("llm_gdn_conv1d_decode");
+        _gdnL2NormPerHeadKernel   = GetKernelFunc("llm_gdn_l2_norm_per_head");
+        _gdnTileHeadsKernel       = GetKernelFunc("llm_gdn_tile_heads");
+        _gdnRecurrenceDecodeKernel = GetKernelFunc("llm_gdn_recurrence_decode");
     }
 
     /// <summary>

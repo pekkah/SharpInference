@@ -143,18 +143,47 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private readonly PagedKvCache _kvCache;     // bookkeeping (block table) for attention layers; data lives on GPU
 
     // Per-GDN-layer F32 weights (preloaded once, decode-only)
-    // Tensor refs to GGUF mmap for the larger projections (run via SimdKernels.MatVec)
+    // Tensor refs to GGUF mmap for the larger projections (run via SimdKernels.MatVec).
+    // Used by the CPU GDN block path (SHARPI_CPU_GDN=1).
     private readonly CpuWeightRef[] _cpuWQkv;        // [L] attn_qkv (output 8192)
     private readonly CpuWeightRef[] _cpuWZGate;      // [L] attn_gate (output 4096)
     private readonly CpuWeightRef[] _cpuSsmOut;      // [L] ssm_out (input 4096, output 2048)
     private readonly CpuWeightRef[] _cpuSsmAlpha;    // [L] F32 [embDim, NumVHeads]
     private readonly CpuWeightRef[] _cpuSsmBeta;     // [L] F32 [embDim, NumVHeads]
 
-    // Tiny preloaded F32 weights
+    // Tiny preloaded F32 weights (CPU GDN path).
     private readonly float*[] _ssmConv1d;            // [L][kernel * channels] — transposed [k, c]
     private readonly float*[] _ssmA;                 // [L][NumVHeads]
     private readonly float*[] _ssmDtBias;            // [L][NumVHeads]
     private readonly float*[] _ssmNormW;             // [L][gdnHeadDim]
+
+    // GPU-resident GDN weights (per layer, only populated for GDN-type layers).
+    // The new GPU GDN block path (default) uses these.
+    private readonly Tensor[] _gpuWAttnQkv;          // [L] Q4_K [conv_channels, embDim]
+    private readonly Tensor[] _gpuWAttnGate;         // [L] Q4_K [value_dim, embDim]
+    private readonly Tensor[] _gpuWSsmOut;           // [L] Q4_K [embDim, value_dim]
+    private readonly Tensor[] _gpuWSsmAlpha;         // [L] F32 [num_v_heads, embDim]
+    private readonly Tensor[] _gpuWSsmBeta;          // [L] F32 [num_v_heads, embDim]
+    private readonly Tensor[] _gpuSsmA;              // [L] F32 [num_v_heads]
+    private readonly Tensor[] _gpuSsmDtBias;         // [L] F32 [num_v_heads]
+    private readonly Tensor[] _gpuSsmNormW;          // [L] F32 [head_dim]
+    private readonly Tensor[] _gpuSsmConv1d;         // [L] F32 [kernel, channels] — transposed
+
+    // GPU-resident GDN per-sequence state, indexed by GDN-layer index (0..numGdn-1),
+    // not absolute layer index. Allocated lazily on first Forward call.
+    private readonly Tensor?[] _gpuGdnScanState;     // [numGdn] F32 [num_v_heads, head_dim, head_dim]
+    private readonly Tensor?[] _gpuGdnConvState;     // [numGdn] F32 [kernel-1, conv_channels] oldest-first
+
+    // GPU scratch reused across GDN layers.
+    private readonly Tensor _gpuGdnQkv;              // [conv_channels]
+    private readonly Tensor _gpuGdnQkvConv;          // [conv_channels] post-conv1d + SiLU
+    private readonly Tensor _gpuGdnZVec;             // [value_dim]
+    private readonly Tensor _gpuGdnQHead;            // [value_dim] (tiled to num_v_heads)
+    private readonly Tensor _gpuGdnKHead;            // [value_dim] (tiled to num_v_heads)
+    private readonly Tensor _gpuGdnVHead;            // [value_dim] (V slice copied out of QkvConv)
+    private readonly Tensor _gpuGdnAlpha;            // [num_v_heads]
+    private readonly Tensor _gpuGdnBeta;             // [num_v_heads]
+    private readonly Tensor _gpuGdnOut;              // [value_dim]
 
     // CPU scratch for GDN block
     private readonly float* _cpuNormBuf;       // [embDim]
@@ -197,6 +226,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // so the env var can be toggled between constructions during testing.
     private readonly bool _cpuMoe =
         Environment.GetEnvironmentVariable("SHARPI_CPU_MOE") == "1";
+
+    // SHARPI_CPU_GDN=1 forces the legacy CPU GDN block path (Phase 7a baseline).
+    // Default (unset) is the new full-GPU GDN block (Phase 7e+). Useful for
+    // bisecting parity bugs and confirming the GPU kernels match CPU output.
+    private readonly bool _cpuGdn =
+        Environment.GetEnvironmentVariable("SHARPI_CPU_GDN") == "1";
 
     // ── CPU MoE state (only allocated/populated when _cpuMoe == true) ──
     // Packed MoE weight refs (mmap pointers; routed experts stay quantized on disk).
@@ -297,6 +332,17 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpuLogits = gpu.Allocate(TensorShape.D1(hp.VocabSize));
         _pinnedHidden = gpu.AllocatePinned(TensorShape.D1(_embDim));
 
+        // GDN GPU scratch (per-layer; reused).
+        _gpuGdnQkv     = gpu.Allocate(TensorShape.D1(_gdnConvChannels));
+        _gpuGdnQkvConv = gpu.Allocate(TensorShape.D1(_gdnConvChannels));
+        _gpuGdnZVec    = gpu.Allocate(TensorShape.D1(_gdnValueDim));
+        _gpuGdnQHead   = gpu.Allocate(TensorShape.D1(_gdnNumVHeads * _gdnHeadDim));
+        _gpuGdnKHead   = gpu.Allocate(TensorShape.D1(_gdnNumVHeads * _gdnHeadDim));
+        _gpuGdnVHead   = gpu.Allocate(TensorShape.D1(_gdnValueDim));
+        _gpuGdnAlpha   = gpu.Allocate(TensorShape.D1(_gdnNumVHeads));
+        _gpuGdnBeta    = gpu.Allocate(TensorShape.D1(_gdnNumVHeads));
+        _gpuGdnOut     = gpu.Allocate(TensorShape.D1(_gdnValueDim));
+
         _routerBuf = new float[_numExperts];
         _logitsBuf = new float[hp.VocabSize];
 
@@ -383,6 +429,18 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _ssmDtBias = new float*[L];
         _ssmNormW = new float*[L];
 
+        _gpuWAttnQkv = new Tensor[L];
+        _gpuWAttnGate = new Tensor[L];
+        _gpuWSsmOut = new Tensor[L];
+        _gpuWSsmAlpha = new Tensor[L];
+        _gpuWSsmBeta = new Tensor[L];
+        _gpuSsmA = new Tensor[L];
+        _gpuSsmDtBias = new Tensor[L];
+        _gpuSsmNormW = new Tensor[L];
+        _gpuSsmConv1d = new Tensor[L];
+        _gpuGdnScanState = new Tensor?[L];
+        _gpuGdnConvState = new Tensor?[L];
+
         if (_cpuMoe)
         {
             Console.Error.WriteLine(
@@ -453,18 +511,46 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             }
             else
             {
-                // GDN block — weights stay on CPU.
-                _cpuWQkv[i] = ResolveCpuWeight($"blk.{i}.attn_qkv.weight");
-                _cpuWZGate[i] = ResolveCpuWeight($"blk.{i}.attn_gate.weight");
-                _cpuSsmOut[i] = ResolveCpuWeight($"blk.{i}.ssm_out.weight");
-                _cpuSsmAlpha[i] = ResolveCpuWeight($"blk.{i}.ssm_alpha.weight");
-                _cpuSsmBeta[i] = ResolveCpuWeight($"blk.{i}.ssm_beta.weight");
+                if (_cpuGdn)
+                {
+                    // CPU GDN path (regression / parity validation).
+                    _cpuWQkv[i] = ResolveCpuWeight($"blk.{i}.attn_qkv.weight");
+                    _cpuWZGate[i] = ResolveCpuWeight($"blk.{i}.attn_gate.weight");
+                    _cpuSsmOut[i] = ResolveCpuWeight($"blk.{i}.ssm_out.weight");
+                    _cpuSsmAlpha[i] = ResolveCpuWeight($"blk.{i}.ssm_alpha.weight");
+                    _cpuSsmBeta[i] = ResolveCpuWeight($"blk.{i}.ssm_beta.weight");
 
-                _ssmA[i] = LoadF32Tensor($"blk.{i}.ssm_a", _gdnNumVHeads);
-                _ssmDtBias[i] = LoadF32Tensor($"blk.{i}.ssm_dt.bias", _gdnNumVHeads);
-                _ssmNormW[i] = LoadF32Tensor($"blk.{i}.ssm_norm.weight", _gdnHeadDim);
-                _ssmConv1d[i] = LoadConv1dTransposed($"blk.{i}.ssm_conv1d.weight",
-                    _gdnConvKernel, _gdnConvChannels);
+                    _ssmA[i] = LoadF32Tensor($"blk.{i}.ssm_a", _gdnNumVHeads);
+                    _ssmDtBias[i] = LoadF32Tensor($"blk.{i}.ssm_dt.bias", _gdnNumVHeads);
+                    _ssmNormW[i] = LoadF32Tensor($"blk.{i}.ssm_norm.weight", _gdnHeadDim);
+                    _ssmConv1d[i] = LoadConv1dTransposed($"blk.{i}.ssm_conv1d.weight",
+                        _gdnConvKernel, _gdnConvChannels);
+                }
+                else
+                {
+                    // GPU GDN path (default; Phase 7e).
+                    _gpuWAttnQkv[i]   = UploadWeight($"blk.{i}.attn_qkv.weight");
+                    _gpuWAttnGate[i]  = UploadWeight($"blk.{i}.attn_gate.weight");
+                    _gpuWSsmOut[i]    = UploadWeight($"blk.{i}.ssm_out.weight");
+                    _gpuWSsmAlpha[i]  = UploadWeight($"blk.{i}.ssm_alpha.weight");
+                    _gpuWSsmBeta[i]   = UploadWeight($"blk.{i}.ssm_beta.weight");
+
+                    _gpuSsmA[i]       = UploadWeight($"blk.{i}.ssm_a");
+                    _gpuSsmDtBias[i]  = UploadWeight($"blk.{i}.ssm_dt.bias");
+                    _gpuSsmNormW[i]   = UploadWeight($"blk.{i}.ssm_norm.weight");
+                    _gpuSsmConv1d[i]  = UploadConv1dTransposedToGpu($"blk.{i}.ssm_conv1d.weight",
+                        _gdnConvKernel, _gdnConvChannels);
+
+                    // Allocate per-layer GDN state on GPU (numVHeads × headDim × headDim scan + conv ring).
+                    long scanFloats = (long)_gdnNumVHeads * _gdnHeadDim * _gdnHeadDim;
+                    long convFloats = (long)(_gdnConvKernel - 1) * _gdnConvChannels;
+                    var scan = gpu.Allocate(TensorShape.D1(scanFloats));
+                    var conv = gpu.Allocate(TensorShape.D1(convFloats));
+                    gpu.Clear(scan);
+                    gpu.Clear(conv);
+                    _gpuGdnScanState[i] = scan;
+                    _gpuGdnConvState[i] = conv;
+                }
             }
             if ((i % 4) == 3) Console.Error.Write(".");
         }
@@ -531,6 +617,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     {
         _kvCache.Reset();
         _gdnStateCache.Reset();
+        if (!_cpuGdn)
+        {
+            // Zero GPU-resident scan + conv state for every GDN layer.
+            for (int i = 0; i < _hp.NumLayers; i++)
+            {
+                if (_gpuGdnScanState[i] is { } scan) _gpu.Clear(scan);
+                if (_gpuGdnConvState[i] is { } conv) _gpu.Clear(conv);
+            }
+        }
     }
 
     /// <summary>Forward one token through the hybrid CUDA + CPU stack.</summary>
@@ -559,9 +654,13 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             {
                 GpuAttnBlock(layer, position);
             }
-            else
+            else if (_cpuGdn)
             {
                 CpuGdnBlock(layer, position);
+            }
+            else
+            {
+                GpuGdnBlock(layer, position);
             }
 
             // Residual add on GPU
@@ -730,6 +829,67 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         // Upload back to GPU.
         _gpu.UploadInto(_gpuHidden, new ReadOnlySpan<float>(_cpuHiddenOut, _embDim));
+    }
+
+    // =================================================================
+    //  GPU GDN block — full-GPU mirror of CpuGdnBlock.
+    //  Consumes _gpuNormBuf, writes the block output into _gpuHidden.
+    //  No CPU↔GPU sync inside the block.
+    // =================================================================
+
+    private void GpuGdnBlock(int layer, int position)
+    {
+        var scanState = _gpuGdnScanState[layer]!;
+        var convState = _gpuGdnConvState[layer]!;
+
+        // 1. Joint QKV projection and z (gate) projection.
+        GpuMatMul(_gpuGdnQkv, _gpuWAttnQkv[layer], _gpuNormBuf);
+        GpuMatMul(_gpuGdnZVec, _gpuWAttnGate[layer], _gpuNormBuf);
+
+        // 2. Depthwise causal conv1d (updates convState in place).
+        _gpu.GdnConv1dDecode(_gpuGdnQkv, convState, _gpuSsmConv1d[layer], _gpuGdnQkvConv,
+            _gdnConvChannels, _gdnConvKernel);
+
+        // 3. SiLU on the conv output (whole 8192).
+        _gpu.SiLUInPlace(_gpuGdnQkvConv);
+
+        // 4. L2-norm per K-head on the Q and K slices (each [k_heads=16, head_dim=128]).
+        //    Layout of _gpuGdnQkvConv:
+        //      [0 .. key_dim)            → Q (k_heads × head_dim)
+        //      [key_dim .. 2*key_dim)    → K
+        //      [2*key_dim .. conv_chan)  → V (v_heads × head_dim)
+        _gpu.GdnL2NormPerHead(_gpuGdnQkvConv, 0,
+            _gdnNumKHeads, _gdnHeadDim, eps: 1e-6f);
+        _gpu.GdnL2NormPerHead(_gpuGdnQkvConv, _gdnKeyDim,
+            _gdnNumKHeads, _gdnHeadDim, eps: 1e-6f);
+
+        // 5. Tile K-heads → V-head count (Hk=16, Hv=32, repeat=2).
+        _gpu.GdnTileHeads(_gpuGdnQkvConv, 0, _gpuGdnQHead, 0,
+            _gdnNumKHeads, _gdnKvRepeat, _gdnHeadDim);
+        _gpu.GdnTileHeads(_gpuGdnQkvConv, _gdnKeyDim, _gpuGdnKHead, 0,
+            _gdnNumKHeads, _gdnKvRepeat, _gdnHeadDim);
+
+        // 6. Alpha / Beta per-v-head projections.
+        GpuMatMul(_gpuGdnAlpha, _gpuWSsmAlpha[layer], _gpuNormBuf);
+        GpuMatMul(_gpuGdnBeta,  _gpuWSsmBeta[layer],  _gpuNormBuf);
+
+        // 7. Copy the V slice (final 4096 floats of _gpuGdnQkvConv) into _gpuGdnVHead.
+        //    This is required because the recurrence wrapper takes whole Tensors;
+        //    16 KiB device copy per layer is negligible (~30 µs total over 30 layers).
+        _gpu.CopyDeviceRegion(_gpuGdnVHead, 0,
+            _gpuGdnQkvConv, 2L * _gdnKeyDim * sizeof(float),
+            (long)_gdnValueDim * sizeof(float));
+
+        // 8. Recurrence: rank-1 state update + per-head RMSNorm + SiLU(z) gate (GPU).
+        _gpu.GdnRecurrenceDecode(
+            scanState, _gpuGdnQHead, _gpuGdnKHead, _gpuGdnVHead,
+            _gpuGdnAlpha, _gpuGdnBeta,
+            _gpuSsmA[layer], _gpuSsmDtBias[layer], _gpuSsmNormW[layer],
+            _gpuGdnZVec, _gpuGdnOut,
+            _gdnNumVHeads, _gdnHeadDim, normEps: 1e-6f);
+
+        // 9. Output projection: ssm_out (input value_dim=4096, output emb_dim=2048).
+        GpuMatMul(_gpuHidden, _gpuWSsmOut[layer], _gpuGdnOut);
     }
 
     // =================================================================
@@ -1062,6 +1222,31 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         return buf;
     }
 
+    private Tensor UploadConv1dTransposedToGpu(string name, int kernel, int channels)
+    {
+        var info = _model.FindTensor(name)
+            ?? throw new InvalidOperationException($"Missing tensor: {name}");
+        int expected = kernel * channels;
+        int count = (int)info.ElementCount;
+        if (count != expected)
+            throw new InvalidOperationException(
+                $"Tensor {name}: expected {expected} elements ({kernel}*{channels}), got {count}.");
+        var data = _model.GetTensorData(info);
+        float[] src = new float[count];
+        if (info.DType == DType.Float32)
+            MemoryMarshal.Cast<byte, float>(data).Slice(0, count).CopyTo(src);
+        else
+            Dequantize.ToFloat32(data, src, info.DType, count);
+
+        var transposed = new float[expected];
+        for (int k = 0; k < kernel; k++)
+            for (int c = 0; c < channels; c++)
+                transposed[k * channels + c] = src[c * kernel + k];
+        var tensor = _gpu.Upload(transposed, TensorShape.D1(expected));
+        _gpuWeightDTypes[tensor.Handle] = DType.Float32;
+        return tensor;
+    }
+
     private static bool ShouldKeepFixedWeightsOnCpu(GgufTensorInfo embedding, GgufTensorInfo? output)
     {
         const long maxStorageBufferBytes = 2L * 1024 * 1024 * 1024 - 1;
@@ -1287,6 +1472,16 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpu.Free(_gpuLogits);
         _gpu.Free(_pinnedHidden);
 
+        _gpu.Free(_gpuGdnQkv);
+        _gpu.Free(_gpuGdnQkvConv);
+        _gpu.Free(_gpuGdnZVec);
+        _gpu.Free(_gpuGdnQHead);
+        _gpu.Free(_gpuGdnKHead);
+        _gpu.Free(_gpuGdnVHead);
+        _gpu.Free(_gpuGdnAlpha);
+        _gpu.Free(_gpuGdnBeta);
+        _gpu.Free(_gpuGdnOut);
+
         for (int i = 0; i < L; i++)
         {
             _gpu.Free(_gpuAttnNorm[i]);
@@ -1309,6 +1504,20 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 _gpu.Free(_gpuKNorm[i]);
                 if (_gpuKCache[i] is { } kc) _gpu.Free(kc);
                 if (_gpuVCache[i] is { } vc) _gpu.Free(vc);
+            }
+            else if (!_cpuGdn)
+            {
+                _gpu.Free(_gpuWAttnQkv[i]);
+                _gpu.Free(_gpuWAttnGate[i]);
+                _gpu.Free(_gpuWSsmOut[i]);
+                _gpu.Free(_gpuWSsmAlpha[i]);
+                _gpu.Free(_gpuWSsmBeta[i]);
+                _gpu.Free(_gpuSsmA[i]);
+                _gpu.Free(_gpuSsmDtBias[i]);
+                _gpu.Free(_gpuSsmNormW[i]);
+                _gpu.Free(_gpuSsmConv1d[i]);
+                if (_gpuGdnScanState[i] is { } gs) _gpu.Free(gs);
+                if (_gpuGdnConvState[i] is { } gc) _gpu.Free(gc);
             }
         }
 
