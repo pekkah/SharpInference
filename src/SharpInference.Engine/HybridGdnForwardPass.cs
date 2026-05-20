@@ -150,6 +150,15 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     private static readonly bool _traceLayers =
         Environment.GetEnvironmentVariable("SHARPI_TRACE_LAYERS") == "1";
 
+    // Bisection-only env vars: zero out one block type's contribution to localize a bug.
+    // Default off; leaving in for future parity work.
+    private static readonly bool _bypassGdn =
+        Environment.GetEnvironmentVariable("SHARPI_BYPASS_GDN") == "1";
+    private static readonly bool _bypassAttn =
+        Environment.GetEnvironmentVariable("SHARPI_BYPASS_ATTN") == "1";
+    private static readonly bool _bypassMoe =
+        Environment.GetEnvironmentVariable("SHARPI_BYPASS_MOE") == "1";
+
     // Output projection.
     private readonly TensorRef _outputNorm;
     private readonly TensorRef _outputWeight;
@@ -380,10 +389,20 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             SimdKernels.RmsNorm(_normBuf, _hidden, attnNormW, _embDim, _hp.RmsNormEps);
 
             bool isAttn = _hp.LayerTypes![layer] == LayerType.Attention;
-            if (isAttn)
+            bool bypass = isAttn ? _bypassAttn : _bypassGdn;
+            if (bypass)
+            {
+                // Identity-skip the block: zero out _hidden so the residual add yields _residual.
+                new Span<float>(_hidden, _embDim).Clear();
+            }
+            else if (isAttn)
+            {
                 AttnBlock(layer, position);
+            }
             else
+            {
                 GdnBlock(layer);
+            }
 
             // Residual add
             SimdKernels.AddInPlace(_hidden, _residual, _embDim);
@@ -395,7 +414,10 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             var postNormW = GetNormWeight(_postAttnNorm[layer]);
             SimdKernels.RmsNorm(_normBuf, _hidden, postNormW, _embDim, _hp.RmsNormEps);
 
-            MoeFfn(layer);
+            if (_bypassMoe)
+                new Span<float>(_hidden, _embDim).Clear();
+            else
+                MoeFfn(layer);
 
             // Residual add
             SimdKernels.AddInPlace(_hidden, _residual, _embDim);

@@ -816,6 +816,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
     private static string FormatPrompt(string userMessage, string? systemPrompt, bool enableThinking = true)
     {
+        // SHARPI_RAW_PROMPT=1 bypasses the chat template entirely. Used for parity testing
+        // against llama.cpp's --no-conversation mode (raw text completion). Not for normal use.
+        if (Environment.GetEnvironmentVariable("SHARPI_RAW_PROMPT") == "1")
+            return userMessage;
+
         // Use the model's own Jinja2 chat template when available (read from GGUF metadata).
         if (s_jinja != null)
         {
