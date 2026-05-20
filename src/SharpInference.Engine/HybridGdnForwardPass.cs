@@ -144,6 +144,12 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     private readonly float* _ropeCosTable;
     private readonly float* _ropeSinTable;
 
+    // Diagnostic: per-layer activation trace (env: SHARPI_TRACE_LAYERS=1). Emits one line
+    // per block plus embedding/pre-logits + top-5 logits to stderr. Modelled on
+    // SHARPI_TRACE_NORMS in ForwardPass.cs.
+    private static readonly bool _traceLayers =
+        Environment.GetEnvironmentVariable("SHARPI_TRACE_LAYERS") == "1";
+
     // Output projection.
     private readonly TensorRef _outputNorm;
     private readonly TensorRef _outputWeight;
@@ -357,6 +363,8 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         // 1. Embedding lookup
         EmbedToken(token);
 
+        if (_traceLayers) EmitLayerTrace(position, -1, "emb");
+
         // 2. Reserve a KV block slot for this token. Layer 0 is GDN (no KV), so the first
         //    attention layer (index 3) would otherwise hit PagedKvCache's "layer-0-must-be-first"
         //    invariant. ReserveBlock populates the block table for all layers without
@@ -371,13 +379,16 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             var attnNormW = GetNormWeight(_attnNorm[layer]);
             SimdKernels.RmsNorm(_normBuf, _hidden, attnNormW, _embDim, _hp.RmsNormEps);
 
-            if (_hp.LayerTypes![layer] == LayerType.Attention)
+            bool isAttn = _hp.LayerTypes![layer] == LayerType.Attention;
+            if (isAttn)
                 AttnBlock(layer, position);
             else
                 GdnBlock(layer);
 
             // Residual add
             SimdKernels.AddInPlace(_hidden, _residual, _embDim);
+
+            if (_traceLayers) EmitLayerTrace(position, layer, isAttn ? "attn-resid" : "gdn-resid");
 
             // ── Pre-MoE residual + norm ──────────────────────────────
             Copy(_residual, _hidden, _embDim);
@@ -388,6 +399,8 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
 
             // Residual add
             SimdKernels.AddInPlace(_hidden, _residual, _embDim);
+
+            if (_traceLayers) EmitLayerTrace(position, layer, "moe-resid");
         }
 
         // 4. Advance position counters
@@ -397,8 +410,77 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         // 5. Final norm + output projection
         var outNormW = GetNormWeight(_outputNorm);
         SimdKernels.RmsNorm(_hidden, _hidden, outNormW, _embDim, _hp.RmsNormEps);
+
+        if (_traceLayers) EmitLayerTrace(position, _hp.NumLayers, "pre-logits");
+
         FusedMatVec(_logits, _outputWeight, _hidden, _hp.VocabSize, _embDim);
+
+        if (_traceLayers) EmitTopLogits(position);
+
         return new ReadOnlySpan<float>(_logits, _hp.VocabSize);
+    }
+
+    // ============================================================
+    //  Trace helpers (SHARPI_TRACE_LAYERS=1)
+    // ============================================================
+
+    private static float L2NormF(float* x, int n)
+    {
+        double s = 0;
+        for (int i = 0; i < n; i++) { double v = x[i]; s += v * v; }
+        return (float)Math.Sqrt(s);
+    }
+
+    private void EmitLayerTrace(int position, int layer, string blockType)
+    {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        float l2 = L2NormF(_hidden, _embDim);
+        var sb = new System.Text.StringBuilder(160);
+        sb.Append("[pos=").Append(position).Append(" L");
+        if (layer < 0) sb.Append("--"); else sb.Append(layer);
+        sb.Append(' ').Append(blockType).Append("] l2=")
+          .Append(l2.ToString("G6", inv))
+          .Append("  first8=[");
+        int n = Math.Min(8, _embDim);
+        for (int i = 0; i < n; i++)
+        {
+            if (i > 0) sb.Append(", ");
+            sb.Append(_hidden[i].ToString("G6", inv));
+        }
+        sb.Append(']');
+        Console.Error.WriteLine(sb.ToString());
+    }
+
+    private void EmitTopLogits(int position)
+    {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        const int K = 5;
+        Span<int> idx = stackalloc int[K];
+        Span<float> val = stackalloc float[K];
+        for (int i = 0; i < K; i++) { idx[i] = -1; val[i] = float.MinValue; }
+        int V = _hp.VocabSize;
+        for (int i = 0; i < V; i++)
+        {
+            float lv = _logits[i];
+            // Insertion into a small sorted-descending list.
+            for (int j = 0; j < K; j++)
+            {
+                if (lv > val[j])
+                {
+                    for (int s = K - 1; s > j; s--) { val[s] = val[s - 1]; idx[s] = idx[s - 1]; }
+                    val[j] = lv; idx[j] = i;
+                    break;
+                }
+            }
+        }
+        var sb = new System.Text.StringBuilder(160);
+        sb.Append("[pos=").Append(position).Append(" top5]");
+        for (int j = 0; j < K; j++)
+        {
+            sb.Append(' ').Append(idx[j]).Append('@')
+              .Append(val[j].ToString("G6", inv));
+        }
+        Console.Error.WriteLine(sb.ToString());
     }
 
     // ============================================================
