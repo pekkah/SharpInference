@@ -40,7 +40,7 @@ matching chat template).
 | Llama-4 Scout 17B-16E (MoE) | [meta-llama](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct) | 61 GB | CPU | 1.4 | 3.3 | 48 layers, 17B active params; split GGUF (Q4_K_M) |
 | Llama-4 Scout 17B-16E (MoE) | (same) | 61 GB | CUDA `-g -1` (hybrid) | 0.8 | 1.9 | 7 GPU + 41 CPU layers — model dwarfs the 12 GB card, PCIe cost > GPU speedup so CPU-only wins here |
 | Qwen3.6-35B-A3B (GDN+MoE) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | 22 GB | CPU | 4.4 | 7.9 | hybrid GDN/attn, 256 experts / 8 active |
-| Qwen3.6-35B-A3B (GDN+MoE) | (same) | 22 GB | **CUDA** `-g -1` (hybrid) | **7.0** | **12.2** | 10 attn + 30 GDN on GPU; MoE auto-routed to CPU (SLRU fits only 32% of experts at 12 GB) |
+| Qwen3.6-35B-A3B (GDN+MoE) | (same) | 22 GB | **CUDA** `-g -1` (hybrid) | **7.2** | **14.0** | 10 attn + 30 GDN on GPU; MoE auto-routed to CPU (SLRU fits only 32% of experts at 12 GB) |
 
 `--backend auto` (default) picks CUDA when available, sizing the GPU/CPU split from
 VRAM via TierPlanner; falls through to Vulkan only when CUDA isn't present.
