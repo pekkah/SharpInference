@@ -77,6 +77,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _embedLookupQ4KKernel;
     private nint   _matvecF32Kernel;
     private nint   _matvecQ4KKernel;
+    private nint   _matvecQ5KKernel;
     private nint   _matvecQ6KKernel;
     private nint   _attentionKernel;
     private nint   _clearF32Kernel;
@@ -94,8 +95,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nuint  _q81BufSize;
 
     // Tracks dtype per tensor handle so MatMul can dispatch to the right matvec variant
-    // (Q4_K / Q6_K / F32). Norm/bias weights upload as F32; quantized weight bytes get
-    // tagged via UploadRaw.
+    // (Q4_K / Q5_K / Q6_K / F32). Norm/bias weights upload as F32; quantized weight bytes
+    // get tagged via UploadRaw.
     private readonly ConcurrentDictionary<nint, DType> _tensorDTypes = new();
 
     public string Name => $"CUDA GPU (cuBLAS, {_precision})";
@@ -710,9 +711,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
         nint kernel = weightDType switch
         {
+            DType.Q5_K    => _matvecQ5KKernel,
             DType.Q6_K    => _matvecQ6KKernel,
             DType.Float32 => _matvecF32Kernel,
-            _ => throw new NotSupportedException($"CUDA MatMul: weight dtype {weightDType} not supported (expected Q4_K, Q6_K, or Float32)."),
+            _ => throw new NotSupportedException($"CUDA MatMul: weight dtype {weightDType} not supported (expected Q4_K, Q5_K, Q6_K, or Float32)."),
         };
 
         uint grid = (uint)((rows + 7) / 8);
@@ -1518,7 +1520,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _softmaxKernel, _ropeInterleavedKernel, _ropeNeoxKernel, _ropeNeoxPartialKernel,
             _mulKernel, _sigmoidMulInPlaceKernel, _splitQgKernel, _kvAppendKernel,
             _embedLookupF32Kernel, _embedLookupQ4KKernel,
-            _matvecF32Kernel, _matvecQ4KKernel, _matvecQ6KKernel,
+            _matvecF32Kernel, _matvecQ4KKernel, _matvecQ5KKernel, _matvecQ6KKernel,
             _attentionKernel, _clearF32Kernel, _quantizeQ81Kernel,
             _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
         ];
@@ -1560,6 +1562,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _embedLookupQ4KKernel  = GetKernelFunc("llm_embed_lookup_q4k");
         _matvecF32Kernel       = GetKernelFunc("llm_matvec_f32");
         _matvecQ4KKernel       = GetKernelFunc("llm_matvec_q4k");
+        _matvecQ5KKernel       = GetKernelFunc("llm_matvec_q5k");
         _matvecQ6KKernel       = GetKernelFunc("llm_matvec_q6k");
         _attentionKernel       = GetKernelFunc("llm_attention");
         _clearF32Kernel        = GetKernelFunc("llm_clear_f32");

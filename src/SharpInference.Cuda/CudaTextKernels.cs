@@ -732,6 +732,120 @@ extern ""C"" __global__ void llm_matvec_q6k(
     if (lane == 0) output[row] = result;
 }
 
+// ── MatVec Q5_K ────────────────────────────────────────────────────────────
+// Q5_K block (176 bytes per 256 elements):
+//   [0:2]     fp16 d  — super-block scale
+//   [2:4]     fp16 dmin — super-block min
+//   [4:16]    scales[12] — packed 6-bit (scale, min) pairs (8 pairs, same packing as Q4_K)
+//   [16:48]   qh[32]   — high bit per element (one bit, 8 polarities × 32 elements)
+//   [48:176]  ql[128]  — lower 4 bits, two elements per byte (128 bytes × 2 nibbles = 256 elems)
+//
+// CPU reference: Dequantize.DequantQ5K / SimdKernels.DotQ5K_Scalar. Layout matches
+// llama.cpp's block_q5_K in ggml-common.h. We mirror Q6_K's launch geometry
+// (8 rows/block × 32 threads/row) and read weight bytes through byte-gather
+// helpers so the kernel works against uint32-strided uploads.
+extern ""C"" __global__ void llm_matvec_q5k(
+    const unsigned int* __restrict__ weights,
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int rows, int cols)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    if (row >= rows) return;
+
+    int num_blocks = cols >> 8;
+    long row_base_bytes = (long)row * (long)num_blocks * 176L;
+
+    float acc = 0.f;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long b0 = row_base_bytes + (long)block * 176L;
+
+        // d, dmin at offsets 0..3 (two fp16 halves packed in the first uint32).
+        unsigned int dword0 = __ldg(&weights[b0 >> 2]);
+        float d    = sharpi_fp16_to_fp32(dword0 & 0xffffu);
+        float dmin = sharpi_fp16_to_fp32(dword0 >> 16);
+
+        // qh byte at offset 16 + lane (lane ∈ 0..31 covers the full 32-byte qh array).
+        unsigned int qh_byte = sharpi_byte_at(weights, b0 + 16 + lane);
+
+        int base_elem = block * 256;
+
+        // 4 chunks × 64 elements each. Chunk c uses (sc[2c], m[2c]) for the low
+        // 32 elems and (sc[2c+1], m[2c+1]) for the high 32 elems. qh bit shifts
+        // for the low/high polarity within each chunk are (2c, 2c+1).
+        #pragma unroll
+        for (int chunk = 0; chunk < 4; chunk++) {
+            // Decode the two 6-bit (scale, min) pairs for this chunk. Matches
+            // get_scale_min_k4 in ggml-quants.c; the 12-byte `scales[]` array
+            // starts at b0 + 4. Pairs 0..3 are stored as low-6-bit fields; pairs
+            // 4..7 splice 4 bits from the second half with 2 bits from the first
+            // half. We unpack both pairs in this chunk inline.
+            unsigned int sc_lo_byte, sc_hi_byte;
+            unsigned int sc1, m1, sc2, m2;
+            int j_lo = chunk * 2;
+            int j_hi = j_lo + 1;
+            if (j_lo < 4) {
+                // Pairs 0..3: q[j] holds scale<<2 in low 6 bits, q[j+4] holds min<<2 in low 6 bits.
+                sc_lo_byte = sharpi_byte_at(weights, b0 + 4 + j_lo);
+                sc_hi_byte = sharpi_byte_at(weights, b0 + 4 + j_lo + 4);
+                sc1 = sc_lo_byte & 63u;
+                m1  = sc_hi_byte & 63u;
+                // Pair j_hi = j_lo + 1 is also < 4.
+                unsigned int sc_lo2 = sharpi_byte_at(weights, b0 + 4 + j_hi);
+                unsigned int sc_hi2 = sharpi_byte_at(weights, b0 + 4 + j_hi + 4);
+                sc2 = sc_lo2 & 63u;
+                m2  = sc_hi2 & 63u;
+            } else {
+                // Pairs 4..7: scale = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4)
+                //             min   = (q[j+4] >> 4)  | ((q[j]   >> 6) << 4)
+                unsigned int a_lo = sharpi_byte_at(weights, b0 + 4 + j_lo + 4); // q[j+4] for j=j_lo
+                unsigned int b_lo = sharpi_byte_at(weights, b0 + 4 + j_lo - 4); // q[j-4]
+                unsigned int c_lo = sharpi_byte_at(weights, b0 + 4 + j_lo);     // q[j]
+                sc1 = (a_lo & 0xFu) | (((b_lo >> 6) & 3u) << 4);
+                m1  = ((a_lo >> 4) & 0xFu) | (((c_lo >> 6) & 3u) << 4);
+
+                unsigned int a_hi = sharpi_byte_at(weights, b0 + 4 + j_hi + 4);
+                unsigned int b_hi = sharpi_byte_at(weights, b0 + 4 + j_hi - 4);
+                unsigned int c_hi = sharpi_byte_at(weights, b0 + 4 + j_hi);
+                sc2 = (a_hi & 0xFu) | (((b_hi >> 6) & 3u) << 4);
+                m2  = ((a_hi >> 4) & 0xFu) | (((c_hi >> 6) & 3u) << 4);
+            }
+
+            float d1  = d * (float)sc1;
+            float dm1 = dmin * (float)m1;
+            float d2  = d * (float)sc2;
+            float dm2 = dmin * (float)m2;
+
+            // qh masks for this chunk's two polarities (u1 = 1<<(2c), u2 = 1<<(2c+1)).
+            unsigned int u1 = 1u << (2 * chunk);
+            unsigned int u2 = u1 << 1;
+
+            // ql byte for this lane in this chunk: offset (48 + chunk*32 + lane).
+            unsigned int ql_byte = sharpi_byte_at(weights, b0 + 48 + chunk * 32 + lane);
+            unsigned int low4 = ql_byte & 0xFu;
+            unsigned int hi4  = (ql_byte >> 4) & 0xFu;
+
+            int hLo = (qh_byte & u1) != 0u ? 16 : 0;
+            int hHi = (qh_byte & u2) != 0u ? 16 : 0;
+
+            int elem_lo = base_elem + chunk * 64 + lane;
+            int elem_hi = elem_lo + 32;
+
+            acc += (d1 * (float)((int)low4 + hLo) - dm1) * input[elem_lo];
+            acc += (d2 * (float)((int)hi4  + hHi) - dm2) * input[elem_hi];
+        }
+    }
+
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output[row] = result;
+}
+
 // ── TurboQuant rotate_query ────────────────────────────────────────────────
 // Applies the Walsh-Hadamard transform + per-layer sign flip to each query
 // head. One block per query head, head_dim threads per block.

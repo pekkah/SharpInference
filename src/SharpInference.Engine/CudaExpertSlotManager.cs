@@ -44,8 +44,8 @@ public sealed class CudaExpertSlotManager : IDisposable
     /// </param>
     /// <param name="dtypes">
     /// Shared DType map used by the CUDA MatMul dispatcher to select the right
-    /// matvec kernel (Q4_K / Q6_K / F32). Keyed by CUDA Tensor handle, same role
-    /// as the Vulkan dtype map.
+    /// matvec kernel (Q4_K / Q5_K / Q6_K / F32). Keyed by CUDA Tensor handle,
+    /// same role as the Vulkan dtype map.
     /// </param>
     public CudaExpertSlotManager(CudaBackend gpu, GgufModel model, ModelHyperparams hp,
         int slotCapacity, Dictionary<nint, DType> dtypes)
@@ -159,18 +159,21 @@ public sealed class CudaExpertSlotManager : IDisposable
         int byteOffset = expertIdx * expertBytes;
         var expertData = data.Slice(byteOffset, expertBytes);
 
-        if (info.DType == DType.Q4_K || info.DType == DType.Q6_K)
+        if (info.DType == DType.Q4_K || info.DType == DType.Q5_K || info.DType == DType.Q6_K)
         {
             // CudaBackend.UploadRaw accepts ReadOnlySpan<byte> directly — no need
             // for the float-cast trick the Vulkan port uses to fit the
-            // single-overload Upload(ReadOnlySpan<float>) signature.
+            // single-overload Upload(ReadOnlySpan<float>) signature. Q5_K matters
+            // here: qwen35moe stores ffn_down_exps as Q5_K, so keeping the raw
+            // bytes instead of expanding to F32 halves the per-expert footprint
+            // and ~doubles SLRU capacity.
             var result = _gpu.UploadRaw(expertData, TensorShape.D1(expertData.Length), info.DType);
             _dtypes[result.Handle] = info.DType;
             return result;
         }
 
-        // Less-common dtypes (Q5_K, Q8_0, …): the CUDA matvec only dispatches on
-        // Q4_K / Q6_K / F32, so dequantize on CPU and upload as F32. Same
+        // Less-common dtypes (Q8_0, Q3_K, …): the CUDA matvec only dispatches on
+        // Q4_K / Q5_K / Q6_K / F32, so dequantize on CPU and upload as F32. Same
         // fallback strategy the Vulkan port uses.
         int count = rows * cols;
         var f32 = new float[count];
