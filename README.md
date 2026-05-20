@@ -11,7 +11,8 @@ OpenBLAS in `tools/openblas/` for faster batched GEMM. Build with `dotnet build 
 
 ## Text generation
 
-Supported architectures: `llama`, `llama4`, `qwen3`, `qwen3moe`. Benchmarked on
+Supported architectures: `llama`, `llama4`, `qwen3`, `qwen3moe`, `qwen35moe`
+(hybrid Gated-DeltaNet + attention + MoE). Benchmarked on
 AMD Zen 4 (12c/24t, DDR4-3200) + RTX 4070 Ti (12 GB), Q4_K_M, `--temp 0`,
 `-n 80`, prompt `"Write a Python function that sorts a list using the quicksort algorithm:"`.
 Decode rate is **forward-pass iterations / decode time**, so it counts
@@ -38,12 +39,20 @@ matching chat template).
 | Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | **CUDA** `-g -1` (hybrid) | **15.2** | **21.7** | 29 GPU + 19 CPU layers (auto), ~2.4× Vulkan decode |
 | Llama-4 Scout 17B-16E (MoE) | [meta-llama](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct) | 61 GB | CPU | 1.4 | 3.3 | 48 layers, 17B active params; split GGUF (Q4_K_M) |
 | Llama-4 Scout 17B-16E (MoE) | (same) | 61 GB | CUDA `-g -1` (hybrid) | 0.8 | 1.9 | 7 GPU + 41 CPU layers — model dwarfs the 12 GB card, PCIe cost > GPU speedup so CPU-only wins here |
+| Qwen3.6-35B-A3B (GDN+MoE) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | 22 GB | CPU | 4.4 | 7.9 | hybrid GDN/attn, 256 experts / 8 active |
+| Qwen3.6-35B-A3B (GDN+MoE) | (same) | 22 GB | **CUDA** `-g -1` (hybrid) | **7.0** | **12.2** | 10 attn + 30 GDN on GPU; MoE auto-routed to CPU (SLRU fits only 32% of experts at 12 GB) |
 
 `--backend auto` (default) picks CUDA when available, sizing the GPU/CPU split from
 VRAM via TierPlanner; falls through to Vulkan only when CUDA isn't present.
 `--tq` enables 3-bit TurboQuant KV compression (CPU, Vulkan, CUDA; requires
 `headDim ∈ {128, 256}`). MoE runs on GPU (full-offload or partial hybrid) on
 both Vulkan and CUDA backends.
+
+For hybrid SSM/attention models (`qwen35moe`), the CUDA backend keeps the
+attention KV cache, the 30 Gated-DeltaNet layers (conv1d + rank-1 outer-product
+recurrence), and the shared expert resident in VRAM; routed-expert dispatch
+auto-selects between an SLRU GPU cache and CPU mmap reads based on what
+fraction of experts can be cached at boot. Override with `SHARPI_CPU_MOE=0|1`.
 
 ### Reasoning models
 
