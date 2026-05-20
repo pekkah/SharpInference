@@ -1317,7 +1317,21 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (_gpuOutputWeight is not null && _gpuOutputWeight.Handle != _gpuEmbedding?.Handle)
             _gpu.Free(_gpuOutputWeight);
 
-        _expertSlotManager?.Dispose();
+        if (_expertSlotManager is not null)
+        {
+            // SHARPI_EXPERT_STATS=<path>: dump SLRU hit rate, per-layer hit rate, and
+            // top-3 experts per layer to the given file. Used to investigate whether
+            // the expert access pattern is highly skewed (caching strategies matter)
+            // or uniformly random (only more VRAM helps).
+            var statsPath = Environment.GetEnvironmentVariable("SHARPI_EXPERT_STATS");
+            if (!string.IsNullOrEmpty(statsPath))
+            {
+                using var w = new StreamWriter(statsPath);
+                _expertSlotManager.Profiler.PrintStats(w);
+            }
+
+            _expertSlotManager.Dispose();
+        }
         _kvCache.Dispose();
         _gdnStateCache.Dispose();
     }
