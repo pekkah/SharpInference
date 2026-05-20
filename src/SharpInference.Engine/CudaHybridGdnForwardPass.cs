@@ -136,7 +136,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // Dtype map shared with CudaExpertSlotManager so MatMul dispatch picks
     // the right matvec variant for SLRU-loaded expert tensors.
     private readonly Dictionary<nint, DType> _gpuWeightDTypes = new();
-    private readonly CudaExpertSlotManager _expertSlotManager;
+    private readonly CudaExpertSlotManager? _expertSlotManager;
 
     // ── CPU-side state for GDN layers ──────────────────────────────────
     private readonly GdnStateCache _gdnStateCache;
@@ -188,6 +188,34 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // Diagnostic: per-layer activation trace (env: SHARPI_TRACE_LAYERS=1).
     private static readonly bool _traceLayers =
         Environment.GetEnvironmentVariable("SHARPI_TRACE_LAYERS") == "1";
+
+    // Experimental: move the MoE FFN (routed + shared experts) back to the CPU
+    // while keeping attention on the GPU. SLRU expert thrash dominates per-token
+    // cost on the default GPU path (~87% misses), so routing MoE through CPU
+    // mmap reads can be a net win even with the extra GPU↔CPU round-trip.
+    // See docs/qwen35moe-plan.md Phase 7 part C. Read per-instance (not static)
+    // so the env var can be toggled between constructions during testing.
+    private readonly bool _cpuMoe =
+        Environment.GetEnvironmentVariable("SHARPI_CPU_MOE") == "1";
+
+    // ── CPU MoE state (only allocated/populated when _cpuMoe == true) ──
+    // Packed MoE weight refs (mmap pointers; routed experts stay quantized on disk).
+    private readonly CpuWeightRef[]? _cpuFfnGateInp;       // [L] router F32 [embDim, numExperts]
+    private readonly CpuWeightRef[]? _cpuFfnGateShexp;     // [L] shared-expert gate
+    private readonly CpuWeightRef[]? _cpuFfnUpShexp;       // [L] shared-expert up
+    private readonly CpuWeightRef[]? _cpuFfnDownShexp;     // [L] shared-expert down
+    private readonly CpuWeightRef[]? _cpuFfnGateExps;      // [L] packed [numExperts, expertDim, embDim]
+    private readonly CpuWeightRef[]? _cpuFfnUpExps;        // [L] packed
+    private readonly CpuWeightRef[]? _cpuFfnDownExps;      // [L] packed
+    private readonly float*[]? _cpuFfnGateInpShexp;        // [L][embDim] F32 (preloaded; small)
+
+    // CPU scratch for the MoE FFN path.
+    private readonly float* _cpuRouterLogits;   // [numExperts]
+    private readonly float* _cpuSharedOut;      // [embDim]
+    private readonly float* _cpuExpertGate;     // [expertDim]
+    private readonly float* _cpuExpertUp;       // [expertDim]
+    private readonly float* _cpuExpertContrib;  // [embDim] — per-expert down-proj scratch
+    private readonly float* _cpuMoeHidden;      // [embDim] — accumulator written back to _gpuHidden
 
     private bool _disposed;
 
@@ -355,17 +383,61 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _ssmDtBias = new float*[L];
         _ssmNormW = new float*[L];
 
+        if (_cpuMoe)
+        {
+            Console.Error.WriteLine(
+                "[CudaHybridGdnForwardPass] CPU MoE mode: routed + shared experts run on CPU (~2.3 GB/s mmap reads); SLRU disabled.");
+            _cpuFfnGateInp = new CpuWeightRef[L];
+            _cpuFfnGateShexp = new CpuWeightRef[L];
+            _cpuFfnUpShexp = new CpuWeightRef[L];
+            _cpuFfnDownShexp = new CpuWeightRef[L];
+            _cpuFfnGateExps = new CpuWeightRef[L];
+            _cpuFfnUpExps = new CpuWeightRef[L];
+            _cpuFfnDownExps = new CpuWeightRef[L];
+            _cpuFfnGateInpShexp = new float*[L];
+
+            _cpuRouterLogits = Alloc(_numExperts);
+            _cpuSharedOut = Alloc(_embDim);
+            _cpuExpertGate = Alloc(_expertDim);
+            _cpuExpertUp = Alloc(_expertDim);
+            _cpuExpertContrib = Alloc(_embDim);
+            _cpuMoeHidden = Alloc(_embDim);
+        }
+        else
+        {
+            _cpuRouterLogits = null;
+            _cpuSharedOut = null;
+            _cpuExpertGate = null;
+            _cpuExpertUp = null;
+            _cpuExpertContrib = null;
+            _cpuMoeHidden = null;
+        }
+
         Console.Error.Write("[CudaHybridGdnForwardPass] Uploading per-layer weights...");
         for (int i = 0; i < L; i++)
         {
             // Common (both block types): norms + MoE FFN weights live on GPU.
             _gpuAttnNorm[i] = UploadWeight($"blk.{i}.attn_norm.weight");
             _gpuPostAttnNorm[i] = UploadWeight($"blk.{i}.post_attention_norm.weight");
-            _gpuWGateInp[i] = UploadWeight($"blk.{i}.ffn_gate_inp.weight");
-            _gpuWGateInpShexp[i] = UploadWeight($"blk.{i}.ffn_gate_inp_shexp.weight");
-            _gpuWGateShexp[i] = UploadWeight($"blk.{i}.ffn_gate_shexp.weight");
-            _gpuWUpShexp[i] = UploadWeight($"blk.{i}.ffn_up_shexp.weight");
-            _gpuWDownShexp[i] = UploadWeight($"blk.{i}.ffn_down_shexp.weight");
+            if (!_cpuMoe)
+            {
+                _gpuWGateInp[i] = UploadWeight($"blk.{i}.ffn_gate_inp.weight");
+                _gpuWGateInpShexp[i] = UploadWeight($"blk.{i}.ffn_gate_inp_shexp.weight");
+                _gpuWGateShexp[i] = UploadWeight($"blk.{i}.ffn_gate_shexp.weight");
+                _gpuWUpShexp[i] = UploadWeight($"blk.{i}.ffn_up_shexp.weight");
+                _gpuWDownShexp[i] = UploadWeight($"blk.{i}.ffn_down_shexp.weight");
+            }
+            else
+            {
+                _cpuFfnGateInp![i] = ResolveCpuWeight($"blk.{i}.ffn_gate_inp.weight");
+                _cpuFfnGateShexp![i] = ResolveCpuWeight($"blk.{i}.ffn_gate_shexp.weight");
+                _cpuFfnUpShexp![i] = ResolveCpuWeight($"blk.{i}.ffn_up_shexp.weight");
+                _cpuFfnDownShexp![i] = ResolveCpuWeight($"blk.{i}.ffn_down_shexp.weight");
+                _cpuFfnGateExps![i] = ResolveCpuWeight($"blk.{i}.ffn_gate_exps.weight");
+                _cpuFfnUpExps![i] = ResolveCpuWeight($"blk.{i}.ffn_up_exps.weight");
+                _cpuFfnDownExps![i] = ResolveCpuWeight($"blk.{i}.ffn_down_exps.weight");
+                _cpuFfnGateInpShexp![i] = LoadF32Tensor($"blk.{i}.ffn_gate_inp_shexp.weight", _embDim);
+            }
 
             if (hp.LayerTypes[i] == LayerType.Attention)
             {
@@ -405,16 +477,23 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // We're conservative — most of the remaining budget is reserved for the
         // attention KV cache (10 layers × maxSeqLen × kvDim × 4 B × 2) and various
         // scratch. Use the GpuKvBytes from placement when the planner sized it.
-        ulong vramTotal = gpu.VramBytes;
-        long allocated = EstimateUploadedVram(); // best-effort estimate of weights uploaded so far
-        long remaining = (long)vramTotal - allocated - (2L << 30); // reserve 2 GiB for headroom
-        long perExpertBytes = EstimatePerExpertBytes();
-        int capacity = perExpertBytes > 0 ? (int)Math.Max(64, remaining / perExpertBytes) : 1024;
-        // Cap at total expert count (all layers × num experts).
-        int totalExperts = L * _numExperts;
-        capacity = Math.Min(capacity, totalExperts);
-        Console.Error.WriteLine($"[CudaHybridGdnForwardPass] SLRU expert cache: {capacity} slots / {totalExperts} total experts (per-expert ≈ {perExpertBytes / 1024} KiB, remaining VRAM ≈ {remaining / (1024 * 1024)} MiB).");
-        _expertSlotManager = new CudaExpertSlotManager(gpu, model, hp, capacity, _gpuWeightDTypes);
+        if (_cpuMoe)
+        {
+            _expertSlotManager = null;
+        }
+        else
+        {
+            ulong vramTotal = gpu.VramBytes;
+            long allocated = EstimateUploadedVram(); // best-effort estimate of weights uploaded so far
+            long remaining = (long)vramTotal - allocated - (2L << 30); // reserve 2 GiB for headroom
+            long perExpertBytes = EstimatePerExpertBytes();
+            int capacity = perExpertBytes > 0 ? (int)Math.Max(64, remaining / perExpertBytes) : 1024;
+            // Cap at total expert count (all layers × num experts).
+            int totalExperts = L * _numExperts;
+            capacity = Math.Min(capacity, totalExperts);
+            Console.Error.WriteLine($"[CudaHybridGdnForwardPass] SLRU expert cache: {capacity} slots / {totalExperts} total experts (per-expert ≈ {perExpertBytes / 1024} KiB, remaining VRAM ≈ {remaining / (1024 * 1024)} MiB).");
+            _expertSlotManager = new CudaExpertSlotManager(gpu, model, hp, capacity, _gpuWeightDTypes);
+        }
     }
 
     // =================================================================
@@ -494,7 +573,18 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _gpu.CopyDevice(_gpuResidual, _gpuHidden);
             _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuPostAttnNorm[layer], _hp.RmsNormEps);
 
-            GpuMoeFfn(layer);
+            if (_cpuMoe)
+            {
+                // Download _gpuNormBuf → _cpuNormBuf, run MoE on CPU, upload result.
+                _gpu.Synchronize();
+                _gpu.Download(_gpuNormBuf, new Span<float>(_cpuNormBuf, _embDim));
+                CpuMoeFfn(layer);
+                _gpu.UploadInto(_gpuHidden, new ReadOnlySpan<float>(_cpuMoeHidden, _embDim));
+            }
+            else
+            {
+                GpuMoeFfn(layer);
+            }
 
             // Residual add
             _gpu.AddInPlace(_gpuHidden, _gpuResidual);
@@ -688,7 +778,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         {
             int expertIdx = selectedExperts[k];
             float expertWeight = expertWeights[k];
-            var slot = _expertSlotManager.GetOrLoad(layer, expertIdx);
+            var slot = _expertSlotManager!.GetOrLoad(layer, expertIdx);
 
             GpuMatMul(_gpuFfnGate, slot.Gate, _gpuNormBuf);
             GpuMatMul(_gpuFfnUp, slot.Up, _gpuNormBuf);
@@ -699,6 +789,113 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         // 5. Add shared expert.
         _gpu.AddInPlace(_gpuHidden, _gpuSharedOut);
+    }
+
+    // =================================================================
+    //  CPU MoE FFN (SHARPI_CPU_MOE=1) — mirror of HybridGdnForwardPass.MoeFfn
+    //  Consumes _cpuNormBuf, produces _cpuMoeHidden.
+    // =================================================================
+
+    private void CpuMoeFfn(int layer)
+    {
+        int numExperts = _numExperts;
+        int numActive = _numActiveExperts;
+        int expertDim = _expertDim;
+
+        // 1. Router: ffn_gate_inp.weight is F32 [embDim, numExperts]; softmax then top-K.
+        var routerW = _cpuFfnGateInp![layer];
+        SimdKernels.MatVec(_cpuRouterLogits, routerW.DataPtr, _cpuNormBuf,
+            numExperts, _embDim, routerW.DType);
+        SimdKernels.SoftmaxInPlace(_cpuRouterLogits, numExperts);
+
+        Span<int> selectedExperts = stackalloc int[numActive];
+        Span<float> expertWeights = stackalloc float[numActive];
+        SelectTopKPtr(_cpuRouterLogits, numExperts, numActive, selectedExperts, expertWeights);
+
+        // 2. Shared expert: ffn_down @ (SiLU(ffn_gate @ x) * (ffn_up @ x)).
+        var gateShexp = _cpuFfnGateShexp![layer];
+        var upShexp = _cpuFfnUpShexp![layer];
+        var downShexp = _cpuFfnDownShexp![layer];
+        SimdKernels.MatVec(_cpuExpertGate, gateShexp.DataPtr, _cpuNormBuf,
+            expertDim, _embDim, gateShexp.DType);
+        SimdKernels.MatVec(_cpuExpertUp, upShexp.DataPtr, _cpuNormBuf,
+            expertDim, _embDim, upShexp.DType);
+        SimdKernels.SiLuMul(_cpuExpertGate, _cpuExpertUp, expertDim);
+        SimdKernels.MatVec(_cpuSharedOut, downShexp.DataPtr, _cpuExpertGate,
+            _embDim, expertDim, downShexp.DType);
+
+        // Per-token sigmoid scalar gate on the shared expert output.
+        float shexpDot = SimdKernels.DotF32(_cpuFfnGateInpShexp![layer], _cpuNormBuf, _embDim);
+        float shexpScale = 1.0f / (1.0f + MathF.Exp(-shexpDot));
+        SimdKernels.ScaleInPlace(_cpuSharedOut, shexpScale, _embDim);
+
+        // 3. Routed experts (sparse top-K). Accumulate into _cpuMoeHidden.
+        new Span<float>(_cpuMoeHidden, _embDim).Clear();
+        var gateExps = _cpuFfnGateExps![layer];
+        var upExps = _cpuFfnUpExps![layer];
+        var downExps = _cpuFfnDownExps![layer];
+        for (int k = 0; k < numActive; k++)
+        {
+            int expertIdx = selectedExperts[k];
+            float weight = expertWeights[k];
+
+            ExpertMatVec(_cpuExpertGate, gateExps, expertIdx, expertDim, _embDim, _cpuNormBuf);
+            ExpertMatVec(_cpuExpertUp, upExps, expertIdx, expertDim, _embDim, _cpuNormBuf);
+            SimdKernels.SiLuMul(_cpuExpertGate, _cpuExpertUp, expertDim);
+            ExpertMatVecDown(_cpuMoeHidden, downExps, expertIdx, _embDim, expertDim,
+                _cpuExpertGate, weight);
+        }
+
+        // 4. Add shared expert output.
+        SimdKernels.AddInPlace(_cpuMoeHidden, _cpuSharedOut, _embDim);
+    }
+
+    private void ExpertMatVec(float* output, in CpuWeightRef packedTensor,
+        int expertIdx, int rows, int cols, float* input)
+    {
+        int bytesPerRow = (cols / DTypeInfo.BlockSize(packedTensor.DType))
+                        * DTypeInfo.BytesPerBlock(packedTensor.DType);
+        long expertOffset = (long)expertIdx * rows * bytesPerRow;
+        byte* expertData = packedTensor.DataPtr + expertOffset;
+        SimdKernels.MatVec(output, expertData, input, rows, cols, packedTensor.DType);
+    }
+
+    private void ExpertMatVecDown(float* output, in CpuWeightRef packedTensor,
+        int expertIdx, int rows, int cols, float* input, float weight)
+    {
+        int bytesPerRow = (cols / DTypeInfo.BlockSize(packedTensor.DType))
+                        * DTypeInfo.BytesPerBlock(packedTensor.DType);
+        long expertOffset = (long)expertIdx * rows * bytesPerRow;
+        byte* expertData = packedTensor.DataPtr + expertOffset;
+        SimdKernels.MatVec(_cpuExpertContrib, expertData, input, rows, cols, packedTensor.DType);
+        SimdKernels.WeightedAddInPlace(output, _cpuExpertContrib, weight, rows);
+    }
+
+    private static void SelectTopKPtr(float* logits, int n, int k,
+        Span<int> indices, Span<float> weights)
+    {
+        for (int ki = 0; ki < k; ki++)
+        {
+            int bestIdx = 0;
+            float bestVal = float.MinValue;
+            for (int i = 0; i < n; i++)
+            {
+                bool alreadySelected = false;
+                for (int j = 0; j < ki; j++)
+                    if (indices[j] == i) { alreadySelected = true; break; }
+                if (!alreadySelected && logits[i] > bestVal)
+                { bestVal = logits[i]; bestIdx = i; }
+            }
+            indices[ki] = bestIdx;
+            weights[ki] = bestVal;
+        }
+        if (k > 1)
+        {
+            float sum = 0;
+            for (int i = 0; i < k; i++) sum += weights[i];
+            if (sum > 0)
+                for (int i = 0; i < k; i++) weights[i] /= sum;
+        }
     }
 
     // =================================================================
@@ -774,15 +971,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             result = _gpu.Upload(floats, TensorShape.D1(floats.Length));
             _gpuWeightDTypes[result.Handle] = DType.Float32;
         }
-        else if (info.DType == DType.Q4_K || info.DType == DType.Q6_K)
+        else if (info.DType == DType.Q4_K || info.DType == DType.Q5_K || info.DType == DType.Q6_K)
         {
-            // CUDA matvec dispatches on Q4_K / Q6_K via dedicated kernels.
+            // CUDA matvec dispatches on Q4_K / Q5_K / Q6_K via dedicated kernels.
             result = _gpu.UploadRaw(data, TensorShape.D1(data.Length), info.DType);
             _gpuWeightDTypes[result.Handle] = info.DType;
         }
         else
         {
-            // Q5_K, Q8_0, etc. — CUDA matvec doesn't dispatch on these. Dequantize to F32.
+            // Q8_0, Q3_K, etc. — CUDA matvec doesn't dispatch on these. Dequantize to F32.
             int count = (int)info.ElementCount;
             var f32 = new float[count];
             Dequantize.ToFloat32(data, f32, info.DType, count);
@@ -877,7 +1074,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     private static long EstimateGpuTensorBytes(GgufTensorInfo tensor)
     {
-        if (tensor.DType == DType.Float32 || tensor.DType == DType.Q4_K || tensor.DType == DType.Q6_K)
+        if (tensor.DType == DType.Float32 || tensor.DType == DType.Q4_K
+            || tensor.DType == DType.Q5_K || tensor.DType == DType.Q6_K)
             return (tensor.ByteSize + 3) & ~3L;
         return tensor.ElementCount * sizeof(float);
     }
@@ -928,9 +1126,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     {
         // Per expert: gate + up + down weight matrices. For qwen35moe Q4_K_M:
         //   gate/up: [embDim=2048, expertDim=512] each ≈ 588 KiB raw Q4_K
-        //   down:    [expertDim=512, embDim=2048]     ≈ 588 KiB raw Q4_K (or Q5_K → F32 expansion!)
-        // Sum: ~1.81 MiB raw. With Q5_K expanded to F32 we'd hit ~4 MiB; use a safe
-        // upper bound by checking the actual tensor dtypes.
+        //   down:    [expertDim=512, embDim=2048]     ≈ 588 KiB raw Q5_K — with the
+        //   CUDA Q5_K matvec landed (Phase 7b) this matrix now stays as raw bytes
+        //   instead of expanding 4× to F32, halving the per-expert footprint.
+        // Sum: ~1.81 MiB raw. Fall back to F32 expansion only for dtypes the
+        // CUDA matvec still can't handle (Q8_0, Q3_K, etc.).
         long bytes = 0;
         foreach (var name in new[] { "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight", "blk.0.ffn_down_exps.weight" })
         {
@@ -940,8 +1140,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             long perExpert = info.Value.ByteSize / Math.Max(1, _numExperts);
             // If the dtype is something CUDA matvec can't handle, the SLRU will
             // dequantize to F32, increasing footprint. Compute conservative byte
-            // size by assuming F32 when not Q4_K/Q6_K.
-            if (info.Value.DType != DType.Q4_K && info.Value.DType != DType.Q6_K && info.Value.DType != DType.Float32)
+            // size by assuming F32 when not Q4_K/Q5_K/Q6_K.
+            if (info.Value.DType != DType.Q4_K && info.Value.DType != DType.Q5_K
+                && info.Value.DType != DType.Q6_K && info.Value.DType != DType.Float32)
             {
                 int rows = (int)(info.Value.ElementCount / _numExperts);
                 perExpert = (long)rows * sizeof(float);
@@ -1053,6 +1254,18 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             if (_ssmA[i] != null) NativeMemory.Free(_ssmA[i]);
             if (_ssmDtBias[i] != null) NativeMemory.Free(_ssmDtBias[i]);
             if (_ssmNormW[i] != null) NativeMemory.Free(_ssmNormW[i]);
+            if (_cpuFfnGateInpShexp is not null && _cpuFfnGateInpShexp[i] != null)
+                NativeMemory.Free(_cpuFfnGateInpShexp[i]);
+        }
+
+        if (_cpuMoe)
+        {
+            if (_cpuRouterLogits != null) NativeMemory.Free(_cpuRouterLogits);
+            if (_cpuSharedOut != null) NativeMemory.Free(_cpuSharedOut);
+            if (_cpuExpertGate != null) NativeMemory.Free(_cpuExpertGate);
+            if (_cpuExpertUp != null) NativeMemory.Free(_cpuExpertUp);
+            if (_cpuExpertContrib != null) NativeMemory.Free(_cpuExpertContrib);
+            if (_cpuMoeHidden != null) NativeMemory.Free(_cpuMoeHidden);
         }
 
         // GPU scratch
@@ -1078,11 +1291,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         {
             _gpu.Free(_gpuAttnNorm[i]);
             _gpu.Free(_gpuPostAttnNorm[i]);
-            _gpu.Free(_gpuWGateInp[i]);
-            _gpu.Free(_gpuWGateInpShexp[i]);
-            _gpu.Free(_gpuWGateShexp[i]);
-            _gpu.Free(_gpuWUpShexp[i]);
-            _gpu.Free(_gpuWDownShexp[i]);
+            if (!_cpuMoe)
+            {
+                _gpu.Free(_gpuWGateInp[i]);
+                _gpu.Free(_gpuWGateInpShexp[i]);
+                _gpu.Free(_gpuWGateShexp[i]);
+                _gpu.Free(_gpuWUpShexp[i]);
+                _gpu.Free(_gpuWDownShexp[i]);
+            }
             if (_hp.LayerTypes![i] == LayerType.Attention)
             {
                 _gpu.Free(_gpuWQGate[i]);
@@ -1101,7 +1317,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (_gpuOutputWeight is not null && _gpuOutputWeight.Handle != _gpuEmbedding?.Handle)
             _gpu.Free(_gpuOutputWeight);
 
-        _expertSlotManager.Dispose();
+        _expertSlotManager?.Dispose();
         _kvCache.Dispose();
         _gdnStateCache.Dispose();
     }

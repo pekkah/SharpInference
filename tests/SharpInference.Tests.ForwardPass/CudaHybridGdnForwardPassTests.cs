@@ -186,4 +186,58 @@ public sealed class CudaHybridGdnForwardPassTests
             "First-token mismatch is structural — it would mean a numerical bug " +
             "in the embedding→40-layer→output pipeline, NOT just precision drift.");
     }
+
+    /// <summary>
+    /// CPU-MoE experiment (SHARPI_CPU_MOE=1): keep attention on GPU and route
+    /// the entire MoE FFN (routed experts + shared expert + scalar gate) through
+    /// CPU SimdKernels via mmap reads. This eliminates SLRU thrash. First-token
+    /// parity must hold because the MoE math is identical to
+    /// <see cref="HybridGdnForwardPass.MoeFfn"/> which already passes the same
+    /// strict greedy check post-Phase 5.
+    /// </summary>
+    [Fact]
+    public void CudaHybridGdnForwardPass_Qwen35Moe_CpuMoeMode_MatchesCpuBaseline()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        var path = FindHybridModelPath();
+        if (path is null) return;
+
+        // Activate the experimental CPU-MoE path for the duration of the test.
+        var prev = Environment.GetEnvironmentVariable("SHARPI_CPU_MOE");
+        Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", "1");
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+
+            var placement = new LayerPlacement(
+                GpuLayers: hp.NumLayers, CpuLayers: 0,
+                GpuWeightBytes: 0, GpuKvBytes: 0,
+                RecommendedCtxSize: Math.Min(hp.ContextLength, 4096));
+
+            using var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
+
+            var tokens = tokenizer.Encode("Hello");
+            Assert.NotEmpty(tokens);
+
+            int referenceFirstToken = tokenizer.Encode(",")[0];
+
+            var logits = fwd.Prefill(tokens);
+            int produced = Sampler.Greedy(logits);
+
+            Assert.True(produced == referenceFirstToken,
+                $"CPU-MoE CUDA hybrid greedy decode diverged from CPU/llama.cpp at step 0: " +
+                $"expected token {referenceFirstToken} (\",\"), got {produced}. " +
+                "Since the CPU MoE math mirrors HybridGdnForwardPass.MoeFfn exactly, " +
+                "a divergence here likely indicates a weight-loading or wiring bug in " +
+                "the SHARPI_CPU_MOE branch.");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", prev);
+        }
+    }
 }
