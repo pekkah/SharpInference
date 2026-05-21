@@ -245,9 +245,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // CPU scratch for the MoE FFN path.
     private readonly float* _cpuRouterLogits;   // [numExperts]
     private readonly float* _cpuSharedOut;      // [embDim]
-    private readonly float* _cpuExpertGate;     // [expertDim]
-    private readonly float* _cpuExpertUp;       // [expertDim]
-    private readonly float* _cpuExpertContrib;  // [embDim] — per-expert down-proj scratch
+    // Batched-expert intermediate buffers: gate/up for all 8 routed experts laid
+    // out as [numActive × expertDim]. The routed loop folds 16 sequential
+    // Parallel.For dispatches per layer into 2 (gate+up sweep, down+accumulate
+    // sweep), amortising TPL dispatch over much larger work units.
+    private readonly float* _cpuExpertGateAll;
+    private readonly float* _cpuExpertUpAll;
     private readonly float* _cpuMoeHidden;      // [embDim] — accumulator written back to _gpuHidden
 
     private bool _disposed;
@@ -478,18 +481,16 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
             _cpuRouterLogits = Alloc(_numExperts);
             _cpuSharedOut = Alloc(_embDim);
-            _cpuExpertGate = Alloc(_expertDim);
-            _cpuExpertUp = Alloc(_expertDim);
-            _cpuExpertContrib = Alloc(_embDim);
+            _cpuExpertGateAll = Alloc(_numActiveExperts * _expertDim);
+            _cpuExpertUpAll = Alloc(_numActiveExperts * _expertDim);
             _cpuMoeHidden = Alloc(_embDim);
         }
         else
         {
             _cpuRouterLogits = null;
             _cpuSharedOut = null;
-            _cpuExpertGate = null;
-            _cpuExpertUp = null;
-            _cpuExpertContrib = null;
+            _cpuExpertGateAll = null;
+            _cpuExpertUpAll = null;
             _cpuMoeHidden = null;
         }
 
@@ -1010,22 +1011,84 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         Span<float> expertWeights = stackalloc float[numActive];
         SelectTopKPtr(_cpuRouterLogits, numExperts, numActive, selectedExperts, expertWeights);
 
-        // 3. Routed experts (sparse top-K). Accumulate into _cpuMoeHidden.
-        new Span<float>(_cpuMoeHidden, _embDim).Clear();
+        // 3. Routed experts (sparse top-K). Two batched Parallel.For sweeps
+        //    instead of 16 per-expert ones — gate+up across all 8 experts in
+        //    one sweep, then down+weighted-accumulate across all 8 experts in
+        //    another. Each worker thread does much more work per dispatch,
+        //    amortising TPL barrier overhead.
         var gateExps = _cpuFfnGateExps![layer];
         var upExps = _cpuFfnUpExps![layer];
         var downExps = _cpuFfnDownExps![layer];
+
+        int bprG = (_embDim    / DTypeInfo.BlockSize(gateExps.DType))
+                 * DTypeInfo.BytesPerBlock(gateExps.DType);
+        int bprU = (_embDim    / DTypeInfo.BlockSize(upExps.DType))
+                 * DTypeInfo.BytesPerBlock(upExps.DType);
+        int bprD = (expertDim  / DTypeInfo.BlockSize(downExps.DType))
+                 * DTypeInfo.BytesPerBlock(downExps.DType);
+
+        // Stackalloc small per-token arrays into native pointers so worker
+        // threads can read them safely (Parallel.For is synchronous, so the
+        // stack frame stays alive until all workers complete).
+        int* sePtr = stackalloc int[numActive];
+        float* ewPtr = stackalloc float[numActive];
+        for (int i = 0; i < numActive; i++)
+        {
+            sePtr[i] = selectedExperts[i];
+            ewPtr[i] = expertWeights[i];
+        }
+
+        // Local copies for lambda capture.
+        byte*  gateP    = gateExps.DataPtr;
+        byte*  upP      = upExps.DataPtr;
+        byte*  downP    = downExps.DataPtr;
+        DType  gateDt   = gateExps.DType;
+        DType  upDt     = upExps.DType;
+        DType  downDt   = downExps.DType;
+        float* gateAll  = _cpuExpertGateAll;
+        float* upAll    = _cpuExpertUpAll;
+        float* normBuf  = _cpuNormBuf;
+        float* moeOut   = _cpuMoeHidden;
+        int    embDimL  = _embDim;
+        int    expertDimL = expertDim;
+        int    numActiveL = numActive;
+        int    bprGL = bprG, bprUL = bprU, bprDL = bprD;
+
+        // Phase A: gate + up rows for all (k, r) tuples.
+        Parallel.For(0, numActiveL * expertDimL, s_moeParallelOpts, idx =>
+        {
+            int k = idx / expertDimL;
+            int r = idx % expertDimL;
+            int expertIdx = sePtr[k];
+            long offG = (long)expertIdx * expertDimL * bprGL + (long)r * bprGL;
+            long offU = (long)expertIdx * expertDimL * bprUL + (long)r * bprUL;
+            gateAll[idx] = DispatchDot(gateP + offG, normBuf, embDimL, gateDt);
+            upAll[idx]   = DispatchDot(upP   + offU, normBuf, embDimL, upDt);
+        });
+
+        // Phase B: SiLuMul on each expert's gate vector (scalar; fast).
         for (int k = 0; k < numActive; k++)
         {
-            int expertIdx = selectedExperts[k];
-            float weight = expertWeights[k];
-
-            ExpertMatVecDual(_cpuExpertGate, gateExps, _cpuExpertUp, upExps,
-                expertIdx, expertDim, _embDim, _cpuNormBuf);
-            SimdKernels.SiLuMul(_cpuExpertGate, _cpuExpertUp, expertDim);
-            ExpertMatVecDown(_cpuMoeHidden, downExps, expertIdx, _embDim, expertDim,
-                _cpuExpertGate, weight);
+            SimdKernels.SiLuMul(_cpuExpertGateAll + (long)k * expertDim,
+                                _cpuExpertUpAll   + (long)k * expertDim, expertDim);
         }
+
+        // Phase C: down × weight, fused across all 8 experts into one sweep over
+        // embDim rows. Each thread owns its rows so there's no cross-expert race.
+        Parallel.For(0, embDimL, s_moeParallelOpts, r =>
+        {
+            float sum = 0f;
+            for (int k = 0; k < numActiveL; k++)
+            {
+                int expertIdx = sePtr[k];
+                float w = ewPtr[k];
+                long offD = (long)expertIdx * embDimL * bprDL + (long)r * bprDL;
+                sum += w * DispatchDot(downP + offD,
+                                       gateAll + (long)k * expertDimL,
+                                       expertDimL, downDt);
+            }
+            moeOut[r] = sum;
+        });
 
         // 4. Wait for GPU shared expert, download, and combine into routed accumulator.
         _gpu.Synchronize();
@@ -1033,48 +1096,24 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         SimdKernels.AddInPlace(_cpuMoeHidden, _cpuSharedOut, _embDim);
     }
 
-    private void ExpertMatVec(float* output, in CpuWeightRef packedTensor,
-        int expertIdx, int rows, int cols, float* input)
+    // ParallelOptions for the routed-MoE Parallel.For sweeps. Matches the
+    // CPU core count exactly so workers don't oversubscribe the CPU with
+    // the (concurrently running) GPU shared-expert host launches.
+    private static readonly ParallelOptions s_moeParallelOpts = new()
     {
-        int bytesPerRow = (cols / DTypeInfo.BlockSize(packedTensor.DType))
-                        * DTypeInfo.BytesPerBlock(packedTensor.DType);
-        long expertOffset = (long)expertIdx * rows * bytesPerRow;
-        byte* expertData = packedTensor.DataPtr + expertOffset;
-        SimdKernels.MatVec(output, expertData, input, rows, cols, packedTensor.DType);
-    }
+        MaxDegreeOfParallelism = Environment.ProcessorCount
+    };
 
-    /// <summary>
-    /// Routed-expert gate+up fused MatVec. Halves the Parallel.For dispatch cost
-    /// vs two sequential <see cref="ExpertMatVec"/> calls — gate and up share the
-    /// same input vector and can be computed in a single per-row loop.
-    /// </summary>
-    private void ExpertMatVecDual(
-        float* outGate, in CpuWeightRef gateTensor,
-        float* outUp,   in CpuWeightRef upTensor,
-        int expertIdx, int rows, int cols, float* input)
-    {
-        int bprG = (cols / DTypeInfo.BlockSize(gateTensor.DType))
-                 * DTypeInfo.BytesPerBlock(gateTensor.DType);
-        int bprU = (cols / DTypeInfo.BlockSize(upTensor.DType))
-                 * DTypeInfo.BytesPerBlock(upTensor.DType);
-        long offG = (long)expertIdx * rows * bprG;
-        long offU = (long)expertIdx * rows * bprU;
-        SimdKernels.MatVecDual(
-            outGate, gateTensor.DataPtr + offG,
-            outUp,   upTensor.DataPtr   + offU,
-            input, rows, cols, gateTensor.DType, upTensor.DType);
-    }
-
-    private void ExpertMatVecDown(float* output, in CpuWeightRef packedTensor,
-        int expertIdx, int rows, int cols, float* input, float weight)
-    {
-        int bytesPerRow = (cols / DTypeInfo.BlockSize(packedTensor.DType))
-                        * DTypeInfo.BytesPerBlock(packedTensor.DType);
-        long expertOffset = (long)expertIdx * rows * bytesPerRow;
-        byte* expertData = packedTensor.DataPtr + expertOffset;
-        SimdKernels.MatVec(_cpuExpertContrib, expertData, input, rows, cols, packedTensor.DType);
-        SimdKernels.WeightedAddInPlace(output, _cpuExpertContrib, weight, rows);
-    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float DispatchDot(byte* row, float* input, int cols, DType dtype) =>
+        dtype switch
+        {
+            DType.Q4_K    => SimdKernels.DotQ4K(row, input, cols),
+            DType.Q5_K    => SimdKernels.DotQ5K(row, input, cols),
+            DType.Q6_K    => SimdKernels.DotQ6K(row, input, cols),
+            DType.Float32 => SimdKernels.DotF32((float*)row, input, cols),
+            _ => throw new NotSupportedException($"Routed expert dtype {dtype} not supported in batched path"),
+        };
 
     private static void SelectTopKPtr(float* logits, int n, int k,
         Span<int> indices, Span<float> weights)
@@ -1545,9 +1584,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         {
             if (_cpuRouterLogits != null) NativeMemory.Free(_cpuRouterLogits);
             if (_cpuSharedOut != null) NativeMemory.Free(_cpuSharedOut);
-            if (_cpuExpertGate != null) NativeMemory.Free(_cpuExpertGate);
-            if (_cpuExpertUp != null) NativeMemory.Free(_cpuExpertUp);
-            if (_cpuExpertContrib != null) NativeMemory.Free(_cpuExpertContrib);
+            if (_cpuExpertGateAll != null) NativeMemory.Free(_cpuExpertGateAll);
+            if (_cpuExpertUpAll != null) NativeMemory.Free(_cpuExpertUpAll);
             if (_cpuMoeHidden != null) NativeMemory.Free(_cpuMoeHidden);
         }
 
