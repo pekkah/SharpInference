@@ -27,6 +27,14 @@ $results += .\scripts\bench-textgen.ps1 -Model $moe -Tag "moe-cpu-tq"        -NT
 $results += .\scripts\bench-textgen.ps1 -Model $moe -Tag "moe-vulkan-hybrid" -NTokens $NTokens -Prompt $Prompt -TimeoutSec 600 -ExtraArgs @("-g","-1","--backend","vulkan")
 $results += .\scripts\bench-textgen.ps1 -Model $moe -Tag "moe-cuda-hybrid"   -NTokens $NTokens -Prompt $Prompt -TimeoutSec 600 -ExtraArgs @("-g","-1","--backend","cuda")
 
+# Qwen3.6-35B-A3B GDN+MoE — hybrid Gated-DeltaNet/attention with 256 experts × 8 active.
+# 22 GB on E:; doesn't fit a 12 GB card so MoE auto-routes to CPU under the CUDA hybrid path.
+$qwen36 = "E:\models\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+if (Test-Path $qwen36) {
+    $results += .\scripts\bench-textgen.ps1 -Model $qwen36 -Tag "qwen36-cpu"         -NTokens $NTokens -Prompt $Prompt -TimeoutSec 600
+    $results += .\scripts\bench-textgen.ps1 -Model $qwen36 -Tag "qwen36-cuda-hybrid" -NTokens $NTokens -Prompt $Prompt -TimeoutSec 600 -ExtraArgs @("-g","-1","--backend","cuda")
+}
+
 # Llama-4-Scout 17B-16E MoE — split GGUF on E: drive (~61 GB total at Q4_K_M; CPU-only on a 12 GB card).
 $scout = "E:\models\Llama-4-Scout-17B-16E-Instruct-Q4_K_M-00001-of-00002.gguf"
 if (Test-Path $scout) {
