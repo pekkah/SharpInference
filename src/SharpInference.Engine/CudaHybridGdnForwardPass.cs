@@ -700,7 +700,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             if (_cpuMoe)
             {
                 // Download _gpuNormBuf → _cpuNormBuf, run MoE on CPU, upload result.
-                _gpu.Synchronize();
+                // Download already syncs the stream (CudaMemcpyAsync + StreamSynchronize),
+                // so an explicit Synchronize before it would just stall the host twice.
                 _gpu.Download(_gpuNormBuf, new Span<float>(_cpuNormBuf, _embDim));
                 CpuMoeFfn(layer);
                 _gpu.UploadInto(_gpuHidden, new ReadOnlySpan<float>(_cpuMoeHidden, _embDim));
@@ -725,8 +726,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpu.MatMul(_gpuLogits, _gpuOutputWeight!, _gpuHidden,
             _gpuWeightDTypes.TryGetValue(_gpuOutputWeight!.Handle, out var outDt) ? outDt : DType.Float32);
 
-        // 6. Download logits to host
-        _gpu.Synchronize();
+        // 6. Download logits to host (Download self-syncs the stream).
         _gpu.Download(_gpuLogits, _logitsBuf);
 
         if (_traceLayers) TraceLogits(position, _logitsBuf);
@@ -781,8 +781,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     private void CpuGdnBlock(int layer, int position)
     {
-        // Download _gpuNormBuf → _cpuNormBuf so the CPU GDN kernels can consume it.
-        _gpu.Synchronize();
+        // Download _gpuNormBuf → _cpuNormBuf so the CPU GDN kernels can consume it
+        // (Download self-syncs the stream).
         _gpu.Download(_gpuNormBuf, new Span<float>(_cpuNormBuf, _embDim));
 
         int gdnIdx = _gdnStateCache.GdnLayerOf(layer);
@@ -928,8 +928,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpu.Softmax(_gpuRouterLogits);
 
         // 2. Download to host and pick top-K (256 → 8).
-        //    Per-layer cost: 1 KB readback + sync — fine.
-        _gpu.Synchronize();
+        //    Per-layer cost: 1 KB readback — Download self-syncs the stream.
         _gpu.Download(_gpuRouterLogits, _routerBuf);
 
         Span<int> selectedExperts = stackalloc int[_numActiveExperts];
@@ -948,8 +947,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         //
         // TODO(Phase6c): add a dot-product + sigmoid + scale-in-place kernel.
         //   For v1: download _gpuNormBuf and the small weight, compute scalar, scale on GPU.
-        //   Note: _gpuNormBuf is already populated; just need the readback for the dot.
-        _gpu.Synchronize();
+        //   Note: _gpuNormBuf is already populated; just need the readback for the dot
+        //   (Download self-syncs the stream).
         _gpu.Download(_gpuNormBuf, new Span<float>(_cpuNormReadback, _embDim));
         _gpu.Download(_gpuWGateInpShexp[layer], new Span<float>(_hostQ, _embDim)); // reuse _hostQ
         // dot product on CPU.
@@ -1088,8 +1087,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             moeOut[r] = sum;
         });
 
-        // 4. Wait for GPU shared expert, download, and combine into routed accumulator.
-        _gpu.Synchronize();
+        // 4. Wait for GPU shared expert, download, and combine into routed accumulator
+        //    (Download self-syncs the stream).
         _gpu.Download(_gpuSharedOut, new Span<float>(_cpuSharedOut, _embDim));
         SimdKernels.AddInPlace(_cpuMoeHidden, _cpuSharedOut, _embDim);
     }
