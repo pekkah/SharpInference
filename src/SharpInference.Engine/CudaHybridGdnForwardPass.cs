@@ -237,9 +237,6 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // ── CPU MoE state (only allocated/populated when _cpuMoe == true) ──
     // Packed MoE weight refs (mmap pointers; routed experts stay quantized on disk).
     private readonly CpuWeightRef[]? _cpuFfnGateInp;       // [L] router F32 [embDim, numExperts]
-    private readonly CpuWeightRef[]? _cpuFfnGateShexp;     // [L] shared-expert gate
-    private readonly CpuWeightRef[]? _cpuFfnUpShexp;       // [L] shared-expert up
-    private readonly CpuWeightRef[]? _cpuFfnDownShexp;     // [L] shared-expert down
     private readonly CpuWeightRef[]? _cpuFfnGateExps;      // [L] packed [numExperts, expertDim, embDim]
     private readonly CpuWeightRef[]? _cpuFfnUpExps;        // [L] packed
     private readonly CpuWeightRef[]? _cpuFfnDownExps;      // [L] packed
@@ -472,11 +469,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (_cpuMoe)
         {
             Console.Error.WriteLine(
-                "[CudaHybridGdnForwardPass] CPU MoE mode: routed + shared experts run on CPU (~2.3 GB/s mmap reads); SLRU disabled.");
+                "[CudaHybridGdnForwardPass] CPU MoE mode: routed experts run on CPU (mmap, ~2.3 GB/s); shared expert stays on GPU, overlapped with the CPU routed loop. SLRU disabled.");
             _cpuFfnGateInp = new CpuWeightRef[L];
-            _cpuFfnGateShexp = new CpuWeightRef[L];
-            _cpuFfnUpShexp = new CpuWeightRef[L];
-            _cpuFfnDownShexp = new CpuWeightRef[L];
             _cpuFfnGateExps = new CpuWeightRef[L];
             _cpuFfnUpExps = new CpuWeightRef[L];
             _cpuFfnDownExps = new CpuWeightRef[L];
@@ -505,20 +499,22 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             // Common (both block types): norms + MoE FFN weights live on GPU.
             _gpuAttnNorm[i] = UploadWeight($"blk.{i}.attn_norm.weight");
             _gpuPostAttnNorm[i] = UploadWeight($"blk.{i}.post_attention_norm.weight");
+
+            // Shared expert weights stay GPU-resident in both modes so the CPU MoE
+            // path can fire them off in parallel with the routed expert loop
+            // (saves ~5 MiB × NumLayers of CPU↔mem bandwidth per token).
+            _gpuWGateShexp[i] = UploadWeight($"blk.{i}.ffn_gate_shexp.weight");
+            _gpuWUpShexp[i] = UploadWeight($"blk.{i}.ffn_up_shexp.weight");
+            _gpuWDownShexp[i] = UploadWeight($"blk.{i}.ffn_down_shexp.weight");
+
             if (!_cpuMoe)
             {
                 _gpuWGateInp[i] = UploadWeight($"blk.{i}.ffn_gate_inp.weight");
                 _gpuWGateInpShexp[i] = UploadWeight($"blk.{i}.ffn_gate_inp_shexp.weight");
-                _gpuWGateShexp[i] = UploadWeight($"blk.{i}.ffn_gate_shexp.weight");
-                _gpuWUpShexp[i] = UploadWeight($"blk.{i}.ffn_up_shexp.weight");
-                _gpuWDownShexp[i] = UploadWeight($"blk.{i}.ffn_down_shexp.weight");
             }
             else
             {
                 _cpuFfnGateInp![i] = ResolveCpuWeight($"blk.{i}.ffn_gate_inp.weight");
-                _cpuFfnGateShexp![i] = ResolveCpuWeight($"blk.{i}.ffn_gate_shexp.weight");
-                _cpuFfnUpShexp![i] = ResolveCpuWeight($"blk.{i}.ffn_up_shexp.weight");
-                _cpuFfnDownShexp![i] = ResolveCpuWeight($"blk.{i}.ffn_down_shexp.weight");
                 _cpuFfnGateExps![i] = ResolveCpuWeight($"blk.{i}.ffn_gate_exps.weight");
                 _cpuFfnUpExps![i] = ResolveCpuWeight($"blk.{i}.ffn_up_exps.weight");
                 _cpuFfnDownExps![i] = ResolveCpuWeight($"blk.{i}.ffn_down_exps.weight");
@@ -990,7 +986,21 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         int numActive = _numActiveExperts;
         int expertDim = _expertDim;
 
-        // 1. Router: ffn_gate_inp.weight is F32 [embDim, numExperts]; softmax then top-K.
+        // 1. Kick off the GPU shared expert (async; overlaps with CPU work below).
+        //    _gpuNormBuf is already populated by the RmsNorm before this call;
+        //    the launches return immediately and execute while the CPU runs router
+        //    and routed experts. Sigmoid scalar gate is computed on CPU and applied
+        //    via ScaleInPlace before the host blocks on Download.
+        GpuMatMul(_gpuFfnGate, _gpuWGateShexp[layer], _gpuNormBuf);
+        GpuMatMul(_gpuFfnUp, _gpuWUpShexp[layer], _gpuNormBuf);
+        _gpu.SiLuMul(_gpuFfnGate, _gpuFfnUp);
+        GpuMatMul(_gpuSharedOut, _gpuWDownShexp[layer], _gpuFfnGate);
+
+        float shexpDot = SimdKernels.DotF32(_cpuFfnGateInpShexp![layer], _cpuNormBuf, _embDim);
+        float shexpScale = 1.0f / (1.0f + MathF.Exp(-shexpDot));
+        _gpu.ScaleInPlace(_gpuSharedOut, shexpScale);
+
+        // 2. Router: ffn_gate_inp.weight is F32 [embDim, numExperts]; softmax then top-K.
         var routerW = _cpuFfnGateInp![layer];
         SimdKernels.MatVec(_cpuRouterLogits, routerW.DataPtr, _cpuNormBuf,
             numExperts, _embDim, routerW.DType);
@@ -999,24 +1009,6 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         Span<int> selectedExperts = stackalloc int[numActive];
         Span<float> expertWeights = stackalloc float[numActive];
         SelectTopKPtr(_cpuRouterLogits, numExperts, numActive, selectedExperts, expertWeights);
-
-        // 2. Shared expert: ffn_down @ (SiLU(ffn_gate @ x) * (ffn_up @ x)).
-        //    Gate and up share the same input — fuse into a single Parallel.For.
-        var gateShexp = _cpuFfnGateShexp![layer];
-        var upShexp = _cpuFfnUpShexp![layer];
-        var downShexp = _cpuFfnDownShexp![layer];
-        SimdKernels.MatVecDual(
-            _cpuExpertGate, gateShexp.DataPtr,
-            _cpuExpertUp,   upShexp.DataPtr,
-            _cpuNormBuf, expertDim, _embDim, gateShexp.DType, upShexp.DType);
-        SimdKernels.SiLuMul(_cpuExpertGate, _cpuExpertUp, expertDim);
-        SimdKernels.MatVec(_cpuSharedOut, downShexp.DataPtr, _cpuExpertGate,
-            _embDim, expertDim, downShexp.DType);
-
-        // Per-token sigmoid scalar gate on the shared expert output.
-        float shexpDot = SimdKernels.DotF32(_cpuFfnGateInpShexp![layer], _cpuNormBuf, _embDim);
-        float shexpScale = 1.0f / (1.0f + MathF.Exp(-shexpDot));
-        SimdKernels.ScaleInPlace(_cpuSharedOut, shexpScale, _embDim);
 
         // 3. Routed experts (sparse top-K). Accumulate into _cpuMoeHidden.
         new Span<float>(_cpuMoeHidden, _embDim).Clear();
@@ -1035,7 +1027,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 _cpuExpertGate, weight);
         }
 
-        // 4. Add shared expert output.
+        // 4. Wait for GPU shared expert, download, and combine into routed accumulator.
+        _gpu.Synchronize();
+        _gpu.Download(_gpuSharedOut, new Span<float>(_cpuSharedOut, _embDim));
         SimdKernels.AddInPlace(_cpuMoeHidden, _cpuSharedOut, _embDim);
     }
 
@@ -1590,13 +1584,13 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         {
             _gpu.Free(_gpuAttnNorm[i]);
             _gpu.Free(_gpuPostAttnNorm[i]);
+            _gpu.Free(_gpuWGateShexp[i]);
+            _gpu.Free(_gpuWUpShexp[i]);
+            _gpu.Free(_gpuWDownShexp[i]);
             if (!_cpuMoe)
             {
                 _gpu.Free(_gpuWGateInp[i]);
                 _gpu.Free(_gpuWGateInpShexp[i]);
-                _gpu.Free(_gpuWGateShexp[i]);
-                _gpu.Free(_gpuWUpShexp[i]);
-                _gpu.Free(_gpuWDownShexp[i]);
             }
             if (_hp.LayerTypes![i] == LayerType.Attention)
             {
