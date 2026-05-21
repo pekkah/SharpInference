@@ -1066,12 +1066,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             upAll[idx]   = DispatchDot(upP   + offU, normBuf, embDimL, upDt);
         });
 
-        // Phase B: SiLuMul on each expert's gate vector (scalar; fast).
-        for (int k = 0; k < numActive; k++)
-        {
-            SimdKernels.SiLuMul(_cpuExpertGateAll + (long)k * expertDim,
-                                _cpuExpertUpAll   + (long)k * expertDim, expertDim);
-        }
+        // Phase B: one fused SiLuMul over (numActive × expertDim) contiguous
+        // floats. SiLuMul is element-wise, so expert boundaries don't matter —
+        // one AVX-vectorised call beats 8 with their own setup cost.
+        SimdKernels.SiLuMul(_cpuExpertGateAll, _cpuExpertUpAll, numActive * expertDim);
 
         // Phase C: down × weight, fused across all 8 experts into one sweep over
         // embDim rows. Each thread owns its rows so there's no cross-expert race.
