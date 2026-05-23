@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/samples/">
     <Project Path="samples/SharpInference.Sample.Chat/SharpInference.Sample.Chat.csproj" />
+    <Project Path="samples/SharpInference.Sample.ToolCall/SharpInference.Sample.ToolCall.csproj" />
   </Folder>
   <Folder Name="/benchmarks/">
     <Project Path="benchmarks/SharpInference.Bench/SharpInference.Bench.csproj" />

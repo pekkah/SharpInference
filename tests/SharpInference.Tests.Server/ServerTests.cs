@@ -781,6 +781,161 @@ public sealed class ServerTests : IClassFixture<WebApplicationFactory<Program>>
         Assert.NotNull(fake.LastSamplingParams);
         Assert.Equal(0, fake.LastSamplingParams!.MaxThinkingTokens);
     }
+
+    // ── Tool calling ─────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task AnthropicMessages_WithTools_NonStreaming_ReturnsToolUseBlock()
+    {
+        // Model output contains a <tool_call> block — endpoint must parse it and return
+        // a tool_use content block with stop_reason = "tool_use".
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(new FakeInferenceEngine(
+                "test-model",
+                [
+                    (GenerateChunkKind.Text, "<tool_call>\n"),
+                    (GenerateChunkKind.Text, "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}"),
+                    (GenerateChunkKind.Text, "\n</tool_call>"),
+                ]))));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "What's the weather?" } },
+            max_tokens = 50,
+            stream = false,
+            tools = new[]
+            {
+                new
+                {
+                    name = "get_weather",
+                    description = "Get weather for a city",
+                    input_schema = new { type = "object", properties = new { city = new { type = "string" } } }
+                }
+            }
+        };
+        var response = await client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+
+        Assert.Equal("tool_use", doc.RootElement.GetProperty("stop_reason").GetString());
+
+        var content = doc.RootElement.GetProperty("content");
+        Assert.Equal(1, content.GetArrayLength());
+        var block = content[0];
+        Assert.Equal("tool_use", block.GetProperty("type").GetString());
+        Assert.Equal("get_weather", block.GetProperty("name").GetString());
+        Assert.True(block.TryGetProperty("id", out _), "tool_use block must have id");
+        var input = block.GetProperty("input");
+        Assert.Equal("Paris", input.GetProperty("city").GetString());
+    }
+
+    [Fact]
+    public async Task AnthropicMessages_WithTools_NonStreaming_TextBeforeToolCall_ReturnsBothBlocks()
+    {
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(new FakeInferenceEngine(
+                "test-model",
+                [
+                    (GenerateChunkKind.Text, "Let me check that for you."),
+                    (GenerateChunkKind.Text, "<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"/foo\"}}\n</tool_call>"),
+                ]))));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Read /foo" } },
+            max_tokens = 50,
+            stream = false,
+            tools = new[] { new { name = "read_file", description = "Read a file", input_schema = new { type = "object" } } }
+        };
+        var response = await client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+
+        Assert.Equal("tool_use", doc.RootElement.GetProperty("stop_reason").GetString());
+        var content = doc.RootElement.GetProperty("content");
+        Assert.Equal(2, content.GetArrayLength());
+        Assert.Equal("text",     content[0].GetProperty("type").GetString());
+        Assert.Equal("tool_use", content[1].GetProperty("type").GetString());
+        Assert.Contains("check", content[0].GetProperty("text").GetString());
+    }
+
+    [Fact]
+    public async Task AnthropicMessages_WithTools_Streaming_EmitsToolUseEvents()
+    {
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(new FakeInferenceEngine(
+                "test-model",
+                [
+                    (GenerateChunkKind.Text, "<tool_call>\n"),
+                    (GenerateChunkKind.Text, "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}"),
+                    (GenerateChunkKind.Text, "\n</tool_call>"),
+                ]))));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Run ls" } },
+            max_tokens = 50,
+            stream = true,
+            tools = new[] { new { name = "bash", description = "Run shell command", input_schema = new { type = "object" } } }
+        };
+        var response = await client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+
+        // Must have a tool_use content_block_start event
+        Assert.Contains("\"type\":\"tool_use\"", body);
+        Assert.Contains("\"name\":\"bash\"", body);
+        Assert.Contains("input_json_delta", body);
+        Assert.Contains("tool_use", body); // stop_reason in message_delta
+        Assert.Contains("event: message_stop", body);
+    }
+
+    [Fact]
+    public async Task AnthropicMessages_ToolResultInMessages_IsAccepted()
+    {
+        // Verifies that a multi-turn conversation with tool_result content blocks is
+        // accepted without error (the FakeEngine just echoes its script, so we only
+        // check status code and basic response shape here).
+        var req = new
+        {
+            model = "test-model",
+            messages = new object[]
+            {
+                new { role = "user", content = "What's the weather?" },
+                new
+                {
+                    role = "assistant",
+                    content = new object[]
+                    {
+                        new { type = "tool_use", id = "toolu_01", name = "get_weather", input = new { city = "Paris" } }
+                    }
+                },
+                new
+                {
+                    role = "user",
+                    content = new object[]
+                    {
+                        new { type = "tool_result", tool_use_id = "toolu_01", content = "Sunny, 22°C" }
+                    }
+                }
+            },
+            max_tokens = 20,
+            stream = false,
+            tools = new[] { new { name = "get_weather", description = "Get weather", input_schema = new { type = "object" } } }
+        };
+        var response = await _client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var json = await response.Content.ReadAsStringAsync();
+        Assert.Contains("message", json);
+    }
 }
 
 public sealed class ChatTemplateScrubTests

@@ -90,6 +90,41 @@ public static partial class ChatTemplate
     }
 
     /// <summary>
+    /// Formats a list of pre-built message dictionaries into a prompt string.
+    /// Used for tool-calling paths where messages may include <c>tool_calls</c> entries
+    /// or role="tool" messages. Passes <paramref name="tools"/> to the Jinja context so
+    /// the model's chat template can inject the tool schema into the system prompt.
+    /// Falls back to extracting plain text when no Jinja template is available.
+    /// </summary>
+    public static string Format(
+        IReadOnlyList<Dictionary<string, object?>> messages,
+        string arch,
+        bool enableThinking = true,
+        object? tools = null)
+    {
+        if (Template != null)
+        {
+            var msgList = messages.Cast<object?>().ToList();
+            return Template.Render(new Dictionary<string, object?>
+            {
+                ["messages"]              = msgList,
+                ["add_generation_prompt"] = true,
+                ["tools"]                 = tools,
+                ["enable_thinking"]       = (object?)enableThinking,
+            });
+        }
+
+        // Fallback: extract basic role/content pairs and use hardcoded arch templates.
+        var simple = messages
+            .Select(m => (
+                role:    m.TryGetValue("role",    out var r) ? (r as string ?? "") : "",
+                content: m.TryGetValue("content", out var c) ? (c as string ?? "") : ""
+            ))
+            .ToList();
+        return Format(simple, arch, enableThinking);
+    }
+
+    /// <summary>
     /// Removes <c>&lt;think&gt;...&lt;/think&gt;</c> blocks from a prior assistant turn.
     /// Reasoning-model chat templates (Qwen3, DeepSeek-R1, ...) are trained assuming
     /// historical assistant turns contain no reasoning, so leaving them in bloats the

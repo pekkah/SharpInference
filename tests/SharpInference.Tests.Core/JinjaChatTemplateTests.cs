@@ -51,4 +51,81 @@ public sealed class JinjaChatTemplateTests
     public void Range_StepZero_Throws() =>
         Assert.Throws<InvalidOperationException>(() =>
             Render("{% for i in range(0, 5, 0) %}{{ i }},{% endfor %}"));
+
+    // ── Macro tests ──────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Macro_Basic_RendersBody()
+    {
+        const string src = "{% macro greet(name) %}Hello {{ name }}!{% endmacro %}{{ greet('World') }}";
+        Assert.Equal("Hello World!", Render(src));
+    }
+
+    [Fact]
+    public void Macro_WithDefault_UsesDefaultWhenNotProvided()
+    {
+        const string src = "{% macro greet(name, punct='.') %}Hi {{ name }}{{ punct }}{% endmacro %}{{ greet('Alice') }}|{{ greet('Bob', '!') }}";
+        Assert.Equal("Hi Alice.|Hi Bob!", Render(src));
+    }
+
+    [Fact]
+    public void Macro_CalledMultipleTimes_RendersCorrectly()
+    {
+        const string src = "{% macro item(x) %}[{{ x }}]{% endmacro %}{% for i in range(3) %}{{ item(i) }}{% endfor %}";
+        Assert.Equal("[0][1][2]", Render(src));
+    }
+
+    [Fact]
+    public void Macro_CanAccessOuterContextVariable()
+    {
+        const string src = "{% macro show() %}{{ val }}{% endmacro %}{{ show() }}";
+        var ctx = new Dictionary<string, object?> { ["val"] = "42" };
+        Assert.Equal("42", Render(src, ctx));
+    }
+
+    // ── loop.previtem / loop.nextitem tests ──────────────────────────────────────
+
+    [Fact]
+    public void Loop_Previtem_IsNullOnFirstIteration()
+    {
+        const string src = "{% for x in items %}{% if loop.previtem is defined %}{{ loop.previtem }},{% endif %}{% endfor %}";
+        var ctx = new Dictionary<string, object?> { ["items"] = new List<object?> { "a", "b", "c" } };
+        Assert.Equal("a,b,", Render(src, ctx));
+    }
+
+    [Fact]
+    public void Loop_Nextitem_IsNullOnLastIteration()
+    {
+        const string src = "{% for x in items %}{% if loop.nextitem is defined %}{{ loop.nextitem }},{% endif %}{% endfor %}";
+        var ctx = new Dictionary<string, object?> { ["items"] = new List<object?> { "a", "b", "c" } };
+        Assert.Equal("b,c,", Render(src, ctx));
+    }
+
+    // ── |items filter + tuple unpacking tests ────────────────────────────────────
+
+    [Fact]
+    public void Filter_Items_IteratesKeyValuePairs()
+    {
+        const string src = "{% for k, v in d|items %}{{ k }}={{ v }};{% endfor %}";
+        var ctx = new Dictionary<string, object?> { ["d"] = new Dictionary<string, object?> { ["x"] = "1", ["y"] = "2" } };
+        var result = Render(src, ctx);
+        // Dict order is insertion order in .NET; both pairs must appear
+        Assert.Contains("x=1;", result);
+        Assert.Contains("y=2;", result);
+    }
+
+    [Fact]
+    public void TupleUnpacking_ForLoop_AssignsBothVars()
+    {
+        const string src = "{% for a, b in pairs %}{{ a }}:{{ b }};{% endfor %}";
+        var ctx = new Dictionary<string, object?>
+        {
+            ["pairs"] = new List<object?>
+            {
+                new List<object?> { "foo", "bar" },
+                new List<object?> { "baz", "qux" },
+            }
+        };
+        Assert.Equal("foo:bar;baz:qux;", Render(src, ctx));
+    }
 }

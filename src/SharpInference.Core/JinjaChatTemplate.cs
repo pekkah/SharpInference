@@ -1,6 +1,12 @@
 using System.Text;
+using System.Text.Json;
 
 namespace SharpInference.Core;
+
+/// <summary>A single tool call parsed from raw model output.</summary>
+public readonly record struct ParsedToolCall(
+    string Name,
+    IReadOnlyDictionary<string, object?> Arguments);
 
 /// <summary>
 /// Minimal Jinja2 template engine for LLM chat templates (read from GGUF tokenizer.chat_template
@@ -53,6 +59,14 @@ public sealed class JinjaChatTemplate
         List<(IExpr Cond, List<INode> Body)> ElseIfs, List<INode>? Else) : INode;
     private sealed record ForNode(string Var, IExpr Iter, List<INode> Body) : INode;
     private sealed record SetNode(string[] Path, IExpr Value) : INode;
+    private sealed record MacroNode(string Name, MacroDef Def) : INode;
+
+    private sealed class MacroDef(List<string> posParams, List<(string Name, IExpr Default)> kwParams, List<INode> body)
+    {
+        public List<string> PosParams { get; } = posParams;
+        public List<(string Name, IExpr Default)> KwParams { get; } = kwParams;
+        public List<INode> Body { get; } = body;
+    }
 
     private interface IExpr { }
     private sealed record LiteralExpr(object? Val) : IExpr;
@@ -233,13 +247,42 @@ public sealed class JinjaChatTemplate
                     {
                         return nodes; // caller handles
                     }
-                    else if (tag.StartsWith("macro ", StringComparison.Ordinal)
-                          || tag.StartsWith("block ", StringComparison.Ordinal)
-                          || tag == "raw")
+                    else if (tag.StartsWith("macro ", StringComparison.Ordinal))
                     {
-                        // Consume the body up to {% endmacro %} / {% endblock %} / {% endraw %} and discard.
-                        // Macros are only invoked from inside branches we don't enter (e.g. tool-call rendering
-                        // when tools is empty); calls to undefined macros emit "" via CallFunction's null fallback.
+                        pos++;
+                        var macroBody = ParseNodes(tokens, ref pos);
+                        if (pos < tokens.Count && tokens[pos].Kind == TokenKind.Block
+                            && IsEndTag(tokens[pos].Content)) pos++;
+
+                        string macroSpec = tag[6..].Trim();
+                        int parenOpen = macroSpec.IndexOf('(');
+                        if (parenOpen >= 0)
+                        {
+                            string macroName = macroSpec[..parenOpen].Trim();
+                            int parenClose = macroSpec.LastIndexOf(')');
+                            string paramStr = parenClose > parenOpen
+                                ? macroSpec.Substring(parenOpen + 1, parenClose - parenOpen - 1).Trim()
+                                : "";
+                            var posParams = new List<string>();
+                            var kwParams  = new List<(string Name, IExpr Default)>();
+                            if (paramStr.Length > 0)
+                            {
+                                foreach (var part in paramStr.Split(','))
+                                {
+                                    string p  = part.Trim();
+                                    int    eq = p.IndexOf('=');
+                                    if (eq >= 0)
+                                        kwParams.Add((p[..eq].Trim(), ParseExpr(p[(eq + 1)..].Trim())));
+                                    else if (p.Length > 0)
+                                        posParams.Add(p);
+                                }
+                            }
+                            nodes.Add(new MacroNode(macroName, new MacroDef(posParams, kwParams, macroBody)));
+                        }
+                    }
+                    else if (tag.StartsWith("block ", StringComparison.Ordinal) || tag == "raw")
+                    {
+                        // Consume the body up to {% endblock %} / {% endraw %} and discard.
                         pos++;
                         ParseNodes(tokens, ref pos);
                         if (pos < tokens.Count && tokens[pos].Kind == TokenKind.Block
@@ -681,18 +724,35 @@ public sealed class JinjaChatTemplate
 
                 case ForNode fn:
                     var items = AsList(Eval(fn.Iter, ctx));
+                    bool isTupleFor = fn.Var.Contains(',');
+                    string[]? tupleVarNames = isTupleFor
+                        ? fn.Var.Split(',').Select(v => v.Trim()).ToArray()
+                        : null;
                     for (int i = 0; i < items.Count; i++)
                     {
                         var loopCtx = new Dictionary<string, object?>(ctx, StringComparer.Ordinal)
                         {
-                            [fn.Var] = items[i],
-                            ["loop"] = new LoopCtx(i, items.Count)
+                            ["loop"] = new LoopCtx(i, items.Count, items)
                         };
+                        if (tupleVarNames != null)
+                        {
+                            var pair = AsList(items[i]);
+                            for (int j = 0; j < tupleVarNames.Length; j++)
+                                loopCtx[tupleVarNames[j]] = j < pair.Count ? pair[j] : null;
+                        }
+                        else
+                        {
+                            loopCtx[fn.Var] = items[i];
+                        }
                         EvalNodes(fn.Body, loopCtx, sb);
                         // Propagate NamespaceObj mutations back to outer scope
                         foreach (var kv in loopCtx)
                             if (ctx.ContainsKey(kv.Key) && kv.Value is NamespaceObj) ctx[kv.Key] = kv.Value;
                     }
+                    break;
+
+                case MacroNode mn:
+                    ctx[mn.Name] = mn.Def;
                     break;
 
                 case SetNode sn:
@@ -748,6 +808,8 @@ public sealed class JinjaChatTemplate
             case CallExpr c:
                 var cArgs   = c.Args.Select(a => Eval(a, ctx)).ToList();
                 var cKwargs = c.Kwargs.Select(kv => (kv.Key, Eval(kv.Val, ctx))).ToList();
+                if (ctx.TryGetValue(c.Name, out var macroObj) && macroObj is MacroDef macroDef)
+                    return CallMacro(macroDef, cArgs, cKwargs, ctx);
                 return CallFunction(c.Name, cArgs, cKwargs);
 
             default: return null;
@@ -797,12 +859,14 @@ public sealed class JinjaChatTemplate
             case LoopCtx lc:
                 return attr switch
                 {
-                    "index0" => (object)(long)lc.Index,
-                    "index"  => (long)(lc.Index + 1),
-                    "first"  => lc.Index == 0,
-                    "last"   => lc.Index == lc.Total - 1,
-                    "length" => (long)lc.Total,
+                    "index0"    => (object)(long)lc.Index,
+                    "index"     => (long)(lc.Index + 1),
+                    "first"     => lc.Index == 0,
+                    "last"      => lc.Index == lc.Total - 1,
+                    "length"    => (long)lc.Total,
                     "revindex0" => (long)(lc.Total - lc.Index - 1),
+                    "previtem"  => lc.Index > 0 ? lc.Items[lc.Index - 1] : null,
+                    "nextitem"  => lc.Index < lc.Total - 1 ? lc.Items[lc.Index + 1] : null,
                     _ => null
                 };
             case Dictionary<string, object?> d:
@@ -851,7 +915,9 @@ public sealed class JinjaChatTemplate
 
     private static object? ApplyFilter(object? val, string filter) => filter switch
     {
-        "length"    => val is List<object?> l ? (object)(long)l.Count : val is string s ? (long)s.Length : 0L,
+        "length"    => val is List<object?> l ? (object)(long)l.Count
+                     : val is System.Collections.ICollection col ? (long)col.Count
+                     : val is string s ? (long)s.Length : 0L,
         "tojson"    => ToJson(val),
         "trim"      => val is string sv ? (object)sv.Trim()            : val,
         "upper"     => val is string su ? (object)su.ToUpperInvariant() : val,
@@ -867,6 +933,14 @@ public sealed class JinjaChatTemplate
         "float"     => Convert.ToDouble(val),
         "abs"       => val is long lv ? (object)Math.Abs(lv) : val,
         "e" or "escape" or "forceescape" => val is string se ? (object)HtmlEscape(se) : val,
+        "items" => val switch
+        {
+            Dictionary<string, object?> d => (object?)d
+                .Select(kv => (object?)new List<object?> { kv.Key, kv.Value }).ToList(),
+            System.Collections.IDictionary id => id.Keys.Cast<object?>()
+                .Select(k => (object?)new List<object?> { k, k != null ? id[k] : null }).ToList(),
+            _ => val
+        },
         _ => val
     };
 
@@ -963,6 +1037,28 @@ public sealed class JinjaChatTemplate
         return null;
     }
 
+    private static string CallMacro(MacroDef macro, List<object?> args, List<(string, object?)> kwargs, Dictionary<string, object?> outerCtx)
+    {
+        var macroCtx = new Dictionary<string, object?>(outerCtx, StringComparer.Ordinal);
+        for (int i = 0; i < macro.PosParams.Count; i++)
+            macroCtx[macro.PosParams[i]] = i < args.Count ? args[i] : null;
+        for (int i = 0; i < macro.KwParams.Count; i++)
+        {
+            var (pName, pDefault) = macro.KwParams[i];
+            var kwarg = kwargs.FirstOrDefault(kv => kv.Item1 == pName);
+            if (kwarg.Item1 != null)
+                macroCtx[pName] = kwarg.Item2;
+            else
+            {
+                int posIdx = macro.PosParams.Count + i;
+                macroCtx[pName] = posIdx < args.Count ? args[posIdx] : Eval(pDefault, outerCtx);
+            }
+        }
+        var sb = new StringBuilder();
+        EvalNodes(macro.Body, macroCtx, sb);
+        return sb.ToString();
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────
 
     private static bool Truthy(object? val) => val switch
@@ -974,6 +1070,7 @@ public sealed class JinjaChatTemplate
         double d           => d != 0.0,
         string s           => s.Length > 0,
         List<object?> lst  => lst.Count > 0,
+        System.Collections.ICollection col => col.Count > 0,
         _                  => true
     };
 
@@ -1023,6 +1120,8 @@ public sealed class JinjaChatTemplate
     {
         List<object?> l => l,
         null            => [],
+        string          => [],   // strings are iterable in Python but not treated as lists here
+        System.Collections.IEnumerable e => e.Cast<object?>().ToList(),
         _               => []
     };
 
@@ -1100,6 +1199,21 @@ public sealed class JinjaChatTemplate
             sb.Append('}');
             return sb.ToString();
         }
+        if (val is System.Text.Json.JsonElement je)
+            return je.GetRawText();
+        if (val is System.Collections.IEnumerable ie && val is not string)
+        {
+            var sb = new System.Text.StringBuilder("[");
+            bool firstItem = true;
+            foreach (var item in ie)
+            {
+                if (!firstItem) sb.Append(',');
+                firstItem = false;
+                sb.Append(ToJson(item));
+            }
+            sb.Append(']');
+            return sb.ToString();
+        }
         // Fallback for NamespaceObj or other types
         return ToJson(Stringify(val));
     }
@@ -1129,11 +1243,152 @@ public sealed class JinjaChatTemplate
         public object? Get(string key) => _d.TryGetValue(key, out var v) ? v : null;
     }
 
-    private sealed class LoopCtx(int index, int total)
+    private sealed class LoopCtx(int index, int total, List<object?> items)
     {
+        public LoopCtx(int index, int total) : this(index, total, []) { }
         public int Index { get; } = index;
         public int Total { get; } = total;
+        public List<object?> Items { get; } = items;
     }
+
+    // ── Tool-call parsing ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// Extracts <c>&lt;tool_call&gt;…&lt;/tool_call&gt;</c> blocks from raw model output.
+    /// Supports both Qwen3.6 XML format (<c>&lt;function=name&gt;&lt;parameter=p&gt;v&lt;/parameter&gt;&lt;/function&gt;</c>)
+    /// and standard Qwen3 JSON format (<c>{"name":"…", "arguments":{…}}</c>).
+    /// Returns the plain text with all tool-call blocks stripped, and a list of parsed calls.
+    /// </summary>
+    public static (string PlainText, IReadOnlyList<ParsedToolCall> ToolCalls)
+        ParseToolCalls(string rawOutput)
+    {
+        const string open  = "<tool_call>";
+        const string close = "</tool_call>";
+
+        var calls = new List<ParsedToolCall>();
+        var plain = new StringBuilder();
+        int pos   = 0;
+
+        while (pos < rawOutput.Length)
+        {
+            int start = rawOutput.IndexOf(open, pos, StringComparison.Ordinal);
+            if (start < 0)
+            {
+                plain.Append(rawOutput, pos, rawOutput.Length - pos);
+                break;
+            }
+
+            plain.Append(rawOutput, pos, start - pos);
+
+            int contentStart = start + open.Length;
+            int end = rawOutput.IndexOf(close, contentStart, StringComparison.Ordinal);
+            if (end < 0) break; // malformed — stop
+
+            string block = rawOutput[contentStart..end].Trim();
+            pos = end + close.Length;
+
+            ParsedToolCall? call = block.StartsWith("<function=", StringComparison.Ordinal)
+                ? ParseXmlToolCallBlock(block)
+                : ParseJsonToolCallBlock(block);
+
+            if (call.HasValue) calls.Add(call.Value);
+        }
+
+        return (plain.ToString(), calls);
+    }
+
+    /// <summary>
+    /// Serialises <paramref name="value"/> to a JSON string using the same rules
+    /// as the Jinja <c>tojson</c> filter (strings, numbers, bools, dicts, lists).
+    /// </summary>
+    public static string SerializeToJson(object? value) => ToJson(value);
+
+    // ─────────────────────────────────────────────────────────────────────
+
+    private static ParsedToolCall? ParseXmlToolCallBlock(string block)
+    {
+        const string funcTag    = "<function=";
+        const string funcClose  = "</function>";
+        const string paramTag   = "<parameter=";
+        const string paramClose = "</parameter>";
+
+        int funcStart = block.IndexOf(funcTag, StringComparison.Ordinal);
+        if (funcStart < 0) return null;
+
+        int nameEnd = block.IndexOf('>', funcStart);
+        if (nameEnd < 0) return null;
+        string funcName = block[(funcStart + funcTag.Length)..nameEnd].Trim();
+
+        int funcBodyEnd = block.IndexOf(funcClose, nameEnd, StringComparison.Ordinal);
+        string funcBody = funcBodyEnd >= 0
+            ? block[(nameEnd + 1)..funcBodyEnd]
+            : block[(nameEnd + 1)..];
+
+        var args = new Dictionary<string, object?>(StringComparer.Ordinal);
+        int p = 0;
+        while (p < funcBody.Length)
+        {
+            int paramStart = funcBody.IndexOf(paramTag, p, StringComparison.Ordinal);
+            if (paramStart < 0) break;
+
+            int paramNameEnd = funcBody.IndexOf('>', paramStart);
+            if (paramNameEnd < 0) break;
+            string paramName = funcBody[(paramStart + paramTag.Length)..paramNameEnd].Trim();
+
+            int valueStart = paramNameEnd + 1;
+            int paramEnd   = funcBody.IndexOf(paramClose, valueStart, StringComparison.Ordinal);
+            if (paramEnd < 0) break;
+
+            args[paramName] = funcBody[valueStart..paramEnd].Trim();
+            p = paramEnd + paramClose.Length;
+        }
+
+        return new ParsedToolCall(funcName, args);
+    }
+
+    private static ParsedToolCall? ParseJsonToolCallBlock(string block)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(block);
+            var root  = doc.RootElement;
+            string name = root.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+            if (name.Length == 0) return null;
+
+            var args = new Dictionary<string, object?>(StringComparer.Ordinal);
+            if (root.TryGetProperty("arguments", out var argsElem))
+            {
+                object? parsed = argsElem.ValueKind == JsonValueKind.String
+                    ? JsonElementToObject(JsonDocument.Parse(argsElem.GetString() ?? "{}").RootElement)
+                    : JsonElementToObject(argsElem);
+                if (parsed is Dictionary<string, object?> d) args = d;
+            }
+
+            return new ParsedToolCall(name, args);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static object? JsonElementToObject(JsonElement el) => el.ValueKind switch
+    {
+        JsonValueKind.Object  => el.EnumerateObject()
+                                   .ToDictionary(p => p.Name,
+                                                 p => JsonElementToObject(p.Value),
+                                                 StringComparer.Ordinal),
+        JsonValueKind.Array   => el.EnumerateArray()
+                                   .Select(JsonElementToObject)
+                                   .ToList<object?>(),
+        JsonValueKind.String  => el.GetString(),
+        JsonValueKind.Number  => el.TryGetInt64(out long l) ? (object?)l
+                               : el.TryGetDouble(out double d) ? d
+                               : el.GetRawText(),
+        JsonValueKind.True    => true,
+        JsonValueKind.False   => false,
+        _                     => null,
+    };
 
     // ── Convenience ───────────────────────────────────────────────────────
 
