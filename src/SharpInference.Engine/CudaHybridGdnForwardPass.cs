@@ -633,9 +633,41 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             ResetCache();
             return;
         }
+        if (length == _snapshotLength && _snapshotLength >= 0)
+        {
+            // Issue #21: restore from the end-of-decode snapshot.
+            // 1. Pull the host-side cache from the snapshot buffer.
+            _gdnStateCache.RestoreFrom(_snapshotBuf, _snapshotCap);
+            // 2. On the GPU GDN path, upload each per-layer host buffer back to
+            //    the device tensors. CPU GDN path has nothing extra to do — state
+            //    already lives in _gdnStateCache.
+            if (!_cpuGdn)
+            {
+                int scanFloats = _gdnStateCache.ScanStateFloatsPerLayer;
+                int convFloats = _gdnStateCache.ConvStateFloatsPerLayer;
+                for (int layer = 0; layer < _hp.NumLayers; layer++)
+                {
+                    int g = _gdnStateCache.GdnLayerOf(layer);
+                    if (g < 0) continue;
+                    if (_gpuGdnScanState[layer] is { } scanT && scanFloats > 0)
+                    {
+                        float* hostScan = _gdnStateCache.ScanStateAt(g);
+                        _gpu.UploadInto(scanT, new ReadOnlySpan<float>(hostScan, scanFloats));
+                    }
+                    if (_gpuGdnConvState[layer] is { } convT && convFloats > 0)
+                    {
+                        float* hostConv = _gdnStateCache.ConvStateAt(g);
+                        _gpu.UploadInto(convT, new ReadOnlySpan<float>(hostConv, convFloats));
+                    }
+                }
+            }
+            _kvCache.TruncateTo(length);
+            return;
+        }
         throw new NotSupportedException(
             $"CudaHybridGdnForwardPass.TruncateTo({length}): GDN state is destructively " +
-            $"updated and cannot be partially rewound; only length == 0 or current ({_gdnStateCache.Length}) is supported. " +
+            $"updated and cannot be partially rewound; only length == 0, current ({_gdnStateCache.Length}), " +
+            $"or SnapshotLength ({_snapshotLength}) is supported. " +
             "SupportsPartialRewind == false on this pass — callers should check it before invoking " +
             "TruncateTo with an intermediate length.");
     }
@@ -644,6 +676,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     {
         _kvCache.Reset();
         _gdnStateCache.Reset();
+        ClearSnapshot();
         if (!_cpuGdn)
         {
             // Zero GPU-resident scan + conv state for every GDN layer.
@@ -657,6 +690,64 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     /// <inheritdoc />
     public bool SupportsPartialRewind => false;
+
+    // ── Snapshot / restore (issue #21) ─────────────────────────────────
+    // Same Phase-1 design as HybridGdnForwardPass: one snapshot per forward-pass
+    // instance, captured at end-of-decode by InferenceEngine. The GPU path
+    // downloads device state into the host-side _gdnStateCache before writing
+    // it into _snapshotBuf, then uploads back on restore.
+    private byte* _snapshotBuf;
+    private long _snapshotCap;
+    private int _snapshotLength = -1;
+
+    /// <inheritdoc />
+    public int SnapshotLength => _snapshotLength;
+
+    /// <inheritdoc />
+    public void CaptureSnapshot()
+    {
+        EnsureSnapshotBuf();
+        if (!_cpuGdn)
+        {
+            // GPU GDN path: device tensors hold the live state; the host-side
+            // _gdnStateCache scan/conv buffers are stale. Download per-layer
+            // before snapshotting. _gpu.Download self-syncs the stream so all
+            // recurrence kernels for this token have committed before the copy.
+            int scanFloats = _gdnStateCache.ScanStateFloatsPerLayer;
+            int convFloats = _gdnStateCache.ConvStateFloatsPerLayer;
+            for (int layer = 0; layer < _hp.NumLayers; layer++)
+            {
+                int g = _gdnStateCache.GdnLayerOf(layer);
+                if (g < 0) continue;
+                if (_gpuGdnScanState[layer] is { } scanT && scanFloats > 0)
+                {
+                    float* hostScan = _gdnStateCache.ScanStateAt(g);
+                    _gpu.Download(scanT, new Span<float>(hostScan, scanFloats));
+                }
+                if (_gpuGdnConvState[layer] is { } convT && convFloats > 0)
+                {
+                    float* hostConv = _gdnStateCache.ConvStateAt(g);
+                    _gpu.Download(convT, new Span<float>(hostConv, convFloats));
+                }
+            }
+        }
+        _gdnStateCache.SnapshotInto(_snapshotBuf, _snapshotCap);
+        _snapshotLength = _gdnStateCache.Length;
+    }
+
+    /// <summary>Drop the currently held snapshot (if any).</summary>
+    public void ClearSnapshot() => _snapshotLength = -1;
+
+    private void EnsureSnapshotBuf()
+    {
+        long needed = _gdnStateCache.SnapshotBytes;
+        if (_snapshotBuf != null && _snapshotCap >= needed)
+            return;
+        if (_snapshotBuf != null)
+            NativeMemory.Free(_snapshotBuf);
+        _snapshotBuf = (byte*)NativeMemory.Alloc((nuint)needed);
+        _snapshotCap = needed;
+    }
 
     /// <summary>Forward one token through the hybrid CUDA + CPU stack.</summary>
     public ReadOnlySpan<float> Forward(int token, int position)
@@ -1679,6 +1770,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
             _expertSlotManager.Dispose();
         }
+        if (_snapshotBuf != null)
+        {
+            NativeMemory.Free(_snapshotBuf);
+            _snapshotBuf = null;
+        }
+
         _kvCache.Dispose();
         _gdnStateCache.Dispose();
     }

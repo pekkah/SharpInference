@@ -213,6 +213,106 @@ public sealed unsafe class GdnStateCache : IDisposable
     public void IncrementPosition() => _length++;
 
     /// <summary>
+    /// Total native byte footprint of a snapshot of this cache: a 4-byte length, a
+    /// 4-byte pad (so the float payload is 8-byte aligned), then per-layer conv state
+    /// followed by per-layer scan state, all in dense (GDN-layer-index) order.
+    /// </summary>
+    /// <remarks>
+    /// Layout, byte offsets:
+    /// <list type="bullet">
+    ///   <item><c>0..4</c>:           <c>_length</c> as int32.</item>
+    ///   <item><c>4..8</c>:           padding (zero).</item>
+    ///   <item><c>8..C0</c>:          <c>NumGdnLayers</c> contiguous conv blocks,
+    ///                                each <see cref="ConvStateFloatsPerLayer"/> floats.</item>
+    ///   <item><c>C0..end</c>:        <c>NumGdnLayers</c> contiguous scan blocks,
+    ///                                each <see cref="ScanStateFloatsPerLayer"/> floats.</item>
+    /// </list>
+    /// Per-layer pointers that are <c>null</c> (degenerate <c>ConvKernel == 1</c>)
+    /// contribute zero bytes — they're skipped in both directions.
+    /// </remarks>
+    public long SnapshotBytes =>
+        sizeof(int) + sizeof(int) /* pad */ +
+        (long)NumGdnLayers * ((long)_convStateBytesPerLayer + (long)_scanStateBytesPerLayer);
+
+    /// <summary>
+    /// Write the contents of this cache (including <see cref="Length"/>) into
+    /// <paramref name="dst"/>. The destination must be at least
+    /// <see cref="SnapshotBytes"/> bytes long.
+    /// </summary>
+    /// <exception cref="ArgumentException">When <paramref name="dstBytes"/> is too small.</exception>
+    public void SnapshotInto(byte* dst, long dstBytes)
+    {
+        long needed = SnapshotBytes;
+        if (dst == null)
+            throw new ArgumentNullException(nameof(dst));
+        if (dstBytes < needed)
+            throw new ArgumentException(
+                $"GdnStateCache.SnapshotInto: dstBytes={dstBytes} < SnapshotBytes={needed}.",
+                nameof(dstBytes));
+
+        // Header: length + 4-byte zero pad for alignment.
+        *(int*)dst = _length;
+        *(int*)(dst + sizeof(int)) = 0;
+
+        byte* cursor = dst + 2 * sizeof(int);
+        // Conv blocks first, scan blocks second — matches SnapshotBytes layout.
+        for (int g = 0; g < NumGdnLayers; g++)
+        {
+            if (_convState[g] != null && _convStateBytesPerLayer > 0)
+            {
+                NativeMemory.Copy(_convState[g], cursor, _convStateBytesPerLayer);
+                cursor += (long)_convStateBytesPerLayer;
+            }
+        }
+        for (int g = 0; g < NumGdnLayers; g++)
+        {
+            if (_scanState[g] != null && _scanStateBytesPerLayer > 0)
+            {
+                NativeMemory.Copy(_scanState[g], cursor, _scanStateBytesPerLayer);
+                cursor += (long)_scanStateBytesPerLayer;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Restore the cache contents (and <see cref="Length"/>) from a snapshot previously
+    /// produced by <see cref="SnapshotInto"/>. The source must be at least
+    /// <see cref="SnapshotBytes"/> bytes long.
+    /// </summary>
+    /// <exception cref="ArgumentException">When <paramref name="srcBytes"/> is too small.</exception>
+    public void RestoreFrom(byte* src, long srcBytes)
+    {
+        long needed = SnapshotBytes;
+        if (src == null)
+            throw new ArgumentNullException(nameof(src));
+        if (srcBytes < needed)
+            throw new ArgumentException(
+                $"GdnStateCache.RestoreFrom: srcBytes={srcBytes} < SnapshotBytes={needed}.",
+                nameof(srcBytes));
+
+        _length = *(int*)src;
+        // Padding byte ignored.
+
+        byte* cursor = src + 2 * sizeof(int);
+        for (int g = 0; g < NumGdnLayers; g++)
+        {
+            if (_convState[g] != null && _convStateBytesPerLayer > 0)
+            {
+                NativeMemory.Copy(cursor, _convState[g], _convStateBytesPerLayer);
+                cursor += (long)_convStateBytesPerLayer;
+            }
+        }
+        for (int g = 0; g < NumGdnLayers; g++)
+        {
+            if (_scanState[g] != null && _scanStateBytesPerLayer > 0)
+            {
+                NativeMemory.Copy(cursor, _scanState[g], _scanStateBytesPerLayer);
+                cursor += (long)_scanStateBytesPerLayer;
+            }
+        }
+    }
+
+    /// <summary>
     /// Free all native state buffers. Safe to call twice — subsequent calls are no-ops.
     /// </summary>
     public void Dispose()

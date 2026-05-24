@@ -338,9 +338,16 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     }
 
     /// <summary>
-    /// Truncate caches to <paramref name="length"/>. For hybrid GDN models this is
-    /// only valid at the no-op boundary (length == current) or full reset (length == 0);
-    /// the GDN recurrent state is destructively updated and cannot be partially rewound.
+    /// Truncate caches to <paramref name="length"/>. For hybrid GDN models the GDN
+    /// recurrent state is destructively updated, so this method only accepts:
+    /// <list type="bullet">
+    ///   <item><c>length == 0</c> (full reset).</item>
+    ///   <item><c>length == Length</c> (no-op).</item>
+    ///   <item><c>length == <see cref="SnapshotLength"/></c> when a snapshot was
+    ///         captured by <see cref="CaptureSnapshot"/> at end of the previous
+    ///         decode (issue #21 — restores GDN state from the held snapshot).</item>
+    /// </list>
+    /// Any other length still throws <see cref="NotSupportedException"/>.
     /// </summary>
     public void TruncateTo(int length)
     {
@@ -354,21 +361,64 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             ResetCache();
             return;
         }
+        if (length == _snapshotLength && _snapshotLength >= 0)
+        {
+            // Issue #21: restore GDN state from the end-of-decode snapshot, then
+            // soft-truncate the KV cache to the matching position.
+            _gdnStateCache.RestoreFrom(_snapshotBuf, _snapshotCap);
+            _kvCache.TruncateTo(length);
+            return;
+        }
         throw new NotSupportedException(
             $"HybridGdnForwardPass.TruncateTo({length}): Gated DeltaNet state is destructively " +
-            $"updated and cannot be partially rewound; only length == 0 (Reset) or length == {_gdnStateCache.Length} " +
-            "(current) is supported. SupportsPartialRewind == false on this pass — callers should " +
-            "check it before invoking TruncateTo with an intermediate length.");
+            $"updated and cannot be partially rewound; only length == 0 (Reset), length == {_gdnStateCache.Length} " +
+            $"(current), or length == SnapshotLength ({_snapshotLength}) is supported. " +
+            "SupportsPartialRewind == false on this pass — callers should check it before invoking " +
+            "TruncateTo with an intermediate length.");
     }
 
     public void ResetCache()
     {
         _kvCache.Reset();
         _gdnStateCache.Reset();
+        ClearSnapshot();
     }
 
     /// <inheritdoc />
     public bool SupportsPartialRewind => false;
+
+    // ── Snapshot / restore (issue #21) ─────────────────────────────────
+    // One snapshot is held per forward-pass instance. The buffer is lazily
+    // allocated on first capture and reused thereafter — sizes are constant
+    // for the lifetime of the pass (model dims don't change).
+    private byte* _snapshotBuf;       // pinned native, lazy-allocated to _gdnStateCache.SnapshotBytes
+    private long _snapshotCap;        // allocated capacity in bytes
+    private int _snapshotLength = -1; // -1 ⇒ no snapshot held
+
+    /// <inheritdoc />
+    public int SnapshotLength => _snapshotLength;
+
+    /// <inheritdoc />
+    public void CaptureSnapshot()
+    {
+        EnsureSnapshotBuf();
+        _gdnStateCache.SnapshotInto(_snapshotBuf, _snapshotCap);
+        _snapshotLength = _gdnStateCache.Length;
+    }
+
+    /// <summary>Drop the currently held snapshot (if any).</summary>
+    public void ClearSnapshot() => _snapshotLength = -1;
+
+    private void EnsureSnapshotBuf()
+    {
+        long needed = _gdnStateCache.SnapshotBytes;
+        if (_snapshotBuf != null && _snapshotCap >= needed)
+            return;
+        if (_snapshotBuf != null)
+            NativeMemory.Free(_snapshotBuf);
+        _snapshotBuf = (byte*)NativeMemory.Alloc((nuint)needed);
+        _snapshotCap = needed;
+    }
 
     /// <summary>Run one token through the hybrid transformer.</summary>
     public ReadOnlySpan<float> Forward(int token, int position)
@@ -1073,6 +1123,12 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         foreach (var p in _normCache.Values)
             NativeMemory.Free((float*)p);
         _normCache.Clear();
+
+        if (_snapshotBuf != null)
+        {
+            NativeMemory.Free(_snapshotBuf);
+            _snapshotBuf = null;
+        }
 
         _kvCache.Dispose();
         _gdnStateCache.Dispose();

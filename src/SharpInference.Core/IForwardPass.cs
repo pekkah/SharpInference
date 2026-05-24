@@ -53,4 +53,23 @@ public interface IForwardPass : IDisposable
     /// throw on partial rewind.
     /// </summary>
     bool SupportsPartialRewind => false;
+
+    /// <summary>
+    /// Length (in tokens) of the most recently captured end-of-decode snapshot, or
+    /// <c>-1</c> when no snapshot is held. Used by <see cref="InferenceEngine"/> to
+    /// reuse cached state across chat-continuation turns on forward passes that don't
+    /// support arbitrary partial rewind (specifically GDN hybrids — issue #21).
+    /// The default <c>-1</c> means "no snapshot facility"; rewindable transformer
+    /// passes ignore this and the engine instead consults <see cref="SupportsPartialRewind"/>.
+    /// </summary>
+    int SnapshotLength => -1;
+
+    /// <summary>
+    /// Capture a snapshot of the current cache state so a subsequent
+    /// <see cref="TruncateTo"/> at <see cref="SnapshotLength"/> can restore it.
+    /// Called once at end-of-decode by the inference engine; no-op by default.
+    /// Implementations that support snapshots must update <see cref="SnapshotLength"/>
+    /// to the cache's current token length when this returns.
+    /// </summary>
+    void CaptureSnapshot() { }
 }
