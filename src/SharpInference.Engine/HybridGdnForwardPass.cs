@@ -357,7 +357,8 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         throw new NotSupportedException(
             $"HybridGdnForwardPass.TruncateTo({length}): Gated DeltaNet state is destructively " +
             $"updated and cannot be partially rewound; only length == 0 (Reset) or length == {_gdnStateCache.Length} " +
-            "(current) is supported. Speculative decoding is disabled for hybrid GDN models in v1.");
+            "(current) is supported. SupportsPartialRewind == false on this pass — callers should " +
+            "check it before invoking TruncateTo with an intermediate length.");
     }
 
     public void ResetCache()
@@ -365,6 +366,9 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         _kvCache.Reset();
         _gdnStateCache.Reset();
     }
+
+    /// <inheritdoc />
+    public bool SupportsPartialRewind => false;
 
     /// <summary>Run one token through the hybrid transformer.</summary>
     public ReadOnlySpan<float> Forward(int token, int position)

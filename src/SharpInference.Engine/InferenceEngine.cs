@@ -153,7 +153,9 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     var stopIds = sp.StopTokenIds ?? [_tokenizer.EosTokenId];
 
                     // Prefix cache check: reuse K/V for matching prefix, skip its prefill.
-                    int prefixLen = FindCacheablePrefix(tokens);
+                    // Skipped entirely when the forward pass can't partially rewind (Gated
+                    // DeltaNet hybrid models) — issue #20.
+                    int prefixLen = _fwd.SupportsPartialRewind ? FindCacheablePrefix(tokens) : 0;
                     if (prefixLen > 0)
                     {
                         // Soft-truncate: discard positions >= prefixLen, keep prefix K/V.
@@ -172,7 +174,10 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     else
                         logits = _fwd.Forward(tokens[^1], tokens.Length - 1);
 
-                    _prevTokens = tokens;
+                    // Only track tokens for FindCacheablePrefix when the pass can actually
+                    // use them — on incompatible passes the array would be dead weight.
+                    if (_fwd.SupportsPartialRewind)
+                        _prevTokens = tokens;
 
                     // Decode loop. Separate stateful UTF-8 decoders for the answer stream and
                     // the thinking stream so multi-byte characters in either stream reassemble

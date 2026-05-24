@@ -22,8 +22,15 @@ public interface IForwardPass : IDisposable
     ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0);
 
     /// <summary>
-    /// Truncate the KV cache to the given length, discarding positions >= length.
+    /// Truncate the KV cache to the given length, discarding positions &gt;= length.
     /// Used by speculative decoding to rewind rejected draft tokens.
+    /// <para>
+    /// Implementations that return <c>false</c> from <see cref="SupportsPartialRewind"/>
+    /// accept only <c>length == 0</c> (full reset) or <c>length == currentCacheLength</c>
+    /// (no-op); any other value must throw <see cref="NotSupportedException"/>. Callers that
+    /// need to rewind to an intermediate position must check <see cref="SupportsPartialRewind"/>
+    /// first.
+    /// </para>
     /// </summary>
     void TruncateTo(int length);
 
@@ -35,4 +42,15 @@ public interface IForwardPass : IDisposable
 
     /// <summary>Reset the KV cache to empty (start of a new conversation).</summary>
     void ResetCache();
+
+    /// <summary>
+    /// Whether <see cref="TruncateTo"/> accepts arbitrary intermediate lengths (i.e. values
+    /// other than 0 or the current cache length). Defaults to <c>false</c> so new
+    /// implementations are safe by default; rewindable transformer passes must opt in by
+    /// overriding this to <c>true</c>. Models whose state is destructively updated per
+    /// token (e.g. Gated DeltaNet hybrid) leave this at the default. Consumed by the
+    /// inference engine and speculative decoder to skip code paths that would otherwise
+    /// throw on partial rewind.
+    /// </summary>
+    bool SupportsPartialRewind => false;
 }

@@ -128,6 +128,9 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             _cpuKvCache.TruncateTo(length);
     }
 
+    /// <inheritdoc />
+    public bool SupportsPartialRewind => true;
+
     public CudaHybridForwardPass(GgufModel model, CudaBackend gpu, ModelHyperparams hp,
         LayerPlacement placement, bool enableTq = false, int tqFp32Window = 256, int tqBits = 3,
         int expertSlotCapacity = -1)
