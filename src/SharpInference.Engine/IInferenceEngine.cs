@@ -18,6 +18,22 @@ public interface IInferenceEngine
     int ActiveRequests { get; }
 
     /// <summary>
+    /// Whether this engine is *capable* of prefix-cache reuse — not whether a reuse just
+    /// happened. Returns <c>false</c> when the underlying forward pass cannot partially
+    /// rewind its KV cache (e.g. Gated DeltaNet hybrid models like Qwen3.6); in that case
+    /// every request re-prefills the full prompt. To observe whether prefix reuse is
+    /// actually saving work, scrape <see cref="PrefillTokensReused"/>.
+    /// </summary>
+    bool PrefixCacheEnabled { get; }
+
+    /// <summary>
+    /// Running count of prompt tokens skipped via the prefix-cache fast path across the
+    /// lifetime of this engine instance. <c>long</c> because the value can grow unbounded
+    /// on a long-running server.
+    /// </summary>
+    long PrefillTokensReused { get; }
+
+    /// <summary>
     /// Generate typed chunks from a pre-formatted prompt string. Each chunk is tagged as
     /// either user-facing <see cref="GenerateChunkKind.Text"/> or internal
     /// <see cref="GenerateChunkKind.Thinking"/> reasoning. The boundary tokens

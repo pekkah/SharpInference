@@ -75,6 +75,52 @@ public sealed class InferenceEnginePrefixCacheTests
         Assert.Equal(32, fwd.LastPrefillStartPos);
     }
 
+    /// <summary>
+    /// Issue #22: rewind-incompatible passes must surface <see cref="IInferenceEngine.PrefixCacheEnabled"/>
+    /// as <c>false</c>, and <see cref="IInferenceEngine.PrefillTokensReused"/> must remain at zero across
+    /// turns because the engine is forced down the full-reset branch.
+    /// </summary>
+    [Fact]
+    public async Task PrefixCacheState_OnRewindIncompatiblePass_ReportsDisabledAndZeroReused()
+    {
+        var tokenizer = new MultiTurnTokenizer();
+        var fwd = new RewindIncompatibleForwardPass();
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock", thinkTokenId: -1, endThinkTokenId: -1);
+
+        Assert.False(engine.PrefixCacheEnabled);
+        Assert.Equal(0, engine.PrefillTokensReused);
+
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 1 };
+        await Drain(engine.GenerateAsync("turn1", sp));
+        await Drain(engine.GenerateAsync("turn2", sp));
+
+        Assert.Equal(0, engine.PrefillTokensReused);
+    }
+
+    /// <summary>
+    /// Issue #22: rewind-capable passes report <see cref="IInferenceEngine.PrefixCacheEnabled"/> true
+    /// and accumulate the matched-prefix length into <see cref="IInferenceEngine.PrefillTokensReused"/>
+    /// after a cache hit. The fixture's two-turn prompt shares a 32-token prefix.
+    /// </summary>
+    [Fact]
+    public async Task PrefixCacheState_OnRewindCapablePass_ReportsEnabledAndAccumulatesReused()
+    {
+        var tokenizer = new MultiTurnTokenizer();
+        var fwd = new RewindCapableForwardPass();
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock", thinkTokenId: -1, endThinkTokenId: -1);
+
+        Assert.True(engine.PrefixCacheEnabled);
+
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 1 };
+        await Drain(engine.GenerateAsync("turn1", sp));
+        // First turn is a cold start — no prefix to reuse.
+        Assert.Equal(0, engine.PrefillTokensReused);
+
+        await Drain(engine.GenerateAsync("turn2", sp));
+        // Second turn shares a 32-token prefix with turn 1.
+        Assert.Equal(32, engine.PrefillTokensReused);
+    }
+
     private static async Task Drain(IAsyncEnumerable<string> stream)
     {
         await foreach (var _ in stream) { }

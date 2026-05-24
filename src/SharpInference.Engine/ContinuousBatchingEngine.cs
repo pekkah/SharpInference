@@ -105,6 +105,16 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
     public int ActiveRequests => _activeCount;
 
     /// <summary>
+    /// Continuous batching does not (yet) share KV state across requests — each admitted
+    /// sequence allocates its own <see cref="PagedKvCache"/> — so prefix caching is always
+    /// off here.
+    /// </summary>
+    public bool PrefixCacheEnabled => false;
+
+    /// <inheritdoc/>
+    public long PrefillTokensReused => 0;
+
+    /// <summary>
     /// Back-compat string-stream view of <see cref="GenerateChunksAsync"/>: yields only
     /// user-facing answer text, suppressing reasoning chunks. Equivalent to the default
     /// interface-method implementation on <see cref="IInferenceEngine"/> but callable

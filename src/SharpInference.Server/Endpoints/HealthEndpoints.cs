@@ -49,7 +49,13 @@ public static class HealthEndpoints
             $"sharpi_queue_depth {engine.QueueDepth}\n" +
             $"# HELP sharpi_active_requests Number of requests currently generating tokens\n" +
             $"# TYPE sharpi_active_requests gauge\n" +
-            $"sharpi_active_requests {engine.ActiveRequests}\n",
+            $"sharpi_active_requests {engine.ActiveRequests}\n" +
+            $"# HELP sharpi_prefix_cache_enabled 1 if the engine's prefix-cache reuse path is active, 0 if disabled (e.g. GDN hybrid models)\n" +
+            $"# TYPE sharpi_prefix_cache_enabled gauge\n" +
+            $"sharpi_prefix_cache_enabled {(engine.PrefixCacheEnabled ? 1 : 0)}\n" +
+            $"# HELP sharpi_prefill_tokens_reused_total Total prompt tokens skipped via the prefix-cache fast path\n" +
+            $"# TYPE sharpi_prefill_tokens_reused_total counter\n" +
+            $"sharpi_prefill_tokens_reused_total {engine.PrefillTokensReused}\n",
             ctx.RequestAborted);
     }
 }
