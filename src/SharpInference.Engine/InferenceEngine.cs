@@ -165,19 +165,54 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     var rng = new Random();
                     var stopIds = sp.StopTokenIds ?? [_tokenizer.EosTokenId];
 
-                    // Prefix cache check: reuse K/V for matching prefix, skip its prefill.
-                    // Skipped entirely when the forward pass can't partially rewind (Gated
-                    // DeltaNet hybrid models) — issue #20.
-                    int prefixLen = _fwd.SupportsPartialRewind ? FindCacheablePrefix(tokens) : 0;
-                    if (prefixLen > 0)
+                    // Track the full generated sequence (prompt + decoded tokens) so the
+                    // next turn's prefix match has the right baseline — issue #21. Sized
+                    // up front: prompt + MaxNewTokens is a safe upper bound. List<int> is
+                    // cheap (vs. native alloc) and just shadows the tokens we'd lose to
+                    // the channel writer.
+                    var fullSeq = new List<int>(tokens.Length + Math.Max(1, sp.MaxNewTokens));
+                    fullSeq.AddRange(tokens);
+
+                    // Prefix cache decision: two branches.
+                    //   (a) Rewindable attention pass — existing FindCacheablePrefix path,
+                    //       page-aligned KV reuse.
+                    //   (b) Non-rewindable GDN hybrid with a snapshot — issue #21: try
+                    //       exact-match against the most-recent snapshot length so the
+                    //       held GDN recurrent state can be restored.
+                    // If neither branch hits, fall back to a full ResetCache + Prefill.
+                    int prefixLen = 0;
+                    if (_fwd.SupportsPartialRewind)
                     {
-                        // Soft-truncate: discard positions >= prefixLen, keep prefix K/V.
-                        _fwd.TruncateTo(prefixLen);
-                        Interlocked.Add(ref _prefillTokensReused, prefixLen);
+                        int candidate = FindCacheablePrefix(tokens);
+                        if (candidate > 0)
+                        {
+                            _fwd.TruncateTo(candidate);
+                            prefixLen = candidate;
+                        }
+                    }
+                    else if (_fwd.SnapshotLength > 0 && _prevTokens != null)
+                    {
+                        int snapLen = _fwd.SnapshotLength;
+                        // snapLen must be a strict prefix of the new prompt (need at least
+                        // one suffix token to drive the decoder) AND a prefix of the
+                        // previously decoded sequence (so the snapshot matches the state
+                        // at that token position).
+                        if (snapLen <= tokens.Length - 1 && snapLen <= _prevTokens.Length
+                            && tokens.AsSpan(0, snapLen).SequenceEqual(_prevTokens.AsSpan(0, snapLen)))
+                        {
+                            _fwd.TruncateTo(snapLen);
+                            prefixLen = snapLen;
+                        }
+                    }
+                    if (prefixLen == 0)
+                    {
+                        _fwd.ResetCache();
                     }
                     else
                     {
-                        _fwd.ResetCache();
+                        // Issue #22 observability: account reused tokens regardless of
+                        // mechanism (attention partial-rewind or GDN snapshot).
+                        Interlocked.Add(ref _prefillTokensReused, prefixLen);
                     }
 
                     // Prefill: process all prompt tokens (or just the suffix after the cached prefix).
@@ -187,11 +222,6 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                         logits = _fwd.Prefill(suffixTokens, prefixLen);
                     else
                         logits = _fwd.Forward(tokens[^1], tokens.Length - 1);
-
-                    // Only track tokens for FindCacheablePrefix when the pass can actually
-                    // use them — on incompatible passes the array would be dead weight.
-                    if (_fwd.SupportsPartialRewind)
-                        _prevTokens = tokens;
 
                     // Decode loop. Separate stateful UTF-8 decoders for the answer stream and
                     // the thinking stream so multi-byte characters in either stream reassemble
@@ -221,6 +251,12 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                                 ? Sampler.Greedy(logits)
                                 : Sampler.Sample(logits, sp, rng);
                         }
+
+                        // Record every emitted/consumed token (stop tokens included) so the
+                        // post-decode snapshot of _prevTokens reflects the full transcript.
+                        // Issue #21: chat-continuation prompts for turn N+1 typically extend
+                        // turn N's full transcript, not just turn N's prompt.
+                        fullSeq.Add(next);
 
                         if (stopIds.Contains(next)) break;
 
@@ -280,6 +316,18 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     var thinkFlush = thinkDec.Flush();
                     if (thinkFlush.Length > 0)
                         channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Thinking, thinkFlush));
+
+                    // Capture end-of-decode snapshot (issue #21) for the GDN-hybrid passes
+                    // and record the full sequence for prefix matching on the next turn.
+                    // ct.ThrowIfCancellationRequested above ensures we don't reach here on
+                    // a cancelled token — skip capture in that case to avoid stale state.
+                    if (!ct.IsCancellationRequested)
+                    {
+                        _fwd.CaptureSnapshot();
+                        // Write _prevTokens AFTER capturing the snapshot so a subsequent
+                        // turn's prefix check sees the matching state.
+                        _prevTokens = fullSeq.ToArray();
+                    }
 
                     channel.Writer.TryComplete();
                 }
