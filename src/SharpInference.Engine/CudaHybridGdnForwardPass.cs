@@ -635,7 +635,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         }
         throw new NotSupportedException(
             $"CudaHybridGdnForwardPass.TruncateTo({length}): GDN state is destructively " +
-            $"updated and cannot be partially rewound; only length == 0 or current ({_gdnStateCache.Length}) is supported.");
+            $"updated and cannot be partially rewound; only length == 0 or current ({_gdnStateCache.Length}) is supported. " +
+            "SupportsPartialRewind == false on this pass — callers should check it before invoking " +
+            "TruncateTo with an intermediate length.");
     }
 
     public void ResetCache()
@@ -652,6 +654,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             }
         }
     }
+
+    /// <inheritdoc />
+    public bool SupportsPartialRewind => false;
 
     /// <summary>Forward one token through the hybrid CUDA + CPU stack.</summary>
     public ReadOnlySpan<float> Forward(int token, int position)

@@ -33,6 +33,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
     // Observability counters (updated via Interlocked).
     private int _pendingCount;
     private int _activeCount;
+    private long _prefillTokensReused;
 
     private bool _disposed;
 
@@ -43,6 +44,12 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
 
     /// <summary>1 while a generation is in progress, 0 otherwise.</summary>
     public int ActiveRequests => _activeCount;
+
+    /// <inheritdoc/>
+    public bool PrefixCacheEnabled => _fwd.SupportsPartialRewind;
+
+    /// <inheritdoc/>
+    public long PrefillTokensReused => Interlocked.Read(ref _prefillTokensReused);
 
     /// <param name="fwd">Forward pass implementation (CPU / GPU / Hybrid). Owned by this engine.</param>
     /// <param name="tokenizer">Tokenizer matching the model vocabulary.</param>
@@ -70,6 +77,12 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
         _thinkTokenId = thinkTokenId;
         _endThinkTokenId = endThinkTokenId;
         _owned = owned;
+
+        if (!fwd.SupportsPartialRewind)
+        {
+            Console.Error.WriteLine(
+                $"[InferenceEngine] prefix cache disabled — {fwd.GetType().Name} reports SupportsPartialRewind == false. Multi-turn requests will re-prefill the full prompt.");
+        }
     }
 
     /// <summary>
@@ -153,11 +166,14 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     var stopIds = sp.StopTokenIds ?? [_tokenizer.EosTokenId];
 
                     // Prefix cache check: reuse K/V for matching prefix, skip its prefill.
-                    int prefixLen = FindCacheablePrefix(tokens);
+                    // Skipped entirely when the forward pass can't partially rewind (Gated
+                    // DeltaNet hybrid models) — issue #20.
+                    int prefixLen = _fwd.SupportsPartialRewind ? FindCacheablePrefix(tokens) : 0;
                     if (prefixLen > 0)
                     {
                         // Soft-truncate: discard positions >= prefixLen, keep prefix K/V.
                         _fwd.TruncateTo(prefixLen);
+                        Interlocked.Add(ref _prefillTokensReused, prefixLen);
                     }
                     else
                     {
@@ -172,7 +188,10 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     else
                         logits = _fwd.Forward(tokens[^1], tokens.Length - 1);
 
-                    _prevTokens = tokens;
+                    // Only track tokens for FindCacheablePrefix when the pass can actually
+                    // use them — on incompatible passes the array would be dead weight.
+                    if (_fwd.SupportsPartialRewind)
+                        _prevTokens = tokens;
 
                     // Decode loop. Separate stateful UTF-8 decoders for the answer stream and
                     // the thinking stream so multi-byte characters in either stream reassemble

@@ -750,6 +750,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         _kvCache.TruncateTo(length);
     }
 
+    /// <inheritdoc />
+    public bool SupportsPartialRewind => true;
+
     /// <inheritdoc/>
     public void ResetCache()
     {

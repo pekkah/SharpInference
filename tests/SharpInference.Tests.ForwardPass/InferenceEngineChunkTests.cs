@@ -259,6 +259,7 @@ public sealed class InferenceEngineChunkTests
         public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0) => EmitNext();
         public void TruncateTo(int length) { }
         public void ResetCache() { _step = 0; }
+        public bool SupportsPartialRewind => true;
         public void Dispose() { }
     }
 }

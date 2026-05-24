@@ -84,6 +84,9 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         _kvCache.TruncateTo(length);
     }
 
+    /// <inheritdoc />
+    public bool SupportsPartialRewind => true;
+
     // CPU KV cache kept for fallback (not used when GPU attention works)
     private readonly Engine.KvCache _kvCache;
 

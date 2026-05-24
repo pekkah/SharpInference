@@ -1014,6 +1014,8 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
     public string ModelId { get; }
     public int QueueDepth => 0;
     public int ActiveRequests => 0;
+    public bool PrefixCacheEnabled => true;
+    public long PrefillTokensReused => 0;
 
     /// <summary>
     /// Captures the <see cref="SamplingParams"/> handed to the most recent

@@ -293,6 +293,9 @@ public sealed unsafe class ForwardPass : IForwardPass
             _kvCache.TruncateTo(length);
     }
 
+    /// <inheritdoc />
+    public bool SupportsPartialRewind => true;
+
     public void ResetCache()
     {
         if (_tqKvCache != null)

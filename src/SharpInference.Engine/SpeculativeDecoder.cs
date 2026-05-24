@@ -36,6 +36,22 @@ public sealed class SpeculativeDecoder
             throw new ArgumentException(
                 $"Target and draft vocab sizes differ ({target.VocabSize} vs {draft.VocabSize}). " +
                 "Both models must share the same tokenizer.");
+        // Spec-decoding rewinds rejected draft tokens via TruncateTo(P + accepted) on
+        // both passes. Models whose state is destructively updated per token (Gated
+        // DeltaNet hybrid) can't honor that, so fail fast at construction rather than
+        // mid-decode. See issue #20.
+        if (!target.SupportsPartialRewind)
+            throw new ArgumentException(
+                $"Speculative decoding requires the target forward pass to support partial rewind; " +
+                $"{target.GetType().Name} does not. Disable speculative decoding for this model or " +
+                "use a non-GDN target pass.",
+                nameof(target));
+        if (!draft.SupportsPartialRewind)
+            throw new ArgumentException(
+                $"Speculative decoding requires the draft forward pass to support partial rewind; " +
+                $"{draft.GetType().Name} does not. Disable speculative decoding for this model or " +
+                "use a non-GDN draft pass.",
+                nameof(draft));
         _target = target;
         _draft = draft;
         _lookahead = Math.Max(1, lookahead);
