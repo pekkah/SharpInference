@@ -72,4 +72,53 @@ public interface IForwardPass : IDisposable
     /// to the cache's current token length when this returns.
     /// </summary>
     void CaptureSnapshot() { }
+
+    // ── Multi-Token Prediction (MTP / NEXTN) self-speculative decoding ──
+    //
+    // Forward passes that load an MTP head report HasMtpHead = true; callers can
+    // then route through MtpDecoder. The MTP head is a single transformer block
+    // appended at GGUF block index NumLayers (== blk.{NumLayers}), with its own
+    // attention KV cache slot that is independent of the main trunk's KV cache
+    // but advances in lockstep (one position per forward).
+
+    /// <summary>
+    /// True when this pass has loaded an MTP / NEXTN head and can serve
+    /// <see cref="MtpForward"/> calls.
+    /// </summary>
+    bool HasMtpHead => false;
+
+    /// <summary>
+    /// Last token's post-trunk pre-final-norm hidden state (length =
+    /// EmbeddingDim). Refreshed at the end of every <see cref="Forward"/> /
+    /// <see cref="Prefill"/> call. Consumed by <see cref="MtpForward"/> as the
+    /// "previous hidden" input. Returns an empty span when <see cref="HasMtpHead"/>
+    /// is false.
+    /// </summary>
+    ReadOnlySpan<float> LastHidden => default;
+
+    /// <summary>
+    /// Drive the MTP head for one draft step.
+    /// </summary>
+    /// <param name="token">Token at <paramref name="position"/> (= argmax of the
+    /// most recent main logits — already known correct by greedy construction).</param>
+    /// <param name="position">Absolute position where <paramref name="token"/> sits.
+    /// Same position the main pass would use if it were processing the token.</param>
+    /// <param name="prevHidden">Previous main forward's <see cref="LastHidden"/>;
+    /// length must equal EmbeddingDim.</param>
+    /// <returns>Logits predicting the token at <paramref name="position"/> + 1.</returns>
+    ReadOnlySpan<float> MtpForward(int token, int position, ReadOnlySpan<float> prevHidden) =>
+        throw new NotSupportedException(
+            $"{GetType().Name} does not implement an MTP head. Check HasMtpHead before calling.");
+
+    /// <summary>Reset the MTP attention KV cache. No-op when <see cref="HasMtpHead"/> is false.</summary>
+    void MtpResetCache() { }
+
+    /// <summary>
+    /// Truncate the MTP attention KV cache to the given length. Used by the MTP
+    /// verify-and-accept loop to roll back rejected draft positions. The MTP
+    /// attention KV cache is a standard paged cache (supports arbitrary lengths
+    /// up to its current length); destructive GDN state on the main pass is a
+    /// separate concern handled via <see cref="TruncateTo"/> / snapshots.
+    /// </summary>
+    void MtpTruncateTo(int length) { }
 }

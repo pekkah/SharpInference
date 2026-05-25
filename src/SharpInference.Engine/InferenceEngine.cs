@@ -223,6 +223,54 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     else
                         logits = _fwd.Forward(tokens[^1], tokens.Length - 1);
 
+                    // MTP self-speculative decoding (issue #25): when the forward pass
+                    // ships an MTP head AND we're in greedy, non-reasoning mode AND the
+                    // user hasn't disabled MTP via SHARPI_DISABLE_MTP=1, drive decode
+                    // through MtpDecoder instead of the per-token sampling loop below.
+                    // The MTP path emits one extra MTP-drafted token per main forward.
+                    bool useMtp = _fwd.HasMtpHead
+                        && Environment.GetEnvironmentVariable("SHARPI_DISABLE_MTP") != "1"
+                        && sp.Temperature <= 0f
+                        && !thinkingEnabled;
+
+                    if (useMtp)
+                    {
+                        var mtpDec = new MtpDecoder(_fwd);
+                        mtpDec.Initialize(tokens.Length, logits);
+                        var textDecMtp = new Utf8StreamDecoder();
+
+                        mtpDec.Decode(sp.MaxNewTokens, stopIds.AsSpan(), tok =>
+                        {
+                            fullSeq.Add(tok);
+                            var bytes = _tokenizer.DecodeBytes(tok);
+                            var chunk = textDecMtp.Append(bytes);
+                            if (chunk.Length > 0)
+                                channel.Writer.TryWrite(
+                                    new GenerateChunk(GenerateChunkKind.Text, chunk));
+                        }, ct);
+
+                        var textFlushMtp = textDecMtp.Flush();
+                        if (textFlushMtp.Length > 0)
+                            channel.Writer.TryWrite(
+                                new GenerateChunk(GenerateChunkKind.Text, textFlushMtp));
+
+                        if (Environment.GetEnvironmentVariable("SHARPI_TRACE_MTP") == "1"
+                            && mtpDec.TotalDraftsEmitted > 0)
+                        {
+                            Console.Error.WriteLine(
+                                $"[InferenceEngine] MTP: {mtpDec.TotalDraftsAccepted}/{mtpDec.TotalDraftsEmitted} " +
+                                $"drafts accepted ({mtpDec.AcceptanceRate:P1})");
+                        }
+
+                        if (!ct.IsCancellationRequested)
+                        {
+                            _fwd.CaptureSnapshot();
+                            _prevTokens = fullSeq.ToArray();
+                        }
+                        channel.Writer.TryComplete();
+                        return;
+                    }
+
                     // Decode loop. Separate stateful UTF-8 decoders for the answer stream and
                     // the thinking stream so multi-byte characters in either stream reassemble
                     // independently — the two streams never share decoder state.

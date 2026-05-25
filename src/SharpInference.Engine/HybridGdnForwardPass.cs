@@ -180,6 +180,43 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     private readonly TensorRef _outputNorm;
     private readonly TensorRef _outputWeight;
 
+    // ── MTP / NEXTN head (Multi-Token Prediction) — issue #25 ──────────
+    // Loaded when hp.NumMtpLayers > 0. Lives at GGUF block index NumLayers
+    // (= blk.{NumLayers}). One standard attention+FFN block plus four
+    // nextn.* tensors. Output uses the shared lm_head (_outputWeight) but
+    // its OWN pre-output norm (nextn.shared_head_norm), not _outputNorm.
+    private readonly bool _hasMtp;
+    private readonly PagedKvCache? _mtpKvCache;       // standalone KV cache (1 layer)
+    private float* _lastHidden;                       // [embDim] pre-output-norm hidden of latest main Forward
+
+    // MTP attention block tensors (same layout as a main full-attention layer)
+    private readonly TensorRef _mtpAttnNorm;
+    private readonly TensorRef _mtpWQGate;            // Q‖gate interleaved per head (output qDim*2)
+    private readonly TensorRef _mtpWK;
+    private readonly TensorRef _mtpWV;
+    private readonly TensorRef _mtpWO;
+    private readonly float* _mtpQNorm;                // [headDim]
+    private readonly float* _mtpKNorm;                // [headDim]
+    private readonly TensorRef _mtpPostAttnNorm;
+
+    // MTP dense FFN tensors (Q4_K gate/up, Q6_K down typically)
+    private readonly TensorRef _mtpFfnGate;
+    private readonly TensorRef _mtpFfnUp;
+    private readonly TensorRef _mtpFfnDown;
+
+    // nextn.* tensors: pre-fc enorm + hnorm, eh_proj, post-block shared_head_norm
+    private readonly float* _mtpEnorm;                // [embDim] F32 gain
+    private readonly float* _mtpHnorm;                // [embDim] F32 gain
+    private readonly float* _mtpSharedHeadNorm;       // [embDim] F32 gain
+    private readonly TensorRef _mtpEhProj;            // [embDim*2 → embDim]; loaded Q8_0 in GGUF, dequant'd to F32
+
+    // MTP scratch (allocated only when _hasMtp)
+    private readonly float* _mtpEmbedBuf;             // [embDim]
+    private readonly float* _mtpEnormBuf;             // [embDim]
+    private readonly float* _mtpHnormBuf;             // [embDim]
+    private readonly float* _mtpConcatBuf;            // [embDim * 2]
+    private readonly float* _mtpEhProjF32;            // dequant'd eh_proj weight [embDim*2 × embDim] row-major F32
+
     public HybridGdnForwardPass(GgufModel model, IComputeBackend backend, ModelHyperparams hp,
         int maxContextLength = 0)
     {
@@ -354,6 +391,72 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             ? ResolveTensor("output.weight")
             : _embTensor; // tied embeddings
 
+        // ── MTP / NEXTN head (issue #25) — block at index NumLayers ────────
+        // Loaded only when the GGUF reports nextn_predict_layers > 0 AND all
+        // expected tensors are present. Multi-head MTP (NumMtpLayers > 1) is
+        // out of scope for v1; we load only the first head.
+        _hasMtp = hp.NumMtpLayers > 0
+                  && model.FindTensor($"blk.{hp.NumLayers}.nextn.eh_proj.weight") is not null;
+        if (_hasMtp)
+        {
+            int mtpLayerIdx = hp.NumLayers;
+
+            _mtpAttnNorm       = ResolveTensor($"blk.{mtpLayerIdx}.attn_norm.weight");
+            _mtpWQGate         = ResolveTensor($"blk.{mtpLayerIdx}.attn_q.weight");
+            _mtpWK             = ResolveTensor($"blk.{mtpLayerIdx}.attn_k.weight");
+            _mtpWV             = ResolveTensor($"blk.{mtpLayerIdx}.attn_v.weight");
+            _mtpWO             = ResolveTensor($"blk.{mtpLayerIdx}.attn_output.weight");
+            _mtpQNorm          = LoadF32Tensor($"blk.{mtpLayerIdx}.attn_q_norm.weight", _headDim);
+            _mtpKNorm          = LoadF32Tensor($"blk.{mtpLayerIdx}.attn_k_norm.weight", _headDim);
+            _mtpPostAttnNorm   = ResolveTensor($"blk.{mtpLayerIdx}.post_attention_norm.weight");
+            _mtpFfnGate        = ResolveTensor($"blk.{mtpLayerIdx}.ffn_gate.weight");
+            _mtpFfnUp          = ResolveTensor($"blk.{mtpLayerIdx}.ffn_up.weight");
+            _mtpFfnDown        = ResolveTensor($"blk.{mtpLayerIdx}.ffn_down.weight");
+
+            _mtpEnorm          = LoadF32Tensor($"blk.{mtpLayerIdx}.nextn.enorm.weight", _embDim);
+            _mtpHnorm          = LoadF32Tensor($"blk.{mtpLayerIdx}.nextn.hnorm.weight", _embDim);
+            _mtpSharedHeadNorm = LoadF32Tensor($"blk.{mtpLayerIdx}.nextn.shared_head_norm.weight", _embDim);
+
+            // eh_proj is Q8_0 in GGUF; dequant to F32 once at load. The matvec is
+            // 10240→5120 once per draft step (~52 M MACs), and a native Q8_0 MatVec
+            // path doesn't exist in SimdKernels.MatVec's specialised switch. F32 is
+            // 200 MiB extra residence vs Q8_0's ~50 MiB but eliminates dequant cost
+            // on the hot path. Switching to a Q8_0 MatVec is a follow-up.
+            _mtpEhProj = ResolveTensor($"blk.{mtpLayerIdx}.nextn.eh_proj.weight");
+            long ehProjElems = _mtpEhProj.Info.ElementCount;
+            if (ehProjElems != (long)_embDim * 2 * _embDim)
+                throw new InvalidOperationException(
+                    $"blk.{mtpLayerIdx}.nextn.eh_proj.weight: expected {(long)_embDim * 2 * _embDim} elements " +
+                    $"({_embDim}*2 × {_embDim}), got {ehProjElems}.");
+            _mtpEhProjF32 = Alloc((int)ehProjElems);
+            if (_mtpEhProj.DType == DType.Float32)
+            {
+                var srcSpan = MemoryMarshal.Cast<byte, float>(
+                    _model.GetTensorData(_mtpEhProj.Info)).Slice(0, (int)ehProjElems);
+                srcSpan.CopyTo(new Span<float>(_mtpEhProjF32, (int)ehProjElems));
+            }
+            else
+            {
+                Dequantize.ToFloat32(_model.GetTensorData(_mtpEhProj.Info),
+                    new Span<float>(_mtpEhProjF32, (int)ehProjElems), _mtpEhProj.DType, ehProjElems);
+            }
+
+            // MTP attention has its OWN paged KV cache (one layer). Position numbering
+            // matches the main trunk's — pos P in MTP = pos P in main = "the token that
+            // sits at position P" — so accept/reject rewinds can use the same length.
+            _mtpKvCache = new PagedKvCache(numLayers: 1, _numKvHeads, _headDim);
+
+            // MTP scratch — small (≤ 10240 floats per buffer, ≪ 1 MiB total).
+            _mtpEmbedBuf  = Alloc(_embDim);
+            _mtpEnormBuf  = Alloc(_embDim);
+            _mtpHnormBuf  = Alloc(_embDim);
+            _mtpConcatBuf = Alloc(_embDim * 2);
+
+            // Pre-norm hidden capture buffer; the post-trunk pre-output-norm hidden
+            // is needed as MTP input. Sized at embDim, refreshed each Forward.
+            _lastHidden = Alloc(_embDim);
+        }
+
         PrefaultWeights();
     }
 
@@ -424,11 +527,19 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     {
         _kvCache.Reset();
         _gdnStateCache.Reset();
+        _mtpKvCache?.Reset();
         ClearSnapshot();
     }
 
     /// <inheritdoc />
     public bool SupportsPartialRewind => false;
+
+    /// <inheritdoc />
+    public bool HasMtpHead => _hasMtp;
+
+    /// <inheritdoc />
+    public ReadOnlySpan<float> LastHidden =>
+        _hasMtp ? new ReadOnlySpan<float>(_lastHidden, _embDim) : default;
 
     // ── Snapshot / restore (issue #21) ─────────────────────────────────
     // One snapshot is held per forward-pass instance. The buffer is lazily
@@ -530,7 +641,12 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         _kvCache.IncrementPosition();
         _gdnStateCache.IncrementPosition();
 
-        // 5. Final norm + output projection
+        // 5. Capture pre-output-norm hidden for MTP (issue #25). RmsNorm below
+        //    overwrites _hidden in place, so snapshot now. Cheap (embDim copy).
+        if (_hasMtp)
+            new ReadOnlySpan<float>(_hidden, _embDim).CopyTo(new Span<float>(_lastHidden, _embDim));
+
+        // 6. Final norm + output projection
         var outNormW = GetNormWeight(_outputNorm);
         SimdKernels.RmsNorm(_hidden, _hidden, outNormW, _embDim, _hp.RmsNormEps);
 
@@ -721,6 +837,180 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
                 }
             }
         });
+    }
+
+    // ============================================================
+    //  MTP / NEXTN head — Multi-Token Prediction (issue #25)
+    // ============================================================
+
+    /// <inheritdoc />
+    public ReadOnlySpan<float> MtpForward(int token, int position, ReadOnlySpan<float> prevHidden)
+    {
+        if (!_hasMtp)
+            throw new InvalidOperationException(
+                "MtpForward called on a HybridGdnForwardPass that did not load an MTP head. " +
+                "Check HasMtpHead before calling.");
+        if (prevHidden.Length != _embDim)
+            throw new ArgumentException(
+                $"prevHidden length {prevHidden.Length} != EmbeddingDim {_embDim}.", nameof(prevHidden));
+
+        // 1. Embed token into _mtpEmbedBuf [embDim].
+        int bytesPerEmbRow = (_embDim / DTypeInfo.BlockSize(_embTensor.DType))
+                           * DTypeInfo.BytesPerBlock(_embTensor.DType);
+        byte* embRowPtr = _embTensor.DataPtr + (long)token * bytesPerEmbRow;
+        if (_embTensor.DType == DType.Float32)
+        {
+            new ReadOnlySpan<float>((float*)embRowPtr, _embDim)
+                .CopyTo(new Span<float>(_mtpEmbedBuf, _embDim));
+        }
+        else
+        {
+            SimdKernels.DequantRow(embRowPtr, _mtpEmbedBuf, _embDim, _embTensor.DType);
+        }
+
+        // 2. enorm(embedding) → _mtpEnormBuf, hnorm(prevHidden) → _mtpHnormBuf.
+        //    Both apply RMSNorm with their respective per-channel gain vector.
+        SimdKernels.RmsNorm(_mtpEnormBuf, _mtpEmbedBuf, _mtpEnorm, _embDim, _hp.RmsNormEps);
+        fixed (float* prevHiddenPtr = prevHidden)
+        {
+            SimdKernels.RmsNorm(_mtpHnormBuf, prevHiddenPtr, _mtpHnorm, _embDim, _hp.RmsNormEps);
+        }
+
+        // 3. Concat [hnorm(h) ‖ enorm(e)] into _mtpConcatBuf [embDim*2]. Order
+        //    matches the GGUF eh_proj weight layout (PR #20533 / Qwen3.6 MTP);
+        //    parity verification (issue #25 acceptance #10) will confirm.
+        new ReadOnlySpan<float>(_mtpHnormBuf, _embDim)
+            .CopyTo(new Span<float>(_mtpConcatBuf, _embDim));
+        new ReadOnlySpan<float>(_mtpEnormBuf, _embDim)
+            .CopyTo(new Span<float>(_mtpConcatBuf + _embDim, _embDim));
+
+        // 4. eh_proj @ concat → _hidden (reuse shared scratch; main forward isn't
+        //    interleaved with MTP forward — the engine serializes them).
+        SimdKernels.MatVecF32(_hidden, _mtpEhProjF32, _mtpConcatBuf, _embDim, _embDim * 2);
+
+        // 5. Residual + attn_norm.
+        Copy(_residual, _hidden, _embDim);
+        var mtpAttnNormW = GetNormWeight(_mtpAttnNorm);
+        SimdKernels.RmsNorm(_normBuf, _hidden, mtpAttnNormW, _embDim, _hp.RmsNormEps);
+
+        // 6. Attention block (standard gated attention; same shape as a main
+        //    full-attention layer). Inlined to keep the MTP KV cache + per-head
+        //    norm tensors decoupled from the trunk arrays.
+        MtpAttnBlock(position);
+
+        // 7. Residual add.
+        SimdKernels.AddInPlace(_hidden, _residual, _embDim);
+
+        // 8. Residual + post_attention_norm.
+        Copy(_residual, _hidden, _embDim);
+        var mtpPostNormW = GetNormWeight(_mtpPostAttnNorm);
+        SimdKernels.RmsNorm(_normBuf, _hidden, mtpPostNormW, _embDim, _hp.RmsNormEps);
+
+        // 9. Dense FFN (gate × up → down).
+        SimdKernels.MatVecDual(
+            _ffnGate, _mtpFfnGate.DataPtr,
+            _ffnUp,   _mtpFfnUp.DataPtr,
+            _normBuf, _intermDim, _embDim,
+            _mtpFfnGate.DType, _mtpFfnUp.DType);
+        SimdKernels.SiLuMul(_ffnGate, _ffnUp, _intermDim);
+        FusedMatVec(_hidden, _mtpFfnDown, _ffnGate, _embDim, _intermDim);
+
+        // 10. Residual add.
+        SimdKernels.AddInPlace(_hidden, _residual, _embDim);
+
+        // 11. shared_head_norm (NOT the main output_norm) → output.weight (shared lm_head).
+        SimdKernels.RmsNorm(_hidden, _hidden, _mtpSharedHeadNorm, _embDim, _hp.RmsNormEps);
+        FusedMatVec(_logits, _outputWeight, _hidden, _hp.VocabSize, _embDim);
+
+        return new ReadOnlySpan<float>(_logits, _hp.VocabSize);
+    }
+
+    /// <summary>
+    /// MTP attention block. Mirrors <see cref="AttnBlock"/> but uses the MTP head's
+    /// per-head norm and projection weights, plus its own paged KV cache.
+    /// </summary>
+    private void MtpAttnBlock(int position)
+    {
+        int qDim = _numHeads * _headDim;
+        int kvDim = _numKvHeads * _headDim;
+        int twoHd = _headDim * 2;
+        var mtpCache = _mtpKvCache!;
+
+        // Project Q‖gate, K, V. Layer index in the MTP cache is always 0.
+        FusedMatVec(_qGate, _mtpWQGate, _normBuf, qDim * 2, _embDim);
+        for (int h = 0; h < _numHeads; h++)
+        {
+            float* src = _qGate + h * twoHd;
+            new ReadOnlySpan<float>(src, _headDim).CopyTo(new Span<float>(_q + h * _headDim, _headDim));
+            new ReadOnlySpan<float>(src + _headDim, _headDim)
+                .CopyTo(new Span<float>(_gate + h * _headDim, _headDim));
+        }
+        FusedMatVec(_k, _mtpWK, _normBuf, kvDim, _embDim);
+        FusedMatVec(_v, _mtpWV, _normBuf, kvDim, _embDim);
+
+        PerHeadRmsNorm(_q, _mtpQNorm, _numHeads, _headDim, _hp.RmsNormEps);
+        PerHeadRmsNorm(_k, _mtpKNorm, _numKvHeads, _headDim, _hp.RmsNormEps);
+
+        float* cos = _ropeCosTable + (long)position * _ropeHalfDim;
+        float* sin = _ropeSinTable + (long)position * _ropeHalfDim;
+        SimdKernels.ApplyRoPECachedNeoxPartial(_q, cos, sin, _numHeads, _headDim, _ropeDim);
+        SimdKernels.ApplyRoPECachedNeoxPartial(_k, cos, sin, _numKvHeads, _headDim, _ropeDim);
+
+        // Layer-0 invariant: reserve a block on every Append-first-of-token call.
+        mtpCache.ReserveBlock();
+        mtpCache.Append(layer: 0,
+            new ReadOnlySpan<float>(_k, kvDim),
+            new ReadOnlySpan<float>(_v, kvDim));
+
+        // Attention scores + softmax + weighted V (mirror of Attention but
+        // walks the MTP cache instead of the trunk cache).
+        int seqLen = position + 1;
+        float scale = 1.0f / MathF.Sqrt(_headDim);
+        int ctxLen = _ctxLen; int hd = _headDim; int hpkg = _headsPerKvGroup;
+        var q = _q; var attnOut = _attnOut; var scores = _attnScores;
+
+        Parallel.For(0, _numHeads, h =>
+        {
+            int kvHead = h / hpkg;
+            float* qHead = q + h * hd;
+            float* outHead = attnOut + h * hd;
+            float* headScores = scores + (long)h * ctxLen;
+
+            for (int t = 0; t < seqLen; t++)
+            {
+                float* kVec = mtpCache.KeyAt(layer: 0, t) + kvHead * hd;
+                headScores[t] = SimdKernels.DotF32(qHead, kVec, hd) * scale;
+            }
+            SimdKernels.SoftmaxInPlace(headScores, seqLen);
+
+            for (int d = 0; d < hd; d++) outHead[d] = 0;
+            for (int t = 0; t < seqLen; t++)
+            {
+                float* vVec = mtpCache.ValueAt(layer: 0, t) + kvHead * hd;
+                float w = headScores[t];
+                for (int d = 0; d < hd; d++) outHead[d] += w * vVec[d];
+            }
+        });
+
+        // GLU gate.
+        ApplySigmoidGate(_attnOut, _gate, qDim);
+
+        // Output projection.
+        FusedMatVec(_hidden, _mtpWO, _attnOut, _embDim, qDim);
+
+        mtpCache.IncrementPosition();
+    }
+
+    /// <inheritdoc />
+    public void MtpResetCache()
+    {
+        _mtpKvCache?.Reset();
+    }
+
+    /// <inheritdoc />
+    public void MtpTruncateTo(int length)
+    {
+        _mtpKvCache?.TruncateTo(length);
     }
 
     // ============================================================
@@ -1338,6 +1628,22 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         {
             NativeMemory.Free(_snapshotBuf);
             _snapshotBuf = null;
+        }
+
+        if (_hasMtp)
+        {
+            if (_mtpQNorm != null) NativeMemory.Free(_mtpQNorm);
+            if (_mtpKNorm != null) NativeMemory.Free(_mtpKNorm);
+            if (_mtpEnorm != null) NativeMemory.Free(_mtpEnorm);
+            if (_mtpHnorm != null) NativeMemory.Free(_mtpHnorm);
+            if (_mtpSharedHeadNorm != null) NativeMemory.Free(_mtpSharedHeadNorm);
+            if (_mtpEhProjF32 != null) NativeMemory.Free(_mtpEhProjF32);
+            if (_mtpEmbedBuf != null) NativeMemory.Free(_mtpEmbedBuf);
+            if (_mtpEnormBuf != null) NativeMemory.Free(_mtpEnormBuf);
+            if (_mtpHnormBuf != null) NativeMemory.Free(_mtpHnormBuf);
+            if (_mtpConcatBuf != null) NativeMemory.Free(_mtpConcatBuf);
+            if (_lastHidden != null) NativeMemory.Free(_lastHidden);
+            _mtpKvCache?.Dispose();
         }
 
         _kvCache.Dispose();

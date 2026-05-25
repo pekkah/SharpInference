@@ -122,4 +122,103 @@ public sealed class HybridGdnForwardPassTests
             $"({string.Join(",", decoded)}); the hybrid forward pass may be stuck in a " +
             "degenerate loop (logits collapsed onto a single output).");
     }
+
+    /// <summary>
+    /// Probes for the qwen35 27B-MTP GGUF in the small-models directory. Tracked
+    /// separately from <see cref="FindHybridModelPath"/> because (a) qwen35-MTP
+    /// is a different architecture (dense FFN + MTP head, not MoE) and (b) the
+    /// file lives in <c>C:\p\sharpi\models</c> (17 GB), not <c>E:\models</c>.
+    /// </summary>
+    private static string? FindMtpModelPath()
+    {
+        string[] absoluteCandidates =
+        {
+            @"C:\p\sharpi\models\Qwen3.6-27B-MTP-Q4_K_M.gguf",
+            @"E:\models\Qwen3.6-27B-MTP-Q4_K_M.gguf",
+        };
+        foreach (var p in absoluteCandidates)
+            if (File.Exists(p)) return p;
+
+        var dir = Directory.GetCurrentDirectory();
+        for (int i = 0; i < 8; i++)
+        {
+            var p = Path.Combine(dir, "models", "Qwen3.6-27B-MTP-Q4_K_M.gguf");
+            if (File.Exists(p)) return p;
+            var parent = Directory.GetParent(dir);
+            if (parent is null) break;
+            dir = parent.FullName;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Smoke test for the MTP / NEXTN head on CPU <see cref="HybridGdnForwardPass"/>
+    /// (issue #25). Asserts the head loads, <see cref="IForwardPass.LastHidden"/>
+    /// is refreshed by the main forward pass, and <see cref="IForwardPass.MtpForward"/>
+    /// returns finite, non-degenerate logits.
+    ///
+    /// We do NOT assert greedy parity vs llama.cpp here — that's a separate test
+    /// requiring an external reference dump. The "no all-NaN, no flat logits"
+    /// guard is enough to catch wholesale wiring bugs (wrong tensor names, bad
+    /// concat order, missed norm).
+    /// </summary>
+    [Fact]
+    public void HybridGdnForwardPass_Qwen35Mtp_MtpHeadProducesWellFormedLogits()
+    {
+        var path = FindMtpModelPath();
+        if (path is null) return;   // silent skip
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+
+        Assert.True(hp.IsHybridSsm, "Expected hp.IsHybridSsm for qwen35 hybrid GDN model");
+        Assert.NotNull(hp.Gdn);
+        Assert.NotNull(hp.LayerTypes);
+        Assert.False(hp.IsMoE, "qwen35 27B-MTP is dense, not MoE");
+        Assert.Equal(1, hp.NumMtpLayers);
+
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var backend = new CpuBackend();
+        using var fwd = new HybridGdnForwardPass(model, backend, hp);
+
+        Assert.True(fwd.HasMtpHead,
+            "HybridGdnForwardPass should have detected the MTP head at blk.NumLayers " +
+            "and reported HasMtpHead == true.");
+
+        // Run prefill on a tiny prompt to populate LastHidden.
+        var tokens = tokenizer.Encode("Hello");
+        Assert.NotEmpty(tokens);
+        var mainLogits = fwd.Prefill(tokens);
+
+        var lastHidden = fwd.LastHidden;
+        Assert.Equal(hp.EmbeddingDim, lastHidden.Length);
+        for (int i = 0; i < lastHidden.Length; i++)
+            Assert.True(float.IsFinite(lastHidden[i]),
+                $"LastHidden has a non-finite entry at index {i}: {lastHidden[i]}. " +
+                "Pre-output-norm hidden capture is broken.");
+
+        // The first decode-position token (= argmax of last prefill logits) feeds
+        // into MtpForward at position tokens.Count to draft position tokens.Count+1.
+        int t1 = Sampler.Greedy(mainLogits);
+        var mtpLogits = fwd.MtpForward(t1, tokens.Count, lastHidden);
+
+        Assert.Equal(hp.VocabSize, mtpLogits.Length);
+
+        float min = float.MaxValue, max = float.MinValue;
+        for (int i = 0; i < mtpLogits.Length; i++)
+        {
+            float v = mtpLogits[i];
+            Assert.True(float.IsFinite(v),
+                $"MTP logit non-finite at vocab idx {i}: {v}. " +
+                "Likely culprits: eh_proj dequant, enorm/hnorm wiring, " +
+                "MTP attention KV cache state, or shared_head_norm.");
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+        Assert.True(max - min > 0.1f,
+            $"MTP logit range too tight ({min:F3}..{max:F3}); the head is " +
+            "producing degenerate output. Likely culprits: concat order " +
+            "(hnorm vs enorm halves), eh_proj weight orientation, or a " +
+            "missed per-head norm in the MTP attention block.");
+    }
 }
