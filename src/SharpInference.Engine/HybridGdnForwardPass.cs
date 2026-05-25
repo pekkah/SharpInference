@@ -78,7 +78,7 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     private readonly float* _beta;           // [NumVHeads]      = 32
     private readonly float* _gdnOut;         // [ValueDim]       = 4096
 
-    // ── MoE scratch ────────────────────────────────────────────────────
+    // ── MoE scratch (only allocated when _hp.IsMoE) ────────────────────
     private readonly float* _routerLogits;   // [NumExperts]      = 256
     private readonly float* _sharedOut;      // [embDim]          = 2048
     private readonly float* _expertGate;     // [ExpertIntermDim] = 512 — used for the shared expert
@@ -90,6 +90,11 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     // larger work units. Mirrors CudaHybridGdnForwardPass.CpuMoeFfn.
     private readonly float* _expertGateAll;  // [numActive × ExpertIntermDim]
     private readonly float* _expertUpAll;    // [numActive × ExpertIntermDim]
+
+    // ── Dense FFN scratch (only allocated when !_hp.IsMoE, e.g. qwen35 27B) ──
+    private readonly float* _ffnGate;        // [IntermediateDim]
+    private readonly float* _ffnUp;          // [IntermediateDim]
+    private readonly int _intermDim;         // hp.IntermediateDim (dense FFN); 0 when MoE
 
     // ── Dimensions (cached) ────────────────────────────────────────────
     private readonly int _embDim;
@@ -146,6 +151,12 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     // Shared-expert per-token gate vector (F32 [embDim]).
     private readonly float*[] _wGateInpShexp;      // [L]
 
+    // Dense FFN tensors (TensorRef[L]; populated only when !_hp.IsMoE). The MoE arrays
+    // above remain null in that case. Mirrors ForwardPass._wGate / _wUp / _wDown.
+    private readonly TensorRef[] _wFfnGate;        // [L] — ffn_gate.weight (dense)
+    private readonly TensorRef[] _wFfnUp;          // [L] — ffn_up.weight (dense)
+    private readonly TensorRef[] _wFfnDown;        // [L] — ffn_down.weight (dense)
+
     // RoPE tables (sized by ropeDim/2, not headDim/2).
     private readonly float* _ropeCosTable;
     private readonly float* _ropeSinTable;
@@ -181,10 +192,13 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             throw new ArgumentException("HybridGdnForwardPass requires hp.Gdn != null (GDN config).", nameof(hp));
         if (hp.LayerTypes is null)
             throw new ArgumentException("HybridGdnForwardPass requires hp.LayerTypes != null (per-layer block type).", nameof(hp));
-        if (!hp.IsMoE)
-            throw new ArgumentException("HybridGdnForwardPass currently requires MoE FFN (qwen35moe).", nameof(hp));
-        if (!hp.HasSharedExpert)
-            throw new ArgumentException("HybridGdnForwardPass currently requires HasSharedExpert (qwen35moe).", nameof(hp));
+        // MoE variants (qwen35moe) need both routed and shared experts; dense variants
+        // (qwen35 27B-MTP) use a plain ffn_gate/up/down triplet. Reject the partial
+        // MoE case (router but no shared expert) — that's not a config we've seen.
+        if (hp.IsMoE && !hp.HasSharedExpert)
+            throw new ArgumentException("HybridGdnForwardPass with MoE requires HasSharedExpert (qwen35moe).", nameof(hp));
+        if (!hp.IsMoE && hp.IntermediateDim <= 0)
+            throw new ArgumentException("HybridGdnForwardPass dense FFN requires hp.IntermediateDim > 0.", nameof(hp));
 
         _model = model;
         _hp = hp;
@@ -240,12 +254,22 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         _beta = Alloc(_gdnNumVHeads);
         _gdnOut = Alloc(_gdnValueDim);
 
-        _routerLogits = Alloc(hp.NumExperts);
-        _sharedOut = Alloc(_embDim);
-        _expertGate = Alloc(hp.ExpertIntermediateDim);
-        _expertUp = Alloc(hp.ExpertIntermediateDim);
-        _expertGateAll = Alloc(hp.NumActiveExperts * hp.ExpertIntermediateDim);
-        _expertUpAll = Alloc(hp.NumActiveExperts * hp.ExpertIntermediateDim);
+        if (hp.IsMoE)
+        {
+            _routerLogits = Alloc(hp.NumExperts);
+            _sharedOut = Alloc(_embDim);
+            _expertGate = Alloc(hp.ExpertIntermediateDim);
+            _expertUp = Alloc(hp.ExpertIntermediateDim);
+            _expertGateAll = Alloc(hp.NumActiveExperts * hp.ExpertIntermediateDim);
+            _expertUpAll = Alloc(hp.NumActiveExperts * hp.ExpertIntermediateDim);
+            _intermDim = 0;
+        }
+        else
+        {
+            _intermDim = hp.IntermediateDim;
+            _ffnGate = Alloc(_intermDim);
+            _ffnUp = Alloc(_intermDim);
+        }
 
         // RoPE tables sized for partial rotation (ropeDim/2 entries per position).
         _ropeCosTable = (float*)NativeMemory.Alloc((nuint)((long)ctxLen * _ropeHalfDim * sizeof(float)));
@@ -275,19 +299,31 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
 
         _wGateInpShexp = new float*[L];
 
+        _wFfnGate = new TensorRef[L]; _wFfnUp = new TensorRef[L]; _wFfnDown = new TensorRef[L];
+
         for (int i = 0; i < L; i++)
         {
             // Common to both block types.
             _attnNorm[i] = ResolveTensor($"blk.{i}.attn_norm.weight");
             _postAttnNorm[i] = ResolveTensor($"blk.{i}.post_attention_norm.weight");
-            _wGateInp[i] = ResolveTensor($"blk.{i}.ffn_gate_inp.weight");
-            _wGateShexp[i] = ResolveTensor($"blk.{i}.ffn_gate_shexp.weight");
-            _wUpShexp[i] = ResolveTensor($"blk.{i}.ffn_up_shexp.weight");
-            _wDownShexp[i] = ResolveTensor($"blk.{i}.ffn_down_shexp.weight");
-            _wGateExps[i] = ResolveTensor($"blk.{i}.ffn_gate_exps.weight");
-            _wUpExps[i] = ResolveTensor($"blk.{i}.ffn_up_exps.weight");
-            _wDownExps[i] = ResolveTensor($"blk.{i}.ffn_down_exps.weight");
-            _wGateInpShexp[i] = LoadF32Tensor($"blk.{i}.ffn_gate_inp_shexp.weight", _embDim);
+
+            if (hp.IsMoE)
+            {
+                _wGateInp[i] = ResolveTensor($"blk.{i}.ffn_gate_inp.weight");
+                _wGateShexp[i] = ResolveTensor($"blk.{i}.ffn_gate_shexp.weight");
+                _wUpShexp[i] = ResolveTensor($"blk.{i}.ffn_up_shexp.weight");
+                _wDownShexp[i] = ResolveTensor($"blk.{i}.ffn_down_shexp.weight");
+                _wGateExps[i] = ResolveTensor($"blk.{i}.ffn_gate_exps.weight");
+                _wUpExps[i] = ResolveTensor($"blk.{i}.ffn_up_exps.weight");
+                _wDownExps[i] = ResolveTensor($"blk.{i}.ffn_down_exps.weight");
+                _wGateInpShexp[i] = LoadF32Tensor($"blk.{i}.ffn_gate_inp_shexp.weight", _embDim);
+            }
+            else
+            {
+                _wFfnGate[i] = ResolveTensor($"blk.{i}.ffn_gate.weight");
+                _wFfnUp[i]   = ResolveTensor($"blk.{i}.ffn_up.weight");
+                _wFfnDown[i] = ResolveTensor($"blk.{i}.ffn_down.weight");
+            }
 
             if (hp.LayerTypes[i] == LayerType.Attention)
             {
@@ -479,8 +515,10 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
 
             if (_bypassMoe)
                 new Span<float>(_hidden, _embDim).Clear();
-            else
+            else if (_hp.IsMoE)
                 MoeFfn(layer);
+            else
+                DenseFfn(layer);
 
             // Residual add
             SimdKernels.AddInPlace(_hidden, _residual, _embDim);
@@ -801,6 +839,22 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         // 9. Output projection: ssm_out (input ValueDim=4096, output embDim=2048).
         FusedMatVec(_hidden, _ssmOut[layer], _gdnOut, _embDim, _gdnValueDim);
         if (_traceLayers) EmitBufTrace(position, layer, "gdn-proj",     _hidden, _embDim);
+    }
+
+    // ============================================================
+    //  DenseFfn — standard gate × up → down (qwen35 27B-MTP and other
+    //  dense hybrid GDN variants without MoE).
+    // ============================================================
+
+    private void DenseFfn(int layer)
+    {
+        SimdKernels.MatVecDual(
+            _ffnGate, _wFfnGate[layer].DataPtr,
+            _ffnUp,   _wFfnUp[layer].DataPtr,
+            _normBuf, _intermDim, _embDim,
+            _wFfnGate[layer].DType, _wFfnUp[layer].DType);
+        SimdKernels.SiLuMul(_ffnGate, _ffnUp, _intermDim);
+        FusedMatVec(_hidden, _wFfnDown[layer], _ffnGate, _embDim, _intermDim);
     }
 
     // ============================================================
@@ -1160,9 +1214,16 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         {
             tensors.Add(_attnNorm[i]);
             tensors.Add(_postAttnNorm[i]);
-            tensors.Add(_wGateInp[i]);
-            tensors.Add(_wGateShexp[i]); tensors.Add(_wUpShexp[i]); tensors.Add(_wDownShexp[i]);
-            tensors.Add(_wGateExps[i]); tensors.Add(_wUpExps[i]); tensors.Add(_wDownExps[i]);
+            if (_hp.IsMoE)
+            {
+                tensors.Add(_wGateInp[i]);
+                tensors.Add(_wGateShexp[i]); tensors.Add(_wUpShexp[i]); tensors.Add(_wDownShexp[i]);
+                tensors.Add(_wGateExps[i]); tensors.Add(_wUpExps[i]); tensors.Add(_wDownExps[i]);
+            }
+            else
+            {
+                tensors.Add(_wFfnGate[i]); tensors.Add(_wFfnUp[i]); tensors.Add(_wFfnDown[i]);
+            }
             if (_hp.LayerTypes![i] == LayerType.Attention)
             {
                 tensors.Add(_wQGate[i]); tensors.Add(_wK[i]); tensors.Add(_wV[i]); tensors.Add(_wO[i]);

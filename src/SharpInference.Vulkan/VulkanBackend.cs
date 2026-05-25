@@ -607,8 +607,10 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     //  IComputeBackend — Memory management
     // ================================================================
 
-    public Tensor Allocate(TensorShape shape, DType dtype = DType.Float32)
+    public Tensor Allocate(TensorShape shape, DType dtype = DType.Float32, bool exact = false)
     {
+        // Vulkan path doesn't pool/round; the exact hint is a no-op here.
+        _ = exact;
         ulong byteSize = (ulong)(shape.ElementCount * DTypeInfo.BytesPerElement(dtype));
         var gpuBuf = GpuBuffer.CreateDeviceLocal(this, byteSize,
             VkBufferUsageFlags.StorageBuffer | VkBufferUsageFlags.TransferSrc | VkBufferUsageFlags.TransferDst);
@@ -658,8 +660,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private GpuBuffer? _uploadStaging;
     private ulong _uploadStagingSize;
 
-    public Tensor Upload(ReadOnlySpan<float> data, TensorShape shape)
+    public Tensor Upload(ReadOnlySpan<float> data, TensorShape shape, bool exact = false)
     {
+        _ = exact;
         ulong byteSize = (ulong)(data.Length * sizeof(float));
 
         // Create device-local destination buffer
@@ -887,8 +890,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     /// Upload raw quantized bytes to a device-local GPU buffer.
     /// The returned tensor's shape is D1(byteLen) and its DType reflects the quantized format.
     /// </summary>
-    public unsafe Tensor UploadRaw(ReadOnlySpan<byte> data, TensorShape shape, DType dtype)
+    public unsafe Tensor UploadRaw(ReadOnlySpan<byte> data, TensorShape shape, DType dtype, bool exact = false)
     {
+        _ = exact;
         ulong byteSize = (ulong)data.Length;
 
         var gpuBuf = GpuBuffer.CreateDeviceLocal(this, byteSize,

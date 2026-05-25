@@ -36,6 +36,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // Each MatQ call (GEMM) does 2 alloc+free cycles; pooling eliminates driver round-trips.
     private readonly GpuBufferPool _pool = new();
 
+    // Handles allocated with exact=true (no pool, no power-of-2 rounding). Tracked so
+    // Free() can release them with cudaFree directly instead of returning to the pool
+    // (where their unique sizes would create per-tensor buckets that never get reused).
+    private readonly ConcurrentDictionary<nint, byte> _exactHandles = new();
+
     private bool _disposed;
 
     // ── NVRTC / image-ops state ────────────────────────────────────────────
@@ -119,6 +124,18 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         {
             if (CuBlasInterop.MemGetInfo(out _, out nuint total) == 0)
                 return total;
+            return 0;
+        }
+    }
+
+    /// <summary>Currently-free VRAM on the active CUDA device, in bytes. Queries the
+    /// driver each call so callers can size allocations against live headroom.</summary>
+    public ulong FreeVramBytes
+    {
+        get
+        {
+            if (CuBlasInterop.MemGetInfo(out nuint free, out _) == 0)
+                return free;
             return 0;
         }
     }
@@ -270,11 +287,15 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
     // ── Memory management ─────────────────────────────────────────────────
 
-    public Tensor Allocate(TensorShape shape, DType dtype = DType.Float32)
+    public Tensor Allocate(TensorShape shape, DType dtype = DType.Float32, bool exact = false)
     {
         nuint byteSize  = (nuint)(shape.ElementCount * DTypeInfo.BytesPerElement(dtype));
-        nuint allocSize = GpuBufferPool.RoundUp(byteSize);
-        nint devPtr = _pool.Rent(allocSize);
+        // exact=true bypasses the power-of-2 pool rounding. Use for one-shot weight
+        // uploads that won't be freed/realloc'd during decode — pooling is pure waste
+        // for those, and the power-of-2 rounding can inflate per-allocation footprint
+        // by up to 2× (a 17 MiB attn_gate rounds to 32 MiB; ~50 % average waste).
+        nuint allocSize = exact ? byteSize : GpuBufferPool.RoundUp(byteSize);
+        nint devPtr = exact ? nint.Zero : _pool.Rent(allocSize);
         if (devPtr == nint.Zero)
         {
             int status = CuBlasInterop.CudaMalloc(out devPtr, allocSize);
@@ -283,6 +304,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         }
         var handle = (nint)Interlocked.Increment(ref _nextHandle);
         _devPtrs[handle] = (devPtr, allocSize);
+        if (exact) _exactHandles[handle] = 0;
         return new Tensor(shape, dtype, handle);
     }
 
@@ -297,15 +319,24 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             CuBlasInterop.FreeHost(pinned.Ptr);
             return;
         }
+        if (_exactHandles.TryRemove(tensor.Handle, out _))
+        {
+            // exact=true allocations bypass the pool; free directly so the memory
+            // returns to the system / driver pool rather than getting stranded in
+            // a per-tensor bucket the pool can't reuse.
+            if (_devPtrs.TryRemove(tensor.Handle, out var ex))
+                CuBlasInterop.CudaFree(ex.devPtr);
+            return;
+        }
         if (_devPtrs.TryRemove(tensor.Handle, out var entry))
             _pool.Return(entry.byteSize, entry.devPtr);
     }
 
-    public Tensor Upload(ReadOnlySpan<float> data, TensorShape shape)
+    public Tensor Upload(ReadOnlySpan<float> data, TensorShape shape, bool exact = false)
     {
         nuint byteSize  = (nuint)(data.Length * sizeof(float));
-        nuint allocSize = GpuBufferPool.RoundUp(byteSize);
-        nint devPtr = _pool.Rent(allocSize);
+        nuint allocSize = exact ? byteSize : GpuBufferPool.RoundUp(byteSize);
+        nint devPtr = exact ? nint.Zero : _pool.Rent(allocSize);
         if (devPtr == nint.Zero)
         {
             int status = CuBlasInterop.CudaMalloc(out devPtr, allocSize);
@@ -316,6 +347,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             UploadViaStaging(devPtr, src, byteSize);
         var handle = (nint)Interlocked.Increment(ref _nextHandle);
         _devPtrs[handle] = (devPtr, allocSize);
+        if (exact) _exactHandles[handle] = 0;
         return new Tensor(shape, DType.Float32, handle);
     }
 
@@ -495,11 +527,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             DownloadViaStaging(d, devPtr, (nuint)dst.Length);
     }
 
-    public Tensor UploadRaw(ReadOnlySpan<byte> data, TensorShape shape, DType dtype)
+    public Tensor UploadRaw(ReadOnlySpan<byte> data, TensorShape shape, DType dtype, bool exact = false)
     {
         nuint byteSize  = (nuint)data.Length;
-        nuint allocSize = GpuBufferPool.RoundUp(byteSize);
-        nint devPtr = _pool.Rent(allocSize);
+        nuint allocSize = exact ? byteSize : GpuBufferPool.RoundUp(byteSize);
+        nint devPtr = exact ? nint.Zero : _pool.Rent(allocSize);
         if (devPtr == nint.Zero)
         {
             int status = CuBlasInterop.CudaMalloc(out devPtr, allocSize);
@@ -510,6 +542,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             UploadViaStaging(devPtr, src, byteSize);
         var handle = (nint)Interlocked.Increment(ref _nextHandle);
         _devPtrs[handle] = (devPtr, allocSize);
+        if (exact) _exactHandles[handle] = 0;
         var tensor = new Tensor(shape, dtype, handle);
         _tensorDTypes[handle] = dtype;
         return tensor;

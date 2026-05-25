@@ -402,3 +402,211 @@ Adding CUDA SSM kernels (Phase 7) brings it to 38–53 days = 8–11 weeks.
 - `src/SharpInference.Engine/CudaHybridForwardPass.cs`
 - `src/SharpInference.Cpu/SsmKernels.cs` (new)
 - `src/SharpInference.Engine/SsmStateCache.cs` (new)
+
+---
+
+## Phase 11 — Qwen3.6-27B-MTP on CUDA + CUDA-Hybrid
+
+*Added 2026-05-25. Tracks GitHub issue #25.*
+
+The 27B-MTP is a dense (no MoE) hybrid GDN+attention model with native MTP heads. Architecturally close to qwen35moe but distinct enough to require its own code paths and a per-token GDN state snapshot facility that the qwen35moe work explicitly deferred (Risk #6 above).
+
+**Hyperparameters (from `Qwen/Qwen3.6-27B/config.json`):**
+
+- `model_type = qwen3_5`, `architectures = Qwen3_5ForConditionalGeneration`
+- 64 layers, `full_attention_interval = 4` → 48 GDN + 16 attention (same pattern as qwen35moe, more layers)
+- `hidden_size = 5120`, `head_dim = 256`, `num_attention_heads = 24`, `num_key_value_heads = 4` (GQA)
+- `intermediate_size = 17408` — **dense FFN**, no MoE
+- `linear_num_value_heads = 48`, `linear_num_key_heads = 16`, `linear_value_head_dim = 128`, `linear_conv_kernel_dim = 4` — wider GDN than qwen35moe's 32-VHead variant
+- `attn_output_gate = true`, `rope_theta = 1e7`, `partial_rotary_factor = 0.25` (64 of 256 dims rotated, same as qwen35moe)
+- `mtp_num_hidden_layers = 1` — single MTP head, shares `embed_tokens` and `lm_head` with the main model
+- `vocab_size = 248320`, `max_position_embeddings = 262144`
+
+**Hardware target:** RTX 4070 Ti 12 GB. Q4_K_M file is 17.1 GB → must partially CPU-offload. Lower quants (Q3_K, IQ3_*) are not supported by `CudaBackend.MatMul` (Q4_K / Q5_K / Q6_K / F32 only, see `CudaBackend.cs:706-724`), so Q4_K_M with per-layer offload is the only Cuda-hybrid configuration. Pure all-GPU Cuda is infeasible at any supported quant on 12 GB.
+
+**MTP tensors (per llama.cpp PR #20533):**
+
+| GGUF name | Maps to (transformers) | Purpose |
+|---|---|---|
+| `mtp.fc` | `model.layers.{bid}.eh_proj` | Concat(embed, hidden) → hidden projection |
+| `mtp.pre_fc_norm_embedding` | `model.layers.{bid}.enorm` | Pre-fc norm on input embedding |
+| `mtp.pre_fc_norm_hidden` | `model.layers.{bid}.hnorm` | Pre-fc norm on last-layer hidden state |
+| `mtp.norm` | `model.layers.{bid}.shared_head.norm` | Post-MTP-block norm |
+| (`output.weight` reused) | `shared_head.head` | Shared lm_head — no separate MTP head weight |
+| (`token_embd.weight` reused) | `model.embed_tokens` | Shared input embedding |
+
+Plus a standard transformer block (attention + FFN of the same arch as main layers) per MTP head.
+
+GGUF metadata key: `{arch}.nextn_predict_layers` (= 1 for 27B-MTP).
+
+### Empirical confirmation from `list-metadata` / `list-tensors`
+
+**Run on 2026-05-25 against `C:\p\sharpi\models\Qwen3.6-27B-MTP-Q4_K_M.gguf` (17.11 GB, 866 tensors, 54 metadata keys).**
+
+GGUF arch string is **`qwen35`** (not `qwen3_5` as the transformers config implies, not `qwen35moe`). All hyperparams live under the `qwen35.*` prefix and align cleanly with the existing GDN config reader:
+
+| Key | Value | Maps to |
+|---|---|---|
+| `qwen35.block_count` | 65 | 64 main layers + 1 MTP head at `blk.64` |
+| `qwen35.full_attention_interval` | 4 | `[GDN, GDN, GDN, attn] × 16` → 48 GDN + 16 attn |
+| `qwen35.embedding_length` | 5120 | hidden_size |
+| `qwen35.feed_forward_length` | 17408 | dense FFN intermediate — **no MoE** |
+| `qwen35.attention.head_count` / `head_count_kv` | 24 / 4 | GQA |
+| `qwen35.attention.key_length` / `value_length` | 256 / 256 | head_dim |
+| `qwen35.rope.dimension_count` | 64 | partial NEOX RoPE (64 of 256) |
+| `qwen35.rope.dimension_sections` | `[11, 11, 10, 0]` | M-RoPE sections; collapse to single-section for text |
+| `qwen35.rope.freq_base` | 1e7 | same as qwen35moe |
+| `qwen35.ssm.conv_kernel` | 4 | same as qwen35moe |
+| `qwen35.ssm.group_count` | 16 | same as qwen35moe |
+| `qwen35.ssm.inner_size` | 6144 | wider than qwen35moe (4096) |
+| `qwen35.ssm.state_size` | 128 | same as qwen35moe |
+| `qwen35.ssm.time_step_rank` | 48 | wider than qwen35moe (32) — = `linear_num_value_heads` |
+| `qwen35.nextn_predict_layers` | 1 | one MTP head |
+| `_sharpi.is_hybrid_ssm` | true | **synthetic probe trips correctly** — no arch hardcode needed for hybrid detection |
+
+**GDN tensor naming is IDENTICAL to `qwen35moe`** — the existing GDN kernels in `HybridGdnForwardPass` / `CudaHybridGdnForwardPass` will work unchanged. Per-layer GDN tensors at `blk.0` (a GDN layer):
+
+```
+blk.0.attn_gate.weight       Q4_K    [5120, 6144]    16.9 MiB
+blk.0.attn_norm.weight       F32     [5120]          20.0 KiB
+blk.0.attn_qkv.weight        Q6_K    [5120, 10240]   41.0 MiB    Q(2048)+K(2048)+V(6144)
+blk.0.ffn_down.weight        Q6_K    [17408, 5120]   69.7 MiB    dense FFN
+blk.0.ffn_gate.weight        Q4_K    [5120, 17408]   47.8 MiB
+blk.0.ffn_up.weight          Q4_K    [5120, 17408]   47.8 MiB
+blk.0.post_attention_norm    F32     [5120]
+blk.0.ssm_a                  F32     [48]
+blk.0.ssm_alpha.weight       F32     [5120, 48]
+blk.0.ssm_beta.weight        F32     [5120, 48]
+blk.0.ssm_conv1d.weight      F32     [4, 10240]
+blk.0.ssm_dt.bias            F32     [48]
+blk.0.ssm_norm.weight        F32     [128]
+blk.0.ssm_out.weight         Q5_K    [6144, 5120]    20.6 MiB
+```
+
+**MTP head at `blk.64`** — one full standard attention block (`attn_q/k/v/output` separate, not `attn_qkv` joint, because the MTP head is a regular attention block not a GDN block) **plus 4 `nextn.*` tensors:**
+
+```
+blk.64.attn_k.weight                   Q4_K     [5120, 1024]
+blk.64.attn_k_norm.weight              F32      [256]
+blk.64.attn_norm.weight                F32      [5120]
+blk.64.attn_output.weight              Q4_K     [6144, 5120]
+blk.64.attn_q.weight                   Q4_K     [5120, 12288]    Q‖gate interleaved (gated attention)
+blk.64.attn_q_norm.weight              F32      [256]
+blk.64.attn_v.weight                   Q6_K     [5120, 1024]
+blk.64.ffn_down.weight                 Q6_K     [17408, 5120]
+blk.64.ffn_gate.weight                 Q4_K     [5120, 17408]
+blk.64.ffn_up.weight                   Q4_K     [5120, 17408]
+blk.64.nextn.eh_proj.weight            Q8_0     [10240, 5120]    concat(hnorm(h)‖enorm(e)) → 5120
+blk.64.nextn.enorm.weight              F32      [5120]           pre-fc norm on embedding
+blk.64.nextn.hnorm.weight              F32      [5120]           pre-fc norm on hidden
+blk.64.nextn.shared_head_norm.weight   F32      [5120]           pre-output norm
+blk.64.post_attention_norm.weight      F32      [5120]
+```
+
+MTP head total: **15 tensors, 276 MiB** (≈ same cost as one main layer; expected since it IS one main-style layer plus 4 norms and the eh_proj concat).
+
+**MTP forward shape:**
+```
+                  last-layer hidden h ∈ R^5120     embedding of next decoded token e ∈ R^5120
+                          │                                        │
+                       hnorm(h)                                  enorm(e)
+                          └───────────── concat ──────────────────┘
+                                        ∈ R^10240
+                                          │
+                                       eh_proj  ∈ R^5120
+                                          │
+                          standard attention block + dense FFN (full-attn, 24×256 heads, GQA 4 KV, gated Q‖gate)
+                                          │
+                                 shared_head_norm
+                                          │
+                                output.weight (shared lm_head)
+                                          │
+                                logits ∈ R^248320 for position p+1
+```
+
+**Tensor-name lookup for code:** the GGUF prefix is `nextn.` (NOT `mtp.` as PR #20533 might suggest — that was the internal canonical, the on-disk name is `nextn.`).
+
+### Updated assessment of structural blockers
+
+- Blocker #1 (`CudaHybridGdnForwardPass.cs:275-276` requires MoE) — **CONFIRMED**, still needs dense-FFN generalization.
+- Blocker #2 (CUDA dequant set) — **CONFIRMED**: quants in the 27B-MTP file are Q4_K (most), Q5_K (`ssm_out`), Q6_K (`ffn_down`, some `attn_*`), Q8_0 (`nextn.eh_proj`), F32 (norms). All but Q8_0 are supported by `CudaBackend.MatMul`. The `nextn.eh_proj` weight is Q8_0 — needs either dequant on host or a Q8_0 CUDA matvec kernel. Q8_0 dequant is trivial (8 bits + per-block float scale); easiest fix is to dequant to F16/F32 once at load.
+- Blocker #3 (`qwen35` arch unknown to `ModelGraph`) — **CONFIRMED**: needs to be added to the NEOX-rope arch list. Hybrid detection via synthetic `_sharpi.is_hybrid_ssm` probe **already works** (verified by metadata dump showing `_sharpi.is_hybrid_ssm = true`).
+
+### Implementation landed 2026-05-25
+
+- **11.1 arch registration** — `qwen35` added to NEOX-rope list at `ModelGraph.cs:179`. Hybrid detection auto-triggers via tensor probe in `GgufModel.cs:132-136`.
+- **11.0/11.1 MTP layer accounting** — `NumLayers = block_count - nextn_predict_layers` in `ModelGraph.cs:202-209`. New `ModelHyperparams.NumMtpLayers` field at `ModelGraph.cs:121-128`. Main forward loop iterates 0..NumLayers-1; MTP block at `blk.NumLayers` is loaded only by the (not-yet-implemented) MTP head path.
+- **11.2 dense-FFN on the hybrid GDN path** (CPU + CUDA hybrid) — `HybridGdnForwardPass` and `CudaHybridGdnForwardPass` now accept `!hp.IsMoE`. MoE-only state (router logits, expert scratch, shared-expert weights, SLRU manager) is gated behind `hp.IsMoE`. New dense FFN code paths: `DenseFfn(layer)` in CPU pass and `CpuDenseFfn(layer)` in CUDA hybrid (download GPU norm → CPU mmap matvec → upload). Backend label updated to distinguish dense-FFN from MoE.
+- **11.3 per-layer FFN-on-GPU offload — NOT LANDED.** See blocker below.
+
+### Measured baselines (RTX 4070 Ti 12 GB)
+
+| Backend | Model | Config | Decode t/s | Notes |
+|---|---|---|---|---|
+| CPU | qwen36-27b-mtp Q4_K_M | — | 3.1 | Single-thread RmsNorm + parallel matvec |
+| CUDA hybrid | qwen36-27b-mtp Q4_K_M | all FFN on CPU | 4.0 | Before exact-size patch; GDN + attn on GPU |
+| CUDA hybrid | qwen36-27b-mtp Q4_K_M | 2 FFN layers on GPU | 4.3 | Before exact-size patch; ceiling was VRAM-bound |
+| CUDA hybrid | qwen36-27b-mtp Q4_K_M | **21 FFN layers on GPU (exact-size)** | **6.3** | **+58 % over baseline.** SHARPI_DENSE_FFN_GPU_MARGIN_MB=32, ctx ≤ 2048 |
+| CUDA hybrid | qwen36-35b-a3b-mtp UD-Q4_K_M | — | 22.3 | Regression check — existing MoE path intact |
+| CUDA all-GPU | qwen3-8b Q4_K_M | — | 59.7 | Dense GPU regression check vs 65 t/s prior baseline |
+
+### Root cause of the unaccounted VRAM — found + fixed
+
+**`GpuBufferPool.RoundUp` rounded every device allocation to the next power of two** (`CudaBackend.cs:2120-2127`). Per the diagnostic checkpoints (run with `SHARPI_TRACE_VRAM=1`):
+
+| Stage | Before exact-size | After exact-size | Reclaimed |
+|---|---|---|---|
+| Constructor entry | 10696 MiB free | 10696 MiB free | — |
+| After embedding upload (Q4_K 715 MiB → ?) | 9672 MiB | 10012 MiB | **+340 MiB** (715→1024 GiB bucket eliminated) |
+| After output upload (Q6_K 994 MiB → ?) | 8648 MiB | 9016 MiB | **+28 MiB** (994→1024 GiB bucket) |
+| After per-layer weight upload | 525 MiB | 3576 MiB | **+3051 MiB** (48 GDN+16 attn layers' avg 50 % rounding waste) |
+| FFN-on-GPU layers uploaded | 2 of 64 | **21 of 64** | — |
+
+The pool's purpose is to **reuse** allocations on the hot path (per-token scratch), but weight uploads are session-lifetime and never freed/realloc'd — pooling is pure waste for them.
+
+**Fix landed this session:**
+- `IComputeBackend.Allocate` / `Upload` / `UploadRaw` now take `bool exact = false` (default false preserves pool semantics for scratch).
+- `CudaBackend` exact path: bypass `_pool.Rent`, allocate via `cudaMalloc(byteSize)` with no rounding; track in `_exactHandles` for direct `cudaFree` on `Free()`.
+- `CudaHybridGdnForwardPass.UploadWeight` and `UploadEmbeddingWeight` pass `exact: true` for every weight tensor.
+- Same hook is available to other backends (CPU/Vulkan implementations no-op the hint for now; they don't pool).
+
+### Remaining levers (smaller wins, deferred unless needed)
+
+1. **Bf16 KV cache** — halves the 512 MiB KV-cache footprint at ctx 4096 → frees ~256 MiB → 1-2 more FFN layers → ~6.5 t/s estimate.
+2. **MTP head + verify-and-accept (issue #25)** — with 1/3 of FFN now on GPU, MTP's batched verify can amortize attention+GDN work across draft positions. Realistic gain 1.2–1.5× → ~8 t/s estimate.
+3. **Q8_0 CUDA matvec or load-time dequant for `nextn.eh_proj`** — needed for any GPU MTP forward path.
+4. **Per-token GDN snapshot ring** — needed if MTP verify ever needs to roll back across multiple tokens (current draft-N is 1, so snapshot-before-draft + restore-on-reject suffices without a ring).
+
+### Structural blockers (must fix before Phase 11 proper)
+
+1. **`CudaHybridGdnForwardPass` rejects non-MoE models** (`CudaHybridGdnForwardPass.cs:275-276`): hard `throw` on `!hp.IsMoE || !hp.HasSharedExpert`. Either generalize (add dense FFN code paths gated on `hp.IsMoE`) or create a sibling `CudaHybridDenseGdnForwardPass` that shares the GDN/attention dispatch but uses a dense FFN. Sibling is cleaner; generalization risks regressing the well-tuned 35B-A3B path.
+
+2. **`ModelGraph` doesn't know `qwen3_5`** (`ModelGraph.cs:161-181`): not in the NEOX-rope architecture list; hybrid detection only triggers via the synthetic `_sharpi.is_hybrid_ssm` tensor probe (`GgufModel.cs:132-136`). Add `qwen3_5` to the NEOX list. The tensor probe at layers 0-3 will trip on `blk.0.ssm_conv1d.weight` (layers 0-2 are GDN under `full_attention_interval=4`), so hybrid auto-detection should work without an arch hardcode.
+
+3. **Per-token GDN state snapshot facility doesn't exist** (`GdnStateCache.cs:243-313` has end-of-decode snapshot only). MTP verify-and-accept needs to restore the scan state to the acceptance point after rejecting draft tokens. Risk #6 above estimated 3 days for this.
+
+### Work order
+
+| # | Task | Files | Notes |
+|---|---|---|---|
+| 11.0 | Empirical confirmation | run `list-tensors`/`list-metadata` on `models/Qwen3.6-27B-MTP-Q4_K_M.gguf`; append output to this doc | Confirm tensor naming and `qwen3_5.*` metadata key prefixes |
+| 11.1 | Arch registration | `ModelGraph.cs` (add `qwen3_5` to NEOX list; verify `qwen3_5.ssm.*` key reads) | Small patch; rely on existing tensor-probe for hybrid detection |
+| 11.2 | Generalize CudaHybridGdnForwardPass to dense FFN | new `CudaHybridDenseGdnForwardPass.cs` or refactor existing | ~80% shared with MoE sibling; pick sibling-class approach to avoid 35B regression |
+| 11.3 | Per-layer FFN offload for 27B | `CudaHybridDenseGdnForwardPass.cs` | Layer-level placement (~half FFN layers to CPU on 12 GB); pattern from `CudaHybridForwardPass` |
+| 11.4 | Baseline t/s without MTP | `bench-textgen.ps1`/`bench-all.ps1` rows for `qwen36-27b-mtp-{cuda,cuda-hybrid}` | Denominator for MTP speedup measurement |
+| 11.5 | MTP head tensor loading | `ModelGraph.cs`, model loader | Read `{arch}.nextn_predict_layers`, load N MTP layers per the table above |
+| 11.6 | MTP head forward path | new `MtpHead.cs` or `MtpForwardPass.cs` | Single transformer block + 2 pre-norms + fc projection + lm_head; reuses main-model attention/FFN kernels |
+| 11.7 | Per-token GDN snapshot ring | `GdnStateCache.cs`, `HybridGdnForwardPass.cs`, `CudaHybridGdnForwardPass.cs` | N copies (N=2 → ~280 MiB extra VRAM for 27B's 140 MiB/snapshot); swap pointers on accept/reject |
+| 11.8 | MTP verify-and-accept loop | new `MtpDecoder.cs` (sibling to `SpeculativeDecoder.cs`, not a refactor) | Cannot reuse `SpeculativeDecoder` — it requires `SupportsPartialRewind` on both passes |
+| 11.9 | `SHARPI_DISABLE_MTP=1` env switch | wiring at `InferenceEngine`/`RunCommand` | Mirrors `SHARPI_BYPASS_GDN`/`SHARPI_CPU_GDN` |
+| 11.10 | Parity vs llama.cpp `--spec-type draft-mtp` | manual + test | ≥60-token greedy parity per issue #25 acceptance criteria |
+| 11.11 | README perf table update | `README.md`, `bench-all.ps1` | `qwen36-27b-mtp-cuda-hybrid` row with `-MTP` and `+MTP` columns; ≥1.3× target |
+
+The dense-FFN generalization (11.2–11.3) and the snapshot ring (11.7) are the biggest unknowns. MTP forward + verify is well-understood since llama.cpp's algorithm is documented.
+
+### Out of scope for Phase 11
+
+- N > 2 MTP draft length (start at N=2 to match llama.cpp's `--spec-draft-n-max 2` default; raise once acceptance rate is measured).
+- Vulkan hybrid path (separate issue; qwen35moe-Vulkan is a known-broken row).
+- Multimodal vision path (the `mmproj` files are not bundled with `qwen36-27b-mtp`).
+- `ContinuousBatchingEngine` integration (single-sequence only, same restriction as qwen35moe).

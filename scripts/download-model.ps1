@@ -4,7 +4,8 @@
 .DESCRIPTION
     Downloads from HuggingFace to the models/ directory. Skips if already present.
     Supports: smollm2, qwen3-8b, olmoe-1b-7b, llama31-70b, qwen3-coder-30b-a3b, qwen36-35b-a3b,
-              llama4-scout, z-image-turbo, z-image-turbo-q8, realesrgan-x4
+              qwen36-27b-mtp, qwen36-35b-a3b-mtp, llama4-scout, z-image-turbo, z-image-turbo-q8,
+              realesrgan-x4
 .PARAMETER Model
     Which model to download. Default: downloads all text models (skips large image models).
 .EXAMPLE
@@ -15,6 +16,8 @@
     .\download-model.ps1 -Model llama31-70b             # Llama 3.1 70B (40.8 GB)
     .\download-model.ps1 -Model qwen3-coder-30b-a3b     # Qwen3-Coder 30B-A3B Q4_K_M (18.6 GB)
     .\download-model.ps1 -Model qwen36-35b-a3b          # Qwen3.6 35B-A3B UD-Q4_K_M (22.1 GB) — recommended general MoE for 12 GB hybrid
+    .\download-model.ps1 -Model qwen36-27b-mtp          # Qwen3.6 27B-MTP Q4_K_M (17.1 GB) — dense MTP parity oracle for issue #25
+    .\download-model.ps1 -Model qwen36-35b-a3b-mtp -DestDir E:\models  # Qwen3.6 35B-A3B-MTP UD-Q4_K_M (22.7 GB) — MoE MTP perf target for issue #25
     .\download-model.ps1 -Model llama4-scout            # Llama 4 Scout Q4_K_M (60.9 GB, 2 shards)
     .\download-model.ps1 -Model z-image-turbo           # Z-Image-Turbo Q5_K_M + abliterated encoder (~8.5 GB)
     .\download-model.ps1 -Model z-image-turbo-q8        # Z-Image-Turbo Q8_0 + abliterated encoder Q8_0 (~12 GB)
@@ -22,7 +25,8 @@
 #>
 param(
     [ValidateSet("smollm2", "qwen3-8b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "qwen36-35b-a3b",
-                 "llama4-scout", "z-image-turbo", "z-image-turbo-q8", "realesrgan-x4")]
+                 "qwen36-27b-mtp", "qwen36-35b-a3b-mtp", "llama4-scout", "z-image-turbo", "z-image-turbo-q8",
+                 "realesrgan-x4")]
     [string]$Model,
     [string]$DestDir
 )
@@ -73,6 +77,27 @@ $Models = @{
         Urls  = @("https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf")
         Size  = "22.1 GB"
         Phase = "CPU-only (Phase 4 of qwen35moe port; parity + CUDA hybrid pending)"
+    }
+    # Qwen3.6-27B-MTP — dense 27B with native Multi-Token Prediction heads (issue #25).
+    # Local filename is renamed (MTP- prefix) so it doesn't collide with a future
+    # non-MTP 27B download from a different repo. Source repo is unsloth's repack
+    # rather than ggml-org's because ggml-org only ships BF16/Q8_0; tensor layout
+    # is identical (same llama.cpp converter from the same upstream weights).
+    "qwen36-27b-mtp" = @{
+        Files = @("Qwen3.6-27B-MTP-Q4_K_M.gguf")
+        Urls  = @("https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf")
+        Size  = "17.1 GB"
+        Phase = "MTP / issue #25 (dense parity oracle for qwen3_next_mtp tensor layout)"
+    }
+    # Qwen3.6-35B-A3B-MTP — the MoE that already runs ~23 t/s on the CUDA hybrid path,
+    # with MTP heads bolted on. Renamed locally to avoid collision with qwen36-35b-a3b
+    # (both repos ship a file called Qwen3.6-35B-A3B-UD-Q4_K_M.gguf). Recommended target
+    # for issue #25's measured ≥1.3× decode speedup acceptance criterion.
+    "qwen36-35b-a3b-mtp" = @{
+        Files = @("Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf")
+        Urls  = @("https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf")
+        Size  = "22.7 GB"
+        Phase = "MTP / issue #25 (MoE decode-throughput target)"
     }
     "llama4-scout" = @{
         Files = @(

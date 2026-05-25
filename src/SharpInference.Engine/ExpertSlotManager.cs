@@ -126,7 +126,7 @@ public sealed class ExpertSlotManager : IDisposable
 
         Func<ReadOnlySpan<float>, TensorShape, Tensor> upload = background
             ? _gpu.UploadBackground
-            : _gpu.Upload;
+            : (d, s) => _gpu.Upload(d, s);
 
         if (info.DType == DType.Float32)
         {

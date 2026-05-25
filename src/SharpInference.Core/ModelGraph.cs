@@ -119,6 +119,15 @@ public sealed record ModelHyperparams
     public GdnConfig? Gdn { get; init; }
 
     /// <summary>
+    /// Number of Multi-Token Prediction (MTP) head layers stored at the end of the GGUF
+    /// block stack. Read from <c>{arch}.nextn_predict_layers</c> (default 0 when absent).
+    /// On disk these live at block indices <c>NumLayers..NumLayers+NumMtpLayers-1</c> —
+    /// <see cref="NumLayers"/> already excludes them so the main forward loop stays clean.
+    /// Used by MTP self-speculative decoding to draft N-ahead tokens per main forward.
+    /// </summary>
+    public int NumMtpLayers { get; init; }
+
+    /// <summary>
     /// Extract hyperparameters from GGUF metadata using the model's architecture prefix.
     /// Supports llama-family models (llama, mistral, qwen, smollm, etc.) and MoE variants.
     /// </summary>
@@ -176,7 +185,7 @@ public sealed record ModelHyperparams
             "jais2" or "gpt-oss" or
             "lfm2" or "lfm2moe" or "smallthinker" or "seed_oss" or "grovemoe" or
             "apertus" or "minimax-m2" or "cogvlm" or "pangu-embedded" or "afmoe" or
-            "qwen3next" or "qwen35moe" or "mimo2" or "step35" => true,
+            "qwen3next" or "qwen35moe" or "qwen35" or "mimo2" or "step35" => true,
             _ => false,
         };
 
@@ -199,7 +208,14 @@ public sealed record ModelHyperparams
         bool isHybridSsm = metadata.ContainsKey("_sharpi.is_hybrid_ssm")
                         || arch == "qwen35moe";
 
-        int numLayers = GetInt(metadata, $"{arch}.block_count");
+        // {arch}.block_count is the total block count in the file, which on MTP-enabled
+        // models (qwen35 27B-MTP, qwen35moe-MTP) includes the MTP head blocks appended
+        // after the main layers. Strip them so NumLayers reflects only the main model;
+        // MTP blocks are loaded separately by the MTP head logic.
+        int totalBlocks = GetInt(metadata, $"{arch}.block_count");
+        int numMtpLayers = GetInt(metadata, $"{arch}.nextn_predict_layers", 0);
+        int numLayers = totalBlocks - numMtpLayers;
+
         IReadOnlyList<LayerType>? layerTypes = null;
         GdnConfig? gdn = null;
         if (isHybridSsm && numLayers > 0)
@@ -229,7 +245,8 @@ public sealed record ModelHyperparams
             VocabSize = GetInt(metadata, $"{arch}.vocab_size"),
             ContextLength = GetInt(metadata, $"{arch}.context_length"),
             EmbeddingDim = embDim,
-            NumLayers = GetInt(metadata, $"{arch}.block_count"),
+            NumLayers = numLayers,
+            NumMtpLayers = numMtpLayers,
             NumHeads = numHeads,
             NumKvHeads = GetInt(metadata, $"{arch}.attention.head_count_kv",
                             GetInt(metadata, $"{arch}.attention.head_count")),

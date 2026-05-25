@@ -23,14 +23,17 @@ public interface IComputeBackend : IDisposable
 
     // --- Memory management ---
 
-    /// <summary>Allocate a tensor of the given shape, initialized to zero.</summary>
-    Tensor Allocate(TensorShape shape, DType dtype = DType.Float32);
+    /// <summary>Allocate a tensor of the given shape, initialized to zero.
+    /// When <paramref name="exact"/> is true, the backend should bypass any allocator
+    /// rounding/pooling — intended for permanent (session-lifetime) weight uploads.</summary>
+    Tensor Allocate(TensorShape shape, DType dtype = DType.Float32, bool exact = false);
 
     /// <summary>Free a tensor's backing memory.</summary>
     void Free(Tensor tensor);
 
-    /// <summary>Copy data to the backend device, returning a new tensor.</summary>
-    Tensor Upload(ReadOnlySpan<float> data, TensorShape shape);
+    /// <summary>Copy data to the backend device, returning a new tensor.
+    /// See <see cref="Allocate"/> for <paramref name="exact"/> semantics.</summary>
+    Tensor Upload(ReadOnlySpan<float> data, TensorShape shape, bool exact = false);
 
     /// <summary>Copy data back from the backend device.</summary>
     void Download(Tensor src, Span<float> dst);
@@ -53,8 +56,9 @@ public interface IComputeBackend : IDisposable
     /// <summary>Copy fp8 E4M3 data back from a Float8E4M3 tensor on the backend device.</summary>
     void DownloadFp8(Tensor src, Span<byte> dst);
 
-    /// <summary>Upload raw quantized bytes to a device-local GPU buffer.</summary>
-    Tensor UploadRaw(ReadOnlySpan<byte> data, TensorShape shape, DType dtype);
+    /// <summary>Upload raw quantized bytes to a device-local GPU buffer.
+    /// See <see cref="Allocate"/> for <paramref name="exact"/> semantics.</summary>
+    Tensor UploadRaw(ReadOnlySpan<byte> data, TensorShape shape, DType dtype, bool exact = false);
 
     /// <summary>True if the backend supports GPU-side dequantization of Q4_K/Q5_K weights.</summary>
     bool SupportsGpuDequant { get; }

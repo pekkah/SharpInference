@@ -15,8 +15,11 @@ public sealed unsafe class CpuBackend : IComputeBackend
 
     // --- Memory management ---
 
-    public Tensor Allocate(TensorShape shape, DType dtype = DType.Float32)
+    public Tensor Allocate(TensorShape shape, DType dtype = DType.Float32, bool exact = false)
     {
+        // exact is meaningful only for backends with allocator pooling; CpuBackend
+        // calls NativeMemory directly and ignores the hint.
+        _ = exact;
         if (dtype != DType.Float32)
             throw new NotSupportedException($"CpuBackend Phase 1 only supports Float32, got {dtype}");
 
@@ -31,8 +34,9 @@ public sealed unsafe class CpuBackend : IComputeBackend
             NativeMemory.Free((void*)tensor.Handle);
     }
 
-    public Tensor Upload(ReadOnlySpan<float> data, TensorShape shape)
+    public Tensor Upload(ReadOnlySpan<float> data, TensorShape shape, bool exact = false)
     {
+        _ = exact;
         if (data.Length != shape.ElementCount)
             throw new ArgumentException(
                 $"Data length ({data.Length}) doesn't match shape element count ({shape.ElementCount})");
@@ -69,7 +73,7 @@ public sealed unsafe class CpuBackend : IComputeBackend
     public void DownloadFp8(Tensor src, Span<byte> dst) =>
         throw new NotSupportedException("CpuBackend does not support fp8 download");
 
-    public Tensor UploadRaw(ReadOnlySpan<byte> data, TensorShape shape, DType dtype) =>
+    public Tensor UploadRaw(ReadOnlySpan<byte> data, TensorShape shape, DType dtype, bool exact = false) =>
         throw new NotSupportedException("CpuBackend does not support raw quantized upload");
 
     public bool SupportsGpuDequant => false;

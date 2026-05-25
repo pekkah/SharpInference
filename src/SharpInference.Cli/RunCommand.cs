@@ -273,7 +273,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 forward = hybridFwd.Forward;
                 prefill = tokens => hybridFwd.Prefill(tokens);
                 resetCache = hybridFwd.ResetCache;
-                AnsiConsole.MarkupLine("[dim]Backend: [blue]CPU[/] (hybrid GDN+MoE)[/]");
+                string ffnKindCpu = hp.IsMoE ? "MoE" : "dense FFN";
+                AnsiConsole.MarkupLine($"[dim]Backend: [blue]CPU[/] (hybrid GDN + {ffnKindCpu})[/]");
             }
             else
             {
@@ -316,7 +317,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     int gdnLayers = 0, attnLayers = 0;
                     for (int i = 0; i < hp.NumLayers; i++)
                         if (hp.LayerTypes![i] == LayerType.Attention) attnLayers++; else gdnLayers++;
-                    AnsiConsole.MarkupLine($"[dim]Backend: [green]CUDA hybrid GDN[/] ({cuda.Name}, {gdnLayers} GDN on CPU + {attnLayers} attn + MoE on GPU)[/]");
+                    string ffnKindGpu = hp.IsMoE ? "MoE on GPU" : "dense FFN on CPU";
+                    AnsiConsole.MarkupLine($"[dim]Backend: [green]CUDA hybrid GDN[/] ({cuda.Name}, {gdnLayers} GDN + {attnLayers} attn on GPU + {ffnKindGpu})[/]");
                 }
                 else
                 {
