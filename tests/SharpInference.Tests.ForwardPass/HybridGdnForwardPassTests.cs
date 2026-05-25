@@ -1,3 +1,4 @@
+using System.Text;
 using SharpInference.Core;
 using SharpInference.Cpu;
 using SharpInference.Engine;
@@ -220,5 +221,73 @@ public sealed class HybridGdnForwardPassTests
             "producing degenerate output. Likely culprits: concat order " +
             "(hnorm vs enorm halves), eh_proj weight orientation, or a " +
             "missed per-head norm in the MTP attention block.");
+    }
+
+    /// <summary>
+    /// End-to-end MTP self-parity: greedy decode through <see cref="InferenceEngine"/>
+    /// with MTP routing enabled must produce the SAME token sequence as the same
+    /// decode with <c>SHARPI_DISABLE_MTP=1</c> on the same model and prompt.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Why this is a meaningful parity check without llama.cpp: under greedy
+    /// sampling, every emitted token is either (a) <c>t1 = argmax(saved_main_logits)</c>
+    /// or (b) <c>t2 = (t2_target == t2_draft) ? t2_draft : t2_target</c>. Since
+    /// <c>t2_target = argmax(main_logits_after_t1)</c> and the t2-emission
+    /// formula reduces to <c>t2_target</c> regardless of MTP acceptance, MTP
+    /// must never alter the emitted sequence. Any divergence indicates the
+    /// MTP forward path is corrupting main state (KV cache, GDN state, scratch
+    /// buffers, or _hidden).
+    /// </para>
+    /// <para>
+    /// The test silently skips when the 27B-MTP file isn't on disk so CI on
+    /// machines without the GGUF stays green.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task InferenceEngine_MtpGreedy_MatchesBaselineGreedy_OnCpu()
+    {
+        var path = FindMtpModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.True(hp.NumMtpLayers > 0);
+
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var backend = new CpuBackend();
+        using var fwd = new HybridGdnForwardPass(model, backend, hp);
+        Assert.True(fwd.HasMtpHead);
+
+        // thinkTokenId=-1 disables the engine's reasoning-stream split so MTP
+        // isn't gated off on this model (which has <think>/</think> tokens).
+        using var engine = new InferenceEngine(
+            fwd, tokenizer, "qwen35-27b-mtp",
+            thinkTokenId: -1, endThinkTokenId: -1);
+
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 12 };
+        const string prompt = "The capital of France is";
+
+        // ── Run 1: MTP path (default — SHARPI_DISABLE_MTP not set) ──────
+        var withMtp = new StringBuilder();
+        await foreach (var s in engine.GenerateAsync(prompt, sp))
+            withMtp.Append(s);
+
+        // ── Run 2: baseline (MTP disabled via env var) ──────────────────
+        Environment.SetEnvironmentVariable("SHARPI_DISABLE_MTP", "1");
+        try
+        {
+            engine.GetType();   // suppress 'unused' analyzer; the env-var read
+                                // happens on each GenerateAsync call.
+            var withoutMtp = new StringBuilder();
+            await foreach (var s in engine.GenerateAsync(prompt, sp))
+                withoutMtp.Append(s);
+
+            Assert.Equal(withoutMtp.ToString(), withMtp.ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("SHARPI_DISABLE_MTP", null);
+        }
     }
 }

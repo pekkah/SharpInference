@@ -167,14 +167,21 @@ public sealed class MtpDecoder
             }
 
             // ── Commit t2 to BOTH caches so they stay in lockstep ────
-            // The mismatch case still needs an MTP cache update at position
-            // P+1 conditioned on the corrected token (t2_target), so the cache
-            // state matches what a re-derivation would produce. (mtp cache
-            // before this was advanced via t1 at position P — that's correct.)
-            ReadOnlySpan<float> mainLogitsAfter = _fwd.Forward(t2, P + 1);
+            // Order matters: the MTP commit at position P+1 needs prev_hidden
+            // = h@P (the hidden from BEFORE main consumed t2 at position P+1).
+            // After the t1 verify Forward above, _fwd.LastHidden already holds
+            // h@P — call MtpForward FIRST, then run main commit which will
+            // overwrite LastHidden with h@P+1 for the next iter.
+            //
+            // The mismatch case still gets a valid MTP cache update at P+1:
+            // it's conditioned on t2 (the actually-emitted token, draft or
+            // target) so subsequent mtp forwards see consistent K/V history.
             _ = _fwd.MtpForward(t2, P + 1, _fwd.LastHidden);
+            ReadOnlySpan<float> mainLogitsAfter = _fwd.Forward(t2, P + 1);
 
             // ── Update saved state for next iter ─────────────────────
+            // After main.Forward(t2, P+1), LastHidden = h@P+1 — exactly the
+            // "previous hidden" the next iter's MTP draft will want.
             _fwd.LastHidden.CopyTo(_savedHidden);
             mainLogitsAfter.CopyTo(_savedMainLogits);
             _nextPos = P + 2;
