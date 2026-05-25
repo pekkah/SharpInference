@@ -1,0 +1,28 @@
+{
+  "issue": "https://github.com/pekkah/sharpi/issues/31",
+  "purpose": "MTP greedy parity reference for Qwen3.6-27B-MTP. The sharpi InferenceEngine running with MTP enabled on `prompt` should produce a continuation starting with `continuation_prefix`.",
+  "model": "Qwen3.6-27B-MTP-Q4_K_M.gguf",
+  "source": {
+    "tool": "llama-cli",
+    "version": "b9245 (b39a7bf1b)",
+    "args": [
+      "-m", "Qwen3.6-27B-MTP-Q4_K_M.gguf",
+      "-p", "The capital of France is",
+      "-n", "80",
+      "--temp", "0",
+      "-st",
+      "--no-display-prompt",
+      "--no-jinja",
+      "--log-disable",
+      "--spec-type", "draft-mtp",
+      "--spec-draft-n-max", "2",
+      "-s", "0"
+    ]
+  },
+  "prompt": "The capital of France is",
+  "prompt_tokens": [760, 6511, 314, 9338, 369],
+  "prompt_tokens_source": "llama-tokenize.exe b9245 on Qwen3.6-27B-MTP-Q4_K_M.gguf",
+  "continuation_prefix": "\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:** The user says \"The capital of France is\"\n2.  **Identify Key Entity:** France\n3.  **Identify Question Type:** Factual/Geography - asking for the capital city\n4.  **Retrieve Knowledge:** The capital of France is Paris.\n5.  **",
+  "continuation_prefix_bytes": 290,
+  "min_match_bytes": 60
+}
