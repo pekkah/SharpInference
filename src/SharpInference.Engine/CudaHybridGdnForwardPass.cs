@@ -1168,6 +1168,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         // Phase C: down × weight, fused across all 8 experts into one sweep over
         // embDim rows. Each thread owns its rows so there's no cross-expert race.
+        // Note: dtype-specialised inner loops were tried but destabilised this
+        // path (run-to-run jitter doubled). On the GPU-coordinated hybrid path
+        // the extra closure variants seem to perturb the host↔stream launch
+        // pacing — the per-iter DispatchDot switch is cheap relative to the
+        // ~1.8 ms/layer GPU sync the host stays in lock-step with anyway.
         Parallel.For(0, embDimL, s_moeParallelOpts, r =>
         {
             float sum = 0f;
