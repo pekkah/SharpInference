@@ -81,9 +81,15 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     // ── MoE scratch ────────────────────────────────────────────────────
     private readonly float* _routerLogits;   // [NumExperts]      = 256
     private readonly float* _sharedOut;      // [embDim]          = 2048
-    private readonly float* _expertGate;     // [ExpertIntermDim] = 512
-    private readonly float* _expertUp;       // [ExpertIntermDim] = 512
-    private readonly float* _expertTmp;      // [embDim]          = 2048 — accumulator for down-proj
+    private readonly float* _expertGate;     // [ExpertIntermDim] = 512 — used for the shared expert
+    private readonly float* _expertUp;       // [ExpertIntermDim] = 512 — used for the shared expert
+    // Batched-routed-expert buffers: gate/up rows for all 8 active experts laid out as
+    // [numActive × expertDim]. Together with the down sweep, this folds the per-expert
+    // 24 Parallel.For sweeps per layer into 2 (one combined gate+up sweep, one combined
+    // down + weighted-accumulate sweep) — amortising TPL barrier overhead over much
+    // larger work units. Mirrors CudaHybridGdnForwardPass.CpuMoeFfn.
+    private readonly float* _expertGateAll;  // [numActive × ExpertIntermDim]
+    private readonly float* _expertUpAll;    // [numActive × ExpertIntermDim]
 
     // ── Dimensions (cached) ────────────────────────────────────────────
     private readonly int _embDim;
@@ -238,7 +244,8 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         _sharedOut = Alloc(_embDim);
         _expertGate = Alloc(hp.ExpertIntermediateDim);
         _expertUp = Alloc(hp.ExpertIntermediateDim);
-        _expertTmp = Alloc(_embDim);
+        _expertGateAll = Alloc(hp.NumActiveExperts * hp.ExpertIntermediateDim);
+        _expertUpAll = Alloc(hp.NumActiveExperts * hp.ExpertIntermediateDim);
 
         // RoPE tables sized for partial rotation (ropeDim/2 entries per position).
         _ropeCosTable = (float*)NativeMemory.Alloc((nuint)((long)ctxLen * _ropeHalfDim * sizeof(float)));
@@ -747,8 +754,14 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             _gdnNumKHeads, _gdnKvRepeat, _gdnHeadDim);
 
         // 7. Alpha / Beta per-v-head pre-activations (F32 weights of shape [embDim, NumVHeads]).
-        FusedMatVec(_alpha, _ssmAlpha[layer], _normBuf, _gdnNumVHeads, _embDim);
-        FusedMatVec(_beta,  _ssmBeta[layer],  _normBuf, _gdnNumVHeads, _embDim);
+        //    Both projections share the same input vector and (typically) the same dtype —
+        //    fuse them so the row-parallel sweep only fires once.
+        var aRef = _ssmAlpha[layer];
+        var bRef = _ssmBeta[layer];
+        SimdKernels.MatVecDual(
+            _alpha, aRef.DataPtr,
+            _beta,  bRef.DataPtr,
+            _normBuf, _gdnNumVHeads, _embDim, aRef.DType, bRef.DType);
         if (_traceLayers) {
             EmitBufTrace(position, layer, "gdn-alpha",      _alpha, _gdnNumVHeads);
             EmitBufTrace(position, layer, "gdn-beta",       _beta,  _gdnNumVHeads);
@@ -809,9 +822,14 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         SelectTopK(_routerLogits, numExperts, numActive, selectedExperts, expertWeights);
 
         // 2. Shared expert: ffn_down @ (SiLU(ffn_gate @ x) * (ffn_up @ x)), then per-token
-        //    scalar gate via sigmoid(ffn_gate_inp_shexp · x).
-        FusedMatVec(_expertGate, _wGateShexp[layer], _normBuf, expertDim, _embDim);
-        FusedMatVec(_expertUp,   _wUpShexp[layer],   _normBuf, expertDim, _embDim);
+        //    scalar gate via sigmoid(ffn_gate_inp_shexp · x). Use MatVecDual to fuse
+        //    gate+up into a single Parallel.For sweep when dtypes match (the common case).
+        var gateShexp = _wGateShexp[layer];
+        var upShexp   = _wUpShexp[layer];
+        SimdKernels.MatVecDual(
+            _expertGate, gateShexp.DataPtr,
+            _expertUp,   upShexp.DataPtr,
+            _normBuf, expertDim, _embDim, gateShexp.DType, upShexp.DType);
         SimdKernels.SiLuMul(_expertGate, _expertUp, expertDim);
         FusedMatVec(_sharedOut,  _wDownShexp[layer], _expertGate, _embDim, expertDim);
 
@@ -823,44 +841,174 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         float shexpScale = 1.0f / (1.0f + MathF.Exp(-shexpDot));
         SimdKernels.ScaleInPlace(_sharedOut, shexpScale, _embDim);
 
-        // 3. Routed experts (sparse top-K).
-        new Span<float>(_hidden, _embDim).Clear();
-        for (int k = 0; k < numActive; k++)
-        {
-            int expertIdx = selectedExperts[k];
-            float weight = expertWeights[k];
+        // 3. Routed experts (sparse top-K), batched into 2 Parallel.For sweeps
+        //    instead of 24 per-expert ones — gate+up across all 8 experts in
+        //    one sweep, then down+weighted-accumulate across all 8 experts in
+        //    another. Mirrors CudaHybridGdnForwardPass.CpuMoeFfn.
+        var gateExps = _wGateExps[layer];
+        var upExps = _wUpExps[layer];
+        var downExps = _wDownExps[layer];
 
-            ExpertMatVec(_expertGate, _wGateExps[layer], expertIdx, expertDim, _embDim, _normBuf);
-            ExpertMatVec(_expertUp,   _wUpExps[layer],   expertIdx, expertDim, _embDim, _normBuf);
-            SimdKernels.SiLuMul(_expertGate, _expertUp, expertDim);
-            ExpertMatVecDown(_hidden, _wDownExps[layer], expertIdx, _embDim, expertDim,
-                _expertGate, weight);
+        int bprG = (_embDim   / DTypeInfo.BlockSize(gateExps.DType))
+                 * DTypeInfo.BytesPerBlock(gateExps.DType);
+        int bprU = (_embDim   / DTypeInfo.BlockSize(upExps.DType))
+                 * DTypeInfo.BytesPerBlock(upExps.DType);
+        int bprD = (expertDim / DTypeInfo.BlockSize(downExps.DType))
+                 * DTypeInfo.BytesPerBlock(downExps.DType);
+
+        // Stash the small per-token arrays in native pointers so worker threads
+        // can read them without lambda-capturing the stackalloc spans. Parallel.For
+        // is synchronous, so the stack frame stays alive until all workers complete.
+        int* sePtr = stackalloc int[numActive];
+        float* ewPtr = stackalloc float[numActive];
+        for (int i = 0; i < numActive; i++)
+        {
+            sePtr[i] = selectedExperts[i];
+            ewPtr[i] = expertWeights[i];
+        }
+
+        byte* gateP = gateExps.DataPtr;
+        byte* upP   = upExps.DataPtr;
+        byte* downP = downExps.DataPtr;
+        DType gateDt = gateExps.DType;
+        DType upDt   = upExps.DType;
+        DType downDt = downExps.DType;
+        float* gateAll = _expertGateAll;
+        float* upAll   = _expertUpAll;
+        float* normBuf = _normBuf;
+        float* hiddenOut = _hidden;
+        int embDimL = _embDim;
+        int expertDimL = expertDim;
+        int numActiveL = numActive;
+        int bprGL = bprG, bprUL = bprU, bprDL = bprD;
+
+        // Phase A: gate + up rows for all (k, r) tuples. Specialised on the
+        // gate/up dtype pair so the inner dot is inlined directly — saves the
+        // per-iter switch on enum across ~327 K dispatches per token.
+        if (gateDt == DType.Q4_K && upDt == DType.Q4_K)
+        {
+            Parallel.For(0, numActiveL * expertDimL, s_moeParallelOpts, idx =>
+            {
+                int k = idx / expertDimL;
+                int r = idx % expertDimL;
+                int expertIdx = sePtr[k];
+                long offG = (long)expertIdx * expertDimL * bprGL + (long)r * bprGL;
+                long offU = (long)expertIdx * expertDimL * bprUL + (long)r * bprUL;
+                gateAll[idx] = SimdKernels.DotQ4K(gateP + offG, normBuf, embDimL);
+                upAll[idx]   = SimdKernels.DotQ4K(upP   + offU, normBuf, embDimL);
+            });
+        }
+        else
+        {
+            Parallel.For(0, numActiveL * expertDimL, s_moeParallelOpts, idx =>
+            {
+                int k = idx / expertDimL;
+                int r = idx % expertDimL;
+                int expertIdx = sePtr[k];
+                long offG = (long)expertIdx * expertDimL * bprGL + (long)r * bprGL;
+                long offU = (long)expertIdx * expertDimL * bprUL + (long)r * bprUL;
+                gateAll[idx] = DispatchDot(gateP + offG, normBuf, embDimL, gateDt);
+                upAll[idx]   = DispatchDot(upP   + offU, normBuf, embDimL, upDt);
+            });
+        }
+
+        // Phase B: one fused SiLuMul over (numActive × expertDim) contiguous
+        // floats. SiLuMul is element-wise, so expert boundaries don't matter.
+        SimdKernels.SiLuMul(_expertGateAll, _expertUpAll, numActive * expertDim);
+
+        // Phase C: down × weight, fused across all 8 experts into one sweep
+        // over embDim output rows. Hot dtypes (Q4_K / Q5_K / Q6_K) get
+        // specialised loops so the inner 8-iter accumulator can inline the dot.
+        switch (downDt)
+        {
+            case DType.Q4_K:
+                Parallel.For(0, embDimL, s_moeParallelOpts, r =>
+                {
+                    float sum = 0f;
+                    for (int k = 0; k < numActiveL; k++)
+                    {
+                        int expertIdx = sePtr[k];
+                        float w = ewPtr[k];
+                        long offD = (long)expertIdx * embDimL * bprDL + (long)r * bprDL;
+                        sum += w * SimdKernels.DotQ4K(downP + offD,
+                                                      gateAll + (long)k * expertDimL,
+                                                      expertDimL);
+                    }
+                    hiddenOut[r] = sum;
+                });
+                break;
+            case DType.Q5_K:
+                Parallel.For(0, embDimL, s_moeParallelOpts, r =>
+                {
+                    float sum = 0f;
+                    for (int k = 0; k < numActiveL; k++)
+                    {
+                        int expertIdx = sePtr[k];
+                        float w = ewPtr[k];
+                        long offD = (long)expertIdx * embDimL * bprDL + (long)r * bprDL;
+                        sum += w * SimdKernels.DotQ5K(downP + offD,
+                                                      gateAll + (long)k * expertDimL,
+                                                      expertDimL);
+                    }
+                    hiddenOut[r] = sum;
+                });
+                break;
+            case DType.Q6_K:
+                Parallel.For(0, embDimL, s_moeParallelOpts, r =>
+                {
+                    float sum = 0f;
+                    for (int k = 0; k < numActiveL; k++)
+                    {
+                        int expertIdx = sePtr[k];
+                        float w = ewPtr[k];
+                        long offD = (long)expertIdx * embDimL * bprDL + (long)r * bprDL;
+                        sum += w * SimdKernels.DotQ6K(downP + offD,
+                                                      gateAll + (long)k * expertDimL,
+                                                      expertDimL);
+                    }
+                    hiddenOut[r] = sum;
+                });
+                break;
+            default:
+                Parallel.For(0, embDimL, s_moeParallelOpts, r =>
+                {
+                    float sum = 0f;
+                    for (int k = 0; k < numActiveL; k++)
+                    {
+                        int expertIdx = sePtr[k];
+                        float w = ewPtr[k];
+                        long offD = (long)expertIdx * embDimL * bprDL + (long)r * bprDL;
+                        sum += w * DispatchDot(downP + offD,
+                                               gateAll + (long)k * expertDimL,
+                                               expertDimL, downDt);
+                    }
+                    hiddenOut[r] = sum;
+                });
+                break;
         }
 
         // 4. Add shared expert output.
         SimdKernels.AddInPlace(_hidden, _sharedOut, _embDim);
     }
 
-    private void ExpertMatVec(float* output, in TensorRef packedTensor,
-        int expertIdx, int rows, int cols, float* input)
+    // ParallelOptions for the routed-MoE sweeps. Pinning to ProcessorCount avoids
+    // the ThreadPool oversubscription that would otherwise add 8+ workers when
+    // these short-but-heavy parallel loops fire back-to-back per layer.
+    private static readonly ParallelOptions s_moeParallelOpts = new()
     {
-        int bytesPerRow = (cols / DTypeInfo.BlockSize(packedTensor.DType))
-                        * DTypeInfo.BytesPerBlock(packedTensor.DType);
-        long expertOffset = (long)expertIdx * rows * bytesPerRow;
-        byte* expertData = packedTensor.DataPtr + expertOffset;
-        SimdKernels.MatVec(output, expertData, input, rows, cols, packedTensor.DType);
-    }
+        MaxDegreeOfParallelism = Environment.ProcessorCount
+    };
 
-    private void ExpertMatVecDown(float* output, in TensorRef packedTensor,
-        int expertIdx, int rows, int cols, float* input, float weight)
-    {
-        int bytesPerRow = (cols / DTypeInfo.BlockSize(packedTensor.DType))
-                        * DTypeInfo.BytesPerBlock(packedTensor.DType);
-        long expertOffset = (long)expertIdx * rows * bytesPerRow;
-        byte* expertData = packedTensor.DataPtr + expertOffset;
-        SimdKernels.MatVec(_expertTmp, expertData, input, rows, cols, packedTensor.DType);
-        SimdKernels.WeightedAddInPlace(output, _expertTmp, weight, rows);
-    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float DispatchDot(byte* row, float* input, int cols, DType dtype) =>
+        dtype switch
+        {
+            DType.Q4_K    => SimdKernels.DotQ4K(row, input, cols),
+            DType.Q5_K    => SimdKernels.DotQ5K(row, input, cols),
+            DType.Q6_K    => SimdKernels.DotQ6K(row, input, cols),
+            DType.Float32 => SimdKernels.DotF32((float*)row, input, cols),
+            _ => throw new NotSupportedException($"Routed expert dtype {dtype} not supported in batched path"),
+        };
 
     private static void SelectTopK(float* logits, int n, int k,
         Span<int> indices, Span<float> weights)
@@ -1102,7 +1250,8 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         NativeMemory.Free(_sharedOut);
         NativeMemory.Free(_expertGate);
         NativeMemory.Free(_expertUp);
-        NativeMemory.Free(_expertTmp);
+        NativeMemory.Free(_expertGateAll);
+        NativeMemory.Free(_expertUpAll);
         NativeMemory.Free(_ropeCosTable);
         NativeMemory.Free(_ropeSinTable);
 
