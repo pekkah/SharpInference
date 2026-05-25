@@ -224,6 +224,94 @@ public sealed class HybridGdnForwardPassTests
     }
 
     /// <summary>
+    /// Issue #33 guard: <see cref="IForwardPass.PrefillMtp"/> must populate the MTP
+    /// attention KV cache for every prompt position so the first decode-step's MTP
+    /// attention sees the prompt context, not just its own freshly-written K/V.
+    ///
+    /// <para>
+    /// We can't introspect <c>_mtpKvCache.Length</c> from the test, so we exercise
+    /// the head behaviourally: with an empty MTP KV the attention at position P
+    /// reduces to <c>softmax([s_self]) · v_self = v_self</c> (a single-token
+    /// softmax collapses to 1.0); after <c>PrefillMtp</c> populates positions
+    /// 0..P-1, attention reads a different value and the MTP logits change.
+    /// We assert (a) the head output is non-degenerate in BOTH configurations
+    /// (smoke-test passes either way — the original bug "passed by accident") AND
+    /// (b) the two outputs are not bitwise-identical — that delta is the load-bearing
+    /// check that PrefillMtp actually changed the cache.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void HybridGdnForwardPass_Qwen35Mtp_PrefillMtpPopulatesMtpKvCache()
+    {
+        var path = FindMtpModelPath();
+        if (path is null) return;   // silent skip
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.Equal(1, hp.NumMtpLayers);
+
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var backend = new CpuBackend();
+        using var fwd = new HybridGdnForwardPass(model, backend, hp);
+        Assert.True(fwd.HasMtpHead);
+
+        // Use a multi-token prompt; the more positions in the prompt, the larger
+        // the gap between "empty MTP KV" and "PrefillMtp-populated MTP KV".
+        var tokens = tokenizer.Encode("The capital of France is");
+        Assert.True(tokens.Count >= 3,
+            "Test needs a multi-token prompt to distinguish empty-vs-populated MTP KV.");
+
+        // ── Run 1: Prefill only (no PrefillMtp) — MTP KV stays empty ──
+        fwd.ResetCache();
+        // Snapshot main logits + hidden up front — both _logits and (on the GPU
+        // path) _gpuHidden are shared scratch buffers that MtpForward overwrites.
+        int t1 = Sampler.Greedy(fwd.Prefill(tokens));
+        var hSnapshot1 = fwd.LastHidden.ToArray();
+        var mtpEmpty = fwd.MtpForward(t1, tokens.Count, hSnapshot1).ToArray();
+
+        // ── Run 2: Prefill + PrefillMtp — MTP KV populated for 0..N-1 ──
+        fwd.ResetCache();
+        int t1b = Sampler.Greedy(fwd.Prefill(tokens));
+        var hSnapshot2 = fwd.LastHidden.ToArray();
+        // Main pass is deterministic; sanity-check we got the same starting state
+        // before PrefillMtp scribbles on the shared _logits buffer.
+        Assert.Equal(t1, t1b);
+        fwd.PrefillMtp(tokens);
+        var mtpPopulated = fwd.MtpForward(t1, tokens.Count, hSnapshot2).ToArray();
+
+        // Both runs must be well-formed (rules out NaN / collapse).
+        Assert.Equal(hp.VocabSize, mtpEmpty.Length);
+        Assert.Equal(hp.VocabSize, mtpPopulated.Length);
+        for (int i = 0; i < mtpEmpty.Length; i++)
+        {
+            Assert.True(float.IsFinite(mtpEmpty[i]), $"empty-KV MTP logit non-finite at {i}");
+            Assert.True(float.IsFinite(mtpPopulated[i]), $"populated-KV MTP logit non-finite at {i}");
+        }
+
+        // Load-bearing assertion: the populated-KV path must differ from the
+        // empty-KV path. If PrefillMtp is a no-op (or only writes one position),
+        // the MTP attention at position N still attends over the same K/V set,
+        // and these arrays are bitwise-identical — that's the bug from issue #33.
+        bool anyDiff = false;
+        float maxDelta = 0f;
+        for (int i = 0; i < mtpEmpty.Length; i++)
+        {
+            float d = MathF.Abs(mtpEmpty[i] - mtpPopulated[i]);
+            if (d > 0f) anyDiff = true;
+            if (d > maxDelta) maxDelta = d;
+        }
+        Assert.True(anyDiff,
+            "PrefillMtp produced bitwise-identical MTP logits to the empty-KV path. " +
+            "Either the MTP KV cache wasn't populated, or MtpForward isn't reading the " +
+            "populated entries. Re-check IForwardPass.PrefillMtp wiring (issue #33).");
+
+        // A token of context should move the MTP logits by more than just FP noise.
+        Assert.True(maxDelta > 1e-4f,
+            $"PrefillMtp-induced delta ({maxDelta:G3}) is at FP-noise level; the MTP " +
+            "attention may be ignoring the populated K/V entries.");
+    }
+
+    /// <summary>
     /// End-to-end MTP self-parity: greedy decode through <see cref="InferenceEngine"/>
     /// with MTP routing enabled must produce the SAME token sequence as the same
     /// decode with <c>SHARPI_DISABLE_MTP=1</c> on the same model and prompt.

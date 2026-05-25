@@ -173,6 +173,21 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     var fullSeq = new List<int>(tokens.Length + Math.Max(1, sp.MaxNewTokens));
                     fullSeq.AddRange(tokens);
 
+                    // MTP self-speculative decoding (issue #25): when the forward pass
+                    // ships an MTP head AND we're in greedy, non-reasoning mode AND the
+                    // user hasn't disabled MTP via SHARPI_DISABLE_MTP=1, drive decode
+                    // through MtpDecoder instead of the per-token sampling loop below.
+                    // The MTP path emits one extra MTP-drafted token per main forward.
+                    //
+                    // Decided BEFORE prefix-reuse (issue #33): MTP requires the MTP KV
+                    // cache to cover every prompt position via PrefillMtp, which only
+                    // works when Prefill starts from position 0. Prefix reuse is
+                    // therefore skipped on MTP runs.
+                    bool useMtp = _fwd.HasMtpHead
+                        && Environment.GetEnvironmentVariable("SHARPI_DISABLE_MTP") != "1"
+                        && sp.Temperature <= 0f
+                        && !thinkingEnabled;
+
                     // Prefix cache decision: two branches.
                     //   (a) Rewindable attention pass — existing FindCacheablePrefix path,
                     //       page-aligned KV reuse.
@@ -181,7 +196,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     //       held GDN recurrent state can be restored.
                     // If neither branch hits, fall back to a full ResetCache + Prefill.
                     int prefixLen = 0;
-                    if (_fwd.SupportsPartialRewind)
+                    if (!useMtp && _fwd.SupportsPartialRewind)
                     {
                         int candidate = FindCacheablePrefix(tokens);
                         if (candidate > 0)
@@ -190,7 +205,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                             prefixLen = candidate;
                         }
                     }
-                    else if (_fwd.SnapshotLength > 0 && _prevTokens != null)
+                    else if (!useMtp && _fwd.SnapshotLength > 0 && _prevTokens != null)
                     {
                         int snapLen = _fwd.SnapshotLength;
                         // snapLen must be a strict prefix of the new prompt (need at least
@@ -223,20 +238,21 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     else
                         logits = _fwd.Forward(tokens[^1], tokens.Length - 1);
 
-                    // MTP self-speculative decoding (issue #25): when the forward pass
-                    // ships an MTP head AND we're in greedy, non-reasoning mode AND the
-                    // user hasn't disabled MTP via SHARPI_DISABLE_MTP=1, drive decode
-                    // through MtpDecoder instead of the per-token sampling loop below.
-                    // The MTP path emits one extra MTP-drafted token per main forward.
-                    bool useMtp = _fwd.HasMtpHead
-                        && Environment.GetEnvironmentVariable("SHARPI_DISABLE_MTP") != "1"
-                        && sp.Temperature <= 0f
-                        && !thinkingEnabled;
-
                     if (useMtp)
                     {
+                        // Initialize captures the main logits + LastHidden BEFORE
+                        // PrefillMtp's MtpForward calls overwrite the shared _logits
+                        // scratch buffer (issue #33). PrefillMtp does not touch
+                        // _lastHidden, so the captured hidden remains h_{N-1}.
                         var mtpDec = new MtpDecoder(_fwd);
                         mtpDec.Initialize(tokens.Length, logits);
+
+                        // Issue #33: populate the MTP KV cache for the prompt so the
+                        // first decode-step MTP attention sees the full prompt context.
+                        // ~1.6%/token overhead — only paid on MTP-enabled runs.
+                        if (suffixTokens.Length > 0)
+                            _fwd.PrefillMtp(suffixTokens, prefixLen);
+
                         var textDecMtp = new Utf8StreamDecoder();
 
                         mtpDec.Decode(sp.MaxNewTokens, stopIds.AsSpan(), tok =>

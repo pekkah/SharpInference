@@ -110,6 +110,27 @@ public interface IForwardPass : IDisposable
         throw new NotSupportedException(
             $"{GetType().Name} does not implement an MTP head. Check HasMtpHead before calling.");
 
+    /// <summary>
+    /// Populate the MTP attention KV cache for a sequence of prompt tokens, calling
+    /// <see cref="MtpForward"/> at each position with the previous main forward's
+    /// hidden state. Must be called after a matching <see cref="Prefill"/> so that
+    /// the MTP head has access to per-position hiddens (the implementation buffers
+    /// them during <see cref="Prefill"/> when <see cref="HasMtpHead"/> is true).
+    /// <para>
+    /// Without this, the MTP attention KV cache is empty at the first decode step
+    /// and the MTP head's attention scores only see its own freshly-written K/V at
+    /// the decode position — issue #33. Self-parity tests don't detect this because
+    /// the emitted sequence is always argmax(main_logits); MTP KV quality only
+    /// affects acceptance rate (and thus speculative speedup).
+    /// </para>
+    /// </summary>
+    /// <param name="tokens">Prompt token IDs to populate MTP KV for. Should match the
+    /// list passed to the preceding <see cref="Prefill"/>.</param>
+    /// <param name="startPos">Position at which the first token sits (== same
+    /// <c>startPos</c> as the preceding <see cref="Prefill"/>).</param>
+    /// <remarks>Default is a no-op so non-MTP forward passes need no override.</remarks>
+    void PrefillMtp(IReadOnlyList<int> tokens, int startPos = 0) { }
+
     /// <summary>Reset the MTP attention KV cache. No-op when <see cref="HasMtpHead"/> is false.</summary>
     void MtpResetCache() { }
 

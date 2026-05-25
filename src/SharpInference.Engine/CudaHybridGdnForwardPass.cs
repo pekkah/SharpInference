@@ -316,6 +316,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // IForwardPass.LastHidden returns a host span without an extra device read.
     private readonly float* _lastHidden;
 
+    // Issue #33: host-side buffer of per-position pre-output-norm hiddens captured
+    // during Prefill. Consumed by PrefillMtp to drive MtpForward at each prompt
+    // position without re-running the trunk. Lazy-allocated; capacity grows as needed.
+    private float* _mtpPrefillHiddens;     // [_mtpPrefillHiddensCap × embDim]
+    private int _mtpPrefillHiddensCap;     // allocated capacity in tokens
+    private int _mtpPrefillHiddensCount;   // hiddens stored by last Prefill
+    private int _mtpPrefillHiddensStartPos; // startPos of last Prefill
+
     private bool _disposed;
 
     public int VocabSize => _hp.VocabSize;
@@ -836,10 +844,37 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     {
         if (tokens is null || tokens.Count == 0)
             throw new ArgumentException("Token list is empty", nameof(tokens));
+
+        // Issue #33: buffer per-position pre-output-norm hiddens for the follow-up
+        // PrefillMtp call. Forward already downloads _lastHidden after each step when
+        // _hasMtp, so we just copy the host span — no extra device traffic.
+        if (_hasMtp)
+        {
+            EnsureMtpPrefillHiddensCap(tokens.Count);
+            _mtpPrefillHiddensCount = tokens.Count;
+            _mtpPrefillHiddensStartPos = startPos;
+        }
+
         ReadOnlySpan<float> logits = default;
         for (int i = 0; i < tokens.Count; i++)
+        {
             logits = Forward(tokens[i], startPos + i);
+            if (_hasMtp)
+            {
+                new ReadOnlySpan<float>(_lastHidden, _embDim).CopyTo(
+                    new Span<float>(_mtpPrefillHiddens + (long)i * _embDim, _embDim));
+            }
+        }
         return logits;
+    }
+
+    private void EnsureMtpPrefillHiddensCap(int requiredTokens)
+    {
+        if (_mtpPrefillHiddensCap >= requiredTokens) return;
+        if (_mtpPrefillHiddens != null) NativeMemory.Free(_mtpPrefillHiddens);
+        _mtpPrefillHiddens = (float*)NativeMemory.Alloc(
+            (nuint)((long)requiredTokens * _embDim * sizeof(float)));
+        _mtpPrefillHiddensCap = requiredTokens;
     }
 
     public void TruncateTo(int length)
@@ -1285,6 +1320,47 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // write; the device-side _gpuMtpKCache is a flat ring, so writes simply
         // overwrite stale slots on subsequent KvAppend calls.
         _mtpKvCache?.TruncateTo(length);
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// Issue #33 (CUDA mirror of <see cref="HybridGdnForwardPass.PrefillMtp"/>):
+    /// Walks the prompt and calls <see cref="MtpForward"/> at each position to
+    /// populate the GPU MTP KV cache. The previous hidden <c>h_{i-1}</c> is read
+    /// from the host-side buffer captured during the matching <see cref="Prefill"/>;
+    /// MtpForward uploads it back to <c>_gpuLastHidden</c> per step.
+    /// </remarks>
+    public void PrefillMtp(IReadOnlyList<int> tokens, int startPos = 0)
+    {
+        if (!_hasMtp) return;
+        if (tokens is null || tokens.Count == 0) return;
+
+        int N = tokens.Count;
+        if (_mtpPrefillHiddensCount < N || _mtpPrefillHiddensStartPos != startPos)
+            throw new InvalidOperationException(
+                $"PrefillMtp({N} tokens, startPos={startPos}) requires a preceding " +
+                $"Prefill with the same startPos and at least {N} tokens; the buffer " +
+                $"holds {_mtpPrefillHiddensCount} hiddens at startPos={_mtpPrefillHiddensStartPos}.");
+
+        if (startPos > 0)
+            throw new InvalidOperationException(
+                "PrefillMtp with startPos > 0 is not supported: h_{startPos-1} from a " +
+                "prior turn is not retained. The caller should disable prefix reuse when " +
+                "MTP is active so PrefillMtp is always called with startPos == 0.");
+
+        float* zeroHidden = (float*)NativeMemory.AllocZeroed((nuint)(_embDim * sizeof(float)));
+        try
+        {
+            for (int i = 0; i < N; i++)
+            {
+                float* prevH = (i == 0) ? zeroHidden : _mtpPrefillHiddens + (long)(i - 1) * _embDim;
+                _ = MtpForward(tokens[i], startPos + i, new ReadOnlySpan<float>(prevH, _embDim));
+            }
+        }
+        finally
+        {
+            NativeMemory.Free(zeroHidden);
+        }
     }
 
     // =================================================================
@@ -2373,6 +2449,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _gpu.Free(_gpuMtpConcatBuf);
             _gpu.Free(_gpuLastHidden);
             if (_lastHidden != null) NativeMemory.Free(_lastHidden);
+            if (_mtpPrefillHiddens != null)
+            {
+                NativeMemory.Free(_mtpPrefillHiddens);
+                _mtpPrefillHiddens = null;
+                _mtpPrefillHiddensCap = 0;
+            }
             _mtpKvCache?.Dispose();
         }
 

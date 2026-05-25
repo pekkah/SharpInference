@@ -217,6 +217,14 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     private readonly float* _mtpConcatBuf;            // [embDim * 2]
     private readonly float* _mtpEhProjF32;            // dequant'd eh_proj weight [embDim*2 × embDim] row-major F32
 
+    // Issue #33: buffer of per-position pre-output-norm hiddens from the most
+    // recent Prefill, so a follow-up PrefillMtp can drive MtpForward at every
+    // prompt position with h_{i-1}. Lazy-allocated; capacity grows as needed.
+    private float* _mtpPrefillHiddens;                // [_mtpPrefillHiddensCap × embDim]
+    private int _mtpPrefillHiddensCap;                // allocated capacity in tokens
+    private int _mtpPrefillHiddensCount;              // hiddens stored by last Prefill
+    private int _mtpPrefillHiddensStartPos;           // startPos of last Prefill
+
     public HybridGdnForwardPass(GgufModel model, IComputeBackend backend, ModelHyperparams hp,
         int maxContextLength = 0)
     {
@@ -477,10 +485,38 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     {
         if (tokens is null || tokens.Count == 0)
             throw new ArgumentException("Token list is empty", nameof(tokens));
+
+        // Issue #33: when MTP is loaded, buffer per-position pre-output-norm hiddens
+        // so a follow-up PrefillMtp can populate the MTP KV cache without redoing
+        // the main trunk. Cost: N × embDim memcpy per prefill (negligible).
+        if (_hasMtp)
+        {
+            EnsureMtpPrefillHiddensCap(tokens.Count);
+            _mtpPrefillHiddensCount = tokens.Count;
+            _mtpPrefillHiddensStartPos = startPos;
+        }
+
         ReadOnlySpan<float> logits = default;
         for (int i = 0; i < tokens.Count; i++)
+        {
             logits = Forward(tokens[i], startPos + i);
+            if (_hasMtp)
+            {
+                // _lastHidden = h_{startPos+i} (set inside Forward when _hasMtp).
+                new ReadOnlySpan<float>(_lastHidden, _embDim).CopyTo(
+                    new Span<float>(_mtpPrefillHiddens + (long)i * _embDim, _embDim));
+            }
+        }
         return logits;
+    }
+
+    private void EnsureMtpPrefillHiddensCap(int requiredTokens)
+    {
+        if (_mtpPrefillHiddensCap >= requiredTokens) return;
+        if (_mtpPrefillHiddens != null) NativeMemory.Free(_mtpPrefillHiddens);
+        _mtpPrefillHiddens = (float*)NativeMemory.Alloc(
+            (nuint)((long)requiredTokens * _embDim * sizeof(float)));
+        _mtpPrefillHiddensCap = requiredTokens;
     }
 
     /// <summary>
@@ -1011,6 +1047,58 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     public void MtpTruncateTo(int length)
     {
         _mtpKvCache?.TruncateTo(length);
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// Issue #33: Walks <paramref name="tokens"/> and calls
+    /// <see cref="MtpForward(int, int, ReadOnlySpan{float})"/> at each prompt position
+    /// so the MTP attention KV cache is populated for positions
+    /// [<paramref name="startPos"/>..<paramref name="startPos"/>+N-1]. The previous
+    /// hidden <c>h_{i-1}</c> is read from the buffer captured during the matching
+    /// <see cref="Prefill"/> call. For the first position when
+    /// <paramref name="startPos"/> is 0, a zero vector is used (matches llama.cpp's
+    /// "no previous hidden" convention at the start of a sequence). When
+    /// <paramref name="startPos"/> &gt; 0 (prefix reuse), <c>h_{startPos-1}</c> would
+    /// have to come from a prior turn — not currently retained, so callers must
+    /// disable prefix reuse when driving MTP.
+    /// </remarks>
+    public void PrefillMtp(IReadOnlyList<int> tokens, int startPos = 0)
+    {
+        if (!_hasMtp) return;
+        if (tokens is null || tokens.Count == 0) return;
+
+        int N = tokens.Count;
+        if (_mtpPrefillHiddensCount < N || _mtpPrefillHiddensStartPos != startPos)
+            throw new InvalidOperationException(
+                $"PrefillMtp({N} tokens, startPos={startPos}) requires a preceding " +
+                $"Prefill with the same startPos and at least {N} tokens; the buffer " +
+                $"holds {_mtpPrefillHiddensCount} hiddens at startPos={_mtpPrefillHiddensStartPos}.");
+
+        // For position startPos+i, prevHidden = h_{startPos+i-1}:
+        //   i == 0 && startPos == 0  →  zero vector
+        //   i == 0 && startPos > 0   →  unsupported (would need h_{startPos-1} from previous turn)
+        //   i > 0                    →  _mtpPrefillHiddens[(i-1) * embDim]
+        if (startPos > 0)
+            throw new InvalidOperationException(
+                "PrefillMtp with startPos > 0 is not supported: h_{startPos-1} from a prior " +
+                "turn is not retained. The caller (InferenceEngine) should disable prefix " +
+                "reuse when MTP is active so PrefillMtp is always called with startPos == 0.");
+
+        // Zero buffer for the i=0 prevHidden slot.
+        float* zeroHidden = (float*)NativeMemory.AllocZeroed((nuint)(_embDim * sizeof(float)));
+        try
+        {
+            for (int i = 0; i < N; i++)
+            {
+                float* prevH = (i == 0) ? zeroHidden : _mtpPrefillHiddens + (long)(i - 1) * _embDim;
+                _ = MtpForward(tokens[i], startPos + i, new ReadOnlySpan<float>(prevH, _embDim));
+            }
+        }
+        finally
+        {
+            NativeMemory.Free(zeroHidden);
+        }
     }
 
     // ============================================================
@@ -1643,6 +1731,12 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             if (_mtpHnormBuf != null) NativeMemory.Free(_mtpHnormBuf);
             if (_mtpConcatBuf != null) NativeMemory.Free(_mtpConcatBuf);
             if (_lastHidden != null) NativeMemory.Free(_lastHidden);
+            if (_mtpPrefillHiddens != null)
+            {
+                NativeMemory.Free(_mtpPrefillHiddens);
+                _mtpPrefillHiddens = null;
+                _mtpPrefillHiddensCap = 0;
+            }
             _mtpKvCache?.Dispose();
         }
 
