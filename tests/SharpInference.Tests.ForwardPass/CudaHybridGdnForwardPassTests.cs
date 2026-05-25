@@ -240,4 +240,104 @@ public sealed class CudaHybridGdnForwardPassTests
             Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", prev);
         }
     }
+
+    /// <summary>
+    /// Probes for the qwen35 27B-MTP GGUF in the small-models directory. Tracked
+    /// separately from <see cref="FindHybridModelPath"/> because qwen35-MTP is a
+    /// dense (non-MoE) hybrid GDN model with an MTP head, not the 35B-A3B MoE.
+    /// </summary>
+    private static string? FindMtpModelPath()
+    {
+        string[] absoluteCandidates =
+        {
+            @"C:\p\sharpi\models\Qwen3.6-27B-MTP-Q4_K_M.gguf",
+            @"E:\models\Qwen3.6-27B-MTP-Q4_K_M.gguf",
+        };
+        foreach (var p in absoluteCandidates)
+            if (File.Exists(p)) return p;
+
+        var dir = Directory.GetCurrentDirectory();
+        for (int i = 0; i < 8; i++)
+        {
+            var p = Path.Combine(dir, "models", "Qwen3.6-27B-MTP-Q4_K_M.gguf");
+            if (File.Exists(p)) return p;
+            var parent = Directory.GetParent(dir);
+            if (parent is null) break;
+            dir = parent.FullName;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Smoke test for the MTP / NEXTN head on the CUDA hybrid path (issue #29).
+    /// Mirrors <see cref="HybridGdnForwardPassTests"/>'s CPU MTP test: asserts
+    /// the head loads, <see cref="IForwardPass.LastHidden"/> is downloaded from
+    /// GPU after each main forward, and <see cref="IForwardPass.MtpForward"/>
+    /// produces finite, non-degenerate logits routed entirely on GPU.
+    /// </summary>
+    [Fact]
+    public void CudaHybridGdnForwardPass_Qwen35Mtp_MtpHeadProducesWellFormedLogits()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        var path = FindMtpModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+
+        Assert.True(hp.IsHybridSsm, "Expected hp.IsHybridSsm for qwen35 27B-MTP");
+        Assert.NotNull(hp.Gdn);
+        Assert.False(hp.IsMoE, "qwen35 27B-MTP is dense, not MoE");
+        Assert.Equal(1, hp.NumMtpLayers);
+
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+
+        var placement = new LayerPlacement(
+            GpuLayers: hp.NumLayers,
+            CpuLayers: 0,
+            GpuWeightBytes: 0,
+            GpuKvBytes: 0,
+            RecommendedCtxSize: Math.Min(hp.ContextLength, 2048));
+
+        using var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
+
+        Assert.True(fwd.HasMtpHead,
+            "CudaHybridGdnForwardPass should have detected the MTP head at " +
+            "blk.NumLayers and reported HasMtpHead == true.");
+
+        var tokens = tokenizer.Encode("Hello");
+        Assert.NotEmpty(tokens);
+
+        var mainLogits = fwd.Prefill(tokens);
+
+        var lastHidden = fwd.LastHidden;
+        Assert.Equal(hp.EmbeddingDim, lastHidden.Length);
+        for (int i = 0; i < lastHidden.Length; i++)
+            Assert.True(float.IsFinite(lastHidden[i]),
+                $"LastHidden has a non-finite entry at index {i}: {lastHidden[i]}. " +
+                "Either the pre-output-norm snapshot or the GPU→host Download is broken.");
+
+        int t1 = Sampler.Greedy(mainLogits);
+        var mtpLogits = fwd.MtpForward(t1, tokens.Count, lastHidden);
+
+        Assert.Equal(hp.VocabSize, mtpLogits.Length);
+
+        float min = float.MaxValue, max = float.MinValue;
+        for (int i = 0; i < mtpLogits.Length; i++)
+        {
+            float v = mtpLogits[i];
+            Assert.True(float.IsFinite(v),
+                $"CUDA MTP logit non-finite at vocab idx {i}: {v}. " +
+                "Likely culprits: eh_proj F32 upload, CopyDeviceRegion concat halves, " +
+                "MTP attention KV cache wiring, or shared_head_norm.");
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+        Assert.True(max - min > 0.1f,
+            $"CUDA MTP logit range too tight ({min:F3}..{max:F3}); the head is " +
+            "producing degenerate output. Likely culprits: SplitQG with MTP weights, " +
+            "GLU gate, or output projection.");
+    }
 }

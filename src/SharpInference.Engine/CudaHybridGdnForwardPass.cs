@@ -273,6 +273,49 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private readonly float* _cpuFfnUpBuf;              // [_intermDim] scratch
     private readonly int _intermDim;                   // hp.IntermediateDim (dense); 0 for MoE
 
+    // ── MTP / NEXTN head (issue #25 / #29) ─────────────────────────────
+    // Mirror of HybridGdnForwardPass MTP fields, plus GPU-resident equivalents
+    // for the per-step forward path. Loaded when hp.NumMtpLayers > 0 AND the
+    // expected nextn.* tensors are present in the GGUF.
+    private readonly bool _hasMtp;
+    private readonly PagedKvCache? _mtpKvCache;  // length bookkeeping; data lives on GPU
+
+    // GPU-resident MTP block weights (standard attn+FFN layout, same as a main
+    // full-attention layer; null when !_hasMtp).
+    private readonly Tensor _gpuMtpAttnNorm;
+    private readonly Tensor _gpuMtpWQGate;        // attn_q (Q‖gate interleaved, output qDim*2)
+    private readonly Tensor _gpuMtpWK;
+    private readonly Tensor _gpuMtpWV;
+    private readonly Tensor _gpuMtpWO;
+    private readonly Tensor _gpuMtpQNorm;
+    private readonly Tensor _gpuMtpKNorm;
+    private readonly Tensor _gpuMtpPostAttnNorm;
+    private readonly Tensor _gpuMtpFfnGate;
+    private readonly Tensor _gpuMtpFfnUp;
+    private readonly Tensor _gpuMtpFfnDown;
+
+    // nextn.* — pre-fc norms, eh_proj (Q8_0 → F32 at load), shared_head_norm.
+    private readonly Tensor _gpuMtpEnorm;
+    private readonly Tensor _gpuMtpHnorm;
+    private readonly Tensor _gpuMtpSharedHeadNorm;
+    private readonly Tensor _gpuMtpEhProj;        // F32 [embDim, embDim*2]
+
+    // GPU MTP KV cache (single attention layer, flat ring layout same as
+    // _gpuKCache[layer] in the trunk).
+    private readonly Tensor? _gpuMtpKCache;
+    private readonly Tensor? _gpuMtpVCache;
+
+    // Per-step scratch on GPU.
+    private readonly Tensor _gpuMtpEmbedBuf;      // [embDim]
+    private readonly Tensor _gpuMtpEnormBuf;      // [embDim]
+    private readonly Tensor _gpuMtpHnormBuf;      // [embDim]
+    private readonly Tensor _gpuMtpConcatBuf;     // [embDim * 2]
+    private readonly Tensor _gpuLastHidden;       // [embDim] — pre-output-norm hidden snapshot
+
+    // Host LastHidden buffer; refreshed via Download after each main Forward so
+    // IForwardPass.LastHidden returns a host span without an extra device read.
+    private readonly float* _lastHidden;
+
     private bool _disposed;
 
     public int VocabSize => _hp.VocabSize;
@@ -704,6 +747,85 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             Console.Error.WriteLine($"[CudaHybridGdnForwardPass] SLRU expert cache: {capacity} slots / {totalExperts} total experts (per-expert ≈ {perExpertBytes / 1024} KiB, remaining VRAM ≈ {remaining / (1024 * 1024)} MiB).");
             _expertSlotManager = new CudaExpertSlotManager(gpu, model, hp, capacity, _gpuWeightDTypes);
         }
+
+        // ── MTP / NEXTN head on GPU (issue #29; mirror of HybridGdnForwardPass) ──
+        // Loaded when the GGUF reports nextn_predict_layers > 0 AND the expected
+        // tensors exist at blk.{NumLayers}. Multi-head MTP (NumMtpLayers > 1) is
+        // out of scope for v1; only the first head is loaded.
+        _hasMtp = hp.NumMtpLayers > 0
+                  && model.FindTensor($"blk.{hp.NumLayers}.nextn.eh_proj.weight") is not null;
+        if (_hasMtp)
+        {
+            int mtpLayerIdx = hp.NumLayers;
+            TraceVram("before MTP head upload");
+
+            _gpuMtpAttnNorm       = UploadWeight($"blk.{mtpLayerIdx}.attn_norm.weight");
+            _gpuMtpWQGate         = UploadWeight($"blk.{mtpLayerIdx}.attn_q.weight");
+            _gpuMtpWK             = UploadWeight($"blk.{mtpLayerIdx}.attn_k.weight");
+            _gpuMtpWV             = UploadWeight($"blk.{mtpLayerIdx}.attn_v.weight");
+            _gpuMtpWO             = UploadWeight($"blk.{mtpLayerIdx}.attn_output.weight");
+            _gpuMtpQNorm          = UploadWeight($"blk.{mtpLayerIdx}.attn_q_norm.weight");
+            _gpuMtpKNorm          = UploadWeight($"blk.{mtpLayerIdx}.attn_k_norm.weight");
+            _gpuMtpPostAttnNorm   = UploadWeight($"blk.{mtpLayerIdx}.post_attention_norm.weight");
+            _gpuMtpFfnGate        = UploadWeight($"blk.{mtpLayerIdx}.ffn_gate.weight");
+            _gpuMtpFfnUp          = UploadWeight($"blk.{mtpLayerIdx}.ffn_up.weight");
+            _gpuMtpFfnDown        = UploadWeight($"blk.{mtpLayerIdx}.ffn_down.weight");
+
+            _gpuMtpEnorm          = UploadWeight($"blk.{mtpLayerIdx}.nextn.enorm.weight");
+            _gpuMtpHnorm          = UploadWeight($"blk.{mtpLayerIdx}.nextn.hnorm.weight");
+            _gpuMtpSharedHeadNorm = UploadWeight($"blk.{mtpLayerIdx}.nextn.shared_head_norm.weight");
+            // eh_proj is Q8_0 in GGUF; UploadWeight dequants to F32 on the path
+            // for any dtype not in {F32, Q4_K, Q5_K, Q6_K}, so this lands as F32
+            // and the CudaBackend.MatMul fp32 path serves it. ~200 MiB residence.
+            _gpuMtpEhProj         = UploadWeight($"blk.{mtpLayerIdx}.nextn.eh_proj.weight");
+
+            // MTP attention KV cache on GPU (one slot; same layout as trunk KV).
+            int mtpKvDim = _numKvHeads * _headDim;
+            _gpuMtpKCache = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * mtpKvDim));
+            _gpuMtpVCache = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * mtpKvDim));
+            gpu.Clear(_gpuMtpKCache);
+            gpu.Clear(_gpuMtpVCache);
+
+            // Per-step scratch.
+            _gpuMtpEmbedBuf  = gpu.Allocate(TensorShape.D1(_embDim));
+            _gpuMtpEnormBuf  = gpu.Allocate(TensorShape.D1(_embDim));
+            _gpuMtpHnormBuf  = gpu.Allocate(TensorShape.D1(_embDim));
+            _gpuMtpConcatBuf = gpu.Allocate(TensorShape.D1(_embDim * 2));
+            _gpuLastHidden   = gpu.Allocate(TensorShape.D1(_embDim));
+
+            // Bookkeeping cache (PagedKvCache for layer-0 invariant + length tracking).
+            _mtpKvCache = new PagedKvCache(numLayers: 1, _numKvHeads, _headDim);
+
+            // Host LastHidden buffer (downloaded after each main Forward).
+            _lastHidden = Alloc(_embDim);
+
+            // GPU dense FFN scratch is allocated by TryUploadDenseFfnLayers only
+            // when at least one trunk FFN layer lands on GPU. For MTP we need it
+            // regardless — the MTP block's dense FFN runs on GPU even if all
+            // trunk FFN layers stayed on CPU (which is unusual but possible
+            // under tight VRAM). Allocate here when missing; the cost is
+            // 2 × intermDim × 4 B = 140 KiB for 27B's intermDim=17408.
+            if (!hp.IsMoE && _gpuFfnGateBufDense is null)
+            {
+                _gpuFfnGateBufDense = gpu.Allocate(TensorShape.D1(_intermDim));
+                _gpuFfnUpBufDense   = gpu.Allocate(TensorShape.D1(_intermDim));
+            }
+
+            TraceVram("after MTP head upload");
+        }
+        else
+        {
+            // Null-forgiving assigns so the non-nullable struct fields satisfy
+            // the constructor analyser. Every access site gates on _hasMtp.
+            _gpuMtpAttnNorm = _gpuMtpWQGate = _gpuMtpWK = _gpuMtpWV = _gpuMtpWO =
+                _gpuMtpQNorm = _gpuMtpKNorm = _gpuMtpPostAttnNorm =
+                _gpuMtpFfnGate = _gpuMtpFfnUp = _gpuMtpFfnDown =
+                _gpuMtpEnorm = _gpuMtpHnorm = _gpuMtpSharedHeadNorm =
+                _gpuMtpEhProj =
+                _gpuMtpEmbedBuf = _gpuMtpEnormBuf = _gpuMtpHnormBuf =
+                _gpuMtpConcatBuf = _gpuLastHidden = null!;
+            _lastHidden = null;
+        }
     }
 
     // =================================================================
@@ -784,6 +906,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 if (_gpuGdnScanState[i] is { } scan) _gpu.Clear(scan);
                 if (_gpuGdnConvState[i] is { } conv) _gpu.Clear(conv);
             }
+        }
+        if (_hasMtp)
+        {
+            _mtpKvCache?.Reset();
+            if (_gpuMtpKCache is { } kT) _gpu.Clear(kT);
+            if (_gpuMtpVCache is { } vT) _gpu.Clear(vT);
         }
     }
 
@@ -932,7 +1060,17 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _kvCache.IncrementPosition();
         _gdnStateCache.IncrementPosition();
 
-        // 5. Final norm + output projection on GPU
+        // 5. Capture pre-output-norm hidden for MTP (issue #29). _gpu.RmsNorm
+        //    below overwrites _gpuHidden in place; snapshot to _gpuLastHidden
+        //    first, then download to host so IForwardPass.LastHidden serves a
+        //    host span. Cost: embDim×4 B = 20 KiB / token over PCIe (negligible).
+        if (_hasMtp)
+        {
+            _gpu.CopyDevice(_gpuLastHidden, _gpuHidden);
+            _gpu.Download(_gpuLastHidden, new Span<float>(_lastHidden, _embDim));
+        }
+
+        // 6. Final norm + output projection on GPU
         _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuOutputNorm!, _hp.RmsNormEps);
         _gpu.MatMul(_gpuLogits, _gpuOutputWeight!, _gpuHidden,
             _gpuWeightDTypes.TryGetValue(_gpuOutputWeight!.Handle, out var outDt) ? outDt : DType.Float32);
@@ -984,6 +1122,169 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         // 6. Output projection.
         GpuMatMul(_gpuHidden, _gpuWO[layer], _gpuAttnOut);
+    }
+
+    // =================================================================
+    //  MTP / NEXTN head on GPU (issue #29)
+    //  Mirror of HybridGdnForwardPass.MtpForward but with GPU-resident
+    //  weights + MTP KV cache + shared scratch tensors.
+    // =================================================================
+
+    /// <inheritdoc />
+    public bool HasMtpHead => _hasMtp;
+
+    /// <inheritdoc />
+    public ReadOnlySpan<float> LastHidden =>
+        _hasMtp ? new ReadOnlySpan<float>(_lastHidden, _embDim) : default;
+
+    /// <inheritdoc />
+    public ReadOnlySpan<float> MtpForward(int token, int position, ReadOnlySpan<float> prevHidden)
+    {
+        if (!_hasMtp)
+            throw new InvalidOperationException(
+                "MtpForward called on a CudaHybridGdnForwardPass that did not load an MTP head. " +
+                "Check HasMtpHead before calling.");
+        if (prevHidden.Length != _embDim)
+            throw new ArgumentException(
+                $"prevHidden length {prevHidden.Length} != EmbeddingDim {_embDim}.", nameof(prevHidden));
+
+        // 1. Upload prevHidden into _gpuLastHidden. The end-of-Forward snapshot
+        //    already populates _gpuLastHidden with the correct bits when the
+        //    caller is MtpDecoder (which copies LastHidden → _savedHidden);
+        //    re-upload for safety in case the caller passes a different buffer.
+        _gpu.UploadInto(_gpuLastHidden, prevHidden);
+
+        // 2. Embed token → _gpuMtpEmbedBuf.
+        if (_embIsQuantized)
+            _gpu.EmbedLookupQ4K(_gpuEmbedding!, _gpuMtpEmbedBuf, token, _embDim);
+        else
+            _gpu.EmbedLookup(_gpuEmbedding!, _gpuMtpEmbedBuf, token, _embDim);
+
+        // 3. enorm(embedding) → _gpuMtpEnormBuf; hnorm(prevHidden) → _gpuMtpHnormBuf.
+        _gpu.RmsNorm(_gpuMtpEnormBuf, _gpuMtpEmbedBuf,  _gpuMtpEnorm, _hp.RmsNormEps);
+        _gpu.RmsNorm(_gpuMtpHnormBuf, _gpuLastHidden,   _gpuMtpHnorm, _hp.RmsNormEps);
+
+        // 4. Concat [hnorm(h) ‖ enorm(e)] into _gpuMtpConcatBuf [embDim*2].
+        //    Two device-side copies; total 40 KiB GPU memcpy for 27B.
+        long embBytes = (long)_embDim * sizeof(float);
+        _gpu.CopyDeviceRegion(_gpuMtpConcatBuf, dstByteOffset: 0,
+                              _gpuMtpHnormBuf, srcByteOffset: 0, embBytes);
+        _gpu.CopyDeviceRegion(_gpuMtpConcatBuf, dstByteOffset: embBytes,
+                              _gpuMtpEnormBuf, srcByteOffset: 0, embBytes);
+
+        // 5. eh_proj @ concat → _gpuHidden. F32 (UploadWeight dequant'd Q8_0 → F32).
+        GpuMatMul(_gpuHidden, _gpuMtpEhProj, _gpuMtpConcatBuf);
+
+        // 6. Residual + attn_norm.
+        _gpu.CopyDevice(_gpuResidual, _gpuHidden);
+        _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuMtpAttnNorm, _hp.RmsNormEps);
+
+        // 7. MTP attention block (reuses _gpuQGate / _gpuQ / _gpuGate / _gpuK /
+        //    _gpuV / _gpuAttnOut / _gpuAttnScratch scratch; writes _gpuHidden).
+        GpuMtpAttnBlock(position);
+
+        // 8. Residual add.
+        _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+
+        // 9. Residual + post_attention_norm.
+        _gpu.CopyDevice(_gpuResidual, _gpuHidden);
+        _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuMtpPostAttnNorm, _hp.RmsNormEps);
+
+        // 10. Dense FFN on GPU. For qwen35 27B-MTP, _intermDim = 17408. Use the
+        //     dense FFN scratch tensors that were allocated by TryUploadDenseFfnLayers
+        //     when at least one trunk FFN layer ran on GPU. If those weren't
+        //     allocated (the no-trunk-FFN-on-GPU case), allocate one-off scratch.
+        var gateBuf = _gpuFfnGateBufDense
+            ?? throw new InvalidOperationException(
+                "MTP dense FFN on GPU requires _gpuFfnGateBufDense; the dense-FFN-on-GPU " +
+                "path didn't initialise it. Re-check TryUploadDenseFfnLayers for the " +
+                "27B-MTP model — at least one trunk FFN layer must land on GPU for the " +
+                "scratch buffers to exist, OR allocate dedicated MTP FFN scratch.");
+        var upBuf = _gpuFfnUpBufDense!;
+
+        GpuMatMul(gateBuf,    _gpuMtpFfnGate, _gpuNormBuf);
+        GpuMatMul(upBuf,      _gpuMtpFfnUp,   _gpuNormBuf);
+        _gpu.SiLuMul(gateBuf, upBuf);
+        GpuMatMul(_gpuHidden, _gpuMtpFfnDown, gateBuf);
+
+        // 11. Residual add.
+        _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+
+        // 12. shared_head_norm (NOT main output_norm) → output.weight (shared lm_head).
+        _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuMtpSharedHeadNorm, _hp.RmsNormEps);
+        _gpu.MatMul(_gpuLogits, _gpuOutputWeight!, _gpuHidden,
+            _gpuWeightDTypes.TryGetValue(_gpuOutputWeight!.Handle, out var outDt) ? outDt : DType.Float32);
+
+        // 13. Download logits to host (Download self-syncs the stream).
+        _gpu.Download(_gpuLogits, _logitsBuf);
+        return _logitsBuf;
+    }
+
+    /// <summary>
+    /// MTP attention block on GPU. Mirrors <see cref="GpuAttnBlock"/> but uses the
+    /// MTP head's per-head norm, projection weights, and its own KV cache. Writes
+    /// the post-attention residual contribution into <c>_gpuHidden</c>.
+    /// </summary>
+    private void GpuMtpAttnBlock(int position)
+    {
+        int kvDim = _numKvHeads * _headDim;
+        var mtpCache = _mtpKvCache!;
+        var kCache = _gpuMtpKCache!;
+        var vCache = _gpuMtpVCache!;
+
+        // 1. Project Q‖gate, K, V on GPU.
+        GpuMatMul(_gpuQGate, _gpuMtpWQGate, _gpuNormBuf);
+        GpuMatMul(_gpuK,     _gpuMtpWK,     _gpuNormBuf);
+        GpuMatMul(_gpuV,     _gpuMtpWV,     _gpuNormBuf);
+
+        // 2a. De-interleave Q‖gate per head → _gpuQ + _gpuGate.
+        _gpu.SplitQG(_gpuQ, _gpuGate, _gpuQGate, _numHeads, _headDim);
+
+        // 2b. Per-head RMSNorm on Q and K.
+        _gpu.HeadNorm(_gpuQ, _gpuMtpQNorm, _numHeads,   _headDim, _hp.RmsNormEps);
+        _gpu.HeadNorm(_gpuK, _gpuMtpKNorm, _numKvHeads, _headDim, _hp.RmsNormEps);
+
+        // 2c. Partial NEOX RoPE.
+        _gpu.RoPEPartial(_gpuQ, position, _headDim, _ropeDim, _hp.RopeTheta, neox: true);
+        _gpu.RoPEPartial(_gpuK, position, _headDim, _ropeDim, _hp.RopeTheta, neox: true);
+
+        // 3. Layer-0 invariant: reserve a block on the MTP KV bookkeeping cache
+        //    before any append at a new page boundary.
+        mtpCache.ReserveBlock();
+        _gpu.KvAppend(_gpuK, _gpuV, kCache, vCache, kvDim, position, _maxSeqLen);
+
+        // 4. Scaled dot-product attention against the MTP cache.
+        _gpu.Attention(_gpuQ, kCache, vCache, _gpuAttnOut, _gpuAttnScratch,
+            _numHeads, _numKvHeads, _headDim, position + 1, _maxSeqLen);
+
+        // 5. GLU gate.
+        _gpu.SigmoidMulInPlace(_gpuAttnOut, _gpuGate);
+
+        // 6. Output projection.
+        GpuMatMul(_gpuHidden, _gpuMtpWO, _gpuAttnOut);
+
+        mtpCache.IncrementPosition();
+    }
+
+    /// <inheritdoc />
+    public void MtpResetCache()
+    {
+        if (!_hasMtp) return;
+        _mtpKvCache?.Reset();
+        if (_gpuMtpKCache is { } kT) _gpu.Clear(kT);
+        if (_gpuMtpVCache is { } vT) _gpu.Clear(vT);
+    }
+
+    /// <inheritdoc />
+    public void MtpTruncateTo(int length)
+    {
+        if (!_hasMtp) return;
+        if (length == 0) { MtpResetCache(); return; }
+        // Soft truncate — PagedKvCache.TruncateTo handles arbitrary lengths up
+        // to current Length. Pages above the new length are reused on next
+        // write; the device-side _gpuMtpKCache is a flat ring, so writes simply
+        // overwrite stale slots on subsequent KvAppend calls.
+        _mtpKvCache?.TruncateTo(length);
     }
 
     // =================================================================
@@ -2045,6 +2346,34 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         {
             NativeMemory.Free(_snapshotBuf);
             _snapshotBuf = null;
+        }
+
+        if (_hasMtp)
+        {
+            _gpu.Free(_gpuMtpAttnNorm);
+            _gpu.Free(_gpuMtpWQGate);
+            _gpu.Free(_gpuMtpWK);
+            _gpu.Free(_gpuMtpWV);
+            _gpu.Free(_gpuMtpWO);
+            _gpu.Free(_gpuMtpQNorm);
+            _gpu.Free(_gpuMtpKNorm);
+            _gpu.Free(_gpuMtpPostAttnNorm);
+            _gpu.Free(_gpuMtpFfnGate);
+            _gpu.Free(_gpuMtpFfnUp);
+            _gpu.Free(_gpuMtpFfnDown);
+            _gpu.Free(_gpuMtpEnorm);
+            _gpu.Free(_gpuMtpHnorm);
+            _gpu.Free(_gpuMtpSharedHeadNorm);
+            _gpu.Free(_gpuMtpEhProj);
+            if (_gpuMtpKCache is { } mkT) _gpu.Free(mkT);
+            if (_gpuMtpVCache is { } mvT) _gpu.Free(mvT);
+            _gpu.Free(_gpuMtpEmbedBuf);
+            _gpu.Free(_gpuMtpEnormBuf);
+            _gpu.Free(_gpuMtpHnormBuf);
+            _gpu.Free(_gpuMtpConcatBuf);
+            _gpu.Free(_gpuLastHidden);
+            if (_lastHidden != null) NativeMemory.Free(_lastHidden);
+            _mtpKvCache?.Dispose();
         }
 
         _kvCache.Dispose();
