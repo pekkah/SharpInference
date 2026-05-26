@@ -508,6 +508,16 @@ public static class GdnKernels
 
             // (2) Predict: p[j] = Σ_i S[i,j] · k[i].  (S^T @ k)
             // Iterate rows i, accumulating k[i] * S[i, :] into p.
+            //
+            // NOTE: ggml stores the state TRANSPOSED (s_out[j*S_v + i] = S[i,j])
+            // and computes p[j] as a contiguous-row ggml_vec_dot_f32 with a
+            // 4-accumulator tree-reduce. That reordering was hypothesized to be
+            // the source of the 0.26% sum / 0.06% l2 drift at L0 gdn-out on
+            // Qwen3.6-27B-MTP pos-12. A direct port — per-head transpose-in/out
+            // scratch with ggml-order dot for predict+readout, FMA AXPY for the
+            // rank-1 update — was tested 2026-05-26 and produced zero change at
+            // L0 gdn-out (l2=3.86054 sum=-7.79791 either way vs llama r12
+            // 3.8582/-7.7774). Don't retry; the drift is elsewhere.
             p.Clear();
             for (int i = 0; i < d; i++)
             {

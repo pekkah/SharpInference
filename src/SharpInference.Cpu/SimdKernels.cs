@@ -196,22 +196,26 @@ public static unsafe class SimdKernels
             case DType.Q6_K:
             {
                 int bpr = (cols / 256) * 210;
+                int scratchBytes = Q8KScratchBytes(cols);
+                byte* scratch = stackalloc byte[scratchBytes];
+                QuantizeRowToQ8K(input, cols, scratch);
+
                 if (rows >= MinRowsForParallel)
                 {
-                    var w1 = weights1; var w2 = weights2; var inp = input;
+                    var w1 = weights1; var w2 = weights2; var s = scratch;
                     var o1 = output1; var o2 = output2; int c = cols;
                     Parallel.For(0, rows, s_parallelOpts, r =>
                     {
-                        o1[r] = DotQ6K(w1 + (long)r * bpr, inp, c);
-                        o2[r] = DotQ6K(w2 + (long)r * bpr, inp, c);
+                        o1[r] = DotQ6K_Q8K(w1 + (long)r * bpr, s, c);
+                        o2[r] = DotQ6K_Q8K(w2 + (long)r * bpr, s, c);
                     });
                 }
                 else
                 {
                     for (int r = 0; r < rows; r++)
                     {
-                        output1[r] = DotQ6K(weights1 + (long)r * bpr, input, cols);
-                        output2[r] = DotQ6K(weights2 + (long)r * bpr, input, cols);
+                        output1[r] = DotQ6K_Q8K(weights1 + (long)r * bpr, scratch, cols);
+                        output2[r] = DotQ6K_Q8K(weights2 + (long)r * bpr, scratch, cols);
                     }
                 }
                 break;
@@ -410,19 +414,22 @@ public static unsafe class SimdKernels
     public static void MatVecQ6K(float* output, byte* weights, float* input, int rows, int cols)
     {
         int bytesPerRow = (cols / 256) * 210;
+        int scratchBytes = Q8KScratchBytes(cols);
+        byte* scratch = stackalloc byte[scratchBytes];
+        QuantizeRowToQ8K(input, cols, scratch);
 
         if (rows >= MinRowsForParallel)
         {
-            var w = weights; var inp = input; var outp = output;
+            var w = weights; var s = scratch; var outp = output; int c = cols;
             Parallel.For(0, rows, s_parallelOpts, i =>
             {
-                outp[i] = DotQ6K(w + (long)i * bytesPerRow, inp, cols);
+                outp[i] = DotQ6K_Q8K(w + (long)i * bytesPerRow, s, c);
             });
         }
         else
         {
             for (int i = 0; i < rows; i++)
-                output[i] = DotQ6K(weights + (long)i * bytesPerRow, input, cols);
+                output[i] = DotQ6K_Q8K(weights + (long)i * bytesPerRow, scratch, cols);
         }
     }
 
@@ -1211,227 +1218,257 @@ public static unsafe class SimdKernels
     }
 
     // ================================================================
-    //  Q6_K Fused Dequant-Dot  (one row)
+    //  Q8_K Input Quantization (used by Q6_K dot for parity with ggml)
     // ================================================================
+    // Scratch layout, one entry per super-block of 256 input floats (nb = cols/256):
+    //   [0 .. nb*4):                          float d[nb]
+    //   [nb*4 .. nb*4 + nb*256):              sbyte qs[nb*256]
+    //   [nb*4 + nb*256 .. nb*4 + nb*256 + nb*32):  short bsums[nb*16]
+    //
+    // Mirrors ggml's block_q8_K but laid out as SoA so each array is contiguous
+    // across super-blocks (cheaper to load in the dot kernel).
+
+    public static int Q8KScratchBytes(int cols)
+    {
+        int nb = cols / 256;
+        return nb * 4 + nb * 256 + nb * 32;
+    }
+
+    /// <summary>
+    /// Quantize a row of float input to Q8_K format, mirroring ggml's
+    /// quantize_row_q8_K_ref. Scale is iscale = -127/max where max is the
+    /// signed element with largest |·|. Single FP rounding per element.
+    /// </summary>
+    public static void QuantizeRowToQ8K(float* input, int cols, byte* scratch)
+    {
+        int nb = cols / 256;
+        float* dArr = (float*)scratch;
+        sbyte* qsArr = (sbyte*)(scratch + nb * 4);
+        short* bsumsArr = (short*)(scratch + nb * 4 + nb * 256);
+
+        for (int b = 0; b < nb; b++)
+        {
+            float* x = input + b * 256;
+            sbyte* qs = qsArr + b * 256;
+            short* bsums = bsumsArr + b * 16;
+
+            float max = 0f, amax = 0f;
+            for (int j = 0; j < 256; j++)
+            {
+                float ax = MathF.Abs(x[j]);
+                if (ax > amax) { amax = ax; max = x[j]; }
+            }
+
+            if (amax == 0f)
+            {
+                dArr[b] = 0f;
+                for (int j = 0; j < 256; j++) qs[j] = 0;
+                for (int j = 0; j < 16; j++) bsums[j] = 0;
+                continue;
+            }
+
+            float iscale = -127.0f / max;
+            for (int j = 0; j < 256; j++)
+            {
+                int v = (int)MathF.Round(iscale * x[j], MidpointRounding.ToEven);
+                if (v > 127) v = 127;
+                qs[j] = (sbyte)v;
+            }
+            for (int j = 0; j < 16; j++)
+            {
+                int sum = 0;
+                for (int ii = 0; ii < 16; ii++) sum += qs[j * 16 + ii];
+                bsums[j] = (short)sum;
+            }
+            dArr[b] = 1.0f / iscale;
+        }
+    }
+
+    // ================================================================
+    //  Q6_K · Q8_K Dot Product  (one row, pre-quantized input)
+    // ================================================================
+    // Mirrors ggml_vec_dot_q6_K_q8_K. The crucial difference vs the legacy
+    // dequant-FMA path is that the input is quantized to int8 once per super-
+    // block (one FP rounding per input element), then the inner dot is done
+    // entirely in int domain (u8·i8 → i16 via maddubs, ×i8 scale → i32 via
+    // madd), with a single FP multiply by d_super = d_w * d_y at the end.
+    // This collapses 256 per-element FP rounding steps to ~1 per super-block,
+    // which matches what llama.cpp produces and removes the Q6_K direction
+    // drift that caused the Qwen3.6-27B-MTP pos-12 argmax flip.
+
+    public static float DotQ6K_Q8K(byte* row, byte* scratch, int cols)
+    {
+        int numBlocks = cols / 256;
+
+        if (Avx2.IsSupported && Fma.IsSupported)
+            return DotQ6K_Q8K_Avx2(row, scratch, cols, numBlocks);
+
+        return DotQ6K_Q8K_Scalar(row, scratch, numBlocks);
+    }
 
     public static float DotQ6K(byte* row, float* input, int cols)
     {
-        int numBlocks = cols / 256;
-
-        if (Avx512F.IsSupported)
-            return DotQ6K_Avx512(row, input, cols, numBlocks);
-
-        if (!Fma.IsSupported)
-            return DotQ6K_Scalar(row, input, cols);
-
-        // Four independent accumulators (one per output group) to break dependency chains
-        var acc1 = Vector256<float>.Zero;
-        var acc2 = Vector256<float>.Zero;
-        var acc3 = Vector256<float>.Zero;
-        var acc4 = Vector256<float>.Zero;
-        var mask0F = Vector256.Create(0x0F);
-        var mask03 = Vector256.Create(0x03);
-        var sub32 = Vector256.Create(32);
-        int elemOff = 0;
-
-        for (int b = 0; b < numBlocks; b++)
-        {
-            byte* x = row + b * 210;
-            byte* ql = x;
-            byte* qh = x + 128;
-            byte* sc = x + 192;
-            float d = HalfToFloat(x[208], x[209]);
-
-            int qlOff = 0, qhOff = 0, scBase = 0;
-
-            for (int half = 0; half < 2; half++)
-            {
-                for (int phase = 0; phase < 2; phase++)
-                {
-                    int lStart = phase * 16;
-                    var s1v = Vector256.Create(d * (sbyte)sc[scBase + phase]);
-                    var s2v = Vector256.Create(d * (sbyte)sc[scBase + phase + 2]);
-                    var s3v = Vector256.Create(d * (sbyte)sc[scBase + phase + 4]);
-                    var s4v = Vector256.Create(d * (sbyte)sc[scBase + phase + 6]);
-
-                    for (int l = lStart; l < lStart + 16; l += 8)
-                    {
-                        var qlA = Avx2.ConvertToVector256Int32(LoadBytes8(ql + qlOff + l));
-                        var qlB = Avx2.ConvertToVector256Int32(LoadBytes8(ql + qlOff + 32 + l));
-                        var qhV = Avx2.ConvertToVector256Int32(LoadBytes8(qh + qhOff + l));
-
-                        // Group 1 → acc1
-                        var g1 = Avx2.Subtract(
-                            Avx2.Or(Avx2.And(qlA, mask0F),
-                                Avx2.ShiftLeftLogical(Avx2.And(qhV, mask03), 4)),
-                            sub32);
-                        acc1 = Fma.MultiplyAdd(
-                            Avx.Multiply(s1v, Avx.ConvertToVector256Single(g1)),
-                            Avx.LoadVector256(input + elemOff + l), acc1);
-
-                        // Group 2 → acc2
-                        var g2 = Avx2.Subtract(
-                            Avx2.Or(Avx2.And(qlB, mask0F),
-                                Avx2.ShiftLeftLogical(Avx2.And(
-                                    Avx2.ShiftRightLogical(qhV, 2), mask03), 4)),
-                            sub32);
-                        acc2 = Fma.MultiplyAdd(
-                            Avx.Multiply(s2v, Avx.ConvertToVector256Single(g2)),
-                            Avx.LoadVector256(input + elemOff + 32 + l), acc2);
-
-                        // Group 3 → acc3
-                        var g3 = Avx2.Subtract(
-                            Avx2.Or(Avx2.And(Avx2.ShiftRightLogical(qlA, 4), mask0F),
-                                Avx2.ShiftLeftLogical(Avx2.And(
-                                    Avx2.ShiftRightLogical(qhV, 4), mask03), 4)),
-                            sub32);
-                        acc3 = Fma.MultiplyAdd(
-                            Avx.Multiply(s3v, Avx.ConvertToVector256Single(g3)),
-                            Avx.LoadVector256(input + elemOff + 64 + l), acc3);
-
-                        // Group 4 → acc4
-                        var g4 = Avx2.Subtract(
-                            Avx2.Or(Avx2.And(Avx2.ShiftRightLogical(qlB, 4), mask0F),
-                                Avx2.ShiftLeftLogical(Avx2.And(
-                                    Avx2.ShiftRightLogical(qhV, 6), mask03), 4)),
-                            sub32);
-                        acc4 = Fma.MultiplyAdd(
-                            Avx.Multiply(s4v, Avx.ConvertToVector256Single(g4)),
-                            Avx.LoadVector256(input + elemOff + 96 + l), acc4);
-                    }
-                }
-                elemOff += 128;
-                qlOff += 64;
-                qhOff += 32;
-                scBase += 8;
-            }
-        }
-
-        return HSum256(Avx.Add(Avx.Add(acc1, acc2), Avx.Add(acc3, acc4)));
+        int scratchBytes = Q8KScratchBytes(cols);
+        byte* scratch = stackalloc byte[scratchBytes];
+        QuantizeRowToQ8K(input, cols, scratch);
+        return DotQ6K_Q8K(row, scratch, cols);
     }
 
-    private static float DotQ6K_Avx512(byte* row, float* input, int cols, int numBlocks)
+    private static float DotQ6K_Q8K_Scalar(byte* row, byte* scratch, int numBlocks)
     {
-        var acc1 = Vector512<float>.Zero;
-        var acc2 = Vector512<float>.Zero;
-        var acc3 = Vector512<float>.Zero;
-        var acc4 = Vector512<float>.Zero;
-        var mask0F = Vector512.Create(0x0F);
-        var mask03 = Vector512.Create(0x03);
-        var sub32 = Vector512.Create(32);
-        int elemOff = 0;
+        float* dArr = (float*)scratch;
+        sbyte* qsArr = (sbyte*)(scratch + numBlocks * 4);
+        short* bsumsArr = (short*)(scratch + numBlocks * 4 + numBlocks * 256);
 
+        float acc = 0f;
         for (int b = 0; b < numBlocks; b++)
         {
             byte* x = row + b * 210;
             byte* ql = x;
             byte* qh = x + 128;
-            byte* sc = x + 192;
-            float d = HalfToFloat(x[208], x[209]);
+            sbyte* sc = (sbyte*)(x + 192);
+            float dw = HalfToFloat(x[208], x[209]);
+            float dy = dArr[b];
+            float dSuper = dw * dy;
 
-            int qlOff = 0, qhOff = 0, scBase = 0;
+            sbyte* q8 = qsArr + b * 256;
+            short* bsums = bsumsArr + b * 16;
 
-            for (int half = 0; half < 2; half++)
-            {
-                for (int phase = 0; phase < 2; phase++)
-                {
-                    int lStart = phase * 16;
-                    var s1v = Vector512.Create(d * (sbyte)sc[scBase + phase]);
-                    var s2v = Vector512.Create(d * (sbyte)sc[scBase + phase + 2]);
-                    var s3v = Vector512.Create(d * (sbyte)sc[scBase + phase + 4]);
-                    var s4v = Vector512.Create(d * (sbyte)sc[scBase + phase + 6]);
+            // Integer accumulator over the whole super-block
+            int sumi = 0;
+            // -32 offset correction: sum(32 * sc[i] * bsums[i]) over 16 sub-groups
+            int offsetCorr = 0;
+            for (int g = 0; g < 16; g++)
+                offsetCorr += (int)sc[g] * bsums[g];
+            offsetCorr <<= 5;  // × 32
 
-                    // 16 elements per Vector512 — entire phase in one iteration
-                    var qlA = Avx512F.ConvertToVector512Int32(
-                        Vector128.LoadUnsafe(ref *(ql + qlOff + lStart)));
-                    var qlB = Avx512F.ConvertToVector512Int32(
-                        Vector128.LoadUnsafe(ref *(ql + qlOff + 32 + lStart)));
-                    var qhV = Avx512F.ConvertToVector512Int32(
-                        Vector128.LoadUnsafe(ref *(qh + qhOff + lStart)));
-
-                    var g1 = Avx512F.Subtract(
-                        Avx512F.Or(Avx512F.And(qlA, mask0F),
-                            Avx512F.ShiftLeftLogical(Avx512F.And(qhV, mask03), 4)),
-                        sub32);
-                    acc1 = Avx512F.FusedMultiplyAdd(
-                        Avx512F.Multiply(s1v, Avx512F.ConvertToVector512Single(g1)),
-                        Vector512.LoadUnsafe(ref *(input + elemOff + lStart)), acc1);
-
-                    var g2 = Avx512F.Subtract(
-                        Avx512F.Or(Avx512F.And(qlB, mask0F),
-                            Avx512F.ShiftLeftLogical(Avx512F.And(
-                                Avx512F.ShiftRightLogical(qhV, 2), mask03), 4)),
-                        sub32);
-                    acc2 = Avx512F.FusedMultiplyAdd(
-                        Avx512F.Multiply(s2v, Avx512F.ConvertToVector512Single(g2)),
-                        Vector512.LoadUnsafe(ref *(input + elemOff + 32 + lStart)), acc2);
-
-                    var g3 = Avx512F.Subtract(
-                        Avx512F.Or(Avx512F.And(Avx512F.ShiftRightLogical(qlA, 4), mask0F),
-                            Avx512F.ShiftLeftLogical(Avx512F.And(
-                                Avx512F.ShiftRightLogical(qhV, 4), mask03), 4)),
-                        sub32);
-                    acc3 = Avx512F.FusedMultiplyAdd(
-                        Avx512F.Multiply(s3v, Avx512F.ConvertToVector512Single(g3)),
-                        Vector512.LoadUnsafe(ref *(input + elemOff + 64 + lStart)), acc3);
-
-                    var g4 = Avx512F.Subtract(
-                        Avx512F.Or(Avx512F.And(Avx512F.ShiftRightLogical(qlB, 4), mask0F),
-                            Avx512F.ShiftLeftLogical(Avx512F.And(
-                                Avx512F.ShiftRightLogical(qhV, 6), mask03), 4)),
-                        sub32);
-                    acc4 = Avx512F.FusedMultiplyAdd(
-                        Avx512F.Multiply(s4v, Avx512F.ConvertToVector512Single(g4)),
-                        Vector512.LoadUnsafe(ref *(input + elemOff + 96 + lStart)), acc4);
-                }
-                elemOff += 128;
-                qlOff += 64;
-                qhOff += 32;
-                scBase += 8;
-            }
-        }
-
-        return HSum512(Avx512F.Add(Avx512F.Add(acc1, acc2), Avx512F.Add(acc3, acc4)));
-    }
-
-    private static float DotQ6K_Scalar(byte* row, float* input, int cols)
-    {
-        int numBlocks = cols / 256;
-        float acc = 0;
-        int elemOff = 0;
-
-        for (int b = 0; b < numBlocks; b++)
-        {
-            byte* x = row + b * 210;
-            byte* ql = x;
-            byte* qh = x + 128;
-            byte* sc = x + 192;
-            float d = HalfToFloat(x[208], x[209]);
-
-            int qlOff = 0, qhOff = 0, scBase = 0;
-
+            int qlOff = 0, qhOff = 0, scBase = 0, qOff = 0;
             for (int half = 0; half < 2; half++)
             {
                 for (int l = 0; l < 32; l++)
                 {
                     int isc = l / 16;
-                    int q1 = ((ql[qlOff + l] & 0xF) | (((qh[qhOff + l] >> 0) & 3) << 4)) - 32;
-                    int q2 = ((ql[qlOff + l + 32] & 0xF) | (((qh[qhOff + l] >> 2) & 3) << 4)) - 32;
-                    int q3 = ((ql[qlOff + l] >> 4) | (((qh[qhOff + l] >> 4) & 3) << 4)) - 32;
-                    int q4 = ((ql[qlOff + l + 32] >> 4) | (((qh[qhOff + l] >> 6) & 3) << 4)) - 32;
+                    // Unsigned 6-bit reconstruction (no -32 offset; subtracted via offsetCorr)
+                    int q1u = (ql[qlOff + l] & 0xF) | (((qh[qhOff + l] >> 0) & 3) << 4);
+                    int q2u = (ql[qlOff + l + 32] & 0xF) | (((qh[qhOff + l] >> 2) & 3) << 4);
+                    int q3u = (ql[qlOff + l] >> 4) | (((qh[qhOff + l] >> 4) & 3) << 4);
+                    int q4u = (ql[qlOff + l + 32] >> 4) | (((qh[qhOff + l] >> 6) & 3) << 4);
 
-                    acc += d * (sbyte)sc[scBase + isc] * q1 * input[elemOff + l];
-                    acc += d * (sbyte)sc[scBase + isc + 2] * q2 * input[elemOff + 32 + l];
-                    acc += d * (sbyte)sc[scBase + isc + 4] * q3 * input[elemOff + 64 + l];
-                    acc += d * (sbyte)sc[scBase + isc + 6] * q4 * input[elemOff + 96 + l];
+                    sumi += (int)sc[scBase + isc] * q1u * q8[qOff + l];
+                    sumi += (int)sc[scBase + isc + 2] * q2u * q8[qOff + 32 + l];
+                    sumi += (int)sc[scBase + isc + 4] * q3u * q8[qOff + 64 + l];
+                    sumi += (int)sc[scBase + isc + 6] * q4u * q8[qOff + 96 + l];
                 }
-                elemOff += 128;
+                qOff += 128;
                 qlOff += 64;
                 qhOff += 32;
                 scBase += 8;
             }
+
+            acc += dSuper * (sumi - offsetCorr);
         }
         return acc;
+    }
+
+    private static float DotQ6K_Q8K_Avx2(byte* row, byte* scratch, int cols, int numBlocks)
+    {
+        float* dArr = (float*)scratch;
+        sbyte* qsArr = (sbyte*)(scratch + numBlocks * 4);
+        short* bsumsArr = (short*)(scratch + numBlocks * 4 + numBlocks * 256);
+
+        var m3 = Vector256.Create((byte)0x03);
+        var m12 = Vector256.Create((byte)0x0C);
+        var m48 = Vector256.Create((byte)0x30);
+        var m192 = Vector256.Create((byte)0xC0);
+        var m15 = Vector256.Create((byte)0x0F);
+        var acc = Vector256<float>.Zero;
+
+        for (int i = 0; i < numBlocks; i++)
+        {
+            byte* x = row + i * 210;
+            byte* ql = x;
+            byte* qh = x + 128;
+            sbyte* sc = (sbyte*)(x + 192);
+            float dw = HalfToFloat(x[208], x[209]);
+            float dSuper = dw * dArr[i];
+
+            // q8sclsub = (bsums · scales_int16) << 5  →  8 int32
+            // bsums: 16 int16. scales: 16 int8 → cvtepi8_epi16 → 16 int16.
+            var q8sums = Vector256.LoadUnsafe(ref *(bsumsArr + i * 16));
+            var scales128 = Vector128.LoadUnsafe(ref *(byte*)sc).AsSByte();
+            var scales16 = Avx2.ConvertToVector256Int16(scales128);
+            var q8sclsub = Avx2.ShiftLeftLogical(
+                Avx2.MultiplyAddAdjacent(q8sums, scales16), 5);
+
+            var sumi = Vector256<int>.Zero;
+            sbyte* q8 = (sbyte*)(qsArr + i * 256);
+
+            for (int j = 0; j < 2; j++)
+            {
+                var q4bits1 = Vector256.LoadUnsafe(ref *(ql + j * 64));
+                var q4bits2 = Vector256.LoadUnsafe(ref *(ql + j * 64 + 32));
+                var q4bitsH = Vector256.LoadUnsafe(ref *(qh + j * 32));
+
+                // Reconstruct 4 sets of 32 unsigned 6-bit values
+                var q4h_0 = Avx2.ShiftLeftLogical(
+                    Avx2.And(q4bitsH, m3).AsInt16(), 4).AsByte();
+                var q4h_1 = Avx2.ShiftLeftLogical(
+                    Avx2.And(q4bitsH, m12).AsInt16(), 2).AsByte();
+                var q4h_2 = Avx2.And(q4bitsH, m48);
+                var q4h_3 = Avx2.ShiftRightLogical(
+                    Avx2.And(q4bitsH, m192).AsInt16(), 2).AsByte();
+
+                var q4_0 = Avx2.Or(Avx2.And(q4bits1, m15), q4h_0);
+                var q4_1 = Avx2.Or(Avx2.And(q4bits2, m15), q4h_1);
+                var q4_2 = Avx2.Or(
+                    Avx2.And(Avx2.ShiftRightLogical(q4bits1.AsInt16(), 4).AsByte(), m15),
+                    q4h_2);
+                var q4_3 = Avx2.Or(
+                    Avx2.And(Avx2.ShiftRightLogical(q4bits2.AsInt16(), 4).AsByte(), m15),
+                    q4h_3);
+
+                var q8_0 = Vector256.LoadUnsafe(ref *(q8 + j * 128)).AsSByte();
+                var q8_1 = Vector256.LoadUnsafe(ref *(q8 + j * 128 + 32)).AsSByte();
+                var q8_2 = Vector256.LoadUnsafe(ref *(q8 + j * 128 + 64)).AsSByte();
+                var q8_3 = Vector256.LoadUnsafe(ref *(q8 + j * 128 + 96)).AsSByte();
+
+                // u8 × i8 → i16 pairs (no saturation: |u6×i8| ≤ 63×127 = 8001, pairs ≤ 16002)
+                var p16_0 = Avx2.MultiplyAddAdjacent(q4_0, q8_0);
+                var p16_1 = Avx2.MultiplyAddAdjacent(q4_1, q8_1);
+                var p16_2 = Avx2.MultiplyAddAdjacent(q4_2, q8_2);
+                var p16_3 = Avx2.MultiplyAddAdjacent(q4_3, q8_3);
+
+                // Apply 8 per-16-element scales (2 per q4_k). Each scale broadcast
+                // to 8 int16 lanes; madd pairs adjacent lanes → 4 int32 outputs
+                // per q4_k all sharing the same scale within a 16-elem sub-group.
+                int isc = j * 8;
+                var sc16_0 = Vector256.Create(
+                    Vector128.Create((short)sc[isc + 0]),
+                    Vector128.Create((short)sc[isc + 1]));
+                var sc16_1 = Vector256.Create(
+                    Vector128.Create((short)sc[isc + 2]),
+                    Vector128.Create((short)sc[isc + 3]));
+                var sc16_2 = Vector256.Create(
+                    Vector128.Create((short)sc[isc + 4]),
+                    Vector128.Create((short)sc[isc + 5]));
+                var sc16_3 = Vector256.Create(
+                    Vector128.Create((short)sc[isc + 6]),
+                    Vector128.Create((short)sc[isc + 7]));
+
+                var s0 = Avx2.MultiplyAddAdjacent(sc16_0, p16_0);
+                var s1 = Avx2.MultiplyAddAdjacent(sc16_1, p16_1);
+                var s2 = Avx2.MultiplyAddAdjacent(sc16_2, p16_2);
+                var s3 = Avx2.MultiplyAddAdjacent(sc16_3, p16_3);
+
+                sumi = Avx2.Add(sumi, Avx2.Add(Avx2.Add(s0, s1), Avx2.Add(s2, s3)));
+            }
+
+            acc = Fma.MultiplyAdd(
+                Vector256.Create(dSuper),
+                Avx.ConvertToVector256Single(Avx2.Subtract(sumi, q8sclsub)),
+                acc);
+        }
+        return HSum256(acc);
     }
 
     // ================================================================

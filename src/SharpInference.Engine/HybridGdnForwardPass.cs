@@ -167,6 +167,24 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     private static readonly bool _traceLayers =
         Environment.GetEnvironmentVariable("SHARPI_TRACE_LAYERS") == "1";
 
+    // Per-layer logit probe (env: SHARPI_PROBE_LOGITS=1). For each trunk-layer
+    // residual output, projects through output_norm + lm_head and emits the
+    // rank/logit of a few diagnostic token ids (set via SHARPI_PROBE_IDS as
+    // comma-separated). Allocates an extra embDim scratch + the existing logit
+    // buffer is reused.
+    private static readonly bool _probeLogits =
+        Environment.GetEnvironmentVariable("SHARPI_PROBE_LOGITS") == "1";
+    private static readonly int[] _probeIds = ParseProbeIds();
+    private static int[] ParseProbeIds()
+    {
+        var s = Environment.GetEnvironmentVariable("SHARPI_PROBE_IDS");
+        if (string.IsNullOrEmpty(s)) return new[] { 198, 248046, 248045, 271 };
+        var parts = s.Split(',');
+        var ids = new List<int>(parts.Length);
+        foreach (var p in parts) if (int.TryParse(p.Trim(), out var id)) ids.Add(id);
+        return ids.ToArray();
+    }
+
     // Bisection-only env vars: zero out one block type's contribution to localize a bug.
     // Default off; leaving in for future parity work.
     private static readonly bool _bypassGdn =
@@ -671,6 +689,7 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             SimdKernels.AddInPlace(_hidden, _residual, _embDim);
 
             if (_traceLayers) EmitLayerTrace(position, layer, "moe-resid");
+            if (_probeLogits) ProbeResidual(position, layer);
         }
 
         // 4. Advance position counters
@@ -736,7 +755,56 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             if (i > 0) sb.Append(", ");
             sb.Append(buf[i].ToString("G6", inv));
         }
+        sb.Append("]  last3=[");
+        int lastStart = Math.Max(k, n - 3);
+        for (int i = lastStart; i < n; i++)
+        {
+            if (i > lastStart) sb.Append(", ");
+            sb.Append(buf[i].ToString("G6", inv));
+        }
         sb.Append(']');
+        Console.Error.WriteLine(sb.ToString());
+    }
+
+    /// <summary>
+    /// Diagnostic only (SHARPI_PROBE_LOGITS=1). Projects the residual at
+    /// <paramref name="layer"/> through output_norm + lm_head and dumps each
+    /// probe-id's logit and rank to stderr. Cost: one extra MatVec per probed
+    /// layer; safe because the post-layer _hidden is replicated into a private
+    /// scratch before the norm so the trunk state isn't disturbed.
+    /// </summary>
+    private void ProbeResidual(int position, int layer)
+    {
+        // Probe is intended for the final prefill position only (otherwise the
+        // output is unmanageable). Skip prior positions.
+        var pos0Env = Environment.GetEnvironmentVariable("SHARPI_PROBE_POS");
+        if (pos0Env != null && int.TryParse(pos0Env, out var probePos) && position != probePos) return;
+
+        // Copy _hidden into _residual scratch (will be overwritten on the next
+        // pre-block residual save at the top of the layer loop, so this is safe).
+        new ReadOnlySpan<float>(_hidden, _embDim).CopyTo(new Span<float>(_residual, _embDim));
+
+        var outNormW = GetNormWeight(_outputNorm);
+        SimdKernels.RmsNorm(_residual, _residual, outNormW, _embDim, _hp.RmsNormEps);
+
+        FusedMatVec(_logits, _outputWeight, _residual, _hp.VocabSize, _embDim);
+
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        var sb = new System.Text.StringBuilder(220);
+        sb.Append("[probe pos=").Append(position).Append(" L").Append(layer).Append("]");
+        int V = _hp.VocabSize;
+        // Find top-1 token + its logit.
+        int top = 0; float topV = _logits[0];
+        for (int i = 1; i < V; i++) if (_logits[i] > topV) { topV = _logits[i]; top = i; }
+        sb.Append(" top=").Append(top).Append('@').Append(topV.ToString("G6", inv));
+        foreach (var id in _probeIds)
+        {
+            if ((uint)id >= (uint)V) continue;
+            float v = _logits[id];
+            int rank = 0;
+            for (int i = 0; i < V; i++) if (_logits[i] > v) rank++;
+            sb.Append("  ").Append(id).Append('=').Append(v.ToString("G6", inv)).Append("(r").Append(rank).Append(')');
+        }
         Console.Error.WriteLine(sb.ToString());
     }
 
