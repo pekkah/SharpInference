@@ -417,8 +417,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             }
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
-                _cpuQNorm[ci] = LoadCpuBias($"blk.{li}.attn_q_norm.weight", _headDim);
-                _cpuKNorm[ci] = LoadCpuBias($"blk.{li}.attn_k_norm.weight", _headDim);
+                int qNormSize = _hp.IsPerChannelQkNorm ? (int)_numHeads * _headDim : _headDim;
+                int kNormSize = _hp.IsPerChannelQkNorm ? (int)_numKvHeads * _headDim : _headDim;
+                _cpuQNorm[ci] = LoadCpuBias($"blk.{li}.attn_q_norm.weight", qNormSize);
+                _cpuKNorm[ci] = LoadCpuBias($"blk.{li}.attn_k_norm.weight", kNormSize);
             }
         }
 
@@ -667,8 +669,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 }
                 else
                 {
-                    _gpu.HeadNorm(_gpuQ, _gpuQNorm![i], _numHeads, _headDim, _hp.RmsNormEps);
-                    _gpu.HeadNorm(_gpuK, _gpuKNorm![i], _numKvHeads, _headDim, _hp.RmsNormEps);
+                    _gpu.HeadNorm(_gpuQ, _gpuQNorm![i], _numHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                    _gpu.HeadNorm(_gpuK, _gpuKNorm![i], _numKvHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
                 }
                 _gpu.RecordBarrier();
             }
@@ -802,8 +804,16 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             }
             else
             {
-                PerHeadRmsNorm(_cpuQ, _cpuQNorm[ci], _numHeads, _headDim, _hp.RmsNormEps);
-                PerHeadRmsNorm(_cpuK, _cpuKNorm[ci], _numKvHeads, _headDim, _hp.RmsNormEps);
+                if (_hp.IsPerChannelQkNorm)
+                {
+                    PerChannelRmsNorm(_cpuQ, _cpuQNorm[ci], (int)_numHeads,   _headDim, _hp.RmsNormEps);
+                    PerChannelRmsNorm(_cpuK, _cpuKNorm[ci], (int)_numKvHeads, _headDim, _hp.RmsNormEps);
+                }
+                else
+                {
+                    PerHeadRmsNorm(_cpuQ, _cpuQNorm[ci], (int)_numHeads,   _headDim, _hp.RmsNormEps);
+                    PerHeadRmsNorm(_cpuK, _cpuKNorm[ci], (int)_numKvHeads, _headDim, _hp.RmsNormEps);
+                }
             }
         }
 
@@ -872,7 +882,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
 
         Span<int> selectedExperts = stackalloc int[numActive];
         Span<float> expertWeights = stackalloc float[numActive];
-        SelectTopK(_cpuRouterLogits, numExperts, numActive, selectedExperts, expertWeights);
+        SelectTopK(_cpuRouterLogits, numExperts, numActive, selectedExperts, expertWeights,
+            normalize: _hp.NormalizeMoeTopKWeights);
 
         if (_hasSharedExpert)
         {
@@ -1066,7 +1077,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     }
 
     private static void SelectTopK(float* logits, int n, int k,
-        Span<int> indices, Span<float> weights)
+        Span<int> indices, Span<float> weights, bool normalize)
     {
         for (int ki = 0; ki < k; ki++)
         {
@@ -1095,7 +1106,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             weights[ki] = bestVal;
         }
 
-        if (k <= 1)
+        if (!normalize || k <= 1)
             return;
 
         float sum = 0;
@@ -1313,7 +1324,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
 
         Span<int> selectedExperts = stackalloc int[numActive];
         Span<float> expertWeights = stackalloc float[numActive];
-        SelectTopK(_gpuRouterBuf!, numActive, selectedExperts, expertWeights);
+        SelectTopK(_gpuRouterBuf!, numActive, selectedExperts, expertWeights, _hp.NormalizeMoeTopKWeights);
 
         if (_hasSharedExpert)
         {
@@ -1416,7 +1427,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     }
 
     private static void SelectTopK(ReadOnlySpan<float> logits, int k,
-        Span<int> indices, Span<float> weights)
+        Span<int> indices, Span<float> weights, bool normalize)
     {
         for (int ki = 0; ki < k; ki++)
         {
@@ -1445,7 +1456,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             weights[ki] = bestVal;
         }
 
-        if (k <= 1)
+        if (!normalize || k <= 1)
             return;
 
         float sum = 0;
@@ -1479,6 +1490,12 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     {
         for (int h = 0; h < numHeads; h++)
             SimdKernels.RmsNorm(data + h * headDim, data + h * headDim, weight, headDim, eps);
+    }
+
+    private static void PerChannelRmsNorm(float* data, float* weight, int numHeads, int headDim, float eps)
+    {
+        for (int h = 0; h < numHeads; h++)
+            SimdKernels.RmsNorm(data + h * headDim, data + h * headDim, weight + h * headDim, headDim, eps);
     }
 
     private static void PerHeadPureRmsNorm(float* data, int numHeads, int headDim, float eps)

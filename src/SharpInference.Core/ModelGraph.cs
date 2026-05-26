@@ -45,6 +45,14 @@ public sealed record ModelHyperparams
     /// </summary>
     public bool HasQkNorm { get; init; }
 
+    /// <summary>
+    /// Whether QK-norm uses a per-channel learned weight of size <c>numHeads * headDim</c>
+    /// (OLMoE) rather than a single <c>headDim</c> vector shared across heads (Qwen3).
+    /// Detected at load time from <c>blk.0.attn_q_norm.weight</c>'s element count.
+    /// Only meaningful when <see cref="HasQkNorm"/> and <see cref="UseL2QkNorm"/> is false.
+    /// </summary>
+    public bool IsPerChannelQkNorm { get; init; }
+
     // ── MoE (Mixture of Experts) ──
 
     /// <summary>Whether this model uses Mixture of Experts architecture.</summary>
@@ -61,6 +69,14 @@ public sealed record ModelHyperparams
 
     /// <summary>Whether the model has a shared expert that runs on every token (e.g. Llama 4, DeepSeek-V2).</summary>
     public bool HasSharedExpert { get; init; }
+
+    /// <summary>
+    /// Whether MoE router top-k weights should be renormalized to sum to 1 after
+    /// selecting the top-k experts. Most architectures (Qwen3-MoE, Mixtral) do.
+    /// OLMoE was trained with <c>norm_topk_prob=false</c> and uses the raw
+    /// post-softmax probabilities directly — renormalizing produces wrong outputs.
+    /// </summary>
+    public bool NormalizeMoeTopKWeights { get; init; } = true;
 
     // ── NoPE (No Positional Encoding) ──
 
@@ -148,6 +164,18 @@ public sealed record ModelHyperparams
             || (model?.FindTensor("blk.0.attn_q.bias") is not null);
         bool hasQkNorm = metadata.ContainsKey("_sharpi.has_qk_norm")
             || (model?.FindTensor("blk.0.attn_q_norm.weight") is not null);
+        bool perChannelQkNorm = false;
+        if (hasQkNorm && model is not null)
+        {
+            var qNormInfo = model.FindTensor("blk.0.attn_q_norm.weight");
+            int numHeadsTmp = GetInt(metadata, $"{arch}.attention.head_count");
+            int embDimTmp = GetInt(metadata, $"{arch}.embedding_length");
+            int headDimMetaTmp = GetInt(metadata, $"{arch}.attention.key_length");
+            int headDimTmp = headDimMetaTmp > 0 ? headDimMetaTmp
+                : (numHeadsTmp > 0 ? embDimTmp / numHeadsTmp : embDimTmp);
+            if (qNormInfo is not null && headDimTmp > 0 && numHeadsTmp > 0)
+                perChannelQkNorm = qNormInfo.Value.ElementCount >= (long)numHeadsTmp * headDimTmp;
+        }
         bool hasSharedExpert = isMoE
             && (model?.FindTensor("blk.0.ffn_gate_shexp.weight") is not null);
 
@@ -256,12 +284,16 @@ public sealed record ModelHyperparams
             RopeTheta = GetFloat(metadata, $"{arch}.rope.freq_base", 10_000f),
             HasAttnBias = hasAttnBias,
             HasQkNorm = hasQkNorm,
+            IsPerChannelQkNorm = perChannelQkNorm,
             IsMoE = isMoE,
             NumExperts = numExperts,
             NumActiveExperts = numActiveExperts,
             ExpertIntermediateDim = GetInt(metadata, $"{arch}.expert_feed_forward_length",
                                        GetInt(metadata, $"{arch}.feed_forward_length")),
             HasSharedExpert = hasSharedExpert,
+            // OLMoE was trained without top-k renormalization. Other softmax-gated
+            // MoE architectures (Qwen3-MoE, Mixtral, qwen35moe) renormalize.
+            NormalizeMoeTopKWeights = !arch.Equals("olmoe", StringComparison.OrdinalIgnoreCase),
             NoRopeLayerStep = noRopeStep,
             UseSigmoidGating = useSigmoidGating,
             UseL2QkNorm = useL2QkNorm,

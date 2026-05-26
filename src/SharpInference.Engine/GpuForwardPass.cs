@@ -420,8 +420,8 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                     }
                     else
                     {
-                        _gpu.HeadNorm(_q, _wqNorm![layer], (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps);
-                        _gpu.HeadNorm(_k, _wkNorm![layer], (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps);
+                        _gpu.HeadNorm(_q, _wqNorm![layer], (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                        _gpu.HeadNorm(_k, _wkNorm![layer], (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
                     }
                     _gpu.RecordBarrier();
                 }
@@ -571,7 +571,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
 
         Span<int> selectedExperts = stackalloc int[numActive];
         Span<float> expertWeights = stackalloc float[numActive];
-        SelectTopK(_routerBuf!, numActive, selectedExperts, expertWeights);
+        SelectTopK(_routerBuf!, numActive, selectedExperts, expertWeights, _hp.NormalizeMoeTopKWeights);
 
         _gpu.BeginRecord();
 
@@ -781,7 +781,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     }
 
     private static void SelectTopK(ReadOnlySpan<float> logits, int k,
-        Span<int> indices, Span<float> weights)
+        Span<int> indices, Span<float> weights, bool normalize)
     {
         for (int ki = 0; ki < k; ki++)
         {
@@ -810,7 +810,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             weights[ki] = bestVal;
         }
 
-        if (k <= 1)
+        if (!normalize || k <= 1)
             return;
 
         float sum = 0;

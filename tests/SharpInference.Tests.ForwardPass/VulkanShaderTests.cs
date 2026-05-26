@@ -778,9 +778,13 @@ public sealed unsafe class VulkanShaderTests
 
     private static string? FindMoEModelPath()
     {
+        // Qwen3-Coder is preferred because it exercises the embDim != expertDim layout
+        // that exposes scratch-sizing bugs (see #2 regression). OLMoE works as a
+        // fallback because its constraints (per-channel QK norm, norm_topk_prob=false,
+        // embDim > intermDim) cover orthogonal MoE features.
         return FindModelPath(
-            "models\\OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf",
             "models\\Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+            "models\\OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf",
             "models\\Llama-4-Scout-17B-16E-Instruct-Q2_K.gguf");
     }
 
@@ -823,14 +827,21 @@ public sealed unsafe class VulkanShaderTests
         if (path is null) return;
 
         using var model = GgufModel.Open(path);
-        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        // Pass `model` so HasQkNorm / IsPerChannelQkNorm probe the tensor index.
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
         if (!hp.IsMoE || hp.NumLayers < 2) return;
 
         var tokenizer = GgufTokenizer.FromGgufModel(model);
         using var gpu = new Vulkan.VulkanBackend();
+        // GpuLayers=5 makes any per-layer activation error compound through enough
+        // attention+FFN stages to push logits into the degenerate "all-EOS" or NaN
+        // regime that the coherence helper catches. The original GpuLayers=1 was
+        // too weak — the issue #2 scratch-sizing bug went undetected for a week
+        // because one layer of wrong activations doesn't always cascade visibly.
+        int gpuLayers = Math.Min(5, hp.NumLayers);
         var placement = new SharpInference.Engine.LayerPlacement(
-            GpuLayers: 1,
-            CpuLayers: hp.NumLayers - 1,
+            GpuLayers: gpuLayers,
+            CpuLayers: hp.NumLayers - gpuLayers,
             GpuWeightBytes: 0,
             GpuKvBytes: 0,
             RecommendedCtxSize: 64);

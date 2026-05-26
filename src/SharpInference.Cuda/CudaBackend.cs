@@ -890,8 +890,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(rmsnorm) failed: {r}");
     }
 
-    /// <summary>Per-head RMS norm with learned weights (Qwen3 QK norm).</summary>
-    public void HeadNorm(Tensor data, Tensor weight, int numHeads, int headDim, float eps = 1e-6f)
+    /// <summary>Per-head RMS norm with learned weights (Qwen3 / OLMoE QK norm).
+    /// <paramref name="perChannelWeight"/> false → weight is shared <c>[headDim]</c> vector
+    /// applied identically to every head (Qwen3); true → weight is
+    /// <c>[numHeads * headDim]</c> with one slice per head (OLMoE).</summary>
+    public void HeadNorm(Tensor data, Tensor weight, int numHeads, int headDim,
+        float eps = 1e-6f, bool perChannelWeight = false)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
@@ -901,10 +905,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         nint wPtr = GetDevPtr(weight);
         int  pHD = headDim, pNH = numHeads;
         float pE = eps;
-        nint* args = stackalloc nint[5]
+        int  pWS = perChannelWeight ? headDim : 0;
+        nint* args = stackalloc nint[6]
         {
             (nint)(&dPtr), (nint)(&wPtr),
-            (nint)(&pHD), (nint)(&pNH), (nint)(&pE)
+            (nint)(&pHD), (nint)(&pNH), (nint)(&pE), (nint)(&pWS)
         };
         int r = NvrtcInterop.LaunchKernel(_headNormKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(head_norm) failed: {r}");

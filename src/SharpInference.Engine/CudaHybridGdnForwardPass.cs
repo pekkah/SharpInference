@@ -1135,8 +1135,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpu.SplitQG(_gpuQ, _gpuGate, _gpuQGate, _numHeads, _headDim);
 
         // 2b. Per-head RMSNorm on Q and K (qwen35moe attn_q_norm / attn_k_norm).
-        _gpu.HeadNorm(_gpuQ, _gpuQNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
-        _gpu.HeadNorm(_gpuK, _gpuKNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+        _gpu.HeadNorm(_gpuQ, _gpuQNorm[layer], _numHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+        _gpu.HeadNorm(_gpuK, _gpuKNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
 
         // 2c. Partial NEOX RoPE on Q and K (rotate first ropeDim of each head).
         _gpu.RoPEPartial(_gpuQ, position, _headDim, _ropeDim, _hp.RopeTheta, neox: true);
@@ -1276,8 +1276,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpu.SplitQG(_gpuQ, _gpuGate, _gpuQGate, _numHeads, _headDim);
 
         // 2b. Per-head RMSNorm on Q and K.
-        _gpu.HeadNorm(_gpuQ, _gpuMtpQNorm, _numHeads,   _headDim, _hp.RmsNormEps);
-        _gpu.HeadNorm(_gpuK, _gpuMtpKNorm, _numKvHeads, _headDim, _hp.RmsNormEps);
+        _gpu.HeadNorm(_gpuQ, _gpuMtpQNorm, _numHeads,   _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+        _gpu.HeadNorm(_gpuK, _gpuMtpKNorm, _numKvHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
 
         // 2c. Partial NEOX RoPE.
         _gpu.RoPEPartial(_gpuQ, position, _headDim, _ropeDim, _hp.RopeTheta, neox: true);
@@ -1523,7 +1523,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         Span<int> selectedExperts = stackalloc int[_numActiveExperts];
         Span<float> expertWeights = stackalloc float[_numActiveExperts];
-        SelectTopK(_routerBuf, _numActiveExperts, selectedExperts, expertWeights);
+        SelectTopK(_routerBuf, _numActiveExperts, selectedExperts, expertWeights, _hp.NormalizeMoeTopKWeights);
 
         // 3. Shared expert: ffn_down @ (SiLU(gate @ x) * (up @ x))
         //    then per-token sigmoid-scalar gate via ffn_gate_inp_shexp · x.
@@ -1716,7 +1716,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         Span<int> selectedExperts = stackalloc int[numActive];
         Span<float> expertWeights = stackalloc float[numActive];
-        SelectTopKPtr(_cpuRouterLogits, numExperts, numActive, selectedExperts, expertWeights);
+        SelectTopKPtr(_cpuRouterLogits, numExperts, numActive, selectedExperts, expertWeights,
+            normalize: _hp.NormalizeMoeTopKWeights);
 
         // 3. Routed experts (sparse top-K). Two batched Parallel.For sweeps
         //    instead of 16 per-expert ones — gate+up across all 8 experts in
@@ -1826,7 +1827,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         };
 
     private static void SelectTopKPtr(float* logits, int n, int k,
-        Span<int> indices, Span<float> weights)
+        Span<int> indices, Span<float> weights, bool normalize)
     {
         for (int ki = 0; ki < k; ki++)
         {
@@ -1843,7 +1844,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             indices[ki] = bestIdx;
             weights[ki] = bestVal;
         }
-        if (k > 1)
+        if (normalize && k > 1)
         {
             float sum = 0;
             for (int i = 0; i < k; i++) sum += weights[i];
@@ -1864,7 +1865,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     }
 
     private static void SelectTopK(ReadOnlySpan<float> logits, int k,
-        Span<int> indices, Span<float> weights)
+        Span<int> indices, Span<float> weights, bool normalize)
     {
         for (int ki = 0; ki < k; ki++)
         {
@@ -1881,7 +1882,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             indices[ki] = bestIdx;
             weights[ki] = bestVal;
         }
-        if (k > 1)
+        if (normalize && k > 1)
         {
             float sum = 0;
             for (int i = 0; i < k; i++) sum += weights[i];

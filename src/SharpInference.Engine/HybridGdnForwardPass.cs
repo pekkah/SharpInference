@@ -1321,7 +1321,8 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
 
         Span<int> selectedExperts = stackalloc int[numActive];
         Span<float> expertWeights = stackalloc float[numActive];
-        SelectTopK(_routerLogits, numExperts, numActive, selectedExperts, expertWeights);
+        SelectTopK(_routerLogits, numExperts, numActive, selectedExperts, expertWeights,
+            normalize: _hp.NormalizeMoeTopKWeights);
 
         // 2. Shared expert: ffn_down @ (SiLU(ffn_gate @ x) * (ffn_up @ x)), then per-token
         //    scalar gate via sigmoid(ffn_gate_inp_shexp · x). Use MatVecDual to fuse
@@ -1513,7 +1514,7 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         };
 
     private static void SelectTopK(float* logits, int n, int k,
-        Span<int> indices, Span<float> weights)
+        Span<int> indices, Span<float> weights, bool normalize)
     {
         for (int ki = 0; ki < k; ki++)
         {
@@ -1530,7 +1531,7 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             indices[ki] = bestIdx;
             weights[ki] = bestVal;
         }
-        if (k > 1)
+        if (normalize && k > 1)
         {
             float sum = 0;
             for (int i = 0; i < k; i++) sum += weights[i];

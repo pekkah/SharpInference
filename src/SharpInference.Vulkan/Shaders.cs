@@ -221,6 +221,9 @@ internal static class Shaders
             uint head_dim;
             uint num_heads;
             float eps;
+            // 0 = weight is shared across heads (Qwen3 style, len = head_dim).
+            // head_dim = per-channel weight (OLMoE style, len = num_heads*head_dim).
+            uint weight_stride;
         };
 
         shared float sdata[256];
@@ -231,6 +234,7 @@ internal static class Shaders
             if (head >= num_heads) return;
 
             uint base_off = head * head_dim;
+            uint w_off    = head * weight_stride;
 
             // Phase 1: accumulate sum of squares
             float sum = 0.0;
@@ -250,7 +254,7 @@ internal static class Shaders
             // Phase 3: normalize in-place with weight
             float scale = inversesqrt(sdata[0] / float(head_dim) + eps);
             for (uint i = tid; i < head_dim; i += 256) {
-                data_buf[base_off + i] = data_buf[base_off + i] * scale * weight_data[i];
+                data_buf[base_off + i] = data_buf[base_off + i] * scale * weight_data[w_off + i];
             }
         }
         """;

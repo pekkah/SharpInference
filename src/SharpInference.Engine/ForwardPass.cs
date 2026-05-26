@@ -55,8 +55,10 @@ public sealed unsafe class ForwardPass : IForwardPass
     private readonly bool _hasAttnBias;
     private readonly float*[] _bq, _bk, _bv, _bo;
 
-    // Optional per-head Q/K RMSNorm (Qwen3)
+    // Optional per-head Q/K RMSNorm (Qwen3-style shared weights of size headDim,
+    // or OLMoE-style per-channel weights of size numHeads*headDim / numKvHeads*headDim).
     private readonly bool _hasQkNorm;
+    private readonly bool _perChannelQkNorm;
     private readonly float*[] _qNorm, _kNorm;
 
     // MoE (Mixture of Experts) — Phase 5
@@ -67,6 +69,10 @@ public sealed unsafe class ForwardPass : IForwardPass
     private readonly float* _sharedOut;     // [embDim] shared expert output
     private readonly float* _expertGate;    // [expertIntermDim] expert gate scratch
     private readonly float* _expertUp;      // [expertIntermDim] expert up scratch
+    // Per-expert down-projection scratch — sized embDim because that's the row count
+    // of the down MatVec. Most MoE models have intermDim >= embDim so _ffnUp would
+    // suffice, but OLMoE has embDim=2048 / intermDim=1024 and overflows it.
+    private readonly float* _moeDownTemp;
 
     // Optional TurboQuant KV cache (Phase 3)
     private TurboQuantKvCache? _tqKvCache;
@@ -156,6 +162,7 @@ public sealed unsafe class ForwardPass : IForwardPass
         _bv = new float*[L]; _bo = new float*[L];
 
         _hasQkNorm = hp.HasQkNorm;
+        _perChannelQkNorm = hp.IsPerChannelQkNorm;
         _qNorm = new float*[L]; _kNorm = new float*[L];
 
         // MoE weight arrays
@@ -171,6 +178,7 @@ public sealed unsafe class ForwardPass : IForwardPass
             _sharedOut = Alloc(_embDim);
             _expertGate = Alloc(hp.ExpertIntermediateDim);
             _expertUp = Alloc(hp.ExpertIntermediateDim);
+            _moeDownTemp = Alloc(_embDim);
         }
 
         for (int i = 0; i < L; i++)
@@ -212,8 +220,10 @@ public sealed unsafe class ForwardPass : IForwardPass
 
             if (_hasQkNorm && !hp.UseL2QkNorm)
             {
-                _qNorm[i] = LoadBias($"blk.{i}.attn_q_norm.weight", _headDim);
-                _kNorm[i] = LoadBias($"blk.{i}.attn_k_norm.weight", _headDim);
+                int qNormSize = _perChannelQkNorm ? _numHeads * _headDim : _headDim;
+                int kNormSize = _perChannelQkNorm ? _numKvHeads * _headDim : _headDim;
+                _qNorm[i] = LoadBias($"blk.{i}.attn_q_norm.weight", qNormSize);
+                _kNorm[i] = LoadBias($"blk.{i}.attn_k_norm.weight", kNormSize);
             }
         }
 
@@ -420,8 +430,7 @@ public sealed unsafe class ForwardPass : IForwardPass
                         // Qwen3 (weighted QK-norm): norm BEFORE RoPE
                         if (_hasQkNorm && !_hp.UseL2QkNorm)
                         {
-                            PerHeadRmsNorm(qn, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
-                            PerHeadRmsNorm(kn, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+                            ApplyQkNorm(qn, kn, layer);
                         }
 
                         if (useRoPE)
@@ -625,8 +634,7 @@ public sealed unsafe class ForwardPass : IForwardPass
                         // Qwen3 (weighted QK-norm): norm BEFORE RoPE
                         if (_hasQkNorm && !_hp.UseL2QkNorm)
                         {
-                            PerHeadRmsNorm(qn, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
-                            PerHeadRmsNorm(kn, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+                            ApplyQkNorm(qn, kn, layer);
                         }
 
                         if (useRoPE)
@@ -776,8 +784,7 @@ public sealed unsafe class ForwardPass : IForwardPass
             // Llama-4 (L2 QK-norm): apply norm AFTER RoPE (per llama.cpp)
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
-                PerHeadRmsNorm(_q, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
-                PerHeadRmsNorm(_k, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+                ApplyQkNorm(_q, _k, layer);
             }
 
             if (useRoPE)
@@ -1084,7 +1091,8 @@ public sealed unsafe class ForwardPass : IForwardPass
         // Find top-k experts (for k=1, just argmax)
         Span<int> selectedExperts = stackalloc int[numActive];
         Span<float> expertWeights = stackalloc float[numActive];
-        SelectTopK(_routerLogits, numExperts, numActive, selectedExperts, expertWeights);
+        SelectTopK(_routerLogits, numExperts, numActive, selectedExperts, expertWeights,
+            normalize: _hp.NormalizeMoeTopKWeights);
 
         if (_traceRouters && (_traceRouterPos < 0 || _traceRouterPos == _currentPos))
         {
@@ -1171,16 +1179,13 @@ public sealed unsafe class ForwardPass : IForwardPass
         long expertOffset = (long)expertIdx * rows * bytesPerRow;
         byte* expertData = packedTensor.DataPtr + expertOffset;
 
-        // Compute into a temp buffer, then weighted-add to output
-        float* temp = _ffnUp; // reuse buffer (embDim is always <= intermDim)
-        SimdKernels.MatVec(temp, expertData, input, rows, cols, packedTensor.DType);
+        SimdKernels.MatVec(_moeDownTemp, expertData, input, rows, cols, packedTensor.DType);
 
-        // Weighted accumulate: output += weight * temp (SIMD)
-        SimdKernels.WeightedAddInPlace(output, temp, weight, rows);
+        SimdKernels.WeightedAddInPlace(output, _moeDownTemp, weight, rows);
     }
 
     private static void SelectTopK(float* logits, int n, int k,
-        Span<int> indices, Span<float> weights)
+        Span<int> indices, Span<float> weights, bool normalize)
     {
         // Simple selection for small k (typically 1 or 2)
         for (int ki = 0; ki < k; ki++)
@@ -1199,15 +1204,17 @@ public sealed unsafe class ForwardPass : IForwardPass
             weights[ki] = bestVal;
         }
 
-        // Renormalize weights for selected experts
-        if (k > 1)
+        // Renormalize selected weights to sum to 1 (Qwen3-MoE / Mixtral convention).
+        // OLMoE skips this — its router uses raw post-softmax probabilities, so
+        // unused mass on non-selected experts intentionally shrinks the MoE block's
+        // contribution to the residual.
+        if (normalize && k > 1)
         {
             float sum = 0;
             for (int i = 0; i < k; i++) sum += weights[i];
             if (sum > 0)
                 for (int i = 0; i < k; i++) weights[i] /= sum;
         }
-        // For k=1, weight is the softmax probability (already normalized)
     }
 
     // ================================================================
@@ -1315,6 +1322,26 @@ public sealed unsafe class ForwardPass : IForwardPass
             SimdKernels.RmsNorm(data + h * headDim, data + h * headDim, weight, headDim, eps);
     }
 
+    private static void PerChannelRmsNorm(float* data, float* weight, int numHeads, int headDim, float eps)
+    {
+        for (int h = 0; h < numHeads; h++)
+            SimdKernels.RmsNorm(data + h * headDim, data + h * headDim, weight + h * headDim, headDim, eps);
+    }
+
+    private void ApplyQkNorm(float* q, float* k, int layer)
+    {
+        if (_perChannelQkNorm)
+        {
+            PerChannelRmsNorm(q, _qNorm[layer], _numHeads,   _headDim, _hp.RmsNormEps);
+            PerChannelRmsNorm(k, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+        }
+        else
+        {
+            PerHeadRmsNorm(q, _qNorm[layer], _numHeads,   _headDim, _hp.RmsNormEps);
+            PerHeadRmsNorm(k, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+        }
+    }
+
     private static void PerHeadPureRmsNorm(float* data, int numHeads, int headDim, float eps)
     {
         for (int h = 0; h < numHeads; h++)
@@ -1364,8 +1391,7 @@ public sealed unsafe class ForwardPass : IForwardPass
                     || (layer + 1) % _hp.NoRopeLayerStep != 0;
                 if (_hasQkNorm && !_hp.UseL2QkNorm)
                 {
-                    PerHeadRmsNorm(_q, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
-                    PerHeadRmsNorm(_k, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+                    ApplyQkNorm(_q, _k, layer);
                 }
                 if (useRoPE)
                 {
@@ -1510,8 +1536,7 @@ public sealed unsafe class ForwardPass : IForwardPass
                             }
                             else
                             {
-                                PerHeadRmsNorm(qn, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
-                                PerHeadRmsNorm(kn, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+                                ApplyQkNorm(qn, kn, layer);
                             }
                         }
                         caches[n].Append(layer,
@@ -1627,6 +1652,15 @@ public sealed unsafe class ForwardPass : IForwardPass
                 NativeMemory.Free(_qNorm[i]);
                 NativeMemory.Free(_kNorm[i]);
             }
+        }
+
+        if (_hp.IsMoE)
+        {
+            NativeMemory.Free(_routerLogits);
+            NativeMemory.Free(_sharedOut);
+            NativeMemory.Free(_expertGate);
+            NativeMemory.Free(_expertUp);
+            NativeMemory.Free(_moeDownTemp);
         }
 
         _kvCache.Dispose();

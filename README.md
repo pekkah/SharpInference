@@ -11,7 +11,7 @@ OpenBLAS in `tools/openblas/` for faster batched GEMM. Build with `dotnet build 
 
 ## Text generation
 
-Supported architectures: `llama`, `llama4`, `qwen3`, `qwen3moe`, `qwen35moe`
+Supported architectures: `llama`, `llama4`, `olmoe`, `qwen3`, `qwen3moe`, `qwen35moe`
 (hybrid Gated-DeltaNet + attention + MoE). Benchmarked on
 AMD Zen 4 (12c/24t, DDR4-3200) + RTX 4070 Ti (12 GB), Q4_K_M, `--temp 0`,
 `-n 80`, prompt `"Write a Python function that sorts a list using the quicksort algorithm:"`.
@@ -32,6 +32,9 @@ matching chat template).
 | Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --no-thinking` | **66.0** | **58.2** | Same per-token rate; reasoning suppressed in chat template, so all decoded tokens are visible answer |
 | Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq` | **65.9** | **58.4** | 3-bit KV → 40 960 ctx; 17 t/s @ 8K, 10 t/s @ 16K |
 | Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq --no-thinking` | **66.1** | **58.1** | Same per-token rate as `--tq` alone; reasoning suppressed |
+| OLMoE 1B-7B Instruct (MoE) | [allenai](https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF) | 4 GB | CPU | 21.6 | 55.7 | 64 experts / 8 active; per-channel QK-norm; `norm_topk_prob=false` |
+| OLMoE 1B-7B Instruct (MoE) | (same) | 4 GB | Vulkan `-g -1` | 18.9 | **121.2** | 16 layers all on VRAM; greedy on this prompt is unstable across backends — use `--temp 0.6 --top-p 0.95` for usable output |
+| OLMoE 1B-7B Instruct (MoE) | (same) | 4 GB | **CUDA** `-g -1` | **117.4** | **111.7** | Same; greedy varies, sampling coherent |
 | Qwen3-Coder 30B-A3B (MoE) | [Qwen](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF) | 17 GB | CPU | 15.1 | 21.2 | 128 experts / 8 active |
 | Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | CPU `--tq` | 12.0 | 21.1 | 3-bit KV |
 | Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | Vulkan `-g -1` (hybrid) | 1.0 | 5.8 | 29 GPU + 19 CPU layers, SLRU expert slot cache |

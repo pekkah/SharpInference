@@ -988,6 +988,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
 
     private struct RmsNormParams{ public uint n; public float eps; }
     private struct HeadNormParams { public uint headDim; public uint numHeads; public float eps; }
+    private struct WeightedHeadNormParams { public uint headDim; public uint numHeads; public float eps; public uint weightStride; }
     private struct CountParams { public uint n; }
     private struct ScaleParams { public uint n; public float scale; }
     private struct RoPEParams { public uint numHeads; public uint headDim; public int position; public float theta; }
@@ -1031,10 +1032,20 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         DispatchOrRecord(_rmsNormPipeline, [GetBuffer(x), GetBuffer(weight), GetBuffer(output)], 1, &p);
     }
 
-    public void HeadNorm(Tensor data, Tensor weight, uint numHeads, uint headDim, float eps = 1e-6f)
+    /// <summary>Per-head RMS norm with learned weights. <paramref name="perChannelWeight"/>
+    /// false → weight is shared <c>[headDim]</c> vector applied identically per head (Qwen3);
+    /// true → weight is <c>[numHeads * headDim]</c> with one slice per head (OLMoE).</summary>
+    public void HeadNorm(Tensor data, Tensor weight, uint numHeads, uint headDim,
+        float eps = 1e-6f, bool perChannelWeight = false)
     {
-        _headNormPipeline ??= new ComputePipeline(this, Shaders.HeadNorm, 2, pushConstantSize: sizeof(HeadNormParams));
-        var p = new HeadNormParams { headDim = headDim, numHeads = numHeads, eps = eps };
+        _headNormPipeline ??= new ComputePipeline(this, Shaders.HeadNorm, 2, pushConstantSize: sizeof(WeightedHeadNormParams));
+        var p = new WeightedHeadNormParams
+        {
+            headDim = headDim,
+            numHeads = numHeads,
+            eps = eps,
+            weightStride = perChannelWeight ? headDim : 0u,
+        };
         DispatchOrRecord(_headNormPipeline, [GetBuffer(data), GetBuffer(weight)], numHeads, &p);
     }
 

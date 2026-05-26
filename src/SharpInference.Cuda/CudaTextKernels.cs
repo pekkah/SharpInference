@@ -100,10 +100,13 @@ extern ""C"" __global__ void llm_rmsnorm(
 
 // ── HeadNorm (weighted per-head RMS) ───────────────────────────────────────
 // One block per head, 256 threads.
+// weight_stride controls QK-norm weight layout:
+//   0        → shared weight vector of length head_dim (Qwen3 style)
+//   head_dim → per-channel weights of length num_heads*head_dim (OLMoE style)
 extern ""C"" __global__ void llm_head_norm(
     float* __restrict__ data,
     const float* __restrict__ weight,
-    int head_dim, int num_heads, float eps)
+    int head_dim, int num_heads, float eps, int weight_stride)
 {
     __shared__ float sdata[256];
     unsigned int tid = threadIdx.x;
@@ -111,6 +114,7 @@ extern ""C"" __global__ void llm_head_norm(
     if ((int)head >= num_heads) return;
 
     int base_off = (int)head * head_dim;
+    int w_off    = (int)head * weight_stride;
 
     float sum = 0.f;
     for (int i = (int)tid; i < head_dim; i += 256) {
@@ -127,7 +131,7 @@ extern ""C"" __global__ void llm_head_norm(
 
     float scale = rsqrtf(sdata[0] / (float)head_dim + eps);
     for (int i = (int)tid; i < head_dim; i += 256)
-        data[base_off + i] = data[base_off + i] * scale * weight[i];
+        data[base_off + i] = data[base_off + i] * scale * weight[w_off + i];
 }
 
 // ── HeadNormPure (L2 normalize per head, no weights) ───────────────────────
