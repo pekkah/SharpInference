@@ -62,6 +62,41 @@ using System.Runtime.CompilerServices;
 public static class GdnKernels
 {
     // ────────────────────────────────────────────────────────────────────
+    //  Diagnostic trace for the qwen3.6-27B-MTP pos-12 parity bug
+    //  (env: SHARPI_TRACE_GDN_INTERNAL=1). Dumps per-head-0 GDN internals
+    //  — decay scalar, state-l2-after-decay, state-l2-after-rank1, p-readout
+    //  (q · S, pre-RMSNorm/SiLU) — at layers selected by SHARPI_TRACE_GDN_LAYERS
+    //  (default "0,20,40,60") and position selected by SHARPI_TRACE_GDN_POS
+    //  (default 12). Only fires when the caller threads layer/position through.
+    // ────────────────────────────────────────────────────────────────────
+    private static readonly bool _traceGdnInternal =
+        Environment.GetEnvironmentVariable("SHARPI_TRACE_GDN_INTERNAL") == "1";
+    private static readonly int[] _traceGdnLayers = ParseTraceGdnLayers();
+    private static readonly int _traceGdnPos = ParseTraceGdnPos();
+    private static int[] ParseTraceGdnLayers()
+    {
+        var s = Environment.GetEnvironmentVariable("SHARPI_TRACE_GDN_LAYERS");
+        if (string.IsNullOrEmpty(s)) return new[] { 0, 20, 40, 60 };
+        var parts = s.Split(',');
+        var ids = new List<int>(parts.Length);
+        foreach (var p in parts) if (int.TryParse(p.Trim(), out var v)) ids.Add(v);
+        return ids.ToArray();
+    }
+    private static int ParseTraceGdnPos()
+    {
+        var s = Environment.GetEnvironmentVariable("SHARPI_TRACE_GDN_POS");
+        if (string.IsNullOrEmpty(s) || !int.TryParse(s, out var v)) return 12;
+        return v;
+    }
+    private static bool ShouldTraceGdn(int layer, int position)
+    {
+        if (!_traceGdnInternal) return false;
+        if (layer < 0 || position < 0) return false;
+        if (position != _traceGdnPos) return false;
+        return Array.IndexOf(_traceGdnLayers, layer) >= 0;
+    }
+
+    // ────────────────────────────────────────────────────────────────────
     //  Element-wise scalar activations
     // ────────────────────────────────────────────────────────────────────
 
@@ -366,13 +401,15 @@ public static class GdnKernels
         Span<float> output,
         int numVHeads,
         int headDim,
-        float normEps = 1e-6f)
+        float normEps = 1e-6f,
+        int layer = -1,
+        int position = -1)
     {
         ValidateRecurrenceArgs(q, k, v, alphaIn, beta, ssmA, dtBias, normWeight, z, state, output,
             numVHeads, headDim);
 
         GdnStepInternal(q, k, v, alphaIn, beta, ssmA, dtBias, normWeight, z,
-            state, output, numVHeads, headDim, normEps);
+            state, output, numVHeads, headDim, normEps, layer, position);
     }
 
     /// <summary>
@@ -471,7 +508,8 @@ public static class GdnKernels
         ReadOnlySpan<float> ssmA, ReadOnlySpan<float> dtBias,
         ReadOnlySpan<float> normWeight, ReadOnlySpan<float> z,
         Span<float> state, Span<float> output,
-        int hv, int d, float normEps)
+        int hv, int d, float normEps,
+        int layer = -1, int position = -1)
     {
         int dd = d * d;
 
@@ -486,6 +524,8 @@ public static class GdnKernels
         // EXCEPT at its eps floor, so omitting this caused per-head magnitude
         // drift on small inner products → gibberish decode at qwen35moe scale.
         float readoutScale = 1.0f / MathF.Sqrt((float)d);
+
+        bool traceThis = ShouldTraceGdn(layer, position);
 
         for (int h = 0; h < hv; h++)
         {
@@ -506,6 +546,10 @@ public static class GdnKernels
             for (int idx = 0; idx < dd; idx++)
                 S[idx] *= decay;
 
+            if (traceThis && h == 0)
+                EmitGdnInternal(layer, position, "post-decay",
+                    decay: decay, bScalar: bScalar, S: S, payload: default, d: d);
+
             // (2) Predict: p[j] = Σ_i S[i,j] · k[i].  (S^T @ k)
             // Iterate rows i, accumulating k[i] * S[i, :] into p.
             //
@@ -517,7 +561,8 @@ public static class GdnKernels
             // scratch with ggml-order dot for predict+readout, FMA AXPY for the
             // rank-1 update — was tested 2026-05-26 and produced zero change at
             // L0 gdn-out (l2=3.86054 sum=-7.79791 either way vs llama r12
-            // 3.8582/-7.7774). Don't retry; the drift is elsewhere.
+            // 3.8582/-7.7774). The hypothesis was re-prioritised at L40+ where
+            // state magnitudes are larger; see SHARPI_TRACE_GDN_INTERNAL.
             p.Clear();
             for (int i = 0; i < d; i++)
             {
@@ -531,6 +576,10 @@ public static class GdnKernels
             for (int j = 0; j < d; j++)
                 dvec[j] = bScalar * (vh[j] - p[j]);
 
+            if (traceThis && h == 0)
+                EmitGdnInternal(layer, position, "dvec",
+                    decay: float.NaN, bScalar: float.NaN, S: default, payload: dvec, d: d);
+
             // (4) Rank-1 update: S[i,j] += k[i] · d[j].
             for (int i = 0; i < d; i++)
             {
@@ -539,6 +588,10 @@ public static class GdnKernels
                 for (int j = 0; j < d; j++)
                     S[rowBase + j] += ki * dvec[j];
             }
+
+            if (traceThis && h == 0)
+                EmitGdnInternal(layer, position, "post-rank1",
+                    decay: float.NaN, bScalar: float.NaN, S: S, payload: default, d: d);
 
             // (5) Readout: o[j] = (Σ_i S[i,j] · q[i]) / sqrt(d).  (S^T @ q, scaled)
             oh.Clear();
@@ -551,6 +604,10 @@ public static class GdnKernels
             }
             for (int j = 0; j < d; j++)
                 oh[j] *= readoutScale;
+
+            if (traceThis && h == 0)
+                EmitGdnInternal(layer, position, "p-readout",
+                    decay: float.NaN, bScalar: float.NaN, S: default, payload: oh, d: d);
 
             // (6) Per-head RMSNorm with shared headDim-wide gain.
             double sumSq = 0.0;
@@ -572,5 +629,50 @@ public static class GdnKernels
                 oh[j] *= silu;
             }
         }
+    }
+
+    // SHARPI_TRACE_GDN_INTERNAL emission. Format mirrors EmitBufTrace in
+    // HybridGdnForwardPass so the grep recipe is the same on both sides.
+    // For "post-decay" we also report the scalar decay and bScalar so the
+    // gate magnitudes are visible alongside the state norm.
+    private static void EmitGdnInternal(
+        int layer, int position, string tag,
+        float decay, float bScalar, ReadOnlySpan<float> S, ReadOnlySpan<float> payload, int d)
+    {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        var sb = new System.Text.StringBuilder(384);
+        sb.Append("[pos=").Append(position).Append(" L").Append(layer)
+          .Append(" gdn-internal head=0 ").Append(tag).Append(']');
+
+        if (!float.IsNaN(decay))
+            sb.Append(" decay=").Append(decay.ToString("G7", inv));
+        if (!float.IsNaN(bScalar))
+            sb.Append(" b=").Append(bScalar.ToString("G7", inv));
+
+        if (S.Length > 0)
+        {
+            double s2 = 0, su = 0;
+            for (int i = 0; i < S.Length; i++) { double vv = S[i]; s2 += vv * vv; su += vv; }
+            sb.Append(" S_l2=").Append(Math.Sqrt(s2).ToString("G6", inv));
+            sb.Append(" S_sum=").Append(((float)su).ToString("G6", inv));
+        }
+
+        if (payload.Length > 0)
+        {
+            double s2 = 0, su = 0;
+            for (int i = 0; i < payload.Length; i++) { double vv = payload[i]; s2 += vv * vv; su += vv; }
+            sb.Append(" l2=").Append(Math.Sqrt(s2).ToString("G6", inv));
+            sb.Append(" sum=").Append(((float)su).ToString("G6", inv));
+            sb.Append(" first8=[");
+            int k = Math.Min(8, payload.Length);
+            for (int i = 0; i < k; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                sb.Append(payload[i].ToString("G6", inv));
+            }
+            sb.Append(']');
+        }
+
+        Console.Error.WriteLine(sb.ToString());
     }
 }

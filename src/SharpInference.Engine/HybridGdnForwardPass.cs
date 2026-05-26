@@ -1266,7 +1266,9 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             output:     new Span<float>(_gdnOut, _gdnValueDim),
             numVHeads:  _gdnNumVHeads,
             headDim:    _gdnHeadDim,
-            normEps:    1e-6f);
+            normEps:    1e-6f,
+            layer:      layer,
+            position:   position);
         if (_traceLayers) {
             EmitBufTrace(position, layer, "gdn-out",       _gdnOut, _gdnValueDim);
             // Per-head L2 of gdn-out (32 heads x 128 dims). Helps spot a single

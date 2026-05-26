@@ -1434,7 +1434,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             output: new Span<float>(_gdnOut, _gdnValueDim),
             numVHeads: _gdnNumVHeads,
             headDim: _gdnHeadDim,
-            normEps: 1e-6f);
+            normEps: 1e-6f,
+            layer: layer,
+            position: position);
 
         // 9. Output projection: ssm_out (input ValueDim, output embDim) → _cpuHiddenOut.
         SimdKernels.MatVec(_cpuHiddenOut, _cpuSsmOut[layer].DataPtr, _gdnOut,
