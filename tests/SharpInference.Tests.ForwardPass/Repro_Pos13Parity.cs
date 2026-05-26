@@ -6,13 +6,25 @@ using SharpInference.Engine;
 namespace SharpInference.Tests.ForwardPass;
 
 /// <summary>
-/// Investigation harness for issue #31's main-forward parity bug on
-/// Qwen3.6-27B-MTP. Off by default; runs only when SHARPI_REPRO_POS13=1.
-/// Feeds the exact 13-token prompt from tests/fixtures/mtp_parity_27b.json
-/// (chat-templated "The capital of France is") and dumps the top-K
-/// position-12 logits — which select the position-13 token — plus the
-/// full per-layer trace, to a file under tmp/ for offline comparison
-/// against llama-eval-callback's output.
+/// Investigation harness for the Qwen3.6-27B-MTP main-forward parity bug. Off
+/// by default; runs only when SHARPI_REPRO_POS13=1.
+///
+/// Feeds the chat-template-correct prompt for "The capital of France is" and
+/// dumps the top-K logits at the final prompt position (which predicts the
+/// next token) plus the full per-layer trace, to a file under tmp/ for offline
+/// comparison against llama-eval-callback's output.
+///
+/// The default prompt is the 15-token output of Qwen3.6's official chat
+/// template with `add_generation_prompt=true` and the default thinking mode.
+/// Extracted from the GGUF's `tokenizer.chat_template` metadata; the template
+/// auto-inserts `<think>\n` after `<|im_start|>assistant\n`, so the model is
+/// trained to predict the FIRST WORD OF THINKING CONTENT at this position
+/// (e.g. sharpi 2026-05-26: token 8160 = "Here" @ logit 23.10 — confident).
+/// The prior 13-token form `[..., 248045, 74455, 271]` was MALFORMED: token
+/// 271 = `\n\n` (BPE-merged double newline) is a sequence the chat template
+/// never produces, so the model was in OOD state and both sharpi and llama
+/// emitted spurious high-entropy predictions. See feedback-prompt-must-match-
+/// chat-template in user-memory and the parity-bug memory note.
 /// </summary>
 public sealed class Repro_Pos13Parity
 {
@@ -29,10 +41,14 @@ public sealed class Repro_Pos13Parity
                     if (int.TryParse(p.Trim(), out var id)) ids.Add(id);
                 return ids.ToArray();
             }
+            // <|im_start|>user\nThe capital of France is<|im_end|>\n
+            // <|im_start|>assistant\n<think>\n
+            // (the trailing `<think>\n` is the template's auto-generation-
+            // prompt insertion in default thinking mode.)
             return new[]
             {
                 248045, 846, 198, 760, 6511, 314, 9338, 369,
-                248046, 198, 248045, 74455, 271,
+                248046, 198, 248045, 74455, 198, 248068, 198,
             };
         }
     }
@@ -96,7 +112,8 @@ public sealed class Repro_Pos13Parity
             (Environment.GetEnvironmentVariable("SHARPI_BYPASS_GDN")  == "1" ? "_nogdn"  : "") +
             (Environment.GetEnvironmentVariable("SHARPI_BYPASS_ATTN") == "1" ? "_noattn" : "") +
             (Environment.GetEnvironmentVariable("SHARPI_BYPASS_MOE")  == "1" ? "_nomoe"  : "");
-        var outPath = Path.Combine(@"C:\p\sharpi\tmp", $"sharpi_pos12_logits{bypassTag}.txt");
+        int predPos = PromptTokens.Length - 1;
+        var outPath = Path.Combine(@"C:\p\sharpi\tmp", $"sharpi_pos{predPos}_logits{bypassTag}.txt");
 
         var inv = CultureInfo.InvariantCulture;
         const int K = 30;
@@ -117,7 +134,7 @@ public sealed class Repro_Pos13Parity
         }
 
         using var w = new StreamWriter(outPath);
-        w.WriteLine($"# sharpi pos-12 logits (predicts pos 13) on Qwen3.6-27B-MTP-Q4_K_M");
+        w.WriteLine($"# sharpi pos-{predPos} logits (predicts pos {predPos + 1}) on Qwen3.6-27B-MTP-Q4_K_M");
         w.WriteLine($"# prompt_tokens = [{string.Join(",", PromptTokens)}]");
         w.WriteLine($"# vocab_size = {logits.Length}");
         w.WriteLine($"# bypass: GDN={Environment.GetEnvironmentVariable("SHARPI_BYPASS_GDN")} " +
@@ -128,7 +145,10 @@ public sealed class Repro_Pos13Parity
             w.WriteLine($"{j,4}  {top[j].idx,7}  {top[j].val.ToString("G8", inv)}");
 
         // A handful of specific tokens we care about for the divergence.
-        int[] interesting = { 198, 248046, 248045, 271, 1235 /* think */, 151649 };
+        // 248068 = `<think>` (auto-inserted by template), 248046 = `<|im_end|>`,
+        // 248045 = `<|im_start|>`, 198 = `\n`, 271 = `\n\n` (BPE-merged),
+        // 8160 = "Here" (sharpi's typical first-thinking-token), 31248 = "Okay".
+        int[] interesting = { 198, 271, 248046, 248045, 248068, 8160, 31248 };
         w.WriteLine("# specific tokens (id  logit  rank):");
         foreach (var id in interesting)
         {
