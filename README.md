@@ -56,6 +56,12 @@ recurrence), and the shared expert resident in VRAM; routed-expert dispatch
 auto-selects between an SLRU GPU cache and CPU mmap reads based on what
 fraction of experts can be cached at boot. Override with `SHARPI_CPU_MOE=0|1`.
 
+On Ampere+ (sm_80+) the CUDA backend auto-selects bf16 cuBLAS GEMM, which
+matches fp32 for almost all workloads. `SHARPI_CUDA_PRECISION=fp32|fp16|bf16|fp8`
+overrides the compute type — handy for bisecting whether an output divergence
+is mantissa-precision (changes between fp32 and bf16) or algorithmic
+(unchanged). Custom NVRTC kernels keep their fp32 accumulators regardless.
+
 ### Reasoning models
 
 Models that emit `<think>...</think>` (Qwen3, DeepSeek-R1, SmolLM3, …) are

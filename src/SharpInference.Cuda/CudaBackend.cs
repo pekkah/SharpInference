@@ -265,6 +265,31 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
     private static SgemmPrecision DetectBestPrecision(int sm)
     {
+        // SHARPI_CUDA_PRECISION = fp32 | fp16 | bf16 | fp8 — debug override for the
+        // cuBLAS GEMM compute type. Bypasses the SM-based auto-detection below.
+        // Unrecognised values fall through to auto-detect (no error).
+        //
+        // When to use: isolating whether an output regression is driven by
+        // mantissa precision (use fp32 as the high-precision floor) vs algorithm
+        // / kernel divergence. The default bf16 path on Ampere+ matches fp32 for
+        // most workloads, but greedy decode is sensitive to single-ulp argmax
+        // flips at low-margin steps. If output stays identical at fp32, the
+        // regression is not precision-related.
+        //
+        // Override only affects the cuBLAS path; custom NVRTC kernels (Q4_K /
+        // Q5_K matvec, RmsNorm, attention) keep their fp32 accumulators.
+        var env = Environment.GetEnvironmentVariable("SHARPI_CUDA_PRECISION");
+        if (env is not null)
+        {
+            switch (env.Trim().ToLowerInvariant())
+            {
+                case "fp32": return SgemmPrecision.Fp32;
+                case "fp16": return SgemmPrecision.Fp16;
+                case "bf16": return SgemmPrecision.Bf16;
+                case "fp8":
+                case "fp8e4m3": return SgemmPrecision.Fp8E4M3;
+            }
+        }
         // fp8 via cublasGemmEx requires sm_90+ (Hopper). Ada Lovelace (sm_89) only supports
         // fp8 through cublasLt (light), not the standard cublasGemmEx API.
         if (sm >= 90 && IsCuda12OrNewer())
