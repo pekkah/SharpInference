@@ -70,6 +70,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     private readonly float* _cpuSharedOut;
     private readonly float* _cpuExpertGate;
     private readonly float* _cpuExpertUp;
+    // Dedicated MoE down-projection scratch sized embDim. Mirrors
+    // ForwardPass._moeDownTemp; replaces the _cpuAttnOut reuse that breaks
+    // whenever numHeads*headDim < embDim.
+    private readonly float* _cpuMoeDownTemp;
     private readonly KvCache _cpuKvCache;
     private readonly TurboQuantKvCache? _cpuTqKvCache;
     private readonly float* _cpuRotatedQuery; // scratch for TQ query rotation [headDim]
@@ -350,6 +354,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         _cpuSharedOut = _isMoE && _hasSharedExpert ? Alloc(_embDim) : null;
         _cpuExpertGate = _isMoE ? Alloc(_expertDim) : null;
         _cpuExpertUp = _isMoE ? Alloc(_expertDim) : null;
+        _cpuMoeDownTemp = _isMoE ? Alloc(_embDim) : null;
 
         // Precompute RoPE cos/sin tables for CPU layers
         _ropeHalfDim = _headDim / 2;
@@ -1070,10 +1075,9 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         long expertOffset = (long)expertIdx * rows * bytesPerRow;
         byte* expertData = packedTensor.DataPtr + expertOffset;
 
-        float* temp = _cpuAttnOut;
-        SimdKernels.MatVec(temp, expertData, input, rows, cols, packedTensor.DType);
+        SimdKernels.MatVec(_cpuMoeDownTemp, expertData, input, rows, cols, packedTensor.DType);
         for (int i = 0; i < rows; i++)
-            output[i] += weight * temp[i];
+            output[i] += weight * _cpuMoeDownTemp[i];
     }
 
     private static void SelectTopK(float* logits, int n, int k,
@@ -1583,6 +1587,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         if (_cpuSharedOut != null) NativeMemory.Free(_cpuSharedOut);
         if (_cpuExpertGate != null) NativeMemory.Free(_cpuExpertGate);
         if (_cpuExpertUp != null) NativeMemory.Free(_cpuExpertUp);
+        if (_cpuMoeDownTemp != null) NativeMemory.Free(_cpuMoeDownTemp);
         if (_cpuRotatedQuery != null) NativeMemory.Free(_cpuRotatedQuery);
         if (_cpuDecompBuf != null) NativeMemory.Free(_cpuDecompBuf);
         _cpuKvCache.Dispose();

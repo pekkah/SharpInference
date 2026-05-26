@@ -262,6 +262,18 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             throw new ArgumentException("HybridGdnForwardPass with MoE requires HasSharedExpert (qwen35moe).", nameof(hp));
         if (!hp.IsMoE && hp.IntermediateDim <= 0)
             throw new ArgumentException("HybridGdnForwardPass dense FFN requires hp.IntermediateDim > 0.", nameof(hp));
+        // QK-norm tensor sizing (lines 397-398, 435-436) and the per-head RmsNorm
+        // dispatch in attention layers (lines 871-872, 1055-1056) both assume the
+        // Qwen3-style shared-weight convention (one [headDim] weight reused across
+        // heads). A model with per-channel QK norm would need both the loaders and
+        // the norm calls updated; reject loudly so the wrong-norm-silent-output
+        // failure mode can't sneak in.
+        if (hp.IsPerChannelQkNorm)
+            throw new NotSupportedException(
+                "HybridGdnForwardPass does not support per-channel QK norm. " +
+                "qwen35moe is the only supported GDN architecture and uses shared QK-norm weights. " +
+                "To enable per-channel QK norm, fix both the LoadF32Tensor sizes for _qNorm/_kNorm/_mtpQNorm/_mtpKNorm " +
+                "and the PerHeadRmsNorm call sites in the main + MTP attention paths.");
 
         _model = model;
         _hp = hp;
@@ -1756,12 +1768,20 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         NativeMemory.Free(_alpha);
         NativeMemory.Free(_beta);
         NativeMemory.Free(_gdnOut);
-        NativeMemory.Free(_routerLogits);
-        NativeMemory.Free(_sharedOut);
-        NativeMemory.Free(_expertGate);
-        NativeMemory.Free(_expertUp);
-        NativeMemory.Free(_expertGateAll);
-        NativeMemory.Free(_expertUpAll);
+        if (_hp.IsMoE)
+        {
+            NativeMemory.Free(_routerLogits);
+            NativeMemory.Free(_sharedOut);
+            NativeMemory.Free(_expertGate);
+            NativeMemory.Free(_expertUp);
+            NativeMemory.Free(_expertGateAll);
+            NativeMemory.Free(_expertUpAll);
+        }
+        else
+        {
+            NativeMemory.Free(_ffnGate);
+            NativeMemory.Free(_ffnUp);
+        }
         NativeMemory.Free(_ropeCosTable);
         NativeMemory.Free(_ropeSinTable);
 
