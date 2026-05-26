@@ -35,6 +35,29 @@ if (Test-Path $qwen36) {
     $results += .\scripts\bench-textgen.ps1 -Model $qwen36 -Tag "qwen36-cuda-hybrid" -NTokens $NTokens -Prompt $Prompt -TimeoutSec 600 -ExtraArgs @("-g","-1","--backend","cuda")
 }
 
+# Qwen3.6-27B-MTP — dense 27B with native MTP head (issue #25, parity oracle).
+# Vulkan can't run hybrid GDN, so CPU and CUDA-hybrid only. The MTP path engages
+# automatically when the model has a HasMtpHead, sampling is greedy, and
+# --no-thinking is set (chat template renders enable_thinking=false). Memory
+# project_mtp_n1_no_speedup documents that N=1 sequential gives no decode
+# speedup vs MTP-off; we still bench both to make the gap concrete (issue #28).
+$qwen36mtpQ4 = "E:\models\Qwen3.6-27B-MTP-Q4_K_M.gguf"
+$qwen36mtpQ5 = "E:\models\Qwen3.6-27B-MTP-Q5_K_M.gguf"
+foreach ($pair in @(
+        @{ Path = $qwen36mtpQ4; QuantTag = "q4" },
+        @{ Path = $qwen36mtpQ5; QuantTag = "q5" })) {
+    if (Test-Path $pair.Path) {
+        $qt = $pair.QuantTag
+        $results += .\scripts\bench-textgen.ps1 -Model $pair.Path -Tag "qwen36-27b-mtp-$qt-cpu-mtp"             -NTokens $NTokens -Prompt $Prompt -TimeoutSec 900 -ExtraArgs @("--no-thinking")
+        $results += .\scripts\bench-textgen.ps1 -Model $pair.Path -Tag "qwen36-27b-mtp-$qt-cuda-hybrid-mtp"     -NTokens $NTokens -Prompt $Prompt -TimeoutSec 900 -ExtraArgs @("-g","-1","--backend","cuda","--no-thinking")
+        # MTP-disabled pair, same chat template, to quantify the N=1 no-speedup gap.
+        $env:SHARPI_DISABLE_MTP = "1"
+        $results += .\scripts\bench-textgen.ps1 -Model $pair.Path -Tag "qwen36-27b-mtp-$qt-cpu-nomtp"           -NTokens $NTokens -Prompt $Prompt -TimeoutSec 900 -ExtraArgs @("--no-thinking")
+        $results += .\scripts\bench-textgen.ps1 -Model $pair.Path -Tag "qwen36-27b-mtp-$qt-cuda-hybrid-nomtp"   -NTokens $NTokens -Prompt $Prompt -TimeoutSec 900 -ExtraArgs @("-g","-1","--backend","cuda","--no-thinking")
+        Remove-Item Env:\SHARPI_DISABLE_MTP -ErrorAction SilentlyContinue
+    }
+}
+
 # Llama-4-Scout 17B-16E MoE — split GGUF on E: drive (~61 GB total at Q4_K_M; CPU-only on a 12 GB card).
 $scout = "E:\models\Llama-4-Scout-17B-16E-Instruct-Q4_K_M-00001-of-00002.gguf"
 if (Test-Path $scout) {
@@ -44,7 +67,7 @@ if (Test-Path $scout) {
 
 Write-Host ""
 Write-Host "=== Summary ===" -ForegroundColor Cyan
-$results | Format-Table Tag, PrefillTok, PrefillTps, DecodeTok, DecodeTps, WallSec, TimedOut -AutoSize
+$results | Format-Table Tag, PrefillTok, PrefillTps, DecodeTok, DecodeTps, MtpAccept, WallSec, TimedOut -AutoSize
 Write-Host ""
 Write-Host "=== Decode samples (first 12 tokens) ===" -ForegroundColor Cyan
 $results | ForEach-Object { "[{0,-14}] {1}" -f $_.Tag, $_.Sample } | ForEach-Object { Write-Host $_ }

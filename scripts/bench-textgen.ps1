@@ -62,6 +62,13 @@ if ($stdout -match 'Decode:\s+(\d+)\s+tokens,\s+([\d\.]+)\s+t/s') {
     $totalDecodeTok = [int]$matches[1]; $decodeTps = Parse-Double $matches[2]
 }
 
+# MTP acceptance rate (when MTP engages). Captured as a percentage so the bench
+# summary can show the draft-acceptance gap without extra plumbing.
+$mtpAccept = $null
+if ($stdout -match 'MTP accept:\s+([\d\.]+)\s*%') {
+    $mtpAccept = Parse-Double $matches[1]
+}
+
 # First 12 decoded tokens for sanity check
 $decTexts = @()
 [regex]::Matches($stderr, "next=\d+\('([^']*)'\)") | Select-Object -First 12 | ForEach-Object {
@@ -75,6 +82,7 @@ $sample = ($decTexts -join "") -replace "`r","" -replace "`n","\\n"
     PrefillTps  = [Math]::Round($prefillTps, 1)
     DecodeTok   = $totalDecodeTok
     DecodeTps   = [Math]::Round($decodeTps, 1)
+    MtpAccept   = if ($null -eq $mtpAccept) { $null } else { [Math]::Round($mtpAccept, 1) }
     WallSec     = [Math]::Round($elapsed.TotalSeconds, 1)
     TimedOut    = $timedOut
     Sample      = $sample

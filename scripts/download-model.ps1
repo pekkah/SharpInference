@@ -4,8 +4,8 @@
 .DESCRIPTION
     Downloads from HuggingFace to the models/ directory. Skips if already present.
     Supports: smollm2, qwen3-8b, olmoe-1b-7b, llama31-70b, qwen3-coder-30b-a3b, qwen36-35b-a3b,
-              qwen36-27b-mtp, qwen36-35b-a3b-mtp, llama4-scout, z-image-turbo, z-image-turbo-q8,
-              realesrgan-x4
+              qwen36-27b-mtp, qwen36-27b-mtp-q5, qwen36-35b-a3b-mtp, llama4-scout, z-image-turbo,
+              z-image-turbo-q8, realesrgan-x4
 .PARAMETER Model
     Which model to download. Default: downloads all text models (skips large image models).
 .EXAMPLE
@@ -16,7 +16,8 @@
     .\download-model.ps1 -Model llama31-70b             # Llama 3.1 70B (40.8 GB)
     .\download-model.ps1 -Model qwen3-coder-30b-a3b     # Qwen3-Coder 30B-A3B Q4_K_M (18.6 GB)
     .\download-model.ps1 -Model qwen36-35b-a3b          # Qwen3.6 35B-A3B UD-Q4_K_M (22.1 GB) — recommended general MoE for 12 GB hybrid
-    .\download-model.ps1 -Model qwen36-27b-mtp          # Qwen3.6 27B-MTP Q4_K_M (17.1 GB) — dense MTP parity oracle for issue #25
+    .\download-model.ps1 -Model qwen36-27b-mtp          # Qwen3.6 27B-MTP Q4_K_M (15.9 GB) — dense MTP parity oracle for issue #25
+    .\download-model.ps1 -Model qwen36-27b-mtp-q5       # Qwen3.6 27B-MTP Q5_K_M (18.5 GB) — higher-quality variant for the MTP bench row
     .\download-model.ps1 -Model qwen36-35b-a3b-mtp -DestDir E:\models  # Qwen3.6 35B-A3B-MTP UD-Q4_K_M (22.7 GB) — MoE MTP perf target for issue #25
     .\download-model.ps1 -Model llama4-scout            # Llama 4 Scout Q4_K_M (60.9 GB, 2 shards)
     .\download-model.ps1 -Model z-image-turbo           # Z-Image-Turbo Q5_K_M + abliterated encoder (~8.5 GB)
@@ -25,8 +26,8 @@
 #>
 param(
     [ValidateSet("smollm2", "qwen3-8b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "qwen36-35b-a3b",
-                 "qwen36-27b-mtp", "qwen36-35b-a3b-mtp", "llama4-scout", "z-image-turbo", "z-image-turbo-q8",
-                 "realesrgan-x4")]
+                 "qwen36-27b-mtp", "qwen36-27b-mtp-q5", "qwen36-35b-a3b-mtp", "llama4-scout", "z-image-turbo",
+                 "z-image-turbo-q8", "realesrgan-x4")]
     [string]$Model,
     [string]$DestDir
 )
@@ -86,8 +87,16 @@ $Models = @{
     "qwen36-27b-mtp" = @{
         Files = @("Qwen3.6-27B-MTP-Q4_K_M.gguf")
         Urls  = @("https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf")
-        Size  = "17.1 GB"
+        Size  = "15.9 GB"
         Phase = "MTP / issue #25 (dense parity oracle for qwen3_next_mtp tensor layout)"
+    }
+    # Same model, Q5_K_M quant — issue #28 wants both Q4_K_M and Q5_K_M bench rows so
+    # the README shows the quality/throughput trade-off on the MTP path.
+    "qwen36-27b-mtp-q5" = @{
+        Files = @("Qwen3.6-27B-MTP-Q5_K_M.gguf")
+        Urls  = @("https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q5_K_M.gguf")
+        Size  = "18.5 GB"
+        Phase = "MTP / issue #25 (Q5_K_M variant for the MTP bench row)"
     }
     # Qwen3.6-35B-A3B-MTP — the MoE that already runs ~23 t/s on the CUDA hybrid path,
     # with MTP heads bolted on. Renamed locally to avoid collision with qwen36-35b-a3b
