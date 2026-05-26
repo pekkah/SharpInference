@@ -262,4 +262,33 @@ public sealed record SamplingParams
     /// never enters thinking mode in that case).
     /// </summary>
     public int MaxThinkingTokens { get; init; } = 0;
+
+    /// <summary>
+    /// Speculative decoding type. Mirrors llama.cpp's <c>--spec-type</c>:
+    /// <c>Auto</c> (default) lets the engine pick (currently: enable MTP when the
+    /// model ships an MTP head AND greedy AND not in thinking mode);
+    /// <c>None</c> forces single-token decode; <c>Mtp</c> forces MTP self-speculative
+    /// decoding (errors if the model doesn't ship an MTP head, or sampling isn't
+    /// greedy, or thinking is on).
+    /// </summary>
+    public SpecType SpecType { get; init; } = SpecType.Auto;
+
+    /// <summary>
+    /// Max number of draft tokens per speculative step. Mirrors llama.cpp's
+    /// <c>--spec-draft-n-max</c>. 0 = engine default (1 for MTP today).
+    /// MTP only supports N=1 in sharpi until issue #30 (Phase-7 batched verify
+    /// + per-token GDN snapshot ring) lands; larger values error at decode time.
+    /// </summary>
+    public int SpecDraftNMax { get; init; } = 0;
+}
+
+/// <summary>Speculative-decoding type. Mirrors llama.cpp's <c>--spec-type</c>.</summary>
+public enum SpecType
+{
+    /// <summary>Engine picks: enable MTP when the model supports it and sampling is greedy.</summary>
+    Auto = 0,
+    /// <summary>Disable speculative decoding; one token per main forward.</summary>
+    None = 1,
+    /// <summary>Multi-Token Prediction self-speculative decoding via the model's own MTP head.</summary>
+    Mtp = 2,
 }

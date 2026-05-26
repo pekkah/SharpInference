@@ -95,9 +95,24 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         public string? DraftModelPath { get; init; }
 
         [CommandOption("--spec-lookahead")]
-        [Description("Number of draft tokens per speculative step (default: 4)")]
+        [Description("Number of draft tokens per speculative step with --draft-model (default: 4)")]
         [DefaultValue(4)]
         public int SpecLookahead { get; init; }
+
+        [CommandOption("--spec-type")]
+        [Description("Speculative decoding type: auto (default; enables MTP when supported), none, mtp (alias: draft-mtp). Mirrors llama.cpp.")]
+        [DefaultValue("auto")]
+        public string SpecTypeStr { get; init; } = "auto";
+
+        [CommandOption("--spec-draft-n-max")]
+        [Description("Max draft tokens per MTP step (default: 1). Currently only N=1 is supported on the MTP path; issue #30 will lift this. Mirrors llama.cpp.")]
+        [DefaultValue(0)]
+        public int SpecDraftNMax { get; init; }
+        // llama.cpp also ships `--spec-draft-n-min` (issue #37) and `--spec-draft-p-min`
+        // (issue #38). Both depend on follow-up work that isn't in sharpi yet:
+        //   n-min meaningfully needs N>1 (issue #30).
+        //   p-min needs probabilistic verify (currently greedy: argmax-match).
+        // Add them here when those land.
 
         [CommandOption("--min-batch-blas")]
         [Description("Minimum batch size to use OpenBLAS SGEMM in MatMulBatched (default: 16, crossover for Q4_K_M weights). Also settable via SHARPI_MIN_BATCH_BLAS env var.")]
@@ -196,8 +211,15 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         // CPU baseline so the bridge can reuse small helpers, but it stays unused.
         ForwardPass? fwd = null;
         HybridGdnForwardPass? hybridFwd = null;
+        // IForwardPass handle for MtpDecoder integration (issue #32). Captured when the
+        // chosen forward pass ships an MTP head. The actual MTP gating happens later in
+        // RunSinglePrompt / RunInteractive based on sp.SpecType.
+        IForwardPass? mtpFwd = null;
         if (hp.IsHybridSsm && settings.NGpuLayers == 0)
+        {
             hybridFwd = new HybridGdnForwardPass(model, cpuBackend, hp);
+            if (hybridFwd.HasMtpHead) mtpFwd = hybridFwd;
+        }
         else if (!hp.IsHybridSsm)
             fwd = new ForwardPass(model, cpuBackend, hp);
 
@@ -311,6 +333,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                         RecommendedCtxSize: ctxSize > 0 ? ctxSize : Math.Min(hp.ContextLength, 4096));
                     var chgdn = new CudaHybridGdnForwardPass(model, cuda, hp, placement);
                     gpuFwd = chgdn;
+                    if (chgdn.HasMtpHead) mtpFwd = chgdn;
                     forward = chgdn.Forward;
                     prefill = tokens => chgdn.Prefill(tokens);
                     resetCache = chgdn.ResetCache;
@@ -490,6 +513,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             MaxNewTokens = settings.NPredict,
             StopTokenIds = [.. BuildStopTokenIds(tokenizer)],
             RepetitionPenalty = settings.RepPenalty,
+            SpecType = ParseSpecType(settings.SpecTypeStr),
+            SpecDraftNMax = settings.SpecDraftNMax,
         };
         var rng = settings.Seed >= 0 ? new Random(settings.Seed) : new Random();
 
@@ -542,8 +567,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         try
         {
             if (settings.Prompt is not null)
-                return RunSinglePrompt(settings, forward, prefill, tokenizer, sp, rng);
-            return RunInteractive(settings, forward, prefill, resetCache, tokenizer, sp, rng);
+                return RunSinglePrompt(settings, forward, prefill, tokenizer, sp, rng, mtpFwd);
+            return RunInteractive(settings, forward, prefill, resetCache, tokenizer, sp, rng, mtpFwd);
         }
         catch (Exception ex)
         {
@@ -667,7 +692,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     private static int RunSinglePrompt(Settings s,
         Func<int, int, ReadOnlySpan<float>> forward,
         Func<IReadOnlyList<int>, ReadOnlySpan<float>> prefill,
-        GgufTokenizer tok, SamplingParams sp, Random rng)
+        GgufTokenizer tok, SamplingParams sp, Random rng,
+        IForwardPass? mtpFwd)
     {
         var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt, enableThinking: !s.NoThinking);
         var tokens = tok.Encode(prompt);
@@ -686,24 +712,121 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         if (!s.NoDisplayPrompt)
             Console.Write(s.Prompt);
 
+        // MTP self-speculative decode (issue #32). Activates when the model ships an
+        // MTP head AND sampling is greedy AND the user disabled thinking on the chat
+        // template (--no-thinking) AND sp.SpecType permits. SHARPI_DISABLE_MTP=1 is
+        // a back-compat off-switch that wins.
+        bool useMtp = ResolveCliMtp(mtpFwd, sp, s.NoThinking, out string? mtpReject);
+        if (mtpReject != null)
+        {
+            AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(mtpReject)}");
+            return 1;
+        }
+
         sw.Restart();
-        var (generated, totalDecoded) = DecodeLoop(forward, logits, tokens.Count, tok, sp, rng, s.VerbosePrompt, s.HideThinking, s.MaxThinkingTokens);
+        int generated, totalDecoded;
+        float? acceptanceRate = null;
+        if (useMtp)
+        {
+            (generated, totalDecoded, acceptanceRate) =
+                DecodeLoopMtp(mtpFwd!, tokens, logits, tok, sp, s.HideThinking);
+        }
+        else
+        {
+            (generated, totalDecoded) =
+                DecodeLoop(forward, logits, tokens.Count, tok, sp, rng, s.VerbosePrompt, s.HideThinking, s.MaxThinkingTokens);
+        }
         var decodeMs = sw.Elapsed.TotalMilliseconds;
 
         Console.WriteLine();
         AnsiConsole.MarkupLine($"\n[dim]Prefill: {tokens.Count} tokens, {tokens.Count / (prefillMs / 1000):F1} t/s | " +
             $"Decode: {totalDecoded} tokens, {totalDecoded / (decodeMs / 1000):F1} t/s" +
             (totalDecoded > generated ? $" ({generated} visible, {totalDecoded - generated} thinking)" : "") +
+            (acceptanceRate is float ar ? $" | MTP accept: {ar:P0}" : "") +
             "[/]");
         return 0;
+    }
+
+    // Decides whether to engage the MTP self-speculative path on the CLI side.
+    // Mirrors the InferenceEngine gate but reads `--no-thinking` from CLI settings
+    // (vs. the engine which inspects whether the model has think tokens registered).
+    // The CLI path can engage MTP even on models that registered <think>/</think>,
+    // as long as the user passed --no-thinking — in that case the template renders
+    // with enable_thinking=false and no think tokens appear in the prompt or output.
+    private static bool ResolveCliMtp(IForwardPass? mtpFwd, SamplingParams sp, bool noThinking, out string? rejectReason)
+    {
+        rejectReason = null;
+        bool envDisabled = Environment.GetEnvironmentVariable("SHARPI_DISABLE_MTP") == "1";
+        bool eligible = mtpFwd is not null
+                        && mtpFwd.HasMtpHead
+                        && sp.Temperature <= 0f
+                        && noThinking
+                        && !envDisabled;
+
+        switch (sp.SpecType)
+        {
+            case SpecType.None:
+                return false;
+            case SpecType.Mtp:
+                if (envDisabled) { rejectReason = "--spec-type mtp conflicts with SHARPI_DISABLE_MTP=1."; return false; }
+                if (mtpFwd is null || !mtpFwd.HasMtpHead) { rejectReason = "--spec-type mtp requires a model with an MTP head (nextn tensors)."; return false; }
+                if (sp.Temperature > 0f) { rejectReason = "--spec-type mtp requires greedy sampling (--temp 0)."; return false; }
+                if (!noThinking) { rejectReason = "--spec-type mtp requires --no-thinking (chat template must render with enable_thinking=false)."; return false; }
+                if (sp.SpecDraftNMax > 1) { rejectReason = $"--spec-draft-n-max={sp.SpecDraftNMax} is not yet supported (sequential N=1 today; issue #30)."; return false; }
+                return true;
+            default: // Auto
+                if (eligible && sp.SpecDraftNMax > 1) { rejectReason = $"--spec-draft-n-max={sp.SpecDraftNMax} is not yet supported (sequential N=1 today; issue #30)."; return false; }
+                return eligible;
+        }
+    }
+
+    // MTP self-speculative decode path. Reuses the same UTF-8 streaming + EmitToken
+    // logic as the baseline DecodeLoop but drives token emission via MtpDecoder.
+    // Requires --no-thinking, so no thinking-mode bookkeeping here.
+    private static (int generated, int totalDecoded, float acceptanceRate) DecodeLoopMtp(
+        IForwardPass mtpFwd, IReadOnlyList<int> promptTokens, ReadOnlySpan<float> initialLogits,
+        GgufTokenizer tok, SamplingParams sp, bool hideThinking)
+    {
+        var mtpDec = new MtpDecoder(mtpFwd);
+        mtpDec.Initialize(promptTokens.Count, initialLogits);
+        // Populate the MTP KV cache for the full prompt. Cost: ~1.6%/token; only paid
+        // on the MTP-enabled run.
+        mtpFwd.PrefillMtp(promptTokens, 0);
+
+        var streamDec = new Utf8StreamDecoder();
+        bool inThinking = false;
+        int generated = 0;
+        int totalDecoded = 0;
+
+        // Materialize stop ids once (MtpDecoder takes ReadOnlySpan<int>).
+        int[] stopIds = sp.StopTokenIds ?? [];
+
+        mtpDec.Decode(sp.MaxNewTokens, stopIds.AsSpan(), next =>
+        {
+            totalDecoded++;
+            if (EmitToken(next, tok, streamDec, ref inThinking, hideThinking)) generated++;
+        }, CancellationToken.None);
+
+        // Flush the UTF-8 decoder tail, applying the same hide-thinking gate as DecodeLoop.
+        var tail = streamDec.Flush();
+        if (!(hideThinking && inThinking))
+            Console.Write(tail);
+        if (inThinking) Console.Write("\x1b[0m");
+
+        return (generated, totalDecoded, mtpDec.AcceptanceRate);
     }
 
     private static int RunInteractive(Settings s,
         Func<int, int, ReadOnlySpan<float>> forward,
         Func<IReadOnlyList<int>, ReadOnlySpan<float>> prefill,
         Action resetCache,
-        GgufTokenizer tok, SamplingParams sp, Random rng)
+        GgufTokenizer tok, SamplingParams sp, Random rng,
+        IForwardPass? mtpFwd)
     {
+        // mtpFwd reserved for interactive MTP wiring (follow-up to #32). Today the
+        // interactive loop stays on the baseline decode path; the bench surface and
+        // single-prompt runs (RunSinglePrompt above) are what exercise MTP.
+        _ = mtpFwd;
         AnsiConsole.MarkupLine("[green]Interactive chat.[/] Type a message, or [yellow]/exit[/] to quit.\n");
 
         while (true)
@@ -845,6 +968,26 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             if (tokenizer.SpecialTokens.TryGetValue(name, out int id) && id != tokenizer.EosTokenId)
                 stops.Add(id);
         return [.. stops];
+    }
+
+    // Accept llama.cpp's "draft-mtp" alongside the shorter "mtp" so existing command
+    // lines copy-paste over. Unknown values fall back to auto with a console warning.
+    private static SpecType ParseSpecType(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return SpecType.Auto;
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "auto" or "" => SpecType.Auto,
+            "none" or "off" or "disabled" => SpecType.None,
+            "mtp" or "draft-mtp" => SpecType.Mtp,
+            _ => WarnUnknownSpecType(value),
+        };
+
+        static SpecType WarnUnknownSpecType(string v)
+        {
+            AnsiConsole.MarkupLine($"[yellow]Warning:[/] Unknown --spec-type [yellow]{Markup.Escape(v)}[/]; expected auto|none|mtp. Falling back to auto.");
+            return SpecType.Auto;
+        }
     }
 
     private static string FormatPrompt(string userMessage, string? systemPrompt, bool enableThinking = true)

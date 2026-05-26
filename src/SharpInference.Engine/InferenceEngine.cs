@@ -174,19 +174,67 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     fullSeq.AddRange(tokens);
 
                     // MTP self-speculative decoding (issue #25): when the forward pass
-                    // ships an MTP head AND we're in greedy, non-reasoning mode AND the
-                    // user hasn't disabled MTP via SHARPI_DISABLE_MTP=1, drive decode
-                    // through MtpDecoder instead of the per-token sampling loop below.
-                    // The MTP path emits one extra MTP-drafted token per main forward.
+                    // ships an MTP head AND we're in greedy, non-reasoning mode AND
+                    // sp.SpecType doesn't forbid it, drive decode through MtpDecoder
+                    // instead of the per-token sampling loop below. The MTP path
+                    // emits one extra MTP-drafted token per main forward.
                     //
                     // Decided BEFORE prefix-reuse (issue #33): MTP requires the MTP KV
                     // cache to cover every prompt position via PrefillMtp, which only
                     // works when Prefill starts from position 0. Prefix reuse is
                     // therefore skipped on MTP runs.
-                    bool useMtp = _fwd.HasMtpHead
-                        && Environment.GetEnvironmentVariable("SHARPI_DISABLE_MTP") != "1"
-                        && sp.Temperature <= 0f
-                        && !thinkingEnabled;
+                    //
+                    // sp.SpecType wires the llama.cpp-compatible --spec-type flag:
+                    //   Auto  → enable when HasMtpHead && greedy && !thinking
+                    //   None  → off (always)
+                    //   Mtp   → on; surface a clear error if any prerequisite is missing
+                    //
+                    // SHARPI_DISABLE_MTP=1 is a back-compat off-switch that wins over Auto
+                    // and Mtp (so existing benchmarking scripts that set it keep working).
+                    bool mtpEnvDisabled = Environment.GetEnvironmentVariable("SHARPI_DISABLE_MTP") == "1";
+                    bool useMtp;
+                    switch (sp.SpecType)
+                    {
+                        case SpecType.None:
+                            useMtp = false;
+                            break;
+                        case SpecType.Mtp:
+                            if (mtpEnvDisabled)
+                                throw new InvalidOperationException(
+                                    "SamplingParams.SpecType=Mtp conflicts with SHARPI_DISABLE_MTP=1. " +
+                                    "Unset the env var or use SpecType.None.");
+                            if (!_fwd.HasMtpHead)
+                                throw new InvalidOperationException(
+                                    "SamplingParams.SpecType=Mtp requires a model with an MTP head. " +
+                                    $"{_fwd.GetType().Name} reports HasMtpHead=false (no nextn tensors in the GGUF).");
+                            if (sp.Temperature > 0f)
+                                throw new InvalidOperationException(
+                                    "SamplingParams.SpecType=Mtp requires greedy sampling (Temperature=0). " +
+                                    "MTP verification is greedy (argmax match); sampling support is not yet implemented.");
+                            if (thinkingEnabled)
+                                throw new InvalidOperationException(
+                                    "SamplingParams.SpecType=Mtp is incompatible with reasoning mode. " +
+                                    "Pass --no-thinking (or render the chat template with enable_thinking=false).");
+                            useMtp = true;
+                            break;
+                        default: // Auto
+                            useMtp = _fwd.HasMtpHead
+                                && !mtpEnvDisabled
+                                && sp.Temperature <= 0f
+                                && !thinkingEnabled;
+                            break;
+                    }
+
+                    // --spec-draft-n-max parity with llama.cpp. Sharpi's MTP decoder
+                    // is sequential N=1 today; issue #30 (Phase-7 batched verify + per-token
+                    // GDN snapshot ring) is what unlocks N>1. Reject larger values up front
+                    // so users don't silently get the same throughput they'd get without
+                    // the flag.
+                    if (useMtp && sp.SpecDraftNMax > 1)
+                        throw new InvalidOperationException(
+                            $"SamplingParams.SpecDraftNMax={sp.SpecDraftNMax} is not yet supported. " +
+                            "Sharpi's MTP path is sequential N=1; issue #30 (Phase-7 batched verify) " +
+                            "lifts this. Pass --spec-draft-n-max 1 (or omit) until then.");
 
                     // Prefix cache decision: two branches.
                     //   (a) Rewindable attention pass — existing FindCacheablePrefix path,
