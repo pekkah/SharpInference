@@ -162,7 +162,12 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         _k = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
         _v = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
         _attnOut = gpu.Allocate(TensorShape.D1(_numHeads * _headDim));
-        int ffnScratchDim = Math.Max(_intermDim, _expertDim);
+        // Match CudaForwardPass: size scratch to the path this model actually uses.
+        // MatMul derives row count from output.ElementCount, so a buffer sized
+        // max(_intermDim, _expertDim) would make an expert MatMul write _intermDim rows
+        // when only _expertDim are valid — the MoE-on-Vulkan garble that's been chased
+        // since #2. Pure-MoE and pure-dense models both fall out correctly from this.
+        int ffnScratchDim = _isMoE ? _expertDim : _intermDim;
         _ffnGate = gpu.Allocate(TensorShape.D1(ffnScratchDim));
         _ffnUp = gpu.Allocate(TensorShape.D1(ffnScratchDim));
         _logits = gpu.Allocate(TensorShape.D1(hp.VocabSize));

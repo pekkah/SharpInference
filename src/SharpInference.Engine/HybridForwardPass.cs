@@ -169,7 +169,13 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         _gpuK = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
         _gpuV = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
         _gpuAttnOut = gpu.Allocate(TensorShape.D1(_numHeads * _headDim));
-        int gpuFfnScratch = Math.Max(_intermDim, _expertDim);
+        // Size the FFN scratch to the exact dim of the path this model actually uses:
+        // MoE → expert intermediate (per-expert MLP), dense → dense intermediate. The
+        // shape doubles as the row count when these buffers serve as MatMul outputs
+        // (MatMul reads rows from output.ElementCount), so an oversized buffer makes
+        // every expert MatMul write past the real output and read garbage on the
+        // next dispatch — the root cause of the MoE-on-Vulkan-hybrid garble (issue #2).
+        int gpuFfnScratch = _isMoE ? _expertDim : _intermDim;
         _gpuFfnGate = gpu.Allocate(TensorShape.D1(gpuFfnScratch));
         _gpuFfnUp = gpu.Allocate(TensorShape.D1(gpuFfnScratch));
         _gpuLogits = gpu.Allocate(TensorShape.D1(hp.VocabSize));

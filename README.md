@@ -16,9 +16,8 @@ Supported architectures: `llama`, `llama4`, `qwen3`, `qwen3moe`, `qwen35moe`
 AMD Zen 4 (12c/24t, DDR4-3200) + RTX 4070 Ti (12 GB), Q4_K_M, `--temp 0`,
 `-n 80`, prompt `"Write a Python function that sorts a list using the quicksort algorithm:"`.
 Decode rate is **forward-pass iterations / decode time**, so it counts
-thinking-mode tokens too. Outputs spot-checked for coherence
-(`scripts/bench-all.ps1`); MoE on Vulkan hybrid is currently a known
-broken row — see ⚠ note. Cross-engine top-1 parity vs llama.cpp b8585
+thinking-mode tokens too. All outputs verified coherent
+(`scripts/bench-all.ps1`). Cross-engine top-1 parity vs llama.cpp b8585
 verified on Qwen3-8B (byte-identical 60-token greedy decode with
 matching chat template).
 
@@ -35,7 +34,7 @@ matching chat template).
 | Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq --no-thinking` | **66.1** | **58.1** | Same per-token rate as `--tq` alone; reasoning suppressed |
 | Qwen3-Coder 30B-A3B (MoE) | [Qwen](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF) | 17 GB | CPU | 15.1 | 21.2 | 128 experts / 8 active |
 | Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | CPU `--tq` | 12.0 | 21.1 | 3-bit KV |
-| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | Vulkan `-g -1` (hybrid) | 1.0 | 10.2 | ⚠ output incoherent on this path — under investigation |
+| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | Vulkan `-g -1` (hybrid) | 1.0 | 5.8 | 29 GPU + 19 CPU layers, SLRU expert slot cache |
 | Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | **CUDA** `-g -1` (hybrid) | **13.9** | **22.7** | 29 GPU + 19 CPU layers (auto), ~2.2× Vulkan decode |
 | Llama-4 Scout 17B-16E (MoE) | [meta-llama](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct) | 61 GB | CPU | 1.9 | 3.9 | 48 layers, 17B active params; split GGUF (Q4_K_M) |
 | Llama-4 Scout 17B-16E (MoE) | (same) | 61 GB | CUDA `-g -1` (hybrid) | 0.9 | 2.1 | 7 GPU + 41 CPU layers — model dwarfs the 12 GB card, PCIe cost > GPU speedup so CPU-only wins here |
