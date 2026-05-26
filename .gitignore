@@ -438,3 +438,4 @@ shaders/*.spv
 codebooks/*.bin
 models/
 tools/
+tmp/
