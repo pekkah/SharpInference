@@ -170,6 +170,14 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
 
         Console.Error.WriteLine($"[HybridForwardPass] {placement.Summary()}{(enableTq ? $" [TQ{tqBits}]" : "")}");
 
+        bool vramTrace = Environment.GetEnvironmentVariable("SHARPI_TRACE_VRAM") == "1";
+        void TraceVram(string label)
+        {
+            if (vramTrace)
+                Console.Error.WriteLine($"[VRAM] {label}: free={gpu.FreeVramBytes / (1024 * 1024)} MiB");
+        }
+        TraceVram("constructor entry");
+
         // ── Allocate GPU scratch buffers ──
         _gpuHidden = gpu.Allocate(TensorShape.D1(_embDim));
         _gpuResidual = gpu.Allocate(TensorShape.D1(_embDim));
@@ -270,6 +278,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             _gpuAttnScoresScratch = gpu.Allocate(TensorShape.D1(scratchElems));
         }
 
+        TraceVram("before per-layer weight upload");
         Console.Error.Write($"[HybridForwardPass] Uploading {_nGpuLayers} GPU layers...");
         for (int i = 0; i < _nGpuLayers; i++)
         {
@@ -331,6 +340,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             Console.Error.Write(".");
         }
         Console.Error.WriteLine(" done.");
+        TraceVram("after all weight uploads");
 
         // MoE GPU layers use eager expert loading (all experts VRAM-resident).
         // No slot manager / SLRU cache — keep it simple at the cost of slightly more
@@ -1240,13 +1250,15 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             ?? throw new InvalidOperationException($"Missing tensor: {name}");
         var data = _model.GetTensorData(info);
 
+        // exact=true: the embedding table is permanent for the session; skip the
+        // pool round-up (a Q4_K embed near 715 MiB would otherwise inflate to 1 GiB).
         Tensor result;
         if (info.DType == DType.Q4_K)
         {
             int floatCount = data.Length / 4;
             var rawFloats = new float[floatCount];
             data.CopyTo(MemoryMarshal.AsBytes(rawFloats.AsSpan()));
-            result = _gpu.Upload(rawFloats, TensorShape.D1(floatCount));
+            result = _gpu.Upload(rawFloats, TensorShape.D1(floatCount), exact: true);
             _gpuWeightDTypes[result.Handle] = DType.Q4_K;
             isQuantized = true;
         }
@@ -1258,7 +1270,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 MemoryMarshal.Cast<byte, float>(data).CopyTo(f32);
             else
                 Dequantize.ToFloat32(data, f32, info.DType, count);
-            result = _gpu.Upload(f32, TensorShape.D1(count));
+            result = _gpu.Upload(f32, TensorShape.D1(count), exact: true);
             _gpuWeightDTypes[result.Handle] = DType.Float32;
             isQuantized = false;
         }
@@ -1271,11 +1283,14 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             ?? throw new InvalidOperationException($"Missing tensor: {name}");
         var data = _model.GetTensorData(info);
 
+        // exact=true: weights live for the entire decoding session. The pool's
+        // power-of-2 round-up (e.g. 17 MiB → 32 MiB) is pure waste at this lifetime;
+        // exact-path goes through cudaMalloc/cudaFree directly. See #25/#26.
         Tensor result;
         if (info.DType == DType.Float32)
         {
             var floats = MemoryMarshal.Cast<byte, float>(data);
-            result = _gpu.Upload(floats, TensorShape.D1(floats.Length));
+            result = _gpu.Upload(floats, TensorShape.D1(floats.Length), exact: true);
             _gpuWeightDTypes[result.Handle] = DType.Float32;
         }
         else if (info.DType == DType.Q4_K || info.DType == DType.Q6_K)
@@ -1283,7 +1298,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             int floatCount = data.Length / 4;
             var rawFloats = new float[floatCount];
             data.CopyTo(MemoryMarshal.AsBytes(rawFloats.AsSpan()));
-            result = _gpu.Upload(rawFloats, TensorShape.D1(floatCount));
+            result = _gpu.Upload(rawFloats, TensorShape.D1(floatCount), exact: true);
             _gpuWeightDTypes[result.Handle] = info.DType;
         }
         else
@@ -1291,7 +1306,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             int count = (int)info.ElementCount;
             var f32 = new float[count];
             Dequantize.ToFloat32(data, f32, info.DType, count);
-            result = _gpu.Upload(f32, TensorShape.D1(count));
+            result = _gpu.Upload(f32, TensorShape.D1(count), exact: true);
             _gpuWeightDTypes[result.Handle] = DType.Float32;
         }
         return result;
@@ -1397,11 +1412,14 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             ?? throw new InvalidOperationException($"Missing tensor: {name}");
         var data = _model.GetTensorData(info);
 
+        // exact=true on every branch: expert weights are session-lifetime. Pool
+        // round-up across (NumExperts × NumLayers) FFN tensors is the dominant
+        // VRAM-waste source on MoE models — reclaiming it widens the SLRU slot count.
         if (info.DType == DType.Float32)
         {
             int elemOffset = expertIdx * rows * cols;
             var floats = MemoryMarshal.Cast<byte, float>(data).Slice(elemOffset, rows * cols);
-            var result = _gpu.Upload(floats, TensorShape.D1(floats.Length));
+            var result = _gpu.Upload(floats, TensorShape.D1(floats.Length), exact: true);
             _gpuWeightDTypes[result.Handle] = DType.Float32;
             return result;
         }
@@ -1417,7 +1435,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             int floatCount = expertData.Length / 4;
             var rawFloats = new float[floatCount];
             expertData.CopyTo(MemoryMarshal.AsBytes(rawFloats.AsSpan()));
-            var result = _gpu.Upload(rawFloats, TensorShape.D1(floatCount));
+            var result = _gpu.Upload(rawFloats, TensorShape.D1(floatCount), exact: true);
             _gpuWeightDTypes[result.Handle] = info.DType;
             return result;
         }
@@ -1425,7 +1443,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         int count = rows * cols;
         var f32 = new float[count];
         Dequantize.ToFloat32(expertData, f32, info.DType, count);
-        var tensor = _gpu.Upload(f32, TensorShape.D1(count));
+        var tensor = _gpu.Upload(f32, TensorShape.D1(count), exact: true);
         _gpuWeightDTypes[tensor.Handle] = DType.Float32;
         return tensor;
     }

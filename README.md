@@ -56,6 +56,16 @@ VRAM via TierPlanner; falls through to Vulkan only when CUDA isn't present.
 `headDim ∈ {128, 256}`). MoE runs on GPU (full-offload or partial hybrid) on
 both Vulkan and CUDA backends.
 
+Session-lifetime weights (per-layer projections, expert FFNs, embedding,
+output) on all three CUDA forward passes (`CudaForwardPass`,
+`CudaHybridForwardPass`, `CudaHybridGdnForwardPass`) bypass the GPU buffer
+pool and go through `cudaMalloc`/`cudaFree` at the exact tensor size.
+The pool's power-of-2 round-up was wasting hundreds of MiB on big-tensor
+layouts (a 17 MiB attn_gate rounds to 32 MiB; across 60+ layers that's a
+couple of GiB — the difference between fitting one more FFN layer on a
+12 GB card or not, see issues #25 / #26). Scratch and KV-cache allocations
+stay pooled.
+
 For hybrid SSM/attention models (`qwen35moe`), the CUDA backend keeps the
 attention KV cache, the 30 Gated-DeltaNet layers (conv1d + rank-1 outer-product
 recurrence), and the shared expert resident in VRAM; routed-expert dispatch

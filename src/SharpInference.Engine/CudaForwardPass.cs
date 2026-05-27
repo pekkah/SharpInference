@@ -180,6 +180,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         Console.Error.WriteLine($"[CudaForwardPass] Context size: {_maxSeqLen} (model max: {hp.ContextLength}){(_tqEnabled ? " [TQ3]" : "")}");
 
+        bool vramTrace = Environment.GetEnvironmentVariable("SHARPI_TRACE_VRAM") == "1";
+        void TraceVram(string label)
+        {
+            if (vramTrace)
+                Console.Error.WriteLine($"[VRAM] {label}: free={gpu.FreeVramBytes / (1024 * 1024)} MiB");
+        }
+        TraceVram("constructor entry");
+
         // Scratch
         _hidden    = gpu.Allocate(TensorShape.D1(_embDim));
         _residual  = gpu.Allocate(TensorShape.D1(_embDim));
@@ -290,6 +298,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             _wqNorm = new Tensor[L]; _wkNorm = new Tensor[L];
         }
 
+        TraceVram("before per-layer weight upload");
         Console.Error.Write($"[CudaForwardPass] Uploading {L} layers to VRAM...");
         for (int i = 0; i < L; i++)
         {
@@ -336,13 +345,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             Console.Error.Write(".");
         }
 
-        // Embedding table
+        // Embedding table — session-lifetime, use exact-size allocation (see #25/#26):
+        // a Q4_K embedding can be 700+ MiB raw and would otherwise round to 1 GiB.
         Console.Error.Write(" emb...");
         var embInfo = model.FindTensor("token_embd.weight")!.Value;
         if (embInfo.DType == DType.Q4_K)
         {
             var embData = model.GetTensorData(embInfo);
-            _gpuEmbedding = _gpu.UploadRaw(embData, TensorShape.D1(embData.Length), DType.Q4_K);
+            _gpuEmbedding = _gpu.UploadRaw(embData, TensorShape.D1(embData.Length), DType.Q4_K, exact: true);
             _embIsQuantized = true;
             _weightDTypes[_gpuEmbedding.Handle] = DType.Q4_K;
         }
@@ -351,7 +361,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             var embData = model.GetTensorData(embInfo);
             var embF32 = new float[(int)embInfo.ElementCount];
             Dequantize.ToFloat32(embData, embF32, embInfo.DType, embInfo.ElementCount);
-            _gpuEmbedding = _gpu.Upload(embF32, TensorShape.D1(embF32.Length));
+            _gpuEmbedding = _gpu.Upload(embF32, TensorShape.D1(embF32.Length), exact: true);
             _embIsQuantized = false;
             _weightDTypes[_gpuEmbedding.Handle] = DType.Float32;
         }
@@ -362,6 +372,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             : _gpuEmbedding;
 
         Console.Error.WriteLine(" done.");
+        TraceVram("after all weight uploads");
 
         // Warm up: synchronize so kernel compilation/caching latency isn't reported
         // as the first token's decode time.
@@ -892,11 +903,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             ?? throw new InvalidOperationException($"Missing tensor: {name}");
         var data = _model.GetTensorData(info);
 
+        // exact=true on every branch: expert weights are session-lifetime, never freed
+        // during decode. Pool's power-of-2 round-up wastes VRAM that the SLRU expert
+        // cache could otherwise spend on more slots.
         if (info.DType == DType.Float32)
         {
             int elemOffset = expertIdx * rows * cols;
             var floats = MemoryMarshal.Cast<byte, float>(data).Slice(elemOffset, rows * cols);
-            var result = _gpu.Upload(floats, TensorShape.D1(floats.Length));
+            var result = _gpu.Upload(floats, TensorShape.D1(floats.Length), exact: true);
             _weightDTypes[result.Handle] = DType.Float32;
             return result;
         }
@@ -909,7 +923,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         if (info.DType == DType.Q4_K || info.DType == DType.Q6_K)
         {
-            var result = _gpu.UploadRaw(expertData, TensorShape.D1(expertData.Length), info.DType);
+            var result = _gpu.UploadRaw(expertData, TensorShape.D1(expertData.Length), info.DType, exact: true);
             _weightDTypes[result.Handle] = info.DType;
             return result;
         }
@@ -919,7 +933,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             int count = rows * cols;
             var f32 = new float[count];
             Dequantize.ToFloat32(expertData, f32, info.DType, count);
-            var result = _gpu.Upload(f32, TensorShape.D1(count));
+            var result = _gpu.Upload(f32, TensorShape.D1(count), exact: true);
             _weightDTypes[result.Handle] = DType.Float32;
             return result;
         }
@@ -931,16 +945,19 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             ?? throw new InvalidOperationException($"Missing tensor: {name}");
         var data = _model.GetTensorData(info);
 
+        // exact=true: weights live for the entire decoding session. The pool's
+        // power-of-2 round-up (e.g. 17 MiB → 32 MiB) is pure waste at this lifetime;
+        // exact-path goes through cudaMalloc/cudaFree directly. See #25/#26.
         Tensor result;
         if (info.DType == DType.Float32)
         {
             var floats = MemoryMarshal.Cast<byte, float>(data);
-            result = _gpu.Upload(floats, TensorShape.D1(floats.Length));
+            result = _gpu.Upload(floats, TensorShape.D1(floats.Length), exact: true);
             _weightDTypes[result.Handle] = DType.Float32;
         }
         else if (info.DType == DType.Q4_K || info.DType == DType.Q6_K)
         {
-            result = _gpu.UploadRaw(data, TensorShape.D1(data.Length), info.DType);
+            result = _gpu.UploadRaw(data, TensorShape.D1(data.Length), info.DType, exact: true);
             _weightDTypes[result.Handle] = info.DType;
         }
         else
@@ -949,7 +966,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             int count = (int)info.ElementCount;
             var f32 = new float[count];
             Dequantize.ToFloat32(data, f32, info.DType, count);
-            result = _gpu.Upload(f32, TensorShape.D1(count));
+            result = _gpu.Upload(f32, TensorShape.D1(count), exact: true);
             _weightDTypes[result.Handle] = DType.Float32;
         }
         return result;
