@@ -108,11 +108,16 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [Description("Max draft tokens per MTP step (default: 1). Currently only N=1 is supported on the MTP path; issue #30 will lift this. Mirrors llama.cpp.")]
         [DefaultValue(0)]
         public int SpecDraftNMax { get; init; }
-        // llama.cpp also ships `--spec-draft-n-min` (issue #37) and `--spec-draft-p-min`
-        // (issue #38). Both depend on follow-up work that isn't in sharpi yet:
-        //   n-min meaningfully needs N>1 (issue #30).
-        //   p-min needs probabilistic verify (currently greedy: argmax-match).
-        // Add them here when those land.
+
+        [CommandOption("--spec-draft-n-min")]
+        [Description("Min draft tokens per MTP step (default: 0). Mirrors llama.cpp. Currently rejected at parse time when > 0 since N=1 is the only supported draft length; issue #37.")]
+        [DefaultValue(0)]
+        public int SpecDraftNMin { get; init; }
+
+        [CommandOption("--spec-draft-p-min")]
+        [Description("Min draft probability for probabilistic accept under sampling (default: 0, disabled). Requires --temp > 0 and N>1; issue #38.")]
+        [DefaultValue(0.0f)]
+        public float SpecDraftPMin { get; init; }
 
         [CommandOption("--min-batch-blas")]
         [Description("Minimum batch size to use OpenBLAS SGEMM in MatMulBatched (default: 16, crossover for Q4_K_M weights). Also settable via SHARPI_MIN_BATCH_BLAS env var.")]
@@ -515,6 +520,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             RepetitionPenalty = settings.RepPenalty,
             SpecType = ParseSpecType(settings.SpecTypeStr),
             SpecDraftNMax = settings.SpecDraftNMax,
+            SpecDraftNMin = settings.SpecDraftNMin,
+            SpecDraftPMin = settings.SpecDraftPMin,
         };
         var rng = settings.Seed >= 0 ? new Random(settings.Seed) : new Random();
 
@@ -763,6 +770,23 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                         && sp.Temperature <= 0f
                         && noThinking
                         && !envDisabled;
+
+        // Spec flags require N>1 to be meaningful; reject early with a clear pointer
+        // to the issues that will lift these constraints. Auto and Mtp paths both
+        // enforce; None passes through (those flags are no-ops without spec decode).
+        if (sp.SpecType != SpecType.None)
+        {
+            if (sp.SpecDraftNMin > 0)
+            {
+                rejectReason = $"--spec-draft-n-min={sp.SpecDraftNMin} requires N>1 draft length (issue #30); not supported until #37 lands.";
+                return false;
+            }
+            if (sp.SpecDraftPMin > 0f)
+            {
+                rejectReason = $"--spec-draft-p-min={sp.SpecDraftPMin} requires probabilistic verify (T>0 + N>1); not supported until #38 lands.";
+                return false;
+            }
+        }
 
         switch (sp.SpecType)
         {

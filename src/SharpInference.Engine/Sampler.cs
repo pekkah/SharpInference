@@ -280,6 +280,22 @@ public sealed record SamplingParams
     /// + per-token GDN snapshot ring) lands; larger values error at decode time.
     /// </summary>
     public int SpecDraftNMax { get; init; } = 0;
+
+    /// <summary>
+    /// Min number of draft tokens per speculative step. Mirrors llama.cpp's
+    /// <c>--spec-draft-n-min</c>. 0 = no minimum. Has no effect today (sharpi
+    /// only supports N=1 draft on the MTP path); rejected at decode time when
+    /// non-zero. Issue #37.
+    /// </summary>
+    public int SpecDraftNMin { get; init; } = 0;
+
+    /// <summary>
+    /// Minimum draft probability for probabilistic accept under sampling. Mirrors
+    /// llama.cpp's <c>--spec-draft-p-min</c>. 0 = disabled (the current greedy
+    /// argmax-match path). Requires <c>Temperature &gt; 0</c> and N&gt;1 to be
+    /// meaningful; rejected at decode time otherwise. Issue #38.
+    /// </summary>
+    public float SpecDraftPMin { get; init; } = 0f;
 }
 
 /// <summary>Speculative-decoding type. Mirrors llama.cpp's <c>--spec-type</c>.</summary>
