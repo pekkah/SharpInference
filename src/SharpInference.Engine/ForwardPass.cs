@@ -342,8 +342,11 @@ public sealed unsafe class ForwardPass : IForwardPass
         if (N == 0) throw new ArgumentException("Token list is empty");
         if (N == 1) return Forward(tokens[0], startPos);
 
-        // MoE models: sequential prefill (batched FFN not yet supported for MoE)
-        if (_hp.IsMoE)
+        // MoE models: sequential prefill (batched FFN not yet supported for MoE).
+        // TurboQuant: PrefillCore writes to _kvCache, but decode reads from
+        // _tqKvCache — without sequential prefill the prompt never lands in the
+        // TQ cache and decode past the FP32 window reads OOB on Fp32KeyAt.
+        if (_hp.IsMoE || _tqKvCache != null)
         {
             ReadOnlySpan<float> logits = default;
             for (int i = 0; i < N; i++)
@@ -998,15 +1001,10 @@ public sealed unsafe class ForwardPass : IForwardPass
                 new ReadOnlySpan<float>(qHead, hd),
                 new Span<float>(headRotated, hd));
 
-            // Phase 1a: TQ-compressed positions
-            for (int t = 0; t < tqLen; t++)
-            {
-                byte* tqKey = tq.TqKeyAt(layer, t, kvHead);
-                float dot = keyCompressor.DequantDot(
-                    new ReadOnlySpan<byte>(tqKey, tqBlkSz),
-                    new ReadOnlySpan<float>(headRotated, hd));
-                headScores[t] = dot * scale;
-            }
+            // K-scoring via FastScan (issue #34): tile-walks full 32-position
+            // tiles through an i8-LUT pshufb kernel and falls back to per-block
+            // DequantDot on the <32 staging tail.
+            tq.ComputeKScores(layer, kvHead, headRotated, scale, headScores);
 
             // Phase 1b: FP32 window positions
             for (int t = fp32Start; t < seqLen; t++)

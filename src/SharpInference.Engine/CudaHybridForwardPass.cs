@@ -1010,14 +1010,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 new ReadOnlySpan<float>(qHead, hd),
                 new Span<float>(headRotated, hd));
 
-            for (int t = 0; t < tqLen; t++)
-            {
-                byte* tqKey = tq.TqKeyAt(ci, t, kvHead);
-                float dot = keyCompressor.DequantDot(
-                    new ReadOnlySpan<byte>(tqKey, tqBlkSz),
-                    new ReadOnlySpan<float>(headRotated, hd));
-                headScores[t] = dot * scale;
-            }
+            // FastScan K-scoring (issue #34) — see ForwardPass.cs for details.
+            tq.ComputeKScores(ci, kvHead, headRotated, scale, headScores);
 
             for (int t = fp32Start; t < seqLen; t++)
             {

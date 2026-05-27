@@ -34,12 +34,10 @@ public sealed class TurboQuantNeedleTests
 
         var scores = new float[seqLen];
 
-        for (int pos = 0; pos < tqLen; pos++)
-        {
-            byte* tqKey = cache.TqKeyAt(layer, pos, kvHead);
-            var keyBlock = new ReadOnlySpan<byte>(tqKey, cache.TqBlockSize);
-            scores[pos] = compressor.DequantDot(keyBlock, rotatedQuery);
-        }
+        // TQ scores via the FastScan-tiled K path (issue #34, Phase 2).
+        fixed (float* qPtr = rotatedQuery)
+        fixed (float* scoresPtr = scores)
+            cache.ComputeKScores(layer, kvHead, qPtr, attnScale: 1.0f, scoresPtr);
 
         for (int pos = tqLen; pos < seqLen; pos++)
         {

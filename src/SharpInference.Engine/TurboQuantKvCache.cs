@@ -22,14 +22,20 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     private readonly float*[] _fp32Keys;
     private readonly float*[] _fp32Values;
 
-    // Per-layer TQ compressed storage
-    private readonly byte*[] _tqKeys;
+    // Per-layer TQ compressed storage. Keys live in FastScan tile layout
+    // (one tile = 32 positions, contiguous per kv-head) with the in-flight
+    // 0..31 positions staged in per-block format. Values stay per-block —
+    // V-tile migration is Phase 3 of issue #34.
+    private readonly byte*[] _tqKeyTiles;     // [layer][numTiles * numKvHeads * _tileBytes]
+    private readonly byte*[] _tqKeyStaging;   // [layer][numKvHeads * TileSize * _tqBlockSize]
     private readonly byte*[] _tqValues;
     private readonly KvCacheCompressor[][] _keyCompressors;   // [layer][kvHead]
     private readonly KvCacheCompressor[][] _valueCompressors;
 
-    private readonly int _tqBlockSize;   // bytes per compressed block per KV head
-    private readonly int _tqBytesPerPosition; // tqBlockSize * numKvHeads
+    private readonly int _tqBlockSize;       // bytes per compressed block per KV head
+    private readonly int _tqBytesPerPosition; // tqBlockSize * numKvHeads (V-side only now)
+    private readonly int _tileBytes;          // FastScan.TileBytes(_headDim) per (tile, head)
+    private readonly int _stagingBytesPerHead; // TileSize * _tqBlockSize
     private readonly int _bits;
 
     private int _totalLength;    // total positions stored (TQ + FP32)
@@ -54,6 +60,8 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     public int NumKvHeads => _numKvHeads;
     public int TqBlockSize => _tqBlockSize;
     public int Bits => _bits;
+    public int TileBytes => _tileBytes;
+    public int FastScanTileSize => SharpInference.TurboQuant.FastScan.TileSize;
 
     public TurboQuantKvCache(int numLayers, int maxSeqLen, int numKvHeads, int headDim,
         int fp32WindowSize = 256, int bits = 3, int layerIndexBase = 0, int totalLayerCountForSeeds = 0)
@@ -67,6 +75,8 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
         _bits = bits;
         _tqBlockSize = TurboQuantOps.BlockSize(bits, headDim);
         _tqBytesPerPosition = _tqBlockSize * numKvHeads;
+        _tileBytes = SharpInference.TurboQuant.FastScan.TileBytes(headDim);
+        _stagingBytesPerHead = SharpInference.TurboQuant.FastScan.TileSize * _tqBlockSize;
         if (totalLayerCountForSeeds == 0)
             totalLayerCountForSeeds = numLayers;
         _layerTqLengths = new int[numLayers];
@@ -81,19 +91,27 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
             _fp32Values[i] = (float*)NativeMemory.AllocZeroed(fp32Bytes);
         }
 
-        // TQ compressed storage per layer
+        // TQ compressed storage per layer.
+        // Keys: tile storage (numTiles × numKvHeads × _tileBytes per layer) +
+        //       staging in per-block layout for the in-flight <32 positions.
+        // Values: per-block layout (Phase 3 will migrate this to V-tile).
         int maxTqPositions = maxSeqLen - fp32WindowSize;
         if (maxTqPositions < 0) maxTqPositions = 0;
+        int maxTiles = (maxTqPositions + SharpInference.TurboQuant.FastScan.TileSize - 1) / SharpInference.TurboQuant.FastScan.TileSize;
 
-        _tqKeys = new byte*[numLayers];
-        _tqValues = new byte*[numLayers];
+        _tqKeyTiles   = new byte*[numLayers];
+        _tqKeyStaging = new byte*[numLayers];
+        _tqValues     = new byte*[numLayers];
         if (maxTqPositions > 0)
         {
-            var tqBytes = (nuint)((long)maxTqPositions * _tqBytesPerPosition);
+            var valBytes      = (nuint)((long)maxTqPositions * _tqBytesPerPosition);
+            var keyTileBytes  = (nuint)((long)maxTiles * numKvHeads * _tileBytes);
+            var keyStageBytes = (nuint)((long)numKvHeads * _stagingBytesPerHead);
             for (int i = 0; i < numLayers; i++)
             {
-                _tqKeys[i] = (byte*)NativeMemory.AllocZeroed(tqBytes);
-                _tqValues[i] = (byte*)NativeMemory.AllocZeroed(tqBytes);
+                _tqKeyTiles[i]   = (byte*)NativeMemory.AllocZeroed(keyTileBytes);
+                _tqKeyStaging[i] = (byte*)NativeMemory.AllocZeroed(keyStageBytes);
+                _tqValues[i]     = (byte*)NativeMemory.AllocZeroed(valBytes);
             }
         }
 
@@ -180,14 +198,33 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     }
 
     /// <summary>
-    /// Returns a pointer to the TQ-compressed key block at the given position and KV head.
-    /// Only valid for positions in the TQ region (position &lt; TqLength).
+    /// Pointer to a FastScan K-tile (32 positions × one kv-head). Tile index
+    /// is 0..NumKeyTiles(layer)-1; positions beyond <c>NumKeyTiles × 32</c> are
+    /// in the staging buffer and accessed via <see cref="KeyStagingBlockAt"/>.
     /// </summary>
-    public byte* TqKeyAt(int layer, int position, int kvHead)
+    public byte* KeyTileAt(int layer, int tileIdx, int kvHead)
     {
-        long byteOffset = (long)position * _tqBytesPerPosition + kvHead * _tqBlockSize;
-        return _tqKeys[layer] + byteOffset;
+        long byteOffset = ((long)tileIdx * _numKvHeads + kvHead) * _tileBytes;
+        return _tqKeyTiles[layer] + byteOffset;
     }
+
+    /// <summary>
+    /// Pointer to one per-block compressed key in the in-flight staging buffer.
+    /// Valid for <c>stagingIdx in 0..KeyStagingCount(layer)-1</c>.
+    /// </summary>
+    public byte* KeyStagingBlockAt(int layer, int stagingIdx, int kvHead)
+    {
+        long byteOffset = (long)kvHead * _stagingBytesPerHead + stagingIdx * _tqBlockSize;
+        return _tqKeyStaging[layer] + byteOffset;
+    }
+
+    /// <summary>Number of complete FastScan tiles for this layer's K cache.</summary>
+    public int NumKeyTiles(int layer) =>
+        _layerTqLengths[layer] / SharpInference.TurboQuant.FastScan.TileSize;
+
+    /// <summary>Number of positions currently in the staging buffer (0..31).</summary>
+    public int KeyStagingCount(int layer) =>
+        _layerTqLengths[layer] % SharpInference.TurboQuant.FastScan.TileSize;
 
     /// <summary>
     /// Returns a pointer to the TQ-compressed value block at the given position and KV head.
@@ -240,8 +277,77 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     {
         long fp32Bytes = (long)_numLayers * 2 * _fp32WindowSize * _kvDim * sizeof(float);
         int maxTqPositions = _maxSeqLen - _fp32WindowSize;
-        long tqBytes = maxTqPositions > 0 ? (long)_numLayers * 2 * maxTqPositions * _tqBytesPerPosition : 0;
-        return fp32Bytes + tqBytes;
+        if (maxTqPositions <= 0) return fp32Bytes;
+
+        int maxTiles = (maxTqPositions + SharpInference.TurboQuant.FastScan.TileSize - 1)
+                       / SharpInference.TurboQuant.FastScan.TileSize;
+        long keyTileBytes  = (long)_numLayers * maxTiles * _numKvHeads * _tileBytes;
+        long keyStageBytes = (long)_numLayers * _numKvHeads * _stagingBytesPerHead;
+        long valBytes      = (long)_numLayers * maxTqPositions * _tqBytesPerPosition;
+        return fp32Bytes + keyTileBytes + keyStageBytes + valBytes;
+    }
+
+    /// <summary>
+    /// Compute K-scores (q·k for all TQ-compressed positions) for one
+    /// (layer, kv-head). Walks complete FastScan tiles via the i8 LUT kernel
+    /// and the staging tail via per-block <c>DequantDot</c>. Final score per
+    /// position is multiplied by <paramref name="attnScale"/>.
+    /// </summary>
+    /// <param name="rotatedQuery">Pre-rotated query (caller invokes
+    /// <see cref="KvCacheCompressor.RotateQuery"/> once per head).</param>
+    /// <param name="attnScale">Attention scale, typically 1/√headDim.</param>
+    /// <param name="scoresOut">Output buffer, length ≥ <c>TqLength</c>.</param>
+    public void ComputeKScores(
+        int layer,
+        int kvHead,
+        float* rotatedQuery,
+        float attnScale,
+        float* scoresOut)
+    {
+        int hd = _headDim;
+        int totalTq = _layerTqLengths[layer];
+        int numFullTiles = totalTq / SharpInference.TurboQuant.FastScan.TileSize;
+        int stagingCount = totalTq % SharpInference.TurboQuant.FastScan.TileSize;
+
+        var centroids = SharpInference.TurboQuant.TurboQuantCodebooks.GetCentroids(_bits, hd);
+
+        // Per-query LUT, stack-allocated for the head dims we ship today
+        // (128 and 256 — capped at 4096 bytes here).
+        Span<sbyte> lut = stackalloc sbyte[256 * 16];
+        lut = lut.Slice(0, hd * 16);
+
+        float lutScale = _bits == 4
+            ? SharpInference.TurboQuant.FastScan.BuildLut4Bit(
+                new ReadOnlySpan<float>(rotatedQuery, hd), centroids, lut, hd)
+            : SharpInference.TurboQuant.FastScan.BuildLut3Bit(
+                new ReadOnlySpan<float>(rotatedQuery, hd), centroids, lut, hd);
+
+        fixed (sbyte* lutPtr = lut)
+        {
+            for (int tileIdx = 0; tileIdx < numFullTiles; tileIdx++)
+            {
+                byte* tile = KeyTileAt(layer, tileIdx, kvHead);
+                SharpInference.TurboQuant.FastScan.KScoreTile4BitAvx2(
+                    tile, lutPtr, lutScale, attnScale,
+                    scoresOut + (long)tileIdx * SharpInference.TurboQuant.FastScan.TileSize,
+                    hd);
+            }
+        }
+
+        if (stagingCount > 0)
+        {
+            var keyCompressor = _keyCompressors[layer][kvHead];
+            var rotatedQuerySpan = new ReadOnlySpan<float>(rotatedQuery, hd);
+            int tailStart = numFullTiles * SharpInference.TurboQuant.FastScan.TileSize;
+            for (int s = 0; s < stagingCount; s++)
+            {
+                byte* block = KeyStagingBlockAt(layer, s, kvHead);
+                float dot = keyCompressor.DequantDot(
+                    new ReadOnlySpan<byte>(block, _tqBlockSize),
+                    rotatedQuerySpan);
+                scoresOut[tailStart + s] = dot * attnScale;
+            }
+        }
     }
 
     private void CompressOldestFp32(int layer)
@@ -251,31 +357,54 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
         int fp32Slot = 0;
         long fp32Offset = (long)fp32Slot * _kvDim;
 
-        // Compress each KV head independently
+        int stagingSlot = _layerTqLengths[layer] % SharpInference.TurboQuant.FastScan.TileSize;
+
+        // Compress each KV head independently. Keys go to the staging slot;
+        // values continue using the existing per-block layout.
         for (int head = 0; head < _numKvHeads; head++)
         {
             int headOffset = head * _headDim;
             var keySpan = new ReadOnlySpan<float>(_fp32Keys[layer] + fp32Offset + headOffset, _headDim);
             var valSpan = new ReadOnlySpan<float>(_fp32Values[layer] + fp32Offset + headOffset, _headDim);
 
-            long tqOffset = (long)_layerTqLengths[layer] * _tqBytesPerPosition + head * _tqBlockSize;
-            var keyDest = new Span<byte>(_tqKeys[layer] + tqOffset, _tqBlockSize);
-            var valDest = new Span<byte>(_tqValues[layer] + tqOffset, _tqBlockSize);
+            long stagingOffset = (long)head * _stagingBytesPerHead + (long)stagingSlot * _tqBlockSize;
+            var keyDest = new Span<byte>(_tqKeyStaging[layer] + stagingOffset, _tqBlockSize);
+
+            long valOffset = (long)_layerTqLengths[layer] * _tqBytesPerPosition + head * _tqBlockSize;
+            var valDest = new Span<byte>(_tqValues[layer] + valOffset, _tqBlockSize);
 
             _keyCompressors[layer][head].Compress(keySpan, keyDest);
             _valueCompressors[layer][head].Compress(valSpan, valDest);
         }
 
+        _layerTqLengths[layer]++;
+
+        // If the staging buffer just filled, pack it into a new K-tile.
+        // Per-head staging is contiguous, so PackTile reads it directly.
+        if (_layerTqLengths[layer] % SharpInference.TurboQuant.FastScan.TileSize == 0)
+        {
+            int tileIdx = _layerTqLengths[layer] / SharpInference.TurboQuant.FastScan.TileSize - 1;
+            for (int head = 0; head < _numKvHeads; head++)
+            {
+                var stageSpan = new ReadOnlySpan<byte>(
+                    _tqKeyStaging[layer] + (long)head * _stagingBytesPerHead,
+                    _stagingBytesPerHead);
+                var tileSpan = new Span<byte>(KeyTileAt(layer, tileIdx, head), _tileBytes);
+                if (_bits == 4)
+                    SharpInference.TurboQuant.FastScan.PackTile4Bit(stageSpan, tileSpan, _headDim);
+                else
+                    SharpInference.TurboQuant.FastScan.PackTile3Bit(stageSpan, tileSpan, _headDim);
+            }
+        }
+
         // Shift FP32 window: move remaining entries down by 1
-        int fp32Count = _totalLength - _layerTqLengths[layer];
+        int fp32Count = _totalLength - (_layerTqLengths[layer] - 1);
         if (fp32Count > 1)
         {
             long copyBytes = (long)(fp32Count - 1) * _kvDim * sizeof(float);
             Buffer.MemoryCopy(_fp32Keys[layer] + _kvDim, _fp32Keys[layer], copyBytes, copyBytes);
             Buffer.MemoryCopy(_fp32Values[layer] + _kvDim, _fp32Values[layer], copyBytes, copyBytes);
         }
-
-        _layerTqLengths[layer]++;
     }
 
     public void Dispose()
@@ -288,8 +417,9 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
             NativeMemory.Free(_fp32Values[i]);
             _fp32Keys[i] = null;
             _fp32Values[i] = null;
-            if (_tqKeys[i] != null) { NativeMemory.Free(_tqKeys[i]); _tqKeys[i] = null; }
-            if (_tqValues[i] != null) { NativeMemory.Free(_tqValues[i]); _tqValues[i] = null; }
+            if (_tqKeyTiles[i]   != null) { NativeMemory.Free(_tqKeyTiles[i]);   _tqKeyTiles[i]   = null; }
+            if (_tqKeyStaging[i] != null) { NativeMemory.Free(_tqKeyStaging[i]); _tqKeyStaging[i] = null; }
+            if (_tqValues[i]     != null) { NativeMemory.Free(_tqValues[i]);     _tqValues[i]     = null; }
         }
     }
 }
