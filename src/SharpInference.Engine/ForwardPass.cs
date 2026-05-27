@@ -1017,17 +1017,11 @@ public sealed unsafe class ForwardPass : IForwardPass
 
             for (int d = 0; d < hd; d++) outHead[d] = 0;
 
-            var valCompressor = tq.GetValueCompressor(layer, kvHead);
-            for (int t = 0; t < tqLen; t++)
-            {
-                byte* tqVal = tq.TqValueAt(layer, t, kvHead);
-                valCompressor.Decompress(
-                    new ReadOnlySpan<byte>(tqVal, tqBlkSz),
-                    new Span<float>(headDecomp, hd));
-                float w = headScores[t];
-                for (int d = 0; d < hd; d++)
-                    outHead[d] += w * headDecomp[d];
-            }
+            // FastScan V-aggregation (issue #34 Phase 3): tile-walks the
+            // TQ-compressed positions with deferred sign-flip + IWHT, then
+            // the FP32-window loop below accumulates the recent positions
+            // on top in the original domain.
+            tq.ComputeVAggregation(layer, kvHead, headScores, outHead);
 
             for (int t = fp32Start; t < seqLen; t++)
             {

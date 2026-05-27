@@ -1009,17 +1009,8 @@ public sealed unsafe class HybridForwardPass : IForwardPass
 
             for (int d = 0; d < hd; d++) outHead[d] = 0;
 
-            var valCompressor = tq.GetValueCompressor(ci, kvHead);
-            for (int t = 0; t < tqLen; t++)
-            {
-                byte* tqVal = tq.TqValueAt(ci, t, kvHead);
-                valCompressor.Decompress(
-                    new ReadOnlySpan<byte>(tqVal, tqBlkSz),
-                    new Span<float>(headDecomp, hd));
-                float w = headScores[t];
-                for (int d = 0; d < hd; d++)
-                    outHead[d] += w * headDecomp[d];
-            }
+            // FastScan V-aggregation (issue #34 Phase 3) — see ForwardPass.cs.
+            tq.ComputeVAggregation(ci, kvHead, headScores, outHead);
 
             for (int t = fp32Start; t < seqLen; t++)
             {
