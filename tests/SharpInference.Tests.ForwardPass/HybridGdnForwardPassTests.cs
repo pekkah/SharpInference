@@ -372,19 +372,33 @@ public sealed class HybridGdnForwardPassTests
 
     /// <summary>
     /// End-to-end MTP self-parity: greedy decode through <see cref="InferenceEngine"/>
-    /// with MTP routing enabled must produce the SAME token sequence as the same
-    /// decode with <c>SHARPI_DISABLE_MTP=1</c> on the same model and prompt.
+    /// with SEQUENTIAL (N=1) MTP routing must produce the SAME token sequence as
+    /// the same decode with <c>SHARPI_DISABLE_MTP=1</c> on the same model and prompt.
     /// </summary>
     /// <remarks>
     /// <para>
     /// Why this is a meaningful parity check without llama.cpp: under greedy
-    /// sampling, every emitted token is either (a) <c>t1 = argmax(saved_main_logits)</c>
-    /// or (b) <c>t2 = (t2_target == t2_draft) ? t2_draft : t2_target</c>. Since
-    /// <c>t2_target = argmax(main_logits_after_t1)</c> and the t2-emission
+    /// sampling with sequential MTP, every emitted token is either
+    /// (a) <c>t1 = argmax(saved_main_logits)</c> or
+    /// (b) <c>t2 = (t2_target == t2_draft) ? t2_draft : t2_target</c>.
+    /// Since <c>t2_target = argmax(main_logits_after_t1)</c> and the t2-emission
     /// formula reduces to <c>t2_target</c> regardless of MTP acceptance, MTP
     /// must never alter the emitted sequence. Any divergence indicates the
     /// MTP forward path is corrupting main state (KV cache, GDN state, scratch
     /// buffers, or _hidden).
+    /// </para>
+    /// <para>
+    /// Batched verify (issue #30 — N=2 <c>BatchForward2</c>) is INTENTIONALLY
+    /// disabled via <c>SHARPI_DISABLE_BATCH_VERIFY=1</c> for this test. That path
+    /// uses <c>MatVec2In</c> (single row decode + fused FMA against both inputs)
+    /// where the per-token path uses <c>MatVecDual</c> (separate dot per input).
+    /// The two are mathematically equivalent but differ in FMA accumulation order
+    /// at the bit level, so on borderline argmax cases (e.g. Qwen3.6-MTP's
+    /// well-known "thinking-or-not" branch right after <c>&lt;think&gt;\n</c>)
+    /// the top-2 can swap. That's an expected property of the batched kernel,
+    /// not a state-leak bug, and it's what this test would otherwise alarm on.
+    /// MTP greedy parity vs llama.cpp (<see cref="MtpDecoder_GreedyParity_LlamaCpp"/>)
+    /// covers the batched path under a different, more forgiving check.
     /// </para>
     /// <para>
     /// The test silently skips when the 27B-MTP file isn't on disk so CI on
@@ -415,26 +429,34 @@ public sealed class HybridGdnForwardPassTests
         var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 12 };
         const string prompt = "The capital of France is";
 
-        // ── Run 1: MTP path (default — SHARPI_DISABLE_MTP not set) ──────
-        var withMtp = new StringBuilder();
-        await foreach (var s in engine.GenerateAsync(prompt, sp))
-            withMtp.Append(s);
-
-        // ── Run 2: baseline (MTP disabled via env var) ──────────────────
-        Environment.SetEnvironmentVariable("SHARPI_DISABLE_MTP", "1");
+        // Force sequential MTP for this test (see XML doc above). Both runs see
+        // the same env var; SHARPI_DISABLE_MTP wins inside the run-2 try block.
+        Environment.SetEnvironmentVariable("SHARPI_DISABLE_BATCH_VERIFY", "1");
         try
         {
-            engine.GetType();   // suppress 'unused' analyzer; the env-var read
-                                // happens on each GenerateAsync call.
-            var withoutMtp = new StringBuilder();
+            // ── Run 1: sequential MTP (SHARPI_DISABLE_MTP not set) ───────
+            var withMtp = new StringBuilder();
             await foreach (var s in engine.GenerateAsync(prompt, sp))
-                withoutMtp.Append(s);
+                withMtp.Append(s);
 
-            Assert.Equal(withoutMtp.ToString(), withMtp.ToString());
+            // ── Run 2: baseline (MTP disabled via env var) ──────────────
+            Environment.SetEnvironmentVariable("SHARPI_DISABLE_MTP", "1");
+            try
+            {
+                var withoutMtp = new StringBuilder();
+                await foreach (var s in engine.GenerateAsync(prompt, sp))
+                    withoutMtp.Append(s);
+
+                Assert.Equal(withoutMtp.ToString(), withMtp.ToString());
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("SHARPI_DISABLE_MTP", null);
+            }
         }
         finally
         {
-            Environment.SetEnvironmentVariable("SHARPI_DISABLE_MTP", null);
+            Environment.SetEnvironmentVariable("SHARPI_DISABLE_BATCH_VERIFY", null);
         }
     }
 
