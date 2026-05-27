@@ -131,6 +131,46 @@ public interface IForwardPass : IDisposable
     /// <remarks>Default is a no-op so non-MTP forward passes need no override.</remarks>
     void PrefillMtp(IReadOnlyList<int> tokens, int startPos = 0) { }
 
+    /// <summary>
+    /// True when this pass implements a batched two-token verify path (issue #30).
+    /// Callers (<see cref="MtpDecoder"/>) dispatch to <see cref="BatchForward2"/> on
+    /// the hybrid GDN passes where it pays off; everything else stays on the
+    /// sequential N=1 algorithm.
+    /// </summary>
+    bool SupportsBatchVerify => false;
+
+    /// <summary>
+    /// Last completed <see cref="BatchForward2"/>'s token-1 pre-output-norm hidden.
+    /// Used by the MTP commit step on the batched verify path. Empty when no batched
+    /// forward has been run.
+    /// </summary>
+    ReadOnlySpan<float> LastHiddenT1 => default;
+
+    /// <summary>
+    /// Two-token batched forward (issue #30). On entry both caches must be at length
+    /// <paramref name="startPos"/>. On return both caches are at length
+    /// <c>startPos + 2</c>, <see cref="LastHidden"/> holds h@startPos+1, and
+    /// <see cref="LastHiddenT1"/> holds h@startPos. A per-layer GDN snapshot is
+    /// captured at the "between t1 and t2" point so a rejected draft can be rolled
+    /// back via <see cref="RestoreBatchSnapshot"/>.
+    /// </summary>
+    void BatchForward2(int t1, int t2, int startPos,
+        out ReadOnlySpan<float> logits1, out ReadOnlySpan<float> logits2) =>
+        throw new NotSupportedException(
+            $"{GetType().Name} does not implement BatchForward2. " +
+            "Check SupportsBatchVerify before calling.");
+
+    /// <summary>
+    /// Roll caches back to <paramref name="lengthAfter"/> using the snapshot taken
+    /// in the most recent <see cref="BatchForward2"/>. Called by the MTP decoder
+    /// when the t2 draft is rejected; the follow-up <see cref="Forward"/> with the
+    /// corrected token then advances state back to <c>startPos + 2</c>.
+    /// </summary>
+    void RestoreBatchSnapshot(int lengthAfter) =>
+        throw new NotSupportedException(
+            $"{GetType().Name} does not implement RestoreBatchSnapshot. " +
+            "Check SupportsBatchVerify before calling.");
+
     /// <summary>Reset the MTP attention KV cache. No-op when <see cref="HasMtpHead"/> is false.</summary>
     void MtpResetCache() { }
 

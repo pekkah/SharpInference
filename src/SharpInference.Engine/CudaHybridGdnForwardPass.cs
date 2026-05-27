@@ -268,6 +268,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // GPU FFN scratch (allocated only when at least one layer is on GPU).
     private Tensor? _gpuFfnGateBufDense;      // [_intermDim] f32
     private Tensor? _gpuFfnUpBufDense;        // [_intermDim] f32
+    // Token-2 GPU FFN scratch for the batched verify path (issue #30). Lazy-allocated
+    // alongside the token-1 buffers so the GPU dense FFN can be invoked per token.
+    private Tensor? _gpuFfnGateBufDense2;     // [_intermDim] f32
+    private Tensor? _gpuFfnUpBufDense2;       // [_intermDim] f32
     private int _denseFfnGpuLayers;           // count of layers with FFN on GPU (diagnostic)
     private readonly float* _cpuFfnGateBuf;            // [_intermDim] scratch
     private readonly float* _cpuFfnUpBuf;              // [_intermDim] scratch
@@ -315,6 +319,27 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // Host LastHidden buffer; refreshed via Download after each main Forward so
     // IForwardPass.LastHidden returns a host span without an extra device read.
     private readonly float* _lastHidden;
+
+    // ── Issue #30 batched-verify scratch (only when _hasMtp && !IsMoE) ─
+    // Mirrors HybridGdnForwardPass; the second token gets its own residual
+    // stream + norm buffer + output logits. Attn/GDN scratch is reused
+    // across t1 and t2 within a layer iteration (sequential block calls).
+    private readonly Tensor _gpuHidden2;          // [embDim]
+    private readonly Tensor _gpuResidual2;        // [embDim]
+    private readonly Tensor _gpuNormBuf2;         // [embDim]
+    private readonly Tensor _gpuLogits2;          // [vocabSize]
+    private readonly Tensor _gpuLastHiddenT1;     // [embDim] — h@startPos for the MTP commit
+    private readonly float[] _logitsBuf2;         // host download for token 2 logits
+    private readonly float* _cpuNormBuf2;         // [embDim] — t2's norm download for CPU FFN path
+    private readonly float* _cpuMoeHidden2;       // [embDim] — t2's CPU FFN output
+    private readonly float* _lastHiddenT1;        // [embDim] — host span for the t1 hidden
+
+    private byte* _batchSnapshotBuf;
+    private long _batchSnapshotCap;
+    private bool _batchSnapshotValid;
+    // Token-2 host FFN scratch (intermediate gate/up post-MatVec2In, pre-SiLuMul).
+    private readonly float* _cpuFfnGateBuf2;
+    private readonly float* _cpuFfnUpBuf2;
 
     // Issue #33: host-side buffer of per-position pre-output-norm hiddens captured
     // during Prefill. Consumed by PrefillMtp to drive MtpForward at each prompt
@@ -819,6 +844,41 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 _gpuFfnUpBufDense   = gpu.Allocate(TensorShape.D1(_intermDim));
             }
 
+            // Issue #30 batched-verify scratch (dense FFN MTP only). Mirrors the
+            // CPU pass: token-2 gets its own residual stream + norm + logits +
+            // a token-1 hidden snapshot for the MTP commit step.
+            if (!hp.IsMoE)
+            {
+                _gpuHidden2      = gpu.Allocate(TensorShape.D1(_embDim));
+                _gpuResidual2    = gpu.Allocate(TensorShape.D1(_embDim));
+                _gpuNormBuf2     = gpu.Allocate(TensorShape.D1(_embDim));
+                _gpuLogits2      = gpu.Allocate(TensorShape.D1(_hp.VocabSize));
+                _gpuLastHiddenT1 = gpu.Allocate(TensorShape.D1(_embDim));
+                _gpuFfnGateBufDense2 = gpu.Allocate(TensorShape.D1(_intermDim));
+                _gpuFfnUpBufDense2   = gpu.Allocate(TensorShape.D1(_intermDim));
+                _logitsBuf2      = new float[_hp.VocabSize];
+                _cpuNormBuf2     = Alloc(_embDim);
+                _cpuMoeHidden2   = Alloc(_embDim);
+                _lastHiddenT1    = Alloc(_embDim);
+                _cpuFfnGateBuf2  = Alloc(_intermDim);
+                _cpuFfnUpBuf2    = Alloc(_intermDim);
+
+                long perLayerBytes = _gdnStateCache.LayerSnapshotBytes;
+                long totalSnapBytes = perLayerBytes * _gdnStateCache.NumGdnLayers;
+                if (totalSnapBytes > 0)
+                {
+                    _batchSnapshotBuf = (byte*)NativeMemory.Alloc((nuint)totalSnapBytes);
+                    _batchSnapshotCap = totalSnapBytes;
+                }
+            }
+            else
+            {
+                _gpuHidden2 = _gpuResidual2 = _gpuNormBuf2 =
+                    _gpuLogits2 = _gpuLastHiddenT1 = null!;
+                _logitsBuf2 = Array.Empty<float>();
+                _cpuNormBuf2 = _cpuMoeHidden2 = _lastHiddenT1 = null;
+            }
+
             TraceVram("after MTP head upload");
         }
         else
@@ -833,6 +893,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 _gpuMtpEmbedBuf = _gpuMtpEnormBuf = _gpuMtpHnormBuf =
                 _gpuMtpConcatBuf = _gpuLastHidden = null!;
             _lastHidden = null;
+
+            _gpuHidden2 = _gpuResidual2 = _gpuNormBuf2 =
+                _gpuLogits2 = _gpuLastHiddenT1 = null!;
+            _logitsBuf2 = Array.Empty<float>();
+            _cpuNormBuf2 = _cpuMoeHidden2 = _lastHiddenT1 = null;
         }
     }
 
@@ -1138,44 +1203,216 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     }
 
     // =================================================================
+    //  BatchForward2 — MTP batched verify (issue #30, CUDA mirror of
+    //  HybridGdnForwardPass.BatchForward2). Bandwidth win lives in
+    //  CpuDenseFfn2 (MatVec2In on the CPU mmap FFN); GPU attn/GDN run
+    //  sequentially per token — no cuBLAS batched GEMM here since most
+    //  27B-MTP layers are CPU FFN under realistic 12 GB VRAM budgets.
+    // =================================================================
+
+    /// <inheritdoc />
+    public bool SupportsBatchVerify => _hasMtp && !_hp.IsMoE;
+
+    /// <inheritdoc />
+    public ReadOnlySpan<float> LastHiddenT1 =>
+        _lastHiddenT1 != null ? new ReadOnlySpan<float>(_lastHiddenT1, _embDim) : default;
+
+    /// <inheritdoc />
+    public void BatchForward2(int t1, int t2, int startPos,
+        out ReadOnlySpan<float> logits1, out ReadOnlySpan<float> logits2)
+    {
+        if (!SupportsBatchVerify)
+            throw new InvalidOperationException(
+                "BatchForward2 is only supported on dense-FFN MTP passes. " +
+                "Check SupportsBatchVerify before calling.");
+        if (startPos < 0)
+            throw new ArgumentOutOfRangeException(nameof(startPos), startPos, "startPos must be >= 0.");
+        if (_kvCache.Length != startPos)
+            throw new InvalidOperationException(
+                $"BatchForward2: _kvCache.Length={_kvCache.Length} != startPos={startPos}.");
+        if (_gdnStateCache.Length != startPos)
+            throw new InvalidOperationException(
+                $"BatchForward2: _gdnStateCache.Length={_gdnStateCache.Length} != startPos={startPos}.");
+
+        // 1. Embed both tokens into independent residual streams.
+        EmbedToken(_gpuHidden,  t1);
+        EmbedToken(_gpuHidden2, t2);
+
+        // 2. Reserve KV blocks covering both positions on the CPU-side block table.
+        _kvCache.ReserveBlockAt(startPos);
+        _kvCache.ReserveBlockAt(startPos + 1);
+
+        _batchSnapshotValid = false;
+        long layerSnapBytes = _gdnStateCache.LayerSnapshotBytes;
+
+        // 3. Trunk layers — sequential per-token attn/GDN within a layer, then
+        //    batched CPU FFN (where the weight-bandwidth win lives), or two
+        //    sequential GPU dense FFNs (GPU layers benefit from L2 weight reuse
+        //    between the two MatMuls).
+        for (int layer = 0; layer < _hp.NumLayers; layer++)
+        {
+            // Pre-block residual + attn-norm for both.
+            _gpu.CopyDevice(_gpuResidual,  _gpuHidden);
+            _gpu.CopyDevice(_gpuResidual2, _gpuHidden2);
+            _gpu.RmsNorm(_gpuNormBuf,  _gpuHidden,  _gpuAttnNorm[layer], _hp.RmsNormEps);
+            _gpu.RmsNorm(_gpuNormBuf2, _gpuHidden2, _gpuAttnNorm[layer], _hp.RmsNormEps);
+
+            bool isAttn = _hp.LayerTypes![layer] == LayerType.Attention;
+            if (isAttn)
+            {
+                GpuAttnBlockAt(layer, position: startPos,     kvPosition: startPos,
+                               normIn: _gpuNormBuf,  hiddenOut: _gpuHidden);
+                GpuAttnBlockAt(layer, position: startPos + 1, kvPosition: startPos + 1,
+                               normIn: _gpuNormBuf2, hiddenOut: _gpuHidden2);
+            }
+            else if (_cpuGdn)
+            {
+                CpuGdnBlockAt(layer, position: startPos,     normInGpu: _gpuNormBuf,
+                              hiddenOutGpu: _gpuHidden, cpuNormScratch: _cpuNormBuf,
+                              cpuHiddenScratch: _cpuHiddenOut);
+                // Snapshot this layer's GDN state right after t1's CPU GDN update.
+                int gdnIdx = _gdnStateCache.GdnLayerOf(layer);
+                _gdnStateCache.SnapshotLayerInto(gdnIdx,
+                    _batchSnapshotBuf + (long)gdnIdx * layerSnapBytes,
+                    layerSnapBytes);
+                CpuGdnBlockAt(layer, position: startPos + 1, normInGpu: _gpuNormBuf2,
+                              hiddenOutGpu: _gpuHidden2, cpuNormScratch: _cpuNormBuf2,
+                              cpuHiddenScratch: _cpuMoeHidden2);
+            }
+            else
+            {
+                GpuGdnBlockAt(layer, position: startPos,     normIn: _gpuNormBuf,  hiddenOut: _gpuHidden);
+                int gdnIdx = _gdnStateCache.GdnLayerOf(layer);
+                _gdnStateCache.SnapshotLayerInto(gdnIdx,
+                    _batchSnapshotBuf + (long)gdnIdx * layerSnapBytes,
+                    layerSnapBytes);
+                GpuGdnBlockAt(layer, position: startPos + 1, normIn: _gpuNormBuf2, hiddenOut: _gpuHidden2);
+            }
+
+            // Residual add for both.
+            _gpu.AddInPlace(_gpuHidden,  _gpuResidual);
+            _gpu.AddInPlace(_gpuHidden2, _gpuResidual2);
+
+            // Pre-FFN residual + post-norm for both.
+            _gpu.CopyDevice(_gpuResidual,  _gpuHidden);
+            _gpu.CopyDevice(_gpuResidual2, _gpuHidden2);
+            _gpu.RmsNorm(_gpuNormBuf,  _gpuHidden,  _gpuPostAttnNorm[layer], _hp.RmsNormEps);
+            _gpu.RmsNorm(_gpuNormBuf2, _gpuHidden2, _gpuPostAttnNorm[layer], _hp.RmsNormEps);
+
+            // Dense FFN: GPU-resident layer → two sequential GpuDenseFfns (L2 reuse).
+            //            CPU mmap layer    → batched CpuDenseFfn2 (MatVec2In win).
+            if (_gpuWFfnGate is not null && _gpuWFfnGate[layer] is not null)
+            {
+                GpuDenseFfnAt(layer, normIn: _gpuNormBuf,  hiddenOut: _gpuHidden,
+                              gateBuf: _gpuFfnGateBufDense!, upBuf: _gpuFfnUpBufDense!);
+                GpuDenseFfnAt(layer, normIn: _gpuNormBuf2, hiddenOut: _gpuHidden2,
+                              gateBuf: _gpuFfnGateBufDense2!, upBuf: _gpuFfnUpBufDense2!);
+            }
+            else
+            {
+                _gpu.Download(_gpuNormBuf,  new Span<float>(_cpuNormBuf,  _embDim));
+                _gpu.Download(_gpuNormBuf2, new Span<float>(_cpuNormBuf2, _embDim));
+                CpuDenseFfn2(layer, _cpuNormBuf, _cpuNormBuf2,
+                             _cpuMoeHidden, _cpuMoeHidden2);
+                _gpu.UploadInto(_gpuHidden,  new ReadOnlySpan<float>(_cpuMoeHidden,  _embDim));
+                _gpu.UploadInto(_gpuHidden2, new ReadOnlySpan<float>(_cpuMoeHidden2, _embDim));
+            }
+
+            // Post-FFN residual add for both.
+            _gpu.AddInPlace(_gpuHidden,  _gpuResidual);
+            _gpu.AddInPlace(_gpuHidden2, _gpuResidual2);
+        }
+
+        // 4. Advance both caches by 2.
+        _kvCache.IncrementPosition();
+        _gdnStateCache.IncrementPosition();
+        _kvCache.IncrementPosition();
+        _gdnStateCache.IncrementPosition();
+
+        // 5. Snapshot pre-output-norm hiddens for MTP commit + next iter draft.
+        _gpu.CopyDevice(_gpuLastHiddenT1, _gpuHidden);
+        _gpu.CopyDevice(_gpuLastHidden,   _gpuHidden2);
+        _gpu.Download(_gpuLastHiddenT1, new Span<float>(_lastHiddenT1, _embDim));
+        _gpu.Download(_gpuLastHidden,   new Span<float>(_lastHidden,   _embDim));
+
+        // 6. Final norm + output projection for both tokens.
+        _gpu.RmsNorm(_gpuHidden,  _gpuHidden,  _gpuOutputNorm!, _hp.RmsNormEps);
+        _gpu.RmsNorm(_gpuHidden2, _gpuHidden2, _gpuOutputNorm!, _hp.RmsNormEps);
+        var outDt = _gpuWeightDTypes.TryGetValue(_gpuOutputWeight!.Handle, out var dt) ? dt : DType.Float32;
+        _gpu.MatMul(_gpuLogits,  _gpuOutputWeight!, _gpuHidden,  outDt);
+        _gpu.MatMul(_gpuLogits2, _gpuOutputWeight!, _gpuHidden2, outDt);
+
+        _gpu.Download(_gpuLogits,  _logitsBuf);
+        _gpu.Download(_gpuLogits2, _logitsBuf2);
+
+        _batchSnapshotValid = true;
+        logits1 = _logitsBuf;
+        logits2 = _logitsBuf2;
+    }
+
+    /// <inheritdoc />
+    public void RestoreBatchSnapshot(int lengthAfter)
+    {
+        if (!_batchSnapshotValid)
+            throw new InvalidOperationException(
+                "RestoreBatchSnapshot: no batched-verify snapshot is held. " +
+                "Call BatchForward2 first.");
+        if (lengthAfter < 0)
+            throw new ArgumentOutOfRangeException(nameof(lengthAfter), lengthAfter,
+                "lengthAfter must be >= 0.");
+
+        long layerSnapBytes = _gdnStateCache.LayerSnapshotBytes;
+        for (int gdnIdx = 0; gdnIdx < _gdnStateCache.NumGdnLayers; gdnIdx++)
+        {
+            _gdnStateCache.RestoreLayerFrom(gdnIdx,
+                _batchSnapshotBuf + (long)gdnIdx * layerSnapBytes,
+                layerSnapBytes);
+        }
+        _gdnStateCache.SetLength(lengthAfter);
+        _kvCache.TruncateTo(lengthAfter);
+        _batchSnapshotValid = false;
+    }
+
+    // =================================================================
     //  GPU attention block — GLU-gated Q, partial NEOX RoPE on first 64 dims
     // =================================================================
 
-    private void GpuAttnBlock(int layer, int position)
+    private void GpuAttnBlock(int layer, int position) =>
+        GpuAttnBlockAt(layer, position, kvPosition: position,
+                       normIn: _gpuNormBuf, hiddenOut: _gpuHidden);
+
+    /// <summary>
+    /// GPU attention block parameterised on input-norm / output-hidden tensors and
+    /// RoPE/KV position. Used by both <see cref="Forward"/> and <see cref="BatchForward2"/>.
+    /// </summary>
+    private void GpuAttnBlockAt(int layer, int position, int kvPosition,
+                                Tensor normIn, Tensor hiddenOut)
     {
         int kvDim = _numKvHeads * _headDim;
 
-        // 1. Project: attn_q → [Q‖G] interleaved per head (output qDim*2 = 8192).
-        GpuMatMul(_gpuQGate, _gpuWQGate[layer], _gpuNormBuf);
-        GpuMatMul(_gpuK, _gpuWK[layer], _gpuNormBuf);
-        GpuMatMul(_gpuV, _gpuWV[layer], _gpuNormBuf);
+        GpuMatMul(_gpuQGate, _gpuWQGate[layer], normIn);
+        GpuMatMul(_gpuK, _gpuWK[layer], normIn);
+        GpuMatMul(_gpuV, _gpuWV[layer], normIn);
 
-        // 2a. GPU strided de-interleave of [Q‖G] → _gpuQ, _gpuGate.
         _gpu.SplitQG(_gpuQ, _gpuGate, _gpuQGate, _numHeads, _headDim);
 
-        // 2b. Per-head RMSNorm on Q and K (qwen35moe attn_q_norm / attn_k_norm).
         _gpu.HeadNorm(_gpuQ, _gpuQNorm[layer], _numHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
         _gpu.HeadNorm(_gpuK, _gpuKNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
 
-        // 2c. Partial NEOX RoPE on Q and K (rotate first ropeDim of each head).
         _gpu.RoPEPartial(_gpuQ, position, _headDim, _ropeDim, _hp.RopeTheta, neox: true);
         _gpu.RoPEPartial(_gpuK, position, _headDim, _ropeDim, _hp.RopeTheta, neox: true);
 
-        // 3. Append K/V to GPU cache (position-indexed flat layout).
         _gpu.KvAppend(_gpuK, _gpuV, _gpuKCache[layer]!, _gpuVCache[layer]!,
-            kvDim, position, _maxSeqLen);
+            kvDim, kvPosition, _maxSeqLen);
 
-        // 4. Scaled dot-product attention.
         _gpu.Attention(_gpuQ, _gpuKCache[layer]!, _gpuVCache[layer]!, _gpuAttnOut,
             _gpuAttnScratch,
             _numHeads, _numKvHeads, _headDim,
-            (position + 1), _maxSeqLen);
+            (kvPosition + 1), _maxSeqLen);
 
-        // 5. Apply GLU gate: attn_out *= sigmoid(gate). Single fused kernel.
         _gpu.SigmoidMulInPlace(_gpuAttnOut, _gpuGate);
 
-        // 6. Output projection.
-        GpuMatMul(_gpuHidden, _gpuWO[layer], _gpuAttnOut);
+        GpuMatMul(hiddenOut, _gpuWO[layer], _gpuAttnOut);
     }
 
     // =================================================================
@@ -1386,11 +1623,21 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     //  CPU GDN block — mirror of HybridGdnForwardPass.GdnBlock
     // =================================================================
 
-    private void CpuGdnBlock(int layer, int position)
+    private void CpuGdnBlock(int layer, int position) =>
+        CpuGdnBlockAt(layer, position, normInGpu: _gpuNormBuf, hiddenOutGpu: _gpuHidden,
+                      cpuNormScratch: _cpuNormBuf, cpuHiddenScratch: _cpuHiddenOut);
+
+    /// <summary>
+    /// CPU-side GDN block parameterised on the GPU norm-input + GPU hidden-output
+    /// tensors plus the CPU scratch pointers to use for the GPU↔CPU staging copies.
+    /// Used by both <see cref="Forward"/> and <see cref="BatchForward2"/>.
+    /// </summary>
+    private void CpuGdnBlockAt(int layer, int position,
+                               Tensor normInGpu, Tensor hiddenOutGpu,
+                               float* cpuNormScratch, float* cpuHiddenScratch)
     {
-        // Download _gpuNormBuf → _cpuNormBuf so the CPU GDN kernels can consume it
-        // (Download self-syncs the stream).
-        _gpu.Download(_gpuNormBuf, new Span<float>(_cpuNormBuf, _embDim));
+        // Download normIn → cpuNormScratch so the CPU GDN kernels can consume it.
+        _gpu.Download(normInGpu, new Span<float>(cpuNormScratch, _embDim));
 
         int gdnIdx = _gdnStateCache.GdnLayerOf(layer);
         float* scanState = _gdnStateCache.ScanStateAt(gdnIdx);
@@ -1399,9 +1646,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         int scanStateLen = _gdnStateCache.ScanStateFloatsPerLayer;
 
         // 1. Joint QKV projection and z (gate) projection — CPU via SimdKernels.
-        SimdKernels.MatVec(_qkv, _cpuWQkv[layer].DataPtr, _cpuNormBuf,
+        SimdKernels.MatVec(_qkv, _cpuWQkv[layer].DataPtr, cpuNormScratch,
             _gdnConvChannels, _embDim, _cpuWQkv[layer].DType);
-        SimdKernels.MatVec(_zVec, _cpuWZGate[layer].DataPtr, _cpuNormBuf,
+        SimdKernels.MatVec(_zVec, _cpuWZGate[layer].DataPtr, cpuNormScratch,
             _gdnValueDim, _embDim, _cpuWZGate[layer].DType);
 
         // 2. Depthwise causal conv1d.
@@ -1433,9 +1680,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _gdnNumKHeads, _gdnKvRepeat, _gdnHeadDim);
 
         // 7. Alpha / Beta per-v-head projections.
-        SimdKernels.MatVec(_alpha, _cpuSsmAlpha[layer].DataPtr, _cpuNormBuf,
+        SimdKernels.MatVec(_alpha, _cpuSsmAlpha[layer].DataPtr, cpuNormScratch,
             _gdnNumVHeads, _embDim, _cpuSsmAlpha[layer].DType);
-        SimdKernels.MatVec(_beta, _cpuSsmBeta[layer].DataPtr, _cpuNormBuf,
+        SimdKernels.MatVec(_beta, _cpuSsmBeta[layer].DataPtr, cpuNormScratch,
             _gdnNumVHeads, _embDim, _cpuSsmBeta[layer].DType);
 
         // 8. Recurrence: rank-1 state update + per-head RMSNorm + SiLU(z) gate.
@@ -1457,12 +1704,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             layer: layer,
             position: position);
 
-        // 9. Output projection: ssm_out (input ValueDim, output embDim) → _cpuHiddenOut.
-        SimdKernels.MatVec(_cpuHiddenOut, _cpuSsmOut[layer].DataPtr, _gdnOut,
+        // 9. Output projection: ssm_out (input ValueDim, output embDim) → cpuHiddenScratch.
+        SimdKernels.MatVec(cpuHiddenScratch, _cpuSsmOut[layer].DataPtr, _gdnOut,
             _embDim, _gdnValueDim, _cpuSsmOut[layer].DType);
 
         // Upload back to GPU.
-        _gpu.UploadInto(_gpuHidden, new ReadOnlySpan<float>(_cpuHiddenOut, _embDim));
+        _gpu.UploadInto(hiddenOutGpu, new ReadOnlySpan<float>(cpuHiddenScratch, _embDim));
     }
 
     // =================================================================
@@ -1471,14 +1718,23 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     //  No CPU↔GPU sync inside the block.
     // =================================================================
 
-    private void GpuGdnBlock(int layer, int position)
+    private void GpuGdnBlock(int layer, int position) =>
+        GpuGdnBlockAt(layer, position, normIn: _gpuNormBuf, hiddenOut: _gpuHidden);
+
+    /// <summary>
+    /// GPU GDN block parameterised on input-norm / output-hidden tensors. The
+    /// recurrent state is the layer-local <see cref="_gpuGdnScanState"/> /
+    /// <see cref="_gpuGdnConvState"/> slot; the caller is responsible for
+    /// snapshotting it between calls when running the batched verify path.
+    /// </summary>
+    private void GpuGdnBlockAt(int layer, int position, Tensor normIn, Tensor hiddenOut)
     {
         var scanState = _gpuGdnScanState[layer]!;
         var convState = _gpuGdnConvState[layer]!;
 
         // 1. Joint QKV projection and z (gate) projection.
-        GpuMatMul(_gpuGdnQkv, _gpuWAttnQkv[layer], _gpuNormBuf);
-        GpuMatMul(_gpuGdnZVec, _gpuWAttnGate[layer], _gpuNormBuf);
+        GpuMatMul(_gpuGdnQkv, _gpuWAttnQkv[layer], normIn);
+        GpuMatMul(_gpuGdnZVec, _gpuWAttnGate[layer], normIn);
 
         // 2. Depthwise causal conv1d (updates convState in place).
         _gpu.GdnConv1dDecode(_gpuGdnQkv, convState, _gpuSsmConv1d[layer], _gpuGdnQkvConv,
@@ -1504,8 +1760,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _gdnNumKHeads, _gdnKvRepeat, _gdnHeadDim);
 
         // 6. Alpha / Beta per-v-head projections.
-        GpuMatMul(_gpuGdnAlpha, _gpuWSsmAlpha[layer], _gpuNormBuf);
-        GpuMatMul(_gpuGdnBeta,  _gpuWSsmBeta[layer],  _gpuNormBuf);
+        GpuMatMul(_gpuGdnAlpha, _gpuWSsmAlpha[layer], normIn);
+        GpuMatMul(_gpuGdnBeta,  _gpuWSsmBeta[layer],  normIn);
 
         // 7. Copy the V slice (final 4096 floats of _gpuGdnQkvConv) into _gpuGdnVHead.
         //    This is required because the recurrence wrapper takes whole Tensors;
@@ -1523,7 +1779,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _gdnNumVHeads, _gdnHeadDim, normEps: 1e-6f);
 
         // 9. Output projection: ssm_out (input value_dim=4096, output emb_dim=2048).
-        GpuMatMul(_gpuHidden, _gpuWSsmOut[layer], _gpuGdnOut);
+        GpuMatMul(hiddenOut, _gpuWSsmOut[layer], _gpuGdnOut);
     }
 
     // =================================================================
@@ -1590,7 +1846,13 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     //  read traffic is ~8.6 GB for 27B at Q4_K_M, capping decode at DRAM bandwidth.
     // =================================================================
 
-    private void CpuDenseFfn(int layer)
+    private void CpuDenseFfn(int layer) =>
+        CpuDenseFfnAt(layer, cpuNorm: _cpuNormBuf, cpuHiddenOut: _cpuMoeHidden);
+
+    /// <summary>
+    /// Single-token CPU dense FFN parameterised on the host norm + output scratch.
+    /// </summary>
+    private void CpuDenseFfnAt(int layer, float* cpuNorm, float* cpuHiddenOut)
     {
         var wGate = _cpuWFfnGate![layer];
         var wUp   = _cpuWFfnUp![layer];
@@ -1599,11 +1861,40 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         SimdKernels.MatVecDual(
             _cpuFfnGateBuf, wGate.DataPtr,
             _cpuFfnUpBuf,   wUp.DataPtr,
-            _cpuNormBuf, _intermDim, _embDim,
+            cpuNorm, _intermDim, _embDim,
             wGate.DType, wUp.DType);
         SimdKernels.SiLuMul(_cpuFfnGateBuf, _cpuFfnUpBuf, _intermDim);
-        SimdKernels.MatVec(_cpuMoeHidden, wDown.DataPtr, _cpuFfnGateBuf,
+        SimdKernels.MatVec(cpuHiddenOut, wDown.DataPtr, _cpuFfnGateBuf,
             _embDim, _intermDim, wDown.DType);
+    }
+
+    /// <summary>
+    /// Batched two-token CPU dense FFN (issue #30). Each FFN weight row is read
+    /// once and dotted against both tokens' inputs via
+    /// <see cref="SimdKernels.MatVec2In"/>. Realises the bandwidth win on the
+    /// CPU mmap FFN path that dominates 27B-MTP decode time on CUDA-hybrid.
+    /// </summary>
+    private void CpuDenseFfn2(int layer,
+        float* cpuNorm1, float* cpuNorm2,
+        float* cpuHiddenOut1, float* cpuHiddenOut2)
+    {
+        var wGate = _cpuWFfnGate![layer];
+        var wUp   = _cpuWFfnUp![layer];
+        var wDown = _cpuWFfnDown![layer];
+
+        // gate: weight row read once, dotted with both norms.
+        SimdKernels.MatVec2In(_cpuFfnGateBuf, _cpuFfnGateBuf2, wGate.DataPtr,
+            cpuNorm1, cpuNorm2, _intermDim, _embDim, wGate.DType);
+        // up: same pattern.
+        SimdKernels.MatVec2In(_cpuFfnUpBuf, _cpuFfnUpBuf2, wUp.DataPtr,
+            cpuNorm1, cpuNorm2, _intermDim, _embDim, wUp.DType);
+
+        SimdKernels.SiLuMul(_cpuFfnGateBuf,  _cpuFfnUpBuf,  _intermDim);
+        SimdKernels.SiLuMul(_cpuFfnGateBuf2, _cpuFfnUpBuf2, _intermDim);
+
+        // down: silu'd gate buffers are the inputs, output dim = embDim.
+        SimdKernels.MatVec2In(cpuHiddenOut1, cpuHiddenOut2, wDown.DataPtr,
+            _cpuFfnGateBuf, _cpuFfnGateBuf2, _embDim, _intermDim, wDown.DType);
     }
 
     // =================================================================
@@ -1611,18 +1902,27 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     //  TryUploadDenseFfnLayers. Consumes _gpuNormBuf, produces _gpuHidden.
     // =================================================================
 
-    private void GpuDenseFfn(int layer)
+    private void GpuDenseFfn(int layer) =>
+        GpuDenseFfnAt(layer, normIn: _gpuNormBuf, hiddenOut: _gpuHidden,
+                      gateBuf: _gpuFfnGateBufDense!, upBuf: _gpuFfnUpBufDense!);
+
+    /// <summary>
+    /// GPU dense FFN parameterised on the input-norm / output-hidden tensors and
+    /// the gate/up scratch tensors. <see cref="BatchForward2"/> calls it twice
+    /// per layer with its own scratch pair so token 1 and token 2 don't clobber
+    /// each other's intermediate gate/up.
+    /// </summary>
+    private void GpuDenseFfnAt(int layer, Tensor normIn, Tensor hiddenOut,
+                               Tensor gateBuf, Tensor upBuf)
     {
         var wGate = _gpuWFfnGate![layer]!;
         var wUp   = _gpuWFfnUp![layer]!;
         var wDown = _gpuWFfnDown![layer]!;
-        var gateBuf = _gpuFfnGateBufDense!;
-        var upBuf   = _gpuFfnUpBufDense!;
 
-        GpuMatMul(gateBuf, wGate, _gpuNormBuf);
-        GpuMatMul(upBuf,   wUp,   _gpuNormBuf);
+        GpuMatMul(gateBuf, wGate, normIn);
+        GpuMatMul(upBuf,   wUp,   normIn);
         _gpu.SiLuMul(gateBuf, upBuf);
-        GpuMatMul(_gpuHidden, wDown, gateBuf);
+        GpuMatMul(hiddenOut, wDown, gateBuf);
     }
 
     // =================================================================
@@ -2480,6 +2780,27 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 NativeMemory.Free(_mtpPrefillHiddens);
                 _mtpPrefillHiddens = null;
                 _mtpPrefillHiddensCap = 0;
+            }
+            // Issue #30 batched-verify scratch (dense FFN MTP only).
+            if (!_hp.IsMoE)
+            {
+                if (_gpuHidden2      is { } h2) _gpu.Free(h2);
+                if (_gpuResidual2    is { } r2) _gpu.Free(r2);
+                if (_gpuNormBuf2     is { } n2) _gpu.Free(n2);
+                if (_gpuLogits2      is { } l2) _gpu.Free(l2);
+                if (_gpuLastHiddenT1 is { } lh1) _gpu.Free(lh1);
+                if (_gpuFfnGateBufDense2 is { } gB2) _gpu.Free(gB2);
+                if (_gpuFfnUpBufDense2   is { } uB2) _gpu.Free(uB2);
+                if (_cpuNormBuf2   != null) NativeMemory.Free(_cpuNormBuf2);
+                if (_cpuMoeHidden2 != null) NativeMemory.Free(_cpuMoeHidden2);
+                if (_lastHiddenT1  != null) NativeMemory.Free(_lastHiddenT1);
+                if (_cpuFfnGateBuf2 != null) NativeMemory.Free(_cpuFfnGateBuf2);
+                if (_cpuFfnUpBuf2   != null) NativeMemory.Free(_cpuFfnUpBuf2);
+                if (_batchSnapshotBuf != null)
+                {
+                    NativeMemory.Free(_batchSnapshotBuf);
+                    _batchSnapshotBuf = null;
+                }
             }
             _mtpKvCache?.Dispose();
         }

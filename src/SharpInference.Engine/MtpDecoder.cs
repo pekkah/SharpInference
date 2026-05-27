@@ -118,9 +118,33 @@ public sealed class MtpDecoder
     /// Decode up to <paramref name="maxTokens"/> tokens. Calls <paramref name="emitToken"/>
     /// for every accepted or correction token. Stops when a token in
     /// <paramref name="stopTokenIds"/> is generated (and does NOT emit the stop token).
+    /// Dispatches to the batched N=2 verify path (<see cref="DecodeBatched"/>) when the
+    /// underlying forward pass implements <see cref="IForwardPass.BatchForward2"/>;
+    /// otherwise falls back to the sequential N=1 algorithm.
     /// </summary>
+    /// <param name="pMin">Min draft probability for probabilistic accept under MTP
+    /// verification (llama.cpp's <c>--spec-draft-p-min</c>, issue #38). <c>1.0</c>
+    /// (default) is byte-perfect argmax-match — accept iff <c>draft == argmax(target)</c>.
+    /// <c>p ∈ (0, 1)</c> also accepts when <c>softmax(target)[draft] &gt;= p</c>; the
+    /// emitted token then equals the draft, which can differ from baseline greedy.
+    /// <c>0.0</c> or negative is treated as <c>1.0</c>.</param>
     public void Decode(int maxTokens, ReadOnlySpan<int> stopTokenIds, Action<int> emitToken,
+                       float pMin = 1f,
                        CancellationToken ct = default)
+    {
+        // Treat 0 and negative as the default (argmax-match) for back-compat with
+        // callers that left SpecDraftPMin at the previous default of 0f.
+        if (pMin <= 0f) pMin = 1f;
+        if (_fwd.SupportsBatchVerify)
+        {
+            DecodeBatched(maxTokens, stopTokenIds, emitToken, pMin, ct);
+            return;
+        }
+        DecodeSequential(maxTokens, stopTokenIds, emitToken, pMin, ct);
+    }
+
+    private void DecodeSequential(int maxTokens, ReadOnlySpan<int> stopTokenIds, Action<int> emitToken,
+                                  float pMin, CancellationToken ct)
     {
         bool trace = Environment.GetEnvironmentVariable("SHARPI_TRACE_MTP") == "1";
         int generated = 0;
@@ -147,17 +171,19 @@ public sealed class MtpDecoder
             ReadOnlySpan<float> mainLogits = _fwd.Forward(t1, P);
             int t2Target = ArgMax(mainLogits);
 
-            int t2 = (t2Target == t2Draft) ? t2Draft : t2Target;
-            if (t2Target == t2Draft) _totalDraftsAccepted++;
+            bool accept = AcceptDraft(t2Draft, t2Target, mainLogits, pMin,
+                                      out float draftProbInMain);
+            int t2 = accept ? t2Draft : t2Target;
+            if (accept) _totalDraftsAccepted++;
 
             if (trace)
             {
                 float draftLogitInMain = mainLogits[t2Draft];
                 float mainTopLogit = mainLogits[t2Target];
                 Console.Error.WriteLine(
-                    $"[mtp] P={P} t1={t1} t2_draft={t2Draft}(draft_logit={t2DraftLogit:F3}, main_logit_at_draft={draftLogitInMain:F3}) " +
+                    $"[mtp] P={P} t1={t1} t2_draft={t2Draft}(draft_logit={t2DraftLogit:F3}, main_logit_at_draft={draftLogitInMain:F3}, p={draftProbInMain:F3}) " +
                     $"t2_target={t2Target}(main_logit={mainTopLogit:F3}) " +
-                    $"{(t2Target == t2Draft ? "ACCEPT" : "reject")}");
+                    $"{(accept ? "ACCEPT" : "reject")}");
             }
 
             if (IsStop(t2, stopTokenIds))
@@ -198,6 +224,171 @@ public sealed class MtpDecoder
             mainLogitsAfter.CopyTo(_savedMainLogits);
             _nextPos = P + 2;
         }
+    }
+
+    /// <summary>
+    /// Batched N=2 verify (issue #30). Per iter:
+    ///   t1 = argmax(saved_main_logits); emit t1
+    ///   t2_draft = argmax(MtpForward(t1, P, h_prev))
+    ///   BatchForward2(t1, t2_draft, P) → (l@P+1, l@P+2), LastHiddenT1 = h@P
+    ///   if argmax(l@P+1) == t2_draft: accept; saved_main_logits = l@P+2; emit t2_draft
+    ///   else: reject; RestoreBatchSnapshot(P+1); MtpTruncateTo(P+1);
+    ///         Forward(t2_target, P+1) → l@P+2; saved_main_logits = l@P+2; emit t2_target
+    ///   MtpForward(t2_emitted, P+1, LastHiddenT1)  # commit MTP at P+1
+    ///   _savedHidden = LastHidden   # h@P+1 ready for next iter
+    /// </summary>
+    private void DecodeBatched(int maxTokens, ReadOnlySpan<int> stopTokenIds, Action<int> emitToken,
+                               float pMin, CancellationToken ct)
+    {
+        bool trace = Environment.GetEnvironmentVariable("SHARPI_TRACE_MTP") == "1";
+        // Per-iter copy of h@P (LastHiddenT1) so MtpForward's scratch can't
+        // disturb the slice between batched verify and MTP commit. Sized to the
+        // embedding dim (length of _savedHidden); allocated once outside the loop.
+        Span<float> hAtPCopy = new float[_savedHidden.Length];
+        int generated = 0;
+        while (generated < maxTokens)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            // ── Token 1: argmax of last main logits (greedy correctness) ──
+            int t1 = ArgMax(_savedMainLogits);
+            if (IsStop(t1, stopTokenIds)) return;
+            emitToken(t1); generated++;
+            if (generated >= maxTokens) return;
+
+            // ── MTP draft for position P+1 ────────────────────────────
+            int P = _nextPos;
+            ReadOnlySpan<float> mtpLogits = _fwd.MtpForward(t1, P, _savedHidden);
+            int t2Draft = ArgMax(mtpLogits);
+            float t2DraftLogit = mtpLogits[t2Draft];
+            _totalDraftsEmitted++;
+
+            // ── Batched main verify (advances main caches through t1 + t2_draft) ─
+            _fwd.BatchForward2(t1, t2Draft, P,
+                out ReadOnlySpan<float> l_atPplus1,
+                out ReadOnlySpan<float> l_atPplus2);
+            int t2Target = ArgMax(l_atPplus1);
+
+            // Snapshot LastHiddenT1 — h@P (t1's pre-output-norm hidden). Needed for
+            // the MTP commit at P+1 regardless of accept/reject. We copy out now
+            // because a subsequent Forward (reject path) doesn't overwrite it but
+            // the value's tied to the batched forward's scratch.
+            var hAtP = _fwd.LastHiddenT1;
+            if (hAtP.Length != _savedHidden.Length)
+                throw new InvalidOperationException(
+                    $"LastHiddenT1 length {hAtP.Length} != EmbeddingDim {_savedHidden.Length}.");
+            // Use a local copy so MtpForward (which writes its own scratch) can't
+            // disturb the slice between now and the commit call.
+            hAtP.CopyTo(hAtPCopy);
+
+            ReadOnlySpan<float> mainLogitsAfter;
+            int t2;
+            bool accept = AcceptDraft(t2Draft, t2Target, l_atPplus1, pMin,
+                                      out float draftProbInMain);
+            if (accept)
+            {
+                _totalDraftsAccepted++;
+                // Emit the draft (which equals argmax on argmax-match, or differs
+                // from argmax on a prob-only accept under pMin < 1.0). The batched
+                // forward has already advanced both caches through t2_draft, so
+                // l_at_P+2 is the next iter's saved_main_logits.
+                t2 = t2Draft;
+                mainLogitsAfter = l_atPplus2;
+            }
+            else
+            {
+                t2 = t2Target;
+                _fwd.RestoreBatchSnapshot(P + 1);
+                _fwd.MtpTruncateTo(P + 1);
+                mainLogitsAfter = _fwd.Forward(t2Target, P + 1);
+            }
+
+            if (trace)
+            {
+                float draftLogitInMain = l_atPplus1[t2Draft];
+                float mainTopLogit = l_atPplus1[t2Target];
+                Console.Error.WriteLine(
+                    $"[mtp-batch] P={P} t1={t1} t2_draft={t2Draft}(draft_logit={t2DraftLogit:F3}, main_logit_at_draft={draftLogitInMain:F3}, p={draftProbInMain:F3}) " +
+                    $"t2_target={t2Target}(main_logit={mainTopLogit:F3}) " +
+                    $"{(accept ? "ACCEPT" : "reject")}");
+            }
+
+            if (IsStop(t2, stopTokenIds))
+            {
+                // Keep state consistent for a follow-up call.
+                _fwd.LastHidden.CopyTo(_savedHidden);
+                mainLogitsAfter.CopyTo(_savedMainLogits);
+                _nextPos = P + 2;
+                return;
+            }
+            emitToken(t2); generated++;
+            if (generated >= maxTokens)
+            {
+                _fwd.LastHidden.CopyTo(_savedHidden);
+                mainLogitsAfter.CopyTo(_savedMainLogits);
+                _nextPos = P + 2;
+                return;
+            }
+
+            // ── MTP commit at P+1 ────────────────────────────────────
+            // prevHidden = h@P (the hidden that came out of the trunk for t1).
+            _ = _fwd.MtpForward(t2, P + 1, hAtPCopy);
+
+            // Update saved state for next iter. _fwd.LastHidden = h@P+1.
+            _fwd.LastHidden.CopyTo(_savedHidden);
+            mainLogitsAfter.CopyTo(_savedMainLogits);
+            _nextPos = P + 2;
+        }
+    }
+
+    /// <summary>
+    /// MTP draft acceptance check (issue #38). Always accepts when the draft is the
+    /// verifier's argmax. Under <paramref name="pMin"/> &lt; 1.0, ALSO accepts when
+    /// the draft's softmax probability under <paramref name="mainLogits"/> meets the
+    /// threshold. The softmax is computed in numerically-stable max-shift form; only
+    /// the draft's probability is materialised (no full distribution write).
+    /// </summary>
+    /// <param name="draft">Token id proposed by the MTP head.</param>
+    /// <param name="target">Argmax of <paramref name="mainLogits"/> (= the greedy
+    /// correction token).</param>
+    /// <param name="mainLogits">Verifier logits at the position the draft predicts.</param>
+    /// <param name="pMin">Acceptance threshold; <c>1.0</c> = argmax-match only.</param>
+    /// <param name="draftProb">Computed <c>softmax(mainLogits)[draft]</c>, or <c>0</c>
+    /// when no softmax was needed (pMin &gt;= 1.0). Surfaced for trace logging.</param>
+    private static bool AcceptDraft(int draft, int target, ReadOnlySpan<float> mainLogits,
+                                    float pMin, out float draftProb)
+    {
+        if (draft == target)
+        {
+            draftProb = 0f;
+            return true;
+        }
+        if (pMin >= 1.0f)
+        {
+            draftProb = 0f;
+            return false;
+        }
+        draftProb = SoftmaxProbAt(mainLogits, draft);
+        return draftProb >= pMin;
+    }
+
+    /// <summary>
+    /// Numerically-stable softmax probability of <paramref name="idx"/> under
+    /// <paramref name="logits"/>: one max-pass, one exp-sum-pass, then the single
+    /// ratio. O(2V) reads; vocab fits in L2 so latency is negligible per MTP iter.
+    /// </summary>
+    private static float SoftmaxProbAt(ReadOnlySpan<float> logits, int idx)
+    {
+        float max = logits[0];
+        for (int i = 1; i < logits.Length; i++)
+            if (logits[i] > max) max = logits[i];
+
+        double sumExp = 0;
+        for (int i = 0; i < logits.Length; i++)
+            sumExp += Math.Exp(logits[i] - max);
+
+        if (sumExp <= 0 || double.IsNaN(sumExp)) return 0f;
+        return (float)(Math.Exp(logits[idx] - max) / sumExp);
     }
 
     private static int ArgMax(ReadOnlySpan<float> logits)

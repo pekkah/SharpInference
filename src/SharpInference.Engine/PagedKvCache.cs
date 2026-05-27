@@ -155,6 +155,59 @@ public sealed unsafe class PagedKvCache : IDisposable
         }
     }
 
+    /// <summary>
+    /// Write key and value vectors at an explicit <paramref name="position"/> regardless
+    /// of <see cref="Length"/>. Used by the MTP batched verify path (issue #30) where two
+    /// tokens at adjacent positions share the same cache: token 1's per-layer Append fires
+    /// at <c>startPos</c>, token 2's at <c>startPos + 1</c>, both before either token
+    /// bumps <see cref="Length"/>. The block table must already cover the page containing
+    /// <paramref name="position"/>; call <see cref="ReserveBlockAt"/> on token 1's first
+    /// layer for each new page.
+    /// </summary>
+    public void AppendAt(int layer, int position, ReadOnlySpan<float> key, ReadOnlySpan<float> value)
+    {
+        int blockIdx = position / PageSize;
+        int offset = position % PageSize;
+
+        if (blockIdx >= _allocatedBlocks)
+            throw new InvalidOperationException(
+                $"PagedKvCache.AppendAt({position}): block {blockIdx} not reserved " +
+                $"(allocated={_allocatedBlocks}). Call ReserveBlockAt before the first " +
+                "AppendAt that crosses a page boundary.");
+
+        int physSlot = _blockTable[layer][blockIdx];
+        float* page = GetPage(layer, physSlot);
+        float* keyDst = page + (long)offset * _kvDim;
+        float* valDst = page + (long)(PageSize + offset) * _kvDim;
+
+        key[.._kvDim].CopyTo(new Span<float>(keyDst, _kvDim));
+        value[.._kvDim].CopyTo(new Span<float>(valDst, _kvDim));
+    }
+
+    /// <summary>
+    /// Reserve the block containing <paramref name="position"/> if not already allocated.
+    /// Mirrors <see cref="ReserveBlock"/> but for an explicit position rather than the
+    /// current <see cref="Length"/>. Used by the batched verify path to make room for
+    /// two tokens that may straddle a page boundary.
+    /// </summary>
+    public void ReserveBlockAt(int position)
+    {
+        int blockIdx = position / PageSize;
+        if (blockIdx >= _allocatedBlocks)
+        {
+            EnsureBlockTableCapacity(blockIdx);
+            // Stretch the high-water mark to include any skipped blocks too — the cache
+            // expects contiguous block ids 0.._allocatedBlocks-1 with valid slots.
+            for (int b = _allocatedBlocks; b <= blockIdx; b++)
+            {
+                int slot = AllocSlot();
+                for (int l = 0; l < _numLayers; l++)
+                    _blockTable[l][b] = slot;
+            }
+            _allocatedBlocks = blockIdx + 1;
+        }
+    }
+
     /// <summary>Advances the logical length. Call once per token after all layers are appended.</summary>
     public void IncrementPosition() => _length++;
 

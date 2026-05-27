@@ -311,7 +311,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                             if (chunk.Length > 0)
                                 channel.Writer.TryWrite(
                                     new GenerateChunk(GenerateChunkKind.Text, chunk));
-                        }, ct);
+                        }, pMin: sp.SpecDraftPMin, ct: ct);
 
                         var textFlushMtp = textDecMtp.Flush();
                         if (textFlushMtp.Length > 0)

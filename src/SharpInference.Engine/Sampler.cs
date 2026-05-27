@@ -275,27 +275,36 @@ public sealed record SamplingParams
 
     /// <summary>
     /// Max number of draft tokens per speculative step. Mirrors llama.cpp's
-    /// <c>--spec-draft-n-max</c>. 0 = engine default (1 for MTP today).
-    /// MTP only supports N=1 in sharpi until issue #30 (Phase-7 batched verify
-    /// + per-token GDN snapshot ring) lands; larger values error at decode time.
+    /// <c>--spec-draft-n-max</c>. 0 = engine default (1 for MTP today; N=2 with
+    /// issue #30 batched verify on hybrid GDN passes).
     /// </summary>
     public int SpecDraftNMax { get; init; } = 0;
 
     /// <summary>
     /// Min number of draft tokens per speculative step. Mirrors llama.cpp's
-    /// <c>--spec-draft-n-min</c>. 0 = no minimum. Has no effect today (sharpi
-    /// only supports N=1 draft on the MTP path); rejected at decode time when
-    /// non-zero. Issue #37.
+    /// <c>--spec-draft-n-min</c>. 0 = no minimum. With issue #30 batched verify
+    /// the draft length is fixed at 1 (= one MTP forward per main pair), so
+    /// this flag is currently accepted but a no-op; it gains meaning when a
+    /// variable-length tree-draft lands. Issue #37.
     /// </summary>
     public int SpecDraftNMin { get; init; } = 0;
 
     /// <summary>
-    /// Minimum draft probability for probabilistic accept under sampling. Mirrors
-    /// llama.cpp's <c>--spec-draft-p-min</c>. 0 = disabled (the current greedy
-    /// argmax-match path). Requires <c>Temperature &gt; 0</c> and N&gt;1 to be
-    /// meaningful; rejected at decode time otherwise. Issue #38.
+    /// Minimum draft probability for probabilistic accept under MTP verification.
+    /// Mirrors llama.cpp's <c>--spec-draft-p-min</c> (llama.cpp default 0.75).
+    /// <list type="bullet">
+    ///   <item><c>1.0</c> (default): pure argmax-match — accept iff
+    ///         <c>draft == argmax(target)</c>. Produces byte-identical output vs
+    ///         <c>SHARPI_DISABLE_MTP=1</c>.</item>
+    ///   <item><c>p ∈ (0, 1)</c>: probabilistic accept — accept iff
+    ///         <c>softmax(target)[draft] &gt;= p</c> OR <c>draft == argmax(target)</c>.
+    ///         Higher acceptance rate, but emitted tokens diverge from baseline
+    ///         when the draft wins on the prob rule alone.</item>
+    ///   <item><c>0.0</c> or negative: treated as 1.0 (default).</item>
+    /// </list>
+    /// Issue #38.
     /// </summary>
-    public float SpecDraftPMin { get; init; } = 0f;
+    public float SpecDraftPMin { get; init; } = 1f;
 }
 
 /// <summary>Speculative-decoding type. Mirrors llama.cpp's <c>--spec-type</c>.</summary>

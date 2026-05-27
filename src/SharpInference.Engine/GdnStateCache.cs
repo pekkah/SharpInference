@@ -313,6 +313,89 @@ public sealed unsafe class GdnStateCache : IDisposable
     }
 
     /// <summary>
+    /// Per-layer snapshot footprint: <c>convStateBytesPerLayer + scanStateBytesPerLayer</c>.
+    /// Used by the MTP batched verify path (issue #30) which writes a snapshot at
+    /// the "between t1 and t2" point of <c>BatchForward2</c> by saving each layer's
+    /// post-t1 state as that layer's slot in a single buffer.
+    /// </summary>
+    public long LayerSnapshotBytes =>
+        (long)_convStateBytesPerLayer + (long)_scanStateBytesPerLayer;
+
+    /// <summary>
+    /// Copy one layer's conv + scan state (no length header) into <paramref name="dst"/>.
+    /// Layout: <c>convBytesPerLayer</c> bytes then <c>scanBytesPerLayer</c> bytes.
+    /// Used by <c>BatchForward2</c> to write the "after t1" snapshot incrementally as
+    /// each layer finishes its t1 attn/GDN block.
+    /// </summary>
+    public void SnapshotLayerInto(int gdnLayerIndex, byte* dst, long dstBytes)
+    {
+        if ((uint)gdnLayerIndex >= (uint)NumGdnLayers)
+            throw new ArgumentOutOfRangeException(
+                nameof(gdnLayerIndex), gdnLayerIndex,
+                $"GDN layer index out of range [0, {NumGdnLayers}).");
+        long needed = LayerSnapshotBytes;
+        if (dst == null) throw new ArgumentNullException(nameof(dst));
+        if (dstBytes < needed)
+            throw new ArgumentException(
+                $"GdnStateCache.SnapshotLayerInto: dstBytes={dstBytes} < LayerSnapshotBytes={needed}.",
+                nameof(dstBytes));
+
+        byte* cursor = dst;
+        if (_convState[gdnLayerIndex] != null && _convStateBytesPerLayer > 0)
+        {
+            NativeMemory.Copy(_convState[gdnLayerIndex], cursor, _convStateBytesPerLayer);
+            cursor += (long)_convStateBytesPerLayer;
+        }
+        if (_scanState[gdnLayerIndex] != null && _scanStateBytesPerLayer > 0)
+        {
+            NativeMemory.Copy(_scanState[gdnLayerIndex], cursor, _scanStateBytesPerLayer);
+        }
+    }
+
+    /// <summary>
+    /// Restore one layer's conv + scan state from a buffer previously written by
+    /// <see cref="SnapshotLayerInto"/>. Does NOT touch <see cref="Length"/>; callers
+    /// using this for batched-verify rollback must update length explicitly via
+    /// <see cref="SetLength"/>.
+    /// </summary>
+    public void RestoreLayerFrom(int gdnLayerIndex, byte* src, long srcBytes)
+    {
+        if ((uint)gdnLayerIndex >= (uint)NumGdnLayers)
+            throw new ArgumentOutOfRangeException(
+                nameof(gdnLayerIndex), gdnLayerIndex,
+                $"GDN layer index out of range [0, {NumGdnLayers}).");
+        long needed = LayerSnapshotBytes;
+        if (src == null) throw new ArgumentNullException(nameof(src));
+        if (srcBytes < needed)
+            throw new ArgumentException(
+                $"GdnStateCache.RestoreLayerFrom: srcBytes={srcBytes} < LayerSnapshotBytes={needed}.",
+                nameof(srcBytes));
+
+        byte* cursor = src;
+        if (_convState[gdnLayerIndex] != null && _convStateBytesPerLayer > 0)
+        {
+            NativeMemory.Copy(cursor, _convState[gdnLayerIndex], _convStateBytesPerLayer);
+            cursor += (long)_convStateBytesPerLayer;
+        }
+        if (_scanState[gdnLayerIndex] != null && _scanStateBytesPerLayer > 0)
+        {
+            NativeMemory.Copy(cursor, _scanState[gdnLayerIndex], _scanStateBytesPerLayer);
+        }
+    }
+
+    /// <summary>
+    /// Set <see cref="Length"/> explicitly. Used by the batched verify path (issue #30)
+    /// to rewind length after a per-layer state restore — the per-layer copy does not
+    /// itself carry a length header. Throws when negative.
+    /// </summary>
+    public void SetLength(int length)
+    {
+        if (length < 0)
+            throw new ArgumentOutOfRangeException(nameof(length), length, "Length must be non-negative.");
+        _length = length;
+    }
+
+    /// <summary>
     /// Free all native state buffers. Safe to call twice — subsequent calls are no-ops.
     /// </summary>
     public void Dispose()

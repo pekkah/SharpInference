@@ -96,6 +96,24 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     private readonly float* _ffnUp;          // [IntermediateDim]
     private readonly int _intermDim;         // hp.IntermediateDim (dense FFN); 0 when MoE
 
+    // ── Token-2 scratch for MTP batched verify (issue #30) — allocated only when
+    //     _hasMtp && !_hp.IsMoE. Mirrors the single-token scratch above; sized to
+    //     give BatchForward2 a parallel residual stream for the second token. ──
+    private readonly float* _hidden2;        // [embDim]
+    private readonly float* _residual2;      // [embDim]
+    private readonly float* _normBuf2;       // [embDim]
+    private readonly float* _ffnGate2;       // [intermDim]
+    private readonly float* _ffnUp2;         // [intermDim]
+    private readonly float* _logits2;        // [vocabSize]
+    private readonly float* _lastHiddenT1;   // [embDim] — t1's pre-output-norm hidden after BatchForward2
+
+    // Per-layer GDN snapshot buffer holding the "between t1 and t2" state during
+    // BatchForward2. Each gdn-layer slot is _gdnStateCache.LayerSnapshotBytes wide,
+    // contiguous in this buffer. Sized in the constructor when MTP is loaded.
+    private byte* _batchSnapshotBuf;
+    private long _batchSnapshotCap;
+    private bool _batchSnapshotValid;
+
     // ── Dimensions (cached) ────────────────────────────────────────────
     private readonly int _embDim;
     private readonly int _headDim;
@@ -493,6 +511,29 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             // Pre-norm hidden capture buffer; the post-trunk pre-output-norm hidden
             // is needed as MTP input. Sized at embDim, refreshed each Forward.
             _lastHidden = Alloc(_embDim);
+
+            // Issue #30: batched verify scratch. Only allocated for the dense-FFN MTP
+            // path (qwen35 27B-MTP). MoE MTP variants are unsupported here — both the
+            // MTP loader (project_mtp_moe_ffn_head_unsupported memory) and the FFN
+            // batching primitive (MatVec2In) target dense weights only.
+            if (!hp.IsMoE)
+            {
+                _hidden2 = Alloc(_embDim);
+                _residual2 = Alloc(_embDim);
+                _normBuf2 = Alloc(_embDim);
+                _ffnGate2 = Alloc(_intermDim);
+                _ffnUp2 = Alloc(_intermDim);
+                _logits2 = Alloc(hp.VocabSize);
+                _lastHiddenT1 = Alloc(_embDim);
+
+                long perLayerBytes = _gdnStateCache.LayerSnapshotBytes;
+                long totalSnapBytes = perLayerBytes * _gdnStateCache.NumGdnLayers;
+                if (totalSnapBytes > 0)
+                {
+                    _batchSnapshotBuf = (byte*)NativeMemory.Alloc((nuint)totalSnapBytes);
+                    _batchSnapshotCap = totalSnapBytes;
+                }
+            }
         }
 
         PrefaultWeights();
@@ -727,6 +768,232 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     }
 
     // ============================================================
+    //  BatchForward2 — MTP batched verify (issue #30)
+    // ============================================================
+    //
+    // Runs two adjacent tokens through the trunk in a single pass so the FFN
+    // gate/up/down MatMuls fold to a single weight read per row via MatVec2In.
+    // Attn/GDN sublayers stay sequential (t1 then t2) so t2's attention can read
+    // t1's just-written K/V and GDN state. A per-layer snapshot of the GDN state
+    // is captured between t1 and t2 so a rejected draft can be rolled back to
+    // <c>startPos + 1</c> without recomputing t1.
+    //
+    // <para><b>State on entry:</b> <c>_kvCache.Length == startPos</c>,
+    // <c>_gdnStateCache.Length == startPos</c>.</para>
+    // <para><b>State on success:</b>
+    //   <c>_kvCache.Length == startPos + 2</c>,
+    //   <c>_gdnStateCache.Length == startPos + 2</c>,
+    //   <c>_lastHidden</c> = h@startPos+1 (t2's pre-output-norm hidden),
+    //   <c>LastHiddenT1</c> = h@startPos (t1's pre-output-norm hidden),
+    //   per-layer GDN snapshot captured at "after t1, before t2" — available for
+    //   <see cref="RestoreBatchSnapshot"/>.</para>
+    // <para><b>Return:</b> two logit slices (predict-startPos+1, predict-startPos+2).</para>
+    //
+    // <para><b>Restrictions:</b> MoE FFN not supported (MatVec2In is dense-only).
+    // The pass is otherwise the same as two sequential <see cref="Forward"/> calls.</para>
+
+    /// <summary>True when this pass implements <see cref="BatchForward2"/>. The
+    /// <c>SHARPI_DISABLE_BATCH_VERIFY=1</c> env var forces the legacy sequential
+    /// MTP path for parity bisection.</summary>
+    public bool SupportsBatchVerify =>
+        _hasMtp && !_hp.IsMoE
+        && Environment.GetEnvironmentVariable("SHARPI_DISABLE_BATCH_VERIFY") != "1";
+
+    /// <summary>
+    /// Last completed <see cref="BatchForward2"/>'s token-1 pre-output-norm hidden.
+    /// Used by the <see cref="MtpDecoder"/> commit step to drive the next MTP forward
+    /// at <c>startPos + 1</c>.
+    /// </summary>
+    public ReadOnlySpan<float> LastHiddenT1 =>
+        _lastHiddenT1 != null ? new ReadOnlySpan<float>(_lastHiddenT1, _embDim) : default;
+
+    /// <summary>
+    /// Run two adjacent tokens (t1 at <paramref name="startPos"/>, t2 at
+    /// <paramref name="startPos"/>+1) through the trunk with batched FFN. Returns
+    /// the two predict-next-position logit slices via out parameters. Both slices
+    /// are backed by per-pass scratch and remain valid until the next forward call.
+    /// </summary>
+    public void BatchForward2(int t1, int t2, int startPos,
+        out ReadOnlySpan<float> logits1, out ReadOnlySpan<float> logits2)
+    {
+        if (!SupportsBatchVerify)
+            throw new InvalidOperationException(
+                "BatchForward2 is only supported on dense-FFN MTP passes. " +
+                "Check SupportsBatchVerify before calling.");
+        if (startPos < 0)
+            throw new ArgumentOutOfRangeException(nameof(startPos), startPos, "startPos must be >= 0.");
+        if (_kvCache.Length != startPos)
+            throw new InvalidOperationException(
+                $"BatchForward2: _kvCache.Length={_kvCache.Length} != startPos={startPos}. " +
+                "Caches must be at startPos before the batched verify call.");
+        if (_gdnStateCache.Length != startPos)
+            throw new InvalidOperationException(
+                $"BatchForward2: _gdnStateCache.Length={_gdnStateCache.Length} != startPos={startPos}.");
+
+        // 1. Embed both tokens.
+        EmbedTokenInto(t1, _hidden);
+        EmbedTokenInto(t2, _hidden2);
+
+        // 2. Reserve KV blocks covering both positions. Both tokens almost always
+        //    share a page (PageSize=16); the call handles the straddle case too.
+        _kvCache.ReserveBlockAt(startPos);
+        _kvCache.ReserveBlockAt(startPos + 1);
+
+        _batchSnapshotValid = false;
+        long layerSnapBytes = _gdnStateCache.LayerSnapshotBytes;
+
+        // 3. Trunk layers — interleave per layer so the FFN can batch via MatVec2In.
+        for (int layer = 0; layer < _hp.NumLayers; layer++)
+        {
+            // ── Pre-block residual + attn-norm for BOTH tokens ───────
+            Copy(_residual,  _hidden,  _embDim);
+            Copy(_residual2, _hidden2, _embDim);
+            var attnNormW = GetNormWeight(_attnNorm[layer]);
+            SimdKernels.RmsNorm(_normBuf,  _hidden,  attnNormW, _embDim, _hp.RmsNormEps);
+            SimdKernels.RmsNorm(_normBuf2, _hidden2, attnNormW, _embDim, _hp.RmsNormEps);
+
+            bool isAttn = _hp.LayerTypes![layer] == LayerType.Attention;
+
+            // ── Attn/GDN: sequential t1 then t2 ──────────────────────
+            // t1 first so t2's attention reads t1's K/V (correct causal order).
+            if (isAttn)
+            {
+                AttnBlockAt(layer, position: startPos,     kvPosition: startPos,     normIn: _normBuf,  hiddenOut: _hidden);
+                AttnBlockAt(layer, position: startPos + 1, kvPosition: startPos + 1, normIn: _normBuf2, hiddenOut: _hidden2);
+            }
+            else
+            {
+                GdnBlockAt(layer, position: startPos,     normIn: _normBuf,  hiddenOut: _hidden);
+                // Snapshot this layer's GDN state right after t1 has updated it.
+                int gdnIdx = _gdnStateCache.GdnLayerOf(layer);
+                _gdnStateCache.SnapshotLayerInto(gdnIdx,
+                    _batchSnapshotBuf + (long)gdnIdx * layerSnapBytes,
+                    layerSnapBytes);
+                GdnBlockAt(layer, position: startPos + 1, normIn: _normBuf2, hiddenOut: _hidden2);
+            }
+
+            // ── Residual add for both ────────────────────────────────
+            SimdKernels.AddInPlace(_hidden,  _residual,  _embDim);
+            SimdKernels.AddInPlace(_hidden2, _residual2, _embDim);
+
+            // ── Pre-FFN residual + post_attention_norm for both ──────
+            Copy(_residual,  _hidden,  _embDim);
+            Copy(_residual2, _hidden2, _embDim);
+            var postNormW = GetNormWeight(_postAttnNorm[layer]);
+            SimdKernels.RmsNorm(_normBuf,  _hidden,  postNormW, _embDim, _hp.RmsNormEps);
+            SimdKernels.RmsNorm(_normBuf2, _hidden2, postNormW, _embDim, _hp.RmsNormEps);
+
+            // ── Dense FFN, batched: each FFN weight row read once, dotted with
+            //    both tokens' inputs. The wins live here. ────────────
+            DenseFfn2(layer, _normBuf, _normBuf2, _hidden, _hidden2);
+
+            // ── Post-FFN residual add for both ───────────────────────
+            SimdKernels.AddInPlace(_hidden,  _residual,  _embDim);
+            SimdKernels.AddInPlace(_hidden2, _residual2, _embDim);
+        }
+
+        // 4. Advance both caches by 2 (one bump per token, in order).
+        _kvCache.IncrementPosition();
+        _gdnStateCache.IncrementPosition();
+        _kvCache.IncrementPosition();
+        _gdnStateCache.IncrementPosition();
+
+        // 5. Snapshot the pre-output-norm hiddens before final norm overwrites them.
+        new ReadOnlySpan<float>(_hidden,  _embDim).CopyTo(new Span<float>(_lastHiddenT1, _embDim));
+        new ReadOnlySpan<float>(_hidden2, _embDim).CopyTo(new Span<float>(_lastHidden,   _embDim));
+
+        // 6. Final norm + output projection for both tokens. The lm_head can use
+        //    MatVec2In so the vocab-sized weight matrix is read once.
+        var outNormW = GetNormWeight(_outputNorm);
+        SimdKernels.RmsNorm(_hidden,  _hidden,  outNormW, _embDim, _hp.RmsNormEps);
+        SimdKernels.RmsNorm(_hidden2, _hidden2, outNormW, _embDim, _hp.RmsNormEps);
+
+        SimdKernels.MatVec2In(_logits, _logits2,
+            _outputWeight.DataPtr, _hidden, _hidden2,
+            _hp.VocabSize, _embDim, _outputWeight.DType);
+
+        _batchSnapshotValid = true;
+        logits1 = new ReadOnlySpan<float>(_logits,  _hp.VocabSize);
+        logits2 = new ReadOnlySpan<float>(_logits2, _hp.VocabSize);
+    }
+
+    /// <summary>
+    /// Roll the caches back to <c>startPos + 1</c> (i.e. token-1 has been processed,
+    /// token-2 has not) using the snapshot taken inside the most recent
+    /// <see cref="BatchForward2"/>. Used by <see cref="MtpDecoder"/> on a rejected
+    /// draft so a single follow-up <see cref="Forward"/> can replay the corrected
+    /// token at position <c>startPos + 1</c>.
+    /// </summary>
+    /// <param name="lengthAfter">Cache length to restore to (always
+    /// <c>startPos + 1</c> for the issue-#30 N=2 path).</param>
+    public void RestoreBatchSnapshot(int lengthAfter)
+    {
+        if (!_batchSnapshotValid)
+            throw new InvalidOperationException(
+                "RestoreBatchSnapshot: no batched-verify snapshot is held. " +
+                "Call BatchForward2 first.");
+        if (lengthAfter < 0)
+            throw new ArgumentOutOfRangeException(nameof(lengthAfter), lengthAfter,
+                "lengthAfter must be >= 0.");
+
+        long layerSnapBytes = _gdnStateCache.LayerSnapshotBytes;
+        for (int gdnIdx = 0; gdnIdx < _gdnStateCache.NumGdnLayers; gdnIdx++)
+        {
+            _gdnStateCache.RestoreLayerFrom(gdnIdx,
+                _batchSnapshotBuf + (long)gdnIdx * layerSnapBytes,
+                layerSnapBytes);
+        }
+        _gdnStateCache.SetLength(lengthAfter);
+        _kvCache.TruncateTo(lengthAfter);
+        _batchSnapshotValid = false;
+    }
+
+    /// <summary>
+    /// Batched gate × up → down dense FFN for two tokens sharing the same weight
+    /// matrices. Each weight row is touched once per row iteration and dotted
+    /// against both inputs via <see cref="SimdKernels.MatVec2In"/>; the gate × up
+    /// SiLU and the down projection are both folded into single passes.
+    /// </summary>
+    private void DenseFfn2(int layer, float* normIn1, float* normIn2,
+                           float* hiddenOut1, float* hiddenOut2)
+    {
+        SimdKernels.MatVec2In(
+            _ffnGate, _ffnGate2,
+            _wFfnGate[layer].DataPtr, normIn1, normIn2,
+            _intermDim, _embDim, _wFfnGate[layer].DType);
+        SimdKernels.MatVec2In(
+            _ffnUp, _ffnUp2,
+            _wFfnUp[layer].DataPtr, normIn1, normIn2,
+            _intermDim, _embDim, _wFfnUp[layer].DType);
+
+        SimdKernels.SiLuMul(_ffnGate,  _ffnUp,  _intermDim);
+        SimdKernels.SiLuMul(_ffnGate2, _ffnUp2, _intermDim);
+
+        SimdKernels.MatVec2In(
+            hiddenOut1, hiddenOut2,
+            _wFfnDown[layer].DataPtr, _ffnGate, _ffnGate2,
+            _embDim, _intermDim, _wFfnDown[layer].DType);
+    }
+
+    // EmbedToken-into-explicit-pointer variant used by BatchForward2 so t1 and
+    // t2 can be embedded into independent residual streams (_hidden, _hidden2).
+    private void EmbedTokenInto(int token, float* dst)
+    {
+        int bytesPerRow = (_embDim / DTypeInfo.BlockSize(_embTensor.DType))
+                        * DTypeInfo.BytesPerBlock(_embTensor.DType);
+        byte* rowPtr = _embTensor.DataPtr + (long)token * bytesPerRow;
+        if (_embTensor.DType == DType.Float32)
+        {
+            new ReadOnlySpan<float>((float*)rowPtr, _embDim)
+                .CopyTo(new Span<float>(dst, _embDim));
+        }
+        else
+        {
+            SimdKernels.DequantRow(rowPtr, dst, _embDim, _embTensor.DType);
+        }
+    }
+
+    // ============================================================
     //  Trace helpers (SHARPI_TRACE_LAYERS=1)
     // ============================================================
 
@@ -856,14 +1123,27 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     //  AttnBlock — full softmax attention with GLU-gated Q
     // ============================================================
 
-    private void AttnBlock(int layer, int position)
+    private void AttnBlock(int layer, int position) =>
+        AttnBlockAt(layer, position, kvPosition: position, normIn: _normBuf, hiddenOut: _hidden);
+
+    /// <summary>
+    /// Attention block parameterised on the input-norm pointer, output-hidden pointer,
+    /// RoPE position, and KV write position. Used by both the per-token <see cref="Forward"/>
+    /// path (where <paramref name="kvPosition"/> == <paramref name="position"/> ==
+    /// current <see cref="PagedKvCache.Length"/>) and by <c>BatchForward2</c> (where t2
+    /// passes <paramref name="kvPosition"/> = <c>startPos + 1</c> while the cache's
+    /// <c>_length</c> has not yet been bumped). The K/V write goes through
+    /// <see cref="PagedKvCache.AppendAt"/> so callers control length-advancement explicitly.
+    /// </summary>
+    private void AttnBlockAt(int layer, int position, int kvPosition,
+                             float* normIn, float* hiddenOut)
     {
         int qDim = _numHeads * _headDim;
         int kvDim = _numKvHeads * _headDim;
         int twoHd = _headDim * 2;   // 512: per-head [Q256, G256]
 
         // 1. Project: attn_q → [Q‖G] interleaved per head (output 8192).
-        FusedMatVec(_qGate, _wQGate[layer], _normBuf, qDim * 2, _embDim);
+        FusedMatVec(_qGate, _wQGate[layer], normIn, qDim * 2, _embDim);
 
         // 2. De-interleave: per head h, _q[h*hd : (h+1)*hd] ← _qGate[h*2hd : h*2hd+hd]
         //                              _gate[h*hd : (h+1)*hd] ← _qGate[h*2hd+hd : (h+1)*2hd]
@@ -876,8 +1156,8 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             new ReadOnlySpan<float>(src + _headDim, _headDim).CopyTo(new Span<float>(dstG, _headDim));
         }
 
-        FusedMatVec(_k, _wK[layer], _normBuf, kvDim, _embDim);
-        FusedMatVec(_v, _wV[layer], _normBuf, kvDim, _embDim);
+        FusedMatVec(_k, _wK[layer], normIn, kvDim, _embDim);
+        FusedMatVec(_v, _wV[layer], normIn, kvDim, _embDim);
 
         // 3. Per-head Q/K RMSNorm (Qwen3-style: norm BEFORE RoPE; weight is shared across heads).
         PerHeadRmsNorm(_q, _qNorm[layer], _numHeads, _headDim, _hp.RmsNormEps);
@@ -889,19 +1169,19 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         SimdKernels.ApplyRoPECachedNeoxPartial(_q, cos, sin, _numHeads, _headDim, _ropeDim);
         SimdKernels.ApplyRoPECachedNeoxPartial(_k, cos, sin, _numKvHeads, _headDim, _ropeDim);
 
-        // 5. Append K/V to cache.
-        _kvCache.Append(layer,
+        // 5. Append K/V to the explicit slot. Callers manage cache length advancement.
+        _kvCache.AppendAt(layer, kvPosition,
             new ReadOnlySpan<float>(_k, kvDim),
             new ReadOnlySpan<float>(_v, kvDim));
 
-        // 6. Scaled dot-product attention (GQA).
-        Attention(layer, position);
+        // 6. Scaled dot-product attention (GQA). Reads K/V at positions 0..kvPosition.
+        Attention(layer, kvPosition);
 
         // 7. Apply GLU gate: attn_out *= sigmoid(gate). (per llama.cpp qwen35moe.cpp build_layer_attn)
         ApplySigmoidGate(_attnOut, _gate, qDim);
 
         // 8. Output projection (input dim = numHeads * headDim = 4096; output dim = embDim).
-        FusedMatVec(_hidden, _wO[layer], _attnOut, _embDim, qDim);
+        FusedMatVec(hiddenOut, _wO[layer], _attnOut, _embDim, qDim);
     }
 
     private void Attention(int layer, int position)
@@ -1190,7 +1470,16 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     //  GdnBlock — Gated DeltaNet recurrent step
     // ============================================================
 
-    private void GdnBlock(int layer, int position)
+    private void GdnBlock(int layer, int position) =>
+        GdnBlockAt(layer, position, normIn: _normBuf, hiddenOut: _hidden);
+
+    /// <summary>
+    /// GDN recurrent block parameterised on input-norm + output-hidden pointers. The
+    /// recurrence state itself remains the layer-local <see cref="GdnStateCache"/> slot
+    /// — the caller is responsible for snapshotting it between calls when running the
+    /// batched verify path (issue #30).
+    /// </summary>
+    private void GdnBlockAt(int layer, int position, float* normIn, float* hiddenOut)
     {
         int gdnIdx = _gdnStateCache.GdnLayerOf(layer);
         float* scanState = _gdnStateCache.ScanStateAt(gdnIdx);
@@ -1199,8 +1488,8 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         int scanStateLen = _gdnStateCache.ScanStateFloatsPerLayer;
 
         // 1. Joint QKV projection and z (gate) projection.
-        FusedMatVec(_qkv, _wQkv[layer], _normBuf, _gdnConvChannels, _embDim);
-        FusedMatVec(_z, _wZGate[layer], _normBuf, _gdnValueDim, _embDim);
+        FusedMatVec(_qkv, _wQkv[layer], normIn, _gdnConvChannels, _embDim);
+        FusedMatVec(_z, _wZGate[layer], normIn, _gdnValueDim, _embDim);
         if (_traceLayers) {
             EmitBufTrace(position, layer, "gdn-qkv-mixed",  _qkv, _gdnConvChannels);
             EmitBufTrace(position, layer, "gdn-z",          _z,   _gdnValueDim);
@@ -1262,7 +1551,7 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         SimdKernels.MatVecDual(
             _alpha, aRef.DataPtr,
             _beta,  bRef.DataPtr,
-            _normBuf, _gdnNumVHeads, _embDim, aRef.DType, bRef.DType);
+            normIn, _gdnNumVHeads, _embDim, aRef.DType, bRef.DType);
         if (_traceLayers) {
             EmitBufTrace(position, layer, "gdn-alpha",      _alpha, _gdnNumVHeads);
             EmitBufTrace(position, layer, "gdn-beta",       _beta,  _gdnNumVHeads);
@@ -1302,8 +1591,8 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         }
 
         // 9. Output projection: ssm_out (input ValueDim=4096, output embDim=2048).
-        FusedMatVec(_hidden, _ssmOut[layer], _gdnOut, _embDim, _gdnValueDim);
-        if (_traceLayers) EmitBufTrace(position, layer, "gdn-proj",     _hidden, _embDim);
+        FusedMatVec(hiddenOut, _ssmOut[layer], _gdnOut, _embDim, _gdnValueDim);
+        if (_traceLayers) EmitBufTrace(position, layer, "gdn-proj",     hiddenOut, _embDim);
     }
 
     // ============================================================
@@ -1832,6 +2121,19 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
                 NativeMemory.Free(_mtpPrefillHiddens);
                 _mtpPrefillHiddens = null;
                 _mtpPrefillHiddensCap = 0;
+            }
+            // Issue #30 batched-verify scratch (dense-FFN MTP only).
+            if (_hidden2 != null) NativeMemory.Free(_hidden2);
+            if (_residual2 != null) NativeMemory.Free(_residual2);
+            if (_normBuf2 != null) NativeMemory.Free(_normBuf2);
+            if (_ffnGate2 != null) NativeMemory.Free(_ffnGate2);
+            if (_ffnUp2 != null) NativeMemory.Free(_ffnUp2);
+            if (_logits2 != null) NativeMemory.Free(_logits2);
+            if (_lastHiddenT1 != null) NativeMemory.Free(_lastHiddenT1);
+            if (_batchSnapshotBuf != null)
+            {
+                NativeMemory.Free(_batchSnapshotBuf);
+                _batchSnapshotBuf = null;
             }
             _mtpKvCache?.Dispose();
         }

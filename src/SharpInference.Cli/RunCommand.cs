@@ -115,8 +115,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         public int SpecDraftNMin { get; init; }
 
         [CommandOption("--spec-draft-p-min")]
-        [Description("Min draft probability for probabilistic accept under sampling (default: 0, disabled). Requires --temp > 0 and N>1; issue #38.")]
-        [DefaultValue(0.0f)]
+        [Description("Min draft probability for MTP probabilistic accept (default: 1.0 = strict argmax-match, byte-identical to no-MTP baseline). 0.75 mirrors llama.cpp; values in (0, 1) accept drafts whose softmax probability under the verifier meets the threshold even when they aren't argmax (issue #38).")]
+        [DefaultValue(1.0f)]
         public float SpecDraftPMin { get; init; }
 
         [CommandOption("--min-batch-blas")]
@@ -771,22 +771,22 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                         && noThinking
                         && !envDisabled;
 
-        // Spec flags require N>1 to be meaningful; reject early with a clear pointer
-        // to the issues that will lift these constraints. Auto and Mtp paths both
-        // enforce; None passes through (those flags are no-ops without spec decode).
+        // Spec-decode CLI flag validation:
+        //   --spec-draft-p-min: clamped to [0, 1] at the MtpDecoder boundary. Accepted
+        //     on any spec path. 1.0 (or 0 / unset) = pure argmax-match; p ∈ (0,1) is
+        //     llama.cpp's probabilistic-accept rule from #38. Reject obviously bad input.
+        //   --spec-draft-n-min: accepted as a no-op under N=2 batched verify.
+        //   --spec-draft-n-max == 2 enables #30 batched verify; > 2 still rejected.
         if (sp.SpecType != SpecType.None)
         {
-            if (sp.SpecDraftNMin > 0)
+            if (sp.SpecDraftPMin > 1f)
             {
-                rejectReason = $"--spec-draft-n-min={sp.SpecDraftNMin} requires N>1 draft length (issue #30); not supported until #37 lands.";
-                return false;
-            }
-            if (sp.SpecDraftPMin > 0f)
-            {
-                rejectReason = $"--spec-draft-p-min={sp.SpecDraftPMin} requires probabilistic verify (T>0 + N>1); not supported until #38 lands.";
+                rejectReason = $"--spec-draft-p-min={sp.SpecDraftPMin} must be in [0, 1].";
                 return false;
             }
         }
+
+        int maxBatchN = (mtpFwd is not null && mtpFwd.SupportsBatchVerify) ? 2 : 1;
 
         switch (sp.SpecType)
         {
@@ -797,10 +797,18 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 if (mtpFwd is null || !mtpFwd.HasMtpHead) { rejectReason = "--spec-type mtp requires a model with an MTP head (nextn tensors)."; return false; }
                 if (sp.Temperature > 0f) { rejectReason = "--spec-type mtp requires greedy sampling (--temp 0)."; return false; }
                 if (!noThinking) { rejectReason = "--spec-type mtp requires --no-thinking (chat template must render with enable_thinking=false)."; return false; }
-                if (sp.SpecDraftNMax > 1) { rejectReason = $"--spec-draft-n-max={sp.SpecDraftNMax} is not yet supported (sequential N=1 today; issue #30)."; return false; }
+                if (sp.SpecDraftNMax > maxBatchN)
+                {
+                    rejectReason = $"--spec-draft-n-max={sp.SpecDraftNMax} exceeds the supported N=2 batched verify ceiling (issue #30); N>2 is still TODO.";
+                    return false;
+                }
                 return true;
             default: // Auto
-                if (eligible && sp.SpecDraftNMax > 1) { rejectReason = $"--spec-draft-n-max={sp.SpecDraftNMax} is not yet supported (sequential N=1 today; issue #30)."; return false; }
+                if (eligible && sp.SpecDraftNMax > maxBatchN)
+                {
+                    rejectReason = $"--spec-draft-n-max={sp.SpecDraftNMax} exceeds the supported N=2 batched verify ceiling (issue #30); N>2 is still TODO.";
+                    return false;
+                }
                 return eligible;
         }
     }
@@ -830,7 +838,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         {
             totalDecoded++;
             if (EmitToken(next, tok, streamDec, ref inThinking, hideThinking)) generated++;
-        }, CancellationToken.None);
+        }, pMin: sp.SpecDraftPMin, ct: CancellationToken.None);
 
         // Flush the UTF-8 decoder tail, applying the same hide-thinking gate as DecodeLoop.
         var tail = streamDec.Flush();
