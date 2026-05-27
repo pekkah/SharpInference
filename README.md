@@ -43,10 +43,12 @@ matching chat template).
 | Llama-4 Scout 17B-16E (MoE) | (same) | 61 GB | CUDA `-g -1` (hybrid) | 0.9 | 2.1 | 7 GPU + 41 CPU layers — model dwarfs the 12 GB card, PCIe cost > GPU speedup so CPU-only wins here |
 | Qwen3.6-35B-A3B (GDN+MoE) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | 22 GB | CPU | 4.3 | 7.8 | hybrid GDN/attn, 256 experts / 8 active |
 | Qwen3.6-35B-A3B (GDN+MoE) | (same) | 22 GB | **CUDA** `-g -1` (hybrid) | **11.2** | **23.8** | 10 attn + 30 GDN on GPU; MoE auto-routed to CPU, batched-expert dispatch (8 experts × 3 ops into 2 Parallel.For sweeps), shared expert kept on GPU and overlapped with the CPU routed loop |
-| Qwen3.6-27B-MTP (GDN) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) | 16 GB | CPU `--no-thinking` | 2.8 | 2.7 | dense 27B, hybrid GDN/attn, native MTP head; auto-engages MTP self-spec (issue #25) at greedy + `--no-thinking`. 95% draft acceptance (38/40) after the #40 eh_proj concat fix. N=1 sequential matches MTP-off within bench noise — issue #30 (batched verify + GDN snapshot ring) is what unlocks the ≥1.3× ceiling |
-| Qwen3.6-27B-MTP (GDN) | (same) | 16 GB | **CUDA** `-g -1 --no-thinking` (hybrid) | **5.1** | **6.2** | 20/64 dense FFN layers on GPU (3.3 GB) + GDN + attn KV resident; 44/64 FFN layers on CPU mmap. 95% MTP draft acceptance |
-| Qwen3.6-27B-MTP (GDN) | (same) | 19 GB | CPU `--no-thinking` `Q5_K_M` | 2.5 | 2.4 | Q5_K_M variant, ~10% slower than Q4_K_M as expected from weight bandwidth. 100% draft acceptance (40/40) on this prompt |
-| Qwen3.6-27B-MTP (GDN) | (same) | 19 GB | **CUDA** `-g -1 --no-thinking` `Q5_K_M` (hybrid) | 1.0 | **4.1** | 13/64 FFN layers on GPU (2.4 GB) + GDN + attn KV resident; 51/64 FFN on CPU mmap. Uses `llm_embed_lookup_q5k` direct-read kernel (issue #39). 98% MTP draft acceptance |
+| Qwen3.6-27B-MTP (GDN) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) | 16 GB | CPU `--no-thinking` | 2.8 | **3.8** | dense 27B, hybrid GDN/attn, native MTP head; auto-engages MTP self-spec (issue #25) at greedy + `--no-thinking`. 95% draft acceptance (38/40); batched N=2 verify (#30) + fused Q6_K·Q8_K 2-input dot (#42) lift decode from 2.7 (sequential N=1) to 3.8 — 1.4× over MTP-off baseline |
+| Qwen3.6-27B-MTP (GDN) | (same) | 16 GB | **CUDA** `-g -1 --no-thinking` (hybrid) | **5.1** | **10.0** | 20/64 dense FFN layers on GPU (3.3 GB) + GDN + attn KV resident; 44/64 FFN layers on CPU mmap. 95% draft acceptance; batched verify lifts decode from 6.2 to 10.0 (1.6× over MTP-off baseline of ~6.1) — the win comes from `CpuDenseFfn2` on the CPU FFN majority, on-GPU FFN MatMuls are still per-token sequential (#43) |
+| Qwen3.6-27B-MTP (GDN) | (same) | 19 GB | CPU `--no-thinking` `Q5_K_M` | 2.5 | **3.5** | Q5_K_M variant, ~10% slower than Q4_K_M as expected from weight bandwidth. 100% draft acceptance (40/40) on this prompt; batched verify lifts decode from 2.4 to 3.5 (1.46×) |
+| Qwen3.6-27B-MTP (GDN) | (same) | 19 GB | **CUDA** `-g -1 --no-thinking` `Q5_K_M` (hybrid) | 1.0 | **7.7** | 13/64 FFN layers on GPU (2.4 GB) + GDN + attn KV resident; 51/64 FFN on CPU mmap. Uses `llm_embed_lookup_q5k` direct-read kernel (issue #39). 98% draft acceptance; batched verify lifts decode from 4.1 to 7.7 (1.88×) |
+| Qwen3.6-35B-A3B-MTP (GDN+MoE) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) | 22 GB | CPU `--no-thinking` | 6.6 | 8.3 | hybrid GDN/attn + 256-expert MoE + native MTP head (issue #44). 100% draft acceptance, but `BatchForward2` is gated on `!IsMoE` so N=1 sequential MTP runs — decode is ~0.93× of the 8.9 MTP-off baseline (per-step MTP-forward overhead, no speculative win yet). Batched verify for MoE is a follow-up |
+| Qwen3.6-35B-A3B-MTP (GDN+MoE) | (same) | 22 GB | **CUDA** `-g -1 --no-thinking` (hybrid) | **14.4** | **22.9** | Requires `SHARPI_CPU_MOE=1`: 30 GDN + 10 attn + shared expert on GPU, MoE routed experts + MTP MoE FFN mmap'd on CPU. 100% draft acceptance; sequential MTP at ~0.99× the 23.0 MTP-off baseline (CUDA noise floor). Same `!IsMoE` batched-verify gate as above |
 
 `--backend auto` (default) picks CUDA when available, sizing the GPU/CPU split from
 VRAM via TierPlanner; falls through to Vulkan only when CUDA isn't present.
@@ -77,11 +79,14 @@ at the end of the run so the acceptance gap is visible.
 
 CLI surface mirrors llama.cpp: `--spec-type <auto|none|mtp|draft-mtp>` forces
 on/off (default `auto` matches the eligibility check above); `--spec-draft-n-max
-<int>` sets the draft depth per spec step. `SHARPI_DISABLE_MTP=1` remains a
-back-compat off-switch. Sharpi today implements sequential N=1 verify, so
-`--spec-draft-n-max > 1` errors with a pointer to [issue
-#30](https://github.com/pekkah/SharpInference/issues/30) (Phase-7 batched verify
-+ GDN snapshot ring — the prerequisite for the ≥1.3× decode speedup).
+<int>` sets the draft depth per spec step (1 or 2; >2 isn't implemented yet —
+that needs tree drafts);  `--spec-draft-p-min <0..1>` accepts a draft when
+`softmax(main)[draft] ≥ p` even if it isn't the argmax (lossy but higher
+acceptance). `SHARPI_DISABLE_MTP=1` is the back-compat off-switch;
+`SHARPI_DISABLE_BATCH_VERIFY=1` forces the legacy sequential N=1 path for
+parity bisection. Batched N=2 verify (issue #30) is the default for dense
+MTP models — MoE MTP models (Qwen3.6-35B-A3B-MTP) currently fall back to
+sequential because `MatVec2In` is dense-only.
 `--spec-draft-n-min` / `--spec-draft-p-min` are not yet wired (issues #37, #38).
 
 ### Reasoning models
