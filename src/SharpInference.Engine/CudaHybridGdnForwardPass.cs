@@ -129,7 +129,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     // Embedding + output
     private readonly Tensor? _gpuEmbedding;
-    private readonly bool _embIsQuantized;
+    private readonly DType _embDType;  // dtype of the on-GPU embedding bytes (Q4_K, Q5_K, or Float32)
     private readonly Tensor? _gpuOutputNorm;
     private readonly Tensor? _gpuOutputWeight;
 
@@ -483,7 +483,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (!cpuFixedWeights)
         {
             TraceVram("before embedding upload");
-            _gpuEmbedding = UploadEmbeddingWeight("token_embd.weight", out _embIsQuantized);
+            _gpuEmbedding = UploadEmbeddingWeight("token_embd.weight", out _embDType);
             TraceVram("after embedding upload");
             _gpuOutputNorm = UploadWeight("output_norm.weight");
             _gpuOutputWeight = model.FindTensor("output.weight") is not null
@@ -1011,14 +1011,33 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _snapshotCap = needed;
     }
 
+    /// <summary>
+    /// Dispatch the per-token embedding lookup into <paramref name="dst"/> based on
+    /// the on-GPU embedding table's dtype. Q4_K + Q5_K both have direct-read NVRTC
+    /// kernels (issue #39); other dtypes are F32-expanded at load time and read via
+    /// the F32 path.
+    /// </summary>
+    private void EmbedToken(Tensor dst, int token)
+    {
+        switch (_embDType)
+        {
+            case DType.Q4_K:
+                _gpu.EmbedLookupQ4K(_gpuEmbedding!, dst, token, _embDim);
+                break;
+            case DType.Q5_K:
+                _gpu.EmbedLookupQ5K(_gpuEmbedding!, dst, token, _embDim);
+                break;
+            default:
+                _gpu.EmbedLookup(_gpuEmbedding!, dst, token, _embDim);
+                break;
+        }
+    }
+
     /// <summary>Forward one token through the hybrid CUDA + CPU stack.</summary>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
         // 1. Embedding → _gpuHidden
-        if (_embIsQuantized)
-            _gpu.EmbedLookupQ4K(_gpuEmbedding!, _gpuHidden, token, _embDim);
-        else
-            _gpu.EmbedLookup(_gpuEmbedding!, _gpuHidden, token, _embDim);
+        EmbedToken(_gpuHidden, token);
 
         if (_traceLayers) TraceGpuTensor(position, -1, "emb", _gpuHidden, _embDim);
 
@@ -1190,10 +1209,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpu.UploadInto(_gpuLastHidden, prevHidden);
 
         // 2. Embed token → _gpuMtpEmbedBuf.
-        if (_embIsQuantized)
-            _gpu.EmbedLookupQ4K(_gpuEmbedding!, _gpuMtpEmbedBuf, token, _embDim);
-        else
-            _gpu.EmbedLookup(_gpuEmbedding!, _gpuMtpEmbedBuf, token, _embDim);
+        EmbedToken(_gpuMtpEmbedBuf, token);
 
         // 3. enorm(embedding) → _gpuMtpEnormBuf; hnorm(prevHidden) → _gpuMtpHnormBuf.
         _gpu.RmsNorm(_gpuMtpEnormBuf, _gpuMtpEmbedBuf,  _gpuMtpEnorm, _hp.RmsNormEps);
@@ -1952,13 +1968,16 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         return result;
     }
 
-    private Tensor UploadEmbeddingWeight(string name, out bool isQuantized)
+    private Tensor UploadEmbeddingWeight(string name, out DType embDType)
     {
         var info = _model.FindTensor(name)
             ?? throw new InvalidOperationException($"Missing tensor: {name}");
         var data = _model.GetTensorData(info);
 
-        if (info.DType == DType.Q4_K)
+        // Raw-bytes upload path for quants we can decode on-device. Q4_K and Q5_K
+        // both have NVRTC embedding-lookup kernels (issues #25 fix, #39); other
+        // dtypes fall through to F32 expansion (capped by ShouldKeepFixedWeightsOnCpu).
+        if (info.DType == DType.Q4_K || info.DType == DType.Q5_K)
         {
             int floatCount = data.Length / 4;
             var rawFloats = new float[floatCount];
@@ -1967,8 +1986,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             // power-of-2 round-up that would otherwise inflate a 715 MiB Q4_K embed
             // to a 1024 MiB GPU allocation.
             var result = _gpu.Upload(rawFloats, TensorShape.D1(floatCount), exact: true);
-            _gpuWeightDTypes[result.Handle] = DType.Q4_K;
-            isQuantized = true;
+            _gpuWeightDTypes[result.Handle] = info.DType;
+            embDType = info.DType;
             return result;
         }
         int count = (int)info.ElementCount;
@@ -1979,7 +1998,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             Dequantize.ToFloat32(data, f32, info.DType, count);
         var t = _gpu.Upload(f32, TensorShape.D1(count), exact: true);
         _gpuWeightDTypes[t.Handle] = DType.Float32;
-        isQuantized = false;
+        embDType = DType.Float32;
         return t;
     }
 
@@ -2073,7 +2092,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     private static long EstimateGpuEmbeddingBytes(GgufTensorInfo tensor)
     {
-        if (tensor.DType == DType.Q4_K)
+        // Quants with a direct-read embedding kernel stay raw on the GPU.
+        if (tensor.DType == DType.Q4_K || tensor.DType == DType.Q5_K)
             return (tensor.ByteSize + 3) & ~3L;
         return tensor.ElementCount * sizeof(float);
     }

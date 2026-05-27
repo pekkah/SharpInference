@@ -468,6 +468,89 @@ extern ""C"" __global__ void llm_embed_lookup_q4k(
     }
 }
 
+// ── Embedding lookup from Q5_K table (issue #39) ───────────────────────────
+// One block of 256 threads dequantizes one row (= emb_dim elements).
+// emb_dim must be a multiple of 256 (Q5_K block size).
+//
+// Q5_K block (176 bytes per 256 elements):
+//   [0:2]     fp16 d
+//   [2:4]     fp16 dmin
+//   [4:16]    scales[12] — packed 6-bit (scale, min) pairs
+//   [16:48]   qh[32]     — high bit per element
+//   [48:176]  ql[128]    — lower 4 bits, two elements per byte
+//
+// Element decoding mirrors llm_matvec_q5k's per-(chunk, lane) layout: for each
+// 256-element block, tid splits into (chunk in 0..3, sub in 0..63, is_upper,
+// byte_pos in 0..31). Lower 4 bits come from ql; high bit from qh; the
+// (scale, min) pair is chosen by is_upper from the chunk's two pairs.
+extern ""C"" __global__ void llm_embed_lookup_q5k(
+    const unsigned char* __restrict__ emb_data,
+    float* __restrict__ output,
+    int token_id, int emb_dim)
+{
+    __shared__ unsigned char blk[176];
+    unsigned int tid = threadIdx.x;
+
+    int num_blocks = emb_dim >> 8;
+    long bytes_per_row = (long)num_blocks * 176L;
+    long row_byte_base = (long)token_id * bytes_per_row;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long blk_byte_base = row_byte_base + (long)block * 176L;
+        if (tid < 176)
+            blk[tid] = emb_data[blk_byte_base + tid];
+        __syncthreads();
+
+        // d, dmin: first two fp16s (4 bytes).
+        unsigned int dword0 =
+              ((unsigned int)blk[0])
+            | ((unsigned int)blk[1] << 8)
+            | ((unsigned int)blk[2] << 16)
+            | ((unsigned int)blk[3] << 24);
+        float d    = sharpi_fp16_to_fp32(dword0 & 0xffffu);
+        float dmin = sharpi_fp16_to_fp32(dword0 >> 16);
+
+        unsigned int chunk    = tid >> 6;          // 0..3
+        unsigned int sub      = tid & 63u;         // 0..63
+        unsigned int is_upper = (sub >= 32u) ? 1u : 0u;
+        unsigned int byte_pos = sub & 31u;         // 0..31
+
+        // Decode the chunk's (scale, min) pair for our half (low if !is_upper,
+        // high if is_upper). j = 2*chunk + is_upper. Same packing as Q4_K /
+        // ggml's get_scale_min_k4. scales[] starts at blk[4], 12 bytes wide.
+        unsigned int j = chunk * 2u + is_upper;
+        float sc, mn;
+        if (j < 4u) {
+            // scales[j] low-6 bits = scale, scales[j+4] low-6 bits = min.
+            sc = (float)(blk[4 + j] & 63u);
+            mn = (float)(blk[4 + j + 4u] & 63u);
+        } else {
+            // Pairs 4..7: scale = (scales[j+4] & 0xF) | ((scales[j-4] >> 6) << 4)
+            //             min   = (scales[j+4] >> 4)  | ((scales[j]   >> 6) << 4)
+            unsigned int a = blk[4 + j + 4u];       // scales[j+4]
+            unsigned int b = blk[4 + (j - 4u)];     // scales[j-4]
+            unsigned int c = blk[4 + j];            // scales[j]
+            sc = (float)((a & 0xFu) | (((b >> 6) & 3u) << 4));
+            mn = (float)(((a >> 4) & 0xFu) | (((c >> 6) & 3u) << 4));
+        }
+
+        // qh bit: chunk c uses bit (2c + is_upper) of qh[byte_pos].
+        unsigned int qh_byte = blk[16 + byte_pos];
+        unsigned int u = 1u << (2u * chunk + is_upper);
+        int hbit = (qh_byte & u) != 0u ? 16 : 0;
+
+        // ql byte: low nibble for !is_upper, high nibble for is_upper. Offset
+        // within ql is chunk*32 + byte_pos (matvec uses the same address; the
+        // (lo, hi) split there feeds two elements per byte from one lane).
+        unsigned int ql_byte = blk[48 + chunk * 32u + byte_pos];
+        unsigned int nibble = is_upper ? (ql_byte >> 4) : (ql_byte & 0xFu);
+
+        output[block * 256 + (int)tid] = d * sc * (float)((int)nibble + hbit) - dmin * mn;
+
+        __syncthreads();
+    }
+}
+
 // ── MatVec F32 ─────────────────────────────────────────────────────────────
 // 256 threads/block, 8 rows/block, 32 threads/row → warp reduce.
 // One grid dim x covers ceil(rows/8) blocks.

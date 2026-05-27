@@ -80,6 +80,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _kvAppendKernel;
     private nint   _embedLookupF32Kernel;
     private nint   _embedLookupQ4KKernel;
+    private nint   _embedLookupQ5KKernel;
     private nint   _matvecF32Kernel;
     private nint   _matvecQ4KKernel;
     private nint   _matvecQ5KKernel;
@@ -1340,6 +1341,30 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(embed_lookup_q4k) failed: {r}");
     }
 
+    /// <summary>
+    /// Dequantize one row from a Q5_K-packed embedding table directly into <paramref name="output"/>.
+    /// <paramref name="embDim"/> must be a multiple of 256 (Q5_K block size).
+    /// </summary>
+    public void EmbedLookupQ5K(Tensor embTable, Tensor output, int tokenId, int embDim)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if ((embDim & 0xff) != 0)
+            throw new ArgumentException($"EmbedLookupQ5K requires embDim to be a multiple of 256 (got {embDim}).");
+
+        nint tP = GetDevPtr(embTable);
+        nint oP = GetDevPtr(output);
+        int  pT = tokenId, pE = embDim;
+        nint* args = stackalloc nint[4]
+        {
+            (nint)(&tP), (nint)(&oP),
+            (nint)(&pT), (nint)(&pE)
+        };
+        int r = NvrtcInterop.LaunchKernel(_embedLookupQ5KKernel, 1, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(embed_lookup_q5k) failed: {r}");
+    }
+
     /// <summary>Set every element of <paramref name="dst"/> to zero.</summary>
     public void Clear(Tensor dst)
     {
@@ -1742,7 +1767,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _rmsNormKernel, _headNormKernel, _headNormPureKernel, _siluMulKernel, _sigmoidKernel,
             _softmaxKernel, _ropeInterleavedKernel, _ropeNeoxKernel, _ropeNeoxPartialKernel,
             _mulKernel, _sigmoidMulInPlaceKernel, _splitQgKernel, _kvAppendKernel,
-            _embedLookupF32Kernel, _embedLookupQ4KKernel,
+            _embedLookupF32Kernel, _embedLookupQ4KKernel, _embedLookupQ5KKernel,
             _matvecF32Kernel, _matvecQ4KKernel, _matvecQ5KKernel, _matvecQ6KKernel,
             _attentionKernel, _clearF32Kernel, _quantizeQ81Kernel,
             _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
@@ -1785,6 +1810,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _kvAppendKernel        = GetKernelFunc("llm_kv_append");
         _embedLookupF32Kernel  = GetKernelFunc("llm_embed_lookup_f32");
         _embedLookupQ4KKernel  = GetKernelFunc("llm_embed_lookup_q4k");
+        _embedLookupQ5KKernel  = GetKernelFunc("llm_embed_lookup_q5k");
         _matvecF32Kernel       = GetKernelFunc("llm_matvec_f32");
         _matvecQ4KKernel       = GetKernelFunc("llm_matvec_q4k");
         _matvecQ5KKernel       = GetKernelFunc("llm_matvec_q5k");
