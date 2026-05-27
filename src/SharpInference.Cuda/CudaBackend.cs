@@ -85,6 +85,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _matvecQ4KKernel;
     private nint   _matvecQ5KKernel;
     private nint   _matvecQ6KKernel;
+    // Issue #43: N=2 (two-input, two-output) variants — read each weight row
+    // once and accumulate into two outputs. Used by MTP BatchForward2's
+    // on-GPU dense FFN to halve weight-bandwidth cost per output.
+    private nint   _matvecF32N2Kernel;
+    private nint   _matvecQ4KN2Kernel;
+    private nint   _matvecQ5KN2Kernel;
+    private nint   _matvecQ6KN2Kernel;
     private nint   _attentionKernel;
     private nint   _clearF32Kernel;
     private nint   _quantizeQ81Kernel;
@@ -106,6 +113,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // never shrinks. Sized in 36-byte sub-blocks (one block_q8_1 per 32 elements).
     private nint   _q81Buf;
     private nuint  _q81BufSize;
+    // Issue #43: second Q8_1 scratch for MatMulN2's second input vector.
+    // Same grow-only sizing policy as _q81Buf. Only allocated when MatMulN2
+    // dispatches the Q4_K path (sequential MatMul callers never touch it).
+    private nint   _q81BufB;
+    private nuint  _q81BufBSize;
 
     // Tracks dtype per tensor handle so MatMul can dispatch to the right matvec variant
     // (Q4_K / Q5_K / Q6_K / F32). Norm/bias weights upload as F32; quantized weight bytes
@@ -813,6 +825,138 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>
+    /// Two-input matrix-vector multiply: produces <paramref name="outputA"/> and
+    /// <paramref name="outputB"/> from a single <paramref name="matrix"/> read,
+    /// dispatched to a per-dtype custom kernel (<c>llm_matvec_*_n2</c>). The
+    /// weight matrix is read once per row, then folded into two independent
+    /// dot products — halves the per-output weight bandwidth versus two
+    /// sequential <see cref="MatMul"/> calls, mirroring the CPU
+    /// <c>SimdKernels.MatVec2In</c> design. Used by MTP batched-verify
+    /// (issue #43, follow-up to #30) to amortise on-GPU dense FFN weight
+    /// reads across the two draft tokens.
+    /// </summary>
+    public void MatMulN2(Tensor outputA, Tensor outputB,
+                        Tensor matrix,
+                        Tensor inputA, Tensor inputB,
+                        DType weightDType)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available on this system.");
+
+        if (outputA.ElementCount != outputB.ElementCount)
+            throw new ArgumentException(
+                $"MatMulN2: outputA.ElementCount ({outputA.ElementCount}) != outputB.ElementCount ({outputB.ElementCount}).");
+        if (inputA.ElementCount != inputB.ElementCount)
+            throw new ArgumentException(
+                $"MatMulN2: inputA.ElementCount ({inputA.ElementCount}) != inputB.ElementCount ({inputB.ElementCount}).");
+
+        int rows = (int)outputA.ElementCount;
+        int cols = (int)inputA.ElementCount;
+        nint wPtr  = GetDevPtr(matrix);
+        nint xAPtr = GetDevPtr(inputA);
+        nint xBPtr = GetDevPtr(inputB);
+        nint yAPtr = GetDevPtr(outputA);
+        nint yBPtr = GetDevPtr(outputB);
+
+        if (weightDType == DType.Q4_K)
+        {
+            DispatchMatVecQ4KN2(wPtr, xAPtr, xBPtr, yAPtr, yBPtr, rows, cols);
+            return;
+        }
+
+        int  pRows = rows, pCols = cols;
+        nint* args = stackalloc nint[7]
+        {
+            (nint)(&wPtr),
+            (nint)(&xAPtr), (nint)(&xBPtr),
+            (nint)(&yAPtr), (nint)(&yBPtr),
+            (nint)(&pRows), (nint)(&pCols)
+        };
+
+        nint kernel = weightDType switch
+        {
+            DType.Q5_K    => _matvecQ5KN2Kernel,
+            DType.Q6_K    => _matvecQ6KN2Kernel,
+            DType.Float32 => _matvecF32N2Kernel,
+            _ => throw new NotSupportedException(
+                $"CUDA MatMulN2: weight dtype {weightDType} not supported (expected Q4_K, Q5_K, Q6_K, or Float32)."),
+        };
+
+        uint grid = (uint)((rows + 7) / 8);
+        int r = NvrtcInterop.LaunchKernel(kernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_n2) failed: {r}");
+    }
+
+    /// <summary>
+    /// Convenience overload: looks up the weight dtype from the
+    /// <see cref="UploadRaw"/> tag dictionary, matching the single-input
+    /// <see cref="MatMul(Tensor, Tensor, Tensor)"/> behaviour.
+    /// </summary>
+    public void MatMulN2(Tensor outputA, Tensor outputB,
+                        Tensor matrix,
+                        Tensor inputA, Tensor inputB)
+    {
+        var dtype = _tensorDTypes.GetValueOrDefault(matrix.Handle, matrix.DType);
+        MatMulN2(outputA, outputB, matrix, inputA, inputB, dtype);
+    }
+
+    /// <summary>
+    /// Q4_K N=2 matvec: quantizes both input vectors into independent Q8_1
+    /// scratches (<c>_q81Buf</c> for A, <c>_q81BufB</c> for B), then dispatches
+    /// the cooperative <c>llm_matvec_q4k_n2</c> kernel that reads each weight
+    /// super-block once and accumulates into two outputs per row.
+    /// </summary>
+    private void DispatchMatVecQ4KN2(nint wPtr, nint xAPtr, nint xBPtr,
+                                     nint yAPtr, nint yBPtr,
+                                     int rows, int cols)
+    {
+        if ((cols & 0xff) != 0)
+            throw new InvalidOperationException(
+                $"CUDA matvec_q4k_n2 requires cols % 256 == 0 (got {cols}).");
+
+        int subBlocks = cols / 32;
+        nuint q81Bytes = (nuint)((long)subBlocks * 36L);
+        EnsureQ81Buf(q81Bytes);
+        EnsureQ81BufB(q81Bytes);
+
+        // Quantize both inputs into their own Q8_1 scratch (32 threads per sub-block).
+        // Two unrolled launches — keeps stackalloc out of any loop (CA2014).
+        nint qInA  = xAPtr;
+        nint qOutA = _q81Buf;
+        nint qInB  = xBPtr;
+        nint qOutB = _q81BufB;
+        int  qN    = cols;
+        nint* qArgsA = stackalloc nint[3] { (nint)(&qInA), (nint)(&qOutA), (nint)(&qN) };
+        int rqA = NvrtcInterop.LaunchKernel(
+            _quantizeQ81Kernel, (uint)subBlocks, 1, 1,
+            32, 1, 1, 0, _stream, qArgsA, null);
+        if (rqA != 0) throw new InvalidOperationException($"cuLaunchKernel(quantize_q8_1 A) failed: {rqA}");
+        nint* qArgsB = stackalloc nint[3] { (nint)(&qInB), (nint)(&qOutB), (nint)(&qN) };
+        int rqB = NvrtcInterop.LaunchKernel(
+            _quantizeQ81Kernel, (uint)subBlocks, 1, 1,
+            32, 1, 1, 0, _stream, qArgsB, null);
+        if (rqB != 0) throw new InvalidOperationException($"cuLaunchKernel(quantize_q8_1 B) failed: {rqB}");
+
+        {
+            nint q81PtrA = _q81Buf;
+            nint q81PtrB = _q81BufB;
+            int  pRows   = rows, pCols = cols;
+            nint* args = stackalloc nint[7]
+            {
+                (nint)(&wPtr),
+                (nint)(&q81PtrA), (nint)(&q81PtrB),
+                (nint)(&yAPtr),   (nint)(&yBPtr),
+                (nint)(&pRows),   (nint)(&pCols)
+            };
+            int rm = NvrtcInterop.LaunchKernel(
+                _matvecQ4KN2Kernel, (uint)rows, 1, 1,
+                32, 8, 1, 0, _stream, args, null);
+            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_q4k_n2) failed: {rm}");
+        }
+    }
+
+    /// <summary>
     /// Q4_K matvec via the llama.cpp Q8_1 + __dp4a path. Quantizes <paramref name="xPtr"/>
     /// (cols floats) into the persistent Q8_1 scratch in 32-element sub-blocks, then
     /// dispatches the cooperative matvec (1 row per block, 4 warps cooperating).
@@ -878,6 +1022,21 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         int r = CuBlasInterop.CudaMalloc(out _q81Buf, newSize);
         if (r != 0) throw new InvalidOperationException($"cudaMalloc(q8_1 scratch, {newSize} B) failed: {r}");
         _q81BufSize = newSize;
+    }
+
+    private void EnsureQ81BufB(nuint required)
+    {
+        if (_q81BufB != nint.Zero && _q81BufBSize >= required) return;
+        if (_q81BufB != nint.Zero)
+        {
+            CuBlasInterop.CudaFree(_q81BufB);
+            _q81BufB = nint.Zero;
+            _q81BufBSize = 0;
+        }
+        nuint newSize = (required + 0xffffu) & ~(nuint)0xffffu;
+        int r = CuBlasInterop.CudaMalloc(out _q81BufB, newSize);
+        if (r != 0) throw new InvalidOperationException($"cudaMalloc(q8_1 scratch B, {newSize} B) failed: {r}");
+        _q81BufBSize = newSize;
     }
 
     public void AddInPlace(Tensor dst, Tensor src)
@@ -1793,6 +1952,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _mulKernel, _sigmoidMulInPlaceKernel, _splitQgKernel, _kvAppendKernel,
             _embedLookupF32Kernel, _embedLookupQ4KKernel, _embedLookupQ5KKernel,
             _matvecF32Kernel, _matvecQ4KKernel, _matvecQ5KKernel, _matvecQ6KKernel,
+            _matvecF32N2Kernel, _matvecQ4KN2Kernel, _matvecQ5KN2Kernel, _matvecQ6KN2Kernel,
             _attentionKernel, _clearF32Kernel, _quantizeQ81Kernel,
             _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
             _siluInplaceKernel, _gdnConv1dDecodeKernel, _gdnL2NormPerHeadKernel,
@@ -1839,6 +1999,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _matvecQ4KKernel       = GetKernelFunc("llm_matvec_q4k");
         _matvecQ5KKernel       = GetKernelFunc("llm_matvec_q5k");
         _matvecQ6KKernel       = GetKernelFunc("llm_matvec_q6k");
+        _matvecF32N2Kernel     = GetKernelFunc("llm_matvec_f32_n2");
+        _matvecQ4KN2Kernel     = GetKernelFunc("llm_matvec_q4k_n2");
+        _matvecQ5KN2Kernel     = GetKernelFunc("llm_matvec_q5k_n2");
+        _matvecQ6KN2Kernel     = GetKernelFunc("llm_matvec_q6k_n2");
         _attentionKernel       = GetKernelFunc("llm_attention");
         _clearF32Kernel        = GetKernelFunc("llm_clear_f32");
         _quantizeQ81Kernel     = GetKernelFunc("llm_quantize_q8_1");
@@ -2191,6 +2355,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             CuBlasInterop.CudaFree(_q81Buf);
             _q81Buf = nint.Zero;
             _q81BufSize = 0;
+        }
+        if (_q81BufB != nint.Zero)
+        {
+            CuBlasInterop.CudaFree(_q81BufB);
+            _q81BufB = nint.Zero;
+            _q81BufBSize = 0;
         }
 
         CuBlasInterop.Destroy(_handle);

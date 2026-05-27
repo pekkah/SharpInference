@@ -1352,7 +1352,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _gpu.RmsNorm(_gpuNormBuf2, _gpuHidden2, _gpuPostAttnNorm[layer], _hp.RmsNormEps);
 
             // FFN dispatch.
-            //   Dense GPU layer  → two sequential GpuDenseFfns (L2 reuse).
+            //   Dense GPU layer  → batched GpuDenseFfn2At (issue #43 — single
+            //                      weight read per row, two outputs).
             //   Dense CPU layer  → batched CpuDenseFfn2 (MatVec2In win).
             //   MoE CPU layer    → two sequential CpuMoeFfn calls (issue #45).
             //   MoE GPU layer    → two sequential GpuMoeFfn calls.
@@ -1363,10 +1364,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             {
                 if (_gpuWFfnGate is not null && _gpuWFfnGate[layer] is not null)
                 {
-                    GpuDenseFfnAt(layer, normIn: _gpuNormBuf,  hiddenOut: _gpuHidden,
-                                  gateBuf: _gpuFfnGateBufDense!, upBuf: _gpuFfnUpBufDense!);
-                    GpuDenseFfnAt(layer, normIn: _gpuNormBuf2, hiddenOut: _gpuHidden2,
-                                  gateBuf: _gpuFfnGateBufDense2!, upBuf: _gpuFfnUpBufDense2!);
+                    GpuDenseFfn2At(layer,
+                        normIn1:    _gpuNormBuf,
+                        normIn2:    _gpuNormBuf2,
+                        hiddenOut1: _gpuHidden,
+                        hiddenOut2: _gpuHidden2,
+                        gateBuf1:   _gpuFfnGateBufDense!,
+                        gateBuf2:   _gpuFfnGateBufDense2!,
+                        upBuf1:     _gpuFfnUpBufDense!,
+                        upBuf2:     _gpuFfnUpBufDense2!);
                 }
                 else
                 {
@@ -2035,6 +2041,30 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         GpuMatMul(hiddenOut, wDown, gateBuf);
     }
 
+    /// <summary>
+    /// Issue #43: two-token variant of <see cref="GpuDenseFfnAt"/>. Each of
+    /// the three FFN MatMuls (gate, up, down) is dispatched as a single
+    /// <c>MatMulN2</c> that reads the weight tensor once and accumulates into
+    /// the two token-side outputs in lockstep. SiLuMul runs twice (cheap,
+    /// purely element-wise on independent scratches).
+    /// </summary>
+    private void GpuDenseFfn2At(int layer,
+                                Tensor normIn1, Tensor normIn2,
+                                Tensor hiddenOut1, Tensor hiddenOut2,
+                                Tensor gateBuf1, Tensor gateBuf2,
+                                Tensor upBuf1,   Tensor upBuf2)
+    {
+        var wGate = _gpuWFfnGate![layer]!;
+        var wUp   = _gpuWFfnUp![layer]!;
+        var wDown = _gpuWFfnDown![layer]!;
+
+        GpuMatMulN2(gateBuf1, gateBuf2, wGate, normIn1, normIn2);
+        GpuMatMulN2(upBuf1,   upBuf2,   wUp,   normIn1, normIn2);
+        _gpu.SiLuMul(gateBuf1, upBuf1);
+        _gpu.SiLuMul(gateBuf2, upBuf2);
+        GpuMatMulN2(hiddenOut1, hiddenOut2, wDown, gateBuf1, gateBuf2);
+    }
+
     // =================================================================
     //  TryUploadDenseFfnLayers — opportunistically upload as many dense FFN
     //  layers' ffn_gate/up/down to GPU as fit in remaining VRAM. Reserves
@@ -2315,6 +2345,18 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private void GpuMatMul(Tensor output, Tensor matrix, Tensor vector)
     {
         _gpu.MatMul(output, matrix, vector,
+            _gpuWeightDTypes.TryGetValue(matrix.Handle, out var dt) ? dt : DType.Float32);
+    }
+
+    /// Issue #43: two-input MatMul dispatch — used by GpuDenseFfn2At so the
+    /// FFN gate / up / down weights get read from VRAM once per (row, lane)
+    /// for both draft tokens instead of twice.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void GpuMatMulN2(Tensor outputA, Tensor outputB,
+                             Tensor matrix,
+                             Tensor inputA, Tensor inputB)
+    {
+        _gpu.MatMulN2(outputA, outputB, matrix, inputA, inputB,
             _gpuWeightDTypes.TryGetValue(matrix.Handle, out var dt) ? dt : DType.Float32);
     }
 
