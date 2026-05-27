@@ -235,10 +235,23 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     private readonly float* _mtpKNorm;                // [headDim]
     private readonly TensorRef _mtpPostAttnNorm;
 
-    // MTP dense FFN tensors (Q4_K gate/up, Q6_K down typically)
+    // MTP dense FFN tensors (Q4_K gate/up, Q6_K down typically). Populated only when
+    // !_mtpIsMoE — qwen35 27B-MTP path.
     private readonly TensorRef _mtpFfnGate;
     private readonly TensorRef _mtpFfnUp;
     private readonly TensorRef _mtpFfnDown;
+
+    // MTP MoE FFN tensors (qwen35moe 35B-A3B-MTP). Populated only when _mtpIsMoE.
+    // Mirrors the per-layer trunk MoE arrays but holds a single block's worth.
+    private readonly bool _mtpIsMoE;
+    private readonly TensorRef _mtpWGateInp;       // router [embDim, numExperts]
+    private readonly TensorRef _mtpWGateShexp;
+    private readonly TensorRef _mtpWUpShexp;
+    private readonly TensorRef _mtpWDownShexp;
+    private readonly TensorRef _mtpWGateExps;      // [numExperts, expertDim, embDim]
+    private readonly TensorRef _mtpWUpExps;
+    private readonly TensorRef _mtpWDownExps;
+    private readonly float* _mtpWGateInpShexpVec;  // [embDim] F32 — shared-expert sigmoid gate
 
     // nextn.* tensors: pre-fc enorm + hnorm, eh_proj, post-block shared_head_norm
     private readonly float* _mtpEnorm;                // [embDim] F32 gain
@@ -465,9 +478,34 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             _mtpQNorm          = LoadF32Tensor($"blk.{mtpLayerIdx}.attn_q_norm.weight", _headDim);
             _mtpKNorm          = LoadF32Tensor($"blk.{mtpLayerIdx}.attn_k_norm.weight", _headDim);
             _mtpPostAttnNorm   = ResolveTensor($"blk.{mtpLayerIdx}.post_attention_norm.weight");
-            _mtpFfnGate        = ResolveTensor($"blk.{mtpLayerIdx}.ffn_gate.weight");
-            _mtpFfnUp          = ResolveTensor($"blk.{mtpLayerIdx}.ffn_up.weight");
-            _mtpFfnDown        = ResolveTensor($"blk.{mtpLayerIdx}.ffn_down.weight");
+
+            // MoE-MTP vs dense-MTP probe (issue #44). qwen35moe-A3B-MTP places MoE
+            // FFN at the MTP block (ffn_gate_exps/_shexp), qwen35 27B-MTP places dense
+            // ffn_gate/up/down. We assume MTP-MoE only co-exists with trunk MoE —
+            // the GGUF MoE hyperparams (numExperts, expertDim) drive both paths.
+            _mtpIsMoE = model.FindTensor($"blk.{mtpLayerIdx}.ffn_gate_exps.weight") is not null;
+            if (_mtpIsMoE && !hp.IsMoE)
+                throw new NotSupportedException(
+                    "MoE MTP head requires trunk MoE (NumExperts/ExpertIntermediateDim from hyperparams). " +
+                    "Dense-trunk + MoE-MTP-head is not a configuration we've seen.");
+
+            if (_mtpIsMoE)
+            {
+                _mtpWGateInp        = ResolveTensor($"blk.{mtpLayerIdx}.ffn_gate_inp.weight");
+                _mtpWGateShexp      = ResolveTensor($"blk.{mtpLayerIdx}.ffn_gate_shexp.weight");
+                _mtpWUpShexp        = ResolveTensor($"blk.{mtpLayerIdx}.ffn_up_shexp.weight");
+                _mtpWDownShexp      = ResolveTensor($"blk.{mtpLayerIdx}.ffn_down_shexp.weight");
+                _mtpWGateExps       = ResolveTensor($"blk.{mtpLayerIdx}.ffn_gate_exps.weight");
+                _mtpWUpExps         = ResolveTensor($"blk.{mtpLayerIdx}.ffn_up_exps.weight");
+                _mtpWDownExps       = ResolveTensor($"blk.{mtpLayerIdx}.ffn_down_exps.weight");
+                _mtpWGateInpShexpVec = LoadF32Tensor($"blk.{mtpLayerIdx}.ffn_gate_inp_shexp.weight", _embDim);
+            }
+            else
+            {
+                _mtpFfnGate    = ResolveTensor($"blk.{mtpLayerIdx}.ffn_gate.weight");
+                _mtpFfnUp      = ResolveTensor($"blk.{mtpLayerIdx}.ffn_up.weight");
+                _mtpFfnDown    = ResolveTensor($"blk.{mtpLayerIdx}.ffn_down.weight");
+            }
 
             _mtpEnorm          = LoadF32Tensor($"blk.{mtpLayerIdx}.nextn.enorm.weight", _embDim);
             _mtpHnorm          = LoadF32Tensor($"blk.{mtpLayerIdx}.nextn.hnorm.weight", _embDim);
@@ -512,10 +550,10 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             // is needed as MTP input. Sized at embDim, refreshed each Forward.
             _lastHidden = Alloc(_embDim);
 
-            // Issue #30: batched verify scratch. Only allocated for the dense-FFN MTP
-            // path (qwen35 27B-MTP). MoE MTP variants are unsupported here — both the
-            // MTP loader (project_mtp_moe_ffn_head_unsupported memory) and the FFN
-            // batching primitive (MatVec2In) target dense weights only.
+            // Issue #30: batched verify scratch. Only allocated for the all-dense path
+            // (qwen35 27B-MTP). Both the trunk MoE FFN and the MTP MoE FFN are
+            // unsupported in BatchForward2 — MatVec2In targets dense weights only.
+            // Since _mtpIsMoE → hp.IsMoE is enforced at load, !hp.IsMoE covers both.
             if (!hp.IsMoE)
             {
                 _hidden2 = Alloc(_embDim);
@@ -1307,14 +1345,25 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         var mtpPostNormW = GetNormWeight(_mtpPostAttnNorm);
         SimdKernels.RmsNorm(_normBuf, _hidden, mtpPostNormW, _embDim, _hp.RmsNormEps);
 
-        // 9. Dense FFN (gate × up → down).
-        SimdKernels.MatVecDual(
-            _ffnGate, _mtpFfnGate.DataPtr,
-            _ffnUp,   _mtpFfnUp.DataPtr,
-            _normBuf, _intermDim, _embDim,
-            _mtpFfnGate.DType, _mtpFfnUp.DType);
-        SimdKernels.SiLuMul(_ffnGate, _ffnUp, _intermDim);
-        FusedMatVec(_hidden, _mtpFfnDown, _ffnGate, _embDim, _intermDim);
+        // 9. FFN — MoE (qwen35moe 35B-A3B-MTP) or dense (qwen35 27B-MTP).
+        if (_mtpIsMoE)
+        {
+            MoeFfnCore(
+                _mtpWGateInp,
+                _mtpWGateShexp, _mtpWUpShexp, _mtpWDownShexp,
+                _mtpWGateExps, _mtpWUpExps, _mtpWDownExps,
+                _mtpWGateInpShexpVec);
+        }
+        else
+        {
+            SimdKernels.MatVecDual(
+                _ffnGate, _mtpFfnGate.DataPtr,
+                _ffnUp,   _mtpFfnUp.DataPtr,
+                _normBuf, _intermDim, _embDim,
+                _mtpFfnGate.DType, _mtpFfnUp.DType);
+            SimdKernels.SiLuMul(_ffnGate, _ffnUp, _intermDim);
+            FusedMatVec(_hidden, _mtpFfnDown, _ffnGate, _embDim, _intermDim);
+        }
 
         // 10. Residual add.
         SimdKernels.AddInPlace(_hidden, _residual, _embDim);
@@ -1615,14 +1664,29 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     //  MoeFfn — 256-expert top-8 router + shared expert (gated)
     // ============================================================
 
-    private void MoeFfn(int layer)
+    private void MoeFfn(int layer) =>
+        MoeFfnCore(
+            wGateInp:      _wGateInp[layer],
+            wGateShexp:    _wGateShexp[layer],
+            wUpShexp:      _wUpShexp[layer],
+            wDownShexp:    _wDownShexp[layer],
+            wGateExps:     _wGateExps[layer],
+            wUpExps:       _wUpExps[layer],
+            wDownExps:     _wDownExps[layer],
+            wGateInpShexp: _wGateInpShexp[layer]);
+
+    private void MoeFfnCore(
+        TensorRef wGateInp,
+        TensorRef wGateShexp, TensorRef wUpShexp, TensorRef wDownShexp,
+        TensorRef wGateExps, TensorRef wUpExps, TensorRef wDownExps,
+        float* wGateInpShexp)
     {
         int numExperts = _hp.NumExperts;
         int numActive = _hp.NumActiveExperts;
         int expertDim = _hp.ExpertIntermediateDim;
 
         // 1. Router (softmax top-K). ffn_gate_inp.weight is F32 [embDim, numExperts].
-        FusedMatVec(_routerLogits, _wGateInp[layer], _normBuf, numExperts, _embDim);
+        FusedMatVec(_routerLogits, wGateInp, _normBuf, numExperts, _embDim);
         SimdKernels.SoftmaxInPlace(_routerLogits, numExperts);
 
         Span<int> selectedExperts = stackalloc int[numActive];
@@ -1633,20 +1697,18 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         // 2. Shared expert: ffn_down @ (SiLU(ffn_gate @ x) * (ffn_up @ x)), then per-token
         //    scalar gate via sigmoid(ffn_gate_inp_shexp · x). Use MatVecDual to fuse
         //    gate+up into a single Parallel.For sweep when dtypes match (the common case).
-        var gateShexp = _wGateShexp[layer];
-        var upShexp   = _wUpShexp[layer];
         SimdKernels.MatVecDual(
-            _expertGate, gateShexp.DataPtr,
-            _expertUp,   upShexp.DataPtr,
-            _normBuf, expertDim, _embDim, gateShexp.DType, upShexp.DType);
+            _expertGate, wGateShexp.DataPtr,
+            _expertUp,   wUpShexp.DataPtr,
+            _normBuf, expertDim, _embDim, wGateShexp.DType, wUpShexp.DType);
         SimdKernels.SiLuMul(_expertGate, _expertUp, expertDim);
-        FusedMatVec(_sharedOut,  _wDownShexp[layer], _expertGate, _embDim, expertDim);
+        FusedMatVec(_sharedOut,  wDownShexp, _expertGate, _embDim, expertDim);
 
         // per llama.cpp build_layer_ffn @ src/models/qwen35moe.cpp:
         //   shared_gate = ffn_gate_inp_shexp @ x         // {n_embd} · {n_embd} → scalar per token
         //   shared_gate = sigmoid(shared_gate)
         //   ffn_shexp = ffn_shexp * shared_gate          // broadcast scalar over channels
-        float shexpDot = SimdKernels.DotF32(_wGateInpShexp[layer], _normBuf, _embDim);
+        float shexpDot = SimdKernels.DotF32(wGateInpShexp, _normBuf, _embDim);
         float shexpScale = 1.0f / (1.0f + MathF.Exp(-shexpDot));
         SimdKernels.ScaleInPlace(_sharedOut, shexpScale, _embDim);
 
@@ -1654,9 +1716,9 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         //    instead of 24 per-expert ones — gate+up across all 8 experts in
         //    one sweep, then down+weighted-accumulate across all 8 experts in
         //    another. Mirrors CudaHybridGdnForwardPass.CpuMoeFfn.
-        var gateExps = _wGateExps[layer];
-        var upExps = _wUpExps[layer];
-        var downExps = _wDownExps[layer];
+        var gateExps = wGateExps;
+        var upExps = wUpExps;
+        var downExps = wDownExps;
 
         int bprG = (_embDim   / DTypeInfo.BlockSize(gateExps.DType))
                  * DTypeInfo.BytesPerBlock(gateExps.DType);
@@ -1990,6 +2052,23 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             }
         }
 
+        if (_hasMtp)
+        {
+            tensors.Add(_mtpAttnNorm);
+            tensors.Add(_mtpWQGate); tensors.Add(_mtpWK); tensors.Add(_mtpWV); tensors.Add(_mtpWO);
+            tensors.Add(_mtpPostAttnNorm);
+            if (_mtpIsMoE)
+            {
+                tensors.Add(_mtpWGateInp);
+                tensors.Add(_mtpWGateShexp); tensors.Add(_mtpWUpShexp); tensors.Add(_mtpWDownShexp);
+                tensors.Add(_mtpWGateExps); tensors.Add(_mtpWUpExps); tensors.Add(_mtpWDownExps);
+            }
+            else
+            {
+                tensors.Add(_mtpFfnGate); tensors.Add(_mtpFfnUp); tensors.Add(_mtpFfnDown);
+            }
+        }
+
         long touchSum = 0;
         Parallel.ForEach(tensors, tensor =>
         {
@@ -2115,6 +2194,7 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             if (_mtpEnormBuf != null) NativeMemory.Free(_mtpEnormBuf);
             if (_mtpHnormBuf != null) NativeMemory.Free(_mtpHnormBuf);
             if (_mtpConcatBuf != null) NativeMemory.Free(_mtpConcatBuf);
+            if (_mtpWGateInpShexpVec != null) NativeMemory.Free(_mtpWGateInpShexpVec);
             if (_lastHidden != null) NativeMemory.Free(_lastHidden);
             if (_mtpPrefillHiddens != null)
             {
