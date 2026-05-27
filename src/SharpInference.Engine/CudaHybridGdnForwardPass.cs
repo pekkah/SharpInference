@@ -890,39 +890,35 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 _gpuFfnUpBufDense   = gpu.Allocate(TensorShape.D1(_intermDim));
             }
 
-            // Issue #30 batched-verify scratch (dense FFN MTP only). Mirrors the
-            // CPU pass: token-2 gets its own residual stream + norm + logits +
-            // a token-1 hidden snapshot for the MTP commit step.
+            // Issue #30 / #45 batched-verify scratch. Token 2 gets its own residual
+            // stream + norm + logits + a token-1 hidden snapshot for the MTP commit
+            // step. Allocated for all MTP-bearing models (dense or MoE). The dense
+            // intermediate buffers (_gpuFfnGateBufDense2 etc.) are MoE-skip; on the
+            // MoE path the routed FFN runs sequentially per token via CpuMoeFfn,
+            // which reuses _cpuExpertGateAll / _cpuExpertUpAll within each call.
+            _gpuHidden2      = gpu.Allocate(TensorShape.D1(_embDim));
+            _gpuResidual2    = gpu.Allocate(TensorShape.D1(_embDim));
+            _gpuNormBuf2     = gpu.Allocate(TensorShape.D1(_embDim));
+            _gpuLogits2      = gpu.Allocate(TensorShape.D1(_hp.VocabSize));
+            _gpuLastHiddenT1 = gpu.Allocate(TensorShape.D1(_embDim));
+            _logitsBuf2      = new float[_hp.VocabSize];
+            _cpuNormBuf2     = Alloc(_embDim);
+            _cpuMoeHidden2   = Alloc(_embDim);
+            _lastHiddenT1    = Alloc(_embDim);
             if (!hp.IsMoE)
             {
-                _gpuHidden2      = gpu.Allocate(TensorShape.D1(_embDim));
-                _gpuResidual2    = gpu.Allocate(TensorShape.D1(_embDim));
-                _gpuNormBuf2     = gpu.Allocate(TensorShape.D1(_embDim));
-                _gpuLogits2      = gpu.Allocate(TensorShape.D1(_hp.VocabSize));
-                _gpuLastHiddenT1 = gpu.Allocate(TensorShape.D1(_embDim));
                 _gpuFfnGateBufDense2 = gpu.Allocate(TensorShape.D1(_intermDim));
                 _gpuFfnUpBufDense2   = gpu.Allocate(TensorShape.D1(_intermDim));
-                _logitsBuf2      = new float[_hp.VocabSize];
-                _cpuNormBuf2     = Alloc(_embDim);
-                _cpuMoeHidden2   = Alloc(_embDim);
-                _lastHiddenT1    = Alloc(_embDim);
                 _cpuFfnGateBuf2  = Alloc(_intermDim);
                 _cpuFfnUpBuf2    = Alloc(_intermDim);
-
-                long perLayerBytes = _gdnStateCache.LayerSnapshotBytes;
-                long totalSnapBytes = perLayerBytes * _gdnStateCache.NumGdnLayers;
-                if (totalSnapBytes > 0)
-                {
-                    _batchSnapshotBuf = (byte*)NativeMemory.Alloc((nuint)totalSnapBytes);
-                    _batchSnapshotCap = totalSnapBytes;
-                }
             }
-            else
+
+            long perLayerBytes = _gdnStateCache.LayerSnapshotBytes;
+            long totalSnapBytes = perLayerBytes * _gdnStateCache.NumGdnLayers;
+            if (totalSnapBytes > 0)
             {
-                _gpuHidden2 = _gpuResidual2 = _gpuNormBuf2 =
-                    _gpuLogits2 = _gpuLastHiddenT1 = null!;
-                _logitsBuf2 = Array.Empty<float>();
-                _cpuNormBuf2 = _cpuMoeHidden2 = _lastHiddenT1 = null;
+                _batchSnapshotBuf = (byte*)NativeMemory.Alloc((nuint)totalSnapBytes);
+                _batchSnapshotCap = totalSnapBytes;
             }
 
             TraceVram("after MTP head upload");
@@ -1228,20 +1224,23 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         // 5. Capture pre-output-norm hidden for MTP (issue #29). _gpu.RmsNorm
         //    below overwrites _gpuHidden in place; snapshot to _gpuLastHidden
-        //    first, then download to host so IForwardPass.LastHidden serves a
-        //    host span. Cost: embDim×4 B = 20 KiB / token over PCIe (negligible).
+        //    on the same stream so the snapshot is consistent. Issue #49: defer
+        //    the D2H download until AFTER the lm_head MatMul is enqueued so the
+        //    MatMul kernel launch isn't gated on the snapshot's PCIe transfer.
+        //    The logits Download below will sync the stream and drain both.
         if (_hasMtp)
-        {
             _gpu.CopyDevice(_gpuLastHidden, _gpuHidden);
-            _gpu.Download(_gpuLastHidden, new Span<float>(_lastHidden, _embDim));
-        }
 
         // 6. Final norm + output projection on GPU
         _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuOutputNorm!, _hp.RmsNormEps);
         _gpu.MatMul(_gpuLogits, _gpuOutputWeight!, _gpuHidden,
             _gpuWeightDTypes.TryGetValue(_gpuOutputWeight!.Handle, out var outDt) ? outDt : DType.Float32);
 
-        // 6. Download logits to host (Download self-syncs the stream).
+        if (_hasMtp)
+            _gpu.Download(_gpuLastHidden, new Span<float>(_lastHidden, _embDim));
+
+        // 6. Download logits to host (Download self-syncs the stream — also
+        // drains the _lastHidden async D2H above).
         _gpu.Download(_gpuLogits, _logitsBuf);
 
         if (_traceLayers) TraceLogits(position, _logitsBuf);
@@ -1258,7 +1257,13 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // =================================================================
 
     /// <inheritdoc />
-    public bool SupportsBatchVerify => _hasMtp && !_hp.IsMoE;
+    /// Issue #45: MoE MTP is supported via the CPU-MoE path (SHARPI_CPU_MOE=1 or
+    /// auto-routed on 12 GB-class cards). Full-GPU MoE (rare, ≥24 GB cards) still
+    /// falls back to sequential decode — folding a 2-token batched-verify into
+    /// GpuMoeFfn's SLRU loop is tracked separately.
+    public bool SupportsBatchVerify => _hasMtp
+        && (!_hp.IsMoE || _cpuMoe)
+        && Environment.GetEnvironmentVariable("SHARPI_DISABLE_BATCH_VERIFY") != "1";
 
     /// <inheritdoc />
     public ReadOnlySpan<float> LastHiddenT1 =>
@@ -1346,23 +1351,62 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _gpu.RmsNorm(_gpuNormBuf,  _gpuHidden,  _gpuPostAttnNorm[layer], _hp.RmsNormEps);
             _gpu.RmsNorm(_gpuNormBuf2, _gpuHidden2, _gpuPostAttnNorm[layer], _hp.RmsNormEps);
 
-            // Dense FFN: GPU-resident layer → two sequential GpuDenseFfns (L2 reuse).
-            //            CPU mmap layer    → batched CpuDenseFfn2 (MatVec2In win).
-            if (_gpuWFfnGate is not null && _gpuWFfnGate[layer] is not null)
+            // FFN dispatch.
+            //   Dense GPU layer  → two sequential GpuDenseFfns (L2 reuse).
+            //   Dense CPU layer  → batched CpuDenseFfn2 (MatVec2In win).
+            //   MoE CPU layer    → two sequential CpuMoeFfn calls (issue #45).
+            //   MoE GPU layer    → two sequential GpuMoeFfn calls.
+            // The MoE per-token TopK usually differs across t1 and t2 so no
+            // routed-expert weight sharing is possible; the wins for MoE come
+            // from amortising lm_head + norms + KV pages, not the FFN itself.
+            if (!_hp.IsMoE)
             {
-                GpuDenseFfnAt(layer, normIn: _gpuNormBuf,  hiddenOut: _gpuHidden,
-                              gateBuf: _gpuFfnGateBufDense!, upBuf: _gpuFfnUpBufDense!);
-                GpuDenseFfnAt(layer, normIn: _gpuNormBuf2, hiddenOut: _gpuHidden2,
-                              gateBuf: _gpuFfnGateBufDense2!, upBuf: _gpuFfnUpBufDense2!);
+                if (_gpuWFfnGate is not null && _gpuWFfnGate[layer] is not null)
+                {
+                    GpuDenseFfnAt(layer, normIn: _gpuNormBuf,  hiddenOut: _gpuHidden,
+                                  gateBuf: _gpuFfnGateBufDense!, upBuf: _gpuFfnUpBufDense!);
+                    GpuDenseFfnAt(layer, normIn: _gpuNormBuf2, hiddenOut: _gpuHidden2,
+                                  gateBuf: _gpuFfnGateBufDense2!, upBuf: _gpuFfnUpBufDense2!);
+                }
+                else
+                {
+                    _gpu.Download(_gpuNormBuf,  new Span<float>(_cpuNormBuf,  _embDim));
+                    _gpu.Download(_gpuNormBuf2, new Span<float>(_cpuNormBuf2, _embDim));
+                    CpuDenseFfn2(layer, _cpuNormBuf, _cpuNormBuf2,
+                                 _cpuMoeHidden, _cpuMoeHidden2);
+                    _gpu.UploadInto(_gpuHidden,  new ReadOnlySpan<float>(_cpuMoeHidden,  _embDim));
+                    _gpu.UploadInto(_gpuHidden2, new ReadOnlySpan<float>(_cpuMoeHidden2, _embDim));
+                }
+            }
+            else if (_cpuMoe)
+            {
+                // t1
+                _gpu.Download(_gpuNormBuf,  new Span<float>(_cpuNormBuf,  _embDim));
+                CpuMoeFfnCore(
+                    _gpuWGateShexp[layer], _gpuWUpShexp[layer], _gpuWDownShexp[layer],
+                    _cpuFfnGateInp![layer], _cpuFfnGateInpShexp![layer],
+                    _cpuFfnGateExps![layer], _cpuFfnUpExps![layer], _cpuFfnDownExps![layer],
+                    gpuNormIn: _gpuNormBuf, gpuSharedOut: _gpuSharedOut,
+                    cpuNormIn: _cpuNormBuf, cpuMoeOut: _cpuMoeHidden);
+                _gpu.UploadInto(_gpuHidden,  new ReadOnlySpan<float>(_cpuMoeHidden,  _embDim));
+                // t2
+                _gpu.Download(_gpuNormBuf2, new Span<float>(_cpuNormBuf2, _embDim));
+                CpuMoeFfnCore(
+                    _gpuWGateShexp[layer], _gpuWUpShexp[layer], _gpuWDownShexp[layer],
+                    _cpuFfnGateInp![layer], _cpuFfnGateInpShexp![layer],
+                    _cpuFfnGateExps![layer], _cpuFfnUpExps![layer], _cpuFfnDownExps![layer],
+                    gpuNormIn: _gpuNormBuf2, gpuSharedOut: _gpuSharedOut,
+                    cpuNormIn: _cpuNormBuf2, cpuMoeOut: _cpuMoeHidden2);
+                _gpu.UploadInto(_gpuHidden2, new ReadOnlySpan<float>(_cpuMoeHidden2, _embDim));
             }
             else
             {
-                _gpu.Download(_gpuNormBuf,  new Span<float>(_cpuNormBuf,  _embDim));
-                _gpu.Download(_gpuNormBuf2, new Span<float>(_cpuNormBuf2, _embDim));
-                CpuDenseFfn2(layer, _cpuNormBuf, _cpuNormBuf2,
-                             _cpuMoeHidden, _cpuMoeHidden2);
-                _gpu.UploadInto(_gpuHidden,  new ReadOnlySpan<float>(_cpuMoeHidden,  _embDim));
-                _gpu.UploadInto(_gpuHidden2, new ReadOnlySpan<float>(_cpuMoeHidden2, _embDim));
+                // Full-GPU MoE (rare; only on ≥24 GB cards). SupportsBatchVerify
+                // gates this off so MtpDecoder falls back to sequential decode.
+                throw new InvalidOperationException(
+                    "BatchForward2 reached the full-GPU MoE branch — SupportsBatchVerify " +
+                    "should have steered MtpDecoder to the sequential path. " +
+                    "Folding 2-token verify into GpuMoeFfn's SLRU loop is a follow-up.");
             }
 
             // Post-FFN residual add for both.
@@ -1539,7 +1583,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             CpuMoeFfnCore(
                 _gpuMtpWGateShexp, _gpuMtpWUpShexp, _gpuMtpWDownShexp,
                 _cpuMtpFfnGateInp, _cpuMtpFfnGateInpShexp,
-                _cpuMtpFfnGateExps, _cpuMtpFfnUpExps, _cpuMtpFfnDownExps);
+                _cpuMtpFfnGateExps, _cpuMtpFfnUpExps, _cpuMtpFfnDownExps,
+                gpuNormIn: _gpuNormBuf, gpuSharedOut: _gpuSharedOut,
+                cpuNormIn: _cpuNormBuf, cpuMoeOut: _cpuMoeHidden);
             _gpu.UploadInto(_gpuHidden, new ReadOnlySpan<float>(_cpuMoeHidden, _embDim));
         }
         else
@@ -2080,34 +2126,45 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             cpuGateInpShexp: _cpuFfnGateInpShexp![layer],
             cpuGateExps:   _cpuFfnGateExps![layer],
             cpuUpExps:     _cpuFfnUpExps![layer],
-            cpuDownExps:   _cpuFfnDownExps![layer]);
+            cpuDownExps:   _cpuFfnDownExps![layer],
+            gpuNormIn:     _gpuNormBuf,
+            gpuSharedOut:  _gpuSharedOut,
+            cpuNormIn:     _cpuNormBuf,
+            cpuMoeOut:     _cpuMoeHidden);
 
     private void CpuMoeFfnCore(
         Tensor gpuGateShexp, Tensor gpuUpShexp, Tensor gpuDownShexp,
         CpuWeightRef cpuRouter, float* cpuGateInpShexp,
-        CpuWeightRef cpuGateExps, CpuWeightRef cpuUpExps, CpuWeightRef cpuDownExps)
+        CpuWeightRef cpuGateExps, CpuWeightRef cpuUpExps, CpuWeightRef cpuDownExps,
+        Tensor gpuNormIn, Tensor gpuSharedOut,
+        float* cpuNormIn, float* cpuMoeOut)
     {
+        // Issue #45: gpuNormIn / cpuNormIn / cpuMoeOut / gpuSharedOut let
+        // BatchForward2 dispatch CpuMoeFfn for token 2 (with _gpuNormBuf2 /
+        // _cpuNormBuf2 / _cpuMoeHidden2). gpuSharedOut is reused for both
+        // tokens because the GPU shared-expert kick is synchronously awaited
+        // by the Download at the end of CpuMoeFfnCore.
         int numExperts = _numExperts;
         int numActive = _numActiveExperts;
         int expertDim = _expertDim;
 
         // 1. Kick off the GPU shared expert (async; overlaps with CPU work below).
-        //    _gpuNormBuf is already populated by the RmsNorm before this call;
+        //    gpuNormIn is already populated by the RmsNorm before this call;
         //    the launches return immediately and execute while the CPU runs router
         //    and routed experts. Sigmoid scalar gate is computed on CPU and applied
         //    via ScaleInPlace before the host blocks on Download.
-        GpuMatMul(_gpuFfnGate, gpuGateShexp, _gpuNormBuf);
-        GpuMatMul(_gpuFfnUp, gpuUpShexp, _gpuNormBuf);
+        GpuMatMul(_gpuFfnGate, gpuGateShexp, gpuNormIn);
+        GpuMatMul(_gpuFfnUp, gpuUpShexp, gpuNormIn);
         _gpu.SiLuMul(_gpuFfnGate, _gpuFfnUp);
-        GpuMatMul(_gpuSharedOut, gpuDownShexp, _gpuFfnGate);
+        GpuMatMul(gpuSharedOut, gpuDownShexp, _gpuFfnGate);
 
-        float shexpDot = SimdKernels.DotF32(cpuGateInpShexp, _cpuNormBuf, _embDim);
+        float shexpDot = SimdKernels.DotF32(cpuGateInpShexp, cpuNormIn, _embDim);
         float shexpScale = 1.0f / (1.0f + MathF.Exp(-shexpDot));
-        _gpu.ScaleInPlace(_gpuSharedOut, shexpScale);
+        _gpu.ScaleInPlace(gpuSharedOut, shexpScale);
 
         // 2. Router: ffn_gate_inp.weight is F32 [embDim, numExperts]; softmax then top-K.
         var routerW = cpuRouter;
-        SimdKernels.MatVec(_cpuRouterLogits, routerW.DataPtr, _cpuNormBuf,
+        SimdKernels.MatVec(_cpuRouterLogits, routerW.DataPtr, cpuNormIn,
             numExperts, _embDim, routerW.DType);
         SimdKernels.SoftmaxInPlace(_cpuRouterLogits, numExperts);
 
@@ -2152,8 +2209,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         DType  downDt   = downExps.DType;
         float* gateAll  = _cpuExpertGateAll;
         float* upAll    = _cpuExpertUpAll;
-        float* normBuf  = _cpuNormBuf;
-        float* moeOut   = _cpuMoeHidden;
+        float* normBuf  = cpuNormIn;
+        float* moeOut   = cpuMoeOut;
         int    embDimL  = _embDim;
         int    expertDimL = expertDim;
         int    numActiveL = numActive;
@@ -2200,8 +2257,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         // 4. Wait for GPU shared expert, download, and combine into routed accumulator
         //    (Download self-syncs the stream).
-        _gpu.Download(_gpuSharedOut, new Span<float>(_cpuSharedOut, _embDim));
-        SimdKernels.AddInPlace(_cpuMoeHidden, _cpuSharedOut, _embDim);
+        _gpu.Download(gpuSharedOut, new Span<float>(_cpuSharedOut, _embDim));
+        SimdKernels.AddInPlace(cpuMoeOut, _cpuSharedOut, _embDim);
     }
 
     // ParallelOptions for the routed-MoE Parallel.For sweeps. Matches the

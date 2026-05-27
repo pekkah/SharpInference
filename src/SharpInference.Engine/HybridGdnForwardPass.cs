@@ -550,27 +550,28 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             // is needed as MTP input. Sized at embDim, refreshed each Forward.
             _lastHidden = Alloc(_embDim);
 
-            // Issue #30: batched verify scratch. Only allocated for the all-dense path
-            // (qwen35 27B-MTP). Both the trunk MoE FFN and the MTP MoE FFN are
-            // unsupported in BatchForward2 — MatVec2In targets dense weights only.
-            // Since _mtpIsMoE → hp.IsMoE is enforced at load, !hp.IsMoE covers both.
+            // Issue #30 / #45: batched verify scratch. _hidden2/_residual2/_normBuf2/
+            // _logits2/_lastHiddenT1 are needed for any MTP-bearing model. The dense
+            // FFN intermediate buffers (_ffnGate2/_ffnUp2) are only used on the dense
+            // path; the MoE path runs MoeFfnCore sequentially per token and shares
+            // _expertGate / _expertUp / _expertGateAll / _expertUpAll between t1 and t2.
+            _hidden2 = Alloc(_embDim);
+            _residual2 = Alloc(_embDim);
+            _normBuf2 = Alloc(_embDim);
+            _logits2 = Alloc(hp.VocabSize);
+            _lastHiddenT1 = Alloc(_embDim);
             if (!hp.IsMoE)
             {
-                _hidden2 = Alloc(_embDim);
-                _residual2 = Alloc(_embDim);
-                _normBuf2 = Alloc(_embDim);
                 _ffnGate2 = Alloc(_intermDim);
                 _ffnUp2 = Alloc(_intermDim);
-                _logits2 = Alloc(hp.VocabSize);
-                _lastHiddenT1 = Alloc(_embDim);
+            }
 
-                long perLayerBytes = _gdnStateCache.LayerSnapshotBytes;
-                long totalSnapBytes = perLayerBytes * _gdnStateCache.NumGdnLayers;
-                if (totalSnapBytes > 0)
-                {
-                    _batchSnapshotBuf = (byte*)NativeMemory.Alloc((nuint)totalSnapBytes);
-                    _batchSnapshotCap = totalSnapBytes;
-                }
+            long perLayerBytes = _gdnStateCache.LayerSnapshotBytes;
+            long totalSnapBytes = perLayerBytes * _gdnStateCache.NumGdnLayers;
+            if (totalSnapBytes > 0)
+            {
+                _batchSnapshotBuf = (byte*)NativeMemory.Alloc((nuint)totalSnapBytes);
+                _batchSnapshotCap = totalSnapBytes;
             }
         }
 
@@ -832,9 +833,10 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
 
     /// <summary>True when this pass implements <see cref="BatchForward2"/>. The
     /// <c>SHARPI_DISABLE_BATCH_VERIFY=1</c> env var forces the legacy sequential
-    /// MTP path for parity bisection.</summary>
+    /// MTP path for parity bisection. Issue #45: MoE MTP models are supported via
+    /// a sequential per-token MoE FFN inside the otherwise-batched trunk.</summary>
     public bool SupportsBatchVerify =>
-        _hasMtp && !_hp.IsMoE
+        _hasMtp
         && Environment.GetEnvironmentVariable("SHARPI_DISABLE_BATCH_VERIFY") != "1";
 
     /// <summary>
@@ -921,9 +923,30 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             SimdKernels.RmsNorm(_normBuf,  _hidden,  postNormW, _embDim, _hp.RmsNormEps);
             SimdKernels.RmsNorm(_normBuf2, _hidden2, postNormW, _embDim, _hp.RmsNormEps);
 
-            // ── Dense FFN, batched: each FFN weight row read once, dotted with
-            //    both tokens' inputs. The wins live here. ────────────
-            DenseFfn2(layer, _normBuf, _normBuf2, _hidden, _hidden2);
+            // ── FFN ────────────────────────────────────────────────
+            // Dense: batched 2-input MatVec2In (the bandwidth win lives here).
+            // MoE (issue #45): per-token sequential MoE — the routed-expert
+            // top-K usually differs across t1 and t2, so no shared weight reads.
+            // Attn/GDN above and lm_head below are what amortise for MoE MTP.
+            if (_hp.IsMoE)
+            {
+                MoeFfnCore(
+                    _wGateInp[layer],
+                    _wGateShexp[layer], _wUpShexp[layer], _wDownShexp[layer],
+                    _wGateExps[layer], _wUpExps[layer], _wDownExps[layer],
+                    _wGateInpShexp[layer],
+                    normInExt: _normBuf,  hiddenOutExt: _hidden);
+                MoeFfnCore(
+                    _wGateInp[layer],
+                    _wGateShexp[layer], _wUpShexp[layer], _wDownShexp[layer],
+                    _wGateExps[layer], _wUpExps[layer], _wDownExps[layer],
+                    _wGateInpShexp[layer],
+                    normInExt: _normBuf2, hiddenOutExt: _hidden2);
+            }
+            else
+            {
+                DenseFfn2(layer, _normBuf, _normBuf2, _hidden, _hidden2);
+            }
 
             // ── Post-FFN residual add for both ───────────────────────
             SimdKernels.AddInPlace(_hidden,  _residual,  _embDim);
@@ -1673,20 +1696,32 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             wGateExps:     _wGateExps[layer],
             wUpExps:       _wUpExps[layer],
             wDownExps:     _wDownExps[layer],
-            wGateInpShexp: _wGateInpShexp[layer]);
+            wGateInpShexp: _wGateInpShexp[layer],
+            normInExt:     null,
+            hiddenOutExt:  null);
 
     private void MoeFfnCore(
         TensorRef wGateInp,
         TensorRef wGateShexp, TensorRef wUpShexp, TensorRef wDownShexp,
         TensorRef wGateExps, TensorRef wUpExps, TensorRef wDownExps,
-        float* wGateInpShexp)
+        float* wGateInpShexp,
+        float* normInExt = null,
+        float* hiddenOutExt = null)
     {
+        // Issue #45: normInExt/hiddenOutExt let BatchForward2 reuse this routine
+        // for the second token (normIn=_normBuf2, hiddenOut=_hidden2). Default
+        // null preserves the per-call signature used by single-token Forward
+        // and MtpForward (normIn=_normBuf, hiddenOut=_hidden). Routed-expert
+        // scratch (_expertGate, _expertGateAll, etc.) is reused safely because
+        // each MoeFfnCore call's lifetime is fully contained within the call.
+        float* normInLocal = normInExt != null ? normInExt : _normBuf;
+        float* hiddenOutLocal = hiddenOutExt != null ? hiddenOutExt : _hidden;
         int numExperts = _hp.NumExperts;
         int numActive = _hp.NumActiveExperts;
         int expertDim = _hp.ExpertIntermediateDim;
 
         // 1. Router (softmax top-K). ffn_gate_inp.weight is F32 [embDim, numExperts].
-        FusedMatVec(_routerLogits, wGateInp, _normBuf, numExperts, _embDim);
+        FusedMatVec(_routerLogits, wGateInp, normInLocal, numExperts, _embDim);
         SimdKernels.SoftmaxInPlace(_routerLogits, numExperts);
 
         Span<int> selectedExperts = stackalloc int[numActive];
@@ -1700,7 +1735,7 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         SimdKernels.MatVecDual(
             _expertGate, wGateShexp.DataPtr,
             _expertUp,   wUpShexp.DataPtr,
-            _normBuf, expertDim, _embDim, wGateShexp.DType, wUpShexp.DType);
+            normInLocal, expertDim, _embDim, wGateShexp.DType, wUpShexp.DType);
         SimdKernels.SiLuMul(_expertGate, _expertUp, expertDim);
         FusedMatVec(_sharedOut,  wDownShexp, _expertGate, _embDim, expertDim);
 
@@ -1708,7 +1743,7 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         //   shared_gate = ffn_gate_inp_shexp @ x         // {n_embd} · {n_embd} → scalar per token
         //   shared_gate = sigmoid(shared_gate)
         //   ffn_shexp = ffn_shexp * shared_gate          // broadcast scalar over channels
-        float shexpDot = SimdKernels.DotF32(wGateInpShexp, _normBuf, _embDim);
+        float shexpDot = SimdKernels.DotF32(wGateInpShexp, normInLocal, _embDim);
         float shexpScale = 1.0f / (1.0f + MathF.Exp(-shexpDot));
         SimdKernels.ScaleInPlace(_sharedOut, shexpScale, _embDim);
 
@@ -1746,8 +1781,8 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         DType downDt = downExps.DType;
         float* gateAll = _expertGateAll;
         float* upAll   = _expertUpAll;
-        float* normBuf = _normBuf;
-        float* hiddenOut = _hidden;
+        float* normBuf = normInLocal;
+        float* hiddenOut = hiddenOutLocal;
         int embDimL = _embDim;
         int expertDimL = expertDim;
         int numActiveL = numActive;
@@ -1859,7 +1894,7 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         }
 
         // 4. Add shared expert output.
-        SimdKernels.AddInPlace(_hidden, _sharedOut, _embDim);
+        SimdKernels.AddInPlace(hiddenOutLocal, _sharedOut, _embDim);
     }
 
     // ParallelOptions for the routed-MoE sweeps. Pinning to ProcessorCount avoids
@@ -2202,7 +2237,8 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
                 _mtpPrefillHiddens = null;
                 _mtpPrefillHiddensCap = 0;
             }
-            // Issue #30 batched-verify scratch (dense-FFN MTP only).
+            // Issues #30/#45 batched-verify scratch. _ffnGate2/_ffnUp2 are only
+            // populated on the dense path; null-check covers the MoE case.
             if (_hidden2 != null) NativeMemory.Free(_hidden2);
             if (_residual2 != null) NativeMemory.Free(_residual2);
             if (_normBuf2 != null) NativeMemory.Free(_normBuf2);

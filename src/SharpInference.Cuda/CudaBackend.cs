@@ -671,6 +671,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             : CuBlasInterop.DeviceSync();
         if (status != 0)
             throw new InvalidOperationException($"CUDA synchronize failed: {status}");
+        _uploadInFlight = false;
     }
 
     // ── Pinned staging buffer ─────────────────────────────────────────────
@@ -693,20 +694,41 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _pinnedBufSize = newSize;
     }
 
+    // Tracks whether the most recent UploadViaStaging call left an async H2D
+    // memcpy in flight reading _pinnedBuf. Cleared on the next stream sync —
+    // either explicit (Synchronize / DownloadViaStaging) or implicit (next
+    // upload's drain). Any operation that overwrites _pinnedBuf must drain
+    // first to avoid corrupting an in-flight DMA. See issue #47.
+    private bool _uploadInFlight;
+
     /// <summary>
-    /// Copy <paramref name="src"/> to the device pointer via the pinned staging buffer
-    /// using a synchronous cudaMemcpy.  Pinned memory avoids the runtime's internal
-    /// pageable→pinned staging copy, so DMA starts immediately.
-    /// The shared staging buffer is safe here because the copy is synchronous — the
-    /// buffer is fully consumed before returning, so the next upload can reuse it.
+    /// Copy <paramref name="src"/> to the device via the pinned staging buffer.
+    /// Issues a non-blocking <c>cudaMemcpyAsync</c> on <c>_stream</c> after the
+    /// host-side memcpy into the pinned buffer (issue #47). The host returns
+    /// immediately; the actual PCIe transfer overlaps with subsequent enqueued
+    /// GPU work on the same stream. The next operation that reuses
+    /// <c>_pinnedBuf</c> drains the prior async copy first, so the buffer is
+    /// never read by the DMA while a new write is in progress.
     /// </summary>
     private unsafe void UploadViaStaging(nint devPtr, void* src, nuint byteSize)
     {
         EnsurePinnedBuf(byteSize);
-        if (_pinnedBuf != nint.Zero)
+        if (_pinnedBuf != nint.Zero && _stream != nint.Zero)
         {
+            // Drain any prior in-flight upload before reusing _pinnedBuf.
+            // Downloads call StreamSynchronize themselves; consecutive uploads
+            // without an interleaved download are the only path that needs this.
+            if (_uploadInFlight)
+            {
+                CuBlasInterop.StreamSynchronize(_stream);
+                _uploadInFlight = false;
+            }
             Buffer.MemoryCopy(src, (void*)_pinnedBuf, _pinnedBufSize, byteSize);
-            CuBlasInterop.CudaMemcpy(devPtr, _pinnedBuf, byteSize, CuBlasInterop.HostToDevice);
+            int r = CuBlasInterop.CudaMemcpyAsync(devPtr, _pinnedBuf, byteSize,
+                                                  CuBlasInterop.HostToDevice, _stream);
+            if (r != 0)
+                throw new InvalidOperationException($"cudaMemcpyAsync (H2D) failed: {r}");
+            _uploadInFlight = true;
         }
         else
         {
@@ -716,7 +738,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
     /// <summary>
     /// Copy from device to <paramref name="dst"/> via the pinned staging buffer (async DMA).
-    /// Caller must call <see cref="Synchronize"/> before reading <paramref name="dst"/>.
+    /// The implicit <c>StreamSynchronize</c> here also drains any in-flight async upload,
+    /// since both ops are queued on <c>_stream</c>.
     /// </summary>
     private unsafe void DownloadViaStaging(void* dst, nint devPtr, nuint byteSize)
     {
@@ -726,6 +749,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             CuBlasInterop.CudaMemcpyAsync(_pinnedBuf, devPtr, byteSize,
                                           CuBlasInterop.DeviceToHost, _stream);
             CuBlasInterop.StreamSynchronize(_stream);
+            _uploadInFlight = false;
             Buffer.MemoryCopy((void*)_pinnedBuf, dst, byteSize, byteSize);
         }
         else
