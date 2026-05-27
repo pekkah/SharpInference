@@ -726,9 +726,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         sw.Restart();
         int generated, totalDecoded;
         float? acceptanceRate = null;
+        long mtpAccepted = 0, mtpEmitted = 0;
         if (useMtp)
         {
-            (generated, totalDecoded, acceptanceRate) =
+            (generated, totalDecoded, acceptanceRate, mtpAccepted, mtpEmitted) =
                 DecodeLoopMtp(mtpFwd!, tokens, logits, tok, sp, s.HideThinking);
         }
         else
@@ -742,7 +743,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         AnsiConsole.MarkupLine($"\n[dim]Prefill: {tokens.Count} tokens, {tokens.Count / (prefillMs / 1000):F1} t/s | " +
             $"Decode: {totalDecoded} tokens, {totalDecoded / (decodeMs / 1000):F1} t/s" +
             (totalDecoded > generated ? $" ({generated} visible, {totalDecoded - generated} thinking)" : "") +
-            (acceptanceRate is float ar ? $" | MTP accept: {ar:P0}" : "") +
+            (acceptanceRate is float ar ? $" | MTP accept: {ar:P0} ({mtpAccepted}/{mtpEmitted})" : "") +
             "[/]");
         return 0;
     }
@@ -783,7 +784,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     // MTP self-speculative decode path. Reuses the same UTF-8 streaming + EmitToken
     // logic as the baseline DecodeLoop but drives token emission via MtpDecoder.
     // Requires --no-thinking, so no thinking-mode bookkeeping here.
-    private static (int generated, int totalDecoded, float acceptanceRate) DecodeLoopMtp(
+    private static (int generated, int totalDecoded, float acceptanceRate, long accepted, long emitted) DecodeLoopMtp(
         IForwardPass mtpFwd, IReadOnlyList<int> promptTokens, ReadOnlySpan<float> initialLogits,
         GgufTokenizer tok, SamplingParams sp, bool hideThinking)
     {
@@ -813,7 +814,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             Console.Write(tail);
         if (inThinking) Console.Write("\x1b[0m");
 
-        return (generated, totalDecoded, mtpDec.AcceptanceRate);
+        return (generated, totalDecoded, mtpDec.AcceptanceRate, mtpDec.TotalDraftsAccepted, mtpDec.TotalDraftsEmitted);
     }
 
     private static int RunInteractive(Settings s,

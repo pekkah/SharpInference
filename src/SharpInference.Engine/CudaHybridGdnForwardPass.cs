@@ -1199,13 +1199,16 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpu.RmsNorm(_gpuMtpEnormBuf, _gpuMtpEmbedBuf,  _gpuMtpEnorm, _hp.RmsNormEps);
         _gpu.RmsNorm(_gpuMtpHnormBuf, _gpuLastHidden,   _gpuMtpHnorm, _hp.RmsNormEps);
 
-        // 4. Concat [hnorm(h) ‖ enorm(e)] into _gpuMtpConcatBuf [embDim*2].
+        // 4. Concat [enorm(e) ‖ hnorm(h)] into _gpuMtpConcatBuf [embDim*2].
         //    Two device-side copies; total 40 KiB GPU memcpy for 27B.
+        //    Issue #40: matches the transformers `Qwen3NextNextNDecoderLayer`
+        //    reference (`torch.cat([enormed, hnormed], dim=-1)`); the inverted
+        //    order produces 0% draft acceptance (see CPU MtpForward note).
         long embBytes = (long)_embDim * sizeof(float);
         _gpu.CopyDeviceRegion(_gpuMtpConcatBuf, dstByteOffset: 0,
-                              _gpuMtpHnormBuf, srcByteOffset: 0, embBytes);
-        _gpu.CopyDeviceRegion(_gpuMtpConcatBuf, dstByteOffset: embBytes,
                               _gpuMtpEnormBuf, srcByteOffset: 0, embBytes);
+        _gpu.CopyDeviceRegion(_gpuMtpConcatBuf, dstByteOffset: embBytes,
+                              _gpuMtpHnormBuf, srcByteOffset: 0, embBytes);
 
         // 5. eh_proj @ concat → _gpuHidden. F32 (UploadWeight dequant'd Q8_0 → F32).
         GpuMatMul(_gpuHidden, _gpuMtpEhProj, _gpuMtpConcatBuf);

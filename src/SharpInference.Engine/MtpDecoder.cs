@@ -122,6 +122,7 @@ public sealed class MtpDecoder
     public void Decode(int maxTokens, ReadOnlySpan<int> stopTokenIds, Action<int> emitToken,
                        CancellationToken ct = default)
     {
+        bool trace = Environment.GetEnvironmentVariable("SHARPI_TRACE_MTP") == "1";
         int generated = 0;
         while (generated < maxTokens)
         {
@@ -139,6 +140,7 @@ public sealed class MtpDecoder
             int P = _nextPos;
             ReadOnlySpan<float> mtpLogits = _fwd.MtpForward(t1, P, _savedHidden);
             int t2Draft = ArgMax(mtpLogits);
+            float t2DraftLogit = mtpLogits[t2Draft];
             _totalDraftsEmitted++;
 
             // ── Main verify (advances main caches through t1) ────────
@@ -147,6 +149,16 @@ public sealed class MtpDecoder
 
             int t2 = (t2Target == t2Draft) ? t2Draft : t2Target;
             if (t2Target == t2Draft) _totalDraftsAccepted++;
+
+            if (trace)
+            {
+                float draftLogitInMain = mainLogits[t2Draft];
+                float mainTopLogit = mainLogits[t2Target];
+                Console.Error.WriteLine(
+                    $"[mtp] P={P} t1={t1} t2_draft={t2Draft}(draft_logit={t2DraftLogit:F3}, main_logit_at_draft={draftLogitInMain:F3}) " +
+                    $"t2_target={t2Target}(main_logit={mainTopLogit:F3}) " +
+                    $"{(t2Target == t2Draft ? "ACCEPT" : "reject")}");
+            }
 
             if (IsStop(t2, stopTokenIds))
             {

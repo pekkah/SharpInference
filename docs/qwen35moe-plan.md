@@ -496,7 +496,7 @@ blk.64.attn_v.weight                   Q6_K     [5120, 1024]
 blk.64.ffn_down.weight                 Q6_K     [17408, 5120]
 blk.64.ffn_gate.weight                 Q4_K     [5120, 17408]
 blk.64.ffn_up.weight                   Q4_K     [5120, 17408]
-blk.64.nextn.eh_proj.weight            Q8_0     [10240, 5120]    concat(hnorm(h)‖enorm(e)) → 5120
+blk.64.nextn.eh_proj.weight            Q8_0     [10240, 5120]    concat(enorm(e)‖hnorm(h)) → 5120
 blk.64.nextn.enorm.weight              F32      [5120]           pre-fc norm on embedding
 blk.64.nextn.hnorm.weight              F32      [5120]           pre-fc norm on hidden
 blk.64.nextn.shared_head_norm.weight   F32      [5120]           pre-output norm
@@ -507,9 +507,9 @@ MTP head total: **15 tensors, 276 MiB** (≈ same cost as one main layer; expect
 
 **MTP forward shape:**
 ```
-                  last-layer hidden h ∈ R^5120     embedding of next decoded token e ∈ R^5120
+                  embedding of next decoded token e ∈ R^5120    last-layer hidden h ∈ R^5120
                           │                                        │
-                       hnorm(h)                                  enorm(e)
+                       enorm(e)                                 hnorm(h)
                           └───────────── concat ──────────────────┘
                                         ∈ R^10240
                                           │

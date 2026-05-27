@@ -992,12 +992,17 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             SimdKernels.RmsNorm(_mtpHnormBuf, prevHiddenPtr, _mtpHnorm, _embDim, _hp.RmsNormEps);
         }
 
-        // 3. Concat [hnorm(h) ‖ enorm(e)] into _mtpConcatBuf [embDim*2]. Order
-        //    matches the GGUF eh_proj weight layout (PR #20533 / Qwen3.6 MTP);
-        //    parity verification (issue #25 acceptance #10) will confirm.
-        new ReadOnlySpan<float>(_mtpHnormBuf, _embDim)
-            .CopyTo(new Span<float>(_mtpConcatBuf, _embDim));
+        // 3. Concat [enorm(e) ‖ hnorm(h)] into _mtpConcatBuf [embDim*2]. The
+        //    Qwen3-Next reference (transformers `Qwen3NextNextNDecoderLayer`)
+        //    does `torch.cat([enormed, hnormed], dim=-1)` — embedding half first,
+        //    hidden half second. Issue #40: the doc string in qwen35moe-plan.md
+        //    had the order inverted; the 0% MTP draft acceptance on the bench
+        //    was the symptom. Diagnostic confirmed: with this order, MTP top-5
+        //    aligns with main top-5; with the inverted order the head produced
+        //    semantically unrelated drafts (e.g. "CAD" instead of "python").
         new ReadOnlySpan<float>(_mtpEnormBuf, _embDim)
+            .CopyTo(new Span<float>(_mtpConcatBuf, _embDim));
+        new ReadOnlySpan<float>(_mtpHnormBuf, _embDim)
             .CopyTo(new Span<float>(_mtpConcatBuf + _embDim, _embDim));
 
         // 4. eh_proj @ concat → _hidden (reuse shared scratch; main forward isn't

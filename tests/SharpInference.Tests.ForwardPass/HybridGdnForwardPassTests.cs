@@ -313,6 +313,64 @@ public sealed class HybridGdnForwardPassTests
     }
 
     /// <summary>
+    /// Regression guard for issue #40 (0% MTP draft acceptance from inverted
+    /// eh_proj concat order). On the canonical chat-templated quicksort prompt
+    /// the MTP head's argmax must match the main forward's argmax at the first
+    /// decode position — both should predict `python` after the ```` ``` ```` token.
+    /// The inverted concat (`[hnorm‖enorm]` instead of `[enorm‖hnorm]`) produced
+    /// semantically unrelated drafts (e.g. ` CAD`) with logits ~3-4x weaker, so
+    /// even a "draft within top-5 of main" assertion catches the regression.
+    /// </summary>
+    [Fact]
+    public void Issue40_MtpDraftMatchesMainArgmax_AtFirstDecode()
+    {
+        var path = FindMtpModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var backend = new CpuBackend();
+        using var fwd = new HybridGdnForwardPass(model, backend, hp);
+        Assert.True(fwd.HasMtpHead);
+
+        // Reproduce the bench prompt — chat-template wrapped, --no-thinking expansion.
+        string promptTpl =
+            "<|im_start|>user\n" +
+            "Write a Python function that sorts a list using the quicksort algorithm:" +
+            "<|im_end|>\n" +
+            "<|im_start|>assistant\n" +
+            "<think>\n\n</think>\n\n";
+        var promptTokens = tokenizer.Encode(promptTpl);
+
+        var mainPrefillLogits = fwd.Prefill(promptTokens).ToArray();
+        var hLast = fwd.LastHidden.ToArray();
+        fwd.PrefillMtp(promptTokens);
+
+        int t1 = ArgMax(mainPrefillLogits);
+        int P = promptTokens.Count;
+        var mtpLogits = fwd.MtpForward(t1, P, hLast).ToArray();
+        var mainVerifyLogits = fwd.Forward(t1, P).ToArray();
+
+        int mtpTop = ArgMax(mtpLogits);
+        int mainTop = ArgMax(mainVerifyLogits);
+
+        Assert.Equal(mainTop, mtpTop);
+
+        // Logit magnitudes should be comparable; the inverted-concat bug had
+        // MTP top ~3-4x smaller than main top.
+        float ratio = mtpLogits[mtpTop] / Math.Max(0.001f, mainVerifyLogits[mainTop]);
+        Assert.InRange(ratio, 0.7f, 1.3f);
+
+        static int ArgMax(float[] x)
+        {
+            int best = 0; float bv = x[0];
+            for (int i = 1; i < x.Length; i++) if (x[i] > bv) { bv = x[i]; best = i; }
+            return best;
+        }
+    }
+
+    /// <summary>
     /// End-to-end MTP self-parity: greedy decode through <see cref="InferenceEngine"/>
     /// with MTP routing enabled must produce the SAME token sequence as the same
     /// decode with <c>SHARPI_DISABLE_MTP=1</c> on the same model and prompt.
