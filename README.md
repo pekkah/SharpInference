@@ -77,11 +77,24 @@ hot path vs the previous per-block AVX2 path
 
 End-to-end gain on decode tracks the K+V share of token cost: small at
 short context (a few percent at 256 ≤ ctx ≤ 1K, dominated by the FFN /
-QKV weight reads on dense models) and growing with context length —
-Qwen3-8B Q4_K_M CPU `--tq` 2K-position decode measures 10.9 t/s, and
-the FastScan ratio projects roughly 2× at 8K and 3× at 16K vs the
-per-block path (where the per-token K+V cost alone would dominate
-decode time).
+QKV weight reads on dense models) and growing with context length.
+Measured Qwen3-8B Q4_K_M CPU `--tq` end-to-end on the same Ryzen 9 7900X
+after TQ-aware batched prefill landed:
+
+| context  | prefill t/s | decode t/s |
+|---------:|------------:|-----------:|
+|     30   |   2.6       | 12.0       |
+|    850   |   9.3       | 10.9       |
+|  1 650   |   9.5       | 10.7       |
+|  3 250   |   9.4       | 10.2       |
+|  6 050   |   9.2       |  9.4       |
+
+Decode rate degrades only ~22 % across a 200× context growth (30 →
+6 050), which puts the FastScan K+V path well under the FFN / output-
+projection floor at every measured point. The per-block AVX2 path would
+add ~120 ms per token at 6 K positions on this CPU (extrapolating the
+kernel table above), dropping decode to ~5 t/s — so FastScan delivers
+roughly 1.9× decode at 6 K context on this workload.
 
 Session-lifetime weights (per-layer projections, expert FFNs, embedding,
 output) on all three CUDA forward passes (`CudaForwardPass`,
