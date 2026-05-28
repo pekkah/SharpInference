@@ -448,6 +448,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// </summary>
     public unsafe void Download(Tensor src, nint pinnedDst, int floatCount)
     {
+        if ((long)floatCount > src.ElementCount)
+            throw new ArgumentException($"Download: floatCount={floatCount} exceeds src.ElementCount={src.ElementCount}.");
         nint devPtr = GetDevPtr(src);
         nuint byteSize = (nuint)floatCount * sizeof(float);
         if (_stream != nint.Zero)
@@ -477,6 +479,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// </summary>
     public unsafe void DownloadAsync(Tensor src, nint pinnedDst, int floatCount)
     {
+        if ((long)floatCount > src.ElementCount)
+            throw new ArgumentException($"DownloadAsync: floatCount={floatCount} exceeds src.ElementCount={src.ElementCount}.");
         nint devPtr = GetDevPtr(src);
         nuint byteSize = (nuint)floatCount * sizeof(float);
         if (_stream != nint.Zero)
