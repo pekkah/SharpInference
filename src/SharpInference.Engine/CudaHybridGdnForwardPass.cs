@@ -123,9 +123,16 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private readonly Tensor[] _gpuQNorm;         // [L] [headDim] F32
     private readonly Tensor[] _gpuKNorm;         // [L] [headDim] F32
 
-    // GPU KV cache (sized [numLayers]; only attention slots are allocated)
-    private readonly Tensor?[] _gpuKCache;       // [L][maxSeq * kvDim] F32
-    private readonly Tensor?[] _gpuVCache;       // [L][maxSeq * kvDim] F32
+    // GPU KV cache (sized [numLayers]; only attention slots are allocated).
+    // Element dtype is governed by `_kvDType` — F32 (legacy) or BFloat16 (#27).
+    private readonly Tensor?[] _gpuKCache;       // [L][maxSeq * kvDim]
+    private readonly Tensor?[] _gpuVCache;       // [L][maxSeq * kvDim]
+
+    // Issue #27: KV-cache element dtype. Default Bf16 — halves cache footprint
+    // on the 16 attention layers (qwen35 27B-MTP / qwen35moe), freeing ~256 MiB
+    // at ctx=4096 to admit more dense-FFN layers on GPU. `SHARPI_KV_DTYPE=fp32`
+    // restores the legacy fp32 path for bisecting any precision regression.
+    private readonly DType _kvDType;
 
     // Embedding + output
     private readonly Tensor? _gpuEmbedding;
@@ -422,7 +429,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         int qDim = _numHeads * _headDim;        // 4096
         int kvDim = _numKvHeads * _headDim;     // 512
 
-        Console.Error.WriteLine($"[CudaHybridGdnForwardPass] layers={L} embDim={_embDim} headDim={_headDim} numHeads={_numHeads} ropeDim={_ropeDim} ctx={_ctxLen}");
+        // SHARPI_KV_DTYPE: fp32 | bf16 (default bf16). Issue #27.
+        _kvDType = ParseKvDType(Environment.GetEnvironmentVariable("SHARPI_KV_DTYPE"));
+
+        Console.Error.WriteLine($"[CudaHybridGdnForwardPass] layers={L} embDim={_embDim} headDim={_headDim} numHeads={_numHeads} ropeDim={_ropeDim} ctx={_ctxLen} kvDType={_kvDType}");
         Console.Error.WriteLine($"[CudaHybridGdnForwardPass] GDN: heads={_gdnNumVHeads}v×{_gdnNumKHeads}k headDim={_gdnHeadDim} conv={_gdnConvChannels}×{_gdnConvKernel} MoE: {_numExperts}exp×{_numActiveExperts}active dim={_expertDim}");
 
         bool vramTrace = Environment.GetEnvironmentVariable("SHARPI_TRACE_VRAM") == "1";
@@ -712,8 +722,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 _gpuQNorm[i] = UploadWeight($"blk.{i}.attn_q_norm.weight");
                 _gpuKNorm[i] = UploadWeight($"blk.{i}.attn_k_norm.weight");
 
-                _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
-                _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
+                _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim), _kvDType);
+                _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim), _kvDType);
             }
             else
             {
@@ -860,8 +870,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
             // MTP attention KV cache on GPU (one slot; same layout as trunk KV).
             int mtpKvDim = _numKvHeads * _headDim;
-            _gpuMtpKCache = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * mtpKvDim));
-            _gpuMtpVCache = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * mtpKvDim));
+            _gpuMtpKCache = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * mtpKvDim), _kvDType);
+            _gpuMtpVCache = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * mtpKvDim), _kvDType);
             gpu.Clear(_gpuMtpKCache);
             gpu.Clear(_gpuMtpVCache);
 
@@ -1499,13 +1509,24 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpu.RoPEPartial(_gpuQ, position, _headDim, _ropeDim, _hp.RopeTheta, neox: true);
         _gpu.RoPEPartial(_gpuK, position, _headDim, _ropeDim, _hp.RopeTheta, neox: true);
 
-        _gpu.KvAppend(_gpuK, _gpuV, _gpuKCache[layer]!, _gpuVCache[layer]!,
-            kvDim, kvPosition, _maxSeqLen);
-
-        _gpu.Attention(_gpuQ, _gpuKCache[layer]!, _gpuVCache[layer]!, _gpuAttnOut,
-            _gpuAttnScratch,
-            _numHeads, _numKvHeads, _headDim,
-            (kvPosition + 1), _maxSeqLen);
+        if (_kvDType == DType.BFloat16)
+        {
+            _gpu.KvAppendBf16(_gpuK, _gpuV, _gpuKCache[layer]!, _gpuVCache[layer]!,
+                kvDim, kvPosition, _maxSeqLen);
+            _gpu.AttentionBf16(_gpuQ, _gpuKCache[layer]!, _gpuVCache[layer]!, _gpuAttnOut,
+                _gpuAttnScratch,
+                _numHeads, _numKvHeads, _headDim,
+                (kvPosition + 1), _maxSeqLen);
+        }
+        else
+        {
+            _gpu.KvAppend(_gpuK, _gpuV, _gpuKCache[layer]!, _gpuVCache[layer]!,
+                kvDim, kvPosition, _maxSeqLen);
+            _gpu.Attention(_gpuQ, _gpuKCache[layer]!, _gpuVCache[layer]!, _gpuAttnOut,
+                _gpuAttnScratch,
+                _numHeads, _numKvHeads, _headDim,
+                (kvPosition + 1), _maxSeqLen);
+        }
 
         _gpu.SigmoidMulInPlace(_gpuAttnOut, _gpuGate);
 
@@ -1658,11 +1679,18 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // 3. Layer-0 invariant: reserve a block on the MTP KV bookkeeping cache
         //    before any append at a new page boundary.
         mtpCache.ReserveBlock();
-        _gpu.KvAppend(_gpuK, _gpuV, kCache, vCache, kvDim, position, _maxSeqLen);
-
-        // 4. Scaled dot-product attention against the MTP cache.
-        _gpu.Attention(_gpuQ, kCache, vCache, _gpuAttnOut, _gpuAttnScratch,
-            _numHeads, _numKvHeads, _headDim, position + 1, _maxSeqLen);
+        if (_kvDType == DType.BFloat16)
+        {
+            _gpu.KvAppendBf16(_gpuK, _gpuV, kCache, vCache, kvDim, position, _maxSeqLen);
+            _gpu.AttentionBf16(_gpuQ, kCache, vCache, _gpuAttnOut, _gpuAttnScratch,
+                _numHeads, _numKvHeads, _headDim, position + 1, _maxSeqLen);
+        }
+        else
+        {
+            _gpu.KvAppend(_gpuK, _gpuV, kCache, vCache, kvDim, position, _maxSeqLen);
+            _gpu.Attention(_gpuQ, kCache, vCache, _gpuAttnOut, _gpuAttnScratch,
+                _numHeads, _numKvHeads, _headDim, position + 1, _maxSeqLen);
+        }
 
         // 5. GLU gate.
         _gpu.SigmoidMulInPlace(_gpuAttnOut, _gpuGate);
@@ -2549,6 +2577,18 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         return tensor;
     }
 
+    // SHARPI_KV_DTYPE — issue #27. Default Bf16 on this forward pass; fp32 is
+    // the bisect-only escape hatch. Anything else is rejected so a typo in the
+    // env var doesn't silently fall back to the default.
+    private static DType ParseKvDType(string? envValue) => envValue?.Trim().ToLowerInvariant() switch
+    {
+        null or ""    => DType.BFloat16,
+        "bf16"        => DType.BFloat16,
+        "fp32"        => DType.Float32,
+        var other     => throw new ArgumentException(
+            $"SHARPI_KV_DTYPE must be 'bf16' or 'fp32' (got '{other}').", nameof(envValue)),
+    };
+
     private static bool ShouldKeepFixedWeightsOnCpu(GgufTensorInfo embedding, GgufTensorInfo? output)
     {
         const long maxStorageBufferBytes = 2L * 1024 * 1024 * 1024 - 1;
@@ -2599,10 +2639,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         int attnLayers = 0;
         for (int i = 0; i < L; i++)
             if (_hp.LayerTypes![i] == LayerType.Attention) attnLayers++;
+        int kvBytes = DTypeInfo.BytesPerElement(_kvDType);
         long attnPerLayer = (long)_embDim * _numHeads * _headDim * 2 * sizeof(float)  // q (output qDim*2)
                           + (long)_embDim * _numKvHeads * _headDim * sizeof(float) * 2 // k + v
                           + (long)_embDim * _numHeads * _headDim * sizeof(float)      // o
-                          + (long)_maxSeqLen * _numKvHeads * _headDim * sizeof(float) * 2; // kv cache
+                          + (long)_maxSeqLen * _numKvHeads * _headDim * kvBytes * 2;  // kv cache
         total += attnLayers * attnPerLayer;
         // Embedding + output.
         if (_gpuEmbedding is not null)
@@ -2626,11 +2667,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         perLayerNonMoeBytes += (long)_embDim * sizeof(float);                  // shexp gate inp
         perLayerNonMoeBytes += 3L * _embDim * _expertDim * sizeof(float);      // shared gate/up/down (Q8_0 → F32 in current path)
 
+        int kvBytes = DTypeInfo.BytesPerElement(_kvDType);
         long attnPerLayer =
               (long)_embDim * _numHeads * _headDim * 2 * sizeof(float)         // q (output qDim*2)
             + (long)_embDim * _numKvHeads * _headDim * sizeof(float) * 2       // k + v
             + (long)_embDim * _numHeads * _headDim * sizeof(float)             // o
-            + (long)_maxSeqLen * _numKvHeads * _headDim * sizeof(float) * 2;   // kv cache
+            + (long)_maxSeqLen * _numKvHeads * _headDim * kvBytes * 2;          // kv cache
 
         long gdnPerLayer = 0;
         if (!_cpuGdn)

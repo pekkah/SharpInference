@@ -54,6 +54,28 @@ __device__ __forceinline__ unsigned int sharpi_fp32_to_fp16(float f)
     return (unsigned int)h;
 }
 
+// ── BF16 ↔ FP32 (no header) ───────────────────────────────────────────────
+// bfloat16 is just the high 16 bits of an IEEE-754 fp32. Decode = left shift;
+// encode = round-to-nearest-even on bit 15 of the discarded mantissa half.
+// We don't bother special-casing NaN — the KV cache is written from RoPE'd
+// activations that are never NaN under normal operation, and any NaN that
+// does appear will round-trip as a NaN (sign/exponent bits survive) which is
+// the same outcome as fp32.
+__device__ __forceinline__ float sharpi_bf16_to_fp32(unsigned int bits)
+{
+    unsigned int f = (bits & 0xFFFFu) << 16;
+    return __int_as_float(f);
+}
+
+__device__ __forceinline__ unsigned int sharpi_fp32_to_bf16(float f)
+{
+    unsigned int bits = __float_as_uint(f);
+    unsigned int lsb  = (bits >> 16) & 1u;
+    unsigned int rb   = 0x7FFFu + lsb;
+    bits += rb;
+    return (bits >> 16) & 0xFFFFu;
+}
+
 // Read one byte from a uint32-stride buffer at absolute byte offset B.
 __device__ __forceinline__ unsigned int sharpi_byte_at(const unsigned int* __restrict__ buf, long B)
 {
@@ -388,6 +410,25 @@ extern ""C"" __global__ void llm_kv_append(
     long offset = (long)position * (long)kv_dim + (long)i;
     k_cache[offset] = k_in[i];
     v_cache[offset] = v_in[i];
+}
+
+// ── KV cache append (bf16 store) ───────────────────────────────────────────
+// FP32 K/V activations in → bf16 K/V cache out. Halves the KV-cache footprint
+// at the cost of one fp32→bf16 conversion per element on the write. Read-side
+// recovery happens in `llm_attention_bf16`. Used by `CudaHybridGdnForwardPass`
+// for the hybrid GDN models (qwen35, qwen35moe, qwen35-MTP) — see issue #27.
+extern ""C"" __global__ void llm_kv_append_bf16(
+    const float* __restrict__ k_in,
+    const float* __restrict__ v_in,
+    unsigned short* __restrict__ k_cache,
+    unsigned short* __restrict__ v_cache,
+    int kv_dim, int position, int max_seq_len)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= kv_dim) return;
+    long offset = (long)position * (long)kv_dim + (long)i;
+    k_cache[offset] = (unsigned short)sharpi_fp32_to_bf16(k_in[i]);
+    v_cache[offset] = (unsigned short)sharpi_fp32_to_bf16(v_in[i]);
 }
 
 // ── Embedding lookup (F32 table) ───────────────────────────────────────────
@@ -1793,6 +1834,102 @@ extern ""C"" __global__ void llm_attention(
             float weight = use_shared ? shared_scores[t] : head_scratch[t];
             long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
             acc += weight * v_cache[v_off + d];
+        }
+        out[out_off + d] = acc;
+    }
+}
+
+// ── Scaled dot-product attention with GQA (bf16 K/V cache) ─────────────────
+// Bit-for-bit copy of `llm_attention` except K/V cache is read as bfloat16
+// (stored as raw unsigned short, decoded via sharpi_bf16_to_fp32). Score
+// scratch, query, and output stay fp32; softmax accumulates in fp32 too.
+// Bf16 → fp32 promotion happens at the dot/weighted-sum read points, so all
+// arithmetic precision (and overflow head-room) matches the fp32 kernel —
+// only the cache footprint is halved. See issue #27.
+extern ""C"" __global__ void llm_attention_bf16(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_cache,
+    const unsigned short* __restrict__ v_cache,
+    float* __restrict__ out,
+    float* __restrict__ scores_scratch,
+    int num_heads, int num_kv_heads, int head_dim,
+    int seq_len, int max_seq_len)
+{
+    const int MAX_STORED_SCORES = 4096;
+    __shared__ float shared_scores[MAX_STORED_SCORES];
+    __shared__ float sdata[256];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int h = blockIdx.x;
+    if ((int)h >= num_heads) return;
+
+    int kv_head = (int)h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = rsqrtf((float)head_dim);
+    long q_off  = (long)h * (long)head_dim;
+    long out_off = q_off;
+
+    bool use_shared = (seq_len <= MAX_STORED_SCORES);
+    float* head_scratch = scores_scratch + (long)h * (long)max_seq_len;
+
+    for (int t = (int)tid; t < seq_len; t += 256) {
+        float dot = 0.f;
+        long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+        for (int d = 0; d < head_dim; d++)
+            dot += q[q_off + d] * sharpi_bf16_to_fp32((unsigned int)k_cache[k_off + d]);
+        float score = dot * scale;
+        if (use_shared) shared_scores[t] = score;
+        else            head_scratch[t]  = score;
+    }
+    if (use_shared) {
+        for (int t = seq_len + (int)tid; t < MAX_STORED_SCORES; t += 256)
+            shared_scores[t] = sharpi_neg_inf();
+    }
+    __syncthreads();
+
+    float local_max = sharpi_neg_inf();
+    for (int t = (int)tid; t < seq_len; t += 256) {
+        float s = use_shared ? shared_scores[t] : head_scratch[t];
+        local_max = fmaxf(local_max, s);
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
+
+    float local_sum = 0.f;
+    for (int t = (int)tid; t < seq_len; t += 256) {
+        float s = use_shared ? shared_scores[t] : head_scratch[t];
+        float e = __expf(s - max_val);
+        if (use_shared) shared_scores[t] = e;
+        else            head_scratch[t]  = e;
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+    __syncthreads();
+
+    for (int t = (int)tid; t < seq_len; t += 256) {
+        if (use_shared) shared_scores[t] *= inv_sum;
+        else            head_scratch[t]  *= inv_sum;
+    }
+    __syncthreads();
+
+    for (int d = (int)tid; d < head_dim; d += 256) {
+        float acc = 0.f;
+        for (int t = 0; t < seq_len; t++) {
+            float weight = use_shared ? shared_scores[t] : head_scratch[t];
+            long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            acc += weight * sharpi_bf16_to_fp32((unsigned int)v_cache[v_off + d]);
         }
         out[out_off + d] = acc;
     }

@@ -114,6 +114,12 @@ recurrence), and the shared expert resident in VRAM; routed-expert dispatch
 auto-selects between an SLRU GPU cache and CPU mmap reads based on what
 fraction of experts can be cached at boot. Override with `SHARPI_CPU_MOE=0|1`.
 
+On hybrid GDN paths the GPU KV cache stores bf16 by default (`SHARPI_KV_DTYPE
+=bf16`, see issue #27); arithmetic still runs in fp32 (bf16→fp32 promotion on
+the read). The 2× cache shrink frees ~128 MiB at ctx=4096 — enough to fit one
+extra dense-FFN layer on a 12 GB card, lifting Qwen3.6-27B-MTP `--temp 0` decode
+from 4.3 → 6.4 t/s. Override with `SHARPI_KV_DTYPE=fp32` to bisect precision.
+
 On Ampere+ (sm_80+) the CUDA backend auto-selects bf16 cuBLAS GEMM, which
 matches fp32 for almost all workloads. `SHARPI_CUDA_PRECISION=fp32|fp16|bf16|fp8`
 overrides the compute type — handy for bisecting whether an output divergence

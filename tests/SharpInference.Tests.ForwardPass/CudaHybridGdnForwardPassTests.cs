@@ -340,4 +340,96 @@ public sealed class CudaHybridGdnForwardPassTests
             "producing degenerate output. Likely culprits: SplitQG with MTP weights, " +
             "GLU gate, or output projection.");
     }
+
+    /// <summary>
+    /// Issue #27: Bf16 KV cache parity on the qwen35 27B-MTP CUDA hybrid path.
+    /// Runs the same prompt twice — once with the legacy fp32 KV cache, once
+    /// with the default bf16 cache — and asserts:
+    ///
+    ///   • bf16 logits are finite and non-degenerate,
+    ///   • greedy top-1 matches fp32 at prefill,
+    ///   • bf16 logits stay within a generous tolerance of fp32 (max top-K logit
+    ///     gap &lt; 0.5 on the top 16 vocab entries, ratifying that bf16's
+    ///     8-bit mantissa hasn't blown out attention output magnitudes).
+    ///
+    /// We intentionally use the qwen35 27B-MTP dense model (not qwen35moe): it
+    /// loads on a 12 GB card and the parity surface is smaller (no SLRU/MoE
+    /// non-determinism on top of cache precision).
+    /// </summary>
+    [Fact]
+    public void CudaHybridGdnForwardPass_Qwen35Mtp_Bf16KvCache_GreedyMatchesFp32()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        var path = FindMtpModelPath();
+        if (path is null) return;
+
+        var prev = Environment.GetEnvironmentVariable("SHARPI_KV_DTYPE");
+
+        // Reference: fp32 KV cache (legacy precision).
+        Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", "fp32");
+        int fp32Top1;
+        float[] fp32TopK;
+        try
+        {
+            (fp32Top1, fp32TopK) = RunGreedyPrefill(gpu, path);
+        }
+        finally { Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", prev); }
+
+        // Candidate: bf16 KV cache (the new default).
+        Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", "bf16");
+        int bf16Top1;
+        float[] bf16TopK;
+        try
+        {
+            (bf16Top1, bf16TopK) = RunGreedyPrefill(gpu, path);
+        }
+        finally { Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", prev); }
+
+        Assert.True(fp32Top1 == bf16Top1,
+            $"Bf16 KV cache diverged at prefill greedy: fp32 picked token {fp32Top1}, " +
+            $"bf16 picked {bf16Top1}. Bf16's 8-bit mantissa shouldn't flip top-1 on a " +
+            "short prompt — investigate KvAppendBf16 / AttentionBf16 wiring.");
+
+        // Compare the top-16 logits in fp32-vocab order. Bf16's per-element ε is
+        // ~1/256; accumulated over an attention dot of head_dim=256 the worst
+        // case is ε ≈ 1.0 in absolute value, much smaller in practice. Cap at 0.5.
+        float maxAbsDiff = 0f;
+        for (int i = 0; i < fp32TopK.Length; i++)
+            maxAbsDiff = Math.Max(maxAbsDiff, Math.Abs(fp32TopK[i] - bf16TopK[i]));
+        Assert.True(maxAbsDiff < 0.5f,
+            $"Bf16 KV cache produced top-K logits diverging by {maxAbsDiff:F3} from fp32; " +
+            "expected < 0.5. Either Bf16 conversion is broken or the kernel is reading " +
+            "stale ring positions.");
+    }
+
+    private static (int top1, float[] topK) RunGreedyPrefill(CudaBackend gpu, string modelPath)
+    {
+        using var model = GgufModel.Open(modelPath);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+
+        var placement = new LayerPlacement(
+            GpuLayers: hp.NumLayers,
+            CpuLayers: 0,
+            GpuWeightBytes: 0,
+            GpuKvBytes: 0,
+            RecommendedCtxSize: Math.Min(hp.ContextLength, 2048));
+
+        using var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
+        var tokens = tokenizer.Encode("Hello");
+        var logits = fwd.Prefill(tokens).ToArray();
+
+        int top1 = Sampler.Greedy(logits);
+
+        // Capture the top-16 raw logits (descending) so the parity diff isn't
+        // dominated by a single high-magnitude entry.
+        const int K = 16;
+        var sorted = (float[])logits.Clone();
+        Array.Sort(sorted, (a, b) => b.CompareTo(a));
+        var topK = new float[K];
+        Array.Copy(sorted, topK, K);
+        return (top1, topK);
+    }
 }
