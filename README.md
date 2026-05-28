@@ -56,6 +56,33 @@ VRAM via TierPlanner; falls through to Vulkan only when CUDA isn't present.
 `headDim ∈ {128, 256}`). MoE runs on GPU (full-offload or partial hybrid) on
 both Vulkan and CUDA backends.
 
+CPU TurboQuant K-scoring and V-aggregation use a FastScan-derived AVX2
+kernel (issue #34): KV positions are packed into 32-position tiles with
+codes stored as 4-bit nibbles, a per-query i8 LUT is built once per
+(layer, kv-head), and each `dim` step reduces to a `vpshufb` against
+the LUT instead of `vpgatherdd`. V-aggregation defers the per-position
+sign-flip + inverse Walsh-Hadamard transform to one call per kv-head
+(commutes through the Σ_t accumulation), so the IWHT cost goes from
+`O(tqLength · dim log dim)` per token down to `O(dim log dim)`. On
+Ryzen 9 7900X, per (layer, kv-head) cost of the combined K+V attention
+hot path vs the previous per-block AVX2 path
+(`TurboQuantOps.DequantDot4Avx2`):
+
+| TQ positions | per-block K+V | FastScan K+V | speedup |
+|---:|---:|---:|---:|
+| 1 024 | 479 µs | 26 µs | 18× |
+| 4 096 | 1 931 µs | 98 µs | 20× |
+| 8 192 | 3 936 µs | 193 µs | 20× |
+| 16 384 | 8 216 µs | 390 µs | 21× |
+
+End-to-end gain on decode tracks the K+V share of token cost: small at
+short context (a few percent at 256 ≤ ctx ≤ 1K, dominated by the FFN /
+QKV weight reads on dense models) and growing with context length —
+Qwen3-8B Q4_K_M CPU `--tq` 2K-position decode measures 10.9 t/s, and
+the FastScan ratio projects roughly 2× at 8K and 3× at 16K vs the
+per-block path (where the per-token K+V cost alone would dominate
+decode time).
+
 Session-lifetime weights (per-layer projections, expert FFNs, embedding,
 output) on all three CUDA forward passes (`CudaForwardPass`,
 `CudaHybridForwardPass`, `CudaHybridGdnForwardPass`) bypass the GPU buffer

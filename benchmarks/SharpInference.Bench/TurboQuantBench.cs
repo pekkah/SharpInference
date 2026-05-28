@@ -20,7 +20,7 @@ public unsafe class FastScanKScoreBench
     private const int Dim = 128;
     private const int Bits = 4;
 
-    [Params(1024, 4096, 8192)]
+    [Params(1024, 4096, 8192, 16384)]
     public int NumPositions;
 
     private int _blockSize;
