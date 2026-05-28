@@ -452,16 +452,20 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         // doesn't participate in scoring and will not be downloaded.
         _gpu.ClearRegion(_snapKvScoreAccum!, 0, N);
 
+        // Record ALL (layer, w) score dispatches into one command buffer and
+        // submit once. The CAS-based atomicAdd on _snapKvScoreAccum (binding 2
+        // of SnapKvScore) serialises writes globally, so dispatch order doesn't
+        // affect the final accumulator. WAR/WAW hazards on the reused _q buffer
+        // are handled by RecordBarrier between each (CopyRegion → SnapKvScore)
+        // pair and after each SnapKvScore (before the next iter's CopyRegion).
+        // For Qwen3-8B (36 × 64 = 2304 dispatches) this collapses ~50 ms of
+        // per-submit overhead into a single submission. (Closes #66.)
         int qDim = _numHeads * _headDim;
+        _gpu.BeginRecord();
         for (int layer = 0; layer < _hp.NumLayers; layer++)
         {
             for (int w = 0; w < W; w++)
             {
-                // Stage the captured Q into _q so the scoring kernel can read a
-                // contiguous [numHeads × headDim] vector at the same device
-                // pointer it does during Forward. One command buffer per pair
-                // so the host stays in lockstep with the score atomicAdds.
-                _gpu.BeginRecord();
                 long srcOffsetElems = ((long)layer * _snapKvQCaptureW + w) * qDim;
                 _gpu.RecordComputeCopyRegion(_q, 0,
                     _snapKvQCapture!, srcOffsetElems * sizeof(float),
@@ -473,9 +477,10 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                     _snapKvScoreAccum!, _snapKvScoreScratch!,
                     (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
                     (uint)N, (uint)qAbsPos, (uint)_maxSeqLen);
-                _gpu.EndRecordAndSubmit();
+                _gpu.RecordBarrier();
             }
         }
+        _gpu.EndRecordAndSubmit();
 
         // Download the prompt-length prefix of the accumulator and pick the keep set.
         var hostScores = new float[N];
