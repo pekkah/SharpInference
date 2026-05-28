@@ -26,7 +26,9 @@ matching chat template).
 | SmolLM2 1.7B Instruct | [HuggingFaceTB](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF) | 1 GB | CPU | 16.6 | 38.9 | AVX2 fused dequant-matvec |
 | SmolLM2 1.7B Instruct | (same) | 1 GB | Vulkan `-g -1` | 42.0 | **139.7** | GLSL `subgroupAdd` reduce |
 | SmolLM2 1.7B Instruct | (same) | 1 GB | **CUDA** `-g -1` | **181.1** | **158.1** | NVRTC `__dp4a` + Q8_1 |
-| Qwen3 8B | [Qwen](https://huggingface.co/Qwen/Qwen3-8B-GGUF) | 5 GB | Vulkan `-g -1` | 23.0 | 45.8 | 11.4K auto-ctx |
+| Qwen3 8B | [Qwen](https://huggingface.co/Qwen/Qwen3-8B-GGUF) | 5 GB | CPU | 2.9 | 11.7 | dense forward pass, no KV compression |
+| Qwen3 8B | (same) | 5 GB | CPU `--tq` | 3.2 | **11.9** | 3-bit KV → up to 40 960 ctx. FastScan K + V kernels (issue #34) deliver ~20× over the per-block AVX2 path on the attention K+V hot loop; visible end-to-end at long context: **10.2 t/s @ 3K, 9.4 t/s @ 6K** (vs ~5 t/s baseline at 6K). Batched prefill is TQ-aware (issue #34 follow-up) so prompt processing matches the no-`--tq` rate |
+| Qwen3 8B | (same) | 5 GB | Vulkan `-g -1` | 23.0 | 45.8 | 11.4K auto-ctx |
 | Qwen3 8B | (same) | 5 GB | Vulkan `-g -1 --tq` | 21.7 | 45.5 | 3-bit KV → 40 960 ctx |
 | Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1` | **65.9** | **58.6** | ~2.8× Vulkan prefill |
 | Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --no-thinking` | **66.0** | **58.2** | Same per-token rate; reasoning suppressed in chat template, so all decoded tokens are visible answer |
