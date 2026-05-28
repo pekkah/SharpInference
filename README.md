@@ -46,32 +46,48 @@ matching chat template).
 | Qwen3.6-35B-A3B (GDN+MoE) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | 22 GB | CPU | 4.3 | 7.8 | hybrid GDN/attn, 256 experts / 8 active |
 | Qwen3.6-35B-A3B (GDN+MoE) | (same) | 22 GB | **CUDA** `-g -1` (hybrid) | **11.2** | **23.8** | 10 attn + 30 GDN on GPU; MoE auto-routed to CPU, batched-expert dispatch (8 experts × 3 ops into 2 Parallel.For sweeps), shared expert kept on GPU and overlapped with the CPU routed loop |
 | Qwen3.6-27B-MTP (GDN) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) | 16 GB | CPU `--no-thinking` | 2.8 | **3.8** | dense 27B, hybrid GDN/attn, native MTP head; auto-engages MTP self-spec (issue #25) at greedy + `--no-thinking`. 95% draft acceptance (38/40); batched N=2 verify (#30) + fused Q6_K·Q8_K 2-input dot (#42) lift decode from 2.7 (sequential N=1) to 3.8 — 1.4× over MTP-off baseline |
-| Qwen3.6-27B-MTP (GDN) | (same) | 16 GB | **CUDA** `-g -1 --no-thinking` (hybrid) | **5.8** | **10.4** | 20/64 dense FFN layers on GPU (3.3 GB) + GDN + attn KV resident; 44/64 FFN layers on CPU mmap. 95% draft acceptance; batched verify lifts decode from 6.1 to 10.4 (1.70× over MTP-off baseline). The CPU FFN majority batches via `CpuDenseFfn2` and the on-GPU FFN layers now batch via `MatMulN2` (issue #43 — one weight read per row, two outputs); the small additional Q4_K gain over the previous CPU-only batching reflects the 31% on-GPU FFN share at 12 GB |
+| Qwen3.6-27B-MTP (GDN) | (same) | 16 GB | **CUDA** `-g -1 --no-thinking` (hybrid) | **5.7** | **10.7** | 20/64 dense FFN layers on GPU (3.3 GB) + GDN + attn KV resident; 44/64 FFN layers on CPU mmap. 95% draft acceptance; batched verify lifts decode from 6.2 to 10.7 (1.73× over MTP-off baseline). The CPU FFN majority batches via `CpuDenseFfn2` and the on-GPU FFN layers now batch via `MatMulN2` (issue #43 — one weight read per row, two outputs). Direct-pinned `Download/UploadInto` (#48) and async `_lastHidden` overlap (#49) shave per-layer host stall on the MoE-MTP/dense-FFN-MTP hot path |
 | Qwen3.6-27B-MTP (GDN) | (same) | 19 GB | CPU `--no-thinking` `Q5_K_M` | 2.5 | **3.5** | Q5_K_M variant, ~10% slower than Q4_K_M as expected from weight bandwidth. 100% draft acceptance (40/40) on this prompt; batched verify lifts decode from 2.4 to 3.5 (1.46×) |
-| Qwen3.6-27B-MTP (GDN) | (same) | 19 GB | **CUDA** `-g -1 --no-thinking` `Q5_K_M` (hybrid) | 1.1 | **7.6** | 13/64 FFN layers on GPU (2.4 GB) + GDN + attn KV resident; 51/64 FFN on CPU mmap. Uses `llm_embed_lookup_q5k` direct-read kernel (issue #39) and the Q5_K `MatMulN2` kernel (issue #43) for the on-GPU layers. 98% draft acceptance; batched verify lifts decode from 4.1 to 7.6 (1.85×) |
+| Qwen3.6-27B-MTP (GDN) | (same) | 19 GB | **CUDA** `-g -1 --no-thinking` `Q5_K_M` (hybrid) | 4.4 | **7.9** | 13/64 FFN layers on GPU (2.4 GB) + GDN + attn KV resident; 51/64 FFN on CPU mmap. Uses `llm_embed_lookup_q5k` direct-read kernel (issue #39) and the Q5_K `MatMulN2` kernel (issue #43) for the on-GPU layers. 98% draft acceptance; batched verify lifts decode from 4.3 to 7.9 (1.84×). Direct-pinned `Download/UploadInto` (#48) + async `_lastHidden` overlap (#49) land 0.5-0.8 t/s on top of #43's batched MatMul win — measurable here because Q5_K MatMul is more PCIe-bound than Q4_K |
 | Qwen3.6-35B-A3B-MTP (GDN+MoE) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) | 22 GB | CPU `--no-thinking` | 6.9 | 8.0 | hybrid GDN/attn + 256-expert MoE + native MTP head (issue #44). 100% draft acceptance. Issue #45 enables `BatchForward2` for MoE MTP — attn/GDN/lm_head batch across t1/t2 but routed experts run sequentially per token (top-K differs), so the win is small (lm_head save + frame overhead). At parity with the 8.2 MTP-off baseline within CPU jitter |
 | Qwen3.6-35B-A3B-MTP (GDN+MoE) | (same) | 22 GB | **CUDA** `-g -1 --no-thinking` (hybrid) | **13.0** | **22.9** | Requires `SHARPI_CPU_MOE=1`: 30 GDN + 10 attn + shared expert on GPU, MoE routed experts + MTP MoE FFN mmap'd on CPU. 100% draft acceptance. Issue #45 lifts decode from 22.9 (sequential MTP at 0.99× MTP-off baseline) to at-or-above MTP-off — modest because routed-expert weight reads can't share between tokens; the bandwidth-bound CPU MoE FFN runs sequentially per token. Issues #47 (async UploadViaStaging) + #49 (overlap `_lastHidden` D2H with lm_head MatMul) shave further µs/layer |
 
 `--backend auto` (default) picks CUDA when available, sizing the GPU/CPU split from
 VRAM via TierPlanner; falls through to Vulkan only when CUDA isn't present.
-SnapKV prefill-time KV eviction (issue #51) is auto-enabled on the CUDA
-hybrid GDN path (`CudaHybridGdnForwardPass`, qwen35moe / Qwen3.6-27B-MTP /
-35B-A3B-MTP) when the configured context is large enough that the full
-attention KV cache would exceed ~256 MiB — the 12 GB-card long-context
-target. The auto-budget is `min(maxSeqLen/4, 4096)` (floored at 1024,
-matching the SnapKV paper's accuracy curve); ctx ≤ ~8K leaves the cache
-untouched. After prefill the GPU scores each prompt position via per-(head,
-last-W-query) softmaxed attention atomicAdd-pooled across all attention
-layers (`llm_snapkv_score` / `_bf16`), picks top-K + a trailing recency
-window, and compacts the bf16 KV ring in place (`llm_kv_compact` / `_bf16`).
-Decode is unchanged — `LogicalLength` stays at the original prompt length so
-RoPE on new tokens lands at the right angle. `SHARPI_SNAPKV_BUDGET=N` forces
-an explicit budget; `=0` disables the auto path entirely. `_WINDOW` and
-`_RECENCY` (defaults 64 each) tune the importance probe and trailing
-must-keep zone. CPU `ForwardPass` (#57) keeps the explicit-opt-in convention
-— set `SHARPI_SNAPKV_BUDGET=N` to engage it there. Dense CUDA, Vulkan,
-TurboQuant composition, and LongBench accuracy validation are tracked as
-follow-ups under #51.
+
+SnapKV prefill-time KV eviction (issue #51) ships on every backend: CPU
+`ForwardPass` (#57), CUDA hybrid GDN `CudaHybridGdnForwardPass` (#58),
+dense CUDA `CudaForwardPass` (#63), and Vulkan `GpuForwardPass` (#64).
+After prefill the model scores each prompt position by softmaxed
+attention from the last `W` queries pooled across heads + layers
+(`llm_snapkv_score` / `_bf16` NVRTC kernels on CUDA; GLSL `SnapKvScore`
+on Vulkan with a CAS-based float `atomicAdd` since Vulkan core lacks
+native float atomics), picks top-K + a trailing recency window, and
+compacts the K/V ring in place (`llm_kv_compact` / `_bf16` / GLSL
+`KvCompact`). Decode is unchanged — `LogicalLength` stays at the
+original prompt length so RoPE on new tokens lands at the right angle.
+
+The three GPU paths auto-enable when the configured context is large
+enough that the full attention KV cache would exceed ~256 MiB (the
+12 GB-card long-context target); auto-budget is `min(maxSeqLen/4, 4096)`
+floored at 1024, matching the SnapKV paper's accuracy curve.
+`SHARPI_SNAPKV_BUDGET=N` forces an explicit budget; `=0` disables the
+auto path entirely. `_WINDOW` and `_RECENCY` (defaults 64 each) tune the
+importance probe and trailing must-keep zone. CPU `ForwardPass` keeps
+the explicit-opt-in convention — set `SHARPI_SNAPKV_BUDGET=N` to engage
+it there.
+
+SnapKV composes with TurboQuant on the CPU path (#68 / PR #71):
+`SnapKvSelector` scores against the TQ-compressed K via the existing
+FastScan dequant path, and `TurboQuantKvCache.Compact` re-quantizes
+TQ-survivors through the same per-(layer, head) Lloyd-Max compressor.
+`SHARPI_SNAPKV_BUDGET=N` + `--tq` together stack the two for ~16× total
+KV reduction (4× TQ × ~4× position pruning) at long context. CUDA and
+Vulkan TQ composition follow the same algorithm and are tracked as #69
+and #70. `CudaHybridForwardPass` (dense CPU+GPU split) is the one
+remaining backend where SnapKV isn't plumbed yet — needs a new
+`KvCache.Compact` for the CPU layers + mixed CPU+GPU score
+accumulation (#65).
 
 **SnapKV long-context eval** (issue #61): `dotnet run --project
 benchmarks/SnapKvEval -- --model models/Qwen3-8B-Q4_K_M.gguf` runs a
