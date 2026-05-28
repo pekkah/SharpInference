@@ -241,4 +241,83 @@ public sealed unsafe class PagedKvCacheTests : IDisposable
         Assert.Equal(42f, _cache.KeyAt(1, PagedKvCache.PageSize)[0]);
         Assert.Equal(99f, _cache.ValueAt(1, PagedKvCache.PageSize)[0]);
     }
+
+    // ── SnapKV (issue #51) compaction ──────────────────────────────────────
+
+    [Fact]
+    public void Compact_KeepEverything_NoOp()
+    {
+        for (int i = 0; i < 20; i++) AppendToken(_cache, i, -i);
+        var keep = new int[20];
+        for (int i = 0; i < 20; i++) keep[i] = i;
+
+        _cache.Compact(keep);
+
+        Assert.Equal(20, _cache.Length);
+        Assert.Equal(20, _cache.LogicalLength);
+        for (int i = 0; i < 20; i++)
+        {
+            Assert.Equal((float)i, _cache.KeyAt(0, i)[0]);
+            Assert.Equal((float)-i, _cache.ValueAt(0, i)[0]);
+        }
+    }
+
+    [Fact]
+    public void Compact_DropsEvictedPositions_KeepsOrder()
+    {
+        // 20 tokens at positions 0..19; keep {0, 5, 11, 17, 19}.
+        for (int i = 0; i < 20; i++) AppendToken(_cache, i + 1f, -(i + 1f));
+        int[] keep = { 0, 5, 11, 17, 19 };
+
+        _cache.Compact(keep);
+
+        Assert.Equal(5, _cache.Length);              // slot count drops
+        Assert.Equal(20, _cache.LogicalLength);      // RoPE frame preserved
+        // Slot i now holds what was at position keep[i].
+        for (int i = 0; i < keep.Length; i++)
+        {
+            float expectedK = keep[i] + 1f;
+            float expectedV = -(keep[i] + 1f);
+            Assert.Equal(expectedK, _cache.KeyAt(0, i)[0]);
+            Assert.Equal(expectedV, _cache.ValueAt(0, i)[0]);
+            Assert.Equal(expectedK, _cache.KeyAt(1, i)[0]);
+            Assert.Equal(expectedV, _cache.ValueAt(1, i)[0]);
+        }
+    }
+
+    [Fact]
+    public void Compact_ThenAppend_NewTokenLandsAtCompactedTail()
+    {
+        for (int i = 0; i < 20; i++) AppendToken(_cache, i + 1f, 0f);
+        int[] keep = { 0, 5, 11, 17, 19 };
+        _cache.Compact(keep);
+
+        // A decode-side append should write at slot 5 (the new tail), while
+        // LogicalLength advances from 20 to 21 — the decode caller will RoPE
+        // the new K at position 20 (the original sequence frame).
+        AppendToken(_cache, 999f, 0f);
+
+        Assert.Equal(6, _cache.Length);
+        Assert.Equal(21, _cache.LogicalLength);
+        Assert.Equal(999f, _cache.KeyAt(0, 5)[0]);
+        // Pre-compaction survivors untouched.
+        Assert.Equal(6f, _cache.KeyAt(0, 1)[0]);  // was position 5, value 6f
+    }
+
+    [Fact]
+    public void Compact_RejectsOutOfRange()
+    {
+        for (int i = 0; i < 8; i++) AppendToken(_cache, i, 0f);
+        // 8 stored — position 8 is out of range.
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            _cache.Compact(new[] { 0, 8 }));
+    }
+
+    [Fact]
+    public void Compact_RejectsUnsorted()
+    {
+        for (int i = 0; i < 8; i++) AppendToken(_cache, i, 0f);
+        Assert.Throws<ArgumentException>(() =>
+            _cache.Compact(new[] { 3, 1 }));
+    }
 }

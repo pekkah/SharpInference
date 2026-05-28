@@ -79,6 +79,12 @@ public sealed unsafe class ForwardPass : IForwardPass
     private float* _rotatedQuery;  // scratch for WHT-rotated query [headDim]
     private float* _decompBuf;     // scratch for decompressed TQ value [headDim]
 
+    // SnapKV (issue #51) prefill-time KV eviction. Activated via the
+    // SHARPI_SNAPKV_BUDGET env var; the selector is lazily allocated on the
+    // first prefill long enough to require eviction.
+    private readonly SnapKvConfig _snapKvCfg;
+    private SnapKvSelector? _snapKv;
+
     // Diagnostic: per-layer residual L2-norm trace (env: SHARPI_TRACE_NORMS=1).
     private static readonly bool _traceNorms =
         Environment.GetEnvironmentVariable("SHARPI_TRACE_NORMS") == "1";
@@ -114,6 +120,7 @@ public sealed unsafe class ForwardPass : IForwardPass
             : Math.Min(hp.ContextLength, 32768);
         _ctxLen = ctxLen;
         _kvCache = new PagedKvCache(hp.NumLayers, hp.NumKvHeads, hp.HeadDim);
+        _snapKvCfg = SnapKvConfig.FromEnvironment();
 
         _embDim = hp.EmbeddingDim;
         _headDim = hp.HeadDim;
@@ -369,6 +376,21 @@ public sealed unsafe class ForwardPass : IForwardPass
     private ReadOnlySpan<float> PrefillCore(IReadOnlyList<int> tokens, PagedKvCache cache, int startPos)
     {
         int N = tokens.Count;
+
+        // SnapKV gating (issue #51): only run eviction when this is a fresh
+        // prefill (startPos==0), the budget is configured, AND the prompt is
+        // long enough that eviction would actually drop something. On short
+        // prompts the scoring cost outweighs the savings.
+        bool snapKvActive = _snapKvCfg.Enabled
+                         && startPos == 0
+                         && N > _snapKvCfg.Budget
+                         && N > _snapKvCfg.Window;
+        if (snapKvActive)
+        {
+            _snapKv ??= new SnapKvSelector(_numHeads, _numKvHeads, _headDim);
+            _snapKv.Reset(N);
+        }
+
         // Batch hidden states: [N, embDim]
         var batchHidden = (float*)NativeMemory.AllocZeroed((nuint)((long)N * _embDim * sizeof(float)));
         var batchResidual = (float*)NativeMemory.AllocZeroed((nuint)((long)N * _embDim * sizeof(float)));
@@ -467,6 +489,17 @@ public sealed unsafe class ForwardPass : IForwardPass
                         Copy(batchAttnOut + (long)n * qDim, _attnOut, qDim);
                     }
 
+                    // SnapKV (issue #51): accumulate per-layer last-W query
+                    // attention into the global score buffer. batchQ here is
+                    // post-RoPE / post-Q-norm — the same vectors that just
+                    // wrote scores against the K cache in the per-token loop
+                    // above, so the scoring math is internally consistent.
+                    if (snapKvActive)
+                    {
+                        _snapKv!.AccumulateLayer(batchQ, N, cache, layer, startPos,
+                            _snapKvCfg.Window);
+                    }
+
                     // Batched output projection
                     SimdKernels.MatMulBatched(batchNorm, _wo[layer].DataPtr, batchAttnOut,
                         N, _embDim, qDim, _wo[layer].DType);
@@ -521,6 +554,21 @@ public sealed unsafe class ForwardPass : IForwardPass
 
                 // Set KV cache length to startPos + N for subsequent decode calls.
                 cache.TruncateTo(startPos + N);
+
+                // SnapKV (issue #51): compact the cache to the selected keep
+                // set. Runs once per prefill — the per-token decode path is
+                // untouched and pays no extra cost. After compaction
+                // cache.Length is the kept-slot count and cache.LogicalLength
+                // is the original prompt length, so decode RoPE continues from
+                // the right reference frame.
+                if (snapKvActive)
+                {
+                    var keep = _snapKv!.SelectKeepSet(N, _snapKvCfg.Budget, _snapKvCfg.Recency);
+                    if (keep.Length < N)
+                    {
+                        cache.Compact(keep);
+                    }
+                }
             }
             finally
             {
@@ -1101,7 +1149,15 @@ public sealed unsafe class ForwardPass : IForwardPass
 
     private void Attention(PagedKvCache cache, int layer, int position)
     {
-        int seqLen = position + 1;
+        // After SnapKV eviction (issue #51), the absolute position keeps
+        // growing while the cache only stores `cache.Length` slots — `position`
+        // would overshoot. The prefill loop increments cache.Length before
+        // calling Attention (so position+1 == cache.Length); the decode loop
+        // increments after (so position+1 == cache.Length+1). Clamping to
+        // cache.Length+1 keeps the old answer for both prefill and the
+        // un-evicted decode case while bounding the read to the actually
+        // stored slots once eviction has shrunk the cache.
+        int seqLen = Math.Min(position + 1, cache.Length + 1);
         float scale = 1.0f / MathF.Sqrt(_headDim);
         int ctxLen = _ctxLen; int hd = _headDim; int hpkg = _headsPerKvGroup;
         var q = _q; var attnOut = _attnOut; var scores = _attnScores;
