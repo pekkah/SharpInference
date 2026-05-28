@@ -54,6 +54,15 @@ matching chat template).
 
 `--backend auto` (default) picks CUDA when available, sizing the GPU/CPU split from
 VRAM via TierPlanner; falls through to Vulkan only when CUDA isn't present.
+`SHARPI_SNAPKV_BUDGET=N` enables SnapKV prefill-time KV eviction on the CPU
+forward pass (issue #51 v1). After prefill, the cache scores each prompt
+position using the last-W queries' attention, retains the top-(N−recency)
+by score plus the trailing `SHARPI_SNAPKV_RECENCY` positions, and compacts
+the `PagedKvCache` to that set. Decode is unchanged — its only cost is
+prefill-side. Use it when the prompt is much longer than the model needs to
+keep around (chat with a big system prompt, RAG with retrieved chunks, …).
+GPU backend ports and TurboQuant composition are tracked as follow-ups.
+
 `--tq` enables 3-bit TurboQuant KV compression (CPU, Vulkan, CUDA; requires
 `headDim ∈ {128, 256}`). MoE runs on GPU (full-offload or partial hybrid) on
 both Vulkan and CUDA backends.

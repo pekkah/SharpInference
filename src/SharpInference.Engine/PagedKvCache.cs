@@ -46,6 +46,19 @@ public sealed unsafe class PagedKvCache : IDisposable
     // Current logical position count (can be < _allocatedBlocks * PageSize after TruncateTo).
     private int _length;
 
+    // SnapKV (issue #51): when prefill eviction is active, _length becomes the
+    // *slot* count after compaction while _logicalLength stays at the original
+    // (pre-eviction) prompt length. The two diverge only after Compact() is
+    // called — outside of SnapKV they track each other exactly.
+    //
+    //   _length         : how many K/V vectors are physically stored, == slot
+    //                     index of the next append.
+    //   _logicalLength  : the absolute position the next decode token sits at,
+    //                     used for RoPE so cached K's (RoPE'd at their
+    //                     original positions) and the incoming query share the
+    //                     same reference frame.
+    private int _logicalLength;
+
     private bool _disposed;
 
     public PagedKvCache(int numLayers, int numKvHeads, int headDim, int maxBlocks = 8192)
@@ -71,6 +84,16 @@ public sealed unsafe class PagedKvCache : IDisposable
 
     public int Length => _length;
     public int KvDim => _kvDim;
+
+    /// <summary>
+    /// Absolute position the next decode token will sit at, == <see cref="Length"/>
+    /// unless SnapKV (issue #51) eviction has been applied. After
+    /// <see cref="Compact"/>, this stays at the original prompt length while
+    /// <see cref="Length"/> drops to the surviving slot count; downstream
+    /// callers should use <see cref="LogicalLength"/> for RoPE on new tokens
+    /// so the cached RoPE'd K's stay in the right reference frame.
+    /// </summary>
+    public int LogicalLength => _logicalLength;
 
     /// <summary>Maximum sequence length this cache can hold (slot pool limit).</summary>
     public int MaxSeqLen => _maxBlocks * PageSize;
@@ -209,7 +232,11 @@ public sealed unsafe class PagedKvCache : IDisposable
     }
 
     /// <summary>Advances the logical length. Call once per token after all layers are appended.</summary>
-    public void IncrementPosition() => _length++;
+    public void IncrementPosition()
+    {
+        _length++;
+        _logicalLength++;
+    }
 
     /// <summary>Returns a pointer to the key vector at <paramref name="position"/> for <paramref name="layer"/>.</summary>
     public float* KeyAt(int layer, int position)
@@ -230,7 +257,11 @@ public sealed unsafe class PagedKvCache : IDisposable
     /// Positions ≥ <paramref name="length"/> will be overwritten by subsequent appends.
     /// Used during per-layer prefill resets and speculative decoding rewinds.
     /// </summary>
-    public void TruncateTo(int length) => _length = length;
+    public void TruncateTo(int length)
+    {
+        _length = length;
+        _logicalLength = length;
+    }
 
     /// <summary>
     /// Full reset: returns all allocated page slots to the warm pool for reuse.
@@ -243,6 +274,143 @@ public sealed unsafe class PagedKvCache : IDisposable
             _warmPool.Push(_blockTable[0][b]);
         _allocatedBlocks = 0;
         _length = 0;
+        _logicalLength = 0;
+    }
+
+    /// <summary>
+    /// SnapKV (issue #51) compaction: keep only the K/V vectors at the positions
+    /// listed in <paramref name="keepPositions"/> (sorted ascending, all within
+    /// <c>[0, Length)</c>); discard the rest. After compaction the cache holds
+    /// <c>keepPositions.Length</c> entries in slots <c>[0, keepPositions.Length)</c>;
+    /// <see cref="LogicalLength"/> is left at the pre-compaction value so RoPE on
+    /// subsequent decode tokens stays in the original position frame.
+    /// </summary>
+    /// <remarks>
+    /// Uniform-across-layers eviction only: the same keep set applies to every
+    /// layer because the block table is shared. Per-layer eviction (true SnapKV)
+    /// is a follow-up; for the common case where attention sparsity patterns
+    /// correlate across layers this is the right tradeoff for a first cut.
+    ///
+    /// The implementation copies survivors into a staging buffer one page at a
+    /// time, then writes them back contiguously into the existing pages. This
+    /// in-place style avoids allocating a parallel cache and works regardless
+    /// of how non-contiguous the keep set is.
+    /// </remarks>
+    public void Compact(ReadOnlySpan<int> keepPositions)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(PagedKvCache));
+        int K = keepPositions.Length;
+        if (K > _length)
+            throw new ArgumentException(
+                $"Compact: keep count {K} exceeds current Length {_length}.",
+                nameof(keepPositions));
+        // Validate sorted + bounds. The selector contract guarantees this; the
+        // assert here catches caller bugs (it's cheap relative to the layer loop).
+        int prev = -1;
+        for (int i = 0; i < K; i++)
+        {
+            int p = keepPositions[i];
+            if (p < 0 || p >= _length)
+                throw new ArgumentOutOfRangeException(nameof(keepPositions),
+                    $"keepPositions[{i}]={p} is outside [0,{_length}).");
+            if (p <= prev)
+                throw new ArgumentException(
+                    $"keepPositions must be strictly increasing; got {prev} then {p} at index {i}.",
+                    nameof(keepPositions));
+            prev = p;
+        }
+
+        if (K == _length)
+        {
+            // No-op compaction (every position kept). Skip the staging dance.
+            return;
+        }
+
+        int preCompactLength = _logicalLength;
+
+        // Stage one layer at a time: read survivors into a contiguous host
+        // buffer, then write them back into slot 0..K-1 of the same layer.
+        // Buffer size: K × kvDim × 2 floats. For K=2048, kvDim=1024 (Qwen3-8B-
+        // class), that's 16 MiB — fine for a one-shot post-prefill op.
+        nuint stageBytes = (nuint)((long)K * _kvDim * 2 * sizeof(float));
+        float* stage = (float*)NativeMemory.Alloc(stageBytes);
+        try
+        {
+            for (int l = 0; l < _numLayers; l++)
+            {
+                // Pull survivors into the stage buffer (K rows × kvDim K-then-V layout).
+                for (int i = 0; i < K; i++)
+                {
+                    int srcPos = keepPositions[i];
+                    int srcSlot = _blockTable[l][srcPos / PageSize];
+                    float* srcPage = _pool[l][srcSlot];
+                    if (srcPage == null)
+                    {
+                        // Layer's page was never allocated for that block — write
+                        // zeros to the stage row. This happens for hybrid GDN
+                        // models on non-attention layers; the slot exists but no
+                        // K/V was ever appended. Compaction should leave them
+                        // empty rather than crash.
+                        for (int j = 0; j < _kvDim * 2; j++) stage[(long)i * _kvDim * 2 + j] = 0f;
+                        continue;
+                    }
+                    int srcOff = srcPos % PageSize;
+                    float* srcKey = srcPage + (long)srcOff * _kvDim;
+                    float* srcVal = srcPage + (long)(PageSize + srcOff) * _kvDim;
+                    float* dstKey = stage + (long)i * _kvDim * 2;
+                    float* dstVal = dstKey + _kvDim;
+                    new ReadOnlySpan<float>(srcKey, _kvDim)
+                        .CopyTo(new Span<float>(dstKey, _kvDim));
+                    new ReadOnlySpan<float>(srcVal, _kvDim)
+                        .CopyTo(new Span<float>(dstVal, _kvDim));
+                }
+
+                // Write survivors back into slot 0..K-1 of this layer. We touch
+                // each destination page through GetPage so any never-allocated
+                // pages get materialised on demand (matters when the source
+                // survivors came from a higher slot than was previously
+                // populated for this layer).
+                int writeBlocks = (K + PageSize - 1) / PageSize;
+                for (int i = 0; i < K; i++)
+                {
+                    int dstBlk = i / PageSize;
+                    int dstOff = i % PageSize;
+                    int dstSlot = _blockTable[l][dstBlk];
+                    float* dstPage = GetPage(l, dstSlot);
+                    float* dstKey = dstPage + (long)dstOff * _kvDim;
+                    float* dstVal = dstPage + (long)(PageSize + dstOff) * _kvDim;
+                    float* srcKey = stage + (long)i * _kvDim * 2;
+                    float* srcVal = srcKey + _kvDim;
+                    new ReadOnlySpan<float>(srcKey, _kvDim)
+                        .CopyTo(new Span<float>(dstKey, _kvDim));
+                    new ReadOnlySpan<float>(srcVal, _kvDim)
+                        .CopyTo(new Span<float>(dstVal, _kvDim));
+                }
+
+                // Free pages beyond the compacted prefix. These slots return to
+                // the warm pool for the *next* request's prefill — the current
+                // request can still grow into them via Append for decode tokens.
+                // We DON'T free the native pages here because the slot may be
+                // reused immediately; freeing would force a re-alloc.
+            }
+
+            // Free trailing block-table entries whose slots are no longer used
+            // for any kept position. Push their slots back to the warm pool so
+            // decode appends reuse them (or future Reset can.)
+            int compactedBlocks = (K + PageSize - 1) / PageSize;
+            for (int b = compactedBlocks; b < _allocatedBlocks; b++)
+            {
+                // All layers share the slot index per block — push once.
+                _warmPool.Push(_blockTable[0][b]);
+            }
+            _allocatedBlocks = compactedBlocks;
+            _length = K;
+            _logicalLength = preCompactLength;
+        }
+        finally
+        {
+            NativeMemory.Free(stage);
+        }
     }
 
     public void Dispose()
