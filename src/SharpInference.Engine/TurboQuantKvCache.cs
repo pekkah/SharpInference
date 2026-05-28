@@ -256,6 +256,17 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     public KvCacheCompressor GetValueCompressor(int layer, int kvHead) =>
         _valueCompressors[layer][kvHead];
 
+    /// <summary>
+    /// Sets the global position counter to <paramref name="length"/> without
+    /// touching per-layer TQ state. Intended for batched prefill: the per-layer
+    /// loop processes N tokens through one layer (advancing _totalLength from
+    /// startPos to startPos+N), then snaps the counter back to startPos before
+    /// the next layer. Per-layer K/V (FastScan tiles + staging + FP32 window)
+    /// stays intact, so each layer's TQ state evolves independently across the
+    /// shared global counter.
+    /// </summary>
+    public void ResetTotalLengthForBatchedPrefill(int length) => _totalLength = length;
+
     /// <summary>Resets the cache for a new generation.</summary>
     public void Reset()
     {
