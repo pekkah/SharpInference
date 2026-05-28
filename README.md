@@ -73,6 +73,13 @@ must-keep zone. CPU `ForwardPass` (#57) keeps the explicit-opt-in convention
 TurboQuant composition, and LongBench accuracy validation are tracked as
 follow-ups under #51.
 
+**SnapKV long-context eval** (issue #61): `dotnet run --project
+benchmarks/SnapKvEval -- --model models/Qwen3-8B-Q4_K_M.gguf` runs a
+needle-in-haystack sweep across budgets (128 → 2048) and needle positions
+(beginning, middle) on the deterministic CPU backend, emitting a markdown
+table of recovery scores. Pass criterion: budget=2048 recovers the needle
+at every position.
+
 `--tq` enables 3-bit TurboQuant KV compression (CPU, Vulkan, CUDA; requires
 `headDim ∈ {128, 256}`). MoE runs on GPU (full-offload or partial hybrid) on
 both Vulkan and CUDA backends.
