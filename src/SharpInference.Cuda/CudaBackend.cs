@@ -78,6 +78,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _sigmoidMulInPlaceKernel;
     private nint   _splitQgKernel;
     private nint   _kvAppendKernel;
+    // Issue #27: bf16-store KV cache for hybrid GDN models. Halves cache VRAM
+    // vs the fp32 ring; arithmetic still happens in fp32 (the bf16 → fp32
+    // promotion is done at the kernel read sites).
+    private nint   _kvAppendBf16Kernel;
+    private nint   _attentionBf16Kernel;
     private nint   _embedLookupF32Kernel;
     private nint   _embedLookupQ4KKernel;
     private nint   _embedLookupQ5KKernel;
@@ -1368,6 +1373,65 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention) failed: {r}");
     }
 
+    /// <summary>
+    /// Bf16-store variant of <see cref="KvAppend"/>. Inputs stay fp32; the K/V
+    /// cache tensors must be <see cref="DType.BFloat16"/>-allocated (half the
+    /// element count of an fp32 cache). See issue #27.
+    /// </summary>
+    public void KvAppendBf16(Tensor kInput, Tensor vInput, Tensor kCache, Tensor vCache,
+                             int kvDim, int position, int maxSeqLen)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint kPtr = GetDevPtr(kInput);
+        nint vPtr = GetDevPtr(vInput);
+        nint kcP  = GetDevPtr(kCache);
+        nint vcP  = GetDevPtr(vCache);
+        int  pKD = kvDim, pPos = position, pMSL = maxSeqLen;
+        nint* args = stackalloc nint[7]
+        {
+            (nint)(&kPtr), (nint)(&vPtr),
+            (nint)(&kcP), (nint)(&vcP),
+            (nint)(&pKD), (nint)(&pPos), (nint)(&pMSL)
+        };
+        uint grid = (uint)((kvDim + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_kvAppendBf16Kernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kv_append_bf16) failed: {r}");
+    }
+
+    /// <summary>
+    /// Bf16-read variant of <see cref="Attention"/>. K/V cache tensors must be
+    /// <see cref="DType.BFloat16"/>; query, output, and the score scratch stay
+    /// fp32. Arithmetic precision matches the fp32 kernel — only the cache
+    /// footprint changes.
+    /// </summary>
+    public void AttentionBf16(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+                              Tensor? scoresScratch,
+                              int numHeads, int numKvHeads, int headDim, int seqLen, int maxSeqLen)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint qP = GetDevPtr(q);
+        nint kP = GetDevPtr(kCache);
+        nint vP = GetDevPtr(vCache);
+        nint oP = GetDevPtr(output);
+        nint ssP = scoresScratch is { } sv ? GetDevPtr(sv) : nint.Zero;
+        int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pSL = seqLen, pMSL = maxSeqLen;
+        nint* args = stackalloc nint[10]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
+            (nint)(&ssP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pSL), (nint)(&pMSL)
+        };
+        int r = NvrtcInterop.LaunchKernel(_attentionBf16Kernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_bf16) failed: {r}");
+    }
+
     // ================================================================
     //  TurboQuant KV-cache compression
     // ================================================================
@@ -1549,13 +1613,24 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>Set every element of <paramref name="dst"/> to zero.</summary>
+    /// <remarks>
+    /// The kernel writes fp32-sized lanes; for sub-fp32 dtypes (e.g. BFloat16)
+    /// the byte count is converted to a 4-byte lane count so we don't overrun
+    /// the underlying buffer. For non-fp32 element sizes that aren't a multiple
+    /// of 4 bytes, callers should instead use a memset path (none exposed yet).
+    /// </remarks>
     public void Clear(Tensor dst)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
             throw new NotSupportedException("NVRTC kernels are not available.");
 
-        int n = (int)dst.ElementCount;
+        long byteCount = dst.ElementCount * DTypeInfo.BytesPerElement(dst.DType);
+        if ((byteCount & 3) != 0)
+            throw new InvalidOperationException(
+                $"Clear: dst byte count ({byteCount}) is not a multiple of 4; " +
+                "dtype-aware memset path is not implemented yet.");
+        int n = (int)(byteCount >> 2);
         nint dP = GetDevPtr(dst);
         int  pN = n;
         nint* args = stackalloc nint[2] { (nint)(&dP), (nint)(&pN) };
@@ -1950,10 +2025,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _rmsNormKernel, _headNormKernel, _headNormPureKernel, _siluMulKernel, _sigmoidKernel,
             _softmaxKernel, _ropeInterleavedKernel, _ropeNeoxKernel, _ropeNeoxPartialKernel,
             _mulKernel, _sigmoidMulInPlaceKernel, _splitQgKernel, _kvAppendKernel,
+            _kvAppendBf16Kernel,
             _embedLookupF32Kernel, _embedLookupQ4KKernel, _embedLookupQ5KKernel,
             _matvecF32Kernel, _matvecQ4KKernel, _matvecQ5KKernel, _matvecQ6KKernel,
             _matvecF32N2Kernel, _matvecQ4KN2Kernel, _matvecQ5KN2Kernel, _matvecQ6KN2Kernel,
-            _attentionKernel, _clearF32Kernel, _quantizeQ81Kernel,
+            _attentionKernel, _attentionBf16Kernel, _clearF32Kernel, _quantizeQ81Kernel,
             _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
             _siluInplaceKernel, _gdnConv1dDecodeKernel, _gdnL2NormPerHeadKernel,
             _gdnTileHeadsKernel, _gdnRecurrenceDecodeKernel,
@@ -1992,6 +2068,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _sigmoidMulInPlaceKernel = GetKernelFunc("llm_sigmoid_mul_inplace");
         _splitQgKernel         = GetKernelFunc("llm_split_qg");
         _kvAppendKernel        = GetKernelFunc("llm_kv_append");
+        _kvAppendBf16Kernel    = GetKernelFunc("llm_kv_append_bf16");
         _embedLookupF32Kernel  = GetKernelFunc("llm_embed_lookup_f32");
         _embedLookupQ4KKernel  = GetKernelFunc("llm_embed_lookup_q4k");
         _embedLookupQ5KKernel  = GetKernelFunc("llm_embed_lookup_q5k");
@@ -2004,6 +2081,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _matvecQ5KN2Kernel     = GetKernelFunc("llm_matvec_q5k_n2");
         _matvecQ6KN2Kernel     = GetKernelFunc("llm_matvec_q6k_n2");
         _attentionKernel       = GetKernelFunc("llm_attention");
+        _attentionBf16Kernel   = GetKernelFunc("llm_attention_bf16");
         _clearF32Kernel        = GetKernelFunc("llm_clear_f32");
         _quantizeQ81Kernel     = GetKernelFunc("llm_quantize_q8_1");
         _bwBaselineKernel      = GetKernelFunc("llm_bw_baseline");
