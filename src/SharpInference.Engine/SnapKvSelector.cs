@@ -1,5 +1,7 @@
+using System.Buffers;
 using System.Runtime.InteropServices;
 using SharpInference.Cpu;
+using SharpInference.TurboQuant;
 
 namespace SharpInference.Engine;
 
@@ -144,6 +146,107 @@ public sealed unsafe class SnapKvSelector
         finally
         {
             if (!useStack) NativeMemory.Free((void*)scoreBuf);
+        }
+    }
+
+    /// <summary>
+    /// TurboQuant-aware overload of <see cref="AccumulateLayer(float*, int, PagedKvCache, int, int, int)"/>:
+    /// reads K vectors from a <see cref="TurboQuantKvCache"/> instead of a paged FP32 cache.
+    /// For positions in the TQ region the score is the dequant-dot of the rotated
+    /// query against the per-position compressed block (tile or staging); for
+    /// positions in the FP32 ring window the score is a plain FP32 dot product.
+    /// Identical pooling/softmax/accumulation structure as the FP32 overload —
+    /// only the per-position K fetch differs.
+    /// </summary>
+    /// <remarks>
+    /// The TQ codec is lossy (~2-5% MSE-optimal bias at 3-4 bits), so the scores
+    /// here have somewhat more noise than the FP32 path. Empirically that's fine
+    /// for keep-set selection because the partial sort in <see cref="SelectKeepSet"/>
+    /// rounds away score-rank perturbations below the budget threshold.
+    /// </remarks>
+    public void AccumulateLayer(float* batchQ, int N, TurboQuantKvCache cache, int layer,
+                                int startPos, int window)
+    {
+        int W = Math.Min(window, N);
+        int wStart = N - W;
+        int promptLen = N;
+        var scratch = stackalloc float[Math.Min(promptLen, 8192)];
+        bool useStack = promptLen <= 8192;
+        float* scoreBuf = useStack ? scratch : (float*)NativeMemory.Alloc((nuint)(promptLen * sizeof(float)));
+        // Per-(head, position) rotated query buffer. Reused across all cached
+        // positions for one query — TurboQuantOps.DequantDot expects its
+        // q-side input already in the rotated domain.
+        Span<float> rotatedQ = stackalloc float[_headDim];
+        // Per-query TQ score scratch sized to the deepest TQ region we'll see.
+        // Path: ComputeKScores writes one float per TQ position, then we copy
+        // them into scoreBuf[0..tqLen). Rented from ArrayPool so AccumulateLayer
+        // is allocation-free across all layers (called once per layer; selector
+        // is reused across the whole prefill).
+        int maxTqLen = cache.GetTqLength(layer);
+        float[] tqScoreScratch = maxTqLen > 0
+            ? ArrayPool<float>.Shared.Rent(maxTqLen)
+            : Array.Empty<float>();
+        try
+        {
+            float scale = 1.0f / MathF.Sqrt(_headDim);
+            for (int w = wStart; w < N; w++)
+            {
+                int qAbsPos = startPos + w;
+                float* qVec = batchQ + (long)w * _numHeads * _headDim;
+                for (int h = 0; h < _numHeads; h++)
+                {
+                    int kvHead = h / _headsPerKvGroup;
+                    float* qHead = qVec + h * _headDim;
+
+                    // Rotate Q once per (head, query). The same rotated vector
+                    // is reused across all tqLen TQ positions via the FastScan
+                    // tile/staging kernels invoked below.
+                    var keyCompressor = cache.GetKeyCompressor(layer, kvHead);
+                    TurboQuantOps.RotateQuery(
+                        new ReadOnlySpan<float>(qHead, _headDim),
+                        rotatedQ,
+                        keyCompressor.SignPattern,
+                        _headDim);
+
+                    int tqLen = cache.GetTqLength(layer);
+
+                    // 1a. TQ K-scores via the same FastScan path TqAttention uses
+                    //     in decode. Single call covers tile-walk + staging tail.
+                    if (tqLen > 0)
+                    {
+                        fixed (float* rotQPtr = rotatedQ)
+                        fixed (float* tqScorePtr = tqScoreScratch)
+                            cache.ComputeKScores(layer, kvHead, rotQPtr, scale, tqScorePtr);
+                    }
+
+                    // 1b. Mux TQ + FP32 + causal mask into scoreBuf in position order.
+                    for (int p = 0; p < promptLen; p++)
+                    {
+                        int absPos = startPos + p;
+                        if (absPos > qAbsPos) { scoreBuf[p] = float.NegativeInfinity; continue; }
+
+                        if (p < tqLen)
+                        {
+                            // ComputeKScores already multiplied by `scale`.
+                            scoreBuf[p] = tqScoreScratch[p];
+                        }
+                        else
+                        {
+                            float* kVec = cache.Fp32KeyAt(layer, p) + kvHead * _headDim;
+                            scoreBuf[p] = SimdKernels.DotF32(qHead, kVec, _headDim) * scale;
+                        }
+                    }
+
+                    // 2-3. Softmax in place + accumulate.
+                    SimdKernels.SoftmaxInPlace(scoreBuf, promptLen);
+                    for (int p = 0; p < promptLen; p++) _scoreAccum[p] += scoreBuf[p];
+                }
+            }
+        }
+        finally
+        {
+            if (!useStack) NativeMemory.Free((void*)scoreBuf);
+            if (maxTqLen > 0) ArrayPool<float>.Shared.Return(tqScoreScratch);
         }
     }
 

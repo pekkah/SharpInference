@@ -609,6 +609,22 @@ public sealed unsafe class ForwardPass : IForwardPass
     {
         var cache = _tqKvCache!;
         int N = tokens.Count;
+
+        // SnapKV (issue #60) gating: fresh prefill, explicit budget, prompt
+        // long enough to drop something. TQ is fine to compose with — the
+        // selector reads from the same cache the per-token TqAttention writes
+        // and the compaction promotes the oldest FP32-window survivors into
+        // the TQ region as needed.
+        bool snapKvActive = _snapKvCfg.Enabled
+                         && startPos == 0
+                         && N > _snapKvCfg.Budget
+                         && N > _snapKvCfg.Window;
+        if (snapKvActive)
+        {
+            _snapKv ??= new SnapKvSelector(_numHeads, _numKvHeads, _headDim);
+            _snapKv.Reset(N);
+        }
+
         var batchHidden = (float*)NativeMemory.AllocZeroed((nuint)((long)N * _embDim * sizeof(float)));
         var batchResidual = (float*)NativeMemory.AllocZeroed((nuint)((long)N * _embDim * sizeof(float)));
         try
@@ -695,6 +711,16 @@ public sealed unsafe class ForwardPass : IForwardPass
                         Copy(batchAttnOut + (long)n * qDim, _attnOut, qDim);
                     }
 
+                    // SnapKV (issue #60): same shape as PrefillCore's call but
+                    // against the TQ cache. batchQ is post-RoPE / post-Q-norm —
+                    // the same vectors TqAttention just used to write scores
+                    // against the TQ-compressed + FP32-ring K state.
+                    if (snapKvActive)
+                    {
+                        _snapKv!.AccumulateLayer(batchQ, N, cache, layer, startPos,
+                            _snapKvCfg.Window);
+                    }
+
                     SimdKernels.MatMulBatched(batchNorm, _wo[layer].DataPtr, batchAttnOut,
                         N, _embDim, qDim, _wo[layer].DType);
 
@@ -743,6 +769,22 @@ public sealed unsafe class ForwardPass : IForwardPass
 
                 // _totalLength was advanced to startPos + N by the last layer's
                 // per-token loop, which is the state subsequent decode calls expect.
+
+                // SnapKV (issue #60): compact the TQ cache to the selected keep
+                // set. Runs once per prefill — per-token decode is untouched.
+                // After compaction Length is the kept-slot count; decode RoPE
+                // for the next token continues from `startPos + N` (the caller's
+                // position counter is unchanged), which is the right post-eviction
+                // reference frame because RoPE depends on absolute position not
+                // on cache slot index.
+                if (snapKvActive)
+                {
+                    var keep = _snapKv!.SelectKeepSet(N, _snapKvCfg.Budget, _snapKvCfg.Recency);
+                    if (keep.Length < N)
+                    {
+                        cache.Compact(keep, N);
+                    }
+                }
             }
             finally
             {
@@ -1212,7 +1254,13 @@ public sealed unsafe class ForwardPass : IForwardPass
     private void TqAttention(int layer, int position)
     {
         var tq = _tqKvCache!;
-        int seqLen = position + 1;
+        // After SnapKV (issue #60) eviction the absolute position keeps
+        // growing while the TQ cache only stores `tq.Length` slots. The
+        // Forward decode path's Append runs before IncrementPosition so the
+        // new K/V is at slot tq.Length (and visible via Fp32KeyAt(position=
+        // tq.Length)), hence the `+1` — mirrors PagedKvCache.Attention.
+        // Pre-eviction position+1 == tq.Length so the clamp is a no-op.
+        int seqLen = Math.Min(position + 1, tq.Length + 1);
         int tqLen = tq.GetTqLength(layer);
         int fp32Start = tqLen;
         float scale = 1.0f / MathF.Sqrt(_headDim);
