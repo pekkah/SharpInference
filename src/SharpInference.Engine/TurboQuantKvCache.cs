@@ -589,6 +589,12 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
         var stageBytes = maxTqPositions > 0
             ? (nuint)((long)_numKvHeads * _stagingBytesPerHead) : (nuint)0;
 
+        // Decompress/repack scratch is sized by constants (_headDim, _tqBlockSize),
+        // so we lift the allocations out of the per-layer loop.
+        float[] decompKeyArr = new float[_headDim];
+        float[] decompValArr = new float[_headDim];
+        byte[]  unpackBlockArr = new byte[_tqBlockSize];
+
         // Per-layer compaction. Each layer's TQ length tracks how far its
         // staging+tile chain has filled, so each layer's split is determined
         // independently from the same shared `keep` set.
@@ -639,15 +645,9 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
 
             try
             {
-                // Per-head decompress scratch + unpack block scratch — sized for
-                // the largest headDim/blockSize we ship today. We allocate on
-                // the heap here (rather than stackalloc) because we sit inside
-                // a `for (int layer ...)` loop and the analyzer rightly flags
-                // stackalloc-in-loop. The buffers are reused across all keep
-                // positions within one layer.
-                float[] decompKeyArr = new float[_headDim];
-                float[] decompValArr = new float[_headDim];
-                byte[]  unpackBlockArr = new byte[_tqBlockSize];
+                // Per-head decompress + unpack scratch (decompKeyArr / decompValArr
+                // / unpackBlockArr) are sized by constants and lifted to the
+                // pre-loop scope above; reused across every layer.
 
                 // 32 per-head staging blocks at a time — when we accumulate
                 // tileSize blocks worth for a head, pack into a K- and V-tile.

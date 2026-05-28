@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Runtime.InteropServices;
 using SharpInference.Cpu;
 using SharpInference.TurboQuant;
@@ -178,10 +179,13 @@ public sealed unsafe class SnapKvSelector
         Span<float> rotatedQ = stackalloc float[_headDim];
         // Per-query TQ score scratch sized to the deepest TQ region we'll see.
         // Path: ComputeKScores writes one float per TQ position, then we copy
-        // them into scoreBuf[0..tqLen). The float[] alloc happens once per layer
-        // call (not per query/head) and ~tqLen=128KB for 32K context is fine.
+        // them into scoreBuf[0..tqLen). Rented from ArrayPool so AccumulateLayer
+        // is allocation-free across all layers (called once per layer; selector
+        // is reused across the whole prefill).
         int maxTqLen = cache.GetTqLength(layer);
-        var tqScoreScratch = maxTqLen > 0 ? new float[maxTqLen] : Array.Empty<float>();
+        float[] tqScoreScratch = maxTqLen > 0
+            ? ArrayPool<float>.Shared.Rent(maxTqLen)
+            : Array.Empty<float>();
         try
         {
             float scale = 1.0f / MathF.Sqrt(_headDim);
@@ -242,6 +246,7 @@ public sealed unsafe class SnapKvSelector
         finally
         {
             if (!useStack) NativeMemory.Free((void*)scoreBuf);
+            if (maxTqLen > 0) ArrayPool<float>.Shared.Return(tqScoreScratch);
         }
     }
 
