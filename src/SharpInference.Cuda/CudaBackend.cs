@@ -83,6 +83,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // promotion is done at the kernel read sites).
     private nint   _kvAppendBf16Kernel;
     private nint   _attentionBf16Kernel;
+    // SnapKV (issue #58): per-(query, head) attention scoring + position-gather
+    // compaction. Used by CudaHybridGdnForwardPass.Prefill when SHARPI_SNAPKV_BUDGET
+    // is set. Bf16 variants compose with the bf16-store KV path.
+    private nint   _snapKvScoreKernel;
+    private nint   _snapKvScoreBf16Kernel;
+    private nint   _kvCompactKernel;
+    private nint   _kvCompactBf16Kernel;
     private nint   _embedLookupF32Kernel;
     private nint   _embedLookupQ4KKernel;
     private nint   _embedLookupQ5KKernel;
@@ -1433,6 +1440,132 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     // ================================================================
+    //  SnapKV (issue #58): prefill KV eviction support
+    // ================================================================
+
+    /// <summary>
+    /// Score one captured query <paramref name="q"/> (size <c>numHeads * headDim</c>)
+    /// against the layer's K cache (positions <c>[0, promptLen)</c>), softmax across
+    /// the causally-valid prefix, and atomicAdd the per-position weights into
+    /// <paramref name="scoreAccum"/>. Caller is responsible for zeroing the accumulator
+    /// before the first call and looping over the W captured queries × attention
+    /// layers; the kernel pools naturally because every call's softmaxed weights are
+    /// summed into the same buffer.
+    /// </summary>
+    /// <param name="qAbsPos">Absolute prompt position of the query (causal mask cutoff).</param>
+    public void SnapKvScore(Tensor q, Tensor kCache, Tensor scoreAccum, Tensor scoresScratch,
+                            int numHeads, int numKvHeads, int headDim,
+                            int promptLen, int qAbsPos, int maxSeqLen)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint qP  = GetDevPtr(q);
+        nint kP  = GetDevPtr(kCache);
+        nint sP  = GetDevPtr(scoreAccum);
+        nint ssP = GetDevPtr(scoresScratch);
+        int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim,
+             pPL = promptLen, pQAP = qAbsPos, pMSL = maxSeqLen;
+        nint* args = stackalloc nint[10]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&sP), (nint)(&ssP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pPL), (nint)(&pQAP), (nint)(&pMSL)
+        };
+        int r = NvrtcInterop.LaunchKernel(_snapKvScoreKernel,
+            (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(snapkv_score) failed: {r}");
+    }
+
+    /// <summary>
+    /// Bf16-K-cache variant of <see cref="SnapKvScore"/>. <paramref name="kCache"/>
+    /// must be a <see cref="DType.BFloat16"/> tensor (raw unsigned short storage);
+    /// the scoring math stays in fp32.
+    /// </summary>
+    public void SnapKvScoreBf16(Tensor q, Tensor kCache, Tensor scoreAccum, Tensor scoresScratch,
+                                int numHeads, int numKvHeads, int headDim,
+                                int promptLen, int qAbsPos, int maxSeqLen)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint qP  = GetDevPtr(q);
+        nint kP  = GetDevPtr(kCache);
+        nint sP  = GetDevPtr(scoreAccum);
+        nint ssP = GetDevPtr(scoresScratch);
+        int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim,
+             pPL = promptLen, pQAP = qAbsPos, pMSL = maxSeqLen;
+        nint* args = stackalloc nint[10]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&sP), (nint)(&ssP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pPL), (nint)(&pQAP), (nint)(&pMSL)
+        };
+        int r = NvrtcInterop.LaunchKernel(_snapKvScoreBf16Kernel,
+            (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(snapkv_score_bf16) failed: {r}");
+    }
+
+    /// <summary>
+    /// Gather kept positions of one KV ring (K or V) into a dense
+    /// <c>[K * kvDim]</c> prefix of <paramref name="dst"/>. <paramref name="src"/>
+    /// and <paramref name="dst"/> MUST be different tensors (the destination is
+    /// later copied back over the original ring's <c>[0, K * kvDim)</c> region by
+    /// the caller). <paramref name="keepPositions"/> must be sorted ascending and
+    /// hold indices in <c>[0, originalLength)</c>.
+    /// </summary>
+    public void KvCompact(Tensor src, Tensor dst, Tensor keepPositions,
+                          int K, int kvDim)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint sP  = GetDevPtr(src);
+        nint dP  = GetDevPtr(dst);
+        nint kpP = GetDevPtr(keepPositions);
+        int  pK = K, pKD = kvDim;
+        nint* args = stackalloc nint[5]
+        {
+            (nint)(&sP), (nint)(&dP), (nint)(&kpP),
+            (nint)(&pK), (nint)(&pKD)
+        };
+        uint gridX = (uint)((kvDim + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_kvCompactKernel,
+            gridX, (uint)K, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kv_compact) failed: {r}");
+    }
+
+    /// <summary>
+    /// Bf16-store variant of <see cref="KvCompact"/>. Source and destination must
+    /// both be <see cref="DType.BFloat16"/> tensors; the gather copies raw unsigned
+    /// short elements with no fp32 round-trip.
+    /// </summary>
+    public void KvCompactBf16(Tensor src, Tensor dst, Tensor keepPositions,
+                              int K, int kvDim)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint sP  = GetDevPtr(src);
+        nint dP  = GetDevPtr(dst);
+        nint kpP = GetDevPtr(keepPositions);
+        int  pK = K, pKD = kvDim;
+        nint* args = stackalloc nint[5]
+        {
+            (nint)(&sP), (nint)(&dP), (nint)(&kpP),
+            (nint)(&pK), (nint)(&pKD)
+        };
+        uint gridX = (uint)((kvDim + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_kvCompactBf16Kernel,
+            gridX, (uint)K, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kv_compact_bf16) failed: {r}");
+    }
+
+    // ================================================================
     //  TurboQuant KV-cache compression
     // ================================================================
 
@@ -2026,6 +2159,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _softmaxKernel, _ropeInterleavedKernel, _ropeNeoxKernel, _ropeNeoxPartialKernel,
             _mulKernel, _sigmoidMulInPlaceKernel, _splitQgKernel, _kvAppendKernel,
             _kvAppendBf16Kernel,
+            _snapKvScoreKernel, _snapKvScoreBf16Kernel,
+            _kvCompactKernel, _kvCompactBf16Kernel,
             _embedLookupF32Kernel, _embedLookupQ4KKernel, _embedLookupQ5KKernel,
             _matvecF32Kernel, _matvecQ4KKernel, _matvecQ5KKernel, _matvecQ6KKernel,
             _matvecF32N2Kernel, _matvecQ4KN2Kernel, _matvecQ5KN2Kernel, _matvecQ6KN2Kernel,
@@ -2069,6 +2204,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _splitQgKernel         = GetKernelFunc("llm_split_qg");
         _kvAppendKernel        = GetKernelFunc("llm_kv_append");
         _kvAppendBf16Kernel    = GetKernelFunc("llm_kv_append_bf16");
+        _snapKvScoreKernel     = GetKernelFunc("llm_snapkv_score");
+        _snapKvScoreBf16Kernel = GetKernelFunc("llm_snapkv_score_bf16");
+        _kvCompactKernel       = GetKernelFunc("llm_kv_compact");
+        _kvCompactBf16Kernel   = GetKernelFunc("llm_kv_compact_bf16");
         _embedLookupF32Kernel  = GetKernelFunc("llm_embed_lookup_f32");
         _embedLookupQ4KKernel  = GetKernelFunc("llm_embed_lookup_q4k");
         _embedLookupQ5KKernel  = GetKernelFunc("llm_embed_lookup_q5k");

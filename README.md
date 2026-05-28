@@ -54,14 +54,24 @@ matching chat template).
 
 `--backend auto` (default) picks CUDA when available, sizing the GPU/CPU split from
 VRAM via TierPlanner; falls through to Vulkan only when CUDA isn't present.
-`SHARPI_SNAPKV_BUDGET=N` enables SnapKV prefill-time KV eviction on the CPU
-forward pass (issue #51 v1). After prefill, the cache scores each prompt
-position using the last-W queries' attention, retains the top-(N−recency)
-by score plus the trailing `SHARPI_SNAPKV_RECENCY` positions, and compacts
-the `PagedKvCache` to that set. Decode is unchanged — its only cost is
-prefill-side. Use it when the prompt is much longer than the model needs to
-keep around (chat with a big system prompt, RAG with retrieved chunks, …).
-GPU backend ports and TurboQuant composition are tracked as follow-ups.
+SnapKV prefill-time KV eviction (issue #51) is auto-enabled on the CUDA
+hybrid GDN path (`CudaHybridGdnForwardPass`, qwen35moe / Qwen3.6-27B-MTP /
+35B-A3B-MTP) when the configured context is large enough that the full
+attention KV cache would exceed ~256 MiB — the 12 GB-card long-context
+target. The auto-budget is `min(maxSeqLen/4, 4096)` (floored at 1024,
+matching the SnapKV paper's accuracy curve); ctx ≤ ~8K leaves the cache
+untouched. After prefill the GPU scores each prompt position via per-(head,
+last-W-query) softmaxed attention atomicAdd-pooled across all attention
+layers (`llm_snapkv_score` / `_bf16`), picks top-K + a trailing recency
+window, and compacts the bf16 KV ring in place (`llm_kv_compact` / `_bf16`).
+Decode is unchanged — `LogicalLength` stays at the original prompt length so
+RoPE on new tokens lands at the right angle. `SHARPI_SNAPKV_BUDGET=N` forces
+an explicit budget; `=0` disables the auto path entirely. `_WINDOW` and
+`_RECENCY` (defaults 64 each) tune the importance probe and trailing
+must-keep zone. CPU `ForwardPass` (#57) keeps the explicit-opt-in convention
+— set `SHARPI_SNAPKV_BUDGET=N` to engage it there. Dense CUDA, Vulkan,
+TurboQuant composition, and LongBench accuracy validation are tracked as
+follow-ups under #51.
 
 `--tq` enables 3-bit TurboQuant KV compression (CPU, Vulkan, CUDA; requires
 `headDim ∈ {128, 256}`). MoE runs on GPU (full-offload or partial hybrid) on

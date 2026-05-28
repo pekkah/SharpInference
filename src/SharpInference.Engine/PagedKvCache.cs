@@ -413,6 +413,29 @@ public sealed unsafe class PagedKvCache : IDisposable
         }
     }
 
+    /// <summary>
+    /// Bookkeeping-only counterpart of <see cref="Compact"/> for callers (e.g.
+    /// <see cref="CudaHybridGdnForwardPass"/>) that store the actual KV payload
+    /// outside this cache and only use it for slot/position accounting. Drops
+    /// <see cref="Length"/> to <paramref name="K"/>, keeps <see cref="LogicalLength"/>
+    /// at its current value (so RoPE on subsequent decode tokens stays in the
+    /// pre-eviction position frame), and returns trailing block slots to the
+    /// warm pool. Never touches per-layer page memory.
+    /// </summary>
+    public void CompactLengthOnly(int K)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(PagedKvCache));
+        if (K < 0 || K > _length)
+            throw new ArgumentOutOfRangeException(nameof(K), K,
+                $"K must be in [0, Length={_length}].");
+        int compactedBlocks = (K + PageSize - 1) / PageSize;
+        for (int b = compactedBlocks; b < _allocatedBlocks; b++)
+            _warmPool.Push(_blockTable[0][b]);
+        _allocatedBlocks = compactedBlocks;
+        _length = K;
+        // _logicalLength stays untouched — that's the whole point.
+    }
+
     public void Dispose()
     {
         if (_disposed) return;

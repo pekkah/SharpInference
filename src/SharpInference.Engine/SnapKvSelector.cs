@@ -63,6 +63,22 @@ public sealed unsafe class SnapKvSelector
     }
 
     /// <summary>
+    /// Replace the internal score accumulator with externally-computed scores
+    /// (e.g. produced by a GPU scoring kernel and downloaded host-side). Length
+    /// must match <paramref name="promptLen"/>; the caller's pooling across
+    /// (queries × heads × layers) is preserved verbatim.
+    /// </summary>
+    public void LoadScores(ReadOnlySpan<float> scores, int promptLen)
+    {
+        if (scores.Length < promptLen)
+            throw new ArgumentException(
+                $"LoadScores: scores.Length={scores.Length} < promptLen={promptLen}.", nameof(scores));
+        if (_scoreAccum.Length < promptLen)
+            _scoreAccum = new float[promptLen];
+        scores[..promptLen].CopyTo(_scoreAccum);
+    }
+
+    /// <summary>
     /// Pool the layer's last-W query attention into the global score accumulator.
     /// <paramref name="batchQ"/> contains the layer's RoPE'd queries laid out
     /// <c>[N, numHeads*headDim]</c>; <paramref name="kPagedCache"/> holds the
@@ -195,23 +211,62 @@ public sealed unsafe class SnapKvSelector
 /// SnapKV runtime configuration (env-backed). One read at construction time per
 /// forward pass; never re-checked during decode.
 /// </summary>
-public readonly record struct SnapKvConfig(int Budget, int Window, int Recency)
+/// <param name="Budget">Explicit budget when <see cref="IsBudgetExplicit"/> is true;
+/// 0 otherwise. Backends with auto-budget support (currently
+/// <c>CudaHybridGdnForwardPass</c>) substitute their own value when the env
+/// var was not set.</param>
+/// <param name="Window">Number of trailing queries used as the importance probe.</param>
+/// <param name="Recency">Trailing positions always retained.</param>
+/// <param name="IsBudgetExplicit">True iff <c>SHARPI_SNAPKV_BUDGET</c> was set to
+/// any value (including <c>0</c>). False iff the env var was unset — backends
+/// may pick an auto-budget instead.</param>
+public readonly record struct SnapKvConfig(int Budget, int Window, int Recency, bool IsBudgetExplicit)
 {
     public bool Enabled => Budget > 0;
 
     /// <summary>
     /// Parse <c>SHARPI_SNAPKV_BUDGET</c>, <c>SHARPI_SNAPKV_WINDOW</c>,
-    /// <c>SHARPI_SNAPKV_RECENCY</c>. Budget=0 (or unset) disables.
+    /// <c>SHARPI_SNAPKV_RECENCY</c>. Budget=0 disables; budget unset leaves the
+    /// decision to the backend (auto on CUDA hybrid GDN, opt-in elsewhere).
     /// </summary>
     public static SnapKvConfig FromEnvironment()
     {
-        int budget  = ParseInt("SHARPI_SNAPKV_BUDGET",  0);
+        var budgetRaw = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_BUDGET");
+        bool explicitBudget = int.TryParse(budgetRaw, out int budget);
         int window  = ParseInt("SHARPI_SNAPKV_WINDOW",  SnapKvSelector.DefaultWindow);
         int recency = ParseInt("SHARPI_SNAPKV_RECENCY", SnapKvSelector.DefaultRecency);
         if (budget < 0) budget = 0;
         if (window < 1) window = 1;
         if (recency < 0) recency = 0;
-        return new SnapKvConfig(budget, window, recency);
+        return new SnapKvConfig(budget, window, recency, explicitBudget);
+    }
+
+    /// <summary>Cache size below which the SnapKV auto-budget stays disabled.
+    /// A 40 MiB cache (Qwen3.6-27B-MTP at ctx=2048, bf16) gains very little
+    /// from eviction — the per-token attention work is already a small slice
+    /// of decode cost. The threshold scales naturally with attention-layer
+    /// count, kv_dim, and configured ctx, so big-context / big-cache setups
+    /// (the 12 GB target) trip it while small-context smoke tests don't.</summary>
+    public const long AutoEnableMinCacheBytes = 256L * 1024 * 1024;
+
+    /// <summary>
+    /// VRAM-scaled default budget used when the env var is unset and the backend
+    /// supports auto-eviction. Targets ~1/4 of the configured context window
+    /// (matching the SnapKV paper's "8× compression on 16K prompts" reference
+    /// point), floored at 1024 (smaller risks losing semantically important
+    /// context) and capped at 4096 (beyond that the paper's accuracy curve
+    /// flattens while post-eviction decode attention keeps scaling). Returns
+    /// 0 — i.e. don't auto-enable — when the full cache is below
+    /// <see cref="AutoEnableMinCacheBytes"/>; the user has plenty of headroom
+    /// and silently introducing a lossy step is not worth it.
+    /// </summary>
+    public static int ComputeAutoBudget(int maxSeqLen, long fullCacheBytes)
+    {
+        if (fullCacheBytes > 0 && fullCacheBytes < AutoEnableMinCacheBytes) return 0;
+        int candidate = maxSeqLen / 4;
+        if (candidate < 1024) candidate = Math.Min(1024, maxSeqLen);
+        if (candidate > 4096) candidate = 4096;
+        return candidate;
     }
 
     private static int ParseInt(string name, int defaultValue)

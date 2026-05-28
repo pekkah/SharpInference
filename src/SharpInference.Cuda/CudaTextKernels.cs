@@ -1935,6 +1935,225 @@ extern ""C"" __global__ void llm_attention_bf16(
     }
 }
 
+// ── SnapKV: per-(query, head) attention scoring against the K cache ────────
+// Issue #58. Computes the SnapKV importance signal for ONE captured query
+// vector against the layer's K cache. For each head h, masks positions
+// p > q_abs_pos, scales dots by rsqrt(head_dim), softmaxes across the valid
+// prefix, and atomicAdd's the resulting weights into a global per-position
+// score accumulator. Mirrors `llm_attention`'s scratch convention: shared
+// memory below 4096 positions, scores_scratch[h * max_seq_len + t] above.
+//
+// The host loops over the captured W queries × num attention layers,
+// accumulating into a single shared float accumulator that's downloaded
+// post-pass and fed to SnapKvSelector.SelectKeepSet.
+extern ""C"" __global__ void llm_snapkv_score(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    float* __restrict__ score_accum,
+    float* __restrict__ scores_scratch,
+    int num_heads, int num_kv_heads, int head_dim,
+    int prompt_len, int q_abs_pos, int max_seq_len)
+{
+    const int MAX_STORED_SCORES = 4096;
+    __shared__ float shared_scores[MAX_STORED_SCORES];
+    __shared__ float sdata[256];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int h = blockIdx.x;
+    if ((int)h >= num_heads) return;
+
+    int kv_head = (int)h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = rsqrtf((float)head_dim);
+    long q_off  = (long)h * (long)head_dim;
+
+    bool use_shared = (prompt_len <= MAX_STORED_SCORES);
+    float* head_scratch = scores_scratch + (long)h * (long)max_seq_len;
+
+    for (int t = (int)tid; t < prompt_len; t += 256) {
+        float score;
+        if (t > q_abs_pos) {
+            score = sharpi_neg_inf();
+        } else {
+            float dot = 0.f;
+            long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            for (int d = 0; d < head_dim; d++)
+                dot += q[q_off + d] * k_cache[k_off + d];
+            score = dot * scale;
+        }
+        if (use_shared) shared_scores[t] = score;
+        else            head_scratch[t]  = score;
+    }
+    if (use_shared) {
+        for (int t = prompt_len + (int)tid; t < MAX_STORED_SCORES; t += 256)
+            shared_scores[t] = sharpi_neg_inf();
+    }
+    __syncthreads();
+
+    float local_max = sharpi_neg_inf();
+    for (int t = (int)tid; t < prompt_len; t += 256) {
+        float s = use_shared ? shared_scores[t] : head_scratch[t];
+        local_max = fmaxf(local_max, s);
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
+
+    float local_sum = 0.f;
+    for (int t = (int)tid; t < prompt_len; t += 256) {
+        float s = use_shared ? shared_scores[t] : head_scratch[t];
+        float e = (s == sharpi_neg_inf()) ? 0.f : __expf(s - max_val);
+        if (use_shared) shared_scores[t] = e;
+        else            head_scratch[t]  = e;
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+    __syncthreads();
+
+    for (int t = (int)tid; t < prompt_len; t += 256) {
+        if (t > q_abs_pos) continue;
+        float w = (use_shared ? shared_scores[t] : head_scratch[t]) * inv_sum;
+        atomicAdd(&score_accum[t], w);
+    }
+}
+
+// Bf16-K-cache variant of `llm_snapkv_score`. Reads bf16 K via
+// sharpi_bf16_to_fp32; arithmetic stays in fp32. Used when SHARPI bf16-KV is
+// enabled (issue #27 / PR #56) — same call site as the fp32 variant.
+extern ""C"" __global__ void llm_snapkv_score_bf16(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_cache,
+    float* __restrict__ score_accum,
+    float* __restrict__ scores_scratch,
+    int num_heads, int num_kv_heads, int head_dim,
+    int prompt_len, int q_abs_pos, int max_seq_len)
+{
+    const int MAX_STORED_SCORES = 4096;
+    __shared__ float shared_scores[MAX_STORED_SCORES];
+    __shared__ float sdata[256];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int h = blockIdx.x;
+    if ((int)h >= num_heads) return;
+
+    int kv_head = (int)h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = rsqrtf((float)head_dim);
+    long q_off  = (long)h * (long)head_dim;
+
+    bool use_shared = (prompt_len <= MAX_STORED_SCORES);
+    float* head_scratch = scores_scratch + (long)h * (long)max_seq_len;
+
+    for (int t = (int)tid; t < prompt_len; t += 256) {
+        float score;
+        if (t > q_abs_pos) {
+            score = sharpi_neg_inf();
+        } else {
+            float dot = 0.f;
+            long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            for (int d = 0; d < head_dim; d++)
+                dot += q[q_off + d] * sharpi_bf16_to_fp32((unsigned int)k_cache[k_off + d]);
+            score = dot * scale;
+        }
+        if (use_shared) shared_scores[t] = score;
+        else            head_scratch[t]  = score;
+    }
+    if (use_shared) {
+        for (int t = prompt_len + (int)tid; t < MAX_STORED_SCORES; t += 256)
+            shared_scores[t] = sharpi_neg_inf();
+    }
+    __syncthreads();
+
+    float local_max = sharpi_neg_inf();
+    for (int t = (int)tid; t < prompt_len; t += 256) {
+        float s = use_shared ? shared_scores[t] : head_scratch[t];
+        local_max = fmaxf(local_max, s);
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
+
+    float local_sum = 0.f;
+    for (int t = (int)tid; t < prompt_len; t += 256) {
+        float s = use_shared ? shared_scores[t] : head_scratch[t];
+        float e = (s == sharpi_neg_inf()) ? 0.f : __expf(s - max_val);
+        if (use_shared) shared_scores[t] = e;
+        else            head_scratch[t]  = e;
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+    __syncthreads();
+
+    for (int t = (int)tid; t < prompt_len; t += 256) {
+        if (t > q_abs_pos) continue;
+        float w = (use_shared ? shared_scores[t] : head_scratch[t]) * inv_sum;
+        atomicAdd(&score_accum[t], w);
+    }
+}
+
+// ── SnapKV: gather kept positions into a dense [K * kv_dim] prefix ─────────
+// Issue #58. Reads a sorted-ascending keep-position list and copies
+// src[keep[i] * kv_dim + d] → dst[i * kv_dim + d]. src and dst MUST point at
+// different buffers (a separate stage tensor) — the destination is later
+// written back over the ring's [0, K * kv_dim) prefix via CopyDeviceRegion.
+// Grid: (ceil(kv_dim / 256), K, 1); Block: (256, 1, 1).
+extern ""C"" __global__ void llm_kv_compact(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    const int* __restrict__ keep_positions,
+    int K, int kv_dim)
+{
+    int i = (int)blockIdx.y;
+    if (i >= K) return;
+    int d = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (d >= kv_dim) return;
+    int src_pos = keep_positions[i];
+    long src_off = (long)src_pos * (long)kv_dim + (long)d;
+    long dst_off = (long)i       * (long)kv_dim + (long)d;
+    dst[dst_off] = src[src_off];
+}
+
+// Bf16-store variant of `llm_kv_compact`. Operates on raw unsigned short
+// elements — no fp32 round-trip — so the bf16 KV ring's bits survive
+// untouched through compaction.
+extern ""C"" __global__ void llm_kv_compact_bf16(
+    const unsigned short* __restrict__ src,
+    unsigned short* __restrict__ dst,
+    const int* __restrict__ keep_positions,
+    int K, int kv_dim)
+{
+    int i = (int)blockIdx.y;
+    if (i >= K) return;
+    int d = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (d >= kv_dim) return;
+    int src_pos = keep_positions[i];
+    long src_off = (long)src_pos * (long)kv_dim + (long)d;
+    long dst_off = (long)i       * (long)kv_dim + (long)d;
+    dst[dst_off] = src[src_off];
+}
+
 // ── Element-wise SiLU in place ─────────────────────────────────────────────
 // x[i] = x[i] / (1 + exp(-x[i])).  One thread per element.
 extern ""C"" __global__ void llm_silu_inplace(float* __restrict__ x, int n)
