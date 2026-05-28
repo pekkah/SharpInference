@@ -13,4 +13,8 @@
     <ProjectReference Include="..\SharpInference.Pipeline\SharpInference.Pipeline.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="SharpInference.Tests.ForwardPass" />
+  </ItemGroup>
+
 </Project>
