@@ -526,6 +526,445 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
         }
     }
 
+    /// <summary>
+    /// SnapKV (issue #60) compaction for the TurboQuant cache: keep only the K/V
+    /// positions listed in <paramref name="keep"/> (sorted ascending, all in
+    /// <c>[0, N)</c>); discard the rest. After compaction the cache holds
+    /// <c>keep.Length</c> entries in slots <c>[0, keep.Length)</c>, with the
+    /// TQ region holding the older survivors and the FP32 ring holding the
+    /// most-recent ones (matching the steady-state hybrid layout).
+    /// </summary>
+    /// <remarks>
+    /// Phase-1 invariant: kept positions originally in the TQ region stay TQ;
+    /// kept positions originally in the FP32 region stay FP32 unless the kept
+    /// FP32 count would exceed <see cref="Fp32WindowSize"/>, in which case the
+    /// oldest excess survivors are re-quantized into the TQ region (matching
+    /// what would have happened if they'd aged out via the normal Append path).
+    ///
+    /// Implementation: per-layer, allocate fresh tile + staging + FP32 buffers,
+    /// write the kept survivors into them in order, then atomically swap the
+    /// underlying native pointers. Doing this in-place is doable but error-prone
+    /// because tiles are dim-major over 32 positions — any partial overwrite
+    /// would corrupt neighbours.
+    /// </remarks>
+    public void Compact(int[] keep, int N)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(TurboQuantKvCache));
+        if (keep is null) throw new ArgumentNullException(nameof(keep));
+        if (N != _totalLength)
+            throw new ArgumentException(
+                $"Compact: N={N} does not match _totalLength={_totalLength}.", nameof(N));
+        int K = keep.Length;
+        if (K > N)
+            throw new ArgumentException(
+                $"Compact: keep count {K} exceeds N={N}.", nameof(keep));
+        int prev = -1;
+        for (int i = 0; i < K; i++)
+        {
+            int p = keep[i];
+            if (p < 0 || p >= N)
+                throw new ArgumentOutOfRangeException(nameof(keep),
+                    $"keep[{i}]={p} is outside [0,{N}).");
+            if (p <= prev)
+                throw new ArgumentException(
+                    $"keep must be strictly increasing; got {prev} then {p} at index {i}.", nameof(keep));
+            prev = p;
+        }
+
+        if (K == N)
+        {
+            // No-op compaction.
+            return;
+        }
+
+        int tileSize = SharpInference.TurboQuant.FastScan.TileSize;
+        int maxTqPositions = _maxSeqLen - _fp32WindowSize;
+        if (maxTqPositions < 0) maxTqPositions = 0;
+        int maxTiles = (maxTqPositions + tileSize - 1) / tileSize;
+        var fp32Bytes = (nuint)((long)_fp32WindowSize * _kvDim * sizeof(float));
+        var keyTileBytes = maxTqPositions > 0
+            ? (nuint)((long)maxTiles * _numKvHeads * _tileBytes) : (nuint)0;
+        var valueTileBytes = maxTqPositions > 0
+            ? (nuint)((long)maxTiles * _numKvHeads * _vTileBytes) : (nuint)0;
+        var stageBytes = maxTqPositions > 0
+            ? (nuint)((long)_numKvHeads * _stagingBytesPerHead) : (nuint)0;
+
+        // Per-layer compaction. Each layer's TQ length tracks how far its
+        // staging+tile chain has filled, so each layer's split is determined
+        // independently from the same shared `keep` set.
+        for (int layer = 0; layer < _numLayers; layer++)
+        {
+            int oldTqLen = _layerTqLengths[layer];
+
+            // Partition the keep set into TQ-source and FP32-source survivors.
+            // Phase-1 invariant: preserve original storage class. The FP32
+            // overflow → TQ-promotion branch below is defense-in-depth: today's
+            // Append (line 157) enforces fp32Count ≤ _fp32WindowSize at all
+            // times, so kept-FP32 count after a sorted Compact cannot exceed
+            // the window. Kept as a guard against future invariant relaxation
+            // (e.g. bulk-load constructors); intentionally unreachable in the
+            // current code path. The same overflow logic is exercised in the
+            // CUDA/Vulkan phases (#69/#70) where async append paths may stage
+            // multiple positions before draining.
+            int tqSurvivors = 0;
+            for (int i = 0; i < K; i++) if (keep[i] < oldTqLen) tqSurvivors++;
+            int fp32Survivors = K - tqSurvivors;
+
+            int newTqLen = tqSurvivors;
+            int newFp32Len = fp32Survivors;
+            if (newFp32Len > _fp32WindowSize)
+            {
+                int excess = newFp32Len - _fp32WindowSize;
+                newTqLen += excess;     // oldest FP32 survivors re-quantized
+                newFp32Len -= excess;
+            }
+
+            int newTotal = newTqLen + newFp32Len;
+            if (newTotal != K)
+                throw new InvalidOperationException(
+                    $"Compact: internal accounting bug, newTqLen+newFp32Len={newTqLen + newFp32Len} != K={K}.");
+            if (newTqLen > maxTqPositions)
+                throw new NotSupportedException(
+                    $"Compact: layer {layer} would have newTqLen={newTqLen} but the cache " +
+                    $"only has room for {maxTqPositions} TQ positions. The keep set is too " +
+                    "long for this cache configuration — increase maxSeqLen or shrink the keep set.");
+
+            // Fresh destination buffers; populate then swap.
+            float* newFp32Keys   = (float*)NativeMemory.AllocZeroed(fp32Bytes);
+            float* newFp32Values = (float*)NativeMemory.AllocZeroed(fp32Bytes);
+            byte*  newKeyTiles     = maxTqPositions > 0 ? (byte*)NativeMemory.AllocZeroed(keyTileBytes)   : null;
+            byte*  newValueTiles   = maxTqPositions > 0 ? (byte*)NativeMemory.AllocZeroed(valueTileBytes) : null;
+            byte*  newKeyStaging   = maxTqPositions > 0 ? (byte*)NativeMemory.AllocZeroed(stageBytes)     : null;
+            byte*  newValueStaging = maxTqPositions > 0 ? (byte*)NativeMemory.AllocZeroed(stageBytes)     : null;
+
+            try
+            {
+                // Per-head decompress scratch + unpack block scratch — sized for
+                // the largest headDim/blockSize we ship today. We allocate on
+                // the heap here (rather than stackalloc) because we sit inside
+                // a `for (int layer ...)` loop and the analyzer rightly flags
+                // stackalloc-in-loop. The buffers are reused across all keep
+                // positions within one layer.
+                float[] decompKeyArr = new float[_headDim];
+                float[] decompValArr = new float[_headDim];
+                byte[]  unpackBlockArr = new byte[_tqBlockSize];
+
+                // 32 per-head staging blocks at a time — when we accumulate
+                // tileSize blocks worth for a head, pack into a K- and V-tile.
+                // Each layer's `_tqBlockSize` is the source block stride.
+                // We funnel writes through these per-head head-major buffers so
+                // we can pack them once per completed tile rather than re-packing
+                // tiles mid-stream.
+                byte* tmpKeyStage   = maxTqPositions > 0
+                    ? (byte*)NativeMemory.AllocZeroed((nuint)((long)_numKvHeads * _stagingBytesPerHead)) : null;
+                byte* tmpValueStage = maxTqPositions > 0
+                    ? (byte*)NativeMemory.AllocZeroed((nuint)((long)_numKvHeads * _stagingBytesPerHead)) : null;
+                try
+                {
+                    Span<float> decompKey = decompKeyArr;
+                    Span<float> decompVal = decompValArr;
+                    Span<byte>  unpackBlock = unpackBlockArr;
+                    // Walk the keep set in order. The newTqLen oldest survivors
+                    // land in TQ, the newFp32Len most-recent land in FP32. With
+                    // `keep` strictly increasing this maps to a clean prefix /
+                    // suffix split: keep[0..newTqLen) → TQ slot i, keep[newTqLen..K)
+                    // → FP32 slot (i - newTqLen).
+                    for (int i = 0; i < K; i++)
+                    {
+                        int srcPos = keep[i];
+                        bool wasTq = srcPos < oldTqLen;
+
+                        if (i < newTqLen)
+                        {
+                            // Destination is TQ. Source is either TQ (decompress
+                            // then re-quantize — generally lossless modulo a
+                            // single dequant→requant round-trip on the same
+                            // codebook) or FP32 (quantize directly).
+                            for (int head = 0; head < _numKvHeads; head++)
+                            {
+                                int headOffset = head * _headDim;
+                                ReadOnlySpan<float> keySrc;
+                                ReadOnlySpan<float> valSrc;
+
+                                if (wasTq)
+                                {
+                                    // Decompress original TQ block (tile or staging)
+                                    // into scratch, then quantize into the new staging slot.
+                                    DecompressKeyTqAt(layer, head, srcPos, decompKey);
+                                    DecompressValueTqAt(layer, head, srcPos, decompVal);
+                                    keySrc = decompKey;
+                                    valSrc = decompVal;
+                                }
+                                else
+                                {
+                                    int fp32Idx = srcPos - oldTqLen;
+                                    long off = (long)fp32Idx * _kvDim + headOffset;
+                                    keySrc = new ReadOnlySpan<float>(_fp32Keys[layer]   + off, _headDim);
+                                    valSrc = new ReadOnlySpan<float>(_fp32Values[layer] + off, _headDim);
+                                }
+
+                                int stageSlot = i % tileSize;
+                                long stageOff = (long)head * _stagingBytesPerHead + (long)stageSlot * _tqBlockSize;
+                                var keyDst = new Span<byte>(tmpKeyStage   + stageOff, _tqBlockSize);
+                                var valDst = new Span<byte>(tmpValueStage + stageOff, _tqBlockSize);
+
+                                _keyCompressors[layer][head].Compress(keySrc, keyDst);
+                                _valueCompressors[layer][head].Compress(valSrc, valDst);
+                            }
+
+                            // If we just completed a tile (slot 31 of tileSize),
+                            // pack the per-head staging into the destination
+                            // K- and V-tiles. After packing we can reuse the
+                            // temp staging slots — the AllocZeroed in the next
+                            // iteration's Compress overwrites the bytes.
+                            if ((i + 1) % tileSize == 0)
+                            {
+                                int tileIdx = i / tileSize;
+                                for (int head = 0; head < _numKvHeads; head++)
+                                {
+                                    var keyStageSpan = new ReadOnlySpan<byte>(
+                                        tmpKeyStage + (long)head * _stagingBytesPerHead,
+                                        _stagingBytesPerHead);
+                                    var valStageSpan = new ReadOnlySpan<byte>(
+                                        tmpValueStage + (long)head * _stagingBytesPerHead,
+                                        _stagingBytesPerHead);
+                                    var keyTileSpan = new Span<byte>(
+                                        newKeyTiles + ((long)tileIdx * _numKvHeads + head) * _tileBytes,
+                                        _tileBytes);
+                                    var valTileSpan = new Span<byte>(
+                                        newValueTiles + ((long)tileIdx * _numKvHeads + head) * _vTileBytes,
+                                        _vTileBytes);
+                                    if (_bits == 4)
+                                    {
+                                        SharpInference.TurboQuant.FastScan.PackTile4Bit(keyStageSpan, keyTileSpan, _headDim);
+                                        SharpInference.TurboQuant.FastScan.PackVTile4Bit(valStageSpan, valTileSpan, _headDim);
+                                    }
+                                    else
+                                    {
+                                        SharpInference.TurboQuant.FastScan.PackTile3Bit(keyStageSpan, keyTileSpan, _headDim);
+                                        SharpInference.TurboQuant.FastScan.PackVTile3Bit(valStageSpan, valTileSpan, _headDim);
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // Destination is FP32. Source is FP32 or TQ.
+                            int fp32SlotDst = i - newTqLen;
+                            long dstOff = (long)fp32SlotDst * _kvDim;
+
+                            if (wasTq)
+                            {
+                                for (int head = 0; head < _numKvHeads; head++)
+                                {
+                                    int headOffset = head * _headDim;
+                                    DecompressKeyTqAt(layer, head, srcPos, decompKey);
+                                    DecompressValueTqAt(layer, head, srcPos, decompVal);
+                                    decompKey.CopyTo(new Span<float>(newFp32Keys   + dstOff + headOffset, _headDim));
+                                    decompVal.CopyTo(new Span<float>(newFp32Values + dstOff + headOffset, _headDim));
+                                }
+                            }
+                            else
+                            {
+                                int fp32IdxSrc = srcPos - oldTqLen;
+                                long srcOff = (long)fp32IdxSrc * _kvDim;
+                                new ReadOnlySpan<float>(_fp32Keys[layer]   + srcOff, _kvDim)
+                                    .CopyTo(new Span<float>(newFp32Keys   + dstOff, _kvDim));
+                                new ReadOnlySpan<float>(_fp32Values[layer] + srcOff, _kvDim)
+                                    .CopyTo(new Span<float>(newFp32Values + dstOff, _kvDim));
+                            }
+                        }
+                    }
+
+                    // If the TQ tail didn't fill a full tile, leave its bytes
+                    // in the destination staging buffer for the decode-time
+                    // FastScan staging path to consume. (Mirrors the in-flight
+                    // staging contract used by CompressOldestFp32.)
+                    int tailCount = newTqLen % tileSize;
+                    if (tailCount > 0 && maxTqPositions > 0)
+                    {
+                        int tailStart = newTqLen - tailCount;
+                        for (int head = 0; head < _numKvHeads; head++)
+                        {
+                            for (int s = 0; s < tailCount; s++)
+                            {
+                                int srcSlot = (tailStart + s) % tileSize;
+                                long srcStageOff = (long)head * _stagingBytesPerHead + (long)srcSlot * _tqBlockSize;
+                                long dstStageOff = (long)head * _stagingBytesPerHead + (long)s        * _tqBlockSize;
+                                Buffer.MemoryCopy(
+                                    tmpKeyStage   + srcStageOff, newKeyStaging   + dstStageOff,
+                                    _tqBlockSize, _tqBlockSize);
+                                Buffer.MemoryCopy(
+                                    tmpValueStage + srcStageOff, newValueStaging + dstStageOff,
+                                    _tqBlockSize, _tqBlockSize);
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    if (tmpKeyStage   != null) NativeMemory.Free(tmpKeyStage);
+                    if (tmpValueStage != null) NativeMemory.Free(tmpValueStage);
+                }
+
+                // Atomic swap: free the old layer buffers, install the new ones.
+                NativeMemory.Free(_fp32Keys[layer]);
+                NativeMemory.Free(_fp32Values[layer]);
+                _fp32Keys[layer]   = newFp32Keys;
+                _fp32Values[layer] = newFp32Values;
+                if (_tqKeyTiles[layer]     != null) NativeMemory.Free(_tqKeyTiles[layer]);
+                if (_tqValueTiles[layer]   != null) NativeMemory.Free(_tqValueTiles[layer]);
+                if (_tqKeyStaging[layer]   != null) NativeMemory.Free(_tqKeyStaging[layer]);
+                if (_tqValueStaging[layer] != null) NativeMemory.Free(_tqValueStaging[layer]);
+                _tqKeyTiles[layer]     = newKeyTiles;
+                _tqValueTiles[layer]   = newValueTiles;
+                _tqKeyStaging[layer]   = newKeyStaging;
+                _tqValueStaging[layer] = newValueStaging;
+                _layerTqLengths[layer] = newTqLen;
+            }
+            catch
+            {
+                // Roll back any successfully-allocated destinations for this
+                // layer before propagating so we don't leak on a mid-loop throw.
+                NativeMemory.Free(newFp32Keys);
+                NativeMemory.Free(newFp32Values);
+                if (newKeyTiles     != null) NativeMemory.Free(newKeyTiles);
+                if (newValueTiles   != null) NativeMemory.Free(newValueTiles);
+                if (newKeyStaging   != null) NativeMemory.Free(newKeyStaging);
+                if (newValueStaging != null) NativeMemory.Free(newValueStaging);
+                throw;
+            }
+        }
+
+        _totalLength = K;
+    }
+
+    /// <summary>
+    /// Decompress one (layer, kvHead, position) TQ K block into <paramref name="dst"/>.
+    /// Handles both tile-resident and staging-resident positions transparently.
+    /// </summary>
+    private void DecompressKeyTqAt(int layer, int kvHead, int position, Span<float> dst)
+    {
+        int tileSize = SharpInference.TurboQuant.FastScan.TileSize;
+        int numFullTiles = _layerTqLengths[layer] / tileSize;
+        var compressor = _keyCompressors[layer][kvHead];
+
+        if (position < numFullTiles * tileSize)
+        {
+            int tileIdx = position / tileSize;
+            int slot = position % tileSize;
+            // Unpack one (tile, slot, kvHead) → per-block format, then dequant.
+            Span<byte> block = stackalloc byte[_tqBlockSize];
+            UnpackTileSlotKey(layer, tileIdx, kvHead, slot, block);
+            compressor.Decompress(block, dst);
+        }
+        else
+        {
+            // Staging-resident.
+            int stagingIdx = position - numFullTiles * tileSize;
+            byte* blockPtr = KeyStagingBlockAt(layer, stagingIdx, kvHead);
+            compressor.Decompress(new ReadOnlySpan<byte>(blockPtr, _tqBlockSize), dst);
+        }
+    }
+
+    /// <summary>V-cache twin of <see cref="DecompressKeyTqAt"/>.</summary>
+    private void DecompressValueTqAt(int layer, int kvHead, int position, Span<float> dst)
+    {
+        int tileSize = SharpInference.TurboQuant.FastScan.TileSize;
+        int numFullTiles = _layerTqLengths[layer] / tileSize;
+        var compressor = _valueCompressors[layer][kvHead];
+
+        if (position < numFullTiles * tileSize)
+        {
+            int tileIdx = position / tileSize;
+            int slot = position % tileSize;
+            Span<byte> block = stackalloc byte[_tqBlockSize];
+            UnpackTileSlotValue(layer, tileIdx, kvHead, slot, block);
+            compressor.Decompress(block, dst);
+        }
+        else
+        {
+            int stagingIdx = position - numFullTiles * tileSize;
+            byte* blockPtr = ValueStagingBlockAt(layer, stagingIdx, kvHead);
+            compressor.Decompress(new ReadOnlySpan<byte>(blockPtr, _tqBlockSize), dst);
+        }
+    }
+
+    /// <summary>
+    /// Reverse the K-tile pack: extract one position's per-block compressed
+    /// representation from a FastScan K-tile. K-tile codes are dim-major with
+    /// each per-dim row holding 32 nibbles (16 bytes); per the packer, byte b
+    /// holds the code for position b (low nibble) and position 16+b (high nibble).
+    /// </summary>
+    private void UnpackTileSlotKey(int layer, int tileIdx, int kvHead, int slot, Span<byte> blockOut)
+    {
+        if (blockOut.Length < _tqBlockSize)
+            throw new ArgumentException($"blockOut must be at least {_tqBlockSize} bytes.", nameof(blockOut));
+
+        blockOut.Clear();
+        byte* tile = KeyTileAt(layer, tileIdx, kvHead);
+
+        // Copy the position's FP16 norm header.
+        blockOut[0] = tile[slot * 2];
+        blockOut[1] = tile[slot * 2 + 1];
+
+        // Walk every dim; pull this position's nibble from the tile-byte
+        // (slot & 15), high-or-low determined by slot >= 16. Write into the
+        // per-block packed layout via the bit-packing helper.
+        byte* codes = tile + SharpInference.TurboQuant.FastScan.NormBytesPerTile;
+        int byteInRow = slot & 15;
+        bool highNibble = slot >= 16;
+
+        for (int d = 0; d < _headDim; d++)
+        {
+            byte pair = codes[d * SharpInference.TurboQuant.FastScan.CodeBytesPerDim + byteInRow];
+            int code = highNibble ? (pair >> 4) & 0x0F : pair & 0x0F;
+            if (_bits == 4)
+                BitPacking.PackBits4(blockOut, TurboQuantOps.IndicesOffset, d, code);
+            else
+                BitPacking.PackBits3(blockOut, TurboQuantOps.IndicesOffset, d, code & 0x07);
+        }
+    }
+
+    /// <summary>
+    /// Reverse the V-tile pack: extract one position's per-block compressed
+    /// representation from a FastScan V-tile. V-tile codes are position-major
+    /// with each per-position row holding dim/2 bytes (one byte per dim pair,
+    /// low nibble = even d, high nibble = odd d).
+    /// </summary>
+    private void UnpackTileSlotValue(int layer, int tileIdx, int kvHead, int slot, Span<byte> blockOut)
+    {
+        if (blockOut.Length < _tqBlockSize)
+            throw new ArgumentException($"blockOut must be at least {_tqBlockSize} bytes.", nameof(blockOut));
+
+        blockOut.Clear();
+        byte* tile = ValueTileAt(layer, tileIdx, kvHead);
+
+        blockOut[0] = tile[slot * 2];
+        blockOut[1] = tile[slot * 2 + 1];
+
+        byte* codes = tile + SharpInference.TurboQuant.FastScan.NormBytesPerTile;
+        int packedPerBlock = _headDim / 2;
+        byte* rowPtr = codes + (long)slot * packedPerBlock;
+
+        for (int d = 0; d < _headDim; d += 2)
+        {
+            byte pair = rowPtr[d / 2];
+            int low  = pair & 0x0F;
+            int high = (pair >> 4) & 0x0F;
+            if (_bits == 4)
+            {
+                BitPacking.PackBits4(blockOut, TurboQuantOps.IndicesOffset, d,     low);
+                BitPacking.PackBits4(blockOut, TurboQuantOps.IndicesOffset, d + 1, high);
+            }
+            else
+            {
+                BitPacking.PackBits3(blockOut, TurboQuantOps.IndicesOffset, d,     low  & 0x07);
+                BitPacking.PackBits3(blockOut, TurboQuantOps.IndicesOffset, d + 1, high & 0x07);
+            }
+        }
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
