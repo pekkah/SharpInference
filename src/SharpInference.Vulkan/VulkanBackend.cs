@@ -964,6 +964,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _matVecF32Pipeline;
     private ComputePipeline? _kvAppendPipeline;
     private ComputePipeline? _attentionPipeline;
+    private ComputePipeline? _snapKvScorePipeline;
+    private ComputePipeline? _kvCompactPipeline;
     private ComputePipeline? _embedLookupPipeline;
     private ComputePipeline? _embedLookupQ4KPipeline;
     private ComputePipeline? _tqRotateQueryPipeline;
@@ -996,6 +998,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private struct EmbedParams { public uint tokenId; public uint embDim; }
     private struct KvAppendParams { public uint kvDim; public uint position; public uint maxSeqLen; }
     private struct AttentionParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint seqLen; public uint maxSeqLen; }
+    private struct SnapKvScoreParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint promptLen; public uint qAbsPos; public uint maxSeqLen; }
+    private struct KvCompactParams { public uint K; public uint kvDim; }
     private struct TqRotateQueryParams { public uint numHeads; public uint numKvHeads; public uint headDim; }
     private struct TqKvAppendParams { public uint kvDim; public uint headDim; public uint position; public uint maxSeqLen; public uint numKvHeads; public uint blockBytes; }
     private struct TqAttentionParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint tqSeqLen; public uint fp16SeqLen; public uint maxSeqLen; public uint blockBytes; }
@@ -1237,6 +1241,89 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(output),
              GetBuffer(scoresScratch)],
             numHeads, &p);
+    }
+
+    /// <summary>
+    /// SnapKV (issue #59) — score one (layer, query) pair against the layer's K
+    /// cache and atomicAdd-pool the post-softmax weights into
+    /// <paramref name="scoreAccum"/>. Mirrors <c>CudaBackend.SnapKvScore</c>.
+    ///
+    /// <paramref name="scoresScratch"/> is only read/written when
+    /// <c>promptLen &gt; 4096</c> (the shared-memory fast-path cap). Callers always
+    /// have to bind a buffer regardless — pass a 1-float placeholder for shorter
+    /// prompts, mirroring the <see cref="Attention"/> convention.
+    /// </summary>
+    public void SnapKvScore(Tensor q, Tensor kCache, Tensor scoreAccum, Tensor scoresScratch,
+                            uint numHeads, uint numKvHeads, uint headDim,
+                            uint promptLen, uint qAbsPos, uint maxSeqLen)
+    {
+        _snapKvScorePipeline ??= new ComputePipeline(this, Shaders.SnapKvScore, 4, pushConstantSize: sizeof(SnapKvScoreParams));
+        var p = new SnapKvScoreParams
+        {
+            numHeads = numHeads, numKvHeads = numKvHeads, headDim = headDim,
+            promptLen = promptLen, qAbsPos = qAbsPos, maxSeqLen = maxSeqLen,
+        };
+        DispatchOrRecord(_snapKvScorePipeline,
+            [GetBuffer(q), GetBuffer(kCache), GetBuffer(scoreAccum), GetBuffer(scoresScratch)],
+            numHeads, &p);
+    }
+
+    /// <summary>
+    /// SnapKV (issue #59) — gather the kept positions of one KV ring (K or V)
+    /// into a dense <c>[K × kvDim]</c> prefix of <paramref name="dst"/>.
+    /// <paramref name="src"/> and <paramref name="dst"/> MUST be different
+    /// tensors; the destination is later copied back over the original ring's
+    /// <c>[0, K × kvDim)</c> region by the caller. <paramref name="keepPositions"/>
+    /// must hold int32 indices in <c>[0, originalLength)</c>.
+    ///
+    /// Dispatched as <c>(ceil(kvDim/256), K, 1)</c> workgroups of 256 threads —
+    /// matches the CUDA reference grid.
+    /// </summary>
+    public void KvCompact(Tensor src, Tensor dst, Tensor keepPositions,
+                          uint K, uint kvDim)
+    {
+        _kvCompactPipeline ??= new ComputePipeline(this, Shaders.KvCompact, 3, pushConstantSize: sizeof(KvCompactParams));
+        var p = new KvCompactParams { K = K, kvDim = kvDim };
+        uint groupsX = (kvDim + 255) / 256;
+        DispatchOrRecord(_kvCompactPipeline,
+            [GetBuffer(src), GetBuffer(dst), GetBuffer(keepPositions)],
+            groupsX, &p, groupY: K);
+    }
+
+    /// <summary>
+    /// SnapKV (issue #59) — zero a sub-region of an f32 tensor starting at
+    /// <paramref name="elementOffset"/> for <paramref name="elementCount"/>
+    /// elements. Mirrors <c>CudaBackend.ClearRegion</c>. SnapKV calls this once
+    /// per prefill over <c>promptLen</c> floats (≤ a few KB), so we go via a
+    /// CPU-side zero buffer staged through the upload pipeline rather than
+    /// adding an offset-aware compute shader. Must NOT be called while a
+    /// command-buffer recording session is active.
+    /// </summary>
+    public unsafe void ClearRegion(Tensor dst, long elementOffset, int elementCount)
+    {
+        if (elementCount <= 0) return;
+        ulong byteSize = (ulong)((long)elementCount * sizeof(float));
+        ulong dstByteOffset = (ulong)(elementOffset * sizeof(float));
+
+        if (_uploadStaging == null || _uploadStagingSize < byteSize)
+        {
+            _uploadStaging?.Dispose();
+            _uploadStaging = GpuBuffer.CreateStaging(this, byteSize, VkBufferUsageFlags.TransferSrc);
+            _uploadStagingSize = byteSize;
+        }
+
+        // Zero the staging window then issue a one-region copy.
+        byte* mapped = (byte*)_uploadStaging.Map();
+        new Span<byte>(mapped, (int)byteSize).Clear();
+        _uploadStaging.Unmap();
+
+        var gpuBuf = GetBuffer(dst);
+        VkCommandBufferBeginInfo beginInfo = new() { flags = VkCommandBufferUsageFlags.OneTimeSubmit };
+        _vkd.vkBeginCommandBuffer(_transferCmd, &beginInfo).CheckResult();
+        VkBufferCopy copyRegion = new() { srcOffset = 0, dstOffset = dstByteOffset, size = byteSize };
+        _vkd.vkCmdCopyBuffer(_transferCmd, _uploadStaging!.Buffer, gpuBuf.Buffer, 1, &copyRegion);
+        _vkd.vkEndCommandBuffer(_transferCmd).CheckResult();
+        SubmitAndWait();
     }
 
     // ================================================================
@@ -1601,6 +1688,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _matVecF32Pipeline?.Dispose();
         _kvAppendPipeline?.Dispose();
         _attentionPipeline?.Dispose();
+        _snapKvScorePipeline?.Dispose();
+        _kvCompactPipeline?.Dispose();
         _embedLookupPipeline?.Dispose();
         _embedLookupQ4KPipeline?.Dispose();
         _bufCopyPipeline?.Dispose();

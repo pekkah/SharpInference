@@ -114,6 +114,18 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     private readonly bool _isMoE, _hasSharedExpert;
     private readonly float[]? _routerBuf;
 
+    // SnapKV (#59) — prefill-time eviction by attention-weight scoring. Mirrors
+    // the CudaForwardPass layout. Every layer in GpuForwardPass is an attention
+    // layer, so no per-layer-type filter on the capture.
+    private readonly SnapKvConfig _snapKvCfg;
+    private readonly int _snapKvEffectiveBudget;
+    private Tensor? _snapKvQCapture;     // [numLayers × W × qDim] f32, captured during Prefill
+    private int _snapKvQCaptureW;        // cached W the buffer was sized for
+    private Tensor? _snapKvScoreAccum;   // [maxSeqLen] f32, per-position importance accumulator
+    private Tensor? _snapKvScoreScratch; // [numHeads × maxSeqLen] f32, lazy scratch for the score kernel
+    private bool _snapKvScoreScratchOwned; // false if aliased to _attnScoresScratch
+    private int _snapKvCaptureSlot = -1; // 0..W-1 for tokens in the capture window; -1 otherwise
+
     public GpuForwardPass(GgufModel model, VulkanBackend gpu, ModelHyperparams hp,
         int maxContextLength = 0, bool enableTurboQuant = false, int tqFp32Window = 256, int tqBits = 3)
     {
@@ -153,6 +165,39 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         if (_tqEnabled && _headDim is not 128 and not 256)
             throw new NotSupportedException($"TurboQuant currently supports head dimensions 128 and 256; model head dim is {_headDim}.");
         _routerBuf = _isMoE ? new float[hp.NumExperts] : null;
+
+        // SnapKV (issue #59) — gated by SHARPI_SNAPKV_BUDGET. Buffers are lazily
+        // allocated on the first active prefill in Prefill(). Composition with
+        // TurboQuant requires per-block ring bookkeeping that doesn't yet exist
+        // (issue #60); explicit opt-in + TQ is rejected up front, and the auto
+        // path stays disabled when TQ is on. Mirrors CudaForwardPass.
+        _snapKvCfg = SnapKvConfig.FromEnvironment();
+        if (_tqEnabled && _snapKvCfg.IsBudgetExplicit && _snapKvCfg.Budget > 0)
+            throw new NotSupportedException(
+                "SnapKV + TurboQuant composition is not yet implemented (issue #60). " +
+                "Set SHARPI_SNAPKV_BUDGET=0 to disable or disable --tq.");
+        if (_snapKvCfg.IsBudgetExplicit)
+        {
+            _snapKvEffectiveBudget = _snapKvCfg.Budget;
+        }
+        else if (_tqEnabled)
+        {
+            _snapKvEffectiveBudget = 0;
+        }
+        else
+        {
+            long fullCacheBytes = (long)_hp.NumLayers * _maxSeqLen
+                                * _numKvHeads * _headDim * 2 * sizeof(float); // K + V, fp32
+            _snapKvEffectiveBudget = SnapKvConfig.ComputeAutoBudget(_maxSeqLen, fullCacheBytes);
+            if (_snapKvEffectiveBudget > 0)
+            {
+                Console.Error.WriteLine(
+                    $"[GpuForwardPass] SnapKV auto-enabled: budget={_snapKvEffectiveBudget}, " +
+                    $"window={_snapKvCfg.Window}, recency={_snapKvCfg.Recency} " +
+                    $"(full cache ~{fullCacheBytes / (1024.0 * 1024.0):F0} MiB; " +
+                    "set SHARPI_SNAPKV_BUDGET=0 to disable).");
+            }
+        }
 
         // Allocate GPU scratch buffers
         _hidden = gpu.Allocate(TensorShape.D1(_embDim));
@@ -354,10 +399,176 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     /// <inheritdoc/>
     public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0)
     {
+        if (tokens is null || tokens.Count == 0)
+            throw new ArgumentException("Token list is empty", nameof(tokens));
+
+        int N = tokens.Count;
+
+        // SnapKV (issue #59) gating: only run eviction when this is a fresh
+        // prefill (startPos==0), the effective budget is positive, the prompt
+        // is long enough that eviction would actually drop something, and TQ
+        // is off (composition with the TQ ring is #60).
+        bool snapKvActive = _snapKvEffectiveBudget > 0
+                         && startPos == 0
+                         && !_tqEnabled
+                         && N > _snapKvEffectiveBudget
+                         && N > _snapKvCfg.Window;
+        int W = 0, wStart = 0;
+        if (snapKvActive)
+        {
+            W = Math.Min(_snapKvCfg.Window, N);
+            wStart = N - W;
+            EnsureSnapKvCaptureBuffer(W);
+        }
+
         ReadOnlySpan<float> logits = default;
-        for (int i = 0; i < tokens.Count; i++)
+        for (int i = 0; i < N; i++)
+        {
+            // Drive Q-capture for the last W tokens — Forward reads
+            // _snapKvCaptureSlot and writes _q into _snapKvQCapture.
+            _snapKvCaptureSlot = (snapKvActive && i >= wStart) ? (i - wStart) : -1;
             logits = Forward(tokens[i], startPos + i);
+        }
+        _snapKvCaptureSlot = -1;
+
+        if (snapKvActive)
+            ApplySnapKvEviction(N, W, wStart);
+
         return logits;
+    }
+
+    /// <summary>
+    /// SnapKV (issue #59): score the captured trailing-W queries against the
+    /// VRAM K cache for every layer (atomicAdd-pooled into a single per-position
+    /// accumulator), download the accumulator, pick a keep set, then compact the
+    /// GPU K/V rings + the host-side <see cref="_kvCache"/> length bookkeeping.
+    /// Called once at the end of a SnapKV-active prefill. Mirrors
+    /// <c>CudaForwardPass.ApplySnapKvEviction</c>.
+    /// </summary>
+    private void ApplySnapKvEviction(int N, int W, int wStart)
+    {
+        EnsureSnapKvScoreBuffers();
+        // Zero only the prompt-prefix slice; the rest of the [maxSeqLen] buffer
+        // doesn't participate in scoring and will not be downloaded.
+        _gpu.ClearRegion(_snapKvScoreAccum!, 0, N);
+
+        // Record ALL (layer, w) score dispatches into one command buffer and
+        // submit once. The CAS-based atomicAdd on _snapKvScoreAccum (binding 2
+        // of SnapKvScore) serialises writes globally, so dispatch order doesn't
+        // affect the final accumulator. WAR/WAW hazards on the reused _q buffer
+        // are handled by RecordBarrier between each (CopyRegion → SnapKvScore)
+        // pair and after each SnapKvScore (before the next iter's CopyRegion).
+        // For Qwen3-8B (36 × 64 = 2304 dispatches) this collapses ~50 ms of
+        // per-submit overhead into a single submission. (Closes #66.)
+        int qDim = _numHeads * _headDim;
+        _gpu.BeginRecord();
+        for (int layer = 0; layer < _hp.NumLayers; layer++)
+        {
+            for (int w = 0; w < W; w++)
+            {
+                long srcOffsetElems = ((long)layer * _snapKvQCaptureW + w) * qDim;
+                _gpu.RecordComputeCopyRegion(_q, 0,
+                    _snapKvQCapture!, srcOffsetElems * sizeof(float),
+                    (long)qDim * sizeof(float));
+                _gpu.RecordBarrier();
+
+                int qAbsPos = wStart + w;
+                _gpu.SnapKvScore(_q, _gpuKCache[layer],
+                    _snapKvScoreAccum!, _snapKvScoreScratch!,
+                    (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
+                    (uint)N, (uint)qAbsPos, (uint)_maxSeqLen);
+                _gpu.RecordBarrier();
+            }
+        }
+        _gpu.EndRecordAndSubmit();
+
+        // Download the prompt-length prefix of the accumulator and pick the keep set.
+        var hostScores = new float[N];
+        _gpu.Download(_snapKvScoreAccum!, hostScores);
+
+        var selector = new SnapKvSelector(_numHeads, _numKvHeads, _headDim);
+        selector.LoadScores(hostScores, N);
+        int[] keep = selector.SelectKeepSet(N, _snapKvEffectiveBudget, _snapKvCfg.Recency);
+        int K = keep.Length;
+        if (K >= N)
+        {
+            // No actual eviction — leave the GPU ring + bookkeeping alone.
+            return;
+        }
+
+        // Upload the keep list to device (int32) for the gather kernels.
+        ReadOnlySpan<byte> keepBytes = MemoryMarshal.AsBytes(keep.AsSpan());
+        var keepDev = _gpu.UploadRaw(keepBytes, TensorShape.D1(K), DType.Int32);
+        int kvDim = _numKvHeads * _headDim;
+        var stage = _gpu.Allocate(TensorShape.D1((long)K * kvDim));
+        try
+        {
+            long sliceBytes = (long)K * kvDim * sizeof(float);
+            _gpu.BeginRecord();
+            for (int layer = 0; layer < _hp.NumLayers; layer++)
+            {
+                // K: gather kept positions into stage, then copy stage back over
+                // the cache's [0, K * kvDim) prefix. Same for V. Two-phase to
+                // avoid src==dst race (workgroup ordering is undefined).
+                _gpu.KvCompact(_gpuKCache[layer], stage, keepDev, (uint)K, (uint)kvDim);
+                _gpu.RecordBarrier();
+                _gpu.RecordComputeCopyRegion(_gpuKCache[layer], 0, stage, 0, sliceBytes);
+                _gpu.RecordBarrier();
+                _gpu.KvCompact(_gpuVCache[layer], stage, keepDev, (uint)K, (uint)kvDim);
+                _gpu.RecordBarrier();
+                _gpu.RecordComputeCopyRegion(_gpuVCache[layer], 0, stage, 0, sliceBytes);
+                _gpu.RecordBarrier();
+            }
+            _gpu.EndRecordAndSubmit();
+        }
+        finally
+        {
+            _gpu.Free(stage);
+            _gpu.Free(keepDev);
+        }
+
+        // Update host-side length bookkeeping. _kvCache is bookkeeping-only on
+        // GpuForwardPass — actual data lives in _gpuKCache/_gpuVCache.
+        _kvLength = K;
+        _kvCache.TruncateTo(K);
+    }
+
+    private void EnsureSnapKvCaptureBuffer(int W)
+    {
+        if (_snapKvQCapture is not null && _snapKvQCaptureW >= W) return;
+        if (_snapKvQCapture is { } old) _gpu.Free(old);
+        int qDim = _numHeads * _headDim;
+        long elems = (long)_hp.NumLayers * W * qDim;
+        _snapKvQCapture = _gpu.Allocate(TensorShape.D1(elems));
+        _snapKvQCaptureW = W;
+    }
+
+    private void EnsureSnapKvScoreBuffers()
+    {
+        if (_snapKvScoreAccum is null)
+            _snapKvScoreAccum = _gpu.Allocate(TensorShape.D1(_maxSeqLen));
+
+        // The SnapKvScore kernel only reads/writes scratch when prompt_len > 4096
+        // (the shared-memory fast-path cap), but it always *binds* it. When
+        // _maxSeqLen ≤ 4096 the kernel never touches scratch, so the 1-float
+        // _attnScoresScratch placeholder is sufficient — same convention as
+        // Attention / TqAttention. Above the cap, reuse the real attention
+        // scratch when sized large enough; otherwise allocate a dedicated buffer.
+        // Track ownership so Dispose doesn't double-free the aliased case.
+        if (_snapKvScoreScratch is null)
+        {
+            if (_maxSeqLen <= 4096
+                || (_attnScoresScratch.Handle != 0 && _attnScoresScratch.ElementCount >= (long)_numHeads * _maxSeqLen))
+            {
+                _snapKvScoreScratch = _attnScoresScratch;
+                _snapKvScoreScratchOwned = false;
+            }
+            else
+            {
+                _snapKvScoreScratch = _gpu.Allocate(TensorShape.D1((long)_numHeads * _maxSeqLen));
+                _snapKvScoreScratchOwned = true;
+            }
+        }
     }
 
     /// <summary>
@@ -425,6 +636,19 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                     }
                     _gpu.RecordBarrier();
                 }
+            }
+
+            // SnapKV (issue #59): capture the post-RoPE / post-Q-norm query for
+            // this (layer, token) into the scoring ring. Gated by the Prefill
+            // wrapper — outside that path _snapKvCaptureSlot stays -1 and we skip.
+            // Every layer here is an attention layer, so no per-layer-type filter.
+            if (_snapKvCaptureSlot >= 0 && _snapKvQCapture is { } capBuf)
+            {
+                int qDim = _numHeads * _headDim;
+                long dstOffsetElems = ((long)layer * _snapKvQCaptureW + _snapKvCaptureSlot) * qDim;
+                _gpu.RecordComputeCopyRegion(capBuf, dstOffsetElems * sizeof(float),
+                                             _q, 0, (long)qDim * sizeof(float));
+                _gpu.RecordBarrier();
             }
             // KV append reads K/V (with or without RoPE)
 
@@ -531,6 +755,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         _gpu.EndRecordAndSubmit();
 
         _gpu.ReadFromStaging(_logitsBuf);
+        _kvLength = Math.Max(_kvLength, position + 1);
         return _logitsBuf;
     }
 
@@ -968,6 +1193,11 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             _gpu.Free(_evictV!);
         }
         _gpu.Free(_attnScoresScratch);
+
+        // SnapKV (#59) buffers
+        if (_snapKvQCapture is { } capBuf) _gpu.Free(capBuf);
+        if (_snapKvScoreAccum is { } accBuf) _gpu.Free(accBuf);
+        if (_snapKvScoreScratch is { } scrBuf && _snapKvScoreScratchOwned) _gpu.Free(scrBuf);
 
         _kvCache.Dispose();
     }

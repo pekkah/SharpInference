@@ -753,6 +753,189 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// SnapKV (issue #59) — per-head attention scoring across a layer's K cache.
+    /// Mirrors the CUDA `llm_snapkv_score` kernel: one workgroup per query head,
+    /// 256 threads. Phase 1 computes causal-masked dot(q_head, k_cache[t, kvHead, :]) * scale
+    /// for every t in [0, prompt_len); Phase 2 runs an in-place softmax over the
+    /// valid prefix; Phase 3 atomicAdds the post-softmax weights into a global
+    /// per-position accumulator.
+    ///
+    /// Vulkan core has no native float atomicAdd, so binding 2 is bound twice —
+    /// once as f32 ScoreAccum for readers, once as u32 ScoreAccumAtomic for the
+    /// compare-and-swap loop. The two views share the same VkBuffer (same bit
+    /// pattern; only the binding type differs).
+    ///
+    /// Push constants: { uint num_heads, num_kv_heads, head_dim, prompt_len, q_abs_pos, max_seq_len }.
+    /// Bindings:
+    ///   0 = Q (readonly)
+    ///   1 = K cache (readonly)
+    ///   2 = score_accum, f32 view (coherent, atomic CAS via the u32 alias on the same buffer)
+    ///   3 = scores_scratch (writeonly, only used when prompt_len &gt; 4096)
+    /// </summary>
+    internal const string SnapKvScore = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Q      { float q_data[]; };
+        layout(binding = 1) readonly buffer KCache { float k_cache[]; };
+        // The CUDA reference does a direct float atomicAdd here; Vulkan core
+        // exposes only integer atomics, so we keep the storage f32 (callers
+        // download it as floats) but mutate it through a uint alias via
+        // atomicCompSwap. Same buffer bound twice — the bit pattern of one
+        // view IS the bit pattern of the other.
+        layout(binding = 2) coherent buffer ScoreAccumAtomic { uint accum_uint[]; };
+        // Spill buffer for the > 4096 path: written in Phase 1, re-read in
+        // Phase 2 (max-reduce + softmax) and Phase 3 (atomicAdd), so no
+        // writeonly qualifier here.
+        layout(binding = 3) buffer ScoresScratch   { float scores_scratch[]; };
+
+        layout(push_constant) uniform Params {
+            uint num_heads;
+            uint num_kv_heads;
+            uint head_dim;
+            uint prompt_len;
+            uint q_abs_pos;
+            uint max_seq_len;
+        };
+
+        const uint MAX_STORED_SCORES = 4096u;
+        shared float scores[MAX_STORED_SCORES];
+        shared float sdata[256];
+
+        void atomicAddFloat(uint idx, float value) {
+            // Compare-and-swap loop on the uint reinterpretation of the f32 word.
+            // The CUDA path uses native float atomicAdd; this matches its semantics
+            // (last-writer-wins associative accumulate) on Vulkan core.
+            uint oldBits = accum_uint[idx];
+            while (true) {
+                float oldVal = uintBitsToFloat(oldBits);
+                float newVal = oldVal + value;
+                uint newBits = floatBitsToUint(newVal);
+                uint prev = atomicCompSwap(accum_uint[idx], oldBits, newBits);
+                if (prev == oldBits) return;
+                oldBits = prev;
+            }
+        }
+
+        void main() {
+            uint h = gl_WorkGroupID.x;
+            uint tid = gl_LocalInvocationID.x;
+            if (h >= num_heads) return;
+
+            uint kv_head = h / (num_heads / num_kv_heads);
+            uint kv_dim  = num_kv_heads * head_dim;
+            float scale  = inversesqrt(float(head_dim));
+            uint q_off   = h * head_dim;
+
+            bool use_shared = (prompt_len <= MAX_STORED_SCORES);
+            uint scratch_base = h * max_seq_len;
+
+            // ─── Phase 1: per-position causal-masked Q·K dot ───
+            for (uint t = tid; t < prompt_len; t += 256) {
+                float score;
+                if (t > q_abs_pos) {
+                    score = -1.0/0.0;
+                } else {
+                    float dot = 0.0;
+                    uint k_off = t * kv_dim + kv_head * head_dim;
+                    for (uint d = 0; d < head_dim; d++)
+                        dot += q_data[q_off + d] * k_cache[k_off + d];
+                    score = dot * scale;
+                }
+                if (use_shared) scores[t] = score;
+                else            scores_scratch[scratch_base + t] = score;
+            }
+            // Pad shared tail so max-reduce ignores stale slots. Scratch reads
+            // iterate only [0, prompt_len), so no padding needed there.
+            if (use_shared) {
+                for (uint t = prompt_len + tid; t < MAX_STORED_SCORES; t += 256)
+                    scores[t] = -1.0/0.0;
+            }
+            barrier();
+
+            // ─── Phase 2a: max over [0, prompt_len) ───
+            float local_max = -1.0/0.0;
+            for (uint t = tid; t < prompt_len; t += 256) {
+                float s = use_shared ? scores[t] : scores_scratch[scratch_base + t];
+                local_max = max(local_max, s);
+            }
+            sdata[tid] = local_max;
+            barrier();
+            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
+                barrier();
+            }
+            float max_val = sdata[0];
+            barrier();
+
+            // ─── Phase 2b: exp(s - max), sum, normalize ───
+            float local_sum = 0.0;
+            for (uint t = tid; t < prompt_len; t += 256) {
+                float s = use_shared ? scores[t] : scores_scratch[scratch_base + t];
+                float e = (s == -1.0/0.0) ? 0.0 : exp(s - max_val);
+                if (use_shared) scores[t] = e;
+                else            scores_scratch[scratch_base + t] = e;
+                local_sum += e;
+            }
+            sdata[tid] = local_sum;
+            barrier();
+            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] += sdata[tid + s];
+                barrier();
+            }
+            float inv_sum = 1.0 / sdata[0];
+            barrier();
+
+            // ─── Phase 3: atomicAdd softmax weight into global accumulator ───
+            for (uint t = tid; t < prompt_len; t += 256) {
+                if (t > q_abs_pos) continue;
+                float w = (use_shared ? scores[t] : scores_scratch[scratch_base + t]) * inv_sum;
+                atomicAddFloat(t, w);
+            }
+        }
+        """;
+
+    /// <summary>
+    /// SnapKV (issue #59) — gather kept positions of one KV ring (K or V) into a
+    /// dense <c>[K * kv_dim]</c> prefix of <c>dst</c>. <c>src</c> and <c>dst</c> MUST be
+    /// different buffers; the destination is later copied back over the ring's
+    /// <c>[0, K * kv_dim)</c> region by the caller.
+    ///
+    /// Each thread copies one float from src[keep[blockIdx.y] * kv_dim + d] to
+    /// dst[blockIdx.y * kv_dim + d]. Grid = (ceil(kv_dim/256), K, 1), block 256.
+    ///
+    /// Push constants: { uint K, kv_dim }.
+    /// Bindings: 0=src (readonly), 1=dst (writeonly), 2=keep_positions (readonly int32).
+    /// </summary>
+    internal const string KvCompact = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly  buffer Src  { float src_data[]; };
+        layout(binding = 1) writeonly buffer Dst  { float dst_data[]; };
+        layout(binding = 2) readonly  buffer Keep { int   keep_positions[]; };
+
+        layout(push_constant) uniform Params {
+            uint K;
+            uint kv_dim;
+        };
+
+        void main() {
+            uint i = gl_WorkGroupID.y;
+            if (i >= K) return;
+            uint d = gl_GlobalInvocationID.x;
+            if (d >= kv_dim) return;
+
+            uint src_pos = uint(keep_positions[i]);
+            uint src_off = src_pos * kv_dim + d;
+            uint dst_off = i       * kv_dim + d;
+            dst_data[dst_off] = src_data[src_off];
+        }
+        """;
+
+    /// <summary>
     /// Matrix-vector multiply with Q6_K dequantization.
     /// Same pattern as Q4_K but different block layout.
     /// Q6_K block (210 bytes per 256 elements):
