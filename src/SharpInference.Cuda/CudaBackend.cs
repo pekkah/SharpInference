@@ -425,6 +425,132 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             UploadViaStaging(dstPtr, s, byteSize);
     }
 
+    // ── Direct-pinned Download/Upload overloads (issues #48/#49) ──────────
+    //
+    // The Span<float> Download/UploadInto overloads above route every transfer
+    // through the internal pinned staging buffer (_pinnedBuf) with an extra
+    // host-side Buffer.MemoryCopy hop. When the caller already owns a pinned
+    // host allocation (cudaMallocHost), that staging hop is wasted work.
+    // These overloads cudaMemcpyAsync directly between the caller's pinned
+    // buffer and the device, avoiding the round-trip via _pinnedBuf.
+    //
+    // The `pinnedDst`/`pinnedSrc` argument MUST point at memory allocated via
+    // cudaMallocHost (see AllocatePinnedHost) — pageable memory will fall back
+    // to a slow sync copy under cudaMemcpyAsync, defeating the optimisation.
+
+    /// <summary>
+    /// Download a float-typed device tensor into a caller-owned pinned host buffer
+    /// via a single <c>cudaMemcpyAsync</c>, skipping the internal <c>_pinnedBuf</c>
+    /// staging hop. Synchronous: blocks the host until the transfer completes.
+    /// Caller is responsible for ensuring <paramref name="pinnedDst"/> points at
+    /// memory allocated via <see cref="AllocatePinnedHost"/> (cudaMallocHost).
+    /// (Issue #48.)
+    /// </summary>
+    public unsafe void Download(Tensor src, nint pinnedDst, int floatCount)
+    {
+        nint devPtr = GetDevPtr(src);
+        nuint byteSize = (nuint)floatCount * sizeof(float);
+        if (_stream != nint.Zero)
+        {
+            int r = CuBlasInterop.CudaMemcpyAsync(pinnedDst, devPtr, byteSize,
+                                                  CuBlasInterop.DeviceToHost, _stream);
+            if (r != 0)
+                throw new InvalidOperationException($"cudaMemcpyAsync (D2H, pinned) failed: {r}");
+            CuBlasInterop.StreamSynchronize(_stream);
+            // The sync above drains any prior in-flight async H2D on _pinnedBuf.
+            _uploadInFlight = false;
+        }
+        else
+        {
+            int r = CuBlasInterop.CudaMemcpy(pinnedDst, devPtr, byteSize, CuBlasInterop.DeviceToHost);
+            if (r != 0)
+                throw new InvalidOperationException($"cudaMemcpy (D2H, pinned) failed: {r}");
+        }
+    }
+
+    /// <summary>
+    /// Like <see cref="Download(Tensor, nint, int)"/> but does NOT sync the stream.
+    /// The transfer is queued on <c>_stream</c>; the buffer's contents are valid
+    /// only after a subsequent stream sync (e.g. the next Download/Synchronize
+    /// call). Used to overlap a hidden-state snapshot D2H with subsequent GPU work
+    /// whose D2H sync will drain both. (Issue #49.)
+    /// </summary>
+    public unsafe void DownloadAsync(Tensor src, nint pinnedDst, int floatCount)
+    {
+        nint devPtr = GetDevPtr(src);
+        nuint byteSize = (nuint)floatCount * sizeof(float);
+        if (_stream != nint.Zero)
+        {
+            int r = CuBlasInterop.CudaMemcpyAsync(pinnedDst, devPtr, byteSize,
+                                                  CuBlasInterop.DeviceToHost, _stream);
+            if (r != 0)
+                throw new InvalidOperationException($"cudaMemcpyAsync (D2H, pinned async) failed: {r}");
+            // No sync — caller is responsible for draining via a subsequent
+            // Download/Synchronize. _uploadInFlight is NOT cleared here.
+        }
+        else
+        {
+            int r = CuBlasInterop.CudaMemcpy(pinnedDst, devPtr, byteSize, CuBlasInterop.DeviceToHost);
+            if (r != 0)
+                throw new InvalidOperationException($"cudaMemcpy (D2H, pinned async fallback) failed: {r}");
+        }
+    }
+
+    /// <summary>
+    /// Upload from a caller-owned pinned host buffer to the device via a single
+    /// <c>cudaMemcpyAsync</c> on <c>_stream</c>, skipping the internal
+    /// <c>_pinnedBuf</c> staging hop. Subsequent enqueued GPU operations on
+    /// <c>_stream</c> automatically sequence behind this transfer; no host-side
+    /// sync is needed unless the caller mutates the pinned buffer before the next
+    /// stream sync. Caller is responsible for ensuring <paramref name="pinnedSrc"/>
+    /// points at memory allocated via <see cref="AllocatePinnedHost"/>
+    /// (cudaMallocHost). (Issue #48.)
+    /// </summary>
+    public unsafe void UploadInto(Tensor dst, nint pinnedSrc, int floatCount)
+    {
+        if ((long)floatCount != dst.ElementCount)
+            throw new ArgumentException($"UploadInto: element-count mismatch ({floatCount} → {dst.ElementCount}).");
+        nint dstPtr = GetDevPtr(dst);
+        nuint byteSize = (nuint)floatCount * sizeof(float);
+        if (_stream != nint.Zero)
+        {
+            // No need to drain _uploadInFlight: this transfer reads from the
+            // caller's pinned buffer, not _pinnedBuf, so it can't race with a
+            // prior async H2D that was using _pinnedBuf as its source.
+            int r = CuBlasInterop.CudaMemcpyAsync(dstPtr, pinnedSrc, byteSize,
+                                                  CuBlasInterop.HostToDevice, _stream);
+            if (r != 0)
+                throw new InvalidOperationException($"cudaMemcpyAsync (H2D, pinned) failed: {r}");
+        }
+        else
+        {
+            int r = CuBlasInterop.CudaMemcpy(dstPtr, pinnedSrc, byteSize, CuBlasInterop.HostToDevice);
+            if (r != 0)
+                throw new InvalidOperationException($"cudaMemcpy (H2D, pinned) failed: {r}");
+        }
+    }
+
+    /// <summary>
+    /// Allocate a pinned host buffer via <c>cudaMallocHost</c>. Returns
+    /// <see cref="IntPtr.Zero"/> on failure. Used by Engine code to allocate
+    /// per-token scratch suitable for the direct-pinned
+    /// <see cref="Download(Tensor, nint, int)"/> /
+    /// <see cref="UploadInto(Tensor, nint, int)"/> overloads.
+    /// </summary>
+    public static nint AllocatePinnedHost(nuint byteSize)
+    {
+        if (CuBlasInterop.MallocHost(out nint ptr, byteSize) != 0)
+            return nint.Zero;
+        return ptr;
+    }
+
+    /// <summary>Free a pinned host buffer allocated via <see cref="AllocatePinnedHost"/>.</summary>
+    public static void FreePinnedHost(nint ptr)
+    {
+        if (ptr != nint.Zero)
+            CuBlasInterop.FreeHost(ptr);
+    }
+
     // ── Vulkan-API shims (used by CudaHybridForwardPass) ──────────────────
     //
     // CUDA executes ops immediately on the stream and orders dependent work

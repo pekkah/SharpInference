@@ -565,7 +565,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _logitsBuf = new float[hp.VocabSize];
 
         // ── CPU scratch ────────────────────────────────────────────────
-        _cpuNormBuf = Alloc(_embDim);
+        // _cpuNormBuf is the per-token GDN-pre-MoE-norm download target. Pinned
+        // (cudaMallocHost) so CudaBackend's direct-pinned Download overload can
+        // DMA into it without bouncing through the internal staging buffer
+        // (issue #48). ~8 KiB per token; safe to pin.
+        _cpuNormBuf = AllocPinned(_embDim);
         _cpuHiddenOut = Alloc(_embDim);
         _qkv = Alloc(_gdnConvChannels);
         _qkvConv = Alloc(_gdnConvChannels);
@@ -715,7 +719,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _cpuSharedOut = Alloc(_embDim);
             _cpuExpertGateAll = Alloc(_numActiveExperts * _expertDim);
             _cpuExpertUpAll = Alloc(_numActiveExperts * _expertDim);
-            _cpuMoeHidden = Alloc(_embDim);
+            // Pinned: source of the per-token UploadInto back to _gpuHidden after
+            // the CPU MoE FFN runs (issue #48). ~8 KiB; safe to pin.
+            _cpuMoeHidden = AllocPinned(_embDim);
         }
         else if (!hp.IsMoE)
         {
@@ -727,7 +733,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _cpuWFfnDown = new CpuWeightRef[L];
             _cpuFfnGateBuf = Alloc(_intermDim);
             _cpuFfnUpBuf   = Alloc(_intermDim);
-            _cpuMoeHidden  = Alloc(_embDim);
+            // Pinned: per-layer UploadInto source after CPU dense FFN (issue #48).
+            _cpuMoeHidden  = AllocPinned(_embDim);
 
             _cpuRouterLogits = null;
             _cpuSharedOut = null;
@@ -956,7 +963,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _mtpKvCache = new PagedKvCache(numLayers: 1, _numKvHeads, _headDim);
 
             // Host LastHidden buffer (downloaded after each main Forward).
-            _lastHidden = Alloc(_embDim);
+            // Pinned (cudaMallocHost) so the snapshot D2H can be queued via
+            // DownloadAsync and drained by the subsequent logits Download's
+            // stream sync. This lets the lm_head MatMul launch in parallel with
+            // the queued PCIe transfer (issue #49).
+            _lastHidden = AllocPinned(_embDim);
 
             // GPU dense FFN scratch is allocated by TryUploadDenseFfnLayers only
             // when at least one trunk FFN layer lands on GPU. For MTP we need it
@@ -982,9 +993,13 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _gpuLogits2      = gpu.Allocate(TensorShape.D1(_hp.VocabSize));
             _gpuLastHiddenT1 = gpu.Allocate(TensorShape.D1(_embDim));
             _logitsBuf2      = new float[_hp.VocabSize];
-            _cpuNormBuf2     = Alloc(_embDim);
-            _cpuMoeHidden2   = Alloc(_embDim);
-            _lastHiddenT1    = Alloc(_embDim);
+            // Pinned: per-token batched-verify Download/UploadInto scratch
+            // (issues #48/#49). _lastHiddenT1 is queued via DownloadAsync and
+            // drained by the subsequent logits Download's sync, mirroring the
+            // single-token path's overlap.
+            _cpuNormBuf2     = AllocPinned(_embDim);
+            _cpuMoeHidden2   = AllocPinned(_embDim);
+            _lastHiddenT1    = AllocPinned(_embDim);
             if (!hp.IsMoE)
             {
                 _gpuFfnGateBufDense2 = gpu.Allocate(TensorShape.D1(_intermDim));
@@ -1429,9 +1444,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 }
                 else
                 {
-                    _gpu.Download(_gpuNormBuf, new Span<float>(_cpuNormBuf, _embDim));
+                    // Direct-pinned Download/UploadInto (issue #48): _cpuNormBuf
+                    // and _cpuMoeHidden are cudaMallocHost'd, so cudaMemcpyAsync
+                    // can DMA straight in/out without bouncing through _pinnedBuf.
+                    _gpu.Download(_gpuNormBuf, (nint)_cpuNormBuf, _embDim);
                     CpuDenseFfn(layer);
-                    _gpu.UploadInto(_gpuHidden, new ReadOnlySpan<float>(_cpuMoeHidden, _embDim));
+                    _gpu.UploadInto(_gpuHidden, (nint)_cpuMoeHidden, _embDim);
                 }
             }
             else if (_cpuMoe)
@@ -1439,9 +1457,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 // Download _gpuNormBuf → _cpuNormBuf, run MoE on CPU, upload result.
                 // Download already syncs the stream (CudaMemcpyAsync + StreamSynchronize),
                 // so an explicit Synchronize before it would just stall the host twice.
-                _gpu.Download(_gpuNormBuf, new Span<float>(_cpuNormBuf, _embDim));
+                // Pinned overloads (issue #48): skip the _pinnedBuf staging hop.
+                _gpu.Download(_gpuNormBuf, (nint)_cpuNormBuf, _embDim);
                 CpuMoeFfn(layer);
-                _gpu.UploadInto(_gpuHidden, new ReadOnlySpan<float>(_cpuMoeHidden, _embDim));
+                _gpu.UploadInto(_gpuHidden, (nint)_cpuMoeHidden, _embDim);
             }
             else
             {
@@ -1460,10 +1479,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         // 5. Capture pre-output-norm hidden for MTP (issue #29). _gpu.RmsNorm
         //    below overwrites _gpuHidden in place; snapshot to _gpuLastHidden
-        //    on the same stream so the snapshot is consistent. Issue #49: defer
-        //    the D2H download until AFTER the lm_head MatMul is enqueued so the
-        //    MatMul kernel launch isn't gated on the snapshot's PCIe transfer.
-        //    The logits Download below will sync the stream and drain both.
+        //    on the same stream so the snapshot is consistent. Issue #49: the
+        //    _lastHidden D2H is queued via DownloadAsync (no sync) AFTER the
+        //    lm_head MatMul has been enqueued. The MatMul kernel launch is no
+        //    longer gated on the snapshot's PCIe transfer, and the logits
+        //    Download below is the single sync that drains both. Pinning
+        //    _lastHidden via cudaMallocHost (constructor) lets cudaMemcpyAsync
+        //    run truly concurrently with the lm_head kernel — without pinning,
+        //    the driver would silently route through the shared _pinnedBuf
+        //    and serialise behind the next Download's sync anyway.
         if (_hasMtp)
             _gpu.CopyDevice(_gpuLastHidden, _gpuHidden);
 
@@ -1473,7 +1497,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _gpuWeightDTypes.TryGetValue(_gpuOutputWeight!.Handle, out var outDt) ? outDt : DType.Float32);
 
         if (_hasMtp)
-            _gpu.Download(_gpuLastHidden, new Span<float>(_lastHidden, _embDim));
+            _gpu.DownloadAsync(_gpuLastHidden, (nint)_lastHidden, _embDim);
 
         // 6. Download logits to host (Download self-syncs the stream — also
         // drains the _lastHidden async D2H above).
@@ -1612,34 +1636,36 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 }
                 else
                 {
-                    _gpu.Download(_gpuNormBuf,  new Span<float>(_cpuNormBuf,  _embDim));
-                    _gpu.Download(_gpuNormBuf2, new Span<float>(_cpuNormBuf2, _embDim));
+                    // Direct-pinned overloads (issue #48).
+                    _gpu.Download(_gpuNormBuf,  (nint)_cpuNormBuf,  _embDim);
+                    _gpu.Download(_gpuNormBuf2, (nint)_cpuNormBuf2, _embDim);
                     CpuDenseFfn2(layer, _cpuNormBuf, _cpuNormBuf2,
                                  _cpuMoeHidden, _cpuMoeHidden2);
-                    _gpu.UploadInto(_gpuHidden,  new ReadOnlySpan<float>(_cpuMoeHidden,  _embDim));
-                    _gpu.UploadInto(_gpuHidden2, new ReadOnlySpan<float>(_cpuMoeHidden2, _embDim));
+                    _gpu.UploadInto(_gpuHidden,  (nint)_cpuMoeHidden,  _embDim);
+                    _gpu.UploadInto(_gpuHidden2, (nint)_cpuMoeHidden2, _embDim);
                 }
             }
             else if (_cpuMoe)
             {
+                // Direct-pinned overloads (issue #48).
                 // t1
-                _gpu.Download(_gpuNormBuf,  new Span<float>(_cpuNormBuf,  _embDim));
+                _gpu.Download(_gpuNormBuf,  (nint)_cpuNormBuf,  _embDim);
                 CpuMoeFfnCore(
                     _gpuWGateShexp[layer], _gpuWUpShexp[layer], _gpuWDownShexp[layer],
                     _cpuFfnGateInp![layer], _cpuFfnGateInpShexp![layer],
                     _cpuFfnGateExps![layer], _cpuFfnUpExps![layer], _cpuFfnDownExps![layer],
                     gpuNormIn: _gpuNormBuf, gpuSharedOut: _gpuSharedOut,
                     cpuNormIn: _cpuNormBuf, cpuMoeOut: _cpuMoeHidden);
-                _gpu.UploadInto(_gpuHidden,  new ReadOnlySpan<float>(_cpuMoeHidden,  _embDim));
+                _gpu.UploadInto(_gpuHidden,  (nint)_cpuMoeHidden,  _embDim);
                 // t2
-                _gpu.Download(_gpuNormBuf2, new Span<float>(_cpuNormBuf2, _embDim));
+                _gpu.Download(_gpuNormBuf2, (nint)_cpuNormBuf2, _embDim);
                 CpuMoeFfnCore(
                     _gpuWGateShexp[layer], _gpuWUpShexp[layer], _gpuWDownShexp[layer],
                     _cpuFfnGateInp![layer], _cpuFfnGateInpShexp![layer],
                     _cpuFfnGateExps![layer], _cpuFfnUpExps![layer], _cpuFfnDownExps![layer],
                     gpuNormIn: _gpuNormBuf2, gpuSharedOut: _gpuSharedOut,
                     cpuNormIn: _cpuNormBuf2, cpuMoeOut: _cpuMoeHidden2);
-                _gpu.UploadInto(_gpuHidden2, new ReadOnlySpan<float>(_cpuMoeHidden2, _embDim));
+                _gpu.UploadInto(_gpuHidden2, (nint)_cpuMoeHidden2, _embDim);
             }
             else
             {
@@ -1663,10 +1689,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gdnStateCache.IncrementPosition();
 
         // 5. Snapshot pre-output-norm hiddens for MTP commit + next iter draft.
+        //    Issue #49: queue both snapshots via DownloadAsync (pinned host
+        //    targets) so the lm_head MatMuls below run concurrently with the
+        //    queued PCIe transfers. The logits Downloads at the end sync the
+        //    stream and drain everything.
         _gpu.CopyDevice(_gpuLastHiddenT1, _gpuHidden);
         _gpu.CopyDevice(_gpuLastHidden,   _gpuHidden2);
-        _gpu.Download(_gpuLastHiddenT1, new Span<float>(_lastHiddenT1, _embDim));
-        _gpu.Download(_gpuLastHidden,   new Span<float>(_lastHidden,   _embDim));
+        _gpu.DownloadAsync(_gpuLastHiddenT1, (nint)_lastHiddenT1, _embDim);
+        _gpu.DownloadAsync(_gpuLastHidden,   (nint)_lastHidden,   _embDim);
 
         // 6. Final norm + output projection for both tokens.
         _gpu.RmsNorm(_gpuHidden,  _gpuHidden,  _gpuOutputNorm!, _hp.RmsNormEps);
@@ -1857,15 +1887,16 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             // CPU MoE for the MTP head: download _gpuNormBuf to CPU, run the same
             // batched-expert path as the trunk CpuMoeFfn but with the MTP block's
             // tensors, upload the result back to _gpuHidden. Shared expert MatMuls
-            // run on GPU and overlap with the CPU routed loop.
-            _gpu.Download(_gpuNormBuf, new Span<float>(_cpuNormBuf, _embDim));
+            // run on GPU and overlap with the CPU routed loop. Direct-pinned
+            // overloads (issue #48).
+            _gpu.Download(_gpuNormBuf, (nint)_cpuNormBuf, _embDim);
             CpuMoeFfnCore(
                 _gpuMtpWGateShexp, _gpuMtpWUpShexp, _gpuMtpWDownShexp,
                 _cpuMtpFfnGateInp, _cpuMtpFfnGateInpShexp,
                 _cpuMtpFfnGateExps, _cpuMtpFfnUpExps, _cpuMtpFfnDownExps,
                 gpuNormIn: _gpuNormBuf, gpuSharedOut: _gpuSharedOut,
                 cpuNormIn: _cpuNormBuf, cpuMoeOut: _cpuMoeHidden);
-            _gpu.UploadInto(_gpuHidden, new ReadOnlySpan<float>(_cpuMoeHidden, _embDim));
+            _gpu.UploadInto(_gpuHidden, (nint)_cpuMoeHidden, _embDim);
         }
         else
         {
@@ -2990,6 +3021,25 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private static float* Alloc(int count) =>
         (float*)NativeMemory.AllocZeroed((nuint)count * (nuint)sizeof(float));
 
+    /// <summary>
+    /// Pinned-host counterpart to <see cref="Alloc"/>. Allocates via
+    /// <c>cudaMallocHost</c> so the buffer can be DMA'd directly via the
+    /// <see cref="CudaBackend.Download(Tensor, nint, int)"/> /
+    /// <see cref="CudaBackend.UploadInto(Tensor, nint, int)"/> overloads,
+    /// skipping the internal staging hop (issues #48/#49). Zeroes the buffer
+    /// to match the AllocZeroed semantics of the pageable helper.
+    /// </summary>
+    private static float* AllocPinned(int count)
+    {
+        nuint byteSize = (nuint)count * (nuint)sizeof(float);
+        nint ptr = CudaBackend.AllocatePinnedHost(byteSize);
+        if (ptr == nint.Zero)
+            throw new InvalidOperationException(
+                $"CudaBackend.AllocatePinnedHost({byteSize}) failed; cannot allocate pinned host scratch.");
+        new Span<byte>((void*)ptr, (int)byteSize).Clear();
+        return (float*)ptr;
+    }
+
     // =================================================================
     //  Tracing (SHARPI_TRACE_LAYERS=1)
     // =================================================================
@@ -3066,8 +3116,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (_disposed) return;
         _disposed = true;
 
-        // CPU buffers
-        NativeMemory.Free(_cpuNormBuf);
+        // CPU buffers — _cpuNormBuf is pinned (issue #48).
+        CudaBackend.FreePinnedHost((nint)_cpuNormBuf);
         NativeMemory.Free(_cpuHiddenOut);
         NativeMemory.Free(_qkv);
         NativeMemory.Free(_qkvConv);
@@ -3099,14 +3149,16 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             if (_cpuSharedOut != null) NativeMemory.Free(_cpuSharedOut);
             if (_cpuExpertGateAll != null) NativeMemory.Free(_cpuExpertGateAll);
             if (_cpuExpertUpAll != null) NativeMemory.Free(_cpuExpertUpAll);
-            if (_cpuMoeHidden != null) NativeMemory.Free(_cpuMoeHidden);
+            // _cpuMoeHidden is pinned (issue #48).
+            if (_cpuMoeHidden != null) CudaBackend.FreePinnedHost((nint)_cpuMoeHidden);
         }
         else if (!_hp.IsMoE)
         {
             // Dense FFN scratch (allocated alongside _cpuMoeHidden on the dense path).
             if (_cpuFfnGateBuf != null) NativeMemory.Free(_cpuFfnGateBuf);
             if (_cpuFfnUpBuf   != null) NativeMemory.Free(_cpuFfnUpBuf);
-            if (_cpuMoeHidden  != null) NativeMemory.Free(_cpuMoeHidden);
+            // _cpuMoeHidden is pinned (issue #48).
+            if (_cpuMoeHidden  != null) CudaBackend.FreePinnedHost((nint)_cpuMoeHidden);
             // Per-layer GPU FFN slots populated by TryUploadDenseFfnLayers.
             if (_gpuWFfnGate is not null)
             {
@@ -3255,26 +3307,31 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _gpu.Free(_gpuMtpHnormBuf);
             _gpu.Free(_gpuMtpConcatBuf);
             _gpu.Free(_gpuLastHidden);
-            if (_lastHidden != null) NativeMemory.Free(_lastHidden);
+            // _lastHidden is pinned (issue #49).
+            if (_lastHidden != null) CudaBackend.FreePinnedHost((nint)_lastHidden);
             if (_mtpPrefillHiddens != null)
             {
                 NativeMemory.Free(_mtpPrefillHiddens);
                 _mtpPrefillHiddens = null;
                 _mtpPrefillHiddensCap = 0;
             }
-            // Issue #30 batched-verify scratch (dense FFN MTP only).
+            // Issue #30 batched-verify scratch: GPU tensors + pinned host
+            // buffers (_cpuNormBuf2/_cpuMoeHidden2/_lastHiddenT1) are allocated
+            // for all MTP-bearing models; dense-only intermediate buffers
+            // (_gpuFfnGateBufDense2 etc.) are MoE-skip.
+            if (_gpuHidden2      is { } h2) _gpu.Free(h2);
+            if (_gpuResidual2    is { } r2) _gpu.Free(r2);
+            if (_gpuNormBuf2     is { } n2) _gpu.Free(n2);
+            if (_gpuLogits2      is { } l2) _gpu.Free(l2);
+            if (_gpuLastHiddenT1 is { } lh1) _gpu.Free(lh1);
+            // Pinned (issues #48/#49).
+            if (_cpuNormBuf2   != null) CudaBackend.FreePinnedHost((nint)_cpuNormBuf2);
+            if (_cpuMoeHidden2 != null) CudaBackend.FreePinnedHost((nint)_cpuMoeHidden2);
+            if (_lastHiddenT1  != null) CudaBackend.FreePinnedHost((nint)_lastHiddenT1);
             if (!_hp.IsMoE)
             {
-                if (_gpuHidden2      is { } h2) _gpu.Free(h2);
-                if (_gpuResidual2    is { } r2) _gpu.Free(r2);
-                if (_gpuNormBuf2     is { } n2) _gpu.Free(n2);
-                if (_gpuLogits2      is { } l2) _gpu.Free(l2);
-                if (_gpuLastHiddenT1 is { } lh1) _gpu.Free(lh1);
                 if (_gpuFfnGateBufDense2 is { } gB2) _gpu.Free(gB2);
                 if (_gpuFfnUpBufDense2   is { } uB2) _gpu.Free(uB2);
-                if (_cpuNormBuf2   != null) NativeMemory.Free(_cpuNormBuf2);
-                if (_cpuMoeHidden2 != null) NativeMemory.Free(_cpuMoeHidden2);
-                if (_lastHiddenT1  != null) NativeMemory.Free(_lastHiddenT1);
                 if (_cpuFfnGateBuf2 != null) NativeMemory.Free(_cpuFfnGateBuf2);
                 if (_cpuFfnUpBuf2   != null) NativeMemory.Free(_cpuFfnUpBuf2);
                 if (_batchSnapshotBuf != null)
