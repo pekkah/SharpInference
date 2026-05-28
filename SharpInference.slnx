@@ -6,6 +6,7 @@
   <Folder Name="/benchmarks/">
     <Project Path="benchmarks/SharpInference.Bench/SharpInference.Bench.csproj" />
     <Project Path="benchmarks/SharpInference.ImageBench/SharpInference.ImageBench.csproj" />
+    <Project Path="benchmarks/SnapKvEval/SnapKvEval.csproj" />
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/SharpInference/SharpInference.csproj" />
