@@ -148,12 +148,45 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [Description("Maximum reasoning tokens before forcing </think>. 0 = unlimited (default). Not honored on the speculative-decode path.")]
         [DefaultValue(0)]
         public int MaxThinkingTokens { get; init; }
+
+        // ── MoE expert-cache tuning (offloaded MoE models; also settable via env vars) ──
+        [CommandOption("--moe-warmpin")]
+        [Description("MoE: pin the top-N hottest experts per layer into the GPU expert cache after warmup (0 = off, default). Also settable via SHARPI_MOE_WARMPIN.")]
+        [DefaultValue(0)]
+        public int MoeWarmPin { get; init; }
+
+        [CommandOption("--moe-warmpin-after")]
+        [Description("MoE: expert accesses to observe before warm-pinning selects the hot set (default 512). Only used with --moe-warmpin. Also settable via SHARPI_MOE_WARMPIN_AFTER.")]
+        [DefaultValue(0)]
+        public long MoeWarmPinAfter { get; init; }
+
+        [CommandOption("--moe-predict-prefetch")]
+        [Description("MoE: enable next-layer predictive expert prefetch (Vulkan backend; default off). Also settable via SHARPI_MOE_PREDICT_PREFETCH=1.")]
+        [DefaultValue(false)]
+        public bool MoePredictPrefetch { get; init; }
+
+        [CommandOption("--expert-stats")]
+        [Description("MoE: write GPU expert-cache (SLRU) hit-rate stats to this file on exit. Also settable via SHARPI_EXPERT_STATS.")]
+        public string? ExpertStatsPath { get; init; }
     }
 
     protected override int Execute(CommandContext context, Settings settings, CancellationToken cancellation)
     {
         if (settings.MinBatchBlas > 0)
             SimdKernels.MinBatchForBlas = settings.MinBatchBlas;
+
+        // MoE expert-cache knobs are read from the environment inside the engine
+        // (WarmPinConfig / HybridForwardPass / slot-manager dispose). Surface them as
+        // CLI flags by setting the env var here — before any forward pass is built —
+        // so an explicit flag overrides, and env-only use still works.
+        if (settings.MoeWarmPin > 0)
+            Environment.SetEnvironmentVariable("SHARPI_MOE_WARMPIN", settings.MoeWarmPin.ToString());
+        if (settings.MoeWarmPinAfter > 0)
+            Environment.SetEnvironmentVariable("SHARPI_MOE_WARMPIN_AFTER", settings.MoeWarmPinAfter.ToString());
+        if (settings.MoePredictPrefetch)
+            Environment.SetEnvironmentVariable("SHARPI_MOE_PREDICT_PREFETCH", "1");
+        if (!string.IsNullOrEmpty(settings.ExpertStatsPath))
+            Environment.SetEnvironmentVariable("SHARPI_EXPERT_STATS", settings.ExpertStatsPath);
 
         var modelPath = settings.ModelPath;
         if (modelPath is null)
