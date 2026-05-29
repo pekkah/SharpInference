@@ -97,6 +97,30 @@ public sealed unsafe class HybridForwardPass : IForwardPass
     // ── Expert slot cache (for MoE GPU layers with lazy/evictable expert loading) ──
     private ExpertSlotManager? _expertSlotManager;
     private MoEPrefetcher? _prefetcher;
+    // Next-layer predictive prefetch: records each layer's expert selection and prefetches
+    // the next GPU MoE layer's likely experts a layer ahead. ON by default (it only makes
+    // the already-on background prefetch smarter, and is a no-op when experts aren't being
+    // evicted); disable with SHARPI_MOE_PREDICT_PREFETCH=0 (or --no-moe-predict-prefetch).
+    private readonly ExpertRoutePredictor? _routePredictor;
+    private readonly bool _predictPrefetch = ParsePredictPrefetchFlag();
+
+    private static bool ParsePredictPrefetchFlag()
+    {
+        var s = Environment.GetEnvironmentVariable("SHARPI_MOE_PREDICT_PREFETCH");
+        if (string.IsNullOrEmpty(s)) return true; // default on
+        switch (s.Trim().ToLowerInvariant())
+        {
+            case "0": case "false": case "off": case "no": case "disabled":
+                return false;
+            case "1": case "true": case "on": case "yes": case "enabled":
+                return true;
+            default:
+                Console.Error.WriteLine(
+                    $"[HybridForwardPass] SHARPI_MOE_PREDICT_PREFETCH='{s}' not recognized; defaulting to ON. " +
+                    "Accepted: 1/0, true/false, on/off, yes/no (case-insensitive).");
+                return true;
+        }
+    }
     // Pinned host-visible GPU tensor for uploading CPU fallback contributions to GPU hidden state.
     private Tensor? _gpuFallbackContrib;
     // Pinned host-visible GPU tensor for reading the norm buffer on CPU without a separate Download.
@@ -330,6 +354,8 @@ public sealed unsafe class HybridForwardPass : IForwardPass
                 : totalExperts;
             _expertSlotManager = new ExpertSlotManager(gpu, model, hp, capacity, _gpuWeightDTypes);
             _prefetcher = new MoEPrefetcher(_expertSlotManager);
+            if (_predictPrefetch)
+                _routePredictor = new ExpertRoutePredictor(_nGpuLayers, hp.NumActiveExperts);
             _gpuFallbackContrib = gpu.AllocatePinned(TensorShape.D1(_embDim));
             _gpuPinnedNorm      = gpu.AllocatePinned(TensorShape.D1(_embDim));
             Console.Error.WriteLine($"[HybridForwardPass] MoE expert slot cache: {capacity} slots ({hp.NumExperts} experts × {_nGpuLayers} layers), SLRU lazy-load.");
@@ -613,6 +639,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             _cpuTqKvCache.Reset();
         else
             _cpuKvCache.Reset();
+        _routePredictor?.Reset();
     }
 
     /// <inheritdoc/>
@@ -1321,8 +1348,10 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         // is idle (between EndRecordAndSubmit and the next BeginRecord).
         // Their weighted outputs are accumulated in _cpuFallbackBuf and
         // uploaded to the pre-allocated pinned tensor for GPU AddInPlace.
-        // Prefetch the same experts for the next token (1-token lookahead).
-        _prefetcher?.EnqueuePrefetch(layer, selectedExperts);
+
+        // Look up current-layer experts FIRST. TryGetCached promotes hits from
+        // probationary to protected, so the slots needed for this token are
+        // safe from the prefetcher's next Preload eviction below.
         Span<bool> isGpu = stackalloc bool[numActive];
         // ExpertGpuSlot contains Tensor (managed reference type fields) — heap-allocate.
         ExpertGpuSlot[] cachedSlots = new ExpertGpuSlot[numActive];
@@ -1332,6 +1361,23 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         {
             isGpu[i] = _expertSlotManager!.TryGetCached(layer, selectedExperts[i], out cachedSlots[i]);
             if (!isGpu[i]) hasCpuFallback = true;
+        }
+
+        // Now enqueue prefetches. Order matters: the worker thread may race ahead
+        // and evict probationary slots — by promoting current-layer slots first
+        // (above), a next-layer prefetch can't evict what this token needs.
+        // Same-layer 1-token-ahead prefetch (cheap, always on).
+        _prefetcher?.EnqueuePrefetch(layer, selectedExperts);
+
+        // ── Next-layer predictive prefetch (opt-in) ──
+        // Record this layer's selection, then prefetch the *next* GPU MoE layer's likely
+        // experts (its previous-token selection) so they load while this layer finishes —
+        // a full layer of lead time. Best-effort: wrong guesses only waste a transfer.
+        if (_routePredictor is not null)
+        {
+            _routePredictor.Record(layer, selectedExperts);
+            if (layer + 1 < _nGpuLayers && _routePredictor.TryPredict(layer + 1, out var nextExperts))
+                _prefetcher?.EnqueuePrefetch(layer + 1, nextExperts);
         }
 
         if (hasCpuFallback)
@@ -1671,7 +1717,26 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         _cpuKvCache.Dispose();
         _cpuTqKvCache?.Dispose();
         _prefetcher?.Dispose();
-        _expertSlotManager?.Dispose();
+        if (_expertSlotManager is not null)
+        {
+            // SHARPI_EXPERT_STATS=<path>: parity with the CUDA hybrid forward passes
+            // (CudaHybridForwardPass/CudaHybridGdnForwardPass) so the CLI flag works
+            // on every MoE backend, not just CUDA.
+            var statsPath = Environment.GetEnvironmentVariable("SHARPI_EXPERT_STATS");
+            if (!string.IsNullOrEmpty(statsPath))
+            {
+                try
+                {
+                    using var w = new StreamWriter(statsPath);
+                    _expertSlotManager.Profiler.PrintStats(w);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[HybridForwardPass] Failed to write expert stats to {statsPath}: {ex.Message}");
+                }
+            }
+            _expertSlotManager.Dispose();
+        }
         if (_gpuFallbackContrib is not null) _gpu.Free(_gpuFallbackContrib);
         if (_gpuPinnedNorm is not null) _gpu.Free(_gpuPinnedNorm);
     }

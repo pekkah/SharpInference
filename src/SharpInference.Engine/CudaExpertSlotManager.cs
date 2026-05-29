@@ -33,6 +33,12 @@ public sealed class CudaExpertSlotManager : IDisposable
     private readonly object _lock = new();
     private bool _disposed;
 
+    // Opt-in warm-pinning of hot experts (SHARPI_MOE_WARMPIN=N). Disabled by default.
+    private readonly int _warmPinPerLayer;
+    private readonly long _warmPinAfter;
+    private readonly int _pinBudget;
+    private bool _warmed;
+
     public ExpertAccessProfiler Profiler => _profiler;
 
     /// <param name="gpu">CUDA backend to allocate/free GPU tensors on.</param>
@@ -55,7 +61,13 @@ public sealed class CudaExpertSlotManager : IDisposable
         _hp = hp;
         _dtypes = dtypes;
         _profiler = new ExpertAccessProfiler(hp.NumLayers, hp.NumExperts);
-        _cache = new ExpertCache<ExpertCudaSlot>(slotCapacity, EvictSlot);
+        // Frequency-aware eviction: under MoE routing skew, the least-accessed
+        // probationary expert is a better victim than the strict LRU tail.
+        _cache = new ExpertCache<ExpertCudaSlot>(slotCapacity, EvictSlot,
+            frequencyOf: _profiler.GetAccessCount);
+        _warmPinPerLayer = WarmPinConfig.PerLayer;
+        _warmPinAfter = WarmPinConfig.AfterAccesses;
+        _pinBudget = Math.Max(1, slotCapacity / 2); // never pin more than half the cache
     }
 
     /// <summary>
@@ -86,7 +98,38 @@ public sealed class CudaExpertSlotManager : IDisposable
             _profiler.RecordMiss(layer, expertId);
             slot = UploadExpert(layer, expertId);
             _cache.Put(layer, expertId, slot);
+            MaybeWarmPin();
             return slot;
+        }
+    }
+
+    /// <summary>
+    /// Once enough routing history has accumulated, pin the hottest currently-resident
+    /// experts (top <c>SHARPI_MOE_WARMPIN</c> per layer) into the protected segment so
+    /// they are never evicted. No-op unless warm-pinning is enabled. Runs once, under
+    /// the caller's lock. Layers are visited in descending hotness so a tight pin
+    /// budget protects the layers that route most often, not whatever happens to sit
+    /// at low indices (matters for hybrid GDN+MoE models where MoE FFN sits at high
+    /// layer indices).
+    /// </summary>
+    private void MaybeWarmPin()
+    {
+        if (_warmed || _warmPinPerLayer <= 0) return;
+        if (_profiler.TotalHits + _profiler.TotalMisses < _warmPinAfter) return;
+        _warmed = true;
+        var layerOrder = new int[_hp.NumLayers];
+        for (int l = 0; l < _hp.NumLayers; l++) layerOrder[l] = l;
+        Array.Sort(layerOrder, (a, b) => _profiler.GetLayerAccessCount(b).CompareTo(_profiler.GetLayerAccessCount(a)));
+        int pinned = 0;
+        foreach (int layer in layerOrder)
+        {
+            if (pinned >= _pinBudget) break;
+            if (_profiler.GetLayerAccessCount(layer) == 0) break;
+            foreach (int e in _profiler.GetTopExperts(layer, _warmPinPerLayer))
+            {
+                if (pinned >= _pinBudget) break;
+                if (_cache.Contains(layer, e)) { _cache.Pin(layer, e); pinned++; }
+            }
         }
     }
 

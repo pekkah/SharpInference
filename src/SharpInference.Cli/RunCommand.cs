@@ -148,12 +148,47 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [Description("Maximum reasoning tokens before forcing </think>. 0 = unlimited (default). Not honored on the speculative-decode path.")]
         [DefaultValue(0)]
         public int MaxThinkingTokens { get; init; }
+
+        // ── MoE expert-cache tuning (offloaded MoE models) ──
+        // Good defaults are automatic: frequency-aware SLRU eviction, VRAM-sized cache,
+        // and next-layer predictive prefetch are all ON without any flag. These knobs only
+        // tune/disable that behaviour. Each is also settable via the named env var.
+        [CommandOption("--no-moe-predict-prefetch")]
+        [Description("MoE: disable next-layer predictive expert prefetch (Vulkan; on by default). Env: SHARPI_MOE_PREDICT_PREFETCH=0.")]
+        [DefaultValue(false)]
+        public bool NoMoePredictPrefetch { get; init; }
+
+        [CommandOption("--moe-warmpin")]
+        [Description("MoE: also pin the top-N hottest experts per layer into the GPU cache after warmup (default 0 = off; frequency-aware eviction already retains hot experts). Env: SHARPI_MOE_WARMPIN.")]
+        public int? MoeWarmPin { get; init; }
+
+        [CommandOption("--moe-warmpin-after")]
+        [Description("MoE: expert accesses to observe before warm-pinning selects the hot set (default 512). Only used with --moe-warmpin. Env: SHARPI_MOE_WARMPIN_AFTER.")]
+        [DefaultValue(0L)]
+        public long MoeWarmPinAfter { get; init; }
+
+        [CommandOption("--expert-stats")]
+        [Description("MoE: write GPU expert-cache (SLRU) hit-rate stats to this file on exit. Env: SHARPI_EXPERT_STATS.")]
+        public string? ExpertStatsPath { get; init; }
     }
 
     protected override int Execute(CommandContext context, Settings settings, CancellationToken cancellation)
     {
         if (settings.MinBatchBlas > 0)
             SimdKernels.MinBatchForBlas = settings.MinBatchBlas;
+
+        // MoE expert-cache knobs are read from the environment inside the engine
+        // (WarmPinConfig / HybridForwardPass / slot-manager dispose). Surface them as
+        // CLI flags by setting the env var here — before any forward pass is built —
+        // so an explicit flag overrides, and env-only use still works.
+        if (settings.MoeWarmPin is int warmPin)  // explicitly passed (incl. 0 to force off)
+            Environment.SetEnvironmentVariable("SHARPI_MOE_WARMPIN", warmPin.ToString());
+        if (settings.MoeWarmPinAfter > 0)
+            Environment.SetEnvironmentVariable("SHARPI_MOE_WARMPIN_AFTER", settings.MoeWarmPinAfter.ToString());
+        if (settings.NoMoePredictPrefetch)
+            Environment.SetEnvironmentVariable("SHARPI_MOE_PREDICT_PREFETCH", "0");
+        if (!string.IsNullOrEmpty(settings.ExpertStatsPath))
+            Environment.SetEnvironmentVariable("SHARPI_EXPERT_STATS", settings.ExpertStatsPath);
 
         var modelPath = settings.ModelPath;
         if (modelPath is null)
@@ -275,8 +310,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 case "":
                     // Auto: pick CUDA when available. CudaForwardPass handles full-offload
                     // (dense + MoE); CudaHybridForwardPass handles partial-offload (dense or
-                    // MoE with eager per-layer expert loading). TQ on CUDA requires
-                    // head_dim ∈ {128, 256}.
+                    // MoE; routed experts stream through the CudaExpertSlotManager SLRU).
+                    // TQ on CUDA requires head_dim ∈ {128, 256}.
                     bool tqHeadDimOk = hp.HeadDim is 128 or 256;
                     wantCuda = (!settings.TurboQuant || tqHeadDimOk)
                         && CudaBackend.IsAvailable();

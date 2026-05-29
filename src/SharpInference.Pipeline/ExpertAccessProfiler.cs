@@ -64,6 +64,34 @@ public sealed class ExpertAccessProfiler
     }
 
     /// <summary>
+    /// Total access count (hits + misses) for one expert. Used as the popularity
+    /// signal for frequency-aware cache eviction.
+    /// </summary>
+    public long GetAccessCount(int layer, int expertId)
+    {
+        int i = layer * _numExperts + expertId;
+        return Interlocked.Read(ref _hits[i]) + Interlocked.Read(ref _misses[i]);
+    }
+
+    /// <summary>
+    /// Total access count for a whole layer (sum across experts). Used to rank
+    /// layers by hotness so warm-pinning budgets the hottest layers first instead
+    /// of iterating in layer-index order (which biases pins to low-index layers
+    /// for hybrid GDN+MoE models that cluster MoE FFN at high indices).
+    /// </summary>
+    public long GetLayerAccessCount(int layer)
+    {
+        long total = 0;
+        int offset = layer * _numExperts;
+        for (int e = 0; e < _numExperts; e++)
+        {
+            total += Interlocked.Read(ref _hits[offset + e]);
+            total += Interlocked.Read(ref _misses[offset + e]);
+        }
+        return total;
+    }
+
+    /// <summary>
     /// Returns the <paramref name="n"/> most-accessed expert IDs for <paramref name="layer"/>,
     /// sorted descending by total access count (hits + misses).
     /// </summary>
@@ -94,7 +122,22 @@ public sealed class ExpertAccessProfiler
 
         for (int layer = 0; layer < _numLayers; layer++)
         {
-            double lr = GetLayerHitRate(layer);
+            long lh = 0, lm = 0;
+            int offset = layer * _numExperts;
+            for (int e = 0; e < _numExperts; e++)
+            {
+                lh += Interlocked.Read(ref _hits[offset + e]);
+                lm += Interlocked.Read(ref _misses[offset + e]);
+            }
+            // Layers that never report into the profiler (CPU-resident under hybrid
+            // offload, or non-MoE layers) have zero counts. Skip the bogus 0.0 % +
+            // arbitrary "top expert" output that would come from sorting equal zeros.
+            if (lh + lm == 0)
+            {
+                sb.AppendLine($"  layer {layer,3}: (no GPU SLRU accesses recorded)");
+                continue;
+            }
+            double lr = (double)lh / (lh + lm);
             var top = GetTopExperts(layer, 3);
             string topStr = string.Join(", ", top);
             sb.AppendLine($"  layer {layer,3}: hit {lr:P1}  top experts: [{topStr}]");
