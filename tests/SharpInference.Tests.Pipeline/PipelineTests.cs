@@ -236,5 +236,53 @@ public sealed class PipelineTests
         Assert.NotNull(evicted);
         Assert.NotEqual("hot", evicted); // the hot expert is retained
     }
+
+    // ── Predictive prefetch: ExpertRoutePredictor ───────────────────────────
+
+    [Fact]
+    public void ExpertRoutePredictor_UnseenLayer_PredictsNothing()
+    {
+        var p = new SharpInference.Pipeline.ExpertRoutePredictor(numLayers: 4, maxActiveExperts: 8);
+        Assert.False(p.TryPredict(0, out _));
+    }
+
+    [Fact]
+    public void ExpertRoutePredictor_RecallsLastSelection()
+    {
+        var p = new SharpInference.Pipeline.ExpertRoutePredictor(numLayers: 4, maxActiveExperts: 8);
+        p.Record(2, stackalloc int[] { 5, 9, 13 });
+        Assert.True(p.TryPredict(2, out var pred));
+        Assert.Equal(new[] { 5, 9, 13 }, pred.ToArray());
+        Assert.False(p.TryPredict(3, out _)); // independent per layer
+    }
+
+    [Fact]
+    public void ExpertRoutePredictor_LatestRecordWins()
+    {
+        var p = new SharpInference.Pipeline.ExpertRoutePredictor(numLayers: 2, maxActiveExperts: 4);
+        p.Record(0, stackalloc int[] { 1, 2 });
+        p.Record(0, stackalloc int[] { 7, 8, 9 }); // next token's selection replaces
+        Assert.True(p.TryPredict(0, out var pred));
+        Assert.Equal(new[] { 7, 8, 9 }, pred.ToArray());
+    }
+
+    [Fact]
+    public void ExpertRoutePredictor_Reset_ClearsHistory()
+    {
+        var p = new SharpInference.Pipeline.ExpertRoutePredictor(numLayers: 2, maxActiveExperts: 4);
+        p.Record(1, stackalloc int[] { 3 });
+        p.Reset();
+        Assert.False(p.TryPredict(1, out _));
+    }
+
+    [Fact]
+    public void ExpertRoutePredictor_ClampsToMaxActive()
+    {
+        var p = new SharpInference.Pipeline.ExpertRoutePredictor(numLayers: 1, maxActiveExperts: 2);
+        p.Record(0, stackalloc int[] { 4, 5, 6, 7 }); // more than maxActive
+        Assert.True(p.TryPredict(0, out var pred));
+        Assert.Equal(2, pred.Length);
+        Assert.Equal(new[] { 4, 5 }, pred.ToArray());
+    }
 }
 

@@ -97,6 +97,12 @@ public sealed unsafe class HybridForwardPass : IForwardPass
     // ── Expert slot cache (for MoE GPU layers with lazy/evictable expert loading) ──
     private ExpertSlotManager? _expertSlotManager;
     private MoEPrefetcher? _prefetcher;
+    // Opt-in next-layer predictive prefetch (SHARPI_MOE_PREDICT_PREFETCH=1). Records each
+    // layer's expert selection and prefetches the next GPU MoE layer's likely experts a
+    // layer ahead. Null/inert unless enabled.
+    private readonly ExpertRoutePredictor? _routePredictor;
+    private readonly bool _predictPrefetch =
+        Environment.GetEnvironmentVariable("SHARPI_MOE_PREDICT_PREFETCH") is "1" or "true";
     // Pinned host-visible GPU tensor for uploading CPU fallback contributions to GPU hidden state.
     private Tensor? _gpuFallbackContrib;
     // Pinned host-visible GPU tensor for reading the norm buffer on CPU without a separate Download.
@@ -330,6 +336,8 @@ public sealed unsafe class HybridForwardPass : IForwardPass
                 : totalExperts;
             _expertSlotManager = new ExpertSlotManager(gpu, model, hp, capacity, _gpuWeightDTypes);
             _prefetcher = new MoEPrefetcher(_expertSlotManager);
+            if (_predictPrefetch)
+                _routePredictor = new ExpertRoutePredictor(_nGpuLayers, hp.NumActiveExperts);
             _gpuFallbackContrib = gpu.AllocatePinned(TensorShape.D1(_embDim));
             _gpuPinnedNorm      = gpu.AllocatePinned(TensorShape.D1(_embDim));
             Console.Error.WriteLine($"[HybridForwardPass] MoE expert slot cache: {capacity} slots ({hp.NumExperts} experts × {_nGpuLayers} layers), SLRU lazy-load.");
@@ -613,6 +621,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             _cpuTqKvCache.Reset();
         else
             _cpuKvCache.Reset();
+        _routePredictor?.Reset();
     }
 
     /// <inheritdoc/>
@@ -1323,6 +1332,17 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         // uploaded to the pre-allocated pinned tensor for GPU AddInPlace.
         // Prefetch the same experts for the next token (1-token lookahead).
         _prefetcher?.EnqueuePrefetch(layer, selectedExperts);
+
+        // ── Next-layer predictive prefetch (opt-in) ──
+        // Record this layer's selection, then prefetch the *next* GPU MoE layer's likely
+        // experts (its previous-token selection) so they load while this layer finishes —
+        // a full layer of lead time. Best-effort: wrong guesses only waste a transfer.
+        if (_routePredictor is not null)
+        {
+            _routePredictor.Record(layer, selectedExperts);
+            if (layer + 1 < _nGpuLayers && _routePredictor.TryPredict(layer + 1, out var nextExperts))
+                _prefetcher?.EnqueuePrefetch(layer + 1, nextExperts);
+        }
         Span<bool> isGpu = stackalloc bool[numActive];
         // ExpertGpuSlot contains Tensor (managed reference type fields) — heap-allocate.
         ExpertGpuSlot[] cachedSlots = new ExpertGpuSlot[numActive];
