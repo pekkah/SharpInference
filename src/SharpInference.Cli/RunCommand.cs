@@ -164,7 +164,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         [CommandOption("--moe-warmpin-after")]
         [Description("MoE: expert accesses to observe before warm-pinning selects the hot set (default 512). Only used with --moe-warmpin. Env: SHARPI_MOE_WARMPIN_AFTER.")]
-        [DefaultValue(0)]
+        [DefaultValue(0L)]
         public long MoeWarmPinAfter { get; init; }
 
         [CommandOption("--expert-stats")]
