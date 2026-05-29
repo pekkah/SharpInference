@@ -226,15 +226,17 @@ public sealed class PipelineTests
         };
         string? evicted = null;
         var cache = new SharpInference.Pipeline.ExpertCache<string>(
-            capacity: 4, onEvict: v => evicted = v,
+            capacity: 8, onEvict: v => evicted = v,
             frequencyOf: (l, e) => accesses.GetValueOrDefault((l, e)));
-        // capacity 4 → probCap=1, protCap=3. Force probationary overflow.
+        // capacity 8 → probCap=2, protCap=6, so "hot" and "cold-a" both fit in
+        // probationary; inserting "cold-b" overflows and must evict the least-accessed
+        // non-head entry — "cold-a" (freq 1), not "hot" (freq 50). With probCap=1 the
+        // head-exclusion alone would force the eviction, never exercising the freq path.
         cache.Put(0, 1, "hot");
         cache.Put(0, 2, "cold-a");
         cache.Put(0, 3, "cold-b");
-        cache.Put(0, 4, "new");   // overflow; least-accessed older non-head evicted
-        Assert.NotNull(evicted);
-        Assert.NotEqual("hot", evicted); // the hot expert is retained
+        Assert.Equal("cold-a", evicted); // least-accessed evicted, not the hot expert
+        Assert.True(cache.Contains(0, 1)); // hot is retained
     }
 
     // ── Predictive prefetch: ExpertRoutePredictor ───────────────────────────

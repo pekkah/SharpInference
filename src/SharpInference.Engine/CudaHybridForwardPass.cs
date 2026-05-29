@@ -37,10 +37,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     private readonly Tensor[] _gpuAttnNorm, _gpuWq, _gpuWk, _gpuWv, _gpuWo;
     private readonly Tensor[] _gpuFfnNorm, _gpuWGate, _gpuWUp, _gpuWDown;
     private readonly Tensor[]? _gpuWGateInp, _gpuWGateShexp, _gpuWUpShexp, _gpuWDownShexp;
-    // Eager per-expert weights for CUDA GPU layers — every expert is VRAM-resident,
-    // so the per-token MoE FFN is a straight indexed lookup. Different from the Vulkan
-    // hybrid's lazy SLRU slot cache: simpler, but the model must fit in VRAM after
-    // accounting for KV cache + scratch.
+    // Attention bias tensors for GPU layers (null when the model has no attention bias).
     private readonly Tensor[]? _gpuBq, _gpuBk, _gpuBv, _gpuBo;
     private readonly Tensor[]? _gpuQNorm, _gpuKNorm;
     private readonly Tensor[] _gpuKCache, _gpuVCache;
@@ -1573,8 +1570,17 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             var statsPath = Environment.GetEnvironmentVariable("SHARPI_EXPERT_STATS");
             if (!string.IsNullOrEmpty(statsPath))
             {
-                using var w = new StreamWriter(statsPath);
-                _expertSlotManager.Profiler.PrintStats(w);
+                // Diagnostic-only: a write failure must never skip the slot manager's
+                // Dispose below (which frees GPU tensors), so swallow + log.
+                try
+                {
+                    using var w = new StreamWriter(statsPath);
+                    _expertSlotManager.Profiler.PrintStats(w);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[CudaHybridForwardPass] Failed to write expert stats to {statsPath}: {ex.Message}");
+                }
             }
             _expertSlotManager.Dispose();
         }
