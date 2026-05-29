@@ -97,12 +97,13 @@ public sealed unsafe class HybridForwardPass : IForwardPass
     // ── Expert slot cache (for MoE GPU layers with lazy/evictable expert loading) ──
     private ExpertSlotManager? _expertSlotManager;
     private MoEPrefetcher? _prefetcher;
-    // Opt-in next-layer predictive prefetch (SHARPI_MOE_PREDICT_PREFETCH=1). Records each
-    // layer's expert selection and prefetches the next GPU MoE layer's likely experts a
-    // layer ahead. Null/inert unless enabled.
+    // Next-layer predictive prefetch: records each layer's expert selection and prefetches
+    // the next GPU MoE layer's likely experts a layer ahead. ON by default (it only makes
+    // the already-on background prefetch smarter, and is a no-op when experts aren't being
+    // evicted); disable with SHARPI_MOE_PREDICT_PREFETCH=0 (or --no-moe-predict-prefetch).
     private readonly ExpertRoutePredictor? _routePredictor;
     private readonly bool _predictPrefetch =
-        Environment.GetEnvironmentVariable("SHARPI_MOE_PREDICT_PREFETCH") is "1" or "true";
+        Environment.GetEnvironmentVariable("SHARPI_MOE_PREDICT_PREFETCH") is not ("0" or "false" or "off");
     // Pinned host-visible GPU tensor for uploading CPU fallback contributions to GPU hidden state.
     private Tensor? _gpuFallbackContrib;
     // Pinned host-visible GPU tensor for reading the norm buffer on CPU without a separate Download.

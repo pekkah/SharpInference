@@ -149,24 +149,26 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [DefaultValue(0)]
         public int MaxThinkingTokens { get; init; }
 
-        // ── MoE expert-cache tuning (offloaded MoE models; also settable via env vars) ──
+        // ── MoE expert-cache tuning (offloaded MoE models) ──
+        // Good defaults are automatic: frequency-aware SLRU eviction, VRAM-sized cache,
+        // and next-layer predictive prefetch are all ON without any flag. These knobs only
+        // tune/disable that behaviour. Each is also settable via the named env var.
+        [CommandOption("--no-moe-predict-prefetch")]
+        [Description("MoE: disable next-layer predictive expert prefetch (Vulkan; on by default). Env: SHARPI_MOE_PREDICT_PREFETCH=0.")]
+        [DefaultValue(false)]
+        public bool NoMoePredictPrefetch { get; init; }
+
         [CommandOption("--moe-warmpin")]
-        [Description("MoE: pin the top-N hottest experts per layer into the GPU expert cache after warmup (0 = off, default). Also settable via SHARPI_MOE_WARMPIN.")]
-        [DefaultValue(0)]
-        public int MoeWarmPin { get; init; }
+        [Description("MoE: also pin the top-N hottest experts per layer into the GPU cache after warmup (default 0 = off; frequency-aware eviction already retains hot experts). Env: SHARPI_MOE_WARMPIN.")]
+        public int? MoeWarmPin { get; init; }
 
         [CommandOption("--moe-warmpin-after")]
-        [Description("MoE: expert accesses to observe before warm-pinning selects the hot set (default 512). Only used with --moe-warmpin. Also settable via SHARPI_MOE_WARMPIN_AFTER.")]
+        [Description("MoE: expert accesses to observe before warm-pinning selects the hot set (default 512). Only used with --moe-warmpin. Env: SHARPI_MOE_WARMPIN_AFTER.")]
         [DefaultValue(0)]
         public long MoeWarmPinAfter { get; init; }
 
-        [CommandOption("--moe-predict-prefetch")]
-        [Description("MoE: enable next-layer predictive expert prefetch (Vulkan backend; default off). Also settable via SHARPI_MOE_PREDICT_PREFETCH=1.")]
-        [DefaultValue(false)]
-        public bool MoePredictPrefetch { get; init; }
-
         [CommandOption("--expert-stats")]
-        [Description("MoE: write GPU expert-cache (SLRU) hit-rate stats to this file on exit. Also settable via SHARPI_EXPERT_STATS.")]
+        [Description("MoE: write GPU expert-cache (SLRU) hit-rate stats to this file on exit. Env: SHARPI_EXPERT_STATS.")]
         public string? ExpertStatsPath { get; init; }
     }
 
@@ -179,12 +181,12 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         // (WarmPinConfig / HybridForwardPass / slot-manager dispose). Surface them as
         // CLI flags by setting the env var here — before any forward pass is built —
         // so an explicit flag overrides, and env-only use still works.
-        if (settings.MoeWarmPin > 0)
-            Environment.SetEnvironmentVariable("SHARPI_MOE_WARMPIN", settings.MoeWarmPin.ToString());
+        if (settings.MoeWarmPin is int warmPin)  // explicitly passed (incl. 0 to force off)
+            Environment.SetEnvironmentVariable("SHARPI_MOE_WARMPIN", warmPin.ToString());
         if (settings.MoeWarmPinAfter > 0)
             Environment.SetEnvironmentVariable("SHARPI_MOE_WARMPIN_AFTER", settings.MoeWarmPinAfter.ToString());
-        if (settings.MoePredictPrefetch)
-            Environment.SetEnvironmentVariable("SHARPI_MOE_PREDICT_PREFETCH", "1");
+        if (settings.NoMoePredictPrefetch)
+            Environment.SetEnvironmentVariable("SHARPI_MOE_PREDICT_PREFETCH", "0");
         if (!string.IsNullOrEmpty(settings.ExpertStatsPath))
             Environment.SetEnvironmentVariable("SHARPI_EXPERT_STATS", settings.ExpertStatsPath);
 
