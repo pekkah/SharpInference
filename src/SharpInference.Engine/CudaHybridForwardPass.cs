@@ -340,20 +340,22 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         // streaming instead of an OOM.
         if (_isMoE && _nGpuLayers > 0)
         {
-            int totalGpuExperts = _nGpuLayers * hp.NumExperts;
             long perExpert = PerExpertBytes();
             long reserve = 512L << 20; // 512 MiB headroom for transient per-GEMM scratch
             long free = (long)gpu.FreeVramBytes;
-            int byBudget = perExpert > 0
-                ? (int)Math.Max(0, (free - reserve) / perExpert)
-                : totalGpuExperts;
-            int floor = Math.Min(totalGpuExperts, 64);
-            int capacity = Math.Clamp(byBudget, floor, totalGpuExperts);
+            var plan = MoeCacheSizing.Plan(_nGpuLayers, hp.NumExperts, hp.NumActiveExperts,
+                free, perExpert, reserve);
+            int totalGpuExperts = _nGpuLayers * hp.NumExperts;
             Console.Error.WriteLine(
-                $"[CudaHybridForwardPass] SLRU expert cache: {capacity} slots / {totalGpuExperts} total " +
+                $"[CudaHybridForwardPass] SLRU expert cache: {plan.Slots} slots / {totalGpuExperts} total " +
                 $"({hp.NumExperts} experts × {_nGpuLayers} GPU layers, per-expert ≈ {perExpert / 1024} KiB, " +
                 $"free VRAM ≈ {free / (1024 * 1024)} MiB).");
-            _expertSlotManager = new CudaExpertSlotManager(gpu, model, hp, capacity, _gpuWeightDTypes);
+            if (plan.Slots < plan.RecommendedSlots)
+                Console.Error.WriteLine(
+                    $"[CudaHybridForwardPass] note: cache ({plan.Slots}) is below the routing-locality " +
+                    $"sweet spot (~{plan.RecommendedSlots} = 2× active per layer); expert hit rate may suffer. " +
+                    $"Fewer GPU layers (-g) or more VRAM would help.");
+            _expertSlotManager = new CudaExpertSlotManager(gpu, model, hp, plan.Slots, _gpuWeightDTypes);
         }
 
         // ── Resolve CPU weights (layers nGpuLayers..numLayers-1) ──

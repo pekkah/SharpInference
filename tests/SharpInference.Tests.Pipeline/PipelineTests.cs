@@ -284,5 +284,68 @@ public sealed class PipelineTests
         Assert.Equal(2, pred.Length);
         Assert.Equal(new[] { 4, 5 }, pred.ToArray());
     }
+
+    // ── Model-aware cache sizing: MoeCacheSizing ────────────────────────────
+
+    [Fact]
+    public void MoeCacheSizing_AmpleVram_CapsAtTotalExperts()
+    {
+        // 8 layers × 64 experts = 512; ample free VRAM → capacity == total.
+        var plan = SharpInference.Pipeline.MoeCacheSizing.Plan(
+            gpuLayers: 8, numExperts: 64, numActiveExperts: 8,
+            freeVramBytes: 100L << 30, perExpertBytes: 2L << 20, reserveBytes: 512L << 20);
+        Assert.Equal(512, plan.Slots);
+        Assert.True(plan.BudgetSlots >= 512);
+    }
+
+    [Fact]
+    public void MoeCacheSizing_TightVram_NeverExceedsBudget()
+    {
+        // Only ~50 experts' worth of VRAM free → capacity bounded by budget, not total.
+        long perExpert = 2L << 20;
+        long free = (512L << 20) + 50 * perExpert; // reserve + 50 experts
+        var plan = SharpInference.Pipeline.MoeCacheSizing.Plan(
+            gpuLayers: 8, numExperts: 64, numActiveExperts: 8,
+            freeVramBytes: free, perExpertBytes: perExpert, reserveBytes: 512L << 20);
+        Assert.Equal(50, plan.Slots);              // exactly what fits
+        Assert.True(plan.Slots <= plan.BudgetSlots);
+    }
+
+    [Fact]
+    public void MoeCacheSizing_RecommendedIsTwiceActivePerLayer()
+    {
+        var plan = SharpInference.Pipeline.MoeCacheSizing.Plan(
+            gpuLayers: 8, numExperts: 64, numActiveExperts: 8,
+            freeVramBytes: 100L << 30, perExpertBytes: 2L << 20, reserveBytes: 512L << 20);
+        Assert.Equal(8 * 2 * 8, plan.RecommendedSlots); // 8 layers × 2×8 active = 128
+    }
+
+    [Fact]
+    public void MoeCacheSizing_TightVram_FlagsBelowRecommended()
+    {
+        long perExpert = 2L << 20;
+        long free = (512L << 20) + 50 * perExpert;
+        var plan = SharpInference.Pipeline.MoeCacheSizing.Plan(
+            gpuLayers: 8, numExperts: 64, numActiveExperts: 8,
+            freeVramBytes: free, perExpertBytes: perExpert, reserveBytes: 512L << 20);
+        Assert.True(plan.Slots < plan.RecommendedSlots); // 50 < 128 → caller warns
+    }
+
+    [Fact]
+    public void MoeCacheSizing_RecommendedCappedAtTotal_WhenFewExperts()
+    {
+        // 2× active (16) exceeds numExperts (8) → recommended per layer capped at numExperts.
+        var plan = SharpInference.Pipeline.MoeCacheSizing.Plan(
+            gpuLayers: 4, numExperts: 8, numActiveExperts: 8,
+            freeVramBytes: 100L << 30, perExpertBytes: 1L << 20, reserveBytes: 0);
+        Assert.Equal(4 * 8, plan.RecommendedSlots); // capped at total, not 4×16
+    }
+
+    [Fact]
+    public void MoeCacheSizing_ZeroLayers_ReturnsZero()
+    {
+        var plan = SharpInference.Pipeline.MoeCacheSizing.Plan(0, 64, 8, 1L << 30, 1L << 20, 0);
+        Assert.Equal(0, plan.Slots);
+    }
 }
 
