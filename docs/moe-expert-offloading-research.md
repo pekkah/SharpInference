@@ -15,29 +15,47 @@ SOTA ideas — an SLRU expert cache, an async prefetcher, CPU-fallback compute o
 cache miss (the core "Fiddler" trick), and per-expert access profiling. That
 puts us ahead of naive "swap on demand" systems.
 
-But the audit found three things worth knowing:
+The implementation is uneven across paths. The audit found:
 
-1. **The CUDA hybrid path doesn't actually use the cache.** It statically
-   uploads *every* expert of every GPU-tier layer to VRAM as **F32** and computes
-   them resident. The `ExpertSlotManager`/`MoEPrefetcher` fields exist but are
-   never assigned — dead code on the CUDA path. So on CUDA we are effectively
-   doing llama.cpp's static `--cpu-moe` split, not dynamic offloading, and paying
-   a 4×–8× VRAM premium by storing experts dequantized.
-2. **Prefetching is reactive, not predictive.** The Vulkan path re-enqueues the
+1. **Per-expert SLRU offloading exists on two of three hybrid paths, but not the
+   third.** The **GDN CUDA path** (`CudaHybridGdnForwardPass`, used for
+   qwen35moe) and the **Vulkan path** (`HybridForwardPass`) both stream experts
+   through the SLRU cache (`CudaExpertSlotManager.GetOrLoad` /
+   `ExpertSlotManager.TryGetCached`) with CPU-fallback compute on miss. But the
+   **non-GDN CUDA hybrid path** (`CudaHybridForwardPass`, used for Mixtral /
+   Qwen3-30B-A3B / Qwen3-Coder when they don't fit VRAM) does **whole-layer**
+   offload only: every expert of a GPU-tier layer is uploaded resident, and its
+   `_expertSlotManager`/`_prefetcher` fields are declared but never assigned (dead
+   code). So for the big non-GDN MoEs, a "GPU layer" must hold its *entire* expert
+   set in VRAM — there is no per-expert streaming, only the coarse CPU-layer /
+   GPU-layer split that `TierPlanner` decides.
+2. **Cached experts are quantized — except Q5_K in two spots.** Good news first:
+   experts are cached in native quant (Q4_K/Q6_K everywhere; Q5_K too on
+   `CudaExpertSlotManager`), so we are *not* generally paying an F32 premium. But
+   the **Vulkan `ExpertSlotManager`** and the non-GDN CUDA resident path
+   **dequantize Q5_K to F32** (`ExpertSlotManager.cs:156`,
+   `CudaHybridForwardPass.cs:1428`). qwen35moe stores `ffn_down_exps` as Q5_K, so
+   on Vulkan every cached down-projection expert is 4 B/element — 4× its source.
+   `CudaExpertSlotManager` already keeps Q5_K raw (`UploadRaw`); the other two
+   paths just need to mirror it.
+3. **Prefetching is reactive, not predictive.** The Vulkan path re-enqueues the
    experts the router *just* selected, betting the next token reuses them at the
    same layer (1-token, same-layer temporal locality). Every SOTA system instead
-   predicts the *next layer's* or *next token's* experts ahead of time. We
-   capture none of that lookahead.
-3. **Cache placement ignores the profiler we already built.** `TierPlanner`
-   places layers by memory footprint; `ExpertAccessProfiler` tracks hot/cold
-   experts but nothing feeds it back into placement or eviction priority.
+   predicts the *next layer's* or *next token's* experts ahead of time. *(Already
+   tracked as issue #50 — pre-gated / PreScope-style predictive prefetch.)*
+4. **Caching is recency-only; the profiler is diagnostic-only.** The SLRU evicts
+   by recency. `ExpertAccessProfiler` tracks per-expert hit/miss and prints stats
+   (`CudaHybridGdnForwardPass` dump), but nothing feeds hotness back into eviction
+   priority or warm-pins hot experts at load. `TierPlanner` places layers by
+   footprint, not access frequency.
 
-The highest-leverage, lowest-risk wins for our use case are: **(a)** keep cached
-experts quantized instead of F32, **(b)** wire the SLRU cache into the CUDA path
-so it stops being all-resident, **(c)** add cross-layer / next-layer expert
-*prediction* to drive the prefetcher, and **(d)** add a fast CPU expert GEMM path
-(KTransformers-style) so CPU-resident experts are cheap to compute rather than
-something to avoid. Details and priorities in §5.
+The highest-leverage, lowest-risk wins for our use case are: **(a)** bring the
+non-GDN CUDA hybrid path to per-expert SLRU parity with the GDN path (so big
+non-GDN MoEs fit in less VRAM), **(b)** stop dequantizing Q5_K experts on the
+Vulkan/resident paths, **(c)** add next-layer expert *prediction* to drive the
+prefetcher (#50), **(d)** make eviction/placement activation-aware using the
+profiler we already built, and **(e)** a fast CPU expert GEMM (KTransformers-style,
+related to #54). Details and priorities in §5.
 
 ---
 
@@ -66,19 +84,28 @@ Verified against the source on this branch.
   CPU while the GPU is idle** (`GpuMoeFfnCpuFallback`), accumulate, upload, GPU
   `AddInPlace`. This is the Fiddler idea (compute on CPU rather than block on a
   transfer) and is genuinely good.
-- **CUDA hybrid** (`CudaHybridForwardPass.cs`): GPU-tier layers upload **all**
-  experts to VRAM as `Tensor[][] _gpuWGateExps/...` (line ~297) and index them
-  directly (line ~1348); CPU-tier layers compute on CPU (`CpuMoeFfn`). The
+- **CUDA GDN hybrid** (`CudaHybridGdnForwardPass.cs`, for qwen35moe): the most
+  developed path. Experts served by `CudaExpertSlotManager` SLRU
+  (`GetOrLoad`, line ~2257), keeps Q4_K/Q5_K/Q6_K quantized, has a CPU-MoE mode
+  (`SHARPI_CPU_MOE=1`), and dumps `ExpertAccessProfiler` stats on dispose.
+- **CUDA non-GDN hybrid** (`CudaHybridForwardPass.cs`, for Mixtral / Qwen3-MoE /
+  Qwen3-Coder too big for VRAM): GPU-tier layers upload **all** experts to VRAM as
+  `Tensor[][] _gpuWGateExps/...` (line ~297) and index them directly (line ~1348);
+  CPU-tier layers compute on CPU (`CpuMoeFfn`). Offload granularity is the whole
+  layer (`TierPlanner` split) — there is **no per-expert SLRU streaming** here. The
   `_expertSlotManager`/`_prefetcher` fields (lines 108–109) are declared and
-  disposed but **never assigned** → the dynamic cache path is dead here.
+  disposed but **never assigned** → the dynamic cache path is dead on this path.
+  Experts are kept in native quant for Q4_K/Q6_K (line ~1418) but Q5_K is
+  dequantized to F32 (line ~1428).
 
 ### 2.3 Offloading infrastructure (`SharpInference.Pipeline` + Engine)
 - `SlruCache<K,V>` — segmented LRU, 25% probationary / 75% protected, evicts
   probationary tail. `ExpertCache<T>` wraps it keyed by `(layer, expertId)`.
 - `ExpertSlotManager` / `CudaExpertSlotManager` — VRAM expert slot cache;
-  `TryGetCached`, `Preload`, eviction callback frees GPU tensors. **Dequantizes
-  experts to F32 on upload** (`ExpertSlotManager.cs` ~line 136/158) — so a cached
-  expert costs 4 B/element regardless of its Q4_K source.
+  `TryGetCached`/`GetOrLoad`, `Preload`, eviction callback frees GPU tensors.
+  Keeps experts in native quant — **except** the Vulkan `ExpertSlotManager`
+  dequantizes Q5_K (and exotic dtypes) to F32 (`ExpertSlotManager.cs:156`), while
+  `CudaExpertSlotManager` keeps Q4_K/Q5_K/Q6_K all raw (`UploadRaw`, line ~162).
 - `MoEPrefetcher` — bounded channel + background worker calling
   `slotManager.Preload`. Drops oldest when full. Wired **only** in the Vulkan
   path, and only with `EnqueuePrefetch(layer, selectedExperts)` — i.e. the
@@ -177,16 +204,17 @@ Don't pay full precision for cold experts.
 
 | SOTA capability | SharpInference today | Gap |
 |---|---|---|
-| Static hot/cold placement (KTransformers, llama.cpp) | CUDA: all GPU-layer experts resident (F32). Vulkan: SLRU. | CUDA has no offloading at all; neither path uses **profiled hotness** for placement. |
-| Activation-aware caching (MoE-Infinity, HybriMoE) | SLRU (recency only) + unused `ExpertAccessProfiler` | Profiler exists but doesn't drive eviction/placement. SLRU ≠ activation-frequency-aware. |
-| **Predictive prefetch** (Pre-gated, Cross-Layer Gate, ProMoE) | Reactive 1-token, **same-layer** re-enqueue (Vulkan only) | No next-layer or next-token prediction. The single biggest missing idea. |
-| Speculative expert prefetch (MoE-SpeQ, SP-MoE) | none (we have speculative *decoding* for some models, not used for expert prediction) | Not started. Natural extension once a draft model exists. |
-| **Mixed-precision experts** (HOBBIT) | Cached experts dequantized to **F32** | We pay max VRAM/transfer for every cached expert; opposite of SOTA. |
-| Fast CPU expert GEMM (KTransformers AMX) | SIMD `MatVec` (GEMV) CPU fallback | Adequate for single-token, but no AMX / blocked sgemm; CPU is treated as fallback, not a peer compute tier. |
-| Cache-miss substitution (BuddyMoE) | CPU-fallback compute (good!) | We block on CPU compute instead of substituting; fine for single-user, but no redundancy reuse. |
-| Model-aware cache sizing (Local Routing Consistency) | fixed slot capacity | No per-model locality measurement; could size cache ≈2× active experts and skip caching for low-locality models. |
+| Per-expert offloading across all backends | Vulkan + CUDA-GDN: per-expert SLRU. CUDA non-GDN: whole-layer offload, all experts resident. | Non-GDN CUDA MoE (Mixtral/Qwen3-30B-A3B/Coder) can't stream experts → must fit a layer's full expert set in VRAM. |
+| Mixed-precision / quantized cache (HOBBIT) | Experts cached in native quant — **except Q5_K → F32** on Vulkan SLRU + non-GDN CUDA resident path | Q5_K (qwen35moe `ffn_down_exps`) costs 4 B/elem on Vulkan. No *down*-quantization of cold experts (true HOBBIT). |
+| Activation-aware caching (MoE-Infinity, HybriMoE) | SLRU (recency only) + diagnostic-only `ExpertAccessProfiler` | Profiler doesn't drive eviction/placement or warm-pin hot experts. SLRU ≠ frequency-aware. |
+| **Predictive prefetch** (Pre-gated, Cross-Layer Gate, ProMoE) | Reactive 1-token, **same-layer** re-enqueue (Vulkan) | No next-layer/next-token prediction. *Tracked: #50.* |
+| Cache-miss CPU compute (Fiddler) | CPU-fallback compute on Vulkan + (via `SHARPI_CPU_MOE`) GDN paths | *Per-dispatch* CPU/GPU decision tracked as #54. |
+| Speculative expert prefetch (MoE-SpeQ, SP-MoE) | speculative *decoding* (MTP) exists, not used for expert prediction | Not started; natural extension of #50 once draft accepts are available. |
+| Fast CPU expert GEMM (KTransformers AMX) | SIMD `MatVec` (GEMV) CPU fallback | No AMX / blocked sgemm; CPU treated as fallback, not a peer compute tier (related to #54). |
+| Cache-miss substitution (BuddyMoE) | block on CPU compute instead | Fine for single-user; no redundancy reuse. |
+| Model-aware cache sizing (Local Routing Consistency) | fixed slot capacity | No per-model locality measurement; could size cache ≈2× active experts, skip caching for low-locality models. |
 | L3 NVMe tier / io_uring | designed, stubbed | Not shipped; only matters for models > host RAM. |
-| Batched/continuous-batching MoE + token reorder (ExpertFlow) | MoE batching disabled | Out of scope for single-user target; revisit if server multi-user MoE is wanted. |
+| Batched MoE + token reorder (ExpertFlow) | MoE batching disabled | Out of scope for single-user target. |
 
 ---
 
@@ -195,47 +223,44 @@ Don't pay full precision for cold experts.
 Ordered by leverage/effort for the single-user desktop, ~12 GB VRAM, GGUF case.
 Most of these reuse infrastructure we already have.
 
-### P0 — Stop the F32 cache bleed (HOBBIT-lite)
-Cache experts **in their native quantized form** (Q4_K/Q5_K/Q6_K) in VRAM and
-dequantize per-GEMM in the shader/kernel (we already dequantize Q4_K_M for dense
-weights). This 3–4×'s the number of experts that fit in the cache for free and
-cuts upload bytes proportionally. Optional next step: a true mixed-precision tier
-(hot experts native, cold experts re-quantized lower) à la HOBBIT.
-*Touches:* `ExpertSlotManager`/`CudaExpertSlotManager` upload path, GPU MoE matmul.
-*Risk:* low — quantized matmul already exists.
+### P0 — Bring the non-GDN CUDA hybrid path to per-expert SLRU parity
+Wire `CudaExpertSlotManager` + `MoEPrefetcher` + CPU-fallback into
+`CudaHybridForwardPass` (the fields are already there, just unassigned) so it
+streams experts per-token like the GDN path (`CudaHybridGdnForwardPass`) and the
+Vulkan path — instead of forcing every expert of a GPU-tier layer to be resident.
+Today a non-GDN MoE bigger than VRAM (Mixtral, Qwen3-30B-A3B, Qwen3-Coder-30B) can
+only offload at whole-layer granularity, wasting VRAM on cold experts in the
+GPU-tier layers. The GDN path is the reference implementation to mirror.
+*Risk:* medium — but the exact pattern already exists in-repo to copy.
 
-### P0 — Make the CUDA hybrid path actually offload
-Wire `CudaExpertSlotManager` + `MoEPrefetcher` into `CudaHybridForwardPass` (the
-fields are already there, just unassigned) so CUDA does dynamic SLRU caching with
-CPU fallback like the Vulkan path, instead of statically pinning every expert as
-F32. This is what unlocks running larger MoEs (Qwen3-235B-class, DeepSeek) on a
-12 GB card. Today CUDA can only run what fits fully resident.
-*Risk:* medium — needs the Vulkan path's miss/fallback logic mirrored, but the
-pattern exists to copy.
+### P1 — Stop dequantizing Q5_K experts (Vulkan + non-GDN CUDA resident path)
+`CudaExpertSlotManager` already keeps Q5_K raw via `UploadRaw`; mirror that in the
+Vulkan `ExpertSlotManager` (`ExpertSlotManager.cs:156`) and the
+`CudaHybridForwardPass` resident upload (`:1428`). qwen35moe's `ffn_down_exps` is
+Q5_K, so this 4×'s the cached down-proj footprint on Vulkan today. Cheap, local,
+high-certainty.
+*Risk:* low — Q5_K dequant-in-matmul kernels already exist.
 
-### P1 — Predictive prefetch (Cross-Layer Gate / Pre-gated)
-Replace the same-layer 1-token re-enqueue with **next-layer prediction**. Cheapest
-viable version: run the *next* MoE layer's router on the *current* layer's hidden
-state (it's only an `embDim×numExperts` GEMV — tiny) to get an early, approximate
-top-k and prefetch those experts a full layer ahead. ~84–91% accuracy is reported
-for single-layer lookahead, which is plenty to convert blocking misses into
-overlapped loads. This is the single biggest latency win for the offloaded regime.
-*Touches:* prefetcher API (`EnqueuePrefetch` already exists), forward-pass loop.
-*Risk:* low–medium; purely a prefetch hint, never affects correctness.
+### P1 — Predictive prefetch (Cross-Layer Gate / Pre-gated) — *issue #50*
+Already filed. Replace the same-layer 1-token re-enqueue with **next-layer
+prediction**: run the *next* MoE layer's router on the *current* hidden state (an
+`embDim×numExperts` GEMV — tiny) to prefetch a layer ahead. ~84–91% accuracy for
+single-layer lookahead is plenty to convert blocking misses into overlapped loads.
+Biggest latency win in the offloaded regime; purely a prefetch hint.
 
-### P1 — Feed the profiler into placement & eviction
-We built `ExpertAccessProfiler` but ignore it. Use it two ways: **(1)** at load,
-warm the cache / pin the top-N experts per layer (offline-profile or first-N-token
-profile) — KTransformers/MoE-Infinity "hot experts on GPU"; **(2)** bias SLRU so
-high-frequency experts resist eviction (frequency-aware, not pure recency).
+### P1 — Feed the profiler into eviction & warm-pinning
+We built `ExpertAccessProfiler` but only print it. Use it two ways: **(1)** at
+load, warm the cache / pin the top-N experts per layer (KTransformers/MoE-Infinity
+"hot experts on GPU"); **(2)** bias SLRU so high-frequency experts resist eviction
+(frequency-aware, not pure recency).
 *Risk:* low.
 
-### P2 — Treat CPU as a compute peer (KTransformers-style)
+### P2 — Treat CPU as a compute peer (KTransformers-style) — *relates to #54*
 Add a blocked/multi-threaded expert GEMM (and explore AVX-512/AMX where available)
 so CPU-resident experts are computed cheaply rather than something we always try
-to avoid by moving to GPU. Pairs naturally with the existing CPU-fallback path —
-it makes "compute on CPU" the *intended* steady state for cold experts, à la
-KTransformers, rather than a stall.
+to avoid by moving to GPU. Pairs naturally with the CPU-fallback dispatch policy
+in #54 — it makes "compute on CPU" the *intended* steady state for cold experts,
+à la KTransformers, rather than a stall.
 *Risk:* medium (kernel work), high payoff for big-model offload.
 
 ### P2 — Model-aware cache policy (Local Routing Consistency)
@@ -245,10 +270,11 @@ expert + dense-then-MoE) where caching helps little — pin shared experts, don'
 over-invest cache slots on routed ones.
 *Risk:* low.
 
-### P3 — Speculative expert prefetch (MoE-SpeQ)
-Once a draft model is wired for speculative *decoding*, reuse its accepted draft
-tokens to prefetch the experts those tokens will need, several tokens ahead. Big
-win only in the heavily-offloaded regime; defer until P0/P1 land.
+### P3 — Speculative expert prefetch (MoE-SpeQ) — *extends #50*
+We already have speculative decoding (MTP). Reuse its drafted tokens to prefetch
+the experts those tokens will need, several tokens ahead — a natural extension of
+the #50 predictor. Big win only in the heavily-offloaded regime; defer until the
+P0/P1 items land.
 
 ### Out of scope for now
 L3/NVMe tier (only matters when model > host RAM), continuous-batching MoE +
@@ -258,13 +284,15 @@ token reordering (single-user target), GDN GPU kernels (orthogonal to offloading
 
 ## 6. Bottom line
 
-We're not missing the *concept* of expert offloading — the bones are good and the
-CPU-fallback-on-miss design is genuinely SOTA-aligned. We're missing the parts
-that make it *pay off on a small GPU*: keeping the cache quantized, using the
-cache on CUDA at all, and predicting experts ahead of time instead of reacting.
-Those three (P0/P0/P1) are mostly wiring over infrastructure we already built, and
-they're what stands between "MoE that fits in VRAM" and "MoE that's bigger than
-VRAM but still fast."
+We're not missing the *concept* of expert offloading — the bones are good, the
+GDN CUDA path is genuinely SOTA-aligned (per-expert SLRU, CPU fallback, quantized
+cache, profiling), and predictive prefetch (#50) and Fiddler dispatch (#54) are
+already on the board. What's missing is *parity and follow-through*: the non-GDN
+CUDA path still does coarse whole-layer offload, Q5_K experts get needlessly
+expanded to F32 on two paths, and the profiler we built doesn't yet steer caching.
+Those are mostly wiring over infrastructure we already have, and they're what
+stands between "MoE that fits in VRAM" and "MoE that's bigger than VRAM but still
+fast."
 
 ---
 
