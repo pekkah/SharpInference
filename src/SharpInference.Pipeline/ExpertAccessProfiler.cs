@@ -64,6 +64,16 @@ public sealed class ExpertAccessProfiler
     }
 
     /// <summary>
+    /// Total access count (hits + misses) for one expert. Used as the popularity
+    /// signal for frequency-aware cache eviction.
+    /// </summary>
+    public long GetAccessCount(int layer, int expertId)
+    {
+        int i = layer * _numExperts + expertId;
+        return Interlocked.Read(ref _hits[i]) + Interlocked.Read(ref _misses[i]);
+    }
+
+    /// <summary>
     /// Returns the <paramref name="n"/> most-accessed expert IDs for <paramref name="layer"/>,
     /// sorted descending by total access count (hits + misses).
     /// </summary>

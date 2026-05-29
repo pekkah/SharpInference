@@ -101,5 +101,140 @@ public sealed class PipelineTests
         Assert.Equal(3, top[0]); // most accesses (3)
         Assert.Equal(2, top[1]); // second most accesses (2)
     }
+
+    [Fact]
+    public void ExpertAccessProfiler_GetAccessCount_SumsHitsAndMisses()
+    {
+        var profiler = new SharpInference.Pipeline.ExpertAccessProfiler(numLayers: 2, numExperts: 4);
+        profiler.RecordHit(1, 2);
+        profiler.RecordHit(1, 2);
+        profiler.RecordMiss(1, 2);
+        Assert.Equal(3, profiler.GetAccessCount(1, 2));
+        Assert.Equal(0, profiler.GetAccessCount(0, 2)); // different layer untouched
+    }
+
+    // ── Frequency-aware eviction ───────────────────────────────────────────
+
+    [Fact]
+    public void SlruCache_FrequencyAware_EvictsLeastAccessed_NotLruTail()
+    {
+        // freq accessor: key 1 is hot, keys 2 and 3 are cold.
+        var freq = new System.Collections.Generic.Dictionary<int, long> { [1] = 100, [2] = 1, [3] = 1 };
+        var cache = new SharpInference.Pipeline.SlruCache<int, string>(
+            probationaryCapacity: 3, protectedCapacity: 1, frequencyOf: k => freq.GetValueOrDefault(k));
+        cache.Put(1, "hot", out _, out _);   // tail-most (oldest) but highest freq
+        cache.Put(2, "cold-a", out _, out _);
+        cache.Put(3, "cold-b", out _, out _);
+        // Insert a 4th → probationary overflows. Plain LRU would evict key 1 (oldest);
+        // frequency-aware keeps the hot key 1 and evicts the least-accessed older entry (key 2).
+        bool evicted = cache.Put(4, "new", out int evKey, out _);
+        Assert.True(evicted);
+        Assert.Equal(2, evKey);
+        Assert.True(cache.Contains(1)); // hot survived despite being oldest
+    }
+
+    [Fact]
+    public void SlruCache_FrequencyAware_NeverEvictsJustInsertedEntry()
+    {
+        // The just-inserted entry has frequency 0 (coldest) but must not be evicted.
+        var freq = new System.Collections.Generic.Dictionary<int, long> { [1] = 5, [2] = 5 };
+        var cache = new SharpInference.Pipeline.SlruCache<int, string>(
+            probationaryCapacity: 2, protectedCapacity: 1, frequencyOf: k => freq.GetValueOrDefault(k));
+        cache.Put(1, "a", out _, out _);
+        cache.Put(2, "b", out _, out _);
+        bool evicted = cache.Put(99, "fresh", out int evKey, out _); // freq(99)=0
+        Assert.True(evicted);
+        Assert.NotEqual(99, evKey);       // the fresh insert is protected from immediate eviction
+        Assert.True(cache.Contains(99));
+    }
+
+    // ── Pinning ────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void SlruCache_Pin_MovesToProtectedAndSurvivesEviction()
+    {
+        var cache = new SharpInference.Pipeline.SlruCache<int, string>(probationaryCapacity: 2, protectedCapacity: 2);
+        cache.Put(1, "pinme", out _, out _);
+        cache.Pin(1);
+        Assert.True(cache.IsPinned(1));
+        Assert.Equal(1, cache.ProtectedCount);     // pinning moved it to protected
+        Assert.Equal(1, cache.PinnedCount);
+
+        // Churn probationary hard; pinned key 1 must never be evicted.
+        for (int k = 10; k < 30; k++)
+            cache.Put(k, $"v{k}", out _, out _);
+        Assert.True(cache.Contains(1));
+    }
+
+    [Fact]
+    public void SlruCache_Pin_NotEvictedAndNotChosenAsVictim()
+    {
+        var cache = new SharpInference.Pipeline.SlruCache<int, string>(probationaryCapacity: 2, protectedCapacity: 1);
+        cache.Put(1, "a", out _, out _);
+        cache.Pin(1);                                  // → protected, pinned
+        cache.Put(2, "b", out _, out _);
+        cache.Put(3, "c", out _, out _);
+        bool evicted = cache.Put(4, "d", out int evKey, out _); // prob overflow (2,3,4) → evict one
+        Assert.True(evicted);
+        Assert.NotEqual(1, evKey);                     // pinned never the victim
+        Assert.True(cache.Contains(1));
+    }
+
+    [Fact]
+    public void SlruCache_Unpin_AllowsEvictionAgain()
+    {
+        var cache = new SharpInference.Pipeline.SlruCache<int, string>(probationaryCapacity: 1, protectedCapacity: 1);
+        cache.Put(1, "a", out _, out _);
+        cache.Pin(1);
+        Assert.True(cache.IsPinned(1));
+        cache.Unpin(1);
+        Assert.False(cache.IsPinned(1));
+        Assert.Equal(0, cache.PinnedCount);
+    }
+
+    [Fact]
+    public void SlruCache_Pin_NonResidentKey_IsNoOp()
+    {
+        var cache = new SharpInference.Pipeline.SlruCache<int, string>(probationaryCapacity: 2, protectedCapacity: 2);
+        cache.Pin(42); // not resident
+        Assert.False(cache.IsPinned(42));
+        Assert.Equal(0, cache.PinnedCount);
+    }
+
+    [Fact]
+    public void ExpertCache_Pin_KeepsHotExpertResidentUnderChurn()
+    {
+        var evicted = new System.Collections.Generic.List<string>();
+        var cache = new SharpInference.Pipeline.ExpertCache<string>(capacity: 4, onEvict: evicted.Add);
+        cache.Put(0, 7, "hot");
+        cache.Pin(0, 7);
+        Assert.True(cache.IsPinned(0, 7));
+        for (int e = 100; e < 130; e++)
+            cache.Put(0, e, $"e{e}");
+        Assert.True(cache.TryGet(0, 7, out var v));
+        Assert.Equal("hot", v);
+        Assert.DoesNotContain("hot", evicted);
+        cache.Dispose();
+    }
+
+    [Fact]
+    public void ExpertCache_FrequencyAware_EvictsLeastAccessedExpert()
+    {
+        var accesses = new System.Collections.Generic.Dictionary<(int, int), long>
+        {
+            [(0, 1)] = 50, [(0, 2)] = 1, [(0, 3)] = 1,
+        };
+        string? evicted = null;
+        var cache = new SharpInference.Pipeline.ExpertCache<string>(
+            capacity: 4, onEvict: v => evicted = v,
+            frequencyOf: (l, e) => accesses.GetValueOrDefault((l, e)));
+        // capacity 4 → probCap=1, protCap=3. Force probationary overflow.
+        cache.Put(0, 1, "hot");
+        cache.Put(0, 2, "cold-a");
+        cache.Put(0, 3, "cold-b");
+        cache.Put(0, 4, "new");   // overflow; least-accessed older non-head evicted
+        Assert.NotNull(evicted);
+        Assert.NotEqual("hot", evicted); // the hot expert is retained
+    }
 }
 

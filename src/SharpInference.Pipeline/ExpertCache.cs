@@ -17,17 +17,26 @@ public sealed class ExpertCache<T> : IDisposable
     /// Optional callback invoked with the evicted value so the caller can release
     /// any associated GPU resources.
     /// </param>
-    public ExpertCache(int capacity, Action<T>? onEvict = null)
+    /// <param name="frequencyOf">
+    /// Optional per-(layer, expertId) access-count accessor. When supplied, eviction
+    /// becomes frequency-aware (least-accessed probationary expert is evicted first),
+    /// exploiting MoE routing skew. When null, eviction is plain LRU.
+    /// </param>
+    public ExpertCache(int capacity, Action<T>? onEvict = null,
+        Func<int, int, long>? frequencyOf = null)
     {
         if (capacity <= 0) throw new ArgumentOutOfRangeException(nameof(capacity));
         // Split: 25% probationary, 75% protected — biased toward retention since routing is skewed.
         int probCap = Math.Max(1, capacity / 4);
         int protCap = Math.Max(1, capacity - probCap);
-        _slru = new SlruCache<(int, int), T>(probCap, protCap);
+        Func<(int Layer, int ExpertId), long>? freq =
+            frequencyOf is null ? null : k => frequencyOf(k.Layer, k.ExpertId);
+        _slru = new SlruCache<(int, int), T>(probCap, protCap, freq);
         _onEvict = onEvict;
     }
 
     public int Count => _slru.Count;
+    public int PinnedCount => _slru.PinnedCount;
 
     /// <summary>Look up the cached value for (<paramref name="layer"/>, <paramref name="expertId"/>).</summary>
     public bool TryGet(int layer, int expertId, out T value) =>
@@ -46,6 +55,18 @@ public sealed class ExpertCache<T> : IDisposable
 
     public bool Contains(int layer, int expertId) =>
         _slru.Contains((layer, expertId));
+
+    /// <summary>
+    /// Pin (<paramref name="layer"/>, <paramref name="expertId"/>) so it is never
+    /// evicted while resident. The expert must already be cached (call <see cref="Put"/>
+    /// first). Use for warm-pinning the hottest experts identified by profiling.
+    /// </summary>
+    public void Pin(int layer, int expertId) => _slru.Pin((layer, expertId));
+
+    /// <summary>Remove the pin on (<paramref name="layer"/>, <paramref name="expertId"/>).</summary>
+    public void Unpin(int layer, int expertId) => _slru.Unpin((layer, expertId));
+
+    public bool IsPinned(int layer, int expertId) => _slru.IsPinned((layer, expertId));
 
     /// <summary>
     /// Invoke <paramref name="action"/> for every currently-cached value, then clear the cache.
