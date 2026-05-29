@@ -347,11 +347,31 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 $"[CudaHybridForwardPass] SLRU expert cache: {plan.Slots} slots / {totalGpuExperts} total " +
                 $"({hp.NumExperts} experts × {_nGpuLayers} GPU layers, per-expert ≈ {perExpert / 1024} KiB, " +
                 $"free VRAM ≈ {free / (1024 * 1024)} MiB).");
-            if (plan.Slots < plan.RecommendedSlots)
-                Console.Error.WriteLine(
-                    $"[CudaHybridForwardPass] note: cache ({plan.Slots}) is below the routing-locality " +
-                    $"sweet spot (~{plan.RecommendedSlots} = 2× active per layer); expert hit rate may suffer. " +
-                    $"Fewer GPU layers (-g) or more VRAM would help.");
+            switch (plan.Status)
+            {
+                case MoeCacheSizingStatus.BudgetExhausted:
+                    // Budget couldn't fit even one expert; capacity was clamped to 1.
+                    // Decode will thrash (~every routed expert misses); louder than the
+                    // BelowRecommended warning because the perf hit is catastrophic.
+                    Console.Error.WriteLine(
+                        "[CudaHybridForwardPass] WARNING: free VRAM cannot fit a single expert; " +
+                        "cache clamped to 1 slot. Every routed expert will miss and stream from CPU. " +
+                        "Reduce -g or use --backend vulkan.");
+                    break;
+                case MoeCacheSizingStatus.UnknownExpertSize:
+                    Console.Error.WriteLine(
+                        "[CudaHybridForwardPass] WARNING: could not measure per-expert size " +
+                        "(missing blk.0.ffn_*_exps tensor); cache fell back to total. " +
+                        "Will fail at runtime if total VRAM is exceeded.");
+                    break;
+                case MoeCacheSizingStatus.BelowRecommended:
+                    int pct = plan.RecommendedSlots > 0 ? plan.Slots * 100 / plan.RecommendedSlots : 0;
+                    Console.Error.WriteLine(
+                        $"[CudaHybridForwardPass] WARNING: cache ({plan.Slots}) is {pct}% of the " +
+                        $"routing-locality recommendation (~{plan.RecommendedSlots} = 2× active per layer); " +
+                        $"expert hit rate may suffer. Fewer GPU layers (-g) or more VRAM would help.");
+                    break;
+            }
             _expertSlotManager = new CudaExpertSlotManager(gpu, model, hp, plan.Slots, _gpuWeightDTypes);
         }
 
@@ -1379,16 +1399,20 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     /// <summary>
     /// On-VRAM bytes for one expert's three weight tensors (gate + up + down), used to
     /// size the SLRU slot capacity. Mirrors CudaExpertSlotManager's upload accounting:
-    /// Q4_K/Q5_K/Q6_K are stored raw; other dtypes expand to F32.
+    /// Q4_K/Q5_K/Q6_K are stored raw; other dtypes expand to F32. Each tensor's raw
+    /// byte size is rounded up to the buffer pool's allocation bucket (power-of-two,
+    /// min 64 B) — otherwise the planner over-estimates capacity by ~2× since pooled
+    /// allocations inflate sub-bucket sizes (e.g. 1.05 MiB Q5_K tensor → 2 MiB).
     /// </summary>
     private long PerExpertBytes()
     {
         long Bytes(string name, int rows, int cols)
         {
             if (_model.FindTensor(name) is not { } info) return 0;
-            if (info.DType is DType.Q4_K or DType.Q5_K or DType.Q6_K)
-                return (long)rows * (cols / DTypeInfo.BlockSize(info.DType)) * DTypeInfo.BytesPerBlock(info.DType);
-            return (long)rows * cols * sizeof(float); // F32 (native or dequantized)
+            long raw = info.DType is DType.Q4_K or DType.Q5_K or DType.Q6_K
+                ? (long)rows * (cols / DTypeInfo.BlockSize(info.DType)) * DTypeInfo.BytesPerBlock(info.DType)
+                : (long)rows * cols * sizeof(float); // F32 (native or dequantized)
+            return (long)CudaBackend.RoundUpAllocBytes((nuint)raw);
         }
         return Bytes("blk.0.ffn_gate_exps.weight", _expertDim, _embDim)
              + Bytes("blk.0.ffn_up_exps.weight",   _expertDim, _embDim)

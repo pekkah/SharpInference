@@ -40,7 +40,7 @@ matching chat template).
 | Qwen3-Coder 30B-A3B (MoE) | [Qwen](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF) | 17 GB | CPU | 13.3 | 21.1 | 128 experts / 8 active |
 | Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | CPU `--tq` | 13.7 | 21.0 | 3-bit KV. FastScan K + V kernels (issue #34) keep attention cost bounded as context grows: **15.5 t/s decode @ 3.2K ctx** (27 % slowdown for ~27× context growth); without FastScan the per-block K+V path would drop this to ~13 t/s |
 | Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | Vulkan `-g -1` (hybrid) | 1.1 | 5.3 | 29 GPU + 19 CPU layers, SLRU expert slot cache. Next-layer predictive prefetch (PR #77 / issue #50) on by default; no-op until the cache is under pressure — disable with `--no-moe-predict-prefetch` |
-| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | **CUDA** `-g -1` (hybrid) | 11.5 | **24.4** | 29 GPU + 19 CPU layers; routed experts now stream through `CudaExpertSlotManager` SLRU (3043/3712 slots, ≈ 87 % hit rate) instead of the prior eager whole-layer upload (PR #77 / issue #72). Decode lifts from 22.7 → 24.4 (+7.5 %) as eviction matches the actual access distribution; prefill drops 13.9 → 11.5 because the first-pass loads experts on demand instead of resident — set `SHARPI_EXPERT_STATS=path` to inspect per-layer hit rates |
+| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | **CUDA** `-g -1` (hybrid) | 10.6 | 22.2 | 29 GPU + 19 CPU layers; routed experts stream through `CudaExpertSlotManager` SLRU (2220 / 3712 slots) instead of the prior eager whole-layer upload (PR #77 / issue #72). Decode is at parity with the eager baseline (22.7 → 22.2 within noise); prefill drops 13.9 → 10.6 because the first-pass loads experts on demand. Cache budget is set to actually-fit-VRAM (counts the buffer pool's power-of-two round-up — earlier 3043-slot planning would have hit `cudaMalloc` failure once a working set filled past ~2200 unique experts). Set `SHARPI_EXPERT_STATS=path` to inspect per-layer hit rates |
 | Llama-4 Scout 17B-16E (MoE) | [meta-llama](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct) | 61 GB | CPU | 2.1 | 4.3 | 48 layers, 17B active params; split GGUF (Q4_K_M) |
 | Llama-4 Scout 17B-16E (MoE) | (same) | 61 GB | CUDA `-g -1` (hybrid) | 1.2 | 2.6 | 7 GPU + 41 CPU layers — model still dwarfs the 12 GB card so CPU-only wins, but per-expert SLRU streaming (PR #77 / issue #72) lifts decode 2.1 → 2.6 (+24 %) and prefill 0.9 → 1.2 (+33 %) over the prior eager whole-layer upload |
 | Qwen3.6-35B-A3B (GDN+MoE) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | 22 GB | CPU | 6.7 | 8.5 | hybrid GDN/attn, 256 experts / 8 active |
@@ -54,6 +54,13 @@ matching chat template).
 
 `--backend auto` (default) picks CUDA when available, sizing the GPU/CPU split from
 VRAM via TierPlanner; falls through to Vulkan only when CUDA isn't present.
+
+MoE expert-cache knobs (`--moe-warmpin`, `--moe-warmpin-after`,
+`--no-moe-predict-prefetch`, `--expert-stats`) are CLI-only on the `run`
+command; under `SharpInference.Server` the same behaviour is reachable
+via the env vars `SHARPI_MOE_WARMPIN`, `SHARPI_MOE_WARMPIN_AFTER`,
+`SHARPI_MOE_PREDICT_PREFETCH=0`, `SHARPI_EXPERT_STATS=<path>` set in the
+process environment before the server starts.
 
 SnapKV prefill-time KV eviction (issue #51) ships on every backend: CPU
 `ForwardPass` (#57), CUDA hybrid GDN `CudaHybridGdnForwardPass` (#58),

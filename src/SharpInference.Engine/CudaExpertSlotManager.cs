@@ -107,16 +107,24 @@ public sealed class CudaExpertSlotManager : IDisposable
     /// Once enough routing history has accumulated, pin the hottest currently-resident
     /// experts (top <c>SHARPI_MOE_WARMPIN</c> per layer) into the protected segment so
     /// they are never evicted. No-op unless warm-pinning is enabled. Runs once, under
-    /// the caller's lock.
+    /// the caller's lock. Layers are visited in descending hotness so a tight pin
+    /// budget protects the layers that route most often, not whatever happens to sit
+    /// at low indices (matters for hybrid GDN+MoE models where MoE FFN sits at high
+    /// layer indices).
     /// </summary>
     private void MaybeWarmPin()
     {
         if (_warmed || _warmPinPerLayer <= 0) return;
         if (_profiler.TotalHits + _profiler.TotalMisses < _warmPinAfter) return;
         _warmed = true;
+        var layerOrder = new int[_hp.NumLayers];
+        for (int l = 0; l < _hp.NumLayers; l++) layerOrder[l] = l;
+        Array.Sort(layerOrder, (a, b) => _profiler.GetLayerAccessCount(b).CompareTo(_profiler.GetLayerAccessCount(a)));
         int pinned = 0;
-        for (int layer = 0; layer < _hp.NumLayers && pinned < _pinBudget; layer++)
+        foreach (int layer in layerOrder)
         {
+            if (pinned >= _pinBudget) break;
+            if (_profiler.GetLayerAccessCount(layer) == 0) break;
             foreach (int e in _profiler.GetTopExperts(layer, _warmPinPerLayer))
             {
                 if (pinned >= _pinBudget) break;

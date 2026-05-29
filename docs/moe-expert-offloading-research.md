@@ -6,6 +6,29 @@
 > to our target deployment (single-user desktop, ~12 GB VRAM e.g. RTX 4070 Ti,
 > NativeAOT, GGUF).
 
+> **Status update (PR #77, 2026-05-29).** The sections below were written before
+> the implementation work in this PR landed. Reflecting what now ships, several
+> "open" items in §1 (TL;DR), §2.2 (CUDA non-GDN hybrid), §4 (gap analysis), and
+> §5 (recommendations) are now closed:
+>
+> - **§5 P0 — non-GDN CUDA per-expert SLRU.** `CudaHybridForwardPass` now streams
+>   routed experts through `CudaExpertSlotManager.GetOrLoad`. The eager
+>   `_gpuWGateExps`/`_gpuWUpExps`/`_gpuWDownExps` arrays referenced in §2.2 no
+>   longer exist (commit `2e48a29`).
+> - **§5 P1 (eviction half) — activation-aware caching.** `SlruCache` now picks
+>   victims by access frequency (`SlruCache.SelectProbationaryVictim`) and the
+>   slot managers support opt-in warm-pinning via `SHARPI_MOE_WARMPIN`
+>   (commit `b6b2763`).
+> - **§4 gap on predictive prefetch (Vulkan).** `ExpertRoutePredictor` records
+>   each layer's selection and prefetches the next GPU MoE layer's likely experts
+>   a layer ahead (commit `757976d`).
+> - **Cache sizing.** `MoeCacheSizing.Plan` is the routing-locality-aware sizer
+>   recommended in §5 P3 (commit `7b70c76`).
+>
+> Still open: the §5 P1 Q5_K-→-F32 dequant on the Vulkan `ExpertSlotManager`
+> upload path; the §5 P2 CPU-peer / KTransformers-AMX direction; the predictive
+> prefetch on the CUDA hybrid path (Vulkan-only today).
+
 ---
 
 ## 1. TL;DR

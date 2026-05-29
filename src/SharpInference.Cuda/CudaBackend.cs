@@ -16,6 +16,16 @@ namespace SharpInference.Cuda;
 /// </summary>
 public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDisposable
 {
+    /// <summary>
+    /// Round <paramref name="byteSize"/> up to the bucket size the buffer pool will
+    /// actually allocate (next power-of-two, min 64 bytes). Use this when sizing
+    /// budgets that share VRAM with pooled allocations — the pool's round-up can
+    /// inflate per-allocation footprint up to ~2× and a budget computed from raw
+    /// byte sizes will overshoot real capacity. Bypasses the pool entirely when
+    /// callers pass <c>exact: true</c> to <see cref="Upload"/> / <see cref="UploadRaw"/>.
+    /// </summary>
+    public static nuint RoundUpAllocBytes(nuint byteSize) => GpuBufferPool.RoundUp(byteSize);
+
     private readonly nint _handle;
     private readonly SgemmPrecision _precision;
     private readonly int _smVersion;

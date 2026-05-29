@@ -348,6 +348,52 @@ public sealed class PipelineTests
     {
         var plan = SharpInference.Pipeline.MoeCacheSizing.Plan(0, 64, 8, 1L << 30, 1L << 20, 0);
         Assert.Equal(0, plan.Slots);
+        Assert.Equal(SharpInference.Pipeline.MoeCacheSizingStatus.Empty, plan.Status);
+    }
+
+    [Fact]
+    public void MoeCacheSizing_AmpleVram_StatusIsOk()
+    {
+        var plan = SharpInference.Pipeline.MoeCacheSizing.Plan(
+            gpuLayers: 8, numExperts: 64, numActiveExperts: 8,
+            freeVramBytes: 100L << 30, perExpertBytes: 2L << 20, reserveBytes: 512L << 20);
+        Assert.Equal(SharpInference.Pipeline.MoeCacheSizingStatus.Ok, plan.Status);
+    }
+
+    [Fact]
+    public void MoeCacheSizing_TightVram_StatusIsBelowRecommended()
+    {
+        long perExpert = 2L << 20;
+        long free = (512L << 20) + 50 * perExpert;
+        var plan = SharpInference.Pipeline.MoeCacheSizing.Plan(
+            gpuLayers: 8, numExperts: 64, numActiveExperts: 8,
+            freeVramBytes: free, perExpertBytes: perExpert, reserveBytes: 512L << 20);
+        Assert.Equal(SharpInference.Pipeline.MoeCacheSizingStatus.BelowRecommended, plan.Status);
+    }
+
+    [Fact]
+    public void MoeCacheSizing_BudgetExhausted_ClampsToOneAndFlagsStatus()
+    {
+        // Reserve consumes the entire free VRAM → budget = 0 → clamped to 1.
+        // Caller must see the BudgetExhausted status to act on it.
+        var plan = SharpInference.Pipeline.MoeCacheSizing.Plan(
+            gpuLayers: 8, numExperts: 64, numActiveExperts: 8,
+            freeVramBytes: 512L << 20, perExpertBytes: 2L << 20, reserveBytes: 512L << 20);
+        Assert.Equal(1, plan.Slots);
+        Assert.Equal(0, plan.BudgetSlots);
+        Assert.Equal(SharpInference.Pipeline.MoeCacheSizingStatus.BudgetExhausted, plan.Status);
+    }
+
+    [Fact]
+    public void MoeCacheSizing_UnknownExpertSize_FlagsStatus()
+    {
+        // perExpertBytes == 0 (caller couldn't measure) → cache falls back to total.
+        // Status flag is the only way the caller can distinguish this from Ok.
+        var plan = SharpInference.Pipeline.MoeCacheSizing.Plan(
+            gpuLayers: 8, numExperts: 64, numActiveExperts: 8,
+            freeVramBytes: 100L << 30, perExpertBytes: 0, reserveBytes: 0);
+        Assert.Equal(8 * 64, plan.Slots);
+        Assert.Equal(SharpInference.Pipeline.MoeCacheSizingStatus.UnknownExpertSize, plan.Status);
     }
 }
 

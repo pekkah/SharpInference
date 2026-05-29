@@ -62,12 +62,20 @@ public sealed class ExpertSlotManager : IDisposable
     /// <summary>
     /// Return the GPU tensors for the given expert only if they are already cached.
     /// Does NOT load from disk on miss — use <see cref="GetOrLoad"/> for that.
+    /// Records the lookup outcome on the profiler so frequency-aware eviction +
+    /// warm-pinning have real data on the Vulkan path (where the forward pass
+    /// never calls <see cref="GetOrLoad"/>).
     /// Thread-safe.
     /// </summary>
     public bool TryGetCached(int layer, int expertId, out ExpertGpuSlot slot)
     {
         lock (_lock)
-            return _cache.TryGet(layer, expertId, out slot);
+        {
+            bool hit = _cache.TryGet(layer, expertId, out slot);
+            if (hit) _profiler.RecordHit(layer, expertId);
+            else _profiler.RecordMiss(layer, expertId);
+            return hit;
+        }
     }
 
     /// <summary>
@@ -96,16 +104,25 @@ public sealed class ExpertSlotManager : IDisposable
     /// Once enough routing history has accumulated, pin the hottest currently-resident
     /// experts (top <c>SHARPI_MOE_WARMPIN</c> per layer) into the protected segment so
     /// they are never evicted. No-op unless warm-pinning is enabled. Runs once, under
-    /// the caller's lock.
+    /// the caller's lock. Layers are visited in descending hotness so a tight pin
+    /// budget protects the layers that route most often, not whatever happens to sit
+    /// at low indices (matters for hybrid GDN+MoE models where MoE FFN sits at high
+    /// layer indices).
     /// </summary>
     private void MaybeWarmPin()
     {
         if (_warmed || _warmPinPerLayer <= 0) return;
         if (_profiler.TotalHits + _profiler.TotalMisses < _warmPinAfter) return;
         _warmed = true;
+        var layerOrder = new int[_hp.NumLayers];
+        for (int l = 0; l < _hp.NumLayers; l++) layerOrder[l] = l;
+        Array.Sort(layerOrder, (a, b) => _profiler.GetLayerAccessCount(b).CompareTo(_profiler.GetLayerAccessCount(a)));
         int pinned = 0;
-        for (int layer = 0; layer < _hp.NumLayers && pinned < _pinBudget; layer++)
+        foreach (int layer in layerOrder)
         {
+            if (pinned >= _pinBudget) break;
+            // Cold layers contribute nothing; once the sort hits zero we can stop.
+            if (_profiler.GetLayerAccessCount(layer) == 0) break;
             foreach (int e in _profiler.GetTopExperts(layer, _warmPinPerLayer))
             {
                 if (pinned >= _pinBudget) break;
@@ -118,6 +135,8 @@ public sealed class ExpertSlotManager : IDisposable
     /// Pre-load the given expert into the cache if not already present.
     /// Uses <see cref="VulkanBackend.UploadBackground"/> so it is safe to call
     /// from a background thread concurrently with the main recording session.
+    /// Also runs <see cref="MaybeWarmPin"/> so warm-pinning fires on the Vulkan
+    /// path (where <see cref="GetOrLoad"/> is never called by the forward pass).
     /// </summary>
     public void Preload(int layer, int expertId)
     {
@@ -128,6 +147,7 @@ public sealed class ExpertSlotManager : IDisposable
                 var slot = UploadExpert(layer, expertId, background: true);
                 _cache.Put(layer, expertId, slot);
             }
+            MaybeWarmPin();
         }
     }
 

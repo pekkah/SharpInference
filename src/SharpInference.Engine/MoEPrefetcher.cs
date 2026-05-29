@@ -47,7 +47,19 @@ public sealed class MoEPrefetcher : IDisposable
                 foreach (int expertId in batch.ExpertIds)
                 {
                     if (_cts.Token.IsCancellationRequested) return;
-                    _slotManager.Preload(batch.Layer, expertId);
+                    try
+                    {
+                        _slotManager.Preload(batch.Layer, expertId);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        // A single Preload failure (transient cudaMalloc / upload
+                        // fault / stale predicted expert) must not silently kill
+                        // the worker: prefetch is best-effort, but losing it mid-run
+                        // degrades throughput with no log to grep for.
+                        Console.Error.WriteLine(
+                            $"[MoEPrefetcher] Preload(layer={batch.Layer}, expert={expertId}) failed: {ex.Message}");
+                    }
                 }
             }
         }

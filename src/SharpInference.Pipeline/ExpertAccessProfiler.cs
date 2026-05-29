@@ -74,6 +74,24 @@ public sealed class ExpertAccessProfiler
     }
 
     /// <summary>
+    /// Total access count for a whole layer (sum across experts). Used to rank
+    /// layers by hotness so warm-pinning budgets the hottest layers first instead
+    /// of iterating in layer-index order (which biases pins to low-index layers
+    /// for hybrid GDN+MoE models that cluster MoE FFN at high indices).
+    /// </summary>
+    public long GetLayerAccessCount(int layer)
+    {
+        long total = 0;
+        int offset = layer * _numExperts;
+        for (int e = 0; e < _numExperts; e++)
+        {
+            total += Interlocked.Read(ref _hits[offset + e]);
+            total += Interlocked.Read(ref _misses[offset + e]);
+        }
+        return total;
+    }
+
+    /// <summary>
     /// Returns the <paramref name="n"/> most-accessed expert IDs for <paramref name="layer"/>,
     /// sorted descending by total access count (hits + misses).
     /// </summary>
