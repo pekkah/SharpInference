@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!--
+    Demo host for the SharpInference.Server class library. Single Program.cs that
+    binds SharpInferenceServerOptions, calls AddSharpInference() / MapSharpInference(),
+    and starts a Kestrel server.
+
+    Trim/AOT explicitly disabled (overriding the repo-wide Directory.Build.props
+    defaults). The CUDA + NVRTC runtime path is not trim-safe — kernel source
+    strings get stripped and cuModuleLoadData fails at runtime (issue #94). The
+    CLI remains the AOT-publish target for SharpInference.
+  -->
+
+  <PropertyGroup>
+    <RootNamespace>SharpInference.Server.Host</RootNamespace>
+    <IsTrimmable>false</IsTrimmable>
+    <EnableTrimAnalyzer>false</EnableTrimAnalyzer>
+    <EnableAotAnalyzer>false</EnableAotAnalyzer>
+    <SuppressTrimAnalysisWarnings>true</SuppressTrimAnalysisWarnings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SharpInference.Server\SharpInference.Server.csproj" />
+  </ItemGroup>
+
+</Project>

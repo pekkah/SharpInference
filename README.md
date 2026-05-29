@@ -246,7 +246,7 @@ dotnet run --project src/SharpInference.Cli -c Release -- \
 
 # API server (OpenAI /v1/chat/completions + Anthropic /v1/messages, port 5000)
 SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
-  dotnet run --project src/SharpInference.Server -c Release
+  dotnet run --project src/SharpInference.Server.Host -c Release
 ```
 
 ## Image generation

@@ -1,43 +1,36 @@
-using System.Diagnostics;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Routing;
 using SharpInference.Engine;
 
 namespace SharpInference.Server.Endpoints;
 
 public static class HealthEndpoints
 {
-    private static readonly Stopwatch s_uptime = Stopwatch.StartNew();
-    private static long s_totalRequests;
-    private static long s_totalTokens;
-
     public static IEndpointRouteBuilder MapHealthEndpoints(this IEndpointRouteBuilder app)
     {
-        app.MapGet("/health", (IInferenceEngine engine) =>
+        app.MapGet("/health", (IInferenceEngine engine, ServerMetrics metrics) =>
             Results.Ok(new HealthStatus("ok", engine.ModelId,
-                (long)s_uptime.Elapsed.TotalSeconds)));
+                (long)metrics.Uptime.TotalSeconds)));
 
         app.MapGet("/metrics", HandleMetrics);
         return app;
     }
 
-    internal static void RecordRequest() =>
-        System.Threading.Interlocked.Increment(ref s_totalRequests);
-
-    internal static void RecordTokens(long count) =>
-        System.Threading.Interlocked.Add(ref s_totalTokens, count);
-
-    private static Task HandleMetrics(HttpContext ctx, IInferenceEngine engine)
+    private static Task HandleMetrics(HttpContext ctx, IInferenceEngine engine, ServerMetrics metrics)
     {
         ctx.Response.ContentType = "text/plain; version=0.0.4";
-        var uptime = s_uptime.Elapsed.TotalSeconds;
-        double tps = uptime > 0 ? s_totalTokens / uptime : 0;
+        double uptime = metrics.Uptime.TotalSeconds;
+        long totalRequests = metrics.TotalRequests;
+        long totalTokens = metrics.TotalTokens;
+        double tps = uptime > 0 ? totalTokens / uptime : 0;
         return ctx.Response.WriteAsync(
             $"# HELP sharpi_requests_total Total inference requests served\n" +
             $"# TYPE sharpi_requests_total counter\n" +
-            $"sharpi_requests_total {s_totalRequests}\n" +
+            $"sharpi_requests_total {totalRequests}\n" +
             $"# HELP sharpi_tokens_generated_total Total tokens generated\n" +
             $"# TYPE sharpi_tokens_generated_total counter\n" +
-            $"sharpi_tokens_generated_total {s_totalTokens}\n" +
+            $"sharpi_tokens_generated_total {totalTokens}\n" +
             $"# HELP sharpi_uptime_seconds Server uptime in seconds\n" +
             $"# TYPE sharpi_uptime_seconds gauge\n" +
             $"sharpi_uptime_seconds {(long)uptime}\n" +

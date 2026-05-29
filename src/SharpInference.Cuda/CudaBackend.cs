@@ -2098,6 +2098,16 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// </summary>
     private void EnsureImageKernels()
     {
+        // Always bind the primary CUDA context on the calling thread — even after the
+        // module is loaded. cuModuleLoadData (init) and cuLaunchKernel (every launch
+        // below) both require a current context, but cuBLAS handles bind to it
+        // internally so the rest of the backend works cross-thread without this.
+        //
+        // Hosted scenarios (e.g. ASP.NET request threads) construct CudaBackend on
+        // one thread and decode on another — without this guard cuModuleLoadData
+        // returns CUDA_ERROR_INVALID_CONTEXT (201). See issue #94.
+        EnsurePrimaryContextCurrent();
+
         if (_imageKernelsInitialized) return;
         lock (_kernelInitLock)
         {
@@ -2118,6 +2128,54 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 _imageKernelsInitialized = true;
             }
         }
+    }
+
+    // ── CUDA primary-context binding ──────────────────────────────────────
+    //
+    // Process-wide retained primary context (device 0), made current on each thread
+    // that calls into the NVRTC kernel path. ThreadStatic flag skips redundant
+    // cuCtxSetCurrent on a thread that's already bound.
+
+    private static readonly object   s_primaryCtxLock = new();
+    private static          nint     s_primaryCtx;
+    private static          int      s_primaryCtxDevice = -1;
+    [ThreadStatic]
+    private static          bool     t_primaryCtxBoundOnThisThread;
+
+    /// <summary>
+    /// Ensure the device's primary context is current on the calling thread. Cheap after
+    /// the first call per thread (single ThreadStatic check). The retained primary context
+    /// is the same one cuBLAS attaches to, so once it's current on a thread the entire
+    /// CUDA Driver API surface works there.
+    /// </summary>
+    internal static void EnsurePrimaryContextCurrent()
+    {
+        if (t_primaryCtxBoundOnThisThread) return;
+
+        if (s_primaryCtx == nint.Zero)
+        {
+            lock (s_primaryCtxLock)
+            {
+                if (s_primaryCtx == nint.Zero)
+                {
+                    int ir = NvrtcInterop.CuInit(0);
+                    if (ir != 0) throw new InvalidOperationException($"cuInit failed: {ir}");
+
+                    int dr = NvrtcInterop.DeviceGet(out int dev, 0);
+                    if (dr != 0) throw new InvalidOperationException($"cuDeviceGet failed: {dr}");
+
+                    int rr = NvrtcInterop.DevicePrimaryCtxRetain(out nint ctx, dev);
+                    if (rr != 0) throw new InvalidOperationException($"cuDevicePrimaryCtxRetain failed: {rr}");
+
+                    s_primaryCtxDevice = dev;
+                    s_primaryCtx       = ctx;
+                }
+            }
+        }
+
+        int sr = NvrtcInterop.CtxSetCurrent(s_primaryCtx);
+        if (sr != 0) throw new InvalidOperationException($"cuCtxSetCurrent failed: {sr}");
+        t_primaryCtxBoundOnThisThread = true;
     }
 
     /// <summary>Combined CUDA source for image + text kernels — one NVRTC compilation.</summary>

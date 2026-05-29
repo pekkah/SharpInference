@@ -1,7 +1,10 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Routing;
+using Microsoft.Extensions.Options;
 using SharpInference.Engine;
 
 namespace SharpInference.Server.Endpoints;
@@ -18,12 +21,15 @@ public static class OpenAiEndpoints
     private static async Task HandleChatCompletion(
         HttpContext ctx,
         IInferenceEngine engine,
-        string? arch = null)
+        ChatTemplateRenderer chatTemplate,
+        ServerMetrics metrics,
+        IOptions<SharpInferenceServerOptions> options)
     {
+        var opts = options.Value;
         ChatCompletionRequest? req;
         try
         {
-            req = await ctx.Request.ReadFromJsonAsync(AppJsonContext.Default.ChatCompletionRequest, ctx.RequestAborted);
+            req = await ctx.Request.ReadFromJsonAsync(SharpInferenceJsonContext.Default.ChatCompletionRequest, ctx.RequestAborted);
         }
         catch
         {
@@ -37,16 +43,15 @@ public static class OpenAiEndpoints
             ctx.Response.ContentType = "application/json";
             await ctx.Response.WriteAsync(
                 JsonSerializer.Serialize(new ErrorResponse("invalid_request_error", "messages array is required"),
-                    AppJsonContext.Default.ErrorResponse), ctx.RequestAborted);
+                    SharpInferenceJsonContext.Default.ErrorResponse), ctx.RequestAborted);
             return;
         }
 
-        HealthEndpoints.RecordRequest();
+        metrics.RecordRequest();
 
-        var modelArch = arch ?? Environment.GetEnvironmentVariable("SHARPI_ARCH") ?? "qwen2";
         bool enableThinking = req.EnableThinking ?? true;
-        var messages = BuildMessageList(req.Messages, modelArch, req.ResponseFormat?.Type);
-        var prompt = ChatTemplate.Format(messages, modelArch, enableThinking);
+        var messages = BuildMessageList(req.Messages, req.ResponseFormat?.Type);
+        var prompt = chatTemplate.Format(messages, enableThinking);
 
         // Parse logit_bias: OpenAI sends {"tokenId": biasValue} with string keys
         IReadOnlyDictionary<int, float>? logitBias = null;
@@ -58,14 +63,12 @@ public static class OpenAiEndpoints
             if (d.Count > 0) logitBias = d;
         }
 
-        var sp = new SamplingParams
-        {
-            Temperature = req.Temperature ?? 1.0f,
-            TopP = req.TopP ?? 1.0f,
-            MaxNewTokens = req.MaxTokens ?? 512,
-            LogitBias = logitBias,
-            MaxThinkingTokens = req.MaxThinkingTokens ?? 0,
-        };
+        var sp = SamplingParamsBuilder.Build(opts,
+            temperature: req.Temperature,
+            topP:        req.TopP,
+            maxTokens:   req.MaxTokens,
+            maxThinking: req.MaxThinkingTokens,
+            logitBias:   logitBias);
 
         var requestId = $"chatcmpl-{Guid.NewGuid():N}";
         long created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -80,7 +83,7 @@ public static class OpenAiEndpoints
             var firstChunk = new ChatCompletionChunk(
                 requestId, "chat.completion.chunk", created, engine.ModelId,
                 [new ChunkChoice(0, new ChunkDelta("assistant", null), null)]);
-            await WriteEvent(ctx.Response, JsonSerializer.Serialize(firstChunk, AppJsonContext.Default.ChatCompletionChunk));
+            await WriteEvent(ctx.Response, JsonSerializer.Serialize(firstChunk, SharpInferenceJsonContext.Default.ChatCompletionChunk));
 
             long tokenCount = 0;
             await foreach (var c in engine.GenerateChunksAsync(prompt, sp, ctx.RequestAborted))
@@ -92,18 +95,18 @@ public static class OpenAiEndpoints
                 var chunk = new ChatCompletionChunk(
                     requestId, "chat.completion.chunk", created, engine.ModelId,
                     [new ChunkChoice(0, delta, null)]);
-                await WriteEvent(ctx.Response, JsonSerializer.Serialize(chunk, AppJsonContext.Default.ChatCompletionChunk));
+                await WriteEvent(ctx.Response, JsonSerializer.Serialize(chunk, SharpInferenceJsonContext.Default.ChatCompletionChunk));
             }
 
             // Final chunk with finish_reason
             var finalChunk = new ChatCompletionChunk(
                 requestId, "chat.completion.chunk", created, engine.ModelId,
                 [new ChunkChoice(0, new ChunkDelta(null, null), "stop")]);
-            await WriteEvent(ctx.Response, JsonSerializer.Serialize(finalChunk, AppJsonContext.Default.ChatCompletionChunk));
+            await WriteEvent(ctx.Response, JsonSerializer.Serialize(finalChunk, SharpInferenceJsonContext.Default.ChatCompletionChunk));
             await ctx.Response.WriteAsync("data: [DONE]\n\n", ctx.RequestAborted);
             await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
 
-            HealthEndpoints.RecordTokens(tokenCount);
+            metrics.RecordTokens(tokenCount);
         }
         else
         {
@@ -127,7 +130,7 @@ public static class OpenAiEndpoints
             }
 
             int completionTokens = textTokens + reasoningTokens;
-            HealthEndpoints.RecordTokens(completionTokens);
+            metrics.RecordTokens(completionTokens);
 
             var message = new OaiAssistantMessage(
                 "assistant",
@@ -144,7 +147,7 @@ public static class OpenAiEndpoints
 
             ctx.Response.ContentType = "application/json";
             await ctx.Response.WriteAsync(
-                JsonSerializer.Serialize(response, AppJsonContext.Default.ChatCompletionResponse),
+                JsonSerializer.Serialize(response, SharpInferenceJsonContext.Default.ChatCompletionResponse),
                 ctx.RequestAborted);
         }
     }
@@ -155,12 +158,12 @@ public static class OpenAiEndpoints
         var response = new ModelsResponse("list", [new ModelInfo(engine.ModelId, "model", created, "sharpi")]);
         ctx.Response.ContentType = "application/json";
         return ctx.Response.WriteAsync(
-            JsonSerializer.Serialize(response, AppJsonContext.Default.ModelsResponse),
+            JsonSerializer.Serialize(response, SharpInferenceJsonContext.Default.ModelsResponse),
             ctx.RequestAborted);
     }
 
     private static List<(string role, string content)> BuildMessageList(
-        OaiMessage[] messages, string arch, string? responseFormatType = null)
+        OaiMessage[] messages, string? responseFormatType = null)
     {
         var list = new List<(string, string)>(messages.Length + 1);
         if (responseFormatType == "json_object")

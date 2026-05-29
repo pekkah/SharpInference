@@ -439,3 +439,6 @@ codebooks/*.bin
 models/
 tools/
 tmp/
+
+# Per-developer host overrides (model paths, etc.) — not committed
+**/appsettings.Local.json

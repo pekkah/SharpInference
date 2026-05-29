@@ -1,11 +1,33 @@
-<Project Sdk="Microsoft.NET.Sdk.Web">
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    SharpInference.Server is an ASP.NET Core class library: it ships
+    AddSharpInference() / MapSharpInference() and the request/response shapes
+    for the OpenAI, Anthropic, and Responses APIs. A separate host project
+    references it and supplies Program.cs.
+
+    Trim/AOT analyzers are explicitly disabled here (overriding the repo-wide
+    Directory.Build.props defaults). The ASP.NET Core RequestDelegate / minimal-
+    API surface is not trim-safe today, and the analyzer-driven trim path is what
+    tripped up NVRTC kernel-source preservation in the host (issue #94). The CLI
+    is the AOT-publish target for SharpInference, not the server.
+  -->
 
   <PropertyGroup>
-    <PublishAot>true</PublishAot>
+    <Description>ASP.NET Core endpoints, options, and DI extensions that expose SharpInference as OpenAI- and Anthropic-compatible HTTP APIs. Bring your own host.</Description>
+    <IsTrimmable>false</IsTrimmable>
+    <EnableTrimAnalyzer>false</EnableTrimAnalyzer>
+    <EnableAotAnalyzer>false</EnableAotAnalyzer>
+    <SuppressTrimAnalysisWarnings>true</SuppressTrimAnalysisWarnings>
   </PropertyGroup>
 
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\SharpInference.Engine\SharpInference.Engine.csproj" />
+    <ProjectReference Include="..\SharpInference.Cpu\SharpInference.Cpu.csproj" />
   </ItemGroup>
 
 </Project>

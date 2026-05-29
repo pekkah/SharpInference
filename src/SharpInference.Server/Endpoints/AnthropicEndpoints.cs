@@ -1,6 +1,9 @@
 using System.Text;
 using System.Text.Json;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Routing;
+using Microsoft.Extensions.Options;
 using SharpInference.Core;
 using SharpInference.Engine;
 
@@ -16,12 +19,16 @@ public static class AnthropicEndpoints
 
     private static async Task HandleMessages(
         HttpContext ctx,
-        IInferenceEngine engine)
+        IInferenceEngine engine,
+        ChatTemplateRenderer chatTemplate,
+        ServerMetrics metrics,
+        IOptions<SharpInferenceServerOptions> options)
     {
+        var opts = options.Value;
         AnthropicMessageRequest? req;
         try
         {
-            req = await ctx.Request.ReadFromJsonAsync(AppJsonContext.Default.AnthropicMessageRequest, ctx.RequestAborted);
+            req = await ctx.Request.ReadFromJsonAsync(SharpInferenceJsonContext.Default.AnthropicMessageRequest, ctx.RequestAborted);
         }
         catch
         {
@@ -35,13 +42,12 @@ public static class AnthropicEndpoints
             ctx.Response.ContentType = "application/json";
             await ctx.Response.WriteAsync(
                 JsonSerializer.Serialize(new AErrorResponse("invalid_request_error", "messages array is required"),
-                    AppJsonContext.Default.AErrorResponse), ctx.RequestAborted);
+                    SharpInferenceJsonContext.Default.AErrorResponse), ctx.RequestAborted);
             return;
         }
 
-        HealthEndpoints.RecordRequest();
+        metrics.RecordRequest();
 
-        var modelArch = Environment.GetEnvironmentVariable("SHARPI_ARCH") ?? "qwen2";
         // Anthropic-style thinking control: {"type":"disabled"} turns it off; absence or any
         // other value (including {"type":"enabled"}) leaves it on. BudgetTokens, when present,
         // maps to SamplingParams.MaxThinkingTokens — the engine force-closes the <think> block
@@ -52,37 +58,36 @@ public static class AnthropicEndpoints
         if (req.Tools is { Length: > 0 })
         {
             var (richMessages, tools) = BuildRichMessageList(req);
-            prompt = ChatTemplate.Format(richMessages, modelArch, enableThinking, tools);
+            prompt = chatTemplate.Format(richMessages, enableThinking, tools);
         }
         else
         {
             var messages = BuildMessageList(req);
-            prompt = ChatTemplate.Format(messages, modelArch, enableThinking);
+            prompt = chatTemplate.Format(messages, enableThinking);
         }
 
-        var sp = new SamplingParams
-        {
-            Temperature = req.Temperature ?? 1.0f,
-            TopP = req.TopP ?? 1.0f,
-            MaxNewTokens = req.MaxTokens,
-            MaxThinkingTokens = req.Thinking?.BudgetTokens ?? 0,
-        };
+        var sp = SamplingParamsBuilder.Build(opts,
+            temperature: req.Temperature,
+            topP:        req.TopP,
+            topK:        req.TopK,
+            maxTokens:   req.MaxTokens,
+            maxThinking: req.Thinking?.BudgetTokens);
 
         var msgId = $"msg_{Guid.NewGuid():N}";
         var modelId = engine.ModelId;
 
         if (req.Stream == true)
         {
-            await HandleStreaming(ctx, engine, prompt, sp, msgId, modelId);
+            await HandleStreaming(ctx, engine, metrics, prompt, sp, msgId, modelId);
         }
         else
         {
-            await HandleNonStreaming(ctx, engine, prompt, sp, msgId, modelId);
+            await HandleNonStreaming(ctx, engine, metrics, prompt, sp, msgId, modelId);
         }
     }
 
     private static async Task HandleNonStreaming(
-        HttpContext ctx, IInferenceEngine engine, string prompt, SamplingParams sp,
+        HttpContext ctx, IInferenceEngine engine, ServerMetrics metrics, string prompt, SamplingParams sp,
         string msgId, string modelId)
     {
         var thinkingSb = new StringBuilder();
@@ -98,7 +103,7 @@ public static class AnthropicEndpoints
                 textSb.Append(chunk.Text);
         }
 
-        HealthEndpoints.RecordTokens(totalOutputTokens);
+        metrics.RecordTokens(totalOutputTokens);
 
         var contentList = new List<AContent>();
 
@@ -136,12 +141,12 @@ public static class AnthropicEndpoints
 
         ctx.Response.ContentType = "application/json";
         await ctx.Response.WriteAsync(
-            JsonSerializer.Serialize(response, AppJsonContext.Default.AnthropicMessageResponse),
+            JsonSerializer.Serialize(response, SharpInferenceJsonContext.Default.AnthropicMessageResponse),
             ctx.RequestAborted);
     }
 
     private static async Task HandleStreaming(
-        HttpContext ctx, IInferenceEngine engine, string prompt, SamplingParams sp,
+        HttpContext ctx, IInferenceEngine engine, ServerMetrics metrics, string prompt, SamplingParams sp,
         string msgId, string modelId)
     {
         ctx.Response.ContentType = "text/event-stream";
@@ -152,7 +157,7 @@ public static class AnthropicEndpoints
         var startMsg = new AMessageStartEvent("message_start",
             new AMessageStartInner(msgId, "message", "assistant", modelId, "max_tokens", new AUsage(0, 0)));
         await WriteAnthropicEvent(ctx.Response, "message_start",
-            JsonSerializer.Serialize(startMsg, AppJsonContext.Default.AMessageStartEvent));
+            JsonSerializer.Serialize(startMsg, SharpInferenceJsonContext.Default.AMessageStartEvent));
 
         // Per Anthropic's protocol, thinking (when present) is index 0 and text is index 1.
         // If no thinking chunks ever arrive, the text block takes index 0. Open each block
@@ -186,11 +191,11 @@ public static class AnthropicEndpoints
                     var sigDelta = new AContentBlockDeltaEvent("content_block_delta", 0,
                         new AContentDelta("signature_delta", Signature: MakeSignatureStub(thinkingSb.ToString())));
                     await WriteAnthropicEvent(ctx.Response, "content_block_delta",
-                        JsonSerializer.Serialize(sigDelta, AppJsonContext.Default.AContentBlockDeltaEvent));
+                        JsonSerializer.Serialize(sigDelta, SharpInferenceJsonContext.Default.AContentBlockDeltaEvent));
                     thinkingClosed = true;
                     await WriteAnthropicEvent(ctx.Response, "content_block_stop",
                         JsonSerializer.Serialize(new AContentBlockStopEvent("content_block_stop", 0),
-                            AppJsonContext.Default.AContentBlockStopEvent));
+                            SharpInferenceJsonContext.Default.AContentBlockStopEvent));
                     nextBlockIndex = 1;
                 }
 
@@ -198,14 +203,14 @@ public static class AnthropicEndpoints
                 var textStart = new AContentBlockStartEvent("content_block_start", textIndex,
                     new AContentBlock("text", Text: ""));
                 await WriteAnthropicEvent(ctx.Response, "content_block_start",
-                    JsonSerializer.Serialize(textStart, AppJsonContext.Default.AContentBlockStartEvent));
+                    JsonSerializer.Serialize(textStart, SharpInferenceJsonContext.Default.AContentBlockStartEvent));
                 textOpen = true;
             }
 
             var delta = new AContentBlockDeltaEvent("content_block_delta", textIndex,
                 new AContentDelta("text_delta", Text: text));
             await WriteAnthropicEvent(ctx.Response, "content_block_delta",
-                JsonSerializer.Serialize(delta, AppJsonContext.Default.AContentBlockDeltaEvent));
+                JsonSerializer.Serialize(delta, SharpInferenceJsonContext.Default.AContentBlockDeltaEvent));
         }
 
         async Task EmitToolCallBlock(string blockContent)
@@ -223,7 +228,7 @@ public static class AnthropicEndpoints
             {
                 await WriteAnthropicEvent(ctx.Response, "content_block_stop",
                     JsonSerializer.Serialize(new AContentBlockStopEvent("content_block_stop", textIndex),
-                        AppJsonContext.Default.AContentBlockStopEvent));
+                        SharpInferenceJsonContext.Default.AContentBlockStopEvent));
                 textOpen = false;
                 nextBlockIndex = textIndex + 1;
             }
@@ -235,16 +240,16 @@ public static class AnthropicEndpoints
             var toolStart = new AContentBlockStartEvent("content_block_start", toolIdx,
                 new AContentBlock("tool_use", Id: id, Name: name, Input: EmptyJsonObject));
             await WriteAnthropicEvent(ctx.Response, "content_block_start",
-                JsonSerializer.Serialize(toolStart, AppJsonContext.Default.AContentBlockStartEvent));
+                JsonSerializer.Serialize(toolStart, SharpInferenceJsonContext.Default.AContentBlockStartEvent));
 
             var inputDelta = new AContentBlockDeltaEvent("content_block_delta", toolIdx,
                 new AContentDelta("input_json_delta", PartialJson: argsJson));
             await WriteAnthropicEvent(ctx.Response, "content_block_delta",
-                JsonSerializer.Serialize(inputDelta, AppJsonContext.Default.AContentBlockDeltaEvent));
+                JsonSerializer.Serialize(inputDelta, SharpInferenceJsonContext.Default.AContentBlockDeltaEvent));
 
             await WriteAnthropicEvent(ctx.Response, "content_block_stop",
                 JsonSerializer.Serialize(new AContentBlockStopEvent("content_block_stop", toolIdx),
-                    AppJsonContext.Default.AContentBlockStopEvent));
+                    SharpInferenceJsonContext.Default.AContentBlockStopEvent));
         }
 
         // Process a text-stream chunk through the tool-call detection state machine.
@@ -311,7 +316,7 @@ public static class AnthropicEndpoints
                         var thinkingStart = new AContentBlockStartEvent("content_block_start", 0,
                             new AContentBlock("thinking", Thinking: ""));
                         await WriteAnthropicEvent(ctx.Response, "content_block_start",
-                            JsonSerializer.Serialize(thinkingStart, AppJsonContext.Default.AContentBlockStartEvent));
+                            JsonSerializer.Serialize(thinkingStart, SharpInferenceJsonContext.Default.AContentBlockStartEvent));
                         thinkingOpen = true;
                         nextBlockIndex = 1;
                     }
@@ -320,7 +325,7 @@ public static class AnthropicEndpoints
                     var delta = new AContentBlockDeltaEvent("content_block_delta", 0,
                         new AContentDelta("thinking_delta", Thinking: chunk.Text));
                     await WriteAnthropicEvent(ctx.Response, "content_block_delta",
-                        JsonSerializer.Serialize(delta, AppJsonContext.Default.AContentBlockDeltaEvent));
+                        JsonSerializer.Serialize(delta, SharpInferenceJsonContext.Default.AContentBlockDeltaEvent));
                 }
                 else // Text (may contain <tool_call> tags)
                 {
@@ -346,10 +351,10 @@ public static class AnthropicEndpoints
                     var sigDelta = new AContentBlockDeltaEvent("content_block_delta", 0,
                         new AContentDelta("signature_delta", Signature: MakeSignatureStub(thinkingSb.ToString())));
                     await WriteAnthropicEvent(ctx.Response, "content_block_delta",
-                        JsonSerializer.Serialize(sigDelta, AppJsonContext.Default.AContentBlockDeltaEvent));
+                        JsonSerializer.Serialize(sigDelta, SharpInferenceJsonContext.Default.AContentBlockDeltaEvent));
                     await WriteAnthropicEvent(ctx.Response, "content_block_stop",
                         JsonSerializer.Serialize(new AContentBlockStopEvent("content_block_stop", 0),
-                            AppJsonContext.Default.AContentBlockStopEvent));
+                            SharpInferenceJsonContext.Default.AContentBlockStopEvent));
                 }
                 catch { /* response already aborted */ }
             }
@@ -359,7 +364,7 @@ public static class AnthropicEndpoints
                 {
                     await WriteAnthropicEvent(ctx.Response, "content_block_stop",
                         JsonSerializer.Serialize(new AContentBlockStopEvent("content_block_stop", textIndex),
-                            AppJsonContext.Default.AContentBlockStopEvent));
+                            SharpInferenceJsonContext.Default.AContentBlockStopEvent));
                 }
                 catch { /* response already aborted */ }
             }
@@ -376,10 +381,10 @@ public static class AnthropicEndpoints
                 var textStart = new AContentBlockStartEvent("content_block_start", idx,
                     new AContentBlock("text", Text: ""));
                 await WriteAnthropicEvent(ctx.Response, "content_block_start",
-                    JsonSerializer.Serialize(textStart, AppJsonContext.Default.AContentBlockStartEvent));
+                    JsonSerializer.Serialize(textStart, SharpInferenceJsonContext.Default.AContentBlockStartEvent));
                 await WriteAnthropicEvent(ctx.Response, "content_block_stop",
                     JsonSerializer.Serialize(new AContentBlockStopEvent("content_block_stop", idx),
-                        AppJsonContext.Default.AContentBlockStopEvent));
+                        SharpInferenceJsonContext.Default.AContentBlockStopEvent));
             }
             catch { /* response already aborted */ }
         }
@@ -389,14 +394,14 @@ public static class AnthropicEndpoints
         var msgDelta = new AMessageDeltaEvent("message_delta",
             new AMessageDelta(stopReason, null), new AUsage(0, outputTokens));
         await WriteAnthropicEvent(ctx.Response, "message_delta",
-            JsonSerializer.Serialize(msgDelta, AppJsonContext.Default.AMessageDeltaEvent));
+            JsonSerializer.Serialize(msgDelta, SharpInferenceJsonContext.Default.AMessageDeltaEvent));
 
         // message_stop
         await WriteAnthropicEvent(ctx.Response, "message_stop",
-            JsonSerializer.Serialize(new ATypeOnly("message_stop"), AppJsonContext.Default.ATypeOnly));
+            JsonSerializer.Serialize(new ATypeOnly("message_stop"), SharpInferenceJsonContext.Default.ATypeOnly));
 
         await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
-        HealthEndpoints.RecordTokens(outputTokens);
+        metrics.RecordTokens(outputTokens);
     }
 
     /// <summary>
@@ -653,7 +658,7 @@ public sealed record AnthropicMessageResponse(
 /// <summary>
 /// Heterogeneous content block — covers <c>text</c>, <c>thinking</c>, and <c>tool_use</c>
 /// shapes via optional fields. Null-valued fields are stripped from JSON output (see
-/// <see cref="AppJsonContext"/>'s <c>WhenWritingNull</c> setting), so the wire format is
+/// <see cref="SharpInferenceJsonContext"/>'s <c>WhenWritingNull</c> setting), so the wire format is
 /// byte-identical to Anthropic's per-type shapes. A single record keeps the response
 /// array NativeAOT-friendly (no polymorphic serialization needed).
 /// </summary>
@@ -705,4 +710,3 @@ public sealed record AMessageDeltaEvent(string Type, AMessageDelta Delta, AUsage
 public sealed record AMessageDelta(string StopReason, string? StopSequence);
 public sealed record ATypeOnly(string Type);
 public sealed record AErrorResponse(string Type, string Message);
-

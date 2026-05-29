@@ -1,7 +1,9 @@
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Routing;
+using Microsoft.Extensions.Options;
 using SharpInference.Engine;
 
 namespace SharpInference.Server.Endpoints;
@@ -22,12 +24,15 @@ public static class ResponsesEndpoints
     private static async Task HandleCreateResponse(
         HttpContext ctx,
         IInferenceEngine engine,
-        string? arch = null)
+        ChatTemplateRenderer chatTemplate,
+        ServerMetrics metrics,
+        IOptions<SharpInferenceServerOptions> options)
     {
+        var opts = options.Value;
         ResponsesRequest? req;
         try
         {
-            req = await ctx.Request.ReadFromJsonAsync(AppJsonContext.Default.ResponsesRequest, ctx.RequestAborted);
+            req = await ctx.Request.ReadFromJsonAsync(SharpInferenceJsonContext.Default.ResponsesRequest, ctx.RequestAborted);
         }
         catch
         {
@@ -41,18 +46,15 @@ public static class ResponsesEndpoints
             return;
         }
 
-        HealthEndpoints.RecordRequest();
+        metrics.RecordRequest();
 
-        var modelArch = arch ?? Environment.GetEnvironmentVariable("SHARPI_ARCH") ?? "qwen2";
         var messages = BuildMessageList(req);
-        var prompt = ChatTemplate.Format(messages, modelArch);
+        var prompt = chatTemplate.Format(messages);
 
-        var sp = new SamplingParams
-        {
-            Temperature = req.Temperature ?? 1.0f,
-            TopP = req.TopP ?? 1.0f,
-            MaxNewTokens = req.MaxOutputTokens ?? 512,
-        };
+        var sp = SamplingParamsBuilder.Build(opts,
+            temperature: req.Temperature,
+            topP:        req.TopP,
+            maxTokens:   req.MaxOutputTokens);
 
         var responseId = $"resp_{Guid.NewGuid():N}";
         var itemId = $"msg_{Guid.NewGuid():N}";
@@ -70,19 +72,19 @@ public static class ResponsesEndpoints
                 new RespObject(responseId, "response", createdAt, modelId, "in_progress",
                     [], new RespUsage(0, 0, 0)));
             await WriteEvent(ctx.Response, "response.created",
-                JsonSerializer.Serialize(createdEvent, AppJsonContext.Default.RespCreatedEvent));
+                JsonSerializer.Serialize(createdEvent, SharpInferenceJsonContext.Default.RespCreatedEvent));
 
             // response.output_item.added
             var itemAddedEvent = new RespOutputItemAddedEvent("response.output_item.added", 0,
                 new RespOutputItem(itemId, "message", "assistant", []));
             await WriteEvent(ctx.Response, "response.output_item.added",
-                JsonSerializer.Serialize(itemAddedEvent, AppJsonContext.Default.RespOutputItemAddedEvent));
+                JsonSerializer.Serialize(itemAddedEvent, SharpInferenceJsonContext.Default.RespOutputItemAddedEvent));
 
             // response.content_part.added
             var partAddedEvent = new RespContentPartAddedEvent("response.content_part.added",
                 itemId, 0, 0, new RespContentPart("output_text", ""));
             await WriteEvent(ctx.Response, "response.content_part.added",
-                JsonSerializer.Serialize(partAddedEvent, AppJsonContext.Default.RespContentPartAddedEvent));
+                JsonSerializer.Serialize(partAddedEvent, SharpInferenceJsonContext.Default.RespContentPartAddedEvent));
 
             var sb = new StringBuilder();
             long tokenCount = 0;
@@ -93,7 +95,7 @@ public static class ResponsesEndpoints
                 var deltaEvent = new RespOutputTextDeltaEvent("response.output_text.delta",
                     itemId, 0, 0, token);
                 await WriteEvent(ctx.Response, "response.output_text.delta",
-                    JsonSerializer.Serialize(deltaEvent, AppJsonContext.Default.RespOutputTextDeltaEvent));
+                    JsonSerializer.Serialize(deltaEvent, SharpInferenceJsonContext.Default.RespOutputTextDeltaEvent));
             }
 
             string fullText = sb.ToString();
@@ -102,14 +104,14 @@ public static class ResponsesEndpoints
             var textDoneEvent = new RespOutputTextDoneEvent("response.output_text.done",
                 itemId, 0, 0, fullText);
             await WriteEvent(ctx.Response, "response.output_text.done",
-                JsonSerializer.Serialize(textDoneEvent, AppJsonContext.Default.RespOutputTextDoneEvent));
+                JsonSerializer.Serialize(textDoneEvent, SharpInferenceJsonContext.Default.RespOutputTextDoneEvent));
 
             // response.output_item.done
             var finalItem = new RespOutputItem(itemId, "message", "assistant",
                 [new RespContentPart("output_text", fullText)]);
             var itemDoneEvent = new RespOutputItemDoneEvent("response.output_item.done", 0, finalItem);
             await WriteEvent(ctx.Response, "response.output_item.done",
-                JsonSerializer.Serialize(itemDoneEvent, AppJsonContext.Default.RespOutputItemDoneEvent));
+                JsonSerializer.Serialize(itemDoneEvent, SharpInferenceJsonContext.Default.RespOutputItemDoneEvent));
 
             // response.completed
             var usage = new RespUsage(0, (int)tokenCount, (int)tokenCount);
@@ -117,10 +119,10 @@ public static class ResponsesEndpoints
                 [finalItem], usage);
             var completedEvent = new RespCompletedEvent("response.completed", completedResp);
             await WriteEvent(ctx.Response, "response.completed",
-                JsonSerializer.Serialize(completedEvent, AppJsonContext.Default.RespCompletedEvent));
+                JsonSerializer.Serialize(completedEvent, SharpInferenceJsonContext.Default.RespCompletedEvent));
 
             await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
-            HealthEndpoints.RecordTokens(tokenCount);
+            metrics.RecordTokens(tokenCount);
         }
         else
         {
@@ -141,10 +143,10 @@ public static class ResponsesEndpoints
 
             ctx.Response.ContentType = "application/json";
             await ctx.Response.WriteAsync(
-                JsonSerializer.Serialize(response, AppJsonContext.Default.RespObject),
+                JsonSerializer.Serialize(response, SharpInferenceJsonContext.Default.RespObject),
                 ctx.RequestAborted);
 
-            HealthEndpoints.RecordTokens(tokenCount);
+            metrics.RecordTokens(tokenCount);
         }
     }
 

@@ -22,6 +22,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\SharpInference.Server\SharpInference.Server.csproj" />
+    <ProjectReference Include="..\..\src\SharpInference.Server.Host\SharpInference.Server.Host.csproj" />
   </ItemGroup>
 
 </Project>

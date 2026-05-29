@@ -18,6 +18,7 @@
     <Project Path="src/SharpInference.Engine/SharpInference.Engine.csproj" />
     <Project Path="src/SharpInference.Pipeline/SharpInference.Pipeline.csproj" />
     <Project Path="src/SharpInference.Server/SharpInference.Server.csproj" />
+    <Project Path="src/SharpInference.Server.Host/SharpInference.Server.Host.csproj" />
     <Project Path="src/SharpInference.TurboQuant/SharpInference.TurboQuant.csproj" />
     <Project Path="src/SharpInference.Vulkan/SharpInference.Vulkan.csproj" />
   </Folder>

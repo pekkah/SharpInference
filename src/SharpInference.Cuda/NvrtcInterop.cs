@@ -67,6 +67,32 @@ internal static unsafe partial class NvrtcInterop
     [LibraryImport("nvcuda", EntryPoint = "cuInit")]
     internal static partial int CuInit(uint flags);
 
+    [LibraryImport("nvcuda", EntryPoint = "cuDeviceGet")]
+    internal static partial int DeviceGet(out int device, int ordinal);
+
+    /// <summary>
+    /// Retain the device's primary context (the one the Runtime API auto-attaches and that
+    /// cuBLAS handles bind to internally). Bumps an internal refcount; pair with
+    /// <see cref="DevicePrimaryCtxRelease"/> on shutdown.
+    /// </summary>
+    [LibraryImport("nvcuda", EntryPoint = "cuDevicePrimaryCtxRetain")]
+    internal static partial int DevicePrimaryCtxRetain(out nint pctx, int dev);
+
+    [LibraryImport("nvcuda", EntryPoint = "cuDevicePrimaryCtxRelease")]
+    internal static partial int DevicePrimaryCtxRelease(int dev);
+
+    /// <summary>
+    /// Make <paramref name="ctx"/> the current CUDA context on the calling thread.
+    /// Required before raw Driver-API calls (cuModuleLoadData, cuLaunchKernel) when the
+    /// thread isn't the one that originally established the context. cuBLAS handles its
+    /// own context binding so its APIs work cross-thread without this; cuModule does not.
+    /// </summary>
+    [LibraryImport("nvcuda", EntryPoint = "cuCtxSetCurrent")]
+    internal static partial int CtxSetCurrent(nint ctx);
+
+    [LibraryImport("nvcuda", EntryPoint = "cuCtxGetCurrent")]
+    internal static partial int CtxGetCurrent(out nint ctx);
+
     /// <summary>Load a PTX string (null-terminated) into a module.</summary>
     [LibraryImport("nvcuda", EntryPoint = "cuModuleLoadData")]
     internal static partial int ModuleLoadData(out nint module, byte* image);

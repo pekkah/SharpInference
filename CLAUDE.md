@@ -22,13 +22,15 @@ dotnet run --project src/SharpInference.Cli -c Release -- \
 dotnet run --project src/SharpInference.Cli -c Release -- \
   -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -p "prompt" --temp 0 -g -1
 
-# Start API server (OpenAI + Anthropic compatible)
+# Start API server (OpenAI + Anthropic compatible). SharpInference.Server is the
+# ASP.NET Core library that ships AddSharpInference() / MapSharpInference();
+# SharpInference.Server.Host is the runnable demo host you'd publish.
 SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
-  dotnet run --project src/SharpInference.Server -c Release
+  dotnet run --project src/SharpInference.Server.Host -c Release
 
 # NativeAOT publish
 dotnet publish src/SharpInference.Cli -c Release -r win-x64
-dotnet publish src/SharpInference.Server -c Release -r win-x64
+dotnet publish src/SharpInference.Server.Host -c Release -r win-x64
 
 # Benchmarks
 dotnet run --project benchmarks/SharpInference.Bench -c Release -- --filter '*'
@@ -57,7 +59,7 @@ Four-layer stack, bottom-up:
    - `SharpInference.Vulkan` — Vulkan compute via `Vortice.Vulkan`, SPIR-V shaders, GPU buffer pool
    - `SharpInference.Cuda` — cuBLAS GEMM (fp32/bf16/fp16/fp8) + NVRTC custom kernels (im2col, element-wise ops) for DiT and RRDBNet; includes `GpuBufferPool` to eliminate per-GEMM `cudaMalloc`/`cudaFree` overhead
 3. **Engine** (`SharpInference.Engine`) — Forward pass orchestration, KV cache, temperature/top-k/top-p/min-p sampling, speculative decoding. Depends on Core + both backends.
-4. **Frontends** — CLI (`Spectre.Console.Cli`, llama.cpp-compatible flags) and API Server (ASP.NET Core Minimal API with `/v1/messages` Anthropic + `/v1/chat/completions` OpenAI endpoints).
+4. **Frontends** — CLI (`Spectre.Console.Cli`, llama.cpp-compatible flags) and API Server. The API server is split: `SharpInference.Server` is an ASP.NET Core class library exposing `AddSharpInference()` / `MapSharpInference()` with the `SharpInferenceServerOptions` options pattern (`/v1/messages` Anthropic + `/v1/chat/completions` OpenAI endpoints); `SharpInference.Server.Host` is the runnable demo host (one `Program.cs`, AOT-published) that consumes it.
 
 Supporting libraries:
 - **TurboQuant** — KV cache compression using Lloyd-Max codebooks (3-4 bit). Codebook data lives in `codebooks/`.
