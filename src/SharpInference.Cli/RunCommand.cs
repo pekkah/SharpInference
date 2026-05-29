@@ -275,8 +275,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 case "":
                     // Auto: pick CUDA when available. CudaForwardPass handles full-offload
                     // (dense + MoE); CudaHybridForwardPass handles partial-offload (dense or
-                    // MoE with eager per-layer expert loading). TQ on CUDA requires
-                    // head_dim ∈ {128, 256}.
+                    // MoE; routed experts stream through the CudaExpertSlotManager SLRU).
+                    // TQ on CUDA requires head_dim ∈ {128, 256}.
                     bool tqHeadDimOk = hp.HeadDim is 128 or 256;
                     wantCuda = (!settings.TurboQuant || tqHeadDimOk)
                         && CudaBackend.IsAvailable();

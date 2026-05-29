@@ -40,9 +40,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     // Eager per-expert weights for CUDA GPU layers — every expert is VRAM-resident,
     // so the per-token MoE FFN is a straight indexed lookup. Different from the Vulkan
     // hybrid's lazy SLRU slot cache: simpler, but the model must fit in VRAM after
-    // accounting for KV cache + scratch. Sized [nGpuLayers][numExperts]; null when
-    // not MoE or there are no GPU layers.
-    private readonly Tensor[][]? _gpuWGateExps, _gpuWUpExps, _gpuWDownExps;
+    // accounting for KV cache + scratch.
     private readonly Tensor[]? _gpuBq, _gpuBk, _gpuBv, _gpuBo;
     private readonly Tensor[]? _gpuQNorm, _gpuKNorm;
     private readonly Tensor[] _gpuKCache, _gpuVCache;
@@ -99,18 +97,14 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     private readonly float* _ropeSinTable;
     private readonly int _ropeHalfDim;
 
-    // ── Expert slot cache (for MoE GPU layers with lazy/evictable expert loading) ──
-    // These fields stay declared for symmetry with HybridForwardPass — CUDA hybrid
-    // currently refuses MoE+GPU at construction time, so the MoE GPU dispatch below
-    // is unreachable and these fields are always null. Pragma-suppressed so the
-    // unused-readonly check doesn't elevate to error under TreatWarningsAsErrors.
-#pragma warning disable CS0649
-    private readonly ExpertSlotManager? _expertSlotManager;
-    private readonly MoEPrefetcher? _prefetcher;
-    private readonly Tensor? _gpuFallbackContrib;
-    private readonly Tensor? _gpuPinnedNorm;
-#pragma warning restore CS0649
-    // CUDA hybrid has no CPU expert fallback (every expert is VRAM-resident).
+    // ── Expert slot cache (MoE GPU layers, lazy/evictable expert loading) ──
+    // Routed experts for GPU-tier MoE layers are streamed through this SLRU cache
+    // (mirror of CudaHybridGdnForwardPass), rather than every expert being uploaded
+    // resident. This lets non-GDN MoE models (Mixtral, Qwen3-30B-A3B, Qwen3-Coder)
+    // run with more layers on the GPU than the full expert footprint would allow.
+    // Null when not MoE or there are no GPU layers. Loads are synchronous on miss
+    // (no prefetcher): the GDN path established this is fast enough for k=8 decode.
+    private readonly CudaExpertSlotManager? _expertSlotManager;
 
     public int MaxSeqLen => _maxSeqLen;
     public LayerPlacement Placement => _placement;
@@ -239,9 +233,6 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         _gpuFfnNorm = new Tensor[_nGpuLayers];
         _gpuWGate = new Tensor[_nGpuLayers]; _gpuWUp = new Tensor[_nGpuLayers]; _gpuWDown = new Tensor[_nGpuLayers];
         _gpuWGateInp = _isMoE ? new Tensor[_nGpuLayers] : null;
-        _gpuWGateExps = _isMoE ? new Tensor[_nGpuLayers][] : null;
-        _gpuWUpExps   = _isMoE ? new Tensor[_nGpuLayers][] : null;
-        _gpuWDownExps = _isMoE ? new Tensor[_nGpuLayers][] : null;
         _gpuWGateShexp = _isMoE && _hasSharedExpert ? new Tensor[_nGpuLayers] : null;
         _gpuWUpShexp = _isMoE && _hasSharedExpert ? new Tensor[_nGpuLayers] : null;
         _gpuWDownShexp = _isMoE && _hasSharedExpert ? new Tensor[_nGpuLayers] : null;
@@ -291,12 +282,9 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             if (_isMoE)
             {
                 _gpuWGateInp![i]  = UploadWeight($"blk.{i}.ffn_gate_inp.weight");
-                // Eager per-expert upload — every expert is VRAM-resident. Required because
-                // CUDA hybrid does not yet ship the SLRU slot cache. The TierPlanner is
-                // expected to size nGpuLayers so the total expert footprint fits.
-                _gpuWGateExps![i] = UploadExpertWeights($"blk.{i}.ffn_gate_exps.weight", _expertDim, _embDim,    hp.NumExperts);
-                _gpuWUpExps![i]   = UploadExpertWeights($"blk.{i}.ffn_up_exps.weight",   _expertDim, _embDim,    hp.NumExperts);
-                _gpuWDownExps![i] = UploadExpertWeights($"blk.{i}.ffn_down_exps.weight", _embDim,    _expertDim, hp.NumExperts);
+                // Routed experts are NOT uploaded here — they stream through the
+                // CudaExpertSlotManager SLRU cache (created after this loop). The router
+                // and shared expert stay resident since they run on every token.
                 if (_hasSharedExpert)
                 {
                     _gpuWGateShexp![i] = UploadWeight($"blk.{i}.ffn_gate_shexp.weight");
@@ -342,12 +330,31 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         Console.Error.WriteLine(" done.");
         TraceVram("after all weight uploads");
 
-        // MoE GPU layers use eager expert loading (all experts VRAM-resident).
-        // No slot manager / SLRU cache — keep it simple at the cost of slightly more
-        // VRAM per GPU layer. TierPlanner sizes nGpuLayers so the total expert footprint
-        // fits the remaining VRAM budget.
+        // MoE GPU layers stream routed experts through an SLRU cache. Size it from
+        // the *actual* free VRAM remaining now that attention weights, KV cache and
+        // scratch are uploaded (cudaMemGetInfo via FreeVramBytes), capped at the full
+        // GPU-layer expert count. Capping at totalGpuExperts means the cache can never
+        // hold more than the old eager path did — which TierPlanner already verified
+        // fits — so there is no new OOM risk; the budget term only *shrinks* capacity
+        // when VRAM is tight (e.g. the user forced extra GPU layers via -g), enabling
+        // streaming instead of an OOM.
         if (_isMoE && _nGpuLayers > 0)
-            Console.Error.WriteLine($"[CudaHybridForwardPass] MoE eager expert load: {hp.NumExperts} experts × {_nGpuLayers} GPU layers (gate+up+down).");
+        {
+            int totalGpuExperts = _nGpuLayers * hp.NumExperts;
+            long perExpert = PerExpertBytes();
+            long reserve = 512L << 20; // 512 MiB headroom for transient per-GEMM scratch
+            long free = (long)gpu.FreeVramBytes;
+            int byBudget = perExpert > 0
+                ? (int)Math.Max(0, (free - reserve) / perExpert)
+                : totalGpuExperts;
+            int floor = Math.Min(totalGpuExperts, 64);
+            int capacity = Math.Clamp(byBudget, floor, totalGpuExperts);
+            Console.Error.WriteLine(
+                $"[CudaHybridForwardPass] SLRU expert cache: {capacity} slots / {totalGpuExperts} total " +
+                $"({hp.NumExperts} experts × {_nGpuLayers} GPU layers, per-expert ≈ {perExpert / 1024} KiB, " +
+                $"free VRAM ≈ {free / (1024 * 1024)} MiB).");
+            _expertSlotManager = new CudaExpertSlotManager(gpu, model, hp, capacity, _gpuWeightDTypes);
+        }
 
         // ── Resolve CPU weights (layers nGpuLayers..numLayers-1) ──
         _cpuHidden = Alloc(_embDim);
@@ -1311,10 +1318,9 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
 
     private void GpuMoeFfn(int layer)
     {
-        // Eager-loaded variant of GpuForwardPass.GpuMoeFfn / CudaForwardPass.MoeFfn:
-        // every expert is VRAM-resident, so the per-token MoE FFN is a straight
-        // indexed lookup over (_gpuWGateExps/_gpuWUpExps/_gpuWDownExps)[layer][expertIdx].
-        // No slot manager, no CPU fallback, no host-coherent pinned norm copy — CUDA's
+        // SLRU-streamed variant (mirror of CudaHybridGdnForwardPass.GpuMoeFfn): each
+        // selected routed expert is fetched via _expertSlotManager.GetOrLoad, which
+        // returns a cached slot or synchronously uploads-then-caches on miss. CUDA's
         // implicit stream ordering removes the explicit barrier vocabulary the Vulkan
         // version needs.
         int numActive = _hp.NumActiveExperts;
@@ -1344,9 +1350,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         {
             int expertIdx = selectedExperts[i];
             float expertWeight = expertWeights[i];
+            var slot = _expertSlotManager!.GetOrLoad(layer, expertIdx);
 
-            GpuMatMul(_gpuFfnGate, _gpuWGateExps![layer][expertIdx], _gpuNormBuf);
-            GpuMatMul(_gpuFfnUp,   _gpuWUpExps![layer][expertIdx],   _gpuNormBuf);
+            GpuMatMul(_gpuFfnGate, slot.Gate, _gpuNormBuf);
+            GpuMatMul(_gpuFfnUp,   slot.Up,   _gpuNormBuf);
 
             if (_hp.UseSigmoidGating)
             {
@@ -1355,7 +1362,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             }
 
             _gpu.SiLuMul(_gpuFfnGate, _gpuFfnUp);
-            GpuMatMul(_gpuMoeExpertOut!, _gpuWDownExps![layer][expertIdx], _gpuFfnGate);
+            GpuMatMul(_gpuMoeExpertOut!, slot.Down, _gpuFfnGate);
 
             if (_hp.UseSigmoidGating)
                 _gpu.AddInPlace(_gpuHidden, _gpuMoeExpertOut!);
@@ -1367,16 +1374,26 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             _gpu.AddInPlace(_gpuHidden, _gpuMoeSharedOut!);
     }
 
-    // GpuMoeFfnCpuFallback removed for CUDA hybrid: every expert is eagerly resident
-    // on the GPU, so there's no slot-cache miss to spill to CPU. ExpertMatVec is still
-    // used by CpuMoeFfn for the all-CPU layer slice.
+    // Routed-expert weights are uploaded lazily by CudaExpertSlotManager on cache
+    // miss, not eagerly here. (The shared expert and router stay resident.)
 
-    private Tensor[] UploadExpertWeights(string name, int rows, int cols, int expertCount)
+    /// <summary>
+    /// On-VRAM bytes for one expert's three weight tensors (gate + up + down), used to
+    /// size the SLRU slot capacity. Mirrors CudaExpertSlotManager's upload accounting:
+    /// Q4_K/Q5_K/Q6_K are stored raw; other dtypes expand to F32.
+    /// </summary>
+    private long PerExpertBytes()
     {
-        var tensors = new Tensor[expertCount];
-        for (int expertIdx = 0; expertIdx < expertCount; expertIdx++)
-            tensors[expertIdx] = UploadExpertWeight(name, rows, cols, expertIdx);
-        return tensors;
+        long Bytes(string name, int rows, int cols)
+        {
+            if (_model.FindTensor(name) is not { } info) return 0;
+            if (info.DType is DType.Q4_K or DType.Q5_K or DType.Q6_K)
+                return (long)rows * (cols / DTypeInfo.BlockSize(info.DType)) * DTypeInfo.BytesPerBlock(info.DType);
+            return (long)rows * cols * sizeof(float); // F32 (native or dequantized)
+        }
+        return Bytes("blk.0.ffn_gate_exps.weight", _expertDim, _embDim)
+             + Bytes("blk.0.ffn_up_exps.weight",   _expertDim, _embDim)
+             + Bytes("blk.0.ffn_down_exps.weight", _embDim,    _expertDim);
     }
 
     private Tensor UploadTqSignPatterns(int layerIndex)
@@ -1389,48 +1406,6 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         }
 
         return _gpu.Upload(fullSigns, TensorShape.D1(fullSigns.Length));
-    }
-
-    private Tensor UploadExpertWeight(string name, int rows, int cols, int expertIdx)
-    {
-        var info = _model.FindTensor(name)
-            ?? throw new InvalidOperationException($"Missing tensor: {name}");
-        var data = _model.GetTensorData(info);
-
-        // exact=true on every branch: expert weights are session-lifetime. Pool
-        // round-up across (NumExperts × NumLayers) FFN tensors is the dominant
-        // VRAM-waste source on MoE models — reclaiming it widens the SLRU slot count.
-        if (info.DType == DType.Float32)
-        {
-            int elemOffset = expertIdx * rows * cols;
-            var floats = MemoryMarshal.Cast<byte, float>(data).Slice(elemOffset, rows * cols);
-            var result = _gpu.Upload(floats, TensorShape.D1(floats.Length), exact: true);
-            _gpuWeightDTypes[result.Handle] = DType.Float32;
-            return result;
-        }
-
-        int bytesPerRow = (cols / DTypeInfo.BlockSize(info.DType))
-                        * DTypeInfo.BytesPerBlock(info.DType);
-        int expertBytes = rows * bytesPerRow;
-        int byteOffset = expertIdx * expertBytes;
-        var expertData = data.Slice(byteOffset, expertBytes);
-
-        if (info.DType == DType.Q4_K || info.DType == DType.Q6_K)
-        {
-            int floatCount = expertData.Length / 4;
-            var rawFloats = new float[floatCount];
-            expertData.CopyTo(MemoryMarshal.AsBytes(rawFloats.AsSpan()));
-            var result = _gpu.Upload(rawFloats, TensorShape.D1(floatCount), exact: true);
-            _gpuWeightDTypes[result.Handle] = info.DType;
-            return result;
-        }
-
-        int count = rows * cols;
-        var f32 = new float[count];
-        Dequantize.ToFloat32(expertData, f32, info.DType, count);
-        var tensor = _gpu.Upload(f32, TensorShape.D1(count), exact: true);
-        _gpuWeightDTypes[tensor.Handle] = DType.Float32;
-        return tensor;
     }
 
     private static void SelectTopK(ReadOnlySpan<float> logits, int k,
@@ -1535,13 +1510,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             if (_isMoE)
             {
                 _gpu.Free(_gpuWGateInp![i]);
-                // Eager per-expert tensors: free every slot since there's no slot manager here.
-                for (int e = 0; e < _hp.NumExperts; e++)
-                {
-                    _gpu.Free(_gpuWGateExps![i][e]);
-                    _gpu.Free(_gpuWUpExps![i][e]);
-                    _gpu.Free(_gpuWDownExps![i][e]);
-                }
+                // Routed-expert tensors are owned by _expertSlotManager (freed in its Dispose).
                 if (_hasSharedExpert)
                 {
                     _gpu.Free(_gpuWGateShexp![i]);
@@ -1595,9 +1564,17 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         if (_cpuDecompBuf != null) NativeMemory.Free(_cpuDecompBuf);
         _cpuKvCache.Dispose();
         _cpuTqKvCache?.Dispose();
-        _prefetcher?.Dispose();
-        _expertSlotManager?.Dispose();
-        if (_gpuFallbackContrib is not null) _gpu.Free(_gpuFallbackContrib);
-        if (_gpuPinnedNorm is not null) _gpu.Free(_gpuPinnedNorm);
+        if (_expertSlotManager is not null)
+        {
+            // SHARPI_EXPERT_STATS=<path>: dump SLRU hit rate + top experts per layer
+            // (parity with CudaHybridGdnForwardPass).
+            var statsPath = Environment.GetEnvironmentVariable("SHARPI_EXPERT_STATS");
+            if (!string.IsNullOrEmpty(statsPath))
+            {
+                using var w = new StreamWriter(statsPath);
+                _expertSlotManager.Profiler.PrintStats(w);
+            }
+            _expertSlotManager.Dispose();
+        }
     }
 }
