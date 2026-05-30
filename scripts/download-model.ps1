@@ -4,8 +4,8 @@
 .DESCRIPTION
     Downloads from HuggingFace to the models/ directory. Skips if already present.
     Supports: smollm2, qwen3-8b, olmoe-1b-7b, llama31-70b, qwen3-coder-30b-a3b, qwen36-35b-a3b,
-              qwen36-27b-mtp, qwen36-27b-mtp-q5, qwen36-35b-a3b-mtp, llama4-scout, z-image-turbo,
-              z-image-turbo-q8, realesrgan-x4
+              qwen36-27b-mtp, qwen36-27b-mtp-q5, qwen36-35b-a3b-mtp, carnice-35b-a3b-mtp,
+              llama4-scout, z-image-turbo, z-image-turbo-q8, realesrgan-x4
 .PARAMETER Model
     Which model to download. Default: downloads all text models (skips large image models).
 .EXAMPLE
@@ -19,6 +19,7 @@
     .\download-model.ps1 -Model qwen36-27b-mtp          # Qwen3.6 27B-MTP Q4_K_M (15.9 GB) — dense MTP parity oracle for issue #25
     .\download-model.ps1 -Model qwen36-27b-mtp-q5       # Qwen3.6 27B-MTP Q5_K_M (18.5 GB) — higher-quality variant for the MTP bench row
     .\download-model.ps1 -Model qwen36-35b-a3b-mtp -DestDir E:\models  # Qwen3.6 35B-A3B-MTP UD-Q4_K_M (22.7 GB) — MoE MTP perf target for issue #25
+    .\download-model.ps1 -Model carnice-35b-a3b-mtp -DestDir E:\models  # Carnice (Qwen3.6-35B-A3B-MTP, agentic/tool-calling) APEX-MTP I-Compact (17.3 GB)
     .\download-model.ps1 -Model llama4-scout            # Llama 4 Scout Q4_K_M (60.9 GB, 2 shards)
     .\download-model.ps1 -Model z-image-turbo           # Z-Image-Turbo Q5_K_M + abliterated encoder (~8.5 GB)
     .\download-model.ps1 -Model z-image-turbo-q8        # Z-Image-Turbo Q8_0 + abliterated encoder Q8_0 (~12 GB)
@@ -26,8 +27,8 @@
 #>
 param(
     [ValidateSet("smollm2", "qwen3-8b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "qwen36-35b-a3b",
-                 "qwen36-27b-mtp", "qwen36-27b-mtp-q5", "qwen36-35b-a3b-mtp", "llama4-scout", "z-image-turbo",
-                 "z-image-turbo-q8", "realesrgan-x4")]
+                 "qwen36-27b-mtp", "qwen36-27b-mtp-q5", "qwen36-35b-a3b-mtp", "carnice-35b-a3b-mtp",
+                 "llama4-scout", "z-image-turbo", "z-image-turbo-q8", "realesrgan-x4")]
     [string]$Model,
     [string]$DestDir
 )
@@ -105,6 +106,17 @@ $Models = @{
         Urls  = @("https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf")
         Size  = "22.7 GB"
         Phase = "MTP / issue #25 (MoE decode-throughput target)"
+    }
+    # Carnice — Hermes-style agentic/tool-calling finetune of Qwen3.6-35B-A3B-MTP
+    # (qwen35moe arch, MTP heads preserved). mudler's APEX quant tier; "I-Compact" is the
+    # imatrix-calibrated Q4-equivalent (17.3 GB) — smaller than UD-Q4_K_M with comparable
+    # quality. Personal-assistant / orchestrator role: routes work to Claude Code via the
+    # OpenAI tool adapter (6fa096d) and handles research with local tool loops.
+    "carnice-35b-a3b-mtp" = @{
+        Files = @("Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-I-Compact.gguf")
+        Urls  = @("https://huggingface.co/mudler/Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-GGUF/resolve/main/Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-I-Compact.gguf")
+        Size  = "17.3 GB"
+        Phase = "assistant (agentic/tool-calling orchestrator on the qwen35moe MTP path)"
     }
     "llama4-scout" = @{
         Files = @(
