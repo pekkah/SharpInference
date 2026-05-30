@@ -54,7 +54,7 @@ public sealed class ExpertSlotManager : IDisposable
         // probationary expert is a better victim than the strict LRU tail.
         _cache = new ExpertCache<ExpertGpuSlot>(slotCapacity, EvictSlot,
             frequencyOf: _profiler.GetAccessCount);
-        _warmPinPerLayer = WarmPinConfig.PerLayer;
+        _warmPinPerLayer = WarmPinConfig.ResolvePerLayer(hp.NumLayers, hp.NumExperts, hp.NumActiveExperts, slotCapacity);
         _warmPinAfter = WarmPinConfig.AfterAccesses;
         _pinBudget = Math.Max(1, slotCapacity / 2); // never pin more than half the cache
     }
@@ -117,18 +117,19 @@ public sealed class ExpertSlotManager : IDisposable
         var layerOrder = new int[_hp.NumLayers];
         for (int l = 0; l < _hp.NumLayers; l++) layerOrder[l] = l;
         Array.Sort(layerOrder, (a, b) => _profiler.GetLayerAccessCount(b).CompareTo(_profiler.GetLayerAccessCount(a)));
-        int pinned = 0;
+        var pinnedList = new List<(int, int)>();
         foreach (int layer in layerOrder)
         {
-            if (pinned >= _pinBudget) break;
+            if (pinnedList.Count >= _pinBudget) break;
             // Cold layers contribute nothing; once the sort hits zero we can stop.
             if (_profiler.GetLayerAccessCount(layer) == 0) break;
             foreach (int e in _profiler.GetTopExperts(layer, _warmPinPerLayer))
             {
-                if (pinned >= _pinBudget) break;
-                if (_cache.Contains(layer, e)) { _cache.Pin(layer, e); pinned++; }
+                if (pinnedList.Count >= _pinBudget) break;
+                if (_cache.Contains(layer, e)) { _cache.Pin(layer, e); pinnedList.Add((layer, e)); }
             }
         }
+        _profiler.RecordWarmPin(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(pinnedList));
     }
 
     /// <summary>
