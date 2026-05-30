@@ -67,17 +67,15 @@ $Models = @{
         Size  = "18.6 GB"
         Phase = "5a"
     }
-    # Qwen3.6-35B-A3B (April 2026) — CPU-only as of 2026-05-20.
-    # Despite the "A3B" label, this is a hybrid Gated-DeltaNet + sparse-attention MoE
-    # (arch="qwen35moe"): only 1 in 4 layers is full attention; the rest are GDN
-    # (delta-rule linear attention with a per-head 128×128 matrix state).
-    # Loads and decodes on CPU; coherence (logit parity vs llama.cpp) is pending.
-    # GPU offload, TurboQuant, and speculative decoding are rejected at CLI startup.
+    # Qwen3.6-35B-A3B (non-MTP) — Gated-DeltaNet + sparse-attention MoE (arch="qwen35moe"):
+    # 1-in-4 layers full attention, the rest GDN (delta-rule linear attention with a
+    # per-head 128×128 matrix state). Kept as the non-MTP control next to qwen36-35b-a3b-mtp
+    # for parity / speedup comparisons. Upstream file is UD-prefixed (unsloth dynamic quant).
     "qwen36-35b-a3b" = @{
         Files = @("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf")
         Urls  = @("https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf")
         Size  = "22.1 GB"
-        Phase = "CPU-only (Phase 4 of qwen35moe port; parity + CUDA hybrid pending)"
+        Phase = "qwen35moe non-MTP baseline (parity control vs qwen36-35b-a3b-mtp)"
     }
     # Qwen3.6-27B-MTP — dense 27B with native Multi-Token Prediction heads (issue #25).
     # Local filename is renamed (MTP- prefix) so it doesn't collide with a future
@@ -98,10 +96,10 @@ $Models = @{
         Size  = "18.5 GB"
         Phase = "MTP / issue #25 (Q5_K_M variant for the MTP bench row)"
     }
-    # Qwen3.6-35B-A3B-MTP — the MoE that already runs ~23 t/s on the CUDA hybrid path,
-    # with MTP heads bolted on. Renamed locally to avoid collision with qwen36-35b-a3b
-    # (both repos ship a file called Qwen3.6-35B-A3B-UD-Q4_K_M.gguf). Recommended target
-    # for issue #25's measured ≥1.3× decode speedup acceptance criterion.
+    # Qwen3.6-35B-A3B-MTP — same qwen35moe architecture as qwen36-35b-a3b but with
+    # MTP heads bolted on. Runs ~23 t/s on the CUDA hybrid path; recommended target
+    # for issue #25's ≥1.3× decode speedup criterion. Local filename keeps the MTP-
+    # prefix; the unsloth MTP repo only ships UD-prefixed Q4 (no plain Q4_K_M exists).
     "qwen36-35b-a3b-mtp" = @{
         Files = @("Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf")
         Urls  = @("https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf")

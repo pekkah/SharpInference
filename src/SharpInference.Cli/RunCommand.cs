@@ -380,8 +380,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     int gdnLayers = 0, attnLayers = 0;
                     for (int i = 0; i < hp.NumLayers; i++)
                         if (hp.LayerTypes![i] == LayerType.Attention) attnLayers++; else gdnLayers++;
-                    string ffnKindGpu = hp.IsMoE ? "MoE on GPU" : "dense FFN on CPU";
-                    AnsiConsole.MarkupLine($"[dim]Backend: [green]CUDA hybrid GDN[/] ({cuda.Name}, {gdnLayers} GDN + {attnLayers} attn on GPU + {ffnKindGpu})[/]");
+                    string ffnKind = hp.IsMoE
+                        ? (chgdn.IsMoeOnCpu ? "MoE on CPU" : "MoE on GPU")
+                        : "dense FFN on CPU";
+                    AnsiConsole.MarkupLine($"[dim]Backend: [green]CUDA hybrid GDN[/] ({cuda.Name}, {gdnLayers} GDN + {attnLayers} attn on GPU + {ffnKind})[/]");
                 }
                 else
                 {

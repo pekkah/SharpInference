@@ -1824,6 +1824,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// <inheritdoc />
     public bool HasMtpHead => _hasMtp;
 
+    // True when the routed/shared MoE FFN runs on CPU (mmap weights + per-token
+    // PCIe norm/hidden roundtrip) rather than via the GPU SLRU expert cache.
+    // Driven by SHARPI_CPU_MOE or auto-selected from SLRU capacity. Exposed so
+    // the CLI banner can report the actual MoE routing instead of guessing.
+    public bool IsMoeOnCpu => _cpuMoe;
+
     /// <inheritdoc />
     public ReadOnlySpan<float> LastHidden =>
         _hasMtp ? new ReadOnlySpan<float>(_lastHidden, _embDim) : default;
