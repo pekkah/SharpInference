@@ -19,7 +19,9 @@
     <IlcInstructionSet>native</IlcInstructionSet>
   </PropertyGroup>
 
-  <!-- NuGet packaging: opt-in. Only the SharpInference meta-package and SharpInference.Cli pack. -->
+  <!-- NuGet packaging: opt-in. The SharpInference meta-package, SharpInference.Server,
+       and SharpInference.Cli pack; everything else (per-backend libs, tests, benchmarks,
+       samples, the demo host) stays unpacked. -->
   <PropertyGroup>
     <IsPackable>false</IsPackable>
     <Authors>Pekka Heikura</Authors>

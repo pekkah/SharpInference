@@ -14,7 +14,12 @@
   -->
 
   <PropertyGroup>
-    <Description>ASP.NET Core endpoints, options, and DI extensions that expose SharpInference as OpenAI- and Anthropic-compatible HTTP APIs. Bring your own host.</Description>
+    <PackageId>SharpInference.Server</PackageId>
+    <IsPackable>true</IsPackable>
+    <Description>ASP.NET Core endpoints, options, and DI extensions that expose SharpInference as OpenAI- and Anthropic-compatible HTTP APIs. Bring your own host (Kestrel, IIS, YARP, etc.).</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>llm;inference;gguf;aspnetcore;openai-api;anthropic-api;chat-completions;ai</PackageTags>
+
     <IsTrimmable>false</IsTrimmable>
     <EnableTrimAnalyzer>false</EnableTrimAnalyzer>
     <EnableAotAnalyzer>false</EnableAotAnalyzer>
@@ -22,12 +27,29 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <None Include="README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\SharpInference.Engine\SharpInference.Engine.csproj" />
-    <ProjectReference Include="..\SharpInference.Cpu\SharpInference.Cpu.csproj" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <!--
+    Engine + Cpu are referenced directly so this project compiles against their
+    public types. PrivateAssets=all keeps their DLLs OUT of SharpInference.Server.nupkg
+    and prevents them from being declared as separate NuGet dependencies — at
+    install time they arrive bundled inside the SharpInference meta-package.
+
+    The SharpInference ProjectReference below is what auto-emits the
+    `<dependency id="SharpInference" version="..."/>` entry into the nuspec
+    (since SharpInference is IsPackable=true and the meta version stays in lockstep
+    via MinVer). The stub assembly it produces is harmless — the real DLLs ride
+    inside that package.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\SharpInference.Engine\SharpInference.Engine.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\SharpInference.Cpu\SharpInference.Cpu.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\SharpInference\SharpInference.csproj" />
   </ItemGroup>
 
 </Project>

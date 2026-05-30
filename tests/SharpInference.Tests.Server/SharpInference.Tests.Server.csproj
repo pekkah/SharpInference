@@ -20,9 +20,15 @@
     <Using Include="Xunit" />
   </ItemGroup>
 
+  <!--
+    Server explicitly hides Engine from package consumers (Engine.dll ships inside
+    the SharpInference meta-package, not Server's nupkg). Tests need Engine types
+    directly to construct fake IInferenceEngine instances, so reference it here.
+  -->
   <ItemGroup>
     <ProjectReference Include="..\..\src\SharpInference.Server\SharpInference.Server.csproj" />
     <ProjectReference Include="..\..\src\SharpInference.Server.Host\SharpInference.Server.Host.csproj" />
+    <ProjectReference Include="..\..\src\SharpInference.Engine\SharpInference.Engine.csproj" />
   </ItemGroup>
 
 </Project>
