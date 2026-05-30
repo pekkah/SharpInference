@@ -113,6 +113,52 @@ public sealed class PipelineTests
         Assert.Equal(0, profiler.GetAccessCount(0, 2)); // different layer untouched
     }
 
+    [Fact]
+    public void ExpertAccessProfiler_RecordWarmPin_SplitsBeforeAfterHitRate()
+    {
+        var profiler = new SharpInference.Pipeline.ExpertAccessProfiler(numLayers: 1, numExperts: 4);
+        // Pre-warm: 1 hit out of 4 accesses → 25%.
+        profiler.RecordHit(0, 0);
+        profiler.RecordMiss(0, 1); profiler.RecordMiss(0, 2); profiler.RecordMiss(0, 3);
+        (int, int)[] pinned = [(0, 0)];
+        profiler.RecordWarmPin(pinned);
+        // Post-warm: 3 hits out of 4 → 75%.
+        profiler.RecordHit(0, 0); profiler.RecordHit(0, 0); profiler.RecordHit(0, 0);
+        profiler.RecordMiss(0, 1);
+        Assert.True(profiler.WarmPinRecorded);
+        Assert.InRange(profiler.PreWarmHitRate, 0.24, 0.26);
+        Assert.InRange(profiler.PostWarmHitRate, 0.74, 0.76);
+        Assert.Equal(1, profiler.WarmPinnedSet.Length);
+        Assert.Equal((0, 0), profiler.WarmPinnedSet[0]);
+    }
+
+    [Fact]
+    public void ExpertAccessProfiler_PrintStats_IncludesWarmPinSetAndPostWarmRate()
+    {
+        var profiler = new SharpInference.Pipeline.ExpertAccessProfiler(numLayers: 2, numExperts: 4);
+        profiler.RecordMiss(0, 0); profiler.RecordMiss(1, 2);
+        profiler.RecordWarmPin([(0, 0), (1, 2)]);
+        profiler.RecordHit(0, 0); profiler.RecordHit(1, 2);
+        using var sw = new System.IO.StringWriter();
+        profiler.PrintStats(sw);
+        string output = sw.ToString();
+        Assert.Contains("warm-pin: 2 expert(s) pinned", output, System.StringComparison.Ordinal);
+        Assert.Contains("pre-warm  hit rate", output, System.StringComparison.Ordinal);
+        Assert.Contains("post-warm hit rate", output, System.StringComparison.Ordinal);
+        Assert.Contains("pinned layer   0: [0]", output, System.StringComparison.Ordinal);
+        Assert.Contains("pinned layer   1: [2]", output, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ExpertAccessProfiler_PrintStats_OmitsWarmPinSectionWhenNotRecorded()
+    {
+        var profiler = new SharpInference.Pipeline.ExpertAccessProfiler(numLayers: 1, numExperts: 4);
+        profiler.RecordHit(0, 0);
+        using var sw = new System.IO.StringWriter();
+        profiler.PrintStats(sw);
+        Assert.DoesNotContain("warm-pin", sw.ToString(), System.StringComparison.Ordinal);
+    }
+
     // ── Frequency-aware eviction ───────────────────────────────────────────
 
     [Fact]
@@ -131,6 +177,33 @@ public sealed class PipelineTests
         Assert.True(evicted);
         Assert.Equal(2, evKey);
         Assert.True(cache.Contains(1)); // hot survived despite being oldest
+    }
+
+    [Fact]
+    public void SlruCache_FrequencyAware_HotKeysSurviveSkewedChurn()
+    {
+        // Simulate MoE routing skew: a hot expert and many cold ones churn through
+        // probationary. Plain LRU evicts the hot key as cold inserts arrive at its
+        // head; frequency-aware retains it because cold keys score lower.
+        var counts = new System.Collections.Generic.Dictionary<int, long>();
+        long Freq(int k) => counts.GetValueOrDefault(k);
+
+        var lru = new SharpInference.Pipeline.SlruCache<int, string>(probationaryCapacity: 2, protectedCapacity: 2);
+        var freqAware = new SharpInference.Pipeline.SlruCache<int, string>(probationaryCapacity: 2, protectedCapacity: 2, frequencyOf: Freq);
+
+        counts[1] = 80;
+        lru.Put(1, "hot", out _, out _); freqAware.Put(1, "hot", out _, out _);
+
+        // Cold churn: 10 unique cold keys, each touched once.
+        for (int k = 100; k < 110; k++)
+        {
+            counts[k] = 1;
+            lru.Put(k, $"c{k}", out _, out _);
+            freqAware.Put(k, $"c{k}", out _, out _);
+        }
+
+        Assert.False(lru.Contains(1));        // pure LRU evicts the hot key
+        Assert.True(freqAware.Contains(1));   // frequency-aware retains it
     }
 
     [Fact]
