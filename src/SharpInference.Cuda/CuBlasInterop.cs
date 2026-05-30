@@ -112,6 +112,9 @@ internal static partial class CuBlasInterop
     [LibraryImport("cudart64_110", EntryPoint = "cudaEventCreate")]
     internal static partial int EventCreate(out nint ev);
 
+    [LibraryImport("cudart64_110", EntryPoint = "cudaEventCreateWithFlags")]
+    internal static partial int EventCreateWithFlags(out nint ev, uint flags);
+
     [LibraryImport("cudart64_110", EntryPoint = "cudaEventRecord")]
     internal static partial int EventRecord(nint ev, nint stream);
 
@@ -123,6 +126,25 @@ internal static partial class CuBlasInterop
 
     [LibraryImport("cudart64_110", EntryPoint = "cudaEventDestroy")]
     internal static partial int EventDestroy(nint ev);
+
+    /// <summary>cudaEventQuery: 0 = ready (cudaSuccess), 600 = not ready (cudaErrorNotReady).</summary>
+    [LibraryImport("cudart64_110", EntryPoint = "cudaEventQuery")]
+    internal static partial int EventQuery(nint ev);
+
+    /// <summary>
+    /// Make <paramref name="stream"/> wait for <paramref name="ev"/> before launching any
+    /// subsequent work. Cross-stream synchronization primitive — used to fence a compute
+    /// stream behind a transfer recorded on an upload stream.
+    /// </summary>
+    [LibraryImport("cudart64_110", EntryPoint = "cudaStreamWaitEvent")]
+    internal static partial int StreamWaitEvent(nint stream, nint ev, uint flags);
+
+    // cudaEventCreate flags
+    internal const uint EventDisableTiming = 0x2;
+
+    // cudaEventQuery / cudaError values used by the async upload path.
+    internal const int CudaSuccess        = 0;
+    internal const int CudaErrorNotReady  = 600;
 
     // ── Pinned host memory (enables DMA-based async transfers) ────────────
 

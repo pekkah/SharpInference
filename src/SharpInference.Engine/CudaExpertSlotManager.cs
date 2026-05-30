@@ -22,7 +22,7 @@ namespace SharpInference.Engine;
 /// consider changing the other.
 /// </para>
 /// </summary>
-public sealed class CudaExpertSlotManager : IDisposable
+public sealed class CudaExpertSlotManager : IDisposable, IExpertPrefetchTarget
 {
     private readonly CudaBackend _gpu;
     private readonly GgufModel _model;
@@ -32,6 +32,13 @@ public sealed class CudaExpertSlotManager : IDisposable
     private readonly Dictionary<nint, DType> _dtypes;
     private readonly object _lock = new();
     private bool _disposed;
+
+    // Pending background uploads keyed by tensor handle. A slot inserted via
+    // Preload is in _cache immediately, but its three weight tensors' DMAs may
+    // still be in flight on the upload stream; consumers consult this map and
+    // either WaitForUpload (cross-stream fence on the compute stream) or skip
+    // it when the event has already signaled.
+    private readonly Dictionary<nint, CudaUploadHandle> _pendingUploads = new();
 
     // Opt-in warm-pinning of hot experts (SHARPI_MOE_WARMPIN=N). Disabled by default.
     private readonly int _warmPinPerLayer;
@@ -73,17 +80,27 @@ public sealed class CudaExpertSlotManager : IDisposable
     /// <summary>
     /// Return the GPU tensors for the given expert only if they are already cached.
     /// Does NOT load from disk on miss — use <see cref="GetOrLoad"/> for that.
+    /// If the slot was admitted via <see cref="Preload"/> and its DMA is still in
+    /// flight, this call also inserts the cross-stream wait so the caller's
+    /// compute kernels block on the upload event.
     /// Thread-safe.
     /// </summary>
     public bool TryGetCached(int layer, int expertId, out ExpertCudaSlot slot)
     {
         lock (_lock)
-            return _cache.TryGet(layer, expertId, out slot);
+        {
+            if (!_cache.TryGet(layer, expertId, out slot)) return false;
+            FenceSlotReadyLocked(slot);
+            return true;
+        }
     }
 
     /// <summary>
     /// Return the GPU tensors for the given expert, loading from the GGUF mmap if not cached.
     /// Thread-safe: concurrent calls are serialized by an internal lock.
+    /// If <see cref="Preload"/> already started a background DMA for this expert,
+    /// the slot is in cache and we only need to fence the compute stream behind
+    /// the upload event — no extra synchronous staging copy.
     /// </summary>
     public ExpertCudaSlot GetOrLoad(int layer, int expertId)
     {
@@ -92,6 +109,7 @@ public sealed class CudaExpertSlotManager : IDisposable
             if (_cache.TryGet(layer, expertId, out var slot))
             {
                 _profiler.RecordHit(layer, expertId);
+                FenceSlotReadyLocked(slot);
                 return slot;
             }
 
@@ -137,31 +155,56 @@ public sealed class CudaExpertSlotManager : IDisposable
     /// Pre-load the given expert into the cache if not already present.
     ///
     /// <para>
-    /// Unlike the Vulkan port (which has a dedicated <c>UploadBackground</c> path
-    /// for off-recording-session uploads), CUDA does not expose a separate
-    /// background-upload entry point. We use the synchronous <see cref="CudaBackend.Upload"/>
-    /// / <see cref="CudaBackend.UploadRaw"/> path here. This is acceptable for v1
-    /// because each call still issues a true async PCIe DMA under the hood
-    /// (cudaMemcpyAsync via the pinned staging buffer on the backend's stream),
-    /// so the bulk transfer overlaps with whatever else is on the stream. The
-    /// practical hit vs Vulkan's UploadBackground is small. If prefetcher
-    /// pipelining is needed later we can plumb a dedicated upload stream.
+    /// Issues three <see cref="CudaBackend.UploadBackgroundRaw"/> /
+    /// <see cref="CudaBackend.UploadBackground"/> calls on the backend's dedicated
+    /// upload stream so the host→device DMA can overlap with whatever is
+    /// currently running on the compute stream. The slot is admitted to the
+    /// cache immediately, with the per-tensor upload event tracked in
+    /// <c>_pendingUploads</c>; the next <see cref="GetOrLoad"/> or
+    /// <see cref="TryGetCached"/> hit will fence the compute stream behind those
+    /// events via <see cref="CudaBackend.WaitForUpload"/> before returning.
     /// </para>
     /// </summary>
     public void Preload(int layer, int expertId)
     {
         lock (_lock)
         {
-            if (!_cache.Contains(layer, expertId))
-            {
-                var slot = UploadExpert(layer, expertId);
-                _cache.Put(layer, expertId, slot);
-            }
+            if (_cache.Contains(layer, expertId)) return;
+            var slot = UploadExpertAsync(layer, expertId);
+            _cache.Put(layer, expertId, slot);
+            MaybeWarmPin();
         }
+    }
+
+    /// <summary>
+    /// If any of <paramref name="slot"/>'s tensors is still tied to a pending
+    /// background upload event, insert a cross-stream wait so the compute stream
+    /// blocks until the DMA completes, then release the event and forget the
+    /// pending entry. Called under <c>_lock</c>.
+    /// </summary>
+    private void FenceSlotReadyLocked(ExpertCudaSlot slot)
+    {
+        FenceTensorReadyLocked(slot.Gate.Handle);
+        FenceTensorReadyLocked(slot.Up.Handle);
+        FenceTensorReadyLocked(slot.Down.Handle);
+    }
+
+    private void FenceTensorReadyLocked(nint handle)
+    {
+        if (!_pendingUploads.Remove(handle, out var pending)) return;
+        _gpu.WaitForUpload(pending);
+        _gpu.ReleaseUploadHandle(pending);
     }
 
     private void EvictSlot(ExpertCudaSlot slot)
     {
+        // If a still-pending background upload is being evicted (rare — the
+        // cache would only evict an unconsumed prefetch under tight capacity),
+        // drain the event so the DMA isn't writing to a freed pointer.
+        FenceTensorReadyLocked(slot.Gate.Handle);
+        FenceTensorReadyLocked(slot.Up.Handle);
+        FenceTensorReadyLocked(slot.Down.Handle);
+
         _dtypes.Remove(slot.Gate.Handle);
         _dtypes.Remove(slot.Up.Handle);
         _dtypes.Remove(slot.Down.Handle);
@@ -178,6 +221,17 @@ public sealed class CudaExpertSlotManager : IDisposable
             Up: UploadExpertWeight($"blk.{layer}.ffn_up_exps.weight",
                 _hp.ExpertIntermediateDim, _hp.EmbeddingDim, expertId),
             Down: UploadExpertWeight($"blk.{layer}.ffn_down_exps.weight",
+                _hp.EmbeddingDim, _hp.ExpertIntermediateDim, expertId));
+    }
+
+    private ExpertCudaSlot UploadExpertAsync(int layer, int expertId)
+    {
+        return new ExpertCudaSlot(
+            Gate: UploadExpertWeightAsync($"blk.{layer}.ffn_gate_exps.weight",
+                _hp.ExpertIntermediateDim, _hp.EmbeddingDim, expertId),
+            Up: UploadExpertWeightAsync($"blk.{layer}.ffn_up_exps.weight",
+                _hp.ExpertIntermediateDim, _hp.EmbeddingDim, expertId),
+            Down: UploadExpertWeightAsync($"blk.{layer}.ffn_down_exps.weight",
                 _hp.EmbeddingDim, _hp.ExpertIntermediateDim, expertId));
     }
 
@@ -226,11 +280,58 @@ public sealed class CudaExpertSlotManager : IDisposable
         return tensor;
     }
 
+    /// <summary>
+    /// Async sibling of <see cref="UploadExpertWeight"/>. Issues the H2D copy on
+    /// the backend's upload stream and registers the returned event in
+    /// <c>_pendingUploads</c>; the tensor is otherwise indistinguishable from a
+    /// sync-uploaded one once <see cref="FenceTensorReadyLocked"/> has run.
+    /// </summary>
+    private Tensor UploadExpertWeightAsync(string tensorName, int rows, int cols, int expertIdx)
+    {
+        var info = _model.FindTensor(tensorName)
+            ?? throw new InvalidOperationException($"Missing tensor: {tensorName}");
+        var data = _model.GetTensorData(info);
+
+        if (info.DType == DType.Float32)
+        {
+            int elemOffset = expertIdx * rows * cols;
+            var floats = MemoryMarshal.Cast<byte, float>(data).Slice(elemOffset, rows * cols);
+            var pending = _gpu.UploadBackground(floats, TensorShape.D1(floats.Length));
+            _dtypes[pending.Tensor.Handle] = DType.Float32;
+            _pendingUploads[pending.Tensor.Handle] = pending;
+            return pending.Tensor;
+        }
+
+        int bytesPerRow = (cols / DTypeInfo.BlockSize(info.DType))
+                        * DTypeInfo.BytesPerBlock(info.DType);
+        int expertBytes = rows * bytesPerRow;
+        int byteOffset = expertIdx * expertBytes;
+        var expertData = data.Slice(byteOffset, expertBytes);
+
+        if (info.DType == DType.Q4_K || info.DType == DType.Q5_K || info.DType == DType.Q6_K)
+        {
+            var pending = _gpu.UploadBackgroundRaw(expertData, TensorShape.D1(expertData.Length), info.DType);
+            _dtypes[pending.Tensor.Handle] = info.DType;
+            _pendingUploads[pending.Tensor.Handle] = pending;
+            return pending.Tensor;
+        }
+
+        int count = rows * cols;
+        var f32 = new float[count];
+        Dequantize.ToFloat32(expertData, f32, info.DType, count);
+        var asyncTensor = _gpu.UploadBackground(f32, TensorShape.D1(count));
+        _dtypes[asyncTensor.Tensor.Handle] = DType.Float32;
+        _pendingUploads[asyncTensor.Tensor.Handle] = asyncTensor;
+        return asyncTensor.Tensor;
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
         // Drain cache, invoking EvictSlot for every resident entry to free GPU tensors.
+        // EvictSlot fences any still-pending uploads before the Free, so a teardown
+        // mid-prefetch can't tear down memory the upload stream is still writing to.
         _cache.Drain(EvictSlot);
     }
 }

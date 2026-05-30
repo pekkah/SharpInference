@@ -39,6 +39,23 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nuint  _pinnedBufSize;
     private const nuint InitialPinnedSize = 32 * 1024 * 1024; // 32 MB
 
+    // Dedicated upload stream for background H2D transfers (UploadBackground*).
+    // Separate from _stream so that prefetch DMA can overlap with the compute
+    // stream without flushing it. Lazily created on first background upload —
+    // costs nothing for backends that never prefetch experts.
+    private nint   _uploadStream;
+    // Per-upload pinned staging used by UploadBackground*. A second cudaMallocHost'd
+    // buffer that the upload stream reads from. The async-upload lock serializes
+    // concurrent calls so the staging contents stay valid until the in-flight DMA
+    // completes (we wait on the previous event before re-filling the buffer).
+    private nint   _asyncPinnedBuf;
+    private nuint  _asyncPinnedBufSize;
+    private readonly object _asyncUploadLock = new();
+    // Event recorded at the end of the most recent UploadBackground; the next
+    // call waits on it before re-using _asyncPinnedBuf to avoid overwriting an
+    // in-flight DMA source. Created lazily, reused for the buffer's lifetime.
+    private nint   _asyncPinnedBufEvent;
+
     // Maximum im2col tile buffer size. All row-aligned tile sizes fit within this bound.
     private const long MaxTileBytes = 2560L * 1024 * 1024; // 2.5 GiB — fits all layers in a single tile
 
@@ -737,6 +754,210 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _tensorDTypes[handle] = dtype;
         return tensor;
     }
+
+    // ── Async background upload path (issue #78) ──────────────────────────
+    //
+    // Mirrors the Vulkan UploadBackground entry point: dispatches the host→device
+    // copy on a dedicated upload stream so the predictive MoE prefetcher can
+    // start moving the next layer's experts over PCIe while the compute stream
+    // is still finishing the current layer's matmuls.
+    //
+    // The returned CudaUploadHandle owns a CUDA event recorded at the end of
+    // the DMA. Consumers MUST call WaitForUpload on the compute stream (or any
+    // other CUDA stream that reads the tensor) before launching dependent work,
+    // otherwise the read can race ahead of the DMA. After WaitForUpload, the
+    // tensor behaves identically to one returned from the synchronous Upload* —
+    // it lives in the same _devPtrs table and is freed via Free() like any
+    // other tensor.
+    //
+    // Concurrent UploadBackground* calls are serialized by _asyncUploadLock
+    // because they share the _asyncPinnedBuf staging — the lock also ensures
+    // the previous transfer's DMA drains before we overwrite the staging bytes.
+
+    /// <summary>
+    /// Async H2D upload on the dedicated upload stream. The returned tensor's
+    /// readiness is tracked by <see cref="CudaUploadHandle.UploadEvent"/>;
+    /// callers MUST invoke <see cref="WaitForUpload"/> on the compute stream
+    /// (or whichever stream consumes the tensor) before launching dependent
+    /// kernels. The event is owned by the handle and released by
+    /// <see cref="ReleaseUploadHandle"/>.
+    /// </summary>
+    public CudaUploadHandle UploadBackground(ReadOnlySpan<float> data, TensorShape shape, bool exact = false)
+    {
+        nuint byteSize = (nuint)(data.Length * sizeof(float));
+        fixed (float* src = data)
+        {
+            var (tensor, ev) = UploadBackgroundCore(src, byteSize, shape, DType.Float32, exact);
+            return new CudaUploadHandle(tensor, ev);
+        }
+    }
+
+    /// <summary>
+    /// Async H2D upload of raw bytes with explicit dtype tagging on the
+    /// dedicated upload stream. Same readiness model as
+    /// <see cref="UploadBackground(ReadOnlySpan{float}, TensorShape, bool)"/>.
+    /// </summary>
+    public CudaUploadHandle UploadBackgroundRaw(ReadOnlySpan<byte> data, TensorShape shape, DType dtype, bool exact = false)
+    {
+        nuint byteSize = (nuint)data.Length;
+        fixed (byte* src = data)
+        {
+            var (tensor, ev) = UploadBackgroundCore(src, byteSize, shape, dtype, exact);
+            _tensorDTypes[tensor.Handle] = dtype;
+            return new CudaUploadHandle(tensor, ev);
+        }
+    }
+
+    /// <summary>
+    /// Make the compute stream wait for the background upload referenced by
+    /// <paramref name="handle"/> to complete before launching any further work.
+    /// Cheap if the DMA has already finished. Safe to call from any thread
+    /// (cudaStreamWaitEvent is async — it inserts a fence into the stream and
+    /// returns immediately, the actual wait happens on the device).
+    /// </summary>
+    public void WaitForUpload(CudaUploadHandle handle)
+    {
+        if (handle.UploadEvent == nint.Zero) return;
+        EnsureUploadStream();
+        if (_stream == nint.Zero)
+        {
+            // No compute stream → use device-wide sync (extremely rare path).
+            int sr = CuBlasInterop.EventSynchronize(handle.UploadEvent);
+            if (sr != 0)
+                throw new InvalidOperationException($"cudaEventSynchronize failed: {sr}");
+            return;
+        }
+        int r = CuBlasInterop.StreamWaitEvent(_stream, handle.UploadEvent, 0);
+        if (r != 0)
+            throw new InvalidOperationException($"cudaStreamWaitEvent failed: {r}");
+    }
+
+    /// <summary>
+    /// Non-blocking poll: returns true if the background upload has completed
+    /// (cudaEventQuery == cudaSuccess). Allows callers (e.g. SLRU GetOrLoad)
+    /// to skip the WaitForUpload fence when the DMA has already drained.
+    /// </summary>
+    public bool IsUploadComplete(CudaUploadHandle handle)
+    {
+        if (handle.UploadEvent == nint.Zero) return true;
+        int r = CuBlasInterop.EventQuery(handle.UploadEvent);
+        return r == CuBlasInterop.CudaSuccess;
+    }
+
+    /// <summary>
+    /// Destroy the CUDA event owned by <paramref name="handle"/>. Call once the
+    /// tensor's readiness no longer needs to be tracked (typically after
+    /// <see cref="WaitForUpload"/> for short-lived prefetches, or never if the
+    /// tensor is long-lived — destroying the event is a courtesy that returns a
+    /// few tens of bytes of driver state, not a correctness requirement).
+    /// Idempotent.
+    /// </summary>
+    public void ReleaseUploadHandle(CudaUploadHandle handle)
+    {
+        if (handle.UploadEvent != nint.Zero)
+            CuBlasInterop.EventDestroy(handle.UploadEvent);
+    }
+
+    private (Tensor tensor, nint ev) UploadBackgroundCore(void* src, nuint byteSize, TensorShape shape, DType dtype, bool exact)
+    {
+        EnsureUploadStream();
+
+        nuint allocSize = exact ? byteSize : GpuBufferPool.RoundUp(byteSize);
+        nint devPtr = exact ? nint.Zero : _pool.Rent(allocSize);
+        if (devPtr == nint.Zero)
+        {
+            int status = CuBlasInterop.CudaMalloc(out devPtr, allocSize);
+            if (status != 0)
+                throw new InvalidOperationException($"cudaMalloc failed: {status}");
+        }
+
+        nint ev;
+        lock (_asyncUploadLock)
+        {
+            EnsureAsyncPinnedBuf(byteSize);
+
+            // Drain the previous async upload before overwriting the shared staging
+            // buffer — the in-flight DMA still reads from _asyncPinnedBuf and a
+            // host-side memcpy here would corrupt it. The wait is on the host because
+            // it gates a host memcpy, not another GPU launch.
+            if (_asyncPinnedBufEvent != nint.Zero)
+            {
+                int sr = CuBlasInterop.EventSynchronize(_asyncPinnedBufEvent);
+                if (sr != 0)
+                    throw new InvalidOperationException($"cudaEventSynchronize (drain prev async upload) failed: {sr}");
+            }
+
+            Buffer.MemoryCopy(src, (void*)_asyncPinnedBuf, _asyncPinnedBufSize, byteSize);
+
+            int rc = CuBlasInterop.CudaMemcpyAsync(devPtr, _asyncPinnedBuf, byteSize,
+                CuBlasInterop.HostToDevice, _uploadStream);
+            if (rc != 0)
+                throw new InvalidOperationException($"cudaMemcpyAsync (UploadBackground) failed: {rc}");
+
+            // Per-call event: timing disabled (we never measure these — the readiness
+            // event is consumed by stream-wait or an EventQuery poll only).
+            int er = CuBlasInterop.EventCreateWithFlags(out ev, CuBlasInterop.EventDisableTiming);
+            if (er != 0)
+                throw new InvalidOperationException($"cudaEventCreateWithFlags failed: {er}");
+
+            int rr = CuBlasInterop.EventRecord(ev, _uploadStream);
+            if (rr != 0)
+            {
+                CuBlasInterop.EventDestroy(ev);
+                throw new InvalidOperationException($"cudaEventRecord failed: {rr}");
+            }
+
+            // Replace the buffer-reuse fence with the freshly recorded event. We
+            // never destroy this reference — ev is owned by the caller's handle;
+            // the *next* UploadBackgroundCore call only reads it via EventSynchronize.
+            _asyncPinnedBufEvent = ev;
+        }
+
+        var handleId = (nint)Interlocked.Increment(ref _nextHandle);
+        _devPtrs[handleId] = (devPtr, allocSize);
+        if (exact) _exactHandles[handleId] = 0;
+        var tensor = new Tensor(shape, dtype, handleId);
+        return (tensor, ev);
+    }
+
+    private void EnsureUploadStream()
+    {
+        if (_uploadStream != nint.Zero) return;
+        lock (_asyncUploadLock)
+        {
+            if (_uploadStream != nint.Zero) return;
+            EnsurePrimaryContextCurrent();
+            int r = CuBlasInterop.StreamCreate(out nint s);
+            if (r != 0)
+                throw new InvalidOperationException($"cudaStreamCreate (upload stream) failed: {r}");
+            _uploadStream = s;
+        }
+    }
+
+    private void EnsureAsyncPinnedBuf(nuint required)
+    {
+        if (_asyncPinnedBuf != nint.Zero && required <= _asyncPinnedBufSize) return;
+        // Drain any in-flight DMA reading the old buffer before freeing it.
+        if (_asyncPinnedBufEvent != nint.Zero && _asyncPinnedBuf != nint.Zero)
+            CuBlasInterop.EventSynchronize(_asyncPinnedBufEvent);
+        if (_asyncPinnedBuf != nint.Zero)
+            CuBlasInterop.FreeHost(_asyncPinnedBuf);
+
+        nuint newSize = Math.Max(required, _asyncPinnedBufSize * 2);
+        if (newSize < 1024 * 1024) newSize = 1024 * 1024;
+        int r = CuBlasInterop.MallocHost(out _asyncPinnedBuf, newSize);
+        if (r != 0)
+            throw new InvalidOperationException($"cudaMallocHost (async upload staging, {newSize} B) failed: {r}");
+        _asyncPinnedBufSize = newSize;
+    }
+
+    /// <summary>
+    /// CUDA upload stream — exposed for tests and for callers that need to
+    /// schedule additional copies on the same async transfer queue.
+    /// <see cref="IntPtr.Zero"/> until the first <see cref="UploadBackground"/>
+    /// (or <see cref="UploadBackgroundRaw"/>) call creates it.
+    /// </summary>
+    public nint UploadStream => _uploadStream;
 
     public void DequantQ5KM(Tensor src, Tensor dst, int numBlocks) =>
         throw new NotSupportedException("CudaBackend does not support GPU dequantization");
@@ -2782,6 +3003,22 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
         if (_stream != nint.Zero)
             CuBlasInterop.StreamDestroy(_stream);
+
+        if (_uploadStream != nint.Zero)
+        {
+            // Drain any straggling background DMA so we don't tear down the stream
+            // out from under a still-in-flight transfer.
+            CuBlasInterop.StreamSynchronize(_uploadStream);
+            CuBlasInterop.StreamDestroy(_uploadStream);
+            _uploadStream = nint.Zero;
+        }
+
+        if (_asyncPinnedBuf != nint.Zero)
+        {
+            CuBlasInterop.FreeHost(_asyncPinnedBuf);
+            _asyncPinnedBuf = nint.Zero;
+            _asyncPinnedBufSize = 0;
+        }
 
         if (_pinnedBuf != nint.Zero)
             CuBlasInterop.FreeHost(_pinnedBuf);

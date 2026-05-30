@@ -13,7 +13,7 @@ namespace SharpInference.Engine;
 /// pressure requires it, enabling models whose total expert weights exceed
 /// available VRAM.
 /// </summary>
-public sealed class ExpertSlotManager : IDisposable
+public sealed class ExpertSlotManager : IDisposable, IExpertPrefetchTarget
 {
     private readonly VulkanBackend _gpu;
     private readonly GgufModel _model;
