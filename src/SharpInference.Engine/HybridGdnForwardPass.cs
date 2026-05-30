@@ -90,6 +90,16 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     // larger work units. Mirrors CudaHybridGdnForwardPass.CpuMoeFfn.
     private readonly float* _expertGateAll;  // [numActive × ExpertIntermDim]
     private readonly float* _expertUpAll;    // [numActive × ExpertIntermDim]
+    // Q8_K prepacked inputs for the SHARPI_Q3K_Q8K routed-expert dot kernels
+    // (allocated only when s_q3kQ8KEnabled). Phase A consumes _normInQ8K (one
+    // row, rewritten per MoeFfnCore call when gate or up is Q3_K); Phase C
+    // consumes numActive contiguous expertDim-sized slices in _expertGateAllQ8K
+    // (rewritten per call when down is Q3_K). BatchForward2 sequences token-1
+    // and token-2 MoeFfnCore calls back-to-back, so the single shared scratch
+    // is rewritten before it's read on each side — no t1/t2 collision.
+    private readonly byte* _normInQ8K;
+    private readonly byte* _expertGateAllQ8K;
+    private readonly int _expertGateAllQ8KStride;
 
     // ── Dense FFN scratch (only allocated when !_hp.IsMoE, e.g. qwen35 27B) ──
     private readonly float* _ffnGate;        // [IntermediateDim]
@@ -211,6 +221,12 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         Environment.GetEnvironmentVariable("SHARPI_BYPASS_ATTN") == "1";
     private static readonly bool _bypassMoe =
         Environment.GetEnvironmentVariable("SHARPI_BYPASS_MOE") == "1";
+
+    // SHARPI_Q3K_Q8K=1 routes Q3_K routed-expert MoE rows through the int-domain
+    // DotQ3K_Q8K kernel. Mirrors the CudaHybridGdnForwardPass gate; see the
+    // comment there for the BatchForward2 / per-call prepack lifetime notes.
+    private static readonly bool s_q3kQ8KEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_Q3K_Q8K") == "1";
 
     // Output projection.
     private readonly TensorRef _outputNorm;
@@ -368,6 +384,19 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             _expertUp = Alloc(hp.ExpertIntermediateDim);
             _expertGateAll = Alloc(hp.NumActiveExperts * hp.ExpertIntermediateDim);
             _expertUpAll = Alloc(hp.NumActiveExperts * hp.ExpertIntermediateDim);
+            if (s_q3kQ8KEnabled)
+            {
+                _expertGateAllQ8KStride = SimdKernels.Q8KScratchBytes(hp.ExpertIntermediateDim);
+                _normInQ8K = (byte*)NativeMemory.Alloc((nuint)SimdKernels.Q8KScratchBytes(_embDim));
+                _expertGateAllQ8K = (byte*)NativeMemory.Alloc(
+                    (nuint)(hp.NumActiveExperts * _expertGateAllQ8KStride));
+            }
+            else
+            {
+                _normInQ8K = null;
+                _expertGateAllQ8K = null;
+                _expertGateAllQ8KStride = 0;
+            }
             _intermDim = 0;
         }
         else
@@ -375,6 +404,9 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             _intermDim = hp.IntermediateDim;
             _ffnGate = Alloc(_intermDim);
             _ffnUp = Alloc(_intermDim);
+            _normInQ8K = null;
+            _expertGateAllQ8K = null;
+            _expertGateAllQ8KStride = 0;
         }
 
         // RoPE tables sized for partial rotation (ropeDim/2 entries per position).
@@ -1788,6 +1820,14 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         int numActiveL = numActive;
         int bprGL = bprG, bprUL = bprU, bprDL = bprD;
 
+        // SHARPI_Q3K_Q8K=1: prepack the Phase-A input as Q8_K once so all
+        // numActive*expertDim Q3_K rows can hit the int-domain dot kernel.
+        bool useQ8KGate = s_q3kQ8KEnabled && gateDt == DType.Q3_K;
+        bool useQ8KUp   = s_q3kQ8KEnabled && upDt   == DType.Q3_K;
+        byte* normInQ8K = _normInQ8K;
+        if (useQ8KGate || useQ8KUp)
+            SimdKernels.QuantizeRowToQ8K(normInLocal, _embDim, normInQ8K);
+
         // Phase A: gate + up rows for all (k, r) tuples. Specialised on the
         // gate/up dtype pair so the inner dot is inlined directly — saves the
         // per-iter switch on enum across ~327 K dispatches per token.
@@ -1804,6 +1844,19 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
                 upAll[idx]   = SimdKernels.DotQ4K(upP   + offU, normBuf, embDimL);
             });
         }
+        else if (useQ8KGate && useQ8KUp)
+        {
+            Parallel.For(0, numActiveL * expertDimL, s_moeParallelOpts, idx =>
+            {
+                int k = idx / expertDimL;
+                int r = idx % expertDimL;
+                int expertIdx = sePtr[k];
+                long offG = (long)expertIdx * expertDimL * bprGL + (long)r * bprGL;
+                long offU = (long)expertIdx * expertDimL * bprUL + (long)r * bprUL;
+                gateAll[idx] = SimdKernels.DotQ3K_Q8K(gateP + offG, normInQ8K, embDimL);
+                upAll[idx]   = SimdKernels.DotQ3K_Q8K(upP   + offU, normInQ8K, embDimL);
+            });
+        }
         else
         {
             Parallel.For(0, numActiveL * expertDimL, s_moeParallelOpts, idx =>
@@ -1813,14 +1866,34 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
                 int expertIdx = sePtr[k];
                 long offG = (long)expertIdx * expertDimL * bprGL + (long)r * bprGL;
                 long offU = (long)expertIdx * expertDimL * bprUL + (long)r * bprUL;
-                gateAll[idx] = DispatchDot(gateP + offG, normBuf, embDimL, gateDt);
-                upAll[idx]   = DispatchDot(upP   + offU, normBuf, embDimL, upDt);
+                gateAll[idx] = useQ8KGate
+                    ? SimdKernels.DotQ3K_Q8K(gateP + offG, normInQ8K, embDimL)
+                    : DispatchDot(gateP + offG, normBuf, embDimL, gateDt);
+                upAll[idx]   = useQ8KUp
+                    ? SimdKernels.DotQ3K_Q8K(upP + offU, normInQ8K, embDimL)
+                    : DispatchDot(upP   + offU, normBuf, embDimL, upDt);
             });
         }
 
         // Phase B: one fused SiLuMul over (numActive × expertDim) contiguous
         // floats. SiLuMul is element-wise, so expert boundaries don't matter.
         SimdKernels.SiLuMul(_expertGateAll, _expertUpAll, numActive * expertDim);
+
+        // SHARPI_Q3K_Q8K=1 Phase-C prepack: each routed expert k has its own
+        // post-SiLuMul gate slice (gateAll + k*expertDim), so we quantise
+        // numActive distinct slices into a stacked Q8_K buffer ahead of the
+        // embDim-row Parallel.For, and the dot reads gateAllQ8K + k*stride.
+        bool useQ8KDown = s_q3kQ8KEnabled && downDt == DType.Q3_K;
+        byte* gateAllQ8K = _expertGateAllQ8K;
+        int   gateAllQ8KStride = _expertGateAllQ8KStride;
+        if (useQ8KDown)
+        {
+            for (int k = 0; k < numActiveL; k++)
+                SimdKernels.QuantizeRowToQ8K(
+                    gateAll + (long)k * expertDimL,
+                    expertDimL,
+                    gateAllQ8K + (long)k * gateAllQ8KStride);
+        }
 
         // Phase C: down × weight, fused across all 8 experts into one sweep
         // over embDim output rows. Hot dtypes (Q4_K / Q5_K / Q6_K) get
@@ -1876,20 +1949,41 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
                 });
                 break;
             default:
-                Parallel.For(0, embDimL, s_moeParallelOpts, r =>
+                if (useQ8KDown)
                 {
-                    float sum = 0f;
-                    for (int k = 0; k < numActiveL; k++)
+                    Parallel.For(0, embDimL, s_moeParallelOpts, r =>
                     {
-                        int expertIdx = sePtr[k];
-                        float w = ewPtr[k];
-                        long offD = (long)expertIdx * embDimL * bprDL + (long)r * bprDL;
-                        sum += w * DispatchDot(downP + offD,
-                                               gateAll + (long)k * expertDimL,
-                                               expertDimL, downDt);
-                    }
-                    hiddenOut[r] = sum;
-                });
+                        float sum = 0f;
+                        for (int k = 0; k < numActiveL; k++)
+                        {
+                            int expertIdx = sePtr[k];
+                            float w = ewPtr[k];
+                            long offD = (long)expertIdx * embDimL * bprDL + (long)r * bprDL;
+                            sum += w * SimdKernels.DotQ3K_Q8K(
+                                downP + offD,
+                                gateAllQ8K + (long)k * gateAllQ8KStride,
+                                expertDimL);
+                        }
+                        hiddenOut[r] = sum;
+                    });
+                }
+                else
+                {
+                    Parallel.For(0, embDimL, s_moeParallelOpts, r =>
+                    {
+                        float sum = 0f;
+                        for (int k = 0; k < numActiveL; k++)
+                        {
+                            int expertIdx = sePtr[k];
+                            float w = ewPtr[k];
+                            long offD = (long)expertIdx * embDimL * bprDL + (long)r * bprDL;
+                            sum += w * DispatchDot(downP + offD,
+                                                   gateAll + (long)k * expertDimL,
+                                                   expertDimL, downDt);
+                        }
+                        hiddenOut[r] = sum;
+                    });
+                }
                 break;
         }
 
@@ -2186,6 +2280,8 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             NativeMemory.Free(_expertUp);
             NativeMemory.Free(_expertGateAll);
             NativeMemory.Free(_expertUpAll);
+            if (_normInQ8K != null) NativeMemory.Free(_normInQ8K);
+            if (_expertGateAllQ8K != null) NativeMemory.Free(_expertGateAllQ8K);
         }
         else
         {

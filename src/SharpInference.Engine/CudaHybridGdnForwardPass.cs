@@ -241,6 +241,16 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private readonly bool _cpuGdn =
         Environment.GetEnvironmentVariable("SHARPI_CPU_GDN") == "1";
 
+    // SHARPI_Q3K_Q8K=1 routes Q3_K routed-expert MoE rows through the int-domain
+    // DotQ3K_Q8K kernel. The float input is prepacked to Q8_K once per
+    // CpuMoeFfnCore call (Phase A: cpuNormIn; Phase C: each gateAll slice) and
+    // shared across all (numActive × expertDim) rows. Default off → byte-identical
+    // to the FP DotQ3K path (see MEMORY feedback_q4k_q8k_no_parity_win.md — a
+    // similar Q4_K → Q8_K port broke cumulative MTP parity even though
+    // per-kernel bit-equivalence held, so we keep this opt-in only).
+    private static readonly bool s_q3kQ8KEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_Q3K_Q8K") == "1";
+
     // ── CPU MoE state (only allocated/populated when _cpuMoe == true) ──
     // Packed MoE weight refs (mmap pointers; routed experts stay quantized on disk).
     private readonly CpuWeightRef[]? _cpuFfnGateInp;       // [L] router F32 [embDim, numExperts]
@@ -258,6 +268,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // sweep), amortising TPL dispatch over much larger work units.
     private readonly float* _cpuExpertGateAll;
     private readonly float* _cpuExpertUpAll;
+    // Q8_K prepacked inputs for the routed-expert dot kernels (allocated only
+    // when s_q3kQ8KEnabled). _cpuNormInQ8K holds the post-RmsNorm hidden
+    // quantised to Q8_K for Phase A (gate+up) — rewritten per CpuMoeFfnCore
+    // call when gate or up is Q3_K. _cpuExpertGateAllQ8K holds numActive
+    // contiguous Q8_K-packed expertDim slices of the post-SiLuMul gate buffer
+    // for Phase C (down) — rewritten per CpuMoeFfnCore call when down is Q3_K.
+    private readonly byte* _cpuNormInQ8K;
+    private readonly byte* _cpuExpertGateAllQ8K;
+    private readonly int _cpuExpertGateAllQ8KStride;
     private readonly float* _cpuMoeHidden;      // [embDim] — accumulator written back to _gpuHidden
 
     // ── CPU dense FFN state (qwen35 27B-MTP and other dense hybrid GDN variants).
@@ -719,6 +738,19 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _cpuSharedOut = Alloc(_embDim);
             _cpuExpertGateAll = Alloc(_numActiveExperts * _expertDim);
             _cpuExpertUpAll = Alloc(_numActiveExperts * _expertDim);
+            if (s_q3kQ8KEnabled)
+            {
+                _cpuExpertGateAllQ8KStride = SimdKernels.Q8KScratchBytes(_expertDim);
+                _cpuNormInQ8K = (byte*)NativeMemory.Alloc((nuint)SimdKernels.Q8KScratchBytes(_embDim));
+                _cpuExpertGateAllQ8K = (byte*)NativeMemory.Alloc(
+                    (nuint)(_numActiveExperts * _cpuExpertGateAllQ8KStride));
+            }
+            else
+            {
+                _cpuNormInQ8K = null;
+                _cpuExpertGateAllQ8K = null;
+                _cpuExpertGateAllQ8KStride = 0;
+            }
             // Pinned: source of the per-token UploadInto back to _gpuHidden after
             // the CPU MoE FFN runs (issue #48). ~8 KiB; safe to pin.
             _cpuMoeHidden = AllocPinned(_embDim);
@@ -740,6 +772,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _cpuSharedOut = null;
             _cpuExpertGateAll = null;
             _cpuExpertUpAll = null;
+            _cpuNormInQ8K = null;
+            _cpuExpertGateAllQ8K = null;
+            _cpuExpertGateAllQ8KStride = 0;
         }
         else
         {
@@ -747,6 +782,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _cpuSharedOut = null;
             _cpuExpertGateAll = null;
             _cpuExpertUpAll = null;
+            _cpuNormInQ8K = null;
+            _cpuExpertGateAllQ8K = null;
+            _cpuExpertGateAllQ8KStride = 0;
             _cpuMoeHidden = null;
         }
 
@@ -2563,6 +2601,17 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         int    numActiveL = numActive;
         int    bprGL = bprG, bprUL = bprU, bprDL = bprD;
 
+        // SHARPI_Q3K_Q8K=1: hoist a single Q8_K prepack of the Phase-A input
+        // (cpuNormIn → _cpuNormInQ8K) so all numActive*expertDim Q3_K rows can
+        // dot against the int-domain DotQ3K_Q8K. BatchForward2 safety: each
+        // CpuMoeFfnCore call writes its own _cpuNormInQ8K from its own
+        // cpuNormIn, so t1 and t2 do not collide.
+        bool useQ8KGate = s_q3kQ8KEnabled && gateDt == DType.Q3_K;
+        bool useQ8KUp   = s_q3kQ8KEnabled && upDt   == DType.Q3_K;
+        byte* normInQ8K = _cpuNormInQ8K;
+        if (useQ8KGate || useQ8KUp)
+            SimdKernels.QuantizeRowToQ8K(cpuNormIn, _embDim, normInQ8K);
+
         // Phase A: gate + up rows for all (k, r) tuples.
         Parallel.For(0, numActiveL * expertDimL, s_moeParallelOpts, idx =>
         {
@@ -2571,14 +2620,34 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             int expertIdx = sePtr[k];
             long offG = (long)expertIdx * expertDimL * bprGL + (long)r * bprGL;
             long offU = (long)expertIdx * expertDimL * bprUL + (long)r * bprUL;
-            gateAll[idx] = DispatchDot(gateP + offG, normBuf, embDimL, gateDt);
-            upAll[idx]   = DispatchDot(upP   + offU, normBuf, embDimL, upDt);
+            gateAll[idx] = useQ8KGate
+                ? SimdKernels.DotQ3K_Q8K(gateP + offG, normInQ8K, embDimL)
+                : DispatchDot(gateP + offG, normBuf, embDimL, gateDt);
+            upAll[idx]   = useQ8KUp
+                ? SimdKernels.DotQ3K_Q8K(upP + offU, normInQ8K, embDimL)
+                : DispatchDot(upP   + offU, normBuf, embDimL, upDt);
         });
 
         // Phase B: one fused SiLuMul over (numActive × expertDim) contiguous
         // floats. SiLuMul is element-wise, so expert boundaries don't matter —
         // one AVX-vectorised call beats 8 with their own setup cost.
         SimdKernels.SiLuMul(_cpuExpertGateAll, _cpuExpertUpAll, numActive * expertDim);
+
+        // SHARPI_Q3K_Q8K=1 Phase C prepack: each routed expert k has its own
+        // post-SiLuMul gate slice (gateAll + k*expertDim), so we quantise
+        // numActive slices into a stacked Q8_K buffer once before the
+        // embDim-row Parallel.For, and the inner loop indexes by k * stride.
+        bool useQ8KDown = s_q3kQ8KEnabled && downDt == DType.Q3_K;
+        byte* gateAllQ8K = _cpuExpertGateAllQ8K;
+        int   gateAllQ8KStride = _cpuExpertGateAllQ8KStride;
+        if (useQ8KDown)
+        {
+            for (int k = 0; k < numActiveL; k++)
+                SimdKernels.QuantizeRowToQ8K(
+                    gateAll + (long)k * expertDimL,
+                    expertDimL,
+                    gateAllQ8K + (long)k * gateAllQ8KStride);
+        }
 
         // Phase C: down × weight, fused across all 8 experts into one sweep over
         // embDim rows. Each thread owns its rows so there's no cross-expert race.
@@ -2595,9 +2664,13 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 int expertIdx = sePtr[k];
                 float w = ewPtr[k];
                 long offD = (long)expertIdx * embDimL * bprDL + (long)r * bprDL;
-                sum += w * DispatchDot(downP + offD,
-                                       gateAll + (long)k * expertDimL,
-                                       expertDimL, downDt);
+                sum += w * (useQ8KDown
+                    ? SimdKernels.DotQ3K_Q8K(downP + offD,
+                                             gateAllQ8K + (long)k * gateAllQ8KStride,
+                                             expertDimL)
+                    : DispatchDot(downP + offD,
+                                  gateAll + (long)k * expertDimL,
+                                  expertDimL, downDt));
             }
             moeOut[r] = sum;
         });
@@ -3157,6 +3230,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             if (_cpuSharedOut != null) NativeMemory.Free(_cpuSharedOut);
             if (_cpuExpertGateAll != null) NativeMemory.Free(_cpuExpertGateAll);
             if (_cpuExpertUpAll != null) NativeMemory.Free(_cpuExpertUpAll);
+            if (_cpuNormInQ8K != null) NativeMemory.Free(_cpuNormInQ8K);
+            if (_cpuExpertGateAllQ8K != null) NativeMemory.Free(_cpuExpertGateAllQ8K);
             // _cpuMoeHidden is pinned (issue #48).
             if (_cpuMoeHidden != null) CudaBackend.FreePinnedHost((nint)_cpuMoeHidden);
         }
