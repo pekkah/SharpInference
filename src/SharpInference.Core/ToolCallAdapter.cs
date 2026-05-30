@@ -84,7 +84,7 @@ public interface IToolCallAdapter
 /// </summary>
 public static class ToolCallAdapterRegistry
 {
-    private static readonly Dictionary<string, IToolCallAdapter> _adapters =
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, IToolCallAdapter> _adapters =
         new(StringComparer.Ordinal)
         {
             // Wrapper-style: Qwen2, Qwen3, Qwen3.x, Qwen3-MoE variants — all use
@@ -180,7 +180,9 @@ internal static class ToolCallParseHelpers
             int paramEnd   = funcBody.IndexOf(paramClose, valueStart, StringComparison.Ordinal);
             if (paramEnd < 0) break;
 
-            args[paramName] = funcBody[valueStart..paramEnd].Trim();
+            // Skip nameless <parameter=> tags rather than inserting an empty-string key.
+            if (paramName.Length > 0)
+                args[paramName] = funcBody[valueStart..paramEnd].Trim();
             p = paramEnd + paramClose.Length;
         }
 
@@ -209,9 +211,16 @@ internal static class ToolCallParseHelpers
             if (root.TryGetProperty(argumentsKey, out var argsElem)
                 || root.TryGetProperty(altKey, out argsElem))
             {
-                object? parsed = argsElem.ValueKind == JsonValueKind.String
-                    ? JsonElementToObject(JsonDocument.Parse(argsElem.GetString() ?? "{}").RootElement)
-                    : JsonElementToObject(argsElem);
+                object? parsed;
+                if (argsElem.ValueKind == JsonValueKind.String)
+                {
+                    using var innerDoc = JsonDocument.Parse(argsElem.GetString() ?? "{}");
+                    parsed = JsonElementToObject(innerDoc.RootElement);
+                }
+                else
+                {
+                    parsed = JsonElementToObject(argsElem);
+                }
                 if (parsed is Dictionary<string, object?> d) args = d;
             }
 

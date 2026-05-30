@@ -96,8 +96,61 @@ public sealed class ToolCallEndpointTests
         Assert.Contains("\"name\":\"bash\"", body);
         Assert.Contains("input_json_delta", body);
         Assert.Contains("event: message_stop", body);
-        // The stop_reason on the terminating message_delta must be tool_use.
-        Assert.Contains("tool_use", body);
+
+        // The stop_reason on the terminating message_delta MUST be tool_use — parse it out of
+        // the SSE stream rather than substring-matching, otherwise an earlier tool_use type
+        // string would mask a regression that emits end_turn at the end.
+        var stopReason = ExtractMessageDeltaStopReason(body);
+        Assert.Equal("tool_use", stopReason);
+    }
+
+    private static string? ExtractMessageDeltaStopReason(string sseBody)
+    {
+        // Locate the message_delta event, then parse its data line.
+        const string evt = "event: message_delta\n";
+        int e = sseBody.IndexOf(evt, StringComparison.Ordinal);
+        if (e < 0) return null;
+        int dStart = sseBody.IndexOf("data: ", e, StringComparison.Ordinal);
+        if (dStart < 0) return null;
+        dStart += "data: ".Length;
+        int dEnd = sseBody.IndexOf('\n', dStart);
+        if (dEnd < 0) dEnd = sseBody.Length;
+        using var doc = JsonDocument.Parse(sseBody[dStart..dEnd]);
+        return doc.RootElement.GetProperty("delta").GetProperty("stop_reason").GetString();
+    }
+
+    [Fact]
+    public async Task OpenAi_WithTools_Streaming_SplitOpenMarkerAcrossChunks()
+    {
+        // Regression guard for the maxOpenLen / pendingText buffering: deliver `<tool_` then
+        // `call>` so the open marker arrives split across two engine chunks. Without buffering,
+        // the first chunk would leak through as content and the tool call would not be detected.
+        var fake = new FakeInferenceEngine("test-model", [
+            (GenerateChunkKind.Text, "<tool_"),
+            (GenerateChunkKind.Text, "call>"),
+            (GenerateChunkKind.Text, "{\"name\":\"bash\",\"arguments\":{\"cmd\":\"ls\"}}"),
+            (GenerateChunkKind.Text, "</tool_call>"),
+        ]);
+        var client = CreateClient(fake);
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "ls" } },
+            max_tokens = 50,
+            stream = true,
+            tools = new[] { new { type = "function", function = new { name = "bash", description = "shell", parameters = new { type = "object" } } } }
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+
+        // The first chunk's bytes must NEVER appear as a content delta — they are part of
+        // the open marker the buffer has to retain.
+        Assert.DoesNotContain("\"content\":\"<tool_\"", body);
+        Assert.Contains("\"tool_calls\":[", body);
+        Assert.Contains("\"name\":\"bash\"", body);
+        Assert.Contains("\"finish_reason\":\"tool_calls\"", body);
     }
 
     // ── /v1/chat/completions tool-call non-streaming (#97) ────────────────────

@@ -32,9 +32,22 @@ public static class OpenAiEndpoints
         {
             req = await ctx.Request.ReadFromJsonAsync(SharpInferenceJsonContext.Default.ChatCompletionRequest, ctx.RequestAborted);
         }
-        catch
+        catch (JsonException ex)
         {
             ctx.Response.StatusCode = 400;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(
+                JsonSerializer.Serialize(new ErrorResponse("invalid_request_error", ex.Message),
+                    SharpInferenceJsonContext.Default.ErrorResponse), ctx.RequestAborted);
+            return;
+        }
+        catch (Microsoft.AspNetCore.Http.BadHttpRequestException ex)
+        {
+            ctx.Response.StatusCode = 400;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(
+                JsonSerializer.Serialize(new ErrorResponse("invalid_request_error", ex.Message),
+                    SharpInferenceJsonContext.Default.ErrorResponse), ctx.RequestAborted);
             return;
         }
 
@@ -275,6 +288,7 @@ public static class OpenAiEndpoints
             }
         }
 
+        bool truncatedToolCall = false;
         try
         {
             await foreach (var c in engine.GenerateChunksAsync(prompt, sp, ctx.RequestAborted))
@@ -305,13 +319,29 @@ public static class OpenAiEndpoints
             // Flush any remaining buffered text (cannot contain a partial open marker now).
             if (!inToolCall && pendingText.Length > 0)
             {
-                try { await WriteContentDelta(pendingText); } catch { /* response aborted */ }
+                try { await WriteContentDelta(pendingText); }
+                catch (OperationCanceledException) { /* client disconnected */ }
+                catch (IOException) { /* response stream closed */ }
                 pendingText = "";
+            }
+
+            // Stream ended mid-tool-call (model hit max_tokens / EOS before emitting the close
+            // marker). Surface the buffered bytes so the client sees the truncated output rather
+            // than getting an empty response, and signal length-based truncation via finish_reason.
+            if (inToolCall && toolCallBuf.Length > 0)
+            {
+                truncatedToolCall = true;
+                try { await WriteContentDelta(toolCallBuf.ToString()); }
+                catch (OperationCanceledException) { /* client disconnected */ }
+                catch (IOException) { /* response stream closed */ }
+                toolCallBuf.Clear();
             }
         }
 
         // Final chunk with finish_reason
-        var finishReason = hasToolCalls ? "tool_calls" : "stop";
+        var finishReason = hasToolCalls
+            ? "tool_calls"
+            : truncatedToolCall ? "length" : "stop";
         var finalChunk = new ChatCompletionChunk(
             requestId, "chat.completion.chunk", created, engine.ModelId,
             [new ChunkChoice(0, new ChunkDelta(null, null), finishReason)]);
@@ -395,15 +425,17 @@ public static class OpenAiEndpoints
                     var toolCalls = new List<object?>();
                     foreach (var tc in m.ToolCalls)
                     {
+                        // Source-gen JSON sets non-nullable record properties to null when the
+                        // payload omits them — guard so malformed history doesn't NRE the request.
                         toolCalls.Add(new Dictionary<string, object?>(StringComparer.Ordinal)
                         {
                             ["id"]   = tc.Id,
                             ["type"] = tc.Type,
                             ["function"] = new Dictionary<string, object?>(StringComparer.Ordinal)
                             {
-                                ["name"]      = tc.Function.Name,
+                                ["name"]      = tc.Function?.Name,
                                 // OpenAI stringifies arguments; pass through as-is.
-                                ["arguments"] = tc.Function.Arguments,
+                                ["arguments"] = tc.Function?.Arguments,
                             },
                         });
                     }
@@ -426,9 +458,9 @@ public static class OpenAiEndpoints
                     ["type"] = t.Type,
                     ["function"] = new Dictionary<string, object?>(StringComparer.Ordinal)
                     {
-                        ["name"]        = t.Function.Name,
-                        ["description"] = t.Function.Description,
-                        ["parameters"]  = t.Function.Parameters,
+                        ["name"]        = t.Function?.Name,
+                        ["description"] = t.Function?.Description,
+                        ["parameters"]  = t.Function?.Parameters,
                     },
                 })
                 .ToList();
@@ -477,8 +509,10 @@ public sealed record OaiMessage(
 /// <summary>
 /// OpenAI tool definition. <c>function.parameters</c> is the JSON Schema; we keep it
 /// as a raw <see cref="JsonElement"/> so it round-trips through the Jinja template unchanged.
+/// <see cref="Function"/> is nullable because source-gen deserialization sets a missing
+/// JSON object to <c>null</c> even on a non-nullable property; the endpoint guards on it.
 /// </summary>
-public sealed record OaiTool(string Type, OaiToolFunction Function);
+public sealed record OaiTool(string Type, OaiToolFunction? Function);
 
 public sealed record OaiToolFunction(
     string Name,
@@ -493,7 +527,7 @@ public sealed record OaiToolFunction(
 public sealed record OaiToolCall(
     string Id,
     string Type,
-    OaiToolCallFunction Function);
+    OaiToolCallFunction? Function);
 
 public sealed record OaiToolCallFunction(string Name, string Arguments);
 

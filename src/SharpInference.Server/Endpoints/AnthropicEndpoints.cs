@@ -30,9 +30,22 @@ public static class AnthropicEndpoints
         {
             req = await ctx.Request.ReadFromJsonAsync(SharpInferenceJsonContext.Default.AnthropicMessageRequest, ctx.RequestAborted);
         }
-        catch
+        catch (JsonException ex)
         {
             ctx.Response.StatusCode = 400;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(
+                JsonSerializer.Serialize(new AErrorResponse("invalid_request_error", ex.Message),
+                    SharpInferenceJsonContext.Default.AErrorResponse), ctx.RequestAborted);
+            return;
+        }
+        catch (Microsoft.AspNetCore.Http.BadHttpRequestException ex)
+        {
+            ctx.Response.StatusCode = 400;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(
+                JsonSerializer.Serialize(new AErrorResponse("invalid_request_error", ex.Message),
+                    SharpInferenceJsonContext.Default.AErrorResponse), ctx.RequestAborted);
             return;
         }
 
@@ -124,8 +137,8 @@ public static class AnthropicEndpoints
         foreach (var (id, name, argsJson) in toolCalls)
         {
             JsonElement inputEl;
-            try   { using var d = JsonDocument.Parse(argsJson); inputEl = d.RootElement.Clone(); }
-            catch { inputEl = JsonDocument.Parse("{}").RootElement.Clone(); }
+            try { using var d = JsonDocument.Parse(argsJson); inputEl = d.RootElement.Clone(); }
+            catch (JsonException) { inputEl = EmptyJsonObject; }
             contentList.Add(new AContent("tool_use", Id: id, Name: name, Input: inputEl));
         }
 
@@ -314,6 +327,7 @@ public static class AnthropicEndpoints
             }
         }
 
+        bool truncatedToolCall = false;
         try
         {
             await foreach (var chunk in engine.GenerateChunksAsync(prompt, sp, ctx.RequestAborted))
@@ -349,11 +363,23 @@ public static class AnthropicEndpoints
         finally
         {
             // Flush any remaining buffered text (cannot contain a partial tool_call open tag).
-            // Discard incomplete tool calls (inToolCall still true on stream end).
             if (!inToolCall && pendingText.Length > 0)
             {
-                try { await FlushTextDelta(pendingText); } catch { /* response already aborted */ }
+                try { await FlushTextDelta(pendingText); }
+                catch (OperationCanceledException) { /* client disconnected */ }
+                catch (IOException) { /* response stream closed */ }
                 pendingText = "";
+            }
+
+            // Stream ended mid-tool-call: surface the buffered bytes so the client sees the
+            // truncated output (rather than an empty assistant turn) and signal max_tokens.
+            if (inToolCall && toolCallBuf.Length > 0)
+            {
+                truncatedToolCall = true;
+                try { await FlushTextDelta(toolCallBuf.ToString()); }
+                catch (OperationCanceledException) { /* client disconnected */ }
+                catch (IOException) { /* response stream closed */ }
+                toolCallBuf.Clear();
             }
 
             // Close thinking block if it was opened but never got a following text block.
@@ -369,7 +395,8 @@ public static class AnthropicEndpoints
                         JsonSerializer.Serialize(new AContentBlockStopEvent("content_block_stop", 0),
                             SharpInferenceJsonContext.Default.AContentBlockStopEvent));
                 }
-                catch { /* response already aborted */ }
+                catch (OperationCanceledException) { /* client disconnected */ }
+                catch (IOException) { /* response stream closed */ }
             }
             if (textOpen)
             {
@@ -379,7 +406,8 @@ public static class AnthropicEndpoints
                         JsonSerializer.Serialize(new AContentBlockStopEvent("content_block_stop", textIndex),
                             SharpInferenceJsonContext.Default.AContentBlockStopEvent));
                 }
-                catch { /* response already aborted */ }
+                catch (OperationCanceledException) { /* client disconnected */ }
+                catch (IOException) { /* response stream closed */ }
             }
         }
 
@@ -399,11 +427,14 @@ public static class AnthropicEndpoints
                     JsonSerializer.Serialize(new AContentBlockStopEvent("content_block_stop", idx),
                         SharpInferenceJsonContext.Default.AContentBlockStopEvent));
             }
-            catch { /* response already aborted */ }
+            catch (OperationCanceledException) { /* client disconnected */ }
+            catch (IOException) { /* response stream closed */ }
         }
 
         // message_delta
-        var stopReason = hasToolCalls ? "tool_use" : "end_turn";
+        var stopReason = hasToolCalls
+            ? "tool_use"
+            : truncatedToolCall ? "max_tokens" : "end_turn";
         var msgDelta = new AMessageDeltaEvent("message_delta",
             new AMessageDelta(stopReason, null), new AUsage(0, outputTokens));
         await WriteAnthropicEvent(ctx.Response, "message_delta",
