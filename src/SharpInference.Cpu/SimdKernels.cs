@@ -2097,6 +2097,143 @@ public static unsafe class SimdKernels
     }
 
     // ================================================================
+    //  Q8_0 · Q8_K Dot Product  (one row, pre-quantized input)
+    // ================================================================
+    // Q8_0 is a 32-element / 34-byte block: [d:FP16 | qs:32×int8]. The
+    // legacy DotQ8_0(float* input) path dequant-expands each block to 32
+    // FP32 lanes and FMAs against the f32 input — that's 32 FP multiplies
+    // and 4 widen-and-convert sequences per block (256 FP rounding events
+    // per 256-element super-block).
+    //
+    // The Q8_K-input fusion keeps the inner dot entirely in int domain:
+    //   - 32 i8·i8 products per sub-block via two VPMADDWD chains
+    //     (16 i16 + 16 i16 → 8 i32 + 8 i32 → lane-add to 8 i32 partials)
+    //   - one FP multiply per Q8_0 sub-block (d_w[sub] × 8-lane int partials)
+    //   - one FP multiply per Q8_K super-block (d_y[b] × Σ_sub)
+    // Eight Q8_0 weight blocks span one Q8_K super-block (8 × 32 = 256
+    // elements), so we collapse 256 FP roundings to 9 (8 inner + 1 outer)
+    // per super-block — same direction-of-improvement as DotQ6K_Q8K and
+    // DotQ3K_Q8K. cols must be a multiple of 256 (every model dim in
+    // the codebase already satisfies this).
+    //
+    // The Q8_K bsums region is intentionally unused: Q8_0 is signed-
+    // symmetric with no -32 offset to amortise, so no `q8sclsub`
+    // correction is needed (cf. DotQ6K/DotQ3K which both subtract a
+    // bsums-based correction). The bsums bytes are dead weight in this
+    // path — see briefing notes for rank-2 design.
+    //
+    // Dual-acc-chain VPMADDWD pattern: each Q8_0 sub-block reduces its
+    // 32 i8·i8 products via two independent MultiplyAddAdjacent chains
+    // (low 16 + high 16 of the sub-block), matching the throughput
+    // template of DotQ6K_Q8K_Avx2 / DotQ3K_Q8K_Avx2.
+
+    public static float DotQ8_0_Q8K(byte* row, byte* scratch, int cols)
+    {
+        int numBlocks = cols / 256;
+
+        if (Avx2.IsSupported && Fma.IsSupported)
+            return DotQ8_0_Q8K_Avx2(row, scratch, numBlocks);
+
+        return DotQ8_0_Q8K_Scalar(row, scratch, numBlocks);
+    }
+
+    public static float DotQ8_0_Q8K(byte* row, float* input, int cols)
+    {
+        int scratchBytes = Q8KScratchBytes(cols);
+        byte* scratch = stackalloc byte[scratchBytes];
+        QuantizeRowToQ8K(input, cols, scratch);
+        return DotQ8_0_Q8K(row, scratch, cols);
+    }
+
+    internal static float DotQ8_0_Q8K_Scalar(byte* row, byte* scratch, int numBlocks)
+    {
+        const int bytesPerBlock = 34;
+        float* dArr = (float*)scratch;
+        sbyte* qsArr = (sbyte*)(scratch + numBlocks * 4);
+        // bsums region after qsArr is unused for Q8_0 — see header.
+
+        double acc = 0;
+        for (int b = 0; b < numBlocks; b++)
+        {
+            float dy = dArr[b];
+            sbyte* q8 = qsArr + b * 256;
+            byte* superBase = row + (long)b * 8 * bytesPerBlock;
+
+            float subAcc = 0f;
+            for (int sub = 0; sub < 8; sub++)
+            {
+                byte* block = superBase + sub * bytesPerBlock;
+                float dw = HalfToFloat(block[0], block[1]);
+                sbyte* qw = (sbyte*)(block + 2);
+                sbyte* qy = q8 + sub * 32;
+
+                int intDot = 0;
+                for (int i = 0; i < 32; i++)
+                    intDot += qw[i] * qy[i];
+
+                subAcc += dw * intDot;
+            }
+
+            acc += dy * subAcc;
+        }
+        return (float)acc;
+    }
+
+    private static float DotQ8_0_Q8K_Avx2(byte* row, byte* scratch, int numBlocks)
+    {
+        const int bytesPerBlock = 34;
+        float* dArr = (float*)scratch;
+        sbyte* qsArr = (sbyte*)(scratch + numBlocks * 4);
+
+        var acc = Vector256<float>.Zero;
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            float dy = dArr[b];
+            sbyte* q8 = qsArr + b * 256;
+            byte* superBase = row + (long)b * 8 * bytesPerBlock;
+
+            // 8 inner i32 dots → scale by d_w[sub] into subAccF; one outer
+            // FMA by d_y[b] folds in the Q8_K super-block scale (see header).
+            var subAccF = Vector256<float>.Zero;
+            for (int sub = 0; sub < 8; sub++)
+            {
+                byte* block = superBase + sub * bytesPerBlock;
+                float dw = HalfToFloat(block[0], block[1]);
+                sbyte* qw = (sbyte*)(block + 2);
+                sbyte* qy = q8 + sub * 32;
+
+                // 32 i8 → two halves of 16 i8 → widen to i16. AVX2 path:
+                // SSE2 load 128b → ConvertToVector256Int16 sign-extends.
+                var qw_lo128 = Sse2.LoadVector128((byte*)qw).AsSByte();           // lanes 0..15
+                var qw_hi128 = Sse2.LoadVector128((byte*)(qw + 16)).AsSByte();    // lanes 16..31
+                var qy_lo128 = Sse2.LoadVector128((byte*)qy).AsSByte();
+                var qy_hi128 = Sse2.LoadVector128((byte*)(qy + 16)).AsSByte();
+
+                var qw_lo = Avx2.ConvertToVector256Int16(qw_lo128);
+                var qw_hi = Avx2.ConvertToVector256Int16(qw_hi128);
+                var qy_lo = Avx2.ConvertToVector256Int16(qy_lo128);
+                var qy_hi = Avx2.ConvertToVector256Int16(qy_hi128);
+
+                // Two independent VPMADDWD chains: i16·i16 → i32 pair-sum.
+                // |i16·i16| ≤ 127·127 = 16129; pair ≤ 32258, no saturation.
+                var p_lo = Avx2.MultiplyAddAdjacent(qw_lo, qy_lo); // 8 i32
+                var p_hi = Avx2.MultiplyAddAdjacent(qw_hi, qy_hi); // 8 i32
+                var p_sum = Avx2.Add(p_lo, p_hi);                  // 8 i32 partials
+
+                // Scale this sub-block's 8 i32 partials by d_w[sub] and
+                // accumulate into the super-block FP accumulator.
+                var pF = Avx.ConvertToVector256Single(p_sum);
+                subAccF = Fma.MultiplyAdd(Vector256.Create(dw), pF, subAccF);
+            }
+
+            // Fold in the Q8_K super-block input scale d_y[b].
+            acc = Fma.MultiplyAdd(Vector256.Create(dy), subAccF, acc);
+        }
+        return HSum256(acc);
+    }
+
+    // ================================================================
     //  Q6_K · Q8_K Fused two-input dot (issue #42) — decode each Q6_K
     //  super-block ONCE in registers and inner-int-product it against
     //  TWO pre-quantized Q8_K inputs in the same pass. Mirrors the
