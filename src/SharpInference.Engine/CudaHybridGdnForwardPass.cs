@@ -2620,9 +2620,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private static float DispatchDot(byte* row, float* input, int cols, DType dtype) =>
         dtype switch
         {
+            DType.Q3_K    => SimdKernels.DotQ3K(row, input, cols),
             DType.Q4_K    => SimdKernels.DotQ4K(row, input, cols),
             DType.Q5_K    => SimdKernels.DotQ5K(row, input, cols),
             DType.Q6_K    => SimdKernels.DotQ6K(row, input, cols),
+            DType.Q8_0    => SimdKernels.DotQ8_0(row, input, cols),
             DType.Float32 => SimdKernels.DotF32((float*)row, input, cols),
             _ => throw new NotSupportedException($"Routed expert dtype {dtype} not supported in batched path"),
         };

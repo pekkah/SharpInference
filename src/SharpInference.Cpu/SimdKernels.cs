@@ -1206,6 +1206,70 @@ public static unsafe class SimdKernels
     }
 
     // ================================================================
+    //  Q8_0 Fused MatVec — 32-element blocks, [d:FP16 | qs:32×int8].
+    //  AVX2 path expands 32 int8 → 4× 8 f32 per block and FMAs against
+    //  the f32 input. APEX-mixed quants (e.g. Carnice MoE) interleave
+    //  Q8_0 with K-quants, so this lives next to DotQ4K/DotQ5K/DotQ6K
+    //  for use by the routed-expert DispatchDot path.
+    // ================================================================
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float DotQ8_0(byte* row, float* input, int cols)
+    {
+        const int QK = 32;
+        const int bytesPerBlock = 34;
+        int numBlocks = cols / QK;
+
+        if (!Fma.IsSupported)
+            return DotQ8_0_Scalar(row, input, cols, numBlocks);
+
+        var acc = Vector256<float>.Zero;
+        for (int b = 0; b < numBlocks; b++)
+        {
+            byte* block = row + b * bytesPerBlock;
+            float d = HalfToFloat(block[0], block[1]);
+            var dvec = Vector256.Create(d);
+            sbyte* qs = (sbyte*)(block + 2);
+            float* inp = input + b * QK;
+
+            // Two halves of 16 sbytes each. Each half: low 8 → 8 i32 → 8 f32,
+            // high 8 → 8 i32 → 8 f32. FMA scaled-qs × input into the accumulator.
+            for (int half = 0; half < 2; half++)
+            {
+                var qs16 = Sse2.LoadVector128((byte*)(qs + half * 16)).AsSByte();
+                var lo32 = Avx2.ConvertToVector256Int32(qs16);
+                var hi32 = Avx2.ConvertToVector256Int32(Sse2.ShiftRightLogical128BitLane(qs16.AsByte(), 8).AsSByte());
+                var loF  = Avx.ConvertToVector256Single(lo32);
+                var hiF  = Avx.ConvertToVector256Single(hi32);
+                var inpLo = Avx.LoadVector256(inp + half * 16);
+                var inpHi = Avx.LoadVector256(inp + half * 16 + 8);
+                acc = Fma.MultiplyAdd(Avx.Multiply(loF, dvec), inpLo, acc);
+                acc = Fma.MultiplyAdd(Avx.Multiply(hiF, dvec), inpHi, acc);
+            }
+        }
+        return HSum256(acc);
+    }
+
+    private static float DotQ8_0_Scalar(byte* row, float* input, int cols, int numBlocks)
+    {
+        const int QK = 32;
+        const int bytesPerBlock = 34;
+        double acc = 0;
+        for (int b = 0; b < numBlocks; b++)
+        {
+            byte* block = row + b * bytesPerBlock;
+            float d = HalfToFloat(block[0], block[1]);
+            sbyte* qs = (sbyte*)(block + 2);
+            float* inp = input + b * QK;
+            float blockSum = 0;
+            for (int i = 0; i < QK; i++)
+                blockSum += qs[i] * inp[i];
+            acc += d * blockSum;
+        }
+        return (float)acc;
+    }
+
+    // ================================================================
     //  Q3_K Fused MatVec
     // ================================================================
 
