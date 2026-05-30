@@ -3,20 +3,31 @@ using System.Threading.Channels;
 namespace SharpInference.Engine;
 
 /// <summary>
+/// Target abstraction for <see cref="MoEPrefetcher"/>. Implemented by both
+/// <see cref="ExpertSlotManager"/> (Vulkan) and <see cref="CudaExpertSlotManager"/>
+/// (CUDA) so the same background prefetcher drives both backends.
+/// </summary>
+public interface IExpertPrefetchTarget
+{
+    /// <summary>Pre-load <paramref name="expertId"/> in <paramref name="layer"/> if not already resident.</summary>
+    void Preload(int layer, int expertId);
+}
+
+/// <summary>
 /// Background prefetcher for MoE expert weights.
 /// After the router selects experts for the current token, callers enqueue
 /// the predicted experts for the next token (or next layer). The background
-/// worker calls <see cref="ExpertSlotManager.Preload"/> so experts are
+/// worker calls <see cref="IExpertPrefetchTarget.Preload"/> so experts are
 /// GPU-resident before they are needed, hiding upload latency.
 /// </summary>
 public sealed class MoEPrefetcher : IDisposable
 {
-    private readonly ExpertSlotManager _slotManager;
+    private readonly IExpertPrefetchTarget _slotManager;
     private readonly Channel<PrefetchBatch> _channel;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _worker;
 
-    public MoEPrefetcher(ExpertSlotManager slotManager, int queueDepth = 8)
+    public MoEPrefetcher(IExpertPrefetchTarget slotManager, int queueDepth = 8)
     {
         _slotManager = slotManager;
         _channel = Channel.CreateBounded<PrefetchBatch>(new BoundedChannelOptions(queueDepth)
