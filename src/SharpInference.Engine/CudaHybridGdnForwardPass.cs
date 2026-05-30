@@ -241,6 +241,38 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private readonly bool _cpuGdn =
         Environment.GetEnvironmentVariable("SHARPI_CPU_GDN") == "1";
 
+    // Issue #54: pluggable Fiddler-style per-expert dispatch policy. The
+    // dispatcher consults it on SLRU miss (and, once #78 lands, also when the
+    // async prefetcher hasn't completed the read) to choose between
+    // sync-Upload-stall and CPU mmap fallback. Default is
+    // WaitForGpuPolicy — preserves the pre-Fiddler stall-on-miss behaviour
+    // so this seam ships behaviour-neutral.
+    private IExpertDispatchPolicy _expertDispatchPolicy = WaitForGpuPolicy.Instance;
+
+    // Cached per-expert byte count for IExpertDispatchPolicy contexts. Set
+    // once at MoE construction; the policy uses it to project CPU/GPU
+    // dispatch costs without re-walking the GGUF on every token.
+    private long _estimatedExpertBytes;
+
+    // Lazily-resolved CPU mmap refs for the routed expert weights. Only
+    // populated on the first CPU fallback dispatch in GPU-MoE mode (the
+    // existing CPU MoE mode already eagerly resolves these and assigns them
+    // to _cpuFfnGateExps etc; the fallback path reads from those same
+    // fields after a one-time resolve).
+    private CpuWeightRef[]? _cpuFallbackGateExps;
+    private CpuWeightRef[]? _cpuFallbackUpExps;
+    private CpuWeightRef[]? _cpuFallbackDownExps;
+    private float* _cpuFallbackGateBuf;
+    private float* _cpuFallbackUpBuf;
+    private float* _cpuFallbackExpertOut;
+    private bool _cpuFallbackInitialized;
+
+    // SHARPI_TRACE_MOE_DISPATCH=1 emits one line per consulted dispatch
+    // decision (layer, expert, decision) — used to validate policy tuning
+    // against real workloads.
+    private static readonly bool _traceMoeDispatch =
+        Environment.GetEnvironmentVariable("SHARPI_TRACE_MOE_DISPATCH") == "1";
+
     // ── CPU MoE state (only allocated/populated when _cpuMoe == true) ──
     // Packed MoE weight refs (mmap pointers; routed experts stay quantized on disk).
     private readonly CpuWeightRef[]? _cpuFfnGateInp;       // [L] router F32 [embDim, numExperts]
@@ -406,6 +438,19 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// original prompt length).
     /// </summary>
     public PagedKvCache Cache => _kvCache;
+
+    /// <summary>
+    /// Replace the per-expert dispatch policy. The default
+    /// <see cref="WaitForGpuPolicy"/> preserves the pre-Fiddler
+    /// stall-on-miss behaviour; <see cref="FiddlerDispatchPolicy"/> lets the
+    /// dispatcher fall back to CPU on SLRU miss when CPU compute is cheaper
+    /// than the predicted GPU upload (issue #54).
+    /// </summary>
+    public void SetExpertDispatchPolicy(IExpertDispatchPolicy policy)
+    {
+        ArgumentNullException.ThrowIfNull(policy);
+        _expertDispatchPolicy = policy;
+    }
 
     public CudaHybridGdnForwardPass(GgufModel model, CudaBackend gpu, ModelHyperparams hp,
         LayerPlacement placement, int maxContextLength = 0)
@@ -875,6 +920,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             long allocated = EstimateUploadedVram(); // best-effort estimate of weights uploaded so far
             long remaining = (long)vramTotal - allocated - (2L << 30); // reserve 2 GiB for headroom
             long perExpertBytes = EstimatePerExpertBytes();
+            _estimatedExpertBytes = perExpertBytes;
             int capacity = perExpertBytes > 0 ? (int)Math.Max(64, remaining / perExpertBytes) : 1024;
             // Cap at total expert count (all layers × num experts).
             int totalExperts = L * _numExperts;
@@ -2260,7 +2306,32 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         {
             int expertIdx = selectedExperts[k];
             float expertWeight = expertWeights[k];
-            var slot = _expertSlotManager!.GetOrLoad(layer, expertIdx);
+
+            // Issue #54: SLRU miss is the only sync-Upload-stall site on the
+            // CUDA hybrid path. Consult the dispatch policy with the cache
+            // hit/miss signal; cache hits skip the policy entirely.
+            // PrefetchReady is hardcoded false here because no CUDA-side
+            // async prefetcher exists today — issue #78 will wire that in.
+            bool cacheHit = _expertSlotManager!.TryGetCached(layer, expertIdx, out var slot);
+            if (!cacheHit)
+            {
+                var ctx = new ExpertDispatchContext(
+                    Layer: layer,
+                    ExpertId: expertIdx,
+                    ExpertSizeBytes: _estimatedExpertBytes,
+                    SlotCacheHit: false,
+                    PrefetchReady: false);
+                var decision = _expertDispatchPolicy.Decide(in ctx);
+                if (_traceMoeDispatch)
+                    Console.Error.WriteLine(
+                        $"[MoEDispatch] layer={layer} expert={expertIdx} miss decision={decision}");
+                if (decision == ExpertDispatchDecision.RunOnCpu)
+                {
+                    CpuFallbackExpert(layer, expertIdx, expertWeight);
+                    continue;
+                }
+                slot = _expertSlotManager!.GetOrLoad(layer, expertIdx);
+            }
 
             GpuMatMul(_gpuFfnGate, slot.Gate, _gpuNormBuf);
             GpuMatMul(_gpuFfnUp, slot.Up, _gpuNormBuf);
@@ -2615,6 +2686,103 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     {
         MaxDegreeOfParallelism = Environment.ProcessorCount
     };
+
+    // =================================================================
+    //  CPU fallback for one routed MoE expert on SLRU miss (issue #54).
+    //  Lazy-initialised: the GPU-MoE happy path runs with no extra mmap
+    //  pointer resolution or host scratch allocation until a policy first
+    //  returns RunOnCpu.
+    // =================================================================
+
+    private void CpuFallbackExpert(int layer, int expertIdx, float expertWeight)
+    {
+        EnsureCpuFallbackInitialized();
+
+        long swStart = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        // _cpuNormReadback is populated earlier in GpuMoeFfn by the shexp
+        // gate readback path; reuse it here instead of issuing another
+        // Download from _gpuNormBuf.
+        float* normIn = _cpuNormReadback;
+
+        var gateRef = _cpuFallbackGateExps![layer];
+        var upRef   = _cpuFallbackUpExps![layer];
+        var downRef = _cpuFallbackDownExps![layer];
+
+        int bprG = (_embDim   / DTypeInfo.BlockSize(gateRef.DType))
+                 * DTypeInfo.BytesPerBlock(gateRef.DType);
+        int bprU = (_embDim   / DTypeInfo.BlockSize(upRef.DType))
+                 * DTypeInfo.BytesPerBlock(upRef.DType);
+        int bprD = (_expertDim / DTypeInfo.BlockSize(downRef.DType))
+                 * DTypeInfo.BytesPerBlock(downRef.DType);
+
+        byte* gateBase = gateRef.DataPtr + (long)expertIdx * _expertDim * bprG;
+        byte* upBase   = upRef.DataPtr   + (long)expertIdx * _expertDim * bprU;
+        byte* downBase = downRef.DataPtr + (long)expertIdx * _embDim    * bprD;
+
+        DType gateDt = gateRef.DType;
+        DType upDt   = upRef.DType;
+        DType downDt = downRef.DType;
+        int   embDim = _embDim;
+        int   expertDim = _expertDim;
+
+        float* gateBuf = _cpuFallbackGateBuf;
+        float* upBuf   = _cpuFallbackUpBuf;
+        float* outBuf  = _cpuFallbackExpertOut;
+
+        Parallel.For(0, expertDim, s_moeParallelOpts, r =>
+        {
+            gateBuf[r] = DispatchDot(gateBase + (long)r * bprG, normIn, embDim, gateDt);
+            upBuf[r]   = DispatchDot(upBase   + (long)r * bprU, normIn, embDim, upDt);
+        });
+        SimdKernels.SiLuMul(gateBuf, upBuf, expertDim);
+
+        Parallel.For(0, embDim, s_moeParallelOpts, r =>
+        {
+            outBuf[r] = DispatchDot(downBase + (long)r * bprD, gateBuf, expertDim, downDt);
+        });
+
+        // Stage CPU result back onto GPU via the pre-allocated _gpuExpertOut
+        // so the same downstream AddInPlace(_gpuHidden, _gpuSharedOut) closes
+        // the layer regardless of which experts took the CPU path.
+        _gpu.UploadInto(_gpuExpertOut, new ReadOnlySpan<float>(outBuf, _embDim));
+        _gpu.AddScaledInPlace(_gpuHidden, _gpuExpertOut, expertWeight);
+
+        long swEnd = System.Diagnostics.Stopwatch.GetTimestamp();
+        double ms = (swEnd - swStart) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        _expertDispatchPolicy.RecordCpuLatency(layer, expertIdx, ms);
+    }
+
+    private void EnsureCpuFallbackInitialized()
+    {
+        if (_cpuFallbackInitialized) return;
+        // Reuse already-resolved CPU MoE refs when SHARPI_CPU_MOE=1; otherwise
+        // resolve once into a dedicated set so the GPU-MoE happy path does no
+        // mmap pointer chasing.
+        if (_cpuFfnGateExps is not null && _cpuFfnUpExps is not null && _cpuFfnDownExps is not null)
+        {
+            _cpuFallbackGateExps = _cpuFfnGateExps;
+            _cpuFallbackUpExps   = _cpuFfnUpExps;
+            _cpuFallbackDownExps = _cpuFfnDownExps;
+        }
+        else
+        {
+            int L = _hp.NumLayers;
+            _cpuFallbackGateExps = new CpuWeightRef[L];
+            _cpuFallbackUpExps   = new CpuWeightRef[L];
+            _cpuFallbackDownExps = new CpuWeightRef[L];
+            for (int i = 0; i < L; i++)
+            {
+                _cpuFallbackGateExps[i] = ResolveCpuWeight($"blk.{i}.ffn_gate_exps.weight");
+                _cpuFallbackUpExps[i]   = ResolveCpuWeight($"blk.{i}.ffn_up_exps.weight");
+                _cpuFallbackDownExps[i] = ResolveCpuWeight($"blk.{i}.ffn_down_exps.weight");
+            }
+        }
+        _cpuFallbackGateBuf    = Alloc(_expertDim);
+        _cpuFallbackUpBuf      = Alloc(_expertDim);
+        _cpuFallbackExpertOut  = Alloc(_embDim);
+        _cpuFallbackInitialized = true;
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static float DispatchDot(byte* row, float* input, int cols, DType dtype) =>
@@ -3177,6 +3345,13 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             }
             if (_gpuFfnGateBufDense is { } gB) _gpu.Free(gB);
             if (_gpuFfnUpBufDense   is { } uB) _gpu.Free(uB);
+        }
+
+        if (_cpuFallbackInitialized)
+        {
+            if (_cpuFallbackGateBuf   != null) NativeMemory.Free(_cpuFallbackGateBuf);
+            if (_cpuFallbackUpBuf     != null) NativeMemory.Free(_cpuFallbackUpBuf);
+            if (_cpuFallbackExpertOut != null) NativeMemory.Free(_cpuFallbackExpertOut);
         }
 
         // GPU scratch
