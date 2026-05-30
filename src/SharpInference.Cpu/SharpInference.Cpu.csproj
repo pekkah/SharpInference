@@ -8,4 +8,8 @@
     <ProjectReference Include="..\SharpInference.Core\SharpInference.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="SharpInference.Tests.ForwardPass" />
+  </ItemGroup>
+
 </Project>
