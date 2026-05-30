@@ -179,6 +179,65 @@ public sealed class InferenceEngineChunkTests
         Assert.Equal("Y", answerText);
     }
 
+    // ── Prompt-seeded thinking state (issue #92) ─────────────────────────
+
+    [Fact]
+    public async Task GenerateChunksAsync_PromptEndsWithThinkToken_RoutesFirstTokenToThinking()
+    {
+        // Qwen3.6 chat template auto-appends `<think>` to the generation prompt, so the
+        // model starts already inside thinking mode. Engine must seed inThinking from the
+        // prompt tokens — otherwise reasoning content leaks into the Text stream.
+        // Model emits: X </think> Y EOS. With the prompt ending in <think>, X must arrive
+        // as Thinking and Y as Text.
+        var scripted = new int[] { TokX, TokEndThink, TokY, TokEos };
+        var tokenizer = new ScriptedTokenizer
+        {
+            PromptTokens = [TokHi, TokThink],
+        };
+        var fwd = new ScriptedForwardPass(scripted, tokenizer.VocabSize);
+        using var engine = new InferenceEngine(
+            fwd, tokenizer, "mock",
+            thinkTokenId: TokThink, endThinkTokenId: TokEndThink);
+
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 10 };
+        var chunks = new List<GenerateChunk>();
+        await foreach (var c in engine.GenerateChunksAsync("seed", sp))
+            chunks.Add(c);
+
+        var thinkingText = string.Concat(chunks.Where(c => c.Kind == GenerateChunkKind.Thinking).Select(c => c.Text));
+        var answerText = string.Concat(chunks.Where(c => c.Kind == GenerateChunkKind.Text).Select(c => c.Text));
+
+        Assert.Equal("X", thinkingText);
+        Assert.Equal("Y", answerText);
+    }
+
+    [Fact]
+    public async Task GenerateChunksAsync_PromptOpensAndClosesThink_StartsOutsideThinking()
+    {
+        // A prompt that contains a balanced `<think>...</think>` block must NOT leave
+        // the engine in thinking mode at decode start — the scan must track both tokens.
+        var scripted = new int[] { TokY, TokEos };
+        var tokenizer = new ScriptedTokenizer
+        {
+            PromptTokens = [TokHi, TokThink, TokX, TokEndThink],
+        };
+        var fwd = new ScriptedForwardPass(scripted, tokenizer.VocabSize);
+        using var engine = new InferenceEngine(
+            fwd, tokenizer, "mock",
+            thinkTokenId: TokThink, endThinkTokenId: TokEndThink);
+
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 10 };
+        var chunks = new List<GenerateChunk>();
+        await foreach (var c in engine.GenerateChunksAsync("seed", sp))
+            chunks.Add(c);
+
+        var thinkingText = string.Concat(chunks.Where(c => c.Kind == GenerateChunkKind.Thinking).Select(c => c.Text));
+        var answerText = string.Concat(chunks.Where(c => c.Kind == GenerateChunkKind.Text).Select(c => c.Text));
+
+        Assert.Equal("", thinkingText);
+        Assert.Equal("Y", answerText);
+    }
+
     // ── Mocks ─────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -200,7 +259,9 @@ public sealed class InferenceEngineChunkTests
         public int PadTokenId => TokEos;
         public bool AddBosToken => false;
 
-        public IReadOnlyList<int> Encode(string text) => [TokHi];
+        public int[] PromptTokens { get; set; } = [TokHi];
+
+        public IReadOnlyList<int> Encode(string text) => PromptTokens;
 
         public string Decode(IEnumerable<int> tokens)
         {

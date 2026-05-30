@@ -337,6 +337,20 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             return;
         }
 
+        // Seed InThinking from the prompt itself (issue #92). Qwen3.6 and other
+        // reasoning models append a bare `<think>` token to the generation prompt
+        // via their chat template, so the model is already inside a reasoning
+        // block before the first sampled token.
+        bool promptInThinking = false;
+        if (thinkingEnabled)
+        {
+            foreach (int tok in tokens)
+            {
+                if (tok == _thinkTokenId) promptInThinking = true;
+                else if (tok == _endThinkTokenId) promptInThinking = false;
+            }
+        }
+
         var seq = new ActiveSeq
         {
             CurrentToken = firstToken,
@@ -348,22 +362,36 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             Rng = rng,
             Ct = req.Ct,
             TokenCount = 1,
+            InThinking = promptInThinking,
         };
 
         // Route the first sampled token through the same state machine as the decode loop.
-        // It's vanishingly rare for the first sampled token to itself be `<think>`, but
-        // handle it cleanly so behavior is symmetric. A stray `</think>` here has no
-        // open block to close, so we treat it as content (same fall-through as decode).
-        if (thinkingEnabled && firstToken == _thinkTokenId)
+        // A `<think>` here without an open block opens one; a `</think>` while in a prompt-
+        // seeded block closes it. A stray `</think>` outside a block falls through to
+        // content (same fall-through as decode).
+        if (thinkingEnabled && firstToken == _thinkTokenId && !seq.InThinking)
         {
             seq.InThinking = true;
+        }
+        else if (thinkingEnabled && firstToken == _endThinkTokenId && seq.InThinking)
+        {
+            seq.InThinking = false;
         }
         else
         {
             var bytes = _tokenizer.DecodeBytes(firstToken);
-            var firstChunk = seq.TextDec.Append(bytes);
-            if (firstChunk.Length > 0)
-                req.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, firstChunk));
+            if (seq.InThinking)
+            {
+                var firstChunk = seq.ThinkDec.Append(bytes);
+                if (firstChunk.Length > 0)
+                    req.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Thinking, firstChunk));
+            }
+            else
+            {
+                var firstChunk = seq.TextDec.Append(bytes);
+                if (firstChunk.Length > 0)
+                    req.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, firstChunk));
+            }
         }
 
         active.Add(seq);

@@ -340,7 +340,22 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     // independently — the two streams never share decoder state.
                     var textDec = new Utf8StreamDecoder();
                     var thinkDec = new Utf8StreamDecoder();
+
+                    // Seed inThinking from the prompt itself (issue #92). Qwen3.6 and other
+                    // reasoning models append a bare `<think>` token to the generation prompt
+                    // via their chat template, so the model is already inside a reasoning
+                    // block before the first sampled token. Without this scan the engine
+                    // would route the model's "Here's a thinking process:" preamble into
+                    // the content stream instead of the reasoning stream.
                     bool inThinking = false;
+                    if (thinkingEnabled)
+                    {
+                        foreach (int tok in tokens)
+                        {
+                            if (tok == thinkId) inThinking = true;
+                            else if (tok == endThinkId) inThinking = false;
+                        }
+                    }
                     int thinkingCount = 0;
 
                     for (int i = 0; i < sp.MaxNewTokens; i++)
