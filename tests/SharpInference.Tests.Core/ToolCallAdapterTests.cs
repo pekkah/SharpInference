@@ -1,0 +1,242 @@
+using SharpInference.Core;
+
+namespace SharpInference.Tests.Core;
+
+/// <summary>
+/// Per-adapter unit tests covering each family's wire format against representative
+/// model outputs. Streaming tests use the open/close marker API directly so they
+/// also lock in the contract the server's streaming state machine depends on.
+/// </summary>
+public sealed class ToolCallAdapterTests
+{
+    // ── Registry ──────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Registry_ResolvesQwenArchitectures()
+    {
+        Assert.IsType<QwenToolCallAdapter>(ToolCallAdapterRegistry.Get("qwen2"));
+        Assert.IsType<QwenToolCallAdapter>(ToolCallAdapterRegistry.Get("qwen3"));
+        Assert.IsType<QwenToolCallAdapter>(ToolCallAdapterRegistry.Get("qwen3moe"));
+        Assert.IsType<QwenToolCallAdapter>(ToolCallAdapterRegistry.Get("qwen35moe"));
+    }
+
+    [Fact]
+    public void Registry_ResolvesQwenCoder() =>
+        Assert.IsType<QwenCoderToolCallAdapter>(ToolCallAdapterRegistry.Get("qwen3coder"));
+
+    [Fact]
+    public void Registry_ResolvesLlamaFamilies()
+    {
+        Assert.IsType<LlamaToolCallAdapter>(ToolCallAdapterRegistry.Get("llama"));
+        Assert.IsType<LlamaToolCallAdapter>(ToolCallAdapterRegistry.Get("llama4"));
+    }
+
+    [Fact]
+    public void Registry_ResolvesDeepSeek() =>
+        Assert.IsType<DeepSeekToolCallAdapter>(ToolCallAdapterRegistry.Get("deepseek2"));
+
+    [Fact]
+    public void Registry_UnknownArchFallsBackToDefault()
+    {
+        var a = ToolCallAdapterRegistry.Get("never-heard-of-it");
+        Assert.Same(ToolCallAdapterRegistry.DefaultAdapter, a);
+    }
+
+    [Fact]
+    public void Registry_NullOrEmptyArchFallsBackToDefault()
+    {
+        Assert.Same(ToolCallAdapterRegistry.DefaultAdapter, ToolCallAdapterRegistry.Get(null));
+        Assert.Same(ToolCallAdapterRegistry.DefaultAdapter, ToolCallAdapterRegistry.Get(""));
+    }
+
+    // ── Qwen (wrapper) adapter ────────────────────────────────────────────────
+
+    [Fact]
+    public void Qwen_Parse_JsonCall()
+    {
+        var a = new QwenToolCallAdapter("qwen3moe");
+        var raw = "<tool_call>\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>";
+        var (plain, calls) = a.Parse(raw);
+        Assert.Equal("", plain);
+        Assert.Single(calls);
+        Assert.Equal("get_weather", calls[0].Name);
+        Assert.Equal("Paris", calls[0].Arguments["city"]);
+    }
+
+    [Fact]
+    public void Qwen_Parse_XmlFunctionCall()
+    {
+        // Qwen3.6 alt payload: <function=name><parameter=k>v</parameter></function>
+        var a = new QwenToolCallAdapter("qwen3moe");
+        var raw = "<tool_call><function=read_file><parameter=path>/etc/passwd</parameter></function></tool_call>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        Assert.Equal("read_file", calls[0].Name);
+        Assert.Equal("/etc/passwd", calls[0].Arguments["path"]);
+    }
+
+    [Fact]
+    public void Qwen_Parse_TextBeforeAndAfterToolCall()
+    {
+        var a = new QwenToolCallAdapter("qwen3moe");
+        var raw = "Let me check.<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call> Done.";
+        var (plain, calls) = a.Parse(raw);
+        Assert.Equal("Let me check. Done.", plain);
+        Assert.Single(calls);
+    }
+
+    [Fact]
+    public void Qwen_FindMarkers_RoundTripsBlock()
+    {
+        var a = new QwenToolCallAdapter("qwen3moe");
+        var buf = "noise<tool_call>{\"name\":\"x\",\"arguments\":{\"k\":1}}</tool_call>tail";
+        int open = a.FindOpenMarker(buf, 0, out int contentStart);
+        Assert.Equal(5, open);
+        Assert.Equal(5 + "<tool_call>".Length, contentStart);
+        int close = a.FindCloseMarker(buf, contentStart, out int afterClose);
+        Assert.True(close > contentStart);
+        Assert.Equal(close + "</tool_call>".Length, afterClose);
+
+        var block = buf[contentStart..close];
+        var calls = a.ParseBlock(block);
+        Assert.Single(calls);
+        Assert.Equal("x", calls[0].Name);
+    }
+
+    // ── Qwen3-Coder adapter (closes #95) ──────────────────────────────────────
+
+    [Fact]
+    public void QwenCoder_Parse_BareFunctionBlock()
+    {
+        var a = new QwenCoderToolCallAdapter();
+        var raw = "<function=get_weather><parameter=city>Paris</parameter></function>";
+        var (plain, calls) = a.Parse(raw);
+        Assert.Equal("", plain);
+        Assert.Single(calls);
+        Assert.Equal("get_weather", calls[0].Name);
+        Assert.Equal("Paris", calls[0].Arguments["city"]);
+    }
+
+    [Fact]
+    public void QwenCoder_Parse_TextBeforeFunctionBlock()
+    {
+        var a = new QwenCoderToolCallAdapter();
+        var raw = "I'll check.\n<function=lookup><parameter=q>x</parameter></function>";
+        var (plain, calls) = a.Parse(raw);
+        Assert.Equal("I'll check.\n", plain);
+        Assert.Single(calls);
+    }
+
+    [Fact]
+    public void QwenCoder_Parse_MultipleFunctionBlocks()
+    {
+        var a = new QwenCoderToolCallAdapter();
+        var raw = "<function=a><parameter=k>1</parameter></function>"
+               + "<function=b><parameter=k>2</parameter></function>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Equal(2, calls.Count);
+        Assert.Equal("a", calls[0].Name);
+        Assert.Equal("b", calls[1].Name);
+    }
+
+    [Fact]
+    public void QwenCoder_Streaming_BlockIncludesOpenMarker()
+    {
+        // The name is inside the open marker, so the streaming block MUST contain it.
+        var a = new QwenCoderToolCallAdapter();
+        var buf = "<function=ls><parameter=path>/</parameter></function>";
+        int open = a.FindOpenMarker(buf, 0, out int contentStart);
+        Assert.Equal(0, open);
+        Assert.Equal(0, contentStart);   // contentStart == openIdx → block keeps the marker
+        int close = a.FindCloseMarker(buf, contentStart, out int afterClose);
+        var block = buf[contentStart..close];
+        Assert.StartsWith("<function=", block);
+        var calls = a.ParseBlock(block);
+        Assert.Single(calls);
+        Assert.Equal("ls", calls[0].Name);
+        Assert.Equal(afterClose, buf.Length);   // we consumed everything
+    }
+
+    // ── Llama adapter ─────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Llama_Parse_PythonTagBlock_WithEom()
+    {
+        var a = new LlamaToolCallAdapter();
+        var raw = "<|python_tag|>{\"name\":\"get_weather\",\"parameters\":{\"city\":\"Paris\"}}<|eom_id|>";
+        var (plain, calls) = a.Parse(raw);
+        Assert.Equal("", plain);
+        Assert.Single(calls);
+        Assert.Equal("get_weather", calls[0].Name);
+        Assert.Equal("Paris", calls[0].Arguments["city"]);
+    }
+
+    [Fact]
+    public void Llama_Parse_PythonTagBlock_WithEot()
+    {
+        // Some short tool outputs close with <|eot_id|> instead of <|eom_id|>.
+        var a = new LlamaToolCallAdapter();
+        var raw = "<|python_tag|>{\"name\":\"x\",\"parameters\":{}}<|eot_id|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        Assert.Equal("x", calls[0].Name);
+    }
+
+    [Fact]
+    public void Llama_Parse_AcceptsArgumentsKey()
+    {
+        // Some fine-tunes use the OpenAI "arguments" key instead of "parameters".
+        var a = new LlamaToolCallAdapter();
+        var raw = "<|python_tag|>{\"name\":\"x\",\"arguments\":{\"k\":1}}<|eom_id|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        Assert.Equal(1L, calls[0].Arguments["k"]);
+    }
+
+    [Fact]
+    public void Llama_RenderToolResult_UsesIpythonRole()
+    {
+        var a = new LlamaToolCallAdapter();
+        var msg = a.RenderToolResult("call_1", "result text");
+        Assert.Equal("ipython", msg["role"]);
+        Assert.Equal("result text", msg["content"]);
+    }
+
+    // ── DeepSeek adapter ──────────────────────────────────────────────────────
+
+    [Fact]
+    public void DeepSeek_Parse_SingleInnerCall()
+    {
+        var a = new DeepSeekToolCallAdapter();
+        var raw = "<|tool_calls_begin|>"
+               + "<|tool_call_begin|>get_weather<|tool_sep|>{\"city\":\"Paris\"}<|tool_call_end|>"
+               + "<|tool_calls_end|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        Assert.Equal("get_weather", calls[0].Name);
+        Assert.Equal("Paris", calls[0].Arguments["city"]);
+    }
+
+    [Fact]
+    public void DeepSeek_Parse_MultipleInnerCalls()
+    {
+        var a = new DeepSeekToolCallAdapter();
+        var raw = "<|tool_calls_begin|>"
+               + "<|tool_call_begin|>a<|tool_sep|>{\"k\":1}<|tool_call_end|>"
+               + "<|tool_call_begin|>b<|tool_sep|>{\"k\":2}<|tool_call_end|>"
+               + "<|tool_calls_end|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Equal(2, calls.Count);
+        Assert.Equal("a", calls[0].Name);
+        Assert.Equal("b", calls[1].Name);
+    }
+
+    [Fact]
+    public void DeepSeek_Parse_PlainTextStaysPlain()
+    {
+        var a = new DeepSeekToolCallAdapter();
+        var (plain, calls) = a.Parse("just an answer with no tool call");
+        Assert.Equal("just an answer with no tool call", plain);
+        Assert.Empty(calls);
+    }
+}

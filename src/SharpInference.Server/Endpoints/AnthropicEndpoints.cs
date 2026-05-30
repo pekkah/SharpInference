@@ -54,10 +54,12 @@ public static class AnthropicEndpoints
         // once that many reasoning tokens have streamed.
         bool enableThinking = req.Thinking?.Type != "disabled";
 
+        var adapter = chatTemplate.ToolCallAdapter;
+
         string prompt;
         if (req.Tools is { Length: > 0 })
         {
-            var (richMessages, tools) = BuildRichMessageList(req);
+            var (richMessages, tools) = BuildRichMessageList(req, adapter);
             prompt = chatTemplate.Format(richMessages, enableThinking, tools);
         }
         else
@@ -78,17 +80,17 @@ public static class AnthropicEndpoints
 
         if (req.Stream == true)
         {
-            await HandleStreaming(ctx, engine, metrics, prompt, sp, msgId, modelId);
+            await HandleStreaming(ctx, engine, metrics, adapter, prompt, sp, msgId, modelId);
         }
         else
         {
-            await HandleNonStreaming(ctx, engine, metrics, prompt, sp, msgId, modelId);
+            await HandleNonStreaming(ctx, engine, metrics, adapter, prompt, sp, msgId, modelId);
         }
     }
 
     private static async Task HandleNonStreaming(
-        HttpContext ctx, IInferenceEngine engine, ServerMetrics metrics, string prompt, SamplingParams sp,
-        string msgId, string modelId)
+        HttpContext ctx, IInferenceEngine engine, ServerMetrics metrics, IToolCallAdapter adapter,
+        string prompt, SamplingParams sp, string msgId, string modelId)
     {
         var thinkingSb = new StringBuilder();
         var textSb = new StringBuilder();
@@ -114,7 +116,7 @@ public static class AnthropicEndpoints
         }
 
         var rawText = textSb.ToString();
-        var (plainText, toolCalls) = ParseToolCalls(rawText);
+        var (plainText, toolCalls) = ParseToolCalls(adapter, rawText);
 
         if (plainText.Length > 0)
             contentList.Add(new AContent("text", Text: plainText));
@@ -146,8 +148,8 @@ public static class AnthropicEndpoints
     }
 
     private static async Task HandleStreaming(
-        HttpContext ctx, IInferenceEngine engine, ServerMetrics metrics, string prompt, SamplingParams sp,
-        string msgId, string modelId)
+        HttpContext ctx, IInferenceEngine engine, ServerMetrics metrics, IToolCallAdapter adapter,
+        string prompt, SamplingParams sp, string msgId, string modelId)
     {
         ctx.Response.ContentType = "text/event-stream";
         ctx.Response.Headers.CacheControl = "no-cache";
@@ -172,13 +174,14 @@ public static class AnthropicEndpoints
         int outputTokens = 0;
         bool hasToolCalls = false;
 
-        // Tool-call streaming state machine.
-        // Text output is buffered to detect "<tool_call>" tags before flushing as text_delta.
-        const string ToolCallOpenTag = "<tool_call>";
-        const string ToolCallCloseTag = "</tool_call>";
+        // Tool-call streaming state machine — adapter-driven so the open/close markers
+        // match the loaded model's wire format (Qwen3 <tool_call>, Qwen3-Coder <function=>,
+        // Llama-3 <|python_tag|>, DeepSeek-R1 <|tool_calls_begin|>, ...).
+        int maxOpenLen = adapter.MaxOpenTagLength;
         bool inToolCall = false;
+        int toolCallContentStart = -1; // index into toolCallBuf where call content begins
         var toolCallBuf = new StringBuilder();
-        string pendingText = ""; // holds text while scanning for ToolCallOpenTag
+        string pendingText = "";
 
         async Task FlushTextDelta(string text)
         {
@@ -213,62 +216,64 @@ public static class AnthropicEndpoints
                 JsonSerializer.Serialize(delta, SharpInferenceJsonContext.Default.AContentBlockDeltaEvent));
         }
 
-        async Task EmitToolCallBlock(string blockContent)
+        async Task EmitToolCallsFromBlock(string blockContent)
         {
-            var (_, calls) = JinjaChatTemplate.ParseToolCalls(
-                $"<tool_call>{blockContent}</tool_call>");
-            if (calls.Count == 0) return;
-
-            var tc = calls[0];
-            string name    = tc.Name;
-            string argsJson = JinjaChatTemplate.SerializeToJson(tc.Arguments);
-
-            // Close any open text block.
-            if (textOpen)
+            var calls = adapter.ParseBlock(blockContent);
+            foreach (var tc in calls)
             {
+                string name    = tc.Name;
+                string argsJson = JinjaChatTemplate.SerializeToJson(tc.Arguments);
+
+                // Close any open text block at the first tool call.
+                if (textOpen)
+                {
+                    await WriteAnthropicEvent(ctx.Response, "content_block_stop",
+                        JsonSerializer.Serialize(new AContentBlockStopEvent("content_block_stop", textIndex),
+                            SharpInferenceJsonContext.Default.AContentBlockStopEvent));
+                    textOpen = false;
+                    nextBlockIndex = textIndex + 1;
+                }
+
+                var id = $"toolu_{Guid.NewGuid():N}";
+                int toolIdx = nextBlockIndex++;
+                hasToolCalls = true;
+
+                var toolStart = new AContentBlockStartEvent("content_block_start", toolIdx,
+                    new AContentBlock("tool_use", Id: id, Name: name, Input: EmptyJsonObject));
+                await WriteAnthropicEvent(ctx.Response, "content_block_start",
+                    JsonSerializer.Serialize(toolStart, SharpInferenceJsonContext.Default.AContentBlockStartEvent));
+
+                var inputDelta = new AContentBlockDeltaEvent("content_block_delta", toolIdx,
+                    new AContentDelta("input_json_delta", PartialJson: argsJson));
+                await WriteAnthropicEvent(ctx.Response, "content_block_delta",
+                    JsonSerializer.Serialize(inputDelta, SharpInferenceJsonContext.Default.AContentBlockDeltaEvent));
+
                 await WriteAnthropicEvent(ctx.Response, "content_block_stop",
-                    JsonSerializer.Serialize(new AContentBlockStopEvent("content_block_stop", textIndex),
+                    JsonSerializer.Serialize(new AContentBlockStopEvent("content_block_stop", toolIdx),
                         SharpInferenceJsonContext.Default.AContentBlockStopEvent));
-                textOpen = false;
-                nextBlockIndex = textIndex + 1;
             }
-
-            var id = $"toolu_{Guid.NewGuid():N}";
-            int toolIdx = nextBlockIndex++;
-            hasToolCalls = true;
-
-            var toolStart = new AContentBlockStartEvent("content_block_start", toolIdx,
-                new AContentBlock("tool_use", Id: id, Name: name, Input: EmptyJsonObject));
-            await WriteAnthropicEvent(ctx.Response, "content_block_start",
-                JsonSerializer.Serialize(toolStart, SharpInferenceJsonContext.Default.AContentBlockStartEvent));
-
-            var inputDelta = new AContentBlockDeltaEvent("content_block_delta", toolIdx,
-                new AContentDelta("input_json_delta", PartialJson: argsJson));
-            await WriteAnthropicEvent(ctx.Response, "content_block_delta",
-                JsonSerializer.Serialize(inputDelta, SharpInferenceJsonContext.Default.AContentBlockDeltaEvent));
-
-            await WriteAnthropicEvent(ctx.Response, "content_block_stop",
-                JsonSerializer.Serialize(new AContentBlockStopEvent("content_block_stop", toolIdx),
-                    SharpInferenceJsonContext.Default.AContentBlockStopEvent));
         }
 
         // Process a text-stream chunk through the tool-call detection state machine.
-        // Calls FlushTextDelta/EmitToolCallBlock — must not be called after the main
-        // loop's finally block starts closing blocks.
+        // Adapter-driven so a different model family (e.g. Qwen3-Coder, Llama-3) plugs
+        // its own open/close marker scan in without changes here.
         async Task ProcessTextChunk(string chunk)
         {
             if (inToolCall)
             {
                 toolCallBuf.Append(chunk);
                 string buf = toolCallBuf.ToString();
-                int closeIdx = buf.IndexOf(ToolCallCloseTag, StringComparison.Ordinal);
+                int closeIdx = adapter.FindCloseMarker(buf, toolCallContentStart, out int afterClose);
                 if (closeIdx >= 0)
                 {
-                    string json = buf[..closeIdx];
-                    string remaining = buf[(closeIdx + ToolCallCloseTag.Length)..];
+                    // Block content is whatever lies between the open marker's contentStart
+                    // and the close marker's start index. afterClose points past the marker.
+                    string block = buf[toolCallContentStart..closeIdx];
+                    string remaining = buf[afterClose..];
                     toolCallBuf.Clear();
+                    toolCallContentStart = -1;
                     inToolCall = false;
-                    await EmitToolCallBlock(json);
+                    await EmitToolCallsFromBlock(block);
                     if (remaining.Length > 0)
                         await ProcessTextChunk(remaining);
                 }
@@ -277,23 +282,31 @@ public static class AnthropicEndpoints
 
             pendingText += chunk;
 
-            int openIdx = pendingText.IndexOf(ToolCallOpenTag, StringComparison.Ordinal);
+            int openIdx = adapter.FindOpenMarker(pendingText, 0, out int contentStart);
             if (openIdx >= 0)
             {
                 if (openIdx > 0)
                     await FlushTextDelta(pendingText[..openIdx]);
-                string afterTag = pendingText[(openIdx + ToolCallOpenTag.Length)..];
-                pendingText = "";
+
+                // Capture whatever the adapter considers "block content" — for most adapters
+                // that's everything past the open marker, but Qwen3-Coder's name lives inside
+                // the open marker so its contentStart points AT the marker, not past it.
                 inToolCall = true;
                 toolCallBuf.Clear();
-                if (afterTag.Length > 0)
-                    await ProcessTextChunk(afterTag);
+                toolCallBuf.Append(pendingText, contentStart, pendingText.Length - contentStart);
+                toolCallContentStart = 0;
+                pendingText = "";
+
+                // The newly buffered region may itself already contain a complete close marker
+                // (e.g. when a single chunk delivered the whole call). Re-enter to check.
+                if (toolCallBuf.Length > 0)
+                    await ProcessTextChunk("");
                 return;
             }
 
-            // No <tool_call> found: flush everything except the last (tag-length - 1) chars
-            // which might be the start of a partial tag match.
-            int safeLen = Math.Max(0, pendingText.Length - (ToolCallOpenTag.Length - 1));
+            // No open marker found: flush everything except the last (maxOpenLen - 1) chars
+            // which might be the start of a partial marker match.
+            int safeLen = Math.Max(0, pendingText.Length - (maxOpenLen - 1));
             if (safeLen > 0)
             {
                 await FlushTextDelta(pendingText[..safeLen]);
@@ -425,14 +438,14 @@ public static class AnthropicEndpoints
     private static readonly JsonElement EmptyJsonObject = JsonDocument.Parse("{}").RootElement.Clone();
 
     /// <summary>
-    /// Parses Qwen3-style <c>&lt;tool_call&gt;...&lt;/tool_call&gt;</c> blocks from model output.
-    /// Supports both Qwen3.6 XML format and standard JSON format.
-    /// Returns the plain text (with tool_call tags removed) and a list of parsed tool calls.
+    /// Extracts tool calls from raw model output via the adapter for the loaded model.
+    /// Returns the plain text (with tool-call blocks stripped) and a list of parsed
+    /// calls tagged with Anthropic-style <c>toolu_</c> identifiers.
     /// </summary>
     private static (string text, List<(string id, string name, string argsJson)> toolCalls)
-        ParseToolCalls(string output)
+        ParseToolCalls(IToolCallAdapter adapter, string output)
     {
-        var (plainText, calls) = JinjaChatTemplate.ParseToolCalls(output);
+        var (plainText, calls) = adapter.Parse(output);
         var toolCalls = calls
             .Select(c => ($"toolu_{Guid.NewGuid():N}", c.Name, JinjaChatTemplate.SerializeToJson(c.Arguments)))
             .ToList();
@@ -463,10 +476,11 @@ public static class AnthropicEndpoints
     /// Builds rich message dictionaries and converts Anthropic tool definitions to
     /// the OpenAI/Qwen3 function format expected by the Jinja chat template.
     /// Handles multi-content messages: tool_use content blocks become <c>tool_calls</c>
-    /// entries on assistant messages; tool_result blocks become role="tool" messages.
+    /// entries on assistant messages; tool_result blocks become the role/content shape
+    /// the adapter specifies (defaults to role="tool").
     /// </summary>
     private static (List<Dictionary<string, object?>> messages, List<object?>? tools)
-        BuildRichMessageList(AnthropicMessageRequest req)
+        BuildRichMessageList(AnthropicMessageRequest req, IToolCallAdapter adapter)
     {
         var messages = new List<Dictionary<string, object?>>();
 
@@ -548,7 +562,10 @@ public static class AnthropicEndpoints
                                     ? c.GetString() ?? ""
                                     : ExtractTextFromArray(c);
                             }
-                            messages.Add(new() { ["role"] = "tool", ["content"] = resultContent });
+                            string toolUseId = block.TryGetProperty("tool_use_id", out var tid)
+                                ? tid.GetString() ?? ""
+                                : "";
+                            messages.Add(adapter.RenderToolResult(toolUseId, resultContent));
                         }
                     }
 

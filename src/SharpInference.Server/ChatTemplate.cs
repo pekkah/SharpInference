@@ -59,6 +59,7 @@ public sealed class ChatTemplateRenderer
 {
     private JinjaChatTemplate? _template;
     private string _architecture;
+    private IToolCallAdapter _toolCallAdapter;
 
     /// <summary>Architecture string used to pick a fallback template when no Jinja is loaded.</summary>
     public string Architecture => _architecture;
@@ -66,12 +67,20 @@ public sealed class ChatTemplateRenderer
     /// <summary>Compiled Jinja template, if the loaded model shipped one.</summary>
     public JinjaChatTemplate? JinjaTemplate => _template;
 
+    /// <summary>
+    /// Tool-call translation layer matched to the loaded model's architecture. Resolved
+    /// once at <see cref="Configure"/> time from <see cref="ToolCallAdapterRegistry"/>;
+    /// endpoint code reads this without having to look up by string each request.
+    /// </summary>
+    public IToolCallAdapter ToolCallAdapter => _toolCallAdapter;
+
     /// <param name="architecture">Default architecture (used both for fallback and exposed via <see cref="Architecture"/>).</param>
     /// <param name="template">Optional compiled Jinja template; null means "use the hardcoded fallback".</param>
     public ChatTemplateRenderer(string architecture = "qwen2", JinjaChatTemplate? template = null)
     {
         _architecture = architecture;
         _template = template;
+        _toolCallAdapter = ToolCallAdapterRegistry.Get(architecture);
     }
 
     /// <summary>
@@ -83,6 +92,7 @@ public sealed class ChatTemplateRenderer
     {
         _architecture = architecture;
         _template = template;
+        _toolCallAdapter = ToolCallAdapterRegistry.Get(architecture);
     }
 
     /// <param name="messages">Messages in order (system, user, assistant, ...).</param>
