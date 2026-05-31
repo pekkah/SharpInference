@@ -241,19 +241,25 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private readonly bool _cpuGdn =
         Environment.GetEnvironmentVariable("SHARPI_CPU_GDN") == "1";
 
-    // SHARPI_Q3K_Q8K=1 routes Q3_K routed-expert MoE rows through the int-domain
-    // DotQ3K_Q8K kernel; SHARPI_Q8_0_Q8K=1 does the same for Q8_0 rows (Carnice
-    // MTP head; #99). The float input is prepacked to Q8_K once per CpuMoeFfnCore
-    // call (Phase A: cpuNormIn; Phase C: each gateAll slice) and shared across
-    // all (numActive × expertDim) rows — the same prepack feeds both kernels,
-    // so either gate enables the scratch allocation. Default off → byte-identical
-    // to the FP DotQ3K / DotQ8_0 path (see MEMORY feedback_q4k_q8k_no_parity_win.md
-    // — a similar Q4_K → Q8_K port broke cumulative MTP parity even though
-    // per-kernel bit-equivalence held, so we keep these opt-in only).
-    private static readonly bool s_q3kQ8KEnabled =
-        Environment.GetEnvironmentVariable("SHARPI_Q3K_Q8K") == "1";
-    private static readonly bool s_q8_0Q8KEnabled =
-        Environment.GetEnvironmentVariable("SHARPI_Q8_0_Q8K") == "1";
+    // Q3_K / Q8_0 routed-expert MoE rows can run through the int-domain
+    // DotQ3K_Q8K / DotQ8_0_Q8K kernels instead of the FP dequant-FMA path.
+    // The float input is prepacked to Q8_K once per CpuMoeFfnCore call
+    // (Phase A: cpuNormIn; Phase C: each gateAll slice) and shared across all
+    // (numActive × expertDim) rows — same prepack feeds both kernels, so
+    // either gate enables the scratch allocation.
+    //
+    // Resolved per-instance from the model's routed-expert dtype mix: auto-on
+    // when the model has at least one Q3_K (or Q8_0) routed-expert layer —
+    // this is mainly the APEX mixed-precision tier (Carnice etc.) where the
+    // legacy FP kernels are the decode bottleneck. SHARPI_Q3K_Q8K=1 / =0 and
+    // SHARPI_Q8_0_Q8K=1 / =0 force the latch on / off respectively, overriding
+    // auto-detect. Output is NOT bit-identical to the FP path; per
+    // feedback_q4k_q8k_no_parity_win, cumulative trunk drift on Qwen3.6-class
+    // models can move argmaxes — auto-detect is scoped to the dtype families
+    // that benefit so the blast radius is models like Carnice where the
+    // ~+8 % decode lift is real and the FP path is otherwise unused anyway.
+    private readonly bool _q3kQ8KEnabled;
+    private readonly bool _q8_0Q8KEnabled;
 
     // ── CPU MoE state (only allocated/populated when _cpuMoe == true) ──
     // Packed MoE weight refs (mmap pointers; routed experts stay quantized on disk).
@@ -273,7 +279,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private readonly float* _cpuExpertGateAll;
     private readonly float* _cpuExpertUpAll;
     // Q8_K prepacked inputs for the routed-expert dot kernels (allocated only
-    // when s_q3kQ8KEnabled). _cpuNormInQ8K holds the post-RmsNorm hidden
+    // when _q3kQ8KEnabled). _cpuNormInQ8K holds the post-RmsNorm hidden
     // quantised to Q8_K for Phase A (gate+up) — rewritten per CpuMoeFfnCore
     // call when gate or up is Q3_K. _cpuExpertGateAllQ8K holds numActive
     // contiguous Q8_K-packed expertDim slices of the post-SiLuMul gate buffer
@@ -689,6 +695,22 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 $"[CudaHybridGdnForwardPass] Dense FFN mode (intermDim={_intermDim}): per-layer ffn_gate/up/down run on CPU from mmap; attn + GDN stay on GPU.");
         }
 
+        // Resolve Q3_K_Q8K / Q8_0_Q8K kernel gates. Auto-on when the model has
+        // routed-expert weights in that dtype (APEX mixed-precision tier — e.g.
+        // Carnice). SHARPI_Q3K_Q8K / SHARPI_Q8_0_Q8K = "1" or "0" override.
+        bool hasQ3KRouted  = HasRoutedExpertsOfDType(model, hp, DType.Q3_K);
+        bool hasQ8_0Routed = HasRoutedExpertsOfDType(model, hp, DType.Q8_0);
+        _q3kQ8KEnabled  = ResolveGate("SHARPI_Q3K_Q8K",  hasQ3KRouted);
+        _q8_0Q8KEnabled = ResolveGate("SHARPI_Q8_0_Q8K", hasQ8_0Routed);
+        if (_cpuMoe && (_q3kQ8KEnabled || _q8_0Q8KEnabled))
+        {
+            var enabled = new List<string>(2);
+            if (_q3kQ8KEnabled)  enabled.Add($"Q3_K_Q8K (Q3_K routed: {hasQ3KRouted})");
+            if (_q8_0Q8KEnabled) enabled.Add($"Q8_0_Q8K (Q8_0 routed: {hasQ8_0Routed})");
+            Console.Error.WriteLine(
+                $"[CudaHybridGdnForwardPass] Routed-MoE Q8_K-input kernels enabled: {string.Join(", ", enabled)}. Override with SHARPI_Q3K_Q8K=0 / SHARPI_Q8_0_Q8K=0.");
+        }
+
         // ── Per-layer tensor arrays ────────────────────────────────────
         _gpuAttnNorm = new Tensor[L];
         _gpuPostAttnNorm = new Tensor[L];
@@ -742,7 +764,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _cpuSharedOut = Alloc(_embDim);
             _cpuExpertGateAll = Alloc(_numActiveExperts * _expertDim);
             _cpuExpertUpAll = Alloc(_numActiveExperts * _expertDim);
-            if (s_q3kQ8KEnabled || s_q8_0Q8KEnabled)
+            if (_q3kQ8KEnabled || _q8_0Q8KEnabled)
             {
                 _cpuExpertGateAllQ8KStride = SimdKernels.Q8KScratchBytes(_expertDim);
                 _cpuNormInQ8K = (byte*)NativeMemory.Alloc((nuint)SimdKernels.Q8KScratchBytes(_embDim));
@@ -2610,10 +2632,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // Q3_K / Q8_0 rows can dot against the int-domain DotQ3K_Q8K / DotQ8_0_Q8K.
         // BatchForward2 safety: each CpuMoeFfnCore call writes its own
         // _cpuNormInQ8K from its own cpuNormIn, so t1 and t2 do not collide.
-        bool useQ8KGate = (s_q3kQ8KEnabled  && gateDt == DType.Q3_K)
-                       || (s_q8_0Q8KEnabled && gateDt == DType.Q8_0);
-        bool useQ8KUp   = (s_q3kQ8KEnabled  && upDt   == DType.Q3_K)
-                       || (s_q8_0Q8KEnabled && upDt   == DType.Q8_0);
+        bool useQ8KGate = (_q3kQ8KEnabled  && gateDt == DType.Q3_K)
+                       || (_q8_0Q8KEnabled && gateDt == DType.Q8_0);
+        bool useQ8KUp   = (_q3kQ8KEnabled  && upDt   == DType.Q3_K)
+                       || (_q8_0Q8KEnabled && upDt   == DType.Q8_0);
         byte* normInQ8K = _cpuNormInQ8K;
         if (useQ8KGate || useQ8KUp)
             SimdKernels.QuantizeRowToQ8K(cpuNormIn, _embDim, normInQ8K);
@@ -2643,8 +2665,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // expert k has its own post-SiLuMul gate slice (gateAll + k*expertDim),
         // so we quantise numActive slices into a stacked Q8_K buffer once before
         // the embDim-row Parallel.For, and the inner loop indexes by k * stride.
-        bool useQ8KDown = (s_q3kQ8KEnabled  && downDt == DType.Q3_K)
-                       || (s_q8_0Q8KEnabled && downDt == DType.Q8_0);
+        bool useQ8KDown = (_q3kQ8KEnabled  && downDt == DType.Q3_K)
+                       || (_q8_0Q8KEnabled && downDt == DType.Q8_0);
         byte* gateAllQ8K = _cpuExpertGateAllQ8K;
         int   gateAllQ8KStride = _cpuExpertGateAllQ8KStride;
         if (useQ8KDown)
@@ -2721,6 +2743,33 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             DType.Q8_0 => SimdKernels.DotQ8_0_Q8K(row, q8kScratch, cols),
             _ => throw new NotSupportedException($"Q8_K-prepacked dispatch not implemented for dtype {dtype}"),
         };
+
+    // True if any routed-expert weight tensor (trunk layers + MTP head if present)
+    // is encoded in `target`. Used to auto-enable the matching Q8_K-input kernel
+    // gate at model load — see _q3kQ8KEnabled / _q8_0Q8KEnabled. Scans the GGUF
+    // tensor index without allocating, so it is cheap to call from the constructor.
+    private static bool HasRoutedExpertsOfDType(GgufModel model, ModelHyperparams hp, DType target)
+    {
+        if (!hp.IsMoE) return false;
+        int L = hp.NumLayers;
+        for (int i = 0; i <= L; i++) // <= L so the MTP-head layer (index L) is included if present
+        {
+            if (model.FindTensor($"blk.{i}.ffn_gate_exps.weight")?.DType == target) return true;
+            if (model.FindTensor($"blk.{i}.ffn_up_exps.weight")?.DType   == target) return true;
+            if (model.FindTensor($"blk.{i}.ffn_down_exps.weight")?.DType == target) return true;
+        }
+        return false;
+    }
+
+    // Three-state env-var resolver: "1" forces on, "0" forces off, anything else
+    // (including unset) falls through to the auto-detected default.
+    private static bool ResolveGate(string envName, bool autoDetect)
+    {
+        var v = Environment.GetEnvironmentVariable(envName);
+        if (v == "1") return true;
+        if (v == "0") return false;
+        return autoDetect;
+    }
 
     private static void SelectTopKPtr(float* logits, int n, int k,
         Span<int> indices, Span<float> weights, bool normalize)
