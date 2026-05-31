@@ -41,10 +41,23 @@ public interface IInferenceEngine
     /// surface in chunk text. Requests are serialized — concurrent calls block until
     /// the current request finishes.
     /// </summary>
+    /// <param name="canonicalHistoryPrefix">
+    /// Optional chat-template render of the request's message history rendered with
+    /// <c>add_generation_prompt=false</c> — i.e. how the same messages would appear as
+    /// pure history in a future turn, with no assistant-generation prefix appended
+    /// (no <c>&lt;|im_start|&gt;assistant\n&lt;think&gt;</c> tail for Qwen3-style
+    /// templates). When provided, must be a string-prefix of <paramref name="prompt"/>;
+    /// the engine validates it tokenizes to a strict token-level prefix and uses that
+    /// boundary as the position to snapshot KV state for next-turn prefix reuse
+    /// (issue #102). If the validation fails the engine falls back to the legacy
+    /// generating-prompt-only path. Endpoints that don't render a separate canonical
+    /// (CLI completions, raw /v1/completions) pass <c>null</c>.
+    /// </param>
     IAsyncEnumerable<GenerateChunk> GenerateChunksAsync(
         string prompt,
         SamplingParams sp,
-        CancellationToken ct = default);
+        CancellationToken ct = default,
+        string? canonicalHistoryPrefix = null);
 
     /// <summary>
     /// Generate text from a pre-formatted prompt string. Yields decoded text chunks

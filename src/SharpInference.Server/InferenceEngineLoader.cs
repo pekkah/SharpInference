@@ -323,8 +323,8 @@ internal sealed class OwnedDisposableEngine(IInferenceEngine inner, IList<IDispo
     public long PrefillTokensReused   => inner.PrefillTokensReused;
 
     public IAsyncEnumerable<GenerateChunk> GenerateChunksAsync(
-        string prompt, SamplingParams sp, CancellationToken ct = default)
-        => inner.GenerateChunksAsync(prompt, sp, ct);
+        string prompt, SamplingParams sp, CancellationToken ct = default, string? canonicalHistoryPrefix = null)
+        => inner.GenerateChunksAsync(prompt, sp, ct, canonicalHistoryPrefix);
 
     public void Dispose()
     {

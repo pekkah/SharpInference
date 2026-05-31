@@ -70,16 +70,27 @@ public static class AnthropicEndpoints
         var adapter = chatTemplate.ToolCallAdapter;
 
         string prompt;
+        // Issue #102: render history-only canonical alongside the generating prompt so the
+        // engine can snapshot at the chat-template's history boundary and reuse KV across
+        // multi-turn /v1/messages calls (the long-running pain point on agentic loops).
+        string? canonicalHistoryPrefix;
         if (req.Tools is { Length: > 0 })
         {
             var (richMessages, tools) = BuildRichMessageList(req, adapter);
             prompt = chatTemplate.Format(richMessages, enableThinking, tools);
+            canonicalHistoryPrefix = chatTemplate.Format(richMessages, enableThinking, tools, addGenerationPrompt: false);
         }
         else
         {
             var messages = BuildMessageList(req);
             prompt = chatTemplate.Format(messages, enableThinking);
+            canonicalHistoryPrefix = chatTemplate.Format(messages, enableThinking, addGenerationPrompt: false);
         }
+
+        // Same guard as OpenAiEndpoints — only forward the hint if it's a string-prefix
+        // of the generating prompt.
+        if (canonicalHistoryPrefix is not null && !prompt.StartsWith(canonicalHistoryPrefix, StringComparison.Ordinal))
+            canonicalHistoryPrefix = null;
 
         var sp = SamplingParamsBuilder.Build(opts,
             temperature: req.Temperature,
@@ -93,23 +104,23 @@ public static class AnthropicEndpoints
 
         if (req.Stream == true)
         {
-            await HandleStreaming(ctx, engine, metrics, adapter, prompt, sp, msgId, modelId);
+            await HandleStreaming(ctx, engine, metrics, adapter, prompt, canonicalHistoryPrefix, sp, msgId, modelId);
         }
         else
         {
-            await HandleNonStreaming(ctx, engine, metrics, adapter, prompt, sp, msgId, modelId);
+            await HandleNonStreaming(ctx, engine, metrics, adapter, prompt, canonicalHistoryPrefix, sp, msgId, modelId);
         }
     }
 
     private static async Task HandleNonStreaming(
         HttpContext ctx, IInferenceEngine engine, ServerMetrics metrics, IToolCallAdapter adapter,
-        string prompt, SamplingParams sp, string msgId, string modelId)
+        string prompt, string? canonicalHistoryPrefix, SamplingParams sp, string msgId, string modelId)
     {
         var thinkingSb = new StringBuilder();
         var textSb = new StringBuilder();
         int totalOutputTokens = 0;
 
-        await foreach (var chunk in engine.GenerateChunksAsync(prompt, sp, ctx.RequestAborted))
+        await foreach (var chunk in engine.GenerateChunksAsync(prompt, sp, ctx.RequestAborted, canonicalHistoryPrefix))
         {
             totalOutputTokens++;
             if (chunk.Kind == GenerateChunkKind.Thinking)
@@ -162,7 +173,7 @@ public static class AnthropicEndpoints
 
     private static async Task HandleStreaming(
         HttpContext ctx, IInferenceEngine engine, ServerMetrics metrics, IToolCallAdapter adapter,
-        string prompt, SamplingParams sp, string msgId, string modelId)
+        string prompt, string? canonicalHistoryPrefix, SamplingParams sp, string msgId, string modelId)
     {
         ctx.Response.ContentType = "text/event-stream";
         ctx.Response.Headers.CacheControl = "no-cache";
@@ -330,7 +341,7 @@ public static class AnthropicEndpoints
         bool truncatedToolCall = false;
         try
         {
-            await foreach (var chunk in engine.GenerateChunksAsync(prompt, sp, ctx.RequestAborted))
+            await foreach (var chunk in engine.GenerateChunksAsync(prompt, sp, ctx.RequestAborted, canonicalHistoryPrefix))
             {
                 outputTokens++;
 

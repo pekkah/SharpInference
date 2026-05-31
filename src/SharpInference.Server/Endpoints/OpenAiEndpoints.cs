@@ -71,16 +71,33 @@ public static class OpenAiEndpoints
         // so the chat template can inject the tool schema and replay prior calls.
         bool toolsActive = req.Tools is { Length: > 0 } || HasToolMessages(req.Messages);
         string prompt;
+        // Issue #102: render a history-only canonical view of the same messages so the
+        // engine can snapshot at the chat-history boundary instead of after the inline
+        // <think> injection. The next turn's generating prompt starts with this exact
+        // canonical render plus the scrubbed assistant content + new user turn, so
+        // storing it as the snapshot anchor is what makes prefix reuse possible across
+        // multi-turn agentic loops.
+        string? canonicalHistoryPrefix;
         if (toolsActive)
         {
             var (richMessages, tools) = BuildRichMessageList(req, adapter);
             prompt = chatTemplate.Format(richMessages, enableThinking, tools);
+            canonicalHistoryPrefix = chatTemplate.Format(richMessages, enableThinking, tools, addGenerationPrompt: false);
         }
         else
         {
             var messages = BuildMessageList(req.Messages, req.ResponseFormat?.Type);
             prompt = chatTemplate.Format(messages, enableThinking);
+            canonicalHistoryPrefix = chatTemplate.Format(messages, enableThinking, addGenerationPrompt: false);
         }
+
+        // Safety: only forward the canonical hint when it's a string-prefix of the generating
+        // prompt. A non-Jinja fallback that diverges, or an exotic template that interleaves
+        // generation prep mid-history, would fail the engine's token-prefix check too — but
+        // skipping the hint here saves a tokenizer call on the engine side and keeps the path
+        // identical to legacy when the template doesn't fit the assumption.
+        if (canonicalHistoryPrefix is not null && !prompt.StartsWith(canonicalHistoryPrefix, StringComparison.Ordinal))
+            canonicalHistoryPrefix = null;
 
         // Parse logit_bias: OpenAI sends {"tokenId": biasValue} with string keys
         IReadOnlyDictionary<int, float>? logitBias = null;
@@ -104,24 +121,24 @@ public static class OpenAiEndpoints
 
         if (req.Stream == true)
         {
-            await HandleStreaming(ctx, engine, metrics, adapter, toolsActive, prompt, sp, requestId, created);
+            await HandleStreaming(ctx, engine, metrics, adapter, toolsActive, prompt, canonicalHistoryPrefix, sp, requestId, created);
         }
         else
         {
-            await HandleNonStreaming(ctx, engine, metrics, adapter, toolsActive, prompt, sp, requestId, created);
+            await HandleNonStreaming(ctx, engine, metrics, adapter, toolsActive, prompt, canonicalHistoryPrefix, sp, requestId, created);
         }
     }
 
     private static async Task HandleNonStreaming(
         HttpContext ctx, IInferenceEngine engine, ServerMetrics metrics, IToolCallAdapter adapter,
-        bool toolsActive, string prompt, SamplingParams sp, string requestId, long created)
+        bool toolsActive, string prompt, string? canonicalHistoryPrefix, SamplingParams sp, string requestId, long created)
     {
         var textSb = new StringBuilder();
         var reasoningSb = new StringBuilder();
         int textTokens = 0;
         int reasoningTokens = 0;
 
-        await foreach (var c in engine.GenerateChunksAsync(prompt, sp, ctx.RequestAborted))
+        await foreach (var c in engine.GenerateChunksAsync(prompt, sp, ctx.RequestAborted, canonicalHistoryPrefix))
         {
             if (c.Kind == GenerateChunkKind.Thinking)
             {
@@ -192,7 +209,7 @@ public static class OpenAiEndpoints
 
     private static async Task HandleStreaming(
         HttpContext ctx, IInferenceEngine engine, ServerMetrics metrics, IToolCallAdapter adapter,
-        bool toolsActive, string prompt, SamplingParams sp, string requestId, long created)
+        bool toolsActive, string prompt, string? canonicalHistoryPrefix, SamplingParams sp, string requestId, long created)
     {
         ctx.Response.ContentType = "text/event-stream";
         ctx.Response.Headers.CacheControl = "no-cache";
@@ -291,7 +308,7 @@ public static class OpenAiEndpoints
         bool truncatedToolCall = false;
         try
         {
-            await foreach (var c in engine.GenerateChunksAsync(prompt, sp, ctx.RequestAborted))
+            await foreach (var c in engine.GenerateChunksAsync(prompt, sp, ctx.RequestAborted, canonicalHistoryPrefix))
             {
                 tokenCount++;
                 if (c.Kind == GenerateChunkKind.Thinking)

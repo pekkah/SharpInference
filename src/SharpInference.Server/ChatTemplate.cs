@@ -101,9 +101,17 @@ public sealed class ChatTemplateRenderer
     /// templates (Qwen3, SmolLM3, ...) skip emitting a <c>&lt;think&gt;</c> block. Ignored by the
     /// hardcoded fallback paths since those archs have no thinking mode.
     /// </param>
+    /// <param name="addGenerationPrompt">
+    /// When false, omits the trailing assistant-generation prefix (e.g. Qwen3.x
+    /// <c>&lt;|im_start|&gt;assistant\n&lt;think&gt;\n\n&lt;/think&gt;\n\n</c>). Used by the
+    /// chat-completion endpoints to render a history-only view of the same messages as
+    /// they would appear in a future turn's chat history — issue #102: the canonical
+    /// rendering is what the engine snapshots so the next turn can reuse KV state.
+    /// </param>
     public string Format(
         IReadOnlyList<(string role, string content)> messages,
-        bool enableThinking = true)
+        bool enableThinking = true,
+        bool addGenerationPrompt = true)
     {
         if (_template != null)
         {
@@ -119,13 +127,13 @@ public sealed class ChatTemplateRenderer
             return _template.Render(new Dictionary<string, object?>
             {
                 ["messages"]              = msgList,
-                ["add_generation_prompt"] = true,
+                ["add_generation_prompt"] = (object?)addGenerationPrompt,
                 ["tools"]                 = null,
                 ["enable_thinking"]       = (object?)enableThinking,
             });
         }
 
-        return RenderFallback(messages, _architecture);
+        return RenderFallback(messages, _architecture, addGenerationPrompt);
     }
 
     /// <summary>
@@ -138,7 +146,8 @@ public sealed class ChatTemplateRenderer
     public string Format(
         IReadOnlyList<Dictionary<string, object?>> messages,
         bool enableThinking = true,
-        object? tools = null)
+        object? tools = null,
+        bool addGenerationPrompt = true)
     {
         if (_template != null)
         {
@@ -146,7 +155,7 @@ public sealed class ChatTemplateRenderer
             return _template.Render(new Dictionary<string, object?>
             {
                 ["messages"]              = msgList,
-                ["add_generation_prompt"] = true,
+                ["add_generation_prompt"] = (object?)addGenerationPrompt,
                 ["tools"]                 = tools,
                 ["enable_thinking"]       = (object?)enableThinking,
             });
@@ -158,10 +167,13 @@ public sealed class ChatTemplateRenderer
                 content: m.TryGetValue("content", out var c) ? (c as string ?? "") : ""
             ))
             .ToList();
-        return RenderFallback(simple, _architecture);
+        return RenderFallback(simple, _architecture, addGenerationPrompt);
     }
 
-    private static string RenderFallback(IReadOnlyList<(string role, string content)> messages, string arch)
+    private static string RenderFallback(
+        IReadOnlyList<(string role, string content)> messages,
+        string arch,
+        bool addGenerationPrompt = true)
     {
         var sb = new StringBuilder();
 
@@ -170,21 +182,24 @@ public sealed class ChatTemplateRenderer
             sb.Append("<|begin_of_text|>");
             foreach (var (role, content) in messages)
                 sb.Append($"<|header_start|>{role}<|header_end|>\n\n{content}<|eot_id|>");
-            sb.Append("<|header_start|>assistant<|header_end|>\n\n");
+            if (addGenerationPrompt)
+                sb.Append("<|header_start|>assistant<|header_end|>\n\n");
         }
         else if (arch is "llama")
         {
             sb.Append("<|begin_of_text|>");
             foreach (var (role, content) in messages)
                 sb.Append($"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>");
-            sb.Append("<|start_header_id|>assistant<|end_header_id|>\n\n");
+            if (addGenerationPrompt)
+                sb.Append("<|start_header_id|>assistant<|end_header_id|>\n\n");
         }
         else
         {
             // ChatML: Qwen, SmolLM2, default
             foreach (var (role, content) in messages)
                 sb.Append($"<|im_start|>{role}\n{content}<|im_end|>\n");
-            sb.Append("<|im_start|>assistant\n");
+            if (addGenerationPrompt)
+                sb.Append("<|im_start|>assistant\n");
         }
 
         return sb.ToString();

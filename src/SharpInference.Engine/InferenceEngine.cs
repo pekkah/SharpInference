@@ -46,7 +46,15 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
     public int ActiveRequests => _activeCount;
 
     /// <inheritdoc/>
-    public bool PrefixCacheEnabled => _fwd.SupportsPartialRewind;
+    /// <remarks>
+    /// True when the underlying pass supports partial rewind (page-aligned reuse across
+    /// any matching prefix) OR a single-slot end-of-prefill snapshot (issue #21 / #102,
+    /// used for chat-continuation reuse on GDN-hybrid passes via a caller-supplied
+    /// canonical-history hint). A <c>false</c> here is the only configuration where the
+    /// engine cannot reuse KV state across turns; reuse on a <c>true</c> backend is still
+    /// gated per-request on a matching prefix being available.
+    /// </remarks>
+    public bool PrefixCacheEnabled => _fwd.SupportsPartialRewind || _fwd.SupportsSnapshot;
 
     /// <inheritdoc/>
     public long PrefillTokensReused => Interlocked.Read(ref _prefillTokensReused);
@@ -80,8 +88,24 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
 
         if (!fwd.SupportsPartialRewind)
         {
-            Console.Error.WriteLine(
-                $"[InferenceEngine] prefix cache disabled — {fwd.GetType().Name} reports SupportsPartialRewind == false. Multi-turn requests will re-prefill the full prompt.");
+            // Issue #102: GDN-hybrid passes report SupportsPartialRewind=false but still
+            // expose a single-slot snapshot via CaptureSnapshot/SnapshotLength. The engine
+            // uses it for chat-continuation reuse when callers pass a canonicalHistoryPrefix,
+            // so flagging the cache as universally "disabled" is misleading. Distinguish
+            // the two flavours so server logs match what actually happens at request time.
+            if (fwd.SupportsSnapshot)
+            {
+                Console.Error.WriteLine(
+                    $"[InferenceEngine] partial-rewind prefix cache disabled — {fwd.GetType().Name} " +
+                    "uses destructive recurrent state. Snapshot-based prefix reuse is available across " +
+                    "chat turns when the caller supplies a canonical-history hint (chat completion endpoints do).");
+            }
+            else
+            {
+                Console.Error.WriteLine(
+                    $"[InferenceEngine] prefix cache disabled — {fwd.GetType().Name} reports SupportsPartialRewind == false " +
+                    "and exposes no snapshot facility. Multi-turn requests will re-prefill the full prompt.");
+            }
         }
     }
 
@@ -140,7 +164,8 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
     public async IAsyncEnumerable<GenerateChunk> GenerateChunksAsync(
         string prompt,
         SamplingParams sp,
-        [EnumeratorCancellation] CancellationToken ct = default)
+        [EnumeratorCancellation] CancellationToken ct = default,
+        string? canonicalHistoryPrefix = null)
     {
         Interlocked.Increment(ref _pendingCount);
         await _gate.WaitAsync(ct).ConfigureAwait(false);
@@ -164,6 +189,34 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     var tokens = _tokenizer.Encode(prompt).ToArray();
                     var rng = new Random();
                     var stopIds = sp.StopTokenIds ?? [_tokenizer.EosTokenId];
+
+                    // Issue #102: canonical-history prefix resolution. The endpoint passes a
+                    // chat-template render of just the message history (add_generation_prompt=false);
+                    // tokenize it and verify it's a strict token-level prefix of the generating
+                    // prompt. The validated boundary becomes (a) the position at which to capture
+                    // the GDN snapshot mid-prefill, and (b) the tokens stored as _prevTokens so the
+                    // next turn's generating prompt — which starts with that same canonical history
+                    // and then appends scrubbed assistant content + the next user turn — matches.
+                    // Empty / mismatched canonical → fall through to legacy behavior (snapshot at
+                    // end-of-decode, _prevTokens stores generating + decoded).
+                    int canonicalLen = 0;
+                    if (!string.IsNullOrEmpty(canonicalHistoryPrefix))
+                    {
+                        var canonTokens = _tokenizer.Encode(canonicalHistoryPrefix).ToArray();
+                        if (canonTokens.Length > 0
+                            && canonTokens.Length < tokens.Length
+                            && tokens.AsSpan(0, canonTokens.Length).SequenceEqual(canonTokens))
+                        {
+                            canonicalLen = canonTokens.Length;
+                        }
+                        else if (Environment.GetEnvironmentVariable("SHARPI_TRACE_SNAPSHOT") == "1")
+                        {
+                            Console.Error.WriteLine(
+                                $"[InferenceEngine] canonical-history prefix is not a strict token prefix of the generating prompt " +
+                                $"(canon.Len={canonTokens.Length}, prompt.Len={tokens.Length}); " +
+                                "falling back to end-of-decode snapshot.");
+                        }
+                    }
 
                     // Track the full generated sequence (prompt + decoded tokens) so the
                     // next turn's prefix match has the right baseline — issue #21. Sized
@@ -243,6 +296,10 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     //       exact-match against the most-recent snapshot length so the
                     //       held GDN recurrent state can be restored.
                     // If neither branch hits, fall back to a full ResetCache + Prefill.
+                    //
+                    // MTP exclusion (still in place): MtpDecoder + PrefillMtp require startPos=0;
+                    // the buffered per-position hiddens from a prior turn aren't retained, so the
+                    // snapshot branch must keep skipping MTP runs even with canonical hints.
                     int prefixLen = 0;
                     if (!useMtp && _fwd.SupportsPartialRewind)
                     {
@@ -253,13 +310,15 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                             prefixLen = candidate;
                         }
                     }
-                    else if (!useMtp && _fwd.SnapshotLength > 0 && _prevTokens != null)
+                    else if (!useMtp && _fwd.SupportsSnapshot && _fwd.SnapshotLength > 0 && _prevTokens != null)
                     {
                         int snapLen = _fwd.SnapshotLength;
-                        // snapLen must be a strict prefix of the new prompt (need at least
-                        // one suffix token to drive the decoder) AND a prefix of the
-                        // previously decoded sequence (so the snapshot matches the state
-                        // at that token position).
+                        // The pair (snapshot @ snapLen, _prevTokens) is maintained as an
+                        // invariant: on the canonical path both are written together immediately
+                        // after CaptureSnapshot, on the legacy path both are written together at
+                        // end-of-decode. snapLen must be a strict prefix of the new prompt (need
+                        // at least one suffix token to drive the decoder) AND a token-level
+                        // prefix of _prevTokens — the latter is the actual reuse precondition.
                         if (snapLen <= tokens.Length - 1 && snapLen <= _prevTokens.Length
                             && tokens.AsSpan(0, snapLen).SequenceEqual(_prevTokens.AsSpan(0, snapLen)))
                         {
@@ -279,12 +338,46 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     }
 
                     // Prefill: process all prompt tokens (or just the suffix after the cached prefix).
-                    ReadOnlySpan<float> logits;
+                    //
+                    // Issue #102 split: when a canonical-history boundary lies strictly between
+                    // prefixLen and the end of the prompt, run the prefill in two stages with a
+                    // CaptureSnapshot in between. That snapshot sits at the canonical boundary so
+                    // the next turn — whose generating prompt starts with the same canonical
+                    // history plus a scrubbed assistant response and a fresh user turn — can
+                    // restore it. Skipped for MTP runs (see snapshot-branch comment above) and
+                    // for backends that don't expose a snapshot (the snapshot call is a no-op,
+                    // but skipping the split keeps the prefill in one shot for cache efficiency).
+                    bool useCanonicalSnapshot =
+                        !useMtp
+                        && canonicalLen > prefixLen
+                        && canonicalLen < tokens.Length
+                        && _fwd.SupportsSnapshot;
+
+                    // Reused by the MTP path below for PrefillMtp(suffixTokens, prefixLen).
                     int[] suffixTokens = prefixLen > 0 ? tokens[prefixLen..] : tokens;
-                    if (suffixTokens.Length > 0)
-                        logits = _fwd.Prefill(suffixTokens, prefixLen);
+
+                    ReadOnlySpan<float> logits;
+                    if (useCanonicalSnapshot)
+                    {
+                        _fwd.Prefill(tokens[prefixLen..canonicalLen], prefixLen);
+                        _fwd.CaptureSnapshot();
+                        // Pair _prevTokens with the snapshot atomically: stage-2 failure or
+                        // mid-decode cancellation now leaves snapshot + _prevTokens consistent
+                        // with each other (both describe this turn's canonical state). Without
+                        // the immediate write, a stage-2 throw would leave the snapshot pointing
+                        // at this turn's canonical while _prevTokens still described the prior
+                        // turn — the next request could pass the snapshot-match check and
+                        // TruncateTo to state that doesn't correspond to its prefix.
+                        _prevTokens = tokens[..canonicalLen];
+                        logits = _fwd.Prefill(tokens[canonicalLen..], canonicalLen);
+                    }
                     else
-                        logits = _fwd.Forward(tokens[^1], tokens.Length - 1);
+                    {
+                        if (suffixTokens.Length > 0)
+                            logits = _fwd.Prefill(suffixTokens, prefixLen);
+                        else
+                            logits = _fwd.Forward(tokens[^1], tokens.Length - 1);
+                    }
 
                     if (useMtp)
                     {
@@ -444,15 +537,13 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     if (thinkFlush.Length > 0)
                         channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Thinking, thinkFlush));
 
-                    // Capture end-of-decode snapshot (issue #21) for the GDN-hybrid passes
-                    // and record the full sequence for prefix matching on the next turn.
-                    // ct.ThrowIfCancellationRequested above ensures we don't reach here on
-                    // a cancelled token — skip capture in that case to avoid stale state.
-                    if (!ct.IsCancellationRequested)
+                    // End-of-decode snapshot for the legacy path only — the canonical path
+                    // already captured + paired _prevTokens during the split prefill above.
+                    // ct.ThrowIfCancellationRequested earlier ensures we don't reach here on a
+                    // cancelled token; skip capture in that case to avoid stale state.
+                    if (!useCanonicalSnapshot && !ct.IsCancellationRequested)
                     {
                         _fwd.CaptureSnapshot();
-                        // Write _prevTokens AFTER capturing the snapshot so a subsequent
-                        // turn's prefix check sees the matching state.
                         _prevTokens = fullSeq.ToArray();
                     }
 

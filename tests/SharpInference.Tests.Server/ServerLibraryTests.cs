@@ -267,6 +267,42 @@ public sealed class ChatTemplateRendererTests
     }
 
     [Fact]
+    public void Fallback_Qwen2_AddGenerationPromptFalse_OmitsAssistantPrep()
+    {
+        // Issue #102: a history-only render must NOT append the trailing assistant-prep
+        // marker, and must be a strict string-prefix of the addGenerationPrompt=true render.
+        var r = new ChatTemplateRenderer("qwen2");
+        var generating = r.Format([("system", "be brief"), ("user", "hi")], addGenerationPrompt: true);
+        var canonical  = r.Format([("system", "be brief"), ("user", "hi")], addGenerationPrompt: false);
+
+        Assert.DoesNotContain("<|im_start|>assistant\n", canonical);
+        Assert.StartsWith(canonical, generating, StringComparison.Ordinal);
+        Assert.EndsWith("<|im_end|>\n", canonical);
+    }
+
+    [Fact]
+    public void Fallback_Llama_AddGenerationPromptFalse_OmitsAssistantPrep()
+    {
+        var r = new ChatTemplateRenderer("llama");
+        var generating = r.Format([("user", "hi")], addGenerationPrompt: true);
+        var canonical  = r.Format([("user", "hi")], addGenerationPrompt: false);
+
+        Assert.DoesNotContain("<|start_header_id|>assistant<|end_header_id|>\n\n", canonical);
+        Assert.StartsWith(canonical, generating, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Fallback_Llama4_AddGenerationPromptFalse_OmitsAssistantPrep()
+    {
+        var r = new ChatTemplateRenderer("llama4");
+        var generating = r.Format([("user", "hi")], addGenerationPrompt: true);
+        var canonical  = r.Format([("user", "hi")], addGenerationPrompt: false);
+
+        Assert.DoesNotContain("<|header_start|>assistant<|header_end|>\n\n", canonical);
+        Assert.StartsWith(canonical, generating, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Configure_ReplacesArchAndTemplate()
     {
         var r = new ChatTemplateRenderer("qwen2");

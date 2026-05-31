@@ -67,11 +67,25 @@ public interface IForwardPass : IDisposable
     /// <summary>
     /// Capture a snapshot of the current cache state so a subsequent
     /// <see cref="TruncateTo"/> at <see cref="SnapshotLength"/> can restore it.
-    /// Called once at end-of-decode by the inference engine; no-op by default.
-    /// Implementations that support snapshots must update <see cref="SnapshotLength"/>
-    /// to the cache's current token length when this returns.
+    /// Called by the inference engine at end-of-decode for non-canonical paths,
+    /// or mid-prefill at the canonical-history boundary for chat-continuation
+    /// reuse (issue #102); no-op by default. Implementations that support
+    /// snapshots must update <see cref="SnapshotLength"/> to the cache's current
+    /// token length when this returns AND override
+    /// <see cref="SupportsSnapshot"/> to <c>true</c>.
     /// </summary>
     void CaptureSnapshot() { }
+
+    /// <summary>
+    /// Static capability flag: <c>true</c> iff this pass implements
+    /// <see cref="CaptureSnapshot"/> / <see cref="SnapshotLength"/>. Distinct from
+    /// <see cref="SnapshotLength"/> because that value is <c>-1</c> both when no
+    /// snapshot has been captured yet AND when the pass doesn't support snapshots
+    /// at all — callers need to know the capability up-front (e.g. constructor-time
+    /// log lines, <c>/metrics</c> exposition) before any request has run.
+    /// Implementations that override <see cref="CaptureSnapshot"/> must override this to <c>true</c>.
+    /// </summary>
+    bool SupportsSnapshot => false;
 
     // ── Multi-Token Prediction (MTP / NEXTN) self-speculative decoding ──
     //

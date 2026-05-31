@@ -169,9 +169,187 @@ public sealed class InferenceEnginePrefixCacheTests
         Assert.Equal(33, fwd.LastPrefillStartPos);
     }
 
+    // ── Issue #102: canonical-history prefix snapshot path ─────────────────
+
+    /// <summary>
+    /// Snapshot-only backend with a canonical-history hint: the engine must split
+    /// prefill into two stages (canonical | generation prep) and capture the snapshot
+    /// at the canonical boundary — NOT at end-of-decode. That captured length is
+    /// what the next turn's prefix match keys off.
+    /// </summary>
+    [Fact]
+    public async Task GenerateAsync_CanonicalPrefix_SnapshotCapturedAtCanonicalBoundary()
+    {
+        var tokenizer = new CanonicalChatTokenizer();
+        var fwd = new SnapshotCapableForwardPass();
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock", thinkTokenId: -1, endThinkTokenId: -1);
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 1 };
+
+        // generating prompt = canonical (24 tokens) + assistant prep (8 tokens) = 32
+        await Drain(GenerateAsync(engine, "turn1_full", canonical: "turn1_canon", sp));
+
+        // Exactly two Prefill calls: stage 1 covers the canonical portion (24 tokens
+        // at startPos=0), stage 2 covers the generation prep (8 tokens at startPos=24).
+        Assert.Equal(2, fwd.PrefillCalls.Count);
+        Assert.Equal((24, 0), fwd.PrefillCalls[0]);
+        Assert.Equal((8, 24), fwd.PrefillCalls[1]);
+
+        // One snapshot captured, at the canonical boundary (not at 32 + 1 = 33).
+        Assert.Single(fwd.CaptureSnapshotCalls);
+        Assert.Equal(24, fwd.CaptureSnapshotCalls[0]);
+        Assert.Equal(24, fwd.SnapshotLength);
+    }
+
+    /// <summary>
+    /// Two-turn flow: turn 2's generating prompt starts with turn 1's canonical history,
+    /// then appends turn 1's scrubbed assistant response + a new user message + assistant
+    /// prep. The engine should restore from turn 1's snapshot (at canonical boundary)
+    /// and prefill only the tail.
+    /// </summary>
+    [Fact]
+    public async Task GenerateAsync_CanonicalPrefix_TurnTwoRestoresFromCanonicalSnapshot()
+    {
+        var tokenizer = new CanonicalChatTokenizer();
+        var fwd = new SnapshotCapableForwardPass();
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock", thinkTokenId: -1, endThinkTokenId: -1);
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 1 };
+
+        // Turn 1: snapshot is captured at 24 (canonical boundary).
+        await Drain(GenerateAsync(engine, "turn1_full", canonical: "turn1_canon", sp));
+        fwd.PrefillCalls.Clear();
+        fwd.CaptureSnapshotCalls.Clear();
+        long reusedAfterTurn1 = engine.PrefillTokensReused;
+
+        // Turn 2: generating prompt's first 24 tokens equal turn 1's canonical → restore.
+        // Turn 2's own canonical is 40 tokens, full prompt is 48. Expected:
+        //   TruncateTo(24)        — restore from turn 1's snapshot
+        //   Prefill(16 @ 24)      — stage 1: prefill canonical tail (positions 24..40)
+        //   CaptureSnapshot at 40 — turn 2's canonical boundary
+        //   Prefill(8 @ 40)       — stage 2: generation prep
+        await Drain(GenerateAsync(engine, "turn2_full", canonical: "turn2_canon", sp));
+
+        Assert.Equal(24, fwd.LastTruncateLength);
+        Assert.False(fwd.ResetCalledAfter,
+            "Snapshot restore must skip ResetCache when the canonical prefix matches.");
+        Assert.Equal(2, fwd.PrefillCalls.Count);
+        Assert.Equal((16, 24), fwd.PrefillCalls[0]);
+        Assert.Equal((8, 40),  fwd.PrefillCalls[1]);
+        Assert.Single(fwd.CaptureSnapshotCalls);
+        Assert.Equal(40, fwd.CaptureSnapshotCalls[0]);
+        // 24 prompt tokens skipped on turn 2 — observable via PrefillTokensReused.
+        Assert.Equal(reusedAfterTurn1 + 24, engine.PrefillTokensReused);
+    }
+
+    /// <summary>
+    /// Rewindable backend with a canonical hint: the canonical-snapshot split is
+    /// gated on <see cref="IForwardPass.SupportsSnapshot"/>, so a rewindable backend
+    /// behaves exactly as it would without the hint — single-shot prefill and
+    /// <c>_prevTokens = fullSeq</c> baseline (legacy path). The hint becomes
+    /// observable on snapshot-only backends like the GDN hybrids. This test pins
+    /// that contract: rewindable backends keep the legacy behavior intact, so the
+    /// canonical-snapshot work doesn't regress page-aligned reuse on the rewindable
+    /// fast path that already shipped (issue #102 design note).
+    /// </summary>
+    [Fact]
+    public async Task GenerateAsync_CanonicalPrefix_RewindableKeepsLegacyFullSeqBaseline()
+    {
+        var tokenizer = new CanonicalChatTokenizer();
+        var fwd = new RewindCapableForwardPass();
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock", thinkTokenId: -1, endThinkTokenId: -1);
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 1 };
+
+        // Turn 1 cold start: full prompt prefilled in one call. No split.
+        await Drain(GenerateAsync(engine, "turn1_full", canonical: "turn1_canon", sp));
+        Assert.Equal(32, fwd.LastPrefillLength);
+        Assert.Equal(0,  fwd.LastPrefillStartPos);
+        Assert.Equal(0, engine.PrefillTokensReused);
+
+        // Turn 2's tokens diverge from turn 1's fullSeq at position 24 (turn 2's
+        // canonical extends with [100..116); turn 1's fullSeq has the assistant prep
+        // [200..208) at the same offset). Shared prefix = 24, page-aligned down to 16.
+        // The point: rewindable backend reuses what the legacy fullSeq baseline allows —
+        // no canonical-aware split, no canonical-only _prevTokens, just FindCacheablePrefix.
+        await Drain(GenerateAsync(engine, "turn2_full", canonical: "turn2_canon", sp));
+        Assert.Equal(PagedKvCache.PageSize, fwd.LastTruncateLength);
+        Assert.Equal(PagedKvCache.PageSize, engine.PrefillTokensReused);
+    }
+
+    /// <summary>
+    /// A canonical hint that doesn't tokenize to a strict token-prefix of the
+    /// generating prompt must be rejected silently and the legacy single-prefill +
+    /// end-of-decode snapshot path used.
+    /// </summary>
+    [Fact]
+    public async Task GenerateAsync_CanonicalPrefix_MismatchedHintFallsBackToLegacy()
+    {
+        var tokenizer = new CanonicalChatTokenizer();
+        var fwd = new SnapshotCapableForwardPass();
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock", thinkTokenId: -1, endThinkTokenId: -1);
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 1 };
+
+        // canonical = "mismatch" → tokenizes to [9,9,9,9] which is NOT a prefix of
+        // the generating prompt's tokens. Engine should fall through to legacy path.
+        await Drain(GenerateAsync(engine, "turn1_full", canonical: "mismatch", sp));
+
+        // Single prefill (no split), single snapshot capture at end-of-decode (33 = 32 prompt + 1 sampled).
+        Assert.Single(fwd.PrefillCalls);
+        Assert.Equal((32, 0), fwd.PrefillCalls[0]);
+        Assert.Single(fwd.CaptureSnapshotCalls);
+        Assert.Equal(33, fwd.CaptureSnapshotCalls[0]);
+    }
+
+    private static IAsyncEnumerable<string> GenerateAsync(
+        InferenceEngine engine, string prompt, string canonical, SamplingParams sp)
+    {
+        // Adapt the IInferenceEngine GenerateChunksAsync to the test's text-only Drain helper.
+        return Inner(engine.GenerateChunksAsync(prompt, sp, default, canonical));
+
+        static async IAsyncEnumerable<string> Inner(IAsyncEnumerable<GenerateChunk> chunks)
+        {
+            await foreach (var c in chunks)
+                if (c.Kind == GenerateChunkKind.Text) yield return c.Text;
+        }
+    }
+
     private static async Task Drain(IAsyncEnumerable<string> stream)
     {
         await foreach (var _ in stream) { }
+    }
+
+    /// <summary>
+    /// Hand-rolled tokenizer that models the chat-template scenario for issue #102:
+    /// each turn has a "canonical" rendering (history only) and a "full" rendering
+    /// (history + assistant prep + inline &lt;think&gt; injection). Canonical is a
+    /// strict token-level prefix of full. Turn 2's canonical extends turn 1's by
+    /// 16 tokens (the scrubbed assistant response + new user message).
+    ///   turn1_canon → tokens [0..24)             (24 tokens)
+    ///   turn1_full  → tokens [0..24) + [200..208) (32 tokens = canon + assistant prep)
+    ///   turn2_canon → tokens [0..24) + [100..116) (40 tokens = turn1_canon + new content)
+    ///   turn2_full  → turn2_canon + [200..208)    (48 tokens)
+    ///   mismatch    → [9,9,9,9]                   (not a prefix of anything else)
+    /// </summary>
+    private sealed class CanonicalChatTokenizer : ITokenizer
+    {
+        public int VocabSize => 300;
+        public int BosTokenId => 0;
+        public int EosTokenId => Eos;
+        public int UnknownTokenId => 0;
+        public int PadTokenId => Eos;
+        public bool AddBosToken => false;
+
+        public IReadOnlyList<int> Encode(string text) => text switch
+        {
+            "turn1_canon" => Enumerable.Range(0, 24).ToArray(),
+            "turn1_full"  => Enumerable.Range(0, 24).Concat(Enumerable.Range(200, 8)).ToArray(),
+            "turn2_canon" => Enumerable.Range(0, 24).Concat(Enumerable.Range(100, 16)).ToArray(),
+            "turn2_full"  => Enumerable.Range(0, 24).Concat(Enumerable.Range(100, 16))
+                                                    .Concat(Enumerable.Range(200, 8)).ToArray(),
+            "mismatch"    => [9, 9, 9, 9],
+            _             => throw new ArgumentException($"unknown prompt: {text}", nameof(text)),
+        };
+
+        public string Decode(IEnumerable<int> tokens) => string.Empty;
+        public byte[] DecodeBytes(int token) => [];
     }
 
     // ── Mocks ─────────────────────────────────────────────────────────────
@@ -313,8 +491,14 @@ public sealed class InferenceEnginePrefixCacheTests
         public int LastPrefillLength { get; private set; } = -1;
         public int LastPrefillStartPos { get; private set; } = -1;
         public bool ResetCalledAfter { get; private set; }
+        // Cumulative call history for tests that need to verify split-prefill behavior
+        // (the canonical-snapshot path issues two Prefill calls and one mid-prefill
+        // CaptureSnapshot per request).
+        public List<(int Length, int StartPos)> PrefillCalls { get; } = [];
+        public List<int> CaptureSnapshotCalls { get; } = [];
 
         public bool SupportsPartialRewind => false;
+        public bool SupportsSnapshot => true;
         public int VocabSize => 200;
         public int MaxSeqLen => 4096;
 
@@ -330,6 +514,7 @@ public sealed class InferenceEnginePrefixCacheTests
         {
             LastPrefillLength = tokens.Count;
             LastPrefillStartPos = startPos;
+            PrefillCalls.Add((tokens.Count, startPos));
             _length = startPos + tokens.Count;
             return SampledLogits();
         }
@@ -366,6 +551,7 @@ public sealed class InferenceEnginePrefixCacheTests
         public void CaptureSnapshot()
         {
             LastCapturedSnapshotLength = _length;
+            CaptureSnapshotCalls.Add(_length);
             SnapshotLength = _length;
         }
 

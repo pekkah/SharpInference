@@ -1367,6 +1367,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     public int SnapshotLength => _snapshotLength;
 
     /// <inheritdoc />
+    public bool SupportsSnapshot => true;
+
+    /// <inheritdoc />
     public void CaptureSnapshot()
     {
         EnsureSnapshotBuf();

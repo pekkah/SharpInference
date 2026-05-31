@@ -782,6 +782,63 @@ public sealed class ServerTests : IClassFixture<WebApplicationFactory<Program>>
         Assert.Equal(0, fake.LastSamplingParams!.MaxThinkingTokens);
     }
 
+    // ── Canonical history-prefix plumbing (issue #102) ───────────────────────
+
+    [Fact]
+    public async Task ChatCompletion_PassesCanonicalHistoryPrefixToEngine()
+    {
+        var fake = new FakeInferenceEngine("test-model");
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(fake)));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[]
+            {
+                new { role = "system", content = "You are concise." },
+                new { role = "user", content = "Hi" },
+            },
+            max_tokens = 4,
+            stream = false,
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // The endpoint must render history-only canonical AND pass it through. Generic
+        // assertions only — we don't pin a specific template here because the test fake
+        // uses the hardcoded ChatML fallback in ChatTemplateRenderer.
+        Assert.NotNull(fake.LastCanonicalHistoryPrefix);
+        Assert.NotEqual(string.Empty, fake.LastCanonicalHistoryPrefix);
+        // History-only render must NOT include the trailing assistant-prep marker
+        // (ChatML: `<|im_start|>assistant\n`). That's the whole point of the param.
+        Assert.DoesNotContain("<|im_start|>assistant\n", fake.LastCanonicalHistoryPrefix!);
+    }
+
+    [Fact]
+    public async Task AnthropicMessages_PassesCanonicalHistoryPrefixToEngine()
+    {
+        var fake = new FakeInferenceEngine("test-model");
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(fake)));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            system = "You are concise.",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            max_tokens = 4,
+            stream = false,
+        };
+        var response = await client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        Assert.NotNull(fake.LastCanonicalHistoryPrefix);
+        Assert.DoesNotContain("<|im_start|>assistant\n", fake.LastCanonicalHistoryPrefix!);
+    }
+
     // ── Tool calling ─────────────────────────────────────────────────────────
 
     [Fact]
@@ -1036,12 +1093,21 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
         _script = script;
     }
 
+    /// <summary>
+    /// Captures the canonical-history hint handed to the most recent
+    /// <see cref="GenerateChunksAsync"/> call so endpoint tests can verify the
+    /// chat-template render reached the engine (issue #102).
+    /// </summary>
+    public string? LastCanonicalHistoryPrefix { get; private set; }
+
     public async IAsyncEnumerable<GenerateChunk> GenerateChunksAsync(
         string prompt,
         SamplingParams sp,
-        [EnumeratorCancellation] CancellationToken ct = default)
+        [EnumeratorCancellation] CancellationToken ct = default,
+        string? canonicalHistoryPrefix = null)
     {
         LastSamplingParams = sp;
+        LastCanonicalHistoryPrefix = canonicalHistoryPrefix;
         foreach (var (kind, text) in _script)
         {
             ct.ThrowIfCancellationRequested();

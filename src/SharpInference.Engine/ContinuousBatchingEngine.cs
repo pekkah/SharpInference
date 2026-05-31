@@ -133,11 +133,19 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// <paramref name="canonicalHistoryPrefix"/> is accepted for interface parity but
+    /// ignored on this engine — continuous batching gives each admitted sequence its
+    /// own freshly allocated <see cref="PagedKvCache"/> and never reuses state across
+    /// requests, so a snapshot hint has nothing to attach to (issue #102).
+    /// </remarks>
     public async IAsyncEnumerable<GenerateChunk> GenerateChunksAsync(
         string prompt,
         SamplingParams sp,
-        [EnumeratorCancellation] CancellationToken ct = default)
+        [EnumeratorCancellation] CancellationToken ct = default,
+        string? canonicalHistoryPrefix = null)
     {
+        _ = canonicalHistoryPrefix; // intentionally ignored; see XML remarks
         var channel = Channel.CreateUnbounded<GenerateChunk>(
             new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
 
