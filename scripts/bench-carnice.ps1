@@ -22,34 +22,25 @@ if (-not (Test-Path $Model)) {
 $results = @()
 $env:SHARPI_CPU_MOE = "1"
 
-# Both Q8K gates start at "no override" (auto-detect). The "baseline" cell
-# explicitly forces them to "0" so we measure the legacy FP DotQ3K / DotQ8_0
-# path even on models where auto-detect would otherwise turn them on.
+# Ensure both Q8K gates start OFF
 Remove-Item env:SHARPI_Q3K_Q8K -ErrorAction SilentlyContinue
 Remove-Item env:SHARPI_Q8_0_Q8K -ErrorAction SilentlyContinue
 
 try {
-    # Baseline: force the int-domain kernels OFF, measure the legacy
-    # DotQ3K / DotQ8_0 (f32 dequant-FMA) path. Required because auto-detect
-    # would otherwise enable both on Carnice's APEX-mixed-precision quants.
-    $env:SHARPI_Q3K_Q8K = "0"
-    $env:SHARPI_Q8_0_Q8K = "0"
+    # Baseline: legacy DotQ3K / DotQ8_0 (f32 dequant-FMA)
     $results += .\scripts\bench-textgen.ps1 -Model $Model -Tag "carnice-cuda-hybrid-baseline" `
         -NTokens $NTokens -Prompt $Prompt -TimeoutSec $TimeoutSec `
         -ExtraArgs @("-g","-1","--backend","cuda","--no-thinking")
 
-    # Q3K gate only (rank 1 #101) — Q8_0 still forced off
+    # Q3K gate only (rank 1 #101)
     $env:SHARPI_Q3K_Q8K = "1"
     $results += .\scripts\bench-textgen.ps1 -Model $Model -Tag "carnice-cuda-hybrid-q3k-q8k" `
         -NTokens $NTokens -Prompt $Prompt -TimeoutSec $TimeoutSec `
         -ExtraArgs @("-g","-1","--backend","cuda","--no-thinking")
 
-    # Default user experience: clear both env vars and let auto-detect engage
-    # both kernels because Carnice has Q3_K + Q8_0 routed experts. This cell
-    # is what a user running Carnice with zero env config will see.
-    Remove-Item env:SHARPI_Q3K_Q8K  -ErrorAction SilentlyContinue
-    Remove-Item env:SHARPI_Q8_0_Q8K -ErrorAction SilentlyContinue
-    $results += .\scripts\bench-textgen.ps1 -Model $Model -Tag "carnice-cuda-hybrid-auto" `
+    # Both gates (rank 1 + rank 2 #99)
+    $env:SHARPI_Q8_0_Q8K = "1"
+    $results += .\scripts\bench-textgen.ps1 -Model $Model -Tag "carnice-cuda-hybrid-both-q8k" `
         -NTokens $NTokens -Prompt $Prompt -TimeoutSec $TimeoutSec `
         -ExtraArgs @("-g","-1","--backend","cuda","--no-thinking")
 }
