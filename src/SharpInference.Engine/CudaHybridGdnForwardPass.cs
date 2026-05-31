@@ -395,13 +395,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private readonly float* _cpuFfnGateBuf2;
     private readonly float* _cpuFfnUpBuf2;
 
-    // Issue #33: host-side buffer of per-position pre-output-norm hiddens captured
-    // during Prefill. Consumed by PrefillMtp to drive MtpForward at each prompt
-    // position without re-running the trunk. Lazy-allocated; capacity grows as needed.
-    private float* _mtpPrefillHiddens;     // [_mtpPrefillHiddensCap × embDim]
+    // Host-side hidden history; see HybridGdnForwardPass field-level doc.
+    private float* _mtpPrefillHiddens;     // [_mtpPrefillHiddensCap × embDim], slot p = h_p
     private int _mtpPrefillHiddensCap;     // allocated capacity in tokens
-    private int _mtpPrefillHiddensCount;   // hiddens stored by last Prefill
-    private int _mtpPrefillHiddensStartPos; // startPos of last Prefill
+    private int _mtpHiddenHistoryLength;   // slots [0.._mtpHiddenHistoryLength) populated
 
     // ── SnapKV (issue #58): GPU prefill-eviction scratch ───────────────
     // Allocated lazily on the first SnapKV-active Prefill (Budget > 0 and prompt
@@ -1119,15 +1116,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         int N = tokens.Count;
 
-        // Issue #33: buffer per-position pre-output-norm hiddens for the follow-up
-        // PrefillMtp call. Forward already downloads _lastHidden after each step when
-        // _hasMtp, so we just copy the host span — no extra device traffic.
+        // Size the hidden buffer up front so Forward's per-step writes don't
+        // each trigger a grow.
         if (_hasMtp)
-        {
-            EnsureMtpPrefillHiddensCap(N);
-            _mtpPrefillHiddensCount = N;
-            _mtpPrefillHiddensStartPos = startPos;
-        }
+            EnsureMtpHiddenHistoryCap(startPos + N);
 
         // SnapKV (issue #58) gating: only run eviction when this is a fresh
         // prefill (startPos==0), the effective budget is positive (env-set or
@@ -1155,11 +1147,6 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _snapKvCaptureSlot = (snapKvActive && i >= wStart) ? (i - wStart) : -1;
 
             logits = Forward(tokens[i], startPos + i);
-            if (_hasMtp)
-            {
-                new ReadOnlySpan<float>(_lastHidden, _embDim).CopyTo(
-                    new Span<float>(_mtpPrefillHiddens + (long)i * _embDim, _embDim));
-            }
         }
         _snapKvCaptureSlot = -1;
 
@@ -1296,13 +1283,22 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _snapKvScoreAccum = _gpu.Allocate(TensorShape.D1(_maxSeqLen));
     }
 
-    private void EnsureMtpPrefillHiddensCap(int requiredTokens)
+    private void EnsureMtpHiddenHistoryCap(int requiredTokens)
     {
         if (_mtpPrefillHiddensCap >= requiredTokens) return;
-        if (_mtpPrefillHiddens != null) NativeMemory.Free(_mtpPrefillHiddens);
-        _mtpPrefillHiddens = (float*)NativeMemory.Alloc(
-            (nuint)((long)requiredTokens * _embDim * sizeof(float)));
-        _mtpPrefillHiddensCap = requiredTokens;
+        // Grow by doubling — see HybridGdnForwardPass.EnsureMtpHiddenHistoryCap.
+        int newCap = Math.Max(requiredTokens, _mtpPrefillHiddensCap * 2);
+        long oldBytes = (long)_mtpHiddenHistoryLength * _embDim * sizeof(float);
+        float* fresh = (float*)NativeMemory.Alloc(
+            (nuint)((long)newCap * _embDim * sizeof(float)));
+        if (_mtpPrefillHiddens != null)
+        {
+            if (oldBytes > 0)
+                NativeMemory.Copy(_mtpPrefillHiddens, fresh, (nuint)oldBytes);
+            NativeMemory.Free(_mtpPrefillHiddens);
+        }
+        _mtpPrefillHiddens = fresh;
+        _mtpPrefillHiddensCap = newCap;
     }
 
     public void TruncateTo(int length)
@@ -1310,6 +1306,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (length == _gdnStateCache.Length)
         {
             _kvCache.TruncateTo(length);
+            // Mirror the CPU path: keep MTP attention KV in lockstep with the
+            // trunk so a future RestoreBatchSnapshot-without-MtpTruncateTo
+            // caller can't silently leave stale entries past `length`.
+            _mtpKvCache?.TruncateTo(length);
             return;
         }
         if (length == 0)
@@ -1346,6 +1346,16 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 }
             }
             _kvCache.TruncateTo(length);
+            // Issue #106: rewind MTP KV (the device-side _gpuMtpKCache is a flat
+            // ring, so future KvAppends just overwrite stale slots) and the
+            // hidden-history length so PrefillMtp(suffix, startPos=length) sees
+            // a consistent view.
+            if (_hasMtp)
+            {
+                _mtpKvCache?.TruncateTo(length);
+                if (_mtpHiddenHistoryLength > length)
+                    _mtpHiddenHistoryLength = length;
+            }
             return;
         }
         throw new NotSupportedException(
@@ -1376,6 +1386,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             if (_gpuMtpKCache is { } kT) _gpu.Clear(kT);
             if (_gpuMtpVCache is { } vT) _gpu.Clear(vT);
         }
+        // Always reset the hidden-history length regardless of _hasMtp, mirroring
+        // the CPU pass — the field defaults to 0 on non-MTP passes so this is a
+        // no-op there, but the unconditional form prevents a future MTP-late-bind
+        // refactor from leaving stale state across resets.
+        _mtpHiddenHistoryLength = 0;
     }
 
     /// <inheritdoc />
@@ -1574,6 +1589,19 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // 6. Download logits to host (Download self-syncs the stream — also
         // drains the _lastHidden async D2H above).
         _gpu.Download(_gpuLogits, _logitsBuf);
+
+        // Issue #106: mirror the host _lastHidden into the absolute-position
+        // hidden history buffer so future snapshot-restore + PrefillMtp(startPos =
+        // past decode position) calls can read the right h_{p-1}. Must come AFTER
+        // the synchronizing Download above so _lastHidden's async D2H has landed.
+        if (_hasMtp)
+        {
+            EnsureMtpHiddenHistoryCap(position + 1);
+            new ReadOnlySpan<float>(_lastHidden, _embDim).CopyTo(
+                new Span<float>(_mtpPrefillHiddens + (long)position * _embDim, _embDim));
+            if (_mtpHiddenHistoryLength < position + 1)
+                _mtpHiddenHistoryLength = position + 1;
+        }
 
         if (_traceLayers) TraceLogits(position, _logitsBuf);
 
@@ -1780,6 +1808,22 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpu.Download(_gpuLogits,  _logitsBuf);
         _gpu.Download(_gpuLogits2, _logitsBuf2);
 
+        // Issue #106: mirror the two host hiddens (now landed via the syncing
+        // Downloads above) into the absolute-position history buffer at slots
+        // startPos and startPos+1. RestoreBatchSnapshot shrinks the count if
+        // t2 is rejected; the follow-up Forward(corrected_t2, startPos+1) then
+        // rewrites slot startPos+1.
+        if (_hasMtp)
+        {
+            EnsureMtpHiddenHistoryCap(startPos + 2);
+            new ReadOnlySpan<float>(_lastHiddenT1, _embDim).CopyTo(
+                new Span<float>(_mtpPrefillHiddens + (long)startPos       * _embDim, _embDim));
+            new ReadOnlySpan<float>(_lastHidden,   _embDim).CopyTo(
+                new Span<float>(_mtpPrefillHiddens + (long)(startPos + 1) * _embDim, _embDim));
+            if (_mtpHiddenHistoryLength < startPos + 2)
+                _mtpHiddenHistoryLength = startPos + 2;
+        }
+
         _batchSnapshotValid = true;
         logits1 = _logitsBuf;
         logits2 = _logitsBuf2;
@@ -1805,6 +1849,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         }
         _gdnStateCache.SetLength(lengthAfter);
         _kvCache.TruncateTo(lengthAfter);
+        // Atomic with the trunk rewind — see HybridGdnForwardPass.RestoreBatchSnapshot.
+        _mtpKvCache?.TruncateTo(lengthAfter);
+        if (_hasMtp && _mtpHiddenHistoryLength > lengthAfter)
+            _mtpHiddenHistoryLength = lengthAfter;
         _batchSnapshotValid = false;
     }
 
@@ -2085,11 +2133,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     /// <inheritdoc />
     /// <remarks>
-    /// Issue #33 (CUDA mirror of <see cref="HybridGdnForwardPass.PrefillMtp"/>):
+    /// Issue #33 / #106 (CUDA mirror of <see cref="HybridGdnForwardPass.PrefillMtp"/>):
     /// Walks the prompt and calls <see cref="MtpForward"/> at each position to
-    /// populate the GPU MTP KV cache. The previous hidden <c>h_{i-1}</c> is read
-    /// from the host-side buffer captured during the matching <see cref="Prefill"/>;
-    /// MtpForward uploads it back to <c>_gpuLastHidden</c> per step.
+    /// populate the GPU MTP KV cache. The previous hidden <c>h_{startPos+i-1}</c> is
+    /// read from the absolute-position hidden history buffer populated by every
+    /// preceding <see cref="Prefill"/> / <see cref="Forward"/> / <see cref="BatchForward2"/>;
+    /// the snapshot branch in <see cref="TruncateTo"/> guarantees slot startPos-1
+    /// survives a turn-boundary snapshot restore. MtpForward uploads each prev
+    /// hidden back to <c>_gpuLastHidden</c> per step.
     /// </remarks>
     public void PrefillMtp(IReadOnlyList<int> tokens, int startPos = 0)
     {
@@ -2097,30 +2148,33 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (tokens is null || tokens.Count == 0) return;
 
         int N = tokens.Count;
-        if (_mtpPrefillHiddensCount < N || _mtpPrefillHiddensStartPos != startPos)
+        int requiredHistory = startPos + N;
+        if (_mtpHiddenHistoryLength < requiredHistory)
             throw new InvalidOperationException(
-                $"PrefillMtp({N} tokens, startPos={startPos}) requires a preceding " +
-                $"Prefill with the same startPos and at least {N} tokens; the buffer " +
-                $"holds {_mtpPrefillHiddensCount} hiddens at startPos={_mtpPrefillHiddensStartPos}.");
+                $"PrefillMtp({N} tokens, startPos={startPos}) requires a preceding Prefill / Forward " +
+                $"sweep covering positions [0..{requiredHistory}); the hidden history only goes to " +
+                $"{_mtpHiddenHistoryLength}.");
 
-        if (startPos > 0)
-            throw new InvalidOperationException(
-                "PrefillMtp with startPos > 0 is not supported: h_{startPos-1} from a " +
-                "prior turn is not retained. The caller should disable prefix reuse when " +
-                "MTP is active so PrefillMtp is always called with startPos == 0.");
-
-        float* zeroHidden = (float*)NativeMemory.AllocZeroed((nuint)(_embDim * sizeof(float)));
+        // For position startPos+i, prevHidden = h_{startPos+i-1}:
+        //   startPos+i == 0 → zero vector (sequence start)
+        //   otherwise       → _mtpPrefillHiddens[(startPos+i-1) * embDim]
+        float* zeroHidden = startPos == 0
+            ? (float*)NativeMemory.AllocZeroed((nuint)(_embDim * sizeof(float)))
+            : null;
         try
         {
             for (int i = 0; i < N; i++)
             {
-                float* prevH = (i == 0) ? zeroHidden : _mtpPrefillHiddens + (long)(i - 1) * _embDim;
-                _ = MtpForward(tokens[i], startPos + i, new ReadOnlySpan<float>(prevH, _embDim));
+                int absPos = startPos + i;
+                float* prevH = absPos == 0
+                    ? zeroHidden!
+                    : _mtpPrefillHiddens + (long)(absPos - 1) * _embDim;
+                _ = MtpForward(tokens[i], absPos, new ReadOnlySpan<float>(prevH, _embDim));
             }
         }
         finally
         {
-            NativeMemory.Free(zeroHidden);
+            if (zeroHidden != null) NativeMemory.Free(zeroHidden);
         }
     }
 

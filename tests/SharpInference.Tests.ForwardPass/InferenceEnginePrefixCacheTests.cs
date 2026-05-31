@@ -274,6 +274,121 @@ public sealed class InferenceEnginePrefixCacheTests
         Assert.Equal(PagedKvCache.PageSize, engine.PrefillTokensReused);
     }
 
+    // ── Issue #106: MTP runs also use canonical / snapshot reuse ───────────
+
+    /// <summary>
+    /// Issue #106 turn 1 of the canonical-snapshot path on an MTP-capable pass.
+    /// With the <c>!useMtp</c> gate removed, MTP runs must also split prefill at the
+    /// canonical boundary, capture the snapshot there (not at end-of-decode), and
+    /// drive <c>PrefillMtp</c> over the full prompt at <c>startPos = 0</c>.
+    /// </summary>
+    [Fact]
+    public async Task GenerateAsync_Mtp_CanonicalPrefix_SnapshotCapturedAtCanonicalBoundary()
+    {
+        var tokenizer = new CanonicalChatTokenizer();
+        var fwd = new SnapshotMtpForwardPass();
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock", thinkTokenId: -1, endThinkTokenId: -1);
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 1 };
+
+        await Drain(GenerateAsync(engine, "turn1_full", canonical: "turn1_canon", sp));
+
+        Assert.Equal(2, fwd.PrefillCalls.Count);
+        Assert.Equal((24, 0), fwd.PrefillCalls[0]);
+        Assert.Equal((8, 24), fwd.PrefillCalls[1]);
+
+        // Exactly one snapshot, at the canonical boundary — NOT at 32 (end-of-prefill)
+        // and NOT at 33 (end-of-decode). The MTP path's end-of-decode capture is now
+        // gated by !useCanonicalSnapshot so it doesn't clobber the canonical snapshot.
+        Assert.Single(fwd.CaptureSnapshotCalls);
+        Assert.Equal(24, fwd.CaptureSnapshotCalls[0]);
+        Assert.Equal(24, fwd.SnapshotLength);
+
+        // PrefillMtp covers the whole prompt at startPos = prefixLen = 0.
+        Assert.Single(fwd.PrefillMtpCalls);
+        Assert.Equal((32, 0), fwd.PrefillMtpCalls[0]);
+    }
+
+    /// <summary>
+    /// Issue #106 turn 2: snapshot restore on an MTP run must also rewind the MTP KV
+    /// cache (mock's <c>MtpTruncateTo</c> fires from inside <c>TruncateTo</c>) and the
+    /// follow-up <c>PrefillMtp</c> must be called with <c>startPos = snapLen</c> (not 0).
+    /// </summary>
+    [Fact]
+    public async Task GenerateAsync_Mtp_CanonicalPrefix_TurnTwoRestoresAndCallsPrefillMtpAtSnapLen()
+    {
+        var tokenizer = new CanonicalChatTokenizer();
+        var fwd = new SnapshotMtpForwardPass();
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock", thinkTokenId: -1, endThinkTokenId: -1);
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 1 };
+
+        await Drain(GenerateAsync(engine, "turn1_full", canonical: "turn1_canon", sp));
+        fwd.PrefillCalls.Clear();
+        fwd.CaptureSnapshotCalls.Clear();
+        fwd.PrefillMtpCalls.Clear();
+        fwd.TruncateCalls.Clear();
+        fwd.MtpTruncateCalls.Clear();
+        long reusedAfterTurn1 = engine.PrefillTokensReused;
+
+        await Drain(GenerateAsync(engine, "turn2_full", canonical: "turn2_canon", sp));
+
+        Assert.Contains(24, fwd.TruncateCalls);
+        Assert.Contains(24, fwd.MtpTruncateCalls);
+        Assert.False(fwd.ResetCalledAfter,
+            "Snapshot restore must skip ResetCache when the canonical prefix matches.");
+
+        // Two-stage prefill at the new canonical boundary (40).
+        Assert.Equal(2, fwd.PrefillCalls.Count);
+        Assert.Equal((16, 24), fwd.PrefillCalls[0]);
+        Assert.Equal((8, 40),  fwd.PrefillCalls[1]);
+        Assert.Single(fwd.CaptureSnapshotCalls);
+        Assert.Equal(40, fwd.CaptureSnapshotCalls[0]);
+
+        // PrefillMtp covers the [24..48) tail at startPos = snapLen.
+        Assert.Single(fwd.PrefillMtpCalls);
+        Assert.Equal((24, 24), fwd.PrefillMtpCalls[0]);
+
+        Assert.Equal(reusedAfterTurn1 + 24, engine.PrefillTokensReused);
+    }
+
+    /// <summary>
+    /// Issue #106 legacy-snapshot path on an MTP run: with no canonical hint, the
+    /// engine still captures a snapshot at end-of-decode and on the next turn
+    /// restores via <c>TruncateTo(snapLen)</c> + <c>PrefillMtp(suffix, startPos = snapLen)</c>.
+    /// Pre-#106, the engine's <c>!useMtp</c> gate skipped the snapshot-match branch for
+    /// MTP runs and re-prefilled the whole prompt every turn — wasted ~95 s per
+    /// round-trip on long Carnice agentic loops per the issue.
+    /// </summary>
+    [Fact]
+    public async Task GenerateAsync_Mtp_LegacySnapshot_TurnTwoRestoresAndCallsPrefillMtpAtSnapLen()
+    {
+        var tokenizer = new MtpLegacyMultiTurnTokenizer();
+        var fwd = new SnapshotMtpForwardPass();
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock", thinkTokenId: -1, endThinkTokenId: -1);
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 1 };
+
+        // Turn 1: 32-token prompt, immediate-EOS decode → end-of-decode snapshot at 32.
+        await Drain(engine.GenerateAsync("turn1", sp));
+        Assert.Equal(32, fwd.SnapshotLength);
+        Assert.Single(fwd.PrefillMtpCalls);
+        Assert.Equal((32, 0), fwd.PrefillMtpCalls[0]);
+
+        fwd.PrefillCalls.Clear();
+        fwd.PrefillMtpCalls.Clear();
+        fwd.TruncateCalls.Clear();
+        fwd.MtpTruncateCalls.Clear();
+
+        // Turn 2: 34-token prompt whose first 32 match turn 1. Snapshot-match fires.
+        await Drain(engine.GenerateAsync("turn2", sp));
+
+        Assert.Contains(32, fwd.TruncateCalls);
+        Assert.False(fwd.ResetCalledAfter,
+            "Snapshot restore must skip ResetCache when the legacy snapshot matches.");
+        Assert.Single(fwd.PrefillCalls);
+        Assert.Equal((2, 32), fwd.PrefillCalls[0]);
+        Assert.Single(fwd.PrefillMtpCalls);
+        Assert.Equal((2, 32), fwd.PrefillMtpCalls[0]);
+    }
+
     /// <summary>
     /// A canonical hint that doesn't tokenize to a strict token-prefix of the
     /// generating prompt must be rejected silently and the legacy single-prefill +
@@ -566,6 +681,148 @@ public sealed class InferenceEnginePrefixCacheTests
             _logits[SnapshotMultiTurnTokenizer.SampledTokenId] = 1.0f;
             return _logits;
         }
+    }
+
+    /// <summary>
+    /// Issue #106: turn 1's 32-token prompt; turn 2's prompt is the same 32 tokens
+    /// plus 2 fresh tokens (50 then 110). With the MTP path's immediate-EOS decode
+    /// the snapshot is captured at length 32; turn 2's first 32 match exactly so
+    /// snapshot reuse fires. The fresh tokens drive a non-empty Prefill + PrefillMtp
+    /// at <c>startPos = 32</c>, exercising the snapshot-restored branch.
+    /// </summary>
+    private sealed class MtpLegacyMultiTurnTokenizer : ITokenizer
+    {
+        public int VocabSize => 200;
+        public int BosTokenId => 0;
+        public int EosTokenId => Eos;
+        public int UnknownTokenId => 0;
+        public int PadTokenId => Eos;
+        public bool AddBosToken => false;
+
+        public IReadOnlyList<int> Encode(string text)
+        {
+            var prefix = Enumerable.Range(0, 32).ToArray();
+            return text == "turn2"
+                ? prefix.Concat([50, 110]).ToArray()
+                : prefix;
+        }
+
+        public string Decode(IEnumerable<int> tokens) => string.Empty;
+        public byte[] DecodeBytes(int token) => [];
+    }
+
+    /// <summary>
+    /// MTP-capable mock forward pass (issue #106). Reports <c>HasMtpHead = true</c>
+    /// and exposes the snapshot + MTP-KV-truncation behaviour the real
+    /// <see cref="HybridGdnForwardPass"/> / <see cref="CudaHybridGdnForwardPass"/> ship:
+    /// <list type="bullet">
+    ///   <item><c>TruncateTo(snapLen)</c> internally calls <c>MtpTruncateTo(snapLen)</c>
+    ///         so the engine doesn't need to know about MTP KV bookkeeping.</item>
+    ///   <item>Returns EOS-favoured logits so <see cref="MtpDecoder"/> exits on the
+    ///         first iter — keeps the tests focused on prefill / PrefillMtp / snapshot
+    ///         plumbing rather than MTP decode minutiae.</item>
+    ///   <item>Records every <c>Prefill</c>, <c>PrefillMtp</c>, <c>TruncateTo</c>,
+    ///         <c>MtpTruncateTo</c>, and <c>CaptureSnapshot</c> call.</item>
+    /// </list>
+    /// </summary>
+    private sealed class SnapshotMtpForwardPass : IForwardPass
+    {
+        private readonly float[] _logits;
+        private readonly float[] _lastHidden;
+        private int _length;
+        private int _mtpLength;
+
+        public int LastTruncateLength { get; private set; } = -1;
+        public bool ResetCalledAfter { get; private set; }
+        public List<(int Length, int StartPos)> PrefillCalls { get; } = [];
+        public List<(int Length, int StartPos)> PrefillMtpCalls { get; } = [];
+        public List<int> CaptureSnapshotCalls { get; } = [];
+        public List<int> TruncateCalls { get; } = [];
+        public List<int> MtpTruncateCalls { get; } = [];
+
+        public bool SupportsPartialRewind => false;
+        public bool SupportsSnapshot => true;
+        public bool HasMtpHead => true;
+        public int VocabSize => 200;
+        public int MaxSeqLen => 4096;
+        public int SnapshotLength { get; private set; } = -1;
+        public ReadOnlySpan<float> LastHidden => _lastHidden;
+
+        public SnapshotMtpForwardPass()
+        {
+            _logits = new float[VocabSize];
+            _logits[Eos] = 1f;
+            // Non-zero hidden so MtpDecoder.Initialize doesn't reject IsEmpty.
+            _lastHidden = new float[16];
+            _lastHidden[0] = 1f;
+        }
+
+        public ReadOnlySpan<float> Forward(int token, int position)
+        {
+            _length = position + 1;
+            return _logits;
+        }
+
+        public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0)
+        {
+            PrefillCalls.Add((tokens.Count, startPos));
+            _length = startPos + tokens.Count;
+            return _logits;
+        }
+
+        public void TruncateTo(int length)
+        {
+            LastTruncateLength = length;
+            TruncateCalls.Add(length);
+            if (length == 0)
+            {
+                _length = 0;
+                _mtpLength = 0;
+                SnapshotLength = -1;
+                return;
+            }
+            if (length == _length) return;
+            if (length == SnapshotLength && SnapshotLength >= 0)
+            {
+                _length = length;
+                // Mirror the real pass: snapshot restore also rewinds MTP KV.
+                _mtpLength = length;
+                MtpTruncateCalls.Add(length);
+                return;
+            }
+            throw new NotSupportedException(
+                $"SnapshotMtpForwardPass.TruncateTo({length}): only 0, current ({_length}), or SnapshotLength ({SnapshotLength}) supported.");
+        }
+
+        public void ResetCache()
+        {
+            if (SnapshotLength >= 0) ResetCalledAfter = true;
+            _length = 0;
+            _mtpLength = 0;
+            SnapshotLength = -1;
+        }
+
+        public void CaptureSnapshot()
+        {
+            CaptureSnapshotCalls.Add(_length);
+            SnapshotLength = _length;
+        }
+
+        public void PrefillMtp(IReadOnlyList<int> tokens, int startPos = 0)
+        {
+            PrefillMtpCalls.Add((tokens.Count, startPos));
+            _mtpLength = startPos + tokens.Count;
+        }
+
+        public void MtpResetCache() { _mtpLength = 0; }
+
+        public void MtpTruncateTo(int length)
+        {
+            MtpTruncateCalls.Add(length);
+            _mtpLength = length;
+        }
+
+        public void Dispose() { }
     }
 
     /// <summary>

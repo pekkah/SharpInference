@@ -285,13 +285,12 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     private readonly float* _mtpConcatBuf;            // [embDim * 2]
     private readonly float* _mtpEhProjF32;            // dequant'd eh_proj weight [embDim*2 × embDim] row-major F32
 
-    // Issue #33: buffer of per-position pre-output-norm hiddens from the most
-    // recent Prefill, so a follow-up PrefillMtp can drive MtpForward at every
-    // prompt position with h_{i-1}. Lazy-allocated; capacity grows as needed.
-    private float* _mtpPrefillHiddens;                // [_mtpPrefillHiddensCap × embDim]
+    // Pre-output-norm hidden history indexed by absolute position (slot p = h_p).
+    // Sticky across turns so PrefillMtp(startPos>0) can read h_{startPos-1} from
+    // slot startPos-1 after a snapshot restore (issue #106).
+    private float* _mtpPrefillHiddens;                // [_mtpPrefillHiddensCap × embDim], slot p = h_p
     private int _mtpPrefillHiddensCap;                // allocated capacity in tokens
-    private int _mtpPrefillHiddensCount;              // hiddens stored by last Prefill
-    private int _mtpPrefillHiddensStartPos;           // startPos of last Prefill
+    private int _mtpHiddenHistoryLength;              // slots [0.._mtpHiddenHistoryLength) populated
 
     public HybridGdnForwardPass(GgufModel model, IComputeBackend backend, ModelHyperparams hp,
         int maxContextLength = 0)
@@ -649,37 +648,36 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         if (tokens is null || tokens.Count == 0)
             throw new ArgumentException("Token list is empty", nameof(tokens));
 
-        // Issue #33: when MTP is loaded, buffer per-position pre-output-norm hiddens
-        // so a follow-up PrefillMtp can populate the MTP KV cache without redoing
-        // the main trunk. Cost: N × embDim memcpy per prefill (negligible).
+        // Size the hidden buffer up front so Forward's per-step writes don't
+        // each trigger a grow.
         if (_hasMtp)
-        {
-            EnsureMtpPrefillHiddensCap(tokens.Count);
-            _mtpPrefillHiddensCount = tokens.Count;
-            _mtpPrefillHiddensStartPos = startPos;
-        }
+            EnsureMtpHiddenHistoryCap(startPos + tokens.Count);
 
         ReadOnlySpan<float> logits = default;
         for (int i = 0; i < tokens.Count; i++)
-        {
             logits = Forward(tokens[i], startPos + i);
-            if (_hasMtp)
-            {
-                // _lastHidden = h_{startPos+i} (set inside Forward when _hasMtp).
-                new ReadOnlySpan<float>(_lastHidden, _embDim).CopyTo(
-                    new Span<float>(_mtpPrefillHiddens + (long)i * _embDim, _embDim));
-            }
-        }
         return logits;
     }
 
-    private void EnsureMtpPrefillHiddensCap(int requiredTokens)
+    private void EnsureMtpHiddenHistoryCap(int requiredTokens)
     {
         if (_mtpPrefillHiddensCap >= requiredTokens) return;
-        if (_mtpPrefillHiddens != null) NativeMemory.Free(_mtpPrefillHiddens);
-        _mtpPrefillHiddens = (float*)NativeMemory.Alloc(
-            (nuint)((long)requiredTokens * _embDim * sizeof(float)));
-        _mtpPrefillHiddensCap = requiredTokens;
+        // Grow by doubling so the per-decode-token Forward calls don't trigger
+        // an Alloc+Copy+Free at every position past the prompt — that's O(N^2)
+        // host memcpy on a long decode. Doubling makes it amortized O(1) per call
+        // at the cost of one over-allocation.
+        int newCap = Math.Max(requiredTokens, _mtpPrefillHiddensCap * 2);
+        long oldBytes = (long)_mtpHiddenHistoryLength * _embDim * sizeof(float);
+        float* fresh = (float*)NativeMemory.Alloc(
+            (nuint)((long)newCap * _embDim * sizeof(float)));
+        if (_mtpPrefillHiddens != null)
+        {
+            if (oldBytes > 0)
+                NativeMemory.Copy(_mtpPrefillHiddens, fresh, (nuint)oldBytes);
+            NativeMemory.Free(_mtpPrefillHiddens);
+        }
+        _mtpPrefillHiddens = fresh;
+        _mtpPrefillHiddensCap = newCap;
     }
 
     /// <summary>
@@ -699,6 +697,12 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         if (length == _gdnStateCache.Length)
         {
             _kvCache.TruncateTo(length);
+            // Keep the MTP attention KV in lockstep with the trunk KV even on the
+            // no-op-for-GDN path. BatchForward2 + a rejected draft can leave
+            // _mtpKvCache past `length` without an accompanying MtpTruncateTo; an
+            // unconditional soft truncate here makes the invariant explicit
+            // instead of caller-tracked.
+            _mtpKvCache?.TruncateTo(length);
             return;
         }
         if (length == 0)
@@ -708,10 +712,15 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         }
         if (length == _snapshotLength && _snapshotLength >= 0)
         {
-            // Issue #21: restore GDN state from the end-of-decode snapshot, then
-            // soft-truncate the KV cache to the matching position.
+            // Issue #21: restore GDN state from the snapshot, soft-truncate the
+            // trunk KV. Issue #106: also rewind the MTP attention KV and hidden
+            // history so PrefillMtp(suffix, startPos=length) sees a consistent
+            // view; slots [0..length) survive the rewind.
             _gdnStateCache.RestoreFrom(_snapshotBuf, _snapshotCap);
             _kvCache.TruncateTo(length);
+            _mtpKvCache?.TruncateTo(length);
+            if (_hasMtp && _mtpHiddenHistoryLength > length)
+                _mtpHiddenHistoryLength = length;
             return;
         }
         throw new NotSupportedException(
@@ -727,6 +736,7 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         _kvCache.Reset();
         _gdnStateCache.Reset();
         _mtpKvCache?.Reset();
+        _mtpHiddenHistoryLength = 0;
         ClearSnapshot();
     }
 
@@ -845,9 +855,18 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         _gdnStateCache.IncrementPosition();
 
         // 5. Capture pre-output-norm hidden for MTP (issue #25). RmsNorm below
-        //    overwrites _hidden in place, so snapshot now. Cheap (embDim copy).
+        //    overwrites _hidden in place, so snapshot now into both _lastHidden
+        //    (current-step pointer) and the absolute-position history slot
+        //    (sticky across turns for PrefillMtp(startPos>0), issue #106).
         if (_hasMtp)
-            new ReadOnlySpan<float>(_hidden, _embDim).CopyTo(new Span<float>(_lastHidden, _embDim));
+        {
+            var hSpan = new ReadOnlySpan<float>(_hidden, _embDim);
+            hSpan.CopyTo(new Span<float>(_lastHidden, _embDim));
+            EnsureMtpHiddenHistoryCap(position + 1);
+            hSpan.CopyTo(new Span<float>(_mtpPrefillHiddens + (long)position * _embDim, _embDim));
+            if (_mtpHiddenHistoryLength < position + 1)
+                _mtpHiddenHistoryLength = position + 1;
+        }
 
         // 6. Final norm + output projection
         var outNormW = GetNormWeight(_outputNorm);
@@ -1016,8 +1035,23 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         _gdnStateCache.IncrementPosition();
 
         // 5. Snapshot the pre-output-norm hiddens before final norm overwrites them.
-        new ReadOnlySpan<float>(_hidden,  _embDim).CopyTo(new Span<float>(_lastHiddenT1, _embDim));
-        new ReadOnlySpan<float>(_hidden2, _embDim).CopyTo(new Span<float>(_lastHidden,   _embDim));
+        var h1Span = new ReadOnlySpan<float>(_hidden,  _embDim);
+        var h2Span = new ReadOnlySpan<float>(_hidden2, _embDim);
+        h1Span.CopyTo(new Span<float>(_lastHiddenT1, _embDim));
+        h2Span.CopyTo(new Span<float>(_lastHidden,   _embDim));
+
+        // Issue #106: also write the absolute-position slots in the hidden history
+        // buffer so future snapshot-restore + PrefillMtp(startPos = past decode
+        // position) calls can read the right h_{p-1}. RestoreBatchSnapshot will
+        // shrink _mtpHiddenHistoryLength back if t2 is rejected and only t1 commits.
+        if (_hasMtp)
+        {
+            EnsureMtpHiddenHistoryCap(startPos + 2);
+            h1Span.CopyTo(new Span<float>(_mtpPrefillHiddens + (long)startPos       * _embDim, _embDim));
+            h2Span.CopyTo(new Span<float>(_mtpPrefillHiddens + (long)(startPos + 1) * _embDim, _embDim));
+            if (_mtpHiddenHistoryLength < startPos + 2)
+                _mtpHiddenHistoryLength = startPos + 2;
+        }
 
         // 6. Final norm + output projection for both tokens. The lm_head can use
         //    MatVec2In so the vocab-sized weight matrix is read once.
@@ -1062,6 +1096,13 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         }
         _gdnStateCache.SetLength(lengthAfter);
         _kvCache.TruncateTo(lengthAfter);
+        // Shrink the hidden history and the MTP attention KV alongside the
+        // trunk so the rollback is atomic — MtpDecoder.DecodeBatched also
+        // calls MtpTruncateTo right after, but folding it in here removes
+        // the implicit "caller must also rewind MTP" contract.
+        _mtpKvCache?.TruncateTo(lengthAfter);
+        if (_hasMtp && _mtpHiddenHistoryLength > lengthAfter)
+            _mtpHiddenHistoryLength = lengthAfter;
         _batchSnapshotValid = false;
     }
 
@@ -1544,17 +1585,18 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
 
     /// <inheritdoc />
     /// <remarks>
-    /// Issue #33: Walks <paramref name="tokens"/> and calls
+    /// Issue #33 / #106: Walks <paramref name="tokens"/> and calls
     /// <see cref="MtpForward(int, int, ReadOnlySpan{float})"/> at each prompt position
     /// so the MTP attention KV cache is populated for positions
     /// [<paramref name="startPos"/>..<paramref name="startPos"/>+N-1]. The previous
-    /// hidden <c>h_{i-1}</c> is read from the buffer captured during the matching
-    /// <see cref="Prefill"/> call. For the first position when
-    /// <paramref name="startPos"/> is 0, a zero vector is used (matches llama.cpp's
-    /// "no previous hidden" convention at the start of a sequence). When
-    /// <paramref name="startPos"/> &gt; 0 (prefix reuse), <c>h_{startPos-1}</c> would
-    /// have to come from a prior turn — not currently retained, so callers must
-    /// disable prefix reuse when driving MTP.
+    /// hidden <c>h_{startPos+i-1}</c> is read from the absolute-position hidden history
+    /// buffer (populated by every preceding <see cref="Prefill"/> /
+    /// <see cref="Forward"/> / <see cref="BatchForward2"/> when MTP is loaded). When
+    /// <paramref name="startPos"/> is 0 a zero vector is used for the i=0 slot
+    /// (llama.cpp's "no previous hidden" convention at the start of a sequence).
+    /// When <paramref name="startPos"/> &gt; 0 (prefix reuse / canonical snapshot
+    /// restore), h_{startPos-1} is read from the buffer's slot startPos-1; the snapshot
+    /// branch in <see cref="TruncateTo"/> guarantees this slot survives the restore.
     /// </remarks>
     public void PrefillMtp(IReadOnlyList<int> tokens, int startPos = 0)
     {
@@ -1562,35 +1604,33 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         if (tokens is null || tokens.Count == 0) return;
 
         int N = tokens.Count;
-        if (_mtpPrefillHiddensCount < N || _mtpPrefillHiddensStartPos != startPos)
+        int requiredHistory = startPos + N;
+        if (_mtpHiddenHistoryLength < requiredHistory)
             throw new InvalidOperationException(
-                $"PrefillMtp({N} tokens, startPos={startPos}) requires a preceding " +
-                $"Prefill with the same startPos and at least {N} tokens; the buffer " +
-                $"holds {_mtpPrefillHiddensCount} hiddens at startPos={_mtpPrefillHiddensStartPos}.");
+                $"PrefillMtp({N} tokens, startPos={startPos}) requires a preceding Prefill / Forward " +
+                $"sweep covering positions [0..{requiredHistory}); the hidden history only goes to " +
+                $"{_mtpHiddenHistoryLength}.");
 
         // For position startPos+i, prevHidden = h_{startPos+i-1}:
-        //   i == 0 && startPos == 0  →  zero vector
-        //   i == 0 && startPos > 0   →  unsupported (would need h_{startPos-1} from previous turn)
-        //   i > 0                    →  _mtpPrefillHiddens[(i-1) * embDim]
-        if (startPos > 0)
-            throw new InvalidOperationException(
-                "PrefillMtp with startPos > 0 is not supported: h_{startPos-1} from a prior " +
-                "turn is not retained. The caller (InferenceEngine) should disable prefix " +
-                "reuse when MTP is active so PrefillMtp is always called with startPos == 0.");
-
-        // Zero buffer for the i=0 prevHidden slot.
-        float* zeroHidden = (float*)NativeMemory.AllocZeroed((nuint)(_embDim * sizeof(float)));
+        //   startPos+i == 0 → zero vector (sequence start)
+        //   otherwise       → _mtpPrefillHiddens[(startPos+i-1) * embDim]
+        float* zeroHidden = startPos == 0
+            ? (float*)NativeMemory.AllocZeroed((nuint)(_embDim * sizeof(float)))
+            : null;
         try
         {
             for (int i = 0; i < N; i++)
             {
-                float* prevH = (i == 0) ? zeroHidden : _mtpPrefillHiddens + (long)(i - 1) * _embDim;
-                _ = MtpForward(tokens[i], startPos + i, new ReadOnlySpan<float>(prevH, _embDim));
+                int absPos = startPos + i;
+                float* prevH = absPos == 0
+                    ? zeroHidden!
+                    : _mtpPrefillHiddens + (long)(absPos - 1) * _embDim;
+                _ = MtpForward(tokens[i], absPos, new ReadOnlySpan<float>(prevH, _embDim));
             }
         }
         finally
         {
-            NativeMemory.Free(zeroHidden);
+            if (zeroHidden != null) NativeMemory.Free(zeroHidden);
         }
     }
 

@@ -127,9 +127,11 @@ public interface IForwardPass : IDisposable
     /// <summary>
     /// Populate the MTP attention KV cache for a sequence of prompt tokens, calling
     /// <see cref="MtpForward"/> at each position with the previous main forward's
-    /// hidden state. Must be called after a matching <see cref="Prefill"/> so that
-    /// the MTP head has access to per-position hiddens (the implementation buffers
-    /// them during <see cref="Prefill"/> when <see cref="HasMtpHead"/> is true).
+    /// hidden state. Must be called after a matching <see cref="Prefill"/> (or
+    /// snapshot restore + Prefill of the new suffix) so that the MTP head has
+    /// access to per-position hiddens — the implementation buffers them in an
+    /// absolute-positional history (slot p = h_p) populated by every
+    /// <see cref="Prefill"/> / <see cref="Forward"/> / <see cref="BatchForward2"/>.
     /// <para>
     /// Without this, the MTP attention KV cache is empty at the first decode step
     /// and the MTP head's attention scores only see its own freshly-written K/V at
@@ -140,8 +142,12 @@ public interface IForwardPass : IDisposable
     /// </summary>
     /// <param name="tokens">Prompt token IDs to populate MTP KV for. Should match the
     /// list passed to the preceding <see cref="Prefill"/>.</param>
-    /// <param name="startPos">Position at which the first token sits (== same
-    /// <c>startPos</c> as the preceding <see cref="Prefill"/>).</param>
+    /// <param name="startPos">Position at which the first token sits. Accepts any
+    /// non-negative value; <c>startPos &gt; 0</c> reads <c>h_{startPos-1}</c> from
+    /// the hidden history buffer's slot <c>startPos-1</c>, which the snapshot
+    /// branch in <see cref="TruncateTo"/> guarantees survives a turn-boundary
+    /// restore (issue #106). At <c>startPos == 0</c> the i=0 slot uses a zero
+    /// vector (llama.cpp's "no previous hidden" sequence-start convention).</param>
     /// <remarks>Default is a no-op so non-MTP forward passes need no override.</remarks>
     void PrefillMtp(IReadOnlyList<int> tokens, int startPos = 0) { }
 

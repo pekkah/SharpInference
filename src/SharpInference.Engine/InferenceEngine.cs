@@ -294,14 +294,12 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     //       page-aligned KV reuse.
                     //   (b) Non-rewindable GDN hybrid with a snapshot — issue #21: try
                     //       exact-match against the most-recent snapshot length so the
-                    //       held GDN recurrent state can be restored.
+                    //       held GDN recurrent state can be restored. Works for MTP
+                    //       runs too (issue #106) — PrefillMtp accepts startPos > 0 and
+                    //       TruncateTo soft-truncates the MTP KV alongside the trunk.
                     // If neither branch hits, fall back to a full ResetCache + Prefill.
-                    //
-                    // MTP exclusion (still in place): MtpDecoder + PrefillMtp require startPos=0;
-                    // the buffered per-position hiddens from a prior turn aren't retained, so the
-                    // snapshot branch must keep skipping MTP runs even with canonical hints.
                     int prefixLen = 0;
-                    if (!useMtp && _fwd.SupportsPartialRewind)
+                    if (_fwd.SupportsPartialRewind)
                     {
                         int candidate = FindCacheablePrefix(tokens);
                         if (candidate > 0)
@@ -310,7 +308,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                             prefixLen = candidate;
                         }
                     }
-                    else if (!useMtp && _fwd.SupportsSnapshot && _fwd.SnapshotLength > 0 && _prevTokens != null)
+                    else if (_fwd.SupportsSnapshot && _fwd.SnapshotLength > 0 && _prevTokens != null)
                     {
                         int snapLen = _fwd.SnapshotLength;
                         // The pair (snapshot @ snapLen, _prevTokens) is maintained as an
@@ -344,12 +342,13 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     // CaptureSnapshot in between. That snapshot sits at the canonical boundary so
                     // the next turn — whose generating prompt starts with the same canonical
                     // history plus a scrubbed assistant response and a fresh user turn — can
-                    // restore it. Skipped for MTP runs (see snapshot-branch comment above) and
-                    // for backends that don't expose a snapshot (the snapshot call is a no-op,
-                    // but skipping the split keeps the prefill in one shot for cache efficiency).
+                    // restore it. Issue #106: also applies on MTP runs; the sticky hidden
+                    // history buffer + MTP KV soft-truncate make PrefillMtp(startPos=snapLen)
+                    // viable. Skipped for backends that don't expose a snapshot (the snapshot
+                    // call is a no-op, but skipping the split keeps the prefill in one shot
+                    // for cache efficiency).
                     bool useCanonicalSnapshot =
-                        !useMtp
-                        && canonicalLen > prefixLen
+                        canonicalLen > prefixLen
                         && canonicalLen < tokens.Length
                         && _fwd.SupportsSnapshot;
 
@@ -419,7 +418,9 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                                 $"drafts accepted ({mtpDec.AcceptanceRate:P1})");
                         }
 
-                        if (!ct.IsCancellationRequested)
+                        // End-of-decode snapshot — see the non-MTP twin below for the
+                        // !useCanonicalSnapshot rationale.
+                        if (!useCanonicalSnapshot && !ct.IsCancellationRequested)
                         {
                             _fwd.CaptureSnapshot();
                             _prevTokens = fullSeq.ToArray();

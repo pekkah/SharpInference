@@ -618,4 +618,108 @@ public sealed class HybridGdnForwardPassTests
                 "corruption from MTP path.");
         }
     }
+
+    /// <summary>
+    /// Issue #106: PrefillMtp must fail loud (InvalidOperationException) when the
+    /// hidden-history buffer hasn't been populated for the requested position
+    /// range. The pre-#106 contract required startPos == 0 with the buffer at
+    /// matching size; the post-#106 contract accepts startPos > 0 but only when
+    /// slots [0..startPos+N) have been written by a preceding Prefill / Forward.
+    /// Without this guard a stale-memory read at slot startPos-1 would corrupt
+    /// MTP attention silently — acceptance rate collapses without a crash.
+    /// </summary>
+    [Fact]
+    public void HybridGdnForwardPass_Qwen35Mtp_PrefillMtp_ThrowsWhenHistoryUnpopulated()
+    {
+        var path = FindMtpModelPath();
+        if (path is null) return;   // silent skip
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var backend = new CpuBackend();
+        using var fwd = new HybridGdnForwardPass(model, backend, hp);
+        Assert.True(fwd.HasMtpHead);
+
+        // Freshly-constructed pass: hidden history length is 0. PrefillMtp at
+        // any startPos > 0, or at startPos == 0 with N > 0 tokens against an
+        // unpopulated buffer, must throw — not silently read stale memory.
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            fwd.PrefillMtp([1, 2, 3], startPos: 4));
+        Assert.Contains("hidden history", ex.Message);
+    }
+
+    /// <summary>
+    /// Issue #106: the sticky absolute-position hidden-history buffer must
+    /// preserve prior-turn slots across a re-allocation triggered by a long
+    /// follow-up Prefill. End-to-end exercise: snapshot at length 8, run a long
+    /// stage-2 Prefill that forces the buffer to grow past its original cap,
+    /// then TruncateTo(8) + PrefillMtp(suffix, startPos=8). PrefillMtp reads
+    /// h_7 from slot 7 — if the grow zeroed prior slots, the head's MTP
+    /// attention input is garbage and either NaNs or produces a near-flat logit
+    /// distribution. Asserts well-formed, non-degenerate output as the
+    /// load-bearing check.
+    /// </summary>
+    [Fact]
+    public void HybridGdnForwardPass_Qwen35Mtp_HiddenHistorySurvivesGrowAcrossSnapshot()
+    {
+        var path = FindMtpModelPath();
+        if (path is null) return;   // silent skip
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var backend = new CpuBackend();
+        using var fwd = new HybridGdnForwardPass(model, backend, hp);
+        Assert.True(fwd.HasMtpHead);
+
+        // Stage 1: short prefill so the buffer's initial cap is small (= 8),
+        // then PrefillMtp so the MTP attention KV covers positions 0..7 (mirrors
+        // turn 1 of a real chat continuation; MtpForward at position >7 below
+        // reads K/V from those slots).
+        var stage1 = Enumerable.Range(100, 8).ToArray();
+        fwd.Prefill(stage1);
+        fwd.PrefillMtp(stage1);
+        fwd.CaptureSnapshot();
+        Assert.Equal(8, fwd.SnapshotLength);
+
+        // Stage 2: long enough that EnsureMtpHiddenHistoryCap has to grow.
+        // 100 tokens at startPos=8 → required cap ≥ 108, well past the initial
+        // 8-slot allocation.
+        var stage2 = Enumerable.Range(200, 100).ToArray();
+        fwd.Prefill(stage2, startPos: 8);
+
+        // Restore to snapshot length and drive PrefillMtp at startPos=8 — h_7
+        // must still be readable from the preserved slot 7 (the grow-preserve
+        // contract under test); the MTP KV slots 0..7 also survive the truncate
+        // (the legacy turn-1 writes) so attention at position 20 has the full
+        // history.
+        fwd.TruncateTo(8);
+        var suffix = Enumerable.Range(300, 12).ToArray();
+        var prefillLogits = fwd.Prefill(suffix, startPos: 8);
+        fwd.PrefillMtp(suffix, startPos: 8);
+
+        // Drive one MTP forward at position 20 using the just-computed greedy
+        // next token + the last hidden. If grow-preserve broke, PrefillMtp's
+        // read of slot 7 was zeroes and the MTP head's K@8 is poisoned; the
+        // symptom is a NaN or a flat near-zero logit distribution.
+        int t1 = Sampler.Greedy(prefillLogits);
+        var mtpLogits = fwd.MtpForward(t1, position: 20, fwd.LastHidden);
+        Assert.Equal(hp.VocabSize, mtpLogits.Length);
+        float min = float.MaxValue, max = float.MinValue;
+        for (int i = 0; i < mtpLogits.Length; i++)
+        {
+            float v = mtpLogits[i];
+            Assert.True(float.IsFinite(v),
+                $"MTP logit non-finite at vocab idx {i}: {v}. Likely cause: " +
+                "the hidden-history buffer's prior-turn slots were zeroed by " +
+                "EnsureMtpHiddenHistoryCap's grow.");
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+        Assert.True(max - min > 0.1f,
+            $"MTP logit range too tight ({min:F3}..{max:F3}) after snapshot-restore " +
+            "+ PrefillMtp at startPos=8. Likely cause: hidden-history slot 7 " +
+            "was overwritten by EnsureMtpHiddenHistoryCap's grow.");
+    }
 }

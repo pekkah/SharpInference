@@ -198,6 +198,25 @@ since issue #45 — attn/GDN/norms/lm_head amortise across t1/t2 while the
 routed-expert FFN runs sequentially per token (per-token top-K diverges).
 `--spec-draft-n-min` / `--spec-draft-p-min` are not yet wired (issues #37, #38).
 
+### Chat-continuation cache
+
+Multi-turn requests against `/v1/messages` and `/v1/chat/completions` reuse
+the prior turn's state instead of re-prefilling the full history every time.
+On the GDN-hybrid passes (Qwen3.6 family) the engine snapshots its recurrent
+state at the chat-template's history boundary (issue #102) and restores it on
+the next turn after a token-level prefix match. On MTP runs the snapshot path
+also covers the MTP attention KV and a sticky absolute-position hidden-history
+buffer (issue #106), so Carnice/Qwen3.6-MTP agentic loops stop paying the
+~tens-of-seconds-per-tool-round-trip re-prefill cost they did before.
+
+The `/metrics` endpoint exposes `sharpi_prefill_tokens_reused_total` for
+verification — it advances on every turn that hits the snapshot match. On a
+Qwen3.6-27B-MTP CUDA hybrid with the included `scripts/test-snapshot-reuse.ps1`
+(2-turn convo, ~30-token assistant replies) the counter goes 0 → 31 between
+turns 1 and 2; the second turn's wall time is essentially flat despite the
+longer prompt. Pre-#102/#106 the counter stayed at 0 across all chat turns on
+GDN/MTP models.
+
 ### Reasoning models
 
 Models that emit `<think>...</think>` (Qwen3, DeepSeek-R1, SmolLM3, …) are
