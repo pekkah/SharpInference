@@ -1,0 +1,49 @@
+[ExpertAccessProfiler] overall hit rate: 82.4 % (9746 hits / 11832 accesses)
+  layer   0: hit 73.0 %  top experts: [77, 62, 72]
+  layer   1: hit 77.5 %  top experts: [88, 10, 45]
+  layer   2: hit 78.2 %  top experts: [47, 23, 90]
+  layer   3: hit 81.1 %  top experts: [16, 84, 43]
+  layer   4: hit 81.1 %  top experts: [104, 124, 48]
+  layer   5: hit 80.6 %  top experts: [17, 70, 44]
+  layer   6: hit 84.1 %  top experts: [8, 40, 106]
+  layer   7: hit 85.3 %  top experts: [71, 97, 9]
+  layer   8: hit 83.6 %  top experts: [116, 46, 127]
+  layer   9: hit 83.8 %  top experts: [10, 27, 19]
+  layer  10: hit 80.4 %  top experts: [53, 30, 112]
+  layer  11: hit 82.8 %  top experts: [21, 37, 127]
+  layer  12: hit 83.3 %  top experts: [98, 116, 56]
+  layer  13: hit 81.4 %  top experts: [64, 109, 113]
+  layer  14: hit 82.4 %  top experts: [90, 58, 88]
+  layer  15: hit 83.1 %  top experts: [10, 76, 123]
+  layer  16: hit 83.6 %  top experts: [64, 17, 66]
+  layer  17: hit 84.1 %  top experts: [91, 35, 97]
+  layer  18: hit 84.8 %  top experts: [8, 106, 40]
+  layer  19: hit 86.5 %  top experts: [71, 97, 9]
+  layer  20: hit 82.8 %  top experts: [46, 116, 26]
+  layer  21: hit 85.5 %  top experts: [10, 64, 75]
+  layer  22: hit 82.6 %  top experts: [53, 30, 112]
+  layer  23: hit 82.1 %  top experts: [127, 37, 6]
+  layer  24: hit 83.8 %  top experts: [116, 56, 104]
+  layer  25: hit 81.1 %  top experts: [64, 104, 42]
+  layer  26: hit 83.1 %  top experts: [90, 8, 88]
+  layer  27: hit 83.3 %  top experts: [10, 18, 76]
+  layer  28: hit 83.6 %  top experts: [66, 64, 67]
+  layer  29: (no GPU SLRU accesses recorded)
+  layer  30: (no GPU SLRU accesses recorded)
+  layer  31: (no GPU SLRU accesses recorded)
+  layer  32: (no GPU SLRU accesses recorded)
+  layer  33: (no GPU SLRU accesses recorded)
+  layer  34: (no GPU SLRU accesses recorded)
+  layer  35: (no GPU SLRU accesses recorded)
+  layer  36: (no GPU SLRU accesses recorded)
+  layer  37: (no GPU SLRU accesses recorded)
+  layer  38: (no GPU SLRU accesses recorded)
+  layer  39: (no GPU SLRU accesses recorded)
+  layer  40: (no GPU SLRU accesses recorded)
+  layer  41: (no GPU SLRU accesses recorded)
+  layer  42: (no GPU SLRU accesses recorded)
+  layer  43: (no GPU SLRU accesses recorded)
+  layer  44: (no GPU SLRU accesses recorded)
+  layer  45: (no GPU SLRU accesses recorded)
+  layer  46: (no GPU SLRU accesses recorded)
+  layer  47: (no GPU SLRU accesses recorded)
