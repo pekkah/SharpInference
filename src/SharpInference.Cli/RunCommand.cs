@@ -774,7 +774,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         if (useMtp)
         {
             (generated, totalDecoded, acceptanceRate, mtpAccepted, mtpEmitted) =
-                DecodeLoopMtp(mtpFwd!, tokens, logits, tok, sp, s.HideThinking);
+                DecodeLoopMtp(mtpFwd!, tokens, logits, tok, sp, s.HideThinking, s.VerbosePrompt);
         }
         else
         {
@@ -855,7 +855,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     // Requires --no-thinking, so no thinking-mode bookkeeping here.
     private static (int generated, int totalDecoded, float acceptanceRate, long accepted, long emitted) DecodeLoopMtp(
         IForwardPass mtpFwd, IReadOnlyList<int> promptTokens, ReadOnlySpan<float> initialLogits,
-        GgufTokenizer tok, SamplingParams sp, bool hideThinking)
+        GgufTokenizer tok, SamplingParams sp, bool hideThinking, bool verbosePromptLogging = false)
     {
         var mtpDec = new MtpDecoder(mtpFwd);
         mtpDec.Initialize(promptTokens.Count, initialLogits);
@@ -873,6 +873,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         mtpDec.Decode(sp.MaxNewTokens, stopIds.AsSpan(), next =>
         {
+            if (verbosePromptLogging)
+                Console.Error.WriteLine($"[DBG] tok={totalDecoded} next={next}('{tok.Decode([next])}')");
             totalDecoded++;
             if (EmitToken(next, tok, streamDec, ref inThinking, hideThinking)) generated++;
         }, pMin: sp.SpecDraftPMin, ct: CancellationToken.None);
