@@ -113,4 +113,36 @@ public interface IComputeBackend : IDisposable
 
     /// <summary>Wait for all queued operations to complete.</summary>
     void Synchronize();
+
+    // --- Gemma 4 kernel surface (Phase 7) -----------------------------------
+    //
+    // Default-throw stubs so CPU/Vulkan backends compile without supporting
+    // these ops. CudaBackend overrides each with a real NVRTC kernel launch.
+    // Forward-pass wiring lands in Phase 8.
+
+    /// <summary>
+    /// Fused tanh-approximate GELU(gate) * up, in place into <paramref name="gate"/>.
+    /// Gemma-style FFN activation:
+    /// <c>gate[i] = 0.5 * g * (1 + tanh(sqrt(2/π) * (g + 0.044715 * g^3))) * up[i]</c>.
+    /// </summary>
+    void GeluTanhMul(Tensor gate, Tensor up) =>
+        throw new NotSupportedException($"{nameof(GeluTanhMul)} is not supported by this backend.");
+
+    /// <summary>
+    /// In-place final-logit softcap: <c>x[i] = tanh(x[i] / cap) * cap</c>.
+    /// Used by Gemma 4 to clip extreme logits before sampling.
+    /// </summary>
+    void SoftcapInPlace(Tensor x, float cap) =>
+        throw new NotSupportedException($"{nameof(SoftcapInPlace)} is not supported by this backend.");
+
+    /// <summary>
+    /// Sliding-window attention. Iterates K/V positions over
+    /// <c>[max(0, position+1-windowSize), position+1)</c> with per-layer
+    /// <paramref name="headDim"/>. Used by Gemma 4 SWA layers.
+    /// </summary>
+    void AttentionSwa(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+                      Tensor? scoresScratch,
+                      int position, int windowSize, int headDim,
+                      int numHeads, int numKvHeads, int maxSeqLen) =>
+        throw new NotSupportedException($"{nameof(AttentionSwa)} is not supported by this backend.");
 }

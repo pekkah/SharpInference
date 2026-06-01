@@ -137,6 +137,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _matvecQ5KN2Kernel;
     private nint   _matvecQ6KN2Kernel;
     private nint   _attentionKernel;
+    // Gemma 4 (Phase 7): sliding-window attention, tanh-GELU FFN, final-logit
+    // softcap. Kernel work only — forward-pass wiring lands in Phase 8.
+    private nint   _attentionSwaKernel;
+    private nint   _geluTanhMulKernel;
+    private nint   _softcapKernel;
     private nint   _clearF32Kernel;
     private nint   _quantizeQ81Kernel;
     private nint   _bwBaselineKernel;
@@ -1568,6 +1573,45 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(silu_mul) failed: {r}");
     }
 
+    /// <summary>Fused tanh-approximate GELU(gate) * up in-place into gate.
+    /// Gemma-style FFN activation. Element-count of <paramref name="gate"/>
+    /// must equal element-count of <paramref name="up"/>.</summary>
+    public void GeluTanhMul(Tensor gate, Tensor up)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        int n = (int)gate.ElementCount;
+        nint gPtr = GetDevPtr(gate);
+        nint uPtr = GetDevPtr(up);
+        int  pN = n;
+        nint* args = stackalloc nint[3] { (nint)(&gPtr), (nint)(&uPtr), (nint)(&pN) };
+        uint grid = (uint)((n + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_geluTanhMulKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gelu_tanh_mul) failed: {r}");
+    }
+
+    /// <summary>
+    /// In-place final-logit softcap: <c>x[i] = tanh(x[i] / cap) * cap</c>.
+    /// Used by Gemma 4 to clip extreme logits before sampling.
+    /// </summary>
+    public void SoftcapInPlace(Tensor x, float cap)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        int n = (int)x.ElementCount;
+        nint xPtr = GetDevPtr(x);
+        int  pN = n;
+        float pCap = cap;
+        nint* args = stackalloc nint[3] { (nint)(&xPtr), (nint)(&pN), (nint)(&pCap) };
+        uint grid = (uint)((n + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_softcapKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(softcap_inplace) failed: {r}");
+    }
+
     public void SiLU(Tensor x) =>
         throw new NotSupportedException("Use SiLuMul(gate, up) for fused SwiGLU on CUDA.");
 
@@ -1745,6 +1789,49 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         };
         int r = NvrtcInterop.LaunchKernel(_attentionKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention) failed: {r}");
+    }
+
+    /// <summary>
+    /// Sliding-window attention (Gemma 4 SWA layers). Iterates positions over
+    /// <c>[max(0, position+1-windowSize), position+1)</c> instead of the full
+    /// prefix. Per-layer <paramref name="headDim"/> is passed explicitly so a
+    /// model with varying head_dim across layers (Gemma 4: 256 SWA / 512 global)
+    /// dispatches correctly.
+    ///
+    /// When the effective windowed range ≤ 4096 the kernel keeps per-position
+    /// scores in shared memory and <paramref name="scoresScratch"/> is ignored.
+    /// Above that threshold the kernel spills to <paramref name="scoresScratch"/>
+    /// which must have room for <c>numHeads × maxSeqLen</c> floats.
+    /// </summary>
+    public void AttentionSwa(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+                             Tensor? scoresScratch,
+                             int position, int windowSize, int headDim,
+                             int numHeads, int numKvHeads, int maxSeqLen)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        int windowEnd   = position + 1;
+        int windowStart = windowEnd - windowSize;
+        if (windowStart < 0) windowStart = 0;
+
+        nint qP = GetDevPtr(q);
+        nint kP = GetDevPtr(kCache);
+        nint vP = GetDevPtr(vCache);
+        nint oP = GetDevPtr(output);
+        nint ssP = scoresScratch is { } sv ? GetDevPtr(sv) : nint.Zero;
+        int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim;
+        int  pWS = windowStart, pWE = windowEnd, pMSL = maxSeqLen;
+        nint* args = stackalloc nint[11]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
+            (nint)(&ssP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pWS), (nint)(&pWE), (nint)(&pMSL)
+        };
+        int r = NvrtcInterop.LaunchKernel(_attentionSwaKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_swa) failed: {r}");
     }
 
     /// <summary>
@@ -2617,7 +2704,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _matvecF32Kernel, _matvecQ4KKernel, _matvecQ5KKernel, _matvecQ6KKernel,
             _matvecQ80Kernel,
             _matvecF32N2Kernel, _matvecQ4KN2Kernel, _matvecQ5KN2Kernel, _matvecQ6KN2Kernel,
-            _attentionKernel, _attentionBf16Kernel, _clearF32Kernel, _quantizeQ81Kernel,
+            _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel,
+            _geluTanhMulKernel, _softcapKernel,
+            _clearF32Kernel, _quantizeQ81Kernel,
             _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
             _siluInplaceKernel, _gdnConv1dDecodeKernel, _gdnL2NormPerHeadKernel,
             _gdnTileHeadsKernel, _gdnRecurrenceDecodeKernel,
@@ -2676,6 +2765,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _matvecQ6KN2Kernel     = GetKernelFunc("llm_matvec_q6k_n2");
         _attentionKernel       = GetKernelFunc("llm_attention");
         _attentionBf16Kernel   = GetKernelFunc("llm_attention_bf16");
+        _attentionSwaKernel    = GetKernelFunc("llm_attention_swa");
+        _geluTanhMulKernel     = GetKernelFunc("llm_gelu_tanh_mul");
+        _softcapKernel         = GetKernelFunc("llm_softcap_inplace");
         _clearF32Kernel        = GetKernelFunc("llm_clear_f32");
         _quantizeQ81Kernel     = GetKernelFunc("llm_quantize_q8_1");
         _bwBaselineKernel      = GetKernelFunc("llm_bw_baseline");

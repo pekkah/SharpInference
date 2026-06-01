@@ -197,6 +197,32 @@ extern ""C"" __global__ void llm_silu_mul(
     gate[i] = g / (1.0f + __expf(-g)) * up[i];
 }
 
+// ── Fused tanh-approximate GELU(gate) * up ─────────────────────────────────
+// Gemma 4 FFN activation. Matches the CPU reference SimdKernels.GeluTanhMul:
+//   inner = sqrt(2/π) * (g + 0.044715 * g^3)
+//   out   = 0.5 * g * (1 + tanh(inner)) * up
+// In-place into `gate` so the call-site signature mirrors llm_silu_mul.
+extern ""C"" __global__ void llm_gelu_tanh_mul(
+    float* __restrict__ gate, const float* __restrict__ up, int n)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) return;
+    float g = gate[i];
+    float inner = 0.7978845608f * (g + 0.044715f * g * g * g);
+    gate[i] = 0.5f * g * (1.0f + tanhf(inner)) * up[i];
+}
+
+// ── Final-logit softcap (in place) ─────────────────────────────────────────
+// x[i] = tanh(x[i] / cap) * cap. Matches SimdKernels.SoftcapInPlace.
+// Used by Gemma 4 for the final logit clipping (cap=30).
+extern ""C"" __global__ void llm_softcap_inplace(
+    float* __restrict__ x, int n, float cap)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) return;
+    x[i] = tanhf(x[i] / cap) * cap;
+}
+
 // ── Element-wise sigmoid in-place ──────────────────────────────────────────
 extern ""C"" __global__ void llm_sigmoid_inplace(float* __restrict__ x, int n)
 {
@@ -1926,6 +1952,115 @@ extern ""C"" __global__ void llm_attention(
         for (int t = 0; t < seq_len; t++) {
             float weight = use_shared ? shared_scores[t] : head_scratch[t];
             long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            acc += weight * v_cache[v_off + d];
+        }
+        out[out_off + d] = acc;
+    }
+}
+
+// ── Scaled dot-product attention with GQA + sliding window ────────────────
+// Bit-for-bit clone of `llm_attention` except positions iterated are
+// [window_start, window_end) instead of [0, seq_len). Used by Gemma 4 SWA
+// layers (window=512 over a possibly much longer context). All three phases
+// (Q·K, softmax, V-weighted sum) operate over `eff_seq = window_end -
+// window_start` positions; the shared-scores fast path still applies when
+// eff_seq ≤ MAX_STORED_SCORES, indexing scores by `t - window_start`.
+extern ""C"" __global__ void llm_attention_swa(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ out,
+    float* __restrict__ scores_scratch,    // [num_heads * max_seq_len], null when eff_seq ≤ MAX_STORED_SCORES
+    int num_heads, int num_kv_heads, int head_dim,
+    int window_start, int window_end, int max_seq_len)
+{
+    const int MAX_STORED_SCORES = 4096;
+    __shared__ float shared_scores[MAX_STORED_SCORES];
+    __shared__ float sdata[256];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int h = blockIdx.x;
+    if ((int)h >= num_heads) return;
+
+    int kv_head = (int)h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = rsqrtf((float)head_dim);
+    long q_off  = (long)h * (long)head_dim;
+    long out_off = q_off;
+
+    int eff_seq = window_end - window_start;
+    if (eff_seq <= 0) return;
+    bool use_shared = (eff_seq <= MAX_STORED_SCORES);
+    float* head_scratch = scores_scratch + (long)h * (long)max_seq_len;
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Phase 1: per-position scores over [window_start, window_end)
+    // ────────────────────────────────────────────────────────────────────
+    for (int t = (int)tid; t < eff_seq; t += 256) {
+        int abs_t = t + window_start;
+        float dot = 0.f;
+        long k_off = (long)abs_t * (long)kv_dim + (long)kv_head * (long)head_dim;
+        for (int d = 0; d < head_dim; d++)
+            dot += q[q_off + d] * k_cache[k_off + d];
+        float score = dot * scale;
+        if (use_shared) shared_scores[t] = score;
+        else            head_scratch[t]  = score;
+    }
+    if (use_shared) {
+        for (int t = eff_seq + (int)tid; t < MAX_STORED_SCORES; t += 256)
+            shared_scores[t] = sharpi_neg_inf();
+    }
+    __syncthreads();
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Phase 2: softmax over [0, eff_seq)
+    // ────────────────────────────────────────────────────────────────────
+    float local_max = sharpi_neg_inf();
+    for (int t = (int)tid; t < eff_seq; t += 256) {
+        float s = use_shared ? shared_scores[t] : head_scratch[t];
+        local_max = fmaxf(local_max, s);
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
+
+    float local_sum = 0.f;
+    for (int t = (int)tid; t < eff_seq; t += 256) {
+        float s = use_shared ? shared_scores[t] : head_scratch[t];
+        float e = __expf(s - max_val);
+        if (use_shared) shared_scores[t] = e;
+        else            head_scratch[t]  = e;
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+    __syncthreads();
+
+    for (int t = (int)tid; t < eff_seq; t += 256) {
+        if (use_shared) shared_scores[t] *= inv_sum;
+        else            head_scratch[t]  *= inv_sum;
+    }
+    __syncthreads();
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Phase 3: weighted V sum over windowed positions
+    // ────────────────────────────────────────────────────────────────────
+    for (int d = (int)tid; d < head_dim; d += 256) {
+        float acc = 0.f;
+        for (int t = 0; t < eff_seq; t++) {
+            int abs_t = t + window_start;
+            float weight = use_shared ? shared_scores[t] : head_scratch[t];
+            long v_off = (long)abs_t * (long)kv_dim + (long)kv_head * (long)head_dim;
             acc += weight * v_cache[v_off + d];
         }
         out[out_off + d] = acc;
