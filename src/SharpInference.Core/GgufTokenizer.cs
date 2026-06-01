@@ -19,6 +19,9 @@ public sealed class GgufTokenizer : ITokenizer
     // without the inner tokenizer's lossy U+FFFD substitution on partial sequences.
     private readonly string[] _idToToken;
     private readonly bool _needsByteEncoding;
+    // SentencePiece-style BPE (Gemma/Llama): the vocab encodes spaces as U+2581 (▁).
+    // Pre-encode by replacing ' ' with ▁ on input and ▁ back to ' ' on output.
+    private readonly bool _isSpmBpe;
 
     public int VocabSize { get; }
     public int BosTokenId { get; }
@@ -51,7 +54,8 @@ public sealed class GgufTokenizer : ITokenizer
         int unknownTokenId,
         int padTokenId,
         bool addBosToken,
-        bool needsByteEncoding)
+        bool needsByteEncoding,
+        bool isSpmBpe)
     {
         _inner = inner;
         _specialTokens = specialTokens;
@@ -59,6 +63,7 @@ public sealed class GgufTokenizer : ITokenizer
         _vocab = vocab;
         _idToToken = idToToken;
         _needsByteEncoding = needsByteEncoding;
+        _isSpmBpe = isSpmBpe;
         VocabSize = vocabSize;
         BosTokenId = bosTokenId;
         EosTokenId = eosTokenId;
@@ -149,30 +154,76 @@ public sealed class GgufTokenizer : ITokenizer
         IReadOnlyDictionary<string, int>? specialTokensDict =
             specialTokens.Count > 0 ? specialTokens : null;
 
+        // SPM-family tokenizers (Gemma, Llama SentencePiece) encode spaces as U+2581 (▁)
+        // and may have merges containing literal newlines/whitespace. The stream-based
+        // BpeTokenizer.Create reads merges via StreamReader, so embedded newlines split
+        // a merge across multiple lines and the parser throws ("Invalid merger file
+        // format"). Use the in-memory BpeOptions API for these models — no file parsing.
+        var tokenizerModel = model.Metadata.TryGetValue("tokenizer.ggml.model", out var tmObj)
+            ? (string)tmObj
+            : "";
+        bool isSpmModel = tokenizerModel is "gemma" or "gemma2" or "gemma3" or "gemma4" or "llama";
+
+        Tokenizer? inner = null;
+        bool needsByteEncoding = false;
+        bool isSpmBpe = false;
+
         // Try CodeGenTokenizer first (better decode quality for GPT-2 style models).
         // CodeGenTokenizer handles GPT-2 byte-level BPE encoding internally.
-        // Fall back to BpeTokenizer if CodeGenTokenizer fails (e.g., Llama 3.1 where
-        // the default unknown token <|endoftext|> is not in the BPE vocab).
-        // BpeTokenizer requires us to pre-encode text to GPT-2 byte-level Unicode.
-        Tokenizer inner;
-        bool needsByteEncoding = false;
-        try
+        // Skip for SPM models — their merges contain whitespace that breaks the parser.
+        if (!isSpmModel)
         {
-            using var vs1 = new MemoryStream(vocabBytes);
-            using var ms1 = new MemoryStream(mergesBytes);
-            inner = CodeGenTokenizer.Create(vs1, ms1,
-                addPrefixSpace: false,
-                addBeginOfSentence: false,
-                addEndOfSentence: false);
+            try
+            {
+                using var vs1 = new MemoryStream(vocabBytes);
+                using var ms1 = new MemoryStream(mergesBytes);
+                inner = CodeGenTokenizer.Create(vs1, ms1,
+                    addPrefixSpace: false,
+                    addBeginOfSentence: false,
+                    addEndOfSentence: false);
+            }
+            catch
+            {
+                inner = null;
+            }
+
+            if (inner is null)
+            {
+                try
+                {
+                    using var vs2 = new MemoryStream(vocabBytes);
+                    using var ms2 = new MemoryStream(mergesBytes);
+                    inner = BpeTokenizer.Create(vs2, ms2,
+                        specialTokens: specialTokensDict,
+                        unknownToken: unknownToken);
+                    needsByteEncoding = true;
+                }
+                catch
+                {
+                    inner = null;
+                }
+            }
         }
-        catch
+
+        if (inner is null)
         {
-            using var vs2 = new MemoryStream(vocabBytes);
-            using var ms2 = new MemoryStream(mergesBytes);
-            inner = BpeTokenizer.Create(vs2, ms2,
-                specialTokens: specialTokensDict,
-                unknownToken: unknownToken);
-            needsByteEncoding = true;
+            var vocabDict = new Dictionary<string, int>(tokensArray.Length, StringComparer.Ordinal);
+            for (int i = 0; i < tokensArray.Length; i++)
+                vocabDict.TryAdd((string)tokensArray[i], i);
+
+            var mergesList = new List<string>(mergesArray.Length);
+            for (int i = 0; i < mergesArray.Length; i++)
+                mergesList.Add((string)mergesArray[i]);
+
+            var bpeOptions = new BpeOptions(vocabDict)
+            {
+                Merges = mergesList,
+                SpecialTokens = specialTokensDict,
+                UnknownToken = unknownToken,
+            };
+            inner = BpeTokenizer.Create(bpeOptions);
+            needsByteEncoding = false;
+            isSpmBpe = isSpmModel;
         }
 
         var idToToken = new string[tokensArray.Length];
@@ -191,7 +242,8 @@ public sealed class GgufTokenizer : ITokenizer
             unknownTokenId,
             padTokenId,
             addBosToken,
-            needsByteEncoding);
+            needsByteEncoding,
+            isSpmBpe);
 
         if (model.Metadata.TryGetValue("tokenizer.chat_template", out var tmpl) && tmpl is string tmplStr)
         {
@@ -262,6 +314,8 @@ public sealed class GgufTokenizer : ITokenizer
         // CodeGenTokenizer handles this automatically.
         if (_needsByteEncoding)
             text = EncodeToGpt2Bytes(text);
+        else if (_isSpmBpe)
+            text = text.Replace(' ', '▁');
 
         var ids = _inner.EncodeToIds(text);
 
@@ -270,7 +324,7 @@ public sealed class GgufTokenizer : ITokenizer
         var result = new List<int>(text.Length);
         foreach (char c in text)
         {
-            // Text is already in GPT-2 encoding if _needsByteEncoding was true
+            // Text is already in GPT-2 / SPM encoding if a transform was applied above.
             char bpe = _needsByteEncoding ? c : EncodeByteToGpt2(c);
             if (_vocab.TryGetValue(bpe.ToString(), out int id))
                 result.Add(id);
@@ -314,6 +368,9 @@ public sealed class GgufTokenizer : ITokenizer
 
         var text = _inner.Decode(tokens) ?? string.Empty;
 
+        if (_isSpmBpe)
+            return text.Replace('▁', ' ');
+
         // BpeTokenizer may output GPT-2 byte-level BPE artifacts:
         // Ġ (U+0120) = space, Ċ (U+010A) = newline, etc.
         // Convert them back to actual bytes if present.
@@ -335,6 +392,9 @@ public sealed class GgufTokenizer : ITokenizer
         // loses the exact bytes a single token contributes to the stream.
         if ((uint)token >= (uint)_idToToken.Length)
             return [];
+
+        if (_isSpmBpe)
+            return Encoding.UTF8.GetBytes(_idToToken[token].Replace('▁', ' '));
 
         return Gpt2CharsToBytes(_idToToken[token]);
     }
