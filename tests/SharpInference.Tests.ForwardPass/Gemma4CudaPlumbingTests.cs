@@ -190,8 +190,13 @@ public sealed class Gemma4CudaPlumbingTests
     }
 
     [Fact]
-    public void Gemma4_CudaForwardPass_ForwardThrowsNotImplemented()
+    public void Gemma4_CudaForwardPass_ForwardReturnsFiniteLogits()
     {
+        // Phase 8 successor of the now-removed NotImplementedException guard.
+        // Single forward must produce VocabSize finite logits — the load-bearing
+        // smoke check that Forward no longer throws and the pipeline runs to
+        // completion. Deeper coherence + CPU↔CUDA parity live in
+        // Gemma4CudaForwardPassTests.
         using var gpu = TryCreate();
         if (gpu is null) return;
         var path = FindModelPath();
@@ -204,11 +209,10 @@ public sealed class Gemma4CudaPlumbingTests
 
         using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 512);
 
-        // Forward integration is Phase 8; the temporary guard at the top of
-        // Forward must throw rather than silently produce garbage. When Phase 8
-        // lands and removes the guard, delete this test (or repurpose it to
-        // assert a successful single-token forward).
-        var ex = Assert.Throws<NotImplementedException>(() => fwd.Forward(1, 0));
-        Assert.Contains("Phase 8", ex.Message);
+        var logits = fwd.Forward(1, 0);
+        Assert.Equal(hp.VocabSize, logits.Length);
+        for (int i = 0; i < logits.Length; i++)
+            Assert.True(float.IsFinite(logits[i]),
+                $"Non-finite logit at vocab idx {i}: {logits[i]}");
     }
 }
