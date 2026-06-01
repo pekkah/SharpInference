@@ -103,6 +103,34 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private readonly Tensor[] _gpuKCache;
     private readonly Tensor[] _gpuVCache;
 
+    // Layers whose K/V buffers ALIAS another layer's pages (Gemma 4 shared_kv_layers
+    // tail). Dispose must skip Free() for any handle that is shared with another
+    // layer to avoid a double free / use-after-free. Empty for non-gemma4 models.
+    private readonly HashSet<int> _kvAliasedLayers = new();
+
+    // ── Gemma 4 plumbing (inert until Phase 8 removes the Forward guard) ──
+    // PLE table stays mmap-resident — never uploaded to GPU. ~4.2 GB at Q8_0.
+    // Per-layer model projection (per_layer_model_proj.weight) is BF16 on disk;
+    // dequantised once to a single CPU float[] at construction (~26 MB) for the
+    // Phase 8 per-token gather. The small per-layer norms (inp_gate / proj /
+    // post_norm) stay mmap-resident here too — Phase 8 decides whether to upload
+    // them pinned per token or keep the compute CPU-side.
+    private readonly CudaTensorRef? _cpuPleTokenEmbed;
+    private readonly float[]? _cpuPerLayerModelProj;
+    private readonly CudaTensorRef? _cpuPerLayerProjNorm;
+    private readonly CudaTensorRef[]? _cpuInpGate;
+    private readonly CudaTensorRef[]? _cpuPleProj;
+    private readonly CudaTensorRef[]? _cpuPlePostNorm;
+
+    // Per-layer post-attention / post-FFN RmsNorm weights (Gemma 4). Each is a
+    // [embDim] f32 vector — small enough to live on GPU normally.
+    private readonly Tensor[]? _wPostAttnNorm;
+    private readonly Tensor[]? _wPostFfwNorm;
+
+    // Per-layer scalar (layer_output_scale.weight); stays on CPU, passed as a
+    // kernel arg in Phase 8.
+    private readonly float[]? _layerOutputScale;
+
     // CPU prefix cache kept only to satisfy IForwardPass.TruncateTo + InferenceEngine
     // prefix-reuse bookkeeping. CUDA cache state advances in lockstep via _kvLength.
     private readonly KvCache _kvCache;
@@ -269,6 +297,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         _gpuVCache = new Tensor[hp.NumLayers];
         if (_tqEnabled)
         {
+            if (hp.LayerHeadDim is not null)
+                throw new NotSupportedException(
+                    "CUDA TurboQuant is not supported for per-layer head_dim architectures " +
+                    "(e.g. Gemma 4). Disable --tq.");
+
             // FP32 window holds only the recent `tqFp32Window` positions per layer.
             for (int i = 0; i < hp.NumLayers; i++)
             {
@@ -305,10 +338,36 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         }
         else
         {
+            // Per-layer KV-cache sizing for gemma4 (LayerHeadDim != null): each layer's
+            // K/V buffer takes its own head_dim, and SWA layers cap context at
+            // SlidingWindowSize. KV-share layers (KvSourceLayer[L] >= 0) alias the
+            // source layer's handle — _kvAliasedLayers tracks them so Dispose skips
+            // the double-free.
+            //
+            // Non-gemma4 path is unchanged: every layer is full-context with the
+            // model-wide head_dim.
+            bool perLayerKv = hp.LayerHeadDim is not null;
+            int swaWindow = hp.SlidingWindowSize > 0 ? hp.SlidingWindowSize : _maxSeqLen;
             for (int i = 0; i < hp.NumLayers; i++)
             {
-                _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
-                _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
+                int kvSrc = hp.KvSourceLayer is { } ksl ? ksl[i] : -1;
+                if (kvSrc >= 0)
+                {
+                    // Alias the source layer's K/V handles. Source must already be
+                    // initialised — the GGUF puts shared_kv_layers at the tail.
+                    _gpuKCache[i] = _gpuKCache[kvSrc];
+                    _gpuVCache[i] = _gpuVCache[kvSrc];
+                    _kvAliasedLayers.Add(i);
+                    continue;
+                }
+
+                int layerHd = perLayerKv ? hp.LayerHeadDim![i] : _headDim;
+                int layerKvDim = _numKvHeads * layerHd;
+                int layerCtx = (perLayerKv && hp.IsSwaLayer is { } swa && swa[i])
+                    ? Math.Min(_maxSeqLen, swaWindow)
+                    : _maxSeqLen;
+                _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)layerCtx * layerKvDim));
+                _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)layerCtx * layerKvDim));
             }
         }
 
@@ -351,16 +410,36 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             _wqNorm = new Tensor[L]; _wkNorm = new Tensor[L];
         }
 
+        // Gemma 4: per-layer post-norms + per-layer output-scale scalars + PLE refs.
+        if (hp.HasPostAttnNorm) _wPostAttnNorm = new Tensor[L];
+        if (hp.HasPostFfwNorm)  _wPostFfwNorm  = new Tensor[L];
+        if (hp.HasLayerOutputScale) _layerOutputScale = new float[L];
+
         TraceVram("before per-layer weight upload");
         Console.Error.Write($"[CudaForwardPass] Uploading {L} layers to VRAM...");
         for (int i = 0; i < L; i++)
         {
+            bool kvShared = hp.KvSourceLayer is { } ksl && ksl[i] >= 0;
+
             _wAttnNorm[i] = UploadWeight($"blk.{i}.attn_norm.weight");
             _wq[i] = UploadWeight($"blk.{i}.attn_q.weight");
-            _wk[i] = UploadWeight($"blk.{i}.attn_k.weight");
-            _wv[i] = UploadWeight($"blk.{i}.attn_v.weight");
+            // KV-share layers (Gemma 4 tail) don't carry their own attn_k/attn_v
+            // weights — they reuse the source layer's projections and aliased K/V
+            // pages. Skip the lookup so missing-tensor errors don't fire.
+            if (!kvShared)
+            {
+                _wk[i] = UploadWeight($"blk.{i}.attn_k.weight");
+                _wv[i] = UploadWeight($"blk.{i}.attn_v.weight");
+            }
             _wo[i] = UploadWeight($"blk.{i}.attn_output.weight");
             _wFfnNorm[i] = UploadWeight($"blk.{i}.ffn_norm.weight");
+
+            if (_wPostAttnNorm is not null)
+                _wPostAttnNorm[i] = UploadWeight($"blk.{i}.post_attention_norm.weight");
+            if (_wPostFfwNorm is not null)
+                _wPostFfwNorm[i]  = UploadWeight($"blk.{i}.post_ffw_norm.weight");
+            if (_layerOutputScale is not null)
+                _layerOutputScale[i] = LoadScalarF32($"blk.{i}.layer_output_scale.weight");
             if (_isMoE)
             {
                 _wGateInp![i]  = UploadWeight($"blk.{i}.ffn_gate_inp.weight");
@@ -384,15 +463,19 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             if (_hasAttnBias)
             {
                 _bq![i] = UploadWeight($"blk.{i}.attn_q.bias");
-                _bk![i] = UploadWeight($"blk.{i}.attn_k.bias");
-                _bv![i] = UploadWeight($"blk.{i}.attn_v.bias");
+                if (!kvShared)
+                {
+                    _bk![i] = UploadWeight($"blk.{i}.attn_k.bias");
+                    _bv![i] = UploadWeight($"blk.{i}.attn_v.bias");
+                }
                 _bo![i] = UploadWeight($"blk.{i}.attn_output.bias");
             }
 
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
                 _wqNorm![i] = UploadWeight($"blk.{i}.attn_q_norm.weight");
-                _wkNorm![i] = UploadWeight($"blk.{i}.attn_k_norm.weight");
+                if (!kvShared)
+                    _wkNorm![i] = UploadWeight($"blk.{i}.attn_k_norm.weight");
             }
 
             Console.Error.Write(".");
@@ -402,12 +485,17 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // a Q4_K embedding can be 700+ MiB raw and would otherwise round to 1 GiB.
         Console.Error.Write(" emb...");
         var embInfo = model.FindTensor("token_embd.weight")!.Value;
-        if (embInfo.DType == DType.Q4_K)
+        // Raw-upload branch: Q4_K and Q8_0 both have dedicated `EmbedLookup*`
+        // kernels on the GPU side, so keep the packed representation in VRAM and
+        // gather a single token's row at decode time. Q8_0 is the Gemma 4 case:
+        // 2560 × 262144 dequanted to F32 would burn ~2.7 GB of VRAM on top of the
+        // raw 700 MB table.
+        if (embInfo.DType == DType.Q4_K || embInfo.DType == DType.Q8_0)
         {
             var embData = model.GetTensorData(embInfo);
-            _gpuEmbedding = _gpu.UploadRaw(embData, TensorShape.D1(embData.Length), DType.Q4_K, exact: true);
+            _gpuEmbedding = _gpu.UploadRaw(embData, TensorShape.D1(embData.Length), embInfo.DType, exact: true);
             _embIsQuantized = true;
-            _weightDTypes[_gpuEmbedding.Handle] = DType.Q4_K;
+            _weightDTypes[_gpuEmbedding.Handle] = embInfo.DType;
         }
         else
         {
@@ -423,6 +511,46 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         _wOutput = model.FindTensor("output.weight") is not null
             ? UploadWeight("output.weight")
             : _gpuEmbedding;
+
+        // ── Gemma 4 PLE plumbing (inert until Phase 8) ────────────────────────
+        // Per-layer-embedding table (~4.2 GB at Q8_0) MUST stay CPU-resident; the
+        // matching TierPlanner branch excludes it from the GPU weight budget.
+        // Phase 8 will gather rows per token into a pinned upload + on-GPU matmul.
+        // per_layer_model_proj is BF16 on disk; preload once as F32 (~26 MB) so the
+        // hot path doesn't pay BF16→F32 conversion. The small per-layer F32 tensors
+        // (inp_gate / proj / post_norm) stay mmap-resident; Phase 8 chooses the
+        // upload strategy.
+        if (hp.HasPerLayerTokenEmbd)
+        {
+            if (model.FindTensor("per_layer_token_embd.weight") is null
+                || model.FindTensor("per_layer_model_proj.weight") is null
+                || model.FindTensor("per_layer_proj_norm.weight") is null)
+            {
+                throw new InvalidOperationException(
+                    "ModelHyperparams.HasPerLayerTokenEmbd is true but one or more PLE tensors " +
+                    "(per_layer_token_embd / per_layer_model_proj / per_layer_proj_norm) are missing.");
+            }
+
+            _cpuPleTokenEmbed = ResolveCpuTensor("per_layer_token_embd.weight");
+
+            var projInfo = model.FindTensor("per_layer_model_proj.weight")!.Value;
+            var projData = model.GetTensorData(projInfo);
+            int projCount = (int)projInfo.ElementCount;
+            _cpuPerLayerModelProj = new float[projCount];
+            Dequantize.ToFloat32(projData, _cpuPerLayerModelProj.AsSpan(), projInfo.DType, projCount);
+
+            _cpuPerLayerProjNorm = ResolveCpuTensor("per_layer_proj_norm.weight");
+
+            _cpuInpGate     = new CudaTensorRef[L];
+            _cpuPleProj     = new CudaTensorRef[L];
+            _cpuPlePostNorm = new CudaTensorRef[L];
+            for (int i = 0; i < L; i++)
+            {
+                _cpuInpGate[i]     = ResolveCpuTensor($"blk.{i}.inp_gate.weight");
+                _cpuPleProj[i]     = ResolveCpuTensor($"blk.{i}.proj.weight");
+                _cpuPlePostNorm[i] = ResolveCpuTensor($"blk.{i}.post_norm.weight");
+            }
+        }
 
         Console.Error.WriteLine(" done.");
         TraceVram("after all weight uploads");
@@ -522,11 +650,27 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// <inheritdoc/>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
+        // Phase 6 plumbing landed (per-layer KV cache, PLE refs, post-norms, alias
+        // tracking, planner exclusion) but Forward integration is Phase 8. Throw
+        // loudly rather than silently producing garbage for Gemma 4 inputs.
+        if (_hp.LayerHeadDim is not null)
+            throw new NotImplementedException(
+                "Gemma 4 CUDA forward integration is Phase 8 (per-layer SWA/global attention, " +
+                "dual-RoPE, KV-share dispatch, PLE gather, GeluTanhMul, layer_output_scale, " +
+                "final logit softcap). Construction succeeds; decode is not yet wired.");
+
         if (s_profile) return ForwardProfiled(token, position);
 
-        // Embed token
+        // Embed token. Dispatch on stored dtype so Q8_0 (Gemma 4 / Phase 0) uses
+        // its dedicated kernel; Q4_K keeps the legacy fast path; F32 the generic one.
         if (_embIsQuantized)
-            _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim);
+        {
+            var embDType = _weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K);
+            if (embDType == DType.Q8_0)
+                _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim);
+            else
+                _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim);
+        }
         else
             _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
 
@@ -701,8 +845,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         var sw = System.Diagnostics.Stopwatch.StartNew();
         long t0 = sw.ElapsedTicks;
 
-        if (_embIsQuantized) _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim);
-        else                 _gpu.EmbedLookup   (_gpuEmbedding, _hidden, token, _embDim);
+        if (_embIsQuantized)
+        {
+            var embDType = _weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K);
+            if (embDType == DType.Q8_0)
+                _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim);
+            else
+                _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim);
+        }
+        else _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
         _gpu.Synchronize();
         AccPhase(PH_EMBED, sw, ref t0);
 
@@ -1197,6 +1348,53 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         return result;
     }
 
+    /// <summary>
+    /// Load a single F32 scalar tensor (any source dtype) into a managed float.
+    /// Used for Gemma 4's per-layer <c>layer_output_scale.weight</c>.
+    /// </summary>
+    private float LoadScalarF32(string name)
+    {
+        var info = _model.FindTensor(name)
+            ?? throw new InvalidOperationException($"Missing tensor: {name}");
+        var data = _model.GetTensorData(info);
+        Span<float> buf = stackalloc float[1];
+        if (info.DType == DType.Float32)
+            MemoryMarshal.Cast<byte, float>(data).Slice(0, 1).CopyTo(buf);
+        else
+            Dequantize.ToFloat32(data, buf, info.DType, 1);
+        return buf[0];
+    }
+
+    /// <summary>
+    /// Resolve a tensor name to a mmap-resident CPU reference (no upload, no copy).
+    /// Used for Gemma 4 PLE tensors that must NEVER hit VRAM.
+    /// </summary>
+    private CudaTensorRef ResolveCpuTensor(string name)
+    {
+        var info = _model.FindTensor(name)
+            ?? throw new InvalidOperationException($"Missing tensor: {name}");
+        return new CudaTensorRef(name, info, info.DType, _model.GetTensorDataPtr(info));
+    }
+
+    /// <summary>
+    /// CPU-resident tensor handle backed by the GGUF mmap. Mirrors the private
+    /// <c>TensorRef</c> struct in <see cref="ForwardPass"/>; kept here so the CUDA
+    /// path can hold a reference to PLE / per-layer-norm tensors that stay on the
+    /// host without dragging in the larger ForwardPass machinery.
+    /// </summary>
+    private readonly unsafe struct CudaTensorRef
+    {
+        public readonly string Name;
+        public readonly GgufTensorInfo Info;
+        public readonly DType DType;
+        public readonly byte* DataPtr;
+
+        public CudaTensorRef(string name, GgufTensorInfo info, DType dtype, byte* dataPtr)
+        {
+            Name = name; Info = info; DType = dtype; DataPtr = dataPtr;
+        }
+    }
+
     private Tensor UploadTqSignPatterns(int layerIndex)
     {
         var fullSigns = new float[_numKvHeads * _headDim];
@@ -1225,6 +1423,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         foreach (var t in model.Tensors)
             weightBytes += EstimateGpuTensorBytes(t);
 
+        // Gemma 4: the per-layer-embedding table (~4.2 GB at Q8_0) is loaded
+        // mmap-only and never reaches VRAM. Subtract it out of the weight budget
+        // before computing free VRAM — otherwise we'd reserve >8 GB of phantom
+        // space and clamp the context window to a uselessly small number.
+        if (hp.HasPerLayerTokenEmbd
+            && model.FindTensor("per_layer_token_embd.weight") is { } pleInfo)
+        {
+            weightBytes -= EstimateGpuTensorBytes(pleInfo);
+        }
+
         int headDim = hp.HeadDim;
         long scratchBytes = (long)(hp.EmbeddingDim * 3 + hp.NumHeads * headDim
             + hp.NumKvHeads * headDim * 2 + hp.NumHeads * headDim
@@ -1241,6 +1449,49 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         long reserved = Math.Max(vramBytes / 3, 2L * 1024 * 1024 * 1024);
         long available = vramBytes - weightBytes - scratchBytes - reserved;
         if (available <= 0) available = 64L * 1024 * 1024;
+
+        // Gemma 4 per-layer head-dim path: each layer's K/V buffer takes its own
+        // head_dim, and SWA layers cap at SlidingWindowSize regardless of the
+        // global context window. Solve for the largest maxCtx s.t. the summed
+        // per-layer bytes still fit in `available`. Without this branch the
+        // non-gemma4 formula (NumLayers × headDim × maxCtx) wildly under- or
+        // over-counts depending on which side of the head-dim mix dominates.
+        if (hp.LayerHeadDim is { } lhd && hp.IsSwaLayer is { } swa)
+        {
+            int swaWindow = hp.SlidingWindowSize > 0 ? hp.SlidingWindowSize : int.MaxValue;
+            long globalKvDimPerToken = 0;
+            long swaKvDimPerToken    = 0;
+            for (int i = 0; i < hp.NumLayers; i++)
+            {
+                // KV-share layers don't allocate their own pages (the source layer
+                // already counted). Skip from both buckets.
+                if (hp.KvSourceLayer is { } ksl && ksl[i] >= 0) continue;
+                long layerKvDim = 2L * hp.NumKvHeads * lhd[i] * sizeof(float);
+                if (swa[i]) swaKvDimPerToken    += layerKvDim;
+                else        globalKvDimPerToken += layerKvDim;
+            }
+            // For a given maxCtx C: bytes = globalKvDimPerToken * C
+            //                            + swaKvDimPerToken    * min(C, swaWindow)
+            // Solve for the largest C ≤ hp.ContextLength that fits in `available`.
+            // Branch on whether C ≤ swaWindow:
+            //   if C ≤ swaWindow: bytes = (global+swa) * C
+            //   else:             bytes = global * C + swa * swaWindow
+            long globalPlusSwa = globalKvDimPerToken + swaKvDimPerToken;
+            int candA = globalPlusSwa > 0 ? (int)(available / globalPlusSwa) : int.MaxValue;
+            int maxCtxL;
+            if (candA <= swaWindow)
+            {
+                maxCtxL = candA;
+            }
+            else
+            {
+                long remain = available - swaKvDimPerToken * swaWindow;
+                int candB = globalKvDimPerToken > 0 && remain > 0
+                    ? (int)(remain / globalKvDimPerToken) : 0;
+                maxCtxL = Math.Max(swaWindow, candB);
+            }
+            return Math.Clamp(maxCtxL, 512, hp.ContextLength);
+        }
 
         long bytesPerToken = 2L * hp.NumLayers * hp.NumKvHeads * headDim * sizeof(float);
         int maxCtx = (int)(available / bytesPerToken);
@@ -1304,8 +1555,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         for (int i = 0; i < _hp.NumLayers; i++)
         {
+            bool kvShared = _hp.KvSourceLayer is { } ksl && ksl[i] >= 0;
+
             _gpu.Free(_wAttnNorm[i]); _gpu.Free(_wFfnNorm[i]);
-            _gpu.Free(_wq[i]); _gpu.Free(_wk[i]); _gpu.Free(_wv[i]); _gpu.Free(_wo[i]);
+            _gpu.Free(_wq[i]); _gpu.Free(_wo[i]);
+            // KV-share layers (Gemma 4 tail) never owned their own K/V projections.
+            if (!kvShared)
+            {
+                _gpu.Free(_wk[i]); _gpu.Free(_wv[i]);
+            }
+            // Gemma 4 per-layer post-norms (small, GPU-resident).
+            if (_wPostAttnNorm is not null) _gpu.Free(_wPostAttnNorm[i]);
+            if (_wPostFfwNorm  is not null) _gpu.Free(_wPostFfwNorm[i]);
             if (_isMoE)
             {
                 _gpu.Free(_wGateInp![i]);
@@ -1329,13 +1590,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
             if (_hasAttnBias)
             {
-                _gpu.Free(_bq![i]); _gpu.Free(_bk![i]);
-                _gpu.Free(_bv![i]); _gpu.Free(_bo![i]);
+                _gpu.Free(_bq![i]);
+                if (!kvShared)
+                {
+                    _gpu.Free(_bk![i]); _gpu.Free(_bv![i]);
+                }
+                _gpu.Free(_bo![i]);
             }
 
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
-                _gpu.Free(_wqNorm![i]); _gpu.Free(_wkNorm![i]);
+                _gpu.Free(_wqNorm![i]);
+                if (!kvShared) _gpu.Free(_wkNorm![i]);
             }
         }
 
@@ -1352,6 +1618,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         for (int i = 0; i < _hp.NumLayers; i++)
         {
+            // Skip KV-aliased layers (Gemma 4 shared_kv_layers tail) — their handles
+            // are owned by the source layer, which already freed them on its iteration.
+            // Without this guard the second Free() on the same device pointer would
+            // hit a CUDA double-free / use-after-free.
+            if (_kvAliasedLayers.Contains(i)) continue;
             _gpu.Free(_gpuKCache[i]);
             _gpu.Free(_gpuVCache[i]);
         }

@@ -42,6 +42,14 @@ public static class TierPlanner
                 : 0; // tied embeddings — shared with token_embd
         long outputNormBytes = cpuFixedWeights ? 0 : MeasureGpuTensorBytes(model, "output_norm.weight");
 
+        // Gemma 4: per_layer_token_embd.weight (PLE table, ~4.2 GB at Q8_0) stays
+        // on CPU unconditionally — it must NOT be counted against the GPU weight
+        // budget. Without this branch the planner reserves ~4 GB of phantom VRAM
+        // and slashes the GPU layer count or context window on cards that could
+        // otherwise hold the full Gemma 4 E4B model.
+        // (Note: MeasureLayerBytes only iterates the standard per-layer suffixes,
+        // so the smaller per-layer PLE tensors — inp_gate / proj / post_norm —
+        // are already implicitly excluded.)
         long fixedGpuBytes = embBytes + outputBytes + outputNormBytes;
         vramBudget -= fixedGpuBytes;
         if (vramBudget < 0) vramBudget = 0;
