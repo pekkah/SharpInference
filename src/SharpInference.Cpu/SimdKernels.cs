@@ -3009,6 +3009,112 @@ public static unsafe class SimdKernels
     }
 
     // ================================================================
+    //  Fused GELU-tanh(gate) * up   (AVX2 + scalar fallback)
+    // ================================================================
+
+    /// <summary>
+    /// Fused tanh-approximate GELU on <paramref name="gate"/> multiplied by
+    /// <paramref name="up"/>, written to <paramref name="outp"/>:
+    /// <c>outp[i] = gelu_tanh(gate[i]) * up[i]</c> where
+    /// <c>gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))</c>.
+    /// Used by Gemma-style models (Gemma 4 FFN activation).
+    /// </summary>
+    public static void GeluTanhMul(float* gate, float* up, float* outp, int n)
+    {
+        // sqrt(2/π) ≈ 0.7978845608028654
+        const float kAlpha = 0.7978845608028654f;
+        const float kBeta = 0.044715f;
+
+        if (Fma.IsSupported && n >= 8)
+        {
+            var half = Vector256.Create(0.5f);
+            var one = Vector256.Create(1.0f);
+            var two = Vector256.Create(2.0f);
+            var alpha = Vector256.Create(kAlpha);
+            var beta = Vector256.Create(kBeta);
+            int i = 0;
+            for (; i + 8 <= n; i += 8)
+            {
+                var g = Avx.LoadVector256(gate + i);
+                var u = Avx.LoadVector256(up + i);
+                // inner = alpha * (g + beta * g^3) = alpha * g * (1 + beta * g^2)
+                var g2 = Avx.Multiply(g, g);
+                var inner = Avx.Multiply(alpha,
+                    Avx.Multiply(g, Fma.MultiplyAdd(beta, g2, one)));
+                // tanh(inner) via (exp(2x) - 1) / (exp(2x) + 1)
+                var e2x = ExpApprox256(Avx.Multiply(two, inner));
+                var tanh = Avx.Divide(Avx.Subtract(e2x, one), Avx.Add(e2x, one));
+                // 0.5 * g * (1 + tanh) * u
+                var gelu = Avx.Multiply(half, Avx.Multiply(g, Avx.Add(one, tanh)));
+                Avx.Store(outp + i, Avx.Multiply(gelu, u));
+            }
+            for (; i < n; i++)
+            {
+                float gs = gate[i];
+                float inner = kAlpha * (gs + kBeta * gs * gs * gs);
+                outp[i] = 0.5f * gs * (1.0f + MathF.Tanh(inner)) * up[i];
+            }
+        }
+        else
+        {
+            GeluTanhMul_Scalar(gate, up, outp, n);
+        }
+    }
+
+    /// <summary>
+    /// Scalar reference for <see cref="GeluTanhMul"/> used by parity tests.
+    /// Uses <see cref="MathF.Tanh"/> directly (no exp approximation).
+    /// </summary>
+    internal static void GeluTanhMul_Scalar(float* gate, float* up, float* outp, int n)
+    {
+        const float kAlpha = 0.7978845608028654f;
+        const float kBeta = 0.044715f;
+        for (int i = 0; i < n; i++)
+        {
+            float gs = gate[i];
+            float inner = kAlpha * (gs + kBeta * gs * gs * gs);
+            outp[i] = 0.5f * gs * (1.0f + MathF.Tanh(inner)) * up[i];
+        }
+    }
+
+    // ================================================================
+    //  Final-logit softcap (AVX2 + scalar)
+    // ================================================================
+
+    /// <summary>
+    /// Apply <c>x[i] = tanh(x[i] / cap) * cap</c> in place. Used for the
+    /// Gemma 4 final-logit softcap (cap=30) to clip extreme logits while
+    /// preserving a smooth gradient near the boundary.
+    /// </summary>
+    public static void SoftcapInPlace(float* x, int n, float cap)
+    {
+        if (Fma.IsSupported && n >= 8)
+        {
+            var one = Vector256.Create(1.0f);
+            var two = Vector256.Create(2.0f);
+            var capV = Vector256.Create(cap);
+            var invCap = Vector256.Create(1.0f / cap);
+            int i = 0;
+            for (; i + 8 <= n; i += 8)
+            {
+                var v = Avx.LoadVector256(x + i);
+                var arg = Avx.Multiply(v, invCap);
+                // tanh(arg) = (exp(2*arg) - 1) / (exp(2*arg) + 1)
+                var e2x = ExpApprox256(Avx.Multiply(two, arg));
+                var tanh = Avx.Divide(Avx.Subtract(e2x, one), Avx.Add(e2x, one));
+                Avx.Store(x + i, Avx.Multiply(tanh, capV));
+            }
+            for (; i < n; i++)
+                x[i] = MathF.Tanh(x[i] / cap) * cap;
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+                x[i] = MathF.Tanh(x[i] / cap) * cap;
+        }
+    }
+
+    // ================================================================
     //  Add in-place (AVX2)
     // ================================================================
 
