@@ -126,6 +126,10 @@ public sealed unsafe class GgufModel : IDisposable
             {
                 if (t.Name == "blk.0.attn_q.bias")     metadata["_sharpi.has_attn_bias"] = true;
                 else if (t.Name == "blk.0.attn_q_norm.weight") metadata["_sharpi.has_qk_norm"] = true;
+                else if (t.Name == "per_layer_token_embd.weight") metadata["_sharpi.has_ple"] = true;
+                else if (t.Name == "blk.0.post_attention_norm.weight") metadata["_sharpi.has_post_attn_norm"] = true;
+                else if (t.Name == "blk.0.post_ffw_norm.weight") metadata["_sharpi.has_post_ffw_norm"] = true;
+                else if (t.Name == "blk.0.layer_output_scale.weight") metadata["_sharpi.has_layer_output_scale"] = true;
                 // Gated-DeltaNet recurrent blocks (qwen35moe and similar hybrids). The
                 // first few layers' indices depend on full_attention_interval, so probe
                 // a window of low layer indices for ssm_conv1d.weight.

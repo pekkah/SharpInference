@@ -34,6 +34,26 @@ public sealed record ModelHyperparams
     public float RopeTheta { get; init; } = 10_000f;
 
     /// <summary>
+    /// Scalar multiplier applied to the token embeddings before they enter the
+    /// transformer trunk. Gemma family multiplies by <c>sqrt(EmbeddingDim)</c>.
+    /// Defaults to 1 (no scaling) for every other architecture.
+    /// </summary>
+    public float EmbeddingScale { get; init; } = 1f;
+
+    /// <summary>
+    /// Cap value for the final-logits softcap (<c>x = tanh(x/cap) * cap</c>).
+    /// 0 disables softcapping (default for non-Gemma architectures). Gemma 4 = 30.0.
+    /// </summary>
+    public float FinalLogitSoftcap { get; init; }
+
+    /// <summary>
+    /// RoPE base frequency used by sliding-window-attention layers. Gemma 4 mixes
+    /// two RoPE bases: <see cref="RopeTheta"/> (1e6 for global layers) and this
+    /// value (1e4 for SWA layers). 0 when the model has only one RoPE base.
+    /// </summary>
+    public float RopeThetaSwa { get; init; }
+
+    /// <summary>
     /// Whether the model has bias terms on Q/K/V/O attention projections (e.g. Qwen models).
     /// Detected at load time by probing for "blk.0.attn_q.bias" in the GGUF tensor index.
     /// </summary>
@@ -142,6 +162,67 @@ public sealed record ModelHyperparams
     /// Used by MTP self-speculative decoding to draft N-ahead tokens per main forward.
     /// </summary>
     public int NumMtpLayers { get; init; }
+
+    // ── Gemma 4 (sliding-window + per-layer head-dim + PLE) ──
+
+    /// <summary>
+    /// Sliding window size (in tokens) used by SWA layers. 0 when the model has
+    /// no sliding-window attention. Gemma 4 = 512.
+    /// </summary>
+    public int SlidingWindowSize { get; init; }
+
+    /// <summary>
+    /// Per-Layer-Embedding (PLE) projection width. Gemma 4 E4B = 256. 0 when the
+    /// model has no PLE table.
+    /// </summary>
+    public int PerLayerEmbeddingWidth { get; init; }
+
+    /// <summary>Whether each layer has a post-attention RMSNorm before residual add (Gemma 4).</summary>
+    public bool HasPostAttnNorm { get; init; }
+
+    /// <summary>Whether each layer has a post-FFN RMSNorm before residual add (Gemma 4).</summary>
+    public bool HasPostFfwNorm { get; init; }
+
+    /// <summary>Whether the model carries a <c>per_layer_token_embd.weight</c> table (Gemma 4 PLE).</summary>
+    public bool HasPerLayerTokenEmbd { get; init; }
+
+    /// <summary>
+    /// Whether each layer has a learned <c>layer_output_scale.weight</c> scalar applied
+    /// to the layer output (Gemma 4).
+    /// </summary>
+    public bool HasLayerOutputScale { get; init; }
+
+    /// <summary>
+    /// FFN activation function. <see cref="FfnActivation.Silu"/> for the vast majority of
+    /// architectures (LLaMA/Mistral/Qwen/etc); <see cref="FfnActivation.GeluApprox"/> for Gemma 4.
+    /// </summary>
+    public FfnActivation FfnActivation { get; init; } = FfnActivation.Silu;
+
+    /// <summary>
+    /// Per-layer flag: <c>true</c> when the layer uses sliding-window attention,
+    /// <c>false</c> for global (full-context) attention. <c>null</c> when every
+    /// layer is global. Gemma 4 follows a 5-SWA : 1-global repeating pattern.
+    /// </summary>
+    public IReadOnlyList<bool>? IsSwaLayer { get; init; }
+
+    /// <summary>
+    /// Per-layer KV-cache source. <c>-1</c> means the layer owns its own K/V;
+    /// otherwise the layer aliases another layer's KV pages (Gemma 4
+    /// <c>shared_kv_layers</c> tail). <c>null</c> when no layer shares KV.
+    /// </summary>
+    public IReadOnlyList<int>? KvSourceLayer { get; init; }
+
+    /// <summary>
+    /// Per-layer attention head dimension (Gemma 4 mixes 256 for SWA and 512 for
+    /// global). <c>null</c> when every layer uses <see cref="HeadDim"/>.
+    /// </summary>
+    public IReadOnlyList<int>? LayerHeadDim { get; init; }
+
+    /// <summary>
+    /// Per-layer RoPE rotation dimension (Gemma 4 mixes 256 for SWA and 512 for
+    /// global). <c>null</c> when every layer uses <see cref="RopeDim"/>.
+    /// </summary>
+    public IReadOnlyList<int>? LayerRopeDim { get; init; }
 
     /// <summary>
     /// Extract hyperparameters from GGUF metadata using the model's architecture prefix.
@@ -268,6 +349,92 @@ public sealed record ModelHyperparams
                 FullAttentionInterval: fullAttnInterval);
         }
 
+        bool isGemma4 = arch.Equals("gemma4", StringComparison.OrdinalIgnoreCase);
+
+        int slidingWindow = 0;
+        int perLayerEmbedWidth = 0;
+        float finalLogitSoftcap = 0f;
+        float ropeThetaSwa = 0f;
+        float embeddingScale = 1f;
+        bool hasPostAttnNorm = false;
+        bool hasPostFfwNorm = false;
+        bool hasPerLayerTokenEmbd = false;
+        bool hasLayerOutputScale = false;
+        FfnActivation ffnActivation = FfnActivation.Silu;
+        IReadOnlyList<bool>? isSwaLayer = null;
+        IReadOnlyList<int>? kvSourceLayer = null;
+        IReadOnlyList<int>? layerHeadDim = null;
+        IReadOnlyList<int>? layerRopeDim = null;
+
+        if (isGemma4)
+        {
+            slidingWindow         = GetInt(metadata, $"{arch}.attention.sliding_window");
+            perLayerEmbedWidth    = GetInt(metadata, $"{arch}.embedding_length_per_layer_input");
+            finalLogitSoftcap     = GetFloat(metadata, $"{arch}.final_logit_softcapping");
+            ropeThetaSwa          = GetFloat(metadata, $"{arch}.rope.freq_base_swa", 10_000f);
+            int sharedKvLayers    = GetInt(metadata, $"{arch}.attention.shared_kv_layers");
+            int keyLengthSwa      = GetInt(metadata, $"{arch}.attention.key_length_swa", headDim);
+            int ropeDimSwa        = GetInt(metadata, $"{arch}.rope.dimension_count_swa", keyLengthSwa);
+
+            embeddingScale = MathF.Sqrt(embDim);
+            ffnActivation  = FfnActivation.GeluApprox;
+
+            hasPostAttnNorm      = metadata.ContainsKey("_sharpi.has_post_attn_norm")
+                || (model?.FindTensor("blk.0.post_attention_norm.weight") is not null);
+            hasPostFfwNorm       = metadata.ContainsKey("_sharpi.has_post_ffw_norm")
+                || (model?.FindTensor("blk.0.post_ffw_norm.weight") is not null);
+            hasPerLayerTokenEmbd = metadata.ContainsKey("_sharpi.has_ple")
+                || (model?.FindTensor("per_layer_token_embd.weight") is not null);
+            hasLayerOutputScale  = metadata.ContainsKey("_sharpi.has_layer_output_scale")
+                || (model?.FindTensor("blk.0.layer_output_scale.weight") is not null);
+
+            if (numLayers > 0)
+            {
+                var pattern = GetBoolArray(metadata, $"{arch}.attention.sliding_window_pattern");
+                var swa = new bool[numLayers];
+                if (pattern is not null && pattern.Count > 0)
+                {
+                    for (int i = 0; i < numLayers; i++)
+                        swa[i] = pattern[i % pattern.Count];
+                }
+                isSwaLayer = swa;
+
+                var hdArr = new int[numLayers];
+                var rdArr = new int[numLayers];
+                for (int i = 0; i < numLayers; i++)
+                {
+                    bool sw = swa[i];
+                    hdArr[i] = sw ? keyLengthSwa : headDim;
+                    rdArr[i] = sw ? ropeDimSwa : ropeDim;
+                }
+                layerHeadDim = hdArr;
+                layerRopeDim = rdArr;
+
+                if (sharedKvLayers > 0)
+                {
+                    int firstSharedLayer = numLayers - sharedKvLayers;
+                    var src = new int[numLayers];
+                    for (int i = 0; i < numLayers; i++)
+                    {
+                        if (i < firstSharedLayer)
+                        {
+                            src[i] = -1;
+                        }
+                        else
+                        {
+                            int found = -1;
+                            for (int j = firstSharedLayer - 1; j >= 0; j--)
+                            {
+                                if (swa[j] == swa[i]) { found = j; break; }
+                            }
+                            src[i] = found;
+                        }
+                    }
+                    kvSourceLayer = src;
+                }
+            }
+        }
+
         return new ModelHyperparams
         {
             VocabSize = GetInt(metadata, $"{arch}.vocab_size"),
@@ -302,6 +469,20 @@ public sealed record ModelHyperparams
             IsHybridSsm = isHybridSsm,
             LayerTypes = layerTypes,
             Gdn = gdn,
+            EmbeddingScale = embeddingScale,
+            FinalLogitSoftcap = finalLogitSoftcap,
+            RopeThetaSwa = ropeThetaSwa,
+            SlidingWindowSize = slidingWindow,
+            PerLayerEmbeddingWidth = perLayerEmbedWidth,
+            HasPostAttnNorm = hasPostAttnNorm,
+            HasPostFfwNorm = hasPostFfwNorm,
+            HasPerLayerTokenEmbd = hasPerLayerTokenEmbd,
+            HasLayerOutputScale = hasLayerOutputScale,
+            FfnActivation = ffnActivation,
+            IsSwaLayer = isSwaLayer,
+            KvSourceLayer = kvSourceLayer,
+            LayerHeadDim = layerHeadDim,
+            LayerRopeDim = layerRopeDim,
         };
     }
 
@@ -310,6 +491,24 @@ public sealed record ModelHyperparams
 
     private static float GetFloat(IReadOnlyDictionary<string, object> m, string key, float fallback = 0f) =>
         m.TryGetValue(key, out var v) ? Convert.ToSingle(v) : fallback;
+
+    private static IReadOnlyList<bool>? GetBoolArray(IReadOnlyDictionary<string, object> m, string key)
+    {
+        if (!m.TryGetValue(key, out var v)) return null;
+        switch (v)
+        {
+            case bool[] ba: return ba;
+            case IReadOnlyList<bool> rl: return rl;
+            case object[] oa:
+            {
+                var result = new bool[oa.Length];
+                for (int i = 0; i < oa.Length; i++)
+                    result[i] = Convert.ToBoolean(oa[i]);
+                return result;
+            }
+            default: return null;
+        }
+    }
 }
 
 public abstract class ModelLayer
@@ -331,6 +530,16 @@ public enum LayerType
 {
     Attention = 0,
     GatedDeltaNet = 1,
+}
+
+/// <summary>
+/// FFN inner activation. Most LLaMA-family models use SiLU/Swish gating; Gemma 4 uses
+/// the tanh-approximation of GELU on the gate projection.
+/// </summary>
+public enum FfnActivation
+{
+    Silu = 0,
+    GeluApprox = 1,
 }
 
 /// <summary>
