@@ -3032,6 +3032,12 @@ public static unsafe class SimdKernels
             var two = Vector256.Create(2.0f);
             var alpha = Vector256.Create(kAlpha);
             var beta = Vector256.Create(kBeta);
+            // Clamp 2*inner before exp so |inner|>~10 (e.g. ~ ±20 gate inputs from a
+            // wide-dim trunk like Gemma 4) doesn't overflow ExpApprox256 to inf and
+            // cascade to (inf-1)/(inf+1)=NaN. Safe range for float32 exp is ~[-88, 88];
+            // |2*inner|>20 already saturates tanh to ±1 well within float precision.
+            var clampHi = Vector256.Create(20.0f);
+            var clampLo = Vector256.Create(-20.0f);
             int i = 0;
             for (; i + 8 <= n; i += 8)
             {
@@ -3042,7 +3048,8 @@ public static unsafe class SimdKernels
                 var inner = Avx.Multiply(alpha,
                     Avx.Multiply(g, Fma.MultiplyAdd(beta, g2, one)));
                 // tanh(inner) via (exp(2x) - 1) / (exp(2x) + 1)
-                var e2x = ExpApprox256(Avx.Multiply(two, inner));
+                var twoInner = Avx.Max(clampLo, Avx.Min(clampHi, Avx.Multiply(two, inner)));
+                var e2x = ExpApprox256(twoInner);
                 var tanh = Avx.Divide(Avx.Subtract(e2x, one), Avx.Add(e2x, one));
                 // 0.5 * g * (1 + tanh) * u
                 var gelu = Avx.Multiply(half, Avx.Multiply(g, Avx.Add(one, tanh)));
@@ -3094,13 +3101,19 @@ public static unsafe class SimdKernels
             var two = Vector256.Create(2.0f);
             var capV = Vector256.Create(cap);
             var invCap = Vector256.Create(1.0f / cap);
+            // Clamp 2*arg before exp so an extreme pre-softcap logit doesn't overflow
+            // ExpApprox256 to inf. |2*arg|>20 already saturates tanh to ±1 well within
+            // float precision so the clamp is invisible to the final cap*tanh result.
+            var clampHi = Vector256.Create(20.0f);
+            var clampLo = Vector256.Create(-20.0f);
             int i = 0;
             for (; i + 8 <= n; i += 8)
             {
                 var v = Avx.LoadVector256(x + i);
                 var arg = Avx.Multiply(v, invCap);
                 // tanh(arg) = (exp(2*arg) - 1) / (exp(2*arg) + 1)
-                var e2x = ExpApprox256(Avx.Multiply(two, arg));
+                var twoArg = Avx.Max(clampLo, Avx.Min(clampHi, Avx.Multiply(two, arg)));
+                var e2x = ExpApprox256(twoArg);
                 var tanh = Avx.Divide(Avx.Subtract(e2x, one), Avx.Add(e2x, one));
                 Avx.Store(x + i, Avx.Multiply(tanh, capV));
             }

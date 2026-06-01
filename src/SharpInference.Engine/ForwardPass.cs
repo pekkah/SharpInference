@@ -42,6 +42,18 @@ public sealed unsafe class ForwardPass : IForwardPass
     private readonly int _headsPerKvGroup;
     private readonly int _intermDim;
 
+    // Per-layer head-dim variance (Gemma 4: SWA layers use 256, global layers use 512).
+    // _layerHeadDim is non-null only when hp.LayerHeadDim is non-null; otherwise the
+    // hot path uses the scalar _headDim. _maxHeadDim sizes scratch + the PagedKvCache
+    // so per-layer slots fit; per-layer Attention reads/writes the leading
+    // head_dim[layer] of each head, with the trailing bytes left as zeros via an
+    // explicit Clear before the Q/K/V matvecs.
+    private readonly int[]? _layerHeadDim;
+    private readonly int[]? _layerRopeDim;
+    private readonly int[]? _layerKvSrc;
+    private readonly bool[]? _isSwaLayer;
+    private readonly int _maxHeadDim;
+
     // Precomputed tensor metadata for hot-path access
     private readonly TensorRef _embTensor;
     private readonly TensorRef[] _attnNorm;
@@ -109,6 +121,17 @@ public sealed unsafe class ForwardPass : IForwardPass
     private readonly float* _ropeSinTable;
     private readonly int _ropeHalfDim;
 
+    // Second RoPE table for Gemma 4 SWA layers (theta = RopeThetaSwa, e.g. 10K).
+    // Non-null only when hp.RopeThetaSwa > 0. Halfdim follows the SWA layers' rope dim.
+    private readonly float* _ropeCosTableSwa;
+    private readonly float* _ropeSinTableSwa;
+    private readonly int _ropeHalfDimSwa;
+
+    // Gemma 4 per-layer norms + scale (null/empty on non-Gemma 4 models).
+    private readonly TensorRef[]? _postAttnNorm;
+    private readonly TensorRef[]? _postFfwNorm;
+    private readonly float[]? _layerOutputScale;
+
     public ForwardPass(GgufModel model, IComputeBackend backend, ModelHyperparams hp,
         int maxContextLength = 0)
     {
@@ -119,7 +142,6 @@ public sealed unsafe class ForwardPass : IForwardPass
             ? Math.Min(maxContextLength, hp.ContextLength)
             : Math.Min(hp.ContextLength, 32768);
         _ctxLen = ctxLen;
-        _kvCache = new PagedKvCache(hp.NumLayers, hp.NumKvHeads, hp.HeadDim);
         _snapKvCfg = SnapKvConfig.FromEnvironment();
 
         _embDim = hp.EmbeddingDim;
@@ -129,14 +151,48 @@ public sealed unsafe class ForwardPass : IForwardPass
         _headsPerKvGroup = hp.NumHeads / hp.NumKvHeads;
         _intermDim = hp.IntermediateDim;
 
+        // Per-layer head-dim plumbing. Materialise the per-layer arrays once so the
+        // hot loop reads from a plain int[] rather than IReadOnlyList<int>.
+        if (hp.LayerHeadDim is { } lhd)
+        {
+            _layerHeadDim = new int[hp.NumLayers];
+            for (int i = 0; i < hp.NumLayers; i++) _layerHeadDim[i] = lhd[i];
+        }
+        if (hp.LayerRopeDim is { } lrd)
+        {
+            _layerRopeDim = new int[hp.NumLayers];
+            for (int i = 0; i < hp.NumLayers; i++) _layerRopeDim[i] = lrd[i];
+        }
+        if (hp.KvSourceLayer is { } ksl)
+        {
+            _layerKvSrc = new int[hp.NumLayers];
+            for (int i = 0; i < hp.NumLayers; i++) _layerKvSrc[i] = ksl[i];
+        }
+        if (hp.IsSwaLayer is { } swa)
+        {
+            _isSwaLayer = new bool[hp.NumLayers];
+            for (int i = 0; i < hp.NumLayers; i++) _isSwaLayer[i] = swa[i];
+        }
+
+        _maxHeadDim = _headDim;
+        int maxRopeDim = hp.RopeDim > 0 ? hp.RopeDim : _headDim;
+        if (_layerHeadDim is not null)
+            for (int i = 0; i < hp.NumLayers; i++)
+                if (_layerHeadDim[i] > _maxHeadDim) _maxHeadDim = _layerHeadDim[i];
+        if (_layerRopeDim is not null)
+            for (int i = 0; i < hp.NumLayers; i++)
+                if (_layerRopeDim[i] > maxRopeDim) maxRopeDim = _layerRopeDim[i];
+
+        _kvCache = new PagedKvCache(hp.NumLayers, hp.NumKvHeads, _maxHeadDim);
+
         // Allocate scratch
         _hidden = Alloc(_embDim);
         _residual = Alloc(_embDim);
         _normBuf = Alloc(_embDim);
-        _q = Alloc(_numHeads * _headDim);
-        _k = Alloc(_numKvHeads * _headDim);
-        _v = Alloc(_numKvHeads * _headDim);
-        _attnOut = Alloc(_numHeads * _headDim);
+        _q = Alloc(_numHeads * _maxHeadDim);
+        _k = Alloc(_numKvHeads * _maxHeadDim);
+        _v = Alloc(_numKvHeads * _maxHeadDim);
+        _attnOut = Alloc(_numHeads * _maxHeadDim);
         _ffnGate = Alloc(_intermDim);
         _ffnUp = Alloc(_intermDim);
         _logits = Alloc(hp.VocabSize);
@@ -148,11 +204,24 @@ public sealed unsafe class ForwardPass : IForwardPass
             _normTraceFfn = new float[hp.NumLayers];
         }
 
-        // Precompute RoPE cos/sin tables for all positions [0, ctxLen)
-        _ropeHalfDim = _headDim / 2;
+        // Precompute RoPE cos/sin tables for all positions [0, ctxLen).
+        // For Gemma 4 the global table is sized for the largest rope dim across layers;
+        // the SWA table is built separately at RopeThetaSwa with its own (smaller) halfDim.
+        _ropeHalfDim = maxRopeDim / 2;
         _ropeCosTable = (float*)NativeMemory.Alloc((nuint)((long)ctxLen * _ropeHalfDim * sizeof(float)));
         _ropeSinTable = (float*)NativeMemory.Alloc((nuint)((long)ctxLen * _ropeHalfDim * sizeof(float)));
-        SimdKernels.BuildRopeTable(_ropeCosTable, _ropeSinTable, ctxLen, _headDim, hp.RopeTheta);
+        SimdKernels.BuildRopeTable(_ropeCosTable, _ropeSinTable, ctxLen, maxRopeDim, hp.RopeTheta);
+
+        if (hp.RopeThetaSwa > 0f && _layerRopeDim is not null)
+        {
+            int swaRopeDim = maxRopeDim;
+            for (int i = 0; i < hp.NumLayers; i++)
+                if (_isSwaLayer![i]) { swaRopeDim = _layerRopeDim[i]; break; }
+            _ropeHalfDimSwa = swaRopeDim / 2;
+            _ropeCosTableSwa = (float*)NativeMemory.Alloc((nuint)((long)ctxLen * _ropeHalfDimSwa * sizeof(float)));
+            _ropeSinTableSwa = (float*)NativeMemory.Alloc((nuint)((long)ctxLen * _ropeHalfDimSwa * sizeof(float)));
+            SimdKernels.BuildRopeTable(_ropeCosTableSwa, _ropeSinTableSwa, ctxLen, swaRopeDim, hp.RopeThetaSwa);
+        }
 
         // Pre-resolve all tensor references (avoids dictionary lookups in hot loop)
         _embTensor = ResolveTensor("token_embd.weight");
@@ -188,14 +257,28 @@ public sealed unsafe class ForwardPass : IForwardPass
             _moeDownTemp = Alloc(_embDim);
         }
 
+        if (hp.HasPostAttnNorm) _postAttnNorm = new TensorRef[L];
+        if (hp.HasPostFfwNorm) _postFfwNorm = new TensorRef[L];
+        if (hp.HasLayerOutputScale) _layerOutputScale = new float[L];
+
         for (int i = 0; i < L; i++)
         {
+            int layerHd = _layerHeadDim?[i] ?? _headDim;
+            bool kvShared = _layerKvSrc is not null && _layerKvSrc[i] >= 0;
+
             _attnNorm[i] = ResolveTensor($"blk.{i}.attn_norm.weight");
             _wq[i] = ResolveTensor($"blk.{i}.attn_q.weight");
-            _wk[i] = ResolveTensor($"blk.{i}.attn_k.weight");
-            _wv[i] = ResolveTensor($"blk.{i}.attn_v.weight");
             _wo[i] = ResolveTensor($"blk.{i}.attn_output.weight");
             _ffnNorm[i] = ResolveTensor($"blk.{i}.ffn_norm.weight");
+
+            // KV-share layers (Gemma 4 tail) don't carry their own attn_k/attn_v weights —
+            // they alias the source layer's K/V pages. Skip the tensor lookup so missing-
+            // tensor errors don't fire; the runtime path also skips these projections.
+            if (!kvShared)
+            {
+                _wk[i] = ResolveTensor($"blk.{i}.attn_k.weight");
+                _wv[i] = ResolveTensor($"blk.{i}.attn_v.weight");
+            }
 
             if (hp.IsMoE)
             {
@@ -219,19 +302,29 @@ public sealed unsafe class ForwardPass : IForwardPass
 
             if (_hasAttnBias)
             {
-                _bq[i] = LoadBias($"blk.{i}.attn_q.bias", _numHeads * _headDim);
-                _bk[i] = LoadBias($"blk.{i}.attn_k.bias", _numKvHeads * _headDim);
-                _bv[i] = LoadBias($"blk.{i}.attn_v.bias", _numKvHeads * _headDim);
+                _bq[i] = LoadBias($"blk.{i}.attn_q.bias", _numHeads * layerHd);
+                if (!kvShared)
+                {
+                    _bk[i] = LoadBias($"blk.{i}.attn_k.bias", _numKvHeads * layerHd);
+                    _bv[i] = LoadBias($"blk.{i}.attn_v.bias", _numKvHeads * layerHd);
+                }
                 _bo[i] = LoadBias($"blk.{i}.attn_output.bias", _embDim);
             }
 
             if (_hasQkNorm && !hp.UseL2QkNorm)
             {
-                int qNormSize = _perChannelQkNorm ? _numHeads * _headDim : _headDim;
-                int kNormSize = _perChannelQkNorm ? _numKvHeads * _headDim : _headDim;
+                int qNormSize = _perChannelQkNorm ? _numHeads * layerHd : layerHd;
+                int kNormSize = _perChannelQkNorm ? _numKvHeads * layerHd : layerHd;
                 _qNorm[i] = LoadBias($"blk.{i}.attn_q_norm.weight", qNormSize);
                 _kNorm[i] = LoadBias($"blk.{i}.attn_k_norm.weight", kNormSize);
             }
+
+            if (_postAttnNorm is not null)
+                _postAttnNorm[i] = ResolveTensor($"blk.{i}.post_attention_norm.weight");
+            if (_postFfwNorm is not null)
+                _postFfwNorm[i] = ResolveTensor($"blk.{i}.post_ffw_norm.weight");
+            if (_layerOutputScale is not null)
+                _layerOutputScale[i] = LoadScalarF32($"blk.{i}.layer_output_scale.weight");
         }
 
         _outputNorm = ResolveTensor("output_norm.weight");
@@ -252,10 +345,13 @@ public sealed unsafe class ForwardPass : IForwardPass
         int L = _hp.NumLayers;
         for (int i = 0; i < L; i++)
         {
+            bool kvShared = _layerKvSrc is not null && _layerKvSrc[i] >= 0;
             tensors.Add(_attnNorm[i]);
-            tensors.Add(_wq[i]); tensors.Add(_wk[i]);
-            tensors.Add(_wv[i]); tensors.Add(_wo[i]);
+            tensors.Add(_wq[i]); tensors.Add(_wo[i]);
+            if (!kvShared) { tensors.Add(_wk[i]); tensors.Add(_wv[i]); }
             tensors.Add(_ffnNorm[i]);
+            if (_postAttnNorm is not null) tensors.Add(_postAttnNorm[i]);
+            if (_postFfwNorm is not null) tensors.Add(_postFfwNorm[i]);
 
             if (_hp.IsMoE)
             {
@@ -350,7 +446,10 @@ public sealed unsafe class ForwardPass : IForwardPass
         if (N == 1) return Forward(tokens[0], startPos);
 
         // MoE models: sequential prefill (batched FFN not yet supported for MoE).
-        if (_hp.IsMoE)
+        // Per-layer head-dim models (Gemma 4): the batched PrefillCore path assumes a
+        // single qDim/kvDim across layers, so fall back to sequential Forward until
+        // Phase 8 plumbs per-layer head_dim through the batched paths.
+        if (_hp.IsMoE || _layerHeadDim is not null)
         {
             ReadOnlySpan<float> logits = default;
             for (int i = 0; i < N; i++)
@@ -822,6 +921,9 @@ public sealed unsafe class ForwardPass : IForwardPass
     {
         if (_tqKvCache != null)
             throw new NotSupportedException("BatchVerify is not supported when TurboQuant KV cache is enabled.");
+        if (_layerHeadDim is not null)
+            throw new NotSupportedException(
+                "gemma4 per-layer head_dim not yet supported on the batched BatchVerify path.");
 
         int N = tokens.Length;
         if (N == 0) return Array.Empty<float[]>();
@@ -1023,11 +1125,23 @@ public sealed unsafe class ForwardPass : IForwardPass
         // 1. Embedding lookup (single-row dequant, no full table materialization)
         EmbedToken(token);
 
+        // Gemma family scales embeddings by sqrt(EmbeddingDim) before the trunk.
+        if (_hp.EmbeddingScale != 1f)
+            SimdKernels.ScaleInPlace(_hidden, _hp.EmbeddingScale, _embDim);
+
         float embNorm = _traceNorms ? L2Norm(_hidden, _embDim) : 0f;
 
         // 2. Transformer layers
         for (int layer = 0; layer < _hp.NumLayers; layer++)
         {
+            int layerHd = _layerHeadDim?[layer] ?? _headDim;
+            int qDimL = _numHeads * layerHd;
+            int kvDimL = _numKvHeads * layerHd;
+            int kvSrc = _layerKvSrc is not null ? _layerKvSrc[layer] : -1;
+            bool kvShared = kvSrc >= 0;
+            int effLayer = kvShared ? kvSrc : layer;
+            int windowSize = _isSwaLayer is not null && _isSwaLayer[layer] ? _hp.SlidingWindowSize : -1;
+
             // Save residual
             Copy(_residual, _hidden, _embDim);
 
@@ -1035,16 +1149,34 @@ public sealed unsafe class ForwardPass : IForwardPass
             var normW = GetNormWeight(_attnNorm[layer]);
             SimdKernels.RmsNorm(_normBuf, _hidden, normW, _embDim, _hp.RmsNormEps);
 
-            // Q/K/V projections (fused dequant-matvec, no intermediate F32 buffer)
-            FusedMatVec(_q, _wq[layer], _normBuf, _numHeads * _headDim, _embDim);
-            FusedMatVec(_k, _wk[layer], _normBuf, _numKvHeads * _headDim, _embDim);
-            FusedMatVec(_v, _wv[layer], _normBuf, _numKvHeads * _headDim, _embDim);
+            // Q projection always runs on the active layer's weights.
+            // For per-layer head_dim models the trailing bytes of _q/_k/_v are stale
+            // from a wider prior layer; zero them so subsequent Attention reads (which
+            // stride by the active layerHd) don't pick up garbage on heads beyond
+            // numHeads*layerHd, and KV cache pages don't carry inter-layer pollution.
+            if (_layerHeadDim is not null)
+            {
+                int qBytes = _numHeads * _maxHeadDim;
+                int kvBytes = _numKvHeads * _maxHeadDim;
+                new Span<float>(_q, qBytes).Clear();
+                new Span<float>(_k, kvBytes).Clear();
+                new Span<float>(_v, kvBytes).Clear();
+            }
+            FusedMatVec(_q, _wq[layer], _normBuf, qDimL, _embDim);
+            if (!kvShared)
+            {
+                FusedMatVec(_k, _wk[layer], _normBuf, kvDimL, _embDim);
+                FusedMatVec(_v, _wv[layer], _normBuf, kvDimL, _embDim);
+            }
 
             if (_hasAttnBias)
             {
-                SimdKernels.AddInPlace(_q, _bq[layer], _numHeads * _headDim);
-                SimdKernels.AddInPlace(_k, _bk[layer], _numKvHeads * _headDim);
-                SimdKernels.AddInPlace(_v, _bv[layer], _numKvHeads * _headDim);
+                SimdKernels.AddInPlace(_q, _bq[layer], qDimL);
+                if (!kvShared)
+                {
+                    SimdKernels.AddInPlace(_k, _bk[layer], kvDimL);
+                    SimdKernels.AddInPlace(_v, _bv[layer], kvDimL);
+                }
             }
 
             // NoPE: skip RoPE for NoPE layers
@@ -1055,46 +1187,62 @@ public sealed unsafe class ForwardPass : IForwardPass
             // Llama-4 (L2 QK-norm): apply norm AFTER RoPE (per llama.cpp)
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
-                ApplyQkNorm(_q, _k, layer);
+                ApplyQkNormLayer(_q, kvShared ? null : _k, layer, layerHd);
             }
 
             if (useRoPE)
             {
-                ApplyRope(_q, position, _numHeads);
-                ApplyRope(_k, position, _numKvHeads);
+                ApplyRopeLayer(_q, position, _numHeads, layer, layerHd);
+                if (!kvShared)
+                    ApplyRopeLayer(_k, position, _numKvHeads, layer, layerHd);
             }
 
             // L2 QK-norm (Llama-4): only on RoPE layers, applied after RoPE
             if (_hasQkNorm && _hp.UseL2QkNorm && useRoPE)
             {
-                PerHeadPureRmsNorm(_q, _numHeads, _headDim, _hp.RmsNormEps);
-                PerHeadPureRmsNorm(_k, _numKvHeads, _headDim, _hp.RmsNormEps);
+                PerHeadPureRmsNorm(_q, _numHeads, layerHd, _hp.RmsNormEps);
+                if (!kvShared)
+                    PerHeadPureRmsNorm(_k, _numKvHeads, layerHd, _hp.RmsNormEps);
             }
 
-            // Store K, V in cache
-            if (_tqKvCache != null)
+            // Store K, V in cache. KV-share layers don't append — the source layer's
+            // cache slot is shared via effLayer in the Attention call below.
+            // PagedKvCache.Append requires exactly cache.KvDim floats; for per-layer
+            // head_dim models the trailing (KvDim - kvDimL) floats were just zeroed.
+            if (!kvShared)
             {
-                _tqKvCache.Append(layer,
-                    new ReadOnlySpan<float>(_k, _numKvHeads * _headDim),
-                    new ReadOnlySpan<float>(_v, _numKvHeads * _headDim));
-            }
-            else
-            {
-                _kvCache.Append(layer,
-                    new ReadOnlySpan<float>(_k, _numKvHeads * _headDim),
-                    new ReadOnlySpan<float>(_v, _numKvHeads * _headDim));
+                int appendLen = _layerHeadDim is not null ? _kvCache.KvDim : kvDimL;
+                if (_tqKvCache != null)
+                {
+                    _tqKvCache.Append(layer,
+                        new ReadOnlySpan<float>(_k, appendLen),
+                        new ReadOnlySpan<float>(_v, appendLen));
+                }
+                else
+                {
+                    _kvCache.Append(layer,
+                        new ReadOnlySpan<float>(_k, appendLen),
+                        new ReadOnlySpan<float>(_v, appendLen));
+                }
             }
 
             // Attention
             if (_tqKvCache != null)
                 TqAttention(layer, position);
             else
-                Attention(_kvCache, layer, position);
+                Attention(_kvCache, effLayer, layer, position, layerHd, windowSize);
 
-            // Output projection
-            FusedMatVec(_hidden, _wo[layer], _attnOut, _embDim, _numHeads * _headDim);
+            // Output projection (input width is per-layer qDim).
+            FusedMatVec(_hidden, _wo[layer], _attnOut, _embDim, qDimL);
             if (_hasAttnBias)
                 SimdKernels.AddInPlace(_hidden, _bo[layer], _embDim);
+
+            // Gemma 4: post-attention RmsNorm BEFORE the residual add.
+            if (_postAttnNorm is not null)
+            {
+                var paNormW = GetNormWeight(_postAttnNorm[layer]);
+                SimdKernels.RmsNorm(_hidden, _hidden, paNormW, _embDim, _hp.RmsNormEps);
+            }
 
             // Residual
             SimdKernels.AddInPlace(_hidden, _residual, _embDim);
@@ -1112,6 +1260,15 @@ public sealed unsafe class ForwardPass : IForwardPass
                 MoeFfn(layer);
             else
                 DenseFfn(layer);
+
+            // Gemma 4: per-layer learned output scale + post-FFN RmsNorm before the residual add.
+            if (_layerOutputScale is not null)
+                SimdKernels.ScaleInPlace(_hidden, _layerOutputScale[layer], _embDim);
+            if (_postFfwNorm is not null)
+            {
+                var pfNormW = GetNormWeight(_postFfwNorm[layer]);
+                SimdKernels.RmsNorm(_hidden, _hidden, pfNormW, _embDim, _hp.RmsNormEps);
+            }
 
             // Residual
             SimdKernels.AddInPlace(_hidden, _residual, _embDim);
@@ -1136,6 +1293,10 @@ public sealed unsafe class ForwardPass : IForwardPass
         // 4. Output projection → logits (fused, no 400MB intermediate buffer)
         FusedMatVec(_logits, _outputWeight, _hidden, _hp.VocabSize, _embDim);
 
+        // Gemma 4 final-logit softcap: x = tanh(x/cap) * cap.
+        if (_hp.FinalLogitSoftcap > 0f)
+            SimdKernels.SoftcapInPlace(_logits, _hp.VocabSize, _hp.FinalLogitSoftcap);
+
         if (_traceNorms)
             EmitNormTrace(token, position, embNorm, preFinalNorm, postFinalNorm);
 
@@ -1150,6 +1311,25 @@ public sealed unsafe class ForwardPass : IForwardPass
             SimdKernels.ApplyRoPECachedNeox(x, cos, sin, heads, _headDim);
         else
             SimdKernels.ApplyRoPECached(x, cos, sin, heads, _headDim);
+    }
+
+    /// <summary>
+    /// Per-layer-aware RoPE: selects the global or SWA cos/sin table for Gemma 4 and
+    /// rotates each head's leading <paramref name="layerHd"/> dims.
+    /// </summary>
+    private void ApplyRopeLayer(float* x, int pos, int heads, int layer, int layerHd)
+    {
+        bool useSwa = _ropeCosTableSwa != null && _isSwaLayer is not null && _isSwaLayer[layer];
+        int halfDim = useSwa ? _ropeHalfDimSwa : _ropeHalfDim;
+        float* cosTab = useSwa ? _ropeCosTableSwa : _ropeCosTable;
+        float* sinTab = useSwa ? _ropeSinTable    : _ropeSinTable;
+        if (useSwa) sinTab = _ropeSinTableSwa;
+        var cos = cosTab + (long)pos * halfDim;
+        var sin = sinTab + (long)pos * halfDim;
+        if (_hp.IsNeoxRope)
+            SimdKernels.ApplyRoPECachedNeox(x, cos, sin, heads, layerHd);
+        else
+            SimdKernels.ApplyRoPECached(x, cos, sin, heads, layerHd);
     }
 
     private static float L2Norm(float* x, int n)
@@ -1190,6 +1370,17 @@ public sealed unsafe class ForwardPass : IForwardPass
     // ================================================================
 
     private void Attention(PagedKvCache cache, int layer, int position)
+        => Attention(cache, layer, layer, position, _headDim, windowSize: -1);
+
+    /// <summary>
+    /// Multi-head attention with optional per-layer head dim, KV-source aliasing, and
+    /// sliding-window bound. <paramref name="readLayer"/> is the layer whose K/V pages
+    /// to read (== <paramref name="ownLayer"/> for non-shared layers; the source layer
+    /// when KV is aliased). <paramref name="windowSize"/> &gt; 0 restricts the score and
+    /// V-aggregation loops to the last <paramref name="windowSize"/> positions.
+    /// </summary>
+    private void Attention(PagedKvCache cache, int readLayer, int ownLayer, int position,
+        int hd, int windowSize)
     {
         // After SnapKV eviction (issue #51), the absolute position keeps
         // growing while the cache only stores `cache.Length` slots — `position`
@@ -1199,48 +1390,58 @@ public sealed unsafe class ForwardPass : IForwardPass
         // cache.Length+1 keeps the old answer for both prefill and the
         // un-evicted decode case while bounding the read to the actually
         // stored slots once eviction has shrunk the cache.
-        int seqLen = Math.Min(position + 1, cache.Length + 1);
-        float scale = 1.0f / MathF.Sqrt(_headDim);
-        int ctxLen = _ctxLen; int hd = _headDim; int hpkg = _headsPerKvGroup;
+        _ = ownLayer;
+        int endSeq = Math.Min(position + 1, cache.Length + 1);
+        int startSeq = windowSize > 0 ? Math.Max(0, endSeq - windowSize) : 0;
+        float scale = 1.0f / MathF.Sqrt(hd);
+        int ctxLen = _ctxLen; int hpkg = _headsPerKvGroup;
+        // Per-layer K/V stride into the cache slot: when LayerHeadDim is active each
+        // cache page row is _maxKvDim wide but only kvHead*layerHd is populated.
+        int slotStride = _layerHeadDim is not null ? _numKvHeads * _maxHeadDim : _numKvHeads * hd;
+        _ = slotStride;
         var q = _q; var attnOut = _attnOut; var scores = _attnScores;
+        int rl = readLayer; int hdLocal = hd; int startLocal = startSeq;
 
         Parallel.For(0, _numHeads, h =>
         {
             int kvHead = h / hpkg;
-            float* qHead = q + h * hd;
-            float* outHead = attnOut + h * hd;
+            float* qHead = q + h * hdLocal;
+            float* outHead = attnOut + h * hdLocal;
             float* headScores = scores + (long)h * ctxLen;
 
-            for (int t = 0; t < seqLen; t++)
+            int scoreLen = endSeq - startLocal;
+            for (int i = 0; i < scoreLen; i++)
             {
-                float* kVec = cache.KeyAt(layer, t) + kvHead * hd;
-                headScores[t] = SimdKernels.DotF32(qHead, kVec, hd) * scale;
+                int t = startLocal + i;
+                float* kVec = cache.KeyAt(rl, t) + kvHead * hdLocal;
+                headScores[i] = SimdKernels.DotF32(qHead, kVec, hdLocal) * scale;
             }
 
-            SimdKernels.SoftmaxInPlace(headScores, seqLen);
+            SimdKernels.SoftmaxInPlace(headScores, scoreLen);
 
-            for (int d = 0; d < hd; d++) outHead[d] = 0;
+            for (int d = 0; d < hdLocal; d++) outHead[d] = 0;
 
-            for (int t = 0; t < seqLen; t++)
+            for (int i = 0; i < scoreLen; i++)
             {
-                float* vVec = cache.ValueAt(layer, t) + kvHead * hd;
-                float w = headScores[t];
-                if (Fma.IsSupported && hd >= 8)
+                int t = startLocal + i;
+                float* vVec = cache.ValueAt(rl, t) + kvHead * hdLocal;
+                float w = headScores[i];
+                if (Fma.IsSupported && hdLocal >= 8)
                 {
                     var wv = Vector256.Create(w);
                     int d = 0;
-                    for (; d + 8 <= hd; d += 8)
+                    for (; d + 8 <= hdLocal; d += 8)
                     {
                         var o = Avx.LoadVector256(outHead + d);
                         var v = Avx.LoadVector256(vVec + d);
                         Avx.Store(outHead + d, Fma.MultiplyAdd(wv, v, o));
                     }
-                    for (; d < hd; d++)
+                    for (; d < hdLocal; d++)
                         outHead[d] += w * vVec[d];
                 }
                 else
                 {
-                    for (int d = 0; d < hd; d++)
+                    for (int d = 0; d < hdLocal; d++)
                         outHead[d] += w * vVec[d];
                 }
             }
@@ -1339,7 +1540,10 @@ public sealed unsafe class ForwardPass : IForwardPass
     {
         SimdKernels.MatVecDual(_ffnGate, _wGate[layer].DataPtr, _ffnUp, _wUp[layer].DataPtr,
             _normBuf, _intermDim, _embDim, _wGate[layer].DType, _wUp[layer].DType);
-        SimdKernels.SiLuMul(_ffnGate, _ffnUp, _intermDim);
+        if (_hp.FfnActivation == FfnActivation.GeluApprox)
+            SimdKernels.GeluTanhMul(_ffnGate, _ffnUp, _ffnGate, _intermDim);
+        else
+            SimdKernels.SiLuMul(_ffnGate, _ffnUp, _intermDim);
         FusedMatVec(_hidden, _wDown[layer], _ffnGate, _embDim, _intermDim);
     }
 
@@ -1541,6 +1745,15 @@ public sealed unsafe class ForwardPass : IForwardPass
         else
             Dequantize.ToFloat32(data, new Span<float>(buf, count), tensor.DType, count);
 
+        // Gemma family stores RMSNorm weights as (w - 1) so the effective scale is
+        // (1 + stored_w); the trained values cluster near zero so the omitted +1 would
+        // crush activations to near-zero. Detected here by EmbeddingScale > 1 because
+        // that flag is currently Gemma-only (sqrt(EmbeddingDim) embedding scale).
+        if (_hp.EmbeddingScale != 1f)
+        {
+            for (int i = 0; i < count; i++) buf[i] += 1.0f;
+        }
+
         _normCache[tensor.Name] = (nint)buf;
         return buf;
     }
@@ -1554,6 +1767,19 @@ public sealed unsafe class ForwardPass : IForwardPass
         var info = _model.FindTensor(name)
             ?? throw new InvalidOperationException($"Missing tensor: {name}");
         return new TensorRef(name, info, info.DType, _model.GetTensorDataPtr(info));
+    }
+
+    private float LoadScalarF32(string name)
+    {
+        var info = _model.FindTensor(name)
+            ?? throw new InvalidOperationException($"Missing tensor: {name}");
+        var data = _model.GetTensorData(info);
+        float[] buf = new float[1];
+        if (info.DType == DType.Float32)
+            MemoryMarshal.Cast<byte, float>(data).Slice(0, 1).CopyTo(buf);
+        else
+            Dequantize.ToFloat32(data, buf.AsSpan(), info.DType, 1);
+        return buf[0];
     }
 
     private float* LoadBias(string name, int count)
@@ -1613,6 +1839,26 @@ public sealed unsafe class ForwardPass : IForwardPass
         {
             PerHeadRmsNorm(q, _qNorm[layer], _numHeads,   _headDim, _hp.RmsNormEps);
             PerHeadRmsNorm(k, _kNorm[layer], _numKvHeads, _headDim, _hp.RmsNormEps);
+        }
+    }
+
+    /// <summary>
+    /// Per-layer-head-dim QK-norm. <paramref name="k"/> may be null on KV-share layers
+    /// where the K projection didn't run (the source layer already normed its own K).
+    /// </summary>
+    private void ApplyQkNormLayer(float* q, float* k, int layer, int layerHd)
+    {
+        if (_perChannelQkNorm)
+        {
+            PerChannelRmsNorm(q, _qNorm[layer], _numHeads, layerHd, _hp.RmsNormEps);
+            if (k != null)
+                PerChannelRmsNorm(k, _kNorm[layer], _numKvHeads, layerHd, _hp.RmsNormEps);
+        }
+        else
+        {
+            PerHeadRmsNorm(q, _qNorm[layer], _numHeads, layerHd, _hp.RmsNormEps);
+            if (k != null)
+                PerHeadRmsNorm(k, _kNorm[layer], _numKvHeads, layerHd, _hp.RmsNormEps);
         }
     }
 
@@ -1715,6 +1961,9 @@ public sealed unsafe class ForwardPass : IForwardPass
     {
         if (_tqKvCache != null)
             throw new NotSupportedException("PrefillWithCache is not supported when TurboQuant KV cache is enabled.");
+        if (_layerHeadDim is not null)
+            throw new NotSupportedException(
+                "gemma4 per-layer head_dim not yet supported on PrefillWithCache.");
         int N = tokens.Count;
         if (N == 0) throw new ArgumentException("Token list is empty", nameof(tokens));
         if (N == 1 || _hp.IsMoE)
@@ -1742,6 +1991,9 @@ public sealed unsafe class ForwardPass : IForwardPass
             throw new NotSupportedException("BatchForwardMulti is not supported when TurboQuant KV cache is enabled.");
         if (_hp.IsMoE)
             throw new NotSupportedException("BatchForwardMulti is not supported for MoE models; use individual ForwardCore calls.");
+        if (_layerHeadDim is not null)
+            throw new NotSupportedException(
+                "gemma4 per-layer head_dim not yet supported on BatchForwardMulti.");
         int N = tokens.Length;
         if (N == 0) return Array.Empty<float[]>();
         int qDim = _numHeads * _headDim;
@@ -1903,6 +2155,8 @@ public sealed unsafe class ForwardPass : IForwardPass
         NativeMemory.Free(_attnScores);
         NativeMemory.Free(_ropeCosTable);
         NativeMemory.Free(_ropeSinTable);
+        if (_ropeCosTableSwa != null) NativeMemory.Free(_ropeCosTableSwa);
+        if (_ropeSinTableSwa != null) NativeMemory.Free(_ropeSinTableSwa);
 
         foreach (var ptr in _normCache.Values)
             NativeMemory.Free((void*)ptr);
@@ -1912,10 +2166,10 @@ public sealed unsafe class ForwardPass : IForwardPass
         {
             for (int i = 0; i < _hp.NumLayers; i++)
             {
-                NativeMemory.Free(_bq[i]);
-                NativeMemory.Free(_bk[i]);
-                NativeMemory.Free(_bv[i]);
-                NativeMemory.Free(_bo[i]);
+                if (_bq[i] != null) NativeMemory.Free(_bq[i]);
+                if (_bk[i] != null) NativeMemory.Free(_bk[i]);
+                if (_bv[i] != null) NativeMemory.Free(_bv[i]);
+                if (_bo[i] != null) NativeMemory.Free(_bo[i]);
             }
         }
 
