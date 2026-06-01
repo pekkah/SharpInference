@@ -592,6 +592,51 @@ extern ""C"" __global__ void llm_embed_lookup_q5k(
     }
 }
 
+// ── Embedding lookup from Q8_0 table ───────────────────────────────────────
+// Q8_0 block (34 bytes per 32 elements): [d:fp16][qs:32 × int8].
+// One CUDA block of 256 threads dequantizes one row (= emb_dim elements).
+// emb_dim must be a multiple of 256 (8 Q8_0 blocks per outer iteration); this
+// holds for every transformer embedding dim in practice. Each iteration loads
+// 8 Q8_0 blocks (= 272 bytes) into shared memory, then every thread emits one
+// output element from the (block, lane) it owns.
+extern ""C"" __global__ void llm_embed_lookup_q8_0(
+    const unsigned char* __restrict__ emb_data,
+    float* __restrict__ output,
+    int token_id, int emb_dim)
+{
+    __shared__ unsigned char blk[272];   // 8 Q8_0 blocks × 34 bytes
+    unsigned int tid = threadIdx.x;
+
+    int num_blocks = emb_dim >> 5;                   // emb_dim / 32
+    long bytes_per_row = (long)num_blocks * 34L;
+    long row_byte_base = (long)token_id * bytes_per_row;
+
+    int outer_iters = emb_dim >> 8;                  // emb_dim / 256
+    for (int outer = 0; outer < outer_iters; outer++) {
+        long base_byte = row_byte_base + (long)(outer * 8) * 34L;
+        // Cooperative load of 272 bytes (8 blocks) — 256 threads cover all bytes
+        // with one each (272 > 256, last 16 lanes do a second load).
+        if (tid < 272) blk[tid] = emb_data[base_byte + tid];
+        if (tid < 16)  blk[256 + tid] = emb_data[base_byte + 256 + tid];
+        __syncthreads();
+
+        // tid splits into (block_in_outer ∈ 0..7, lane ∈ 0..31).
+        unsigned int block_in_outer = tid >> 5;
+        unsigned int lane           = tid & 31u;
+
+        // d (fp16) lives in bytes [b*34 .. b*34 + 1]; quants in [b*34 + 2 .. b*34 + 33].
+        unsigned int block_off = block_in_outer * 34u;
+        unsigned int d_bits = (unsigned int)blk[block_off]
+                            | ((unsigned int)blk[block_off + 1u] << 8);
+        float d = sharpi_fp16_to_fp32(d_bits);
+
+        int q = (int)(signed char)blk[block_off + 2u + lane];
+        output[outer * 256 + (int)tid] = d * (float)q;
+
+        __syncthreads();
+    }
+}
+
 // ── MatVec F32 ─────────────────────────────────────────────────────────────
 // 256 threads/block, 8 rows/block, 32 threads/row → warp reduce.
 // One grid dim x covers ceil(rows/8) blocks.
@@ -968,6 +1013,54 @@ extern ""C"" __global__ void llm_matvec_q5k(
             acc += (d1 * (float)((int)low4 + hLo) - dm1) * input[elem_lo];
             acc += (d2 * (float)((int)hi4  + hHi) - dm2) * input[elem_hi];
         }
+    }
+
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output[row] = result;
+}
+
+// ── MatVec Q8_0 ────────────────────────────────────────────────────────────
+// Q8_0 block (34 bytes per 32 elements): [d:fp16][qs:32 × int8].
+// Launch geometry mirrors Q5_K/Q6_K: 8 rows/block × 32 threads/row → warp
+// reduce. Each lane (0..31) processes one int8 quant per block, so one full
+// pass over 32 lanes covers a whole 32-element Q8_0 block. cols must be a
+// multiple of 32; this holds for every projection dim in practice.
+//
+// Weights are read through uint32 byte-gather helpers so the kernel works
+// against the uint32-strided UploadRaw layout used by every other quantized
+// matvec in this file. d is decoded inline from two byte gathers to avoid
+// any alignment assumptions on the 34-byte block stride.
+extern ""C"" __global__ void llm_matvec_q8_0(
+    const unsigned int* __restrict__ weights,
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int rows, int cols)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    if (row >= rows) return;
+
+    int num_blocks = cols >> 5;                       // cols / 32
+    long row_base_bytes = (long)row * (long)num_blocks * 34L;
+
+    float acc = 0.f;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long b0 = row_base_bytes + (long)block * 34L;
+
+        // d: FP16 at offset 0..1 of the block (two bytes).
+        unsigned int dlo = sharpi_byte_at(weights, b0 + 0);
+        unsigned int dhi = sharpi_byte_at(weights, b0 + 1);
+        float d = sharpi_fp16_to_fp32(dlo | (dhi << 8));
+
+        // One int8 quant per lane; element offset within the block = lane.
+        int q = sharpi_int8_at(weights, b0 + 2 + (long)lane);
+        float x = input[block * 32 + lane];
+        acc += d * (float)q * x;
     }
 
     float result = sharpi_warp_reduce_sum(acc);

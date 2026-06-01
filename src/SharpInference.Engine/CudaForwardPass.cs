@@ -10,8 +10,8 @@ namespace SharpInference.Engine;
 /// GPU-resident forward pass for dense LLaMA-family transformers driven by the
 /// CUDA backend (cuBLAS + NVRTC compute kernels).
 ///
-/// All weights live in VRAM (Q4_K / Q6_K raw bytes for projection matrices,
-/// FP32 for norm/bias weights). One-token autoregressive decode runs the full
+/// All weights live in VRAM (Q4_K / Q6_K / Q8_0 raw bytes for projection
+/// matrices, FP32 for norm/bias weights). One-token autoregressive decode runs the full
 /// sequence on the GPU: embedding lookup, per-layer attention with paged-stride
 /// KV cache, SwiGLU FFN, output projection, and a single logits download.
 ///
@@ -1142,8 +1142,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         int byteOffset = expertIdx * expertBytes;
         var expertData = data.Slice(byteOffset, expertBytes);
 
-        if (info.DType == DType.Q4_K || info.DType == DType.Q6_K)
+        if (info.DType == DType.Q4_K || info.DType == DType.Q6_K || info.DType == DType.Q8_0)
         {
+            // Q8_0 raw-upload: same Phase-0 motivation as UploadWeight — keep the
+            // 1.0625 byte/elem packed layout on the GPU, dispatch the native
+            // llm_matvec_q8_0 kernel from MatMul. The dequant-to-F32 fallback
+            // below would burn 4× the VRAM per expert.
             var result = _gpu.UploadRaw(expertData, TensorShape.D1(expertData.Length), info.DType, exact: true);
             _weightDTypes[result.Handle] = info.DType;
             return result;
@@ -1176,7 +1180,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             result = _gpu.Upload(floats, TensorShape.D1(floats.Length), exact: true);
             _weightDTypes[result.Handle] = DType.Float32;
         }
-        else if (info.DType == DType.Q4_K || info.DType == DType.Q6_K)
+        else if (info.DType == DType.Q4_K || info.DType == DType.Q6_K || info.DType == DType.Q8_0)
         {
             result = _gpu.UploadRaw(data, TensorShape.D1(data.Length), info.DType, exact: true);
             _weightDTypes[result.Handle] = info.DType;
@@ -1281,7 +1285,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
     private static long EstimateGpuTensorBytes(GgufTensorInfo tensor)
     {
-        if (tensor.DType == DType.Float32 || tensor.DType == DType.Q4_K || tensor.DType == DType.Q6_K)
+        // Raw-upload dtypes (no CPU dequant): tensor lives on GPU at its native byte size,
+        // padded up to the next 4-byte boundary to match UploadRaw's uint32-strided
+        // layout. Q8_0 is included here (Phase 0 of the Gemma-4 plan) — ~1.0625 bytes
+        // per element vs the 4 bytes/elem the F32-fallback path would burn.
+        if (tensor.DType == DType.Float32 || tensor.DType == DType.Q4_K
+            || tensor.DType == DType.Q6_K  || tensor.DType == DType.Q8_0)
             return (tensor.ByteSize + 3) & ~3L;
         return tensor.ElementCount * sizeof(float);
     }

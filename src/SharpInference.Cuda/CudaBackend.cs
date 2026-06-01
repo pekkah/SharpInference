@@ -120,10 +120,15 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _embedLookupF32Kernel;
     private nint   _embedLookupQ4KKernel;
     private nint   _embedLookupQ5KKernel;
+    private nint   _embedLookupQ80Kernel;
     private nint   _matvecF32Kernel;
     private nint   _matvecQ4KKernel;
     private nint   _matvecQ5KKernel;
     private nint   _matvecQ6KKernel;
+    // Q8_0 matvec (Phase 0 of the Gemma-4 plan): keeps Q8_0 weights packed on
+    // the GPU. Without this, Q8_0 weights would dequant to F32 on upload and
+    // blow out VRAM ~2.1×. Geometry mirrors Q5_K/Q6_K (8 rows/block × 32 thr/row).
+    private nint   _matvecQ80Kernel;
     // Issue #43: N=2 (two-input, two-output) variants — read each weight row
     // once and accumulate into two outputs. Used by MTP BatchForward2's
     // on-GPU dense FFN to halve weight-bandwidth cost per output.
@@ -1156,7 +1161,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     ///   • Q4_K → llama.cpp-style int8 / __dp4a path: quantize the input vector
     ///     to Q8_1 once, then dispatch a 1-row-per-block × 4-warp cooperative
     ///     matvec that uses __dp4a for the inner dot products.
-    ///   • Q6_K / F32 → custom fp32 matvec kernels (8 rows / block).
+    ///   • Q5_K / Q6_K / Q8_0 / F32 → custom fp32 matvec kernels (8 rows / block).
     /// Output is FP32 in every case.
     /// </summary>
     public void MatMul(Tensor output, Tensor matrix, Tensor vector, DType weightDType)
@@ -1188,8 +1193,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         {
             DType.Q5_K    => _matvecQ5KKernel,
             DType.Q6_K    => _matvecQ6KKernel,
+            DType.Q8_0    => _matvecQ80Kernel,
             DType.Float32 => _matvecF32Kernel,
-            _ => throw new NotSupportedException($"CUDA MatMul: weight dtype {weightDType} not supported (expected Q4_K, Q5_K, Q6_K, or Float32)."),
+            _ => throw new NotSupportedException($"CUDA MatMul: weight dtype {weightDType} not supported (expected Q4_K, Q5_K, Q6_K, Q8_0, or Float32)."),
         };
 
         uint grid = (uint)((rows + 7) / 8);
@@ -2106,6 +2112,32 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(embed_lookup_q5k) failed: {r}");
     }
 
+    /// <summary>
+    /// Dequantize one row from a Q8_0-packed embedding table directly into <paramref name="output"/>.
+    /// <paramref name="embDim"/> must be a multiple of 256 (8 Q8_0 blocks per outer iteration).
+    /// Phase 0 of the Gemma-4 plan: keeps the (10752, 262144) Q8_0 token-embd table off
+    /// the dequant-to-F32 upload path that would otherwise blow out VRAM.
+    /// </summary>
+    public void EmbedLookupQ8_0(Tensor embTable, Tensor output, int tokenId, int embDim)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if ((embDim & 0xff) != 0)
+            throw new ArgumentException($"EmbedLookupQ8_0 requires embDim to be a multiple of 256 (got {embDim}).");
+
+        nint tP = GetDevPtr(embTable);
+        nint oP = GetDevPtr(output);
+        int  pT = tokenId, pE = embDim;
+        nint* args = stackalloc nint[4]
+        {
+            (nint)(&tP), (nint)(&oP),
+            (nint)(&pT), (nint)(&pE)
+        };
+        int r = NvrtcInterop.LaunchKernel(_embedLookupQ80Kernel, 1, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(embed_lookup_q8_0) failed: {r}");
+    }
+
     /// <summary>Set every element of <paramref name="dst"/> to zero.</summary>
     /// <remarks>
     /// The kernel writes fp32-sized lanes; for sub-fp32 dtypes (e.g. BFloat16)
@@ -2581,7 +2613,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _snapKvScoreKernel, _snapKvScoreBf16Kernel,
             _kvCompactKernel, _kvCompactBf16Kernel,
             _embedLookupF32Kernel, _embedLookupQ4KKernel, _embedLookupQ5KKernel,
+            _embedLookupQ80Kernel,
             _matvecF32Kernel, _matvecQ4KKernel, _matvecQ5KKernel, _matvecQ6KKernel,
+            _matvecQ80Kernel,
             _matvecF32N2Kernel, _matvecQ4KN2Kernel, _matvecQ5KN2Kernel, _matvecQ6KN2Kernel,
             _attentionKernel, _attentionBf16Kernel, _clearF32Kernel, _quantizeQ81Kernel,
             _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
@@ -2630,10 +2664,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _embedLookupF32Kernel  = GetKernelFunc("llm_embed_lookup_f32");
         _embedLookupQ4KKernel  = GetKernelFunc("llm_embed_lookup_q4k");
         _embedLookupQ5KKernel  = GetKernelFunc("llm_embed_lookup_q5k");
+        _embedLookupQ80Kernel  = GetKernelFunc("llm_embed_lookup_q8_0");
         _matvecF32Kernel       = GetKernelFunc("llm_matvec_f32");
         _matvecQ4KKernel       = GetKernelFunc("llm_matvec_q4k");
         _matvecQ5KKernel       = GetKernelFunc("llm_matvec_q5k");
         _matvecQ6KKernel       = GetKernelFunc("llm_matvec_q6k");
+        _matvecQ80Kernel       = GetKernelFunc("llm_matvec_q8_0");
         _matvecF32N2Kernel     = GetKernelFunc("llm_matvec_f32_n2");
         _matvecQ4KN2Kernel     = GetKernelFunc("llm_matvec_q4k_n2");
         _matvecQ5KN2Kernel     = GetKernelFunc("llm_matvec_q5k_n2");
