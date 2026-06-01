@@ -132,6 +132,21 @@ public sealed unsafe class ForwardPass : IForwardPass
     private readonly TensorRef[]? _postFfwNorm;
     private readonly float[]? _layerOutputScale;
 
+    // Gemma 4 Per-Layer-Embedding (PLE) injection. Non-null only when
+    // _hp.HasPerLayerTokenEmbd is true. _pleTokenEmbed stays mmap-resident
+    // (~3 GB Q8_0). _perLayerModelProj is preloaded BF16→F32 once.
+    private readonly TensorRef _pleTokenEmbed;
+    private readonly float* _perLayerModelProj;
+    private readonly TensorRef _perLayerProjNormTensor;
+    private readonly TensorRef[]? _pleInpGate;
+    private readonly TensorRef[]? _plePostProj;
+    private readonly TensorRef[]? _plePostNorm;
+    private readonly int _pleWidth;
+    private readonly float* _pleRowBuf;       // [NumLayers * PleWidth] gathered+dequant per token
+    private readonly float* _projPerLayer;    // [NumLayers * PleWidth] proj_layer cache per token
+    private readonly float* _pleX;            // [PleWidth] inner scratch
+    private readonly float* _pleY;            // [embDim] inner scratch
+
     public ForwardPass(GgufModel model, IComputeBackend backend, ModelHyperparams hp,
         int maxContextLength = 0)
     {
@@ -331,6 +346,47 @@ public sealed unsafe class ForwardPass : IForwardPass
         _outputWeight = model.FindTensor("output.weight") is not null
             ? ResolveTensor("output.weight")
             : _embTensor; // tied embeddings
+
+        if (hp.HasPerLayerTokenEmbd)
+        {
+            if (model.FindTensor("per_layer_token_embd.weight") is null
+                || model.FindTensor("per_layer_model_proj.weight") is null
+                || model.FindTensor("per_layer_proj_norm.weight") is null)
+            {
+                throw new InvalidOperationException(
+                    "ModelHyperparams.HasPerLayerTokenEmbd is true but one or more PLE tensors " +
+                    "(per_layer_token_embd / per_layer_model_proj / per_layer_proj_norm) are missing.");
+            }
+
+            _pleWidth = hp.PerLayerEmbeddingWidth;
+            int stackedDim = L * _pleWidth;
+
+            _pleTokenEmbed = ResolveTensor("per_layer_token_embd.weight");
+
+            var projInfo = model.FindTensor("per_layer_model_proj.weight")!.Value;
+            var projData = model.GetTensorData(projInfo);
+            int projCount = (int)projInfo.ElementCount;
+            _perLayerModelProj = Alloc(projCount);
+            Dequantize.ToFloat32(projData, new Span<float>(_perLayerModelProj, projCount),
+                projInfo.DType, projCount);
+
+            _perLayerProjNormTensor = ResolveTensor("per_layer_proj_norm.weight");
+
+            _pleInpGate = new TensorRef[L];
+            _plePostProj = new TensorRef[L];
+            _plePostNorm = new TensorRef[L];
+            for (int i = 0; i < L; i++)
+            {
+                _pleInpGate[i] = ResolveTensor($"blk.{i}.inp_gate.weight");
+                _plePostProj[i] = ResolveTensor($"blk.{i}.proj.weight");
+                _plePostNorm[i] = ResolveTensor($"blk.{i}.post_norm.weight");
+            }
+
+            _pleRowBuf = Alloc(stackedDim);
+            _projPerLayer = Alloc(stackedDim);
+            _pleX = Alloc(_pleWidth);
+            _pleY = Alloc(_embDim);
+        }
 
         PrefaultWeights();
     }
@@ -1129,6 +1185,9 @@ public sealed unsafe class ForwardPass : IForwardPass
         if (_hp.EmbeddingScale != 1f)
             SimdKernels.ScaleInPlace(_hidden, _hp.EmbeddingScale, _embDim);
 
+        if (_hp.HasPerLayerTokenEmbd)
+            BuildPerLayerProjections(token);
+
         float embNorm = _traceNorms ? L2Norm(_hidden, _embDim) : 0f;
 
         // 2. Transformer layers
@@ -1261,17 +1320,24 @@ public sealed unsafe class ForwardPass : IForwardPass
             else
                 DenseFfn(layer);
 
-            // Gemma 4: per-layer learned output scale + post-FFN RmsNorm before the residual add.
-            if (_layerOutputScale is not null)
-                SimdKernels.ScaleInPlace(_hidden, _layerOutputScale[layer], _embDim);
+            // Gemma 4: post-FFN RmsNorm before the residual add.
             if (_postFfwNorm is not null)
             {
                 var pfNormW = GetNormWeight(_postFfwNorm[layer]);
                 SimdKernels.RmsNorm(_hidden, _hidden, pfNormW, _embDim, _hp.RmsNormEps);
             }
 
-            // Residual
+            // Residual (post-attn output that includes its own residual).
             SimdKernels.AddInPlace(_hidden, _residual, _embDim);
+
+            if (_hp.HasPerLayerTokenEmbd)
+                ApplyPerLayerEmbedding(layer);
+
+            // Gemma 4: per-layer learned output scale applies AFTER the PLE injection
+            // (matches llama.cpp gemma4 build order — applying it before PLE breaks the
+            // residual balance and produces unbounded hidden L2 growth).
+            if (_layerOutputScale is not null)
+                SimdKernels.ScaleInPlace(_hidden, _layerOutputScale[layer], _embDim);
 
             if (_traceNorms) _normTraceFfn![layer] = L2Norm(_hidden, _embDim);
         }
@@ -1700,6 +1766,65 @@ public sealed unsafe class ForwardPass : IForwardPass
     // ================================================================
 
     private void EmbedToken(int token) => EmbedTokenInto(token, _hidden);
+
+    // ================================================================
+    //  Gemma 4 Per-Layer-Embedding (PLE)
+    // ================================================================
+
+    // Token-major layout: per_layer_token_embd shape (PleAll=10752, vocab=262144) stores
+    // one row of length PleAll per token (GGUF dim[0] is row width). Gather + dequant
+    // the row, then per-layer normalise + add projection + scale.
+    private void BuildPerLayerProjections(int token)
+    {
+        int stackedDim = _hp.NumLayers * _pleWidth;
+
+        int bytesPerRow = (stackedDim / DTypeInfo.BlockSize(_pleTokenEmbed.DType))
+                        * DTypeInfo.BytesPerBlock(_pleTokenEmbed.DType);
+        byte* rowPtr = _pleTokenEmbed.DataPtr + (long)token * bytesPerRow;
+        if (_pleTokenEmbed.DType == DType.Float32)
+        {
+            new ReadOnlySpan<float>((float*)rowPtr, stackedDim)
+                .CopyTo(new Span<float>(_pleRowBuf, stackedDim));
+        }
+        else
+        {
+            SimdKernels.DequantRow(rowPtr, _pleRowBuf, stackedDim, _pleTokenEmbed.DType);
+        }
+
+        // Gemma scales every embedding table by sqrt(its hidden dim). The PLE table's
+        // hidden dim is PleWidth (256 → 16×), matching the trunk's sqrt(EmbeddingDim)
+        // scale on token_embd.
+        float pleScale = MathF.Sqrt(_pleWidth);
+        SimdKernels.ScaleInPlace(_pleRowBuf, pleScale, stackedDim);
+
+        SimdKernels.MatVec(_projPerLayer, (byte*)_perLayerModelProj,
+            _hidden, stackedDim, _embDim, DType.Float32);
+
+        float embScale = 1.0f / MathF.Sqrt(_embDim);
+        SimdKernels.ScaleInPlace(_projPerLayer, embScale, stackedDim);
+
+        float invSqrt2 = 1.0f / MathF.Sqrt(2.0f);
+        var projNormW = GetNormWeight(_perLayerProjNormTensor);
+        for (int L = 0; L < _hp.NumLayers; L++)
+        {
+            float* slice = _projPerLayer + (long)L * _pleWidth;
+            SimdKernels.RmsNorm(slice, slice, projNormW, _pleWidth, _hp.RmsNormEps);
+            SimdKernels.AddInPlace(slice, _pleRowBuf + (long)L * _pleWidth, _pleWidth);
+            SimdKernels.ScaleInPlace(slice, invSqrt2, _pleWidth);
+        }
+
+    }
+
+    private void ApplyPerLayerEmbedding(int layer)
+    {
+        float* slice = _projPerLayer + (long)layer * _pleWidth;
+        FusedMatVec(_pleX, _pleInpGate![layer], _hidden, _pleWidth, _embDim);
+        SimdKernels.GeluTanhMul(_pleX, slice, _pleX, _pleWidth);
+        FusedMatVec(_pleY, _plePostProj![layer], _pleX, _embDim, _pleWidth);
+        var postW = GetNormWeight(_plePostNorm![layer]);
+        SimdKernels.RmsNorm(_pleY, _pleY, postW, _embDim, _hp.RmsNormEps);
+        SimdKernels.AddInPlace(_hidden, _pleY, _embDim);
+    }
 
     private void EmbedTokenInto(int token, float* dest)
     {
@@ -2189,6 +2314,15 @@ public sealed unsafe class ForwardPass : IForwardPass
             NativeMemory.Free(_expertGate);
             NativeMemory.Free(_expertUp);
             NativeMemory.Free(_moeDownTemp);
+        }
+
+        if (_hp.HasPerLayerTokenEmbd)
+        {
+            NativeMemory.Free(_perLayerModelProj);
+            NativeMemory.Free(_pleRowBuf);
+            NativeMemory.Free(_projPerLayer);
+            NativeMemory.Free(_pleX);
+            NativeMemory.Free(_pleY);
         }
 
         _kvCache.Dispose();

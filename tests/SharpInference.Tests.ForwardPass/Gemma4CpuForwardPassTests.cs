@@ -63,12 +63,12 @@ public sealed class Gemma4CpuForwardPassTests
         int bosId = ReadIntMetadata(model, "tokenizer.ggml.bos_token_id", fallback: 2);
         int eosId = ReadIntMetadata(model, "tokenizer.ggml.eos_token_id", fallback: 1);
         // Arbitrary mid-vocab token IDs to exercise prefill + multi-position attention.
-        // Greedy variety is NOT asserted here because Phase 3 ships without PLE injection
-        // (deferred to Phase 4 per the implementation plan), so the model may emit a
-        // single repeated token — the coherence helper accordingly only checks finite
-        // logits and non-EOS argmax for the gemma4 case (signals controlled in the
-        // AssertCoherentDecode call below).
+        // With Phase 4 PLE wired the model is expected to produce a varied decode stream,
+        // so variety is asserted via AssertCoherentDecode(requireVariety: true).
         var tokens = new int[] { bosId, 651, 6037, 576, 6081, 603, 1234, 4567, 8901 };
+
+        Assert.True(hp.HasPerLayerTokenEmbd,
+            "gemma4 E4B GGUF must carry per_layer_token_embd for the PLE smoke test.");
 
         using var backend = new CpuBackend();
         using var fwd = new SharpInference.Engine.ForwardPass(model, backend, hp);
@@ -76,7 +76,50 @@ public sealed class Gemma4CpuForwardPassTests
         var logits = fwd.Prefill(tokens);
         Assert.Equal(hp.VocabSize, logits.Length);
 
-        AssertCoherentDecode(fwd, eosId, logits, tokens.Length, hp.VocabSize, requireVariety: false);
+        AssertCoherentDecode(fwd, eosId, logits, tokens.Length, hp.VocabSize, requireVariety: true);
+    }
+
+    [Fact]
+    public void Gemma4_E4B_CpuForward_PleProducesVariety()
+    {
+        // Phase 4 acceptance signal: with PLE correctly injected, greedy decode over
+        // four tokens must produce ≥ 2 distinct token IDs. A degenerate single-token
+        // loop (e.g. <pad> spam) signals broken PLE wiring (wrong row layout, missing
+        // norm offset, wrong scaling, etc.).
+        var path = FindModelPath("gemma-4-E4B-it-Q8_0.gguf");
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        if (!hp.HasPerLayerTokenEmbd) return;
+
+        int bosId = ReadIntMetadata(model, "tokenizer.ggml.bos_token_id", fallback: 2);
+        var tokens = new int[] { bosId, 651, 6037, 576, 6081, 603, 1234, 4567, 8901 };
+
+        using var backend = new CpuBackend();
+        using var fwd = new SharpInference.Engine.ForwardPass(model, backend, hp);
+
+        var logits = fwd.Prefill(tokens);
+
+        Span<int> decoded = stackalloc int[4];
+        decoded[0] = Argmax(logits);
+        int pos = tokens.Length;
+        for (int i = 1; i < decoded.Length; i++)
+        {
+            var step = fwd.Forward(decoded[i - 1], pos++);
+            decoded[i] = Argmax(step);
+        }
+
+        int distinct = 0;
+        for (int i = 0; i < decoded.Length; i++)
+        {
+            bool seen = false;
+            for (int j = 0; j < i; j++) if (decoded[j] == decoded[i]) { seen = true; break; }
+            if (!seen) distinct++;
+        }
+        Assert.True(distinct >= 2,
+            $"PLE-on greedy decode produced only {distinct} distinct token(s) over {decoded.Length} steps " +
+            $"({string.Join(",", decoded.ToArray())}); Phase 4 PLE injection is not producing variety.");
     }
 
     private static int ReadIntMetadata(GgufModel model, string key, int fallback)
