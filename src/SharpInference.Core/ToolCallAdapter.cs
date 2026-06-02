@@ -16,17 +16,40 @@ namespace SharpInference.Core;
 /// open/close-marker model used by the streaming endpoint state machine.
 /// </para>
 /// </summary>
+/// <summary>
+/// Result of <see cref="IToolCallAdapter.Parse"/>: the plain text (complete tool-call blocks
+/// removed), the structured calls in order, and whether the output ended inside an
+/// UNTERMINATED tool-call block — an open marker with no matching close, i.e. the model hit
+/// max_tokens / EOS mid-call. A truncated trailing block is deliberately NOT returned as a
+/// <see cref="Calls"/> entry (it would be a half-parsed, possibly dangerous call); its raw
+/// partial is folded into <see cref="PlainText"/> so the non-streaming endpoints surface it as
+/// text and report a length/max_tokens finish — exactly what the streaming state machine does.
+/// The two-value <see cref="Deconstruct(out string, out IReadOnlyList{ParsedToolCall})"/> keeps
+/// existing <c>(plain, calls) = Parse(...)</c> call sites working unchanged.
+/// </summary>
+public readonly record struct ToolCallParseResult(
+    string PlainText, IReadOnlyList<ParsedToolCall> Calls, bool Truncated)
+{
+    /// <summary>Back-compat deconstruction that ignores <see cref="Truncated"/>.</summary>
+    public void Deconstruct(out string plainText, out IReadOnlyList<ParsedToolCall> calls)
+    {
+        plainText = PlainText;
+        calls = Calls;
+    }
+}
+
 public interface IToolCallAdapter
 {
     /// <summary>Architecture key this adapter handles (e.g. <c>"qwen3moe"</c>).</summary>
     string Architecture { get; }
 
     /// <summary>
-    /// Extracts structured tool calls from a complete model output. Returns the
-    /// plain text (with tool-call blocks stripped) plus the parsed calls in the
-    /// order they appeared. Used by the non-streaming endpoint code paths.
+    /// Extracts structured tool calls from a complete model output. Returns the plain text
+    /// (with complete tool-call blocks stripped), the parsed calls in order, and whether the
+    /// output ended mid-call (see <see cref="ToolCallParseResult"/>). Used by the non-streaming
+    /// endpoint code paths.
     /// </summary>
-    (string PlainText, IReadOnlyList<ParsedToolCall> Calls) Parse(string rawOutput);
+    ToolCallParseResult Parse(string rawOutput);
 
     /// <summary>
     /// Length of the longest open marker this adapter recognises. The streaming
@@ -271,7 +294,7 @@ public sealed class QwenToolCallAdapter(string architecture) : IToolCallAdapter
     public string Architecture { get; } = architecture;
     public int MaxOpenTagLength => OpenMarker.Length;
 
-    public (string PlainText, IReadOnlyList<ParsedToolCall> Calls) Parse(string rawOutput)
+    public ToolCallParseResult Parse(string rawOutput)
     {
         var calls = new List<ParsedToolCall>();
         var plain = new StringBuilder();
@@ -289,14 +312,20 @@ public sealed class QwenToolCallAdapter(string architecture) : IToolCallAdapter
             plain.Append(rawOutput, pos, start - pos);
             int contentStart = start + OpenMarker.Length;
             int end = rawOutput.IndexOf(CloseMarker, contentStart, StringComparison.Ordinal);
-            if (end < 0) break;
+            if (end < 0)
+            {
+                // Unterminated call: surface the partial as text and flag truncation rather
+                // than emitting a half-parsed call.
+                plain.Append(rawOutput, contentStart, rawOutput.Length - contentStart);
+                return new ToolCallParseResult(plain.ToString(), calls, Truncated: true);
+            }
 
             string block = rawOutput[contentStart..end].Trim();
             pos = end + CloseMarker.Length;
             foreach (var c in ParseBlock(block)) calls.Add(c);
         }
 
-        return (plain.ToString(), calls);
+        return new ToolCallParseResult(plain.ToString(), calls, Truncated: false);
     }
 
     public int FindOpenMarker(string buffer, int startSearch, out int contentStart)
@@ -338,7 +367,7 @@ public sealed class QwenCoderToolCallAdapter : IToolCallAdapter
     public string Architecture => "qwen3coder";
     public int MaxOpenTagLength => OpenMarker.Length;
 
-    public (string PlainText, IReadOnlyList<ParsedToolCall> Calls) Parse(string rawOutput)
+    public ToolCallParseResult Parse(string rawOutput)
     {
         var calls = new List<ParsedToolCall>();
         var plain = new StringBuilder();
@@ -355,17 +384,23 @@ public sealed class QwenCoderToolCallAdapter : IToolCallAdapter
 
             plain.Append(rawOutput, pos, start - pos);
             int end = rawOutput.IndexOf(CloseMarker, start, StringComparison.Ordinal);
+            if (end < 0)
+            {
+                // Unterminated <function=...> (no </function>): surface the partial (marker
+                // included, matching the streaming buffer) and flag truncation.
+                plain.Append(rawOutput, start, rawOutput.Length - start);
+                return new ToolCallParseResult(plain.ToString(), calls, Truncated: true);
+            }
+
             // Block must include the <function=> prefix so the parser can read the name.
-            string block = end >= 0
-                ? rawOutput[start..(end + CloseMarker.Length)]
-                : rawOutput[start..];
-            pos = end >= 0 ? end + CloseMarker.Length : rawOutput.Length;
+            string block = rawOutput[start..(end + CloseMarker.Length)];
+            pos = end + CloseMarker.Length;
 
             var call = ToolCallParseHelpers.ParseXmlFunctionBlock(block);
             if (call.HasValue) calls.Add(call.Value);
         }
 
-        return (plain.ToString(), calls);
+        return new ToolCallParseResult(plain.ToString(), calls, Truncated: false);
     }
 
     public int FindOpenMarker(string buffer, int startSearch, out int contentStart)
@@ -412,7 +447,7 @@ public sealed class LlamaToolCallAdapter : IToolCallAdapter
     public string Architecture => "llama";
     public int MaxOpenTagLength => OpenMarker.Length;
 
-    public (string PlainText, IReadOnlyList<ParsedToolCall> Calls) Parse(string rawOutput)
+    public ToolCallParseResult Parse(string rawOutput)
     {
         var calls = new List<ParsedToolCall>();
         var plain = new StringBuilder();
@@ -430,13 +465,19 @@ public sealed class LlamaToolCallAdapter : IToolCallAdapter
             plain.Append(rawOutput, pos, start - pos);
             int contentStart = start + OpenMarker.Length;
             int end = FindEarliest(rawOutput, contentStart, EomMarker, EotMarker, out int afterClose);
-            string block = end >= 0 ? rawOutput[contentStart..end] : rawOutput[contentStart..];
-            pos = afterClose >= 0 ? afterClose : rawOutput.Length;
+            if (end < 0)
+            {
+                // No <|eom_id|>/<|eot_id|> close: surface the partial and flag truncation.
+                plain.Append(rawOutput, contentStart, rawOutput.Length - contentStart);
+                return new ToolCallParseResult(plain.ToString(), calls, Truncated: true);
+            }
 
+            string block = rawOutput[contentStart..end];
+            pos = afterClose;
             foreach (var c in ParseBlock(block)) calls.Add(c);
         }
 
-        return (plain.ToString(), calls);
+        return new ToolCallParseResult(plain.ToString(), calls, Truncated: false);
     }
 
     public int FindOpenMarker(string buffer, int startSearch, out int contentStart)
@@ -500,7 +541,7 @@ public sealed class DeepSeekToolCallAdapter : IToolCallAdapter
     public string Architecture => "deepseek2";
     public int MaxOpenTagLength => OuterOpen.Length;
 
-    public (string PlainText, IReadOnlyList<ParsedToolCall> Calls) Parse(string rawOutput)
+    public ToolCallParseResult Parse(string rawOutput)
     {
         var calls = new List<ParsedToolCall>();
         var plain = new StringBuilder();
@@ -518,13 +559,19 @@ public sealed class DeepSeekToolCallAdapter : IToolCallAdapter
             plain.Append(rawOutput, pos, start - pos);
             int contentStart = start + OuterOpen.Length;
             int end = rawOutput.IndexOf(OuterClose, contentStart, StringComparison.Ordinal);
-            string block = end >= 0 ? rawOutput[contentStart..end] : rawOutput[contentStart..];
-            pos = end >= 0 ? end + OuterClose.Length : rawOutput.Length;
+            if (end < 0)
+            {
+                // No <|tool_calls_end|>: surface the partial and flag truncation.
+                plain.Append(rawOutput, contentStart, rawOutput.Length - contentStart);
+                return new ToolCallParseResult(plain.ToString(), calls, Truncated: true);
+            }
 
+            string block = rawOutput[contentStart..end];
+            pos = end + OuterClose.Length;
             foreach (var c in ParseBlock(block)) calls.Add(c);
         }
 
-        return (plain.ToString(), calls);
+        return new ToolCallParseResult(plain.ToString(), calls, Truncated: false);
     }
 
     public int FindOpenMarker(string buffer, int startSearch, out int contentStart)
@@ -606,7 +653,7 @@ public sealed class Gemma4ToolCallAdapter : IToolCallAdapter
     public string Architecture => "gemma4";
     public int MaxOpenTagLength => OpenMarker.Length;
 
-    public (string PlainText, IReadOnlyList<ParsedToolCall> Calls) Parse(string rawOutput)
+    public ToolCallParseResult Parse(string rawOutput)
     {
         var calls = new List<ParsedToolCall>();
         var plain = new StringBuilder();
@@ -624,14 +671,20 @@ public sealed class Gemma4ToolCallAdapter : IToolCallAdapter
             plain.Append(rawOutput, pos, start - pos);
             int contentStart = start + OpenMarker.Length;
             int end = rawOutput.IndexOf(CloseMarker, contentStart, StringComparison.Ordinal);
-            // Tolerate a missing close marker (model stopped mid-call): take the rest.
-            string block = end >= 0 ? rawOutput[contentStart..end] : rawOutput[contentStart..];
-            pos = end >= 0 ? end + CloseMarker.Length : rawOutput.Length;
+            if (end < 0)
+            {
+                // Model stopped mid-call (no <tool_call|>): surface the partial as text and flag
+                // truncation rather than emitting a half-parsed call. Matches the streaming path.
+                plain.Append(rawOutput, contentStart, rawOutput.Length - contentStart);
+                return new ToolCallParseResult(plain.ToString(), calls, Truncated: true);
+            }
 
+            string block = rawOutput[contentStart..end];
+            pos = end + CloseMarker.Length;
             foreach (var c in ParseBlock(block)) calls.Add(c);
         }
 
-        return (plain.ToString(), calls);
+        return new ToolCallParseResult(plain.ToString(), calls, Truncated: false);
     }
 
     public int FindOpenMarker(string buffer, int startSearch, out int contentStart)

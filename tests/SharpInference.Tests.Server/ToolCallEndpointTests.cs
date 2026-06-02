@@ -337,4 +337,74 @@ public sealed class ToolCallEndpointTests
         Assert.Contains("\"content\":\"!\"", body);
         Assert.Contains("\"finish_reason\":\"stop\"", body);
     }
+
+    // ── Truncated tool call: non-streaming must NOT emit a half-parsed call ─────
+
+    [Fact]
+    public async Task OpenAi_TruncatedToolCall_NonStreaming_ReportsLengthNotToolCalls()
+    {
+        // Model hit max_tokens mid-call: open marker, no </tool_call>.
+        var fake = new FakeInferenceEngine("test-model", [
+            (GenerateChunkKind.Text, "<tool_call>"),
+            (GenerateChunkKind.Text, "{\"name\":\"get_weather\",\"argum"),
+        ]);
+        var client = CreateClient(fake);
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Weather?" } },
+            max_tokens = 8,
+            stream = false,
+            tools = new[] { new
+            {
+                type = "function",
+                function = new { name = "get_weather", description = "Get weather",
+                    parameters = new { type = "object", properties = new { city = new { type = "string" } } } }
+            } }
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+
+        var choice = doc.RootElement.GetProperty("choices")[0];
+        // No complete call → must NOT report tool_calls; truncation surfaces as length.
+        Assert.Equal("length", choice.GetProperty("finish_reason").GetString());
+        var message = choice.GetProperty("message");
+        Assert.False(message.TryGetProperty("tool_calls", out var tc) && tc.ValueKind == JsonValueKind.Array && tc.GetArrayLength() > 0,
+            "a truncated call must not be emitted as a tool_calls entry");
+    }
+
+    [Fact]
+    public async Task Anthropic_TruncatedToolCall_NonStreaming_ReportsMaxTokens()
+    {
+        var fake = new FakeInferenceEngine("test-model", [
+            (GenerateChunkKind.Text, "<tool_call>"),
+            (GenerateChunkKind.Text, "{\"name\":\"get_weather\",\"argum"),
+        ]);
+        var client = CreateClient(fake);
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Weather?" } },
+            max_tokens = 8,
+            stream = false,
+            tools = new[] { new
+            {
+                name = "get_weather", description = "Get weather",
+                input_schema = new { type = "object", properties = new { city = new { type = "string" } } }
+            } }
+        };
+        var response = await client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+
+        Assert.Equal("max_tokens", doc.RootElement.GetProperty("stop_reason").GetString());
+        // No tool_use block should be present.
+        foreach (var block in doc.RootElement.GetProperty("content").EnumerateArray())
+            Assert.NotEqual("tool_use", block.GetProperty("type").GetString());
+    }
 }

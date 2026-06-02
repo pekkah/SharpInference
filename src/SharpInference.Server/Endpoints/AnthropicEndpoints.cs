@@ -140,7 +140,7 @@ public static class AnthropicEndpoints
         }
 
         var rawText = textSb.ToString();
-        var (plainText, toolCalls) = ParseToolCalls(adapter, rawText);
+        var (plainText, toolCalls, truncatedCall) = ParseToolCalls(adapter, rawText);
 
         if (plainText.Length > 0)
             contentList.Add(new AContent("text", Text: plainText));
@@ -157,7 +157,10 @@ public static class AnthropicEndpoints
         if (contentList.Count == 0)
             contentList.Add(new AContent("text", Text: ""));
 
-        var stopReason = toolCalls.Count > 0 ? "tool_use" : "end_turn";
+        // A trailing unterminated tool call was surfaced as text (not a tool_use block); report
+        // max_tokens so the client sees it was cut off. Mirrors the streaming path.
+        var stopReason = toolCalls.Count > 0 ? "tool_use"
+                       : truncatedCall ? "max_tokens" : "end_turn";
 
         var response = new AnthropicMessageResponse(
             msgId, "message", "assistant",
@@ -484,14 +487,14 @@ public static class AnthropicEndpoints
     /// Returns the plain text (with tool-call blocks stripped) and a list of parsed
     /// calls tagged with Anthropic-style <c>toolu_</c> identifiers.
     /// </summary>
-    private static (string text, List<(string id, string name, string argsJson)> toolCalls)
+    private static (string text, List<(string id, string name, string argsJson)> toolCalls, bool truncated)
         ParseToolCalls(IToolCallAdapter adapter, string output)
     {
-        var (plainText, calls) = adapter.Parse(output);
-        var toolCalls = calls
+        var pr = adapter.Parse(output);
+        var toolCalls = pr.Calls
             .Select(c => ($"toolu_{Guid.NewGuid():N}", c.Name, JinjaChatTemplate.SerializeToJson(c.Arguments)))
             .ToList();
-        return (plainText, toolCalls);
+        return (pr.PlainText, toolCalls, pr.Truncated);
     }
 
     /// <summary>

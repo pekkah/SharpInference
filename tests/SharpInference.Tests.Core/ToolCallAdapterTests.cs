@@ -352,14 +352,35 @@ public sealed class ToolCallAdapterTests
     }
 
     [Fact]
-    public void Gemma4_Parse_MissingCloseMarker_StillParses()
+    public void Gemma4_Parse_MissingCloseMarker_IsTruncatedNotEmitted()
     {
-        // Model stopped before emitting <tool_call|>.
+        // Model stopped before emitting <tool_call|>. A truncated call must NOT be emitted as a
+        // complete call (the streaming path surfaces it as text + length); instead Parse flags
+        // truncation and folds the partial into PlainText.
         var a = new Gemma4ToolCallAdapter();
         var raw = "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}";
-        var (_, calls) = a.Parse(raw);
-        Assert.Single(calls);
-        Assert.Equal("Paris", calls[0].Arguments["city"]);
+        var result = a.Parse(raw);
+        Assert.True(result.Truncated);
+        Assert.Empty(result.Calls);
+        Assert.Contains("call:get_weather", result.PlainText);
+        // Back-compat 2-value deconstruction still works.
+        var (plain, calls) = a.Parse(raw);
+        Assert.Empty(calls);
+        Assert.Equal(result.PlainText, plain);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_CompleteCallBeforeTruncated_EmitsCompleteOnly()
+    {
+        // One complete call, then a second that gets cut off → first is emitted, second is
+        // surfaced as text with Truncated=true.
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:a{k:1}<tool_call|><|tool_call>call:b{k:";
+        var result = a.Parse(raw);
+        Assert.True(result.Truncated);
+        Assert.Single(result.Calls);
+        Assert.Equal("a", result.Calls[0].Name);
+        Assert.Contains("call:b", result.PlainText);
     }
 
     [Fact]
