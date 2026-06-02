@@ -2807,6 +2807,81 @@ public static unsafe class SimdKernels
     //  RMS Norm (AVX2)
     // ================================================================
 
+    /// <summary>
+    /// Wide-vector RmsNorm (AVX-512, 16 floats/iter). Falls through to the AVX2 path
+    /// when Avx512F isn't available so callers can use it unconditionally. The
+    /// reduction order differs by ~ULP vs the AVX2 path; only use from forward
+    /// passes whose parity tests target internal-only argmax (Gemma 4) rather than
+    /// byte-exact llama.cpp output (Qwen3.6-MTP — see
+    /// feedback_qkv_matvecdual_breaks_mtp_parity).
+    /// </summary>
+    public static void RmsNormWide(float* output, float* input, float* weight, int size, float eps)
+    {
+        if (Avx512F.IsSupported && size >= 16)
+        {
+            var sumSq = Vector512<float>.Zero;
+            int i = 0;
+            for (; i + 16 <= size; i += 16)
+            {
+                var v = Avx512F.LoadVector512(input + i);
+                sumSq = Avx512F.FusedMultiplyAdd(v, v, sumSq);
+            }
+            float ss = HSum512(sumSq);
+            for (; i < size; i++) ss += input[i] * input[i];
+
+            float scale = 1.0f / MathF.Sqrt(ss / size + eps);
+            var scaleV = Vector512.Create(scale);
+
+            i = 0;
+            for (; i + 16 <= size; i += 16)
+            {
+                var v = Avx512F.LoadVector512(input + i);
+                var w = Avx512F.LoadVector512(weight + i);
+                Avx512F.Store(output + i, Avx512F.Multiply(Avx512F.Multiply(v, scaleV), w));
+            }
+            for (; i < size; i++)
+                output[i] = input[i] * scale * weight[i];
+        }
+        else
+        {
+            RmsNorm(output, input, weight, size, eps);
+        }
+    }
+
+    /// <summary>
+    /// Wide-vector PureRmsNorm (AVX-512, 16 floats/iter). See <see cref="RmsNormWide"/>
+    /// for parity caveats — only use from forward passes whose tests target
+    /// internal-only argmax.
+    /// </summary>
+    public static void PureRmsNormWide(float* output, float* input, int size, float eps)
+    {
+        if (Avx512F.IsSupported && size >= 16)
+        {
+            var sumSq = Vector512<float>.Zero;
+            int i = 0;
+            for (; i + 16 <= size; i += 16)
+            {
+                var v = Avx512F.LoadVector512(input + i);
+                sumSq = Avx512F.FusedMultiplyAdd(v, v, sumSq);
+            }
+            float ss = HSum512(sumSq);
+            for (; i < size; i++) ss += input[i] * input[i];
+
+            float scale = 1.0f / MathF.Sqrt(ss / size + eps);
+            var scaleV = Vector512.Create(scale);
+
+            i = 0;
+            for (; i + 16 <= size; i += 16)
+                Avx512F.Store(output + i, Avx512F.Multiply(Avx512F.LoadVector512(input + i), scaleV));
+            for (; i < size; i++)
+                output[i] = input[i] * scale;
+        }
+        else
+        {
+            PureRmsNorm(output, input, size, eps);
+        }
+    }
+
     public static void RmsNorm(float* output, float* input, float* weight, int size, float eps)
     {
         if (Fma.IsSupported && size >= 8)

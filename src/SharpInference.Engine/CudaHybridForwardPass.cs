@@ -1264,7 +1264,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             {
                 // Final norm + output on CPU.
                 var outNormW = GetCpuNormWeight(_cpuOutputNorm);
-                SimdKernels.RmsNorm(_cpuNormBuf, _cpuHidden, outNormW, _embDim, _hp.RmsNormEps);
+                SimdKernels.RmsNormWide(_cpuNormBuf, _cpuHidden, outNormW, _embDim, _hp.RmsNormEps);
                 fixed (float* logits = _logitsBuf)
                 {
                     SimdKernels.MatVec(logits, _cpuOutputWeight.DataPtr, _cpuNormBuf,
@@ -1464,7 +1464,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
 
         // Pre-attention RmsNorm.
         var normW = GetCpuNormWeight(_cpuAttnNorm[ci]);
-        SimdKernels.RmsNorm(_cpuNormBuf, _cpuHidden, normW, _embDim, _hp.RmsNormEps);
+        SimdKernels.RmsNormWide(_cpuNormBuf, _cpuHidden, normW, _embDim, _hp.RmsNormEps);
 
         // Per-layer head_dim: clear Q/K/V scratch tails so MatVec only fills active rows.
         new Span<float>(_cpuQ, _numHeads * _maxHeadDim).Clear();
@@ -1474,8 +1474,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         SimdKernels.MatVec(_cpuQ, _cpuWq[ci].DataPtr, _cpuNormBuf, qDimL, _embDim, _cpuWq[ci].DType);
         if (!kvShared)
         {
-            SimdKernels.MatVec(_cpuK, _cpuWk[ci].DataPtr, _cpuNormBuf, kvDimL, _embDim, _cpuWk[ci].DType);
-            SimdKernels.MatVec(_cpuV, _cpuWv[ci].DataPtr, _cpuNormBuf, kvDimL, _embDim, _cpuWv[ci].DType);
+            // Fuse K and V via MatVecDual — same row count, same input, FP-order
+            // drift is acceptable on Gemma 4 (internal-only argmax parity test).
+            SimdKernels.MatVecDual(_cpuK, _cpuWk[ci].DataPtr, _cpuV, _cpuWv[ci].DataPtr,
+                _cpuNormBuf, kvDimL, _embDim, _cpuWk[ci].DType, _cpuWv[ci].DType);
         }
 
         if (_hasAttnBias)
@@ -1553,14 +1555,14 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         if (_cpuPostAttnNorm is not null)
         {
             var paNormW = GetCpuNormWeight(_cpuPostAttnNorm[ci]);
-            SimdKernels.RmsNorm(_cpuHidden, _cpuHidden, paNormW, _embDim, _hp.RmsNormEps);
+            SimdKernels.RmsNormWide(_cpuHidden, _cpuHidden, paNormW, _embDim, _hp.RmsNormEps);
         }
         SimdKernels.AddInPlace(_cpuHidden, _cpuResidual, _embDim);
 
         // FFN.
         new Span<float>(_cpuHidden, _embDim).CopyTo(new Span<float>(_cpuResidual, _embDim));
         var ffnNormW = GetCpuNormWeight(_cpuFfnNorm[ci]);
-        SimdKernels.RmsNorm(_cpuNormBuf, _cpuHidden, ffnNormW, _embDim, _hp.RmsNormEps);
+        SimdKernels.RmsNormWide(_cpuNormBuf, _cpuHidden, ffnNormW, _embDim, _hp.RmsNormEps);
         SimdKernels.MatVecDual(_cpuFfnGate, _cpuWGate[ci].DataPtr, _cpuFfnUp, _cpuWUp[ci].DataPtr,
             _cpuNormBuf, _intermDim, _embDim, _cpuWGate[ci].DType, _cpuWUp[ci].DType);
         SimdKernels.GeluTanhMul(_cpuFfnGate, _cpuFfnUp, _cpuFfnGate, _intermDim);
@@ -1570,7 +1572,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         if (_cpuPostFfwNorm is not null)
         {
             var pfNormW = GetCpuNormWeight(_cpuPostFfwNorm[ci]);
-            SimdKernels.RmsNorm(_cpuHidden, _cpuHidden, pfNormW, _embDim, _hp.RmsNormEps);
+            SimdKernels.RmsNormWide(_cpuHidden, _cpuHidden, pfNormW, _embDim, _hp.RmsNormEps);
         }
         SimdKernels.AddInPlace(_cpuHidden, _cpuResidual, _embDim);
 
@@ -1692,7 +1694,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         for (int liIdx = 0; liIdx < L; liIdx++)
         {
             float* slice = _projPerLayer + (long)liIdx * _pleWidth;
-            SimdKernels.RmsNorm(slice, slice, projNormW, _pleWidth, _hp.RmsNormEps);
+            SimdKernels.RmsNormWide(slice, slice, projNormW, _pleWidth, _hp.RmsNormEps);
             SimdKernels.AddInPlace(slice, _pleRowBuf + (long)liIdx * _pleWidth, _pleWidth);
             SimdKernels.ScaleInPlace(slice, invSqrt2, _pleWidth);
         }
@@ -1707,7 +1709,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         SimdKernels.MatVec(_pleY, _cpuPleProj![li].DataPtr, _pleX,
             _embDim, _pleWidth, _cpuPleProj[li].DType);
         var postW = GetCpuNormWeight(_cpuPlePostNorm![li]);
-        SimdKernels.RmsNorm(_pleY, _pleY, postW, _embDim, _hp.RmsNormEps);
+        SimdKernels.RmsNormWide(_pleY, _pleY, postW, _embDim, _hp.RmsNormEps);
         SimdKernels.AddInPlace(_cpuHidden, _pleY, _embDim);
     }
 

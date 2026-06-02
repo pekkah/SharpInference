@@ -18,9 +18,12 @@ if (-not (Test-Path $ModelPath)) {
 $env:SHARPI_MODEL = $ModelPath
 $env:ASPNETCORE_URLS = "http://127.0.0.1:$Port"
 
-# Force CPU backend via SHARPI_BACKEND env var. The default hybrid-CUDA path
-# can't fit Gemma 4 E4B Q8 in 12 GB VRAM and doesn't yet implement the
-# per-layer head_dim trunk, so it produces `<pad>` tokens.
+# Force CPU backend via SHARPI_BACKEND env var. The smoke test targets the
+# server transport (OpenAI + Anthropic endpoints) on a known-good backend; the
+# hybrid-CUDA Gemma 4 trunk now exists (CudaHybridForwardPass.ForwardGemma4)
+# but requires -g <= 22 to keep KV-share source layers on CPU, and the default
+# TierPlanner split would exceed that on a 12 GB card. Switch to "Cuda" with
+# SHARPI_N_GPU_LAYERS=22 when you want to exercise the hybrid path here too.
 $env:SHARPI_BACKEND = "Cpu"
 $env:SHARPI_N_GPU_LAYERS = "0"
 

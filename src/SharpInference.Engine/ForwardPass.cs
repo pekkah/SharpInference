@@ -73,6 +73,13 @@ public sealed unsafe class ForwardPass : IForwardPass
     private readonly bool _perChannelQkNorm;
     private readonly float*[] _qNorm, _kNorm;
 
+    // Wide-vector (AVX-512) RmsNorm fast path. Enabled only when the model has
+    // per-layer head_dim (Gemma 4) — for other models the byte-parity oracles
+    // (e.g. MtpDecoder_GreedyParity_LlamaCpp on Qwen3.6-27B-MTP) are sensitive
+    // to the ~ULP reduction-order shift between the AVX2 and AVX-512 sum-of-
+    // squares paths. See feedback_qkv_matvecdual_breaks_mtp_parity.
+    private readonly bool _useWideNorms;
+
     // MoE (Mixture of Experts) — Phase 5
     private readonly TensorRef[]? _wGateInp;      // router weights [numExperts, embDim] per layer
     private readonly TensorRef[]? _wGateShexp, _wUpShexp, _wDownShexp; // shared expert per layer
@@ -194,6 +201,11 @@ public sealed unsafe class ForwardPass : IForwardPass
         if (_layerHeadDim is not null)
             for (int i = 0; i < hp.NumLayers; i++)
                 if (_layerHeadDim[i] > _maxHeadDim) _maxHeadDim = _layerHeadDim[i];
+
+        // Gemma 4 (per-layer head_dim) gets the wider AVX-512 RmsNorm path because
+        // its parity test is internal CPU-vs-CUDA argmax, which is invariant to the
+        // ~ULP reduction-order difference. Other architectures stick to AVX2.
+        _useWideNorms = _layerHeadDim is not null && Avx512F.IsSupported;
         if (_layerRopeDim is not null)
             for (int i = 0; i < hp.NumLayers; i++)
                 if (_layerRopeDim[i] > maxRopeDim) maxRopeDim = _layerRopeDim[i];
@@ -1224,7 +1236,7 @@ public sealed unsafe class ForwardPass : IForwardPass
 
             // Pre-attention RMS norm
             var normW = GetNormWeight(_attnNorm[layer]);
-            SimdKernels.RmsNorm(_normBuf, _hidden, normW, _embDim, _hp.RmsNormEps);
+            FastRmsNorm(_normBuf, _hidden, normW, _embDim, _hp.RmsNormEps);
 
             // Q projection always runs on the active layer's weights.
             // For per-layer head_dim models the trailing bytes of _q/_k/_v are stale
@@ -1242,8 +1254,23 @@ public sealed unsafe class ForwardPass : IForwardPass
             FusedMatVec(_q, _wq[layer], _normBuf, qDimL, _embDim);
             if (!kvShared)
             {
-                FusedMatVec(_k, _wk[layer], _normBuf, kvDimL, _embDim);
-                FusedMatVec(_v, _wv[layer], _normBuf, kvDimL, _embDim);
+                if (_layerHeadDim is not null)
+                {
+                    // Gemma 4: K and V share row count and dtype — fuse via
+                    // MatVecDual so the row loops interleave and the input
+                    // vector reads amortize. The row-interleave changes the FP
+                    // ordering vs sequential matvecs by ~ULP; gated to the
+                    // per-layer head_dim path because cumulative trunk drift
+                    // breaks Qwen3.6-27B-MTP byte parity (see
+                    // feedback_qkv_matvecdual_breaks_mtp_parity).
+                    SimdKernels.MatVecDual(_k, _wk[layer].DataPtr, _v, _wv[layer].DataPtr,
+                        _normBuf, kvDimL, _embDim, _wk[layer].DType, _wv[layer].DType);
+                }
+                else
+                {
+                    FusedMatVec(_k, _wk[layer], _normBuf, kvDimL, _embDim);
+                    FusedMatVec(_v, _wv[layer], _normBuf, kvDimL, _embDim);
+                }
             }
 
             if (_hasAttnBias)
@@ -1326,7 +1353,7 @@ public sealed unsafe class ForwardPass : IForwardPass
             if (_postAttnNorm is not null)
             {
                 var paNormW = GetNormWeight(_postAttnNorm[layer]);
-                SimdKernels.RmsNorm(_hidden, _hidden, paNormW, _embDim, _hp.RmsNormEps);
+                FastRmsNorm(_hidden, _hidden, paNormW, _embDim, _hp.RmsNormEps);
             }
 
             // Residual
@@ -1339,7 +1366,7 @@ public sealed unsafe class ForwardPass : IForwardPass
 
             // Pre-FFN RMS norm
             var ffnNormW = GetNormWeight(_ffnNorm[layer]);
-            SimdKernels.RmsNorm(_normBuf, _hidden, ffnNormW, _embDim, _hp.RmsNormEps);
+            FastRmsNorm(_normBuf, _hidden, ffnNormW, _embDim, _hp.RmsNormEps);
 
             if (_hp.IsMoE)
                 MoeFfn(layer);
@@ -1350,7 +1377,7 @@ public sealed unsafe class ForwardPass : IForwardPass
             if (_postFfwNorm is not null)
             {
                 var pfNormW = GetNormWeight(_postFfwNorm[layer]);
-                SimdKernels.RmsNorm(_hidden, _hidden, pfNormW, _embDim, _hp.RmsNormEps);
+                FastRmsNorm(_hidden, _hidden, pfNormW, _embDim, _hp.RmsNormEps);
             }
 
             // Residual (post-attn output that includes its own residual).
@@ -1378,7 +1405,7 @@ public sealed unsafe class ForwardPass : IForwardPass
 
         // 3. Final RMS norm
         var outNormW = GetNormWeight(_outputNorm);
-        SimdKernels.RmsNorm(_hidden, _hidden, outNormW, _embDim, _hp.RmsNormEps);
+        FastRmsNorm(_hidden, _hidden, outNormW, _embDim, _hp.RmsNormEps);
 
         float postFinalNorm = _traceNorms ? L2Norm(_hidden, _embDim) : 0f;
 
@@ -1837,7 +1864,7 @@ public sealed unsafe class ForwardPass : IForwardPass
         for (int L = 0; L < _hp.NumLayers; L++)
         {
             float* slice = _projPerLayer + (long)L * _pleWidth;
-            SimdKernels.RmsNorm(slice, slice, projNormW, _pleWidth, _hp.RmsNormEps);
+            FastRmsNorm(slice, slice, projNormW, _pleWidth, _hp.RmsNormEps);
             SimdKernels.AddInPlace(slice, _pleRowBuf + (long)L * _pleWidth, _pleWidth);
             SimdKernels.ScaleInPlace(slice, invSqrt2, _pleWidth);
         }
@@ -1851,7 +1878,7 @@ public sealed unsafe class ForwardPass : IForwardPass
         SimdKernels.GeluTanhMul(_pleX, slice, _pleX, _pleWidth);
         FusedMatVec(_pleY, _plePostProj![layer], _pleX, _embDim, _pleWidth);
         var postW = GetNormWeight(_plePostNorm![layer]);
-        SimdKernels.RmsNorm(_pleY, _pleY, postW, _embDim, _hp.RmsNormEps);
+        FastRmsNorm(_pleY, _pleY, postW, _embDim, _hp.RmsNormEps);
         SimdKernels.AddInPlace(_hidden, _pleY, _embDim);
     }
 
@@ -1879,6 +1906,20 @@ public sealed unsafe class ForwardPass : IForwardPass
     private static void FusedMatVec(float* output, in TensorRef tensor, float* input, int rows, int cols)
     {
         SimdKernels.MatVec(output, tensor.DataPtr, input, rows, cols, tensor.DType);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void FastRmsNorm(float* output, float* input, float* weight, int size, float eps)
+    {
+        if (_useWideNorms) SimdKernels.RmsNormWide(output, input, weight, size, eps);
+        else               SimdKernels.RmsNorm    (output, input, weight, size, eps);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void FastPureRmsNorm(float* output, float* input, int size, float eps)
+    {
+        if (_useWideNorms) SimdKernels.PureRmsNormWide(output, input, size, eps);
+        else               SimdKernels.PureRmsNorm    (output, input, size, eps);
     }
 
     // ================================================================

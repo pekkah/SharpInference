@@ -65,6 +65,20 @@ if (Test-Path $scout) {
     $results += .\scripts\bench-textgen.ps1 -Model $scout -Tag "scout-cuda-hybrid" -NTokens $NTokens -Prompt $Prompt -TimeoutSec 1200 -ExtraArgs @("-g","-1","--backend","cuda")
 }
 
+# Gemma 4 E4B Q8 — 42-layer dense gemma4 with per-layer head_dim, SWA + global
+# attention, PLE. The CUDA full-offload path requires a small context (~512) to
+# fit all 42 layers in 12 GB; the hybrid path can run with -g <= 22 to keep
+# KV-share source layers on CPU. SHARPI_RAW_PROMPT=1 mirrors llama.cpp's
+# `--no-conversation` raw-completion mode used for the parity baseline.
+$gemma4 = "E:\models\gemma-4-E4B-it-Q8_0.gguf"
+if (Test-Path $gemma4) {
+    $env:SHARPI_RAW_PROMPT = "1"
+    $results += .\scripts\bench-textgen.ps1 -Model $gemma4 -Tag "gemma4-cpu"         -NTokens $NTokens -Prompt $Prompt -TimeoutSec 1200
+    $results += .\scripts\bench-textgen.ps1 -Model $gemma4 -Tag "gemma4-cuda"        -NTokens $NTokens -Prompt $Prompt -TimeoutSec 1200 -ExtraArgs @("-g","-1","--backend","cuda","--ctx-size","512")
+    $results += .\scripts\bench-textgen.ps1 -Model $gemma4 -Tag "gemma4-cuda-hybrid" -NTokens $NTokens -Prompt $Prompt -TimeoutSec 1200 -ExtraArgs @("-g","22","--backend","cuda","--ctx-size","2048")
+    Remove-Item Env:\SHARPI_RAW_PROMPT -ErrorAction SilentlyContinue
+}
+
 Write-Host ""
 Write-Host "=== Summary ===" -ForegroundColor Cyan
 $results | Format-Table Tag, PrefillTok, PrefillTps, DecodeTok, DecodeTps, MtpAccept, WallSec, TimedOut -AutoSize

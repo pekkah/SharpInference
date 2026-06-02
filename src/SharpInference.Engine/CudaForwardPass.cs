@@ -727,14 +727,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private readonly double[] _phaseMs = new double[10];
     private readonly long[]   _phaseCount = new long[10];
     private const int PH_EMBED = 0, PH_QKV = 1, PH_ROPE_QKN = 2, PH_KV_ATTN = 3,
-                      PH_O_RES = 4, PH_FFN = 5, PH_FINAL = 6;
+                      PH_O_RES = 4, PH_FFN = 5, PH_FINAL = 6, PH_PLE = 7;
     private static readonly string[] s_phaseName =
-        ["embed", "qkv-matmul", "rope+qknorm", "kv+attn", "o-proj+res", "ffn", "final+download"];
+        ["embed", "qkv-matmul", "rope+qknorm", "kv+attn", "o-proj+res", "ffn", "final+download", "ple"];
 
     /// <inheritdoc/>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
-        if (_isGemma4Like) return ForwardGemma4(token, position);
+        if (_isGemma4Like) return s_profile ? ForwardProfiledGemma4(token, position) : ForwardGemma4(token, position);
 
         if (s_profile) return ForwardProfiled(token, position);
 
@@ -1268,6 +1268,151 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         _phaseMs[idx] += (t1 - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
         _phaseCount[idx]++;
         t0 = t1;
+    }
+
+    /// <summary>
+    /// Per-phase profiled mirror of ForwardGemma4. Buckets per-token GPU time into
+    /// embed / PLE pre-pass / qkv-matmul / rope+qknorm / kv+attn / o-proj+res /
+    /// ffn / final so SHARPI_CUDA_PROFILE=1 can decompose Gemma 4 kernel time.
+    /// Throws on TQ (matches the dense profiler's precondition).
+    /// </summary>
+    private ReadOnlySpan<float> ForwardProfiledGemma4(int token, int position)
+    {
+        if (_tqEnabled)
+            throw new NotSupportedException(
+                "SHARPI_CUDA_PROFILE per-phase profiling is not wired for the TurboQuant path.");
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        long t0 = sw.ElapsedTicks;
+
+        // 1. Embedding lookup + scale.
+        if (_embIsQuantized)
+        {
+            var embDType = _weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K);
+            if (embDType == DType.Q8_0) _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim);
+            else                         _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim);
+        }
+        else _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
+        if (_hp.EmbeddingScale != 1f) _gpu.ScaleInPlace(_hidden, _hp.EmbeddingScale);
+        _gpu.Synchronize();
+        AccPhase(PH_EMBED, sw, ref t0);
+
+        if (_hp.HasPerLayerTokenEmbd)
+        {
+            BuildPerLayerProjectionsGpu(token);
+            _gpu.Synchronize();
+            AccPhase(PH_PLE, sw, ref t0);
+        }
+
+        int L = _hp.NumLayers;
+        for (int layer = 0; layer < L; layer++)
+        {
+            int layerHd = _hp.LayerHeadDim![layer];
+            int qDimL = _numHeads * layerHd;
+            int kvDimL = _numKvHeads * layerHd;
+            int kvSrc = _hp.KvSourceLayer is { } ksl ? ksl[layer] : -1;
+            bool kvShared = kvSrc >= 0;
+            int effLayer = kvShared ? kvSrc : layer;
+            bool isSwa = _hp.IsSwaLayer is { } swa && swa[layer];
+
+            var qView = new Tensor(TensorShape.D1(qDimL), DType.Float32, _q.Handle);
+            var kView = new Tensor(TensorShape.D1(kvDimL), DType.Float32, _k.Handle);
+            var vView = new Tensor(TensorShape.D1(kvDimL), DType.Float32, _v.Handle);
+            var attnOutView = new Tensor(TensorShape.D1(qDimL), DType.Float32, _attnOut.Handle);
+
+            CopyDevice(_residual, _hidden);
+            _gpu.RmsNorm(_normBuf, _hidden, _wAttnNorm[layer], _hp.RmsNormEps);
+
+            GpuMatMul(qView, _wq[layer], _normBuf);
+            if (!kvShared)
+            {
+                GpuMatMul(kView, _wk[layer], _normBuf);
+                GpuMatMul(vView, _wv[layer], _normBuf);
+            }
+            _gpu.Synchronize();
+            AccPhase(PH_QKV, sw, ref t0);
+
+            if (_hasQkNorm && !_hp.UseL2QkNorm)
+            {
+                _gpu.HeadNorm(qView, _wqNorm![layer], _numHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                if (!kvShared)
+                    _gpu.HeadNorm(kView, _wkNorm![layer], _numKvHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+            }
+            float ropeTheta = isSwa ? _ropeThetaSwa : _hp.RopeTheta;
+            if (!isSwa && _gpuRopeFreqs is { } rfTbl)
+            {
+                _gpu.RoPEWithFactors(qView, position, layerHd, ropeTheta, rfTbl);
+                if (!kvShared) _gpu.RoPEWithFactors(kView, position, layerHd, ropeTheta, rfTbl);
+            }
+            else
+            {
+                _gpu.RoPE(qView, position, layerHd, ropeTheta, _hp.IsNeoxRope);
+                if (!kvShared) _gpu.RoPE(kView, position, layerHd, ropeTheta, _hp.IsNeoxRope);
+            }
+            _gpu.Synchronize();
+            AccPhase(PH_ROPE_QKN, sw, ref t0);
+
+            if (!kvShared)
+            {
+                int layerCtx = isSwa && _hp.SlidingWindowSize > 0
+                    ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
+                    : _maxSeqLen;
+                _gpu.KvAppend(kView, vView, _gpuKCache[layer], _gpuVCache[layer], kvDimL, position, layerCtx);
+            }
+            int effLayerCtx = (_hp.IsSwaLayer is { } swaEff && swaEff[effLayer]
+                              && _hp.SlidingWindowSize > 0)
+                ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
+                : _maxSeqLen;
+            if (isSwa)
+                _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
+                    _attnScoresScratch, position, _hp.SlidingWindowSize, layerHd,
+                    _numHeads, _numKvHeads, effLayerCtx);
+            else
+                _gpu.Attention(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
+                    _attnScoresScratch, _numHeads, _numKvHeads, layerHd, position + 1, effLayerCtx);
+            _gpu.Synchronize();
+            AccPhase(PH_KV_ATTN, sw, ref t0);
+
+            GpuMatMul(_hidden, _wo[layer], attnOutView);
+            if (_wPostAttnNorm is not null)
+                _gpu.RmsNorm(_hidden, _hidden, _wPostAttnNorm[layer], _hp.RmsNormEps);
+            _gpu.AddInPlace(_hidden, _residual);
+            _gpu.Synchronize();
+            AccPhase(PH_O_RES, sw, ref t0);
+
+            CopyDevice(_residual, _hidden);
+            _gpu.RmsNorm(_normBuf, _hidden, _wFfnNorm[layer], _hp.RmsNormEps);
+            GpuMatMul(_ffnGate, _wGate[layer], _normBuf);
+            GpuMatMul(_ffnUp,   _wUp[layer],   _normBuf);
+            _gpu.GeluTanhMul(_ffnGate, _ffnUp);
+            GpuMatMul(_hidden, _wDown[layer], _ffnGate);
+            if (_wPostFfwNorm is not null)
+                _gpu.RmsNorm(_hidden, _hidden, _wPostFfwNorm[layer], _hp.RmsNormEps);
+            _gpu.AddInPlace(_hidden, _residual);
+            _gpu.Synchronize();
+            AccPhase(PH_FFN, sw, ref t0);
+
+            if (_hp.HasPerLayerTokenEmbd)
+            {
+                ApplyPerLayerEmbeddingGpu(layer);
+                _gpu.Synchronize();
+                AccPhase(PH_PLE, sw, ref t0);
+            }
+
+            if (_layerOutputScale is not null)
+                _gpu.ScaleInPlace(_hidden, _layerOutputScale[layer]);
+        }
+
+        _gpu.RmsNorm(_hidden, _hidden, _wOutputNorm, _hp.RmsNormEps);
+        GpuMatMul(_logits, _wOutput, _hidden);
+        if (_hp.FinalLogitSoftcap > 0f)
+            _gpu.SoftcapInPlace(_logits, _hp.FinalLogitSoftcap);
+        _gpu.Download(_logits, _logitsBuf);
+        _gpu.Synchronize();
+        AccPhase(PH_FINAL, sw, ref t0);
+
+        _kvLength = Math.Max(_kvLength, position + 1);
+        return _logitsBuf;
     }
 
     /// <summary>Write accumulated per-phase timings to stderr (no-op when profiling disabled).</summary>
