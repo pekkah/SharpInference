@@ -344,6 +344,39 @@ extern ""C"" __global__ void llm_rope_neox(
     x[b] = x0 * s + x1 * c;
 }
 
+// ── RoPE NEOX with per-half-dim freq_factors (Gemma 4 global layers) ──────
+// llama.cpp gemma4.cpp:191 passes `rope_freqs.weight` only for non-SWA layers
+// of Gemma 4 / Gemma-3n: the table is size head_dim/2 and divides each pair's
+// frequency, masking the high-frequency tail to ~identity for long context.
+// Mirrors the CPU `SimdKernels.BuildRopeTable(..., globalFreqFactors)` path.
+extern ""C"" __global__ void llm_rope_neox_with_factors(
+    float* __restrict__ x,
+    int num_heads, int head_dim, int position, float theta,
+    const float* __restrict__ freq_factors)
+{
+    int pair_idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int half_dim = head_dim / 2;
+    int total_pairs = num_heads * half_dim;
+    if (pair_idx >= total_pairs) return;
+
+    int h = pair_idx / half_dim;
+    int i = pair_idx % half_dim;
+
+    float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)head_dim);
+    freq /= freq_factors[i];
+    float angle = (float)position * freq;
+    float c = cosf(angle);
+    float s = sinf(angle);
+
+    int head_base = h * head_dim;
+    int a = head_base + i;
+    int b = head_base + i + half_dim;
+    float x0 = x[a];
+    float x1 = x[b];
+    x[a] = x0 * c - x1 * s;
+    x[b] = x0 * s + x1 * c;
+}
+
 // ── RoPE NEOX partial (rotate dims [0, rope_dim); pass dims [rope_dim, head_dim)) ──
 // qwen35moe rotates only the first 64 of each 256-dim head. The frequency
 // exponent uses `rope_dim` (not `head_dim`) — this matches the CPU reference

@@ -156,6 +156,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     // SWA RoPE freq base (10K for Gemma 4 SWA layers). 0 when no SWA layers.
     private readonly float _ropeThetaSwa;
 
+    // Optional Gemma 4 RoPE frequency-scaling table (size = maxHeadDim/2). Non-null
+    // when `rope_freqs.weight` is present; applied to non-SWA (global) layers only,
+    // mirrors llama.cpp gemma4.cpp:191 and the CPU ForwardPass globalFreqFactors path.
+    private readonly Tensor? _gpuRopeFreqs;
+
     // CPU prefix cache kept only to satisfy IForwardPass.TruncateTo + InferenceEngine
     // prefix-reuse bookkeeping. CUDA cache state advances in lockstep via _kvLength.
     private readonly KvCache _kvCache;
@@ -550,6 +555,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         _wOutput = model.FindTensor("output.weight") is not null
             ? UploadWeight("output.weight")
             : _gpuEmbedding;
+
+        // Gemma 4 / Gemma-3n: optional `rope_freqs.weight` table (size = maxHeadDim/2)
+        // masks the global-layer RoPE high-frequency tail (~identity for long context).
+        // CPU bakes this into its precomputed RoPE table; CUDA applies it live via
+        // `RoPEWithFactors` on non-SWA layers — see ForwardGemma4 dispatch.
+        if (_isGemma4Like
+            && model.FindTensor("rope_freqs.weight") is GgufTensorInfo rfInfo
+            && rfInfo.DType == DType.Float32
+            && rfInfo.ElementCount == _maxHeadDim / 2)
+        {
+            _gpuRopeFreqs = UploadWeight("rope_freqs.weight");
+        }
 
         // ── Gemma 4 PLE plumbing ───────────────────────────────────────────────
         // Per-layer-embedding table (~4.2 GB at Q8_0) MUST stay CPU-resident; the
@@ -962,9 +979,20 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             }
 
             float ropeTheta = isSwa ? _ropeThetaSwa : _hp.RopeTheta;
-            _gpu.RoPE(qView, position, layerHd, ropeTheta, _hp.IsNeoxRope);
-            if (!kvShared)
-                _gpu.RoPE(kView, position, layerHd, ropeTheta, _hp.IsNeoxRope);
+            // Global (non-SWA) layers use rope_freqs.weight to mask high-frequency
+            // pairs; SWA layers use the plain table. Mirrors llama.cpp gemma4.cpp:191.
+            if (!isSwa && _gpuRopeFreqs is { } rfTbl)
+            {
+                _gpu.RoPEWithFactors(qView, position, layerHd, ropeTheta, rfTbl);
+                if (!kvShared)
+                    _gpu.RoPEWithFactors(kView, position, layerHd, ropeTheta, rfTbl);
+            }
+            else
+            {
+                _gpu.RoPE(qView, position, layerHd, ropeTheta, _hp.IsNeoxRope);
+                if (!kvShared)
+                    _gpu.RoPE(kView, position, layerHd, ropeTheta, _hp.IsNeoxRope);
+            }
 
             // KV append on the owning layer only; shared layers read from the
             // source layer's pages via effLayer below.
@@ -1611,30 +1639,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     }
 
     /// <summary>
-    /// Upload an F32 RMSNorm weight tensor with Gemma's (w-1)→(w+1) offset baked
-    /// in when the model is a Gemma-family architecture (signalled by
-    /// <c>hp.EmbeddingScale &gt; 1</c>). Mirrors the CPU
-    /// <c>ForwardPass.GetNormWeight</c> branch.
+    /// Upload an F32 RMSNorm weight tensor. The Gemma GGUF converter already bakes
+    /// the HF "(1 + w)" RMSNorm convention into the stored weights, so we upload
+    /// raw — same as the CPU <c>ForwardPass.GetNormWeight</c> path.
     /// </summary>
-    private Tensor UploadNormWeight(string name)
-    {
-        var info = _model.FindTensor(name)
-            ?? throw new InvalidOperationException($"Missing tensor: {name}");
-        if (_hp.EmbeddingScale == 1f)
-            return UploadWeight(name);
-
-        var data = _model.GetTensorData(info);
-        int count = (int)info.ElementCount;
-        var f32 = new float[count];
-        if (info.DType == DType.Float32)
-            MemoryMarshal.Cast<byte, float>(data).Slice(0, count).CopyTo(f32);
-        else
-            Dequantize.ToFloat32(data, f32, info.DType, count);
-        for (int i = 0; i < count; i++) f32[i] += 1.0f;
-        var result = _gpu.Upload(f32, TensorShape.D1(count), exact: true);
-        _weightDTypes[result.Handle] = DType.Float32;
-        return result;
-    }
+    private Tensor UploadNormWeight(string name) => UploadWeight(name);
 
     private Tensor UploadWeight(string name)
     {
@@ -1986,6 +1995,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         if (_gpuProjPerLayer is { } ppl) _gpu.Free(ppl);
         if (_gpuPleX         is { } px) _gpu.Free(px);
         if (_gpuPleY         is { } py) _gpu.Free(py);
+
+        if (_gpuRopeFreqs    is { } rf) _gpu.Free(rf);
 
         _kvCache.Dispose();
     }

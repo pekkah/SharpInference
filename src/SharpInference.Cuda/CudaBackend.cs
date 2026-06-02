@@ -101,6 +101,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _ropeInterleavedKernel;
     private nint   _ropeNeoxKernel;
     private nint   _ropeNeoxPartialKernel;
+    private nint   _ropeNeoxWithFactorsKernel;
     private nint   _mulKernel;
     private nint   _sigmoidMulInPlaceKernel;
     private nint   _splitQgKernel;
@@ -1673,6 +1674,44 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>
+    /// NEOX RoPE with per-half-dim frequency factors (Gemma 4 global layers /
+    /// Gemma-3n). <paramref name="freqFactors"/> is a <c>head_dim/2</c> F32 device
+    /// vector that divides each pair's frequency; mirrors llama.cpp
+    /// <c>gemma4.cpp:191</c> passing <c>rope_freqs.weight</c> only for non-SWA
+    /// layers and the CPU <see cref="Cpu.SimdKernels.BuildRopeTable"/>
+    /// globalFreqFactors path.
+    /// </summary>
+    public void RoPEWithFactors(Tensor x, int position, int headDim, float ropeTheta, Tensor freqFactors)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (headDim <= 0 || (headDim & 1) != 0)
+            throw new ArgumentException("headDim must be a positive even number.", nameof(headDim));
+        if (freqFactors.ElementCount != headDim / 2)
+            throw new ArgumentException(
+                $"RoPEWithFactors: freqFactors length {freqFactors.ElementCount} != headDim/2 ({headDim / 2}).",
+                nameof(freqFactors));
+
+        int numHeads = (int)(x.ElementCount / headDim);
+        int totalPairs = numHeads * (headDim / 2);
+
+        nint xPtr = GetDevPtr(x);
+        nint fPtr = GetDevPtr(freqFactors);
+        int  pNH = numHeads, pHD = headDim, pPos = position;
+        float pT = ropeTheta;
+        nint* args = stackalloc nint[6]
+        {
+            (nint)(&xPtr),
+            (nint)(&pNH), (nint)(&pHD), (nint)(&pPos), (nint)(&pT),
+            (nint)(&fPtr)
+        };
+        uint grid = (uint)((totalPairs + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_ropeNeoxWithFactorsKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(rope_neox_with_factors) failed: {r}");
+    }
+
+    /// <summary>
     /// Fused <c>x[i] *= sigmoid(gate[i])</c> in-place. Replaces a Sigmoid + ElementwiseMul
     /// pair for the qwen35moe GLU attention gate.
     /// </summary>
@@ -2695,6 +2734,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _addScaledKernel, _clampKernel, _pshuffleKernel, _punshuffleKernel, _upsample2xKernel,
             _rmsNormKernel, _headNormKernel, _headNormPureKernel, _siluMulKernel, _sigmoidKernel,
             _softmaxKernel, _ropeInterleavedKernel, _ropeNeoxKernel, _ropeNeoxPartialKernel,
+            _ropeNeoxWithFactorsKernel,
             _mulKernel, _sigmoidMulInPlaceKernel, _splitQgKernel, _kvAppendKernel,
             _kvAppendBf16Kernel,
             _snapKvScoreKernel, _snapKvScoreBf16Kernel,
@@ -2741,6 +2781,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _ropeInterleavedKernel = GetKernelFunc("llm_rope_interleaved");
         _ropeNeoxKernel        = GetKernelFunc("llm_rope_neox");
         _ropeNeoxPartialKernel = GetKernelFunc("llm_rope_neox_partial");
+        _ropeNeoxWithFactorsKernel = GetKernelFunc("llm_rope_neox_with_factors");
         _mulKernel             = GetKernelFunc("llm_mul");
         _sigmoidMulInPlaceKernel = GetKernelFunc("llm_sigmoid_mul_inplace");
         _splitQgKernel         = GetKernelFunc("llm_split_qg");
