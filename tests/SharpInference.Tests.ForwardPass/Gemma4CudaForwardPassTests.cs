@@ -181,6 +181,85 @@ public sealed class Gemma4CudaForwardPassTests
         }
     }
 
+    /// <summary>
+    /// Long-decode variety check vs the "degenerate 2-cycle" failure mode that
+    /// a 4-step variety test misses: an attention scale mismatch (kernel
+    /// applies 1/sqrt(head_dim) but Gemma 4 wants 1.0) produces a correct
+    /// first-decode argmax then collapses into a 2-token repeat ("the of the
+    /// of of of..."). Real coherent output produces ≥8 distinct tokens in a
+    /// 16-step decode; the bug produces ≤3. The first 4 tokens are also
+    /// checked against the CPU reference for exact-match, which catches the
+    /// failure before drift kicks in.
+    /// </summary>
+    [Fact]
+    public void Gemma4_E4B_CudaForward_LongDecodeIsCoherent()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.NotNull(hp.LayerHeadDim);
+
+        int bosId = ReadIntMetadata(model, "tokenizer.ggml.bos_token_id", fallback: 2);
+        var tokens = new int[] { bosId, 818, 5279, 529, 7001, 563 }; // "The capital of France is"
+
+        // CPU reference for the first 4 decode tokens — pre-drift the argmax
+        // should match across CPU and CUDA.
+        var cpuFirst4 = new int[4];
+        using (var cpuBackend = new CpuBackend())
+        using (var cpuFwd = new SharpInference.Engine.ForwardPass(model, cpuBackend, hp))
+        {
+            var logits = cpuFwd.Prefill(tokens);
+            cpuFirst4[0] = Argmax(logits);
+            int pos = tokens.Length;
+            for (int i = 1; i < cpuFirst4.Length; i++)
+            {
+                var step = cpuFwd.Forward(cpuFirst4[i - 1], pos++);
+                cpuFirst4[i] = Argmax(step);
+            }
+        }
+
+        // CUDA long decode.
+        const int NSteps = 16;
+        var cudaDecoded = new int[NSteps];
+        using (var cudaFwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 512))
+        {
+            var logits = cudaFwd.Prefill(tokens);
+            cudaDecoded[0] = Argmax(logits);
+            int pos = tokens.Length;
+            for (int i = 1; i < cudaDecoded.Length; i++)
+            {
+                var step = cudaFwd.Forward(cudaDecoded[i - 1], pos++);
+                cudaDecoded[i] = Argmax(step);
+            }
+        }
+
+        // First 4 should match CPU exactly — drift hasn't built up yet.
+        for (int i = 0; i < cpuFirst4.Length; i++)
+            Assert.True(cpuFirst4[i] == cudaDecoded[i],
+                $"CPU/CUDA diverge at decode step {i}: CPU={cpuFirst4[i]} CUDA={cudaDecoded[i]}. " +
+                $"Full CUDA decode: [{string.Join(",", cudaDecoded)}]. " +
+                "Likely an attention scale / RoPE / KV-cache mismatch — the kind that lets " +
+                "first-argmax parity pass while the decode loop degenerates.");
+
+        // ≥8 distinct tokens out of 16 — coherent output never collapses to a
+        // 2-cycle repeat, but a partial repeat (e.g. "the X the Y the Z") is
+        // still allowed by greedy sampling on a short factual prompt.
+        int distinct = 0;
+        for (int i = 0; i < cudaDecoded.Length; i++)
+        {
+            bool seen = false;
+            for (int j = 0; j < i; j++) if (cudaDecoded[j] == cudaDecoded[i]) { seen = true; break; }
+            if (!seen) distinct++;
+        }
+        Assert.True(distinct >= 8,
+            $"CUDA 16-step decode collapsed to {distinct} distinct token(s): " +
+            $"[{string.Join(",", cudaDecoded)}]. Output is degenerate.");
+    }
+
     private static int[] TopK(ReadOnlySpan<float> logits, int k)
     {
         var result = new int[k];

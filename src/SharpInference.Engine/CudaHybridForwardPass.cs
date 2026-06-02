@@ -1364,6 +1364,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
             : _maxSeqLen;
 
+        // Gemma 4: attention_scale = 1.0. Pre-scale Q by sqrt(head_dim) so the
+        // kernel's implicit rsqrtf(head_dim) cancels.
+        _gpu.ScaleInPlace(qView, MathF.Sqrt(layerHd));
+
         if (isSwa)
         {
             _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,

@@ -1010,6 +1010,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
                 : _maxSeqLen;
 
+            // Gemma 4 uses attention_scale = 1.0 (no 1/sqrt(head_dim) prefactor); the
+            // CUDA attention kernels bake `rsqrtf(head_dim)` in unconditionally. Pre-
+            // scale the query by sqrt(head_dim) so the kernel's implicit scale cancels
+            // out — mirrors the CPU path's `_layerHeadDim is not null ? 1f : 1/sqrt(hd)`
+            // in ForwardPass.Attention.
+            _gpu.ScaleInPlace(qView, MathF.Sqrt(layerHd));
+
             if (isSwa)
             {
                 _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
@@ -1363,6 +1370,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                               && _hp.SlidingWindowSize > 0)
                 ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
                 : _maxSeqLen;
+            _gpu.ScaleInPlace(qView, MathF.Sqrt(layerHd));
             if (isSwa)
                 _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                     _attnScoresScratch, position, _hp.SlidingWindowSize, layerHd,
