@@ -94,6 +94,55 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     private readonly float* _ropeSinTable;
     private readonly int _ropeHalfDim;
 
+    // ── Gemma 4 plumbing ──────────────────────────────────────────────────
+    // Mirrors CudaForwardPass and ForwardPass: per-layer head_dim variance, dual
+    // RoPE (10K SWA / 1M global), KV-share alias dispatch, SWA-vs-full attention
+    // split, post-attn/post-ffw norms, layer_output_scale, PLE injection, final
+    // softcap, GeluTanh activation. _isGemma4Like is the master switch.
+    private readonly bool _isGemma4Like;
+    private readonly int _maxHeadDim;
+    private readonly float _ropeThetaSwa;
+    // SWA cos/sin tables — built at the SWA layers' RoPE dim (typically 256 → halfDim=128).
+    private readonly float* _ropeCosTableSwa;
+    private readonly float* _ropeSinTableSwa;
+    private readonly int _ropeHalfDimSwa;
+    // Per-layer global-RoPE frequency factors (rope_freqs.weight, size maxHeadDim/2);
+    // CPU bakes them into _ropeCosTable/_ropeSinTable, GPU applies via RoPEWithFactors.
+    private readonly float[]? _globalFreqFactors;
+    private readonly Tensor? _gpuRopeFreqs;
+    // KV-share layer set per tier — Append is skipped and reads route to the source
+    // layer's pages. Mirrors CudaForwardPass._kvAliasedLayers. The constructor enforces
+    // that all shared-KV source layers live on the CPU side so cross-tier reads never
+    // happen (see Gemma4ValidateHybridSplit).
+    private readonly HashSet<int> _gpuKvAliasedLayers = new();
+
+    // Per-layer post-norms (Gemma 4) — same length as the tier's layer count.
+    private readonly Tensor[]? _gpuPostAttnNorm, _gpuPostFfwNorm;
+    private readonly CpuWeightRef[]? _cpuPostAttnNorm, _cpuPostFfwNorm;
+
+    // Per-layer scalar gain applied AFTER the PLE injection (matches llama.cpp order).
+    private readonly float[]? _layerOutputScale;
+
+    // Gemma 4 PLE: table is CPU-resident (~4.2 GB at Q8_0 for E4B), per-layer
+    // projections are uploaded to GPU once. BuildPerLayerProjectionsCpu computes the
+    // 42×256 per-layer-slice array on CPU each token; CPU layers consume it directly,
+    // GPU layers consume an uploaded copy.
+    private readonly CpuWeightRef? _pleTokenEmbed;
+    private readonly float[]? _perLayerModelProjF32;
+    private readonly CpuWeightRef? _perLayerProjNorm;
+    private readonly CpuWeightRef[]? _cpuInpGate, _cpuPleProj, _cpuPlePostNorm;
+    private readonly Tensor[]? _gpuInpGate, _gpuPleProj, _gpuPlePostNorm;
+    // Per-token PLE scratch (CPU).
+    private readonly float* _pleRowBuf;       // [stackedDim = numLayers * pleWidth] f32
+    private readonly float* _projPerLayer;    // [stackedDim] f32 — per-layer projection cache
+    private readonly float* _pleX;            // [pleWidth] f32
+    private readonly float* _pleY;            // [embDim]  f32
+    // Per-token PLE scratch (GPU) — slice upload + on-GPU injection.
+    private readonly Tensor? _gpuPleSliceUp;  // [pleWidth] f32, uploaded per GPU layer
+    private readonly Tensor? _gpuPleX;        // [pleWidth] f32
+    private readonly Tensor? _gpuPleY;        // [embDim] f32
+    private readonly int _pleWidth;
+
     // ── Expert slot cache (MoE GPU layers, lazy/evictable expert loading) ──
     // Routed experts for GPU-tier MoE layers are streamed through this SLRU cache
     // (mirror of CudaHybridGdnForwardPass), rather than every expert being uploaded
@@ -149,6 +198,27 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         _hasQkNorm = hp.HasQkNorm;
         _isMoE = hp.IsMoE;
         _hasSharedExpert = hp.HasSharedExpert;
+
+        // Gemma 4 / per-layer head_dim path. _maxHeadDim sizes the Q/K/V/attnOut
+        // scratch buffers and the CPU KV cache row width; per-layer views carve out
+        // the active head_dim each layer. _ropeThetaSwa drives the SWA RoPE table.
+        _isGemma4Like = hp.LayerHeadDim is not null;
+        _maxHeadDim = _headDim;
+        if (hp.LayerHeadDim is { } lhdMax)
+            for (int i = 0; i < hp.NumLayers; i++)
+                if (lhdMax[i] > _maxHeadDim) _maxHeadDim = lhdMax[i];
+        _ropeThetaSwa = hp.RopeThetaSwa;
+        if (_isGemma4Like && _isMoE)
+            throw new NotSupportedException(
+                "CudaHybridForwardPass does not yet support MoE Gemma-style models. " +
+                "(The dense Gemma 4 path is supported; an MoE variant would need separate plumbing.)");
+        if (_isGemma4Like && enableTq)
+            throw new NotSupportedException(
+                "CudaHybridForwardPass + TurboQuant is not supported for per-layer head_dim " +
+                "architectures (e.g. Gemma 4). Disable --tq.");
+        if (_isGemma4Like)
+            Gemma4ValidateHybridSplit(hp, _nGpuLayers);
+
         bool cpuEmbeddingOutputOnly = ShouldKeepFixedWeightsOnCpu(
             model.FindTensor("token_embd.weight")!.Value,
             model.FindTensor("output.weight"));
@@ -170,13 +240,15 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         TraceVram("constructor entry");
 
         // ── Allocate GPU scratch buffers ──
+        // Q/K/V/attnOut are sized to _maxHeadDim so per-layer view tensors can carve
+        // out the active head_dim on Gemma 4 (256 SWA / 512 global).
         _gpuHidden = gpu.Allocate(TensorShape.D1(_embDim));
         _gpuResidual = gpu.Allocate(TensorShape.D1(_embDim));
         _gpuNormBuf = gpu.Allocate(TensorShape.D1(_embDim));
-        _gpuQ = gpu.Allocate(TensorShape.D1(_numHeads * _headDim));
-        _gpuK = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
-        _gpuV = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
-        _gpuAttnOut = gpu.Allocate(TensorShape.D1(_numHeads * _headDim));
+        _gpuQ = gpu.Allocate(TensorShape.D1((long)_numHeads * _maxHeadDim));
+        _gpuK = gpu.Allocate(TensorShape.D1((long)_numKvHeads * _maxHeadDim));
+        _gpuV = gpu.Allocate(TensorShape.D1((long)_numKvHeads * _maxHeadDim));
+        _gpuAttnOut = gpu.Allocate(TensorShape.D1((long)_numHeads * _maxHeadDim));
         // For MoE the dense FFN path is unreachable, so size scratch tightly to the
         // expert intermediate dim. Vulkan tolerates the over-allocation via
         // robustBufferAccess (OOB reads return 0); CUDA's Q4_K matvec doesn't —
@@ -236,6 +308,9 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
 
         if (_hasAttnBias) { _gpuBq = new Tensor[_nGpuLayers]; _gpuBk = new Tensor[_nGpuLayers]; _gpuBv = new Tensor[_nGpuLayers]; _gpuBo = new Tensor[_nGpuLayers]; }
         if (_hasQkNorm) { _gpuQNorm = new Tensor[_nGpuLayers]; _gpuKNorm = new Tensor[_nGpuLayers]; }
+        // Gemma 4 per-layer post-norms (sized to GPU layer count; null for non-gemma4).
+        if (_isGemma4Like && hp.HasPostAttnNorm) _gpuPostAttnNorm = new Tensor[_nGpuLayers];
+        if (_isGemma4Like && hp.HasPostFfwNorm)  _gpuPostFfwNorm  = new Tensor[_nGpuLayers];
 
         int kvDim = _numKvHeads * _headDim;
         _gpuKCache = new Tensor[_nGpuLayers];
@@ -270,12 +345,24 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         Console.Error.Write($"[HybridForwardPass] Uploading {_nGpuLayers} GPU layers...");
         for (int i = 0; i < _nGpuLayers; i++)
         {
+            bool kvShared = _isGemma4Like && hp.KvSourceLayer is { } ksl && ksl[i] >= 0;
             _gpuAttnNorm[i] = UploadWeight($"blk.{i}.attn_norm.weight");
             _gpuWq[i] = UploadWeight($"blk.{i}.attn_q.weight");
+            // KV-share layers (Gemma 4 tail) carry no attn_k/attn_v of their own.
+            // Validated above that all such layers live on the CPU side, so we never
+            // hit this branch in the GPU loop — assert with a helpful message.
+            if (kvShared)
+                throw new InvalidOperationException(
+                    $"GPU layer {i} is KV-shared with source layer {hp.KvSourceLayer![i]}; " +
+                    "Gemma4ValidateHybridSplit should have rejected this configuration.");
             _gpuWk[i] = UploadWeight($"blk.{i}.attn_k.weight");
             _gpuWv[i] = UploadWeight($"blk.{i}.attn_v.weight");
             _gpuWo[i] = UploadWeight($"blk.{i}.attn_output.weight");
             _gpuFfnNorm[i] = UploadWeight($"blk.{i}.ffn_norm.weight");
+            if (_gpuPostAttnNorm is not null)
+                _gpuPostAttnNorm[i] = UploadWeight($"blk.{i}.post_attention_norm.weight");
+            if (_gpuPostFfwNorm is not null)
+                _gpuPostFfwNorm[i]  = UploadWeight($"blk.{i}.post_ffw_norm.weight");
             if (_isMoE)
             {
                 _gpuWGateInp![i]  = UploadWeight($"blk.{i}.ffn_gate_inp.weight");
@@ -319,8 +406,16 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             }
             else
             {
-                _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
-                _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim));
+                // Gemma 4: each GPU layer sizes its KV cache by per-layer head_dim and
+                // (for SWA layers) caps at SlidingWindowSize. Non-gemma4 stays at the
+                // model-wide head_dim × full context.
+                int layerHd = _isGemma4Like ? hp.LayerHeadDim![i] : _headDim;
+                int layerKvDim = _numKvHeads * layerHd;
+                int layerCtx = (_isGemma4Like && hp.IsSwaLayer is { } swa && swa[i] && hp.SlidingWindowSize > 0)
+                    ? Math.Min(_maxSeqLen, hp.SlidingWindowSize)
+                    : _maxSeqLen;
+                _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)layerCtx * layerKvDim));
+                _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)layerCtx * layerKvDim));
             }
             Console.Error.Write(".");
         }
@@ -376,13 +471,15 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         }
 
         // ── Resolve CPU weights (layers nGpuLayers..numLayers-1) ──
+        // Per-layer head_dim path widens Q/K/V/attnOut scratch to _maxHeadDim so the
+        // per-layer views can carve out the active head_dim each layer.
         _cpuHidden = Alloc(_embDim);
         _cpuResidual = Alloc(_embDim);
         _cpuNormBuf = Alloc(_embDim);
-        _cpuQ = Alloc(_numHeads * _headDim);
-        _cpuK = Alloc(_numKvHeads * _headDim);
-        _cpuV = Alloc(_numKvHeads * _headDim);
-        _cpuAttnOut = Alloc(_numHeads * _headDim);
+        _cpuQ = Alloc(_numHeads * _maxHeadDim);
+        _cpuK = Alloc(_numKvHeads * _maxHeadDim);
+        _cpuV = Alloc(_numKvHeads * _maxHeadDim);
+        _cpuAttnOut = Alloc(_numHeads * _maxHeadDim);
         _cpuFfnGate = Alloc(_intermDim);
         _cpuFfnUp = Alloc(_intermDim);
         _cpuAttnScores = Alloc(_numHeads * _maxSeqLen);
@@ -392,11 +489,44 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         _cpuExpertUp = _isMoE ? Alloc(_expertDim) : null;
         _cpuMoeDownTemp = _isMoE ? Alloc(_embDim) : null;
 
-        // Precompute RoPE cos/sin tables for CPU layers
-        _ropeHalfDim = _headDim / 2;
+        // Precompute RoPE cos/sin tables for CPU layers. Gemma 4 builds two: the
+        // primary table at the (max) head_dim / RopeTheta (1M), the SWA table at the
+        // SWA layers' head_dim / RopeThetaSwa (10K). When `rope_freqs.weight` exists
+        // it bakes into the primary table so ApplyRoPECachedNeox matches llama.cpp's
+        // RoPEWithFactors path for the global layers.
+        _ropeHalfDim = _maxHeadDim / 2;
         _ropeCosTable = (float*)NativeMemory.Alloc((nuint)((long)_maxSeqLen * _ropeHalfDim * sizeof(float)));
         _ropeSinTable = (float*)NativeMemory.Alloc((nuint)((long)_maxSeqLen * _ropeHalfDim * sizeof(float)));
-        SimdKernels.BuildRopeTable(_ropeCosTable, _ropeSinTable, _maxSeqLen, _headDim, hp.RopeTheta);
+        if (_isGemma4Like
+            && model.FindTensor("rope_freqs.weight") is GgufTensorInfo rfInfo
+            && rfInfo.DType == DType.Float32
+            && rfInfo.ElementCount == _maxHeadDim / 2)
+        {
+            var rfData = model.GetTensorData(rfInfo);
+            _globalFreqFactors = new float[_maxHeadDim / 2];
+            MemoryMarshal.Cast<byte, float>(rfData).Slice(0, _globalFreqFactors.Length)
+                .CopyTo(_globalFreqFactors);
+            fixed (float* ff = _globalFreqFactors)
+                SimdKernels.BuildRopeTable(_ropeCosTable, _ropeSinTable,
+                    _maxSeqLen, _maxHeadDim, hp.RopeTheta, ff);
+        }
+        else
+        {
+            SimdKernels.BuildRopeTable(_ropeCosTable, _ropeSinTable, _maxSeqLen, _maxHeadDim, hp.RopeTheta);
+        }
+        if (_isGemma4Like)
+        {
+            // SWA table — sized to the smallest SWA-layer head_dim (256 on E4B).
+            int swaHd = _maxHeadDim;
+            if (hp.LayerHeadDim is { } lhdSwa && hp.IsSwaLayer is { } swaMask)
+                for (int li = 0; li < hp.NumLayers; li++)
+                    if (swaMask[li]) swaHd = Math.Min(swaHd, lhdSwa[li]);
+            _ropeHalfDimSwa = swaHd / 2;
+            _ropeCosTableSwa = (float*)NativeMemory.Alloc((nuint)((long)_maxSeqLen * _ropeHalfDimSwa * sizeof(float)));
+            _ropeSinTableSwa = (float*)NativeMemory.Alloc((nuint)((long)_maxSeqLen * _ropeHalfDimSwa * sizeof(float)));
+            SimdKernels.BuildRopeTable(_ropeCosTableSwa, _ropeSinTableSwa, _maxSeqLen, swaHd,
+                _ropeThetaSwa > 0f ? _ropeThetaSwa : hp.RopeTheta);
+        }
 
         _cpuAttnNorm = new CpuWeightRef[_nCpuLayers];
         _cpuWq = new CpuWeightRef[_nCpuLayers]; _cpuWk = new CpuWeightRef[_nCpuLayers];
@@ -419,16 +549,30 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 _cpuWDownShexp = new CpuWeightRef[_nCpuLayers];
             }
         }
+        // Gemma 4 per-layer Q/K-norm allocations need to handle KV-share layers where
+        // attn_k_norm is absent (the source layer's K is already normed). The arrays
+        // are still indexed by ci so non-shared layers can populate them; shared
+        // layers leave the K-norm slot null.
+        if (_isGemma4Like && hp.HasPostAttnNorm) _cpuPostAttnNorm = new CpuWeightRef[_nCpuLayers];
+        if (_isGemma4Like && hp.HasPostFfwNorm)  _cpuPostFfwNorm  = new CpuWeightRef[_nCpuLayers];
 
         for (int ci = 0; ci < _nCpuLayers; ci++)
         {
             int li = ci + _nGpuLayers; // actual layer index
+            bool kvShared = _isGemma4Like && hp.KvSourceLayer is { } ksl && ksl[li] >= 0;
             _cpuAttnNorm[ci] = ResolveCpuWeight($"blk.{li}.attn_norm.weight");
             _cpuWq[ci] = ResolveCpuWeight($"blk.{li}.attn_q.weight");
-            _cpuWk[ci] = ResolveCpuWeight($"blk.{li}.attn_k.weight");
-            _cpuWv[ci] = ResolveCpuWeight($"blk.{li}.attn_v.weight");
+            if (!kvShared)
+            {
+                _cpuWk[ci] = ResolveCpuWeight($"blk.{li}.attn_k.weight");
+                _cpuWv[ci] = ResolveCpuWeight($"blk.{li}.attn_v.weight");
+            }
             _cpuWo[ci] = ResolveCpuWeight($"blk.{li}.attn_output.weight");
             _cpuFfnNorm[ci] = ResolveCpuWeight($"blk.{li}.ffn_norm.weight");
+            if (_cpuPostAttnNorm is not null)
+                _cpuPostAttnNorm[ci] = ResolveCpuWeight($"blk.{li}.post_attention_norm.weight");
+            if (_cpuPostFfwNorm is not null)
+                _cpuPostFfwNorm[ci] = ResolveCpuWeight($"blk.{li}.post_ffw_norm.weight");
             if (_isMoE)
             {
                 _cpuWGateInp![ci] = ResolveCpuWeight($"blk.{li}.ffn_gate_inp.weight");
@@ -452,23 +596,115 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             // Gemma 4 has per-layer head_dim (256 SWA / 512 global); other arches
             // pin to scalar _headDim. Mirrors CudaForwardPass per-layer dispatch.
             int layerHd = _hp.LayerHeadDim is { } lhd ? lhd[li] : _headDim;
-            if (_hasAttnBias)
+            if (_hasAttnBias && !kvShared)
             {
                 _cpuBq[ci] = LoadCpuBias($"blk.{li}.attn_q.bias", _numHeads * layerHd);
                 _cpuBk[ci] = LoadCpuBias($"blk.{li}.attn_k.bias", _numKvHeads * layerHd);
                 _cpuBv[ci] = LoadCpuBias($"blk.{li}.attn_v.bias", _numKvHeads * layerHd);
                 _cpuBo[ci] = LoadCpuBias($"blk.{li}.attn_output.bias", _embDim);
             }
+            else if (_hasAttnBias)
+            {
+                _cpuBq[ci] = LoadCpuBias($"blk.{li}.attn_q.bias", _numHeads * layerHd);
+                _cpuBo[ci] = LoadCpuBias($"blk.{li}.attn_output.bias", _embDim);
+            }
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
                 int qNormSize = _hp.IsPerChannelQkNorm ? (int)_numHeads * layerHd : layerHd;
-                int kNormSize = _hp.IsPerChannelQkNorm ? (int)_numKvHeads * layerHd : layerHd;
                 _cpuQNorm[ci] = LoadCpuBias($"blk.{li}.attn_q_norm.weight", qNormSize);
-                _cpuKNorm[ci] = LoadCpuBias($"blk.{li}.attn_k_norm.weight", kNormSize);
+                if (!kvShared)
+                {
+                    int kNormSize = _hp.IsPerChannelQkNorm ? (int)_numKvHeads * layerHd : layerHd;
+                    _cpuKNorm[ci] = LoadCpuBias($"blk.{li}.attn_k_norm.weight", kNormSize);
+                }
             }
         }
 
-        _cpuKvCache = new KvCache(_nCpuLayers, _maxSeqLen, _numKvHeads, _headDim);
+        // CPU KV cache row width must accommodate the widest per-layer head_dim on
+        // Gemma 4 (zero-padded tail per layer; mirror of ForwardPass). For non-gemma4
+        // _maxHeadDim == _headDim so the row width is unchanged.
+        _cpuKvCache = new KvCache(_nCpuLayers, _maxSeqLen, _numKvHeads, _maxHeadDim);
+
+        // Per-layer scalar output_scale (Gemma 4). Loaded for all layers (GPU+CPU)
+        // because the GPU half also reads it per layer in GpuLayerGemma4.
+        if (_isGemma4Like && hp.HasLayerOutputScale)
+        {
+            _layerOutputScale = new float[hp.NumLayers];
+            for (int li = 0; li < hp.NumLayers; li++)
+                _layerOutputScale[li] = LoadScalarF32($"blk.{li}.layer_output_scale.weight");
+        }
+
+        // PLE — CPU-resident table, projections uploaded to GPU and resolved on CPU
+        // for the CPU half. BuildPerLayerProjectionsCpu runs once per token across
+        // both tiers.
+        _pleWidth = (_isGemma4Like && hp.HasPerLayerTokenEmbd) ? hp.PerLayerEmbeddingWidth : 0;
+        if (_isGemma4Like && hp.HasPerLayerTokenEmbd)
+        {
+            _pleTokenEmbed = ResolveCpuWeight("per_layer_token_embd.weight");
+            _perLayerProjNorm = ResolveCpuWeight("per_layer_proj_norm.weight");
+
+            var projInfo = model.FindTensor("per_layer_model_proj.weight")
+                ?? throw new InvalidOperationException("Missing per_layer_model_proj.weight");
+            var projData = model.GetTensorData(projInfo);
+            int projCount = (int)projInfo.ElementCount;
+            _perLayerModelProjF32 = new float[projCount];
+            if (projInfo.DType == DType.Float32)
+                MemoryMarshal.Cast<byte, float>(projData).Slice(0, projCount).CopyTo(_perLayerModelProjF32);
+            else
+                Dequantize.ToFloat32(projData, _perLayerModelProjF32.AsSpan(), projInfo.DType, projCount);
+
+            _cpuInpGate     = new CpuWeightRef[hp.NumLayers];
+            _cpuPleProj     = new CpuWeightRef[hp.NumLayers];
+            _cpuPlePostNorm = new CpuWeightRef[hp.NumLayers];
+            for (int li = 0; li < hp.NumLayers; li++)
+            {
+                _cpuInpGate[li]     = ResolveCpuWeight($"blk.{li}.inp_gate.weight");
+                _cpuPleProj[li]     = ResolveCpuWeight($"blk.{li}.proj.weight");
+                _cpuPlePostNorm[li] = ResolveCpuWeight($"blk.{li}.post_norm.weight");
+            }
+
+            int stackedDim = hp.NumLayers * _pleWidth;
+            _pleRowBuf    = Alloc(stackedDim);
+            _projPerLayer = Alloc(stackedDim);
+            _pleX         = Alloc(_pleWidth);
+            _pleY         = Alloc(_embDim);
+
+            // GPU-side PLE weights for the GPU half (per-layer for layers 0..nGpu-1).
+            if (_nGpuLayers > 0)
+            {
+                _gpuInpGate     = new Tensor[_nGpuLayers];
+                _gpuPleProj     = new Tensor[_nGpuLayers];
+                _gpuPlePostNorm = new Tensor[_nGpuLayers];
+                for (int i = 0; i < _nGpuLayers; i++)
+                {
+                    _gpuInpGate[i]     = UploadWeight($"blk.{i}.inp_gate.weight");
+                    _gpuPleProj[i]     = UploadWeight($"blk.{i}.proj.weight");
+                    _gpuPlePostNorm[i] = UploadWeight($"blk.{i}.post_norm.weight");
+                }
+                _gpuPleSliceUp = gpu.Allocate(TensorShape.D1(_pleWidth));
+                _gpuPleX       = gpu.Allocate(TensorShape.D1(_pleWidth));
+                _gpuPleY       = gpu.Allocate(TensorShape.D1(_embDim));
+            }
+        }
+
+        // Populate the GPU KV-aliased layer set (Gemma 4 shared-KV tail). The
+        // constructor validation already guarantees all aliased GPU layers point to
+        // GPU sources (no cross-tier reads).
+        if (_isGemma4Like && hp.KvSourceLayer is { } kslGpu)
+        {
+            for (int i = 0; i < _nGpuLayers; i++)
+                if (kslGpu[i] >= 0) _gpuKvAliasedLayers.Add(i);
+        }
+
+        // Upload rope_freqs.weight to GPU when present (Gemma 4 global-layer factors).
+        if (_isGemma4Like
+            && model.FindTensor("rope_freqs.weight") is GgufTensorInfo rfGpu
+            && rfGpu.DType == DType.Float32
+            && rfGpu.ElementCount == _maxHeadDim / 2
+            && _nGpuLayers > 0)
+        {
+            _gpuRopeFreqs = UploadWeight("rope_freqs.weight");
+        }
 
         // Pre-fault mmap pages for CPU layers: touch the first byte of each weight tensor
         // to ensure OS pages them into RAM before the first forward pass.
@@ -502,7 +738,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
 
             foreach (var wRef in weightsToTouch)
             {
-                // Touch first and last cache line of each weight tensor
+                // Skip un-resolved slots — KV-share layers on Gemma 4 leave attn_k /
+                // attn_v unresolved by design (the source layer's projections are
+                // reused via the alias dispatch).
+                if (wRef.DataPtr == null) continue;
                 touchSum += wRef.DataPtr[0];
                 long size = wRef.Info.ByteSize;
                 if (size > 64) touchSum += wRef.DataPtr[size - 1];
@@ -527,6 +766,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
 
     public ReadOnlySpan<float> Forward(int token, int position)
     {
+        if (_isGemma4Like) return ForwardGemma4(token, position);
+
         // ── Phase 1: GPU layers ──
         _gpu.BeginRecord();
 
@@ -909,8 +1150,565 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     {
         SimdKernels.MatVecDual(_cpuFfnGate, _cpuWGate[ci].DataPtr, _cpuFfnUp, _cpuWUp[ci].DataPtr,
             _cpuNormBuf, _intermDim, _embDim, _cpuWGate[ci].DType, _cpuWUp[ci].DType);
-        SimdKernels.SiLuMul(_cpuFfnGate, _cpuFfnUp, _intermDim);
+        if (_hp.FfnActivation == FfnActivation.GeluApprox)
+            SimdKernels.GeluTanhMul(_cpuFfnGate, _cpuFfnUp, _cpuFfnGate, _intermDim);
+        else
+            SimdKernels.SiLuMul(_cpuFfnGate, _cpuFfnUp, _intermDim);
         SimdKernels.MatVec(_cpuHidden, _cpuWDown[ci].DataPtr, _cpuFfnGate, _embDim, _intermDim, _cpuWDown[ci].DType);
+    }
+
+    // ================================================================
+    //  Gemma 4 Forward — orchestrates embed scale + PLE pre-pass + per-tier layer
+    //  dispatch + final norm/output/softcap. Mirrors CudaForwardPass.ForwardGemma4
+    //  for the GPU half and ForwardPass.Forward (Gemma 4 path) for the CPU half.
+    // ================================================================
+
+    private ReadOnlySpan<float> ForwardGemma4(int token, int position)
+    {
+        // PLE pre-pass needs the hidden state, so embed first.
+        // Embedding lives wherever ShouldKeepFixedWeightsOnCpu decided.
+        if (_gpuEmbedding is not null)
+        {
+            _gpu.BeginRecord();
+            if (_embIsQuantized)
+            {
+                var embDType = _gpuWeightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K);
+                if (embDType == DType.Q8_0) _gpu.EmbedLookupQ8_0(_gpuEmbedding, _gpuHidden, token, _embDim);
+                else _gpu.EmbedLookupQ4K(_gpuEmbedding, _gpuHidden, token, _embDim);
+            }
+            else
+            {
+                _gpu.EmbedLookup(_gpuEmbedding, _gpuHidden, token, _embDim);
+            }
+            _gpu.RecordBarrier();
+
+            // Download embedded hidden to CPU for the PLE pre-pass (and any CPU layers).
+            CopyGpuBuffer(_pinnedHidden, _gpuHidden);
+            _gpu.RecordBarrier();
+            _gpu.EndRecordAndSubmit();
+            float* pinned = _gpu.MapPinned(_pinnedHidden);
+            new ReadOnlySpan<float>(pinned, _embDim).CopyTo(new Span<float>(_cpuHidden, _embDim));
+            _gpu.UnmapPinned(_pinnedHidden);
+        }
+        else
+        {
+            CpuEmbedToken(token, _cpuHidden);
+        }
+
+        // Embedding scale (× sqrt(embDim) on Gemma 4).
+        if (_hp.EmbeddingScale != 1f)
+            SimdKernels.ScaleInPlace(_cpuHidden, _hp.EmbeddingScale, _embDim);
+
+        // PLE pre-pass on CPU — produces _projPerLayer[NumLayers * pleWidth].
+        if (_hp.HasPerLayerTokenEmbd)
+            BuildPerLayerProjectionsCpu(token);
+
+        // Re-upload the (possibly scaled) hidden state to GPU for the GPU half.
+        if (_nGpuLayers > 0)
+        {
+            float* pinned = _gpu.MapPinned(_pinnedHidden);
+            new ReadOnlySpan<float>(_cpuHidden, _embDim).CopyTo(new Span<float>(pinned, _embDim));
+            _gpu.UnmapPinned(_pinnedHidden);
+            _gpu.BeginRecord();
+            CopyGpuBuffer(_gpuHidden, _pinnedHidden);
+            _gpu.RecordBarrier();
+
+            for (int i = 0; i < _nGpuLayers; i++)
+                GpuLayerGemma4(i, position);
+
+            if (_nCpuLayers > 0)
+            {
+                CopyGpuBuffer(_pinnedHidden, _gpuHidden);
+                _gpu.RecordBarrier();
+            }
+            _gpu.EndRecordAndSubmit();
+
+            if (_nCpuLayers > 0)
+            {
+                float* pinnedDown = _gpu.MapPinned(_pinnedHidden);
+                new ReadOnlySpan<float>(pinnedDown, _embDim).CopyTo(new Span<float>(_cpuHidden, _embDim));
+                _gpu.UnmapPinned(_pinnedHidden);
+            }
+        }
+
+        if (_nCpuLayers > 0)
+        {
+            for (int ci = 0; ci < _nCpuLayers; ci++)
+                CpuLayerGemma4(ci, position);
+
+            _cpuKvCache.IncrementPosition();
+
+            if (_gpuOutputWeight is not null)
+            {
+                float* pinned = _gpu.MapPinned(_pinnedHidden);
+                new ReadOnlySpan<float>(_cpuHidden, _embDim).CopyTo(new Span<float>(pinned, _embDim));
+                _gpu.UnmapPinned(_pinnedHidden);
+
+                _gpu.BeginRecord();
+                CopyGpuBuffer(_gpuHidden, _pinnedHidden);
+                _gpu.RecordBarrier();
+                _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuOutputNorm!, _hp.RmsNormEps);
+                _gpu.RecordBarrier();
+                GpuMatMul(_gpuLogits, _gpuOutputWeight, _gpuHidden);
+                if (_hp.FinalLogitSoftcap > 0f)
+                {
+                    _gpu.RecordBarrier();
+                    _gpu.SoftcapInPlace(_gpuLogits, _hp.FinalLogitSoftcap);
+                }
+                _gpu.RecordComputeToTransferBarrier();
+                _gpu.RecordDownloadToStaging(_gpuLogits, _logitsBuf.Length);
+                _gpu.EndRecordAndSubmit();
+                _gpu.ReadFromStaging(_logitsBuf);
+            }
+            else
+            {
+                // Final norm + output on CPU.
+                var outNormW = GetCpuNormWeight(_cpuOutputNorm);
+                SimdKernels.RmsNorm(_cpuNormBuf, _cpuHidden, outNormW, _embDim, _hp.RmsNormEps);
+                fixed (float* logits = _logitsBuf)
+                {
+                    SimdKernels.MatVec(logits, _cpuOutputWeight.DataPtr, _cpuNormBuf,
+                        _hp.VocabSize, _embDim, _cpuOutputWeight.DType);
+                    if (_hp.FinalLogitSoftcap > 0f)
+                        SimdKernels.SoftcapInPlace(logits, _hp.VocabSize, _hp.FinalLogitSoftcap);
+                }
+            }
+        }
+        else
+        {
+            // All-GPU layer set already produced _gpuHidden; finalise on GPU.
+            _gpu.BeginRecord();
+            _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuOutputNorm!, _hp.RmsNormEps);
+            _gpu.RecordBarrier();
+            GpuMatMul(_gpuLogits, _gpuOutputWeight!, _gpuHidden);
+            if (_hp.FinalLogitSoftcap > 0f)
+            {
+                _gpu.RecordBarrier();
+                _gpu.SoftcapInPlace(_gpuLogits, _hp.FinalLogitSoftcap);
+            }
+            _gpu.RecordComputeToTransferBarrier();
+            _gpu.RecordDownloadToStaging(_gpuLogits, _logitsBuf.Length);
+            _gpu.EndRecordAndSubmit();
+            _gpu.ReadFromStaging(_logitsBuf);
+        }
+
+        _kvLength = position + 1;
+        return _logitsBuf;
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Gemma 4 GPU layer — mirrors CudaForwardPass.ForwardGemma4 inner loop.
+    // ────────────────────────────────────────────────────────────────────
+
+    private void GpuLayerGemma4(int i, int position)
+    {
+        int layerHd = _hp.LayerHeadDim![i];
+        int qDimL = _numHeads * layerHd;
+        int kvDimL = _numKvHeads * layerHd;
+        bool isSwa = _hp.IsSwaLayer is { } swa && swa[i];
+        bool kvShared = _gpuKvAliasedLayers.Contains(i);
+        int effLayer = i; // validated above: no kv-shared GPU layers
+
+        var qView = new Tensor(TensorShape.D1(qDimL), DType.Float32, _gpuQ.Handle);
+        var kView = new Tensor(TensorShape.D1(kvDimL), DType.Float32, _gpuK.Handle);
+        var vView = new Tensor(TensorShape.D1(kvDimL), DType.Float32, _gpuV.Handle);
+        var attnOutView = new Tensor(TensorShape.D1(qDimL), DType.Float32, _gpuAttnOut.Handle);
+
+        CopyGpuBuffer(_gpuResidual, _gpuHidden);
+        _gpu.RecordBarrier();
+        _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuAttnNorm[i], _hp.RmsNormEps);
+        _gpu.RecordBarrier();
+
+        GpuMatMul(qView, _gpuWq[i], _gpuNormBuf);
+        if (!kvShared)
+        {
+            GpuMatMul(kView, _gpuWk[i], _gpuNormBuf);
+            GpuMatMul(vView, _gpuWv[i], _gpuNormBuf);
+        }
+        _gpu.RecordBarrier();
+
+        // Per-head Q/K norm (Gemma 4: shared headDim-sized weight per head, applied
+        // BEFORE RoPE since UseL2QkNorm == false).
+        if (_hasQkNorm && !_hp.UseL2QkNorm)
+        {
+            _gpu.HeadNorm(qView, _gpuQNorm![i], _numHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+            if (!kvShared)
+                _gpu.HeadNorm(kView, _gpuKNorm![i], _numKvHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+            _gpu.RecordBarrier();
+        }
+
+        float ropeTheta = isSwa ? _ropeThetaSwa : _hp.RopeTheta;
+        if (!isSwa && _gpuRopeFreqs is { } rfTbl)
+        {
+            _gpu.RoPEWithFactors(qView, position, layerHd, ropeTheta, rfTbl);
+            if (!kvShared) _gpu.RoPEWithFactors(kView, position, layerHd, ropeTheta, rfTbl);
+        }
+        else
+        {
+            _gpu.RoPE(qView, position, layerHd, ropeTheta, _hp.IsNeoxRope);
+            if (!kvShared) _gpu.RoPE(kView, position, layerHd, ropeTheta, _hp.IsNeoxRope);
+        }
+        _gpu.RecordBarrier();
+
+        if (!kvShared)
+        {
+            int layerCtx = isSwa && _hp.SlidingWindowSize > 0
+                ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
+                : _maxSeqLen;
+            _gpu.KvAppend(kView, vView, _gpuKCache[i], _gpuVCache[i], kvDimL, position, layerCtx);
+            _gpu.RecordBarrier();
+        }
+
+        int effLayerCtx = (_hp.IsSwaLayer is { } swaEff && swaEff[effLayer]
+                          && _hp.SlidingWindowSize > 0)
+            ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
+            : _maxSeqLen;
+
+        if (isSwa)
+        {
+            _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
+                _gpuAttnScoresScratch,
+                position, _hp.SlidingWindowSize, layerHd,
+                _numHeads, _numKvHeads, effLayerCtx);
+        }
+        else
+        {
+            _gpu.Attention(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
+                _gpuAttnScoresScratch,
+                _numHeads, _numKvHeads, layerHd, position + 1, effLayerCtx);
+        }
+        _gpu.RecordBarrier();
+
+        GpuMatMul(_gpuHidden, _gpuWo[i], attnOutView);
+        _gpu.RecordBarrier();
+
+        // Post-attn RmsNorm before residual.
+        if (_gpuPostAttnNorm is not null)
+        {
+            _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuPostAttnNorm[i], _hp.RmsNormEps);
+            _gpu.RecordBarrier();
+        }
+        _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+        _gpu.RecordBarrier();
+
+        // FFN.
+        CopyGpuBuffer(_gpuResidual, _gpuHidden);
+        _gpu.RecordBarrier();
+        _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuFfnNorm[i], _hp.RmsNormEps);
+        _gpu.RecordBarrier();
+        GpuMatMul(_gpuFfnGate, _gpuWGate[i], _gpuNormBuf);
+        GpuMatMul(_gpuFfnUp,   _gpuWUp[i],   _gpuNormBuf);
+        _gpu.RecordBarrier();
+        _gpu.GeluTanhMul(_gpuFfnGate, _gpuFfnUp);
+        _gpu.RecordBarrier();
+        GpuMatMul(_gpuHidden, _gpuWDown[i], _gpuFfnGate);
+        _gpu.RecordBarrier();
+
+        if (_gpuPostFfwNorm is not null)
+        {
+            _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuPostFfwNorm[i], _hp.RmsNormEps);
+            _gpu.RecordBarrier();
+        }
+        _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+        _gpu.RecordBarrier();
+
+        // PLE injection — upload the per-layer slice from _projPerLayer (CPU) into
+        // _gpuPleSliceUp, then run the inp_gate / gelu / proj / post_norm / add on GPU.
+        if (_hp.HasPerLayerTokenEmbd && _gpuInpGate is not null)
+        {
+            // Flush so the upload sees a stable consumer; UploadInto is synchronous
+            // w.r.t. host but we need ordering with subsequent kernel reads.
+            _gpu.RecordBarrier();
+            _gpu.UploadInto(_gpuPleSliceUp!,
+                new ReadOnlySpan<float>(_projPerLayer + (long)i * _pleWidth, _pleWidth));
+            _gpu.RecordBarrier();
+
+            GpuMatMul(_gpuPleX!, _gpuInpGate[i], _gpuHidden);
+            _gpu.RecordBarrier();
+            _gpu.GeluTanhMul(_gpuPleX!, _gpuPleSliceUp!);
+            _gpu.RecordBarrier();
+            GpuMatMul(_gpuPleY!, _gpuPleProj![i], _gpuPleX!);
+            _gpu.RecordBarrier();
+            _gpu.RmsNorm(_gpuPleY!, _gpuPleY!, _gpuPlePostNorm![i], _hp.RmsNormEps);
+            _gpu.RecordBarrier();
+            _gpu.AddInPlace(_gpuHidden, _gpuPleY!);
+            _gpu.RecordBarrier();
+        }
+
+        if (_layerOutputScale is not null)
+        {
+            _gpu.ScaleInPlace(_gpuHidden, _layerOutputScale[i]);
+            _gpu.RecordBarrier();
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Gemma 4 CPU layer — mirrors ForwardPass.Forward Gemma 4 inner loop.
+    // ────────────────────────────────────────────────────────────────────
+
+    private void CpuLayerGemma4(int ci, int position)
+    {
+        int li = ci + _nGpuLayers;
+        int layerHd = _hp.LayerHeadDim![li];
+        int qDimL = _numHeads * layerHd;
+        int kvDimL = _numKvHeads * layerHd;
+        bool isSwa = _hp.IsSwaLayer is { } swa && swa[li];
+        var ksl = _hp.KvSourceLayer;
+        bool kvShared = ksl is not null && ksl[li] >= 0;
+        int kvSrcLi = kvShared ? ksl![li] : li;
+        int effCi = kvSrcLi - _nGpuLayers; // validated to be on CPU side
+        int windowSize = isSwa && _hp.SlidingWindowSize > 0 ? _hp.SlidingWindowSize : -1;
+
+        // Save residual.
+        new Span<float>(_cpuHidden, _embDim).CopyTo(new Span<float>(_cpuResidual, _embDim));
+
+        // Pre-attention RmsNorm.
+        var normW = GetCpuNormWeight(_cpuAttnNorm[ci]);
+        SimdKernels.RmsNorm(_cpuNormBuf, _cpuHidden, normW, _embDim, _hp.RmsNormEps);
+
+        // Per-layer head_dim: clear Q/K/V scratch tails so MatVec only fills active rows.
+        new Span<float>(_cpuQ, _numHeads * _maxHeadDim).Clear();
+        new Span<float>(_cpuK, _numKvHeads * _maxHeadDim).Clear();
+        new Span<float>(_cpuV, _numKvHeads * _maxHeadDim).Clear();
+
+        SimdKernels.MatVec(_cpuQ, _cpuWq[ci].DataPtr, _cpuNormBuf, qDimL, _embDim, _cpuWq[ci].DType);
+        if (!kvShared)
+        {
+            SimdKernels.MatVec(_cpuK, _cpuWk[ci].DataPtr, _cpuNormBuf, kvDimL, _embDim, _cpuWk[ci].DType);
+            SimdKernels.MatVec(_cpuV, _cpuWv[ci].DataPtr, _cpuNormBuf, kvDimL, _embDim, _cpuWv[ci].DType);
+        }
+
+        if (_hasAttnBias)
+        {
+            SimdKernels.AddInPlace(_cpuQ, _cpuBq[ci], qDimL);
+            if (!kvShared)
+            {
+                SimdKernels.AddInPlace(_cpuK, _cpuBk[ci], kvDimL);
+                SimdKernels.AddInPlace(_cpuV, _cpuBv[ci], kvDimL);
+            }
+        }
+
+        // Per-head Q/K norm (Gemma 4: applied BEFORE RoPE, UseL2QkNorm == false).
+        if (_hasQkNorm && !_hp.UseL2QkNorm)
+        {
+            if (_hp.IsPerChannelQkNorm)
+            {
+                PerChannelRmsNorm(_cpuQ, _cpuQNorm[ci], _numHeads, layerHd, _hp.RmsNormEps);
+                if (!kvShared)
+                    PerChannelRmsNorm(_cpuK, _cpuKNorm[ci], _numKvHeads, layerHd, _hp.RmsNormEps);
+            }
+            else
+            {
+                PerHeadRmsNorm(_cpuQ, _cpuQNorm[ci], _numHeads, layerHd, _hp.RmsNormEps);
+                if (!kvShared)
+                    PerHeadRmsNorm(_cpuK, _cpuKNorm[ci], _numKvHeads, layerHd, _hp.RmsNormEps);
+            }
+        }
+
+        // Gemma 4: V per-head pure RmsNorm (no learned weight) before cache.
+        if (!kvShared)
+            PerHeadPureRmsNorm(_cpuV, _numKvHeads, layerHd, _hp.RmsNormEps);
+
+        // RoPE — dual-table (global vs SWA).
+        bool useSwaTable = isSwa && _ropeCosTableSwa != null;
+        int halfDim = useSwaTable ? _ropeHalfDimSwa : _ropeHalfDim;
+        float* cosTab = useSwaTable ? _ropeCosTableSwa : _ropeCosTable;
+        float* sinTab = useSwaTable ? _ropeSinTableSwa : _ropeSinTable;
+        float* cos = cosTab + (long)position * halfDim;
+        float* sin = sinTab + (long)position * halfDim;
+        if (_hp.IsNeoxRope)
+        {
+            SimdKernels.ApplyRoPECachedNeox(_cpuQ, cos, sin, _numHeads, layerHd);
+            if (!kvShared)
+                SimdKernels.ApplyRoPECachedNeox(_cpuK, cos, sin, _numKvHeads, layerHd);
+        }
+        else
+        {
+            SimdKernels.ApplyRoPECached(_cpuQ, cos, sin, _numHeads, layerHd);
+            if (!kvShared)
+                SimdKernels.ApplyRoPECached(_cpuK, cos, sin, _numKvHeads, layerHd);
+        }
+
+        // KV append. The cache row is _maxKvDim wide on Gemma 4; the active head_dim
+        // populates the leading slots, trailing slots are zero (cleared above).
+        if (!kvShared)
+        {
+            int appendLen = _cpuKvCache.KvDim; // _numKvHeads * _maxHeadDim
+            _cpuKvCache.Append(ci,
+                new ReadOnlySpan<float>(_cpuK, appendLen),
+                new ReadOnlySpan<float>(_cpuV, appendLen));
+        }
+
+        // Attention reads `effCi` on Gemma 4. The cache stride between kv heads is
+        // _maxHeadDim (the cache row width).
+        CpuAttentionGemma4(ci, effCi, position, layerHd, qDimL, windowSize);
+
+        // Output projection. _cpuWo is [embDim, qDimL].
+        SimdKernels.MatVec(_cpuHidden, _cpuWo[ci].DataPtr, _cpuAttnOut, _embDim, qDimL, _cpuWo[ci].DType);
+
+        if (_hasAttnBias)
+            SimdKernels.AddInPlace(_cpuHidden, _cpuBo[ci], _embDim);
+
+        // Post-attention RmsNorm BEFORE residual add.
+        if (_cpuPostAttnNorm is not null)
+        {
+            var paNormW = GetCpuNormWeight(_cpuPostAttnNorm[ci]);
+            SimdKernels.RmsNorm(_cpuHidden, _cpuHidden, paNormW, _embDim, _hp.RmsNormEps);
+        }
+        SimdKernels.AddInPlace(_cpuHidden, _cpuResidual, _embDim);
+
+        // FFN.
+        new Span<float>(_cpuHidden, _embDim).CopyTo(new Span<float>(_cpuResidual, _embDim));
+        var ffnNormW = GetCpuNormWeight(_cpuFfnNorm[ci]);
+        SimdKernels.RmsNorm(_cpuNormBuf, _cpuHidden, ffnNormW, _embDim, _hp.RmsNormEps);
+        SimdKernels.MatVecDual(_cpuFfnGate, _cpuWGate[ci].DataPtr, _cpuFfnUp, _cpuWUp[ci].DataPtr,
+            _cpuNormBuf, _intermDim, _embDim, _cpuWGate[ci].DType, _cpuWUp[ci].DType);
+        SimdKernels.GeluTanhMul(_cpuFfnGate, _cpuFfnUp, _cpuFfnGate, _intermDim);
+        SimdKernels.MatVec(_cpuHidden, _cpuWDown[ci].DataPtr, _cpuFfnGate, _embDim, _intermDim, _cpuWDown[ci].DType);
+
+        // Post-FFN RmsNorm BEFORE residual.
+        if (_cpuPostFfwNorm is not null)
+        {
+            var pfNormW = GetCpuNormWeight(_cpuPostFfwNorm[ci]);
+            SimdKernels.RmsNorm(_cpuHidden, _cpuHidden, pfNormW, _embDim, _hp.RmsNormEps);
+        }
+        SimdKernels.AddInPlace(_cpuHidden, _cpuResidual, _embDim);
+
+        // PLE injection (after post-FFN residual, before layer_output_scale).
+        if (_hp.HasPerLayerTokenEmbd && _cpuInpGate is not null)
+            ApplyPerLayerEmbeddingCpu(li);
+
+        // Per-layer scalar output_scale.
+        if (_layerOutputScale is not null)
+            SimdKernels.ScaleInPlace(_cpuHidden, _layerOutputScale[li], _embDim);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Gemma 4 attention — per-layer head_dim + SWA window + alias support.
+    //  Stride between kv heads is _maxHeadDim (cache row width).
+    // ────────────────────────────────────────────────────────────────────
+
+    private void CpuAttentionGemma4(int ci, int effCi, int position, int hd, int qDim, int windowSize)
+    {
+        int endSeq = position + 1;
+        int startSeq = windowSize > 0 ? Math.Max(0, endSeq - windowSize) : 0;
+        int scoreLen = endSeq - startSeq;
+        // Gemma 4 uses attn_scale = 1.0 (no 1/sqrt(hd) prefactor).
+        float scale = 1.0f;
+        int maxSeqLen = _maxSeqLen; int hpkg = _headsPerKvGroup;
+        int slotStride = _numKvHeads * _maxHeadDim; // cache row width
+        var q = _cpuQ; var attnOut = _cpuAttnOut; var scores = _cpuAttnScores;
+        var kvCache = _cpuKvCache;
+        int hdLocal = hd; int startLocal = startSeq;
+        int eff = effCi;
+
+        // Zero the active attnOut window (qDim floats) so the slot reuse from a
+        // wider previous layer doesn't bleed into this layer's output projection.
+        new Span<float>(attnOut, _numHeads * _maxHeadDim).Clear();
+
+        Parallel.For(0, _numHeads, h =>
+        {
+            int kvHead = h / hpkg;
+            float* qHead = q + h * hdLocal;
+            float* outHead = attnOut + h * hdLocal;
+            float* headScores = scores + (long)h * maxSeqLen;
+
+            for (int i = 0; i < scoreLen; i++)
+            {
+                int t = startLocal + i;
+                float* kVec = (kvCache.KeyAt(eff, t)) + kvHead * _maxHeadDim;
+                headScores[i] = SimdKernels.DotF32(qHead, kVec, hdLocal) * scale;
+            }
+
+            SimdKernels.SoftmaxInPlace(headScores, scoreLen);
+
+            for (int d = 0; d < hdLocal; d++) outHead[d] = 0;
+
+            for (int i = 0; i < scoreLen; i++)
+            {
+                int t = startLocal + i;
+                float* vVec = (kvCache.ValueAt(eff, t)) + kvHead * _maxHeadDim;
+                float w = headScores[i];
+                if (Fma.IsSupported && hdLocal >= 8)
+                {
+                    var wv = Vector256.Create(w);
+                    int d = 0;
+                    for (; d + 8 <= hdLocal; d += 8)
+                    {
+                        var o = Avx.LoadVector256(outHead + d);
+                        var v = Avx.LoadVector256(vVec + d);
+                        Avx.Store(outHead + d, Fma.MultiplyAdd(wv, v, o));
+                    }
+                    for (; d < hdLocal; d++)
+                        outHead[d] += w * vVec[d];
+                }
+                else
+                {
+                    for (int d = 0; d < hdLocal; d++)
+                        outHead[d] += w * vVec[d];
+                }
+            }
+        });
+        _ = qDim; _ = slotStride;
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    //  PLE pre-pass + injection — CPU side. The PLE table is too large for
+    //  GPU residency at Q8 (~4.2 GB on E4B); the projection is small enough
+    //  to run on CPU each token and a 256-float slice uploads cheaply for
+    //  the GPU half.
+    // ────────────────────────────────────────────────────────────────────
+
+    private void BuildPerLayerProjectionsCpu(int token)
+    {
+        int L = _hp.NumLayers;
+        int stackedDim = L * _pleWidth;
+        var pleRef = _pleTokenEmbed!.Value;
+
+        int bytesPerRow = (stackedDim / DTypeInfo.BlockSize(pleRef.DType))
+                        * DTypeInfo.BytesPerBlock(pleRef.DType);
+        byte* rowPtr = pleRef.DataPtr + (long)token * bytesPerRow;
+        if (pleRef.DType == DType.Float32)
+        {
+            new ReadOnlySpan<float>((float*)rowPtr, stackedDim)
+                .CopyTo(new Span<float>(_pleRowBuf, stackedDim));
+        }
+        else
+        {
+            SimdKernels.DequantRow(rowPtr, _pleRowBuf, stackedDim, pleRef.DType);
+        }
+        SimdKernels.ScaleInPlace(_pleRowBuf, MathF.Sqrt(_pleWidth), stackedDim);
+
+        // proj_per_layer = per_layer_model_proj @ hidden  → [stackedDim]
+        fixed (float* proj = _perLayerModelProjF32!)
+        {
+            SimdKernels.MatVec(_projPerLayer, (byte*)proj, _cpuHidden,
+                stackedDim, _embDim, DType.Float32);
+        }
+        SimdKernels.ScaleInPlace(_projPerLayer, 1.0f / MathF.Sqrt(_embDim), stackedDim);
+
+        float invSqrt2 = 1.0f / MathF.Sqrt(2.0f);
+        var projNormW = GetCpuNormWeight(_perLayerProjNorm!.Value);
+        for (int liIdx = 0; liIdx < L; liIdx++)
+        {
+            float* slice = _projPerLayer + (long)liIdx * _pleWidth;
+            SimdKernels.RmsNorm(slice, slice, projNormW, _pleWidth, _hp.RmsNormEps);
+            SimdKernels.AddInPlace(slice, _pleRowBuf + (long)liIdx * _pleWidth, _pleWidth);
+            SimdKernels.ScaleInPlace(slice, invSqrt2, _pleWidth);
+        }
+    }
+
+    private void ApplyPerLayerEmbeddingCpu(int li)
+    {
+        float* slice = _projPerLayer + (long)li * _pleWidth;
+        SimdKernels.MatVec(_pleX, _cpuInpGate![li].DataPtr, _cpuHidden,
+            _pleWidth, _embDim, _cpuInpGate[li].DType);
+        SimdKernels.GeluTanhMul(_pleX, slice, _pleX, _pleWidth);
+        SimdKernels.MatVec(_pleY, _cpuPleProj![li].DataPtr, _pleX,
+            _embDim, _pleWidth, _cpuPleProj[li].DType);
+        var postW = GetCpuNormWeight(_cpuPlePostNorm![li]);
+        SimdKernels.RmsNorm(_pleY, _pleY, postW, _embDim, _hp.RmsNormEps);
+        SimdKernels.AddInPlace(_cpuHidden, _pleY, _embDim);
     }
 
     private void CpuMoeFfn(int ci)
@@ -1181,6 +1979,41 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         else
             Dequantize.ToFloat32(data, new Span<float>(buf, count), info.DType, count);
         return buf;
+    }
+
+    private float LoadScalarF32(string name)
+    {
+        var info = _model.FindTensor(name)
+            ?? throw new InvalidOperationException($"Missing tensor: {name}");
+        var data = _model.GetTensorData(info);
+        Span<float> buf = stackalloc float[1];
+        if (info.DType == DType.Float32)
+            MemoryMarshal.Cast<byte, float>(data).Slice(0, 1).CopyTo(buf);
+        else
+            Dequantize.ToFloat32(data, buf, info.DType, 1);
+        return buf[0];
+    }
+
+    /// <summary>
+    /// Reject hybrid splits that would require cross-tier KV reads for Gemma 4's
+    /// shared_kv_layers tail. The shared-KV source layers (typically the last two
+    /// own-KV layers, indices 22 and 23 on E4B with shared_kv_layers=18) MUST live
+    /// on the CPU side so the shared layers (24..41, all on CPU) can read them.
+    /// </summary>
+    private static void Gemma4ValidateHybridSplit(ModelHyperparams hp, int nGpuLayers)
+    {
+        if (hp.KvSourceLayer is not { } ksl) return;
+        int minSrc = int.MaxValue;
+        for (int i = 0; i < hp.NumLayers; i++)
+            if (ksl[i] >= 0 && ksl[i] < minSrc) minSrc = ksl[i];
+        if (minSrc == int.MaxValue) return; // no aliased layers
+        if (nGpuLayers > minSrc)
+            throw new NotSupportedException(
+                $"Gemma 4 hybrid split with -g {nGpuLayers} would place shared-KV source layer " +
+                $"{minSrc} on the GPU while its dependent shared-KV layers run on the CPU; " +
+                "cross-tier KV reads are not implemented. " +
+                $"Use -g <= {minSrc} (own-KV sources stay on CPU) or -g {hp.NumLayers} " +
+                "(full-GPU via CudaForwardPass).");
     }
 
     private float* GetCpuNormWeight(in CpuWeightRef tensor)
@@ -1548,7 +2381,20 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             {
                 _gpu.Free(_gpuWGate[i]); _gpu.Free(_gpuWUp[i]); _gpu.Free(_gpuWDown[i]);
             }
-            _gpu.Free(_gpuKCache[i]); _gpu.Free(_gpuVCache[i]);
+            if (_gpuPostAttnNorm is not null) _gpu.Free(_gpuPostAttnNorm[i]);
+            if (_gpuPostFfwNorm is not null)  _gpu.Free(_gpuPostFfwNorm[i]);
+            if (_gpuInpGate is not null)
+            {
+                _gpu.Free(_gpuInpGate[i]);
+                _gpu.Free(_gpuPleProj![i]);
+                _gpu.Free(_gpuPlePostNorm![i]);
+            }
+            // KV cache: shared-KV layers alias another layer's handle (Gemma 4); skip
+            // the Free here, the owning layer releases it.
+            if (!_gpuKvAliasedLayers.Contains(i))
+            {
+                _gpu.Free(_gpuKCache[i]); _gpu.Free(_gpuVCache[i]);
+            }
             if (_tqEnabled)
             {
                 _gpu.Free(_gpuTqKCache![i]);
@@ -1581,6 +2427,16 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         NativeMemory.Free(_cpuQ); NativeMemory.Free(_cpuK); NativeMemory.Free(_cpuV); NativeMemory.Free(_cpuAttnOut);
         NativeMemory.Free(_cpuFfnGate); NativeMemory.Free(_cpuFfnUp); NativeMemory.Free(_cpuAttnScores);
         NativeMemory.Free(_ropeCosTable); NativeMemory.Free(_ropeSinTable);
+        if (_ropeCosTableSwa != null) NativeMemory.Free(_ropeCosTableSwa);
+        if (_ropeSinTableSwa != null) NativeMemory.Free(_ropeSinTableSwa);
+        if (_pleRowBuf != null)    NativeMemory.Free(_pleRowBuf);
+        if (_projPerLayer != null) NativeMemory.Free(_projPerLayer);
+        if (_pleX != null)         NativeMemory.Free(_pleX);
+        if (_pleY != null)         NativeMemory.Free(_pleY);
+        if (_gpuPleSliceUp is { } pleUp) _gpu.Free(pleUp);
+        if (_gpuPleX is { } pleX)  _gpu.Free(pleX);
+        if (_gpuPleY is { } pleY)  _gpu.Free(pleY);
+        if (_gpuRopeFreqs is { } rfFree) _gpu.Free(rfFree);
         if (_cpuRouterLogits != null) NativeMemory.Free(_cpuRouterLogits);
         if (_cpuSharedOut != null) NativeMemory.Free(_cpuSharedOut);
         if (_cpuExpertGate != null) NativeMemory.Free(_cpuExpertGate);
