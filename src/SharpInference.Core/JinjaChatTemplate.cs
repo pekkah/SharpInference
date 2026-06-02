@@ -80,7 +80,7 @@ public sealed class JinjaChatTemplate
     private sealed record UnaryExpr(string Op, IExpr Operand) : IExpr;
     private sealed record CallExpr(string Name, List<IExpr> Args, List<(string Key, IExpr Val)> Kwargs) : IExpr;
     private sealed record MethodExpr(IExpr Obj, string Method, List<IExpr> Args) : IExpr;
-    private sealed record FilterExpr(IExpr Value, string Filter) : IExpr;
+    private sealed record FilterExpr(IExpr Value, string Filter, List<IExpr>? Args = null) : IExpr;
     private sealed record IsTestExpr(IExpr Value, string Test, bool Negated) : IExpr;
 
     // ── Lexer ─────────────────────────────────────────────────────────────
@@ -566,7 +566,15 @@ public sealed class JinjaChatTemplate
                 {
                     Pos++; Skip();
                     string filter = ReadIdent();
-                    expr = new FilterExpr(expr, filter);
+                    // Filters may carry arguments, e.g. `| default([])`, `| map('upper')`.
+                    List<IExpr>? filterArgs = null;
+                    Skip();
+                    if (Pos < _s.Length && _s[Pos] == '(')
+                    {
+                        Pos++;
+                        filterArgs = ParseArgList(')');
+                    }
+                    expr = new FilterExpr(expr, filter, filterArgs);
                 }
                 else break;
             }
@@ -870,7 +878,13 @@ public sealed class JinjaChatTemplate
                 bool r = EvalIsTest(Eval(it.Value, ctx), it.Test, ctx);
                 return it.Negated ? !r : r;
 
-            case FilterExpr f:  return ApplyFilter(Eval(f.Value, ctx), f.Filter);
+            case FilterExpr f:
+            {
+                var fval = Eval(f.Value, ctx);
+                if (f.Args is { Count: > 0 })
+                    return ApplyFilterWithArgs(fval, f.Filter, f.Args.Select(a => Eval(a, ctx)).ToList());
+                return ApplyFilter(fval, f.Filter);
+            }
 
             case MethodExpr m:
                 var mArgs = m.Args.Select(a => Eval(a, ctx)).ToList();
@@ -915,7 +929,8 @@ public sealed class JinjaChatTemplate
             "undefined" => val is null,
             "none"      => val is null,
             "integer" or "number" => val is long or int or double,
-            "iterable"  => val is System.Collections.IList,
+            "boolean"   => val is bool,
+            "iterable" or "sequence" => val is System.Collections.IList,
             "mapping"   => val is System.Collections.IDictionary,
             "true"      => Truthy(val),
             "false"     => !Truthy(val),
@@ -1004,16 +1019,79 @@ public sealed class JinjaChatTemplate
         "float"     => Convert.ToDouble(val),
         "abs"       => val is long lv ? (object)Math.Abs(lv) : val,
         "e" or "escape" or "forceescape" => val is string se ? (object)HtmlEscape(se) : val,
-        "items" => val switch
-        {
-            Dictionary<string, object?> d => (object?)d
-                .Select(kv => (object?)new List<object?> { kv.Key, kv.Value }).ToList(),
-            System.Collections.IDictionary id => id.Keys.Cast<object?>()
-                .Select(k => (object?)new List<object?> { k, k != null ? id[k] : null }).ToList(),
-            _ => val
-        },
+        "items"    => DictItems(val, sort: false),
+        // Jinja `dictsort` yields (key, value) pairs ordered by key. Used heavily by the
+        // Gemma 4 tool template to render JSON-schema properties deterministically.
+        "dictsort" => DictItems(val, sort: true),
         _ => val
     };
+
+    /// <summary>
+    /// Filters that take arguments (<c>default(x)</c>, <c>map('upper')</c>, <c>join(sep)</c>).
+    /// An unrecognised parenthesised filter degrades to a no-op (returns the value unchanged)
+    /// rather than throwing — a hard throw would lose the whole template for any model whose
+    /// chat template uses a filter we haven't implemented. But an argument-taking filter that
+    /// no-ops is almost always a dropped transformation (e.g. <c>selectattr</c> that should have
+    /// narrowed a list), so we emit a one-time diagnostic to make the silent-no-op observable.
+    /// </summary>
+    private static object? ApplyFilterWithArgs(object? val, string filter, List<object?> args) => filter switch
+    {
+        // `x | default(y)` → y when x is undefined/null (our engine conflates the two).
+        "default" or "d" => val ?? (args.Count > 0 ? args[0] : null),
+        // `seq | map('filtername')` → apply the named (argument-less) filter to each element.
+        "map"  => MapFilter(val, args.Count > 0 ? Stringify(args[0]) : ""),
+        "join" => val is System.Collections.IEnumerable en && val is not string
+                    ? string.Join(args.Count > 0 ? Stringify(args[0]) : "",
+                                  en.Cast<object?>().Select(Stringify))
+                    : val,
+        _ => UnknownArgFilter(val, filter),
+    };
+
+    private static object? UnknownArgFilter(object? val, string filter)
+    {
+        WarnUnsupportedOnce("filter", filter);
+        return ApplyFilter(val, filter);   // last-ditch: maybe it's an arg-less filter we know
+    }
+
+    // One diagnostic per distinct unsupported filter/method per process. Console.Error is the
+    // only channel available from this dependency-free Core type; deduped so it never spams.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> s_warnedUnsupported = new();
+    private static void WarnUnsupportedOnce(string kind, string name)
+    {
+        if (s_warnedUnsupported.TryAdd($"{kind}:{name}", 0))
+            Console.Error.WriteLine(
+                $"[SharpInference.Jinja] Unsupported {kind} '{name}' — value passed through unchanged; " +
+                "rendered template output may be wrong.");
+    }
+
+    private static object? DictItems(object? val, bool sort)
+    {
+        IEnumerable<KeyValuePair<string, object?>>? pairs = val switch
+        {
+            Dictionary<string, object?> d => d,
+            IReadOnlyDictionary<string, object?> rd => rd,
+            _ => null,
+        };
+        if (pairs is null)
+        {
+            // Non-generic dictionary (e.g. parsed JSON object backed by a different map type).
+            if (val is System.Collections.IDictionary id)
+            {
+                var list = id.Keys.Cast<object?>()
+                    .Select(k => new KeyValuePair<string, object?>(Stringify(k), k != null ? id[k] : null));
+                pairs = list;
+            }
+            else return val;
+        }
+        if (sort) pairs = pairs.OrderBy(kv => kv.Key, StringComparer.Ordinal);
+        return pairs.Select(kv => (object?)new List<object?> { kv.Key, kv.Value }).ToList();
+    }
+
+    private static object? MapFilter(object? val, string filterName)
+    {
+        if (val is not System.Collections.IEnumerable en || val is string) return val;
+        return en.Cast<object?>().Select(item => ApplyFilter(item, filterName)).ToList();
+    }
 
     private static object? CallMethod(object? obj, string method, List<object?> args)
     {
@@ -1048,6 +1126,36 @@ public sealed class JinjaChatTemplate
                 "extend" => ExtendList(list, args.Count > 0 ? AsList(args[0]) : []),
                 _ => null
             };
+        }
+        // Dict methods: `.get(key[, default])`, `.keys()`, `.values()`, `.items()`.
+        // The Gemma 4 tool template leans on `.get()` for optional message fields
+        // (tool_calls, tool_responses, content, name, reasoning, tool_call_id).
+        if (obj is Dictionary<string, object?> or IReadOnlyDictionary<string, object?>)
+        {
+            switch (method)
+            {
+                case "get":
+                {
+                    object? fallback = args.Count > 1 ? args[1] : null;
+                    var v = args.Count > 0 && args[0] is string key ? GetAttr(obj, key) : null;
+                    return v ?? fallback;
+                }
+                case "keys":
+                    return obj is Dictionary<string, object?> dk
+                        ? dk.Keys.Select(k => (object?)k).ToList()
+                        : ((IReadOnlyDictionary<string, object?>)obj).Keys.Select(k => (object?)k).ToList();
+                case "values":
+                    return obj is Dictionary<string, object?> dv
+                        ? dv.Values.ToList()
+                        : ((IReadOnlyDictionary<string, object?>)obj).Values.ToList();
+                case "items":
+                    return ApplyFilter(obj, "items");
+                default:
+                    // A called dict method we don't implement (e.g. .pop/.setdefault) returning
+                    // null is almost certainly a dropped operation — surface it once.
+                    WarnUnsupportedOnce("dict method", method);
+                    return null;
+            }
         }
         return null;
     }

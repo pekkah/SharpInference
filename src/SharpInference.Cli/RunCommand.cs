@@ -220,6 +220,15 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             s_thinkTokenId = thinkId;
             s_endThinkTokenId = endThinkId;
         }
+        // Gemma 4 brackets its reasoning in <|channel>thought … <channel|> instead. Route it
+        // through the same think/end-think machinery so the markers don't leak into output.
+        else if (tokenizer.SpecialTokens.TryGetValue("<|channel>", out int channelId)
+            && tokenizer.SpecialTokens.TryGetValue("<channel|>", out int endChannelId)
+            && channelId > 0 && endChannelId > 0)
+        {
+            s_thinkTokenId = channelId;
+            s_endThinkTokenId = endChannelId;
+        }
 
         // Greedy on a reasoning model tends to "wait, but actually" itself into infinite
         // loops; --no-thinking sidesteps the issue since the model won't reason at all.
@@ -1068,18 +1077,14 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     private static JinjaChatTemplate? s_jinja;  // parsed from GGUF tokenizer.chat_template
 
     /// <summary>
-    /// Builds the stop token ID list: EOS plus any end-of-turn special tokens
-    /// (<|eot_id|>, <|eom_id|>, <|end|>, <|im_end|>) present in the model vocabulary.
+    /// Builds the stop token ID list. Delegates to <see cref="GgufTokenizer.EogTokenIds"/> —
+    /// the single source of truth for end-of-generation tokens (EOS plus the end-of-turn
+    /// variants used by Llama 3/4, Mistral, Phi, Gemma, etc.) — so the CLI and server stop on
+    /// exactly the same set. Notably this is what lets the CLI halt on Gemma 4's <c>&lt;eos&gt;</c>
+    /// (id 1, distinct from its configured EOS <c>&lt;turn|&gt;</c> at id 106) instead of decoding
+    /// it as literal text.
     /// </summary>
-    private static IReadOnlyList<int> BuildStopTokenIds(GgufTokenizer tokenizer)
-    {
-        var stops = new HashSet<int> { tokenizer.EosTokenId };
-        // End-of-turn tokens used by Llama 3/4, Mistral, Phi, etc.
-        foreach (var name in new[] { "<|eot_id|>", "<|eom_id|>", "<|eot|>", "<|eom|>", "<|end|>", "<|im_end|>", "<|endoftext|>" })
-            if (tokenizer.SpecialTokens.TryGetValue(name, out int id) && id != tokenizer.EosTokenId)
-                stops.Add(id);
-        return [.. stops];
-    }
+    private static IReadOnlyList<int> BuildStopTokenIds(GgufTokenizer tokenizer) => tokenizer.EogTokenIds;
 
     // Accept llama.cpp's "draft-mtp" alongside the shorter "mtp" so existing command
     // lines copy-paste over. Unknown values fall back to auto with a console warning.

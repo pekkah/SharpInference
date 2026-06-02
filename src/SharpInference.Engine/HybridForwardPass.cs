@@ -159,6 +159,14 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         LayerPlacement placement, bool enableTq = false, int tqFp32Window = 256, int tqBits = 3,
         int expertSlotCapacity = -1)
     {
+        // Gemma 4 has no Vulkan implementation (no SWA / PLE / per-layer head_dim / softcap);
+        // a hybrid Vulkan split would silently produce garbage. hp.LayerHeadDim is the gemma4
+        // master switch. CUDA (CudaHybridForwardPass) and CPU are the supported backends.
+        if (hp.LayerHeadDim is not null)
+            throw new NotSupportedException(
+                "Gemma 4 models are not supported on the Vulkan backend. " +
+                "Use the CUDA backend (-g) or CPU (NGpuLayers=0).");
+
         _model = model;
         _gpu = gpu;
         _hp = hp;

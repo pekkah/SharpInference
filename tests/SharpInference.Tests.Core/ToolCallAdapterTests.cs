@@ -239,4 +239,204 @@ public sealed class ToolCallAdapterTests
         Assert.Equal("just an answer with no tool call", plain);
         Assert.Empty(calls);
     }
+
+    // ── Gemma 4 adapter ───────────────────────────────────────────────────────
+
+    [Fact]
+    public void Registry_ResolvesGemma4() =>
+        Assert.IsType<Gemma4ToolCallAdapter>(ToolCallAdapterRegistry.Get("gemma4"));
+
+    [Fact]
+    public void Gemma4_Parse_StringArgument()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>";
+        var (plain, calls) = a.Parse(raw);
+        Assert.Equal("", plain);
+        Assert.Single(calls);
+        Assert.Equal("get_weather", calls[0].Name);
+        Assert.Equal("Paris", calls[0].Arguments["city"]);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_MixedScalarArguments()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        // string, int, double, bool — Gemma's bare/quoted scalar mix.
+        var raw = "<|tool_call>call:book{name:<|\"|>Ada<|\"|>,count:3,ratio:1.5,vip:true}<tool_call|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        Assert.Equal("Ada", calls[0].Arguments["name"]);
+        Assert.Equal(3L, calls[0].Arguments["count"]);
+        Assert.Equal(1.5d, calls[0].Arguments["ratio"]);
+        Assert.Equal(true, calls[0].Arguments["vip"]);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_StringWithCommaAndBraces()
+    {
+        // Structural chars inside a <|"|>-quoted string must NOT split the argument.
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:say{text:<|\"|>a, b, {c}<|\"|>,n:1}<tool_call|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        Assert.Equal("a, b, {c}", calls[0].Arguments["text"]);
+        Assert.Equal(1L, calls[0].Arguments["n"]);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_NestedObjectAndArray()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:q{filter:{min:0,max:10},tags:[<|\"|>x<|\"|>,<|\"|>y<|\"|>]}<tool_call|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        var filter = Assert.IsType<Dictionary<string, object?>>(calls[0].Arguments["filter"]);
+        Assert.Equal(0L, filter["min"]);
+        Assert.Equal(10L, filter["max"]);
+        var tags = Assert.IsType<List<object?>>(calls[0].Arguments["tags"]);
+        Assert.Equal(new object?[] { "x", "y" }, tags);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_NoArguments()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:get_time{}<tool_call|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        Assert.Equal("get_time", calls[0].Name);
+        Assert.Empty(calls[0].Arguments);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_TextBeforeAndMultipleCalls()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "Let me check.<|tool_call>call:a{k:1}<tool_call|>"
+                + "<|tool_call>call:b{k:2}<tool_call|>";
+        var (plain, calls) = a.Parse(raw);
+        Assert.Equal("Let me check.", plain);
+        Assert.Equal(2, calls.Count);
+        Assert.Equal("a", calls[0].Name);
+        Assert.Equal("b", calls[1].Name);
+        Assert.Equal(2L, calls[1].Arguments["k"]);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_PlainTextStaysPlain()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        var (plain, calls) = a.Parse("Paris is the capital of France.");
+        Assert.Equal("Paris is the capital of France.", plain);
+        Assert.Empty(calls);
+    }
+
+    [Fact]
+    public void Gemma4_FindMarkers_RoundTripsBlock()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        var buf = "pre<|tool_call>call:x{k:<|\"|>v<|\"|>}<tool_call|>post";
+        int open = a.FindOpenMarker(buf, 0, out int contentStart);
+        Assert.Equal(3, open);
+        Assert.Equal(3 + "<|tool_call>".Length, contentStart);
+        int close = a.FindCloseMarker(buf, contentStart, out int afterClose);
+        Assert.True(close > contentStart);
+        Assert.Equal(close + "<tool_call|>".Length, afterClose);
+
+        var block = buf[contentStart..close];
+        var calls = a.ParseBlock(block);
+        Assert.Single(calls);
+        Assert.Equal("x", calls[0].Name);
+        Assert.Equal("v", calls[0].Arguments["k"]);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_MissingCloseMarker_IsTruncatedNotEmitted()
+    {
+        // Model stopped before emitting <tool_call|>. A truncated call must NOT be emitted as a
+        // complete call (the streaming path surfaces it as text + length); instead Parse flags
+        // truncation and folds the partial into PlainText.
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}";
+        var result = a.Parse(raw);
+        Assert.True(result.Truncated);
+        Assert.Empty(result.Calls);
+        Assert.Contains("call:get_weather", result.PlainText);
+        // Back-compat 2-value deconstruction still works.
+        var (plain, calls) = a.Parse(raw);
+        Assert.Empty(calls);
+        Assert.Equal(result.PlainText, plain);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_CompleteCallBeforeTruncated_EmitsCompleteOnly()
+    {
+        // One complete call, then a second that gets cut off → first is emitted, second is
+        // surfaced as text with Truncated=true.
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:a{k:1}<tool_call|><|tool_call>call:b{k:";
+        var result = a.Parse(raw);
+        Assert.True(result.Truncated);
+        Assert.Single(result.Calls);
+        Assert.Equal("a", result.Calls[0].Name);
+        Assert.Contains("call:b", result.PlainText);
+    }
+
+    [Fact]
+    public void Gemma4_RenderToolResult_CarriesToolCallId()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        var msg = a.RenderToolResult("call_42", "sunny, 21C");
+        Assert.Equal("tool", msg["role"]);
+        Assert.Equal("sunny, 21C", msg["content"]);
+        Assert.Equal("call_42", msg["tool_call_id"]);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_NullAndNegativeAndBarewordScalars()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:f{a:null,b:-3,c:-1.5,d:pending}<tool_call|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        Assert.Null(calls[0].Arguments["a"]);
+        Assert.Equal(-3L, calls[0].Arguments["b"]);
+        Assert.Equal(-1.5d, calls[0].Arguments["c"]);
+        Assert.Equal("pending", calls[0].Arguments["d"]);   // unparseable bareword → raw string
+    }
+
+    [Fact]
+    public void Gemma4_Parse_QuotedKey()
+    {
+        // Keys are normally bare, but the parser also accepts a <|"|>-quoted key.
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:f{<|\"|>weird key<|\"|>:<|\"|>v<|\"|>}<tool_call|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        Assert.Equal("v", calls[0].Arguments["weird key"]);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_UnterminatedQuote_TakesRemainder()
+    {
+        // Missing closing <|"|> → value absorbs the rest of the block (documented tolerance).
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:f{msg:<|\"|>hello world<tool_call|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        Assert.Equal("f", calls[0].Name);
+        Assert.Equal("hello world", calls[0].Arguments["msg"]);
+    }
+
+    [Fact]
+    public void Gemma4_FindMarkers_ReturnNegativeWhenAbsent()
+    {
+        // The streaming state machine relies on the -1 / out=-1 not-found contract.
+        var a = new Gemma4ToolCallAdapter();
+        Assert.Equal(-1, a.FindOpenMarker("plain text, no markers", 0, out int contentStart));
+        Assert.Equal(-1, contentStart);
+        Assert.Equal(-1, a.FindCloseMarker("still nothing here", 0, out int afterClose));
+        Assert.Equal(-1, afterClose);
+    }
 }

@@ -129,6 +129,15 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     public GpuForwardPass(GgufModel model, VulkanBackend gpu, ModelHyperparams hp,
         int maxContextLength = 0, bool enableTurboQuant = false, int tqFp32Window = 256, int tqBits = 3)
     {
+        // Gemma 4's per-layer head_dim, sliding-window attention, PLE injection, KV-share tail,
+        // and final-logit softcap have no Vulkan implementation — only CUDA and CPU. Running it
+        // here would silently produce garbage (generic dense path with wrong dims / no PLE / no
+        // softcap), so reject up front. hp.LayerHeadDim is the gemma4 master switch.
+        if (hp.LayerHeadDim is not null)
+            throw new NotSupportedException(
+                "Gemma 4 models are not supported on the Vulkan backend (no SWA / PLE / per-layer " +
+                "head_dim / softcap kernels). Use the CUDA backend (-g) or CPU (NGpuLayers=0).");
+
         _model = model;
         _gpu = gpu;
         _hp = hp;

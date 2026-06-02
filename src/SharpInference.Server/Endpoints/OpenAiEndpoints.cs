@@ -158,9 +158,13 @@ public static class OpenAiEndpoints
         var rawText = textSb.ToString();
         IReadOnlyList<ParsedToolCall> parsedCalls;
         string plainText;
+        bool truncatedCall = false;
         if (toolsActive)
         {
-            (plainText, parsedCalls) = adapter.Parse(rawText);
+            var pr = adapter.Parse(rawText);
+            plainText = pr.PlainText;
+            parsedCalls = pr.Calls;
+            truncatedCall = pr.Truncated;
         }
         else
         {
@@ -185,6 +189,13 @@ public static class OpenAiEndpoints
             // OpenAI returns content: null when a tool_calls array is present and there
             // was no accompanying text; an empty string would be a wire-shape mismatch.
             if (plainText.Length == 0) content = null;
+        }
+        else if (truncatedCall)
+        {
+            // Model hit max_tokens / EOS inside an unterminated tool call. The partial was
+            // surfaced as content by Parse; report length so the client knows it was cut off
+            // and does NOT receive a half-parsed call. Mirrors the streaming path.
+            finishReason = "length";
         }
 
         var message = new OaiAssistantMessage(

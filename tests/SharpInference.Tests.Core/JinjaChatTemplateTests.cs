@@ -128,4 +128,101 @@ public sealed class JinjaChatTemplateTests
         };
         Assert.Equal("foo:bar;baz:qux;", Render(src, ctx));
     }
+
+    // ── Filters/tests added for the Gemma 4 tool template ─────────────────────
+
+    [Fact]
+    public void Dictsort_YieldsKeyValuePairsSortedByKey()
+    {
+        // Insertion order is b, a — dictsort must emit a then b.
+        const string src = "{% for k, v in d | dictsort %}{{ k }}={{ v }};{% endfor %}";
+        var ctx = new Dictionary<string, object?>
+        {
+            ["d"] = new Dictionary<string, object?> { ["b"] = 2L, ["a"] = 1L },
+        };
+        Assert.Equal("a=1;b=2;", Render(src, ctx));
+    }
+
+    [Fact]
+    public void DefaultFilter_ReplacesUndefined()
+    {
+        var ctx = new Dictionary<string, object?> { ["x"] = null };
+        Assert.Equal("fallback", Render("{{ x | default('fallback') }}", ctx));
+    }
+
+    [Fact]
+    public void DefaultFilter_KeepsDefinedValue()
+    {
+        var ctx = new Dictionary<string, object?> { ["x"] = "real" };
+        Assert.Equal("real", Render("{{ x | default('fallback') }}", ctx));
+    }
+
+    [Fact]
+    public void DefaultFilter_EmptyListFallbackInForLoop()
+    {
+        // `for item in missing | default([])` must iterate zero times, not crash.
+        Assert.Equal("", Render("{% for i in missing | default([]) %}{{ i }}{% endfor %}"));
+    }
+
+    [Fact]
+    public void MapFilter_AppliesNamedFilterToEachElement()
+    {
+        var ctx = new Dictionary<string, object?>
+        {
+            ["xs"] = new List<object?> { "a", "b" },
+        };
+        Assert.Equal("A,B,", Render("{% for x in xs | map('upper') | list %}{{ x }},{% endfor %}", ctx));
+    }
+
+    [Fact]
+    public void IsBoolean_Test()
+    {
+        var ctx = new Dictionary<string, object?> { ["t"] = true, ["s"] = "x" };
+        Assert.Equal("yes", Render("{% if t is boolean %}yes{% else %}no{% endif %}", ctx));
+        Assert.Equal("no", Render("{% if s is boolean %}yes{% else %}no{% endif %}", ctx));
+    }
+
+    [Fact]
+    public void IsSequence_Test()
+    {
+        var ctx = new Dictionary<string, object?>
+        {
+            ["lst"] = new List<object?> { 1L },
+            ["str"] = "x",
+        };
+        Assert.Equal("yes", Render("{% if lst is sequence %}yes{% else %}no{% endif %}", ctx));
+        // A bare string is not classified as a sequence here (template guards `is string` first).
+        Assert.Equal("no", Render("{% if str is sequence %}yes{% else %}no{% endif %}", ctx));
+    }
+
+    [Fact]
+    public void JoinFilter_ConcatenatesWithSeparator()
+    {
+        var ctx = new Dictionary<string, object?> { ["xs"] = new List<object?> { "a", "b", "c" } };
+        Assert.Equal("a-b-c", Render("{{ xs | join('-') }}", ctx));
+    }
+
+    [Fact]
+    public void DictGet_ReturnsValueOrFallback()
+    {
+        var ctx = new Dictionary<string, object?>
+        {
+            ["d"] = new Dictionary<string, object?> { ["present"] = "P" },
+        };
+        Assert.Equal("P", Render("{{ d.get('present', 'fallback') }}", ctx));
+        Assert.Equal("fallback", Render("{{ d.get('missing', 'fallback') }}", ctx));
+        // No fallback arg → empty string for a missing key.
+        Assert.Equal("", Render("{{ d.get('missing') }}", ctx));
+    }
+
+    [Fact]
+    public void DictKeysAndValues_Iterate()
+    {
+        var ctx = new Dictionary<string, object?>
+        {
+            ["d"] = new Dictionary<string, object?> { ["a"] = 1L, ["b"] = 2L },
+        };
+        Assert.Equal("a,b,", Render("{% for k in d.keys() %}{{ k }},{% endfor %}", ctx));
+        Assert.Equal("1,2,", Render("{% for v in d.values() %}{{ v }},{% endfor %}", ctx));
+    }
 }

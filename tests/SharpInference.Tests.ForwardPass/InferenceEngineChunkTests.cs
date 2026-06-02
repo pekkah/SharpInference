@@ -61,6 +61,26 @@ public sealed class InferenceEngineChunkTests
         Assert.Equal("Hi there", sb.ToString());
     }
 
+    [Fact]
+    public async Task GenerateChunksAsync_StopsOnAlternateEogToken()
+    {
+        // EogTokenIds = {EOS=6, alternate=Y=5}. Model emits: Hi, Y(alt-EOG), X.
+        // Generation must halt at the alternate EOG token — only "Hi" is emitted; neither the
+        // stop token nor anything after it appears. This is the Gemma 4 <eos>-vs-<turn|> fix:
+        // without EogTokenIds the engine would stop only on EOS (6) and decode Y as text.
+        var scripted = new int[] { TokHi, TokY, TokX };
+        var tokenizer = new ScriptedTokenizer { EogOverride = [TokEos, TokY] };
+        var fwd = new ScriptedForwardPass(scripted, tokenizer.VocabSize);
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock", thinkTokenId: -1, endThinkTokenId: -1);
+
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 10 };
+        var sb = new StringBuilder();
+        await foreach (var s in engine.GenerateAsync("seed", sp))
+            sb.Append(s);
+
+        Assert.Equal("Hi", sb.ToString());
+    }
+
     // ── With reasoning ───────────────────────────────────────────────────
 
     [Fact]
@@ -258,6 +278,10 @@ public sealed class InferenceEngineChunkTests
         public int UnknownTokenId => 0;
         public int PadTokenId => TokEos;
         public bool AddBosToken => false;
+
+        /// <summary>When set, overrides the end-of-generation set (default is just EOS).</summary>
+        public System.Collections.Immutable.ImmutableArray<int>? EogOverride { get; set; }
+        public System.Collections.Immutable.ImmutableArray<int> EogTokenIds => EogOverride ?? [EosTokenId];
 
         public int[] PromptTokens { get; set; } = [TokHi];
 

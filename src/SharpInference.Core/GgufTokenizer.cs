@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Text;
 using System.Text.Json;
 using Microsoft.ML.Tokenizers;
@@ -35,6 +36,16 @@ public sealed class GgufTokenizer : ITokenizer
     public int PadTokenId { get; }
     public bool AddBosToken { get; }
 
+    /// <summary>
+    /// All end-of-generation token IDs: the configured EOS plus any well-known EOG marker
+    /// present in this vocab (e.g. Gemma 4's <c>&lt;eos&gt;</c> at id 1, which is distinct from
+    /// its configured EOS <c>&lt;turn|&gt;</c> at id 106). Generation should stop on ANY of these;
+    /// otherwise a model that emits an alternate end token decodes it as literal text and runs on.
+    /// Always contains at least <see cref="EosTokenId"/>. See <see cref="BuildEogTokenIds"/> for
+    /// the resolution rules. Immutable, so the published stop set can't be tampered with.
+    /// </summary>
+    public ImmutableArray<int> EogTokenIds { get; }
+
     /// <summary>All special (control) tokens keyed by their string representation.</summary>
     public IReadOnlyDictionary<string, int> SpecialTokens => _specialTokens;
 
@@ -61,7 +72,8 @@ public sealed class GgufTokenizer : ITokenizer
         bool addBosToken,
         bool needsByteEncoding,
         bool isSpmBpe,
-        Dictionary<(string, string), int>? spmMerges)
+        Dictionary<(string, string), int>? spmMerges,
+        ImmutableArray<int> eogTokenIds)
     {
         _inner = inner;
         _specialTokens = specialTokens;
@@ -77,6 +89,7 @@ public sealed class GgufTokenizer : ITokenizer
         UnknownTokenId = unknownTokenId;
         PadTokenId = padTokenId;
         AddBosToken = addBosToken;
+        EogTokenIds = eogTokenIds;
     }
 
     /// <summary>
@@ -254,11 +267,14 @@ public sealed class GgufTokenizer : ITokenizer
         for (int i = 0; i < tokensArray.Length; i++)
             idToToken[i] = (string)tokensArray[i];
 
+        var vocabLookup = BuildVocabLookup(tokensArray);
+        var eogIds = BuildEogTokenIds(vocabLookup, new HashSet<int>(specialTokens.Values), eosTokenId);
+
         var tokenizer = new GgufTokenizer(
             inner,
             specialTokens,
             specialTokens.ToDictionary(kv => kv.Value, kv => kv.Key),
-            BuildVocabLookup(tokensArray),
+            vocabLookup,
             idToToken,
             tokensArray.Length,
             bosTokenId,
@@ -268,7 +284,8 @@ public sealed class GgufTokenizer : ITokenizer
             addBosToken,
             needsByteEncoding,
             isSpmBpe,
-            spmMerges);
+            spmMerges,
+            eogIds);
 
         if (model.Metadata.TryGetValue("tokenizer.chat_template", out var tmpl) && tmpl is string tmplStr)
         {
@@ -285,6 +302,45 @@ public sealed class GgufTokenizer : ITokenizer
         for (int i = 0; i < tokensArray.Length; i++)
             vocab.TryAdd((string)tokensArray[i], i);
         return vocab;
+    }
+
+    // Canonical end-of-sequence names accepted even when typed NORMAL rather than control —
+    // Gemma 4 ships <eos> (id 1) as a normal token, distinct from its configured EOS <turn|>
+    // (id 106). A normal token literally named <eos>/<end_of_turn> appearing in generated
+    // content is not a real-world case, so treating it as a stop is safe.
+    private static readonly string[] s_canonicalEosNames = ["<eos>", "<end_of_turn>"];
+
+    // Bracket-style end-of-turn markers (Llama, Mistral, Phi, ChatML, ...). These are only
+    // accepted as stops when the vocab types them as control/user-defined tokens, so a model
+    // that legitimately uses one of these strings as ordinary text isn't silently truncated.
+    private static readonly string[] s_controlEogNames =
+        ["<|im_end|>", "<|eot_id|>", "<|eom_id|>", "<|eot|>", "<|eom|>", "<|end|>", "<|endoftext|>"];
+
+    /// <summary>
+    /// Builds the end-of-generation token set: the configured EOS plus any well-known EOG marker
+    /// present in <paramref name="vocabLookup"/>. llama.cpp stops on any EOG; mirroring that
+    /// prevents a model from decoding an alternate end token as literal text and running on past
+    /// its turn. Canonical EOS-family names (<see cref="s_canonicalEosNames"/>) are accepted even
+    /// when typed NORMAL (Gemma 4's <c>&lt;eos&gt;</c> is id 1, NORMAL-typed); the bracket-style
+    /// markers are accepted only when the vocab types them as control (id present in
+    /// <paramref name="specialIds"/>) so an ordinary token that happens to share the string isn't
+    /// silently turned into a stop. Always contains <paramref name="eosTokenId"/>.
+    /// </summary>
+    internal static ImmutableArray<int> BuildEogTokenIds(
+        IReadOnlyDictionary<string, int> vocabLookup, IReadOnlySet<int> specialIds, int eosTokenId)
+    {
+        var eogIds = new List<int> { eosTokenId };
+
+        void TryAdd(string name, bool requireControl)
+        {
+            if (vocabLookup.TryGetValue(name, out int id) && id > 0 && !eogIds.Contains(id)
+                && (!requireControl || specialIds.Contains(id)))
+                eogIds.Add(id);
+        }
+
+        foreach (var name in s_canonicalEosNames) TryAdd(name, requireControl: false);
+        foreach (var name in s_controlEogNames)   TryAdd(name, requireControl: true);
+        return [.. eogIds];
     }
 
     public IReadOnlyList<int> Encode(string text)

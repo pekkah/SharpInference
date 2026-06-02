@@ -8,4 +8,8 @@
     <PackageReference Include="Microsoft.ML.Tokenizers" Version="*" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="SharpInference.Tests.Core" />
+  </ItemGroup>
+
 </Project>
