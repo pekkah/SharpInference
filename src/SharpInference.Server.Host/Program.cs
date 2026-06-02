@@ -18,6 +18,19 @@ builder.Services.AddSharpInference(builder.Configuration, opts =>
 
     if (int.TryParse(Environment.GetEnvironmentVariable("SHARPI_MAX_BATCH"), out int maxBatch) && maxBatch > 0)
         opts.MaxBatchSize = maxBatch;
+
+    // SHARPI_BACKEND ∈ {auto, cpu, cuda, vulkan} — case-insensitive. Lets a
+    // smoke test or ad-hoc run override the appsettings.Local.json backend
+    // without editing the file (matches the SHARPI_MODEL pattern above).
+    var envBackend = Environment.GetEnvironmentVariable("SHARPI_BACKEND");
+    if (!string.IsNullOrWhiteSpace(envBackend)
+        && Enum.TryParse<SharpInference.Server.ServerBackend>(envBackend, ignoreCase: true, out var backend))
+    {
+        opts.Backend = backend;
+    }
+
+    if (int.TryParse(Environment.GetEnvironmentVariable("SHARPI_N_GPU_LAYERS"), out int nGpuLayers))
+        opts.NGpuLayers = nGpuLayers;
 });
 
 var app = builder.Build();

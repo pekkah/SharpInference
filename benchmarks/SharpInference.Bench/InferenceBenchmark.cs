@@ -1508,6 +1508,10 @@ internal static class BenchmarkHelper
 
     public static string? FindModelPath(string filename)
     {
+        // Conventional out-of-tree location for large (>20 GB) GGUFs on this host.
+        if (OperatingSystem.IsWindows() && File.Exists($@"E:\models\{filename}"))
+            return $@"E:\models\{filename}";
+
         var dir = Directory.GetCurrentDirectory();
         for (int i = 0; i < 10; i++)
         {
@@ -1523,5 +1527,168 @@ internal static class BenchmarkHelper
         }
 
         return null;
+    }
+}
+
+internal static class BenchmarkPromptHelper
+{
+    /// <summary>
+    /// Gemma 4 raw-completion prompt for parity vs llama.cpp `--no-conversation`:
+    /// prepend the BOS token id, then encode the user text. The tokenizer's
+    /// Encode() does not auto-prepend BOS; the CLI's SHARPI_RAW_PROMPT path
+    /// inlines the same step.
+    /// </summary>
+    public static IReadOnlyList<int> BuildGemma4PromptTokens(GgufModel model, string text)
+    {
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        int bosId = 2;
+        if (model.Metadata.TryGetValue("tokenizer.ggml.bos_token_id", out var bosObj))
+            bosId = Convert.ToInt32(bosObj);
+        var encoded = tokenizer.Encode(text);
+        var result = new int[encoded.Count + 1];
+        result[0] = bosId;
+        for (int i = 0; i < encoded.Count; i++) result[i + 1] = encoded[i];
+        return result;
+    }
+}
+
+// ── Gemma 4 E4B Q8 ────────────────────────────────────────────────────────────
+// Phase 9: smoke-bench so per-release t/s comparisons against llama.cpp have a
+// reference row. The model is 8.2 GB Q8_0; the CUDA path requires fitting all
+// 42 layers in VRAM (use a small context to leave headroom for KV).
+
+[MemoryDiagnoser]
+[WarmupCount(1)]
+[IterationCount(3)]
+public class Gemma4E4BCpuBenchmarks
+{
+    private const string ModelFile = "gemma-4-E4B-it-Q8_0.gguf";
+
+    private GgufModel _model = null!;
+    private CpuBackend _backend = null!;
+    private ForwardPass _fwd = null!;
+    private IReadOnlyList<int> _promptTokens = null!;
+
+    [Params(1, 32)]
+    public int TokenCount { get; set; }
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        var path = BenchmarkHelper.FindModelPath(ModelFile)
+            ?? throw new FileNotFoundException($"{ModelFile} not found (drop it in models/ or E:\\models\\).");
+
+        _model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(_model.Metadata, _model);
+        _backend = new CpuBackend();
+        _fwd = new ForwardPass(_model, _backend, hp);
+        // Gemma 4's GGUF carries a BOS token; mirror llama.cpp `--no-conversation`
+        // raw-completion mode used for the parity baseline.
+        _promptTokens = BenchmarkPromptHelper.BuildGemma4PromptTokens(_model, "The capital of France is");
+    }
+
+    [IterationSetup(Target = nameof(DecodeTokens))]
+    public void DecodeIterSetup()
+    {
+        _fwd.Cache.Reset();
+        for (int i = 0; i < _promptTokens.Count; i++)
+            _fwd.Forward(_promptTokens[i], i);
+    }
+
+    [Benchmark(Description = "Gemma 4 E4B Q8 CPU Decode N tokens")]
+    public int DecodeTokens()
+    {
+        ReadOnlySpan<float> logits = _fwd.Forward(
+            Sampler.Greedy(_fwd.Forward(_promptTokens[^1], _promptTokens.Count - 1)),
+            _promptTokens.Count);
+
+        int lastToken = Sampler.Greedy(logits);
+        int pos = _promptTokens.Count + 1;
+        for (int i = 1; i < TokenCount; i++)
+        {
+            logits = _fwd.Forward(lastToken, pos++);
+            lastToken = Sampler.Greedy(logits);
+        }
+        return lastToken;
+    }
+
+    [IterationSetup(Target = nameof(PrefillBatched))]
+    public void PrefillIterSetup() => _fwd.Cache.Reset();
+
+    [Benchmark(Description = "Gemma 4 E4B Q8 CPU Prefill batched")]
+    public int PrefillBatched()
+    {
+        var logits = _fwd.Prefill(_promptTokens);
+        return Sampler.Greedy(logits);
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        _fwd.Dispose();
+        _backend.Dispose();
+        _model.Dispose();
+    }
+}
+
+[MemoryDiagnoser]
+[WarmupCount(1)]
+[IterationCount(3)]
+public class Gemma4E4BCudaDecodeBenchmark
+{
+    private const string ModelFile = "gemma-4-E4B-it-Q8_0.gguf";
+
+    private GgufModel _model = null!;
+    private Cuda.CudaBackend _gpu = null!;
+    private CudaForwardPass _fwd = null!;
+    private IReadOnlyList<int> _promptTokens = null!;
+    private int _decodePos;
+    private int _lastToken;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        var path = BenchmarkHelper.FindModelPath(ModelFile)
+            ?? throw new FileNotFoundException($"{ModelFile} not found (drop it in models/ or E:\\models\\).");
+
+        _model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(_model.Metadata, _model);
+        _gpu = Cuda.CudaBackend.Create();
+        // 512-token context keeps the full 42-layer Gemma 4 E4B Q8 model in VRAM
+        // on a 12 GB card without spilling to CudaHybridForwardPass.
+        _fwd = new CudaForwardPass(_model, _gpu, hp, maxContextLength: 512);
+        _promptTokens = BenchmarkPromptHelper.BuildGemma4PromptTokens(_model, "The capital of France is");
+    }
+
+    [IterationSetup]
+    public void IterSetup()
+    {
+        _fwd.ResetCache();
+        ReadOnlySpan<float> logits = default;
+        for (int i = 0; i < _promptTokens.Count; i++)
+            logits = _fwd.Forward(_promptTokens[i], i);
+        _lastToken = Sampler.Greedy(logits);
+        _decodePos = _promptTokens.Count;
+    }
+
+    [Benchmark(Description = "Gemma 4 E4B Q8 CUDA Decode 32 tokens")]
+    public int Decode()
+    {
+        ReadOnlySpan<float> logits = _fwd.Forward(_lastToken, _decodePos++);
+        int lastToken = Sampler.Greedy(logits);
+        for (int i = 1; i < 32; i++)
+        {
+            logits = _fwd.Forward(lastToken, _decodePos++);
+            lastToken = Sampler.Greedy(logits);
+        }
+        return lastToken;
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        _fwd?.Dispose();
+        _gpu?.Dispose();
+        _model?.Dispose();
     }
 }
