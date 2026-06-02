@@ -1,3 +1,5 @@
+using System.Collections.Immutable;
+
 namespace SharpInference.Core;
 
 /// <summary>
@@ -30,8 +32,9 @@ public interface ITokenizer
     /// All end-of-generation token IDs (the configured EOS plus any alternate EOG control
     /// tokens this vocab defines). Generation stops on ANY of these. Defaults to just
     /// <see cref="EosTokenId"/> for tokenizers that don't distinguish a broader set.
+    /// Immutable so the published stop set can't be tampered with by a consumer.
     /// </summary>
-    int[] EogTokenIds => [EosTokenId];
+    ImmutableArray<int> EogTokenIds => [EosTokenId];
 
     /// <summary>Whether BOS token should be automatically prepended.</summary>
     bool AddBosToken { get; }

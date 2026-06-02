@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Text;
 using System.Text.Json;
 using Microsoft.ML.Tokenizers;
@@ -41,9 +42,9 @@ public sealed class GgufTokenizer : ITokenizer
     /// its configured EOS <c>&lt;turn|&gt;</c> at id 106). Generation should stop on ANY of these;
     /// otherwise a model that emits an alternate end token decodes it as literal text and runs on.
     /// Always contains at least <see cref="EosTokenId"/>. See <see cref="BuildEogTokenIds"/> for
-    /// the resolution rules. Treat as read-only.
+    /// the resolution rules. Immutable, so the published stop set can't be tampered with.
     /// </summary>
-    public int[] EogTokenIds { get; }
+    public ImmutableArray<int> EogTokenIds { get; }
 
     /// <summary>All special (control) tokens keyed by their string representation.</summary>
     public IReadOnlyDictionary<string, int> SpecialTokens => _specialTokens;
@@ -72,7 +73,7 @@ public sealed class GgufTokenizer : ITokenizer
         bool needsByteEncoding,
         bool isSpmBpe,
         Dictionary<(string, string), int>? spmMerges,
-        int[] eogTokenIds)
+        ImmutableArray<int> eogTokenIds)
     {
         _inner = inner;
         _specialTokens = specialTokens;
@@ -284,7 +285,7 @@ public sealed class GgufTokenizer : ITokenizer
             needsByteEncoding,
             isSpmBpe,
             spmMerges,
-            eogIds.ToArray());
+            eogIds);
 
         if (model.Metadata.TryGetValue("tokenizer.chat_template", out var tmpl) && tmpl is string tmplStr)
         {
@@ -325,7 +326,7 @@ public sealed class GgufTokenizer : ITokenizer
     /// <paramref name="specialIds"/>) so an ordinary token that happens to share the string isn't
     /// silently turned into a stop. Always contains <paramref name="eosTokenId"/>.
     /// </summary>
-    internal static int[] BuildEogTokenIds(
+    internal static ImmutableArray<int> BuildEogTokenIds(
         IReadOnlyDictionary<string, int> vocabLookup, IReadOnlySet<int> specialIds, int eosTokenId)
     {
         var eogIds = new List<int> { eosTokenId };

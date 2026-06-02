@@ -1028,8 +1028,11 @@ public sealed class JinjaChatTemplate
 
     /// <summary>
     /// Filters that take arguments (<c>default(x)</c>, <c>map('upper')</c>, <c>join(sep)</c>).
-    /// Falls through to the argument-less <see cref="ApplyFilter"/> for everything else so an
-    /// unrecognised parenthesised filter degrades to a no-op rather than dropping the value.
+    /// An unrecognised parenthesised filter degrades to a no-op (returns the value unchanged)
+    /// rather than throwing — a hard throw would lose the whole template for any model whose
+    /// chat template uses a filter we haven't implemented. But an argument-taking filter that
+    /// no-ops is almost always a dropped transformation (e.g. <c>selectattr</c> that should have
+    /// narrowed a list), so we emit a one-time diagnostic to make the silent-no-op observable.
     /// </summary>
     private static object? ApplyFilterWithArgs(object? val, string filter, List<object?> args) => filter switch
     {
@@ -1041,8 +1044,25 @@ public sealed class JinjaChatTemplate
                     ? string.Join(args.Count > 0 ? Stringify(args[0]) : "",
                                   en.Cast<object?>().Select(Stringify))
                     : val,
-        _ => ApplyFilter(val, filter),
+        _ => UnknownArgFilter(val, filter),
     };
+
+    private static object? UnknownArgFilter(object? val, string filter)
+    {
+        WarnUnsupportedOnce("filter", filter);
+        return ApplyFilter(val, filter);   // last-ditch: maybe it's an arg-less filter we know
+    }
+
+    // One diagnostic per distinct unsupported filter/method per process. Console.Error is the
+    // only channel available from this dependency-free Core type; deduped so it never spams.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> s_warnedUnsupported = new();
+    private static void WarnUnsupportedOnce(string kind, string name)
+    {
+        if (s_warnedUnsupported.TryAdd($"{kind}:{name}", 0))
+            Console.Error.WriteLine(
+                $"[SharpInference.Jinja] Unsupported {kind} '{name}' — value passed through unchanged; " +
+                "rendered template output may be wrong.");
+    }
 
     private static object? DictItems(object? val, bool sort)
     {
@@ -1131,6 +1151,9 @@ public sealed class JinjaChatTemplate
                 case "items":
                     return ApplyFilter(obj, "items");
                 default:
+                    // A called dict method we don't implement (e.g. .pop/.setdefault) returning
+                    // null is almost certainly a dropped operation — surface it once.
+                    WarnUnsupportedOnce("dict method", method);
                     return null;
             }
         }

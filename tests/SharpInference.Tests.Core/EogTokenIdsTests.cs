@@ -20,7 +20,7 @@ public sealed class EogTokenIdsTests
     public void AlwaysContainsConfiguredEos()
     {
         var eog = GgufTokenizer.BuildEogTokenIds(Vocab(), new HashSet<int>(), eosTokenId: 42);
-        Assert.Equal([42], eog);
+        Assert.Equal(new[] { 42 }, eog);
     }
 
     [Fact]
@@ -54,7 +54,7 @@ public sealed class EogTokenIdsTests
         // Configured EOS id is also reachable by name → appears once.
         var vocab = Vocab(("<|im_end|>", 7));
         var eog = GgufTokenizer.BuildEogTokenIds(vocab, specialIds: new HashSet<int> { 7 }, eosTokenId: 7);
-        Assert.Equal([7], eog);
+        Assert.Equal(new[] { 7 }, eog);
     }
 
     [Fact]
@@ -63,7 +63,7 @@ public sealed class EogTokenIdsTests
         // id 0 is pad/unk territory — never a stop; absent names are skipped.
         var vocab = Vocab(("<eos>", 0));
         var eog = GgufTokenizer.BuildEogTokenIds(vocab, specialIds: new HashSet<int> { 0 }, eosTokenId: 5);
-        Assert.Equal([5], eog);
+        Assert.Equal(new[] { 5 }, eog);
     }
 
     [Fact]

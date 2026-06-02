@@ -280,8 +280,8 @@ public sealed class InferenceEngineChunkTests
         public bool AddBosToken => false;
 
         /// <summary>When set, overrides the end-of-generation set (default is just EOS).</summary>
-        public int[]? EogOverride { get; set; }
-        public int[] EogTokenIds => EogOverride ?? [EosTokenId];
+        public System.Collections.Immutable.ImmutableArray<int>? EogOverride { get; set; }
+        public System.Collections.Immutable.ImmutableArray<int> EogTokenIds => EogOverride ?? [EosTokenId];
 
         public int[] PromptTokens { get; set; } = [TokHi];
 

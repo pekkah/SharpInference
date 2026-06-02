@@ -54,7 +54,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         public required PagedKvCache Cache;
         public required SamplingParams Sp;
         public required Channel<GenerateChunk> Output;
-        public required int[] StopIds;
+        public required System.Collections.Immutable.ImmutableArray<int> StopIds;
         public required Random Rng;
         public required CancellationToken Ct;
         public int TokenCount;
@@ -334,7 +334,8 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         // Stop on ANY end-of-generation token, not just the configured EOS — matches the
         // single-user InferenceEngine path. A model with an alternate end token (e.g. Gemma's
         // <eos>, distinct from its <turn|> EOS) would otherwise decode it as text and run on.
-        var stopIds = req.Sp.StopTokenIds ?? _tokenizer.EogTokenIds;
+        System.Collections.Immutable.ImmutableArray<int> stopIds =
+            req.Sp.StopTokenIds is { } userStops ? [.. userStops] : _tokenizer.EogTokenIds;
         var rng = new Random();
 
         int firstToken = req.Sp.Temperature <= 0f
