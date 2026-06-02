@@ -59,6 +59,7 @@ public sealed class JinjaChatTemplate
         List<(IExpr Cond, List<INode> Body)> ElseIfs, List<INode>? Else) : INode;
     private sealed record ForNode(string Var, IExpr Iter, List<INode> Body) : INode;
     private sealed record SetNode(string[] Path, IExpr Value) : INode;
+    private sealed record BlockSetNode(string[] Path, List<INode> Body) : INode;
     private sealed record MacroNode(string Name, MacroDef Def) : INode;
 
     private sealed class MacroDef(List<string> posParams, List<(string Name, IExpr Default)> kwParams, List<INode> body)
@@ -75,6 +76,7 @@ public sealed class JinjaChatTemplate
     private sealed record IndexExpr(IExpr Obj, IExpr Idx) : IExpr;
     private sealed record SliceExpr(IExpr Obj, IExpr? Start, IExpr? Stop, IExpr? Step) : IExpr;
     private sealed record BinExpr(string Op, IExpr L, IExpr R) : IExpr;
+    private sealed record TernaryExpr(IExpr Cond, IExpr Then, IExpr Otherwise) : IExpr;
     private sealed record UnaryExpr(string Op, IExpr Operand) : IExpr;
     private sealed record CallExpr(string Name, List<IExpr> Args, List<(string Key, IExpr Val)> Kwargs) : IExpr;
     private sealed record MethodExpr(IExpr Obj, string Method, List<IExpr> Args) : IExpr;
@@ -241,7 +243,21 @@ public sealed class JinjaChatTemplate
                     else if (tag.StartsWith("set ", StringComparison.Ordinal))
                     {
                         pos++;
-                        nodes.Add(ParseSet(tag[4..].Trim()));
+                        string spec = tag[4..].Trim();
+                        // Block-set form: `{% set name %} ... {% endset %}` captures the
+                        // rendered body into a variable. No `=` (outside of comparisons)
+                        // distinguishes it from the inline `{% set x = expr %}` form.
+                        if (!SetHasAssignment(spec))
+                        {
+                            var bodyNodes = ParseNodes(tokens, ref pos);
+                            if (pos < tokens.Count && tokens[pos].Kind == TokenKind.Block
+                                && IsEndTag(tokens[pos].Content)) pos++;
+                            nodes.Add(new BlockSetNode(spec.Split('.'), bodyNodes));
+                        }
+                        else
+                        {
+                            nodes.Add(ParseSet(spec));
+                        }
                     }
                     else if (tag is "else" || tag.StartsWith("elif ", StringComparison.Ordinal))
                     {
@@ -300,7 +316,23 @@ public sealed class JinjaChatTemplate
     }
 
     private static bool IsEndTag(string tag) =>
-        tag is "endif" or "endfor" or "endblock" or "endmacro" or "endraw";
+        tag is "endif" or "endfor" or "endblock" or "endmacro" or "endraw" or "endset";
+
+    /// <summary>
+    /// True when the `{% set ... %}` spec has a top-level `=` assignment (inline form);
+    /// false for the block-set form `{% set name %} ... {% endset %}`.
+    /// </summary>
+    private static bool SetHasAssignment(string spec)
+    {
+        for (int i = 0; i < spec.Length; i++)
+        {
+            char c = spec[i];
+            if (c == '=' && (i == 0 || spec[i - 1] is not ('!' or '<' or '>' or '='))
+                         && (i + 1 >= spec.Length || spec[i + 1] != '='))
+                return true;
+        }
+        return false;
+    }
 
     private static IfNode ParseIf(List<Token> tokens, ref int pos, string condStr)
     {
@@ -346,6 +378,17 @@ public sealed class JinjaChatTemplate
         return new ForNode(varName, iter, body);
     }
 
+    private static void AssignSet(string[] path, object? val, Dictionary<string, object?> ctx)
+    {
+        if (path.Length == 1)
+            ctx[path[0]] = val;
+        else if (path.Length == 2
+            && ctx.TryGetValue(path[0], out var nsObj) && nsObj is NamespaceObj ns)
+            ns.Set(path[1], val);
+        else
+            ctx[string.Join(".", path)] = val;
+    }
+
     private static SetNode ParseSet(string spec)
     {
         // Find first '=' that is not part of '==', '!=', '<=', '>='
@@ -372,9 +415,35 @@ public sealed class JinjaChatTemplate
         private readonly string _s = src;
         public int Pos;
 
-        public IExpr Parse() { var e = ParseOr(); return e; }
+        public IExpr Parse() { var e = ParseTernary(); return e; }
 
-        // Operator precedence (low → high): or → and → not → comparison → add → unary → postfix → primary
+        // Operator precedence (low → high): ternary → or → and → not → comparison → add → unary → postfix → primary
+
+        /// <summary>
+        /// Jinja inline ternary: <c>then if cond else otherwise</c>. Right-associative,
+        /// lowest precedence so `or` / `and` inside the condition bind first.
+        /// Used by Gemma 4 / Gemma-3n: `set role = 'model' if msg.role == 'assistant' else msg.role`.
+        /// </summary>
+        private IExpr ParseTernary()
+        {
+            var then = ParseOr();
+            Skip();
+            if (PeekWord("if"))
+            {
+                Pos += 2; // consume "if"
+                var cond = ParseOr();
+                Skip();
+                // `else` is optional in Jinja: `{{ x if c }}` renders empty when c is false.
+                IExpr otherwise = new LiteralExpr(null);
+                if (PeekWord("else"))
+                {
+                    Pos += 4;
+                    otherwise = ParseTernary();
+                }
+                return new TernaryExpr(cond, then, otherwise);
+            }
+            return then;
+        }
 
         private IExpr ParseOr()
         {
@@ -756,14 +825,13 @@ public sealed class JinjaChatTemplate
                     break;
 
                 case SetNode sn:
-                    var val = Eval(sn.Value, ctx);
-                    if (sn.Path.Length == 1)
-                        ctx[sn.Path[0]] = val;
-                    else if (sn.Path.Length == 2
-                        && ctx.TryGetValue(sn.Path[0], out var nsObj) && nsObj is NamespaceObj ns)
-                        ns.Set(sn.Path[1], val);
-                    else
-                        ctx[string.Join(".", sn.Path)] = val;
+                    AssignSet(sn.Path, Eval(sn.Value, ctx), ctx);
+                    break;
+
+                case BlockSetNode bsn:
+                    var bsSb = new StringBuilder();
+                    EvalNodes(bsn.Body, ctx, bsSb);
+                    AssignSet(bsn.Path, bsSb.ToString(), ctx);
                     break;
             }
         }
@@ -789,6 +857,9 @@ public sealed class JinjaChatTemplate
                 { var lv = Eval(b.L, ctx); return Truthy(lv) ? lv : Eval(b.R, ctx); }
             case BinExpr b:
                 return EvalBin(b.Op, Eval(b.L, ctx), Eval(b.R, ctx));
+
+            case TernaryExpr t:
+                return Truthy(Eval(t.Cond, ctx)) ? Eval(t.Then, ctx) : Eval(t.Otherwise, ctx);
 
             case UnaryExpr { Op: "not" } u: return !Truthy(Eval(u.Operand, ctx));
             case UnaryExpr { Op: "-"   } u:
