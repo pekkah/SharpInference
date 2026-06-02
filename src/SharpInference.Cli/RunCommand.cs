@@ -1080,8 +1080,9 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     /// Builds the stop token ID list. Delegates to <see cref="GgufTokenizer.EogTokenIds"/> —
     /// the single source of truth for end-of-generation tokens (EOS plus the end-of-turn
     /// variants used by Llama 3/4, Mistral, Phi, Gemma, etc.) — so the CLI and server stop on
-    /// exactly the same set. Notably this is what lets the CLI halt on Gemma's <c>&lt;eos&gt;</c>
-    /// (distinct from its <c>&lt;end_of_turn&gt;</c> EOS) instead of decoding it as literal text.
+    /// exactly the same set. Notably this is what lets the CLI halt on Gemma 4's <c>&lt;eos&gt;</c>
+    /// (id 1, distinct from its configured EOS <c>&lt;turn|&gt;</c> at id 106) instead of decoding
+    /// it as literal text.
     /// </summary>
     private static IReadOnlyList<int> BuildStopTokenIds(GgufTokenizer tokenizer) => tokenizer.EogTokenIds;
 

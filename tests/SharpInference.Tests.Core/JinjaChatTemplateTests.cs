@@ -194,4 +194,35 @@ public sealed class JinjaChatTemplateTests
         // A bare string is not classified as a sequence here (template guards `is string` first).
         Assert.Equal("no", Render("{% if str is sequence %}yes{% else %}no{% endif %}", ctx));
     }
+
+    [Fact]
+    public void JoinFilter_ConcatenatesWithSeparator()
+    {
+        var ctx = new Dictionary<string, object?> { ["xs"] = new List<object?> { "a", "b", "c" } };
+        Assert.Equal("a-b-c", Render("{{ xs | join('-') }}", ctx));
+    }
+
+    [Fact]
+    public void DictGet_ReturnsValueOrFallback()
+    {
+        var ctx = new Dictionary<string, object?>
+        {
+            ["d"] = new Dictionary<string, object?> { ["present"] = "P" },
+        };
+        Assert.Equal("P", Render("{{ d.get('present', 'fallback') }}", ctx));
+        Assert.Equal("fallback", Render("{{ d.get('missing', 'fallback') }}", ctx));
+        // No fallback arg → empty string for a missing key.
+        Assert.Equal("", Render("{{ d.get('missing') }}", ctx));
+    }
+
+    [Fact]
+    public void DictKeysAndValues_Iterate()
+    {
+        var ctx = new Dictionary<string, object?>
+        {
+            ["d"] = new Dictionary<string, object?> { ["a"] = 1L, ["b"] = 2L },
+        };
+        Assert.Equal("a,b,", Render("{% for k in d.keys() %}{{ k }},{% endfor %}", ctx));
+        Assert.Equal("1,2,", Render("{% for v in d.values() %}{{ v }},{% endfor %}", ctx));
+    }
 }

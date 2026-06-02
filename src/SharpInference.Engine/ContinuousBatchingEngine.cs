@@ -331,7 +331,10 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         var cache = _fwd.CreateCache();
         ReadOnlySpan<float> logits = _fwd.PrefillWithCache(tokens, cache);
 
-        var stopIds = req.Sp.StopTokenIds ?? [_tokenizer.EosTokenId];
+        // Stop on ANY end-of-generation token, not just the configured EOS — matches the
+        // single-user InferenceEngine path. A model with an alternate end token (e.g. Gemma's
+        // <eos>, distinct from its <turn|> EOS) would otherwise decode it as text and run on.
+        var stopIds = req.Sp.StopTokenIds ?? _tokenizer.EogTokenIds;
         var rng = new Random();
 
         int firstToken = req.Sp.Temperature <= 0f

@@ -590,8 +590,8 @@ public sealed class DeepSeekToolCallAdapter : IToolCallAdapter
 /// Arguments are NOT JSON. They use Gemma's bespoke key:value syntax produced by the
 /// GGUF chat template's <c>format_argument</c> macro: strings are wrapped in the
 /// <c>&lt;|"|&gt;</c> quote token, keys are bare (unquoted), booleans render as
-/// <c>true</c>/<c>false</c>, numbers are bare, nested objects use <c>{k:v,...}</c> and
-/// arrays use <c>[v,...]</c>. Example:
+/// <c>true</c>/<c>false</c>, <c>null</c> is bare, numbers are bare, nested objects use
+/// <c>{k:v,...}</c> and arrays use <c>[v,...]</c>. Example:
 /// <c>&lt;|tool_call&gt;call:get_weather{city:&lt;|"|&gt;Paris&lt;|"|&gt;,days:3}&lt;tool_call|&gt;</c>.
 /// </para>
 /// </summary>

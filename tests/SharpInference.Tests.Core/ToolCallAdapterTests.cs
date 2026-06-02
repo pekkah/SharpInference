@@ -371,4 +371,51 @@ public sealed class ToolCallAdapterTests
         Assert.Equal("sunny, 21C", msg["content"]);
         Assert.Equal("call_42", msg["tool_call_id"]);
     }
+
+    [Fact]
+    public void Gemma4_Parse_NullAndNegativeAndBarewordScalars()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:f{a:null,b:-3,c:-1.5,d:pending}<tool_call|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        Assert.Null(calls[0].Arguments["a"]);
+        Assert.Equal(-3L, calls[0].Arguments["b"]);
+        Assert.Equal(-1.5d, calls[0].Arguments["c"]);
+        Assert.Equal("pending", calls[0].Arguments["d"]);   // unparseable bareword → raw string
+    }
+
+    [Fact]
+    public void Gemma4_Parse_QuotedKey()
+    {
+        // Keys are normally bare, but the parser also accepts a <|"|>-quoted key.
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:f{<|\"|>weird key<|\"|>:<|\"|>v<|\"|>}<tool_call|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        Assert.Equal("v", calls[0].Arguments["weird key"]);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_UnterminatedQuote_TakesRemainder()
+    {
+        // Missing closing <|"|> → value absorbs the rest of the block (documented tolerance).
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:f{msg:<|\"|>hello world<tool_call|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        Assert.Equal("f", calls[0].Name);
+        Assert.Equal("hello world", calls[0].Arguments["msg"]);
+    }
+
+    [Fact]
+    public void Gemma4_FindMarkers_ReturnNegativeWhenAbsent()
+    {
+        // The streaming state machine relies on the -1 / out=-1 not-found contract.
+        var a = new Gemma4ToolCallAdapter();
+        Assert.Equal(-1, a.FindOpenMarker("plain text, no markers", 0, out int contentStart));
+        Assert.Equal(-1, contentStart);
+        Assert.Equal(-1, a.FindCloseMarker("still nothing here", 0, out int afterClose));
+        Assert.Equal(-1, afterClose);
+    }
 }
