@@ -188,7 +188,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                 {
                     var tokens = _tokenizer.Encode(prompt).ToArray();
                     var rng = new Random();
-                    var stopIds = sp.StopTokenIds ?? [_tokenizer.EosTokenId];
+                    var stopIds = sp.StopTokenIds ?? _tokenizer.EogTokenIds;
 
                     // Issue #102: canonical-history prefix resolution. The endpoint passes a
                     // chat-template render of just the message history (add_generation_prompt=false);

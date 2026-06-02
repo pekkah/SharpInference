@@ -175,6 +175,8 @@ public static class InferenceEngineLoader
             int gpuLayers = nGpuLayers == -1
                 ? TierPlanner.Plan(model, hp, hwProfile, turboQuant, requestedCtxSize: ctxSize).GpuLayers
                 : nGpuLayers;
+            if (nGpuLayers == -1)
+                gpuLayers = ClampGemma4KvShareBoundary(hp, gpuLayers);
 
             if (gpuLayers <= 0)
             {
@@ -255,10 +257,14 @@ public static class InferenceEngineLoader
     }
 
     /// <summary>
-    /// Looks up <c>&lt;think&gt;</c> / <c>&lt;/think&gt;</c> special-token IDs. Both must be
-    /// positive — id 0 is usually <c>&lt;pad&gt;</c>/<c>&lt;unk&gt;</c> and would mis-trigger
-    /// — and both must be present. Missing tokens leave reasoning-stream splitting disabled
-    /// (the engine emits Text chunks only).
+    /// Resolves the open/close special-token IDs that bracket a model's reasoning stream so
+    /// the engine can split it into a separate <c>Thinking</c> channel. Tries the ChatML
+    /// <c>&lt;think&gt;</c>/<c>&lt;/think&gt;</c> convention first, then Gemma 4's
+    /// <c>&lt;|channel&gt;</c>/<c>&lt;channel|&gt;</c> "thought" channel. Both IDs must be
+    /// positive — id 0 is usually <c>&lt;pad&gt;</c>/<c>&lt;unk&gt;</c> and would mis-trigger —
+    /// and both must be present. No match leaves reasoning-stream splitting disabled (the
+    /// engine emits Text chunks only), which is why a Gemma model would otherwise leak raw
+    /// <c>&lt;|channel&gt;thought…&lt;channel|&gt;</c> markers into the assistant content.
     /// </summary>
     private static (int thinkTokenId, int endThinkTokenId) ResolveReasoningTokens(GgufTokenizer tokenizer)
     {
@@ -266,7 +272,44 @@ public static class InferenceEngineLoader
             && tokenizer.SpecialTokens.TryGetValue("</think>", out int eid)
             && tid > 0 && eid > 0)
             return (tid, eid);
+        // Gemma 4 wraps reasoning in <|channel>thought … <channel|> (single special tokens).
+        // The template strips every channel block from history, so treating the whole block
+        // as reasoning matches the model's own content/thought split.
+        if (tokenizer.SpecialTokens.TryGetValue("<|channel>", out int cid)
+            && tokenizer.SpecialTokens.TryGetValue("<channel|>", out int ceid)
+            && cid > 0 && ceid > 0)
+            return (cid, ceid);
         return (-1, -1);
+    }
+
+    /// <summary>
+    /// Gemma 4 KV-share constraint: the shared-KV source layers must live on the same tier as
+    /// their dependent shared-KV tail because cross-tier KV reads aren't wired (see
+    /// <c>CudaHybridForwardPass.Gemma4ValidateHybridSplit</c>). <see cref="TierPlanner"/> doesn't
+    /// model this and can return a layer count that straddles the boundary (e.g. 30 on E4B Q8 /
+    /// 12 GB). When the auto value lands in the forbidden band, promote to full offload — the
+    /// planner's per-layer KV budget is pessimistic for shared-KV layers (they alias source
+    /// pages instead of growing their own cache), so full offload almost always fits once the
+    /// auto value already cleared the safe max. Mirrors the <c>SharpInference.Cli</c> RunCommand
+    /// fix (#82); only applied on the auto (<c>-g -1</c>) path so an explicit <c>-g</c> is honoured.
+    /// </summary>
+    private static int ClampGemma4KvShareBoundary(ModelHyperparams hp, int gpuLayers)
+    {
+        if (hp.KvSourceLayer is not { } ksl) return gpuLayers;
+
+        int minSrc = int.MaxValue;
+        for (int i = 0; i < hp.NumLayers; i++)
+            if (ksl[i] >= 0 && ksl[i] < minSrc) minSrc = ksl[i];
+
+        if (minSrc != int.MaxValue && gpuLayers > minSrc && gpuLayers < hp.NumLayers)
+        {
+            Console.Error.WriteLine(
+                $"[SharpInference] TierPlanner returned -g {gpuLayers}, which would cross the " +
+                $"Gemma 4 KV-share boundary (sources <= {minSrc}); promoting to full offload " +
+                $"(-g {hp.NumLayers}). Set NGpuLayers={minSrc} explicitly if VRAM is tight.");
+            return hp.NumLayers;
+        }
+        return gpuLayers;
     }
 
     /// <summary>

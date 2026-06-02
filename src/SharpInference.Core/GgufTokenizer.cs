@@ -35,6 +35,15 @@ public sealed class GgufTokenizer : ITokenizer
     public int PadTokenId { get; }
     public bool AddBosToken { get; }
 
+    /// <summary>
+    /// All end-of-generation token IDs: the configured EOS plus any well-known EOG control
+    /// tokens present in this vocab (e.g. Gemma's <c>&lt;eos&gt;</c> which is distinct from its
+    /// <c>&lt;end_of_turn&gt;</c> EOS). Generation should stop on ANY of these; otherwise a model
+    /// that emits an alternate end token decodes it as literal text and runs on. Always contains
+    /// at least <see cref="EosTokenId"/>.
+    /// </summary>
+    public int[] EogTokenIds { get; }
+
     /// <summary>All special (control) tokens keyed by their string representation.</summary>
     public IReadOnlyDictionary<string, int> SpecialTokens => _specialTokens;
 
@@ -61,7 +70,8 @@ public sealed class GgufTokenizer : ITokenizer
         bool addBosToken,
         bool needsByteEncoding,
         bool isSpmBpe,
-        Dictionary<(string, string), int>? spmMerges)
+        Dictionary<(string, string), int>? spmMerges,
+        int[] eogTokenIds)
     {
         _inner = inner;
         _specialTokens = specialTokens;
@@ -77,6 +87,7 @@ public sealed class GgufTokenizer : ITokenizer
         UnknownTokenId = unknownTokenId;
         PadTokenId = padTokenId;
         AddBosToken = addBosToken;
+        EogTokenIds = eogTokenIds;
     }
 
     /// <summary>
@@ -254,11 +265,27 @@ public sealed class GgufTokenizer : ITokenizer
         for (int i = 0; i < tokensArray.Length; i++)
             idToToken[i] = (string)tokensArray[i];
 
+        var vocabLookup = BuildVocabLookup(tokensArray);
+
+        // End-of-generation set: the configured EOS plus any well-known EOG token present in
+        // this vocab. llama.cpp stops on any EOG; mirroring that prevents a model from decoding
+        // an alternate end token as literal text and running on past its turn. Resolved against
+        // the FULL vocab, not just control tokens — Gemma 4 ships <eos> as a NORMAL-typed token
+        // (id 1) distinct from its configured EOS <turn|> (id 106), so a special-token-only scan
+        // would miss it. The names are reserved EOG markers, so a normal-token collision is
+        // implausible.
+        var eogIds = new List<int> { eosTokenId };
+        foreach (var eogName in (ReadOnlySpan<string>)[
+            "<eos>", "<end_of_turn>", "<|im_end|>", "<|eot_id|>", "<|eom_id|>",
+            "<|eot|>", "<|eom|>", "<|end|>", "<|endoftext|>"])
+            if (vocabLookup.TryGetValue(eogName, out int eogId) && eogId > 0 && !eogIds.Contains(eogId))
+                eogIds.Add(eogId);
+
         var tokenizer = new GgufTokenizer(
             inner,
             specialTokens,
             specialTokens.ToDictionary(kv => kv.Value, kv => kv.Key),
-            BuildVocabLookup(tokensArray),
+            vocabLookup,
             idToToken,
             tokensArray.Length,
             bosTokenId,
@@ -268,7 +295,8 @@ public sealed class GgufTokenizer : ITokenizer
             addBosToken,
             needsByteEncoding,
             isSpmBpe,
-            spmMerges);
+            spmMerges,
+            eogIds.ToArray());
 
         if (model.Metadata.TryGetValue("tokenizer.chat_template", out var tmpl) && tmpl is string tmplStr)
         {
