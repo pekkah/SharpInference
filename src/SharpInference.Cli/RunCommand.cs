@@ -400,6 +400,33 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant,
                         requestedCtxSize: ctxSize);
                     cudaGpuLayers = placement.GpuLayers;
+
+                    // Gemma 4 KV-share constraint: the shared-KV source layers (E4B:
+                    // 22 and 23) must live on the same tier as the shared-KV tail
+                    // layers (24..41) because cross-tier KV reads are not wired.
+                    // TierPlanner doesn't model this and may return a value that
+                    // straddles the boundary (e.g. 30). Clamp UP to NumLayers when
+                    // possible — TierPlanner's per-layer KV budget ignores that
+                    // shared-KV-aliased layers don't grow their own cache, so it's
+                    // pessimistic by ~18 layers × full-ctx-KV; full offload almost
+                    // always fits when the auto value already exceeded the safe max.
+                    if (hp.KvSourceLayer is { } ksl)
+                    {
+                        int minSrc = int.MaxValue;
+                        for (int i = 0; i < hp.NumLayers; i++)
+                            if (ksl[i] >= 0 && ksl[i] < minSrc) minSrc = ksl[i];
+                        if (minSrc != int.MaxValue
+                            && cudaGpuLayers > minSrc
+                            && cudaGpuLayers < hp.NumLayers)
+                        {
+                            AnsiConsole.MarkupLine(
+                                $"[dim]TierPlanner returned -g {cudaGpuLayers}, which would " +
+                                $"cross the Gemma 4 KV-share boundary (sources <= {minSrc}); " +
+                                $"promoting to full offload (-g {hp.NumLayers}). " +
+                                $"Pass -g {minSrc} explicitly if VRAM is tight.[/]");
+                            cudaGpuLayers = hp.NumLayers;
+                        }
+                    }
                 }
                 else
                 {
