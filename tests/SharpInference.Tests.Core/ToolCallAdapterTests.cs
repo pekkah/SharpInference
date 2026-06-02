@@ -239,4 +239,136 @@ public sealed class ToolCallAdapterTests
         Assert.Equal("just an answer with no tool call", plain);
         Assert.Empty(calls);
     }
+
+    // ── Gemma 4 adapter ───────────────────────────────────────────────────────
+
+    [Fact]
+    public void Registry_ResolvesGemma4() =>
+        Assert.IsType<Gemma4ToolCallAdapter>(ToolCallAdapterRegistry.Get("gemma4"));
+
+    [Fact]
+    public void Gemma4_Parse_StringArgument()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>";
+        var (plain, calls) = a.Parse(raw);
+        Assert.Equal("", plain);
+        Assert.Single(calls);
+        Assert.Equal("get_weather", calls[0].Name);
+        Assert.Equal("Paris", calls[0].Arguments["city"]);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_MixedScalarArguments()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        // string, int, double, bool — Gemma's bare/quoted scalar mix.
+        var raw = "<|tool_call>call:book{name:<|\"|>Ada<|\"|>,count:3,ratio:1.5,vip:true}<tool_call|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        Assert.Equal("Ada", calls[0].Arguments["name"]);
+        Assert.Equal(3L, calls[0].Arguments["count"]);
+        Assert.Equal(1.5d, calls[0].Arguments["ratio"]);
+        Assert.Equal(true, calls[0].Arguments["vip"]);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_StringWithCommaAndBraces()
+    {
+        // Structural chars inside a <|"|>-quoted string must NOT split the argument.
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:say{text:<|\"|>a, b, {c}<|\"|>,n:1}<tool_call|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        Assert.Equal("a, b, {c}", calls[0].Arguments["text"]);
+        Assert.Equal(1L, calls[0].Arguments["n"]);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_NestedObjectAndArray()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:q{filter:{min:0,max:10},tags:[<|\"|>x<|\"|>,<|\"|>y<|\"|>]}<tool_call|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        var filter = Assert.IsType<Dictionary<string, object?>>(calls[0].Arguments["filter"]);
+        Assert.Equal(0L, filter["min"]);
+        Assert.Equal(10L, filter["max"]);
+        var tags = Assert.IsType<List<object?>>(calls[0].Arguments["tags"]);
+        Assert.Equal(new object?[] { "x", "y" }, tags);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_NoArguments()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:get_time{}<tool_call|>";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        Assert.Equal("get_time", calls[0].Name);
+        Assert.Empty(calls[0].Arguments);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_TextBeforeAndMultipleCalls()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "Let me check.<|tool_call>call:a{k:1}<tool_call|>"
+                + "<|tool_call>call:b{k:2}<tool_call|>";
+        var (plain, calls) = a.Parse(raw);
+        Assert.Equal("Let me check.", plain);
+        Assert.Equal(2, calls.Count);
+        Assert.Equal("a", calls[0].Name);
+        Assert.Equal("b", calls[1].Name);
+        Assert.Equal(2L, calls[1].Arguments["k"]);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_PlainTextStaysPlain()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        var (plain, calls) = a.Parse("Paris is the capital of France.");
+        Assert.Equal("Paris is the capital of France.", plain);
+        Assert.Empty(calls);
+    }
+
+    [Fact]
+    public void Gemma4_FindMarkers_RoundTripsBlock()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        var buf = "pre<|tool_call>call:x{k:<|\"|>v<|\"|>}<tool_call|>post";
+        int open = a.FindOpenMarker(buf, 0, out int contentStart);
+        Assert.Equal(3, open);
+        Assert.Equal(3 + "<|tool_call>".Length, contentStart);
+        int close = a.FindCloseMarker(buf, contentStart, out int afterClose);
+        Assert.True(close > contentStart);
+        Assert.Equal(close + "<tool_call|>".Length, afterClose);
+
+        var block = buf[contentStart..close];
+        var calls = a.ParseBlock(block);
+        Assert.Single(calls);
+        Assert.Equal("x", calls[0].Name);
+        Assert.Equal("v", calls[0].Arguments["k"]);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_MissingCloseMarker_StillParses()
+    {
+        // Model stopped before emitting <tool_call|>.
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}";
+        var (_, calls) = a.Parse(raw);
+        Assert.Single(calls);
+        Assert.Equal("Paris", calls[0].Arguments["city"]);
+    }
+
+    [Fact]
+    public void Gemma4_RenderToolResult_CarriesToolCallId()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        var msg = a.RenderToolResult("call_42", "sunny, 21C");
+        Assert.Equal("tool", msg["role"]);
+        Assert.Equal("sunny, 21C", msg["content"]);
+        Assert.Equal("call_42", msg["tool_call_id"]);
+    }
 }

@@ -106,6 +106,10 @@ public static class ToolCallAdapterRegistry
 
             // DeepSeek-R1 wrapped multi-call envelope.
             ["deepseek2"]  = new DeepSeekToolCallAdapter(),
+
+            // Gemma 4: <|tool_call>call:NAME{k:v,...}<tool_call|> with a bespoke
+            // non-JSON argument syntax (<|"|>-quoted strings, bare keys).
+            ["gemma4"]     = new Gemma4ToolCallAdapter(),
         };
 
     /// <summary>
@@ -575,4 +579,200 @@ public sealed class DeepSeekToolCallAdapter : IToolCallAdapter
 
     public Dictionary<string, object?> RenderToolResult(string toolUseId, string resultContent) =>
         ToolCallParseHelpers.DefaultRenderToolResult(toolUseId, resultContent);
+}
+
+/// <summary>
+/// Gemma 4 family. The model wraps each call in
+/// <c>&lt;|tool_call&gt;call:NAME{...}&lt;tool_call|&gt;</c> (note the asymmetric
+/// pipe placement — open is <c>&lt;|tool_call&gt;</c>, close is <c>&lt;tool_call|&gt;</c>).
+///
+/// <para>
+/// Arguments are NOT JSON. They use Gemma's bespoke key:value syntax produced by the
+/// GGUF chat template's <c>format_argument</c> macro: strings are wrapped in the
+/// <c>&lt;|"|&gt;</c> quote token, keys are bare (unquoted), booleans render as
+/// <c>true</c>/<c>false</c>, numbers are bare, nested objects use <c>{k:v,...}</c> and
+/// arrays use <c>[v,...]</c>. Example:
+/// <c>&lt;|tool_call&gt;call:get_weather{city:&lt;|"|&gt;Paris&lt;|"|&gt;,days:3}&lt;tool_call|&gt;</c>.
+/// </para>
+/// </summary>
+public sealed class Gemma4ToolCallAdapter : IToolCallAdapter
+{
+    public const string OpenMarker  = "<|tool_call>";
+    public const string CloseMarker = "<tool_call|>";
+    public const string CallPrefix  = "call:";
+    /// <summary>Gemma's string-delimiter token; brackets a string literal on both sides.</summary>
+    public const string Quote       = "<|\"|>";
+
+    public string Architecture => "gemma4";
+    public int MaxOpenTagLength => OpenMarker.Length;
+
+    public (string PlainText, IReadOnlyList<ParsedToolCall> Calls) Parse(string rawOutput)
+    {
+        var calls = new List<ParsedToolCall>();
+        var plain = new StringBuilder();
+        int pos = 0;
+
+        while (pos < rawOutput.Length)
+        {
+            int start = rawOutput.IndexOf(OpenMarker, pos, StringComparison.Ordinal);
+            if (start < 0)
+            {
+                plain.Append(rawOutput, pos, rawOutput.Length - pos);
+                break;
+            }
+
+            plain.Append(rawOutput, pos, start - pos);
+            int contentStart = start + OpenMarker.Length;
+            int end = rawOutput.IndexOf(CloseMarker, contentStart, StringComparison.Ordinal);
+            // Tolerate a missing close marker (model stopped mid-call): take the rest.
+            string block = end >= 0 ? rawOutput[contentStart..end] : rawOutput[contentStart..];
+            pos = end >= 0 ? end + CloseMarker.Length : rawOutput.Length;
+
+            foreach (var c in ParseBlock(block)) calls.Add(c);
+        }
+
+        return (plain.ToString(), calls);
+    }
+
+    public int FindOpenMarker(string buffer, int startSearch, out int contentStart)
+    {
+        int idx = buffer.IndexOf(OpenMarker, startSearch, StringComparison.Ordinal);
+        contentStart = idx < 0 ? -1 : idx + OpenMarker.Length;
+        return idx;
+    }
+
+    public int FindCloseMarker(string buffer, int startSearch, out int afterClose)
+    {
+        int idx = buffer.IndexOf(CloseMarker, startSearch, StringComparison.Ordinal);
+        afterClose = idx < 0 ? -1 : idx + CloseMarker.Length;
+        return idx;
+    }
+
+    public IReadOnlyList<ParsedToolCall> ParseBlock(string block)
+    {
+        block = block.Trim();
+        // Strip the leading "call:" if present (tolerant of drift where the model omits it).
+        int nameStart = block.StartsWith(CallPrefix, StringComparison.Ordinal) ? CallPrefix.Length : 0;
+
+        int brace = block.IndexOf('{', nameStart);
+        if (brace < 0)
+        {
+            string nm = block[nameStart..].Trim();
+            return nm.Length > 0
+                ? [new ParsedToolCall(nm, new Dictionary<string, object?>(StringComparer.Ordinal))]
+                : [];
+        }
+
+        string name = block[nameStart..brace].Trim();
+        if (name.Length == 0) return [];
+
+        int p = brace;
+        var args = ParseObject(block, ref p);
+        return [new ParsedToolCall(name, args)];
+    }
+
+    public Dictionary<string, object?> RenderToolResult(string toolUseId, string resultContent) =>
+        // Carry the tool_call_id so the Gemma chat template's forward-scan can resolve the
+        // originating function name (it matches assistant tool_calls[].id == tool_call_id).
+        new(StringComparer.Ordinal)
+        {
+            ["role"]         = "tool",
+            ["content"]      = resultContent,
+            ["tool_call_id"] = toolUseId,
+        };
+
+    // ── Gemma argument-syntax parser ──────────────────────────────────────────
+
+    private static Dictionary<string, object?> ParseObject(string s, ref int p)
+    {
+        var dict = new Dictionary<string, object?>(StringComparer.Ordinal);
+        if (p < s.Length && s[p] == '{') p++;   // skip '{'
+        SkipWs(s, ref p);
+
+        while (p < s.Length && s[p] != '}')
+        {
+            string key = ReadKey(s, ref p);
+            SkipWs(s, ref p);
+            if (p < s.Length && s[p] == ':') p++;
+            object? val = ParseValue(s, ref p);
+            if (key.Length > 0) dict[key] = val;
+
+            SkipWs(s, ref p);
+            if (p < s.Length && s[p] == ',') p++;
+            SkipWs(s, ref p);
+        }
+        if (p < s.Length && s[p] == '}') p++;   // skip '}'
+        return dict;
+    }
+
+    private static List<object?> ParseArray(string s, ref int p)
+    {
+        var list = new List<object?>();
+        if (p < s.Length && s[p] == '[') p++;    // skip '['
+        SkipWs(s, ref p);
+
+        while (p < s.Length && s[p] != ']')
+        {
+            list.Add(ParseValue(s, ref p));
+            SkipWs(s, ref p);
+            if (p < s.Length && s[p] == ',') p++;
+            SkipWs(s, ref p);
+        }
+        if (p < s.Length && s[p] == ']') p++;    // skip ']'
+        return list;
+    }
+
+    private static object? ParseValue(string s, ref int p)
+    {
+        SkipWs(s, ref p);
+        if (p >= s.Length) return null;
+
+        if (IsAt(s, p, Quote)) return ReadQuoted(s, ref p);
+        char c = s[p];
+        if (c == '{') return ParseObject(s, ref p);
+        if (c == '[') return ParseArray(s, ref p);
+
+        // Bareword scalar: read up to the next structural delimiter.
+        int start = p;
+        while (p < s.Length && s[p] is not (',' or '}' or ']')) p++;
+        return ParseScalar(s[start..p].Trim());
+    }
+
+    private static string ReadKey(string s, ref int p)
+    {
+        SkipWs(s, ref p);
+        if (IsAt(s, p, Quote)) return ReadQuoted(s, ref p);
+        int start = p;
+        while (p < s.Length && s[p] is not (':' or '}' or ',')) p++;
+        return s[start..p].Trim();
+    }
+
+    private static string ReadQuoted(string s, ref int p)
+    {
+        p += Quote.Length;   // skip opening <|"|>
+        int end = s.IndexOf(Quote, p, StringComparison.Ordinal);
+        string val = end < 0 ? s[p..] : s[p..end];
+        p = end < 0 ? s.Length : end + Quote.Length;
+        return val;
+    }
+
+    private static object? ParseScalar(string token) => token switch
+    {
+        "true"  => true,
+        "false" => false,
+        "null" or "" => null,
+        _ => long.TryParse(token, System.Globalization.NumberStyles.Integer,
+                           System.Globalization.CultureInfo.InvariantCulture, out long l) ? l
+           : double.TryParse(token, System.Globalization.NumberStyles.Float,
+                           System.Globalization.CultureInfo.InvariantCulture, out double d) ? (object?)d
+           : token,
+    };
+
+    private static bool IsAt(string s, int p, string marker) =>
+        p + marker.Length <= s.Length && s.AsSpan(p, marker.Length).SequenceEqual(marker);
+
+    private static void SkipWs(string s, ref int p)
+    {
+        while (p < s.Length && char.IsWhiteSpace(s[p])) p++;
+    }
 }
