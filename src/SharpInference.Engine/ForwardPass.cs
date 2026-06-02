@@ -225,7 +225,25 @@ public sealed unsafe class ForwardPass : IForwardPass
         _ropeHalfDim = maxRopeDim / 2;
         _ropeCosTable = (float*)NativeMemory.Alloc((nuint)((long)ctxLen * _ropeHalfDim * sizeof(float)));
         _ropeSinTable = (float*)NativeMemory.Alloc((nuint)((long)ctxLen * _ropeHalfDim * sizeof(float)));
-        SimdKernels.BuildRopeTable(_ropeCosTable, _ropeSinTable, ctxLen, maxRopeDim, hp.RopeTheta);
+
+        // Gemma 4 stores a top-level `rope_freqs.weight` (size halfDim) that masks
+        // the global-layer RoPE frequencies: first 64 pairs = 1.0 (rotate), last
+        // 192 = 1e30 (identity). Mirrors llama.cpp gemma4.cpp:191 which passes
+        // `rope_freqs` only for non-SWA layers. The SWA table is built unscaled.
+        float* globalFreqFactors = null;
+        var ropeFreqsInfo = model.FindTensor("rope_freqs.weight");
+        float[]? ropeFreqsBuf = null;
+        if (ropeFreqsInfo is GgufTensorInfo rfi && rfi.DType == DType.Float32 && rfi.ElementCount == _ropeHalfDim)
+        {
+            var src = MemoryMarshal.Cast<byte, float>(model.GetTensorData(rfi));
+            ropeFreqsBuf = new float[_ropeHalfDim];
+            src.Slice(0, _ropeHalfDim).CopyTo(ropeFreqsBuf);
+        }
+        fixed (float* p = ropeFreqsBuf)
+        {
+            globalFreqFactors = p;
+            SimdKernels.BuildRopeTable(_ropeCosTable, _ropeSinTable, ctxLen, maxRopeDim, hp.RopeTheta, globalFreqFactors);
+        }
 
         if (hp.RopeThetaSwa > 0f && _layerRopeDim is not null)
         {
@@ -1249,6 +1267,14 @@ public sealed unsafe class ForwardPass : IForwardPass
                 ApplyQkNormLayer(_q, kvShared ? null : _k, layer, layerHd);
             }
 
+            // Gemma 4: V is plain per-head RmsNorm (no learned weight) before cache.
+            // Matches llama.cpp src/models/gemma4.cpp line 227:
+            //   Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps)
+            if (_layerHeadDim is not null && !kvShared)
+            {
+                PerHeadPureRmsNorm(_v, _numKvHeads, layerHd, _hp.RmsNormEps);
+            }
+
             if (useRoPE)
             {
                 ApplyRopeLayer(_q, position, _numHeads, layer, layerHd);
@@ -1459,7 +1485,10 @@ public sealed unsafe class ForwardPass : IForwardPass
         _ = ownLayer;
         int endSeq = Math.Min(position + 1, cache.Length + 1);
         int startSeq = windowSize > 0 ? Math.Max(0, endSeq - windowSize) : 0;
-        float scale = 1.0f / MathF.Sqrt(hd);
+        // Gemma 4 uses self.scaling = 1.0 (no pre-attention scaling); other archs
+        // use 1/sqrt(head_dim). See llama.cpp src/models/gemma4.cpp:11
+        //   hparams.f_attention_scale = 1.0f
+        float scale = _layerHeadDim is not null ? 1.0f : 1.0f / MathF.Sqrt(hd);
         int ctxLen = _ctxLen; int hpkg = _headsPerKvGroup;
         // Per-layer K/V stride into the cache slot: when LayerHeadDim is active each
         // cache page row is _maxKvDim wide but only kvHead*layerHd is populated.
@@ -1870,14 +1899,10 @@ public sealed unsafe class ForwardPass : IForwardPass
         else
             Dequantize.ToFloat32(data, new Span<float>(buf, count), tensor.DType, count);
 
-        // Gemma family stores RMSNorm weights as (w - 1) so the effective scale is
-        // (1 + stored_w); the trained values cluster near zero so the omitted +1 would
-        // crush activations to near-zero. Detected here by EmbeddingScale > 1 because
-        // that flag is currently Gemma-only (sqrt(EmbeddingDim) embedding scale).
-        if (_hp.EmbeddingScale != 1f)
-        {
-            for (int i = 0; i < count; i++) buf[i] += 1.0f;
-        }
+        // GGUF converter for gemma family already bakes the HF "(1 + w)" RMSNorm
+        // convention; we multiply by stored `w` directly (mirrors llama.cpp build_norm
+        // in src/llama-graph.cpp). Verified vs actual GGUF: attn_norm ~8, attn_q_norm
+        // ~0.98 — already final multipliers.
 
         _normCache[tensor.Name] = (nint)buf;
         return buf;

@@ -22,6 +22,11 @@ public sealed class GgufTokenizer : ITokenizer
     // SentencePiece-style BPE (Gemma/Llama): the vocab encodes spaces as U+2581 (▁).
     // Pre-encode by replacing ' ' with ▁ on input and ▁ back to ' ' on output.
     private readonly bool _isSpmBpe;
+    // For SPM mode, merges as (left, right) → priority (lower = higher priority).
+    // Microsoft.ML.Tokenizers' BPE applies a built-in pre-tokenizer that splits on
+    // ▁ boundaries so merges like "▁ capital → ▁capital" never fire. We do the
+    // merge loop ourselves directly against this map.
+    private readonly Dictionary<(string, string), int>? _spmMerges;
 
     public int VocabSize { get; }
     public int BosTokenId { get; }
@@ -55,7 +60,8 @@ public sealed class GgufTokenizer : ITokenizer
         int padTokenId,
         bool addBosToken,
         bool needsByteEncoding,
-        bool isSpmBpe)
+        bool isSpmBpe,
+        Dictionary<(string, string), int>? spmMerges)
     {
         _inner = inner;
         _specialTokens = specialTokens;
@@ -64,6 +70,7 @@ public sealed class GgufTokenizer : ITokenizer
         _idToToken = idToToken;
         _needsByteEncoding = needsByteEncoding;
         _isSpmBpe = isSpmBpe;
+        _spmMerges = spmMerges;
         VocabSize = vocabSize;
         BosTokenId = bosTokenId;
         EosTokenId = eosTokenId;
@@ -205,6 +212,7 @@ public sealed class GgufTokenizer : ITokenizer
             }
         }
 
+        Dictionary<(string, string), int>? spmMerges = null;
         if (inner is null)
         {
             var vocabDict = new Dictionary<string, int>(tokensArray.Length, StringComparer.Ordinal);
@@ -224,6 +232,22 @@ public sealed class GgufTokenizer : ITokenizer
             inner = BpeTokenizer.Create(bpeOptions);
             needsByteEncoding = false;
             isSpmBpe = isSpmModel;
+
+            // SPM mode: build a (left,right)→priority map for our manual BPE.
+            // The first space-separated pair per merge line is the merge rule.
+            if (isSpmBpe)
+            {
+                spmMerges = new Dictionary<(string, string), int>(mergesArray.Length);
+                for (int i = 0; i < mergesArray.Length; i++)
+                {
+                    var line = (string)mergesArray[i];
+                    int sp = line.IndexOf(' ');
+                    if (sp <= 0 || sp >= line.Length - 1) continue;
+                    var left = line[..sp];
+                    var right = line[(sp + 1)..];
+                    spmMerges.TryAdd((left, right), i);
+                }
+            }
         }
 
         var idToToken = new string[tokensArray.Length];
@@ -243,7 +267,8 @@ public sealed class GgufTokenizer : ITokenizer
             padTokenId,
             addBosToken,
             needsByteEncoding,
-            isSpmBpe);
+            isSpmBpe,
+            spmMerges);
 
         if (model.Metadata.TryGetValue("tokenizer.chat_template", out var tmpl) && tmpl is string tmplStr)
         {
@@ -315,7 +340,11 @@ public sealed class GgufTokenizer : ITokenizer
         if (_needsByteEncoding)
             text = EncodeToGpt2Bytes(text);
         else if (_isSpmBpe)
+        {
             text = text.Replace(' ', '▁');
+            if (_spmMerges is not null)
+                return EncodeSpm(text);
+        }
 
         var ids = _inner.EncodeToIds(text);
 
@@ -330,6 +359,45 @@ public sealed class GgufTokenizer : ITokenizer
                 result.Add(id);
         }
         return result;
+    }
+
+    /// <summary>
+    /// SentencePiece-style BPE: split into unicode code points, then iteratively
+    /// apply the highest-priority adjacent merge (lowest index in merges array)
+    /// until no merges apply. Matches llama.cpp's <c>llm_tokenizer_spm</c> behaviour.
+    /// </summary>
+    private IReadOnlyList<int> EncodeSpm(string text)
+    {
+        var pieces = new List<string>(text.Length);
+        var en = System.Globalization.StringInfo.GetTextElementEnumerator(text);
+        while (en.MoveNext()) pieces.Add((string)en.Current);
+
+        while (true)
+        {
+            int bestIdx = -1;
+            int bestPriority = int.MaxValue;
+            for (int i = 0; i < pieces.Count - 1; i++)
+            {
+                if (_spmMerges!.TryGetValue((pieces[i], pieces[i + 1]), out int pri) && pri < bestPriority)
+                {
+                    bestPriority = pri;
+                    bestIdx = i;
+                }
+            }
+            if (bestIdx < 0) break;
+            pieces[bestIdx] = pieces[bestIdx] + pieces[bestIdx + 1];
+            pieces.RemoveAt(bestIdx + 1);
+        }
+
+        var ids = new List<int>(pieces.Count);
+        foreach (var piece in pieces)
+        {
+            if (_vocab.TryGetValue(piece, out int id))
+                ids.Add(id);
+            else if (UnknownTokenId >= 0)
+                ids.Add(UnknownTokenId);
+        }
+        return ids;
     }
 
     /// <summary>

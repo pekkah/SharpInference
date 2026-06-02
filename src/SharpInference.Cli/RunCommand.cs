@@ -742,6 +742,18 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt, enableThinking: !s.NoThinking);
         var tokens = tok.Encode(prompt);
 
+        // SHARPI_RAW_PROMPT bypasses the chat template, so we need to add BOS
+        // manually for models that expect it (e.g. Gemma 4 with add_bos_token=true).
+        // The chat-template path already injects bos_token via Jinja.
+        bool isRaw = Environment.GetEnvironmentVariable("SHARPI_RAW_PROMPT") == "1";
+        if (isRaw && tok.AddBosToken && tok.BosTokenId >= 0
+            && (tokens.Count == 0 || tokens[0] != tok.BosTokenId))
+        {
+            var withBos = new List<int>(tokens.Count + 1) { tok.BosTokenId };
+            withBos.AddRange(tokens);
+            tokens = withBos;
+        }
+
         if (s.VerbosePrompt)
         {
             var escaped = prompt.Replace("\n", "\\n").Replace("\r", "\\r");

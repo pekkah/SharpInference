@@ -3379,11 +3379,24 @@ public static unsafe class SimdKernels
     /// cosOut and sinOut must each point to maxSeqLen * (headDim / 2) floats.
     /// </summary>
     public static void BuildRopeTable(float* cosOut, float* sinOut, int maxSeqLen, int headDim, float theta)
+        => BuildRopeTable(cosOut, sinOut, maxSeqLen, headDim, theta, null);
+
+    /// <summary>
+    /// Variant accepting a per-pair frequency factor array (e.g. Gemma 4
+    /// <c>rope_freqs.weight</c> for global layers). When non-null, the raw
+    /// inverse frequency is divided by <c>freqFactors[i]</c> for pair i,
+    /// so a factor of 1e30 zeros out the rotation for that pair (identity).
+    /// </summary>
+    public static void BuildRopeTable(float* cosOut, float* sinOut, int maxSeqLen, int headDim, float theta, float* freqFactors)
     {
         int halfDim = headDim / 2;
         float* freqs = stackalloc float[halfDim];
         for (int i = 0; i < halfDim; i++)
-            freqs[i] = 1.0f / MathF.Pow(theta, 2.0f * i / headDim);
+        {
+            float inv = 1.0f / MathF.Pow(theta, 2.0f * i / headDim);
+            if (freqFactors != null) inv /= freqFactors[i];
+            freqs[i] = inv;
+        }
 
         for (int p = 0; p < maxSeqLen; p++)
         {
