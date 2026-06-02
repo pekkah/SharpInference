@@ -449,17 +449,20 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 _cpuWDown[ci] = ResolveCpuWeight($"blk.{li}.ffn_down.weight");
             }
 
+            // Gemma 4 has per-layer head_dim (256 SWA / 512 global); other arches
+            // pin to scalar _headDim. Mirrors CudaForwardPass per-layer dispatch.
+            int layerHd = _hp.LayerHeadDim is { } lhd ? lhd[li] : _headDim;
             if (_hasAttnBias)
             {
-                _cpuBq[ci] = LoadCpuBias($"blk.{li}.attn_q.bias", _numHeads * _headDim);
-                _cpuBk[ci] = LoadCpuBias($"blk.{li}.attn_k.bias", _numKvHeads * _headDim);
-                _cpuBv[ci] = LoadCpuBias($"blk.{li}.attn_v.bias", _numKvHeads * _headDim);
+                _cpuBq[ci] = LoadCpuBias($"blk.{li}.attn_q.bias", _numHeads * layerHd);
+                _cpuBk[ci] = LoadCpuBias($"blk.{li}.attn_k.bias", _numKvHeads * layerHd);
+                _cpuBv[ci] = LoadCpuBias($"blk.{li}.attn_v.bias", _numKvHeads * layerHd);
                 _cpuBo[ci] = LoadCpuBias($"blk.{li}.attn_output.bias", _embDim);
             }
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
-                int qNormSize = _hp.IsPerChannelQkNorm ? (int)_numHeads * _headDim : _headDim;
-                int kNormSize = _hp.IsPerChannelQkNorm ? (int)_numKvHeads * _headDim : _headDim;
+                int qNormSize = _hp.IsPerChannelQkNorm ? (int)_numHeads * layerHd : layerHd;
+                int kNormSize = _hp.IsPerChannelQkNorm ? (int)_numKvHeads * layerHd : layerHd;
                 _cpuQNorm[ci] = LoadCpuBias($"blk.{li}.attn_q_norm.weight", qNormSize);
                 _cpuKNorm[ci] = LoadCpuBias($"blk.{li}.attn_k_norm.weight", kNormSize);
             }
