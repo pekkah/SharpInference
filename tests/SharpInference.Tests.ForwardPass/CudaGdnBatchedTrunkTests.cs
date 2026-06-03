@@ -46,7 +46,9 @@ public sealed unsafe class CudaGdnBatchedTrunkTests
         if (gpu is null) return;
 
         const int channels = 8192, kernelSize = 4, retained = kernelSize - 1;
-        foreach (int N in new[] { 2, 5, 33 })
+        // N=1 hits the maximal state-aliasing edge the state-update kernel guards against
+        // (all retained taps come from carried state); N<K-1 mixes carried state + chunk.
+        foreach (int N in new[] { 1, 2, 5, 33 })
         {
             var rng = new Random(114 + N);
             var xAll = Rand(N * channels, rng);
@@ -172,7 +174,7 @@ public sealed unsafe class CudaGdnBatchedTrunkTests
 
         const int hv = 4, d = 128;
         int hd = hv * d;
-        foreach (int N in new[] { 2, 7, 33 })
+        foreach (int N in new[] { 1, 2, 7, 33 })
         {
             var rng = new Random(400 + N);
             var state0 = Rand(hv * d * d, rng);
@@ -245,7 +247,9 @@ public sealed unsafe class CudaGdnBatchedTrunkTests
         const int numHeads = 8, numKvHeads = 2, headDim = 128;
         int qDim = numHeads * headDim, kvDim = numKvHeads * headDim;
         const int maxSeq = 4096;
-        foreach ((int startPos, int N) in new[] { (0, 3), (0, 64), (100, 17), (3000, 40) })
+        // (4090,6): last query seq_len == 4096, the inclusive edge of the shared-scores
+        // buffer and the AttentionBatched startPos+N<=4096 guard boundary.
+        foreach ((int startPos, int N) in new[] { (0, 3), (0, 64), (100, 17), (3000, 40), (4090, 6) })
         {
             var rng = new Random(500 + startPos + N);
             // Prefix K/V for positions [0, startPos), plus chunk K/V for [startPos, startPos+N).

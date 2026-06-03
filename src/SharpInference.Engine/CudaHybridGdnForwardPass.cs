@@ -536,6 +536,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     internal static bool BatchedAttnEnabled =
         Environment.GetEnvironmentVariable("SHARPI_BATCHED_ATTN") != "0";
 
+    // One-shot guard so the >4096 batched-SDPA perf fallback is observable (it is
+    // bit-identical, just slower per-position) without spamming once per layer/chunk.
+    private bool _loggedBatchedAttnFallback;
+
     public int VocabSize => _hp.VocabSize;
     public int MaxSeqLen => _maxSeqLen;
     public LayerPlacement Placement => _placement;
@@ -1507,8 +1511,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// plus the attn-norm / post-attn-norm RmsNorms, per-head Q/K RMSNorm, RoPE,
     /// Q‖gate split and GLU gate run as single batched launches over all N tokens.
     /// The conv1d / delta-net recurrence and KV-append / scaled-dot-product attention
-    /// stay per-position (they are positional), reading per-token slices via
-    /// <see cref="CudaBackend.View"/>. Output is bit-identical to
+    /// were per-position over N (per-token slices via <see cref="CudaBackend.View"/>)
+    /// in #111; issue #114-B now batches them too by default — a fused sequential-scan
+    /// for the GDN recurrence and a batched-query SDPA — falling back to the per-position
+    /// View loops under <c>SHARPI_BATCHED_GDN_SCAN=0</c> / <c>SHARPI_BATCHED_ATTN=0</c>
+    /// (and, for attention, when the chunk exceeds the shared-scores window or SnapKV is
+    /// active). Output is bit-identical to
     /// <see cref="TrunkLayerSequential"/>: every batched kernel runs the same per-row /
     /// per-element computation as its single-token counterpart, only collapsing the
     /// N per-token launches into one each — which is what removes the host launch
@@ -1553,7 +1561,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpu.Synchronize();   // drain all queued D2H: resid/norm/shared now host-valid
     }
 
-    /// <summary>Batched GDN block: projections over N tokens, per-position recurrence.</summary>
+    /// <summary>Batched GDN block: projections over N tokens; fused sequential-scan
+    /// recurrence + batched conv1d/L2norm/tile by default (issue #114-B), or the
+    /// per-position View loop under <c>SHARPI_BATCHED_GDN_SCAN=0</c>.</summary>
     private void GdnBlockBatched(int layer, int N, Tensor norm, Tensor blockOut)
     {
         int convCh = _gdnConvChannels, valDim = _gdnValueDim, nVH = _gdnNumVHeads;
@@ -1643,8 +1653,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         GpuMatMulBatched(blockOut, _gpuWSsmOut[layer], gdnOutAll, N);
     }
 
-    /// <summary>Batched attention block: projections + Q/K norm + RoPE over N tokens,
-    /// per-position KV-append + SDPA.</summary>
+    /// <summary>Batched attention block: projections + Q/K norm + RoPE over N tokens;
+    /// batched KV-append + batched-query SDPA by default (issue #114-B) when the chunk
+    /// stays on the shared-scores window (<c>startPos+N ≤ 4096</c>) and SnapKV is inactive,
+    /// else (or under <c>SHARPI_BATCHED_ATTN=0</c>) the per-position KV-append + SDPA loop.</summary>
     private void AttnBlockBatched(int layer, int N, int startPos, bool snapKvActive, int wStart,
                                   Tensor norm, Tensor blockOut)
     {
@@ -1686,6 +1698,18 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _gpu.SigmoidMulInPlace(attnOutAll, gateAll);
             GpuMatMulBatched(blockOut, _gpuWO[layer], attnOutAll, N);
             return;
+        }
+
+        // Falling back to the per-position attention loop. Bit-identical, but slower —
+        // surface the >4096 perf cliff once (the batched SDPA only covers the
+        // shared-scores window; SnapKV-active prefill also takes this path by design).
+        if (BatchedAttnEnabled && !snapKvActive && startPos + N > 4096 && !_loggedBatchedAttnFallback)
+        {
+            _loggedBatchedAttnFallback = true;
+            Console.Error.WriteLine(
+                $"[CudaHybridGdnForwardPass] batched-query SDPA disabled for this prefill: " +
+                $"startPos+N={startPos + N} exceeds the {4096}-position shared-scores window; " +
+                "using the per-position attention path (bit-identical, slower). #114-B follow-up: wave-based >4096 SDPA.");
         }
 
         // Per-position KV-append + scaled-dot-product attention (positional →
