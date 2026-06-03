@@ -142,6 +142,70 @@ public sealed class CudaHybridGdnBatchedPrefillTests
         fwd.LastHidden.ToArray();
 
     /// <summary>
+    /// Issue #111: the GEMM-batched trunk (<c>TrunkLayerBatched</c>, default) must be
+    /// bit-identical to the per-token <c>TrunkLayerSequential</c> fallback
+    /// (<c>SHARPI_BATCHED_TRUNK=0</c>). Both run under batched prefill; only the trunk
+    /// strategy differs. This is the equivalence users rely on when bisecting with the
+    /// env var — otherwise asserted only by prose.
+    /// </summary>
+    [Fact]
+    public void BatchedTrunk_BitwiseMatchesSequentialTrunk_Carnice()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindCarnicePath();
+        if (path is null) return;
+
+        var prevCpuMoe = Environment.GetEnvironmentVariable("SHARPI_CPU_MOE");
+        Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", "1");
+        bool prevBatchedPrefill = CudaHybridGdnForwardPass.BatchedPrefillEnabled;
+        bool prevBatchedTrunk = CudaHybridGdnForwardPass.BatchedTrunkEnabled;
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            if (!hp.IsMoE) return;
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+            var placement = new LayerPlacement(
+                GpuLayers: hp.NumLayers, CpuLayers: 0, GpuWeightBytes: 0, GpuKvBytes: 0,
+                RecommendedCtxSize: Math.Min(hp.ContextLength, 4096));
+            var tokens = tokenizer.Encode(
+                "The quick brown fox jumps over the lazy dog. " +
+                "Pack my box with five dozen liquor jugs. " +
+                "How razorback-jumping frogs can level six piqued gymnasts!");
+            Assert.True(tokens.Count >= 8);
+
+            CudaHybridGdnForwardPass.BatchedPrefillEnabled = true;
+
+            float[] RunWithTrunk(bool batchedTrunk)
+            {
+                CudaHybridGdnForwardPass.BatchedTrunkEnabled = batchedTrunk;
+                using var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
+                return fwd.Prefill(tokens).ToArray();
+            }
+
+            float[] seqTrunk = RunWithTrunk(false);
+            float[] batTrunk = RunWithTrunk(true);
+
+            Assert.Equal(seqTrunk.Length, batTrunk.Length);
+            int firstDiff = -1;
+            for (int i = 0; i < seqTrunk.Length; i++)
+                if (BitConverter.SingleToInt32Bits(seqTrunk[i]) != BitConverter.SingleToInt32Bits(batTrunk[i]))
+                { firstDiff = i; break; }
+            Assert.True(firstDiff < 0,
+                $"Batched trunk diverges from sequential trunk at index {firstDiff}. " +
+                "TrunkLayerBatched must be bit-identical to TrunkLayerSequential (SHARPI_BATCHED_TRUNK=0).");
+            Assert.Equal(Sampler.Greedy(seqTrunk), Sampler.Greedy(batTrunk));
+        }
+        finally
+        {
+            CudaHybridGdnForwardPass.BatchedPrefillEnabled = prevBatchedPrefill;
+            CudaHybridGdnForwardPass.BatchedTrunkEnabled = prevBatchedTrunk;
+            Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", prevCpuMoe);
+        }
+    }
+
+    /// <summary>
     /// Multi-chunk parity: prefill the prompt in two segments (<c>[0,k)</c> then
     /// <c>[k,N)</c>, the second with <c>startPos=k</c>) and assert the final-token
     /// logits are bit-identical between batched and sequential. Exercises the paths
