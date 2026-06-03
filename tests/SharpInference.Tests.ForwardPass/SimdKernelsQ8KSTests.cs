@@ -294,6 +294,63 @@ public sealed unsafe class SimdKernelsQ8KSTests
         }
     }
 
+    /// <summary>
+    /// Issue #114: the four-input dequant-once <see cref="SimdKernels.DotQ3K_Q8KS_4In"/>
+    /// must be <b>bit-identical</b> to four separate <see cref="SimdKernels.DotQ3K_Q8KS"/>
+    /// calls — it decodes the weight row once but accumulates each input in the
+    /// identical sub-block order (same failure mode the routed-MoE byte-parity oracle
+    /// trips on). Mirrors <see cref="DotQ3K_Q8KS_2In_BitwiseMatchesSingle"/>.
+    /// </summary>
+    [Fact]
+    public void DotQ3K_Q8KS_4In_BitwiseMatchesSingle()
+    {
+        if (!Avx2.IsSupported || !Fma.IsSupported) return;
+
+        foreach ((int rows, int cols) in new[] { (4, 256), (5, 512), (8, 2048), (3, 4096) })
+        {
+            var rng = new Random(unchecked((int)0x114C0DE) ^ (rows * 131 + cols));
+            byte[] weightBytes = BuildQ3KMatrix(rows, cols, rng);
+
+            var inputs = new float[4][];
+            for (int t = 0; t < 4; t++)
+            {
+                inputs[t] = new float[cols];
+                for (int i = 0; i < cols; i++) inputs[t][i] = (float)(rng.NextDouble() * 2 - 1);
+            }
+
+            int bytesPerRow = (cols / 256) * 110;
+            int scratchBytes = SimdKernels.Q8KSScratchBytes(cols);
+            var s = new byte[4][];
+            for (int t = 0; t < 4; t++) s[t] = new byte[scratchBytes];
+
+            fixed (byte* wPtr = weightBytes)
+            fixed (byte* sp0 = s[0]) fixed (byte* sp1 = s[1])
+            fixed (byte* sp2 = s[2]) fixed (byte* sp3 = s[3])
+            fixed (float* i0 = inputs[0]) fixed (float* i1 = inputs[1])
+            fixed (float* i2 = inputs[2]) fixed (float* i3 = inputs[3])
+            {
+                SimdKernels.QuantizeRowToQ8KS(i0, cols, sp0);
+                SimdKernels.QuantizeRowToQ8KS(i1, cols, sp1);
+                SimdKernels.QuantizeRowToQ8KS(i2, cols, sp2);
+                SimdKernels.QuantizeRowToQ8KS(i3, cols, sp3);
+                for (int r = 0; r < rows; r++)
+                {
+                    byte* rowP = wPtr + (long)r * bytesPerRow;
+                    float ref0 = SimdKernels.DotQ3K_Q8KS(rowP, sp0, cols);
+                    float ref1 = SimdKernels.DotQ3K_Q8KS(rowP, sp1, cols);
+                    float ref2 = SimdKernels.DotQ3K_Q8KS(rowP, sp2, cols);
+                    float ref3 = SimdKernels.DotQ3K_Q8KS(rowP, sp3, cols);
+                    SimdKernels.DotQ3K_Q8KS_4In(rowP, sp0, sp1, sp2, sp3, cols,
+                        out float v0, out float v1, out float v2, out float v3);
+                    Assert.Equal(BitConverter.SingleToInt32Bits(ref0), BitConverter.SingleToInt32Bits(v0));
+                    Assert.Equal(BitConverter.SingleToInt32Bits(ref1), BitConverter.SingleToInt32Bits(v1));
+                    Assert.Equal(BitConverter.SingleToInt32Bits(ref2), BitConverter.SingleToInt32Bits(v2));
+                    Assert.Equal(BitConverter.SingleToInt32Bits(ref3), BitConverter.SingleToInt32Bits(v3));
+                }
+            }
+        }
+    }
+
     private static byte[] BuildQ4KMatrix(int rows, int cols, Random rng)
     {
         int blocksPerRow = cols / 256, bytesPerRow = blocksPerRow * 144;
@@ -370,6 +427,48 @@ public sealed unsafe class SimdKernelsQ8KSTests
                                  BitConverter.SingleToInt32Bits(w1));
                     Assert.Equal(BitConverter.SingleToInt32Bits(SimdKernels.DotQ5K(r5, i2, cols)),
                                  BitConverter.SingleToInt32Bits(w2));
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Issue #114: the four-input FP-path <see cref="SimdKernels.DotQ4K_4In"/> must be
+    /// <b>bit-identical</b> to four single <c>DotQ4K</c> calls — the register-tiled
+    /// quad only amortizes the nibble unpack, never the per-input accumulation order.
+    /// </summary>
+    [Fact]
+    public void DotQ4K_4In_BitwiseMatchesSingle()
+    {
+        foreach ((int rows, int cols) in new[] { (4, 256), (5, 512), (8, 2048), (3, 4096) })
+        {
+            var rng = new Random(unchecked((int)0x4114C0DE) ^ (rows * 131 + cols));
+            byte[] q4 = BuildQ4KMatrix(rows, cols, rng);
+            var inputs = new float[4][];
+            for (int t = 0; t < 4; t++)
+            {
+                inputs[t] = new float[cols];
+                for (int i = 0; i < cols; i++) inputs[t][i] = (float)(rng.NextDouble() * 2 - 1);
+            }
+
+            int bprQ4 = (cols / 256) * 144;
+            fixed (byte* q4p = q4)
+            fixed (float* i0 = inputs[0]) fixed (float* i1 = inputs[1])
+            fixed (float* i2 = inputs[2]) fixed (float* i3 = inputs[3])
+            {
+                for (int r = 0; r < rows; r++)
+                {
+                    byte* r4 = q4p + (long)r * bprQ4;
+                    SimdKernels.DotQ4K_4In(r4, i0, i1, i2, i3, cols,
+                        out float v0, out float v1, out float v2, out float v3);
+                    Assert.Equal(BitConverter.SingleToInt32Bits(SimdKernels.DotQ4K(r4, i0, cols)),
+                                 BitConverter.SingleToInt32Bits(v0));
+                    Assert.Equal(BitConverter.SingleToInt32Bits(SimdKernels.DotQ4K(r4, i1, cols)),
+                                 BitConverter.SingleToInt32Bits(v1));
+                    Assert.Equal(BitConverter.SingleToInt32Bits(SimdKernels.DotQ4K(r4, i2, cols)),
+                                 BitConverter.SingleToInt32Bits(v2));
+                    Assert.Equal(BitConverter.SingleToInt32Bits(SimdKernels.DotQ4K(r4, i3, cols)),
+                                 BitConverter.SingleToInt32Bits(v3));
                 }
             }
         }
