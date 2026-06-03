@@ -206,6 +206,82 @@ public sealed class CudaHybridGdnBatchedPrefillTests
     }
 
     /// <summary>
+    /// Issue #114-B: the batched GDN trunk's <b>fused sequential-scan recurrence</b>
+    /// (<c>BatchedGdnScanEnabled</c>) and <b>batched-query SDPA</b>
+    /// (<c>BatchedAttnEnabled</c>), both default-on, must be bit-identical to the
+    /// per-position View-loop fallback (the path taken when those flags are off — the
+    /// pre-#114-B reference). This is the only oracle that exercises the host glue in
+    /// <c>GdnBlockBatched</c> / <c>AttnBlockBatched</c> — the conv→silu→L2norm→tile→scan
+    /// strides/offsets and the KV-append/SDPA wiring — at the model level; the per-kernel
+    /// tests (<see cref="CudaGdnBatchedTrunkTests"/>) prove each kernel in isolation but
+    /// not the argument plumbing that strings them together. Both arms run under batched
+    /// prefill + batched trunk (#110/#111); only the #114-B sub-paths differ.
+    /// </summary>
+    [Fact]
+    public void BatchedGdnScanAndAttn_BitwiseMatchesPerPosition_Carnice()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindCarnicePath();
+        if (path is null) return;
+
+        var prevCpuMoe = Environment.GetEnvironmentVariable("SHARPI_CPU_MOE");
+        Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", "1");
+        bool prevBatchedPrefill = CudaHybridGdnForwardPass.BatchedPrefillEnabled;
+        bool prevBatchedTrunk = CudaHybridGdnForwardPass.BatchedTrunkEnabled;
+        bool prevScan = CudaHybridGdnForwardPass.BatchedGdnScanEnabled;
+        bool prevAttn = CudaHybridGdnForwardPass.BatchedAttnEnabled;
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            if (!hp.IsMoE) return;
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+            var placement = new LayerPlacement(
+                GpuLayers: hp.NumLayers, CpuLayers: 0, GpuWeightBytes: 0, GpuKvBytes: 0,
+                RecommendedCtxSize: Math.Min(hp.ContextLength, 4096));
+            var tokens = tokenizer.Encode(
+                "The quick brown fox jumps over the lazy dog. " +
+                "Pack my box with five dozen liquor jugs. " +
+                "How razorback-jumping frogs can level six piqued gymnasts!");
+            Assert.True(tokens.Count >= 8);
+
+            // Hold the #110/#111 batched paths on; only toggle the #114-B sub-paths.
+            CudaHybridGdnForwardPass.BatchedPrefillEnabled = true;
+            CudaHybridGdnForwardPass.BatchedTrunkEnabled = true;
+
+            float[] RunWith(bool fused)
+            {
+                CudaHybridGdnForwardPass.BatchedGdnScanEnabled = fused;
+                CudaHybridGdnForwardPass.BatchedAttnEnabled = fused;
+                using var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
+                return fwd.Prefill(tokens).ToArray();
+            }
+
+            float[] perPos = RunWith(false);  // per-position recurrence + SDPA (View loops)
+            float[] fused = RunWith(true);     // fused sequential-scan + batched-query SDPA
+
+            Assert.Equal(perPos.Length, fused.Length);
+            int firstDiff = -1;
+            for (int i = 0; i < perPos.Length; i++)
+                if (BitConverter.SingleToInt32Bits(perPos[i]) != BitConverter.SingleToInt32Bits(fused[i]))
+                { firstDiff = i; break; }
+            Assert.True(firstDiff < 0,
+                $"Fused GDN-scan + batched-query SDPA diverges from the per-position path at index {firstDiff}. " +
+                "GdnBlockBatched/AttnBlockBatched host wiring (strides/offsets) must be bit-identical to the View-loop fallback.");
+            Assert.Equal(Sampler.Greedy(perPos), Sampler.Greedy(fused));
+        }
+        finally
+        {
+            CudaHybridGdnForwardPass.BatchedPrefillEnabled = prevBatchedPrefill;
+            CudaHybridGdnForwardPass.BatchedTrunkEnabled = prevBatchedTrunk;
+            CudaHybridGdnForwardPass.BatchedGdnScanEnabled = prevScan;
+            CudaHybridGdnForwardPass.BatchedAttnEnabled = prevAttn;
+            Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", prevCpuMoe);
+        }
+    }
+
+    /// <summary>
     /// Multi-chunk parity: prefill the prompt in two segments (<c>[0,k)</c> then
     /// <c>[k,N)</c>, the second with <c>startPos=k</c>) and assert the final-token
     /// logits are bit-identical between batched and sequential. Exercises the paths

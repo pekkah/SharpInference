@@ -175,6 +175,17 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _gdnTileHeadsKernel;
     private nint   _gdnRecurrenceDecodeKernel;
 
+    // Issue #114-B: batched GDN trunk + batched-query SDPA kernels.
+    private nint   _gdnConv1dDecodeBatchedKernel;
+    private nint   _gdnConv1dStateUpdateBatchedKernel;
+    private nint   _gdnL2NormPerHeadBatchedKernel;
+    private nint   _gdnTileHeadsBatchedKernel;
+    private nint   _gdnRecurrenceScanKernel;
+    private nint   _kvAppendBatchedKernel;
+    private nint   _kvAppendBatchedBf16Kernel;
+    private nint   _fullSeqAttentionKernel;
+    private nint   _fullSeqAttentionBf16Kernel;
+
     // Persistent Q8_1 scratch for the Q4_K matvec input. Grows on demand and
     // never shrinks. Sized in 36-byte sub-blocks (one block_q8_1 per 32 elements).
     private nint   _q81Buf;
@@ -2242,6 +2253,114 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_bf16) failed: {r}");
     }
 
+    // ── Issue #114-B: batched prompt-prefill SDPA ──────────────────────────
+
+    /// <summary>
+    /// Batched <see cref="KvAppend"/>: writes the K/V vectors for <paramref name="nTok"/>
+    /// tokens into the cache at consecutive positions <c>startPos .. startPos+nTok-1</c>
+    /// in a single launch. <paramref name="kAll"/>/<paramref name="vAll"/> are
+    /// <c>[nTok × kvDim]</c> token-major. Bit-identical to nTok sequential
+    /// <see cref="KvAppend"/> calls.
+    /// </summary>
+    public void KvAppendBatched(Tensor kAll, Tensor vAll, Tensor kCache, Tensor vCache,
+                                int kvDim, int startPos, int maxSeqLen, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint kPtr = GetDevPtr(kAll), vPtr = GetDevPtr(vAll);
+        nint kcP = GetDevPtr(kCache), vcP = GetDevPtr(vCache);
+        int pKD = kvDim, pSP = startPos, pMSL = maxSeqLen, pN = nTok;
+        nint* args = stackalloc nint[8]
+        {
+            (nint)(&kPtr), (nint)(&vPtr), (nint)(&kcP), (nint)(&vcP),
+            (nint)(&pKD), (nint)(&pSP), (nint)(&pMSL), (nint)(&pN)
+        };
+        uint grid = (uint)((kvDim + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_kvAppendBatchedKernel, grid, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kv_append_batched) failed: {r}");
+    }
+
+    /// <summary>Bf16-store variant of <see cref="KvAppendBatched"/> (default KV dtype).</summary>
+    public void KvAppendBatchedBf16(Tensor kAll, Tensor vAll, Tensor kCache, Tensor vCache,
+                                    int kvDim, int startPos, int maxSeqLen, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint kPtr = GetDevPtr(kAll), vPtr = GetDevPtr(vAll);
+        nint kcP = GetDevPtr(kCache), vcP = GetDevPtr(vCache);
+        int pKD = kvDim, pSP = startPos, pMSL = maxSeqLen, pN = nTok;
+        nint* args = stackalloc nint[8]
+        {
+            (nint)(&kPtr), (nint)(&vPtr), (nint)(&kcP), (nint)(&vcP),
+            (nint)(&pKD), (nint)(&pSP), (nint)(&pMSL), (nint)(&pN)
+        };
+        uint grid = (uint)((kvDim + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_kvAppendBatchedBf16Kernel, grid, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kv_append_batched_bf16) failed: {r}");
+    }
+
+    /// <summary>
+    /// Batched-query scaled dot-product attention (issue #114-B). All
+    /// <paramref name="nTok"/> prompt queries attend over their causal prefix in a
+    /// single launch (grid = numHeads × nTok), instead of nTok sequential
+    /// <see cref="Attention"/> launches. Query i (row of <paramref name="qAll"/>,
+    /// <c>[nTok × numHeads·headDim]</c>) attends over cache positions
+    /// <c>[0, startPos+i+1)</c>; output written to <paramref name="outAll"/> in the
+    /// same layout. Bit-identical to the per-token <see cref="Attention"/> path.
+    ///
+    /// <para><b>Constraint:</b> uses the shared-scores fast path only, so the caller
+    /// MUST guarantee <c>startPos + nTok ≤ 4096</c> (every block's seqLen stays
+    /// ≤ MAX_STORED_SCORES). Beyond that, fall back to the per-token loop.</para>
+    /// </summary>
+    public void AttentionBatched(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
+                                 int numHeads, int numKvHeads, int headDim,
+                                 int startPos, int maxSeqLen, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (startPos + nTok > 4096)
+            throw new ArgumentException(
+                $"AttentionBatched requires startPos+nTok ≤ 4096 (shared-scores path); got {startPos}+{nTok}.");
+
+        nint qP = GetDevPtr(qAll), kP = GetDevPtr(kCache), vP = GetDevPtr(vCache), oP = GetDevPtr(outAll);
+        int pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pSP = startPos, pMSL = maxSeqLen, pN = nTok;
+        nint* args = stackalloc nint[10]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD), (nint)(&pSP), (nint)(&pMSL), (nint)(&pN)
+        };
+        int r = NvrtcInterop.LaunchKernel(_fullSeqAttentionKernel, (uint)numHeads, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(full_seq_attention) failed: {r}");
+    }
+
+    /// <summary>Bf16-read variant of <see cref="AttentionBatched"/> (default KV dtype).</summary>
+    public void AttentionBatchedBf16(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
+                                     int numHeads, int numKvHeads, int headDim,
+                                     int startPos, int maxSeqLen, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (startPos + nTok > 4096)
+            throw new ArgumentException(
+                $"AttentionBatchedBf16 requires startPos+nTok ≤ 4096 (shared-scores path); got {startPos}+{nTok}.");
+
+        nint qP = GetDevPtr(qAll), kP = GetDevPtr(kCache), vP = GetDevPtr(vCache), oP = GetDevPtr(outAll);
+        int pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pSP = startPos, pMSL = maxSeqLen, pN = nTok;
+        nint* args = stackalloc nint[10]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD), (nint)(&pSP), (nint)(&pMSL), (nint)(&pN)
+        };
+        int r = NvrtcInterop.LaunchKernel(_fullSeqAttentionBf16Kernel, (uint)numHeads, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(full_seq_attention_bf16) failed: {r}");
+    }
+
     // ================================================================
     //  SnapKV (issue #58): prefill KV eviction support
     // ================================================================
@@ -2754,6 +2873,143 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_recurrence_decode) failed: {r}");
     }
 
+    // ── Issue #114-B: batched GDN trunk over a chunk of N prompt tokens ────────
+
+    /// <summary>
+    /// Batched GDN depthwise conv1d over <paramref name="nTok"/> tokens (read-only
+    /// state). <paramref name="x"/>/<paramref name="output"/> are <c>[nTok × channels]</c>;
+    /// <paramref name="state"/> is the carried <c>[(K-1) × channels]</c>. Bit-identical to
+    /// nTok sequential <see cref="GdnConv1dDecode"/> calls. State is advanced separately by
+    /// <see cref="GdnConv1dStateUpdateBatched"/> (so concurrent token blocks read one snapshot).
+    /// </summary>
+    public void GdnConv1dDecodeBatched(Tensor x, Tensor state, Tensor weight, Tensor output,
+                                       int channels, int kernelSize, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint xP = GetDevPtr(x), sP = GetDevPtr(state), wP = GetDevPtr(weight), oP = GetDevPtr(output);
+        int pC = channels, pK = kernelSize, pN = nTok;
+        nint* args = stackalloc nint[7]
+        {
+            (nint)(&xP), (nint)(&sP), (nint)(&wP), (nint)(&oP),
+            (nint)(&pC), (nint)(&pK), (nint)(&pN)
+        };
+        uint grid = (uint)((channels + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_gdnConv1dDecodeBatchedKernel, grid, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_conv1d_decode_batched) failed: {r}");
+    }
+
+    /// <summary>Advance the conv1d state past a chunk of <paramref name="nTok"/> tokens
+    /// (matches the sequential state evolution). See <see cref="GdnConv1dDecodeBatched"/>.</summary>
+    public void GdnConv1dStateUpdateBatched(Tensor x, Tensor state, int channels, int kernelSize, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint xP = GetDevPtr(x), sP = GetDevPtr(state);
+        int pC = channels, pK = kernelSize, pN = nTok;
+        nint* args = stackalloc nint[5] { (nint)(&xP), (nint)(&sP), (nint)(&pC), (nint)(&pK), (nint)(&pN) };
+        uint grid = (uint)((channels + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_gdnConv1dStateUpdateBatchedKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_conv1d_state_update_batched) failed: {r}");
+    }
+
+    /// <summary>
+    /// Batched per-head L2-norm over <paramref name="nTok"/> tokens. <paramref name="data"/>
+    /// is offset to the region base; <paramref name="rowStride"/> is the per-token element
+    /// stride. grid = (numHeads, nTok). Bit-identical to nTok sequential
+    /// <see cref="GdnL2NormPerHead"/> calls.
+    /// </summary>
+    public void GdnL2NormPerHeadBatched(Tensor data, long elementOffset, int numHeads, int headDim,
+                                        int rowStride, int nTok, float eps = 1e-6f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint dP = GetDevPtr(data) + (nint)(elementOffset * sizeof(float));
+        int pHD = headDim, pNH = numHeads, pRS = rowStride, pN = nTok;
+        float pE = eps;
+        nint* args = stackalloc nint[6]
+        {
+            (nint)(&dP), (nint)(&pHD), (nint)(&pNH), (nint)(&pE), (nint)(&pRS), (nint)(&pN)
+        };
+        int r = NvrtcInterop.LaunchKernel(_gdnL2NormPerHeadBatchedKernel, (uint)numHeads, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_l2_norm_per_head_batched) failed: {r}");
+    }
+
+    /// <summary>
+    /// Batched GQA-broadcast tile over <paramref name="nTok"/> tokens. <paramref name="src"/>
+    /// is offset to the region base; <paramref name="srcStride"/>/<paramref name="dstStride"/>
+    /// are per-token strides. Bit-identical to nTok sequential <see cref="GdnTileHeads"/> calls.
+    /// </summary>
+    public void GdnTileHeadsBatched(Tensor src, long srcOffset, Tensor dst, long dstOffset,
+                                    int srcHeads, int repeat, int headDim,
+                                    int srcStride, int dstStride, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint sP = GetDevPtr(src) + (nint)(srcOffset * sizeof(float));
+        nint dP = GetDevPtr(dst) + (nint)(dstOffset * sizeof(float));
+        int pSH = srcHeads, pR = repeat, pHD = headDim, pSS = srcStride, pDS = dstStride, pN = nTok;
+        nint* args = stackalloc nint[8]
+        {
+            (nint)(&sP), (nint)(&dP), (nint)(&pSH), (nint)(&pR), (nint)(&pHD),
+            (nint)(&pSS), (nint)(&pDS), (nint)(&pN)
+        };
+        int total = srcHeads * repeat * headDim;
+        uint grid = (uint)((total + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_gdnTileHeadsBatchedKernel, grid, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_tile_heads_batched) failed: {r}");
+    }
+
+    /// <summary>
+    /// Fused sequential GDN recurrence scan over <paramref name="nTok"/> tokens: one launch
+    /// (one block per v-head) loops the positions internally, carrying the per-head state in
+    /// place. Bit-identical to nTok sequential <see cref="GdnRecurrenceDecode"/> calls — the
+    /// fused form of the per-token decode, NOT the parallel chunked-scan. Per-head input
+    /// strides let q/k come from the tiled <c>[nTok × valueDim]</c> buffers, v from the
+    /// silu'd conv output (<paramref name="vHeadOff"/> into a <c>[nTok × convChannels]</c>
+    /// buffer), z from a <c>[nTok × valueDim]</c> gate, alpha/beta from <c>[nTok × numVHeads]</c>.
+    /// </summary>
+    public void GdnRecurrenceScan(
+        Tensor state, Tensor qAll, Tensor kAll, Tensor vAll,
+        Tensor alphaAll, Tensor betaAll, Tensor ssmA, Tensor dtBias,
+        Tensor normWeight, Tensor zAll, Tensor outputAll,
+        int numVHeads, int headDim, float normEps,
+        int qStride, int kStride, int vStride, int vHeadOff, int zStride, int oStride, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint sP = GetDevPtr(state);
+        nint qP = GetDevPtr(qAll), kP = GetDevPtr(kAll), vP = GetDevPtr(vAll);
+        nint aP = GetDevPtr(alphaAll), bP = GetDevPtr(betaAll);
+        nint aaP = GetDevPtr(ssmA), dbP = GetDevPtr(dtBias), nwP = GetDevPtr(normWeight);
+        nint zP = GetDevPtr(zAll), oP = GetDevPtr(outputAll);
+        int pHV = numVHeads, pD = headDim;
+        float pE = normEps;
+        int pQS = qStride, pKS = kStride, pVS = vStride, pVO = vHeadOff, pZS = zStride, pOS = oStride, pN = nTok;
+        nint* args = stackalloc nint[21]
+        {
+            (nint)(&sP), (nint)(&qP), (nint)(&kP), (nint)(&vP),
+            (nint)(&aP), (nint)(&bP), (nint)(&aaP), (nint)(&dbP),
+            (nint)(&nwP), (nint)(&zP), (nint)(&oP),
+            (nint)(&pHV), (nint)(&pD), (nint)(&pE),
+            (nint)(&pQS), (nint)(&pKS), (nint)(&pVS), (nint)(&pVO), (nint)(&pZS), (nint)(&pOS), (nint)(&pN)
+        };
+        uint sharedBytes = (uint)(8 * headDim * sizeof(float));
+        int r = NvrtcInterop.LaunchKernel(_gdnRecurrenceScanKernel,
+            (uint)numVHeads, 1, 1, (uint)headDim, 1, 1, sharedBytes, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_recurrence_scan) failed: {r}");
+    }
+
     public void FullSeqAttention(Tensor output, Tensor q, Tensor k, Tensor v,
                                  int nTok, int nHeads, int headDim, float scale) =>
         throw new NotSupportedException("CudaBackend.FullSeqAttention is not implemented (LLM path uses single-token Attention).");
@@ -3063,6 +3319,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
             _siluInplaceKernel, _gdnConv1dDecodeKernel, _gdnL2NormPerHeadKernel,
             _gdnTileHeadsKernel, _gdnRecurrenceDecodeKernel,
+            _gdnConv1dDecodeBatchedKernel, _gdnConv1dStateUpdateBatchedKernel,
+            _gdnL2NormPerHeadBatchedKernel, _gdnTileHeadsBatchedKernel, _gdnRecurrenceScanKernel,
+            _kvAppendBatchedKernel, _kvAppendBatchedBf16Kernel,
+            _fullSeqAttentionKernel, _fullSeqAttentionBf16Kernel,
         ];
         foreach (nint k in kernels)
         {
@@ -3144,6 +3404,17 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _gdnL2NormPerHeadKernel   = GetKernelFunc("llm_gdn_l2_norm_per_head");
         _gdnTileHeadsKernel       = GetKernelFunc("llm_gdn_tile_heads");
         _gdnRecurrenceDecodeKernel = GetKernelFunc("llm_gdn_recurrence_decode");
+
+        // qwen35moe GDN batched trunk + batched-query SDPA kernels (issue #114-B).
+        _gdnConv1dDecodeBatchedKernel      = GetKernelFunc("llm_gdn_conv1d_decode_batched");
+        _gdnConv1dStateUpdateBatchedKernel = GetKernelFunc("llm_gdn_conv1d_state_update_batched");
+        _gdnL2NormPerHeadBatchedKernel     = GetKernelFunc("llm_gdn_l2_norm_per_head_batched");
+        _gdnTileHeadsBatchedKernel         = GetKernelFunc("llm_gdn_tile_heads_batched");
+        _gdnRecurrenceScanKernel           = GetKernelFunc("llm_gdn_recurrence_scan");
+        _kvAppendBatchedKernel             = GetKernelFunc("llm_kv_append_batched");
+        _kvAppendBatchedBf16Kernel         = GetKernelFunc("llm_kv_append_batched_bf16");
+        _fullSeqAttentionKernel            = GetKernelFunc("llm_full_seq_attention");
+        _fullSeqAttentionBf16Kernel        = GetKernelFunc("llm_full_seq_attention_bf16");
     }
 
     /// <summary>

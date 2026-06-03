@@ -2958,5 +2958,430 @@ extern ""C"" __global__ void llm_gdn_recurrence_decode(
 
     output[hd_off + j] = o_normed * silu;
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Issue #114-B: batched GDN trunk kernels — collapse the per-position decode
+//  launches into one launch each over all N prompt tokens. Every kernel runs the
+//  IDENTICAL per-row / per-position arithmetic (and reduction order) as its
+//  single-token counterpart above, so the batched trunk is BIT-IDENTICAL to the
+//  per-token TrunkLayerSequential path. The recurrence/conv state evolves exactly
+//  as the sequential loop; only the host launch overhead is removed.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── GDN: depthwise causal conv1d over a chunk (read-only state) ─────────────
+// Bit-identical to N sequential `llm_gdn_conv1d_decode` calls. Each (channel,
+// token) thread computes output[i,c] reading the chunk inputs + the carried
+// pre-chunk state (oldest-first [(K-1), channels]). Does NOT mutate state — the
+// state advance is a separate launch (`llm_gdn_conv1d_state_update_batched`) so
+// concurrent token blocks all read the same old state. Sum order matches the
+// single-token kernel exactly: current tap (weight[K-1]) first, then taps
+// k=0..K-2 oldest→newest.
+extern ""C"" __global__ void llm_gdn_conv1d_decode_batched(
+    const float* __restrict__ x,        // [n_tok, channels]
+    const float* __restrict__ state,    // [(K-1), channels] oldest-first, pre-chunk
+    const float* __restrict__ weight,   // [K, channels]
+    float* __restrict__ output,         // [n_tok, channels]
+    int channels, int kernel_size, int n_tok)
+{
+    int c = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int i = (int)blockIdx.y;
+    if (c >= channels || i >= n_tok) return;
+
+    int retained = kernel_size - 1;
+    float x_c = x[(long)i * channels + c];
+    float sum = weight[(long)retained * channels + c] * x_c;
+    #pragma unroll 4
+    for (int k = 0; k < retained; k++) {
+        int p = i - retained + k;       // chunk-relative position of tap k
+        float val = (p >= 0)
+            ? x[(long)p * channels + c]
+            : state[(long)(p + retained) * channels + c];
+        sum += weight[(long)k * channels + c] * val;
+    }
+    output[(long)i * channels + c] = sum;
+}
+
+// ── GDN: advance conv1d state past a chunk ──────────────────────────────────
+// After the sequential loop processes all n_tok tokens, the retained state holds
+// the last (K-1) inputs oldest-first. Reproduces that exactly: new_state[r] is the
+// chunk input at position (n_tok-(K-1)+r), or the carried old state when that index
+// is still before the chunk (n_tok < K-1). All sources are read into registers
+// before any write to tolerate the in-place aliasing of the small-N case.
+extern ""C"" __global__ void llm_gdn_conv1d_state_update_batched(
+    const float* __restrict__ x,        // [n_tok, channels]
+    float* __restrict__ state,          // [(K-1), channels] in/out
+    int channels, int kernel_size, int n_tok)
+{
+    int c = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (c >= channels) return;
+
+    int retained = kernel_size - 1;
+    float tmp[4];                        // K-1 <= 4 for our models
+    #pragma unroll 4
+    for (int r = 0; r < retained; r++) {
+        int p = n_tok - retained + r;
+        tmp[r] = (p >= 0)
+            ? x[(long)p * channels + c]
+            : state[(long)(p + retained) * channels + c];
+    }
+    #pragma unroll 4
+    for (int r = 0; r < retained; r++)
+        state[(long)r * channels + c] = tmp[r];
+}
+
+// ── GDN: L2-norm per head, batched over n_tok rows ──────────────────────────
+// Bit-identical to n_tok sequential `llm_gdn_l2_norm_per_head` calls. grid =
+// (num_heads, n_tok); `data` is the region base (already offset to the Q or K
+// region by the host), `row_stride` is the per-token element stride (= conv
+// channels). One block per (head, token); same 256-thread tree reduction.
+extern ""C"" __global__ void llm_gdn_l2_norm_per_head_batched(
+    float* __restrict__ data,
+    int head_dim, int num_heads, float eps, int row_stride, int n_tok)
+{
+    __shared__ float sdata[256];
+    unsigned int tid = threadIdx.x;
+    unsigned int head = blockIdx.x;
+    int i = (int)blockIdx.y;
+    if ((int)head >= num_heads || i >= n_tok) return;
+
+    float* d = data + (long)i * row_stride + (long)head * head_dim;
+
+    float sum = 0.f;
+    for (int e = (int)tid; e < head_dim; e += 256) {
+        float v = d[e];
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float norm = sqrtf(sdata[0]);
+    float divisor = norm > eps ? norm : eps;
+    float inv_div = 1.0f / divisor;
+    for (int e = (int)tid; e < head_dim; e += 256)
+        d[e] *= inv_div;
+}
+
+// ── GDN: tile heads (GQA broadcast), batched over n_tok rows ────────────────
+// Bit-identical to n_tok sequential `llm_gdn_tile_heads` calls. `src` is the
+// region base (host-offset to Q or K region), `src_stride` the per-token source
+// stride (= conv channels), `dst_stride` the per-token dst stride (= value_dim).
+extern ""C"" __global__ void llm_gdn_tile_heads_batched(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int src_heads, int repeat, int head_dim,
+    int src_stride, int dst_stride, int n_tok)
+{
+    int dst_total = src_heads * repeat * head_dim;
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int i = (int)blockIdx.y;
+    if (idx >= dst_total || i >= n_tok) return;
+    int j = idx % head_dim;
+    int h_dst = idx / head_dim;
+    int h_src = h_dst % src_heads;
+    dst[(long)i * dst_stride + idx] = src[(long)i * src_stride + (long)h_src * head_dim + j];
+}
+
+// ── GDN: fused sequential recurrence scan over a chunk ───────────────────────
+// One block per v-head, blockDim = head_dim. Loops the n_tok positions INTERNALLY,
+// running the exact passes of `llm_gdn_recurrence_decode` at each step and carrying
+// the per-head state matrix in global memory between steps. This is the bit-identical
+// fused form of N sequential `llm_gdn_recurrence_decode` launches — NOT the parallel
+// chunked-scan (which reorders the FP reductions). Each thread owns output column j
+// of its head's state, so the only cross-thread sharing is via shared memory with
+// the same __syncthreads barriers as the single-token kernel; the trailing barrier
+// makes the position boundary clean before the next step reloads shared inputs.
+//
+// Per-head input strides let q/k come from the tiled [n_tok, value_dim] buffers,
+// v straight from the silu'd conv output (v_head_off into the [n_tok, conv_ch]
+// buffer), z from the [n_tok, value_dim] gate, alpha/beta from [n_tok, num_v_heads].
+extern ""C"" __global__ void llm_gdn_recurrence_scan(
+    float* __restrict__ state,            // [hv, d, d]
+    const float* __restrict__ q_all,      // [n_tok, q_stride]; head h at h*d
+    const float* __restrict__ k_all,      // [n_tok, k_stride]
+    const float* __restrict__ v_all,      // [n_tok, v_stride]; head h at v_head_off + h*d
+    const float* __restrict__ alpha_all,  // [n_tok, hv]
+    const float* __restrict__ beta_all,   // [n_tok, hv]
+    const float* __restrict__ ssm_a,      // [hv]
+    const float* __restrict__ dt_bias,    // [hv]
+    const float* __restrict__ norm_weight,// [d]
+    const float* __restrict__ z_all,      // [n_tok, z_stride]; head h at h*d
+    float* __restrict__ output_all,       // [n_tok, o_stride]; head h at h*d
+    int hv, int d, float norm_eps,
+    int q_stride, int k_stride, int v_stride, int v_head_off,
+    int z_stride, int o_stride, int n_tok)
+{
+    int h = (int)blockIdx.x;
+    int j = (int)threadIdx.x;
+    if (h >= hv || j >= d) return;
+
+    extern __shared__ float smem[];
+    float* sK     = smem;
+    float* sQ     = sK + d;
+    float* sV     = sQ + d;
+    float* sZ     = sV + d;
+    float* sNormW = sZ + d;
+    float* sP     = sNormW + d;
+    float* sD     = sP + d;
+    float* sRed   = sD + d;
+
+    sNormW[j] = norm_weight[j];           // layer-constant; each thread reads own j
+    long state_base = (long)h * (long)d * (long)d;
+
+    for (int i = 0; i < n_tok; i++) {
+        long qoff = (long)i * q_stride + (long)h * d;
+        long koff = (long)i * k_stride + (long)h * d;
+        long voff = (long)i * v_stride + v_head_off + (long)h * d;
+        long zoff = (long)i * z_stride + (long)h * d;
+        sK[j] = k_all[koff + j];
+        sQ[j] = q_all[qoff + j];
+        sV[j] = v_all[voff + j];
+        sZ[j] = z_all[zoff + j];
+        __syncthreads();
+
+        float alpha_x = alpha_all[(long)i * hv + h] + dt_bias[h];
+        float dt      = alpha_x >= 20.0f ? alpha_x : __logf(1.0f + __expf(alpha_x));
+        float decay   = __expf(dt * ssm_a[h]);
+        float b_sc    = 1.0f / (1.0f + __expf(-beta_all[(long)i * hv + h]));
+
+        // Pass A: decay S, accumulate p[j] = Σ_i k[i]·S[i,j].
+        float p_local = 0.f;
+        for (int ii = 0; ii < d; ii++) {
+            long off = state_base + (long)ii * d + j;
+            float sij = state[off] * decay;
+            state[off] = sij;
+            p_local += sK[ii] * sij;
+        }
+        sP[j] = p_local;
+        __syncthreads();
+
+        float d_j = b_sc * (sV[j] - sP[j]);
+        sD[j] = d_j;
+        __syncthreads();
+
+        // Pass B: rank-1 update S[i,j] += k[i]·d[j], fused with readout o[j].
+        float o_local = 0.f;
+        for (int ii = 0; ii < d; ii++) {
+            long off = state_base + (long)ii * d + j;
+            float sij = state[off] + sK[ii] * d_j;
+            state[off] = sij;
+            o_local += sQ[ii] * sij;
+        }
+        o_local *= rsqrtf((float)d);
+
+        sRed[j] = o_local * o_local;
+        __syncthreads();
+        for (int s = d / 2; s > 0; s >>= 1) {
+            if (j < s) sRed[j] += sRed[j + s];
+            __syncthreads();
+        }
+        float scale = rsqrtf(sRed[0] / (float)d + norm_eps);
+        float o_normed = o_local * scale * sNormW[j];
+
+        float zv = sZ[j];
+        float silu = zv / (1.0f + __expf(-zv));
+        output_all[(long)i * o_stride + (long)h * d + j] = o_normed * silu;
+        __syncthreads();                  // position boundary: next step reloads shared
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Issue #114-B: batched-query SDPA for prompt prefill.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── KV cache append, batched over n_tok tokens (fp32 store) ─────────────────
+// Bit-identical to n_tok sequential `llm_kv_append` calls at positions
+// start_pos+i. grid = ((kv_dim+255)/256, n_tok).
+extern ""C"" __global__ void llm_kv_append_batched(
+    const float* __restrict__ k_all, const float* __restrict__ v_all,
+    float* __restrict__ k_cache, float* __restrict__ v_cache,
+    int kv_dim, int start_pos, int max_seq_len, int n_tok)
+{
+    int e = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int i = (int)blockIdx.y;
+    if (e >= kv_dim || i >= n_tok) return;
+    long off = (long)(start_pos + i) * (long)kv_dim + (long)e;
+    k_cache[off] = k_all[(long)i * kv_dim + e];
+    v_cache[off] = v_all[(long)i * kv_dim + e];
+}
+
+// bf16-store variant (default KV dtype). Matches `llm_kv_append_bf16`.
+extern ""C"" __global__ void llm_kv_append_batched_bf16(
+    const float* __restrict__ k_all, const float* __restrict__ v_all,
+    unsigned short* __restrict__ k_cache, unsigned short* __restrict__ v_cache,
+    int kv_dim, int start_pos, int max_seq_len, int n_tok)
+{
+    int e = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int i = (int)blockIdx.y;
+    if (e >= kv_dim || i >= n_tok) return;
+    long off = (long)(start_pos + i) * (long)kv_dim + (long)e;
+    k_cache[off] = (unsigned short)sharpi_fp32_to_bf16(k_all[(long)i * kv_dim + e]);
+    v_cache[off] = (unsigned short)sharpi_fp32_to_bf16(v_all[(long)i * kv_dim + e]);
+}
+
+// ── Full-sequence (batched-query) scaled dot-product attention ──────────────
+// Implements CudaBackend.FullSeqAttention for prompt prefill. grid = (num_heads,
+// n_tok): block (h, i) computes the attention output for query i (absolute
+// position start_pos+i) over the causal prefix [0, start_pos+i+1). Bit-identical
+// to n_tok sequential `llm_attention` calls (use_shared path) — same per-position
+// dot, same 256-thread tree softmax, same V-weighted sum. The host only dispatches
+// this when start_pos+n_tok ≤ MAX_STORED_SCORES, so every block stays on the
+// shared-scores fast path (no global scratch, no cross-block aliasing).
+extern ""C"" __global__ void llm_full_seq_attention(
+    const float* __restrict__ q_all,      // [n_tok, num_heads*head_dim]
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ out_all,          // [n_tok, num_heads*head_dim]
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int max_seq_len, int n_tok)
+{
+    const int MAX_STORED_SCORES = 4096;
+    __shared__ float shared_scores[MAX_STORED_SCORES];
+    __shared__ float sdata[256];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int h = blockIdx.x;
+    int i = (int)blockIdx.y;
+    if ((int)h >= num_heads || i >= n_tok) return;
+
+    int seq_len = start_pos + i + 1;
+    int kv_head = (int)h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = rsqrtf((float)head_dim);
+    int q_dim = num_heads * head_dim;
+    const float* q = q_all + (long)i * q_dim;
+    float* out = out_all + (long)i * q_dim;
+    long q_off = (long)h * (long)head_dim;
+    long out_off = q_off;
+
+    for (int t = (int)tid; t < seq_len; t += 256) {
+        float dot = 0.f;
+        long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+        for (int dd = 0; dd < head_dim; dd++)
+            dot += q[q_off + dd] * k_cache[k_off + dd];
+        shared_scores[t] = dot * scale;
+    }
+    __syncthreads();
+
+    float local_max = sharpi_neg_inf();
+    for (int t = (int)tid; t < seq_len; t += 256)
+        local_max = fmaxf(local_max, shared_scores[t]);
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
+
+    float local_sum = 0.f;
+    for (int t = (int)tid; t < seq_len; t += 256) {
+        float ev = __expf(shared_scores[t] - max_val);
+        shared_scores[t] = ev;
+        local_sum += ev;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+    __syncthreads();
+
+    for (int t = (int)tid; t < seq_len; t += 256)
+        shared_scores[t] *= inv_sum;
+    __syncthreads();
+
+    for (int dd = (int)tid; dd < head_dim; dd += 256) {
+        float acc = 0.f;
+        for (int t = 0; t < seq_len; t++) {
+            long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            acc += shared_scores[t] * v_cache[v_off + dd];
+        }
+        out[out_off + dd] = acc;
+    }
+}
+
+// bf16-read variant (default KV dtype). Matches `llm_attention_bf16`'s use_shared path.
+extern ""C"" __global__ void llm_full_seq_attention_bf16(
+    const float* __restrict__ q_all,
+    const unsigned short* __restrict__ k_cache,
+    const unsigned short* __restrict__ v_cache,
+    float* __restrict__ out_all,
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int max_seq_len, int n_tok)
+{
+    const int MAX_STORED_SCORES = 4096;
+    __shared__ float shared_scores[MAX_STORED_SCORES];
+    __shared__ float sdata[256];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int h = blockIdx.x;
+    int i = (int)blockIdx.y;
+    if ((int)h >= num_heads || i >= n_tok) return;
+
+    int seq_len = start_pos + i + 1;
+    int kv_head = (int)h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = rsqrtf((float)head_dim);
+    int q_dim = num_heads * head_dim;
+    const float* q = q_all + (long)i * q_dim;
+    float* out = out_all + (long)i * q_dim;
+    long q_off = (long)h * (long)head_dim;
+    long out_off = q_off;
+
+    for (int t = (int)tid; t < seq_len; t += 256) {
+        float dot = 0.f;
+        long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+        for (int dd = 0; dd < head_dim; dd++)
+            dot += q[q_off + dd] * sharpi_bf16_to_fp32((unsigned int)k_cache[k_off + dd]);
+        shared_scores[t] = dot * scale;
+    }
+    __syncthreads();
+
+    float local_max = sharpi_neg_inf();
+    for (int t = (int)tid; t < seq_len; t += 256)
+        local_max = fmaxf(local_max, shared_scores[t]);
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
+
+    float local_sum = 0.f;
+    for (int t = (int)tid; t < seq_len; t += 256) {
+        float ev = __expf(shared_scores[t] - max_val);
+        shared_scores[t] = ev;
+        local_sum += ev;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+    __syncthreads();
+
+    for (int t = (int)tid; t < seq_len; t += 256)
+        shared_scores[t] *= inv_sum;
+    __syncthreads();
+
+    for (int dd = (int)tid; dd < head_dim; dd += 256) {
+        float acc = 0.f;
+        for (int t = 0; t < seq_len; t++) {
+            long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            acc += shared_scores[t] * sharpi_bf16_to_fp32((unsigned int)v_cache[v_off + dd]);
+        }
+        out[out_off + dd] = acc;
+    }
+}
 ";
 }
