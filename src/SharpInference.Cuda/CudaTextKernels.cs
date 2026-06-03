@@ -1466,6 +1466,340 @@ extern ""C"" __global__ void llm_matvec_q5k_n2(
     }
 }
 
+// ── MatVec F32 — batched GEMM-N variant (issue #111) ──────────────────────
+// One weight matrix, N input vectors, N output rows. grid = (ceil(rows/8), N);
+// block = 256 threads (8 rows × 32 lanes). Block (rx, t) computes 8 output rows
+// for token t. Each (row, token) runs the IDENTICAL per-row reduction as
+// llm_matvec_f32, so output_all is bit-identical to N sequential llm_matvec_f32
+// launches — only the input/output base pointers shift by token. Collapses the
+// N per-token launches into one, killing the host launch overhead that dominates
+// GDN-hybrid prefill (#111).
+extern ""C"" __global__ void llm_matvec_f32_gemm_n(
+    const float* __restrict__ weights,
+    const float* __restrict__ input_all,   // [n_tok][cols] contiguous
+    float* __restrict__ output_all,        // [n_tok][rows] contiguous
+    int rows, int cols, int n_tok)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    int token = (int)blockIdx.y;
+    if (row >= rows || token >= n_tok) return;
+
+    const float* input = input_all + (long)token * (long)cols;
+
+    float acc = 0.f;
+    long base = (long)row * (long)cols;
+    for (int i = lane; i < cols; i += THREADS_PER_ROW)
+        acc += weights[base + i] * input[i];
+
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output_all[(long)token * (long)rows + row] = result;
+}
+
+// ── MatVec Q4_K — batched GEMM-N variant (issue #111) ─────────────────────
+// One weight matrix, N input vectors (pre-quantized to Q8_1 as N contiguous
+// q81 rows), N output rows. grid = (rows, N); block = (32, NWARPS). Block
+// (row, token) runs the IDENTICAL per-row reduction as llm_matvec_q4k — same
+// weight decode, same dp4a chain, same warp + shared reduce — so output_all is
+// bit-identical to N sequential llm_matvec_q4k launches. Weight is reread per
+// token (the trunk bottleneck is launch latency, not weight bandwidth — #111).
+extern ""C"" __global__ void llm_matvec_q4k_gemm_n(
+    const unsigned int* __restrict__ weights,
+    const unsigned char* __restrict__ y_q81_all,  // [n_tok][num_blocks*8*36] bytes
+    float* __restrict__ output_all,               // [n_tok][rows]
+    int rows, int cols, int n_tok)
+{
+    int row     = (int)blockIdx.x;
+    int token   = (int)blockIdx.y;
+    int warp_id = (int)threadIdx.y;
+    int lane    = (int)threadIdx.x;
+    if (row >= rows || token >= n_tok) return;
+
+    int num_blocks = cols >> 8;
+    long word_row_base = (long)row * (long)num_blocks * 36L;
+    // q81 row stride = (cols/32) sub-blocks × 36 bytes = num_blocks*8*36.
+    const unsigned char* y_q81 = y_q81_all + (long)token * (long)num_blocks * 8L * 36L;
+
+    int chunk    = lane >> 3;
+    int byte_off = (lane & 7) * 4;
+    int q4_offset = 4 + chunk * 8 + (lane & 7);
+
+    float acc = 0.f;
+
+    for (int block = warp_id; block < num_blocks; block += MATVEC_Q4K_NWARPS) {
+        long word_base = word_row_base + (long)block * 36L;
+
+        unsigned int w0  = __ldg(&weights[word_base]);
+        unsigned int sm0 = __ldg(&weights[word_base + 1]);
+        unsigned int sm1 = __ldg(&weights[word_base + 2]);
+        unsigned int sm2 = __ldg(&weights[word_base + 3]);
+        float super_d    = sharpi_fp16_to_fp32(w0 & 0xffffu);
+        float super_dmin = sharpi_fp16_to_fp32(w0 >> 16);
+
+        unsigned int sc_lo, mn_lo, sc_hi, mn_hi;
+        switch (chunk) {
+            case 0:
+                sc_lo = (sm0)       & 63u; mn_lo = (sm1)       & 63u;
+                sc_hi = (sm0 >>  8) & 63u; mn_hi = (sm1 >>  8) & 63u;
+                break;
+            case 1:
+                sc_lo = (sm0 >> 16) & 63u; mn_lo = (sm1 >> 16) & 63u;
+                sc_hi = (sm0 >> 24) & 63u; mn_hi = (sm1 >> 24) & 63u;
+                break;
+            case 2:
+                sc_lo = (sm2        & 0xFu) | (((sm0 >>  6) & 3u) << 4);
+                mn_lo = ((sm2 >>  4) & 0xFu) | (((sm1 >>  6) & 3u) << 4);
+                sc_hi = ((sm2 >>  8) & 0xFu) | (((sm0 >> 14) & 3u) << 4);
+                mn_hi = ((sm2 >> 12) & 0xFu) | (((sm1 >> 14) & 3u) << 4);
+                break;
+            default:
+                sc_lo = ((sm2 >> 16) & 0xFu) | (((sm0 >> 22) & 3u) << 4);
+                mn_lo = ((sm2 >> 20) & 0xFu) | (((sm1 >> 22) & 3u) << 4);
+                sc_hi = ((sm2 >> 24) & 0xFu) | (((sm0 >> 30) & 3u) << 4);
+                mn_hi = ((sm2 >> 28) & 0xFu) | (((sm1 >> 30) & 3u) << 4);
+                break;
+        }
+
+        unsigned int wq    = __ldg(&weights[word_base + q4_offset]);
+        unsigned int wq_lo = wq & 0x0F0F0F0Fu;
+        unsigned int wq_hi = (wq >> 4) & 0x0F0F0F0Fu;
+
+        long q81_base_lo = (long)(block * 8 + chunk * 2)     * 36L;
+        long q81_base_hi = (long)(block * 8 + chunk * 2 + 1) * 36L;
+
+        unsigned int d_bits_lo = __ldg(reinterpret_cast<const unsigned int*>(y_q81 + q81_base_lo)) & 0xffffu;
+        unsigned int d_bits_hi = __ldg(reinterpret_cast<const unsigned int*>(y_q81 + q81_base_hi)) & 0xffffu;
+        float d8_lo = sharpi_fp16_to_fp32(d_bits_lo);
+        float d8_hi = sharpi_fp16_to_fp32(d_bits_hi);
+
+        int act_lo = *reinterpret_cast<const int*>(y_q81 + q81_base_lo + 4 + byte_off);
+        int act_hi = *reinterpret_cast<const int*>(y_q81 + q81_base_hi + 4 + byte_off);
+
+        int dot_lo   = __dp4a((int)wq_lo, act_lo, 0);
+        int dot_hi   = __dp4a((int)wq_hi, act_hi, 0);
+        int sum_lo   = __dp4a((int)0x01010101, act_lo, 0);
+        int sum_hi   = __dp4a((int)0x01010101, act_hi, 0);
+
+        float coef_d_lo = super_d    * (float)sc_lo * d8_lo;
+        float coef_m_lo = super_dmin * (float)mn_lo * d8_lo;
+        float coef_d_hi = super_d    * (float)sc_hi * d8_hi;
+        float coef_m_hi = super_dmin * (float)mn_hi * d8_hi;
+        acc += coef_d_lo * (float)dot_lo - coef_m_lo * (float)sum_lo;
+        acc += coef_d_hi * (float)dot_hi - coef_m_hi * (float)sum_hi;
+    }
+
+    acc = sharpi_warp_reduce_sum(acc);
+
+    __shared__ float warp_acc[MATVEC_Q4K_NWARPS];
+    if (lane == 0) warp_acc[warp_id] = acc;
+    __syncthreads();
+
+    if (warp_id == 0 && lane == 0) {
+        float s = 0.f;
+        #pragma unroll
+        for (int w = 0; w < MATVEC_Q4K_NWARPS; w++) s += warp_acc[w];
+        output_all[(long)token * (long)rows + row] = s;
+    }
+}
+
+// ── MatVec Q6_K — batched GEMM-N variant (issue #111) ─────────────────────
+// One weight matrix, N F32 input vectors, N output rows. grid = (ceil(rows/8), N);
+// block = 256 (8 rows × 32 lanes). Block (rx, token) computes 8 output rows for
+// token. Identical per-row reduction to llm_matvec_q6k; only input/output base
+// pointers shift by token. Used for the shared-expert down projection (Q6_K).
+extern ""C"" __global__ void llm_matvec_q6k_gemm_n(
+    const unsigned int* __restrict__ weights,
+    const float* __restrict__ input_all,   // [n_tok][cols]
+    float* __restrict__ output_all,        // [n_tok][rows]
+    int rows, int cols, int n_tok)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    int token = (int)blockIdx.y;
+    if (row >= rows || token >= n_tok) return;
+
+    const float* input = input_all + (long)token * (long)cols;
+    int num_blocks = cols >> 8;
+    long row_base_bytes = (long)row * (long)num_blocks * 210L;
+
+    float acc = 0.f;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long b0 = row_base_bytes + (long)block * 210L;
+
+        unsigned int dlo = (weights[(b0 + 208) >> 2] >> (((b0 + 208) & 3) * 8)) & 0xFFu;
+        unsigned int dhi = (weights[(b0 + 209) >> 2] >> (((b0 + 209) & 3) * 8)) & 0xFFu;
+        float d = sharpi_fp16_to_fp32(dlo | (dhi << 8));
+
+        long isc = (long)(lane >> 4);
+
+        float sc0 = d * (float)sharpi_int8_at(weights, b0 + 192 + isc);
+        float sc1 = d * (float)sharpi_int8_at(weights, b0 + 194 + isc);
+        float sc2 = d * (float)sharpi_int8_at(weights, b0 + 196 + isc);
+        float sc3 = d * (float)sharpi_int8_at(weights, b0 + 198 + isc);
+        float sc4 = d * (float)sharpi_int8_at(weights, b0 + 200 + isc);
+        float sc5 = d * (float)sharpi_int8_at(weights, b0 + 202 + isc);
+        float sc6 = d * (float)sharpi_int8_at(weights, b0 + 204 + isc);
+        float sc7 = d * (float)sharpi_int8_at(weights, b0 + 206 + isc);
+
+        unsigned int ql0 = sharpi_byte_at(weights, b0 +   0 + lane);
+        unsigned int ql1 = sharpi_byte_at(weights, b0 +  32 + lane);
+        unsigned int ql2 = sharpi_byte_at(weights, b0 +  64 + lane);
+        unsigned int ql3 = sharpi_byte_at(weights, b0 +  96 + lane);
+        unsigned int qh0 = sharpi_byte_at(weights, b0 + 128 + lane);
+        unsigned int qh1 = sharpi_byte_at(weights, b0 + 160 + lane);
+
+        int base_elem = block * 256;
+
+        acc += sc0 * (float)((int)((ql0 & 0xFu)        | (((qh0 >> 0) & 3u) << 4)) - 32) * input[base_elem +       lane];
+        acc += sc1 * (float)((int)((ql1 & 0xFu)        | (((qh0 >> 2) & 3u) << 4)) - 32) * input[base_elem +  32 + lane];
+        acc += sc2 * (float)((int)(((ql0 >> 4) & 0xFu) | (((qh0 >> 4) & 3u) << 4)) - 32) * input[base_elem +  64 + lane];
+        acc += sc3 * (float)((int)(((ql1 >> 4) & 0xFu) | (((qh0 >> 6) & 3u) << 4)) - 32) * input[base_elem +  96 + lane];
+        acc += sc4 * (float)((int)((ql2 & 0xFu)        | (((qh1 >> 0) & 3u) << 4)) - 32) * input[base_elem + 128 + lane];
+        acc += sc5 * (float)((int)((ql3 & 0xFu)        | (((qh1 >> 2) & 3u) << 4)) - 32) * input[base_elem + 160 + lane];
+        acc += sc6 * (float)((int)(((ql2 >> 4) & 0xFu) | (((qh1 >> 4) & 3u) << 4)) - 32) * input[base_elem + 192 + lane];
+        acc += sc7 * (float)((int)(((ql3 >> 4) & 0xFu) | (((qh1 >> 6) & 3u) << 4)) - 32) * input[base_elem + 224 + lane];
+    }
+
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output_all[(long)token * (long)rows + row] = result;
+}
+
+// ── Batched trunk elementwise/norm kernels (issue #111) ───────────────────
+// Each adds a token dimension (grid.y or a token-major offset) over the
+// single-token kernel above; the per-token math is byte-for-byte identical, so
+// batched output matches N sequential single-token launches exactly. Used by
+// CudaHybridGdnForwardPass batched prefill to collapse the per-token trunk
+// launches into one launch per op.
+
+// RmsNorm over N rows: one block per (token), 256 threads. Identical reduction
+// to llm_rmsnorm; input/output offset by token*n; weight shared across tokens.
+extern ""C"" __global__ void llm_rmsnorm_batched(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    float* __restrict__ output,
+    int n, float eps, int n_tok)
+{
+    __shared__ float sdata[256];
+    unsigned int tid = threadIdx.x;
+    int token = (int)blockIdx.x;
+    if (token >= n_tok) return;
+
+    const float* in = input + (long)token * (long)n;
+    float* out = output + (long)token * (long)n;
+
+    float sum = 0.f;
+    for (int i = (int)tid; i < n; i += 256) {
+        float v = in[i];
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    float scale = rsqrtf(sdata[0] / (float)n + eps);
+    for (int i = (int)tid; i < n; i += 256)
+        out[i] = in[i] * scale * weight[i];
+}
+
+// HeadNorm over N rows: grid = (num_heads, n_tok); block 256. data offset by
+// token*(num_heads*head_dim). Identical reduction to llm_head_norm.
+extern ""C"" __global__ void llm_head_norm_batched(
+    float* __restrict__ data,
+    const float* __restrict__ weight,
+    int head_dim, int num_heads, float eps, int weight_stride, int n_tok)
+{
+    __shared__ float sdata[256];
+    unsigned int tid = threadIdx.x;
+    unsigned int head = blockIdx.x;
+    int token = (int)blockIdx.y;
+    if ((int)head >= num_heads || token >= n_tok) return;
+
+    long token_off = (long)token * (long)num_heads * (long)head_dim;
+    long base_off = token_off + (long)head * head_dim;
+    int  w_off    = (int)head * weight_stride;
+
+    float sum = 0.f;
+    for (int i = (int)tid; i < head_dim; i += 256) {
+        float v = data[base_off + i];
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);
+    for (int i = (int)tid; i < head_dim; i += 256)
+        data[base_off + i] = data[base_off + i] * scale * weight[w_off + i];
+}
+
+// Strided de-interleave [Q‖G] → Q, G over N tokens. qg row stride =
+// num_heads*head_dim*2; q/g row stride = num_heads*head_dim.
+extern ""C"" __global__ void llm_split_qg_batched(
+    const float* __restrict__ qg,
+    float* __restrict__ q,
+    float* __restrict__ g,
+    int num_heads, int head_dim, int n_tok)
+{
+    int total = num_heads * head_dim;
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int token = (int)blockIdx.y;
+    if (idx >= total || token >= n_tok) return;
+
+    int h = idx / head_dim;
+    int j = idx % head_dim;
+    long qg_base = (long)token * (long)num_heads * (long)head_dim * 2L + (long)h * head_dim * 2;
+    long out_base = (long)token * (long)total + (long)h * head_dim;
+    q[out_base + j] = qg[qg_base + j];
+    g[out_base + j] = qg[qg_base + head_dim + j];
+}
+
+// Partial NEOX RoPE over N tokens. Position for token t is base_position + t
+// (prompt prefill assigns contiguous positions). x row stride = num_heads*head_dim.
+extern ""C"" __global__ void llm_rope_neox_partial_batched(
+    float* __restrict__ x,
+    int num_heads, int head_dim, int rope_dim, int base_position, float theta, int n_tok)
+{
+    int pair_idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int rope_half_dim = rope_dim / 2;
+    int total_pairs = num_heads * rope_half_dim;
+    int token = (int)blockIdx.y;
+    if (pair_idx >= total_pairs || token >= n_tok) return;
+
+    int h = pair_idx / rope_half_dim;
+    int i = pair_idx % rope_half_dim;
+    int position = base_position + token;
+
+    float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)rope_dim);
+    float angle = (float)position * freq;
+    float c = cosf(angle);
+    float s = sinf(angle);
+
+    long head_base = (long)token * (long)num_heads * (long)head_dim + (long)h * head_dim;
+    long a = head_base + i;
+    long b = head_base + i + rope_half_dim;
+    float x0 = x[a];
+    float x1 = x[b];
+    x[a] = x0 * c - x1 * s;
+    x[b] = x0 * s + x1 * c;
+}
+
 // ── TurboQuant rotate_query ────────────────────────────────────────────────
 // Applies the Walsh-Hadamard transform + per-layer sign flip to each query
 // head. One block per query head, head_dim threads per block.

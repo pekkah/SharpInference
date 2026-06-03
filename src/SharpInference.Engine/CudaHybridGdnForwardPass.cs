@@ -423,6 +423,25 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     private bool _disposed;
 
+    // Issue #110/#111: batched prefill is non-transactional — it mutates the GDN
+    // scan/conv recurrent state and writes KV pages as it goes, deferring the
+    // length-counter bookkeeping to the end. A throw mid-chunk (CUDA stream fault,
+    // OOM) therefore leaves the recurrent state partially advanced while the length
+    // counters still read startPos. Retrying any forward call would run on poisoned
+    // state and silently produce wrong output. We latch this fault and refuse all
+    // subsequent forward entries so the caller must discard the pass / reload the
+    // model rather than getting garbage tokens.
+    private bool _faulted;
+
+    private void ThrowIfFaulted()
+    {
+        if (_faulted)
+            throw new InvalidOperationException(
+                "CudaHybridGdnForwardPass: a prior batched prefill faulted mid-chunk, leaving the " +
+                "GDN recurrent state corrupted. This instance can no longer produce correct output — " +
+                "discard it and reload the model.");
+    }
+
     // Prefill profiling (SHARPI_PREFILL_PROFILE=1): accumulate synchronous CPU-MoE
     // wall time vs total Forward wall time to size the batching opportunity.
     private static readonly bool _prefillProfile =
@@ -467,6 +486,36 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private int*   _bExpTokI;          // [bCap × numActive] — token index, grouped by expert
     private int*   _bExpTokK;          // [bCap × numActive] — slot (top-k rank), grouped by expert
     private int*   _bUsedExperts;      // [numExperts] — compact list of experts with ≥1 token this layer
+
+    // ── Batched trunk (issue #111) ────────────────────────────────────────
+    // Device-side per-token activation buffers for the GEMM-batched trunk. The
+    // projection matvecs (GDN qkv/z/alpha/beta/ssm_out, attn q/k/v/o, shared
+    // gate/up/down) run as single GEMM-N launches over all N tokens; the conv1d /
+    // delta-net recurrence and KV-append / SDPA stay per-position, reading per-token
+    // slices via CudaBackend.View. Token-major layout ([N × dim]) matches MatMulBatched.
+    // Allocated grow-only by EnsureBatchedTrunkScratch; null when _cpuGdn (the CPU-GDN
+    // debug path keeps the sequential per-token trunk). Disabled with
+    // SHARPI_BATCHED_TRUNK=0 (falls back to the per-token trunk loop).
+    internal static bool BatchedTrunkEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_BATCHED_TRUNK") != "0";
+    private int _btCap;
+    private Tensor? _gpuBtNorm;      // [N × embDim] attn-norm output (block input)
+    private Tensor? _gpuBtBlockOut;  // [N × embDim] block output → postBlock (resid)
+    private Tensor? _gpuBtMoeNorm;   // [N × embDim] post-attn-norm (MoE input)
+    private Tensor? _gpuBtShared;    // [N × embDim] shared-expert output (unscaled)
+    private Tensor? _gpuBtQkv;       // [N × convChannels] GDN joint QKV
+    private Tensor? _gpuBtZ;         // [N × valueDim] GDN z-gate
+    private Tensor? _gpuBtAlpha;     // [N × numVHeads] GDN alpha
+    private Tensor? _gpuBtBeta;      // [N × numVHeads] GDN beta
+    private Tensor? _gpuBtGdnOut;    // [N × valueDim] GDN recurrence output
+    private Tensor? _gpuBtQGate;     // [N × qDim*2] attn Q‖gate
+    private Tensor? _gpuBtQ;         // [N × qDim] attn Q
+    private Tensor? _gpuBtGate;      // [N × qDim] attn GLU gate
+    private Tensor? _gpuBtK;         // [N × kvDim] attn K
+    private Tensor? _gpuBtV;         // [N × kvDim] attn V
+    private Tensor? _gpuBtAttnOut;   // [N × qDim] attn output (pre-O)
+    private Tensor? _gpuBtSGate;     // [N × expertDim] shared-expert gate
+    private Tensor? _gpuBtSUp;       // [N × expertDim] shared-expert up
 
     public int VocabSize => _hp.VocabSize;
     public int MaxSeqLen => _maxSeqLen;
@@ -1156,6 +1205,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0)
     {
+        ThrowIfFaulted();
         if (tokens is null || tokens.Count == 0)
             throw new ArgumentException("Token list is empty", nameof(tokens));
 
@@ -1329,6 +1379,271 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     {
         if (_gpuStreamAll is { } s) { _gpu.Free(s); _gpuStreamAll = null; }
         FreeBatchedHostScratch();
+        FreeBatchedTrunkScratch();
+    }
+
+    /// <summary>
+    /// Grow-only (exact-size) allocation of the device batched-trunk activation
+    /// buffers (issue #111). Sized to exactly <paramref name="N"/> tokens — the GEMM-N
+    /// kernels derive <c>rows = output.ElementCount / nTok</c>, so over-allocation would
+    /// misshape the launch. Reallocated when N changes (at most twice per prompt: a full
+    /// chunk then a remainder). Only used on the GPU-GDN path (<c>!_cpuGdn</c>).
+    /// </summary>
+    private void EnsureBatchedTrunkScratch(int N)
+    {
+        if (_btCap == N) return;
+        FreeBatchedTrunkScratch();
+
+        int embDim = _embDim;
+        int qDim = _numHeads * _headDim;
+        int kvDim = _numKvHeads * _headDim;
+
+        Tensor A(long elems) => _gpu.Allocate(TensorShape.D1(elems));
+
+        _gpuBtNorm     = A((long)N * embDim);
+        _gpuBtBlockOut = A((long)N * embDim);
+        _gpuBtMoeNorm  = A((long)N * embDim);
+        _gpuBtShared   = A((long)N * embDim);
+        _gpuBtQkv      = A((long)N * _gdnConvChannels);
+        _gpuBtZ        = A((long)N * _gdnValueDim);
+        _gpuBtAlpha    = A((long)N * _gdnNumVHeads);
+        _gpuBtBeta     = A((long)N * _gdnNumVHeads);
+        _gpuBtGdnOut   = A((long)N * _gdnValueDim);
+        _gpuBtQGate    = A((long)N * qDim * 2);
+        _gpuBtQ        = A((long)N * qDim);
+        _gpuBtGate     = A((long)N * qDim);
+        _gpuBtK        = A((long)N * kvDim);
+        _gpuBtV        = A((long)N * kvDim);
+        _gpuBtAttnOut  = A((long)N * qDim);
+        _gpuBtSGate    = A((long)N * _expertDim);
+        _gpuBtSUp      = A((long)N * _expertDim);
+        _btCap = N;
+    }
+
+    private void FreeBatchedTrunkScratch()
+    {
+        void F(ref Tensor? t) { if (t is { } v) { _gpu.Free(v); t = null; } }
+        F(ref _gpuBtNorm); F(ref _gpuBtBlockOut); F(ref _gpuBtMoeNorm); F(ref _gpuBtShared);
+        F(ref _gpuBtQkv); F(ref _gpuBtZ); F(ref _gpuBtAlpha); F(ref _gpuBtBeta); F(ref _gpuBtGdnOut);
+        F(ref _gpuBtQGate); F(ref _gpuBtQ); F(ref _gpuBtGate); F(ref _gpuBtK); F(ref _gpuBtV); F(ref _gpuBtAttnOut);
+        F(ref _gpuBtSGate); F(ref _gpuBtSUp);
+        _btCap = 0;
+    }
+
+    /// <summary>
+    /// Sequential per-token trunk for one layer (the pre-#111 path). Used on the
+    /// CPU-GDN debug path and when SHARPI_BATCHED_TRUNK=0. Produces the host
+    /// <see cref="_bResidAll"/> / <see cref="_bNormAll"/> / <see cref="_bSharedAll"/>
+    /// buffers and self-syncs the stream, exactly as the batched variant.
+    /// </summary>
+    private void TrunkLayerSequential(int layer, int N, int startPos, bool isAttn,
+                                      bool snapKvActive, int wStart)
+    {
+        int embDim = _embDim;
+        for (int i = 0; i < N; i++)
+        {
+            _gpu.CopyDeviceRegion(_gpuHidden, 0, _gpuStreamAll!,
+                                  (long)i * embDim * sizeof(float), (long)embDim * sizeof(float));
+            _gpu.CopyDevice(_gpuResidual, _gpuHidden);
+            _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuAttnNorm[layer], _hp.RmsNormEps);
+
+            _snapKvCaptureSlot = (snapKvActive && i >= wStart) ? (i - wStart) : -1;
+
+            if (isAttn)
+                GpuAttnBlockAt(layer, position: startPos + i, kvPosition: startPos + i,
+                               normIn: _gpuNormBuf, hiddenOut: _gpuHidden);
+            else if (_cpuGdn)
+                CpuGdnBlockAt(layer, position: startPos + i, normInGpu: _gpuNormBuf,
+                              hiddenOutGpu: _gpuHidden, cpuNormScratch: _cpuNormBuf,
+                              cpuHiddenScratch: _cpuHiddenOut);
+            else
+                GpuGdnBlockAt(layer, position: startPos + i, normIn: _gpuNormBuf, hiddenOut: _gpuHidden);
+
+            _gpu.AddInPlace(_gpuHidden, _gpuResidual);           // postBlock (MoE residual)
+            _gpu.DownloadAsync(_gpuHidden, (nint)(_bResidAll + (long)i * embDim), embDim);
+
+            _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuPostAttnNorm[layer], _hp.RmsNormEps);
+            _gpu.DownloadAsync(_gpuNormBuf, (nint)(_bNormAll + (long)i * embDim), embDim);
+
+            GpuMatMul(_gpuFfnGate, _gpuWGateShexp[layer], _gpuNormBuf);
+            GpuMatMul(_gpuFfnUp, _gpuWUpShexp[layer], _gpuNormBuf);
+            _gpu.SiLuMul(_gpuFfnGate, _gpuFfnUp);
+            GpuMatMul(_gpuSharedOut, _gpuWDownShexp[layer], _gpuFfnGate);
+            _gpu.DownloadAsync(_gpuSharedOut, (nint)(_bSharedAll + (long)i * embDim), embDim);
+        }
+        _snapKvCaptureSlot = -1;
+        _gpu.Synchronize();   // drain all queued D2H: resid/norm/shared now host-valid
+    }
+
+    /// <summary>
+    /// GEMM-batched trunk for one layer (issue #111). The projection matvecs —
+    /// GDN qkv/z/alpha/beta/ssm_out, attention q/k/v/o, shared-expert gate/up/down —
+    /// plus the attn-norm / post-attn-norm RmsNorms, per-head Q/K RMSNorm, RoPE,
+    /// Q‖gate split and GLU gate run as single batched launches over all N tokens.
+    /// The conv1d / delta-net recurrence and KV-append / scaled-dot-product attention
+    /// stay per-position (they are positional), reading per-token slices via
+    /// <see cref="CudaBackend.View"/>. Output is bit-identical to
+    /// <see cref="TrunkLayerSequential"/>: every batched kernel runs the same per-row /
+    /// per-element computation as its single-token counterpart, only collapsing the
+    /// N per-token launches into one each — which is what removes the host launch
+    /// overhead that dominates GDN-hybrid prefill.
+    /// </summary>
+    private void TrunkLayerBatched(int layer, int N, int startPos, bool isAttn,
+                                   bool snapKvActive, int wStart)
+    {
+        int embDim = _embDim;
+        EnsureBatchedTrunkScratch(N);
+        var stream   = _gpuStreamAll!;
+        var norm     = _gpuBtNorm!;
+        var blockOut = _gpuBtBlockOut!;
+        var moeNorm  = _gpuBtMoeNorm!;
+        var shared   = _gpuBtShared!;
+
+        // attn-norm (block input) over all tokens.
+        _gpu.RmsNormBatched(norm, stream, _gpuAttnNorm[layer], N, embDim, _hp.RmsNormEps);
+
+        if (isAttn)
+            AttnBlockBatched(layer, N, startPos, snapKvActive, wStart, norm, blockOut);
+        else
+            GdnBlockBatched(layer, N, norm, blockOut);
+
+        // postBlock = blockOut + stream (the pre-block residual). blockOut now holds
+        // the MoE residual — download it to the host combine buffer.
+        _gpu.AddInPlace(blockOut, stream);
+        _gpu.DownloadAsync(blockOut, (nint)_bResidAll, (int)((long)N * embDim));
+
+        // post-attention norm (MoE input).
+        _gpu.RmsNormBatched(moeNorm, blockOut, _gpuPostAttnNorm[layer], N, embDim, _hp.RmsNormEps);
+        _gpu.DownloadAsync(moeNorm, (nint)_bNormAll, (int)((long)N * embDim));
+
+        // Shared expert (unscaled) — gate/up/down batched over all tokens; scale
+        // folded into the host combine, matching the sequential path's operand order.
+        GpuMatMulBatched(_gpuBtSGate!, _gpuWGateShexp[layer], moeNorm, N);
+        GpuMatMulBatched(_gpuBtSUp!,   _gpuWUpShexp[layer],   moeNorm, N);
+        _gpu.SiLuMul(_gpuBtSGate!, _gpuBtSUp!);   // pointwise over N×expertDim
+        GpuMatMulBatched(shared, _gpuWDownShexp[layer], _gpuBtSGate!, N);
+        _gpu.DownloadAsync(shared, (nint)_bSharedAll, (int)((long)N * embDim));
+
+        _gpu.Synchronize();   // drain all queued D2H: resid/norm/shared now host-valid
+    }
+
+    /// <summary>Batched GDN block: projections over N tokens, per-position recurrence.</summary>
+    private void GdnBlockBatched(int layer, int N, Tensor norm, Tensor blockOut)
+    {
+        int convCh = _gdnConvChannels, valDim = _gdnValueDim, nVH = _gdnNumVHeads;
+        int kDim = _gdnKeyDim, hd = _gdnHeadDim;
+        var qkvAll = _gpuBtQkv!; var zAll = _gpuBtZ!;
+        var alphaAll = _gpuBtAlpha!; var betaAll = _gpuBtBeta!; var gdnOutAll = _gpuBtGdnOut!;
+
+        // Batched projections (one launch each over all tokens).
+        GpuMatMulBatched(qkvAll,   _gpuWAttnQkv[layer],  norm, N);
+        GpuMatMulBatched(zAll,     _gpuWAttnGate[layer], norm, N);
+        GpuMatMulBatched(alphaAll, _gpuWSsmAlpha[layer], norm, N);
+        GpuMatMulBatched(betaAll,  _gpuWSsmBeta[layer],  norm, N);
+
+        var scanState = _gpuGdnScanState[layer]!;
+        var convState = _gpuGdnConvState[layer]!;
+
+        // Per-token conv1d + delta-net recurrence (positional → sequential). The
+        // conv/L2/tile scratch (_gpuGdnQkvConv / _gpuGdnQHead / _gpuGdnKHead /
+        // _gpuGdnVHead) is reused per token; only the batched-buffer inputs/output
+        // need per-token views.
+        for (int i = 0; i < N; i++)
+        {
+            var qkvIn = _gpu.View(qkvAll, (long)i * convCh, convCh);
+            var zIn   = _gpu.View(zAll,   (long)i * valDim, valDim);
+            var aIn   = _gpu.View(alphaAll, (long)i * nVH, nVH);
+            var bIn   = _gpu.View(betaAll,  (long)i * nVH, nVH);
+            var outV  = _gpu.View(gdnOutAll, (long)i * valDim, valDim);
+            try
+            {
+                _gpu.GdnConv1dDecode(qkvIn, convState, _gpuSsmConv1d[layer], _gpuGdnQkvConv,
+                    convCh, _gdnConvKernel);
+                _gpu.SiLUInPlace(_gpuGdnQkvConv);
+                _gpu.GdnL2NormPerHead(_gpuGdnQkvConv, 0,    _gdnNumKHeads, hd, eps: 1e-6f);
+                _gpu.GdnL2NormPerHead(_gpuGdnQkvConv, kDim, _gdnNumKHeads, hd, eps: 1e-6f);
+                _gpu.GdnTileHeads(_gpuGdnQkvConv, 0,    _gpuGdnQHead, 0, _gdnNumKHeads, _gdnKvRepeat, hd);
+                _gpu.GdnTileHeads(_gpuGdnQkvConv, kDim, _gpuGdnKHead, 0, _gdnNumKHeads, _gdnKvRepeat, hd);
+                _gpu.CopyDeviceRegion(_gpuGdnVHead, 0,
+                    _gpuGdnQkvConv, 2L * kDim * sizeof(float), (long)valDim * sizeof(float));
+                _gpu.GdnRecurrenceDecode(
+                    scanState, _gpuGdnQHead, _gpuGdnKHead, _gpuGdnVHead, aIn, bIn,
+                    _gpuSsmA[layer], _gpuSsmDtBias[layer], _gpuSsmNormW[layer], zIn, outV,
+                    nVH, hd, normEps: 1e-6f);
+            }
+            finally
+            {
+                _gpu.Free(qkvIn); _gpu.Free(zIn); _gpu.Free(aIn); _gpu.Free(bIn); _gpu.Free(outV);
+            }
+        }
+
+        // Batched ssm_out projection: blockOut = WSsmOut @ gdnOutAll.
+        GpuMatMulBatched(blockOut, _gpuWSsmOut[layer], gdnOutAll, N);
+    }
+
+    /// <summary>Batched attention block: projections + Q/K norm + RoPE over N tokens,
+    /// per-position KV-append + SDPA.</summary>
+    private void AttnBlockBatched(int layer, int N, int startPos, bool snapKvActive, int wStart,
+                                  Tensor norm, Tensor blockOut)
+    {
+        int qDim = _numHeads * _headDim, kvDim = _numKvHeads * _headDim;
+        var qGateAll = _gpuBtQGate!; var qAll = _gpuBtQ!; var gateAll = _gpuBtGate!;
+        var kAll = _gpuBtK!; var vAll = _gpuBtV!; var attnOutAll = _gpuBtAttnOut!;
+
+        // Batched projections + de-interleave + per-head norm + RoPE over all tokens.
+        GpuMatMulBatched(qGateAll, _gpuWQGate[layer], norm, N);
+        GpuMatMulBatched(kAll,     _gpuWK[layer],     norm, N);
+        GpuMatMulBatched(vAll,     _gpuWV[layer],     norm, N);
+
+        _gpu.SplitQGBatched(qAll, gateAll, qGateAll, _numHeads, _headDim, N);
+        _gpu.HeadNormBatched(qAll, _gpuQNorm[layer], _numHeads,   _headDim, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+        _gpu.HeadNormBatched(kAll, _gpuKNorm[layer], _numKvHeads, _headDim, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+        _gpu.RoPEPartialBatched(qAll, startPos, _headDim, _ropeDim, _hp.RopeTheta, _numHeads,   N, neox: true);
+        _gpu.RoPEPartialBatched(kAll, startPos, _headDim, _ropeDim, _hp.RopeTheta, _numKvHeads, N, neox: true);
+
+        // Per-position KV-append + scaled-dot-product attention (positional →
+        // sequential), plus SnapKV Q-capture for the trailing window.
+        for (int i = 0; i < N; i++)
+        {
+            int pos = startPos + i;
+            var qV = _gpu.View(qAll, (long)i * qDim, qDim);
+            var kV = _gpu.View(kAll, (long)i * kvDim, kvDim);
+            var vV = _gpu.View(vAll, (long)i * kvDim, kvDim);
+            var oV = _gpu.View(attnOutAll, (long)i * qDim, qDim);
+            try
+            {
+                if (snapKvActive && i >= wStart && _snapKvQCapture is { } capBuf)
+                {
+                    int attnIdx = _attnLayerIndexOf[layer];
+                    if (attnIdx >= 0)
+                    {
+                        long dstOff = ((long)attnIdx * _snapKvQCaptureW + (i - wStart)) * qDim;
+                        _gpu.CopyDeviceRegion(capBuf, dstOff * sizeof(float),
+                                              qV, 0, (long)qDim * sizeof(float));
+                    }
+                }
+                if (_kvDType == DType.BFloat16)
+                {
+                    _gpu.KvAppendBf16(kV, vV, _gpuKCache[layer]!, _gpuVCache[layer]!, kvDim, pos, _maxSeqLen);
+                    _gpu.AttentionBf16(qV, _gpuKCache[layer]!, _gpuVCache[layer]!, oV, _gpuAttnScratch,
+                        _numHeads, _numKvHeads, _headDim, pos + 1, _maxSeqLen);
+                }
+                else
+                {
+                    _gpu.KvAppend(kV, vV, _gpuKCache[layer]!, _gpuVCache[layer]!, kvDim, pos, _maxSeqLen);
+                    _gpu.Attention(qV, _gpuKCache[layer]!, _gpuVCache[layer]!, oV, _gpuAttnScratch,
+                        _numHeads, _numKvHeads, _headDim, pos + 1, _maxSeqLen);
+                }
+            }
+            finally
+            {
+                _gpu.Free(qV); _gpu.Free(kV); _gpu.Free(vV); _gpu.Free(oV);
+            }
+        }
+
+        // GLU gate (pointwise over N×qDim) then batched O projection.
+        _gpu.SigmoidMulInPlace(attnOutAll, gateAll);
+        GpuMatMulBatched(blockOut, _gpuWO[layer], attnOutAll, N);
     }
 
     private void FreeBatchedHostScratch()
@@ -1386,6 +1701,13 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         long t0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         long trunkTicks = 0, routerTicks = 0, routedTicks = 0, combineTicks = 0;
 
+        // Pessimistic fault latch: the GDN recurrent-state mutation + deferred
+        // length-counter bookkeeping below is non-transactional, so mark the pass
+        // poisoned for the whole region and clear it only once the counters have
+        // been advanced consistently (step 3). A throw anywhere in between leaves
+        // _faulted set, and ThrowIfFaulted() blocks any retry on corrupt state.
+        _faulted = true;
+
         // 1. Embed every token into the residual-stream buffer + reserve KV blocks.
         for (int i = 0; i < N; i++)
         {
@@ -1401,44 +1723,19 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             bool isAttn = _hp.LayerTypes![layer] == LayerType.Attention;
             long lt0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
-            // ── Trunk: sequential per token (GPU), queue D2H of resid/norm/shared.
-            for (int i = 0; i < N; i++)
+            // ── Trunk: GEMM-batched over N tokens (issue #111) on the GPU-GDN path;
+            //    sequential per token on the CPU-GDN debug path / when disabled.
+            //    Both produce host _bResidAll / _bNormAll / _bSharedAll, then the
+            //    batched MoE below runs identically. The batched trunk is bit-identical
+            //    to the sequential one (same kernels, same per-row FP reduction).
+            if (BatchedTrunkEnabled && !_cpuGdn)
             {
-                _gpu.CopyDeviceRegion(_gpuHidden, 0, _gpuStreamAll!,
-                                      (long)i * embDim * sizeof(float), (long)embDim * sizeof(float));
-                _gpu.CopyDevice(_gpuResidual, _gpuHidden);
-                _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuAttnNorm[layer], _hp.RmsNormEps);
-
-                _snapKvCaptureSlot = (snapKvActive && i >= wStart) ? (i - wStart) : -1;
-
-                if (isAttn)
-                    GpuAttnBlockAt(layer, position: startPos + i, kvPosition: startPos + i,
-                                   normIn: _gpuNormBuf, hiddenOut: _gpuHidden);
-                else if (_cpuGdn)
-                    CpuGdnBlockAt(layer, position: startPos + i, normInGpu: _gpuNormBuf,
-                                  hiddenOutGpu: _gpuHidden, cpuNormScratch: _cpuNormBuf,
-                                  cpuHiddenScratch: _cpuHiddenOut);
-                else
-                    GpuGdnBlockAt(layer, position: startPos + i, normIn: _gpuNormBuf, hiddenOut: _gpuHidden);
-
-                _gpu.AddInPlace(_gpuHidden, _gpuResidual);           // postBlock (MoE residual)
-                _gpu.DownloadAsync(_gpuHidden, (nint)(_bResidAll + (long)i * embDim), embDim);
-
-                _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuPostAttnNorm[layer], _hp.RmsNormEps);
-                _gpu.DownloadAsync(_gpuNormBuf, (nint)(_bNormAll + (long)i * embDim), embDim);
-
-                // Shared expert (unscaled) — scale folded into the host combine.
-                // Kept in the trunk loop: the GPU compute is tiny and overlapping
-                // it with the routed-CPU work only shifts host launch overhead
-                // (issuing the launches), which is the real cost — no net win.
-                GpuMatMul(_gpuFfnGate, _gpuWGateShexp[layer], _gpuNormBuf);
-                GpuMatMul(_gpuFfnUp, _gpuWUpShexp[layer], _gpuNormBuf);
-                _gpu.SiLuMul(_gpuFfnGate, _gpuFfnUp);
-                GpuMatMul(_gpuSharedOut, _gpuWDownShexp[layer], _gpuFfnGate);
-                _gpu.DownloadAsync(_gpuSharedOut, (nint)(_bSharedAll + (long)i * embDim), embDim);
+                TrunkLayerBatched(layer, N, startPos, isAttn, snapKvActive, wStart);
             }
-            _snapKvCaptureSlot = -1;
-            _gpu.Synchronize();   // drain all queued D2H: resid/norm/shared now host-valid
+            else
+            {
+                TrunkLayerSequential(layer, N, startPos, isAttn, snapKvActive, wStart);
+            }
             long lt1 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
             // ── Router + shared-expert gate per token (host).
@@ -1497,6 +1794,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _kvCache.IncrementPosition();
             _gdnStateCache.IncrementPosition();
         }
+        // Recurrent state + length counters are now consistent — clear the fault latch.
+        _faulted = false;
 
         // 4. MTP hidden history: _bHiddenAll holds the pre-output-norm hidden for
         //    every token after the final layer — mirror into the absolute-position
@@ -1607,18 +1906,43 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             int e = used[u];
             byte* gateRow = gateP + (long)e * expertDimL * bprG + (long)r * bprG;
             byte* upRow   = upP   + (long)e * expertDimL * bprU + (long)r * bprU;
-            for (int p = expStart[e]; p < expStart[e + 1]; p++)
+            int pStart = expStart[e], pEnd = expStart[e + 1];
+            // Issue #112: dot each gate/up row against the expert's tokens in PAIRS,
+            // decoding the (Q4_K/Q5_K/Q3_K) weight row once per pair. Bit-identical to
+            // the per-token dots (the 2In kernels mirror the single accumulation order).
+            int p = pStart;
+            for (; p + 1 < pEnd; p += 2)
+            {
+                int i0 = expTokI[p],     k0 = expTokK[p];
+                int i1 = expTokI[p + 1], k1 = expTokK[p + 1];
+                long o0 = ((long)i0 * naL + k0) * expertDimL + r;
+                long o1 = ((long)i1 * naL + k1) * expertDimL + r;
+                float a0, a1;
+                if (useQ8KGate)
+                    DispatchDotQ8K2In(gateRow, normAllQ8K + (long)i0 * q8kEmbStride,
+                        normAllQ8K + (long)i1 * q8kEmbStride, embDimL, gateDt, out a0, out a1);
+                else
+                    DispatchDot2In(gateRow, normAll + (long)i0 * embDimL,
+                        normAll + (long)i1 * embDimL, embDimL, gateDt, out a0, out a1);
+                gateAll[o0] = a0; gateAll[o1] = a1;
+                if (useQ8KUp)
+                    DispatchDotQ8K2In(upRow, normAllQ8K + (long)i0 * q8kEmbStride,
+                        normAllQ8K + (long)i1 * q8kEmbStride, embDimL, upDt, out a0, out a1);
+                else
+                    DispatchDot2In(upRow, normAll + (long)i0 * embDimL,
+                        normAll + (long)i1 * embDimL, embDimL, upDt, out a0, out a1);
+                upAll[o0] = a0; upAll[o1] = a1;
+            }
+            if (p < pEnd) // odd remainder
             {
                 int i = expTokI[p], k = expTokK[p];
                 long outIdx = ((long)i * naL + k) * expertDimL + r;
-                if (useQ8KGate)
-                    gateAll[outIdx] = DispatchDotQ8K(gateRow, normAllQ8K + (long)i * q8kEmbStride, embDimL, gateDt);
-                else
-                    gateAll[outIdx] = DispatchDot(gateRow, normAll + (long)i * embDimL, embDimL, gateDt);
-                if (useQ8KUp)
-                    upAll[outIdx] = DispatchDotQ8K(upRow, normAllQ8K + (long)i * q8kEmbStride, embDimL, upDt);
-                else
-                    upAll[outIdx] = DispatchDot(upRow, normAll + (long)i * embDimL, embDimL, upDt);
+                gateAll[outIdx] = useQ8KGate
+                    ? DispatchDotQ8K(gateRow, normAllQ8K + (long)i * q8kEmbStride, embDimL, gateDt)
+                    : DispatchDot(gateRow, normAll + (long)i * embDimL, embDimL, gateDt);
+                upAll[outIdx] = useQ8KUp
+                    ? DispatchDotQ8K(upRow, normAllQ8K + (long)i * q8kEmbStride, embDimL, upDt)
+                    : DispatchDot(upRow, normAll + (long)i * embDimL, embDimL, upDt);
             }
         });
 
@@ -1639,10 +1963,27 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             int r = idx % embDimL;
             int e = used[u];
             byte* downRow = downP + (long)e * embDimL * bprD + (long)r * bprD;
-            for (int p = expStart[e]; p < expStart[e + 1]; p++)
+            int pStart = expStart[e], pEnd = expStart[e + 1];
+            // Issue #112: down row dotted against the expert's silu'd-gate slices in
+            // PAIRS, decoding the weight row once per pair (bit-identical to per-token).
+            int p = pStart;
+            for (; p + 1 < pEnd; p += 2)
             {
-                int i = expTokI[p], k = expTokK[p];
-                long slot = (long)i * naL + k;
+                long s0 = (long)expTokI[p]     * naL + expTokK[p];
+                long s1 = (long)expTokI[p + 1] * naL + expTokK[p + 1];
+                float d0, d1;
+                if (useQ8KDown)
+                    DispatchDotQ8K2In(downRow, gateAllQ8K + s0 * q8kExpStride,
+                        gateAllQ8K + s1 * q8kExpStride, expertDimL, downDt, out d0, out d1);
+                else
+                    DispatchDot2In(downRow, gateAll + s0 * expertDimL,
+                        gateAll + s1 * expertDimL, expertDimL, downDt, out d0, out d1);
+                downPartial[s0 * embDimL + r] = d0;
+                downPartial[s1 * embDimL + r] = d1;
+            }
+            if (p < pEnd) // odd remainder
+            {
+                long slot = (long)expTokI[p] * naL + expTokK[p];
                 downPartial[slot * embDimL + r] = useQ8KDown
                     ? DispatchDotQ8K(downRow, gateAllQ8K + slot * q8kExpStride, expertDimL, downDt)
                     : DispatchDot(downRow, gateAll + slot * expertDimL, expertDimL, downDt);
@@ -1992,6 +2333,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// <summary>Forward one token through the hybrid CUDA + CPU stack.</summary>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
+        ThrowIfFaulted();
         long fwdT0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         // 1. Embedding → _gpuHidden
         EmbedToken(_gpuHidden, token);
@@ -2153,6 +2495,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     public void BatchForward2(int t1, int t2, int startPos,
         out ReadOnlySpan<float> logits1, out ReadOnlySpan<float> logits2)
     {
+        ThrowIfFaulted();
         if (!SupportsBatchVerify)
             throw new InvalidOperationException(
                 "BatchForward2 is only supported on dense-FFN MTP passes. " +
@@ -2477,6 +2820,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// <inheritdoc />
     public ReadOnlySpan<float> MtpForward(int token, int position, ReadOnlySpan<float> prevHidden)
     {
+        ThrowIfFaulted();
         if (!_hasMtp)
             throw new InvalidOperationException(
                 "MtpForward called on a CudaHybridGdnForwardPass that did not load an MTP head. " +
@@ -2664,6 +3008,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// </remarks>
     public void PrefillMtp(IReadOnlyList<int> tokens, int startPos = 0)
     {
+        ThrowIfFaulted();
         if (!_hasMtp) return;
         if (tokens is null || tokens.Count == 0) return;
 
@@ -3313,6 +3658,46 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _ => throw new NotSupportedException($"Routed expert dtype {dtype} not supported in batched path"),
         };
 
+    // Issue #112: dequant-once two-input dispatch. Decodes the quantized weight row
+    // ONCE and dots it against two token inputs, amortizing the (Q4_K/Q5_K nibble)
+    // unpack across the pair. Bit-identical to two <see cref="DispatchDot"/> calls —
+    // the 2In kernels mirror the single-input accumulator structure exactly (proven
+    // by the MTP batched-verify path) — so the routed-MoE byte-parity oracle still
+    // holds. Dtypes without a 2In kernel fall back to two single dots (no win, still
+    // correct).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void DispatchDot2In(byte* row, float* in1, float* in2, int cols, DType dtype,
+        out float v1, out float v2)
+    {
+        switch (dtype)
+        {
+            case DType.Q4_K: SimdKernels.DotQ4K_2In(row, in1, in2, cols, out v1, out v2); break;
+            case DType.Q5_K: SimdKernels.DotQ5K_2In(row, in1, in2, cols, out v1, out v2); break;
+            default:
+                v1 = DispatchDot(row, in1, cols, dtype);
+                v2 = DispatchDot(row, in2, cols, dtype);
+                break;
+        }
+    }
+
+    // Issue #112: dequant-once two-input dispatch for the Q8_KS-prepacked path.
+    // Decodes the Q3_K weight row once and dots against two prepacked token inputs.
+    // Bit-identical to two <see cref="DispatchDotQ8K"/> calls. Q8_0 has no expensive
+    // unpack, so it falls back to two single dots.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void DispatchDotQ8K2In(byte* row, byte* scr1, byte* scr2, int cols, DType dtype,
+        out float v1, out float v2)
+    {
+        switch (dtype)
+        {
+            case DType.Q3_K: SimdKernels.DotQ3K_Q8KS_2In(row, scr1, scr2, cols, out v1, out v2); break;
+            default:
+                v1 = DispatchDotQ8K(row, scr1, cols, dtype);
+                v2 = DispatchDotQ8K(row, scr2, cols, dtype);
+                break;
+        }
+    }
+
     // Same idea as DispatchDot but the input is already prepacked to Q8_KS
     // (per-32-element scales — issue #107) once per CpuMoeFfnCore call (Phase A:
     // cpuNormIn; Phase C: each gateAll slice), so individual rows hit the
@@ -3389,6 +3774,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private void GpuMatMul(Tensor output, Tensor matrix, Tensor vector)
     {
         _gpu.MatMul(output, matrix, vector,
+            _gpuWeightDTypes.TryGetValue(matrix.Handle, out var dt) ? dt : DType.Float32);
+    }
+
+    /// Issue #111: batched (GEMM-N) MatMul dispatch — one weight read applied to N
+    /// token columns in a single launch, bit-identical to N sequential GpuMatMul calls.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void GpuMatMulBatched(Tensor outputAll, Tensor matrix, Tensor inputAll, int nTok)
+    {
+        _gpu.MatMulBatched(outputAll, matrix, inputAll, nTok,
             _gpuWeightDTypes.TryGetValue(matrix.Handle, out var dt) ? dt : DType.Float32);
     }
 

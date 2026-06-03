@@ -31,6 +31,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private readonly int _smVersion;
     private readonly nint _stream;
     private readonly ConcurrentDictionary<nint, (nint devPtr, nuint byteSize)> _devPtrs = new();
+    // Issue #111: handles registered by View() — non-owning slices into another
+    // tensor's allocation. Free() drops the registration without freeing memory.
+    private readonly ConcurrentDictionary<nint, byte> _viewHandles = new();
     private long _nextHandle = 1;
 
     // Pinned host staging buffer for DMA-capable async H2D/D2H transfers.
@@ -137,6 +140,19 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _matvecQ4KN2Kernel;
     private nint   _matvecQ5KN2Kernel;
     private nint   _matvecQ6KN2Kernel;
+    // Issue #111: batched GEMM-N variants — one weight matrix, N input vectors,
+    // N output rows in a single launch. Each (row, token) runs the identical
+    // per-row reduction as the GEMV so results are bit-identical to N sequential
+    // matvecs. Collapses the per-token trunk launches that dominate GDN-hybrid
+    // prefill into one launch per projection.
+    private nint   _matvecF32GemmNKernel;
+    private nint   _matvecQ4KGemmNKernel;
+    private nint   _matvecQ6KGemmNKernel;
+    // Issue #111: batched trunk elementwise/norm kernels (one launch over N tokens).
+    private nint   _rmsNormBatchedKernel;
+    private nint   _headNormBatchedKernel;
+    private nint   _splitQgBatchedKernel;
+    private nint   _ropeNeoxPartialBatchedKernel;
     private nint   _attentionKernel;
     // Gemma 4 (Phase 7): sliding-window attention, tanh-GELU FFN, final-logit
     // softcap. Kernel work only — forward-pass wiring lands in Phase 8.
@@ -168,6 +184,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // dispatches the Q4_K path (sequential MatMul callers never touch it).
     private nint   _q81BufB;
     private nuint  _q81BufBSize;
+    // Issue #111: Q8_1 scratch for MatMulBatched's N input vectors (laid out as
+    // N contiguous q81 rows). Grow-only, same policy as _q81Buf.
+    private nint   _q81BatchBuf;
+    private nuint  _q81BatchBufSize;
 
     // Tracks dtype per tensor handle so MatMul can dispatch to the right matvec variant
     // (Q4_K / Q5_K / Q6_K / F32). Norm/bias weights upload as F32; quantized weight bytes
@@ -396,8 +416,45 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         return new Tensor(shape, dtype, handle);
     }
 
+    /// <summary>
+    /// Registers a non-owning view into <paramref name="parent"/> starting at
+    /// <paramref name="elemOffset"/> elements, spanning <paramref name="elemCount"/>
+    /// elements (issue #111). The returned <see cref="Tensor"/> shares the parent's
+    /// device memory; <see cref="Free"/> on it only drops the handle registration and
+    /// never frees the underlying allocation. Used by batched prefill to pass a
+    /// per-token slice of a <c>[N×dim]</c> batched buffer to the per-position
+    /// recurrence / KV-append / attention kernels without an extra device copy.
+    /// Element size is taken from the parent dtype (Float32 for activation buffers).
+    /// </summary>
+    public Tensor View(Tensor parent, long elemOffset, long elemCount, DType dtype = DType.Float32)
+    {
+        if (!_devPtrs.TryGetValue(parent.Handle, out var pe))
+            throw new InvalidOperationException($"View: parent handle {parent.Handle} not registered.");
+        if (elemOffset < 0 || elemCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(elemOffset),
+                $"View: elemOffset ({elemOffset}) and elemCount ({elemCount}) must be non-negative.");
+        int elemBytes = DTypeInfo.BytesPerElement(dtype);
+        long byteOffset = elemOffset * elemBytes;
+        long byteCount = elemCount * elemBytes;
+        if (byteOffset < 0 || byteOffset + byteCount > (long)pe.byteSize)
+            throw new ArgumentOutOfRangeException(nameof(elemOffset),
+                $"View [{elemOffset}, {elemOffset + elemCount}) (×{elemBytes}B) out of parent bounds ({pe.byteSize}B).");
+        var handle = (nint)Interlocked.Increment(ref _nextHandle);
+        _devPtrs[handle] = (pe.devPtr + (nint)byteOffset, (nuint)byteCount);
+        _viewHandles[handle] = 0;
+        return new Tensor(TensorShape.D1(elemCount), dtype, handle);
+    }
+
     public void Free(Tensor tensor)
     {
+        if (_viewHandles.TryRemove(tensor.Handle, out _))
+        {
+            // Non-owning view: drop the handle registration only; the parent owns
+            // the device memory and frees it on its own Free().
+            _tensorDTypes.TryRemove(tensor.Handle, out _);
+            _devPtrs.TryRemove(tensor.Handle, out _);
+            return;
+        }
         _tensorDTypes.TryRemove(tensor.Handle, out _);
         if (_pinnedAllocs.Remove(tensor.Handle, out var pinned))
         {
@@ -1287,6 +1344,148 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>
+    /// Batched matrix-vector multiply (GEMM-N, issue #111): one <paramref name="matrix"/>
+    /// applied to <paramref name="nTok"/> input vectors, producing <paramref name="nTok"/>
+    /// output rows — in a single kernel launch. Layout is token-major:
+    /// <paramref name="inputAll"/> is <c>[nTok × cols]</c> and <paramref name="outputAll"/>
+    /// is <c>[nTok × rows]</c> (token <c>t</c>'s slice starts at <c>t × rows</c>).
+    ///
+    /// <para><b>Bit-exact:</b> each (row, token) pair runs the identical per-row reduction
+    /// as the single-token <see cref="MatMul(Tensor,Tensor,Tensor,DType)"/> — same weight
+    /// decode, same dp4a/FMA chain, same warp + shared reduce — so the result is
+    /// bit-identical to <paramref name="nTok"/> sequential <see cref="MatMul"/> calls. This
+    /// is the property the GDN/MTP byte-parity oracles depend on; do not reorder the
+    /// reduction. Only the launch count collapses (N → 1), killing the host launch
+    /// overhead that dominates GDN-hybrid prefill.</para>
+    ///
+    /// Supports Q4_K (via per-token Q8_1 quantize + the GEMM-N dp4a kernel) and Float32.
+    /// Other dtypes throw — the GDN-hybrid trunk projections are all Q4_K.
+    /// </summary>
+    public void MatMulBatched(Tensor outputAll, Tensor matrix, Tensor inputAll,
+                              int nTok, DType weightDType)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available on this system.");
+        if (nTok <= 0)
+            throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be > 0.");
+        if (outputAll.ElementCount % nTok != 0 || inputAll.ElementCount % nTok != 0)
+            throw new ArgumentException(
+                $"MatMulBatched: outputAll ({outputAll.ElementCount}) and inputAll ({inputAll.ElementCount}) " +
+                $"element counts must be divisible by nTok ({nTok}).");
+
+        int rows = (int)(outputAll.ElementCount / nTok);
+        int cols = (int)(inputAll.ElementCount / nTok);
+        nint wPtr = GetDevPtr(matrix);
+        nint xPtr = GetDevPtr(inputAll);
+        nint yPtr = GetDevPtr(outputAll);
+
+        if (weightDType == DType.Q4_K)
+        {
+            DispatchMatVecQ4KBatched(wPtr, xPtr, yPtr, rows, cols, nTok);
+            return;
+        }
+        if (weightDType == DType.Float32 || weightDType == DType.Q6_K)
+        {
+            // Both take F32 input; the Q6_K kernel decodes the weight per element.
+            nint kernel = weightDType == DType.Q6_K ? _matvecQ6KGemmNKernel : _matvecF32GemmNKernel;
+            int pRows = rows, pCols = cols, pN = nTok;
+            nint* args = stackalloc nint[6]
+            {
+                (nint)(&wPtr), (nint)(&xPtr), (nint)(&yPtr),
+                (nint)(&pRows), (nint)(&pCols), (nint)(&pN)
+            };
+            uint gridX = (uint)((rows + 7) / 8);
+            int r = NvrtcInterop.LaunchKernel(kernel, gridX, (uint)nTok, 1,
+                                              256, 1, 1, 0, _stream, args, null);
+            if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_gemm_n) failed: {r}");
+            return;
+        }
+        throw new NotSupportedException(
+            $"CUDA MatMulBatched: weight dtype {weightDType} not supported (expected Q4_K, Q6_K, or Float32).");
+    }
+
+    /// <summary>
+    /// Convenience overload: looks up the weight dtype from the
+    /// <see cref="UploadRaw"/> tag dictionary.
+    /// </summary>
+    public void MatMulBatched(Tensor outputAll, Tensor matrix, Tensor inputAll, int nTok)
+    {
+        var dtype = _tensorDTypes.GetValueOrDefault(matrix.Handle, matrix.DType);
+        MatMulBatched(outputAll, matrix, inputAll, nTok, dtype);
+    }
+
+    /// <summary>
+    /// Q4_K batched GEMM-N: quantizes all <paramref name="nTok"/> input vectors into a
+    /// single contiguous Q8_1 scratch (one launch over <c>nTok × subBlocks</c> blocks —
+    /// the per-token quantize is independent so this is bit-identical to per-token
+    /// quantization), then dispatches <c>llm_matvec_q4k_gemm_n</c> over a (rows, nTok)
+    /// grid.
+    /// </summary>
+    private void DispatchMatVecQ4KBatched(nint wPtr, nint xPtr, nint yPtr,
+                                          int rows, int cols, int nTok)
+    {
+        if ((cols & 0xff) != 0)
+            throw new InvalidOperationException(
+                $"CUDA matvec_q4k_gemm_n requires cols % 256 == 0 (got {cols}).");
+
+        int subBlocks = cols / 32;                          // per token
+        long totalSub = (long)subBlocks * nTok;
+        nuint q81Bytes = (nuint)(totalSub * 36L);
+        EnsureQ81BatchBuf(q81Bytes);
+
+        // Quantize all nTok inputs → contiguous Q8_1. The single-token kernel's
+        // index math (elem_idx = block_id*32 + lane, out += block_id*36) already
+        // covers a contiguous [nTok × cols] batch: block_id runs [0, nTok*subBlocks).
+        {
+            nint qInPtr  = xPtr;
+            nint qOutPtr = _q81BatchBuf;
+            int  qN      = (int)((long)cols * nTok);
+            if ((long)cols * nTok > int.MaxValue)
+                throw new InvalidOperationException(
+                    $"MatMulBatched: cols*nTok ({(long)cols * nTok}) exceeds int range.");
+            nint* args = stackalloc nint[3]
+            {
+                (nint)(&qInPtr), (nint)(&qOutPtr), (nint)(&qN)
+            };
+            int rq = NvrtcInterop.LaunchKernel(
+                _quantizeQ81Kernel, (uint)totalSub, 1, 1,
+                32, 1, 1, 0, _stream, args, null);
+            if (rq != 0) throw new InvalidOperationException($"cuLaunchKernel(quantize_q8_1 batched) failed: {rq}");
+        }
+
+        {
+            nint q81Ptr = _q81BatchBuf;
+            int  pRows  = rows, pCols = cols, pN = nTok;
+            nint* args = stackalloc nint[6]
+            {
+                (nint)(&wPtr), (nint)(&q81Ptr), (nint)(&yPtr),
+                (nint)(&pRows), (nint)(&pCols), (nint)(&pN)
+            };
+            // grid = (rows, nTok); block = 32 × MATVEC_Q4K_NWARPS(8) = 256 threads.
+            int rm = NvrtcInterop.LaunchKernel(
+                _matvecQ4KGemmNKernel, (uint)rows, (uint)nTok, 1,
+                32, 8, 1, 0, _stream, args, null);
+            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_q4k_gemm_n) failed: {rm}");
+        }
+    }
+
+    private void EnsureQ81BatchBuf(nuint required)
+    {
+        if (_q81BatchBuf != nint.Zero && _q81BatchBufSize >= required) return;
+        if (_q81BatchBuf != nint.Zero)
+        {
+            CuBlasInterop.CudaFree(_q81BatchBuf);
+            _q81BatchBuf = nint.Zero;
+            _q81BatchBufSize = 0;
+        }
+        nuint newSize = (required + 0xffffu) & ~(nuint)0xffffu;
+        int r = CuBlasInterop.CudaMalloc(out _q81BatchBuf, newSize);
+        if (r != 0) throw new InvalidOperationException($"cudaMalloc(q8_1 batch scratch, {newSize} B) failed: {r}");
+        _q81BatchBufSize = newSize;
+    }
+
+    /// <summary>
     /// Q4_K N=2 matvec: quantizes both input vectors into independent Q8_1
     /// scratches (<c>_q81Buf</c> for A, <c>_q81BufB</c> for B), then dispatches
     /// the cooperative <c>llm_matvec_q4k_n2</c> kernel that reads each weight
@@ -1484,6 +1683,32 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(rmsnorm) failed: {r}");
     }
 
+    /// <summary>
+    /// Batched RmsNorm over <paramref name="nTok"/> rows (issue #111). <paramref name="x"/>
+    /// and <paramref name="output"/> are <c>[nTok × dim]</c> contiguous; <paramref name="weight"/>
+    /// is shared across rows. One block per token runs the identical reduction as
+    /// <see cref="RmsNorm"/>, so output is bit-identical to nTok sequential calls.
+    /// </summary>
+    public void RmsNormBatched(Tensor output, Tensor x, Tensor weight, int nTok, int dim, float eps = 1e-5f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint xPtr = GetDevPtr(x);
+        nint wPtr = GetDevPtr(weight);
+        nint yPtr = GetDevPtr(output);
+        int   pN = dim, pNT = nTok;
+        float pE = eps;
+        nint* args = stackalloc nint[6]
+        {
+            (nint)(&xPtr), (nint)(&wPtr), (nint)(&yPtr),
+            (nint)(&pN), (nint)(&pE), (nint)(&pNT)
+        };
+        int r = NvrtcInterop.LaunchKernel(_rmsNormBatchedKernel, (uint)nTok, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(rmsnorm_batched) failed: {r}");
+    }
+
     /// <summary>Per-head RMS norm with learned weights (Qwen3 / OLMoE QK norm).
     /// <paramref name="perChannelWeight"/> false → weight is shared <c>[headDim]</c> vector
     /// applied identically to every head (Qwen3); true → weight is
@@ -1507,6 +1732,31 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         };
         int r = NvrtcInterop.LaunchKernel(_headNormKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(head_norm) failed: {r}");
+    }
+
+    /// <summary>
+    /// Batched per-head RmsNorm over <paramref name="nTok"/> rows (issue #111).
+    /// <paramref name="data"/> is <c>[nTok × numHeads × headDim]</c>; grid = (numHeads, nTok).
+    /// Bit-identical to nTok sequential <see cref="HeadNorm"/> calls.
+    /// </summary>
+    public void HeadNormBatched(Tensor data, Tensor weight, int numHeads, int headDim,
+        int nTok, float eps = 1e-6f, bool perChannelWeight = false)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint dPtr = GetDevPtr(data);
+        nint wPtr = GetDevPtr(weight);
+        int  pHD = headDim, pNH = numHeads, pWS = perChannelWeight ? headDim : 0, pNT = nTok;
+        float pE = eps;
+        nint* args = stackalloc nint[7]
+        {
+            (nint)(&dPtr), (nint)(&wPtr),
+            (nint)(&pHD), (nint)(&pNH), (nint)(&pE), (nint)(&pWS), (nint)(&pNT)
+        };
+        int r = NvrtcInterop.LaunchKernel(_headNormBatchedKernel, (uint)numHeads, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(head_norm_batched) failed: {r}");
     }
 
     /// <summary>Per-head L2 normalize (no learned weights). Llama-4 style.</summary>
@@ -1674,6 +1924,39 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>
+    /// Batched partial NEOX RoPE over <paramref name="nTok"/> rows (issue #111). Token t
+    /// rotates at position <paramref name="basePosition"/> + t (prefill assigns contiguous
+    /// positions). <paramref name="x"/> is <c>[nTok × numHeads × headDim]</c>. Bit-identical
+    /// to nTok sequential <see cref="RoPEPartial"/> calls at the matching positions.
+    /// </summary>
+    public void RoPEPartialBatched(Tensor x, int basePosition, int headDim, int ropeDim,
+        float ropeTheta, int numHeads, int nTok, bool neox)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (!neox)
+            throw new ArgumentException("RoPEPartialBatched currently supports only neox=true.", nameof(neox));
+        if (ropeDim <= 0 || (ropeDim & 1) != 0)
+            throw new ArgumentException("ropeDim must be a positive even number.", nameof(ropeDim));
+        if (ropeDim > headDim)
+            throw new ArgumentException("ropeDim must be <= headDim.", nameof(ropeDim));
+
+        int totalPairs = numHeads * (ropeDim / 2);
+        nint xPtr = GetDevPtr(x);
+        int  pNH = numHeads, pHD = headDim, pRD = ropeDim, pPos = basePosition, pNT = nTok;
+        float pT = ropeTheta;
+        nint* args = stackalloc nint[7]
+        {
+            (nint)(&xPtr),
+            (nint)(&pNH), (nint)(&pHD), (nint)(&pRD), (nint)(&pPos), (nint)(&pT), (nint)(&pNT)
+        };
+        uint grid = (uint)((totalPairs + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_ropeNeoxPartialBatchedKernel, grid, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(rope_neox_partial_batched) failed: {r}");
+    }
+
+    /// <summary>
     /// NEOX RoPE with per-half-dim frequency factors (Gemma 4 global layers /
     /// Gemma-3n). <paramref name="freqFactors"/> is a <c>head_dim/2</c> F32 device
     /// vector that divides each pair's frequency; mirrors llama.cpp
@@ -1771,6 +2054,33 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         uint grid = (uint)((total + 255) / 256);
         int r = NvrtcInterop.LaunchKernel(_splitQgKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(split_qg) failed: {r}");
+    }
+
+    /// <summary>
+    /// Batched <see cref="SplitQG"/> over <paramref name="nTok"/> rows (issue #111).
+    /// <paramref name="qg"/> is <c>[nTok × numHeads × headDim × 2]</c>; <paramref name="q"/>
+    /// and <paramref name="g"/> are <c>[nTok × numHeads × headDim]</c>. Bit-identical to
+    /// nTok sequential <see cref="SplitQG"/> calls.
+    /// </summary>
+    public void SplitQGBatched(Tensor q, Tensor g, Tensor qg, int numHeads, int headDim, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint qgPtr = GetDevPtr(qg);
+        nint qPtr  = GetDevPtr(q);
+        nint gPtr  = GetDevPtr(g);
+        int  pNH = numHeads, pHD = headDim, pNT = nTok;
+        nint* args = stackalloc nint[6]
+        {
+            (nint)(&qgPtr), (nint)(&qPtr), (nint)(&gPtr),
+            (nint)(&pNH), (nint)(&pHD), (nint)(&pNT)
+        };
+        int total = numHeads * headDim;
+        uint grid = (uint)((total + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_splitQgBatchedKernel, grid, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(split_qg_batched) failed: {r}");
     }
 
     /// <summary>Write fresh K and V vectors for one token into the layer KV cache at <paramref name="position"/>.</summary>
@@ -2744,6 +3054,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _matvecF32Kernel, _matvecQ4KKernel, _matvecQ5KKernel, _matvecQ6KKernel,
             _matvecQ80Kernel,
             _matvecF32N2Kernel, _matvecQ4KN2Kernel, _matvecQ5KN2Kernel, _matvecQ6KN2Kernel,
+            _matvecF32GemmNKernel, _matvecQ4KGemmNKernel, _matvecQ6KGemmNKernel,
+            _rmsNormBatchedKernel, _headNormBatchedKernel,
+            _splitQgBatchedKernel, _ropeNeoxPartialBatchedKernel,
             _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel,
             _geluTanhMulKernel, _softcapKernel,
             _clearF32Kernel, _quantizeQ81Kernel,
@@ -2804,6 +3117,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _matvecQ4KN2Kernel     = GetKernelFunc("llm_matvec_q4k_n2");
         _matvecQ5KN2Kernel     = GetKernelFunc("llm_matvec_q5k_n2");
         _matvecQ6KN2Kernel     = GetKernelFunc("llm_matvec_q6k_n2");
+        _matvecF32GemmNKernel  = GetKernelFunc("llm_matvec_f32_gemm_n");
+        _matvecQ4KGemmNKernel  = GetKernelFunc("llm_matvec_q4k_gemm_n");
+        _matvecQ6KGemmNKernel  = GetKernelFunc("llm_matvec_q6k_gemm_n");
+        _rmsNormBatchedKernel  = GetKernelFunc("llm_rmsnorm_batched");
+        _headNormBatchedKernel = GetKernelFunc("llm_head_norm_batched");
+        _splitQgBatchedKernel  = GetKernelFunc("llm_split_qg_batched");
+        _ropeNeoxPartialBatchedKernel = GetKernelFunc("llm_rope_neox_partial_batched");
         _attentionKernel       = GetKernelFunc("llm_attention");
         _attentionBf16Kernel   = GetKernelFunc("llm_attention_bf16");
         _attentionSwaKernel    = GetKernelFunc("llm_attention_swa");
@@ -3166,6 +3486,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             CuBlasInterop.CudaFree(_q81BufB);
             _q81BufB = nint.Zero;
             _q81BufBSize = 0;
+        }
+        if (_q81BatchBuf != nint.Zero)
+        {
+            CuBlasInterop.CudaFree(_q81BatchBuf);
+            _q81BatchBuf = nint.Zero;
+            _q81BatchBufSize = 0;
         }
 
         CuBlasInterop.Destroy(_handle);
