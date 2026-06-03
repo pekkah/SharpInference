@@ -516,6 +516,25 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private Tensor? _gpuBtAttnOut;   // [N × qDim] attn output (pre-O)
     private Tensor? _gpuBtSGate;     // [N × expertDim] shared-expert gate
     private Tensor? _gpuBtSUp;       // [N × expertDim] shared-expert up
+    // Issue #114-B fused-GDN-scan scratch (only allocated when BatchedGdnScanEnabled).
+    private Tensor? _gpuBtQkvConv;   // [N × convChannels] post-conv1d + SiLU
+    private Tensor? _gpuBtQHead;     // [N × valueDim] tiled GDN query heads
+    private Tensor? _gpuBtKHead;     // [N × valueDim] tiled GDN key heads
+
+    // Issue #114-B: fuse the per-position GDN recurrence launches into one
+    // sequential-scan kernel + batched conv1d/L2norm/tile/silu over N. Default on;
+    // SHARPI_BATCHED_GDN_SCAN=0 falls back to the per-position View loop inside
+    // GdnBlockBatched (the pre-#114-B path). A/B-toggleable like SHARPI_BATCHED_TRUNK.
+    internal static bool BatchedGdnScanEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_BATCHED_GDN_SCAN") != "0";
+
+    // Issue #114-B: batch the per-position KV-append + SDPA into one launch each
+    // (CudaBackend.AttentionBatched). Only used when the chunk stays on the
+    // shared-scores path (startPos+N ≤ 4096) and SnapKV Q-capture is inactive;
+    // otherwise AttnBlockBatched keeps the per-position loop. Default on;
+    // SHARPI_BATCHED_ATTN=0 forces the per-position path.
+    internal static bool BatchedAttnEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_BATCHED_ATTN") != "0";
 
     public int VocabSize => _hp.VocabSize;
     public int MaxSeqLen => _maxSeqLen;
@@ -1417,6 +1436,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpuBtAttnOut  = A((long)N * qDim);
         _gpuBtSGate    = A((long)N * _expertDim);
         _gpuBtSUp      = A((long)N * _expertDim);
+        if (BatchedGdnScanEnabled)
+        {
+            _gpuBtQkvConv = A((long)N * _gdnConvChannels);
+            _gpuBtQHead   = A((long)N * _gdnValueDim);
+            _gpuBtKHead   = A((long)N * _gdnValueDim);
+        }
         _btCap = N;
     }
 
@@ -1427,6 +1452,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         F(ref _gpuBtQkv); F(ref _gpuBtZ); F(ref _gpuBtAlpha); F(ref _gpuBtBeta); F(ref _gpuBtGdnOut);
         F(ref _gpuBtQGate); F(ref _gpuBtQ); F(ref _gpuBtGate); F(ref _gpuBtK); F(ref _gpuBtV); F(ref _gpuBtAttnOut);
         F(ref _gpuBtSGate); F(ref _gpuBtSUp);
+        F(ref _gpuBtQkvConv); F(ref _gpuBtQHead); F(ref _gpuBtKHead);
         _btCap = 0;
     }
 
@@ -1544,6 +1570,42 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         var scanState = _gpuGdnScanState[layer]!;
         var convState = _gpuGdnConvState[layer]!;
 
+        // Issue #114-B: fuse the per-position conv1d + delta-net recurrence into
+        // one batched launch per stage + a single sequential-scan kernel. Output is
+        // bit-identical to the per-position View loop below (same per-position math,
+        // same reduction order; only the host launch overhead is removed).
+        if (BatchedGdnScanEnabled)
+        {
+            var qkvConvAll = _gpuBtQkvConv!;
+            var qHeadAll = _gpuBtQHead!;
+            var kHeadAll = _gpuBtKHead!;
+
+            // conv1d over all tokens (read-only state), then advance the state.
+            _gpu.GdnConv1dDecodeBatched(qkvAll, convState, _gpuSsmConv1d[layer], qkvConvAll,
+                convCh, _gdnConvKernel, N);
+            _gpu.GdnConv1dStateUpdateBatched(qkvAll, convState, convCh, _gdnConvKernel, N);
+            // SiLU over the whole [N × convCh] (matches the per-token full-convCh SiLU).
+            _gpu.SiLUInPlace(qkvConvAll);
+            // L2-norm the Q (offset 0) and K (offset kDim) regions, per head, per token.
+            _gpu.GdnL2NormPerHeadBatched(qkvConvAll, 0,    _gdnNumKHeads, hd, convCh, N, eps: 1e-6f);
+            _gpu.GdnL2NormPerHeadBatched(qkvConvAll, kDim, _gdnNumKHeads, hd, convCh, N, eps: 1e-6f);
+            // Tile Q and K heads (GQA broadcast) into the [N × valueDim] head buffers.
+            _gpu.GdnTileHeadsBatched(qkvConvAll, 0,    qHeadAll, 0, _gdnNumKHeads, _gdnKvRepeat, hd, convCh, valDim, N);
+            _gpu.GdnTileHeadsBatched(qkvConvAll, kDim, kHeadAll, 0, _gdnNumKHeads, _gdnKvRepeat, hd, convCh, valDim, N);
+            // Fused sequential scan: v read straight from the silu'd conv output's V
+            // region (vHeadOff = 2*kDim, stride convCh); q/k from the tiled head buffers.
+            _gpu.GdnRecurrenceScan(
+                scanState, qHeadAll, kHeadAll, qkvConvAll,
+                alphaAll, betaAll, _gpuSsmA[layer], _gpuSsmDtBias[layer], _gpuSsmNormW[layer],
+                zAll, gdnOutAll,
+                nVH, hd, normEps: 1e-6f,
+                qStride: valDim, kStride: valDim, vStride: convCh, vHeadOff: 2 * kDim,
+                zStride: valDim, oStride: valDim, nTok: N);
+
+            GpuMatMulBatched(blockOut, _gpuWSsmOut[layer], gdnOutAll, N);
+            return;
+        }
+
         // Per-token conv1d + delta-net recurrence (positional → sequential). The
         // conv/L2/tile scratch (_gpuGdnQkvConv / _gpuGdnQHead / _gpuGdnKHead /
         // _gpuGdnVHead) is reused per token; only the batched-buffer inputs/output
@@ -1600,6 +1662,31 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpu.HeadNormBatched(kAll, _gpuKNorm[layer], _numKvHeads, _headDim, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
         _gpu.RoPEPartialBatched(qAll, startPos, _headDim, _ropeDim, _hp.RopeTheta, _numHeads,   N, neox: true);
         _gpu.RoPEPartialBatched(kAll, startPos, _headDim, _ropeDim, _hp.RopeTheta, _numKvHeads, N, neox: true);
+
+        // Issue #114-B: batch the KV-append + SDPA into one launch each when the
+        // chunk stays on the shared-scores fast path (startPos+N ≤ 4096) and SnapKV
+        // Q-capture is inactive. Bit-identical to the per-position loop below (the
+        // batched attention kernel clones llm_attention per (head, query) block).
+        // SnapKV active or long context → fall through to the per-position loop,
+        // which captures Q and supports the >4096 global-scratch attention path.
+        if (BatchedAttnEnabled && !snapKvActive && startPos + N <= 4096)
+        {
+            if (_kvDType == DType.BFloat16)
+            {
+                _gpu.KvAppendBatchedBf16(kAll, vAll, _gpuKCache[layer]!, _gpuVCache[layer]!, kvDim, startPos, _maxSeqLen, N);
+                _gpu.AttentionBatchedBf16(qAll, _gpuKCache[layer]!, _gpuVCache[layer]!, attnOutAll,
+                    _numHeads, _numKvHeads, _headDim, startPos, _maxSeqLen, N);
+            }
+            else
+            {
+                _gpu.KvAppendBatched(kAll, vAll, _gpuKCache[layer]!, _gpuVCache[layer]!, kvDim, startPos, _maxSeqLen, N);
+                _gpu.AttentionBatched(qAll, _gpuKCache[layer]!, _gpuVCache[layer]!, attnOutAll,
+                    _numHeads, _numKvHeads, _headDim, startPos, _maxSeqLen, N);
+            }
+            _gpu.SigmoidMulInPlace(attnOutAll, gateAll);
+            GpuMatMulBatched(blockOut, _gpuWO[layer], attnOutAll, N);
+            return;
+        }
 
         // Per-position KV-append + scaled-dot-product attention (positional →
         // sequential), plus SnapKV Q-capture for the trailing window.
