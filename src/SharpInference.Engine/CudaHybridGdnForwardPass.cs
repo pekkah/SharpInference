@@ -3759,7 +3759,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // without a 4In kernel fall back to two 2In pairs — never worse than the prior
     // pairing path, still correct.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void DispatchDot4In(byte* row, float* in0, float* in1, float* in2, float* in3,
+    internal static void DispatchDot4In(byte* row, float* in0, float* in1, float* in2, float* in3,
         int cols, DType dtype, out float v0, out float v1, out float v2, out float v3)
     {
         switch (dtype)
@@ -3779,7 +3779,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // Bit-identical to four DispatchDotQ8K calls. Other dtypes fall back to two 2In
     // pairs (Q8_0 has no expensive unpack; this keeps it correct without regressing).
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void DispatchDotQ8K4In(byte* row, byte* s0, byte* s1, byte* s2, byte* s3,
+    internal static void DispatchDotQ8K4In(byte* row, byte* s0, byte* s1, byte* s2, byte* s3,
         int cols, DType dtype, out float v0, out float v1, out float v2, out float v3)
     {
         switch (dtype)
