@@ -1,0 +1,215 @@
+using SharpInference.Core;
+using SharpInference.Cuda;
+using SharpInference.Engine;
+
+namespace SharpInference.Tests.ForwardPass;
+
+/// <summary>
+/// Issue #110: byte-parity guard for batched prompt prefill on the CPU-MoE
+/// GDN-hybrid CUDA path. The batched path (<see cref="CudaHybridGdnForwardPass"/>
+/// per-layer prefill, routed experts grouped by selection) must produce
+/// bit-identical prefill logits and bit-identical MTP draft logits to the
+/// sequential per-token loop — the same DispatchDot/DispatchDotQ8K kernels run
+/// with identical per-token top-k accumulation order. A divergence here means
+/// the batching reordered a floating-point reduction (the failure mode the MTP
+/// greedy-parity oracles trip on).
+///
+/// Targets the Carnice APEX MTP model (Q3_K + Q8_0 routed experts → exercises
+/// the Q8_KS-prepacked batched path and the MTP hidden-history population).
+/// Skipped silently when CUDA is unavailable or the model isn't on disk.
+/// </summary>
+public sealed class CudaHybridGdnBatchedPrefillTests
+{
+    private static CudaBackend? TryCreate()
+    {
+        if (!CudaBackend.IsAvailable()) return null;
+        try { return CudaBackend.Create(); } catch { return null; }
+    }
+
+    private static string? FindCarnicePath()
+    {
+        string[] candidates =
+        {
+            @"E:\models\Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-I-Compact.gguf",
+            @"E:\models\Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf",
+            @"E:\models\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        };
+        foreach (var p in candidates)
+            if (File.Exists(p)) return p;
+        return null;
+    }
+
+    [Fact]
+    public void BatchedPrefill_BitwiseMatchesSequential_Carnice()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindCarnicePath();
+        if (path is null) return;
+
+        var prevCpuMoe = Environment.GetEnvironmentVariable("SHARPI_CPU_MOE");
+        Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", "1");
+        bool prevBatched = CudaHybridGdnForwardPass.BatchedPrefillEnabled;
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            if (!hp.IsMoE) return; // batched path only applies to CPU MoE
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+
+            var placement = new LayerPlacement(
+                GpuLayers: hp.NumLayers, CpuLayers: 0,
+                GpuWeightBytes: 0, GpuKvBytes: 0,
+                RecommendedCtxSize: Math.Min(hp.ContextLength, 4096));
+
+            // A long-enough prompt that many experts collide across tokens, so the
+            // grouped-by-expert path is actually exercised (N >= 2 triggers it).
+            var tokens = tokenizer.Encode(
+                "The quick brown fox jumps over the lazy dog. " +
+                "Pack my box with five dozen liquor jugs. " +
+                "How razorback-jumping frogs can level six piqued gymnasts! " +
+                "The five boxing wizards jump quickly.");
+            Assert.True(tokens.Count >= 8, $"Prompt tokenized to only {tokens.Count} tokens.");
+
+            // ── Sequential reference ──────────────────────────────────────────
+            CudaHybridGdnForwardPass.BatchedPrefillEnabled = false;
+            float[] seqLogits;
+            float[]? seqMtp = null;
+            using (var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement))
+            {
+                seqLogits = fwd.Prefill(tokens).ToArray();
+                if (fwd.HasMtpHead)
+                {
+                    fwd.PrefillMtp(tokens);
+                    int t1 = Sampler.Greedy(seqLogits);
+                    seqMtp = fwd.MtpForward(t1, tokens.Count,
+                        new ReadOnlySpan<float>(/* prev hidden */ GetLastHidden(fwd))).ToArray();
+                }
+            }
+
+            // ── Batched ───────────────────────────────────────────────────────
+            CudaHybridGdnForwardPass.BatchedPrefillEnabled = true;
+            float[] batLogits;
+            float[]? batMtp = null;
+            using (var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement))
+            {
+                batLogits = fwd.Prefill(tokens).ToArray();
+                if (fwd.HasMtpHead)
+                {
+                    fwd.PrefillMtp(tokens);
+                    int t1 = Sampler.Greedy(batLogits);
+                    batMtp = fwd.MtpForward(t1, tokens.Count,
+                        new ReadOnlySpan<float>(GetLastHidden(fwd))).ToArray();
+                }
+            }
+
+            Assert.Equal(seqLogits.Length, batLogits.Length);
+            int firstDiff = -1;
+            for (int i = 0; i < seqLogits.Length; i++)
+                if (BitConverter.SingleToInt32Bits(seqLogits[i]) != BitConverter.SingleToInt32Bits(batLogits[i]))
+                { firstDiff = i; break; }
+
+            Assert.True(firstDiff < 0,
+                $"Batched prefill logits diverge from sequential at index {firstDiff}: " +
+                $"seq={(firstDiff >= 0 ? seqLogits[firstDiff] : 0)} bat={(firstDiff >= 0 ? batLogits[firstDiff] : 0)}. " +
+                "Batched prefill must be bit-identical to the sequential per-token loop " +
+                "(see the K/V MatVecDual MTP-parity regression note).");
+
+            Assert.Equal(Sampler.Greedy(seqLogits), Sampler.Greedy(batLogits));
+
+            if (seqMtp is not null && batMtp is not null)
+            {
+                int mtpDiff = -1;
+                for (int i = 0; i < seqMtp.Length; i++)
+                    if (BitConverter.SingleToInt32Bits(seqMtp[i]) != BitConverter.SingleToInt32Bits(batMtp[i]))
+                    { mtpDiff = i; break; }
+                Assert.True(mtpDiff < 0,
+                    $"Batched-prefill MTP draft logits diverge from sequential at index {mtpDiff}. " +
+                    "The MTP hidden-history (PrefillMtp reads _mtpPrefillHiddens) must be " +
+                    "populated identically under batching.");
+            }
+        }
+        finally
+        {
+            CudaHybridGdnForwardPass.BatchedPrefillEnabled = prevBatched;
+            Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", prevCpuMoe);
+        }
+    }
+
+    // The MTP head needs the pre-output-norm hidden of the last prompt token as
+    // prevHidden. After Prefill, that is exposed via LastHidden.
+    private static float[] GetLastHidden(CudaHybridGdnForwardPass fwd) =>
+        fwd.LastHidden.ToArray();
+
+    /// <summary>
+    /// Multi-chunk parity: prefill the prompt in two segments (<c>[0,k)</c> then
+    /// <c>[k,N)</c>, the second with <c>startPos=k</c>) and assert the final-token
+    /// logits are bit-identical between batched and sequential. Exercises the paths
+    /// the single-chunk test misses: <c>startPos &gt; 0</c>, cross-chunk KV/GDN
+    /// continuity, and the exact-size <c>_gpuStreamAll</c> reallocation between two
+    /// chunks of different length (the bug that produced the UploadInto element-count
+    /// mismatch during development).
+    /// </summary>
+    [Fact]
+    public void BatchedPrefill_MultiChunk_BitwiseMatchesSequential_Carnice()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindCarnicePath();
+        if (path is null) return;
+
+        var prevCpuMoe = Environment.GetEnvironmentVariable("SHARPI_CPU_MOE");
+        Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", "1");
+        bool prevBatched = CudaHybridGdnForwardPass.BatchedPrefillEnabled;
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            if (!hp.IsMoE) return;
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+
+            var placement = new LayerPlacement(
+                GpuLayers: hp.NumLayers, CpuLayers: 0,
+                GpuWeightBytes: 0, GpuKvBytes: 0,
+                RecommendedCtxSize: Math.Min(hp.ContextLength, 4096));
+
+            var tokens = tokenizer.Encode(
+                "The quick brown fox jumps over the lazy dog. " +
+                "Pack my box with five dozen liquor jugs. " +
+                "How razorback-jumping frogs can level six piqued gymnasts! " +
+                "The five boxing wizards jump quickly. Sphinx of black quartz, judge my vow.");
+            int N = tokens.Count;
+            Assert.True(N >= 12, $"Prompt tokenized to only {N} tokens.");
+            // Split into two unequal chunks so the second has startPos>0 and the
+            // device stream buffer must resize from k1 to k2 tokens.
+            int k1 = N / 3;
+
+            float[] RunTwoChunks(bool batched)
+            {
+                CudaHybridGdnForwardPass.BatchedPrefillEnabled = batched;
+                using var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
+                fwd.Prefill(tokens.Take(k1).ToList(), 0);
+                return fwd.Prefill(tokens.Skip(k1).ToList(), k1).ToArray();
+            }
+
+            float[] seq = RunTwoChunks(false);
+            float[] bat = RunTwoChunks(true);
+
+            Assert.Equal(seq.Length, bat.Length);
+            int firstDiff = -1;
+            for (int i = 0; i < seq.Length; i++)
+                if (BitConverter.SingleToInt32Bits(seq[i]) != BitConverter.SingleToInt32Bits(bat[i]))
+                { firstDiff = i; break; }
+            Assert.True(firstDiff < 0,
+                $"Multi-chunk batched prefill diverges from sequential at index {firstDiff} " +
+                $"(N={N}, split at {k1}). Cross-chunk KV/GDN continuity or the startPos>0 " +
+                "path is not bit-identical to the sequential loop.");
+            Assert.Equal(Sampler.Greedy(seq), Sampler.Greedy(bat));
+        }
+        finally
+        {
+            CudaHybridGdnForwardPass.BatchedPrefillEnabled = prevBatched;
+            Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", prevCpuMoe);
+        }
+    }
+}

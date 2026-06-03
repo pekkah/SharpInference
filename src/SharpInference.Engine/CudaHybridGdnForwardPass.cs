@@ -423,6 +423,51 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     private bool _disposed;
 
+    // Prefill profiling (SHARPI_PREFILL_PROFILE=1): accumulate synchronous CPU-MoE
+    // wall time vs total Forward wall time to size the batching opportunity.
+    private static readonly bool _prefillProfile =
+        Environment.GetEnvironmentVariable("SHARPI_PREFILL_PROFILE") == "1";
+    private long _profMoeTicks;
+    private long _profTotalTicks;
+    private int _profTokens;
+
+    // ── Batched prefill (issue #110) ──────────────────────────────────────
+    // Per-layer batched prompt prefill for the CPU-MoE GDN-hybrid path. The
+    // trunk (attention + GDN) stays sequential per token (GDN recurrence and KV
+    // append are positional), but the routed MoE experts — 78-83% of prefill
+    // wall, DRAM-bound on mmap weight reads — are grouped by selected expert so
+    // each expert's weight rows are read once per chunk and dotted against every
+    // token routing to it, instead of re-reading per token. Byte-parity with the
+    // sequential path is preserved: the same DispatchDot/DispatchDotQ8K kernels
+    // run with identical per-token top-k accumulation order. Disable with
+    // SHARPI_BATCHED_PREFILL=0 (falls back to the sequential Forward loop).
+    // Settable (not readonly) so the A/B parity test can toggle batched vs
+    // sequential prefill within one process; resolved from the env at class load.
+    internal static bool BatchedPrefillEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_BATCHED_PREFILL") != "0";
+    private int _bCap;                 // token capacity the batched scratch is sized for (grow-only)
+    private Tensor? _gpuStreamAll;     // [N × embDim] inter-layer residual stream for all tokens
+    private float* _bResidAll;         // [bCap × embDim] pinned — per-token MoE residual (postBlock hidden)
+    private float* _bNormAll;          // [bCap × embDim] pinned — per-token post-attn-norm (MoE input)
+    private float* _bSharedAll;        // [bCap × embDim] pinned — per-token shared-expert out (unscaled)
+    private float* _bHiddenAll;        // [bCap × embDim] pinned — combined hidden, uploaded to _gpuStreamAll
+    private float* _bRoutedAll;        // [bCap × embDim] — routed-expert accumulator (host only)
+    private float* _bGateAll;          // [bCap × numActive × expertDim] — gate projections
+    private float* _bUpAll;            // [bCap × numActive × expertDim] — up projections
+    private float* _bDownPartial;      // [bCap × numActive × embDim] — per-(token,slot) down dots (pre-reduce)
+    private byte*  _bNormAllQ8K;       // [bCap × q8ksEmbBytes] — Q8_KS-packed norms (when q3k/q8_0 gate/up)
+    private byte*  _bGateAllQ8K;       // [bCap × numActive × q8ksExpBytes] — Q8_KS-packed silu'd gate slices
+    private int    _bQ8KEmbStride;     // Q8_KS bytes for an embDim row
+    private int    _bQ8KExpStride;     // Q8_KS bytes for an expertDim row
+    private int*   _bSelected;         // [bCap × numActive] — per-token selected experts
+    private float* _bWeights;          // [bCap × numActive] — per-token expert weights
+    private float* _bShexpScale;       // [bCap] — per-token shared-expert sigmoid gate
+    private int*   _bExpStart;         // [numExperts+1] — CSR offsets into _bExpTokI/_bExpTokK
+    private int*   _bExpCursor;        // [numExperts] — fill cursor (reused per layer)
+    private int*   _bExpTokI;          // [bCap × numActive] — token index, grouped by expert
+    private int*   _bExpTokK;          // [bCap × numActive] — slot (top-k rank), grouped by expert
+    private int*   _bUsedExperts;      // [numExperts] — compact list of experts with ≥1 token this layer
+
     public int VocabSize => _hp.VocabSize;
     public int MaxSeqLen => _maxSeqLen;
     public LayerPlacement Placement => _placement;
@@ -1139,6 +1184,37 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             EnsureSnapKvCaptureBuffer(W);
         }
 
+        // Issue #110: batched prompt prefill for the CPU-MoE path. Amortises the
+        // DRAM-bound routed-expert mmap reads across all prompt tokens. Falls back
+        // to the sequential loop below for single tokens, non-CPU-MoE configs, or
+        // when explicitly disabled.
+        //
+        // Two correctness guards gate the fast path (both fall back to the
+        // sequential loop, which has neither limitation):
+        //   • Length == startPos on both caches: the batched trunk writes the
+        //     attention KV at explicit slot `startPos + i` and advances the GDN
+        //     recurrence in token order, which is only equivalent to the
+        //     sequential `_kvCache.Length`-driven append when the caches sit
+        //     exactly at startPos. After a SnapKV compaction the physical KV
+        //     length diverges from the logical RoPE frame (kvPosition != position),
+        //     so the explicit-slot assumption breaks — defer to sequential.
+        //   • int-safe element counts: BatchedRoutedExperts indexes its scratch
+        //     with `int` element counts (e.g. SiLuMul over N×numActive×expertDim);
+        //     guard against silent truncation when chunking is disabled and the
+        //     chunk is enormous (SHARPI_PREFILL_CHUNK set very large).
+        bool batchedSafe = N >= 2
+            && _kvCache.Length == startPos
+            && _gdnStateCache.Length == startPos
+            && (long)N * _numActiveExperts * _expertDim <= int.MaxValue;
+        if (BatchedPrefillEnabled && _cpuMoe && batchedSafe)
+        {
+            ReadOnlySpan<float> bLogits = PrefillBatchedCpuMoe(tokens, startPos, snapKvActive, W, wStart);
+            _snapKvCaptureSlot = -1;
+            if (snapKvActive)
+                ApplySnapKvEviction(N, W, wStart);
+            return bLogits;
+        }
+
         ReadOnlySpan<float> logits = default;
         for (int i = 0; i < N; i++)
         {
@@ -1155,7 +1231,441 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             ApplySnapKvEviction(N, W, wStart);
         }
 
+        if (_prefillProfile && _profTokens > 0)
+            DumpPrefillProfile();
+
         return logits;
+    }
+
+    private void DumpPrefillProfile()
+    {
+        double totalMs = _profTotalTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        double moeMs   = _profMoeTicks   * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        Console.Error.WriteLine(
+            $"[prefill-profile] tokens={_profTokens} total={totalMs:F0}ms " +
+            $"({totalMs / _profTokens:F1}ms/tok) cpuMoe={moeMs:F0}ms ({100.0 * moeMs / totalMs:F0}%) " +
+            $"trunk+other={totalMs - moeMs:F0}ms ({100.0 * (totalMs - moeMs) / totalMs:F0}%)");
+        _profMoeTicks = _profTotalTicks = 0;
+        _profTokens = 0;
+    }
+
+    // =================================================================
+    //  Batched prefill (issue #110)
+    // =================================================================
+
+    /// <summary>
+    /// Grow-only allocation of the per-chunk batched-prefill scratch, sized for
+    /// <paramref name="N"/> tokens. Host buffers fed to <c>Download</c>/<c>UploadInto</c>
+    /// are pinned (cudaMallocHost); the routed-expert compute buffers and the
+    /// expert→token bucket arrays are plain native memory.
+    /// </summary>
+    private void EnsureBatchedScratch(int N)
+    {
+        int embDim = _embDim;
+
+        // _gpuStreamAll must match the chunk's exact element count (UploadInto
+        // requires whole-tensor match); chunks are 512 + a remainder, so this
+        // reallocates at most twice per prompt. Host scratch is grow-only.
+        if (_gpuStreamAll is not { } gs || gs.ElementCount != (long)N * embDim)
+        {
+            if (_gpuStreamAll is { } old) { _gpu.Free(old); _gpuStreamAll = null; }
+            _gpuStreamAll = _gpu.Allocate(TensorShape.D1((long)N * embDim));
+        }
+
+        if (N <= _bCap) return;
+
+        FreeBatchedHostScratch();
+
+        int na = _numActiveExperts;
+        long perTokEmb = (long)N * embDim;
+        long perTokSel = (long)N * na;
+
+        _bResidAll  = AllocPinnedL(perTokEmb);
+        _bNormAll   = AllocPinnedL(perTokEmb);
+        _bSharedAll = AllocPinnedL(perTokEmb);
+        _bHiddenAll = AllocPinnedL(perTokEmb);
+        _bRoutedAll = AllocL(perTokEmb);
+        _bGateAll   = AllocL(perTokSel * _expertDim);
+        _bUpAll     = AllocL(perTokSel * _expertDim);
+        _bDownPartial = AllocL(perTokSel * embDim);
+
+        _bSelected   = (int*)NativeMemory.Alloc((nuint)perTokSel * sizeof(int));
+        _bWeights    = AllocL(perTokSel);
+        _bShexpScale = AllocL(N);
+        _bExpTokI    = (int*)NativeMemory.Alloc((nuint)perTokSel * sizeof(int));
+        _bExpTokK    = (int*)NativeMemory.Alloc((nuint)perTokSel * sizeof(int));
+
+        if (_q3kQ8KEnabled || _q8_0Q8KEnabled)
+        {
+            _bQ8KEmbStride = SimdKernels.Q8KSScratchBytes(embDim);
+            _bQ8KExpStride = SimdKernels.Q8KSScratchBytes(_expertDim);
+            _bNormAllQ8K = (byte*)NativeMemory.Alloc((nuint)((long)N * _bQ8KEmbStride));
+            _bGateAllQ8K = (byte*)NativeMemory.Alloc((nuint)(perTokSel * _bQ8KExpStride));
+        }
+
+        // Per-expert bucket bookkeeping (sized by numExperts, allocated once).
+        if (_bExpStart == null)
+        {
+            _bExpStart    = (int*)NativeMemory.Alloc((nuint)(_numExperts + 1) * sizeof(int));
+            _bExpCursor   = (int*)NativeMemory.Alloc((nuint)_numExperts * sizeof(int));
+            _bUsedExperts = (int*)NativeMemory.Alloc((nuint)_numExperts * sizeof(int));
+        }
+
+        _bCap = N;
+    }
+
+    private static float* AllocL(long count) =>
+        (float*)NativeMemory.AllocZeroed((nuint)count * (nuint)sizeof(float));
+
+    private static float* AllocPinnedL(long count)
+    {
+        nint ptr = CudaBackend.AllocatePinnedHost((nuint)count * sizeof(float));
+        if (ptr == nint.Zero)
+            throw new InvalidOperationException($"AllocatePinnedHost({count} floats) failed for batched prefill scratch.");
+        return (float*)ptr;
+    }
+
+    private void FreeBatchedScratch()
+    {
+        if (_gpuStreamAll is { } s) { _gpu.Free(s); _gpuStreamAll = null; }
+        FreeBatchedHostScratch();
+    }
+
+    private void FreeBatchedHostScratch()
+    {
+        if (_bResidAll  != null) { CudaBackend.FreePinnedHost((nint)_bResidAll);  _bResidAll = null; }
+        if (_bNormAll   != null) { CudaBackend.FreePinnedHost((nint)_bNormAll);   _bNormAll = null; }
+        if (_bSharedAll != null) { CudaBackend.FreePinnedHost((nint)_bSharedAll); _bSharedAll = null; }
+        if (_bHiddenAll != null) { CudaBackend.FreePinnedHost((nint)_bHiddenAll); _bHiddenAll = null; }
+        if (_bRoutedAll != null) { NativeMemory.Free(_bRoutedAll); _bRoutedAll = null; }
+        if (_bGateAll   != null) { NativeMemory.Free(_bGateAll);   _bGateAll = null; }
+        if (_bUpAll     != null) { NativeMemory.Free(_bUpAll);     _bUpAll = null; }
+        if (_bDownPartial != null) { NativeMemory.Free(_bDownPartial); _bDownPartial = null; }
+        if (_bSelected   != null) { NativeMemory.Free(_bSelected);   _bSelected = null; }
+        if (_bWeights    != null) { NativeMemory.Free(_bWeights);    _bWeights = null; }
+        if (_bShexpScale != null) { NativeMemory.Free(_bShexpScale); _bShexpScale = null; }
+        if (_bExpTokI    != null) { NativeMemory.Free(_bExpTokI);    _bExpTokI = null; }
+        if (_bExpTokK    != null) { NativeMemory.Free(_bExpTokK);    _bExpTokK = null; }
+        if (_bNormAllQ8K != null) { NativeMemory.Free(_bNormAllQ8K); _bNormAllQ8K = null; }
+        if (_bGateAllQ8K != null) { NativeMemory.Free(_bGateAllQ8K); _bGateAllQ8K = null; }
+        _bCap = 0;
+    }
+
+    /// <summary>
+    /// Per-layer batched prompt prefill for the CPU-MoE GDN-hybrid path. The trunk
+    /// (attention / GDN) runs sequentially per token on the GPU exactly as in
+    /// <see cref="Forward"/> — the GDN recurrence and KV append are positional — but
+    /// the routed MoE experts run once batched per layer (<see cref="BatchedRoutedExperts"/>),
+    /// reading each selected expert's weight rows once and dotting them against every
+    /// token that routed to it. Produces bit-identical KV cache, GDN state, MTP hidden
+    /// history, and last-token logits as the sequential loop.
+    ///
+    /// <para><b>Not transactional.</b> The trunk mutates the GDN scan/conv state in
+    /// place and writes KV pages as it goes, but defers the <c>IncrementPosition</c>
+    /// bookkeeping to the end. A throw mid-chunk (e.g. a CUDA stream fault) therefore
+    /// leaves the recurrent GDN state partially advanced while the length counters
+    /// still read <paramref name="startPos"/> — the cache is NOT cleanly truncated as
+    /// it would be after a failed sequential <see cref="Forward"/>. The caller must
+    /// treat such a failure as fatal for this pass (discard it / reload the model);
+    /// retrying the prefill would run on poisoned recurrent state. In practice the
+    /// only throw sources past the entry guards are genuine CUDA/OOM faults, which
+    /// are fatal anyway.</para>
+    /// </summary>
+    private ReadOnlySpan<float> PrefillBatchedCpuMoe(IReadOnlyList<int> tokens, int startPos,
+                                                     bool snapKvActive, int W, int wStart)
+    {
+        int N = tokens.Count;
+        int embDim = _embDim;
+        int na = _numActiveExperts;
+        EnsureBatchedScratch(N);
+
+        // Hoisted out of the layer loop (CA2014: no stackalloc in a loop).
+        Span<int> sel = stackalloc int[na];
+        Span<float> wts = stackalloc float[na];
+
+        long t0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        long trunkTicks = 0, routerTicks = 0, routedTicks = 0, combineTicks = 0;
+
+        // 1. Embed every token into the residual-stream buffer + reserve KV blocks.
+        for (int i = 0; i < N; i++)
+        {
+            EmbedToken(_gpuHidden, tokens[i]);
+            _gpu.CopyDeviceRegion(_gpuStreamAll!, (long)i * embDim * sizeof(float),
+                                  _gpuHidden, 0, (long)embDim * sizeof(float));
+            _kvCache.ReserveBlockAt(startPos + i);
+        }
+
+        // 2. Trunk + batched MoE, layer by layer.
+        for (int layer = 0; layer < _hp.NumLayers; layer++)
+        {
+            bool isAttn = _hp.LayerTypes![layer] == LayerType.Attention;
+            long lt0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
+            // ── Trunk: sequential per token (GPU), queue D2H of resid/norm/shared.
+            for (int i = 0; i < N; i++)
+            {
+                _gpu.CopyDeviceRegion(_gpuHidden, 0, _gpuStreamAll!,
+                                      (long)i * embDim * sizeof(float), (long)embDim * sizeof(float));
+                _gpu.CopyDevice(_gpuResidual, _gpuHidden);
+                _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuAttnNorm[layer], _hp.RmsNormEps);
+
+                _snapKvCaptureSlot = (snapKvActive && i >= wStart) ? (i - wStart) : -1;
+
+                if (isAttn)
+                    GpuAttnBlockAt(layer, position: startPos + i, kvPosition: startPos + i,
+                                   normIn: _gpuNormBuf, hiddenOut: _gpuHidden);
+                else if (_cpuGdn)
+                    CpuGdnBlockAt(layer, position: startPos + i, normInGpu: _gpuNormBuf,
+                                  hiddenOutGpu: _gpuHidden, cpuNormScratch: _cpuNormBuf,
+                                  cpuHiddenScratch: _cpuHiddenOut);
+                else
+                    GpuGdnBlockAt(layer, position: startPos + i, normIn: _gpuNormBuf, hiddenOut: _gpuHidden);
+
+                _gpu.AddInPlace(_gpuHidden, _gpuResidual);           // postBlock (MoE residual)
+                _gpu.DownloadAsync(_gpuHidden, (nint)(_bResidAll + (long)i * embDim), embDim);
+
+                _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuPostAttnNorm[layer], _hp.RmsNormEps);
+                _gpu.DownloadAsync(_gpuNormBuf, (nint)(_bNormAll + (long)i * embDim), embDim);
+
+                // Shared expert (unscaled) — scale folded into the host combine.
+                // Kept in the trunk loop: the GPU compute is tiny and overlapping
+                // it with the routed-CPU work only shifts host launch overhead
+                // (issuing the launches), which is the real cost — no net win.
+                GpuMatMul(_gpuFfnGate, _gpuWGateShexp[layer], _gpuNormBuf);
+                GpuMatMul(_gpuFfnUp, _gpuWUpShexp[layer], _gpuNormBuf);
+                _gpu.SiLuMul(_gpuFfnGate, _gpuFfnUp);
+                GpuMatMul(_gpuSharedOut, _gpuWDownShexp[layer], _gpuFfnGate);
+                _gpu.DownloadAsync(_gpuSharedOut, (nint)(_bSharedAll + (long)i * embDim), embDim);
+            }
+            _snapKvCaptureSlot = -1;
+            _gpu.Synchronize();   // drain all queued D2H: resid/norm/shared now host-valid
+            long lt1 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
+            // ── Router + shared-expert gate per token (host).
+            var routerW = _cpuFfnGateInp![layer];
+            float* gateInpShexp = _cpuFfnGateInpShexp![layer];
+            for (int i = 0; i < N; i++)
+            {
+                float* normI = _bNormAll + (long)i * embDim;
+                SimdKernels.MatVec(_cpuRouterLogits, routerW.DataPtr, normI,
+                    _numExperts, embDim, routerW.DType);
+                SimdKernels.SoftmaxInPlace(_cpuRouterLogits, _numExperts);
+                SelectTopKPtr(_cpuRouterLogits, _numExperts, na, sel, wts, _hp.NormalizeMoeTopKWeights);
+                for (int k = 0; k < na; k++)
+                {
+                    _bSelected[(long)i * na + k] = sel[k];
+                    _bWeights[(long)i * na + k] = wts[k];
+                }
+                float dot = SimdKernels.DotF32(gateInpShexp, normI, embDim);
+                _bShexpScale[i] = 1.0f / (1.0f + MathF.Exp(-dot));
+            }
+
+            long lt2 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
+            // ── Batched routed experts (host, DRAM-amortized).
+            BatchedRoutedExperts(layer, N);
+
+            long lt3 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
+            // ── Combine on host: (routed + shared*scale) + resid, matching the
+            //    sequential AddInPlace(moe, shared) then GPU AddInPlace(hidden, resid)
+            //    operand order exactly. Upload the new residual stream to the GPU.
+            Parallel.For(0, N, s_moeParallelOpts, i =>
+            {
+                float* routed = _bRoutedAll + (long)i * embDim;
+                float* shared = _bSharedAll + (long)i * embDim;
+                float* resid  = _bResidAll  + (long)i * embDim;
+                float* outp   = _bHiddenAll + (long)i * embDim;
+                float scale   = _bShexpScale[i];
+                for (int r = 0; r < embDim; r++)
+                    outp[r] = (routed[r] + shared[r] * scale) + resid[r];
+            });
+            _gpu.UploadInto(_gpuStreamAll!, (nint)_bHiddenAll, (int)((long)N * embDim));
+            if (_prefillProfile)
+            {
+                long lt4 = System.Diagnostics.Stopwatch.GetTimestamp();
+                trunkTicks   += lt1 - lt0;
+                routerTicks  += lt2 - lt1;
+                routedTicks  += lt3 - lt2;
+                combineTicks += lt4 - lt3;
+            }
+        }
+
+        // 3. Advance the position counters by N (block table already reserved).
+        for (int i = 0; i < N; i++)
+        {
+            _kvCache.IncrementPosition();
+            _gdnStateCache.IncrementPosition();
+        }
+
+        // 4. MTP hidden history: _bHiddenAll holds the pre-output-norm hidden for
+        //    every token after the final layer — mirror into the absolute-position
+        //    history buffer so PrefillMtp can read h_{p-1}.
+        if (_hasMtp)
+        {
+            for (int i = 0; i < N; i++)
+                new ReadOnlySpan<float>(_bHiddenAll + (long)i * embDim, embDim).CopyTo(
+                    new Span<float>(_mtpPrefillHiddens + (long)(startPos + i) * embDim, embDim));
+            if (_mtpHiddenHistoryLength < startPos + N)
+                _mtpHiddenHistoryLength = startPos + N;
+
+            // Last token's pre-output-norm hidden — the MTP decoder reads
+            // LastHidden after prefill as the first draft's prevHidden. Mirror
+            // Forward's _lastHidden population so batched prefill drives MTP too.
+            new ReadOnlySpan<float>(_bHiddenAll + (long)(N - 1) * embDim, embDim).CopyTo(
+                new Span<float>(_lastHidden, embDim));
+        }
+
+        // 5. Last token: output norm + lm_head → logits.
+        _gpu.CopyDeviceRegion(_gpuHidden, 0, _gpuStreamAll!,
+                              (long)(N - 1) * embDim * sizeof(float), (long)embDim * sizeof(float));
+        _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuOutputNorm!, _hp.RmsNormEps);
+        _gpu.MatMul(_gpuLogits, _gpuOutputWeight!, _gpuHidden,
+            _gpuWeightDTypes.TryGetValue(_gpuOutputWeight!.Handle, out var outDt) ? outDt : DType.Float32);
+        _gpu.Download(_gpuLogits, _logitsBuf);
+
+        if (_prefillProfile)
+        {
+            double f = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            double total = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * f;
+            Console.Error.WriteLine(
+                $"[batched-prefill] N={N} total={total:F0}ms ({total / N:F1}ms/tok) " +
+                $"trunk={trunkTicks * f:F0}ms router={routerTicks * f:F0}ms " +
+                $"routedMoE={routedTicks * f:F0}ms combine={combineTicks * f:F0}ms");
+        }
+        return _logitsBuf;
+    }
+
+    /// <summary>
+    /// Batched routed-MoE FFN for <paramref name="N"/> prompt tokens at one layer.
+    /// Groups tokens by selected expert so each expert's gate/up/down weight rows are
+    /// read once per layer and dotted against every token routing to it (instead of
+    /// per-token re-reads — the DRAM bottleneck the sequential path hits). Output is
+    /// written to <see cref="_bRoutedAll"/>. Byte-parity with the per-token
+    /// <see cref="CpuMoeFfnCore"/> is preserved: identical dot kernels, identical
+    /// per-token top-k accumulation order in the final reduce.
+    /// </summary>
+    private void BatchedRoutedExperts(int layer, int N)
+    {
+        int embDim = _embDim;
+        int na = _numActiveExperts;
+        int expertDim = _expertDim;
+        int numExperts = _numExperts;
+
+        var gateExps = _cpuFfnGateExps![layer];
+        var upExps   = _cpuFfnUpExps![layer];
+        var downExps = _cpuFfnDownExps![layer];
+        byte* gateP = gateExps.DataPtr; byte* upP = upExps.DataPtr; byte* downP = downExps.DataPtr;
+        DType gateDt = gateExps.DType, upDt = upExps.DType, downDt = downExps.DType;
+
+        int bprG = (embDim    / DTypeInfo.BlockSize(gateDt)) * DTypeInfo.BytesPerBlock(gateDt);
+        int bprU = (embDim    / DTypeInfo.BlockSize(upDt))   * DTypeInfo.BytesPerBlock(upDt);
+        int bprD = (expertDim / DTypeInfo.BlockSize(downDt)) * DTypeInfo.BytesPerBlock(downDt);
+
+        bool useQ8KGate = (_q3kQ8KEnabled && gateDt == DType.Q3_K) || (_q8_0Q8KEnabled && gateDt == DType.Q8_0);
+        bool useQ8KUp   = (_q3kQ8KEnabled && upDt   == DType.Q3_K) || (_q8_0Q8KEnabled && upDt   == DType.Q8_0);
+        bool useQ8KDown = (_q3kQ8KEnabled && downDt == DType.Q3_K) || (_q8_0Q8KEnabled && downDt == DType.Q8_0);
+
+        // Bucket (token, slot) pairs by selected expert (CSR layout).
+        int* expStart = _bExpStart!; int* cursor = _bExpCursor!; int* used = _bUsedExperts!;
+        int* selected = _bSelected!;
+        for (int e = 0; e <= numExperts; e++) expStart[e] = 0;
+        long totalSel = (long)N * na;
+        for (long s = 0; s < totalSel; s++) expStart[selected[s] + 1]++;
+        for (int e = 0; e < numExperts; e++) expStart[e + 1] += expStart[e];
+        for (int e = 0; e < numExperts; e++) cursor[e] = expStart[e];
+        int* expTokI = _bExpTokI!; int* expTokK = _bExpTokK!;
+        for (int i = 0; i < N; i++)
+            for (int k = 0; k < na; k++)
+            {
+                int e = selected[(long)i * na + k];
+                int p = cursor[e]++;
+                expTokI[p] = i; expTokK[p] = k;
+            }
+        int numUsed = 0;
+        for (int e = 0; e < numExperts; e++)
+            if (expStart[e + 1] > expStart[e]) used[numUsed++] = e;
+
+        float* gateAll = _bGateAll!; float* upAll = _bUpAll!; float* downPartial = _bDownPartial!;
+        float* normAll = _bNormAll;
+        byte* normAllQ8K = _bNormAllQ8K; byte* gateAllQ8K = _bGateAllQ8K;
+        int q8kEmbStride = _bQ8KEmbStride, q8kExpStride = _bQ8KExpStride;
+
+        // Q8_KS-prepack each token's norm once (shared across all gate/up rows).
+        if (useQ8KGate || useQ8KUp)
+            Parallel.For(0, N, s_moeParallelOpts, i =>
+                SimdKernels.QuantizeRowToQ8KS(normAll + (long)i * embDim, embDim,
+                    normAllQ8K + (long)i * q8kEmbStride));
+
+        // Phase A: gate + up. Parallelize over (used expert, expert-row); read each
+        // weight row once, dot against every token routing to this expert.
+        int naL = na, expertDimL = expertDim, embDimL = embDim;
+        Parallel.For(0, numUsed * expertDim, s_moeParallelOpts, idx =>
+        {
+            int u = idx / expertDimL;
+            int r = idx % expertDimL;
+            int e = used[u];
+            byte* gateRow = gateP + (long)e * expertDimL * bprG + (long)r * bprG;
+            byte* upRow   = upP   + (long)e * expertDimL * bprU + (long)r * bprU;
+            for (int p = expStart[e]; p < expStart[e + 1]; p++)
+            {
+                int i = expTokI[p], k = expTokK[p];
+                long outIdx = ((long)i * naL + k) * expertDimL + r;
+                if (useQ8KGate)
+                    gateAll[outIdx] = DispatchDotQ8K(gateRow, normAllQ8K + (long)i * q8kEmbStride, embDimL, gateDt);
+                else
+                    gateAll[outIdx] = DispatchDot(gateRow, normAll + (long)i * embDimL, embDimL, gateDt);
+                if (useQ8KUp)
+                    upAll[outIdx] = DispatchDotQ8K(upRow, normAllQ8K + (long)i * q8kEmbStride, embDimL, upDt);
+                else
+                    upAll[outIdx] = DispatchDot(upRow, normAll + (long)i * embDimL, embDimL, upDt);
+            }
+        });
+
+        // Phase B: SiLU(gate) * up over the whole contiguous (token × slot × expertDim) block.
+        SimdKernels.SiLuMul(gateAll, upAll, (int)(totalSel * expertDim));
+
+        // Q8_KS-prepack each silu'd gate slice for the down dots.
+        if (useQ8KDown)
+            Parallel.For(0, (int)totalSel, s_moeParallelOpts, s =>
+                SimdKernels.QuantizeRowToQ8KS(gateAll + (long)s * expertDim, expertDim,
+                    gateAllQ8K + (long)s * q8kExpStride));
+
+        // Phase C: down. Parallelize over (used expert, emb-row); read each down row
+        // once, dot against every token's silu'd gate. Store unweighted partials.
+        Parallel.For(0, numUsed * embDim, s_moeParallelOpts, idx =>
+        {
+            int u = idx / embDimL;
+            int r = idx % embDimL;
+            int e = used[u];
+            byte* downRow = downP + (long)e * embDimL * bprD + (long)r * bprD;
+            for (int p = expStart[e]; p < expStart[e + 1]; p++)
+            {
+                int i = expTokI[p], k = expTokK[p];
+                long slot = (long)i * naL + k;
+                downPartial[slot * embDimL + r] = useQ8KDown
+                    ? DispatchDotQ8K(downRow, gateAllQ8K + slot * q8kExpStride, expertDimL, downDt)
+                    : DispatchDot(downRow, gateAll + slot * expertDimL, expertDimL, downDt);
+            }
+        });
+
+        // Phase C reduce: per token, sum the numActive weighted down partials in
+        // top-k order — bit-identical to the sequential `sum += w * dot` loop.
+        float* weights = _bWeights!; float* routedAll = _bRoutedAll!;
+        Parallel.For(0, N, s_moeParallelOpts, i =>
+        {
+            float* outp = routedAll + (long)i * embDimL;
+            for (int r = 0; r < embDimL; r++)
+            {
+                float sum = 0f;
+                for (int k = 0; k < naL; k++)
+                {
+                    long slot = (long)i * naL + k;
+                    sum += weights[slot] * downPartial[slot * embDimL + r];
+                }
+                outp[r] = sum;
+            }
+        });
     }
 
     /// <summary>
@@ -1482,6 +1992,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// <summary>Forward one token through the hybrid CUDA + CPU stack.</summary>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
+        long fwdT0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         // 1. Embedding → _gpuHidden
         EmbedToken(_gpuHidden, token);
 
@@ -1545,9 +2056,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 // Download already syncs the stream (CudaMemcpyAsync + StreamSynchronize),
                 // so an explicit Synchronize before it would just stall the host twice.
                 // Pinned overloads (issue #48): skip the _pinnedBuf staging hop.
+                long moeT0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 _gpu.Download(_gpuNormBuf, (nint)_cpuNormBuf, _embDim);
                 CpuMoeFfn(layer);
                 _gpu.UploadInto(_gpuHidden, (nint)_cpuMoeHidden, _embDim);
+                if (_prefillProfile)
+                    _profMoeTicks += System.Diagnostics.Stopwatch.GetTimestamp() - moeT0;
             }
             else
             {
@@ -1604,6 +2118,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         }
 
         if (_traceLayers) TraceLogits(position, _logitsBuf);
+
+        if (_prefillProfile)
+        {
+            _profTotalTicks += System.Diagnostics.Stopwatch.GetTimestamp() - fwdT0;
+            _profTokens++;
+        }
 
         return _logitsBuf;
     }
@@ -3328,6 +3848,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     {
         if (_disposed) return;
         _disposed = true;
+
+        // Batched-prefill scratch (issue #110).
+        FreeBatchedScratch();
+        if (_bExpStart    != null) NativeMemory.Free(_bExpStart);
+        if (_bExpCursor   != null) NativeMemory.Free(_bExpCursor);
+        if (_bUsedExperts != null) NativeMemory.Free(_bUsedExperts);
 
         // CPU buffers — _cpuNormBuf is pinned (issue #48).
         CudaBackend.FreePinnedHost((nint)_cpuNormBuf);

@@ -123,6 +123,60 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
     }
 
     /// <summary>
+    /// Prompt-prefill batch size, in tokens. A single <see cref="IForwardPass.Prefill"/> call is
+    /// opaque to the request's <see cref="CancellationToken"/> — the engine only checks <c>ct</c>
+    /// between decode tokens — so a large-prompt prefill would otherwise run to completion even
+    /// after the client has disconnected, pinning the engine gate and a CPU/GPU core for the dead
+    /// request. Splitting the prompt into chunks and checking <c>ct</c> between them makes prefill
+    /// cooperatively cancellable, bounding the post-disconnect compute to (at most) one chunk.
+    /// <para>
+    /// Chunking is numerically identical to a single prefill: a transformer forward produces one
+    /// independent output row per token (GEMM output rows don't mix across the token batch) and the
+    /// GDN recurrent state carries across calls via the cache — the same multi-call pattern the
+    /// prefix-reuse and canonical-snapshot prefill paths already rely on. Tunable via
+    /// <c>SHARPI_PREFILL_CHUNK</c> (set very large to effectively disable chunking, e.g. for
+    /// prefill throughput benchmarking).
+    /// </para>
+    /// </summary>
+    private static readonly int PrefillChunkSize =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPI_PREFILL_CHUNK"), out int c) && c > 0
+            ? c
+            : 512;
+
+    /// <summary>
+    /// Prefill the absolute token range <c>[from, to)</c> (where <c>tokens[i]</c> sits at cache
+    /// position <c>i</c>) in <see cref="PrefillChunkSize"/>-token chunks, checking
+    /// <paramref name="ct"/> before each chunk so a client disconnect aborts prefill promptly.
+    /// Returns the logits for the last processed token (the only ones a caller consumes).
+    /// </summary>
+    private ReadOnlySpan<float> PrefillChunked(int[] tokens, int from, int to, CancellationToken ct)
+    {
+        ReadOnlySpan<float> logits = default;
+        for (int pos = from; pos < to; pos += PrefillChunkSize)
+        {
+            ct.ThrowIfCancellationRequested();
+            int len = Math.Min(PrefillChunkSize, to - pos);
+            logits = _fwd.Prefill(new ArraySegment<int>(tokens, pos, len), pos);
+        }
+        return logits;
+    }
+
+    /// <summary>
+    /// Cancellation-checkpointed twin of <see cref="PrefillChunked"/> for the MTP attention KV
+    /// cache (issue #33). Same chunking rationale; populates one chunk per call so a disconnect
+    /// during MTP-prompt population is honored within one chunk.
+    /// </summary>
+    private void PrefillMtpChunked(int[] tokens, int from, int to, CancellationToken ct)
+    {
+        for (int pos = from; pos < to; pos += PrefillChunkSize)
+        {
+            ct.ThrowIfCancellationRequested();
+            int len = Math.Min(PrefillChunkSize, to - pos);
+            _fwd.PrefillMtp(new ArraySegment<int>(tokens, pos, len), pos);
+        }
+    }
+
+    /// <summary>
     /// Finds the longest page-aligned prefix shared between the new token array and the cached
     /// previous token array, returning its length (0 if no reusable prefix exists).
     /// </summary>
@@ -359,7 +413,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                     ReadOnlySpan<float> logits;
                     if (useCanonicalSnapshot)
                     {
-                        _fwd.Prefill(tokens[prefixLen..canonicalLen], prefixLen);
+                        PrefillChunked(tokens, prefixLen, canonicalLen, ct);
                         _fwd.CaptureSnapshot();
                         // Pair _prevTokens with the snapshot atomically: stage-2 failure or
                         // mid-decode cancellation now leaves snapshot + _prevTokens consistent
@@ -369,12 +423,12 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                         // turn — the next request could pass the snapshot-match check and
                         // TruncateTo to state that doesn't correspond to its prefix.
                         _prevTokens = tokens[..canonicalLen];
-                        logits = _fwd.Prefill(tokens[canonicalLen..], canonicalLen);
+                        logits = PrefillChunked(tokens, canonicalLen, tokens.Length, ct);
                     }
                     else
                     {
                         if (suffixTokens.Length > 0)
-                            logits = _fwd.Prefill(suffixTokens, prefixLen);
+                            logits = PrefillChunked(tokens, prefixLen, tokens.Length, ct);
                         else
                             logits = _fwd.Forward(tokens[^1], tokens.Length - 1);
                     }
@@ -392,7 +446,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                         // first decode-step MTP attention sees the full prompt context.
                         // ~1.6%/token overhead — only paid on MTP-enabled runs.
                         if (suffixTokens.Length > 0)
-                            _fwd.PrefillMtp(suffixTokens, prefixLen);
+                            PrefillMtpChunked(tokens, prefixLen, tokens.Length, ct);
 
                         var textDecMtp = new Utf8StreamDecoder();
 
@@ -557,10 +611,31 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
                 }
             }, ct);
 
-            await foreach (var chunk in channel.Reader.ReadAllAsync(ct).ConfigureAwait(false))
-                yield return chunk;
-
-            await genTask.ConfigureAwait(false); // re-throw any generation exception
+            try
+            {
+                await foreach (var chunk in channel.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+                    yield return chunk;
+            }
+            finally
+            {
+                // Issue #109: the background generation task drives the (non-thread-safe)
+                // forward pass + shared KV cache. We must wait for it to fully stop before
+                // releasing the gate — otherwise a cancelled/abandoned consumer (e.g. an
+                // agentic client that disconnects mid-decode and immediately fires the next
+                // request) would throw out of the await foreach above and release the gate
+                // while genTask is still inside _fwd.Forward(...), letting the next request
+                // reset/prefill the same cache concurrently and corrupt it (observed hang).
+                // genTask routes all exceptions through the channel (surfaced by the foreach),
+                // so awaiting it here only re-throws on the unobserved cancellation path,
+                // which we swallow — the original cause already propagates from the foreach.
+                try
+                {
+                    await genTask.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+            }
         }
         finally
         {
