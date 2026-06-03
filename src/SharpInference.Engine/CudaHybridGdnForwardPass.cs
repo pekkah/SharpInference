@@ -1907,10 +1907,42 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             byte* gateRow = gateP + (long)e * expertDimL * bprG + (long)r * bprG;
             byte* upRow   = upP   + (long)e * expertDimL * bprU + (long)r * bprU;
             int pStart = expStart[e], pEnd = expStart[e + 1];
-            // Issue #112: dot each gate/up row against the expert's tokens in PAIRS,
-            // decoding the (Q4_K/Q5_K/Q3_K) weight row once per pair. Bit-identical to
-            // the per-token dots (the 2In kernels mirror the single accumulation order).
+            // Issue #114: dot each gate/up row against the expert's tokens in QUADS,
+            // decoding the (Q4_K/Q3_K) weight row once per quad (decode/4). Then mop up
+            // remaining tokens in PAIRS (issue #112, decode/2) and a final single.
+            // Every tier is bit-identical to the per-token dot (the 4In/2In kernels
+            // mirror the single accumulation order) — only the unpack is amortized.
             int p = pStart;
+            for (; p + 3 < pEnd; p += 4)
+            {
+                int i0 = expTokI[p],     k0 = expTokK[p];
+                int i1 = expTokI[p + 1], k1 = expTokK[p + 1];
+                int i2 = expTokI[p + 2], k2 = expTokK[p + 2];
+                int i3 = expTokI[p + 3], k3 = expTokK[p + 3];
+                long o0 = ((long)i0 * naL + k0) * expertDimL + r;
+                long o1 = ((long)i1 * naL + k1) * expertDimL + r;
+                long o2 = ((long)i2 * naL + k2) * expertDimL + r;
+                long o3 = ((long)i3 * naL + k3) * expertDimL + r;
+                float a0, a1, a2, a3;
+                if (useQ8KGate)
+                    DispatchDotQ8K4In(gateRow, normAllQ8K + (long)i0 * q8kEmbStride,
+                        normAllQ8K + (long)i1 * q8kEmbStride, normAllQ8K + (long)i2 * q8kEmbStride,
+                        normAllQ8K + (long)i3 * q8kEmbStride, embDimL, gateDt, out a0, out a1, out a2, out a3);
+                else
+                    DispatchDot4In(gateRow, normAll + (long)i0 * embDimL, normAll + (long)i1 * embDimL,
+                        normAll + (long)i2 * embDimL, normAll + (long)i3 * embDimL, embDimL, gateDt,
+                        out a0, out a1, out a2, out a3);
+                gateAll[o0] = a0; gateAll[o1] = a1; gateAll[o2] = a2; gateAll[o3] = a3;
+                if (useQ8KUp)
+                    DispatchDotQ8K4In(upRow, normAllQ8K + (long)i0 * q8kEmbStride,
+                        normAllQ8K + (long)i1 * q8kEmbStride, normAllQ8K + (long)i2 * q8kEmbStride,
+                        normAllQ8K + (long)i3 * q8kEmbStride, embDimL, upDt, out a0, out a1, out a2, out a3);
+                else
+                    DispatchDot4In(upRow, normAll + (long)i0 * embDimL, normAll + (long)i1 * embDimL,
+                        normAll + (long)i2 * embDimL, normAll + (long)i3 * embDimL, embDimL, upDt,
+                        out a0, out a1, out a2, out a3);
+                upAll[o0] = a0; upAll[o1] = a1; upAll[o2] = a2; upAll[o3] = a3;
+            }
             for (; p + 1 < pEnd; p += 2)
             {
                 int i0 = expTokI[p],     k0 = expTokK[p];
@@ -1964,9 +1996,30 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             int e = used[u];
             byte* downRow = downP + (long)e * embDimL * bprD + (long)r * bprD;
             int pStart = expStart[e], pEnd = expStart[e + 1];
-            // Issue #112: down row dotted against the expert's silu'd-gate slices in
-            // PAIRS, decoding the weight row once per pair (bit-identical to per-token).
+            // Issue #114: down row dotted against the expert's silu'd-gate slices in
+            // QUADS (decode/4), then PAIRS (issue #112, decode/2), then a final single.
+            // Every tier is bit-identical to the per-token dot.
             int p = pStart;
+            for (; p + 3 < pEnd; p += 4)
+            {
+                long s0 = (long)expTokI[p]     * naL + expTokK[p];
+                long s1 = (long)expTokI[p + 1] * naL + expTokK[p + 1];
+                long s2 = (long)expTokI[p + 2] * naL + expTokK[p + 2];
+                long s3 = (long)expTokI[p + 3] * naL + expTokK[p + 3];
+                float d0, d1, d2, d3;
+                if (useQ8KDown)
+                    DispatchDotQ8K4In(downRow, gateAllQ8K + s0 * q8kExpStride,
+                        gateAllQ8K + s1 * q8kExpStride, gateAllQ8K + s2 * q8kExpStride,
+                        gateAllQ8K + s3 * q8kExpStride, expertDimL, downDt, out d0, out d1, out d2, out d3);
+                else
+                    DispatchDot4In(downRow, gateAll + s0 * expertDimL, gateAll + s1 * expertDimL,
+                        gateAll + s2 * expertDimL, gateAll + s3 * expertDimL, expertDimL, downDt,
+                        out d0, out d1, out d2, out d3);
+                downPartial[s0 * embDimL + r] = d0;
+                downPartial[s1 * embDimL + r] = d1;
+                downPartial[s2 * embDimL + r] = d2;
+                downPartial[s3 * embDimL + r] = d3;
+            }
             for (; p + 1 < pEnd; p += 2)
             {
                 long s0 = (long)expTokI[p]     * naL + expTokK[p];
@@ -3694,6 +3747,49 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             default:
                 v1 = DispatchDotQ8K(row, scr1, cols, dtype);
                 v2 = DispatchDotQ8K(row, scr2, cols, dtype);
+                break;
+        }
+    }
+
+    // Issue #114: dequant-once FOUR-input dispatch — register-tiled extension of
+    // DispatchDot2In. Decodes the quantized weight row ONCE and dots it against four
+    // token inputs (decode/4 vs the pairing's decode/2). Bit-identical to four
+    // DispatchDot calls (the 4In kernels mirror the single-input accumulator order;
+    // proven by the SimdKernelsQ8KSTests *_4In_BitwiseMatchesSingle oracles). Dtypes
+    // without a 4In kernel fall back to two 2In pairs — never worse than the prior
+    // pairing path, still correct.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void DispatchDot4In(byte* row, float* in0, float* in1, float* in2, float* in3,
+        int cols, DType dtype, out float v0, out float v1, out float v2, out float v3)
+    {
+        switch (dtype)
+        {
+            case DType.Q4_K:
+                SimdKernels.DotQ4K_4In(row, in0, in1, in2, in3, cols, out v0, out v1, out v2, out v3);
+                break;
+            default:
+                DispatchDot2In(row, in0, in1, cols, dtype, out v0, out v1);
+                DispatchDot2In(row, in2, in3, cols, dtype, out v2, out v3);
+                break;
+        }
+    }
+
+    // Issue #114: dequant-once four-input dispatch for the Q8_KS-prepacked path.
+    // Decodes the Q3_K weight row once and dots against four prepacked token inputs.
+    // Bit-identical to four DispatchDotQ8K calls. Other dtypes fall back to two 2In
+    // pairs (Q8_0 has no expensive unpack; this keeps it correct without regressing).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void DispatchDotQ8K4In(byte* row, byte* s0, byte* s1, byte* s2, byte* s3,
+        int cols, DType dtype, out float v0, out float v1, out float v2, out float v3)
+    {
+        switch (dtype)
+        {
+            case DType.Q3_K:
+                SimdKernels.DotQ3K_Q8KS_4In(row, s0, s1, s2, s3, cols, out v0, out v1, out v2, out v3);
+                break;
+            default:
+                DispatchDotQ8K2In(row, s0, s1, cols, dtype, out v0, out v1);
+                DispatchDotQ8K2In(row, s2, s3, cols, dtype, out v2, out v3);
                 break;
         }
     }
