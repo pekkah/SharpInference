@@ -63,7 +63,9 @@ public static class OpenAiEndpoints
 
         metrics.RecordRequest();
 
-        bool enableThinking = req.EnableThinking ?? true;
+        // Server-level DisableThinking (SHARPI_NO_THINKING) forces reasoning off regardless of
+        // the per-request enable_thinking flag — for agentic clients that never send it.
+        bool enableThinking = (req.EnableThinking ?? true) && !options.Value.DisableThinking;
         var adapter = chatTemplate.ToolCallAdapter;
 
         // Tool-aware rendering: if either tool definitions or a history-side

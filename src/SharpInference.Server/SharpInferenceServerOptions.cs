@@ -20,6 +20,12 @@ namespace SharpInference.Server;
 /// </summary>
 public sealed class SharpInferenceServerOptions
 {
+    /// <summary>
+    /// Globally disable reasoning for every request (server-side <c>--no-thinking</c> /
+    /// <c>SHARPI_NO_THINKING</c>). For agentic clients that never send the per-request opt-out.
+    /// </summary>
+    public bool DisableThinking { get; set; }
+
     // ── Model loading ────────────────────────────────────────────────────────
 
     /// <summary>

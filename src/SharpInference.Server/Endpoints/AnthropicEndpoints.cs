@@ -65,7 +65,10 @@ public static class AnthropicEndpoints
         // other value (including {"type":"enabled"}) leaves it on. BudgetTokens, when present,
         // maps to SamplingParams.MaxThinkingTokens — the engine force-closes the <think> block
         // once that many reasoning tokens have streamed.
-        bool enableThinking = req.Thinking?.Type != "disabled";
+        // Server-level DisableThinking (SHARPI_NO_THINKING) forces reasoning off regardless of
+        // the per-request thinking flag — for agentic clients (e.g. Claude Code) that never send
+        // thinking:{"type":"disabled"}.
+        bool enableThinking = req.Thinking?.Type != "disabled" && !options.Value.DisableThinking;
 
         var adapter = chatTemplate.ToolCallAdapter;
 
@@ -504,8 +507,9 @@ public static class AnthropicEndpoints
     private static List<(string role, string content)> BuildMessageList(AnthropicMessageRequest req)
     {
         var list = new List<(string, string)>();
-        if (req.System is { Length: > 0 })
-            list.Add(("system", req.System));
+        var systemText = ExtractTextContent(req.System);
+        if (!string.IsNullOrEmpty(systemText))
+            list.Add(("system", systemText));
         foreach (var m in req.Messages!)
         {
             var role = m.Role ?? "user";
@@ -529,8 +533,9 @@ public static class AnthropicEndpoints
     {
         var messages = new List<Dictionary<string, object?>>();
 
-        if (req.System is { Length: > 0 })
-            messages.Add(new() { ["role"] = "system", ["content"] = req.System });
+        var systemText = ExtractTextContent(req.System);
+        if (!string.IsNullOrEmpty(systemText))
+            messages.Add(new() { ["role"] = "system", ["content"] = systemText });
 
         foreach (var m in req.Messages!)
         {
@@ -679,7 +684,10 @@ public sealed record AnthropicMessageRequest(
     string? Model,
     AnthropicMessage[]? Messages,
     int MaxTokens,
-    string? System,
+    // Anthropic allows `system` to be either a plain string or an array of text content
+    // blocks (with cache_control) — Claude Code sends the array form. Accept both as a raw
+    // JsonElement and flatten via ExtractTextContent.
+    JsonElement? System,
     bool? Stream,
     float? Temperature,
     float? TopP,

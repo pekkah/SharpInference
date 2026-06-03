@@ -31,6 +31,15 @@ builder.Services.AddSharpInference(builder.Configuration, opts =>
 
     if (int.TryParse(Environment.GetEnvironmentVariable("SHARPI_N_GPU_LAYERS"), out int nGpuLayers))
         opts.NGpuLayers = nGpuLayers;
+
+    // SHARPI_NO_THINKING ∈ {1, true} globally disables reasoning (server-side --no-thinking),
+    // for agentic clients that never send the per-request opt-out.
+    var envNoThink = Environment.GetEnvironmentVariable("SHARPI_NO_THINKING");
+    if (!string.IsNullOrWhiteSpace(envNoThink)
+        && (envNoThink == "1" || envNoThink.Equals("true", StringComparison.OrdinalIgnoreCase)))
+    {
+        opts.DisableThinking = true;
+    }
 });
 
 var app = builder.Build();

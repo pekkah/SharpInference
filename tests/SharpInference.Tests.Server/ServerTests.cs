@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
+using SharpInference.Core;
 using SharpInference.Engine;
 using SharpInference.Server;
 using SharpInference.Server.Endpoints;
@@ -1055,6 +1056,62 @@ public sealed class ChatTemplateScrubTests
         var input = "<think>line 1\nline 2\nline 3</think>final answer";
         Assert.Equal("final answer", ChatTemplate.ScrubAssistantThinking(input));
     }
+
+    // ── Server-level DisableThinking (SHARPI_NO_THINKING) ──────────────────────
+
+    // Jinja template that records whether enable_thinking reached it, so the test can assert
+    // the rendered prompt the endpoint produced.
+    private const string ThinkProbeTemplate =
+        "{% if enable_thinking %}<<THINK>>{% else %}<<NOTHINK>>{% endif %}{% for m in messages %}{{ m.content }}{% endfor %}";
+
+    private static (HttpClient client, FakeInferenceEngine fake) ProbeClient(bool disableThinking)
+    {
+        var fake = new FakeInferenceEngine("m");
+        var renderer = new ChatTemplateRenderer("test", new JinjaChatTemplate(ThinkProbeTemplate));
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s =>
+            {
+                s.AddSingleton(renderer);                       // overrides the TryAddSingleton default
+                s.AddSingleton<IInferenceEngine>(fake);
+                s.Configure<SharpInferenceServerOptions>(o => o.DisableThinking = disableThinking);
+            }));
+        return (factory.CreateClient(), fake);
+    }
+
+    [Fact]
+    public async Task Anthropic_DisableThinking_ForcesNoThinking_EvenWhenRequestDoesNotOptOut()
+    {
+        var (client, fake) = ProbeClient(disableThinking: true);
+        // Request carries no thinking field → would normally enable thinking; the server flag wins.
+        var req = new { model = "m", max_tokens = 16, messages = new[] { new { role = "user", content = "hi" } } };
+        var resp = await client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        Assert.NotNull(fake.LastPrompt);
+        Assert.Contains("<<NOTHINK>>", fake.LastPrompt);
+        Assert.DoesNotContain("<<THINK>>", fake.LastPrompt);
+    }
+
+    [Fact]
+    public async Task Anthropic_ThinkingStaysOn_WhenServerFlagDisabledAndRequestDoesNotOptOut()
+    {
+        var (client, fake) = ProbeClient(disableThinking: false);
+        var req = new { model = "m", max_tokens = 16, messages = new[] { new { role = "user", content = "hi" } } };
+        var resp = await client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        Assert.NotNull(fake.LastPrompt);
+        Assert.Contains("<<THINK>>", fake.LastPrompt);
+    }
+
+    [Fact]
+    public async Task OpenAi_DisableThinking_ForcesNoThinking()
+    {
+        var (client, fake) = ProbeClient(disableThinking: true);
+        var req = new { model = "m", max_tokens = 16, messages = new[] { new { role = "user", content = "hi" } } };
+        var resp = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        Assert.NotNull(fake.LastPrompt);
+        Assert.Contains("<<NOTHINK>>", fake.LastPrompt);
+    }
 }
 
 /// <summary>
@@ -1100,6 +1157,9 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
     /// </summary>
     public string? LastCanonicalHistoryPrefix { get; private set; }
 
+    /// <summary>The rendered prompt handed to the most recent generation call.</summary>
+    public string? LastPrompt { get; private set; }
+
     public async IAsyncEnumerable<GenerateChunk> GenerateChunksAsync(
         string prompt,
         SamplingParams sp,
@@ -1108,6 +1168,7 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
     {
         LastSamplingParams = sp;
         LastCanonicalHistoryPrefix = canonicalHistoryPrefix;
+        LastPrompt = prompt;
         foreach (var (kind, text) in _script)
         {
             ct.ThrowIfCancellationRequested();
