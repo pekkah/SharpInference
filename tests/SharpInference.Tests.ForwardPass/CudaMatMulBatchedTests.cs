@@ -508,6 +508,51 @@ public sealed unsafe class CudaMatMulBatchedTests
     }
 
     [Fact]
+    public void AttentionSwaBatched_BitwiseMatchesSingle()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        int numHeads = 8, numKvHeads = 2, headDim = 256, maxSeqLen = 1024;
+        int qDim = numHeads * headDim, kvDim = numKvHeads * headDim;
+
+        foreach ((int startPos, int nTok, int window) in
+                 new[] { (0, 3, 8), (5, 17, 8), (37, 64, 512), (300, 40, 512) })
+        {
+            var rng = new Random(53 + startPos * 7 + nTok + window);
+            // KV cache: fill the positions that will be read; rest is irrelevant.
+            var kc = new float[(long)maxSeqLen * kvDim];
+            var vc = new float[(long)maxSeqLen * kvDim];
+            int filled = (startPos + nTok) * kvDim;
+            for (int i = 0; i < filled; i++) { kc[i] = (float)(rng.NextDouble() * 2 - 1); vc[i] = (float)(rng.NextDouble() * 2 - 1); }
+            var xAll = Rand(nTok * qDim, rng);
+
+            var gpuK = gpu.Upload(kc, TensorShape.D1((long)maxSeqLen * kvDim));
+            var gpuV = gpu.Upload(vc, TensorShape.D1((long)maxSeqLen * kvDim));
+            var gpuQ = gpu.Upload(xAll, TensorShape.D1((long)nTok * qDim));
+            var gpuOut = gpu.Allocate(TensorShape.D1((long)nTok * qDim));
+            gpu.AttentionSwaBatched(gpuQ, gpuK, gpuV, gpuOut, numHeads, numKvHeads, headDim,
+                startPos, window, maxSeqLen, nTok);
+            gpu.Synchronize();
+            var bat = new float[(long)nTok * qDim]; gpu.Download(gpuOut, bat);
+
+            var refs = new float[nTok][];
+            for (int t = 0; t < nTok; t++)
+            {
+                var xt = new float[qDim]; Array.Copy(xAll, (long)t * qDim, xt, 0, qDim);
+                var gx = gpu.Upload(xt, TensorShape.D1(qDim));
+                var go = gpu.Allocate(TensorShape.D1(qDim));
+                gpu.AttentionSwa(gx, gpuK, gpuV, go, null, startPos + t, window, headDim,
+                    numHeads, numKvHeads, maxSeqLen);
+                gpu.Synchronize();
+                refs[t] = new float[qDim]; gpu.Download(go, refs[t]);
+                gpu.Free(gx); gpu.Free(go);
+            }
+            gpu.Free(gpuK); gpu.Free(gpuV); gpu.Free(gpuQ); gpu.Free(gpuOut);
+            AssertRowsBitIdentical($"SWA startPos={startPos} nTok={nTok} window={window}", qDim, nTok, bat, refs);
+        }
+    }
+
+    [Fact]
     public void MatMulBatched_F32_BitwiseMatchesSequential()
     {
         using var gpu = TryCreate();

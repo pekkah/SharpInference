@@ -2562,6 +2562,96 @@ extern ""C"" __global__ void llm_attention_swa(
     }
 }
 
+// Batched sliding-window attention over N query tokens (Gemma 4 SWA layers in
+// batched-trunk prefill). Grid = (num_heads, n_tok); query token i sits at
+// absolute position start_pos+i and attends [max(0,pos+1-window), pos+1). The
+// window bounds eff_seq ≤ window_size, so the shared-scores path always suffices
+// (window_size ≤ MAX_STORED_SCORES required by the dispatch). Per (head, token)
+// this is bit-identical to the per-token llm_attention_swa.
+extern ""C"" __global__ void llm_attention_swa_batched(
+    const float* __restrict__ q_all,      // [n_tok, num_heads*head_dim]
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ out_all,          // [n_tok, num_heads*head_dim]
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int window_size, int max_seq_len, int n_tok)
+{
+    const int MAX_STORED_SCORES = 4096;
+    __shared__ float shared_scores[MAX_STORED_SCORES];
+    __shared__ float sdata[256];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int h = blockIdx.x;
+    int i = (int)blockIdx.y;
+    if ((int)h >= num_heads || i >= n_tok) return;
+
+    int window_end = start_pos + i + 1;
+    int window_start = window_end - window_size;
+    if (window_start < 0) window_start = 0;
+    int eff_seq = window_end - window_start;
+    if (eff_seq <= 0) return;
+
+    int kv_head = (int)h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = rsqrtf((float)head_dim);
+    int q_dim = num_heads * head_dim;
+    const float* q = q_all + (long)i * q_dim;
+    float* out = out_all + (long)i * q_dim;
+    long q_off = (long)h * (long)head_dim;
+    long out_off = q_off;
+
+    for (int t = (int)tid; t < eff_seq; t += 256) {
+        int abs_t = t + window_start;
+        float dot = 0.f;
+        long k_off = (long)abs_t * (long)kv_dim + (long)kv_head * (long)head_dim;
+        for (int dd = 0; dd < head_dim; dd++)
+            dot += q[q_off + dd] * k_cache[k_off + dd];
+        shared_scores[t] = dot * scale;
+    }
+    __syncthreads();
+
+    float local_max = sharpi_neg_inf();
+    for (int t = (int)tid; t < eff_seq; t += 256)
+        local_max = fmaxf(local_max, shared_scores[t]);
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
+
+    float local_sum = 0.f;
+    for (int t = (int)tid; t < eff_seq; t += 256) {
+        float ev = __expf(shared_scores[t] - max_val);
+        shared_scores[t] = ev;
+        local_sum += ev;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+    __syncthreads();
+
+    for (int t = (int)tid; t < eff_seq; t += 256)
+        shared_scores[t] *= inv_sum;
+    __syncthreads();
+
+    for (int dd = (int)tid; dd < head_dim; dd += 256) {
+        float acc = 0.f;
+        for (int t = 0; t < eff_seq; t++) {
+            int abs_t = t + window_start;
+            long v_off = (long)abs_t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            acc += shared_scores[t] * v_cache[v_off + dd];
+        }
+        out[out_off + dd] = acc;
+    }
+}
+
 // ── Scaled dot-product attention with GQA (bf16 K/V cache) ─────────────────
 // Bit-for-bit copy of `llm_attention` except K/V cache is read as bfloat16
 // (stored as raw unsigned short, decoded via sharpi_bf16_to_fp32). Score

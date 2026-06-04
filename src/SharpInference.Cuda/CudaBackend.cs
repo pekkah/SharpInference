@@ -159,6 +159,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // Gemma 4 (Phase 7): sliding-window attention, tanh-GELU FFN, final-logit
     // softcap. Kernel work only — forward-pass wiring lands in Phase 8.
     private nint   _attentionSwaKernel;
+    private nint   _attentionSwaBatchedKernel;
     private nint   _geluTanhMulKernel;
     private nint   _softcapKernel;
     private nint   _clearF32Kernel;
@@ -2251,6 +2252,39 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>
+    /// Batched <see cref="AttentionSwa"/> over <paramref name="nTok"/> query tokens
+    /// (Gemma 4 SWA layers in batched-trunk prefill). Query token <c>i</c> sits at
+    /// absolute position <c>startPos+i</c> and attends its sliding window. The window
+    /// bounds eff_seq ≤ <paramref name="windowSize"/>, so the shared-scores path always
+    /// suffices (windowSize ≤ 4096 required). Bit-identical per (head, token) to the
+    /// per-token kernel — no global scores scratch needed.
+    /// </summary>
+    public void AttentionSwaBatched(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
+        int numHeads, int numKvHeads, int headDim,
+        int startPos, int windowSize, int maxSeqLen, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (windowSize <= 0 || windowSize > 4096)
+            throw new ArgumentException(
+                $"AttentionSwaBatched requires 0 < windowSize ≤ 4096 (shared-scores path); got {windowSize}.",
+                nameof(windowSize));
+
+        nint qP = GetDevPtr(qAll), kP = GetDevPtr(kCache), vP = GetDevPtr(vCache), oP = GetDevPtr(outAll);
+        int pNH = numHeads, pNKV = numKvHeads, pHD = headDim;
+        int pSP = startPos, pWS = windowSize, pMSL = maxSeqLen, pN = nTok;
+        nint* args = stackalloc nint[11]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pSP), (nint)(&pWS), (nint)(&pMSL), (nint)(&pN)
+        };
+        int r = NvrtcInterop.LaunchKernel(_attentionSwaBatchedKernel, (uint)numHeads, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_swa_batched) failed: {r}");
+    }
+
+    /// <summary>
     /// Bf16-store variant of <see cref="KvAppend"/>. Inputs stay fp32; the K/V
     /// cache tensors must be <see cref="DType.BFloat16"/>-allocated (half the
     /// element count of an fp32 cache). See issue #27.
@@ -3492,7 +3526,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _matvecF32GemmNKernel, _matvecQ4KGemmNKernel, _matvecQ5KGemmNKernel, _matvecQ6KGemmNKernel,
             _rmsNormBatchedKernel, _headNormBatchedKernel,
             _splitQgBatchedKernel, _ropeNeoxPartialBatchedKernel,
-            _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel,
+            _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel, _attentionSwaBatchedKernel,
             _geluTanhMulKernel, _softcapKernel,
             _clearF32Kernel, _quantizeQ81Kernel,
             _scaleRowsKernel, _moeWeightedReduceKernel,
@@ -3570,6 +3604,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _attentionKernel       = GetKernelFunc("llm_attention");
         _attentionBf16Kernel   = GetKernelFunc("llm_attention_bf16");
         _attentionSwaKernel    = GetKernelFunc("llm_attention_swa");
+        _attentionSwaBatchedKernel = GetKernelFunc("llm_attention_swa_batched");
         _geluTanhMulKernel     = GetKernelFunc("llm_gelu_tanh_mul");
         _softcapKernel         = GetKernelFunc("llm_softcap_inplace");
         _clearF32Kernel        = GetKernelFunc("llm_clear_f32");
