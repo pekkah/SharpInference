@@ -3489,8 +3489,9 @@ extern ""C"" __global__ void llm_full_seq_attention_bf16(
 // V-weighted sum) is identical to `llm_attention`'s global-scratch path (the
 // per-position >4096 fallback this replaces). `score_stride` must be ≥ the
 // largest seq_len any query in this launch reaches (start_pos + n_tok). The host
-// drives this in waves of n_tok queries chosen so the scratch fits a bounded
-// budget — see CudaBackend.AttentionBatchedWave.
+// drives this in waves of W ≤ n_tok queries (W chosen so the scratch fits a
+// bounded budget; each launch's n_tok == that wave's width) — see
+// CudaBackend.AttentionBatchedWave.
 extern ""C"" __global__ void llm_full_seq_attention_global(
     const float* __restrict__ q_all,      // [n_tok, num_heads*head_dim]
     const float* __restrict__ k_cache,

@@ -1290,8 +1290,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // the FFN/MoE stage differs (per-token GPU/CPU FFN or GPU-SLRU routed experts).
         // Gated on the GPU-GDN trunk (the batched kernels require it) and the trunk-batch
         // toggle (the whole value here is the batched trunk; SHARPI_BATCHED_TRUNK=0 falls
-        // through to the sequential per-token loop below, the parity reference).
-        if (BatchedPrefillEnabled && BatchedTrunkEnabled && !_cpuGdn && trunkBatchSafe)
+        // through to the sequential per-token loop below, the parity reference). The
+        // `!_cpuMoe` clause is load-bearing: a CPU-MoE chunk that tripped the int-overflow
+        // guard above (cpuMoeBatchSafe false, trunkBatchSafe true) must NOT land here —
+        // PrefillBatchedTrunkGpuFfn dispatches GpuMoeFfn, whose SLRU manager is null on the
+        // CPU-MoE path. It falls through to the sequential per-token loop instead.
+        if (BatchedPrefillEnabled && BatchedTrunkEnabled && !_cpuGdn && !_cpuMoe && trunkBatchSafe)
         {
             ReadOnlySpan<float> gLogits = PrefillBatchedTrunkGpuFfn(tokens, startPos, snapKvActive, W, wStart);
             _snapKvCaptureSlot = -1;
@@ -1339,12 +1343,6 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // =================================================================
 
     /// <summary>
-    /// Grow-only allocation of the per-chunk batched-prefill scratch, sized for
-    /// <paramref name="N"/> tokens. Host buffers fed to <c>Download</c>/<c>UploadInto</c>
-    /// are pinned (cudaMallocHost); the routed-expert compute buffers and the
-    /// expert→token bucket arrays are plain native memory.
-    /// </summary>
-    /// <summary>
     /// Exact-size (re)allocation of the inter-layer residual-stream device buffer
     /// <see cref="_gpuStreamAll"/> for N tokens. <c>UploadInto</c> requires a whole-tensor
     /// element-count match, so chunks of differing length reallocate (at most twice per
@@ -1362,6 +1360,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         }
     }
 
+    /// <summary>
+    /// Grow-only allocation of the per-chunk CPU-MoE batched-prefill scratch, sized for
+    /// <paramref name="N"/> tokens (calls <see cref="EnsureStreamAll"/> first). Host buffers
+    /// fed to <c>Download</c>/<c>UploadInto</c> are pinned (cudaMallocHost); the routed-expert
+    /// compute buffers and the expert→token bucket arrays are plain native memory.
+    /// </summary>
     private void EnsureBatchedScratch(int N)
     {
         int embDim = _embDim;

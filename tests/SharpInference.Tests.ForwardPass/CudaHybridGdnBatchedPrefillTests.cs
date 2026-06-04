@@ -475,6 +475,134 @@ public sealed class CudaHybridGdnBatchedPrefillTests
     }
 
     /// <summary>
+    /// Issue #119 (coverage): the dense <c>PrefillBatchedTrunkGpuFfn</c> path across two
+    /// chunks (<c>[0,k)</c> then <c>[k,N)</c> with <c>startPos=k</c>). Exercises the paths
+    /// the single-chunk dense test misses — <c>startPos &gt; 0</c>, cross-chunk KV/GDN
+    /// continuity, and the exact-size <c>EnsureStreamAll</c> reallocation between two chunks
+    /// of different length (the realloc that historically produced the UploadInto
+    /// element-count mismatch). Final-token logits must be bit-identical to the sequential
+    /// per-token <c>Forward</c> loop.
+    /// </summary>
+    [Fact]
+    public void BatchedTrunkGpuFfn_MultiChunk_BitwiseMatchesSequential_Dense27BMtp()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindDense27BMtpPath();
+        if (path is null) return;
+
+        bool prevBatched = CudaHybridGdnForwardPass.BatchedPrefillEnabled;
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            if (hp.IsMoE) return;
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+            var placement = new LayerPlacement(
+                GpuLayers: hp.NumLayers, CpuLayers: 0, GpuWeightBytes: 0, GpuKvBytes: 0,
+                RecommendedCtxSize: Math.Min(hp.ContextLength, 4096));
+            var tokens = tokenizer.Encode(
+                "The quick brown fox jumps over the lazy dog. " +
+                "Pack my box with five dozen liquor jugs. " +
+                "How razorback-jumping frogs can level six piqued gymnasts! " +
+                "The five boxing wizards jump quickly. Sphinx of black quartz, judge my vow.");
+            int N = tokens.Count;
+            Assert.True(N >= 12, $"Prompt tokenized to only {N} tokens.");
+            int k1 = N / 3;
+
+            float[] RunTwoChunks(bool batched)
+            {
+                CudaHybridGdnForwardPass.BatchedPrefillEnabled = batched;
+                using var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
+                fwd.Prefill(tokens.Take(k1).ToList(), 0);
+                return fwd.Prefill(tokens.Skip(k1).ToList(), k1).ToArray();
+            }
+
+            float[] seq = RunTwoChunks(false);
+            float[] bat = RunTwoChunks(true);
+
+            Assert.Equal(seq.Length, bat.Length);
+            int firstDiff = -1;
+            for (int i = 0; i < seq.Length; i++)
+                if (BitConverter.SingleToInt32Bits(seq[i]) != BitConverter.SingleToInt32Bits(bat[i]))
+                { firstDiff = i; break; }
+            Assert.True(firstDiff < 0,
+                $"Dense multi-chunk batched-trunk prefill diverges from sequential at index {firstDiff} " +
+                $"(N={N}, split at {k1}). Cross-chunk KV/GDN continuity or the startPos>0 path " +
+                "(EnsureStreamAll realloc) is not bit-identical to the sequential loop.");
+            Assert.Equal(Sampler.Greedy(seq), Sampler.Greedy(bat));
+        }
+        finally
+        {
+            CudaHybridGdnForwardPass.BatchedPrefillEnabled = prevBatched;
+        }
+    }
+
+    /// <summary>
+    /// Issue #119 (coverage): SnapKV-active prefill on the dense <c>PrefillBatchedTrunkGpuFfn</c>
+    /// path. SnapKV (issue #58) forces the per-position Q-capture loop inside
+    /// <c>AttnBlockBatched</c> even under batched prefill — a fully reachable branch the
+    /// happy-path dense test skips. With a long-enough prompt and a small
+    /// <c>SHARPI_SNAPKV_BUDGET</c> the batched path must still return final-token logits
+    /// bit-identical to the sequential per-token <c>Forward</c> loop (both capture Q and
+    /// evict identically).
+    /// </summary>
+    [Fact]
+    public void BatchedTrunkGpuFfn_SnapKvActive_BitwiseMatchesSequential_Dense27BMtp()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindDense27BMtpPath();
+        if (path is null) return;
+
+        var prevSnap = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_BUDGET");
+        Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", "128");
+        bool prevBatched = CudaHybridGdnForwardPass.BatchedPrefillEnabled;
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            if (hp.IsMoE) return;
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+            var placement = new LayerPlacement(
+                GpuLayers: hp.NumLayers, CpuLayers: 0, GpuWeightBytes: 0, GpuKvBytes: 0,
+                RecommendedCtxSize: Math.Min(hp.ContextLength, 4096));
+            // Prompt comfortably longer than the 128-token budget so SnapKV engages.
+            var tokens = LongPrompt(tokenizer, 400);
+            Assert.True(tokens.Count > 128);
+
+            float[] Run(bool batched)
+            {
+                CudaHybridGdnForwardPass.BatchedPrefillEnabled = batched;
+                using var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
+                var logits = fwd.Prefill(tokens).ToArray();
+                // Cache shrinks to exactly the budget post-eviction → confirms SnapKV
+                // actually engaged (otherwise the test would be vacuous).
+                Assert.Equal(128, fwd.Cache.Length);
+                return logits;
+            }
+
+            float[] seq = Run(false);
+            float[] bat = Run(true);
+
+            Assert.Equal(seq.Length, bat.Length);
+            int firstDiff = -1;
+            for (int i = 0; i < seq.Length; i++)
+                if (BitConverter.SingleToInt32Bits(seq[i]) != BitConverter.SingleToInt32Bits(bat[i]))
+                { firstDiff = i; break; }
+            Assert.True(firstDiff < 0,
+                $"SnapKV-active dense batched-trunk prefill diverges from sequential at index {firstDiff}. " +
+                "The per-position Q-capture path under batched prefill must be bit-identical to the sequential loop.");
+            Assert.Equal(Sampler.Greedy(seq), Sampler.Greedy(bat));
+        }
+        finally
+        {
+            CudaHybridGdnForwardPass.BatchedPrefillEnabled = prevBatched;
+            Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", prevSnap);
+        }
+    }
+
+    /// <summary>
     /// Issue #119: batched-trunk prefill for the <b>GPU-SLRU MoE</b> path — a GDN-hybrid
     /// MoE model forced onto the on-GPU routed-expert path with <c>SHARPI_CPU_MOE=0</c>
     /// (<c>_cpuMoe == false</c>; routed experts run via <c>GpuMoeFfn</c> per token). The
@@ -511,14 +639,22 @@ public sealed class CudaHybridGdnBatchedPrefillTests
             float[] RunOrNull(bool batched)
             {
                 CudaHybridGdnForwardPass.BatchedPrefillEnabled = batched;
+                CudaHybridGdnForwardPass fwd;
                 try
                 {
-                    using var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
+                    // Only construction is allowed to skip (a box without the VRAM to host
+                    // this 22 GB model under GPU-SLRU, or a config this class can't load).
+                    // A failure inside Prefill itself must FAIL the test, not silently skip —
+                    // that is exactly the kind of regression this oracle exists to catch.
+                    fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
+                }
+                catch (NotSupportedException) { return Array.Empty<float>(); }
+                catch (InvalidOperationException) { return Array.Empty<float>(); } // OOM / VRAM at construction
+                using (fwd)
+                {
                     if (fwd.IsMoeOnCpu) return Array.Empty<float>(); // not the SLRU path on this box
                     return fwd.Prefill(tokens).ToArray();
                 }
-                catch (NotSupportedException) { return Array.Empty<float>(); }
-                catch (InvalidOperationException) { return Array.Empty<float>(); } // OOM / VRAM
             }
 
             float[] seq = RunOrNull(false);
