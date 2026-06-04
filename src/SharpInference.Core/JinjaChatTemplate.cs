@@ -993,6 +993,9 @@ public sealed class JinjaChatTemplate
         if (obj is not System.Collections.IList list) return null;
         int count  = list.Count;
         int stepN  = step  != null ? (int)ToLong(step)  : 1;
+        // A zero step would spin forever in the loops below (i += 0). Match Jinja/Python
+        // (and our own range()) by rejecting it rather than hanging.
+        if (stepN == 0) throw new InvalidOperationException("slice step cannot be zero");
         int startN = start != null ? (int)ToLong(start) : (stepN >= 0 ? 0 : count - 1);
         int stopN  = stop  != null ? (int)ToLong(stop)  : (stepN >= 0 ? count : -count - 1);
 

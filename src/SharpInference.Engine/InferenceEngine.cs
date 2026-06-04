@@ -692,8 +692,10 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
         // Stop any in-flight worker, then wait for it to release the gate before freeing
         // _fwd — see DrainNote on DisposeAsync.
         _shutdownCts.Cancel();
+        // Don't release after acquiring: we're about to dispose the gate, and releasing it
+        // would let a queued waiter whose cancellation hasn't yet propagated slip in and
+        // touch _fwd as it's freed. Holding the permit guarantees exclusivity through teardown.
         bool drained = _gate.Wait(_disposeDrainTimeout);
-        if (drained) _gate.Release();
         DisposeCore(drained);
     }
 
@@ -715,8 +717,8 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
         // returns in well under one forward. The timeout is only a backstop against a wedged
         // backend or a consumer that abandoned its enumerator without disposing it (which
         // would otherwise strand the gate forever).
+        // See Dispose(): keep the permit held through teardown rather than releasing it.
         bool drained = await _gate.WaitAsync(_disposeDrainTimeout).ConfigureAwait(false);
-        if (drained) _gate.Release();
         DisposeCore(drained);
     }
 

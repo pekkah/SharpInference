@@ -302,6 +302,15 @@ public sealed class JinjaChatTemplateTests
     }
 
     [Fact]
+    public void Slice_StepZero_Throws() =>
+        // A zero step must throw rather than spin forever in GetSlice (matches range(…, 0)).
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            var ctx = new Dictionary<string, object?> { ["xs"] = new List<object?> { 1L, 2L, 3L } };
+            Render("{% for x in xs[::0] %}{{ x }}{% endfor %}", ctx);
+        });
+
+    [Fact]
     public void Index_OnArrayOfTypedDicts_Resolves()
     {
         // The fix matches System.Collections.IList, which covers T[] too — pin the array claim.
