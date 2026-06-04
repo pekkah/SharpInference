@@ -967,7 +967,12 @@ public sealed class JinjaChatTemplate
     {
         switch (obj)
         {
-            case List<object?> list:
+            // Match the non-generic IList so any List<T> / array works — not just
+            // List<object?>. C# generic invariance means List<Dictionary<string,object?>>
+            // (the natural shape a C# caller builds a message list with) is NOT assignable
+            // to List<object?>, so a List<object?>-only match silently fell through to
+            // `default: return null`, dropping e.g. messages[0] and the system block (#131).
+            case System.Collections.IList list:
             {
                 int i = (int)ToLong(idx);
                 if (i < 0) i += list.Count;
@@ -983,9 +988,14 @@ public sealed class JinjaChatTemplate
 
     private static object? GetSlice(object? obj, object? start, object? stop, object? step)
     {
-        if (obj is not List<object?> list) return null;
+        // See GetIndex (#131): match the non-generic IList so List<Dictionary<…>> and
+        // arrays slice correctly, not just List<object?>.
+        if (obj is not System.Collections.IList list) return null;
         int count  = list.Count;
         int stepN  = step  != null ? (int)ToLong(step)  : 1;
+        // A zero step would spin forever in the loops below (i += 0). Match Jinja/Python
+        // (and our own range()) by rejecting it rather than hanging.
+        if (stepN == 0) throw new InvalidOperationException("slice step cannot be zero");
         int startN = start != null ? (int)ToLong(start) : (stepN >= 0 ? 0 : count - 1);
         int stopN  = stop  != null ? (int)ToLong(stop)  : (stepN >= 0 ? count : -count - 1);
 

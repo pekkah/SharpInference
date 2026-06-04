@@ -225,4 +225,118 @@ public sealed class JinjaChatTemplateTests
         Assert.Equal("a,b,", Render("{% for k in d.keys() %}{{ k }},{% endfor %}", ctx));
         Assert.Equal("1,2,", Render("{% for v in d.values() %}{{ v }},{% endfor %}", ctx));
     }
+
+    // ── Index/slice on naturally-typed C# lists (issue #131) ─────────────────────
+    // GetIndex / GetSlice used to match only List<object?>. A C# caller naturally builds
+    // a messages list as List<Dictionary<string,object?>>, which (generic invariance) is
+    // NOT a List<object?>, so messages[0] returned null and templates that branch on
+    // messages[0].role == 'system' silently dropped the system block.
+
+    [Fact]
+    public void Index_OnListOfTypedDicts_ResolvesElementAndAttr()
+    {
+        var ctx = new Dictionary<string, object?>
+        {
+            // The "obvious" C# shape — typed list of typed dicts, not List<object?>.
+            ["messages"] = new List<Dictionary<string, object?>>
+            {
+                new() { ["role"] = "system", ["content"] = "You are Ayu." },
+                new() { ["role"] = "user",   ["content"] = "hi" },
+            },
+        };
+        Assert.Equal("system", Render("{{ messages[0].role }}", ctx));
+        Assert.Equal("hi", Render("{{ messages[1].content }}", ctx));
+        // Negative index wraps from the end (the GetIndex path under test).
+        Assert.Equal("user", Render("{{ messages[-1].role }}", ctx));
+    }
+
+    [Fact]
+    public void SystemBlockBranch_OnListOfTypedDicts_IsNotDropped()
+    {
+        // The exact failure shape from issue #131: a Qwen3-style template guarding the
+        // system block on messages[0].role == 'system'.
+        const string src =
+            "{% if messages[0].role == 'system' %}<sys>{{ messages[0].content }}</sys>{% endif %}" +
+            "{% for m in messages %}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{% endfor %}";
+        var ctx = new Dictionary<string, object?>
+        {
+            ["messages"] = new List<Dictionary<string, object?>>
+            {
+                new() { ["role"] = "system", ["content"] = "S" },
+                new() { ["role"] = "user",   ["content"] = "U" },
+            },
+        };
+        Assert.Equal("<sys>S</sys><system>S</system><user>U</user>", Render(src, ctx));
+    }
+
+    [Fact]
+    public void Slice_OnListOfTypedDicts_DropsFirstElement()
+    {
+        // messages[1:] is the common "skip the system message" idiom — exercises GetSlice.
+        var ctx = new Dictionary<string, object?>
+        {
+            ["messages"] = new List<Dictionary<string, object?>>
+            {
+                new() { ["role"] = "system", ["content"] = "S" },
+                new() { ["role"] = "user",   ["content"] = "U" },
+                new() { ["role"] = "assistant", ["content"] = "A" },
+            },
+        };
+        Assert.Equal("U,A,", Render("{% for m in messages[1:] %}{{ m.content }},{% endfor %}", ctx));
+    }
+
+    [Fact]
+    public void Slice_NegativeStop_OnListOfTypedDicts_DropsLastElement()
+    {
+        // messages[:-1] — negative-stop arithmetic is the error-prone part of GetSlice.
+        var ctx = new Dictionary<string, object?>
+        {
+            ["messages"] = new List<Dictionary<string, object?>>
+            {
+                new() { ["content"] = "A" },
+                new() { ["content"] = "B" },
+                new() { ["content"] = "C" },
+            },
+        };
+        Assert.Equal("A,B,", Render("{% for m in messages[:-1] %}{{ m.content }},{% endfor %}", ctx));
+    }
+
+    [Fact]
+    public void Slice_StepZero_Throws() =>
+        // A zero step must throw rather than spin forever in GetSlice (matches range(…, 0)).
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            var ctx = new Dictionary<string, object?> { ["xs"] = new List<object?> { 1L, 2L, 3L } };
+            Render("{% for x in xs[::0] %}{{ x }}{% endfor %}", ctx);
+        });
+
+    [Fact]
+    public void Index_OnArrayOfTypedDicts_Resolves()
+    {
+        // The fix matches System.Collections.IList, which covers T[] too — pin the array claim.
+        var ctx = new Dictionary<string, object?>
+        {
+            ["messages"] = new[]
+            {
+                new Dictionary<string, object?> { ["role"] = "system", ["content"] = "S" },
+                new Dictionary<string, object?> { ["role"] = "user",   ["content"] = "U" },
+            },
+        };
+        Assert.Equal("system", Render("{{ messages[0].role }}", ctx));
+        Assert.Equal("U", Render("{% for m in messages[1:] %}{{ m.content }}{% endfor %}", ctx));
+    }
+
+    [Fact]
+    public void Index_OutOfRange_OnListOfTypedDicts_ReturnsNullNotThrow()
+    {
+        // The i >= 0 && i < Count guard must hold for the broadened IList match too.
+        var ctx = new Dictionary<string, object?>
+        {
+            ["messages"] = new List<Dictionary<string, object?>>
+            {
+                new() { ["content"] = "only" },
+            },
+        };
+        Assert.Equal("", Render("{{ messages[5].content }}", ctx));
+    }
 }
