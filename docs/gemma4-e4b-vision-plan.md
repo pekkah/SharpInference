@@ -86,7 +86,7 @@ image's 256-token block). *Confirm Gemma-4-E behavior matches Gemma-3 here.*
 | Conv2D / GroupNorm / LayerNorm / Gelu / resize (CPU) | `Diffusion/DiffusionOps.cs` | CPU vision path + image resize |
 | GEMM / RMSNorm / attention / GeLU SIMD kernels | `Cpu/SimdKernels.cs`, backends | Projector MLP, any attn blocks in MobileNet-V5 |
 | gemma4 text decoder (PLE, SWA, KV-share, dual-RoPE, softcap) | `Engine/ForwardPass.cs` | Unchanged consumer of spliced embeddings |
-| **Embedding entry point** | `ForwardPass.cs:1212` `EmbedToken` / `1824` `EmbedTokenInto(token, ptr)`; scale at `:1215` | **The splice seam** — add an overload that writes a precomputed embedding instead of a `token_embd` lookup |
+| **Embedding entry point** | `ForwardPass.cs:1212` `EmbedToken` call site / `1824` `EmbedToken` wrapper / `1885` `EmbedTokenInto(token, dest)` definition; scale at `:1215` | **The splice seam** — add an overload that writes a precomputed embedding instead of a `token_embd` lookup |
 
 The two toolkits we need — a GGUF transformer runtime and a convolutional image-ops backend —
 already exist; they're just siloed (the image ops serve text-to-image diffusion / RRDBNet today).
