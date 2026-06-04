@@ -147,6 +147,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // prefill into one launch per projection.
     private nint   _matvecF32GemmNKernel;
     private nint   _matvecQ4KGemmNKernel;
+    private nint   _matvecQ5KGemmNKernel;
     private nint   _matvecQ6KGemmNKernel;
     // Issue #111: batched trunk elementwise/norm kernels (one launch over N tokens).
     private nint   _rmsNormBatchedKernel;
@@ -185,6 +186,14 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _kvAppendBatchedBf16Kernel;
     private nint   _fullSeqAttentionKernel;
     private nint   _fullSeqAttentionBf16Kernel;
+    private nint   _fullSeqAttentionGlobalKernel;
+    private nint   _fullSeqAttentionGlobalBf16Kernel;
+
+    // Grow-only global score scratch for the wave-based >4096 batched-query SDPA
+    // (issue #118). Sized W × num_heads × score_stride floats; W is chosen so this
+    // stays under a bounded budget. Freed in Dispose.
+    private nint   _waveScratchBuf;
+    private nuint  _waveScratchBufSize;
 
     // Persistent Q8_1 scratch for the Q4_K matvec input. Grows on demand and
     // never shrinks. Sized in 36-byte sub-blocks (one block_q8_1 per 32 elements).
@@ -1396,10 +1405,15 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             DispatchMatVecQ4KBatched(wPtr, xPtr, yPtr, rows, cols, nTok);
             return;
         }
-        if (weightDType == DType.Float32 || weightDType == DType.Q6_K)
+        if (weightDType == DType.Float32 || weightDType == DType.Q6_K || weightDType == DType.Q5_K)
         {
-            // Both take F32 input; the Q6_K kernel decodes the weight per element.
-            nint kernel = weightDType == DType.Q6_K ? _matvecQ6KGemmNKernel : _matvecF32GemmNKernel;
+            // All take F32 input; the Q5_K/Q6_K kernels decode the weight per element.
+            nint kernel = weightDType switch
+            {
+                DType.Q6_K => _matvecQ6KGemmNKernel,
+                DType.Q5_K => _matvecQ5KGemmNKernel,
+                _          => _matvecF32GemmNKernel,
+            };
             int pRows = rows, pCols = cols, pN = nTok;
             nint* args = stackalloc nint[6]
             {
@@ -1413,7 +1427,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             return;
         }
         throw new NotSupportedException(
-            $"CUDA MatMulBatched: weight dtype {weightDType} not supported (expected Q4_K, Q6_K, or Float32).");
+            $"CUDA MatMulBatched: weight dtype {weightDType} not supported (expected Q4_K, Q5_K, Q6_K, or Float32).");
     }
 
     /// <summary>
@@ -2359,6 +2373,129 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         };
         int r = NvrtcInterop.LaunchKernel(_fullSeqAttentionBf16Kernel, (uint)numHeads, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(full_seq_attention_bf16) failed: {r}");
+    }
+
+    // ── Issue #118: wave-based >4096 batched-query SDPA ─────────────────────
+
+    /// <summary>
+    /// Bounded scratch budget (in floats) for the wave-based SDPA. The wave width is
+    /// chosen so <c>W × numHeads × scoreStride</c> floats fit this budget. Override
+    /// via <c>SHARPI_ATTN_WAVE_BUDGET_MB</c> (default 256 MiB).
+    /// </summary>
+    private static long WaveScratchBudgetFloats()
+    {
+        long mb = 256;
+        var ov = Environment.GetEnvironmentVariable("SHARPI_ATTN_WAVE_BUDGET_MB");
+        if (ov is not null && long.TryParse(ov, out long m) && m > 0) mb = m;
+        return mb * 1024 * 1024 / sizeof(float);
+    }
+
+    private void EnsureWaveScratch(long floats)
+    {
+        nuint required = (nuint)floats * sizeof(float);
+        if (_waveScratchBuf != nint.Zero && _waveScratchBufSize >= required) return;
+        if (_waveScratchBuf != nint.Zero)
+        {
+            CuBlasInterop.CudaFree(_waveScratchBuf);
+            _waveScratchBuf = nint.Zero;
+            _waveScratchBufSize = 0;
+        }
+        int r = CuBlasInterop.CudaMalloc(out _waveScratchBuf, required);
+        if (r != 0)
+            throw new InvalidOperationException($"cudaMalloc(wave attn scratch, {required} bytes) failed: {r}");
+        _waveScratchBufSize = required;
+    }
+
+    /// <summary>
+    /// Wave-based batched-query SDPA for prompt prefill past the 4096-position
+    /// shared-scores window (issue #118). Splits the <paramref name="nTok"/> queries
+    /// into waves of <c>W</c> (chosen so <c>W × numHeads × (startPos+nTok)</c> floats
+    /// of global score scratch fit <see cref="WaveScratchBudgetFloats"/>); each wave is
+    /// one launch over <c>(numHeads, W)</c> blocks, each block cloning
+    /// <c>llm_attention</c>'s global-scratch path. Bit-identical to the per-token
+    /// <see cref="Attention"/> path (same per-(head,query) dot / tree softmax /
+    /// V-weighted sum). Query/output layout matches <see cref="AttentionBatched"/>.
+    /// </summary>
+    public void AttentionBatchedWave(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
+                                     int numHeads, int numKvHeads, int headDim,
+                                     int startPos, int maxSeqLen, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        int scoreStride = startPos + nTok;            // max seq_len any query reaches
+        long perQuery = (long)numHeads * scoreStride; // score floats per query row
+        long budget = WaveScratchBudgetFloats();
+        int W = (int)Math.Max(1, Math.Min(nTok, budget / Math.Max(1, perQuery)));
+        EnsureWaveScratch((long)W * perQuery);
+
+        int qDim = numHeads * headDim;
+        nint qBase = GetDevPtr(qAll), oBase = GetDevPtr(outAll);
+        nint kP = GetDevPtr(kCache), vP = GetDevPtr(vCache);
+        nint scP = _waveScratchBuf;
+        // Per-launch mutables (qP/oP/spEff/pN change each wave); the rest are constant.
+        nint qP = qBase, oP = oBase;
+        int spEff = startPos, pN = 0;
+        int pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pMSL = maxSeqLen, pStride = scoreStride;
+        nint* args = stackalloc nint[12]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP), (nint)(&scP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&spEff), (nint)(&pMSL), (nint)(&pN), (nint)(&pStride)
+        };
+        for (int waveStart = 0; waveStart < nTok; waveStart += W)
+        {
+            int wThis = Math.Min(W, nTok - waveStart);
+            qP = qBase + (nint)((long)waveStart * qDim * sizeof(float));
+            oP = oBase + (nint)((long)waveStart * qDim * sizeof(float));
+            spEff = startPos + waveStart;
+            pN = wThis;
+            int r = NvrtcInterop.LaunchKernel(_fullSeqAttentionGlobalKernel,
+                (uint)numHeads, (uint)wThis, 1, 256, 1, 1, 0, _stream, args, null);
+            if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(full_seq_attention_global) failed: {r}");
+        }
+    }
+
+    /// <summary>Bf16-read variant of <see cref="AttentionBatchedWave"/> (default KV dtype).</summary>
+    public void AttentionBatchedWaveBf16(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
+                                         int numHeads, int numKvHeads, int headDim,
+                                         int startPos, int maxSeqLen, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        int scoreStride = startPos + nTok;
+        long perQuery = (long)numHeads * scoreStride;
+        long budget = WaveScratchBudgetFloats();
+        int W = (int)Math.Max(1, Math.Min(nTok, budget / Math.Max(1, perQuery)));
+        EnsureWaveScratch((long)W * perQuery);
+
+        int qDim = numHeads * headDim;
+        nint qBase = GetDevPtr(qAll), oBase = GetDevPtr(outAll);
+        nint kP = GetDevPtr(kCache), vP = GetDevPtr(vCache);
+        nint scP = _waveScratchBuf;
+        nint qP = qBase, oP = oBase;
+        int spEff = startPos, pN = 0;
+        int pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pMSL = maxSeqLen, pStride = scoreStride;
+        nint* args = stackalloc nint[12]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP), (nint)(&scP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&spEff), (nint)(&pMSL), (nint)(&pN), (nint)(&pStride)
+        };
+        for (int waveStart = 0; waveStart < nTok; waveStart += W)
+        {
+            int wThis = Math.Min(W, nTok - waveStart);
+            qP = qBase + (nint)((long)waveStart * qDim * sizeof(float));
+            oP = oBase + (nint)((long)waveStart * qDim * sizeof(float));
+            spEff = startPos + waveStart;
+            pN = wThis;
+            int r = NvrtcInterop.LaunchKernel(_fullSeqAttentionGlobalBf16Kernel,
+                (uint)numHeads, (uint)wThis, 1, 256, 1, 1, 0, _stream, args, null);
+            if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(full_seq_attention_global_bf16) failed: {r}");
+        }
     }
 
     // ================================================================
@@ -3310,7 +3447,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _matvecF32Kernel, _matvecQ4KKernel, _matvecQ5KKernel, _matvecQ6KKernel,
             _matvecQ80Kernel,
             _matvecF32N2Kernel, _matvecQ4KN2Kernel, _matvecQ5KN2Kernel, _matvecQ6KN2Kernel,
-            _matvecF32GemmNKernel, _matvecQ4KGemmNKernel, _matvecQ6KGemmNKernel,
+            _matvecF32GemmNKernel, _matvecQ4KGemmNKernel, _matvecQ5KGemmNKernel, _matvecQ6KGemmNKernel,
             _rmsNormBatchedKernel, _headNormBatchedKernel,
             _splitQgBatchedKernel, _ropeNeoxPartialBatchedKernel,
             _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel,
@@ -3323,6 +3460,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _gdnL2NormPerHeadBatchedKernel, _gdnTileHeadsBatchedKernel, _gdnRecurrenceScanKernel,
             _kvAppendBatchedKernel, _kvAppendBatchedBf16Kernel,
             _fullSeqAttentionKernel, _fullSeqAttentionBf16Kernel,
+            _fullSeqAttentionGlobalKernel, _fullSeqAttentionGlobalBf16Kernel,
         ];
         foreach (nint k in kernels)
         {
@@ -3379,6 +3517,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _matvecQ6KN2Kernel     = GetKernelFunc("llm_matvec_q6k_n2");
         _matvecF32GemmNKernel  = GetKernelFunc("llm_matvec_f32_gemm_n");
         _matvecQ4KGemmNKernel  = GetKernelFunc("llm_matvec_q4k_gemm_n");
+        _matvecQ5KGemmNKernel  = GetKernelFunc("llm_matvec_q5k_gemm_n");
         _matvecQ6KGemmNKernel  = GetKernelFunc("llm_matvec_q6k_gemm_n");
         _rmsNormBatchedKernel  = GetKernelFunc("llm_rmsnorm_batched");
         _headNormBatchedKernel = GetKernelFunc("llm_head_norm_batched");
@@ -3415,6 +3554,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _kvAppendBatchedBf16Kernel         = GetKernelFunc("llm_kv_append_batched_bf16");
         _fullSeqAttentionKernel            = GetKernelFunc("llm_full_seq_attention");
         _fullSeqAttentionBf16Kernel        = GetKernelFunc("llm_full_seq_attention_bf16");
+        _fullSeqAttentionGlobalKernel      = GetKernelFunc("llm_full_seq_attention_global");
+        _fullSeqAttentionGlobalBf16Kernel  = GetKernelFunc("llm_full_seq_attention_global_bf16");
     }
 
     /// <summary>
@@ -3763,6 +3904,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             CuBlasInterop.CudaFree(_q81BatchBuf);
             _q81BatchBuf = nint.Zero;
             _q81BatchBufSize = 0;
+        }
+        if (_waveScratchBuf != nint.Zero)
+        {
+            CuBlasInterop.CudaFree(_waveScratchBuf);
+            _waveScratchBuf = nint.Zero;
+            _waveScratchBufSize = 0;
         }
 
         CuBlasInterop.Destroy(_handle);

@@ -171,6 +171,72 @@ public sealed unsafe class CudaMatMulBatchedTests
         }
     }
 
+    /// Q5_K layout: 176 bytes per 256-element super-block
+    /// ([d:fp16][dmin:fp16][scales:12][qh:32][ql:128]).
+    private static byte[] BuildQ5KMatrix(int rows, int cols, Random rng)
+    {
+        int blocksPerRow = cols / 256;
+        int bytesPerRow = blocksPerRow * 176;
+        var bytes = new byte[rows * bytesPerRow];
+        for (int r = 0; r < rows; r++)
+            for (int b = 0; b < blocksPerRow; b++)
+            {
+                int off = r * bytesPerRow + b * 176;
+                float d = (float)(rng.NextDouble() * 0.05 + 0.005);
+                float dmin = (float)(rng.NextDouble() * 0.02);
+                ushort dh = HalfToUshort((Half)d);
+                ushort dmh = HalfToUshort((Half)dmin);
+                bytes[off + 0] = (byte)(dh & 0xFF);
+                bytes[off + 1] = (byte)(dh >> 8);
+                bytes[off + 2] = (byte)(dmh & 0xFF);
+                bytes[off + 3] = (byte)(dmh >> 8);
+                for (int i = 4; i < 176; i++) bytes[off + i] = (byte)rng.Next(256);
+            }
+        return bytes;
+    }
+
+    [Fact]
+    public void MatMulBatched_Q5K_BitwiseMatchesSequential()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        foreach ((int rows, int cols, int nTok) in
+                 new[] { (8, 256, 2), (33, 512, 5), (64, 1024, 17), (256, 512, 64) })
+        {
+            var rng = new Random(20260603 + rows * 41 + cols * 13 + nTok);
+            byte[] weights = BuildQ5KMatrix(rows, cols, rng);
+
+            var inAll = new float[(long)nTok * cols];
+            for (int i = 0; i < inAll.Length; i++) inAll[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            var gpuW = gpu.UploadRaw(weights, TensorShape.D1(weights.Length), DType.Q5_K);
+            var gpuInAll = gpu.Upload(inAll, TensorShape.D1((long)nTok * cols));
+            var gpuOutAll = gpu.Allocate(TensorShape.D1((long)nTok * rows));
+
+            gpu.MatMulBatched(gpuOutAll, gpuW, gpuInAll, nTok, DType.Q5_K);
+            gpu.Synchronize();
+            var batched = new float[(long)nTok * rows];
+            gpu.Download(gpuOutAll, batched);
+
+            var reference = new float[nTok][];
+            for (int t = 0; t < nTok; t++)
+            {
+                var inT = new float[cols];
+                Array.Copy(inAll, (long)t * cols, inT, 0, cols);
+                var gpuInT = gpu.Upload(inT, TensorShape.D1(cols));
+                var gpuRefT = gpu.Allocate(TensorShape.D1(rows));
+                gpu.MatMul(gpuRefT, gpuW, gpuInT, DType.Q5_K);
+                gpu.Synchronize();
+                reference[t] = new float[rows];
+                gpu.Download(gpuRefT, reference[t]);
+                gpu.Free(gpuInT); gpu.Free(gpuRefT);
+            }
+            gpu.Free(gpuW); gpu.Free(gpuInAll); gpu.Free(gpuOutAll);
+            AssertBitIdentical($"Q5_K rows={rows} cols={cols} nTok={nTok}", rows, nTok, batched, reference);
+        }
+    }
+
     private static float[] Rand(int n, Random rng)
     {
         var a = new float[n];
