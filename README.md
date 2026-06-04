@@ -12,124 +12,84 @@ OpenBLAS in `tools/openblas/` for faster batched GEMM. Build with `dotnet build 
 ## Text generation
 
 Supported architectures: `llama`, `llama4`, `olmoe`, `qwen3`, `qwen3moe`, `qwen35moe`
-(hybrid Gated-DeltaNet + attention + MoE), `gemma4` (per-layer head_dim, SWA + global, PLE). Benchmarked on
-AMD Zen 4 (12c/24t, DDR4-3200) + RTX 4070 Ti (12 GB), Q4_K_M, `--temp 0`,
-`-n 80`, prompt `"Write a Python function that sorts a list using the quicksort algorithm:"`.
-Decode rate is **forward-pass iterations / decode time**, so it counts
-thinking-mode tokens too. All outputs verified coherent
-(`scripts/bench-all.ps1`). Cross-engine top-1 parity vs llama.cpp b8585
-verified on Qwen3-8B (byte-identical 60-token greedy decode with
-matching chat template).
+(hybrid Gated-DeltaNet + attention + MoE), `gemma4` (per-layer head_dim, SWA + global, PLE).
+Benchmarked on AMD Zen 4 (12c/24t, DDR4-3200) + RTX 4070 Ti (12 GB), Q4_K_M, `--temp 0`.
+**Prefill t/s** is the warm-cache rate at a ~1K-token prompt; **decode t/s** is the near-zero-ctx
+generation rate (forward-pass iterations / time, so thinking tokens count). All outputs verified
+coherent (`scripts/bench-all.ps1`); top-1 parity vs llama.cpp b8585 verified on Qwen3-8B (byte-identical
+60-token greedy decode).
 
 | Model | Repo | Size | Backend | Prefill t/s | Decode t/s | Notes |
 |---|---|---:|---|---:|---:|---|
 | SmolLM2 1.7B Instruct | [HuggingFaceTB](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF) | 1 GB | CPU | 40.4 | 38.9 | AVX2 fused dequant-matvec |
 | SmolLM2 1.7B Instruct | (same) | 1 GB | Vulkan `-g -1` | 123.2 | **139.7** | GLSL `subgroupAdd` reduce |
 | SmolLM2 1.7B Instruct | (same) | 1 GB | **CUDA** `-g -1` | **163.1** | **158.1** | NVRTC `__dp4a` + Q8_1 |
-| Qwen3 8B | [Qwen](https://huggingface.co/Qwen/Qwen3-8B-GGUF) | 5 GB | CPU | 9.9 | 11.7 | dense forward pass, no KV compression |
-| Qwen3 8B | (same) | 5 GB | CPU `--tq` | 9.5 | **11.9** | 3-bit KV → up to 40 960 ctx. FastScan K + V kernels (issue #34) deliver ~20× over the per-block AVX2 path on the attention K+V hot loop; visible end-to-end at long context: **10.2 t/s @ 3K, 9.4 t/s @ 6K** (vs ~5 t/s baseline at 6K). Batched prefill is TQ-aware (issue #34 follow-up) so prompt processing matches the no-`--tq` rate |
+| Qwen3 8B | [Qwen](https://huggingface.co/Qwen/Qwen3-8B-GGUF) | 5 GB | CPU | 9.9 | 11.7 | dense, no KV compression |
+| Qwen3 8B | (same) | 5 GB | CPU `--tq` | 9.5 | **11.9** | 3-bit KV → 40 960 ctx; FastScan K+V (#34) keeps long-ctx decode ~flat (10.2 @ 3K, 9.4 @ 6K) |
 | Qwen3 8B | (same) | 5 GB | Vulkan `-g -1` | 45.4 | 45.8 | 11.4K auto-ctx |
 | Qwen3 8B | (same) | 5 GB | Vulkan `-g -1 --tq` | 40.7 | 45.5 | 3-bit KV → 40 960 ctx |
 | Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1` | **61.7** | **58.6** | ~2.8× Vulkan prefill |
-| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --no-thinking` | **61.8** | **58.2** | Same per-token rate; reasoning suppressed in chat template, so all decoded tokens are visible answer |
-| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq` | **57.4** | **58.4** | 3-bit KV → 40 960 ctx; 17 t/s @ 8K, 10 t/s @ 16K |
-| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq --no-thinking` | **57.5** | **58.1** | Same per-token rate as `--tq` alone; reasoning suppressed |
+| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --no-thinking` | **61.8** | **58.2** | reasoning suppressed in template |
+| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq` | **57.4** | **58.4** | 3-bit KV → 40 960 ctx; 17 t/s @ 8K, 10 @ 16K |
+| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq --no-thinking` | **57.5** | **58.1** | as `--tq`, reasoning suppressed |
 | OLMoE 1B-7B Instruct (MoE) | [allenai](https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF) | 4 GB | CPU | 51.6 | 55.7 | 64 experts / 8 active; per-channel QK-norm; `norm_topk_prob=false` |
-| OLMoE 1B-7B Instruct (MoE) | (same) | 4 GB | Vulkan `-g -1` | 112.3 | **121.2** | 16 layers all on VRAM; greedy on this prompt is unstable across backends — use `--temp 0.6 --top-p 0.95` for usable output |
-| OLMoE 1B-7B Instruct (MoE) | (same) | 4 GB | **CUDA** `-g -1` | **117.6** | **111.7** | Same; greedy varies, sampling coherent |
+| OLMoE 1B-7B Instruct (MoE) | (same) | 4 GB | Vulkan `-g -1` | 112.3 | **121.2** | greedy unstable across backends — use `--temp 0.6 --top-p 0.95` |
+| OLMoE 1B-7B Instruct (MoE) | (same) | 4 GB | **CUDA** `-g -1` | **117.6** | **111.7** | greedy varies, sampling coherent |
 | Qwen3-Coder 30B-A3B (MoE) | [Qwen](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF) | 17 GB | CPU | 19.4 | 21.1 | 128 experts / 8 active |
-| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | CPU `--tq` | 18.8 | 21.0 | 3-bit KV. FastScan K + V kernels (issue #34) keep attention cost bounded as context grows: **15.5 t/s decode @ 3.2K ctx** (27 % slowdown for ~27× context growth); without FastScan the per-block K+V path would drop this to ~13 t/s |
-| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | Vulkan `-g -1` (hybrid) | 1.1 | 5.3 | 29 GPU + 19 CPU layers, SLRU expert slot cache. Next-layer predictive prefetch (PR #77 / issue #50) on by default; no-op until the cache is under pressure — disable with `--no-moe-predict-prefetch`. (Prefill not re-measured at ~1K like the other rows — the Vulkan-hybrid MoE path errored on the longer prompt; value is the original short-ctx run) |
-| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | **CUDA** `-g -1` (hybrid) | **30.1** | **25.0** | 29 GPU + 19 CPU layers; routed experts stream through `CudaExpertSlotManager` SLRU (2220 / 3712 slots) instead of the prior eager whole-layer upload (PR #77 / issue #72). Decode lifts 22.2 → 25.0 (+13 %) and prefill 10.6 → 12.3 (+16 %) on top of #77's baseline once the warm-pin + frequency-biased eviction (#74) and async upload stream (#78) hide miss latency in the steady-state working set. Set `SHARPI_EXPERT_STATS=path` to inspect per-layer hit rates. Issue #123 gives this layer-split `CudaHybridForwardPass` a batched-trunk prefill (`PrefillBatchedTrunk`: GEMM-batched attention projections + batched KV-append + batched-query SDPA — shared-scores ≤4096 and the #118 wave kernel past it — over the N prompt tokens of the 29 GPU layers, per-token FFN/MoE, then the 19 CPU layers per token), bit-identical to the sequential per-token `Forward` loop (`CudaHybridBatchedPrefillTests`, single / multi-chunk / >4096) — prefill 25.2 → 30.1 (+19 %) at ~1K ctx (A/B via `SHARPI_BATCHED_PREFILL=0`). Decode is unchanged (the FFN/MoE + CPU layers stay per token) |
-| Llama-4 Scout 17B-16E (MoE) | [meta-llama](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct) | 61 GB | CPU | 2.1 | 4.3 | 48 layers, 17B active params; split GGUF (Q4_K_M) |
-| Llama-4 Scout 17B-16E (MoE) | (same) | 61 GB | CUDA `-g -1` (hybrid) | 1.2 | 2.6 | 7 GPU + 41 CPU layers — model still dwarfs the 12 GB card so CPU-only wins, but per-expert SLRU streaming (PR #77 / issue #72) lifts decode 2.1 → 2.6 (+24 %) and prefill 0.9 → 1.2 (+33 %) over the prior eager whole-layer upload |
+| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | CPU `--tq` | 18.8 | 21.0 | 3-bit KV; FastScan (#34) → 15.5 t/s decode @ 3.2K ctx |
+| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | Vulkan `-g -1` (hybrid) | 1.1 | 5.3 | 29 GPU + 19 CPU layers, SLRU expert cache; predictive prefetch (#50/#77) on by default (`--no-moe-predict-prefetch`). Prefill is the original short-ctx run (Vulkan-hybrid errored on the ~1K prompt) |
+| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | **CUDA** `-g -1` (hybrid) | **30.1** | **25.0** | 29 GPU + 19 CPU layers; routed experts stream through `CudaExpertSlotManager` SLRU (#72/#77). Batched-trunk prefill (#123, bit-identical; `SHARPI_BATCHED_PREFILL=0` to bisect). `SHARPI_EXPERT_STATS=path` for hit rates |
+| Llama-4 Scout 17B-16E (MoE) | [meta-llama](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct) | 61 GB | CPU | 2.1 | 4.3 | 48 layers, 17B active; split GGUF (not on bench machine) |
+| Llama-4 Scout 17B-16E (MoE) | (same) | 61 GB | CUDA `-g -1` (hybrid) | 1.2 | 2.6 | 7 GPU + 41 CPU layers — model dwarfs the 12 GB card so CPU-only wins; per-expert SLRU streaming (#72/#77) still lifts both |
 | Qwen3.6-35B-A3B (GDN+MoE) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | 22 GB | CPU | 8.4 | 8.5 | hybrid GDN/attn, 256 experts / 8 active |
-| Qwen3.6-35B-A3B (GDN+MoE) | (same) | 22 GB | **CUDA** `-g -1` (hybrid) | **63.7** | **23.2** | 10 attn + 30 GDN on GPU; MoE auto-routed to CPU, batched-expert dispatch (8 experts × 3 ops into 2 Parallel.For sweeps), shared expert kept on GPU and overlapped with the CPU routed loop. Issue #114-B collapses the per-position GDN recurrence into one fused sequential-scan kernel and the KV-append + SDPA into batched-query launches (`llm_full_seq_attention`), bit-identical to the per-token path; the win grows with context (A/B at ~4K ctx: +17%, 55.3 → 64.5 t/s, over the #111 GEMM-batched-projection trunk). Issue #118 extends that batched-query SDPA past the 4096-position shared-scores window with a wave-based global-scratch kernel (`llm_full_seq_attention_global`, launched in bounded waves), so long-context prefill keeps the batched win instead of falling back to the per-position loop. Decode is the near-zero-ctx generation rate |
-| Qwen3.6-27B-MTP (GDN) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) | 16 GB | CPU `--no-thinking` | 3.2 | **3.8** | dense 27B, hybrid GDN/attn, native MTP head; auto-engages MTP self-spec (issue #25) at greedy + `--no-thinking`. 95% draft acceptance (38/40); batched N=2 verify (#30) + fused Q6_K·Q8_K 2-input dot (#42) lift decode from 2.7 (sequential N=1) to 3.8 — 1.4× over MTP-off baseline |
-| Qwen3.6-27B-MTP (GDN) | (same) | 16 GB | **CUDA** `-g -1 --no-thinking` (hybrid) | **8.3** | **10.7** | 20/64 dense FFN layers on GPU (3.3 GB) + GDN + attn KV resident; 44/64 FFN layers on CPU mmap. 95% draft acceptance; batched verify lifts decode from 6.2 to 10.7 (1.73× over MTP-off baseline). The CPU FFN majority batches via `CpuDenseFfn2` and the on-GPU FFN layers now batch via `MatMulN2` (issue #43 — one weight read per row, two outputs). Direct-pinned `Download/UploadInto` (#48) and async `_lastHidden` overlap (#49) shave per-layer host stall on the MoE-MTP/dense-FFN-MTP hot path. Issue #119 extends the GDN-hybrid batched trunk (#111/#114-B — GEMM-batched projections + fused sequential-scan GDN recurrence + batched-query SDPA) to this **dense** path (`PrefillBatchedTrunkGpuFfn`: batched trunk + per-token GPU/CPU FFN), bit-identical to the sequential per-token prefill (`BatchedTrunkGpuFfn_BitwiseMatchesSequential_Dense27BMtp`, incl. MTP draft logits) — prefill 6.3 → 8.3 (+32%) at ~1K ctx. Needs the new `llm_matvec_q5k_gemm_n` GEMM-N kernel, since Q4_K_M trunks carry Q5_K projection weights. Issue #121 additionally batches the on-GPU dense FFN into GEMM-N gate/up/down over N (`BatchedGpuDenseFfn`), bit-identical (`BatchedFfn_BitwiseMatchesPerTokenFfn_Dense27BMtp`, `SHARPI_BATCHED_FFN=0` to bisect); ~1K prefill is flat here (8.5 ↔ 8.5) because 44/64 FFN layers stay CPU-mmap and dominate prefill — the launch-collapse pays off when more FFN is GPU-resident |
-| Qwen3.6-27B-MTP (GDN) | (same) | 19 GB | CPU `--no-thinking` `Q5_K_M` | 2.8 | **3.5** | Q5_K_M variant, ~10% slower than Q4_K_M as expected from weight bandwidth. 100% draft acceptance (40/40) on this prompt; batched verify lifts decode from 2.4 to 3.5 (1.46×) |
-| Qwen3.6-27B-MTP (GDN) | (same) | 19 GB | **CUDA** `-g -1 --no-thinking` `Q5_K_M` (hybrid) | 5.4 | **7.9** | 13/64 FFN layers on GPU (2.4 GB) + GDN + attn KV resident; 51/64 FFN on CPU mmap. Uses `llm_embed_lookup_q5k` direct-read kernel (issue #39) and the Q5_K `MatMulN2` kernel (issue #43) for the on-GPU layers. 98% draft acceptance; batched verify lifts decode from 4.3 to 7.9 (1.84×). Direct-pinned `Download/UploadInto` (#48) + async `_lastHidden` overlap (#49) land 0.5-0.8 t/s on top of #43's batched MatMul win — measurable here because Q5_K MatMul is more PCIe-bound than Q4_K. Issue #119's batched trunk (`PrefillBatchedTrunkGpuFfn` + the new `llm_matvec_q5k_gemm_n` GEMM-N kernel for the Q5_K trunk projections) lifts prefill 4.2 → 5.4 (+29%) at ~1K ctx, bit-identical to the sequential per-token path. Issue #121's on-GPU dense-FFN batching is likewise bit-identical but ~1K-prefill-neutral here (5.6 ↔ 5.5, within noise) — 51/64 FFN layers are CPU-mmap and prefill-bound |
-| Qwen3.6-35B-A3B-MTP (GDN+MoE) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) | 22 GB | CPU `--no-thinking` | 8.5 | 8.0 | hybrid GDN/attn + 256-expert MoE + native MTP head (issue #44). 100% draft acceptance. Issue #45 enables `BatchForward2` for MoE MTP — attn/GDN/lm_head batch across t1/t2 but routed experts run sequentially per token (top-K differs), so the win is small (lm_head save + frame overhead). At parity with the 8.2 MTP-off baseline within CPU jitter |
-| Qwen3.6-35B-A3B-MTP (GDN+MoE) | (same) | 22 GB | **CUDA** `-g -1 --no-thinking` (hybrid) | **65.0** | **22.9** | Requires `SHARPI_CPU_MOE=1`: 30 GDN + 10 attn + shared expert on GPU, MoE routed experts + MTP MoE FFN mmap'd on CPU. 100% draft acceptance. Issue #45 lifts decode from 22.9 (sequential MTP at 0.99× MTP-off baseline) to at-or-above MTP-off — modest because routed-expert weight reads can't share between tokens; the bandwidth-bound CPU MoE FFN runs sequentially per token. Issues #47 (async UploadViaStaging) + #49 (overlap `_lastHidden` D2H with lm_head MatMul) shave further µs/layer. Issue #114-B's fused GDN sequential-scan + batched-query SDPA (`llm_full_seq_attention`) is bit-identical to the per-token path and grows with context (A/B at ~4K ctx: +17%, 55.4 → 64.7 t/s, over the #111 per-position trunk); issue #118 carries that batched SDPA past 4096 with the wave-based `llm_full_seq_attention_global` kernel. Decode is the near-zero-ctx MTP generation rate |
-| Carnice (Qwen3.6-35B-A3B-MTP finetune) | [mudler](https://huggingface.co/mudler/Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-GGUF) | 17 GB | **CUDA** `-g -1 --no-thinking` (hybrid) | **43.6** | **25.0** | Issue #114-B collapses the per-position GDN recurrence (fused sequential-scan kernel) + KV-append/SDPA (`llm_full_seq_attention`) into one launch each, bit-identical to the per-token path (per-kernel bit-exactness + `BatchedTrunk_BitwiseMatchesSequentialTrunk` oracles, full Tests.ForwardPass suite green); the win grows with context (A/B at ~4K ctx: +31%, 92.1 → 120.8 t/s, over the #111 GEMM-batched-projection trunk). Issue #118 extends the batched-query SDPA past the 4096-position shared-scores window with a wave-based global-scratch kernel (`llm_full_seq_attention_global`, bit-identical to the per-position global path — per-kernel f32/bf16 + the `BatchedAttnWave_BitwiseMatchesPerPosition_Over4096_Carnice` oracle), so the win continues past 4096: A/B at a ~5.8K-token prompt is +36% (85.0 → 115.7 t/s) vs the per-position attention loop. Decode shown is the near-zero-ctx MTP generation rate. APEX-MTP-I-Compact mixed-precision quant: Q3_K + Q8_0 routed experts (rest Q4_K/Q5_K). Hermes-style agentic/tool-calling finetune of 35B-A3B-MTP; same qwen35moe arch + MTP head; 77% draft acceptance on the `bench-carnice.ps1` 60-token prompt (the `bench-all` "capital of France" default elicits a 1-token EOS on Carnice's terser agentic tuning, so it gets its own bench cell). Numbers are apples-to-apples warm-cache; the prior 5.3 t/s decode in this row was a cold-cache artefact (mmap'd expert pages). Issues #101 / #99 / #107 add `DotQ3K_Q8KS_Avx2` + `DotQ8_0_Q8KS_Avx2` (dual-acc-chain int-domain dots over a **Q8_KS** per-32-element-scale input — 8 FP scales per 256-elem super-block instead of Q8_K's one per 256), **auto-enabled at model load** when the GGUF tensor index shows matching routed-expert dtypes (APEX mixed-precision tier) — this lifts warm decode from 23.9 (forced off) to 25.0 t/s (+4.6%). Force off with `SHARPI_Q3K_Q8K=0` / `SHARPI_Q8_0_Q8K=0` to fall back to the FP `DotQ3K` / `DotQ8_0` path; output is not bit-identical (cumulative trunk drift on Qwen3.6-class models, see `feedback_q4k_q8k_no_parity_win`) but Q8_KS cuts the parity envelope ~4× vs the plain-Q8_K probe (#103 validation: ±13 pp MTP-accept → ±3 pp, every prompt argmax-stable through ≥32 tokens), and all 294 Tests.ForwardPass tests stay green with the kernels engaged |
-| Gemma 4 E4B-it Q8 | [unsloth](https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF) | 8 GB | CPU | 4.9 | 5.0 | dense 42-layer gemma4 (E4B): per-layer head_dim (256 SWA / 512 global), dual-RoPE (10K SWA / 1M global with `rope_freqs.weight` baked in), KV-share tail (shared_kv_layers=18; last 18 layers alias layer 22 or 23), 5 SWA : 1 global attention pattern, post-attn + post-ffw RmsNorms, `layer_output_scale` per-layer scalar, final-logit softcap=30, GeluTanh FFN, PLE-256 injection (per_layer_token_embd ~4.2 GB stays mmap-resident, per_layer_model_proj BF16→F32 dequant once). `SimdKernels.RmsNormWide` (AVX-512, 16 floats/iter) + K/V `MatVecDual` fuse model-gated to per-layer-head_dim path; other models stay on AVX2 because Qwen3.6-27B-MTP byte-parity is sensitive to the ~ULP reduction-order shift |
-| Gemma 4 E4B-it Q8 | (same) | 8 GB | **CUDA** `-g -1 -c 2048` | **47.7** | **44.1** | All 42 layers fit in 12 GB (still fits at `-c 2048`, used here for the ~1K-token prefill cell; decode shown is the small-ctx rate). Attention scale fix (Gemma 4 wants 1.0, kernels apply 1/sqrt(head_dim) so Q is pre-scaled by sqrt(layerHd) — would otherwise produce a degenerate 2-cycle repeat after first decode). KV-share alias dispatch + SWA vs full attention split per layer; `rope_freqs.weight` applied via `RoPEWithFactors` on global layers, plain `RoPE` on SWA. PLE projections (~215 MB across 42 layers) upload at construction; per-token row dequant + projection runs on GPU |
-| Gemma 4 E4B-it Q8 | (same) | 8 GB | **CUDA** `-g 22 -c 2048` (hybrid) | 6.6 | 6.8 | 22 GPU + 20 CPU layers @ 2K context. `-g <= 22` constraint: own-KV source layers (22, 23) must live on CPU so the shared-KV tail (24..41, all on CPU) can read them without cross-tier KV reads. CPU half dominates decode (dense FFN reads ~28 MB Q8 per layer × 20 layers = ~560 MB/token, bandwidth-bound on Zen 4 DDR4-3200); GPU half overlaps the embed/output norm. SHARPI_CUDA_PROFILE=1 dumps per-phase breakdown (embed / ple / qkv / rope+qknorm / kv+attn / o-proj+res / ffn / final) |
+| Qwen3.6-35B-A3B (GDN+MoE) | (same) | 22 GB | **CUDA** `-g -1` (hybrid) | **63.7** | **23.2** | 10 attn + 30 GDN on GPU; MoE auto-routed to CPU, shared expert on GPU overlapped with the routed loop. Fused GDN scan + batched-query SDPA (#114-B/#118), bit-identical, win grows with ctx. Forcing on-GPU experts (`SHARPI_CPU_MOE=0`, non-default) gets the #129 fused MoE-reduce kernel: GPU-SLRU prefill +20% (45.3 → 54.3 t/s) |
+| Qwen3.6-27B-MTP (GDN) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) | 16 GB | CPU `--no-thinking` | 3.2 | **3.8** | dense 27B GDN/attn + native MTP head; auto MTP self-spec (#25) at greedy + `--no-thinking`. 95% draft acceptance; batched N=2 verify (#30) → 1.4× over MTP-off |
+| Qwen3.6-27B-MTP (GDN) | (same) | 16 GB | **CUDA** `-g -1 --no-thinking` (hybrid) | **8.3** | **10.7** | 20/64 dense FFN on GPU + GDN/attn KV resident, 44/64 FFN CPU mmap. 95% acceptance; batched verify → 1.73×. Batched trunk + on-GPU dense-FFN (#119/#121), bit-identical |
+| Qwen3.6-27B-MTP (GDN) | (same) | 19 GB | CPU `--no-thinking` `Q5_K_M` | 2.8 | **3.5** | ~10% slower than Q4_K_M; 100% acceptance; batched verify → 1.46× |
+| Qwen3.6-27B-MTP (GDN) | (same) | 19 GB | **CUDA** `-g -1 --no-thinking` `Q5_K_M` (hybrid) | 5.4 | **7.9** | 13/64 FFN on GPU, 51/64 CPU mmap. 98% acceptance; batched verify → 1.84×. Batched trunk (#119) bit-identical; FFN batching prefill-neutral here (CPU-mmap bound) |
+| Qwen3.6-35B-A3B-MTP (GDN+MoE) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) | 22 GB | CPU `--no-thinking` | 8.5 | 8.0 | GDN/attn + 256-expert MoE + MTP head (#44). 100% acceptance; MoE-MTP batched verify (#45) — routed experts sequential per token, so ~MTP-off parity |
+| Qwen3.6-35B-A3B-MTP (GDN+MoE) | (same) | 22 GB | **CUDA** `-g -1 --no-thinking` (hybrid) | **65.0** | **22.9** | Requires `SHARPI_CPU_MOE=1`: 30 GDN + 10 attn + shared expert on GPU, routed experts CPU mmap. 100% acceptance. Fused GDN scan + batched SDPA (#114-B/#118), bit-identical, grows with ctx |
+| Carnice (Qwen3.6-35B-A3B-MTP finetune) | [mudler](https://huggingface.co/mudler/Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-GGUF) | 17 GB | **CUDA** `-g -1 --no-thinking` (hybrid) | **43.6** | **25.0** | agentic finetune of 35B-A3B-MTP; 77% acceptance (`bench-carnice.ps1` — the default prompt 1-token-EOSes on this terser tune). APEX mixed-precision (Q3_K + Q8_0 experts); Q8_KS per-32 int dots auto-enable at load (#99/#101/#107), +4.6% decode at ~4× tighter parity vs plain Q8_K (`SHARPI_Q3K_Q8K=0`/`SHARPI_Q8_0_Q8K=0` to disable). Fused GDN scan + wave SDPA (#114-B/#118) bit-identical past 4096 |
+| Gemma 4 E4B-it Q8 | [unsloth](https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF) | 8 GB | CPU | 4.9 | 5.0 | dense 42-layer gemma4: per-layer head_dim (256 SWA / 512 global), dual-RoPE, KV-share tail (18 layers), 5:1 SWA:global, logit softcap 30, PLE-256 injection (~4.2 GB mmap-resident) |
+| Gemma 4 E4B-it Q8 | (same) | 8 GB | **CUDA** `-g -1 -c 2048` | **47.7** | **44.1** | all 42 layers fit at `-c 2048`. KV-share alias + SWA/global split per layer; PLE projections (~215 MB) upload at construction, per-token dequant + projection on GPU |
+| Gemma 4 E4B-it Q8 | (same) | 8 GB | **CUDA** `-g 22 -c 2048` (hybrid) | 6.6 | 6.8 | 22 GPU + 20 CPU layers. `-g ≤ 22` required so the CPU shared-KV tail can read its own-KV source layers; CPU dense-FFN dominates decode (bandwidth-bound). `SHARPI_CUDA_PROFILE=1` for per-phase breakdown |
 
-_Methodology: **Prefill t/s** is the warm-cache rate at a **~1K-token prompt** (≈1000–1120 tokens
-per row — steady-state prompt processing), re-measured across every on-disk row so the column is
-comparable rather than the old ~10–60-token launch-overhead cells. **Decode t/s** is the
-near-zero-ctx generation rate (the conventional generation-speed metric; the per-issue before/after
-figures in the notes are historical at-the-time measurements). Llama-4 Scout is not on the bench
-machine (kept at its prior numbers); Qwen3-Coder Vulkan-hybrid errored on the ~1K prompt so its
-prefill is the original short-ctx value._
+_Numbers re-measured across every on-disk row at ~1K ctx so the prefill column is comparable; per-issue
+before/after figures in the notes are historical. Llama-4 Scout and Qwen3-Coder Vulkan-hybrid keep their
+prior values (not re-runnable on the bench machine)._
 
-`--backend auto` (default) picks CUDA when available, sizing the GPU/CPU split from
-VRAM via TierPlanner; falls through to Vulkan only when CUDA isn't present.
+`--backend auto` (default) picks CUDA when available, sizing the GPU/CPU split from VRAM via TierPlanner;
+falls through to Vulkan only when CUDA isn't present. For hybrid `qwen35moe` models the CUDA backend keeps
+attention KV, the GDN layers, and the shared expert in VRAM; routed-expert dispatch auto-selects between
+an SLRU GPU cache and CPU mmap based on how many experts fit at boot (`SHARPI_CPU_MOE=0|1` to override).
+On Ampere+ it auto-selects bf16 cuBLAS GEMM (`SHARPI_CUDA_PRECISION=fp32|fp16|bf16|fp8` to bisect; custom
+NVRTC kernels keep fp32 accumulators). The GPU KV cache stores bf16 by default on GDN paths
+(`SHARPI_KV_DTYPE=fp32` to bisect).
 
-MoE expert-cache knobs (`--moe-warmpin`, `--moe-warmpin-after`,
-`--no-moe-predict-prefetch`, `--expert-stats`) are CLI-only on the `run`
-command; under `SharpInference.Server` the same behaviour is reachable
-via the env vars `SHARPI_MOE_WARMPIN`, `SHARPI_MOE_WARMPIN_AFTER`,
-`SHARPI_MOE_PREDICT_PREFETCH=0`, `SHARPI_EXPERT_STATS=<path>` set in the
-process environment before the server starts.
+MoE expert-cache knobs (`--moe-warmpin`, `--moe-warmpin-after`, `--no-moe-predict-prefetch`,
+`--expert-stats`) are CLI-only; the server reads the equivalent `SHARPI_MOE_WARMPIN*`,
+`SHARPI_MOE_PREDICT_PREFETCH=0`, `SHARPI_EXPERT_STATS=<path>` env vars.
 
-SnapKV prefill-time KV eviction (issue #51) ships on every backend: CPU
-`ForwardPass` (#57), CUDA hybrid GDN `CudaHybridGdnForwardPass` (#58),
-dense CUDA `CudaForwardPass` (#63), and Vulkan `GpuForwardPass` (#64).
-After prefill the model scores each prompt position by softmaxed
-attention from the last `W` queries pooled across heads + layers
-(`llm_snapkv_score` / `_bf16` NVRTC kernels on CUDA; GLSL `SnapKvScore`
-on Vulkan with a CAS-based float `atomicAdd` since Vulkan core lacks
-native float atomics), picks top-K + a trailing recency window, and
-compacts the K/V ring in place (`llm_kv_compact` / `_bf16` / GLSL
-`KvCompact`). Decode is unchanged — `LogicalLength` stays at the
-original prompt length so RoPE on new tokens lands at the right angle.
+### SnapKV (prefill-time KV eviction, issue #51)
 
-The three GPU paths auto-enable when the configured context is large
-enough that the full attention KV cache would exceed ~256 MiB (the
-12 GB-card long-context target); auto-budget is `min(maxSeqLen/4, 4096)`
-floored at 1024, matching the SnapKV paper's accuracy curve.
-`SHARPI_SNAPKV_BUDGET=N` forces an explicit budget; `=0` disables the
-auto path entirely. `_WINDOW` and `_RECENCY` (defaults 64 each) tune the
-importance probe and trailing must-keep zone. CPU `ForwardPass` keeps
-the explicit-opt-in convention — set `SHARPI_SNAPKV_BUDGET=N` to engage
-it there.
+Ships on CPU `ForwardPass`, CUDA hybrid GDN, dense CUDA, and Vulkan. After prefill the model scores each
+prompt position by softmaxed attention from the last `W` queries, keeps top-K + a trailing recency window,
+and compacts the K/V ring in place. Decode is unchanged — `LogicalLength` stays at the original prompt
+length so RoPE on new tokens lands correctly.
 
-SnapKV composes with TurboQuant on the CPU path (#68 / PR #71):
-`SnapKvSelector` scores against the TQ-compressed K via the existing
-FastScan dequant path, and `TurboQuantKvCache.Compact` re-quantizes
-TQ-survivors through the same per-(layer, head) Lloyd-Max compressor.
-`SHARPI_SNAPKV_BUDGET=N` + `--tq` together stack the two for ~16× total
-KV reduction (4× TQ × ~4× position pruning) at long context. CUDA and
-Vulkan TQ composition follow the same algorithm and are tracked as #69
-and #70. `CudaHybridForwardPass` (dense CPU+GPU split) is the one
-remaining backend where SnapKV isn't plumbed yet — needs a new
-`KvCache.Compact` for the CPU layers + mixed CPU+GPU score
-accumulation (#65).
+The GPU paths auto-enable when the full attention KV cache would exceed ~256 MiB; auto-budget is
+`min(maxSeqLen/4, 4096)` floored at 1024. `SHARPI_SNAPKV_BUDGET=N` forces a budget (`=0` disables);
+`_WINDOW`/`_RECENCY` (default 64) tune the probe and must-keep zone. CPU keeps the explicit-opt-in
+convention (set the budget to engage). SnapKV composes with TurboQuant on CPU for ~16× total KV reduction
+(#68). Long-context eval: `dotnet run --project benchmarks/SnapKvEval -- --model <gguf>` runs a
+needle-in-haystack sweep across budgets.
 
-**SnapKV long-context eval** (issue #61): `dotnet run --project
-benchmarks/SnapKvEval -- --model models/Qwen3-8B-Q4_K_M.gguf` runs a
-needle-in-haystack sweep across budgets (128 → 2048) and needle positions
-(beginning, middle) on the deterministic CPU backend, emitting a markdown
-table of recovery scores. Pass criterion: budget=2048 recovers the needle
-at every position.
+### TurboQuant (`--tq`, 3-bit KV compression)
 
-`--tq` enables 3-bit TurboQuant KV compression (CPU, Vulkan, CUDA; requires
-`headDim ∈ {128, 256}`). MoE runs on GPU (full-offload or partial hybrid) on
-both Vulkan and CUDA backends.
-
-CPU TurboQuant K-scoring and V-aggregation use a FastScan-derived AVX2
-kernel (issue #34): KV positions are packed into 32-position tiles with
-codes stored as 4-bit nibbles, a per-query i8 LUT is built once per
-(layer, kv-head), and each `dim` step reduces to a `vpshufb` against
-the LUT instead of `vpgatherdd`. V-aggregation defers the per-position
-sign-flip + inverse Walsh-Hadamard transform to one call per kv-head
-(commutes through the Σ_t accumulation), so the IWHT cost goes from
-`O(tqLength · dim log dim)` per token down to `O(dim log dim)`. On
-Ryzen 9 7900X, per (layer, kv-head) cost of the combined K+V attention
-hot path vs the previous per-block AVX2 path
-(`TurboQuantOps.DequantDot4Avx2`):
+CPU/Vulkan/CUDA; requires `headDim ∈ {128, 256}`. K-scoring and V-aggregation use a FastScan AVX2 kernel
+(#34): KV positions pack into 32-position tiles with 4-bit codes, a per-query i8 LUT reduces each step to a
+`vpshufb`, and the IWHT is deferred to one call per kv-head. Per (layer, kv-head) cost of the combined K+V
+hot path vs the prior per-block AVX2 path on a Ryzen 9 7900X:
 
 | TQ positions | per-block K+V | FastScan K+V | speedup |
 |---:|---:|---:|---:|
@@ -138,113 +98,33 @@ hot path vs the previous per-block AVX2 path
 | 8 192 | 3 936 µs | 193 µs | 20× |
 | 16 384 | 8 216 µs | 390 µs | 21× |
 
-End-to-end gain on decode tracks the K+V share of token cost: small at
-short context (a few percent at 256 ≤ ctx ≤ 1K, dominated by the FFN /
-QKV weight reads on dense models) and growing with context length.
-Measured Qwen3-8B Q4_K_M CPU `--tq` end-to-end on the same Ryzen 9 7900X
-after TQ-aware batched prefill landed:
-
-| context  | prefill t/s | decode t/s |
-|---------:|------------:|-----------:|
-|     30   |   2.6       | 12.0       |
-|    850   |   9.3       | 10.9       |
-|  1 650   |   9.5       | 10.7       |
-|  3 250   |   9.4       | 10.2       |
-|  6 050   |   9.2       |  9.4       |
-
-Decode rate degrades only ~22 % across a 200× context growth (30 →
-6 050), which puts the FastScan K+V path well under the FFN / output-
-projection floor at every measured point. The per-block AVX2 path would
-add ~120 ms per token at 6 K positions on this CPU (extrapolating the
-kernel table above), dropping decode to ~5 t/s — so FastScan delivers
-roughly 1.9× decode at 6 K context on this workload.
-
-Session-lifetime weights (per-layer projections, expert FFNs, embedding,
-output) on all three CUDA forward passes (`CudaForwardPass`,
-`CudaHybridForwardPass`, `CudaHybridGdnForwardPass`) bypass the GPU buffer
-pool and go through `cudaMalloc`/`cudaFree` at the exact tensor size.
-The pool's power-of-2 round-up was wasting hundreds of MiB on big-tensor
-layouts (a 17 MiB attn_gate rounds to 32 MiB; across 60+ layers that's a
-couple of GiB — the difference between fitting one more FFN layer on a
-12 GB card or not, see issues #25 / #26). Scratch and KV-cache allocations
-stay pooled.
-
-For hybrid SSM/attention models (`qwen35moe`), the CUDA backend keeps the
-attention KV cache, the 30 Gated-DeltaNet layers (conv1d + rank-1 outer-product
-recurrence), and the shared expert resident in VRAM; routed-expert dispatch
-auto-selects between an SLRU GPU cache and CPU mmap reads based on what
-fraction of experts can be cached at boot. Override with `SHARPI_CPU_MOE=0|1`.
-
-On hybrid GDN paths the GPU KV cache stores bf16 by default (`SHARPI_KV_DTYPE
-=bf16`, see issue #27); arithmetic still runs in fp32 (bf16→fp32 promotion on
-the read). The 2× cache shrink frees ~128 MiB at ctx=4096 — enough to fit one
-extra dense-FFN layer on a 12 GB card, lifting Qwen3.6-27B-MTP `--temp 0` decode
-from 4.3 → 6.4 t/s. Override with `SHARPI_KV_DTYPE=fp32` to bisect precision.
-
-On Ampere+ (sm_80+) the CUDA backend auto-selects bf16 cuBLAS GEMM, which
-matches fp32 for almost all workloads. `SHARPI_CUDA_PRECISION=fp32|fp16|bf16|fp8`
-overrides the compute type — handy for bisecting whether an output divergence
-is mantissa-precision (changes between fp32 and bf16) or algorithmic
-(unchanged). Custom NVRTC kernels keep their fp32 accumulators regardless.
+End-to-end gain tracks the K+V share of token cost — small at short context, growing with length. Qwen3-8B
+CPU `--tq` decode degrades only ~22% from 30 → 6 050 ctx (12.0 → 9.4 t/s); the per-block path would drop
+to ~5 t/s at 6K, so FastScan is ~1.9× decode there.
 
 ### Multi-Token Prediction (MTP)
 
-Models that ship native MTP heads (Qwen3.6-27B-MTP, Qwen3.5 / Qwen3.6 A3B-MTP,
-DeepSeek V3/R1, …) get self-speculative decoding for free — no separate
-draft model. The MTP path engages automatically when the forward pass reports
-`HasMtpHead`, sampling is greedy (`--temp 0`), and the chat template renders
-with `enable_thinking=false` (`--no-thinking`). The CLI prints `MTP accept: N%`
-at the end of the run so the acceptance gap is visible.
-
-CLI surface mirrors llama.cpp: `--spec-type <auto|none|mtp|draft-mtp>` forces
-on/off (default `auto` matches the eligibility check above); `--spec-draft-n-max
-<int>` sets the draft depth per spec step (1 or 2; >2 isn't implemented yet —
-that needs tree drafts);  `--spec-draft-p-min <0..1>` accepts a draft when
-`softmax(main)[draft] ≥ p` even if it isn't the argmax (lossy but higher
-acceptance). `SHARPI_DISABLE_MTP=1` is the back-compat off-switch;
-`SHARPI_DISABLE_BATCH_VERIFY=1` forces the legacy sequential N=1 path for
-parity bisection. Batched N=2 verify (issue #30) is the default for dense
-MTP models; MoE MTP models (Qwen3.6-35B-A3B-MTP) also engage batched verify
-since issue #45 — attn/GDN/norms/lm_head amortise across t1/t2 while the
-routed-expert FFN runs sequentially per token (per-token top-K diverges).
-`--spec-draft-n-min` / `--spec-draft-p-min` are not yet wired (issues #37, #38).
+Models with native MTP heads (Qwen3.6-27B-MTP, Qwen3.5/3.6 A3B-MTP, DeepSeek V3/R1) get self-speculative
+decoding with no separate draft model. It engages automatically when the pass reports `HasMtpHead`, sampling
+is greedy (`--temp 0`), and thinking is off (`--no-thinking`); the CLI prints `MTP accept: N%`. Batched N=2
+verify (#30) is the default for dense MTP; MoE MTP also batches the trunk while routed experts run per token
+(#45). CLI mirrors llama.cpp: `--spec-type`, `--spec-draft-n-max <1|2>`, `--spec-draft-p-min <0..1>`
+(lossy probabilistic accept). `SHARPI_DISABLE_MTP=1` / `SHARPI_DISABLE_BATCH_VERIFY=1` are the off-switches.
 
 ### Chat-continuation cache
 
-Multi-turn requests against `/v1/messages` and `/v1/chat/completions` reuse
-the prior turn's state instead of re-prefilling the full history every time.
-On the GDN-hybrid passes (Qwen3.6 family) the engine snapshots its recurrent
-state at the chat-template's history boundary (issue #102) and restores it on
-the next turn after a token-level prefix match. On MTP runs the snapshot path
-also covers the MTP attention KV and a sticky absolute-position hidden-history
-buffer (issue #106), so Carnice/Qwen3.6-MTP agentic loops stop paying the
-~tens-of-seconds-per-tool-round-trip re-prefill cost they did before.
-
-The `/metrics` endpoint exposes `sharpi_prefill_tokens_reused_total` for
-verification — it advances on every turn that hits the snapshot match. On a
-Qwen3.6-27B-MTP CUDA hybrid with the included `scripts/test-snapshot-reuse.ps1`
-(2-turn convo, ~30-token assistant replies) the counter goes 0 → 31 between
-turns 1 and 2; the second turn's wall time is essentially flat despite the
-longer prompt. Pre-#102/#106 the counter stayed at 0 across all chat turns on
-GDN/MTP models.
+Multi-turn requests reuse the prior turn's state instead of re-prefilling. GDN-hybrid passes snapshot their
+recurrent state at the history boundary (#102) and restore on a prefix match; MTP runs also snapshot the MTP
+attention KV + hidden-history (#106), so agentic tool loops skip the per-round-trip re-prefill. `/metrics`
+exposes `sharpi_prefill_tokens_reused_total` (verify with `scripts/test-snapshot-reuse.ps1`).
 
 ### Reasoning models
 
-Models that emit `<think>...</think>` (Qwen3, DeepSeek-R1, SmolLM3, …) are
-detected automatically from their special tokens — no flag needed. The CLI
-dims the reasoning stream as it generates. Use `--no-thinking` to disable
-reasoning at the chat-template level, `--hide-thinking` to keep it on but
-hide the stream, and `--max-thinking-tokens N` to force-close runaway
-reasoning. Greedy decoding (`--temp 0`) on these models often loops, so
-the CLI warns and recommends `--temp 0.6 --top-p 0.95 --top-k 20`.
-
-The API server surfaces reasoning per each protocol's convention: Anthropic
-`/v1/messages` emits a `thinking` content block before `text`; OpenAI
-`/v1/chat/completions` exposes `reasoning_content` alongside `content`
-(vLLM / DeepSeek style). Anthropic's `thinking.budget_tokens` and an OpenAI
-extension `max_thinking_tokens` both map to the same engine-side budget.
-Prior assistant turns in chat history have their `<think>` blocks stripped
-before templating (Qwen3 and friends are trained without them).
+Models that emit `<think>...</think>` are detected from their special tokens — no flag. The CLI dims the
+reasoning stream. `--no-thinking` disables it at the template level, `--hide-thinking` keeps it on but
+hidden, `--max-thinking-tokens N` force-closes runaway reasoning. Greedy on these models often loops, so the
+CLI recommends `--temp 0.6 --top-p 0.95 --top-k 20`. The server emits reasoning per protocol convention
+(Anthropic `thinking` block; OpenAI `reasoning_content`).
 
 ### CLI examples
 
@@ -253,27 +133,18 @@ before templating (Qwen3 and friends are trained without them).
 dotnet run --project src/SharpInference.Cli -c Release -- \
   -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -p "What is 2+2?" --temp 0
 
-# Full GPU offload (auto-picks CUDA on dense + full offload)
+# Full GPU offload (auto-picks CUDA)
 dotnet run --project src/SharpInference.Cli -c Release -- \
   -m models/Qwen3-8B-Q4_K_M.gguf -p "Write a quicksort in Python" --temp 0 -g -1
 
-# MoE on CPU with 3-bit KV compression (5× less VRAM, full ctx)
+# MoE on CPU with 3-bit KV compression
 dotnet run --project src/SharpInference.Cli -c Release -- \
   -m models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --tq -p "Implement a BST in C#" --temp 0
-
-# Interactive chat (no -p)
-dotnet run --project src/SharpInference.Cli -c Release -- \
-  -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
 
 # Speculative decoding (~2× faster at temp 0)
 dotnet run --project src/SharpInference.Cli -c Release -- \
   -m models/Qwen3-8B-Q4_K_M.gguf --draft-model models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
   -p "Write a binary search in Rust" --temp 0
-
-# Reasoning model: stream shows dimmed <think>...</think>, then the answer
-dotnet run --project src/SharpInference.Cli -c Release -- \
-  -m models/Qwen3-8B-Q4_K_M.gguf -g -1 --temp 0.6 --top-p 0.95 --top-k 20 \
-  -p "What's 17 × 23?" --max-thinking-tokens 1024
 
 # API server (OpenAI /v1/chat/completions + Anthropic /v1/messages, port 5000)
 SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
@@ -282,20 +153,17 @@ SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
 
 ## Image generation
 
-Two pipelines, auto-detected from model filename. Benchmarked on AMD Zen 4
-+ RTX 4070 Ti (CUDA backend, 4 denoising steps, 512×512 output). The CLI is
-a one-shot binary, so each invocation pays the full load + text-encoder
-warmup. The "cached" column is the steady-state cost when the same encoder
-weights stay resident — e.g., re-rendering inside the server or interactive
-loop after the first prompt.
+Two pipelines, auto-detected from model filename. Benchmarked on AMD Zen 4 + RTX 4070 Ti (CUDA, 4 steps,
+512×512). The CLI is one-shot, so each run pays the full load + encoder warmup; the "cached" column is the
+steady-state cost when encoder weights stay resident (server or interactive loop after the first prompt).
 
 | Pipeline | Components (repo • file • size) | Per-run | Cached prompt | Notes |
 |---|---|---:|---:|---|
-| **Z-Image-Turbo** | DiT: [jayn7/Z-Image-Turbo-GGUF](https://huggingface.co/jayn7/Z-Image-Turbo-GGUF) `z_image_turbo-Q5_K_M.gguf` 5.5 GB<br/>Encoder: [BennyDaBall/...-AbliteratedV1](https://huggingface.co/BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1) `Z-Image-AbliteratedV1.Q5_K_M.gguf` 2.9 GB<br/>VAE + tokenizer: [Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) `vae/` `tokenizer/` | **~108 s** | **~30 s** | Most of the per-run cost is text-encoder warmup (~90 s); DiT ~4 s, VAE ~18 s once weights are hot. Output verified visually. |
-| **FLUX.1-schnell** | DiT: [city96/FLUX.1-schnell-gguf](https://huggingface.co/city96/FLUX.1-schnell-gguf) `flux1-schnell-Q4_K_S.gguf` ~7 GB<br/>Encoders + VAE: [comfyanonymous/flux_text_encoders](https://huggingface.co/comfyanonymous/flux_text_encoders) `clip_l.safetensors` + `t5xxl_fp16.safetensors` + `ae.safetensors` | — | — | 4-step distilled; model not on this benchmark machine |
+| **Z-Image-Turbo** | DiT: [jayn7/Z-Image-Turbo-GGUF](https://huggingface.co/jayn7/Z-Image-Turbo-GGUF) `z_image_turbo-Q5_K_M.gguf` 5.5 GB<br/>Encoder: [BennyDaBall/...-AbliteratedV1](https://huggingface.co/BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1) `Z-Image-AbliteratedV1.Q5_K_M.gguf` 2.9 GB<br/>VAE + tokenizer: [Tongyi-MAI/Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) `vae/` `tokenizer/` | **~108 s** | **~30 s** | Most per-run cost is text-encoder warmup (~90 s); DiT ~4 s, VAE ~18 s once hot |
+| **FLUX.1-schnell** | DiT: [city96/FLUX.1-schnell-gguf](https://huggingface.co/city96/FLUX.1-schnell-gguf) `flux1-schnell-Q4_K_S.gguf` ~7 GB<br/>Encoders + VAE: [comfyanonymous/flux_text_encoders](https://huggingface.co/comfyanonymous/flux_text_encoders) `clip_l.safetensors` + `t5xxl_fp16.safetensors` + `ae.safetensors` | — | — | 4-step distilled; not on this bench machine |
 
-Optional **4× upscale** via Real-ESRGAN (`RealESRGAN_x4plus.safetensors`):
-runs on CUDA when available, falls back to bicubic.
+Optional **4× upscale** via Real-ESRGAN (`RealESRGAN_x4plus.safetensors`): runs on CUDA when available,
+falls back to bicubic.
 
 ### CLI examples
 
@@ -307,14 +175,6 @@ dotnet run --project src/SharpInference.Cli -c Release -- image \
   --qwen-encoder models/Z-Image-AbliteratedV1.Q5_K_M.gguf \
   --qwen-tokenizer models/z-image-turbo/tokenizer/tokenizer.json \
   -p "a serene mountain lake at sunrise" -W 1024 -H 1024 --steps 4 -o landscape.png
-
-# FLUX.1-schnell
-dotnet run --project src/SharpInference.Cli -c Release -- image \
-  -m models/flux1-schnell-Q4_K_S.gguf \
-  --vae models/flux/ae.safetensors \
-  --clip-l models/flux/clip_l.safetensors --clip-tokenizer models/flux/tokenizer_clip.json \
-  --t5xxl models/flux/t5xxl_fp16.safetensors --t5-tokenizer models/flux/tokenizer_t5.json \
-  -p "a cinematic photograph of a mountain lake" -W 512 -H 512 --steps 4 -o out.png
 
 # With 4× Real-ESRGAN upscale + blend
 dotnet run --project src/SharpInference.Cli -c Release -- image \
