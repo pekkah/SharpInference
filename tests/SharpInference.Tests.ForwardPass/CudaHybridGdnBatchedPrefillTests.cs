@@ -391,6 +391,74 @@ public sealed class CudaHybridGdnBatchedPrefillTests
     }
 
     /// <summary>
+    /// Issue #121: the GEMM-N-batched dense FFN (<c>BatchedGpuDenseFfn</c>, default) must be
+    /// bit-identical to the per-token FFN fallback (<c>SHARPI_BATCHED_FFN=0</c>). Both arms
+    /// run under batched prefill + batched trunk; only the FFN strategy differs. This is the
+    /// FFN counterpart to <see cref="BatchedTrunk_BitwiseMatchesSequentialTrunk_Carnice"/> —
+    /// the equivalence a user relies on when bisecting a parity regression with the env var,
+    /// otherwise asserted only by prose. (The GPU-SLRU grouped-MoE FFN equivalence is covered
+    /// by <see cref="BatchedTrunkGpuFfn_BitwiseMatchesSequential_GpuSlruMoe"/>, which pins both
+    /// batched flags on.)
+    /// </summary>
+    [Fact]
+    public void BatchedFfn_BitwiseMatchesPerTokenFfn_Dense27BMtp()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindDense27BMtpPath();
+        if (path is null) return;
+
+        bool prevPrefill = CudaHybridGdnForwardPass.BatchedPrefillEnabled;
+        bool prevTrunk = CudaHybridGdnForwardPass.BatchedTrunkEnabled;
+        bool prevFfn = CudaHybridGdnForwardPass.BatchedFfnEnabled;
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            if (hp.IsMoE) return; // dense-only path
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+            var placement = new LayerPlacement(
+                GpuLayers: hp.NumLayers, CpuLayers: 0, GpuWeightBytes: 0, GpuKvBytes: 0,
+                RecommendedCtxSize: Math.Min(hp.ContextLength, 4096));
+            var tokens = tokenizer.Encode(
+                "The quick brown fox jumps over the lazy dog. " +
+                "Pack my box with five dozen liquor jugs. " +
+                "How razorback-jumping frogs can level six piqued gymnasts!");
+            Assert.True(tokens.Count >= 8);
+
+            // Hold prefill + trunk batching on; toggle ONLY the FFN strategy.
+            CudaHybridGdnForwardPass.BatchedPrefillEnabled = true;
+            CudaHybridGdnForwardPass.BatchedTrunkEnabled = true;
+
+            float[] RunWithFfn(bool batchedFfn)
+            {
+                CudaHybridGdnForwardPass.BatchedFfnEnabled = batchedFfn;
+                using var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
+                return fwd.Prefill(tokens).ToArray();
+            }
+
+            float[] perTokenFfn = RunWithFfn(false);
+            float[] batchedFfn  = RunWithFfn(true);
+
+            Assert.Equal(perTokenFfn.Length, batchedFfn.Length);
+            int firstDiff = -1;
+            for (int i = 0; i < perTokenFfn.Length; i++)
+                if (BitConverter.SingleToInt32Bits(perTokenFfn[i]) != BitConverter.SingleToInt32Bits(batchedFfn[i]))
+                { firstDiff = i; break; }
+            Assert.True(firstDiff < 0,
+                $"Batched dense FFN diverges from the per-token FFN at index {firstDiff}. " +
+                "BatchedGpuDenseFfn must be bit-identical to the per-token GpuDenseFfn loop (SHARPI_BATCHED_FFN=0).");
+            Assert.Equal(Sampler.Greedy(perTokenFfn), Sampler.Greedy(batchedFfn));
+        }
+        finally
+        {
+            CudaHybridGdnForwardPass.BatchedPrefillEnabled = prevPrefill;
+            CudaHybridGdnForwardPass.BatchedTrunkEnabled = prevTrunk;
+            CudaHybridGdnForwardPass.BatchedFfnEnabled = prevFfn;
+        }
+    }
+
+    /// <summary>
     /// Issue #119: batched-trunk prefill for the <b>dense</b> GDN-hybrid path
     /// (<c>!hp.IsMoE</c>, Qwen3.6-27B-MTP) — <c>_cpuMoe == false</c>, FFN runs per token
     /// on GPU/CPU. The batched path (<c>PrefillBatchedTrunkGpuFfn</c>) must be bit-identical
@@ -539,13 +607,17 @@ public sealed class CudaHybridGdnBatchedPrefillTests
     }
 
     /// <summary>
-    /// Issue #119 (coverage): SnapKV-active prefill on the dense <c>PrefillBatchedTrunkGpuFfn</c>
-    /// path. SnapKV (issue #58) forces the per-position Q-capture loop inside
-    /// <c>AttnBlockBatched</c> even under batched prefill — a fully reachable branch the
-    /// happy-path dense test skips. With a long-enough prompt and a small
-    /// <c>SHARPI_SNAPKV_BUDGET</c> the batched path must still return final-token logits
-    /// bit-identical to the sequential per-token <c>Forward</c> loop (both capture Q and
-    /// evict identically).
+    /// Issue #119 + #122 (coverage): SnapKV-active prefill on the dense
+    /// <c>PrefillBatchedTrunkGpuFfn</c> path. SnapKV (issue #58) engages the trailing-window
+    /// Q-capture inside <c>AttnBlockBatched</c>. Post-#122 (with <c>BatchedAttnEnabled</c> on,
+    /// the default), the batched arm captures Q in one batched <c>CopyDeviceRegion</c> from
+    /// <c>qAll</c> and runs the batched SDPA — so this oracle now exercises the #122 batched
+    /// capture path (before #122 the SnapKV-active branch fell back to the per-position loop).
+    /// With a long-enough prompt and a small <c>SHARPI_SNAPKV_BUDGET</c> the batched path must
+    /// still return final-token logits bit-identical to the sequential per-token <c>Forward</c>
+    /// loop (both capture Q and evict identically; sequential <c>Forward</c> is the
+    /// deterministic reference). This is the dense ≤4096 counterpart to
+    /// <see cref="SnapKvActive_BatchedWave_BitwiseMatchesSequential_Over4096_Carnice"/>.
     /// </summary>
     [Fact]
     public void BatchedTrunkGpuFfn_SnapKvActive_BitwiseMatchesSequential_Dense27BMtp()
@@ -603,6 +675,99 @@ public sealed class CudaHybridGdnBatchedPrefillTests
     }
 
     /// <summary>
+    /// Issue #122 (&gt;4096): the wave-based SDPA (issue #118) must run with SnapKV active.
+    /// Before #122, SnapKV forced the per-position KV-append + <c>Attention</c> loop (the
+    /// only place the trailing-window Q was captured into <c>_snapKvQCapture</c>), so a
+    /// SnapKV-active &gt;4096 prefill got neither the wave SDPA nor batching. Now
+    /// <c>AttnBlockBatched</c> does a single batched Q-capture from <c>qAll</c> first, then
+    /// runs the wave SDPA. This pins the batched-prefill path (wave SDPA + batched capture,
+    /// <c>SHARPI_BATCHED_PREFILL=1</c>) against the sequential per-token <c>Forward</c> loop
+    /// (<c>=0</c>) — the deterministic reference — and asserts the final-token logits are
+    /// <b>bit-identical</b>.
+    /// <para>
+    /// Why bit-identical (not just greedy-token): the sequential <c>Forward</c> reference is
+    /// run-to-run deterministic under SnapKV (verified — two sequential runs are bit-equal),
+    /// the batched Q-capture copies the same contiguous <c>qAll</c> rows <c>[wStart,N)</c> the
+    /// per-position loop copies, and <c>AttentionBatchedWave</c> is already proven bit-identical
+    /// to the per-position SDPA by the non-SnapKV wave oracle — so the captured Q, the
+    /// eviction keep-set, and the post-eviction logits all match exactly. (The
+    /// <c>BatchedAttnEnabled=false</c> per-position fallback under batched prefill is itself
+    /// nondeterministic and is deliberately NOT used as the reference here.) A small wave
+    /// budget on the batched arm forces the multi-wave loop. Asserts SnapKV engaged
+    /// (<c>Cache.Length == 128</c>) on both arms so the batched Q-capture actually ran.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void SnapKvActive_BatchedWave_BitwiseMatchesSequential_Over4096_Carnice()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindCarnicePath();
+        if (path is null) return;
+
+        var prevCpuMoe = Environment.GetEnvironmentVariable("SHARPI_CPU_MOE");
+        var prevBudget = Environment.GetEnvironmentVariable("SHARPI_ATTN_WAVE_BUDGET_MB");
+        var prevSnap = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_BUDGET");
+        Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", "1");
+        Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", "128");
+        bool prevBatchedPrefill = CudaHybridGdnForwardPass.BatchedPrefillEnabled;
+        bool prevBatchedTrunk = CudaHybridGdnForwardPass.BatchedTrunkEnabled;
+        bool prevAttn = CudaHybridGdnForwardPass.BatchedAttnEnabled;
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            if (!hp.IsMoE) return;
+            if (hp.ContextLength < 4400) return; // need room past the 4096 window
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+            var tokens = LongPrompt(tokenizer, 4200);
+            Assert.True(tokens.Count > 4096, $"Prompt only {tokens.Count} tokens; need >4096.");
+            int ctx = Math.Min(hp.ContextLength, tokens.Count + 64);
+
+            var placement = new LayerPlacement(
+                GpuLayers: hp.NumLayers, CpuLayers: 0, GpuWeightBytes: 0, GpuKvBytes: 0,
+                RecommendedCtxSize: ctx);
+
+            CudaHybridGdnForwardPass.BatchedTrunkEnabled = true;
+            CudaHybridGdnForwardPass.BatchedAttnEnabled = true;
+
+            float[] Run(bool batchedPrefill, string? budgetMb)
+            {
+                CudaHybridGdnForwardPass.BatchedPrefillEnabled = batchedPrefill;
+                Environment.SetEnvironmentVariable("SHARPI_ATTN_WAVE_BUDGET_MB", budgetMb);
+                using var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
+                var logits = fwd.Prefill(tokens).ToArray();
+                // Confirms SnapKV engaged on both arms → the batched Q-capture ran.
+                Assert.Equal(128, fwd.Cache.Length);
+                return logits;
+            }
+
+            float[] seq  = Run(false, null);  // sequential per-token Forward (deterministic reference)
+            float[] wave = Run(true, "8");      // #122 batched capture + wave SDPA (forced multi-wave)
+
+            Assert.Equal(seq.Length, wave.Length);
+            int firstDiff = -1;
+            for (int i = 0; i < seq.Length; i++)
+                if (BitConverter.SingleToInt32Bits(seq[i]) != BitConverter.SingleToInt32Bits(wave[i]))
+                { firstDiff = i; break; }
+            Assert.True(firstDiff < 0,
+                $"SnapKV-active wave batched prefill diverges from sequential at index {firstDiff} " +
+                $"(N={tokens.Count}). The batched Q-capture + AttentionBatchedWave must be bit-identical " +
+                "to the sequential per-token Forward loop's per-position capture + SDPA.");
+            Assert.Equal(Sampler.Greedy(seq), Sampler.Greedy(wave));
+        }
+        finally
+        {
+            CudaHybridGdnForwardPass.BatchedPrefillEnabled = prevBatchedPrefill;
+            CudaHybridGdnForwardPass.BatchedTrunkEnabled = prevBatchedTrunk;
+            CudaHybridGdnForwardPass.BatchedAttnEnabled = prevAttn;
+            Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", prevCpuMoe);
+            Environment.SetEnvironmentVariable("SHARPI_ATTN_WAVE_BUDGET_MB", prevBudget);
+            Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", prevSnap);
+        }
+    }
+
+    /// <summary>
     /// Issue #119: batched-trunk prefill for the <b>GPU-SLRU MoE</b> path — a GDN-hybrid
     /// MoE model forced onto the on-GPU routed-expert path with <c>SHARPI_CPU_MOE=0</c>
     /// (<c>_cpuMoe == false</c>; routed experts run via <c>GpuMoeFfn</c> per token). The
@@ -622,6 +787,14 @@ public sealed class CudaHybridGdnBatchedPrefillTests
         var prevCpuMoe = Environment.GetEnvironmentVariable("SHARPI_CPU_MOE");
         Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", "0"); // force GPU-SLRU MoE
         bool prevBatched = CudaHybridGdnForwardPass.BatchedPrefillEnabled;
+        // The Batched*Enabled flags are static and mutated by sibling tests; this oracle's
+        // batched arm must run the #121 grouped-by-expert BatchedGpuMoeFfn (which requires
+        // both trunk + FFN batching on), not a per-token fallback left behind by another
+        // test. Pin them on explicitly and restore in finally so the parity check isn't vacuous.
+        bool prevTrunk = CudaHybridGdnForwardPass.BatchedTrunkEnabled;
+        bool prevFfn = CudaHybridGdnForwardPass.BatchedFfnEnabled;
+        CudaHybridGdnForwardPass.BatchedTrunkEnabled = true;
+        CudaHybridGdnForwardPass.BatchedFfnEnabled = true;
         try
         {
             using var model = GgufModel.Open(path);
@@ -674,6 +847,8 @@ public sealed class CudaHybridGdnBatchedPrefillTests
         finally
         {
             CudaHybridGdnForwardPass.BatchedPrefillEnabled = prevBatched;
+            CudaHybridGdnForwardPass.BatchedTrunkEnabled = prevTrunk;
+            CudaHybridGdnForwardPass.BatchedFfnEnabled = prevFfn;
             Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", prevCpuMoe);
         }
     }

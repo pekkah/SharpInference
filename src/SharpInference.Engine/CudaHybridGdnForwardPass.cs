@@ -521,6 +521,47 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private Tensor? _gpuBtQHead;     // [N × valueDim] tiled GDN query heads
     private Tensor? _gpuBtKHead;     // [N × valueDim] tiled GDN key heads
 
+    // ── Batched FFN / MoE (issue #121) ─────────────────────────────────────
+    // Device buffers for the GEMM-N-batched FFN stage of PrefillBatchedTrunkGpuFfn:
+    // dense gate/up ([N × intermDim]) + hidden ([N × embDim]); MoE routed gather/
+    // scatter scratch ([N × expertDim] gate/up, [N × na × embDim] down partials, plus
+    // per-expert gather buffers). Sized exactly to N by EnsureBatchedFfnScratch alongside
+    // EnsureBatchedTrunkScratch. Null on the CPU-MoE / CPU-dense-fallback paths.
+    private int _bfCap;
+    private Tensor? _gpuBfGateAll;   // dense: [N × intermDim] gate proj
+    private Tensor? _gpuBfUpAll;     // dense: [N × intermDim] up proj
+    private Tensor? _gpuBfHiddenAll; // dense+MoE: [N × embDim] FFN output / shared-expert out
+    private Tensor? _gpuBfMoeDownPartial; // MoE: [N × na × embDim] unweighted down partials (pre-reduce)
+    private Tensor? _gpuBfMoeGateGathN;   // MoE: [N × expertDim] gathered gate (per used expert, ≤N rows)
+    private Tensor? _gpuBfMoeUpGathN;      // MoE: [N × expertDim] gathered up
+    private Tensor? _gpuBfMoeNormGathN;    // MoE: [N × embDim] gathered routed-token norms (per used expert)
+    private Tensor? _gpuBfMoeDownGathN;    // MoE: [N × embDim] gathered down output (per used expert)
+    private Tensor? _gpuBfMoeRouterAll;    // MoE: [N × numExperts] batched router logits
+    // Host bucket bookkeeping for the GPU-SLRU grouped-by-expert routed pass (issue #121).
+    // Mirrors the CPU-MoE _bExpStart/_bExpTokI/… arrays but lives on the GPU-FFN path,
+    // which never calls EnsureBatchedScratch. Selection / weights / shexp-gate are host
+    // arrays (top-k picked on CPU after a router-logit readback, as in GpuMoeFfn).
+    private int*   _bfSelected;     // [N × na] selected experts (token-major)
+    private float* _bfWeights;      // [N × na] expert weights
+    private float* _bfShexpScale;   // [N] shared-expert sigmoid gate
+    private float* _bfRouterAll;    // [N × numExperts] router-logit readback
+    private float* _bfNormReadback; // [N × embDim] norm readback for shexp-gate dots
+    private int*   _bfExpStart;     // [numExperts+1] CSR offsets
+    private int*   _bfExpCursor;    // [numExperts] fill cursor
+    private int*   _bfExpTokI;      // [N × na] token index, grouped by expert
+    private int*   _bfExpTokK;      // [N × na] slot (top-k rank), grouped by expert
+    private int*   _bfUsedExperts;  // [numExperts] compact list of experts with ≥1 token
+    private int*   _bfGathTokI;     // [N] gather list: row r of gather buffer ← token _bfGathTokI[r]
+
+    // Issue #121: batch the per-token FFN/MoE stage of PrefillBatchedTrunkGpuFfn into
+    // GEMM-N launches (dense gate/up/down over N) and a grouped-by-expert routed-MoE
+    // pass (each cached expert loaded once, matmul'd against all its tokens), with a
+    // per-token top-k-ordered reduce that keeps byte-parity with the sequential
+    // per-token loop. Default on; SHARPI_BATCHED_FFN=0 forces the per-token FFN path
+    // (the bit-exact reference). A/B-toggleable like SHARPI_BATCHED_TRUNK.
+    internal static bool BatchedFfnEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_BATCHED_FFN") != "0";
+
     // Issue #114-B: fuse the per-position GDN recurrence launches into one
     // sequential-scan kernel + batched conv1d/L2norm/tile/silu over N. Default on;
     // SHARPI_BATCHED_GDN_SCAN=0 falls back to the per-position View loop inside
@@ -1491,6 +1532,80 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         F(ref _gpuBtSGate); F(ref _gpuBtSUp);
         F(ref _gpuBtQkvConv); F(ref _gpuBtQHead); F(ref _gpuBtKHead);
         _btCap = 0;
+        // Caller contract: EnsureBatchedFfnScratch(N) must always run AFTER this (the
+        // FFN scratch is sized to the same N as the trunk scratch). PrefillBatchedTrunkGpuFfn
+        // calls EnsureBatchedTrunkScratch then EnsureBatchedFfnScratch in that order, so an
+        // N-change that re-frees the FFN scratch here is immediately re-allocated.
+        FreeBatchedFfnScratch();
+    }
+
+    /// <summary>
+    /// Issue #121: exact-size device scratch for the GEMM-N-batched FFN/MoE stage. Only
+    /// allocated on the GPU-FFN batched-prefill path (dense GPU-FFN layers or GPU-SLRU
+    /// MoE) — the CPU-MoE / CPU-dense-fallback paths never call this. Sized to exactly
+    /// <paramref name="N"/> tokens so the GEMM-N kernels derive
+    /// <c>rows = output.ElementCount / nTok</c> correctly. Reallocated when N changes.
+    /// </summary>
+    private void EnsureBatchedFfnScratch(int N)
+    {
+        if (_bfCap == N) return;
+        FreeBatchedFfnScratch();
+
+        int embDim = _embDim;
+        Tensor A(long elems) => _gpu.Allocate(TensorShape.D1(elems));
+
+        if (_hp.IsMoE)
+        {
+            // GPU-SLRU routed-MoE grouped-by-expert scratch.
+            int na = _numActiveExperts;
+            _gpuBfHiddenAll        = A((long)N * embDim);              // per-token shared-expert out
+            _gpuBfMoeDownPartial   = A((long)N * na * embDim);         // per-(token,slot) down partials
+            _gpuBfMoeNormGathN     = A((long)N * embDim);              // gathered routed-token norms
+            _gpuBfMoeGateGathN     = A((long)N * _expertDim);          // gathered gate proj
+            _gpuBfMoeUpGathN       = A((long)N * _expertDim);          // gathered up proj
+            _gpuBfMoeDownGathN     = A((long)N * embDim);              // gathered down out
+            _gpuBfMoeRouterAll     = A((long)N * _numExperts);         // batched router logits
+
+            long perTokSel = (long)N * na;
+            _bfSelected     = (int*)NativeMemory.Alloc((nuint)perTokSel * sizeof(int));
+            _bfWeights      = (float*)NativeMemory.Alloc((nuint)perTokSel * sizeof(float));
+            _bfShexpScale   = (float*)NativeMemory.Alloc((nuint)N * sizeof(float));
+            _bfRouterAll    = (float*)NativeMemory.Alloc((nuint)((long)N * _numExperts) * sizeof(float));
+            _bfNormReadback = (float*)NativeMemory.Alloc((nuint)((long)N * embDim) * sizeof(float));
+            _bfExpTokI      = (int*)NativeMemory.Alloc((nuint)perTokSel * sizeof(int));
+            _bfExpTokK      = (int*)NativeMemory.Alloc((nuint)perTokSel * sizeof(int));
+            _bfGathTokI     = (int*)NativeMemory.Alloc((nuint)N * sizeof(int));
+            if (_bfExpStart == null)
+            {
+                _bfExpStart    = (int*)NativeMemory.Alloc((nuint)(_numExperts + 1) * sizeof(int));
+                _bfExpCursor   = (int*)NativeMemory.Alloc((nuint)_numExperts * sizeof(int));
+                _bfUsedExperts = (int*)NativeMemory.Alloc((nuint)_numExperts * sizeof(int));
+            }
+        }
+        else
+        {
+            // Dense GPU-FFN gate/up/down batched scratch.
+            _gpuBfGateAll   = A((long)N * _intermDim);
+            _gpuBfUpAll     = A((long)N * _intermDim);
+            _gpuBfHiddenAll = A((long)N * embDim);
+        }
+        _bfCap = N;
+    }
+
+    private void FreeBatchedFfnScratch()
+    {
+        void F(ref Tensor? t) { if (t is { } v) { _gpu.Free(v); t = null; } }
+        F(ref _gpuBfGateAll); F(ref _gpuBfUpAll); F(ref _gpuBfHiddenAll);
+        F(ref _gpuBfMoeDownPartial); F(ref _gpuBfMoeGateGathN); F(ref _gpuBfMoeUpGathN);
+        F(ref _gpuBfMoeNormGathN); F(ref _gpuBfMoeDownGathN); F(ref _gpuBfMoeRouterAll);
+        void FH(ref int* p) { if (p != null) { NativeMemory.Free(p); p = null; } }
+        void FHf(ref float* p) { if (p != null) { NativeMemory.Free(p); p = null; } }
+        FH(ref _bfSelected); FHf(ref _bfWeights); FHf(ref _bfShexpScale);
+        FHf(ref _bfRouterAll); FHf(ref _bfNormReadback);
+        FH(ref _bfExpTokI); FH(ref _bfExpTokK); FH(ref _bfGathTokI);
+        // _bfExpStart/_bfExpCursor/_bfUsedExperts are sized by numExperts (N-independent);
+        // keep them across reallocs and free only in Dispose.
+        _bfCap = 0;
     }
 
     /// <summary>
@@ -1711,10 +1826,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     }
 
     /// <summary>Batched attention block: projections + Q/K norm + RoPE over N tokens;
-    /// batched KV-append + batched-query SDPA by default when SnapKV is inactive — the
-    /// shared-scores fast path (issue #114-B) at <c>startPos+N ≤ 4096</c>, the wave-based
-    /// global-scratch SDPA (issue #118) past it. SnapKV active (or
-    /// <c>SHARPI_BATCHED_ATTN=0</c>) takes the per-position KV-append + SDPA loop.</summary>
+    /// batched KV-append + batched-query SDPA by default — the shared-scores fast path
+    /// (issue #114-B) at <c>startPos+N ≤ 4096</c>, the wave-based global-scratch SDPA
+    /// (issue #118) past it. Issue #122: the batched path also runs with SnapKV active,
+    /// capturing the trailing-window Q in a single batched copy. Only
+    /// <c>SHARPI_BATCHED_ATTN=0</c> takes the per-position KV-append + SDPA loop (which
+    /// keeps its own per-position Q-capture).</summary>
     private void AttnBlockBatched(int layer, int N, int startPos, bool snapKvActive, int wStart,
                                   Tensor norm, Tensor blockOut)
     {
@@ -1733,14 +1850,38 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpu.RoPEPartialBatched(qAll, startPos, _headDim, _ropeDim, _hp.RopeTheta, _numHeads,   N, neox: true);
         _gpu.RoPEPartialBatched(kAll, startPos, _headDim, _ropeDim, _hp.RopeTheta, _numKvHeads, N, neox: true);
 
-        // Issue #114-B / #118: batch the KV-append + SDPA into one launch each when
-        // SnapKV Q-capture is inactive. ≤4096 uses the shared-scores fast path
-        // (AttentionBatched); past 4096 uses the wave-based global-scratch SDPA
-        // (AttentionBatchedWave, issue #118) — both bit-identical to the per-position
-        // loop below (each (head, query) block clones llm_attention). SnapKV active →
-        // fall through to the per-position loop, which captures Q.
-        if (BatchedAttnEnabled && !snapKvActive)
+        // Issue #114-B / #118 / #122: batch the KV-append + SDPA into one launch each.
+        // ≤4096 uses the shared-scores fast path (AttentionBatched); past 4096 uses the
+        // wave-based global-scratch SDPA (AttentionBatchedWave, issue #118) — both
+        // bit-identical to the per-position loop below (each (head, query) block clones
+        // llm_attention). Issue #122: this path now runs with SnapKV active too — the
+        // trailing-window Q-capture is done as a single batched CopyDeviceRegion from
+        // qAll BEFORE the SDPA. This is bit-identical to the per-position capture below:
+        //   • Captured Q — copying contiguous rows [wStart,N) of qAll equals the
+        //     per-position per-row copies of the same qAll rows → byte-identical, because
+        //     the destination slots (i-wStart)=0..(N-1-wStart) for a fixed attnIdx are
+        //     also contiguous (stride qDim).
+        //   • Attention output — AttentionBatched/AttentionBatchedWave are already proven
+        //     bit-identical to the per-position Attention loop; SnapKV only changes which
+        //     Q rows are captured, not the attention math.
+        // The per-position loop below remains the fallback for !BatchedAttnEnabled (and
+        // keeps its own per-position capture for that path).
+        if (BatchedAttnEnabled)
         {
+            // Issue #122: single batched Q-capture for the trailing SnapKV window.
+            // Source rows [wStart,N) of qAll are contiguous, and their destination slots
+            // for this attnIdx are contiguous, so the whole window copies in one shot.
+            if (snapKvActive && N > wStart && _snapKvQCapture is { } snapCapBuf)
+            {
+                int attnIdx = _attnLayerIndexOf[layer];
+                if (attnIdx >= 0)
+                {
+                    long dstOff = (long)attnIdx * _snapKvQCaptureW * qDim;
+                    _gpu.CopyDeviceRegion(snapCapBuf, dstOff * sizeof(float),
+                                          qAll, (long)wStart * qDim * sizeof(float),
+                                          (long)(N - wStart) * qDim * sizeof(float));
+                }
+            }
             bool sharedFast = startPos + N <= 4096;
             if (_kvDType == DType.BFloat16)
             {
@@ -1767,8 +1908,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             return;
         }
 
-        // Per-position KV-append + scaled-dot-product attention (positional →
-        // sequential), plus SnapKV Q-capture for the trailing window.
+        // Fallback (!BatchedAttnEnabled): per-position KV-append + scaled-dot-product
+        // attention (positional → sequential), plus SnapKV Q-capture for the trailing
+        // window. Issue #122: the batched path above now handles the SnapKV-active case,
+        // so this per-position capture only runs when batched attention is disabled.
         for (int i = 0; i < N; i++)
         {
             int pos = startPos + i;
@@ -2029,6 +2172,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         int embDim = _embDim;
         EnsureStreamAll(N);
         EnsureBatchedTrunkScratch(N);
+        // Issue #121: device + host scratch for the batched FFN/MoE stage. Allocated only
+        // when the batched FFN path can actually run on this model (MoE, or ≥1 GPU dense
+        // FFN layer); the CPU-dense-fallback-only / CPU-MoE paths never touch it.
+        if (BatchedFfnEnabled && (_hp.IsMoE || _denseFfnGpuLayers > 0))
+            EnsureBatchedFfnScratch(N);
 
         long t0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         long trunkTicks = 0, ffnTicks = 0;
@@ -2061,37 +2209,66 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             var moeNorm  = _gpuBtMoeNorm!;
             long lt1 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
-            // ── FFN / MoE per token, mirroring Forward's single-token dispatch. Reads
-            //    the batched post-attn norm slice into _gpuNormBuf, writes _gpuHidden,
-            //    adds the postBlock residual, and writes the new residual stream slice.
-            for (int i = 0; i < N; i++)
+            // ── FFN / MoE stage. Issue #121: batch the GPU FFN/MoE over all N tokens
+            //    when possible (dense GPU-FFN layers → GEMM-N gate/up/down; GPU-SLRU MoE
+            //    → grouped-by-expert with a top-k-ordered per-token reduce). Both write
+            //    the combined FFN output into _gpuBfHiddenAll [N × embDim], add the
+            //    postBlock residual batched, and scatter the new residual stream in one
+            //    copy. The per-token fallback (below) covers !BatchedFfnEnabled and the
+            //    dense CPU-mmap-fallback layers (_gpuWFfnGate[layer] == null).
+            bool denseGpuLayer = !isMoe && _gpuWFfnGate is not null && _gpuWFfnGate[layer] is not null;
+            // Issue #121: only batch when every weight that would hit MatMulBatched is a
+            // GEMM-N-supported dtype (Q4_K/Q5_K/Q6_K/F32). Unsupported dtypes (e.g. a Q8_0
+            // router) fall back to the bit-exact per-token loop instead of faulting. Routed
+            // expert weights are constrained to supported dtypes by the slot manager.
+            bool batchLayer = BatchedFfnEnabled
+                && (isMoe ? BatchedMatMulSupported(_gpuWGateInp[layer])
+                          : denseGpuLayer
+                            && BatchedMatMulSupported(_gpuWFfnGate![layer]!)
+                            && BatchedMatMulSupported(_gpuWFfnUp![layer]!)
+                            && BatchedMatMulSupported(_gpuWFfnDown![layer]!));
+            if (batchLayer)
             {
-                _gpu.CopyDeviceRegion(_gpuNormBuf, 0, moeNorm, (long)i * embDim * sizeof(float),
-                                      (long)embDim * sizeof(float));
+                if (isMoe)
+                    BatchedGpuMoeFfn(layer, N, moeNorm, _gpuBfHiddenAll!);
+                else
+                    BatchedGpuDenseFfn(layer, N, moeNorm, _gpuBfHiddenAll!);
 
-                if (!isMoe)
+                // Batched residual add (postBlock) + scatter the whole stream slice.
+                _gpu.AddInPlace(_gpuBfHiddenAll!, blockOut);
+                _gpu.CopyDeviceRegion(stream, 0, _gpuBfHiddenAll!, 0, (long)N * embDim * sizeof(float));
+            }
+            else
+            {
+                for (int i = 0; i < N; i++)
                 {
-                    if (_gpuWFfnGate is not null && _gpuWFfnGate[layer] is not null)
+                    _gpu.CopyDeviceRegion(_gpuNormBuf, 0, moeNorm, (long)i * embDim * sizeof(float),
+                                          (long)embDim * sizeof(float));
+
+                    if (!isMoe)
                     {
-                        GpuDenseFfn(layer);
+                        if (denseGpuLayer)
+                        {
+                            GpuDenseFfn(layer);
+                        }
+                        else
+                        {
+                            _gpu.Download(_gpuNormBuf, (nint)_cpuNormBuf, embDim);
+                            CpuDenseFfn(layer);
+                            _gpu.UploadInto(_gpuHidden, (nint)_cpuMoeHidden, embDim);
+                        }
                     }
                     else
                     {
-                        _gpu.Download(_gpuNormBuf, (nint)_cpuNormBuf, embDim);
-                        CpuDenseFfn(layer);
-                        _gpu.UploadInto(_gpuHidden, (nint)_cpuMoeHidden, embDim);
+                        GpuMoeFfn(layer);
                     }
-                }
-                else
-                {
-                    GpuMoeFfn(layer);
-                }
 
-                _gpu.CopyDeviceRegion(_gpuResidual, 0, blockOut, (long)i * embDim * sizeof(float),
-                                      (long)embDim * sizeof(float));
-                _gpu.AddInPlace(_gpuHidden, _gpuResidual);
-                _gpu.CopyDeviceRegion(stream, (long)i * embDim * sizeof(float),
-                                      _gpuHidden, 0, (long)embDim * sizeof(float));
+                    _gpu.CopyDeviceRegion(_gpuResidual, 0, blockOut, (long)i * embDim * sizeof(float),
+                                          (long)embDim * sizeof(float));
+                    _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+                    _gpu.CopyDeviceRegion(stream, (long)i * embDim * sizeof(float),
+                                          _gpuHidden, 0, (long)embDim * sizeof(float));
+                }
             }
             if (_prefillProfile)
             {
@@ -3732,6 +3909,215 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         GpuMatMulN2(hiddenOut1, hiddenOut2, wDown, gateBuf1, gateBuf2);
     }
 
+    /// <summary>
+    /// Issue #121: dense GPU FFN batched over all <paramref name="N"/> prompt tokens.
+    /// gate/up/down each run as a single GEMM-N launch (<see cref="GpuMatMulBatched"/>)
+    /// over the post-attn-norm rows <paramref name="normAll"/> ([N × embDim]) — one weight
+    /// read per row applied to all N token columns — followed by an elementwise batched
+    /// <c>SiLuMul</c>. Bit-identical to N sequential <see cref="GpuDenseFfn"/> calls: the
+    /// GEMM-N kernels are proven row-for-row equal to the per-token matvec (#119), and
+    /// SiLuMul is per-element. Output written to <paramref name="hiddenAll"/> [N × embDim].
+    /// </summary>
+    private void BatchedGpuDenseFfn(int layer, int N, Tensor normAll, Tensor hiddenAll)
+    {
+        var wGate = _gpuWFfnGate![layer]!;
+        var wUp   = _gpuWFfnUp![layer]!;
+        var wDown = _gpuWFfnDown![layer]!;
+        var gateAll = _gpuBfGateAll!;
+        var upAll   = _gpuBfUpAll!;
+
+        GpuMatMulBatched(gateAll, wGate, normAll, N);
+        GpuMatMulBatched(upAll,   wUp,   normAll, N);
+        _gpu.SiLuMul(gateAll, upAll);
+        GpuMatMulBatched(hiddenAll, wDown, gateAll, N);
+    }
+
+    /// <summary>
+    /// Issue #121: GPU-SLRU routed-MoE FFN batched over <paramref name="N"/> prompt tokens
+    /// at one layer, grouped by selected expert. Mirrors the CPU
+    /// <see cref="BatchedRoutedExperts"/> structure on the GPU: each cached expert is
+    /// loaded once (one <c>GetOrLoad</c> instead of N×na), its tokens' norm rows are
+    /// gathered into a contiguous block, gate/up/down run as GEMM-N over that block, and
+    /// the unweighted down outputs are scattered into a per-(token,slot) partial buffer.
+    /// A final per-token reduce then sums the na partials in top-k slot order (k=0..na-1)
+    /// and adds the per-token shared expert — byte-identical to the sequential
+    /// <see cref="GpuMoeFfn"/> accumulation. Output written to <paramref name="hiddenAll"/>.
+    ///
+    /// <para>Bit-parity rests on: (1) GEMM-N over a gathered contiguous block is row-for-row
+    /// equal to per-token <c>GpuMatMul</c> (#119); (2) the gather/scatter are exact byte
+    /// copies; (3) the reduce visits slots in the same k=0..na-1 order, with the same
+    /// per-token weights, as the sequential <c>AddScaledInPlace</c> loop; (4) the shared
+    /// expert + its sigmoid scalar gate are computed and applied per token exactly as in
+    /// <c>GpuMoeFfn</c>. SLRU access order does not affect loaded weights, so grouping is
+    /// safe.</para>
+    /// </summary>
+    private void BatchedGpuMoeFfn(int layer, int N, Tensor normAll, Tensor hiddenAll)
+    {
+        int embDim = _embDim;
+        int na = _numActiveExperts;
+        int expertDim = _expertDim;
+        int numExperts = _numExperts;
+
+        // ── Phase 0: router (batched) + per-token top-k selection. The router matmul is
+        //    a GEMM-N over normAll, bit-identical to N per-token GpuMatMul(_gpuRouterLogits)
+        //    calls. Softmax is applied per row as N independent Softmax launches over
+        //    numExperts-wide views — bit-identical to the per-token Softmax(_gpuRouterLogits).
+        //    Download once, pick top-k per token on the host exactly as the sequential
+        //    SelectTopK does.
+        var routerAll = _gpuBfMoeRouterAll!;
+        GpuMatMulBatched(routerAll, _gpuWGateInp[layer], normAll, N);
+        for (int i = 0; i < N; i++)
+        {
+            var rowV = _gpu.View(routerAll, (long)i * numExperts, numExperts);
+            try { _gpu.Softmax(rowV); }
+            finally { _gpu.Free(rowV); }
+        }
+        _gpu.Download(routerAll, new Span<float>(_bfRouterAll, (int)((long)N * numExperts)));
+
+        int* selected = _bfSelected!; float* weights = _bfWeights!;
+        for (int i = 0; i < N; i++)
+        {
+            Span<int> sel = new(selected + (long)i * na, na);
+            Span<float> wts = new(weights + (long)i * na, na);
+            SelectTopK(new ReadOnlySpan<float>(_bfRouterAll + (long)i * numExperts, numExperts),
+                       na, sel, wts, _hp.NormalizeMoeTopKWeights);
+        }
+
+        // ── Phase 1: shared expert per token → _gpuBfHiddenAll[i]. Computed exactly as in
+        //    GpuMoeFfn: ffn_down @ (SiLU(gate@x) * (up@x)), then a per-token sigmoid scalar
+        //    gate from ffn_gate_inp_shexp · x. Reads each token's norm into _gpuNormBuf.
+        _gpu.Download(normAll, new Span<float>(_bfNormReadback, (int)((long)N * embDim)));
+        _gpu.Download(_gpuWGateInpShexp[layer], new Span<float>(_hostQ, embDim)); // gate-inp weight (shared across tokens)
+        for (int i = 0; i < N; i++)
+        {
+            _gpu.CopyDeviceRegion(_gpuNormBuf, 0, normAll, (long)i * embDim * sizeof(float),
+                                  (long)embDim * sizeof(float));
+            GpuMatMul(_gpuFfnGate, _gpuWGateShexp[layer], _gpuNormBuf);
+            GpuMatMul(_gpuFfnUp,   _gpuWUpShexp[layer],   _gpuNormBuf);
+            _gpu.SiLuMul(_gpuFfnGate, _gpuFfnUp);
+            GpuMatMul(_gpuSharedOut, _gpuWDownShexp[layer], _gpuFfnGate);
+            // Per-token sigmoid scalar gate (dot on CPU, exactly as GpuMoeFfn).
+            float dot = SimdKernels.DotF32(_hostQ, _bfNormReadback + (long)i * embDim, embDim);
+            float shexpScale = 1.0f / (1.0f + MathF.Exp(-dot));
+            _gpu.ScaleInPlace(_gpuSharedOut, shexpScale);
+            _gpu.CopyDeviceRegion(hiddenAll, (long)i * embDim * sizeof(float),
+                                  _gpuSharedOut, 0, (long)embDim * sizeof(float));
+        }
+
+        // ── Phase 2: bucket (token, slot) by selected expert (CSR), identical to
+        //    BatchedRoutedExperts. Then for each used expert, gather its tokens' norm
+        //    rows contiguously, GEMM-N gate/up/down, and scatter the UNWEIGHTED down
+        //    output into the per-(token,slot) partial buffer.
+        int* expStart = _bfExpStart!; int* cursor = _bfExpCursor!; int* used = _bfUsedExperts!;
+        for (int e = 0; e <= numExperts; e++) expStart[e] = 0;
+        long totalSel = (long)N * na;
+        for (long s = 0; s < totalSel; s++) expStart[selected[s] + 1]++;
+        for (int e = 0; e < numExperts; e++) expStart[e + 1] += expStart[e];
+        for (int e = 0; e < numExperts; e++) cursor[e] = expStart[e];
+        int* expTokI = _bfExpTokI!; int* expTokK = _bfExpTokK!;
+        for (int i = 0; i < N; i++)
+            for (int k = 0; k < na; k++)
+            {
+                int e = selected[(long)i * na + k];
+                int p = cursor[e]++;
+                expTokI[p] = i; expTokK[p] = k;
+            }
+        int numUsed = 0;
+        for (int e = 0; e < numExperts; e++)
+            if (expStart[e + 1] > expStart[e]) used[numUsed++] = e;
+
+        var downPartial = _gpuBfMoeDownPartial!;   // [N × na × embDim]
+        var normGath = _gpuBfMoeNormGathN!;        // [≤N × embDim]
+        var gateGath = _gpuBfMoeGateGathN!;        // [≤N × expertDim]
+        var upGath   = _gpuBfMoeUpGathN!;          // [≤N × expertDim]
+        var downGath = _gpuBfMoeDownGathN!;        // [≤N × embDim]
+        int* gathTokI = _bfGathTokI!;
+
+        for (int u = 0; u < numUsed; u++)
+        {
+            int e = used[u];
+            int pStart = expStart[e], pEnd = expStart[e + 1];
+            int cnt = pEnd - pStart;
+            if (cnt == 0) continue;
+
+            var slot = _expertSlotManager!.GetOrLoad(layer, e);
+
+            // Gather this expert's token norm rows into a contiguous [cnt × embDim] block.
+            for (int g = 0; g < cnt; g++)
+            {
+                int i = expTokI[pStart + g];
+                gathTokI[g] = i;
+                _gpu.CopyDeviceRegion(normGath, (long)g * embDim * sizeof(float),
+                                      normAll, (long)i * embDim * sizeof(float),
+                                      (long)embDim * sizeof(float));
+            }
+
+            // GEMM-N gate/up over the gathered block (bit-identical to per-token matvec),
+            // batched SiLuMul, GEMM-N down. View the gather buffers to exactly cnt rows so
+            // the GEMM-N row/col derivation matches.
+            var normV = _gpu.View(normGath, 0, (long)cnt * embDim);
+            var gateV = _gpu.View(gateGath, 0, (long)cnt * expertDim);
+            var upV   = _gpu.View(upGath,   0, (long)cnt * expertDim);
+            var downV = _gpu.View(downGath, 0, (long)cnt * embDim);
+            try
+            {
+                GpuMatMulBatched(gateV, slot.Gate, normV, cnt);
+                GpuMatMulBatched(upV,   slot.Up,   normV, cnt);
+                _gpu.SiLuMul(gateV, upV);
+                GpuMatMulBatched(downV, slot.Down, gateV, cnt);
+            }
+            finally
+            {
+                _gpu.Free(normV); _gpu.Free(gateV); _gpu.Free(upV); _gpu.Free(downV);
+            }
+
+            // Scatter the UNWEIGHTED down rows into per-(token,slot) partials. The reduce
+            // (Phase 3) applies the top-k weights in slot order, so we keep them unscaled
+            // here — exactly like the CPU Phase-C partials.
+            for (int g = 0; g < cnt; g++)
+            {
+                int i = expTokI[pStart + g];
+                int k = expTokK[pStart + g];
+                long slotIdx = (long)i * na + k;
+                _gpu.CopyDeviceRegion(downPartial, slotIdx * embDim * sizeof(float),
+                                      downGath, (long)g * embDim * sizeof(float),
+                                      (long)embDim * sizeof(float));
+            }
+        }
+
+        // ── Phase 3: per-token ordered reduce. For each token: start from the shared
+        //    expert (already in hiddenAll[i]), then add the na weighted down partials in
+        //    top-k slot order k=0..na-1 — bit-identical to GpuMoeFfn's Clear + per-slot
+        //    AddScaledInPlace(_gpuHidden, expertOut_k, weight_k) followed by + shared.
+        //    (Sequential adds shared LAST; FP add is commutative on the two-operand
+        //    accumulator only when the running order matches. To match exactly we
+        //    accumulate routed-first into _gpuHidden, then add shared — see note.)
+        //    PERF (issue #129): this host loop issues ~N·(na+2) small stream ops; for
+        //    large-N GPU-SLRU prefill the launch overhead undercuts the grouped-GEMM win.
+        //    A single batched weighted-scatter-reduce kernel (preserving this k-order)
+        //    is the follow-up. Correctness/bit-parity are unaffected; this only gates
+        //    the on-GPU-experts (SHARPI_CPU_MOE=0) path, not the CPU-MoE default.
+        for (int i = 0; i < N; i++)
+        {
+            // Routed accumulation in top-k order, starting from zero (matches the
+            // sequential Clear(_gpuHidden) + per-k AddScaledInPlace).
+            _gpu.Clear(_gpuHidden);
+            for (int k = 0; k < na; k++)
+            {
+                long slotIdx = (long)i * na + k;
+                var partV = _gpu.View(downPartial, slotIdx * embDim, embDim);
+                try { _gpu.AddScaledInPlace(_gpuHidden, partV, weights[(long)i * na + k]); }
+                finally { _gpu.Free(partV); }
+            }
+            // Add the per-token shared expert (sequential adds it last).
+            var sharedV = _gpu.View(hiddenAll, (long)i * embDim, embDim);
+            try { _gpu.AddInPlace(_gpuHidden, sharedV); }
+            finally { _gpu.Free(sharedV); }
+            _gpu.CopyDeviceRegion(hiddenAll, (long)i * embDim * sizeof(float),
+                                  _gpuHidden, 0, (long)embDim * sizeof(float));
+        }
+    }
+
     // =================================================================
     //  TryUploadDenseFfnLayers — opportunistically upload as many dense FFN
     //  layers' ffn_gate/up/down to GPU as fit in remaining VRAM. Reserves
@@ -4186,6 +4572,17 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     {
         _gpu.MatMulBatched(outputAll, matrix, inputAll, nTok,
             _gpuWeightDTypes.TryGetValue(matrix.Handle, out var dt) ? dt : DType.Float32);
+    }
+
+    /// Issue #121: true when <paramref name="matrix"/>'s dtype is one of the dtypes
+    /// <see cref="CudaBackend.MatMulBatched"/> implements a GEMM-N kernel for. Gates the
+    /// batched FFN/MoE path so an unsupported dtype falls back to the per-token loop
+    /// instead of throwing NotSupportedException mid-prefill.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool BatchedMatMulSupported(Tensor matrix)
+    {
+        var dt = _gpuWeightDTypes.TryGetValue(matrix.Handle, out var d) ? d : DType.Float32;
+        return dt is DType.Q4_K or DType.Q5_K or DType.Q6_K or DType.Float32;
     }
 
     /// Issue #43: two-input MatMul dispatch — used by GpuDenseFfn2At so the
@@ -4650,6 +5047,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (_bExpStart    != null) NativeMemory.Free(_bExpStart);
         if (_bExpCursor   != null) NativeMemory.Free(_bExpCursor);
         if (_bUsedExperts != null) NativeMemory.Free(_bUsedExperts);
+        // Issue #121: N-independent GPU-MoE bucket arrays (FreeBatchedFfnScratch keeps them).
+        if (_bfExpStart    != null) NativeMemory.Free(_bfExpStart);
+        if (_bfExpCursor   != null) NativeMemory.Free(_bfExpCursor);
+        if (_bfUsedExperts != null) NativeMemory.Free(_bfUsedExperts);
 
         // CPU buffers — _cpuNormBuf is pinned (issue #48).
         CudaBackend.FreePinnedHost((nint)_cpuNormBuf);
