@@ -24,8 +24,12 @@ Multiple GGUF conversions of `google/gemma-4-12B-it` already exist (verified 202
 | `unsloth/gemma-4-12b-it-GGUF` | Q4_K_M / Q5_K_M / Q8_0; tagged `gemma4`, `gemma4_unified` |
 | `lmstudio-community/gemma-4-12B-it-GGUF` | LM Studio community conversions |
 
-Recommended first target: `gemma-4-12b-it-Q4_K_M.gguf` (~7 GB, fits 12 GB VRAM with KV).
-Q8_0 needs the native Q8_0 CUDA matvec kernel (already landed for E4B — Phase 0 of the E4B plan).
+**Primary iteration-1 target: `gemma-4-12b-it-Q4_K_M.gguf`** (~7.3 GB) — fits the 12 GB VRAM
+target (RTX 3060/4070) with full-GPU offload plus KV at a practical 8K–32K context. Q4_K_M
+matvec kernels already exist in the CUDA backend (the workhorse `llm_matvec_q4_k_m` path), so no
+new quant kernel is required for iteration 1. Higher quants are follow-ups: Q5_K_M (~8.4 GB)
+still fits the GPU; Q8_0 (~12.5 GB) needs CUDA-Hybrid layer offload (or a 16 GB card) and the
+native Q8_0 CUDA matvec kernel landed for E4B.
 
 > ⚠️ **Network note:** `huggingface.co` is **not** in this environment's egress allowlist
 > (`curl` → `403 host_not_allowed`). The GGUF must be fetched on a machine with HF access and
