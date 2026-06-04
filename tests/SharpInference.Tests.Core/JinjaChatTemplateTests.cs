@@ -225,4 +225,63 @@ public sealed class JinjaChatTemplateTests
         Assert.Equal("a,b,", Render("{% for k in d.keys() %}{{ k }},{% endfor %}", ctx));
         Assert.Equal("1,2,", Render("{% for v in d.values() %}{{ v }},{% endfor %}", ctx));
     }
+
+    // ── Index/slice on naturally-typed C# lists (issue #131) ─────────────────────
+    // GetIndex / GetSlice used to match only List<object?>. A C# caller naturally builds
+    // a messages list as List<Dictionary<string,object?>>, which (generic invariance) is
+    // NOT a List<object?>, so messages[0] returned null and templates that branch on
+    // messages[0].role == 'system' silently dropped the system block.
+
+    [Fact]
+    public void Index_OnListOfTypedDicts_ResolvesElementAndAttr()
+    {
+        var ctx = new Dictionary<string, object?>
+        {
+            // The "obvious" C# shape — typed list of typed dicts, not List<object?>.
+            ["messages"] = new List<Dictionary<string, object?>>
+            {
+                new() { ["role"] = "system", ["content"] = "You are Ayu." },
+                new() { ["role"] = "user",   ["content"] = "hi" },
+            },
+        };
+        Assert.Equal("system", Render("{{ messages[0].role }}", ctx));
+        Assert.Equal("hi", Render("{{ messages[1].content }}", ctx));
+        // Negative index wraps from the end (the GetIndex path under test).
+        Assert.Equal("user", Render("{{ messages[-1].role }}", ctx));
+    }
+
+    [Fact]
+    public void SystemBlockBranch_OnListOfTypedDicts_IsNotDropped()
+    {
+        // The exact failure shape from issue #131: a Qwen3-style template guarding the
+        // system block on messages[0].role == 'system'.
+        const string src =
+            "{% if messages[0].role == 'system' %}<sys>{{ messages[0].content }}</sys>{% endif %}" +
+            "{% for m in messages %}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{% endfor %}";
+        var ctx = new Dictionary<string, object?>
+        {
+            ["messages"] = new List<Dictionary<string, object?>>
+            {
+                new() { ["role"] = "system", ["content"] = "S" },
+                new() { ["role"] = "user",   ["content"] = "U" },
+            },
+        };
+        Assert.Equal("<sys>S</sys><system>S</system><user>U</user>", Render(src, ctx));
+    }
+
+    [Fact]
+    public void Slice_OnListOfTypedDicts_DropsFirstElement()
+    {
+        // messages[1:] is the common "skip the system message" idiom — exercises GetSlice.
+        var ctx = new Dictionary<string, object?>
+        {
+            ["messages"] = new List<Dictionary<string, object?>>
+            {
+                new() { ["role"] = "system", ["content"] = "S" },
+                new() { ["role"] = "user",   ["content"] = "U" },
+                new() { ["role"] = "assistant", ["content"] = "A" },
+            },
+        };
+        Assert.Equal("U,A,", Render("{% for m in messages[1:] %}{{ m.content }},{% endfor %}", ctx));
+    }
 }
