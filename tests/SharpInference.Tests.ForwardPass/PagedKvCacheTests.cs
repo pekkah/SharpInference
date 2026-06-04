@@ -320,4 +320,46 @@ public sealed unsafe class PagedKvCacheTests : IDisposable
         Assert.Throws<ArgumentException>(() =>
             _cache.Compact(new[] { 3, 1 }));
     }
+
+    /// <summary>
+    /// Issue #130 gate contract: <see cref="PagedKvCache.Length"/> and
+    /// <see cref="PagedKvCache.LogicalLength"/> stay equal through all normal operations
+    /// (Append/IncrementPosition, TruncateTo, Reset) and diverge ONLY after eviction
+    /// (Compact / CompactLengthOnly). The <c>SupportsBatchVerify</c> gate keys off
+    /// <c>Length != LogicalLength</c> as its "eviction occurred" signal, so this invariant
+    /// is load-bearing: if a future cache change broke it, the gate would mis-fire and only
+    /// the heavy dev-box-only GPU oracle would catch it. This locks it in CI (no GPU/model).
+    /// </summary>
+    [Fact]
+    public void LengthAndLogicalLength_EqualExceptAfterEviction()
+    {
+        // Normal appends advance both in lockstep.
+        for (int i = 0; i < 8; i++) AppendToken(_cache, i, 0f);
+        Assert.Equal(8, _cache.Length);
+        Assert.Equal(_cache.Length, _cache.LogicalLength);
+
+        // CompactLengthOnly (the SnapKV host-bookkeeping path) drops the physical
+        // length to the budget K while leaving the logical RoPE position untouched.
+        _cache.CompactLengthOnly(3);
+        Assert.Equal(3, _cache.Length);
+        Assert.Equal(8, _cache.LogicalLength);
+        Assert.NotEqual(_cache.Length, _cache.LogicalLength); // gate would now fire
+
+        // TruncateTo re-synchronizes both (speculative rewind / per-layer prefill reset).
+        _cache.TruncateTo(5);
+        Assert.Equal(5, _cache.Length);
+        Assert.Equal(5, _cache.LogicalLength);
+
+        // Reset zeroes both.
+        _cache.Reset();
+        Assert.Equal(0, _cache.Length);
+        Assert.Equal(0, _cache.LogicalLength);
+
+        // Position-based Compact (keep a subset) also leaves logical length at the
+        // pre-compaction value while physical length shrinks to the kept count.
+        for (int i = 0; i < 8; i++) AppendToken(_cache, i, 0f);
+        _cache.Compact(new[] { 0, 2, 4, 6 });
+        Assert.Equal(4, _cache.Length);
+        Assert.Equal(8, _cache.LogicalLength);
+    }
 }

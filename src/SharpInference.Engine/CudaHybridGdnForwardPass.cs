@@ -3026,13 +3026,32 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     //  27B-MTP layers are CPU FFN under realistic 12 GB VRAM budgets.
     // =================================================================
 
+    /// <summary>True when the attention KV cache has been SnapKV-compacted, i.e.
+    /// the physical slot count (<see cref="PagedKvCache.Length"/>) has dropped
+    /// below the logical RoPE position (<see cref="PagedKvCache.LogicalLength"/>).
+    /// <c>IncrementPosition</c> advances both together and <c>TruncateTo</c>/<c>Reset</c>
+    /// keep them equal, so this is an exact, stable "eviction occurred" signal that
+    /// is false in all normal (non-evicted) operation (issue #130). Only meaningful
+    /// when this config has attention layers (<c>_numAttnLayers &gt; 0</c>); a
+    /// pure-GDN model never compacts. <c>_kvCache</c> is always constructed, but the
+    /// null-guard mirrors the defensive style used elsewhere.</summary>
+    private bool KvCacheCompacted =>
+        _numAttnLayers > 0 && _kvCache is not null && _kvCache.Length != _kvCache.LogicalLength;
+
     /// <inheritdoc />
     /// Issue #45: MoE MTP is supported via the CPU-MoE path (SHARPI_CPU_MOE=1 or
     /// auto-routed on 12 GB-class cards). Full-GPU MoE (rare, ≥24 GB cards) still
     /// falls back to sequential decode — folding a 2-token batched-verify into
     /// GpuMoeFfn's SLRU loop is tracked separately.
+    /// Issue #130: batched-verify (BatchForward2) cannot run on a SnapKV-evicted
+    /// cache — its precondition requires _kvCache.Length == startPos (the logical
+    /// RoPE position), but eviction leaves Length at the budget K while the logical
+    /// position stays at the prompt length N. We gate off when the cache is compacted
+    /// so MtpDecoder falls back to the eviction-safe sequential Forward path; making
+    /// batched-verify coexist with eviction is the #130 follow-up.
     public bool SupportsBatchVerify => _hasMtp
         && (!_hp.IsMoE || _cpuMoe)
+        && !KvCacheCompacted
         && Environment.GetEnvironmentVariable("SHARPI_DISABLE_BATCH_VERIFY") != "1";
 
     /// <inheritdoc />
@@ -3052,7 +3071,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             throw new ArgumentOutOfRangeException(nameof(startPos), startPos, "startPos must be >= 0.");
         if (_kvCache.Length != startPos)
             throw new InvalidOperationException(
-                $"BatchForward2: _kvCache.Length={_kvCache.Length} != startPos={startPos}.");
+                $"BatchForward2: _kvCache.Length={_kvCache.Length} != startPos={startPos}. " +
+                "A SnapKV-evicted (compacted) cache is unsupported here (issue #130) — callers " +
+                "must check SupportsBatchVerify, which returns false once the cache is compacted, " +
+                "and fall back to the sequential Forward path.");
         if (_gdnStateCache.Length != startPos)
             throw new InvalidOperationException(
                 $"BatchForward2: _gdnStateCache.Length={_gdnStateCache.Length} != startPos={startPos}.");

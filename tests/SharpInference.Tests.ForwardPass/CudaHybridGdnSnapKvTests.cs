@@ -146,6 +146,107 @@ public sealed class CudaHybridGdnSnapKvTests
     }
 
     /// <summary>
+    /// Issue #130 regression: with SnapKV eviction active on an MTP model, the
+    /// first MTP batched-verify decode iteration used to throw
+    /// <c>BatchForward2: _kvCache.Length=K != startPos=N</c> because eviction
+    /// leaves the physical slot count (<see cref="PagedKvCache.Length"/>) at the
+    /// budget K while the logical RoPE position (<see cref="PagedKvCache.LogicalLength"/>)
+    /// stays at the prompt length N, and the decoder passes the logical position as
+    /// <c>startPos</c>. The fix gates <see cref="CudaHybridGdnForwardPass.SupportsBatchVerify"/>
+    /// to false once the cache is compacted, so <see cref="MtpDecoder"/> falls back
+    /// to the eviction-safe sequential <c>Forward</c> path.
+    ///
+    /// This is a no-crash + coherence test (not bit-parity): decode must complete
+    /// without throwing and produce non-degenerate output (first argmax != EOS,
+    /// ≥2 distinct tokens) — IsFinite alone passes on all-EOS degenerate output.
+    /// </summary>
+    [Fact]
+    public void CudaHybridGdnSnapKv_MtpDecode_AfterEviction_DoesNotCrash_StaysCoherent()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        var path = FindMtpModelPath();
+        if (path is null) return;
+
+        const int budget = 128;
+        const int promptTargetLen = 320;
+
+        var prev = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_BUDGET");
+        Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", budget.ToString());
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+
+            var placement = new LayerPlacement(
+                GpuLayers: hp.NumLayers,
+                CpuLayers: 0,
+                GpuWeightBytes: 0,
+                GpuKvBytes: 0,
+                RecommendedCtxSize: Math.Min(hp.ContextLength, 2048));
+
+            CudaHybridGdnForwardPass fwd;
+            try
+            {
+                fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
+            }
+            catch (NotSupportedException) { return; }   // unsupported config — skip
+            catch (InvalidOperationException) { return; } // VRAM / construction — skip
+
+            using (fwd)
+            {
+                // Model must ship an MTP head for this path to be exercised.
+                if (!fwd.HasMtpHead) return;
+
+                var tokens = LongPrompt(tokenizer, promptTargetLen);
+                Assert.True(tokens.Length >= budget + SnapKvSelector.DefaultWindow,
+                    $"Prompt too short ({tokens.Length}) — SnapKV gate requires it to exceed budget + window.");
+
+                var prefillLogits = fwd.Prefill(tokens).ToArray();
+
+                // NON-VACUOUS: eviction must actually have occurred, otherwise we'd
+                // never exercise the evicted-cache decode path this test targets.
+                Assert.Equal(budget, fwd.Cache.Length);
+                Assert.Equal(tokens.Length, fwd.Cache.LogicalLength);
+
+                // The gate must have engaged: Length != LogicalLength ⇒ SupportsBatchVerify
+                // is false even though the model otherwise supports batched verify.
+                Assert.False(fwd.SupportsBatchVerify,
+                    "Expected the #130 gate to disable batched-verify on a compacted cache.");
+
+                var decoder = new MtpDecoder(fwd);
+                decoder.Initialize(tokens.Length, prefillLogits);
+
+                var produced = new List<int>(32);
+                int[] stops = tokenizer.EogTokenIds.ToArray();
+
+                // PRIMARY assertion: this must NOT throw. Pre-fix it threw the
+                // BatchForward2 InvalidOperationException on the first iteration.
+                decoder.Decode(
+                    maxTokens: 24,
+                    stopTokenIds: stops,
+                    emitToken: produced.Add);
+
+                // COHERENCE: first emitted token must not be EOS, and there must be
+                // multi-token variety (IsFinite-only passes on degenerate all-EOS).
+                Assert.NotEmpty(produced);
+                Assert.DoesNotContain(produced[0], stops);
+                int distinct = produced.Distinct().Count();
+                Assert.True(distinct >= 2,
+                    $"MTP decode after eviction produced only {distinct} distinct token(s): " +
+                    $"[{string.Join(",", produced)}]. Degenerate output suggests the " +
+                    "post-eviction sequential Forward fallback is broken.");
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", prev);
+        }
+    }
+
+    /// <summary>
     /// With <c>SHARPI_SNAPKV_BUDGET</c> unset and a small configured context,
     /// the cache size sits below <see cref="SnapKvConfig.AutoEnableMinCacheBytes"/>
     /// and the auto-budget stays disabled. Verifies the cache-size threshold
@@ -184,6 +285,14 @@ public sealed class CudaHybridGdnSnapKvTests
 
             Assert.Equal(tokens.Length, fwd.Cache.Length);
             Assert.Equal(tokens.Length, fwd.Cache.LogicalLength);
+
+            // Gate false-positive guard (issue #130): with no eviction the cache is not
+            // compacted (Length == LogicalLength), so the #130 gate must NOT fire — an
+            // MTP model still reports batched-verify as available here.
+            if (fwd.HasMtpHead)
+                Assert.True(fwd.SupportsBatchVerify,
+                    "SupportsBatchVerify must stay true when the cache was not evicted; " +
+                    "the #130 gate should only disable batched-verify on a compacted cache.");
         }
         finally
         {

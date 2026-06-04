@@ -135,7 +135,17 @@ public sealed class MtpDecoder
         // Treat 0 and negative as the default (argmax-match) for back-compat with
         // callers that left SpecDraftPMin at the previous default of 0f.
         if (pMin <= 0f) pMin = 1f;
-        if (_fwd.SupportsBatchVerify)
+        // SupportsBatchVerify is evaluated once here and we commit to one path for the
+        // whole loop. Issue #130: it returns false when the KV cache is SnapKV-compacted,
+        // so an evicted cache routes to the eviction-safe sequential path. This relies on
+        // eviction being prefill-only (all ApplySnapKvEviction call sites are in Prefill) —
+        // if decode-time/rolling eviction is ever added, BatchForward2's precondition would
+        // need to handle a mid-loop compaction rather than this once-per-Decode gate.
+        bool batched = _fwd.SupportsBatchVerify;
+        if (Environment.GetEnvironmentVariable("SHARPI_TRACE_MTP") == "1")
+            Console.Error.WriteLine(
+                $"[mtp] batched-verify {(batched ? "ON" : "OFF (cache compacted / unsupported config)")}");
+        if (batched)
         {
             DecodeBatched(maxTokens, stopTokenIds, emitToken, pMin, ct);
             return;
