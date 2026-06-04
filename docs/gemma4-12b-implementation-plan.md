@@ -59,7 +59,7 @@ the 31B dense model."
 | GQA | 8 query / 4 KV heads (pattern; confirm counts from GGUF) | ✅ metadata-driven |
 | Dual RoPE base | 10 000 (SWA) / 1 000 000 (global) | ✅ `RopeTheta` / `RopeThetaSwa` |
 | Proportional RoPE (p-RoPE, p≈0.25) on global layers | high freqs rotated, low-freq pairs frozen via `rope_freqs.weight` | ✅ `_gpuRopeFreqs`, applied to global layers only |
-| Shared-KV tail layers | yes (`shared_kv_layers`) | ✅ `KvSourceLayer[]` |
+| Shared-KV tail layers | **expected none** — `shared_kv_layers == 0` on dense (E-series-only feature); confirm in Phase 0 | ✅ `KvSourceLayer[]` (all entries `-1` when 0); metadata-driven either way |
 | Final-logit softcap | 30.0 | ✅ `FinalLogitSoftcap` + `SoftcapInPlace` |
 | **Per-Layer Embeddings (PLE)** | **NOT present** (dense) — `per_layer_*` tensors omitted | ⚠️ gated on `HasPerLayerTokenEmbd`, but the **false** branch is untested |
 | **`layer_output_scale`** | likely absent on dense (confirm) | ⚠️ gated on `HasLayerOutputScale`; false branch untested |
@@ -204,7 +204,7 @@ scope for this plan; tracked separately.
 3. Confirm `per_layer_*` tensors are **absent** and `layer_output_scale` absent (dense).
 4. Confirm `rope_freqs.weight` present and its length (`maxHeadDim/2` ⇒ 256).
 5. `sliding_window == 1024`? `sliding_window_pattern` length == block_count, final entry global?
-6. `shared_kv_layers` count for the dense trunk (drives KV aliasing layout).
+6. Confirm `shared_kv_layers == 0` for the dense trunk (expected — no KV aliasing; shared-KV is an E-series feature). If non-zero, `KvSourceLayer[]` drives the aliasing layout.
 7. Does the text GGUF embed any multimodal projection tensors, or is `mmproj` fully separate?
 
 ## 6. Honest scope estimate
