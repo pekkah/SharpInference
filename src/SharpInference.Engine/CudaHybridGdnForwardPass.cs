@@ -4092,6 +4092,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         //    (Sequential adds shared LAST; FP add is commutative on the two-operand
         //    accumulator only when the running order matches. To match exactly we
         //    accumulate routed-first into _gpuHidden, then add shared — see note.)
+        //    PERF (issue #129): this host loop issues ~N·(na+2) small stream ops; for
+        //    large-N GPU-SLRU prefill the launch overhead undercuts the grouped-GEMM win.
+        //    A single batched weighted-scatter-reduce kernel (preserving this k-order)
+        //    is the follow-up. Correctness/bit-parity are unaffected; this only gates
+        //    the on-GPU-experts (SHARPI_CPU_MOE=0) path, not the CPU-MoE default.
         for (int i = 0; i < N; i++)
         {
             // Routed accumulation in top-k order, starting from zero (matches the
