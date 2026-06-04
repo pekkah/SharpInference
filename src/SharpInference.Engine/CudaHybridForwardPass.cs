@@ -12,7 +12,7 @@ namespace SharpInference.Engine;
 
 /// <summary>
 /// Hybrid GPU/CPU forward pass for models larger than VRAM.
-/// First N layers run on GPU (Vulkan compute shaders), remaining layers on CPU (AVX2 SIMD).
+/// First N layers run on GPU (CUDA / cuBLAS + NVRTC kernels), remaining layers on CPU (AVX2 SIMD).
 /// Hidden state transfers via pinned host memory at GPU↔CPU boundaries.
 /// </summary>
 public sealed unsafe class CudaHybridForwardPass : IForwardPass
@@ -151,6 +151,42 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     // Null when not MoE or there are no GPU layers. Loads are synchronous on miss
     // (no prefetcher): the GDN path established this is fast enough for k=8 decode.
     private readonly CudaExpertSlotManager? _expertSlotManager;
+
+    // ── Issue #123: batched-trunk prompt prefill ──────────────────────────────
+    // Gate (default ON). When set, Prefill dispatches the supported configs to the
+    // batched-trunk path (PrefillBatchedTrunk); otherwise the per-token Forward loop.
+    internal static bool BatchedPrefillEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_BATCHED_PREFILL") != "0";
+
+    // Test observable (issue #123): set by Prefill to whether the last call dispatched the
+    // batched-trunk path (true) or fell back to the per-token loop (false). Lets the parity
+    // oracles assert the batched path actually ran instead of passing vacuously when the
+    // config is gated out (e.g. CPU-resident embedding / non-batchable dtype on a given box).
+    internal bool LastPrefillWasBatched;
+
+    // Device scratch for the batched attention trunk, allocated lazily by
+    // EnsureBatchedTrunkScratch(N) and sized to the largest N seen so far. The
+    // residual-stream buffer [N × embDim] carries the hidden state across layers;
+    // the q/k/v/attnOut/norm buffers are the batched analogues of the per-token
+    // _gpuQ/_gpuK/_gpuV/_gpuAttnOut/_gpuNormBuf.
+    private Tensor? _gpuBpStream;     // [N × embDim]
+    private Tensor? _gpuBpNormAll;    // [N × embDim]  (attn-norm / ffn-norm output)
+    private Tensor? _gpuBpQ;          // [N × numHeads*headDim]
+    private Tensor? _gpuBpK;          // [N × numKvHeads*headDim]
+    private Tensor? _gpuBpV;          // [N × numKvHeads*headDim]
+    private Tensor? _gpuBpAttnOut;    // [N × numHeads*headDim]
+    private Tensor? _gpuBpBlockOut;   // [N × embDim]  (o-proj out + post-attn residual)
+    private int _bpCapN;              // current capacity (tokens) of the buffers above
+    // Pinned host buffer for the batched GPU→CPU hidden transfer [N × embDim].
+    private Tensor? _pinnedHiddenAll;
+    private int _pinnedHiddenAllN;
+
+    // Non-transactional fault latch (mirror of CudaHybridGdnForwardPass._faulted):
+    // set at batched-prefill entry, cleared only after the KV/position counters have
+    // been advanced consistently. A mid-prefill throw leaves the KV cache partially
+    // appended while _kvLength still reads the chunk start, so any retry on this pass
+    // would run on inconsistent state. ThrowIfFaulted() blocks that.
+    private bool _faulted;
 
     public int MaxSeqLen => _maxSeqLen;
     public LayerPlacement Placement => _placement;
@@ -766,6 +802,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
 
     public ReadOnlySpan<float> Forward(int token, int position)
     {
+        ThrowIfFaulted();
         if (_isGemma4Like) return ForwardGemma4(token, position);
 
         // ── Phase 1: GPU layers ──
@@ -902,10 +939,350 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     /// <inheritdoc/>
     public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0)
     {
+        ThrowIfFaulted();
+        int n = tokens.Count;
+        // Issue #123: batched-trunk prefill for the supported pure-attention configs
+        // (non-Gemma4, non-TurboQuant, NEOX RoPE, learned/no QK-norm — never L2). The
+        // batched trunk collapses the per-position attention launches whose cost grows
+        // with context. Everything else falls back to the bit-exact per-token loop.
+        if (BatchedPrefillEnabled && n >= 2 && IsBatchedPrefillSupported)
+        {
+            LastPrefillWasBatched = true;
+            return PrefillBatchedTrunk(tokens, startPos);
+        }
+
+        LastPrefillWasBatched = false;
         ReadOnlySpan<float> logits = default;
-        for (int i = 0; i < tokens.Count; i++)
+        for (int i = 0; i < n; i++)
             logits = Forward(tokens[i], startPos + i);
         return logits;
+    }
+
+    /// <summary>
+    /// Configs the issue-#123 batched-trunk prefill handles bit-identically. Gemma 4
+    /// (per-layer head_dim / dual-RoPE / PLE), TurboQuant-KV, non-NEOX RoPE (the only
+    /// batched RoPE kernel is NEOX), and L2 QK-norm (no batched HeadNormPure) all fall
+    /// back to the per-token <see cref="Forward"/> loop. Qwen3-Coder-30B (NEOX, learned
+    /// QK-norm, no attn-bias, MoE, GPU-resident embedding) is supported.
+    /// <para>
+    /// CPU-resident embedding (<c>_gpuEmbedding is null</c>, a low-VRAM config) is gated
+    /// OUT: the batched embed loop would have to drain the stream between tokens to avoid
+    /// a write-after-read race on the shared <c>_pinnedHidden</c> staging buffer (the
+    /// per-token <see cref="Forward"/> path is safe only because it syncs once per token).
+    /// Rather than ship that uncovered path, fall back to the bit-exact per-token loop.
+    /// </para>
+    /// </summary>
+    private bool IsBatchedPrefillSupported =>
+        !_isGemma4Like
+        && !_tqEnabled
+        && _gpuEmbedding is not null
+        && _hp.IsNeoxRope
+        && !(_hasQkNorm && _hp.UseL2QkNorm)
+        && !_hasAttnBias
+        && BatchedTrunkWeightsSupported();
+
+    // The trunk's batched q/k/v/o GEMM-N kernels only handle Q4_K/Q5_K/Q6_K/F32. A
+    // model with e.g. a Q8_0 attention weight must fall back to the per-token loop
+    // rather than fault mid-prefill. Checked once per Prefill (cheap: 4 × nGpuLayers).
+    private bool BatchedTrunkWeightsSupported()
+    {
+        for (int i = 0; i < _nGpuLayers; i++)
+            if (!Batchable(_gpuWq[i]) || !Batchable(_gpuWk[i]) ||
+                !Batchable(_gpuWv[i]) || !Batchable(_gpuWo[i]))
+                return false;
+        return true;
+
+        bool Batchable(Tensor t)
+        {
+            var dt = _gpuWeightDTypes.TryGetValue(t.Handle, out var d) ? d : DType.Float32;
+            return dt is DType.Q4_K or DType.Q5_K or DType.Q6_K or DType.Float32;
+        }
+    }
+
+    private void ThrowIfFaulted()
+    {
+        if (_faulted)
+            throw new InvalidOperationException(
+                "CudaHybridForwardPass is in a faulted state: a previous batched prefill threw " +
+                "after mutating the KV cache but before advancing its length counters, leaving the " +
+                "cache inconsistent. This pass must be discarded (reload the model).");
+    }
+
+    // ================================================================
+    //  Issue #123: batched-trunk prompt prefill
+    // ================================================================
+
+    /// <summary>
+    /// (Re)allocate the batched-trunk device scratch to hold exactly <paramref name="n"/>
+    /// tokens. Exact-size — not grow-only — so the stream / norm buffers' element counts
+    /// always equal <c>n × embDim</c>, which the whole-buffer CopyDevice / AddInPlace
+    /// launches rely on (mirrors CudaHybridGdnForwardPass.EnsureStreamAll).
+    /// </summary>
+    private void EnsureBatchedTrunkScratch(int n)
+    {
+        if (_bpCapN == n && _gpuBpStream is not null) return;
+        FreeBatchedTrunkScratch();
+        long qDim = (long)_numHeads * _headDim;
+        long kvDim = (long)_numKvHeads * _headDim;
+        _gpuBpStream   = _gpu.Allocate(TensorShape.D1((long)n * _embDim));
+        _gpuBpNormAll  = _gpu.Allocate(TensorShape.D1((long)n * _embDim));
+        _gpuBpBlockOut = _gpu.Allocate(TensorShape.D1((long)n * _embDim));
+        _gpuBpQ        = _gpu.Allocate(TensorShape.D1((long)n * qDim));
+        _gpuBpK        = _gpu.Allocate(TensorShape.D1((long)n * kvDim));
+        _gpuBpV        = _gpu.Allocate(TensorShape.D1((long)n * kvDim));
+        _gpuBpAttnOut  = _gpu.Allocate(TensorShape.D1((long)n * qDim));
+        _bpCapN = n;
+    }
+
+    private void FreeBatchedTrunkScratch()
+    {
+        if (_gpuBpStream is { } s)   { _gpu.Free(s);   _gpuBpStream = null; }
+        if (_gpuBpNormAll is { } na) { _gpu.Free(na);  _gpuBpNormAll = null; }
+        if (_gpuBpBlockOut is { } b) { _gpu.Free(b);   _gpuBpBlockOut = null; }
+        if (_gpuBpQ is { } q)        { _gpu.Free(q);   _gpuBpQ = null; }
+        if (_gpuBpK is { } k)        { _gpu.Free(k);   _gpuBpK = null; }
+        if (_gpuBpV is { } v)        { _gpu.Free(v);   _gpuBpV = null; }
+        if (_gpuBpAttnOut is { } ao) { _gpu.Free(ao);  _gpuBpAttnOut = null; }
+        _bpCapN = 0;
+    }
+
+    // Exact-size (matches EnsureBatchedTrunkScratch) so CopyDevice(pinnedAll, stream)
+    // has equal element counts on both sides.
+    private Tensor EnsurePinnedHiddenAll(int n)
+    {
+        if (_pinnedHiddenAll is { } p && _pinnedHiddenAllN == n) return p;
+        if (_pinnedHiddenAll is { } old) { _gpu.Free(old); _pinnedHiddenAll = null; }
+        _pinnedHiddenAll = _gpu.AllocatePinned(TensorShape.D1((long)n * _embDim));
+        _pinnedHiddenAllN = n;
+        return _pinnedHiddenAll;
+    }
+
+    /// <summary>
+    /// Batched-trunk prompt prefill for the pure-attention hybrid path (issue #123).
+    /// The attention trunk of the <c>_nGpuLayers</c> GPU layers runs as batched launches
+    /// over the N prompt tokens (RmsNormBatched → MatMulBatched q/k/v → RoPE-batched →
+    /// HeadNorm-batched → KvAppendBatched → AttentionBatched/Wave → MatMulBatched o-proj →
+    /// batched residual), collapsing the per-position attention launches whose cost grows
+    /// with context. The FFN/MoE stage stays per token (the issue's "batched-TRUNK" scope):
+    /// the SLRU expert loads / dense GEMV are amortized over the prompt cheaply enough, and
+    /// per-token reuse of <see cref="GpuMoeFfn"/>/<see cref="GpuDenseFfn"/> keeps the FFN
+    /// math bit-identical to <see cref="Forward"/>. The CPU layers (when <c>_nCpuLayers &gt;
+    /// 0</c>, as on Qwen3-Coder-30B with -g auto) then run per token over the N hidden rows.
+    ///
+    /// <para>Produces bit-identical KV cache and final-token logits to the sequential
+    /// per-token <see cref="Forward"/> loop: every batched trunk kernel runs the same
+    /// per-row math as its single-token counterpart (proven by the backend per-kernel
+    /// oracles), and the FFN/CPU stages run the identical single-token sequences.</para>
+    ///
+    /// <para><b>Not transactional</b> (mirror of CudaHybridGdnForwardPass): the KV pages are
+    /// written as the trunk runs but <c>_kvLength</c> / the CPU KV position counters are
+    /// advanced only at the end, so a mid-prefill throw leaves the cache inconsistent
+    /// (<c>_faulted</c> latched). Such a failure is fatal for this pass.</para>
+    /// </summary>
+    private ReadOnlySpan<float> PrefillBatchedTrunk(IReadOnlyList<int> tokens, int startPos)
+    {
+        int N = tokens.Count;
+        int embDim = _embDim;
+        EnsureBatchedTrunkScratch(N);
+        var stream = _gpuBpStream!;
+
+        // Pessimistic fault latch: the KV append below is committed to the cache tensors
+        // immediately, but the length counters (_kvLength / CPU KV positions) are advanced
+        // only at the end. Clear only once they are consistent (step 5).
+        _faulted = true;
+
+        // 1. Embed every token into the residual-stream buffer [N × embDim].
+        //    Only the GPU-resident-embedding path runs here: CPU-resident embedding is
+        //    gated out of the batched path (IsBatchedPrefillSupported requires
+        //    _gpuEmbedding is not null) because reusing the shared _pinnedHidden staging
+        //    buffer across tokens without a per-token drain would race the async copy.
+        if (_gpuEmbedding is null)
+            throw new InvalidOperationException(
+                "Batched-trunk prefill requires a GPU-resident embedding (gated by IsBatchedPrefillSupported).");
+        for (int i = 0; i < N; i++)
+        {
+            if (_embIsQuantized) _gpu.EmbedLookupQ4K(_gpuEmbedding, _gpuHidden, tokens[i], embDim);
+            else                 _gpu.EmbedLookup(_gpuEmbedding, _gpuHidden, tokens[i], embDim);
+            _gpu.CopyDeviceRegion(stream, (long)i * embDim * sizeof(float),
+                                  _gpuHidden, 0, (long)embDim * sizeof(float));
+        }
+
+        // 2. GPU layers: batched attention trunk + per-token FFN/MoE.
+        for (int i = 0; i < _nGpuLayers; i++)
+            GpuLayerBatchedTrunk(i, N, startPos);
+
+        // 3. CPU layers (if any): transfer the N hidden rows GPU→CPU in one batched copy,
+        //    then run each CPU layer per token over the N rows (reusing CpuLayer). The
+        //    CPU KV cache is positional, so token i must run all CPU layers at position
+        //    startPos+i before token i+1 — i.e. loop tokens outer, layers inner, exactly
+        //    as the sequential Forward loop would.
+        if (_nCpuLayers > 0)
+        {
+            var pinnedAll = EnsurePinnedHiddenAll(N);
+            _gpu.CopyDevice(pinnedAll, stream);     // device stream → pinned host (N × embDim)
+            _gpu.Synchronize();
+            float* hostAll = _gpu.MapPinned(pinnedAll);
+
+            for (int i = 0; i < N; i++)
+            {
+                int position = startPos + i;
+                new ReadOnlySpan<float>(hostAll + (long)i * embDim, embDim)
+                    .CopyTo(new Span<float>(_cpuHidden, embDim));
+
+                for (int ci = 0; ci < _nCpuLayers; ci++)
+                    CpuLayer(ci, position);
+
+                if (_cpuTqKvCache != null) _cpuTqKvCache.IncrementPosition();
+                else                       _cpuKvCache.IncrementPosition();
+
+                // Only the LAST token's hidden feeds the output projection; copy it back.
+                if (i == N - 1)
+                    new ReadOnlySpan<float>(_cpuHidden, embDim)
+                        .CopyTo(new Span<float>(hostAll + (long)i * embDim, embDim));
+            }
+            _gpu.UnmapPinned(pinnedAll);
+
+            // Bring the last token's (CPU) hidden back to _gpuHidden for the output stage,
+            // or compute the output entirely on CPU when there is no GPU output weight.
+            if (_gpuOutputWeight is null)
+            {
+                _kvLength = startPos + N;
+                _faulted = false;
+                ComputeCpuOutput();
+                return _logitsBuf;
+            }
+
+            float* pinned = _gpu.MapPinned(_pinnedHidden);
+            new ReadOnlySpan<float>(_cpuHidden, embDim).CopyTo(new Span<float>(pinned, embDim));
+            _gpu.UnmapPinned(_pinnedHidden);
+            _gpu.CopyDevice(_gpuHidden, _pinnedHidden);
+        }
+        else
+        {
+            // All-GPU: the last token's hidden is the final stream row.
+            _gpu.CopyDeviceRegion(_gpuHidden, 0, stream, (long)(N - 1) * embDim * sizeof(float),
+                                  (long)embDim * sizeof(float));
+
+            if (_gpuOutputWeight is null)
+            {
+                // No GPU output weight: compute the output on CPU from the last hidden row.
+                _gpu.CopyDevice(_pinnedHidden, _gpuHidden);
+                _gpu.Synchronize();
+                float* pinned = _gpu.MapPinned(_pinnedHidden);
+                new ReadOnlySpan<float>(pinned, embDim).CopyTo(new Span<float>(_cpuHidden, embDim));
+                _gpu.UnmapPinned(_pinnedHidden);
+
+                _kvLength = startPos + N;
+                _faulted = false;
+                ComputeCpuOutput();
+                return _logitsBuf;
+            }
+        }
+
+        // 4. Advance the GPU KV length counter (CPU counters already advanced above).
+        _kvLength = startPos + N;
+        _faulted = false;
+
+        // 5. Final norm + output projection on GPU for the last token.
+        _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuOutputNorm!, _hp.RmsNormEps);
+        GpuMatMul(_gpuLogits, _gpuOutputWeight!, _gpuHidden);
+        _gpu.Download(_gpuLogits, _logitsBuf);
+        return _logitsBuf;
+    }
+
+    /// <summary>
+    /// One GPU layer of the batched-trunk prefill: batched attention block over all
+    /// <paramref name="n"/> tokens, then the per-token FFN/MoE stage. Mirrors
+    /// <see cref="GpuLayer"/> kernel-for-kernel, only batched across N.
+    /// </summary>
+    private void GpuLayerBatchedTrunk(int i, int n, int startPos)
+    {
+        var stream   = _gpuBpStream!;
+        var normAll  = _gpuBpNormAll!;
+        var blockOut = _gpuBpBlockOut!;
+        var qAll     = _gpuBpQ!;
+        var kAll     = _gpuBpK!;
+        var vAll     = _gpuBpV!;
+        var attnOut  = _gpuBpAttnOut!;
+        int qDim  = _numHeads * _headDim;
+        int kvDim = _numKvHeads * _headDim;
+
+        // ── Attention norm (batched).
+        _gpu.RmsNormBatched(normAll, stream, _gpuAttnNorm[i], n, _embDim, _hp.RmsNormEps);
+
+        // ── Q/K/V projections (batched GEMM-N).
+        GpuMatMulBatched(qAll, _gpuWq[i], normAll, n);
+        GpuMatMulBatched(kAll, _gpuWk[i], normAll, n);
+        GpuMatMulBatched(vAll, _gpuWv[i], normAll, n);
+
+        // ── Attention bias is gated OUT of the batched path (Coder-30B has none); the
+        //    supported configs never set _hasAttnBias here (see IsBatchedPrefillSupported
+        //    + the Prefill dispatch). Guard defensively so a future bias model can't run
+        //    silently wrong — it would have fallen back, so this is unreachable.
+        if (_hasAttnBias)
+            throw new InvalidOperationException("Batched-trunk prefill does not support attention bias.");
+
+        // ── RoPE (batched, full headDim NEOX). NoPE layers skip RoPE, matching GpuLayer.
+        bool useRoPE = _hp.NoRopeLayerStep == 0 || (i + 1) % _hp.NoRopeLayerStep != 0;
+        if (useRoPE)
+        {
+            // RoPEPartialBatched with ropeDim==headDim matches the per-token RoPE(neox)
+            // path GpuLayer uses: same freq formula (2·j/headDim) and pair layout, every
+            // dim rotated. IsBatchedPrefillSupported already required NEOX. This RoPE step
+            // (and the RoPE≡RoPEPartial(ropeDim=headDim) equivalence) is covered end-to-end
+            // by BatchedPrefill_BitwiseMatchesSequential_Coder, not the per-kernel oracle
+            // (which compares RoPEPartialBatched against RoPEPartial).
+            _gpu.RoPEPartialBatched(qAll, startPos, _headDim, _headDim, _hp.RopeTheta, _numHeads,   n, neox: true);
+            _gpu.RoPEPartialBatched(kAll, startPos, _headDim, _headDim, _hp.RopeTheta, _numKvHeads, n, neox: true);
+        }
+
+        // ── QK-norm (batched, learned). L2/pure QK-norm was gated out (no batched kernel).
+        if (_hasQkNorm)
+        {
+            _gpu.HeadNormBatched(qAll, _gpuQNorm![i], _numHeads,   _headDim, n, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+            _gpu.HeadNormBatched(kAll, _gpuKNorm![i], _numKvHeads, _headDim, n, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+        }
+
+        // ── KV append + SDPA (batched). Shared-scores fast path when startPos+n ≤ 4096,
+        //    wave-based global-scratch SDPA above (issue #118). Both bit-identical to the
+        //    per-position KvAppend + Attention loop in GpuLayer.
+        _gpu.KvAppendBatched(kAll, vAll, _gpuKCache[i], _gpuVCache[i], kvDim, startPos, _maxSeqLen, n);
+        if (startPos + n <= 4096)
+            _gpu.AttentionBatched(qAll, _gpuKCache[i], _gpuVCache[i], attnOut,
+                _numHeads, _numKvHeads, _headDim, startPos, _maxSeqLen, n);
+        else
+            _gpu.AttentionBatchedWave(qAll, _gpuKCache[i], _gpuVCache[i], attnOut,
+                _numHeads, _numKvHeads, _headDim, startPos, _maxSeqLen, n);
+
+        // ── Output projection (batched) → blockOut, then post-attn residual add.
+        GpuMatMulBatched(blockOut, _gpuWo[i], attnOut, n);
+        _gpu.AddInPlace(blockOut, stream);   // blockOut = o-proj(attn) + pre-attn residual
+
+        // ── FFN norm (batched) over the post-attn residual.
+        _gpu.RmsNormBatched(normAll, blockOut, _gpuFfnNorm[i], n, _embDim, _hp.RmsNormEps);
+
+        // ── FFN / MoE stage: per token (issue #123 scope is the trunk). Reuse the exact
+        //    single-token GpuMoeFfn/GpuDenseFfn (reads _gpuNormBuf, writes _gpuHidden), then
+        //    add the post-attn residual row and scatter the new hidden back into the stream.
+        for (int t = 0; t < n; t++)
+        {
+            _gpu.CopyDeviceRegion(_gpuNormBuf, 0, normAll, (long)t * _embDim * sizeof(float),
+                                  (long)_embDim * sizeof(float));
+            if (_isMoE) GpuMoeFfn(i);
+            else        GpuDenseFfn(i);
+
+            _gpu.CopyDeviceRegion(_gpuResidual, 0, blockOut, (long)t * _embDim * sizeof(float),
+                                  (long)_embDim * sizeof(float));
+            _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+            _gpu.CopyDeviceRegion(stream, (long)t * _embDim * sizeof(float),
+                                  _gpuHidden, 0, (long)_embDim * sizeof(float));
+        }
+    }
+
+    private void GpuMatMulBatched(Tensor outputAll, Tensor weights, Tensor inputAll, int nTok)
+    {
+        _gpu.MatMulBatched(outputAll, weights, inputAll, nTok,
+            _gpuWeightDTypes.TryGetValue(weights.Handle, out var dt) ? dt : DType.Float32);
     }
 
     // ================================================================
@@ -2367,6 +2744,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         if (_gpuMoeSharedOut is not null) _gpu.Free(_gpuMoeSharedOut);
         if (_gpuMoeExpertOut is not null) _gpu.Free(_gpuMoeExpertOut);
         _gpu.Free(_pinnedHidden);
+
+        // Issue #123: batched-trunk prefill scratch.
+        FreeBatchedTrunkScratch();
+        if (_pinnedHiddenAll is { } pha) { _gpu.Free(pha); _pinnedHiddenAll = null; }
 
         for (int i = 0; i < _nGpuLayers; i++)
         {
