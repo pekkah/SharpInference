@@ -377,6 +377,39 @@ extern ""C"" __global__ void llm_rope_neox_with_factors(
     x[b] = x0 * s + x1 * c;
 }
 
+// Batched NEOX-with-factors RoPE over N tokens (Gemma 4 global layers in batched
+// prefill). Position for token t is base_position + t; x row stride = num_heads*
+// head_dim. Per row this is bit-identical to llm_rope_neox_with_factors.
+extern ""C"" __global__ void llm_rope_neox_with_factors_batched(
+    float* __restrict__ x,
+    int num_heads, int head_dim, int base_position, float theta,
+    const float* __restrict__ freq_factors, int n_tok)
+{
+    int pair_idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int half_dim = head_dim / 2;
+    int total_pairs = num_heads * half_dim;
+    int token = (int)blockIdx.y;
+    if (pair_idx >= total_pairs || token >= n_tok) return;
+
+    int h = pair_idx / half_dim;
+    int i = pair_idx % half_dim;
+    int position = base_position + token;
+
+    float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)head_dim);
+    freq /= freq_factors[i];
+    float angle = (float)position * freq;
+    float c = cosf(angle);
+    float s = sinf(angle);
+
+    long head_base = (long)token * (long)num_heads * (long)head_dim + (long)h * head_dim;
+    long a = head_base + i;
+    long b = head_base + i + half_dim;
+    float x0 = x[a];
+    float x1 = x[b];
+    x[a] = x0 * c - x1 * s;
+    x[b] = x0 * s + x1 * c;
+}
+
 // ── RoPE NEOX partial (rotate dims [0, rope_dim); pass dims [rope_dim, head_dim)) ──
 // qwen35moe rotates only the first 64 of each 256-dim head. The frequency
 // exponent uses `rope_dim` (not `head_dim`) — this matches the CPU reference

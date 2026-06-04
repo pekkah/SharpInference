@@ -469,6 +469,45 @@ public sealed unsafe class CudaMatMulBatchedTests
     }
 
     [Fact]
+    public void RoPEWithFactorsBatched_BitwiseMatchesSingle()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        int numHeads = 8, headDim = 256;       // Gemma 4 global-layer shape
+        int qDim = numHeads * headDim;
+        float theta = 1000000f;
+        // Per-half-dim frequency factors (strictly positive — they divide the freq).
+        var rngF = new Random(4242);
+        var factors = new float[headDim / 2];
+        for (int i = 0; i < factors.Length; i++) factors[i] = (float)(rngF.NextDouble() * 3 + 0.25);
+        var gpuFactors = gpu.Upload(factors, TensorShape.D1(headDim / 2));
+
+        foreach ((int basePos, int nTok) in new[] { (0, 3), (37, 17), (512, 64) })
+        {
+            var rng = new Random(91 + basePos + nTok);
+            var xAll = Rand(nTok * qDim, rng);
+            var gpuX = gpu.Upload(xAll, TensorShape.D1((long)nTok * qDim));
+            gpu.RoPEWithFactorsBatched(gpuX, basePos, headDim, theta, gpuFactors, numHeads, nTok);
+            gpu.Synchronize();
+            var bat = new float[(long)nTok * qDim]; gpu.Download(gpuX, bat);
+
+            var refs = new float[nTok][];
+            for (int t = 0; t < nTok; t++)
+            {
+                var xt = new float[qDim]; Array.Copy(xAll, (long)t * qDim, xt, 0, qDim);
+                var gx = gpu.Upload(xt, TensorShape.D1(qDim));
+                gpu.RoPEWithFactors(gx, basePos + t, headDim, theta, gpuFactors);
+                gpu.Synchronize();
+                refs[t] = new float[qDim]; gpu.Download(gx, refs[t]);
+                gpu.Free(gx);
+            }
+            gpu.Free(gpuX);
+            AssertRowsBitIdentical($"RoPEFactors basePos={basePos} nTok={nTok}", qDim, nTok, bat, refs);
+        }
+        gpu.Free(gpuFactors);
+    }
+
+    [Fact]
     public void MatMulBatched_F32_BitwiseMatchesSequential()
     {
         using var gpu = TryCreate();

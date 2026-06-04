@@ -105,6 +105,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _ropeNeoxKernel;
     private nint   _ropeNeoxPartialKernel;
     private nint   _ropeNeoxWithFactorsKernel;
+    private nint   _ropeNeoxWithFactorsBatchedKernel;
     private nint   _mulKernel;
     private nint   _sigmoidMulInPlaceKernel;
     private nint   _splitQgKernel;
@@ -2026,6 +2027,41 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>
+    /// Batched <see cref="RoPEWithFactors"/> over <paramref name="nTok"/> tokens (Gemma 4
+    /// global layers in batched-trunk prefill). Token <c>t</c> uses position
+    /// <c>basePosition + t</c>; <paramref name="x"/> is <c>[nTok × numHeads*headDim]</c>.
+    /// Bit-identical per row to the per-token kernel.
+    /// </summary>
+    public void RoPEWithFactorsBatched(Tensor x, int basePosition, int headDim,
+        float ropeTheta, Tensor freqFactors, int numHeads, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (headDim <= 0 || (headDim & 1) != 0)
+            throw new ArgumentException("headDim must be a positive even number.", nameof(headDim));
+        if (freqFactors.ElementCount != headDim / 2)
+            throw new ArgumentException(
+                $"RoPEWithFactorsBatched: freqFactors length {freqFactors.ElementCount} != headDim/2 ({headDim / 2}).",
+                nameof(freqFactors));
+
+        int totalPairs = numHeads * (headDim / 2);
+        nint xPtr = GetDevPtr(x);
+        nint fPtr = GetDevPtr(freqFactors);
+        int  pNH = numHeads, pHD = headDim, pPos = basePosition, pNT = nTok;
+        float pT = ropeTheta;
+        nint* args = stackalloc nint[7]
+        {
+            (nint)(&xPtr),
+            (nint)(&pNH), (nint)(&pHD), (nint)(&pPos), (nint)(&pT),
+            (nint)(&fPtr), (nint)(&pNT)
+        };
+        uint grid = (uint)((totalPairs + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_ropeNeoxWithFactorsBatchedKernel, grid, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(rope_neox_with_factors_batched) failed: {r}");
+    }
+
+    /// <summary>
     /// Fused <c>x[i] *= sigmoid(gate[i])</c> in-place. Replaces a Sigmoid + ElementwiseMul
     /// pair for the qwen35moe GLU attention gate.
     /// </summary>
@@ -3443,7 +3479,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _addScaledKernel, _clampKernel, _pshuffleKernel, _punshuffleKernel, _upsample2xKernel,
             _rmsNormKernel, _headNormKernel, _headNormPureKernel, _siluMulKernel, _sigmoidKernel,
             _softmaxKernel, _ropeInterleavedKernel, _ropeNeoxKernel, _ropeNeoxPartialKernel,
-            _ropeNeoxWithFactorsKernel,
+            _ropeNeoxWithFactorsKernel, _ropeNeoxWithFactorsBatchedKernel,
             _mulKernel, _sigmoidMulInPlaceKernel, _splitQgKernel, _kvAppendKernel,
             _kvAppendBf16Kernel,
             _snapKvScoreKernel, _snapKvScoreBf16Kernel,
@@ -3530,6 +3566,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _headNormBatchedKernel = GetKernelFunc("llm_head_norm_batched");
         _splitQgBatchedKernel  = GetKernelFunc("llm_split_qg_batched");
         _ropeNeoxPartialBatchedKernel = GetKernelFunc("llm_rope_neox_partial_batched");
+        _ropeNeoxWithFactorsBatchedKernel = GetKernelFunc("llm_rope_neox_with_factors_batched");
         _attentionKernel       = GetKernelFunc("llm_attention");
         _attentionBf16Kernel   = GetKernelFunc("llm_attention_bf16");
         _attentionSwaKernel    = GetKernelFunc("llm_attention_swa");
