@@ -906,12 +906,32 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     // <para><b>Restrictions:</b> MoE FFN not supported (MatVec2In is dense-only).
     // The pass is otherwise the same as two sequential <see cref="Forward"/> calls.</para>
 
+    /// <summary>True when the attention KV cache has been SnapKV-compacted, i.e.
+    /// the physical slot count (<see cref="PagedKvCache.Length"/>) has dropped
+    /// below the logical RoPE position (<see cref="PagedKvCache.LogicalLength"/>).
+    /// <c>IncrementPosition</c> advances both together and <c>TruncateTo</c>/<c>Reset</c>
+    /// keep them equal, so this is an exact, stable "eviction occurred" signal that
+    /// is false in all normal (non-evicted) operation (issue #130). Inert in this pass —
+    /// this GDN CPU pass doesn't implement SnapKV eviction (the dense CPU <c>ForwardPass</c>
+    /// and the CUDA passes do), so it never calls <c>Compact</c> — but kept symmetric with
+    /// the CUDA pass; null-guarded for safety.</summary>
+    private bool KvCacheCompacted =>
+        _kvCache is not null && _kvCache.Length != _kvCache.LogicalLength;
+
     /// <summary>True when this pass implements <see cref="BatchForward2"/>. The
     /// <c>SHARPI_DISABLE_BATCH_VERIFY=1</c> env var forces the legacy sequential
     /// MTP path for parity bisection. Issue #45: MoE MTP models are supported via
-    /// a sequential per-token MoE FFN inside the otherwise-batched trunk.</summary>
+    /// a sequential per-token MoE FFN inside the otherwise-batched trunk.
+    /// Issue #130: batched-verify (<see cref="BatchForward2"/>) cannot run on a
+    /// SnapKV-evicted cache — its precondition requires <c>_kvCache.Length == startPos</c>
+    /// (logical position), but eviction leaves <c>Length</c> at the budget K while
+    /// the logical RoPE position stays at the prompt length N. We gate off when the
+    /// cache is compacted so <see cref="MtpDecoder"/> falls back to the eviction-safe
+    /// sequential <c>Forward</c> path; making batched-verify coexist with eviction is
+    /// the #130 follow-up.</summary>
     public bool SupportsBatchVerify =>
         _hasMtp
+        && !KvCacheCompacted
         && Environment.GetEnvironmentVariable("SHARPI_DISABLE_BATCH_VERIFY") != "1";
 
     /// <summary>
@@ -940,7 +960,10 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         if (_kvCache.Length != startPos)
             throw new InvalidOperationException(
                 $"BatchForward2: _kvCache.Length={_kvCache.Length} != startPos={startPos}. " +
-                "Caches must be at startPos before the batched verify call.");
+                "Caches must be at startPos before the batched verify call. A SnapKV-evicted " +
+                "(compacted) cache is unsupported here (issue #130) — callers must check " +
+                "SupportsBatchVerify, which returns false once the cache is compacted, and fall " +
+                "back to the sequential Forward path.");
         if (_gdnStateCache.Length != startPos)
             throw new InvalidOperationException(
                 $"BatchForward2: _gdnStateCache.Length={_gdnStateCache.Length} != startPos={startPos}.");

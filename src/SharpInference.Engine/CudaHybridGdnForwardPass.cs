@@ -537,6 +537,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private Tensor? _gpuBfMoeNormGathN;    // MoE: [N × embDim] gathered routed-token norms (per used expert)
     private Tensor? _gpuBfMoeDownGathN;    // MoE: [N × embDim] gathered down output (per used expert)
     private Tensor? _gpuBfMoeRouterAll;    // MoE: [N × numExperts] batched router logits
+    // Issue #129: batched shared-expert + single-launch reduce scratch (GPU-SLRU MoE).
+    private Tensor? _gpuBfShGateAll;       // MoE: [N × expertDim] batched shared-expert gate
+    private Tensor? _gpuBfShUpAll;         // MoE: [N × expertDim] batched shared-expert up
+    private Tensor? _gpuBfShexpScaleDev;   // MoE: [N] per-token shared-expert sigmoid gate (device)
+    private Tensor? _gpuBfMoeWeightsDev;   // MoE: [N × na] top-k weights (device, for the reduce kernel)
     // Host bucket bookkeeping for the GPU-SLRU grouped-by-expert routed pass (issue #121).
     // Mirrors the CPU-MoE _bExpStart/_bExpTokI/… arrays but lives on the GPU-FFN path,
     // which never calls EnsureBatchedScratch. Selection / weights / shexp-gate are host
@@ -1565,6 +1570,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _gpuBfMoeUpGathN       = A((long)N * _expertDim);          // gathered up proj
             _gpuBfMoeDownGathN     = A((long)N * embDim);              // gathered down out
             _gpuBfMoeRouterAll     = A((long)N * _numExperts);         // batched router logits
+            // Issue #129: batched shared-expert gate/up + per-token gate scalar + device
+            // top-k weights for the single-launch reduce.
+            _gpuBfShGateAll        = A((long)N * _expertDim);          // batched shared-expert gate
+            _gpuBfShUpAll          = A((long)N * _expertDim);          // batched shared-expert up
+            _gpuBfShexpScaleDev    = A((long)N);                       // per-token shexp sigmoid gate
+            _gpuBfMoeWeightsDev    = A((long)N * na);                  // top-k weights (device)
 
             long perTokSel = (long)N * na;
             _bfSelected     = (int*)NativeMemory.Alloc((nuint)perTokSel * sizeof(int));
@@ -1598,6 +1609,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         F(ref _gpuBfGateAll); F(ref _gpuBfUpAll); F(ref _gpuBfHiddenAll);
         F(ref _gpuBfMoeDownPartial); F(ref _gpuBfMoeGateGathN); F(ref _gpuBfMoeUpGathN);
         F(ref _gpuBfMoeNormGathN); F(ref _gpuBfMoeDownGathN); F(ref _gpuBfMoeRouterAll);
+        F(ref _gpuBfShGateAll); F(ref _gpuBfShUpAll); F(ref _gpuBfShexpScaleDev); F(ref _gpuBfMoeWeightsDev);
         void FH(ref int* p) { if (p != null) { NativeMemory.Free(p); p = null; } }
         void FHf(ref float* p) { if (p != null) { NativeMemory.Free(p); p = null; } }
         FH(ref _bfSelected); FHf(ref _bfWeights); FHf(ref _bfShexpScale);
@@ -3014,13 +3026,32 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     //  27B-MTP layers are CPU FFN under realistic 12 GB VRAM budgets.
     // =================================================================
 
+    /// <summary>True when the attention KV cache has been SnapKV-compacted, i.e.
+    /// the physical slot count (<see cref="PagedKvCache.Length"/>) has dropped
+    /// below the logical RoPE position (<see cref="PagedKvCache.LogicalLength"/>).
+    /// <c>IncrementPosition</c> advances both together and <c>TruncateTo</c>/<c>Reset</c>
+    /// keep them equal, so this is an exact, stable "eviction occurred" signal that
+    /// is false in all normal (non-evicted) operation (issue #130). Only meaningful
+    /// when this config has attention layers (<c>_numAttnLayers &gt; 0</c>); a
+    /// pure-GDN model never compacts. <c>_kvCache</c> is always constructed, but the
+    /// null-guard mirrors the defensive style used elsewhere.</summary>
+    private bool KvCacheCompacted =>
+        _numAttnLayers > 0 && _kvCache is not null && _kvCache.Length != _kvCache.LogicalLength;
+
     /// <inheritdoc />
     /// Issue #45: MoE MTP is supported via the CPU-MoE path (SHARPI_CPU_MOE=1 or
     /// auto-routed on 12 GB-class cards). Full-GPU MoE (rare, ≥24 GB cards) still
     /// falls back to sequential decode — folding a 2-token batched-verify into
     /// GpuMoeFfn's SLRU loop is tracked separately.
+    /// Issue #130: batched-verify (BatchForward2) cannot run on a SnapKV-evicted
+    /// cache — its precondition requires _kvCache.Length == startPos (the logical
+    /// RoPE position), but eviction leaves Length at the budget K while the logical
+    /// position stays at the prompt length N. We gate off when the cache is compacted
+    /// so MtpDecoder falls back to the eviction-safe sequential Forward path; making
+    /// batched-verify coexist with eviction is the #130 follow-up.
     public bool SupportsBatchVerify => _hasMtp
         && (!_hp.IsMoE || _cpuMoe)
+        && !KvCacheCompacted
         && Environment.GetEnvironmentVariable("SHARPI_DISABLE_BATCH_VERIFY") != "1";
 
     /// <inheritdoc />
@@ -3040,7 +3071,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             throw new ArgumentOutOfRangeException(nameof(startPos), startPos, "startPos must be >= 0.");
         if (_kvCache.Length != startPos)
             throw new InvalidOperationException(
-                $"BatchForward2: _kvCache.Length={_kvCache.Length} != startPos={startPos}.");
+                $"BatchForward2: _kvCache.Length={_kvCache.Length} != startPos={startPos}. " +
+                "A SnapKV-evicted (compacted) cache is unsupported here (issue #130) — callers " +
+                "must check SupportsBatchVerify, which returns false once the cache is compacted, " +
+                "and fall back to the sequential Forward path.");
         if (_gdnStateCache.Length != startPos)
             throw new InvalidOperationException(
                 $"BatchForward2: _gdnStateCache.Length={_gdnStateCache.Length} != startPos={startPos}.");
@@ -3939,15 +3973,19 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// loaded once (one <c>GetOrLoad</c> instead of N×na), its tokens' norm rows are
     /// gathered into a contiguous block, gate/up/down run as GEMM-N over that block, and
     /// the unweighted down outputs are scattered into a per-(token,slot) partial buffer.
-    /// A final per-token reduce then sums the na partials in top-k slot order (k=0..na-1)
-    /// and adds the per-token shared expert — byte-identical to the sequential
-    /// <see cref="GpuMoeFfn"/> accumulation. Output written to <paramref name="hiddenAll"/>.
+    /// A final single-launch reduce (issue #129) then sums the na partials in top-k slot
+    /// order (k=0..na-1) and adds the per-token shared expert — byte-identical to the
+    /// sequential <see cref="GpuMoeFfn"/> accumulation. The shared expert itself is also
+    /// computed batched (GEMM-N gate/up/down + one per-row scale launch) rather than the
+    /// old per-token loop. Output written to <paramref name="hiddenAll"/>.
     ///
-    /// <para>Bit-parity rests on: (1) GEMM-N over a gathered contiguous block is row-for-row
-    /// equal to per-token <c>GpuMatMul</c> (#119); (2) the gather/scatter are exact byte
-    /// copies; (3) the reduce visits slots in the same k=0..na-1 order, with the same
-    /// per-token weights, as the sequential <c>AddScaledInPlace</c> loop; (4) the shared
-    /// expert + its sigmoid scalar gate are computed and applied per token exactly as in
+    /// <para>Bit-parity rests on: (1) GEMM-N over a gathered (or full-N) contiguous block is
+    /// row-for-row equal to per-token <c>GpuMatMul</c> (#119/#121); (2) the gather/scatter
+    /// are exact byte copies; (3) the <c>llm_moe_weighted_reduce</c> kernel visits slots in
+    /// the same k=0..na-1 order with the same per-token weights and the same per-op rounding
+    /// (FMA per term + plain shared add) as the sequential <c>AddScaledInPlace</c>×na +
+    /// <c>AddInPlace</c>; (4) the shared expert + its sigmoid scalar gate are computed and
+    /// applied (CPU dot → per-row <c>llm_scale_rows_inplace</c>) exactly as in
     /// <c>GpuMoeFfn</c>. SLRU access order does not affect loaded weights, so grouping is
     /// safe.</para>
     /// </summary>
@@ -3983,26 +4021,32 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                        na, sel, wts, _hp.NormalizeMoeTopKWeights);
         }
 
-        // ── Phase 1: shared expert per token → _gpuBfHiddenAll[i]. Computed exactly as in
-        //    GpuMoeFfn: ffn_down @ (SiLU(gate@x) * (up@x)), then a per-token sigmoid scalar
-        //    gate from ffn_gate_inp_shexp · x. Reads each token's norm into _gpuNormBuf.
+        // ── Phase 1: shared expert (batched). Issue #129: instead of N per-token
+        //    matvec+scale loops, run gate/up/down as GEMM-N over all N tokens — each is
+        //    bit-identical to the per-token GpuMatMul by the #119/#121 GEMM-N invariant
+        //    (also verified by the batched shared-expert in TrunkLayerBatched). The
+        //    per-token sigmoid scalar gate is still computed on the CPU exactly as
+        //    GpuMoeFfn (dot of ffn_gate_inp_shexp · norm_i over the host readback) to stay
+        //    bit-identical, then applied with one llm_scale_rows_inplace launch — a single
+        //    float multiply per element, identical to the per-token ScaleInPlace. This
+        //    rounds the shared output to float BEFORE the Phase-3 plain add, exactly as the
+        //    sequential ScaleInPlace-then-AddInPlace ordering requires.
         _gpu.Download(normAll, new Span<float>(_bfNormReadback, (int)((long)N * embDim)));
         _gpu.Download(_gpuWGateInpShexp[layer], new Span<float>(_hostQ, embDim)); // gate-inp weight (shared across tokens)
+        float* shexpScale = _bfShexpScale!;
         for (int i = 0; i < N; i++)
         {
-            _gpu.CopyDeviceRegion(_gpuNormBuf, 0, normAll, (long)i * embDim * sizeof(float),
-                                  (long)embDim * sizeof(float));
-            GpuMatMul(_gpuFfnGate, _gpuWGateShexp[layer], _gpuNormBuf);
-            GpuMatMul(_gpuFfnUp,   _gpuWUpShexp[layer],   _gpuNormBuf);
-            _gpu.SiLuMul(_gpuFfnGate, _gpuFfnUp);
-            GpuMatMul(_gpuSharedOut, _gpuWDownShexp[layer], _gpuFfnGate);
-            // Per-token sigmoid scalar gate (dot on CPU, exactly as GpuMoeFfn).
             float dot = SimdKernels.DotF32(_hostQ, _bfNormReadback + (long)i * embDim, embDim);
-            float shexpScale = 1.0f / (1.0f + MathF.Exp(-dot));
-            _gpu.ScaleInPlace(_gpuSharedOut, shexpScale);
-            _gpu.CopyDeviceRegion(hiddenAll, (long)i * embDim * sizeof(float),
-                                  _gpuSharedOut, 0, (long)embDim * sizeof(float));
+            shexpScale[i] = 1.0f / (1.0f + MathF.Exp(-dot));
         }
+        // GEMM-N gate/up over all N norm rows → batched SiLuMul → GEMM-N down into hiddenAll
+        // (UNSCALED shared output), then apply the per-row sigmoid gate in one launch.
+        GpuMatMulBatched(_gpuBfShGateAll!, _gpuWGateShexp[layer], normAll, N);
+        GpuMatMulBatched(_gpuBfShUpAll!,   _gpuWUpShexp[layer],   normAll, N);
+        _gpu.SiLuMul(_gpuBfShGateAll!, _gpuBfShUpAll!);   // pointwise over N×expertDim
+        GpuMatMulBatched(hiddenAll, _gpuWDownShexp[layer], _gpuBfShGateAll!, N);
+        _gpu.UploadInto(_gpuBfShexpScaleDev!, new ReadOnlySpan<float>(shexpScale, N));
+        _gpu.ScaleRowsInPlace(hiddenAll, _gpuBfShexpScaleDev!, N, embDim);
 
         // ── Phase 2: bucket (token, slot) by selected expert (CSR), identical to
         //    BatchedRoutedExperts. Then for each used expert, gather its tokens' norm
@@ -4085,37 +4129,21 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             }
         }
 
-        // ── Phase 3: per-token ordered reduce. For each token: start from the shared
-        //    expert (already in hiddenAll[i]), then add the na weighted down partials in
-        //    top-k slot order k=0..na-1 — bit-identical to GpuMoeFfn's Clear + per-slot
-        //    AddScaledInPlace(_gpuHidden, expertOut_k, weight_k) followed by + shared.
-        //    (Sequential adds shared LAST; FP add is commutative on the two-operand
-        //    accumulator only when the running order matches. To match exactly we
-        //    accumulate routed-first into _gpuHidden, then add shared — see note.)
-        //    PERF (issue #129): this host loop issues ~N·(na+2) small stream ops; for
-        //    large-N GPU-SLRU prefill the launch overhead undercuts the grouped-GEMM win.
-        //    A single batched weighted-scatter-reduce kernel (preserving this k-order)
-        //    is the follow-up. Correctness/bit-parity are unaffected; this only gates
-        //    the on-GPU-experts (SHARPI_CPU_MOE=0) path, not the CPU-MoE default.
-        for (int i = 0; i < N; i++)
-        {
-            // Routed accumulation in top-k order, starting from zero (matches the
-            // sequential Clear(_gpuHidden) + per-k AddScaledInPlace).
-            _gpu.Clear(_gpuHidden);
-            for (int k = 0; k < na; k++)
-            {
-                long slotIdx = (long)i * na + k;
-                var partV = _gpu.View(downPartial, slotIdx * embDim, embDim);
-                try { _gpu.AddScaledInPlace(_gpuHidden, partV, weights[(long)i * na + k]); }
-                finally { _gpu.Free(partV); }
-            }
-            // Add the per-token shared expert (sequential adds it last).
-            var sharedV = _gpu.View(hiddenAll, (long)i * embDim, embDim);
-            try { _gpu.AddInPlace(_gpuHidden, sharedV); }
-            finally { _gpu.Free(sharedV); }
-            _gpu.CopyDeviceRegion(hiddenAll, (long)i * embDim * sizeof(float),
-                                  _gpuHidden, 0, (long)embDim * sizeof(float));
-        }
+        // ── Phase 3: single-launch ordered reduce (issue #129 — RESOLVED). The previous
+        //    host loop issued ~N·(na+2) tiny stream ops (Clear + na AddScaledInPlace +
+        //    AddInPlace per token), whose launch overhead undercut the grouped-GEMM win
+        //    on large-N GPU-SLRU prefill. We now upload the host top-k weights once and do
+        //    the whole weighted scatter-reduce + shared add in ONE llm_moe_weighted_reduce
+        //    launch over all N·embDim elements. Per (token i, element e) the kernel computes
+        //    acc = Σ_{k=0..na-1} downPartial[(i*na+k)*embDim+e] * weights[i*na+k], then
+        //    acc += hiddenAll[i*embDim+e] (the scaled+rounded shared output), writing back
+        //    in place. The per-k FMA contraction (NVRTC fmad=true) reproduces the
+        //    AddScaledInPlace fmaf rounding exactly; the final plain add reproduces
+        //    AddInPlace; routed-first / shared-last order is preserved — byte-identical to
+        //    the sequential Clear + AddScaledInPlace×na + AddInPlace. Gates only the
+        //    on-GPU-experts (SHARPI_CPU_MOE=0) path.
+        _gpu.UploadInto(_gpuBfMoeWeightsDev!, new ReadOnlySpan<float>(weights, (int)((long)N * na)));
+        _gpu.MoeWeightedReduce(downPartial, _gpuBfMoeWeightsDev!, hiddenAll, N, na, embDim);
     }
 
     // =================================================================
