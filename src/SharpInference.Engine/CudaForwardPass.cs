@@ -137,11 +137,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private readonly Tensor? _gpuProjPerLayer;  // [PleWidth*NumLayers]   F32 — per-layer projection
     private readonly Tensor? _gpuPleX;          // [PleWidth]             F32 — inner gate buffer
     private readonly Tensor? _gpuPleY;          // [embDim]               F32 — inner proj buffer
-    // Non-owning per-layer slice views into _gpuProjPerLayer / _gpuPleRow. Offsets are
-    // static (layer*PleWidth), so we build them once instead of round-tripping each
-    // slice through CopyDeviceRegion every token. Freed in Dispose.
+    // Non-owning per-layer slice views into _gpuProjPerLayer (offset layer*PleWidth),
+    // built once so ApplyPerLayerEmbeddingGpu can read the proj slice without a copy.
+    // Freed in Dispose.
     private readonly Tensor[]? _gpuProjSliceViews; // [L] view → _gpuProjPerLayer[layer]
-    private readonly Tensor[]? _gpuPleRowSliceViews;// [L] view → _gpuPleRow[layer]
     // Managed buffer for dequanting the active token's PLE row before upload.
     private readonly float[]? _pleRowHost;
     private readonly int _pleWidth;
@@ -640,14 +639,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             _gpuPleY         = _gpu.Allocate(TensorShape.D1(_embDim));
             _pleRowHost      = new float[stackedDim];
 
-            // Precompute static per-layer slice views (no per-token CopyDeviceRegion).
-            _gpuProjSliceViews  = new Tensor[L];
-            _gpuPleRowSliceViews = new Tensor[L];
+            // Precompute static per-layer proj-slice views (no per-token copy).
+            _gpuProjSliceViews = new Tensor[L];
             for (int i = 0; i < L; i++)
-            {
-                _gpuProjSliceViews[i]   = _gpu.View(_gpuProjPerLayer, (long)i * _pleWidth, _pleWidth);
-                _gpuPleRowSliceViews[i] = _gpu.View(_gpuPleRow,       (long)i * _pleWidth, _pleWidth);
-            }
+                _gpuProjSliceViews[i] = _gpu.View(_gpuProjPerLayer, (long)i * _pleWidth, _pleWidth);
         }
 
         Console.Error.WriteLine(" done.");
@@ -1132,16 +1127,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         _gpu.ScaleInPlace(_gpuProjPerLayer!, 1.0f / MathF.Sqrt(_embDim));
 
-        // Per-layer slice: RmsNorm with per_layer_proj_norm (w+1 baked in), add the
-        // same-slice of the PLE row, scale by 1/sqrt(2). Operates in place on static
-        // non-owning views into _gpuProjPerLayer / _gpuPleRow (no per-slice copies).
-        for (int li = 0; li < L; li++)
-        {
-            var projSlice = _gpuProjSliceViews![li];
-            _gpu.RmsNorm(projSlice, projSlice, _gpuPerLayerProjNorm!, _hp.RmsNormEps);
-            _gpu.AddInPlace(projSlice, _gpuPleRowSliceViews![li]);
-            _gpu.ScaleInPlace(projSlice, 1.0f / MathF.Sqrt(2f));
-        }
+        // Per-layer slice: RmsNorm each pleWidth row with per_layer_proj_norm (w+1
+        // baked in), add the same-slice PLE row, scale by 1/sqrt(2). The norm is the
+        // only per-slice op (one block per row, byte-identical to llm_rmsnorm); the
+        // add and scale are pure elementwise and run over the whole [L*pleWidth]
+        // buffer at once. Collapses the old 3×L per-slice launches to 3 total.
+        _gpu.RmsNormBatched(_gpuProjPerLayer!, _gpuProjPerLayer!, _gpuPerLayerProjNorm!,
+            L, _pleWidth, _hp.RmsNormEps);
+        _gpu.AddInPlace(_gpuProjPerLayer!, _gpuPleRow!);
+        _gpu.ScaleInPlace(_gpuProjPerLayer!, 1.0f / MathF.Sqrt(2f));
     }
 
     /// <summary>
@@ -2143,7 +2137,6 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         if (_gpuPlePostNorm is not null)
             for (int i = 0; i < _gpuPlePostNorm.Length; i++) _gpu.Free(_gpuPlePostNorm[i]);
         if (_gpuProjSliceViews is { } psv) foreach (var v in psv) _gpu.Free(v);
-        if (_gpuPleRowSliceViews is { } prsv) foreach (var v in prsv) _gpu.Free(v);
         if (_gpuPleRow       is { } pr) _gpu.Free(pr);
         if (_gpuProjPerLayer is { } ppl) _gpu.Free(ppl);
         if (_gpuPleX         is { } px) _gpu.Free(px);
