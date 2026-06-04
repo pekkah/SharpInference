@@ -104,18 +104,18 @@ extern ""C"" __global__ void add_scaled_inplace(
 }
 
 // ── scale_rows_inplace ────────────────────────────────────────────────────
-// Per-row scalar multiply: buf[i*cols + e] *= scales[i].  One thread per
-// (row, col) element; total = rows*cols.  The multiply rounds to float exactly
-// like a per-row scale_inplace launch, so the result is bit-identical to
-// applying ScaleInPlace(row_i, scales[i]) once per row.
+// Per-row scalar multiply: buf[i*cols + e] *= scales[i].  2D grid: blockIdx.x
+// (× blockDim.x) walks the column e, blockIdx.y is the row i — so there's no
+// per-thread integer divide/modulo to recover (i, e).  The multiply rounds to
+// float exactly like a per-row scale_inplace launch, so the result is
+// bit-identical to applying ScaleInPlace(row_i, scales[i]) once per row.
 extern ""C"" __global__ void llm_scale_rows_inplace(
     float* __restrict__ buf, const float* __restrict__ scales, int rows, int cols)
 {
-    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    long total = (long)rows * cols;
-    if (idx >= total) return;
-    int i = (int)(idx / cols);
-    buf[idx] *= scales[i];
+    int e = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int i = (int)blockIdx.y;
+    if (e >= cols || i >= rows) return;
+    buf[(long)i * cols + e] *= scales[i];
 }
 
 // ── moe_weighted_reduce ───────────────────────────────────────────────────
@@ -128,23 +128,22 @@ extern ""C"" __global__ void llm_scale_rows_inplace(
 //   acc += shared[i*embDim + e]
 //   shared[i*embDim + e] = acc
 //
-// One thread per (i, e); total = N*embDim.  `shared` is in/out — the thread
-// that owns element (i,e) is the only reader and writer, so the read-modify-
-// write is race-free.  `acc` is a single float register: each `acc += p*w`
-// contracts to fmaf under NVRTC's default fmad=true (one rounding per term,
-// matching add_scaled_inplace), and the shared add is a plain a+b (one
-// rounding, matching add_inplace).  Order (routed first, shared last) and per-
-// op rounding therefore reproduce the sequential Clear + AddScaledInPlace×na +
+// 2D grid: blockIdx.x (× blockDim.x) walks the element e, blockIdx.y is the
+// token i — no per-thread integer divide/modulo to recover (i, e).  `shared` is
+// in/out — the thread that owns element (i,e) is the only reader and writer, so
+// the read-modify-write is race-free.  `acc` is a single float register: each
+// `acc += p*w` contracts to fmaf under NVRTC's default fmad=true (one rounding
+// per term, matching add_scaled_inplace), and the shared add is a plain a+b (one
+// rounding, matching add_inplace).  Order (routed first, shared last) and per-op
+// rounding therefore reproduce the sequential Clear + AddScaledInPlace×na +
 // AddInPlace accumulation byte-for-byte.
 extern ""C"" __global__ void llm_moe_weighted_reduce(
     const float* __restrict__ downPartial, const float* __restrict__ weights,
     float* __restrict__ shared, int N, int na, int embDim)
 {
-    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    long total = (long)N * embDim;
-    if (idx >= total) return;
-    int i = (int)(idx / embDim);
-    int e = (int)(idx - (long)i * embDim);
+    int e = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int i = (int)blockIdx.y;
+    if (e >= embDim || i >= N) return;
     float acc = 0.0f;
     const float* w = weights + (long)i * na;
     const float* p = downPartial + ((long)i * na) * embDim + e;

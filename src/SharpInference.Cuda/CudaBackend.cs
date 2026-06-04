@@ -3777,13 +3777,18 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
             throw new NotSupportedException("NVRTC is not available; cannot run CUDA image kernels.");
+        if ((uint)rows > 65535)
+            throw new ArgumentOutOfRangeException(nameof(rows), rows, "ScaleRowsInPlace: rows must fit the CUDA gridDim.y limit (65535).");
 
-        long total = (long)rows * cols;
+        // 2D grid: x walks columns (256-wide blocks), y is the row — the kernel
+        // recovers (i, e) from block/thread indices with no integer divide.
         nint p0 = GetDevPtr(buf);
         nint p1 = GetDevPtr(scales);
         int  p2 = rows, p3 = cols;
         nint* args = stackalloc nint[4] { (nint)(&p0), (nint)(&p1), (nint)(&p2), (nint)(&p3) };
-        Launch1D(_scaleRowsKernel, checked((int)total), args);
+        uint gridX = (uint)((cols + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_scaleRowsKernel, gridX, (uint)rows, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(scale_rows) failed: {r}");
     }
 
     /// <summary>
@@ -3805,15 +3810,20 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
             throw new NotSupportedException("NVRTC is not available; cannot run CUDA image kernels.");
+        if ((uint)N > 65535)
+            throw new ArgumentOutOfRangeException(nameof(N), N, "MoeWeightedReduce: N must fit the CUDA gridDim.y limit (65535).");
 
-        long total = (long)N * embDim;
+        // 2D grid: x walks embDim (256-wide blocks), y is the token — the kernel
+        // recovers (i, e) from block/thread indices with no integer divide/modulo.
         nint p0 = GetDevPtr(downPartial);
         nint p1 = GetDevPtr(weights);
         nint p2 = GetDevPtr(shared);
         int  p3 = N, p4 = na, p5 = embDim;
         nint* args = stackalloc nint[6]
             { (nint)(&p0), (nint)(&p1), (nint)(&p2), (nint)(&p3), (nint)(&p4), (nint)(&p5) };
-        Launch1D(_moeWeightedReduceKernel, checked((int)total), args);
+        uint gridX = (uint)((embDim + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_moeWeightedReduceKernel, gridX, (uint)N, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(moe_weighted_reduce) failed: {r}");
     }
 
     /// <inheritdoc/>
