@@ -18,7 +18,7 @@ namespace SharpInference.Engine;
 /// into <see cref="GenerateChunkKind.Thinking"/> and <see cref="GenerateChunkKind.Text"/>
 /// chunks. Boundary tokens themselves are consumed and never appear in chunk text.
 /// </summary>
-public sealed class InferenceEngine : IInferenceEngine, IDisposable
+public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDisposable
 {
     private readonly IForwardPass _fwd;
     private readonly ITokenizer _tokenizer;
@@ -26,6 +26,11 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly int _thinkTokenId;
     private readonly int _endThinkTokenId;
+
+    // Cancelled by Dispose/DisposeAsync; linked into every generation's token so a
+    // shutdown stops the in-flight background worker promptly rather than letting it
+    // run to MaxNewTokens (issue #132).
+    private readonly CancellationTokenSource _shutdownCts = new();
 
     // Prefix caching state (guarded by _gate — only accessed during generation).
     private int[]? _prevTokens;
@@ -35,7 +40,16 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
     private int _activeCount;
     private long _prefillTokensReused;
 
-    private bool _disposed;
+    // 0 = live, 1 = disposed. Interlocked so Dispose/DisposeAsync are single-shot even
+    // if both are called (or called concurrently).
+    private int _disposed;
+
+    // Upper bound on how long Dispose waits for an in-flight generation to drain before
+    // freeing the forward pass anyway. The worker is cancelled (via _shutdownCts) and
+    // cooperatively checks cancellation between decode tokens and prefill chunks, so the
+    // real wait is one forward/prefill-chunk; this is only a backstop against a wedged
+    // backend or an abandoned (never-disposed) enumerator stranding the gate.
+    private static readonly TimeSpan DisposeDrainTimeout = TimeSpan.FromSeconds(10);
 
     public string ModelId { get; }
 
@@ -221,6 +235,16 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
         [EnumeratorCancellation] CancellationToken ct = default,
         string? canonicalHistoryPrefix = null)
     {
+        if (Volatile.Read(ref _disposed) != 0)
+            throw new ObjectDisposedException(nameof(InferenceEngine));
+
+        // Link the caller's token with the engine-shutdown token so Dispose can stop this
+        // generation's background worker (issue #132). Everything below uses `ct` — the
+        // linked token — so cancellation from either source aborts decode and releases the
+        // gate via the finally blocks.
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _shutdownCts.Token);
+        ct = linkedCts.Token;
+
         Interlocked.Increment(ref _pendingCount);
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         Interlocked.Decrement(ref _pendingCount);
@@ -644,13 +668,61 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable
         }
     }
 
+    /// <summary>
+    /// Synchronous dispose. Prefer <see cref="DisposeAsync"/> on async shutdown paths
+    /// (e.g. a Generic Host's <c>StopAsync</c>); this overload blocks the calling thread
+    /// while the in-flight generation drains.
+    /// </summary>
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        // Stop any in-flight worker, then wait for it to release the gate before freeing
+        // _fwd — see DrainNote.
+        _shutdownCts.Cancel();
+        if (_gate.Wait(DisposeDrainTimeout))
+            _gate.Release();
+        else
+            WarnDrainTimedOut();
+        DisposeCore();
+    }
+
+    /// <summary>
+    /// Asynchronous dispose. Signals shutdown and awaits the in-flight generation worker's
+    /// completion before freeing the engine-owned <see cref="IForwardPass"/>, so a host
+    /// that cancels and disposes mid-decode gets a clean teardown instead of an access
+    /// violation from the worker touching freed KV-cache memory (issue #132).
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        _shutdownCts.Cancel();
+        // DrainNote: the gate is held for the entire lifetime of a GenerateChunksAsync call
+        // — across the background worker AND its drain (the finally awaits genTask before
+        // releasing) — so re-acquiring it guarantees no worker is still inside _fwd.Forward /
+        // the shared PagedKvCache. Cancelling _shutdownCts above makes the active worker exit
+        // at its next per-token / per-prefill-chunk cancellation checkpoint, so this normally
+        // returns in well under one forward. The timeout is only a backstop against a wedged
+        // backend or a consumer that abandoned its enumerator without disposing it (which
+        // would otherwise strand the gate forever).
+        if (await _gate.WaitAsync(DisposeDrainTimeout).ConfigureAwait(false))
+            _gate.Release();
+        else
+            WarnDrainTimedOut();
+        DisposeCore();
+    }
+
+    private static void WarnDrainTimedOut() =>
+        Console.Error.WriteLine(
+            "[InferenceEngine] dispose timed out waiting for the in-flight generation to drain; " +
+            "freeing the forward pass anyway. If a generation was still running this can crash — " +
+            "ensure consumers dispose their generation enumerators and that the backend is responsive.");
+
+    private void DisposeCore()
+    {
         _fwd.Dispose();
         foreach (var d in _owned)
             d.Dispose();
         _gate.Dispose();
+        _shutdownCts.Dispose();
     }
 }

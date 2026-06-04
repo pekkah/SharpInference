@@ -106,6 +106,80 @@ public sealed class InferenceEngineConcurrencyTests
             $"prefilled {fwd.TotalTokensPrefilled} of {promptLen} tokens — prefill was not chunked/cancellable.");
     }
 
+    /// <summary>
+    /// Issue #132: <see cref="InferenceEngine.DisposeAsync"/> must not free the engine-owned
+    /// forward pass while a background generation worker is still inside it. The worker is
+    /// parked inside a <c>Prefill</c> call (holding the gate); disposing then must (a) block
+    /// until the worker drains and (b) never call <c>_fwd.Dispose()</c> while a call is in flight.
+    /// </summary>
+    [Fact]
+    public async Task DisposeAsync_DrainsInFlightWorker_BeforeFreeingForwardPass()
+    {
+        var fwd = new DrainTrackingForwardPass();
+        var tokenizer = new SingleTokenTokenizer();
+        var engine = new InferenceEngine(fwd, tokenizer, "mock");
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 64 };
+
+        using var cts = new CancellationTokenSource();
+        var genTask = Task.Run(async () =>
+        {
+            try
+            {
+                await foreach (var _ in engine.GenerateChunksAsync("seed", sp, cts.Token))
+                {
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected: shutdown cancels the in-flight generation.
+            }
+        });
+
+        // Park the worker inside the forward pass, holding the serialization gate.
+        Assert.True(fwd.EnteredForward.Wait(TimeSpan.FromSeconds(5)),
+            "worker never entered the forward pass");
+
+        // Dispose while the worker is still inside Prefill. DisposeAsync signals shutdown
+        // (so the worker will unwind at its next checkpoint) and waits for the gate.
+        var disposeTask = engine.DisposeAsync().AsTask();
+
+        // It must NOT complete yet — the worker is still inside the forward pass, and
+        // freeing _fwd now is exactly the 0xC0000005 window from #132.
+        var settledEarly = await Task.WhenAny(disposeTask, Task.Delay(500));
+        Assert.NotSame(disposeTask, settledEarly);
+        Assert.False(fwd.Disposed, "forward pass was freed before the in-flight worker drained");
+
+        // Release the parked call; the worker returns, observes shutdown cancellation,
+        // drains, releases the gate, and DisposeAsync proceeds to free the forward pass.
+        fwd.Release();
+        await disposeTask.WaitAsync(TimeSpan.FromSeconds(10));
+        await genTask.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.True(fwd.Disposed, "forward pass was never disposed");
+        Assert.False(fwd.DisposedWhileActive,
+            "forward pass was disposed while a worker call was in flight (issue #132)");
+    }
+
+    [Fact]
+    public async Task GenerateChunksAsync_AfterDispose_Throws()
+    {
+        var fwd = new DrainTrackingForwardPass();
+        var engine = new InferenceEngine(fwd, new SingleTokenTokenizer(), "mock");
+        await engine.DisposeAsync();
+
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 1 };
+        await Assert.ThrowsAsync<ObjectDisposedException>(async () =>
+        {
+            await foreach (var _ in engine.GenerateChunksAsync("seed", sp))
+            {
+            }
+        });
+
+        // Dispose is single-shot and safe to call again (sync and async), in any order.
+        await engine.DisposeAsync();
+        engine.Dispose();
+    }
+
     /// <summary>Tokenizer whose prompt always encodes to <paramref name="length"/> copies of token 0.</summary>
     private sealed class FixedLengthTokenizer(int length) : ITokenizer
     {
@@ -245,5 +319,59 @@ public sealed class InferenceEngineConcurrencyTests
 
         public bool SupportsPartialRewind => true;
         public void Dispose() => _release.Dispose();
+    }
+
+    /// <summary>
+    /// Forward pass that parks every call on a release gate (like <see cref="GatedForwardPass"/>)
+    /// but additionally records whether <see cref="Dispose"/> was ever called while a call was
+    /// still in flight — the use-after-free the #132 drain-on-dispose fix prevents.
+    /// </summary>
+    private sealed class DrainTrackingForwardPass : IForwardPass
+    {
+        private readonly float[] _logits = [1.0f, 0.0f]; // greedy → token 0 (non-EOS)
+        private readonly Lock _lock = new();
+        private readonly ManualResetEventSlim _release = new(false);
+
+        public readonly ManualResetEventSlim EnteredForward = new(false);
+
+        private int _active;
+        public bool Disposed { get; private set; }
+        public bool DisposedWhileActive { get; private set; }
+
+        public int VocabSize => 2;
+        public int MaxSeqLen => 4096;
+
+        private ReadOnlySpan<float> Blocking()
+        {
+            lock (_lock) _active++;
+            try
+            {
+                EnteredForward.Set();
+                _release.Wait(TimeSpan.FromSeconds(15));
+                return _logits;
+            }
+            finally
+            {
+                lock (_lock) _active--;
+            }
+        }
+
+        public void Release() => _release.Set();
+
+        public ReadOnlySpan<float> Forward(int token, int position) => Blocking();
+        public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0) => Blocking();
+        public void ResetCache() { }
+        public void TruncateTo(int length) { }
+        public bool SupportsPartialRewind => true;
+
+        public void Dispose()
+        {
+            lock (_lock)
+            {
+                if (_active > 0) DisposedWhileActive = true;
+                Disposed = true;
+            }
+            _release.Dispose();
+        }
     }
 }
