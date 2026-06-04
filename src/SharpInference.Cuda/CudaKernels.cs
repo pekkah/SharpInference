@@ -103,6 +103,57 @@ extern ""C"" __global__ void add_scaled_inplace(
     dst[idx] += src[idx] * scale;
 }
 
+// ── scale_rows_inplace ────────────────────────────────────────────────────
+// Per-row scalar multiply: buf[i*cols + e] *= scales[i].  One thread per
+// (row, col) element; total = rows*cols.  The multiply rounds to float exactly
+// like a per-row scale_inplace launch, so the result is bit-identical to
+// applying ScaleInPlace(row_i, scales[i]) once per row.
+extern ""C"" __global__ void llm_scale_rows_inplace(
+    float* __restrict__ buf, const float* __restrict__ scales, int rows, int cols)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)rows * cols;
+    if (idx >= total) return;
+    int i = (int)(idx / cols);
+    buf[idx] *= scales[i];
+}
+
+// ── moe_weighted_reduce ───────────────────────────────────────────────────
+// Per-token MoE reduce: for each (token i, element e) sum the na unweighted
+// down partials in top-k slot order (k = 0..na-1) with their per-(token,slot)
+// weights, then add the already-scaled-and-rounded shared-expert value LAST.
+//
+//   acc = 0
+//   for k in 0..na-1:  acc += downPartial[(i*na+k)*embDim + e] * weights[i*na+k]
+//   acc += shared[i*embDim + e]
+//   shared[i*embDim + e] = acc
+//
+// One thread per (i, e); total = N*embDim.  `shared` is in/out — the thread
+// that owns element (i,e) is the only reader and writer, so the read-modify-
+// write is race-free.  `acc` is a single float register: each `acc += p*w`
+// contracts to fmaf under NVRTC's default fmad=true (one rounding per term,
+// matching add_scaled_inplace), and the shared add is a plain a+b (one
+// rounding, matching add_inplace).  Order (routed first, shared last) and per-
+// op rounding therefore reproduce the sequential Clear + AddScaledInPlace×na +
+// AddInPlace accumulation byte-for-byte.
+extern ""C"" __global__ void llm_moe_weighted_reduce(
+    const float* __restrict__ downPartial, const float* __restrict__ weights,
+    float* __restrict__ shared, int N, int na, int embDim)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)N * embDim;
+    if (idx >= total) return;
+    int i = (int)(idx / embDim);
+    int e = (int)(idx - (long)i * embDim);
+    float acc = 0.0f;
+    const float* w = weights + (long)i * na;
+    const float* p = downPartial + ((long)i * na) * embDim + e;
+    for (int k = 0; k < na; k++)
+        acc += p[(long)k * embDim] * w[k];
+    acc += shared[(long)i * embDim + e];
+    shared[(long)i * embDim + e] = acc;
+}
+
 // ── clamp_inplace ─────────────────────────────────────────────────────────
 extern ""C"" __global__ void clamp_inplace(float* __restrict__ x, float lo, float hi, int n)
 {

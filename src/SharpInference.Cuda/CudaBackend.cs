@@ -163,6 +163,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _clearF32Kernel;
     private nint   _quantizeQ81Kernel;
     private nint   _bwBaselineKernel;
+    // Issue #129: batched GPU-SLRU MoE host-loop replacements. scale_rows applies a
+    // per-row scalar (shared-expert sigmoid gate) over [rows × cols] in one launch;
+    // moe_weighted_reduce does the whole Phase-3 top-k weighted scatter-reduce +
+    // shared add over all N tokens in one launch (replacing ~N·(na+2) tiny ops).
+    private nint   _scaleRowsKernel;
+    private nint   _moeWeightedReduceKernel;
 
     // TurboQuant KV-cache compression kernels.
     private nint   _tqRotateQueryKernel;
@@ -3453,6 +3459,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel,
             _geluTanhMulKernel, _softcapKernel,
             _clearF32Kernel, _quantizeQ81Kernel,
+            _scaleRowsKernel, _moeWeightedReduceKernel,
             _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
             _siluInplaceKernel, _gdnConv1dDecodeKernel, _gdnL2NormPerHeadKernel,
             _gdnTileHeadsKernel, _gdnRecurrenceDecodeKernel,
@@ -3531,6 +3538,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _clearF32Kernel        = GetKernelFunc("llm_clear_f32");
         _quantizeQ81Kernel     = GetKernelFunc("llm_quantize_q8_1");
         _bwBaselineKernel      = GetKernelFunc("llm_bw_baseline");
+        _scaleRowsKernel       = GetKernelFunc("llm_scale_rows_inplace");
+        _moeWeightedReduceKernel = GetKernelFunc("llm_moe_weighted_reduce");
 
         // TurboQuant kernels (loaded from the same NVRTC module).
         _tqRotateQueryKernel = GetKernelFunc("llm_tq_rotate_query");
@@ -3753,6 +3762,58 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         int   p3 = n;
         nint* args = stackalloc nint[4] { (nint)(&p0), (nint)(&p1), (nint)(&p2), (nint)(&p3) };
         Launch1D(_addScaledKernel, n, args);
+    }
+
+    /// <summary>
+    /// Issue #129: per-row scalar multiply over a [rows × cols] buffer:
+    /// <c>buf[i*cols + e] *= scales[i]</c>. The device <paramref name="scales"/> buffer
+    /// holds one scalar per row. Bit-identical to calling
+    /// <see cref="ScaleInPlace"/>(row_i, scales[i]) once per row — a single float
+    /// multiply per element, rounded to float. Used to apply the per-token shared-expert
+    /// sigmoid gate to the batched shared-expert down output in one launch.
+    /// </summary>
+    public void ScaleRowsInPlace(Tensor buf, Tensor scales, int rows, int cols)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC is not available; cannot run CUDA image kernels.");
+
+        long total = (long)rows * cols;
+        nint p0 = GetDevPtr(buf);
+        nint p1 = GetDevPtr(scales);
+        int  p2 = rows, p3 = cols;
+        nint* args = stackalloc nint[4] { (nint)(&p0), (nint)(&p1), (nint)(&p2), (nint)(&p3) };
+        Launch1D(_scaleRowsKernel, checked((int)total), args);
+    }
+
+    /// <summary>
+    /// Issue #129: batched MoE top-k weighted scatter-reduce + shared-expert add, in one
+    /// launch over all N tokens. For each (token i, element e):
+    /// <c>acc = Σ_k downPartial[(i*na+k)*embDim+e] * weights[i*na+k]; acc += shared[i*embDim+e]; shared[i*embDim+e] = acc;</c>
+    /// The per-k <c>acc += partial*weight</c> contracts to <c>fmaf</c> (NVRTC fmad=true),
+    /// one rounding per term, exactly matching the sequential <c>AddScaledInPlace</c> loop;
+    /// the final <c>acc += shared</c> is a plain add (one rounding), matching the sequential
+    /// <c>AddInPlace</c>. Routed slots are summed in k=0..na-1 order, shared added last —
+    /// byte-identical to the per-token <c>Clear + AddScaledInPlace×na + AddInPlace</c>.
+    /// <paramref name="shared"/> is in/out (must already hold the scaled+rounded shared
+    /// output per token); each thread owns its (i,e) element so the read-modify-write is
+    /// race-free.
+    /// </summary>
+    public void MoeWeightedReduce(Tensor downPartial, Tensor weights, Tensor shared,
+                                  int N, int na, int embDim)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC is not available; cannot run CUDA image kernels.");
+
+        long total = (long)N * embDim;
+        nint p0 = GetDevPtr(downPartial);
+        nint p1 = GetDevPtr(weights);
+        nint p2 = GetDevPtr(shared);
+        int  p3 = N, p4 = na, p5 = embDim;
+        nint* args = stackalloc nint[6]
+            { (nint)(&p0), (nint)(&p1), (nint)(&p2), (nint)(&p3), (nint)(&p4), (nint)(&p5) };
+        Launch1D(_moeWeightedReduceKernel, checked((int)total), args);
     }
 
     /// <inheritdoc/>
