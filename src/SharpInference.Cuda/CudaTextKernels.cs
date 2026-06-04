@@ -212,6 +212,25 @@ extern ""C"" __global__ void llm_gelu_tanh_mul(
     gate[i] = 0.5f * g * (1.0f + tanhf(inner)) * up[i];
 }
 
+// Strided-up variant: gate is [n_tok × width] contiguous; the up operand for
+// token t lives at up + t*up_stride + up_offset (width contiguous floats). Lets
+// batched PLE inject the per-layer slice of a [n_tok × (L*pleWidth)] projection
+// buffer without a gather. Per element bit-identical to llm_gelu_tanh_mul.
+extern ""C"" __global__ void llm_gelu_tanh_mul_strided(
+    float* __restrict__ gate, const float* __restrict__ up,
+    int width, long up_stride, long up_offset, int n_tok)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)n_tok * (long)width;
+    if (idx >= total) return;
+    long t = idx / width;
+    long j = idx % width;
+    float g = gate[idx];
+    float inner = 0.7978845608f * (g + 0.044715f * g * g * g);
+    float u = up[t * up_stride + up_offset + j];
+    gate[idx] = 0.5f * g * (1.0f + tanhf(inner)) * u;
+}
+
 // ── Final-logit softcap (in place) ─────────────────────────────────────────
 // x[i] = tanh(x[i] / cap) * cap. Matches SimdKernels.SoftcapInPlace.
 // Used by Gemma 4 for the final logit clipping (cap=30).
@@ -1157,6 +1176,44 @@ extern ""C"" __global__ void llm_matvec_q8_0(
 
     float result = sharpi_warp_reduce_sum(acc);
     if (lane == 0) output[row] = result;
+}
+
+// Q8_0 GEMM-N: N tokens through one weight matrix. grid=( (rows+7)/8, n_tok ).
+// Input [n_tok, cols] and output [n_tok, rows] are offset by token; the per-row
+// accumulation + warp reduce is identical to llm_matvec_q8_0, so this is
+// bit-identical to n_tok sequential matvecs. (Weights are re-read per token —
+// the launch-count collapse is the win; weight-reuse tiling is a follow-up.)
+extern ""C"" __global__ void llm_matvec_q8_0_gemm_n(
+    const unsigned int* __restrict__ weights,
+    const float* __restrict__ input,   // [n_tok, cols]
+    float* __restrict__ output,        // [n_tok, rows]
+    int rows, int cols, int n_tok)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    int token = (int)blockIdx.y;
+    if (row >= rows || token >= n_tok) return;
+
+    int num_blocks = cols >> 5;
+    long row_base_bytes = (long)row * (long)num_blocks * 34L;
+    const float* in = input + (long)token * (long)cols;
+
+    float acc = 0.f;
+    for (int block = 0; block < num_blocks; block++) {
+        long b0 = row_base_bytes + (long)block * 34L;
+        unsigned int dlo = sharpi_byte_at(weights, b0 + 0);
+        unsigned int dhi = sharpi_byte_at(weights, b0 + 1);
+        float d = sharpi_fp16_to_fp32(dlo | (dhi << 8));
+        int q = sharpi_int8_at(weights, b0 + 2 + (long)lane);
+        float x = in[block * 32 + lane];
+        acc += d * (float)q * x;
+    }
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output[(long)token * (long)rows + row] = result;
 }
 
 // ── MatVec F32 — N=2 variant (issue #43) ──────────────────────────────────

@@ -237,6 +237,67 @@ public sealed unsafe class CudaMatMulBatchedTests
         }
     }
 
+    /// Q8_0 layout: 34 bytes per 32-element block ([d:fp16][32×int8]).
+    private static byte[] BuildQ80Matrix(int rows, int cols, Random rng)
+    {
+        int blocksPerRow = cols / 32;
+        int bytesPerRow = blocksPerRow * 34;
+        var bytes = new byte[rows * bytesPerRow];
+        for (int r = 0; r < rows; r++)
+            for (int b = 0; b < blocksPerRow; b++)
+            {
+                int off = r * bytesPerRow + b * 34;
+                float d = (float)(rng.NextDouble() * 0.05 + 0.005);
+                ushort dh = HalfToUshort((Half)d);
+                bytes[off + 0] = (byte)(dh & 0xFF);
+                bytes[off + 1] = (byte)(dh >> 8);
+                for (int i = 0; i < 32; i++) bytes[off + 2 + i] = (byte)rng.Next(256);
+            }
+        return bytes;
+    }
+
+    [Fact]
+    public void MatMulBatched_Q8_0_BitwiseMatchesSequential()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        foreach ((int rows, int cols, int nTok) in
+                 new[] { (8, 256, 2), (33, 512, 5), (64, 1024, 17), (130, 2048, 40) })
+        {
+            var rng = new Random(20260604 + rows * 17 + cols * 5 + nTok);
+            byte[] weights = BuildQ80Matrix(rows, cols, rng);
+
+            var inAll = new float[(long)nTok * cols];
+            for (int i = 0; i < inAll.Length; i++) inAll[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            var gpuW = gpu.UploadRaw(weights, TensorShape.D1(weights.Length), DType.Q8_0);
+            var gpuInAll = gpu.Upload(inAll, TensorShape.D1((long)nTok * cols));
+            var gpuOutAll = gpu.Allocate(TensorShape.D1((long)nTok * rows));
+
+            gpu.MatMulBatched(gpuOutAll, gpuW, gpuInAll, nTok, DType.Q8_0);
+            gpu.Synchronize();
+            var batched = new float[(long)nTok * rows];
+            gpu.Download(gpuOutAll, batched);
+
+            var reference = new float[nTok][];
+            for (int t = 0; t < nTok; t++)
+            {
+                var inT = new float[cols];
+                Array.Copy(inAll, (long)t * cols, inT, 0, cols);
+                var gpuInT = gpu.Upload(inT, TensorShape.D1(cols));
+                var gpuRefT = gpu.Allocate(TensorShape.D1(rows));
+                gpu.MatMul(gpuRefT, gpuW, gpuInT, DType.Q8_0);
+                gpu.Synchronize();
+                reference[t] = new float[rows];
+                gpu.Download(gpuRefT, reference[t]);
+                gpu.Free(gpuInT); gpu.Free(gpuRefT);
+            }
+            gpu.Free(gpuW); gpu.Free(gpuInAll); gpu.Free(gpuOutAll);
+            AssertBitIdentical($"Q8_0 rows={rows} cols={cols} nTok={nTok}", rows, nTok, batched, reference);
+        }
+    }
+
     private static float[] Rand(int n, Random rng)
     {
         var a = new float[n];

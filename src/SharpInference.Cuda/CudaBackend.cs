@@ -150,6 +150,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _matvecQ4KGemmNKernel;
     private nint   _matvecQ5KGemmNKernel;
     private nint   _matvecQ6KGemmNKernel;
+    private nint   _matvecQ80GemmNKernel;
     // Issue #111: batched trunk elementwise/norm kernels (one launch over N tokens).
     private nint   _rmsNormBatchedKernel;
     private nint   _headNormBatchedKernel;
@@ -161,6 +162,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _attentionSwaKernel;
     private nint   _attentionSwaBatchedKernel;
     private nint   _geluTanhMulKernel;
+    private nint   _geluTanhMulStridedKernel;
     private nint   _softcapKernel;
     private nint   _clearF32Kernel;
     private nint   _quantizeQ81Kernel;
@@ -1413,13 +1415,15 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             DispatchMatVecQ4KBatched(wPtr, xPtr, yPtr, rows, cols, nTok);
             return;
         }
-        if (weightDType == DType.Float32 || weightDType == DType.Q6_K || weightDType == DType.Q5_K)
+        if (weightDType is DType.Float32 or DType.Q6_K or DType.Q5_K or DType.Q8_0)
         {
-            // All take F32 input; the Q5_K/Q6_K kernels decode the weight per element.
+            // All take F32 input; the Q5_K/Q6_K/Q8_0 kernels decode the weight per
+            // element. Same (rows+7)/8 × nTok geometry across all four.
             nint kernel = weightDType switch
             {
                 DType.Q6_K => _matvecQ6KGemmNKernel,
                 DType.Q5_K => _matvecQ5KGemmNKernel,
+                DType.Q8_0 => _matvecQ80GemmNKernel,
                 _          => _matvecF32GemmNKernel,
             };
             int pRows = rows, pCols = cols, pN = nTok;
@@ -1435,7 +1439,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             return;
         }
         throw new NotSupportedException(
-            $"CUDA MatMulBatched: weight dtype {weightDType} not supported (expected Q4_K, Q5_K, Q6_K, or Float32).");
+            $"CUDA MatMulBatched: weight dtype {weightDType} not supported (expected Q4_K, Q5_K, Q6_K, Q8_0, or Float32).");
     }
 
     /// <summary>
@@ -1874,6 +1878,33 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         uint grid = (uint)((n + 255) / 256);
         int r = NvrtcInterop.LaunchKernel(_geluTanhMulKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gelu_tanh_mul) failed: {r}");
+    }
+
+    /// <summary>
+    /// Strided-up <see cref="GeluTanhMul"/> over <paramref name="nTok"/> tokens:
+    /// <paramref name="gate"/> is <c>[nTok × width]</c> contiguous; the up operand for
+    /// token t is at <c>up + t*upStride + upOffset</c>. Lets batched PLE inject the
+    /// per-layer slice of a <c>[nTok × (L*pleWidth)]</c> projection buffer without a
+    /// gather. Per element bit-identical to <see cref="GeluTanhMul"/>.
+    /// </summary>
+    public void GeluTanhMulStrided(Tensor gate, Tensor up, int width, long upStride, long upOffset, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        long total = (long)nTok * width;
+        nint gPtr = GetDevPtr(gate);
+        nint uPtr = GetDevPtr(up);
+        int  pW = width, pNT = nTok;
+        long pStride = upStride, pOff = upOffset;
+        nint* args = stackalloc nint[6]
+        {
+            (nint)(&gPtr), (nint)(&uPtr), (nint)(&pW), (nint)(&pStride), (nint)(&pOff), (nint)(&pNT)
+        };
+        uint grid = (uint)((total + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_geluTanhMulStridedKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gelu_tanh_mul_strided) failed: {r}");
     }
 
     /// <summary>
@@ -3524,10 +3555,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _matvecQ80Kernel,
             _matvecF32N2Kernel, _matvecQ4KN2Kernel, _matvecQ5KN2Kernel, _matvecQ6KN2Kernel,
             _matvecF32GemmNKernel, _matvecQ4KGemmNKernel, _matvecQ5KGemmNKernel, _matvecQ6KGemmNKernel,
+            _matvecQ80GemmNKernel,
             _rmsNormBatchedKernel, _headNormBatchedKernel,
             _splitQgBatchedKernel, _ropeNeoxPartialBatchedKernel,
             _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel, _attentionSwaBatchedKernel,
-            _geluTanhMulKernel, _softcapKernel,
+            _geluTanhMulKernel, _geluTanhMulStridedKernel, _softcapKernel,
             _clearF32Kernel, _quantizeQ81Kernel,
             _scaleRowsKernel, _moeWeightedReduceKernel,
             _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
@@ -3596,6 +3628,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _matvecQ4KGemmNKernel  = GetKernelFunc("llm_matvec_q4k_gemm_n");
         _matvecQ5KGemmNKernel  = GetKernelFunc("llm_matvec_q5k_gemm_n");
         _matvecQ6KGemmNKernel  = GetKernelFunc("llm_matvec_q6k_gemm_n");
+        _matvecQ80GemmNKernel  = GetKernelFunc("llm_matvec_q8_0_gemm_n");
         _rmsNormBatchedKernel  = GetKernelFunc("llm_rmsnorm_batched");
         _headNormBatchedKernel = GetKernelFunc("llm_head_norm_batched");
         _splitQgBatchedKernel  = GetKernelFunc("llm_split_qg_batched");
@@ -3606,6 +3639,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _attentionSwaKernel    = GetKernelFunc("llm_attention_swa");
         _attentionSwaBatchedKernel = GetKernelFunc("llm_attention_swa_batched");
         _geluTanhMulKernel     = GetKernelFunc("llm_gelu_tanh_mul");
+        _geluTanhMulStridedKernel = GetKernelFunc("llm_gelu_tanh_mul_strided");
         _softcapKernel         = GetKernelFunc("llm_softcap_inplace");
         _clearF32Kernel        = GetKernelFunc("llm_clear_f32");
         _quantizeQ81Kernel     = GetKernelFunc("llm_quantize_q8_1");
