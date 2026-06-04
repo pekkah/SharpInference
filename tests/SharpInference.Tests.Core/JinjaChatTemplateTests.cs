@@ -284,4 +284,50 @@ public sealed class JinjaChatTemplateTests
         };
         Assert.Equal("U,A,", Render("{% for m in messages[1:] %}{{ m.content }},{% endfor %}", ctx));
     }
+
+    [Fact]
+    public void Slice_NegativeStop_OnListOfTypedDicts_DropsLastElement()
+    {
+        // messages[:-1] — negative-stop arithmetic is the error-prone part of GetSlice.
+        var ctx = new Dictionary<string, object?>
+        {
+            ["messages"] = new List<Dictionary<string, object?>>
+            {
+                new() { ["content"] = "A" },
+                new() { ["content"] = "B" },
+                new() { ["content"] = "C" },
+            },
+        };
+        Assert.Equal("A,B,", Render("{% for m in messages[:-1] %}{{ m.content }},{% endfor %}", ctx));
+    }
+
+    [Fact]
+    public void Index_OnArrayOfTypedDicts_Resolves()
+    {
+        // The fix matches System.Collections.IList, which covers T[] too — pin the array claim.
+        var ctx = new Dictionary<string, object?>
+        {
+            ["messages"] = new[]
+            {
+                new Dictionary<string, object?> { ["role"] = "system", ["content"] = "S" },
+                new Dictionary<string, object?> { ["role"] = "user",   ["content"] = "U" },
+            },
+        };
+        Assert.Equal("system", Render("{{ messages[0].role }}", ctx));
+        Assert.Equal("U", Render("{% for m in messages[1:] %}{{ m.content }}{% endfor %}", ctx));
+    }
+
+    [Fact]
+    public void Index_OutOfRange_OnListOfTypedDicts_ReturnsNullNotThrow()
+    {
+        // The i >= 0 && i < Count guard must hold for the broadened IList match too.
+        var ctx = new Dictionary<string, object?>
+        {
+            ["messages"] = new List<Dictionary<string, object?>>
+            {
+                new() { ["content"] = "only" },
+            },
+        };
+        Assert.Equal("", Render("{{ messages[5].content }}", ctx));
+    }
 }

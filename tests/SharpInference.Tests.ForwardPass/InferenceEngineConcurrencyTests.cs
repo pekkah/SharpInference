@@ -158,6 +158,105 @@ public sealed class InferenceEngineConcurrencyTests
         Assert.True(fwd.Disposed, "forward pass was never disposed");
         Assert.False(fwd.DisposedWhileActive,
             "forward pass was disposed while a worker call was in flight (issue #132)");
+        // The worker parked in the prompt prefill and never reached the decode loop: after the
+        // parked call returns it hits the per-token cancellation checkpoint and unwinds. If the
+        // shutdown token were NOT linked into the generation, the decode loop would instead spin
+        // out all 64 MaxNewTokens. One call (the prefill) proves the link works.
+        Assert.Equal(1, fwd.Calls);
+    }
+
+    /// <summary>
+    /// The synchronous <see cref="InferenceEngine.Dispose"/> drain path is distinct from
+    /// <see cref="InferenceEngine.DisposeAsync"/> (blocking <c>SemaphoreSlim.Wait</c> vs
+    /// <c>await WaitAsync</c>) and is what a non-async host calls — it must drain too (#132).
+    /// </summary>
+    [Fact]
+    public async Task Dispose_Synchronous_DrainsInFlightWorker_BeforeFreeingForwardPass()
+    {
+        var fwd = new DrainTrackingForwardPass();
+        var engine = new InferenceEngine(fwd, new SingleTokenTokenizer(), "mock");
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 64 };
+
+        using var cts = new CancellationTokenSource();
+        var genTask = Task.Run(async () =>
+        {
+            try
+            {
+                await foreach (var _ in engine.GenerateChunksAsync("seed", sp, cts.Token))
+                {
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        });
+
+        Assert.True(fwd.EnteredForward.Wait(TimeSpan.FromSeconds(5)),
+            "worker never entered the forward pass");
+
+        // Run the blocking Dispose() off-thread; it must not return while the worker is parked.
+        var disposeTask = Task.Run(engine.Dispose);
+        var settledEarly = await Task.WhenAny(disposeTask, Task.Delay(500));
+        Assert.NotSame(disposeTask, settledEarly);
+        Assert.False(fwd.Disposed, "forward pass freed before the worker drained (sync Dispose)");
+
+        fwd.Release();
+        await disposeTask.WaitAsync(TimeSpan.FromSeconds(10));
+        await genTask.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.True(fwd.Disposed, "forward pass was never disposed (sync Dispose)");
+        Assert.Equal(1, fwd.DisposeCount);
+        Assert.False(fwd.DisposedWhileActive,
+            "forward pass disposed while a call was in flight (sync Dispose, #132)");
+    }
+
+    /// <summary>
+    /// When the drain times out (a wedged backend or an abandoned enumerator that never
+    /// releases the gate), DisposeAsync must NOT free the forward pass — freeing it under a
+    /// still-live worker is the exact use-after-free #132 fixes. It leaks instead.
+    /// </summary>
+    [Fact]
+    public async Task DisposeAsync_DrainTimeout_LeaksForwardPassInsteadOfFreeingUnderLiveWorker()
+    {
+        var fwd = new DrainTrackingForwardPass();
+        var engine = new InferenceEngine(fwd, new SingleTokenTokenizer(), "mock")
+        {
+            _disposeDrainTimeout = TimeSpan.FromMilliseconds(200),
+        };
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 64 };
+
+        using var cts = new CancellationTokenSource();
+        var genTask = Task.Run(async () =>
+        {
+            try
+            {
+                await foreach (var _ in engine.GenerateChunksAsync("seed", sp, cts.Token))
+                {
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        });
+
+        Assert.True(fwd.EnteredForward.Wait(TimeSpan.FromSeconds(5)),
+            "worker never entered the forward pass");
+
+        // Worker is parked and never released → the drain times out at ~200ms (not the
+        // worker's 15s park), and the forward pass is left intact.
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await engine.DisposeAsync();
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5),
+            $"DisposeAsync waited {sw.Elapsed} — it should bail at the drain timeout, not block on the worker");
+        Assert.False(fwd.Disposed,
+            "forward pass was freed under a still-live worker on drain timeout (#132)");
+        Assert.False(fwd.DisposedWhileActive);
+
+        // Let the parked worker finish so the test doesn't strand a thread-pool thread.
+        fwd.Release();
+        await genTask.WaitAsync(TimeSpan.FromSeconds(10));
     }
 
     [Fact]
@@ -175,9 +274,11 @@ public sealed class InferenceEngineConcurrencyTests
             }
         });
 
-        // Dispose is single-shot and safe to call again (sync and async), in any order.
+        // Dispose is single-shot and safe to call again (sync and async), in any order —
+        // the forward pass is freed exactly once.
         await engine.DisposeAsync();
         engine.Dispose();
+        Assert.Equal(1, fwd.DisposeCount);
     }
 
     /// <summary>Tokenizer whose prompt always encodes to <paramref name="length"/> copies of token 0.</summary>
@@ -335,15 +436,21 @@ public sealed class InferenceEngineConcurrencyTests
         public readonly ManualResetEventSlim EnteredForward = new(false);
 
         private int _active;
-        public bool Disposed { get; private set; }
+        // DisposeCount (not a bool) so a double-free regression in the single-shot guard is
+        // visible; Disposed is the convenience view used by most assertions.
+        public int DisposeCount { get; private set; }
+        public bool Disposed => DisposeCount > 0;
         public bool DisposedWhileActive { get; private set; }
+        // Number of Prefill/Forward calls — lets a test prove the worker stopped well short of
+        // MaxNewTokens once shutdown cancellation propagates through the linked token.
+        public int Calls { get; private set; }
 
         public int VocabSize => 2;
         public int MaxSeqLen => 4096;
 
         private ReadOnlySpan<float> Blocking()
         {
-            lock (_lock) _active++;
+            lock (_lock) { _active++; Calls++; }
             try
             {
                 EnteredForward.Set();
@@ -369,7 +476,7 @@ public sealed class InferenceEngineConcurrencyTests
             lock (_lock)
             {
                 if (_active > 0) DisposedWhileActive = true;
-                Disposed = true;
+                DisposeCount++;
             }
             _release.Dispose();
         }
