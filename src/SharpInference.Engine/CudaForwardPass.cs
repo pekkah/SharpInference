@@ -137,6 +137,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private readonly Tensor? _gpuProjPerLayer;  // [PleWidth*NumLayers]   F32 — per-layer projection
     private readonly Tensor? _gpuPleX;          // [PleWidth]             F32 — inner gate buffer
     private readonly Tensor? _gpuPleY;          // [embDim]               F32 — inner proj buffer
+    // Non-owning per-layer slice views into _gpuProjPerLayer / _gpuPleRow. Offsets are
+    // static (layer*PleWidth), so we build them once instead of round-tripping each
+    // slice through CopyDeviceRegion every token. Freed in Dispose.
+    private readonly Tensor[]? _gpuProjSliceViews; // [L] view → _gpuProjPerLayer[layer]
+    private readonly Tensor[]? _gpuPleRowSliceViews;// [L] view → _gpuPleRow[layer]
     // Managed buffer for dequanting the active token's PLE row before upload.
     private readonly float[]? _pleRowHost;
     private readonly int _pleWidth;
@@ -634,6 +639,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             _gpuPleX         = _gpu.Allocate(TensorShape.D1(_pleWidth));
             _gpuPleY         = _gpu.Allocate(TensorShape.D1(_embDim));
             _pleRowHost      = new float[stackedDim];
+
+            // Precompute static per-layer slice views (no per-token CopyDeviceRegion).
+            _gpuProjSliceViews  = new Tensor[L];
+            _gpuPleRowSliceViews = new Tensor[L];
+            for (int i = 0; i < L; i++)
+            {
+                _gpuProjSliceViews[i]   = _gpu.View(_gpuProjPerLayer, (long)i * _pleWidth, _pleWidth);
+                _gpuPleRowSliceViews[i] = _gpu.View(_gpuPleRow,       (long)i * _pleWidth, _pleWidth);
+            }
         }
 
         Console.Error.WriteLine(" done.");
@@ -1118,25 +1132,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         _gpu.ScaleInPlace(_gpuProjPerLayer!, 1.0f / MathF.Sqrt(_embDim));
 
-        // Per-layer slice: RmsNorm with per_layer_proj_norm (w+1 baked in),
-        // add the same-slice of the PLE row, scale by 1/sqrt(2). The Tensor
-        // abstraction can't encode a device-pointer offset, so each slice
-        // round-trips through small scratch tensors. Total copy traffic is
-        // 42 × 256 × 4 = 43 KiB per token — negligible compared to the
-        // proj MatMul that just ran.
-        long sliceBytes = (long)_pleWidth * sizeof(float);
+        // Per-layer slice: RmsNorm with per_layer_proj_norm (w+1 baked in), add the
+        // same-slice of the PLE row, scale by 1/sqrt(2). Operates in place on static
+        // non-owning views into _gpuProjPerLayer / _gpuPleRow (no per-slice copies).
         for (int li = 0; li < L; li++)
         {
-            long sliceOffsetBytes = (long)li * _pleWidth * sizeof(float);
-            _gpu.CopyDeviceRegion(_gpuPleX!, 0, _gpuProjPerLayer!, sliceOffsetBytes, sliceBytes);
-            _gpu.RmsNorm(_gpuPleX!, _gpuPleX!, _gpuPerLayerProjNorm!, _hp.RmsNormEps);
-            // Reuse _gpuPleY (sized embDim, much wider than pleWidth) as a
-            // staging slot for the PLE row slice, then add via a view tensor.
-            _gpu.CopyDeviceRegion(_gpuPleY!, 0, _gpuPleRow!, sliceOffsetBytes, sliceBytes);
-            var addSrcView = new Tensor(TensorShape.D1(_pleWidth), DType.Float32, _gpuPleY!.Handle);
-            _gpu.AddInPlace(_gpuPleX!, addSrcView);
-            _gpu.ScaleInPlace(_gpuPleX!, 1.0f / MathF.Sqrt(2f));
-            _gpu.CopyDeviceRegion(_gpuProjPerLayer!, sliceOffsetBytes, _gpuPleX!, 0, sliceBytes);
+            var projSlice = _gpuProjSliceViews![li];
+            _gpu.RmsNorm(projSlice, projSlice, _gpuPerLayerProjNorm!, _hp.RmsNormEps);
+            _gpu.AddInPlace(projSlice, _gpuPleRowSliceViews![li]);
+            _gpu.ScaleInPlace(projSlice, 1.0f / MathF.Sqrt(2f));
         }
     }
 
@@ -1147,17 +1151,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// </summary>
     private void ApplyPerLayerEmbeddingGpu(int layer)
     {
-        long sliceOffsetBytes = (long)layer * _pleWidth * sizeof(float);
-        long sliceBytes = (long)_pleWidth * sizeof(float);
-
         // gate = inp_gate @ hidden  → [pleWidth]
         GpuMatMul(_gpuPleX!, _gpuInpGate![layer], _hidden);
 
-        // up = proj_per_layer[layer]  (stage into _gpuPleY's leading pleWidth
-        // floats so we can pass a fresh view tensor to GeluTanhMul).
-        _gpu.CopyDeviceRegion(_gpuPleY!, 0, _gpuProjPerLayer!, sliceOffsetBytes, sliceBytes);
-        var upView = new Tensor(TensorShape.D1(_pleWidth), DType.Float32, _gpuPleY!.Handle);
-        _gpu.GeluTanhMul(_gpuPleX!, upView);
+        // up = proj_per_layer[layer], read directly via the static slice view.
+        _gpu.GeluTanhMul(_gpuPleX!, _gpuProjSliceViews![layer]);
 
         // proj output (embDim).
         GpuMatMul(_gpuPleY!, _gpuPleProj![layer], _gpuPleX!);
@@ -2144,6 +2142,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             for (int i = 0; i < _gpuPleProj.Length; i++) _gpu.Free(_gpuPleProj[i]);
         if (_gpuPlePostNorm is not null)
             for (int i = 0; i < _gpuPlePostNorm.Length; i++) _gpu.Free(_gpuPlePostNorm[i]);
+        if (_gpuProjSliceViews is { } psv) foreach (var v in psv) _gpu.Free(v);
+        if (_gpuPleRowSliceViews is { } prsv) foreach (var v in prsv) _gpu.Free(v);
         if (_gpuPleRow       is { } pr) _gpu.Free(pr);
         if (_gpuProjPerLayer is { } ppl) _gpu.Free(ppl);
         if (_gpuPleX         is { } px) _gpu.Free(px);
