@@ -536,10 +536,6 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     internal static bool BatchedAttnEnabled =
         Environment.GetEnvironmentVariable("SHARPI_BATCHED_ATTN") != "0";
 
-    // One-shot guard so the >4096 batched-SDPA perf fallback is observable (it is
-    // bit-identical, just slower per-position) without spamming once per layer/chunk.
-    private bool _loggedBatchedAttnFallback;
-
     public int VocabSize => _hp.VocabSize;
     public int MaxSeqLen => _maxSeqLen;
     public LayerPlacement Placement => _placement;
@@ -1275,17 +1271,37 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         //     with `int` element counts (e.g. SiLuMul over N×numActive×expertDim);
         //     guard against silent truncation when chunking is disabled and the
         //     chunk is enormous (SHARPI_PREFILL_CHUNK set very large).
-        bool batchedSafe = N >= 2
+        bool trunkBatchSafe = N >= 2
             && _kvCache.Length == startPos
-            && _gdnStateCache.Length == startPos
+            && _gdnStateCache.Length == startPos;
+        bool cpuMoeBatchSafe = trunkBatchSafe
             && (long)N * _numActiveExperts * _expertDim <= int.MaxValue;
-        if (BatchedPrefillEnabled && _cpuMoe && batchedSafe)
+        if (BatchedPrefillEnabled && _cpuMoe && cpuMoeBatchSafe)
         {
             ReadOnlySpan<float> bLogits = PrefillBatchedCpuMoe(tokens, startPos, snapKvActive, W, wStart);
             _snapKvCaptureSlot = -1;
             if (snapKvActive)
                 ApplySnapKvEviction(N, W, wStart);
             return bLogits;
+        }
+
+        // Issue #119: extend the batched trunk to the dense GDN-hybrid (!IsMoE) and
+        // GPU-SLRU MoE (_cpuMoe==false) configs. The trunk batches identically; only
+        // the FFN/MoE stage differs (per-token GPU/CPU FFN or GPU-SLRU routed experts).
+        // Gated on the GPU-GDN trunk (the batched kernels require it) and the trunk-batch
+        // toggle (the whole value here is the batched trunk; SHARPI_BATCHED_TRUNK=0 falls
+        // through to the sequential per-token loop below, the parity reference). The
+        // `!_cpuMoe` clause is load-bearing: a CPU-MoE chunk that tripped the int-overflow
+        // guard above (cpuMoeBatchSafe false, trunkBatchSafe true) must NOT land here —
+        // PrefillBatchedTrunkGpuFfn dispatches GpuMoeFfn, whose SLRU manager is null on the
+        // CPU-MoE path. It falls through to the sequential per-token loop instead.
+        if (BatchedPrefillEnabled && BatchedTrunkEnabled && !_cpuGdn && !_cpuMoe && trunkBatchSafe)
+        {
+            ReadOnlySpan<float> gLogits = PrefillBatchedTrunkGpuFfn(tokens, startPos, snapKvActive, W, wStart);
+            _snapKvCaptureSlot = -1;
+            if (snapKvActive)
+                ApplySnapKvEviction(N, W, wStart);
+            return gLogits;
         }
 
         ReadOnlySpan<float> logits = default;
@@ -1327,23 +1343,33 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // =================================================================
 
     /// <summary>
-    /// Grow-only allocation of the per-chunk batched-prefill scratch, sized for
-    /// <paramref name="N"/> tokens. Host buffers fed to <c>Download</c>/<c>UploadInto</c>
-    /// are pinned (cudaMallocHost); the routed-expert compute buffers and the
-    /// expert→token bucket arrays are plain native memory.
+    /// Exact-size (re)allocation of the inter-layer residual-stream device buffer
+    /// <see cref="_gpuStreamAll"/> for N tokens. <c>UploadInto</c> requires a whole-tensor
+    /// element-count match, so chunks of differing length reallocate (at most twice per
+    /// prompt: a full chunk then a remainder). Shared by the CPU-MoE
+    /// (<see cref="EnsureBatchedScratch"/>) and dense/GPU-SLRU
+    /// (<see cref="PrefillBatchedTrunkGpuFfn"/>, issue #119) batched-prefill paths.
     /// </summary>
-    private void EnsureBatchedScratch(int N)
+    private void EnsureStreamAll(int N)
     {
         int embDim = _embDim;
-
-        // _gpuStreamAll must match the chunk's exact element count (UploadInto
-        // requires whole-tensor match); chunks are 512 + a remainder, so this
-        // reallocates at most twice per prompt. Host scratch is grow-only.
         if (_gpuStreamAll is not { } gs || gs.ElementCount != (long)N * embDim)
         {
             if (_gpuStreamAll is { } old) { _gpu.Free(old); _gpuStreamAll = null; }
             _gpuStreamAll = _gpu.Allocate(TensorShape.D1((long)N * embDim));
         }
+    }
+
+    /// <summary>
+    /// Grow-only allocation of the per-chunk CPU-MoE batched-prefill scratch, sized for
+    /// <paramref name="N"/> tokens (calls <see cref="EnsureStreamAll"/> first). Host buffers
+    /// fed to <c>Download</c>/<c>UploadInto</c> are pinned (cudaMallocHost); the routed-expert
+    /// compute buffers and the expert→token bucket arrays are plain native memory.
+    /// </summary>
+    private void EnsureBatchedScratch(int N)
+    {
+        int embDim = _embDim;
+        EnsureStreamAll(N);
 
         if (N <= _bCap) return;
 
@@ -1426,7 +1452,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpuBtNorm     = A((long)N * embDim);
         _gpuBtBlockOut = A((long)N * embDim);
         _gpuBtMoeNorm  = A((long)N * embDim);
-        _gpuBtShared   = A((long)N * embDim);
+        if (_cpuMoe)
+            _gpuBtShared = A((long)N * embDim);   // shared-expert out (CPU-MoE combine only)
         _gpuBtQkv      = A((long)N * _gdnConvChannels);
         _gpuBtZ        = A((long)N * _gdnValueDim);
         _gpuBtAlpha    = A((long)N * _gdnNumVHeads);
@@ -1438,8 +1465,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpuBtK        = A((long)N * kvDim);
         _gpuBtV        = A((long)N * kvDim);
         _gpuBtAttnOut  = A((long)N * qDim);
-        _gpuBtSGate    = A((long)N * _expertDim);
-        _gpuBtSUp      = A((long)N * _expertDim);
+        // Shared-expert scratch is used only by the CPU-MoE TrunkLayerBatched combine;
+        // the dense / GPU-SLRU batched-trunk path (issue #119) computes its FFN/MoE
+        // per token and never touches these (and _expertDim is unset for dense models).
+        if (_cpuMoe)
+        {
+            _gpuBtSGate = A((long)N * _expertDim);
+            _gpuBtSUp   = A((long)N * _expertDim);
+        }
         if (BatchedGdnScanEnabled)
         {
             _gpuBtQkvConv = A((long)N * _gdnConvChannels);
@@ -1522,7 +1555,19 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// N per-token launches into one each — which is what removes the host launch
     /// overhead that dominates GDN-hybrid prefill.
     /// </summary>
-    private void TrunkLayerBatched(int layer, int N, int startPos, bool isAttn,
+    /// <summary>
+    /// Config-independent batched trunk block for one layer: attn-norm → attention /
+    /// GDN block → postBlock residual → post-attention norm, all batched over N tokens
+    /// and left on the GPU. On return <see cref="_gpuBtBlockOut"/> holds the postBlock
+    /// residual (MoE/FFN residual) and <see cref="_gpuBtMoeNorm"/> the post-attention
+    /// norm (MoE/FFN input). The shared-expert / host-combine plumbing is layered on top
+    /// by the per-config callers (<see cref="TrunkLayerBatched"/> for CPU-MoE;
+    /// <see cref="PrefillBatchedTrunkGpuFfn"/> for the dense / GPU-SLRU paths, issue #119).
+    /// Bit-identical to the per-token trunk in <see cref="TrunkLayerSequential"/> /
+    /// <see cref="Forward"/>: every batched kernel runs the same per-row computation as
+    /// its single-token counterpart.
+    /// </summary>
+    private void TrunkBlockBatched(int layer, int N, int startPos, bool isAttn,
                                    bool snapKvActive, int wStart)
     {
         int embDim = _embDim;
@@ -1531,7 +1576,6 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         var norm     = _gpuBtNorm!;
         var blockOut = _gpuBtBlockOut!;
         var moeNorm  = _gpuBtMoeNorm!;
-        var shared   = _gpuBtShared!;
 
         // attn-norm (block input) over all tokens.
         _gpu.RmsNormBatched(norm, stream, _gpuAttnNorm[layer], N, embDim, _hp.RmsNormEps);
@@ -1542,12 +1586,25 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             GdnBlockBatched(layer, N, norm, blockOut);
 
         // postBlock = blockOut + stream (the pre-block residual). blockOut now holds
-        // the MoE residual — download it to the host combine buffer.
+        // the MoE/FFN residual.
         _gpu.AddInPlace(blockOut, stream);
-        _gpu.DownloadAsync(blockOut, (nint)_bResidAll, (int)((long)N * embDim));
 
-        // post-attention norm (MoE input).
+        // post-attention norm (MoE/FFN input).
         _gpu.RmsNormBatched(moeNorm, blockOut, _gpuPostAttnNorm[layer], N, embDim, _hp.RmsNormEps);
+    }
+
+    private void TrunkLayerBatched(int layer, int N, int startPos, bool isAttn,
+                                   bool snapKvActive, int wStart)
+    {
+        int embDim = _embDim;
+        TrunkBlockBatched(layer, N, startPos, isAttn, snapKvActive, wStart);
+        var blockOut = _gpuBtBlockOut!;
+        var moeNorm  = _gpuBtMoeNorm!;
+        var shared   = _gpuBtShared!;
+
+        // Download the postBlock residual + post-attn norm to the host combine buffers.
+        // (blockOut is unchanged by the moeNorm RmsNorm, so the queue order is moot.)
+        _gpu.DownloadAsync(blockOut, (nint)_bResidAll, (int)((long)N * embDim));
         _gpu.DownloadAsync(moeNorm, (nint)_bNormAll, (int)((long)N * embDim));
 
         // Shared expert (unscaled) — gate/up/down batched over all tokens; scale
@@ -1654,9 +1711,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     }
 
     /// <summary>Batched attention block: projections + Q/K norm + RoPE over N tokens;
-    /// batched KV-append + batched-query SDPA by default (issue #114-B) when the chunk
-    /// stays on the shared-scores window (<c>startPos+N ≤ 4096</c>) and SnapKV is inactive,
-    /// else (or under <c>SHARPI_BATCHED_ATTN=0</c>) the per-position KV-append + SDPA loop.</summary>
+    /// batched KV-append + batched-query SDPA by default when SnapKV is inactive — the
+    /// shared-scores fast path (issue #114-B) at <c>startPos+N ≤ 4096</c>, the wave-based
+    /// global-scratch SDPA (issue #118) past it. SnapKV active (or
+    /// <c>SHARPI_BATCHED_ATTN=0</c>) takes the per-position KV-append + SDPA loop.</summary>
     private void AttnBlockBatched(int layer, int N, int startPos, bool snapKvActive, int wStart,
                                   Tensor norm, Tensor blockOut)
     {
@@ -1675,41 +1733,38 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpu.RoPEPartialBatched(qAll, startPos, _headDim, _ropeDim, _hp.RopeTheta, _numHeads,   N, neox: true);
         _gpu.RoPEPartialBatched(kAll, startPos, _headDim, _ropeDim, _hp.RopeTheta, _numKvHeads, N, neox: true);
 
-        // Issue #114-B: batch the KV-append + SDPA into one launch each when the
-        // chunk stays on the shared-scores fast path (startPos+N ≤ 4096) and SnapKV
-        // Q-capture is inactive. Bit-identical to the per-position loop below (the
-        // batched attention kernel clones llm_attention per (head, query) block).
-        // SnapKV active or long context → fall through to the per-position loop,
-        // which captures Q and supports the >4096 global-scratch attention path.
-        if (BatchedAttnEnabled && !snapKvActive && startPos + N <= 4096)
+        // Issue #114-B / #118: batch the KV-append + SDPA into one launch each when
+        // SnapKV Q-capture is inactive. ≤4096 uses the shared-scores fast path
+        // (AttentionBatched); past 4096 uses the wave-based global-scratch SDPA
+        // (AttentionBatchedWave, issue #118) — both bit-identical to the per-position
+        // loop below (each (head, query) block clones llm_attention). SnapKV active →
+        // fall through to the per-position loop, which captures Q.
+        if (BatchedAttnEnabled && !snapKvActive)
         {
+            bool sharedFast = startPos + N <= 4096;
             if (_kvDType == DType.BFloat16)
             {
                 _gpu.KvAppendBatchedBf16(kAll, vAll, _gpuKCache[layer]!, _gpuVCache[layer]!, kvDim, startPos, _maxSeqLen, N);
-                _gpu.AttentionBatchedBf16(qAll, _gpuKCache[layer]!, _gpuVCache[layer]!, attnOutAll,
-                    _numHeads, _numKvHeads, _headDim, startPos, _maxSeqLen, N);
+                if (sharedFast)
+                    _gpu.AttentionBatchedBf16(qAll, _gpuKCache[layer]!, _gpuVCache[layer]!, attnOutAll,
+                        _numHeads, _numKvHeads, _headDim, startPos, _maxSeqLen, N);
+                else
+                    _gpu.AttentionBatchedWaveBf16(qAll, _gpuKCache[layer]!, _gpuVCache[layer]!, attnOutAll,
+                        _numHeads, _numKvHeads, _headDim, startPos, _maxSeqLen, N);
             }
             else
             {
                 _gpu.KvAppendBatched(kAll, vAll, _gpuKCache[layer]!, _gpuVCache[layer]!, kvDim, startPos, _maxSeqLen, N);
-                _gpu.AttentionBatched(qAll, _gpuKCache[layer]!, _gpuVCache[layer]!, attnOutAll,
-                    _numHeads, _numKvHeads, _headDim, startPos, _maxSeqLen, N);
+                if (sharedFast)
+                    _gpu.AttentionBatched(qAll, _gpuKCache[layer]!, _gpuVCache[layer]!, attnOutAll,
+                        _numHeads, _numKvHeads, _headDim, startPos, _maxSeqLen, N);
+                else
+                    _gpu.AttentionBatchedWave(qAll, _gpuKCache[layer]!, _gpuVCache[layer]!, attnOutAll,
+                        _numHeads, _numKvHeads, _headDim, startPos, _maxSeqLen, N);
             }
             _gpu.SigmoidMulInPlace(attnOutAll, gateAll);
             GpuMatMulBatched(blockOut, _gpuWO[layer], attnOutAll, N);
             return;
-        }
-
-        // Falling back to the per-position attention loop. Bit-identical, but slower —
-        // surface the >4096 perf cliff once (the batched SDPA only covers the
-        // shared-scores window; SnapKV-active prefill also takes this path by design).
-        if (BatchedAttnEnabled && !snapKvActive && startPos + N > 4096 && !_loggedBatchedAttnFallback)
-        {
-            _loggedBatchedAttnFallback = true;
-            Console.Error.WriteLine(
-                $"[CudaHybridGdnForwardPass] batched-query SDPA disabled for this prefill: " +
-                $"startPos+N={startPos + N} exceeds the {4096}-position shared-scores window; " +
-                "using the per-position attention path (bit-identical, slower). #114-B follow-up: wave-based >4096 SDPA.");
         }
 
         // Per-position KV-append + scaled-dot-product attention (positional →
@@ -1942,6 +1997,146 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 $"[batched-prefill] N={N} total={total:F0}ms ({total / N:F1}ms/tok) " +
                 $"trunk={trunkTicks * f:F0}ms router={routerTicks * f:F0}ms " +
                 $"routedMoE={routedTicks * f:F0}ms combine={combineTicks * f:F0}ms");
+        }
+        return _logitsBuf;
+    }
+
+    /// <summary>
+    /// Batched-trunk prompt prefill for the non-CPU-MoE GDN-hybrid configs (issue #119):
+    /// the dense FFN path (<c>!hp.IsMoE</c>, e.g. Qwen3.6-27B-MTP) and the GPU-SLRU MoE
+    /// path (<c>_cpuMoe == false</c> on a model whose experts mostly fit VRAM, e.g.
+    /// Qwen3-Coder-30B forced with <c>SHARPI_CPU_MOE=0</c>). The trunk (attention / GDN)
+    /// runs as the same GEMM-batched + fused-scan + batched-query-SDPA launches the
+    /// CPU-MoE path uses (<see cref="TrunkBlockBatched"/>), collapsing the per-token
+    /// GDN/attn launches that dominate long-context prefill. The FFN/MoE stage then runs
+    /// per token on the GPU exactly as in <see cref="Forward"/> — there is no routed-expert
+    /// DRAM amortization here (that is CPU-MoE-specific, #110/#112), only the trunk half.
+    ///
+    /// <para>Produces bit-identical KV cache, GDN state, MTP hidden history, and last-token
+    /// logits to the sequential per-token <see cref="Forward"/> loop: every batched trunk
+    /// kernel runs the same per-row math as its single-token counterpart, and the FFN/MoE
+    /// is the identical single-token kernel sequence over the (batched) post-attn norm.</para>
+    ///
+    /// <para><b>Not transactional</b> — same caveat as <see cref="PrefillBatchedCpuMoe"/>:
+    /// the GDN scan/conv state and KV pages are mutated in place while the length counters
+    /// are advanced only at the end, so a mid-chunk throw leaves poisoned recurrent state
+    /// (<c>_faulted</c> latched). Such a failure is fatal for this pass.</para>
+    /// </summary>
+    private ReadOnlySpan<float> PrefillBatchedTrunkGpuFfn(IReadOnlyList<int> tokens, int startPos,
+                                                          bool snapKvActive, int W, int wStart)
+    {
+        int N = tokens.Count;
+        int embDim = _embDim;
+        EnsureStreamAll(N);
+        EnsureBatchedTrunkScratch(N);
+
+        long t0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        long trunkTicks = 0, ffnTicks = 0;
+
+        // Pessimistic fault latch (see PrefillBatchedCpuMoe): clear only once the
+        // length counters have been advanced consistently with the recurrent state.
+        _faulted = true;
+
+        // 1. Embed every token into the residual-stream buffer + reserve KV blocks.
+        for (int i = 0; i < N; i++)
+        {
+            EmbedToken(_gpuHidden, tokens[i]);
+            _gpu.CopyDeviceRegion(_gpuStreamAll!, (long)i * embDim * sizeof(float),
+                                  _gpuHidden, 0, (long)embDim * sizeof(float));
+            _kvCache.ReserveBlockAt(startPos + i);
+        }
+
+        bool isMoe = _hp.IsMoE;
+        var stream = _gpuStreamAll!;
+
+        // 2. Trunk (batched) + per-token FFN/MoE, layer by layer.
+        for (int layer = 0; layer < _hp.NumLayers; layer++)
+        {
+            bool isAttn = _hp.LayerTypes![layer] == LayerType.Attention;
+            long lt0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
+            // ── Batched trunk block → _gpuBtBlockOut (resid) + _gpuBtMoeNorm (FFN input).
+            TrunkBlockBatched(layer, N, startPos, isAttn, snapKvActive, wStart);
+            var blockOut = _gpuBtBlockOut!;
+            var moeNorm  = _gpuBtMoeNorm!;
+            long lt1 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
+            // ── FFN / MoE per token, mirroring Forward's single-token dispatch. Reads
+            //    the batched post-attn norm slice into _gpuNormBuf, writes _gpuHidden,
+            //    adds the postBlock residual, and writes the new residual stream slice.
+            for (int i = 0; i < N; i++)
+            {
+                _gpu.CopyDeviceRegion(_gpuNormBuf, 0, moeNorm, (long)i * embDim * sizeof(float),
+                                      (long)embDim * sizeof(float));
+
+                if (!isMoe)
+                {
+                    if (_gpuWFfnGate is not null && _gpuWFfnGate[layer] is not null)
+                    {
+                        GpuDenseFfn(layer);
+                    }
+                    else
+                    {
+                        _gpu.Download(_gpuNormBuf, (nint)_cpuNormBuf, embDim);
+                        CpuDenseFfn(layer);
+                        _gpu.UploadInto(_gpuHidden, (nint)_cpuMoeHidden, embDim);
+                    }
+                }
+                else
+                {
+                    GpuMoeFfn(layer);
+                }
+
+                _gpu.CopyDeviceRegion(_gpuResidual, 0, blockOut, (long)i * embDim * sizeof(float),
+                                      (long)embDim * sizeof(float));
+                _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+                _gpu.CopyDeviceRegion(stream, (long)i * embDim * sizeof(float),
+                                      _gpuHidden, 0, (long)embDim * sizeof(float));
+            }
+            if (_prefillProfile)
+            {
+                long lt2 = System.Diagnostics.Stopwatch.GetTimestamp();
+                trunkTicks += lt1 - lt0;
+                ffnTicks   += lt2 - lt1;
+            }
+        }
+
+        // 3. Advance the position counters by N (block table already reserved).
+        for (int i = 0; i < N; i++)
+        {
+            _kvCache.IncrementPosition();
+            _gdnStateCache.IncrementPosition();
+        }
+        _faulted = false;
+
+        // 4. MTP hidden history: after the final layer, stream[i] holds the
+        //    pre-output-norm hidden for token startPos+i. Mirror into the
+        //    absolute-position history so PrefillMtp can read h_{p-1}.
+        if (_hasMtp)
+        {
+            EnsureMtpHiddenHistoryCap(startPos + N);
+            _gpu.Download(stream, (nint)(_mtpPrefillHiddens + (long)startPos * embDim), (int)((long)N * embDim));
+            if (_mtpHiddenHistoryLength < startPos + N)
+                _mtpHiddenHistoryLength = startPos + N;
+            new ReadOnlySpan<float>(_mtpPrefillHiddens + (long)(startPos + N - 1) * embDim, embDim).CopyTo(
+                new Span<float>(_lastHidden, embDim));
+        }
+
+        // 5. Last token: output norm + lm_head → logits.
+        _gpu.CopyDeviceRegion(_gpuHidden, 0, stream,
+                              (long)(N - 1) * embDim * sizeof(float), (long)embDim * sizeof(float));
+        _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuOutputNorm!, _hp.RmsNormEps);
+        _gpu.MatMul(_gpuLogits, _gpuOutputWeight!, _gpuHidden,
+            _gpuWeightDTypes.TryGetValue(_gpuOutputWeight!.Handle, out var outDt) ? outDt : DType.Float32);
+        _gpu.Download(_gpuLogits, _logitsBuf);
+
+        if (_prefillProfile)
+        {
+            double f = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            double total = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * f;
+            Console.Error.WriteLine(
+                $"[batched-prefill-gpuffn] N={N} total={total:F0}ms ({total / N:F1}ms/tok) " +
+                $"trunk={trunkTicks * f:F0}ms ffn={ffnTicks * f:F0}ms");
         }
         return _logitsBuf;
     }

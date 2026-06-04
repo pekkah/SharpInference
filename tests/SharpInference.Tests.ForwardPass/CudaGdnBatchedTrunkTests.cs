@@ -390,4 +390,186 @@ public sealed unsafe class CudaGdnBatchedTrunkTests
             AssertBitId($"attn bf16 startPos={startPos} N={N}", batOut, refOut);
         }
     }
+
+    // ── Wave-based >4096 batched SDPA (fp32), issue #118 ────────────────────
+    // Past the 4096 shared-scores window AttentionBatchedWave must match the
+    // per-token Attention global-scratch path bit-for-bit. One case forces a tiny
+    // wave budget so the multi-wave loop (W < N) is exercised.
+    [Fact]
+    public void AttentionBatchedWave_F32_BitwiseMatchesSequential()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        const int numHeads = 8, numKvHeads = 2, headDim = 128;
+        int qDim = numHeads * headDim, kvDim = numKvHeads * headDim;
+
+        foreach ((int startPos, int N, int budgetMb) in new[]
+                 { (4097, 8, 0), (5000, 64, 0), (8000, 40, 0), (5000, 64, 1) })
+        {
+            int maxSeq = startPos + N;
+            var rng = new Random(700 + startPos + N + budgetMb);
+            var prefixKV = Rand(startPos * kvDim * 2, rng);
+            var kAll = Rand(N * kvDim, rng);
+            var vAll = Rand(N * kvDim, rng);
+            var qAll = Rand(N * qDim, rng);
+
+            // Fill the prefix [0, startPos) into a fresh cache via the batched
+            // KV-append (proven bit-identical to per-token append). Used by both arms.
+            void FillPrefix(Tensor kc, Tensor vc)
+            {
+                if (startPos == 0) return;
+                var kp = new float[(long)startPos * kvDim];
+                var vp = new float[(long)startPos * kvDim];
+                for (int p = 0; p < startPos; p++)
+                {
+                    Array.Copy(prefixKV, (long)p * kvDim * 2, kp, (long)p * kvDim, kvDim);
+                    Array.Copy(prefixKV, (long)p * kvDim * 2 + kvDim, vp, (long)p * kvDim, kvDim);
+                }
+                var gk = gpu.Upload(kp, TensorShape.D1((long)startPos * kvDim));
+                var gv = gpu.Upload(vp, TensorShape.D1((long)startPos * kvDim));
+                gpu.KvAppendBatched(gk, gv, kc, vc, kvDim, 0, maxSeq, startPos);
+                gpu.Free(gk); gpu.Free(gv);
+            }
+
+            float[] RunRef()
+            {
+                var kc = gpu.Allocate(TensorShape.D1((long)maxSeq * kvDim));
+                var vc = gpu.Allocate(TensorShape.D1((long)maxSeq * kvDim));
+                var scratch = gpu.Allocate(TensorShape.D1((long)numHeads * maxSeq));
+                FillPrefix(kc, vc);
+                var outAll = new float[(long)N * qDim];
+                for (int i = 0; i < N; i++)
+                {
+                    int pos = startPos + i;
+                    float[] S(float[] a, int st) { var s = new float[st]; Array.Copy(a, (long)i * st, s, 0, st); return s; }
+                    var gk = gpu.Upload(S(kAll, kvDim), TensorShape.D1(kvDim));
+                    var gv = gpu.Upload(S(vAll, kvDim), TensorShape.D1(kvDim));
+                    var gq = gpu.Upload(S(qAll, qDim), TensorShape.D1(qDim));
+                    var go = gpu.Allocate(TensorShape.D1(qDim));
+                    gpu.KvAppend(gk, gv, kc, vc, kvDim, pos, maxSeq);
+                    gpu.Attention(gq, kc, vc, go, scratch, numHeads, numKvHeads, headDim, pos + 1, maxSeq);
+                    gpu.Synchronize();
+                    var ot = new float[qDim]; gpu.Download(go, ot);
+                    Array.Copy(ot, 0, outAll, (long)i * qDim, qDim);
+                    gpu.Free(gk); gpu.Free(gv); gpu.Free(gq); gpu.Free(go);
+                }
+                gpu.Free(kc); gpu.Free(vc); gpu.Free(scratch);
+                return outAll;
+            }
+
+            float[] RunWave()
+            {
+                var kc = gpu.Allocate(TensorShape.D1((long)maxSeq * kvDim));
+                var vc = gpu.Allocate(TensorShape.D1((long)maxSeq * kvDim));
+                FillPrefix(kc, vc);
+                var gKAll = gpu.Upload(kAll, TensorShape.D1((long)N * kvDim));
+                var gVAll = gpu.Upload(vAll, TensorShape.D1((long)N * kvDim));
+                var gQAll = gpu.Upload(qAll, TensorShape.D1((long)N * qDim));
+                var gOut = gpu.Allocate(TensorShape.D1((long)N * qDim));
+                gpu.KvAppendBatched(gKAll, gVAll, kc, vc, kvDim, startPos, maxSeq, N);
+                gpu.AttentionBatchedWave(gQAll, kc, vc, gOut, numHeads, numKvHeads, headDim, startPos, maxSeq, N);
+                gpu.Synchronize();
+                var outAll = new float[(long)N * qDim]; gpu.Download(gOut, outAll);
+                gpu.Free(kc); gpu.Free(vc); gpu.Free(gKAll); gpu.Free(gVAll); gpu.Free(gQAll); gpu.Free(gOut);
+                return outAll;
+            }
+
+            var prevBudget = Environment.GetEnvironmentVariable("SHARPI_ATTN_WAVE_BUDGET_MB");
+            if (budgetMb > 0) Environment.SetEnvironmentVariable("SHARPI_ATTN_WAVE_BUDGET_MB", budgetMb.ToString());
+            try
+            {
+                AssertBitId($"wave f32 startPos={startPos} N={N} budgetMb={budgetMb}", RunWave(), RunRef());
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("SHARPI_ATTN_WAVE_BUDGET_MB", prevBudget);
+            }
+        }
+    }
+
+    // ── Wave-based >4096 batched SDPA (bf16 cache), issue #118 ──────────────
+    [Fact]
+    public void AttentionBatchedWave_Bf16_BitwiseMatchesSequential()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        const int numHeads = 8, numKvHeads = 2, headDim = 128;
+        int qDim = numHeads * headDim, kvDim = numKvHeads * headDim;
+
+        foreach ((int startPos, int N, int budgetMb) in new[] { (4097, 8, 0), (6000, 48, 0), (6000, 48, 1) })
+        {
+            int maxSeq = startPos + N;
+            var rng = new Random(800 + startPos + N + budgetMb);
+            var prefixKV = Rand(startPos * kvDim * 2, rng);
+            var kAll = Rand(N * kvDim, rng);
+            var vAll = Rand(N * kvDim, rng);
+            var qAll = Rand(N * qDim, rng);
+
+            void FillPrefix(Tensor kc, Tensor vc)
+            {
+                if (startPos == 0) return;
+                var kp = new float[(long)startPos * kvDim];
+                var vp = new float[(long)startPos * kvDim];
+                for (int p = 0; p < startPos; p++)
+                {
+                    Array.Copy(prefixKV, (long)p * kvDim * 2, kp, (long)p * kvDim, kvDim);
+                    Array.Copy(prefixKV, (long)p * kvDim * 2 + kvDim, vp, (long)p * kvDim, kvDim);
+                }
+                var gk = gpu.Upload(kp, TensorShape.D1((long)startPos * kvDim));
+                var gv = gpu.Upload(vp, TensorShape.D1((long)startPos * kvDim));
+                gpu.KvAppendBatchedBf16(gk, gv, kc, vc, kvDim, 0, maxSeq, startPos);
+                gpu.Free(gk); gpu.Free(gv);
+            }
+
+            // Reference: per-token bf16 append + attention.
+            var kcR = gpu.Allocate(TensorShape.D1((long)maxSeq * kvDim), DType.BFloat16);
+            var vcR = gpu.Allocate(TensorShape.D1((long)maxSeq * kvDim), DType.BFloat16);
+            var scratch = gpu.Allocate(TensorShape.D1((long)numHeads * maxSeq));
+            FillPrefix(kcR, vcR);
+            var refOut = new float[(long)N * qDim];
+            for (int i = 0; i < N; i++)
+            {
+                int pos = startPos + i;
+                float[] S(float[] a, int st) { var s = new float[st]; Array.Copy(a, (long)i * st, s, 0, st); return s; }
+                var gk = gpu.Upload(S(kAll, kvDim), TensorShape.D1(kvDim));
+                var gv = gpu.Upload(S(vAll, kvDim), TensorShape.D1(kvDim));
+                var gq = gpu.Upload(S(qAll, qDim), TensorShape.D1(qDim));
+                var go = gpu.Allocate(TensorShape.D1(qDim));
+                gpu.KvAppendBf16(gk, gv, kcR, vcR, kvDim, pos, maxSeq);
+                gpu.AttentionBf16(gq, kcR, vcR, go, scratch, numHeads, numKvHeads, headDim, pos + 1, maxSeq);
+                gpu.Synchronize();
+                var ot = new float[qDim]; gpu.Download(go, ot);
+                Array.Copy(ot, 0, refOut, (long)i * qDim, qDim);
+                gpu.Free(gk); gpu.Free(gv); gpu.Free(gq); gpu.Free(go);
+            }
+            gpu.Free(kcR); gpu.Free(vcR); gpu.Free(scratch);
+
+            // Wave.
+            var kcB = gpu.Allocate(TensorShape.D1((long)maxSeq * kvDim), DType.BFloat16);
+            var vcB = gpu.Allocate(TensorShape.D1((long)maxSeq * kvDim), DType.BFloat16);
+            FillPrefix(kcB, vcB);
+            var gKAll = gpu.Upload(kAll, TensorShape.D1((long)N * kvDim));
+            var gVAll = gpu.Upload(vAll, TensorShape.D1((long)N * kvDim));
+            var gQAll = gpu.Upload(qAll, TensorShape.D1((long)N * qDim));
+            var gOut = gpu.Allocate(TensorShape.D1((long)N * qDim));
+            var prevBudget = Environment.GetEnvironmentVariable("SHARPI_ATTN_WAVE_BUDGET_MB");
+            if (budgetMb > 0) Environment.SetEnvironmentVariable("SHARPI_ATTN_WAVE_BUDGET_MB", budgetMb.ToString());
+            try
+            {
+                gpu.KvAppendBatchedBf16(gKAll, gVAll, kcB, vcB, kvDim, startPos, maxSeq, N);
+                gpu.AttentionBatchedWaveBf16(gQAll, kcB, vcB, gOut, numHeads, numKvHeads, headDim, startPos, maxSeq, N);
+                gpu.Synchronize();
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("SHARPI_ATTN_WAVE_BUDGET_MB", prevBudget);
+            }
+            var batOut = new float[(long)N * qDim]; gpu.Download(gOut, batOut);
+            gpu.Free(kcB); gpu.Free(vcB); gpu.Free(gKAll); gpu.Free(gVAll); gpu.Free(gQAll); gpu.Free(gOut);
+
+            AssertBitId($"wave bf16 startPos={startPos} N={N} budgetMb={budgetMb}", batOut, refOut);
+        }
+    }
 }

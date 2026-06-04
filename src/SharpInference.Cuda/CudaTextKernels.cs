@@ -1673,6 +1673,101 @@ extern ""C"" __global__ void llm_matvec_q6k_gemm_n(
     if (lane == 0) output_all[(long)token * (long)rows + row] = result;
 }
 
+// ── MatVec Q5_K GEMM-N (issue #119) ────────────────────────────────────────
+// Batched (token-dimension) clone of `llm_matvec_q5k`: F32 input, per-element
+// Q5_K weight decode, 8 rows/block × 32 threads/row warp reduce. Per-lane
+// accumulation order is byte-for-byte identical to the single-token kernel, so a
+// (rows, n_tok) launch is bit-identical to n_tok sequential `llm_matvec_q5k`
+// calls. Lets the batched trunk (TrunkBlockBatched) drive Q5_K projection weights,
+// which Q4_K_M-quantized GDN-hybrid models (e.g. Qwen3.6-27B-MTP) carry.
+extern ""C"" __global__ void llm_matvec_q5k_gemm_n(
+    const unsigned int* __restrict__ weights,
+    const float* __restrict__ input_all,   // [n_tok][cols]
+    float* __restrict__ output_all,        // [n_tok][rows]
+    int rows, int cols, int n_tok)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    int token = (int)blockIdx.y;
+    if (row >= rows || token >= n_tok) return;
+
+    const float* input = input_all + (long)token * (long)cols;
+    int num_blocks = cols >> 8;
+    long row_base_bytes = (long)row * (long)num_blocks * 176L;
+
+    float acc = 0.f;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long b0 = row_base_bytes + (long)block * 176L;
+
+        unsigned int dword0 = __ldg(&weights[b0 >> 2]);
+        float d    = sharpi_fp16_to_fp32(dword0 & 0xffffu);
+        float dmin = sharpi_fp16_to_fp32(dword0 >> 16);
+
+        unsigned int qh_byte = sharpi_byte_at(weights, b0 + 16 + lane);
+
+        int base_elem = block * 256;
+
+        #pragma unroll
+        for (int chunk = 0; chunk < 4; chunk++) {
+            unsigned int sc_lo_byte, sc_hi_byte;
+            unsigned int sc1, m1, sc2, m2;
+            int j_lo = chunk * 2;
+            int j_hi = j_lo + 1;
+            if (j_lo < 4) {
+                sc_lo_byte = sharpi_byte_at(weights, b0 + 4 + j_lo);
+                sc_hi_byte = sharpi_byte_at(weights, b0 + 4 + j_lo + 4);
+                sc1 = sc_lo_byte & 63u;
+                m1  = sc_hi_byte & 63u;
+                unsigned int sc_lo2 = sharpi_byte_at(weights, b0 + 4 + j_hi);
+                unsigned int sc_hi2 = sharpi_byte_at(weights, b0 + 4 + j_hi + 4);
+                sc2 = sc_lo2 & 63u;
+                m2  = sc_hi2 & 63u;
+            } else {
+                unsigned int a_lo = sharpi_byte_at(weights, b0 + 4 + j_lo + 4);
+                unsigned int b_lo = sharpi_byte_at(weights, b0 + 4 + j_lo - 4);
+                unsigned int c_lo = sharpi_byte_at(weights, b0 + 4 + j_lo);
+                sc1 = (a_lo & 0xFu) | (((b_lo >> 6) & 3u) << 4);
+                m1  = ((a_lo >> 4) & 0xFu) | (((c_lo >> 6) & 3u) << 4);
+
+                unsigned int a_hi = sharpi_byte_at(weights, b0 + 4 + j_hi + 4);
+                unsigned int b_hi = sharpi_byte_at(weights, b0 + 4 + j_hi - 4);
+                unsigned int c_hi = sharpi_byte_at(weights, b0 + 4 + j_hi);
+                sc2 = (a_hi & 0xFu) | (((b_hi >> 6) & 3u) << 4);
+                m2  = ((a_hi >> 4) & 0xFu) | (((c_hi >> 6) & 3u) << 4);
+            }
+
+            float d1  = d * (float)sc1;
+            float dm1 = dmin * (float)m1;
+            float d2  = d * (float)sc2;
+            float dm2 = dmin * (float)m2;
+
+            unsigned int u1 = 1u << (2 * chunk);
+            unsigned int u2 = u1 << 1;
+
+            unsigned int ql_byte = sharpi_byte_at(weights, b0 + 48 + chunk * 32 + lane);
+            unsigned int low4 = ql_byte & 0xFu;
+            unsigned int hi4  = (ql_byte >> 4) & 0xFu;
+
+            int hLo = (qh_byte & u1) != 0u ? 16 : 0;
+            int hHi = (qh_byte & u2) != 0u ? 16 : 0;
+
+            int elem_lo = base_elem + chunk * 64 + lane;
+            int elem_hi = elem_lo + 32;
+
+            acc += (d1 * (float)((int)low4 + hLo) - dm1) * input[elem_lo];
+            acc += (d2 * (float)((int)hi4  + hHi) - dm2) * input[elem_hi];
+        }
+    }
+
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output_all[(long)token * (long)rows + row] = result;
+}
+
 // ── Batched trunk elementwise/norm kernels (issue #111) ───────────────────
 // Each adds a token dimension (grid.y or a token-major offset) over the
 // single-token kernel above; the per-token math is byte-for-byte identical, so
@@ -3379,6 +3474,174 @@ extern ""C"" __global__ void llm_full_seq_attention_bf16(
         for (int t = 0; t < seq_len; t++) {
             long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
             acc += shared_scores[t] * sharpi_bf16_to_fp32((unsigned int)v_cache[v_off + dd]);
+        }
+        out[out_off + dd] = acc;
+    }
+}
+
+// ── Full-sequence (batched-query) SDPA, global-scratch (issue #118) ─────────
+// Bit-for-bit clone of `llm_full_seq_attention` except per-position scores spill
+// to a caller-provided global slice instead of the 16 KB `__shared__` buffer, so
+// it works past the 4096-position shared-scores window. Each block (h, i)
+// (grid = num_heads × n_tok) owns the private slice
+// `scores_scratch + (i*num_heads + h) * score_stride`, scanned only over
+// [0, seq_len) — so the per-(head,query) math (dot, 256-thread tree softmax,
+// V-weighted sum) is identical to `llm_attention`'s global-scratch path (the
+// per-position >4096 fallback this replaces). `score_stride` must be ≥ the
+// largest seq_len any query in this launch reaches (start_pos + n_tok). The host
+// drives this in waves of W ≤ n_tok queries (W chosen so the scratch fits a
+// bounded budget; each launch's n_tok == that wave's width) — see
+// CudaBackend.AttentionBatchedWave.
+extern ""C"" __global__ void llm_full_seq_attention_global(
+    const float* __restrict__ q_all,      // [n_tok, num_heads*head_dim]
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ out_all,          // [n_tok, num_heads*head_dim]
+    float* __restrict__ scores_scratch,   // [n_tok * num_heads * score_stride]
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int max_seq_len, int n_tok, int score_stride)
+{
+    __shared__ float sdata[256];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int h = blockIdx.x;
+    int i = (int)blockIdx.y;
+    if ((int)h >= num_heads || i >= n_tok) return;
+
+    int seq_len = start_pos + i + 1;
+    int kv_head = (int)h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = rsqrtf((float)head_dim);
+    int q_dim = num_heads * head_dim;
+    const float* q = q_all + (long)i * q_dim;
+    float* out = out_all + (long)i * q_dim;
+    long q_off = (long)h * (long)head_dim;
+    long out_off = q_off;
+    float* sc = scores_scratch + ((long)i * num_heads + h) * (long)score_stride;
+
+    for (int t = (int)tid; t < seq_len; t += 256) {
+        float dot = 0.f;
+        long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+        for (int dd = 0; dd < head_dim; dd++)
+            dot += q[q_off + dd] * k_cache[k_off + dd];
+        sc[t] = dot * scale;
+    }
+    __syncthreads();
+
+    float local_max = sharpi_neg_inf();
+    for (int t = (int)tid; t < seq_len; t += 256)
+        local_max = fmaxf(local_max, sc[t]);
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
+
+    float local_sum = 0.f;
+    for (int t = (int)tid; t < seq_len; t += 256) {
+        float ev = __expf(sc[t] - max_val);
+        sc[t] = ev;
+        local_sum += ev;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+    __syncthreads();
+
+    for (int t = (int)tid; t < seq_len; t += 256)
+        sc[t] *= inv_sum;
+    __syncthreads();
+
+    for (int dd = (int)tid; dd < head_dim; dd += 256) {
+        float acc = 0.f;
+        for (int t = 0; t < seq_len; t++) {
+            long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            acc += sc[t] * v_cache[v_off + dd];
+        }
+        out[out_off + dd] = acc;
+    }
+}
+
+// bf16-read variant (default KV dtype). Matches `llm_attention_bf16`'s global path.
+extern ""C"" __global__ void llm_full_seq_attention_global_bf16(
+    const float* __restrict__ q_all,
+    const unsigned short* __restrict__ k_cache,
+    const unsigned short* __restrict__ v_cache,
+    float* __restrict__ out_all,
+    float* __restrict__ scores_scratch,
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int max_seq_len, int n_tok, int score_stride)
+{
+    __shared__ float sdata[256];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int h = blockIdx.x;
+    int i = (int)blockIdx.y;
+    if ((int)h >= num_heads || i >= n_tok) return;
+
+    int seq_len = start_pos + i + 1;
+    int kv_head = (int)h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = rsqrtf((float)head_dim);
+    int q_dim = num_heads * head_dim;
+    const float* q = q_all + (long)i * q_dim;
+    float* out = out_all + (long)i * q_dim;
+    long q_off = (long)h * (long)head_dim;
+    long out_off = q_off;
+    float* sc = scores_scratch + ((long)i * num_heads + h) * (long)score_stride;
+
+    for (int t = (int)tid; t < seq_len; t += 256) {
+        float dot = 0.f;
+        long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+        for (int dd = 0; dd < head_dim; dd++)
+            dot += q[q_off + dd] * sharpi_bf16_to_fp32((unsigned int)k_cache[k_off + dd]);
+        sc[t] = dot * scale;
+    }
+    __syncthreads();
+
+    float local_max = sharpi_neg_inf();
+    for (int t = (int)tid; t < seq_len; t += 256)
+        local_max = fmaxf(local_max, sc[t]);
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
+
+    float local_sum = 0.f;
+    for (int t = (int)tid; t < seq_len; t += 256) {
+        float ev = __expf(sc[t] - max_val);
+        sc[t] = ev;
+        local_sum += ev;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+    __syncthreads();
+
+    for (int t = (int)tid; t < seq_len; t += 256)
+        sc[t] *= inv_sum;
+    __syncthreads();
+
+    for (int dd = (int)tid; dd < head_dim; dd += 256) {
+        float acc = 0.f;
+        for (int t = 0; t < seq_len; t++) {
+            long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            acc += sc[t] * sharpi_bf16_to_fp32((unsigned int)v_cache[v_off + dd]);
         }
         out[out_off + dd] = acc;
     }
