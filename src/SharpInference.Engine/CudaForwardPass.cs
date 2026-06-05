@@ -330,6 +330,21 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             }
         }
 
+        // SnapKV cannot compose with Gemma-4-like models: their SWA layers use
+        // sliding-window ring caches and layers carry per-layer head_dim, so the
+        // full-context scoring + uniform-kvDim compaction in ApplySnapKvEviction would
+        // mis-index those caches (out-of-range gather, wrong row stride). Force it off
+        // rather than silently corrupt the cache; warn only if it was explicitly asked for.
+        if (_isGemma4Like && _snapKvEffectiveBudget > 0)
+        {
+            if (_snapKvCfg.IsBudgetExplicit)
+                Console.Error.WriteLine(
+                    "[CudaForwardPass] SnapKV is not supported for Gemma-4-style models " +
+                    "(sliding-window ring caches + per-layer head_dim); ignoring the " +
+                    "configured budget and using the full KV cache.");
+            _snapKvEffectiveBudget = 0;
+        }
+
         Console.Error.WriteLine($"[CudaForwardPass] Context size: {_maxSeqLen} (model max: {hp.ContextLength}){(_tqEnabled ? " [TQ3]" : "")}");
 
         bool vramTrace = Environment.GetEnvironmentVariable("SHARPI_TRACE_VRAM") == "1";
@@ -768,6 +783,31 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private static readonly string[] s_phaseName =
         ["embed", "qkv-matmul", "rope+qknorm", "kv+attn", "o-proj+res", "ffn", "final+download", "ple"];
 
+    // CUDA Graph decode (issue #136): the Gemma 4 layer + output region has static
+    // topology across decode tokens (only `position` varies), so capture it once on the
+    // first decode token and replay per token — collapsing ~1k host launches/token into
+    // one cuGraphLaunch + a handful of node-param updates. Off by default; opt in with
+    // SHARPI_CUDA_GRAPH=1 or the UseCudaGraph setter. Falls back to direct launches on
+    // any capture/replay failure.
+    private bool _useCudaGraph =
+        Environment.GetEnvironmentVariable("SHARPI_CUDA_GRAPH") == "1";
+    private bool _graphCaptured;
+    // Number of KV entries SnapKV physically dropped when it compacted the cache
+    // (= N - K at eviction, 0 otherwise). Decode indexes the compacted cache by the
+    // *physical* slot `position - _kvEvictedCount` while RoPE keeps the logical
+    // `position`; without this the post-eviction decode reads stale/duplicated slots
+    // (cache-fill != absolute position). Also gates CUDA graphs off once > 0 — a
+    // compacted cache breaks the captured seqLen == position+1 invariant. A configured
+    // SnapKV budget that never evicts (prompt <= budget) leaves this 0, so the cache
+    // fills sequentially and graphs stay valid. Reset on a full ResetCache.
+    private int _kvEvictedCount;
+
+    /// <summary>
+    /// Enable/disable CUDA-graph capture+replay for the Gemma 4 decode loop. Defaults from
+    /// the <c>SHARPI_CUDA_GRAPH</c> env var; set before the first decode (tests/bench).
+    /// </summary>
+    public bool UseCudaGraph { get => _useCudaGraph; set => _useCudaGraph = value; }
+
     /// <inheritdoc/>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
@@ -897,10 +937,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             }
             else
             {
-                _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer], kvDim, position, _maxSeqLen);
+                // Index the cache by the physical slot. After a SnapKV eviction the cache
+                // is compacted to K entries, so the next write lands at
+                // `position - _kvEvictedCount` (= position when nothing was evicted), and
+                // attention reads that many + 1. RoPE above still uses the logical position.
+                int kvSlot = position - _kvEvictedCount;
+                _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer], kvDim, kvSlot, _maxSeqLen);
                 _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
                     _attnScoresScratch,
-                    _numHeads, _numKvHeads, _headDim, position + 1, _maxSeqLen);
+                    _numHeads, _numKvHeads, _headDim, kvSlot + 1, _maxSeqLen);
             }
 
             GpuMatMul(_hidden, _wo[layer], _attnOut);
@@ -977,6 +1022,24 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         if (_hp.HasPerLayerTokenEmbd)
             BuildPerLayerProjectionsGpu(token);
 
+        // 3. Transformer layers + final norm/output/softcap. Static topology across
+        //    tokens (only `position` varies), so optionally capture it once into a CUDA
+        //    graph and replay per token to kill the ~1k-launch/token host overhead (#136).
+        if (!TryRunGemma4DeviceRegionViaGraph(position))
+            RunGemma4DeviceRegion(position);
+
+        _gpu.Download(_logits, _logitsBuf);
+        _gpu.Synchronize();
+
+        _kvLength = Math.Max(_kvLength, position + 1);
+        return _logitsBuf;
+    }
+
+    // Transformer layer loop + final norm/output/softcap — the pure on-device-compute
+    // region the CUDA-graph path captures. Token-varying embedding + PLE run before it;
+    // the logits download + sync run after. Only `position` varies across tokens.
+    private void RunGemma4DeviceRegion(int position)
+    {
         int L = _hp.NumLayers;
         for (int layer = 0; layer < L; layer++)
         {
@@ -1105,12 +1168,56 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         if (_hp.FinalLogitSoftcap > 0f)
             _gpu.SoftcapInPlace(_logits, _hp.FinalLogitSoftcap);
+    }
 
-        _gpu.Download(_logits, _logitsBuf);
-        _gpu.Synchronize();
+    // CUDA-graph capture/replay for the Gemma 4 decode region. Returns true if the logits
+    // were produced via the graph (captured on the first decode token, replayed after);
+    // false means the caller must run the region with direct launches. Any capture/replay
+    // failure disables graphs for the rest of the session and degrades to direct launches.
+    private bool TryRunGemma4DeviceRegionViaGraph(int position)
+    {
+        if (!_useCudaGraph || !_gpu.GraphCaptureSupported)
+            return false;
 
-        _kvLength = Math.Max(_kvLength, position + 1);
-        return _logitsBuf;
+        // Graphs bake in the standard decode invariant (fixed topology, seqLen ==
+        // position+1). TurboQuant (extra host-synced rotate/compress ops) and an *actual*
+        // SnapKV eviction (cache compacted, so cache-fill != absolute position) break that.
+        // A configured-but-unevicted SnapKV budget does not — the cache still fills
+        // sequentially — so gate on an actual eviction (_kvEvictedCount > 0), not on the
+        // budget being set.
+        if (_kvEvictedCount > 0 || _tqEnabled)
+            return false;
+
+        // Steady state: graph already captured — just replay at the new position.
+        if (_graphCaptured && _gpu.GraphReady)
+        {
+            try { _gpu.LaunchGraphForPosition(position); return true; }
+            catch { _useCudaGraph = false; _graphCaptured = false; return false; }
+        }
+
+        if (_graphCaptured)
+            return false; // latched but not ready — shouldn't happen; stay on direct launches
+
+        // First decode token: capture the region (records onto the stream without executing)
+        // then launch it for real. On any failure the region was NOT executed, so the caller
+        // re-runs it directly.
+        try
+        {
+            if (!_gpu.TryBeginGraphCapture())
+                return false;
+            RunGemma4DeviceRegion(position);
+            if (!_gpu.TryEndGraphCaptureAndInstantiate())
+                return false;
+            _gpu.LaunchGraphForPosition(position);
+            _graphCaptured = true;
+            return true;
+        }
+        catch
+        {
+            _gpu.AbortGraphCapture();
+            _useCudaGraph = false;
+            return false;
+        }
     }
 
     /// <summary>
@@ -1254,10 +1361,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             }
 
             int kvDim = _numKvHeads * _headDim;
-            _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer], kvDim, position, _maxSeqLen);
+            // Physical KV slot (= position unless SnapKV compacted the cache). See the
+            // matching note in Forward.
+            int kvSlot = position - _kvEvictedCount;
+            _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer], kvDim, kvSlot, _maxSeqLen);
             _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
                 _attnScoresScratch,
-                _numHeads, _numKvHeads, _headDim, position + 1, _maxSeqLen);
+                _numHeads, _numKvHeads, _headDim, kvSlot + 1, _maxSeqLen);
             _gpu.Synchronize();
             AccPhase(PH_KV_ATTN, sw, ref t0);
 
@@ -1876,6 +1986,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // CudaForwardPass — actual data lives in _gpuKCache/_gpuVCache.
         _kvLength = K;
         _kvCache.TruncateTo(K);
+        // The cache is now compacted: K physical entries at slots [0, K) but the logical
+        // RoPE positions continue at N, N+1, … So decode must index the cache by the
+        // physical slot `position - _kvEvictedCount`. This also disables CUDA-graph replay
+        // for the sequence (the seqLen == position+1 invariant no longer holds); both are
+        // re-enabled on a full ResetCache.
+        _kvEvictedCount = N - K;
     }
 
     private void EnsureSnapKvCaptureBuffer(int W)
@@ -1923,6 +2039,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 "truncate inside the FP32 recent window.");
         _kvLength = length;
         _kvCache.TruncateTo(length);
+        // _kvEvictedCount is intentionally NOT reset here. TruncateTo only rewinds *decode*
+        // tokens (speculative decode rejects), whose logical positions stay >= the eviction
+        // point, so the physical mapping `slot = position - _kvEvictedCount` remains valid.
+        // (Rewinding below the eviction point would be nonsensical — those prompt tokens were
+        // compacted away — and SnapKV does not compose with speculative decode in practice.)
     }
 
     /// <inheritdoc />
@@ -1936,6 +2057,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         _tqCompressedLen = 0;
         _fp32WriteIdx = 0;
         _fp32Count = 0;
+        _kvEvictedCount = 0; // fresh sequence — standard sequential cache state restored
     }
 
     private void GpuMatMul(Tensor output, Tensor weights, Tensor input)

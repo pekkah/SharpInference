@@ -1544,6 +1544,65 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     //  for the GPU half and ForwardPass.Forward (Gemma 4 path) for the CPU half.
     // ================================================================
 
+    // CUDA Graph decode (issue #136): the GPU layer loop has static topology across
+    // decode tokens (only `position` varies), so capture it once on the first decode
+    // token and replay per token — collapsing the per-layer launches into one
+    // cuGraphLaunch + a handful of node-param updates. Off by default; opt in with
+    // SHARPI_CUDA_GRAPH=1 or the UseCudaGraph setter. Falls back to direct launches on
+    // any capture/replay failure. The hybrid win is smaller than the all-GPU path's
+    // since host transfers + CPU layers bracket only a fraction of the layers.
+    private bool _useCudaGraph =
+        Environment.GetEnvironmentVariable("SHARPI_CUDA_GRAPH") == "1";
+    private bool _graphCaptured;
+
+    /// <summary>
+    /// Enable/disable CUDA-graph capture+replay for the Gemma 4 GPU layer loop. Defaults
+    /// from the <c>SHARPI_CUDA_GRAPH</c> env var; set before the first decode (tests/bench).
+    /// </summary>
+    public bool UseCudaGraph { get => _useCudaGraph; set => _useCudaGraph = value; }
+
+    // CUDA-graph capture/replay for the Gemma 4 GPU layer loop. Returns true if the loop
+    // ran via the graph (captured on the first decode token, replayed after); false means
+    // the caller must run the layers with direct launches. Any failure disables graphs for
+    // the rest of the session and degrades to direct launches.
+    private bool TryRunGpuLayersGemma4ViaGraph(int position)
+    {
+        if (!_useCudaGraph || !_gpu.GraphCaptureSupported || _tqEnabled)
+            return false;
+
+        // Steady state: graph already captured — just replay at the new position.
+        if (_graphCaptured && _gpu.GraphReady)
+        {
+            try { _gpu.LaunchGraphForPosition(position); return true; }
+            catch { _useCudaGraph = false; _graphCaptured = false; return false; }
+        }
+
+        if (_graphCaptured)
+            return false;
+
+        // First decode token: capture the loop (records onto the stream without executing)
+        // then launch it for real. On any failure the loop was NOT executed, so the caller
+        // re-runs it directly.
+        try
+        {
+            if (!_gpu.TryBeginGraphCapture())
+                return false;
+            for (int i = 0; i < _nGpuLayers; i++)
+                GpuLayerGemma4(i, position);
+            if (!_gpu.TryEndGraphCaptureAndInstantiate())
+                return false;
+            _gpu.LaunchGraphForPosition(position);
+            _graphCaptured = true;
+            return true;
+        }
+        catch
+        {
+            _gpu.AbortGraphCapture();
+            _useCudaGraph = false;
+            return false;
+        }
+    }
+
     private ReadOnlySpan<float> ForwardGemma4(int token, int position)
     {
         // PLE pre-pass needs the hidden state, so embed first.
@@ -1603,8 +1662,13 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 _gpu.RecordBarrier();
             }
 
-            for (int i = 0; i < _nGpuLayers; i++)
-                GpuLayerGemma4(i, position);
+            // The GPU layer loop has static topology across decode tokens (only
+            // `position` varies), so optionally capture it once into a CUDA graph and
+            // replay per token (issue #136). Uploads above and the download below stay
+            // outside the captured region (they are host transfers).
+            if (!TryRunGpuLayersGemma4ViaGraph(position))
+                for (int i = 0; i < _nGpuLayers; i++)
+                    GpuLayerGemma4(i, position);
 
             if (_nCpuLayers > 0)
             {
