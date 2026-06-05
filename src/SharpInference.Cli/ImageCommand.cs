@@ -67,10 +67,15 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
         [Description("(Z-Image) Path to Qwen3 tokenizer.json")]
         public string? QwenTokenizerPath { get; init; }
 
-        [CommandOption("-g|--n-gpu-layers")]
-        [Description("(Z-Image) GPU acceleration: -1 = auto (CUDA→Vulkan→CPU, default), 0 = CPU only")]
+        [CommandOption("--n-gpu-layers|--gpu-layers|--ngl")]
+        [Description("(Z-Image) GPU acceleration: -1 = auto (CUDA→Vulkan→CPU, default), 0 = CPU only. llama.cpp short flag -ngl is also accepted.")]
         [DefaultValue(-1)]
         public int NGpuLayers { get; init; }
+
+        [CommandOption("--device")]
+        [Description("GPU device to offload to: index (0,1,…), name (CUDA0, Vulkan1), or 'none' for CPU. " +
+            "Default: auto. Single-device only. llama.cpp short flag -dev is also accepted.")]
+        public string? Device { get; init; }
 
         [CommandOption("--backend")]
         [Description("(Z-Image) Force compute backend: auto (default), cuda, vulkan, cpu")]
@@ -199,6 +204,19 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
         // Pass -1 when no explicit --steps given so ZImagePipeline uses ZImageParams.DefaultSteps (4)
         int steps = s.Steps > 0 ? s.Steps : -1;
 
+        // Resolve --device before any GPU call (may set CUDA_VISIBLE_DEVICES).
+        int deviceIndex;
+        bool deviceNone;
+        try
+        {
+            deviceIndex = GpuDevice.Resolve(s.Device, out deviceNone);
+        }
+        catch (InvalidOperationException ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(ex.Message)}");
+            return 1;
+        }
+
         AnsiConsole.MarkupLine("[bold]Z-Image-Turbo[/] (S3-DiT + Qwen3-4B)");
         AnsiConsole.MarkupLine($"[dim]DiT:[/]      {Markup.Escape(modelPath)}");
         AnsiConsole.MarkupLine($"[dim]VAE:[/]      {Markup.Escape(vaePath!)}");
@@ -226,10 +244,10 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                     {
                         // Resolve which backend to use:
                         //   --backend cuda|vulkan|cpu  → forced
-                        //   -g 0                       → CPU only
+                        //   --ngl 0 / --device none    → CPU only
                         //   default (-1)               → CUDA → Vulkan → CPU fallback
                         string backendChoice = (s.Backend ?? "auto").ToLowerInvariant();
-                        bool forceCpu    = s.NGpuLayers == 0 || backendChoice == "cpu";
+                        bool forceCpu    = s.NGpuLayers == 0 || deviceNone || backendChoice == "cpu";
                         bool forceCuda   = backendChoice == "cuda";
                         bool forceVulkan = backendChoice == "vulkan";
 
@@ -244,7 +262,7 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                             {
                                 try
                                 {
-                                    var vulkan = new VulkanBackend();
+                                    var vulkan = new VulkanBackend(deviceIndex);
                                     gpu = vulkan;
                                     vulkan.PrintDeviceInfo();
                                     AnsiConsole.MarkupLine("[dim]Backend:[/]  GPU (Vulkan SGEMM)");
@@ -275,7 +293,7 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                             {
                                 try
                                 {
-                                    upscalerGpu = new VulkanBackend();
+                                    upscalerGpu = new VulkanBackend(deviceIndex);
                                     upscalerBackend = upscalerGpu;
                                     AnsiConsole.MarkupLine("[dim]Upscaler backend:[/] GPU (Vulkan, native kernels)");
                                 }
@@ -342,6 +360,19 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
         int steps     = s.Steps > 0 ? s.Steps : IsDistilled(modelPath) ? 4 : 20;
         float cfg     = s.CfgScale > 0f ? s.CfgScale : 1.0f;
 
+        // Resolve --device before any GPU call (may set CUDA_VISIBLE_DEVICES). The FLUX upscaler
+        // is the only GPU consumer here; 'none' just leaves it on whatever fallback applies.
+        int deviceIndex;
+        try
+        {
+            deviceIndex = GpuDevice.Resolve(s.Device, out _);
+        }
+        catch (InvalidOperationException ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(ex.Message)}");
+            return 1;
+        }
+
         AnsiConsole.MarkupLine("[bold]FLUX.1[/] (MM-DiT + CLIP-L + T5-XXL)");
         AnsiConsole.MarkupLine($"[dim]DiT:[/]     {Markup.Escape(modelPath)}");
         AnsiConsole.MarkupLine($"[dim]VAE:[/]     {Markup.Escape(s.VaePath!)}");
@@ -401,7 +432,7 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                             {
                                 try
                                 {
-                                    upscalerGpu = new VulkanBackend();
+                                    upscalerGpu = new VulkanBackend(deviceIndex);
                                     AnsiConsole.MarkupLine("[dim]Upscaler backend:[/] GPU (Vulkan, native kernels)");
                                 }
                                 catch

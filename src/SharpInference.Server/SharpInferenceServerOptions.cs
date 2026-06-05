@@ -198,7 +198,7 @@ public sealed class SamplingDefaults
     /// <summary>Min-p cutoff. <c>0</c> = disabled. Mirrors <c>--min-p</c>.</summary>
     public float MinP { get; set; } = 0f;
 
-    /// <summary>Repetition penalty. <c>1.0</c> = disabled. Mirrors <c>--rep-penalty</c>.</summary>
+    /// <summary>Repetition penalty. <c>1.0</c> = disabled. Mirrors <c>--repeat-penalty</c>.</summary>
     public float RepetitionPenalty { get; set; } = 1f;
 
     /// <summary>

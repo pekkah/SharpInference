@@ -21,7 +21,10 @@ dotnet tool update -g SharpInference.Cli
 sharpi-cli -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -p "Once upon a time" --temp 0.7
 
 # All layers on GPU (Vulkan or CUDA, auto-selected)
-sharpi-cli -m models/Qwen3-8B-Q4_K_M.gguf -p "Explain mmap" -g -1
+sharpi-cli -m models/Qwen3-8B-Q4_K_M.gguf -p "Explain mmap" -ngl -1
+
+# Pick a specific GPU (multi-GPU box): offload all layers to device 1
+sharpi-cli -m models/Qwen3-8B-Q4_K_M.gguf -p "Explain mmap" -ngl -1 -dev 1
 
 # Interactive chat (omit -p to enter chat mode)
 sharpi-cli -m models/Qwen3-8B-Q4_K_M.gguf
@@ -35,7 +38,10 @@ sharpi-cli image \
   -p "a serene mountain lake at sunrise" -W 512 -H 512 --steps 4 -o out.png
 ```
 
-Flag names are intentionally compatible with `llama.cpp` / `llama-cli`.
+Flag names are intentionally compatible with `llama.cpp` / `llama-cli`. The llama-style
+single-dash multi-character flags `-ngl`, `-dev`, `-md`, `-st`, and `-sys` are accepted as
+aliases for `--n-gpu-layers`, `--device`, `--model-draft`, `--single-turn`, and
+`--system-prompt` respectively.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -46,8 +52,10 @@ Flag names are intentionally compatible with `llama.cpp` / `llama-cli`.
 | `--top-k` | `40` | Top-k sampling |
 | `--top-p` | `0.95` | Top-p nucleus sampling |
 | `--min-p` | `0.05` | Min-p sampling |
-| `-g, --n-gpu-layers` | `0` | Layers on GPU (`0` = CPU only, `-1` = all) |
+| `-ngl, --n-gpu-layers` | `0` | Layers on GPU (`0` = CPU only, `-1` = all) |
+| `-dev, --device` | auto | GPU to offload to (`0`, `1`, `CUDA0`, `Vulkan1`, or `none`); single-device only |
 | `-c, --ctx-size` | model default | Context / max sequence length |
+| `--repeat-penalty` | `1.1` | Repetition penalty (`1.0` = disabled) |
 | `--tq` | off | TurboQuant KV cache compression (3-bit, ~5× VRAM reduction) |
 
 Run `sharpi-cli --help` for the full reference.

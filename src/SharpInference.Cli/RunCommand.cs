@@ -57,12 +57,12 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         public int Seed { get; init; }
 
         [CommandOption("--single-turn")]
-        [Description("Generate one response and exit")]
+        [Description("Generate one response and exit (llama.cpp short flag -st is also accepted)")]
         [DefaultValue(false)]
         public bool SingleTurn { get; init; }
 
         [CommandOption("--system-prompt")]
-        [Description("System prompt")]
+        [Description("System prompt (llama.cpp short flag -sys is also accepted)")]
         public string? SystemPrompt { get; init; }
 
         [CommandOption("--no-display-prompt")]
@@ -75,10 +75,15 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [DefaultValue(false)]
         public bool VerbosePrompt { get; init; }
 
-        [CommandOption("--n-gpu-layers|-g")]
-        [Description("Layers on GPU (0=CPU only, -1=all, default: 0)")]
+        [CommandOption("--n-gpu-layers|--gpu-layers|--ngl")]
+        [Description("Layers on GPU (0=CPU only, -1=all, default: 0). llama.cpp short flag -ngl is also accepted.")]
         [DefaultValue(0)]
         public int NGpuLayers { get; init; }
+
+        [CommandOption("--device")]
+        [Description("GPU device to offload to: index (0,1,…), name (CUDA0, Vulkan1), or 'none' for CPU. " +
+            "Default: auto. Single-device only (no multi-GPU split). llama.cpp short flag -dev is also accepted.")]
+        public string? Device { get; init; }
 
         [CommandOption("-c|--ctx-size")]
         [Description("Context size / max sequence length (0 = model default)")]
@@ -90,8 +95,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [DefaultValue(false)]
         public bool TurboQuant { get; init; }
 
-        [CommandOption("--draft-model")]
-        [Description("Path to a smaller draft model for speculative decoding (greedy only, requires --temp 0)")]
+        [CommandOption("--model-draft|--draft-model")]
+        [Description("Path to a smaller draft model for speculative decoding (greedy only, requires --temp 0). llama.cpp short flag -md is also accepted.")]
         public string? DraftModelPath { get; init; }
 
         [CommandOption("--spec-lookahead")]
@@ -124,13 +129,13 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [DefaultValue(0)]
         public int MinBatchBlas { get; init; }
 
-        [CommandOption("--rep-penalty")]
+        [CommandOption("--repeat-penalty")]
         [Description("Repetition penalty (1.0 = disabled, >1.0 penalizes repeated tokens, default: 1.1)")]
         [DefaultValue(1.1f)]
         public float RepPenalty { get; init; }
 
         [CommandOption("--backend")]
-        [Description("GPU backend: auto, vulkan, cuda. Default: auto (prefers CUDA when -g is set and CUDA is available, otherwise Vulkan).")]
+        [Description("GPU backend: auto, vulkan, cuda. Default: auto (prefers CUDA when -ngl is set and CUDA is available, otherwise Vulkan).")]
         [DefaultValue("auto")]
         public string Backend { get; init; } = "auto";
 
@@ -176,6 +181,22 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     {
         if (settings.MinBatchBlas > 0)
             SimdKernels.MinBatchForBlas = settings.MinBatchBlas;
+
+        // Resolve --device before any GPU call (it may set CUDA_VISIBLE_DEVICES, which the
+        // CUDA driver only reads at first init). `--device none` forces the CPU path, so it
+        // overrides --n-gpu-layers below.
+        int gpuDeviceIndex;
+        bool deviceNone;
+        try
+        {
+            gpuDeviceIndex = GpuDevice.Resolve(settings.Device, out deviceNone);
+        }
+        catch (InvalidOperationException ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(ex.Message)}");
+            return 1;
+        }
+        int effNGpuLayers = deviceNone ? 0 : settings.NGpuLayers;
 
         // MoE expert-cache knobs are read from the environment inside the engine
         // (WarmPinConfig / HybridForwardPass / slot-manager dispose). Surface them as
@@ -264,7 +285,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         // chosen forward pass ships an MTP head. The actual MTP gating happens later in
         // RunSinglePrompt / RunInteractive based on sp.SpecType.
         IForwardPass? mtpFwd = null;
-        if (hp.IsHybridSsm && settings.NGpuLayers == 0)
+        if (hp.IsHybridSsm && effNGpuLayers == 0)
         {
             hybridFwd = new HybridGdnForwardPass(model, cpuBackend, hp);
             if (hybridFwd.HasMtpHead) mtpFwd = hybridFwd;
@@ -291,17 +312,17 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             }
         }
 
-        int nGpuLayers = settings.NGpuLayers;
+        int nGpuLayers = effNGpuLayers;
 
         // Issue #2 (MoE on hybrid GPU+CPU produced NaN/garbled output) was resolved by
         // fixing the descriptor-set reuse hazard in ComputePipeline.RecordWith.
         // The MoE+hybrid path is now exercised by
         // SharpInference.Tests.ForwardPass.VulkanShaderTests.HybridForwardPass_MoE_ProducesFiniteLogits.
 
-        // Resolve which GPU backend to use when -g is non-zero. CUDA is preferred only
+        // Resolve which GPU backend to use when -ngl is non-zero. CUDA is preferred only
         // when the user explicitly opted in (--backend cuda) or auto-detection finds it
         // and Vulkan is not the explicit choice. The CUDA forward pass currently covers
-        // dense (non-MoE) models with all layers on GPU; MoE and hybrid -g N stay on the
+        // dense (non-MoE) models with all layers on GPU; MoE and hybrid -ngl N stay on the
         // Vulkan path.
         bool wantCuda = false;
         string backendStr = (settings.Backend ?? "auto").Trim().ToLowerInvariant();
@@ -397,7 +418,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 else
                 {
 
-                // For -g -1 (auto), run TierPlanner against CUDA's VRAM and use the
+                // For -ngl -1 (auto), run TierPlanner against CUDA's VRAM and use the
                 // resulting layer split — same logic as the Vulkan branch. Without this,
                 // a model bigger than VRAM (e.g. Qwen3-Coder 30B-A3B in 12 GB) would
                 // attempt full-offload via CudaForwardPass and silently OOM.
@@ -429,10 +450,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                             && cudaGpuLayers < hp.NumLayers)
                         {
                             AnsiConsole.MarkupLine(
-                                $"[dim]TierPlanner returned -g {cudaGpuLayers}, which would " +
+                                $"[dim]TierPlanner returned -ngl {cudaGpuLayers}, which would " +
                                 $"cross the Gemma 4 KV-share boundary (sources <= {minSrc}); " +
-                                $"promoting to full offload (-g {hp.NumLayers}). " +
-                                $"Pass -g {minSrc} explicitly if VRAM is tight.[/]");
+                                $"promoting to full offload (-ngl {hp.NumLayers}). " +
+                                $"Pass -ngl {minSrc} explicitly if VRAM is tight.[/]");
                             cudaGpuLayers = hp.NumLayers;
                         }
                     }
@@ -500,14 +521,14 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         else
         {
             // Vulkan path. There is no Vulkan equivalent of CudaHybridGdnForwardPass yet,
-            // so qwen35moe must use --backend cuda or -g 0.
+            // so qwen35moe must use --backend cuda or -ngl 0.
             if (hp.IsHybridSsm)
             {
-                AnsiConsole.MarkupLine("[red]Error:[/] Hybrid GDN models (qwen35moe) are not supported on the Vulkan backend yet. Use [yellow]--backend cuda[/] or [yellow]-g 0[/] (CPU).");
+                AnsiConsole.MarkupLine("[red]Error:[/] Hybrid GDN models (qwen35moe) are not supported on the Vulkan backend yet. Use [yellow]--backend cuda[/] or [yellow]-ngl 0[/] (CPU).");
                 return 1;
             }
 
-            var gpu = new VulkanBackend();
+            var gpu = new VulkanBackend(gpuDeviceIndex);
             gpuBackend = gpu;
             try
             {
@@ -516,7 +537,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 var hwProfile = HardwareProfile.Detect(gpu);
                 AnsiConsole.MarkupLine($"[dim]Hardware: {hwProfile.Summary()}[/]");
 
-                // Auto-detect layer count when -g -1
+                // Auto-detect layer count when -ngl -1
                 if (nGpuLayers == -1)
                 {
                     var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant, requestedCtxSize: ctxSize);
@@ -556,7 +577,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     // Hybrid: N layers GPU, rest CPU
                     var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant,
                         requestedCtxSize: ctxSize);
-                    // Override with explicit -g N if user specified it
+                    // Override with explicit -ngl N if user specified it
                     if (settings.NGpuLayers > 0)
                         placement = placement with { GpuLayers = nGpuLayers, CpuLayers = hp.NumLayers - nGpuLayers };
 

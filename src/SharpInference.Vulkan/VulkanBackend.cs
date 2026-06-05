@@ -251,7 +251,11 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _vkd.vkWaitForFences(1, &fence, true, ulong.MaxValue).CheckResult();
     }
 
-    public VulkanBackend()
+    /// <param name="deviceIndex">
+    /// Physical-device index to use (as enumerated by <c>vkEnumeratePhysicalDevices</c>).
+    /// <c>-1</c> (default) auto-selects, preferring a discrete GPU.
+    /// </param>
+    public VulkanBackend(int deviceIndex = -1)
     {
         // 1. Initialize Vulkan loader
         vkInitialize().CheckResult();
@@ -268,8 +272,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         vkCreateInstance(in instanceCI, out _instance).CheckResult();
         _vki = new VkInstanceApi(in _instance);
 
-        // 3. Select physical device (prefer discrete GPU)
-        _physicalDevice = SelectPhysicalDevice();
+        // 3. Select physical device (explicit index, else prefer discrete GPU)
+        _physicalDevice = SelectPhysicalDevice(deviceIndex);
         _vki.vkGetPhysicalDeviceProperties(_physicalDevice, out _deviceProperties);
         VkPhysicalDeviceMemoryProperties memProps;
         _vki.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, &memProps);
@@ -528,7 +532,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     //  Physical device selection
     // ================================================================
 
-    private VkPhysicalDevice SelectPhysicalDevice()
+    private VkPhysicalDevice SelectPhysicalDevice(int deviceIndex)
     {
         uint count = 0;
         _vki.vkEnumeratePhysicalDevices(&count, null);
@@ -537,6 +541,19 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         var devices = new VkPhysicalDevice[count];
         fixed (VkPhysicalDevice* p = devices)
             _vki.vkEnumeratePhysicalDevices(&count, p);
+
+        // Explicit device index (--device N): use it verbatim, but require a compute queue.
+        if (deviceIndex >= 0)
+        {
+            if (deviceIndex >= (int)count)
+                throw new InvalidOperationException(
+                    $"--device {deviceIndex}: only {count} Vulkan device(s) present (valid indices 0..{count - 1}).");
+            var chosen = devices[deviceIndex];
+            if (!HasComputeQueue(chosen))
+                throw new InvalidOperationException(
+                    $"--device {deviceIndex}: the selected Vulkan device has no compute queue.");
+            return chosen;
+        }
 
         // Prefer discrete GPU, fall back to any compute-capable device
         VkPhysicalDevice fallback = default;

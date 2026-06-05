@@ -18,9 +18,9 @@ dotnet test --filter "FullyQualifiedName~SomeTest"  # Run a single test
 dotnet run --project src/SharpInference.Cli -c Release -- \
   -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -p "prompt" --temp 0
 
-# GPU backend (all layers offloaded)
+# GPU backend (all layers offloaded; -ngl matches llama.cpp, -dev N selects a specific GPU)
 dotnet run --project src/SharpInference.Cli -c Release -- \
-  -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -p "prompt" --temp 0 -g -1
+  -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -p "prompt" --temp 0 -ngl -1
 
 # Start API server (OpenAI + Anthropic compatible). SharpInference.Server is the
 # ASP.NET Core library that ships AddSharpInference() / MapSharpInference();
