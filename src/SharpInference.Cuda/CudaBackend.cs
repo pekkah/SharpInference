@@ -741,6 +741,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint _capturedGraph;   // CUgraph — kept alive: node handles below belong to it
     private nint _graphExec;       // CUgraphExec
     private readonly List<GraphPosNode> _graphPosNodes = new();
+    // Upper bound on a tracked kernel's arg count — sizes the reusable stackalloc cell/ptr
+    // buffers in LaunchGraphForPosition and bounds the per-node snapshot in TrackPositionNode.
+    // The widest position-varying op (AttentionSwa) has 12 args; 16 leaves headroom.
+    private const int GraphMaxKernelArgs = 16;
 
     /// <summary>True while a graph capture is in progress on <see cref="Stream"/>.</summary>
     public bool GraphCapturing => _graphCapturing;
@@ -843,9 +847,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (_graphExec == nint.Zero)
             throw new InvalidOperationException("LaunchGraphForPosition called before a graph was captured.");
 
-        const int MaxArgs = 16;
-        nint* cells = stackalloc nint[MaxArgs];
-        nint* ptrs  = stackalloc nint[MaxArgs];
+        nint* cells = stackalloc nint[GraphMaxKernelArgs];
+        nint* ptrs  = stackalloc nint[GraphMaxKernelArgs];
         foreach (var n in _graphPosNodes)
         {
             int cnt = n.ArgValues.Length;
@@ -900,7 +903,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         int rc = NvrtcInterop.StreamGetCaptureInfo(
             _stream, out int status, out _, out _, out nint deps, out nuint numDeps);
         if (rc != 0 || status != NvrtcInterop.CU_STREAM_CAPTURE_STATUS_ACTIVE
-                    || numDeps != 1 || deps == nint.Zero || argValues.Length > 16)
+                    || numDeps != 1 || deps == nint.Zero || argValues.Length > GraphMaxKernelArgs)
         {
             _graphCaptureFailed = true;
             return;
