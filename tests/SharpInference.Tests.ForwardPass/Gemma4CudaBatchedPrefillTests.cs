@@ -77,11 +77,12 @@ public sealed class Gemma4CudaBatchedPrefillTests
 
         using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 512);
 
-        // Batched cuBLAS-GEMM prefill (#141). Pin MMQ off so this isolates the
-        // dequant→fp16→cuBLAS GEMM path (MMQ has its own oracle below).
+        // Batched cuBLAS-GEMM prefill (#141). Pin MMQ + flash off so this isolates the
+        // dequant→fp16→cuBLAS GEMM path (each has its own oracle below).
         fwd.BatchedPrefillEnabled = true;
         fwd.PrefillGemmEnabled = true;
         fwd.PrefillMmqEnabled = false;
+        fwd.PrefillFlashAttnEnabled = false;
         var batched = fwd.Prefill(tokens).ToArray();
         Assert.True(fwd.LastPrefillWasBatched,
             "Batched-trunk prefill did not engage — check IsGemma4BatchedPrefillSupported gating.");
@@ -140,6 +141,7 @@ public sealed class Gemma4CudaBatchedPrefillTests
         fwd.BatchedPrefillEnabled = true;
         fwd.PrefillGemmEnabled = true;
         fwd.PrefillMmqEnabled = true;
+        fwd.PrefillFlashAttnEnabled = false;   // isolate the MMQ matmul (flash has its own oracle)
         var batched = fwd.Prefill(tokens).ToArray();
         Assert.True(fwd.LastPrefillWasBatched,
             "Batched-trunk MMQ prefill did not engage — check IsGemma4BatchedPrefillSupported gating.");
@@ -167,6 +169,53 @@ public sealed class Gemma4CudaBatchedPrefillTests
     }
 
     [Fact]
+    public void Gemma4_E4B_BatchedPrefill_FlashAttnMatchesSequential()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.NotNull(hp.LayerHeadDim);
+        Assert.True(hp.HasPerLayerTokenEmbd);
+
+        var tokens = new int[] { 2, 651, 6037, 576, 6081, 603, 1234, 4567, 8901, 222, 333, 444 };
+
+        using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 512);
+
+        // Flash-attention prefill (#141, default on). Its online softmax reassociates
+        // the score sum, so it is argmax-stable to the fp32 per-token reference, not
+        // bit-exact. Exercises both the SWA-windowed and global attention layers.
+        fwd.BatchedPrefillEnabled = true;
+        fwd.PrefillFlashAttnEnabled = true;
+        var batched = fwd.Prefill(tokens).ToArray();
+        Assert.True(fwd.LastPrefillWasBatched);
+
+        fwd.ResetCache();
+        fwd.BatchedPrefillEnabled = false;
+        var sequential = fwd.Prefill(tokens).ToArray();
+        Assert.False(fwd.LastPrefillWasBatched);
+
+        Assert.Equal(sequential.Length, batched.Length);
+        Assert.Equal(Argmax(sequential), Argmax(batched));
+
+        float maxAbs = 0f;
+        for (int i = 0; i < sequential.Length; i++)
+            maxAbs = MathF.Max(maxAbs, MathF.Abs(sequential[i] - batched[i]));
+        Assert.True(maxAbs < 1.0f,
+            $"Flash-attn prefill vs sequential logits diverged beyond fp tolerance: maxAbs={maxAbs}.");
+
+        var seqTop = TopKSet(sequential, 5);
+        var batTop = TopKSet(batched, 5);
+        int overlap = 0;
+        foreach (var t in batTop) if (seqTop.Contains(t)) overlap++;
+        Assert.True(overlap >= 4,
+            $"Flash-attn prefill top-5 overlaps the fp32 reference in only {overlap}/5 slots.");
+    }
+
+    [Fact]
     public void Gemma4_E4B_BatchedPrefill_GemmOff_MatchesSequentialBitExact()
     {
         using var gpu = TryCreate();
@@ -189,8 +238,12 @@ public sealed class Gemma4CudaBatchedPrefillTests
         using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 512);
 
         // Batched matvec GEMM-N path (#136), bit-exact to per-token by construction.
+        // Flash attention pinned off: its online softmax reassociates the score sum
+        // and is only argmax-stable, which would break this bit-exact oracle (it
+        // verifies the batched matvec/norm/rope primitives, not the attention method).
         fwd.BatchedPrefillEnabled = true;
         fwd.PrefillGemmEnabled = false;
+        fwd.PrefillFlashAttnEnabled = false;
         var batched = fwd.Prefill(tokens).ToArray();
         Assert.True(fwd.LastPrefillWasBatched);
 

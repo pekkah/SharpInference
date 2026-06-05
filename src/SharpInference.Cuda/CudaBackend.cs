@@ -209,6 +209,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _fullSeqAttentionBf16Kernel;
     private nint   _fullSeqAttentionGlobalKernel;
     private nint   _fullSeqAttentionGlobalBf16Kernel;
+    // Issue #141 (attention): memory-efficient flash-attention prefill (shared K/V
+    // tiles reused across a query tile + online softmax) replacing the scalar
+    // full_seq / swa_batched kernels' O(n²) global K/V re-reads.
+    private nint   _flashAttnPrefillKernel;
 
     // Grow-only global score scratch for the wave-based >4096 batched-query SDPA
     // (issue #118). Sized W × num_heads × score_stride floats; W is chosen so this
@@ -2894,6 +2898,55 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>
+    /// Issue #141 (attention): memory-efficient flash-attention prefill. Replaces
+    /// <see cref="AttentionBatched"/> (global, <paramref name="windowSize"/>=0) and
+    /// <see cref="AttentionSwaBatched"/> (sliding window, windowSize&gt;0) for the
+    /// fp32-KV batched-trunk prefill. A block handles a tile of 8 queries of one head
+    /// and streams K/V through shared-memory tiles with an online softmax, so each
+    /// key is read from global once per 8 queries instead of once per query — cutting
+    /// the scalar kernels' O(n²) (SWA: up to ~512×) redundant K/V traffic. GQA, causal,
+    /// optional sliding window, per-layer <paramref name="headDim"/>. Matches the scalar
+    /// kernels to fp tolerance (online softmax), not bit-exact.
+    /// </summary>
+    public void FlashAttentionPrefill(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
+        int numHeads, int numKvHeads, int headDim,
+        int startPos, int windowSize, int maxSeqLen, int nTok, float attnScale = -1f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (nTok <= 0)
+            throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be > 0.");
+        if (headDim > 512)
+            throw new NotSupportedException(
+                $"FlashAttentionPrefill supports head_dim ≤ 512 (16 dims/lane); got {headDim}.");
+
+        // Pick the streaming K-tile so the 2*ktTile*headDim float K/V tile fits a 48 KB
+        // shared budget (no >48 KB opt-in needed): ktTile = 48K / (2*headDim*4).
+        const int sharedBudget = 48 * 1024;
+        int ktTile = sharedBudget / (2 * headDim * sizeof(float));
+        if (ktTile < 1) ktTile = 1;
+        if (ktTile > 32) ktTile = 32;
+        uint sharedBytes = (uint)(2 * ktTile * headDim * sizeof(float));
+
+        nint qP = GetDevPtr(qAll), kP = GetDevPtr(kCache), vP = GetDevPtr(vCache), oP = GetDevPtr(outAll);
+        int pNH = numHeads, pNKV = numKvHeads, pHD = headDim;
+        int pSP = startPos, pWS = windowSize, pMSL = maxSeqLen, pN = nTok, pKT = ktTile;
+        float pScale = attnScale;
+        nint* args = stackalloc nint[13]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pSP), (nint)(&pWS), (nint)(&pMSL), (nint)(&pN), (nint)(&pKT), (nint)(&pScale)
+        };
+        const int faQt = 8;   // FA_QT in the kernel
+        uint gy = (uint)((nTok + faQt - 1) / faQt);
+        int r = NvrtcInterop.LaunchKernel(_flashAttnPrefillKernel, (uint)numHeads, gy, 1,
+                                          256, 1, 1, sharedBytes, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(flash_attn_prefill) failed: {r}");
+    }
+
+    /// <summary>
     /// Bf16-store variant of <see cref="KvAppend"/>. Inputs stay fp32; the K/V
     /// cache tensors must be <see cref="DType.BFloat16"/>-allocated (half the
     /// element count of an fp32 cache). See issue #27.
@@ -4150,6 +4203,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _kvAppendBatchedKernel, _kvAppendBatchedBf16Kernel,
             _fullSeqAttentionKernel, _fullSeqAttentionBf16Kernel,
             _fullSeqAttentionGlobalKernel, _fullSeqAttentionGlobalBf16Kernel,
+            _flashAttnPrefillKernel,
         ];
         foreach (nint k in kernels)
         {
@@ -4213,6 +4267,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _dequantQ80F16Kernel   = GetKernelFunc("llm_dequant_q8_0_to_f16");
         _f32ToF16Kernel        = GetKernelFunc("llm_f32_to_f16");
         _mmqQ80Kernel          = GetKernelFunc("llm_mmq_q8_0");
+        _flashAttnPrefillKernel = GetKernelFunc("llm_flash_attn_prefill_f32");
         _rmsNormBatchedKernel  = GetKernelFunc("llm_rmsnorm_batched");
         _headNormBatchedKernel = GetKernelFunc("llm_head_norm_batched");
         _headNormQkKernel        = GetKernelFunc("llm_head_norm_qk");

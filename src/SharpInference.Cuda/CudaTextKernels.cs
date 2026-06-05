@@ -2983,6 +2983,135 @@ extern ""C"" __global__ void llm_attention_swa(
     }
 }
 
+// ── Flash-attention prefill (issue #141 attention) ─────────────────────────
+// Memory-efficient batched SDPA replacing the scalar llm_full_seq_attention /
+// llm_attention_swa_batched (one 256-thread block PER query, each re-reading its
+// whole K/V range from global → O(n²) global traffic; for SWA, adjacent queries'
+// 512-wide windows overlap ~99%, so K/V is re-streamed up to ~512×). Here a block
+// handles a TILE of FA_QT queries of one head and streams K/V in shared-memory
+// tiles of `kt_tile` keys, so each key is read from global once per FA_QT queries
+// (FA_QT× less traffic) and the softmax runs online (running max/sum + rescaled
+// output accumulator, FlashAttention-2 style) — no n²-sized score buffer.
+//
+// One warp = one query. Lane L owns head dims {L, L+32, …}; qreg/oreg hold up to
+// 512/32 = 16 dims/lane. The QK dot is a warp reduce (score is then warp-uniform,
+// so the causal/window mask `continue` and the online-softmax update never diverge
+// within a warp). GQA via kv_head = h/(num_heads/num_kv_heads); per-layer head_dim;
+// causal (key ≤ start_pos+qi) + optional sliding window (window_size>0). Matches the
+// scalar kernels to fp tolerance (online softmax reassociates the same sum), not
+// bit-exact. Dynamic shared = 2*kt_tile*head_dim floats (sized by the host to fit).
+#define FA_QT 8
+extern ""C"" __global__ void llm_flash_attn_prefill_f32(
+    const float* __restrict__ q_all,      // [n_tok, num_heads*head_dim]
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ out_all,          // [n_tok, num_heads*head_dim]
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int window_size, int max_seq_len, int n_tok,
+    int kt_tile, float attn_scale)
+{
+    extern __shared__ float fa_smem[];    // [kt_tile*head_dim] K then [kt_tile*head_dim] V
+    float* sK = fa_smem;
+    float* sV = fa_smem + kt_tile * head_dim;
+
+    int h     = (int)blockIdx.x;
+    int warp  = (int)(threadIdx.x >> 5);  // 0..FA_QT-1  (query within the tile)
+    int lane  = (int)(threadIdx.x & 31);
+    int tid   = (int)threadIdx.x;
+    int qi    = (int)blockIdx.y * FA_QT + warp;
+
+    int kv_head = h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
+    int q_dim   = num_heads * head_dim;
+    int ndj     = (head_dim + 31) >> 5;   // dims per lane (≤16)
+
+    bool active = (qi < n_tok);
+    int qpos    = start_pos + qi;
+    int win_end = qpos + 1;                                  // keys [.., qpos]
+    int win_start = (window_size > 0) ? (win_end - window_size) : 0;
+    if (win_start < 0) win_start = 0;
+
+    float qreg[16], oreg[16];
+    #pragma unroll
+    for (int j = 0; j < 16; j++) { qreg[j] = 0.f; oreg[j] = 0.f; }
+    if (active) {
+        long q_base = (long)qi * q_dim + (long)h * head_dim;
+        for (int j = 0; j < ndj; j++) {
+            int d = lane + 32 * j;
+            if (d < head_dim) qreg[j] = q_all[q_base + d];
+        }
+    }
+    float m_run = sharpi_neg_inf();
+    float l_run = 0.f;
+
+    // Union key range over the FA_QT queries in this block.
+    int last_qi = (int)blockIdx.y * FA_QT + (FA_QT - 1);
+    if (last_qi > n_tok - 1) last_qi = n_tok - 1;
+    int blk_key_end = (start_pos + last_qi) + 1;
+    int first_qpos  = start_pos + (int)blockIdx.y * FA_QT;
+    int blk_key_start = (window_size > 0) ? (first_qpos + 1 - window_size) : 0;
+    if (blk_key_start < 0) blk_key_start = 0;
+
+    for (int kt0 = blk_key_start; kt0 < blk_key_end; kt0 += kt_tile) {
+        int tile_keys = blk_key_end - kt0;
+        if (tile_keys > kt_tile) tile_keys = kt_tile;
+
+        for (int idx = tid; idx < kt_tile * head_dim; idx += (int)blockDim.x) {
+            int kk = idx / head_dim;
+            int d  = idx - kk * head_dim;
+            float kv_k = 0.f, kv_v = 0.f;
+            if (kk < tile_keys) {
+                long off = (long)(kt0 + kk) * kv_dim + (long)kv_head * head_dim + d;
+                kv_k = k_cache[off];
+                kv_v = v_cache[off];
+            }
+            sK[idx] = kv_k;
+            sV[idx] = kv_v;
+        }
+        __syncthreads();
+
+        if (active) {
+            for (int kk = 0; kk < tile_keys; kk++) {
+                int abs_t = kt0 + kk;
+                if (abs_t >= win_end || abs_t < win_start) continue;  // warp-uniform
+                float part = 0.f;
+                for (int j = 0; j < ndj; j++) {
+                    int d = lane + 32 * j;
+                    if (d < head_dim) part += qreg[j] * sK[kk * head_dim + d];
+                }
+                part += __shfl_xor_sync(0xffffffffu, part, 16);
+                part += __shfl_xor_sync(0xffffffffu, part, 8);
+                part += __shfl_xor_sync(0xffffffffu, part, 4);
+                part += __shfl_xor_sync(0xffffffffu, part, 2);
+                part += __shfl_xor_sync(0xffffffffu, part, 1);
+                float score = part * scale;
+                float m_new = fmaxf(m_run, score);
+                float alpha = __expf(m_run - m_new);
+                float p     = __expf(score - m_new);
+                l_run = l_run * alpha + p;
+                for (int j = 0; j < ndj; j++) {
+                    int d = lane + 32 * j;
+                    float vv = (d < head_dim) ? sV[kk * head_dim + d] : 0.f;
+                    oreg[j] = oreg[j] * alpha + p * vv;
+                }
+                m_run = m_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (active) {
+        float inv = (l_run > 0.f) ? (1.f / l_run) : 0.f;
+        long o_base = (long)qi * q_dim + (long)h * head_dim;
+        for (int j = 0; j < ndj; j++) {
+            int d = lane + 32 * j;
+            if (d < head_dim) out_all[o_base + d] = oreg[j] * inv;
+        }
+    }
+}
+#undef FA_QT
+
 // Batched sliding-window attention over N query tokens (Gemma 4 SWA layers in
 // batched-trunk prefill). Grid = (num_heads, n_tok); query token i sits at
 // absolute position start_pos+i and attends [max(0,pos+1-window), pos+1). The

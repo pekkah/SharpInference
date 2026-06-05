@@ -188,6 +188,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// bit-exact (both operands int8-quantized), like the GEMM path it replaces.
     /// </summary>
     public bool PrefillMmqEnabled { get; set; }
+    /// <summary>
+    /// Issue #141 (attention): route the batched-trunk prefill attention through the
+    /// memory-efficient flash kernel (<see cref="CudaBackend.FlashAttentionPrefill"/>,
+    /// shared K/V tiles + online softmax) instead of the scalar per-query
+    /// <see cref="CudaBackend.AttentionBatched"/> / <see cref="CudaBackend.AttentionSwaBatched"/>
+    /// (which re-read each query's whole K/V range from global — O(n²), the dominant
+    /// prefill cost). fp32 KV only. Argmax-stable, not bit-exact (online softmax).
+    /// Default on (<c>SHARPI_PREFILL_FLASH</c>=0 reverts to the scalar kernels).
+    /// </summary>
+    public bool PrefillFlashAttnEnabled { get; set; }
     private int _bpCapacity;                 // current N the scratch is sized for (0 = none)
     private Tensor? _bpHidden, _bpResidual, _bpNorm;       // [N × embDim]
     private Tensor? _bpQ, _bpAttnOut;                      // [N × numHeads*maxHeadDim]
@@ -292,6 +302,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // the cuBLAS GEMM path. Gated under PrefillGemmEnabled (the compute-bound path).
         PrefillMmqEnabled =
             Environment.GetEnvironmentVariable("SHARPI_PREFILL_MMQ") != "0";
+        // Issue #141 (attention): default on — the flash kernel cuts batched-prefill
+        // attention ~929ms→~411ms (2.26×) at N=1848, lifting Gemma 4 prefill
+        // ~1389→~2180 t/s. SHARPI_PREFILL_FLASH=0 reverts to the scalar kernels.
+        PrefillFlashAttnEnabled =
+            Environment.GetEnvironmentVariable("SHARPI_PREFILL_FLASH") != "0";
         _maxHeadDim = _headDim;
         if (hp.LayerHeadDim is { } lhdMax)
             for (int i = 0; i < hp.NumLayers; i++)
@@ -1959,7 +1974,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         if (s_prefillProfile) { _gpu.Synchronize(); _profSw.Restart(); }
         // Gemma 4: attention_scale = 1.0, passed explicitly (kernel skips its rsqrtf).
-        if (isSwa)
+        if (PrefillFlashAttnEnabled)
+            _gpu.FlashAttentionPrefill(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
+                _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: 1f);
+        else if (isSwa)
             _gpu.AttentionSwaBatched(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
                 _numHeads, _numKvHeads, layerHd, startPos, window, effLayerCtx, N, attnScale: 1f);
         else
