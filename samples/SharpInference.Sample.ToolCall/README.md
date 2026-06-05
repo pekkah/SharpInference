@@ -18,11 +18,11 @@ dotnet run --project samples/SharpInference.Sample.ToolCall -c Release -- \
 
 # CUDA — auto-detect how many layers fit in VRAM
 dotnet run --project samples/SharpInference.Sample.ToolCall -c Release -- \
-    -m models/Qwen3-35B-A3B-Q4_K_M.gguf --backend cuda -ngl -1
+    -m models/Qwen3-35B-A3B-Q4_K_M.gguf --backend cuda --ngl -1
 
 # CUDA — force all layers on GPU (will OOM if model doesn't fit)
 dotnet run --project samples/SharpInference.Sample.ToolCall -c Release -- \
-    -m models/Qwen3-35B-A3B-Q4_K_M.gguf --backend cuda -ngl 999
+    -m models/Qwen3-35B-A3B-Q4_K_M.gguf --backend cuda --ngl 999
 ```
 
 Custom question:

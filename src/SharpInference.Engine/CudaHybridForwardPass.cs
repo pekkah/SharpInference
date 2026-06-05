@@ -487,7 +487,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                     Console.Error.WriteLine(
                         "[CudaHybridForwardPass] WARNING: free VRAM cannot fit a single expert; " +
                         "cache clamped to 1 slot. Every routed expert will miss and stream from CPU. " +
-                        "Reduce -ngl or use --backend vulkan.");
+                        "Reduce --ngl or use --backend vulkan.");
                     break;
                 case MoeCacheSizingStatus.UnknownExpertSize:
                     Console.Error.WriteLine(
@@ -2392,10 +2392,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         if (minSrc == int.MaxValue) return; // no aliased layers
         if (nGpuLayers > minSrc)
             throw new NotSupportedException(
-                $"Gemma 4 hybrid split with -ngl {nGpuLayers} would place shared-KV source layer " +
+                $"Gemma 4 hybrid split with --ngl {nGpuLayers} would place shared-KV source layer " +
                 $"{minSrc} on the GPU while its dependent shared-KV layers run on the CPU; " +
                 "cross-tier KV reads are not implemented. " +
-                $"Use -ngl <= {minSrc} (own-KV sources stay on CPU) or -ngl {hp.NumLayers} " +
+                $"Use --ngl <= {minSrc} (own-KV sources stay on CPU) or --ngl {hp.NumLayers} " +
                 "(full-GPU via CudaForwardPass).");
     }
 

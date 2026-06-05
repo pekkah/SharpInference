@@ -34,7 +34,7 @@ if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir | Out
 
 function Run([string]$label, [string]$dll, [bool]$warm) {
   $args = @($dll, "-m", $Model, "-p", $prompt, "--temp", "0", "-n", "$NTokens",
-            "-ngl", "-1", "--backend", "cuda", "--single-turn", "--verbose-prompt")
+            "--ngl", "-1", "--backend", "cuda", "--single-turn", "--verbose-prompt")
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = $dotnet
   $psi.Arguments = ($args | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join ' '

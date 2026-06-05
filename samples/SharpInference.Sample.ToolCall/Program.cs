@@ -13,18 +13,18 @@
 //
 // Run (CUDA, all layers on GPU):
 //   dotnet run --project samples/SharpInference.Sample.ToolCall -c Release -- \
-//       -m models/Qwen3-35B-A3B-Q4_K_M.gguf --backend cuda -ngl -1
+//       -m models/Qwen3-35B-A3B-Q4_K_M.gguf --backend cuda --ngl -1
 //
 // Run (CUDA hybrid — first 20 layers on GPU, rest on CPU):
 //   dotnet run --project samples/SharpInference.Sample.ToolCall -c Release -- \
-//       -m models/Qwen3-35B-A3B-Q4_K_M.gguf --backend cuda -ngl 20
+//       -m models/Qwen3-35B-A3B-Q4_K_M.gguf --backend cuda --ngl 20
 //
 // Flags:
 //   -m / --model     <path>    Path to GGUF model (or set SHARPI_MODEL env var)
 //   -p / --prompt    <text>    User question (default: built-in demo question)
 //   --temp           <float>   Sampling temperature (default: 0.6)
 //   --backend        cpu|cuda  Compute backend (default: cpu)
-//   -ngl/--n-gpu-layers <int>  GPU layer count: 0=CPU-only, -1=auto/all, N=N layers on GPU
+//   --ngl/--n-gpu-layers <int> GPU layer count: 0=CPU-only, -1=auto/all, N=N layers on GPU
 
 using System.Text;
 using SharpInference.Core;
@@ -48,7 +48,7 @@ for (int i = 0; i < args.Length; i++)
         case "-p" or "--prompt"  when i + 1 < args.Length: question    = args[++i]; break;
         case "--temp"            when i + 1 < args.Length: temperature = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
         case "--backend"         when i + 1 < args.Length: backendStr  = args[++i].ToLowerInvariant(); break;
-        case "-ngl" or "--n-gpu-layers" when i + 1 < args.Length: nGpuLayers  = int.Parse(args[++i]); break;
+        case "--ngl" or "--n-gpu-layers" when i + 1 < args.Length: nGpuLayers  = int.Parse(args[++i]); break;
         case "-h" or "--help":
             Console.Error.WriteLine(
                 "usage: sharpi-sample-toolcall -m <model.gguf> [-p <question>] [--temp 0.6] [--backend cpu|cuda] [-g <layers>]");

@@ -67,14 +67,14 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
         [Description("(Z-Image) Path to Qwen3 tokenizer.json")]
         public string? QwenTokenizerPath { get; init; }
 
-        [CommandOption("--n-gpu-layers|--gpu-layers|--ngl")]
-        [Description("(Z-Image) GPU acceleration: -1 = auto (CUDA→Vulkan→CPU, default), 0 = CPU only. llama.cpp short flag -ngl is also accepted.")]
+        [CommandOption("--ngl|--n-gpu-layers|--gpu-layers")]
+        [Description("(Z-Image) GPU acceleration: -1 = auto (CUDA→Vulkan→CPU, default), 0 = CPU only. Mirrors llama.cpp's --n-gpu-layers/--ngl.")]
         [DefaultValue(-1)]
         public int NGpuLayers { get; init; }
 
         [CommandOption("--device")]
         [Description("GPU device to offload to: index (0,1,…), name (CUDA0, Vulkan1), or 'none' for CPU. " +
-            "Default: auto. Single-device only. llama.cpp short flag -dev is also accepted.")]
+            "Default: auto. Single-device only. Mirrors llama.cpp's --device.")]
         public string? Device { get; init; }
 
         [CommandOption("--backend")]

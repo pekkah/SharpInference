@@ -304,9 +304,9 @@ public static class InferenceEngineLoader
         if (minSrc != int.MaxValue && gpuLayers > minSrc && gpuLayers < hp.NumLayers)
         {
             Console.Error.WriteLine(
-                $"[SharpInference] TierPlanner returned -ngl {gpuLayers}, which would cross the " +
+                $"[SharpInference] TierPlanner returned --ngl {gpuLayers}, which would cross the " +
                 $"Gemma 4 KV-share boundary (sources <= {minSrc}); promoting to full offload " +
-                $"(-ngl {hp.NumLayers}). Set NGpuLayers={minSrc} explicitly if VRAM is tight.");
+                $"(--ngl {hp.NumLayers}). Set NGpuLayers={minSrc} explicitly if VRAM is tight.");
             return hp.NumLayers;
         }
         return gpuLayers;
