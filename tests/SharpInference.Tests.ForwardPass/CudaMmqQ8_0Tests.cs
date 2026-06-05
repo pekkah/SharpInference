@@ -6,7 +6,7 @@ namespace SharpInference.Tests.ForwardPass;
 
 /// <summary>
 /// Issue #141 (MMQ): parity for the int8 tensor-core Q8_0×Q8_1 batched matmul
-/// (<see cref="CudaBackend.MatMulBatchedMmq"/>, kernel <c>llm_mmq_q8_0_naive</c>).
+/// (<see cref="CudaBackend.MatMulBatchedMmq"/>, kernel <c>llm_mmq_q8_0</c>).
 /// A small Q8_0 weight matrix [rows×cols] and an fp32 activation batch [nTok×cols]
 /// are multiplied both on the GPU (MMQ) and on the CPU (<see cref="SimdKernels.DotQ8_0"/>,
 /// fp32 reference). MMQ quantizes the activation to int8 (Q8_1) before the int8 mma,
