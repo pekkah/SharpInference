@@ -2039,6 +2039,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 "truncate inside the FP32 recent window.");
         _kvLength = length;
         _kvCache.TruncateTo(length);
+        // _kvEvictedCount is intentionally NOT reset here. TruncateTo only rewinds *decode*
+        // tokens (speculative decode rejects), whose logical positions stay >= the eviction
+        // point, so the physical mapping `slot = position - _kvEvictedCount` remains valid.
+        // (Rewinding below the eviction point would be nonsensical — those prompt tokens were
+        // compacted away — and SnapKV does not compose with speculative decode in practice.)
     }
 
     /// <inheritdoc />

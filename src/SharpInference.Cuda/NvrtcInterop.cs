@@ -139,7 +139,7 @@ internal static unsafe partial class NvrtcInterop
     // Driver-API graph capture/replay for the launch-bound Gemma 4 decode loop.
     // All of these live in nvcuda.dll (the display driver), so they are
     // independent of the CUDA toolkit version the rest of the backend binds to
-    // (cudart64_110 / cublas64_11 / nvrtc64_120_0). They are stable since
+    // (cudart64_12 / cublas64_12 / nvrtc64_120_0). They are stable since
     // CUDA 11.3+ and present in any modern driver.
 
     /// <summary>Stream capture mode for <see cref="StreamBeginCapture"/>.</summary>

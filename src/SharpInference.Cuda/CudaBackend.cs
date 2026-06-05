@@ -725,7 +725,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // Capture the launch-bound Gemma 4 decode region once, then replay it per token
     // with only the position-derived kernel-node params rewritten. The forward passes
     // bracket a PURE on-device-compute region (no H2D/D2H — those need a stream sync,
-    // illegal during capture) with TryBeginGraphCapture / TryEndGraphCaptureAndInstantiate
+    // illegal during capture; also no cudaMalloc/cudaFree, so any pooled scratch the
+    // captured kernels touch — e.g. the Q8_1 matvec buffer — must already be at its max
+    // size before capture. The supported Q8_0 Gemma 4 decode has no Q8_1 quantize and the
+    // Q4_K buffer is pre-grown during prefill, so this holds; a capture that does hit an
+    // illegal op errors the stream and degrades to direct launches) with
+    // TryBeginGraphCapture / TryEndGraphCaptureAndInstantiate
     // and replay via LaunchGraphForPosition. The five position-varying ops
     // (RoPE / RoPEWithFactors / KvAppend / Attention / AttentionSwa) self-register their
     // graph node during capture so replay can update just those scalars. Any failure
@@ -819,6 +824,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _graphCapturing = false;
             if (g != nint.Zero) NvrtcInterop.GraphDestroy(g);
         }
+        // A failure can also reach here *after* TryEndGraphCaptureAndInstantiate already
+        // built _graphExec/_capturedGraph (e.g. the first LaunchGraphForPosition threw):
+        // at that point _graphCapturing is already false, so free those handles too —
+        // otherwise "abort" leaks an exec graph and leaves GraphReady stuck true.
+        DiscardGraph();
         _graphPosNodes.Clear();
         _graphCaptureSupported = false;
     }
