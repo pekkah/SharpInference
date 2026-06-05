@@ -2,9 +2,11 @@
 # prefill + launch fusions). Same ~1K prompt + warm-cache methodology as
 # bench-allrows-1k.ps1. Captures batched-on (default), batched-off (A/B for the
 # prefill delta), and the hybrid row (expected flat).
+param(
+    [string]$ModelDir = "E:\models"
+)
 $ErrorActionPreference = "Continue"
-$E = "E:\models"
-$model = "$E\gemma-4-E4B-it-Q8_0.gguf"
+$model = Join-Path $ModelDir "gemma-4-E4B-it-Q8_0.gguf"
 
 # Identical ~1K-token prompt to bench-allrows-1k.ps1.
 $para = @(
@@ -29,13 +31,17 @@ $null = .\scripts\bench-textgen.ps1 -Model $model -Tag "g4-warm" -NTokens 8 -Pro
 
 $rows = @()
 function Run($tag, $a, $envOff) {
-    if ($envOff) { $env:SHARPI_BATCHED_PREFILL = "0" } else { Remove-Item env:SHARPI_BATCHED_PREFILL -ErrorAction SilentlyContinue }
-    # Run twice, keep the second (warm) — matches the discard-first guidance.
-    $null = .\scripts\bench-textgen.ps1 -Model $model -Tag "$tag-w" -NTokens 60 -Prompt $prompt -TimeoutSec 900 -ExtraArgs $a
-    $r = .\scripts\bench-textgen.ps1 -Model $model -Tag $tag -NTokens 60 -Prompt $prompt -TimeoutSec 900 -ExtraArgs $a
-    Remove-Item env:SHARPI_BATCHED_PREFILL -ErrorAction SilentlyContinue
-    $script:rows += [PSCustomObject]@{ Tag=$tag; PrefTok=$r.PrefillTok; PrefillTps=$r.PrefillTps; DecodeTps=$r.DecodeTps; Wall=$r.WallSec; TO=$r.TimedOut }
-    Write-Host ("  {0,-22} pref={1,7} t/s  dec={2,6} t/s  ({3} tok)" -f $tag,$r.PrefillTps,$r.DecodeTps,$r.PrefillTok) -ForegroundColor Green
+    try {
+        if ($envOff) { $env:SHARPI_BATCHED_PREFILL = "0" } else { Remove-Item env:SHARPI_BATCHED_PREFILL -ErrorAction SilentlyContinue }
+        # Run twice, keep the second (warm) — matches the discard-first guidance.
+        $null = .\scripts\bench-textgen.ps1 -Model $model -Tag "$tag-w" -NTokens 60 -Prompt $prompt -TimeoutSec 900 -ExtraArgs $a
+        $r = .\scripts\bench-textgen.ps1 -Model $model -Tag $tag -NTokens 60 -Prompt $prompt -TimeoutSec 900 -ExtraArgs $a
+        $script:rows += [PSCustomObject]@{ Tag=$tag; PrefTok=$r.PrefillTok; PrefillTps=$r.PrefillTps; DecodeTps=$r.DecodeTps; Wall=$r.WallSec; TO=$r.TimedOut }
+        Write-Host ("  {0,-22} pref={1,7} t/s  dec={2,6} t/s  ({3} tok)" -f $tag,$r.PrefillTps,$r.DecodeTps,$r.PrefillTok) -ForegroundColor Green
+    }
+    finally {
+        Remove-Item env:SHARPI_BATCHED_PREFILL -ErrorAction SilentlyContinue
+    }
 }
 
 Run "gemma4-cuda-batched"    $cudaArgs $false
