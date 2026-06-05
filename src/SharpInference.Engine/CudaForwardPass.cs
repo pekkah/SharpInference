@@ -768,6 +768,22 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private static readonly string[] s_phaseName =
         ["embed", "qkv-matmul", "rope+qknorm", "kv+attn", "o-proj+res", "ffn", "final+download", "ple"];
 
+    // CUDA Graph decode (issue #136): the Gemma 4 layer + output region has static
+    // topology across decode tokens (only `position` varies), so capture it once on the
+    // first decode token and replay per token — collapsing ~1k host launches/token into
+    // one cuGraphLaunch + a handful of node-param updates. Off by default; opt in with
+    // SHARPI_CUDA_GRAPH=1 or the UseCudaGraph setter. Falls back to direct launches on
+    // any capture/replay failure.
+    private bool _useCudaGraph =
+        Environment.GetEnvironmentVariable("SHARPI_CUDA_GRAPH") == "1";
+    private bool _graphCaptured;
+
+    /// <summary>
+    /// Enable/disable CUDA-graph capture+replay for the Gemma 4 decode loop. Defaults from
+    /// the <c>SHARPI_CUDA_GRAPH</c> env var; set before the first decode (tests/bench).
+    /// </summary>
+    public bool UseCudaGraph { get => _useCudaGraph; set => _useCudaGraph = value; }
+
     /// <inheritdoc/>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
@@ -977,6 +993,24 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         if (_hp.HasPerLayerTokenEmbd)
             BuildPerLayerProjectionsGpu(token);
 
+        // 3. Transformer layers + final norm/output/softcap. Static topology across
+        //    tokens (only `position` varies), so optionally capture it once into a CUDA
+        //    graph and replay per token to kill the ~1k-launch/token host overhead (#136).
+        if (!TryRunGemma4DeviceRegionViaGraph(position))
+            RunGemma4DeviceRegion(position);
+
+        _gpu.Download(_logits, _logitsBuf);
+        _gpu.Synchronize();
+
+        _kvLength = Math.Max(_kvLength, position + 1);
+        return _logitsBuf;
+    }
+
+    // Transformer layer loop + final norm/output/softcap — the pure on-device-compute
+    // region the CUDA-graph path captures. Token-varying embedding + PLE run before it;
+    // the logits download + sync run after. Only `position` varies across tokens.
+    private void RunGemma4DeviceRegion(int position)
+    {
         int L = _hp.NumLayers;
         for (int layer = 0; layer < L; layer++)
         {
@@ -1105,12 +1139,53 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         if (_hp.FinalLogitSoftcap > 0f)
             _gpu.SoftcapInPlace(_logits, _hp.FinalLogitSoftcap);
+    }
 
-        _gpu.Download(_logits, _logitsBuf);
-        _gpu.Synchronize();
+    // CUDA-graph capture/replay for the Gemma 4 decode region. Returns true if the logits
+    // were produced via the graph (captured on the first decode token, replayed after);
+    // false means the caller must run the region with direct launches. Any capture/replay
+    // failure disables graphs for the rest of the session and degrades to direct launches.
+    private bool TryRunGemma4DeviceRegionViaGraph(int position)
+    {
+        if (!_useCudaGraph || !_gpu.GraphCaptureSupported)
+            return false;
 
-        _kvLength = Math.Max(_kvLength, position + 1);
-        return _logitsBuf;
+        // Graphs bake in the standard decode invariant (fixed topology, seqLen ==
+        // position+1). SnapKV eviction (variable logical length) and TurboQuant (extra
+        // host-synced rotate/compress ops) break that, so stay on direct launches there.
+        if (_snapKvEffectiveBudget > 0 || _tqEnabled)
+            return false;
+
+        // Steady state: graph already captured — just replay at the new position.
+        if (_graphCaptured && _gpu.GraphReady)
+        {
+            try { _gpu.LaunchGraphForPosition(position); return true; }
+            catch { _useCudaGraph = false; _graphCaptured = false; return false; }
+        }
+
+        if (_graphCaptured)
+            return false; // latched but not ready — shouldn't happen; stay on direct launches
+
+        // First decode token: capture the region (records onto the stream without executing)
+        // then launch it for real. On any failure the region was NOT executed, so the caller
+        // re-runs it directly.
+        try
+        {
+            if (!_gpu.TryBeginGraphCapture())
+                return false;
+            RunGemma4DeviceRegion(position);
+            if (!_gpu.TryEndGraphCaptureAndInstantiate())
+                return false;
+            _gpu.LaunchGraphForPosition(position);
+            _graphCaptured = true;
+            return true;
+        }
+        catch
+        {
+            _gpu.AbortGraphCapture();
+            _useCudaGraph = false;
+            return false;
+        }
     }
 
     /// <summary>

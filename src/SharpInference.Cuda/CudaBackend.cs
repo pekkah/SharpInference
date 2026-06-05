@@ -721,6 +721,189 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _stagingPendingSrc = null;
     }
 
+    // ── CUDA Graphs (issue #136) ──────────────────────────────────────────
+    // Capture the launch-bound Gemma 4 decode region once, then replay it per token
+    // with only the position-derived kernel-node params rewritten. The forward passes
+    // bracket a PURE on-device-compute region (no H2D/D2H — those need a stream sync,
+    // illegal during capture) with TryBeginGraphCapture / TryEndGraphCaptureAndInstantiate
+    // and replay via LaunchGraphForPosition. The five position-varying ops
+    // (RoPE / RoPEWithFactors / KvAppend / Attention / AttentionSwa) self-register their
+    // graph node during capture so replay can update just those scalars. Any failure
+    // flips _graphCaptureSupported off and the caller falls back to direct launches.
+    private bool _graphCaptureSupported = true;
+    private bool _graphCapturing;
+    private bool _graphCaptureFailed;
+    private nint _capturedGraph;   // CUgraph — kept alive: node handles below belong to it
+    private nint _graphExec;       // CUgraphExec
+    private readonly List<GraphPosNode> _graphPosNodes = new();
+
+    /// <summary>True while a graph capture is in progress on <see cref="Stream"/>.</summary>
+    public bool GraphCapturing => _graphCapturing;
+    /// <summary>True until graph capture is ruled out (e.g. a driver capture error).</summary>
+    public bool GraphCaptureSupported => _graphCaptureSupported;
+    /// <summary>True once a graph is captured + instantiated and ready to replay.</summary>
+    public bool GraphReady => _graphExec != nint.Zero;
+
+    private enum GraphPosKind { Position, PositionPlus1, SwaWindowStart, SwaWindowEnd }
+
+    // One captured kernel node whose params carry per-token-varying position scalars.
+    private sealed class GraphPosNode
+    {
+        public nint Node;
+        public nint Func;
+        public uint Gx, Gy, Gz, Bx, By, Bz, Sh;
+        public nint[] ArgValues = [];                         // snapshot of every kernel-arg cell
+        public (int Slot, GraphPosKind Kind, int Window)[] Updates = [];
+    }
+
+    // Pack a float's bit pattern into an arg cell (the kernel reads its low 4 bytes).
+    private static nint GraphFloatBits(float f) => (nint)(uint)BitConverter.SingleToInt32Bits(f);
+
+    /// <summary>
+    /// Begin capturing the decode region into a fresh graph. Drains pending async
+    /// transfers first so capture starts from a clean stream. Returns false (and
+    /// disables graphs) if the driver rejects capture.
+    /// </summary>
+    public bool TryBeginGraphCapture()
+    {
+        if (!_graphCaptureSupported || _graphCapturing) return false;
+        Synchronize();                 // drain in-flight H2D/D2H before capture starts
+        DiscardGraph();
+        _graphPosNodes.Clear();
+        _graphCaptureFailed = false;
+        int rc = NvrtcInterop.StreamBeginCapture(_stream, NvrtcInterop.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+        if (rc != 0) { _graphCaptureSupported = false; return false; }
+        _graphCapturing = true;
+        return true;
+    }
+
+    /// <summary>
+    /// End the in-progress capture and instantiate it into a replayable exec graph.
+    /// Returns false (disabling graphs) on any capture/instantiate error or if a tracked
+    /// node failed to harvest mid-capture.
+    /// </summary>
+    public bool TryEndGraphCaptureAndInstantiate()
+    {
+        if (!_graphCapturing) return false;
+        int rc = NvrtcInterop.StreamEndCapture(_stream, out nint graph);
+        _graphCapturing = false;
+        if (rc != 0 || graph == nint.Zero || _graphCaptureFailed)
+        {
+            if (graph != nint.Zero) NvrtcInterop.GraphDestroy(graph);
+            _graphPosNodes.Clear();
+            _graphCaptureSupported = false;
+            return false;
+        }
+        rc = NvrtcInterop.GraphInstantiate(out nint exec, graph, 0);
+        if (rc != 0 || exec == nint.Zero)
+        {
+            NvrtcInterop.GraphDestroy(graph);
+            _graphPosNodes.Clear();
+            _graphCaptureSupported = false;
+            return false;
+        }
+        _capturedGraph = graph;
+        _graphExec = exec;
+        return true;
+    }
+
+    /// <summary>
+    /// Abort an in-progress capture (drains the stream out of capture mode) and give up
+    /// on graphs for this backend. Safe to call when not capturing.
+    /// </summary>
+    public void AbortGraphCapture()
+    {
+        if (_graphCapturing)
+        {
+            NvrtcInterop.StreamEndCapture(_stream, out nint g);
+            _graphCapturing = false;
+            if (g != nint.Zero) NvrtcInterop.GraphDestroy(g);
+        }
+        _graphPosNodes.Clear();
+        _graphCaptureSupported = false;
+    }
+
+    /// <summary>
+    /// Replay the captured decode graph for <paramref name="position"/>: rewrite each
+    /// tracked node's position-derived scalar params, then launch the exec graph on the
+    /// compute stream. Bit-identical to a direct-launch decode at the same position.
+    /// </summary>
+    public void LaunchGraphForPosition(int position)
+    {
+        if (_graphExec == nint.Zero)
+            throw new InvalidOperationException("LaunchGraphForPosition called before a graph was captured.");
+
+        const int MaxArgs = 16;
+        nint* cells = stackalloc nint[MaxArgs];
+        nint* ptrs  = stackalloc nint[MaxArgs];
+        foreach (var n in _graphPosNodes)
+        {
+            int cnt = n.ArgValues.Length;
+            for (int i = 0; i < cnt; i++) cells[i] = n.ArgValues[i];
+            foreach (var u in n.Updates)
+                cells[u.Slot] = u.Kind switch
+                {
+                    GraphPosKind.Position       => position,
+                    GraphPosKind.PositionPlus1  => position + 1,
+                    GraphPosKind.SwaWindowStart => Math.Max(0, position + 1 - u.Window),
+                    GraphPosKind.SwaWindowEnd   => position + 1,
+                    _                           => cells[u.Slot],
+                };
+            for (int i = 0; i < cnt; i++) ptrs[i] = (nint)(cells + i);
+
+            var p = new NvrtcInterop.CudaKernelNodeParams
+            {
+                Func = n.Func,
+                GridDimX = n.Gx, GridDimY = n.Gy, GridDimZ = n.Gz,
+                BlockDimX = n.Bx, BlockDimY = n.By, BlockDimZ = n.Bz,
+                SharedMemBytes = n.Sh,
+                KernelParams = (nint)ptrs,
+                Extra = nint.Zero,
+            };
+            int rc = NvrtcInterop.GraphExecKernelNodeSetParams(_graphExec, n.Node, &p);
+            if (rc != 0)
+                throw new InvalidOperationException($"cuGraphExecKernelNodeSetParams failed: {rc}");
+        }
+
+        int lr = NvrtcInterop.GraphLaunch(_graphExec, _stream);
+        if (lr != 0)
+            throw new InvalidOperationException($"cuGraphLaunch failed: {lr}");
+    }
+
+    private void DiscardGraph()
+    {
+        if (_graphExec != nint.Zero) { NvrtcInterop.GraphExecDestroy(_graphExec); _graphExec = nint.Zero; }
+        if (_capturedGraph != nint.Zero) { NvrtcInterop.GraphDestroy(_capturedGraph); _capturedGraph = nint.Zero; }
+    }
+
+    // Called by the position-varying op methods immediately after their cuLaunchKernel
+    // while a capture is active. Harvests the just-added graph node from the capture-info
+    // leaf set (a linearly-ordered stream has exactly one leaf) and snapshots its kernel-arg
+    // values so the position slots can be rewritten per replay. Marks the capture failed
+    // (→ fallback) if the leaf set isn't the expected single node.
+    private void TrackPositionNode(
+        nint func, uint gx, uint gy, uint gz, uint bx, uint by, uint bz, uint sh,
+        ReadOnlySpan<nint> argValues,
+        (int Slot, GraphPosKind Kind, int Window)[] updates)
+    {
+        if (_graphCaptureFailed) return;
+        int rc = NvrtcInterop.StreamGetCaptureInfo(
+            _stream, out int status, out _, out _, out nint deps, out nuint numDeps);
+        if (rc != 0 || status != NvrtcInterop.CU_STREAM_CAPTURE_STATUS_ACTIVE
+                    || numDeps != 1 || deps == nint.Zero || argValues.Length > 16)
+        {
+            _graphCaptureFailed = true;
+            return;
+        }
+        _graphPosNodes.Add(new GraphPosNode
+        {
+            Node = ((nint*)deps)[0], Func = func,
+            Gx = gx, Gy = gy, Gz = gz, Bx = bx, By = by, Bz = bz, Sh = sh,
+            ArgValues = argValues.ToArray(),
+            Updates = updates,
+        });
+    }
+
     // ── Pinned host memory exposed as device-accessible tensors ──
     // Vulkan exposes host-visible-device-local buffers as a single Tensor that
     // both the GPU shaders and CPU mapped pointer can use. Under UVA, CUDA's
@@ -1998,6 +2181,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         nint kernel = neox ? _ropeNeoxKernel : _ropeInterleavedKernel;
         int r = NvrtcInterop.LaunchKernel(kernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(rope) failed: {r}");
+
+        if (_graphCapturing)
+        {
+            Span<nint> av = stackalloc nint[5];
+            av[0] = xPtr; av[1] = pNH; av[2] = pHD; av[3] = pPos; av[4] = GraphFloatBits(pT);
+            TrackPositionNode(kernel, grid, 1, 1, 256, 1, 1, 0, av, [(3, GraphPosKind.Position, 0)]);
+        }
     }
 
     /// <summary>
@@ -2103,6 +2293,15 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         uint grid = (uint)((totalPairs + 255) / 256);
         int r = NvrtcInterop.LaunchKernel(_ropeNeoxWithFactorsKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(rope_neox_with_factors) failed: {r}");
+
+        if (_graphCapturing)
+        {
+            Span<nint> av = stackalloc nint[6];
+            av[0] = xPtr; av[1] = pNH; av[2] = pHD; av[3] = pPos;
+            av[4] = GraphFloatBits(pT); av[5] = fPtr;
+            TrackPositionNode(_ropeNeoxWithFactorsKernel, grid, 1, 1, 256, 1, 1, 0, av,
+                [(3, GraphPosKind.Position, 0)]);
+        }
     }
 
     /// <summary>
@@ -2251,6 +2450,14 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         uint grid = (uint)((kvDim + 255) / 256);
         int r = NvrtcInterop.LaunchKernel(_kvAppendKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kv_append) failed: {r}");
+
+        if (_graphCapturing)
+        {
+            Span<nint> av = stackalloc nint[7];
+            av[0] = kPtr; av[1] = vPtr; av[2] = kcP; av[3] = vcP;
+            av[4] = pKD; av[5] = pPos; av[6] = pMSL;
+            TrackPositionNode(_kvAppendKernel, grid, 1, 1, 256, 1, 1, 0, av, [(5, GraphPosKind.Position, 0)]);
+        }
     }
 
     /// <summary>
@@ -2287,6 +2494,17 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         };
         int r = NvrtcInterop.LaunchKernel(_attentionKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention) failed: {r}");
+
+        if (_graphCapturing)
+        {
+            Span<nint> av = stackalloc nint[11];
+            av[0] = qP; av[1] = kP; av[2] = vP; av[3] = oP; av[4] = ssP;
+            av[5] = pNH; av[6] = pNKV; av[7] = pHD; av[8] = pSL; av[9] = pMSL;
+            av[10] = GraphFloatBits(pScale);
+            // pSL = seqLen = position + 1 in the decode path.
+            TrackPositionNode(_attentionKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, av,
+                [(8, GraphPosKind.PositionPlus1, 0)]);
+        }
     }
 
     /// <summary>
@@ -2333,6 +2551,17 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         };
         int r = NvrtcInterop.LaunchKernel(_attentionSwaKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_swa) failed: {r}");
+
+        if (_graphCapturing)
+        {
+            Span<nint> av = stackalloc nint[12];
+            av[0] = qP; av[1] = kP; av[2] = vP; av[3] = oP; av[4] = ssP;
+            av[5] = pNH; av[6] = pNKV; av[7] = pHD;
+            av[8] = pWS; av[9] = pWE; av[10] = pMSL; av[11] = GraphFloatBits(pScale);
+            // windowStart = max(0, position+1-window); windowEnd = position+1.
+            TrackPositionNode(_attentionSwaKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, av,
+                [(8, GraphPosKind.SwaWindowStart, windowSize), (9, GraphPosKind.SwaWindowEnd, 0)]);
+        }
     }
 
     /// <summary>
@@ -4147,6 +4376,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _waveScratchBuf = nint.Zero;
             _waveScratchBufSize = 0;
         }
+
+        // Tear down any captured CUDA graph (issue #136) before stream/context go away.
+        if (_graphCapturing)
+            NvrtcInterop.StreamEndCapture(_stream, out _);
+        DiscardGraph();
 
         CuBlasInterop.Destroy(_handle);
 
