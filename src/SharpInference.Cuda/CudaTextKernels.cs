@@ -2417,7 +2417,7 @@ extern ""C"" __global__ void llm_attention(
     float* __restrict__ out,
     float* __restrict__ scores_scratch,    // [num_heads * max_seq_len], null when seq_len ≤ MAX_STORED_SCORES
     int num_heads, int num_kv_heads, int head_dim,
-    int seq_len, int max_seq_len)
+    int seq_len, int max_seq_len, float attn_scale)
 {
     const int MAX_STORED_SCORES = 4096;
     __shared__ float shared_scores[MAX_STORED_SCORES];
@@ -2429,7 +2429,7 @@ extern ""C"" __global__ void llm_attention(
 
     int kv_head = (int)h / (num_heads / num_kv_heads);
     int kv_dim  = num_kv_heads * head_dim;
-    float scale = rsqrtf((float)head_dim);
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
     long q_off  = (long)h * (long)head_dim;
     long out_off = q_off;
 
@@ -2524,7 +2524,7 @@ extern ""C"" __global__ void llm_attention_swa(
     float* __restrict__ out,
     float* __restrict__ scores_scratch,    // [num_heads * max_seq_len], null when eff_seq ≤ MAX_STORED_SCORES
     int num_heads, int num_kv_heads, int head_dim,
-    int window_start, int window_end, int max_seq_len)
+    int window_start, int window_end, int max_seq_len, float attn_scale)
 {
     const int MAX_STORED_SCORES = 4096;
     __shared__ float shared_scores[MAX_STORED_SCORES];
@@ -2536,7 +2536,7 @@ extern ""C"" __global__ void llm_attention_swa(
 
     int kv_head = (int)h / (num_heads / num_kv_heads);
     int kv_dim  = num_kv_heads * head_dim;
-    float scale = rsqrtf((float)head_dim);
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
     long q_off  = (long)h * (long)head_dim;
     long out_off = q_off;
 
@@ -2631,7 +2631,7 @@ extern ""C"" __global__ void llm_attention_swa_batched(
     const float* __restrict__ v_cache,
     float* __restrict__ out_all,          // [n_tok, num_heads*head_dim]
     int num_heads, int num_kv_heads, int head_dim,
-    int start_pos, int window_size, int max_seq_len, int n_tok)
+    int start_pos, int window_size, int max_seq_len, int n_tok, float attn_scale)
 {
     const int MAX_STORED_SCORES = 4096;
     __shared__ float shared_scores[MAX_STORED_SCORES];
@@ -2650,7 +2650,7 @@ extern ""C"" __global__ void llm_attention_swa_batched(
 
     int kv_head = (int)h / (num_heads / num_kv_heads);
     int kv_dim  = num_kv_heads * head_dim;
-    float scale = rsqrtf((float)head_dim);
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
     int q_dim = num_heads * head_dim;
     const float* q = q_all + (long)i * q_dim;
     float* out = out_all + (long)i * q_dim;
@@ -3510,7 +3510,7 @@ extern ""C"" __global__ void llm_full_seq_attention(
     const float* __restrict__ v_cache,
     float* __restrict__ out_all,          // [n_tok, num_heads*head_dim]
     int num_heads, int num_kv_heads, int head_dim,
-    int start_pos, int max_seq_len, int n_tok)
+    int start_pos, int max_seq_len, int n_tok, float attn_scale)
 {
     const int MAX_STORED_SCORES = 4096;
     __shared__ float shared_scores[MAX_STORED_SCORES];
@@ -3524,7 +3524,7 @@ extern ""C"" __global__ void llm_full_seq_attention(
     int seq_len = start_pos + i + 1;
     int kv_head = (int)h / (num_heads / num_kv_heads);
     int kv_dim  = num_kv_heads * head_dim;
-    float scale = rsqrtf((float)head_dim);
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
     int q_dim = num_heads * head_dim;
     const float* q = q_all + (long)i * q_dim;
     float* out = out_all + (long)i * q_dim;

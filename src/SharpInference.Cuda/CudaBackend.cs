@@ -2216,7 +2216,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// </summary>
     public void Attention(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
                           Tensor? scoresScratch,
-                          int numHeads, int numKvHeads, int headDim, int seqLen, int maxSeqLen)
+                          int numHeads, int numKvHeads, int headDim, int seqLen, int maxSeqLen,
+                          float attnScale = -1f)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
@@ -2228,12 +2229,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         nint oP = GetDevPtr(output);
         nint ssP = scoresScratch is { } sv ? GetDevPtr(sv) : nint.Zero;
         int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pSL = seqLen, pMSL = maxSeqLen;
-        nint* args = stackalloc nint[10]
+        float pScale = attnScale;
+        nint* args = stackalloc nint[11]
         {
             (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
             (nint)(&ssP),
             (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
-            (nint)(&pSL), (nint)(&pMSL)
+            (nint)(&pSL), (nint)(&pMSL), (nint)(&pScale)
         };
         int r = NvrtcInterop.LaunchKernel(_attentionKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention) failed: {r}");
@@ -2254,7 +2256,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     public void AttentionSwa(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
                              Tensor? scoresScratch,
                              int position, int windowSize, int headDim,
-                             int numHeads, int numKvHeads, int maxSeqLen)
+                             int numHeads, int numKvHeads, int maxSeqLen,
+                             float attnScale = -1f)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
@@ -2271,12 +2274,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         nint ssP = scoresScratch is { } sv ? GetDevPtr(sv) : nint.Zero;
         int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim;
         int  pWS = windowStart, pWE = windowEnd, pMSL = maxSeqLen;
-        nint* args = stackalloc nint[11]
+        float pScale = attnScale;
+        nint* args = stackalloc nint[12]
         {
             (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
             (nint)(&ssP),
             (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
-            (nint)(&pWS), (nint)(&pWE), (nint)(&pMSL)
+            (nint)(&pWS), (nint)(&pWE), (nint)(&pMSL), (nint)(&pScale)
         };
         int r = NvrtcInterop.LaunchKernel(_attentionSwaKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_swa) failed: {r}");
@@ -2292,7 +2296,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// </summary>
     public void AttentionSwaBatched(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
         int numHeads, int numKvHeads, int headDim,
-        int startPos, int windowSize, int maxSeqLen, int nTok)
+        int startPos, int windowSize, int maxSeqLen, int nTok, float attnScale = -1f)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
@@ -2305,11 +2309,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         nint qP = GetDevPtr(qAll), kP = GetDevPtr(kCache), vP = GetDevPtr(vCache), oP = GetDevPtr(outAll);
         int pNH = numHeads, pNKV = numKvHeads, pHD = headDim;
         int pSP = startPos, pWS = windowSize, pMSL = maxSeqLen, pN = nTok;
-        nint* args = stackalloc nint[11]
+        float pScale = attnScale;
+        nint* args = stackalloc nint[12]
         {
             (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
             (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
-            (nint)(&pSP), (nint)(&pWS), (nint)(&pMSL), (nint)(&pN)
+            (nint)(&pSP), (nint)(&pWS), (nint)(&pMSL), (nint)(&pN), (nint)(&pScale)
         };
         int r = NvrtcInterop.LaunchKernel(_attentionSwaBatchedKernel, (uint)numHeads, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_swa_batched) failed: {r}");
@@ -2439,7 +2444,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// </summary>
     public void AttentionBatched(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
                                  int numHeads, int numKvHeads, int headDim,
-                                 int startPos, int maxSeqLen, int nTok)
+                                 int startPos, int maxSeqLen, int nTok, float attnScale = -1f)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
@@ -2450,10 +2455,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
         nint qP = GetDevPtr(qAll), kP = GetDevPtr(kCache), vP = GetDevPtr(vCache), oP = GetDevPtr(outAll);
         int pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pSP = startPos, pMSL = maxSeqLen, pN = nTok;
-        nint* args = stackalloc nint[10]
+        float pScale = attnScale;
+        nint* args = stackalloc nint[11]
         {
             (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
-            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD), (nint)(&pSP), (nint)(&pMSL), (nint)(&pN)
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD), (nint)(&pSP), (nint)(&pMSL), (nint)(&pN), (nint)(&pScale)
         };
         int r = NvrtcInterop.LaunchKernel(_fullSeqAttentionKernel, (uint)numHeads, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(full_seq_attention) failed: {r}");

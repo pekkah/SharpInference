@@ -1045,25 +1045,22 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
                 : _maxSeqLen;
 
-            // Gemma 4 uses attention_scale = 1.0 (no 1/sqrt(head_dim) prefactor); the
-            // CUDA attention kernels bake `rsqrtf(head_dim)` in unconditionally. Pre-
-            // scale the query by sqrt(head_dim) so the kernel's implicit scale cancels
-            // out — mirrors the CPU path's `_layerHeadDim is not null ? 1f : 1/sqrt(hd)`
-            // in ForwardPass.Attention.
-            _gpu.ScaleInPlace(qView, MathF.Sqrt(layerHd));
-
+            // Gemma 4 uses attention_scale = 1.0 (no 1/sqrt(head_dim) prefactor). Pass
+            // it explicitly so the kernel skips its rsqrtf(head_dim) — matching the CPU
+            // path's `_layerHeadDim is not null ? 1f : 1/sqrt(hd)` exactly with no
+            // prescale round-trip, and dropping a ScaleInPlace launch per layer.
             if (isSwa)
             {
                 _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                     _attnScoresScratch,
                     position, _hp.SlidingWindowSize, layerHd,
-                    _numHeads, _numKvHeads, effLayerCtx);
+                    _numHeads, _numKvHeads, effLayerCtx, attnScale: 1f);
             }
             else
             {
                 _gpu.Attention(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                     _attnScoresScratch,
-                    _numHeads, _numKvHeads, layerHd, position + 1, effLayerCtx);
+                    _numHeads, _numKvHeads, layerHd, position + 1, effLayerCtx, attnScale: 1f);
             }
 
             // Output projection: _wo[layer] is [embDim, qDimL] — pass attnOutView
@@ -1388,14 +1385,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                               && _hp.SlidingWindowSize > 0)
                 ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
                 : _maxSeqLen;
-            _gpu.ScaleInPlace(qView, MathF.Sqrt(layerHd));
             if (isSwa)
                 _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                     _attnScoresScratch, position, _hp.SlidingWindowSize, layerHd,
-                    _numHeads, _numKvHeads, effLayerCtx);
+                    _numHeads, _numKvHeads, effLayerCtx, attnScale: 1f);
             else
                 _gpu.Attention(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
-                    _attnScoresScratch, _numHeads, _numKvHeads, layerHd, position + 1, effLayerCtx);
+                    _attnScoresScratch, _numHeads, _numKvHeads, layerHd, position + 1, effLayerCtx, attnScale: 1f);
             _gpu.Synchronize();
             AccPhase(PH_KV_ATTN, sw, ref t0);
 
@@ -1740,15 +1736,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         int effLayerCtx = (_hp.IsSwaLayer is { } swaEff && swaEff[effLayer] && window > 0)
             ? Math.Min(_maxSeqLen, window) : _maxSeqLen;
 
-        // Gemma 4: attention_scale = 1.0 — prescale Q so the kernel's rsqrtf cancels.
-        _gpu.ScaleInPlace(qAll, MathF.Sqrt(layerHd));
-
+        // Gemma 4: attention_scale = 1.0, passed explicitly (kernel skips its rsqrtf).
         if (isSwa)
             _gpu.AttentionSwaBatched(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                _numHeads, _numKvHeads, layerHd, startPos, window, effLayerCtx, N);
+                _numHeads, _numKvHeads, layerHd, startPos, window, effLayerCtx, N, attnScale: 1f);
         else
             _gpu.AttentionBatched(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                _numHeads, _numKvHeads, layerHd, startPos, effLayerCtx, N);
+                _numHeads, _numKvHeads, layerHd, startPos, effLayerCtx, N, attnScale: 1f);
 
         GpuMatMulBatched(_bpHidden!, _wo[layer], attnAll, N);
         if (_wPostAttnNorm is not null)
