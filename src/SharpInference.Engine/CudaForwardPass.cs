@@ -801,11 +801,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     // CUDA Graph decode (issue #136): the Gemma 4 layer + output region has static
     // topology across decode tokens (only `position` varies), so capture it once on the
     // first decode token and replay per token — collapsing ~1k host launches/token into
-    // one cuGraphLaunch + a handful of node-param updates. Off by default; opt in with
-    // SHARPI_CUDA_GRAPH=1 or the UseCudaGraph setter. Falls back to direct launches on
-    // any capture/replay failure.
+    // one cuGraphLaunch + a handful of node-param updates. Falls back to direct launches
+    // on any capture/replay failure.
+    //
+    // Default ON (issue #142): after the #137 launch fusions and the dp4a decode matvec,
+    // graphs measure +9–10% at both low and ~1K context on the all-GPU Gemma 4 path (the
+    // earlier short-context regression that kept #136 default-off is gone). SHARPI_CUDA_GRAPH=0
+    // reverts to direct launches.
     private bool _useCudaGraph =
-        Environment.GetEnvironmentVariable("SHARPI_CUDA_GRAPH") == "1";
+        Environment.GetEnvironmentVariable("SHARPI_CUDA_GRAPH") != "0";
     private bool _graphCaptured;
     // Number of KV entries SnapKV physically dropped when it compacted the cache
     // (= N - K at eviction, 0 otherwise). Decode indexes the compacted cache by the
