@@ -286,10 +286,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             Environment.GetEnvironmentVariable("SHARPI_BATCHED_PREFILL") != "0";
         PrefillGemmEnabled =
             Environment.GetEnvironmentVariable("SHARPI_PREFILL_GEMM") != "0";
-        // Issue #141 (MMQ): opt-in during bring-up (SHARPI_PREFILL_MMQ=1); once
-        // benched faster than the GEMM path this becomes the Q8_0 prefill default.
+        // Issue #141 (MMQ): default on — the int8 tensor-core MMQ beats the
+        // dequant→fp16→cuBLAS GEMM matmul (~316ms vs ~332ms over a 1848-tok Gemma 4
+        // prefill) and drops the fp16 weight HBM temp. SHARPI_PREFILL_MMQ=0 reverts to
+        // the cuBLAS GEMM path. Gated under PrefillGemmEnabled (the compute-bound path).
         PrefillMmqEnabled =
-            Environment.GetEnvironmentVariable("SHARPI_PREFILL_MMQ") == "1";
+            Environment.GetEnvironmentVariable("SHARPI_PREFILL_MMQ") != "0";
         _maxHeadDim = _headDim;
         if (hp.LayerHeadDim is { } lhdMax)
             for (int i = 0; i < hp.NumLayers; i++)

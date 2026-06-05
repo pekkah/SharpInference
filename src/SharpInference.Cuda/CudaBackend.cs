@@ -1826,8 +1826,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             if (rq != 0) throw new InvalidOperationException($"cuLaunchKernel(quantize_q8_1 mmq) failed: {rq}");
         }
 
-        // 2) int8 mma MMQ: grid = ((rows+63)/64, (nTok+63)/64), 256 threads/block,
-        //    each block a 64×64 output tile (8 warps × 4 m16n8k32 mma per K-block).
+        // 2) int8 mma MMQ: grid = ((rows+63)/64, (nTok+127)/128), 256 threads/block,
+        //    each block a 64×128 output tile (8 warps × 8 m16n8k32 mma per K-block).
         {
             nint q81 = _q81BatchBuf;
             int pRows = rows, pCols = cols, pN = nTok;
@@ -1836,7 +1836,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 (nint)(&wPtr), (nint)(&q81), (nint)(&yPtr),
                 (nint)(&pRows), (nint)(&pCols), (nint)(&pN)
             };
-            uint gx = (uint)((rows + 63) / 64), gy = (uint)((nTok + 63) / 64);
+            uint gx = (uint)((rows + 63) / 64), gy = (uint)((nTok + 127) / 128);
             int rm = NvrtcInterop.LaunchKernel(_mmqQ80Kernel, gx, gy, 1,
                                                256, 1, 1, 0, _stream, args, null);
             if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(mmq_q8_0) failed: {rm}");

@@ -77,9 +77,11 @@ public sealed class Gemma4CudaBatchedPrefillTests
 
         using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 512);
 
-        // Batched cuBLAS-GEMM prefill (#141 default on).
+        // Batched cuBLAS-GEMM prefill (#141). Pin MMQ off so this isolates the
+        // dequant→fp16→cuBLAS GEMM path (MMQ has its own oracle below).
         fwd.BatchedPrefillEnabled = true;
         fwd.PrefillGemmEnabled = true;
+        fwd.PrefillMmqEnabled = false;
         var batched = fwd.Prefill(tokens).ToArray();
         Assert.True(fwd.LastPrefillWasBatched,
             "Batched-trunk prefill did not engage — check IsGemma4BatchedPrefillSupported gating.");
@@ -113,6 +115,55 @@ public sealed class Gemma4CudaBatchedPrefillTests
         Assert.True(overlap >= 4,
             $"GEMM-batched top-5 overlaps the fp32 reference in only {overlap}/5 slots; " +
             "fp16 GEMM is diverging more than rounding explains.");
+    }
+
+    [Fact]
+    public void Gemma4_E4B_BatchedPrefill_MmqMatchesSequential()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.NotNull(hp.LayerHeadDim);
+        Assert.True(hp.HasPerLayerTokenEmbd);
+
+        var tokens = new int[] { 2, 651, 6037, 576, 6081, 603, 1234, 4567, 8901, 222, 333, 444 };
+
+        using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 512);
+
+        // Int8 tensor-core MMQ prefill (#141, default on). Like the cuBLAS GEMM path
+        // it int8-quantizes both operands, so it is argmax-stable to the fp32 per-token
+        // reference, not bit-exact.
+        fwd.BatchedPrefillEnabled = true;
+        fwd.PrefillGemmEnabled = true;
+        fwd.PrefillMmqEnabled = true;
+        var batched = fwd.Prefill(tokens).ToArray();
+        Assert.True(fwd.LastPrefillWasBatched,
+            "Batched-trunk MMQ prefill did not engage — check IsGemma4BatchedPrefillSupported gating.");
+
+        fwd.ResetCache();
+        fwd.BatchedPrefillEnabled = false;
+        var sequential = fwd.Prefill(tokens).ToArray();
+        Assert.False(fwd.LastPrefillWasBatched);
+
+        Assert.Equal(sequential.Length, batched.Length);
+        Assert.Equal(Argmax(sequential), Argmax(batched));
+
+        float maxAbs = 0f;
+        for (int i = 0; i < sequential.Length; i++)
+            maxAbs = MathF.Max(maxAbs, MathF.Abs(sequential[i] - batched[i]));
+        Assert.True(maxAbs < 1.0f,
+            $"MMQ-batched vs sequential logits diverged beyond int8 tolerance: maxAbs={maxAbs}.");
+
+        var seqTop = TopKSet(sequential, 5);
+        var batTop = TopKSet(batched, 5);
+        int overlap = 0;
+        foreach (var t in batTop) if (seqTop.Contains(t)) overlap++;
+        Assert.True(overlap >= 4,
+            $"MMQ-batched top-5 overlaps the fp32 reference in only {overlap}/5 slots.");
     }
 
     [Fact]
