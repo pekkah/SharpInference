@@ -159,8 +159,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
     // Issue #136: all-GPU batched-trunk prefill scratch (Gemma 4). Lazily sized to
     // the current prompt length N; reallocated when N changes (prefill is infrequent).
-    // Every buffer holds exactly N rows so element-count-driven ops (Add/Scale/Copy)
-    // span exactly N tokens. Freed in Dispose.
+    // The embDim/intermDim/pleWidth buffers hold exactly N rows, so element-count-driven
+    // ops (Add/Scale/Copy) span exactly N tokens. The Q/K/V/attn buffers are sized for
+    // max head_dim and accessed through per-layer _gpu.View slices at the active layer's
+    // head_dim. Freed in Dispose.
     /// <summary>
     /// Gates the issue-#136 batched-trunk prefill. Initialised from
     /// <c>SHARPI_BATCHED_PREFILL</c> (default on); settable so tests can A/B the
@@ -1155,7 +1157,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // baked in), add the same-slice PLE row, scale by 1/sqrt(2). The norm is the
         // only per-slice op (one block per row, byte-identical to llm_rmsnorm); the
         // add and scale are pure elementwise and run over the whole [L*pleWidth]
-        // buffer at once. Collapses the old 3×L per-slice launches to 3 total.
+        // buffer at once. Collapses the original per-slice loop (≈6 device ops × L —
+        // 3 slice copies + norm/add/scale) to 3 whole-buffer launches.
         _gpu.RmsNormBatched(_gpuProjPerLayer!, _gpuProjPerLayer!, _gpuPerLayerProjNorm!,
             L, _pleWidth, _hp.RmsNormEps);
         _gpu.AddInPlace(_gpuProjPerLayer!, _gpuPleRow!);
@@ -1516,6 +1519,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private DType WDType(Tensor t) => _weightDTypes.GetValueOrDefault(t.Handle, DType.Q4_K);
 
     /// <summary>
+    /// Fail-safe batchability check for the prefill gate: an unregistered handle is
+    /// treated as NOT batchable (forcing the per-token fallback) rather than defaulting
+    /// to a batchable dtype, so a future weight whose dtype isn't tracked can't slip
+    /// into the GEMM-N path and be misdispatched.
+    /// </summary>
+    private bool BatchableWeight(Tensor t) =>
+        _weightDTypes.TryGetValue(t.Handle, out var d) && BatchableDType(d);
+
+    /// <summary>
     /// Whether the issue-#136 batched-trunk prefill can run this model bit-identically.
     /// Requires a dense Gemma 4 with NEOX RoPE, non-L2 QK-norm, no attention bias, TQ
     /// off, and every trunk + PLE weight in a GEMM-N-batchable dtype.
@@ -1528,17 +1540,19 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         for (int i = 0; i < _hp.NumLayers; i++)
         {
             bool kvShared = _hp.KvSourceLayer is { } ksl && ksl[i] >= 0;
-            if (!BatchableDType(WDType(_wq[i])) || !BatchableDType(WDType(_wo[i])) ||
-                !BatchableDType(WDType(_wGate[i])) || !BatchableDType(WDType(_wUp[i])) ||
-                !BatchableDType(WDType(_wDown[i])))
+            if (!BatchableWeight(_wq[i]) || !BatchableWeight(_wo[i]) ||
+                !BatchableWeight(_wGate[i]) || !BatchableWeight(_wUp[i]) ||
+                !BatchableWeight(_wDown[i]))
                 return false;
-            if (!kvShared && (!BatchableDType(WDType(_wk[i])) || !BatchableDType(WDType(_wv[i]))))
+            if (!kvShared && (!BatchableWeight(_wk[i]) || !BatchableWeight(_wv[i])))
                 return false;
             if (_hp.HasPerLayerTokenEmbd &&
-                (!BatchableDType(WDType(_gpuInpGate![i])) || !BatchableDType(WDType(_gpuPleProj![i]))))
+                (!BatchableWeight(_gpuInpGate![i]) || !BatchableWeight(_gpuPleProj![i])))
                 return false;
         }
-        return BatchableDType(WDType(_wOutput));
+        if (_hp.HasPerLayerTokenEmbd && !BatchableWeight(_gpuPerLayerModelProj!))
+            return false;
+        return BatchableWeight(_wOutput);
     }
 
     private void GpuMatMulBatched(Tensor outAll, Tensor weights, Tensor inAll, int n) =>

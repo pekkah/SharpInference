@@ -680,6 +680,78 @@ public sealed unsafe class CudaMatMulBatchedTests
     }
 
     [Fact]
+    public void AttentionExplicitScale_BitwiseMatchesSingle_AndDiffersFromSentinel()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        int numHeads = 8, numKvHeads = 2, headDim = 256, maxSeqLen = 1024;
+        int qDim = numHeads * headDim, kvDim = numKvHeads * headDim;
+        int startPos = 50, nTok = 12, window = 512;
+        const float scale = 1.0f;   // Gemma 4's attention_scale
+
+        var rng = new Random(7777);
+        var kc = new float[(long)maxSeqLen * kvDim];
+        var vc = new float[(long)maxSeqLen * kvDim];
+        int filled = (startPos + nTok) * kvDim;
+        for (int i = 0; i < filled; i++) { kc[i] = (float)(rng.NextDouble() * 2 - 1); vc[i] = (float)(rng.NextDouble() * 2 - 1); }
+        var xAll = Rand(nTok * qDim, rng);
+        var gpuK = gpu.Upload(kc, TensorShape.D1((long)maxSeqLen * kvDim));
+        var gpuV = gpu.Upload(vc, TensorShape.D1((long)maxSeqLen * kvDim));
+
+        // ---- SWA: batched(scale) == per-token(scale), bit-exact; and scale != sentinel.
+        var gq = gpu.Upload(xAll, TensorShape.D1((long)nTok * qDim));
+        var gOut = gpu.Allocate(TensorShape.D1((long)nTok * qDim));
+        gpu.AttentionSwaBatched(gq, gpuK, gpuV, gOut, numHeads, numKvHeads, headDim, startPos, window, maxSeqLen, nTok, attnScale: scale);
+        gpu.Synchronize();
+        var swaBat = new float[(long)nTok * qDim]; gpu.Download(gOut, swaBat);
+
+        var swaRef = new float[nTok][];
+        var swaSentinel = new float[nTok][];
+        for (int t = 0; t < nTok; t++)
+        {
+            var xt = new float[qDim]; Array.Copy(xAll, (long)t * qDim, xt, 0, qDim);
+            var gx = gpu.Upload(xt, TensorShape.D1(qDim));
+            var go = gpu.Allocate(TensorShape.D1(qDim));
+            gpu.AttentionSwa(gx, gpuK, gpuV, go, null, startPos + t, window, headDim, numHeads, numKvHeads, maxSeqLen, attnScale: scale);
+            gpu.Synchronize();
+            swaRef[t] = new float[qDim]; gpu.Download(go, swaRef[t]);
+            // Sentinel (default rsqrt) for the differs-check.
+            var gx2 = gpu.Upload(xt, TensorShape.D1(qDim));
+            var go2 = gpu.Allocate(TensorShape.D1(qDim));
+            gpu.AttentionSwa(gx2, gpuK, gpuV, go2, null, startPos + t, window, headDim, numHeads, numKvHeads, maxSeqLen);
+            gpu.Synchronize();
+            swaSentinel[t] = new float[qDim]; gpu.Download(go2, swaSentinel[t]);
+            gpu.Free(gx); gpu.Free(go); gpu.Free(gx2); gpu.Free(go2);
+        }
+        AssertRowsBitIdentical($"SWA scale={scale}", qDim, nTok, swaBat, swaRef);
+        // scale=1 must NOT equal the rsqrt(headDim) sentinel — proves the param is honored.
+        Assert.NotEqual(BitConverter.SingleToInt32Bits(swaRef[0][0]), BitConverter.SingleToInt32Bits(swaSentinel[0][0]));
+        gpu.Free(gq); gpu.Free(gOut);
+
+        // ---- Full (non-SWA, Gemma global layers): batched(scale) == per-token(scale).
+        var gq2 = gpu.Upload(xAll, TensorShape.D1((long)nTok * qDim));
+        var gOut2 = gpu.Allocate(TensorShape.D1((long)nTok * qDim));
+        gpu.AttentionBatched(gq2, gpuK, gpuV, gOut2, numHeads, numKvHeads, headDim, startPos, maxSeqLen, nTok, attnScale: scale);
+        gpu.Synchronize();
+        var fullBat = new float[(long)nTok * qDim]; gpu.Download(gOut2, fullBat);
+
+        var fullRef = new float[nTok][];
+        for (int t = 0; t < nTok; t++)
+        {
+            var xt = new float[qDim]; Array.Copy(xAll, (long)t * qDim, xt, 0, qDim);
+            var gx = gpu.Upload(xt, TensorShape.D1(qDim));
+            var go = gpu.Allocate(TensorShape.D1(qDim));
+            gpu.Attention(gx, gpuK, gpuV, go, null, numHeads, numKvHeads, headDim, startPos + t + 1, maxSeqLen, attnScale: scale);
+            gpu.Synchronize();
+            fullRef[t] = new float[qDim]; gpu.Download(go, fullRef[t]);
+            gpu.Free(gx); gpu.Free(go);
+        }
+        AssertRowsBitIdentical($"Full scale={scale}", qDim, nTok, fullBat, fullRef);
+        gpu.Free(gq2); gpu.Free(gOut2);
+        gpu.Free(gpuK); gpu.Free(gpuV);
+    }
+
+    [Fact]
     public void MatMulBatched_F32_BitwiseMatchesSequential()
     {
         using var gpu = TryCreate();

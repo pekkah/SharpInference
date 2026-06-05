@@ -103,5 +103,15 @@ public sealed class Gemma4CudaBatchedPrefillTests
         Assert.True(maxAbs < 1e-2f,
             $"Batched vs sequential logits diverged: maxAbs={maxAbs}, maxRel={maxRel}, " +
             $"bit-exact {exact}/{sequential.Length}.");
+
+        // Every batched primitive is individually bit-identical to its per-token form,
+        // so the assembled trunk should be too — assert a high bit-exact fraction (not
+        // just the loose maxAbs envelope) so a future single-kernel reassociation that
+        // stays under 1e-2 still trips this oracle. The maxAbs check above remains the
+        // net for any driver-level reassociation across the differing grid shapes.
+        float exactFrac = (float)exact / sequential.Length;
+        Assert.True(exactFrac > 0.95f,
+            $"Batched vs sequential only {exact}/{sequential.Length} ({exactFrac:P1}) bit-exact " +
+            $"(expected >95%); maxAbs={maxAbs}.");
     }
 }

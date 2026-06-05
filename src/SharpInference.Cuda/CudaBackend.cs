@@ -2261,6 +2261,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// scores to <paramref name="scoresScratch"/>, which must have room for
     /// <c>numHeads × maxSeqLen</c> floats. Passing a non-null scratch always works.
     /// </summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
     public void Attention(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
                           Tensor? scoresScratch,
                           int numHeads, int numKvHeads, int headDim, int seqLen, int maxSeqLen,
@@ -2300,6 +2301,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// Above that threshold the kernel spills to <paramref name="scoresScratch"/>
     /// which must have room for <c>numHeads × maxSeqLen</c> floats.
     /// </summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
     public void AttentionSwa(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
                              Tensor? scoresScratch,
                              int position, int windowSize, int headDim,
@@ -2341,6 +2343,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// suffices (windowSize ≤ 4096 required). Bit-identical per (head, token) to the
     /// per-token kernel — no global scores scratch needed.
     /// </summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
     public void AttentionSwaBatched(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
         int numHeads, int numKvHeads, int headDim,
         int startPos, int windowSize, int maxSeqLen, int nTok, float attnScale = -1f)
@@ -2489,6 +2492,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// MUST guarantee <c>startPos + nTok ≤ 4096</c> (every block's seqLen stays
     /// ≤ MAX_STORED_SCORES). Beyond that, fall back to the per-token loop.</para>
     /// </summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
     public void AttentionBatched(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
                                  int numHeads, int numKvHeads, int headDim,
                                  int startPos, int maxSeqLen, int nTok, float attnScale = -1f)
