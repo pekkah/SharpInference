@@ -1215,6 +1215,92 @@ extern ""C"" __global__ void llm_matvec_q8_0(
     if (lane == 0) output[row] = result;
 }
 
+// ── MatVec Q8_0 — __dp4a / Q8_1 path (issue #142) ─────────────────────────
+// Decode matvec mirroring llama.cpp's mul_mat_vec_q8_0_q8_1. The input vector is
+// pre-quantized to Q8_1 (36-byte sub-blocks: fp16 d at [0:2], 32 int8 at [4:36]),
+// so each 4-int8 inner product is one __dp4a instruction instead of four
+// int8→float converts + fp32 FMAs — far fewer instructions per byte of weight,
+// pushing the (already memory-coalesced) Q8_0 matvec closer to the HBM ceiling.
+//
+// One output row per block; MATVEC_Q80_NWARPS warps cooperate. Within a warp the
+// 32 lanes split into 4 groups of 8: group g = lane>>3 owns one Q8_0 block of the
+// warp's 4-block stripe; sub-lane s = lane&7 handles int32 word s (4 int8) of that
+// block via one __dp4a. The 8 sub-lane partials are summed (shfl_xor over the
+// group of 8) and scaled by d_w·d_a, then accumulated across the stripe.
+//
+// Q8_0 block = 34 bytes (fp16 d + 32 int8); qs is only 2-byte aligned, so the
+// 4-int8 weight words are assembled with __funnelshift_r from two aligned uint
+// loads (the activation Q8_1 qs at +4 is naturally 4-aligned).
+#define MATVEC_Q80_NWARPS 8
+extern ""C"" __global__ void llm_matvec_q8_0_dp4a(
+    const unsigned int* __restrict__ weights,
+    const unsigned char* __restrict__ y_q81,
+    float* __restrict__ output,
+    int rows, int cols)
+{
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    int warp_id = (int)threadIdx.y;     // 0..NWARPS-1
+    int lane    = (int)threadIdx.x;     // 0..31
+    int grp     = lane >> 3;            // 0..3  block within the warp's 4-block stripe
+    int sub     = lane & 7;             // 0..7  int32 word within the block
+
+    int num_blocks = cols >> 5;         // cols / 32
+    long row_base_bytes = (long)row * (long)num_blocks * 34L;
+
+    float acc = 0.f;
+
+    for (int block0 = warp_id * 4; block0 < num_blocks; block0 += MATVEC_Q80_NWARPS * 4) {
+        int block = block0 + grp;
+        float part = 0.f;
+        if (block < num_blocks) {
+            long b0 = row_base_bytes + (long)block * 34L;
+            unsigned int dlo = sharpi_byte_at(weights, b0);
+            unsigned int dhi = sharpi_byte_at(weights, b0 + 1);
+            float dw = sharpi_fp16_to_fp32(dlo | (dhi << 8));
+
+            // This sub-lane's 4 weight int8 = qs[sub*4 .. sub*4+4) at byte b0+2+sub*4.
+            long wb        = b0 + 2 + (long)sub * 4;
+            long aligned   = wb & ~3L;
+            unsigned int shift = (unsigned int)(wb & 3L) * 8u;
+            unsigned int w_lo = weights[aligned >> 2];
+            int wq;
+            if (shift == 0u) wq = (int)w_lo;
+            else {
+                unsigned int w_hi = weights[(aligned >> 2) + 1];
+                wq = (int)__funnelshift_r(w_lo, w_hi, shift);
+            }
+
+            // Activation Q8_1 sub-block = block; d at base (low 16), 32 int8 at +4.
+            long ab = (long)block * 36L;
+            unsigned int d_bits = (*reinterpret_cast<const unsigned int*>(y_q81 + ab)) & 0xffffu;
+            float da = sharpi_fp16_to_fp32(d_bits);
+            int aq = *reinterpret_cast<const int*>(y_q81 + ab + 4 + (long)sub * 4);
+
+            int dot = __dp4a(wq, aq, 0);
+            part = dw * da * (float)dot;
+        }
+        // Sum the 8 sub-lanes within each aligned group of 8.
+        part += __shfl_xor_sync(0xffffffffu, part, 4);
+        part += __shfl_xor_sync(0xffffffffu, part, 2);
+        part += __shfl_xor_sync(0xffffffffu, part, 1);
+        if (sub == 0) acc += part;
+    }
+
+    // Group leaders (sub==0: lanes 0,8,16,24) hold per-stripe sums; reduce across
+    // the 4 groups and all warps via shared memory.
+    __shared__ float warp_acc[MATVEC_Q80_NWARPS][4];
+    if (sub == 0) warp_acc[warp_id][grp] = acc;
+    __syncthreads();
+    if (warp_id == 0 && lane == 0) {
+        float s = 0.f;
+        #pragma unroll
+        for (int w = 0; w < MATVEC_Q80_NWARPS; w++)
+            for (int g = 0; g < 4; g++) s += warp_acc[w][g];
+        output[row] = s;
+    }
+}
+
 // Q8_0 GEMM-N: N tokens through one weight matrix. grid=( (rows+7)/8, n_tok ).
 // Input [n_tok, cols] and output [n_tok, rows] are offset by token; the per-row
 // accumulation + warp reduce is identical to llm_matvec_q8_0, so this is
@@ -1251,6 +1337,48 @@ extern ""C"" __global__ void llm_matvec_q8_0_gemm_n(
     }
     float result = sharpi_warp_reduce_sum(acc);
     if (lane == 0) output[(long)token * (long)rows + row] = result;
+}
+
+// ── Q8_0 → FP16 dequant for cuBLAS prefill GEMM (issue #141) ───────────────
+// Dequantizes a Q8_0-packed weight matrix [rows × cols] into a row-major fp16
+// matrix [rows × cols]. One block per row (256 threads), each thread strides
+// over the row's columns. Element (row, c): super-block b = c >> 5, lane =
+// c & 31; the per-block fp16 scale d lives at byte (row*nb + b)*34, the int8
+// quant at +2+lane. Stored value d*q is rounded to fp16 — this is the only
+// lossy step vs the fp32 matvec (which keeps d*q*x in fp32), and it's what lets
+// the prefill GEMM read each weight once per batch instead of once per token.
+extern ""C"" __global__ void llm_dequant_q8_0_to_f16(
+    const unsigned int* __restrict__ weights,
+    unsigned short* __restrict__ out,    // [rows * cols] fp16
+    int rows, int cols)
+{
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    int num_blocks = cols >> 5;
+    long row_base_bytes = (long)row * (long)num_blocks * 34L;
+    long out_row = (long)row * (long)cols;
+    for (int c = (int)threadIdx.x; c < cols; c += (int)blockDim.x) {
+        int block = c >> 5;
+        int lane  = c & 31;
+        long b0 = row_base_bytes + (long)block * 34L;
+        unsigned int dlo = sharpi_byte_at(weights, b0 + 0);
+        unsigned int dhi = sharpi_byte_at(weights, b0 + 1);
+        float d = sharpi_fp16_to_fp32(dlo | (dhi << 8));
+        int q = sharpi_int8_at(weights, b0 + 2 + (long)lane);
+        out[out_row + c] = (unsigned short)sharpi_fp32_to_fp16(d * (float)q);
+    }
+}
+
+// ── FP32 → FP16 elementwise convert (issue #141) ──────────────────────────
+// Converts the prefill activation batch [n] fp32 → fp16 so it can feed the
+// cuBLAS fp16 GEMM alongside the dequantized weights.
+extern ""C"" __global__ void llm_f32_to_f16(
+    const float* __restrict__ in,
+    unsigned short* __restrict__ out,
+    int n)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) out[i] = (unsigned short)sharpi_fp32_to_fp16(in[i]);
 }
 
 // ── MatVec F32 — N=2 variant (issue #43) ──────────────────────────────────

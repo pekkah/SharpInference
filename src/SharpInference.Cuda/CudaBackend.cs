@@ -134,6 +134,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // the GPU. Without this, Q8_0 weights would dequant to F32 on upload and
     // blow out VRAM ~2.1×. Geometry mirrors Q5_K/Q6_K (8 rows/block × 32 thr/row).
     private nint   _matvecQ80Kernel;
+    // Issue #142: dp4a/Q8_1 decode matvec (quantize activation to int8, __dp4a dot).
+    private nint   _matvecQ80Dp4aKernel;
     // Issue #43: N=2 (two-input, two-output) variants — read each weight row
     // once and accumulate into two outputs. Used by MTP BatchForward2's
     // on-GPU dense FFN to halve weight-bandwidth cost per output.
@@ -151,6 +153,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _matvecQ5KGemmNKernel;
     private nint   _matvecQ6KGemmNKernel;
     private nint   _matvecQ80GemmNKernel;
+    // Issue #141: compute-bound prefill GEMM — dequant Q8_0 weight + convert
+    // activations to fp16, then one cublasGemmEx (weight read once per batch).
+    private nint   _dequantQ80F16Kernel;
+    private nint   _f32ToF16Kernel;
     // Issue #111: batched trunk elementwise/norm kernels (one launch over N tokens).
     private nint   _rmsNormBatchedKernel;
     private nint   _headNormBatchedKernel;
@@ -220,6 +226,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // N contiguous q81 rows). Grow-only, same policy as _q81Buf.
     private nint   _q81BatchBuf;
     private nuint  _q81BatchBufSize;
+    // Issue #141: fp16 scratch for the prefill GEMM — dequantized weight and
+    // converted activations. Grow-only; sized to the largest trunk matmul.
+    private nint   _gemmWf16Buf;
+    private nuint  _gemmWf16Size;
+    private nint   _gemmAf16Buf;
+    private nuint  _gemmAf16Size;
 
     // Tracks dtype per tensor handle so MatMul can dispatch to the right matvec variant
     // (Q4_K / Q5_K / Q6_K / F32). Norm/bias weights upload as F32; quantized weight bytes
@@ -231,6 +243,16 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     public SgemmPrecision BestSgemmPrecision => _precision;
 
     public bool SupportsGpuDequant => false;
+
+    /// <summary>
+    /// Issue #142: route Q8_0 decode matvecs through the dp4a/Q8_1 kernel
+    /// (<see cref="DispatchMatVecQ80Dp4a"/>) instead of the fp32-decode kernel.
+    /// Default on (<c>SHARPI_Q80_DP4A</c>); the dp4a path quantizes the activation
+    /// to int8 so it is argmax-stable, not bit-exact to the fp32 matvec. Settable so
+    /// bit-parity oracles can pin both sides to the fp32 path.
+    /// </summary>
+    public bool Q80Dp4aEnabled { get; set; } =
+        Environment.GetEnvironmentVariable("SHARPI_Q80_DP4A") != "0";
 
     /// <summary>Total VRAM on the active CUDA device, in bytes. Queried once at backend creation.</summary>
     public ulong VramBytes
@@ -1472,6 +1494,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             DispatchMatVecQ4K(wPtr, xPtr, yPtr, rows, cols);
             return;
         }
+        // Issue #142: Q8_0 decode matvec via dp4a/Q8_1 (cols % 32 == 0 — every LLM
+        // hidden dim qualifies). Falls back to the fp32-decode kernel otherwise.
+        if (weightDType == DType.Q8_0 && Q80Dp4aEnabled && (cols & 31) == 0)
+        {
+            DispatchMatVecQ80Dp4a(wPtr, xPtr, yPtr, rows, cols);
+            return;
+        }
 
         int  pRows = rows, pCols = cols;
         nint* args = stackalloc nint[5]
@@ -1651,6 +1680,128 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>
+    /// Compute-bound batched matmul for prefill (issue #141). Dequantizes the
+    /// Q8_0 <paramref name="matrix"/> [rows×cols] to an fp16 scratch <b>once</b>,
+    /// converts the <paramref name="nTok"/> activation vectors to fp16, then runs a
+    /// single <c>cublasGemmEx</c> (fp16×fp16 → fp32, fp32 accumulate). The
+    /// <see cref="MatMulBatched"/> matvec GEMM-N re-streams the weight matrix once
+    /// per token (memory-bound); this reads each weight once per ~nTok batch, so on
+    /// a compute-rich GPU prefill becomes compute-bound — the ~70× pp512 gap vs
+    /// llama.cpp the matvec path could never close.
+    ///
+    /// <para><b>NOT bit-exact</b> to the matvec path: the weight value <c>d*q</c> and
+    /// each activation are rounded to fp16 before the tensor-core multiply (fp32
+    /// accumulation). Result tracks the fp32 path to fp tolerance (argmax-stable),
+    /// not byte-for-byte. Callers that need byte-parity (GDN/MTP draft verify) must
+    /// use <see cref="MatMulBatched"/>. Q8_0 weights only — other dtypes throw.</para>
+    ///
+    /// Layout matches <see cref="MatMulBatched"/>: <paramref name="inputAll"/> is
+    /// token-major <c>[nTok × cols]</c>, <paramref name="outputAll"/> is
+    /// <c>[nTok × rows]</c>.
+    /// </summary>
+    public void MatMulBatchedGemm(Tensor outputAll, Tensor matrix, Tensor inputAll,
+                                  int nTok, DType weightDType)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available on this system.");
+        if (weightDType != DType.Q8_0)
+            throw new NotSupportedException(
+                $"CUDA MatMulBatchedGemm: weight dtype {weightDType} not supported (Q8_0 only).");
+        if (nTok <= 0)
+            throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be > 0.");
+        if (outputAll.ElementCount % nTok != 0 || inputAll.ElementCount % nTok != 0)
+            throw new ArgumentException(
+                $"MatMulBatchedGemm: outputAll ({outputAll.ElementCount}) and inputAll " +
+                $"({inputAll.ElementCount}) element counts must be divisible by nTok ({nTok}).");
+
+        int rows = (int)(outputAll.ElementCount / nTok);
+        int cols = (int)(inputAll.ElementCount / nTok);
+        if ((cols & 31) != 0)
+            throw new InvalidOperationException(
+                $"CUDA MatMulBatchedGemm requires cols % 32 == 0 (got {cols}).");
+
+        nint wPtr = GetDevPtr(matrix);
+        nint xPtr = GetDevPtr(inputAll);
+        nint yPtr = GetDevPtr(outputAll);
+
+        EnsureGemmWf16((nuint)((long)rows * cols * 2L));
+        EnsureGemmAf16((nuint)((long)nTok * cols * 2L));
+
+        // 1) Dequant Q8_0 weight → fp16 (one block per row).
+        {
+            nint wp = wPtr, op = _gemmWf16Buf;
+            int pRows = rows, pCols = cols;
+            nint* args = stackalloc nint[4] { (nint)(&wp), (nint)(&op), (nint)(&pRows), (nint)(&pCols) };
+            int r = NvrtcInterop.LaunchKernel(_dequantQ80F16Kernel, (uint)rows, 1, 1,
+                                              256, 1, 1, 0, _stream, args, null);
+            if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(dequant_q8_0_to_f16) failed: {r}");
+        }
+
+        // 2) Convert activations fp32 → fp16.
+        {
+            nint ip = xPtr, op = _gemmAf16Buf;
+            int n = nTok * cols;
+            nint* args = stackalloc nint[3] { (nint)(&ip), (nint)(&op), (nint)(&n) };
+            uint grid = (uint)((n + 255) / 256);
+            int r = NvrtcInterop.LaunchKernel(_f32ToF16Kernel, grid, 1, 1,
+                                              256, 1, 1, 0, _stream, args, null);
+            if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(f32_to_f16) failed: {r}");
+        }
+
+        // 3) GemmEx: C[nTok×rows] f32 = A[nTok×cols] f16 × B[rows×cols] f16ᵀ, fp32 accum.
+        //    Row-major via the col-major transpose identity (mirrors Sgemm):
+        //    row-major C=A·Bᵀ ≡ col-major Cᵀ = B·Aᵀ.
+        {
+            float alpha = 1f, beta = 0f;
+            int M = nTok, K = cols, N = rows;
+            int status = CuBlasInterop.GemmEx(
+                _handle,
+                CuBlasInterop.OpT, CuBlasInterop.OpN,
+                N, M, K,
+                ref alpha,
+                _gemmWf16Buf, CuBlasInterop.CUDA_R_16F, K,
+                _gemmAf16Buf, CuBlasInterop.CUDA_R_16F, K,
+                ref beta,
+                yPtr, CuBlasInterop.CUDA_R_32F, N,
+                CuBlasInterop.CUBLAS_COMPUTE_32F,
+                CuBlasInterop.CUBLAS_GEMM_DEFAULT);
+            if (status != 0)
+                throw new InvalidOperationException($"cublasGemmEx (prefill GEMM) failed: {status}");
+        }
+    }
+
+    private void EnsureGemmWf16(nuint required)
+    {
+        if (_gemmWf16Buf != nint.Zero && _gemmWf16Size >= required) return;
+        if (_gemmWf16Buf != nint.Zero)
+        {
+            CuBlasInterop.CudaFree(_gemmWf16Buf);
+            _gemmWf16Buf = nint.Zero;
+            _gemmWf16Size = 0;
+        }
+        nuint newSize = (required + 0xffffu) & ~(nuint)0xffffu;
+        int r = CuBlasInterop.CudaMalloc(out _gemmWf16Buf, newSize);
+        if (r != 0) throw new InvalidOperationException($"cudaMalloc(gemm wf16, {newSize} B) failed: {r}");
+        _gemmWf16Size = newSize;
+    }
+
+    private void EnsureGemmAf16(nuint required)
+    {
+        if (_gemmAf16Buf != nint.Zero && _gemmAf16Size >= required) return;
+        if (_gemmAf16Buf != nint.Zero)
+        {
+            CuBlasInterop.CudaFree(_gemmAf16Buf);
+            _gemmAf16Buf = nint.Zero;
+            _gemmAf16Size = 0;
+        }
+        nuint newSize = (required + 0xffffu) & ~(nuint)0xffffu;
+        int r = CuBlasInterop.CudaMalloc(out _gemmAf16Buf, newSize);
+        if (r != 0) throw new InvalidOperationException($"cudaMalloc(gemm af16, {newSize} B) failed: {r}");
+        _gemmAf16Size = newSize;
+    }
+
+    /// <summary>
     /// Q4_K batched GEMM-N: quantizes all <paramref name="nTok"/> input vectors into a
     /// single contiguous Q8_1 scratch (one launch over <c>nTok × subBlocks</c> blocks —
     /// the per-token quantize is independent so this is bit-identical to per-token
@@ -1823,6 +1974,64 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 _matvecQ4KKernel, (uint)rows, 1, 1,
                 32, 8, 1, 0, _stream, args, null);
             if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_q4k) failed: {rm}");
+        }
+    }
+
+    /// <summary>
+    /// Q8_0 decode matvec via dp4a (issue #142): quantize the input vector to Q8_1
+    /// (32-element sub-blocks), then dispatch <c>llm_matvec_q8_0_dp4a</c> (1 row /
+    /// block, MATVEC_Q80_NWARPS warps). The int8·int8 dp4a inner product replaces
+    /// the per-element int8→float decode of the fp32 matvec, cutting instruction
+    /// count on the bandwidth-bound decode path. Requires <c>cols % 32 == 0</c>.
+    /// </summary>
+    /// <summary>
+    /// Pre-grow the Q8_1 input-quantization scratch to hold a <paramref name="cols"/>-wide
+    /// vector (issue #142). Call before a CUDA-graph capture region that contains a dp4a
+    /// matvec: capture forbids <c>cudaMalloc</c>, so the buffer must already be at its max
+    /// size. No-op if already large enough.
+    /// </summary>
+    public void EnsureQ81Scratch(int cols)
+    {
+        if (cols <= 0) return;
+        int subBlocks = (cols + 31) / 32;
+        EnsureQ81Buf((nuint)((long)subBlocks * 36L));
+    }
+
+    private void DispatchMatVecQ80Dp4a(nint wPtr, nint xPtr, nint yPtr, int rows, int cols)
+    {
+        if ((cols & 31) != 0)
+            throw new InvalidOperationException(
+                $"CUDA matvec_q8_0_dp4a requires cols % 32 == 0 (got {cols}).");
+
+        int subBlocks = cols / 32;
+        nuint q81Bytes = (nuint)((long)subBlocks * 36L);
+        EnsureQ81Buf(q81Bytes);
+
+        // Quantize input → Q8_1 (32 threads per sub-block).
+        {
+            nint qInPtr  = xPtr;
+            nint qOutPtr = _q81Buf;
+            int  qN      = cols;
+            nint* args = stackalloc nint[3] { (nint)(&qInPtr), (nint)(&qOutPtr), (nint)(&qN) };
+            int rq = NvrtcInterop.LaunchKernel(
+                _quantizeQ81Kernel, (uint)subBlocks, 1, 1,
+                32, 1, 1, 0, _stream, args, null);
+            if (rq != 0) throw new InvalidOperationException($"cuLaunchKernel(quantize_q8_1 for q8_0) failed: {rq}");
+        }
+
+        // Cooperative dp4a matvec: 1 row/block, MATVEC_Q80_NWARPS warps × 32 threads.
+        {
+            nint q81Ptr = _q81Buf;
+            int  pRows  = rows, pCols = cols;
+            nint* args = stackalloc nint[5]
+            {
+                (nint)(&wPtr), (nint)(&q81Ptr), (nint)(&yPtr),
+                (nint)(&pRows), (nint)(&pCols)
+            };
+            int rm = NvrtcInterop.LaunchKernel(
+                _matvecQ80Dp4aKernel, (uint)rows, 1, 1,
+                32, 8, 1, 0, _stream, args, null);
+            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_q8_0_dp4a) failed: {rm}");
         }
     }
 
@@ -3919,6 +4128,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _matvecQ5KKernel       = GetKernelFunc("llm_matvec_q5k");
         _matvecQ6KKernel       = GetKernelFunc("llm_matvec_q6k");
         _matvecQ80Kernel       = GetKernelFunc("llm_matvec_q8_0");
+        _matvecQ80Dp4aKernel   = GetKernelFunc("llm_matvec_q8_0_dp4a");
         _matvecF32N2Kernel     = GetKernelFunc("llm_matvec_f32_n2");
         _matvecQ4KN2Kernel     = GetKernelFunc("llm_matvec_q4k_n2");
         _matvecQ5KN2Kernel     = GetKernelFunc("llm_matvec_q5k_n2");
@@ -3928,6 +4138,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _matvecQ5KGemmNKernel  = GetKernelFunc("llm_matvec_q5k_gemm_n");
         _matvecQ6KGemmNKernel  = GetKernelFunc("llm_matvec_q6k_gemm_n");
         _matvecQ80GemmNKernel  = GetKernelFunc("llm_matvec_q8_0_gemm_n");
+        _dequantQ80F16Kernel   = GetKernelFunc("llm_dequant_q8_0_to_f16");
+        _f32ToF16Kernel        = GetKernelFunc("llm_f32_to_f16");
         _rmsNormBatchedKernel  = GetKernelFunc("llm_rmsnorm_batched");
         _headNormBatchedKernel = GetKernelFunc("llm_head_norm_batched");
         _headNormQkKernel        = GetKernelFunc("llm_head_norm_qk");
@@ -4382,6 +4594,18 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             CuBlasInterop.CudaFree(_q81BatchBuf);
             _q81BatchBuf = nint.Zero;
             _q81BatchBufSize = 0;
+        }
+        if (_gemmWf16Buf != nint.Zero)
+        {
+            CuBlasInterop.CudaFree(_gemmWf16Buf);
+            _gemmWf16Buf = nint.Zero;
+            _gemmWf16Size = 0;
+        }
+        if (_gemmAf16Buf != nint.Zero)
+        {
+            CuBlasInterop.CudaFree(_gemmAf16Buf);
+            _gemmAf16Buf = nint.Zero;
+            _gemmAf16Size = 0;
         }
         if (_waveScratchBuf != nint.Zero)
         {
