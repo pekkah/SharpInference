@@ -1006,10 +1006,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             // CPU applies norm BEFORE RoPE (UseL2QkNorm == false).
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
-                _gpu.HeadNorm(qView, _wqNorm![layer], _numHeads, layerHd,
-                    _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
                 if (!kvShared)
-                    _gpu.HeadNorm(kView, _wkNorm![layer], _numKvHeads, layerHd,
+                    _gpu.HeadNormQk(qView, _wqNorm![layer], kView, _wkNorm![layer],
+                        _numHeads, _numKvHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                else
+                    _gpu.HeadNorm(qView, _wqNorm![layer], _numHeads, layerHd,
                         _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             }
 
@@ -1356,9 +1357,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
-                _gpu.HeadNorm(qView, _wqNorm![layer], _numHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
                 if (!kvShared)
-                    _gpu.HeadNorm(kView, _wkNorm![layer], _numKvHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                    _gpu.HeadNormQk(qView, _wqNorm![layer], kView, _wkNorm![layer],
+                        _numHeads, _numKvHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                else
+                    _gpu.HeadNorm(qView, _wqNorm![layer], _numHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             }
             float ropeTheta = isSwa ? _ropeThetaSwa : _hp.RopeTheta;
             if (!isSwa && _gpuRopeFreqs is { } rfTbl)
@@ -1708,9 +1711,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         if (_hasQkNorm && !_hp.UseL2QkNorm)
         {
-            _gpu.HeadNormBatched(qAll, _wqNorm![layer], _numHeads, layerHd, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             if (!kvShared)
-                _gpu.HeadNormBatched(kAll, _wkNorm![layer], _numKvHeads, layerHd, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                _gpu.HeadNormQkBatched(qAll, _wqNorm![layer], kAll, _wkNorm![layer],
+                    _numHeads, _numKvHeads, layerHd, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+            else
+                _gpu.HeadNormBatched(qAll, _wqNorm![layer], _numHeads, layerHd, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
         }
 
         float ropeTheta = isSwa ? _ropeThetaSwa : _hp.RopeTheta;

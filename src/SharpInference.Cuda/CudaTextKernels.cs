@@ -186,6 +186,43 @@ extern ""C"" __global__ void llm_head_norm_pure(
         data[base_off + i] = data[base_off + i] * scale;
 }
 
+// Dual Q+K HeadNorm: Gemma 4 applies the same per-head RmsNorm to Q (num_heads)
+// and K (num_kv_heads) with separate weights. One launch over num_heads+num_kv_heads
+// blocks halves the launch pair; per block this is bit-identical to llm_head_norm.
+extern ""C"" __global__ void llm_head_norm_qk(
+    float* __restrict__ q_data, const float* __restrict__ q_weight,
+    float* __restrict__ k_data, const float* __restrict__ k_weight,
+    int head_dim, int num_heads, int num_kv_heads, float eps, int weight_stride)
+{
+    __shared__ float sdata[256];
+    unsigned int tid = threadIdx.x;
+    unsigned int blk = blockIdx.x;
+    if ((int)blk >= num_heads + num_kv_heads) return;
+
+    bool is_q = (int)blk < num_heads;
+    int head = is_q ? (int)blk : (int)blk - num_heads;
+    float* data = is_q ? q_data : k_data;
+    const float* weight = is_q ? q_weight : k_weight;
+
+    int base_off = head * head_dim;
+    int w_off    = head * weight_stride;
+
+    float sum = 0.f;
+    for (int i = (int)tid; i < head_dim; i += 256) {
+        float v = data[base_off + i];
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);
+    for (int i = (int)tid; i < head_dim; i += 256)
+        data[base_off + i] = data[base_off + i] * scale * weight[w_off + i];
+}
+
 // ── Fused SiLU(gate) * up ──────────────────────────────────────────────────
 // gate[i] = gate[i] / (1 + exp(-gate[i])) * up[i]
 extern ""C"" __global__ void llm_silu_mul(
@@ -1929,6 +1966,46 @@ extern ""C"" __global__ void llm_head_norm_batched(
         __syncthreads();
     }
 
+    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);
+    for (int i = (int)tid; i < head_dim; i += 256)
+        data[base_off + i] = data[base_off + i] * scale * weight[w_off + i];
+}
+
+// Batched dual Q+K HeadNorm over N tokens. grid = (num_heads+num_kv_heads, n_tok);
+// Q blocks stride by num_heads*head_dim, K blocks by num_kv_heads*head_dim. Per
+// (block, token) bit-identical to llm_head_norm_batched.
+extern ""C"" __global__ void llm_head_norm_qk_batched(
+    float* __restrict__ q_data, const float* __restrict__ q_weight,
+    float* __restrict__ k_data, const float* __restrict__ k_weight,
+    int head_dim, int num_heads, int num_kv_heads, float eps, int weight_stride, int n_tok)
+{
+    __shared__ float sdata[256];
+    unsigned int tid = threadIdx.x;
+    unsigned int blk = blockIdx.x;
+    int token = (int)blockIdx.y;
+    if ((int)blk >= num_heads + num_kv_heads || token >= n_tok) return;
+
+    bool is_q = (int)blk < num_heads;
+    int head = is_q ? (int)blk : (int)blk - num_heads;
+    float* data = is_q ? q_data : k_data;
+    const float* weight = is_q ? q_weight : k_weight;
+    int heads_here = is_q ? num_heads : num_kv_heads;
+
+    long token_off = (long)token * (long)heads_here * (long)head_dim;
+    long base_off = token_off + (long)head * head_dim;
+    int  w_off    = head * weight_stride;
+
+    float sum = 0.f;
+    for (int i = (int)tid; i < head_dim; i += 256) {
+        float v = data[base_off + i];
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
     float scale = rsqrtf(sdata[0] / (float)head_dim + eps);
     for (int i = (int)tid; i < head_dim; i += 256)
         data[base_off + i] = data[base_off + i] * scale * weight[w_off + i];

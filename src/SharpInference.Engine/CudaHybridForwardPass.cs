@@ -1721,9 +1721,11 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         // BEFORE RoPE since UseL2QkNorm == false).
         if (_hasQkNorm && !_hp.UseL2QkNorm)
         {
-            _gpu.HeadNorm(qView, _gpuQNorm![i], _numHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             if (!kvShared)
-                _gpu.HeadNorm(kView, _gpuKNorm![i], _numKvHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                _gpu.HeadNormQk(qView, _gpuQNorm![i], kView, _gpuKNorm![i],
+                    _numHeads, _numKvHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+            else
+                _gpu.HeadNorm(qView, _gpuQNorm![i], _numHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             _gpu.RecordBarrier();
         }
 

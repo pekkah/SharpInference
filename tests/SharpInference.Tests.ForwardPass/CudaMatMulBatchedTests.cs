@@ -530,6 +530,72 @@ public sealed unsafe class CudaMatMulBatchedTests
     }
 
     [Fact]
+    public void HeadNormQk_BitwiseMatchesSeparate()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        int numHeads = 16, numKvHeads = 4, headDim = 256;
+        int qDim = numHeads * headDim, kvDim = numKvHeads * headDim;
+        var rng = new Random(909);
+        var qw = Rand(headDim, rng);
+        var kw = Rand(headDim, rng);
+        var qd = Rand(qDim, rng);
+        var kd = Rand(kvDim, rng);
+        var gqw = gpu.Upload(qw, TensorShape.D1(headDim));
+        var gkw = gpu.Upload(kw, TensorShape.D1(headDim));
+
+        // Dual single-token.
+        var gqd = gpu.Upload(qd, TensorShape.D1(qDim));
+        var gkd = gpu.Upload(kd, TensorShape.D1(kvDim));
+        gpu.HeadNormQk(gqd, gqw, gkd, gkw, numHeads, numKvHeads, headDim, 1e-6f, false);
+        gpu.Synchronize();
+        var dualQ = new float[qDim]; gpu.Download(gqd, dualQ);
+        var dualK = new float[kvDim]; gpu.Download(gkd, dualK);
+
+        // Reference: two separate HeadNorm calls.
+        var sqd = gpu.Upload(qd, TensorShape.D1(qDim));
+        var skd = gpu.Upload(kd, TensorShape.D1(kvDim));
+        gpu.HeadNorm(sqd, gqw, numHeads, headDim, 1e-6f, false);
+        gpu.HeadNorm(skd, gkw, numKvHeads, headDim, 1e-6f, false);
+        gpu.Synchronize();
+        var refQ = new float[qDim]; gpu.Download(sqd, refQ);
+        var refK = new float[kvDim]; gpu.Download(skd, refK);
+        for (int i = 0; i < qDim; i++)
+            Assert.Equal(BitConverter.SingleToInt32Bits(refQ[i]), BitConverter.SingleToInt32Bits(dualQ[i]));
+        for (int i = 0; i < kvDim; i++)
+            Assert.Equal(BitConverter.SingleToInt32Bits(refK[i]), BitConverter.SingleToInt32Bits(dualK[i]));
+        gpu.Free(gqd); gpu.Free(gkd); gpu.Free(sqd); gpu.Free(skd);
+
+        // Batched dual vs separate batched.
+        foreach (int nTok in new[] { 3, 17, 40 })
+        {
+            var rng2 = new Random(31 + nTok);
+            var qAll = Rand(nTok * qDim, rng2);
+            var kAllArr = Rand(nTok * kvDim, rng2);
+            var gq = gpu.Upload(qAll, TensorShape.D1((long)nTok * qDim));
+            var gk = gpu.Upload(kAllArr, TensorShape.D1((long)nTok * kvDim));
+            gpu.HeadNormQkBatched(gq, gqw, gk, gkw, numHeads, numKvHeads, headDim, nTok, 1e-6f, false);
+            gpu.Synchronize();
+            var bq = new float[(long)nTok * qDim]; gpu.Download(gq, bq);
+            var bk = new float[(long)nTok * kvDim]; gpu.Download(gk, bk);
+
+            var rq = gpu.Upload(qAll, TensorShape.D1((long)nTok * qDim));
+            var rk = gpu.Upload(kAllArr, TensorShape.D1((long)nTok * kvDim));
+            gpu.HeadNormBatched(rq, gqw, numHeads, headDim, nTok, 1e-6f, false);
+            gpu.HeadNormBatched(rk, gkw, numKvHeads, headDim, nTok, 1e-6f, false);
+            gpu.Synchronize();
+            var refbq = new float[(long)nTok * qDim]; gpu.Download(rq, refbq);
+            var refbk = new float[(long)nTok * kvDim]; gpu.Download(rk, refbk);
+            for (int i = 0; i < bq.Length; i++)
+                Assert.Equal(BitConverter.SingleToInt32Bits(refbq[i]), BitConverter.SingleToInt32Bits(bq[i]));
+            for (int i = 0; i < bk.Length; i++)
+                Assert.Equal(BitConverter.SingleToInt32Bits(refbk[i]), BitConverter.SingleToInt32Bits(bk[i]));
+            gpu.Free(gq); gpu.Free(gk); gpu.Free(rq); gpu.Free(rk);
+        }
+        gpu.Free(gqw); gpu.Free(gkw);
+    }
+
+    [Fact]
     public void RoPEWithFactorsBatched_BitwiseMatchesSingle()
     {
         using var gpu = TryCreate();
