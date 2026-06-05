@@ -58,6 +58,11 @@ _Numbers re-measured across every on-disk row at ~1K ctx so the prefill column i
 before/after figures in the notes are historical. Llama-4 Scout and Qwen3-Coder Vulkan-hybrid keep their
 prior values (not re-runnable on the bench machine)._
 
+**Recommended sampling for Gemma 4 E4B-it:** `--temp 1.0 --top-k 64 --top-p 0.95 --min-p 0 --no-thinking`
+(the Gemma 3/4 family defaults). Gemma 4 E4B-it is **not** a reasoning model, so pass `--no-thinking` —
+without it the chat template renders an `enable_thinking=true` `<think>` block the model wasn't trained to
+fill and the output degenerates. Greedy (`--temp 0`) makes the same failure worse; use the values above.
+
 `--backend auto` (default) picks CUDA when available, sizing the GPU/CPU split from VRAM via TierPlanner;
 falls through to Vulkan only when CUDA isn't present. For hybrid `qwen35moe` models the CUDA backend keeps
 attention KV, the GDN layers, and the shared expert in VRAM; routed-expert dispatch auto-selects between
