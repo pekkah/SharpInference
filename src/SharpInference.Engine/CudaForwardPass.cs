@@ -1812,12 +1812,29 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         var swp = profile ? System.Diagnostics.Stopwatch.StartNew() : null;
         long tEmbed = 0, tPle = 0, tLayers = 0;
 
-        // 1. Embed every token into _bpHidden, then batched embedding scale.
-        for (int i = 0; i < N; i++)
+        // 1. Embed every token into _bpHidden, then batched embedding scale. The Q8_0
+        // table (Gemma 4) goes through a single batched launch instead of 2·N host-
+        // driven EmbedLookup + copy launches (bit-identical); other dtypes keep the loop.
+        var embDType = _embIsQuantized
+            ? _weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K)
+            : DType.Float32;
+        if (_embIsQuantized && embDType == DType.Q8_0)
         {
-            EmbedTokenGpu(tokens[i]);   // writes _hidden
-            _gpu.CopyDeviceRegion(_bpHidden!, (long)i * embDim * sizeof(float),
-                                  _hidden, 0, (long)embDim * sizeof(float));
+            int[] ids = tokens as int[] ?? System.Linq.Enumerable.ToArray(tokens);
+            var idTensor = _gpu.UploadRaw(
+                System.Runtime.InteropServices.MemoryMarshal.AsBytes<int>(ids),
+                TensorShape.D1(N), DType.Float32);
+            _gpu.EmbedLookupQ8_0Batched(_gpuEmbedding, _bpHidden!, idTensor, N, embDim);
+            _gpu.Free(idTensor);
+        }
+        else
+        {
+            for (int i = 0; i < N; i++)
+            {
+                EmbedTokenGpu(tokens[i]);   // writes _hidden
+                _gpu.CopyDeviceRegion(_bpHidden!, (long)i * embDim * sizeof(float),
+                                      _hidden, 0, (long)embDim * sizeof(float));
+            }
         }
         if (_hp.EmbeddingScale != 1f)
             _gpu.ScaleInPlace(_bpHidden!, _hp.EmbeddingScale);

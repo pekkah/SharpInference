@@ -829,6 +829,46 @@ extern ""C"" __global__ void llm_embed_lookup_q8_0(
     }
 }
 
+// Batched Q8_0 embedding lookup: one block per query token (grid.x = n_tok),
+// reading token_ids[blockIdx.x] and writing row blockIdx.x of output. Collapses
+// the prefill's per-token EmbedLookupQ8_0 + copy (2·N host launches) into one
+// launch — the per-token body is identical to llm_embed_lookup_q8_0.
+extern ""C"" __global__ void llm_embed_lookup_q8_0_batched(
+    const unsigned char* __restrict__ emb_data,
+    float* __restrict__ output,           // [n_tok * emb_dim]
+    const int* __restrict__ token_ids,    // [n_tok]
+    int n_tok, int emb_dim)
+{
+    __shared__ unsigned char blk[272];
+    unsigned int tid = threadIdx.x;
+    int i = (int)blockIdx.x;
+    if (i >= n_tok) return;
+
+    int token_id = token_ids[i];
+    float* out_row = output + (long)i * emb_dim;
+    int num_blocks = emb_dim >> 5;
+    long bytes_per_row = (long)num_blocks * 34L;
+    long row_byte_base = (long)token_id * bytes_per_row;
+
+    int outer_iters = emb_dim >> 8;
+    for (int outer = 0; outer < outer_iters; outer++) {
+        long base_byte = row_byte_base + (long)(outer * 8) * 34L;
+        if (tid < 272) blk[tid] = emb_data[base_byte + tid];
+        if (tid < 16)  blk[256 + tid] = emb_data[base_byte + 256 + tid];
+        __syncthreads();
+
+        unsigned int block_in_outer = tid >> 5;
+        unsigned int lane           = tid & 31u;
+        unsigned int block_off = block_in_outer * 34u;
+        unsigned int d_bits = (unsigned int)blk[block_off]
+                            | ((unsigned int)blk[block_off + 1u] << 8);
+        float d = sharpi_fp16_to_fp32(d_bits);
+        int q = (int)(signed char)blk[block_off + 2u + lane];
+        out_row[outer * 256 + (int)tid] = d * (float)q;
+        __syncthreads();
+    }
+}
+
 // ── MatVec F32 ─────────────────────────────────────────────────────────────
 // 256 threads/block, 8 rows/block, 32 threads/row → warp reduce.
 // One grid dim x covers ceil(rows/8) blocks.

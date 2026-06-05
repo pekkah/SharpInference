@@ -126,6 +126,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _embedLookupQ4KKernel;
     private nint   _embedLookupQ5KKernel;
     private nint   _embedLookupQ80Kernel;
+    private nint   _embedLookupQ80BatchedKernel;
     private nint   _matvecF32Kernel;
     private nint   _matvecQ4KKernel;
     private nint   _matvecQ5KKernel;
@@ -3570,6 +3571,35 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(embed_lookup_q8_0) failed: {r}");
     }
 
+    /// <summary>
+    /// Batched Q8_0 embedding lookup: writes all <paramref name="nTok"/> token rows into
+    /// <paramref name="outputAll"/> ([nTok × embDim]) in one launch, reading the per-token
+    /// ids from the device buffer <paramref name="tokenIds"/> (nTok int32). Collapses the
+    /// prefill's per-token <see cref="EmbedLookupQ8_0"/> + device copy (2·N host launches)
+    /// into a single grid.x = nTok launch. Bit-identical to the per-token path.
+    /// </summary>
+    public void EmbedLookupQ8_0Batched(Tensor embTable, Tensor outputAll, Tensor tokenIds, int nTok, int embDim)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if ((embDim & 0xff) != 0)
+            throw new ArgumentException($"EmbedLookupQ8_0Batched requires embDim to be a multiple of 256 (got {embDim}).");
+        if (nTok <= 0)
+            throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be > 0.");
+
+        nint tP = GetDevPtr(embTable);
+        nint oP = GetDevPtr(outputAll);
+        nint idP = GetDevPtr(tokenIds);
+        int pN = nTok, pE = embDim;
+        nint* args = stackalloc nint[5]
+        {
+            (nint)(&tP), (nint)(&oP), (nint)(&idP), (nint)(&pN), (nint)(&pE)
+        };
+        int r = NvrtcInterop.LaunchKernel(_embedLookupQ80BatchedKernel, (uint)nTok, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(embed_lookup_q8_0_batched) failed: {r}");
+    }
+
     /// <summary>Set every element of <paramref name="dst"/> to zero.</summary>
     /// <remarks>
     /// The kernel writes fp32-sized lanes; for sub-fp32 dtypes (e.g. BFloat16)
@@ -4183,7 +4213,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _snapKvScoreKernel, _snapKvScoreBf16Kernel,
             _kvCompactKernel, _kvCompactBf16Kernel,
             _embedLookupF32Kernel, _embedLookupQ4KKernel, _embedLookupQ5KKernel,
-            _embedLookupQ80Kernel,
+            _embedLookupQ80Kernel, _embedLookupQ80BatchedKernel,
             _matvecF32Kernel, _matvecQ4KKernel, _matvecQ5KKernel, _matvecQ6KKernel,
             _matvecQ80Kernel,
             _matvecF32N2Kernel, _matvecQ4KN2Kernel, _matvecQ5KN2Kernel, _matvecQ6KN2Kernel,
@@ -4249,6 +4279,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _embedLookupQ4KKernel  = GetKernelFunc("llm_embed_lookup_q4k");
         _embedLookupQ5KKernel  = GetKernelFunc("llm_embed_lookup_q5k");
         _embedLookupQ80Kernel  = GetKernelFunc("llm_embed_lookup_q8_0");
+        _embedLookupQ80BatchedKernel = GetKernelFunc("llm_embed_lookup_q8_0_batched");
         _matvecF32Kernel       = GetKernelFunc("llm_matvec_f32");
         _matvecQ4KKernel       = GetKernelFunc("llm_matvec_q4k");
         _matvecQ5KKernel       = GetKernelFunc("llm_matvec_q5k");
