@@ -157,6 +157,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // activations to fp16, then one cublasGemmEx (weight read once per batch).
     private nint   _dequantQ80F16Kernel;
     private nint   _f32ToF16Kernel;
+    // Issue #141 (MMQ): int8 tensor-core Q8_0×Q8_1 matmul — weight read once as
+    // int8, no fp16 HBM round-trip, m16n8k32 s8 mma. Replaces the dequant→GEMM path.
+    private nint   _mmqQ80Kernel;
     // Issue #111: batched trunk elementwise/norm kernels (one launch over N tokens).
     private nint   _rmsNormBatchedKernel;
     private nint   _headNormBatchedKernel;
@@ -1768,6 +1771,75 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 CuBlasInterop.CUBLAS_GEMM_DEFAULT);
             if (status != 0)
                 throw new InvalidOperationException($"cublasGemmEx (prefill GEMM) failed: {status}");
+        }
+    }
+
+    /// <summary>
+    /// Issue #141 (MMQ): int8 tensor-core batched matmul for Q8_0 weights.
+    /// C[nTok×rows] f32 = X[nTok×cols] · Wᵀ where W is Q8_0 [rows×cols]. The input is
+    /// quantized to Q8_1 (per-32-block int8 + fp16 scale) and multiplied by the Q8_0
+    /// weight via the m16n8k32 s8 mma — the weight is read once as int8, with no fp16
+    /// dequant temp written to HBM (the cost that capped <see cref="MatMulBatchedGemm"/>).
+    /// Argmax-stable, not bit-exact (both operands are int8-quantized).
+    /// </summary>
+    public void MatMulBatchedMmq(Tensor outputAll, Tensor matrix, Tensor inputAll,
+                                 int nTok, DType weightDType)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available on this system.");
+        if (weightDType != DType.Q8_0)
+            throw new NotSupportedException(
+                $"CUDA MatMulBatchedMmq: weight dtype {weightDType} not supported (Q8_0 only).");
+        if (nTok <= 0)
+            throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be > 0.");
+        if (outputAll.ElementCount % nTok != 0 || inputAll.ElementCount % nTok != 0)
+            throw new ArgumentException(
+                $"MatMulBatchedMmq: outputAll ({outputAll.ElementCount}) and inputAll " +
+                $"({inputAll.ElementCount}) element counts must be divisible by nTok ({nTok}).");
+
+        int rows = (int)(outputAll.ElementCount / nTok);
+        int cols = (int)(inputAll.ElementCount / nTok);
+        if ((cols & 31) != 0)
+            throw new InvalidOperationException(
+                $"CUDA MatMulBatchedMmq requires cols % 32 == 0 (got {cols}).");
+
+        nint wPtr = GetDevPtr(matrix);
+        nint xPtr = GetDevPtr(inputAll);
+        nint yPtr = GetDevPtr(outputAll);
+
+        // 1) Quantize activations [nTok×cols] f32 → contiguous Q8_1 (36 B/block). The
+        //    per-block quantize is independent, so a single launch over nTok×subBlocks
+        //    is bit-identical to per-token quantization (mirrors DispatchMatVecQ4KBatched).
+        int subBlocks = cols / 32;
+        long totalSub = (long)subBlocks * nTok;
+        EnsureQ81BatchBuf((nuint)(totalSub * 36L));
+        {
+            nint qIn = xPtr, qOut = _q81BatchBuf;
+            int qN = (int)((long)cols * nTok);
+            if ((long)cols * nTok > int.MaxValue)
+                throw new InvalidOperationException(
+                    $"MatMulBatchedMmq: cols*nTok ({(long)cols * nTok}) exceeds int range.");
+            nint* args = stackalloc nint[3] { (nint)(&qIn), (nint)(&qOut), (nint)(&qN) };
+            int rq = NvrtcInterop.LaunchKernel(_quantizeQ81Kernel, (uint)totalSub, 1, 1,
+                                               32, 1, 1, 0, _stream, args, null);
+            if (rq != 0) throw new InvalidOperationException($"cuLaunchKernel(quantize_q8_1 mmq) failed: {rq}");
+        }
+
+        // 2) int8 mma MMQ: grid = ((rows+63)/64, (nTok+63)/64), 256 threads/block,
+        //    each block a 64×64 output tile (8 warps × 4 m16n8k32 mma per K-block).
+        {
+            nint q81 = _q81BatchBuf;
+            int pRows = rows, pCols = cols, pN = nTok;
+            nint* args = stackalloc nint[6]
+            {
+                (nint)(&wPtr), (nint)(&q81), (nint)(&yPtr),
+                (nint)(&pRows), (nint)(&pCols), (nint)(&pN)
+            };
+            uint gx = (uint)((rows + 63) / 64), gy = (uint)((nTok + 63) / 64);
+            int rm = NvrtcInterop.LaunchKernel(_mmqQ80Kernel, gx, gy, 1,
+                                               256, 1, 1, 0, _stream, args, null);
+            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(mmq_q8_0) failed: {rm}");
         }
     }
 
@@ -4063,7 +4135,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _matvecQ80Kernel,
             _matvecF32N2Kernel, _matvecQ4KN2Kernel, _matvecQ5KN2Kernel, _matvecQ6KN2Kernel,
             _matvecF32GemmNKernel, _matvecQ4KGemmNKernel, _matvecQ5KGemmNKernel, _matvecQ6KGemmNKernel,
-            _matvecQ80GemmNKernel,
+            _matvecQ80GemmNKernel, _mmqQ80Kernel,
             _rmsNormBatchedKernel, _headNormBatchedKernel, _headNormQkKernel, _headNormQkBatchedKernel,
             _splitQgBatchedKernel, _ropeNeoxPartialBatchedKernel,
             _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel, _attentionSwaBatchedKernel,
@@ -4140,6 +4212,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _matvecQ80GemmNKernel  = GetKernelFunc("llm_matvec_q8_0_gemm_n");
         _dequantQ80F16Kernel   = GetKernelFunc("llm_dequant_q8_0_to_f16");
         _f32ToF16Kernel        = GetKernelFunc("llm_f32_to_f16");
+        _mmqQ80Kernel          = GetKernelFunc("llm_mmq_q8_0");
         _rmsNormBatchedKernel  = GetKernelFunc("llm_rmsnorm_batched");
         _headNormBatchedKernel = GetKernelFunc("llm_head_norm_batched");
         _headNormQkKernel        = GetKernelFunc("llm_head_norm_qk");

@@ -90,6 +90,21 @@ __device__ __forceinline__ int sharpi_int8_at(const unsigned int* __restrict__ b
     return v >= 128 ? v - 256 : v;
 }
 
+// Read a 4-byte little-endian word from a uint32-stride buffer at an arbitrary
+// (possibly 2-byte-aligned) byte offset B. Q8_0 qs start at a 2-byte offset inside
+// each 34-byte block, so a raw int load would be misaligned; this assembles the
+// word from the two covering aligned uints via funnelshift (1 extra load only when
+// B is not 4-aligned). Mirrors llama.cpp's get_int_b2 (vecdotq.cuh).
+__device__ __forceinline__ unsigned int sharpi_uint_at(const unsigned int* __restrict__ buf, long B)
+{
+    long aB = B & ~3L;
+    unsigned int sh = (unsigned int)(B & 3L) * 8u;
+    unsigned int lo = buf[aB >> 2];
+    if (sh == 0u) return lo;
+    unsigned int hi = buf[(aB >> 2) + 1];
+    return __funnelshift_r(lo, hi, sh);
+}
+
 // ── RmsNorm ────────────────────────────────────────────────────────────────
 // output[i] = input[i] / rms * weight[i], rms = sqrt(mean(input^2) + eps).
 // 1 block of 256 threads. Push-equivalent: (n, eps).
@@ -1298,6 +1313,137 @@ extern ""C"" __global__ void llm_matvec_q8_0_dp4a(
         for (int w = 0; w < MATVEC_Q80_NWARPS; w++)
             for (int g = 0; g < 4; g++) s += warp_acc[w][g];
         output[row] = s;
+    }
+}
+
+// ── Q8_0 × Q8_1 int8 tensor-core MMQ (issue #141 prefill) ──────────────────
+// Replaces the dequant→fp16→cuBLAS GEMM round-trip with a direct int8 tensor-core
+// multiply: each Q8_0 weight is read once as int8 (no fp16 weight temp written to
+// HBM) and fed to the m16n8k32 s8 mma. Activations are pre-quantized to the
+// 36-byte/block Q8_1 layout (fp16 d at [0:2], 32 int8 at [4:36]) — the same buffer
+// the dp4a decode matvec uses. result[r,t] = Σ_block ( int32(W_blk·Y_blk) · d_w · d_a ).
+// Q8_0 is symmetric (scale only, no min), so — like llama.cpp's D4 layout — there
+// is NO sum/bias correction term; the activation `s` field is never read.
+//
+// The mma fragment register layout follows the PTX m16n8k32.row.col spec exactly:
+//   groupID = lane>>2 (0..7), tig = lane&3 (0..3)
+//   A(16×32 s8): a0=W[grp][tig*4..], a1=W[grp+8][..], a2=W[grp][16+tig*4..], a3=W[grp+8][..]
+//   B(32×8  s8): b0=Y[tig*4..][grp], b1=Y[16+tig*4..][grp]    (col=token=grp)
+//   C(16×8 s32): c0=[grp][tig*2], c1=[grp][tig*2+1], c2=[grp+8][tig*2], c3=[grp+8][tig*2+1]
+//
+// Shared-tiled: a 256-thread block computes a 64(row)×64(token) output tile, looping
+// K in 32-wide Q8_0 blocks. Each K-block stages the weight + activation sub-tiles
+// into shared once; 8 warps (4 row × 2 col) then run 4 m16n8k32 s8 mma's each,
+// accumulating per-block-scaled products in fp32 registers. Every weight row is read
+// once per (row-block, K-block) and reused across all 64 tokens in the tile — the
+// weight-read-once property the dequant->fp16->cuBLAS path bought with a 2x fp16 HBM
+// temp, here delivered without the temp and on int8 tensor cores (2x fp16 TC peak).
+#define MMQ_BM 64
+#define MMQ_BN 64
+extern ""C"" __global__ void llm_mmq_q8_0(
+    const unsigned int*  __restrict__ weights,   // Q8_0 [rows × cols], 34 B/block
+    const unsigned char* __restrict__ y_q81,     // Q8_1 [n_tok × cols], 36 B/block
+    float* __restrict__ output,                  // [n_tok × rows] fp32
+    int rows, int cols, int n_tok)
+{
+    __shared__ int   sW[MMQ_BM * 8];   // 64 weight rows × 8 int32 (32 int8)
+    __shared__ float sWd[MMQ_BM];      // 64 weight block-scales
+    __shared__ int   sY[MMQ_BN * 8];   // 64 tokens × 8 int32 acts
+    __shared__ float sYd[MMQ_BN];      // 64 act block-scales
+
+    int row_block = (int)blockIdx.x * MMQ_BM;
+    int tok_block = (int)blockIdx.y * MMQ_BN;
+    int nb = cols >> 5;
+
+    int tid  = (int)threadIdx.x;       // 0..255
+    int warp = tid >> 5;               // 0..7
+    int lane = tid & 31;
+    int grp  = lane >> 2;              // 0..7
+    int tig  = lane & 3;               // 0..3
+    int wr   = warp & 3;               // 0..3 row-group → rows [wr*16 : +16]
+    int wc   = warp >> 2;              // 0..1 col-group → tokens [wc*32 : +32]
+    int mrow0 = wr * 16;
+
+    float acc[4][4];                   // 4 N-tiles × 4 C registers, fp32
+    #pragma unroll
+    for (int n = 0; n < 4; n++) { acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.f; }
+
+    for (int kb = 0; kb < nb; kb++) {
+        // Stage weights → sW/sWd (each lane reads 4 int8 = one int32 word).
+        for (int li = tid; li < MMQ_BM * 8; li += 256) {
+            int grow = row_block + (li >> 3);
+            unsigned int v = (grow < rows)
+                ? sharpi_uint_at(weights, ((long)grow * nb + kb) * 34L + 2 + (long)(li & 7) * 4)
+                : 0u;
+            sW[li] = (int)v;
+        }
+        for (int li = tid; li < MMQ_BM; li += 256) {
+            int grow = row_block + li;
+            long wb = ((long)grow * nb + kb) * 34L;
+            sWd[li] = (grow < rows)
+                ? sharpi_fp16_to_fp32(sharpi_byte_at(weights, wb) | (sharpi_byte_at(weights, wb + 1) << 8))
+                : 0.f;
+        }
+        // Stage acts → sY/sYd (int8 region is 4-aligned in the 36-byte Q8_1 block).
+        for (int li = tid; li < MMQ_BN * 8; li += 256) {
+            int gtok = tok_block + (li >> 3);
+            unsigned int v = (gtok < n_tok)
+                ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gtok * nb + kb) * 36L + 4 + (long)(li & 7) * 4)
+                : 0u;
+            sY[li] = (int)v;
+        }
+        for (int li = tid; li < MMQ_BN; li += 256) {
+            int gtok = tok_block + li;
+            sYd[li] = (gtok < n_tok)
+                ? sharpi_fp16_to_fp32((*reinterpret_cast<const unsigned int*>(y_q81 + ((long)gtok * nb + kb) * 36L)) & 0xffffu)
+                : 0.f;
+        }
+        __syncthreads();
+
+        // A fragment for this warp's 16-row tile (read once, reused over 4 N-tiles).
+        int a0 = sW[(mrow0 + grp) * 8     + tig];
+        int a1 = sW[(mrow0 + grp + 8) * 8 + tig];
+        int a2 = sW[(mrow0 + grp) * 8     + tig + 4];
+        int a3 = sW[(mrow0 + grp + 8) * 8 + tig + 4];
+        float dwA = sWd[mrow0 + grp];
+        float dwB = sWd[mrow0 + grp + 8];
+
+        #pragma unroll
+        for (int nt = 0; nt < 4; nt++) {
+            int ncol0 = wc * 32 + nt * 8;
+            int b0 = sY[(ncol0 + grp) * 8 + tig];
+            int b1 = sY[(ncol0 + grp) * 8 + tig + 4];
+            float daC0 = sYd[ncol0 + tig * 2];
+            float daC1 = sYd[ncol0 + tig * 2 + 1];
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            asm(
+              ""mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 ""
+              ""{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};""
+              : ""+r""(c0), ""+r""(c1), ""+r""(c2), ""+r""(c3)
+              : ""r""(a0), ""r""(a1), ""r""(a2), ""r""(a3), ""r""(b0), ""r""(b1));
+            acc[nt][0] += (float)c0 * dwA * daC0;
+            acc[nt][1] += (float)c1 * dwA * daC1;
+            acc[nt][2] += (float)c2 * dwB * daC0;
+            acc[nt][3] += (float)c3 * dwB * daC1;
+        }
+        __syncthreads();
+    }
+
+    int rowA = row_block + mrow0 + grp;
+    int rowB = rowA + 8;
+    #pragma unroll
+    for (int nt = 0; nt < 4; nt++) {
+        int ncol0 = tok_block + wc * 32 + nt * 8;
+        int tokC0 = ncol0 + tig * 2;
+        int tokC1 = ncol0 + tig * 2 + 1;
+        if (rowA < rows) {
+            if (tokC0 < n_tok) output[(long)tokC0 * rows + rowA] = acc[nt][0];
+            if (tokC1 < n_tok) output[(long)tokC1 * rows + rowA] = acc[nt][1];
+        }
+        if (rowB < rows) {
+            if (tokC0 < n_tok) output[(long)tokC0 * rows + rowB] = acc[nt][2];
+            if (tokC1 < n_tok) output[(long)tokC1 * rows + rowB] = acc[nt][3];
+        }
     }
 }
 

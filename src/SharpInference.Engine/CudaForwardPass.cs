@@ -178,6 +178,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// weights always fall back to the matvec GEMM-N regardless.
     /// </summary>
     public bool PrefillGemmEnabled { get; set; }
+    /// <summary>
+    /// Issue #141 (MMQ): route Q8_0 trunk matmuls through the int8 tensor-core MMQ
+    /// kernel (<see cref="CudaBackend.MatMulBatchedMmq"/>) instead of the
+    /// dequant→fp16→cuBLAS GEMM (<see cref="PrefillGemmEnabled"/>). Reads each Q8_0
+    /// weight once as int8 with no fp16 HBM temp, on int8 tensor cores. Takes
+    /// precedence over <see cref="PrefillGemmEnabled"/> when both are set. Default on
+    /// (<c>SHARPI_PREFILL_MMQ</c>=0 reverts to the GEMM path). Argmax-stable, not
+    /// bit-exact (both operands int8-quantized), like the GEMM path it replaces.
+    /// </summary>
+    public bool PrefillMmqEnabled { get; set; }
     private int _bpCapacity;                 // current N the scratch is sized for (0 = none)
     private Tensor? _bpHidden, _bpResidual, _bpNorm;       // [N × embDim]
     private Tensor? _bpQ, _bpAttnOut;                      // [N × numHeads*maxHeadDim]
@@ -276,6 +286,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             Environment.GetEnvironmentVariable("SHARPI_BATCHED_PREFILL") != "0";
         PrefillGemmEnabled =
             Environment.GetEnvironmentVariable("SHARPI_PREFILL_GEMM") != "0";
+        // Issue #141 (MMQ): opt-in during bring-up (SHARPI_PREFILL_MMQ=1); once
+        // benched faster than the GEMM path this becomes the Q8_0 prefill default.
+        PrefillMmqEnabled =
+            Environment.GetEnvironmentVariable("SHARPI_PREFILL_MMQ") == "1";
         _maxHeadDim = _headDim;
         if (hp.LayerHeadDim is { } lhdMax)
             for (int i = 0; i < hp.NumLayers; i++)
@@ -1707,7 +1721,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         }
         if (dt == DType.Q8_0)
         {
-            _gpu.MatMulBatchedGemm(outAll, weights, inAll, n, dt);
+            if (PrefillMmqEnabled)
+                _gpu.MatMulBatchedMmq(outAll, weights, inAll, n, dt);
+            else
+                _gpu.MatMulBatchedGemm(outAll, weights, inAll, n, dt);
         }
         else if (dt == DType.Float32)
         {
