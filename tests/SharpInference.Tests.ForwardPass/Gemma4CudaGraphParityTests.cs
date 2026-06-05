@@ -180,6 +180,71 @@ public sealed class Gemma4CudaGraphParityTests
         }
     }
 
+    [Fact]
+    public void Gemma4_E4B_CudaGraph_AllGpu_SnapKvConfiguredNoEvict_BitMatches()
+    {
+        // Regression guard for the precise SnapKV gate: when a SnapKV budget is
+        // *configured* but the prompt fits under it (no eviction), the KV cache fills
+        // sequentially and the graph's seqLen == position+1 invariant still holds, so
+        // graphs MUST engage (and match bit-for-bit). The coarse "budget > 0" guard
+        // wrongly disabled them here — this is the default-bench scenario (972-token
+        // prompt under the 1024 auto-budget).
+        if (!CudaBackend.IsAvailable()) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        var prev = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_BUDGET");
+        Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", "512"); // configured, but prompt << 512
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            Assert.NotNull(hp.LayerHeadDim);
+
+            int bosId = ReadIntMetadata(model, "tokenizer.ggml.bos_token_id", fallback: 2);
+            var tokens = new int[] { bosId, 818, 5279, 529, 7001, 563 }; // 6 tokens — no eviction
+            const int NSteps = 8;
+
+            var refLogits = new float[NSteps][];
+            var refTokens = new int[NSteps];
+            using (var gpu = TryCreate())
+            {
+                if (gpu is null) return;
+                using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 1024) { UseCudaGraph = false };
+                var logits = fwd.Prefill(tokens);
+                refLogits[0] = logits.ToArray();
+                refTokens[0] = Argmax(logits);
+                int pos = tokens.Length;
+                for (int i = 1; i < NSteps; i++)
+                {
+                    var step = fwd.Forward(refTokens[i - 1], pos++);
+                    refLogits[i] = step.ToArray();
+                    refTokens[i] = Argmax(step);
+                }
+            }
+
+            using (var gpu = TryCreate())
+            {
+                if (gpu is null) return;
+                using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 1024) { UseCudaGraph = true };
+                var logits = fwd.Prefill(tokens);
+                AssertBitIdentical(refLogits[0], logits, step: 0);
+                int pos = tokens.Length;
+                for (int i = 1; i < NSteps; i++)
+                    AssertBitIdentical(refLogits[i], fwd.Forward(refTokens[i - 1], pos++), step: i);
+
+                Assert.True(gpu.GraphReady,
+                    "Graphs must engage when SnapKV is configured but the prompt fits the budget " +
+                    "(no eviction). GraphReady=false means the _snapKvEvicted gate is over-broad " +
+                    "and the default-config win is lost.");
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", prev);
+        }
+    }
+
     private static void AssertBitIdentical(float[] expected, ReadOnlySpan<float> actual, int step)
     {
         Assert.Equal(expected.Length, actual.Length);

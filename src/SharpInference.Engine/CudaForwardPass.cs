@@ -777,6 +777,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private bool _useCudaGraph =
         Environment.GetEnvironmentVariable("SHARPI_CUDA_GRAPH") == "1";
     private bool _graphCaptured;
+    // Set once SnapKV actually compacts the KV cache (K < N) — that's what breaks the
+    // captured seqLen == position+1 invariant. A merely *configured* SnapKV budget that
+    // never evicts (prompt <= budget) leaves the cache filling sequentially, so graphs
+    // stay valid. Reset on a full ResetCache.
+    private bool _snapKvEvicted;
 
     /// <summary>
     /// Enable/disable CUDA-graph capture+replay for the Gemma 4 decode loop. Defaults from
@@ -1151,9 +1156,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             return false;
 
         // Graphs bake in the standard decode invariant (fixed topology, seqLen ==
-        // position+1). SnapKV eviction (variable logical length) and TurboQuant (extra
-        // host-synced rotate/compress ops) break that, so stay on direct launches there.
-        if (_snapKvEffectiveBudget > 0 || _tqEnabled)
+        // position+1). TurboQuant (extra host-synced rotate/compress ops) and an *actual*
+        // SnapKV eviction (cache compacted, so cache-fill != absolute position) break that.
+        // A configured-but-unevicted SnapKV budget does not — the cache still fills
+        // sequentially — so gate on _snapKvEvicted, not on the budget being set.
+        if (_snapKvEvicted || _tqEnabled)
             return false;
 
         // Steady state: graph already captured — just replay at the new position.
@@ -1951,6 +1958,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // CudaForwardPass — actual data lives in _gpuKCache/_gpuVCache.
         _kvLength = K;
         _kvCache.TruncateTo(K);
+        // The cache is now compacted (cache-fill K < absolute position), which breaks the
+        // CUDA-graph seqLen == position+1 invariant — disable graph replay for this
+        // sequence (re-enabled on a full ResetCache).
+        _snapKvEvicted = true;
     }
 
     private void EnsureSnapKvCaptureBuffer(int W)
@@ -2011,6 +2022,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         _tqCompressedLen = 0;
         _fp32WriteIdx = 0;
         _fp32Count = 0;
+        _snapKvEvicted = false; // fresh sequence — standard sequential cache state restored
     }
 
     private void GpuMatMul(Tensor output, Tensor weights, Tensor input)
