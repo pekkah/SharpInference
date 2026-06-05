@@ -5,6 +5,12 @@ namespace SharpInference.Cuda;
 /// <summary>
 /// P/Invoke bindings for cuBLAS and CUDA runtime.
 /// Uses source-generated LibraryImport for NativeAOT compatibility.
+///
+/// Runtime is pinned to the <b>CUDA 12.x</b> SONAMEs (<c>cudart64_12</c> /
+/// <c>cublas64_12</c>) so the runtime/cuBLAS match the NVRTC the kernels are JIT'd
+/// with (<c>nvrtc64_120_0</c>, see <see cref="NvrtcInterop"/>). The driver API
+/// (<c>nvcuda</c>) and CUDA-graph calls are version-independent. On a machine with
+/// several toolkits installed, the loader picks the first 12.x <c>bin</c> on PATH.
 /// </summary>
 internal static partial class CuBlasInterop
 {
@@ -22,13 +28,13 @@ internal static partial class CuBlasInterop
 
     // ── cuBLAS handle lifecycle ──────────────────────────────────────────
 
-    [LibraryImport("cublas64_11", EntryPoint = "cublasCreate_v2")]
+    [LibraryImport("cublas64_12", EntryPoint = "cublasCreate_v2")]
     internal static partial int Create(out nint handle);
 
-    [LibraryImport("cublas64_11", EntryPoint = "cublasDestroy_v2")]
+    [LibraryImport("cublas64_12", EntryPoint = "cublasDestroy_v2")]
     internal static partial int Destroy(nint handle);
 
-    [LibraryImport("cublas64_11", EntryPoint = "cublasSetStream_v2")]
+    [LibraryImport("cublas64_12", EntryPoint = "cublasSetStream_v2")]
     internal static partial int SetStream(nint handle, nint stream);
 
     // CUBLAS_MATH_ALLOW_REDUCED_PRECISION_REDUCTION = 0 means standard FP32.
@@ -36,11 +42,11 @@ internal static partial class CuBlasInterop
     public const int CUBLAS_DEFAULT_MATH = 0;
     public const int CUBLAS_TF32_TENSOR_OP_MATH = 3;
 
-    [LibraryImport("cublas64_11", EntryPoint = "cublasSetMathMode")]
+    [LibraryImport("cublas64_12", EntryPoint = "cublasSetMathMode")]
     internal static partial int SetMathMode(nint handle, int mode);
 
     // ── cublasSgemm: C = alpha*op(A)*op(B) + beta*C (fp32) ──────────────
-    [LibraryImport("cublas64_11", EntryPoint = "cublasSgemm_v2")]
+    [LibraryImport("cublas64_12", EntryPoint = "cublasSgemm_v2")]
     internal static partial int Sgemm(
         nint handle,
         int transa, int transb,
@@ -53,7 +59,7 @@ internal static partial class CuBlasInterop
 
     // ── cublasGemmEx: mixed-precision GEMM (fp16/bf16 in, fp32 accum) ────
     // alpha and beta are float* when computeType == CUBLAS_COMPUTE_32F.
-    [LibraryImport("cublas64_11", EntryPoint = "cublasGemmEx")]
+    [LibraryImport("cublas64_12", EntryPoint = "cublasGemmEx")]
     internal static partial int GemmEx(
         nint handle,
         int transa, int transb,
@@ -68,67 +74,67 @@ internal static partial class CuBlasInterop
 
     // ── CUDA memory management ────────────────────────────────────────────
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaMalloc")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaMalloc")]
     internal static partial int CudaMalloc(out nint devPtr, nuint size);
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaFree")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaFree")]
     internal static partial int CudaFree(nint devPtr);
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaMemcpy")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaMemcpy")]
     internal static partial int CudaMemcpy(nint dst, nint src, nuint count, int kind);
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaMemcpyAsync")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaMemcpyAsync")]
     internal static partial int CudaMemcpyAsync(nint dst, nint src, nuint count, int kind, nint stream);
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaMemcpy2DAsync")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaMemcpy2DAsync")]
     internal static partial int CudaMemcpy2DAsync(
         nint dst, nuint dpitch,
         nint src, nuint spitch,
         nuint width, nuint height,
         int kind, nint stream);
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaDeviceSynchronize")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaDeviceSynchronize")]
     internal static partial int DeviceSync();
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaStreamCreate")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaStreamCreate")]
     internal static partial int StreamCreate(out nint stream);
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaStreamDestroy")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaStreamDestroy")]
     internal static partial int StreamDestroy(nint stream);
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaStreamSynchronize")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaStreamSynchronize")]
     internal static partial int StreamSynchronize(nint stream);
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaRuntimeGetVersion")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaRuntimeGetVersion")]
     internal static partial int RuntimeGetVersion(out int version);
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaDeviceGetAttribute")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaDeviceGetAttribute")]
     internal static partial int DeviceGetAttribute(out int value, int attr, int device);
 
     /// <summary>cudaMemGetInfo: free and total VRAM on the current device, in bytes.</summary>
-    [LibraryImport("cudart64_110", EntryPoint = "cudaMemGetInfo")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaMemGetInfo")]
     internal static partial int MemGetInfo(out nuint free, out nuint total);
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaEventCreate")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaEventCreate")]
     internal static partial int EventCreate(out nint ev);
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaEventCreateWithFlags")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaEventCreateWithFlags")]
     internal static partial int EventCreateWithFlags(out nint ev, uint flags);
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaEventRecord")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaEventRecord")]
     internal static partial int EventRecord(nint ev, nint stream);
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaEventSynchronize")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaEventSynchronize")]
     internal static partial int EventSynchronize(nint ev);
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaEventElapsedTime")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaEventElapsedTime")]
     internal static partial int EventElapsedTime(out float ms, nint start, nint stop);
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaEventDestroy")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaEventDestroy")]
     internal static partial int EventDestroy(nint ev);
 
     /// <summary>cudaEventQuery: 0 = ready (cudaSuccess), 600 = not ready (cudaErrorNotReady).</summary>
-    [LibraryImport("cudart64_110", EntryPoint = "cudaEventQuery")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaEventQuery")]
     internal static partial int EventQuery(nint ev);
 
     /// <summary>
@@ -136,7 +142,7 @@ internal static partial class CuBlasInterop
     /// subsequent work. Cross-stream synchronization primitive — used to fence a compute
     /// stream behind a transfer recorded on an upload stream.
     /// </summary>
-    [LibraryImport("cudart64_110", EntryPoint = "cudaStreamWaitEvent")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaStreamWaitEvent")]
     internal static partial int StreamWaitEvent(nint stream, nint ev, uint flags);
 
     // cudaEventCreate flags
@@ -148,10 +154,10 @@ internal static partial class CuBlasInterop
 
     // ── Pinned host memory (enables DMA-based async transfers) ────────────
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaMallocHost")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaMallocHost")]
     internal static partial int MallocHost(out nint ptr, nuint size);
 
-    [LibraryImport("cudart64_110", EntryPoint = "cudaFreeHost")]
+    [LibraryImport("cudart64_12", EntryPoint = "cudaFreeHost")]
     internal static partial int FreeHost(nint ptr);
 
     // ── Constants ─────────────────────────────────────────────────────────
