@@ -2939,10 +2939,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
             (nint)(&pSP), (nint)(&pWS), (nint)(&pMSL), (nint)(&pN), (nint)(&pKT), (nint)(&pScale)
         };
-        const int faQt = 8;   // FA_QT in the kernel
+        const int faQt = 16;   // FA_QT in the kernel (warps/block = K/V reuse factor)
         uint gy = (uint)((nTok + faQt - 1) / faQt);
         int r = NvrtcInterop.LaunchKernel(_flashAttnPrefillKernel, (uint)numHeads, gy, 1,
-                                          256, 1, 1, sharedBytes, _stream, args, null);
+                                          (uint)(faQt * 32), 1, 1, sharedBytes, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(flash_attn_prefill) failed: {r}");
     }
 

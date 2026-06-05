@@ -3000,7 +3000,8 @@ extern ""C"" __global__ void llm_attention_swa(
 // causal (key ≤ start_pos+qi) + optional sliding window (window_size>0). Matches the
 // scalar kernels to fp tolerance (online softmax reassociates the same sum), not
 // bit-exact. Dynamic shared = 2*kt_tile*head_dim floats (sized by the host to fit).
-#define FA_QT 8
+// FA_QT warps/block = queries sharing each K/V tile load (the reuse factor).
+#define FA_QT 16
 extern ""C"" __global__ void llm_flash_attn_prefill_f32(
     const float* __restrict__ q_all,      // [n_tok, num_heads*head_dim]
     const float* __restrict__ k_cache,
