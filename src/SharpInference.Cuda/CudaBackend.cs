@@ -2921,13 +2921,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             throw new NotSupportedException(
                 $"FlashAttentionPrefill supports head_dim ≤ 512 (16 dims/lane); got {headDim}.");
 
-        // Pick the streaming K-tile so the 2*ktTile*headDim float K/V tile fits a 48 KB
-        // shared budget (no >48 KB opt-in needed): ktTile = 48K / (2*headDim*4).
+        // Pick the streaming K-tile so the per-key shared tile (K fp16 = headDim*2 B +
+        // V fp32 = headDim*4 B = 6*headDim B) fits a 48 KB budget (no >48 KB opt-in).
         const int sharedBudget = 48 * 1024;
-        int ktTile = sharedBudget / (2 * headDim * sizeof(float));
+        int ktTile = sharedBudget / (6 * headDim);
         if (ktTile < 1) ktTile = 1;
         if (ktTile > 32) ktTile = 32;
-        uint sharedBytes = (uint)(2 * ktTile * headDim * sizeof(float));
+        uint sharedBytes = (uint)(6 * ktTile * headDim);
 
         nint qP = GetDevPtr(qAll), kP = GetDevPtr(kCache), vP = GetDevPtr(vCache), oP = GetDevPtr(outAll);
         int pNH = numHeads, pNKV = numKvHeads, pHD = headDim;

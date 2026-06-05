@@ -9,10 +9,10 @@ namespace SharpInference.Tests.ForwardPass;
 /// <c>llm_flash_attn_prefill_f32</c>) against the validated scalar batched kernels
 /// it replaces — <see cref="CudaBackend.AttentionBatched"/> (global) and
 /// <see cref="CudaBackend.AttentionSwaBatched"/> (sliding window). Random Q/K/V are
-/// run through both; the flash kernel's online softmax reassociates the same sum, so
-/// it tracks the reference to fp tolerance, not bit-exactly. Exercises GQA, both
-/// head_dims Gemma 4 uses (256 SWA / 512 global), causal masking, windowing, and a
-/// partial final query tile (nTok % 8 ≠ 0).
+/// run through both; the flash kernel's online softmax reassociates the same sum and
+/// rounds K to fp16 for the half2 QK dot, so it tracks the reference to fp tolerance
+/// (~fp16-relative), not bit-exactly. Exercises GQA, both head_dims Gemma 4 uses
+/// (256 SWA / 512 global), causal masking, windowing, and a partial final query tile.
 ///
 /// Silent no-op on hosts without CUDA, matching the other Cuda* test files.
 /// </summary>
@@ -82,12 +82,13 @@ public sealed unsafe class CudaFlashAttnTests
             {
                 float diff = MathF.Abs(outFla[i] - outRef[i]);
                 maxAbs = MathF.Max(maxAbs, diff);
-                if (diff > 1e-3f * rms) mismatches++;
+                // K is fp16-rounded for the half2 QK dot → ~fp16-relative score error.
+                if (diff > 5e-3f * rms) mismatches++;
             }
             Console.WriteLine(
                 $"Flash nh={nh} nkv={nkv} hd={hd} win={win} nTok={nTok}: maxAbs={maxAbs:E2} rms={rms:E2} mismatches={mismatches}/{outRef.Length}");
             Assert.True(mismatches == 0,
-                $"Flash attention diverged from scalar reference: {mismatches}/{outRef.Length} beyond 1e-3·rms ({rms:E3}), maxAbs={maxAbs:E3} (nh={nh} hd={hd} win={win} nTok={nTok}).");
+                $"Flash attention diverged from scalar reference: {mismatches}/{outRef.Length} beyond 5e-3·rms ({rms:E3}), maxAbs={maxAbs:E3} (nh={nh} hd={hd} win={win} nTok={nTok}).");
         }
     }
 }

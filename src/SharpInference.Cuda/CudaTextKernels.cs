@@ -32,6 +32,35 @@ __device__ __forceinline__ float sharpi_fp16_to_fp32(unsigned int h)
     return result;
 }
 
+// ── half2 (fp16x2) pack / fma / unpack via inline PTX ──────────────────────
+// NVRTC compiles this source without cuda_fp16.h, so the __half2 intrinsics are
+// unavailable; these wrap the raw PTX. A packed fp16x2 lives in one unsigned int
+// (low half = first element). Used by the flash-attention QK dot to do 2 multiply-
+// accumulates per instruction (FP16x2 path, ~2× the fp32 FMA rate) — the scores
+// tolerate fp16-rounded inputs (argmax-stable), and the running sum over only a few
+// pairs per lane keeps fp16 accumulation error negligible (final reduce is fp32).
+__device__ __forceinline__ unsigned int sharpi_f32x2_to_f16x2(float a, float b)
+{
+    unsigned int r;
+    asm(""{ .reg .b16 lo, hi; cvt.rn.f16.f32 lo, %1; cvt.rn.f16.f32 hi, %2; mov.b32 %0, {lo, hi}; }""
+        : ""=r""(r) : ""f""(a), ""f""(b));
+    return r;
+}
+__device__ __forceinline__ unsigned int sharpi_hfma2(unsigned int a, unsigned int b, unsigned int acc)
+{
+    unsigned int r;
+    asm(""fma.rn.f16x2 %0, %1, %2, %3;"" : ""=r""(r) : ""r""(a), ""r""(b), ""r""(acc));
+    return r;
+}
+// Sum the low and high fp16 halves of a packed fp16x2 into one fp32.
+__device__ __forceinline__ float sharpi_f16x2_sum(unsigned int p)
+{
+    float lo, hi;
+    asm(""{ .reg .b16 l, h; mov.b32 {l, h}, %2; cvt.f32.f16 %0, l; cvt.f32.f16 %1, h; }""
+        : ""=f""(lo), ""=f""(hi) : ""r""(p));
+    return lo + hi;
+}
+
 // Warp-level sum reduction over 32 lanes (full-warp mask).
 __device__ __forceinline__ float sharpi_warp_reduce_sum(float v)
 {
@@ -3011,9 +3040,14 @@ extern ""C"" __global__ void llm_flash_attn_prefill_f32(
     int start_pos, int window_size, int max_seq_len, int n_tok,
     int kt_tile, float attn_scale)
 {
-    extern __shared__ float fa_smem[];    // [kt_tile*head_dim] K then [kt_tile*head_dim] V
-    float* sK = fa_smem;
-    float* sV = fa_smem + kt_tile * head_dim;
+    // Dynamic shared: K as fp16 (half2-packed, hd/2 uints/key) then V as fp32. K is
+    // read with the half2 QK dot (fp16-rounded inputs — argmax-stable); V stays fp32
+    // for the exact scalar PV. Each lane owns dim-PAIRS pi = lane+32*p (dims 2·pi,
+    // 2·pi+1) so the shared half2 loads stay coalesced. host sizes 6·kt_tile·head_dim B.
+    extern __shared__ unsigned int fa_smem[];
+    int hd2 = head_dim >> 1;                       // pairs per key
+    unsigned int* sKh = fa_smem;                   // [kt_tile * hd2] fp16x2
+    float* sV = (float*)(fa_smem + kt_tile * hd2); // [kt_tile * head_dim] fp32
 
     int h     = (int)blockIdx.x;
     int warp  = (int)(threadIdx.x >> 5);  // 0..FA_QT-1  (query within the tile)
@@ -3025,7 +3059,7 @@ extern ""C"" __global__ void llm_flash_attn_prefill_f32(
     int kv_dim  = num_kv_heads * head_dim;
     float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
     int q_dim   = num_heads * head_dim;
-    int ndj     = (head_dim + 31) >> 5;   // dims per lane (≤16)
+    int ndj2    = (hd2 + 31) >> 5;        // dim-pairs per lane (≤8)
 
     bool active = (qi < n_tok);
     int qpos    = start_pos + qi;
@@ -3033,14 +3067,15 @@ extern ""C"" __global__ void llm_flash_attn_prefill_f32(
     int win_start = (window_size > 0) ? (win_end - window_size) : 0;
     if (win_start < 0) win_start = 0;
 
-    float qreg[16], oreg[16];
+    unsigned int qh2[8];                 // this query's dim-pairs, fp16x2-packed
+    float oreg[16];                      // PV accumulator, fp32, 2 per pair
     #pragma unroll
-    for (int j = 0; j < 16; j++) { qreg[j] = 0.f; oreg[j] = 0.f; }
+    for (int p = 0; p < 8; p++) { qh2[p] = 0u; oreg[2 * p] = 0.f; oreg[2 * p + 1] = 0.f; }
     if (active) {
         long q_base = (long)qi * q_dim + (long)h * head_dim;
-        for (int j = 0; j < ndj; j++) {
-            int d = lane + 32 * j;
-            if (d < head_dim) qreg[j] = q_all[q_base + d];
+        for (int p = 0; p < ndj2; p++) {
+            int pi = lane + 32 * p;
+            if (pi < hd2) qh2[p] = sharpi_f32x2_to_f16x2(q_all[q_base + 2 * pi], q_all[q_base + 2 * pi + 1]);
         }
     }
     float m_run = sharpi_neg_inf();
@@ -3058,17 +3093,22 @@ extern ""C"" __global__ void llm_flash_attn_prefill_f32(
         int tile_keys = blk_key_end - kt0;
         if (tile_keys > kt_tile) tile_keys = kt_tile;
 
-        for (int idx = tid; idx < kt_tile * head_dim; idx += (int)blockDim.x) {
-            int kk = idx / head_dim;
-            int d  = idx - kk * head_dim;
-            float kv_k = 0.f, kv_v = 0.f;
+        // Stage K (fp32 global → fp16x2 shared, one pair/thread-step).
+        for (int idx = tid; idx < kt_tile * hd2; idx += (int)blockDim.x) {
+            int kk = idx / hd2, pr = idx - kk * hd2;
+            unsigned int kh = 0u;
             if (kk < tile_keys) {
-                long off = (long)(kt0 + kk) * kv_dim + (long)kv_head * head_dim + d;
-                kv_k = k_cache[off];
-                kv_v = v_cache[off];
+                long off = (long)(kt0 + kk) * kv_dim + (long)kv_head * head_dim + 2 * pr;
+                kh = sharpi_f32x2_to_f16x2(k_cache[off], k_cache[off + 1]);
             }
-            sK[idx] = kv_k;
-            sV[idx] = kv_v;
+            sKh[idx] = kh;
+        }
+        // Stage V (fp32 → fp32 shared).
+        for (int idx = tid; idx < kt_tile * head_dim; idx += (int)blockDim.x) {
+            int kk = idx / head_dim, d = idx - kk * head_dim;
+            sV[idx] = (kk < tile_keys)
+                ? v_cache[(long)(kt0 + kk) * kv_dim + (long)kv_head * head_dim + d]
+                : 0.f;
         }
         __syncthreads();
 
@@ -3076,11 +3116,12 @@ extern ""C"" __global__ void llm_flash_attn_prefill_f32(
             for (int kk = 0; kk < tile_keys; kk++) {
                 int abs_t = kt0 + kk;
                 if (abs_t >= win_end || abs_t < win_start) continue;  // warp-uniform
-                float part = 0.f;
-                for (int j = 0; j < ndj; j++) {
-                    int d = lane + 32 * j;
-                    if (d < head_dim) part += qreg[j] * sK[kk * head_dim + d];
+                unsigned int acc = 0u;
+                for (int p = 0; p < ndj2; p++) {
+                    int pi = lane + 32 * p;
+                    if (pi < hd2) acc = sharpi_hfma2(qh2[p], sKh[kk * hd2 + pi], acc);
                 }
+                float part = sharpi_f16x2_sum(acc);
                 part += __shfl_xor_sync(0xffffffffu, part, 16);
                 part += __shfl_xor_sync(0xffffffffu, part, 8);
                 part += __shfl_xor_sync(0xffffffffu, part, 4);
@@ -3089,12 +3130,14 @@ extern ""C"" __global__ void llm_flash_attn_prefill_f32(
                 float score = part * scale;
                 float m_new = fmaxf(m_run, score);
                 float alpha = __expf(m_run - m_new);
-                float p     = __expf(score - m_new);
-                l_run = l_run * alpha + p;
-                for (int j = 0; j < ndj; j++) {
-                    int d = lane + 32 * j;
-                    float vv = (d < head_dim) ? sV[kk * head_dim + d] : 0.f;
-                    oreg[j] = oreg[j] * alpha + p * vv;
+                float pw    = __expf(score - m_new);
+                l_run = l_run * alpha + pw;
+                for (int p = 0; p < ndj2; p++) {
+                    int pi = lane + 32 * p;
+                    float v0 = (pi < hd2) ? sV[kk * head_dim + 2 * pi]     : 0.f;
+                    float v1 = (pi < hd2) ? sV[kk * head_dim + 2 * pi + 1] : 0.f;
+                    oreg[2 * p]     = oreg[2 * p]     * alpha + pw * v0;
+                    oreg[2 * p + 1] = oreg[2 * p + 1] * alpha + pw * v1;
                 }
                 m_run = m_new;
             }
@@ -3105,9 +3148,12 @@ extern ""C"" __global__ void llm_flash_attn_prefill_f32(
     if (active) {
         float inv = (l_run > 0.f) ? (1.f / l_run) : 0.f;
         long o_base = (long)qi * q_dim + (long)h * head_dim;
-        for (int j = 0; j < ndj; j++) {
-            int d = lane + 32 * j;
-            if (d < head_dim) out_all[o_base + d] = oreg[j] * inv;
+        for (int p = 0; p < ndj2; p++) {
+            int pi = lane + 32 * p;
+            if (pi < hd2) {
+                out_all[o_base + 2 * pi]     = oreg[2 * p]     * inv;
+                out_all[o_base + 2 * pi + 1] = oreg[2 * p + 1] * inv;
+            }
         }
     }
 }
