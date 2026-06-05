@@ -186,6 +186,43 @@ extern ""C"" __global__ void llm_head_norm_pure(
         data[base_off + i] = data[base_off + i] * scale;
 }
 
+// Dual Q+K HeadNorm: Gemma 4 applies the same per-head RmsNorm to Q (num_heads)
+// and K (num_kv_heads) with separate weights. One launch over num_heads+num_kv_heads
+// blocks halves the launch pair; per block this is bit-identical to llm_head_norm.
+extern ""C"" __global__ void llm_head_norm_qk(
+    float* __restrict__ q_data, const float* __restrict__ q_weight,
+    float* __restrict__ k_data, const float* __restrict__ k_weight,
+    int head_dim, int num_heads, int num_kv_heads, float eps, int weight_stride)
+{
+    __shared__ float sdata[256];
+    unsigned int tid = threadIdx.x;
+    unsigned int blk = blockIdx.x;
+    if ((int)blk >= num_heads + num_kv_heads) return;
+
+    bool is_q = (int)blk < num_heads;
+    int head = is_q ? (int)blk : (int)blk - num_heads;
+    float* data = is_q ? q_data : k_data;
+    const float* weight = is_q ? q_weight : k_weight;
+
+    int base_off = head * head_dim;
+    int w_off    = head * weight_stride;
+
+    float sum = 0.f;
+    for (int i = (int)tid; i < head_dim; i += 256) {
+        float v = data[base_off + i];
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);
+    for (int i = (int)tid; i < head_dim; i += 256)
+        data[base_off + i] = data[base_off + i] * scale * weight[w_off + i];
+}
+
 // ── Fused SiLU(gate) * up ──────────────────────────────────────────────────
 // gate[i] = gate[i] / (1 + exp(-gate[i])) * up[i]
 extern ""C"" __global__ void llm_silu_mul(
@@ -210,6 +247,25 @@ extern ""C"" __global__ void llm_gelu_tanh_mul(
     float g = gate[i];
     float inner = 0.7978845608f * (g + 0.044715f * g * g * g);
     gate[i] = 0.5f * g * (1.0f + tanhf(inner)) * up[i];
+}
+
+// Strided-up variant: gate is [n_tok × width] contiguous; the up operand for
+// token t lives at up + t*up_stride + up_offset (width contiguous floats). Lets
+// batched PLE inject the per-layer slice of a [n_tok × (L*pleWidth)] projection
+// buffer without a gather. Per element bit-identical to llm_gelu_tanh_mul.
+extern ""C"" __global__ void llm_gelu_tanh_mul_strided(
+    float* __restrict__ gate, const float* __restrict__ up,
+    int width, long up_stride, long up_offset, int n_tok)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)n_tok * (long)width;
+    if (idx >= total) return;
+    long t = idx / width;
+    long j = idx % width;
+    float g = gate[idx];
+    float inner = 0.7978845608f * (g + 0.044715f * g * g * g);
+    float u = up[t * up_stride + up_offset + j];
+    gate[idx] = 0.5f * g * (1.0f + tanhf(inner)) * u;
 }
 
 // ── Final-logit softcap (in place) ─────────────────────────────────────────
@@ -371,6 +427,39 @@ extern ""C"" __global__ void llm_rope_neox_with_factors(
     int head_base = h * head_dim;
     int a = head_base + i;
     int b = head_base + i + half_dim;
+    float x0 = x[a];
+    float x1 = x[b];
+    x[a] = x0 * c - x1 * s;
+    x[b] = x0 * s + x1 * c;
+}
+
+// Batched NEOX-with-factors RoPE over N tokens (Gemma 4 global layers in batched
+// prefill). Position for token t is base_position + t; x row stride = num_heads*
+// head_dim. Per row this is bit-identical to llm_rope_neox_with_factors.
+extern ""C"" __global__ void llm_rope_neox_with_factors_batched(
+    float* __restrict__ x,
+    int num_heads, int head_dim, int base_position, float theta,
+    const float* __restrict__ freq_factors, int n_tok)
+{
+    int pair_idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int half_dim = head_dim / 2;
+    int total_pairs = num_heads * half_dim;
+    int token = (int)blockIdx.y;
+    if (pair_idx >= total_pairs || token >= n_tok) return;
+
+    int h = pair_idx / half_dim;
+    int i = pair_idx % half_dim;
+    int position = base_position + token;
+
+    float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)head_dim);
+    freq /= freq_factors[i];
+    float angle = (float)position * freq;
+    float c = cosf(angle);
+    float s = sinf(angle);
+
+    long head_base = (long)token * (long)num_heads * (long)head_dim + (long)h * head_dim;
+    long a = head_base + i;
+    long b = head_base + i + half_dim;
     float x0 = x[a];
     float x1 = x[b];
     x[a] = x0 * c - x1 * s;
@@ -1126,6 +1215,44 @@ extern ""C"" __global__ void llm_matvec_q8_0(
     if (lane == 0) output[row] = result;
 }
 
+// Q8_0 GEMM-N: N tokens through one weight matrix. grid=( (rows+7)/8, n_tok ).
+// Input [n_tok, cols] and output [n_tok, rows] are offset by token; the per-row
+// accumulation + warp reduce is identical to llm_matvec_q8_0, so this is
+// bit-identical to n_tok sequential matvecs. (Weights are re-read per token —
+// the launch-count collapse is the win; weight-reuse tiling is a follow-up.)
+extern ""C"" __global__ void llm_matvec_q8_0_gemm_n(
+    const unsigned int* __restrict__ weights,
+    const float* __restrict__ input,   // [n_tok, cols]
+    float* __restrict__ output,        // [n_tok, rows]
+    int rows, int cols, int n_tok)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    int token = (int)blockIdx.y;
+    if (row >= rows || token >= n_tok) return;
+
+    int num_blocks = cols >> 5;
+    long row_base_bytes = (long)row * (long)num_blocks * 34L;
+    const float* in = input + (long)token * (long)cols;
+
+    float acc = 0.f;
+    for (int block = 0; block < num_blocks; block++) {
+        long b0 = row_base_bytes + (long)block * 34L;
+        unsigned int dlo = sharpi_byte_at(weights, b0 + 0);
+        unsigned int dhi = sharpi_byte_at(weights, b0 + 1);
+        float d = sharpi_fp16_to_fp32(dlo | (dhi << 8));
+        int q = sharpi_int8_at(weights, b0 + 2 + (long)lane);
+        float x = in[block * 32 + lane];
+        acc += d * (float)q * x;
+    }
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output[(long)token * (long)rows + row] = result;
+}
+
 // ── MatVec F32 — N=2 variant (issue #43) ──────────────────────────────────
 // Two input vectors, two output vectors, single weight read. Mirrors the
 // llm_matvec_f32 launch geometry (8 rows × 32 threads/row). Wins over two
@@ -1844,6 +1971,46 @@ extern ""C"" __global__ void llm_head_norm_batched(
         data[base_off + i] = data[base_off + i] * scale * weight[w_off + i];
 }
 
+// Batched dual Q+K HeadNorm over N tokens. grid = (num_heads+num_kv_heads, n_tok);
+// Q blocks stride by num_heads*head_dim, K blocks by num_kv_heads*head_dim. Per
+// (block, token) bit-identical to llm_head_norm_batched.
+extern ""C"" __global__ void llm_head_norm_qk_batched(
+    float* __restrict__ q_data, const float* __restrict__ q_weight,
+    float* __restrict__ k_data, const float* __restrict__ k_weight,
+    int head_dim, int num_heads, int num_kv_heads, float eps, int weight_stride, int n_tok)
+{
+    __shared__ float sdata[256];
+    unsigned int tid = threadIdx.x;
+    unsigned int blk = blockIdx.x;
+    int token = (int)blockIdx.y;
+    if ((int)blk >= num_heads + num_kv_heads || token >= n_tok) return;
+
+    bool is_q = (int)blk < num_heads;
+    int head = is_q ? (int)blk : (int)blk - num_heads;
+    float* data = is_q ? q_data : k_data;
+    const float* weight = is_q ? q_weight : k_weight;
+    int heads_here = is_q ? num_heads : num_kv_heads;
+
+    long token_off = (long)token * (long)heads_here * (long)head_dim;
+    long base_off = token_off + (long)head * head_dim;
+    int  w_off    = head * weight_stride;
+
+    float sum = 0.f;
+    for (int i = (int)tid; i < head_dim; i += 256) {
+        float v = data[base_off + i];
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);
+    for (int i = (int)tid; i < head_dim; i += 256)
+        data[base_off + i] = data[base_off + i] * scale * weight[w_off + i];
+}
+
 // Strided de-interleave [Q‖G] → Q, G over N tokens. qg row stride =
 // num_heads*head_dim*2; q/g row stride = num_heads*head_dim.
 extern ""C"" __global__ void llm_split_qg_batched(
@@ -2327,7 +2494,7 @@ extern ""C"" __global__ void llm_attention(
     float* __restrict__ out,
     float* __restrict__ scores_scratch,    // [num_heads * max_seq_len], null when seq_len ≤ MAX_STORED_SCORES
     int num_heads, int num_kv_heads, int head_dim,
-    int seq_len, int max_seq_len)
+    int seq_len, int max_seq_len, float attn_scale)
 {
     const int MAX_STORED_SCORES = 4096;
     __shared__ float shared_scores[MAX_STORED_SCORES];
@@ -2339,7 +2506,7 @@ extern ""C"" __global__ void llm_attention(
 
     int kv_head = (int)h / (num_heads / num_kv_heads);
     int kv_dim  = num_kv_heads * head_dim;
-    float scale = rsqrtf((float)head_dim);
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
     long q_off  = (long)h * (long)head_dim;
     long out_off = q_off;
 
@@ -2434,7 +2601,7 @@ extern ""C"" __global__ void llm_attention_swa(
     float* __restrict__ out,
     float* __restrict__ scores_scratch,    // [num_heads * max_seq_len], null when eff_seq ≤ MAX_STORED_SCORES
     int num_heads, int num_kv_heads, int head_dim,
-    int window_start, int window_end, int max_seq_len)
+    int window_start, int window_end, int max_seq_len, float attn_scale)
 {
     const int MAX_STORED_SCORES = 4096;
     __shared__ float shared_scores[MAX_STORED_SCORES];
@@ -2446,7 +2613,7 @@ extern ""C"" __global__ void llm_attention_swa(
 
     int kv_head = (int)h / (num_heads / num_kv_heads);
     int kv_dim  = num_kv_heads * head_dim;
-    float scale = rsqrtf((float)head_dim);
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
     long q_off  = (long)h * (long)head_dim;
     long out_off = q_off;
 
@@ -2526,6 +2693,96 @@ extern ""C"" __global__ void llm_attention_swa(
             acc += weight * v_cache[v_off + d];
         }
         out[out_off + d] = acc;
+    }
+}
+
+// Batched sliding-window attention over N query tokens (Gemma 4 SWA layers in
+// batched-trunk prefill). Grid = (num_heads, n_tok); query token i sits at
+// absolute position start_pos+i and attends [max(0,pos+1-window), pos+1). The
+// window bounds eff_seq ≤ window_size, so the shared-scores path always suffices
+// (window_size ≤ MAX_STORED_SCORES required by the dispatch). Per (head, token)
+// this is bit-identical to the per-token llm_attention_swa.
+extern ""C"" __global__ void llm_attention_swa_batched(
+    const float* __restrict__ q_all,      // [n_tok, num_heads*head_dim]
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ out_all,          // [n_tok, num_heads*head_dim]
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int window_size, int max_seq_len, int n_tok, float attn_scale)
+{
+    const int MAX_STORED_SCORES = 4096;
+    __shared__ float shared_scores[MAX_STORED_SCORES];
+    __shared__ float sdata[256];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int h = blockIdx.x;
+    int i = (int)blockIdx.y;
+    if ((int)h >= num_heads || i >= n_tok) return;
+
+    int window_end = start_pos + i + 1;
+    int window_start = window_end - window_size;
+    if (window_start < 0) window_start = 0;
+    int eff_seq = window_end - window_start;
+    if (eff_seq <= 0) return;
+
+    int kv_head = (int)h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
+    int q_dim = num_heads * head_dim;
+    const float* q = q_all + (long)i * q_dim;
+    float* out = out_all + (long)i * q_dim;
+    long q_off = (long)h * (long)head_dim;
+    long out_off = q_off;
+
+    for (int t = (int)tid; t < eff_seq; t += 256) {
+        int abs_t = t + window_start;
+        float dot = 0.f;
+        long k_off = (long)abs_t * (long)kv_dim + (long)kv_head * (long)head_dim;
+        for (int dd = 0; dd < head_dim; dd++)
+            dot += q[q_off + dd] * k_cache[k_off + dd];
+        shared_scores[t] = dot * scale;
+    }
+    __syncthreads();
+
+    float local_max = sharpi_neg_inf();
+    for (int t = (int)tid; t < eff_seq; t += 256)
+        local_max = fmaxf(local_max, shared_scores[t]);
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
+
+    float local_sum = 0.f;
+    for (int t = (int)tid; t < eff_seq; t += 256) {
+        float ev = __expf(shared_scores[t] - max_val);
+        shared_scores[t] = ev;
+        local_sum += ev;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+    __syncthreads();
+
+    for (int t = (int)tid; t < eff_seq; t += 256)
+        shared_scores[t] *= inv_sum;
+    __syncthreads();
+
+    for (int dd = (int)tid; dd < head_dim; dd += 256) {
+        float acc = 0.f;
+        for (int t = 0; t < eff_seq; t++) {
+            int abs_t = t + window_start;
+            long v_off = (long)abs_t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            acc += shared_scores[t] * v_cache[v_off + dd];
+        }
+        out[out_off + dd] = acc;
     }
 }
 
@@ -3330,7 +3587,7 @@ extern ""C"" __global__ void llm_full_seq_attention(
     const float* __restrict__ v_cache,
     float* __restrict__ out_all,          // [n_tok, num_heads*head_dim]
     int num_heads, int num_kv_heads, int head_dim,
-    int start_pos, int max_seq_len, int n_tok)
+    int start_pos, int max_seq_len, int n_tok, float attn_scale)
 {
     const int MAX_STORED_SCORES = 4096;
     __shared__ float shared_scores[MAX_STORED_SCORES];
@@ -3344,7 +3601,7 @@ extern ""C"" __global__ void llm_full_seq_attention(
     int seq_len = start_pos + i + 1;
     int kv_head = (int)h / (num_heads / num_kv_heads);
     int kv_dim  = num_kv_heads * head_dim;
-    float scale = rsqrtf((float)head_dim);
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
     int q_dim = num_heads * head_dim;
     const float* q = q_all + (long)i * q_dim;
     float* out = out_all + (long)i * q_dim;

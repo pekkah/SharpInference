@@ -137,8 +137,9 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     private readonly float* _projPerLayer;    // [stackedDim] f32 — per-layer projection cache
     private readonly float* _pleX;            // [pleWidth] f32
     private readonly float* _pleY;            // [embDim]  f32
-    // Per-token PLE scratch (GPU) — slice upload + on-GPU injection.
-    private readonly Tensor? _gpuPleSliceUp;  // [pleWidth] f32, uploaded per GPU layer
+    // Per-token PLE scratch (GPU) — full projection uploaded once, viewed per layer.
+    private readonly Tensor? _gpuProjPerLayerGpu;  // [nGpu*pleWidth] f32, one H2D/token
+    private readonly Tensor[]? _gpuProjSliceViews; // [nGpu] static views into the above
     private readonly Tensor? _gpuPleX;        // [pleWidth] f32
     private readonly Tensor? _gpuPleY;        // [embDim] f32
     private readonly int _pleWidth;
@@ -717,7 +718,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                     _gpuPleProj[i]     = UploadWeight($"blk.{i}.proj.weight");
                     _gpuPlePostNorm[i] = UploadWeight($"blk.{i}.post_norm.weight");
                 }
-                _gpuPleSliceUp = gpu.Allocate(TensorShape.D1(_pleWidth));
+                _gpuProjPerLayerGpu = gpu.Allocate(TensorShape.D1(_nGpuLayers * _pleWidth));
+                _gpuProjSliceViews  = new Tensor[_nGpuLayers];
+                for (int i = 0; i < _nGpuLayers; i++)
+                    _gpuProjSliceViews[i] = gpu.View(_gpuProjPerLayerGpu, (long)i * _pleWidth, _pleWidth);
                 _gpuPleX       = gpu.Allocate(TensorShape.D1(_pleWidth));
                 _gpuPleY       = gpu.Allocate(TensorShape.D1(_embDim));
             }
@@ -1590,6 +1594,15 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             CopyGpuBuffer(_gpuHidden, _pinnedHidden);
             _gpu.RecordBarrier();
 
+            // Upload the full per-layer PLE projection once (was L tiny per-layer
+            // uploads): GPU layer i reads slice i via a static non-owning view.
+            if (_hp.HasPerLayerTokenEmbd && _gpuInpGate is not null)
+            {
+                _gpu.UploadInto(_gpuProjPerLayerGpu!,
+                    new ReadOnlySpan<float>(_projPerLayer, _nGpuLayers * _pleWidth));
+                _gpu.RecordBarrier();
+            }
+
             for (int i = 0; i < _nGpuLayers; i++)
                 GpuLayerGemma4(i, position);
 
@@ -1708,9 +1721,11 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         // BEFORE RoPE since UseL2QkNorm == false).
         if (_hasQkNorm && !_hp.UseL2QkNorm)
         {
-            _gpu.HeadNorm(qView, _gpuQNorm![i], _numHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             if (!kvShared)
-                _gpu.HeadNorm(kView, _gpuKNorm![i], _numKvHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                _gpu.HeadNormQk(qView, _gpuQNorm![i], kView, _gpuKNorm![i],
+                    _numHeads, _numKvHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+            else
+                _gpu.HeadNorm(qView, _gpuQNorm![i], _numHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             _gpu.RecordBarrier();
         }
 
@@ -1741,22 +1756,19 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
             : _maxSeqLen;
 
-        // Gemma 4: attention_scale = 1.0. Pre-scale Q by sqrt(head_dim) so the
-        // kernel's implicit rsqrtf(head_dim) cancels.
-        _gpu.ScaleInPlace(qView, MathF.Sqrt(layerHd));
-
+        // Gemma 4: attention_scale = 1.0, passed explicitly (kernel skips its rsqrtf).
         if (isSwa)
         {
             _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                 _gpuAttnScoresScratch,
                 position, _hp.SlidingWindowSize, layerHd,
-                _numHeads, _numKvHeads, effLayerCtx);
+                _numHeads, _numKvHeads, effLayerCtx, attnScale: 1f);
         }
         else
         {
             _gpu.Attention(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                 _gpuAttnScoresScratch,
-                _numHeads, _numKvHeads, layerHd, position + 1, effLayerCtx);
+                _numHeads, _numKvHeads, layerHd, position + 1, effLayerCtx, attnScale: 1f);
         }
         _gpu.RecordBarrier();
 
@@ -1793,20 +1805,13 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         _gpu.AddInPlace(_gpuHidden, _gpuResidual);
         _gpu.RecordBarrier();
 
-        // PLE injection — upload the per-layer slice from _projPerLayer (CPU) into
-        // _gpuPleSliceUp, then run the inp_gate / gelu / proj / post_norm / add on GPU.
+        // PLE injection — the per-layer projection slice is already resident
+        // (uploaded once per token); read it via the static view.
         if (_hp.HasPerLayerTokenEmbd && _gpuInpGate is not null)
         {
-            // Flush so the upload sees a stable consumer; UploadInto is synchronous
-            // w.r.t. host but we need ordering with subsequent kernel reads.
-            _gpu.RecordBarrier();
-            _gpu.UploadInto(_gpuPleSliceUp!,
-                new ReadOnlySpan<float>(_projPerLayer + (long)i * _pleWidth, _pleWidth));
-            _gpu.RecordBarrier();
-
             GpuMatMul(_gpuPleX!, _gpuInpGate[i], _gpuHidden);
             _gpu.RecordBarrier();
-            _gpu.GeluTanhMul(_gpuPleX!, _gpuPleSliceUp!);
+            _gpu.GeluTanhMul(_gpuPleX!, _gpuProjSliceViews![i]);
             _gpu.RecordBarrier();
             GpuMatMul(_gpuPleY!, _gpuPleProj![i], _gpuPleX!);
             _gpu.RecordBarrier();
@@ -2820,7 +2825,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         if (_projPerLayer != null) NativeMemory.Free(_projPerLayer);
         if (_pleX != null)         NativeMemory.Free(_pleX);
         if (_pleY != null)         NativeMemory.Free(_pleY);
-        if (_gpuPleSliceUp is { } pleUp) _gpu.Free(pleUp);
+        if (_gpuProjSliceViews is { } psv) foreach (var v in psv) _gpu.Free(v);
+        if (_gpuProjPerLayerGpu is { } projUp) _gpu.Free(projUp);
         if (_gpuPleX is { } pleX)  _gpu.Free(pleX);
         if (_gpuPleY is { } pleY)  _gpu.Free(pleY);
         if (_gpuRopeFreqs is { } rfFree) _gpu.Free(rfFree);

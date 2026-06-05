@@ -137,6 +137,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private readonly Tensor? _gpuProjPerLayer;  // [PleWidth*NumLayers]   F32 — per-layer projection
     private readonly Tensor? _gpuPleX;          // [PleWidth]             F32 — inner gate buffer
     private readonly Tensor? _gpuPleY;          // [embDim]               F32 — inner proj buffer
+    // Non-owning per-layer slice views into _gpuProjPerLayer (offset layer*PleWidth),
+    // built once so ApplyPerLayerEmbeddingGpu can read the proj slice without a copy.
+    // Freed in Dispose.
+    private readonly Tensor[]? _gpuProjSliceViews; // [L] view → _gpuProjPerLayer[layer]
     // Managed buffer for dequanting the active token's PLE row before upload.
     private readonly float[]? _pleRowHost;
     private readonly int _pleWidth;
@@ -152,6 +156,30 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     // Per-layer head_dim flag — non-null on Gemma 4. Triggers the gemma4 Forward path.
     private readonly bool _isGemma4Like;
     private readonly int _maxHeadDim;
+
+    // Issue #136: all-GPU batched-trunk prefill scratch (Gemma 4). Lazily sized to
+    // the current prompt length N; reallocated when N changes (prefill is infrequent).
+    // The embDim/intermDim/pleWidth buffers hold exactly N rows, so element-count-driven
+    // ops (Add/Scale/Copy) span exactly N tokens. The Q/K/V/attn buffers are sized for
+    // max head_dim and accessed through per-layer _gpu.View slices at the active layer's
+    // head_dim. Freed in Dispose.
+    /// <summary>
+    /// Gates the issue-#136 batched-trunk prefill. Initialised from
+    /// <c>SHARPI_BATCHED_PREFILL</c> (default on); settable so tests can A/B the
+    /// batched path against the bit-exact per-token loop on one model instance.
+    /// </summary>
+    public bool BatchedPrefillEnabled { get; set; }
+    private int _bpCapacity;                 // current N the scratch is sized for (0 = none)
+    private Tensor? _bpHidden, _bpResidual, _bpNorm;       // [N × embDim]
+    private Tensor? _bpQ, _bpAttnOut;                      // [N × numHeads*maxHeadDim]
+    private Tensor? _bpK, _bpV;                            // [N × numKvHeads*maxHeadDim]
+    private Tensor? _bpFfnGate, _bpFfnUp;                  // [N × intermDim]
+    private Tensor? _bpProjAll, _bpPleRowAll;             // [N × L*pleWidth]
+    private Tensor? _bpPleGate;                            // [N × pleWidth]
+    private Tensor? _bpPleY;                               // [N × embDim]
+    private float[]? _bpPleRowHostAll;                     // managed [N × L*pleWidth]
+    /// <summary>True if the most recent <see cref="Prefill"/> used the batched trunk.</summary>
+    public bool LastPrefillWasBatched { get; private set; }
 
     // SWA RoPE freq base (10K for Gemma 4 SWA layers). 0 when no SWA layers.
     private readonly float _ropeThetaSwa;
@@ -233,6 +261,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // Gemma 4 / per-layer head_dim path. _maxHeadDim sizes the Q/K/V/attnOut
         // scratch (per-layer view tensors carve out the active head_dim).
         _isGemma4Like = hp.LayerHeadDim is not null;
+        // Batched-trunk prefill is on by default; SHARPI_BATCHED_PREFILL=0 forces the
+        // bit-exact per-token loop (useful for A/B and parity debugging).
+        BatchedPrefillEnabled =
+            Environment.GetEnvironmentVariable("SHARPI_BATCHED_PREFILL") != "0";
         _maxHeadDim = _headDim;
         if (hp.LayerHeadDim is { } lhdMax)
             for (int i = 0; i < hp.NumLayers; i++)
@@ -634,6 +666,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             _gpuPleX         = _gpu.Allocate(TensorShape.D1(_pleWidth));
             _gpuPleY         = _gpu.Allocate(TensorShape.D1(_embDim));
             _pleRowHost      = new float[stackedDim];
+
+            // Precompute static per-layer proj-slice views (no per-token copy).
+            _gpuProjSliceViews = new Tensor[L];
+            for (int i = 0; i < L; i++)
+                _gpuProjSliceViews[i] = _gpu.View(_gpuProjPerLayer, (long)i * _pleWidth, _pleWidth);
         }
 
         Console.Error.WriteLine(" done.");
@@ -971,10 +1008,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             // CPU applies norm BEFORE RoPE (UseL2QkNorm == false).
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
-                _gpu.HeadNorm(qView, _wqNorm![layer], _numHeads, layerHd,
-                    _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
                 if (!kvShared)
-                    _gpu.HeadNorm(kView, _wkNorm![layer], _numKvHeads, layerHd,
+                    _gpu.HeadNormQk(qView, _wqNorm![layer], kView, _wkNorm![layer],
+                        _numHeads, _numKvHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                else
+                    _gpu.HeadNorm(qView, _wqNorm![layer], _numHeads, layerHd,
                         _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             }
 
@@ -1010,25 +1048,22 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
                 : _maxSeqLen;
 
-            // Gemma 4 uses attention_scale = 1.0 (no 1/sqrt(head_dim) prefactor); the
-            // CUDA attention kernels bake `rsqrtf(head_dim)` in unconditionally. Pre-
-            // scale the query by sqrt(head_dim) so the kernel's implicit scale cancels
-            // out — mirrors the CPU path's `_layerHeadDim is not null ? 1f : 1/sqrt(hd)`
-            // in ForwardPass.Attention.
-            _gpu.ScaleInPlace(qView, MathF.Sqrt(layerHd));
-
+            // Gemma 4 uses attention_scale = 1.0 (no 1/sqrt(head_dim) prefactor). Pass
+            // it explicitly so the kernel skips its rsqrtf(head_dim) — matching the CPU
+            // path's `_layerHeadDim is not null ? 1f : 1/sqrt(hd)` exactly with no
+            // prescale round-trip, and dropping a ScaleInPlace launch per layer.
             if (isSwa)
             {
                 _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                     _attnScoresScratch,
                     position, _hp.SlidingWindowSize, layerHd,
-                    _numHeads, _numKvHeads, effLayerCtx);
+                    _numHeads, _numKvHeads, effLayerCtx, attnScale: 1f);
             }
             else
             {
                 _gpu.Attention(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                     _attnScoresScratch,
-                    _numHeads, _numKvHeads, layerHd, position + 1, effLayerCtx);
+                    _numHeads, _numKvHeads, layerHd, position + 1, effLayerCtx, attnScale: 1f);
             }
 
             // Output projection: _wo[layer] is [embDim, qDimL] — pass attnOutView
@@ -1118,26 +1153,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         _gpu.ScaleInPlace(_gpuProjPerLayer!, 1.0f / MathF.Sqrt(_embDim));
 
-        // Per-layer slice: RmsNorm with per_layer_proj_norm (w+1 baked in),
-        // add the same-slice of the PLE row, scale by 1/sqrt(2). The Tensor
-        // abstraction can't encode a device-pointer offset, so each slice
-        // round-trips through small scratch tensors. Total copy traffic is
-        // 42 × 256 × 4 = 43 KiB per token — negligible compared to the
-        // proj MatMul that just ran.
-        long sliceBytes = (long)_pleWidth * sizeof(float);
-        for (int li = 0; li < L; li++)
-        {
-            long sliceOffsetBytes = (long)li * _pleWidth * sizeof(float);
-            _gpu.CopyDeviceRegion(_gpuPleX!, 0, _gpuProjPerLayer!, sliceOffsetBytes, sliceBytes);
-            _gpu.RmsNorm(_gpuPleX!, _gpuPleX!, _gpuPerLayerProjNorm!, _hp.RmsNormEps);
-            // Reuse _gpuPleY (sized embDim, much wider than pleWidth) as a
-            // staging slot for the PLE row slice, then add via a view tensor.
-            _gpu.CopyDeviceRegion(_gpuPleY!, 0, _gpuPleRow!, sliceOffsetBytes, sliceBytes);
-            var addSrcView = new Tensor(TensorShape.D1(_pleWidth), DType.Float32, _gpuPleY!.Handle);
-            _gpu.AddInPlace(_gpuPleX!, addSrcView);
-            _gpu.ScaleInPlace(_gpuPleX!, 1.0f / MathF.Sqrt(2f));
-            _gpu.CopyDeviceRegion(_gpuProjPerLayer!, sliceOffsetBytes, _gpuPleX!, 0, sliceBytes);
-        }
+        // Per-layer slice: RmsNorm each pleWidth row with per_layer_proj_norm (w+1
+        // baked in), add the same-slice PLE row, scale by 1/sqrt(2). The norm is the
+        // only per-slice op (one block per row, byte-identical to llm_rmsnorm); the
+        // add and scale are pure elementwise and run over the whole [L*pleWidth]
+        // buffer at once. Collapses the original per-slice loop (≈6 device ops × L —
+        // 3 slice copies + norm/add/scale) to 3 whole-buffer launches.
+        _gpu.RmsNormBatched(_gpuProjPerLayer!, _gpuProjPerLayer!, _gpuPerLayerProjNorm!,
+            L, _pleWidth, _hp.RmsNormEps);
+        _gpu.AddInPlace(_gpuProjPerLayer!, _gpuPleRow!);
+        _gpu.ScaleInPlace(_gpuProjPerLayer!, 1.0f / MathF.Sqrt(2f));
     }
 
     /// <summary>
@@ -1147,17 +1172,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// </summary>
     private void ApplyPerLayerEmbeddingGpu(int layer)
     {
-        long sliceOffsetBytes = (long)layer * _pleWidth * sizeof(float);
-        long sliceBytes = (long)_pleWidth * sizeof(float);
-
         // gate = inp_gate @ hidden  → [pleWidth]
         GpuMatMul(_gpuPleX!, _gpuInpGate![layer], _hidden);
 
-        // up = proj_per_layer[layer]  (stage into _gpuPleY's leading pleWidth
-        // floats so we can pass a fresh view tensor to GeluTanhMul).
-        _gpu.CopyDeviceRegion(_gpuPleY!, 0, _gpuProjPerLayer!, sliceOffsetBytes, sliceBytes);
-        var upView = new Tensor(TensorShape.D1(_pleWidth), DType.Float32, _gpuPleY!.Handle);
-        _gpu.GeluTanhMul(_gpuPleX!, upView);
+        // up = proj_per_layer[layer], read directly via the static slice view.
+        _gpu.GeluTanhMul(_gpuPleX!, _gpuProjSliceViews![layer]);
 
         // proj output (embDim).
         GpuMatMul(_gpuPleY!, _gpuPleProj![layer], _gpuPleX!);
@@ -1341,9 +1360,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
-                _gpu.HeadNorm(qView, _wqNorm![layer], _numHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
                 if (!kvShared)
-                    _gpu.HeadNorm(kView, _wkNorm![layer], _numKvHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                    _gpu.HeadNormQk(qView, _wqNorm![layer], kView, _wkNorm![layer],
+                        _numHeads, _numKvHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                else
+                    _gpu.HeadNorm(qView, _wqNorm![layer], _numHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             }
             float ropeTheta = isSwa ? _ropeThetaSwa : _hp.RopeTheta;
             if (!isSwa && _gpuRopeFreqs is { } rfTbl)
@@ -1370,14 +1391,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                               && _hp.SlidingWindowSize > 0)
                 ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
                 : _maxSeqLen;
-            _gpu.ScaleInPlace(qView, MathF.Sqrt(layerHd));
             if (isSwa)
                 _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                     _attnScoresScratch, position, _hp.SlidingWindowSize, layerHd,
-                    _numHeads, _numKvHeads, effLayerCtx);
+                    _numHeads, _numKvHeads, effLayerCtx, attnScale: 1f);
             else
                 _gpu.Attention(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
-                    _attnScoresScratch, _numHeads, _numKvHeads, layerHd, position + 1, effLayerCtx);
+                    _attnScoresScratch, _numHeads, _numKvHeads, layerHd, position + 1, effLayerCtx, attnScale: 1f);
             _gpu.Synchronize();
             AccPhase(PH_KV_ATTN, sw, ref t0);
 
@@ -1448,6 +1468,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             throw new ArgumentException("Token list is empty", nameof(tokens));
 
         int N = tokens.Count;
+        LastPrefillWasBatched = false;
 
         // SnapKV (issue #59) gating: only run eviction when this is a fresh
         // prefill (startPos==0), the effective budget is positive (env-set or
@@ -1458,6 +1479,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                          && !_tqEnabled
                          && N > _snapKvEffectiveBudget
                          && N > _snapKvCfg.Window;
+        // Issue #136: all-GPU batched-trunk prefill for Gemma 4. Collapses the
+        // per-position attention/FFN/PLE launches (whose count grows with N) into
+        // batched GEMM-N + batched-attention launches. Gated to the configs the
+        // batched kernels cover bit-identically; everything else (SnapKV-active,
+        // TQ, >4096 context, non-NEOX RoPE, unbatchable weight dtype) falls back
+        // to the per-token loop below.
+        if (BatchedPrefillEnabled && _isGemma4Like && !snapKvActive && N >= 2
+            && startPos + N <= 4096 && IsGemma4BatchedPrefillSupported())
+            return PrefillBatchedTrunkGemma4(tokens, startPos);
+
         int W = 0, wStart = 0;
         if (snapKvActive)
         {
@@ -1480,6 +1511,291 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             ApplySnapKvEviction(N, W, wStart);
 
         return logits;
+    }
+
+    private static bool BatchableDType(DType d) =>
+        d is DType.Q4_K or DType.Q5_K or DType.Q6_K or DType.Q8_0 or DType.Float32;
+
+    private DType WDType(Tensor t) => _weightDTypes.GetValueOrDefault(t.Handle, DType.Q4_K);
+
+    /// <summary>
+    /// Fail-safe batchability check for the prefill gate: an unregistered handle is
+    /// treated as NOT batchable (forcing the per-token fallback) rather than defaulting
+    /// to a batchable dtype, so a future weight whose dtype isn't tracked can't slip
+    /// into the GEMM-N path and be misdispatched.
+    /// </summary>
+    private bool BatchableWeight(Tensor t) =>
+        _weightDTypes.TryGetValue(t.Handle, out var d) && BatchableDType(d);
+
+    /// <summary>
+    /// Whether the issue-#136 batched-trunk prefill can run this model bit-identically.
+    /// Requires a dense Gemma 4 with NEOX RoPE, non-L2 QK-norm, no attention bias, TQ
+    /// off, and every trunk + PLE weight in a GEMM-N-batchable dtype.
+    /// </summary>
+    private bool IsGemma4BatchedPrefillSupported()
+    {
+        if (_isMoE || _tqEnabled || _hasAttnBias || !_hp.IsNeoxRope) return false;
+        if (_hasQkNorm && _hp.UseL2QkNorm) return false;
+
+        for (int i = 0; i < _hp.NumLayers; i++)
+        {
+            bool kvShared = _hp.KvSourceLayer is { } ksl && ksl[i] >= 0;
+            if (!BatchableWeight(_wq[i]) || !BatchableWeight(_wo[i]) ||
+                !BatchableWeight(_wGate[i]) || !BatchableWeight(_wUp[i]) ||
+                !BatchableWeight(_wDown[i]))
+                return false;
+            if (!kvShared && (!BatchableWeight(_wk[i]) || !BatchableWeight(_wv[i])))
+                return false;
+            if (_hp.HasPerLayerTokenEmbd &&
+                (!BatchableWeight(_gpuInpGate![i]) || !BatchableWeight(_gpuPleProj![i])))
+                return false;
+        }
+        if (_hp.HasPerLayerTokenEmbd && !BatchableWeight(_gpuPerLayerModelProj!))
+            return false;
+        return BatchableWeight(_wOutput);
+    }
+
+    private void GpuMatMulBatched(Tensor outAll, Tensor weights, Tensor inAll, int n) =>
+        _gpu.MatMulBatched(outAll, weights, inAll, n, WDType(weights));
+
+    /// <summary>(Re)allocate the batched-trunk scratch for a prompt of length N.</summary>
+    private void EnsureBatchedTrunkScratch(int n)
+    {
+        if (_bpCapacity == n) return;
+        FreeBatchedTrunkScratch();
+
+        long emb = (long)n * _embDim;
+        _bpHidden   = _gpu.Allocate(TensorShape.D1(emb));
+        _bpResidual = _gpu.Allocate(TensorShape.D1(emb));
+        _bpNorm     = _gpu.Allocate(TensorShape.D1(emb));
+        _bpQ        = _gpu.Allocate(TensorShape.D1((long)n * _numHeads * _maxHeadDim));
+        _bpAttnOut  = _gpu.Allocate(TensorShape.D1((long)n * _numHeads * _maxHeadDim));
+        _bpK        = _gpu.Allocate(TensorShape.D1((long)n * _numKvHeads * _maxHeadDim));
+        _bpV        = _gpu.Allocate(TensorShape.D1((long)n * _numKvHeads * _maxHeadDim));
+        _bpFfnGate  = _gpu.Allocate(TensorShape.D1((long)n * _intermDim));
+        _bpFfnUp    = _gpu.Allocate(TensorShape.D1((long)n * _intermDim));
+        if (_hp.HasPerLayerTokenEmbd)
+        {
+            long stacked = (long)n * _hp.NumLayers * _pleWidth;
+            _bpProjAll    = _gpu.Allocate(TensorShape.D1(stacked));
+            _bpPleRowAll  = _gpu.Allocate(TensorShape.D1(stacked));
+            _bpPleGate    = _gpu.Allocate(TensorShape.D1((long)n * _pleWidth));
+            _bpPleY       = _gpu.Allocate(TensorShape.D1(emb));
+            _bpPleRowHostAll = new float[stacked];
+        }
+        _bpCapacity = n;
+    }
+
+    private void FreeBatchedTrunkScratch()
+    {
+        foreach (var t in new[] { _bpHidden, _bpResidual, _bpNorm, _bpQ, _bpAttnOut,
+                                  _bpK, _bpV, _bpFfnGate, _bpFfnUp,
+                                  _bpProjAll, _bpPleRowAll, _bpPleGate, _bpPleY })
+            if (t is { } v) _gpu.Free(v);
+        _bpHidden = _bpResidual = _bpNorm = _bpQ = _bpAttnOut = _bpK = _bpV =
+            _bpFfnGate = _bpFfnUp = _bpProjAll = _bpPleRowAll = _bpPleGate = _bpPleY = null;
+        _bpPleRowHostAll = null;
+        _bpCapacity = 0;
+    }
+
+    /// <summary>
+    /// All-GPU batched-trunk prefill for Gemma 4 (issue #136). Embeds all N tokens,
+    /// builds the per-layer PLE projections batched, runs every transformer layer
+    /// batched across N, then the final norm + output projection on the last token.
+    /// Bit-identical to the per-token <see cref="ForwardGemma4"/> loop.
+    /// </summary>
+    private ReadOnlySpan<float> PrefillBatchedTrunkGemma4(IReadOnlyList<int> tokens, int startPos)
+    {
+        int N = tokens.Count;
+        EnsureBatchedTrunkScratch(N);
+        int embDim = _embDim;
+
+        // 1. Embed every token into _bpHidden, then batched embedding scale.
+        for (int i = 0; i < N; i++)
+        {
+            EmbedTokenGpu(tokens[i]);   // writes _hidden
+            _gpu.CopyDeviceRegion(_bpHidden!, (long)i * embDim * sizeof(float),
+                                  _hidden, 0, (long)embDim * sizeof(float));
+        }
+        if (_hp.EmbeddingScale != 1f)
+            _gpu.ScaleInPlace(_bpHidden!, _hp.EmbeddingScale);
+
+        // 2. PLE pre-pass batched (builds _bpProjAll = [N × L*pleWidth]).
+        if (_hp.HasPerLayerTokenEmbd)
+            BuildPerLayerProjectionsBatched(tokens);
+
+        // 3. Transformer layers, batched across N.
+        for (int layer = 0; layer < _hp.NumLayers; layer++)
+            GpuLayerBatchedTrunkGemma4(layer, N, startPos);
+
+        // 4. Final norm + output projection on the last token only.
+        var lastHidden = _gpu.View(_bpHidden!, (long)(N - 1) * embDim, embDim);
+        _gpu.RmsNorm(_hidden, lastHidden, _wOutputNorm, _hp.RmsNormEps);
+        _gpu.Free(lastHidden);
+        GpuMatMul(_logits, _wOutput, _hidden);
+        if (_hp.FinalLogitSoftcap > 0f)
+            _gpu.SoftcapInPlace(_logits, _hp.FinalLogitSoftcap);
+        _gpu.Download(_logits, _logitsBuf);
+        _gpu.Synchronize();
+
+        _kvLength = Math.Max(_kvLength, startPos + N);
+        LastPrefillWasBatched = true;
+        return _logitsBuf;
+    }
+
+    /// <summary>Embed a single token into <c>_hidden</c> (mirrors ForwardGemma4 step 1).</summary>
+    private void EmbedTokenGpu(int token)
+    {
+        if (_embIsQuantized)
+        {
+            var embDType = _weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K);
+            if (embDType == DType.Q8_0) _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim);
+            else                        _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim);
+        }
+        else
+            _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
+    }
+
+    /// <summary>
+    /// Batched PLE pre-pass: build <c>_bpProjAll</c> ([N × L*pleWidth]) for all N
+    /// tokens. Mirrors <see cref="BuildPerLayerProjectionsGpu"/> kernel-for-kernel,
+    /// batched: one proj GEMM-N, per-(token,layer) RmsNormBatched, full-buffer add/scale.
+    /// </summary>
+    private void BuildPerLayerProjectionsBatched(IReadOnlyList<int> tokens)
+    {
+        int N = tokens.Count, L = _hp.NumLayers;
+        int stackedDim = L * _pleWidth;
+        var pleRef = _cpuPleTokenEmbed!.Value;
+        int bytesPerRow = (stackedDim / DTypeInfo.BlockSize(pleRef.DType))
+                        * DTypeInfo.BytesPerBlock(pleRef.DType);
+
+        // CPU dequant of each token's PLE row into the [N × stackedDim] host buffer.
+        var host = _bpPleRowHostAll!;
+        for (int i = 0; i < N; i++)
+        {
+            byte* rowPtr = pleRef.DataPtr + (long)tokens[i] * bytesPerRow;
+            var dst = new Span<float>(host).Slice(i * stackedDim, stackedDim);
+            if (pleRef.DType == DType.Float32)
+                new ReadOnlySpan<float>((float*)rowPtr, stackedDim).CopyTo(dst);
+            else
+                Dequantize.ToFloat32(new ReadOnlySpan<byte>(rowPtr, bytesPerRow), dst, pleRef.DType, stackedDim);
+        }
+        _gpu.UploadInto(_bpPleRowAll!, host);
+        _gpu.ScaleInPlace(_bpPleRowAll!, MathF.Sqrt(_pleWidth));
+
+        // proj_per_layer = per_layer_model_proj @ hidden, for all N tokens.
+        GpuMatMulBatched(_bpProjAll!, _gpuPerLayerModelProj!, _bpHidden!, N);
+        _gpu.ScaleInPlace(_bpProjAll!, 1.0f / MathF.Sqrt(_embDim));
+
+        // Per-(token,layer) slice RmsNorm, then full-buffer add of the PLE row + 1/sqrt(2).
+        _gpu.RmsNormBatched(_bpProjAll!, _bpProjAll!, _gpuPerLayerProjNorm!, N * L, _pleWidth, _hp.RmsNormEps);
+        _gpu.AddInPlace(_bpProjAll!, _bpPleRowAll!);
+        _gpu.ScaleInPlace(_bpProjAll!, 1.0f / MathF.Sqrt(2f));
+    }
+
+    /// <summary>
+    /// One transformer layer of the batched-trunk prefill, mirroring
+    /// <see cref="ForwardGemma4"/>'s per-layer body batched across N tokens.
+    /// </summary>
+    private void GpuLayerBatchedTrunkGemma4(int layer, int N, int startPos)
+    {
+        int layerHd = _hp.LayerHeadDim![layer];
+        int qDimL = _numHeads * layerHd, kvDimL = _numKvHeads * layerHd;
+        int kvSrc = _hp.KvSourceLayer is { } ksl ? ksl[layer] : -1;
+        bool kvShared = kvSrc >= 0;
+        int effLayer = kvShared ? kvSrc : layer;
+        bool isSwa = _hp.IsSwaLayer is { } swa && swa[layer];
+        int window = _hp.SlidingWindowSize;
+
+        // Per-layer dense views (the buffers are sized for max head_dim).
+        var qAll = _gpu.View(_bpQ!, 0, (long)N * qDimL);
+        var kAll = _gpu.View(_bpK!, 0, (long)N * kvDimL);
+        var vAll = _gpu.View(_bpV!, 0, (long)N * kvDimL);
+        var attnAll = _gpu.View(_bpAttnOut!, 0, (long)N * qDimL);
+
+        _gpu.CopyDevice(_bpResidual!, _bpHidden!);
+        _gpu.RmsNormBatched(_bpNorm!, _bpHidden!, _wAttnNorm[layer], N, _embDim, _hp.RmsNormEps);
+
+        GpuMatMulBatched(qAll, _wq[layer], _bpNorm!, N);
+        if (!kvShared)
+        {
+            GpuMatMulBatched(kAll, _wk[layer], _bpNorm!, N);
+            GpuMatMulBatched(vAll, _wv[layer], _bpNorm!, N);
+        }
+
+        if (_hasQkNorm && !_hp.UseL2QkNorm)
+        {
+            if (!kvShared)
+                _gpu.HeadNormQkBatched(qAll, _wqNorm![layer], kAll, _wkNorm![layer],
+                    _numHeads, _numKvHeads, layerHd, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+            else
+                _gpu.HeadNormBatched(qAll, _wqNorm![layer], _numHeads, layerHd, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+        }
+
+        float ropeTheta = isSwa ? _ropeThetaSwa : _hp.RopeTheta;
+        if (!isSwa && _gpuRopeFreqs is { } rfTbl)
+        {
+            _gpu.RoPEWithFactorsBatched(qAll, startPos, layerHd, ropeTheta, rfTbl, _numHeads, N);
+            if (!kvShared)
+                _gpu.RoPEWithFactorsBatched(kAll, startPos, layerHd, ropeTheta, rfTbl, _numKvHeads, N);
+        }
+        else
+        {
+            _gpu.RoPEPartialBatched(qAll, startPos, layerHd, layerHd, ropeTheta, _numHeads, N, neox: true);
+            if (!kvShared)
+                _gpu.RoPEPartialBatched(kAll, startPos, layerHd, layerHd, ropeTheta, _numKvHeads, N, neox: true);
+        }
+
+        if (!kvShared)
+        {
+            int layerCtx = isSwa && window > 0 ? Math.Min(_maxSeqLen, window) : _maxSeqLen;
+            _gpu.KvAppendBatched(kAll, vAll, _gpuKCache[layer], _gpuVCache[layer], kvDimL, startPos, layerCtx, N);
+        }
+
+        int effLayerCtx = (_hp.IsSwaLayer is { } swaEff && swaEff[effLayer] && window > 0)
+            ? Math.Min(_maxSeqLen, window) : _maxSeqLen;
+
+        // Gemma 4: attention_scale = 1.0, passed explicitly (kernel skips its rsqrtf).
+        if (isSwa)
+            _gpu.AttentionSwaBatched(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
+                _numHeads, _numKvHeads, layerHd, startPos, window, effLayerCtx, N, attnScale: 1f);
+        else
+            _gpu.AttentionBatched(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
+                _numHeads, _numKvHeads, layerHd, startPos, effLayerCtx, N, attnScale: 1f);
+
+        GpuMatMulBatched(_bpHidden!, _wo[layer], attnAll, N);
+        if (_wPostAttnNorm is not null)
+            _gpu.RmsNormBatched(_bpHidden!, _bpHidden!, _wPostAttnNorm[layer], N, _embDim, _hp.RmsNormEps);
+        _gpu.AddInPlace(_bpHidden!, _bpResidual!);
+
+        // FFN.
+        _gpu.CopyDevice(_bpResidual!, _bpHidden!);
+        _gpu.RmsNormBatched(_bpNorm!, _bpHidden!, _wFfnNorm[layer], N, _embDim, _hp.RmsNormEps);
+        GpuMatMulBatched(_bpFfnGate!, _wGate[layer], _bpNorm!, N);
+        GpuMatMulBatched(_bpFfnUp!,   _wUp[layer],   _bpNorm!, N);
+        _gpu.GeluTanhMul(_bpFfnGate!, _bpFfnUp!);
+        GpuMatMulBatched(_bpHidden!, _wDown[layer], _bpFfnGate!, N);
+        if (_wPostFfwNorm is not null)
+            _gpu.RmsNormBatched(_bpHidden!, _bpHidden!, _wPostFfwNorm[layer], N, _embDim, _hp.RmsNormEps);
+        _gpu.AddInPlace(_bpHidden!, _bpResidual!);
+
+        // PLE injection, batched: gate = inp_gate @ hidden; gelu * proj-slice;
+        // proj @; post-norm; add. proj-slice read with per-token stride via the
+        // strided gelu, so no gather of the [N × L*pleWidth] projection buffer.
+        if (_hp.HasPerLayerTokenEmbd)
+        {
+            GpuMatMulBatched(_bpPleGate!, _gpuInpGate![layer], _bpHidden!, N);
+            _gpu.GeluTanhMulStrided(_bpPleGate!, _bpProjAll!, _pleWidth,
+                (long)_hp.NumLayers * _pleWidth, (long)layer * _pleWidth, N);
+            GpuMatMulBatched(_bpPleY!, _gpuPleProj![layer], _bpPleGate!, N);
+            _gpu.RmsNormBatched(_bpPleY!, _bpPleY!, _gpuPlePostNorm![layer], N, _embDim, _hp.RmsNormEps);
+            _gpu.AddInPlace(_bpHidden!, _bpPleY!);
+        }
+
+        if (_layerOutputScale is not null)
+            _gpu.ScaleInPlace(_bpHidden!, _layerOutputScale[layer]);
+
+        _gpu.Free(qAll); _gpu.Free(kAll); _gpu.Free(vAll); _gpu.Free(attnAll);
     }
 
     /// <summary>
@@ -2144,6 +2460,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             for (int i = 0; i < _gpuPleProj.Length; i++) _gpu.Free(_gpuPleProj[i]);
         if (_gpuPlePostNorm is not null)
             for (int i = 0; i < _gpuPlePostNorm.Length; i++) _gpu.Free(_gpuPlePostNorm[i]);
+        FreeBatchedTrunkScratch();
+        if (_gpuProjSliceViews is { } psv) foreach (var v in psv) _gpu.Free(v);
         if (_gpuPleRow       is { } pr) _gpu.Free(pr);
         if (_gpuProjPerLayer is { } ppl) _gpu.Free(ppl);
         if (_gpuPleX         is { } px) _gpu.Free(px);

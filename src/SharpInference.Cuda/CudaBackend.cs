@@ -105,6 +105,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _ropeNeoxKernel;
     private nint   _ropeNeoxPartialKernel;
     private nint   _ropeNeoxWithFactorsKernel;
+    private nint   _ropeNeoxWithFactorsBatchedKernel;
     private nint   _mulKernel;
     private nint   _sigmoidMulInPlaceKernel;
     private nint   _splitQgKernel;
@@ -149,16 +150,21 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _matvecQ4KGemmNKernel;
     private nint   _matvecQ5KGemmNKernel;
     private nint   _matvecQ6KGemmNKernel;
+    private nint   _matvecQ80GemmNKernel;
     // Issue #111: batched trunk elementwise/norm kernels (one launch over N tokens).
     private nint   _rmsNormBatchedKernel;
     private nint   _headNormBatchedKernel;
+    private nint   _headNormQkKernel;
+    private nint   _headNormQkBatchedKernel;
     private nint   _splitQgBatchedKernel;
     private nint   _ropeNeoxPartialBatchedKernel;
     private nint   _attentionKernel;
     // Gemma 4 (Phase 7): sliding-window attention, tanh-GELU FFN, final-logit
     // softcap. Kernel work only — forward-pass wiring lands in Phase 8.
     private nint   _attentionSwaKernel;
+    private nint   _attentionSwaBatchedKernel;
     private nint   _geluTanhMulKernel;
+    private nint   _geluTanhMulStridedKernel;
     private nint   _softcapKernel;
     private nint   _clearF32Kernel;
     private nint   _quantizeQ81Kernel;
@@ -1411,13 +1417,15 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             DispatchMatVecQ4KBatched(wPtr, xPtr, yPtr, rows, cols, nTok);
             return;
         }
-        if (weightDType == DType.Float32 || weightDType == DType.Q6_K || weightDType == DType.Q5_K)
+        if (weightDType is DType.Float32 or DType.Q6_K or DType.Q5_K or DType.Q8_0)
         {
-            // All take F32 input; the Q5_K/Q6_K kernels decode the weight per element.
+            // All take F32 input; the Q5_K/Q6_K/Q8_0 kernels decode the weight per
+            // element. Same (rows+7)/8 × nTok geometry across all four.
             nint kernel = weightDType switch
             {
                 DType.Q6_K => _matvecQ6KGemmNKernel,
                 DType.Q5_K => _matvecQ5KGemmNKernel,
+                DType.Q8_0 => _matvecQ80GemmNKernel,
                 _          => _matvecF32GemmNKernel,
             };
             int pRows = rows, pCols = cols, pN = nTok;
@@ -1433,7 +1441,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             return;
         }
         throw new NotSupportedException(
-            $"CUDA MatMulBatched: weight dtype {weightDType} not supported (expected Q4_K, Q5_K, Q6_K, or Float32).");
+            $"CUDA MatMulBatched: weight dtype {weightDType} not supported (expected Q4_K, Q5_K, Q6_K, Q8_0, or Float32).");
     }
 
     /// <summary>
@@ -1790,6 +1798,51 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(head_norm_batched) failed: {r}");
     }
 
+    /// <summary>
+    /// Dual per-head RmsNorm of Q and K in one launch (Gemma 4 QK-norm). Grid covers
+    /// <c>numHeads + numKvHeads</c> blocks; the first <c>numHeads</c> normalize Q with
+    /// <paramref name="qWeight"/>, the rest K with <paramref name="kWeight"/>. Per block
+    /// bit-identical to <see cref="HeadNorm"/>.
+    /// </summary>
+    public void HeadNormQk(Tensor qData, Tensor qWeight, Tensor kData, Tensor kWeight,
+        int numHeads, int numKvHeads, int headDim, float eps = 1e-6f, bool perChannelWeight = false)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint qP = GetDevPtr(qData), qwP = GetDevPtr(qWeight), kP = GetDevPtr(kData), kwP = GetDevPtr(kWeight);
+        int pHD = headDim, pNH = numHeads, pNKV = numKvHeads, pWS = perChannelWeight ? headDim : 0;
+        float pE = eps;
+        nint* args = stackalloc nint[9]
+        {
+            (nint)(&qP), (nint)(&qwP), (nint)(&kP), (nint)(&kwP),
+            (nint)(&pHD), (nint)(&pNH), (nint)(&pNKV), (nint)(&pE), (nint)(&pWS)
+        };
+        int r = NvrtcInterop.LaunchKernel(_headNormQkKernel, (uint)(numHeads + numKvHeads), 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(head_norm_qk) failed: {r}");
+    }
+
+    /// <summary>Batched <see cref="HeadNormQk"/> over <paramref name="nTok"/> tokens.</summary>
+    public void HeadNormQkBatched(Tensor qData, Tensor qWeight, Tensor kData, Tensor kWeight,
+        int numHeads, int numKvHeads, int headDim, int nTok, float eps = 1e-6f, bool perChannelWeight = false)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint qP = GetDevPtr(qData), qwP = GetDevPtr(qWeight), kP = GetDevPtr(kData), kwP = GetDevPtr(kWeight);
+        int pHD = headDim, pNH = numHeads, pNKV = numKvHeads, pWS = perChannelWeight ? headDim : 0, pNT = nTok;
+        float pE = eps;
+        nint* args = stackalloc nint[10]
+        {
+            (nint)(&qP), (nint)(&qwP), (nint)(&kP), (nint)(&kwP),
+            (nint)(&pHD), (nint)(&pNH), (nint)(&pNKV), (nint)(&pE), (nint)(&pWS), (nint)(&pNT)
+        };
+        int r = NvrtcInterop.LaunchKernel(_headNormQkBatchedKernel, (uint)(numHeads + numKvHeads), (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(head_norm_qk_batched) failed: {r}");
+    }
+
     /// <summary>Per-head L2 normalize (no learned weights). Llama-4 style.</summary>
     public void HeadNormPure(Tensor data, int numHeads, int headDim, float eps = 1e-6f)
     {
@@ -1872,6 +1925,33 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         uint grid = (uint)((n + 255) / 256);
         int r = NvrtcInterop.LaunchKernel(_geluTanhMulKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gelu_tanh_mul) failed: {r}");
+    }
+
+    /// <summary>
+    /// Strided-up <see cref="GeluTanhMul"/> over <paramref name="nTok"/> tokens:
+    /// <paramref name="gate"/> is <c>[nTok × width]</c> contiguous; the up operand for
+    /// token t is at <c>up + t*upStride + upOffset</c>. Lets batched PLE inject the
+    /// per-layer slice of a <c>[nTok × (L*pleWidth)]</c> projection buffer without a
+    /// gather. Per element bit-identical to <see cref="GeluTanhMul"/>.
+    /// </summary>
+    public void GeluTanhMulStrided(Tensor gate, Tensor up, int width, long upStride, long upOffset, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        long total = (long)nTok * width;
+        nint gPtr = GetDevPtr(gate);
+        nint uPtr = GetDevPtr(up);
+        int  pW = width, pNT = nTok;
+        long pStride = upStride, pOff = upOffset;
+        nint* args = stackalloc nint[6]
+        {
+            (nint)(&gPtr), (nint)(&uPtr), (nint)(&pW), (nint)(&pStride), (nint)(&pOff), (nint)(&pNT)
+        };
+        uint grid = (uint)((total + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_geluTanhMulStridedKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gelu_tanh_mul_strided) failed: {r}");
     }
 
     /// <summary>
@@ -2026,6 +2106,41 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>
+    /// Batched <see cref="RoPEWithFactors"/> over <paramref name="nTok"/> tokens (Gemma 4
+    /// global layers in batched-trunk prefill). Token <c>t</c> uses position
+    /// <c>basePosition + t</c>; <paramref name="x"/> is <c>[nTok × numHeads*headDim]</c>.
+    /// Bit-identical per row to the per-token kernel.
+    /// </summary>
+    public void RoPEWithFactorsBatched(Tensor x, int basePosition, int headDim,
+        float ropeTheta, Tensor freqFactors, int numHeads, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (headDim <= 0 || (headDim & 1) != 0)
+            throw new ArgumentException("headDim must be a positive even number.", nameof(headDim));
+        if (freqFactors.ElementCount != headDim / 2)
+            throw new ArgumentException(
+                $"RoPEWithFactorsBatched: freqFactors length {freqFactors.ElementCount} != headDim/2 ({headDim / 2}).",
+                nameof(freqFactors));
+
+        int totalPairs = numHeads * (headDim / 2);
+        nint xPtr = GetDevPtr(x);
+        nint fPtr = GetDevPtr(freqFactors);
+        int  pNH = numHeads, pHD = headDim, pPos = basePosition, pNT = nTok;
+        float pT = ropeTheta;
+        nint* args = stackalloc nint[7]
+        {
+            (nint)(&xPtr),
+            (nint)(&pNH), (nint)(&pHD), (nint)(&pPos), (nint)(&pT),
+            (nint)(&fPtr), (nint)(&pNT)
+        };
+        uint grid = (uint)((totalPairs + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_ropeNeoxWithFactorsBatchedKernel, grid, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(rope_neox_with_factors_batched) failed: {r}");
+    }
+
+    /// <summary>
     /// Fused <c>x[i] *= sigmoid(gate[i])</c> in-place. Replaces a Sigmoid + ElementwiseMul
     /// pair for the qwen35moe GLU attention gate.
     /// </summary>
@@ -2146,9 +2261,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// scores to <paramref name="scoresScratch"/>, which must have room for
     /// <c>numHeads × maxSeqLen</c> floats. Passing a non-null scratch always works.
     /// </summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
     public void Attention(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
                           Tensor? scoresScratch,
-                          int numHeads, int numKvHeads, int headDim, int seqLen, int maxSeqLen)
+                          int numHeads, int numKvHeads, int headDim, int seqLen, int maxSeqLen,
+                          float attnScale = -1f)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
@@ -2160,12 +2277,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         nint oP = GetDevPtr(output);
         nint ssP = scoresScratch is { } sv ? GetDevPtr(sv) : nint.Zero;
         int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pSL = seqLen, pMSL = maxSeqLen;
-        nint* args = stackalloc nint[10]
+        float pScale = attnScale;
+        nint* args = stackalloc nint[11]
         {
             (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
             (nint)(&ssP),
             (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
-            (nint)(&pSL), (nint)(&pMSL)
+            (nint)(&pSL), (nint)(&pMSL), (nint)(&pScale)
         };
         int r = NvrtcInterop.LaunchKernel(_attentionKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention) failed: {r}");
@@ -2183,10 +2301,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// Above that threshold the kernel spills to <paramref name="scoresScratch"/>
     /// which must have room for <c>numHeads × maxSeqLen</c> floats.
     /// </summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
     public void AttentionSwa(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
                              Tensor? scoresScratch,
                              int position, int windowSize, int headDim,
-                             int numHeads, int numKvHeads, int maxSeqLen)
+                             int numHeads, int numKvHeads, int maxSeqLen,
+                             float attnScale = -1f)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
@@ -2203,15 +2323,51 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         nint ssP = scoresScratch is { } sv ? GetDevPtr(sv) : nint.Zero;
         int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim;
         int  pWS = windowStart, pWE = windowEnd, pMSL = maxSeqLen;
-        nint* args = stackalloc nint[11]
+        float pScale = attnScale;
+        nint* args = stackalloc nint[12]
         {
             (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
             (nint)(&ssP),
             (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
-            (nint)(&pWS), (nint)(&pWE), (nint)(&pMSL)
+            (nint)(&pWS), (nint)(&pWE), (nint)(&pMSL), (nint)(&pScale)
         };
         int r = NvrtcInterop.LaunchKernel(_attentionSwaKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_swa) failed: {r}");
+    }
+
+    /// <summary>
+    /// Batched <see cref="AttentionSwa"/> over <paramref name="nTok"/> query tokens
+    /// (Gemma 4 SWA layers in batched-trunk prefill). Query token <c>i</c> sits at
+    /// absolute position <c>startPos+i</c> and attends its sliding window. The window
+    /// bounds eff_seq ≤ <paramref name="windowSize"/>, so the shared-scores path always
+    /// suffices (windowSize ≤ 4096 required). Bit-identical per (head, token) to the
+    /// per-token kernel — no global scores scratch needed.
+    /// </summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
+    public void AttentionSwaBatched(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
+        int numHeads, int numKvHeads, int headDim,
+        int startPos, int windowSize, int maxSeqLen, int nTok, float attnScale = -1f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (windowSize <= 0 || windowSize > 4096)
+            throw new ArgumentException(
+                $"AttentionSwaBatched requires 0 < windowSize ≤ 4096 (shared-scores path); got {windowSize}.",
+                nameof(windowSize));
+
+        nint qP = GetDevPtr(qAll), kP = GetDevPtr(kCache), vP = GetDevPtr(vCache), oP = GetDevPtr(outAll);
+        int pNH = numHeads, pNKV = numKvHeads, pHD = headDim;
+        int pSP = startPos, pWS = windowSize, pMSL = maxSeqLen, pN = nTok;
+        float pScale = attnScale;
+        nint* args = stackalloc nint[12]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pSP), (nint)(&pWS), (nint)(&pMSL), (nint)(&pN), (nint)(&pScale)
+        };
+        int r = NvrtcInterop.LaunchKernel(_attentionSwaBatchedKernel, (uint)numHeads, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_swa_batched) failed: {r}");
     }
 
     /// <summary>
@@ -2336,9 +2492,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// MUST guarantee <c>startPos + nTok ≤ 4096</c> (every block's seqLen stays
     /// ≤ MAX_STORED_SCORES). Beyond that, fall back to the per-token loop.</para>
     /// </summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
     public void AttentionBatched(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
                                  int numHeads, int numKvHeads, int headDim,
-                                 int startPos, int maxSeqLen, int nTok)
+                                 int startPos, int maxSeqLen, int nTok, float attnScale = -1f)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
@@ -2349,10 +2506,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
         nint qP = GetDevPtr(qAll), kP = GetDevPtr(kCache), vP = GetDevPtr(vCache), oP = GetDevPtr(outAll);
         int pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pSP = startPos, pMSL = maxSeqLen, pN = nTok;
-        nint* args = stackalloc nint[10]
+        float pScale = attnScale;
+        nint* args = stackalloc nint[11]
         {
             (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
-            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD), (nint)(&pSP), (nint)(&pMSL), (nint)(&pN)
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD), (nint)(&pSP), (nint)(&pMSL), (nint)(&pN), (nint)(&pScale)
         };
         int r = NvrtcInterop.LaunchKernel(_fullSeqAttentionKernel, (uint)numHeads, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(full_seq_attention) failed: {r}");
@@ -3443,7 +3601,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _addScaledKernel, _clampKernel, _pshuffleKernel, _punshuffleKernel, _upsample2xKernel,
             _rmsNormKernel, _headNormKernel, _headNormPureKernel, _siluMulKernel, _sigmoidKernel,
             _softmaxKernel, _ropeInterleavedKernel, _ropeNeoxKernel, _ropeNeoxPartialKernel,
-            _ropeNeoxWithFactorsKernel,
+            _ropeNeoxWithFactorsKernel, _ropeNeoxWithFactorsBatchedKernel,
             _mulKernel, _sigmoidMulInPlaceKernel, _splitQgKernel, _kvAppendKernel,
             _kvAppendBf16Kernel,
             _snapKvScoreKernel, _snapKvScoreBf16Kernel,
@@ -3454,10 +3612,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _matvecQ80Kernel,
             _matvecF32N2Kernel, _matvecQ4KN2Kernel, _matvecQ5KN2Kernel, _matvecQ6KN2Kernel,
             _matvecF32GemmNKernel, _matvecQ4KGemmNKernel, _matvecQ5KGemmNKernel, _matvecQ6KGemmNKernel,
-            _rmsNormBatchedKernel, _headNormBatchedKernel,
+            _matvecQ80GemmNKernel,
+            _rmsNormBatchedKernel, _headNormBatchedKernel, _headNormQkKernel, _headNormQkBatchedKernel,
             _splitQgBatchedKernel, _ropeNeoxPartialBatchedKernel,
-            _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel,
-            _geluTanhMulKernel, _softcapKernel,
+            _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel, _attentionSwaBatchedKernel,
+            _geluTanhMulKernel, _geluTanhMulStridedKernel, _softcapKernel,
             _clearF32Kernel, _quantizeQ81Kernel,
             _scaleRowsKernel, _moeWeightedReduceKernel,
             _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
@@ -3526,14 +3685,20 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _matvecQ4KGemmNKernel  = GetKernelFunc("llm_matvec_q4k_gemm_n");
         _matvecQ5KGemmNKernel  = GetKernelFunc("llm_matvec_q5k_gemm_n");
         _matvecQ6KGemmNKernel  = GetKernelFunc("llm_matvec_q6k_gemm_n");
+        _matvecQ80GemmNKernel  = GetKernelFunc("llm_matvec_q8_0_gemm_n");
         _rmsNormBatchedKernel  = GetKernelFunc("llm_rmsnorm_batched");
         _headNormBatchedKernel = GetKernelFunc("llm_head_norm_batched");
+        _headNormQkKernel        = GetKernelFunc("llm_head_norm_qk");
+        _headNormQkBatchedKernel = GetKernelFunc("llm_head_norm_qk_batched");
         _splitQgBatchedKernel  = GetKernelFunc("llm_split_qg_batched");
         _ropeNeoxPartialBatchedKernel = GetKernelFunc("llm_rope_neox_partial_batched");
+        _ropeNeoxWithFactorsBatchedKernel = GetKernelFunc("llm_rope_neox_with_factors_batched");
         _attentionKernel       = GetKernelFunc("llm_attention");
         _attentionBf16Kernel   = GetKernelFunc("llm_attention_bf16");
         _attentionSwaKernel    = GetKernelFunc("llm_attention_swa");
+        _attentionSwaBatchedKernel = GetKernelFunc("llm_attention_swa_batched");
         _geluTanhMulKernel     = GetKernelFunc("llm_gelu_tanh_mul");
+        _geluTanhMulStridedKernel = GetKernelFunc("llm_gelu_tanh_mul_strided");
         _softcapKernel         = GetKernelFunc("llm_softcap_inplace");
         _clearF32Kernel        = GetKernelFunc("llm_clear_f32");
         _quantizeQ81Kernel     = GetKernelFunc("llm_quantize_q8_1");
