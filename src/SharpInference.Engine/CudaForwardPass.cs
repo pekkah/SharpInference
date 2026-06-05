@@ -330,6 +330,21 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             }
         }
 
+        // SnapKV cannot compose with Gemma-4-like models: their SWA layers use
+        // sliding-window ring caches and layers carry per-layer head_dim, so the
+        // full-context scoring + uniform-kvDim compaction in ApplySnapKvEviction would
+        // mis-index those caches (out-of-range gather, wrong row stride). Force it off
+        // rather than silently corrupt the cache; warn only if it was explicitly asked for.
+        if (_isGemma4Like && _snapKvEffectiveBudget > 0)
+        {
+            if (_snapKvCfg.IsBudgetExplicit)
+                Console.Error.WriteLine(
+                    "[CudaForwardPass] SnapKV is not supported for Gemma-4-style models " +
+                    "(sliding-window ring caches + per-layer head_dim); ignoring the " +
+                    "configured budget and using the full KV cache.");
+            _snapKvEffectiveBudget = 0;
+        }
+
         Console.Error.WriteLine($"[CudaForwardPass] Context size: {_maxSeqLen} (model max: {hp.ContextLength}){(_tqEnabled ? " [TQ3]" : "")}");
 
         bool vramTrace = Environment.GetEnvironmentVariable("SHARPI_TRACE_VRAM") == "1";
@@ -777,11 +792,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private bool _useCudaGraph =
         Environment.GetEnvironmentVariable("SHARPI_CUDA_GRAPH") == "1";
     private bool _graphCaptured;
-    // Set once SnapKV actually compacts the KV cache (K < N) — that's what breaks the
-    // captured seqLen == position+1 invariant. A merely *configured* SnapKV budget that
-    // never evicts (prompt <= budget) leaves the cache filling sequentially, so graphs
-    // stay valid. Reset on a full ResetCache.
-    private bool _snapKvEvicted;
+    // Number of KV entries SnapKV physically dropped when it compacted the cache
+    // (= N - K at eviction, 0 otherwise). Decode indexes the compacted cache by the
+    // *physical* slot `position - _kvEvictedCount` while RoPE keeps the logical
+    // `position`; without this the post-eviction decode reads stale/duplicated slots
+    // (cache-fill != absolute position). Also gates CUDA graphs off once > 0 — a
+    // compacted cache breaks the captured seqLen == position+1 invariant. A configured
+    // SnapKV budget that never evicts (prompt <= budget) leaves this 0, so the cache
+    // fills sequentially and graphs stay valid. Reset on a full ResetCache.
+    private int _kvEvictedCount;
 
     /// <summary>
     /// Enable/disable CUDA-graph capture+replay for the Gemma 4 decode loop. Defaults from
@@ -918,10 +937,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             }
             else
             {
-                _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer], kvDim, position, _maxSeqLen);
+                // Index the cache by the physical slot. After a SnapKV eviction the cache
+                // is compacted to K entries, so the next write lands at
+                // `position - _kvEvictedCount` (= position when nothing was evicted), and
+                // attention reads that many + 1. RoPE above still uses the logical position.
+                int kvSlot = position - _kvEvictedCount;
+                _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer], kvDim, kvSlot, _maxSeqLen);
                 _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
                     _attnScoresScratch,
-                    _numHeads, _numKvHeads, _headDim, position + 1, _maxSeqLen);
+                    _numHeads, _numKvHeads, _headDim, kvSlot + 1, _maxSeqLen);
             }
 
             GpuMatMul(_hidden, _wo[layer], _attnOut);
@@ -1159,8 +1183,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // position+1). TurboQuant (extra host-synced rotate/compress ops) and an *actual*
         // SnapKV eviction (cache compacted, so cache-fill != absolute position) break that.
         // A configured-but-unevicted SnapKV budget does not — the cache still fills
-        // sequentially — so gate on _snapKvEvicted, not on the budget being set.
-        if (_snapKvEvicted || _tqEnabled)
+        // sequentially — so gate on an actual eviction (_kvEvictedCount > 0), not on the
+        // budget being set.
+        if (_kvEvictedCount > 0 || _tqEnabled)
             return false;
 
         // Steady state: graph already captured — just replay at the new position.
@@ -1336,10 +1361,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             }
 
             int kvDim = _numKvHeads * _headDim;
-            _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer], kvDim, position, _maxSeqLen);
+            // Physical KV slot (= position unless SnapKV compacted the cache). See the
+            // matching note in Forward.
+            int kvSlot = position - _kvEvictedCount;
+            _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer], kvDim, kvSlot, _maxSeqLen);
             _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
                 _attnScoresScratch,
-                _numHeads, _numKvHeads, _headDim, position + 1, _maxSeqLen);
+                _numHeads, _numKvHeads, _headDim, kvSlot + 1, _maxSeqLen);
             _gpu.Synchronize();
             AccPhase(PH_KV_ATTN, sw, ref t0);
 
@@ -1958,10 +1986,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // CudaForwardPass — actual data lives in _gpuKCache/_gpuVCache.
         _kvLength = K;
         _kvCache.TruncateTo(K);
-        // The cache is now compacted (cache-fill K < absolute position), which breaks the
-        // CUDA-graph seqLen == position+1 invariant — disable graph replay for this
-        // sequence (re-enabled on a full ResetCache).
-        _snapKvEvicted = true;
+        // The cache is now compacted: K physical entries at slots [0, K) but the logical
+        // RoPE positions continue at N, N+1, … So decode must index the cache by the
+        // physical slot `position - _kvEvictedCount`. This also disables CUDA-graph replay
+        // for the sequence (the seqLen == position+1 invariant no longer holds); both are
+        // re-enabled on a full ResetCache.
+        _kvEvictedCount = N - K;
     }
 
     private void EnsureSnapKvCaptureBuffer(int W)
@@ -2022,7 +2052,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         _tqCompressedLen = 0;
         _fp32WriteIdx = 0;
         _fp32Count = 0;
-        _snapKvEvicted = false; // fresh sequence — standard sequential cache state restored
+        _kvEvictedCount = 0; // fresh sequence — standard sequential cache state restored
     }
 
     private void GpuMatMul(Tensor output, Tensor weights, Tensor input)

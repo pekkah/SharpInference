@@ -183,12 +183,12 @@ public sealed class Gemma4CudaGraphParityTests
     [Fact]
     public void Gemma4_E4B_CudaGraph_AllGpu_SnapKvConfiguredNoEvict_BitMatches()
     {
-        // Regression guard for the precise SnapKV gate: when a SnapKV budget is
-        // *configured* but the prompt fits under it (no eviction), the KV cache fills
-        // sequentially and the graph's seqLen == position+1 invariant still holds, so
-        // graphs MUST engage (and match bit-for-bit). The coarse "budget > 0" guard
-        // wrongly disabled them here — this is the default-bench scenario (972-token
-        // prompt under the 1024 auto-budget).
+        // Regression guard: a configured SHARPI_SNAPKV_BUDGET must not break Gemma 4 graph
+        // decode. SnapKV is force-disabled for Gemma-4-style models (SWA ring caches +
+        // per-layer head_dim can't be SnapKV-compacted), so the cache fills sequentially
+        // and graphs MUST engage and match bit-for-bit. (Even on a full-attention model
+        // where SnapKV stays enabled, a configured-but-unevicted budget keeps
+        // _kvEvictedCount == 0, so the same invariant holds.)
         if (!CudaBackend.IsAvailable()) return;
         var path = FindModelPath();
         if (path is null) return;
@@ -234,9 +234,9 @@ public sealed class Gemma4CudaGraphParityTests
                     AssertBitIdentical(refLogits[i], fwd.Forward(refTokens[i - 1], pos++), step: i);
 
                 Assert.True(gpu.GraphReady,
-                    "Graphs must engage when SnapKV is configured but the prompt fits the budget " +
-                    "(no eviction). GraphReady=false means the _snapKvEvicted gate is over-broad " +
-                    "and the default-config win is lost.");
+                    "Graphs must engage when a SnapKV budget is set but no eviction occurs " +
+                    "(SnapKV is disabled for Gemma 4, or the prompt fits the budget). " +
+                    "GraphReady=false means the _kvEvictedCount gate is over-broad.");
             }
         }
         finally
