@@ -1529,6 +1529,129 @@ extern ""C"" __global__ void llm_mmq_q8_0(
 #undef MMQ_BM
 #undef MMQ_BN
 
+// ── SoA-layout int8 MMQ (issue #149) ───────────────────────────────────────
+// Same tiling/mma as llm_mmq_q8_0, but the Q8_0 weights are pre-repacked into a
+// struct-of-arrays layout: `qw` holds the 32 int8 quants per block contiguous and
+// 16-byte aligned (8 uints/block, row-major by (row*nb+kb)), and `ws` holds the
+// fp16 block scales separately. This kills the AoS tax: in the interleaved 34-byte
+// layout the qs start at a 2-byte offset, so every weight word costs an extra load
+// + __funnelshift (sharpi_uint_at); here every weight word is a plain aligned load.
+// The roofline probe put the interleaved MMQ at 23-34% of int8 TC peak, inner-loop-
+// bound on exactly this. Activations (Q8_1) are already 4-aligned, so only the
+// weight-load path changes. Bit-identical to llm_mmq_q8_0 given a faithful repack.
+#define MMQ_BM 64
+#define MMQ_BN 128
+extern ""C"" __global__ void llm_mmq_q8_0_soa(
+    const unsigned int*   __restrict__ qw,       // quants, 8 uint/block, [(row*nb+kb)*8 + j]
+    const unsigned short* __restrict__ ws,       // fp16 block scales, [row*nb + kb]
+    const unsigned char*  __restrict__ y_q81,    // Q8_1 [n_tok × cols], 36 B/block
+    float* __restrict__ output,                  // [n_tok × rows] fp32
+    int rows, int cols, int n_tok)
+{
+    __shared__ int   sW[MMQ_BM * 8];
+    __shared__ float sWd[MMQ_BM];
+    __shared__ int   sY[MMQ_BN * 8];
+    __shared__ float sYd[MMQ_BN];
+
+    int row_block = (int)blockIdx.x * MMQ_BM;
+    int tok_block = (int)blockIdx.y * MMQ_BN;
+    int nb = cols >> 5;
+
+    int tid  = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int grp  = lane >> 2;
+    int tig  = lane & 3;
+    int wr   = warp & 3;
+    int wc   = warp >> 2;
+    int mrow0 = wr * 16;
+
+    float acc[8][4];
+    #pragma unroll
+    for (int n = 0; n < 8; n++) { acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.f; }
+
+    // Register-prefetch double-buffer, SoA weights: aligned uint loads (no funnelshift).
+    unsigned int rW0, rW1, rY0, rY1, rY2, rY3;
+    float rWd, rYd;
+    #define MMQ_LOAD_TILE_SOA(KB) do { \
+        int gw0 = row_block + (tid >> 3); \
+        rW0 = (gw0 < rows) ? qw[((long)gw0 * nb + (KB)) * 8L + (tid & 7)] : 0u; \
+        int gw1 = row_block + ((tid + 256) >> 3); \
+        rW1 = (gw1 < rows) ? qw[((long)gw1 * nb + (KB)) * 8L + ((tid + 256) & 7)] : 0u; \
+        if (tid < MMQ_BM) { int gw = row_block + tid; \
+            rWd = (gw < rows) ? sharpi_fp16_to_fp32(ws[(long)gw * nb + (KB)]) : 0.f; } \
+        int gy0 = tok_block + (tid >> 3); \
+        rY0 = (gy0 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy0 * nb + (KB)) * 36L + 4 + (long)(tid & 7) * 4) : 0u; \
+        int gy1 = tok_block + ((tid + 256) >> 3); \
+        rY1 = (gy1 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy1 * nb + (KB)) * 36L + 4 + (long)((tid + 256) & 7) * 4) : 0u; \
+        int gy2 = tok_block + ((tid + 512) >> 3); \
+        rY2 = (gy2 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy2 * nb + (KB)) * 36L + 4 + (long)((tid + 512) & 7) * 4) : 0u; \
+        int gy3 = tok_block + ((tid + 768) >> 3); \
+        rY3 = (gy3 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy3 * nb + (KB)) * 36L + 4 + (long)((tid + 768) & 7) * 4) : 0u; \
+        if (tid < MMQ_BN) { int gt = tok_block + tid; \
+            rYd = (gt < n_tok) ? sharpi_fp16_to_fp32((*reinterpret_cast<const unsigned int*>(y_q81 + ((long)gt * nb + (KB)) * 36L)) & 0xffffu) : 0.f; } \
+    } while (0)
+
+    MMQ_LOAD_TILE_SOA(0);
+
+    for (int kb = 0; kb < nb; kb++) {
+        sW[tid] = (int)rW0; sW[tid + 256] = (int)rW1;
+        if (tid < MMQ_BM) sWd[tid] = rWd;
+        sY[tid] = (int)rY0; sY[tid + 256] = (int)rY1; sY[tid + 512] = (int)rY2; sY[tid + 768] = (int)rY3;
+        if (tid < MMQ_BN) sYd[tid] = rYd;
+        __syncthreads();
+
+        if (kb + 1 < nb) MMQ_LOAD_TILE_SOA(kb + 1);
+
+        int a0 = sW[(mrow0 + grp) * 8     + tig];
+        int a1 = sW[(mrow0 + grp + 8) * 8 + tig];
+        int a2 = sW[(mrow0 + grp) * 8     + tig + 4];
+        int a3 = sW[(mrow0 + grp + 8) * 8 + tig + 4];
+        float dwA = sWd[mrow0 + grp];
+        float dwB = sWd[mrow0 + grp + 8];
+
+        #pragma unroll
+        for (int nt = 0; nt < 8; nt++) {
+            int ncol0 = wc * 64 + nt * 8;
+            int b0 = sY[(ncol0 + grp) * 8 + tig];
+            int b1 = sY[(ncol0 + grp) * 8 + tig + 4];
+            float daC0 = sYd[ncol0 + tig * 2];
+            float daC1 = sYd[ncol0 + tig * 2 + 1];
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            asm(
+              ""mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 ""
+              ""{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};""
+              : ""+r""(c0), ""+r""(c1), ""+r""(c2), ""+r""(c3)
+              : ""r""(a0), ""r""(a1), ""r""(a2), ""r""(a3), ""r""(b0), ""r""(b1));
+            acc[nt][0] += (float)c0 * dwA * daC0;
+            acc[nt][1] += (float)c1 * dwA * daC1;
+            acc[nt][2] += (float)c2 * dwB * daC0;
+            acc[nt][3] += (float)c3 * dwB * daC1;
+        }
+        __syncthreads();
+    }
+
+    int rowA = row_block + mrow0 + grp;
+    int rowB = rowA + 8;
+    #pragma unroll
+    for (int nt = 0; nt < 8; nt++) {
+        int ncol0 = tok_block + wc * 64 + nt * 8;
+        int tokC0 = ncol0 + tig * 2;
+        int tokC1 = ncol0 + tig * 2 + 1;
+        if (rowA < rows) {
+            if (tokC0 < n_tok) output[(long)tokC0 * rows + rowA] = acc[nt][0];
+            if (tokC1 < n_tok) output[(long)tokC1 * rows + rowA] = acc[nt][1];
+        }
+        if (rowB < rows) {
+            if (tokC0 < n_tok) output[(long)tokC0 * rows + rowB] = acc[nt][2];
+            if (tokC1 < n_tok) output[(long)tokC1 * rows + rowB] = acc[nt][3];
+        }
+    }
+}
+#undef MMQ_LOAD_TILE_SOA
+#undef MMQ_BM
+#undef MMQ_BN
+
 // Q8_0 GEMM-N: N tokens through one weight matrix. grid=( (rows+7)/8, n_tok ).
 // Input [n_tok, cols] and output [n_tok, rows] are offset by token; the per-row
 // accumulation + warp reduce is identical to llm_matvec_q8_0, so this is

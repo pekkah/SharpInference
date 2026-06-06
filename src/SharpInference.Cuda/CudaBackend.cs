@@ -161,6 +161,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // Issue #141 (MMQ): int8 tensor-core Q8_0×Q8_1 matmul — weight read once as
     // int8, no fp16 HBM round-trip, m16n8k32 s8 mma. Replaces the dequant→GEMM path.
     private nint   _mmqQ80Kernel;
+    // Issue #149: SoA-layout MMQ (quants 16B-aligned, scales separate) — kills the
+    // Q8_0 qs 2-byte-misalignment funnelshift tax in the weight load.
+    private nint   _mmqQ80SoaKernel;
     // Issue #111: batched trunk elementwise/norm kernels (one launch over N tokens).
     private nint   _rmsNormBatchedKernel;
     private nint   _headNormBatchedKernel;
@@ -1857,6 +1860,68 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             int rm = NvrtcInterop.LaunchKernel(_mmqQ80Kernel, gx, gy, 1,
                                                256, 1, 1, 0, _stream, args, null);
             if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(mmq_q8_0) failed: {rm}");
+        }
+    }
+
+    /// <summary>
+    /// Issue #149: SoA-layout variant of <see cref="MatMulBatchedMmq"/>. Identical
+    /// math/output, but the Q8_0 weights are passed pre-repacked into a struct-of-
+    /// arrays layout — <paramref name="quants"/> = the 32 int8/block contiguous &amp;
+    /// 16-byte aligned ([rows*cols] bytes), <paramref name="scales"/> = the fp16 block
+    /// scales ([rows*cols/32] ushort) — so the weight load uses plain aligned uint
+    /// reads instead of the funnelshift the interleaved 34-byte block forces. Bit-
+    /// identical to <see cref="MatMulBatchedMmq"/> given a faithful repack.
+    /// </summary>
+    public void MatMulBatchedMmqSoa(Tensor outputAll, Tensor quants, Tensor scales,
+                                    Tensor inputAll, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available on this system.");
+        if (nTok <= 0)
+            throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be > 0.");
+        if (outputAll.ElementCount % nTok != 0 || inputAll.ElementCount % nTok != 0)
+            throw new ArgumentException(
+                $"MatMulBatchedMmqSoa: outputAll ({outputAll.ElementCount}) and inputAll " +
+                $"({inputAll.ElementCount}) element counts must be divisible by nTok ({nTok}).");
+
+        int rows = (int)(outputAll.ElementCount / nTok);
+        int cols = (int)(inputAll.ElementCount / nTok);
+        if ((cols & 31) != 0)
+            throw new InvalidOperationException(
+                $"CUDA MatMulBatchedMmqSoa requires cols % 32 == 0 (got {cols}).");
+
+        nint qwPtr = GetDevPtr(quants);
+        nint wsPtr = GetDevPtr(scales);
+        nint xPtr = GetDevPtr(inputAll);
+        nint yPtr = GetDevPtr(outputAll);
+
+        int subBlocks = cols / 32;
+        long totalSub = (long)subBlocks * nTok;
+        EnsureQ81BatchBuf((nuint)(totalSub * 36L));
+        {
+            nint qIn = xPtr, qOut = _q81BatchBuf;
+            long ce = (long)cols * nTok;
+            if (ce > int.MaxValue)
+                throw new InvalidOperationException($"MatMulBatchedMmqSoa: cols*nTok ({ce}) exceeds int range.");
+            int qN = (int)ce;
+            nint* args = stackalloc nint[3] { (nint)(&qIn), (nint)(&qOut), (nint)(&qN) };
+            int rq = NvrtcInterop.LaunchKernel(_quantizeQ81Kernel, (uint)totalSub, 1, 1,
+                                               32, 1, 1, 0, _stream, args, null);
+            if (rq != 0) throw new InvalidOperationException($"cuLaunchKernel(quantize_q8_1 mmq-soa) failed: {rq}");
+        }
+        {
+            nint q81 = _q81BatchBuf;
+            int pRows = rows, pCols = cols, pN = nTok;
+            nint* args = stackalloc nint[7]
+            {
+                (nint)(&qwPtr), (nint)(&wsPtr), (nint)(&q81), (nint)(&yPtr),
+                (nint)(&pRows), (nint)(&pCols), (nint)(&pN)
+            };
+            uint gx = (uint)((rows + 63) / 64), gy = (uint)((nTok + 127) / 128);
+            int rm = NvrtcInterop.LaunchKernel(_mmqQ80SoaKernel, gx, gy, 1,
+                                               256, 1, 1, 0, _stream, args, null);
+            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(mmq_q8_0_soa) failed: {rm}");
         }
     }
 
@@ -4330,7 +4395,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _matvecQ80Kernel,
             _matvecF32N2Kernel, _matvecQ4KN2Kernel, _matvecQ5KN2Kernel, _matvecQ6KN2Kernel,
             _matvecF32GemmNKernel, _matvecQ4KGemmNKernel, _matvecQ5KGemmNKernel, _matvecQ6KGemmNKernel,
-            _matvecQ80GemmNKernel, _mmqQ80Kernel,
+            _matvecQ80GemmNKernel, _mmqQ80Kernel, _mmqQ80SoaKernel,
             _rmsNormBatchedKernel, _headNormBatchedKernel, _headNormQkKernel, _headNormQkBatchedKernel,
             _splitQgBatchedKernel, _ropeNeoxPartialBatchedKernel,
             _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel, _attentionSwaBatchedKernel,
@@ -4411,6 +4476,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _dequantQ80F16Kernel   = GetKernelFunc("llm_dequant_q8_0_to_f16");
         _f32ToF16Kernel        = GetKernelFunc("llm_f32_to_f16");
         _mmqQ80Kernel          = GetKernelFunc("llm_mmq_q8_0");
+        _mmqQ80SoaKernel       = GetKernelFunc("llm_mmq_q8_0_soa");
         _flashAttnPrefillKernel = GetKernelFunc("llm_flash_attn_prefill_f32");
         _mmaTestM16N8K16Kernel  = GetKernelFunc("llm_mma_test_m16n8k16_f32");
         _flashAttnPrefillTcKernel = GetKernelFunc("llm_flash_attn_prefill_tc");
