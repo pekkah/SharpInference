@@ -915,6 +915,41 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         else
             _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
 
+        // Transformer layers + final norm/output — static topology across tokens (only
+        // `position` varies), so optionally capture it once into a CUDA graph and replay
+        // per token to kill the ~1k-launch/token host overhead (#136/#158). The token-
+        // varying embedding ran above; the TQ ring-advance (host state) and logits
+        // download run after.
+        if (!TryRunDeviceRegionViaGraph(position))
+            RunDeviceRegion(position);
+
+        // After all layers have used the same FP32 indices for this token, advance the
+        // TQ ring-buffer state (shared across layers). Pure host-state mutation for the
+        // NEXT token — kept outside the captured region (it would break static topology,
+        // and TQ already bails graphs off anyway).
+        if (_tqEnabled)
+        {
+            if (_fp32Count >= _tqFp32Window)
+                _tqCompressedLen++;
+            _fp32WriteIdx = (_fp32WriteIdx + 1) % _tqFp32Window;
+            if (_fp32Count < _tqFp32Window)
+                _fp32Count++;
+        }
+
+        _gpu.Download(_logits, _logitsBuf);
+        _gpu.Synchronize();
+
+        _kvLength = Math.Max(_kvLength, position + 1);
+        return _logitsBuf;
+    }
+
+    // Transformer layer loop + final norm/output — the pure on-device-compute region the
+    // CUDA-graph path captures. Token-varying embedding runs before it; the TQ ring-advance
+    // (host state) and logits download + sync run after. Only `position` varies across
+    // tokens. Contains the TQ-hybrid and SnapKV-capture blocks for the direct-launch path;
+    // both are host-gated off whenever graphs are active (see TryRunDeviceRegionViaGraph).
+    private void RunDeviceRegion(int position)
+    {
         for (int layer = 0; layer < _hp.NumLayers; layer++)
         {
             // residual = hidden
@@ -1060,25 +1095,71 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             _gpu.AddInPlace(_hidden, _residual);
         }
 
-        // After all layers have used the same FP32 indices for this token, advance
-        // the TQ ring-buffer state (shared across layers).
-        if (_tqEnabled)
-        {
-            if (_fp32Count >= _tqFp32Window)
-                _tqCompressedLen++;
-            _fp32WriteIdx = (_fp32WriteIdx + 1) % _tqFp32Window;
-            if (_fp32Count < _tqFp32Window)
-                _fp32Count++;
-        }
-
         _gpu.RmsNorm(_hidden, _hidden, _wOutputNorm, _hp.RmsNormEps);
         GpuMatMul(_logits, _wOutput, _hidden);
+    }
 
-        _gpu.Download(_logits, _logitsBuf);
-        _gpu.Synchronize();
+    // CUDA-graph capture/replay for the non-Gemma dense decode region (#158, mirrors the
+    // Gemma TryRunGemma4DeviceRegionViaGraph). Returns true if the logits were produced via
+    // the graph (captured on the first eligible token, replayed after); false means the
+    // caller must run the region with direct launches. Any capture/replay failure disables
+    // graphs for the rest of the session and degrades to direct launches.
+    private bool TryRunDeviceRegionViaGraph(int position)
+    {
+        if (!_useCudaGraph || !_gpu.GraphCaptureSupported)
+            return false;
 
-        _kvLength = Math.Max(_kvLength, position + 1);
-        return _logitsBuf;
+        // Graphs bake in the standard decode invariant (fixed topology, seqLen ==
+        // position+1, no host-varying device offsets). Three things break that and must
+        // bail to direct launches:
+        //  • TurboQuant — extra host-synced rotate/compress ops + a ring whose advance is
+        //    host state (the if/else attention branch also flips once a row evicts).
+        //  • An actual SnapKV eviction — the cache is compacted, so cache-fill != absolute
+        //    position. A configured-but-unevicted budget keeps _kvEvictedCount == 0 and is
+        //    fine (the cache still fills sequentially).
+        //  • An active SnapKV Q-capture window (_snapKvCaptureSlot >= 0, prefill scoring
+        //    only) — its per-layer CopyDeviceRegion writes to a host-computed slot offset
+        //    that would be baked wrong on replay. Pure decode keeps the slot at -1, so the
+        //    capture block is dormant and never enters the captured graph.
+        //  • MoE — MoeFfn does a router Download + Synchronize mid-layer, which is illegal
+        //    during stream capture (it would error the stream).
+        if (_tqEnabled || _kvEvictedCount > 0 || _snapKvCaptureSlot >= 0 || _isMoE)
+            return false;
+
+        // Steady state: graph already captured — just replay at the new position.
+        if (_graphCaptured && _gpu.GraphReady)
+        {
+            try { _gpu.LaunchGraphForPosition(position); return true; }
+            catch { _useCudaGraph = false; _graphCaptured = false; return false; }
+        }
+
+        if (_graphCaptured)
+            return false; // latched but not ready — shouldn't happen; stay on direct launches
+
+        // First eligible token: pre-grow the Q4_K/Q8_0 dp4a Q8_1 input scratch to the widest
+        // decode matvec (FFN-down cols = intermDim, output proj cols = embDim) BEFORE capture
+        // — DispatchMatVecQ4K/Dp4a grow it on demand via cudaMalloc, which capture forbids.
+        _gpu.EnsureQ81Scratch(Math.Max(_embDim, _intermDim));
+
+        // Capture the region (records onto the stream without executing) then launch it for
+        // real. On any failure the region was NOT executed, so the caller re-runs it directly.
+        try
+        {
+            if (!_gpu.TryBeginGraphCapture())
+                return false;
+            RunDeviceRegion(position);
+            if (!_gpu.TryEndGraphCaptureAndInstantiate())
+                return false;
+            _gpu.LaunchGraphForPosition(position);
+            _graphCaptured = true;
+            return true;
+        }
+        catch
+        {
+            _gpu.AbortGraphCapture();
+            _useCudaGraph = false;
+            return false;
+        }
     }
 
     /// <summary>
