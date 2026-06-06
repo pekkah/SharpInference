@@ -361,11 +361,12 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
         float cfg     = s.CfgScale > 0f ? s.CfgScale : 1.0f;
 
         // Resolve --device before any GPU call (may set CUDA_VISIBLE_DEVICES). The FLUX upscaler
-        // is the only GPU consumer here; 'none' just leaves it on whatever fallback applies.
+        // is the only GPU consumer here; '--device none' keeps it on the CPU.
         int deviceIndex;
+        bool deviceNone;
         try
         {
-            deviceIndex = GpuDevice.Resolve(s.Device, out _);
+            deviceIndex = GpuDevice.Resolve(s.Device, out deviceNone);
         }
         catch (InvalidOperationException ex)
         {
@@ -405,8 +406,15 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
 
                         if (s.UpscalerPath is not null)
                         {
+                            // --device none keeps the upscaler on the CPU (upscalerGpu stays null).
+                            if (deviceNone)
+                            {
+                                AnsiConsole.MarkupLine("[dim]Upscaler backend:[/] CPU (--device none)");
+                            }
                             // Prefer CudaBackend directly when NVRTC image kernels are available.
                             // Fall back to VulkanBackend, then CudaBackend SGEMM path.
+                            else
+                            {
                             try
                             {
                                 if (CudaBackend.IsAvailable())
@@ -451,6 +459,7 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                                         AnsiConsole.MarkupLine("[dim]Upscaler backend:[/] CPU (no GPU detected)");
                                     }
                                 }
+                            }
                             }
                             ctx.Status("Loading RRDBNet upscaler…");
                             upscaler = RRDBNet.Load(s.UpscalerPath, upscalerGpu);

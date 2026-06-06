@@ -51,7 +51,7 @@ for (int i = 0; i < args.Length; i++)
         case "--ngl" or "--n-gpu-layers" when i + 1 < args.Length: nGpuLayers  = int.Parse(args[++i]); break;
         case "-h" or "--help":
             Console.Error.WriteLine(
-                "usage: sharpi-sample-toolcall -m <model.gguf> [-p <question>] [--temp 0.6] [--backend cpu|cuda] [-g <layers>]");
+                "usage: sharpi-sample-toolcall -m <model.gguf> [-p <question>] [--temp 0.6] [--backend cpu|cuda] [--ngl <layers>]");
             return 0;
     }
 }
