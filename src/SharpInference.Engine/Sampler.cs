@@ -73,7 +73,16 @@ public static class Sampler
 
         // Top-k filtering
         if (p.TopK > 0 && p.TopK < vocabSize)
+        {
             ApplyTopK(probs, p.TopK);
+            // Renormalize the surviving probabilities over the top-k set before min-p /
+            // top-p, so the nucleus cutoff is taken over the post-top-k distribution. This
+            // is the llama.cpp ordering (top-k → renormalize → top-p) and keeps this path
+            // consistent with the SampleTopK fast path, which softmaxes over the k
+            // survivors directly. (min-p is a ratio test, so it is unaffected by the
+            // renormalization; top-p's cumulative cutoff is not.)
+            Normalize(probs);
+        }
 
         // Min-p filtering
         if (p.MinP > 0f)
@@ -93,32 +102,28 @@ public static class Sampler
     /// <summary>
     /// Top-k-first sampling fast path (no logit bias). Selects the top-k logits in one
     /// O(vocab) pass, then applies temperature, softmax, min-p, and top-p over only those
-    /// k candidates — avoiding any full-vocabulary softmax, sort, or allocation.
-    /// Probabilities are normalised over the kept candidates (the same renormalisation the
-    /// full path performs), so the per-token distribution matches.
+    /// k candidates — avoiding the full-vocabulary softmax, sort, and allocation of the
+    /// slow path. Probabilities are softmaxed over the k survivors (i.e. renormalised over
+    /// the top-k set), which is the llama.cpp ordering (top-k → renormalise → top-p) and
+    /// matches the slow path's behaviour: <see cref="Sample"/> renormalises after
+    /// <see cref="ApplyTopK"/> for exactly this reason.
     ///
     /// Repetition penalty (<paramref name="hasPenalty"/>) only ever *lowers* the logits of
     /// recently seen tokens, so it cannot promote a token from outside the top-(k+W) raw
-    /// logits into the post-penalty top-k (W = number of penalised tokens). We therefore
-    /// over-select the top-(k+W) raw candidates, apply the penalty to that small set,
-    /// re-sort, and keep the top-k — bit-identical to penalising the full vocabulary.
+    /// logits into the post-penalty top-k (W = number of penalised tokens, bounded above by
+    /// <c>PreviousTokens.Count</c>). We therefore over-select the top-(k+W) raw candidates,
+    /// apply the penalty to that small set, re-sort, and keep the top-k.
     /// </summary>
     private static int SampleTopK(ReadOnlySpan<float> logits, SamplingParams p, Random rng, bool hasPenalty)
     {
         int k = p.TopK;
         int vocab = logits.Length;
 
-        // Penalty occurrence counts (per-occurrence compounding, matching the full path).
-        Dictionary<int, int>? penCounts = null;
-        int sel = k;
-        if (hasPenalty)
-        {
-            penCounts = new Dictionary<int, int>(p.PreviousTokens!.Count);
-            foreach (int id in p.PreviousTokens!)
-                if ((uint)id < (uint)vocab)
-                    penCounts[id] = penCounts.TryGetValue(id, out int pc) ? pc + 1 : 1;
-            sel = Math.Min(vocab, k + penCounts.Count);   // over-select to cover demotions
-        }
+        // Over-select to cover penalty demotions. W ≤ PreviousTokens.Count (using the raw
+        // count, an upper bound on distinct penalised tokens, avoids a per-token dictionary
+        // allocation on this hot path; the candidate set stays tiny).
+        int prevCount = hasPenalty ? p.PreviousTokens!.Count : 0;
+        int sel = Math.Min(vocab, k + prevCount);
 
         // Select the top-`sel` (idx, logit) descending by logit via threshold insertion.
         Span<int>   idx  = sel <= 256 ? stackalloc int[sel]   : new int[sel];
@@ -134,18 +139,29 @@ public static class Sampler
             vals[j] = v; idx[j] = i;
         }
 
+        // Degenerate guard: no finite logit was selected (e.g. an all -inf vector). Fall
+        // back to greedy over the raw logits, which always yields a valid token index
+        // rather than the Fill(-1) sentinel.
+        if (idx[0] < 0 || float.IsNegativeInfinity(vals[0]))
+            return Greedy(logits);
+
         // Apply repetition penalty to the selected candidates, then re-sort so the top-k
         // reflects the post-penalty order. Penalty is in logit space: positive logits are
-        // divided, negative ones multiplied, once per occurrence.
-        if (penCounts is not null)
+        // divided, negative ones multiplied, once per occurrence in PreviousTokens (the
+        // same per-occurrence compounding as the slow path).
+        if (hasPenalty)
         {
             for (int t = 0; t < sel; t++)
             {
-                if (idx[t] < 0 || !penCounts.TryGetValue(idx[t], out int pc)) continue;
-                float pen = MathF.Pow(p.RepetitionPenalty, pc);
+                if (idx[t] < 0) continue;
+                int occ = 0;
+                foreach (int id in p.PreviousTokens!)
+                    if (id == idx[t]) occ++;
+                if (occ == 0) continue;
+                float pen = MathF.Pow(p.RepetitionPenalty, occ);
                 vals[t] = vals[t] > 0f ? vals[t] / pen : vals[t] * pen;
             }
-            // Insertion re-sort (sel is tiny: k + #distinct-recent ≤ ~128).
+            // Insertion re-sort (sel is tiny: k + PreviousTokens.Count).
             for (int a = 1; a < sel; a++)
             {
                 float v = vals[a]; int id = idx[a]; int b = a - 1;
@@ -162,7 +178,7 @@ public static class Sampler
         for (int t = 0; t < k; t++)
         {
             // Tokens past the real vocab tail (k > #finite logits) stay at -inf → exp = 0.
-            float e = vals[t] == float.NegativeInfinity ? 0f : MathF.Exp(vals[t] * invTemp - max);
+            float e = float.IsNegativeInfinity(vals[t]) ? 0f : MathF.Exp(vals[t] * invTemp - max);
             probs[t] = e;
             sum += e;
         }
@@ -191,7 +207,9 @@ public static class Sampler
             }
         }
 
-        // Sample proportionally over the kept candidates [0, count).
+        // Sample proportionally over the kept candidates [0, count). idx[0] is the argmax
+        // and always valid (guarded above), so it is the safe rounding/empty-set fallback —
+        // never the Fill(-1) sentinel.
         float keptSum = 0f;
         for (int t = 0; t < count; t++) keptSum += probs[t];
         float r = (float)rng.NextDouble() * keptSum;
@@ -199,9 +217,9 @@ public static class Sampler
         for (int t = 0; t < count; t++)
         {
             c += probs[t];
-            if (r <= c) return idx[t];
+            if (r <= c && idx[t] >= 0) return idx[t];
         }
-        return idx[count > 0 ? count - 1 : 0];
+        return idx[0];
     }
 
     /// <summary>
