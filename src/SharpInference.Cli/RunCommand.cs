@@ -251,9 +251,20 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             s_endThinkTokenId = endChannelId;
         }
 
+        // Gemma 4 E4B-it brackets a <|channel>thought block in its chat template but is
+        // NOT a reasoning model — rendering enable_thinking=true makes it try to fill a
+        // think section it wasn't trained for and the output degenerates. Default thinking
+        // OFF for Gemma 4 (its recommended config); --no-thinking still forces it off for
+        // every other model. Pass --temp 1.0 --top-k 64 --top-p 0.95 for Gemma 4.
+        bool modelDefaultsThinkingOff = s_arch == "gemma4";
+        s_noThinking = settings.NoThinking || modelDefaultsThinkingOff;
+        if (modelDefaultsThinkingOff && !settings.NoThinking)
+            AnsiConsole.MarkupLine("[dim]Gemma 4 is not a reasoning model — defaulting to --no-thinking " +
+                "(recommended: --temp 1.0 --top-k 64 --top-p 0.95).[/]");
+
         // Greedy on a reasoning model tends to "wait, but actually" itself into infinite
         // loops; --no-thinking sidesteps the issue since the model won't reason at all.
-        if (s_thinkTokenId > 0 && settings.Temperature == 0f && !settings.NoThinking)
+        if (s_thinkTokenId > 0 && settings.Temperature == 0f && !s_noThinking)
         {
             AnsiConsole.MarkupLine("[yellow]Warning:[/] Greedy decoding (--temp 0) on a reasoning model often produces");
             AnsiConsole.MarkupLine("infinite \"wait, but actually\" loops. Consider [yellow]--temp 0.6 --top-p 0.95 --top-k 20[/].");
@@ -689,7 +700,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         ForwardPass target, ForwardPass draft,
         GgufTokenizer tok, SamplingParams sp)
     {
-        var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt, enableThinking: !s.NoThinking);
+        var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt, enableThinking: !s_noThinking);
         var tokens = tok.Encode(prompt);
 
         if (!s.NoDisplayPrompt)
@@ -747,7 +758,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             if (input is null or "/exit" or "/quit") break;
             if (string.IsNullOrWhiteSpace(input)) continue;
 
-            var prompt = FormatPrompt(input, s.SystemPrompt, enableThinking: !s.NoThinking);
+            var prompt = FormatPrompt(input, s.SystemPrompt, enableThinking: !s_noThinking);
             var tokens = tok.Encode(prompt);
 
             target.Cache.Reset();
@@ -796,7 +807,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         GgufTokenizer tok, SamplingParams sp, Random rng,
         IForwardPass? mtpFwd)
     {
-        var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt, enableThinking: !s.NoThinking);
+        var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt, enableThinking: !s_noThinking);
         var tokens = tok.Encode(prompt);
 
         // SHARPI_RAW_PROMPT bypasses the chat template, so we need to add BOS
@@ -829,7 +840,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         // MTP head AND sampling is greedy AND the user disabled thinking on the chat
         // template (--no-thinking) AND sp.SpecType permits. SHARPI_DISABLE_MTP=1 is
         // a back-compat off-switch that wins.
-        bool useMtp = ResolveCliMtp(mtpFwd, sp, s.NoThinking, out string? mtpReject);
+        bool useMtp = ResolveCliMtp(mtpFwd, sp, s_noThinking, out string? mtpReject);
         if (mtpReject != null)
         {
             AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(mtpReject)}");
@@ -977,7 +988,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             if (input is null or "/exit" or "/quit") break;
             if (string.IsNullOrWhiteSpace(input)) continue;
 
-            var prompt = FormatPrompt(input, s.SystemPrompt, enableThinking: !s.NoThinking);
+            var prompt = FormatPrompt(input, s.SystemPrompt, enableThinking: !s_noThinking);
             var tokens = tok.Encode(prompt);
 
             resetCache();
@@ -1093,6 +1104,9 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     }
 
     private static string s_arch = "qwen2"; // set during model load
+    // Effective "thinking off" state: --no-thinking OR a model whose recommended config
+    // disables reasoning (Gemma 4 E4B-it is not a reasoning model). Set during model load.
+    private static bool s_noThinking;
     private static int s_thinkTokenId = -1;    // <think> token for any model using the <think>/</think> special-token convention
     private static int s_endThinkTokenId = -1; // </think> token for any model using the <think>/</think> special-token convention
     private static JinjaChatTemplate? s_jinja;  // parsed from GGUF tokenizer.chat_template

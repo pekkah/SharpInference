@@ -260,6 +260,51 @@ public sealed class Gemma4CudaForwardPassTests
             $"[{string.Join(",", cudaDecoded)}]. Output is degenerate.");
     }
 
+    /// <summary>
+    /// SnapKV must be force-disabled for Gemma-4-style models: their SWA layers use
+    /// sliding-window ring caches and layers carry per-layer head_dim, so the full-context
+    /// scoring + uniform-kvDim compaction in ApplySnapKvEviction would mis-index the cache.
+    /// With an explicit budget set and an over-budget prompt, KvLength must equal the full
+    /// prompt length (no eviction) rather than collapsing to the budget.
+    /// </summary>
+    [Fact]
+    public void Gemma4_E4B_CudaForward_SnapKvDisabled_NoEvictionEvenOverBudget()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        const int budget = 64;
+        var prev = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_BUDGET");
+        Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", budget.ToString());
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            Assert.NotNull(hp.LayerHeadDim); // confirms this is the Gemma-4-like path
+
+            // Build an over-budget prompt (N > budget AND N > SnapKV window) from valid
+            // mid-vocab token ids — enough to trip the eviction gate if it were enabled.
+            int bosId = ReadIntMetadata(model, "tokenizer.ggml.bos_token_id", fallback: 2);
+            int[] cycle = { 818, 5279, 529, 7001, 563, 1234, 4567, 8901 };
+            var tokens = new int[160];
+            tokens[0] = bosId;
+            for (int i = 1; i < tokens.Length; i++) tokens[i] = cycle[i % cycle.Length];
+
+            using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 1024);
+            var logits = fwd.Prefill(tokens);
+
+            Assert.Equal(hp.VocabSize, logits.Length);
+            // The decisive assertion: SnapKV stayed off, so the cache keeps every token.
+            Assert.Equal(tokens.Length, fwd.KvLength);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", prev);
+        }
+    }
+
     private static int[] TopK(ReadOnlySpan<float> logits, int k)
     {
         var result = new int[k];

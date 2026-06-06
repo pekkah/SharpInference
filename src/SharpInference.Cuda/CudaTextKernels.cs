@@ -32,6 +32,35 @@ __device__ __forceinline__ float sharpi_fp16_to_fp32(unsigned int h)
     return result;
 }
 
+// ── half2 (fp16x2) pack / fma / unpack via inline PTX ──────────────────────
+// NVRTC compiles this source without cuda_fp16.h, so the __half2 intrinsics are
+// unavailable; these wrap the raw PTX. A packed fp16x2 lives in one unsigned int
+// (low half = first element). Used by the flash-attention QK dot to do 2 multiply-
+// accumulates per instruction (FP16x2 path, ~2× the fp32 FMA rate) — the scores
+// tolerate fp16-rounded inputs (argmax-stable), and the running sum over only a few
+// pairs per lane keeps fp16 accumulation error negligible (final reduce is fp32).
+__device__ __forceinline__ unsigned int sharpi_f32x2_to_f16x2(float a, float b)
+{
+    unsigned int r;
+    asm(""{ .reg .b16 lo, hi; cvt.rn.f16.f32 lo, %1; cvt.rn.f16.f32 hi, %2; mov.b32 %0, {lo, hi}; }""
+        : ""=r""(r) : ""f""(a), ""f""(b));
+    return r;
+}
+__device__ __forceinline__ unsigned int sharpi_hfma2(unsigned int a, unsigned int b, unsigned int acc)
+{
+    unsigned int r;
+    asm(""fma.rn.f16x2 %0, %1, %2, %3;"" : ""=r""(r) : ""r""(a), ""r""(b), ""r""(acc));
+    return r;
+}
+// Sum the low and high fp16 halves of a packed fp16x2 into one fp32.
+__device__ __forceinline__ float sharpi_f16x2_sum(unsigned int p)
+{
+    float lo, hi;
+    asm(""{ .reg .b16 l, h; mov.b32 {l, h}, %2; cvt.f32.f16 %0, l; cvt.f32.f16 %1, h; }""
+        : ""=f""(lo), ""=f""(hi) : ""r""(p));
+    return lo + hi;
+}
+
 // Warp-level sum reduction over 32 lanes (full-warp mask).
 __device__ __forceinline__ float sharpi_warp_reduce_sum(float v)
 {
@@ -88,6 +117,21 @@ __device__ __forceinline__ int sharpi_int8_at(const unsigned int* __restrict__ b
 {
     int v = (int)sharpi_byte_at(buf, B);
     return v >= 128 ? v - 256 : v;
+}
+
+// Read a 4-byte little-endian word from a uint32-stride buffer at an arbitrary
+// (possibly 2-byte-aligned) byte offset B. Q8_0 qs start at a 2-byte offset inside
+// each 34-byte block, so a raw int load would be misaligned; this assembles the
+// word from the two covering aligned uints via funnelshift (1 extra load only when
+// B is not 4-aligned). Mirrors llama.cpp's get_int_b2 (vecdotq.cuh).
+__device__ __forceinline__ unsigned int sharpi_uint_at(const unsigned int* __restrict__ buf, long B)
+{
+    long aB = B & ~3L;
+    unsigned int sh = (unsigned int)(B & 3L) * 8u;
+    unsigned int lo = buf[aB >> 2];
+    if (sh == 0u) return lo;
+    unsigned int hi = buf[(aB >> 2) + 1];
+    return __funnelshift_r(lo, hi, sh);
 }
 
 // ── RmsNorm ────────────────────────────────────────────────────────────────
@@ -186,6 +230,43 @@ extern ""C"" __global__ void llm_head_norm_pure(
         data[base_off + i] = data[base_off + i] * scale;
 }
 
+// Dual Q+K HeadNorm: Gemma 4 applies the same per-head RmsNorm to Q (num_heads)
+// and K (num_kv_heads) with separate weights. One launch over num_heads+num_kv_heads
+// blocks halves the launch pair; per block this is bit-identical to llm_head_norm.
+extern ""C"" __global__ void llm_head_norm_qk(
+    float* __restrict__ q_data, const float* __restrict__ q_weight,
+    float* __restrict__ k_data, const float* __restrict__ k_weight,
+    int head_dim, int num_heads, int num_kv_heads, float eps, int weight_stride)
+{
+    __shared__ float sdata[256];
+    unsigned int tid = threadIdx.x;
+    unsigned int blk = blockIdx.x;
+    if ((int)blk >= num_heads + num_kv_heads) return;
+
+    bool is_q = (int)blk < num_heads;
+    int head = is_q ? (int)blk : (int)blk - num_heads;
+    float* data = is_q ? q_data : k_data;
+    const float* weight = is_q ? q_weight : k_weight;
+
+    int base_off = head * head_dim;
+    int w_off    = head * weight_stride;
+
+    float sum = 0.f;
+    for (int i = (int)tid; i < head_dim; i += 256) {
+        float v = data[base_off + i];
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);
+    for (int i = (int)tid; i < head_dim; i += 256)
+        data[base_off + i] = data[base_off + i] * scale * weight[w_off + i];
+}
+
 // ── Fused SiLU(gate) * up ──────────────────────────────────────────────────
 // gate[i] = gate[i] / (1 + exp(-gate[i])) * up[i]
 extern ""C"" __global__ void llm_silu_mul(
@@ -210,6 +291,25 @@ extern ""C"" __global__ void llm_gelu_tanh_mul(
     float g = gate[i];
     float inner = 0.7978845608f * (g + 0.044715f * g * g * g);
     gate[i] = 0.5f * g * (1.0f + tanhf(inner)) * up[i];
+}
+
+// Strided-up variant: gate is [n_tok × width] contiguous; the up operand for
+// token t lives at up + t*up_stride + up_offset (width contiguous floats). Lets
+// batched PLE inject the per-layer slice of a [n_tok × (L*pleWidth)] projection
+// buffer without a gather. Per element bit-identical to llm_gelu_tanh_mul.
+extern ""C"" __global__ void llm_gelu_tanh_mul_strided(
+    float* __restrict__ gate, const float* __restrict__ up,
+    int width, long up_stride, long up_offset, int n_tok)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)n_tok * (long)width;
+    if (idx >= total) return;
+    long t = idx / width;
+    long j = idx % width;
+    float g = gate[idx];
+    float inner = 0.7978845608f * (g + 0.044715f * g * g * g);
+    float u = up[t * up_stride + up_offset + j];
+    gate[idx] = 0.5f * g * (1.0f + tanhf(inner)) * u;
 }
 
 // ── Final-logit softcap (in place) ─────────────────────────────────────────
@@ -371,6 +471,39 @@ extern ""C"" __global__ void llm_rope_neox_with_factors(
     int head_base = h * head_dim;
     int a = head_base + i;
     int b = head_base + i + half_dim;
+    float x0 = x[a];
+    float x1 = x[b];
+    x[a] = x0 * c - x1 * s;
+    x[b] = x0 * s + x1 * c;
+}
+
+// Batched NEOX-with-factors RoPE over N tokens (Gemma 4 global layers in batched
+// prefill). Position for token t is base_position + t; x row stride = num_heads*
+// head_dim. Per row this is bit-identical to llm_rope_neox_with_factors.
+extern ""C"" __global__ void llm_rope_neox_with_factors_batched(
+    float* __restrict__ x,
+    int num_heads, int head_dim, int base_position, float theta,
+    const float* __restrict__ freq_factors, int n_tok)
+{
+    int pair_idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int half_dim = head_dim / 2;
+    int total_pairs = num_heads * half_dim;
+    int token = (int)blockIdx.y;
+    if (pair_idx >= total_pairs || token >= n_tok) return;
+
+    int h = pair_idx / half_dim;
+    int i = pair_idx % half_dim;
+    int position = base_position + token;
+
+    float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)head_dim);
+    freq /= freq_factors[i];
+    float angle = (float)position * freq;
+    float c = cosf(angle);
+    float s = sinf(angle);
+
+    long head_base = (long)token * (long)num_heads * (long)head_dim + (long)h * head_dim;
+    long a = head_base + i;
+    long b = head_base + i + half_dim;
     float x0 = x[a];
     float x1 = x[b];
     x[a] = x0 * c - x1 * s;
@@ -692,6 +825,46 @@ extern ""C"" __global__ void llm_embed_lookup_q8_0(
         int q = (int)(signed char)blk[block_off + 2u + lane];
         output[outer * 256 + (int)tid] = d * (float)q;
 
+        __syncthreads();
+    }
+}
+
+// Batched Q8_0 embedding lookup: one block per query token (grid.x = n_tok),
+// reading token_ids[blockIdx.x] and writing row blockIdx.x of output. Collapses
+// the prefill's per-token EmbedLookupQ8_0 + copy (2·N host launches) into one
+// launch — the per-token body is identical to llm_embed_lookup_q8_0.
+extern ""C"" __global__ void llm_embed_lookup_q8_0_batched(
+    const unsigned char* __restrict__ emb_data,
+    float* __restrict__ output,           // [n_tok * emb_dim]
+    const int* __restrict__ token_ids,    // [n_tok]
+    int n_tok, int emb_dim)
+{
+    __shared__ unsigned char blk[272];
+    unsigned int tid = threadIdx.x;
+    int i = (int)blockIdx.x;
+    if (i >= n_tok) return;
+
+    int token_id = token_ids[i];
+    float* out_row = output + (long)i * emb_dim;
+    int num_blocks = emb_dim >> 5;
+    long bytes_per_row = (long)num_blocks * 34L;
+    long row_byte_base = (long)token_id * bytes_per_row;
+
+    int outer_iters = emb_dim >> 8;
+    for (int outer = 0; outer < outer_iters; outer++) {
+        long base_byte = row_byte_base + (long)(outer * 8) * 34L;
+        if (tid < 272) blk[tid] = emb_data[base_byte + tid];
+        if (tid < 16)  blk[256 + tid] = emb_data[base_byte + 256 + tid];
+        __syncthreads();
+
+        unsigned int block_in_outer = tid >> 5;
+        unsigned int lane           = tid & 31u;
+        unsigned int block_off = block_in_outer * 34u;
+        unsigned int d_bits = (unsigned int)blk[block_off]
+                            | ((unsigned int)blk[block_off + 1u] << 8);
+        float d = sharpi_fp16_to_fp32(d_bits);
+        int q = (int)(signed char)blk[block_off + 2u + lane];
+        out_row[outer * 256 + (int)tid] = d * (float)q;
         __syncthreads();
     }
 }
@@ -1124,6 +1297,316 @@ extern ""C"" __global__ void llm_matvec_q8_0(
 
     float result = sharpi_warp_reduce_sum(acc);
     if (lane == 0) output[row] = result;
+}
+
+// ── MatVec Q8_0 — __dp4a / Q8_1 path (issue #142) ─────────────────────────
+// Decode matvec mirroring llama.cpp's mul_mat_vec_q8_0_q8_1. The input vector is
+// pre-quantized to Q8_1 (36-byte sub-blocks: fp16 d at [0:2], 32 int8 at [4:36]),
+// so each 4-int8 inner product is one __dp4a instruction instead of four
+// int8→float converts + fp32 FMAs — far fewer instructions per byte of weight,
+// pushing the (already memory-coalesced) Q8_0 matvec closer to the HBM ceiling.
+//
+// One output row per block; MATVEC_Q80_NWARPS warps cooperate. Within a warp the
+// 32 lanes split into 4 groups of 8: group g = lane>>3 owns one Q8_0 block of the
+// warp's 4-block stripe; sub-lane s = lane&7 handles int32 word s (4 int8) of that
+// block via one __dp4a. The 8 sub-lane partials are summed (shfl_xor over the
+// group of 8) and scaled by d_w·d_a, then accumulated across the stripe.
+//
+// Q8_0 block = 34 bytes (fp16 d + 32 int8); qs is only 2-byte aligned, so the
+// 4-int8 weight words are assembled with __funnelshift_r from two aligned uint
+// loads (the activation Q8_1 qs at +4 is naturally 4-aligned).
+#define MATVEC_Q80_NWARPS 8
+extern ""C"" __global__ void llm_matvec_q8_0_dp4a(
+    const unsigned int* __restrict__ weights,
+    const unsigned char* __restrict__ y_q81,
+    float* __restrict__ output,
+    int rows, int cols)
+{
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    int warp_id = (int)threadIdx.y;     // 0..NWARPS-1
+    int lane    = (int)threadIdx.x;     // 0..31
+    int grp     = lane >> 3;            // 0..3  block within the warp's 4-block stripe
+    int sub     = lane & 7;             // 0..7  int32 word within the block
+
+    int num_blocks = cols >> 5;         // cols / 32
+    long row_base_bytes = (long)row * (long)num_blocks * 34L;
+
+    float acc = 0.f;
+
+    for (int block0 = warp_id * 4; block0 < num_blocks; block0 += MATVEC_Q80_NWARPS * 4) {
+        int block = block0 + grp;
+        float part = 0.f;
+        if (block < num_blocks) {
+            long b0 = row_base_bytes + (long)block * 34L;
+            unsigned int dlo = sharpi_byte_at(weights, b0);
+            unsigned int dhi = sharpi_byte_at(weights, b0 + 1);
+            float dw = sharpi_fp16_to_fp32(dlo | (dhi << 8));
+
+            // This sub-lane's 4 weight int8 = qs[sub*4 .. sub*4+4) at byte b0+2+sub*4.
+            long wb        = b0 + 2 + (long)sub * 4;
+            long aligned   = wb & ~3L;
+            unsigned int shift = (unsigned int)(wb & 3L) * 8u;
+            unsigned int w_lo = weights[aligned >> 2];
+            int wq;
+            if (shift == 0u) wq = (int)w_lo;
+            else {
+                unsigned int w_hi = weights[(aligned >> 2) + 1];
+                wq = (int)__funnelshift_r(w_lo, w_hi, shift);
+            }
+
+            // Activation Q8_1 sub-block = block; d at base (low 16), 32 int8 at +4.
+            long ab = (long)block * 36L;
+            unsigned int d_bits = (*reinterpret_cast<const unsigned int*>(y_q81 + ab)) & 0xffffu;
+            float da = sharpi_fp16_to_fp32(d_bits);
+            int aq = *reinterpret_cast<const int*>(y_q81 + ab + 4 + (long)sub * 4);
+
+            int dot = __dp4a(wq, aq, 0);
+            part = dw * da * (float)dot;
+        }
+        // Sum the 8 sub-lanes within each aligned group of 8.
+        part += __shfl_xor_sync(0xffffffffu, part, 4);
+        part += __shfl_xor_sync(0xffffffffu, part, 2);
+        part += __shfl_xor_sync(0xffffffffu, part, 1);
+        if (sub == 0) acc += part;
+    }
+
+    // Group leaders (sub==0: lanes 0,8,16,24) hold per-stripe sums; reduce across
+    // the 4 groups and all warps via shared memory.
+    __shared__ float warp_acc[MATVEC_Q80_NWARPS][4];
+    if (sub == 0) warp_acc[warp_id][grp] = acc;
+    __syncthreads();
+    if (warp_id == 0 && lane == 0) {
+        float s = 0.f;
+        #pragma unroll
+        for (int w = 0; w < MATVEC_Q80_NWARPS; w++)
+            for (int g = 0; g < 4; g++) s += warp_acc[w][g];
+        output[row] = s;
+    }
+}
+
+// ── Q8_0 × Q8_1 int8 tensor-core MMQ (issue #141 prefill) ──────────────────
+// Replaces the dequant→fp16→cuBLAS GEMM round-trip with a direct int8 tensor-core
+// multiply: each Q8_0 weight is read once as int8 (no fp16 weight temp written to
+// HBM) and fed to the m16n8k32 s8 mma. Activations are pre-quantized to the
+// 36-byte/block Q8_1 layout (fp16 d at [0:2], 32 int8 at [4:36]) — the same buffer
+// the dp4a decode matvec uses. result[r,t] = Σ_block ( int32(W_blk·Y_blk) · d_w · d_a ).
+// Q8_0 is symmetric (scale only, no min), so — like llama.cpp's D4 layout — there
+// is NO sum/bias correction term; the activation `s` field is never read.
+//
+// The mma fragment register layout follows the PTX m16n8k32.row.col spec exactly:
+//   groupID = lane>>2 (0..7), tig = lane&3 (0..3)
+//   A(16×32 s8): a0=W[grp][tig*4..], a1=W[grp+8][..], a2=W[grp][16+tig*4..], a3=W[grp+8][..]
+//   B(32×8  s8): b0=Y[tig*4..][grp], b1=Y[16+tig*4..][grp]    (col=token=grp)
+//   C(16×8 s32): c0=[grp][tig*2], c1=[grp][tig*2+1], c2=[grp+8][tig*2], c3=[grp+8][tig*2+1]
+//
+// Shared-tiled: a 256-thread block computes a 64(row)×128(token) output tile, looping
+// K in 32-wide Q8_0 blocks. Each K-block stages the weight + activation sub-tiles into
+// shared once; 8 warps (4 row × 2 col) then run 8 m16n8k32 s8 mma's each (one per
+// 8-token N-tile), accumulating per-block-scaled products in fp32 registers. Every
+// weight row is read once per (row-block, K-block) and reused across all 128 tokens in
+// the tile — the weight-read-once property the dequant->fp16->cuBLAS path bought with a
+// 2x fp16 HBM temp, here without the temp and on int8 tensor cores (2x fp16 TC peak).
+// The wide 128-token tile halves the weight re-read factor (nTok/MMQ_BN) vs a 64-token
+// tile, which matters because the Q8_0 qs 2-byte misalignment taxes each weight word.
+#define MMQ_BM 64
+#define MMQ_BN 128
+extern ""C"" __global__ void llm_mmq_q8_0(
+    const unsigned int*  __restrict__ weights,   // Q8_0 [rows × cols], 34 B/block
+    const unsigned char* __restrict__ y_q81,     // Q8_1 [n_tok × cols], 36 B/block
+    float* __restrict__ output,                  // [n_tok × rows] fp32
+    int rows, int cols, int n_tok)
+{
+    __shared__ int   sW[MMQ_BM * 8];   // 64 weight rows × 8 int32 (32 int8)
+    __shared__ float sWd[MMQ_BM];      // 64 weight block-scales
+    __shared__ int   sY[MMQ_BN * 8];   // 128 tokens × 8 int32 acts
+    __shared__ float sYd[MMQ_BN];      // 128 act block-scales
+
+    int row_block = (int)blockIdx.x * MMQ_BM;
+    int tok_block = (int)blockIdx.y * MMQ_BN;
+    int nb = cols >> 5;
+
+    int tid  = (int)threadIdx.x;       // 0..255
+    int warp = tid >> 5;               // 0..7
+    int lane = tid & 31;
+    int grp  = lane >> 2;              // 0..7
+    int tig  = lane & 3;               // 0..3
+    int wr   = warp & 3;               // 0..3 row-group → rows [wr*16 : +16]
+    int wc   = warp >> 2;              // 0..1 col-group → tokens [wc*64 : +64]
+    int mrow0 = wr * 16;
+
+    float acc[8][4];                   // 8 N-tiles × 4 C registers, fp32
+    #pragma unroll
+    for (int n = 0; n < 8; n++) { acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.f; }
+
+    // Register-prefetch double-buffer: each thread stages 2 weight words (li=tid,
+    // tid+256) and 4 act words (li=tid,+256,+512,+768) plus, for tid in range, one
+    // weight/act block-scale. The next K-tile's global loads are issued into these
+    // registers while the current tile's mma's run, so global latency hides behind
+    // compute instead of stalling the per-K-block barrier (cp.async can't be used —
+    // the Q8_0 qs is only 2-byte aligned). Macro loads tile `KB` into the rX regs.
+    unsigned int rW0, rW1, rY0, rY1, rY2, rY3;
+    float rWd, rYd;
+    #define MMQ_LOAD_TILE(KB) do { \
+        int gw0 = row_block + (tid >> 3); \
+        rW0 = (gw0 < rows) ? sharpi_uint_at(weights, ((long)gw0 * nb + (KB)) * 34L + 2 + (long)(tid & 7) * 4) : 0u; \
+        int gw1 = row_block + ((tid + 256) >> 3); \
+        rW1 = (gw1 < rows) ? sharpi_uint_at(weights, ((long)gw1 * nb + (KB)) * 34L + 2 + (long)((tid + 256) & 7) * 4) : 0u; \
+        if (tid < MMQ_BM) { long wb = ((long)(row_block + tid) * nb + (KB)) * 34L; \
+            rWd = (row_block + tid < rows) ? sharpi_fp16_to_fp32(sharpi_byte_at(weights, wb) | (sharpi_byte_at(weights, wb + 1) << 8)) : 0.f; } \
+        int gy0 = tok_block + (tid >> 3); \
+        rY0 = (gy0 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy0 * nb + (KB)) * 36L + 4 + (long)(tid & 7) * 4) : 0u; \
+        int gy1 = tok_block + ((tid + 256) >> 3); \
+        rY1 = (gy1 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy1 * nb + (KB)) * 36L + 4 + (long)((tid + 256) & 7) * 4) : 0u; \
+        int gy2 = tok_block + ((tid + 512) >> 3); \
+        rY2 = (gy2 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy2 * nb + (KB)) * 36L + 4 + (long)((tid + 512) & 7) * 4) : 0u; \
+        int gy3 = tok_block + ((tid + 768) >> 3); \
+        rY3 = (gy3 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy3 * nb + (KB)) * 36L + 4 + (long)((tid + 768) & 7) * 4) : 0u; \
+        if (tid < MMQ_BN) { int gt = tok_block + tid; \
+            rYd = (gt < n_tok) ? sharpi_fp16_to_fp32((*reinterpret_cast<const unsigned int*>(y_q81 + ((long)gt * nb + (KB)) * 36L)) & 0xffffu) : 0.f; } \
+    } while (0)
+
+    MMQ_LOAD_TILE(0);
+
+    for (int kb = 0; kb < nb; kb++) {
+        // Publish the prefetched tile to shared.
+        sW[tid] = (int)rW0; sW[tid + 256] = (int)rW1;
+        if (tid < MMQ_BM) sWd[tid] = rWd;
+        sY[tid] = (int)rY0; sY[tid + 256] = (int)rY1; sY[tid + 512] = (int)rY2; sY[tid + 768] = (int)rY3;
+        if (tid < MMQ_BN) sYd[tid] = rYd;
+        __syncthreads();
+
+        // Issue the next tile's global loads (in flight during the mma's below).
+        if (kb + 1 < nb) MMQ_LOAD_TILE(kb + 1);
+
+        // A fragment for this warp's 16-row tile (read once, reused over 8 N-tiles).
+        int a0 = sW[(mrow0 + grp) * 8     + tig];
+        int a1 = sW[(mrow0 + grp + 8) * 8 + tig];
+        int a2 = sW[(mrow0 + grp) * 8     + tig + 4];
+        int a3 = sW[(mrow0 + grp + 8) * 8 + tig + 4];
+        float dwA = sWd[mrow0 + grp];
+        float dwB = sWd[mrow0 + grp + 8];
+
+        #pragma unroll
+        for (int nt = 0; nt < 8; nt++) {
+            int ncol0 = wc * 64 + nt * 8;
+            int b0 = sY[(ncol0 + grp) * 8 + tig];
+            int b1 = sY[(ncol0 + grp) * 8 + tig + 4];
+            float daC0 = sYd[ncol0 + tig * 2];
+            float daC1 = sYd[ncol0 + tig * 2 + 1];
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            asm(
+              ""mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 ""
+              ""{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};""
+              : ""+r""(c0), ""+r""(c1), ""+r""(c2), ""+r""(c3)
+              : ""r""(a0), ""r""(a1), ""r""(a2), ""r""(a3), ""r""(b0), ""r""(b1));
+            acc[nt][0] += (float)c0 * dwA * daC0;
+            acc[nt][1] += (float)c1 * dwA * daC1;
+            acc[nt][2] += (float)c2 * dwB * daC0;
+            acc[nt][3] += (float)c3 * dwB * daC1;
+        }
+        __syncthreads();
+    }
+
+    int rowA = row_block + mrow0 + grp;
+    int rowB = rowA + 8;
+    #pragma unroll
+    for (int nt = 0; nt < 8; nt++) {
+        int ncol0 = tok_block + wc * 64 + nt * 8;
+        int tokC0 = ncol0 + tig * 2;
+        int tokC1 = ncol0 + tig * 2 + 1;
+        if (rowA < rows) {
+            if (tokC0 < n_tok) output[(long)tokC0 * rows + rowA] = acc[nt][0];
+            if (tokC1 < n_tok) output[(long)tokC1 * rows + rowA] = acc[nt][1];
+        }
+        if (rowB < rows) {
+            if (tokC0 < n_tok) output[(long)tokC0 * rows + rowB] = acc[nt][2];
+            if (tokC1 < n_tok) output[(long)tokC1 * rows + rowB] = acc[nt][3];
+        }
+    }
+}
+#undef MMQ_LOAD_TILE
+#undef MMQ_BM
+#undef MMQ_BN
+
+// Q8_0 GEMM-N: N tokens through one weight matrix. grid=( (rows+7)/8, n_tok ).
+// Input [n_tok, cols] and output [n_tok, rows] are offset by token; the per-row
+// accumulation + warp reduce is identical to llm_matvec_q8_0, so this is
+// bit-identical to n_tok sequential matvecs. (Weights are re-read per token —
+// the launch-count collapse is the win; weight-reuse tiling is a follow-up.)
+extern ""C"" __global__ void llm_matvec_q8_0_gemm_n(
+    const unsigned int* __restrict__ weights,
+    const float* __restrict__ input,   // [n_tok, cols]
+    float* __restrict__ output,        // [n_tok, rows]
+    int rows, int cols, int n_tok)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    int token = (int)blockIdx.y;
+    if (row >= rows || token >= n_tok) return;
+
+    int num_blocks = cols >> 5;
+    long row_base_bytes = (long)row * (long)num_blocks * 34L;
+    const float* in = input + (long)token * (long)cols;
+
+    float acc = 0.f;
+    for (int block = 0; block < num_blocks; block++) {
+        long b0 = row_base_bytes + (long)block * 34L;
+        unsigned int dlo = sharpi_byte_at(weights, b0 + 0);
+        unsigned int dhi = sharpi_byte_at(weights, b0 + 1);
+        float d = sharpi_fp16_to_fp32(dlo | (dhi << 8));
+        int q = sharpi_int8_at(weights, b0 + 2 + (long)lane);
+        float x = in[block * 32 + lane];
+        acc += d * (float)q * x;
+    }
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output[(long)token * (long)rows + row] = result;
+}
+
+// ── Q8_0 → FP16 dequant for cuBLAS prefill GEMM (issue #141) ───────────────
+// Dequantizes a Q8_0-packed weight matrix [rows × cols] into a row-major fp16
+// matrix [rows × cols]. One block per row (256 threads), each thread strides
+// over the row's columns. Element (row, c): super-block b = c >> 5, lane =
+// c & 31; the per-block fp16 scale d lives at byte (row*nb + b)*34, the int8
+// quant at +2+lane. Stored value d*q is rounded to fp16 — this is the only
+// lossy step vs the fp32 matvec (which keeps d*q*x in fp32), and it's what lets
+// the prefill GEMM read each weight once per batch instead of once per token.
+extern ""C"" __global__ void llm_dequant_q8_0_to_f16(
+    const unsigned int* __restrict__ weights,
+    unsigned short* __restrict__ out,    // [rows * cols] fp16
+    int rows, int cols)
+{
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    int num_blocks = cols >> 5;
+    long row_base_bytes = (long)row * (long)num_blocks * 34L;
+    long out_row = (long)row * (long)cols;
+    for (int c = (int)threadIdx.x; c < cols; c += (int)blockDim.x) {
+        int block = c >> 5;
+        int lane  = c & 31;
+        long b0 = row_base_bytes + (long)block * 34L;
+        unsigned int dlo = sharpi_byte_at(weights, b0 + 0);
+        unsigned int dhi = sharpi_byte_at(weights, b0 + 1);
+        float d = sharpi_fp16_to_fp32(dlo | (dhi << 8));
+        int q = sharpi_int8_at(weights, b0 + 2 + (long)lane);
+        out[out_row + c] = (unsigned short)sharpi_fp32_to_fp16(d * (float)q);
+    }
+}
+
+// ── FP32 → FP16 elementwise convert (issue #141) ──────────────────────────
+// Converts the prefill activation batch [n] fp32 → fp16 so it can feed the
+// cuBLAS fp16 GEMM alongside the dequantized weights.
+extern ""C"" __global__ void llm_f32_to_f16(
+    const float* __restrict__ in,
+    unsigned short* __restrict__ out,
+    int n)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) out[i] = (unsigned short)sharpi_fp32_to_fp16(in[i]);
 }
 
 // ── MatVec F32 — N=2 variant (issue #43) ──────────────────────────────────
@@ -1844,6 +2327,46 @@ extern ""C"" __global__ void llm_head_norm_batched(
         data[base_off + i] = data[base_off + i] * scale * weight[w_off + i];
 }
 
+// Batched dual Q+K HeadNorm over N tokens. grid = (num_heads+num_kv_heads, n_tok);
+// Q blocks stride by num_heads*head_dim, K blocks by num_kv_heads*head_dim. Per
+// (block, token) bit-identical to llm_head_norm_batched.
+extern ""C"" __global__ void llm_head_norm_qk_batched(
+    float* __restrict__ q_data, const float* __restrict__ q_weight,
+    float* __restrict__ k_data, const float* __restrict__ k_weight,
+    int head_dim, int num_heads, int num_kv_heads, float eps, int weight_stride, int n_tok)
+{
+    __shared__ float sdata[256];
+    unsigned int tid = threadIdx.x;
+    unsigned int blk = blockIdx.x;
+    int token = (int)blockIdx.y;
+    if ((int)blk >= num_heads + num_kv_heads || token >= n_tok) return;
+
+    bool is_q = (int)blk < num_heads;
+    int head = is_q ? (int)blk : (int)blk - num_heads;
+    float* data = is_q ? q_data : k_data;
+    const float* weight = is_q ? q_weight : k_weight;
+    int heads_here = is_q ? num_heads : num_kv_heads;
+
+    long token_off = (long)token * (long)heads_here * (long)head_dim;
+    long base_off = token_off + (long)head * head_dim;
+    int  w_off    = head * weight_stride;
+
+    float sum = 0.f;
+    for (int i = (int)tid; i < head_dim; i += 256) {
+        float v = data[base_off + i];
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);
+    for (int i = (int)tid; i < head_dim; i += 256)
+        data[base_off + i] = data[base_off + i] * scale * weight[w_off + i];
+}
+
 // Strided de-interleave [Q‖G] → Q, G over N tokens. qg row stride =
 // num_heads*head_dim*2; q/g row stride = num_heads*head_dim.
 extern ""C"" __global__ void llm_split_qg_batched(
@@ -2327,7 +2850,7 @@ extern ""C"" __global__ void llm_attention(
     float* __restrict__ out,
     float* __restrict__ scores_scratch,    // [num_heads * max_seq_len], null when seq_len ≤ MAX_STORED_SCORES
     int num_heads, int num_kv_heads, int head_dim,
-    int seq_len, int max_seq_len)
+    int seq_len, int max_seq_len, float attn_scale)
 {
     const int MAX_STORED_SCORES = 4096;
     __shared__ float shared_scores[MAX_STORED_SCORES];
@@ -2339,7 +2862,7 @@ extern ""C"" __global__ void llm_attention(
 
     int kv_head = (int)h / (num_heads / num_kv_heads);
     int kv_dim  = num_kv_heads * head_dim;
-    float scale = rsqrtf((float)head_dim);
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
     long q_off  = (long)h * (long)head_dim;
     long out_off = q_off;
 
@@ -2434,7 +2957,7 @@ extern ""C"" __global__ void llm_attention_swa(
     float* __restrict__ out,
     float* __restrict__ scores_scratch,    // [num_heads * max_seq_len], null when eff_seq ≤ MAX_STORED_SCORES
     int num_heads, int num_kv_heads, int head_dim,
-    int window_start, int window_end, int max_seq_len)
+    int window_start, int window_end, int max_seq_len, float attn_scale)
 {
     const int MAX_STORED_SCORES = 4096;
     __shared__ float shared_scores[MAX_STORED_SCORES];
@@ -2446,7 +2969,7 @@ extern ""C"" __global__ void llm_attention_swa(
 
     int kv_head = (int)h / (num_heads / num_kv_heads);
     int kv_dim  = num_kv_heads * head_dim;
-    float scale = rsqrtf((float)head_dim);
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
     long q_off  = (long)h * (long)head_dim;
     long out_off = q_off;
 
@@ -2526,6 +3049,243 @@ extern ""C"" __global__ void llm_attention_swa(
             acc += weight * v_cache[v_off + d];
         }
         out[out_off + d] = acc;
+    }
+}
+
+// ── Flash-attention prefill (issue #141 attention) ─────────────────────────
+// Memory-efficient batched SDPA replacing the scalar llm_full_seq_attention /
+// llm_attention_swa_batched (one 256-thread block PER query, each re-reading its
+// whole K/V range from global → O(n²) global traffic; for SWA, adjacent queries'
+// 512-wide windows overlap ~99%, so K/V is re-streamed up to ~512×). Here a block
+// handles a TILE of FA_QT queries of one head and streams K/V in shared-memory
+// tiles of `kt_tile` keys, so each key is read from global once per FA_QT queries
+// (FA_QT× less traffic) and the softmax runs online (running max/sum + rescaled
+// output accumulator, FlashAttention-2 style) — no n²-sized score buffer.
+//
+// One warp = one query. Lane L owns head dims {L, L+32, …}; qreg/oreg hold up to
+// 512/32 = 16 dims/lane. The QK dot is a warp reduce (score is then warp-uniform,
+// so the causal/window mask `continue` and the online-softmax update never diverge
+// within a warp). GQA via kv_head = h/(num_heads/num_kv_heads); per-layer head_dim;
+// causal (key ≤ start_pos+qi) + optional sliding window (window_size>0). Matches the
+// scalar kernels to fp tolerance (online softmax reassociates the same sum), not
+// bit-exact. Dynamic shared = 2*kt_tile*head_dim floats (sized by the host to fit).
+// FA_QT warps/block = queries sharing each K/V tile load (the reuse factor).
+#define FA_QT 16
+extern ""C"" __global__ void llm_flash_attn_prefill_f32(
+    const float* __restrict__ q_all,      // [n_tok, num_heads*head_dim]
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ out_all,          // [n_tok, num_heads*head_dim]
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int window_size, int max_seq_len, int n_tok,
+    int kt_tile, float attn_scale)
+{
+    // Dynamic shared: K as fp16 (half2-packed, hd/2 uints/key) then V as fp32. K is
+    // read with the half2 QK dot (fp16-rounded inputs — argmax-stable); V stays fp32
+    // for the exact scalar PV. Each lane owns dim-PAIRS pi = lane+32*p (dims 2·pi,
+    // 2·pi+1) so the shared half2 loads stay coalesced. host sizes 6·kt_tile·head_dim B.
+    extern __shared__ unsigned int fa_smem[];
+    int hd2 = head_dim >> 1;                       // pairs per key
+    unsigned int* sKh = fa_smem;                   // [kt_tile * hd2] fp16x2
+    float* sV = (float*)(fa_smem + kt_tile * hd2); // [kt_tile * head_dim] fp32
+
+    int h     = (int)blockIdx.x;
+    int warp  = (int)(threadIdx.x >> 5);  // 0..FA_QT-1  (query within the tile)
+    int lane  = (int)(threadIdx.x & 31);
+    int tid   = (int)threadIdx.x;
+    int qi    = (int)blockIdx.y * FA_QT + warp;
+
+    int kv_head = h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
+    int q_dim   = num_heads * head_dim;
+    int ndj2    = (hd2 + 31) >> 5;        // dim-pairs per lane (≤8)
+
+    bool active = (qi < n_tok);
+    int qpos    = start_pos + qi;
+    int win_end = qpos + 1;                                  // keys [.., qpos]
+    int win_start = (window_size > 0) ? (win_end - window_size) : 0;
+    if (win_start < 0) win_start = 0;
+
+    unsigned int qh2[8];                 // this query's dim-pairs, fp16x2-packed
+    float oreg[16];                      // PV accumulator, fp32, 2 per pair
+    #pragma unroll
+    for (int p = 0; p < 8; p++) { qh2[p] = 0u; oreg[2 * p] = 0.f; oreg[2 * p + 1] = 0.f; }
+    if (active) {
+        long q_base = (long)qi * q_dim + (long)h * head_dim;
+        for (int p = 0; p < ndj2; p++) {
+            int pi = lane + 32 * p;
+            if (pi < hd2) qh2[p] = sharpi_f32x2_to_f16x2(q_all[q_base + 2 * pi], q_all[q_base + 2 * pi + 1]);
+        }
+    }
+    float m_run = sharpi_neg_inf();
+    float l_run = 0.f;
+
+    // Union key range over the FA_QT queries in this block.
+    int last_qi = (int)blockIdx.y * FA_QT + (FA_QT - 1);
+    if (last_qi > n_tok - 1) last_qi = n_tok - 1;
+    int blk_key_end = (start_pos + last_qi) + 1;
+    int first_qpos  = start_pos + (int)blockIdx.y * FA_QT;
+    int blk_key_start = (window_size > 0) ? (first_qpos + 1 - window_size) : 0;
+    if (blk_key_start < 0) blk_key_start = 0;
+
+    for (int kt0 = blk_key_start; kt0 < blk_key_end; kt0 += kt_tile) {
+        int tile_keys = blk_key_end - kt0;
+        if (tile_keys > kt_tile) tile_keys = kt_tile;
+
+        // Stage K (fp32 global → fp16x2 shared, one pair/thread-step).
+        for (int idx = tid; idx < kt_tile * hd2; idx += (int)blockDim.x) {
+            int kk = idx / hd2, pr = idx - kk * hd2;
+            unsigned int kh = 0u;
+            if (kk < tile_keys) {
+                long off = (long)(kt0 + kk) * kv_dim + (long)kv_head * head_dim + 2 * pr;
+                kh = sharpi_f32x2_to_f16x2(k_cache[off], k_cache[off + 1]);
+            }
+            sKh[idx] = kh;
+        }
+        // Stage V (fp32 → fp32 shared).
+        for (int idx = tid; idx < kt_tile * head_dim; idx += (int)blockDim.x) {
+            int kk = idx / head_dim, d = idx - kk * head_dim;
+            sV[idx] = (kk < tile_keys)
+                ? v_cache[(long)(kt0 + kk) * kv_dim + (long)kv_head * head_dim + d]
+                : 0.f;
+        }
+        __syncthreads();
+
+        if (active) {
+            for (int kk = 0; kk < tile_keys; kk++) {
+                int abs_t = kt0 + kk;
+                if (abs_t >= win_end || abs_t < win_start) continue;  // warp-uniform
+                unsigned int acc = 0u;
+                for (int p = 0; p < ndj2; p++) {
+                    int pi = lane + 32 * p;
+                    if (pi < hd2) acc = sharpi_hfma2(qh2[p], sKh[kk * hd2 + pi], acc);
+                }
+                float part = sharpi_f16x2_sum(acc);
+                part += __shfl_xor_sync(0xffffffffu, part, 16);
+                part += __shfl_xor_sync(0xffffffffu, part, 8);
+                part += __shfl_xor_sync(0xffffffffu, part, 4);
+                part += __shfl_xor_sync(0xffffffffu, part, 2);
+                part += __shfl_xor_sync(0xffffffffu, part, 1);
+                float score = part * scale;
+                float m_new = fmaxf(m_run, score);
+                float alpha = __expf(m_run - m_new);
+                float pw    = __expf(score - m_new);
+                l_run = l_run * alpha + pw;
+                for (int p = 0; p < ndj2; p++) {
+                    int pi = lane + 32 * p;
+                    float v0 = (pi < hd2) ? sV[kk * head_dim + 2 * pi]     : 0.f;
+                    float v1 = (pi < hd2) ? sV[kk * head_dim + 2 * pi + 1] : 0.f;
+                    oreg[2 * p]     = oreg[2 * p]     * alpha + pw * v0;
+                    oreg[2 * p + 1] = oreg[2 * p + 1] * alpha + pw * v1;
+                }
+                m_run = m_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (active) {
+        float inv = (l_run > 0.f) ? (1.f / l_run) : 0.f;
+        long o_base = (long)qi * q_dim + (long)h * head_dim;
+        for (int p = 0; p < ndj2; p++) {
+            int pi = lane + 32 * p;
+            if (pi < hd2) {
+                out_all[o_base + 2 * pi]     = oreg[2 * p]     * inv;
+                out_all[o_base + 2 * pi + 1] = oreg[2 * p + 1] * inv;
+            }
+        }
+    }
+}
+#undef FA_QT
+
+// Batched sliding-window attention over N query tokens (Gemma 4 SWA layers in
+// batched-trunk prefill). Grid = (num_heads, n_tok); query token i sits at
+// absolute position start_pos+i and attends [max(0,pos+1-window), pos+1). The
+// window bounds eff_seq ≤ window_size, so the shared-scores path always suffices
+// (window_size ≤ MAX_STORED_SCORES required by the dispatch). Per (head, token)
+// this is bit-identical to the per-token llm_attention_swa.
+extern ""C"" __global__ void llm_attention_swa_batched(
+    const float* __restrict__ q_all,      // [n_tok, num_heads*head_dim]
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ out_all,          // [n_tok, num_heads*head_dim]
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int window_size, int max_seq_len, int n_tok, float attn_scale)
+{
+    const int MAX_STORED_SCORES = 4096;
+    __shared__ float shared_scores[MAX_STORED_SCORES];
+    __shared__ float sdata[256];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int h = blockIdx.x;
+    int i = (int)blockIdx.y;
+    if ((int)h >= num_heads || i >= n_tok) return;
+
+    int window_end = start_pos + i + 1;
+    int window_start = window_end - window_size;
+    if (window_start < 0) window_start = 0;
+    int eff_seq = window_end - window_start;
+    if (eff_seq <= 0) return;
+
+    int kv_head = (int)h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
+    int q_dim = num_heads * head_dim;
+    const float* q = q_all + (long)i * q_dim;
+    float* out = out_all + (long)i * q_dim;
+    long q_off = (long)h * (long)head_dim;
+    long out_off = q_off;
+
+    for (int t = (int)tid; t < eff_seq; t += 256) {
+        int abs_t = t + window_start;
+        float dot = 0.f;
+        long k_off = (long)abs_t * (long)kv_dim + (long)kv_head * (long)head_dim;
+        for (int dd = 0; dd < head_dim; dd++)
+            dot += q[q_off + dd] * k_cache[k_off + dd];
+        shared_scores[t] = dot * scale;
+    }
+    __syncthreads();
+
+    float local_max = sharpi_neg_inf();
+    for (int t = (int)tid; t < eff_seq; t += 256)
+        local_max = fmaxf(local_max, shared_scores[t]);
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
+
+    float local_sum = 0.f;
+    for (int t = (int)tid; t < eff_seq; t += 256) {
+        float ev = __expf(shared_scores[t] - max_val);
+        shared_scores[t] = ev;
+        local_sum += ev;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+    __syncthreads();
+
+    for (int t = (int)tid; t < eff_seq; t += 256)
+        shared_scores[t] *= inv_sum;
+    __syncthreads();
+
+    for (int dd = (int)tid; dd < head_dim; dd += 256) {
+        float acc = 0.f;
+        for (int t = 0; t < eff_seq; t++) {
+            int abs_t = t + window_start;
+            long v_off = (long)abs_t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            acc += shared_scores[t] * v_cache[v_off + dd];
+        }
+        out[out_off + dd] = acc;
     }
 }
 
@@ -3330,7 +4090,7 @@ extern ""C"" __global__ void llm_full_seq_attention(
     const float* __restrict__ v_cache,
     float* __restrict__ out_all,          // [n_tok, num_heads*head_dim]
     int num_heads, int num_kv_heads, int head_dim,
-    int start_pos, int max_seq_len, int n_tok)
+    int start_pos, int max_seq_len, int n_tok, float attn_scale)
 {
     const int MAX_STORED_SCORES = 4096;
     __shared__ float shared_scores[MAX_STORED_SCORES];
@@ -3344,7 +4104,7 @@ extern ""C"" __global__ void llm_full_seq_attention(
     int seq_len = start_pos + i + 1;
     int kv_head = (int)h / (num_heads / num_kv_heads);
     int kv_dim  = num_kv_heads * head_dim;
-    float scale = rsqrtf((float)head_dim);
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
     int q_dim = num_heads * head_dim;
     const float* q = q_all + (long)i * q_dim;
     float* out = out_all + (long)i * q_dim;

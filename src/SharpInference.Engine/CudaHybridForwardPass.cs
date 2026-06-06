@@ -137,8 +137,9 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     private readonly float* _projPerLayer;    // [stackedDim] f32 — per-layer projection cache
     private readonly float* _pleX;            // [pleWidth] f32
     private readonly float* _pleY;            // [embDim]  f32
-    // Per-token PLE scratch (GPU) — slice upload + on-GPU injection.
-    private readonly Tensor? _gpuPleSliceUp;  // [pleWidth] f32, uploaded per GPU layer
+    // Per-token PLE scratch (GPU) — full projection uploaded once, viewed per layer.
+    private readonly Tensor? _gpuProjPerLayerGpu;  // [nGpu*pleWidth] f32, one H2D/token
+    private readonly Tensor[]? _gpuProjSliceViews; // [nGpu] static views into the above
     private readonly Tensor? _gpuPleX;        // [pleWidth] f32
     private readonly Tensor? _gpuPleY;        // [embDim] f32
     private readonly int _pleWidth;
@@ -717,7 +718,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                     _gpuPleProj[i]     = UploadWeight($"blk.{i}.proj.weight");
                     _gpuPlePostNorm[i] = UploadWeight($"blk.{i}.post_norm.weight");
                 }
-                _gpuPleSliceUp = gpu.Allocate(TensorShape.D1(_pleWidth));
+                _gpuProjPerLayerGpu = gpu.Allocate(TensorShape.D1(_nGpuLayers * _pleWidth));
+                _gpuProjSliceViews  = new Tensor[_nGpuLayers];
+                for (int i = 0; i < _nGpuLayers; i++)
+                    _gpuProjSliceViews[i] = gpu.View(_gpuProjPerLayerGpu, (long)i * _pleWidth, _pleWidth);
                 _gpuPleX       = gpu.Allocate(TensorShape.D1(_pleWidth));
                 _gpuPleY       = gpu.Allocate(TensorShape.D1(_embDim));
             }
@@ -1540,6 +1544,65 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     //  for the GPU half and ForwardPass.Forward (Gemma 4 path) for the CPU half.
     // ================================================================
 
+    // CUDA Graph decode (issue #136): the GPU layer loop has static topology across
+    // decode tokens (only `position` varies), so capture it once on the first decode
+    // token and replay per token — collapsing the per-layer launches into one
+    // cuGraphLaunch + a handful of node-param updates. Off by default; opt in with
+    // SHARPI_CUDA_GRAPH=1 or the UseCudaGraph setter. Falls back to direct launches on
+    // any capture/replay failure. The hybrid win is smaller than the all-GPU path's
+    // since host transfers + CPU layers bracket only a fraction of the layers.
+    private bool _useCudaGraph =
+        Environment.GetEnvironmentVariable("SHARPI_CUDA_GRAPH") == "1";
+    private bool _graphCaptured;
+
+    /// <summary>
+    /// Enable/disable CUDA-graph capture+replay for the Gemma 4 GPU layer loop. Defaults
+    /// from the <c>SHARPI_CUDA_GRAPH</c> env var; set before the first decode (tests/bench).
+    /// </summary>
+    public bool UseCudaGraph { get => _useCudaGraph; set => _useCudaGraph = value; }
+
+    // CUDA-graph capture/replay for the Gemma 4 GPU layer loop. Returns true if the loop
+    // ran via the graph (captured on the first decode token, replayed after); false means
+    // the caller must run the layers with direct launches. Any failure disables graphs for
+    // the rest of the session and degrades to direct launches.
+    private bool TryRunGpuLayersGemma4ViaGraph(int position)
+    {
+        if (!_useCudaGraph || !_gpu.GraphCaptureSupported || _tqEnabled)
+            return false;
+
+        // Steady state: graph already captured — just replay at the new position.
+        if (_graphCaptured && _gpu.GraphReady)
+        {
+            try { _gpu.LaunchGraphForPosition(position); return true; }
+            catch { _useCudaGraph = false; _graphCaptured = false; return false; }
+        }
+
+        if (_graphCaptured)
+            return false;
+
+        // First decode token: capture the loop (records onto the stream without executing)
+        // then launch it for real. On any failure the loop was NOT executed, so the caller
+        // re-runs it directly.
+        try
+        {
+            if (!_gpu.TryBeginGraphCapture())
+                return false;
+            for (int i = 0; i < _nGpuLayers; i++)
+                GpuLayerGemma4(i, position);
+            if (!_gpu.TryEndGraphCaptureAndInstantiate())
+                return false;
+            _gpu.LaunchGraphForPosition(position);
+            _graphCaptured = true;
+            return true;
+        }
+        catch
+        {
+            _gpu.AbortGraphCapture();
+            _useCudaGraph = false;
+            return false;
+        }
+    }
+
     private ReadOnlySpan<float> ForwardGemma4(int token, int position)
     {
         // PLE pre-pass needs the hidden state, so embed first.
@@ -1590,8 +1653,22 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             CopyGpuBuffer(_gpuHidden, _pinnedHidden);
             _gpu.RecordBarrier();
 
-            for (int i = 0; i < _nGpuLayers; i++)
-                GpuLayerGemma4(i, position);
+            // Upload the full per-layer PLE projection once (was L tiny per-layer
+            // uploads): GPU layer i reads slice i via a static non-owning view.
+            if (_hp.HasPerLayerTokenEmbd && _gpuInpGate is not null)
+            {
+                _gpu.UploadInto(_gpuProjPerLayerGpu!,
+                    new ReadOnlySpan<float>(_projPerLayer, _nGpuLayers * _pleWidth));
+                _gpu.RecordBarrier();
+            }
+
+            // The GPU layer loop has static topology across decode tokens (only
+            // `position` varies), so optionally capture it once into a CUDA graph and
+            // replay per token (issue #136). Uploads above and the download below stay
+            // outside the captured region (they are host transfers).
+            if (!TryRunGpuLayersGemma4ViaGraph(position))
+                for (int i = 0; i < _nGpuLayers; i++)
+                    GpuLayerGemma4(i, position);
 
             if (_nCpuLayers > 0)
             {
@@ -1708,9 +1785,11 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         // BEFORE RoPE since UseL2QkNorm == false).
         if (_hasQkNorm && !_hp.UseL2QkNorm)
         {
-            _gpu.HeadNorm(qView, _gpuQNorm![i], _numHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             if (!kvShared)
-                _gpu.HeadNorm(kView, _gpuKNorm![i], _numKvHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                _gpu.HeadNormQk(qView, _gpuQNorm![i], kView, _gpuKNorm![i],
+                    _numHeads, _numKvHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+            else
+                _gpu.HeadNorm(qView, _gpuQNorm![i], _numHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             _gpu.RecordBarrier();
         }
 
@@ -1741,22 +1820,19 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
             : _maxSeqLen;
 
-        // Gemma 4: attention_scale = 1.0. Pre-scale Q by sqrt(head_dim) so the
-        // kernel's implicit rsqrtf(head_dim) cancels.
-        _gpu.ScaleInPlace(qView, MathF.Sqrt(layerHd));
-
+        // Gemma 4: attention_scale = 1.0, passed explicitly (kernel skips its rsqrtf).
         if (isSwa)
         {
             _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                 _gpuAttnScoresScratch,
                 position, _hp.SlidingWindowSize, layerHd,
-                _numHeads, _numKvHeads, effLayerCtx);
+                _numHeads, _numKvHeads, effLayerCtx, attnScale: 1f);
         }
         else
         {
             _gpu.Attention(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                 _gpuAttnScoresScratch,
-                _numHeads, _numKvHeads, layerHd, position + 1, effLayerCtx);
+                _numHeads, _numKvHeads, layerHd, position + 1, effLayerCtx, attnScale: 1f);
         }
         _gpu.RecordBarrier();
 
@@ -1793,20 +1869,13 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         _gpu.AddInPlace(_gpuHidden, _gpuResidual);
         _gpu.RecordBarrier();
 
-        // PLE injection — upload the per-layer slice from _projPerLayer (CPU) into
-        // _gpuPleSliceUp, then run the inp_gate / gelu / proj / post_norm / add on GPU.
+        // PLE injection — the per-layer projection slice is already resident
+        // (uploaded once per token); read it via the static view.
         if (_hp.HasPerLayerTokenEmbd && _gpuInpGate is not null)
         {
-            // Flush so the upload sees a stable consumer; UploadInto is synchronous
-            // w.r.t. host but we need ordering with subsequent kernel reads.
-            _gpu.RecordBarrier();
-            _gpu.UploadInto(_gpuPleSliceUp!,
-                new ReadOnlySpan<float>(_projPerLayer + (long)i * _pleWidth, _pleWidth));
-            _gpu.RecordBarrier();
-
             GpuMatMul(_gpuPleX!, _gpuInpGate[i], _gpuHidden);
             _gpu.RecordBarrier();
-            _gpu.GeluTanhMul(_gpuPleX!, _gpuPleSliceUp!);
+            _gpu.GeluTanhMul(_gpuPleX!, _gpuProjSliceViews![i]);
             _gpu.RecordBarrier();
             GpuMatMul(_gpuPleY!, _gpuPleProj![i], _gpuPleX!);
             _gpu.RecordBarrier();
@@ -2820,7 +2889,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         if (_projPerLayer != null) NativeMemory.Free(_projPerLayer);
         if (_pleX != null)         NativeMemory.Free(_pleX);
         if (_pleY != null)         NativeMemory.Free(_pleY);
-        if (_gpuPleSliceUp is { } pleUp) _gpu.Free(pleUp);
+        if (_gpuProjSliceViews is { } psv) foreach (var v in psv) _gpu.Free(v);
+        if (_gpuProjPerLayerGpu is { } projUp) _gpu.Free(projUp);
         if (_gpuPleX is { } pleX)  _gpu.Free(pleX);
         if (_gpuPleY is { } pleY)  _gpu.Free(pleY);
         if (_gpuRopeFreqs is { } rfFree) _gpu.Free(rfFree);
