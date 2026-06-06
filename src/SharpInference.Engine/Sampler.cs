@@ -17,6 +17,19 @@ public static class Sampler
         rng ??= Random.Shared;
         int vocabSize = logits.Length;
 
+        bool hasBias = p.LogitBias is { Count: > 0 };
+        bool hasPenalty = p.RepetitionPenalty != 1.0f && p.PreviousTokens is { Count: > 0 };
+
+        // Fast path: top-k bounds the candidate set to a handful of tokens, so there is
+        // no need to softmax/normalize/sort the whole vocabulary (262144 for Gemma 4) —
+        // the dominant decode-time sampling cost. Select the top-k logits in a single
+        // pass, then run temperature / softmax / min-p / top-p over just those k. This is
+        // the llama.cpp ordering (top-k → softmax(survivors) → top-p). Repetition penalty
+        // only *demotes* the recent tokens, so it is folded in by over-selecting (see
+        // SampleTopK). Logit bias can promote *arbitrary* tokens, so it keeps the full path.
+        if (p.TopK > 0 && p.TopK < vocabSize && !hasBias)
+            return SampleTopK(logits, p, rng, hasPenalty);
+
         // Copy logits so we can modify them
         Span<float> probs = vocabSize <= 4096
             ? stackalloc float[vocabSize]
@@ -75,6 +88,120 @@ public static class Sampler
 
         // Sample from the distribution
         return SampleFromDistribution(probs, rng);
+    }
+
+    /// <summary>
+    /// Top-k-first sampling fast path (no logit bias). Selects the top-k logits in one
+    /// O(vocab) pass, then applies temperature, softmax, min-p, and top-p over only those
+    /// k candidates — avoiding any full-vocabulary softmax, sort, or allocation.
+    /// Probabilities are normalised over the kept candidates (the same renormalisation the
+    /// full path performs), so the per-token distribution matches.
+    ///
+    /// Repetition penalty (<paramref name="hasPenalty"/>) only ever *lowers* the logits of
+    /// recently seen tokens, so it cannot promote a token from outside the top-(k+W) raw
+    /// logits into the post-penalty top-k (W = number of penalised tokens). We therefore
+    /// over-select the top-(k+W) raw candidates, apply the penalty to that small set,
+    /// re-sort, and keep the top-k — bit-identical to penalising the full vocabulary.
+    /// </summary>
+    private static int SampleTopK(ReadOnlySpan<float> logits, SamplingParams p, Random rng, bool hasPenalty)
+    {
+        int k = p.TopK;
+        int vocab = logits.Length;
+
+        // Penalty occurrence counts (per-occurrence compounding, matching the full path).
+        Dictionary<int, int>? penCounts = null;
+        int sel = k;
+        if (hasPenalty)
+        {
+            penCounts = new Dictionary<int, int>(p.PreviousTokens!.Count);
+            foreach (int id in p.PreviousTokens!)
+                if ((uint)id < (uint)vocab)
+                    penCounts[id] = penCounts.TryGetValue(id, out int pc) ? pc + 1 : 1;
+            sel = Math.Min(vocab, k + penCounts.Count);   // over-select to cover demotions
+        }
+
+        // Select the top-`sel` (idx, logit) descending by logit via threshold insertion.
+        Span<int>   idx  = sel <= 256 ? stackalloc int[sel]   : new int[sel];
+        Span<float> vals = sel <= 256 ? stackalloc float[sel] : new float[sel];
+        vals.Fill(float.NegativeInfinity);
+        idx.Fill(-1);
+        for (int i = 0; i < vocab; i++)
+        {
+            float v = logits[i];
+            if (v <= vals[sel - 1]) continue;
+            int j = sel - 1;
+            while (j > 0 && vals[j - 1] < v) { vals[j] = vals[j - 1]; idx[j] = idx[j - 1]; j--; }
+            vals[j] = v; idx[j] = i;
+        }
+
+        // Apply repetition penalty to the selected candidates, then re-sort so the top-k
+        // reflects the post-penalty order. Penalty is in logit space: positive logits are
+        // divided, negative ones multiplied, once per occurrence.
+        if (penCounts is not null)
+        {
+            for (int t = 0; t < sel; t++)
+            {
+                if (idx[t] < 0 || !penCounts.TryGetValue(idx[t], out int pc)) continue;
+                float pen = MathF.Pow(p.RepetitionPenalty, pc);
+                vals[t] = vals[t] > 0f ? vals[t] / pen : vals[t] * pen;
+            }
+            // Insertion re-sort (sel is tiny: k + #distinct-recent ≤ ~128).
+            for (int a = 1; a < sel; a++)
+            {
+                float v = vals[a]; int id = idx[a]; int b = a - 1;
+                while (b >= 0 && vals[b] < v) { vals[b + 1] = vals[b]; idx[b + 1] = idx[b]; b--; }
+                vals[b + 1] = v; idx[b + 1] = id;
+            }
+        }
+
+        // Temperature + softmax over the top-k candidates (vals[0] is the max logit).
+        float invTemp = p.Temperature == 1.0f ? 1.0f : 1.0f / p.Temperature;
+        float max = vals[0] * invTemp;
+        Span<float> probs = k <= 256 ? stackalloc float[k] : new float[k];
+        float sum = 0f;
+        for (int t = 0; t < k; t++)
+        {
+            // Tokens past the real vocab tail (k > #finite logits) stay at -inf → exp = 0.
+            float e = vals[t] == float.NegativeInfinity ? 0f : MathF.Exp(vals[t] * invTemp - max);
+            probs[t] = e;
+            sum += e;
+        }
+        float invSum = sum > 0f ? 1.0f / sum : 0f;
+        for (int t = 0; t < k; t++) probs[t] *= invSum;
+
+        int count = k;
+
+        // Min-p: drop candidates below minP × max prob. Descending order ⇒ first failure
+        // bounds the survivors. The ratio probs[t]/probs[0] is normalisation-invariant.
+        if (p.MinP > 0f)
+        {
+            float thr = p.MinP * probs[0];
+            for (int t = 0; t < count; t++)
+                if (probs[t] < thr) { count = t; break; }
+        }
+
+        // Top-p (nucleus): smallest prefix whose cumulative prob reaches topP.
+        if (p.TopP < 1.0f && p.TopP > 0f)
+        {
+            float cum = 0f;
+            for (int t = 0; t < count; t++)
+            {
+                cum += probs[t];
+                if (cum >= p.TopP) { count = t + 1; break; }
+            }
+        }
+
+        // Sample proportionally over the kept candidates [0, count).
+        float keptSum = 0f;
+        for (int t = 0; t < count; t++) keptSum += probs[t];
+        float r = (float)rng.NextDouble() * keptSum;
+        float c = 0f;
+        for (int t = 0; t < count; t++)
+        {
+            c += probs[t];
+            if (r <= c) return idx[t];
+        }
+        return idx[count > 0 ? count - 1 : 0];
     }
 
     /// <summary>
@@ -149,14 +276,32 @@ public static class Sampler
     /// <summary>
     /// Keep only the smallest set of tokens whose cumulative probability >= topP.
     /// </summary>
+    /// <remarks>
+    /// Only the non-zero entries are sorted. With a large vocabulary (Gemma 4 =
+    /// 262144) and top-k applied first, all but ~k entries are already zero, so
+    /// sorting the full span (the old behaviour) was an O(V·logV) delegate-comparator
+    /// sort + V-element allocation per token — the dominant decode-time sampling cost.
+    /// Zeros never affect the cumulative sum or the cutoff (they would sort to the
+    /// tail), so gathering and sorting only the survivors is bit-identical.
+    /// </remarks>
     private static void ApplyTopP(Span<float> probs, float topP)
     {
-        // Build index-probability pairs and sort descending
-        var indexed = new (int idx, float prob)[probs.Length];
+        // Gather non-zero (idx, prob) survivors. After top-k this is ~k entries;
+        // without top-k it can be the whole vocab (same cost as before, no regression).
+        int n = 0;
         for (int i = 0; i < probs.Length; i++)
-            indexed[i] = (i, probs[i]);
+            if (probs[i] > 0f) n++;
+        if (n == 0) return;
 
-        Array.Sort(indexed, (a, b) => b.prob.CompareTo(a.prob));
+        Span<(int idx, float prob)> indexed = n <= 512
+            ? stackalloc (int, float)[n]
+            : new (int, float)[n];
+        int j = 0;
+        for (int i = 0; i < probs.Length; i++)
+            if (probs[i] > 0f) indexed[j++] = (i, probs[i]);
+
+        // Descending sort by probability (survivors only).
+        MemoryExtensions.Sort(indexed, static (a, b) => b.prob.CompareTo(a.prob));
 
         // Find cutoff
         float cumSum = 0;

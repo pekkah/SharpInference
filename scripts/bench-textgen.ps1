@@ -13,8 +13,12 @@ $stdoutPath = Join-Path $OutDir "$Tag.out"
 $stderrPath = Join-Path $OutDir "$Tag.err"
 
 $cliDll = ".\src\SharpInference.Cli\bin\Release\net10.0\sharpi-cli.dll"
+# NOTE: --verbose-prompt is deliberately NOT passed. Its per-token debug logging does a
+# full-vocabulary LINQ OrderByDescending (262144 elements for Gemma 4) every decode step,
+# which adds ~1.5-2.5 ms/token of CPU overhead and badly understates the measured decode
+# t/s. Benchmarks must run without it to reflect real generation throughput.
 $argList = @("$cliDll", "-m", "$Model", "-p", "$Prompt", "--temp", "0",
-             "-n", "$NTokens", "--verbose-prompt", "--single-turn") + $ExtraArgs
+             "-n", "$NTokens", "--single-turn") + $ExtraArgs
 
 Write-Host "[$Tag] $($ExtraArgs -join ' ') (timeout ${TimeoutSec}s)" -ForegroundColor DarkGray
 $dotnetExe = (Get-Command dotnet).Source
@@ -69,12 +73,14 @@ if ($stdout -match 'MTP accept:\s+([\d\.]+)\s*%') {
     $mtpAccept = Parse-Double $matches[1]
 }
 
-# First 12 decoded tokens for sanity check
-$decTexts = @()
-[regex]::Matches($stderr, "next=\d+\('([^']*)'\)") | Select-Object -First 12 | ForEach-Object {
-    $decTexts += $_.Groups[1].Value
-}
-$sample = ($decTexts -join "") -replace "`r","" -replace "`n","\\n"
+# Generation sample for a sanity check. Without --verbose-prompt there are no per-token
+# debug lines, so take the decoded text from stdout: strip the prompt echo and the
+# trailing "Prefill: ... | Decode: ..." stats line, then keep a short snippet.
+$genText = $stdout -replace "`r",""
+$genText = ($genText -split "Prefill:")[0]
+if ($genText.StartsWith($Prompt)) { $genText = $genText.Substring($Prompt.Length) }
+$sample = ($genText -replace "`n","\\n").Trim()
+if ($sample.Length -gt 80) { $sample = $sample.Substring(0, 80) }
 
 [PSCustomObject]@{
     Tag         = $Tag

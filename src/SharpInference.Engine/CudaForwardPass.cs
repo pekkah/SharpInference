@@ -1081,6 +1081,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// </summary>
     private ReadOnlySpan<float> ForwardGemma4(int token, int position)
     {
+        if (s_regionProfile) return ForwardGemma4RegionProfiled(token, position);
+
         // 1. Embedding lookup
         if (_embIsQuantized)
         {
@@ -1108,6 +1110,53 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         _gpu.Download(_logits, _logitsBuf);
         _gpu.Synchronize();
+
+        _kvLength = Math.Max(_kvLength, position + 1);
+        return _logitsBuf;
+    }
+
+    // Region profiler (SHARPI_DECODE_REGIONS=1): splits the graphs-ON decode token into
+    // (a) embed+PLE-prepass, (b) graphed device region, (c) logits download+sync, each
+    // bracketed by a Synchronize so the wall-clock is attributable. The syncs add ~µs of
+    // overhead but reveal where the per-token time goes (the SHARPI_CUDA_PROFILE path runs
+    // graphs-off, which inflates the launch-bound phases). Prints every 64 tokens.
+    private static readonly bool s_regionProfile =
+        Environment.GetEnvironmentVariable("SHARPI_DECODE_REGIONS") == "1";
+    private readonly System.Diagnostics.Stopwatch _rpSw = new();
+    private double _rpEmbedPle, _rpDevice, _rpDownload;
+    private long _rpCount;
+
+    private ReadOnlySpan<float> ForwardGemma4RegionProfiled(int token, int position)
+    {
+        _rpSw.Restart();
+        if (_embIsQuantized)
+        {
+            var embDType = _weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K);
+            if (embDType == DType.Q8_0) _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim);
+            else _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim);
+        }
+        else _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
+        if (_hp.EmbeddingScale != 1f) _gpu.ScaleInPlace(_hidden, _hp.EmbeddingScale);
+        if (_hp.HasPerLayerTokenEmbd) BuildPerLayerProjectionsGpu(token);
+        _gpu.Synchronize();
+        _rpEmbedPle += _rpSw.Elapsed.TotalMilliseconds; _rpSw.Restart();
+
+        if (!TryRunGemma4DeviceRegionViaGraph(position))
+            RunGemma4DeviceRegion(position);
+        _gpu.Synchronize();
+        _rpDevice += _rpSw.Elapsed.TotalMilliseconds; _rpSw.Restart();
+
+        _gpu.Download(_logits, _logitsBuf);
+        _gpu.Synchronize();
+        _rpDownload += _rpSw.Elapsed.TotalMilliseconds;
+
+        if (++_rpCount % 64 == 0)
+        {
+            double n = _rpCount;
+            Console.Error.WriteLine(
+                $"[regions] n={_rpCount} embed+ple={_rpEmbedPle / n:F3}ms device={_rpDevice / n:F3}ms " +
+                $"download={_rpDownload / n:F3}ms total={(_rpEmbedPle + _rpDevice + _rpDownload) / n:F3}ms");
+        }
 
         _kvLength = Math.Max(_kvLength, position + 1);
         return _logitsBuf;
