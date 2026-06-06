@@ -207,4 +207,125 @@ public sealed class SamplerTests
 
         Assert.Equal(4, sampled.Count);
     }
+
+    // ── Top-k-first fast path (SampleTopK) ────────────────────────────────────
+    // The fast path runs when TopK>0 and there is no logit bias. Adding an out-of-range
+    // LogitBias entry (never applied — the id is bounds-checked away) forces the otherwise
+    // identical slow path, giving a differential oracle for the fast path.
+    private static readonly IReadOnlyDictionary<int, float> ForceSlowPath =
+        new Dictionary<int, float> { { -1, 0f } };
+
+    private static float[] RandomLogits(int vocab, int seed)
+    {
+        var rng = new Random(seed);
+        var l = new float[vocab];
+        for (int i = 0; i < vocab; i++) l[i] = (float)(rng.NextDouble() * 12 - 6);
+        return l;
+    }
+
+    private static HashSet<int> ReachableSet(float[] logits, SamplingParams p, int seed, int trials)
+    {
+        var rng = new Random(seed);
+        var set = new HashSet<int>();
+        for (int i = 0; i < trials; i++) set.Add(Sampler.Sample(logits, p, rng));
+        return set;
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(7)]
+    [InlineData(99)]
+    public void SampleTopK_FastPath_MatchesSlowPath_ReachableSet(int seed)
+    {
+        // Same config, same logits: the fast path (no bias) and the slow path (forced via
+        // out-of-range bias) must reach exactly the same set of tokens — both apply
+        // top-k → renormalize → min-p → top-p over the same nucleus.
+        float[] logits = RandomLogits(96, seed);
+        var prev = new List<int> { 3, 3, 10, 25 };
+        var baseP = new SamplingParams
+        {
+            Temperature = 0.8f, TopK = 16, TopP = 0.9f, MinP = 0.02f,
+            RepetitionPenalty = 1.3f, PreviousTokens = prev,
+        };
+
+        var fast = ReachableSet(logits, baseP, seed: 1234, trials: 4000);
+        var slow = ReachableSet(logits, baseP with { LogitBias = ForceSlowPath }, seed: 1234, trials: 4000);
+
+        Assert.Equal(slow.OrderBy(x => x), fast.OrderBy(x => x));
+    }
+
+    [Fact]
+    public void SampleTopK_Penalty_DemotesPenalizedTokenOutOfTopK()
+    {
+        // Token 1 is the 2nd-highest raw logit; penalising it pushes it below token 2, so
+        // with TopK=2 the surviving pair becomes {0, 2} rather than {0, 1}.
+        float[] logits = [10f, 8f, 7f, 1f, 0f];
+        var p = new SamplingParams
+        {
+            Temperature = 1f, TopK = 2, RepetitionPenalty = 4f,
+            PreviousTokens = new List<int> { 1 },
+        };
+        var reach = ReachableSet(logits, p, seed: 5, trials: 500);
+        Assert.DoesNotContain(1, reach);          // demoted out of the top-2
+        Assert.True(reach.IsSubsetOf(new[] { 0, 2 }), $"got {string.Join(",", reach)}");
+        Assert.Contains(2, reach);                // token 2 took the freed slot
+    }
+
+    [Fact]
+    public void SampleTopK_Penalty_DuplicateOccurrences_Compound()
+    {
+        // Token 1 (logit 8) sits 2nd; token 2 has logit 6.5. One penalty occurrence:
+        // 8/1.2 = 6.67 > 6.5, so token 1 stays in the top-2. Three occurrences (compounded):
+        // 8/1.2^3 = 4.63 < 6.5, so token 1 is demoted below token 2.
+        float[] logits = [9f, 8f, 6.5f, 1f];
+        var once = new SamplingParams
+        {
+            Temperature = 1f, TopK = 2, RepetitionPenalty = 1.2f,
+            PreviousTokens = new List<int> { 1 },
+        };
+        var thrice = once with { PreviousTokens = new List<int> { 1, 1, 1 } };
+
+        var reachOnce = ReachableSet(logits, once, seed: 9, trials: 500);
+        var reachThrice = ReachableSet(logits, thrice, seed: 9, trials: 500);
+
+        Assert.Contains(1, reachOnce);            // single occurrence keeps it in the top-2
+        Assert.DoesNotContain(1, reachThrice);    // compounded penalty demotes it
+        Assert.Contains(2, reachThrice);          // token 2 takes the freed slot
+    }
+
+    [Fact]
+    public void SampleTopK_NegInfLogits_NeverReturnsInvalidToken()
+    {
+        // Masked tokens (-inf) must never be selected, and the sentinel index must never
+        // leak out: every returned token is a valid, finite-logit index.
+        float[] logits = [2f, float.NegativeInfinity, 5f, float.NegativeInfinity, 1f, 3f];
+        var p = new SamplingParams { Temperature = 1f, TopK = 5, TopP = 0.95f };
+        var rng = new Random(3);
+        for (int i = 0; i < 1000; i++)
+        {
+            int tok = Sampler.Sample(logits, p, rng);
+            Assert.InRange(tok, 0, logits.Length - 1);
+            Assert.False(float.IsNegativeInfinity(logits[tok]), $"sampled masked token {tok}");
+        }
+    }
+
+    [Fact]
+    public void SampleTopK_AllNegInf_FallsBackToValidToken()
+    {
+        float[] logits = [float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity];
+        var p = new SamplingParams { Temperature = 1f, TopK = 2, TopP = 0.9f };
+        int tok = Sampler.Sample(logits, p, new Random(1));
+        Assert.InRange(tok, 0, logits.Length - 1);   // valid index, not the -1 sentinel
+    }
+
+    [Fact]
+    public void SampleTopK_TopKThenTopP_NucleusTakenAfterTopK()
+    {
+        // top-k keeps the 3 highest; after renormalising over them, top-p=0.5 keeps the
+        // smallest leading prefix reaching 0.5 — here just token 0 (dominant).
+        float[] logits = [6f, 3f, 2.5f, 0f, 0f, 0f, 0f, 0f];
+        var p = new SamplingParams { Temperature = 1f, TopK = 3, TopP = 0.5f };
+        var reach = ReachableSet(logits, p, seed: 2, trials: 500);
+        Assert.True(reach.IsSubsetOf(new[] { 0 }), $"got {string.Join(",", reach)}");
+    }
 }
