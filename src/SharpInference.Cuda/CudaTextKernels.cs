@@ -1893,6 +1893,69 @@ extern ""C"" __global__ void llm_dequant_q8_0_to_f16_soa(
     }
 }
 
+// ── Dequant Q4_K weight [rows × cols] → fp16 (issue #156 Item C / C1) ───────
+// One block of 256 threads dequantizes one weight row (cols elements). cols must
+// be a multiple of 256 (Q4_K super-block = 256 elements / 144 bytes). The per-
+// element decode is identical to llm_embed_lookup_q4k / llm_matvec_q4k (same
+// d*sc*nibble - dmin*mn), but parameterized by row and written as fp16. The fp16
+// rounding is the only lossy step vs the fp32 dp4a matvec — it lets the prefill
+// GEMM read each weight once per batch instead of re-streaming it once per token.
+extern ""C"" __global__ void llm_dequant_q4k_to_f16(
+    const unsigned int* __restrict__ weights,
+    unsigned short* __restrict__ out,    // [rows * cols] fp16
+    int rows, int cols)
+{
+    __shared__ unsigned int blk[36];
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    unsigned int tid = threadIdx.x;
+
+    int num_blocks = cols >> 8;                              // cols / 256
+    long row_word_base = (long)row * (long)num_blocks * 36L; // 144 bytes = 36 words per super-block
+    long out_row = (long)row * (long)cols;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long blk_word_base = row_word_base + (long)block * 36L;
+        if (tid < 36)
+            blk[tid] = weights[blk_word_base + tid];
+        __syncthreads();
+
+        unsigned int w0 = blk[0];
+        float d    = sharpi_fp16_to_fp32(w0 & 0xffffu);
+        float dmin = sharpi_fp16_to_fp32(w0 >> 16);
+
+        unsigned int chunk = tid >> 6;          // 0..3
+        unsigned int sub   = tid & 63u;         // 0..63
+        unsigned int is_upper = (sub >= 32u) ? 1u : 0u;
+        unsigned int byte_pos = sub & 31u;
+
+        unsigned int sm0 = blk[1];
+        unsigned int sm1 = blk[2];
+        unsigned int sm2 = blk[3];
+
+        unsigned int si = chunk * 2u + is_upper;
+        float sc, mn;
+        if (si < 4u) {
+            sc = (float)((sm0 >> (si * 8u)) & 63u);
+            mn = (float)((sm1 >> (si * 8u)) & 63u);
+        } else {
+            unsigned int j = si - 4u;
+            sc = (float)(((sm2 >> (j * 8u)) & 0xFu)
+                       | (((sm0 >> (j * 8u + 6u)) & 3u) << 4));
+            mn = (float)(((sm2 >> (j * 8u + 4u)) & 0xFu)
+                       | (((sm1 >> (j * 8u + 6u)) & 3u) << 4));
+        }
+
+        unsigned int qword = blk[4u + chunk * 8u + (byte_pos >> 2)];
+        unsigned int qbyte = (qword >> ((byte_pos & 3u) * 8u)) & 0xFFu;
+        unsigned int nibble = is_upper ? (qbyte >> 4) : (qbyte & 0xFu);
+
+        float val = d * sc * (float)nibble - dmin * mn;
+        out[out_row + (long)block * 256 + (int)tid] = (unsigned short)sharpi_fp32_to_fp16(val);
+        __syncthreads();
+    }
+}
+
 // ── FP32 → FP16 elementwise convert (issue #141) ──────────────────────────
 // Converts the prefill activation batch [n] fp32 → fp16 so it can feed the
 // cuBLAS fp16 GEMM alongside the dequantized weights.

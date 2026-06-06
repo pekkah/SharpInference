@@ -859,6 +859,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         Environment.GetEnvironmentVariable("SHARPI_PREFILL_PROFILE") == "1";
     private readonly System.Diagnostics.Stopwatch _profSw = new();
     private double _profAttnMs;
+    private readonly System.Diagnostics.Stopwatch _profMmSw = new();
+    private double _profMatmulMs;
     private readonly double[] _phaseMs = new double[10];
     private readonly long[]   _phaseCount = new long[10];
     private const int PH_EMBED = 0, PH_QKV = 1, PH_ROPE_QKN = 2, PH_KV_ATTN = 3,
@@ -1893,6 +1895,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
     private void GpuMatMulBatched(Tensor outAll, Tensor weights, Tensor inAll, int n)
     {
+        if (s_prefillProfile) { _gpu.Synchronize(); _profMmSw.Restart(); }
+        GpuMatMulBatchedCore(outAll, weights, inAll, n);
+        if (s_prefillProfile) { _gpu.Synchronize(); _profMatmulMs += _profMmSw.Elapsed.TotalMilliseconds; }
+    }
+
+    private void GpuMatMulBatchedCore(Tensor outAll, Tensor weights, Tensor inAll, int n)
+    {
         var dt = WDType(weights);
         // Issue #141: route the trunk matmuls through compute-bound cuBLAS GEMM
         // (each weight read once per batch) instead of the memory-bound matvec
@@ -1911,6 +1920,19 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 _gpu.MatMulBatchedMmq(outAll, weights, inAll, n, dt);
             else
                 _gpu.MatMulBatchedGemm(outAll, weights, inAll, n, dt);
+        }
+        else if (dt == DType.Q4_K)
+        {
+            // Issue #156 Item C: route Q4_K trunk matmuls through the compute-bound
+            // dequant→fp16→cuBLAS GEMM (weight read once per batch) instead of the
+            // memory-bound matvec GEMM-N (weight re-streamed per token). Argmax-stable.
+            // Requires cols % 256; every Q4_K hidden dim satisfies it, but fall back to
+            // the matvec path defensively if not.
+            int cols = (int)(inAll.ElementCount / n);
+            if ((cols & 0xff) == 0)
+                _gpu.MatMulBatchedGemm(outAll, weights, inAll, n, dt);
+            else
+                _gpu.MatMulBatched(outAll, weights, inAll, n, dt);
         }
         else if (dt == DType.Float32)
         {
@@ -2023,8 +2045,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             _gpu.Synchronize();
             tLayers = swp!.ElapsedMilliseconds;
             Console.Error.WriteLine($"[prefill-profile] N={N} embed={tEmbed}ms ple={tPle - tEmbed}ms " +
-                $"layers={tLayers - tPle}ms (attn={_profAttnMs:F0}ms)");
-            _profAttnMs = 0;
+                $"layers={tLayers - tPle}ms (attn={_profAttnMs:F0}ms matmul={_profMatmulMs:F0}ms)");
+            _profAttnMs = 0; _profMatmulMs = 0;
         }
 
         // 4. Final norm + output projection on the last token only.

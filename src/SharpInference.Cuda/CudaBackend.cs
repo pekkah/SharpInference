@@ -164,6 +164,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // Issue #141: compute-bound prefill GEMM — dequant Q8_0 weight + convert
     // activations to fp16, then one cublasGemmEx (weight read once per batch).
     private nint   _dequantQ80F16Kernel;
+    // Issue #156 Item C / C1: Q4_K weight → fp16 dequant for the same prefill GEMM path.
+    private nint   _dequantQ4KF16Kernel;
     private nint   _f32ToF16Kernel;
     // Issue #141 (MMQ): int8 tensor-core Q8_0×Q8_1 matmul — weight read once as
     // int8, no fp16 HBM round-trip, m16n8k32 s8 mma. Replaces the dequant→GEMM path.
@@ -1749,7 +1751,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// each activation are rounded to fp16 before the tensor-core multiply (fp32
     /// accumulation). Result tracks the fp32 path to fp tolerance (argmax-stable),
     /// not byte-for-byte. Callers that need byte-parity (GDN/MTP draft verify) must
-    /// use <see cref="MatMulBatched"/>. Q8_0 weights only — other dtypes throw.</para>
+    /// use <see cref="MatMulBatched"/>. Q8_0 and Q4_K weights (issue #156 Item C
+    /// added Q4_K via <c>llm_dequant_q4k_to_f16</c>) — other dtypes throw.</para>
     ///
     /// Layout matches <see cref="MatMulBatched"/>: <paramref name="inputAll"/> is
     /// token-major <c>[nTok × cols]</c>, <paramref name="outputAll"/> is
@@ -1761,9 +1764,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
             throw new NotSupportedException("NVRTC kernels are not available on this system.");
-        if (weightDType != DType.Q8_0)
+        if (weightDType is not (DType.Q8_0 or DType.Q4_K))
             throw new NotSupportedException(
-                $"CUDA MatMulBatchedGemm: weight dtype {weightDType} not supported (Q8_0 only).");
+                $"CUDA MatMulBatchedGemm: weight dtype {weightDType} not supported (Q8_0 or Q4_K).");
         if (nTok <= 0)
             throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be > 0.");
         if (outputAll.ElementCount % nTok != 0 || inputAll.ElementCount % nTok != 0)
@@ -1773,9 +1776,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
         int rows = (int)(outputAll.ElementCount / nTok);
         int cols = (int)(inputAll.ElementCount / nTok);
-        if ((cols & 31) != 0)
+        // Q8_0 sub-block is 32 elements; Q4_K super-block is 256. Each dequant kernel
+        // loops over the row in its native block size, so cols must align to it.
+        int colAlign = weightDType == DType.Q4_K ? 256 : 32;
+        if ((cols % colAlign) != 0)
             throw new InvalidOperationException(
-                $"CUDA MatMulBatchedGemm requires cols % 32 == 0 (got {cols}).");
+                $"CUDA MatMulBatchedGemm ({weightDType}) requires cols % {colAlign} == 0 (got {cols}).");
 
         nint wPtr = GetDevPtr(matrix);
         nint xPtr = GetDevPtr(inputAll);
@@ -1784,15 +1790,19 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         EnsureGemmWf16((nuint)((long)rows * cols * 2L));
         EnsureGemmAf16((nuint)((long)nTok * cols * 2L));
 
-        // 1) Dequant Q8_0 weight → fp16 (one block per row). #149: SoA-aware.
+        // 1) Dequant weight → fp16 (one block of 256 threads per row). Q8_0 is #149
+        //    SoA-aware; Q4_K (#156 Item C) decodes the 256-element super-block. Both
+        //    write a row-major [rows×cols] fp16 buffer for the GemmEx below.
         {
             nint wp = wPtr, op = _gemmWf16Buf;
             int pRows = rows, pCols = cols;
-            nint dqKern = _soaHandles.ContainsKey(matrix.Handle) ? _dequantQ80F16SoaKernel : _dequantQ80F16Kernel;
+            nint dqKern = weightDType == DType.Q4_K
+                ? _dequantQ4KF16Kernel
+                : (_soaHandles.ContainsKey(matrix.Handle) ? _dequantQ80F16SoaKernel : _dequantQ80F16Kernel);
             nint* args = stackalloc nint[4] { (nint)(&wp), (nint)(&op), (nint)(&pRows), (nint)(&pCols) };
             int r = NvrtcInterop.LaunchKernel(dqKern, (uint)rows, 1, 1,
                                               256, 1, 1, 0, _stream, args, null);
-            if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(dequant_q8_0_to_f16) failed: {r}");
+            if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(dequant_{weightDType}_to_f16) failed: {r}");
         }
 
         // 2) Convert activations fp32 → fp16.
@@ -4544,6 +4554,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _matvecQ6KGemmNKernel  = GetKernelFunc("llm_matvec_q6k_gemm_n");
         _matvecQ80GemmNKernel  = GetKernelFunc("llm_matvec_q8_0_gemm_n");
         _dequantQ80F16Kernel   = GetKernelFunc("llm_dequant_q8_0_to_f16");
+        _dequantQ4KF16Kernel   = GetKernelFunc("llm_dequant_q4k_to_f16");
         _f32ToF16Kernel        = GetKernelFunc("llm_f32_to_f16");
         _mmqQ80Kernel          = GetKernelFunc("llm_mmq_q8_0");
         _mmqQ80SoaKernel       = GetKernelFunc("llm_mmq_q8_0_soa");

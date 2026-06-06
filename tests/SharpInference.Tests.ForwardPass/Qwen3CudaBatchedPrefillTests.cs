@@ -125,9 +125,12 @@ public sealed class Qwen3CudaBatchedPrefillTests
     }
 
     /// <summary>
-    /// Flash off: Q4_K trunk runs the batched matvec GEMM-N, which is built to be
-    /// bit-identical to N per-token Q4_K dp4a matvecs. Verifies the batched
+    /// Flash off + GEMM off: Q4_K trunk runs the batched matvec GEMM-N, which is built to
+    /// be bit-identical to N per-token Q4_K dp4a matvecs. Verifies the batched
     /// matvec/norm/rope/SwiGLU primitives in isolation from the argmax-stable attention.
+    /// <c>PrefillGemmEnabled = false</c> is required because #156 Item C made the GEMM
+    /// (dequant→fp16→cuBLAS, argmax-stable but not bit-exact) the Q4_K default — that path
+    /// is covered by <see cref="Qwen3_8B_BatchedPrefill_Q4KGemm_ArgmaxStable"/>.
     /// </summary>
     [Fact]
     public void Qwen3_8B_BatchedPrefill_FlashOff_MatchesSequential()
@@ -146,6 +149,7 @@ public sealed class Qwen3CudaBatchedPrefillTests
         fwd.BatchedPrefillEnabled = true;
         fwd.PrefillFlashAttnEnabled = false;
         fwd.PrefillFlashTcEnabled = false;
+        fwd.PrefillGemmEnabled = false; // pin the bit-exact Q4_K matvec GEMM-N, not the #156-C fp16 GEMM
         var batched = fwd.Prefill(Tokens).ToArray();
         Assert.True(fwd.LastPrefillWasBatched);
 
@@ -167,5 +171,61 @@ public sealed class Qwen3CudaBatchedPrefillTests
         }
         Assert.True(maxAbs < 1e-2f,
             $"matvec-batched vs sequential logits diverged: maxAbs={maxAbs}, bit-exact {exact}/{sequential.Length}.");
+    }
+
+    /// <summary>
+    /// Issue #156 Item C oracle: the Q4_K compute-bound prefill GEMM (dequant→fp16→cuBLAS,
+    /// <c>llm_dequant_q4k_to_f16</c>, weight read once per batch) must be argmax-stable vs
+    /// the bit-exact Q4_K matvec GEMM-N (weight re-streamed per token). Both run the same
+    /// batched-trunk path with flash off so only the trunk-matmul dtype dispatch differs —
+    /// isolating the new fp16 GEMM from the attention reassociation. Not bit-exact (fp16
+    /// weight + activation rounding), so this asserts argmax equality + top-5 overlap, the
+    /// same contract the Q8_0 prefill GEMM (#141) holds.
+    /// </summary>
+    [Fact]
+    public void Qwen3_8B_BatchedPrefill_Q4KGemm_ArgmaxStable()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.Null(hp.LayerHeadDim);
+
+        using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 512)
+        {
+            BatchedPrefillEnabled = true,
+            PrefillFlashAttnEnabled = false,
+            PrefillFlashTcEnabled = false,
+        };
+
+        // Reference: bit-exact Q4_K matvec GEMM-N.
+        fwd.PrefillGemmEnabled = false;
+        var matvec = fwd.Prefill(Tokens).ToArray();
+        Assert.True(fwd.LastPrefillWasBatched);
+
+        // Candidate: the #156-C dequant→fp16→cuBLAS GEMM.
+        fwd.ResetCache();
+        fwd.PrefillGemmEnabled = true;
+        var gemm = fwd.Prefill(Tokens).ToArray();
+        Assert.True(fwd.LastPrefillWasBatched);
+
+        Assert.Equal(matvec.Length, gemm.Length);
+        Assert.Equal(Argmax(matvec), Argmax(gemm));
+
+        float maxAbs = 0f;
+        for (int i = 0; i < matvec.Length; i++)
+            maxAbs = MathF.Max(maxAbs, MathF.Abs(matvec[i] - gemm[i]));
+        Assert.True(maxAbs < 1.0f,
+            $"Q4_K prefill GEMM vs matvec logits diverged beyond fp16 tolerance: maxAbs={maxAbs}.");
+
+        var matvecTop = TopKSet(matvec, 5);
+        var gemmTop = TopKSet(gemm, 5);
+        int overlap = 0;
+        foreach (var t in gemmTop) if (matvecTop.Contains(t)) overlap++;
+        Assert.True(overlap >= 4,
+            $"Q4_K prefill GEMM top-5 overlaps the matvec reference in only {overlap}/5 slots.");
     }
 }
