@@ -531,6 +531,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
     public void Free(Tensor tensor)
     {
+        // #149: drop any SoA-layout mark (harmless no-op for non-repacked handles) so
+        // the set doesn't grow across model load/free cycles.
+        _soaHandles.TryRemove(tensor.Handle, out _);
         if (_viewHandles.TryRemove(tensor.Handle, out _))
         {
             // Non-owning view: drop the handle registration only; the parent owns
@@ -1549,7 +1552,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         // hidden dim qualifies). Falls back to the fp32-decode kernel otherwise.
         if (weightDType == DType.Q8_0 && Q80Dp4aEnabled && (cols & 31) == 0)
         {
-            DispatchMatVecQ80Dp4a(wPtr, xPtr, yPtr, rows, cols, soa: _soaHandles.Contains(matrix.Handle));
+            DispatchMatVecQ80Dp4a(wPtr, xPtr, yPtr, rows, cols, soa: _soaHandles.ContainsKey(matrix.Handle));
             return;
         }
 
@@ -1560,7 +1563,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             (nint)(&pRows), (nint)(&pCols)
         };
 
-        bool soa = weightDType == DType.Q8_0 && _soaHandles.Contains(matrix.Handle);
+        bool soa = weightDType == DType.Q8_0 && _soaHandles.ContainsKey(matrix.Handle);
         nint kernel = weightDType switch
         {
             DType.Q5_K    => _matvecQ5KKernel,
@@ -1698,7 +1701,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         {
             // All take F32 input; the Q5_K/Q6_K/Q8_0 kernels decode the weight per
             // element. Same (rows+7)/8 × nTok geometry across all four.
-            bool soa = weightDType == DType.Q8_0 && _soaHandles.Contains(matrix.Handle);
+            bool soa = weightDType == DType.Q8_0 && _soaHandles.ContainsKey(matrix.Handle);
             nint kernel = weightDType switch
             {
                 DType.Q6_K => _matvecQ6KGemmNKernel,
@@ -1785,7 +1788,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         {
             nint wp = wPtr, op = _gemmWf16Buf;
             int pRows = rows, pCols = cols;
-            nint dqKern = _soaHandles.Contains(matrix.Handle) ? _dequantQ80F16SoaKernel : _dequantQ80F16Kernel;
+            nint dqKern = _soaHandles.ContainsKey(matrix.Handle) ? _dequantQ80F16SoaKernel : _dequantQ80F16Kernel;
             nint* args = stackalloc nint[4] { (nint)(&wp), (nint)(&op), (nint)(&pRows), (nint)(&pCols) };
             int r = NvrtcInterop.LaunchKernel(dqKern, (uint)rows, 1, 1,
                                               256, 1, 1, 0, _stream, args, null);
@@ -1889,7 +1892,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             };
             uint gx = (uint)((rows + 63) / 64), gy = (uint)((nTok + 127) / 128);
             // #149: if this weight was repacked SoA, use the aligned-load kernel (same args).
-            nint kern = _soaHandles.Contains(matrix.Handle) ? _mmqQ80SoaKernel : _mmqQ80Kernel;
+            nint kern = _soaHandles.ContainsKey(matrix.Handle) ? _mmqQ80SoaKernel : _mmqQ80Kernel;
             int rm = NvrtcInterop.LaunchKernel(kern, gx, gy, 1,
                                                256, 1, 1, 0, _stream, args, null);
             if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(mmq_q8_0) failed: {rm}");
@@ -1959,7 +1962,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// <summary>Issue #149: device handles of Q8_0 weights repacked into the SoA layout
     /// (see <see cref="RepackQ8_0Soa"/>). <see cref="MatMulBatchedMmq"/> and the decode
     /// matvec auto-route to the aligned-load SoA kernels for these.</summary>
-    private readonly HashSet<nint> _soaHandles = new();
+    private readonly ConcurrentDictionary<nint, byte> _soaHandles = new();
 
     /// <summary>
     /// Issue #149: allocate a new buffer the same size as the interleaved Q8_0
@@ -1986,7 +1989,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(q8_0_repack_soa) failed: {r}");
         Synchronize();
         Free(src);
-        _soaHandles.Add(dst.Handle);
+        _soaHandles[dst.Handle] = 0;
         return dst;
     }
 
@@ -4976,6 +4979,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         foreach (var entry in _devPtrs.Values)
             CuBlasInterop.CudaFree(entry.devPtr);
         _devPtrs.Clear();
+        _soaHandles.Clear();   // #149
 
         _pool.Dispose();
 

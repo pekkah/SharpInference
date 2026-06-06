@@ -157,4 +157,65 @@ public sealed unsafe class CudaMmqSoaTests
         }
         Assert.True(true);
     }
+
+    /// <summary>
+    /// Exercises the production <see cref="CudaBackend.RepackQ8_0Soa"/> (GPU repack) and
+    /// the auto-routing through ALL five Q8_0 readers — dp4a + fp32 decode matvec, GEMM-N,
+    /// dequant→GEMM, and MMQ — by repacking on the GPU and asserting each reader's output
+    /// is bit-identical to the interleaved kernel. GGUF-free, runs on any CUDA box, so it
+    /// is the durable regression net the model-level oracles (bench-machine only) lack.
+    /// </summary>
+    [Fact]
+    public void GpuRepack_AllSoaReaders_BitIdenticalToInterleaved()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        foreach ((int rows, int cols) in new[] { (256, 256), (1024, 512), (512, 2560) })
+        {
+            var rng = new Random(20260607 + rows * 7 + cols);
+            byte[] interleaved = BuildQ8_0Matrix(rows, cols, rng);
+            const int nTok = 20;
+
+            var vec = new float[cols];
+            for (int i = 0; i < vec.Length; i++) vec[i] = (float)(rng.NextDouble() * 2 - 1);
+            var input = new float[(long)nTok * cols];
+            for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+            var gVec = gpu.Upload(vec, TensorShape.D1(cols));
+            var gIn = gpu.Upload(input, TensorShape.D1(input.Length));
+
+            // Run `reader` on an interleaved weight and on a GPU-repacked SoA weight (the
+            // backend auto-routes the SoA handle to the aligned-load kernel) → bit-identical.
+            void Check(string label, int outElems, Action<Tensor, Tensor> reader)
+            {
+                var gW   = gpu.UploadRaw(interleaved, TensorShape.D1(interleaved.Length), DType.Q8_0);
+                var gWr  = gpu.UploadRaw(interleaved, TensorShape.D1(interleaved.Length), DType.Q8_0);
+                var gSoa = gpu.RepackQ8_0Soa(gWr, rows, cols);   // frees gWr, marks gSoa SoA
+                var gA = gpu.Allocate(TensorShape.D1(outElems));
+                var gB = gpu.Allocate(TensorShape.D1(outElems));
+                reader(gW, gA);     // interleaved
+                reader(gSoa, gB);   // SoA (auto-routed)
+                gpu.Synchronize();
+                var a = new float[outElems]; var b = new float[outElems];
+                gpu.Download(gA, a); gpu.Download(gB, b);
+                gpu.Free(gW); gpu.Free(gSoa); gpu.Free(gA); gpu.Free(gB);
+                float maxAbs = 0; int diffs = 0;
+                for (int i = 0; i < outElems; i++) { float d = MathF.Abs(a[i] - b[i]); maxAbs = MathF.Max(maxAbs, d); if (d != 0f) diffs++; }
+                Console.WriteLine($"SoA-reader {label,-16} rows={rows} cols={cols}: maxAbs={maxAbs:E2} diffs={diffs}/{outElems}");
+                Assert.True(maxAbs == 0f,
+                    $"GPU-repacked SoA reader '{label}' not bit-identical to interleaved: {diffs}/{outElems} differ, maxAbs={maxAbs:E3} (rows={rows} cols={cols}).");
+            }
+
+            gpu.Q80Dp4aEnabled = true;
+            Check("decode-dp4a", rows, (w, o) => gpu.MatMul(o, w, gVec, DType.Q8_0));
+            gpu.Q80Dp4aEnabled = false;
+            Check("decode-fp32", rows, (w, o) => gpu.MatMul(o, w, gVec, DType.Q8_0));
+            gpu.Q80Dp4aEnabled = true;
+            Check("gemm-n", nTok * rows, (w, o) => gpu.MatMulBatched(o, w, gIn, nTok, DType.Q8_0));
+            Check("dequant-gemm", nTok * rows, (w, o) => gpu.MatMulBatchedGemm(o, w, gIn, nTok, DType.Q8_0));
+            Check("mmq", nTok * rows, (w, o) => gpu.MatMulBatchedMmq(o, w, gIn, nTok, DType.Q8_0));
+
+            gpu.Free(gVec); gpu.Free(gIn);
+        }
+    }
 }
