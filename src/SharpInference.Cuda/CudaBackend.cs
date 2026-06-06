@@ -140,6 +140,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // Issue #149: SoA-layout dp4a decode matvec + the interleaved→SoA repack kernel.
     private nint   _matvecQ80Dp4aSoaKernel;
     private nint   _q80RepackSoaKernel;
+    // Issue #149: SoA variants of the remaining Q8_0 readers (fp32 matvec / GEMM-N / dequant).
+    private nint   _matvecQ80SoaKernel;
+    private nint   _matvecQ80GemmNSoaKernel;
+    private nint   _dequantQ80F16SoaKernel;
     // Issue #43: N=2 (two-input, two-output) variants — read each weight row
     // once and accumulate into two outputs. Used by MTP BatchForward2's
     // on-GPU dense FFN to halve weight-bandwidth cost per output.
@@ -1556,11 +1560,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             (nint)(&pRows), (nint)(&pCols)
         };
 
+        bool soa = weightDType == DType.Q8_0 && _soaHandles.Contains(matrix.Handle);
         nint kernel = weightDType switch
         {
             DType.Q5_K    => _matvecQ5KKernel,
             DType.Q6_K    => _matvecQ6KKernel,
-            DType.Q8_0    => _matvecQ80Kernel,
+            DType.Q8_0    => soa ? _matvecQ80SoaKernel : _matvecQ80Kernel,
             DType.Float32 => _matvecF32Kernel,
             _ => throw new NotSupportedException($"CUDA MatMul: weight dtype {weightDType} not supported (expected Q4_K, Q5_K, Q6_K, Q8_0, or Float32)."),
         };
@@ -1693,11 +1698,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         {
             // All take F32 input; the Q5_K/Q6_K/Q8_0 kernels decode the weight per
             // element. Same (rows+7)/8 × nTok geometry across all four.
+            bool soa = weightDType == DType.Q8_0 && _soaHandles.Contains(matrix.Handle);
             nint kernel = weightDType switch
             {
                 DType.Q6_K => _matvecQ6KGemmNKernel,
                 DType.Q5_K => _matvecQ5KGemmNKernel,
-                DType.Q8_0 => _matvecQ80GemmNKernel,
+                DType.Q8_0 => soa ? _matvecQ80GemmNSoaKernel : _matvecQ80GemmNKernel,
                 _          => _matvecF32GemmNKernel,
             };
             int pRows = rows, pCols = cols, pN = nTok;
@@ -1775,12 +1781,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         EnsureGemmWf16((nuint)((long)rows * cols * 2L));
         EnsureGemmAf16((nuint)((long)nTok * cols * 2L));
 
-        // 1) Dequant Q8_0 weight → fp16 (one block per row).
+        // 1) Dequant Q8_0 weight → fp16 (one block per row). #149: SoA-aware.
         {
             nint wp = wPtr, op = _gemmWf16Buf;
             int pRows = rows, pCols = cols;
+            nint dqKern = _soaHandles.Contains(matrix.Handle) ? _dequantQ80F16SoaKernel : _dequantQ80F16Kernel;
             nint* args = stackalloc nint[4] { (nint)(&wp), (nint)(&op), (nint)(&pRows), (nint)(&pCols) };
-            int r = NvrtcInterop.LaunchKernel(_dequantQ80F16Kernel, (uint)rows, 1, 1,
+            int r = NvrtcInterop.LaunchKernel(dqKern, (uint)rows, 1, 1,
                                               256, 1, 1, 0, _stream, args, null);
             if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(dequant_q8_0_to_f16) failed: {r}");
         }
@@ -4455,6 +4462,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _matvecF32GemmNKernel, _matvecQ4KGemmNKernel, _matvecQ5KGemmNKernel, _matvecQ6KGemmNKernel,
             _matvecQ80GemmNKernel, _mmqQ80Kernel, _mmqQ80SoaKernel,
             _matvecQ80Dp4aSoaKernel, _q80RepackSoaKernel,
+            _matvecQ80SoaKernel, _matvecQ80GemmNSoaKernel, _dequantQ80F16SoaKernel,
             _rmsNormBatchedKernel, _headNormBatchedKernel, _headNormQkKernel, _headNormQkBatchedKernel,
             _splitQgBatchedKernel, _ropeNeoxPartialBatchedKernel,
             _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel, _attentionSwaBatchedKernel,
@@ -4538,6 +4546,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _mmqQ80SoaKernel       = GetKernelFunc("llm_mmq_q8_0_soa");
         _matvecQ80Dp4aSoaKernel = GetKernelFunc("llm_matvec_q8_0_dp4a_soa");
         _q80RepackSoaKernel    = GetKernelFunc("llm_q8_0_repack_soa");
+        _matvecQ80SoaKernel    = GetKernelFunc("llm_matvec_q8_0_soa");
+        _matvecQ80GemmNSoaKernel = GetKernelFunc("llm_matvec_q8_0_gemm_n_soa");
+        _dequantQ80F16SoaKernel = GetKernelFunc("llm_dequant_q8_0_to_f16_soa");
         _flashAttnPrefillKernel = GetKernelFunc("llm_flash_attn_prefill_f32");
         _mmaTestM16N8K16Kernel  = GetKernelFunc("llm_mma_test_m16n8k16_f32");
         _flashAttnPrefillTcKernel = GetKernelFunc("llm_flash_attn_prefill_tc");

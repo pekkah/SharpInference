@@ -288,10 +288,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         _model = model;
         _gpu = gpu;
         _hp = hp;
-        // Issue #149: repack 2-D Q8_0 weights into the SoA layout at upload so the
-        // prefill MMQ + decode dp4a matvec use aligned loads (no funnelshift). The
-        // backend auto-routes per repacked weight handle. Default from env.
-        _mmqSoa = mmqSoa ?? (Environment.GetEnvironmentVariable("SHARPI_MMQ_SOA") == "1");
+        // Issue #149: repack 2-D Q8_0 weights into the SoA layout at upload so all the
+        // Q8_0 readers (prefill MMQ, decode dp4a, fp32 matvec, GEMM-N, dequant) use
+        // aligned loads instead of the qs-misalignment funnelshift — +10-12% prefill,
+        // bit-identical. The backend auto-routes per repacked handle. Default on
+        // (SHARPI_MMQ_SOA=0 reverts).
+        _mmqSoa = mmqSoa ?? (Environment.GetEnvironmentVariable("SHARPI_MMQ_SOA") != "0");
         _tqEnabled = enableTurboQuant;
         _tqBits = enableTurboQuant ? tqBits : 0;
 

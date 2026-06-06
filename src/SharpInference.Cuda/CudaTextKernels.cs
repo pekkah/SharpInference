@@ -1299,6 +1299,39 @@ extern ""C"" __global__ void llm_matvec_q8_0(
     if (lane == 0) output[row] = result;
 }
 
+// SoA-layout fp32 matvec (issue #149): bit-identical to llm_matvec_q8_0 but reads the
+// Q8_0 weight from the SoA buffer [quants rows*cols B][scales rows*nb fp16] — aligned
+// quant bytes, one aligned fp16 scale per block, no funnelshift.
+extern ""C"" __global__ void llm_matvec_q8_0_soa(
+    const unsigned int* __restrict__ weights,
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int rows, int cols)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    if (row >= rows) return;
+
+    int num_blocks = cols >> 5;
+    long qrow = (long)row * cols;
+    const unsigned short* ws = (const unsigned short*)((const char*)weights + (long)rows * cols);
+    long srow = (long)row * num_blocks;
+
+    float acc = 0.f;
+    for (int block = 0; block < num_blocks; block++) {
+        float d = sharpi_fp16_to_fp32(ws[srow + block]);
+        int q = sharpi_int8_at(weights, qrow + (long)block * 32 + lane);
+        float x = input[block * 32 + lane];
+        acc += d * (float)q * x;
+    }
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output[row] = result;
+}
+
 // ── MatVec Q8_0 — __dp4a / Q8_1 path (issue #142) ─────────────────────────
 // Decode matvec mirroring llama.cpp's mul_mat_vec_q8_0_q8_1. The input vector is
 // pre-quantized to Q8_1 (36-byte sub-blocks: fp16 d at [0:2], 32 int8 at [4:36]),
@@ -1773,6 +1806,40 @@ extern ""C"" __global__ void llm_matvec_q8_0_gemm_n(
     if (lane == 0) output[(long)token * (long)rows + row] = result;
 }
 
+// SoA-layout GEMM-N (issue #149): bit-identical to llm_matvec_q8_0_gemm_n, aligned
+// SoA weight reads.
+extern ""C"" __global__ void llm_matvec_q8_0_gemm_n_soa(
+    const unsigned int* __restrict__ weights,
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int rows, int cols, int n_tok)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    int token = (int)blockIdx.y;
+    if (row >= rows || token >= n_tok) return;
+
+    int num_blocks = cols >> 5;
+    long qrow = (long)row * cols;
+    const unsigned short* ws = (const unsigned short*)((const char*)weights + (long)rows * cols);
+    long srow = (long)row * num_blocks;
+    const float* in = input + (long)token * (long)cols;
+
+    float acc = 0.f;
+    for (int block = 0; block < num_blocks; block++) {
+        float d = sharpi_fp16_to_fp32(ws[srow + block]);
+        int q = sharpi_int8_at(weights, qrow + (long)block * 32 + lane);
+        float x = in[block * 32 + lane];
+        acc += d * (float)q * x;
+    }
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output[(long)token * (long)rows + row] = result;
+}
+
 // ── Q8_0 → FP16 dequant for cuBLAS prefill GEMM (issue #141) ───────────────
 // Dequantizes a Q8_0-packed weight matrix [rows × cols] into a row-major fp16
 // matrix [rows × cols]. One block per row (256 threads), each thread strides
@@ -1799,6 +1866,29 @@ extern ""C"" __global__ void llm_dequant_q8_0_to_f16(
         unsigned int dhi = sharpi_byte_at(weights, b0 + 1);
         float d = sharpi_fp16_to_fp32(dlo | (dhi << 8));
         int q = sharpi_int8_at(weights, b0 + 2 + (long)lane);
+        out[out_row + c] = (unsigned short)sharpi_fp32_to_fp16(d * (float)q);
+    }
+}
+
+// SoA-layout dequant (issue #149): bit-identical to llm_dequant_q8_0_to_f16, aligned
+// SoA weight reads.
+extern ""C"" __global__ void llm_dequant_q8_0_to_f16_soa(
+    const unsigned int* __restrict__ weights,
+    unsigned short* __restrict__ out,
+    int rows, int cols)
+{
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    int num_blocks = cols >> 5;
+    long qrow = (long)row * cols;
+    const unsigned short* ws = (const unsigned short*)((const char*)weights + (long)rows * cols);
+    long srow = (long)row * num_blocks;
+    long out_row = (long)row * (long)cols;
+    for (int c = (int)threadIdx.x; c < cols; c += (int)blockDim.x) {
+        int block = c >> 5;
+        int lane  = c & 31;
+        float d = sharpi_fp16_to_fp32(ws[srow + block]);
+        int q = sharpi_int8_at(weights, qrow + (long)block * 32 + lane);
         out[out_row + c] = (unsigned short)sharpi_fp32_to_fp16(d * (float)q);
     }
 }
