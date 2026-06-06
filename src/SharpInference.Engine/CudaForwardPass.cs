@@ -198,6 +198,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// Default on (<c>SHARPI_PREFILL_FLASH</c>=0 reverts to the scalar kernels).
     /// </summary>
     public bool PrefillFlashAttnEnabled { get; set; }
+
+    /// <summary>
+    /// Issues #146/#147: use the tensor-core flash-attention prefill (QK^T + P·V on the
+    /// mma cores) instead of the half2 <see cref="PrefillFlashAttnEnabled"/> kernel. Takes
+    /// precedence within the flash path. Requires head_dim % 16 == 0 (Gemma 4: 256/512);
+    /// the multi-warp #147 kernel (head_dim % 64 == 0) is +27-40% over half2, the
+    /// single-warp #146 fallback +5%. Default on (<c>SHARPI_PREFILL_FLASH_TC</c>=0 reverts
+    /// to half2). Argmax-stable, not bit-exact (fp16 Q/K/V/P + online softmax).
+    /// </summary>
+    public bool PrefillFlashTcEnabled { get; set; }
+    private bool _forceFlashTc1;             // #147 A/B: pin the single-warp TC kernel
+    private readonly bool _mmqSoa;           // #149: repack 2-D Q8_0 weights to SoA at upload
     private int _bpCapacity;                 // current N the scratch is sized for (0 = none)
     private Tensor? _bpHidden, _bpResidual, _bpNorm;       // [N × embDim]
     private Tensor? _bpQ, _bpAttnOut;                      // [N × numHeads*maxHeadDim]
@@ -270,11 +282,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
     public CudaForwardPass(GgufModel model, CudaBackend gpu, ModelHyperparams hp,
         int maxContextLength = 0,
-        bool enableTurboQuant = false, int tqFp32Window = 256, int tqBits = 3)
+        bool enableTurboQuant = false, int tqFp32Window = 256, int tqBits = 3,
+        bool? mmqSoa = null)
     {
         _model = model;
         _gpu = gpu;
         _hp = hp;
+        // Issue #149: repack 2-D Q8_0 weights into the SoA layout at upload so all the
+        // Q8_0 readers (prefill MMQ, decode dp4a, fp32 matvec, GEMM-N, dequant) use
+        // aligned loads instead of the qs-misalignment funnelshift — +10-12% prefill,
+        // bit-identical. The backend auto-routes per repacked handle. Default on
+        // (SHARPI_MMQ_SOA=0 reverts).
+        _mmqSoa = mmqSoa ?? (Environment.GetEnvironmentVariable("SHARPI_MMQ_SOA") != "0");
         _tqEnabled = enableTurboQuant;
         _tqBits = enableTurboQuant ? tqBits : 0;
 
@@ -307,6 +326,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // ~1389→~2180 t/s. SHARPI_PREFILL_FLASH=0 reverts to the scalar kernels.
         PrefillFlashAttnEnabled =
             Environment.GetEnvironmentVariable("SHARPI_PREFILL_FLASH") != "0";
+        // Issues #146/#147: tensor-core flash prefill — default on (the #147 multi-warp
+        // kernel is +27-40% over half2 on Gemma 4 at d=512). SHARPI_PREFILL_FLASH_TC=0
+        // reverts to the half2 kernel.
+        PrefillFlashTcEnabled =
+            Environment.GetEnvironmentVariable("SHARPI_PREFILL_FLASH_TC") != "0"
+            && (_headDim & 15) == 0;
+        // Issue #147 A/B: force the single-warp TC kernel even where #147 would apply.
+        _forceFlashTc1 =
+            Environment.GetEnvironmentVariable("SHARPI_PREFILL_FLASH_TC1") == "1";
         _maxHeadDim = _headDim;
         if (hp.LayerHeadDim is { } lhdMax)
             for (int i = 0; i < hp.NumLayers; i++)
@@ -1991,7 +2019,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         if (s_prefillProfile) { _gpu.Synchronize(); _profSw.Restart(); }
         // Gemma 4: attention_scale = 1.0, passed explicitly (kernel skips its rsqrtf).
-        if (PrefillFlashAttnEnabled)
+        if (PrefillFlashTcEnabled && (layerHd & 15) == 0)
+        {
+            // #147 multi-warp/d-split when head_dim is a multiple of 64 (W·16); else the
+            // #146 single-warp kernel. SHARPI_PREFILL_FLASH_TC1=1 forces single-warp (A/B).
+            if (!_forceFlashTc1 && (layerHd & 63) == 0)
+                _gpu.FlashAttentionPrefillTc2(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
+                    _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: 1f);
+            else
+                _gpu.FlashAttentionPrefillTc(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
+                    _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: 1f);
+        }
+        else if (PrefillFlashAttnEnabled)
             _gpu.FlashAttentionPrefill(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
                 _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: 1f);
         else if (isSwa)
@@ -2384,6 +2423,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         else if (info.DType == DType.Q4_K || info.DType == DType.Q6_K || info.DType == DType.Q8_0)
         {
             result = _gpu.UploadRaw(data, TensorShape.D1(data.Length), info.DType, exact: true);
+            // #149: repack 2-D Q8_0 GEMM weights (norms/biases are 1-D; embedding uploads
+            // elsewhere) into the SoA layout. Dimensions are GGUF ne order: [cols, rows].
+            if (_mmqSoa && info.DType == DType.Q8_0 && info.NDimensions == 2)
+            {
+                int cols = (int)info.Dimensions[0];
+                int rows = (int)info.Dimensions[1];
+                result = _gpu.RepackQ8_0Soa(result, rows, cols);
+            }
             _weightDTypes[result.Handle] = info.DType;
         }
         else

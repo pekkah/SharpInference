@@ -1299,6 +1299,39 @@ extern ""C"" __global__ void llm_matvec_q8_0(
     if (lane == 0) output[row] = result;
 }
 
+// SoA-layout fp32 matvec (issue #149): bit-identical to llm_matvec_q8_0 but reads the
+// Q8_0 weight from the SoA buffer [quants rows*cols B][scales rows*nb fp16] — aligned
+// quant bytes, one aligned fp16 scale per block, no funnelshift.
+extern ""C"" __global__ void llm_matvec_q8_0_soa(
+    const unsigned int* __restrict__ weights,
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int rows, int cols)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    if (row >= rows) return;
+
+    int num_blocks = cols >> 5;
+    long qrow = (long)row * cols;
+    const unsigned short* ws = (const unsigned short*)((const char*)weights + (long)rows * cols);
+    long srow = (long)row * num_blocks;
+
+    float acc = 0.f;
+    for (int block = 0; block < num_blocks; block++) {
+        float d = sharpi_fp16_to_fp32(ws[srow + block]);
+        int q = sharpi_int8_at(weights, qrow + (long)block * 32 + lane);
+        float x = input[block * 32 + lane];
+        acc += d * (float)q * x;
+    }
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output[row] = result;
+}
+
 // ── MatVec Q8_0 — __dp4a / Q8_1 path (issue #142) ─────────────────────────
 // Decode matvec mirroring llama.cpp's mul_mat_vec_q8_0_q8_1. The input vector is
 // pre-quantized to Q8_1 (36-byte sub-blocks: fp16 d at [0:2], 32 int8 at [4:36]),
@@ -1383,6 +1416,84 @@ extern ""C"" __global__ void llm_matvec_q8_0_dp4a(
             for (int g = 0; g < 4; g++) s += warp_acc[w][g];
         output[row] = s;
     }
+}
+
+// SoA-layout dp4a decode matvec (issue #149). Same as llm_matvec_q8_0_dp4a but the
+// Q8_0 weight is in the SoA buffer [quants rows*cols B][scales rows*nb fp16], so the
+// quant words are plain aligned loads (no funnelshift) and the scale is one aligned
+// fp16 read. Bit-identical to the AoS dp4a. ws locates the scale region at byte rows*cols.
+extern ""C"" __global__ void llm_matvec_q8_0_dp4a_soa(
+    const unsigned int* __restrict__ weights,    // SoA: [quants][scales]
+    const unsigned char* __restrict__ y_q81,
+    float* __restrict__ output,
+    int rows, int cols)
+{
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    int warp_id = (int)threadIdx.y;
+    int lane    = (int)threadIdx.x;
+    int grp     = lane >> 3;
+    int sub     = lane & 7;
+
+    int num_blocks = cols >> 5;
+    long qrow = (long)row * (cols >> 2);            // uint index of this row's quants
+    const unsigned short* ws = (const unsigned short*)((const char*)weights + (long)rows * cols);
+    long srow = (long)row * num_blocks;             // ushort index of this row's scales
+
+    float acc = 0.f;
+    for (int block0 = warp_id * 4; block0 < num_blocks; block0 += MATVEC_Q80_NWARPS * 4) {
+        int block = block0 + grp;
+        float part = 0.f;
+        if (block < num_blocks) {
+            float dw = sharpi_fp16_to_fp32(ws[srow + block]);
+            int wq = (int)weights[qrow + (long)block * 8 + sub];   // aligned, no funnelshift
+
+            long ab = (long)block * 36L;
+            unsigned int d_bits = (*reinterpret_cast<const unsigned int*>(y_q81 + ab)) & 0xffffu;
+            float da = sharpi_fp16_to_fp32(d_bits);
+            int aq = *reinterpret_cast<const int*>(y_q81 + ab + 4 + (long)sub * 4);
+
+            int dot = __dp4a(wq, aq, 0);
+            part = dw * da * (float)dot;
+        }
+        part += __shfl_xor_sync(0xffffffffu, part, 4);
+        part += __shfl_xor_sync(0xffffffffu, part, 2);
+        part += __shfl_xor_sync(0xffffffffu, part, 1);
+        if (sub == 0) acc += part;
+    }
+
+    __shared__ float warp_acc[MATVEC_Q80_NWARPS][4];
+    if (sub == 0) warp_acc[warp_id][grp] = acc;
+    __syncthreads();
+    if (warp_id == 0 && lane == 0) {
+        float s = 0.f;
+        #pragma unroll
+        for (int w = 0; w < MATVEC_Q80_NWARPS; w++)
+            for (int g = 0; g < 4; g++) s += warp_acc[w][g];
+        output[row] = s;
+    }
+}
+
+// One-time repack of an interleaved Q8_0 weight [rows × nb × 34 B] into the SoA
+// buffer [quants rows*cols B][scales rows*nb fp16] (issue #149). One thread per
+// 32-int8 block: copies the 2-byte fp16 scale to the scale region and the 32 quants
+// to the (16-byte-aligned) quant region. Runs once at weight upload.
+extern ""C"" __global__ void llm_q8_0_repack_soa(
+    const unsigned char* __restrict__ src,   // interleaved, 34 B/block
+    unsigned char* __restrict__ dst,         // SoA [quants][scales]
+    int rows, int cols)
+{
+    long blk = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    int nb = cols >> 5;
+    long total = (long)rows * nb;
+    if (blk >= total) return;
+    long srcOff = blk * 34L;
+    long qDst = blk * 32L;                       // quants region
+    long sDst = (long)rows * cols + blk * 2L;    // scales region
+    dst[sDst]     = src[srcOff];
+    dst[sDst + 1] = src[srcOff + 1];
+    #pragma unroll
+    for (int i = 0; i < 32; i++) dst[qDst + i] = src[srcOff + 2 + i];
 }
 
 // ── Q8_0 × Q8_1 int8 tensor-core MMQ (issue #141 prefill) ──────────────────
@@ -1529,6 +1640,134 @@ extern ""C"" __global__ void llm_mmq_q8_0(
 #undef MMQ_BM
 #undef MMQ_BN
 
+// ── SoA-layout int8 MMQ (issue #149) ───────────────────────────────────────
+// Same tiling/mma as llm_mmq_q8_0, but the Q8_0 weights are pre-repacked into a
+// struct-of-arrays layout: `qw` holds the 32 int8 quants per block contiguous and
+// 16-byte aligned (8 uints/block, row-major by (row*nb+kb)), and `ws` holds the
+// fp16 block scales separately. This kills the AoS tax: in the interleaved 34-byte
+// layout the qs start at a 2-byte offset, so every weight word costs an extra load
+// + __funnelshift (sharpi_uint_at); here every weight word is a plain aligned load.
+// The roofline probe put the interleaved MMQ at 23-34% of int8 TC peak, inner-loop-
+// bound on exactly this. Activations (Q8_1) are already 4-aligned, so only the
+// weight-load path changes. Bit-identical to llm_mmq_q8_0 given a faithful repack.
+#define MMQ_BM 64
+#define MMQ_BN 128
+extern ""C"" __global__ void llm_mmq_q8_0_soa(
+    const unsigned int*  __restrict__ weights,   // SoA buffer: [quants rows*cols B][scales rows*nb fp16]
+    const unsigned char* __restrict__ y_q81,     // Q8_1 [n_tok × cols], 36 B/block
+    float* __restrict__ output,                  // [n_tok × rows] fp32
+    int rows, int cols, int n_tok)
+{
+    // Single SoA buffer; split into the quant and scale views (host stores both
+    // contiguous so the kernel signature matches llm_mmq_q8_0 — the dispatch just
+    // swaps the kernel function pointer based on whether the weight was repacked).
+    const unsigned int*   qw = weights;
+    const unsigned short* ws = (const unsigned short*)((const char*)weights + (long)rows * cols);
+
+    __shared__ int   sW[MMQ_BM * 8];
+    __shared__ float sWd[MMQ_BM];
+    __shared__ int   sY[MMQ_BN * 8];
+    __shared__ float sYd[MMQ_BN];
+
+    int row_block = (int)blockIdx.x * MMQ_BM;
+    int tok_block = (int)blockIdx.y * MMQ_BN;
+    int nb = cols >> 5;
+
+    int tid  = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int grp  = lane >> 2;
+    int tig  = lane & 3;
+    int wr   = warp & 3;
+    int wc   = warp >> 2;
+    int mrow0 = wr * 16;
+
+    float acc[8][4];
+    #pragma unroll
+    for (int n = 0; n < 8; n++) { acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.f; }
+
+    // Register-prefetch double-buffer, SoA weights: aligned uint loads (no funnelshift).
+    unsigned int rW0, rW1, rY0, rY1, rY2, rY3;
+    float rWd, rYd;
+    #define MMQ_LOAD_TILE_SOA(KB) do { \
+        int gw0 = row_block + (tid >> 3); \
+        rW0 = (gw0 < rows) ? qw[((long)gw0 * nb + (KB)) * 8L + (tid & 7)] : 0u; \
+        int gw1 = row_block + ((tid + 256) >> 3); \
+        rW1 = (gw1 < rows) ? qw[((long)gw1 * nb + (KB)) * 8L + ((tid + 256) & 7)] : 0u; \
+        if (tid < MMQ_BM) { int gw = row_block + tid; \
+            rWd = (gw < rows) ? sharpi_fp16_to_fp32(ws[(long)gw * nb + (KB)]) : 0.f; } \
+        int gy0 = tok_block + (tid >> 3); \
+        rY0 = (gy0 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy0 * nb + (KB)) * 36L + 4 + (long)(tid & 7) * 4) : 0u; \
+        int gy1 = tok_block + ((tid + 256) >> 3); \
+        rY1 = (gy1 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy1 * nb + (KB)) * 36L + 4 + (long)((tid + 256) & 7) * 4) : 0u; \
+        int gy2 = tok_block + ((tid + 512) >> 3); \
+        rY2 = (gy2 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy2 * nb + (KB)) * 36L + 4 + (long)((tid + 512) & 7) * 4) : 0u; \
+        int gy3 = tok_block + ((tid + 768) >> 3); \
+        rY3 = (gy3 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy3 * nb + (KB)) * 36L + 4 + (long)((tid + 768) & 7) * 4) : 0u; \
+        if (tid < MMQ_BN) { int gt = tok_block + tid; \
+            rYd = (gt < n_tok) ? sharpi_fp16_to_fp32((*reinterpret_cast<const unsigned int*>(y_q81 + ((long)gt * nb + (KB)) * 36L)) & 0xffffu) : 0.f; } \
+    } while (0)
+
+    MMQ_LOAD_TILE_SOA(0);
+
+    for (int kb = 0; kb < nb; kb++) {
+        sW[tid] = (int)rW0; sW[tid + 256] = (int)rW1;
+        if (tid < MMQ_BM) sWd[tid] = rWd;
+        sY[tid] = (int)rY0; sY[tid + 256] = (int)rY1; sY[tid + 512] = (int)rY2; sY[tid + 768] = (int)rY3;
+        if (tid < MMQ_BN) sYd[tid] = rYd;
+        __syncthreads();
+
+        if (kb + 1 < nb) MMQ_LOAD_TILE_SOA(kb + 1);
+
+        int a0 = sW[(mrow0 + grp) * 8     + tig];
+        int a1 = sW[(mrow0 + grp + 8) * 8 + tig];
+        int a2 = sW[(mrow0 + grp) * 8     + tig + 4];
+        int a3 = sW[(mrow0 + grp + 8) * 8 + tig + 4];
+        float dwA = sWd[mrow0 + grp];
+        float dwB = sWd[mrow0 + grp + 8];
+
+        #pragma unroll
+        for (int nt = 0; nt < 8; nt++) {
+            int ncol0 = wc * 64 + nt * 8;
+            int b0 = sY[(ncol0 + grp) * 8 + tig];
+            int b1 = sY[(ncol0 + grp) * 8 + tig + 4];
+            float daC0 = sYd[ncol0 + tig * 2];
+            float daC1 = sYd[ncol0 + tig * 2 + 1];
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            asm(
+              ""mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 ""
+              ""{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};""
+              : ""+r""(c0), ""+r""(c1), ""+r""(c2), ""+r""(c3)
+              : ""r""(a0), ""r""(a1), ""r""(a2), ""r""(a3), ""r""(b0), ""r""(b1));
+            acc[nt][0] += (float)c0 * dwA * daC0;
+            acc[nt][1] += (float)c1 * dwA * daC1;
+            acc[nt][2] += (float)c2 * dwB * daC0;
+            acc[nt][3] += (float)c3 * dwB * daC1;
+        }
+        __syncthreads();
+    }
+
+    int rowA = row_block + mrow0 + grp;
+    int rowB = rowA + 8;
+    #pragma unroll
+    for (int nt = 0; nt < 8; nt++) {
+        int ncol0 = tok_block + wc * 64 + nt * 8;
+        int tokC0 = ncol0 + tig * 2;
+        int tokC1 = ncol0 + tig * 2 + 1;
+        if (rowA < rows) {
+            if (tokC0 < n_tok) output[(long)tokC0 * rows + rowA] = acc[nt][0];
+            if (tokC1 < n_tok) output[(long)tokC1 * rows + rowA] = acc[nt][1];
+        }
+        if (rowB < rows) {
+            if (tokC0 < n_tok) output[(long)tokC0 * rows + rowB] = acc[nt][2];
+            if (tokC1 < n_tok) output[(long)tokC1 * rows + rowB] = acc[nt][3];
+        }
+    }
+}
+#undef MMQ_LOAD_TILE_SOA
+#undef MMQ_BM
+#undef MMQ_BN
+
 // Q8_0 GEMM-N: N tokens through one weight matrix. grid=( (rows+7)/8, n_tok ).
 // Input [n_tok, cols] and output [n_tok, rows] are offset by token; the per-row
 // accumulation + warp reduce is identical to llm_matvec_q8_0, so this is
@@ -1567,6 +1806,40 @@ extern ""C"" __global__ void llm_matvec_q8_0_gemm_n(
     if (lane == 0) output[(long)token * (long)rows + row] = result;
 }
 
+// SoA-layout GEMM-N (issue #149): bit-identical to llm_matvec_q8_0_gemm_n, aligned
+// SoA weight reads.
+extern ""C"" __global__ void llm_matvec_q8_0_gemm_n_soa(
+    const unsigned int* __restrict__ weights,
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int rows, int cols, int n_tok)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    int token = (int)blockIdx.y;
+    if (row >= rows || token >= n_tok) return;
+
+    int num_blocks = cols >> 5;
+    long qrow = (long)row * cols;
+    const unsigned short* ws = (const unsigned short*)((const char*)weights + (long)rows * cols);
+    long srow = (long)row * num_blocks;
+    const float* in = input + (long)token * (long)cols;
+
+    float acc = 0.f;
+    for (int block = 0; block < num_blocks; block++) {
+        float d = sharpi_fp16_to_fp32(ws[srow + block]);
+        int q = sharpi_int8_at(weights, qrow + (long)block * 32 + lane);
+        float x = in[block * 32 + lane];
+        acc += d * (float)q * x;
+    }
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output[(long)token * (long)rows + row] = result;
+}
+
 // ── Q8_0 → FP16 dequant for cuBLAS prefill GEMM (issue #141) ───────────────
 // Dequantizes a Q8_0-packed weight matrix [rows × cols] into a row-major fp16
 // matrix [rows × cols]. One block per row (256 threads), each thread strides
@@ -1593,6 +1866,29 @@ extern ""C"" __global__ void llm_dequant_q8_0_to_f16(
         unsigned int dhi = sharpi_byte_at(weights, b0 + 1);
         float d = sharpi_fp16_to_fp32(dlo | (dhi << 8));
         int q = sharpi_int8_at(weights, b0 + 2 + (long)lane);
+        out[out_row + c] = (unsigned short)sharpi_fp32_to_fp16(d * (float)q);
+    }
+}
+
+// SoA-layout dequant (issue #149): bit-identical to llm_dequant_q8_0_to_f16, aligned
+// SoA weight reads.
+extern ""C"" __global__ void llm_dequant_q8_0_to_f16_soa(
+    const unsigned int* __restrict__ weights,
+    unsigned short* __restrict__ out,
+    int rows, int cols)
+{
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    int num_blocks = cols >> 5;
+    long qrow = (long)row * cols;
+    const unsigned short* ws = (const unsigned short*)((const char*)weights + (long)rows * cols);
+    long srow = (long)row * num_blocks;
+    long out_row = (long)row * (long)cols;
+    for (int c = (int)threadIdx.x; c < cols; c += (int)blockDim.x) {
+        int block = c >> 5;
+        int lane  = c & 31;
+        float d = sharpi_fp16_to_fp32(ws[srow + block]);
+        int q = sharpi_int8_at(weights, qrow + (long)block * 32 + lane);
         out[out_row + c] = (unsigned short)sharpi_fp32_to_fp16(d * (float)q);
     }
 }
@@ -3051,6 +3347,483 @@ extern ""C"" __global__ void llm_attention_swa(
         out[out_off + d] = acc;
     }
 }
+
+// ── mma.sync m16n8k16 fragment-layout validation (issue #146) ──────────────
+// Single-warp test harness for the int8/fp16 tensor-core building block used by
+// the TC flash-attention prefill. One block / 32 threads computes C[16x8] =
+// A[16x16] · B[16x8] on the tensor cores (fp16 multiplicands, fp32 accumulate)
+// and writes C back in (row,col) order so a host unit test can compare against a
+// CPU fp32 matmul. Validating the A/B/C fragment→lane→register maps in isolation
+// (PTX ISA m16n8k16 .f16/.f32 tables) de-risks the full kernel — a wrong mapping
+// silently produces garbage. a_in is row-major [16*16], b_in is row-major K-major
+// [16*8] (b_in[k*8+n] = B[k][n]), c_out is row-major [16*8].
+extern ""C"" __global__ void llm_mma_test_m16n8k16_f32(
+    const float* __restrict__ a_in,   // [16*16] row-major A
+    const float* __restrict__ b_in,   // [16*8]  K-major  B (b_in[k*8+n])
+    float* __restrict__ c_out)        // [16*8]  row-major C = A·B
+{
+    int lane = (int)(threadIdx.x & 31);
+    int gid  = lane >> 2;     // groupID 0..7
+    int tig  = lane & 3;      // threadID_in_group 0..3
+
+    // A fragment (16x16 fp16, row-major): 4 regs, each a column-pair {2c,2c+1}.
+    unsigned int a0 = sharpi_f32x2_to_f16x2(a_in[(gid    ) * 16 + (2 * tig    )], a_in[(gid    ) * 16 + (2 * tig + 1)]);
+    unsigned int a1 = sharpi_f32x2_to_f16x2(a_in[(gid + 8) * 16 + (2 * tig    )], a_in[(gid + 8) * 16 + (2 * tig + 1)]);
+    unsigned int a2 = sharpi_f32x2_to_f16x2(a_in[(gid    ) * 16 + (2 * tig + 8)], a_in[(gid    ) * 16 + (2 * tig + 9)]);
+    unsigned int a3 = sharpi_f32x2_to_f16x2(a_in[(gid + 8) * 16 + (2 * tig + 8)], a_in[(gid + 8) * 16 + (2 * tig + 9)]);
+
+    // B fragment (16x8 fp16, col-major): 2 regs, each a K-row-pair of column `gid`.
+    unsigned int b0 = sharpi_f32x2_to_f16x2(b_in[(2 * tig    ) * 8 + gid], b_in[(2 * tig + 1) * 8 + gid]);
+    unsigned int b1 = sharpi_f32x2_to_f16x2(b_in[(2 * tig + 8) * 8 + gid], b_in[(2 * tig + 9) * 8 + gid]);
+
+    float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+    asm volatile(
+        ""mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 ""
+        ""{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};""
+        : ""+f""(c0), ""+f""(c1), ""+f""(c2), ""+f""(c3)
+        : ""r""(a0), ""r""(a1), ""r""(a2), ""r""(a3), ""r""(b0), ""r""(b1));
+
+    // C fragment (16x8 fp32): c0=(gid,2tig) c1=(gid,2tig+1) c2=(gid+8,2tig) c3=(gid+8,2tig+1).
+    c_out[(gid    ) * 8 + (2 * tig    )] = c0;
+    c_out[(gid    ) * 8 + (2 * tig + 1)] = c1;
+    c_out[(gid + 8) * 8 + (2 * tig    )] = c2;
+    c_out[(gid + 8) * 8 + (2 * tig + 1)] = c3;
+}
+
+// ── Tensor-core flash-attention prefill (issue #146) ───────────────────────
+// Full TC version of llm_flash_attn_prefill_f32: both QK^T and P·V run on the
+// tensor cores (mma.sync m16n8k16, fp16 multiplicands / fp32 accumulate). One
+// warp owns a 16-query tile and streams the keys in 16-key tiles with an online
+// softmax. The elegant part: the QK^T score C-fragment is reused *directly* as
+// the P·V A-fragment — the key index is QK^T's N-column AND P·V's contraction
+// dim, and the m16n8k16 C and A fragment layouts coincide on (row, 2·tig), so no
+// transpose / shared round-trip is needed for P. O[16×head_dim] is too large for
+// registers (head_dim/8 × 4 = 256 regs/lane at d=512), so it lives in shared fp32
+// and is rescaled in place per key-tile. K and V time-share one 16×head_dim fp16
+// shared buffer (K is fully consumed by QK^T before V is staged for P·V), so the
+// whole kernel fits 16·head_dim·(4+2) = 48 KB at d=512. Requires head_dim%16==0.
+// Matches the scalar kernels to fp tolerance (online softmax + fp16 Q/K/V/P), not
+// bit-exact. GQA, causal, optional sliding window, per-layer head_dim.
+__device__ __forceinline__ float fatc_mask(float s, int qpos, int abs_k, int window_size)
+{
+    bool ok = (abs_k <= qpos) && (window_size <= 0 || abs_k >= qpos + 1 - window_size);
+    return ok ? s : sharpi_neg_inf();
+}
+#define FATC_KT 16
+extern ""C"" __global__ void llm_flash_attn_prefill_tc(
+    const float* __restrict__ q_all,      // [n_tok, num_heads*head_dim]
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ out_all,          // [n_tok, num_heads*head_dim]
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int window_size, int max_seq_len, int n_tok, float attn_scale)
+{
+    extern __shared__ unsigned int fatc_smem[];
+    float*          sO  = (float*)fatc_smem;                       // [16 * head_dim] fp32
+    unsigned short* sKV = (unsigned short*)(sO + 16 * head_dim);   // [16 * head_dim] fp16
+
+    int lane = (int)(threadIdx.x & 31);
+    int gid  = lane >> 2;     // 0..7  (query-row base; also the N-col 0..7)
+    int tig  = lane & 3;      // 0..3
+    int h    = (int)blockIdx.x;
+    int qtile0 = (int)blockIdx.y * 16;
+
+    int kv_head = h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    int q_dim   = num_heads * head_dim;
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
+    int nchunk  = head_dim >> 4;   // d / 16  (QK^T contract chunks)
+    int ndtile  = head_dim >> 3;   // d / 8   (P·V head-dim N-tiles)
+
+    int q0 = qtile0 + gid;          // this lane's two query rows
+    int q1 = qtile0 + gid + 8;
+    int qpos0 = start_pos + q0;
+    int qpos1 = start_pos + q1;
+
+    for (int idx = lane; idx < 16 * head_dim; idx += 32) sO[idx] = 0.f;
+
+    float m0 = sharpi_neg_inf(), l0 = 0.f;   // running max/sum, query row gid
+    float m1 = sharpi_neg_inf(), l1 = 0.f;   // query row gid+8
+
+    // Union key range over the 16 queries in this tile (causal + optional window).
+    int last_q = qtile0 + 15; if (last_q > n_tok - 1) last_q = n_tok - 1;
+    int key_end = start_pos + last_q + 1;
+    int first_qpos = start_pos + qtile0;
+    int key_start = (window_size > 0) ? (first_qpos + 1 - window_size) : 0;
+    if (key_start < 0) key_start = 0;
+    key_start = (key_start / FATC_KT) * FATC_KT;   // align down to a key tile
+    __syncthreads();
+
+    for (int kt0 = key_start; kt0 < key_end; kt0 += FATC_KT) {
+        // Stage K-tile [16 keys × head_dim] → sKV (fp16). Out-of-range keys load 0
+        // (later masked to -inf by the causal bound).
+        for (int idx = lane; idx < FATC_KT * head_dim; idx += 32) {
+            int kk = idx / head_dim, d = idx - kk * head_dim;
+            int abs_k = kt0 + kk;
+            float kv = (abs_k < key_end)
+                ? k_cache[(long)abs_k * kv_dim + (long)kv_head * head_dim + d] : 0.f;
+            sKV[idx] = (unsigned short)sharpi_fp32_to_fp16(kv);
+        }
+        __syncthreads();
+
+        // ── QK^T → S[16q × 16k], two N=8 key sub-tiles (nt0: keys 0-7, nt1: 8-15) ──
+        float s0[4] = {0.f,0.f,0.f,0.f};   // nt0 C-frag c0..c3
+        float s1[4] = {0.f,0.f,0.f,0.f};   // nt1 C-frag
+        for (int dc = 0; dc < nchunk; dc++) {
+            int d0 = dc * 16;
+            long qb = (long)h * head_dim + d0;
+            // A = Q frag: rows {gid→q0, gid+8→q1}, cols {2tig,2tig+1,2tig+8,2tig+9}.
+            float qa0l = (q0 < n_tok) ? q_all[(long)q0 * q_dim + qb + 2*tig    ] : 0.f;
+            float qa0h = (q0 < n_tok) ? q_all[(long)q0 * q_dim + qb + 2*tig + 1] : 0.f;
+            float qa1l = (q1 < n_tok) ? q_all[(long)q1 * q_dim + qb + 2*tig    ] : 0.f;
+            float qa1h = (q1 < n_tok) ? q_all[(long)q1 * q_dim + qb + 2*tig + 1] : 0.f;
+            float qa2l = (q0 < n_tok) ? q_all[(long)q0 * q_dim + qb + 2*tig + 8] : 0.f;
+            float qa2h = (q0 < n_tok) ? q_all[(long)q0 * q_dim + qb + 2*tig + 9] : 0.f;
+            float qa3l = (q1 < n_tok) ? q_all[(long)q1 * q_dim + qb + 2*tig + 8] : 0.f;
+            float qa3h = (q1 < n_tok) ? q_all[(long)q1 * q_dim + qb + 2*tig + 9] : 0.f;
+            unsigned int a0 = sharpi_f32x2_to_f16x2(qa0l, qa0h);
+            unsigned int a1 = sharpi_f32x2_to_f16x2(qa1l, qa1h);
+            unsigned int a2 = sharpi_f32x2_to_f16x2(qa2l, qa2h);
+            unsigned int a3 = sharpi_f32x2_to_f16x2(qa3l, qa3h);
+            // B = K frag (col-major; col = key within sub-tile, rows = contract d).
+            #pragma unroll
+            for (int nt = 0; nt < 2; nt++) {
+                int kbase = (nt * 8 + gid) * head_dim + d0;   // key (nt*8+gid)
+                unsigned int b0 = ((unsigned int)sKV[kbase + 2*tig + 1] << 16) | (unsigned int)sKV[kbase + 2*tig    ];
+                unsigned int b1 = ((unsigned int)sKV[kbase + 2*tig + 9] << 16) | (unsigned int)sKV[kbase + 2*tig + 8];
+                float* s = nt ? s1 : s0;
+                asm volatile(
+                    ""mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 ""
+                    ""{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};""
+                    : ""+f""(s[0]), ""+f""(s[1]), ""+f""(s[2]), ""+f""(s[3])
+                    : ""r""(a0), ""r""(a1), ""r""(a2), ""r""(a3), ""r""(b0), ""r""(b1));
+            }
+        }
+
+        // Scale + causal/window mask. C-frag: s0[c0]=S[q0,kt0+2tig], s0[c1]=S[q0,kt0+2tig+1],
+        // s0[c2]=S[q1,kt0+2tig], s0[c3]=S[q1,kt0+2tig+1]; s1 keys shifted by +8.
+        s0[0] = fatc_mask(s0[0]*scale, qpos0, kt0 + 2*tig,     window_size);
+        s0[1] = fatc_mask(s0[1]*scale, qpos0, kt0 + 2*tig + 1, window_size);
+        s0[2] = fatc_mask(s0[2]*scale, qpos1, kt0 + 2*tig,     window_size);
+        s0[3] = fatc_mask(s0[3]*scale, qpos1, kt0 + 2*tig + 1, window_size);
+        s1[0] = fatc_mask(s1[0]*scale, qpos0, kt0 + 2*tig + 8, window_size);
+        s1[1] = fatc_mask(s1[1]*scale, qpos0, kt0 + 2*tig + 9, window_size);
+        s1[2] = fatc_mask(s1[2]*scale, qpos1, kt0 + 2*tig + 8, window_size);
+        s1[3] = fatc_mask(s1[3]*scale, qpos1, kt0 + 2*tig + 9, window_size);
+
+        // Online softmax, per query row. Row gid uses {s0[0],s0[1],s1[0],s1[1]} (this
+        // lane's 4 keys) reduced across the 4 lanes of the group (tig). Row gid+8 uses
+        // {s0[2],s0[3],s1[2],s1[3]}.
+        float tmax0 = fmaxf(fmaxf(s0[0], s0[1]), fmaxf(s1[0], s1[1]));
+        float tmax1 = fmaxf(fmaxf(s0[2], s0[3]), fmaxf(s1[2], s1[3]));
+        tmax0 = fmaxf(tmax0, __shfl_xor_sync(0xffffffffu, tmax0, 1));
+        tmax0 = fmaxf(tmax0, __shfl_xor_sync(0xffffffffu, tmax0, 2));
+        tmax1 = fmaxf(tmax1, __shfl_xor_sync(0xffffffffu, tmax1, 1));
+        tmax1 = fmaxf(tmax1, __shfl_xor_sync(0xffffffffu, tmax1, 2));
+        float mnew0 = fmaxf(m0, tmax0);
+        float mnew1 = fmaxf(m1, tmax1);
+        // A query row whose every key in this tile is masked (sliding window: a later
+        // query's early tiles fall entirely outside its window) keeps tmax = -inf; if
+        // no valid key has been seen yet mnew is also -inf, so exp(m-mnew)=exp(-inf+inf)
+        // is NaN. Guard: when mnew is -inf, skip the update (alpha=1 leaves O=0 intact,
+        // probabilities are 0). Once any valid key exists, mnew is finite and a masked
+        // score (-inf) safely yields exp(-inf - finite) = 0.
+        bool ok0 = mnew0 > sharpi_neg_inf();
+        bool ok1 = mnew1 > sharpi_neg_inf();
+        float alpha0 = ok0 ? __expf(m0 - mnew0) : 1.f;
+        float alpha1 = ok1 ? __expf(m1 - mnew1) : 1.f;
+        // Probabilities (unnormalized). Masked (-inf) or no-valid-key → 0.
+        float p0[4], p1[4];
+        p0[0] = ok0 ? __expf(s0[0] - mnew0) : 0.f; p0[1] = ok0 ? __expf(s0[1] - mnew0) : 0.f;
+        p0[2] = ok1 ? __expf(s0[2] - mnew1) : 0.f; p0[3] = ok1 ? __expf(s0[3] - mnew1) : 0.f;
+        p1[0] = ok0 ? __expf(s1[0] - mnew0) : 0.f; p1[1] = ok0 ? __expf(s1[1] - mnew0) : 0.f;
+        p1[2] = ok1 ? __expf(s1[2] - mnew1) : 0.f; p1[3] = ok1 ? __expf(s1[3] - mnew1) : 0.f;
+        float lt0 = p0[0] + p0[1] + p1[0] + p1[1];
+        float lt1 = p0[2] + p0[3] + p1[2] + p1[3];
+        lt0 += __shfl_xor_sync(0xffffffffu, lt0, 1); lt0 += __shfl_xor_sync(0xffffffffu, lt0, 2);
+        lt1 += __shfl_xor_sync(0xffffffffu, lt1, 1); lt1 += __shfl_xor_sync(0xffffffffu, lt1, 2);
+        l0 = l0 * alpha0 + lt0;
+        l1 = l1 * alpha1 + lt1;
+        m0 = mnew0; m1 = mnew1;
+
+        // P A-fragment (fp16), reusing the score layout directly (no transpose):
+        // a0=(gid; keys 2tig,2tig+1) a1=(gid+8; …) a2=(gid; keys 8+2tig,…) a3=(gid+8; …).
+        unsigned int pa0 = sharpi_f32x2_to_f16x2(p0[0], p0[1]);
+        unsigned int pa1 = sharpi_f32x2_to_f16x2(p0[2], p0[3]);
+        unsigned int pa2 = sharpi_f32x2_to_f16x2(p1[0], p1[1]);
+        unsigned int pa3 = sharpi_f32x2_to_f16x2(p1[2], p1[3]);
+
+        // Stage V over the (now-consumed) K buffer.
+        __syncthreads();
+        for (int idx = lane; idx < FATC_KT * head_dim; idx += 32) {
+            int kk = idx / head_dim, d = idx - kk * head_dim;
+            int abs_k = kt0 + kk;
+            float vv = (abs_k < key_end)
+                ? v_cache[(long)abs_k * kv_dim + (long)kv_head * head_dim + d] : 0.f;
+            sKV[idx] = (unsigned short)sharpi_fp32_to_fp16(vv);
+        }
+        __syncthreads();
+
+        // ── P·V → O[16q × head_dim], rescaling shared O in place per N=8 d-tile ──
+        for (int dt = 0; dt < ndtile; dt++) {
+            int dbase = dt * 8 + gid;   // V col = head-dim index dt*8+gid
+            unsigned int b0 = ((unsigned int)sKV[(2*tig + 1) * head_dim + dbase] << 16) | (unsigned int)sKV[(2*tig    ) * head_dim + dbase];
+            unsigned int b1 = ((unsigned int)sKV[(2*tig + 9) * head_dim + dbase] << 16) | (unsigned int)sKV[(2*tig + 8) * head_dim + dbase];
+            float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+            asm volatile(
+                ""mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 ""
+                ""{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};""
+                : ""+f""(o0), ""+f""(o1), ""+f""(o2), ""+f""(o3)
+                : ""r""(pa0), ""r""(pa1), ""r""(pa2), ""r""(pa3), ""r""(b0), ""r""(b1));
+            // o0=O[gid][dt*8+2tig] o1=O[gid][dt*8+2tig+1] o2=O[gid+8][…] o3=O[gid+8][…+1].
+            int c0 = gid * head_dim + dt*8 + 2*tig;
+            int c1 = c0 + 1;
+            int c2 = (gid + 8) * head_dim + dt*8 + 2*tig;
+            int c3 = c2 + 1;
+            sO[c0] = sO[c0] * alpha0 + o0;
+            sO[c1] = sO[c1] * alpha0 + o1;
+            sO[c2] = sO[c2] * alpha1 + o2;
+            sO[c3] = sO[c3] * alpha1 + o3;
+        }
+        __syncthreads();
+    }
+
+    // Normalize and write out. The 4 lanes of a group share (gid, l0, l1) so they
+    // cooperatively stride the head dim by 4 (tig).
+    float inv0 = (l0 > 0.f) ? (1.f / l0) : 0.f;
+    float inv1 = (l1 > 0.f) ? (1.f / l1) : 0.f;
+    for (int d = tig; d < head_dim; d += 4) {
+        if (q0 < n_tok) out_all[(long)q0 * q_dim + (long)h * head_dim + d] = sO[gid * head_dim + d] * inv0;
+        if (q1 < n_tok) out_all[(long)q1 * q_dim + (long)h * head_dim + d] = sO[(gid + 8) * head_dim + d] * inv1;
+    }
+}
+#undef FATC_KT
+
+// ── Multi-warp / d-split tensor-core flash-attention prefill (issue #147) ───
+// Fixes the single-warp llm_flash_attn_prefill_tc occupancy limit (1 warp/block +
+// 48 KB shared → ~2 warps/SM). Here a block is W warps that cooperate on ONE
+// 16-query tile, splitting the head dim: warp w owns output columns [w·dW, …) with
+// dW = head_dim/W, so O[16×dW] stays REGISTER-resident (16×128 = 64 regs/lane at
+// d=512,W=4) instead of in shared — no per-key-tile shared-O rescale traffic, and
+// the freed shared lets occupancy rise to ~16-20 warps/SM. Each warp computes a
+// PARTIAL QK^T over its d-slice; the partials are summed across warps through a
+// small shared S buffer ([W×16×16] fp32), after which every warp holds the full
+// reduced score tile in its C-fragment and proceeds exactly like the single-warp
+// kernel (in-warp softmax, no-transpose score→P, P·V for its d-slice). Requires
+// head_dim % (W·16) == 0. Shared = 16·head_dim·2 (K/V fp16) + W·256·4 (S) B.
+#define FATC2_W 4
+#define FATC2_KT 16
+extern ""C"" __global__ void llm_flash_attn_prefill_tc2(
+    const float* __restrict__ q_all,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ out_all,
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int window_size, int max_seq_len, int n_tok, float attn_scale)
+{
+    extern __shared__ unsigned int fatc2_smem[];
+    unsigned short* sKV = (unsigned short*)fatc2_smem;          // [16 * head_dim] fp16
+    float*          sS  = (float*)(sKV + 16 * head_dim);        // [W * 16 * 16] fp32
+
+    int tid  = (int)threadIdx.x;
+    int warp = tid >> 5;          // 0..W-1  (d-slice owner)
+    int lane = tid & 31;
+    int gid  = lane >> 2;         // 0..7
+    int tig  = lane & 3;          // 0..3
+    int h    = (int)blockIdx.x;
+    int qtile0 = (int)blockIdx.y * 16;
+
+    int kv_head = h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    int q_dim   = num_heads * head_dim;
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
+    int dW      = head_dim / FATC2_W;     // this warp's head-dim slice width
+    int d_off   = warp * dW;              // first dim this warp owns
+    int nchunk  = dW >> 4;                // dW / 16  (QK^T contract chunks for the slice)
+    int ndt     = dW >> 3;                // dW / 8   (P·V N-tiles for the slice)
+
+    int q0 = qtile0 + gid;
+    int q1 = qtile0 + gid + 8;
+    int qpos0 = start_pos + q0;
+    int qpos1 = start_pos + q1;
+
+    // Register-resident O for this warp's d-slice: ndt N-tiles × 4 (c0..c3) fp32.
+    float oacc[64];
+    #pragma unroll
+    for (int i = 0; i < 64; i++) oacc[i] = 0.f;
+
+    float m0 = sharpi_neg_inf(), l0 = 0.f;
+    float m1 = sharpi_neg_inf(), l1 = 0.f;
+
+    int last_q = qtile0 + 15; if (last_q > n_tok - 1) last_q = n_tok - 1;
+    int key_end = start_pos + last_q + 1;
+    int first_qpos = start_pos + qtile0;
+    int key_start = (window_size > 0) ? (first_qpos + 1 - window_size) : 0;
+    if (key_start < 0) key_start = 0;
+    key_start = (key_start / FATC2_KT) * FATC2_KT;
+    __syncthreads();
+
+    for (int kt0 = key_start; kt0 < key_end; kt0 += FATC2_KT) {
+        // Stage K-tile [16 × head_dim] → sKV (all warps cooperate over the full tile).
+        for (int idx = tid; idx < FATC2_KT * head_dim; idx += FATC2_W * 32) {
+            int kk = idx / head_dim, d = idx - kk * head_dim;
+            int abs_k = kt0 + kk;
+            float kv = (abs_k < key_end)
+                ? k_cache[(long)abs_k * kv_dim + (long)kv_head * head_dim + d] : 0.f;
+            sKV[idx] = (unsigned short)sharpi_fp32_to_fp16(kv);
+        }
+        __syncthreads();
+
+        // ── Partial QK^T over this warp's d-slice → s0/s1 (C-frag, 2 key sub-tiles) ──
+        float s0[4] = {0.f,0.f,0.f,0.f};
+        float s1[4] = {0.f,0.f,0.f,0.f};
+        for (int dc = 0; dc < nchunk; dc++) {
+            int d0 = d_off + dc * 16;           // absolute head dim of this chunk
+            long qb = (long)h * head_dim + d0;
+            float qa0l = (q0 < n_tok) ? q_all[(long)q0 * q_dim + qb + 2*tig    ] : 0.f;
+            float qa0h = (q0 < n_tok) ? q_all[(long)q0 * q_dim + qb + 2*tig + 1] : 0.f;
+            float qa1l = (q1 < n_tok) ? q_all[(long)q1 * q_dim + qb + 2*tig    ] : 0.f;
+            float qa1h = (q1 < n_tok) ? q_all[(long)q1 * q_dim + qb + 2*tig + 1] : 0.f;
+            float qa2l = (q0 < n_tok) ? q_all[(long)q0 * q_dim + qb + 2*tig + 8] : 0.f;
+            float qa2h = (q0 < n_tok) ? q_all[(long)q0 * q_dim + qb + 2*tig + 9] : 0.f;
+            float qa3l = (q1 < n_tok) ? q_all[(long)q1 * q_dim + qb + 2*tig + 8] : 0.f;
+            float qa3h = (q1 < n_tok) ? q_all[(long)q1 * q_dim + qb + 2*tig + 9] : 0.f;
+            unsigned int a0 = sharpi_f32x2_to_f16x2(qa0l, qa0h);
+            unsigned int a1 = sharpi_f32x2_to_f16x2(qa1l, qa1h);
+            unsigned int a2 = sharpi_f32x2_to_f16x2(qa2l, qa2h);
+            unsigned int a3 = sharpi_f32x2_to_f16x2(qa3l, qa3h);
+            #pragma unroll
+            for (int nt = 0; nt < 2; nt++) {
+                int kbase = (nt * 8 + gid) * head_dim + d0;
+                unsigned int b0 = ((unsigned int)sKV[kbase + 2*tig + 1] << 16) | (unsigned int)sKV[kbase + 2*tig    ];
+                unsigned int b1 = ((unsigned int)sKV[kbase + 2*tig + 9] << 16) | (unsigned int)sKV[kbase + 2*tig + 8];
+                float* s = nt ? s1 : s0;
+                asm volatile(
+                    ""mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 ""
+                    ""{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};""
+                    : ""+f""(s[0]), ""+f""(s[1]), ""+f""(s[2]), ""+f""(s[3])
+                    : ""r""(a0), ""r""(a1), ""r""(a2), ""r""(a3), ""r""(b0), ""r""(b1));
+            }
+        }
+
+        // ── Reduce partial scores across warps via shared, then read the full S back ──
+        // Each warp writes its C-frag to sS[warp][q][k]; lane (gid,tig) of every warp
+        // owns the same (q,k) cells, so after the barrier each lane sums over warps.
+        float* sw = sS + warp * 256;
+        sw[(gid    ) * 16 + (2*tig    )] = s0[0];
+        sw[(gid    ) * 16 + (2*tig + 1)] = s0[1];
+        sw[(gid + 8) * 16 + (2*tig    )] = s0[2];
+        sw[(gid + 8) * 16 + (2*tig + 1)] = s0[3];
+        sw[(gid    ) * 16 + (8 + 2*tig    )] = s1[0];
+        sw[(gid    ) * 16 + (8 + 2*tig + 1)] = s1[1];
+        sw[(gid + 8) * 16 + (8 + 2*tig    )] = s1[2];
+        sw[(gid + 8) * 16 + (8 + 2*tig + 1)] = s1[3];
+        __syncthreads();
+        // Sum the W partials (start from this warp's own value, add the others).
+        #pragma unroll
+        for (int ww = 1; ww < FATC2_W; ww++) {
+            int o = ((warp + ww) % FATC2_W) * 256;
+            s0[0] += sS[o + (gid    )*16 + 2*tig    ];
+            s0[1] += sS[o + (gid    )*16 + 2*tig + 1];
+            s0[2] += sS[o + (gid + 8)*16 + 2*tig    ];
+            s0[3] += sS[o + (gid + 8)*16 + 2*tig + 1];
+            s1[0] += sS[o + (gid    )*16 + 8 + 2*tig    ];
+            s1[1] += sS[o + (gid    )*16 + 8 + 2*tig + 1];
+            s1[2] += sS[o + (gid + 8)*16 + 8 + 2*tig    ];
+            s1[3] += sS[o + (gid + 8)*16 + 8 + 2*tig + 1];
+        }
+
+        // Scale + causal/window mask (full reduced scores now).
+        s0[0] = fatc_mask(s0[0]*scale, qpos0, kt0 + 2*tig,     window_size);
+        s0[1] = fatc_mask(s0[1]*scale, qpos0, kt0 + 2*tig + 1, window_size);
+        s0[2] = fatc_mask(s0[2]*scale, qpos1, kt0 + 2*tig,     window_size);
+        s0[3] = fatc_mask(s0[3]*scale, qpos1, kt0 + 2*tig + 1, window_size);
+        s1[0] = fatc_mask(s1[0]*scale, qpos0, kt0 + 2*tig + 8, window_size);
+        s1[1] = fatc_mask(s1[1]*scale, qpos0, kt0 + 2*tig + 9, window_size);
+        s1[2] = fatc_mask(s1[2]*scale, qpos1, kt0 + 2*tig + 8, window_size);
+        s1[3] = fatc_mask(s1[3]*scale, qpos1, kt0 + 2*tig + 9, window_size);
+
+        // Online softmax (per query row; reduce the 4 keys across the group's 4 lanes).
+        float tmax0 = fmaxf(fmaxf(s0[0], s0[1]), fmaxf(s1[0], s1[1]));
+        float tmax1 = fmaxf(fmaxf(s0[2], s0[3]), fmaxf(s1[2], s1[3]));
+        tmax0 = fmaxf(tmax0, __shfl_xor_sync(0xffffffffu, tmax0, 1));
+        tmax0 = fmaxf(tmax0, __shfl_xor_sync(0xffffffffu, tmax0, 2));
+        tmax1 = fmaxf(tmax1, __shfl_xor_sync(0xffffffffu, tmax1, 1));
+        tmax1 = fmaxf(tmax1, __shfl_xor_sync(0xffffffffu, tmax1, 2));
+        float mnew0 = fmaxf(m0, tmax0);
+        float mnew1 = fmaxf(m1, tmax1);
+        bool ok0 = mnew0 > sharpi_neg_inf();
+        bool ok1 = mnew1 > sharpi_neg_inf();
+        float alpha0 = ok0 ? __expf(m0 - mnew0) : 1.f;
+        float alpha1 = ok1 ? __expf(m1 - mnew1) : 1.f;
+        float p0[4], p1[4];
+        p0[0] = ok0 ? __expf(s0[0] - mnew0) : 0.f; p0[1] = ok0 ? __expf(s0[1] - mnew0) : 0.f;
+        p0[2] = ok1 ? __expf(s0[2] - mnew1) : 0.f; p0[3] = ok1 ? __expf(s0[3] - mnew1) : 0.f;
+        p1[0] = ok0 ? __expf(s1[0] - mnew0) : 0.f; p1[1] = ok0 ? __expf(s1[1] - mnew0) : 0.f;
+        p1[2] = ok1 ? __expf(s1[2] - mnew1) : 0.f; p1[3] = ok1 ? __expf(s1[3] - mnew1) : 0.f;
+        float lt0 = p0[0] + p0[1] + p1[0] + p1[1];
+        float lt1 = p0[2] + p0[3] + p1[2] + p1[3];
+        lt0 += __shfl_xor_sync(0xffffffffu, lt0, 1); lt0 += __shfl_xor_sync(0xffffffffu, lt0, 2);
+        lt1 += __shfl_xor_sync(0xffffffffu, lt1, 1); lt1 += __shfl_xor_sync(0xffffffffu, lt1, 2);
+        l0 = l0 * alpha0 + lt0;
+        l1 = l1 * alpha1 + lt1;
+        m0 = mnew0; m1 = mnew1;
+
+        unsigned int pa0 = sharpi_f32x2_to_f16x2(p0[0], p0[1]);
+        unsigned int pa1 = sharpi_f32x2_to_f16x2(p0[2], p0[3]);
+        unsigned int pa2 = sharpi_f32x2_to_f16x2(p1[0], p1[1]);
+        unsigned int pa3 = sharpi_f32x2_to_f16x2(p1[2], p1[3]);
+
+        // Stage V over the consumed K buffer.
+        __syncthreads();
+        for (int idx = tid; idx < FATC2_KT * head_dim; idx += FATC2_W * 32) {
+            int kk = idx / head_dim, d = idx - kk * head_dim;
+            int abs_k = kt0 + kk;
+            float vv = (abs_k < key_end)
+                ? v_cache[(long)abs_k * kv_dim + (long)kv_head * head_dim + d] : 0.f;
+            sKV[idx] = (unsigned short)sharpi_fp32_to_fp16(vv);
+        }
+        __syncthreads();
+
+        // ── P·V over this warp's d-slice → register O, rescaled in place ──
+        for (int dt = 0; dt < ndt; dt++) {
+            int dcol = d_off + dt * 8 + gid;     // absolute head dim (V col)
+            unsigned int b0 = ((unsigned int)sKV[(2*tig + 1) * head_dim + dcol] << 16) | (unsigned int)sKV[(2*tig    ) * head_dim + dcol];
+            unsigned int b1 = ((unsigned int)sKV[(2*tig + 9) * head_dim + dcol] << 16) | (unsigned int)sKV[(2*tig + 8) * head_dim + dcol];
+            float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+            asm volatile(
+                ""mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 ""
+                ""{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};""
+                : ""+f""(o0), ""+f""(o1), ""+f""(o2), ""+f""(o3)
+                : ""r""(pa0), ""r""(pa1), ""r""(pa2), ""r""(pa3), ""r""(b0), ""r""(b1));
+            int base = dt * 4;
+            oacc[base + 0] = oacc[base + 0] * alpha0 + o0;   // O[gid][dcol_2tig]
+            oacc[base + 1] = oacc[base + 1] * alpha0 + o1;
+            oacc[base + 2] = oacc[base + 2] * alpha1 + o2;   // O[gid+8]
+            oacc[base + 3] = oacc[base + 3] * alpha1 + o3;
+        }
+        __syncthreads();
+    }
+
+    // Normalize and write this warp's d-slice from registers. oacc[dt] cells map to
+    // O[q=gid/gid+8][d_off + dt*8 + {2tig,2tig+1}].
+    float inv0 = (l0 > 0.f) ? (1.f / l0) : 0.f;
+    float inv1 = (l1 > 0.f) ? (1.f / l1) : 0.f;
+    for (int dt = 0; dt < ndt; dt++) {
+        int d = d_off + dt * 8 + 2*tig;
+        int base = dt * 4;
+        if (q0 < n_tok) {
+            out_all[(long)q0 * q_dim + (long)h * head_dim + d    ] = oacc[base + 0] * inv0;
+            out_all[(long)q0 * q_dim + (long)h * head_dim + d + 1] = oacc[base + 1] * inv0;
+        }
+        if (q1 < n_tok) {
+            out_all[(long)q1 * q_dim + (long)h * head_dim + d    ] = oacc[base + 2] * inv1;
+            out_all[(long)q1 * q_dim + (long)h * head_dim + d + 1] = oacc[base + 3] * inv1;
+        }
+    }
+}
+#undef FATC2_W
+#undef FATC2_KT
 
 // ── Flash-attention prefill (issue #141 attention) ─────────────────────────
 // Memory-efficient batched SDPA replacing the scalar llm_full_seq_attention /
