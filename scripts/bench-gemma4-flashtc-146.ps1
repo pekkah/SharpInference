@@ -28,20 +28,26 @@ Write-Host "--- warming model ---" -ForegroundColor DarkGray
 $null = .\scripts\bench-textgen.ps1 -Model $model -Tag "ftc-warm" -NTokens 8 -Prompt "Hello, world." -TimeoutSec 900 -ExtraArgs $cudaArgs
 
 $rows = @()
-function Run($tag, $tcOn) {
+# variant: half2 | tc1 (single-warp #146) | tc2 (multi-warp #147)
+function Run($tag, $variant) {
     try {
-        if ($tcOn) { $env:SHARPI_PREFILL_FLASH_TC = "1" } else { Remove-Item env:SHARPI_PREFILL_FLASH_TC -ErrorAction SilentlyContinue }
+        Remove-Item env:SHARPI_PREFILL_FLASH_TC  -ErrorAction SilentlyContinue
+        Remove-Item env:SHARPI_PREFILL_FLASH_TC1 -ErrorAction SilentlyContinue
+        if ($variant -eq "tc1") { $env:SHARPI_PREFILL_FLASH_TC = "1"; $env:SHARPI_PREFILL_FLASH_TC1 = "1" }
+        elseif ($variant -eq "tc2") { $env:SHARPI_PREFILL_FLASH_TC = "1" }
         $null = .\scripts\bench-textgen.ps1 -Model $model -Tag "$tag-w" -NTokens 60 -Prompt $prompt -TimeoutSec 900 -ExtraArgs $cudaArgs
         $r = .\scripts\bench-textgen.ps1 -Model $model -Tag $tag -NTokens 60 -Prompt $prompt -TimeoutSec 900 -ExtraArgs $cudaArgs
         $script:rows += [PSCustomObject]@{ Tag=$tag; PrefTok=$r.PrefillTok; PrefillTps=$r.PrefillTps; DecodeTps=$r.DecodeTps; Wall=$r.WallSec; TO=$r.TimedOut; Sample=$r.Sample }
         Write-Host ("  {0,-18} pref={1,7} t/s  dec={2,6} t/s  ({3} tok)" -f $tag,$r.PrefillTps,$r.DecodeTps,$r.PrefillTok) -ForegroundColor Green
     } finally {
-        Remove-Item env:SHARPI_PREFILL_FLASH_TC -ErrorAction SilentlyContinue
+        Remove-Item env:SHARPI_PREFILL_FLASH_TC  -ErrorAction SilentlyContinue
+        Remove-Item env:SHARPI_PREFILL_FLASH_TC1 -ErrorAction SilentlyContinue
     }
 }
 
-Run "flash-half2" $false
-Run "flash-tc"    $true
+Run "flash-half2" "half2"
+Run "flash-tc1"   "tc1"
+Run "flash-tc2"   "tc2"
 
 Write-Host ""
 Write-Host "=== Gemma 4 flash half2 vs TC (#146, ~1K ctx, warm) ===" -ForegroundColor Cyan

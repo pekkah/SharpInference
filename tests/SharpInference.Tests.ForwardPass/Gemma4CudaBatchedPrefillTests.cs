@@ -83,6 +83,7 @@ public sealed class Gemma4CudaBatchedPrefillTests
         fwd.PrefillGemmEnabled = true;
         fwd.PrefillMmqEnabled = false;
         fwd.PrefillFlashAttnEnabled = false;
+        fwd.PrefillFlashTcEnabled = false;
         var batched = fwd.Prefill(tokens).ToArray();
         Assert.True(fwd.LastPrefillWasBatched,
             "Batched-trunk prefill did not engage — check IsGemma4BatchedPrefillSupported gating.");
@@ -142,6 +143,7 @@ public sealed class Gemma4CudaBatchedPrefillTests
         fwd.PrefillGemmEnabled = true;
         fwd.PrefillMmqEnabled = true;
         fwd.PrefillFlashAttnEnabled = false;   // isolate the MMQ matmul (flash has its own oracle)
+        fwd.PrefillFlashTcEnabled = false;
         var batched = fwd.Prefill(tokens).ToArray();
         Assert.True(fwd.LastPrefillWasBatched,
             "Batched-trunk MMQ prefill did not engage — check IsGemma4BatchedPrefillSupported gating.");
@@ -238,6 +240,7 @@ public sealed class Gemma4CudaBatchedPrefillTests
         // bit-exact. Exercises both the SWA-windowed and global attention layers.
         fwd.BatchedPrefillEnabled = true;
         fwd.PrefillFlashAttnEnabled = true;
+        fwd.PrefillFlashTcEnabled = false;   // this oracle targets the half2 kernel; TC has its own
         var batched = fwd.Prefill(tokens).ToArray();
         Assert.True(fwd.LastPrefillWasBatched);
 
@@ -292,6 +295,7 @@ public sealed class Gemma4CudaBatchedPrefillTests
         fwd.BatchedPrefillEnabled = true;
         fwd.PrefillGemmEnabled = false;
         fwd.PrefillFlashAttnEnabled = false;
+        fwd.PrefillFlashTcEnabled = false;
         var batched = fwd.Prefill(tokens).ToArray();
         Assert.True(fwd.LastPrefillWasBatched);
 
