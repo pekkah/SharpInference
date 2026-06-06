@@ -930,10 +930,20 @@ extern ""C"" __global__ void llm_quantize_q8_1(
     unsigned char* dst = out + (long)block_id * 36L;
     dst[4 + lane] = (unsigned char)(signed char)q;
 
+    // #156 C2: per-sub-block activation sum Σq, dequantized as d·Σq, packed as the
+    // fp16 `s` half at bytes [2:4]. The Q4_K MMQ min-bias term (super_dmin·mn·s) reads
+    // it; every other q8_1 reader masks the d-word with 0xffff, so this high half is
+    // otherwise inert (mirrors ggml block_q8_1's ds = {d, s}).
+    int qsum = q;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        qsum += __shfl_xor_sync(0xffffffffu, qsum, off);
+
     if (lane == 0) {
-        // Pack {d, 0} as two fp16 halves into one uint32 at offset 0..3.
+        // Pack {d, d·Σq} as two fp16 halves into one uint32 at offset 0..3.
         unsigned int d_bits = sharpi_fp32_to_fp16(d);
-        *reinterpret_cast<unsigned int*>(dst) = d_bits;
+        unsigned int s_bits = sharpi_fp32_to_fp16(d * (float)qsum);
+        *reinterpret_cast<unsigned int*>(dst) = d_bits | (s_bits << 16);
     }
 }
 
@@ -1765,6 +1775,186 @@ extern ""C"" __global__ void llm_mmq_q8_0_soa(
     }
 }
 #undef MMQ_LOAD_TILE_SOA
+#undef MMQ_BM
+#undef MMQ_BN
+
+// get_scale_min_k4 (ggml-quants.c) for one Q4_K sub-block `sb` (0..7). The 12-byte
+// scales[] array lives in the three uints sm0/sm1/sm2 (block bytes [4:16]); each
+// sub-block has a 6-bit scale `sc` and 6-bit min `mn`. Matches the lo/hi switch in
+// llm_matvec_q4k_gemm_n (chunk = sb>>1, polarity = sb&1).
+__device__ __forceinline__ void sharpi_q4k_scale_min(
+    unsigned int sm0, unsigned int sm1, unsigned int sm2, int sb,
+    unsigned int* sc, unsigned int* mn)
+{
+    int chunk = sb >> 1;
+    if (sb & 1) {  // odd sub-block (high half of the chunk)
+        switch (chunk) {
+            case 0:  *sc = (sm0 >>  8) & 63u; *mn = (sm1 >>  8) & 63u; break;
+            case 1:  *sc = (sm0 >> 24) & 63u; *mn = (sm1 >> 24) & 63u; break;
+            case 2:  *sc = ((sm2 >>  8) & 0xFu) | (((sm0 >> 14) & 3u) << 4);
+                     *mn = ((sm2 >> 12) & 0xFu) | (((sm1 >> 14) & 3u) << 4); break;
+            default: *sc = ((sm2 >> 24) & 0xFu) | (((sm0 >> 30) & 3u) << 4);
+                     *mn = ((sm2 >> 28) & 0xFu) | (((sm1 >> 30) & 3u) << 4); break;
+        }
+    } else {       // even sub-block (low half of the chunk)
+        switch (chunk) {
+            case 0:  *sc = (sm0)       & 63u; *mn = (sm1)       & 63u; break;
+            case 1:  *sc = (sm0 >> 16) & 63u; *mn = (sm1 >> 16) & 63u; break;
+            case 2:  *sc = (sm2        & 0xFu) | (((sm0 >>  6) & 3u) << 4);
+                     *mn = ((sm2 >>  4) & 0xFu) | (((sm1 >>  6) & 3u) << 4); break;
+            default: *sc = ((sm2 >> 16) & 0xFu) | (((sm0 >> 22) & 3u) << 4);
+                     *mn = ((sm2 >> 20) & 0xFu) | (((sm1 >> 22) & 3u) << 4); break;
+        }
+    }
+}
+
+// ── int8 MMQ Q4_K (issue #156 Item C2) ─────────────────────────────────────
+// Maximal Item C: reads each Q4_K weight once as int8 (no fp16 dequant temp to HBM —
+// the cost that capped the C1 dequant→fp16→cuBLAS GEMM) and feeds the m16n8k32 s8
+// mma, mirroring llm_mmq_q8_0's tiling/fragment map exactly. The only Q4_K-specific
+// work vs Q8_0: (a) the 4-bit weight nibbles are expanded to int8 (values 0..15) on
+// load via the same lo/hi split as llm_matvec_q4k_gemm_n, (b) the per-(row,sub-block)
+// (scale,min) are unpacked with get_scale_min_k4, and (c) Q4_K is asymmetric
+// (w = super_d·sc·q − super_dmin·mn), so each sub-block adds a min-bias term
+// −super_dmin·mn·(d_a·Σq_a). The activation sum d_a·Σq_a is the fp16 `s` half that
+// llm_quantize_q8_1 packs at bytes [2:4] of each q8_1 block.
+//
+// One K-tile = one 32-element Q4_K sub-block (8 per 256-elem super-block). result
+//   [r,t] = Σ_sb ( super_d·sc[r,sb]·d_a[t,sb]·⟨q_w[r,sb],q_a[t,sb]⟩
+//                  − super_dmin·mn[r,sb]·(d_a·Σq_a)[t,sb] ).
+// The mma fragment register layout is byte-identical to llm_mmq_q8_0 (validated by
+// #141): only the int8 values staged into sW and the per-row/-token scale
+// coefficients differ. Argmax-stable, not bit-exact (both operands int8-quantized).
+#define MMQ_BM 64
+#define MMQ_BN 128
+extern ""C"" __global__ void llm_mmq_q4k(
+    const unsigned int*  __restrict__ weights,   // Q4_K [rows × cols], 144 B/super-block
+    const unsigned char* __restrict__ y_q81,     // Q8_1 [n_tok × cols], 36 B/block (d at [0:2], s at [2:4])
+    float* __restrict__ output,                  // [n_tok × rows] fp32
+    int rows, int cols, int n_tok)
+{
+    __shared__ int   sW[MMQ_BM * 8];   // 64 weight rows × 8 int32 (32 nibbles→int8)
+    __shared__ float sWdd[MMQ_BM];     // 64 × super_d·sc (per row, this sub-block)
+    __shared__ float sWdm[MMQ_BM];     // 64 × super_dmin·mn (per row, this sub-block)
+    __shared__ int   sY[MMQ_BN * 8];   // 128 tokens × 8 int32 acts
+    __shared__ float sYd[MMQ_BN];      // 128 × activation block-scale d_a
+    __shared__ float sYs[MMQ_BN];      // 128 × activation sum d_a·Σq_a
+
+    int row_block = (int)blockIdx.x * MMQ_BM;
+    int tok_block = (int)blockIdx.y * MMQ_BN;
+    int nb_super  = cols >> 8;          // super-blocks per row
+    int sub_total = cols >> 5;          // 32-element sub-blocks per row (= K-tiles)
+
+    int tid  = (int)threadIdx.x;        // 0..255
+    int warp = tid >> 5;                // 0..7
+    int lane = tid & 31;
+    int grp  = lane >> 2;               // 0..7
+    int tig  = lane & 3;                // 0..3
+    int wr   = warp & 3;                // 0..3 row-group → rows [wr*16 : +16]
+    int wc   = warp >> 2;               // 0..1 col-group → tokens [wc*64 : +64]
+    int mrow0 = wr * 16;
+
+    float acc[8][4];
+    #pragma unroll
+    for (int n = 0; n < 8; n++) { acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.f; }
+
+    // Register-prefetch double-buffer, mirroring llm_mmq_q8_0: each thread stages 2
+    // weight words (nibble-expanded) and 4 act words, plus — for the in-range threads —
+    // one weight (super_d·sc, super_dmin·mn) coefficient pair and one act (d_a, s) pair.
+    unsigned int rWq0, rWq1, rY0, rY1, rY2, rY3;
+    float rWdd, rWdm, rYd, rYs;
+    #define MMQ_LOAD_TILE_Q4K(KB) do { \
+        int kbs = (KB) >> 3; int sb = (KB) & 7; int chk = sb >> 1; int pol = sb & 1; \
+        int gw0 = row_block + (tid >> 3); \
+        { unsigned int w = (gw0 < rows) ? weights[((long)gw0 * nb_super + kbs) * 36L + 4 + chk * 8 + (tid & 7)] : 0u; \
+          rWq0 = pol ? ((w >> 4) & 0x0F0F0F0Fu) : (w & 0x0F0F0F0Fu); } \
+        int gw1 = row_block + ((tid + 256) >> 3); \
+        { unsigned int w = (gw1 < rows) ? weights[((long)gw1 * nb_super + kbs) * 36L + 4 + chk * 8 + ((tid + 256) & 7)] : 0u; \
+          rWq1 = pol ? ((w >> 4) & 0x0F0F0F0Fu) : (w & 0x0F0F0F0Fu); } \
+        if (tid < MMQ_BM) { int gw = row_block + tid; \
+          if (gw < rows) { long hb = (long)(gw * nb_super + kbs) * 36L; \
+            unsigned int w0 = weights[hb]; \
+            unsigned int sm0 = weights[hb + 1], sm1 = weights[hb + 2], sm2 = weights[hb + 3]; \
+            unsigned int sc, mn; sharpi_q4k_scale_min(sm0, sm1, sm2, sb, &sc, &mn); \
+            rWdd = sharpi_fp16_to_fp32(w0 & 0xffffu) * (float)sc; \
+            rWdm = sharpi_fp16_to_fp32(w0 >> 16)     * (float)mn; \
+          } else { rWdd = 0.f; rWdm = 0.f; } } \
+        int gy0 = tok_block + (tid >> 3); \
+        rY0 = (gy0 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy0 * sub_total + (KB)) * 36L + 4 + (long)(tid & 7) * 4) : 0u; \
+        int gy1 = tok_block + ((tid + 256) >> 3); \
+        rY1 = (gy1 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy1 * sub_total + (KB)) * 36L + 4 + (long)((tid + 256) & 7) * 4) : 0u; \
+        int gy2 = tok_block + ((tid + 512) >> 3); \
+        rY2 = (gy2 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy2 * sub_total + (KB)) * 36L + 4 + (long)((tid + 512) & 7) * 4) : 0u; \
+        int gy3 = tok_block + ((tid + 768) >> 3); \
+        rY3 = (gy3 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy3 * sub_total + (KB)) * 36L + 4 + (long)((tid + 768) & 7) * 4) : 0u; \
+        if (tid < MMQ_BN) { int gt = tok_block + tid; \
+          if (gt < n_tok) { unsigned int dw = *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gt * sub_total + (KB)) * 36L); \
+            rYd = sharpi_fp16_to_fp32(dw & 0xffffu); rYs = sharpi_fp16_to_fp32(dw >> 16); } \
+          else { rYd = 0.f; rYs = 0.f; } } \
+    } while (0)
+
+    MMQ_LOAD_TILE_Q4K(0);
+
+    for (int kb = 0; kb < sub_total; kb++) {
+        // Publish the prefetched sub-block tile to shared.
+        sW[tid] = (int)rWq0; sW[tid + 256] = (int)rWq1;
+        if (tid < MMQ_BM) { sWdd[tid] = rWdd; sWdm[tid] = rWdm; }
+        sY[tid] = (int)rY0; sY[tid + 256] = (int)rY1; sY[tid + 512] = (int)rY2; sY[tid + 768] = (int)rY3;
+        if (tid < MMQ_BN) { sYd[tid] = rYd; sYs[tid] = rYs; }
+        __syncthreads();
+
+        // Issue the next sub-block's global loads (in flight during the mma's below).
+        if (kb + 1 < sub_total) MMQ_LOAD_TILE_Q4K(kb + 1);
+
+        // A fragment for this warp's 16-row tile (read once, reused over 8 N-tiles).
+        int a0 = sW[(mrow0 + grp) * 8     + tig];
+        int a1 = sW[(mrow0 + grp + 8) * 8 + tig];
+        int a2 = sW[(mrow0 + grp) * 8     + tig + 4];
+        int a3 = sW[(mrow0 + grp + 8) * 8 + tig + 4];
+        float ddA = sWdd[mrow0 + grp],     dmA = sWdm[mrow0 + grp];
+        float ddB = sWdd[mrow0 + grp + 8], dmB = sWdm[mrow0 + grp + 8];
+
+        #pragma unroll
+        for (int nt = 0; nt < 8; nt++) {
+            int ncol0 = wc * 64 + nt * 8;
+            int b0 = sY[(ncol0 + grp) * 8 + tig];
+            int b1 = sY[(ncol0 + grp) * 8 + tig + 4];
+            float dC0 = sYd[ncol0 + tig * 2], dC1 = sYd[ncol0 + tig * 2 + 1];
+            float sC0 = sYs[ncol0 + tig * 2], sC1 = sYs[ncol0 + tig * 2 + 1];
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            asm(
+              ""mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 ""
+              ""{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};""
+              : ""+r""(c0), ""+r""(c1), ""+r""(c2), ""+r""(c3)
+              : ""r""(a0), ""r""(a1), ""r""(a2), ""r""(a3), ""r""(b0), ""r""(b1));
+            // dot term super_d·sc·d_a·⟨q_w,q_a⟩ minus the asymmetric min-bias
+            // super_dmin·mn·(d_a·Σq_a); both accumulate over all sub-blocks.
+            acc[nt][0] += (float)c0 * ddA * dC0 - dmA * sC0;
+            acc[nt][1] += (float)c1 * ddA * dC1 - dmA * sC1;
+            acc[nt][2] += (float)c2 * ddB * dC0 - dmB * sC0;
+            acc[nt][3] += (float)c3 * ddB * dC1 - dmB * sC1;
+        }
+        __syncthreads();
+    }
+
+    int rowA = row_block + mrow0 + grp;
+    int rowB = rowA + 8;
+    #pragma unroll
+    for (int nt = 0; nt < 8; nt++) {
+        int ncol0 = tok_block + wc * 64 + nt * 8;
+        int tokC0 = ncol0 + tig * 2;
+        int tokC1 = ncol0 + tig * 2 + 1;
+        if (rowA < rows) {
+            if (tokC0 < n_tok) output[(long)tokC0 * rows + rowA] = acc[nt][0];
+            if (tokC1 < n_tok) output[(long)tokC1 * rows + rowA] = acc[nt][1];
+        }
+        if (rowB < rows) {
+            if (tokC0 < n_tok) output[(long)tokC0 * rows + rowB] = acc[nt][2];
+            if (tokC1 < n_tok) output[(long)tokC1 * rows + rowB] = acc[nt][3];
+        }
+    }
+}
+#undef MMQ_LOAD_TILE_Q4K
 #undef MMQ_BM
 #undef MMQ_BN
 

@@ -188,7 +188,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// Issue #141 (MMQ): route Q8_0 trunk matmuls through the int8 tensor-core MMQ
     /// kernel (<see cref="CudaBackend.MatMulBatchedMmq"/>) instead of the
     /// dequant→fp16→cuBLAS GEMM (<see cref="PrefillGemmEnabled"/>). Reads each Q8_0
-    /// weight once as int8 with no fp16 HBM temp, on int8 tensor cores. Takes
+    /// weight once as int8 with no fp16 HBM temp, on int8 tensor cores. Issue #156 C2
+    /// extends the same MMQ path to Q4_K (nibble-expanded weights + asymmetric min-bias,
+    /// kernel <c>llm_mmq_q4k</c>). Takes
     /// precedence over <see cref="PrefillGemmEnabled"/> when both are set. Default on
     /// (<c>SHARPI_PREFILL_MMQ</c>=0 reverts to the GEMM path). Argmax-stable, not
     /// bit-exact (both operands int8-quantized), like the GEMM path it replaces.
@@ -1923,14 +1925,20 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         }
         else if (dt == DType.Q4_K)
         {
-            // Issue #156 Item C: route Q4_K trunk matmuls through the compute-bound
-            // dequant→fp16→cuBLAS GEMM (weight read once per batch) instead of the
-            // memory-bound matvec GEMM-N (weight re-streamed per token). Argmax-stable.
-            // Requires cols % 256; every Q4_K hidden dim satisfies it, but fall back to
-            // the matvec path defensively if not.
+            // Issue #156 Item C: route Q4_K trunk matmuls through a compute-bound path
+            // (weight read once per batch) instead of the memory-bound matvec GEMM-N
+            // (weight re-streamed per token). Argmax-stable. Requires cols % 256; every
+            // Q4_K hidden dim satisfies it, but fall back to the matvec path defensively
+            // if not. C2 (PrefillMmqEnabled): the int8 MMQ reads the weight once as int8
+            // with no fp16 dequant temp; C1 fallback: dequant→fp16→cuBLAS GEMM.
             int cols = (int)(inAll.ElementCount / n);
             if ((cols & 0xff) == 0)
-                _gpu.MatMulBatchedGemm(outAll, weights, inAll, n, dt);
+            {
+                if (PrefillMmqEnabled)
+                    _gpu.MatMulBatchedMmq(outAll, weights, inAll, n, dt);
+                else
+                    _gpu.MatMulBatchedGemm(outAll, weights, inAll, n, dt);
+            }
             else
                 _gpu.MatMulBatched(outAll, weights, inAll, n, dt);
         }

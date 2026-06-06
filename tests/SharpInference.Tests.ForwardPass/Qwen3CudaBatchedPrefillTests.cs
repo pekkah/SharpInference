@@ -12,10 +12,11 @@ namespace SharpInference.Tests.ForwardPass;
 /// 1/sqrt(head_dim) attention scale — the batched prefill engages and agrees with the
 /// per-token <see cref="CudaForwardPass.Forward"/> loop.
 ///
-/// Q4_K trunk matmuls route through the matvec GEMM-N batched path (no Q4_K cuBLAS/MMQ
-/// kernel exists yet — that is issue #156 Item C), so the FlashOff case is the bit-exact
-/// oracle for the batched matvec/norm/rope/SwiGLU primitives, while the default case adds
-/// flash attention and is argmax-stable (online softmax reassociates the score sum).
+/// Q4_K trunk matmuls have a bit-exact matvec GEMM-N batched path plus two compute-bound
+/// prefill variants (#156 Item C: C1 dequant→fp16→cuBLAS GEMM, C2 int8 MMQ); the FlashOff
+/// matvec case is the bit-exact oracle for the batched matvec/norm/rope/SwiGLU primitives,
+/// while the default case adds flash attention and is argmax-stable (online softmax
+/// reassociates the score sum). The C1/C2 paths get their own argmax-stable oracles below.
 ///
 /// Single 5 GB model instance toggled via <see cref="CudaForwardPass.BatchedPrefillEnabled"/>
 /// with a <c>ResetCache</c> between runs. Silent-skips when CUDA or the GGUF is absent.
@@ -227,5 +228,64 @@ public sealed class Qwen3CudaBatchedPrefillTests
         foreach (var t in gemmTop) if (matvecTop.Contains(t)) overlap++;
         Assert.True(overlap >= 4,
             $"Q4_K prefill GEMM top-5 overlaps the matvec reference in only {overlap}/5 slots.");
+    }
+
+    /// <summary>
+    /// Issue #156 Item C2 oracle: the Q4_K int8 tensor-core MMQ prefill (kernel
+    /// <c>llm_mmq_q4k</c>, weight read once as int8 — no fp16 dequant temp) must be
+    /// argmax-stable vs the bit-exact Q4_K matvec GEMM-N (weight re-streamed per token).
+    /// Both run the same batched-trunk path with flash off so only the trunk-matmul
+    /// dispatch differs — isolating the new int8 MMQ from the attention reassociation.
+    /// Not bit-exact (both operands int8-quantized + the asymmetric min-bias rounds
+    /// through fp16 `s`), so this asserts argmax equality + top-5 overlap, the same
+    /// contract the Q8_0 MMQ (#141) and the Q4_K C1 GEMM hold.
+    /// </summary>
+    [Fact]
+    public void Qwen3_8B_BatchedPrefill_Q4KMmq_ArgmaxStable()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.Null(hp.LayerHeadDim);
+
+        using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 512)
+        {
+            BatchedPrefillEnabled = true,
+            PrefillFlashAttnEnabled = false,
+            PrefillFlashTcEnabled = false,
+        };
+
+        // Reference: bit-exact Q4_K matvec GEMM-N.
+        fwd.PrefillGemmEnabled = false;
+        var matvec = fwd.Prefill(Tokens).ToArray();
+        Assert.True(fwd.LastPrefillWasBatched);
+
+        // Candidate: the #156-C2 int8 MMQ (PrefillGemmEnabled gates the compute-bound
+        // path; PrefillMmqEnabled selects MMQ over the C1 fp16 GEMM within it).
+        fwd.ResetCache();
+        fwd.PrefillGemmEnabled = true;
+        fwd.PrefillMmqEnabled = true;
+        var mmq = fwd.Prefill(Tokens).ToArray();
+        Assert.True(fwd.LastPrefillWasBatched);
+
+        Assert.Equal(matvec.Length, mmq.Length);
+        Assert.Equal(Argmax(matvec), Argmax(mmq));
+
+        float maxAbs = 0f;
+        for (int i = 0; i < matvec.Length; i++)
+            maxAbs = MathF.Max(maxAbs, MathF.Abs(matvec[i] - mmq[i]));
+        Assert.True(maxAbs < 1.0f,
+            $"Q4_K prefill MMQ vs matvec logits diverged beyond int8 tolerance: maxAbs={maxAbs}.");
+
+        var matvecTop = TopKSet(matvec, 5);
+        var mmqTop = TopKSet(mmq, 5);
+        int overlap = 0;
+        foreach (var t in mmqTop) if (matvecTop.Contains(t)) overlap++;
+        Assert.True(overlap >= 4,
+            $"Q4_K prefill MMQ top-5 overlaps the matvec reference in only {overlap}/5 slots.");
     }
 }

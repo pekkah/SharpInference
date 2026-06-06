@@ -173,6 +173,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // Issue #149: SoA-layout MMQ (quants 16B-aligned, scales separate) — kills the
     // Q8_0 qs 2-byte-misalignment funnelshift tax in the weight load.
     private nint   _mmqQ80SoaKernel;
+    // Issue #156 C2: int8 tensor-core Q4_K×Q8_1 matmul — weight read once as int8
+    // (nibble-expanded, no fp16 dequant temp), m16n8k32 s8 mma + asymmetric min-bias.
+    private nint   _mmqQ4kKernel;
     // Issue #111: batched trunk elementwise/norm kernels (one launch over N tokens).
     private nint   _rmsNormBatchedKernel;
     private nint   _headNormBatchedKernel;
@@ -1852,9 +1855,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
             throw new NotSupportedException("NVRTC kernels are not available on this system.");
-        if (weightDType != DType.Q8_0)
+        if (weightDType != DType.Q8_0 && weightDType != DType.Q4_K)
             throw new NotSupportedException(
-                $"CUDA MatMulBatchedMmq: weight dtype {weightDType} not supported (Q8_0 only).");
+                $"CUDA MatMulBatchedMmq: weight dtype {weightDType} not supported (Q8_0 or Q4_K).");
         if (nTok <= 0)
             throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be > 0.");
         if (outputAll.ElementCount % nTok != 0 || inputAll.ElementCount % nTok != 0)
@@ -1864,9 +1867,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
         int rows = (int)(outputAll.ElementCount / nTok);
         int cols = (int)(inputAll.ElementCount / nTok);
-        if ((cols & 31) != 0)
+        // Q4_K super-blocks are 256-wide (get_scale_min/nibble layout); Q8_0 is 32-wide.
+        int colAlign = weightDType == DType.Q4_K ? 256 : 32;
+        if ((cols % colAlign) != 0)
             throw new InvalidOperationException(
-                $"CUDA MatMulBatchedMmq requires cols % 32 == 0 (got {cols}).");
+                $"CUDA MatMulBatchedMmq ({weightDType}) requires cols % {colAlign} == 0 (got {cols}).");
 
         nint wPtr = GetDevPtr(matrix);
         nint xPtr = GetDevPtr(inputAll);
@@ -1901,11 +1906,14 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 (nint)(&pRows), (nint)(&pCols), (nint)(&pN)
             };
             uint gx = (uint)((rows + 63) / 64), gy = (uint)((nTok + 127) / 128);
-            // #149: if this weight was repacked SoA, use the aligned-load kernel (same args).
-            nint kern = _soaHandles.ContainsKey(matrix.Handle) ? _mmqQ80SoaKernel : _mmqQ80Kernel;
+            // Q4_K → the nibble-expanding MMQ kernel; Q8_0 → the int8 kernel (#149: if the
+            // weight was repacked SoA, the aligned-load variant — same args either way).
+            nint kern = weightDType == DType.Q4_K
+                ? _mmqQ4kKernel
+                : (_soaHandles.ContainsKey(matrix.Handle) ? _mmqQ80SoaKernel : _mmqQ80Kernel);
             int rm = NvrtcInterop.LaunchKernel(kern, gx, gy, 1,
                                                256, 1, 1, 0, _stream, args, null);
-            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(mmq_q8_0) failed: {rm}");
+            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(mmq {weightDType}) failed: {rm}");
         }
     }
 
@@ -4473,7 +4481,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _matvecQ80Kernel,
             _matvecF32N2Kernel, _matvecQ4KN2Kernel, _matvecQ5KN2Kernel, _matvecQ6KN2Kernel,
             _matvecF32GemmNKernel, _matvecQ4KGemmNKernel, _matvecQ5KGemmNKernel, _matvecQ6KGemmNKernel,
-            _matvecQ80GemmNKernel, _mmqQ80Kernel, _mmqQ80SoaKernel,
+            _matvecQ80GemmNKernel, _mmqQ80Kernel, _mmqQ80SoaKernel, _mmqQ4kKernel,
             _matvecQ80Dp4aSoaKernel, _q80RepackSoaKernel,
             _matvecQ80SoaKernel, _matvecQ80GemmNSoaKernel, _dequantQ80F16SoaKernel,
             _rmsNormBatchedKernel, _headNormBatchedKernel, _headNormQkKernel, _headNormQkBatchedKernel,
@@ -4558,6 +4566,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _f32ToF16Kernel        = GetKernelFunc("llm_f32_to_f16");
         _mmqQ80Kernel          = GetKernelFunc("llm_mmq_q8_0");
         _mmqQ80SoaKernel       = GetKernelFunc("llm_mmq_q8_0_soa");
+        _mmqQ4kKernel          = GetKernelFunc("llm_mmq_q4k");
         _matvecQ80Dp4aSoaKernel = GetKernelFunc("llm_matvec_q8_0_dp4a_soa");
         _q80RepackSoaKernel    = GetKernelFunc("llm_q8_0_repack_soa");
         _matvecQ80SoaKernel    = GetKernelFunc("llm_matvec_q8_0_soa");
