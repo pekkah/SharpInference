@@ -129,6 +129,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _embedLookupQ80BatchedKernel;
     private nint   _matvecF32Kernel;
     private nint   _matvecQ4KKernel;
+    private nint   _matvecQ4KSoaKernel;     // #156: scale-pre-unpacked SoA decode matvec
+    private nint   _q4kRepackSoaKernel;     // #156: one-time Q4_K → SoA repack
     private nint   _matvecQ5KKernel;
     private nint   _matvecQ6KKernel;
     // Q8_0 matvec (Phase 0 of the Gemma-4 plan): keeps Q8_0 weights packed on
@@ -176,6 +178,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // Issue #156 C2: int8 tensor-core Q4_K×Q8_1 matmul — weight read once as int8
     // (nibble-expanded, no fp16 dequant temp), m16n8k32 s8 mma + asymmetric min-bias.
     private nint   _mmqQ4kKernel;
+    private nint   _mmqQ4kSoaKernel;        // #156: Q4_K MMQ over the SoA weight
     // Issue #111: batched trunk elementwise/norm kernels (one launch over N tokens).
     private nint   _rmsNormBatchedKernel;
     private nint   _headNormBatchedKernel;
@@ -539,6 +542,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         // #149: drop any SoA-layout mark (harmless no-op for non-repacked handles) so
         // the set doesn't grow across model load/free cycles.
         _soaHandles.TryRemove(tensor.Handle, out _);
+        _soaQ4kHandles.TryRemove(tensor.Handle, out _);   // #156
+
         if (_viewHandles.TryRemove(tensor.Handle, out _))
         {
             // Non-owning view: drop the handle registration only; the parent owns
@@ -1550,7 +1555,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
         if (weightDType == DType.Q4_K)
         {
-            DispatchMatVecQ4K(wPtr, xPtr, yPtr, rows, cols);
+            if (_soaQ4kHandles.ContainsKey(matrix.Handle))
+                DispatchMatVecQ4KSoa(wPtr, xPtr, yPtr, rows, cols);
+            else
+                DispatchMatVecQ4K(wPtr, xPtr, yPtr, rows, cols);
             return;
         }
         // Issue #142: Q8_0 decode matvec via dp4a/Q8_1 (cols % 32 == 0 — every LLM
@@ -1620,6 +1628,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
         if (weightDType == DType.Q4_K)
         {
+            if (_soaQ4kHandles.ContainsKey(matrix.Handle))
+                throw new NotSupportedException(
+                    "Q4_K SoA weight reached MatMulN2 (MTP 2-input), which has no SoA reader. " +
+                    "Disable SHARPI_Q4K_SOA for MTP models.");
             DispatchMatVecQ4KN2(wPtr, xAPtr, xBPtr, yAPtr, yBPtr, rows, cols);
             return;
         }
@@ -1699,6 +1711,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
         if (weightDType == DType.Q4_K)
         {
+            if (_soaQ4kHandles.ContainsKey(matrix.Handle))
+                throw new NotSupportedException(
+                    "Q4_K SoA weight reached the matvec GEMM-N path, which has no SoA reader. " +
+                    "SHARPI_Q4K_SOA requires the int8 MMQ prefill (SHARPI_PREFILL_MMQ=1, default).");
             DispatchMatVecQ4KBatched(wPtr, xPtr, yPtr, rows, cols, nTok);
             return;
         }
@@ -1799,6 +1815,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         {
             nint wp = wPtr, op = _gemmWf16Buf;
             int pRows = rows, pCols = cols;
+            if (weightDType == DType.Q4_K && _soaQ4kHandles.ContainsKey(matrix.Handle))
+                throw new NotSupportedException(
+                    "Q4_K SoA weight reached the dequant→fp16→GEMM path, which has no SoA reader. " +
+                    "SHARPI_Q4K_SOA requires the int8 MMQ prefill (SHARPI_PREFILL_MMQ=1, default).");
             nint dqKern = weightDType == DType.Q4_K
                 ? _dequantQ4KF16Kernel
                 : (_soaHandles.ContainsKey(matrix.Handle) ? _dequantQ80F16SoaKernel : _dequantQ80F16Kernel);
@@ -1909,7 +1929,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             // Q4_K → the nibble-expanding MMQ kernel; Q8_0 → the int8 kernel (#149: if the
             // weight was repacked SoA, the aligned-load variant — same args either way).
             nint kern = weightDType == DType.Q4_K
-                ? _mmqQ4kKernel
+                ? (_soaQ4kHandles.ContainsKey(matrix.Handle) ? _mmqQ4kSoaKernel : _mmqQ4kKernel)   // #156
                 : (_soaHandles.ContainsKey(matrix.Handle) ? _mmqQ80SoaKernel : _mmqQ80Kernel);
             int rm = NvrtcInterop.LaunchKernel(kern, gx, gy, 1,
                                                256, 1, 1, 0, _stream, args, null);
@@ -1982,6 +2002,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// matvec auto-route to the aligned-load SoA kernels for these.</summary>
     private readonly ConcurrentDictionary<nint, byte> _soaHandles = new();
 
+    /// <summary>Issue #156: device handles of Q4_K weights repacked into the
+    /// scale-pre-unpacked SoA layout (see <see cref="RepackQ4KSoa"/>). The decode
+    /// matvec auto-routes these to <c>llm_matvec_q4k_soa</c>.</summary>
+    private readonly ConcurrentDictionary<nint, byte> _soaQ4kHandles = new();
+
     /// <summary>
     /// Issue #149: allocate a new buffer the same size as the interleaved Q8_0
     /// <paramref name="src"/> [rows×nb×34 B], repack it into the SoA layout
@@ -2009,6 +2034,78 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         Free(src);
         _soaHandles[dst.Handle] = 0;
         return dst;
+    }
+
+    /// <summary>
+    /// Issue #156: repack an interleaved Q4_K weight [rows × nb × 144 B] into the
+    /// scale-pre-unpacked SoA layout [Q rows*nb*128][S rows*nb*16][D rows*nb*4]
+    /// (see <c>llm_q4k_repack_soa</c>), free <paramref name="src"/>, and mark the new
+    /// handle so the decode matvec routes to <c>llm_matvec_q4k_soa</c>. The repacked
+    /// scale/min bytes are bit-identical to the AoS switch unpack, so the matvec is
+    /// bit-identical to <see cref="DispatchMatVecQ4K"/>. Costs +4 B per 144-B super-block.
+    /// </summary>
+    public Tensor RepackQ4KSoa(Tensor src, int rows, int cols)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available on this system.");
+        if ((cols & 0xff) != 0)
+            throw new InvalidOperationException($"RepackQ4KSoa requires cols % 256 == 0 (got {cols}).");
+
+        long nb = cols / 256;
+        long totalSub = (long)rows * nb;
+        long bytes = totalSub * (128L + 16L + 4L);     // Q + S + D regions
+        var dst = AllocateRawBytes(bytes, DType.Q4_K, exact: true);
+        nint sPtr = GetDevPtr(src), dPtr = GetDevPtr(dst);
+        int pRows = rows, pCols = cols;
+        nint* args = stackalloc nint[4] { (nint)(&sPtr), (nint)(&dPtr), (nint)(&pRows), (nint)(&pCols) };
+        uint grid = (uint)((totalSub + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_q4kRepackSoaKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(q4k_repack_soa) failed: {r}");
+        Synchronize();
+        Free(src);
+        _soaQ4kHandles[dst.Handle] = 0;
+        return dst;
+    }
+
+    /// <summary>
+    /// Issue #156: Q4_K decode matvec over the scale-pre-unpacked SoA weight. Same
+    /// Q8_1 input quantization as <see cref="DispatchMatVecQ4K"/>, then dispatches
+    /// <c>llm_matvec_q4k_soa</c> (1 row/block, MATVEC_Q4K_SOA_NWARPS warps).
+    /// </summary>
+    private void DispatchMatVecQ4KSoa(nint wPtr, nint xPtr, nint yPtr, int rows, int cols)
+    {
+        if ((cols & 0xff) != 0)
+            throw new InvalidOperationException(
+                $"CUDA matvec_q4k_soa requires cols % 256 == 0 (got {cols}).");
+
+        int subBlocks = cols / 32;
+        nuint q81Bytes = (nuint)((long)subBlocks * 36L);
+        EnsureQ81Buf(q81Bytes);
+
+        {
+            nint qInPtr  = xPtr;
+            nint qOutPtr = _q81Buf;
+            int  qN      = cols;
+            nint* args = stackalloc nint[3] { (nint)(&qInPtr), (nint)(&qOutPtr), (nint)(&qN) };
+            int rq = NvrtcInterop.LaunchKernel(
+                _quantizeQ81Kernel, (uint)subBlocks, 1, 1, 32, 1, 1, 0, _stream, args, null);
+            if (rq != 0) throw new InvalidOperationException($"cuLaunchKernel(quantize_q8_1) failed: {rq}");
+        }
+
+        {
+            nint q81Ptr = _q81Buf;
+            int  pRows  = rows, pCols = cols;
+            nint* args = stackalloc nint[5]
+            {
+                (nint)(&wPtr), (nint)(&q81Ptr), (nint)(&yPtr),
+                (nint)(&pRows), (nint)(&pCols)
+            };
+            int rm = NvrtcInterop.LaunchKernel(
+                _matvecQ4KSoaKernel, (uint)rows, 1, 1,
+                32, 8, 1, 0, _stream, args, null);   // MATVEC_Q4K_SOA_NWARPS = 8
+            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_q4k_soa) failed: {rm}");
+        }
     }
 
     private void EnsureGemmWf16(nuint required)
@@ -4548,6 +4645,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _embedLookupQ80BatchedKernel = GetKernelFunc("llm_embed_lookup_q8_0_batched");
         _matvecF32Kernel       = GetKernelFunc("llm_matvec_f32");
         _matvecQ4KKernel       = GetKernelFunc("llm_matvec_q4k");
+        _matvecQ4KSoaKernel    = GetKernelFunc("llm_matvec_q4k_soa");
+        _q4kRepackSoaKernel    = GetKernelFunc("llm_q4k_repack_soa");
         _matvecQ5KKernel       = GetKernelFunc("llm_matvec_q5k");
         _matvecQ6KKernel       = GetKernelFunc("llm_matvec_q6k");
         _matvecQ80Kernel       = GetKernelFunc("llm_matvec_q8_0");
@@ -4567,6 +4666,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _mmqQ80Kernel          = GetKernelFunc("llm_mmq_q8_0");
         _mmqQ80SoaKernel       = GetKernelFunc("llm_mmq_q8_0_soa");
         _mmqQ4kKernel          = GetKernelFunc("llm_mmq_q4k");
+        _mmqQ4kSoaKernel       = GetKernelFunc("llm_mmq_q4k_soa");
         _matvecQ80Dp4aSoaKernel = GetKernelFunc("llm_matvec_q8_0_dp4a_soa");
         _q80RepackSoaKernel    = GetKernelFunc("llm_q8_0_repack_soa");
         _matvecQ80SoaKernel    = GetKernelFunc("llm_matvec_q8_0_soa");
@@ -5000,6 +5100,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             CuBlasInterop.CudaFree(entry.devPtr);
         _devPtrs.Clear();
         _soaHandles.Clear();   // #149
+        _soaQ4kHandles.Clear();   // #156
 
         _pool.Dispose();
 

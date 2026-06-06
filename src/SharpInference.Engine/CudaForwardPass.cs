@@ -218,6 +218,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     public bool PrefillFlashTcEnabled { get; set; }
     private bool _forceFlashTc1;             // #147 A/B: pin the single-warp TC kernel
     private readonly bool _mmqSoa;           // #149: repack 2-D Q8_0 weights to SoA at upload
+    private readonly bool _q4kSoa;           // #156: repack 2-D Q4_K weights to scale-unpacked SoA
     private int _bpCapacity;                 // current N the scratch is sized for (0 = none)
     private Tensor? _bpHidden, _bpResidual, _bpNorm;       // [N × embDim]
     private Tensor? _bpQ, _bpAttnOut;                      // [N × numHeads*maxHeadDim]
@@ -302,6 +303,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // bit-identical. The backend auto-routes per repacked handle. Default on
         // (SHARPI_MMQ_SOA=0 reverts).
         _mmqSoa = mmqSoa ?? (Environment.GetEnvironmentVariable("SHARPI_MMQ_SOA") != "0");
+        // Issue #156: repack 2-D Q4_K trunk weights into the scale-pre-unpacked SoA
+        // layout so the decode matvec (and prefill int8 MMQ) skip the per-super-block
+        // 6-bit (scale,min) unpack switch — +13-15% decode matvec BW, bit-identical.
+        // Opt-in (SHARPI_Q4K_SOA=1) and dense-only for now: the MoE/MTP Q4_K readers
+        // are not SoA-converted (they throw defensively if a SoA handle reaches them).
+        _q4kSoa = Environment.GetEnvironmentVariable("SHARPI_Q4K_SOA") == "1";
         _tqEnabled = enableTurboQuant;
         _tqBits = enableTurboQuant ? tqBits : 0;
 
@@ -2627,6 +2634,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 int cols = (int)info.Dimensions[0];
                 int rows = (int)info.Dimensions[1];
                 result = _gpu.RepackQ8_0Soa(result, rows, cols);
+            }
+            // #156: same for 2-D Q4_K trunk weights (dense-only; cols % 256 required —
+            // every Q4_K hidden dim satisfies it, so the 2-D check is sufficient).
+            else if (_q4kSoa && !_isMoE && info.DType == DType.Q4_K && info.NDimensions == 2)
+            {
+                int cols = (int)info.Dimensions[0];
+                int rows = (int)info.Dimensions[1];
+                result = _gpu.RepackQ4KSoa(result, rows, cols);
             }
             _weightDTypes[result.Handle] = info.DType;
         }
