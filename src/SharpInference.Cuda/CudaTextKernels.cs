@@ -2433,6 +2433,56 @@ extern ""C"" __global__ void llm_dequant_q4k_to_f16(
     }
 }
 
+// ── Dequant Q4_K → FP16 over the scale-pre-unpacked SoA weight (issue #156) ──
+// SoA twin of llm_dequant_q4k_to_f16: same d*sc*nibble − dmin*mn decode, only the
+// (scale, min) come from the pre-unpacked SoA bytes (sblk[si] / sblk[8+si]) and
+// d/dmin from the D region. The fp16 output is bit-identical to the AoS dequant.
+// Used only on the SHARPI_PREFILL_MMQ=0 dequant→fp16→GEMM fallback so a SoA
+// weight never throws there.
+extern ""C"" __global__ void llm_dequant_q4k_to_f16_soa(
+    const unsigned int* __restrict__ weights,   // SoA: [Q][S][D]
+    unsigned short* __restrict__ out,           // [rows * cols] fp16
+    int rows, int cols)
+{
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    unsigned int tid = threadIdx.x;
+
+    int num_blocks = cols >> 8;
+    long totalSub  = (long)rows * num_blocks;
+    const unsigned char* qReg = (const unsigned char*)weights;
+    const unsigned char* sReg = qReg + totalSub * 128L;
+    const unsigned int*  dReg = (const unsigned int*)(sReg + totalSub * 16L);
+
+    long out_row = (long)row * (long)cols;
+    long row_blk_base = (long)row * num_blocks;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long sb = row_blk_base + block;
+
+        unsigned int dd = __ldg(&dReg[sb]);
+        float d    = sharpi_fp16_to_fp32(dd & 0xffffu);
+        float dmin = sharpi_fp16_to_fp32(dd >> 16);
+
+        unsigned int chunk    = tid >> 6;          // 0..3
+        unsigned int sub      = tid & 63u;         // 0..63
+        unsigned int is_upper = (sub >= 32u) ? 1u : 0u;
+        unsigned int byte_pos = sub & 31u;
+        unsigned int si       = chunk * 2u + is_upper;
+
+        const unsigned char* sblk = sReg + sb * 16L;
+        float sc = (float)sblk[si];
+        float mn = (float)sblk[8u + si];
+
+        unsigned int qword  = __ldg(&weights[sb * 32L + (long)(chunk * 8u + (byte_pos >> 2))]);
+        unsigned int qbyte  = (qword >> ((byte_pos & 3u) * 8u)) & 0xFFu;
+        unsigned int nibble = is_upper ? (qbyte >> 4) : (qbyte & 0xFu);
+
+        float val = d * sc * (float)nibble - dmin * mn;
+        out[out_row + (long)block * 256 + (int)tid] = (unsigned short)sharpi_fp32_to_fp16(val);
+    }
+}
+
 // ── FP32 → FP16 elementwise convert (issue #141) ──────────────────────────
 // Converts the prefill activation batch [n] fp32 → fp16 so it can feed the
 // cuBLAS fp16 GEMM alongside the dequantized weights.
@@ -2551,6 +2601,114 @@ extern ""C"" __global__ void llm_matvec_q4k_n2(
         long q81_base_hi = (long)(block * 8 + chunk * 2 + 1) * 36L;
 
         // Per-input d and activation pair — loaded for A and B independently.
+        unsigned int d_bits_lo_a = __ldg(reinterpret_cast<const unsigned int*>(y_q81_a + q81_base_lo)) & 0xffffu;
+        unsigned int d_bits_hi_a = __ldg(reinterpret_cast<const unsigned int*>(y_q81_a + q81_base_hi)) & 0xffffu;
+        unsigned int d_bits_lo_b = __ldg(reinterpret_cast<const unsigned int*>(y_q81_b + q81_base_lo)) & 0xffffu;
+        unsigned int d_bits_hi_b = __ldg(reinterpret_cast<const unsigned int*>(y_q81_b + q81_base_hi)) & 0xffffu;
+        float d8_lo_a = sharpi_fp16_to_fp32(d_bits_lo_a);
+        float d8_hi_a = sharpi_fp16_to_fp32(d_bits_hi_a);
+        float d8_lo_b = sharpi_fp16_to_fp32(d_bits_lo_b);
+        float d8_hi_b = sharpi_fp16_to_fp32(d_bits_hi_b);
+
+        int act_lo_a = *reinterpret_cast<const int*>(y_q81_a + q81_base_lo + 4 + byte_off);
+        int act_hi_a = *reinterpret_cast<const int*>(y_q81_a + q81_base_hi + 4 + byte_off);
+        int act_lo_b = *reinterpret_cast<const int*>(y_q81_b + q81_base_lo + 4 + byte_off);
+        int act_hi_b = *reinterpret_cast<const int*>(y_q81_b + q81_base_hi + 4 + byte_off);
+
+        int dot_lo_a = __dp4a((int)wq_lo, act_lo_a, 0);
+        int dot_hi_a = __dp4a((int)wq_hi, act_hi_a, 0);
+        int sum_lo_a = __dp4a((int)0x01010101, act_lo_a, 0);
+        int sum_hi_a = __dp4a((int)0x01010101, act_hi_a, 0);
+        int dot_lo_b = __dp4a((int)wq_lo, act_lo_b, 0);
+        int dot_hi_b = __dp4a((int)wq_hi, act_hi_b, 0);
+        int sum_lo_b = __dp4a((int)0x01010101, act_lo_b, 0);
+        int sum_hi_b = __dp4a((int)0x01010101, act_hi_b, 0);
+
+        float sd_sc_lo = super_d * (float)sc_lo;
+        float sm_mn_lo = super_dmin * (float)mn_lo;
+        float sd_sc_hi = super_d * (float)sc_hi;
+        float sm_mn_hi = super_dmin * (float)mn_hi;
+
+        acc_a += sd_sc_lo * d8_lo_a * (float)dot_lo_a - sm_mn_lo * d8_lo_a * (float)sum_lo_a;
+        acc_a += sd_sc_hi * d8_hi_a * (float)dot_hi_a - sm_mn_hi * d8_hi_a * (float)sum_hi_a;
+        acc_b += sd_sc_lo * d8_lo_b * (float)dot_lo_b - sm_mn_lo * d8_lo_b * (float)sum_lo_b;
+        acc_b += sd_sc_hi * d8_hi_b * (float)dot_hi_b - sm_mn_hi * d8_hi_b * (float)sum_hi_b;
+    }
+
+    acc_a = sharpi_warp_reduce_sum(acc_a);
+    acc_b = sharpi_warp_reduce_sum(acc_b);
+
+    __shared__ float warp_acc_a[MATVEC_Q4K_NWARPS];
+    __shared__ float warp_acc_b[MATVEC_Q4K_NWARPS];
+    if (lane == 0) { warp_acc_a[warp_id] = acc_a; warp_acc_b[warp_id] = acc_b; }
+    __syncthreads();
+
+    if (warp_id == 0 && lane == 0) {
+        float sa = 0.f, sb = 0.f;
+        #pragma unroll
+        for (int w = 0; w < MATVEC_Q4K_NWARPS; w++) { sa += warp_acc_a[w]; sb += warp_acc_b[w]; }
+        output_a[row] = sa;
+        output_b[row] = sb;
+    }
+}
+
+// ── MatVec Q4_K — N=2 over the scale-pre-unpacked SoA weight (issue #156) ──
+// SoA twin of llm_matvec_q4k_n2: identical two-input dp4a + accumulation order,
+// only the (scale, min) and d/dmin come from the pre-unpacked SoA regions
+// (plain bytes, no 6-bit switch) instead of the interleaved 144-B block. The
+// stored integers are bit-identical to the switch output, so this is
+// bit-identical to llm_matvec_q4k_n2 (and thus to N sequential AoS matvecs).
+// Same NWARPS=8 and per-warp reduction tree → FP-order-preserving (the MTP
+// byte-parity oracle is sensitive to cumulative trunk drift). Lets the dense
+// MTP batched-verify path consume the SoA weight that the decode matvec uses.
+extern ""C"" __global__ void llm_matvec_q4k_n2_soa(
+    const unsigned int* __restrict__ weights,    // SoA: [Q][S][D]
+    const unsigned char* __restrict__ y_q81_a,
+    const unsigned char* __restrict__ y_q81_b,
+    float* __restrict__ output_a,
+    float* __restrict__ output_b,
+    int rows, int cols)
+{
+    int row     = (int)blockIdx.x;
+    int warp_id = (int)threadIdx.y;
+    int lane    = (int)threadIdx.x;
+    if (row >= rows) return;
+
+    int num_blocks = cols >> 8;
+    long totalSub  = (long)rows * num_blocks;
+
+    const unsigned char* qReg = (const unsigned char*)weights;
+    const unsigned char* sReg = qReg + totalSub * 128L;
+    const unsigned int*  dReg = (const unsigned int*)(sReg + totalSub * 16L);
+
+    int chunk    = lane >> 3;
+    int byte_off = (lane & 7) * 4;
+    int q_word_in_block = chunk * 8 + (lane & 7);
+
+    long row_blk_base = (long)row * num_blocks;
+
+    float acc_a = 0.f, acc_b = 0.f;
+
+    for (int block = warp_id; block < num_blocks; block += MATVEC_Q4K_NWARPS) {
+        long sb = row_blk_base + block;
+
+        unsigned int dd  = __ldg(&dReg[sb]);
+        float super_d    = sharpi_fp16_to_fp32(dd & 0xffffu);
+        float super_dmin = sharpi_fp16_to_fp32(dd >> 16);
+
+        const unsigned char* sblk = sReg + sb * 16L;
+        unsigned int sc_lo = sblk[2 * chunk];
+        unsigned int sc_hi = sblk[2 * chunk + 1];
+        unsigned int mn_lo = sblk[8 + 2 * chunk];
+        unsigned int mn_hi = sblk[8 + 2 * chunk + 1];
+
+        unsigned int wq    = __ldg(&weights[sb * 32L + q_word_in_block]);
+        unsigned int wq_lo = wq & 0x0F0F0F0Fu;
+        unsigned int wq_hi = (wq >> 4) & 0x0F0F0F0Fu;
+
+        long q81_base_lo = (long)(block * 8 + chunk * 2)     * 36L;
+        long q81_base_hi = (long)(block * 8 + chunk * 2 + 1) * 36L;
+
         unsigned int d_bits_lo_a = __ldg(reinterpret_cast<const unsigned int*>(y_q81_a + q81_base_lo)) & 0xffffu;
         unsigned int d_bits_hi_a = __ldg(reinterpret_cast<const unsigned int*>(y_q81_a + q81_base_hi)) & 0xffffu;
         unsigned int d_bits_lo_b = __ldg(reinterpret_cast<const unsigned int*>(y_q81_b + q81_base_lo)) & 0xffffu;
@@ -2884,6 +3042,94 @@ extern ""C"" __global__ void llm_matvec_q4k_gemm_n(
         }
 
         unsigned int wq    = __ldg(&weights[word_base + q4_offset]);
+        unsigned int wq_lo = wq & 0x0F0F0F0Fu;
+        unsigned int wq_hi = (wq >> 4) & 0x0F0F0F0Fu;
+
+        long q81_base_lo = (long)(block * 8 + chunk * 2)     * 36L;
+        long q81_base_hi = (long)(block * 8 + chunk * 2 + 1) * 36L;
+
+        unsigned int d_bits_lo = __ldg(reinterpret_cast<const unsigned int*>(y_q81 + q81_base_lo)) & 0xffffu;
+        unsigned int d_bits_hi = __ldg(reinterpret_cast<const unsigned int*>(y_q81 + q81_base_hi)) & 0xffffu;
+        float d8_lo = sharpi_fp16_to_fp32(d_bits_lo);
+        float d8_hi = sharpi_fp16_to_fp32(d_bits_hi);
+
+        int act_lo = *reinterpret_cast<const int*>(y_q81 + q81_base_lo + 4 + byte_off);
+        int act_hi = *reinterpret_cast<const int*>(y_q81 + q81_base_hi + 4 + byte_off);
+
+        int dot_lo   = __dp4a((int)wq_lo, act_lo, 0);
+        int dot_hi   = __dp4a((int)wq_hi, act_hi, 0);
+        int sum_lo   = __dp4a((int)0x01010101, act_lo, 0);
+        int sum_hi   = __dp4a((int)0x01010101, act_hi, 0);
+
+        float coef_d_lo = super_d    * (float)sc_lo * d8_lo;
+        float coef_m_lo = super_dmin * (float)mn_lo * d8_lo;
+        float coef_d_hi = super_d    * (float)sc_hi * d8_hi;
+        float coef_m_hi = super_dmin * (float)mn_hi * d8_hi;
+        acc += coef_d_lo * (float)dot_lo - coef_m_lo * (float)sum_lo;
+        acc += coef_d_hi * (float)dot_hi - coef_m_hi * (float)sum_hi;
+    }
+
+    acc = sharpi_warp_reduce_sum(acc);
+
+    __shared__ float warp_acc[MATVEC_Q4K_NWARPS];
+    if (lane == 0) warp_acc[warp_id] = acc;
+    __syncthreads();
+
+    if (warp_id == 0 && lane == 0) {
+        float s = 0.f;
+        #pragma unroll
+        for (int w = 0; w < MATVEC_Q4K_NWARPS; w++) s += warp_acc[w];
+        output_all[(long)token * (long)rows + row] = s;
+    }
+}
+
+// ── MatVec Q4_K — batched GEMM-N over the scale-pre-unpacked SoA weight (#156) ─
+// SoA twin of llm_matvec_q4k_gemm_n: identical per-(row,token) reduction, only
+// the weight decode reads the pre-unpacked SoA regions. Bit-identical to the AoS
+// GEMM-N (and to N sequential llm_matvec_q4k_soa launches). Used only on the
+// SHARPI_PREFILL_MMQ=0 fallback prefill path so a SoA weight never throws there.
+extern ""C"" __global__ void llm_matvec_q4k_gemm_n_soa(
+    const unsigned int* __restrict__ weights,     // SoA: [Q][S][D]
+    const unsigned char* __restrict__ y_q81_all,  // [n_tok][num_blocks*8*36] bytes
+    float* __restrict__ output_all,               // [n_tok][rows]
+    int rows, int cols, int n_tok)
+{
+    int row     = (int)blockIdx.x;
+    int token   = (int)blockIdx.y;
+    int warp_id = (int)threadIdx.y;
+    int lane    = (int)threadIdx.x;
+    if (row >= rows || token >= n_tok) return;
+
+    int num_blocks = cols >> 8;
+    long totalSub  = (long)rows * num_blocks;
+    const unsigned char* qReg = (const unsigned char*)weights;
+    const unsigned char* sReg = qReg + totalSub * 128L;
+    const unsigned int*  dReg = (const unsigned int*)(sReg + totalSub * 16L);
+
+    const unsigned char* y_q81 = y_q81_all + (long)token * (long)num_blocks * 8L * 36L;
+
+    int chunk    = lane >> 3;
+    int byte_off = (lane & 7) * 4;
+    int q_word_in_block = chunk * 8 + (lane & 7);
+
+    long row_blk_base = (long)row * num_blocks;
+
+    float acc = 0.f;
+
+    for (int block = warp_id; block < num_blocks; block += MATVEC_Q4K_NWARPS) {
+        long sb = row_blk_base + block;
+
+        unsigned int dd  = __ldg(&dReg[sb]);
+        float super_d    = sharpi_fp16_to_fp32(dd & 0xffffu);
+        float super_dmin = sharpi_fp16_to_fp32(dd >> 16);
+
+        const unsigned char* sblk = sReg + sb * 16L;
+        unsigned int sc_lo = sblk[2 * chunk];
+        unsigned int sc_hi = sblk[2 * chunk + 1];
+        unsigned int mn_lo = sblk[8 + 2 * chunk];
+        unsigned int mn_hi = sblk[8 + 2 * chunk + 1];
+
+        unsigned int wq    = __ldg(&weights[sb * 32L + q_word_in_block]);
         unsigned int wq_lo = wq & 0x0F0F0F0Fu;
         unsigned int wq_hi = (wq >> 4) & 0x0F0F0F0Fu;
 

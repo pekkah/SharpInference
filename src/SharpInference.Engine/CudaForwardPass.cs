@@ -303,12 +303,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // bit-identical. The backend auto-routes per repacked handle. Default on
         // (SHARPI_MMQ_SOA=0 reverts).
         _mmqSoa = mmqSoa ?? (Environment.GetEnvironmentVariable("SHARPI_MMQ_SOA") != "0");
-        // Issue #156: repack 2-D Q4_K trunk weights into the scale-pre-unpacked SoA
-        // layout so the decode matvec (and prefill int8 MMQ) skip the per-super-block
-        // 6-bit (scale,min) unpack switch — +13-15% decode matvec BW, bit-identical.
-        // Opt-in (SHARPI_Q4K_SOA=1) and dense-only for now: the MoE/MTP Q4_K readers
-        // are not SoA-converted (they throw defensively if a SoA handle reaches them).
-        _q4kSoa = Environment.GetEnvironmentVariable("SHARPI_Q4K_SOA") == "1";
+        // Issue #156/#160: repack 2-D Q4_K trunk weights into the scale-pre-unpacked
+        // SoA layout so the decode matvec, prefill int8 MMQ, the N=2 MTP batched-verify
+        // reader, and the GEMM-N/dequant fallback prefill readers all skip the
+        // per-super-block 6-bit (scale,min) unpack switch — +7% decode / +5% prefill,
+        // bit-identical (Qwen3-8B 70.0 → 74.7 t/s). Default on (SHARPI_Q4K_SOA=0
+        // reverts). Dense-only: the MoE Q4_K readers are not SoA-converted, so the
+        // repack is gated on !_isMoE at upload.
+        _q4kSoa = Environment.GetEnvironmentVariable("SHARPI_Q4K_SOA") != "0";
         _tqEnabled = enableTurboQuant;
         _tqBits = enableTurboQuant ? tqBits : 0;
 

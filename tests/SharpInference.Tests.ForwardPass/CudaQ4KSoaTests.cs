@@ -134,6 +134,113 @@ public sealed unsafe class CudaQ4KSoaTests
     }
 
     [Fact]
+    public void Q4KSoaN2_BitIdenticalToInterleaved()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        // Exercises the MTP batched-verify reader (issue #160): the dense Qwen3.6-MTP
+        // trunk weights are repacked SoA when SHARPI_Q4K_SOA is default-on, so MatMulN2
+        // must route to llm_matvec_q4k_n2_soa and stay bit-identical to the interleaved
+        // llm_matvec_q4k_n2 (same two-input dp4a + accumulation order). Bit-parity here
+        // is the gate that protects MtpDecoder_GreedyParity_LlamaCpp's cumulative-drift
+        // oracle (see memory feedback_qkv_matvecdual_breaks_mtp_parity).
+        foreach ((int rows, int cols) in new[]
+                 { (256, 256), (1024, 512), (4096, 4096), (6144, 4096), (4096, 12288), (12288, 4096) })
+        {
+            var rng = new Random(20260606 + rows * 17 + cols * 3);
+            byte[] interleaved = BuildQ4KMatrix(rows, cols, rng);
+            var vecA = new float[cols];
+            var vecB = new float[cols];
+            for (int i = 0; i < cols; i++) { vecA[i] = (float)(rng.NextDouble() * 2 - 1); vecB[i] = (float)(rng.NextDouble() * 2 - 1); }
+            var gA = gpu.Upload(vecA, TensorShape.D1(cols));
+            var gB = gpu.Upload(vecB, TensorShape.D1(cols));
+
+            var gW   = gpu.UploadRaw(interleaved, TensorShape.D1(interleaved.Length), DType.Q4_K);
+            var gWr  = gpu.UploadRaw(interleaved, TensorShape.D1(interleaved.Length), DType.Q4_K);
+            var gSoa = gpu.RepackQ4KSoa(gWr, rows, cols);
+            var aA = gpu.Allocate(TensorShape.D1(rows)); var aB = gpu.Allocate(TensorShape.D1(rows));
+            var sA = gpu.Allocate(TensorShape.D1(rows)); var sB = gpu.Allocate(TensorShape.D1(rows));
+
+            gpu.MatMulN2(aA, aB, gW,   gA, gB, DType.Q4_K);  // interleaved llm_matvec_q4k_n2
+            gpu.MatMulN2(sA, sB, gSoa, gA, gB, DType.Q4_K);  // SoA (auto-routed) llm_matvec_q4k_n2_soa
+            gpu.Synchronize();
+
+            var haA = new float[rows]; var haB = new float[rows];
+            var hsA = new float[rows]; var hsB = new float[rows];
+            gpu.Download(aA, haA); gpu.Download(aB, haB); gpu.Download(sA, hsA); gpu.Download(sB, hsB);
+            gpu.Free(gW); gpu.Free(gSoa); gpu.Free(gA); gpu.Free(gB);
+            gpu.Free(aA); gpu.Free(aB); gpu.Free(sA); gpu.Free(sB);
+
+            int diffs = 0; float maxAbs = 0;
+            for (int i = 0; i < rows; i++)
+            {
+                float da = MathF.Abs(haA[i] - hsA[i]), db = MathF.Abs(haB[i] - hsB[i]);
+                maxAbs = MathF.Max(maxAbs, MathF.Max(da, db));
+                if (da != 0f || db != 0f) diffs++;
+            }
+            Console.WriteLine($"Q4K-N2-SoA rows={rows} cols={cols}: maxAbs={maxAbs:E2} diffs={diffs}/{rows}");
+            Assert.True(maxAbs == 0f,
+                $"Q4_K SoA N=2 matvec not bit-identical to interleaved: {diffs}/{rows} differ, maxAbs={maxAbs:E3} (rows={rows} cols={cols}).");
+        }
+    }
+
+    [Fact]
+    public void Q4KSoaFallbackPrefill_BitIdenticalToInterleaved()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        // The two non-MMQ prefill fallback readers (SHARPI_PREFILL_MMQ=0): the GEMM-N
+        // dp4a path (MatMulBatched → llm_matvec_q4k_gemm_n_soa) and the dequant→fp16→GEMM
+        // path (MatMulBatchedGemm → llm_dequant_q4k_to_f16_soa). Both must be bit-identical
+        // to their interleaved counterparts so default-on SoA is safe with MMQ disabled.
+        foreach ((int rows, int cols, int nTok) in new[]
+                 { (256, 256, 8), (1024, 512, 40), (4096, 4096, 64) })
+        {
+            var rng = new Random(20260606 + rows * 11 + cols * 9 + nTok);
+            byte[] interleaved = BuildQ4KMatrix(rows, cols, rng);
+            var acts = new float[(long)nTok * cols];
+            for (int i = 0; i < acts.Length; i++) acts[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            var gW   = gpu.UploadRaw(interleaved, TensorShape.D1(interleaved.Length), DType.Q4_K);
+            var gWr  = gpu.UploadRaw(interleaved, TensorShape.D1(interleaved.Length), DType.Q4_K);
+            var gSoa = gpu.RepackQ4KSoa(gWr, rows, cols);
+            var gX   = gpu.Upload(acts, TensorShape.D1(acts.Length));
+
+            // GEMM-N dp4a fallback.
+            var gnI = gpu.Allocate(TensorShape.D1((long)nTok * rows));
+            var gnS = gpu.Allocate(TensorShape.D1((long)nTok * rows));
+            gpu.MatMulBatched(gnI, gW,   gX, nTok, DType.Q4_K);
+            gpu.MatMulBatched(gnS, gSoa, gX, nTok, DType.Q4_K);
+
+            // dequant→fp16→GEMM fallback.
+            var dqI = gpu.Allocate(TensorShape.D1((long)nTok * rows));
+            var dqS = gpu.Allocate(TensorShape.D1((long)nTok * rows));
+            gpu.MatMulBatchedGemm(dqI, gW,   gX, nTok, DType.Q4_K);
+            gpu.MatMulBatchedGemm(dqS, gSoa, gX, nTok, DType.Q4_K);
+            gpu.Synchronize();
+
+            var hgnI = new float[(long)nTok * rows]; var hgnS = new float[(long)nTok * rows];
+            var hdqI = new float[(long)nTok * rows]; var hdqS = new float[(long)nTok * rows];
+            gpu.Download(gnI, hgnI); gpu.Download(gnS, hgnS);
+            gpu.Download(dqI, hdqI); gpu.Download(dqS, hdqS);
+            gpu.Free(gW); gpu.Free(gSoa); gpu.Free(gX);
+            gpu.Free(gnI); gpu.Free(gnS); gpu.Free(dqI); gpu.Free(dqS);
+
+            float gnMax = 0, dqMax = 0; int gnDiffs = 0, dqDiffs = 0;
+            for (int i = 0; i < hgnI.Length; i++)
+            {
+                float g = MathF.Abs(hgnI[i] - hgnS[i]); gnMax = MathF.Max(gnMax, g); if (g != 0f) gnDiffs++;
+                float d = MathF.Abs(hdqI[i] - hdqS[i]); dqMax = MathF.Max(dqMax, d); if (d != 0f) dqDiffs++;
+            }
+            Console.WriteLine($"Q4K-fallback rows={rows} cols={cols} nTok={nTok}: gemm-n maxAbs={gnMax:E2} ({gnDiffs}), dequant maxAbs={dqMax:E2} ({dqDiffs})");
+            Assert.True(gnMax == 0f, $"Q4_K SoA GEMM-N not bit-identical: {gnDiffs} differ, maxAbs={gnMax:E3} (rows={rows} cols={cols} nTok={nTok}).");
+            Assert.True(dqMax == 0f, $"Q4_K SoA dequant→GEMM not bit-identical: {dqDiffs} differ, maxAbs={dqMax:E3} (rows={rows} cols={cols} nTok={nTok}).");
+        }
+    }
+
+    [Fact]
     public void Q4KSoa_Vs_Interleaved_DecodeSpeed()
     {
         using var gpu = TryCreate();

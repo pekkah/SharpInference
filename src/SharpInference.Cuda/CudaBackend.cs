@@ -151,6 +151,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // on-GPU dense FFN to halve weight-bandwidth cost per output.
     private nint   _matvecF32N2Kernel;
     private nint   _matvecQ4KN2Kernel;
+    private nint   _matvecQ4KN2SoaKernel;   // #156: N=2 over scale-pre-unpacked SoA weight
     private nint   _matvecQ5KN2Kernel;
     private nint   _matvecQ6KN2Kernel;
     // Issue #111: batched GEMM-N variants — one weight matrix, N input vectors,
@@ -160,6 +161,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // prefill into one launch per projection.
     private nint   _matvecF32GemmNKernel;
     private nint   _matvecQ4KGemmNKernel;
+    private nint   _matvecQ4KGemmNSoaKernel;  // #156: GEMM-N over scale-pre-unpacked SoA weight
     private nint   _matvecQ5KGemmNKernel;
     private nint   _matvecQ6KGemmNKernel;
     private nint   _matvecQ80GemmNKernel;
@@ -168,6 +170,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _dequantQ80F16Kernel;
     // Issue #156 Item C / C1: Q4_K weight → fp16 dequant for the same prefill GEMM path.
     private nint   _dequantQ4KF16Kernel;
+    private nint   _dequantQ4KF16SoaKernel;  // #156: dequant over scale-pre-unpacked SoA weight
     private nint   _f32ToF16Kernel;
     // Issue #141 (MMQ): int8 tensor-core Q8_0×Q8_1 matmul — weight read once as
     // int8, no fp16 HBM round-trip, m16n8k32 s8 mma. Replaces the dequant→GEMM path.
@@ -1628,11 +1631,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
         if (weightDType == DType.Q4_K)
         {
-            if (_soaQ4kHandles.ContainsKey(matrix.Handle))
-                throw new NotSupportedException(
-                    "Q4_K SoA weight reached MatMulN2 (MTP 2-input), which has no SoA reader. " +
-                    "Disable SHARPI_Q4K_SOA for MTP models.");
-            DispatchMatVecQ4KN2(wPtr, xAPtr, xBPtr, yAPtr, yBPtr, rows, cols);
+            // #156: the dense MTP batched-verify trunk weights may be repacked SoA;
+            // route to the bit-identical SoA N=2 reader (no AoS fallback throw).
+            DispatchMatVecQ4KN2(wPtr, xAPtr, xBPtr, yAPtr, yBPtr, rows, cols,
+                                soa: _soaQ4kHandles.ContainsKey(matrix.Handle));
             return;
         }
 
@@ -1711,11 +1713,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
         if (weightDType == DType.Q4_K)
         {
-            if (_soaQ4kHandles.ContainsKey(matrix.Handle))
-                throw new NotSupportedException(
-                    "Q4_K SoA weight reached the matvec GEMM-N path, which has no SoA reader. " +
-                    "SHARPI_Q4K_SOA requires the int8 MMQ prefill (SHARPI_PREFILL_MMQ=1, default).");
-            DispatchMatVecQ4KBatched(wPtr, xPtr, yPtr, rows, cols, nTok);
+            // #156: the GEMM-N fallback prefill (SHARPI_PREFILL_MMQ=0) over a
+            // repacked SoA weight uses the bit-identical SoA GEMM-N reader.
+            DispatchMatVecQ4KBatched(wPtr, xPtr, yPtr, rows, cols, nTok,
+                                     soa: _soaQ4kHandles.ContainsKey(matrix.Handle));
             return;
         }
         if (weightDType is DType.Float32 or DType.Q6_K or DType.Q5_K or DType.Q8_0)
@@ -1815,12 +1816,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         {
             nint wp = wPtr, op = _gemmWf16Buf;
             int pRows = rows, pCols = cols;
-            if (weightDType == DType.Q4_K && _soaQ4kHandles.ContainsKey(matrix.Handle))
-                throw new NotSupportedException(
-                    "Q4_K SoA weight reached the dequant→fp16→GEMM path, which has no SoA reader. " +
-                    "SHARPI_Q4K_SOA requires the int8 MMQ prefill (SHARPI_PREFILL_MMQ=1, default).");
+            // #156: a repacked SoA Q4_K weight on this fallback (SHARPI_PREFILL_MMQ=0)
+            // path uses the bit-identical SoA dequant kernel.
             nint dqKern = weightDType == DType.Q4_K
-                ? _dequantQ4KF16Kernel
+                ? (_soaQ4kHandles.ContainsKey(matrix.Handle) ? _dequantQ4KF16SoaKernel : _dequantQ4KF16Kernel)
                 : (_soaHandles.ContainsKey(matrix.Handle) ? _dequantQ80F16SoaKernel : _dequantQ80F16Kernel);
             nint* args = stackalloc nint[4] { (nint)(&wp), (nint)(&op), (nint)(&pRows), (nint)(&pCols) };
             int r = NvrtcInterop.LaunchKernel(dqKern, (uint)rows, 1, 1,
@@ -2146,7 +2145,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// grid.
     /// </summary>
     private void DispatchMatVecQ4KBatched(nint wPtr, nint xPtr, nint yPtr,
-                                          int rows, int cols, int nTok)
+                                          int rows, int cols, int nTok, bool soa)
     {
         if ((cols & 0xff) != 0)
             throw new InvalidOperationException(
@@ -2187,9 +2186,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             };
             // grid = (rows, nTok); block = 32 × MATVEC_Q4K_NWARPS(8) = 256 threads.
             int rm = NvrtcInterop.LaunchKernel(
-                _matvecQ4KGemmNKernel, (uint)rows, (uint)nTok, 1,
+                soa ? _matvecQ4KGemmNSoaKernel : _matvecQ4KGemmNKernel, (uint)rows, (uint)nTok, 1,
                 32, 8, 1, 0, _stream, args, null);
-            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_q4k_gemm_n) failed: {rm}");
+            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_q4k_gemm_n{(soa ? "_soa" : "")}) failed: {rm}");
         }
     }
 
@@ -2212,11 +2211,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// Q4_K N=2 matvec: quantizes both input vectors into independent Q8_1
     /// scratches (<c>_q81Buf</c> for A, <c>_q81BufB</c> for B), then dispatches
     /// the cooperative <c>llm_matvec_q4k_n2</c> kernel that reads each weight
-    /// super-block once and accumulates into two outputs per row.
+    /// super-block once and accumulates into two outputs per row. When the weight
+    /// was repacked to the scale-pre-unpacked SoA layout (#156), dispatches the
+    /// bit-identical <c>llm_matvec_q4k_n2_soa</c> reader instead.
     /// </summary>
     private void DispatchMatVecQ4KN2(nint wPtr, nint xAPtr, nint xBPtr,
                                      nint yAPtr, nint yBPtr,
-                                     int rows, int cols)
+                                     int rows, int cols, bool soa)
     {
         if ((cols & 0xff) != 0)
             throw new InvalidOperationException(
@@ -2257,9 +2258,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 (nint)(&pRows),   (nint)(&pCols)
             };
             int rm = NvrtcInterop.LaunchKernel(
-                _matvecQ4KN2Kernel, (uint)rows, 1, 1,
+                soa ? _matvecQ4KN2SoaKernel : _matvecQ4KN2Kernel, (uint)rows, 1, 1,
                 32, 8, 1, 0, _stream, args, null);
-            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_q4k_n2) failed: {rm}");
+            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_q4k_n2{(soa ? "_soa" : "")}) failed: {rm}");
         }
     }
 
@@ -4653,15 +4654,18 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _matvecQ80Dp4aKernel   = GetKernelFunc("llm_matvec_q8_0_dp4a");
         _matvecF32N2Kernel     = GetKernelFunc("llm_matvec_f32_n2");
         _matvecQ4KN2Kernel     = GetKernelFunc("llm_matvec_q4k_n2");
+        _matvecQ4KN2SoaKernel  = GetKernelFunc("llm_matvec_q4k_n2_soa");
         _matvecQ5KN2Kernel     = GetKernelFunc("llm_matvec_q5k_n2");
         _matvecQ6KN2Kernel     = GetKernelFunc("llm_matvec_q6k_n2");
         _matvecF32GemmNKernel  = GetKernelFunc("llm_matvec_f32_gemm_n");
         _matvecQ4KGemmNKernel  = GetKernelFunc("llm_matvec_q4k_gemm_n");
+        _matvecQ4KGemmNSoaKernel = GetKernelFunc("llm_matvec_q4k_gemm_n_soa");
         _matvecQ5KGemmNKernel  = GetKernelFunc("llm_matvec_q5k_gemm_n");
         _matvecQ6KGemmNKernel  = GetKernelFunc("llm_matvec_q6k_gemm_n");
         _matvecQ80GemmNKernel  = GetKernelFunc("llm_matvec_q8_0_gemm_n");
         _dequantQ80F16Kernel   = GetKernelFunc("llm_dequant_q8_0_to_f16");
         _dequantQ4KF16Kernel   = GetKernelFunc("llm_dequant_q4k_to_f16");
+        _dequantQ4KF16SoaKernel = GetKernelFunc("llm_dequant_q4k_to_f16_soa");
         _f32ToF16Kernel        = GetKernelFunc("llm_f32_to_f16");
         _mmqQ80Kernel          = GetKernelFunc("llm_mmq_q8_0");
         _mmqQ80SoaKernel       = GetKernelFunc("llm_mmq_q8_0_soa");
