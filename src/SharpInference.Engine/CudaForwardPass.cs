@@ -209,6 +209,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// </summary>
     public bool PrefillFlashTcEnabled { get; set; }
     private bool _forceFlashTc1;             // #147 A/B: pin the single-warp TC kernel
+    private readonly bool _mmqSoa;           // #149: repack 2-D Q8_0 weights to SoA at upload
     private int _bpCapacity;                 // current N the scratch is sized for (0 = none)
     private Tensor? _bpHidden, _bpResidual, _bpNorm;       // [N × embDim]
     private Tensor? _bpQ, _bpAttnOut;                      // [N × numHeads*maxHeadDim]
@@ -281,11 +282,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
     public CudaForwardPass(GgufModel model, CudaBackend gpu, ModelHyperparams hp,
         int maxContextLength = 0,
-        bool enableTurboQuant = false, int tqFp32Window = 256, int tqBits = 3)
+        bool enableTurboQuant = false, int tqFp32Window = 256, int tqBits = 3,
+        bool? mmqSoa = null)
     {
         _model = model;
         _gpu = gpu;
         _hp = hp;
+        // Issue #149: repack 2-D Q8_0 weights into the SoA layout at upload so the
+        // prefill MMQ + decode dp4a matvec use aligned loads (no funnelshift). The
+        // backend auto-routes per repacked weight handle. Default from env.
+        _mmqSoa = mmqSoa ?? (Environment.GetEnvironmentVariable("SHARPI_MMQ_SOA") == "1");
         _tqEnabled = enableTurboQuant;
         _tqBits = enableTurboQuant ? tqBits : 0;
 
@@ -2415,6 +2421,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         else if (info.DType == DType.Q4_K || info.DType == DType.Q6_K || info.DType == DType.Q8_0)
         {
             result = _gpu.UploadRaw(data, TensorShape.D1(data.Length), info.DType, exact: true);
+            // #149: repack 2-D Q8_0 GEMM weights (norms/biases are 1-D; embedding uploads
+            // elsewhere) into the SoA layout. Dimensions are GGUF ne order: [cols, rows].
+            if (_mmqSoa && info.DType == DType.Q8_0 && info.NDimensions == 2)
+            {
+                int cols = (int)info.Dimensions[0];
+                int rows = (int)info.Dimensions[1];
+                result = _gpu.RepackQ8_0Soa(result, rows, cols);
+            }
             _weightDTypes[result.Handle] = info.DType;
         }
         else

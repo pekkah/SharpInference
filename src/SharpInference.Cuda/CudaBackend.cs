@@ -137,6 +137,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _matvecQ80Kernel;
     // Issue #142: dp4a/Q8_1 decode matvec (quantize activation to int8, __dp4a dot).
     private nint   _matvecQ80Dp4aKernel;
+    // Issue #149: SoA-layout dp4a decode matvec + the interleaved→SoA repack kernel.
+    private nint   _matvecQ80Dp4aSoaKernel;
+    private nint   _q80RepackSoaKernel;
     // Issue #43: N=2 (two-input, two-output) variants — read each weight row
     // once and accumulate into two outputs. Used by MTP BatchForward2's
     // on-GPU dense FFN to halve weight-bandwidth cost per output.
@@ -1096,6 +1099,27 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         return tensor;
     }
 
+    /// <summary>Allocate an uninitialized device buffer of <paramref name="bytes"/> bytes
+    /// (issue #149 SoA repack destination). Mirrors <see cref="UploadRaw"/>'s allocation
+    /// without the host→device copy. The shape is a 1-D byte count for bookkeeping.</summary>
+    public Tensor AllocateRawBytes(long bytes, DType dtype, bool exact = false)
+    {
+        nuint byteSize  = (nuint)bytes;
+        nuint allocSize = exact ? byteSize : GpuBufferPool.RoundUp(byteSize);
+        nint devPtr = exact ? nint.Zero : _pool.Rent(allocSize);
+        if (devPtr == nint.Zero)
+        {
+            int status = CuBlasInterop.CudaMalloc(out devPtr, allocSize);
+            if (status != 0)
+                throw new InvalidOperationException($"cudaMalloc failed: {status}");
+        }
+        var handle = (nint)Interlocked.Increment(ref _nextHandle);
+        _devPtrs[handle] = (devPtr, allocSize);
+        if (exact) _exactHandles[handle] = 0;
+        _tensorDTypes[handle] = dtype;
+        return new Tensor(TensorShape.D1(bytes), dtype, handle);
+    }
+
     // ── Async background upload path (issue #78) ──────────────────────────
     //
     // Mirrors the Vulkan UploadBackground entry point: dispatches the host→device
@@ -1521,7 +1545,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         // hidden dim qualifies). Falls back to the fp32-decode kernel otherwise.
         if (weightDType == DType.Q8_0 && Q80Dp4aEnabled && (cols & 31) == 0)
         {
-            DispatchMatVecQ80Dp4a(wPtr, xPtr, yPtr, rows, cols);
+            DispatchMatVecQ80Dp4a(wPtr, xPtr, yPtr, rows, cols, soa: _soaHandles.Contains(matrix.Handle));
             return;
         }
 
@@ -1857,7 +1881,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 (nint)(&pRows), (nint)(&pCols), (nint)(&pN)
             };
             uint gx = (uint)((rows + 63) / 64), gy = (uint)((nTok + 127) / 128);
-            int rm = NvrtcInterop.LaunchKernel(_mmqQ80Kernel, gx, gy, 1,
+            // #149: if this weight was repacked SoA, use the aligned-load kernel (same args).
+            nint kern = _soaHandles.Contains(matrix.Handle) ? _mmqQ80SoaKernel : _mmqQ80Kernel;
+            int rm = NvrtcInterop.LaunchKernel(kern, gx, gy, 1,
                                                256, 1, 1, 0, _stream, args, null);
             if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(mmq_q8_0) failed: {rm}");
         }
@@ -1865,15 +1891,14 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
     /// <summary>
     /// Issue #149: SoA-layout variant of <see cref="MatMulBatchedMmq"/>. Identical
-    /// math/output, but the Q8_0 weights are passed pre-repacked into a struct-of-
-    /// arrays layout — <paramref name="quants"/> = the 32 int8/block contiguous &amp;
-    /// 16-byte aligned ([rows*cols] bytes), <paramref name="scales"/> = the fp16 block
-    /// scales ([rows*cols/32] ushort) — so the weight load uses plain aligned uint
-    /// reads instead of the funnelshift the interleaved 34-byte block forces. Bit-
-    /// identical to <see cref="MatMulBatchedMmq"/> given a faithful repack.
+    /// math/output, but <paramref name="soaWeight"/> is a single buffer holding the
+    /// Q8_0 weight repacked struct-of-arrays — <c>[quants rows*cols B][scales rows*nb
+    /// fp16]</c> — so the 32 quants/block are contiguous &amp; 16-byte aligned and the
+    /// weight load uses plain aligned uint reads instead of the funnelshift the
+    /// interleaved 34-byte block forces. The host splits the buffer at byte rows*cols
+    /// into the quant and scale pointers. Bit-identical to <see cref="MatMulBatchedMmq"/>.
     /// </summary>
-    public void MatMulBatchedMmqSoa(Tensor outputAll, Tensor quants, Tensor scales,
-                                    Tensor inputAll, int nTok)
+    public void MatMulBatchedMmqSoa(Tensor outputAll, Tensor soaWeight, Tensor inputAll, int nTok)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
@@ -1891,8 +1916,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             throw new InvalidOperationException(
                 $"CUDA MatMulBatchedMmqSoa requires cols % 32 == 0 (got {cols}).");
 
-        nint qwPtr = GetDevPtr(quants);
-        nint wsPtr = GetDevPtr(scales);
+        nint wPtr = GetDevPtr(soaWeight);
         nint xPtr = GetDevPtr(inputAll);
         nint yPtr = GetDevPtr(outputAll);
 
@@ -1913,9 +1937,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         {
             nint q81 = _q81BatchBuf;
             int pRows = rows, pCols = cols, pN = nTok;
-            nint* args = stackalloc nint[7]
+            nint* args = stackalloc nint[6]
             {
-                (nint)(&qwPtr), (nint)(&wsPtr), (nint)(&q81), (nint)(&yPtr),
+                (nint)(&wPtr), (nint)(&q81), (nint)(&yPtr),
                 (nint)(&pRows), (nint)(&pCols), (nint)(&pN)
             };
             uint gx = (uint)((rows + 63) / 64), gy = (uint)((nTok + 127) / 128);
@@ -1923,6 +1947,40 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                                                256, 1, 1, 0, _stream, args, null);
             if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(mmq_q8_0_soa) failed: {rm}");
         }
+    }
+
+    /// <summary>Issue #149: device handles of Q8_0 weights repacked into the SoA layout
+    /// (see <see cref="RepackQ8_0Soa"/>). <see cref="MatMulBatchedMmq"/> and the decode
+    /// matvec auto-route to the aligned-load SoA kernels for these.</summary>
+    private readonly HashSet<nint> _soaHandles = new();
+
+    /// <summary>
+    /// Issue #149: allocate a new buffer the same size as the interleaved Q8_0
+    /// <paramref name="src"/> [rows×nb×34 B], repack it into the SoA layout
+    /// [quants rows*cols B][scales rows*nb fp16] on the GPU, free <paramref name="src"/>,
+    /// and mark the new handle so the matmul/matvec dispatch uses the SoA kernels.
+    /// </summary>
+    public Tensor RepackQ8_0Soa(Tensor src, int rows, int cols)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available on this system.");
+        if ((cols & 31) != 0)
+            throw new InvalidOperationException($"RepackQ8_0Soa requires cols % 32 == 0 (got {cols}).");
+
+        long bytes = (long)rows * (cols / 32) * 34L;   // == rows*cols + rows*nb*2
+        var dst = AllocateRawBytes(bytes, DType.Q8_0, exact: true);
+        nint sPtr = GetDevPtr(src), dPtr = GetDevPtr(dst);
+        int pRows = rows, pCols = cols;
+        nint* args = stackalloc nint[4] { (nint)(&sPtr), (nint)(&dPtr), (nint)(&pRows), (nint)(&pCols) };
+        long totalBlocks = (long)rows * (cols / 32);
+        uint grid = (uint)((totalBlocks + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_q80RepackSoaKernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(q8_0_repack_soa) failed: {r}");
+        Synchronize();
+        Free(src);
+        _soaHandles.Add(dst.Handle);
+        return dst;
     }
 
     private void EnsureGemmWf16(nuint required)
@@ -2151,7 +2209,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         EnsureQ81Buf((nuint)((long)subBlocks * 36L));
     }
 
-    private void DispatchMatVecQ80Dp4a(nint wPtr, nint xPtr, nint yPtr, int rows, int cols)
+    private void DispatchMatVecQ80Dp4a(nint wPtr, nint xPtr, nint yPtr, int rows, int cols, bool soa = false)
     {
         if ((cols & 31) != 0)
             throw new InvalidOperationException(
@@ -2183,7 +2241,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 (nint)(&pRows), (nint)(&pCols)
             };
             int rm = NvrtcInterop.LaunchKernel(
-                _matvecQ80Dp4aKernel, (uint)rows, 1, 1,
+                soa ? _matvecQ80Dp4aSoaKernel : _matvecQ80Dp4aKernel, (uint)rows, 1, 1,
                 32, 8, 1, 0, _stream, args, null);
             if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_q8_0_dp4a) failed: {rm}");
         }
@@ -4396,6 +4454,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _matvecF32N2Kernel, _matvecQ4KN2Kernel, _matvecQ5KN2Kernel, _matvecQ6KN2Kernel,
             _matvecF32GemmNKernel, _matvecQ4KGemmNKernel, _matvecQ5KGemmNKernel, _matvecQ6KGemmNKernel,
             _matvecQ80GemmNKernel, _mmqQ80Kernel, _mmqQ80SoaKernel,
+            _matvecQ80Dp4aSoaKernel, _q80RepackSoaKernel,
             _rmsNormBatchedKernel, _headNormBatchedKernel, _headNormQkKernel, _headNormQkBatchedKernel,
             _splitQgBatchedKernel, _ropeNeoxPartialBatchedKernel,
             _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel, _attentionSwaBatchedKernel,
@@ -4477,6 +4536,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _f32ToF16Kernel        = GetKernelFunc("llm_f32_to_f16");
         _mmqQ80Kernel          = GetKernelFunc("llm_mmq_q8_0");
         _mmqQ80SoaKernel       = GetKernelFunc("llm_mmq_q8_0_soa");
+        _matvecQ80Dp4aSoaKernel = GetKernelFunc("llm_matvec_q8_0_dp4a_soa");
+        _q80RepackSoaKernel    = GetKernelFunc("llm_q8_0_repack_soa");
         _flashAttnPrefillKernel = GetKernelFunc("llm_flash_attn_prefill_f32");
         _mmaTestM16N8K16Kernel  = GetKernelFunc("llm_mma_test_m16n8k16_f32");
         _flashAttnPrefillTcKernel = GetKernelFunc("llm_flash_attn_prefill_tc");

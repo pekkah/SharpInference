@@ -42,21 +42,22 @@ public sealed unsafe class CudaMmqSoaTests
         return bytes;
     }
 
-    /// <summary>Repack interleaved Q8_0 [34 B/block] → SoA (quants[rows*cols], scales[rows*nb] fp16).</summary>
-    private static (byte[] quants, byte[] scaleBytes) RepackToSoA(byte[] interleaved, int rows, int cols)
+    /// <summary>Repack interleaved Q8_0 [34 B/block] → a single SoA buffer
+    /// [quants rows*cols B][scales rows*nb fp16] (matches CudaBackend's split at rows*cols).</summary>
+    private static byte[] RepackToSoA(byte[] interleaved, int rows, int cols)
     {
         int nb = cols / 32, bytesPerRow = nb * 34;
-        var quants = new byte[rows * cols];
-        var scaleBytes = new byte[rows * nb * 2];
+        var soa = new byte[rows * cols + rows * nb * 2];
+        int scaleBase = rows * cols;
         for (int r = 0; r < rows; r++)
             for (int b = 0; b < nb; b++)
             {
                 int off = r * bytesPerRow + b * 34;
                 int blk = r * nb + b;
-                scaleBytes[blk * 2] = interleaved[off]; scaleBytes[blk * 2 + 1] = interleaved[off + 1];
-                Array.Copy(interleaved, off + 2, quants, blk * 32, 32);
+                soa[scaleBase + blk * 2] = interleaved[off]; soa[scaleBase + blk * 2 + 1] = interleaved[off + 1];
+                Array.Copy(interleaved, off + 2, soa, blk * 32, 32);
             }
-        return (quants, scaleBytes);
+        return soa;
     }
 
     [Fact]
@@ -70,27 +71,26 @@ public sealed unsafe class CudaMmqSoaTests
         {
             var rng = new Random(20260606 + rows * 31 + cols * 7 + nTok);
             byte[] interleaved = BuildQ8_0Matrix(rows, cols, rng);
-            var (quants, scaleBytes) = RepackToSoA(interleaved, rows, cols);
+            byte[] soa = RepackToSoA(interleaved, rows, cols);
 
             var acts = new float[nTok * cols];
             for (int i = 0; i < acts.Length; i++) acts[i] = (float)(rng.NextDouble() * 2 - 1);
 
             var gW   = gpu.UploadRaw(interleaved, TensorShape.D1(interleaved.Length), DType.Q8_0);
-            var gQ   = gpu.UploadRaw(quants, TensorShape.D1(quants.Length), DType.Q8_0);
-            var gS   = gpu.UploadRaw(scaleBytes, TensorShape.D1(scaleBytes.Length), DType.Q8_0);
+            var gSoa = gpu.UploadRaw(soa, TensorShape.D1(soa.Length), DType.Q8_0);
             var gX   = gpu.Upload(acts, TensorShape.D1(acts.Length));
             var gYi  = gpu.Allocate(TensorShape.D1((long)nTok * rows));
             var gYs  = gpu.Allocate(TensorShape.D1((long)nTok * rows));
 
             gpu.MatMulBatchedMmq(gYi, gW, gX, nTok, DType.Q8_0);
-            gpu.MatMulBatchedMmqSoa(gYs, gQ, gS, gX, nTok);
+            gpu.MatMulBatchedMmqSoa(gYs, gSoa, gX, nTok);
             gpu.Synchronize();
 
             var yi = new float[nTok * rows];
             var ys = new float[nTok * rows];
             gpu.Download(gYi, yi);
             gpu.Download(gYs, ys);
-            gpu.Free(gW); gpu.Free(gQ); gpu.Free(gS); gpu.Free(gX); gpu.Free(gYi); gpu.Free(gYs);
+            gpu.Free(gW); gpu.Free(gSoa); gpu.Free(gX); gpu.Free(gYi); gpu.Free(gYs);
 
             int diffs = 0; float maxAbs = 0;
             for (int i = 0; i < yi.Length; i++)
@@ -123,13 +123,12 @@ public sealed unsafe class CudaMmqSoaTests
         foreach (var (rows, cols, nTok, what) in shapes)
         {
             byte[] interleaved = BuildQ8_0Matrix(rows, cols, rng);
-            var (quants, scaleBytes) = RepackToSoA(interleaved, rows, cols);
+            byte[] soa = RepackToSoA(interleaved, rows, cols);
             var acts = new float[nTok * cols];
             for (int i = 0; i < acts.Length; i++) acts[i] = (float)(rng.NextDouble() * 2 - 1);
 
             var gW = gpu.UploadRaw(interleaved, TensorShape.D1(interleaved.Length), DType.Q8_0);
-            var gQ = gpu.UploadRaw(quants, TensorShape.D1(quants.Length), DType.Q8_0);
-            var gS = gpu.UploadRaw(scaleBytes, TensorShape.D1(scaleBytes.Length), DType.Q8_0);
+            var gSoa = gpu.UploadRaw(soa, TensorShape.D1(soa.Length), DType.Q8_0);
             var gX = gpu.Upload(acts, TensorShape.D1(acts.Length));
             var gY = gpu.Allocate(TensorShape.D1((long)nTok * rows));
 
@@ -141,14 +140,14 @@ public sealed unsafe class CudaMmqSoaTests
             gpu.Synchronize(); sw.Stop();
             double msAos = sw.Elapsed.TotalMilliseconds / iters;
 
-            for (int i = 0; i < 5; i++) gpu.MatMulBatchedMmqSoa(gY, gQ, gS, gX, nTok);
+            for (int i = 0; i < 5; i++) gpu.MatMulBatchedMmqSoa(gY, gSoa, gX, nTok);
             gpu.Synchronize();
             sw.Restart();
-            for (int i = 0; i < iters; i++) gpu.MatMulBatchedMmqSoa(gY, gQ, gS, gX, nTok);
+            for (int i = 0; i < iters; i++) gpu.MatMulBatchedMmqSoa(gY, gSoa, gX, nTok);
             gpu.Synchronize(); sw.Stop();
             double msSoa = sw.Elapsed.TotalMilliseconds / iters;
 
-            gpu.Free(gW); gpu.Free(gQ); gpu.Free(gS); gpu.Free(gX); gpu.Free(gY);
+            gpu.Free(gW); gpu.Free(gSoa); gpu.Free(gX); gpu.Free(gY);
 
             double macs = (double)rows * cols * nTok;
             double topsAos = 2.0 * macs / (msAos * 1e-3) / 1e12;

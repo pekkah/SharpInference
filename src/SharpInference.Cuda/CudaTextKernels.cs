@@ -1385,6 +1385,84 @@ extern ""C"" __global__ void llm_matvec_q8_0_dp4a(
     }
 }
 
+// SoA-layout dp4a decode matvec (issue #149). Same as llm_matvec_q8_0_dp4a but the
+// Q8_0 weight is in the SoA buffer [quants rows*cols B][scales rows*nb fp16], so the
+// quant words are plain aligned loads (no funnelshift) and the scale is one aligned
+// fp16 read. Bit-identical to the AoS dp4a. ws locates the scale region at byte rows*cols.
+extern ""C"" __global__ void llm_matvec_q8_0_dp4a_soa(
+    const unsigned int* __restrict__ weights,    // SoA: [quants][scales]
+    const unsigned char* __restrict__ y_q81,
+    float* __restrict__ output,
+    int rows, int cols)
+{
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    int warp_id = (int)threadIdx.y;
+    int lane    = (int)threadIdx.x;
+    int grp     = lane >> 3;
+    int sub     = lane & 7;
+
+    int num_blocks = cols >> 5;
+    long qrow = (long)row * (cols >> 2);            // uint index of this row's quants
+    const unsigned short* ws = (const unsigned short*)((const char*)weights + (long)rows * cols);
+    long srow = (long)row * num_blocks;             // ushort index of this row's scales
+
+    float acc = 0.f;
+    for (int block0 = warp_id * 4; block0 < num_blocks; block0 += MATVEC_Q80_NWARPS * 4) {
+        int block = block0 + grp;
+        float part = 0.f;
+        if (block < num_blocks) {
+            float dw = sharpi_fp16_to_fp32(ws[srow + block]);
+            int wq = (int)weights[qrow + (long)block * 8 + sub];   // aligned, no funnelshift
+
+            long ab = (long)block * 36L;
+            unsigned int d_bits = (*reinterpret_cast<const unsigned int*>(y_q81 + ab)) & 0xffffu;
+            float da = sharpi_fp16_to_fp32(d_bits);
+            int aq = *reinterpret_cast<const int*>(y_q81 + ab + 4 + (long)sub * 4);
+
+            int dot = __dp4a(wq, aq, 0);
+            part = dw * da * (float)dot;
+        }
+        part += __shfl_xor_sync(0xffffffffu, part, 4);
+        part += __shfl_xor_sync(0xffffffffu, part, 2);
+        part += __shfl_xor_sync(0xffffffffu, part, 1);
+        if (sub == 0) acc += part;
+    }
+
+    __shared__ float warp_acc[MATVEC_Q80_NWARPS][4];
+    if (sub == 0) warp_acc[warp_id][grp] = acc;
+    __syncthreads();
+    if (warp_id == 0 && lane == 0) {
+        float s = 0.f;
+        #pragma unroll
+        for (int w = 0; w < MATVEC_Q80_NWARPS; w++)
+            for (int g = 0; g < 4; g++) s += warp_acc[w][g];
+        output[row] = s;
+    }
+}
+
+// One-time repack of an interleaved Q8_0 weight [rows × nb × 34 B] into the SoA
+// buffer [quants rows*cols B][scales rows*nb fp16] (issue #149). One thread per
+// 32-int8 block: copies the 2-byte fp16 scale to the scale region and the 32 quants
+// to the (16-byte-aligned) quant region. Runs once at weight upload.
+extern ""C"" __global__ void llm_q8_0_repack_soa(
+    const unsigned char* __restrict__ src,   // interleaved, 34 B/block
+    unsigned char* __restrict__ dst,         // SoA [quants][scales]
+    int rows, int cols)
+{
+    long blk = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    int nb = cols >> 5;
+    long total = (long)rows * nb;
+    if (blk >= total) return;
+    long srcOff = blk * 34L;
+    long qDst = blk * 32L;                       // quants region
+    long sDst = (long)rows * cols + blk * 2L;    // scales region
+    dst[sDst]     = src[srcOff];
+    dst[sDst + 1] = src[srcOff + 1];
+    #pragma unroll
+    for (int i = 0; i < 32; i++) dst[qDst + i] = src[srcOff + 2 + i];
+}
+
 // ── Q8_0 × Q8_1 int8 tensor-core MMQ (issue #141 prefill) ──────────────────
 // Replaces the dequant→fp16→cuBLAS GEMM round-trip with a direct int8 tensor-core
 // multiply: each Q8_0 weight is read once as int8 (no fp16 weight temp written to
@@ -1542,12 +1620,17 @@ extern ""C"" __global__ void llm_mmq_q8_0(
 #define MMQ_BM 64
 #define MMQ_BN 128
 extern ""C"" __global__ void llm_mmq_q8_0_soa(
-    const unsigned int*   __restrict__ qw,       // quants, 8 uint/block, [(row*nb+kb)*8 + j]
-    const unsigned short* __restrict__ ws,       // fp16 block scales, [row*nb + kb]
-    const unsigned char*  __restrict__ y_q81,    // Q8_1 [n_tok × cols], 36 B/block
+    const unsigned int*  __restrict__ weights,   // SoA buffer: [quants rows*cols B][scales rows*nb fp16]
+    const unsigned char* __restrict__ y_q81,     // Q8_1 [n_tok × cols], 36 B/block
     float* __restrict__ output,                  // [n_tok × rows] fp32
     int rows, int cols, int n_tok)
 {
+    // Single SoA buffer; split into the quant and scale views (host stores both
+    // contiguous so the kernel signature matches llm_mmq_q8_0 — the dispatch just
+    // swaps the kernel function pointer based on whether the weight was repacked).
+    const unsigned int*   qw = weights;
+    const unsigned short* ws = (const unsigned short*)((const char*)weights + (long)rows * cols);
+
     __shared__ int   sW[MMQ_BM * 8];
     __shared__ float sWd[MMQ_BM];
     __shared__ int   sY[MMQ_BN * 8];
