@@ -215,6 +215,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // full_seq / swa_batched kernels' O(n²) global K/V re-reads.
     private nint   _flashAttnPrefillKernel;
 
+    // Issue #146: single-warp mma.sync m16n8k16 fragment-layout validation harness
+    // (de-risks the TC flash-attention fragment packing). Test-only.
+    private nint   _mmaTestM16N8K16Kernel;
+
     // Grow-only global score scratch for the wave-based >4096 batched-query SDPA
     // (issue #118). Sized W × num_heads × score_stride floats; W is chosen so this
     // stays under a bounded budget. Freed in Dispose.
@@ -2948,6 +2952,28 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>
+    /// Issue #146 (test-only): one tensor-core <c>mma.sync.m16n8k16.f32.f16.f16.f32</c>
+    /// computing <paramref name="cOut"/>[16×8] = <paramref name="aIn"/>[16×16] ·
+    /// <paramref name="bIn"/>[16×8] on a single warp. Validates the A/B/C fragment
+    /// layouts used by the TC flash kernel; inputs are fp32 (rounded to fp16 inside),
+    /// so the result tracks an fp32 reference to fp16 tolerance, not bit-exactly.
+    /// <paramref name="aIn"/> is row-major [16*16], <paramref name="bIn"/> is K-major
+    /// [16*8] (bIn[k*8+n] = B[k][n]), <paramref name="cOut"/> is row-major [16*8].
+    /// </summary>
+    public void MmaTestM16N8K16(Tensor aIn, Tensor bIn, Tensor cOut)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint aP = GetDevPtr(aIn), bP = GetDevPtr(bIn), cP = GetDevPtr(cOut);
+        nint* args = stackalloc nint[3] { (nint)(&aP), (nint)(&bP), (nint)(&cP) };
+        int r = NvrtcInterop.LaunchKernel(_mmaTestM16N8K16Kernel, 1, 1, 1,
+                                          32, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(mma_test_m16n8k16) failed: {r}");
+    }
+
+    /// <summary>
     /// Bf16-store variant of <see cref="KvAppend"/>. Inputs stay fp32; the K/V
     /// cache tensors must be <see cref="DType.BFloat16"/>-allocated (half the
     /// element count of an fp32 cache). See issue #27.
@@ -4233,7 +4259,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _kvAppendBatchedKernel, _kvAppendBatchedBf16Kernel,
             _fullSeqAttentionKernel, _fullSeqAttentionBf16Kernel,
             _fullSeqAttentionGlobalKernel, _fullSeqAttentionGlobalBf16Kernel,
-            _flashAttnPrefillKernel,
+            _flashAttnPrefillKernel, _mmaTestM16N8K16Kernel,
         ];
         foreach (nint k in kernels)
         {
@@ -4299,6 +4325,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _f32ToF16Kernel        = GetKernelFunc("llm_f32_to_f16");
         _mmqQ80Kernel          = GetKernelFunc("llm_mmq_q8_0");
         _flashAttnPrefillKernel = GetKernelFunc("llm_flash_attn_prefill_f32");
+        _mmaTestM16N8K16Kernel  = GetKernelFunc("llm_mma_test_m16n8k16_f32");
         _rmsNormBatchedKernel  = GetKernelFunc("llm_rmsnorm_batched");
         _headNormBatchedKernel = GetKernelFunc("llm_head_norm_batched");
         _headNormQkKernel        = GetKernelFunc("llm_head_norm_qk");

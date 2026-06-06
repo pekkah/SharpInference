@@ -3052,6 +3052,48 @@ extern ""C"" __global__ void llm_attention_swa(
     }
 }
 
+// ── mma.sync m16n8k16 fragment-layout validation (issue #146) ──────────────
+// Single-warp test harness for the int8/fp16 tensor-core building block used by
+// the TC flash-attention prefill. One block / 32 threads computes C[16x8] =
+// A[16x16] · B[16x8] on the tensor cores (fp16 multiplicands, fp32 accumulate)
+// and writes C back in (row,col) order so a host unit test can compare against a
+// CPU fp32 matmul. Validating the A/B/C fragment→lane→register maps in isolation
+// (PTX ISA m16n8k16 .f16/.f32 tables) de-risks the full kernel — a wrong mapping
+// silently produces garbage. a_in is row-major [16*16], b_in is row-major K-major
+// [16*8] (b_in[k*8+n] = B[k][n]), c_out is row-major [16*8].
+extern ""C"" __global__ void llm_mma_test_m16n8k16_f32(
+    const float* __restrict__ a_in,   // [16*16] row-major A
+    const float* __restrict__ b_in,   // [16*8]  K-major  B (b_in[k*8+n])
+    float* __restrict__ c_out)        // [16*8]  row-major C = A·B
+{
+    int lane = (int)(threadIdx.x & 31);
+    int gid  = lane >> 2;     // groupID 0..7
+    int tig  = lane & 3;      // threadID_in_group 0..3
+
+    // A fragment (16x16 fp16, row-major): 4 regs, each a column-pair {2c,2c+1}.
+    unsigned int a0 = sharpi_f32x2_to_f16x2(a_in[(gid    ) * 16 + (2 * tig    )], a_in[(gid    ) * 16 + (2 * tig + 1)]);
+    unsigned int a1 = sharpi_f32x2_to_f16x2(a_in[(gid + 8) * 16 + (2 * tig    )], a_in[(gid + 8) * 16 + (2 * tig + 1)]);
+    unsigned int a2 = sharpi_f32x2_to_f16x2(a_in[(gid    ) * 16 + (2 * tig + 8)], a_in[(gid    ) * 16 + (2 * tig + 9)]);
+    unsigned int a3 = sharpi_f32x2_to_f16x2(a_in[(gid + 8) * 16 + (2 * tig + 8)], a_in[(gid + 8) * 16 + (2 * tig + 9)]);
+
+    // B fragment (16x8 fp16, col-major): 2 regs, each a K-row-pair of column `gid`.
+    unsigned int b0 = sharpi_f32x2_to_f16x2(b_in[(2 * tig    ) * 8 + gid], b_in[(2 * tig + 1) * 8 + gid]);
+    unsigned int b1 = sharpi_f32x2_to_f16x2(b_in[(2 * tig + 8) * 8 + gid], b_in[(2 * tig + 9) * 8 + gid]);
+
+    float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+    asm volatile(
+        ""mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 ""
+        ""{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};""
+        : ""+f""(c0), ""+f""(c1), ""+f""(c2), ""+f""(c3)
+        : ""r""(a0), ""r""(a1), ""r""(a2), ""r""(a3), ""r""(b0), ""r""(b1));
+
+    // C fragment (16x8 fp32): c0=(gid,2tig) c1=(gid,2tig+1) c2=(gid+8,2tig) c3=(gid+8,2tig+1).
+    c_out[(gid    ) * 8 + (2 * tig    )] = c0;
+    c_out[(gid    ) * 8 + (2 * tig + 1)] = c1;
+    c_out[(gid + 8) * 8 + (2 * tig    )] = c2;
+    c_out[(gid + 8) * 8 + (2 * tig + 1)] = c3;
+}
+
 // ── Flash-attention prefill (issue #141 attention) ─────────────────────────
 // Memory-efficient batched SDPA replacing the scalar llm_full_seq_attention /
 // llm_attention_swa_batched (one 256-thread block PER query, each re-reading its
