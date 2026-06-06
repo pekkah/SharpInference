@@ -28,7 +28,7 @@ coherent (`scripts/bench-all.ps1`); top-1 parity vs llama.cpp b8585 verified on 
 | Qwen3 8B | (same) | 5 GB | CPU `--tq` | 9.5 | **11.9** | 3-bit KV → 40 960 ctx; FastScan K+V (#34) keeps long-ctx decode ~flat (10.2 @ 3K, 9.4 @ 6K) |
 | Qwen3 8B | (same) | 5 GB | Vulkan `-g -1` | 45.4 | 45.8 | 11.4K auto-ctx |
 | Qwen3 8B | (same) | 5 GB | Vulkan `-g -1 --tq` | 40.7 | 45.5 | 3-bit KV → 40 960 ctx |
-| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1` | **61.7** | **58.6** | ~2.8× Vulkan prefill |
+| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1` | **119.8** | **58.6** | ~2.8× Vulkan prefill. Batched-trunk prefill (#156) 61.2 → 119.8 t/s (1.96×) — generalizes the Gemma 4 all-GPU batched prefill + flash attention to dense Q4_K; argmax-stable, `SHARPI_BATCHED_PREFILL=0` to bisect |
 | Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --no-thinking` | **61.8** | **58.2** | reasoning suppressed in template |
 | Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq` | **57.4** | **58.4** | 3-bit KV → 40 960 ctx; 17 t/s @ 8K, 10 @ 16K |
 | Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq --no-thinking` | **57.5** | **58.1** | as `--tq`, reasoning suppressed |
