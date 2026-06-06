@@ -198,6 +198,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// Default on (<c>SHARPI_PREFILL_FLASH</c>=0 reverts to the scalar kernels).
     /// </summary>
     public bool PrefillFlashAttnEnabled { get; set; }
+
+    /// <summary>
+    /// Issue #146: use the tensor-core flash-attention prefill (QK^T + P·V on the mma
+    /// cores) instead of the half2 <see cref="PrefillFlashAttnEnabled"/> kernel. Takes
+    /// precedence within the flash path. Requires head_dim % 16 == 0 (Gemma 4: 256/512).
+    /// Default off (<c>SHARPI_PREFILL_FLASH_TC</c>=1 to enable) until benched ≥ the half2
+    /// kernel. Argmax-stable, not bit-exact (fp16 Q/K/V/P + online softmax).
+    /// </summary>
+    public bool PrefillFlashTcEnabled { get; set; }
     private int _bpCapacity;                 // current N the scratch is sized for (0 = none)
     private Tensor? _bpHidden, _bpResidual, _bpNorm;       // [N × embDim]
     private Tensor? _bpQ, _bpAttnOut;                      // [N × numHeads*maxHeadDim]
@@ -307,6 +316,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // ~1389→~2180 t/s. SHARPI_PREFILL_FLASH=0 reverts to the scalar kernels.
         PrefillFlashAttnEnabled =
             Environment.GetEnvironmentVariable("SHARPI_PREFILL_FLASH") != "0";
+        // Issue #146: tensor-core flash prefill, opt-in until benched ≥ the half2 kernel.
+        PrefillFlashTcEnabled =
+            Environment.GetEnvironmentVariable("SHARPI_PREFILL_FLASH_TC") == "1"
+            && (_headDim & 15) == 0;
         _maxHeadDim = _headDim;
         if (hp.LayerHeadDim is { } lhdMax)
             for (int i = 0; i < hp.NumLayers; i++)
@@ -1991,7 +2004,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         if (s_prefillProfile) { _gpu.Synchronize(); _profSw.Restart(); }
         // Gemma 4: attention_scale = 1.0, passed explicitly (kernel skips its rsqrtf).
-        if (PrefillFlashAttnEnabled)
+        if (PrefillFlashTcEnabled && (layerHd & 15) == 0)
+            _gpu.FlashAttentionPrefillTc(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
+                _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: 1f);
+        else if (PrefillFlashAttnEnabled)
             _gpu.FlashAttentionPrefill(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
                 _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: 1f);
         else if (isSwa)

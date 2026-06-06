@@ -219,6 +219,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // (de-risks the TC flash-attention fragment packing). Test-only.
     private nint   _mmaTestM16N8K16Kernel;
 
+    // Issue #146: tensor-core flash-attention prefill (QK^T + P·V on the mma cores,
+    // shared-memory O). The compute-bound successor to the half2 flash kernel.
+    private nint   _flashAttnPrefillTcKernel;
+
     // Grow-only global score scratch for the wave-based >4096 batched-query SDPA
     // (issue #118). Sized W × num_heads × score_stride floats; W is chosen so this
     // stays under a bounded budget. Freed in Dispose.
@@ -2974,6 +2978,45 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>
+    /// Issue #146: tensor-core flash-attention prefill. Drop-in for
+    /// <see cref="FlashAttentionPrefill"/> — same args/semantics — but runs both
+    /// QK^T and P·V on the mma cores (one warp per 16-query tile, online softmax,
+    /// O accumulated in shared fp32). Requires <paramref name="headDim"/> % 16 == 0
+    /// and ≤ 512 (shared = 16·headDim·6 B = 48 KB at d=512). Matches the scalar
+    /// kernels to fp tolerance (fp16 Q/K/V/P + online softmax), not bit-exact.
+    /// </summary>
+    public void FlashAttentionPrefillTc(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
+        int numHeads, int numKvHeads, int headDim,
+        int startPos, int windowSize, int maxSeqLen, int nTok, float attnScale = -1f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (nTok <= 0)
+            throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be > 0.");
+        if (headDim > 512 || (headDim & 15) != 0)
+            throw new NotSupportedException(
+                $"FlashAttentionPrefillTc requires head_dim ≤ 512 and a multiple of 16; got {headDim}.");
+
+        uint sharedBytes = (uint)(16 * headDim * 6);   // O fp32 (×4) + K/V fp16 (×2)
+
+        nint qP = GetDevPtr(qAll), kP = GetDevPtr(kCache), vP = GetDevPtr(vCache), oP = GetDevPtr(outAll);
+        int pNH = numHeads, pNKV = numKvHeads, pHD = headDim;
+        int pSP = startPos, pWS = windowSize, pMSL = maxSeqLen, pN = nTok;
+        float pScale = attnScale;
+        nint* args = stackalloc nint[12]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pSP), (nint)(&pWS), (nint)(&pMSL), (nint)(&pN), (nint)(&pScale)
+        };
+        uint gy = (uint)((nTok + 15) / 16);
+        int r = NvrtcInterop.LaunchKernel(_flashAttnPrefillTcKernel, (uint)numHeads, gy, 1,
+                                          32, 1, 1, sharedBytes, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(flash_attn_prefill_tc) failed: {r}");
+    }
+
+    /// <summary>
     /// Bf16-store variant of <see cref="KvAppend"/>. Inputs stay fp32; the K/V
     /// cache tensors must be <see cref="DType.BFloat16"/>-allocated (half the
     /// element count of an fp32 cache). See issue #27.
@@ -4259,7 +4302,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _kvAppendBatchedKernel, _kvAppendBatchedBf16Kernel,
             _fullSeqAttentionKernel, _fullSeqAttentionBf16Kernel,
             _fullSeqAttentionGlobalKernel, _fullSeqAttentionGlobalBf16Kernel,
-            _flashAttnPrefillKernel, _mmaTestM16N8K16Kernel,
+            _flashAttnPrefillKernel, _mmaTestM16N8K16Kernel, _flashAttnPrefillTcKernel,
         ];
         foreach (nint k in kernels)
         {
@@ -4326,6 +4369,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _mmqQ80Kernel          = GetKernelFunc("llm_mmq_q8_0");
         _flashAttnPrefillKernel = GetKernelFunc("llm_flash_attn_prefill_f32");
         _mmaTestM16N8K16Kernel  = GetKernelFunc("llm_mma_test_m16n8k16_f32");
+        _flashAttnPrefillTcKernel = GetKernelFunc("llm_flash_attn_prefill_tc");
         _rmsNormBatchedKernel  = GetKernelFunc("llm_rmsnorm_batched");
         _headNormBatchedKernel = GetKernelFunc("llm_head_norm_batched");
         _headNormQkKernel        = GetKernelFunc("llm_head_norm_qk");

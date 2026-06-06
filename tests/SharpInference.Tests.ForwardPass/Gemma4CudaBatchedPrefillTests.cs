@@ -169,6 +169,54 @@ public sealed class Gemma4CudaBatchedPrefillTests
     }
 
     [Fact]
+    public void Gemma4_E4B_BatchedPrefill_FlashTcMatchesSequential()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.NotNull(hp.LayerHeadDim);
+        Assert.True(hp.HasPerLayerTokenEmbd);
+
+        var tokens = new int[] { 2, 651, 6037, 576, 6081, 603, 1234, 4567, 8901, 222, 333, 444 };
+
+        using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 512);
+
+        // Tensor-core flash-attention prefill (#146). Like the half2 flash it is
+        // argmax-stable (online softmax + fp16 Q/K/V/P), not bit-exact. End-to-end
+        // full-model check on top of the per-kernel CudaFlashAttnTcTests parity, over
+        // the real per-layer head_dim mix (256 SWA / 512 global) and KV-share tail.
+        fwd.BatchedPrefillEnabled = true;
+        fwd.PrefillFlashTcEnabled = true;
+        var batched = fwd.Prefill(tokens).ToArray();
+        Assert.True(fwd.LastPrefillWasBatched);
+
+        fwd.ResetCache();
+        fwd.BatchedPrefillEnabled = false;
+        var sequential = fwd.Prefill(tokens).ToArray();
+        Assert.False(fwd.LastPrefillWasBatched);
+
+        Assert.Equal(sequential.Length, batched.Length);
+        Assert.Equal(Argmax(sequential), Argmax(batched));
+
+        float maxAbs = 0f;
+        for (int i = 0; i < sequential.Length; i++)
+            maxAbs = MathF.Max(maxAbs, MathF.Abs(sequential[i] - batched[i]));
+        Assert.True(maxAbs < 1.0f,
+            $"TC flash prefill vs sequential logits diverged beyond fp tolerance: maxAbs={maxAbs}.");
+
+        var seqTop5 = TopKSet(sequential, 5);
+        var batTop5 = TopKSet(batched, 5);
+        int ov = 0;
+        foreach (var t in batTop5) if (seqTop5.Contains(t)) ov++;
+        Assert.True(ov >= 4,
+            $"TC flash prefill top-5 overlaps the fp32 reference in only {ov}/5 slots.");
+    }
+
+    [Fact]
     public void Gemma4_E4B_BatchedPrefill_FlashAttnMatchesSequential()
     {
         using var gpu = TryCreate();

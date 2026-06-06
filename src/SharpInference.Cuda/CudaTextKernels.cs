@@ -3094,6 +3094,215 @@ extern ""C"" __global__ void llm_mma_test_m16n8k16_f32(
     c_out[(gid + 8) * 8 + (2 * tig + 1)] = c3;
 }
 
+// ── Tensor-core flash-attention prefill (issue #146) ───────────────────────
+// Full TC version of llm_flash_attn_prefill_f32: both QK^T and P·V run on the
+// tensor cores (mma.sync m16n8k16, fp16 multiplicands / fp32 accumulate). One
+// warp owns a 16-query tile and streams the keys in 16-key tiles with an online
+// softmax. The elegant part: the QK^T score C-fragment is reused *directly* as
+// the P·V A-fragment — the key index is QK^T's N-column AND P·V's contraction
+// dim, and the m16n8k16 C and A fragment layouts coincide on (row, 2·tig), so no
+// transpose / shared round-trip is needed for P. O[16×head_dim] is too large for
+// registers (head_dim/8 × 4 = 256 regs/lane at d=512), so it lives in shared fp32
+// and is rescaled in place per key-tile. K and V time-share one 16×head_dim fp16
+// shared buffer (K is fully consumed by QK^T before V is staged for P·V), so the
+// whole kernel fits 16·head_dim·(4+2) = 48 KB at d=512. Requires head_dim%16==0.
+// Matches the scalar kernels to fp tolerance (online softmax + fp16 Q/K/V/P), not
+// bit-exact. GQA, causal, optional sliding window, per-layer head_dim.
+__device__ __forceinline__ float fatc_mask(float s, int qpos, int abs_k, int window_size)
+{
+    bool ok = (abs_k <= qpos) && (window_size <= 0 || abs_k >= qpos + 1 - window_size);
+    return ok ? s : sharpi_neg_inf();
+}
+#define FATC_KT 16
+extern ""C"" __global__ void llm_flash_attn_prefill_tc(
+    const float* __restrict__ q_all,      // [n_tok, num_heads*head_dim]
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ out_all,          // [n_tok, num_heads*head_dim]
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int window_size, int max_seq_len, int n_tok, float attn_scale)
+{
+    extern __shared__ unsigned int fatc_smem[];
+    float*          sO  = (float*)fatc_smem;                       // [16 * head_dim] fp32
+    unsigned short* sKV = (unsigned short*)(sO + 16 * head_dim);   // [16 * head_dim] fp16
+
+    int lane = (int)(threadIdx.x & 31);
+    int gid  = lane >> 2;     // 0..7  (query-row base; also the N-col 0..7)
+    int tig  = lane & 3;      // 0..3
+    int h    = (int)blockIdx.x;
+    int qtile0 = (int)blockIdx.y * 16;
+
+    int kv_head = h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    int q_dim   = num_heads * head_dim;
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
+    int nchunk  = head_dim >> 4;   // d / 16  (QK^T contract chunks)
+    int ndtile  = head_dim >> 3;   // d / 8   (P·V head-dim N-tiles)
+
+    int q0 = qtile0 + gid;          // this lane's two query rows
+    int q1 = qtile0 + gid + 8;
+    int qpos0 = start_pos + q0;
+    int qpos1 = start_pos + q1;
+
+    for (int idx = lane; idx < 16 * head_dim; idx += 32) sO[idx] = 0.f;
+
+    float m0 = sharpi_neg_inf(), l0 = 0.f;   // running max/sum, query row gid
+    float m1 = sharpi_neg_inf(), l1 = 0.f;   // query row gid+8
+
+    // Union key range over the 16 queries in this tile (causal + optional window).
+    int last_q = qtile0 + 15; if (last_q > n_tok - 1) last_q = n_tok - 1;
+    int key_end = start_pos + last_q + 1;
+    int first_qpos = start_pos + qtile0;
+    int key_start = (window_size > 0) ? (first_qpos + 1 - window_size) : 0;
+    if (key_start < 0) key_start = 0;
+    key_start = (key_start / FATC_KT) * FATC_KT;   // align down to a key tile
+    __syncthreads();
+
+    for (int kt0 = key_start; kt0 < key_end; kt0 += FATC_KT) {
+        // Stage K-tile [16 keys × head_dim] → sKV (fp16). Out-of-range keys load 0
+        // (later masked to -inf by the causal bound).
+        for (int idx = lane; idx < FATC_KT * head_dim; idx += 32) {
+            int kk = idx / head_dim, d = idx - kk * head_dim;
+            int abs_k = kt0 + kk;
+            float kv = (abs_k < key_end)
+                ? k_cache[(long)abs_k * kv_dim + (long)kv_head * head_dim + d] : 0.f;
+            sKV[idx] = (unsigned short)sharpi_fp32_to_fp16(kv);
+        }
+        __syncthreads();
+
+        // ── QK^T → S[16q × 16k], two N=8 key sub-tiles (nt0: keys 0-7, nt1: 8-15) ──
+        float s0[4] = {0.f,0.f,0.f,0.f};   // nt0 C-frag c0..c3
+        float s1[4] = {0.f,0.f,0.f,0.f};   // nt1 C-frag
+        for (int dc = 0; dc < nchunk; dc++) {
+            int d0 = dc * 16;
+            long qb = (long)h * head_dim + d0;
+            // A = Q frag: rows {gid→q0, gid+8→q1}, cols {2tig,2tig+1,2tig+8,2tig+9}.
+            float qa0l = (q0 < n_tok) ? q_all[(long)q0 * q_dim + qb + 2*tig    ] : 0.f;
+            float qa0h = (q0 < n_tok) ? q_all[(long)q0 * q_dim + qb + 2*tig + 1] : 0.f;
+            float qa1l = (q1 < n_tok) ? q_all[(long)q1 * q_dim + qb + 2*tig    ] : 0.f;
+            float qa1h = (q1 < n_tok) ? q_all[(long)q1 * q_dim + qb + 2*tig + 1] : 0.f;
+            float qa2l = (q0 < n_tok) ? q_all[(long)q0 * q_dim + qb + 2*tig + 8] : 0.f;
+            float qa2h = (q0 < n_tok) ? q_all[(long)q0 * q_dim + qb + 2*tig + 9] : 0.f;
+            float qa3l = (q1 < n_tok) ? q_all[(long)q1 * q_dim + qb + 2*tig + 8] : 0.f;
+            float qa3h = (q1 < n_tok) ? q_all[(long)q1 * q_dim + qb + 2*tig + 9] : 0.f;
+            unsigned int a0 = sharpi_f32x2_to_f16x2(qa0l, qa0h);
+            unsigned int a1 = sharpi_f32x2_to_f16x2(qa1l, qa1h);
+            unsigned int a2 = sharpi_f32x2_to_f16x2(qa2l, qa2h);
+            unsigned int a3 = sharpi_f32x2_to_f16x2(qa3l, qa3h);
+            // B = K frag (col-major; col = key within sub-tile, rows = contract d).
+            #pragma unroll
+            for (int nt = 0; nt < 2; nt++) {
+                int kbase = (nt * 8 + gid) * head_dim + d0;   // key (nt*8+gid)
+                unsigned int b0 = ((unsigned int)sKV[kbase + 2*tig + 1] << 16) | (unsigned int)sKV[kbase + 2*tig    ];
+                unsigned int b1 = ((unsigned int)sKV[kbase + 2*tig + 9] << 16) | (unsigned int)sKV[kbase + 2*tig + 8];
+                float* s = nt ? s1 : s0;
+                asm volatile(
+                    ""mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 ""
+                    ""{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};""
+                    : ""+f""(s[0]), ""+f""(s[1]), ""+f""(s[2]), ""+f""(s[3])
+                    : ""r""(a0), ""r""(a1), ""r""(a2), ""r""(a3), ""r""(b0), ""r""(b1));
+            }
+        }
+
+        // Scale + causal/window mask. C-frag: s0[c0]=S[q0,kt0+2tig], s0[c1]=S[q0,kt0+2tig+1],
+        // s0[c2]=S[q1,kt0+2tig], s0[c3]=S[q1,kt0+2tig+1]; s1 keys shifted by +8.
+        s0[0] = fatc_mask(s0[0]*scale, qpos0, kt0 + 2*tig,     window_size);
+        s0[1] = fatc_mask(s0[1]*scale, qpos0, kt0 + 2*tig + 1, window_size);
+        s0[2] = fatc_mask(s0[2]*scale, qpos1, kt0 + 2*tig,     window_size);
+        s0[3] = fatc_mask(s0[3]*scale, qpos1, kt0 + 2*tig + 1, window_size);
+        s1[0] = fatc_mask(s1[0]*scale, qpos0, kt0 + 2*tig + 8, window_size);
+        s1[1] = fatc_mask(s1[1]*scale, qpos0, kt0 + 2*tig + 9, window_size);
+        s1[2] = fatc_mask(s1[2]*scale, qpos1, kt0 + 2*tig + 8, window_size);
+        s1[3] = fatc_mask(s1[3]*scale, qpos1, kt0 + 2*tig + 9, window_size);
+
+        // Online softmax, per query row. Row gid uses {s0[0],s0[1],s1[0],s1[1]} (this
+        // lane's 4 keys) reduced across the 4 lanes of the group (tig). Row gid+8 uses
+        // {s0[2],s0[3],s1[2],s1[3]}.
+        float tmax0 = fmaxf(fmaxf(s0[0], s0[1]), fmaxf(s1[0], s1[1]));
+        float tmax1 = fmaxf(fmaxf(s0[2], s0[3]), fmaxf(s1[2], s1[3]));
+        tmax0 = fmaxf(tmax0, __shfl_xor_sync(0xffffffffu, tmax0, 1));
+        tmax0 = fmaxf(tmax0, __shfl_xor_sync(0xffffffffu, tmax0, 2));
+        tmax1 = fmaxf(tmax1, __shfl_xor_sync(0xffffffffu, tmax1, 1));
+        tmax1 = fmaxf(tmax1, __shfl_xor_sync(0xffffffffu, tmax1, 2));
+        float mnew0 = fmaxf(m0, tmax0);
+        float mnew1 = fmaxf(m1, tmax1);
+        // A query row whose every key in this tile is masked (sliding window: a later
+        // query's early tiles fall entirely outside its window) keeps tmax = -inf; if
+        // no valid key has been seen yet mnew is also -inf, so exp(m-mnew)=exp(-inf+inf)
+        // is NaN. Guard: when mnew is -inf, skip the update (alpha=1 leaves O=0 intact,
+        // probabilities are 0). Once any valid key exists, mnew is finite and a masked
+        // score (-inf) safely yields exp(-inf - finite) = 0.
+        bool ok0 = mnew0 > sharpi_neg_inf();
+        bool ok1 = mnew1 > sharpi_neg_inf();
+        float alpha0 = ok0 ? __expf(m0 - mnew0) : 1.f;
+        float alpha1 = ok1 ? __expf(m1 - mnew1) : 1.f;
+        // Probabilities (unnormalized). Masked (-inf) or no-valid-key → 0.
+        float p0[4], p1[4];
+        p0[0] = ok0 ? __expf(s0[0] - mnew0) : 0.f; p0[1] = ok0 ? __expf(s0[1] - mnew0) : 0.f;
+        p0[2] = ok1 ? __expf(s0[2] - mnew1) : 0.f; p0[3] = ok1 ? __expf(s0[3] - mnew1) : 0.f;
+        p1[0] = ok0 ? __expf(s1[0] - mnew0) : 0.f; p1[1] = ok0 ? __expf(s1[1] - mnew0) : 0.f;
+        p1[2] = ok1 ? __expf(s1[2] - mnew1) : 0.f; p1[3] = ok1 ? __expf(s1[3] - mnew1) : 0.f;
+        float lt0 = p0[0] + p0[1] + p1[0] + p1[1];
+        float lt1 = p0[2] + p0[3] + p1[2] + p1[3];
+        lt0 += __shfl_xor_sync(0xffffffffu, lt0, 1); lt0 += __shfl_xor_sync(0xffffffffu, lt0, 2);
+        lt1 += __shfl_xor_sync(0xffffffffu, lt1, 1); lt1 += __shfl_xor_sync(0xffffffffu, lt1, 2);
+        l0 = l0 * alpha0 + lt0;
+        l1 = l1 * alpha1 + lt1;
+        m0 = mnew0; m1 = mnew1;
+
+        // P A-fragment (fp16), reusing the score layout directly (no transpose):
+        // a0=(gid; keys 2tig,2tig+1) a1=(gid+8; …) a2=(gid; keys 8+2tig,…) a3=(gid+8; …).
+        unsigned int pa0 = sharpi_f32x2_to_f16x2(p0[0], p0[1]);
+        unsigned int pa1 = sharpi_f32x2_to_f16x2(p0[2], p0[3]);
+        unsigned int pa2 = sharpi_f32x2_to_f16x2(p1[0], p1[1]);
+        unsigned int pa3 = sharpi_f32x2_to_f16x2(p1[2], p1[3]);
+
+        // Stage V over the (now-consumed) K buffer.
+        __syncthreads();
+        for (int idx = lane; idx < FATC_KT * head_dim; idx += 32) {
+            int kk = idx / head_dim, d = idx - kk * head_dim;
+            int abs_k = kt0 + kk;
+            float vv = (abs_k < key_end)
+                ? v_cache[(long)abs_k * kv_dim + (long)kv_head * head_dim + d] : 0.f;
+            sKV[idx] = (unsigned short)sharpi_fp32_to_fp16(vv);
+        }
+        __syncthreads();
+
+        // ── P·V → O[16q × head_dim], rescaling shared O in place per N=8 d-tile ──
+        for (int dt = 0; dt < ndtile; dt++) {
+            int dbase = dt * 8 + gid;   // V col = head-dim index dt*8+gid
+            unsigned int b0 = ((unsigned int)sKV[(2*tig + 1) * head_dim + dbase] << 16) | (unsigned int)sKV[(2*tig    ) * head_dim + dbase];
+            unsigned int b1 = ((unsigned int)sKV[(2*tig + 9) * head_dim + dbase] << 16) | (unsigned int)sKV[(2*tig + 8) * head_dim + dbase];
+            float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+            asm volatile(
+                ""mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 ""
+                ""{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};""
+                : ""+f""(o0), ""+f""(o1), ""+f""(o2), ""+f""(o3)
+                : ""r""(pa0), ""r""(pa1), ""r""(pa2), ""r""(pa3), ""r""(b0), ""r""(b1));
+            // o0=O[gid][dt*8+2tig] o1=O[gid][dt*8+2tig+1] o2=O[gid+8][…] o3=O[gid+8][…+1].
+            int c0 = gid * head_dim + dt*8 + 2*tig;
+            int c1 = c0 + 1;
+            int c2 = (gid + 8) * head_dim + dt*8 + 2*tig;
+            int c3 = c2 + 1;
+            sO[c0] = sO[c0] * alpha0 + o0;
+            sO[c1] = sO[c1] * alpha0 + o1;
+            sO[c2] = sO[c2] * alpha1 + o2;
+            sO[c3] = sO[c3] * alpha1 + o3;
+        }
+        __syncthreads();
+    }
+
+    // Normalize and write out. The 4 lanes of a group share (gid, l0, l1) so they
+    // cooperatively stride the head dim by 4 (tig).
+    float inv0 = (l0 > 0.f) ? (1.f / l0) : 0.f;
+    float inv1 = (l1 > 0.f) ? (1.f / l1) : 0.f;
+    for (int d = tig; d < head_dim; d += 4) {
+        if (q0 < n_tok) out_all[(long)q0 * q_dim + (long)h * head_dim + d] = sO[gid * head_dim + d] * inv0;
+        if (q1 < n_tok) out_all[(long)q1 * q_dim + (long)h * head_dim + d] = sO[(gid + 8) * head_dim + d] * inv1;
+    }
+}
+#undef FATC_KT
+
 // ── Flash-attention prefill (issue #141 attention) ─────────────────────────
 // Memory-efficient batched SDPA replacing the scalar llm_full_seq_attention /
 // llm_attention_swa_batched (one 256-thread block PER query, each re-reading its
