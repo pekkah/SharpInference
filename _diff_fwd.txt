@@ -1,0 +1,458 @@
+diff --git a/src/SharpInference.Engine/CudaForwardPass.cs b/src/SharpInference.Engine/CudaForwardPass.cs
+index 7210efe..0bc9d94 100644
+--- a/src/SharpInference.Engine/CudaForwardPass.cs
++++ b/src/SharpInference.Engine/CudaForwardPass.cs
+@@ -157,6 +157,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+     private readonly bool _isGemma4Like;
+     private readonly int _maxHeadDim;
+ 
++    // Softmax score scale passed to the attention kernels. Gemma 4 uses
++    // attention_scale = 1.0 (no 1/sqrt(head_dim) prefactor); every other model uses
++    // the kernel default (≤0 → 1/sqrt(head_dim)). Cached so the batched/per-token
++    // attention call sites stay model-agnostic.
++    private readonly float _attnScale;
++
+     // Issue #136: all-GPU batched-trunk prefill scratch (Gemma 4). Lazily sized to
+     // the current prompt length N; reallocated when N changes (prefill is infrequent).
+     // The embDim/intermDim/pleWidth buffers hold exactly N rows, so element-count-driven
+@@ -182,7 +188,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+     /// Issue #141 (MMQ): route Q8_0 trunk matmuls through the int8 tensor-core MMQ
+     /// kernel (<see cref="CudaBackend.MatMulBatchedMmq"/>) instead of the
+     /// dequant→fp16→cuBLAS GEMM (<see cref="PrefillGemmEnabled"/>). Reads each Q8_0
+-    /// weight once as int8 with no fp16 HBM temp, on int8 tensor cores. Takes
++    /// weight once as int8 with no fp16 HBM temp, on int8 tensor cores. Issue #156 C2
++    /// extends the same MMQ path to Q4_K (nibble-expanded weights + asymmetric min-bias,
++    /// kernel <c>llm_mmq_q4k</c>). Takes
+     /// precedence over <see cref="PrefillGemmEnabled"/> when both are set. Default on
+     /// (<c>SHARPI_PREFILL_MMQ</c>=0 reverts to the GEMM path). Argmax-stable, not
+     /// bit-exact (both operands int8-quantized), like the GEMM path it replaces.
+@@ -210,6 +218,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+     public bool PrefillFlashTcEnabled { get; set; }
+     private bool _forceFlashTc1;             // #147 A/B: pin the single-warp TC kernel
+     private readonly bool _mmqSoa;           // #149: repack 2-D Q8_0 weights to SoA at upload
++    private readonly bool _q4kSoa;           // #156: repack 2-D Q4_K weights to scale-unpacked SoA
+     private int _bpCapacity;                 // current N the scratch is sized for (0 = none)
+     private Tensor? _bpHidden, _bpResidual, _bpNorm;       // [N × embDim]
+     private Tensor? _bpQ, _bpAttnOut;                      // [N × numHeads*maxHeadDim]
+@@ -294,6 +303,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+         // bit-identical. The backend auto-routes per repacked handle. Default on
+         // (SHARPI_MMQ_SOA=0 reverts).
+         _mmqSoa = mmqSoa ?? (Environment.GetEnvironmentVariable("SHARPI_MMQ_SOA") != "0");
++        // Issue #156/#160: repack 2-D Q4_K trunk weights into the scale-pre-unpacked
++        // SoA layout so the decode matvec, prefill int8 MMQ, the N=2 MTP batched-verify
++        // reader, and the GEMM-N/dequant fallback prefill readers all skip the
++        // per-super-block 6-bit (scale,min) unpack switch — +7% decode / +5% prefill,
++        // bit-identical (Qwen3-8B 70.0 → 74.7 t/s). Default on (SHARPI_Q4K_SOA=0
++        // reverts). Dense-only: the MoE Q4_K readers are not SoA-converted, so the
++        // repack is gated on !_isMoE at upload.
++        _q4kSoa = Environment.GetEnvironmentVariable("SHARPI_Q4K_SOA") != "0";
+         _tqEnabled = enableTurboQuant;
+         _tqBits = enableTurboQuant ? tqBits : 0;
+ 
+@@ -309,6 +326,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+         // Gemma 4 / per-layer head_dim path. _maxHeadDim sizes the Q/K/V/attnOut
+         // scratch (per-layer view tensors carve out the active head_dim).
+         _isGemma4Like = hp.LayerHeadDim is not null;
++        // Gemma 4 attention has no 1/sqrt(head_dim) prefactor; everyone else lets the
++        // kernel derive it (attnScale ≤ 0 → 1/sqrt(head_dim)).
++        _attnScale = _isGemma4Like ? 1f : -1f;
+         // Batched-trunk prefill is on by default; SHARPI_BATCHED_PREFILL=0 forces the
+         // bit-exact per-token loop (useful for A/B and parity debugging).
+         BatchedPrefillEnabled =
+@@ -850,6 +870,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+         Environment.GetEnvironmentVariable("SHARPI_PREFILL_PROFILE") == "1";
+     private readonly System.Diagnostics.Stopwatch _profSw = new();
+     private double _profAttnMs;
++    private readonly System.Diagnostics.Stopwatch _profMmSw = new();
++    private double _profMatmulMs;
+     private readonly double[] _phaseMs = new double[10];
+     private readonly long[]   _phaseCount = new long[10];
+     private const int PH_EMBED = 0, PH_QKV = 1, PH_ROPE_QKN = 2, PH_KV_ATTN = 3,
+@@ -906,6 +928,41 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+         else
+             _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
+ 
++        // Transformer layers + final norm/output — static topology across tokens (only
++        // `position` varies), so optionally capture it once into a CUDA graph and replay
++        // per token to kill the ~1k-launch/token host overhead (#136/#158). The token-
++        // varying embedding ran above; the TQ ring-advance (host state) and logits
++        // download run after.
++        if (!TryRunDeviceRegionViaGraph(position))
++            RunDeviceRegion(position);
++
++        // After all layers have used the same FP32 indices for this token, advance the
++        // TQ ring-buffer state (shared across layers). Pure host-state mutation for the
++        // NEXT token — kept outside the captured region (it would break static topology,
++        // and TQ already bails graphs off anyway).
++        if (_tqEnabled)
++        {
++            if (_fp32Count >= _tqFp32Window)
++                _tqCompressedLen++;
++            _fp32WriteIdx = (_fp32WriteIdx + 1) % _tqFp32Window;
++            if (_fp32Count < _tqFp32Window)
++                _fp32Count++;
++        }
++
++        _gpu.Download(_logits, _logitsBuf);
++        _gpu.Synchronize();
++
++        _kvLength = Math.Max(_kvLength, position + 1);
++        return _logitsBuf;
++    }
++
++    // Transformer layer loop + final norm/output — the pure on-device-compute region the
++    // CUDA-graph path captures. Token-varying embedding runs before it; the TQ ring-advance
++    // (host state) and logits download + sync run after. Only `position` varies across
++    // tokens. Contains the TQ-hybrid and SnapKV-capture blocks for the direct-launch path;
++    // both are host-gated off whenever graphs are active (see TryRunDeviceRegionViaGraph).
++    private void RunDeviceRegion(int position)
++    {
+         for (int layer = 0; layer < _hp.NumLayers; layer++)
+         {
+             // residual = hidden
+@@ -1051,25 +1108,71 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+             _gpu.AddInPlace(_hidden, _residual);
+         }
+ 
+-        // After all layers have used the same FP32 indices for this token, advance
+-        // the TQ ring-buffer state (shared across layers).
+-        if (_tqEnabled)
++        _gpu.RmsNorm(_hidden, _hidden, _wOutputNorm, _hp.RmsNormEps);
++        GpuMatMul(_logits, _wOutput, _hidden);
++    }
++
++    // CUDA-graph capture/replay for the non-Gemma dense decode region (#158, mirrors the
++    // Gemma TryRunGemma4DeviceRegionViaGraph). Returns true if the logits were produced via
++    // the graph (captured on the first eligible token, replayed after); false means the
++    // caller must run the region with direct launches. Any capture/replay failure disables
++    // graphs for the rest of the session and degrades to direct launches.
++    private bool TryRunDeviceRegionViaGraph(int position)
++    {
++        if (!_useCudaGraph || !_gpu.GraphCaptureSupported)
++            return false;
++
++        // Graphs bake in the standard decode invariant (fixed topology, seqLen ==
++        // position+1, no host-varying device offsets). Three things break that and must
++        // bail to direct launches:
++        //  • TurboQuant — extra host-synced rotate/compress ops + a ring whose advance is
++        //    host state (the if/else attention branch also flips once a row evicts).
++        //  • An actual SnapKV eviction — the cache is compacted, so cache-fill != absolute
++        //    position. A configured-but-unevicted budget keeps _kvEvictedCount == 0 and is
++        //    fine (the cache still fills sequentially).
++        //  • An active SnapKV Q-capture window (_snapKvCaptureSlot >= 0, prefill scoring
++        //    only) — its per-layer CopyDeviceRegion writes to a host-computed slot offset
++        //    that would be baked wrong on replay. Pure decode keeps the slot at -1, so the
++        //    capture block is dormant and never enters the captured graph.
++        //  • MoE — MoeFfn does a router Download + Synchronize mid-layer, which is illegal
++        //    during stream capture (it would error the stream).
++        if (_tqEnabled || _kvEvictedCount > 0 || _snapKvCaptureSlot >= 0 || _isMoE)
++            return false;
++
++        // Steady state: graph already captured — just replay at the new position.
++        if (_graphCaptured && _gpu.GraphReady)
+         {
+-            if (_fp32Count >= _tqFp32Window)
+-                _tqCompressedLen++;
+-            _fp32WriteIdx = (_fp32WriteIdx + 1) % _tqFp32Window;
+-            if (_fp32Count < _tqFp32Window)
+-                _fp32Count++;
++            try { _gpu.LaunchGraphForPosition(position); return true; }
++            catch { _useCudaGraph = false; _graphCaptured = false; return false; }
+         }
+ 
+-        _gpu.RmsNorm(_hidden, _hidden, _wOutputNorm, _hp.RmsNormEps);
+-        GpuMatMul(_logits, _wOutput, _hidden);
++        if (_graphCaptured)
++            return false; // latched but not ready — shouldn't happen; stay on direct launches
+ 
+-        _gpu.Download(_logits, _logitsBuf);
+-        _gpu.Synchronize();
++        // First eligible token: pre-grow the Q4_K/Q8_0 dp4a Q8_1 input scratch to the widest
++        // decode matvec (FFN-down cols = intermDim, output proj cols = embDim) BEFORE capture
++        // — DispatchMatVecQ4K/Dp4a grow it on demand via cudaMalloc, which capture forbids.
++        _gpu.EnsureQ81Scratch(Math.Max(_embDim, _intermDim));
+ 
+-        _kvLength = Math.Max(_kvLength, position + 1);
+-        return _logitsBuf;
++        // Capture the region (records onto the stream without executing) then launch it for
++        // real. On any failure the region was NOT executed, so the caller re-runs it directly.
++        try
++        {
++            if (!_gpu.TryBeginGraphCapture())
++                return false;
++            RunDeviceRegion(position);
++            if (!_gpu.TryEndGraphCaptureAndInstantiate())
++                return false;
++            _gpu.LaunchGraphForPosition(position);
++            _graphCaptured = true;
++            return true;
++        }
++        catch
++        {
++            _gpu.AbortGraphCapture();
++            _useCudaGraph = false;
++            return false;
++        }
+     }
+ 
+     /// <summary>
+@@ -1723,15 +1826,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+                          && !_tqEnabled
+                          && N > _snapKvEffectiveBudget
+                          && N > _snapKvCfg.Window;
+-        // Issue #136: all-GPU batched-trunk prefill for Gemma 4. Collapses the
+-        // per-position attention/FFN/PLE launches (whose count grows with N) into
+-        // batched GEMM-N + batched-attention launches. Gated to the configs the
+-        // batched kernels cover bit-identically; everything else (SnapKV-active,
+-        // TQ, >4096 context, non-NEOX RoPE, unbatchable weight dtype) falls back
+-        // to the per-token loop below.
+-        if (BatchedPrefillEnabled && _isGemma4Like && !snapKvActive && N >= 2
+-            && startPos + N <= 4096 && IsGemma4BatchedPrefillSupported())
+-            return PrefillBatchedTrunkGemma4(tokens, startPos);
++        // Issue #136/#156: all-GPU batched-trunk prefill. Collapses the per-position
++        // attention/FFN/PLE launches (whose count grows with N) into batched GEMM-N +
++        // batched-attention launches. Originally Gemma-4-only; #156 opened it to any
++        // dense model the batched kernels cover (e.g. Qwen3-8B Q4_K). Everything else
++        // (MoE, SnapKV-active, TQ, >4096 context, non-NEOX RoPE, L2 QK-norm, attn bias,
++        // unbatchable weight dtype) falls back to the per-token loop below.
++        if (BatchedPrefillEnabled && !snapKvActive && N >= 2
++            && startPos + N <= 4096 && IsBatchedPrefillSupported())
++            return PrefillBatchedTrunk(tokens, startPos);
+ 
+         int W = 0, wStart = 0;
+         if (snapKvActive)
+@@ -1772,11 +1875,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+         _weightDTypes.TryGetValue(t.Handle, out var d) && BatchableDType(d);
+ 
+     /// <summary>
+-    /// Whether the issue-#136 batched-trunk prefill can run this model bit-identically.
+-    /// Requires a dense Gemma 4 with NEOX RoPE, non-L2 QK-norm, no attention bias, TQ
+-    /// off, and every trunk + PLE weight in a GEMM-N-batchable dtype.
++    /// Whether the issue-#136/#156 batched-trunk prefill can run this model. Requires a
++    /// dense model with NEOX RoPE, non-L2 QK-norm, no attention bias, TQ off, and every
++    /// trunk (+ optional Gemma PLE) weight in a GEMM-N-batchable dtype. Gemma 4 satisfies
++    /// these; so do dense Qwen3/Llama-style models (the batched body skips the Gemma-only
++    /// PLE / shared-KV / SWA / post-norm steps via their null/flag guards).
+     /// </summary>
+-    private bool IsGemma4BatchedPrefillSupported()
++    private bool IsBatchedPrefillSupported()
+     {
+         if (_isMoE || _tqEnabled || _hasAttnBias || !_hp.IsNeoxRope) return false;
+         if (_hasQkNorm && _hp.UseL2QkNorm) return false;
+@@ -1800,6 +1905,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+     }
+ 
+     private void GpuMatMulBatched(Tensor outAll, Tensor weights, Tensor inAll, int n)
++    {
++        if (s_prefillProfile) { _gpu.Synchronize(); _profMmSw.Restart(); }
++        GpuMatMulBatchedCore(outAll, weights, inAll, n);
++        if (s_prefillProfile) { _gpu.Synchronize(); _profMatmulMs += _profMmSw.Elapsed.TotalMilliseconds; }
++    }
++
++    private void GpuMatMulBatchedCore(Tensor outAll, Tensor weights, Tensor inAll, int n)
+     {
+         var dt = WDType(weights);
+         // Issue #141: route the trunk matmuls through compute-bound cuBLAS GEMM
+@@ -1820,6 +1932,25 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+             else
+                 _gpu.MatMulBatchedGemm(outAll, weights, inAll, n, dt);
+         }
++        else if (dt == DType.Q4_K)
++        {
++            // Issue #156 Item C: route Q4_K trunk matmuls through a compute-bound path
++            // (weight read once per batch) instead of the memory-bound matvec GEMM-N
++            // (weight re-streamed per token). Argmax-stable. Requires cols % 256; every
++            // Q4_K hidden dim satisfies it, but fall back to the matvec path defensively
++            // if not. C2 (PrefillMmqEnabled): the int8 MMQ reads the weight once as int8
++            // with no fp16 dequant temp; C1 fallback: dequant→fp16→cuBLAS GEMM.
++            int cols = (int)(inAll.ElementCount / n);
++            if ((cols & 0xff) == 0)
++            {
++                if (PrefillMmqEnabled)
++                    _gpu.MatMulBatchedMmq(outAll, weights, inAll, n, dt);
++                else
++                    _gpu.MatMulBatchedGemm(outAll, weights, inAll, n, dt);
++            }
++            else
++                _gpu.MatMulBatched(outAll, weights, inAll, n, dt);
++        }
+         else if (dt == DType.Float32)
+         {
+             // C[n×rows] = A[n×cols] · B[rows×cols]ᵀ  →  Sgemm(C, A, B, M=n, K=cols, N=rows).
+@@ -1874,12 +2005,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+     }
+ 
+     /// <summary>
+-    /// All-GPU batched-trunk prefill for Gemma 4 (issue #136). Embeds all N tokens,
+-    /// builds the per-layer PLE projections batched, runs every transformer layer
+-    /// batched across N, then the final norm + output projection on the last token.
+-    /// Bit-identical to the per-token <see cref="ForwardGemma4"/> loop.
++    /// All-GPU batched-trunk prefill (issue #136; generalized to dense non-Gemma models
++    /// in #156). Embeds all N tokens, builds the per-layer PLE projections batched (Gemma
++    /// only), runs every transformer layer batched across N, then the final norm + output
++    /// projection on the last token. Argmax-stable with the per-token
++    /// <see cref="Forward"/> / <see cref="ForwardGemma4"/> loop (flash/GEMM are not byte-exact).
+     /// </summary>
+-    private ReadOnlySpan<float> PrefillBatchedTrunkGemma4(IReadOnlyList<int> tokens, int startPos)
++    private ReadOnlySpan<float> PrefillBatchedTrunk(IReadOnlyList<int> tokens, int startPos)
+     {
+         int N = tokens.Count;
+         EnsureBatchedTrunkScratch(N);
+@@ -1924,14 +2056,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+ 
+         // 3. Transformer layers, batched across N.
+         for (int layer = 0; layer < _hp.NumLayers; layer++)
+-            GpuLayerBatchedTrunkGemma4(layer, N, startPos);
++            GpuLayerBatchedTrunk(layer, N, startPos);
+         if (profile)
+         {
+             _gpu.Synchronize();
+             tLayers = swp!.ElapsedMilliseconds;
+             Console.Error.WriteLine($"[prefill-profile] N={N} embed={tEmbed}ms ple={tPle - tEmbed}ms " +
+-                $"layers={tLayers - tPle}ms (attn={_profAttnMs:F0}ms)");
+-            _profAttnMs = 0;
++                $"layers={tLayers - tPle}ms (attn={_profAttnMs:F0}ms matmul={_profMatmulMs:F0}ms)");
++            _profAttnMs = 0; _profMatmulMs = 0;
+         }
+ 
+         // 4. Final norm + output projection on the last token only.
+@@ -2005,12 +2137,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+     }
+ 
+     /// <summary>
+-    /// One transformer layer of the batched-trunk prefill, mirroring
+-    /// <see cref="ForwardGemma4"/>'s per-layer body batched across N tokens.
++    /// One transformer layer of the batched-trunk prefill, batched across N tokens.
++    /// Mirrors the per-token body (<see cref="ForwardGemma4"/> for Gemma, the dense
++    /// <see cref="Forward"/> loop otherwise); Gemma-only steps (PLE, shared-KV, SWA,
++    /// sandwich post-norms, per-layer head_dim, layer_output_scale) are guarded off for
++    /// models that lack them.
+     /// </summary>
+-    private void GpuLayerBatchedTrunkGemma4(int layer, int N, int startPos)
++    private void GpuLayerBatchedTrunk(int layer, int N, int startPos)
+     {
+-        int layerHd = _hp.LayerHeadDim![layer];
++        int layerHd = _hp.LayerHeadDim is { } lhd ? lhd[layer] : _headDim;
+         int qDimL = _numHeads * layerHd, kvDimL = _numKvHeads * layerHd;
+         int kvSrc = _hp.KvSourceLayer is { } ksl ? ksl[layer] : -1;
+         bool kvShared = kvSrc >= 0;
+@@ -2034,8 +2169,17 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+             GpuMatMulBatched(vAll, _wv[layer], _bpNorm!, N);
+         }
+ 
+-        if (_hasQkNorm && !_hp.UseL2QkNorm)
++        // RoPE and per-head QK-norm must run in the SAME order as the matching per-token
++        // oracle, because RoPE does not commute with per-channel-weighted RMSNorm: Gemma
++        // applies QK-norm before RoPE (RunGemma4DeviceRegion), the dense path applies RoPE
++        // before QK-norm (Forward). NoRopeLayerStep skips RoPE on the same layers as the
++        // per-token path; QK-norm (weighted) always runs. L2 QK-norm is gated out upstream.
++        bool useRoPE = _hp.NoRopeLayerStep == 0 || (layer + 1) % _hp.NoRopeLayerStep != 0;
++        float ropeTheta = isSwa ? _ropeThetaSwa : _hp.RopeTheta;
++
++        void ApplyQkNormBatched()
+         {
++            if (!_hasQkNorm || _hp.UseL2QkNorm) return;
+             if (!kvShared)
+                 _gpu.HeadNormQkBatched(qAll, _wqNorm![layer], kAll, _wkNorm![layer],
+                     _numHeads, _numKvHeads, layerHd, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+@@ -2043,20 +2187,26 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+                 _gpu.HeadNormBatched(qAll, _wqNorm![layer], _numHeads, layerHd, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+         }
+ 
+-        float ropeTheta = isSwa ? _ropeThetaSwa : _hp.RopeTheta;
+-        if (!isSwa && _gpuRopeFreqs is { } rfTbl)
+-        {
+-            _gpu.RoPEWithFactorsBatched(qAll, startPos, layerHd, ropeTheta, rfTbl, _numHeads, N);
+-            if (!kvShared)
+-                _gpu.RoPEWithFactorsBatched(kAll, startPos, layerHd, ropeTheta, rfTbl, _numKvHeads, N);
+-        }
+-        else
++        void ApplyRopeBatched()
+         {
+-            _gpu.RoPEPartialBatched(qAll, startPos, layerHd, layerHd, ropeTheta, _numHeads, N, neox: true);
+-            if (!kvShared)
+-                _gpu.RoPEPartialBatched(kAll, startPos, layerHd, layerHd, ropeTheta, _numKvHeads, N, neox: true);
++            if (!useRoPE) return;
++            if (!isSwa && _gpuRopeFreqs is { } rfTbl)
++            {
++                _gpu.RoPEWithFactorsBatched(qAll, startPos, layerHd, ropeTheta, rfTbl, _numHeads, N);
++                if (!kvShared)
++                    _gpu.RoPEWithFactorsBatched(kAll, startPos, layerHd, ropeTheta, rfTbl, _numKvHeads, N);
++            }
++            else
++            {
++                _gpu.RoPEPartialBatched(qAll, startPos, layerHd, layerHd, ropeTheta, _numHeads, N, neox: true);
++                if (!kvShared)
++                    _gpu.RoPEPartialBatched(kAll, startPos, layerHd, layerHd, ropeTheta, _numKvHeads, N, neox: true);
++            }
+         }
+ 
++        if (_isGemma4Like) { ApplyQkNormBatched(); ApplyRopeBatched(); }
++        else { ApplyRopeBatched(); ApplyQkNormBatched(); }
++
+         if (!kvShared)
+         {
+             int layerCtx = isSwa && window > 0 ? Math.Min(_maxSeqLen, window) : _maxSeqLen;
+@@ -2068,26 +2218,27 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+ 
+         if (s_prefillProfile) { _gpu.Synchronize(); _profSw.Restart(); }
+         // Gemma 4: attention_scale = 1.0, passed explicitly (kernel skips its rsqrtf).
++        // Other models pass _attnScale = -1 so the kernel derives 1/sqrt(head_dim).
+         if (PrefillFlashTcEnabled && (layerHd & 15) == 0)
+         {
+             // #147 multi-warp/d-split when head_dim is a multiple of 64 (W·16); else the
+             // #146 single-warp kernel. SHARPI_PREFILL_FLASH_TC1=1 forces single-warp (A/B).
+             if (!_forceFlashTc1 && (layerHd & 63) == 0)
+                 _gpu.FlashAttentionPrefillTc2(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
+-                    _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: 1f);
++                    _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
+             else
+                 _gpu.FlashAttentionPrefillTc(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
+-                    _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: 1f);
++                    _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
+         }
+         else if (PrefillFlashAttnEnabled)
+             _gpu.FlashAttentionPrefill(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
+-                _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: 1f);
++                _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
+         else if (isSwa)
+             _gpu.AttentionSwaBatched(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
+-                _numHeads, _numKvHeads, layerHd, startPos, window, effLayerCtx, N, attnScale: 1f);
++                _numHeads, _numKvHeads, layerHd, startPos, window, effLayerCtx, N, attnScale: _attnScale);
+         else
+             _gpu.AttentionBatched(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
+-                _numHeads, _numKvHeads, layerHd, startPos, effLayerCtx, N, attnScale: 1f);
++                _numHeads, _numKvHeads, layerHd, startPos, effLayerCtx, N, attnScale: _attnScale);
+         if (s_prefillProfile) { _gpu.Synchronize(); _profAttnMs += _profSw.Elapsed.TotalMilliseconds; }
+ 
+         GpuMatMulBatched(_bpHidden!, _wo[layer], attnAll, N);
+@@ -2100,7 +2251,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+         _gpu.RmsNormBatched(_bpNorm!, _bpHidden!, _wFfnNorm[layer], N, _embDim, _hp.RmsNormEps);
+         GpuMatMulBatched(_bpFfnGate!, _wGate[layer], _bpNorm!, N);
+         GpuMatMulBatched(_bpFfnUp!,   _wUp[layer],   _bpNorm!, N);
+-        _gpu.GeluTanhMul(_bpFfnGate!, _bpFfnUp!);
++        // SwiGLU (Silu, Qwen/Llama) vs GEGLU (GeluApprox, Gemma 4). Both are
++        // elementwise over the whole N·intermDim buffer, so the batched call is
++        // identical to the per-token one bar the activation.
++        if (_hp.FfnActivation == FfnActivation.GeluApprox)
++            _gpu.GeluTanhMul(_bpFfnGate!, _bpFfnUp!);
++        else
++            _gpu.SiLuMul(_bpFfnGate!, _bpFfnUp!);
+         GpuMatMulBatched(_bpHidden!, _wDown[layer], _bpFfnGate!, N);
+         if (_wPostFfwNorm is not null)
+             _gpu.RmsNormBatched(_bpHidden!, _bpHidden!, _wPostFfwNorm[layer], N, _embDim, _hp.RmsNormEps);
+@@ -2480,6 +2637,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
+                 int rows = (int)info.Dimensions[1];
+                 result = _gpu.RepackQ8_0Soa(result, rows, cols);
+             }
++            // #156: same for 2-D Q4_K trunk weights (dense-only; cols % 256 required —
++            // every Q4_K hidden dim satisfies it, so the 2-D check is sufficient).
++            else if (_q4kSoa && !_isMoE && info.DType == DType.Q4_K && info.NDimensions == 2)
++            {
++                int cols = (int)info.Dimensions[0];
++                int rows = (int)info.Dimensions[1];
++                result = _gpu.RepackQ4KSoa(result, rows, cols);
++            }
+             _weightDTypes[result.Handle] = info.DType;
+         }
+         else
