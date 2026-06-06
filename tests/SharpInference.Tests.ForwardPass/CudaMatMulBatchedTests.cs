@@ -261,6 +261,10 @@ public sealed unsafe class CudaMatMulBatchedTests
     {
         using var gpu = TryCreate();
         if (gpu is null) return;
+        // The batched matvec GEMM-N path is fp32; pin the sequential MatMul
+        // reference to the fp32 kernel too (the default dp4a path quantizes the
+        // activation to int8 — argmax-stable, not bit-exact). Issue #142.
+        gpu.Q80Dp4aEnabled = false;
 
         foreach ((int rows, int cols, int nTok) in
                  new[] { (8, 256, 2), (33, 512, 5), (64, 1024, 17), (130, 2048, 40) })

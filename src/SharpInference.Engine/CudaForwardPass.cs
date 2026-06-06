@@ -169,6 +169,35 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// batched path against the bit-exact per-token loop on one model instance.
     /// </summary>
     public bool BatchedPrefillEnabled { get; set; }
+    /// <summary>
+    /// Issue #141: route Q8_0 trunk matmuls in the batched prefill through the
+    /// compute-bound cuBLAS GEMM (<see cref="CudaBackend.MatMulBatchedGemm"/>)
+    /// instead of the memory-bound matvec GEMM-N. Default on
+    /// (<c>SHARPI_PREFILL_GEMM</c>); settable so tests can A/B the GEMM path
+    /// against the bit-exact matvec path on one model instance. Non-Q8_0 trunk
+    /// weights always fall back to the matvec GEMM-N regardless.
+    /// </summary>
+    public bool PrefillGemmEnabled { get; set; }
+    /// <summary>
+    /// Issue #141 (MMQ): route Q8_0 trunk matmuls through the int8 tensor-core MMQ
+    /// kernel (<see cref="CudaBackend.MatMulBatchedMmq"/>) instead of the
+    /// dequant→fp16→cuBLAS GEMM (<see cref="PrefillGemmEnabled"/>). Reads each Q8_0
+    /// weight once as int8 with no fp16 HBM temp, on int8 tensor cores. Takes
+    /// precedence over <see cref="PrefillGemmEnabled"/> when both are set. Default on
+    /// (<c>SHARPI_PREFILL_MMQ</c>=0 reverts to the GEMM path). Argmax-stable, not
+    /// bit-exact (both operands int8-quantized), like the GEMM path it replaces.
+    /// </summary>
+    public bool PrefillMmqEnabled { get; set; }
+    /// <summary>
+    /// Issue #141 (attention): route the batched-trunk prefill attention through the
+    /// memory-efficient flash kernel (<see cref="CudaBackend.FlashAttentionPrefill"/>,
+    /// shared K/V tiles + online softmax) instead of the scalar per-query
+    /// <see cref="CudaBackend.AttentionBatched"/> / <see cref="CudaBackend.AttentionSwaBatched"/>
+    /// (which re-read each query's whole K/V range from global — O(n²), the dominant
+    /// prefill cost). fp32 KV only. Argmax-stable, not bit-exact (online softmax).
+    /// Default on (<c>SHARPI_PREFILL_FLASH</c>=0 reverts to the scalar kernels).
+    /// </summary>
+    public bool PrefillFlashAttnEnabled { get; set; }
     private int _bpCapacity;                 // current N the scratch is sized for (0 = none)
     private Tensor? _bpHidden, _bpResidual, _bpNorm;       // [N × embDim]
     private Tensor? _bpQ, _bpAttnOut;                      // [N × numHeads*maxHeadDim]
@@ -265,6 +294,19 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // bit-exact per-token loop (useful for A/B and parity debugging).
         BatchedPrefillEnabled =
             Environment.GetEnvironmentVariable("SHARPI_BATCHED_PREFILL") != "0";
+        PrefillGemmEnabled =
+            Environment.GetEnvironmentVariable("SHARPI_PREFILL_GEMM") != "0";
+        // Issue #141 (MMQ): default on — the int8 tensor-core MMQ beats the
+        // dequant→fp16→cuBLAS GEMM matmul (~316ms vs ~332ms over a 1848-tok Gemma 4
+        // prefill) and drops the fp16 weight HBM temp. SHARPI_PREFILL_MMQ=0 reverts to
+        // the cuBLAS GEMM path. Gated under PrefillGemmEnabled (the compute-bound path).
+        PrefillMmqEnabled =
+            Environment.GetEnvironmentVariable("SHARPI_PREFILL_MMQ") != "0";
+        // Issue #141 (attention): default on — the flash kernel cuts batched-prefill
+        // attention ~929ms→~411ms (2.26×) at N=1848, lifting Gemma 4 prefill
+        // ~1389→~2180 t/s. SHARPI_PREFILL_FLASH=0 reverts to the scalar kernels.
+        PrefillFlashAttnEnabled =
+            Environment.GetEnvironmentVariable("SHARPI_PREFILL_FLASH") != "0";
         _maxHeadDim = _headDim;
         if (hp.LayerHeadDim is { } lhdMax)
             for (int i = 0; i < hp.NumLayers; i++)
@@ -776,6 +818,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     // Profiling state (only used when SHARPI_CUDA_PROFILE is set).
     private static readonly bool s_profile =
         Environment.GetEnvironmentVariable("SHARPI_CUDA_PROFILE") == "1";
+    private static readonly bool s_prefillProfile =
+        Environment.GetEnvironmentVariable("SHARPI_PREFILL_PROFILE") == "1";
+    private readonly System.Diagnostics.Stopwatch _profSw = new();
+    private double _profAttnMs;
     private readonly double[] _phaseMs = new double[10];
     private readonly long[]   _phaseCount = new long[10];
     private const int PH_EMBED = 0, PH_QKV = 1, PH_ROPE_QKN = 2, PH_KV_ATTN = 3,
@@ -786,11 +832,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     // CUDA Graph decode (issue #136): the Gemma 4 layer + output region has static
     // topology across decode tokens (only `position` varies), so capture it once on the
     // first decode token and replay per token — collapsing ~1k host launches/token into
-    // one cuGraphLaunch + a handful of node-param updates. Off by default; opt in with
-    // SHARPI_CUDA_GRAPH=1 or the UseCudaGraph setter. Falls back to direct launches on
-    // any capture/replay failure.
+    // one cuGraphLaunch + a handful of node-param updates. Falls back to direct launches
+    // on any capture/replay failure.
+    //
+    // Default ON (issue #142): after the #137 launch fusions and the dp4a decode matvec,
+    // graphs measure +9–10% at both low and ~1K context on the all-GPU Gemma 4 path (the
+    // earlier short-context regression that kept #136 default-off is gone). SHARPI_CUDA_GRAPH=0
+    // reverts to direct launches.
     private bool _useCudaGraph =
-        Environment.GetEnvironmentVariable("SHARPI_CUDA_GRAPH") == "1";
+        Environment.GetEnvironmentVariable("SHARPI_CUDA_GRAPH") != "0";
     private bool _graphCaptured;
     // Number of KV entries SnapKV physically dropped when it compacted the cache
     // (= N - K at eviction, 0 otherwise). Decode indexes the compacted cache by the
@@ -1580,6 +1630,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         int N = tokens.Count;
         LastPrefillWasBatched = false;
 
+        // Issue #142: pre-grow the dp4a Q8_1 input scratch to the widest decode
+        // matvec (FFN down: cols = intermDim) before any CUDA-graph capture on the
+        // first decode token — capture forbids cudaMalloc, so the buffer must
+        // already be at max size. Harmless when the dp4a path is disabled.
+        if (_isGemma4Like)
+            _gpu.EnsureQ81Scratch(Math.Max(_embDim, _intermDim));
+
         // SnapKV (issue #59) gating: only run eviction when this is a fresh
         // prefill (startPos==0), the effective budget is positive (env-set or
         // VRAM-scaled auto), the prompt is long enough that eviction would drop
@@ -1665,8 +1722,39 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         return BatchableWeight(_wOutput);
     }
 
-    private void GpuMatMulBatched(Tensor outAll, Tensor weights, Tensor inAll, int n) =>
-        _gpu.MatMulBatched(outAll, weights, inAll, n, WDType(weights));
+    private void GpuMatMulBatched(Tensor outAll, Tensor weights, Tensor inAll, int n)
+    {
+        var dt = WDType(weights);
+        // Issue #141: route the trunk matmuls through compute-bound cuBLAS GEMM
+        // (each weight read once per batch) instead of the memory-bound matvec
+        // GEMM-N (weight re-streamed per token). Q8_0 weights dequant to fp16
+        // first; F32 weights (PLE projections) feed Sgemm's TF32 path directly.
+        // ~argmax-stable, not byte-exact — fine for Gemma 4 prefill, which has no
+        // MTP/GDN byte-parity oracle. Other dtypes keep the matvec GEMM-N.
+        if (!PrefillGemmEnabled)
+        {
+            _gpu.MatMulBatched(outAll, weights, inAll, n, dt);
+            return;
+        }
+        if (dt == DType.Q8_0)
+        {
+            if (PrefillMmqEnabled)
+                _gpu.MatMulBatchedMmq(outAll, weights, inAll, n, dt);
+            else
+                _gpu.MatMulBatchedGemm(outAll, weights, inAll, n, dt);
+        }
+        else if (dt == DType.Float32)
+        {
+            // C[n×rows] = A[n×cols] · B[rows×cols]ᵀ  →  Sgemm(C, A, B, M=n, K=cols, N=rows).
+            int rows = (int)(outAll.ElementCount / n);
+            int cols = (int)(inAll.ElementCount / n);
+            _gpu.Sgemm(outAll, inAll, weights, n, cols, rows);
+        }
+        else
+        {
+            _gpu.MatMulBatched(outAll, weights, inAll, n, dt);
+        }
+    }
 
     /// <summary>(Re)allocate the batched-trunk scratch for a prompt of length N.</summary>
     private void EnsureBatchedTrunkScratch(int n)
@@ -1720,23 +1808,54 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         EnsureBatchedTrunkScratch(N);
         int embDim = _embDim;
 
-        // 1. Embed every token into _bpHidden, then batched embedding scale.
-        for (int i = 0; i < N; i++)
+        bool profile = s_prefillProfile;
+        var swp = profile ? System.Diagnostics.Stopwatch.StartNew() : null;
+        long tEmbed = 0, tPle = 0, tLayers = 0;
+
+        // 1. Embed every token into _bpHidden, then batched embedding scale. The Q8_0
+        // table (Gemma 4) goes through a single batched launch instead of 2·N host-
+        // driven EmbedLookup + copy launches (bit-identical); other dtypes keep the loop.
+        var embDType = _embIsQuantized
+            ? _weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K)
+            : DType.Float32;
+        if (_embIsQuantized && embDType == DType.Q8_0)
         {
-            EmbedTokenGpu(tokens[i]);   // writes _hidden
-            _gpu.CopyDeviceRegion(_bpHidden!, (long)i * embDim * sizeof(float),
-                                  _hidden, 0, (long)embDim * sizeof(float));
+            int[] ids = tokens as int[] ?? System.Linq.Enumerable.ToArray(tokens);
+            var idTensor = _gpu.UploadRaw(
+                System.Runtime.InteropServices.MemoryMarshal.AsBytes<int>(ids),
+                TensorShape.D1(N), DType.Float32);
+            _gpu.EmbedLookupQ8_0Batched(_gpuEmbedding, _bpHidden!, idTensor, N, embDim);
+            _gpu.Free(idTensor);
+        }
+        else
+        {
+            for (int i = 0; i < N; i++)
+            {
+                EmbedTokenGpu(tokens[i]);   // writes _hidden
+                _gpu.CopyDeviceRegion(_bpHidden!, (long)i * embDim * sizeof(float),
+                                      _hidden, 0, (long)embDim * sizeof(float));
+            }
         }
         if (_hp.EmbeddingScale != 1f)
             _gpu.ScaleInPlace(_bpHidden!, _hp.EmbeddingScale);
+        if (profile) { _gpu.Synchronize(); tEmbed = swp!.ElapsedMilliseconds; }
 
         // 2. PLE pre-pass batched (builds _bpProjAll = [N × L*pleWidth]).
         if (_hp.HasPerLayerTokenEmbd)
             BuildPerLayerProjectionsBatched(tokens);
+        if (profile) { _gpu.Synchronize(); tPle = swp!.ElapsedMilliseconds; }
 
         // 3. Transformer layers, batched across N.
         for (int layer = 0; layer < _hp.NumLayers; layer++)
             GpuLayerBatchedTrunkGemma4(layer, N, startPos);
+        if (profile)
+        {
+            _gpu.Synchronize();
+            tLayers = swp!.ElapsedMilliseconds;
+            Console.Error.WriteLine($"[prefill-profile] N={N} embed={tEmbed}ms ple={tPle - tEmbed}ms " +
+                $"layers={tLayers - tPle}ms (attn={_profAttnMs:F0}ms)");
+            _profAttnMs = 0;
+        }
 
         // 4. Final norm + output projection on the last token only.
         var lastHidden = _gpu.View(_bpHidden!, (long)(N - 1) * embDim, embDim);
@@ -1780,16 +1899,21 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                         * DTypeInfo.BytesPerBlock(pleRef.DType);
 
         // CPU dequant of each token's PLE row into the [N × stackedDim] host buffer.
+        // Parallelized across tokens (each row is independent): for a long prompt
+        // this serial gather+dequant of N×stackedDim Q8_0 elements was ~30% of the
+        // whole batched prefill (issue #141 profiling).
         var host = _bpPleRowHostAll!;
-        for (int i = 0; i < N; i++)
+        byte* basePtr = pleRef.DataPtr;
+        var dtype = pleRef.DType;
+        System.Threading.Tasks.Parallel.For(0, N, i =>
         {
-            byte* rowPtr = pleRef.DataPtr + (long)tokens[i] * bytesPerRow;
+            byte* rowPtr = basePtr + (long)tokens[i] * bytesPerRow;
             var dst = new Span<float>(host).Slice(i * stackedDim, stackedDim);
-            if (pleRef.DType == DType.Float32)
+            if (dtype == DType.Float32)
                 new ReadOnlySpan<float>((float*)rowPtr, stackedDim).CopyTo(dst);
             else
-                Dequantize.ToFloat32(new ReadOnlySpan<byte>(rowPtr, bytesPerRow), dst, pleRef.DType, stackedDim);
-        }
+                Dequantize.ToFloat32(new ReadOnlySpan<byte>(rowPtr, bytesPerRow), dst, dtype, stackedDim);
+        });
         _gpu.UploadInto(_bpPleRowAll!, host);
         _gpu.ScaleInPlace(_bpPleRowAll!, MathF.Sqrt(_pleWidth));
 
@@ -1865,13 +1989,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         int effLayerCtx = (_hp.IsSwaLayer is { } swaEff && swaEff[effLayer] && window > 0)
             ? Math.Min(_maxSeqLen, window) : _maxSeqLen;
 
+        if (s_prefillProfile) { _gpu.Synchronize(); _profSw.Restart(); }
         // Gemma 4: attention_scale = 1.0, passed explicitly (kernel skips its rsqrtf).
-        if (isSwa)
+        if (PrefillFlashAttnEnabled)
+            _gpu.FlashAttentionPrefill(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
+                _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: 1f);
+        else if (isSwa)
             _gpu.AttentionSwaBatched(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
                 _numHeads, _numKvHeads, layerHd, startPos, window, effLayerCtx, N, attnScale: 1f);
         else
             _gpu.AttentionBatched(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
                 _numHeads, _numKvHeads, layerHd, startPos, effLayerCtx, N, attnScale: 1f);
+        if (s_prefillProfile) { _gpu.Synchronize(); _profAttnMs += _profSw.Elapsed.TotalMilliseconds; }
 
         GpuMatMulBatched(_bpHidden!, _wo[layer], attnAll, N);
         if (_wPostAttnNorm is not null)
