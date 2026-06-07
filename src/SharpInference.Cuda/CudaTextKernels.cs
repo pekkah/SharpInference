@@ -2490,6 +2490,113 @@ extern ""C"" __global__ void llm_dequant_q4k_to_f16_soa(
     }
 }
 
+// ── Dequant Q6_K → FP16 for cuBLAS prefill GEMM (issue #162) ────────────────
+// Qwen3-8B-Q4_K_M (and other _M mixes) keep ~half of ffn_down + attn_v in Q6_K. Those
+// trunk matmuls had no compute-bound prefill path, so they fell back to the GEMM-N
+// matvec (llm_matvec_q6k_gemm_n) which re-streams the whole weight ONCE PER TOKEN —
+// memory-bound, and the dominant prefill cost at large N (94 GB of weight reads for one
+// N=2290 ffn_down). This dequant lets the Q6_K weight be read once per batch into an
+// fp16 temp that cuBLAS GEMMs, mirroring llm_dequant_q4k_to_f16.
+//
+// Element decode mirrors llm_matvec_q6k exactly. Thread e (0..255) owns weight column e
+// of the super-block: with lane=e&31, group=e>>5, the matvec multiplies input[group*32
+// + lane] == input[e], so out column == e. The 16 int8 scales cover 16 elements each
+// (scale index 2*group + (lane>>4)); value = d·scale·(q − 32), fp16-rounded (the only
+// lossy step vs the fp32 matvec). One block of 256 threads per row, looping super-blocks.
+extern ""C"" __global__ void llm_dequant_q6k_to_f16(
+    const unsigned int* __restrict__ weights,
+    unsigned short* __restrict__ out,    // [rows * cols] fp16
+    int rows, int cols)
+{
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    int num_blocks = cols >> 8;                              // cols / 256
+    long row_base_bytes = (long)row * (long)num_blocks * 210L;
+    long out_row = (long)row * (long)cols;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long b0 = row_base_bytes + (long)block * 210L;
+        unsigned int dlo = sharpi_byte_at(weights, b0 + 208);
+        unsigned int dhi = sharpi_byte_at(weights, b0 + 209);
+        float d = sharpi_fp16_to_fp32(dlo | (dhi << 8));
+
+        for (int e = (int)threadIdx.x; e < 256; e += (int)blockDim.x) {
+            int lane  = e & 31;
+            int group = e >> 5;        // 0..7
+            int isc   = lane >> 4;     // 0 or 1
+            float sc  = d * (float)sharpi_int8_at(weights, b0 + 192 + group * 2 + isc);
+
+            unsigned int ql, qh; int q;
+            switch (group) {
+                case 0:  ql = sharpi_byte_at(weights, b0 +   0 + lane); qh = sharpi_byte_at(weights, b0 + 128 + lane);
+                         q = (int)((ql & 0xFu)        | (((qh >> 0) & 3u) << 4)); break;
+                case 1:  ql = sharpi_byte_at(weights, b0 +  32 + lane); qh = sharpi_byte_at(weights, b0 + 128 + lane);
+                         q = (int)((ql & 0xFu)        | (((qh >> 2) & 3u) << 4)); break;
+                case 2:  ql = sharpi_byte_at(weights, b0 +   0 + lane); qh = sharpi_byte_at(weights, b0 + 128 + lane);
+                         q = (int)(((ql >> 4) & 0xFu) | (((qh >> 4) & 3u) << 4)); break;
+                case 3:  ql = sharpi_byte_at(weights, b0 +  32 + lane); qh = sharpi_byte_at(weights, b0 + 128 + lane);
+                         q = (int)(((ql >> 4) & 0xFu) | (((qh >> 6) & 3u) << 4)); break;
+                case 4:  ql = sharpi_byte_at(weights, b0 +  64 + lane); qh = sharpi_byte_at(weights, b0 + 160 + lane);
+                         q = (int)((ql & 0xFu)        | (((qh >> 0) & 3u) << 4)); break;
+                case 5:  ql = sharpi_byte_at(weights, b0 +  96 + lane); qh = sharpi_byte_at(weights, b0 + 160 + lane);
+                         q = (int)((ql & 0xFu)        | (((qh >> 2) & 3u) << 4)); break;
+                case 6:  ql = sharpi_byte_at(weights, b0 +  64 + lane); qh = sharpi_byte_at(weights, b0 + 160 + lane);
+                         q = (int)(((ql >> 4) & 0xFu) | (((qh >> 4) & 3u) << 4)); break;
+                default: ql = sharpi_byte_at(weights, b0 +  96 + lane); qh = sharpi_byte_at(weights, b0 + 160 + lane);
+                         q = (int)(((ql >> 4) & 0xFu) | (((qh >> 6) & 3u) << 4)); break;
+            }
+            float val = sc * (float)(q - 32);
+            out[out_row + (long)block * 256 + e] = (unsigned short)sharpi_fp32_to_fp16(val);
+        }
+    }
+}
+
+// ── Dequant Q5_K → FP16 for cuBLAS prefill GEMM (issue #162) ────────────────
+// Same motivation as the Q6_K dequant: Q5_K_M mixes keep q/k/o/gate/up in Q5_K, which
+// otherwise fell to the per-token GEMM-N matvec. Element decode mirrors llm_matvec_q5k:
+// thread e owns weight column e (lane=e&31, chunk=e>>6, isHigh=(e>>5)&1); the matvec
+// multiplies that value by input[e], so out column == e. The 12-byte scales[] use the
+// SAME 6-bit packing as Q4_K (sharpi_q4k_scale_min over sub-block e>>5); the value is
+// d·sc·(low4|hi4 + 16·qh_bit) − dmin·mn, fp16-rounded. One block of 256 threads per row.
+extern ""C"" __global__ void llm_dequant_q5k_to_f16(
+    const unsigned int* __restrict__ weights,
+    unsigned short* __restrict__ out,    // [rows * cols] fp16
+    int rows, int cols)
+{
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    int num_blocks = cols >> 8;                              // cols / 256
+    long row_base_bytes = (long)row * (long)num_blocks * 176L;
+    long out_row = (long)row * (long)cols;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long b0 = row_base_bytes + (long)block * 176L;       // 176 B / super-block, 4-aligned
+        unsigned int dword0 = weights[b0 >> 2];
+        float d    = sharpi_fp16_to_fp32(dword0 & 0xffffu);
+        float dmin = sharpi_fp16_to_fp32(dword0 >> 16);
+        unsigned int sm0 = weights[(b0 >> 2) + 1];           // scales[0:4]
+        unsigned int sm1 = weights[(b0 >> 2) + 2];           // scales[4:8]
+        unsigned int sm2 = weights[(b0 >> 2) + 3];           // scales[8:12]
+
+        for (int e = (int)threadIdx.x; e < 256; e += (int)blockDim.x) {
+            int chunk  = e >> 6;          // 0..3
+            int lane   = e & 31;
+            int isHigh = (e >> 5) & 1;    // low (0..31) vs high (32..63) half of the chunk
+            unsigned int sc, mn;
+            sharpi_q4k_scale_min(sm0, sm1, sm2, (e >> 5), &sc, &mn);   // sub-block = e/32
+
+            unsigned int ql_byte = sharpi_byte_at(weights, b0 + 48 + chunk * 32 + lane);
+            unsigned int nibble  = isHigh ? ((ql_byte >> 4) & 0xFu) : (ql_byte & 0xFu);
+            unsigned int qh_byte = sharpi_byte_at(weights, b0 + 16 + lane);
+            unsigned int u = 1u << (2 * chunk + isHigh);
+            int q5 = (int)nibble + ((qh_byte & u) != 0u ? 16 : 0);
+
+            float val = d * (float)sc * (float)q5 - dmin * (float)mn;
+            out[out_row + (long)block * 256 + e] = (unsigned short)sharpi_fp32_to_fp16(val);
+        }
+    }
+}
+
 // ── FP32 → FP16 elementwise convert (issue #141) ──────────────────────────
 // Converts the prefill activation batch [n] fp32 → fp16 so it can feed the
 // cuBLAS fp16 GEMM alongside the dequantized weights.

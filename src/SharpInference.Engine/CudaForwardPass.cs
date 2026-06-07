@@ -2039,6 +2039,21 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             else
                 _gpu.MatMulBatched(outAll, weights, inAll, n, dt);
         }
+        else if (dt is DType.Q6_K or DType.Q5_K)
+        {
+            // Issue #162: mixed _M quants keep trunk tensors in Q6_K (ffn_down + attn_v
+            // in Q4_K_M) or Q5_K (q/k/o/gate/up in Q5_K_M). Neither has an int8 MMQ
+            // kernel, so route those trunk matmuls through the dequant→fp16→cuBLAS GEMM
+            // (weight read once per batch) instead of the memory-bound per-token GEMM-N
+            // matvec — the latter re-streams the whole weight once per token and was the
+            // dominant large-N prefill cost. Both are 256-wide super-blocks; fall back
+            // defensively if cols isn't aligned.
+            int cols = (int)(inAll.ElementCount / n);
+            if ((cols & 0xff) == 0)
+                _gpu.MatMulBatchedGemm(outAll, weights, inAll, n, dt);
+            else
+                _gpu.MatMulBatched(outAll, weights, inAll, n, dt);
+        }
         else if (dt == DType.Float32)
         {
             // C[n×rows] = A[n×cols] · B[rows×cols]ᵀ  →  Sgemm(C, A, B, M=n, K=cols, N=rows).
