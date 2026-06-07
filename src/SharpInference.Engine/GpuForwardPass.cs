@@ -622,6 +622,20 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             {
                 bool useRoPE = _hp.NoRopeLayerStep == 0
                     || (layer + 1) % _hp.NoRopeLayerStep != 0;
+
+                // Ordering (issue #157): RoPE does NOT commute with per-channel-weighted
+                // QK-norm (NEOX RoPE mixes channels i and i+d/2, which carry different
+                // learned weights), so mirror the CPU ForwardPass / HF Qwen3 / llama.cpp
+                // build_qwen3 order exactly:
+                //   • weighted QK-norm (Qwen3, …): norm BEFORE RoPE
+                //   • L2 QK-norm (Llama-4):        norm AFTER  RoPE (RoPE layers only)
+                if (_hasQkNorm && !_hp.UseL2QkNorm)
+                {
+                    _gpu.HeadNorm(_q, _wqNorm![layer], (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                    _gpu.HeadNorm(_k, _wkNorm![layer], (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                    _gpu.RecordBarrier();
+                }
+
                 if (useRoPE)
                 {
                     // RoPE on Q and K
@@ -630,19 +644,12 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                     _gpu.RecordBarrier();
                 }
 
-                // QK-norm: for L2 (Llama-4), only on RoPE layers per llama.cpp
-                if (_hasQkNorm && (_hp.UseL2QkNorm ? useRoPE : true))
+                // L2 QK-norm (Llama-4): pure RMS norm without learned weights, after RoPE,
+                // only on RoPE layers per llama.cpp.
+                if (_hasQkNorm && _hp.UseL2QkNorm && useRoPE)
                 {
-                    if (_hp.UseL2QkNorm)
-                    {
-                        _gpu.HeadNormPure(_q, (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps);
-                        _gpu.HeadNormPure(_k, (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps);
-                    }
-                    else
-                    {
-                        _gpu.HeadNorm(_q, _wqNorm![layer], (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
-                        _gpu.HeadNorm(_k, _wkNorm![layer], (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
-                    }
+                    _gpu.HeadNormPure(_q, (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps);
+                    _gpu.HeadNormPure(_k, (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps);
                     _gpu.RecordBarrier();
                 }
             }

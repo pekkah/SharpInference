@@ -1,4 +1,5 @@
 using SharpInference.Core;
+using SharpInference.Cpu;
 using SharpInference.Cuda;
 using SharpInference.Engine;
 
@@ -123,6 +124,74 @@ public sealed class Qwen3CudaBatchedPrefillTests
         foreach (var t in batTop) if (seqTop.Contains(t)) overlap++;
         Assert.True(overlap >= 4,
             $"Default batched top-5 overlaps the per-token reference in only {overlap}/5 slots.");
+    }
+
+    /// <summary>
+    /// Issue #157 regression guard: the CUDA dense per-token <see cref="CudaForwardPass.Forward"/>
+    /// must apply per-head QK-norm <b>before</b> RoPE for weighted-QK-norm models (Qwen3), matching
+    /// the HF Qwen3 reference, llama.cpp <c>build_qwen3</c>, and the trusted CPU
+    /// <see cref="Engine.ForwardPass"/>. RoPE does not commute with per-channel-weighted RMSNorm (NEOX RoPE
+    /// mixes channels i and i+d/2, which carry different learned q_norm/k_norm weights), so a flipped
+    /// order silently degrades output.
+    /// <para>
+    /// This is a <b>cross-backend</b> oracle on purpose: the CUDA-vs-CUDA batched-prefill oracles
+    /// can't catch the bug because the batched path was deliberately built to match the per-token
+    /// loop — both were equally wrong. Only the CPU path (always norm→RoPE) is an independent
+    /// reference. Pre-fix the CUDA dense path was RoPE→norm and diverged ~9 logits from CPU
+    /// (#156); post-fix the two agree at argmax + top-5 (cross-backend Q4_K precision still differs).
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void Qwen3_8B_CudaForward_MatchesCpu_QkNormBeforeRope()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        // Precondition: this is exactly the buggy branch — weighted (non-L2) QK-norm + NEOX RoPE.
+        Assert.True(hp.HasQkNorm);
+        Assert.False(hp.UseL2QkNorm);
+        Assert.True(hp.IsNeoxRope);
+
+        // CPU reference (norm→RoPE, matches llama.cpp build_qwen3).
+        using var cpu = new CpuBackend();
+        using var cpuFwd = new Engine.ForwardPass(model, cpu, hp, maxContextLength: 512);
+        var cpuLogits = cpuFwd.Prefill(Tokens).ToArray();
+
+        // CUDA dense per-token path (Forward loop; batched prefill off so this is the
+        // RunDeviceRegion ordering under test, not the batched trunk).
+        using var cudaFwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 512)
+        {
+            BatchedPrefillEnabled = false,
+        };
+        var cudaLogits = cudaFwd.Prefill(Tokens).ToArray();
+        Assert.False(cudaFwd.LastPrefillWasBatched);
+
+        Assert.Equal(cpuLogits.Length, cudaLogits.Length);
+
+        float maxAbs = 0f;
+        for (int i = 0; i < cpuLogits.Length; i++)
+            maxAbs = MathF.Max(maxAbs, MathF.Abs(cpuLogits[i] - cudaLogits[i]));
+
+        // Argmax must agree across backends; pre-fix the order mismatch flips it / scrambles top-5.
+        Assert.Equal(Argmax(cpuLogits), Argmax(cudaLogits));
+
+        var cpuTop = TopKSet(cpuLogits, 5);
+        var cudaTop = TopKSet(cudaLogits, 5);
+        int overlap = 0;
+        foreach (var t in cudaTop) if (cpuTop.Contains(t)) overlap++;
+        Assert.True(overlap >= 4,
+            $"CUDA dense Forward top-5 overlaps the CPU reference in only {overlap}/5 slots " +
+            $"(maxAbs={maxAbs}). A RoPE/QK-norm ordering regression (#157) is the likely cause.");
+
+        // With matching order, cross-backend Q4_K divergence is small (≪ the ~9-logit gap a flipped
+        // order produces). 4.0 cleanly separates "same order, different backend" from "wrong order".
+        Assert.True(maxAbs < 4.0f,
+            $"CUDA dense Forward diverged from CPU by maxAbs={maxAbs} — far beyond cross-backend " +
+            "Q4_K precision; suggests a RoPE/QK-norm ordering regression (#157).");
     }
 
     /// <summary>

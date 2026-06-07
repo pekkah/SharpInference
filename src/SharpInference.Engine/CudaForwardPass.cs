@@ -1029,24 +1029,29 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
             bool useRoPE = _hp.NoRopeLayerStep == 0
                 || (layer + 1) % _hp.NoRopeLayerStep != 0;
+
+            // Order matters: RoPE does NOT commute with per-channel-weighted QK-norm
+            // (NEOX RoPE mixes channels i and i+d/2, which carry different learned
+            // weights), so we mirror the CPU ForwardPass / HF Qwen3 / llama.cpp
+            // build_qwen3 ordering exactly (issue #157):
+            //   • weighted QK-norm (Qwen3, OLMoE, …): norm BEFORE RoPE
+            //   • L2 QK-norm (Llama-4):               norm AFTER  RoPE (RoPE layers only)
+            if (_hasQkNorm && !_hp.UseL2QkNorm)
+            {
+                _gpu.HeadNorm(_q, _wqNorm![layer], _numHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                _gpu.HeadNorm(_k, _wkNorm![layer], _numKvHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+            }
+
             if (useRoPE)
             {
                 _gpu.RoPE(_q, position, _headDim, _hp.RopeTheta, _hp.IsNeoxRope);
                 _gpu.RoPE(_k, position, _headDim, _hp.RopeTheta, _hp.IsNeoxRope);
             }
 
-            if (_hasQkNorm && (_hp.UseL2QkNorm ? useRoPE : true))
+            if (_hasQkNorm && _hp.UseL2QkNorm && useRoPE)
             {
-                if (_hp.UseL2QkNorm)
-                {
-                    _gpu.HeadNormPure(_q, _numHeads, _headDim, _hp.RmsNormEps);
-                    _gpu.HeadNormPure(_k, _numKvHeads, _headDim, _hp.RmsNormEps);
-                }
-                else
-                {
-                    _gpu.HeadNorm(_q, _wqNorm![layer], _numHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
-                    _gpu.HeadNorm(_k, _wkNorm![layer], _numKvHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
-                }
+                _gpu.HeadNormPure(_q, _numHeads, _headDim, _hp.RmsNormEps);
+                _gpu.HeadNormPure(_k, _numKvHeads, _headDim, _hp.RmsNormEps);
             }
 
             // SnapKV (issue #59): capture the post-RoPE / post-Q-norm query for
@@ -1604,23 +1609,22 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             AccPhase(PH_QKV, sw, ref t0);
 
             bool useRoPE = _hp.NoRopeLayerStep == 0 || (layer + 1) % _hp.NoRopeLayerStep != 0;
+            // Same ordering contract as RunDeviceRegion (issue #157): weighted QK-norm
+            // before RoPE, L2 QK-norm after RoPE — RoPE does not commute with weighted norm.
+            if (_hasQkNorm && !_hp.UseL2QkNorm)
+            {
+                _gpu.HeadNorm(_q, _wqNorm![layer], _numHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                _gpu.HeadNorm(_k, _wkNorm![layer], _numKvHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+            }
             if (useRoPE)
             {
                 _gpu.RoPE(_q, position, _headDim, _hp.RopeTheta, _hp.IsNeoxRope);
                 _gpu.RoPE(_k, position, _headDim, _hp.RopeTheta, _hp.IsNeoxRope);
             }
-            if (_hasQkNorm && (_hp.UseL2QkNorm ? useRoPE : true))
+            if (_hasQkNorm && _hp.UseL2QkNorm && useRoPE)
             {
-                if (_hp.UseL2QkNorm)
-                {
-                    _gpu.HeadNormPure(_q, _numHeads, _headDim, _hp.RmsNormEps);
-                    _gpu.HeadNormPure(_k, _numKvHeads, _headDim, _hp.RmsNormEps);
-                }
-                else
-                {
-                    _gpu.HeadNorm(_q, _wqNorm![layer], _numHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
-                    _gpu.HeadNorm(_k, _wkNorm![layer], _numKvHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
-                }
+                _gpu.HeadNormPure(_q, _numHeads, _headDim, _hp.RmsNormEps);
+                _gpu.HeadNormPure(_k, _numKvHeads, _headDim, _hp.RmsNormEps);
             }
             _gpu.Synchronize();
             AccPhase(PH_ROPE_QKN, sw, ref t0);
@@ -2273,10 +2277,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         }
 
         // RoPE and per-head QK-norm must run in the SAME order as the matching per-token
-        // oracle, because RoPE does not commute with per-channel-weighted RMSNorm: Gemma
-        // applies QK-norm before RoPE (RunGemma4DeviceRegion), the dense path applies RoPE
-        // before QK-norm (Forward). NoRopeLayerStep skips RoPE on the same layers as the
-        // per-token path; QK-norm (weighted) always runs. L2 QK-norm is gated out upstream.
+        // oracle, because RoPE does not commute with per-channel-weighted RMSNorm. All
+        // weighted-QK-norm dense models (Gemma, Qwen3, …) apply QK-norm BEFORE RoPE — the
+        // HF / llama.cpp ordering also followed by the per-token RunDeviceRegion and the CPU
+        // ForwardPass (issue #157). NoRopeLayerStep skips RoPE on the same layers as the
+        // per-token path; QK-norm (weighted) always runs. L2 QK-norm is gated out upstream
+        // (IsBatchedPrefillSupported returns false), so only the weighted norm→rope case lands here.
         bool useRoPE = _hp.NoRopeLayerStep == 0 || (layer + 1) % _hp.NoRopeLayerStep != 0;
         float ropeTheta = isSwa ? _ropeThetaSwa : _hp.RopeTheta;
 
@@ -2307,8 +2313,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             }
         }
 
-        if (_isGemma4Like) { ApplyQkNormBatched(); ApplyRopeBatched(); }
-        else { ApplyRopeBatched(); ApplyQkNormBatched(); }
+        // Weighted QK-norm before RoPE for every dense family (issue #157).
+        ApplyQkNormBatched();
+        ApplyRopeBatched();
 
         if (!kvShared)
         {

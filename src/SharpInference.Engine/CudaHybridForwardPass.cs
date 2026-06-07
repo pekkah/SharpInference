@@ -1246,8 +1246,20 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         if (_hasAttnBias)
             throw new InvalidOperationException("Batched-trunk prefill does not support attention bias.");
 
-        // ── RoPE (batched, full headDim NEOX). NoPE layers skip RoPE, matching GpuLayer.
         bool useRoPE = _hp.NoRopeLayerStep == 0 || (i + 1) % _hp.NoRopeLayerStep != 0;
+
+        // ── QK-norm BEFORE RoPE (batched, learned). RoPE does not commute with weighted
+        //    QK-norm, so this must run in the same order as the per-token GpuLayer path and
+        //    the CPU/HF/llama.cpp reference (issue #157). L2/pure QK-norm is gated out by
+        //    IsBatchedPrefillSupported (no batched kernel); the explicit !UseL2QkNorm guard
+        //    keeps _gpuQNorm/_gpuKNorm (null for L2) from dereferencing if that gate ever changes.
+        if (_hasQkNorm && !_hp.UseL2QkNorm)
+        {
+            _gpu.HeadNormBatched(qAll, _gpuQNorm![i], _numHeads,   _headDim, n, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+            _gpu.HeadNormBatched(kAll, _gpuKNorm![i], _numKvHeads, _headDim, n, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+        }
+
+        // ── RoPE (batched, full headDim NEOX). NoPE layers skip RoPE, matching GpuLayer.
         if (useRoPE)
         {
             // RoPEPartialBatched with ropeDim==headDim matches the per-token RoPE(neox)
@@ -1258,13 +1270,6 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             // (which compares RoPEPartialBatched against RoPEPartial).
             _gpu.RoPEPartialBatched(qAll, startPos, _headDim, _headDim, _hp.RopeTheta, _numHeads,   n, neox: true);
             _gpu.RoPEPartialBatched(kAll, startPos, _headDim, _headDim, _hp.RopeTheta, _numKvHeads, n, neox: true);
-        }
-
-        // ── QK-norm (batched, learned). L2/pure QK-norm was gated out (no batched kernel).
-        if (_hasQkNorm)
-        {
-            _gpu.HeadNormBatched(qAll, _gpuQNorm![i], _numHeads,   _headDim, n, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
-            _gpu.HeadNormBatched(kAll, _gpuKNorm![i], _numKvHeads, _headDim, n, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
         }
 
         // ── KV append + SDPA (batched). Shared-scores fast path when startPos+n ≤ 4096,
@@ -1355,6 +1360,18 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             // NoPE: skip RoPE for NoPE layers
             bool useRoPE = _hp.NoRopeLayerStep == 0
                 || (i + 1) % _hp.NoRopeLayerStep != 0;
+
+            // Ordering (issue #157): RoPE does NOT commute with per-channel-weighted
+            // QK-norm, so mirror the CPU ForwardPass / HF Qwen3 / llama.cpp order:
+            //   • weighted QK-norm (Qwen3, …): norm BEFORE RoPE
+            //   • L2 QK-norm (Llama-4):        norm AFTER  RoPE (RoPE layers only)
+            if (_hasQkNorm && !_hp.UseL2QkNorm)
+            {
+                _gpu.HeadNorm(_gpuQ, _gpuQNorm![i], _numHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                _gpu.HeadNorm(_gpuK, _gpuKNorm![i], _numKvHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                _gpu.RecordBarrier();
+            }
+
             if (useRoPE)
             {
                 _gpu.RoPE(_gpuQ, position, _headDim, _hp.RopeTheta, _hp.IsNeoxRope);
@@ -1362,19 +1379,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 _gpu.RecordBarrier();
             }
 
-            // QK-norm: for L2 (Llama-4), only on RoPE layers per llama.cpp
-            if (_hasQkNorm && (_hp.UseL2QkNorm ? useRoPE : true))
+            if (_hasQkNorm && _hp.UseL2QkNorm && useRoPE)
             {
-                if (_hp.UseL2QkNorm)
-                {
-                    _gpu.HeadNormPure(_gpuQ, _numHeads, _headDim, _hp.RmsNormEps);
-                    _gpu.HeadNormPure(_gpuK, _numKvHeads, _headDim, _hp.RmsNormEps);
-                }
-                else
-                {
-                    _gpu.HeadNorm(_gpuQ, _gpuQNorm![i], _numHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
-                    _gpu.HeadNorm(_gpuK, _gpuKNorm![i], _numKvHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
-                }
+                _gpu.HeadNormPure(_gpuQ, _numHeads, _headDim, _hp.RmsNormEps);
+                _gpu.HeadNormPure(_gpuK, _numKvHeads, _headDim, _hp.RmsNormEps);
                 _gpu.RecordBarrier();
             }
         }
