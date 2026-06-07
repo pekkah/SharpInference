@@ -464,17 +464,19 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // sequential prefill within one process; resolved from the env at class load.
     internal static bool BatchedPrefillEnabled =
         Environment.GetEnvironmentVariable("SHARPI_BATCHED_PREFILL") != "0";
-    // Issue #162: route batched-prefill Q6_K/Q5_K trunk matmuls through the
-    // compute-bound dequant→fp16→cuBLAS GEMM (weight read once per batch) instead of
-    // the per-token GEMM-N matvec that re-streams the whole weight once per token.
-    // Dense GDN _M mixes (e.g. Qwen3.6-27B-MTP: Q6_K attn_qkv/ffn_down + Q5_K ssm_out)
-    // otherwise pay the memory-bound fallback for most of the prefill trunk. Like the
-    // dense path's GEMM (CudaForwardPass), this is argmax-stable, NOT byte-exact — so
-    // the bit-parity oracle (CudaHybridGdnBatchedPrefillTests) pins it OFF to keep
-    // validating the byte-exact matvec path; the GEMM kernels' correctness is covered
-    // by CudaGemmQ6KTests / CudaGemmQ5KTests. Settable for that test; SHARPI_GDN_PREFILL_GEMM=0 reverts.
-    internal static bool GdnPrefillGemmEnabled =
-        Environment.GetEnvironmentVariable("SHARPI_GDN_PREFILL_GEMM") != "0";
+    // Issue #162: route batched-prefill trunk matmuls through the compute-bound path
+    // (weight read once per batch) instead of the per-token GEMM-N matvec that re-streams
+    // the whole weight once per token. Q8_0/Q4_K → int8 MMQ; Q6_K/Q5_K (no MMQ kernel) →
+    // dequant→fp16→cuBLAS GEMM. The GDN trunk is mostly Q4_K (attn q/k/o + dense FFN) with
+    // Q6_K/Q5_K islands (e.g. Qwen3.6-27B-MTP: Q6_K attn_qkv/ffn_down, Q5_K ssm_out), so
+    // routing ONLY Q6_K/Q5_K left the Q4_K bulk on the memory-bound fallback. Like the
+    // all-GPU path (CudaForwardPass), MMQ/GEMM are argmax-stable, NOT byte-exact — so the
+    // bit-parity oracle (CudaHybridGdnBatchedPrefillTests) pins this OFF to keep validating
+    // the byte-exact matvec batching; the MMQ/GEMM kernels' correctness is covered by
+    // CudaMmqQ4K/Q8_0Tests + CudaGemmQ6K/Q5KTests. Settable for that test;
+    // SHARPI_GDN_PREFILL_COMPUTE=0 reverts to the byte-exact per-token matvec.
+    internal static bool GdnPrefillComputeEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_GDN_PREFILL_COMPUTE") != "0";
     private int _bCap;                 // token capacity the batched scratch is sized for (grow-only)
     private Tensor? _gpuStreamAll;     // [N × embDim] inter-layer residual stream for all tokens
     private float* _bResidAll;         // [bCap × embDim] pinned — per-token MoE residual (postBlock hidden)
@@ -4610,18 +4612,24 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private void GpuMatMulBatched(Tensor outputAll, Tensor matrix, Tensor inputAll, int nTok)
     {
         var dt = _gpuWeightDTypes.TryGetValue(matrix.Handle, out var d) ? d : DType.Float32;
-        // #162: Q6_K/Q5_K trunk weights have no int8 MMQ kernel and otherwise fall to the
-        // per-token GEMM-N matvec (weight re-streamed once/token). When the prompt is
-        // batched (nTok > 1), route them through the compute-bound dequant→fp16→cuBLAS
-        // GEMM (weight read once per batch). Argmax-stable, not byte-exact — gated so the
-        // bit-parity oracle keeps the matvec path. Q6_K/Q5_K super-blocks are 256-wide.
-        if (GdnPrefillGemmEnabled && nTok > 1 && dt is DType.Q6_K or DType.Q5_K)
+        // #162: in a batched prompt (nTok > 1), read each weight once per batch instead of
+        // the per-token GEMM-N matvec re-stream. Q8_0/Q4_K → int8 MMQ (no fp16 temp);
+        // Q6_K/Q5_K (no MMQ kernel) → dequant→fp16→cuBLAS GEMM. Argmax-stable, gated so the
+        // bit-parity oracle keeps the matvec path. Q4_K/Q6_K/Q5_K need 256-aligned cols;
+        // Q8_0 needs 32 — true for every projection dim, but guarded so we fall back
+        // (never throw) on an odd shape.
+        if (GdnPrefillComputeEnabled && nTok > 1)
         {
             int cols = (int)(inputAll.ElementCount / nTok);
-            if ((cols & 0xff) == 0)
+            switch (dt)
             {
-                _gpu.MatMulBatchedGemm(outputAll, matrix, inputAll, nTok, dt);
-                return;
+                case DType.Q8_0 when (cols & 31) == 0:
+                    _gpu.MatMulBatchedMmq(outputAll, matrix, inputAll, nTok, dt); return;
+                case DType.Q4_K when (cols & 0xff) == 0:
+                    _gpu.MatMulBatchedMmq(outputAll, matrix, inputAll, nTok, dt); return;
+                case DType.Q6_K when (cols & 0xff) == 0:
+                case DType.Q5_K when (cols & 0xff) == 0:
+                    _gpu.MatMulBatchedGemm(outputAll, matrix, inputAll, nTok, dt); return;
             }
         }
         _gpu.MatMulBatched(outputAll, matrix, inputAll, nTok, dt);

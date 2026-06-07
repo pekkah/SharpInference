@@ -21,10 +21,21 @@ namespace SharpInference.Tests.ForwardPass;
 /// Skipped silently when CUDA is unavailable, the model isn't on disk, or
 /// construction OOMs — but a failure INSIDE Prefill must FAIL, not skip.
 /// </summary>
-public sealed class CudaHybridBatchedPrefillTests
+public sealed class CudaHybridBatchedPrefillTests : IDisposable
 {
     private readonly ITestOutputHelper _out;
-    public CudaHybridBatchedPrefillTests(ITestOutputHelper o) => _out = o;
+    // Issue #162: these oracles assert the batched trunk is bit-identical to the
+    // sequential loop. The compute-bound attention-projection path (MMQ/GEMM) is
+    // argmax-stable, NOT byte-exact, so pin it OFF for the whole class to keep the batched
+    // side on the byte-exact matvec. MMQ/GEMM correctness is covered by CudaMmqQ4K/Q8_0Tests
+    // + CudaGemmQ6K/Q5KTests. Restored in Dispose.
+    private readonly bool _prevHybridCompute = CudaHybridForwardPass.HybridPrefillComputeEnabled;
+    public CudaHybridBatchedPrefillTests(ITestOutputHelper o)
+    {
+        _out = o;
+        CudaHybridForwardPass.HybridPrefillComputeEnabled = false;
+    }
+    public void Dispose() => CudaHybridForwardPass.HybridPrefillComputeEnabled = _prevHybridCompute;
 
     private static CudaBackend? TryCreate()
     {

@@ -159,6 +159,16 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     internal static bool BatchedPrefillEnabled =
         Environment.GetEnvironmentVariable("SHARPI_BATCHED_PREFILL") != "0";
 
+    // Issue #162: route the batched attention projections (q/k/v/o) through the
+    // compute-bound path (Q8_0/Q4_K int8 MMQ, Q6_K/Q5_K dequant→fp16 GEMM, weight read
+    // once per batch) instead of the per-token GEMM-N matvec re-stream. NOTE: only the
+    // attention projections are batched in this path (#123 scope) — the FFN/MoE stage
+    // stays per-token — so this helps the q/k/v/o matmuls only. Argmax-stable, NOT
+    // byte-exact → the bit-parity oracle (CudaHybridBatchedPrefillTests) pins it OFF.
+    // SHARPI_HYBRID_PREFILL_COMPUTE=0 reverts to the byte-exact per-token matvec.
+    internal static bool HybridPrefillComputeEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_HYBRID_PREFILL_COMPUTE") != "0";
+
     // Test observable (issue #123): set by Prefill to whether the last call dispatched the
     // batched-trunk path (true) or fell back to the per-token loop (false). Lets the parity
     // oracles assert the batched path actually ran instead of passing vacuously when the
@@ -1295,8 +1305,25 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
 
     private void GpuMatMulBatched(Tensor outputAll, Tensor weights, Tensor inputAll, int nTok)
     {
-        _gpu.MatMulBatched(outputAll, weights, inputAll, nTok,
-            _gpuWeightDTypes.TryGetValue(weights.Handle, out var dt) ? dt : DType.Float32);
+        var dt = _gpuWeightDTypes.TryGetValue(weights.Handle, out var d) ? d : DType.Float32;
+        // #162: read each weight once per batch (Q8_0/Q4_K → int8 MMQ; Q6_K/Q5_K → dequant
+        // →fp16 GEMM) instead of the per-token GEMM-N matvec re-stream. Argmax-stable,
+        // gated so the bit-parity oracle keeps the matvec path. Guarded on block alignment.
+        if (HybridPrefillComputeEnabled && nTok > 1)
+        {
+            int cols = (int)(inputAll.ElementCount / nTok);
+            switch (dt)
+            {
+                case DType.Q8_0 when (cols & 31) == 0:
+                    _gpu.MatMulBatchedMmq(outputAll, weights, inputAll, nTok, dt); return;
+                case DType.Q4_K when (cols & 0xff) == 0:
+                    _gpu.MatMulBatchedMmq(outputAll, weights, inputAll, nTok, dt); return;
+                case DType.Q6_K when (cols & 0xff) == 0:
+                case DType.Q5_K when (cols & 0xff) == 0:
+                    _gpu.MatMulBatchedGemm(outputAll, weights, inputAll, nTok, dt); return;
+            }
+        }
+        _gpu.MatMulBatched(outputAll, weights, inputAll, nTok, dt);
     }
 
     // ================================================================
