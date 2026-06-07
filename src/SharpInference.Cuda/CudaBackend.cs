@@ -125,6 +125,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _embedLookupF32Kernel;
     private nint   _embedLookupQ4KKernel;
     private nint   _embedLookupQ5KKernel;
+    private nint   _embedLookupQ6KKernel;   // #124: Q6_K tied embedding (Gemma 4 12B)
     private nint   _embedLookupQ80Kernel;
     private nint   _embedLookupQ80BatchedKernel;
     private nint   _matvecF32Kernel;
@@ -3921,6 +3922,32 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>
+    /// Dequantize one row from a Q6_K-packed embedding table directly into
+    /// <paramref name="output"/> (issue #124, Gemma 4 12B tied token_embd). Keeps the
+    /// (3840, 262144) Q6_K table packed (~787 MiB) off the F32 dequant path that would
+    /// burn ~4 GB of VRAM. <paramref name="embDim"/> must be a multiple of 256.
+    /// </summary>
+    public void EmbedLookupQ6K(Tensor embTable, Tensor output, int tokenId, int embDim)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if ((embDim & 0xff) != 0)
+            throw new ArgumentException($"EmbedLookupQ6K requires embDim to be a multiple of 256 (got {embDim}).");
+
+        nint tP = GetDevPtr(embTable);
+        nint oP = GetDevPtr(output);
+        int  pT = tokenId, pE = embDim;
+        nint* args = stackalloc nint[4]
+        {
+            (nint)(&tP), (nint)(&oP),
+            (nint)(&pT), (nint)(&pE)
+        };
+        int r = NvrtcInterop.LaunchKernel(_embedLookupQ6KKernel, 1, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(embed_lookup_q6k) failed: {r}");
+    }
+
+    /// <summary>
     /// Dequantize one row from a Q8_0-packed embedding table directly into <paramref name="output"/>.
     /// <paramref name="embDim"/> must be a multiple of 256 (8 Q8_0 blocks per outer iteration).
     /// Phase 0 of the Gemma-4 plan: keeps the (10752, 262144) Q8_0 token-embd table off
@@ -4588,8 +4615,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _snapKvScoreKernel, _snapKvScoreBf16Kernel,
             _kvCompactKernel, _kvCompactBf16Kernel,
             _embedLookupF32Kernel, _embedLookupQ4KKernel, _embedLookupQ5KKernel,
+            _embedLookupQ6KKernel,
             _embedLookupQ80Kernel, _embedLookupQ80BatchedKernel,
-            _matvecF32Kernel, _matvecQ4KKernel, _matvecQ5KKernel, _matvecQ6KKernel,
+            _matvecF32Kernel, _matvecQ40Kernel, _matvecQ4KKernel, _matvecQ5KKernel, _matvecQ6KKernel,
             _matvecQ80Kernel,
             _matvecF32N2Kernel, _matvecQ4KN2Kernel, _matvecQ5KN2Kernel, _matvecQ6KN2Kernel,
             _matvecF32GemmNKernel, _matvecQ4KGemmNKernel, _matvecQ5KGemmNKernel, _matvecQ6KGemmNKernel,
@@ -4661,6 +4689,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _embedLookupF32Kernel  = GetKernelFunc("llm_embed_lookup_f32");
         _embedLookupQ4KKernel  = GetKernelFunc("llm_embed_lookup_q4k");
         _embedLookupQ5KKernel  = GetKernelFunc("llm_embed_lookup_q5k");
+        _embedLookupQ6KKernel  = GetKernelFunc("llm_embed_lookup_q6k");
         _embedLookupQ80Kernel  = GetKernelFunc("llm_embed_lookup_q8_0");
         _embedLookupQ80BatchedKernel = GetKernelFunc("llm_embed_lookup_q8_0_batched");
         _matvecF32Kernel       = GetKernelFunc("llm_matvec_f32");

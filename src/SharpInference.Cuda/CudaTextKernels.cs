@@ -791,6 +791,51 @@ extern ""C"" __global__ void llm_embed_lookup_q5k(
     }
 }
 
+// ── Embedding lookup from Q6_K table (issue #124, Gemma 4 12B tied embedding) ─
+// Q6_K block (210 bytes / 256 elems): [ql:128][qh:64][scales:16 int8][d:fp16].
+// One CUDA block of 256 threads gathers one row (emb_dim elements) of token_id;
+// thread tid emits element tid of each 256-element super-block. Per-element decode
+// mirrors llm_matvec_q6k exactly. emb_dim must be a multiple of 256.
+extern ""C"" __global__ void llm_embed_lookup_q6k(
+    const unsigned char* __restrict__ emb_data,
+    float* __restrict__ output,
+    int token_id, int emb_dim)
+{
+    __shared__ unsigned char blk[210];
+    unsigned int tid = threadIdx.x;
+
+    int num_blocks = emb_dim >> 8;                  // emb_dim / 256
+    long bytes_per_row = (long)num_blocks * 210L;
+    long row_byte_base = (long)token_id * bytes_per_row;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long base = row_byte_base + (long)block * 210L;
+        if (tid < 210) blk[tid] = emb_data[base + tid];
+        __syncthreads();
+
+        unsigned int lane = tid & 31u;          // 0..31
+        unsigned int g    = tid >> 5;           // group 0..7
+        unsigned int isc  = lane >> 4;          // 0 or 1 (scale half)
+
+        float d = sharpi_fp16_to_fp32((unsigned int)blk[208] | ((unsigned int)blk[209] << 8));
+        float scale = d * (float)((signed char)blk[192 + 2u * g + isc]);
+
+        // ql byte: groups {0,2}->ql0, {1,3}->ql1, {4,6}->ql2, {5,7}->ql3 (+lane).
+        unsigned int ql_index = (g < 4u) ? (g & 1u) : (2u + (g & 1u));
+        unsigned int ql_byte  = blk[ql_index * 32u + lane];
+        unsigned int high     = (g >> 1) & 1u;  // groups 2,3,6,7 use the high nibble
+        unsigned int nib      = high ? (ql_byte >> 4) : (ql_byte & 0xFu);
+
+        // qh: groups 0-3 from qh0 (offset 128), 4-7 from qh1 (160); 2-bit field per group.
+        unsigned int qh_byte = (g < 4u) ? blk[128 + lane] : blk[160 + lane];
+        unsigned int shift   = 2u * (g & 3u);
+        int q = (int)(nib | (((qh_byte >> shift) & 3u) << 4)) - 32;
+
+        output[block * 256 + (int)tid] = scale * (float)q;
+        __syncthreads();
+    }
+}
+
 // ── Embedding lookup from Q8_0 table ───────────────────────────────────────
 // Q8_0 block (34 bytes per 32 elements): [d:fp16][qs:32 × int8].
 // One CUDA block of 256 threads dequantizes one row (= emb_dim elements).

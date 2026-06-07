@@ -310,6 +310,10 @@ public sealed unsafe class ForwardPass : IForwardPass
         {
             int layerHd = _layerHeadDim?[i] ?? _headDim;
             bool kvShared = _layerKvSrc is not null && _layerKvSrc[i] >= 0;
+            // Gemma 4 12B global layers carry no attn_v (attention_k_eq_v): V reuses
+            // the K projection, so the tensor is genuinely absent.
+            bool kEqVLayer = _model.FindTensor($"blk.{i}.attn_v.weight") is null
+                          && _model.FindTensor($"blk.{i}.attn_k.weight") is not null;
 
             _attnNorm[i] = ResolveTensor($"blk.{i}.attn_norm.weight");
             _wq[i] = ResolveTensor($"blk.{i}.attn_q.weight");
@@ -322,7 +326,9 @@ public sealed unsafe class ForwardPass : IForwardPass
             if (!kvShared)
             {
                 _wk[i] = ResolveTensor($"blk.{i}.attn_k.weight");
-                _wv[i] = ResolveTensor($"blk.{i}.attn_v.weight");
+                // k_eq_v global layers have no attn_v; the runtime reuses K as V.
+                if (!kEqVLayer)
+                    _wv[i] = ResolveTensor($"blk.{i}.attn_v.weight");
             }
 
             if (hp.IsMoE)
@@ -434,7 +440,8 @@ public sealed unsafe class ForwardPass : IForwardPass
             bool kvShared = _layerKvSrc is not null && _layerKvSrc[i] >= 0;
             tensors.Add(_attnNorm[i]);
             tensors.Add(_wq[i]); tensors.Add(_wo[i]);
-            if (!kvShared) { tensors.Add(_wk[i]); tensors.Add(_wv[i]); }
+            // k_eq_v global layers have no attn_v (_wv[i] is default/unset).
+            if (!kvShared) { tensors.Add(_wk[i]); if (_wv[i].DataPtr is not null) tensors.Add(_wv[i]); }
             tensors.Add(_ffnNorm[i]);
             if (_postAttnNorm is not null) tensors.Add(_postAttnNorm[i]);
             if (_postFfwNorm is not null) tensors.Add(_postFfwNorm[i]);
