@@ -395,17 +395,21 @@ public sealed class Gemma4CudaBatchedPrefillTests
     /// 4096-token chunk before any of those queries attend (so it needs ring ≥ window +
     /// chunk span). If the ring were undersized, the chunked path would overwrite an
     /// earlier query's window and diverge from the per-token reference — so agreement
-    /// validates the window + SwaRingHeadroom sizing. ctx exceeds window + headroom, so the
-    /// SWA cache is a true ring (positions ≥ ring size wrap) rather than a full cache.
+    /// validates the window + SwaRingHeadroom sizing.
     /// </para>
     /// <para>
-    /// N=5040 exercises a full + partial chunk (4096 + 944); N=8192 the exact-multiple
-    /// boundary (two full 4096 chunks).
+    /// The prompt lengths make the LAST chunk SHORTER than the 512 window (4296 = 4096+200,
+    /// 8292 = 2·4096+100). Prefill returns only the final token's logits, and with a short
+    /// last chunk the final token's window reaches BACK across the preceding chunk boundary —
+    /// so the single observable logit genuinely depends on cross-chunk KV reads (and, for
+    /// 8292 at ctx 9216 &gt; window+headroom=4608, ring-WRAPPED reads). A whole-chunk prompt
+    /// (e.g. 8192) would leave the final window entirely inside the last chunk, hiding any
+    /// cross-chunk ring overwrite from the assertion. 8292 also drives a 3-chunk loop.
     /// </para>
     /// </summary>
     [Theory]
-    [InlineData(5040, 6144)]
-    [InlineData(8192, 9216)]
+    [InlineData(4296, 6144)]
+    [InlineData(8292, 9216)]
     public void Gemma4_E4B_ChunkedBatchedPrefill_Over4096_MatchesSequential(int promptLen, int ctx)
     {
         using var gpu = TryCreate();

@@ -406,6 +406,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             _maxSeqLen = EstimateMaxContextTq(model, gpu, hp, tqFp32Window, tqBits);
         else
             _maxSeqLen = EstimateMaxContext(model, gpu, hp);
+        // The KV-append/attention kernels index the cache at `pos % _maxSeqLen` (the ring
+        // modulo, identity for full caches), so a zero context — e.g. a malformed GGUF with
+        // context_length=0 reached via an explicit ctx-size — would be an in-kernel
+        // divide-by-zero (GPU trap). Fail loud at construction instead.
+        if (_maxSeqLen < 1)
+            throw new ArgumentException(
+                $"Resolved max context length is {_maxSeqLen}; the model's context_length " +
+                "metadata is missing or zero.", nameof(maxContextLength));
 
         if (_tqEnabled)
         {
@@ -1884,9 +1892,17 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             // SWA layers are now correct across chunk boundaries (issue #162): their KV
             // ring is sized window + SwaRingHeadroom (≥ one chunk span), so appending a
             // whole chunk before attending never overwrites a still-needed window, and the
-            // flash/append kernels wrap reads/writes modulo the ring (SwaRingSize). So flash
-            // alone gates chunking; windowed (Gemma 4) and dense models both qualify.
-            bool canChunkPast4096 = PrefillFlashAttnEnabled;
+            // flash/append kernels wrap reads/writes modulo the ring (SwaRingSize).
+            //
+            // Fail-closed guard (kept from the pre-#162 gate): the per-layer SWA dispatch
+            // keys off `IsSwaLayer`, which today only Gemma 4 populates. A future arch that
+            // sets a model-wide `SlidingWindowSize` WITHOUT a per-layer `IsSwaLayer` pattern
+            // would run every layer as full-causal (window silently ignored) — harmless
+            // within the proven 4096 cap, but extending that past 4096 would silently drop
+            // the window. So only chunk past 4096 when either there's a real per-layer SWA
+            // pattern or the model has no window at all.
+            bool canChunkPast4096 = PrefillFlashAttnEnabled
+                && (_hp.IsSwaLayer is not null || _hp.SlidingWindowSize <= 0);
             int cap = canChunkPast4096 ? _maxSeqLen : 4096;
             if (startPos + N <= cap)
             {
