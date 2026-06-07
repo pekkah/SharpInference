@@ -464,6 +464,17 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // sequential prefill within one process; resolved from the env at class load.
     internal static bool BatchedPrefillEnabled =
         Environment.GetEnvironmentVariable("SHARPI_BATCHED_PREFILL") != "0";
+    // Issue #162: route batched-prefill Q6_K/Q5_K trunk matmuls through the
+    // compute-bound dequant→fp16→cuBLAS GEMM (weight read once per batch) instead of
+    // the per-token GEMM-N matvec that re-streams the whole weight once per token.
+    // Dense GDN _M mixes (e.g. Qwen3.6-27B-MTP: Q6_K attn_qkv/ffn_down + Q5_K ssm_out)
+    // otherwise pay the memory-bound fallback for most of the prefill trunk. Like the
+    // dense path's GEMM (CudaForwardPass), this is argmax-stable, NOT byte-exact — so
+    // the bit-parity oracle (CudaHybridGdnBatchedPrefillTests) pins it OFF to keep
+    // validating the byte-exact matvec path; the GEMM kernels' correctness is covered
+    // by CudaGemmQ6KTests / CudaGemmQ5KTests. Settable for that test; SHARPI_GDN_PREFILL_GEMM=0 reverts.
+    internal static bool GdnPrefillGemmEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_GDN_PREFILL_GEMM") != "0";
     private int _bCap;                 // token capacity the batched scratch is sized for (grow-only)
     private Tensor? _gpuStreamAll;     // [N × embDim] inter-layer residual stream for all tokens
     private float* _bResidAll;         // [bCap × embDim] pinned — per-token MoE residual (postBlock hidden)
@@ -4598,8 +4609,22 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void GpuMatMulBatched(Tensor outputAll, Tensor matrix, Tensor inputAll, int nTok)
     {
-        _gpu.MatMulBatched(outputAll, matrix, inputAll, nTok,
-            _gpuWeightDTypes.TryGetValue(matrix.Handle, out var dt) ? dt : DType.Float32);
+        var dt = _gpuWeightDTypes.TryGetValue(matrix.Handle, out var d) ? d : DType.Float32;
+        // #162: Q6_K/Q5_K trunk weights have no int8 MMQ kernel and otherwise fall to the
+        // per-token GEMM-N matvec (weight re-streamed once/token). When the prompt is
+        // batched (nTok > 1), route them through the compute-bound dequant→fp16→cuBLAS
+        // GEMM (weight read once per batch). Argmax-stable, not byte-exact — gated so the
+        // bit-parity oracle keeps the matvec path. Q6_K/Q5_K super-blocks are 256-wide.
+        if (GdnPrefillGemmEnabled && nTok > 1 && dt is DType.Q6_K or DType.Q5_K)
+        {
+            int cols = (int)(inputAll.ElementCount / nTok);
+            if ((cols & 0xff) == 0)
+            {
+                _gpu.MatMulBatchedGemm(outputAll, matrix, inputAll, nTok, dt);
+                return;
+            }
+        }
+        _gpu.MatMulBatched(outputAll, matrix, inputAll, nTok, dt);
     }
 
     /// Issue #121: true when <paramref name="matrix"/>'s dtype is one of the dtypes
