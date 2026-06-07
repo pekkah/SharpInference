@@ -1465,6 +1465,53 @@ extern ""C"" __global__ void llm_matvec_q8_0(
     if (lane == 0) output[row] = result;
 }
 
+// ── Q4_0 fp32 matvec (Gemma 4 12B QAT primary weights, issue #124) ──────────
+// Q4_0 block (18 bytes per 32 elements): [d:fp16][qs:16 × uint8] — two signed
+// nibbles per byte. Element j (0..15) = low nibble of qs[j]; element j+16 = high
+// nibble. Value = (nibble - 8) * d. Mirrors dequantize_row_q4_0 / the CPU
+// DequantQ4_0 path. Same 8-rows/block × 32-threads/row geometry as the Q8_0
+// kernel; each lane owns exactly one element of the 32-wide block.
+extern ""C"" __global__ void llm_matvec_q4_0(
+    const unsigned int* __restrict__ weights,
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int rows, int cols)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    if (row >= rows) return;
+
+    int num_blocks = cols >> 5;                       // cols / 32
+    long row_base_bytes = (long)row * (long)num_blocks * 18L;
+
+    float acc = 0.f;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long b0 = row_base_bytes + (long)block * 18L;
+
+        // d: FP16 at offset 0..1 of the block (two bytes).
+        unsigned int dlo = sharpi_byte_at(weights, b0 + 0);
+        unsigned int dhi = sharpi_byte_at(weights, b0 + 1);
+        float d = sharpi_fp16_to_fp32(dlo | (dhi << 8));
+
+        // Two nibbles per byte: lane 0..15 read the low nibble of qs[lane],
+        // lanes 16..31 the high nibble of qs[lane-16]. q = nibble - 8.
+        unsigned int qbyte = sharpi_byte_at(weights, b0 + 2 + (long)(lane & 15));
+        int nib = (lane < 16) ? (int)(qbyte & 0xFu) : (int)(qbyte >> 4);
+        int q = nib - 8;
+
+        float x = input[block * 32 + lane];
+        acc += d * (float)q * x;
+    }
+
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output[row] = result;
+}
+
 // SoA-layout fp32 matvec (issue #149): bit-identical to llm_matvec_q8_0 but reads the
 // Q8_0 weight from the SoA buffer [quants rows*cols B][scales rows*nb fp16] — aligned
 // quant bytes, one aligned fp16 scale per block, no funnelshift.

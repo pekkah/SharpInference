@@ -133,6 +133,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _q4kRepackSoaKernel;     // #156: one-time Q4_K → SoA repack
     private nint   _matvecQ5KKernel;
     private nint   _matvecQ6KKernel;
+    // Q4_0 matvec (issue #124, Gemma 4 12B QAT): keeps the q4_0 weights packed on
+    // the GPU. Without it q4_0 falls to the F32-dequant upload (~4× VRAM — a 7 GB
+    // model would need ~28 GB, defeating full offload). 8 rows/block × 32 thr/row.
+    private nint   _matvecQ40Kernel;
     // Q8_0 matvec (Phase 0 of the Gemma-4 plan): keeps Q8_0 weights packed on
     // the GPU. Without this, Q8_0 weights would dequant to F32 on upload and
     // blow out VRAM ~2.1×. Geometry mirrors Q5_K/Q6_K (8 rows/block × 32 thr/row).
@@ -1587,11 +1591,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         bool soa = weightDType == DType.Q8_0 && _soaHandles.ContainsKey(matrix.Handle);
         nint kernel = weightDType switch
         {
+            DType.Q4_0    => _matvecQ40Kernel,
             DType.Q5_K    => _matvecQ5KKernel,
             DType.Q6_K    => _matvecQ6KKernel,
             DType.Q8_0    => soa ? _matvecQ80SoaKernel : _matvecQ80Kernel,
             DType.Float32 => _matvecF32Kernel,
-            _ => throw new NotSupportedException($"CUDA MatMul: weight dtype {weightDType} not supported (expected Q4_K, Q5_K, Q6_K, Q8_0, or Float32)."),
+            _ => throw new NotSupportedException($"CUDA MatMul: weight dtype {weightDType} not supported (expected Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, or Float32)."),
         };
 
         uint grid = (uint)((rows + 7) / 8);
@@ -4664,6 +4669,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _q4kRepackSoaKernel    = GetKernelFunc("llm_q4k_repack_soa");
         _matvecQ5KKernel       = GetKernelFunc("llm_matvec_q5k");
         _matvecQ6KKernel       = GetKernelFunc("llm_matvec_q6k");
+        _matvecQ40Kernel       = GetKernelFunc("llm_matvec_q4_0");
         _matvecQ80Kernel       = GetKernelFunc("llm_matvec_q8_0");
         _matvecQ80Dp4aKernel   = GetKernelFunc("llm_matvec_q8_0_dp4a");
         _matvecF32N2Kernel     = GetKernelFunc("llm_matvec_f32_n2");

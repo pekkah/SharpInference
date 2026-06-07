@@ -2637,6 +2637,14 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             result = _gpu.Upload(floats, TensorShape.D1(floats.Length), exact: true);
             _gpuWeightDTypes[result.Handle] = DType.Float32;
         }
+        else if (info.DType == DType.Q4_0)
+        {
+            // Q4_0 blocks are 18 bytes — not a multiple of 4 — so the byte→float
+            // pack used for Q4_K/Q6_K below would truncate. Upload the raw bytes
+            // verbatim (issue #124, Gemma 4 12B QAT).
+            result = _gpu.UploadRaw(data, TensorShape.D1(data.Length), info.DType, exact: true);
+            _gpuWeightDTypes[result.Handle] = info.DType;
+        }
         else if (info.DType == DType.Q4_K || info.DType == DType.Q6_K)
         {
             int floatCount = data.Length / 4;

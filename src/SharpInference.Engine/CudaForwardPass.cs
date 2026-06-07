@@ -2736,7 +2736,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             result = _gpu.Upload(floats, TensorShape.D1(floats.Length), exact: true);
             _weightDTypes[result.Handle] = DType.Float32;
         }
-        else if (info.DType == DType.Q4_K || info.DType == DType.Q6_K || info.DType == DType.Q8_0)
+        else if (info.DType == DType.Q4_0 || info.DType == DType.Q4_K || info.DType == DType.Q6_K || info.DType == DType.Q8_0)
         {
             result = _gpu.UploadRaw(data, TensorShape.D1(data.Length), info.DType, exact: true);
             // #149: repack 2-D Q8_0 GEMM weights (norms/biases are 1-D; embedding uploads
