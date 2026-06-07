@@ -129,11 +129,17 @@ public sealed class Qwen3CudaBatchedPrefillTests
     /// Issue #162: prompts longer than the non-flash 4096 cap must still take the fast
     /// batched-trunk path (chunked into <c>PrefillBatchChunk</c> windows, flash streaming
     /// the prior KV) and stay argmax-stable vs the bit-exact per-token loop — instead of
-    /// silently dropping to the ~8× slower memory-bound per-token prefill. Uses a ~5040-token
-    /// synthetic prompt so the chunked branch (two windows: 4096 + 944) engages.
+    /// silently dropping to the ~8× slower memory-bound per-token prefill.
+    /// <para>
+    /// N=5040 exercises a full + partial window (4096 + 944); N=8192 exercises the
+    /// exact-multiple boundary (two full 4096 windows, the final chunk's len == chunk size)
+    /// to catch the classic off-by-one in the chunk loop.
+    /// </para>
     /// </summary>
-    [Fact]
-    public void Qwen3_8B_ChunkedBatchedPrefill_Over4096_MatchesSequential()
+    [Theory]
+    [InlineData(5040, 6144)]
+    [InlineData(8192, 9216)]
+    public void Qwen3_8B_ChunkedBatchedPrefill_Over4096_MatchesSequential(int promptLen, int ctx)
     {
         using var gpu = TryCreate();
         if (gpu is null) return;
@@ -144,9 +150,9 @@ public sealed class Qwen3CudaBatchedPrefillTests
         var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
         Assert.Null(hp.LayerHeadDim);
 
-        // ~5040 tokens (> 4096) → forces the chunked branch. Deterministic spread across
-        // the vocab via a small LCG; all ids well within Qwen3's 151936 vocab.
-        var longTokens = new int[5040];
+        // > 4096 tokens → forces the chunked branch. Deterministic spread across the vocab
+        // via a small LCG; all ids well within Qwen3's 151936 vocab.
+        var longTokens = new int[promptLen];
         uint s = 0x9E3779B9u;
         for (int i = 0; i < longTokens.Length; i++)
         {
@@ -159,7 +165,7 @@ public sealed class Qwen3CudaBatchedPrefillTests
         var prevSnap = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_BUDGET");
         Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", "0");
         CudaForwardPass fwd;
-        try { fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 6144); }
+        try { fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: ctx); }
         finally { Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", prevSnap); }
         using var _fwd = fwd;
 

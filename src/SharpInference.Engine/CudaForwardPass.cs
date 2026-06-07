@@ -1852,10 +1852,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             && startPos + N <= _maxSeqLen && IsBatchedPrefillSupported())
         {
             // Chunking past 4096 requires a streaming attention path (flash) AND simple
-            // (non-windowed) KV position semantics. SWA layers (Gemma 4) wrap KV in a
-            // window-sized ring whose cross-chunk behaviour past the window boundary is not
-            // yet validated, so they keep the proven 4096 cap (follow-up: #162).
-            bool canChunkPast4096 = PrefillFlashAttnEnabled && _hp.IsSwaLayer is null;
+            // (non-windowed) KV position semantics. SWA layers wrap KV in a window-sized
+            // ring whose cross-chunk behaviour past the window boundary is not yet
+            // validated, so any windowed model keeps the proven 4096 cap (follow-up: #162).
+            // Note: `IsSwaLayer` is only populated for Gemma 4 today, so the explicit
+            // `SlidingWindowSize <= 0` check fails closed if SWA parsing is later extended
+            // to a uniform-window arch that sets the window without a per-layer pattern.
+            bool canChunkPast4096 = PrefillFlashAttnEnabled
+                                  && _hp.IsSwaLayer is null && _hp.SlidingWindowSize <= 0;
             int cap = canChunkPast4096 ? _maxSeqLen : 4096;
             if (startPos + N <= cap)
             {
