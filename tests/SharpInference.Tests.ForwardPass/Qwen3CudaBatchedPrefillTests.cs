@@ -126,6 +126,72 @@ public sealed class Qwen3CudaBatchedPrefillTests
     }
 
     /// <summary>
+    /// Issue #162: prompts longer than the non-flash 4096 cap must still take the fast
+    /// batched-trunk path (chunked into <c>PrefillBatchChunk</c> windows, flash streaming
+    /// the prior KV) and stay argmax-stable vs the bit-exact per-token loop — instead of
+    /// silently dropping to the ~8× slower memory-bound per-token prefill.
+    /// <para>
+    /// N=5040 exercises a full + partial window (4096 + 944); N=8192 exercises the
+    /// exact-multiple boundary (two full 4096 windows, the final chunk's len == chunk size)
+    /// to catch the classic off-by-one in the chunk loop.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(5040, 6144)]
+    [InlineData(8192, 9216)]
+    public void Qwen3_8B_ChunkedBatchedPrefill_Over4096_MatchesSequential(int promptLen, int ctx)
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.Null(hp.LayerHeadDim);
+
+        // > 4096 tokens → forces the chunked branch. Deterministic spread across the vocab
+        // via a small LCG; all ids well within Qwen3's 151936 vocab.
+        var longTokens = new int[promptLen];
+        uint s = 0x9E3779B9u;
+        for (int i = 0; i < longTokens.Length; i++)
+        {
+            s = s * 1664525u + 1013904223u;
+            longTokens[i] = (int)(s % 150000u) + 1;
+        }
+
+        // Disable SnapKV (a >budget prompt would otherwise route to the per-token SnapKV
+        // eviction path before the batched gate). Construct under the override, then restore.
+        var prevSnap = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_BUDGET");
+        Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", "0");
+        CudaForwardPass fwd;
+        try { fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: ctx); }
+        finally { Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", prevSnap); }
+        using var _fwd = fwd;
+
+        // Shipped defaults (flash TC on) → chunked batched path.
+        fwd.BatchedPrefillEnabled = true;
+        var batched = fwd.Prefill(longTokens).ToArray();
+        Assert.True(fwd.LastPrefillWasBatched,
+            "Chunked batched prefill did not engage for a >4096-token prompt (#162).");
+
+        fwd.ResetCache();
+        fwd.BatchedPrefillEnabled = false;
+        var sequential = fwd.Prefill(longTokens).ToArray();
+        Assert.False(fwd.LastPrefillWasBatched);
+
+        Assert.Equal(sequential.Length, batched.Length);
+        Assert.Equal(Argmax(sequential), Argmax(batched));
+
+        var seqTop = TopKSet(sequential, 5);
+        var batTop = TopKSet(batched, 5);
+        int overlap = 0;
+        foreach (var t in batTop) if (seqTop.Contains(t)) overlap++;
+        Assert.True(overlap >= 4,
+            $"Chunked batched top-5 overlaps the per-token reference in only {overlap}/5 slots.");
+    }
+
+    /// <summary>
     /// Flash off + GEMM off: Q4_K trunk runs the batched matvec GEMM-N, which is built to
     /// be bit-identical to N per-token Q4_K dp4a matvecs. Verifies the batched
     /// matvec/norm/rope/SwiGLU primitives in isolation from the argmax-stable attention.
