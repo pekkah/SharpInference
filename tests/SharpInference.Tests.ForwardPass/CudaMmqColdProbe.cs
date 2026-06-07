@@ -19,8 +19,7 @@ namespace SharpInference.Tests.ForwardPass;
 /// not the warm roofline.
 ///
 /// Run explicitly: --filter FullyQualifiedName~CudaMmqColdProbe. Silent no-op without
-/// CUDA. Always asserts true — it only prints the measurement. Set SHARPI_MMQ_V2=1 to
-/// route the dispatch through the candidate kernel for an A/B.
+/// CUDA. Always asserts true — it only prints the measurement.
 /// </summary>
 public sealed unsafe class CudaMmqColdProbe
 {
@@ -73,7 +72,6 @@ public sealed unsafe class CudaMmqColdProbe
         // revisits. 16 copies of the largest shape (~28 MB each) ≈ 448 MB ≫ L2, so every
         // visit is a cold L2 miss — the real-prefill regime, without a 36-layer model.
         const int ringLen = 16;
-        bool v2 = Environment.GetEnvironmentVariable("SHARPI_MMQ_V2") == "1";
 
         var rng = new Random(20260607);
         double totColdMs = 0, totGflopPerLayer = 0;
@@ -119,7 +117,7 @@ public sealed unsafe class CudaMmqColdProbe
         }
 
         Console.WriteLine(
-            $"[{(v2 ? "V2" : "V1")}] per-layer trunk: {totGflopPerLayer:F1} GFLOP  |  COLD {totColdMs:F2} ms  " +
+            $"per-layer trunk: {totGflopPerLayer:F1} GFLOP  |  COLD {totColdMs:F2} ms  " +
             $"(×36 layers @ N={nTok}: {totColdMs * 36 / 1000:F2} s)");
         Assert.True(true);
     }
