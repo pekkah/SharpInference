@@ -599,7 +599,10 @@ extern ""C"" __global__ void llm_kv_append(
 {
     int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= kv_dim) return;
-    long offset = (long)position * (long)kv_dim + (long)i;
+    // Ring slot: `position % max_seq_len`. `max_seq_len` is the allocated cache size,
+    // so for a full-context (dense / global) cache `position < max_seq_len` makes this
+    // the identity; for a window-sized SWA ring it wraps the write into the ring.
+    long offset = (long)(position % max_seq_len) * (long)kv_dim + (long)i;
     k_cache[offset] = k_in[i];
     v_cache[offset] = v_in[i];
 }
@@ -618,7 +621,11 @@ extern ""C"" __global__ void llm_kv_append_bf16(
 {
     int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= kv_dim) return;
-    long offset = (long)position * (long)kv_dim + (long)i;
+    // Ring slot `position % max_seq_len` (identity for a full-context cache; wraps a
+    // window-sized ring). Matches the f32 llm_kv_append so the write/read indexing stays
+    // uniform if a windowed model ever uses the bf16 KV cache (today only the full-context
+    // GDN-hybrid path does, where position < max_seq_len makes this the identity).
+    long offset = (long)(position % max_seq_len) * (long)kv_dim + (long)i;
     k_cache[offset] = (unsigned short)sharpi_fp32_to_bf16(k_in[i]);
     v_cache[offset] = (unsigned short)sharpi_fp32_to_bf16(v_in[i]);
 }
@@ -4066,7 +4073,9 @@ extern ""C"" __global__ void llm_attention_swa(
     for (int t = (int)tid; t < eff_seq; t += 256) {
         int abs_t = t + window_start;
         float dot = 0.f;
-        long k_off = (long)abs_t * (long)kv_dim + (long)kv_head * (long)head_dim;
+        // Ring slot `abs_t % max_seq_len` (max_seq_len = allocated cache size): identity
+        // for a full cache, wraps a window-sized SWA ring. abs_t itself stays logical.
+        long k_off = (long)(abs_t % max_seq_len) * (long)kv_dim + (long)kv_head * (long)head_dim;
         for (int d = 0; d < head_dim; d++)
             dot += q[q_off + d] * k_cache[k_off + d];
         float score = dot * scale;
@@ -4127,7 +4136,7 @@ extern ""C"" __global__ void llm_attention_swa(
         for (int t = 0; t < eff_seq; t++) {
             int abs_t = t + window_start;
             float weight = use_shared ? shared_scores[t] : head_scratch[t];
-            long v_off = (long)abs_t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            long v_off = (long)(abs_t % max_seq_len) * (long)kv_dim + (long)kv_head * (long)head_dim;
             acc += weight * v_cache[v_off + d];
         }
         out[out_off + d] = acc;
@@ -4246,8 +4255,10 @@ extern ""C"" __global__ void llm_flash_attn_prefill_tc(
         for (int idx = lane; idx < FATC_KT * head_dim; idx += 32) {
             int kk = idx / head_dim, d = idx - kk * head_dim;
             int abs_k = kt0 + kk;
+            // Cache read at ring slot `abs_k % max_seq_len` (identity for a full cache,
+            // wraps a window-sized SWA ring); abs_k stays logical for the causal bound.
             float kv = (abs_k < key_end)
-                ? k_cache[(long)abs_k * kv_dim + (long)kv_head * head_dim + d] : 0.f;
+                ? k_cache[(long)(abs_k % max_seq_len) * kv_dim + (long)kv_head * head_dim + d] : 0.f;
             sKV[idx] = (unsigned short)sharpi_fp32_to_fp16(kv);
         }
         __syncthreads();
@@ -4345,7 +4356,7 @@ extern ""C"" __global__ void llm_flash_attn_prefill_tc(
             int kk = idx / head_dim, d = idx - kk * head_dim;
             int abs_k = kt0 + kk;
             float vv = (abs_k < key_end)
-                ? v_cache[(long)abs_k * kv_dim + (long)kv_head * head_dim + d] : 0.f;
+                ? v_cache[(long)(abs_k % max_seq_len) * kv_dim + (long)kv_head * head_dim + d] : 0.f;
             sKV[idx] = (unsigned short)sharpi_fp32_to_fp16(vv);
         }
         __syncthreads();
@@ -4454,8 +4465,10 @@ extern ""C"" __global__ void llm_flash_attn_prefill_tc2(
         for (int idx = tid; idx < FATC2_KT * head_dim; idx += FATC2_W * 32) {
             int kk = idx / head_dim, d = idx - kk * head_dim;
             int abs_k = kt0 + kk;
+            // Cache read at ring slot `abs_k % max_seq_len` (identity for a full cache,
+            // wraps a window-sized SWA ring); abs_k stays logical for the causal bound.
             float kv = (abs_k < key_end)
-                ? k_cache[(long)abs_k * kv_dim + (long)kv_head * head_dim + d] : 0.f;
+                ? k_cache[(long)(abs_k % max_seq_len) * kv_dim + (long)kv_head * head_dim + d] : 0.f;
             sKV[idx] = (unsigned short)sharpi_fp32_to_fp16(kv);
         }
         __syncthreads();
@@ -4566,7 +4579,7 @@ extern ""C"" __global__ void llm_flash_attn_prefill_tc2(
             int kk = idx / head_dim, d = idx - kk * head_dim;
             int abs_k = kt0 + kk;
             float vv = (abs_k < key_end)
-                ? v_cache[(long)abs_k * kv_dim + (long)kv_head * head_dim + d] : 0.f;
+                ? v_cache[(long)(abs_k % max_seq_len) * kv_dim + (long)kv_head * head_dim + d] : 0.f;
             sKV[idx] = (unsigned short)sharpi_fp32_to_fp16(vv);
         }
         __syncthreads();
@@ -4697,7 +4710,9 @@ extern ""C"" __global__ void llm_flash_attn_prefill_f32(
             int kk = idx / hd2, pr = idx - kk * hd2;
             unsigned int kh = 0u;
             if (kk < tile_keys) {
-                long off = (long)(kt0 + kk) * kv_dim + (long)kv_head * head_dim + 2 * pr;
+                // Ring slot `(kt0+kk) % max_seq_len`: identity for a full cache, wraps a
+                // window-sized SWA ring. The kt0+kk index stays logical for tile bounds.
+                long off = (long)((kt0 + kk) % max_seq_len) * kv_dim + (long)kv_head * head_dim + 2 * pr;
                 kh = sharpi_f32x2_to_f16x2(k_cache[off], k_cache[off + 1]);
             }
             sKh[idx] = kh;
@@ -4706,7 +4721,7 @@ extern ""C"" __global__ void llm_flash_attn_prefill_f32(
         for (int idx = tid; idx < kt_tile * head_dim; idx += (int)blockDim.x) {
             int kk = idx / head_dim, d = idx - kk * head_dim;
             sV[idx] = (kk < tile_keys)
-                ? v_cache[(long)(kt0 + kk) * kv_dim + (long)kv_head * head_dim + d]
+                ? v_cache[(long)((kt0 + kk) % max_seq_len) * kv_dim + (long)kv_head * head_dim + d]
                 : 0.f;
         }
         __syncthreads();
@@ -4799,7 +4814,9 @@ extern ""C"" __global__ void llm_attention_swa_batched(
     for (int t = (int)tid; t < eff_seq; t += 256) {
         int abs_t = t + window_start;
         float dot = 0.f;
-        long k_off = (long)abs_t * (long)kv_dim + (long)kv_head * (long)head_dim;
+        // Ring slot `abs_t % max_seq_len` (max_seq_len = allocated cache size): identity
+        // for a full cache, wraps a window-sized SWA ring. abs_t itself stays logical.
+        long k_off = (long)(abs_t % max_seq_len) * (long)kv_dim + (long)kv_head * (long)head_dim;
         for (int dd = 0; dd < head_dim; dd++)
             dot += q[q_off + dd] * k_cache[k_off + dd];
         shared_scores[t] = dot * scale;
@@ -4841,7 +4858,7 @@ extern ""C"" __global__ void llm_attention_swa_batched(
         float acc = 0.f;
         for (int t = 0; t < eff_seq; t++) {
             int abs_t = t + window_start;
-            long v_off = (long)abs_t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            long v_off = (long)(abs_t % max_seq_len) * (long)kv_dim + (long)kv_head * (long)head_dim;
             acc += shared_scores[t] * v_cache[v_off + dd];
         }
         out[out_off + dd] = acc;
@@ -5616,7 +5633,9 @@ extern ""C"" __global__ void llm_kv_append_batched(
     int e = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     int i = (int)blockIdx.y;
     if (e >= kv_dim || i >= n_tok) return;
-    long off = (long)(start_pos + i) * (long)kv_dim + (long)e;
+    // Ring slot `(start_pos+i) % max_seq_len`: identity for a full-context cache
+    // (position < max_seq_len), wraps into a window-sized SWA ring otherwise.
+    long off = (long)((start_pos + i) % max_seq_len) * (long)kv_dim + (long)e;
     k_cache[off] = k_all[(long)i * kv_dim + e];
     v_cache[off] = v_all[(long)i * kv_dim + e];
 }
@@ -5630,7 +5649,9 @@ extern ""C"" __global__ void llm_kv_append_batched_bf16(
     int e = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     int i = (int)blockIdx.y;
     if (e >= kv_dim || i >= n_tok) return;
-    long off = (long)(start_pos + i) * (long)kv_dim + (long)e;
+    // Ring slot `(start_pos+i) % max_seq_len` (identity for a full-context cache; wraps a
+    // window-sized ring) — kept in lockstep with the f32 llm_kv_append_batched.
+    long off = (long)((start_pos + i) % max_seq_len) * (long)kv_dim + (long)e;
     k_cache[off] = (unsigned short)sharpi_fp32_to_bf16(k_all[(long)i * kv_dim + e]);
     v_cache[off] = (unsigned short)sharpi_fp32_to_bf16(v_all[(long)i * kv_dim + e]);
 }

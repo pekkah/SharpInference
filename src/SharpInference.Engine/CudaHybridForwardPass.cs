@@ -446,6 +446,16 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 // Gemma 4: each GPU layer sizes its KV cache by per-layer head_dim and
                 // (for SWA layers) caps at SlidingWindowSize. Non-gemma4 stays at the
                 // model-wide head_dim × full context.
+                //
+                // This path is DECODE-ONLY for Gemma 4 (IsBatchedPrefillSupported requires
+                // !_isGemma4Like), so the SWA ring only needs to hold `window` positions:
+                // each token appends one K/V then attends its window before the next append,
+                // so the bare-window ring is never overwritten early. The shared kernels'
+                // `pos % max_seq_len` (max_seq_len == this layerCtx) wraps writes/reads into
+                // it — which also fixes the pre-#162 latent OOB here (positions ≥ window used
+                // to index a window-sized cache absolutely). It deliberately does NOT use
+                // CudaForwardPass.SwaRingSize (the window+chunk headroom) because that's only
+                // needed by the batched-append (chunked-prefill) path, which never runs here.
                 int layerHd = _isGemma4Like ? hp.LayerHeadDim![i] : _headDim;
                 int layerKvDim = _numKvHeads * layerHd;
                 int layerCtx = (_isGemma4Like && hp.IsSwaLayer is { } swa && swa[i] && hp.SlidingWindowSize > 0)
