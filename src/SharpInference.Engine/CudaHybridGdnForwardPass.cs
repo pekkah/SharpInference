@@ -449,6 +449,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private long _profMoeTicks;
     private long _profTotalTicks;
     private int _profTokens;
+    // Sub-phase breakdown of the batched routed-MoE (BatchedRoutedExperts), accumulated
+    // across the layer loop and printed once per chunk on the [moe-subphase] line when
+    // SHARPI_PREFILL_PROFILE=1. Establishes whether routed-MoE prefill cost is in the
+    // int8 dots (phaseA gate+up, phaseC down) or the per-token Q8_KS quantization /
+    // bucketing overhead — the diagnostic that confirmed #112's routed-MoE is dot-bound
+    // (96% phaseA+phaseC) and pinpoints the next mixed-quant cliff (issue #168). Zero
+    // cost when profiling is off (all sites guarded by _prefillProfile).
+    private long _profMoeNormQ, _profMoePhaseA, _profMoeSilu, _profMoeGateQ, _profMoePhaseC, _profMoeBucket;
 
     // ── Batched prefill (issue #110) ──────────────────────────────────────
     // Per-layer batched prompt prefill for the CPU-MoE GDN-hybrid path. The
@@ -2034,6 +2042,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         long t0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         long trunkTicks = 0, routerTicks = 0, routedTicks = 0, combineTicks = 0;
+        _profMoeNormQ = _profMoePhaseA = _profMoeSilu = _profMoeGateQ = _profMoePhaseC = _profMoeBucket = 0;
 
         // Pessimistic fault latch: the GDN recurrent-state mutation + deferred
         // length-counter bookkeeping below is non-transactional, so mark the pass
@@ -2165,6 +2174,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 $"[batched-prefill] N={N} total={total:F0}ms ({total / N:F1}ms/tok) " +
                 $"trunk={trunkTicks * f:F0}ms router={routerTicks * f:F0}ms " +
                 $"routedMoE={routedTicks * f:F0}ms combine={combineTicks * f:F0}ms");
+            Console.Error.WriteLine(
+                $"[moe-subphase] bucket={_profMoeBucket * f:F0}ms normQ={_profMoeNormQ * f:F0}ms " +
+                $"phaseA(gate+up)={_profMoePhaseA * f:F0}ms silu/reduce={_profMoeSilu * f:F0}ms " +
+                $"gateQ={_profMoeGateQ * f:F0}ms phaseC(down)={_profMoePhaseC * f:F0}ms");
         }
         return _logitsBuf;
     }
@@ -2373,6 +2386,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         bool useQ8KUp   = (_q3kQ8KEnabled && upDt   == DType.Q3_K) || (_q8_0Q8KEnabled && upDt   == DType.Q8_0);
         bool useQ8KDown = (_q3kQ8KEnabled && downDt == DType.Q3_K) || (_q8_0Q8KEnabled && downDt == DType.Q8_0);
 
+        long sp0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         // Bucket (token, slot) pairs by selected expert (CSR layout).
         int* expStart = _bExpStart!; int* cursor = _bExpCursor!; int* used = _bUsedExperts!;
         int* selected = _bSelected!;
@@ -2398,11 +2412,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         byte* normAllQ8K = _bNormAllQ8K; byte* gateAllQ8K = _bGateAllQ8K;
         int q8kEmbStride = _bQ8KEmbStride, q8kExpStride = _bQ8KExpStride;
 
+        long sp1 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        if (_prefillProfile) _profMoeBucket += sp1 - sp0;
         // Q8_KS-prepack each token's norm once (shared across all gate/up rows).
         if (useQ8KGate || useQ8KUp)
             Parallel.For(0, N, s_moeParallelOpts, i =>
                 SimdKernels.QuantizeRowToQ8KS(normAll + (long)i * embDim, embDim,
                     normAllQ8K + (long)i * q8kEmbStride));
+        long sp2 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        if (_prefillProfile) _profMoeNormQ += sp2 - sp1;
 
         // Phase A: gate + up. Parallelize over (used expert, expert-row); read each
         // weight row once, dot against every token routing to this expert.
@@ -2486,14 +2504,20 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             }
         });
 
+        long sp3 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        if (_prefillProfile) _profMoePhaseA += sp3 - sp2;
         // Phase B: SiLU(gate) * up over the whole contiguous (token × slot × expertDim) block.
         SimdKernels.SiLuMul(gateAll, upAll, (int)(totalSel * expertDim));
+        long sp4 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        if (_prefillProfile) _profMoeSilu += sp4 - sp3;
 
         // Q8_KS-prepack each silu'd gate slice for the down dots.
         if (useQ8KDown)
             Parallel.For(0, (int)totalSel, s_moeParallelOpts, s =>
                 SimdKernels.QuantizeRowToQ8KS(gateAll + (long)s * expertDim, expertDim,
                     gateAllQ8K + (long)s * q8kExpStride));
+        long sp5 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        if (_prefillProfile) _profMoeGateQ += sp5 - sp4;
 
         // Phase C: down. Parallelize over (used expert, emb-row); read each down row
         // once, dot against every token's silu'd gate. Store unweighted partials.
@@ -2550,6 +2574,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                     : DispatchDot(downRow, gateAll + slot * expertDimL, expertDimL, downDt);
             }
         });
+        long sp6 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        if (_prefillProfile) _profMoePhaseC += sp6 - sp5;
 
         // Phase C reduce: per token, sum the numActive weighted down partials in
         // top-k order — bit-identical to the sequential `sum += w * dot` loop.
@@ -2568,6 +2594,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 outp[r] = sum;
             }
         });
+        // Fold the top-k reduce into the silu/reduce bucket (both are cheap element-wise passes).
+        if (_prefillProfile) _profMoeSilu += System.Diagnostics.Stopwatch.GetTimestamp() - sp6;
     }
 
     /// <summary>
