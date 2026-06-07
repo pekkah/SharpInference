@@ -1251,8 +1251,9 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         // ── QK-norm BEFORE RoPE (batched, learned). RoPE does not commute with weighted
         //    QK-norm, so this must run in the same order as the per-token GpuLayer path and
         //    the CPU/HF/llama.cpp reference (issue #157). L2/pure QK-norm is gated out by
-        //    IsBatchedPrefillSupported (no batched kernel), so only the weighted case lands here.
-        if (_hasQkNorm)
+        //    IsBatchedPrefillSupported (no batched kernel); the explicit !UseL2QkNorm guard
+        //    keeps _gpuQNorm/_gpuKNorm (null for L2) from dereferencing if that gate ever changes.
+        if (_hasQkNorm && !_hp.UseL2QkNorm)
         {
             _gpu.HeadNormBatched(qAll, _gpuQNorm![i], _numHeads,   _headDim, n, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             _gpu.HeadNormBatched(kAll, _gpuKNorm![i], _numKvHeads, _headDim, n, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
