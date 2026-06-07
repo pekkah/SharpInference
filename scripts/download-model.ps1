@@ -129,8 +129,8 @@ $Models = @{
     # PRIMARY iteration-1 target. Text GGUF only — vision mmproj is a separate
     # follow-up (out of scope for iter 1).
     "gemma4-12b-qat" = @{
-        Files = @("gemma-4-12b-it-q4_0.gguf")
-        Urls  = @("https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/main/gemma-4-12b-it-q4_0.gguf")
+        Files = @("gemma-4-12b-it-qat-q4_0.gguf")
+        Urls  = @("https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/main/gemma-4-12b-it-qat-q4_0.gguf")
         Size  = "~7.0 GB"
         SizeGB = 7.0
         Phase = "issue #124 (PRIMARY — QAT q4_0, dense no-PLE path)"

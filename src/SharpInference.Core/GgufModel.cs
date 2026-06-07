@@ -122,6 +122,7 @@ public sealed unsafe class GgufModel : IDisposable
 
             // Inject synthetic metadata from tensor inspection
             var arch = metadata.TryGetValue("general.architecture", out var archVal) ? (string)archVal : "llama";
+            int attnKCount = 0, attnVCount = 0;
             foreach (var t in allTensors)
             {
                 if (t.Name == "blk.0.attn_q.bias")     metadata["_sharpi.has_attn_bias"] = true;
@@ -138,7 +139,14 @@ public sealed unsafe class GgufModel : IDisposable
                                  or "blk.2.ssm_conv1d.weight"
                                  or "blk.3.ssm_conv1d.weight")
                     metadata["_sharpi.is_hybrid_ssm"] = true;
+
+                // Gemma 4 12B global layers omit attn_v and reuse K as V
+                // (attention_k_eq_v). Detect by a V-projection deficit vs K.
+                if (t.Name.EndsWith(".attn_k.weight", StringComparison.Ordinal))      attnKCount++;
+                else if (t.Name.EndsWith(".attn_v.weight", StringComparison.Ordinal)) attnVCount++;
             }
+            if (attnKCount > 0 && attnVCount < attnKCount)
+                metadata["_sharpi.attention_k_eq_v"] = true;
 
             if (!metadata.ContainsKey($"{arch}.vocab_size") &&
                 metadata.TryGetValue("tokenizer.ggml.tokens", out var tokArr) && tokArr is object[] toks)
