@@ -21,10 +21,21 @@ namespace SharpInference.Tests.ForwardPass;
 /// Skipped silently when CUDA is unavailable, the model isn't on disk, or
 /// construction OOMs — but a failure INSIDE Prefill must FAIL, not skip.
 /// </summary>
-public sealed class CudaHybridBatchedPrefillTests
+public sealed class CudaHybridBatchedPrefillTests : IDisposable
 {
     private readonly ITestOutputHelper _out;
-    public CudaHybridBatchedPrefillTests(ITestOutputHelper o) => _out = o;
+    // Issue #162: these oracles assert the batched trunk is bit-identical to the
+    // sequential loop. The compute-bound attention-projection path (MMQ/GEMM) is
+    // argmax-stable, NOT byte-exact, so pin it OFF for the whole class to keep the batched
+    // side on the byte-exact matvec. MMQ/GEMM correctness is covered by CudaMmqQ4K/Q8_0Tests
+    // + CudaGemmQ6K/Q5KTests. Restored in Dispose.
+    private readonly bool _prevHybridCompute = CudaHybridForwardPass.HybridPrefillComputeEnabled;
+    public CudaHybridBatchedPrefillTests(ITestOutputHelper o)
+    {
+        _out = o;
+        CudaHybridForwardPass.HybridPrefillComputeEnabled = false;
+    }
+    public void Dispose() => CudaHybridForwardPass.HybridPrefillComputeEnabled = _prevHybridCompute;
 
     private static CudaBackend? TryCreate()
     {
@@ -167,6 +178,77 @@ public sealed class CudaHybridBatchedPrefillTests
         finally
         {
             CudaHybridForwardPass.BatchedPrefillEnabled = prev;
+        }
+    }
+
+    /// <summary>
+    /// Issue #162: the class pins <see cref="CudaHybridForwardPass.HybridPrefillComputeEnabled"/>
+    /// OFF so the bit-parity oracles validate the byte-exact matvec batching. This test flips
+    /// it ON — the path that actually ships to users — and asserts the compute-routed batched
+    /// prefill (Q8_0/Q4_K → int8 MMQ, Q6_K/Q5_K → dequant→fp16 GEMM for the attention
+    /// projections) stays <b>argmax-stable</b> vs the byte-exact matvec batching: same final-token
+    /// greedy argmax, logits within a loose fp tolerance (the matmuls are argmax-stable, not
+    /// byte-exact). This is the integration coverage the kernel-isolation tests
+    /// (<see cref="CudaMmqQ4KTests"/>, <see cref="CudaGemmQ6KTests"/>, …) can't give — it proves
+    /// the routing switch is wired correctly at model scale.
+    /// </summary>
+    [Fact]
+    public void BatchedPrefill_ComputeRouting_ArgmaxStableVsMatvec_Coder()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindCoderPath();
+        if (path is null) return;
+
+        bool prevBatched = CudaHybridForwardPass.BatchedPrefillEnabled;
+        bool prevCompute = CudaHybridForwardPass.HybridPrefillComputeEnabled;
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+            int ctx = Math.Min(hp.ContextLength, 4096);
+            var placement = PlanCoder(model, hp, gpu, ctx);
+
+            var tokens = tokenizer.Encode(
+                "The quick brown fox jumps over the lazy dog. " +
+                "Pack my box with five dozen liquor jugs. " +
+                "How razorback-jumping frogs can level six piqued gymnasts! " +
+                "The five boxing wizards jump quickly.");
+            Assert.True(tokens.Count >= 8, $"Prompt tokenized to only {tokens.Count} tokens.");
+
+            float[] Run(bool compute)
+            {
+                CudaHybridForwardPass.BatchedPrefillEnabled = true;
+                CudaHybridForwardPass.HybridPrefillComputeEnabled = compute;
+                using var fwd = TryConstruct(model, gpu, hp, placement);
+                if (fwd is null) return Array.Empty<float>();
+                var logits = fwd.Prefill(tokens).ToArray();
+                Assert.True(fwd.LastPrefillWasBatched,
+                    "Batched arm fell back to per-token — the comparison would be vacuous.");
+                return logits;
+            }
+
+            float[] matvec  = Run(false);   // byte-exact GEMM-N matvec
+            float[] compute = Run(true);    // default-on MMQ/GEMM compute routing
+            if (matvec.Length == 0 || compute.Length == 0)
+            {
+                _out.WriteLine("SKIP: construction OOM'd on this box.");
+                return;
+            }
+
+            Assert.Equal(matvec.Length, compute.Length);
+            Assert.Equal(Sampler.Greedy(matvec), Sampler.Greedy(compute));
+            float maxAbs = 0f;
+            for (int i = 0; i < matvec.Length; i++)
+                maxAbs = MathF.Max(maxAbs, MathF.Abs(matvec[i] - compute[i]));
+            _out.WriteLine($"OK compute-routing argmax-stable: N={tokens.Count} " +
+                $"greedy={Sampler.Greedy(matvec)} maxAbs={maxAbs:E2}");
+        }
+        finally
+        {
+            CudaHybridForwardPass.BatchedPrefillEnabled = prevBatched;
+            CudaHybridForwardPass.HybridPrefillComputeEnabled = prevCompute;
         }
     }
 

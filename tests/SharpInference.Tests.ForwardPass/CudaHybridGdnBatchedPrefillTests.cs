@@ -18,8 +18,18 @@ namespace SharpInference.Tests.ForwardPass;
 /// the Q8_KS-prepacked batched path and the MTP hidden-history population).
 /// Skipped silently when CUDA is unavailable or the model isn't on disk.
 /// </summary>
-public sealed class CudaHybridGdnBatchedPrefillTests
+public sealed class CudaHybridGdnBatchedPrefillTests : IDisposable
 {
+    // Issue #162: these oracles assert the BATCHED prefill is bit-identical to the
+    // sequential loop — they validate batching's reduction order, not the matmul kernel
+    // choice. The compute-bound prefill path (Q8_0/Q4_K int8 MMQ, Q6_K/Q5_K dequant→fp16
+    // GEMM) is argmax-stable, NOT byte-exact, so pin it OFF for the whole class to keep
+    // the batched side on the byte-exact GEMM-N matvec. The MMQ/GEMM kernels' correctness
+    // is covered separately by CudaMmqQ4K/Q8_0Tests + CudaGemmQ6K/Q5KTests. Restored in Dispose.
+    private readonly bool _prevGdnCompute = CudaHybridGdnForwardPass.GdnPrefillComputeEnabled;
+    public CudaHybridGdnBatchedPrefillTests() => CudaHybridGdnForwardPass.GdnPrefillComputeEnabled = false;
+    public void Dispose() => CudaHybridGdnForwardPass.GdnPrefillComputeEnabled = _prevGdnCompute;
+
     private static CudaBackend? TryCreate()
     {
         if (!CudaBackend.IsAvailable()) return null;
