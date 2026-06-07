@@ -176,6 +176,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// </summary>
     public bool BatchedPrefillEnabled { get; set; }
     /// <summary>
+    /// Issue #162: window size (tokens) for chunked batched prefill of prompts longer
+    /// than the non-flash 4096 cap. Each window is batched at its own startPos with flash
+    /// attention streaming the prior KV, so the N-sized trunk scratch stays bounded to
+    /// this many tokens regardless of prompt length. 4096 matches the well-tested
+    /// single-shot batch size.
+    /// </summary>
+    private const int PrefillBatchChunk = 4096;
+    /// <summary>
     /// Issue #141: route Q8_0 trunk matmuls in the batched prefill through the
     /// compute-bound cuBLAS GEMM (<see cref="CudaBackend.MatMulBatchedGemm"/>)
     /// instead of the memory-bound matvec GEMM-N. Default on
@@ -1830,11 +1838,44 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // attention/FFN/PLE launches (whose count grows with N) into batched GEMM-N +
         // batched-attention launches. Originally Gemma-4-only; #156 opened it to any
         // dense model the batched kernels cover (e.g. Qwen3-8B Q4_K). Everything else
-        // (MoE, SnapKV-active, TQ, >4096 context, non-NEOX RoPE, L2 QK-norm, attn bias,
-        // unbatchable weight dtype) falls back to the per-token loop below.
+        // (MoE, SnapKV-active, TQ, non-NEOX RoPE, L2 QK-norm, attn bias, unbatchable
+        // weight dtype) falls back to the per-token loop below.
+        //
+        // Issue #162: the 4096 fast-path cap is a limit of the *non-flash* shared-scores
+        // AttentionBatched kernel (it throws above startPos+nTok=4096). The flash prefill
+        // kernels stream KV, so when flash is enabled we run the batched path for prompts
+        // of any length, chunking into PrefillBatchChunk-token windows so the N-sized trunk
+        // scratch stays bounded. Each chunk is batched at its own startPos; flash attends
+        // to all prior KV. Without this, a >4096-token prompt drops to the per-token loop
+        // (memory-bound, ~8× slower: 432 → 50 t/s on Qwen3-8B Q4_K @ 4070 Ti).
         if (BatchedPrefillEnabled && !snapKvActive && N >= 2
-            && startPos + N <= 4096 && IsBatchedPrefillSupported())
-            return PrefillBatchedTrunk(tokens, startPos);
+            && startPos + N <= _maxSeqLen && IsBatchedPrefillSupported())
+        {
+            // Chunking past 4096 requires a streaming attention path (flash) AND simple
+            // (non-windowed) KV position semantics. SWA layers (Gemma 4) wrap KV in a
+            // window-sized ring whose cross-chunk behaviour past the window boundary is not
+            // yet validated, so they keep the proven 4096 cap (follow-up: #162).
+            bool canChunkPast4096 = PrefillFlashAttnEnabled && _hp.IsSwaLayer is null;
+            int cap = canChunkPast4096 ? _maxSeqLen : 4096;
+            if (startPos + N <= cap)
+            {
+                if (N <= PrefillBatchChunk || !canChunkPast4096)
+                    return PrefillBatchedTrunk(tokens, startPos);
+
+                // Chunked: flash streams KV across windows, so process PrefillBatchChunk
+                // tokens at a time. Only the last chunk's logits are returned (decode
+                // starts from the final token); the per-chunk final norm + output proj on
+                // earlier chunks is discarded, a negligible cost vs the batched-trunk win.
+                int[] all = tokens as int[] ?? System.Linq.Enumerable.ToArray(tokens);
+                ReadOnlySpan<float> chunkLogits = default;
+                for (int off = 0; off < N; off += PrefillBatchChunk)
+                {
+                    int len = Math.Min(PrefillBatchChunk, N - off);
+                    chunkLogits = PrefillBatchedTrunk(new ArraySegment<int>(all, off, len), startPos + off);
+                }
+                return chunkLogits;
+            }
+        }
 
         int W = 0, wStart = 0;
         if (snapKvActive)
