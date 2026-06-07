@@ -325,6 +325,156 @@ public sealed class Gemma4CudaBatchedPrefillTests
             $"(expected >95%); maxAbs={maxAbs}.");
     }
 
+    /// <summary>
+    /// Issue #162 (SWA sub-item): a Gemma-4 prompt LONGER than the 512-token sliding window
+    /// but still under the 4096 single-batch cap must produce correct output. This is the
+    /// scenario the old window-sized-cache-with-absolute-indexing got wrong (positions ≥
+    /// window read/wrote out of bounds). With the SWA ring (cache sized window +
+    /// SwaRingHeadroom, capped at ctx) the per-token loop is itself correct again, so the
+    /// batched path is checked against it. ctx=1024 makes the SWA cache full (1024 &lt;
+    /// window+headroom), so this isolates the windowed-attention-past-the-window fix from
+    /// the ring-wrap fix (covered by the chunked test below).
+    /// </summary>
+    [Fact]
+    public void Gemma4_E4B_BatchedPrefill_PastWindow_MatchesSequential()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.NotNull(hp.LayerHeadDim);
+        Assert.True(hp.SlidingWindowSize > 0 && hp.SlidingWindowSize < 700,
+            $"Test assumes a sliding window < the 700-token prompt; got {hp.SlidingWindowSize}.");
+
+        // 700 > window (512): the trailing queries' windows exclude the earliest tokens,
+        // exactly the regime that the absolute-into-window-sized-cache bug corrupted.
+        var tokens = MakeTokens(700);
+
+        using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 1024);
+
+        fwd.BatchedPrefillEnabled = true;   // shipped defaults (flash TC on)
+        var batched = fwd.Prefill(tokens).ToArray();
+        Assert.True(fwd.LastPrefillWasBatched);
+
+        fwd.ResetCache();
+        fwd.BatchedPrefillEnabled = false;
+        var sequential = fwd.Prefill(tokens).ToArray();
+        Assert.False(fwd.LastPrefillWasBatched);
+
+        Assert.Equal(sequential.Length, batched.Length);
+        Assert.Equal(Argmax(sequential), Argmax(batched));
+
+        // Logit-envelope check on top of argmax: the flash TC path rounds to fp16 over 42
+        // layers + softcap, so a few tenths of a logit is expected; a whole-number gap would
+        // signal a wiring bug (e.g. a ring slot reading the wrong position) that argmax alone
+        // could miss when it doesn't quite flip the top token.
+        float maxAbs = 0f;
+        for (int i = 0; i < sequential.Length; i++)
+            maxAbs = MathF.Max(maxAbs, MathF.Abs(sequential[i] - batched[i]));
+        Assert.True(maxAbs < 1.5f,
+            $"Past-window batched vs per-token logits diverged beyond fp16 tolerance: maxAbs={maxAbs}.");
+
+        var seqTop = TopKSet(sequential, 5);
+        var batTop = TopKSet(batched, 5);
+        int overlap = 0;
+        foreach (var t in batTop) if (seqTop.Contains(t)) overlap++;
+        Assert.True(overlap >= 4,
+            $"Past-window batched top-5 overlaps the per-token reference in only {overlap}/5 slots.");
+    }
+
+    /// <summary>
+    /// Issue #162 (SWA sub-item): a Gemma-4 prompt longer than the 4096 cap must take the
+    /// chunked batched path (flash streaming the prior KV) and stay argmax-stable vs the
+    /// per-token loop, with both running through the SWA KV ring.
+    /// <para>
+    /// This is the decisive ring oracle: the per-token loop attends right after each single
+    /// append (so it only ever needs ring ≥ window) while the chunked path appends a whole
+    /// 4096-token chunk before any of those queries attend (so it needs ring ≥ window +
+    /// chunk span). If the ring were undersized, the chunked path would overwrite an
+    /// earlier query's window and diverge from the per-token reference — so agreement
+    /// validates the window + SwaRingHeadroom sizing. ctx exceeds window + headroom, so the
+    /// SWA cache is a true ring (positions ≥ ring size wrap) rather than a full cache.
+    /// </para>
+    /// <para>
+    /// N=5040 exercises a full + partial chunk (4096 + 944); N=8192 the exact-multiple
+    /// boundary (two full 4096 chunks).
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData(5040, 6144)]
+    [InlineData(8192, 9216)]
+    public void Gemma4_E4B_ChunkedBatchedPrefill_Over4096_MatchesSequential(int promptLen, int ctx)
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.NotNull(hp.LayerHeadDim);
+        Assert.True(hp.SlidingWindowSize > 0);
+
+        var longTokens = MakeTokens(promptLen);
+
+        // Disable SnapKV (a >budget prompt would otherwise route to the per-token SnapKV
+        // eviction path before the batched gate). Construct under the override, then restore.
+        var prevSnap = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_BUDGET");
+        Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", "0");
+        CudaForwardPass fwd;
+        try { fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: ctx); }
+        finally { Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", prevSnap); }
+        using var _fwd = fwd;
+
+        fwd.BatchedPrefillEnabled = true;   // shipped defaults (flash TC on) → chunked path
+        var batched = fwd.Prefill(longTokens).ToArray();
+        Assert.True(fwd.LastPrefillWasBatched,
+            "Chunked batched prefill did not engage for a >4096-token Gemma 4 prompt (#162).");
+
+        fwd.ResetCache();
+        fwd.BatchedPrefillEnabled = false;
+        var sequential = fwd.Prefill(longTokens).ToArray();
+        Assert.False(fwd.LastPrefillWasBatched);
+
+        Assert.Equal(sequential.Length, batched.Length);
+        Assert.Equal(Argmax(sequential), Argmax(batched));
+
+        // Envelope check: the chunked flash path reassociates the softmax over thousands of
+        // streamed keys, so it's looser than the ≤4096 case, but a several-unit gap would
+        // still flag a ring-overwrite bug (an early query reading a clobbered window slot)
+        // that argmax-stability alone might not surface.
+        float maxAbs = 0f;
+        for (int i = 0; i < sequential.Length; i++)
+            maxAbs = MathF.Max(maxAbs, MathF.Abs(sequential[i] - batched[i]));
+        Assert.True(maxAbs < 2.0f,
+            $"Chunked batched vs per-token logits diverged beyond fp tolerance: maxAbs={maxAbs}.");
+
+        var seqTop = TopKSet(sequential, 5);
+        var batTop = TopKSet(batched, 5);
+        int overlap = 0;
+        foreach (var t in batTop) if (seqTop.Contains(t)) overlap++;
+        Assert.True(overlap >= 4,
+            $"Chunked batched top-5 overlaps the per-token reference in only {overlap}/5 slots.");
+    }
+
+    // Deterministic spread across the vocab via a small LCG; all ids well within Gemma 4's
+    // vocab. Token 2 (BOS) leads so the prompt starts in-distribution.
+    private static int[] MakeTokens(int n)
+    {
+        var t = new int[n];
+        t[0] = 2;
+        uint s = 0x9E3779B9u;
+        for (int i = 1; i < n; i++)
+        {
+            s = s * 1664525u + 1013904223u;
+            t[i] = (int)(s % 100000u) + 5;
+        }
+        return t;
+    }
+
     private static HashSet<int> TopKSet(ReadOnlySpan<float> logits, int k)
     {
         var idx = new int[logits.Length];

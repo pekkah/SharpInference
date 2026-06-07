@@ -183,6 +183,30 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// single-shot batch size.
     /// </summary>
     private const int PrefillBatchChunk = 4096;
+
+    /// <summary>
+    /// Headroom (in positions) added to a Gemma-4 SWA layer's window when sizing its KV
+    /// ring (issue #162). A batched prefill appends a whole batch of K/V before any of
+    /// those queries attend, so the ring must hold the window PLUS one batched-append span
+    /// or the earliest queries' window would be overwritten by the latest appends. The
+    /// widest single append span is the larger of the chunked-prefill window
+    /// (<see cref="PrefillBatchChunk"/>) and the 4096 non-flash batched-attention cap, so a
+    /// ring of <c>window + SwaRingHeadroom</c> is always large enough. Capped at the model
+    /// context (<see cref="SwaRingSize"/>) — a full-context cache needs no ring at all.
+    /// </summary>
+    private const int SwaRingHeadroom = PrefillBatchChunk > 4096 ? PrefillBatchChunk : 4096;
+
+    /// <summary>
+    /// Allocated KV-cache size, in positions, for a Gemma-4 sliding-window layer: the
+    /// window plus <see cref="SwaRingHeadroom"/>, capped at the full context. When this
+    /// equals the context the cache is full (the ring modulo in the kernels degenerates to
+    /// the identity); when the context exceeds it the kernels wrap writes/reads modulo this
+    /// size. The value passed as each SWA append/attention call's <c>maxSeqLen</c> argument
+    /// MUST equal this so the kernel's <c>pos % maxSeqLen</c> lands in the right ring slot.
+    /// </summary>
+    private static int SwaRingSize(int maxSeqLen, int window) =>
+        (int)Math.Min(maxSeqLen, (long)window + SwaRingHeadroom);
+
     /// <summary>
     /// Issue #141: route Q8_0 trunk matmuls in the batched prefill through the
     /// compute-bound cuBLAS GEMM (<see cref="CudaBackend.MatMulBatchedGemm"/>)
@@ -548,8 +572,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
                 int layerHd = perLayerKv ? hp.LayerHeadDim![i] : _headDim;
                 int layerKvDim = _numKvHeads * layerHd;
+                // SWA layers use a window-sized ring (window + headroom for one batched
+                // append span, issue #162); everything else is full-context. The same
+                // SwaRingSize value is passed to the kernels as maxSeqLen so their
+                // pos % maxSeqLen wraps into this exact ring.
                 int layerCtx = (perLayerKv && hp.IsSwaLayer is { } swa && swa[i])
-                    ? Math.Min(_maxSeqLen, swaWindow)
+                    ? SwaRingSize(_maxSeqLen, swaWindow)
                     : _maxSeqLen;
                 _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)layerCtx * layerKvDim));
                 _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)layerCtx * layerKvDim));
@@ -1338,7 +1366,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             if (!kvShared)
             {
                 int layerCtx = isSwa && _hp.SlidingWindowSize > 0
-                    ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
+                    ? SwaRingSize(_maxSeqLen, _hp.SlidingWindowSize)
                     : _maxSeqLen;
                 _gpu.KvAppend(kView, vView, _gpuKCache[layer], _gpuVCache[layer],
                     kvDimL, position, layerCtx);
@@ -1346,7 +1374,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
             int effLayerCtx = (_hp.IsSwaLayer is { } swaEff && swaEff[effLayer]
                               && _hp.SlidingWindowSize > 0)
-                ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
+                ? SwaRingSize(_maxSeqLen, _hp.SlidingWindowSize)
                 : _maxSeqLen;
 
             // Gemma 4 uses attention_scale = 1.0 (no 1/sqrt(head_dim) prefactor). Pass
@@ -1731,13 +1759,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             if (!kvShared)
             {
                 int layerCtx = isSwa && _hp.SlidingWindowSize > 0
-                    ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
+                    ? SwaRingSize(_maxSeqLen, _hp.SlidingWindowSize)
                     : _maxSeqLen;
                 _gpu.KvAppend(kView, vView, _gpuKCache[layer], _gpuVCache[layer], kvDimL, position, layerCtx);
             }
             int effLayerCtx = (_hp.IsSwaLayer is { } swaEff && swaEff[effLayer]
                               && _hp.SlidingWindowSize > 0)
-                ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
+                ? SwaRingSize(_maxSeqLen, _hp.SlidingWindowSize)
                 : _maxSeqLen;
             if (isSwa)
                 _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
@@ -1851,15 +1879,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         if (BatchedPrefillEnabled && !snapKvActive && N >= 2
             && startPos + N <= _maxSeqLen && IsBatchedPrefillSupported())
         {
-            // Chunking past 4096 requires a streaming attention path (flash) AND simple
-            // (non-windowed) KV position semantics. SWA layers wrap KV in a window-sized
-            // ring whose cross-chunk behaviour past the window boundary is not yet
-            // validated, so any windowed model keeps the proven 4096 cap (follow-up: #162).
-            // Note: `IsSwaLayer` is only populated for Gemma 4 today, so the explicit
-            // `SlidingWindowSize <= 0` check fails closed if SWA parsing is later extended
-            // to a uniform-window arch that sets the window without a per-layer pattern.
-            bool canChunkPast4096 = PrefillFlashAttnEnabled
-                                  && _hp.IsSwaLayer is null && _hp.SlidingWindowSize <= 0;
+            // Chunking past 4096 requires a streaming attention path (flash) for the
+            // global (full-causal) layers — the non-flash AttentionBatched caps at 4096.
+            // SWA layers are now correct across chunk boundaries (issue #162): their KV
+            // ring is sized window + SwaRingHeadroom (≥ one chunk span), so appending a
+            // whole chunk before attending never overwrites a still-needed window, and the
+            // flash/append kernels wrap reads/writes modulo the ring (SwaRingSize). So flash
+            // alone gates chunking; windowed (Gemma 4) and dense models both qualify.
+            bool canChunkPast4096 = PrefillFlashAttnEnabled;
             int cap = canChunkPast4096 ? _maxSeqLen : 4096;
             if (startPos + N <= cap)
             {
@@ -2254,12 +2281,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         if (!kvShared)
         {
-            int layerCtx = isSwa && window > 0 ? Math.Min(_maxSeqLen, window) : _maxSeqLen;
+            int layerCtx = isSwa && window > 0 ? SwaRingSize(_maxSeqLen, window) : _maxSeqLen;
             _gpu.KvAppendBatched(kAll, vAll, _gpuKCache[layer], _gpuVCache[layer], kvDimL, startPos, layerCtx, N);
         }
 
         int effLayerCtx = (_hp.IsSwaLayer is { } swaEff && swaEff[effLayer] && window > 0)
-            ? Math.Min(_maxSeqLen, window) : _maxSeqLen;
+            ? SwaRingSize(_maxSeqLen, window) : _maxSeqLen;
 
         if (s_prefillProfile) { _gpu.Synchronize(); _profSw.Restart(); }
         // Gemma 4: attention_scale = 1.0, passed explicitly (kernel skips its rsqrtf).
@@ -2815,6 +2842,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         if (hp.LayerHeadDim is { } lhd && hp.IsSwaLayer is { } swa)
         {
             int swaWindow = hp.SlidingWindowSize > 0 ? hp.SlidingWindowSize : int.MaxValue;
+            // SWA layers are sized as a ring of window + SwaRingHeadroom positions (issue
+            // #162), so the cap for the per-token byte formula is the ring size, not the
+            // bare window. Guard against overflow when swaWindow is "unbounded".
+            long swaCap = swaWindow == int.MaxValue ? long.MaxValue : (long)swaWindow + SwaRingHeadroom;
             long globalKvDimPerToken = 0;
             long swaKvDimPerToken    = 0;
             for (int i = 0; i < hp.NumLayers; i++)
@@ -2827,24 +2858,26 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 else        globalKvDimPerToken += layerKvDim;
             }
             // For a given maxCtx C: bytes = globalKvDimPerToken * C
-            //                            + swaKvDimPerToken    * min(C, swaWindow)
+            //                            + swaKvDimPerToken    * min(C, swaCap)
             // Solve for the largest C ≤ hp.ContextLength that fits in `available`.
-            // Branch on whether C ≤ swaWindow:
-            //   if C ≤ swaWindow: bytes = (global+swa) * C
-            //   else:             bytes = global * C + swa * swaWindow
+            // Branch on whether C ≤ swaCap:
+            //   if C ≤ swaCap: bytes = (global+swa) * C
+            //   else:          bytes = global * C + swa * swaCap
             long globalPlusSwa = globalKvDimPerToken + swaKvDimPerToken;
             int candA = globalPlusSwa > 0 ? (int)(available / globalPlusSwa) : int.MaxValue;
             int maxCtxL;
-            if (candA <= swaWindow)
+            if (candA <= swaCap)
             {
                 maxCtxL = candA;
             }
             else
             {
-                long remain = available - swaKvDimPerToken * swaWindow;
+                // swaCap is finite here (candA ≤ long.MaxValue always takes the branch
+                // above when swaCap is unbounded), so swaKvDimPerToken * swaCap is safe.
+                long remain = available - swaKvDimPerToken * swaCap;
                 int candB = globalKvDimPerToken > 0 && remain > 0
                     ? (int)(remain / globalKvDimPerToken) : 0;
-                maxCtxL = Math.Max(swaWindow, candB);
+                maxCtxL = (int)Math.Max(swaCap, candB);
             }
             return Math.Clamp(maxCtxL, 512, hp.ContextLength);
         }
