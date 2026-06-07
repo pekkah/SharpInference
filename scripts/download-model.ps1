@@ -242,10 +242,18 @@ function Download-Model {
     param([string]$key)
     $info = $Models[$key]
 
-    # Check free disk space
-    $drive   = Split-Path -Qualifier (Resolve-Path $ModelDir)
-    $freeGB  = [math]::Round((Get-PSDrive ($drive.TrimEnd(':'))).Free / 1GB, 1)
-    Write-Host "[$key] Free disk on $drive : $freeGB GB"
+    # Check free disk space. Split-Path -Qualifier returns empty on non-Windows
+    # or UNC paths, so fall back and tolerate Get-PSDrive failing.
+    $drive     = Split-Path -Qualifier (Resolve-Path $ModelDir)
+    $driveName = if ($drive) { $drive.TrimEnd(':') } else { '/' }
+    $freeGB    = $null
+    try {
+        $freeGB = [math]::Round((Get-PSDrive $driveName).Free / 1GB, 1)
+        Write-Host "[$key] Free disk on $driveName : $freeGB GB"
+    }
+    catch {
+        Write-Host "[$key] Free disk space could not be determined for $driveName"
+    }
 
     $allPresent = $true
     foreach ($file in $info.Files) {
@@ -254,10 +262,10 @@ function Download-Model {
 
     # Guard: refuse to start a download that won't fit (10% headroom for temp/partial files).
     # Only enforced when the model declares a numeric SizeGB. Skipped if files already present.
-    if (-not $allPresent -and $info.ContainsKey('SizeGB')) {
+    if (-not $allPresent -and $info.ContainsKey('SizeGB') -and $null -ne $freeGB) {
         $neededGB = [math]::Round($info.SizeGB * 1.1, 1)
         if ($freeGB -lt $neededGB) {
-            Write-Error "[$key] Not enough disk space on $drive : need ~$neededGB GB (incl. headroom), have $freeGB GB. Use -DestDir to pick a drive with more room (e.g. -DestDir E:\models)."
+            Write-Error "[$key] Not enough disk space on $driveName : need ~$neededGB GB (incl. headroom), have $freeGB GB. Use -DestDir to pick a drive with more room (e.g. -DestDir E:\models)."
             return
         }
     }
