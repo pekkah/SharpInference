@@ -5,6 +5,7 @@
     Downloads from HuggingFace to the models/ directory. Skips if already present.
     Supports: smollm2, qwen3-8b, olmoe-1b-7b, llama31-70b, qwen3-coder-30b-a3b, qwen36-35b-a3b,
               qwen36-27b-mtp, qwen36-27b-mtp-q5, qwen36-35b-a3b-mtp, carnice-35b-a3b-mtp,
+              gemma4-12b-qat, gemma4-12b-q4km,
               llama4-scout, z-image-turbo, z-image-turbo-q8, realesrgan-x4
 .PARAMETER Model
     Which model to download. Default: downloads all text models (skips large image models).
@@ -20,6 +21,8 @@
     .\download-model.ps1 -Model qwen36-27b-mtp-q5       # Qwen3.6 27B-MTP Q5_K_M (18.5 GB) — higher-quality variant for the MTP bench row
     .\download-model.ps1 -Model qwen36-35b-a3b-mtp -DestDir E:\models  # Qwen3.6 35B-A3B-MTP UD-Q4_K_M (22.7 GB) — MoE MTP perf target for issue #25
     .\download-model.ps1 -Model carnice-35b-a3b-mtp -DestDir E:\models  # Carnice (Qwen3.6-35B-A3B-MTP, agentic/tool-calling) APEX-MTP I-Compact (17.3 GB)
+    .\download-model.ps1 -Model gemma4-12b-qat -DestDir E:\models  # Gemma 4 12B-it QAT q4_0 (~7.0 GB) — issue #124 PRIMARY (official quantization-aware-trained)
+    .\download-model.ps1 -Model gemma4-12b-q4km -DestDir E:\models # Gemma 4 12B-it Q4_K_M (~7.3 GB) — issue #124 fallback / K-quant cross-check
     .\download-model.ps1 -Model llama4-scout            # Llama 4 Scout Q4_K_M (60.9 GB, 2 shards)
     .\download-model.ps1 -Model z-image-turbo           # Z-Image-Turbo Q5_K_M + abliterated encoder (~8.5 GB)
     .\download-model.ps1 -Model z-image-turbo-q8        # Z-Image-Turbo Q8_0 + abliterated encoder Q8_0 (~12 GB)
@@ -28,6 +31,7 @@
 param(
     [ValidateSet("smollm2", "qwen3-8b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "qwen36-35b-a3b",
                  "qwen36-27b-mtp", "qwen36-27b-mtp-q5", "qwen36-35b-a3b-mtp", "carnice-35b-a3b-mtp",
+                 "gemma4-12b-qat", "gemma4-12b-q4km",
                  "llama4-scout", "z-image-turbo", "z-image-turbo-q8", "realesrgan-x4")]
     [string]$Model,
     [string]$DestDir
@@ -117,6 +121,29 @@ $Models = @{
         Urls  = @("https://huggingface.co/mudler/Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-GGUF/resolve/main/Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-I-Compact.gguf")
         Size  = "17.3 GB"
         Phase = "assistant (agentic/tool-calling orchestrator on the qwen35moe MTP path)"
+    }
+    # ── Gemma 4 12B (dense gemma4_unified) — issue #124 ───────────────────────
+    # Google's official quantization-aware-trained (QAT) 4-bit weights. Stored as
+    # q4_0 (NOT a K-quant), so this exercises the q4_0 dequant path (gap G0). Best
+    # quality-per-byte at 4-bit; fits full-GPU offload on 12 GB VRAM. This is the
+    # PRIMARY iteration-1 target. Text GGUF only — vision mmproj is a separate
+    # follow-up (out of scope for iter 1).
+    "gemma4-12b-qat" = @{
+        Files = @("gemma-4-12b-it-q4_0.gguf")
+        Urls  = @("https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/main/gemma-4-12b-it-q4_0.gguf")
+        Size  = "~7.0 GB"
+        SizeGB = 7.0
+        Phase = "issue #124 (PRIMARY — QAT q4_0, dense no-PLE path)"
+    }
+    # Community K-quant of the (non-QAT) instruct weights — the Q4_K_M fallback /
+    # cross-check next to the QAT q4_0 primary. Exercises the K-quant path so both
+    # quant formats are covered for the dense 12B bring-up.
+    "gemma4-12b-q4km" = @{
+        Files = @("gemma-4-12b-it-Q4_K_M.gguf")
+        Urls  = @("https://huggingface.co/unsloth/gemma-4-12b-it-GGUF/resolve/main/gemma-4-12b-it-Q4_K_M.gguf")
+        Size  = "~7.3 GB"
+        SizeGB = 7.3
+        Phase = "issue #124 (fallback — Q4_K_M K-quant cross-check)"
     }
     "llama4-scout" = @{
         Files = @(
@@ -215,14 +242,32 @@ function Download-Model {
     param([string]$key)
     $info = $Models[$key]
 
-    # Check free disk space
-    $drive   = Split-Path -Qualifier (Resolve-Path $ModelDir)
-    $freeGB  = [math]::Round((Get-PSDrive ($drive.TrimEnd(':'))).Free / 1GB, 1)
-    Write-Host "[$key] Free disk: $freeGB GB"
+    # Check free disk space. Split-Path -Qualifier returns empty on non-Windows
+    # or UNC paths, so fall back and tolerate Get-PSDrive failing.
+    $drive     = Split-Path -Qualifier (Resolve-Path $ModelDir)
+    $driveName = if ($drive) { $drive.TrimEnd(':') } else { '/' }
+    $freeGB    = $null
+    try {
+        $freeGB = [math]::Round((Get-PSDrive $driveName).Free / 1GB, 1)
+        Write-Host "[$key] Free disk on $driveName : $freeGB GB"
+    }
+    catch {
+        Write-Host "[$key] Free disk space could not be determined for $driveName"
+    }
 
     $allPresent = $true
     foreach ($file in $info.Files) {
         if (-not (Test-Path (Join-Path $ModelDir $file))) { $allPresent = $false; break }
+    }
+
+    # Guard: refuse to start a download that won't fit (10% headroom for temp/partial files).
+    # Only enforced when the model declares a numeric SizeGB. Skipped if files already present.
+    if (-not $allPresent -and $info.ContainsKey('SizeGB') -and $null -ne $freeGB) {
+        $neededGB = [math]::Round($info.SizeGB * 1.1, 1)
+        if ($freeGB -lt $neededGB) {
+            Write-Error "[$key] Not enough disk space on $driveName : need ~$neededGB GB (incl. headroom), have $freeGB GB. Use -DestDir to pick a drive with more room (e.g. -DestDir E:\models)."
+            return
+        }
     }
 
     if ($allPresent) {
