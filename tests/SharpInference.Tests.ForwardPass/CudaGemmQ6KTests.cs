@@ -29,8 +29,8 @@ public sealed unsafe class CudaGemmQ6KTests
         catch { return null; }
     }
 
-    private static ushort HalfToUshort(Half h) =>
-        BitConverter.ToUInt16(BitConverter.GetBytes(h), 0);
+    // Canonical fp16 bit pattern as ushort (matches the GPU/CPU fp16 decode).
+    private static ushort HalfToUshort(Half h) => BitConverter.HalfToUInt16Bits(h);
 
     /// <summary>Build a <paramref name="rows"/>×<paramref name="cols"/> Q6_K matrix
     /// (210 B / 256-element super-block: 128 ql, 64 qh, 16 int8 scales, fp16 d).</summary>

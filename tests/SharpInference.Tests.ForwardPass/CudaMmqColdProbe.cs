@@ -30,7 +30,7 @@ public sealed unsafe class CudaMmqColdProbe
         catch { return null; }
     }
 
-    private static ushort HalfToUshort(Half h) => BitConverter.ToUInt16(BitConverter.GetBytes(h), 0);
+    private static ushort HalfToUshort(Half h) => BitConverter.HalfToUInt16Bits(h);
 
     // block_q4_K = 144 B / 256 elems: d(fp16) dmin(fp16) scales[12] qs[128].
     private static byte[] BuildQ4KMatrix(int rows, int cols, Random rng)
