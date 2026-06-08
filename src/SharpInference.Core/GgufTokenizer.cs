@@ -305,10 +305,16 @@ public sealed class GgufTokenizer : ITokenizer
     }
 
     // Canonical end-of-sequence names accepted even when typed NORMAL rather than control —
-    // Gemma 4 ships <eos> (id 1) as a normal token, distinct from its configured EOS <turn|>
-    // (id 106). A normal token literally named <eos>/<end_of_turn> appearing in generated
+    // Gemma 4 ships <eos> (id 1) as a normal token, distinct from its end-of-turn token,
+    // which these GGUFs name <turn|> (id 106) — NOT the HF-canonical <end_of_turn> (which
+    // doesn't exist as a single vocab token here; it splits into pieces). E4B declares
+    // eos_token_id=106 so it stops anyway, but the 12B QAT model declares eos_token_id=1,
+    // so without <turn|> in this list its turn-end (106) never enters the EOG set and
+    // generation runs past the turn (leaking <turn|>…<channel|> garbage). Including all
+    // three names makes the turn-end a stop regardless of the (model-varying) eos metadata.
+    // A normal token literally named <eos>/<end_of_turn>/<turn|> appearing in generated
     // content is not a real-world case, so treating it as a stop is safe.
-    private static readonly string[] s_canonicalEosNames = ["<eos>", "<end_of_turn>"];
+    private static readonly string[] s_canonicalEosNames = ["<eos>", "<end_of_turn>", "<turn|>"];
 
     // Bracket-style end-of-turn markers (Llama, Mistral, Phi, ChatML, ...). These are only
     // accepted as stops when the vocab types them as control/user-defined tokens, so a model

@@ -579,7 +579,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 }
 
                 int layerHd = perLayerKv ? hp.LayerHeadDim![i] : _headDim;
-                int layerKvDim = _numKvHeads * layerHd;
+                // Gemma 4 12B mixes per-layer KV head counts (8 GQA on SWA, 1 MQA on
+                // global). Size each layer's K/V by its own count so global layers
+                // don't over-allocate (and match the attention dispatch below).
+                int layerKvHeads = hp.LayerKvHeads is { } lkv ? lkv[i] : _numKvHeads;
+                int layerKvDim = layerKvHeads * layerHd;
                 // SWA layers use a window-sized ring (window + headroom for one batched
                 // append span, issue #162); everything else is full-context. The same
                 // SwaRingSize value is passed to the kernels as maxSeqLen so their
@@ -650,7 +654,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             if (!kvShared)
             {
                 _wk[i] = UploadWeight($"blk.{i}.attn_k.weight");
-                _wv[i] = UploadWeight($"blk.{i}.attn_v.weight");
+                // Gemma 4 12B global layers omit attn_v (attention_k_eq_v): V reuses
+                // the raw K projection. Skip the missing tensor; the forward path
+                // copies K→V for these layers.
+                if (_model.FindTensor($"blk.{i}.attn_v.weight") is not null)
+                    _wv[i] = UploadWeight($"blk.{i}.attn_v.weight");
             }
             _wo[i] = UploadWeight($"blk.{i}.attn_output.weight");
             _wFfnNorm[i] = UploadNormWeight($"blk.{i}.ffn_norm.weight");
@@ -715,8 +723,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // gather a single token's row at decode time. Q8_0 is the Gemma 4 case:
         // 2560 × 262144 dequanted to F32 would burn ~2.7 GB of VRAM on top of the
         // raw 700 MB table.
-        if (embInfo.DType == DType.Q4_K || embInfo.DType == DType.Q8_0)
+        if (embInfo.DType == DType.Q4_K || embInfo.DType == DType.Q8_0 || embInfo.DType == DType.Q6_K)
         {
+            // Q6_K is the Gemma 4 12B (QAT) tied token_embd: 3840×262144 dequanted to
+            // F32 would burn ~4 GB of VRAM (and OOM full offload on a 12 GB card). Keep
+            // it packed (~787 MiB) and gather/dequant one row per token via the dedicated
+            // EmbedLookup* kernel; the tied output projection reuses the packed table
+            // through the Q6_K matvec (issue #124).
             var embData = model.GetTensorData(embInfo);
             _gpuEmbedding = _gpu.UploadRaw(embData, TensorShape.D1(embData.Length), embInfo.DType, exact: true);
             _embIsQuantized = true;
@@ -961,13 +974,17 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         // Embed token. Dispatch on stored dtype so Q8_0 (Gemma 4 / Phase 0) uses
         // its dedicated kernel; Q4_K keeps the legacy fast path; F32 the generic one.
+        // Must cover every quant the graph can store or the wrong dequant silently
+        // produces garbage (#124) — mirror EmbedTokenGemma4/EmbedTokenGpu exactly.
         if (_embIsQuantized)
         {
-            var embDType = _weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K);
-            if (embDType == DType.Q8_0)
-                _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim);
-            else
-                _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim);
+            switch (_weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K))
+            {
+                case DType.Q8_0: _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim); break;
+                case DType.Q6_K: _gpu.EmbedLookupQ6K(_gpuEmbedding, _hidden, token, _embDim); break;
+                case DType.Q5_K: _gpu.EmbedLookupQ5K(_gpuEmbedding, _hidden, token, _embDim); break;
+                default:         _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim); break;
+            }
         }
         else
             _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
@@ -1231,21 +1248,31 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// post-ffn norms, GeluTanhMul FFN, PLE injection, layer_output_scale, final
     /// softcap on the logits.
     /// </summary>
+    // Gemma 4 token embedding gather into _hidden, dispatched on the packed
+    // embedding dtype. Q6_K is the 12B QAT tied table (issue #124); Q8_0 the E4B
+    // case; Q4_K/Q5_K the K-quant conversions; F32 the dequant-on-upload fallback.
+    private void EmbedTokenGemma4(int token)
+    {
+        if (!_embIsQuantized)
+        {
+            _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
+            return;
+        }
+        switch (_weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K))
+        {
+            case DType.Q8_0: _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim); break;
+            case DType.Q6_K: _gpu.EmbedLookupQ6K(_gpuEmbedding, _hidden, token, _embDim); break;
+            case DType.Q5_K: _gpu.EmbedLookupQ5K(_gpuEmbedding, _hidden, token, _embDim); break;
+            default:         _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim); break;
+        }
+    }
+
     private ReadOnlySpan<float> ForwardGemma4(int token, int position)
     {
         if (s_regionProfile) return ForwardGemma4RegionProfiled(token, position);
 
         // 1. Embedding lookup
-        if (_embIsQuantized)
-        {
-            var embDType = _weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K);
-            if (embDType == DType.Q8_0)
-                _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim);
-            else
-                _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim);
-        }
-        else
-            _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
+        EmbedTokenGemma4(token);
 
         if (_hp.EmbeddingScale != 1f)
             _gpu.ScaleInPlace(_hidden, _hp.EmbeddingScale);
@@ -1281,13 +1308,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private ReadOnlySpan<float> ForwardGemma4RegionProfiled(int token, int position)
     {
         _rpSw.Restart();
-        if (_embIsQuantized)
-        {
-            var embDType = _weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K);
-            if (embDType == DType.Q8_0) _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim);
-            else _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim);
-        }
-        else _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
+        EmbedTokenGemma4(token);
         if (_hp.EmbeddingScale != 1f) _gpu.ScaleInPlace(_hidden, _hp.EmbeddingScale);
         if (_hp.HasPerLayerTokenEmbd) BuildPerLayerProjectionsGpu(token);
         _gpu.Synchronize();
@@ -1323,12 +1344,17 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         for (int layer = 0; layer < L; layer++)
         {
             int layerHd = _hp.LayerHeadDim![layer];
+            // Per-layer KV head count (Gemma 4 12B: 8 GQA on SWA, 1 MQA on global).
+            int layerKv = _hp.LayerKvHeads is { } lkv ? lkv[layer] : _numKvHeads;
             int qDimL = _numHeads * layerHd;
-            int kvDimL = _numKvHeads * layerHd;
+            int kvDimL = layerKv * layerHd;
             int kvSrc = _hp.KvSourceLayer is { } ksl ? ksl[layer] : -1;
             bool kvShared = kvSrc >= 0;
             int effLayer = kvShared ? kvSrc : layer;
             bool isSwa = _hp.IsSwaLayer is { } swa && swa[layer];
+            // Gemma 4 12B global layers carry no attn_v: V reuses the raw K projection
+            // (attention_k_eq_v). These layers always own their KV (shared_kv_layers=0).
+            bool kEqV = _hp.AttentionKEqV && !isSwa && _wv[layer] is null;
 
             // Per-layer view tensors so MatMul writes only qDimL/kvDimL rows.
             var qView = new Tensor(TensorShape.D1(qDimL), DType.Float32, _q.Handle);
@@ -1343,7 +1369,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             if (!kvShared)
             {
                 GpuMatMul(kView, _wk[layer], _normBuf);
-                GpuMatMul(vView, _wv[layer], _normBuf);
+                if (kEqV)
+                    CopyDevice(vView, kView);   // V = raw K projection (pre-norm, pre-RoPE)
+                else
+                    GpuMatMul(vView, _wv[layer]!, _normBuf);
             }
 
             // Per-head Q/K norm (Gemma 4: shared headDim-sized weight per head).
@@ -1352,11 +1381,21 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             {
                 if (!kvShared)
                     _gpu.HeadNormQk(qView, _wqNorm![layer], kView, _wkNorm![layer],
-                        _numHeads, _numKvHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                        _numHeads, layerKv, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
                 else
                     _gpu.HeadNorm(qView, _wqNorm![layer], _numHeads, layerHd,
                         _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             }
+
+            // Gemma 4: V gets a plain per-head RMSNorm (no learned weight) before the
+            // KV cache, on EVERY KV-owning layer (E4B and 12B alike). Mirrors the CPU
+            // ForwardPass + llama.cpp gemma4.cpp:227 (Vcur = ggml_rms_norm(Vcur),
+            // unconditional for has_kv layers). V is never RoPE'd. This loop is gemma4-only
+            // (layerHd from LayerHeadDim![layer]) so !kvShared == has_kv. For 12B k_eq_v
+            // globals V is the raw K projection (copied above); for E4B / 12B SWA it is
+            // wv·norm — both get the same V-norm here.
+            if (!kvShared)
+                _gpu.HeadNormPure(vView, layerKv, layerHd, _hp.RmsNormEps);
 
             float ropeTheta = isSwa ? _ropeThetaSwa : _hp.RopeTheta;
             // Global (non-SWA) layers use rope_freqs.weight to mask high-frequency
@@ -1399,13 +1438,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                     _attnScoresScratch,
                     position, _hp.SlidingWindowSize, layerHd,
-                    _numHeads, _numKvHeads, effLayerCtx, attnScale: 1f);
+                    _numHeads, layerKv, effLayerCtx, attnScale: 1f);
             }
             else
             {
                 _gpu.Attention(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                     _attnScoresScratch,
-                    _numHeads, _numKvHeads, layerHd, position + 1, effLayerCtx, attnScale: 1f);
+                    _numHeads, layerKv, layerHd, position + 1, effLayerCtx, attnScale: 1f);
             }
 
             // Output projection: _wo[layer] is [embDim, qDimL] — pass attnOutView
@@ -1580,13 +1619,17 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         var sw = System.Diagnostics.Stopwatch.StartNew();
         long t0 = sw.ElapsedTicks;
 
+        // Dispatch on stored embedding dtype — must cover every quant the graph can
+        // store (#124); mirror EmbedTokenGemma4/EmbedTokenGpu exactly.
         if (_embIsQuantized)
         {
-            var embDType = _weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K);
-            if (embDType == DType.Q8_0)
-                _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim);
-            else
-                _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim);
+            switch (_weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K))
+            {
+                case DType.Q8_0: _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim); break;
+                case DType.Q6_K: _gpu.EmbedLookupQ6K(_gpuEmbedding, _hidden, token, _embDim); break;
+                case DType.Q5_K: _gpu.EmbedLookupQ5K(_gpuEmbedding, _hidden, token, _embDim); break;
+                default:         _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim); break;
+            }
         }
         else _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
         _gpu.Synchronize();
@@ -1700,13 +1743,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         long t0 = sw.ElapsedTicks;
 
         // 1. Embedding lookup + scale.
-        if (_embIsQuantized)
-        {
-            var embDType = _weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K);
-            if (embDType == DType.Q8_0) _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim);
-            else                         _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim);
-        }
-        else _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
+        EmbedTokenGemma4(token);
         if (_hp.EmbeddingScale != 1f) _gpu.ScaleInPlace(_hidden, _hp.EmbeddingScale);
         _gpu.Synchronize();
         AccPhase(PH_EMBED, sw, ref t0);
@@ -1722,12 +1759,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         for (int layer = 0; layer < L; layer++)
         {
             int layerHd = _hp.LayerHeadDim![layer];
+            int layerKv = _hp.LayerKvHeads is { } lkv ? lkv[layer] : _numKvHeads;
             int qDimL = _numHeads * layerHd;
-            int kvDimL = _numKvHeads * layerHd;
+            int kvDimL = layerKv * layerHd;
             int kvSrc = _hp.KvSourceLayer is { } ksl ? ksl[layer] : -1;
             bool kvShared = kvSrc >= 0;
             int effLayer = kvShared ? kvSrc : layer;
             bool isSwa = _hp.IsSwaLayer is { } swa && swa[layer];
+            bool kEqV = _hp.AttentionKEqV && !isSwa && _wv[layer] is null;
 
             var qView = new Tensor(TensorShape.D1(qDimL), DType.Float32, _q.Handle);
             var kView = new Tensor(TensorShape.D1(kvDimL), DType.Float32, _k.Handle);
@@ -1741,7 +1780,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             if (!kvShared)
             {
                 GpuMatMul(kView, _wk[layer], _normBuf);
-                GpuMatMul(vView, _wv[layer], _normBuf);
+                if (kEqV) CopyDevice(vView, kView);
+                else      GpuMatMul(vView, _wv[layer]!, _normBuf);
             }
             _gpu.Synchronize();
             AccPhase(PH_QKV, sw, ref t0);
@@ -1750,10 +1790,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             {
                 if (!kvShared)
                     _gpu.HeadNormQk(qView, _wqNorm![layer], kView, _wkNorm![layer],
-                        _numHeads, _numKvHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                        _numHeads, layerKv, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
                 else
                     _gpu.HeadNorm(qView, _wqNorm![layer], _numHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             }
+            if (!kvShared)   // Gemma 4 V-norm on every KV-owning layer (see ForwardGemma4)
+                _gpu.HeadNormPure(vView, layerKv, layerHd, _hp.RmsNormEps);
             float ropeTheta = isSwa ? _ropeThetaSwa : _hp.RopeTheta;
             if (!isSwa && _gpuRopeFreqs is { } rfTbl)
             {
@@ -1782,10 +1824,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             if (isSwa)
                 _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                     _attnScoresScratch, position, _hp.SlidingWindowSize, layerHd,
-                    _numHeads, _numKvHeads, effLayerCtx, attnScale: 1f);
+                    _numHeads, layerKv, effLayerCtx, attnScale: 1f);
             else
                 _gpu.Attention(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
-                    _attnScoresScratch, _numHeads, _numKvHeads, layerHd, position + 1, effLayerCtx, attnScale: 1f);
+                    _attnScoresScratch, _numHeads, layerKv, layerHd, position + 1, effLayerCtx, attnScale: 1f);
             _gpu.Synchronize();
             AccPhase(PH_KV_ATTN, sw, ref t0);
 
@@ -1953,7 +1995,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     }
 
     private static bool BatchableDType(DType d) =>
-        d is DType.Q4_K or DType.Q5_K or DType.Q6_K or DType.Q8_0 or DType.Float32;
+        d is DType.Q4_K or DType.Q5_K or DType.Q6_K or DType.Q8_0 or DType.Q4_0 or DType.Float32;
 
     private DType WDType(Tensor t) => _weightDTypes.GetValueOrDefault(t.Handle, DType.Q4_K);
 
@@ -1985,8 +2027,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 !BatchableWeight(_wGate[i]) || !BatchableWeight(_wUp[i]) ||
                 !BatchableWeight(_wDown[i]))
                 return false;
-            if (!kvShared && (!BatchableWeight(_wk[i]) || !BatchableWeight(_wv[i])))
-                return false;
+            if (!kvShared)
+            {
+                if (!BatchableWeight(_wk[i])) return false;
+                // Gemma 4 12B global layers (attention_k_eq_v) carry no attn_v: V reuses
+                // the raw K projection, handled in GpuLayerBatchedTrunk. Only require a
+                // batchable _wv when the layer actually has a separate V projection; a
+                // null _wv on a non-k_eq_v model is unexpected → fall back to per-token.
+                if (_wv[i] is not null) { if (!BatchableWeight(_wv[i])) return false; }
+                else if (!_hp.AttentionKEqV) return false;
+            }
             if (_hp.HasPerLayerTokenEmbd &&
                 (!BatchableWeight(_gpuInpGate![i]) || !BatchableWeight(_gpuPleProj![i])))
                 return false;
@@ -2042,6 +2092,31 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             }
             else
                 _gpu.MatMulBatched(outAll, weights, inAll, n, dt);
+        }
+        else if (dt == DType.Q4_0)
+        {
+            // Issue #124/#173: Gemma 4 12B QAT keeps all bulk matmul weights in Q4_0.
+            // Route the trunk matmuls through a compute-bound path (weight read once per
+            // batch) instead of the memory-bound per-token GEMM-N matvec (re-streams the
+            // whole weight once per token — the dominant large-N prefill cost).
+            // PrefillMmqEnabled: the int8 MMQ reads the weight once as int8 (nibble-
+            // expanded, no fp16 dequant temp to HBM, int8 tensor cores), with the Q4_0
+            // symmetric −8·d_w·Σq centering term. Fallback: dequant→fp16→cuBLAS GEMM.
+            // Argmax-stable, not byte-exact. Q4_0 blocks are 32-wide; every Gemma 4 12B
+            // hidden dim is a multiple of 32. There is no Q4_0 GEMM-N matvec fallback
+            // (CudaBackend.MatMulBatched has no Q4_0 case), so an unaligned width is a
+            // hard error rather than a silent wrong-kernel path.
+            int cols = (int)(inAll.ElementCount / n);
+            if ((cols & 0x1f) == 0)
+            {
+                if (PrefillMmqEnabled)
+                    _gpu.MatMulBatchedMmq(outAll, weights, inAll, n, dt);
+                else
+                    _gpu.MatMulBatchedGemm(outAll, weights, inAll, n, dt);
+            }
+            else
+                throw new InvalidOperationException(
+                    $"Q4_0 batched prefill matmul requires cols % 32 == 0 (got {cols}).");
         }
         else if (dt is DType.Q6_K or DType.Q5_K)
         {
@@ -2193,9 +2268,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     {
         if (_embIsQuantized)
         {
-            var embDType = _weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K);
-            if (embDType == DType.Q8_0) _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim);
-            else                        _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim);
+            // Dispatch on the packed embedding dtype — MUST cover every quant the model
+            // graph can store, or the wrong dequant kernel silently produces garbage. The
+            // Gemma 4 12B QAT tied table is Q6_K (#124); a bare Q8_0/else split dequanted
+            // it as Q4_K → NaN embeddings → all-NaN batched-prefill logits. Mirrors the
+            // per-token EmbedTokenGemma4 dispatch exactly.
+            switch (_weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K))
+            {
+                case DType.Q8_0: _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim); break;
+                case DType.Q6_K: _gpu.EmbedLookupQ6K(_gpuEmbedding, _hidden, token, _embDim); break;
+                case DType.Q5_K: _gpu.EmbedLookupQ5K(_gpuEmbedding, _hidden, token, _embDim); break;
+                default:         _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim); break;
+            }
         }
         else
             _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
@@ -2253,14 +2337,19 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private void GpuLayerBatchedTrunk(int layer, int N, int startPos)
     {
         int layerHd = _hp.LayerHeadDim is { } lhd ? lhd[layer] : _headDim;
-        int qDimL = _numHeads * layerHd, kvDimL = _numKvHeads * layerHd;
+        // Per-layer KV head count (Gemma 4 12B: 8 GQA on SWA, 1 MQA on global).
+        int layerKv = _hp.LayerKvHeads is { } lkv ? lkv[layer] : _numKvHeads;
+        int qDimL = _numHeads * layerHd, kvDimL = layerKv * layerHd;
         int kvSrc = _hp.KvSourceLayer is { } ksl ? ksl[layer] : -1;
         bool kvShared = kvSrc >= 0;
         int effLayer = kvShared ? kvSrc : layer;
         bool isSwa = _hp.IsSwaLayer is { } swa && swa[layer];
         int window = _hp.SlidingWindowSize;
+        // Gemma 4 12B global layers carry no attn_v: V reuses the raw K projection
+        // (attention_k_eq_v). These layers always own their KV (shared_kv_layers=0).
+        bool kEqV = _hp.AttentionKEqV && !isSwa && _wv[layer] is null;
 
-        // Per-layer dense views (the buffers are sized for max head_dim).
+        // Per-layer dense views (the buffers are sized for max head_dim × max KV heads).
         var qAll = _gpu.View(_bpQ!, 0, (long)N * qDimL);
         var kAll = _gpu.View(_bpK!, 0, (long)N * kvDimL);
         var vAll = _gpu.View(_bpV!, 0, (long)N * kvDimL);
@@ -2273,7 +2362,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         if (!kvShared)
         {
             GpuMatMulBatched(kAll, _wk[layer], _bpNorm!, N);
-            GpuMatMulBatched(vAll, _wv[layer], _bpNorm!, N);
+            if (kEqV)
+                _gpu.CopyDevice(vAll, kAll);   // V = raw K projection (pre-norm, pre-RoPE)
+            else
+                GpuMatMulBatched(vAll, _wv[layer]!, _bpNorm!, N);
         }
 
         // RoPE and per-head QK-norm must run in the SAME order as the matching per-token
@@ -2291,7 +2383,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             if (!_hasQkNorm || _hp.UseL2QkNorm) return;
             if (!kvShared)
                 _gpu.HeadNormQkBatched(qAll, _wqNorm![layer], kAll, _wkNorm![layer],
-                    _numHeads, _numKvHeads, layerHd, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                    _numHeads, layerKv, layerHd, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             else
                 _gpu.HeadNormBatched(qAll, _wqNorm![layer], _numHeads, layerHd, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
         }
@@ -2303,18 +2395,28 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             {
                 _gpu.RoPEWithFactorsBatched(qAll, startPos, layerHd, ropeTheta, rfTbl, _numHeads, N);
                 if (!kvShared)
-                    _gpu.RoPEWithFactorsBatched(kAll, startPos, layerHd, ropeTheta, rfTbl, _numKvHeads, N);
+                    _gpu.RoPEWithFactorsBatched(kAll, startPos, layerHd, ropeTheta, rfTbl, layerKv, N);
             }
             else
             {
                 _gpu.RoPEPartialBatched(qAll, startPos, layerHd, layerHd, ropeTheta, _numHeads, N, neox: true);
                 if (!kvShared)
-                    _gpu.RoPEPartialBatched(kAll, startPos, layerHd, layerHd, ropeTheta, _numKvHeads, N, neox: true);
+                    _gpu.RoPEPartialBatched(kAll, startPos, layerHd, layerHd, ropeTheta, layerKv, N, neox: true);
             }
         }
 
         // Weighted QK-norm before RoPE for every dense family (issue #157).
         ApplyQkNormBatched();
+        // Gemma 4: V gets a plain per-head RmsNorm (no learned weight) before the KV cache
+        // on every KV-owning layer (E4B + 12B) — mirrors the per-token ForwardGemma4 +
+        // llama.cpp gemma4.cpp:227. For 12B k_eq_v globals V was copied from the RAW K
+        // projection above (pre QK-norm); for E4B / 12B SWA it is wv·norm. V is never RoPE'd.
+        // This trunk also serves non-gemma4 models (layerHd falls back to _headDim), so the
+        // V-norm is gated on the gemma4 master switch — NOT AttentionKEqV (E4B lacks it but
+        // still V-norms, matching the CPU reference and avoiding a mixed-norm V cache vs the
+        // per-token decode path that previously broke the E4B coherence oracle).
+        if (_isGemma4Like && !kvShared)
+            _gpu.HeadNormPureBatched(vAll, layerKv, layerHd, N, _hp.RmsNormEps);
         ApplyRopeBatched();
 
         if (!kvShared)
@@ -2335,20 +2437,20 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             // #146 single-warp kernel. SHARPI_PREFILL_FLASH_TC1=1 forces single-warp (A/B).
             if (!_forceFlashTc1 && (layerHd & 63) == 0)
                 _gpu.FlashAttentionPrefillTc2(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                    _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
+                    _numHeads, layerKv, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
             else
                 _gpu.FlashAttentionPrefillTc(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                    _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
+                    _numHeads, layerKv, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
         }
         else if (PrefillFlashAttnEnabled)
             _gpu.FlashAttentionPrefill(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
+                _numHeads, layerKv, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
         else if (isSwa)
             _gpu.AttentionSwaBatched(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                _numHeads, _numKvHeads, layerHd, startPos, window, effLayerCtx, N, attnScale: _attnScale);
+                _numHeads, layerKv, layerHd, startPos, window, effLayerCtx, N, attnScale: _attnScale);
         else
             _gpu.AttentionBatched(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                _numHeads, _numKvHeads, layerHd, startPos, effLayerCtx, N, attnScale: _attnScale);
+                _numHeads, layerKv, layerHd, startPos, effLayerCtx, N, attnScale: _attnScale);
         if (s_prefillProfile) { _gpu.Synchronize(); _profAttnMs += _profSw.Elapsed.TotalMilliseconds; }
 
         GpuMatMulBatched(_bpHidden!, _wo[layer], attnAll, N);
@@ -2736,7 +2838,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             result = _gpu.Upload(floats, TensorShape.D1(floats.Length), exact: true);
             _weightDTypes[result.Handle] = DType.Float32;
         }
-        else if (info.DType == DType.Q4_K || info.DType == DType.Q6_K || info.DType == DType.Q8_0)
+        else if (info.DType == DType.Q4_0 || info.DType == DType.Q4_K || info.DType == DType.Q6_K || info.DType == DType.Q8_0)
         {
             result = _gpu.UploadRaw(data, TensorShape.D1(data.Length), info.DType, exact: true);
             // #149: repack 2-D Q8_0 GEMM weights (norms/biases are 1-D; embedding uploads
@@ -2754,6 +2856,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 int cols = (int)info.Dimensions[0];
                 int rows = (int)info.Dimensions[1];
                 result = _gpu.RepackQ4KSoa(result, rows, cols);
+            }
+            // #124/#173: same funnelshift-killing SoA repack for 2-D Q4_0 trunk weights
+            // (Gemma 4 12B QAT). cols % 32 required — every Q4_0 hidden dim satisfies it.
+            // Gated on the same SHARPI_MMQ_SOA flag as Q8_0 (#149); dense-only.
+            else if (_mmqSoa && !_isMoE && info.DType == DType.Q4_0 && info.NDimensions == 2)
+            {
+                int cols = (int)info.Dimensions[0];
+                int rows = (int)info.Dimensions[1];
+                result = _gpu.RepackQ4_0Soa(result, rows, cols);
             }
             _weightDTypes[result.Handle] = info.DType;
         }
@@ -2987,9 +3098,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             _gpu.Free(_wAttnNorm[i]); _gpu.Free(_wFfnNorm[i]);
             _gpu.Free(_wq[i]); _gpu.Free(_wo[i]);
             // KV-share layers (Gemma 4 tail) never owned their own K/V projections.
+            // Gemma 4 12B global layers (k_eq_v) carry K but no V (_wv[i] is null).
             if (!kvShared)
             {
-                _gpu.Free(_wk[i]); _gpu.Free(_wv[i]);
+                _gpu.Free(_wk[i]);
+                if (_wv[i] is not null) _gpu.Free(_wv[i]);
             }
             // Gemma 4 per-layer post-norms (small, GPU-resident).
             if (_wPostAttnNorm is not null) _gpu.Free(_wPostAttnNorm[i]);

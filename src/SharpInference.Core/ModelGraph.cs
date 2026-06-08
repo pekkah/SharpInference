@@ -225,6 +225,23 @@ public sealed record ModelHyperparams
     public IReadOnlyList<int>? LayerRopeDim { get; init; }
 
     /// <summary>
+    /// Per-layer KV head count. Gemma 4 12B (dense) mixes 8 (GQA) on SWA layers
+    /// and 1 (MQA) on global layers; stored in the GGUF as a per-layer
+    /// <c>attention.head_count_kv</c> array. <c>null</c> when every layer uses the
+    /// scalar <see cref="NumKvHeads"/>.
+    /// </summary>
+    public IReadOnlyList<int>? LayerKvHeads { get; init; }
+
+    /// <summary>
+    /// When <c>true</c>, attention reuses the K projection as V on the layers that
+    /// omit a <c>attn_v.weight</c> tensor (Gemma 4 12B global layers,
+    /// <c>attention_k_eq_v=true</c> in the HF config). Such layers carry no V
+    /// projection; the K output doubles as the value stream. <c>false</c> for the
+    /// usual separate-K/V layout.
+    /// </summary>
+    public bool AttentionKEqV { get; init; }
+
+    /// <summary>
     /// Extract hyperparameters from GGUF metadata using the model's architecture prefix.
     /// Supports llama-family models (llama, mistral, qwen, smollm, etc.) and MoE variants.
     /// </summary>
@@ -365,6 +382,8 @@ public sealed record ModelHyperparams
         IReadOnlyList<int>? kvSourceLayer = null;
         IReadOnlyList<int>? layerHeadDim = null;
         IReadOnlyList<int>? layerRopeDim = null;
+        IReadOnlyList<int>? layerKvHeads = null;
+        bool attentionKEqV = false;
 
         if (isGemma4)
         {
@@ -388,6 +407,11 @@ public sealed record ModelHyperparams
             hasLayerOutputScale  = metadata.ContainsKey("_sharpi.has_layer_output_scale")
                 || (model?.FindTensor("blk.0.layer_output_scale.weight") is not null);
 
+            // Gemma 4 12B (dense) global layers omit attn_v and reuse K as V
+            // (attention_k_eq_v=true in the HF config; not a GGUF metadata key, so it
+            // is detected from the tensor inventory via a GgufModel.Open probe).
+            attentionKEqV = metadata.ContainsKey("_sharpi.attention_k_eq_v");
+
             if (numLayers > 0)
             {
                 var pattern = GetBoolArray(metadata, $"{arch}.attention.sliding_window_pattern");
@@ -409,6 +433,24 @@ public sealed record ModelHyperparams
                 }
                 layerHeadDim = hdArr;
                 layerRopeDim = rdArr;
+
+                // Per-layer KV head count (Gemma 4 12B: 8 on SWA, 1 on global).
+                // Stored as a per-layer array in the GGUF; build the full vector so
+                // forward passes can size each layer's KV independently. Falls back
+                // to the scalar head_count_kv (broadcast) when stored as a scalar.
+                var kvArr = GetIntArray(metadata, $"{arch}.attention.head_count_kv");
+                if (kvArr is not null && kvArr.Count > 0)
+                {
+                    var lkv = new int[numLayers];
+                    for (int i = 0; i < numLayers; i++)
+                    {
+                        // Guard a corrupt/0 KV head count → it would divide-by-zero in the
+                        // attention group-size calc (_numHeads / kvHeads) downstream.
+                        int val = kvArr[i % kvArr.Count];
+                        lkv[i] = val > 0 ? val : 1;
+                    }
+                    layerKvHeads = lkv;
+                }
 
                 if (sharedKvLayers > 0)
                 {
@@ -483,14 +525,47 @@ public sealed record ModelHyperparams
             KvSourceLayer = kvSourceLayer,
             LayerHeadDim = layerHeadDim,
             LayerRopeDim = layerRopeDim,
+            LayerKvHeads = layerKvHeads,
+            AttentionKEqV = attentionKEqV,
         };
     }
 
-    private static int GetInt(IReadOnlyDictionary<string, object> m, string key, int fallback = 0) =>
-        m.TryGetValue(key, out var v) ? Convert.ToInt32(v) : fallback;
+    private static int GetInt(IReadOnlyDictionary<string, object> m, string key, int fallback = 0)
+    {
+        if (!m.TryGetValue(key, out var v)) return fallback;
+        // Some keys are stored per-layer as an array (e.g. Gemma 4 12B's
+        // gemma4.attention.head_count_kv = [8,8,8,8,8,1,…]). A plain Convert.ToInt32
+        // throws on an array; collapse to the first element so the scalar reader
+        // doesn't crash. IList covers the reader's object[] plus any typed array
+        // (int[]/long[]). Per-layer consumers use GetIntArray instead.
+        if (v is System.Collections.IList list) return list.Count > 0 ? Convert.ToInt32(list[0]) : fallback;
+        return Convert.ToInt32(v);
+    }
 
     private static float GetFloat(IReadOnlyDictionary<string, object> m, string key, float fallback = 0f) =>
         m.TryGetValue(key, out var v) ? Convert.ToSingle(v) : fallback;
+
+    /// <summary>
+    /// Reads a per-layer integer array (e.g. Gemma 4's per-layer
+    /// <c>attention.head_count_kv</c>). Returns <c>null</c> when the key is absent
+    /// or stored as a scalar (the caller then falls back to the scalar field).
+    /// </summary>
+    private static IReadOnlyList<int>? GetIntArray(IReadOnlyDictionary<string, object> m, string key)
+    {
+        if (!m.TryGetValue(key, out var v)) return null;
+        switch (v)
+        {
+            case IReadOnlyList<int> rl: return rl;          // int[]/List<int> — zero-copy
+            case System.Collections.IList list:             // object[] (the reader's form), long[], … — convert
+            {
+                var result = new int[list.Count];
+                for (int i = 0; i < list.Count; i++)
+                    result[i] = Convert.ToInt32(list[i]);
+                return result;
+            }
+            default: return null;
+        }
+    }
 
     private static IReadOnlyList<bool>? GetBoolArray(IReadOnlyDictionary<string, object> m, string key)
     {

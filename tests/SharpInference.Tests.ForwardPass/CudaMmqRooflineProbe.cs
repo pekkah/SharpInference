@@ -62,28 +62,36 @@ public sealed unsafe class CudaMmqRooflineProbe
             var acts = new float[nTok * cols];
             for (int i = 0; i < acts.Length; i++) acts[i] = (float)(rng.NextDouble() * 2 - 1);
 
-            var gpuW = gpu.UploadRaw(weightBytes, TensorShape.D1(weightBytes.Length), DType.Q8_0);
             var gpuX = gpu.Upload(acts, TensorShape.D1(acts.Length));
             var gpuY = gpu.Allocate(TensorShape.D1((long)nTok * rows));
-
-            // Warm up (incl. first-call NVRTC/quantize buffer alloc), then time.
-            for (int i = 0; i < 5; i++) gpu.MatMulBatchedMmq(gpuY, gpuW, gpuX, nTok, DType.Q8_0);
-            gpu.Synchronize();
-
-            const int iters = 50;
-            var sw = Stopwatch.StartNew();
-            for (int i = 0; i < iters; i++) gpu.MatMulBatchedMmq(gpuY, gpuW, gpuX, nTok, DType.Q8_0);
-            gpu.Synchronize();
-            sw.Stop();
-
-            gpu.Free(gpuW); gpu.Free(gpuX); gpu.Free(gpuY);
-
-            double msPer = sw.Elapsed.TotalMilliseconds / iters;
             double macs = (double)rows * cols * nTok;          // multiply-accumulates
-            double tops = (2.0 * macs) / (msPer * 1e-3) / 1e12; // ×2 (MAC=mul+add)
             double peak = 160.0;                                // ~RTX 4070 Ti dense int8 TC TOPS
-            Console.WriteLine(
-                $"MMQ {what,-12} [{rows}×{cols}]·[{cols}×{nTok}]: {msPer:F3} ms/call  {tops:F1} int8 TOPS  ({100*tops/peak:F0}% of ~{peak:F0} peak)");
+
+            // AoS (interleaved 34-B block, sharpi_uint_at funnelshift) vs SoA (#149,
+            // 16-B-aligned quants + separate scales). Time both to see how much of the
+            // 34%-of-peak ceiling is the misalignment tax vs the kernel's intrinsic cap.
+            foreach (var soa in new[] { false, true })
+            {
+                var gpuW0 = gpu.UploadRaw(weightBytes, TensorShape.D1(weightBytes.Length), DType.Q8_0);
+                var gpuW  = soa ? gpu.RepackQ8_0Soa(gpuW0, rows, cols) : gpuW0;
+
+                for (int i = 0; i < 5; i++) gpu.MatMulBatchedMmq(gpuY, gpuW, gpuX, nTok, DType.Q8_0);
+                gpu.Synchronize();
+
+                const int iters = 50;
+                var sw = Stopwatch.StartNew();
+                for (int i = 0; i < iters; i++) gpu.MatMulBatchedMmq(gpuY, gpuW, gpuX, nTok, DType.Q8_0);
+                gpu.Synchronize();
+                sw.Stop();
+
+                gpu.Free(gpuW);
+
+                double msPer = sw.Elapsed.TotalMilliseconds / iters;
+                double tops = (2.0 * macs) / (msPer * 1e-3) / 1e12; // ×2 (MAC=mul+add)
+                Console.WriteLine(
+                    $"MMQ {(soa ? "SoA" : "AoS")} {what,-12} [{rows}×{cols}]·[{cols}×{nTok}]: {msPer:F3} ms/call  {tops:F1} int8 TOPS  ({100*tops/peak:F0}% of ~{peak:F0} peak)");
+            }
+            gpu.Free(gpuX); gpu.Free(gpuY);
         }
         Assert.True(true);
     }

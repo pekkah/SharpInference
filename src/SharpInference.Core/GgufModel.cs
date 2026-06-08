@@ -122,6 +122,7 @@ public sealed unsafe class GgufModel : IDisposable
 
             // Inject synthetic metadata from tensor inspection
             var arch = metadata.TryGetValue("general.architecture", out var archVal) ? (string)archVal : "llama";
+            int attnKCount = 0, attnVCount = 0;
             foreach (var t in allTensors)
             {
                 if (t.Name == "blk.0.attn_q.bias")     metadata["_sharpi.has_attn_bias"] = true;
@@ -138,7 +139,20 @@ public sealed unsafe class GgufModel : IDisposable
                                  or "blk.2.ssm_conv1d.weight"
                                  or "blk.3.ssm_conv1d.weight")
                     metadata["_sharpi.is_hybrid_ssm"] = true;
+
+                // Gemma 4 12B global layers omit attn_v and reuse K as V
+                // (attention_k_eq_v). Detect by a V-projection deficit vs K.
+                if (t.Name.EndsWith(".attn_k.weight", StringComparison.Ordinal))      attnKCount++;
+                else if (t.Name.EndsWith(".attn_v.weight", StringComparison.Ordinal)) attnVCount++;
             }
+            // k_eq_v is a Gemma-4-specific mechanism (its global layers drop attn_v and reuse
+            // the K projection as V). Gate the V-deficit heuristic on the gemma4 arch family so
+            // an unrelated architecture that ships fewer V than K projections can't be mis-driven
+            // down the copy-K-into-V path. Heuristic, not a metadata read — no GGUF declares
+            // attention_k_eq_v directly.
+            if (attnKCount > 0 && attnVCount < attnKCount
+                && arch.StartsWith("gemma4", StringComparison.Ordinal))
+                metadata["_sharpi.attention_k_eq_v"] = true;
 
             if (!metadata.ContainsKey($"{arch}.vocab_size") &&
                 metadata.TryGetValue("tokenizer.ggml.tokens", out var tokArr) && tokArr is object[] toks)

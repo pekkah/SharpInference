@@ -139,14 +139,16 @@ public static class TierPlanner
         return info is not null ? ((info.Value.ByteSize + 3) & ~3L) : 0;
     }
 
-    // Embedding-aware: only Q4_K embed stays quantized on GPU (the only quantized
-    // EmbedLookup shader). Anything else gets dequantized to F32 at upload time,
-    // so the post-upload footprint is 4 bytes per element regardless of source dtype.
+    // Embedding-aware: Q4_K / Q8_0 / Q6_K embeddings stay quantized on GPU (each has a
+    // dedicated EmbedLookup* kernel — Q6_K added for the Gemma 4 12B QAT tied table,
+    // issue #124). Anything else is dequantized to F32 at upload, so its post-upload
+    // footprint is 4 bytes per element.
     private static long MeasureGpuEmbeddingBytes(GgufModel model, string name)
     {
         var info = model.FindTensor(name);
         if (info is null) return 0;
-        if (info.Value.DType == DType.Q4_K)
+        var dt = info.Value.DType;
+        if (dt == DType.Q4_K || dt == DType.Q8_0 || dt == DType.Q6_K)
             return (info.Value.ByteSize + 3) & ~3L;
         return info.Value.ElementCount * sizeof(float);
     }
@@ -204,10 +206,19 @@ public static class TierPlanner
 
     private static long EstimateGpuTensorBytes(GgufTensorInfo tensor)
     {
-        if (tensor.DType == DType.Float32 || tensor.DType == DType.Q4_K || tensor.DType == DType.Q6_K)
-            return (tensor.ByteSize + 3) & ~3L;
-
-        return tensor.ElementCount * sizeof(float);
+        // Dtypes the CUDA forward pass keeps packed in VRAM (CudaForwardPass.UploadWeight):
+        // Q4_0 (Gemma 4 12B QAT, #124), Q4_K, Q6_K, Q8_0. Others (incl. Q5_K) dequant to F32.
+        switch (tensor.DType)
+        {
+            case DType.Float32:
+            case DType.Q4_0:
+            case DType.Q4_K:
+            case DType.Q6_K:
+            case DType.Q8_0:
+                return (tensor.ByteSize + 3) & ~3L;
+            default:
+                return tensor.ElementCount * sizeof(float);
+        }
     }
 
     private static bool ShouldKeepFixedWeightsOnCpu(GgufTensorInfo embedding, GgufTensorInfo? output)
