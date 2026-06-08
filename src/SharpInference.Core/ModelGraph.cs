@@ -443,7 +443,12 @@ public sealed record ModelHyperparams
                 {
                     var lkv = new int[numLayers];
                     for (int i = 0; i < numLayers; i++)
-                        lkv[i] = kvArr[i % kvArr.Count];
+                    {
+                        // Guard a corrupt/0 KV head count → it would divide-by-zero in the
+                        // attention group-size calc (_numHeads / kvHeads) downstream.
+                        int val = kvArr[i % kvArr.Count];
+                        lkv[i] = val > 0 ? val : 1;
+                    }
                     layerKvHeads = lkv;
                 }
 
@@ -530,9 +535,10 @@ public sealed record ModelHyperparams
         if (!m.TryGetValue(key, out var v)) return fallback;
         // Some keys are stored per-layer as an array (e.g. Gemma 4 12B's
         // gemma4.attention.head_count_kv = [8,8,8,8,8,1,…]). A plain Convert.ToInt32
-        // throws on object[]; collapse to the first element so the scalar reader
-        // doesn't crash. Per-layer consumers use GetIntArray instead.
-        if (v is object[] arr) return arr.Length > 0 ? Convert.ToInt32(arr[0]) : fallback;
+        // throws on an array; collapse to the first element so the scalar reader
+        // doesn't crash. IList covers the reader's object[] plus any typed array
+        // (int[]/long[]). Per-layer consumers use GetIntArray instead.
+        if (v is System.Collections.IList list) return list.Count > 0 ? Convert.ToInt32(list[0]) : fallback;
         return Convert.ToInt32(v);
     }
 
@@ -549,13 +555,12 @@ public sealed record ModelHyperparams
         if (!m.TryGetValue(key, out var v)) return null;
         switch (v)
         {
-            case int[] ia: return ia;
-            case IReadOnlyList<int> rl: return rl;
-            case object[] oa:
+            case IReadOnlyList<int> rl: return rl;          // int[]/List<int> — zero-copy
+            case System.Collections.IList list:             // object[] (the reader's form), long[], … — convert
             {
-                var result = new int[oa.Length];
-                for (int i = 0; i < oa.Length; i++)
-                    result[i] = Convert.ToInt32(oa[i]);
+                var result = new int[list.Count];
+                for (int i = 0; i < list.Count; i++)
+                    result[i] = Convert.ToInt32(list[i]);
                 return result;
             }
             default: return null;
