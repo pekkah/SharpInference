@@ -2258,9 +2258,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     {
         if (_embIsQuantized)
         {
-            var embDType = _weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K);
-            if (embDType == DType.Q8_0) _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim);
-            else                        _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim);
+            // Dispatch on the packed embedding dtype — MUST cover every quant the model
+            // graph can store, or the wrong dequant kernel silently produces garbage. The
+            // Gemma 4 12B QAT tied table is Q6_K (#124); a bare Q8_0/else split dequanted
+            // it as Q4_K → NaN embeddings → all-NaN batched-prefill logits. Mirrors the
+            // per-token EmbedTokenGemma4 dispatch exactly.
+            switch (_weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K))
+            {
+                case DType.Q8_0: _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim); break;
+                case DType.Q6_K: _gpu.EmbedLookupQ6K(_gpuEmbedding, _hidden, token, _embDim); break;
+                case DType.Q5_K: _gpu.EmbedLookupQ5K(_gpuEmbedding, _hidden, token, _embDim); break;
+                default:         _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim); break;
+            }
         }
         else
             _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
