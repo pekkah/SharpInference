@@ -974,13 +974,17 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         // Embed token. Dispatch on stored dtype so Q8_0 (Gemma 4 / Phase 0) uses
         // its dedicated kernel; Q4_K keeps the legacy fast path; F32 the generic one.
+        // Must cover every quant the graph can store or the wrong dequant silently
+        // produces garbage (#124) — mirror EmbedTokenGemma4/EmbedTokenGpu exactly.
         if (_embIsQuantized)
         {
-            var embDType = _weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K);
-            if (embDType == DType.Q8_0)
-                _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim);
-            else
-                _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim);
+            switch (_weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K))
+            {
+                case DType.Q8_0: _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim); break;
+                case DType.Q6_K: _gpu.EmbedLookupQ6K(_gpuEmbedding, _hidden, token, _embDim); break;
+                case DType.Q5_K: _gpu.EmbedLookupQ5K(_gpuEmbedding, _hidden, token, _embDim); break;
+                default:         _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim); break;
+            }
         }
         else
             _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
@@ -1615,13 +1619,17 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         var sw = System.Diagnostics.Stopwatch.StartNew();
         long t0 = sw.ElapsedTicks;
 
+        // Dispatch on stored embedding dtype — must cover every quant the graph can
+        // store (#124); mirror EmbedTokenGemma4/EmbedTokenGpu exactly.
         if (_embIsQuantized)
         {
-            var embDType = _weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K);
-            if (embDType == DType.Q8_0)
-                _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim);
-            else
-                _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim);
+            switch (_weightDTypes.GetValueOrDefault(_gpuEmbedding.Handle, DType.Q4_K))
+            {
+                case DType.Q8_0: _gpu.EmbedLookupQ8_0(_gpuEmbedding, _hidden, token, _embDim); break;
+                case DType.Q6_K: _gpu.EmbedLookupQ6K(_gpuEmbedding, _hidden, token, _embDim); break;
+                case DType.Q5_K: _gpu.EmbedLookupQ5K(_gpuEmbedding, _hidden, token, _embDim); break;
+                default:         _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, token, _embDim); break;
+            }
         }
         else _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
         _gpu.Synchronize();
