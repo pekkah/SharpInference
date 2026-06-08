@@ -2747,6 +2747,281 @@ extern ""C"" __global__ void llm_dequant_q4_0_to_f16(
     }
 }
 
+// ── Q4_0 SoA repack + SoA readers (issue #124/#173, mirrors #149) ───────────
+// The Q4_0 block is 18 B ([d:fp16][qs:16]) and 18 is not a multiple of 4, so half
+// the blocks' qs start at a 2-byte offset — every weight uint costs a funnelshift
+// (sharpi_uint_at) in the MMQ / dp4a readers, which the roofline puts at ~52 TFLOPS
+// (~32% of fp16 TC peak), the same class as the pre-#149 Q8_0 ceiling. A one-time
+// upload repack into struct-of-arrays — [quants rows*cols/2 B (16 B/block, 16-byte
+// aligned)][scales rows*nb fp16] — lets every reader use plain aligned uint loads.
+// Same total bytes as AoS (16+2 = 18). Quant byte values and scales are bit-identical
+// to the interleaved layout, so each SoA reader is bit-identical to its AoS twin
+// (and the SoA MMQ is bit-identical to llm_mmq_q4_0, itself argmax-stable vs fp).
+
+// One thread per 32-element block: copy the 16 qs bytes to the (16-byte-aligned)
+// quants region and the 2-byte fp16 scale to the scales region.
+extern ""C"" __global__ void llm_q4_0_repack_soa(
+    const unsigned char* __restrict__ src,   // interleaved, 18 B/block
+    unsigned char* __restrict__ dst,         // SoA [quants rows*cols/2 B][scales rows*nb fp16]
+    int rows, int cols)
+{
+    long blk = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    int nb = cols >> 5;
+    long total = (long)rows * nb;
+    if (blk >= total) return;
+    long srcOff = blk * 18L;
+    long qDst = blk * 16L;                            // quants region (16 B/block)
+    long sDst = ((long)rows * cols) / 2 + blk * 2L;   // scales region (fp16/block)
+    dst[sDst]     = src[srcOff];
+    dst[sDst + 1] = src[srcOff + 1];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) dst[qDst + i] = src[srcOff + 2 + i];
+}
+
+// SoA fp32 matvec — bit-identical to llm_matvec_q4_0 (same byte value / fp16 d /
+// per-lane accumulation order), reading the SoA layout instead of the 18-B block.
+extern ""C"" __global__ void llm_matvec_q4_0_soa(
+    const unsigned int* __restrict__ weights,
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int rows, int cols)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    if (row >= rows) return;
+
+    int num_blocks = cols >> 5;
+    const unsigned short* ws = (const unsigned short*)((const char*)weights + ((long)rows * cols) / 2);
+    long srow = (long)row * num_blocks;
+
+    float acc = 0.f;
+    for (int block = 0; block < num_blocks; block++) {
+        long blk_idx = srow + block;
+        float d = sharpi_fp16_to_fp32(ws[blk_idx]);
+        unsigned int qbyte = sharpi_byte_at(weights, blk_idx * 16L + (long)(lane & 15));
+        int nib = (lane < 16) ? (int)(qbyte & 0xFu) : (int)(qbyte >> 4);
+        int q = nib - 8;
+        float x = input[block * 32 + lane];
+        acc += d * (float)q * x;
+    }
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output[row] = result;
+}
+
+// SoA dp4a decode matvec — bit-identical to llm_matvec_q4_0_dp4a (same nibble words /
+// fp16 d / −8·d_w·s correction / 8-warp reduction), aligned weight uint loads.
+extern ""C"" __global__ void llm_matvec_q4_0_dp4a_soa(
+    const unsigned int* __restrict__ weights,    // SoA [quants][scales]
+    const unsigned char* __restrict__ y_q81,
+    float* __restrict__ output,
+    int rows, int cols)
+{
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    int warp_id = (int)threadIdx.y;
+    int lane    = (int)threadIdx.x;
+    int grp     = lane >> 2;
+    int sub     = lane & 3;
+
+    int num_blocks = cols >> 5;
+    long qrow = (long)row * num_blocks;             // block-index base for this row
+    const unsigned short* ws = (const unsigned short*)((const char*)weights + ((long)rows * cols) / 2);
+
+    float acc = 0.f;
+    for (int block0 = warp_id * 8; block0 < num_blocks; block0 += MATVEC_Q40_NWARPS * 8) {
+        int block = block0 + grp;
+        float part = 0.f;
+        if (block < num_blocks) {
+            long blk_idx = qrow + block;
+            float dw = sharpi_fp16_to_fp32(ws[blk_idx]);
+            unsigned int w = weights[blk_idx * 4L + sub];      // aligned, no funnelshift
+            int vi0 = (int)(w & 0x0F0F0F0Fu);
+            int vi1 = (int)((w >> 4) & 0x0F0F0F0Fu);
+
+            long ab = (long)block * 36L;
+            unsigned int d_bits = (*reinterpret_cast<const unsigned int*>(y_q81 + ab)) & 0xffffu;
+            float da = sharpi_fp16_to_fp32(d_bits);
+            int aq0 = *reinterpret_cast<const int*>(y_q81 + ab + 4 + (long)sub * 4);
+            int aq1 = *reinterpret_cast<const int*>(y_q81 + ab + 4 + 16 + (long)sub * 4);
+
+            int dot = __dp4a(vi0, aq0, 0);
+            dot = __dp4a(vi1, aq1, dot);
+            part = dw * da * (float)dot;
+
+            if (sub == 0) {
+                unsigned int s_bits = (*reinterpret_cast<const unsigned int*>(y_q81 + ab)) >> 16;
+                float s = sharpi_fp16_to_fp32(s_bits);
+                part -= 8.f * dw * s;
+            }
+        }
+        part += __shfl_xor_sync(0xffffffffu, part, 2);
+        part += __shfl_xor_sync(0xffffffffu, part, 1);
+        if (sub == 0) acc += part;
+    }
+
+    __shared__ float warp_acc[MATVEC_Q40_NWARPS][8];
+    if (sub == 0) warp_acc[warp_id][grp] = acc;
+    __syncthreads();
+    if (warp_id == 0 && lane == 0) {
+        float s = 0.f;
+        #pragma unroll
+        for (int w = 0; w < MATVEC_Q40_NWARPS; w++)
+            for (int g = 0; g < 8; g++) s += warp_acc[w][g];
+        output[row] = s;
+    }
+}
+
+// SoA Q4_0 → fp16 dequant (cuBLAS prefill GEMM fallback, SHARPI_PREFILL_MMQ=0) —
+// bit-identical to llm_dequant_q4_0_to_f16, reading the SoA layout.
+extern ""C"" __global__ void llm_dequant_q4_0_to_f16_soa(
+    const unsigned int* __restrict__ weights,   // SoA [quants][scales]
+    unsigned short* __restrict__ out,           // [rows * cols] fp16
+    int rows, int cols)
+{
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    int num_blocks = cols >> 5;
+    const unsigned short* ws = (const unsigned short*)((const char*)weights + ((long)rows * cols) / 2);
+    long srow = (long)row * num_blocks;
+    long out_row = (long)row * (long)cols;
+    for (int c = (int)threadIdx.x; c < cols; c += (int)blockDim.x) {
+        int block = c >> 5;
+        int within = c & 31;
+        long blk_idx = srow + block;
+        float d = sharpi_fp16_to_fp32(ws[blk_idx]);
+        unsigned int qbyte = sharpi_byte_at(weights, blk_idx * 16L + (long)(within & 15));
+        int nib = (within < 16) ? (int)(qbyte & 0xFu) : (int)(qbyte >> 4);
+        int q = nib - 8;
+        out[out_row + c] = (unsigned short)sharpi_fp32_to_fp16(d * (float)q);
+    }
+}
+
+// SoA int8 MMQ — bit-identical to llm_mmq_q4_0 (same int8 nibbles / fp16 scales /
+// 8-warp mma accumulation), aligned weight uint loads instead of sharpi_uint_at.
+#define MMQ_BM 64
+#define MMQ_BN 128
+extern ""C"" __global__ void llm_mmq_q4_0_soa(
+    const unsigned int*  __restrict__ weights,   // SoA [quants rows*cols/2 B][scales rows*nb fp16]
+    const unsigned char* __restrict__ y_q81,     // Q8_1 [n_tok × cols], 36 B/block
+    float* __restrict__ output,                  // [n_tok × rows] fp32
+    int rows, int cols, int n_tok)
+{
+    const unsigned int*   qw = weights;
+    const unsigned short* ws = (const unsigned short*)((const char*)weights + ((long)rows * cols) / 2);
+
+    __shared__ int   sW[MMQ_BM * 8];
+    __shared__ float sWd[MMQ_BM];
+    __shared__ int   sY[MMQ_BN * 8];
+    __shared__ float sYd[MMQ_BN];
+    __shared__ float sYs[MMQ_BN];
+
+    int row_block = (int)blockIdx.x * MMQ_BM;
+    int tok_block = (int)blockIdx.y * MMQ_BN;
+    int nb = cols >> 5;
+
+    int tid  = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int grp  = lane >> 2;
+    int tig  = lane & 3;
+    int wr   = warp & 3;
+    int wc   = warp >> 2;
+    int mrow0 = wr * 16;
+
+    float acc[8][4];
+    #pragma unroll
+    for (int n = 0; n < 8; n++) { acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.f; }
+
+    unsigned int rWq0, rWq1, rY0, rY1, rY2, rY3;
+    float rWd, rYd, rYs;
+    #define MMQ_LOAD_TILE_Q40_SOA(KB) do { \
+        int ww = tid & 7; int qword = ww & 3; \
+        int gw0 = row_block + (tid >> 3); \
+        { unsigned int w = (gw0 < rows) ? qw[((long)gw0 * nb + (KB)) * 4L + qword] : 0u; \
+          rWq0 = (ww < 4) ? (w & 0x0F0F0F0Fu) : ((w >> 4) & 0x0F0F0F0Fu); } \
+        int gw1 = row_block + ((tid + 256) >> 3); \
+        { unsigned int w = (gw1 < rows) ? qw[((long)gw1 * nb + (KB)) * 4L + qword] : 0u; \
+          rWq1 = (ww < 4) ? (w & 0x0F0F0F0Fu) : ((w >> 4) & 0x0F0F0F0Fu); } \
+        if (tid < MMQ_BM) { int gw = row_block + tid; \
+          rWd = (gw < rows) ? sharpi_fp16_to_fp32(ws[(long)gw * nb + (KB)]) : 0.f; } \
+        int gy0 = tok_block + (tid >> 3); \
+        rY0 = (gy0 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy0 * nb + (KB)) * 36L + 4 + (long)(tid & 7) * 4) : 0u; \
+        int gy1 = tok_block + ((tid + 256) >> 3); \
+        rY1 = (gy1 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy1 * nb + (KB)) * 36L + 4 + (long)((tid + 256) & 7) * 4) : 0u; \
+        int gy2 = tok_block + ((tid + 512) >> 3); \
+        rY2 = (gy2 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy2 * nb + (KB)) * 36L + 4 + (long)((tid + 512) & 7) * 4) : 0u; \
+        int gy3 = tok_block + ((tid + 768) >> 3); \
+        rY3 = (gy3 < n_tok) ? *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gy3 * nb + (KB)) * 36L + 4 + (long)((tid + 768) & 7) * 4) : 0u; \
+        if (tid < MMQ_BN) { int gt = tok_block + tid; \
+          if (gt < n_tok) { unsigned int dw = *reinterpret_cast<const unsigned int*>(y_q81 + ((long)gt * nb + (KB)) * 36L); \
+            rYd = sharpi_fp16_to_fp32(dw & 0xffffu); rYs = sharpi_fp16_to_fp32(dw >> 16); } \
+          else { rYd = 0.f; rYs = 0.f; } } \
+    } while (0)
+
+    MMQ_LOAD_TILE_Q40_SOA(0);
+
+    for (int kb = 0; kb < nb; kb++) {
+        sW[tid] = (int)rWq0; sW[tid + 256] = (int)rWq1;
+        if (tid < MMQ_BM) sWd[tid] = rWd;
+        sY[tid] = (int)rY0; sY[tid + 256] = (int)rY1; sY[tid + 512] = (int)rY2; sY[tid + 768] = (int)rY3;
+        if (tid < MMQ_BN) { sYd[tid] = rYd; sYs[tid] = rYs; }
+        __syncthreads();
+
+        if (kb + 1 < nb) MMQ_LOAD_TILE_Q40_SOA(kb + 1);
+
+        int a0 = sW[(mrow0 + grp) * 8     + tig];
+        int a1 = sW[(mrow0 + grp + 8) * 8 + tig];
+        int a2 = sW[(mrow0 + grp) * 8     + tig + 4];
+        int a3 = sW[(mrow0 + grp + 8) * 8 + tig + 4];
+        float dwA = sWd[mrow0 + grp];
+        float dwB = sWd[mrow0 + grp + 8];
+
+        #pragma unroll
+        for (int nt = 0; nt < 8; nt++) {
+            int ncol0 = wc * 64 + nt * 8;
+            int b0 = sY[(ncol0 + grp) * 8 + tig];
+            int b1 = sY[(ncol0 + grp) * 8 + tig + 4];
+            float dC0 = sYd[ncol0 + tig * 2], dC1 = sYd[ncol0 + tig * 2 + 1];
+            float sC0 = sYs[ncol0 + tig * 2], sC1 = sYs[ncol0 + tig * 2 + 1];
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            asm(
+              ""mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 ""
+              ""{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};""
+              : ""+r""(c0), ""+r""(c1), ""+r""(c2), ""+r""(c3)
+              : ""r""(a0), ""r""(a1), ""r""(a2), ""r""(a3), ""r""(b0), ""r""(b1));
+            acc[nt][0] += (float)c0 * dwA * dC0 - 8.f * dwA * sC0;
+            acc[nt][1] += (float)c1 * dwA * dC1 - 8.f * dwA * sC1;
+            acc[nt][2] += (float)c2 * dwB * dC0 - 8.f * dwB * sC0;
+            acc[nt][3] += (float)c3 * dwB * dC1 - 8.f * dwB * sC1;
+        }
+        __syncthreads();
+    }
+
+    int rowA = row_block + mrow0 + grp;
+    int rowB = rowA + 8;
+    #pragma unroll
+    for (int nt = 0; nt < 8; nt++) {
+        int ncol0 = tok_block + wc * 64 + nt * 8;
+        int tokC0 = ncol0 + tig * 2;
+        int tokC1 = ncol0 + tig * 2 + 1;
+        if (rowA < rows) {
+            if (tokC0 < n_tok) output[(long)tokC0 * rows + rowA] = acc[nt][0];
+            if (tokC1 < n_tok) output[(long)tokC1 * rows + rowA] = acc[nt][1];
+        }
+        if (rowB < rows) {
+            if (tokC0 < n_tok) output[(long)tokC0 * rows + rowB] = acc[nt][2];
+            if (tokC1 < n_tok) output[(long)tokC1 * rows + rowB] = acc[nt][3];
+        }
+    }
+}
+#undef MMQ_LOAD_TILE_Q40_SOA
+#undef MMQ_BM
+#undef MMQ_BN
+
 // Batched per-head pure RmsNorm (no learned weight) over N tokens. grid =
 // (num_heads, n_tok); data is token-major [n_tok × num_heads × head_dim].
 // Per (head, token) bit-identical to llm_head_norm_pure. Used for the Gemma 4

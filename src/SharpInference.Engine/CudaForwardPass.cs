@@ -2834,6 +2834,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 int rows = (int)info.Dimensions[1];
                 result = _gpu.RepackQ4KSoa(result, rows, cols);
             }
+            // #124/#173: same funnelshift-killing SoA repack for 2-D Q4_0 trunk weights
+            // (Gemma 4 12B QAT). cols % 32 required — every Q4_0 hidden dim satisfies it.
+            // Gated on the same SHARPI_MMQ_SOA flag as Q8_0 (#149); dense-only.
+            else if (_mmqSoa && !_isMoE && info.DType == DType.Q4_0 && info.NDimensions == 2)
+            {
+                int cols = (int)info.Dimensions[0];
+                int rows = (int)info.Dimensions[1];
+                result = _gpu.RepackQ4_0Soa(result, rows, cols);
+            }
             _weightDTypes[result.Handle] = info.DType;
         }
         else
