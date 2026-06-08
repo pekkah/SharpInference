@@ -1231,12 +1231,19 @@ public sealed unsafe class ForwardPass : IForwardPass
         for (int layer = 0; layer < _hp.NumLayers; layer++)
         {
             int layerHd = _layerHeadDim?[layer] ?? _headDim;
+            // Per-layer KV head count (Gemma 4 12B: 8 GQA on SWA, 1 MQA on the global
+            // k_eq_v layers). Falls back to the model-level count for every other arch.
+            int layerKv = _hp.LayerKvHeads is { } lkv ? lkv[layer] : _numKvHeads;
             int qDimL = _numHeads * layerHd;
-            int kvDimL = _numKvHeads * layerHd;
+            int kvDimL = layerKv * layerHd;
             int kvSrc = _layerKvSrc is not null ? _layerKvSrc[layer] : -1;
             bool kvShared = kvSrc >= 0;
             int effLayer = kvShared ? kvSrc : layer;
-            int windowSize = _isSwaLayer is not null && _isSwaLayer[layer] ? _hp.SlidingWindowSize : -1;
+            bool isSwa = _isSwaLayer is not null && _isSwaLayer[layer];
+            int windowSize = isSwa ? _hp.SlidingWindowSize : -1;
+            // Gemma 4 12B global layers carry no attn_v (attention_k_eq_v): V reuses the
+            // raw K projection (pre QK-norm, pre-RoPE). These layers always own their KV.
+            bool kEqV = _hp.AttentionKEqV && !isSwa && _wv[layer].DataPtr is null;
 
             // Save residual
             Copy(_residual, _hidden, _embDim);
@@ -1261,7 +1268,15 @@ public sealed unsafe class ForwardPass : IForwardPass
             FusedMatVec(_q, _wq[layer], _normBuf, qDimL, _embDim);
             if (!kvShared)
             {
-                if (_layerHeadDim is not null)
+                if (kEqV)
+                {
+                    // Gemma 4 12B global layers: no attn_v weight — V is the raw K
+                    // projection (copied BEFORE QK-norm and RoPE, then plain-RMS-normed
+                    // below). Mirrors CudaForwardPass CopyDevice(vView, kView).
+                    FusedMatVec(_k, _wk[layer], _normBuf, kvDimL, _embDim);
+                    Copy(_v, _k, kvDimL);
+                }
+                else if (_layerHeadDim is not null)
                 {
                     // Gemma 4: K and V share row count and dtype — fuse via
                     // MatVecDual so the row loops interleave and the input
@@ -1298,7 +1313,7 @@ public sealed unsafe class ForwardPass : IForwardPass
             // Llama-4 (L2 QK-norm): apply norm AFTER RoPE (per llama.cpp)
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
-                ApplyQkNormLayer(_q, kvShared ? null : _k, layer, layerHd);
+                ApplyQkNormLayer(_q, kvShared ? null : _k, layer, layerHd, layerKv);
             }
 
             // Gemma 4: V is plain per-head RmsNorm (no learned weight) before cache.
@@ -1306,14 +1321,14 @@ public sealed unsafe class ForwardPass : IForwardPass
             //   Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps)
             if (_layerHeadDim is not null && !kvShared)
             {
-                PerHeadPureRmsNorm(_v, _numKvHeads, layerHd, _hp.RmsNormEps);
+                PerHeadPureRmsNorm(_v, layerKv, layerHd, _hp.RmsNormEps);
             }
 
             if (useRoPE)
             {
                 ApplyRopeLayer(_q, position, _numHeads, layer, layerHd);
                 if (!kvShared)
-                    ApplyRopeLayer(_k, position, _numKvHeads, layer, layerHd);
+                    ApplyRopeLayer(_k, position, layerKv, layer, layerHd);
             }
 
             // L2 QK-norm (Llama-4): only on RoPE layers, applied after RoPE
@@ -1349,7 +1364,7 @@ public sealed unsafe class ForwardPass : IForwardPass
             if (_tqKvCache != null)
                 TqAttention(layer, position);
             else
-                Attention(_kvCache, effLayer, layer, position, layerHd, windowSize);
+                Attention(_kvCache, effLayer, layer, position, layerHd, windowSize, layerKv);
 
             // Output projection (input width is per-layer qDim).
             FusedMatVec(_hidden, _wo[layer], _attnOut, _embDim, qDimL);
@@ -1496,7 +1511,7 @@ public sealed unsafe class ForwardPass : IForwardPass
     // ================================================================
 
     private void Attention(PagedKvCache cache, int layer, int position)
-        => Attention(cache, layer, layer, position, _headDim, windowSize: -1);
+        => Attention(cache, layer, layer, position, _headDim, windowSize: -1, _numKvHeads);
 
     /// <summary>
     /// Multi-head attention with optional per-layer head dim, KV-source aliasing, and
@@ -1504,9 +1519,12 @@ public sealed unsafe class ForwardPass : IForwardPass
     /// to read (== <paramref name="ownLayer"/> for non-shared layers; the source layer
     /// when KV is aliased). <paramref name="windowSize"/> &gt; 0 restricts the score and
     /// V-aggregation loops to the last <paramref name="windowSize"/> positions.
+    /// <paramref name="kvHeads"/> is the active layer's KV head count (Gemma 4 12B:
+    /// 8 GQA on SWA layers, 1 MQA on the k_eq_v global layers) — it can differ from the
+    /// model-level <see cref="_numKvHeads"/>, so the head→KV-group ratio is computed here.
     /// </summary>
     private void Attention(PagedKvCache cache, int readLayer, int ownLayer, int position,
-        int hd, int windowSize)
+        int hd, int windowSize, int kvHeads)
     {
         // After SnapKV eviction (issue #51), the absolute position keeps
         // growing while the cache only stores `cache.Length` slots — `position`
@@ -1523,7 +1541,11 @@ public sealed unsafe class ForwardPass : IForwardPass
         // use 1/sqrt(head_dim). See llama.cpp src/models/gemma4.cpp:11
         //   hparams.f_attention_scale = 1.0f
         float scale = _layerHeadDim is not null ? 1.0f : 1.0f / MathF.Sqrt(hd);
-        int ctxLen = _ctxLen; int hpkg = _headsPerKvGroup;
+        // Head→KV-group ratio for the ACTIVE layer (kvHeads, not the model-level
+        // _numKvHeads): Gemma 4 12B global layers are MQA (kvHeads=1 → all _numHeads map
+        // to KV head 0), SWA layers GQA (kvHeads=8). For non-per-layer models kvHeads ==
+        // _numKvHeads so hpkg == _headsPerKvGroup.
+        int ctxLen = _ctxLen; int hpkg = _numHeads / kvHeads;
         // Per-layer K/V stride into the cache slot: when LayerHeadDim is active each
         // cache page row is _maxKvDim wide but only kvHead*layerHd is populated.
         int slotStride = _layerHeadDim is not null ? _numKvHeads * _maxHeadDim : _numKvHeads * hd;
@@ -2044,19 +2066,19 @@ public sealed unsafe class ForwardPass : IForwardPass
     /// Per-layer-head-dim QK-norm. <paramref name="k"/> may be null on KV-share layers
     /// where the K projection didn't run (the source layer already normed its own K).
     /// </summary>
-    private void ApplyQkNormLayer(float* q, float* k, int layer, int layerHd)
+    private void ApplyQkNormLayer(float* q, float* k, int layer, int layerHd, int kvHeads)
     {
         if (_perChannelQkNorm)
         {
             PerChannelRmsNorm(q, _qNorm[layer], _numHeads, layerHd, _hp.RmsNormEps);
             if (k != null)
-                PerChannelRmsNorm(k, _kNorm[layer], _numKvHeads, layerHd, _hp.RmsNormEps);
+                PerChannelRmsNorm(k, _kNorm[layer], kvHeads, layerHd, _hp.RmsNormEps);
         }
         else
         {
             PerHeadRmsNorm(q, _qNorm[layer], _numHeads, layerHd, _hp.RmsNormEps);
             if (k != null)
-                PerHeadRmsNorm(k, _kNorm[layer], _numKvHeads, layerHd, _hp.RmsNormEps);
+                PerHeadRmsNorm(k, _kNorm[layer], kvHeads, layerHd, _hp.RmsNormEps);
         }
     }
 
