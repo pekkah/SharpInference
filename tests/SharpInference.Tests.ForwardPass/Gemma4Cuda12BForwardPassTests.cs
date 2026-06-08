@@ -268,6 +268,162 @@ public sealed class Gemma4Cuda12BForwardPassTests
             "noise stays well under 5; this magnitude indicates a trunk math divergence).");
     }
 
+    /// <summary>
+    /// Hybrid (partial-offload) coverage of the 12B k_eq_v trunk. The 12B fits fully in
+    /// 12 GB, but a forced 24/24 split exercises the <see cref="CudaHybridForwardPass"/>
+    /// per-token Gemma 4 path — which previously threw on the global layers' absent
+    /// attn_v (only full offload via <see cref="CudaForwardPass"/> worked). The split puts
+    /// global k_eq_v layers on BOTH tiers (GPU: 5,11,17,23; CPU: 29,35,41,47) and SWA
+    /// layers (head_dim 256 &lt; the 512 global max) on both, so it covers the GPU V=copy-K
+    /// + gated V-norm, the CPU V=copy-K + per-layer-KV attention, and the contiguous
+    /// per-head cache stride. Synthetic prompt → finite + non-degenerate decode.
+    /// </summary>
+    [Fact]
+    public void Gemma4_12B_CudaHybridForward_ProducesCoherentDecode()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.True(hp.AttentionKEqV, "expected attention_k_eq_v=true for the 12B QAT model");
+        Assert.NotNull(hp.LayerKvHeads);
+
+        int bosId = ReadIntMetadata(model, "tokenizer.ggml.bos_token_id", fallback: 2);
+        int eosId = ReadIntMetadata(model, "tokenizer.ggml.eos_token_id", fallback: 1);
+        var tokens = SyntheticPrompt(bosId);
+
+        using var fwd = new CudaHybridForwardPass(model, gpu, hp, HalfSplit(hp));
+        AssertCoherentDecode(fwd, tokens, eosId, hp.VocabSize, "12B CUDA-hybrid");
+    }
+
+    /// <summary>
+    /// Cross-backend logit-level parity for the 12B on a single prefill: the partial-offload
+    /// <see cref="CudaHybridForwardPass"/> (24/24 split) vs the independent CPU
+    /// <see cref="ForwardPass"/> oracle (per feedback_cross_backend_parity_test — the hybrid
+    /// GPU half shares kernels with the full-GPU path, so the CPU reference is what exposes a
+    /// k_eq_v / per-layer-KV / cache-stride bug a GPU-vs-GPU check can't). q4_0 is argmax-stable
+    /// but not bit-exact across backends, so we assert on a single prefill: argmax agreement,
+    /// top-5 overlap, and a loose maxAbs bound (a real trunk bug diverges by many logits).
+    /// </summary>
+    [Fact]
+    public void Gemma4_12B_CpuMatchesCudaHybridLogits()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.True(hp.AttentionKEqV, "expected attention_k_eq_v=true for the 12B QAT model");
+
+        int bosId = ReadIntMetadata(model, "tokenizer.ggml.bos_token_id", fallback: 2);
+        var tokens = SyntheticPrompt(bosId);
+
+        float[] hybridLogits;
+        using (var hybridFwd = new CudaHybridForwardPass(model, gpu, hp, HalfSplit(hp)))
+            hybridLogits = hybridFwd.Prefill(tokens).ToArray();
+
+        float[] cpuLogits;
+        using (var cpuBackend = new CpuBackend())
+        using (var cpuFwd = new SharpInference.Engine.ForwardPass(model, cpuBackend, hp, maxContextLength: 4096))
+            cpuLogits = cpuFwd.Prefill(tokens).ToArray();
+
+        Assert.Equal(hybridLogits.Length, cpuLogits.Length);
+
+        float maxAbs = 0f;
+        for (int i = 0; i < cpuLogits.Length; i++)
+        {
+            float d = MathF.Abs(cpuLogits[i] - hybridLogits[i]);
+            if (d > maxAbs) maxAbs = d;
+        }
+
+        int cpuArgmax = Argmax(cpuLogits);
+        int hybridArgmax = Argmax(hybridLogits);
+        var cpuTop5 = TopK(cpuLogits, 5);
+        var hybridTop5 = TopK(hybridLogits, 5);
+        int overlap = 0;
+        foreach (var t in cpuTop5) if (Array.IndexOf(hybridTop5, t) >= 0) overlap++;
+
+        Assert.True(cpuArgmax == hybridArgmax,
+            $"CPU↔CUDA-hybrid 12B argmax disagree: CPU={cpuArgmax} hybrid={hybridArgmax}, maxAbs={maxAbs:F3}, " +
+            $"CPU top5=[{string.Join(",", cpuTop5)}] hybrid top5=[{string.Join(",", hybridTop5)}]. " +
+            "A structural k_eq_v / per-layer-KV / cache-stride bug in the hybrid split, not q4_0 noise.");
+        Assert.True(overlap >= 4,
+            $"CPU↔CUDA-hybrid 12B top-5 overlap only {overlap}/5 (maxAbs={maxAbs:F3}); " +
+            $"CPU=[{string.Join(",", cpuTop5)}] hybrid=[{string.Join(",", hybridTop5)}].");
+        Assert.True(maxAbs < 5.0f,
+            $"CPU↔CUDA-hybrid 12B logit maxAbs {maxAbs:F3} exceeds the structural bound (q4_0 cross-backend " +
+            "noise stays well under 5; this magnitude indicates a hybrid trunk math divergence).");
+    }
+
+    /// <summary>
+    /// A forced ~half/half layer split (GPU gets the lower half) — the 12B fits fully in
+    /// 12 GB, so this is purely to exercise the hybrid per-token path on both tiers. The
+    /// byte fields only feed <see cref="LayerPlacement.Summary"/>; RecommendedCtxSize sets
+    /// the hybrid's max sequence length.
+    /// </summary>
+    private static LayerPlacement HalfSplit(ModelHyperparams hp)
+    {
+        int gpuLayers = hp.NumLayers / 2;
+        return new LayerPlacement(
+            GpuLayers: gpuLayers,
+            CpuLayers: hp.NumLayers - gpuLayers,
+            GpuWeightBytes: 0,
+            GpuKvBytes: 0,
+            RecommendedCtxSize: 4096);
+    }
+
+    /// <summary>
+    /// Shared finite + non-degenerate decode assertion (≥2 distinct greedy tokens, first
+    /// token not EOS, no all-EOS run, all logits finite) used by the per-backend coherence
+    /// tests. IsFinite alone passes on a zero-logit "all EOS" failure, so the distinct /
+    /// non-EOS checks are the load-bearing part.
+    /// </summary>
+    private static void AssertCoherentDecode(IForwardPass fwd, int[] tokens, int eosId, int vocab, string label)
+    {
+        var logits = fwd.Prefill(tokens);
+        Assert.Equal(vocab, logits.Length);
+
+        int nonFinite = 0;
+        for (int i = 0; i < logits.Length; i++)
+            if (!float.IsFinite(logits[i])) nonFinite++;
+        Assert.True(nonFinite == 0, $"{nonFinite}/{logits.Length} non-finite logits after the {label} 12B prefill.");
+
+        int first = Argmax(logits);
+        Assert.NotEqual(eosId, first);
+
+        Span<int> decoded = stackalloc int[6];
+        decoded[0] = first;
+        int pos = tokens.Length;
+        for (int i = 1; i < decoded.Length; i++)
+        {
+            var step = fwd.Forward(decoded[i - 1], pos++);
+            for (int k = 0; k < step.Length; k++)
+                Assert.True(float.IsFinite(step[k]), $"non-finite logit at {label} decode step {i}, idx {k}");
+            decoded[i] = Argmax(step);
+        }
+
+        int distinct = 0;
+        for (int i = 0; i < decoded.Length; i++)
+        {
+            bool seen = false;
+            for (int j = 0; j < i; j++) if (decoded[j] == decoded[i]) { seen = true; break; }
+            if (!seen) distinct++;
+        }
+        Assert.True(distinct >= 2,
+            $"{label} 12B greedy decode produced only {distinct} distinct token(s) over {decoded.Length} steps " +
+            $"([{string.Join(",", decoded.ToArray())}]); the 12B forward integration is degenerate.");
+
+        int eosCount = 0;
+        for (int i = 0; i < decoded.Length; i++)
+            if (decoded[i] == eosId) eosCount++;
+        Assert.True(eosCount < decoded.Length, $"All {decoded.Length} {label} greedy tokens were EOS — 12B output is degenerate.");
+    }
+
     /// <summary>Indices of the top-<paramref name="k"/> logits, descending by value.</summary>
     private static int[] TopK(ReadOnlySpan<float> logits, int k)
     {

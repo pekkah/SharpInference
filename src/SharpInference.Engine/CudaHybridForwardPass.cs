@@ -393,6 +393,11 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         for (int i = 0; i < _nGpuLayers; i++)
         {
             bool kvShared = _isGemma4Like && hp.KvSourceLayer is { } ksl && ksl[i] >= 0;
+            // Gemma 4 12B global layers carry no attn_v (attention_k_eq_v): V reuses the
+            // raw K projection, so there is no attn_v.weight (or bias) to upload. The
+            // global layers are exactly the non-SWA ones; KvSourceLayer is null on the 12B
+            // so kEqV and kvShared never overlap. Mirrors CudaForwardPass.RunGemma4DeviceRegion.
+            bool kEqV = hp.AttentionKEqV && hp.IsSwaLayer is { } swaUp && !swaUp[i];
             _gpuAttnNorm[i] = UploadWeight($"blk.{i}.attn_norm.weight");
             _gpuWq[i] = UploadWeight($"blk.{i}.attn_q.weight");
             // KV-share layers (Gemma 4 tail) carry no attn_k/attn_v of their own.
@@ -403,7 +408,11 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                     $"GPU layer {i} is KV-shared with source layer {hp.KvSourceLayer![i]}; " +
                     "Gemma4ValidateHybridSplit should have rejected this configuration.");
             _gpuWk[i] = UploadWeight($"blk.{i}.attn_k.weight");
-            _gpuWv[i] = UploadWeight($"blk.{i}.attn_v.weight");
+            // k_eq_v global layers leave _gpuWv[i] as default(Tensor); GpuLayerGemma4
+            // copies the raw K projection into V instead (and Dispose's Free is a no-op
+            // on the default handle).
+            if (!kEqV)
+                _gpuWv[i] = UploadWeight($"blk.{i}.attn_v.weight");
             _gpuWo[i] = UploadWeight($"blk.{i}.attn_output.weight");
             _gpuFfnNorm[i] = UploadWeight($"blk.{i}.ffn_norm.weight");
             if (_gpuPostAttnNorm is not null)
@@ -434,7 +443,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             {
                 _gpuBq![i] = UploadWeight($"blk.{i}.attn_q.bias");
                 _gpuBk![i] = UploadWeight($"blk.{i}.attn_k.bias");
-                _gpuBv![i] = UploadWeight($"blk.{i}.attn_v.bias");
+                if (!kEqV)
+                    _gpuBv![i] = UploadWeight($"blk.{i}.attn_v.bias");
                 _gpuBo![i] = UploadWeight($"blk.{i}.attn_output.bias");
             }
             if (_hasQkNorm && !_hp.UseL2QkNorm)
@@ -467,7 +477,11 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 // CudaForwardPass.SwaRingSize (the window+chunk headroom) because that's only
                 // needed by the batched-append (chunked-prefill) path, which never runs here.
                 int layerHd = _isGemma4Like ? hp.LayerHeadDim![i] : _headDim;
-                int layerKvDim = _numKvHeads * layerHd;
+                // Per-layer KV head count (Gemma 4 12B: 8 GQA on SWA, 1 MQA on the global
+                // k_eq_v layers). Sizing the cache tight reclaims VRAM — the whole point of
+                // the hybrid (<12 GB) path — and matches CudaForwardPass's per-layer cache.
+                int layerKv = hp.LayerKvHeads is { } lkv ? lkv[i] : _numKvHeads;
+                int layerKvDim = layerKv * layerHd;
                 int layerCtx = (_isGemma4Like && hp.IsSwaLayer is { } swa && swa[i] && hp.SlidingWindowSize > 0)
                     ? Math.Min(_maxSeqLen, hp.SlidingWindowSize)
                     : _maxSeqLen;
@@ -617,12 +631,18 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         {
             int li = ci + _nGpuLayers; // actual layer index
             bool kvShared = _isGemma4Like && hp.KvSourceLayer is { } ksl && ksl[li] >= 0;
+            // Gemma 4 12B global layers carry no attn_v (attention_k_eq_v): V reuses the raw
+            // K projection. Leave _cpuWv[ci] as default(CpuWeightRef) (DataPtr == null) — the
+            // detector CpuLayerGemma4 uses to copy K→V. Per-layer KV head count too.
+            bool kEqV = hp.AttentionKEqV && hp.IsSwaLayer is { } swaCpu && !swaCpu[li];
+            int layerKvCpu = hp.LayerKvHeads is { } lkvCpu ? lkvCpu[li] : _numKvHeads;
             _cpuAttnNorm[ci] = ResolveCpuWeight($"blk.{li}.attn_norm.weight");
             _cpuWq[ci] = ResolveCpuWeight($"blk.{li}.attn_q.weight");
             if (!kvShared)
             {
                 _cpuWk[ci] = ResolveCpuWeight($"blk.{li}.attn_k.weight");
-                _cpuWv[ci] = ResolveCpuWeight($"blk.{li}.attn_v.weight");
+                if (!kEqV)
+                    _cpuWv[ci] = ResolveCpuWeight($"blk.{li}.attn_v.weight");
             }
             _cpuWo[ci] = ResolveCpuWeight($"blk.{li}.attn_output.weight");
             _cpuFfnNorm[ci] = ResolveCpuWeight($"blk.{li}.ffn_norm.weight");
@@ -656,8 +676,9 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             if (_hasAttnBias && !kvShared)
             {
                 _cpuBq[ci] = LoadCpuBias($"blk.{li}.attn_q.bias", _numHeads * layerHd);
-                _cpuBk[ci] = LoadCpuBias($"blk.{li}.attn_k.bias", _numKvHeads * layerHd);
-                _cpuBv[ci] = LoadCpuBias($"blk.{li}.attn_v.bias", _numKvHeads * layerHd);
+                _cpuBk[ci] = LoadCpuBias($"blk.{li}.attn_k.bias", layerKvCpu * layerHd);
+                if (!kEqV)
+                    _cpuBv[ci] = LoadCpuBias($"blk.{li}.attn_v.bias", layerKvCpu * layerHd);
                 _cpuBo[ci] = LoadCpuBias($"blk.{li}.attn_output.bias", _embDim);
             }
             else if (_hasAttnBias)
@@ -1802,10 +1823,15 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     private void GpuLayerGemma4(int i, int position)
     {
         int layerHd = _hp.LayerHeadDim![i];
+        // Per-layer KV head count (Gemma 4 12B: 8 GQA on SWA, 1 MQA on the global layers).
+        int layerKv = _hp.LayerKvHeads is { } lkv ? lkv[i] : _numKvHeads;
         int qDimL = _numHeads * layerHd;
-        int kvDimL = _numKvHeads * layerHd;
+        int kvDimL = layerKv * layerHd;
         bool isSwa = _hp.IsSwaLayer is { } swa && swa[i];
         bool kvShared = _gpuKvAliasedLayers.Contains(i);
+        // Gemma 4 12B global layers carry no attn_v (attention_k_eq_v): V reuses the raw K
+        // projection. _gpuWv[i] is default(Tensor) on those layers (not uploaded).
+        bool kEqV = _hp.AttentionKEqV && !isSwa;
         int effLayer = i; // validated above: no kv-shared GPU layers
 
         var qView = new Tensor(TensorShape.D1(qDimL), DType.Float32, _gpuQ.Handle);
@@ -1822,7 +1848,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         if (!kvShared)
         {
             GpuMatMul(kView, _gpuWk[i], _gpuNormBuf);
-            GpuMatMul(vView, _gpuWv[i], _gpuNormBuf);
+            if (kEqV)
+                CopyGpuBuffer(vView, kView);   // V = raw K projection (pre-norm, pre-RoPE)
+            else
+                GpuMatMul(vView, _gpuWv[i], _gpuNormBuf);
         }
         _gpu.RecordBarrier();
 
@@ -1832,9 +1861,18 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         {
             if (!kvShared)
                 _gpu.HeadNormQk(qView, _gpuQNorm![i], kView, _gpuKNorm![i],
-                    _numHeads, _numKvHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                    _numHeads, layerKv, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             else
                 _gpu.HeadNorm(qView, _gpuQNorm![i], _numHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+            _gpu.RecordBarrier();
+        }
+
+        // Gemma 4: V gets a plain per-head RMSNorm (no learned weight) before the KV cache
+        // (llama.cpp gemma4.cpp:227). Gated to k_eq_v (12B) models, matching the full-GPU
+        // CudaForwardPass gate — E4B hybrid keeps its pre-existing no-V-norm GPU behaviour.
+        if (!kvShared && _hp.AttentionKEqV)
+        {
+            _gpu.HeadNormPure(vView, layerKv, layerHd, _hp.RmsNormEps);
             _gpu.RecordBarrier();
         }
 
@@ -1871,13 +1909,13 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                 _gpuAttnScoresScratch,
                 position, _hp.SlidingWindowSize, layerHd,
-                _numHeads, _numKvHeads, effLayerCtx, attnScale: 1f);
+                _numHeads, layerKv, effLayerCtx, attnScale: 1f);
         }
         else
         {
             _gpu.Attention(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                 _gpuAttnScoresScratch,
-                _numHeads, _numKvHeads, layerHd, position + 1, effLayerCtx, attnScale: 1f);
+                _numHeads, layerKv, layerHd, position + 1, effLayerCtx, attnScale: 1f);
         }
         _gpu.RecordBarrier();
 
@@ -1945,11 +1983,16 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     {
         int li = ci + _nGpuLayers;
         int layerHd = _hp.LayerHeadDim![li];
+        // Per-layer KV head count (Gemma 4 12B: 8 GQA on SWA, 1 MQA on the global layers).
+        int layerKv = _hp.LayerKvHeads is { } lkv ? lkv[li] : _numKvHeads;
         int qDimL = _numHeads * layerHd;
-        int kvDimL = _numKvHeads * layerHd;
+        int kvDimL = layerKv * layerHd;
         bool isSwa = _hp.IsSwaLayer is { } swa && swa[li];
         var ksl = _hp.KvSourceLayer;
         bool kvShared = ksl is not null && ksl[li] >= 0;
+        // Gemma 4 12B global layers carry no attn_v (attention_k_eq_v): V reuses the raw K
+        // projection. _cpuWv[ci] is default(CpuWeightRef) (DataPtr == null) on those layers.
+        bool kEqV = _hp.AttentionKEqV && !isSwa;
         int kvSrcLi = kvShared ? ksl![li] : li;
         int effCi = kvSrcLi - _nGpuLayers; // validated to be on CPU side
         int windowSize = isSwa && _hp.SlidingWindowSize > 0 ? _hp.SlidingWindowSize : -1;
@@ -1969,10 +2012,21 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         SimdKernels.MatVec(_cpuQ, _cpuWq[ci].DataPtr, _cpuNormBuf, qDimL, _embDim, _cpuWq[ci].DType);
         if (!kvShared)
         {
-            // Fuse K and V via MatVecDual — same row count, same input, FP-order
-            // drift is acceptable on Gemma 4 (internal-only argmax parity test).
-            SimdKernels.MatVecDual(_cpuK, _cpuWk[ci].DataPtr, _cpuV, _cpuWv[ci].DataPtr,
-                _cpuNormBuf, kvDimL, _embDim, _cpuWk[ci].DType, _cpuWv[ci].DType);
+            if (kEqV)
+            {
+                // Global k_eq_v layers: no attn_v weight — V is the raw K projection
+                // (copied BEFORE QK-norm and RoPE, then pure-RMS-normed below). Mirrors
+                // CudaForwardPass CopyDevice(vView, kView) + the CPU ForwardPass core.
+                SimdKernels.MatVec(_cpuK, _cpuWk[ci].DataPtr, _cpuNormBuf, kvDimL, _embDim, _cpuWk[ci].DType);
+                new ReadOnlySpan<float>(_cpuK, kvDimL).CopyTo(new Span<float>(_cpuV, kvDimL));
+            }
+            else
+            {
+                // Fuse K and V via MatVecDual — same row count, same input, FP-order
+                // drift is acceptable on Gemma 4 (internal-only argmax parity test).
+                SimdKernels.MatVecDual(_cpuK, _cpuWk[ci].DataPtr, _cpuV, _cpuWv[ci].DataPtr,
+                    _cpuNormBuf, kvDimL, _embDim, _cpuWk[ci].DType, _cpuWv[ci].DType);
+            }
         }
 
         if (_hasAttnBias)
@@ -1981,7 +2035,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             if (!kvShared)
             {
                 SimdKernels.AddInPlace(_cpuK, _cpuBk[ci], kvDimL);
-                SimdKernels.AddInPlace(_cpuV, _cpuBv[ci], kvDimL);
+                if (!kEqV)
+                    SimdKernels.AddInPlace(_cpuV, _cpuBv[ci], kvDimL);
             }
         }
 
@@ -1992,19 +2047,19 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             {
                 PerChannelRmsNorm(_cpuQ, _cpuQNorm[ci], _numHeads, layerHd, _hp.RmsNormEps);
                 if (!kvShared)
-                    PerChannelRmsNorm(_cpuK, _cpuKNorm[ci], _numKvHeads, layerHd, _hp.RmsNormEps);
+                    PerChannelRmsNorm(_cpuK, _cpuKNorm[ci], layerKv, layerHd, _hp.RmsNormEps);
             }
             else
             {
                 PerHeadRmsNorm(_cpuQ, _cpuQNorm[ci], _numHeads, layerHd, _hp.RmsNormEps);
                 if (!kvShared)
-                    PerHeadRmsNorm(_cpuK, _cpuKNorm[ci], _numKvHeads, layerHd, _hp.RmsNormEps);
+                    PerHeadRmsNorm(_cpuK, _cpuKNorm[ci], layerKv, layerHd, _hp.RmsNormEps);
             }
         }
 
         // Gemma 4: V per-head pure RmsNorm (no learned weight) before cache.
         if (!kvShared)
-            PerHeadPureRmsNorm(_cpuV, _numKvHeads, layerHd, _hp.RmsNormEps);
+            PerHeadPureRmsNorm(_cpuV, layerKv, layerHd, _hp.RmsNormEps);
 
         // RoPE — dual-table (global vs SWA).
         bool useSwaTable = isSwa && _ropeCosTableSwa != null;
@@ -2017,13 +2072,13 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         {
             SimdKernels.ApplyRoPECachedNeox(_cpuQ, cos, sin, _numHeads, layerHd);
             if (!kvShared)
-                SimdKernels.ApplyRoPECachedNeox(_cpuK, cos, sin, _numKvHeads, layerHd);
+                SimdKernels.ApplyRoPECachedNeox(_cpuK, cos, sin, layerKv, layerHd);
         }
         else
         {
             SimdKernels.ApplyRoPECached(_cpuQ, cos, sin, _numHeads, layerHd);
             if (!kvShared)
-                SimdKernels.ApplyRoPECached(_cpuK, cos, sin, _numKvHeads, layerHd);
+                SimdKernels.ApplyRoPECached(_cpuK, cos, sin, layerKv, layerHd);
         }
 
         // KV append. The cache row is _maxKvDim wide on Gemma 4; the active head_dim
@@ -2037,8 +2092,9 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         }
 
         // Attention reads `effCi` on Gemma 4. The cache stride between kv heads is
-        // _maxHeadDim (the cache row width).
-        CpuAttentionGemma4(ci, effCi, position, layerHd, qDimL, windowSize);
+        // _maxHeadDim (the cache row width). The active KV head count (layerKv) drives the
+        // head→KV-group ratio: MQA global layers (layerKv=1) map all heads to KV head 0.
+        CpuAttentionGemma4(ci, effCi, position, layerHd, qDimL, windowSize, layerKv);
 
         // Output projection. _cpuWo is [embDim, qDimL].
         SimdKernels.MatVec(_cpuHidden, _cpuWo[ci].DataPtr, _cpuAttnOut, _embDim, qDimL, _cpuWo[ci].DType);
@@ -2082,17 +2138,25 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
 
     // ────────────────────────────────────────────────────────────────────
     //  Gemma 4 attention — per-layer head_dim + SWA window + alias support.
-    //  Stride between kv heads is _maxHeadDim (cache row width).
+    //  Within a position's cache row the KV heads are packed contiguously at the
+    //  per-layer head_dim stride (kvHead*hd), matching the contiguous K/V MatVec
+    //  write — the cache ROW is _maxHeadDim-wide per head only to size the page;
+    //  the trailing slots stay zero when layerHd < _maxHeadDim (12B SWA = 256/512).
+    //  Mirrors ForwardPass.Attention (its slotStride is likewise computed-but-unused).
     // ────────────────────────────────────────────────────────────────────
 
-    private void CpuAttentionGemma4(int ci, int effCi, int position, int hd, int qDim, int windowSize)
+    private void CpuAttentionGemma4(int ci, int effCi, int position, int hd, int qDim, int windowSize, int kvHeads)
     {
         int endSeq = position + 1;
         int startSeq = windowSize > 0 ? Math.Max(0, endSeq - windowSize) : 0;
         int scoreLen = endSeq - startSeq;
         // Gemma 4 uses attn_scale = 1.0 (no 1/sqrt(hd) prefactor).
         float scale = 1.0f;
-        int maxSeqLen = _maxSeqLen; int hpkg = _headsPerKvGroup;
+        // Head→KV-group ratio for the ACTIVE layer (kvHeads, not the model-level
+        // _numKvHeads): Gemma 4 12B global layers are MQA (kvHeads=1 → all _numHeads map to
+        // KV head 0), SWA layers GQA (kvHeads=8). For non-per-layer models kvHeads ==
+        // _numKvHeads so hpkg == _headsPerKvGroup.
+        int maxSeqLen = _maxSeqLen; int hpkg = _numHeads / kvHeads;
         int slotStride = _numKvHeads * _maxHeadDim; // cache row width
         var q = _cpuQ; var attnOut = _cpuAttnOut; var scores = _cpuAttnScores;
         var kvCache = _cpuKvCache;
@@ -2113,7 +2177,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             for (int i = 0; i < scoreLen; i++)
             {
                 int t = startLocal + i;
-                float* kVec = (kvCache.KeyAt(eff, t)) + kvHead * _maxHeadDim;
+                float* kVec = (kvCache.KeyAt(eff, t)) + kvHead * hdLocal;
                 headScores[i] = SimdKernels.DotF32(qHead, kVec, hdLocal) * scale;
             }
 
@@ -2124,7 +2188,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             for (int i = 0; i < scoreLen; i++)
             {
                 int t = startLocal + i;
-                float* vVec = (kvCache.ValueAt(eff, t)) + kvHead * _maxHeadDim;
+                float* vVec = (kvCache.ValueAt(eff, t)) + kvHead * hdLocal;
                 float w = headScores[i];
                 if (Fma.IsSupported && hdLocal >= 8)
                 {
@@ -2874,7 +2938,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         for (int i = 0; i < _nGpuLayers; i++)
         {
             _gpu.Free(_gpuAttnNorm[i]); _gpu.Free(_gpuFfnNorm[i]);
-            _gpu.Free(_gpuWq[i]); _gpu.Free(_gpuWk[i]); _gpu.Free(_gpuWv[i]); _gpu.Free(_gpuWo[i]);
+            // _gpuWv[i] is null on Gemma 4 12B global k_eq_v layers (no attn_v uploaded).
+            _gpu.Free(_gpuWq[i]); _gpu.Free(_gpuWk[i]);
+            if (_gpuWv[i] is not null) _gpu.Free(_gpuWv[i]);
+            _gpu.Free(_gpuWo[i]);
             if (_isMoE)
             {
                 _gpu.Free(_gpuWGateInp![i]);
