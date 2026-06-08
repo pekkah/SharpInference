@@ -225,6 +225,18 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _softcapKernel;
     private nint   _clearF32Kernel;
     private nint   _quantizeQ81Kernel;
+    // Track A (#124/#173): SoA Q8_1 activation producer + the SoA-weight+SoA-activation
+    // MMQ twins. Splits the 36-B AoS Q8_1 block into a contiguous int8-quants array and
+    // a separate {d,s} array so a token's qs are aligned/contiguous — the substrate the
+    // coalesced per-token load (Phase B) reads. Bit-identical to the AoS-activation MMQ.
+    private nint   _quantizeQ81SoaKernel;
+    private nint   _mmqQ80SoaActsKernel;
+    private nint   _mmqQ4kSoaActsKernel;
+    private nint   _mmqQ40SoaActsKernel;
+    // Track B port: cp.async double-buffered SoA-acts MMQ — streams global→shared off
+    // the L1TEX LSU pipe (the 78.6% ceiling). Bit-identical to the scalar SoA-acts kernels.
+    private nint   _mmqQ80SoaActsCpaKernel;
+    private nint   _mmqQ40SoaActsCpaKernel;
     private nint   _bwBaselineKernel;
     // Issue #129: batched GPU-SLRU MoE host-loop replacements. scale_rows applies a
     // per-row scalar (shared-expert sigmoid gate) over [rows × cols] in one launch;
@@ -293,6 +305,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // N contiguous q81 rows). Grow-only, same policy as _q81Buf.
     private nint   _q81BatchBuf;
     private nuint  _q81BatchBufSize;
+    // Track A (#124/#173): SoA Q8_1 activation scratch for the prefill MMQ. One
+    // allocation split [qs: totalSub*32 B][ds: totalSub*4 B] — contiguous int8 quants
+    // then the {d,s} uint32 array. Grow-only; only allocated when ActSoaEnabled routes
+    // the prefill through the SoA-activation MMQ kernels.
+    private nint   _q81BatchSoaBuf;
+    private nuint  _q81BatchSoaBufSize;
     // Issue #141: fp16 scratch for the prefill GEMM — dequantized weight and
     // converted activations. Grow-only; sized to the largest trunk matmul.
     private nint   _gemmWf16Buf;
@@ -330,6 +348,30 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// </summary>
     public bool Q40Dp4aEnabled { get; set; } =
         Environment.GetEnvironmentVariable("SHARPI_Q40_DP4A") != "0";
+
+    /// <summary>
+    /// Track A (#124/#173): when on, the prefill MMQ over a SoA-repacked weight reads
+    /// activations from the SoA Q8_1 layout (<c>llm_quantize_q8_1_soa</c> → the
+    /// <c>llm_mmq_*_soa_acts</c> kernels) instead of the interleaved 36-B AoS block.
+    /// Phase A keeps the same load mapping → bit-identical; it is the substrate the
+    /// coalesced per-token load (Phase B) is built on. Default OFF
+    /// (<c>SHARPI_ACT_SOA</c>=1 enables) until the e2e A/B win is proven; settable so
+    /// parity oracles can A/B both sides. Only takes effect for SoA-weight handles
+    /// (AoS-weight prefill is unaffected).
+    /// </summary>
+    public bool ActSoaEnabled { get; set; } =
+        Environment.GetEnvironmentVariable("SHARPI_ACT_SOA") == "1";
+
+    /// <summary>
+    /// Track B (#124/#173): with <see cref="ActSoaEnabled"/>, route the Q8_0 prefill MMQ
+    /// through the cp.async double-buffered kernel (<c>llm_mmq_q8_0_soa_acts_cpa</c>) — it
+    /// streams the weight+activation quants global→shared off the L1TEX LSU pipe (the
+    /// profiled 78.6% ceiling) and overlaps the next K-tile's copy with the current mma in
+    /// hardware. Bit-identical to the scalar-load SoA-acts MMQ. Default OFF
+    /// (<c>SHARPI_ACT_SOA_CPA</c>=1) — the perf-experiment switch; settable for A/B.
+    /// </summary>
+    public bool ActSoaCpaEnabled { get; set; } =
+        Environment.GetEnvironmentVariable("SHARPI_ACT_SOA_CPA") == "1";
 
     /// <summary>Total VRAM on the active CUDA device, in bytes. Queried once at backend creation.</summary>
     public ulong VramBytes
@@ -1949,18 +1991,67 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         nint xPtr = GetDevPtr(inputAll);
         nint yPtr = GetDevPtr(outputAll);
 
+        if ((long)cols * nTok > int.MaxValue)
+            throw new InvalidOperationException(
+                $"MatMulBatchedMmq: cols*nTok ({(long)cols * nTok}) exceeds int range.");
+
+        int subBlocks = cols / 32;
+        long totalSub = (long)subBlocks * nTok;
+
+        // Track A (#124/#173): the SoA-activation MMQ requires a SoA-repacked weight (the
+        // _soa_acts kernels read the SoA weight layout). Only then is ActSoaEnabled honored;
+        // AoS-weight prefill always takes the interleaved-activation path.
+        bool wIsSoa = weightDType switch
+        {
+            DType.Q4_K => _soaQ4kHandles.ContainsKey(matrix.Handle),
+            DType.Q4_0 => _soaQ40Handles.ContainsKey(matrix.Handle),
+            _          => _soaHandles.ContainsKey(matrix.Handle),
+        };
+        bool useActSoa = ActSoaEnabled && wIsSoa;
+
+        uint gx = (uint)((rows + 63) / 64), gy = (uint)((nTok + 127) / 128);
+
+        if (useActSoa)
+        {
+            // 1) Quantize activations f32 → SoA Q8_1: [qs totalSub*32 B][ds totalSub*4 B].
+            EnsureQ81BatchSoaBuf((nuint)(totalSub * 36L));
+            nint qsPtr = _q81BatchSoaBuf;
+            nint dsPtr = _q81BatchSoaBuf + (nint)(totalSub * 32L);
+            {
+                nint qIn = xPtr, qQs = qsPtr, qDs = dsPtr;
+                int qN = (int)((long)cols * nTok);
+                nint* args = stackalloc nint[4] { (nint)(&qIn), (nint)(&qQs), (nint)(&qDs), (nint)(&qN) };
+                int rq = NvrtcInterop.LaunchKernel(_quantizeQ81SoaKernel, (uint)totalSub, 1, 1,
+                                                   32, 1, 1, 0, _stream, args, null);
+                if (rq != 0) throw new InvalidOperationException($"cuLaunchKernel(quantize_q8_1_soa mmq) failed: {rq}");
+            }
+            // 2) SoA-weight + SoA-activation MMQ.
+            {
+                int pRows = rows, pCols = cols, pN = nTok;
+                nint* args = stackalloc nint[7]
+                {
+                    (nint)(&wPtr), (nint)(&qsPtr), (nint)(&dsPtr), (nint)(&yPtr),
+                    (nint)(&pRows), (nint)(&pCols), (nint)(&pN)
+                };
+                nint kern = weightDType switch
+                {
+                    DType.Q4_K => _mmqQ4kSoaActsKernel,
+                    DType.Q4_0 => ActSoaCpaEnabled ? _mmqQ40SoaActsCpaKernel : _mmqQ40SoaActsKernel,
+                    _          => ActSoaCpaEnabled ? _mmqQ80SoaActsCpaKernel : _mmqQ80SoaActsKernel,
+                };
+                int rm = NvrtcInterop.LaunchKernel(kern, gx, gy, 1, 256, 1, 1, 0, _stream, args, null);
+                if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(mmq {weightDType} soa_acts) failed: {rm}");
+            }
+            return;
+        }
+
         // 1) Quantize activations [nTok×cols] f32 → contiguous Q8_1 (36 B/block). The
         //    per-block quantize is independent, so a single launch over nTok×subBlocks
         //    is bit-identical to per-token quantization (mirrors DispatchMatVecQ4KBatched).
-        int subBlocks = cols / 32;
-        long totalSub = (long)subBlocks * nTok;
         EnsureQ81BatchBuf((nuint)(totalSub * 36L));
         {
             nint qIn = xPtr, qOut = _q81BatchBuf;
             int qN = (int)((long)cols * nTok);
-            if ((long)cols * nTok > int.MaxValue)
-                throw new InvalidOperationException(
-                    $"MatMulBatchedMmq: cols*nTok ({(long)cols * nTok}) exceeds int range.");
             nint* args = stackalloc nint[3] { (nint)(&qIn), (nint)(&qOut), (nint)(&qN) };
             int rq = NvrtcInterop.LaunchKernel(_quantizeQ81Kernel, (uint)totalSub, 1, 1,
                                                32, 1, 1, 0, _stream, args, null);
@@ -1977,7 +2068,6 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 (nint)(&wPtr), (nint)(&q81), (nint)(&yPtr),
                 (nint)(&pRows), (nint)(&pCols), (nint)(&pN)
             };
-            uint gx = (uint)((rows + 63) / 64), gy = (uint)((nTok + 127) / 128);
             // Q4_K → the nibble-expanding MMQ kernel; Q4_0 → the symmetric nibble MMQ
             // (#124/#173); Q8_0 → the int8 kernel (#149: if the weight was repacked SoA,
             // the aligned-load variant — same args either way).
@@ -2298,6 +2388,24 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         int r = CuBlasInterop.CudaMalloc(out _q81BatchBuf, newSize);
         if (r != 0) throw new InvalidOperationException($"cudaMalloc(q8_1 batch scratch, {newSize} B) failed: {r}");
         _q81BatchBufSize = newSize;
+    }
+
+    /// <summary>Track A (#124/#173): grow-only SoA Q8_1 activation scratch
+    /// (<c>_q81BatchSoaBuf</c>), one allocation holding [qs: totalSub*32 B][ds:
+    /// totalSub*4 B]. Same policy as <see cref="EnsureQ81BatchBuf"/>.</summary>
+    private void EnsureQ81BatchSoaBuf(nuint required)
+    {
+        if (_q81BatchSoaBuf != nint.Zero && _q81BatchSoaBufSize >= required) return;
+        if (_q81BatchSoaBuf != nint.Zero)
+        {
+            CuBlasInterop.CudaFree(_q81BatchSoaBuf);
+            _q81BatchSoaBuf = nint.Zero;
+            _q81BatchSoaBufSize = 0;
+        }
+        nuint newSize = (required + 0xffffu) & ~(nuint)0xffffu;
+        int r = CuBlasInterop.CudaMalloc(out _q81BatchSoaBuf, newSize);
+        if (r != 0) throw new InvalidOperationException($"cudaMalloc(q8_1 SoA batch scratch, {newSize} B) failed: {r}");
+        _q81BatchSoaBufSize = newSize;
     }
 
     /// <summary>
@@ -4902,6 +5010,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _softcapKernel         = GetKernelFunc("llm_softcap_inplace");
         _clearF32Kernel        = GetKernelFunc("llm_clear_f32");
         _quantizeQ81Kernel     = GetKernelFunc("llm_quantize_q8_1");
+        _quantizeQ81SoaKernel  = GetKernelFunc("llm_quantize_q8_1_soa");      // Track A (#124/#173)
+        _mmqQ80SoaActsKernel   = GetKernelFunc("llm_mmq_q8_0_soa_acts");      // Track A (#124/#173)
+        _mmqQ4kSoaActsKernel   = GetKernelFunc("llm_mmq_q4k_soa_acts");       // Track A (#124/#173)
+        _mmqQ40SoaActsKernel   = GetKernelFunc("llm_mmq_q4_0_soa_acts");      // Track A (#124/#173)
+        _mmqQ80SoaActsCpaKernel = GetKernelFunc("llm_mmq_q8_0_soa_acts_cpa"); // Track B (#124/#173)
+        _mmqQ40SoaActsCpaKernel = GetKernelFunc("llm_mmq_q4_0_soa_acts_cpa"); // Track B (#124/#173)
         _bwBaselineKernel      = GetKernelFunc("llm_bw_baseline");
         _scaleRowsKernel       = GetKernelFunc("llm_scale_rows_inplace");
         _moeWeightedReduceKernel = GetKernelFunc("llm_moe_weighted_reduce");
@@ -5343,6 +5457,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             CuBlasInterop.CudaFree(_q81BatchBuf);
             _q81BatchBuf = nint.Zero;
             _q81BatchBufSize = 0;
+        }
+        if (_q81BatchSoaBuf != nint.Zero)
+        {
+            CuBlasInterop.CudaFree(_q81BatchSoaBuf);
+            _q81BatchSoaBuf = nint.Zero;
+            _q81BatchSoaBufSize = 0;
         }
         if (_gemmWf16Buf != nint.Zero)
         {
