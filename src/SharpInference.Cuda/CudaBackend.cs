@@ -139,6 +139,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // the GPU. Without it q4_0 falls to the F32-dequant upload (~4× VRAM — a 7 GB
     // model would need ~28 GB, defeating full offload). 8 rows/block × 32 thr/row.
     private nint   _matvecQ40Kernel;
+    // Issue #124: dp4a/Q8_1 decode matvec for Q4_0 (Gemma 4 12B QAT primary weights).
+    private nint   _matvecQ40Dp4aKernel;
     // Q8_0 matvec (Phase 0 of the Gemma-4 plan): keeps Q8_0 weights packed on
     // the GPU. Without this, Q8_0 weights would dequant to F32 on upload and
     // blow out VRAM ~2.1×. Geometry mirrors Q5_K/Q6_K (8 rows/block × 32 thr/row).
@@ -306,6 +308,16 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// </summary>
     public bool Q80Dp4aEnabled { get; set; } =
         Environment.GetEnvironmentVariable("SHARPI_Q80_DP4A") != "0";
+
+    /// <summary>
+    /// Issue #124: route Q4_0 decode matvecs through the dp4a/Q8_1 kernel
+    /// (<see cref="DispatchMatVecQ40Dp4a"/>) instead of the per-element fp32 matvec
+    /// (<c>llm_matvec_q4_0</c>). Default on (<c>SHARPI_Q40_DP4A</c>); the dp4a path
+    /// quantizes the activation to int8 so it is argmax-stable, not bit-exact to the
+    /// fp32 matvec. Settable so bit-parity oracles can pin both sides to the fp32 path.
+    /// </summary>
+    public bool Q40Dp4aEnabled { get; set; } =
+        Environment.GetEnvironmentVariable("SHARPI_Q40_DP4A") != "0";
 
     /// <summary>Total VRAM on the active CUDA device, in bytes. Queried once at backend creation.</summary>
     public ulong VramBytes
@@ -1583,6 +1595,14 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             DispatchMatVecQ80Dp4a(wPtr, xPtr, yPtr, rows, cols, soa: _soaHandles.ContainsKey(matrix.Handle));
             return;
         }
+        // Issue #124: Q4_0 decode matvec via dp4a/Q8_1 (cols % 32 == 0). Falls back to
+        // the per-element fp32 kernel otherwise. Gemma 4 12B QAT keeps all bulk weights
+        // in Q4_0; this is the decode counterpart of the prefill GEMM path.
+        if (weightDType == DType.Q4_0 && Q40Dp4aEnabled && (cols & 31) == 0)
+        {
+            DispatchMatVecQ40Dp4a(wPtr, xPtr, yPtr, rows, cols);
+            return;
+        }
 
         int  pRows = rows, pCols = cols;
         nint* args = stackalloc nint[5]
@@ -2388,6 +2408,50 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 soa ? _matvecQ80Dp4aSoaKernel : _matvecQ80Dp4aKernel, (uint)rows, 1, 1,
                 32, 8, 1, 0, _stream, args, null);
             if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_q8_0_dp4a) failed: {rm}");
+        }
+    }
+
+    /// <summary>
+    /// Q4_0 decode matvec via dp4a (issue #124): quantize the input vector to Q8_1
+    /// (32-element sub-blocks), then dispatch <c>llm_matvec_q4_0_dp4a</c> (1 row /
+    /// block, MATVEC_Q40_NWARPS warps). Q4_0 is symmetric, so the asymmetric dp4a
+    /// trick uses the stored Q8_1 sum to subtract the 8·Σq centering term once per
+    /// block. Requires <c>cols % 32 == 0</c>.
+    /// </summary>
+    private void DispatchMatVecQ40Dp4a(nint wPtr, nint xPtr, nint yPtr, int rows, int cols)
+    {
+        if ((cols & 31) != 0)
+            throw new InvalidOperationException(
+                $"CUDA matvec_q4_0_dp4a requires cols % 32 == 0 (got {cols}).");
+
+        int subBlocks = cols / 32;
+        EnsureQ81Buf((nuint)((long)subBlocks * 36L));
+
+        // Quantize input → Q8_1 (32 threads per sub-block).
+        {
+            nint qInPtr  = xPtr;
+            nint qOutPtr = _q81Buf;
+            int  qN      = cols;
+            nint* args = stackalloc nint[3] { (nint)(&qInPtr), (nint)(&qOutPtr), (nint)(&qN) };
+            int rq = NvrtcInterop.LaunchKernel(
+                _quantizeQ81Kernel, (uint)subBlocks, 1, 1,
+                32, 1, 1, 0, _stream, args, null);
+            if (rq != 0) throw new InvalidOperationException($"cuLaunchKernel(quantize_q8_1 for q4_0) failed: {rq}");
+        }
+
+        // Cooperative dp4a matvec: 1 row/block, MATVEC_Q40_NWARPS warps × 32 threads.
+        {
+            nint q81Ptr = _q81Buf;
+            int  pRows  = rows, pCols = cols;
+            nint* args = stackalloc nint[5]
+            {
+                (nint)(&wPtr), (nint)(&q81Ptr), (nint)(&yPtr),
+                (nint)(&pRows), (nint)(&pCols)
+            };
+            int rm = NvrtcInterop.LaunchKernel(
+                _matvecQ40Dp4aKernel, (uint)rows, 1, 1,
+                32, 8, 1, 0, _stream, args, null);
+            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_q4_0_dp4a) failed: {rm}");
         }
     }
 
@@ -4653,7 +4717,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _q4kRepackSoaKernel, _matvecQ4KSoaKernel, _matvecQ4KN2SoaKernel,
             _matvecQ4KGemmNSoaKernel, _dequantQ4KF16Kernel, _dequantQ4KF16SoaKernel,
             _dequantQ6KF16Kernel, _dequantQ5KF16Kernel,   // #162
-            _dequantQ40F16Kernel, _headNormPureBatchedKernel,   // #124
+            _dequantQ40F16Kernel, _headNormPureBatchedKernel, _matvecQ40Dp4aKernel,   // #124
             _rmsNormBatchedKernel, _headNormBatchedKernel, _headNormQkKernel, _headNormQkBatchedKernel,
             _splitQgBatchedKernel, _ropeNeoxPartialBatchedKernel,
             _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel, _attentionSwaBatchedKernel,
@@ -4724,6 +4788,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _matvecQ5KKernel       = GetKernelFunc("llm_matvec_q5k");
         _matvecQ6KKernel       = GetKernelFunc("llm_matvec_q6k");
         _matvecQ40Kernel       = GetKernelFunc("llm_matvec_q4_0");
+        _matvecQ40Dp4aKernel   = GetKernelFunc("llm_matvec_q4_0_dp4a");   // #124
         _matvecQ80Kernel       = GetKernelFunc("llm_matvec_q8_0");
         _matvecQ80Dp4aKernel   = GetKernelFunc("llm_matvec_q8_0_dp4a");
         _matvecF32N2Kernel     = GetKernelFunc("llm_matvec_f32_n2");

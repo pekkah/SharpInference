@@ -63,6 +63,11 @@ public sealed unsafe class CudaMatVecQ40Tests
     {
         using var gpu = TryCreate();
         if (gpu is null) return;
+        // Validate the fp32-decode kernel (llm_matvec_q4_0): exact-byte Q4_0 weights
+        // dotted with fp32 activations, so only fp16-d rounding + reduction order differ
+        // from the CPU reference. Pin off the dp4a path (issue #124), which quantizes the
+        // activation to int8 and is covered by the looser test below.
+        gpu.Q40Dp4aEnabled = false;
 
         // Mix of shapes: small single-block rows, an odd row count (exercises the
         // tail of the 8-rows/block grid), and Gemma 4 12B's real attn/ffn widths.
@@ -116,6 +121,69 @@ public sealed unsafe class CudaMatVecQ40Tests
                 $"MatVecQ4_0 rows={rows} cols={cols}: maxAbs={maxAbs:E2} maxRel={maxRel:E2} mismatches={mismatches}/{rows}");
             Assert.True(mismatches == 0,
                 $"Q4_0 matvec mismatches ({mismatches}/{rows}) for rows={rows} cols={cols}, maxAbs={maxAbs:E3}, maxRel={maxRel:E3}");
+        }
+    }
+
+    /// <summary>
+    /// Issue #124: the dp4a Q4_0 matvec (<c>llm_matvec_q4_0_dp4a</c>) quantizes the
+    /// activation to int8 (Q8_1) before the int8·int8 dp4a dot, using the asymmetric
+    /// −8·Σq centering trick (Q4_0 is symmetric). That introduces ~Q8 activation-quant
+    /// error (~1%), so it tracks the fp32 CPU reference to a loose relative tolerance,
+    /// not 1e-3. The aggregate dot must still be accurate enough to be argmax-stable,
+    /// which this bounds. Mirrors <c>CudaQ8_0Tests.MatVec_Q8_0_Dp4a_TracksCpuReference</c>.
+    /// </summary>
+    [Fact]
+    public void MatVecQ4_0_Dp4a_TracksCpuReference()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        gpu.Q40Dp4aEnabled = true;
+
+        foreach ((int rows, int cols) in new[] { (256, 256), (1024, 1024), (64, 3840), (40, 15360) })
+        {
+            var rng = new Random(20260608 + rows * 31 + cols);
+            byte[] weightBytes = BuildQ4_0Matrix(rows, cols, rng);
+
+            var input = new float[cols];
+            for (int i = 0; i < cols; i++)
+                input[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            var cpuOutput = new float[rows];
+            fixed (byte* wPtr = weightBytes)
+            fixed (float* iPtr = input)
+            fixed (float* oPtr = cpuOutput)
+            {
+                SimdKernels.MatVec(oPtr, wPtr, iPtr, rows, cols, DType.Q4_0);
+            }
+
+            var gpuWeights = gpu.UploadRaw(weightBytes, TensorShape.D1(weightBytes.Length), DType.Q4_0);
+            var gpuInput = gpu.Upload(input, TensorShape.D1(cols));
+            var gpuOutput = gpu.Allocate(TensorShape.D1(rows));
+            gpu.MatMul(gpuOutput, gpuWeights, gpuInput, DType.Q4_0);
+            gpu.Synchronize();
+            var gpuResult = new float[rows];
+            gpu.Download(gpuOutput, gpuResult);
+            gpu.Free(gpuWeights);
+            gpu.Free(gpuInput);
+            gpu.Free(gpuOutput);
+
+            // Per-row magnitude scale for a relative bound (random ±1 activations over
+            // `cols` Q4_0 weights → dot stddev ~ sqrt(cols)·scale).
+            float refRms = 0f;
+            for (int r = 0; r < rows; r++) refRms += cpuOutput[r] * cpuOutput[r];
+            refRms = MathF.Sqrt(refRms / rows);
+
+            int mismatches = 0;
+            float maxAbs = 0;
+            for (int r = 0; r < rows; r++)
+            {
+                float diff = MathF.Abs(gpuResult[r] - cpuOutput[r]);
+                maxAbs = MathF.Max(maxAbs, diff);
+                if (diff > 0.02f * refRms) mismatches++;
+            }
+            Console.WriteLine($"MatVecQ4_0-dp4a rows={rows} cols={cols}: maxAbs={maxAbs:E2} refRms={refRms:E2} mismatches={mismatches}/{rows}");
+            Assert.True(mismatches <= rows / 100 + 1,
+                $"dp4a Q4_0 matvec drifted from fp32 reference: {mismatches}/{rows} rows beyond 2% of row RMS ({refRms:E3}), maxAbs={maxAbs:E3}.");
         }
     }
 }

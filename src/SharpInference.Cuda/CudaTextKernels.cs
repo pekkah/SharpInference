@@ -1732,6 +1732,103 @@ extern ""C"" __global__ void llm_matvec_q8_0_dp4a_soa(
     }
 }
 
+// ── MatVec Q4_0 — __dp4a / Q8_1 path (issue #124) ─────────────────────────
+// Decode matvec mirroring llama.cpp's mul_mat_vec_q4_0_q8_1. The input vector is
+// pre-quantized to Q8_1 (36-byte sub-blocks: fp16 d at [0:2], fp16 s=d·Σq at
+// [2:4], 32 int8 at [4:36]). Q4_0 weight is symmetric (value = (nibble-8)·d), so
+// the asymmetric dp4a trick avoids per-nibble centering: dp4a the RAW nibbles
+// (0..15) against the activations, then subtract 8·Σq once per block via the
+// stored Q8_1 sum s. Far fewer instructions per byte than the per-element fp32
+// matvec (llm_matvec_q4_0), pushing the bandwidth-bound decode toward HBM peak.
+//
+// One output row per block; MATVEC_Q40_NWARPS warps cooperate. A Q4_0 block is
+// 16 qs bytes = 4 uint words; lanes split 8 groups × 4 sub-lanes: group g =
+// lane>>2 owns one block of the warp's 8-block stripe, sub-lane s = lane&3 owns
+// uint word s. Word s holds 4 low nibbles (elements 4s..4s+3) and 4 high nibbles
+// (elements 16+4s..16+4s+3); two __dp4a's cover both halves. The −8·d_w·s
+// correction is added once per block (sub==0). qs is only 2-byte aligned, so the
+// weight word is assembled with __funnelshift_r from two aligned uint loads; the
+// activation int8 at +4+4·s is naturally 4-aligned.
+#define MATVEC_Q40_NWARPS 8
+extern ""C"" __global__ void llm_matvec_q4_0_dp4a(
+    const unsigned int* __restrict__ weights,
+    const unsigned char* __restrict__ y_q81,
+    float* __restrict__ output,
+    int rows, int cols)
+{
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    int warp_id = (int)threadIdx.y;     // 0..NWARPS-1
+    int lane    = (int)threadIdx.x;     // 0..31
+    int grp     = lane >> 2;            // 0..7  block within the warp's 8-block stripe
+    int sub     = lane & 3;             // 0..3  uint word within the block
+
+    int num_blocks = cols >> 5;         // cols / 32
+    long row_base_bytes = (long)row * (long)num_blocks * 18L;
+
+    float acc = 0.f;
+
+    for (int block0 = warp_id * 8; block0 < num_blocks; block0 += MATVEC_Q40_NWARPS * 8) {
+        int block = block0 + grp;
+        float part = 0.f;
+        if (block < num_blocks) {
+            long b0 = row_base_bytes + (long)block * 18L;
+            unsigned int dlo = sharpi_byte_at(weights, b0);
+            unsigned int dhi = sharpi_byte_at(weights, b0 + 1);
+            float dw = sharpi_fp16_to_fp32(dlo | (dhi << 8));
+
+            // This sub-lane's 4 weight bytes = qs[sub*4 .. sub*4+4) at byte b0+2+sub*4.
+            long wb        = b0 + 2 + (long)sub * 4;
+            long aligned   = wb & ~3L;
+            unsigned int shift = (unsigned int)(wb & 3L) * 8u;
+            unsigned int w_lo = weights[aligned >> 2];
+            unsigned int w;
+            if (shift == 0u) w = w_lo;
+            else {
+                unsigned int w_hi = weights[(aligned >> 2) + 1];
+                w = __funnelshift_r(w_lo, w_hi, shift);
+            }
+            int vi0 = (int)(w & 0x0F0F0F0Fu);          // low nibbles  → elements 4s..4s+3
+            int vi1 = (int)((w >> 4) & 0x0F0F0F0Fu);   // high nibbles → elements 16+4s..
+
+            long ab = (long)block * 36L;
+            unsigned int d_bits = (*reinterpret_cast<const unsigned int*>(y_q81 + ab)) & 0xffffu;
+            float da = sharpi_fp16_to_fp32(d_bits);
+            // 4 activations for the low half (elements 4s..) and the high half (16+4s..).
+            int aq0 = *reinterpret_cast<const int*>(y_q81 + ab + 4 + (long)sub * 4);
+            int aq1 = *reinterpret_cast<const int*>(y_q81 + ab + 4 + 16 + (long)sub * 4);
+
+            int dot = __dp4a(vi0, aq0, 0);
+            dot = __dp4a(vi1, aq1, dot);
+            part = dw * da * (float)dot;
+
+            // −8·Σq·d_x·d_w added once per block (sub==0): Σq·d_x is the stored s.
+            if (sub == 0) {
+                unsigned int s_bits = (*reinterpret_cast<const unsigned int*>(y_q81 + ab)) >> 16;
+                float s = sharpi_fp16_to_fp32(s_bits);
+                part -= 8.f * dw * s;
+            }
+        }
+        // Sum the 4 sub-lanes within each aligned group of 4.
+        part += __shfl_xor_sync(0xffffffffu, part, 2);
+        part += __shfl_xor_sync(0xffffffffu, part, 1);
+        if (sub == 0) acc += part;
+    }
+
+    // Group leaders (sub==0: lanes 0,4,8,…,28) hold per-stripe sums; reduce across
+    // the 8 groups and all warps via shared memory.
+    __shared__ float warp_acc[MATVEC_Q40_NWARPS][8];
+    if (sub == 0) warp_acc[warp_id][grp] = acc;
+    __syncthreads();
+    if (warp_id == 0 && lane == 0) {
+        float s = 0.f;
+        #pragma unroll
+        for (int w = 0; w < MATVEC_Q40_NWARPS; w++)
+            for (int g = 0; g < 8; g++) s += warp_acc[w][g];
+        output[row] = s;
+    }
+}
+
 // One-time repack of an interleaved Q8_0 weight [rows × nb × 34 B] into the SoA
 // buffer [quants rows*cols B][scales rows*nb fp16] (issue #149). One thread per
 // 32-int8 block: copies the 2-byte fp16 scale to the scale region and the 32 quants
