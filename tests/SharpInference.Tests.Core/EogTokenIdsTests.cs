@@ -35,6 +35,20 @@ public sealed class EogTokenIdsTests
     }
 
     [Fact]
+    public void Gemma4Turn_StopsEvenWhenEosMetadataIsEosNotTurn()
+    {
+        // Gemma 4 12B QAT regression: the GGUF declares eos_token_id=1 (<eos>), but the
+        // model ends turns with <turn|> (id 106). Without <turn|> in the canonical EOG
+        // names, 106 never enters the stop set and generation runs past the turn (leaking
+        // <turn|>…<channel|> garbage). <turn|> must be picked up by NAME regardless of the
+        // eos metadata. (E4B happens to declare eos=106 and stops either way.)
+        var vocab = Vocab(("<eos>", 1), ("<turn|>", 106));
+        var eog = GgufTokenizer.BuildEogTokenIds(vocab, specialIds: new HashSet<int>(), eosTokenId: 1);
+        Assert.Contains(106, eog);   // <turn|> — the actual end-of-turn token
+        Assert.Contains(1, eog);     // configured <eos>
+    }
+
+    [Fact]
     public void BracketMarker_AcceptedOnlyWhenControlTyped()
     {
         // <|endoftext|> present in vocab but NOT typed control → must NOT become a stop, to avoid
