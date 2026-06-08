@@ -189,6 +189,76 @@ public sealed class Gemma4CudaHybridForwardPassTests
     }
 
     /// <summary>
+    /// Strict cross-backend logit parity for the E4B hybrid split vs the independent CPU
+    /// <see cref="ForwardPass"/> reference. This is the oracle the argmax-only
+    /// <see cref="Gemma4_E4B_CudaHybridForward_MatchesCpuArgmax"/> can't give: it pins the
+    /// V-norm consistency between the two hybrid tiers. llama.cpp gemma4.cpp:227 V-norms
+    /// every KV-owning gemma4 layer (E4B too); the CPU half (CpuLayerGemma4) always did, but
+    /// the GPU half used to gate V-norm on AttentionKEqV — so an E4B split V-normed its CPU
+    /// layers and not its GPU layers (split-internal inconsistency), diverging from the CPU
+    /// reference by ~14 logits even while first-argmax held. Q8_0 is argmax-stable but not
+    /// bit-exact, so we assert a single prefill: argmax + top-5 overlap + a loose maxAbs bound.
+    /// </summary>
+    [Fact]
+    public void Gemma4_E4B_CpuMatchesCudaHybridLogits()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.NotNull(hp.LayerHeadDim);
+
+        int bosId = ReadIntMetadata(model, "tokenizer.ggml.bos_token_id", fallback: 2);
+        var tokens = new int[] { bosId, 651, 6037, 576, 6081, 603, 1234, 4567, 8901 };
+
+        var placement = new LayerPlacement(
+            GpuLayers: SafeGpuLayers,
+            CpuLayers: hp.NumLayers - SafeGpuLayers,
+            GpuWeightBytes: 0,
+            GpuKvBytes: 0,
+            RecommendedCtxSize: 512);
+
+        float[] hybridLogits;
+        using (var hybridFwd = new CudaHybridForwardPass(model, gpu, hp, placement))
+            hybridLogits = hybridFwd.Prefill(tokens).ToArray();
+
+        float[] cpuLogits;
+        using (var cpuBackend = new CpuBackend())
+        using (var cpuFwd = new SharpInference.Engine.ForwardPass(model, cpuBackend, hp))
+            cpuLogits = cpuFwd.Prefill(tokens).ToArray();
+
+        Assert.Equal(hybridLogits.Length, cpuLogits.Length);
+
+        float maxAbs = 0f;
+        for (int i = 0; i < cpuLogits.Length; i++)
+        {
+            float d = MathF.Abs(cpuLogits[i] - hybridLogits[i]);
+            if (d > maxAbs) maxAbs = d;
+        }
+
+        int cpuArgmax = Argmax(cpuLogits);
+        int hybridArgmax = Argmax(hybridLogits);
+        var cpuTop5 = TopK(cpuLogits, 5);
+        var hybridTop5 = TopK(hybridLogits, 5);
+        int overlap = 0;
+        foreach (var t in cpuTop5) if (Array.IndexOf(hybridTop5, t) >= 0) overlap++;
+
+        Assert.True(cpuArgmax == hybridArgmax,
+            $"CPU↔CUDA-hybrid E4B argmax disagree: CPU={cpuArgmax} hybrid={hybridArgmax}, maxAbs={maxAbs:F3}, " +
+            $"CPU top5=[{string.Join(",", cpuTop5)}] hybrid top5=[{string.Join(",", hybridTop5)}]. " +
+            "A V-norm / per-layer-KV inconsistency across the hybrid tiers, not Q8_0 noise.");
+        Assert.True(overlap >= 4,
+            $"CPU↔CUDA-hybrid E4B top-5 overlap only {overlap}/5 (maxAbs={maxAbs:F3}); " +
+            $"CPU=[{string.Join(",", cpuTop5)}] hybrid=[{string.Join(",", hybridTop5)}].");
+        Assert.True(maxAbs < 5.0f,
+            $"CPU↔CUDA-hybrid E4B logit maxAbs {maxAbs:F3} exceeds the structural bound (Q8_0 cross-backend " +
+            "noise stays well under 5; this magnitude indicates a tier-inconsistent V-norm).");
+    }
+
+    /// <summary>
     /// Validation gate: hybrid splits that would cross a KV-share source/dependent
     /// tier boundary must be rejected up front with an actionable message.
     /// </summary>

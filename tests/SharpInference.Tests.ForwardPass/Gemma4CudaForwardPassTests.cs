@@ -261,6 +261,73 @@ public sealed class Gemma4CudaForwardPassTests
     }
 
     /// <summary>
+    /// Cross-backend (CPU↔CUDA) logit-level parity on a single E4B prefill — the strict
+    /// oracle the argmax-only <see cref="Gemma4_E4B_CudaForward_MatchesCpuArgmax"/> /
+    /// <see cref="Gemma4_E4B_CudaForward_LongDecodeIsCoherent"/> checks cannot provide
+    /// (top-1 token sequences are robust to sub-argmax perturbations, per
+    /// feedback_cross_backend_parity_test). The CPU <see cref="ForwardPass"/> is the
+    /// independent reference (mirrors HF/llama.cpp math, shares no GPU kernels): llama.cpp
+    /// gemma4.cpp:227 plain-RMS-norms V on EVERY KV-owning gemma4 layer, E4B included, and
+    /// the CPU per-token Forward does too — so a CUDA path that skips V-norm for E4B (the
+    /// pre-#124 AttentionKEqV gate) diverges here at the logit level even while argmax holds.
+    /// Q8_0 is argmax-stable but not bit-exact across backends, so we assert on a SINGLE
+    /// prefill: argmax agreement, top-5 overlap, and a loose maxAbs bound (a real trunk
+    /// math divergence is many logits; Q8_0 cross-backend noise stays well under 5).
+    /// </summary>
+    [Fact]
+    public void Gemma4_E4B_CpuMatchesCudaLogits()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.NotNull(hp.LayerHeadDim);
+
+        int bosId = ReadIntMetadata(model, "tokenizer.ggml.bos_token_id", fallback: 2);
+        var tokens = new int[] { bosId, 651, 6037, 576, 6081, 603, 1234, 4567, 8901 };
+
+        float[] cudaLogits;
+        using (var cudaFwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 512))
+            cudaLogits = cudaFwd.Prefill(tokens).ToArray();
+
+        float[] cpuLogits;
+        using (var cpuBackend = new CpuBackend())
+        using (var cpuFwd = new SharpInference.Engine.ForwardPass(model, cpuBackend, hp))
+            cpuLogits = cpuFwd.Prefill(tokens).ToArray();
+
+        Assert.Equal(cudaLogits.Length, cpuLogits.Length);
+
+        float maxAbs = 0f;
+        for (int i = 0; i < cpuLogits.Length; i++)
+        {
+            float d = MathF.Abs(cpuLogits[i] - cudaLogits[i]);
+            if (d > maxAbs) maxAbs = d;
+        }
+
+        int cpuArgmax = Argmax(cpuLogits);
+        int cudaArgmax = Argmax(cudaLogits);
+        var cpuTop5 = TopK(cpuLogits, 5);
+        var cudaTop5 = TopK(cudaLogits, 5);
+        int overlap = 0;
+        foreach (var t in cpuTop5) if (Array.IndexOf(cudaTop5, t) >= 0) overlap++;
+
+        Assert.True(cpuArgmax == cudaArgmax,
+            $"CPU↔CUDA E4B argmax disagree: CPU={cpuArgmax} CUDA={cudaArgmax}, maxAbs={maxAbs:F3}, " +
+            $"CPU top5=[{string.Join(",", cpuTop5)}] CUDA top5=[{string.Join(",", cudaTop5)}]. " +
+            "A structural V-norm / per-layer-KV ordering bug, not Q8_0 noise.");
+        Assert.True(overlap >= 4,
+            $"CPU↔CUDA E4B top-5 overlap only {overlap}/5 (maxAbs={maxAbs:F3}); " +
+            $"CPU=[{string.Join(",", cpuTop5)}] CUDA=[{string.Join(",", cudaTop5)}].");
+        Assert.True(maxAbs < 5.0f,
+            $"CPU↔CUDA E4B logit maxAbs {maxAbs:F3} exceeds the structural bound (Q8_0 cross-backend " +
+            "noise stays well under 5; this magnitude indicates a trunk math divergence — e.g. V-norm " +
+            "applied on one backend but not the other).");
+    }
+
+    /// <summary>
     /// SnapKV must be force-disabled for Gemma-4-style models: their SWA layers use
     /// sliding-window ring caches and layers carry per-layer head_dim, so the full-context
     /// scoring + uniform-kvDim compaction in ApplySnapKvEviction would mis-index the cache.

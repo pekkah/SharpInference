@@ -1384,13 +1384,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             }
 
             // Gemma 4: V gets a plain per-head RMSNorm (no learned weight) before the
-            // KV cache. Mirrors CPU decode + llama.cpp gemma4.cpp:227 (ggml_rms_norm(Vcur)).
-            // V is never RoPE'd. Gated to k_eq_v (12B) models: the pre-existing CUDA
-            // gemma4 path never normed V, and the CPU *prefill* cores also skip it, so
-            // enabling it for E4B (separate-V) would diverge the CPU/CUDA V caches on the
-            // prefill positions. Bringing V-norm to E4B + all CPU prefill cores for full
-            // cross-backend parity is a tracked follow-up (issue #124).
-            if (!kvShared && _hp.AttentionKEqV)
+            // KV cache, on EVERY KV-owning layer (E4B and 12B alike). Mirrors the CPU
+            // ForwardPass + llama.cpp gemma4.cpp:227 (Vcur = ggml_rms_norm(Vcur),
+            // unconditional for has_kv layers). V is never RoPE'd. This loop is gemma4-only
+            // (layerHd from LayerHeadDim![layer]) so !kvShared == has_kv. For 12B k_eq_v
+            // globals V is the raw K projection (copied above); for E4B / 12B SWA it is
+            // wv·norm — both get the same V-norm here.
+            if (!kvShared)
                 _gpu.HeadNormPure(vView, layerKv, layerHd, _hp.RmsNormEps);
 
             float ropeTheta = isSwa ? _ropeThetaSwa : _hp.RopeTheta;
@@ -1786,7 +1786,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 else
                     _gpu.HeadNorm(qView, _wqNorm![layer], _numHeads, layerHd, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             }
-            if (!kvShared && _hp.AttentionKEqV)   // V-norm gated to k_eq_v models (see RunGemma4DeviceRegion)
+            if (!kvShared)   // Gemma 4 V-norm on every KV-owning layer (see ForwardGemma4)
                 _gpu.HeadNormPure(vView, layerKv, layerHd, _hp.RmsNormEps);
             float ropeTheta = isSwa ? _ropeThetaSwa : _hp.RopeTheta;
             if (!isSwa && _gpuRopeFreqs is { } rfTbl)
@@ -2397,11 +2397,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
 
         // Weighted QK-norm before RoPE for every dense family (issue #157).
         ApplyQkNormBatched();
-        // Gemma 4 12B k_eq_v: V gets a plain per-head RmsNorm (no learned weight) before
-        // the KV cache — mirrors the per-token RunGemma4DeviceRegion + llama.cpp
-        // gemma4.cpp:227. V was copied from the RAW K projection above (pre QK-norm), and
-        // is never RoPE'd. Gated to k_eq_v (12B) models, matching the per-token gate.
-        if (!kvShared && _hp.AttentionKEqV)
+        // Gemma 4: V gets a plain per-head RmsNorm (no learned weight) before the KV cache
+        // on every KV-owning layer (E4B + 12B) — mirrors the per-token ForwardGemma4 +
+        // llama.cpp gemma4.cpp:227. For 12B k_eq_v globals V was copied from the RAW K
+        // projection above (pre QK-norm); for E4B / 12B SWA it is wv·norm. V is never RoPE'd.
+        // This trunk also serves non-gemma4 models (layerHd falls back to _headDim), so the
+        // V-norm is gated on the gemma4 master switch — NOT AttentionKEqV (E4B lacks it but
+        // still V-norms, matching the CPU reference and avoiding a mixed-norm V cache vs the
+        // per-token decode path that previously broke the E4B coherence oracle).
+        if (_isGemma4Like && !kvShared)
             _gpu.HeadNormPureBatched(vAll, layerKv, layerHd, N, _hp.RmsNormEps);
         ApplyRopeBatched();
 

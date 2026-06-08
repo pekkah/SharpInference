@@ -1868,9 +1868,13 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         }
 
         // Gemma 4: V gets a plain per-head RMSNorm (no learned weight) before the KV cache
-        // (llama.cpp gemma4.cpp:227). Gated to k_eq_v (12B) models, matching the full-GPU
-        // CudaForwardPass gate — E4B hybrid keeps its pre-existing no-V-norm GPU behaviour.
-        if (!kvShared && _hp.AttentionKEqV)
+        // on every KV-owning layer (llama.cpp gemma4.cpp:227, unconditional for has_kv).
+        // This method is gemma4-only (layerHd from LayerHeadDim![i]), so !kvShared == has_kv.
+        // Applied for E4B too — matching the full-GPU CudaForwardPass AND the hybrid CPU half
+        // (CpuLayerGemma4 already V-norms unconditionally); the old AttentionKEqV gate left
+        // the E4B hybrid GPU tier un-normed while the CPU tier normed → split-internal
+        // inconsistency. Mirrors the CPU ForwardPass reference.
+        if (!kvShared)
         {
             _gpu.HeadNormPure(vView, layerKv, layerHd, _hp.RmsNormEps);
             _gpu.RecordBarrier();
