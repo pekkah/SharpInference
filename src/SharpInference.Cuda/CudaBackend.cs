@@ -363,12 +363,18 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         Environment.GetEnvironmentVariable("SHARPI_ACT_SOA") == "1";
 
     /// <summary>
-    /// Track B (#124/#173): with <see cref="ActSoaEnabled"/>, route the Q8_0 prefill MMQ
-    /// through the cp.async double-buffered kernel (<c>llm_mmq_q8_0_soa_acts_cpa</c>) — it
-    /// streams the weight+activation quants global→shared off the L1TEX LSU pipe (the
-    /// profiled 78.6% ceiling) and overlaps the next K-tile's copy with the current mma in
-    /// hardware. Bit-identical to the scalar-load SoA-acts MMQ. Default OFF
-    /// (<c>SHARPI_ACT_SOA_CPA</c>=1) — the perf-experiment switch; settable for A/B.
+    /// Track B (#124/#173): route the Q8_0/Q4_0 prefill MMQ through the cp.async
+    /// double-buffered kernels (<c>llm_mmq_{q8_0,q4_0}_soa_acts_cpa</c>) — they stream the
+    /// weight+activation quants global→shared off the L1TEX LSU pipe and overlap the next
+    /// K-tile's copy with the current mma in hardware. Implies the SoA-activation substrate
+    /// for those formats. Bit-identical to the scalar-load SoA-acts MMQ (and to AoS).
+    /// <b>Default OFF</b> (<c>SHARPI_ACT_SOA_CPA=1</c> to enable). It is a real
+    /// <i>kernel-level</i> win (+10–15% at L2-resident FFN matmul probe shapes) but
+    /// <b>e2e-NEUTRAL</b> on the real 48-layer prefill: profiled matmul 74→73 ms with it on,
+    /// because the isolated probe is L1TEX-bound (cp.async's regime) while the full prefill
+    /// streams 7 GB of weights and is bound elsewhere. Kept opt-in as bit-identical,
+    /// arch-guarded (cp.async on sm_80+, scalar fallback below) groundwork. See the project
+    /// memory's probe≠e2e analysis before re-enabling by default.
     /// </summary>
     public bool ActSoaCpaEnabled { get; set; } =
         Environment.GetEnvironmentVariable("SHARPI_ACT_SOA_CPA") == "1";
@@ -2007,7 +2013,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             DType.Q4_0 => _soaQ40Handles.ContainsKey(matrix.Handle),
             _          => _soaHandles.ContainsKey(matrix.Handle),
         };
-        bool useActSoa = ActSoaEnabled && wIsSoa;
+        // cp.async (default-on, #124/#173) implies the SoA-activation substrate — engage it
+        // for the formats that HAVE a cp.async kernel (Q8_0/Q4_0). Q4_K only takes the SoA
+        // path when ActSoaEnabled is explicitly set (no Q4_K cp.async kernel yet → scalar).
+        bool cpaFmt = weightDType is DType.Q8_0 or DType.Q4_0;
+        bool useCpa = ActSoaCpaEnabled && cpaFmt && wIsSoa;
+        bool useActSoa = (ActSoaEnabled || useCpa) && wIsSoa;
 
         uint gx = (uint)((rows + 63) / 64), gy = (uint)((nTok + 127) / 128);
 
@@ -2036,8 +2047,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 nint kern = weightDType switch
                 {
                     DType.Q4_K => _mmqQ4kSoaActsKernel,
-                    DType.Q4_0 => ActSoaCpaEnabled ? _mmqQ40SoaActsCpaKernel : _mmqQ40SoaActsKernel,
-                    _          => ActSoaCpaEnabled ? _mmqQ80SoaActsCpaKernel : _mmqQ80SoaActsKernel,
+                    DType.Q4_0 => useCpa ? _mmqQ40SoaActsCpaKernel : _mmqQ40SoaActsKernel,
+                    _          => useCpa ? _mmqQ80SoaActsCpaKernel : _mmqQ80SoaActsKernel,
                 };
                 int rm = NvrtcInterop.LaunchKernel(kern, gx, gy, 1, 256, 1, 1, 0, _stream, args, null);
                 if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(mmq {weightDType} soa_acts) failed: {rm}");

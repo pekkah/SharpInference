@@ -2296,6 +2296,40 @@ extern ""C"" __global__ void __launch_bounds__(256, 4) llm_mmq_q8_0_soa_acts(
 #undef MMQ_BM
 #undef MMQ_BN
 
+// ── cp.async 16-B helpers (Track B) — arch-guarded so the module still compiles on
+//    pre-Ampere (sm_75 Turing, where the int8 mma works but cp.async does not). On
+//    sm_80+ they issue real async copies; on older arch they fall back to a synchronous
+//    16-B scalar shared store (the commit/wait become no-ops), keeping the kernel correct
+//    everywhere — just without the async-pipeline speedup. Bit-identical either way.
+__device__ __forceinline__ void sharpi_cp_async16(int* smem, const void* gmem)
+{
+#if __CUDA_ARCH__ >= 800
+    unsigned int s = (unsigned int)__cvta_generic_to_shared(smem);
+    asm volatile(""cp.async.cg.shared.global [%0], [%1], 16;"" :: ""r""(s), ""l""(gmem));
+#else
+    const int* g = (const int*)gmem;
+    smem[0] = g[0]; smem[1] = g[1]; smem[2] = g[2]; smem[3] = g[3];
+#endif
+}
+__device__ __forceinline__ void sharpi_cp_commit()
+{
+#if __CUDA_ARCH__ >= 800
+    asm volatile(""cp.async.commit_group;"");
+#endif
+}
+__device__ __forceinline__ void sharpi_cp_wait_keep1()
+{
+#if __CUDA_ARCH__ >= 800
+    asm volatile(""cp.async.wait_group 1;"");
+#endif
+}
+__device__ __forceinline__ void sharpi_cp_wait_all()
+{
+#if __CUDA_ARCH__ >= 800
+    asm volatile(""cp.async.wait_group 0;"");
+#endif
+}
+
 // ── Q8_0 SoA-acts MMQ with cp.async pipelined global→shared (Track B port) ──
 // The lever ncu identified: the kernel is L1TEX-bound (78.6%), and occupancy/coalescing
 // were both proven not to move the 1.14 ms floor. cp.async copies global→shared WITHOUT
@@ -2349,29 +2383,25 @@ extern ""C"" __global__ void __launch_bounds__(256, 4) llm_mmq_q8_0_soa_acts_cpa
     #define CPA_ISSUE(KB, ST) do { \
         if (tid < MMQ_BM * 2) { int row = tid >> 1, half = tid & 1; int gw = row_block + row; \
             int* dstp = &sW[ST][row * 8 + half * 4]; \
-            if (gw < rows) { unsigned dsts = (unsigned)__cvta_generic_to_shared(dstp); \
-                const void* src = &qw[((long)gw * nb + (KB)) * 8L + half * 4]; \
-                asm volatile(""cp.async.cg.shared.global [%0], [%1], 16;"" :: ""r""(dsts), ""l""(src)); } \
+            if (gw < rows) sharpi_cp_async16(dstp, &qw[((long)gw * nb + (KB)) * 8L + half * 4]); \
             else { dstp[0] = dstp[1] = dstp[2] = dstp[3] = 0; } } \
         { int token = tid >> 1, half = tid & 1; int gy = tok_block + token; \
             int* dstp = &sY[ST][token * 8 + half * 4]; \
-            if (gy < n_tok) { unsigned dsts = (unsigned)__cvta_generic_to_shared(dstp); \
-                const void* src = &y_qs[((long)gy * nb + (KB)) * 8L + half * 4]; \
-                asm volatile(""cp.async.cg.shared.global [%0], [%1], 16;"" :: ""r""(dsts), ""l""(src)); } \
+            if (gy < n_tok) sharpi_cp_async16(dstp, &y_qs[((long)gy * nb + (KB)) * 8L + half * 4]); \
             else { dstp[0] = dstp[1] = dstp[2] = dstp[3] = 0; } } \
     } while (0)
 
     CPA_ISSUE(0, 0);
-    asm volatile(""cp.async.commit_group;"");
+    sharpi_cp_commit();
 
     for (int kb = 0; kb < nb; kb++) {
         int cur = kb & 1;
         if (kb + 1 < nb) {
             CPA_ISSUE(kb + 1, (kb + 1) & 1);
-            asm volatile(""cp.async.commit_group;"");
-            asm volatile(""cp.async.wait_group 1;"");   // keep the just-issued next tile in flight
+            sharpi_cp_commit();
+            sharpi_cp_wait_keep1();   // keep the just-issued next tile in flight
         } else {
-            asm volatile(""cp.async.wait_group 0;"");
+            sharpi_cp_wait_all();
         }
         // Per-block scales for the CURRENT kb (scalar path — tiny vs the quant stream).
         if (tid < MMQ_BM) { int gw = row_block + tid;
@@ -2477,29 +2507,25 @@ extern ""C"" __global__ void __launch_bounds__(256, 4) llm_mmq_q4_0_soa_acts_cpa
     #define CPA_ISSUE_Q40(KB, ST) do { \
         if (tid < MMQ_BM) { int gw = row_block + tid; \
             int* dstp = &sWraw[ST][tid * 4]; \
-            if (gw < rows) { unsigned dsts = (unsigned)__cvta_generic_to_shared(dstp); \
-                const void* src = &qw[((long)gw * nb + (KB)) * 4L]; \
-                asm volatile(""cp.async.cg.shared.global [%0], [%1], 16;"" :: ""r""(dsts), ""l""(src)); } \
+            if (gw < rows) sharpi_cp_async16(dstp, &qw[((long)gw * nb + (KB)) * 4L]); \
             else { dstp[0] = dstp[1] = dstp[2] = dstp[3] = 0; } } \
         { int token = tid >> 1, half = tid & 1; int gy = tok_block + token; \
             int* dstp = &sY[ST][token * 8 + half * 4]; \
-            if (gy < n_tok) { unsigned dsts = (unsigned)__cvta_generic_to_shared(dstp); \
-                const void* src = &y_qs[((long)gy * nb + (KB)) * 8L + half * 4]; \
-                asm volatile(""cp.async.cg.shared.global [%0], [%1], 16;"" :: ""r""(dsts), ""l""(src)); } \
+            if (gy < n_tok) sharpi_cp_async16(dstp, &y_qs[((long)gy * nb + (KB)) * 8L + half * 4]); \
             else { dstp[0] = dstp[1] = dstp[2] = dstp[3] = 0; } } \
     } while (0)
 
     CPA_ISSUE_Q40(0, 0);
-    asm volatile(""cp.async.commit_group;"");
+    sharpi_cp_commit();
 
     for (int kb = 0; kb < nb; kb++) {
         int cur = kb & 1;
         if (kb + 1 < nb) {
             CPA_ISSUE_Q40(kb + 1, (kb + 1) & 1);
-            asm volatile(""cp.async.commit_group;"");
-            asm volatile(""cp.async.wait_group 1;"");
+            sharpi_cp_commit();
+            sharpi_cp_wait_keep1();
         } else {
-            asm volatile(""cp.async.wait_group 0;"");
+            sharpi_cp_wait_all();
         }
         if (tid < MMQ_BM) { int gw = row_block + tid;
             sWd[tid] = (gw < rows) ? sharpi_fp16_to_fp32(ws[(long)gw * nb + kb]) : 0.f; }
