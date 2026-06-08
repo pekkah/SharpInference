@@ -145,7 +145,13 @@ public sealed unsafe class GgufModel : IDisposable
                 if (t.Name.EndsWith(".attn_k.weight", StringComparison.Ordinal))      attnKCount++;
                 else if (t.Name.EndsWith(".attn_v.weight", StringComparison.Ordinal)) attnVCount++;
             }
-            if (attnKCount > 0 && attnVCount < attnKCount)
+            // k_eq_v is a Gemma-4-specific mechanism (its global layers drop attn_v and reuse
+            // the K projection as V). Gate the V-deficit heuristic on the gemma4 arch family so
+            // an unrelated architecture that ships fewer V than K projections can't be mis-driven
+            // down the copy-K-into-V path. Heuristic, not a metadata read — no GGUF declares
+            // attention_k_eq_v directly.
+            if (attnKCount > 0 && attnVCount < attnKCount
+                && arch.StartsWith("gemma4", StringComparison.Ordinal))
                 metadata["_sharpi.attention_k_eq_v"] = true;
 
             if (!metadata.ContainsKey($"{arch}.vocab_size") &&

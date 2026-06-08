@@ -2013,9 +2013,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             DType.Q4_0 => _soaQ40Handles.ContainsKey(matrix.Handle),
             _          => _soaHandles.ContainsKey(matrix.Handle),
         };
-        // cp.async (default-on, #124/#173) implies the SoA-activation substrate — engage it
-        // for the formats that HAVE a cp.async kernel (Q8_0/Q4_0). Q4_K only takes the SoA
-        // path when ActSoaEnabled is explicitly set (no Q4_K cp.async kernel yet → scalar).
+        // cp.async (opt-in/default-off, #124/#173) implies the SoA-activation substrate —
+        // engage it for the formats that HAVE a cp.async kernel (Q8_0/Q4_0). Q4_K only takes
+        // the SoA path when ActSoaEnabled is explicitly set (no Q4_K cp.async kernel → scalar).
         bool cpaFmt = weightDType is DType.Q8_0 or DType.Q4_0;
         bool useCpa = ActSoaCpaEnabled && cpaFmt && wIsSoa;
         bool useActSoa = (ActSoaEnabled || useCpa) && wIsSoa;

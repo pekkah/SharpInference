@@ -2103,8 +2103,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             // expanded, no fp16 dequant temp to HBM, int8 tensor cores), with the Q4_0
             // symmetric −8·d_w·Σq centering term. Fallback: dequant→fp16→cuBLAS GEMM.
             // Argmax-stable, not byte-exact. Q4_0 blocks are 32-wide; every Gemma 4 12B
-            // hidden dim is a multiple of 32, but fall back to the matvec path
-            // defensively if not.
+            // hidden dim is a multiple of 32. There is no Q4_0 GEMM-N matvec fallback
+            // (CudaBackend.MatMulBatched has no Q4_0 case), so an unaligned width is a
+            // hard error rather than a silent wrong-kernel path.
             int cols = (int)(inAll.ElementCount / n);
             if ((cols & 0x1f) == 0)
             {
@@ -2114,7 +2115,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                     _gpu.MatMulBatchedGemm(outAll, weights, inAll, n, dt);
             }
             else
-                _gpu.MatMulBatched(outAll, weights, inAll, n, dt);
+                throw new InvalidOperationException(
+                    $"Q4_0 batched prefill matmul requires cols % 32 == 0 (got {cols}).");
         }
         else if (dt is DType.Q6_K or DType.Q5_K)
         {
