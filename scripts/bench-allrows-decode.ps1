@@ -1,29 +1,19 @@
-# Re-benchmark every on-disk README row at a uniform ~1K-token "normal" context,
-# warm-cache, current code (#114-B batched trunk on by default). Goal: make the
-# README "Prefill t/s" column consistent (warm @~1K ctx) instead of the old
-# ~10-token launch-overhead cells. Decode is captured for reference but the README
-# decode column / notes stay as the near-zero-ctx generation rate.
+# Companion to bench-allrows-1k.ps1: re-measure the README "Decode t/s" column at
+# near-zero context (short prompt) so it stays comparable to llama.cpp tg128 and the
+# per-issue near-zero figures. Same job table, same warm-clock discipline (a discarded
+# full run for GPU configs so boost clocks have ramped), 60 generated tokens.
 $ErrorActionPreference = "Continue"
 
 $C = "C:\p\sharpi\models"
 $E = "E:\models"
 
-# ~1K-token prompt: a few varied technical sections + a task (not pure repetition).
-$para = @(
-"Modern large language model inference is dominated by memory bandwidth rather than raw compute.",
-"Each decode step streams the full weight matrix for every layer, so quantization formats like Q4_K and Q5_K trade a small accuracy loss for a large reduction in bytes moved per token.",
-"Mixture-of-experts models complicate this: only a handful of the hundreds of experts fire per token, and which fire varies token to token, defeating simple weight caching.",
-"Gated DeltaNet layers replace quadratic attention with a linear recurrent state update, bounding per-token cost as context grows, at the price of a strictly sequential scan.",
-"Hybrid placement keeps the attention and recurrent trunk on the accelerator while streaming routed-expert weights from host memory, overlapping the two so neither stalls."
-) -join " "
-$sb = [System.Text.StringBuilder]::new()
-[void]$sb.Append("Read the following engineering notes and then write a concise technical summary.`n`n")
-for ($i = 1; $i -le 6; $i++) { [void]$sb.Append("Section $i. $para`n`n") }
-[void]$sb.Append("Summarize the main performance trade-offs across the sections above.")
-$prompt = $sb.ToString()
+# Near-zero-ctx prompt: short to keep prefill negligible, but OPEN-ENDED so every model
+# generates the full 60 tokens. A factual prompt ("capital of France") makes the model
+# emit a one-line answer and hit EOS after a few tokens, so decode t/s is then computed
+# over a handful of tokens dominated by fixed first-token cost (SmolLM2 mis-measured at
+# ~14 t/s instead of ~38). An essay prompt guarantees a long, EOS-free generation.
+$prompt = "Write a detailed multi-paragraph explanation of how the water cycle works on Earth."
 
-# Job table: Tag, Model, Args, Env (CPU_MOE), Timeout. Order groups by model file so
-# the first run of each model warms the OS page cache for the ones after it.
 $jobs = @(
   @{ Tag="smol-cpu";        M="$C\SmolLM2-1.7B-Instruct-Q4_K_M.gguf"; A=@();                                               T=300 }
   @{ Tag="smol-vulkan";     M="$C\SmolLM2-1.7B-Instruct-Q4_K_M.gguf"; A=@("-g","-1","--backend","vulkan");                 T=300 }
@@ -44,7 +34,6 @@ $jobs = @(
 
   @{ Tag="coder-cpu";       M="$C\Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"; A=@();                                       T=600 }
   @{ Tag="coder-cpu-tq";    M="$C\Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"; A=@("--tq");                                 T=600 }
-  @{ Tag="coder-vulkan";    M="$C\Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"; A=@("-g","-1","--backend","vulkan");         T=1800 }
   @{ Tag="coder-cuda";      M="$C\Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"; A=@("-g","-1","--backend","cuda");           T=600 }
 
   @{ Tag="qwen36-35b-cpu";  M="$E\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"; A=@();                                                 T=900 }
@@ -73,28 +62,24 @@ foreach ($j in $jobs) {
     if (-not (Test-Path $j.M)) { Write-Host "[skip] $($j.Tag): $($j.M) missing" -ForegroundColor Yellow; continue }
     if ($j.CpuMoe) { $env:SHARPI_CPU_MOE = "1" } else { Remove-Item env:SHARPI_CPU_MOE -ErrorAction SilentlyContinue }
 
-    # Warm the OS page cache for this model file once (short prompt, discarded).
     if (-not $warmed.ContainsKey($j.M)) {
         Write-Host "--- warming $($j.Tag) model ---" -ForegroundColor DarkGray
-        $null = .\scripts\bench-textgen.ps1 -Model $j.M -Tag "$($j.Tag)-warm1k" -NTokens 8 -Prompt "Hello, world." -TimeoutSec $j.T -ExtraArgs $j.A
+        $null = .\scripts\bench-textgen.ps1 -Model $j.M -Tag "$($j.Tag)-dwarm" -NTokens 8 -Prompt "Hello, world." -TimeoutSec $j.T -ExtraArgs $j.A
         $warmed[$j.M] = $true
     }
+    # Warm-up measured run, discarded: GPU configs need it for boost clocks, and CPU
+    # configs need it for JIT — a short near-zero decode on a freshly-JITted process
+    # under-measures the first tokens (e.g. SmolLM2 finishes in ~4 s, before hot paths
+    # compile). The 1K-prefill sweep masks this; here we must warm explicitly.
+    $null = .\scripts\bench-textgen.ps1 -Model $j.M -Tag "$($j.Tag)-dwarmclk" -NTokens 60 -Prompt $prompt -TimeoutSec $j.T -ExtraArgs $j.A
 
-    # GPU jobs need a per-config warm-up: the first launch of each backend in this
-    # session runs at idle boost clocks and under-measures by ~30%. Run the full
-    # measured prompt once and discard it, then keep the second (warm-clock) run.
-    # CPU jobs don't boost-warm and the page cache is already hot, so skip it for them.
-    if ($j.A -contains "-g") {
-        $null = .\scripts\bench-textgen.ps1 -Model $j.M -Tag "$($j.Tag)-warmclk" -NTokens 60 -Prompt $prompt -TimeoutSec $j.T -ExtraArgs $j.A
-    }
-
-    $r = .\scripts\bench-textgen.ps1 -Model $j.M -Tag "$($j.Tag)-1k" -NTokens 60 -Prompt $prompt -TimeoutSec $j.T -ExtraArgs $j.A
+    $r = .\scripts\bench-textgen.ps1 -Model $j.M -Tag "$($j.Tag)-dec" -NTokens 60 -Prompt $prompt -TimeoutSec $j.T -ExtraArgs $j.A
     Remove-Item env:SHARPI_CPU_MOE -ErrorAction SilentlyContinue
-    $rows += [PSCustomObject]@{ Tag=$j.Tag; PrefTok=$r.PrefillTok; PrefillTps=$r.PrefillTps; DecodeTps=$r.DecodeTps; Mtp=$r.MtpAccept; Wall=$r.WallSec; TO=$r.TimedOut }
-    Write-Host ("  {0,-18} pref={1,7} t/s  dec={2,6} t/s  ({3} tok, {4}s{5})" -f $j.Tag,$r.PrefillTps,$r.DecodeTps,$r.PrefillTok,$r.WallSec,($(if($r.TimedOut){" TIMEOUT"}else{""}))) -ForegroundColor Green
+    $rows += [PSCustomObject]@{ Tag=$j.Tag; PrefTok=$r.PrefillTok; DecodeTps=$r.DecodeTps; Mtp=$r.MtpAccept; Wall=$r.WallSec; TO=$r.TimedOut }
+    Write-Host ("  {0,-18} dec={1,6} t/s  ({2} tok, {3}s{4})" -f $j.Tag,$r.DecodeTps,$r.PrefillTok,$r.WallSec,($(if($r.TimedOut){" TIMEOUT"}else{""}))) -ForegroundColor Green
 }
 Write-Host ""
-Write-Host "=== All-rows @~1K ctx (warm) ===" -ForegroundColor Cyan
+Write-Host "=== All-rows near-zero-ctx decode (warm) ===" -ForegroundColor Cyan
 $rows | Format-Table -AutoSize
-$rows | Export-Csv -NoTypeInformation -Path "tools\bench\allrows-1k.csv"
-Write-Host "CSV: tools\bench\allrows-1k.csv"
+$rows | Export-Csv -NoTypeInformation -Path "tools\bench\allrows-decode.csv"
+Write-Host "CSV: tools\bench\allrows-decode.csv"
