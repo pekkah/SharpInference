@@ -2469,6 +2469,72 @@ extern ""C"" __global__ void llm_dequant_q8_0_to_f16_soa(
     }
 }
 
+// ── Q4_0 → FP16 dequant for cuBLAS prefill GEMM (issue #124) ───────────────
+// Dequantizes a Q4_0-packed weight matrix [rows × cols] into a row-major fp16
+// matrix [rows × cols]. One block per row (256 threads), each thread strides over
+// the row's columns. Element (row, c): block b = c >> 5, within = c & 31; the
+// block layout is [d:fp16][qs:16 × uint8] (18 bytes). within<16 reads the low
+// nibble of qs[within], within>=16 the high nibble of qs[within-16]; value =
+// (nibble - 8) * d. Mirrors llm_matvec_q4_0; d*q rounded to fp16 is the only lossy
+// step, letting the prefill GEMM read each weight once per batch (vs per token).
+extern ""C"" __global__ void llm_dequant_q4_0_to_f16(
+    const unsigned int* __restrict__ weights,
+    unsigned short* __restrict__ out,    // [rows * cols] fp16
+    int rows, int cols)
+{
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    int num_blocks = cols >> 5;
+    long row_base_bytes = (long)row * (long)num_blocks * 18L;
+    long out_row = (long)row * (long)cols;
+    for (int c = (int)threadIdx.x; c < cols; c += (int)blockDim.x) {
+        int block = c >> 5;
+        int within = c & 31;
+        long b0 = row_base_bytes + (long)block * 18L;
+        unsigned int dlo = sharpi_byte_at(weights, b0 + 0);
+        unsigned int dhi = sharpi_byte_at(weights, b0 + 1);
+        float d = sharpi_fp16_to_fp32(dlo | (dhi << 8));
+        unsigned int qbyte = sharpi_byte_at(weights, b0 + 2 + (long)(within & 15));
+        int nib = (within < 16) ? (int)(qbyte & 0xFu) : (int)(qbyte >> 4);
+        int q = nib - 8;
+        out[out_row + c] = (unsigned short)sharpi_fp32_to_fp16(d * (float)q);
+    }
+}
+
+// Batched per-head pure RmsNorm (no learned weight) over N tokens. grid =
+// (num_heads, n_tok); data is token-major [n_tok × num_heads × head_dim].
+// Per (head, token) bit-identical to llm_head_norm_pure. Used for the Gemma 4
+// 12B k_eq_v V-norm in the batched-trunk prefill (issue #124).
+extern ""C"" __global__ void llm_head_norm_pure_batched(
+    float* __restrict__ data,
+    int head_dim, int num_heads, float eps, int n_tok)
+{
+    __shared__ float sdata[256];
+    unsigned int tid = threadIdx.x;
+    unsigned int head = blockIdx.x;
+    int token = (int)blockIdx.y;
+    if ((int)head >= num_heads || token >= n_tok) return;
+
+    long base_off = ((long)token * (long)num_heads + (long)head) * (long)head_dim;
+
+    float sum = 0.f;
+    for (int i = (int)tid; i < head_dim; i += 256) {
+        float v = data[base_off + i];
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    float scale = rsqrtf(sdata[0] / (float)head_dim + eps);
+    for (int i = (int)tid; i < head_dim; i += 256)
+        data[base_off + i] = data[base_off + i] * scale;
+}
+
 // ── Dequant Q4_K weight [rows × cols] → fp16 (issue #156 Item C / C1) ───────
 // One block of 256 threads dequantizes one weight row (cols elements). cols must
 // be a multiple of 256 (Q4_K super-block = 256 elements / 144 bytes). The per-

@@ -98,6 +98,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _rmsNormKernel;
     private nint   _headNormKernel;
     private nint   _headNormPureKernel;
+    private nint   _headNormPureBatchedKernel;   // #124: batched k_eq_v V-norm
     private nint   _siluMulKernel;
     private nint   _sigmoidKernel;
     private nint   _softmaxKernel;
@@ -181,6 +182,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // matvec (weight re-streamed once/token), the dominant large-N prefill cost.
     private nint   _dequantQ6KF16Kernel;
     private nint   _dequantQ5KF16Kernel;   // #162: same path for Q5_K_M mixes
+    private nint   _dequantQ40F16Kernel;   // #124: Q4_0 weight → fp16 (Gemma 4 12B QAT)
     private nint   _f32ToF16Kernel;
     // Issue #141 (MMQ): int8 tensor-core Q8_0×Q8_1 matmul — weight read once as
     // int8, no fp16 HBM round-trip, m16n8k32 s8 mma. Replaces the dequant→GEMM path.
@@ -1795,9 +1797,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
             throw new NotSupportedException("NVRTC kernels are not available on this system.");
-        if (weightDType is not (DType.Q8_0 or DType.Q4_K or DType.Q6_K or DType.Q5_K))
+        if (weightDType is not (DType.Q8_0 or DType.Q4_K or DType.Q6_K or DType.Q5_K or DType.Q4_0))
             throw new NotSupportedException(
-                $"CUDA MatMulBatchedGemm: weight dtype {weightDType} not supported (Q8_0, Q4_K, Q5_K, or Q6_K).");
+                $"CUDA MatMulBatchedGemm: weight dtype {weightDType} not supported (Q8_0, Q4_0, Q4_K, Q5_K, or Q6_K).");
         if (nTok <= 0)
             throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be > 0.");
         if (outputAll.ElementCount % nTok != 0 || inputAll.ElementCount % nTok != 0)
@@ -1834,6 +1836,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 DType.Q4_K => _soaQ4kHandles.ContainsKey(matrix.Handle) ? _dequantQ4KF16SoaKernel : _dequantQ4KF16Kernel,
                 DType.Q6_K => _dequantQ6KF16Kernel,   // #162
                 DType.Q5_K => _dequantQ5KF16Kernel,   // #162
+                DType.Q4_0 => _dequantQ40F16Kernel,   // #124 (Gemma 4 12B QAT)
                 _          => _soaHandles.ContainsKey(matrix.Handle) ? _dequantQ80F16SoaKernel : _dequantQ80F16Kernel,
             };
             nint* args = stackalloc nint[4] { (nint)(&wp), (nint)(&op), (nint)(&pRows), (nint)(&pCols) };
@@ -2618,6 +2621,27 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         };
         int r = NvrtcInterop.LaunchKernel(_headNormPureKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(head_norm_pure) failed: {r}");
+    }
+
+    /// <summary>Batched per-head L2 normalize (no learned weights) over N tokens.
+    /// <paramref name="data"/> is token-major [nTok × numHeads × headDim]; per
+    /// (head, token) bit-identical to <see cref="HeadNormPure"/>. Used for the
+    /// Gemma 4 12B k_eq_v V-norm in the batched-trunk prefill (issue #124).</summary>
+    public void HeadNormPureBatched(Tensor data, int numHeads, int headDim, int nTok, float eps = 1e-6f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint dPtr = GetDevPtr(data);
+        int  pHD = headDim, pNH = numHeads, pNT = nTok;
+        float pE = eps;
+        nint* args = stackalloc nint[5]
+        {
+            (nint)(&dPtr), (nint)(&pHD), (nint)(&pNH), (nint)(&pE), (nint)(&pNT)
+        };
+        int r = NvrtcInterop.LaunchKernel(_headNormPureBatchedKernel, (uint)numHeads, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(head_norm_pure_batched) failed: {r}");
     }
 
     public void Softmax(Tensor x)
@@ -4629,6 +4653,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _q4kRepackSoaKernel, _matvecQ4KSoaKernel, _matvecQ4KN2SoaKernel,
             _matvecQ4KGemmNSoaKernel, _dequantQ4KF16Kernel, _dequantQ4KF16SoaKernel,
             _dequantQ6KF16Kernel, _dequantQ5KF16Kernel,   // #162
+            _dequantQ40F16Kernel, _headNormPureBatchedKernel,   // #124
             _rmsNormBatchedKernel, _headNormBatchedKernel, _headNormQkKernel, _headNormQkBatchedKernel,
             _splitQgBatchedKernel, _ropeNeoxPartialBatchedKernel,
             _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel, _attentionSwaBatchedKernel,
@@ -4717,6 +4742,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _dequantQ4KF16SoaKernel = GetKernelFunc("llm_dequant_q4k_to_f16_soa");
         _dequantQ6KF16Kernel   = GetKernelFunc("llm_dequant_q6k_to_f16");
         _dequantQ5KF16Kernel   = GetKernelFunc("llm_dequant_q5k_to_f16");
+        _dequantQ40F16Kernel   = GetKernelFunc("llm_dequant_q4_0_to_f16");   // #124
+        _headNormPureBatchedKernel = GetKernelFunc("llm_head_norm_pure_batched");   // #124
         _f32ToF16Kernel        = GetKernelFunc("llm_f32_to_f16");
         _mmqQ80Kernel          = GetKernelFunc("llm_mmq_q8_0");
         _mmqQ80SoaKernel       = GetKernelFunc("llm_mmq_q8_0_soa");

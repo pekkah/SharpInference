@@ -1987,7 +1987,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     }
 
     private static bool BatchableDType(DType d) =>
-        d is DType.Q4_K or DType.Q5_K or DType.Q6_K or DType.Q8_0 or DType.Float32;
+        d is DType.Q4_K or DType.Q5_K or DType.Q6_K or DType.Q8_0 or DType.Q4_0 or DType.Float32;
 
     private DType WDType(Tensor t) => _weightDTypes.GetValueOrDefault(t.Handle, DType.Q4_K);
 
@@ -2019,8 +2019,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 !BatchableWeight(_wGate[i]) || !BatchableWeight(_wUp[i]) ||
                 !BatchableWeight(_wDown[i]))
                 return false;
-            if (!kvShared && (!BatchableWeight(_wk[i]) || !BatchableWeight(_wv[i])))
-                return false;
+            if (!kvShared)
+            {
+                if (!BatchableWeight(_wk[i])) return false;
+                // Gemma 4 12B global layers (attention_k_eq_v) carry no attn_v: V reuses
+                // the raw K projection, handled in GpuLayerBatchedTrunk. Only require a
+                // batchable _wv when the layer actually has a separate V projection; a
+                // null _wv on a non-k_eq_v model is unexpected → fall back to per-token.
+                if (_wv[i] is not null) { if (!BatchableWeight(_wv[i])) return false; }
+                else if (!_hp.AttentionKEqV) return false;
+            }
             if (_hp.HasPerLayerTokenEmbd &&
                 (!BatchableWeight(_gpuInpGate![i]) || !BatchableWeight(_gpuPleProj![i])))
                 return false;
@@ -2074,6 +2082,21 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 else
                     _gpu.MatMulBatchedGemm(outAll, weights, inAll, n, dt);
             }
+            else
+                _gpu.MatMulBatched(outAll, weights, inAll, n, dt);
+        }
+        else if (dt == DType.Q4_0)
+        {
+            // Issue #124: Gemma 4 12B QAT keeps all bulk matmul weights in Q4_0, which
+            // has no int8 MMQ kernel. Route the trunk matmuls through the dequant→fp16→
+            // cuBLAS GEMM (weight read once per batch) instead of the memory-bound
+            // per-token GEMM-N matvec (re-streams the whole weight once per token — the
+            // dominant large-N prefill cost). Argmax-stable, not byte-exact. Q4_0 blocks
+            // are 32-wide; every Gemma 4 12B hidden dim is a multiple of 32, but fall back
+            // to the matvec path defensively if not.
+            int cols = (int)(inAll.ElementCount / n);
+            if ((cols & 0x1f) == 0)
+                _gpu.MatMulBatchedGemm(outAll, weights, inAll, n, dt);
             else
                 _gpu.MatMulBatched(outAll, weights, inAll, n, dt);
         }
@@ -2287,14 +2310,19 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private void GpuLayerBatchedTrunk(int layer, int N, int startPos)
     {
         int layerHd = _hp.LayerHeadDim is { } lhd ? lhd[layer] : _headDim;
-        int qDimL = _numHeads * layerHd, kvDimL = _numKvHeads * layerHd;
+        // Per-layer KV head count (Gemma 4 12B: 8 GQA on SWA, 1 MQA on global).
+        int layerKv = _hp.LayerKvHeads is { } lkv ? lkv[layer] : _numKvHeads;
+        int qDimL = _numHeads * layerHd, kvDimL = layerKv * layerHd;
         int kvSrc = _hp.KvSourceLayer is { } ksl ? ksl[layer] : -1;
         bool kvShared = kvSrc >= 0;
         int effLayer = kvShared ? kvSrc : layer;
         bool isSwa = _hp.IsSwaLayer is { } swa && swa[layer];
         int window = _hp.SlidingWindowSize;
+        // Gemma 4 12B global layers carry no attn_v: V reuses the raw K projection
+        // (attention_k_eq_v). These layers always own their KV (shared_kv_layers=0).
+        bool kEqV = _hp.AttentionKEqV && !isSwa && _wv[layer] is null;
 
-        // Per-layer dense views (the buffers are sized for max head_dim).
+        // Per-layer dense views (the buffers are sized for max head_dim × max KV heads).
         var qAll = _gpu.View(_bpQ!, 0, (long)N * qDimL);
         var kAll = _gpu.View(_bpK!, 0, (long)N * kvDimL);
         var vAll = _gpu.View(_bpV!, 0, (long)N * kvDimL);
@@ -2307,7 +2335,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         if (!kvShared)
         {
             GpuMatMulBatched(kAll, _wk[layer], _bpNorm!, N);
-            GpuMatMulBatched(vAll, _wv[layer], _bpNorm!, N);
+            if (kEqV)
+                _gpu.CopyDevice(vAll, kAll);   // V = raw K projection (pre-norm, pre-RoPE)
+            else
+                GpuMatMulBatched(vAll, _wv[layer]!, _bpNorm!, N);
         }
 
         // RoPE and per-head QK-norm must run in the SAME order as the matching per-token
@@ -2325,7 +2356,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             if (!_hasQkNorm || _hp.UseL2QkNorm) return;
             if (!kvShared)
                 _gpu.HeadNormQkBatched(qAll, _wqNorm![layer], kAll, _wkNorm![layer],
-                    _numHeads, _numKvHeads, layerHd, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                    _numHeads, layerKv, layerHd, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             else
                 _gpu.HeadNormBatched(qAll, _wqNorm![layer], _numHeads, layerHd, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
         }
@@ -2337,18 +2368,24 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             {
                 _gpu.RoPEWithFactorsBatched(qAll, startPos, layerHd, ropeTheta, rfTbl, _numHeads, N);
                 if (!kvShared)
-                    _gpu.RoPEWithFactorsBatched(kAll, startPos, layerHd, ropeTheta, rfTbl, _numKvHeads, N);
+                    _gpu.RoPEWithFactorsBatched(kAll, startPos, layerHd, ropeTheta, rfTbl, layerKv, N);
             }
             else
             {
                 _gpu.RoPEPartialBatched(qAll, startPos, layerHd, layerHd, ropeTheta, _numHeads, N, neox: true);
                 if (!kvShared)
-                    _gpu.RoPEPartialBatched(kAll, startPos, layerHd, layerHd, ropeTheta, _numKvHeads, N, neox: true);
+                    _gpu.RoPEPartialBatched(kAll, startPos, layerHd, layerHd, ropeTheta, layerKv, N, neox: true);
             }
         }
 
         // Weighted QK-norm before RoPE for every dense family (issue #157).
         ApplyQkNormBatched();
+        // Gemma 4 12B k_eq_v: V gets a plain per-head RmsNorm (no learned weight) before
+        // the KV cache — mirrors the per-token RunGemma4DeviceRegion + llama.cpp
+        // gemma4.cpp:227. V was copied from the RAW K projection above (pre QK-norm), and
+        // is never RoPE'd. Gated to k_eq_v (12B) models, matching the per-token gate.
+        if (!kvShared && _hp.AttentionKEqV)
+            _gpu.HeadNormPureBatched(vAll, layerKv, layerHd, N, _hp.RmsNormEps);
         ApplyRopeBatched();
 
         if (!kvShared)
@@ -2369,20 +2406,20 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             // #146 single-warp kernel. SHARPI_PREFILL_FLASH_TC1=1 forces single-warp (A/B).
             if (!_forceFlashTc1 && (layerHd & 63) == 0)
                 _gpu.FlashAttentionPrefillTc2(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                    _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
+                    _numHeads, layerKv, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
             else
                 _gpu.FlashAttentionPrefillTc(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                    _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
+                    _numHeads, layerKv, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
         }
         else if (PrefillFlashAttnEnabled)
             _gpu.FlashAttentionPrefill(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                _numHeads, _numKvHeads, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
+                _numHeads, layerKv, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
         else if (isSwa)
             _gpu.AttentionSwaBatched(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                _numHeads, _numKvHeads, layerHd, startPos, window, effLayerCtx, N, attnScale: _attnScale);
+                _numHeads, layerKv, layerHd, startPos, window, effLayerCtx, N, attnScale: _attnScale);
         else
             _gpu.AttentionBatched(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                _numHeads, _numKvHeads, layerHd, startPos, effLayerCtx, N, attnScale: _attnScale);
+                _numHeads, layerKv, layerHd, startPos, effLayerCtx, N, attnScale: _attnScale);
         if (s_prefillProfile) { _gpu.Synchronize(); _profAttnMs += _profSw.Elapsed.TotalMilliseconds; }
 
         GpuMatMulBatched(_bpHidden!, _wo[layer], attnAll, N);
