@@ -2087,16 +2087,24 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         }
         else if (dt == DType.Q4_0)
         {
-            // Issue #124: Gemma 4 12B QAT keeps all bulk matmul weights in Q4_0, which
-            // has no int8 MMQ kernel. Route the trunk matmuls through the dequant→fp16→
-            // cuBLAS GEMM (weight read once per batch) instead of the memory-bound
-            // per-token GEMM-N matvec (re-streams the whole weight once per token — the
-            // dominant large-N prefill cost). Argmax-stable, not byte-exact. Q4_0 blocks
-            // are 32-wide; every Gemma 4 12B hidden dim is a multiple of 32, but fall back
-            // to the matvec path defensively if not.
+            // Issue #124/#173: Gemma 4 12B QAT keeps all bulk matmul weights in Q4_0.
+            // Route the trunk matmuls through a compute-bound path (weight read once per
+            // batch) instead of the memory-bound per-token GEMM-N matvec (re-streams the
+            // whole weight once per token — the dominant large-N prefill cost).
+            // PrefillMmqEnabled: the int8 MMQ reads the weight once as int8 (nibble-
+            // expanded, no fp16 dequant temp to HBM, int8 tensor cores), with the Q4_0
+            // symmetric −8·d_w·Σq centering term. Fallback: dequant→fp16→cuBLAS GEMM.
+            // Argmax-stable, not byte-exact. Q4_0 blocks are 32-wide; every Gemma 4 12B
+            // hidden dim is a multiple of 32, but fall back to the matvec path
+            // defensively if not.
             int cols = (int)(inAll.ElementCount / n);
             if ((cols & 0x1f) == 0)
-                _gpu.MatMulBatchedGemm(outAll, weights, inAll, n, dt);
+            {
+                if (PrefillMmqEnabled)
+                    _gpu.MatMulBatchedMmq(outAll, weights, inAll, n, dt);
+                else
+                    _gpu.MatMulBatchedGemm(outAll, weights, inAll, n, dt);
+            }
             else
                 _gpu.MatMulBatched(outAll, weights, inAll, n, dt);
         }
