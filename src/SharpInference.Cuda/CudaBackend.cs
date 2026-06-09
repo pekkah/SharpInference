@@ -3600,11 +3600,16 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             (nint)(&pSP), (nint)(&pWS), (nint)(&pMSL), (nint)(&pN), (nint)(&pScale)
         };
         uint gy = (uint)((nTok + 15) / 16);
+        // Explicit per-dtype routing — fail loud on an unexpected dtype rather than
+        // silently reinterpreting a narrowed cache through the fp32 kernel (which would
+        // stride 34-B q8_0 blocks as 4-B floats → garbage). fp32 is the only fall-through.
         nint kern = kvCacheType switch
         {
+            DType.Float32  => _flashAttnPrefillTc2Kernel,
             DType.BFloat16 => _flashAttnPrefillTc2Bf16Kernel,
             DType.Q8_0     => _flashAttnPrefillTc2Q8Kernel,
-            _              => _flashAttnPrefillTc2Kernel,
+            _ => throw new ArgumentOutOfRangeException(nameof(kvCacheType), kvCacheType,
+                "FlashAttentionPrefillTc2 supports fp32 / bf16 / q8_0 K/V caches only."),
         };
         int r = NvrtcInterop.LaunchKernel(kern, (uint)numHeads, gy, 1,
                                           (uint)(w * 32), 1, 1, sharedBytes, _stream, args, null);
@@ -5008,8 +5013,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             catch (Exception ex)
             {
                 _imageKernelsAvailable = false;
-                // Log to stderr so the user can see NVRTC failure reason when debugging.
-                Console.Error.WriteLine($"[CudaBackend] NVRTC kernel init failed: {ex.Message}");
+                // Log to stderr so the user can see the NVRTC failure reason when debugging.
+                // Use ToString() not just Message: a GetKernelFunc failure names the specific
+                // kernel that didn't bind (e.g. a typo'd q8_0 thunk), and that name only
+                // survives in the full exception text + stack, not the terse Message.
+                Console.Error.WriteLine($"[CudaBackend] NVRTC kernel init failed: {ex}");
             }
             finally
             {
