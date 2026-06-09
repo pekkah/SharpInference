@@ -2031,10 +2031,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             // within the proven 4096 cap, but extending that past 4096 would silently drop
             // the window. So only chunk past 4096 when either there's a real per-layer SWA
             // pattern or the model has no window at all.
-            // bf16 KV (#179) has no flash/TC kernel yet, so it can't chunk past the 4096
-            // shared-scores cap — prompts beyond it drop to the per-token loop below.
-            bool canChunkPast4096 = PrefillFlashAttnEnabled
-                && _kvDType != DType.BFloat16
+            // Chunking past the 4096 scalar cap needs a streaming (flash) attention path on
+            // every layer. fp32 uses the half2/TC flash kernels; bf16 only has the Tc2 thunk
+            // so far, so it can chunk only when Tc2-bf16 covers all layers (head_dim%64).
+            bool flashCoversAll = _kvDType == DType.BFloat16
+                ? Bf16FlashTc2CoversAllLayers()
+                : PrefillFlashAttnEnabled;
+            bool canChunkPast4096 = flashCoversAll
                 && (_hp.IsSwaLayer is not null || _hp.SlidingWindowSize <= 0);
             int cap = canChunkPast4096 ? _maxSeqLen : 4096;
             if (startPos + N <= cap)
@@ -2102,6 +2105,21 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// these; so do dense Qwen3/Llama-style models (the batched body skips the Gemma-only
     /// PLE / shared-KV / SWA / post-norm steps via their null/flag guards).
     /// </summary>
+    // bf16 KV (#179): true when every layer would take the Tc2-bf16 flash kernel, so the
+    // batched trunk streams K/V and can chunk a prompt past the 4096 scalar cap. Requires
+    // TC flash on (not forced to single-warp) and head_dim % 64 == 0 on every layer.
+    private bool Bf16FlashTc2CoversAllLayers()
+    {
+        if (_kvDType != DType.BFloat16 || !PrefillFlashTcEnabled || _forceFlashTc1) return false;
+        if (_hp.LayerHeadDim is { } lhd)
+        {
+            foreach (int hd in lhd)
+                if ((hd & 63) != 0) return false;
+            return true;
+        }
+        return (_headDim & 63) == 0;
+    }
+
     private bool IsBatchedPrefillSupported()
     {
         // bf16 KV (issue #179): the scalar batched kernels (KvAppendBatchedBf16,
@@ -2529,11 +2547,17 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // Other models pass _attnScale = -1 so the kernel derives 1/sqrt(head_dim).
         if (_kvDType == DType.BFloat16)
         {
-            // bf16 KV (#179): scalar batched path only — the flash/TC kernels read an
-            // fp32 cache (bf16 flash is the 1.5b follow-up). The prefill gate forces
-            // canChunkPast4096=false under bf16, so startPos+N ≤ 4096 here and the
-            // shared-scores kernels always apply.
-            if (isSwa)
+            // bf16 KV (#179). The tensor-core flash kernel (Tc2) has a bf16-cache thunk and
+            // streams K/V, so head_dim%64 layers use it for any length (incl. chunked
+            // prefill past 4096). Other head_dims fall to the scalar batched bf16 kernels,
+            // which the gate keeps ≤4096 (canChunkPast4096 requires Tc2 covers all layers).
+            // The single-warp Tc and half2 flash kernels have no bf16 thunk yet — a trivial
+            // follow-up only a non-%64 head_dim model past 4096 would need.
+            if (PrefillFlashTcEnabled && !_forceFlashTc1 && (layerHd & 63) == 0)
+                _gpu.FlashAttentionPrefillTc2(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
+                    _numHeads, layerKv, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N,
+                    attnScale: _attnScale, bf16Cache: true);
+            else if (isSwa)
                 _gpu.AttentionSwaBatchedBf16(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
                     _numHeads, layerKv, layerHd, startPos, window, effLayerCtx, N, attnScale: _attnScale);
             else

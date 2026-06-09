@@ -287,6 +287,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // Issue #147: multi-warp / d-split TC flash (register-resident O, ~10× the
     // single-warp occupancy). Default TC path when head_dim % 64 == 0.
     private nint   _flashAttnPrefillTc2Kernel;
+    private nint   _flashAttnPrefillTc2Bf16Kernel;   // issue #179
 
     // Grow-only global score scratch for the wave-based >4096 batched-query SDPA
     // (issue #118). Sized W × num_heads × score_stride floats; W is chosen so this
@@ -3555,9 +3556,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// resident (no shared-O rescale) and occupancy rises ~10×. Requires
     /// <paramref name="headDim"/> % 64 == 0 (W·16) and ≤ 512. Argmax-stable, not bit-exact.
     /// </summary>
+    /// <param name="bf16Cache">When true the K/V cache tensors are bf16 (issue #179);
+    /// the bf16-thunk kernel decodes each element to fp32 on load. Same args/shared/grid.</param>
     public void FlashAttentionPrefillTc2(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
         int numHeads, int numKvHeads, int headDim,
-        int startPos, int windowSize, int maxSeqLen, int nTok, float attnScale = -1f)
+        int startPos, int windowSize, int maxSeqLen, int nTok, float attnScale = -1f,
+        bool bf16Cache = false)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
@@ -3582,9 +3586,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             (nint)(&pSP), (nint)(&pWS), (nint)(&pMSL), (nint)(&pN), (nint)(&pScale)
         };
         uint gy = (uint)((nTok + 15) / 16);
-        int r = NvrtcInterop.LaunchKernel(_flashAttnPrefillTc2Kernel, (uint)numHeads, gy, 1,
+        nint kern = bf16Cache ? _flashAttnPrefillTc2Bf16Kernel : _flashAttnPrefillTc2Kernel;
+        int r = NvrtcInterop.LaunchKernel(kern, (uint)numHeads, gy, 1,
                                           (uint)(w * 32), 1, 1, sharedBytes, _stream, args, null);
-        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(flash_attn_prefill_tc2) failed: {r}");
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(flash_attn_prefill_tc2{(bf16Cache ? "_bf16" : "")}) failed: {r}");
     }
 
     /// <summary>
@@ -5020,7 +5025,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _fullSeqAttentionKernel, _fullSeqAttentionBf16Kernel,
             _fullSeqAttentionGlobalKernel, _fullSeqAttentionGlobalBf16Kernel,
             _flashAttnPrefillKernel, _mmaTestM16N8K16Kernel, _flashAttnPrefillTcKernel,
-            _flashAttnPrefillTc2Kernel,
+            _flashAttnPrefillTc2Kernel, _flashAttnPrefillTc2Bf16Kernel,
         ];
         foreach (nint k in kernels)
         {
@@ -5116,6 +5121,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _mmaTestM16N8K16Kernel  = GetKernelFunc("llm_mma_test_m16n8k16_f32");
         _flashAttnPrefillTcKernel = GetKernelFunc("llm_flash_attn_prefill_tc");
         _flashAttnPrefillTc2Kernel = GetKernelFunc("llm_flash_attn_prefill_tc2");
+        _flashAttnPrefillTc2Bf16Kernel = GetKernelFunc("llm_flash_attn_prefill_tc2_bf16");
         _rmsNormBatchedKernel  = GetKernelFunc("llm_rmsnorm_batched");
         _headNormBatchedKernel = GetKernelFunc("llm_head_norm_batched");
         _headNormQkKernel        = GetKernelFunc("llm_head_norm_qk");

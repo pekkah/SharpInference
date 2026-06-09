@@ -162,15 +162,13 @@ public sealed class CudaForwardPassKvDtypeTests
     }
 
     /// <summary>
-    /// Increment 1.5: with bf16 KV, batched prefill must agree with the bf16 per-token
-    /// prefill. This isolates the scalar batched bf16 kernels (KvAppendBatchedBf16,
-    /// AttentionBatchedBf16, AttentionSwaBatchedBf16) + the batched dispatch: both runs
-    /// store bf16 KV, so the only differences are the batched attention algorithm
-    /// (documented bit-identical per (head, token) to the per-token kernel) and the GEMM
-    /// vs matvec trunk matmul — the same gap the fp32 batched path already tolerates.
-    /// The prompt is kept ≤4096 tokens so it stays on the batched path (bf16 can't chunk
-    /// past 4096 until the flash port). Reference is bf16 per-token; candidate is bf16
-    /// batched, teacher-forced onto the reference trajectory.
+    /// Increment 1.5: bf16 batched prefill must match fp32 batched prefill. Both runs use
+    /// the SAME batched path — for head_dim%64 models that's the Tc2 tensor-core flash
+    /// kernel (the bf16 thunk vs the fp32 one), with per-token decode after — so the only
+    /// variable is the KV-cache dtype. This isolates the bf16 flash/scalar batched kernels
+    /// and the dispatch + chunking gate. fp32 is the reference; bf16 is teacher-forced onto
+    /// its trajectory. Tolerances match the per-token argmax-stable test (store-rounding
+    /// budget), since the attention algorithm is identical between the two runs.
     /// </summary>
     private static void AssertBf16BatchedPrefillParity(string filename, string prompt, float maxAbsTol)
     {
@@ -182,23 +180,83 @@ public sealed class CudaForwardPassKvDtypeTests
         const int steps = 6;
         const int ctx = 2048;
 
-        var (pt, ptArgmax) = RunPrefillDecode(gpu, path, "bf16", prompt, steps, ctx, forced: null, batchedPrefill: false);
-        var (bt, _) = RunPrefillDecode(gpu, path, "bf16", prompt, steps, ctx, forced: ptArgmax, batchedPrefill: true);
+        var (f32, f32Argmax) = RunPrefillDecode(gpu, path, "fp32", prompt, steps, ctx, forced: null, batchedPrefill: true);
+        var (bf16, _) = RunPrefillDecode(gpu, path, "bf16", prompt, steps, ctx, forced: f32Argmax, batchedPrefill: true);
 
         for (int p = 0; p <= steps; p++)
         {
-            Assert.Equal(pt[p].Length, bt[p].Length);
+            Assert.Equal(f32[p].Length, bf16[p].Length);
             float maxAbs = 0f;
-            for (int i = 0; i < pt[p].Length; i++)
+            for (int i = 0; i < f32[p].Length; i++)
             {
-                Assert.True(float.IsFinite(bt[p][i]), $"{filename}: non-finite batched-bf16 logit at pos {p}, idx {i}.");
-                maxAbs = Math.Max(maxAbs, Math.Abs(pt[p][i] - bt[p][i]));
+                Assert.True(float.IsFinite(bf16[p][i]), $"{filename}: non-finite batched-bf16 logit at pos {p}, idx {i}.");
+                maxAbs = Math.Max(maxAbs, Math.Abs(f32[p][i] - bf16[p][i]));
             }
             Assert.True(maxAbs < maxAbsTol,
-                $"{filename}: pos {p} batched-bf16 vs per-token-bf16 logit max-abs {maxAbs:F3} exceeds " +
-                $"{maxAbsTol:F1} — the bf16 batched kernels/dispatch diverge from the per-token path.");
-            Assert.True(TopK(bt[p], 5).Contains(ptArgmax[p]),
-                $"{filename}: pos {p} per-token top-1 ({ptArgmax[p]}) fell out of batched-bf16's top-5.");
+                $"{filename}: pos {p} batched bf16-vs-fp32 logit max-abs {maxAbs:F3} exceeds " +
+                $"{maxAbsTol:F1} — the bf16 batched/flash kernels diverge from the fp32 batched path.");
+            Assert.True(TopK(bf16[p], 5).Contains(f32Argmax[p]),
+                $"{filename}: pos {p} fp32 top-1 ({f32Argmax[p]}) fell out of batched-bf16's top-5.");
+        }
+    }
+
+    /// <summary>
+    /// Increment 1.5b: bf16 chunked prefill PAST the 4096 cap must stay argmax-stable vs
+    /// fp32 chunked prefill. A prompt longer than PrefillBatchChunk (4096) forces the chunk
+    /// loop, which for bf16 requires the Tc2 flash thunk on every layer
+    /// (Bf16FlashTc2CoversAllLayers) and exercises the SWA KV ring wrapping across chunk
+    /// boundaries under a bf16 store — the path most likely to hide a ring/index bug.
+    ///
+    /// Unlike the short-prompt tests this asserts the issue's LONG-context bar (coherent +
+    /// argmax-stable), not tight logit parity: bf16-store rounding compounds with sequence
+    /// length and autoregressive depth (observed max-abs grows 2→5 over a 5000-token
+    /// context), so the hard check is top-5 stability at every position plus a loose
+    /// finite/blow-up ceiling. A structural cross-chunk bug would drop top-5 or NaN, not
+    /// nudge logits by a few units.
+    /// </summary>
+    private static void AssertBf16ChunkedPrefillParity(string filename, float maxAbsCeiling)
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath(filename);
+        if (path is null) return;
+
+        const int steps = 4;
+        const int ctx = 6144;           // > 4096 so the prefill chunk loop runs
+        const int promptLen = 5000;     // spans two PrefillBatchChunk windows
+
+        // A long, varied prompt so attention sees a non-degenerate pattern across chunks.
+        using (var model = GgufModel.Open(path))
+        {
+            var tok = GgufTokenizer.FromGgufModel(model);
+            var sb = new System.Text.StringBuilder();
+            const string seed = "The quick brown fox jumps over the lazy dog. " +
+                                "Sphinx of black quartz, judge my vow. " +
+                                "Pack my box with five dozen liquor jugs. ";
+            while (tok.Encode(sb.ToString()).Count < promptLen) sb.Append(seed);
+            string prompt = sb.ToString();
+
+            var (f32, f32Argmax) = RunPrefillDecode(gpu, path, "fp32", prompt, steps, ctx, forced: null, batchedPrefill: true);
+            var (bf16, _) = RunPrefillDecode(gpu, path, "bf16", prompt, steps, ctx, forced: f32Argmax, batchedPrefill: true);
+
+            for (int p = 0; p <= steps; p++)
+            {
+                Assert.Equal(f32[p].Length, bf16[p].Length);
+                float maxAbs = 0f;
+                for (int i = 0; i < f32[p].Length; i++)
+                {
+                    Assert.True(float.IsFinite(bf16[p][i]), $"{filename}: non-finite chunked-bf16 logit at pos {p}, idx {i}.");
+                    maxAbs = Math.Max(maxAbs, Math.Abs(f32[p][i] - bf16[p][i]));
+                }
+                // Hard check: argmax-stable (top-5 overlap). Soft ceiling: catch a blown-up
+                // kernel / NaN, not the expected long-context rounding accumulation.
+                Assert.True(TopK(bf16[p], 5).Contains(f32Argmax[p]),
+                    $"{filename}: pos {p} fp32 top-1 ({f32Argmax[p]}) fell out of chunked-bf16's top-5 " +
+                    $"(max-abs {maxAbs:F3}) — a cross-chunk SWA-ring or Tc2-bf16 divergence.");
+                Assert.True(maxAbs < maxAbsCeiling,
+                    $"{filename}: pos {p} chunked bf16-vs-fp32 logit max-abs {maxAbs:F3} exceeds the " +
+                    $"blow-up ceiling {maxAbsCeiling:F1} — likely a kernel bug, not rounding.");
+            }
         }
     }
 
@@ -250,4 +308,17 @@ public sealed class CudaForwardPassKvDtypeTests
     [Fact]
     public void Gemma4_12B_Bf16BatchedPrefill_MatchesPerToken()
         => AssertBf16BatchedPrefillParity("gemma-4-12b-it-qat-q4_0.gguf", LowEntropyPrompt, maxAbsTol: 8.0f);
+
+    // ── Increment 1.5b: bf16 chunked prefill past 4096 (Tc2 flash + SWA ring) ──
+
+    /// <summary>
+    /// Gemma 4 E4B Q8_0: bf16 Tc2-flash chunked prefill across the SWA ring boundary.
+    /// The budget is wider than the short-prompt tests: bf16-store rounding accumulates
+    /// with sequence length, so a 5000-token prefill diverges more than a ~10-token one
+    /// (observed ~2.1); a structural cross-chunk bug would produce garbage, not ~2. Top-5
+    /// stability is the real argmax-stable check.
+    /// </summary>
+    [Fact]
+    public void Gemma4_E4B_Bf16ChunkedPrefill_MatchesFp32()
+        => AssertBf16ChunkedPrefillParity("gemma-4-E4B-it-Q8_0.gguf", maxAbsCeiling: 25.0f);
 }

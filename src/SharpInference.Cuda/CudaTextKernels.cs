@@ -105,6 +105,13 @@ __device__ __forceinline__ unsigned int sharpi_fp32_to_bf16(float f)
     return (bits >> 16) & 0xFFFFu;
 }
 
+// KV-cache element load (issue #179): one float per element when the cache is fp32,
+// or a bf16 short decoded to fp32 when it's half-width. Overloaded on the pointer
+// type so a single templated kernel body serves both dtypes; the fp32 overload is a
+// plain p[i] (byte-identical to the pre-#179 kernels).
+__device__ __forceinline__ float sharpi_kvload(const float* __restrict__ p, long i) { return p[i]; }
+__device__ __forceinline__ float sharpi_kvload(const unsigned short* __restrict__ p, long i) { return sharpi_bf16_to_fp32((unsigned int)p[i]); }
+
 // Read one byte from a uint32-stride buffer at absolute byte offset B.
 __device__ __forceinline__ unsigned int sharpi_byte_at(const unsigned int* __restrict__ buf, long B)
 {
@@ -5921,10 +5928,15 @@ extern ""C"" __global__ void llm_flash_attn_prefill_tc(
 // head_dim % (W·16) == 0. Shared = 16·head_dim·2 (K/V fp16) + W·256·4 (S) B.
 #define FATC2_W 4
 #define FATC2_KT 16
-extern ""C"" __global__ void llm_flash_attn_prefill_tc2(
+// Issue #179: templated K/V dtype (KV = float for the fp32 cache, unsigned short for
+// the bf16 cache). The body is unchanged bar the two cache-load sites, which go
+// through sharpi_kvload — so the float instantiation is byte-identical to the
+// pre-#179 kernel. Two extern ""C"" thunks below give NVRTC stable entry points.
+template<typename KV>
+__device__ __forceinline__ void sharpi_flash_attn_prefill_tc2_impl(
     const float* __restrict__ q_all,
-    const float* __restrict__ k_cache,
-    const float* __restrict__ v_cache,
+    const KV* __restrict__ k_cache,
+    const KV* __restrict__ v_cache,
     float* __restrict__ out_all,
     int num_heads, int num_kv_heads, int head_dim,
     int start_pos, int window_size, int max_seq_len, int n_tok, float attn_scale)
@@ -5979,7 +5991,7 @@ extern ""C"" __global__ void llm_flash_attn_prefill_tc2(
             // Cache read at ring slot `abs_k % max_seq_len` (identity for a full cache,
             // wraps a window-sized SWA ring); abs_k stays logical for the causal bound.
             float kv = (abs_k < key_end)
-                ? k_cache[(long)(abs_k % max_seq_len) * kv_dim + (long)kv_head * head_dim + d] : 0.f;
+                ? sharpi_kvload(k_cache, (long)(abs_k % max_seq_len) * kv_dim + (long)kv_head * head_dim + d) : 0.f;
             sKV[idx] = (unsigned short)sharpi_fp32_to_fp16(kv);
         }
         __syncthreads();
@@ -6090,7 +6102,7 @@ extern ""C"" __global__ void llm_flash_attn_prefill_tc2(
             int kk = idx / head_dim, d = idx - kk * head_dim;
             int abs_k = kt0 + kk;
             float vv = (abs_k < key_end)
-                ? v_cache[(long)(abs_k % max_seq_len) * kv_dim + (long)kv_head * head_dim + d] : 0.f;
+                ? sharpi_kvload(v_cache, (long)(abs_k % max_seq_len) * kv_dim + (long)kv_head * head_dim + d) : 0.f;
             sKV[idx] = (unsigned short)sharpi_fp32_to_fp16(vv);
         }
         __syncthreads();
@@ -6134,6 +6146,32 @@ extern ""C"" __global__ void llm_flash_attn_prefill_tc2(
 }
 #undef FATC2_W
 #undef FATC2_KT
+
+// fp32-cache and bf16-cache entry points (issue #179). The fp32 thunk is the
+// original #147 kernel; the bf16 thunk reads a half-width K/V cache.
+extern ""C"" __global__ void llm_flash_attn_prefill_tc2(
+    const float* __restrict__ q_all,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ out_all,
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int window_size, int max_seq_len, int n_tok, float attn_scale)
+{
+    sharpi_flash_attn_prefill_tc2_impl<float>(q_all, k_cache, v_cache, out_all,
+        num_heads, num_kv_heads, head_dim, start_pos, window_size, max_seq_len, n_tok, attn_scale);
+}
+
+extern ""C"" __global__ void llm_flash_attn_prefill_tc2_bf16(
+    const float* __restrict__ q_all,
+    const unsigned short* __restrict__ k_cache,
+    const unsigned short* __restrict__ v_cache,
+    float* __restrict__ out_all,
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int window_size, int max_seq_len, int n_tok, float attn_scale)
+{
+    sharpi_flash_attn_prefill_tc2_impl<unsigned short>(q_all, k_cache, v_cache, out_all,
+        num_heads, num_kv_heads, head_dim, start_pos, window_size, max_seq_len, n_tok, attn_scale);
+}
 
 // ── Flash-attention prefill (issue #141 attention) ─────────────────────────
 // Memory-efficient batched SDPA replacing the scalar llm_full_seq_attention /
