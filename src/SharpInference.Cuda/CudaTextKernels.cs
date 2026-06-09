@@ -672,7 +672,12 @@ __device__ __forceinline__ void sharpi_q8_append_one(
     a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a,  2));
     a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a,  1));
     float d    = a / 127.f;
-    float invd = (d == 0.f) ? 0.f : (1.f / d);
+    // Threshold (not d==0): if the whole sub-block is subnormal-small, d is a subnormal,
+    // 1/d overflows to +inf, and a zero lane's 0*inf = NaN → (int)NaN clamps to -127
+    // instead of 0. 1e-30 is far below any real KV scale (d ≈ amax/127 ≈ 1e-3..1e-1) yet
+    // above the subnormal danger zone, so real blocks are unaffected; an all-near-zero
+    // block quantizes to all-zeros, which is correct to within its negligible magnitude.
+    float invd = (d < 1e-30f) ? 0.f : (1.f / d);
     int   q    = (int)rintf(val * invd);
     if (q >  127) q =  127;
     if (q < -127) q = -127;
