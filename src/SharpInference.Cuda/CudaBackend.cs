@@ -220,6 +220,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // softcap. Kernel work only — forward-pass wiring lands in Phase 8.
     private nint   _attentionSwaKernel;
     private nint   _attentionSwaBatchedKernel;
+    private nint   _attentionSwaBf16Kernel;        // issue #179
+    private nint   _attentionSwaBatchedBf16Kernel; // issue #179
     private nint   _geluTanhMulKernel;
     private nint   _geluTanhMulStridedKernel;
     private nint   _softcapKernel;
@@ -3611,6 +3613,14 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         uint grid = (uint)((kvDim + 255) / 256);
         int r = NvrtcInterop.LaunchKernel(_kvAppendBf16Kernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kv_append_bf16) failed: {r}");
+
+        if (_graphCapturing)
+        {
+            Span<nint> av = stackalloc nint[7];
+            av[0] = kPtr; av[1] = vPtr; av[2] = kcP; av[3] = vcP;
+            av[4] = pKD; av[5] = pPos; av[6] = pMSL;
+            TrackPositionNode(_kvAppendBf16Kernel, grid, 1, 1, 256, 1, 1, 0, av, [(5, GraphPosKind.Position, 0)]);
+        }
     }
 
     /// <summary>
@@ -3619,9 +3629,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// fp32. Arithmetic precision matches the fp32 kernel — only the cache
     /// footprint changes.
     /// </summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
     public void AttentionBf16(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
                               Tensor? scoresScratch,
-                              int numHeads, int numKvHeads, int headDim, int seqLen, int maxSeqLen)
+                              int numHeads, int numKvHeads, int headDim, int seqLen, int maxSeqLen,
+                              float attnScale = -1f)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
@@ -3633,15 +3645,109 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         nint oP = GetDevPtr(output);
         nint ssP = scoresScratch is { } sv ? GetDevPtr(sv) : nint.Zero;
         int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pSL = seqLen, pMSL = maxSeqLen;
-        nint* args = stackalloc nint[10]
+        float pScale = attnScale;
+        nint* args = stackalloc nint[11]
         {
             (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
             (nint)(&ssP),
             (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
-            (nint)(&pSL), (nint)(&pMSL)
+            (nint)(&pSL), (nint)(&pMSL), (nint)(&pScale)
         };
         int r = NvrtcInterop.LaunchKernel(_attentionBf16Kernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_bf16) failed: {r}");
+
+        if (_graphCapturing)
+        {
+            Span<nint> av = stackalloc nint[11];
+            av[0] = qP; av[1] = kP; av[2] = vP; av[3] = oP; av[4] = ssP;
+            av[5] = pNH; av[6] = pNKV; av[7] = pHD; av[8] = pSL; av[9] = pMSL;
+            av[10] = GraphFloatBits(pScale);
+            TrackPositionNode(_attentionBf16Kernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, av,
+                [(8, GraphPosKind.PositionPlus1, 0)]);
+        }
+    }
+
+    /// <summary>
+    /// Bf16-read variant of <see cref="AttentionSwa"/> (issue #179). K/V cache
+    /// tensors must be <see cref="DType.BFloat16"/>; query, output, and score
+    /// scratch stay fp32. Same SWA ring, GQA, per-layer head_dim, and graph-capture
+    /// position tracking as the fp32 kernel — only the cache footprint is halved.
+    /// </summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
+    public void AttentionSwaBf16(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+                                 Tensor? scoresScratch,
+                                 int position, int windowSize, int headDim,
+                                 int numHeads, int numKvHeads, int maxSeqLen,
+                                 float attnScale = -1f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        int windowEnd   = position + 1;
+        int windowStart = windowEnd - windowSize;
+        if (windowStart < 0) windowStart = 0;
+
+        nint qP = GetDevPtr(q);
+        nint kP = GetDevPtr(kCache);
+        nint vP = GetDevPtr(vCache);
+        nint oP = GetDevPtr(output);
+        nint ssP = scoresScratch is { } sv ? GetDevPtr(sv) : nint.Zero;
+        int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim;
+        int  pWS = windowStart, pWE = windowEnd, pMSL = maxSeqLen;
+        float pScale = attnScale;
+        nint* args = stackalloc nint[12]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
+            (nint)(&ssP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pWS), (nint)(&pWE), (nint)(&pMSL), (nint)(&pScale)
+        };
+        int r = NvrtcInterop.LaunchKernel(_attentionSwaBf16Kernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_swa_bf16) failed: {r}");
+
+        if (_graphCapturing)
+        {
+            Span<nint> av = stackalloc nint[12];
+            av[0] = qP; av[1] = kP; av[2] = vP; av[3] = oP; av[4] = ssP;
+            av[5] = pNH; av[6] = pNKV; av[7] = pHD;
+            av[8] = pWS; av[9] = pWE; av[10] = pMSL; av[11] = GraphFloatBits(pScale);
+            TrackPositionNode(_attentionSwaBf16Kernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, av,
+                [(8, GraphPosKind.SwaWindowStart, windowSize), (9, GraphPosKind.SwaWindowEnd, 0)]);
+        }
+    }
+
+    /// <summary>
+    /// Bf16-read variant of <see cref="AttentionSwaBatched"/> (issue #179). K/V cache
+    /// tensors must be <see cref="DType.BFloat16"/>. Same windowSize ≤ 4096
+    /// shared-scores constraint; bit-identical per (head, token) to the per-token
+    /// <see cref="AttentionSwaBf16"/> (modulo bf16 store rounding).
+    /// </summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
+    public void AttentionSwaBatchedBf16(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
+        int numHeads, int numKvHeads, int headDim,
+        int startPos, int windowSize, int maxSeqLen, int nTok, float attnScale = -1f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (windowSize <= 0 || windowSize > 4096)
+            throw new ArgumentException(
+                $"AttentionSwaBatchedBf16 requires 0 < windowSize ≤ 4096 (shared-scores path); got {windowSize}.",
+                nameof(windowSize));
+
+        nint qP = GetDevPtr(qAll), kP = GetDevPtr(kCache), vP = GetDevPtr(vCache), oP = GetDevPtr(outAll);
+        int pNH = numHeads, pNKV = numKvHeads, pHD = headDim;
+        int pSP = startPos, pWS = windowSize, pMSL = maxSeqLen, pN = nTok;
+        float pScale = attnScale;
+        nint* args = stackalloc nint[12]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pSP), (nint)(&pWS), (nint)(&pMSL), (nint)(&pN), (nint)(&pScale)
+        };
+        int r = NvrtcInterop.LaunchKernel(_attentionSwaBatchedBf16Kernel, (uint)numHeads, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_swa_batched_bf16) failed: {r}");
     }
 
     // ── Issue #114-B: batched prompt-prefill SDPA ──────────────────────────
@@ -4897,6 +5003,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _rmsNormBatchedKernel, _headNormBatchedKernel, _headNormQkKernel, _headNormQkBatchedKernel,
             _splitQgBatchedKernel, _ropeNeoxPartialBatchedKernel,
             _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel, _attentionSwaBatchedKernel,
+            _attentionSwaBf16Kernel, _attentionSwaBatchedBf16Kernel,
             _geluTanhMulKernel, _geluTanhMulStridedKernel, _softcapKernel,
             _clearF32Kernel, _quantizeQ81Kernel,
             _scaleRowsKernel, _moeWeightedReduceKernel,
@@ -5016,6 +5123,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _attentionBf16Kernel   = GetKernelFunc("llm_attention_bf16");
         _attentionSwaKernel    = GetKernelFunc("llm_attention_swa");
         _attentionSwaBatchedKernel = GetKernelFunc("llm_attention_swa_batched");
+        _attentionSwaBf16Kernel = GetKernelFunc("llm_attention_swa_bf16");
+        _attentionSwaBatchedBf16Kernel = GetKernelFunc("llm_attention_swa_batched_bf16");
         _geluTanhMulKernel     = GetKernelFunc("llm_gelu_tanh_mul");
         _geluTanhMulStridedKernel = GetKernelFunc("llm_gelu_tanh_mul_strided");
         _softcapKernel         = GetKernelFunc("llm_softcap_inplace");

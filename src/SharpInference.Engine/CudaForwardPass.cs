@@ -103,6 +103,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private readonly Tensor[] _gpuKCache;
     private readonly Tensor[] _gpuVCache;
 
+    // KV-cache element dtype (issue #179). F32 (default) or BFloat16 — the latter
+    // halves the cache footprint to unlock long context on a 12 GB card. Arithmetic
+    // stays fp32 in the kernels; only the *store* is narrowed, so decode is
+    // argmax-stable vs fp32 KV. bf16 is rejected up front when composed with
+    // TurboQuant or explicit SnapKV (see constructor); auto-SnapKV is disabled under
+    // bf16. Set via SHARPI_KV_DTYPE=bf16. Mirrors CudaHybridGdnForwardPass (#27).
+    private readonly DType _kvDType;
+
     // Layers whose K/V buffers ALIAS another layer's pages (Gemma 4 shared_kv_layers
     // tail). Dispose must skip Free() for any handle that is shared with another
     // layer to avoid a double free / use-after-free. Empty for non-gemma4 models.
@@ -206,6 +214,60 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// </summary>
     private static int SwaRingSize(int maxSeqLen, int window) =>
         (int)Math.Min(maxSeqLen, (long)window + SwaRingHeadroom);
+
+    // ── Per-token KV-dtype dispatch (issue #179) ───────────────────────────
+    // Route the per-token decode/prefill KV kernels to their bf16-cache variants
+    // when SHARPI_KV_DTYPE=bf16. Arithmetic is identical to the fp32 kernels; only
+    // the cache load/store is narrowed. Used by every per-token Forward path
+    // (gemma4 + dense, plain + profiled) and the per-token prefill fallback.
+    private void KvAppendKv(Tensor k, Tensor v, Tensor kCache, Tensor vCache,
+                            int kvDim, int position, int maxSeqLen)
+    {
+        if (_kvDType == DType.BFloat16)
+            _gpu.KvAppendBf16(k, v, kCache, vCache, kvDim, position, maxSeqLen);
+        else
+            _gpu.KvAppend(k, v, kCache, vCache, kvDim, position, maxSeqLen);
+    }
+
+    private void AttentionKv(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+                             Tensor? scoresScratch,
+                             int numHeads, int numKvHeads, int headDim, int seqLen, int maxSeqLen,
+                             float attnScale = -1f)
+    {
+        if (_kvDType == DType.BFloat16)
+            _gpu.AttentionBf16(q, kCache, vCache, output, scoresScratch,
+                numHeads, numKvHeads, headDim, seqLen, maxSeqLen, attnScale);
+        else
+            _gpu.Attention(q, kCache, vCache, output, scoresScratch,
+                numHeads, numKvHeads, headDim, seqLen, maxSeqLen, attnScale);
+    }
+
+    private void AttentionSwaKv(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+                                Tensor? scoresScratch,
+                                int position, int windowSize, int headDim,
+                                int numHeads, int numKvHeads, int maxSeqLen,
+                                float attnScale = -1f)
+    {
+        if (_kvDType == DType.BFloat16)
+            _gpu.AttentionSwaBf16(q, kCache, vCache, output, scoresScratch,
+                position, windowSize, headDim, numHeads, numKvHeads, maxSeqLen, attnScale);
+        else
+            _gpu.AttentionSwa(q, kCache, vCache, output, scoresScratch,
+                position, windowSize, headDim, numHeads, numKvHeads, maxSeqLen, attnScale);
+    }
+
+    // SHARPI_KV_DTYPE — issue #179. F32 (default on the dense path; bf16 is opt-in
+    // until long-context validated) or BFloat16 (half-footprint KV). Anything else
+    // is rejected so a typo doesn't silently fall back. Mirrors the GDN path's parser
+    // (#27) but defaults to fp32 here rather than bf16.
+    private static DType ParseKvDType(string? envValue) => envValue?.Trim().ToLowerInvariant() switch
+    {
+        null or ""    => DType.Float32,
+        "fp32"        => DType.Float32,
+        "bf16"        => DType.BFloat16,
+        var other     => throw new ArgumentException(
+            $"SHARPI_KV_DTYPE must be 'bf16' or 'fp32' (got '{other}').", nameof(envValue)),
+    };
 
     /// <summary>
     /// Issue #141: route Q8_0 trunk matmuls in the batched prefill through the
@@ -430,11 +492,26 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // TurboQuant requires per-block ring bookkeeping that doesn't yet exist
         // (issue #60); explicit opt-in + TQ is rejected up front, and the auto
         // path stays disabled when TQ is on.
+        // KV-cache dtype (issue #179). bf16 narrows the store to half the footprint;
+        // it composes with neither TurboQuant (its own quantized ring) nor SnapKV
+        // physical compaction (no bf16 compact kernel wired on this path yet), so both
+        // are rejected up front and auto-SnapKV is disabled under bf16 below.
+        _kvDType = ParseKvDType(Environment.GetEnvironmentVariable("SHARPI_KV_DTYPE"));
+        if (_kvDType == DType.BFloat16 && _tqEnabled)
+            throw new NotSupportedException(
+                "SHARPI_KV_DTYPE=bf16 + TurboQuant is not supported (TQ owns the KV " +
+                "quantization). Use one or the other (issue #179).");
+
         _snapKvCfg = SnapKvConfig.FromEnvironment();
         if (_tqEnabled && _snapKvCfg.IsBudgetExplicit && _snapKvCfg.Budget > 0)
             throw new NotSupportedException(
                 "SnapKV + TurboQuant composition is not yet implemented (issue #60). " +
                 "Set SHARPI_SNAPKV_BUDGET=0 to disable or disable --tq.");
+        if (_kvDType == DType.BFloat16 && _snapKvCfg.IsBudgetExplicit && _snapKvCfg.Budget > 0)
+            throw new NotSupportedException(
+                "SHARPI_KV_DTYPE=bf16 + SnapKV is not yet implemented (bf16 physical " +
+                "compaction kernel not wired on the dense path; issue #179). " +
+                "Set SHARPI_SNAPKV_BUDGET=0 to disable SnapKV.");
         if (_snapKvCfg.IsBudgetExplicit)
         {
             _snapKvEffectiveBudget = _snapKvCfg.Budget;
@@ -443,6 +520,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         {
             // SnapKV stacking on the TQ ring buffer needs separate design — see #60.
             // Defer auto-enable.
+            _snapKvEffectiveBudget = 0;
+        }
+        else if (_kvDType == DType.BFloat16)
+        {
+            // bf16 already halves the KV footprint — the memory win SnapKV auto-enable
+            // chases — and the bf16 physical-compaction kernel isn't wired here yet
+            // (#179). Don't auto-enable eviction on top of the narrowed store.
             _snapKvEffectiveBudget = 0;
         }
         else
@@ -475,7 +559,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             _snapKvEffectiveBudget = 0;
         }
 
-        Console.Error.WriteLine($"[CudaForwardPass] Context size: {_maxSeqLen} (model max: {hp.ContextLength}){(_tqEnabled ? " [TQ3]" : "")}");
+        Console.Error.WriteLine($"[CudaForwardPass] Context size: {_maxSeqLen} (model max: {hp.ContextLength}){(_tqEnabled ? " [TQ3]" : "")}{(_kvDType == DType.BFloat16 ? " [KV bf16]" : "")}");
 
         bool vramTrace = Environment.GetEnvironmentVariable("SHARPI_TRACE_VRAM") == "1";
         void TraceVram(string label)
@@ -591,8 +675,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 int layerCtx = (perLayerKv && hp.IsSwaLayer is { } swa && swa[i])
                     ? SwaRingSize(_maxSeqLen, swaWindow)
                     : _maxSeqLen;
-                _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)layerCtx * layerKvDim));
-                _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)layerCtx * layerKvDim));
+                _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)layerCtx * layerKvDim), _kvDType);
+                _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)layerCtx * layerKvDim), _kvDType);
             }
         }
 
@@ -1143,8 +1227,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 // `position - _kvEvictedCount` (= position when nothing was evicted), and
                 // attention reads that many + 1. RoPE above still uses the logical position.
                 int kvSlot = position - _kvEvictedCount;
-                _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer], kvDim, kvSlot, _maxSeqLen);
-                _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                KvAppendKv(_k, _v, _gpuKCache[layer], _gpuVCache[layer], kvDim, kvSlot, _maxSeqLen);
+                AttentionKv(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
                     _attnScoresScratch,
                     _numHeads, _numKvHeads, _headDim, kvSlot + 1, _maxSeqLen);
             }
@@ -1420,7 +1504,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 int layerCtx = isSwa && _hp.SlidingWindowSize > 0
                     ? SwaRingSize(_maxSeqLen, _hp.SlidingWindowSize)
                     : _maxSeqLen;
-                _gpu.KvAppend(kView, vView, _gpuKCache[layer], _gpuVCache[layer],
+                KvAppendKv(kView, vView, _gpuKCache[layer], _gpuVCache[layer],
                     kvDimL, position, layerCtx);
             }
 
@@ -1435,14 +1519,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             // prescale round-trip, and dropping a ScaleInPlace launch per layer.
             if (isSwa)
             {
-                _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
+                AttentionSwaKv(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                     _attnScoresScratch,
                     position, _hp.SlidingWindowSize, layerHd,
                     _numHeads, layerKv, effLayerCtx, attnScale: 1f);
             }
             else
             {
-                _gpu.Attention(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
+                AttentionKv(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                     _attnScoresScratch,
                     _numHeads, layerKv, layerHd, position + 1, effLayerCtx, attnScale: 1f);
             }
@@ -1685,8 +1769,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             // Physical KV slot (= position unless SnapKV compacted the cache). See the
             // matching note in Forward.
             int kvSlot = position - _kvEvictedCount;
-            _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer], kvDim, kvSlot, _maxSeqLen);
-            _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+            KvAppendKv(_k, _v, _gpuKCache[layer], _gpuVCache[layer], kvDim, kvSlot, _maxSeqLen);
+            AttentionKv(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
                 _attnScoresScratch,
                 _numHeads, _numKvHeads, _headDim, kvSlot + 1, _maxSeqLen);
             _gpu.Synchronize();
@@ -1815,18 +1899,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 int layerCtx = isSwa && _hp.SlidingWindowSize > 0
                     ? SwaRingSize(_maxSeqLen, _hp.SlidingWindowSize)
                     : _maxSeqLen;
-                _gpu.KvAppend(kView, vView, _gpuKCache[layer], _gpuVCache[layer], kvDimL, position, layerCtx);
+                KvAppendKv(kView, vView, _gpuKCache[layer], _gpuVCache[layer], kvDimL, position, layerCtx);
             }
             int effLayerCtx = (_hp.IsSwaLayer is { } swaEff && swaEff[effLayer]
                               && _hp.SlidingWindowSize > 0)
                 ? SwaRingSize(_maxSeqLen, _hp.SlidingWindowSize)
                 : _maxSeqLen;
             if (isSwa)
-                _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
+                AttentionSwaKv(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                     _attnScoresScratch, position, _hp.SlidingWindowSize, layerHd,
                     _numHeads, layerKv, effLayerCtx, attnScale: 1f);
             else
-                _gpu.Attention(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
+                AttentionKv(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                     _attnScoresScratch, _numHeads, layerKv, layerHd, position + 1, effLayerCtx, attnScale: 1f);
             _gpu.Synchronize();
             AccPhase(PH_KV_ATTN, sw, ref t0);
@@ -2017,6 +2101,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// </summary>
     private bool IsBatchedPrefillSupported()
     {
+        // bf16 KV (issue #179): the batched/flash prefill kernels (FlashAttentionPrefill*,
+        // AttentionBatched, AttentionSwaBatched) read an fp32 cache. bf16-cache flash/TC
+        // prefill is a follow-up; until then bf16 prefill uses the per-token loop, which
+        // routes through the bf16-aware KvAppend/Attention/AttentionSwa kernels.
+        if (_kvDType == DType.BFloat16) return false;
         if (_isMoE || _tqEnabled || _hasAttnBias || !_hp.IsNeoxRope) return false;
         if (_hasQkNorm && _hp.UseL2QkNorm) return false;
 

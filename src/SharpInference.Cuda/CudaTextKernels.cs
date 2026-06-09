@@ -6376,6 +6376,193 @@ extern ""C"" __global__ void llm_attention_swa_batched(
     }
 }
 
+// ── Sliding-window attention, bf16 K/V cache (issues #179 + #27) ────────────
+// Bf16-store variant of `llm_attention_swa`. K/V cache is read as bfloat16
+// (raw unsigned short, decoded via sharpi_bf16_to_fp32) at the dot/weighted-sum
+// read points; q, out, score scratch, and all softmax arithmetic stay fp32, so
+// precision matches the fp32 SWA kernel and only the cache footprint is halved.
+// Preserves the SWA ring (`abs_t % max_seq_len`) and Gemma 4's attn_scale=1.0.
+extern ""C"" __global__ void llm_attention_swa_bf16(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_cache,
+    const unsigned short* __restrict__ v_cache,
+    float* __restrict__ out,
+    float* __restrict__ scores_scratch,    // [num_heads * max_seq_len], null when eff_seq ≤ MAX_STORED_SCORES
+    int num_heads, int num_kv_heads, int head_dim,
+    int window_start, int window_end, int max_seq_len, float attn_scale)
+{
+    const int MAX_STORED_SCORES = 4096;
+    __shared__ float shared_scores[MAX_STORED_SCORES];
+    __shared__ float sdata[256];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int h = blockIdx.x;
+    if ((int)h >= num_heads) return;
+
+    int kv_head = (int)h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
+    long q_off  = (long)h * (long)head_dim;
+    long out_off = q_off;
+
+    int eff_seq = window_end - window_start;
+    if (eff_seq <= 0) return;
+    bool use_shared = (eff_seq <= MAX_STORED_SCORES);
+    float* head_scratch = scores_scratch + (long)h * (long)max_seq_len;
+
+    for (int t = (int)tid; t < eff_seq; t += 256) {
+        int abs_t = t + window_start;
+        float dot = 0.f;
+        long k_off = (long)(abs_t % max_seq_len) * (long)kv_dim + (long)kv_head * (long)head_dim;
+        for (int d = 0; d < head_dim; d++)
+            dot += q[q_off + d] * sharpi_bf16_to_fp32((unsigned int)k_cache[k_off + d]);
+        float score = dot * scale;
+        if (use_shared) shared_scores[t] = score;
+        else            head_scratch[t]  = score;
+    }
+    if (use_shared) {
+        for (int t = eff_seq + (int)tid; t < MAX_STORED_SCORES; t += 256)
+            shared_scores[t] = sharpi_neg_inf();
+    }
+    __syncthreads();
+
+    float local_max = sharpi_neg_inf();
+    for (int t = (int)tid; t < eff_seq; t += 256) {
+        float s = use_shared ? shared_scores[t] : head_scratch[t];
+        local_max = fmaxf(local_max, s);
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
+
+    float local_sum = 0.f;
+    for (int t = (int)tid; t < eff_seq; t += 256) {
+        float s = use_shared ? shared_scores[t] : head_scratch[t];
+        float e = __expf(s - max_val);
+        if (use_shared) shared_scores[t] = e;
+        else            head_scratch[t]  = e;
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+    __syncthreads();
+
+    for (int t = (int)tid; t < eff_seq; t += 256) {
+        if (use_shared) shared_scores[t] *= inv_sum;
+        else            head_scratch[t]  *= inv_sum;
+    }
+    __syncthreads();
+
+    for (int d = (int)tid; d < head_dim; d += 256) {
+        float acc = 0.f;
+        for (int t = 0; t < eff_seq; t++) {
+            int abs_t = t + window_start;
+            float weight = use_shared ? shared_scores[t] : head_scratch[t];
+            long v_off = (long)(abs_t % max_seq_len) * (long)kv_dim + (long)kv_head * (long)head_dim;
+            acc += weight * sharpi_bf16_to_fp32((unsigned int)v_cache[v_off + d]);
+        }
+        out[out_off + d] = acc;
+    }
+}
+
+// ── Batched sliding-window attention, bf16 K/V cache (issues #179 + #27) ────
+// Bf16-store variant of `llm_attention_swa_batched`. One 256-thread block per
+// (head, query); K/V read as bf16, all arithmetic fp32. Bit-identical (modulo
+// the bf16 store rounding) to the per-token llm_attention_swa_bf16.
+extern ""C"" __global__ void llm_attention_swa_batched_bf16(
+    const float* __restrict__ q_all,      // [n_tok, num_heads*head_dim]
+    const unsigned short* __restrict__ k_cache,
+    const unsigned short* __restrict__ v_cache,
+    float* __restrict__ out_all,          // [n_tok, num_heads*head_dim]
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int window_size, int max_seq_len, int n_tok, float attn_scale)
+{
+    const int MAX_STORED_SCORES = 4096;
+    __shared__ float shared_scores[MAX_STORED_SCORES];
+    __shared__ float sdata[256];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int h = blockIdx.x;
+    int i = (int)blockIdx.y;
+    if ((int)h >= num_heads || i >= n_tok) return;
+
+    int window_end = start_pos + i + 1;
+    int window_start = window_end - window_size;
+    if (window_start < 0) window_start = 0;
+    int eff_seq = window_end - window_start;
+    if (eff_seq <= 0) return;
+
+    int kv_head = (int)h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
+    int q_dim = num_heads * head_dim;
+    const float* q = q_all + (long)i * q_dim;
+    float* out = out_all + (long)i * q_dim;
+    long q_off = (long)h * (long)head_dim;
+    long out_off = q_off;
+
+    for (int t = (int)tid; t < eff_seq; t += 256) {
+        int abs_t = t + window_start;
+        float dot = 0.f;
+        long k_off = (long)(abs_t % max_seq_len) * (long)kv_dim + (long)kv_head * (long)head_dim;
+        for (int dd = 0; dd < head_dim; dd++)
+            dot += q[q_off + dd] * sharpi_bf16_to_fp32((unsigned int)k_cache[k_off + dd]);
+        shared_scores[t] = dot * scale;
+    }
+    __syncthreads();
+
+    float local_max = sharpi_neg_inf();
+    for (int t = (int)tid; t < eff_seq; t += 256)
+        local_max = fmaxf(local_max, shared_scores[t]);
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
+
+    float local_sum = 0.f;
+    for (int t = (int)tid; t < eff_seq; t += 256) {
+        float ev = __expf(shared_scores[t] - max_val);
+        shared_scores[t] = ev;
+        local_sum += ev;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+    __syncthreads();
+
+    for (int t = (int)tid; t < eff_seq; t += 256)
+        shared_scores[t] *= inv_sum;
+    __syncthreads();
+
+    for (int dd = (int)tid; dd < head_dim; dd += 256) {
+        float acc = 0.f;
+        for (int t = 0; t < eff_seq; t++) {
+            int abs_t = t + window_start;
+            long v_off = (long)(abs_t % max_seq_len) * (long)kv_dim + (long)kv_head * (long)head_dim;
+            acc += shared_scores[t] * sharpi_bf16_to_fp32((unsigned int)v_cache[v_off + dd]);
+        }
+        out[out_off + dd] = acc;
+    }
+}
+
 // ── Scaled dot-product attention with GQA (bf16 K/V cache) ─────────────────
 // Bit-for-bit copy of `llm_attention` except K/V cache is read as bfloat16
 // (stored as raw unsigned short, decoded via sharpi_bf16_to_fp32). Score
@@ -6390,7 +6577,7 @@ extern ""C"" __global__ void llm_attention_bf16(
     float* __restrict__ out,
     float* __restrict__ scores_scratch,
     int num_heads, int num_kv_heads, int head_dim,
-    int seq_len, int max_seq_len)
+    int seq_len, int max_seq_len, float attn_scale)
 {
     const int MAX_STORED_SCORES = 4096;
     __shared__ float shared_scores[MAX_STORED_SCORES];
@@ -6402,7 +6589,8 @@ extern ""C"" __global__ void llm_attention_bf16(
 
     int kv_head = (int)h / (num_heads / num_kv_heads);
     int kv_dim  = num_kv_heads * head_dim;
-    float scale = rsqrtf((float)head_dim);
+    // attn_scale > 0 overrides (Gemma 4 passes 1.0); ≤0 uses 1/sqrt(head_dim).
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
     long q_off  = (long)h * (long)head_dim;
     long out_off = q_off;
 
