@@ -485,7 +485,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             // and a triple-pass recompute path above that. No per-context allocation cap.
         }
 
-        _kvCache = new KvCache(hp.NumLayers, _maxSeqLen, hp.NumKvHeads, hp.HeadDim);
+        // Bookkeeping-only: the actual KV lives in VRAM (_gpuKCache/_gpuVCache); this host
+        // object tracks only the position counter (Length/TruncateTo/Reset). Allocating the
+        // full host K/V buffers here is pure waste — numLayers × maxSeqLen × kvDim × 2 floats
+        // is tens of GB at long context and OOMs the host before VRAM is the limit (#179).
+        _kvCache = KvCache.CreateBookkeepingOnly(hp.NumLayers, _maxSeqLen, hp.NumKvHeads, hp.HeadDim);
 
         // SnapKV (issue #59) — gated by SHARPI_SNAPKV_BUDGET. Buffers are lazily
         // allocated on the first active prefill in Prefill(). Composition with

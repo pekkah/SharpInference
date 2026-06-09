@@ -18,13 +18,22 @@ public sealed unsafe class KvCache : IDisposable
     private int _length;
     private bool _disposed;
 
+    private readonly bool _bookkeepingOnly;
+
     public KvCache(int numLayers, int maxSeqLen, int numKvHeads, int headDim)
+        : this(numLayers, maxSeqLen, numKvHeads, headDim, allocateBuffers: true)
+    {
+    }
+
+    private KvCache(int numLayers, int maxSeqLen, int numKvHeads, int headDim, bool allocateBuffers)
     {
         _numLayers = numLayers;
         _maxSeqLen = maxSeqLen;
         _kvDim = numKvHeads * headDim;
+        _bookkeepingOnly = !allocateBuffers;
         _keys = new float*[numLayers];
         _values = new float*[numLayers];
+        if (!allocateBuffers) return;
 
         var bytesPerLayer = (nuint)((long)maxSeqLen * _kvDim * sizeof(float));
         for (int i = 0; i < numLayers; i++)
@@ -38,6 +47,18 @@ public sealed unsafe class KvCache : IDisposable
         : this(hp.NumLayers, hp.ContextLength, hp.NumKvHeads, hp.HeadDim)
     {
     }
+
+    /// <summary>
+    /// A cache that tracks only the position counter (<see cref="Length"/>,
+    /// <see cref="TruncateTo"/>, <see cref="Reset"/>) without allocating the per-layer
+    /// K/V buffers. For GPU backends that hold the actual KV in VRAM and need the host
+    /// object purely for length bookkeeping (e.g. <c>CudaForwardPass</c>): the full
+    /// allocation is numLayers × maxSeqLen × kvDim × 2 floats — tens of GB of host RAM at
+    /// long context, which is pure waste and OOMs the host (issue #179). Append/Get*/*At
+    /// are unsupported in this mode and will fault on the null buffers.
+    /// </summary>
+    public static KvCache CreateBookkeepingOnly(int numLayers, int maxSeqLen, int numKvHeads, int headDim)
+        => new(numLayers, maxSeqLen, numKvHeads, headDim, allocateBuffers: false);
 
     /// <summary>Number of positions currently stored in the cache.</summary>
     public int Length => _length;
@@ -105,6 +126,7 @@ public sealed unsafe class KvCache : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        if (_bookkeepingOnly) return;   // no buffers were allocated
         for (int i = 0; i < _numLayers; i++)
         {
             NativeMemory.Free(_keys[i]);
