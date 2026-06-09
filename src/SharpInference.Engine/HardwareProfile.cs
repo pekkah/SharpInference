@@ -49,6 +49,34 @@ public sealed record HardwareProfile(
         return new HardwareProfile(vram, ram, cores, pcieBw, avx512);
     }
 
+    /// <summary>
+    /// Estimate how many KV-cache token positions can be held concurrently in host RAM
+    /// before risking out-of-memory, given the per-token cost reported by the forward pass
+    /// (<see cref="ForwardPass.KvBytesPerToken"/>). This is the "Phase-0 autotune" budget
+    /// used by <see cref="ContinuousBatchingEngine"/> to bound admission: a burst of
+    /// long-prompt requests is deferred rather than allowed to allocate unbounded
+    /// <see cref="PagedKvCache"/> pages.
+    /// </summary>
+    /// <param name="kvBytesPerToken">Bytes one KV position costs across all layers (keys+values).</param>
+    /// <param name="memoryFraction">
+    /// Fraction of currently-available RAM the KV caches may occupy. Defaults to 0.5 to
+    /// leave headroom for weights already resident, activations, and the rest of the
+    /// process. Clamped to [0, 0.9].
+    /// </param>
+    /// <returns>
+    /// A positive token budget, or <c>0</c> when it cannot be estimated (no RAM figure or
+    /// non-positive per-token cost) — callers treat 0 as "unlimited / disabled".
+    /// </returns>
+    public long EstimateKvTokenBudget(long kvBytesPerToken, double memoryFraction = 0.5)
+    {
+        if (kvBytesPerToken <= 0 || RamBytes <= 0) return 0;
+        double frac = Math.Clamp(memoryFraction, 0.0, 0.9);
+        if (frac <= 0.0) return 0;
+        long budgetBytes = (long)(RamBytes * frac);
+        long tokens = budgetBytes / kvBytesPerToken;
+        return tokens > 0 ? tokens : 0;
+    }
+
     public string Summary()
     {
         string vramStr = VramBytes > 0 ? $"{VramBytes / (1024.0 * 1024 * 1024):F1} GB" : "none";

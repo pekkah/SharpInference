@@ -1937,6 +1937,15 @@ curl http://localhost:5000/v1/messages \
   3. Samples next token per sequence; writes to that sequence's output channel
   4. Retires sequences that hit EOS, `MaxNewTokens`, or cancellation; disposes cache
 - [x] Enabled via `SHARPI_MAX_BATCH` environment variable (server `Program.cs`); `> 1` activates continuous batching
+- [x] **KV-cache admission budget** (issue #183): `maxActiveTokens` caps the total live KV
+  footprint (sum of active sequence lengths). When admitting a prompt would exceed the
+  ceiling the request is parked in the queue until a sequence retires — backpressure that
+  stops a burst of long prompts from allocating unbounded `PagedKvCache` pages and OOM-ing
+  the host. A single over-budget prompt is still admitted when the batch is empty so no
+  request can starve. The server derives a default from available RAM and the model's
+  per-token KV cost (`ForwardPass.KvBytesPerToken` × `HardwareProfile.EstimateKvTokenBudget`,
+  ~50% of free RAM); override or disable with `SHARPI_KV_TOKEN_BUDGET` (`0` = unlimited).
+  Observable via `TokenBudget` / `ActiveTokens`.
 
 **Throughput model**: with batch size N, weight reads are amortized N×. For N=8 on a memory-bandwidth-bound decode, expect up to 8× total throughput (tokens/s across all users) vs single-user baseline.
 

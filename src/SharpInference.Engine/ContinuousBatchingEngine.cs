@@ -27,6 +27,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
     private readonly ForwardPass _fwd;
     private readonly ITokenizer _tokenizer;
     private readonly int _maxBatchSize;
+    private readonly long _maxActiveTokens;
     private readonly int _thinkTokenId;
     private readonly int _endThinkTokenId;
 
@@ -38,6 +39,9 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
     // Observability counters (updated via Interlocked).
     private int _pendingCount;
     private int _activeCount;
+    // Total KV positions held across the active batch. Mutated only by the batcher
+    // thread; published for metrics via Volatile so other threads see fresh values.
+    private long _activeTokens;
 
     private sealed class PendingRequest(string prompt, SamplingParams sp, CancellationToken ct, Channel<GenerateChunk> output)
     {
@@ -79,18 +83,29 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
     /// Token ID of the model's <c>&lt;/think&gt;</c> marker, or <c>-1</c>. Must be paired with
     /// a non-negative <paramref name="thinkTokenId"/> to enable reasoning-stream splitting.
     /// </param>
+    /// <param name="maxActiveTokens">
+    /// KV-cache admission budget: the maximum total number of token positions held across
+    /// all active sequences. When admitting a new request would push the live KV footprint
+    /// past this ceiling, the request is held in the queue until a sequence retires and frees
+    /// capacity — backpressure that stops a burst of long prompts from allocating unbounded
+    /// <see cref="PagedKvCache"/> pages (host RAM) and OOM-ing the process. <c>0</c> (default)
+    /// disables the budget (unlimited, original behaviour). A single prompt larger than the
+    /// budget is still admitted when the batch is otherwise empty, so no request can starve.
+    /// </param>
     public ContinuousBatchingEngine(
         ForwardPass fwd,
         ITokenizer tokenizer,
         string modelId,
         int maxBatchSize = 8,
         int thinkTokenId = -1,
-        int endThinkTokenId = -1)
+        int endThinkTokenId = -1,
+        long maxActiveTokens = 0)
     {
         _fwd = fwd;
         _tokenizer = tokenizer;
         ModelId = modelId;
         _maxBatchSize = Math.Max(1, maxBatchSize);
+        _maxActiveTokens = Math.Max(0, maxActiveTokens);
         _thinkTokenId = thinkTokenId;
         _endThinkTokenId = endThinkTokenId;
         _batcherTask = Task.Run(BatcherLoop);
@@ -103,6 +118,18 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
 
     /// <summary>Number of requests currently in the active decode batch.</summary>
     public int ActiveRequests => _activeCount;
+
+    /// <summary>
+    /// Total KV-cache token positions currently held across the active batch. Compare against
+    /// <see cref="TokenBudget"/> to gauge how close admission is to backpressure.
+    /// </summary>
+    public long ActiveTokens => Interlocked.Read(ref _activeTokens);
+
+    /// <summary>
+    /// KV-cache admission budget in token positions (the <c>maxActiveTokens</c> ctor argument),
+    /// or <c>0</c> when the budget is disabled (unlimited).
+    /// </summary>
+    public long TokenBudget => _maxActiveTokens;
 
     /// <summary>
     /// Continuous batching does not (yet) share KV state across requests — each admitted
@@ -165,19 +192,49 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         var cacheBuf = new PagedKvCache[_maxBatchSize];
         bool thinkingEnabled = _thinkTokenId >= 0 && _endThinkTokenId >= 0;
 
+        // A request pulled from the queue but rejected by the KV token budget is parked here
+        // and retried first on the next iteration, once a retiring sequence frees capacity.
+        PendingRequest? deferred = null;
+
         while (!_disposed)
         {
-            // Admit pending requests into available batch slots
-            while (active.Count < _maxBatchSize && _queue.Reader.TryRead(out var req))
+            // Admit pending requests into available batch slots, honouring the KV token budget.
+            while (active.Count < _maxBatchSize)
             {
-                Interlocked.Decrement(ref _pendingCount);
+                PendingRequest req;
+                if (deferred is not null)
+                {
+                    req = deferred;
+                    deferred = null;
+                    Interlocked.Decrement(ref _pendingCount); // unpark: counted as pending while parked
+                }
+                else if (_queue.Reader.TryRead(out var pulled))
+                {
+                    req = pulled;
+                    Interlocked.Decrement(ref _pendingCount);
+                }
+                else
+                {
+                    break;
+                }
+
+                AdmitResult result;
                 try
                 {
-                    AdmitRequest(req, active, thinkingEnabled);
+                    result = TryAdmit(req, active, thinkingEnabled);
                 }
                 catch (Exception ex)
                 {
                     req.Output.Writer.TryComplete(ex);
+                    continue;
+                }
+
+                if (result == AdmitResult.Deferred)
+                {
+                    // Budget full — park this request and stop admitting until a sequence retires.
+                    deferred = req;
+                    Interlocked.Increment(ref _pendingCount); // keep it visible in QueueDepth while parked
+                    break;
                 }
             }
 
@@ -238,6 +295,8 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                 if (done)
                 {
                     FlushAndComplete(seq);
+                    // seq.Position == this sequence's current KV length; reclaim it from the budget.
+                    Interlocked.Add(ref _activeTokens, -seq.Position);
                     seq.Cache.Dispose();
                     active.RemoveAt(i);
                     Interlocked.Decrement(ref _activeCount);
@@ -286,7 +345,8 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                     }
 
                     seq.CurrentToken = next;
-                    seq.Position++;
+                    seq.Position++;          // one more KV position for this sequence next step
+                    Interlocked.Increment(ref _activeTokens);
                     seq.TokenCount++;
                 }
             }
@@ -300,6 +360,15 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             Interlocked.Decrement(ref _activeCount);
         }
         active.Clear();
+
+        // A request parked by the token budget never got its own channel; complete it so the
+        // caller's await-foreach unblocks instead of hanging on shutdown.
+        if (deferred is not null)
+        {
+            deferred.Output.Writer.TryComplete();
+            Interlocked.Decrement(ref _pendingCount);
+            deferred = null;
+        }
     }
 
     private static void FlushAndComplete(ActiveSeq seq)
@@ -313,19 +382,40 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         seq.Output.Writer.TryComplete();
     }
 
-    private void AdmitRequest(PendingRequest req, List<ActiveSeq> active, bool thinkingEnabled)
+    /// <summary>Outcome of an admission attempt, driving the batcher's park/retry loop.</summary>
+    private enum AdmitResult
+    {
+        /// <summary>Sequence was prefilled and added to the active batch.</summary>
+        Admitted,
+        /// <summary>KV token budget is full; caller should park the request and retry later.</summary>
+        Deferred,
+        /// <summary>Request was completed without admission (cancelled, empty, or immediate EOS).</summary>
+        Skipped,
+    }
+
+    private AdmitResult TryAdmit(PendingRequest req, List<ActiveSeq> active, bool thinkingEnabled)
     {
         if (req.Ct.IsCancellationRequested)
         {
             req.Output.Writer.TryComplete();
-            return;
+            return AdmitResult.Skipped;
         }
 
         var tokens = _tokenizer.Encode(req.Prompt).ToArray();
         if (tokens.Length == 0)
         {
             req.Output.Writer.TryComplete();
-            return;
+            return AdmitResult.Skipped;
+        }
+
+        // KV token-budget backpressure: defer when admitting this prompt would push the live
+        // KV footprint past the ceiling. Bypassed when the batch is empty so a single
+        // over-budget prompt still runs rather than deadlocking the queue. Checked before the
+        // (expensive) prefill so a deferred request costs only one tokenize pass.
+        if (_maxActiveTokens > 0 && active.Count > 0
+            && _activeTokens + tokens.Length > _maxActiveTokens)
+        {
+            return AdmitResult.Deferred;
         }
 
         var cache = _fwd.CreateCache();
@@ -346,7 +436,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         {
             req.Output.Writer.TryComplete();
             cache.Dispose();
-            return;
+            return AdmitResult.Skipped;
         }
 
         // Seed InThinking from the prompt itself (issue #92). Qwen3.6 and other
@@ -408,6 +498,9 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
 
         active.Add(seq);
         Interlocked.Increment(ref _activeCount);
+        // Prompt KV is now resident (cache length == tokens.Length == seq.Position).
+        Interlocked.Add(ref _activeTokens, tokens.Length);
+        return AdmitResult.Admitted;
     }
 
     public void Dispose()

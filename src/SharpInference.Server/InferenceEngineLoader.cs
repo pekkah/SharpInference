@@ -86,8 +86,9 @@ public static class InferenceEngineLoader
         IInferenceEngine engine;
         if (opts.MaxBatchSize > 1 && batchingSupported && fwd is ForwardPass cpuFwd)
         {
+            long kvTokenBudget = ResolveKvTokenBudget(cpuFwd);
             engine = new ContinuousBatchingEngine(cpuFwd, tokenizer, modelId, opts.MaxBatchSize,
-                thinkTokenId, endThinkTokenId);
+                thinkTokenId, endThinkTokenId, kvTokenBudget);
             // ContinuousBatchingEngine doesn't accept owned[] disposables; transfer
             // disposal responsibility by wrapping it in a composite disposable.
             engine = new OwnedDisposableEngine(engine, owned);
@@ -99,6 +100,25 @@ public static class InferenceEngineLoader
         }
 
         return new LoadedEngine(engine, arch, tokenizer.ChatTemplate);
+    }
+
+    /// <summary>
+    /// Resolve the KV-cache admission budget (in token positions) for
+    /// <see cref="ContinuousBatchingEngine"/>. <c>SHARPI_KV_TOKEN_BUDGET</c> wins when set:
+    /// a positive value caps the live KV footprint; <c>0</c> disables the budget (unlimited).
+    /// Absent the env var, derive a budget from available RAM and the model's per-token KV
+    /// cost so a burst of long-prompt requests is throttled instead of OOM-ing the host.
+    /// </summary>
+    private static long ResolveKvTokenBudget(ForwardPass cpuFwd)
+    {
+        if (Environment.GetEnvironmentVariable("SHARPI_KV_TOKEN_BUDGET") is { } raw
+            && long.TryParse(raw, out long explicitBudget) && explicitBudget >= 0)
+        {
+            return explicitBudget;
+        }
+
+        var hw = HardwareProfile.Detect();
+        return hw.EstimateKvTokenBudget(cpuFwd.KvBytesPerToken);
     }
 
     // ── Backend dispatch ─────────────────────────────────────────────────────

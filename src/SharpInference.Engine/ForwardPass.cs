@@ -2106,6 +2106,16 @@ public sealed unsafe class ForwardPass : IForwardPass
         new PagedKvCache(_hp.NumLayers, _hp.NumKvHeads, _headDim);
 
     /// <summary>
+    /// Host-RAM cost of one KV position in a <see cref="PagedKvCache"/> for this model:
+    /// keys + values, fp32, across every layer. Used by
+    /// <see cref="ContinuousBatchingEngine"/> admission control to convert a memory
+    /// budget into a token budget. Matches the page layout in <see cref="PagedKvCache"/>
+    /// (<c>numLayers × kvDim × 2 × sizeof(float)</c>).
+    /// </summary>
+    public long KvBytesPerToken =>
+        (long)_hp.NumLayers * _hp.NumKvHeads * _headDim * 2 * sizeof(float);
+
+    /// <summary>
     /// Forward pass for a single token using the provided explicit cache (no TurboQuant).
     /// Used by <see cref="PrefillWithCache"/> for single-token prompts and MoE sequential prefill.
     /// </summary>
