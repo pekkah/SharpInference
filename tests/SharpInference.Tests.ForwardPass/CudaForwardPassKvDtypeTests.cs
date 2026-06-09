@@ -67,7 +67,8 @@ public sealed class CudaForwardPassKvDtypeTests
     /// env var is read in the constructor, so it must be set before construction.
     /// </summary>
     private static (float[][] logits, int[] argmax) RunPrefillDecode(
-        CudaBackend gpu, string path, string? kvDtype, string prompt, int steps, int ctx, int[]? forced)
+        CudaBackend gpu, string path, string? kvDtype, string prompt, int steps, int ctx, int[]? forced,
+        bool batchedPrefill = false)
     {
         var prevKv = Environment.GetEnvironmentVariable("SHARPI_KV_DTYPE");
         var prevSnap = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_BUDGET");
@@ -80,12 +81,12 @@ public sealed class CudaForwardPassKvDtypeTests
             var tokenizer = GgufTokenizer.FromGgufModel(model);
             int useCtx = Math.Min(hp.ContextLength, ctx);
             using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: useCtx);
-            // Force the per-token attention path on BOTH runs. bf16 already falls back to
-            // it (batched/flash KV is fp32-only, #179), but the fp32 reference would
-            // otherwise prefill via the batched flash/TC kernels — whose online softmax
-            // is not bit-exact vs the scalar path. Comparing scalar-vs-flash would
-            // conflate that gap with the KV-dtype effect we're isolating here.
-            fwd.BatchedPrefillEnabled = false;
+            // Pin the prefill path. The argmax-stability test compares fp32 vs bf16 with
+            // both on the per-token path (the fp32 batched flash/TC online softmax isn't
+            // bit-exact vs scalar, which would conflate with the KV-dtype effect). The
+            // batched-prefill test (#179 Increment 1.5) instead toggles this true to
+            // exercise the scalar bf16 batched kernels.
+            fwd.BatchedPrefillEnabled = batchedPrefill;
 
             var tokens = tokenizer.Encode(prompt).ToArray();
             var perPos = new float[steps + 1][];
@@ -160,6 +161,47 @@ public sealed class CudaForwardPassKvDtypeTests
         }
     }
 
+    /// <summary>
+    /// Increment 1.5: with bf16 KV, batched prefill must agree with the bf16 per-token
+    /// prefill. This isolates the scalar batched bf16 kernels (KvAppendBatchedBf16,
+    /// AttentionBatchedBf16, AttentionSwaBatchedBf16) + the batched dispatch: both runs
+    /// store bf16 KV, so the only differences are the batched attention algorithm
+    /// (documented bit-identical per (head, token) to the per-token kernel) and the GEMM
+    /// vs matvec trunk matmul — the same gap the fp32 batched path already tolerates.
+    /// The prompt is kept ≤4096 tokens so it stays on the batched path (bf16 can't chunk
+    /// past 4096 until the flash port). Reference is bf16 per-token; candidate is bf16
+    /// batched, teacher-forced onto the reference trajectory.
+    /// </summary>
+    private static void AssertBf16BatchedPrefillParity(string filename, string prompt, float maxAbsTol)
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath(filename);
+        if (path is null) return;
+
+        const int steps = 6;
+        const int ctx = 2048;
+
+        var (pt, ptArgmax) = RunPrefillDecode(gpu, path, "bf16", prompt, steps, ctx, forced: null, batchedPrefill: false);
+        var (bt, _) = RunPrefillDecode(gpu, path, "bf16", prompt, steps, ctx, forced: ptArgmax, batchedPrefill: true);
+
+        for (int p = 0; p <= steps; p++)
+        {
+            Assert.Equal(pt[p].Length, bt[p].Length);
+            float maxAbs = 0f;
+            for (int i = 0; i < pt[p].Length; i++)
+            {
+                Assert.True(float.IsFinite(bt[p][i]), $"{filename}: non-finite batched-bf16 logit at pos {p}, idx {i}.");
+                maxAbs = Math.Max(maxAbs, Math.Abs(pt[p][i] - bt[p][i]));
+            }
+            Assert.True(maxAbs < maxAbsTol,
+                $"{filename}: pos {p} batched-bf16 vs per-token-bf16 logit max-abs {maxAbs:F3} exceeds " +
+                $"{maxAbsTol:F1} — the bf16 batched kernels/dispatch diverge from the per-token path.");
+            Assert.True(TopK(bt[p], 5).Contains(ptArgmax[p]),
+                $"{filename}: pos {p} per-token top-1 ({ptArgmax[p]}) fell out of batched-bf16's top-5.");
+        }
+    }
+
     /// <summary>Indices of the <paramref name="k"/> largest entries of <paramref name="v"/>.</summary>
     private static HashSet<int> TopK(float[] v, int k)
     {
@@ -191,4 +233,21 @@ public sealed class CudaForwardPassKvDtypeTests
     [Fact]
     public void Gemma4_12B_Bf16Kv_ArgmaxStable_VsFp32()
         => AssertBf16Parity("gemma-4-12b-it-qat-q4_0.gguf", LowEntropyPrompt, eosToken: null, maxAbsTol: 8.0f);
+
+    // ── Increment 1.5: bf16 batched prefill agrees with bf16 per-token ──────
+
+    /// <summary>Qwen3-8B Q4_K: bf16 global batched prefill (AttentionBatchedBf16).</summary>
+    [Fact]
+    public void Qwen3_8B_Bf16BatchedPrefill_MatchesPerToken()
+        => AssertBf16BatchedPrefillParity("Qwen3-8B-Q4_K_M.gguf", LowEntropyPrompt, maxAbsTol: 1.5f);
+
+    /// <summary>Gemma 4 E4B Q8_0: bf16 SWA + global batched prefill (AttentionSwaBatchedBf16).</summary>
+    [Fact]
+    public void Gemma4_E4B_Bf16BatchedPrefill_MatchesPerToken()
+        => AssertBf16BatchedPrefillParity("gemma-4-E4B-it-Q8_0.gguf", LowEntropyPrompt, maxAbsTol: 1.5f);
+
+    /// <summary>Gemma 4 12B QAT Q4_0: bf16 batched prefill with k_eq_v globals.</summary>
+    [Fact]
+    public void Gemma4_12B_Bf16BatchedPrefill_MatchesPerToken()
+        => AssertBf16BatchedPrefillParity("gemma-4-12b-it-qat-q4_0.gguf", LowEntropyPrompt, maxAbsTol: 8.0f);
 }

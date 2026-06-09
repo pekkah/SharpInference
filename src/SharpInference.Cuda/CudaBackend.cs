@@ -3838,9 +3838,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>Bf16-read variant of <see cref="AttentionBatched"/> (default KV dtype).</summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
     public void AttentionBatchedBf16(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
                                      int numHeads, int numKvHeads, int headDim,
-                                     int startPos, int maxSeqLen, int nTok)
+                                     int startPos, int maxSeqLen, int nTok, float attnScale = -1f)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
@@ -3851,10 +3852,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
         nint qP = GetDevPtr(qAll), kP = GetDevPtr(kCache), vP = GetDevPtr(vCache), oP = GetDevPtr(outAll);
         int pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pSP = startPos, pMSL = maxSeqLen, pN = nTok;
-        nint* args = stackalloc nint[10]
+        float pScale = attnScale;
+        nint* args = stackalloc nint[11]
         {
             (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
-            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD), (nint)(&pSP), (nint)(&pMSL), (nint)(&pN)
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD), (nint)(&pSP), (nint)(&pMSL), (nint)(&pN), (nint)(&pScale)
         };
         int r = NvrtcInterop.LaunchKernel(_fullSeqAttentionBf16Kernel, (uint)numHeads, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(full_seq_attention_bf16) failed: {r}");
@@ -3943,9 +3945,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>Bf16-read variant of <see cref="AttentionBatchedWave"/> (default KV dtype).</summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
     public void AttentionBatchedWaveBf16(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
                                          int numHeads, int numKvHeads, int headDim,
-                                         int startPos, int maxSeqLen, int nTok)
+                                         int startPos, int maxSeqLen, int nTok, float attnScale = -1f)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
@@ -3964,11 +3967,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         nint qP = qBase, oP = oBase;
         int spEff = startPos, pN = 0;
         int pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pMSL = maxSeqLen, pStride = scoreStride;
-        nint* args = stackalloc nint[12]
+        float pScale = attnScale;
+        nint* args = stackalloc nint[13]
         {
             (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP), (nint)(&scP),
             (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
-            (nint)(&spEff), (nint)(&pMSL), (nint)(&pN), (nint)(&pStride)
+            (nint)(&spEff), (nint)(&pMSL), (nint)(&pN), (nint)(&pStride), (nint)(&pScale)
         };
         for (int waveStart = 0; waveStart < nTok; waveStart += W)
         {

@@ -7447,7 +7447,7 @@ extern ""C"" __global__ void llm_full_seq_attention_bf16(
     const unsigned short* __restrict__ v_cache,
     float* __restrict__ out_all,
     int num_heads, int num_kv_heads, int head_dim,
-    int start_pos, int max_seq_len, int n_tok)
+    int start_pos, int max_seq_len, int n_tok, float attn_scale)
 {
     const int MAX_STORED_SCORES = 4096;
     __shared__ float shared_scores[MAX_STORED_SCORES];
@@ -7461,7 +7461,8 @@ extern ""C"" __global__ void llm_full_seq_attention_bf16(
     int seq_len = start_pos + i + 1;
     int kv_head = (int)h / (num_heads / num_kv_heads);
     int kv_dim  = num_kv_heads * head_dim;
-    float scale = rsqrtf((float)head_dim);
+    // attn_scale > 0 overrides (Gemma 4 passes 1.0); ≤0 uses 1/sqrt(head_dim).
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
     int q_dim = num_heads * head_dim;
     const float* q = q_all + (long)i * q_dim;
     float* out = out_all + (long)i * q_dim;
@@ -7616,7 +7617,7 @@ extern ""C"" __global__ void llm_full_seq_attention_global_bf16(
     float* __restrict__ out_all,
     float* __restrict__ scores_scratch,
     int num_heads, int num_kv_heads, int head_dim,
-    int start_pos, int max_seq_len, int n_tok, int score_stride)
+    int start_pos, int max_seq_len, int n_tok, int score_stride, float attn_scale)
 {
     __shared__ float sdata[256];
 
@@ -7628,7 +7629,8 @@ extern ""C"" __global__ void llm_full_seq_attention_global_bf16(
     int seq_len = start_pos + i + 1;
     int kv_head = (int)h / (num_heads / num_kv_heads);
     int kv_dim  = num_kv_heads * head_dim;
-    float scale = rsqrtf((float)head_dim);
+    // attn_scale > 0 overrides (Gemma 4 passes 1.0); ≤0 uses 1/sqrt(head_dim).
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
     int q_dim = num_heads * head_dim;
     const float* q = q_all + (long)i * q_dim;
     float* out = out_all + (long)i * q_dim;

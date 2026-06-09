@@ -2031,7 +2031,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             // within the proven 4096 cap, but extending that past 4096 would silently drop
             // the window. So only chunk past 4096 when either there's a real per-layer SWA
             // pattern or the model has no window at all.
+            // bf16 KV (#179) has no flash/TC kernel yet, so it can't chunk past the 4096
+            // shared-scores cap — prompts beyond it drop to the per-token loop below.
             bool canChunkPast4096 = PrefillFlashAttnEnabled
+                && _kvDType != DType.BFloat16
                 && (_hp.IsSwaLayer is not null || _hp.SlidingWindowSize <= 0);
             int cap = canChunkPast4096 ? _maxSeqLen : 4096;
             if (startPos + N <= cap)
@@ -2101,11 +2104,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     /// </summary>
     private bool IsBatchedPrefillSupported()
     {
-        // bf16 KV (issue #179): the batched/flash prefill kernels (FlashAttentionPrefill*,
-        // AttentionBatched, AttentionSwaBatched) read an fp32 cache. bf16-cache flash/TC
-        // prefill is a follow-up; until then bf16 prefill uses the per-token loop, which
-        // routes through the bf16-aware KvAppend/Attention/AttentionSwa kernels.
-        if (_kvDType == DType.BFloat16) return false;
+        // bf16 KV (issue #179): the scalar batched kernels (KvAppendBatchedBf16,
+        // AttentionBatchedBf16, AttentionSwaBatchedBf16) read the bf16 cache, so batched
+        // prefill is supported up to the shared-scores cap. The flash/TC kernels are still
+        // fp32-only, so the prefill gate forces canChunkPast4096=false under bf16 —
+        // prompts past 4096 fall back to the per-token loop (also bf16-aware) until the
+        // bf16 flash port (1.5b) lands.
         if (_isMoE || _tqEnabled || _hasAttnBias || !_hp.IsNeoxRope) return false;
         if (_hasQkNorm && _hp.UseL2QkNorm) return false;
 
@@ -2511,7 +2515,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         if (!kvShared)
         {
             int layerCtx = isSwa && window > 0 ? SwaRingSize(_maxSeqLen, window) : _maxSeqLen;
-            _gpu.KvAppendBatched(kAll, vAll, _gpuKCache[layer], _gpuVCache[layer], kvDimL, startPos, layerCtx, N);
+            if (_kvDType == DType.BFloat16)
+                _gpu.KvAppendBatchedBf16(kAll, vAll, _gpuKCache[layer], _gpuVCache[layer], kvDimL, startPos, layerCtx, N);
+            else
+                _gpu.KvAppendBatched(kAll, vAll, _gpuKCache[layer], _gpuVCache[layer], kvDimL, startPos, layerCtx, N);
         }
 
         int effLayerCtx = (_hp.IsSwaLayer is { } swaEff && swaEff[effLayer] && window > 0)
@@ -2520,7 +2527,20 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         if (s_prefillProfile) { _gpu.Synchronize(); _profSw.Restart(); }
         // Gemma 4: attention_scale = 1.0, passed explicitly (kernel skips its rsqrtf).
         // Other models pass _attnScale = -1 so the kernel derives 1/sqrt(head_dim).
-        if (PrefillFlashTcEnabled && (layerHd & 15) == 0)
+        if (_kvDType == DType.BFloat16)
+        {
+            // bf16 KV (#179): scalar batched path only — the flash/TC kernels read an
+            // fp32 cache (bf16 flash is the 1.5b follow-up). The prefill gate forces
+            // canChunkPast4096=false under bf16, so startPos+N ≤ 4096 here and the
+            // shared-scores kernels always apply.
+            if (isSwa)
+                _gpu.AttentionSwaBatchedBf16(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
+                    _numHeads, layerKv, layerHd, startPos, window, effLayerCtx, N, attnScale: _attnScale);
+            else
+                _gpu.AttentionBatchedBf16(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
+                    _numHeads, layerKv, layerHd, startPos, effLayerCtx, N, attnScale: _attnScale);
+        }
+        else if (PrefillFlashTcEnabled && (layerHd & 15) == 0)
         {
             // #147 multi-warp/d-split when head_dim is a multiple of 64 (W·16); else the
             // #146 single-warp kernel. SHARPI_PREFILL_FLASH_TC1=1 forces single-warp (A/B).
