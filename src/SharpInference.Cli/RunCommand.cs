@@ -91,7 +91,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         public bool TurboQuant { get; init; }
 
         [CommandOption("--kv-type")]
-        [Description("KV-cache element type for the CUDA backend: fp32 (default) or bf16 (half the KV VRAM → ~2x context). Like llama.cpp --cache-type-k/v. Env: SHARPI_KV_DTYPE.")]
+        [Description("KV-cache element type for the CUDA backend: fp32 (default), bf16 (half the KV VRAM → ~2x context), or q8_0 (quarter → ~4x). Like llama.cpp --cache-type-k/v. Env: SHARPI_KV_DTYPE.")]
         public string? KvType { get; init; }
 
         [CommandOption("--draft-model")]
@@ -194,7 +194,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         // KV-cache dtype (issue #179): surface SHARPI_KV_DTYPE as a flag. Set before
         // any forward pass is built so an explicit flag overrides; env-only use still
-        // works. The CudaForwardPass constructor validates the value (fp32|bf16).
+        // works. The CudaForwardPass constructor validates the value (fp32|bf16|q8_0).
         if (settings.KvType is { Length: > 0 })
             Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", settings.KvType);
         if (!string.IsNullOrEmpty(settings.ExpertStatsPath))

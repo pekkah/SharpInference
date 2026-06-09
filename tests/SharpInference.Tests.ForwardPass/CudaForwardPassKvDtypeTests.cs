@@ -112,7 +112,7 @@ public sealed class CudaForwardPassKvDtypeTests
         }
     }
 
-    private static void AssertBf16Parity(string filename, string prompt, int? eosToken, float maxAbsTol)
+    private static void AssertKvParity(string filename, string kvDtype, string prompt, int? eosToken, float maxAbsTol)
     {
         using var gpu = TryCreate();
         if (gpu is null) return;
@@ -122,13 +122,13 @@ public sealed class CudaForwardPassKvDtypeTests
         const int steps = 6;
         const int ctx = 2048;
 
-        // fp32 reference first; teacher-force bf16 onto the SAME trajectory so each
-        // decode position sees identical inputs and the KV dtype is the only variable.
+        // fp32 reference first; teacher-force the narrowed dtype onto the SAME trajectory so
+        // each decode position sees identical inputs and the KV dtype is the only variable.
         // Greedy-token equality alone is fragile on near-tie tokens (a borderline pair
         // flips on store rounding without any kernel bug), so parity is asserted at the
         // logit level — top-1 stable + small max-abs — per feedback_cross_backend_parity_test.
         var (f32, f32Argmax) = RunPrefillDecode(gpu, path, "fp32", prompt, steps, ctx, forced: null);
-        var (bf16, bf16Argmax) = RunPrefillDecode(gpu, path, "bf16", prompt, steps, ctx, forced: f32Argmax);
+        var (kv, kvArgmax) = RunPrefillDecode(gpu, path, kvDtype, prompt, steps, ctx, forced: f32Argmax);
 
         // Coherence (feedback_forward_pass_tests): the fp32 reference must be a real
         // decode — IsFinite alone passes on a degenerate all-EOS run.
@@ -137,27 +137,27 @@ public sealed class CudaForwardPassKvDtypeTests
 
         // Per-position parity. Index 0 = prefill (full-prompt trunk over the whole KV
         // cache); 1.. = teacher-forced decode steps. Both runs saw identical inputs at
-        // every position, so a faithful bf16 path differs only by accumulated store
+        // every position, so a faithful narrowed path differs only by accumulated store
         // rounding. We assert (a) logit max-abs is within the rounding budget — the
-        // primary faithfulness measure — and (b) fp32's top-1 stays in bf16's top-5, a
-        // reorder-tolerant "argmax-stable" check. We do NOT assert top-1 equality: a
+        // primary faithfulness measure — and (b) fp32's top-1 stays in the narrowed top-5,
+        // a reorder-tolerant "argmax-stable" check. We do NOT assert top-1 equality: a
         // genuine near-tie (e.g. the 12B's degenerate-repeat positions, where adjacent
-        // token IDs sit within bf16 noise) can flip top-1 with no kernel bug.
+        // token IDs sit within store noise) can flip top-1 with no kernel bug.
         for (int p = 0; p <= steps; p++)
         {
-            Assert.Equal(f32[p].Length, bf16[p].Length);
+            Assert.Equal(f32[p].Length, kv[p].Length);
             float maxAbs = 0f;
             for (int i = 0; i < f32[p].Length; i++)
             {
-                Assert.True(float.IsFinite(bf16[p][i]), $"{filename}: non-finite bf16 logit at pos {p}, idx {i}.");
-                maxAbs = Math.Max(maxAbs, Math.Abs(f32[p][i] - bf16[p][i]));
+                Assert.True(float.IsFinite(kv[p][i]), $"{filename}: non-finite {kvDtype} logit at pos {p}, idx {i}.");
+                maxAbs = Math.Max(maxAbs, Math.Abs(f32[p][i] - kv[p][i]));
             }
             Assert.True(maxAbs < maxAbsTol,
-                $"{filename}: pos {p} bf16 vs fp32 logit max-abs diff {maxAbs:F3} exceeds the " +
+                $"{filename}: pos {p} {kvDtype} vs fp32 logit max-abs diff {maxAbs:F3} exceeds the " +
                 $"rounding budget ({maxAbsTol:F1}) — likely an arithmetic divergence (SWA-ring / k_eq_v / attn_scale).");
-            Assert.True(TopK(bf16[p], 5).Contains(f32Argmax[p]),
-                $"{filename}: pos {p} fp32 top-1 ({f32Argmax[p]}) fell out of bf16's top-5 " +
-                $"(max-abs {maxAbs:F3}) — the bf16 path reordered the head of the distribution.");
+            Assert.True(TopK(kv[p], 5).Contains(f32Argmax[p]),
+                $"{filename}: pos {p} fp32 top-1 ({f32Argmax[p]}) fell out of {kvDtype}'s top-5 " +
+                $"(max-abs {maxAbs:F3}) — the {kvDtype} path reordered the head of the distribution.");
         }
     }
 
@@ -170,7 +170,7 @@ public sealed class CudaForwardPassKvDtypeTests
     /// its trajectory. Tolerances match the per-token argmax-stable test (store-rounding
     /// budget), since the attention algorithm is identical between the two runs.
     /// </summary>
-    private static void AssertBf16BatchedPrefillParity(string filename, string prompt, float maxAbsTol)
+    private static void AssertKvBatchedPrefillParity(string filename, string kvDtype, string prompt, float maxAbsTol)
     {
         using var gpu = TryCreate();
         if (gpu is null) return;
@@ -181,22 +181,22 @@ public sealed class CudaForwardPassKvDtypeTests
         const int ctx = 2048;
 
         var (f32, f32Argmax) = RunPrefillDecode(gpu, path, "fp32", prompt, steps, ctx, forced: null, batchedPrefill: true);
-        var (bf16, _) = RunPrefillDecode(gpu, path, "bf16", prompt, steps, ctx, forced: f32Argmax, batchedPrefill: true);
+        var (kv, _) = RunPrefillDecode(gpu, path, kvDtype, prompt, steps, ctx, forced: f32Argmax, batchedPrefill: true);
 
         for (int p = 0; p <= steps; p++)
         {
-            Assert.Equal(f32[p].Length, bf16[p].Length);
+            Assert.Equal(f32[p].Length, kv[p].Length);
             float maxAbs = 0f;
             for (int i = 0; i < f32[p].Length; i++)
             {
-                Assert.True(float.IsFinite(bf16[p][i]), $"{filename}: non-finite batched-bf16 logit at pos {p}, idx {i}.");
-                maxAbs = Math.Max(maxAbs, Math.Abs(f32[p][i] - bf16[p][i]));
+                Assert.True(float.IsFinite(kv[p][i]), $"{filename}: non-finite batched-{kvDtype} logit at pos {p}, idx {i}.");
+                maxAbs = Math.Max(maxAbs, Math.Abs(f32[p][i] - kv[p][i]));
             }
             Assert.True(maxAbs < maxAbsTol,
-                $"{filename}: pos {p} batched bf16-vs-fp32 logit max-abs {maxAbs:F3} exceeds " +
-                $"{maxAbsTol:F1} — the bf16 batched/flash kernels diverge from the fp32 batched path.");
-            Assert.True(TopK(bf16[p], 5).Contains(f32Argmax[p]),
-                $"{filename}: pos {p} fp32 top-1 ({f32Argmax[p]}) fell out of batched-bf16's top-5.");
+                $"{filename}: pos {p} batched {kvDtype}-vs-fp32 logit max-abs {maxAbs:F3} exceeds " +
+                $"{maxAbsTol:F1} — the {kvDtype} batched/flash kernels diverge from the fp32 batched path.");
+            Assert.True(TopK(kv[p], 5).Contains(f32Argmax[p]),
+                $"{filename}: pos {p} fp32 top-1 ({f32Argmax[p]}) fell out of batched-{kvDtype}'s top-5.");
         }
     }
 
@@ -214,7 +214,7 @@ public sealed class CudaForwardPassKvDtypeTests
     /// finite/blow-up ceiling. A structural cross-chunk bug would drop top-5 or NaN, not
     /// nudge logits by a few units.
     /// </summary>
-    private static void AssertBf16ChunkedPrefillParity(string filename, float maxAbsCeiling)
+    private static void AssertKvChunkedPrefillParity(string filename, string kvDtype, float maxAbsCeiling)
     {
         using var gpu = TryCreate();
         if (gpu is null) return;
@@ -237,24 +237,24 @@ public sealed class CudaForwardPassKvDtypeTests
             string prompt = sb.ToString();
 
             var (f32, f32Argmax) = RunPrefillDecode(gpu, path, "fp32", prompt, steps, ctx, forced: null, batchedPrefill: true);
-            var (bf16, _) = RunPrefillDecode(gpu, path, "bf16", prompt, steps, ctx, forced: f32Argmax, batchedPrefill: true);
+            var (kv, _) = RunPrefillDecode(gpu, path, kvDtype, prompt, steps, ctx, forced: f32Argmax, batchedPrefill: true);
 
             for (int p = 0; p <= steps; p++)
             {
-                Assert.Equal(f32[p].Length, bf16[p].Length);
+                Assert.Equal(f32[p].Length, kv[p].Length);
                 float maxAbs = 0f;
                 for (int i = 0; i < f32[p].Length; i++)
                 {
-                    Assert.True(float.IsFinite(bf16[p][i]), $"{filename}: non-finite chunked-bf16 logit at pos {p}, idx {i}.");
-                    maxAbs = Math.Max(maxAbs, Math.Abs(f32[p][i] - bf16[p][i]));
+                    Assert.True(float.IsFinite(kv[p][i]), $"{filename}: non-finite chunked-{kvDtype} logit at pos {p}, idx {i}.");
+                    maxAbs = Math.Max(maxAbs, Math.Abs(f32[p][i] - kv[p][i]));
                 }
                 // Hard check: argmax-stable (top-5 overlap). Soft ceiling: catch a blown-up
                 // kernel / NaN, not the expected long-context rounding accumulation.
-                Assert.True(TopK(bf16[p], 5).Contains(f32Argmax[p]),
-                    $"{filename}: pos {p} fp32 top-1 ({f32Argmax[p]}) fell out of chunked-bf16's top-5 " +
-                    $"(max-abs {maxAbs:F3}) — a cross-chunk SWA-ring or Tc2-bf16 divergence.");
+                Assert.True(TopK(kv[p], 5).Contains(f32Argmax[p]),
+                    $"{filename}: pos {p} fp32 top-1 ({f32Argmax[p]}) fell out of chunked-{kvDtype}'s top-5 " +
+                    $"(max-abs {maxAbs:F3}) — a cross-chunk SWA-ring or Tc2-{kvDtype} divergence.");
                 Assert.True(maxAbs < maxAbsCeiling,
-                    $"{filename}: pos {p} chunked bf16-vs-fp32 logit max-abs {maxAbs:F3} exceeds the " +
+                    $"{filename}: pos {p} chunked {kvDtype}-vs-fp32 logit max-abs {maxAbs:F3} exceeds the " +
                     $"blow-up ceiling {maxAbsCeiling:F1} — likely a kernel bug, not rounding.");
             }
         }
@@ -276,12 +276,12 @@ public sealed class CudaForwardPassKvDtypeTests
     /// <summary>Qwen3-8B Q4_K: non-SWA dense, exercises the global bf16 attention + append.</summary>
     [Fact]
     public void Qwen3_8B_Bf16Kv_ArgmaxStable_VsFp32()
-        => AssertBf16Parity("Qwen3-8B-Q4_K_M.gguf", LowEntropyPrompt, eosToken: null, maxAbsTol: 1.5f);
+        => AssertKvParity("Qwen3-8B-Q4_K_M.gguf", "bf16", LowEntropyPrompt, eosToken: null, maxAbsTol: 1.5f);
 
     /// <summary>Gemma 4 E4B Q8_0: SWA + global layers, exercises AttentionSwaBf16.</summary>
     [Fact]
     public void Gemma4_E4B_Bf16Kv_ArgmaxStable_VsFp32()
-        => AssertBf16Parity("gemma-4-E4B-it-Q8_0.gguf", LowEntropyPrompt, eosToken: null, maxAbsTol: 1.5f);
+        => AssertKvParity("gemma-4-E4B-it-Q8_0.gguf", "bf16", LowEntropyPrompt, eosToken: null, maxAbsTol: 1.5f);
 
     /// <summary>
     /// Gemma 4 12B QAT: the driving model — adds attention_k_eq_v global layers. Q4_0
@@ -290,24 +290,24 @@ public sealed class CudaForwardPassKvDtypeTests
     /// </summary>
     [Fact]
     public void Gemma4_12B_Bf16Kv_ArgmaxStable_VsFp32()
-        => AssertBf16Parity("gemma-4-12b-it-qat-q4_0.gguf", LowEntropyPrompt, eosToken: null, maxAbsTol: 8.0f);
+        => AssertKvParity("gemma-4-12b-it-qat-q4_0.gguf", "bf16", LowEntropyPrompt, eosToken: null, maxAbsTol: 8.0f);
 
     // ── Increment 1.5: bf16 batched prefill agrees with bf16 per-token ──────
 
     /// <summary>Qwen3-8B Q4_K: bf16 global batched prefill (AttentionBatchedBf16).</summary>
     [Fact]
     public void Qwen3_8B_Bf16BatchedPrefill_MatchesPerToken()
-        => AssertBf16BatchedPrefillParity("Qwen3-8B-Q4_K_M.gguf", LowEntropyPrompt, maxAbsTol: 1.5f);
+        => AssertKvBatchedPrefillParity("Qwen3-8B-Q4_K_M.gguf", "bf16", LowEntropyPrompt, maxAbsTol: 1.5f);
 
     /// <summary>Gemma 4 E4B Q8_0: bf16 SWA + global batched prefill (AttentionSwaBatchedBf16).</summary>
     [Fact]
     public void Gemma4_E4B_Bf16BatchedPrefill_MatchesPerToken()
-        => AssertBf16BatchedPrefillParity("gemma-4-E4B-it-Q8_0.gguf", LowEntropyPrompt, maxAbsTol: 1.5f);
+        => AssertKvBatchedPrefillParity("gemma-4-E4B-it-Q8_0.gguf", "bf16", LowEntropyPrompt, maxAbsTol: 1.5f);
 
     /// <summary>Gemma 4 12B QAT Q4_0: bf16 batched prefill with k_eq_v globals.</summary>
     [Fact]
     public void Gemma4_12B_Bf16BatchedPrefill_MatchesPerToken()
-        => AssertBf16BatchedPrefillParity("gemma-4-12b-it-qat-q4_0.gguf", LowEntropyPrompt, maxAbsTol: 8.0f);
+        => AssertKvBatchedPrefillParity("gemma-4-12b-it-qat-q4_0.gguf", "bf16", LowEntropyPrompt, maxAbsTol: 8.0f);
 
     // ── Increment 1.5b: bf16 chunked prefill past 4096 (Tc2 flash + SWA ring) ──
 
@@ -320,5 +320,46 @@ public sealed class CudaForwardPassKvDtypeTests
     /// </summary>
     [Fact]
     public void Gemma4_E4B_Bf16ChunkedPrefill_MatchesFp32()
-        => AssertBf16ChunkedPrefillParity("gemma-4-E4B-it-Q8_0.gguf", maxAbsCeiling: 25.0f);
+        => AssertKvChunkedPrefillParity("gemma-4-E4B-it-Q8_0.gguf", "bf16", maxAbsCeiling: 25.0f);
+
+    // ── Increment 2: q8_0 KV (block-quantized, ~quarter-fp32) ────────────────
+    // Same parity oracles as bf16, with the q8_0 cache. q8_0's per-32-block 8-bit
+    // quantization is a coarser store than bf16's per-element 8-bit mantissa, so the
+    // max-abs budgets are a touch wider; the top-5 argmax-stable check is unchanged
+    // and is the real correctness gate. Tolerances were set from observed peaks.
+
+    /// <summary>Qwen3-8B Q4_K: non-SWA dense, exercises AttentionQ8_0 / KvAppendQ8_0.</summary>
+    [Fact]
+    public void Qwen3_8B_Q8Kv_ArgmaxStable_VsFp32()
+        => AssertKvParity("Qwen3-8B-Q4_K_M.gguf", "q8_0", LowEntropyPrompt, eosToken: null, maxAbsTol: 2.5f);
+
+    /// <summary>Gemma 4 E4B Q8_0: SWA + global layers, exercises AttentionSwaQ8_0.</summary>
+    [Fact]
+    public void Gemma4_E4B_Q8Kv_ArgmaxStable_VsFp32()
+        => AssertKvParity("gemma-4-E4B-it-Q8_0.gguf", "q8_0", LowEntropyPrompt, eosToken: null, maxAbsTol: 2.5f);
+
+    /// <summary>Gemma 4 12B QAT Q4_0: the driving model — attention_k_eq_v globals + q8_0 KV.</summary>
+    [Fact]
+    public void Gemma4_12B_Q8Kv_ArgmaxStable_VsFp32()
+        => AssertKvParity("gemma-4-12b-it-qat-q4_0.gguf", "q8_0", LowEntropyPrompt, eosToken: null, maxAbsTol: 10.0f);
+
+    /// <summary>Qwen3-8B Q4_K: q8_0 global batched prefill (AttentionBatchedQ8_0).</summary>
+    [Fact]
+    public void Qwen3_8B_Q8BatchedPrefill_MatchesPerToken()
+        => AssertKvBatchedPrefillParity("Qwen3-8B-Q4_K_M.gguf", "q8_0", LowEntropyPrompt, maxAbsTol: 2.5f);
+
+    /// <summary>Gemma 4 E4B Q8_0: q8_0 SWA + global batched prefill (AttentionSwaBatchedQ8_0).</summary>
+    [Fact]
+    public void Gemma4_E4B_Q8BatchedPrefill_MatchesPerToken()
+        => AssertKvBatchedPrefillParity("gemma-4-E4B-it-Q8_0.gguf", "q8_0", LowEntropyPrompt, maxAbsTol: 2.5f);
+
+    /// <summary>Gemma 4 12B QAT Q4_0: q8_0 batched prefill with k_eq_v globals.</summary>
+    [Fact]
+    public void Gemma4_12B_Q8BatchedPrefill_MatchesPerToken()
+        => AssertKvBatchedPrefillParity("gemma-4-12b-it-qat-q4_0.gguf", "q8_0", LowEntropyPrompt, maxAbsTol: 10.0f);
+
+    /// <summary>Gemma 4 E4B Q8_0: q8_0 Tc2-flash chunked prefill across the SWA ring boundary.</summary>
+    [Fact]
+    public void Gemma4_E4B_Q8ChunkedPrefill_MatchesFp32()
+        => AssertKvChunkedPrefillParity("gemma-4-E4B-it-Q8_0.gguf", "q8_0", maxAbsCeiling: 30.0f);
 }

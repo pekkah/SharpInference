@@ -288,6 +288,16 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // single-warp occupancy). Default TC path when head_dim % 64 == 0.
     private nint   _flashAttnPrefillTc2Kernel;
     private nint   _flashAttnPrefillTc2Bf16Kernel;   // issue #179
+    private nint   _flashAttnPrefillTc2Q8Kernel;     // issue #179 (q8_0 KV)
+
+    // Issue #179 (q8_0 KV): block-quantized cache variants of the bf16 KV kernels.
+    private nint   _kvAppendQ8Kernel;
+    private nint   _kvAppendBatchedQ8Kernel;
+    private nint   _attentionQ8Kernel;
+    private nint   _attentionSwaQ8Kernel;
+    private nint   _attentionSwaBatchedQ8Kernel;
+    private nint   _fullSeqAttentionQ8Kernel;
+    private nint   _fullSeqAttentionGlobalQ8Kernel;
 
     // Grow-only global score scratch for the wave-based >4096 batched-query SDPA
     // (issue #118). Sized W × num_heads × score_stride floats; W is chosen so this
@@ -579,7 +589,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
     public Tensor Allocate(TensorShape shape, DType dtype = DType.Float32, bool exact = false)
     {
-        nuint byteSize  = (nuint)(shape.ElementCount * DTypeInfo.BytesPerElement(dtype));
+        // ByteSize handles both scalar (blockSize 1 → elementCount·elemBytes, identical to
+        // the old BytesPerElement product) and block-quantized dtypes (q8_0 KV cache, #179:
+        // (count/32)·34). Lets the KV cache allocate as DType.Q8_0 without a special path.
+        nuint byteSize  = (nuint)DTypeInfo.ByteSize(shape.ElementCount, dtype);
         // exact=true bypasses the power-of-2 pool rounding. Use for one-shot weight
         // uploads that won't be freed/realloc'd during decode — pooling is pure waste
         // for those, and the power-of-2 rounding can inflate per-allocation footprint
@@ -3556,12 +3569,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// resident (no shared-O rescale) and occupancy rises ~10×. Requires
     /// <paramref name="headDim"/> % 64 == 0 (W·16) and ≤ 512. Argmax-stable, not bit-exact.
     /// </summary>
-    /// <param name="bf16Cache">When true the K/V cache tensors are bf16 (issue #179);
-    /// the bf16-thunk kernel decodes each element to fp32 on load. Same args/shared/grid.</param>
+    /// <param name="kvCacheType">K/V cache element dtype (issue #179): Float32 (default),
+    /// BFloat16, or Q8_0. The matching templated thunk decodes each element to fp32 on
+    /// load; args/shared/grid are identical across dtypes.</param>
     public void FlashAttentionPrefillTc2(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
         int numHeads, int numKvHeads, int headDim,
         int startPos, int windowSize, int maxSeqLen, int nTok, float attnScale = -1f,
-        bool bf16Cache = false)
+        DType kvCacheType = DType.Float32)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
@@ -3586,10 +3600,15 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             (nint)(&pSP), (nint)(&pWS), (nint)(&pMSL), (nint)(&pN), (nint)(&pScale)
         };
         uint gy = (uint)((nTok + 15) / 16);
-        nint kern = bf16Cache ? _flashAttnPrefillTc2Bf16Kernel : _flashAttnPrefillTc2Kernel;
+        nint kern = kvCacheType switch
+        {
+            DType.BFloat16 => _flashAttnPrefillTc2Bf16Kernel,
+            DType.Q8_0     => _flashAttnPrefillTc2Q8Kernel,
+            _              => _flashAttnPrefillTc2Kernel,
+        };
         int r = NvrtcInterop.LaunchKernel(kern, (uint)numHeads, gy, 1,
                                           (uint)(w * 32), 1, 1, sharedBytes, _stream, args, null);
-        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(flash_attn_prefill_tc2{(bf16Cache ? "_bf16" : "")}) failed: {r}");
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(flash_attn_prefill_tc2 {kvCacheType}) failed: {r}");
     }
 
     /// <summary>
@@ -3989,6 +4008,244 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             int r = NvrtcInterop.LaunchKernel(_fullSeqAttentionGlobalBf16Kernel,
                 (uint)numHeads, (uint)wThis, 1, 256, 1, 1, 0, _stream, args, null);
             if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(full_seq_attention_global_bf16) failed: {r}");
+        }
+    }
+
+    // ── Issue #179: q8_0 KV-cache kernel wrappers ──────────────────────────
+    // Block-quantized (~quarter-fp32) variants of the bf16 KV kernels above. Same
+    // arg marshalling and grids; only the launched kernel handle differs (the
+    // templated <block_q8_0> thunks). The store kernels quantize per 32-lane warp.
+
+    /// <summary>q8_0-store variant of <see cref="KvAppendBf16"/> (issue #179).</summary>
+    public void KvAppendQ8_0(Tensor kInput, Tensor vInput, Tensor kCache, Tensor vCache,
+                             int kvDim, int position, int maxSeqLen)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint kPtr = GetDevPtr(kInput);
+        nint vPtr = GetDevPtr(vInput);
+        nint kcP  = GetDevPtr(kCache);
+        nint vcP  = GetDevPtr(vCache);
+        int  pKD = kvDim, pPos = position, pMSL = maxSeqLen;
+        nint* args = stackalloc nint[7]
+        {
+            (nint)(&kPtr), (nint)(&vPtr),
+            (nint)(&kcP), (nint)(&vcP),
+            (nint)(&pKD), (nint)(&pPos), (nint)(&pMSL)
+        };
+        uint grid = (uint)((kvDim + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_kvAppendQ8Kernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kv_append_q8_0) failed: {r}");
+
+        if (_graphCapturing)
+        {
+            Span<nint> av = stackalloc nint[7];
+            av[0] = kPtr; av[1] = vPtr; av[2] = kcP; av[3] = vcP;
+            av[4] = pKD; av[5] = pPos; av[6] = pMSL;
+            TrackPositionNode(_kvAppendQ8Kernel, grid, 1, 1, 256, 1, 1, 0, av, [(5, GraphPosKind.Position, 0)]);
+        }
+    }
+
+    /// <summary>q8_0-read variant of <see cref="AttentionBf16"/> (issue #179).</summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
+    public void AttentionQ8_0(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+                              Tensor? scoresScratch,
+                              int numHeads, int numKvHeads, int headDim, int seqLen, int maxSeqLen,
+                              float attnScale = -1f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint qP = GetDevPtr(q);
+        nint kP = GetDevPtr(kCache);
+        nint vP = GetDevPtr(vCache);
+        nint oP = GetDevPtr(output);
+        nint ssP = scoresScratch is { } sv ? GetDevPtr(sv) : nint.Zero;
+        int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pSL = seqLen, pMSL = maxSeqLen;
+        float pScale = attnScale;
+        nint* args = stackalloc nint[11]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
+            (nint)(&ssP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pSL), (nint)(&pMSL), (nint)(&pScale)
+        };
+        int r = NvrtcInterop.LaunchKernel(_attentionQ8Kernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_q8_0) failed: {r}");
+
+        if (_graphCapturing)
+        {
+            Span<nint> av = stackalloc nint[11];
+            av[0] = qP; av[1] = kP; av[2] = vP; av[3] = oP; av[4] = ssP;
+            av[5] = pNH; av[6] = pNKV; av[7] = pHD; av[8] = pSL; av[9] = pMSL;
+            av[10] = GraphFloatBits(pScale);
+            TrackPositionNode(_attentionQ8Kernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, av,
+                [(8, GraphPosKind.PositionPlus1, 0)]);
+        }
+    }
+
+    /// <summary>q8_0-read variant of <see cref="AttentionSwaBf16"/> (issue #179).</summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
+    public void AttentionSwaQ8_0(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+                                 Tensor? scoresScratch,
+                                 int position, int windowSize, int headDim,
+                                 int numHeads, int numKvHeads, int maxSeqLen,
+                                 float attnScale = -1f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        int windowEnd   = position + 1;
+        int windowStart = windowEnd - windowSize;
+        if (windowStart < 0) windowStart = 0;
+
+        nint qP = GetDevPtr(q);
+        nint kP = GetDevPtr(kCache);
+        nint vP = GetDevPtr(vCache);
+        nint oP = GetDevPtr(output);
+        nint ssP = scoresScratch is { } sv ? GetDevPtr(sv) : nint.Zero;
+        int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim;
+        int  pWS = windowStart, pWE = windowEnd, pMSL = maxSeqLen;
+        float pScale = attnScale;
+        nint* args = stackalloc nint[12]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
+            (nint)(&ssP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pWS), (nint)(&pWE), (nint)(&pMSL), (nint)(&pScale)
+        };
+        int r = NvrtcInterop.LaunchKernel(_attentionSwaQ8Kernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_swa_q8_0) failed: {r}");
+
+        if (_graphCapturing)
+        {
+            Span<nint> av = stackalloc nint[12];
+            av[0] = qP; av[1] = kP; av[2] = vP; av[3] = oP; av[4] = ssP;
+            av[5] = pNH; av[6] = pNKV; av[7] = pHD;
+            av[8] = pWS; av[9] = pWE; av[10] = pMSL; av[11] = GraphFloatBits(pScale);
+            TrackPositionNode(_attentionSwaQ8Kernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, av,
+                [(8, GraphPosKind.SwaWindowStart, windowSize), (9, GraphPosKind.SwaWindowEnd, 0)]);
+        }
+    }
+
+    /// <summary>q8_0-read variant of <see cref="AttentionSwaBatchedBf16"/> (issue #179).</summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
+    public void AttentionSwaBatchedQ8_0(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
+        int numHeads, int numKvHeads, int headDim,
+        int startPos, int windowSize, int maxSeqLen, int nTok, float attnScale = -1f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (windowSize <= 0 || windowSize > 4096)
+            throw new ArgumentException(
+                $"AttentionSwaBatchedQ8_0 requires 0 < windowSize ≤ 4096 (shared-scores path); got {windowSize}.",
+                nameof(windowSize));
+
+        nint qP = GetDevPtr(qAll), kP = GetDevPtr(kCache), vP = GetDevPtr(vCache), oP = GetDevPtr(outAll);
+        int pNH = numHeads, pNKV = numKvHeads, pHD = headDim;
+        int pSP = startPos, pWS = windowSize, pMSL = maxSeqLen, pN = nTok;
+        float pScale = attnScale;
+        nint* args = stackalloc nint[12]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pSP), (nint)(&pWS), (nint)(&pMSL), (nint)(&pN), (nint)(&pScale)
+        };
+        int r = NvrtcInterop.LaunchKernel(_attentionSwaBatchedQ8Kernel, (uint)numHeads, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_swa_batched_q8_0) failed: {r}");
+    }
+
+    /// <summary>q8_0-store variant of <see cref="KvAppendBatchedBf16"/> (issue #179).</summary>
+    public void KvAppendBatchedQ8_0(Tensor kAll, Tensor vAll, Tensor kCache, Tensor vCache,
+                                    int kvDim, int startPos, int maxSeqLen, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint kPtr = GetDevPtr(kAll), vPtr = GetDevPtr(vAll);
+        nint kcP = GetDevPtr(kCache), vcP = GetDevPtr(vCache);
+        int pKD = kvDim, pSP = startPos, pMSL = maxSeqLen, pN = nTok;
+        nint* args = stackalloc nint[8]
+        {
+            (nint)(&kPtr), (nint)(&vPtr), (nint)(&kcP), (nint)(&vcP),
+            (nint)(&pKD), (nint)(&pSP), (nint)(&pMSL), (nint)(&pN)
+        };
+        uint grid = (uint)((kvDim + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_kvAppendBatchedQ8Kernel, grid, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kv_append_batched_q8_0) failed: {r}");
+    }
+
+    /// <summary>q8_0-read variant of <see cref="AttentionBatchedBf16"/> (issue #179).</summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
+    public void AttentionBatchedQ8_0(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
+                                     int numHeads, int numKvHeads, int headDim,
+                                     int startPos, int maxSeqLen, int nTok, float attnScale = -1f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (startPos + nTok > 4096)
+            throw new ArgumentException(
+                $"AttentionBatchedQ8_0 requires startPos+nTok ≤ 4096 (shared-scores path); got {startPos}+{nTok}.");
+
+        nint qP = GetDevPtr(qAll), kP = GetDevPtr(kCache), vP = GetDevPtr(vCache), oP = GetDevPtr(outAll);
+        int pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pSP = startPos, pMSL = maxSeqLen, pN = nTok;
+        float pScale = attnScale;
+        nint* args = stackalloc nint[11]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD), (nint)(&pSP), (nint)(&pMSL), (nint)(&pN), (nint)(&pScale)
+        };
+        int r = NvrtcInterop.LaunchKernel(_fullSeqAttentionQ8Kernel, (uint)numHeads, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(full_seq_attention_q8_0) failed: {r}");
+    }
+
+    /// <summary>q8_0-read variant of <see cref="AttentionBatchedWaveBf16"/> (issue #179).</summary>
+    /// <param name="attnScale">Softmax score scale: a positive value overrides (Gemma 4 passes 1.0); ≤0 (default -1) uses 1/sqrt(headDim).</param>
+    public void AttentionBatchedWaveQ8_0(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
+                                         int numHeads, int numKvHeads, int headDim,
+                                         int startPos, int maxSeqLen, int nTok, float attnScale = -1f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        int scoreStride = startPos + nTok;
+        long perQuery = (long)numHeads * scoreStride;
+        long budget = WaveScratchBudgetFloats();
+        int W = (int)Math.Max(1, Math.Min(nTok, budget / Math.Max(1, perQuery)));
+        EnsureWaveScratch((long)W * perQuery);
+
+        int qDim = numHeads * headDim;
+        nint qBase = GetDevPtr(qAll), oBase = GetDevPtr(outAll);
+        nint kP = GetDevPtr(kCache), vP = GetDevPtr(vCache);
+        nint scP = _waveScratchBuf;
+        nint qP = qBase, oP = oBase;
+        int spEff = startPos, pN = 0;
+        int pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pMSL = maxSeqLen, pStride = scoreStride;
+        float pScale = attnScale;
+        nint* args = stackalloc nint[13]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&oP), (nint)(&scP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&spEff), (nint)(&pMSL), (nint)(&pN), (nint)(&pStride), (nint)(&pScale)
+        };
+        for (int waveStart = 0; waveStart < nTok; waveStart += W)
+        {
+            int wThis = Math.Min(W, nTok - waveStart);
+            qP = qBase + (nint)((long)waveStart * qDim * sizeof(float));
+            oP = oBase + (nint)((long)waveStart * qDim * sizeof(float));
+            spEff = startPos + waveStart;
+            pN = wThis;
+            int r = NvrtcInterop.LaunchKernel(_fullSeqAttentionGlobalQ8Kernel,
+                (uint)numHeads, (uint)wThis, 1, 256, 1, 1, 0, _stream, args, null);
+            if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(full_seq_attention_global_q8_0) failed: {r}");
         }
     }
 
@@ -5025,7 +5282,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _fullSeqAttentionKernel, _fullSeqAttentionBf16Kernel,
             _fullSeqAttentionGlobalKernel, _fullSeqAttentionGlobalBf16Kernel,
             _flashAttnPrefillKernel, _mmaTestM16N8K16Kernel, _flashAttnPrefillTcKernel,
-            _flashAttnPrefillTc2Kernel, _flashAttnPrefillTc2Bf16Kernel,
+            _flashAttnPrefillTc2Kernel, _flashAttnPrefillTc2Bf16Kernel, _flashAttnPrefillTc2Q8Kernel,
+            _kvAppendQ8Kernel, _kvAppendBatchedQ8Kernel,
+            _attentionQ8Kernel, _attentionSwaQ8Kernel, _attentionSwaBatchedQ8Kernel,
+            _fullSeqAttentionQ8Kernel, _fullSeqAttentionGlobalQ8Kernel,
         ];
         foreach (nint k in kernels)
         {
@@ -5122,6 +5382,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _flashAttnPrefillTcKernel = GetKernelFunc("llm_flash_attn_prefill_tc");
         _flashAttnPrefillTc2Kernel = GetKernelFunc("llm_flash_attn_prefill_tc2");
         _flashAttnPrefillTc2Bf16Kernel = GetKernelFunc("llm_flash_attn_prefill_tc2_bf16");
+        _flashAttnPrefillTc2Q8Kernel = GetKernelFunc("llm_flash_attn_prefill_tc2_q8_0");
         _rmsNormBatchedKernel  = GetKernelFunc("llm_rmsnorm_batched");
         _headNormBatchedKernel = GetKernelFunc("llm_head_norm_batched");
         _headNormQkKernel        = GetKernelFunc("llm_head_norm_qk");
@@ -5131,10 +5392,14 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _ropeNeoxWithFactorsBatchedKernel = GetKernelFunc("llm_rope_neox_with_factors_batched");
         _attentionKernel       = GetKernelFunc("llm_attention");
         _attentionBf16Kernel   = GetKernelFunc("llm_attention_bf16");
+        _attentionQ8Kernel     = GetKernelFunc("llm_attention_q8_0");
         _attentionSwaKernel    = GetKernelFunc("llm_attention_swa");
         _attentionSwaBatchedKernel = GetKernelFunc("llm_attention_swa_batched");
         _attentionSwaBf16Kernel = GetKernelFunc("llm_attention_swa_bf16");
         _attentionSwaBatchedBf16Kernel = GetKernelFunc("llm_attention_swa_batched_bf16");
+        _attentionSwaQ8Kernel = GetKernelFunc("llm_attention_swa_q8_0");
+        _attentionSwaBatchedQ8Kernel = GetKernelFunc("llm_attention_swa_batched_q8_0");
+        _kvAppendQ8Kernel      = GetKernelFunc("llm_kv_append_q8_0");
         _geluTanhMulKernel     = GetKernelFunc("llm_gelu_tanh_mul");
         _geluTanhMulStridedKernel = GetKernelFunc("llm_gelu_tanh_mul_strided");
         _softcapKernel         = GetKernelFunc("llm_softcap_inplace");
@@ -5170,10 +5435,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _gdnRecurrenceScanKernel           = GetKernelFunc("llm_gdn_recurrence_scan");
         _kvAppendBatchedKernel             = GetKernelFunc("llm_kv_append_batched");
         _kvAppendBatchedBf16Kernel         = GetKernelFunc("llm_kv_append_batched_bf16");
+        _kvAppendBatchedQ8Kernel           = GetKernelFunc("llm_kv_append_batched_q8_0");
         _fullSeqAttentionKernel            = GetKernelFunc("llm_full_seq_attention");
         _fullSeqAttentionBf16Kernel        = GetKernelFunc("llm_full_seq_attention_bf16");
+        _fullSeqAttentionQ8Kernel          = GetKernelFunc("llm_full_seq_attention_q8_0");
         _fullSeqAttentionGlobalKernel      = GetKernelFunc("llm_full_seq_attention_global");
         _fullSeqAttentionGlobalBf16Kernel  = GetKernelFunc("llm_full_seq_attention_global_bf16");
+        _fullSeqAttentionGlobalQ8Kernel    = GetKernelFunc("llm_full_seq_attention_global_q8_0");
     }
 
     /// <summary>

@@ -112,6 +112,22 @@ __device__ __forceinline__ unsigned int sharpi_fp32_to_bf16(float f)
 __device__ __forceinline__ float sharpi_kvload(const float* __restrict__ p, long i) { return p[i]; }
 __device__ __forceinline__ float sharpi_kvload(const unsigned short* __restrict__ p, long i) { return sharpi_bf16_to_fp32((unsigned int)p[i]); }
 
+// Issue #179 (q8_0 KV): block-quantized cache element. One block packs 32 int8
+// quants sharing one fp16 scale (ggml block_q8_0 layout; 34 B/block ≈ 1.06 B/elem,
+// ~half of bf16, ~quarter of fp32). The store side (llm_kv_append_q8_0 / _batched)
+// computes the scale per 32-lane warp; this overload decodes ONE element so the
+// SAME templated attention/flash bodies that serve fp32/bf16 also serve q8_0 via
+// sharpi_kvload. kv_dim and kv_head·head_dim are both multiples of 32, so a KV
+// row's blocks never straddle a row boundary and the flat element index `i` maps
+// cleanly to block `i>>5`, lane `i&31`.
+struct block_q8_0 { unsigned short d; signed char qs[32]; };
+__device__ __forceinline__ float sharpi_kvload(const block_q8_0* __restrict__ p, long i)
+{
+    long b = i >> 5;
+    int  j = (int)(i & 31);
+    return sharpi_fp16_to_fp32((unsigned int)p[b].d) * (float)p[b].qs[j];
+}
+
 // Read one byte from a uint32-stride buffer at absolute byte offset B.
 __device__ __forceinline__ unsigned int sharpi_byte_at(const unsigned int* __restrict__ buf, long B)
 {
@@ -635,6 +651,54 @@ extern ""C"" __global__ void llm_kv_append_bf16(
     long offset = (long)(position % max_seq_len) * (long)kv_dim + (long)i;
     k_cache[offset] = (unsigned short)sharpi_fp32_to_bf16(k_in[i]);
     v_cache[offset] = (unsigned short)sharpi_fp32_to_bf16(v_in[i]);
+}
+
+// ── KV cache append (q8_0 store, issue #179) ───────────────────────────────
+// FP32 K/V activations in → block-quantized q8_0 K/V cache out (~quarter of the
+// fp32 footprint). Each hardware warp (32 consecutive lanes) owns one q8_0 block:
+// it warp-reduces the sub-block amax, derives the fp16 scale d = amax/127, and
+// writes 32 int8 quants (rintf, clamped ±127 — the codebase's q8 convention, see
+// llm_quantize_q8_1) + the scale. kv_dim is a multiple of 32, so block boundaries
+// align to KV-row boundaries; the ring slot `position % max_seq_len` matches the
+// f32/bf16 appends. Read-side recovery is sharpi_kvload(const block_q8_0*, ...).
+__device__ __forceinline__ void sharpi_q8_append_one(
+    float val, bool valid, block_q8_0* __restrict__ cache, long block_idx, int lane)
+{
+    // amax across the 32-lane sub-block (all lanes participate — no early return).
+    float a = fabsf(val);
+    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 16));
+    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a,  8));
+    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a,  4));
+    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a,  2));
+    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a,  1));
+    float d    = a / 127.f;
+    float invd = (d == 0.f) ? 0.f : (1.f / d);
+    int   q    = (int)rintf(val * invd);
+    if (q >  127) q =  127;
+    if (q < -127) q = -127;
+    if (!valid) return;
+    block_q8_0* dst = cache + block_idx;
+    dst->qs[lane] = (signed char)q;
+    if (lane == 0) dst->d = (unsigned short)sharpi_fp32_to_fp16(d);
+}
+
+extern ""C"" __global__ void llm_kv_append_q8_0(
+    const float* __restrict__ k_in,
+    const float* __restrict__ v_in,
+    block_q8_0* __restrict__ k_cache,
+    block_q8_0* __restrict__ v_cache,
+    int kv_dim, int position, int max_seq_len)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int lane = (int)(threadIdx.x & 31);
+    bool valid = (i < kv_dim);
+    // Flat element index in the cache; row = position % max_seq_len. Both kv_dim and
+    // the row stride are multiples of 32, so `(row*kv_dim + i) >> 5` is the block.
+    long row   = (long)(position % max_seq_len);
+    long elem  = row * (long)kv_dim + (long)i;
+    long block = elem >> 5;
+    sharpi_q8_append_one(valid ? k_in[i] : 0.f, valid, k_cache, block, lane);
+    sharpi_q8_append_one(valid ? v_in[i] : 0.f, valid, v_cache, block, lane);
 }
 
 // ── Embedding lookup (F32 table) ───────────────────────────────────────────
@@ -6173,6 +6237,18 @@ extern ""C"" __global__ void llm_flash_attn_prefill_tc2_bf16(
         num_heads, num_kv_heads, head_dim, start_pos, window_size, max_seq_len, n_tok, attn_scale);
 }
 
+extern ""C"" __global__ void llm_flash_attn_prefill_tc2_q8_0(
+    const float* __restrict__ q_all,
+    const block_q8_0* __restrict__ k_cache,
+    const block_q8_0* __restrict__ v_cache,
+    float* __restrict__ out_all,
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int window_size, int max_seq_len, int n_tok, float attn_scale)
+{
+    sharpi_flash_attn_prefill_tc2_impl<block_q8_0>(q_all, k_cache, v_cache, out_all,
+        num_heads, num_kv_heads, head_dim, start_pos, window_size, max_seq_len, n_tok, attn_scale);
+}
+
 // ── Flash-attention prefill (issue #141 attention) ─────────────────────────
 // Memory-efficient batched SDPA replacing the scalar llm_full_seq_attention /
 // llm_attention_swa_batched (one 256-thread block PER query, each re-reading its
@@ -6420,10 +6496,14 @@ extern ""C"" __global__ void llm_attention_swa_batched(
 // read points; q, out, score scratch, and all softmax arithmetic stay fp32, so
 // precision matches the fp32 SWA kernel and only the cache footprint is halved.
 // Preserves the SWA ring (`abs_t % max_seq_len`) and Gemma 4's attn_scale=1.0.
-extern ""C"" __global__ void llm_attention_swa_bf16(
+// Issue #179: templated K/V dtype (KV = unsigned short for bf16, block_q8_0 for
+// q8_0). Body unchanged bar the two cache loads, which go through sharpi_kvload;
+// the bf16 thunk is byte-identical to the pre-q8_0 kernel. extern ""C"" thunks below.
+template<typename KV>
+__device__ void llm_attention_swa_kv_impl(
     const float* __restrict__ q,
-    const unsigned short* __restrict__ k_cache,
-    const unsigned short* __restrict__ v_cache,
+    const KV* __restrict__ k_cache,
+    const KV* __restrict__ v_cache,
     float* __restrict__ out,
     float* __restrict__ scores_scratch,    // [num_heads * max_seq_len], null when eff_seq ≤ MAX_STORED_SCORES
     int num_heads, int num_kv_heads, int head_dim,
@@ -6453,7 +6533,7 @@ extern ""C"" __global__ void llm_attention_swa_bf16(
         float dot = 0.f;
         long k_off = (long)(abs_t % max_seq_len) * (long)kv_dim + (long)kv_head * (long)head_dim;
         for (int d = 0; d < head_dim; d++)
-            dot += q[q_off + d] * sharpi_bf16_to_fp32((unsigned int)k_cache[k_off + d]);
+            dot += q[q_off + d] * sharpi_kvload(k_cache, k_off + d);
         float score = dot * scale;
         if (use_shared) shared_scores[t] = score;
         else            head_scratch[t]  = score;
@@ -6507,20 +6587,47 @@ extern ""C"" __global__ void llm_attention_swa_bf16(
             int abs_t = t + window_start;
             float weight = use_shared ? shared_scores[t] : head_scratch[t];
             long v_off = (long)(abs_t % max_seq_len) * (long)kv_dim + (long)kv_head * (long)head_dim;
-            acc += weight * sharpi_bf16_to_fp32((unsigned int)v_cache[v_off + d]);
+            acc += weight * sharpi_kvload(v_cache, v_off + d);
         }
         out[out_off + d] = acc;
     }
+}
+
+extern ""C"" __global__ void llm_attention_swa_bf16(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_cache,
+    const unsigned short* __restrict__ v_cache,
+    float* __restrict__ out,
+    float* __restrict__ scores_scratch,
+    int num_heads, int num_kv_heads, int head_dim,
+    int window_start, int window_end, int max_seq_len, float attn_scale)
+{
+    llm_attention_swa_kv_impl<unsigned short>(q, k_cache, v_cache, out, scores_scratch,
+        num_heads, num_kv_heads, head_dim, window_start, window_end, max_seq_len, attn_scale);
+}
+
+extern ""C"" __global__ void llm_attention_swa_q8_0(
+    const float* __restrict__ q,
+    const block_q8_0* __restrict__ k_cache,
+    const block_q8_0* __restrict__ v_cache,
+    float* __restrict__ out,
+    float* __restrict__ scores_scratch,
+    int num_heads, int num_kv_heads, int head_dim,
+    int window_start, int window_end, int max_seq_len, float attn_scale)
+{
+    llm_attention_swa_kv_impl<block_q8_0>(q, k_cache, v_cache, out, scores_scratch,
+        num_heads, num_kv_heads, head_dim, window_start, window_end, max_seq_len, attn_scale);
 }
 
 // ── Batched sliding-window attention, bf16 K/V cache (issues #179 + #27) ────
 // Bf16-store variant of `llm_attention_swa_batched`. One 256-thread block per
 // (head, query); K/V read as bf16, all arithmetic fp32. Bit-identical (modulo
 // the bf16 store rounding) to the per-token llm_attention_swa_bf16.
-extern ""C"" __global__ void llm_attention_swa_batched_bf16(
+template<typename KV>
+__device__ void llm_attention_swa_batched_kv_impl(
     const float* __restrict__ q_all,      // [n_tok, num_heads*head_dim]
-    const unsigned short* __restrict__ k_cache,
-    const unsigned short* __restrict__ v_cache,
+    const KV* __restrict__ k_cache,
+    const KV* __restrict__ v_cache,
     float* __restrict__ out_all,          // [n_tok, num_heads*head_dim]
     int num_heads, int num_kv_heads, int head_dim,
     int start_pos, int window_size, int max_seq_len, int n_tok, float attn_scale)
@@ -6554,7 +6661,7 @@ extern ""C"" __global__ void llm_attention_swa_batched_bf16(
         float dot = 0.f;
         long k_off = (long)(abs_t % max_seq_len) * (long)kv_dim + (long)kv_head * (long)head_dim;
         for (int dd = 0; dd < head_dim; dd++)
-            dot += q[q_off + dd] * sharpi_bf16_to_fp32((unsigned int)k_cache[k_off + dd]);
+            dot += q[q_off + dd] * sharpi_kvload(k_cache, k_off + dd);
         shared_scores[t] = dot * scale;
     }
     __syncthreads();
@@ -6595,10 +6702,34 @@ extern ""C"" __global__ void llm_attention_swa_batched_bf16(
         for (int t = 0; t < eff_seq; t++) {
             int abs_t = t + window_start;
             long v_off = (long)(abs_t % max_seq_len) * (long)kv_dim + (long)kv_head * (long)head_dim;
-            acc += shared_scores[t] * sharpi_bf16_to_fp32((unsigned int)v_cache[v_off + dd]);
+            acc += shared_scores[t] * sharpi_kvload(v_cache, v_off + dd);
         }
         out[out_off + dd] = acc;
     }
+}
+
+extern ""C"" __global__ void llm_attention_swa_batched_bf16(
+    const float* __restrict__ q_all,
+    const unsigned short* __restrict__ k_cache,
+    const unsigned short* __restrict__ v_cache,
+    float* __restrict__ out_all,
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int window_size, int max_seq_len, int n_tok, float attn_scale)
+{
+    llm_attention_swa_batched_kv_impl<unsigned short>(q_all, k_cache, v_cache, out_all,
+        num_heads, num_kv_heads, head_dim, start_pos, window_size, max_seq_len, n_tok, attn_scale);
+}
+
+extern ""C"" __global__ void llm_attention_swa_batched_q8_0(
+    const float* __restrict__ q_all,
+    const block_q8_0* __restrict__ k_cache,
+    const block_q8_0* __restrict__ v_cache,
+    float* __restrict__ out_all,
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int window_size, int max_seq_len, int n_tok, float attn_scale)
+{
+    llm_attention_swa_batched_kv_impl<block_q8_0>(q_all, k_cache, v_cache, out_all,
+        num_heads, num_kv_heads, head_dim, start_pos, window_size, max_seq_len, n_tok, attn_scale);
 }
 
 // ── Scaled dot-product attention with GQA (bf16 K/V cache) ─────────────────
@@ -6608,10 +6739,11 @@ extern ""C"" __global__ void llm_attention_swa_batched_bf16(
 // Bf16 → fp32 promotion happens at the dot/weighted-sum read points, so all
 // arithmetic precision (and overflow head-room) matches the fp32 kernel —
 // only the cache footprint is halved. See issue #27.
-extern ""C"" __global__ void llm_attention_bf16(
+template<typename KV>
+__device__ void llm_attention_kv_impl(
     const float* __restrict__ q,
-    const unsigned short* __restrict__ k_cache,
-    const unsigned short* __restrict__ v_cache,
+    const KV* __restrict__ k_cache,
+    const KV* __restrict__ v_cache,
     float* __restrict__ out,
     float* __restrict__ scores_scratch,
     int num_heads, int num_kv_heads, int head_dim,
@@ -6639,7 +6771,7 @@ extern ""C"" __global__ void llm_attention_bf16(
         float dot = 0.f;
         long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
         for (int d = 0; d < head_dim; d++)
-            dot += q[q_off + d] * sharpi_bf16_to_fp32((unsigned int)k_cache[k_off + d]);
+            dot += q[q_off + d] * sharpi_kvload(k_cache, k_off + d);
         float score = dot * scale;
         if (use_shared) shared_scores[t] = score;
         else            head_scratch[t]  = score;
@@ -6692,10 +6824,36 @@ extern ""C"" __global__ void llm_attention_bf16(
         for (int t = 0; t < seq_len; t++) {
             float weight = use_shared ? shared_scores[t] : head_scratch[t];
             long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
-            acc += weight * sharpi_bf16_to_fp32((unsigned int)v_cache[v_off + d]);
+            acc += weight * sharpi_kvload(v_cache, v_off + d);
         }
         out[out_off + d] = acc;
     }
+}
+
+extern ""C"" __global__ void llm_attention_bf16(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_cache,
+    const unsigned short* __restrict__ v_cache,
+    float* __restrict__ out,
+    float* __restrict__ scores_scratch,
+    int num_heads, int num_kv_heads, int head_dim,
+    int seq_len, int max_seq_len, float attn_scale)
+{
+    llm_attention_kv_impl<unsigned short>(q, k_cache, v_cache, out, scores_scratch,
+        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, attn_scale);
+}
+
+extern ""C"" __global__ void llm_attention_q8_0(
+    const float* __restrict__ q,
+    const block_q8_0* __restrict__ k_cache,
+    const block_q8_0* __restrict__ v_cache,
+    float* __restrict__ out,
+    float* __restrict__ scores_scratch,
+    int num_heads, int num_kv_heads, int head_dim,
+    int seq_len, int max_seq_len, float attn_scale)
+{
+    llm_attention_kv_impl<block_q8_0>(q, k_cache, v_cache, out, scores_scratch,
+        num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, attn_scale);
 }
 
 // ── SnapKV: per-(query, head) attention scoring against the K cache ────────
@@ -7393,6 +7551,24 @@ extern ""C"" __global__ void llm_kv_append_batched_bf16(
     v_cache[off] = (unsigned short)sharpi_fp32_to_bf16(v_all[(long)i * kv_dim + e]);
 }
 
+// q8_0-store variant (issue #179). Matches `llm_kv_append_q8_0`; one hardware warp
+// per q8_0 block, grid = (ceil(kv_dim/256), n_tok). The token's source row is
+// dense fp32 [i*kv_dim + e]; the cache block index uses the ring slot.
+extern ""C"" __global__ void llm_kv_append_batched_q8_0(
+    const float* __restrict__ k_all, const float* __restrict__ v_all,
+    block_q8_0* __restrict__ k_cache, block_q8_0* __restrict__ v_cache,
+    int kv_dim, int start_pos, int max_seq_len, int n_tok)
+{
+    int e = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int i = (int)blockIdx.y;
+    int lane = (int)(threadIdx.x & 31);
+    bool valid = (e < kv_dim && i < n_tok);
+    long row   = (long)((start_pos + i) % max_seq_len);
+    long block = (row * (long)kv_dim + (long)e) >> 5;
+    sharpi_q8_append_one(valid ? k_all[(long)i * kv_dim + e] : 0.f, valid, k_cache, block, lane);
+    sharpi_q8_append_one(valid ? v_all[(long)i * kv_dim + e] : 0.f, valid, v_cache, block, lane);
+}
+
 // ── Full-sequence (batched-query) scaled dot-product attention ──────────────
 // Implements CudaBackend.FullSeqAttention for prompt prefill. grid = (num_heads,
 // n_tok): block (h, i) computes the attention output for query i (absolute
@@ -7479,10 +7655,11 @@ extern ""C"" __global__ void llm_full_seq_attention(
 }
 
 // bf16-read variant (default KV dtype). Matches `llm_attention_bf16`'s use_shared path.
-extern ""C"" __global__ void llm_full_seq_attention_bf16(
+template<typename KV>
+__device__ void llm_full_seq_attention_kv_impl(
     const float* __restrict__ q_all,
-    const unsigned short* __restrict__ k_cache,
-    const unsigned short* __restrict__ v_cache,
+    const KV* __restrict__ k_cache,
+    const KV* __restrict__ v_cache,
     float* __restrict__ out_all,
     int num_heads, int num_kv_heads, int head_dim,
     int start_pos, int max_seq_len, int n_tok, float attn_scale)
@@ -7511,7 +7688,7 @@ extern ""C"" __global__ void llm_full_seq_attention_bf16(
         float dot = 0.f;
         long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
         for (int dd = 0; dd < head_dim; dd++)
-            dot += q[q_off + dd] * sharpi_bf16_to_fp32((unsigned int)k_cache[k_off + dd]);
+            dot += q[q_off + dd] * sharpi_kvload(k_cache, k_off + dd);
         shared_scores[t] = dot * scale;
     }
     __syncthreads();
@@ -7551,10 +7728,34 @@ extern ""C"" __global__ void llm_full_seq_attention_bf16(
         float acc = 0.f;
         for (int t = 0; t < seq_len; t++) {
             long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
-            acc += shared_scores[t] * sharpi_bf16_to_fp32((unsigned int)v_cache[v_off + dd]);
+            acc += shared_scores[t] * sharpi_kvload(v_cache, v_off + dd);
         }
         out[out_off + dd] = acc;
     }
+}
+
+extern ""C"" __global__ void llm_full_seq_attention_bf16(
+    const float* __restrict__ q_all,
+    const unsigned short* __restrict__ k_cache,
+    const unsigned short* __restrict__ v_cache,
+    float* __restrict__ out_all,
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int max_seq_len, int n_tok, float attn_scale)
+{
+    llm_full_seq_attention_kv_impl<unsigned short>(q_all, k_cache, v_cache, out_all,
+        num_heads, num_kv_heads, head_dim, start_pos, max_seq_len, n_tok, attn_scale);
+}
+
+extern ""C"" __global__ void llm_full_seq_attention_q8_0(
+    const float* __restrict__ q_all,
+    const block_q8_0* __restrict__ k_cache,
+    const block_q8_0* __restrict__ v_cache,
+    float* __restrict__ out_all,
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int max_seq_len, int n_tok, float attn_scale)
+{
+    llm_full_seq_attention_kv_impl<block_q8_0>(q_all, k_cache, v_cache, out_all,
+        num_heads, num_kv_heads, head_dim, start_pos, max_seq_len, n_tok, attn_scale);
 }
 
 // ── Full-sequence (batched-query) SDPA, global-scratch (issue #118) ─────────
@@ -7648,10 +7849,11 @@ extern ""C"" __global__ void llm_full_seq_attention_global(
 }
 
 // bf16-read variant (default KV dtype). Matches `llm_attention_bf16`'s global path.
-extern ""C"" __global__ void llm_full_seq_attention_global_bf16(
+template<typename KV>
+__device__ void llm_full_seq_attention_global_kv_impl(
     const float* __restrict__ q_all,
-    const unsigned short* __restrict__ k_cache,
-    const unsigned short* __restrict__ v_cache,
+    const KV* __restrict__ k_cache,
+    const KV* __restrict__ v_cache,
     float* __restrict__ out_all,
     float* __restrict__ scores_scratch,
     int num_heads, int num_kv_heads, int head_dim,
@@ -7680,7 +7882,7 @@ extern ""C"" __global__ void llm_full_seq_attention_global_bf16(
         float dot = 0.f;
         long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
         for (int dd = 0; dd < head_dim; dd++)
-            dot += q[q_off + dd] * sharpi_bf16_to_fp32((unsigned int)k_cache[k_off + dd]);
+            dot += q[q_off + dd] * sharpi_kvload(k_cache, k_off + dd);
         sc[t] = dot * scale;
     }
     __syncthreads();
@@ -7720,10 +7922,36 @@ extern ""C"" __global__ void llm_full_seq_attention_global_bf16(
         float acc = 0.f;
         for (int t = 0; t < seq_len; t++) {
             long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
-            acc += sc[t] * sharpi_bf16_to_fp32((unsigned int)v_cache[v_off + dd]);
+            acc += sc[t] * sharpi_kvload(v_cache, v_off + dd);
         }
         out[out_off + dd] = acc;
     }
+}
+
+extern ""C"" __global__ void llm_full_seq_attention_global_bf16(
+    const float* __restrict__ q_all,
+    const unsigned short* __restrict__ k_cache,
+    const unsigned short* __restrict__ v_cache,
+    float* __restrict__ out_all,
+    float* __restrict__ scores_scratch,
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int max_seq_len, int n_tok, int score_stride, float attn_scale)
+{
+    llm_full_seq_attention_global_kv_impl<unsigned short>(q_all, k_cache, v_cache, out_all,
+        scores_scratch, num_heads, num_kv_heads, head_dim, start_pos, max_seq_len, n_tok, score_stride, attn_scale);
+}
+
+extern ""C"" __global__ void llm_full_seq_attention_global_q8_0(
+    const float* __restrict__ q_all,
+    const block_q8_0* __restrict__ k_cache,
+    const block_q8_0* __restrict__ v_cache,
+    float* __restrict__ out_all,
+    float* __restrict__ scores_scratch,
+    int num_heads, int num_kv_heads, int head_dim,
+    int start_pos, int max_seq_len, int n_tok, int score_stride, float attn_scale)
+{
+    llm_full_seq_attention_global_kv_impl<block_q8_0>(q_all, k_cache, v_cache, out_all,
+        scores_scratch, num_heads, num_kv_heads, head_dim, start_pos, max_seq_len, n_tok, score_stride, attn_scale);
 }
 ";
 }
