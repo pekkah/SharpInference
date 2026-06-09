@@ -505,11 +505,65 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // TurboQuant requires per-block ring bookkeeping that doesn't yet exist
         // (issue #60); explicit opt-in + TQ is rejected up front, and the auto
         // path stays disabled when TQ is on.
-        // KV-cache dtype (issue #179). bf16 narrows the store to half the footprint;
-        // it composes with neither TurboQuant (its own quantized ring) nor SnapKV
-        // physical compaction (no bf16 compact kernel wired on this path yet), so both
-        // are rejected up front and auto-SnapKV is disabled under bf16 below.
-        _kvDType = ParseKvDType(Environment.GetEnvironmentVariable("SHARPI_KV_DTYPE"));
+        // KV-cache dtype (issue #179). bf16 narrows the store to half the footprint,
+        // q8_0 to ~a quarter; both compose with neither TurboQuant (its own quantized
+        // ring) nor SnapKV physical compaction (no narrowed compact kernel wired on this
+        // path yet), so both are rejected up front and auto-SnapKV is disabled under a
+        // narrowed dtype below.
+        string? kvDTypeEnv = Environment.GetEnvironmentVariable("SHARPI_KV_DTYPE");
+        bool kvDTypeExplicit = !string.IsNullOrWhiteSpace(kvDTypeEnv);
+        _kvDType = ParseKvDType(kvDTypeEnv);
+        _snapKvCfg = SnapKvConfig.FromEnvironment();
+
+        // Auto-narrow the KV dtype (issue #185 item 1). When the resolved context's fp32
+        // KV cache won't fit the VRAM budget, the construction-time per-layer K/V Allocate
+        // below would fail with "cudaMalloc failed: 2" instead of degrading gracefully —
+        // capping context at fp32 even though a narrowed store would fit. Mirror the
+        // auto-SnapKV VRAM heuristic: pick a narrowed dtype (bf16 preferred; q8_0 if bf16
+        // still won't fit and the geometry supports it) and log the choice, so an oversized
+        // -c reaches long context instead of erroring.
+        //
+        // Precedence vs auto-SnapKV: auto-narrow runs FIRST and wins. SnapKV does NOT
+        // shrink this construction-time allocation (the cache is allocated full-_maxSeqLen
+        // up front; eviction only bounds the *logical* length at runtime), so it cannot
+        // prevent the cudaMalloc failure — only narrowing the element width can. Narrowing
+        // is also exact-context, argmax-stable, and full-speed-prefill, whereas SnapKV
+        // evicts tokens (lossy). We therefore auto-narrow only when the operator set
+        // NEITHER an explicit --kv-type NOR an explicit SnapKV budget; either explicit
+        // choice is respected and never overridden (an explicit fp32 still errors loudly at
+        // allocation rather than silently narrowing; an explicit SnapKV budget is honoured
+        // even though it can't avert the alloc failure — the operator's call). When
+        // auto-narrow fires it sets a narrowed _kvDType, which flips kvNarrowed below and
+        // disables auto-SnapKV.
+        if (!_tqEnabled && !kvDTypeExplicit && _kvDType == DType.Float32
+            && !_snapKvCfg.IsBudgetExplicit)
+        {
+            long availKvBytes = EstimateAvailableKvVram(model, gpu, hp);
+            long fp32KvBytes  = EstimateKvCacheBytes(hp, _maxSeqLen, DType.Float32);
+            long bf16KvBytes  = EstimateKvCacheBytes(hp, _maxSeqLen, DType.BFloat16);
+            _kvDType = ResolveKvDType(
+                _kvDType, kvDTypeExplicit, _tqEnabled,
+                availKvBytes, fp32KvBytes, bf16KvBytes, Q8KvGeometrySupported(hp),
+                out bool autoNarrowed);
+            if (autoNarrowed)
+            {
+                // bf16 footprint is already in hand; only q8_0 (or a best-effort bf16 that
+                // still won't fit) needs a recompute for the banner.
+                long chosenKvBytes = _kvDType == DType.BFloat16
+                    ? bf16KvBytes : EstimateKvCacheBytes(hp, _maxSeqLen, _kvDType);
+                // When even the narrowest store we could pick still won't fit, the per-layer
+                // Allocate below will cudaMalloc-fail — say so rather than imply success.
+                string fitNote = chosenKvBytes > availKvBytes
+                    ? " — still over budget, allocation may fail (context too large for this GPU)"
+                    : "";
+                Console.Error.WriteLine(
+                    $"[CudaForwardPass] KV auto-narrowed to {_kvDType} for context {_maxSeqLen}: fp32 KV " +
+                    $"~{fp32KvBytes / (1024.0 * 1024.0):F0} MiB exceeds the ~{availKvBytes / (1024.0 * 1024.0):F0} MiB " +
+                    $"VRAM KV budget ({_kvDType} ~{chosenKvBytes / (1024.0 * 1024.0):F0} MiB{fitNote}). " +
+                    "Set --kv-type fp32 to force fp32 (errors if it won't fit).");
+            }
+        }
+
         // bf16 and q8_0 both narrow the KV store; the gating below (TQ, SnapKV,
         // auto-SnapKV) applies identically to either narrowed dtype (issue #179).
         bool kvNarrowed = _kvDType != DType.Float32;
@@ -518,7 +572,6 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 $"SHARPI_KV_DTYPE={_kvDType} + TurboQuant is not supported (TQ owns the KV " +
                 "quantization). Use one or the other (issue #179).");
 
-        _snapKvCfg = SnapKvConfig.FromEnvironment();
         if (_tqEnabled && _snapKvCfg.IsBudgetExplicit && _snapKvCfg.Budget > 0)
             throw new NotSupportedException(
                 "SnapKV + TurboQuant composition is not yet implemented (issue #60). " +
@@ -3112,11 +3165,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     }
 
     /// <summary>
-    /// VRAM-based context-length estimator: subtract uploaded-weight bytes and a fixed
-    /// scratch budget from total VRAM, then divide what's left between K and V caches
-    /// (each FP32, [maxSeqLen, kvDim] per layer).
+    /// VRAM left for the KV cache after weights, attention/FFN scratch, and the driver
+    /// reserve. This is the budget the context estimator divides by per-token KV bytes,
+    /// and the budget the auto-narrow heuristic (issue #185) compares the fp32 KV
+    /// footprint against. Single-sourced so both stay in agreement.
     /// </summary>
-    public static int EstimateMaxContext(GgufModel model, CudaBackend gpu, ModelHyperparams hp)
+    internal static long EstimateAvailableKvVram(GgufModel model, CudaBackend gpu, ModelHyperparams hp)
     {
         long vramBytes = (long)gpu.VramBytes;
         if (vramBytes <= 0) vramBytes = 8L * 1024 * 1024 * 1024; // fallback assumption: 8 GB
@@ -3151,6 +3205,101 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         long reserved = Math.Max(vramBytes / 3, 2L * 1024 * 1024 * 1024);
         long available = vramBytes - weightBytes - scratchBytes - reserved;
         if (available <= 0) available = 64L * 1024 * 1024;
+        return available;
+    }
+
+    /// <summary>
+    /// Total KV-cache bytes (K + V, summed over layers) for the given context at the given
+    /// element dtype. Mirrors the ctor's per-layer allocation: per-layer head_dim / kv-head
+    /// counts and SWA window-ring sizing for gemma4-style models, the flat
+    /// <c>NumLayers × kvDim × maxCtx</c> formula otherwise; KV-share layers (Gemma 4 tail)
+    /// alias the source and allocate nothing. Used by the auto-narrow heuristic (#185) to
+    /// compare the fp32 / bf16 / q8_0 footprints against <see cref="EstimateAvailableKvVram"/>.
+    /// </summary>
+    internal static long EstimateKvCacheBytes(ModelHyperparams hp, int maxCtx, DType kvDType)
+    {
+        bool perLayerKv = hp.LayerHeadDim is not null;
+        int swaWindow = hp.SlidingWindowSize > 0 ? hp.SlidingWindowSize : maxCtx;
+        long total = 0;
+        for (int i = 0; i < hp.NumLayers; i++)
+        {
+            if (hp.KvSourceLayer is { } ksl && ksl[i] >= 0) continue; // aliased — no own pages
+            int layerHd = perLayerKv ? hp.LayerHeadDim![i] : hp.HeadDim;
+            int layerKvHeads = hp.LayerKvHeads is { } lkv ? lkv[i] : hp.NumKvHeads;
+            long layerKvDim = (long)layerKvHeads * layerHd;
+            long layerCtx = (perLayerKv && hp.IsSwaLayer is { } swa && swa[i])
+                ? SwaRingSize(maxCtx, swaWindow)
+                : maxCtx;
+            // The K and V buffers are allocated through the GPU buffer pool
+            // (gpu.Allocate, exact:false), which rounds every buffer up to the next power
+            // of two (GpuBufferPool.RoundUp). Round each buffer the same way so the
+            // estimate matches the VRAM the ctor will actually reserve: a raw byte sum
+            // undercounts by up to ~2× per buffer (q8_0 especially — its 34-byte blocks
+            // rarely land on a power of two), which could wrongly conclude fp32 fits and
+            // defeat the auto-narrow, leaving the original cudaMalloc failure.
+            long bufBytes = (long)CudaBackend.RoundUpAllocBytes(
+                (nuint)DTypeInfo.ByteSize(layerCtx * layerKvDim, kvDType));
+            total += 2 * bufBytes; // K + V
+        }
+        return total;
+    }
+
+    /// <summary>
+    /// True when every (non-aliased) layer's kvDim is a multiple of 32 — the q8_0 block size.
+    /// The q8_0 KV store quantizes per 32-lane warp and assumes blocks never straddle a KV
+    /// row, so a layer with kvDim % 32 != 0 cannot use q8_0 (the ctor would throw). The
+    /// auto-narrow heuristic checks this before falling to q8_0 (#185).
+    /// </summary>
+    internal static bool Q8KvGeometrySupported(ModelHyperparams hp)
+    {
+        bool perLayerKv = hp.LayerHeadDim is not null;
+        for (int i = 0; i < hp.NumLayers; i++)
+        {
+            if (hp.KvSourceLayer is { } ksl && ksl[i] >= 0) continue;
+            int layerHd = perLayerKv ? hp.LayerHeadDim![i] : hp.HeadDim;
+            int layerKvHeads = hp.LayerKvHeads is { } lkv ? lkv[i] : hp.NumKvHeads;
+            if ((((long)layerKvHeads * layerHd) & 31) != 0) return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// The auto-narrow decision (issue #185 item 1), factored out as a pure function so it
+    /// can be unit-tested without a GPU or model. Returns the KV dtype to use and sets
+    /// <paramref name="autoNarrowed"/> when it picked a narrowed dtype the operator did not
+    /// request. Rules, in order:
+    /// <list type="bullet">
+    ///   <item>An explicit operator choice, a TQ run (own KV path), or a non-fp32 request is
+    ///         returned unchanged — explicit choices are never overridden.</item>
+    ///   <item>If fp32 KV fits the budget, fp32 is kept.</item>
+    ///   <item>Else bf16 if it fits; else q8_0 if the geometry supports it (narrowest store);
+    ///         else bf16 best-effort (the only narrowed store valid for any geometry — may
+    ///         still cudaMalloc-fail, but halves the footprint vs fp32).</item>
+    /// </list>
+    /// </summary>
+    internal static DType ResolveKvDType(
+        DType requested, bool explicitChoice, bool tqEnabled,
+        long availableKvBytes, long fp32KvBytes, long bf16KvBytes, bool q8Supported,
+        out bool autoNarrowed)
+    {
+        autoNarrowed = false;
+        if (explicitChoice || tqEnabled || requested != DType.Float32) return requested;
+        if (fp32KvBytes <= availableKvBytes) return requested;
+        autoNarrowed = true;
+        if (bf16KvBytes <= availableKvBytes) return DType.BFloat16;
+        return q8Supported ? DType.Q8_0 : DType.BFloat16;
+    }
+
+    /// <summary>
+    /// VRAM-based context-length estimator: take the KV-cache budget from
+    /// <see cref="EstimateAvailableKvVram"/> and divide what's left between K and V caches
+    /// (each FP32, [maxSeqLen, kvDim] per layer), with per-layer / SWA-ring sizing for
+    /// gemma4-style models.
+    /// </summary>
+    public static int EstimateMaxContext(GgufModel model, CudaBackend gpu, ModelHyperparams hp)
+    {
+        long available = EstimateAvailableKvVram(model, gpu, hp);
+        int headDim = hp.HeadDim;
 
         // Gemma 4 per-layer head-dim path: each layer's K/V buffer takes its own
         // head_dim, and SWA layers cap at SlidingWindowSize regardless of the
