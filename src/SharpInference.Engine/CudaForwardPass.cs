@@ -692,6 +692,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass
                 int layerCtx = (perLayerKv && hp.IsSwaLayer is { } swa && swa[i])
                     ? SwaRingSize(_maxSeqLen, swaWindow)
                     : _maxSeqLen;
+                // q8_0 KV packs 32 elements per block; the store kernels' per-warp amax
+                // reduction (and DTypeInfo.ByteSize's count/32 sizing) assume each layer's
+                // kvDim is a multiple of 32 so blocks never straddle a KV row. Every dense
+                // GGUF head_dim (64/128/256) satisfies this, but fail loud rather than
+                // silently under-allocate + corrupt if a future geometry doesn't (#179).
+                if (_kvDType == DType.Q8_0 && (layerKvDim & 31) != 0)
+                    throw new NotSupportedException(
+                        $"SHARPI_KV_DTYPE=q8_0 requires every layer's kvDim to be a multiple of 32 " +
+                        $"(block_q8_0 = 32 elements/block); layer {i} has kvDim={layerKvDim}. " +
+                        "Use --kv-type bf16 or fp32 for this model.");
                 _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)layerCtx * layerKvDim), _kvDType);
                 _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)layerCtx * layerKvDim), _kvDType);
             }

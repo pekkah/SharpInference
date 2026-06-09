@@ -362,4 +362,16 @@ public sealed class CudaForwardPassKvDtypeTests
     [Fact]
     public void Gemma4_E4B_Q8ChunkedPrefill_MatchesFp32()
         => AssertKvChunkedPrefillParity("gemma-4-E4B-it-Q8_0.gguf", "q8_0", maxAbsCeiling: 30.0f);
+
+    /// <summary>
+    /// Gemma 4 12B QAT Q4_0: the 128K driving model — q8_0 Tc2-flash chunked prefill past
+    /// 4096 over its attention_k_eq_v global layers (V reuses K storage). The other tests
+    /// cross the chunk/SWA-ring boundary only on E4B, which has no k_eq_v; this is the one
+    /// long-context test that exercises the headline config (12B + q8_0 + >4096) end to end.
+    /// Wider blow-up ceiling: Q4_0 weights over 48 layers + q8_0 store accumulate more over
+    /// a 5000-token context; top-5 stability is the real argmax-stable gate.
+    /// </summary>
+    [Fact]
+    public void Gemma4_12B_Q8ChunkedPrefill_MatchesFp32()
+        => AssertKvChunkedPrefillParity("gemma-4-12b-it-qat-q4_0.gguf", "q8_0", maxAbsCeiling: 45.0f);
 }

@@ -117,9 +117,9 @@ __device__ __forceinline__ float sharpi_kvload(const unsigned short* __restrict_
 // ~half of bf16, ~quarter of fp32). The store side (llm_kv_append_q8_0 / _batched)
 // computes the scale per 32-lane warp; this overload decodes ONE element so the
 // SAME templated attention/flash bodies that serve fp32/bf16 also serve q8_0 via
-// sharpi_kvload. kv_dim and kv_head·head_dim are both multiples of 32, so a KV
-// row's blocks never straddle a row boundary and the flat element index `i` maps
-// cleanly to block `i>>5`, lane `i&31`.
+// sharpi_kvload. The load is purely per-element (block `i>>5`, lane `i&31`); the
+// store side (llm_kv_append_q8_0) is what relies on kv_dim being a multiple of 32 so
+// a KV row's blocks never straddle a row boundary — see that kernel's note.
 struct block_q8_0 { unsigned short d; signed char qs[32]; };
 __device__ __forceinline__ float sharpi_kvload(const block_q8_0* __restrict__ p, long i)
 {
@@ -5993,9 +5993,10 @@ extern ""C"" __global__ void llm_flash_attn_prefill_tc(
 #define FATC2_W 4
 #define FATC2_KT 16
 // Issue #179: templated K/V dtype (KV = float for the fp32 cache, unsigned short for
-// the bf16 cache). The body is unchanged bar the two cache-load sites, which go
-// through sharpi_kvload — so the float instantiation is byte-identical to the
-// pre-#179 kernel. Two extern ""C"" thunks below give NVRTC stable entry points.
+// the bf16 cache, block_q8_0 for the q8_0 cache). The body is unchanged bar the two
+// cache-load sites, which go through sharpi_kvload — so the float instantiation is
+// byte-identical to the pre-#179 kernel. Three extern ""C"" thunks below give NVRTC
+// stable entry points (fp32 / bf16 / q8_0).
 template<typename KV>
 __device__ __forceinline__ void sharpi_flash_attn_prefill_tc2_impl(
     const float* __restrict__ q_all,
@@ -6211,8 +6212,9 @@ __device__ __forceinline__ void sharpi_flash_attn_prefill_tc2_impl(
 #undef FATC2_W
 #undef FATC2_KT
 
-// fp32-cache and bf16-cache entry points (issue #179). The fp32 thunk is the
-// original #147 kernel; the bf16 thunk reads a half-width K/V cache.
+// fp32 / bf16 / q8_0 cache entry points (issue #179). The fp32 thunk is the original
+// #147 kernel; the bf16 thunk reads a half-width K/V cache; the q8_0 thunk reads a
+// block-quantized (~quarter) K/V cache. All decode each element to fp32 on load.
 extern ""C"" __global__ void llm_flash_attn_prefill_tc2(
     const float* __restrict__ q_all,
     const float* __restrict__ k_cache,
@@ -6490,12 +6492,11 @@ extern ""C"" __global__ void llm_attention_swa_batched(
     }
 }
 
-// ── Sliding-window attention, bf16 K/V cache (issues #179 + #27) ────────────
-// Bf16-store variant of `llm_attention_swa`. K/V cache is read as bfloat16
-// (raw unsigned short, decoded via sharpi_bf16_to_fp32) at the dot/weighted-sum
-// read points; q, out, score scratch, and all softmax arithmetic stay fp32, so
-// precision matches the fp32 SWA kernel and only the cache footprint is halved.
-// Preserves the SWA ring (`abs_t % max_seq_len`) and Gemma 4's attn_scale=1.0.
+// ── Sliding-window attention, narrowed K/V cache (issues #179 + #27) ─────────
+// Narrowed-store variant of `llm_attention_swa`: q, out, score scratch, and all
+// softmax arithmetic stay fp32, so precision matches the fp32 SWA kernel and only
+// the cache footprint shrinks. Preserves the SWA ring (`abs_t % max_seq_len`) and
+// Gemma 4's attn_scale=1.0.
 // Issue #179: templated K/V dtype (KV = unsigned short for bf16, block_q8_0 for
 // q8_0). Body unchanged bar the two cache loads, which go through sharpi_kvload;
 // the bf16 thunk is byte-identical to the pre-q8_0 kernel. extern ""C"" thunks below.
@@ -6619,10 +6620,11 @@ extern ""C"" __global__ void llm_attention_swa_q8_0(
         num_heads, num_kv_heads, head_dim, window_start, window_end, max_seq_len, attn_scale);
 }
 
-// ── Batched sliding-window attention, bf16 K/V cache (issues #179 + #27) ────
-// Bf16-store variant of `llm_attention_swa_batched`. One 256-thread block per
-// (head, query); K/V read as bf16, all arithmetic fp32. Bit-identical (modulo
-// the bf16 store rounding) to the per-token llm_attention_swa_bf16.
+// ── Batched sliding-window attention, narrowed K/V cache (issues #179 + #27) ─
+// Narrowed-store variant of `llm_attention_swa_batched`. One 256-thread block per
+// (head, query); K/V decoded to fp32 on load (sharpi_kvload), all arithmetic fp32.
+// Per (head, token) the bf16 instantiation matches the per-token llm_attention_swa
+// bf16 thunk (modulo store rounding); the q8_0 instantiation matches its q8_0 thunk.
 template<typename KV>
 __device__ void llm_attention_swa_batched_kv_impl(
     const float* __restrict__ q_all,      // [n_tok, num_heads*head_dim]
@@ -7654,7 +7656,8 @@ extern ""C"" __global__ void llm_full_seq_attention(
     }
 }
 
-// bf16-read variant (default KV dtype). Matches `llm_attention_bf16`'s use_shared path.
+// Templated K/V dtype (bf16 / q8_0; #179). Matches `llm_attention`'s use_shared path,
+// decoding each cache element to fp32 on load via sharpi_kvload.
 template<typename KV>
 __device__ void llm_full_seq_attention_kv_impl(
     const float* __restrict__ q_all,
@@ -7848,7 +7851,8 @@ extern ""C"" __global__ void llm_full_seq_attention_global(
     }
 }
 
-// bf16-read variant (default KV dtype). Matches `llm_attention_bf16`'s global path.
+// Templated K/V dtype (bf16 / q8_0; #179). Matches `llm_attention`'s global-scratch
+// path, decoding each cache element to fp32 on load via sharpi_kvload.
 template<typename KV>
 __device__ void llm_full_seq_attention_global_kv_impl(
     const float* __restrict__ q_all,
