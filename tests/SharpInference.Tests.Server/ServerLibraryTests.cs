@@ -36,6 +36,7 @@ public sealed class SharpInferenceServerOptionsTests
         Assert.Equal(0, opts.NGpuLayers);
         Assert.Equal(0, opts.ContextSize);
         Assert.False(opts.TurboQuant);
+        Assert.Null(opts.KvType);            // fp32 KV unless explicitly narrowed (#179)
         Assert.Equal(0, opts.MinBatchBlas);
 
         // MoE knob defaults: predictive prefetch on, nothing pinned.
@@ -78,6 +79,7 @@ public sealed class OptionsConfigurationBindingTests
             ["SharpInference:NGpuLayers"]   = "-1",
             ["SharpInference:ContextSize"]  = "4096",
             ["SharpInference:TurboQuant"]   = "true",
+            ["SharpInference:KvType"]       = "q8_0",
             ["SharpInference:MinBatchBlas"] = "32",
         }).Build();
 
@@ -89,6 +91,7 @@ public sealed class OptionsConfigurationBindingTests
         Assert.Equal(-1,   opts.NGpuLayers);
         Assert.Equal(4096, opts.ContextSize);
         Assert.True(opts.TurboQuant);
+        Assert.Equal("q8_0", opts.KvType);
         Assert.Equal(32, opts.MinBatchBlas);
     }
 

@@ -235,6 +235,16 @@ public sealed class GgufModelTests : IDisposable
     }
 
     [Fact]
+    public void DTypeInfo_ByteSize_CorrectForQ8_0()
+    {
+        // Q8_0: block_size=32, bytes_per_block=34 (32 int8 + 1 fp16 scale). This is the
+        // sizing CudaBackend.Allocate uses for the q8_0 KV cache (#179) — a regression
+        // here would silently under-allocate the cache.
+        Assert.Equal(34L, DTypeInfo.ByteSize(32, DType.Q8_0));
+        Assert.Equal(1088L, DTypeInfo.ByteSize(1024, DType.Q8_0)); // 32 blocks * 34
+    }
+
+    [Fact]
     public void GgufTensorInfo_ElementCount_IsProduct()
     {
         var info = new GgufTensorInfo("test", 3, [2, 3, 4], DType.Float32, 0);

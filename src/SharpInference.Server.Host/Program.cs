@@ -32,6 +32,13 @@ builder.Services.AddSharpInference(builder.Configuration, opts =>
     if (int.TryParse(Environment.GetEnvironmentVariable("SHARPI_N_GPU_LAYERS"), out int nGpuLayers))
         opts.NGpuLayers = nGpuLayers;
 
+    // SHARPI_KV_DTYPE ∈ {fp32, bf16, q8_0} — CUDA dense KV-cache element type (#179).
+    // Mirrors the SHARPI_MODEL/SHARPI_BACKEND override pattern; the loader forwards it
+    // back to the env var the forward pass reads. Validated at model load.
+    var envKvType = Environment.GetEnvironmentVariable("SHARPI_KV_DTYPE");
+    if (!string.IsNullOrWhiteSpace(envKvType))
+        opts.KvType = envKvType;
+
     // SHARPI_NO_THINKING ∈ {1, true} globally disables reasoning (server-side --no-thinking),
     // for agentic clients that never send the per-request opt-out.
     var envNoThink = Environment.GetEnvironmentVariable("SHARPI_NO_THINKING");

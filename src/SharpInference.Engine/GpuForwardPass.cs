@@ -159,7 +159,9 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         _tqFp32Window = enableTurboQuant ? Math.Min(tqFp32Window, _maxSeqLen) : 0;
         _tqBlockBytes = enableTurboQuant ? TurboQuantOps.BlockSize(tqBits, hp.HeadDim) : 0;
 
-        _kvCache = new Engine.KvCache(hp.NumLayers, _maxSeqLen, hp.NumKvHeads, hp.HeadDim);
+        // Bookkeeping-only: KV lives in GPU buffers, this tracks only the position counter.
+        // Allocating the full host K/V buffers is pure waste (tens of GB at long ctx, #179).
+        _kvCache = Engine.KvCache.CreateBookkeepingOnly(hp.NumLayers, _maxSeqLen, hp.NumKvHeads, hp.HeadDim);
         Console.Error.WriteLine($"[GpuForwardPass] Context size: {_maxSeqLen} (model max: {hp.ContextLength}){(enableTurboQuant ? " [TQ3]" : "")}");
 
         _embDim = hp.EmbeddingDim;
