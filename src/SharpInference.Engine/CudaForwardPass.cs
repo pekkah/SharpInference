@@ -529,14 +529,17 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         // prevent the cudaMalloc failure — only narrowing the element width can. Narrowing
         // is also exact-context, argmax-stable, and full-speed-prefill, whereas SnapKV
         // evicts tokens (lossy). We therefore auto-narrow only when the operator set
-        // NEITHER an explicit --kv-type NOR an explicit SnapKV budget; either explicit
-        // choice is respected and never overridden (an explicit fp32 still errors loudly at
-        // allocation rather than silently narrowing; an explicit SnapKV budget is honoured
-        // even though it can't avert the alloc failure — the operator's call). When
-        // auto-narrow fires it sets a narrowed _kvDType, which flips kvNarrowed below and
-        // disables auto-SnapKV.
+        // NEITHER an explicit --kv-type NOR an explicit *positive* SnapKV budget; either
+        // explicit choice is respected and never overridden (an explicit fp32 still errors
+        // loudly at allocation rather than silently narrowing; an explicit positive SnapKV
+        // budget is honoured even though it can't avert the alloc failure — the operator's
+        // call). Note SHARPI_SNAPKV_BUDGET=0 means "disable SnapKV" (IsBudgetExplicit=true,
+        // Budget=0), the same disable knob the banners advertise — it must NOT suppress
+        // auto-narrow, so we gate on Budget > 0 to match the disable semantics used by the
+        // SnapKV throws/auto-enable below. When auto-narrow fires it sets a narrowed
+        // _kvDType, which flips kvNarrowed below and disables auto-SnapKV.
         if (!_tqEnabled && !kvDTypeExplicit && _kvDType == DType.Float32
-            && !_snapKvCfg.IsBudgetExplicit)
+            && !(_snapKvCfg.IsBudgetExplicit && _snapKvCfg.Budget > 0))
         {
             long availKvBytes = EstimateAvailableKvVram(model, gpu, hp);
             long fp32KvBytes  = EstimateKvCacheBytes(hp, _maxSeqLen, DType.Float32);
@@ -3395,10 +3398,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     {
         // Raw-upload dtypes (no CPU dequant): tensor lives on GPU at its native byte size,
         // padded up to the next 4-byte boundary to match UploadRaw's uint32-strided
-        // layout. Q8_0 is included here (Phase 0 of the Gemma-4 plan) — ~1.0625 bytes
-        // per element vs the 4 bytes/elem the F32-fallback path would burn.
-        if (tensor.DType == DType.Float32 || tensor.DType == DType.Q4_K
-            || tensor.DType == DType.Q6_K  || tensor.DType == DType.Q8_0)
+        // layout. This set must match UploadWeight's raw-upload branch exactly
+        // ({Float32, Q4_0, Q4_K, Q6_K, Q8_0}) — every other dtype (e.g. Q5_K) is
+        // CPU-dequantized to F32 there and so genuinely occupies fp32 bytes on the GPU.
+        // Q8_0 is ~1.0625 bytes/elem and Q4_0 ~0.56 vs the 4 bytes/elem the F32 fallback
+        // would burn; omitting Q4_0 (the Gemma 4 12B QAT weight dtype) over-counts weights
+        // ~7×, floors the KV budget, and would wrongly auto-narrow models that fit (#185).
+        if (tensor.DType == DType.Float32 || tensor.DType == DType.Q4_0
+            || tensor.DType == DType.Q4_K || tensor.DType == DType.Q6_K
+            || tensor.DType == DType.Q8_0)
             return (tensor.ByteSize + 3) & ~3L;
         return tensor.ElementCount * sizeof(float);
     }

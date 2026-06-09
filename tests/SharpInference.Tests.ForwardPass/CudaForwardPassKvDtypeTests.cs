@@ -524,4 +524,121 @@ public sealed class CudaForwardPassKvDtypeTests
         // kvDim = 1 × 48 = 48 → 48 % 32 == 16 → unsupported.
         Assert.False(CudaForwardPass.Q8KvGeometrySupported(FlatHp(4, 1, 48)));
     }
+
+    /// <summary>
+    /// A gemma4-shaped ModelHyperparams: per-layer head_dim / kv-head counts, an SWA layer,
+    /// and a KV-share (aliased) tail layer. Exercises the per-layer branches of
+    /// EstimateKvCacheBytes / Q8KvGeometrySupported that the flat model never reaches — the
+    /// branches that matter for the #185 driving models (12B/E4B).
+    /// </summary>
+    private static ModelHyperparams Gemma4ShapedHp(
+        int[] layerHeadDim, int[] layerKvHeads, bool[] isSwa, int[] kvSource, int slidingWindow)
+        => new()
+        {
+            NumLayers = layerHeadDim.Length,
+            NumHeads = 8,
+            NumKvHeads = 8,
+            HeadDim = layerHeadDim[0],
+            ContextLength = 131072,
+            VocabSize = 1000,
+            EmbeddingDim = 2048,
+            IntermediateDim = 4096,
+            SlidingWindowSize = slidingWindow,
+            LayerHeadDim = layerHeadDim,
+            LayerKvHeads = layerKvHeads,
+            IsSwaLayer = isSwa,
+            KvSourceLayer = kvSource,
+        };
+
+    /// <summary>
+    /// EstimateKvCacheBytes mirrors the gemma4 per-layer allocation: a KV-share (aliased)
+    /// layer allocates nothing, an SWA layer is capped at the window-ring size (not maxCtx),
+    /// and a global layer uses full maxCtx — each with its own head_dim / kv-head count.
+    /// </summary>
+    [Fact]
+    public void EstimateKvCacheBytes_Gemma4_AliasedSkipped_SwaRingCapped()
+    {
+        // 3 layers: [0]=global (256 hd, 8 kv), [1]=SWA (256 hd, 8 kv), [2]=KV-share aliasing 0.
+        const int ctx = 65536;
+        const int window = 1024;
+        var hp = Gemma4ShapedHp(
+            layerHeadDim: [256, 256, 256],
+            layerKvHeads: [8, 8, 8],
+            isSwa: [false, true, false],
+            kvSource: [-1, -1, 0],   // layer 2 aliases layer 0 → no own pages
+            slidingWindow: window);
+
+        long bytes = CudaForwardPass.EstimateKvCacheBytes(hp, ctx, DType.BFloat16);
+
+        // Hand-compute against the same per-buffer power-of-two rounding the helper applies.
+        // SwaRingHeadroom is large (>= 4096); the helper caps the ring at min(maxCtx, window+headroom).
+        int swaRing = SwaRingSizeForTest(ctx, window);
+        long kvDim = 8L * 256;                                  // 2048
+        long globalBuf = RoundUpPow2(kvDim * ctx * 2);          // bf16 = 2 B/elem
+        long swaBuf    = RoundUpPow2(kvDim * swaRing * 2);
+        long expected  = 2 * globalBuf + 2 * swaBuf;            // layer0 (K+V) + layer1 (K+V); layer2 aliased
+        Assert.Equal(expected, bytes);
+    }
+
+    /// <summary>
+    /// Q8KvGeometrySupported returns false when ANY single (non-aliased) layer violates the
+    /// %32 rule — not just when all do. A mixed set with one bad layer must fail, matching
+    /// the ctor's per-layer throw (else auto-narrow would pick q8_0 and then crash).
+    /// </summary>
+    [Fact]
+    public void Q8KvGeometry_FailsWhenAnySingleLayerViolates()
+    {
+        // layer 0 kvDim = 8×128 = 1024 (ok); layer 1 kvDim = 8×52 = 416 (416 % 32 == 0 → ok too).
+        // Make layer 1 the violator: 1 kv-head × 52 hd = 52 → %32 == 20.
+        var hp = Gemma4ShapedHp(
+            layerHeadDim: [128, 52],
+            layerKvHeads: [8, 1],
+            isSwa: [false, false],
+            kvSource: [-1, -1],
+            slidingWindow: 4096);
+        Assert.False(CudaForwardPass.Q8KvGeometrySupported(hp));
+
+        // An aliased violator must be skipped (it owns no pages): layer 1 bad but aliases layer 0.
+        var aliased = Gemma4ShapedHp(
+            layerHeadDim: [128, 52],
+            layerKvHeads: [8, 1],
+            isSwa: [false, false],
+            kvSource: [-1, 0],
+            slidingWindow: 4096);
+        Assert.True(CudaForwardPass.Q8KvGeometrySupported(aliased));
+    }
+
+    /// <summary>ResolveKvDType fit comparisons are inclusive (&lt;=): an exact-fit fp32/bf16 is kept, not narrowed past.</summary>
+    [Fact]
+    public void ResolveKvDType_FitBoundaryIsInclusive()
+    {
+        // fp32 exactly equals budget → keep fp32 (no narrow).
+        var dt1 = CudaForwardPass.ResolveKvDType(
+            DType.Float32, false, false,
+            availableKvBytes: 1000, fp32KvBytes: 1000, bf16KvBytes: 500, q8Supported: true,
+            out bool narrowed1);
+        Assert.Equal(DType.Float32, dt1);
+        Assert.False(narrowed1);
+
+        // fp32 just over, bf16 exactly equals budget → pick bf16 (not fall to q8).
+        var dt2 = CudaForwardPass.ResolveKvDType(
+            DType.Float32, false, false,
+            availableKvBytes: 500, fp32KvBytes: 1000, bf16KvBytes: 500, q8Supported: true,
+            out bool narrowed2);
+        Assert.Equal(DType.BFloat16, dt2);
+        Assert.True(narrowed2);
+    }
+
+    // Local mirrors of the production rounding/SWA-ring math, so the gemma4 estimate test
+    // computes its expectation independently rather than echoing the implementation.
+    private const int SwaRingHeadroomForTest = 4096; // PrefillBatchChunk is 4096 by default
+    private static int SwaRingSizeForTest(int maxSeqLen, int window)
+        => (int)Math.Min(maxSeqLen, (long)window + SwaRingHeadroomForTest);
+    private static long RoundUpPow2(long v)
+    {
+        if (v <= 64) return 64;
+        ulong u = (ulong)(v - 1);
+        u |= u >> 1; u |= u >> 2; u |= u >> 4; u |= u >> 8; u |= u >> 16; u |= u >> 32;
+        return (long)(u + 1);
+    }
 }
