@@ -38,6 +38,13 @@ public static class InferenceEngineLoader
         if (opts.MinBatchBlas > 0)
             SimdKernels.MinBatchForBlas = opts.MinBatchBlas;
 
+        // KV-cache dtype (#179): the CUDA dense forward pass reads SHARPI_KV_DTYPE in its
+        // constructor, so translate the option into the environment before BuildForwardPass.
+        // Only set when explicitly configured — leave an externally-set env var alone so
+        // SHARPI_KV_DTYPE-only operation keeps working. CudaForwardPass validates the value.
+        if (!string.IsNullOrWhiteSpace(opts.KvType))
+            Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", opts.KvType);
+
         // ── 2. Resolve & open the model.
         var modelPath = ResolveModelPath(opts.ModelPath);
         var model = GgufModel.Open(modelPath);

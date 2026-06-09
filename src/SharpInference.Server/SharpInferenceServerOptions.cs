@@ -79,6 +79,19 @@ public sealed class SharpInferenceServerOptions
     public bool TurboQuant { get; set; } = false;
 
     /// <summary>
+    /// KV-cache element type for the CUDA dense path. Mirrors the CLI's <c>--kv-type</c> /
+    /// <c>SHARPI_KV_DTYPE</c>: <c>"fp32"</c> (default), <c>"bf16"</c> (half the KV VRAM →
+    /// ~2× context), or <c>"q8_0"</c> (block-quantized, ~quarter → ~4× context; restores
+    /// full decode speed at very long context where bf16 spills the tied embed table). The
+    /// loader forwards this to <c>SHARPI_KV_DTYPE</c> before the forward pass is built; the
+    /// value is validated then (an unrecognized string fails model load). <c>null</c>/empty
+    /// leaves any externally-set <c>SHARPI_KV_DTYPE</c> untouched. Has effect only on the
+    /// CUDA dense forward pass; ignored by CPU/Vulkan and rejected with TurboQuant or an
+    /// explicit SnapKV budget (issue #179).
+    /// </summary>
+    public string? KvType { get; set; }
+
+    /// <summary>
     /// Minimum batch size before <see cref="SharpInference.Cpu.SimdKernels.MinBatchForBlas"/>
     /// promotes the inner loop to OpenBLAS SGEMM. Mirrors <c>--min-batch-blas</c> /
     /// <c>SHARPI_MIN_BATCH_BLAS</c>. <c>0</c> = leave the engine default.
