@@ -26,7 +26,7 @@ public sealed unsafe class CudaDecodeMmqTests
     }
 
     private static ushort HalfToUshort(Half h) =>
-        BitConverter.ToUInt16(BitConverter.GetBytes(h), 0);
+        BitConverter.HalfToUInt16Bits(h);
 
     private static byte[] BuildQ4KMatrix(int rows, int cols, Random rng)
     {
