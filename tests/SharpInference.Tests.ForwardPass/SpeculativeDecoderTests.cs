@@ -76,14 +76,15 @@ public sealed class SpeculativeDecoderTests
         spec.Decode(6, [], emitted.Add);
 
         // Draft and target agree everywhere (same chain), so both steps accept fully:
-        // step 1 (k=3) emits 3+1 tokens, step 2 (k=min(3, remaining=2)=2) emits 2+1.
+        // each k=3 step packs [certain, d1, d2] into one verify and emits all 3.
         Assert.Equal(new[] { 2, 3, 4, 5, 6, 7 }, emitted);
         Assert.Equal(2, target.BatchVerifyCalls);
-        // Target Forward runs only for the per-step correction commit, never for verify.
-        Assert.Equal(2, target.ForwardCalls);
-        // Full acceptance: 5 accepted out of 7 emitted (corrections always count against
-        // the rate — k/(k+1) per step is the ceiling).
-        Assert.Equal(5f / 7f, spec.AcceptanceRate, 3);
+        // The certain token rides in the verify batch, so the target NEVER runs a
+        // single-token Forward — one batched pass per step is the whole target cost.
+        Assert.Equal(0, target.ForwardCalls);
+        // 2 accepted proposals out of 3 emitted per step (the certain token never
+        // counts as accepted): 4/6.
+        Assert.Equal(4f / 6f, spec.AcceptanceRate, 3);
     }
 
     [Fact]
@@ -108,11 +109,11 @@ public sealed class SpeculativeDecoderTests
         var emitted = new List<int>();
         spec.Decode(6, [], emitted.Add);
 
-        // Identical emitted sequence, but verification ran as k sequential Forwards plus
-        // the per-step correction commit: step 1 (k=3) 3+1, step 2 (k=2) 2+1 → 7 total.
+        // Identical emitted sequence, but verification ran as k sequential Forwards:
+        // 2 steps × 3 = 6 total (no batched pass, no separate commit forward either).
         Assert.Equal(new[] { 2, 3, 4, 5, 6, 7 }, emitted);
         Assert.Equal(0, target.BatchVerifyCalls);
-        Assert.Equal(7, target.ForwardCalls);
+        Assert.Equal(6, target.ForwardCalls);
     }
 
     [Fact]

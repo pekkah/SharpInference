@@ -98,7 +98,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [Description("Path to a smaller draft model for speculative decoding (greedy only, requires --temp 0)")]
         public string? DraftModelPath { get; init; }
 
-        [CommandOption("--spec-lookahead")]
+        [CommandOption("--spec-lookahead|--draft-tokens")]
         [Description("Number of draft tokens per speculative step with --draft-model (default: 4)")]
         [DefaultValue(4)]
         public int SpecLookahead { get; init; }
@@ -663,13 +663,26 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     var draftHp = ModelHyperparams.FromGgufMetadata(draftModel.Metadata, draftModel);
                     if (cudaSpecTarget)
                     {
+                        var target = (CudaForwardPass)gpuFwd!;
                         // The draft gets its OWN CudaBackend: graph capture state is one
                         // exec graph per backend instance, so sharing the target's backend
                         // would have the draft's decode graph clobber the target's.
+                        //
+                        // Clamp the draft's context: the decoder advances both passes in
+                        // lockstep, so the draft never sees a position past the target's
+                        // window — and unless the user pinned -c explicitly, cap it at 4096
+                        // (the decode runners bound generation by BOTH windows, so a smaller
+                        // draft ring only caps session length, never indexes out of range).
+                        // Passing 0 would size the draft's KV from the VRAM left AFTER the
+                        // target loaded — measured on the 12 GB 4070 Ti: the 0.6B draft
+                        // grabbed a 34K-ctx / ~7 GB ring next to the 8B target (decode
+                        // 75 → 13 t/s, WDDM paging); even a target-matched 12K fp32 ring
+                        // (~2.8 GB) left so little headroom that the draft's weights paged
+                        // in and out every step (draft forward 2.9 → ~15 ms, decode 34 t/s).
+                        int draftCtx = ctxSize > 0 ? target.MaxSeqLen : Math.Min(target.MaxSeqLen, 4096);
                         using var draftCuda = CudaBackend.Create();
-                        using var draftFwd = new CudaForwardPass(draftModel, draftCuda, draftHp, ctxSize);
+                        using var draftFwd = new CudaForwardPass(draftModel, draftCuda, draftHp, draftCtx);
                         AnsiConsole.MarkupLine($"[dim]Draft model: {draftHp.NumLayers}L, {draftHp.EmbeddingDim}d ([green]CUDA[/]) | Lookahead k={settings.SpecLookahead}[/]");
-                        var target = (CudaForwardPass)gpuFwd!;
                         if (settings.Prompt is not null)
                             return RunSpeculativeSinglePrompt(settings, target, draftFwd, tokenizer, sp);
                         return RunSpeculativeInteractive(settings, target, draftFwd, tokenizer, sp);
@@ -739,13 +752,20 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         var spec = new SpeculativeDecoder(target, draft, s.SpecLookahead);
         spec.Initialize(tokens.Count, targetLogits, draftLogits);
 
+        // Bound generation by BOTH context windows (the draft's may be smaller — the CUDA
+        // spec path caps its KV ring), leaving lookahead headroom for the last spec step.
+        int maxNew = Math.Min(sp.MaxNewTokens,
+            Math.Min(target.MaxSeqLen, draft.MaxSeqLen) - tokens.Count - s.SpecLookahead - 1);
+        if (maxNew < sp.MaxNewTokens)
+            AnsiConsole.MarkupLine($"[yellow]Note:[/] generation capped at {maxNew} tokens by the context window.");
+
         sw.Restart();
         int generated = 0;
         int totalDecoded = 0;
         bool inThinking = false;
         var streamDec = new Utf8StreamDecoder();
         bool hideThinking = s.HideThinking;
-        spec.Decode(sp.MaxNewTokens, sp.StopTokenIds ?? [], token =>
+        spec.Decode(maxNew, sp.StopTokenIds ?? [], token =>
         {
             if (EmitToken(token, tok, streamDec, ref inThinking, hideThinking)) generated++;
             totalDecoded++;
@@ -790,13 +810,16 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
             spec.Initialize(tokens.Count, targetLogits, draftLogits);
 
+            int maxNew = Math.Min(sp.MaxNewTokens,
+                Math.Min(target.MaxSeqLen, draft.MaxSeqLen) - tokens.Count - s.SpecLookahead - 1);
+
             sw.Restart();
             int generated = 0;
             int totalDecoded = 0;
             bool inThinking = false;
             var streamDec = new Utf8StreamDecoder();
             bool hideThinking = s.HideThinking;
-            spec.Decode(sp.MaxNewTokens, sp.StopTokenIds ?? [], token =>
+            spec.Decode(maxNew, sp.StopTokenIds ?? [], token =>
             {
                 if (EmitToken(token, tok, streamDec, ref inThinking, hideThinking)) generated++;
                 totalDecoded++;

@@ -3009,24 +3009,32 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     /// decode — keep them out until a batched softcap is wired), and every trunk + output weight
     /// in a GEMM-N-batchable dtype (excludes Q4_0).
     /// </summary>
-    public bool SupportsContinuousBatching
+    public bool SupportsContinuousBatching => _snapKvEffectiveBudget == 0 && DenseBatchedDecodeSupported();
+
+    /// <summary>
+    /// The arch/dtype gate shared by <see cref="SupportsContinuousBatching"/> and
+    /// <see cref="SupportsBatchVerify"/>: dense (non-MoE, non-Gemma-4), no TurboQuant, no
+    /// final-logit softcap, every trunk + output weight GEMM-N-batchable. SnapKV terms are
+    /// applied by the callers — continuous batching excludes any configured budget (prefill
+    /// into a per-sequence cache could evict), while spec-decode verify only excludes an
+    /// actually-compacted owned cache (decode never evicts; an unevicted budget keeps
+    /// slot == position).
+    /// </summary>
+    private bool DenseBatchedDecodeSupported()
     {
-        get
+        if (_isMoE || _isGemma4Like || _tqEnabled) return false;
+        if (_hp.FinalLogitSoftcap > 0f) return false;
+        for (int i = 0; i < _hp.NumLayers; i++)
         {
-            if (_isMoE || _isGemma4Like || _tqEnabled || _snapKvEffectiveBudget > 0) return false;
-            if (_hp.FinalLogitSoftcap > 0f) return false;
-            for (int i = 0; i < _hp.NumLayers; i++)
-            {
-                if (!DecodeBatchable(_wq[i]) || !DecodeBatchable(_wk[i]) ||
-                    !DecodeBatchable(_wo[i]) || !DecodeBatchable(_wGate[i]) ||
-                    !DecodeBatchable(_wUp[i]) || !DecodeBatchable(_wDown[i]))
-                    return false;
-                // Dense layers must own a separate V projection (k_eq_v is Gemma-4-only);
-                // a null _wv would NRE in BatchForwardMulti, so disable batching defensively.
-                if (_wv[i] is not { } wv || !DecodeBatchable(wv)) return false;
-            }
-            return DecodeBatchable(_wOutput);
+            if (!DecodeBatchable(_wq[i]) || !DecodeBatchable(_wk[i]) ||
+                !DecodeBatchable(_wo[i]) || !DecodeBatchable(_wGate[i]) ||
+                !DecodeBatchable(_wUp[i]) || !DecodeBatchable(_wDown[i]))
+                return false;
+            // Dense layers must own a separate V projection (k_eq_v is Gemma-4-only);
+            // a null _wv would NRE in BatchForwardMulti, so disable batching defensively.
+            if (_wv[i] is not { } wv || !DecodeBatchable(wv)) return false;
         }
+        return DecodeBatchable(_wOutput);
     }
 
     /// <summary>
@@ -3035,7 +3043,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     /// machine (TQ ring, SnapKV eviction), per-layer geometry (Gemma 4), a logit softcap, or a
     /// weight dtype the GEMM-N matvec can't drive (Q4_0) is out of scope.
     /// </summary>
-    private void ThrowIfBatchingUnsupported()
+    private void ThrowIfBatchingUnsupported(bool decodeOnly = false)
     {
         if (_isMoE)
             throw new NotSupportedException(
@@ -3046,14 +3054,20 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         if (_tqEnabled)
             throw new NotSupportedException(
                 "CUDA continuous batching is not supported with the TurboQuant KV cache.");
-        if (_snapKvEffectiveBudget > 0)
-            throw new NotSupportedException(
-                "CUDA continuous batching is not supported with an active SnapKV budget (eviction runs only on a whole-prompt prefill of the owned cache).");
+        // Prefill-capable entry points (CreateCache / PrefillWithCache / PrefillPackedMulti)
+        // reject any configured SnapKV budget — a whole-prompt prefill into a bound cache
+        // could evict. Decode-only batching (BatchForwardMulti, incl. the issue-#207
+        // BatchVerify wrapper) never evicts, so it only rejects an ALREADY-compacted owned
+        // cache, where logical position != physical slot.
+        if (decodeOnly ? _kvEvictedCount > 0 : _snapKvEffectiveBudget > 0)
+            throw new NotSupportedException(decodeOnly
+                ? "CUDA batched decode is not supported on a SnapKV-compacted cache (physical slot != logical position)."
+                : "CUDA continuous batching is not supported with an active SnapKV budget (eviction runs only on a whole-prompt prefill of the owned cache).");
         if (_hp.FinalLogitSoftcap > 0f)
             throw new NotSupportedException(
                 "CUDA continuous batching is not supported with a final-logit softcap (the batched decode finisher does not apply it).");
         // Reaching here, only the weight-dtype loop can make it unsupported.
-        if (!SupportsContinuousBatching)
+        if (!DenseBatchedDecodeSupported())
             throw new NotSupportedException(
                 "CUDA continuous batching requires every trunk + output weight in a GEMM-N-batchable " +
                 "dtype (Q4_K/Q5_K/Q6_K/Q8_0/F32); a Q4_0 weight has no batched-decode matvec kernel.");
@@ -3227,7 +3241,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         ArgumentNullException.ThrowIfNull(tokens);
         ArgumentNullException.ThrowIfNull(positions);
         ArgumentNullException.ThrowIfNull(caches);
-        ThrowIfBatchingUnsupported();
+        ThrowIfBatchingUnsupported(decodeOnly: true);
         int N = tokens.Length;
         if (N == 0) return Array.Empty<float[]>();
         if (positions.Length != N || caches.Length != N)
@@ -3446,15 +3460,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     // ── Speculative-decode batched verify (issue #207) ──────────────────────────────────
 
     /// <summary>
-    /// Whether <see cref="BatchVerify"/> can run: the dense continuous-batching-capable
-    /// configuration (<see cref="SupportsContinuousBatching"/> — non-MoE, non-Gemma-4, no
-    /// TurboQuant, no active SnapKV budget, no final-logit softcap, GEMM-N-batchable weights)
-    /// with an uncompacted cache. The eviction term is redundant today (eviction needs an
-    /// active budget, which is already excluded) but mirrors the GDN passes' gate so a future
-    /// relaxation of the budget exclusion can't silently re-enable verify on a compacted
-    /// cache (physical slot != position).
+    /// Whether <see cref="BatchVerify"/> can run: the dense batched-decode configuration
+    /// (<see cref="DenseBatchedDecodeSupported"/> — non-MoE, non-Gemma-4, no TurboQuant, no
+    /// final-logit softcap, GEMM-N-batchable weights) with an uncompacted cache. Unlike
+    /// <see cref="SupportsContinuousBatching"/>, a CONFIGURED SnapKV budget does not disable
+    /// verify — only an actual prefill-time eviction does (then physical slot != logical
+    /// position and the batched kernels would mis-index). Dynamic: flips false after such a
+    /// prefill, so the speculative decoder (which re-checks per step) degrades to sequential
+    /// verify — the same once-evicted gating the GDN passes use (#130).
     /// </summary>
-    public bool SupportsBatchVerify => _kvEvictedCount == 0 && SupportsContinuousBatching;
+    public bool SupportsBatchVerify => _kvEvictedCount == 0 && DenseBatchedDecodeSupported();
 
     /// <summary>
     /// Batched k-token verify for single-user speculative decoding (issue #207): one packed
