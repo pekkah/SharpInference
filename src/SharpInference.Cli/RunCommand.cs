@@ -633,16 +633,21 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         };
         var rng = settings.Seed >= 0 ? new Random(settings.Seed) : new Random();
 
-        // Speculative decoding path (requires --draft-model and --temp 0)
+        // Speculative decoding path (requires --draft-model and --temp 0). Supported
+        // targets: pure CPU (-g 0) and full CUDA offload of a dense model (issue #207 —
+        // packed k-token verify via CudaForwardPass.BatchVerify). Vulkan and the partial-
+        // offload hybrids fall back to normal generation: without a batched verify,
+        // speculation costs k sequential target forwards per step and is never a win.
         if (settings.DraftModelPath is not null)
         {
+            bool cudaSpecTarget = gpuFwd is CudaForwardPass { SupportsBatchVerify: true };
             if (settings.Temperature > 0f)
             {
                 AnsiConsole.MarkupLine("[yellow]Warning:[/] Speculative decoding requires greedy sampling (--temp 0). Falling back to normal generation.");
             }
-            else if (nGpuLayers != 0)
+            else if (nGpuLayers != 0 && !cudaSpecTarget)
             {
-                AnsiConsole.MarkupLine("[yellow]Warning:[/] Speculative decoding is only supported for CPU (--n-gpu-layers 0). Falling back to normal generation.");
+                AnsiConsole.MarkupLine("[yellow]Warning:[/] Speculative decoding requires pure CPU (-g 0) or full CUDA offload of a dense model. Falling back to normal generation.");
             }
             else if (!File.Exists(settings.DraftModelPath))
             {
@@ -656,13 +661,28 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     AnsiConsole.MarkupLine($"[dim]Loading draft model:[/] {settings.DraftModelPath}");
                     using var draftModel = GgufModel.Open(settings.DraftModelPath);
                     var draftHp = ModelHyperparams.FromGgufMetadata(draftModel.Metadata, draftModel);
-                    using var draftCpuBackend = new CpuBackend();
-                    using var draftFwd = new ForwardPass(draftModel, draftCpuBackend, draftHp);
-                    AnsiConsole.MarkupLine($"[dim]Draft model: {draftHp.NumLayers}L, {draftHp.EmbeddingDim}d | Lookahead k={settings.SpecLookahead}[/]");
-
-                    if (settings.Prompt is not null)
-                        return RunSpeculativeSinglePrompt(settings, fwd!, draftFwd, tokenizer, sp);
-                    return RunSpeculativeInteractive(settings, fwd!, draftFwd, tokenizer, sp);
+                    if (cudaSpecTarget)
+                    {
+                        // The draft gets its OWN CudaBackend: graph capture state is one
+                        // exec graph per backend instance, so sharing the target's backend
+                        // would have the draft's decode graph clobber the target's.
+                        using var draftCuda = CudaBackend.Create();
+                        using var draftFwd = new CudaForwardPass(draftModel, draftCuda, draftHp, ctxSize);
+                        AnsiConsole.MarkupLine($"[dim]Draft model: {draftHp.NumLayers}L, {draftHp.EmbeddingDim}d ([green]CUDA[/]) | Lookahead k={settings.SpecLookahead}[/]");
+                        var target = (CudaForwardPass)gpuFwd!;
+                        if (settings.Prompt is not null)
+                            return RunSpeculativeSinglePrompt(settings, target, draftFwd, tokenizer, sp);
+                        return RunSpeculativeInteractive(settings, target, draftFwd, tokenizer, sp);
+                    }
+                    else
+                    {
+                        using var draftCpuBackend = new CpuBackend();
+                        using var draftFwd = new ForwardPass(draftModel, draftCpuBackend, draftHp);
+                        AnsiConsole.MarkupLine($"[dim]Draft model: {draftHp.NumLayers}L, {draftHp.EmbeddingDim}d ([blue]CPU[/]) | Lookahead k={settings.SpecLookahead}[/]");
+                        if (settings.Prompt is not null)
+                            return RunSpeculativeSinglePrompt(settings, fwd!, draftFwd, tokenizer, sp);
+                        return RunSpeculativeInteractive(settings, fwd!, draftFwd, tokenizer, sp);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -700,7 +720,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     }
 
     private static int RunSpeculativeSinglePrompt(Settings s,
-        ForwardPass target, ForwardPass draft,
+        IForwardPass target, IForwardPass draft,
         GgufTokenizer tok, SamplingParams sp)
     {
         var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt, enableThinking: !s_noThinking);
@@ -710,14 +730,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             Console.Write(s.Prompt);
 
         var sw = Stopwatch.StartNew();
-        // Prefill both models with the same prompt
-        ReadOnlySpan<float> targetLogits = default;
-        ReadOnlySpan<float> draftLogits = default;
-        for (int i = 0; i < tokens.Count; i++)
-        {
-            targetLogits = target.Forward(tokens[i], i);
-            draftLogits = draft.Forward(tokens[i], i);
-        }
+        // Prefill both models with the same prompt (batched-trunk path on both — the
+        // per-token Forward loop this replaces was ~30× slower on the CUDA target).
+        ReadOnlySpan<float> targetLogits = target.Prefill(tokens);
+        ReadOnlySpan<float> draftLogits = draft.Prefill(tokens);
         var prefillMs = sw.Elapsed.TotalMilliseconds;
 
         var spec = new SpeculativeDecoder(target, draft, s.SpecLookahead);
@@ -743,12 +759,13 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         AnsiConsole.MarkupLine($"\n[dim]Prefill: {tokens.Count} tokens, {tokens.Count / (prefillMs / 1000):F1} t/s | " +
             $"Decode: {totalDecoded} tokens, {totalDecoded / (decodeMs / 1000):F1} t/s" +
             (totalDecoded > generated ? $" ({generated} visible, {totalDecoded - generated} thinking)" : "") +
-            $" | Acceptance rate: {spec.AcceptanceRate:P0}[/]");
+            $" | Acceptance rate: {spec.AcceptanceRate:P0} | " +
+            $"draft {spec.DraftMs:F0}ms / verify {spec.VerifyMs:F0}ms / commit {spec.CommitMs:F0}ms[/]");
         return 0;
     }
 
     private static int RunSpeculativeInteractive(Settings s,
-        ForwardPass target, ForwardPass draft,
+        IForwardPass target, IForwardPass draft,
         GgufTokenizer tok, SamplingParams sp)
     {
         AnsiConsole.MarkupLine("[green]Interactive chat (speculative decoding).[/] Type a message, or [yellow]/exit[/] to quit.\n");
@@ -764,17 +781,12 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             var prompt = FormatPrompt(input, s.SystemPrompt, enableThinking: !s_noThinking);
             var tokens = tok.Encode(prompt);
 
-            target.Cache.Reset();
-            draft.Cache.Reset();
+            target.ResetCache();
+            draft.ResetCache();
 
-            ReadOnlySpan<float> targetLogits = default;
-            ReadOnlySpan<float> draftLogits = default;
             var sw = Stopwatch.StartNew();
-            for (int i = 0; i < tokens.Count; i++)
-            {
-                targetLogits = target.Forward(tokens[i], i);
-                draftLogits = draft.Forward(tokens[i], i);
-            }
+            ReadOnlySpan<float> targetLogits = target.Prefill(tokens);
+            ReadOnlySpan<float> draftLogits = draft.Prefill(tokens);
 
             spec.Initialize(tokens.Count, targetLogits, draftLogits);
 

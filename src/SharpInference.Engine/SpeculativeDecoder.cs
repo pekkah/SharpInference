@@ -19,6 +19,7 @@ public sealed class SpeculativeDecoder
 {
     private readonly IForwardPass _target;
     private readonly IForwardPass _draft;
+    private readonly bool _batchVerify;
     private int _lookahead;
 
     // Generation state
@@ -29,6 +30,10 @@ public sealed class SpeculativeDecoder
     // Acceptance statistics
     private long _totalAccepted;
     private long _totalEmitted;
+
+    // Phase timing (issue #207 bench reporting): cumulative wall time spent drafting,
+    // batch-verifying, and committing (truncate + correction forwards) across all steps.
+    private readonly System.Diagnostics.Stopwatch _phaseSw = new();
 
     public SpeculativeDecoder(IForwardPass target, IForwardPass draft, int lookahead = 4)
     {
@@ -54,6 +59,12 @@ public sealed class SpeculativeDecoder
                 nameof(draft));
         _target = target;
         _draft = draft;
+        // Kill-switch (issue #207): SHARPI_SPEC_BATCH_VERIFY=0 forces the sequential
+        // verify fallback even when the target implements BatchVerify. Read once at
+        // construction (same pattern as the forward passes' decode toggles); the
+        // capability itself is re-checked per step — it can flip after construction
+        // (e.g. ForwardPass.EnableTurboQuant).
+        _batchVerify = Environment.GetEnvironmentVariable("SHARPI_SPEC_BATCH_VERIFY") != "0";
         _lookahead = Math.Max(1, lookahead);
         _savedTargetLogits = new float[target.VocabSize];
         _savedDraftLogits = new float[draft.VocabSize];
@@ -69,6 +80,15 @@ public sealed class SpeculativeDecoder
     /// <summary>Running acceptance rate (accepted tokens / total emitted tokens).</summary>
     public float AcceptanceRate => _totalEmitted > 0 ? (float)_totalAccepted / _totalEmitted : 0f;
 
+    /// <summary>Cumulative milliseconds spent in the draft phase (k−1 draft forwards per step).</summary>
+    public double DraftMs { get; private set; }
+
+    /// <summary>Cumulative milliseconds spent batch-verifying with the target.</summary>
+    public double VerifyMs { get; private set; }
+
+    /// <summary>Cumulative milliseconds spent in cache truncation + correction-token forwards.</summary>
+    public double CommitMs { get; private set; }
+
     /// <summary>
     /// Initialize the decoder after both models have processed the prompt.
     /// Call after prefilling both target and draft with the same prompt tokens.
@@ -83,6 +103,9 @@ public sealed class SpeculativeDecoder
         draftLogits.CopyTo(_savedDraftLogits);
         _totalAccepted = 0;
         _totalEmitted = 0;
+        DraftMs = 0;
+        VerifyMs = 0;
+        CommitMs = 0;
     }
 
     /// <summary>
@@ -123,6 +146,7 @@ public sealed class SpeculativeDecoder
         // ── Draft phase ──────────────────────────────────────────────────────────
         // d[0] is free: argmax of saved draft logits (no forward pass needed).
         // d[1..k-1] require k-1 draft Forward calls, appending d[0..k-2] to draft cache.
+        _phaseSw.Restart();
         var draftTokens = new int[k];
         var draftLogitsPerPos = new float[k][];
 
@@ -137,12 +161,15 @@ public sealed class SpeculativeDecoder
             draftTokens[i] = ArgMax(draftLogitsPerPos[i]);
         }
         // Draft cache is now at P + k - 1 (appended d[0..k-2]).
+        DraftMs += _phaseSw.Elapsed.TotalMilliseconds;
 
         // ── Target batch-verify ──────────────────────────────────────────────────
         // Process d[0..k-1] in one batched forward pass.
         // targetLogitsFromBatch[i] = P_target(·|ctx + d[0..i]) (logits AFTER d[i]).
         // After this call, target cache is at P + k.
+        _phaseSw.Restart();
         float[][] targetLogitsFromBatch = BatchVerifyTarget(draftTokens, P);
+        VerifyMs += _phaseSw.Elapsed.TotalMilliseconds;
 
         // targetLogits[0]   = saved (before d[0])
         // targetLogits[i+1] = after d[i]  (from batch)
@@ -172,6 +199,7 @@ public sealed class SpeculativeDecoder
 
         // ── Truncate caches to accepted position ─────────────────────────────────
         // Target is at P+k; truncate to P+accepted.
+        _phaseSw.Restart();
         _target.TruncateTo(P + accepted);
 
         // Draft is at P+k-1; truncate to P+accepted.
@@ -191,6 +219,7 @@ public sealed class SpeculativeDecoder
         int commitPos = accepted == k ? P + k : P + accepted;
         var newTargetLogits = _target.Forward(correction, commitPos);
         var newDraftLogits = _draft.Forward(correction, commitPos);
+        CommitMs += _phaseSw.Elapsed.TotalMilliseconds;
 
         // ── Update state ─────────────────────────────────────────────────────────
         _nextPos = commitPos + 1;
@@ -205,14 +234,16 @@ public sealed class SpeculativeDecoder
     }
 
     /// <summary>
-    /// Batch-verify draft tokens with the target model.
-    /// If target is a ForwardPass, uses its batched BatchVerify for efficiency.
-    /// Falls back to sequential Forward calls otherwise.
+    /// Batch-verify draft tokens with the target model. Targets that report
+    /// <see cref="IForwardPass.SupportsBatchVerify"/> (CPU <see cref="ForwardPass"/>, dense
+    /// <c>CudaForwardPass</c> — issue #207) take the packed k-token pass, which amortizes
+    /// the weight reads k× on memory-bound decode paths. Everything else (and
+    /// <c>SHARPI_SPEC_BATCH_VERIFY=0</c>) falls back to k sequential Forward calls.
     /// </summary>
     private float[][] BatchVerifyTarget(int[] draftTokens, int startPos)
     {
-        if (_target is ForwardPass cpuTarget)
-            return cpuTarget.BatchVerify(draftTokens, startPos);
+        if (_batchVerify && _target.SupportsBatchVerify)
+            return _target.BatchVerify(draftTokens, startPos);
 
         // Generic fallback: sequential Forward calls
         var result = new float[draftTokens.Length][];

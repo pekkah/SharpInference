@@ -396,6 +396,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     private Tensor[][]? _raggedKLayers;
     private Tensor[][]? _raggedVLayers;
 
+    // Issue #207: non-owning per-sequence-cache view over the OWNED K/V tensors, so the
+    // single-user speculative-decode BatchVerify can drive BatchForwardMulti's packed trunk
+    // against the owned cache. Never disposed (the owned tensors are freed by Dispose);
+    // every layer is marked aliased so even an accidental Dispose can't free them.
+    private CudaSequenceKvCache? _ownedCacheView;
+
     // Ragged attention spill scratch [N × numHeads × maxSeqLen] — the ragged kernel
     // spills per-(sequence, head) score rows when a sequence's length exceeds the
     // 4096-slot shared-memory fast path. Lazily allocated only when such a length
@@ -3435,6 +3441,81 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
                 if (aViews[n] is { } av) _gpu.Free(av);
             }
         }
+    }
+
+    // ── Speculative-decode batched verify (issue #207) ──────────────────────────────────
+
+    /// <summary>
+    /// Whether <see cref="BatchVerify"/> can run: the dense continuous-batching-capable
+    /// configuration (<see cref="SupportsContinuousBatching"/> — non-MoE, non-Gemma-4, no
+    /// TurboQuant, no active SnapKV budget, no final-logit softcap, GEMM-N-batchable weights)
+    /// with an uncompacted cache. The eviction term is redundant today (eviction needs an
+    /// active budget, which is already excluded) but mirrors the GDN passes' gate so a future
+    /// relaxation of the budget exclusion can't silently re-enable verify on a compacted
+    /// cache (physical slot != position).
+    /// </summary>
+    public bool SupportsBatchVerify => _kvEvictedCount == 0 && SupportsContinuousBatching;
+
+    /// <summary>
+    /// Batched k-token verify for single-user speculative decoding (issue #207): one packed
+    /// pass over the OWNED cache at contiguous positions [<paramref name="startPos"/>,
+    /// <paramref name="startPos"/> + k), returning <c>result[i]</c> = logits after
+    /// <c>tokens[i]</c>. Reuses <see cref="BatchForwardMulti"/>'s trunk with every row bound
+    /// to the same cache: the ragged kernels append all k K/V rows before any row attends,
+    /// and row i attends over [0, startPos+i] — i.e. packed causal attention (the legacy
+    /// per-sequence fallback loop appends-then-attends in ascending row order, equally
+    /// causal). Every matmul routes through <see cref="BatchDecodeMatMul"/>, so the #194
+    /// weight-stationary kernels (or the opt-in #201 decode MMQ) amortize the weight HBM
+    /// reads k×. Each row keeps the per-token kernels' reduction chains (#194/#197), so the
+    /// default WS path is expected bit-identical to k sequential <see cref="Forward"/> calls;
+    /// the opt-in compute-bound/MMQ toggles are argmax-stable only. All k K/V entries land in
+    /// the cache; the caller rewinds rejected tokens via <see cref="TruncateTo"/>. Issues
+    /// direct launches only — the per-token decode CUDA graph (owned-cache pointers) stays
+    /// valid for the surrounding Forward steps.
+    /// </summary>
+    public float[][] BatchVerify(int[] tokens, int startPos)
+    {
+        ArgumentNullException.ThrowIfNull(tokens);
+        if (!SupportsBatchVerify)
+            throw new NotSupportedException(
+                "BatchVerify requires the dense batching-capable configuration (no MoE / " +
+                "Gemma-4 / TurboQuant / SnapKV / softcap, GEMM-N-batchable weights) and an " +
+                "uncompacted cache. Check SupportsBatchVerify before calling.");
+        int k = tokens.Length;
+        if (k == 0) return Array.Empty<float[]>();
+        if (startPos < 0 || startPos + k > _maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(startPos),
+                $"BatchVerify range [{startPos}, {startPos + k}) exceeds the context window (maxSeqLen={_maxSeqLen}).");
+
+        if (k == 1)
+        {
+            // A single token amortizes nothing — the per-token Forward (CUDA-graph
+            // replayable) is strictly better. Mirrors the CPU BatchVerify fallback.
+            var logits = Forward(tokens[0], startPos);
+            var seq = new float[1][];
+            seq[0] = new float[_hp.VocabSize];
+            logits.CopyTo(seq[0]);
+            return seq;
+        }
+
+        if (_ownedCacheView is null)
+        {
+            var all = new HashSet<int>();
+            for (int l = 0; l < _hp.NumLayers; l++) all.Add(l);
+            _ownedCacheView = new CudaSequenceKvCache(_gpu, _ownedKCache, _ownedVCache, all);
+        }
+        _ownedCacheView.Length = startPos;
+
+        var positions = new int[k];
+        for (int i = 0; i < k; i++) positions[i] = startPos + i;
+        var caches = new CudaSequenceKvCache[k];
+        Array.Fill(caches, _ownedCacheView);
+
+        var result = BatchForwardMulti(tokens, positions, caches);
+        // Mirror what k sequential Forward calls would leave behind; the speculative
+        // decoder's TruncateTo(startPos + accepted) then rewinds the rejected tail.
+        _kvLength = Math.Max(_kvLength, startPos + k);
+        return result;
     }
 
     /// <summary>(Re)allocate the batched-decode logits buffer [<paramref name="n"/> × vocab]

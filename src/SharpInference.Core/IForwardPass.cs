@@ -152,12 +152,31 @@ public interface IForwardPass : IDisposable
     void PrefillMtp(IReadOnlyList<int> tokens, int startPos = 0) { }
 
     /// <summary>
-    /// True when this pass implements a batched two-token verify path (issue #30).
-    /// Callers (<see cref="MtpDecoder"/>) dispatch to <see cref="BatchForward2"/> on
-    /// the hybrid GDN passes where it pays off; everything else stays on the
-    /// sequential N=1 algorithm.
+    /// True when this pass implements a batched verify path. Two consumers, two methods:
+    /// the MTP decoder dispatches to <see cref="BatchForward2"/> (two-token self-speculative
+    /// verify, issue #30 — implemented by the hybrid GDN passes), and the speculative
+    /// decoder dispatches to <see cref="BatchVerify"/> (k-token draft verification,
+    /// issue #207 — implemented by the rewindable dense passes). The consumers' own gates
+    /// keep the two method sets disjoint: the MTP decoder requires <see cref="HasMtpHead"/>
+    /// (GDN hybrids only), the speculative decoder requires
+    /// <see cref="SupportsPartialRewind"/> (which GDN hybrids never report). A pass that
+    /// returns <c>true</c> here must implement whichever method its reachable consumer calls.
     /// </summary>
     bool SupportsBatchVerify => false;
+
+    /// <summary>
+    /// Batched verification for speculative decoding (issue #207): process
+    /// <paramref name="tokens"/> as one packed pass over the current sequence starting at
+    /// <paramref name="startPos"/> (the cache must hold exactly <paramref name="startPos"/>
+    /// positions), returning <c>result[i]</c> = logits after <c>tokens[i]</c>. All k K/V
+    /// entries are appended to the cache; the caller rewinds rejected tokens via
+    /// <see cref="TruncateTo"/>. Amortizes the weight reads k× vs sequential
+    /// <see cref="Forward"/> calls on memory-bound decode paths.
+    /// </summary>
+    float[][] BatchVerify(int[] tokens, int startPos) =>
+        throw new NotSupportedException(
+            $"{GetType().Name} does not implement BatchVerify. " +
+            "Check SupportsBatchVerify before calling.");
 
     /// <summary>
     /// Last completed <see cref="BatchForward2"/>'s token-1 pre-output-norm hidden.

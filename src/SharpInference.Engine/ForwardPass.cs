@@ -1162,6 +1162,15 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
     }
 
     /// <summary>
+    /// Whether <see cref="BatchVerify"/> can run (issue #207): everything except the two
+    /// configurations it throws for — the TurboQuant KV cache (compressed ring can't take
+    /// the batched appends) and gemma4-style per-layer head_dim (not wired into the batched
+    /// trunk). MoE stays <c>true</c>: <see cref="BatchVerify"/> itself falls back to
+    /// sequential <see cref="Forward"/> calls for MoE, which is still correct.
+    /// </summary>
+    public bool SupportsBatchVerify => _tqKvCache is null && _layerHeadDim is null;
+
+    /// <summary>
     /// Batched verification for speculative decoding: processes <paramref name="tokens"/> starting
     /// at <paramref name="startPos"/> using the existing KV cache as context.
     /// All K/V entries are appended to the cache; caller must call TruncateTo to rewind on rejection.
