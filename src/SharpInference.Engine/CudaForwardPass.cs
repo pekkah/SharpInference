@@ -370,6 +370,31 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     private readonly bool _batchDecodeWeightStationary =
         Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_WS") != "0";
 
+    // Ragged-batched per-sequence attention ops (issue #197). Default on: the per-layer
+    // QK-norm/RoPE/KV-append/attention launches collapse from O(N) per-sequence calls
+    // (~6·N low-occupancy single-token kernels per layer, the N attention blocks running
+    // back-to-back) to O(1) ragged kernels whose grid covers all N sequences at their own
+    // positions against their own caches (CudaBackend.*BatchedRagged). Bit-identical per
+    // sequence to the per-sequence loop (same kernels' reduction chains, batched grid).
+    // SHARPI_BATCH_DECODE_RAGGED=0 restores the #190 per-sequence loop.
+    private readonly bool _batchDecodeRagged =
+        Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_RAGGED") != "0";
+
+    // Per-batch-composition cache pointer table for the ragged kernels: [layer][seq]
+    // K/V cache tensors, rebuilt only when the caches array composition changes
+    // (sequence admitted/retired — compared by element identity). Avoids re-walking
+    // N caches × L layers on every decode step.
+    private CudaSequenceKvCache[]? _raggedSnapshot;
+    private Tensor[][]? _raggedKLayers;
+    private Tensor[][]? _raggedVLayers;
+
+    // Ragged attention spill scratch [N × numHeads × maxSeqLen] — the ragged kernel
+    // spills per-(sequence, head) score rows when a sequence's length exceeds the
+    // 4096-slot shared-memory fast path. Lazily allocated only when such a length
+    // actually occurs (43 MB at N=8 / 40K ctx — don't pay it for short decodes).
+    private Tensor? _raggedAttnScores;
+    private int _raggedAttnScoresCapacity;
+
     // Empty (no-aliasing) layer set shared by every dense per-sequence cache CreateCache
     // hands out — dense models never share KV across layers (that's the Gemma 4 tail,
     // excluded from batching), so nothing is ever skipped on CudaSequenceKvCache.Dispose.
@@ -3198,12 +3223,27 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         EnsureBatchedTrunkScratch(N);
         EnsureDecodeLogits(N);
 
-        // Per-sequence views into the batched Q/K/V/attnOut scratch. The offsets are fixed
-        // across layers (the batched buffers are reused each layer), so build them once and
-        // free them at the end rather than per-layer. _maxHeadDim == _headDim on the dense
-        // path, so the q/k/v/attn buffers are exactly N×qDim / N×kvDim with no padding stride.
-        // (The O-projection bias add needs per-row hidden views too, but only when _hasAttnBias
-        // — created inline in that rare branch so the common no-bias path allocates nothing extra.)
+        // Ragged path (#197, default): the per-layer QK-norm/RoPE/KV-append/attention run as
+        // O(1) ragged-batched launches over all N sequences. Build the [layer][seq] cache
+        // tensor table once per batch composition (identity-compared; steps within a stable
+        // batch reuse it) and grab the spill scratch only if some sequence is past the
+        // 4096-slot shared-memory fast path.
+        bool ragged = _batchDecodeRagged;
+        Tensor? raggedScores = null;
+        if (ragged)
+        {
+            EnsureRaggedCacheTable(caches);
+            raggedScores = EnsureRaggedAttnScores(N, positions);
+        }
+
+        // Per-sequence views into the batched Q/K/V/attnOut scratch — only the legacy
+        // per-sequence loop (SHARPI_BATCH_DECODE_RAGGED=0) needs them; the ragged kernels
+        // index rows internally. The offsets are fixed across layers (the batched buffers
+        // are reused each layer), so build them once and free them at the end rather than
+        // per-layer. _maxHeadDim == _headDim on the dense path, so the q/k/v/attn buffers
+        // are exactly N×qDim / N×kvDim with no padding stride. (The O-projection bias add
+        // needs per-row hidden views too, but only when _hasAttnBias — created inline in
+        // that rare branch so the common no-bias path allocates nothing extra.)
         // Allocated INSIDE the try so a mid-loop View throw still frees the views taken so far.
         var qViews = new Tensor[N];
         var kViews = new Tensor[N];
@@ -3211,13 +3251,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         var aViews = new Tensor[N];
         try
         {
-            for (int n = 0; n < N; n++)
-            {
-                qViews[n] = _gpu.View(_bpQ!, (long)n * qDim, qDim);
-                kViews[n] = _gpu.View(_bpK!, (long)n * kvDim, kvDim);
-                vViews[n] = _gpu.View(_bpV!, (long)n * kvDim, kvDim);
-                aViews[n] = _gpu.View(_bpAttnOut!, (long)n * qDim, qDim);
-            }
+            if (!ragged)
+                for (int n = 0; n < N; n++)
+                {
+                    qViews[n] = _gpu.View(_bpQ!, (long)n * qDim, qDim);
+                    kViews[n] = _gpu.View(_bpK!, (long)n * kvDim, kvDim);
+                    vViews[n] = _gpu.View(_bpV!, (long)n * kvDim, kvDim);
+                    aViews[n] = _gpu.View(_bpAttnOut!, (long)n * qDim, qDim);
+                }
 
             // 1. Embed each sequence's current token into the batched hidden buffer. (No
             //    embedding scale: the dense per-token Forward oracle applies none — that
@@ -3245,10 +3286,47 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
 
                 bool useRoPE = _hp.NoRopeLayerStep == 0 || (layer + 1) % _hp.NoRopeLayerStep != 0;
 
-                // Per-sequence: bias → QK-norm/RoPE (same order as RunDeviceRegion, #157) →
-                // KV append into that sequence's own cache → single-query attention over its
-                // [0, pos+1). _kvEvictedCount is 0 (SnapKV is rejected for batching), so the
-                // physical slot is simply pos.
+                if (ragged)
+                {
+                    // Ragged-batched (#197): same op sequence as the per-sequence loop below
+                    // (bias → QK-norm/RoPE, #157 order → KV append → attention), each op one
+                    // launch whose grid covers all N rows at positions[n] against caches[n].
+                    // Every kernel keeps its per-token counterpart's reduction chain, so per
+                    // sequence this is bit-identical to the loop it replaces. _kvEvictedCount
+                    // is 0 (SnapKV is rejected for batching), so the physical slot is pos.
+                    if (_hasAttnBias)
+                    {
+                        _gpu.AddBiasBatched(_bpQ!, _bq![layer], qDim, N);
+                        _gpu.AddBiasBatched(_bpK!, _bk![layer], kvDim, N);
+                        _gpu.AddBiasBatched(_bpV!, _bv![layer], kvDim, N);
+                    }
+
+                    if (_hasQkNorm && !_hp.UseL2QkNorm)
+                        _gpu.HeadNormQkBatched(_bpQ!, _wqNorm![layer], _bpK!, _wkNorm![layer],
+                            _numHeads, _numKvHeads, _headDim, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                    if (useRoPE)
+                    {
+                        _gpu.RoPEBatchedRagged(_bpQ!, positions, _numHeads, _headDim, _hp.RopeTheta, _hp.IsNeoxRope);
+                        _gpu.RoPEBatchedRagged(_bpK!, positions, _numKvHeads, _headDim, _hp.RopeTheta, _hp.IsNeoxRope);
+                    }
+                    if (_hasQkNorm && _hp.UseL2QkNorm && useRoPE)
+                    {
+                        _gpu.HeadNormPureBatched(_bpQ!, _numHeads, _headDim, N, _hp.RmsNormEps);
+                        _gpu.HeadNormPureBatched(_bpK!, _numKvHeads, _headDim, N, _hp.RmsNormEps);
+                    }
+
+                    _gpu.KvAppendBatchedRagged(_bpK!, _bpV!, _raggedKLayers![layer], _raggedVLayers![layer],
+                        positions, kvDim, _maxSeqLen, _kvDType);
+                    _gpu.AttentionBatchedRagged(_bpQ!, _raggedKLayers[layer], _raggedVLayers[layer],
+                        _bpAttnOut!, raggedScores,
+                        _numHeads, _numKvHeads, _headDim, positions, _maxSeqLen, _attnScale, _kvDType);
+                    // caches[n].Length is advanced once after the pass completes (below).
+                }
+                else
+                // Per-sequence (#190, SHARPI_BATCH_DECODE_RAGGED=0): bias → QK-norm/RoPE (same
+                // order as RunDeviceRegion, #157) → KV append into that sequence's own cache →
+                // single-query attention over its [0, pos+1). _kvEvictedCount is 0 (SnapKV is
+                // rejected for batching), so the physical slot is simply pos.
                 for (int n = 0; n < N; n++)
                 {
                     int pos = positions[n];
@@ -3285,17 +3363,23 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
                     // here — a mid-pass throw then leaves the logical length unadvanced.
                 }
 
-                // Batched O-projection + residual. The attn-output bias is per-row, so it needs
-                // a per-sequence hidden view; created inline here (rare branch) to keep the
-                // common no-bias decode path free of unused per-row views.
+                // Batched O-projection + residual. The attn-output bias is per-row; the ragged
+                // path adds it in one broadcast launch, the legacy loop via per-sequence hidden
+                // views created inline here (rare branch) to keep the common no-bias decode
+                // path free of unused per-row views.
                 BatchDecodeMatMul(_bpHidden!, _wo[layer], _bpAttnOut!, N);
                 if (_hasAttnBias)
-                    for (int n = 0; n < N; n++)
-                    {
-                        var hv = _gpu.View(_bpHidden!, (long)n * embDim, embDim);
-                        _gpu.AddInPlace(hv, _bo![layer]);
-                        _gpu.Free(hv);
-                    }
+                {
+                    if (ragged)
+                        _gpu.AddBiasBatched(_bpHidden!, _bo![layer], embDim, N);
+                    else
+                        for (int n = 0; n < N; n++)
+                        {
+                            var hv = _gpu.View(_bpHidden!, (long)n * embDim, embDim);
+                            _gpu.AddInPlace(hv, _bo![layer]);
+                            _gpu.Free(hv);
+                        }
+                }
                 _gpu.AddInPlace(_bpHidden!, _bpResidual!);
 
                 // FFN (dense SwiGLU), batched across N.
@@ -3358,6 +3442,63 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         _decodeLogitsAll = _gpu.Allocate(TensorShape.D1(total));
         _decodeLogitsHost = new float[(int)total];
         _decodeLogitsCapacity = n;
+    }
+
+    /// <summary>
+    /// (Re)build the ragged kernels' [layer][seq] K/V cache tensor table when the batch
+    /// composition changed (issue #197). Compared by element identity: a stable batch
+    /// reuses the table across decode steps; any admit/retire (different object at any
+    /// slot, or different length) rebuilds it. The snapshot is a defensive clone so a
+    /// caller mutating its array between steps can't alias the comparison.
+    /// </summary>
+    private void EnsureRaggedCacheTable(CudaSequenceKvCache[] caches)
+    {
+        if (_raggedSnapshot is { } snap && snap.Length == caches.Length)
+        {
+            bool same = true;
+            for (int i = 0; i < caches.Length; i++)
+                if (!ReferenceEquals(snap[i], caches[i])) { same = false; break; }
+            if (same) return;
+        }
+
+        int layers = _hp.NumLayers, count = caches.Length;
+        var k = new Tensor[layers][];
+        var v = new Tensor[layers][];
+        for (int l = 0; l < layers; l++)
+        {
+            k[l] = new Tensor[count];
+            v[l] = new Tensor[count];
+            for (int n = 0; n < count; n++)
+            {
+                k[l][n] = caches[n].K[l];
+                v[l][n] = caches[n].V[l];
+            }
+        }
+        _raggedKLayers = k;
+        _raggedVLayers = v;
+        _raggedSnapshot = (CudaSequenceKvCache[])caches.Clone();
+    }
+
+    /// <summary>
+    /// Spill scratch for the ragged attention kernel (issue #197): null while every
+    /// sequence fits the kernel's 4096-slot shared-memory score path (the common case —
+    /// the kernel never dereferences the scratch then); otherwise an
+    /// [N × numHeads × maxSeqLen] buffer of per-(sequence, head) score rows, lazily
+    /// allocated and re-sized only when the decode batch capacity changes.
+    /// </summary>
+    private Tensor? EnsureRaggedAttnScores(int n, int[] positions)
+    {
+        int maxLen = 0;
+        for (int i = 0; i < positions.Length; i++) maxLen = Math.Max(maxLen, positions[i] + 1);
+        if (maxLen <= 4096) return null;
+
+        if (_raggedAttnScoresCapacity != n)
+        {
+            if (_raggedAttnScores is { } old) _gpu.Free(old);
+            _raggedAttnScores = _gpu.Allocate(TensorShape.D1((long)n * _numHeads * _maxSeqLen));
+            _raggedAttnScoresCapacity = n;
+        }
+        return _raggedAttnScores;
     }
 
     // Explicit IBatchedForwardPass surface: the engine holds caches as opaque
@@ -4010,6 +4151,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
 
         // Batched-decode logits scratch (issue #190; allocated only if batching ran).
         if (_decodeLogitsAll is { } dl) _gpu.Free(dl);
+        // Ragged attention spill scratch (issue #197; allocated only on a >4096-length
+        // batched decode). The [layer][seq] cache table holds borrowed tensor refs the
+        // per-sequence caches own — nothing to free there.
+        if (_raggedAttnScores is { } ras) _gpu.Free(ras);
 
         if (_tqEnabled)
         {

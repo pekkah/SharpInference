@@ -281,6 +281,20 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _fullSeqAttentionBf16Kernel;
     private nint   _fullSeqAttentionGlobalKernel;
     private nint   _fullSeqAttentionGlobalBf16Kernel;
+
+    // Issue #197: ragged-batched decode kernels — one launch covers all N sequences'
+    // RoPE / KV-append / single-query attention at per-sequence positions against N
+    // distinct per-sequence caches (positions + cache pointer tables ride in by-value
+    // struct kernel parameters; see CudaRaggedKernels).
+    private nint   _ropeNeoxRaggedKernel;
+    private nint   _ropeInterleavedRaggedKernel;
+    private nint   _kvAppendRaggedKernel;
+    private nint   _kvAppendRaggedBf16Kernel;
+    private nint   _kvAppendRaggedQ8Kernel;
+    private nint   _attentionRaggedKernel;
+    private nint   _attentionRaggedBf16Kernel;
+    private nint   _attentionRaggedQ8Kernel;
+    private nint   _addBiasRowsKernel;
     // Issue #141 (attention): memory-efficient flash-attention prefill (shared K/V
     // tiles reused across a query tile + online softmax) replacing the scalar
     // full_seq / swa_batched kernels' O(n²) global K/V re-reads.
@@ -3558,6 +3572,236 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         }
     }
 
+    // ── Ragged-batched decode ops (issue #197) ─────────────────────────────
+    //
+    // One launch per op covers all N decode sequences: row t of the [N × dim]
+    // activation buffer is processed at positions[t] against kCaches[t]/vCaches[t].
+    // Per-sequence positions and cache base pointers ride in by-value struct kernel
+    // parameters (capacity 16; larger batches chunk into ceil(N/16) launches), so
+    // there is no device-side table, no host→device upload, and no sync on the hot
+    // path. These methods issue direct launches only — batched decode never captures
+    // a CUDA graph (CudaForwardPass.CreateCache disables graphs), so no Track*Node.
+
+    /// <summary>Sequences per ragged launch — the by-value struct parameter capacity.</summary>
+    private const int RaggedChunk = CudaRaggedKernels.ChunkCapacity;
+
+    /// <summary>
+    /// Ragged-batched RoPE (issue #197): row <c>t</c> of <paramref name="xAll"/>
+    /// (<c>[N × numHeads*headDim]</c>) rotates at <c>positions[t]</c>. Per row
+    /// bit-identical to the per-token <see cref="RoPE"/> at that position. Unlike the
+    /// <c>*_batched</c> prefill RoPE kernels (consecutive <c>basePos+t</c>), every row
+    /// carries its own arbitrary position — the batched-decode contract.
+    /// </summary>
+    public void RoPEBatchedRagged(Tensor xAll, ReadOnlySpan<int> positions,
+        int numHeads, int headDim, float ropeTheta = 10000f, bool neox = false)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        int nTok = positions.Length;
+        if (nTok == 0) return;
+        if ((long)nTok * numHeads * headDim > xAll.ElementCount)
+            throw new ArgumentException(
+                $"RoPEBatchedRagged: x has {xAll.ElementCount} elements; need {(long)nTok * numHeads * headDim}.");
+
+        int totalPairs = numHeads * (headDim / 2);
+        uint gridX = (uint)((totalPairs + 255) / 256);
+        nint kernel = neox ? _ropeNeoxRaggedKernel : _ropeInterleavedRaggedKernel;
+        long rowBytes = (long)numHeads * headDim * sizeof(float);
+        nint xBase = GetDevPtr(xAll);
+
+        int* pos = stackalloc int[RaggedChunk];
+        nint xPtr = 0;
+        int  pNH = numHeads, pHD = headDim, pNT = 0;
+        float pT = ropeTheta;
+        nint* args = stackalloc nint[6]
+        {
+            (nint)(&xPtr), (nint)(&pNH), (nint)(&pHD), (nint)pos, (nint)(&pT), (nint)(&pNT)
+        };
+        for (int s = 0; s < nTok; s += RaggedChunk)
+        {
+            int n = Math.Min(RaggedChunk, nTok - s);
+            for (int t = 0; t < n; t++) pos[t] = positions[s + t];
+            xPtr = xBase + (nint)((long)s * rowBytes);
+            pNT = n;
+            int r = NvrtcInterop.LaunchKernel(kernel, gridX, (uint)n, 1, 256, 1, 1, 0, _stream, args, null);
+            if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(rope_ragged) failed: {r}");
+        }
+    }
+
+    /// <summary>
+    /// Ragged-batched KV append (issue #197): row <c>t</c> of the fp32
+    /// <paramref name="kInputAll"/>/<paramref name="vInputAll"/> (<c>[N × kvDim]</c>)
+    /// is stored into <c>kCaches[t]</c>/<c>vCaches[t]</c> at slot
+    /// <c>positions[t] % maxSeqLen</c>. Per sequence bit-identical to the matching
+    /// per-token append (<see cref="KvAppend"/> / <see cref="KvAppendBf16"/> /
+    /// <see cref="KvAppendQ8_0"/> per <paramref name="kvDType"/>).
+    /// </summary>
+    public void KvAppendBatchedRagged(
+        Tensor kInputAll, Tensor vInputAll,
+        ReadOnlySpan<Tensor> kCaches, ReadOnlySpan<Tensor> vCaches,
+        ReadOnlySpan<int> positions, int kvDim, int maxSeqLen, DType kvDType = DType.Float32)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        int nTok = positions.Length;
+        if (nTok == 0) return;
+        if (kCaches.Length != nTok || vCaches.Length != nTok)
+            throw new ArgumentException("KvAppendBatchedRagged: kCaches/vCaches/positions lengths must match.");
+        nint kernel = kvDType switch
+        {
+            DType.Float32  => _kvAppendRaggedKernel,
+            DType.BFloat16 => _kvAppendRaggedBf16Kernel,
+            DType.Q8_0     => _kvAppendRaggedQ8Kernel,
+            _ => throw new NotSupportedException($"KvAppendBatchedRagged: unsupported KV dtype {kvDType}."),
+        };
+
+        uint gridX = (uint)((kvDim + 255) / 256);
+        long rowBytes = (long)kvDim * sizeof(float);
+        nint kBase = GetDevPtr(kInputAll);
+        nint vBase = GetDevPtr(vInputAll);
+
+        nint* kPtrs = stackalloc nint[RaggedChunk];
+        nint* vPtrs = stackalloc nint[RaggedChunk];
+        int*  pos   = stackalloc int[RaggedChunk];
+        nint kIn = 0, vIn = 0;
+        int  pKD = kvDim, pMSL = maxSeqLen, pNT = 0;
+        nint* args = stackalloc nint[8]
+        {
+            (nint)(&kIn), (nint)(&vIn), (nint)kPtrs, (nint)vPtrs, (nint)pos,
+            (nint)(&pKD), (nint)(&pMSL), (nint)(&pNT)
+        };
+        for (int s = 0; s < nTok; s += RaggedChunk)
+        {
+            int n = Math.Min(RaggedChunk, nTok - s);
+            for (int t = 0; t < n; t++)
+            {
+                kPtrs[t] = GetDevPtr(kCaches[s + t]);
+                vPtrs[t] = GetDevPtr(vCaches[s + t]);
+                pos[t]   = positions[s + t];
+            }
+            kIn = kBase + (nint)((long)s * rowBytes);
+            vIn = vBase + (nint)((long)s * rowBytes);
+            pNT = n;
+            int r = NvrtcInterop.LaunchKernel(kernel, gridX, (uint)n, 1, 256, 1, 1, 0, _stream, args, null);
+            if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kv_append_ragged) failed: {r}");
+        }
+    }
+
+    /// <summary>
+    /// Ragged-batched single-query attention (issue #197): query row <c>t</c> of
+    /// <paramref name="qAll"/> (<c>[N × numHeads*headDim]</c>) attends over
+    /// <c>kCaches[t]</c>/<c>vCaches[t]</c> positions <c>[0, positions[t] + 1)</c> into
+    /// row <c>t</c> of <paramref name="outputAll"/>. Grid is (numHeads, N): all N
+    /// sequences' attention blocks run concurrently in one launch. Each (head, sequence)
+    /// block keeps the per-token <see cref="Attention"/> kernel's exact reduction chain,
+    /// so per sequence the output is bit-identical to the sequential call.
+    ///
+    /// When every <c>positions[t] + 1 ≤ 4096</c> scores stay in shared memory and
+    /// <paramref name="scoresScratch"/> may be null; above that it must hold
+    /// <c>N × numHeads × maxSeqLen</c> floats (per-sequence rows of the per-token
+    /// kernel's <c>numHeads × maxSeqLen</c> layout).
+    /// </summary>
+    public void AttentionBatchedRagged(
+        Tensor qAll, ReadOnlySpan<Tensor> kCaches, ReadOnlySpan<Tensor> vCaches,
+        Tensor outputAll, Tensor? scoresScratch,
+        int numHeads, int numKvHeads, int headDim,
+        ReadOnlySpan<int> positions, int maxSeqLen, float attnScale = -1f, DType kvDType = DType.Float32)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        int nTok = positions.Length;
+        if (nTok == 0) return;
+        if (kCaches.Length != nTok || vCaches.Length != nTok)
+            throw new ArgumentException("AttentionBatchedRagged: kCaches/vCaches/positions lengths must match.");
+        nint kernel = kvDType switch
+        {
+            DType.Float32  => _attentionRaggedKernel,
+            DType.BFloat16 => _attentionRaggedBf16Kernel,
+            DType.Q8_0     => _attentionRaggedQ8Kernel,
+            _ => throw new NotSupportedException($"AttentionBatchedRagged: unsupported KV dtype {kvDType}."),
+        };
+
+        nint ssBase = scoresScratch is { } sv ? GetDevPtr(sv) : nint.Zero;
+        int maxLen = 0;
+        for (int i = 0; i < nTok; i++) maxLen = Math.Max(maxLen, positions[i] + 1);
+        if (maxLen > 4096)
+        {
+            // Fail loud, not corrupt: a too-small/absent scratch would make the kernel
+            // spill out of bounds (per-sequence rows, unlike the per-token kernel's
+            // single numHeads × maxSeqLen block).
+            if (scoresScratch is not { } scratch ||
+                scratch.ElementCount < (long)nTok * numHeads * maxSeqLen)
+                throw new ArgumentException(
+                    $"AttentionBatchedRagged: seqLen {maxLen} > 4096 requires a scores scratch of " +
+                    $"{nTok}×{numHeads}×{maxSeqLen} floats.");
+        }
+
+        long qRowBytes  = (long)numHeads * headDim * sizeof(float);
+        long ssRowBytes = (long)numHeads * maxSeqLen * sizeof(float);
+        nint qBase = GetDevPtr(qAll);
+        nint oBase = GetDevPtr(outputAll);
+
+        nint* kPtrs = stackalloc nint[RaggedChunk];
+        nint* vPtrs = stackalloc nint[RaggedChunk];
+        int*  pos   = stackalloc int[RaggedChunk];
+        nint qPtr = 0, oPtr = 0, ssPtr = 0;
+        int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pMSL = maxSeqLen, pNT = 0;
+        float pScale = attnScale;
+        nint* args = stackalloc nint[12]
+        {
+            (nint)(&qPtr), (nint)kPtrs, (nint)vPtrs, (nint)(&oPtr), (nint)(&ssPtr),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)pos, (nint)(&pMSL), (nint)(&pScale), (nint)(&pNT)
+        };
+        for (int s = 0; s < nTok; s += RaggedChunk)
+        {
+            int n = Math.Min(RaggedChunk, nTok - s);
+            for (int t = 0; t < n; t++)
+            {
+                kPtrs[t] = GetDevPtr(kCaches[s + t]);
+                vPtrs[t] = GetDevPtr(vCaches[s + t]);
+                pos[t]   = positions[s + t];
+            }
+            qPtr  = qBase + (nint)((long)s * qRowBytes);
+            oPtr  = oBase + (nint)((long)s * qRowBytes);
+            ssPtr = ssBase == nint.Zero ? nint.Zero : ssBase + (nint)((long)s * ssRowBytes);
+            pNT = n;
+            int r = NvrtcInterop.LaunchKernel(kernel, (uint)numHeads, (uint)n, 1, 256, 1, 1, 0, _stream, args, null);
+            if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_ragged) failed: {r}");
+        }
+    }
+
+    /// <summary>
+    /// Broadcast bias add over <paramref name="nTok"/> rows (issue #197):
+    /// <c>xAll[t][i] += bias[i]</c>. Replaces N per-row <see cref="AddInPlace"/>
+    /// launches in the batched-decode attn-bias branch; one fp32 add per element,
+    /// bit-identical to the per-row calls.
+    /// </summary>
+    public void AddBiasBatched(Tensor xAll, Tensor bias, int dim, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (nTok == 0) return;
+        if ((long)dim * nTok > xAll.ElementCount)
+            throw new ArgumentException(
+                $"AddBiasBatched: x has {xAll.ElementCount} elements; need {(long)dim * nTok}.");
+        if (bias.ElementCount < dim)
+            throw new ArgumentException(
+                $"AddBiasBatched: bias has {bias.ElementCount} elements; need {dim}.");
+
+        nint xPtr = GetDevPtr(xAll);
+        nint bPtr = GetDevPtr(bias);
+        int  pD = dim, pNT = nTok;
+        nint* args = stackalloc nint[4] { (nint)(&xPtr), (nint)(&bPtr), (nint)(&pD), (nint)(&pNT) };
+        uint gridX = (uint)((dim + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_addBiasRowsKernel, gridX, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(add_bias_rows) failed: {r}");
+    }
+
     /// <summary>
     /// Sliding-window attention (Gemma 4 SWA layers). Iterates positions over
     /// <c>[max(0, position+1-windowSize), position+1)</c> instead of the full
@@ -5275,7 +5519,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// <summary>Combined CUDA source for image + text + weight-stationary kernels — one
     /// NVRTC compilation (the cubin cache key hashes this, so adding a source invalidates it).</summary>
     private static string CombinedKernelSource =>
-        CudaKernels.Source + "\n" + CudaTextKernels.Source + "\n" + CudaWsKernels.Source;
+        CudaKernels.Source + "\n" + CudaTextKernels.Source + "\n" + CudaWsKernels.Source +
+        "\n" + CudaRaggedKernels.Source;
 
     private void CompileAndLoadKernels()
     {
@@ -5494,6 +5739,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _kvAppendQ8Kernel, _kvAppendBatchedQ8Kernel,
             _attentionQ8Kernel, _attentionSwaQ8Kernel, _attentionSwaBatchedQ8Kernel,
             _fullSeqAttentionQ8Kernel, _fullSeqAttentionGlobalQ8Kernel,
+            // #197: ragged-batched decode kernels.
+            _ropeNeoxRaggedKernel, _ropeInterleavedRaggedKernel,
+            _kvAppendRaggedKernel, _kvAppendRaggedBf16Kernel, _kvAppendRaggedQ8Kernel,
+            _attentionRaggedKernel, _attentionRaggedBf16Kernel, _attentionRaggedQ8Kernel,
+            _addBiasRowsKernel,
         ];
         foreach (nint k in kernels)
         {
@@ -5672,6 +5922,17 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _fullSeqAttentionGlobalKernel      = GetKernelFunc("llm_full_seq_attention_global");
         _fullSeqAttentionGlobalBf16Kernel  = GetKernelFunc("llm_full_seq_attention_global_bf16");
         _fullSeqAttentionGlobalQ8Kernel    = GetKernelFunc("llm_full_seq_attention_global_q8_0");
+
+        // Issue #197: ragged-batched decode kernels.
+        _ropeNeoxRaggedKernel        = GetKernelFunc("llm_rope_neox_ragged");
+        _ropeInterleavedRaggedKernel = GetKernelFunc("llm_rope_interleaved_ragged");
+        _kvAppendRaggedKernel        = GetKernelFunc("llm_kv_append_ragged");
+        _kvAppendRaggedBf16Kernel    = GetKernelFunc("llm_kv_append_ragged_bf16");
+        _kvAppendRaggedQ8Kernel      = GetKernelFunc("llm_kv_append_ragged_q8_0");
+        _attentionRaggedKernel       = GetKernelFunc("llm_attention_ragged");
+        _attentionRaggedBf16Kernel   = GetKernelFunc("llm_attention_ragged_bf16");
+        _attentionRaggedQ8Kernel     = GetKernelFunc("llm_attention_ragged_q8_0");
+        _addBiasRowsKernel           = GetKernelFunc("llm_add_bias_rows");
     }
 
     /// <summary>
