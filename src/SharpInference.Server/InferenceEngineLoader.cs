@@ -94,7 +94,9 @@ public static class InferenceEngineLoader
         if (opts.MaxBatchSize > 1 && batchingSupported && fwd is ForwardPass cpuFwd)
         {
             engine = new ContinuousBatchingEngine(cpuFwd, tokenizer, modelId, opts.MaxBatchSize,
-                thinkTokenId, endThinkTokenId);
+                thinkTokenId, endThinkTokenId,
+                prefillChunkTokens: opts.PrefillChunkTokens,
+                kvBudgetBytes: opts.KvBudgetMb > 0 ? opts.KvBudgetMb * 1024 * 1024 : opts.KvBudgetMb);
             // ContinuousBatchingEngine doesn't accept owned[] disposables; transfer
             // disposal responsibility by wrapping it in a composite disposable.
             engine = new OwnedDisposableEngine(engine, owned);
@@ -145,8 +147,11 @@ public static class InferenceEngineLoader
             owned.Add(dense);
             if (turboQuant)
                 dense.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
-            // ContinuousBatchingEngine doesn't yet support MoE or TurboQuant fan-out.
-            bool batchOk = !hp.IsMoE && !turboQuant;
+            // ContinuousBatchingEngine doesn't yet support MoE, TurboQuant fan-out, or
+            // gemma4 per-layer head_dim (PrefillWithCache / BatchForwardMulti /
+            // PrefillPackedMulti all throw NotSupportedException) — those fall back to
+            // the single-user InferenceEngine instead of failing every request.
+            bool batchOk = !hp.IsMoE && !turboQuant && hp.LayerHeadDim is null;
             return (dense, batchOk);
         }
 

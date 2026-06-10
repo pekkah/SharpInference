@@ -487,6 +487,23 @@ public sealed unsafe class ForwardPass : IForwardPass
     public int MaxSeqLen => _kvCache.MaxSeqLen;
 
     /// <summary>
+    /// Bytes of (fp32) KV cache one token occupies across all layers. Used by
+    /// <see cref="ContinuousBatchingEngine"/> to convert a memory budget into a token
+    /// budget for admission backpressure (issue #183). Page-granularity slack in
+    /// <see cref="PagedKvCache"/> (16-position pages) is not included — the budget is
+    /// a planning estimate, not an exact accounting.
+    /// </summary>
+    public long KvBytesPerToken => (long)_hp.NumLayers * _numKvHeads * _headDim * 2 * sizeof(float);
+
+    /// <summary>
+    /// Whether SnapKV prefill eviction is configured (via SHARPI_SNAPKV*). The
+    /// continuous-batching engine checks this to disable chunked/packed prefill:
+    /// SnapKV scoring only runs on a fresh full-prompt prefill (startPos == 0), so
+    /// splitting the prompt into chunks would silently skip eviction.
+    /// </summary>
+    public bool SnapKvEnabled => _snapKvCfg.Enabled;
+
+    /// <summary>
     /// Truncate the KV cache to the given length, discarding positions >= length.
     /// Used by speculative decoding to rewind rejected draft tokens.
     /// Not supported when TurboQuant is enabled and the target length falls in the compressed range.
@@ -2349,6 +2366,226 @@ public sealed unsafe class ForwardPass : IForwardPass
                 FusedMatVec(_logits, _outputWeight, h, _hp.VocabSize, _embDim);
                 result[n] = new float[_hp.VocabSize];
                 new ReadOnlySpan<float>(_logits, _hp.VocabSize).CopyTo(result[n]);
+            }
+            return result;
+        }
+        finally
+        {
+            NativeMemory.Free(batchHidden);
+            NativeMemory.Free(batchResidual);
+        }
+    }
+
+    /// <summary>
+    /// Packed multi-sequence prefill (issue #183 Gap 2): processes one chunk of prompt
+    /// tokens from each of S sequences in a single forward pass. All chunks are
+    /// concatenated into one packed batch so every GEMM amortizes weight reads across
+    /// the combined token count — the multi-prompt analogue of what
+    /// <see cref="BatchForwardMulti"/> does for decode. Attention stays per-token
+    /// against each sequence's own cache (varlen / cu_seqlens-style: no cross-sequence
+    /// attention, no padding).
+    ///
+    /// SnapKV eviction is never applied here — chunked admission feeds this with
+    /// startPos &gt; 0 segments where SnapKV scoring doesn't run; callers that want
+    /// SnapKV must use whole-prompt <see cref="PrefillWithCache"/> instead (the engine
+    /// gates on <see cref="SnapKvEnabled"/>).
+    /// </summary>
+    /// <param name="chunks">Per-sequence token chunk (each non-empty).</param>
+    /// <param name="startPos">Per-sequence cache position at which its chunk begins.</param>
+    /// <param name="caches">Per-sequence KV cache.</param>
+    /// <param name="wantLogits">
+    /// Per-sequence: compute logits for the chunk's last token (true for a sequence's
+    /// final chunk; intermediate chunks skip the vocab projection).
+    /// </param>
+    /// <returns>Per-sequence logits array, null where <paramref name="wantLogits"/> was false.</returns>
+    public float[]?[] PrefillPackedMulti(
+        ReadOnlyMemory<int>[] chunks, int[] startPos, PagedKvCache[] caches, bool[] wantLogits)
+    {
+        if (_tqKvCache != null)
+            throw new NotSupportedException("PrefillPackedMulti is not supported when TurboQuant KV cache is enabled.");
+        if (_hp.IsMoE)
+            throw new NotSupportedException("PrefillPackedMulti is not supported for MoE models.");
+        if (_layerHeadDim is not null)
+            throw new NotSupportedException(
+                "gemma4 per-layer head_dim not yet supported on PrefillPackedMulti.");
+
+        int S = chunks.Length;
+        if (S == 0) return Array.Empty<float[]?>();
+        if (startPos.Length != S || caches.Length != S || wantLogits.Length != S)
+            throw new ArgumentException("chunks/startPos/caches/wantLogits lengths must match.");
+
+        // Packed offsets: sequence s owns packed rows [off[s], off[s+1]).
+        var off = new int[S + 1];
+        for (int s = 0; s < S; s++)
+        {
+            if (chunks[s].IsEmpty)
+                throw new ArgumentException($"Chunk for sequence {s} is empty.", nameof(chunks));
+            off[s + 1] = off[s] + chunks[s].Length;
+        }
+        int N = off[S];
+
+        int qDim = _numHeads * _headDim;
+        int kvDim = _numKvHeads * _headDim;
+        var batchHidden = (float*)NativeMemory.AllocZeroed((nuint)((long)N * _embDim * sizeof(float)));
+        var batchResidual = (float*)NativeMemory.AllocZeroed((nuint)((long)N * _embDim * sizeof(float)));
+        try
+        {
+            for (int s = 0; s < S; s++)
+            {
+                var span = chunks[s].Span;
+                for (int i = 0; i < span.Length; i++)
+                    EmbedTokenInto(span[i], batchHidden + (long)(off[s] + i) * _embDim);
+            }
+
+            var batchNorm = (float*)NativeMemory.AllocZeroed((nuint)((long)N * _embDim * sizeof(float)));
+            var batchQ = (float*)NativeMemory.AllocZeroed((nuint)((long)N * qDim * sizeof(float)));
+            var batchK = (float*)NativeMemory.AllocZeroed((nuint)((long)N * kvDim * sizeof(float)));
+            var batchV = (float*)NativeMemory.AllocZeroed((nuint)((long)N * kvDim * sizeof(float)));
+            var batchAttnOut = (float*)NativeMemory.AllocZeroed((nuint)((long)N * qDim * sizeof(float)));
+            var batchFfnGate = (float*)NativeMemory.AllocZeroed((nuint)((long)N * _intermDim * sizeof(float)));
+            var batchFfnUp = (float*)NativeMemory.AllocZeroed((nuint)((long)N * _intermDim * sizeof(float)));
+            try
+            {
+                for (int layer = 0; layer < _hp.NumLayers; layer++)
+                {
+                    // Rewind each cache so this layer's appends land at startPos[s]
+                    // (Append advances the shared position counter every layer; same
+                    // per-layer soft reset PrefillCore does for its single cache).
+                    for (int s = 0; s < S; s++)
+                        caches[s].TruncateTo(startPos[s]);
+
+                    var normW = GetNormWeight(_attnNorm[layer]);
+                    for (int n = 0; n < N; n++)
+                    {
+                        Copy(batchResidual + (long)n * _embDim, batchHidden + (long)n * _embDim, _embDim);
+                        SimdKernels.RmsNorm(batchNorm + (long)n * _embDim,
+                            batchHidden + (long)n * _embDim, normW, _embDim, _hp.RmsNormEps);
+                    }
+
+                    SimdKernels.MatMulBatched(batchQ, _wq[layer].DataPtr, batchNorm,
+                        N, qDim, _embDim, _wq[layer].DType);
+                    SimdKernels.MatMulBatched(batchK, _wk[layer].DataPtr, batchNorm,
+                        N, kvDim, _embDim, _wk[layer].DType);
+                    SimdKernels.MatMulBatched(batchV, _wv[layer].DataPtr, batchNorm,
+                        N, kvDim, _embDim, _wv[layer].DType);
+
+                    if (_hasAttnBias)
+                    {
+                        for (int n = 0; n < N; n++)
+                        {
+                            SimdKernels.AddInPlace(batchQ + (long)n * qDim, _bq[layer], qDim);
+                            SimdKernels.AddInPlace(batchK + (long)n * kvDim, _bk[layer], kvDim);
+                            SimdKernels.AddInPlace(batchV + (long)n * kvDim, _bv[layer], kvDim);
+                        }
+                    }
+
+                    bool useRoPE = _hp.NoRopeLayerStep == 0
+                        || (layer + 1) % _hp.NoRopeLayerStep != 0;
+
+                    // Per-token: RoPE at the token's own absolute position, KV append
+                    // into the token's own cache, causal attention over that cache only.
+                    for (int s = 0; s < S; s++)
+                    {
+                        for (int i = 0; i < chunks[s].Length; i++)
+                        {
+                            int n = off[s] + i;
+                            int pos = startPos[s] + i;
+                            float* qn = batchQ + (long)n * qDim;
+                            float* kn = batchK + (long)n * kvDim;
+                            float* vn = batchV + (long)n * kvDim;
+
+                            if (_hasQkNorm && !_hp.UseL2QkNorm)
+                            {
+                                ApplyQkNorm(qn, kn, layer);
+                            }
+                            if (useRoPE)
+                            {
+                                ApplyRope(qn, pos, _numHeads);
+                                ApplyRope(kn, pos, _numKvHeads);
+                            }
+                            if (_hasQkNorm && _hp.UseL2QkNorm && useRoPE)
+                            {
+                                PerHeadPureRmsNorm(qn, _numHeads, _headDim, _hp.RmsNormEps);
+                                PerHeadPureRmsNorm(kn, _numKvHeads, _headDim, _hp.RmsNormEps);
+                            }
+
+                            caches[s].Append(layer,
+                                new ReadOnlySpan<float>(kn, kvDim),
+                                new ReadOnlySpan<float>(vn, kvDim));
+                            caches[s].IncrementPosition();
+
+                            Copy(_q, qn, qDim);
+                            Attention(caches[s], layer, pos);
+                            Copy(batchAttnOut + (long)n * qDim, _attnOut, qDim);
+                        }
+                    }
+
+                    SimdKernels.MatMulBatched(batchNorm, _wo[layer].DataPtr, batchAttnOut,
+                        N, _embDim, qDim, _wo[layer].DType);
+                    if (_hasAttnBias)
+                    {
+                        for (int n = 0; n < N; n++)
+                            SimdKernels.AddInPlace(batchNorm + (long)n * _embDim, _bo[layer], _embDim);
+                    }
+                    for (int n = 0; n < N; n++)
+                    {
+                        float* h = batchHidden + (long)n * _embDim;
+                        Copy(h, batchNorm + (long)n * _embDim, _embDim);
+                        SimdKernels.AddInPlace(h, batchResidual + (long)n * _embDim, _embDim);
+                    }
+
+                    var ffnNormW = GetNormWeight(_ffnNorm[layer]);
+                    for (int n = 0; n < N; n++)
+                    {
+                        Copy(batchResidual + (long)n * _embDim, batchHidden + (long)n * _embDim, _embDim);
+                        SimdKernels.RmsNorm(batchNorm + (long)n * _embDim,
+                            batchHidden + (long)n * _embDim, ffnNormW, _embDim, _hp.RmsNormEps);
+                    }
+                    SimdKernels.MatMulBatched(batchFfnGate, _wGate[layer].DataPtr, batchNorm,
+                        N, _intermDim, _embDim, _wGate[layer].DType);
+                    SimdKernels.MatMulBatched(batchFfnUp, _wUp[layer].DataPtr, batchNorm,
+                        N, _intermDim, _embDim, _wUp[layer].DType);
+                    for (int n = 0; n < N; n++)
+                        SimdKernels.SiLuMul(batchFfnGate + (long)n * _intermDim,
+                            batchFfnUp + (long)n * _intermDim, _intermDim);
+                    SimdKernels.MatMulBatched(batchNorm, _wDown[layer].DataPtr, batchFfnGate,
+                        N, _embDim, _intermDim, _wDown[layer].DType);
+                    for (int n = 0; n < N; n++)
+                    {
+                        float* h = batchHidden + (long)n * _embDim;
+                        Copy(h, batchNorm + (long)n * _embDim, _embDim);
+                        SimdKernels.AddInPlace(h, batchResidual + (long)n * _embDim, _embDim);
+                    }
+                }
+
+                // Leave every cache at its post-chunk length for subsequent decode/chunks.
+                for (int s = 0; s < S; s++)
+                    caches[s].TruncateTo(startPos[s] + chunks[s].Length);
+            }
+            finally
+            {
+                NativeMemory.Free(batchNorm);
+                NativeMemory.Free(batchQ);
+                NativeMemory.Free(batchK);
+                NativeMemory.Free(batchV);
+                NativeMemory.Free(batchAttnOut);
+                NativeMemory.Free(batchFfnGate);
+                NativeMemory.Free(batchFfnUp);
+            }
+
+            // Final norm + vocab projection only for sequences whose chunk completes
+            // their prompt — intermediate chunks never need logits.
+            var outNormW = GetNormWeight(_outputNorm);
+            var result = new float[]?[S];
+            for (int s = 0; s < S; s++)
+            {
+                if (!wantLogits[s]) continue;
+                float* lastHidden = batchHidden + (long)(off[s + 1] - 1) * _embDim;
+                SimdKernels.RmsNorm(lastHidden, lastHidden, outNormW, _embDim, _hp.RmsNormEps);
+                FusedMatVec(_logits, _outputWeight, lastHidden, _hp.VocabSize, _embDim);
+                var arr = new float[_hp.VocabSize];
+                new ReadOnlySpan<float>(_logits, _hp.VocabSize).CopyTo(arr);
+                result[s] = arr;
             }
             return result;
         }

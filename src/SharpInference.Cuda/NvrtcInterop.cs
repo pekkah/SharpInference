@@ -14,13 +14,9 @@ internal static unsafe partial class NvrtcInterop
 {
     static NvrtcInterop()
     {
-        NativeLibrary.SetDllImportResolver(typeof(NvrtcInterop).Assembly, static (name, _, _) =>
-        {
-            if (name == "nvrtc")
-                foreach (var candidate in new[] { "nvrtc64_120_0", "nvrtc64_112_0", "nvrtc64_11" })
-                    if (NativeLibrary.TryLoad(candidate, out nint h)) return h;
-            return nint.Zero;
-        });
+        // NVRTC probing now lives in the assembly-wide resolver (shared with the
+        // cudart/cublas major-version selection — see CudaLibraryResolver).
+        CudaLibraryResolver.Register();
     }
 
     // ── NVRTC ─────────────────────────────────────────────────────────────

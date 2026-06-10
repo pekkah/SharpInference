@@ -73,7 +73,7 @@ Supporting libraries:
 - `PagedKvCache` (in Engine) — lazily allocated paged KV cache used by `ForwardPass`. Pages (16 positions) allocated on first write; `TruncateTo` is a soft operation (enables prefix reuse); `Reset` returns pages to warm pool.
 - `IInferenceEngine` (in Engine) — top-level generation interface used by the server: `GenerateAsync(prompt, sp, ct) → IAsyncEnumerable<string>`. Implemented by `InferenceEngine` (single-user, prefix caching) and `ContinuousBatchingEngine` (multi-user batching, activated via `SHARPI_MAX_BATCH`).
 - `ForwardPass.BatchForwardMulti(tokens[], positions[], caches[])` — batched multi-sequence decode; amortizes weight reads N× across concurrent users. Each sequence has its own `PagedKvCache`. Not supported for MoE or TurboQuant.
-- `ForwardPass.PrefillWithCache(tokens, cache, startPos)` — prefills a per-sequence cache (used by `ContinuousBatchingEngine` during request admission).
+- `ForwardPass.PrefillWithCache(tokens, cache, startPos)` — prefills a per-sequence cache (used by `ContinuousBatchingEngine` during request admission). Admission is chunked (`SHARPI_PREFILL_CHUNK`, default 256 tokens) and interleaved with decode steps; multiple in-flight prompts prefill as one packed pass via `ForwardPass.PrefillPackedMulti` and admission is gated by a KV token budget (`SHARPI_KV_BUDGET_MB`) — issue #183.
 - `ForwardPass` / `GpuForwardPass` in Engine dispatch the transformer layer sequence.
 - Hot paths use `NativeMemory`, `Span<T>`, and Vulkan buffers — no managed heap allocations.
 - Unsafe code is used throughout for performance. `AllowUnsafeBlocks` is enabled globally.

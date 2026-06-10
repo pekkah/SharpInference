@@ -419,6 +419,59 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     public int SmVersion => _smVersion;
 
     /// <summary>
+    /// Measures effective host↔device transfer bandwidth with a pinned 64 MiB
+    /// <c>cudaMemcpy</c> probe (issue #183: replaces <c>HardwareProfile</c>'s
+    /// VRAM-size-bucket PCIe guess with a real number). Returns the slower of the
+    /// H2D and D2H directions in GB/s — streaming-cost estimates shouldn't assume
+    /// the faster one. Costs ~100 ms; intended to run once at model load. Returns
+    /// 0 on any failure so callers can fall back to a heuristic.
+    /// </summary>
+    public double MeasurePcieBandwidthGBps()
+    {
+        nuint Size = 64 * 1024 * 1024;
+        nint host = 0, dev = 0;
+        try
+        {
+            if (CuBlasInterop.MallocHost(out host, Size) != 0) return 0;
+            if (CuBlasInterop.CudaMalloc(out dev, Size) != 0) return 0;
+
+            // Warm both directions once (the driver lazily maps the pinned range).
+            if (CuBlasInterop.CudaMemcpy(dev, host, Size, CuBlasInterop.HostToDevice) != 0) return 0;
+            if (CuBlasInterop.CudaMemcpy(host, dev, Size, CuBlasInterop.DeviceToHost) != 0) return 0;
+
+            double h2d = TimeDirection(dev, host, CuBlasInterop.HostToDevice, Size);
+            double d2h = TimeDirection(host, dev, CuBlasInterop.DeviceToHost, Size);
+            if (h2d <= 0 || d2h <= 0) return 0;
+            return Math.Min(h2d, d2h);
+        }
+        catch
+        {
+            return 0;
+        }
+        finally
+        {
+            if (dev != 0) _ = CuBlasInterop.CudaFree(dev);
+            if (host != 0) _ = CuBlasInterop.FreeHost(host);
+        }
+
+        static double TimeDirection(nint dst, nint src, int kind, nuint size)
+        {
+            const int Reps = 3;
+            double best = 0;
+            for (int i = 0; i < Reps; i++)
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                if (CuBlasInterop.CudaMemcpy(dst, src, size, kind) != 0) return 0;
+                sw.Stop();
+                // Synchronous cudaMemcpy returns only after the copy completes, so
+                // wall time is the transfer time. Best-of-3 rejects scheduler noise.
+                best = Math.Max(best, size / sw.Elapsed.TotalSeconds / 1e9);
+            }
+            return best;
+        }
+    }
+
+    /// <summary>
     /// CUDA stream that all kernels and memcpys are enqueued on. Callers that need to
     /// schedule their own async work against the backend pipeline can use this handle —
     /// it is owned by the backend and synchronized by <see cref="Synchronize"/>.

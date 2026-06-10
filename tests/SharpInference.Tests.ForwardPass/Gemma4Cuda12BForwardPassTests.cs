@@ -27,9 +27,25 @@ namespace SharpInference.Tests.ForwardPass;
 /// Silent-skip: if CUDA isn't available (CPU-only tests still run) OR the GGUF isn't on
 /// disk, the relevant tests no-op.
 /// </summary>
-public sealed class Gemma4Cuda12BForwardPassTests
+public sealed class Gemma4Cuda12BForwardPassTests : IDisposable
 {
     private const string ModelFile = "gemma-4-12b-it-qat-q4_0.gguf";
+
+    // Pin the KV cache to fp32 for these tests. Since #185, CudaForwardPass
+    // auto-narrows the KV dtype when fp32 won't fit the VRAM budget — on a 12 GB
+    // card the 12B at ctx 4096 narrows to bf16, making the effective dtype
+    // environment-dependent. These tests greedy-decode a synthetic OOD token
+    // prompt where the top-logit margin is tiny, and bf16 rounding noise tips it
+    // into a single-token repetition attractor (fails the ≥2-distinct assertion)
+    // even though the bf16 path is coherent on real prompts (validated via CLI to
+    // 128K, #179/#184; q8_0's different rounding happens to pass). The guards
+    // here target trunk math (k_eq_v, per-layer KV, embed), so the dtype must be
+    // deterministic. Restored in Dispose.
+    private readonly string? _prevKvDType = Environment.GetEnvironmentVariable("SHARPI_KV_DTYPE");
+    public Gemma4Cuda12BForwardPassTests() =>
+        Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", "fp32");
+    public void Dispose() =>
+        Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", _prevKvDType);
 
     // Synthetic BOS-led mid-vocab prompt: the 12B IT model emits a 1-token EOS on real
     // factual prompts, so coherence is asserted on arbitrary tokens (see task notes).

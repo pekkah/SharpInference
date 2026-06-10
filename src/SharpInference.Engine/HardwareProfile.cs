@@ -11,11 +11,19 @@ public sealed record HardwareProfile(
     bool HasAvx512)
 {
     /// <summary>
-    /// Detect hardware capabilities given a CUDA device's VRAM. Used by the CUDA hybrid
-    /// path; the underlying placement math only needs total VRAM bytes regardless of
-    /// which GPU backend reported them.
+    /// Detect hardware capabilities given a CUDA device. Used by the CUDA hybrid path.
+    /// PCIe bandwidth is measured with a real pinned-copy probe (issue #183) instead of
+    /// the VRAM-size bucket guess; the heuristic remains as fallback when the probe
+    /// fails (e.g. not enough free VRAM for the 64 MiB scratch).
     /// </summary>
-    public static HardwareProfile Detect(Cuda.CudaBackend gpu) => DetectFromVram((long)gpu.VramBytes);
+    public static HardwareProfile Detect(Cuda.CudaBackend gpu)
+    {
+        var profile = DetectFromVram((long)gpu.VramBytes);
+        double measured = gpu.MeasurePcieBandwidthGBps();
+        if (measured > 0)
+            profile = profile with { EstPcieBandwidthGBps = Math.Clamp(measured, 5.0, 64.0) };
+        return profile;
+    }
 
     /// <summary>
     /// Detect hardware capabilities from the current system and Vulkan device.
