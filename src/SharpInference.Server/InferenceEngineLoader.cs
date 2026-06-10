@@ -77,7 +77,8 @@ public static class InferenceEngineLoader
 
         try
         {
-            (fwd, batchingSupported) = BuildForwardPass(model, hp, arch, ctxSize, nGpuLayers, opts.Backend, turboQuant, owned);
+            (fwd, batchingSupported) = BuildForwardPass(model, hp, arch, ctxSize, nGpuLayers, opts.Backend, turboQuant, owned,
+                DequantCacheBytes(opts.PrefillDequantCacheMb));
             owned.Add(model);
         }
         catch
@@ -89,22 +90,33 @@ public static class InferenceEngineLoader
 
         // ── 5. Wrap in the right engine. ContinuousBatchingEngine takes the concrete
         // ForwardPass — it isn't built for the GPU / hybrid paths — so we honour
-        // MaxBatchSize > 1 only when batching is structurally possible.
+        // MaxBatchSize > 1 only when batching is structurally possible. Mirror the
+        // BuildForwardPass guard above: if an engine constructor throws, dispose everything
+        // in owned[] (the backend, the multi-GB forward pass, the GGUF handle) rather than
+        // leaking it — ownership only transfers once construction succeeds.
         IInferenceEngine engine;
-        if (opts.MaxBatchSize > 1 && batchingSupported && fwd is ForwardPass cpuFwd)
+        try
         {
-            engine = new ContinuousBatchingEngine(cpuFwd, tokenizer, modelId, opts.MaxBatchSize,
-                thinkTokenId, endThinkTokenId,
-                prefillChunkTokens: opts.PrefillChunkTokens,
-                kvBudgetBytes: opts.KvBudgetMb > 0 ? opts.KvBudgetMb * 1024 * 1024 : opts.KvBudgetMb);
-            // ContinuousBatchingEngine doesn't accept owned[] disposables; transfer
-            // disposal responsibility by wrapping it in a composite disposable.
-            engine = new OwnedDisposableEngine(engine, owned);
+            if (opts.MaxBatchSize > 1 && batchingSupported && fwd is IBatchedForwardPass batchFwd)
+            {
+                engine = new ContinuousBatchingEngine(batchFwd, tokenizer, modelId, opts.MaxBatchSize,
+                    thinkTokenId, endThinkTokenId,
+                    prefillChunkTokens: opts.PrefillChunkTokens,
+                    kvBudgetBytes: opts.KvBudgetMb > 0 ? opts.KvBudgetMb * 1024 * 1024 : opts.KvBudgetMb);
+                // ContinuousBatchingEngine doesn't accept owned[] disposables; transfer
+                // disposal responsibility by wrapping it in a composite disposable.
+                engine = new OwnedDisposableEngine(engine, owned);
+            }
+            else
+            {
+                engine = new InferenceEngine(fwd, tokenizer, modelId, thinkTokenId, endThinkTokenId,
+                    owned.ToArray());
+            }
         }
-        else
+        catch
         {
-            engine = new InferenceEngine(fwd, tokenizer, modelId, thinkTokenId, endThinkTokenId,
-                owned.ToArray());
+            foreach (var d in owned) try { d.Dispose(); } catch { /* fall through to rethrow */ }
+            throw;
         }
 
         return new LoadedEngine(engine, arch, tokenizer.ChatTemplate);
@@ -112,9 +124,18 @@ public static class InferenceEngineLoader
 
     // ── Backend dispatch ─────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Translate <see cref="SharpInferenceServerOptions.PrefillDequantCacheMb"/> (MiB, nullable)
+    /// into the <see cref="ForwardPass"/> constructor's byte budget: <c>null</c> → defer to the
+    /// <c>SHARPI_PREFILL_DEQUANT_MB</c> env / auto-sizing; <c>0</c> → off; negative → unlimited;
+    /// positive → that many MiB (saturating, never overflowing).
+    /// </summary>
+    private static long DequantCacheBytes(long? mb) =>
+        mb is null ? long.MinValue : ForwardPass.MbToBudgetBytes(mb.Value);
+
     private static (IForwardPass Fwd, bool BatchingSupported) BuildForwardPass(
         GgufModel model, ModelHyperparams hp, string arch, int ctxSize, int nGpuLayers,
-        ServerBackend backend, bool turboQuant, List<IDisposable> owned)
+        ServerBackend backend, bool turboQuant, List<IDisposable> owned, long prefillDequantCacheBytes)
     {
         // Resolve "auto" first so the rest of the method can treat backend as concrete.
         if (nGpuLayers != 0 && backend == ServerBackend.Auto)
@@ -143,7 +164,8 @@ public static class InferenceEngineLoader
                 return (hybrid, BatchingSupported: false);
             }
 
-            var dense = new ForwardPass(model, cpuBackend, hp);
+            var dense = new ForwardPass(model, cpuBackend, hp,
+                prefillDequantCacheBytes: prefillDequantCacheBytes);
             owned.Add(dense);
             if (turboQuant)
                 dense.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
@@ -157,7 +179,10 @@ public static class InferenceEngineLoader
 
         // GPU paths share a CPU baseline (for the hybrid-CPU half of partial offload).
         // For full GPU paths the dense CPU fwd is unused but still cheap to construct.
-        ForwardPass? cpuDense = hp.IsHybridSsm ? null : new ForwardPass(model, cpuBackend, hp);
+        // The #189 dequant cache is off here: GPU/hybrid never drive the batched CPU prefill
+        // that consults it, so a full F32 model copy would be pure wasted RAM.
+        ForwardPass? cpuDense = hp.IsHybridSsm ? null
+            : new ForwardPass(model, cpuBackend, hp, prefillDequantCacheBytes: 0);
         if (cpuDense is not null) owned.Add(cpuDense);
 
         if (backend == ServerBackend.Cuda)
@@ -201,7 +226,13 @@ public static class InferenceEngineLoader
             {
                 var cfwd = new CudaForwardPass(model, cuda, hp, ctxSize, enableTurboQuant: turboQuant);
                 owned.Add(cfwd);
-                return (cfwd, BatchingSupported: false);
+                // Issue #190: dense CUDA full-offload supports continuous batching (per-sequence
+                // GPU KV caches + true batched decode). SupportsContinuousBatching is the single
+                // source of truth shared with CudaForwardPass's runtime guard, so the loader gate
+                // can't diverge from what the batched methods accept — it folds in MoE, Gemma-4
+                // (per-layer head_dim), TurboQuant, an auto/explicit SnapKV budget, a final-logit
+                // softcap, and any non-GEMM-N-batchable trunk/output weight dtype (Q4_0).
+                return (cfwd, cfwd.SupportsContinuousBatching);
             }
 
             var planForHybrid = TierPlanner.Plan(model, hp, hwProfile, turboQuant, requestedCtxSize: ctxSize)

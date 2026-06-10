@@ -27,6 +27,10 @@ builder.Services.AddSharpInference(builder.Configuration, opts =>
     if (long.TryParse(Environment.GetEnvironmentVariable("SHARPI_KV_BUDGET_MB"), out long kvBudgetMb) && kvBudgetMb != 0)
         opts.KvBudgetMb = kvBudgetMb;
 
+    // Dequant-once BLAS weight-cache budget in MiB (issue #189). null/unset = auto.
+    if (long.TryParse(Environment.GetEnvironmentVariable("SHARPI_PREFILL_DEQUANT_MB"), out long dequantMb))
+        opts.PrefillDequantCacheMb = dequantMb;
+
     // SHARPI_BACKEND ∈ {auto, cpu, cuda, vulkan} — case-insensitive. Lets a
     // smoke test or ad-hoc run override the appsettings.Local.json backend
     // without editing the file (matches the SHARPI_MODEL pattern above).

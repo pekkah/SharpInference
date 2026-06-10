@@ -38,7 +38,7 @@ namespace SharpInference.Engine;
 ///   • MoE + TurboQuant combination not validated (no test model has both;
 ///     should compose but the dispatch never sees the combination today).
 /// </summary>
-public sealed unsafe class CudaForwardPass : IForwardPass
+public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
 {
     private readonly CudaBackend _gpu;
     private readonly GgufModel _model;
@@ -100,8 +100,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     // Non-TQ path: full FP32 cache [maxSeqLen, numKvHeads*headDim] per layer.
     // TQ path:     FP32 ring window [tqFp32Window, numKvHeads*headDim] per layer,
     //              plus TurboQuant-compressed storage for older positions.
-    private readonly Tensor[] _gpuKCache;
-    private readonly Tensor[] _gpuVCache;
+    //
+    // Mutable (issue #190): the continuous-batching path swaps in a per-sequence
+    // CudaSequenceKvCache's K/V arrays via BindCache around a Prefill call, then restores
+    // the owned arrays. _ownedKCache/_ownedVCache are the real allocation home — the only
+    // arrays Dispose frees — so a torn bind (mid-exception) never leaks or double-frees.
+    private Tensor[] _gpuKCache;
+    private Tensor[] _gpuVCache;
+    private Tensor[] _ownedKCache = null!;
+    private Tensor[] _ownedVCache = null!;
 
     // KV-cache element dtype (issue #179). F32 (default) or BFloat16 — the latter
     // halves the cache footprint to unlock long context on a 12 GB card. Arithmetic
@@ -333,6 +340,36 @@ public sealed unsafe class CudaForwardPass : IForwardPass
     private float[]? _bpPleRowHostAll;                     // managed [N × L*pleWidth]
     /// <summary>True if the most recent <see cref="Prefill"/> used the batched trunk.</summary>
     public bool LastPrefillWasBatched { get; private set; }
+
+    // Batched-decode logits scratch (issue #190): the output projection is the single
+    // largest matmul, so BatchForwardMulti runs it once over all N decode rows (weight
+    // read amortized N×) into this [N × vocab] device buffer, downloads it in one copy
+    // into _decodeLogitsHost, then splits into the per-sequence float[] results. Lazily
+    // (re)sized to the current decode batch N (small + changes only as the batch grows).
+    private Tensor? _decodeLogitsAll;
+    private float[]? _decodeLogitsHost;
+    private int _decodeLogitsCapacity;
+
+    // Batched-decode matmul path (issue #190). false (default): the GEMM-N matvec
+    // (_gpu.MatMulBatched) — bit-closest to the per-token decode oracle. It reads each weight
+    // tile once PER token-block (grid Y = nTok), so it amortizes launch overhead + L2 weight
+    // reuse, not the weight HBM reads. true (SHARPI_BATCH_DECODE_GEMM=1): the compute-bound
+    // GEMM/MMQ path (GpuMatMulBatchedCore) that reads each weight ONCE per batch — argmax-stable,
+    // not bit-exact (same contract the prefill batched trunk holds).
+    //
+    // Measured on Qwen3-8B Q4_K_M @ 4070 Ti (aggregate t/s, single-user Forward = 75): GEMM-N
+    // beats compute-bound at every realistic decode batch — N=1 70 vs 15, N=4 99 vs 57, N=8 106
+    // vs 98 — because the compute-bound kernels carry large per-step fixed costs (int8 activation
+    // conversion + the Q6_K output-weight fp16 dequant every step) that only amortize at the
+    // N=4096 scale prefill runs at. So GEMM-N is the default; the toggle is kept for very high
+    // concurrency (the curves converge near N=8, so compute-bound may overtake at N≳16).
+    private readonly bool _batchDecodeComputeBound =
+        Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_GEMM") == "1";
+
+    // Empty (no-aliasing) layer set shared by every dense per-sequence cache CreateCache
+    // hands out — dense models never share KV across layers (that's the Gemma 4 tail,
+    // excluded from batching), so nothing is ever skipped on CudaSequenceKvCache.Dispose.
+    private static readonly IReadOnlySet<int> s_noAliasedLayers = new HashSet<int>();
 
     // SWA RoPE freq base (10K for Gemma 4 SWA layers). 0 when no SWA layers.
     private readonly float _ropeThetaSwa;
@@ -669,6 +706,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         int kvDim = _numKvHeads * _headDim;
         _gpuKCache = new Tensor[hp.NumLayers];
         _gpuVCache = new Tensor[hp.NumLayers];
+        // The owned arrays are filled in-place by the branches below; capture the array
+        // references now so BindCache/RestoreOwned (issue #190) and Dispose always target
+        // the real allocation home regardless of any transient rebind.
+        _ownedKCache = _gpuKCache;
+        _ownedVCache = _gpuVCache;
         if (_tqEnabled)
         {
             if (hp.LayerHeadDim is not null)
@@ -2872,6 +2914,466 @@ public sealed unsafe class CudaForwardPass : IForwardPass
         _kvEvictedCount = 0; // fresh sequence — standard sequential cache state restored
     }
 
+    // ── IBatchedForwardPass (issue #190): CUDA continuous batching, dense path ──────────
+    //
+    // The continuous-batching engine drives this forward pass through the backend-agnostic
+    // IBatchedForwardPass surface: it allocates one per-sequence GPU KV cache per admitted
+    // request (CreateCache), prefills each (PrefillWithCache / PrefillPackedMulti), then
+    // decodes all active sequences together in one weight-amortized batched step
+    // (BatchForwardMulti). All calls land on the engine's single batcher thread, so the
+    // shared scratch + the BindCache rebind below never race.
+    //
+    // Scope is DENSE only. MoE (router Download mid-layer), Gemma-4-like (per-layer
+    // head_dim / SWA rings / shared-KV aliasing), TurboQuant (compressed ring), and an
+    // active SnapKV budget (eviction only runs on the owned cache during a whole-prompt
+    // prefill) all throw NotSupportedException here, and the loader keeps
+    // batchingSupported=false for them so those models fall back to the single-user engine.
+
+    /// <summary>Whether SnapKV prefill eviction is configured/active (issue #59). The engine
+    /// disables chunked/packed prefill when true; the loader keeps batching off when true.</summary>
+    public bool SnapKvEnabled => _snapKvEffectiveBudget > 0;
+
+    /// <summary>Bytes of KV one token occupies across all layers (issue #183) — the engine
+    /// turns a memory budget into a token admission budget. Honors the KV dtype (#179) via
+    /// block-aware <see cref="DTypeInfo.ByteSize"/> — <see cref="DTypeInfo.BytesPerElement"/>
+    /// throws for quantized stores (q8_0 packs 32 elements into a 34-byte block).</summary>
+    public long KvBytesPerToken =>
+        (long)_hp.NumLayers * 2 * DTypeInfo.ByteSize((long)_numKvHeads * _headDim, _kvDType);
+
+    /// <summary>The dequant-once CPU weight cache (issue #189) is a CPU-path optimization;
+    /// the CUDA path keeps all weights resident in VRAM, so it never applies here.</summary>
+    public bool PrefillDequantCacheActive => false;
+
+    /// <summary>Dtypes the batched-decode GEMM-N matvec (<see cref="CudaBackend.MatMulBatched"/>)
+    /// supports. Excludes Q4_0 — it has compute-bound GEMM/MMQ prefill kernels but NO GEMM-N
+    /// matvec, so a Q4_0 trunk/output weight would throw at the first batched decode step. Dense
+    /// Q4_0 is otherwise rare (the common Q4_0 model, Gemma 4 12B QAT, is already excluded as
+    /// per-layer head_dim).</summary>
+    private static bool GemmNBatchable(DType d) =>
+        d is DType.Q4_K or DType.Q5_K or DType.Q6_K or DType.Q8_0 or DType.Float32;
+
+    /// <summary>Fail-closed dtype check for a batched-decode weight: an unregistered handle is
+    /// treated as NOT batchable, so a weight whose dtype isn't tracked can't slip into the
+    /// GEMM-N path and be misdispatched (mirrors <see cref="BatchableWeight"/>).</summary>
+    private bool DecodeBatchable(Tensor t) =>
+        _weightDTypes.TryGetValue(t.Handle, out var d) && GemmNBatchable(d);
+
+    /// <summary>
+    /// Whether this instance can be driven by the continuous-batching engine (issue #190).
+    /// Single source of truth for both the loader gate and the runtime guard, so they can't
+    /// diverge: dense (non-MoE, non-Gemma-4), no TurboQuant, no active SnapKV, no final-logit
+    /// softcap (a dense softcap arch would cap prefill logits but not the un-softcapped batched
+    /// decode — keep them out until a batched softcap is wired), and every trunk + output weight
+    /// in a GEMM-N-batchable dtype (excludes Q4_0).
+    /// </summary>
+    public bool SupportsContinuousBatching
+    {
+        get
+        {
+            if (_isMoE || _isGemma4Like || _tqEnabled || _snapKvEffectiveBudget > 0) return false;
+            if (_hp.FinalLogitSoftcap > 0f) return false;
+            for (int i = 0; i < _hp.NumLayers; i++)
+            {
+                if (!DecodeBatchable(_wq[i]) || !DecodeBatchable(_wk[i]) ||
+                    !DecodeBatchable(_wo[i]) || !DecodeBatchable(_wGate[i]) ||
+                    !DecodeBatchable(_wUp[i]) || !DecodeBatchable(_wDown[i]))
+                    return false;
+                // Dense layers must own a separate V projection (k_eq_v is Gemma-4-only);
+                // a null _wv would NRE in BatchForwardMulti, so disable batching defensively.
+                if (_wv[i] is not { } wv || !DecodeBatchable(wv)) return false;
+            }
+            return DecodeBatchable(_wOutput);
+        }
+    }
+
+    /// <summary>
+    /// Guards the batched-serving entry points: continuous batching on the CUDA path is
+    /// implemented for dense transformers only. Anything that needs the owned-cache state
+    /// machine (TQ ring, SnapKV eviction), per-layer geometry (Gemma 4), a logit softcap, or a
+    /// weight dtype the GEMM-N matvec can't drive (Q4_0) is out of scope.
+    /// </summary>
+    private void ThrowIfBatchingUnsupported()
+    {
+        if (_isMoE)
+            throw new NotSupportedException(
+                "CUDA continuous batching is not supported for MoE models (router Download/Synchronize per layer).");
+        if (_isGemma4Like)
+            throw new NotSupportedException(
+                "CUDA continuous batching is not supported for Gemma-4-style models (per-layer head_dim, SWA rings, shared-KV aliasing).");
+        if (_tqEnabled)
+            throw new NotSupportedException(
+                "CUDA continuous batching is not supported with the TurboQuant KV cache.");
+        if (_snapKvEffectiveBudget > 0)
+            throw new NotSupportedException(
+                "CUDA continuous batching is not supported with an active SnapKV budget (eviction runs only on a whole-prompt prefill of the owned cache).");
+        if (_hp.FinalLogitSoftcap > 0f)
+            throw new NotSupportedException(
+                "CUDA continuous batching is not supported with a final-logit softcap (the batched decode finisher does not apply it).");
+        // Reaching here, only the weight-dtype loop can make it unsupported.
+        if (!SupportsContinuousBatching)
+            throw new NotSupportedException(
+                "CUDA continuous batching requires every trunk + output weight in a GEMM-N-batchable " +
+                "dtype (Q4_K/Q5_K/Q6_K/Q8_0/F32); a Q4_0 weight has no batched-decode matvec kernel.");
+    }
+
+    /// <summary>
+    /// Allocate a fresh, empty per-sequence GPU KV cache: NumLayers full-context K/V pairs
+    /// at the model-wide head_dim / KV-head count and the active KV dtype (#179), mirroring
+    /// the dense branch of the constructor's owned-cache allocation. Dense models never
+    /// alias KV across layers, so the cache frees every layer on dispose.
+    /// </summary>
+    internal CudaSequenceKvCache CreateCache()
+    {
+        ThrowIfBatchingUnsupported();
+
+        // The per-token CUDA-graph decode path bakes the OWNED cache's device pointers into
+        // the captured graph; replaying it after BindCache swapped in a per-sequence cache
+        // would touch a stale (foreign) pointer. Batched decode issues direct launches and
+        // never captures a graph; the only graph-eligible path the engine can still reach is
+        // Prefill's single-token Forward fallback. So once this instance is driven by the
+        // batching engine (first CreateCache), disable graphs for its lifetime.
+        _useCudaGraph = false;
+
+        int kvDim = _numKvHeads * _headDim;
+        // q8_0 KV packs 32 elements/block; the store kernels assume each layer's kvDim is a
+        // multiple of 32 (mirrors the owned-cache guard in the constructor's dense branch).
+        if (_kvDType == DType.Q8_0 && (kvDim & 31) != 0)
+            throw new NotSupportedException(
+                $"SHARPI_KV_DTYPE=q8_0 requires kvDim % 32 == 0 (block_q8_0 = 32 elements/block); kvDim={kvDim}.");
+
+        int L = _hp.NumLayers;
+        var k = new Tensor[L];
+        var v = new Tensor[L];
+        // OOM mid-loop is the realistic failure under batch pressure (each admitted sequence
+        // reserves 2·NumLayers full-context tensors). Free the partial allocations on throw so
+        // the engine's AdmitPending catch (which fails just that request and keeps running)
+        // doesn't strand VRAM that no CudaSequenceKvCache owns.
+        try
+        {
+            for (int i = 0; i < L; i++)
+            {
+                k[i] = _gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim), _kvDType);
+                v[i] = _gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim), _kvDType);
+            }
+        }
+        catch
+        {
+            for (int i = 0; i < L; i++)
+            {
+                if (k[i] is { } ki) _gpu.Free(ki);
+                if (v[i] is { } vi) _gpu.Free(vi);
+            }
+            throw;
+        }
+        return new CudaSequenceKvCache(_gpu, k, v, s_noAliasedLayers);
+    }
+
+    /// <summary>Swap the owned KV-cache pointers for a per-sequence cache's, plumbing its
+    /// logical length into the position counter so Prefill appends at the right slots.</summary>
+    private void BindCache(CudaSequenceKvCache cache)
+    {
+        _gpuKCache = cache.K;
+        _gpuVCache = cache.V;
+        _kvLength = cache.Length;
+    }
+
+    /// <summary>Restore the owned KV-cache pointers after a BindCache. Always called in a
+    /// finally so an exception mid-Prefill can't leave a foreign cache bound.</summary>
+    private void RestoreOwned()
+    {
+        _gpuKCache = _ownedKCache;
+        _gpuVCache = _ownedVCache;
+    }
+
+    /// <summary>
+    /// Prefill <paramref name="tokens"/> into the per-sequence <paramref name="cache"/> at
+    /// <paramref name="startPos"/>. Binds the cache, delegates to the existing
+    /// <see cref="Prefill"/> (its batched trunk is both correct and weight-amortized; prefill
+    /// captures no per-token graph, so the rebind is safe), writes the advanced length back,
+    /// and always restores the owned cache. Returns the logits at the chunk's final token.
+    /// </summary>
+    internal ReadOnlySpan<float> PrefillWithCache(IReadOnlyList<int> tokens, CudaSequenceKvCache cache, int startPos = 0)
+    {
+        ArgumentNullException.ThrowIfNull(cache);
+        ThrowIfBatchingUnsupported();
+        if (tokens is null || tokens.Count == 0)
+            throw new ArgumentException("Token list is empty", nameof(tokens));
+
+        int savedKvLength = _kvLength;
+        BindCache(cache);
+        try
+        {
+            var logits = Prefill(tokens, startPos);
+            cache.Length = _kvLength;
+            return logits;
+        }
+        finally
+        {
+            RestoreOwned();
+            _kvLength = savedKvLength;
+        }
+    }
+
+    /// <summary>
+    /// Prefill several pending sequences' chunks. Cross-prompt packing into one forward pass
+    /// is a follow-up (issue #190); for now each chunk prefills sequentially into its own
+    /// per-sequence cache via <see cref="PrefillWithCache"/> — still correct and still
+    /// amortizing the batched-trunk GEMMs within each chunk, just not across prompts.
+    /// </summary>
+    internal float[]?[] PrefillPackedMulti(
+        ReadOnlyMemory<int>[] chunks, int[] startPos, CudaSequenceKvCache[] caches, bool[] wantLogits)
+    {
+        ArgumentNullException.ThrowIfNull(chunks);
+        ArgumentNullException.ThrowIfNull(startPos);
+        ArgumentNullException.ThrowIfNull(caches);
+        ArgumentNullException.ThrowIfNull(wantLogits);
+        ThrowIfBatchingUnsupported();
+        int S = chunks.Length;
+        if (S == 0) return Array.Empty<float[]?>();
+        if (startPos.Length != S || caches.Length != S || wantLogits.Length != S)
+            throw new ArgumentException("chunks/startPos/caches/wantLogits lengths must match.");
+
+        var result = new float[]?[S];
+        for (int s = 0; s < S; s++)
+        {
+            var logits = PrefillWithCache(AsList(chunks[s]), caches[s], startPos[s]);
+            result[s] = wantLogits[s] ? logits.ToArray() : null;
+        }
+        return result;
+    }
+
+    /// <summary>Expose a token chunk as IReadOnlyList without copying when it's array-backed
+    /// (the engine always builds chunks from <c>int[].AsMemory</c>).</summary>
+    private static IReadOnlyList<int> AsList(ReadOnlyMemory<int> mem) =>
+        MemoryMarshal.TryGetArray(mem, out ArraySegment<int> seg) ? seg : mem.ToArray();
+
+    /// <summary>One batched-decode matmul, routed by <see cref="_batchDecodeComputeBound"/>:
+    /// the GEMM-N matvec (default) or the compute-bound GEMM/MMQ path that amortizes the weight
+    /// HBM read across the batch (the same routing <see cref="GpuMatMulBatchedCore"/> uses for
+    /// prefill).</summary>
+    private void BatchDecodeMatMul(Tensor outAll, Tensor weights, Tensor inAll, int n)
+    {
+        if (_batchDecodeComputeBound)
+            GpuMatMulBatchedCore(outAll, weights, inAll, n);
+        else
+            _gpu.MatMulBatched(outAll, weights, inAll, n, WDType(weights));
+    }
+
+    /// <summary>
+    /// Ragged batched decode (issue #190): one token per sequence, each at its own position
+    /// against its own per-sequence cache, with the dense weight reads amortized N× across
+    /// the batch. This is a TRUE batched pass — it issues direct launches and never replays
+    /// the per-token CUDA graph (which would bake in owned-cache pointers). It adapts the
+    /// batched-trunk prefill (<see cref="PrefillBatchedTrunk"/>) to N sequences: batched
+    /// embed → per layer {batched RmsNorm + batched QKV GEMM-N, then per-sequence RoPE /
+    /// QK-norm / KV-append / single-query attention against that sequence's cache, then
+    /// batched O-proj + batched FFN} → per-row final norm + one batched output GEMM. The
+    /// per-sequence attention block mirrors the dense <see cref="RunDeviceRegion"/> ordering
+    /// exactly (QK-norm before RoPE, #157), so it is argmax-stable vs the single-user loop.
+    /// </summary>
+    internal float[][] BatchForwardMulti(int[] tokens, int[] positions, CudaSequenceKvCache[] caches)
+    {
+        ArgumentNullException.ThrowIfNull(tokens);
+        ArgumentNullException.ThrowIfNull(positions);
+        ArgumentNullException.ThrowIfNull(caches);
+        ThrowIfBatchingUnsupported();
+        int N = tokens.Length;
+        if (N == 0) return Array.Empty<float[]>();
+        if (positions.Length != N || caches.Length != N)
+            throw new ArgumentException("tokens/positions/caches lengths must match.");
+
+        int embDim = _embDim;
+        int qDim = _numHeads * _headDim;
+        int kvDim = _numKvHeads * _headDim;
+        int vocab = _hp.VocabSize;
+
+        EnsureBatchedTrunkScratch(N);
+        EnsureDecodeLogits(N);
+
+        // Per-sequence views into the batched Q/K/V/attnOut scratch. The offsets are fixed
+        // across layers (the batched buffers are reused each layer), so build them once and
+        // free them at the end rather than per-layer. _maxHeadDim == _headDim on the dense
+        // path, so the q/k/v/attn buffers are exactly N×qDim / N×kvDim with no padding stride.
+        // (The O-projection bias add needs per-row hidden views too, but only when _hasAttnBias
+        // — created inline in that rare branch so the common no-bias path allocates nothing extra.)
+        // Allocated INSIDE the try so a mid-loop View throw still frees the views taken so far.
+        var qViews = new Tensor[N];
+        var kViews = new Tensor[N];
+        var vViews = new Tensor[N];
+        var aViews = new Tensor[N];
+        try
+        {
+            for (int n = 0; n < N; n++)
+            {
+                qViews[n] = _gpu.View(_bpQ!, (long)n * qDim, qDim);
+                kViews[n] = _gpu.View(_bpK!, (long)n * kvDim, kvDim);
+                vViews[n] = _gpu.View(_bpV!, (long)n * kvDim, kvDim);
+                aViews[n] = _gpu.View(_bpAttnOut!, (long)n * qDim, qDim);
+            }
+
+            // 1. Embed each sequence's current token into the batched hidden buffer. (No
+            //    embedding scale: the dense per-token Forward oracle applies none — that
+            //    sqrt(embDim) factor is Gemma-only, which is out of scope here.)
+            for (int n = 0; n < N; n++)
+            {
+                EmbedTokenGpu(tokens[n]); // writes _hidden
+                _gpu.CopyDeviceRegion(_bpHidden!, (long)n * embDim * sizeof(float),
+                                      _hidden, 0, (long)embDim * sizeof(float));
+            }
+
+            // 2. Transformer layers: batched dense GEMMs + per-sequence attention.
+            for (int layer = 0; layer < _hp.NumLayers; layer++)
+            {
+                _gpu.CopyDevice(_bpResidual!, _bpHidden!);
+                _gpu.RmsNormBatched(_bpNorm!, _bpHidden!, _wAttnNorm[layer], N, embDim, _hp.RmsNormEps);
+
+                // Batched QKV. Default GEMM-N matvec (bit-closest to the per-token oracle);
+                // SHARPI_BATCH_DECODE_GEMM=1 routes the compute-bound GEMM/MMQ that amortizes
+                // the weight HBM read across the batch (argmax-stable, see BatchDecodeMatMul).
+                BatchDecodeMatMul(_bpQ!, _wq[layer], _bpNorm!, N);
+                BatchDecodeMatMul(_bpK!, _wk[layer], _bpNorm!, N);
+                BatchDecodeMatMul(_bpV!, _wv[layer]!, _bpNorm!, N);
+
+                bool useRoPE = _hp.NoRopeLayerStep == 0 || (layer + 1) % _hp.NoRopeLayerStep != 0;
+
+                // Per-sequence: bias → QK-norm/RoPE (same order as RunDeviceRegion, #157) →
+                // KV append into that sequence's own cache → single-query attention over its
+                // [0, pos+1). _kvEvictedCount is 0 (SnapKV is rejected for batching), so the
+                // physical slot is simply pos.
+                for (int n = 0; n < N; n++)
+                {
+                    int pos = positions[n];
+                    Tensor qv = qViews[n], kv = kViews[n], vv = vViews[n], av = aViews[n];
+
+                    if (_hasAttnBias)
+                    {
+                        _gpu.AddInPlace(qv, _bq![layer]);
+                        _gpu.AddInPlace(kv, _bk![layer]);
+                        _gpu.AddInPlace(vv, _bv![layer]);
+                    }
+
+                    if (_hasQkNorm && !_hp.UseL2QkNorm)
+                    {
+                        _gpu.HeadNorm(qv, _wqNorm![layer], _numHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                        _gpu.HeadNorm(kv, _wkNorm![layer], _numKvHeads, _headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                    }
+                    if (useRoPE)
+                    {
+                        _gpu.RoPE(qv, pos, _headDim, _hp.RopeTheta, _hp.IsNeoxRope);
+                        _gpu.RoPE(kv, pos, _headDim, _hp.RopeTheta, _hp.IsNeoxRope);
+                    }
+                    if (_hasQkNorm && _hp.UseL2QkNorm && useRoPE)
+                    {
+                        _gpu.HeadNormPure(qv, _numHeads, _headDim, _hp.RmsNormEps);
+                        _gpu.HeadNormPure(kv, _numKvHeads, _headDim, _hp.RmsNormEps);
+                    }
+
+                    Tensor kc = caches[n].K[layer], vc = caches[n].V[layer];
+                    KvAppendKv(kv, vv, kc, vc, kvDim, pos, _maxSeqLen);
+                    AttentionKv(qv, kc, vc, av, _attnScoresScratch,
+                        _numHeads, _numKvHeads, _headDim, pos + 1, _maxSeqLen, _attnScale);
+                    // caches[n].Length is advanced once after the pass completes (below), not
+                    // here — a mid-pass throw then leaves the logical length unadvanced.
+                }
+
+                // Batched O-projection + residual. The attn-output bias is per-row, so it needs
+                // a per-sequence hidden view; created inline here (rare branch) to keep the
+                // common no-bias decode path free of unused per-row views.
+                BatchDecodeMatMul(_bpHidden!, _wo[layer], _bpAttnOut!, N);
+                if (_hasAttnBias)
+                    for (int n = 0; n < N; n++)
+                    {
+                        var hv = _gpu.View(_bpHidden!, (long)n * embDim, embDim);
+                        _gpu.AddInPlace(hv, _bo![layer]);
+                        _gpu.Free(hv);
+                    }
+                _gpu.AddInPlace(_bpHidden!, _bpResidual!);
+
+                // FFN (dense SwiGLU), batched across N.
+                _gpu.CopyDevice(_bpResidual!, _bpHidden!);
+                _gpu.RmsNormBatched(_bpNorm!, _bpHidden!, _wFfnNorm[layer], N, embDim, _hp.RmsNormEps);
+                BatchDecodeMatMul(_bpFfnGate!, _wGate[layer], _bpNorm!, N);
+                BatchDecodeMatMul(_bpFfnUp!,   _wUp[layer],   _bpNorm!, N);
+                _gpu.SiLuMul(_bpFfnGate!, _bpFfnUp!);
+                BatchDecodeMatMul(_bpHidden!, _wDown[layer], _bpFfnGate!, N);
+                _gpu.AddInPlace(_bpHidden!, _bpResidual!);
+            }
+
+            // 3. Final norm + output projection, batched (the output weight is the largest
+            //    single matmul, so amortizing its read across N is the main throughput win).
+            _gpu.RmsNormBatched(_bpHidden!, _bpHidden!, _wOutputNorm, N, embDim, _hp.RmsNormEps);
+            BatchDecodeMatMul(_decodeLogitsAll!, _wOutput, _bpHidden!, N);
+            _gpu.Download(_decodeLogitsAll!, _decodeLogitsHost.AsSpan(0, N * vocab));
+            _gpu.Synchronize();
+
+            var result = new float[N][];
+            for (int n = 0; n < N; n++)
+            {
+                result[n] = new float[vocab];
+                Array.Copy(_decodeLogitsHost!, (long)n * vocab, result[n], 0, vocab);
+                // Advance each sequence's logical length now that the append + attention for
+                // this token have completed and synchronized (transactional: a mid-pass throw
+                // leaves Length untouched).
+                caches[n].Length = positions[n] + 1;
+            }
+            return result;
+        }
+        finally
+        {
+            // View arrays may be partially populated if a View call above threw — null-check
+            // each (Tensor is a ref type; Free(null) would NRE) so cleanup is exception-safe.
+            for (int n = 0; n < N; n++)
+            {
+                if (qViews[n] is { } qv) _gpu.Free(qv);
+                if (kViews[n] is { } kv) _gpu.Free(kv);
+                if (vViews[n] is { } vv) _gpu.Free(vv);
+                if (aViews[n] is { } av) _gpu.Free(av);
+            }
+        }
+    }
+
+    /// <summary>(Re)allocate the batched-decode logits buffer [<paramref name="n"/> × vocab]
+    /// and its host download buffer when the decode batch size changes.</summary>
+    private void EnsureDecodeLogits(int n)
+    {
+        if (_decodeLogitsCapacity == n) return;
+        // The device buffer + Array.Copy offsets are computed in long, but the host array
+        // length and Download span are int (array lengths are int). Guard the int*int product
+        // so an extreme batch×vocab can't silently wrap to a too-small host buffer (unreachable
+        // at sane batch sizes — N ≤ maxBatch, ~14K at vocab 152K — but fail loud, not corrupt).
+        long total = (long)n * _hp.VocabSize;
+        if (total > int.MaxValue)
+            throw new NotSupportedException(
+                $"Batched decode logits buffer ({n}×{_hp.VocabSize}) exceeds int.MaxValue; reduce SHARPI_MAX_BATCH.");
+        if (_decodeLogitsAll is { } old) _gpu.Free(old);
+        _decodeLogitsAll = _gpu.Allocate(TensorShape.D1(total));
+        _decodeLogitsHost = new float[(int)total];
+        _decodeLogitsCapacity = n;
+    }
+
+    // Explicit IBatchedForwardPass surface: the engine holds caches as opaque
+    // ISequenceKvCache handles; unwrap them to the concrete CUDA cache the methods above take.
+    ISequenceKvCache IBatchedForwardPass.CreateCache() => CreateCache();
+
+    ReadOnlySpan<float> IBatchedForwardPass.PrefillWithCache(
+        IReadOnlyList<int> tokens, ISequenceKvCache cache, int startPos)
+        => PrefillWithCache(tokens, (CudaSequenceKvCache)cache, startPos);
+
+    float[]?[] IBatchedForwardPass.PrefillPackedMulti(
+        ReadOnlyMemory<int>[] chunks, int[] startPos, ISequenceKvCache[] caches, bool[] wantLogits)
+        => PrefillPackedMulti(chunks, startPos, Cast(caches), wantLogits);
+
+    float[][] IBatchedForwardPass.BatchForwardMulti(int[] tokens, int[] positions, ISequenceKvCache[] caches)
+        => BatchForwardMulti(tokens, positions, Cast(caches));
+
+    private static CudaSequenceKvCache[] Cast(ISequenceKvCache[] caches)
+    {
+        var r = new CudaSequenceKvCache[caches.Length];
+        for (int i = 0; i < caches.Length; i++)
+            r[i] = (CudaSequenceKvCache)caches[i];
+        return r;
+    }
+
     private void GpuMatMul(Tensor output, Tensor weights, Tensor input)
     {
         var dtype = _weightDTypes.GetValueOrDefault(weights.Handle, DType.Q4_K);
@@ -3490,9 +3992,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass
             // Without this guard the second Free() on the same device pointer would
             // hit a CUDA double-free / use-after-free.
             if (_kvAliasedLayers.Contains(i)) continue;
-            _gpu.Free(_gpuKCache[i]);
-            _gpu.Free(_gpuVCache[i]);
+            // Free the OWNED arrays (issue #190): _gpuKCache/_gpuVCache may transiently
+            // point at a per-sequence cache mid-bind, but every bind restores in a finally,
+            // so at teardown they equal the owned arrays — free those directly to be robust.
+            _gpu.Free(_ownedKCache[i]);
+            _gpu.Free(_ownedVCache[i]);
         }
+
+        // Batched-decode logits scratch (issue #190; allocated only if batching ran).
+        if (_decodeLogitsAll is { } dl) _gpu.Free(dl);
 
         if (_tqEnabled)
         {

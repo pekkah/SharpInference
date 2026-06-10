@@ -30,7 +30,7 @@ namespace SharpInference.Engine;
 /// </summary>
 public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
 {
-    private readonly ForwardPass _fwd;
+    private readonly IBatchedForwardPass _fwd;
     private readonly ITokenizer _tokenizer;
     private readonly int _maxBatchSize;
     private readonly int _thinkTokenId;
@@ -73,7 +73,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
     {
         public required PendingRequest Req;
         public required int[] Tokens;
-        public required PagedKvCache Cache;
+        public required ISequenceKvCache Cache;
         public required long ProjectedTokens; // KV budget reservation, released on retire
         public int Consumed;                  // prompt tokens prefilled so far
     }
@@ -82,7 +82,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
     {
         public required int CurrentToken;
         public required int Position;       // position at which CurrentToken will be decoded
-        public required PagedKvCache Cache;
+        public required ISequenceKvCache Cache;
         public required SamplingParams Sp;
         public required Channel<GenerateChunk> Output;
         public required System.Collections.Immutable.ImmutableArray<int> StopIds;
@@ -114,21 +114,26 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
     /// <param name="prefillChunkTokens">
     /// Prompt tokens prefilled per batcher iteration (issue #183 Gap 1); active sequences
     /// decode one step between chunks. <c>0</c> = prefill each prompt in one blocking call.
+    /// <c>-1</c> = auto (issue #189): <c>64</c> when the forward pass's dequant-once weight
+    /// cache covers the model — small chunks are then nearly free, so a low decode-stall
+    /// chunk is safe — otherwise <c>256</c> to keep the per-chunk re-dequant amortized.
     /// </param>
     /// <param name="kvBudgetBytes">
     /// KV-memory budget gating admission (issue #183 Gap 3). <c>0</c> = auto (half of
     /// available system RAM), negative = unlimited, positive = explicit byte budget.
     /// </param>
     public ContinuousBatchingEngine(
-        ForwardPass fwd,
+        IBatchedForwardPass fwd,
         ITokenizer tokenizer,
         string modelId,
         int maxBatchSize = 8,
         int thinkTokenId = -1,
         int endThinkTokenId = -1,
-        int prefillChunkTokens = 256,
+        int prefillChunkTokens = -1,
         long kvBudgetBytes = 0)
     {
+        ArgumentNullException.ThrowIfNull(fwd);
+        ArgumentNullException.ThrowIfNull(tokenizer);
         _fwd = fwd;
         _tokenizer = tokenizer;
         ModelId = modelId;
@@ -137,8 +142,13 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         _endThinkTokenId = endThinkTokenId;
         _thinkingEnabled = thinkTokenId >= 0 && endThinkTokenId >= 0;
 
-        _prefillChunkTokens = prefillChunkTokens;
-        _chunkingEnabled = prefillChunkTokens > 0 && !fwd.SnapKvEnabled;
+        // -1 = auto (issue #189): a small chunk minimizes decode stall but normally collapses
+        // prefill throughput (per-chunk weight re-dequant); pick it only when the dequant-once
+        // cache covers the model so small chunks re-pay no dequant. Otherwise keep 256.
+        _prefillChunkTokens = prefillChunkTokens >= 0
+            ? prefillChunkTokens
+            : (fwd.PrefillDequantCacheActive ? 64 : 256);
+        _chunkingEnabled = _prefillChunkTokens > 0 && !fwd.SnapKvEnabled;
 
         long budgetBytes = kvBudgetBytes switch
         {
@@ -234,7 +244,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         var active = new List<ActiveSeq>(_maxBatchSize);
         var tokensBuf = new int[_maxBatchSize];
         var posBuf = new int[_maxBatchSize];
-        var cacheBuf = new PagedKvCache[_maxBatchSize];
+        var cacheBuf = new ISequenceKvCache[_maxBatchSize];
 
         // An exception the per-request handlers didn't isolate (e.g. a backend failure
         // inside BatchForwardMulti) must not kill the batcher silently: without the
@@ -459,7 +469,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             pending.Dequeue();
             Interlocked.Decrement(ref _pendingCount);
 
-            PagedKvCache cache;
+            ISequenceKvCache cache;
             try
             {
                 cache = _fwd.CreateCache();
@@ -533,7 +543,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
 
         var chunks = new ReadOnlyMemory<int>[sCount];
         var startPos = new int[sCount];
-        var caches = new PagedKvCache[sCount];
+        var caches = new ISequenceKvCache[sCount];
         var wantLogits = new bool[sCount];
         var takes = new int[sCount];
         for (int s = 0; s < sCount; s++)

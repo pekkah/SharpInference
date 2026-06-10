@@ -55,6 +55,16 @@ public static class ContinuousBatchingHarness
         using var backend = new CpuBackend();
         using var fwd = new ForwardPass(model, backend, hp);
 
+        // Issue #189: report the dequant-once weight-cache state so the prefill A/B below is
+        // interpretable. Force it off for the "before" numbers with SHARPI_PREFILL_DEQUANT_MB=0.
+        Console.WriteLine($"[cb] OpenBLAS: {(SimdKernels.BlasAvailable ? "LOADED" : "not found")}");
+        string budgetStr = fwd.PrefillDequantCacheBudgetBytes == long.MaxValue
+            ? "unlimited"
+            : $"{fwd.PrefillDequantCacheBudgetBytes / (1024 * 1024)} MiB";
+        Console.WriteLine($"[cb] dequant cache: {(fwd.PrefillDequantCacheActive
+            ? $"ACTIVE ({budgetStr} budget, covers model)"
+            : fwd.PrefillDequantCacheBudgetBytes > 0 ? "partial (budget < model)" : "off")}");
+
         // Long prompt: repeat filler text until the tokenizer crosses the target count.
         const string filler = "The quick brown fox jumps over the lazy dog near the quiet river bank. ";
         var sb = new System.Text.StringBuilder("<|im_start|>user\nSummarize the following text:\n");
@@ -77,7 +87,9 @@ public static class ContinuousBatchingHarness
 
         if (args.Contains("--packed"))
         {
-            RunPackedPrefillAb(fwd, tokenizer, longPrompt);
+            // --chunk N drives the per-prompt chunk size of the chunked modes so the A/B can
+            // reproduce the issue #189 chunk sweep (e.g. --packed --chunk 32 / 64). Default 64.
+            RunPackedPrefillAb(fwd, tokenizer, longPrompt, chunkArg > 0 ? chunkArg : 64);
             return;
         }
 
@@ -95,7 +107,7 @@ public static class ContinuousBatchingHarness
     /// (one PrefillWithCache per prompt) vs as ONE packed PrefillPackedMulti call.
     /// Isolates the weight-read amortization across prompts from the scheduling change.
     /// </summary>
-    private static void RunPackedPrefillAb(ForwardPass fwd, GgufTokenizer tokenizer, string longText)
+    private static void RunPackedPrefillAb(ForwardPass fwd, GgufTokenizer tokenizer, string longText, int perSeqChunk)
     {
         const int S = 4, T = 256;
         var all = tokenizer.Encode(longText).ToArray();
@@ -103,7 +115,8 @@ public static class ContinuousBatchingHarness
         for (int s = 0; s < S; s++)
             prompts[s] = all.AsSpan(s * T, T).ToArray();
 
-        const int PerSeq = 64; // chunk each prompt advances per round in the chunked modes
+        int perSeq = Math.Clamp(perSeqChunk, 1, T); // chunk each prompt advances per round in the chunked modes
+        Console.WriteLine($"  (per-prompt chunk = {perSeq} tokens)");
 
         foreach (string mode in new[] { "whole-prompt serial", "chunked serial", "chunked packed" })
         {
@@ -121,10 +134,10 @@ public static class ContinuousBatchingHarness
 
                 case "chunked serial":
                     // Gap 1 without Gap 2: same rounds, but one small call per prompt —
-                    // each call re-pays the weight read/dequant for only PerSeq tokens.
-                    for (int consumed = 0; consumed < T; consumed += PerSeq)
+                    // each call re-pays the weight read/dequant for only perSeq tokens.
+                    for (int consumed = 0; consumed < T; consumed += perSeq)
                     {
-                        int take = Math.Min(PerSeq, T - consumed);
+                        int take = Math.Min(perSeq, T - consumed);
                         for (int s = 0; s < S; s++)
                         {
                             var segment = new ArraySegment<int>(prompts[s], consumed, take);
@@ -135,9 +148,9 @@ public static class ContinuousBatchingHarness
 
                 case "chunked packed":
                     // Gap 1 + Gap 2: the S per-prompt chunks run as ONE packed pass.
-                    for (int consumed = 0; consumed < T; consumed += PerSeq)
+                    for (int consumed = 0; consumed < T; consumed += perSeq)
                     {
-                        int take = Math.Min(PerSeq, T - consumed);
+                        int take = Math.Min(perSeq, T - consumed);
                         var chunks = new ReadOnlyMemory<int>[S];
                         var startPos = new int[S];
                         var want = new bool[S];
@@ -155,7 +168,7 @@ public static class ContinuousBatchingHarness
             sw.Stop();
             foreach (var c in caches) c.Dispose();
             double tps = S * T / sw.Elapsed.TotalSeconds;
-            Console.WriteLine($"  {mode,-20} ({(mode == "whole-prompt serial" ? $"{T}/call" : $"{PerSeq}/prompt/round")}): {S}×{T} tokens in {sw.Elapsed.TotalMilliseconds,7:F0} ms → {tps,7:F1} tok/s");
+            Console.WriteLine($"  {mode,-20} ({(mode == "whole-prompt serial" ? $"{T}/call" : $"{perSeq}/prompt/round")}): {S}×{T} tokens in {sw.Elapsed.TotalMilliseconds,7:F0} ms → {tps,7:F1} tok/s");
         }
     }
 
