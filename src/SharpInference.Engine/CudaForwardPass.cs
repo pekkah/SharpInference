@@ -369,6 +369,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_GEMM") == "1";
     private readonly bool _batchDecodeWeightStationary =
         Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_WS") != "0";
+    // SHARPI_BATCH_DECODE_MMQ=1 (#201, opt-in): int8 tensor-core decode matmuls for the
+    // big Q4_K-SoA shapes (BN=16 mma tile, weight read once per step) — argmax-stable,
+    // not bit-exact; small/non-Q4_K shapes fall back to weight-stationary per tensor
+    // inside the backend. The bit-exact WS matvecs are L1TEX-bound ~3× above the weight
+    // floor at N=8 and their lane geometry is frozen by the bit-identity contract, so
+    // this toggle is where the remaining batched-decode headroom lives.
+    private readonly bool _batchDecodeMmq =
+        Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_MMQ") == "1";
 
     // Ragged-batched per-sequence attention ops (issue #197). Default on: the per-layer
     // QK-norm/RoPE/KV-append/attention launches collapse from O(N) per-sequence calls
@@ -3179,13 +3187,17 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     /// <summary>One batched-decode matmul. Default: the weight-stationary small-N matvec
     /// (#194 — weight HBM read amortized across the batch, bit-identical reduction to the
     /// GEMM-N matvec; N=1 / N&gt;16 delegate to GEMM-N inside the backend).
-    /// SHARPI_BATCH_DECODE_WS=0: the #190 GEMM-N matvec. SHARPI_BATCH_DECODE_GEMM=1: the
-    /// compute-bound GEMM/MMQ path (the same routing <see cref="GpuMatMulBatchedCore"/> uses
-    /// for prefill) — argmax-stable only, kept as the A/B toggle for very high concurrency.</summary>
+    /// SHARPI_BATCH_DECODE_WS=0: the #190 GEMM-N matvec. SHARPI_BATCH_DECODE_MMQ=1: the
+    /// #201 int8 tensor-core decode tile for big Q4_K-SoA shapes (argmax-stable, WS
+    /// fallback per tensor). SHARPI_BATCH_DECODE_GEMM=1: the compute-bound GEMM/MMQ path
+    /// (the same routing <see cref="GpuMatMulBatchedCore"/> uses for prefill) —
+    /// argmax-stable only, kept as the A/B toggle for very high concurrency.</summary>
     private void BatchDecodeMatMul(Tensor outAll, Tensor weights, Tensor inAll, int n)
     {
         if (_batchDecodeComputeBound)
             GpuMatMulBatchedCore(outAll, weights, inAll, n);
+        else if (_batchDecodeMmq)
+            _gpu.MatMulBatchedDecodeMmq(outAll, weights, inAll, n, WDType(weights));
         else if (_batchDecodeWeightStationary)
             _gpu.MatMulBatchedWeightStationary(outAll, weights, inAll, n, WDType(weights));
         else

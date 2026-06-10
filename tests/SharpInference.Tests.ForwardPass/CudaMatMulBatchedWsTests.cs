@@ -276,6 +276,40 @@ public sealed unsafe class CudaMatMulBatchedWsTests
         gpu.Free(gpuW);
     }
 
+    /// <summary>
+    /// #201 kill-switch coverage. The default-on Q6_K sweep above routes through the
+    /// scale-word kernel (<c>llm_matvec_q6k_ws_sw_n*</c>), so this pins the
+    /// SHARPI_BATCH_DECODE_WS_V2=0 fallback — the #194 byte-gather kernel — to the
+    /// same bit-identity contract against sequential MatMul across all capacity
+    /// variants, plus the sw path explicitly (independent of the dispatch default).
+    /// The 210-byte Q6_K block stride makes the scale-word tail alternate between 0-
+    /// and 2-byte word misalignment per super-block, so the multi-block cols=1024
+    /// shape exercises both funnel-shift paths.
+    /// </summary>
+    [Fact]
+    public void Ws_Q6K_V2KillSwitch_BitwiseMatchesSequential()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        const int rows = 64, cols = 1024;
+        var rng = new Random(20260610 + 201);
+        byte[] q6 = BuildQ6KMatrix(rows, cols, rng);
+        var gpuQ6 = gpu.UploadRaw(q6, TensorShape.D1(q6.Length), DType.Q6_K);
+
+        // SHARPI_BATCH_DECODE_WS_V2=0: the #194 byte-gather kernel.
+        gpu.WsV2Enabled = false;
+        foreach (int nTok in new[] { 2, 5, 8, 16 })
+            RunCase(gpu, gpuQ6, DType.Q6_K, "Q6_K-v2off", rows, cols, nTok, rng);
+
+        // Default: the #201 scale-word kernel.
+        gpu.WsV2Enabled = true;
+        foreach (int nTok in new[] { 2, 5, 8, 16 })
+            RunCase(gpu, gpuQ6, DType.Q6_K, "Q6_K-sw", rows, cols, nTok, rng);
+
+        gpu.Free(gpuQ6);
+    }
+
     [Fact]
     public void Ws_F32_BitwiseMatchesSequential()
     {
