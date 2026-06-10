@@ -77,7 +77,8 @@ public static class InferenceEngineLoader
 
         try
         {
-            (fwd, batchingSupported) = BuildForwardPass(model, hp, arch, ctxSize, nGpuLayers, opts.Backend, turboQuant, owned);
+            (fwd, batchingSupported) = BuildForwardPass(model, hp, arch, ctxSize, nGpuLayers, opts.Backend, turboQuant, owned,
+                DequantCacheBytes(opts.PrefillDequantCacheMb));
             owned.Add(model);
         }
         catch
@@ -91,9 +92,9 @@ public static class InferenceEngineLoader
         // ForwardPass — it isn't built for the GPU / hybrid paths — so we honour
         // MaxBatchSize > 1 only when batching is structurally possible.
         IInferenceEngine engine;
-        if (opts.MaxBatchSize > 1 && batchingSupported && fwd is ForwardPass cpuFwd)
+        if (opts.MaxBatchSize > 1 && batchingSupported && fwd is IBatchedForwardPass batchFwd)
         {
-            engine = new ContinuousBatchingEngine(cpuFwd, tokenizer, modelId, opts.MaxBatchSize,
+            engine = new ContinuousBatchingEngine(batchFwd, tokenizer, modelId, opts.MaxBatchSize,
                 thinkTokenId, endThinkTokenId,
                 prefillChunkTokens: opts.PrefillChunkTokens,
                 kvBudgetBytes: opts.KvBudgetMb > 0 ? opts.KvBudgetMb * 1024 * 1024 : opts.KvBudgetMb);
@@ -112,9 +113,18 @@ public static class InferenceEngineLoader
 
     // ── Backend dispatch ─────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Translate <see cref="SharpInferenceServerOptions.PrefillDequantCacheMb"/> (MiB, nullable)
+    /// into the <see cref="ForwardPass"/> constructor's byte budget: <c>null</c> → defer to the
+    /// <c>SHARPI_PREFILL_DEQUANT_MB</c> env / auto-sizing; <c>0</c> → off; negative → unlimited;
+    /// positive → that many MiB (saturating, never overflowing).
+    /// </summary>
+    private static long DequantCacheBytes(long? mb) =>
+        mb is null ? long.MinValue : ForwardPass.MbToBudgetBytes(mb.Value);
+
     private static (IForwardPass Fwd, bool BatchingSupported) BuildForwardPass(
         GgufModel model, ModelHyperparams hp, string arch, int ctxSize, int nGpuLayers,
-        ServerBackend backend, bool turboQuant, List<IDisposable> owned)
+        ServerBackend backend, bool turboQuant, List<IDisposable> owned, long prefillDequantCacheBytes)
     {
         // Resolve "auto" first so the rest of the method can treat backend as concrete.
         if (nGpuLayers != 0 && backend == ServerBackend.Auto)
@@ -143,7 +153,8 @@ public static class InferenceEngineLoader
                 return (hybrid, BatchingSupported: false);
             }
 
-            var dense = new ForwardPass(model, cpuBackend, hp);
+            var dense = new ForwardPass(model, cpuBackend, hp,
+                prefillDequantCacheBytes: prefillDequantCacheBytes);
             owned.Add(dense);
             if (turboQuant)
                 dense.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
@@ -157,7 +168,10 @@ public static class InferenceEngineLoader
 
         // GPU paths share a CPU baseline (for the hybrid-CPU half of partial offload).
         // For full GPU paths the dense CPU fwd is unused but still cheap to construct.
-        ForwardPass? cpuDense = hp.IsHybridSsm ? null : new ForwardPass(model, cpuBackend, hp);
+        // The #189 dequant cache is off here: GPU/hybrid never drive the batched CPU prefill
+        // that consults it, so a full F32 model copy would be pure wasted RAM.
+        ForwardPass? cpuDense = hp.IsHybridSsm ? null
+            : new ForwardPass(model, cpuBackend, hp, prefillDequantCacheBytes: 0);
         if (cpuDense is not null) owned.Add(cpuDense);
 
         if (backend == ServerBackend.Cuda)

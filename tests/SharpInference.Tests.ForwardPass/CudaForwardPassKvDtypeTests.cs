@@ -375,6 +375,125 @@ public sealed class CudaForwardPassKvDtypeTests
     public void Gemma4_12B_Q8ChunkedPrefill_MatchesFp32()
         => AssertKvChunkedPrefillParity("gemma-4-12b-it-qat-q4_0.gguf", "q8_0", maxAbsCeiling: 45.0f);
 
+    // ── Issue #191: narrowed-KV GREEDY decode coherence (template-correct) ───
+    // The parity tests above teacher-force the narrowed dtype onto fp32's trajectory, so
+    // they never let bf16/q8_0 pick their OWN greedy tokens — exactly the path a real 12 GB
+    // user hits (#185 auto-narrows to bf16 by default) and the one #188 found degenerate on
+    // a synthetic OOD prompt. These decode the narrowed path GREEDILY on a TEMPLATE-CORRECT
+    // prompt (turn-structured, healthy top-logit margin per the 'prompt must match chat
+    // template' lesson) and assert coherence (≥2 distinct, non-EOS, finite). The fp32
+    // synthetic-prompt tests in Gemma4Cuda12BForwardPassTests stay as the trunk-math guards.
+
+    // Gemma 4 turn format: <bos> is added by the tokenizer (add_bos=true); the control tokens
+    // encode as singletons. An open-ended instruction elicits a multi-token answer (a factual
+    // prompt makes the 12B-IT emit a 1-token <end_of_turn>, which is why the fp32 guard uses a
+    // synthetic prompt instead — see Gemma4Cuda12BForwardPassTests).
+    private const string Gemma4TemplatePrompt =
+        "<start_of_turn>user\nWrite a short sentence about the ocean.<end_of_turn>\n<start_of_turn>model\n";
+
+    // Qwen3 ChatML. Thinking is left on (the template auto-opens <think>), which only makes the
+    // continuation longer/more varied — fine for a coherence check.
+    private const string Qwen3TemplatePrompt =
+        "<|im_start|>user\nWrite a short sentence about the ocean.<|im_end|>\n<|im_start|>assistant\n";
+
+    private static int ReadEosId(string path)
+    {
+        using var model = GgufModel.Open(path);
+        return GgufTokenizer.FromGgufModel(model).EosTokenId;
+    }
+
+    /// <summary>
+    /// Prefill a template-correct prompt and GREEDILY decode (the narrowed path picks its own
+    /// tokens — not teacher-forced) on the given KV dtype, asserting the decode is coherent:
+    /// all logits finite, the first generated token is not EOS, and ≥2 distinct tokens over the
+    /// run (an all-one-token repetition or all-EOS collapse — the #188 failure mode — fails).
+    /// </summary>
+    private static void AssertGreedyCoherence(
+        string filename, string kvDtype, string prompt, int ctx = 2048, bool batchedPrefill = false)
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath(filename);
+        if (path is null) return;
+
+        int eosId = ReadEosId(path);
+        const int steps = 6;
+        var (logits, argmax) = RunPrefillDecode(
+            gpu, path, kvDtype, prompt, steps, ctx, forced: null, batchedPrefill: batchedPrefill);
+
+        for (int p = 0; p <= steps; p++)
+            for (int i = 0; i < logits[p].Length; i++)
+                Assert.True(float.IsFinite(logits[p][i]),
+                    $"{filename} {kvDtype}: non-finite logit at pos {p}, idx {i} — a narrowed-KV (SWA-ring / k_eq_v) bug.");
+
+        Assert.True(argmax[0] != eosId,
+            $"{filename} {kvDtype}: first greedy token was EOS — the template-correct prompt should have a real " +
+            "continuation, so this means the narrowed greedy path collapsed.");
+
+        var seen = new HashSet<int>(argmax);
+        Assert.True(seen.Count >= 2,
+            $"{filename} {kvDtype}: greedy decode produced only {seen.Count} distinct token(s) " +
+            $"([{string.Join(",", argmax)}]) — narrowed-KV greedy decode is degenerate.");
+    }
+
+    /// <summary>Qwen3-8B Q4_K (non-SWA dense) bf16 KV: greedy decode stays coherent.</summary>
+    [Fact]
+    public void Qwen3_8B_Bf16Kv_GreedyDecode_Coherent()
+        => AssertGreedyCoherence("Qwen3-8B-Q4_K_M.gguf", "bf16", Qwen3TemplatePrompt);
+
+    /// <summary>Qwen3-8B Q4_K q8_0 KV: greedy decode stays coherent.</summary>
+    [Fact]
+    public void Qwen3_8B_Q8Kv_GreedyDecode_Coherent()
+        => AssertGreedyCoherence("Qwen3-8B-Q4_K_M.gguf", "q8_0", Qwen3TemplatePrompt);
+
+    /// <summary>
+    /// Gemma 4 12B QAT bf16 KV: the headline 12 GB-card config (auto-narrows to bf16 by
+    /// default). The fp32 synthetic-prompt guard can't run bf16 greedily — this is the only
+    /// coverage that the default narrowed dtype decodes coherently on a real prompt.
+    /// </summary>
+    [Fact]
+    public void Gemma4_12B_Bf16Kv_GreedyDecode_Coherent()
+        => AssertGreedyCoherence("gemma-4-12b-it-qat-q4_0.gguf", "bf16", Gemma4TemplatePrompt);
+
+    /// <summary>Gemma 4 12B QAT q8_0 KV: greedy decode stays coherent.</summary>
+    [Fact]
+    public void Gemma4_12B_Q8Kv_GreedyDecode_Coherent()
+        => AssertGreedyCoherence("gemma-4-12b-it-qat-q4_0.gguf", "q8_0", Gemma4TemplatePrompt);
+
+    /// <summary>
+    /// Issue #166 (latent half): bf16 KV with the SWA ring WRAPPED, then a GREEDY decode. E4B
+    /// has sliding_window=512, so the ring is min(ctx, 512+4096=4608); a >4608-token prefill
+    /// wraps it (the batched bf16 append overwrites earlier slots), and the subsequent greedy
+    /// decode keeps writing wrapped slots via the single-token bf16 append — the decode path
+    /// the existing chunked-prefill parity test only exercises teacher-forced. A wrapped-ring
+    /// OOB read/write would surface as NaN or a degenerate single-token collapse here.
+    /// </summary>
+    [Fact]
+    public void Gemma4_E4B_Bf16Kv_GreedyDecodePastSwaRingWrap_Coherent()
+    {
+        // AssertGreedyCoherence creates its own backend; just gate the prompt build here.
+        if (!CudaBackend.IsAvailable()) return;
+        var path = FindModelPath("gemma-4-E4B-it-Q8_0.gguf");
+        if (path is null) return;
+
+        // Build a >4608-token prompt so the 512-window SWA ring (4608 slots) actually wraps.
+        string prompt;
+        using (var model = GgufModel.Open(path))
+        {
+            var tok = GgufTokenizer.FromGgufModel(model);
+            var sb = new System.Text.StringBuilder();
+            const string seed = "The quick brown fox jumps over the lazy dog. " +
+                                "Sphinx of black quartz, judge my vow. " +
+                                "Pack my box with five dozen liquor jugs. ";
+            while (tok.Encode(sb.ToString()).Count < 5000) sb.Append(seed);
+            prompt = sb.ToString();
+        }
+
+        // ctx 6144 > ring (4608) so the wrap is real; batched prefill drives the chunked
+        // append, then RunPrefillDecode greedily decodes past the wrap.
+        AssertGreedyCoherence("gemma-4-E4B-it-Q8_0.gguf", "bf16", prompt, ctx: 6144, batchedPrefill: true);
+    }
+
     // ── Issue #185 item 1: auto-narrow KV dtype decision ─────────────────────
     // The decision is factored into the pure CudaForwardPass.ResolveKvDType /
     // EstimateKvCacheBytes / Q8KvGeometrySupported helpers so it's unit-testable

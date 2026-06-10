@@ -301,6 +301,53 @@ public sealed class ContinuousBatchingTests
     }
 
     [Fact]
+    public void PrefillWithCache_DequantCacheOnOff_BitIdentical()
+    {
+        // Issue #189: the dequant-once weight cache must be transparent — chunked prefill with
+        // the cache active produces bit-for-bit the same logits as with it off (same F32
+        // dequant feeds the same SGEMM, just sourced from the cache on reuse).
+        var path = FindModelPath();
+        if (path is null) return;
+        // The cache only diverts the OpenBLAS SGEMM path; without BLAS both runs are identical
+        // by construction and the test proves nothing.
+        if (!SimdKernels.BlasAvailable) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        using var backend = new CpuBackend();
+
+        // 48 tokens prefilled in 16-token chunks: each chunk is at/above MinBatchForBlas so the
+        // SGEMM+cache path runs, and chunks 2-3 read weights the cache filled during chunk 1.
+        int[] tokens = [1, 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47,
+                        53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127,
+                        131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193, 197, 199, 211];
+
+        float[] cacheOff = ChunkedPrefillLogits(model, backend, hp, tokens, chunk: 16, dequantCacheBytes: 0);
+        float[] cacheOn = ChunkedPrefillLogits(model, backend, hp, tokens, chunk: 16, dequantCacheBytes: -1);
+
+        Assert.Equal(cacheOff.Length, cacheOn.Length);
+        for (int i = 0; i < cacheOff.Length; i++)
+            Assert.Equal(cacheOff[i], cacheOn[i]);
+    }
+
+    private static float[] ChunkedPrefillLogits(
+        GgufModel model, CpuBackend backend, ModelHyperparams hp,
+        int[] tokens, int chunk, long dequantCacheBytes)
+    {
+        using var fwd = new Engine.ForwardPass(model, backend, hp,
+            prefillDequantCacheBytes: dequantCacheBytes);
+        using var cache = fwd.CreateCache();
+        float[] logits = [];
+        for (int start = 0; start < tokens.Length; start += chunk)
+        {
+            int take = Math.Min(chunk, tokens.Length - start);
+            var segment = new ArraySegment<int>(tokens, start, take);
+            logits = fwd.PrefillWithCache(segment, cache, startPos: start).ToArray();
+        }
+        return logits;
+    }
+
+    [Fact]
     public void PrefillPackedMulti_MatchesSequentialPrefill()
     {
         var path = FindModelPath();

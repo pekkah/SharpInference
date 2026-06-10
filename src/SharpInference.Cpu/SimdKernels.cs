@@ -113,6 +113,36 @@ public static unsafe class SimdKernels
 
     }
 
+    /// <summary>Whether OpenBLAS was found, i.e. whether the SGEMM batched-prefill path is live.</summary>
+    public static bool BlasAvailable => BlasInterop.IsAvailable;
+
+    /// <summary>
+    /// Batched matrix multiply against an <b>already-dequantized F32</b> weight matrix —
+    /// the dequant-free twin of <see cref="MatMulBatched"/>. Issue #189: chunked prompt
+    /// admission re-walks the same layer weights every chunk, so <see cref="MatMulBatched"/>
+    /// re-pays the full Q→F32 dequant on every call. When a caller (ForwardPass) holds the
+    /// F32 dequant of a weight in a reuse cache, it routes here to skip dequant entirely.
+    /// Bit-identical to <see cref="MatMulBatched"/>'s BLAS path: same F32 weights, same SGEMM.
+    /// </summary>
+    public static void MatMulBatchedF32(float* output, float* weightsF32, float* input,
+        int batchSize, int rows, int cols)
+    {
+        if (batchSize < MinBatchForBlas || !BlasInterop.IsAvailable)
+        {
+            // Mirror the small-batch / no-BLAS fallback, but the weights are already F32.
+            for (int n = 0; n < batchSize; n++)
+                MatVecF32(output + n * rows, weightsF32, input + n * cols, rows, cols);
+            return;
+        }
+
+        BlasInterop.Sgemm(
+            BlasInterop.RowMajor, BlasInterop.NoTrans, BlasInterop.Trans,
+            batchSize, rows, cols,
+            1.0f, input, cols,
+            weightsF32, cols,
+            0.0f, output, rows);
+    }
+
     // ================================================================
     //  Dispatchers
     // ================================================================

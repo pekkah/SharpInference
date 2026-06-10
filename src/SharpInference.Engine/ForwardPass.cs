@@ -12,7 +12,7 @@ namespace SharpInference.Engine;
 /// Optimized CPU forward pass for a dense LLaMA-family transformer.
 /// Uses AVX2 SIMD, fused dequant-matvec, and multi-threading.
 /// </summary>
-public sealed unsafe class ForwardPass : IForwardPass
+public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
 {
     private readonly GgufModel _model;
     private readonly ModelHyperparams _hp;
@@ -21,6 +21,19 @@ public sealed unsafe class ForwardPass : IForwardPass
 
     // Norm weight cache: only tiny F32 weights (2048 floats = 8KB each)
     private readonly Dictionary<string, nint> _normCache = new();
+
+    // Dequant-once BLAS weight cache (issue #189). The batched-prefill BLAS path
+    // (SimdKernels.MatMulBatched) re-dequantizes each projection weight to F32 on every
+    // call; chunked prompt admission re-walks all layers per chunk, so small chunks re-pay
+    // the full dequant N times. We cache the F32 dequant per weight tensor (keyed by name)
+    // and reuse it across chunks. Reuse distance is a full model sweep, so the cache only
+    // pays off if it can hold *every* batched projection weight — hence _dequantCacheCovers.
+    // Populated lazily on the single batcher thread (same no-lock assumption as _normCache).
+    private readonly Dictionary<string, nint> _dequantWeightCache = new();
+    private readonly bool _dequantCacheEnabled;
+    private readonly bool _dequantCacheCovers;     // budget holds the whole model
+    private readonly long _dequantCacheBudgetBytes; // 0 = off, long.MaxValue = unlimited
+    private long _dequantCacheUsedBytes;
 
     // Preallocated scratch buffers
     private readonly float* _hidden;     // [embDim]
@@ -155,7 +168,7 @@ public sealed unsafe class ForwardPass : IForwardPass
     private readonly float* _pleY;            // [embDim] inner scratch
 
     public ForwardPass(GgufModel model, IComputeBackend backend, ModelHyperparams hp,
-        int maxContextLength = 0)
+        int maxContextLength = 0, long prefillDequantCacheBytes = long.MinValue)
     {
         _model = model;
         _hp = hp;
@@ -424,8 +437,66 @@ public sealed unsafe class ForwardPass : IForwardPass
             _pleY = Alloc(_embDim);
         }
 
+        // ── Dequant-once BLAS weight cache budget (issue #189) ──────────────────────
+        // Only dense models route batched prefill through MatMulBatched: MoE uses its own
+        // expert path and Gemma 4 per-layer head_dim falls back to sequential Forward, so
+        // neither would ever consult the cache. And without OpenBLAS the batched path stays
+        // on the fused register-dequant MatVec, where a separate F32 cache is a net loss.
+        bool cacheable = SimdKernels.BlasAvailable && !_hp.IsMoE && _layerHeadDim is null;
+        long fullF32Bytes = 0;
+        if (cacheable)
+        {
+            // Sum only weights that will actually be cached: skip unset tensors (a default
+            // TensorRef has a null Dimensions array, whose ElementCount throws), e.g. the
+            // absent attn_v on k_eq_v layers. MatMulBatchedCached caches the same set.
+            static long F32Bytes(in TensorRef t) =>
+                t.DataPtr is null ? 0 : t.Info.ElementCount * sizeof(float);
+            for (int l = 0; l < _hp.NumLayers; l++)
+                fullF32Bytes += F32Bytes(_wq[l]) + F32Bytes(_wk[l]) + F32Bytes(_wv[l])
+                    + F32Bytes(_wo[l]) + F32Bytes(_wGate[l]) + F32Bytes(_wUp[l]) + F32Bytes(_wDown[l]);
+        }
+        _dequantCacheBudgetBytes = ResolveDequantCacheBudget(prefillDequantCacheBytes, fullF32Bytes, cacheable);
+        _dequantCacheEnabled = _dequantCacheBudgetBytes > 0;
+        _dequantCacheCovers = _dequantCacheEnabled && fullF32Bytes > 0
+            && _dequantCacheBudgetBytes >= fullF32Bytes;
+
         PrefaultWeights();
     }
+
+    /// <summary>
+    /// Resolve the issue #189 dequant-cache byte budget. <paramref name="requested"/> is the
+    /// programmatic override in <i>bytes</i> (<c>long.MinValue</c> = resolve from the
+    /// <c>SHARPI_PREFILL_DEQUANT_MB</c> env var); for both sources <c>0</c> = off,
+    /// negative = unlimited, positive = explicit budget. The env "auto" default (unset or
+    /// <c>auto</c>) enables the cache only when a full F32 copy of the projection weights
+    /// fits within a quarter of available RAM (as reported by <see cref="GC.GetGCMemoryInfo"/>,
+    /// which reflects the container/cgroup limit when the runtime detects one), mirroring the
+    /// engine's KV-budget auto-sizing.
+    /// </summary>
+    private static long ResolveDequantCacheBudget(long requested, long fullF32Bytes, bool cacheable)
+    {
+        if (!cacheable) return 0;
+
+        if (requested != long.MinValue)
+            return requested == 0 ? 0 : requested < 0 ? long.MaxValue : requested;
+
+        var raw = Environment.GetEnvironmentVariable("SHARPI_PREFILL_DEQUANT_MB");
+        if (raw is null || raw.Equals("auto", StringComparison.OrdinalIgnoreCase)
+            || !long.TryParse(raw, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out long mb))
+        {
+            long avail = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+            return fullF32Bytes > 0 && fullF32Bytes <= avail / 4 ? fullF32Bytes : 0;
+        }
+        return MbToBudgetBytes(mb);
+    }
+
+    /// <summary>MiB→byte budget with the #189 sign convention (0=off, &lt;0=unlimited), saturating
+    /// to <see cref="long.MaxValue"/> instead of overflowing on an absurdly large MiB value.</summary>
+    public static long MbToBudgetBytes(long mb) =>
+        mb == 0 ? 0
+        : mb < 0 || mb > long.MaxValue / (1024 * 1024) ? long.MaxValue
+        : mb * 1024 * 1024;
 
     /// <summary>
     /// Touch every 4KB page of all weight tensors to force OS page-in,
@@ -502,6 +573,18 @@ public sealed unsafe class ForwardPass : IForwardPass
     /// splitting the prompt into chunks would silently skip eviction.
     /// </summary>
     public bool SnapKvEnabled => _snapKvCfg.Enabled;
+
+    /// <summary>
+    /// Whether the issue #189 dequant-once BLAS weight cache is active <i>and</i> budgeted to
+    /// hold every batched-prefill projection weight. When true, chunked prefill at small chunk
+    /// sizes re-pays no dequant after the first sweep, so <see cref="ContinuousBatchingEngine"/>
+    /// can default to a small prefill chunk (low decode-stall) without the throughput collapse
+    /// the per-chunk re-dequant would otherwise cause.
+    /// </summary>
+    public bool PrefillDequantCacheActive => _dequantCacheCovers;
+
+    /// <summary>Resolved dequant-cache byte budget (issue #189): 0 = off, long.MaxValue = unlimited.</summary>
+    public long PrefillDequantCacheBudgetBytes => _dequantCacheBudgetBytes;
 
     /// <summary>
     /// Truncate the KV cache to the given length, discarding positions >= length.
@@ -582,6 +665,71 @@ public sealed unsafe class ForwardPass : IForwardPass
     /// Batched prefill core: processes N tokens layer-by-layer into the given cache.
     /// Used by <see cref="Prefill"/> (with _kvCache) and <see cref="PrefillWithCache"/> (with an external cache).
     /// </summary>
+    /// <summary>
+    /// Batched projection used by the prefill cores. When the issue #189 dequant cache is
+    /// active and this is a BLAS-engaged quantized GEMM, it dequantizes the weight once into
+    /// the cache and reuses it across chunks; otherwise it falls back to the standard
+    /// <see cref="SimdKernels.MatMulBatched"/> (dequant-per-call). The cached path is
+    /// bit-identical: same F32 weights, same SGEMM.
+    /// </summary>
+    private void MatMulBatchedCached(float* output, in TensorRef w, float* input,
+        int N, int rows, int cols)
+    {
+        if (_dequantCacheEnabled && w.DType != DType.Float32 && N >= SimdKernels.MinBatchForBlas)
+        {
+            float* wf32 = GetDequantWeightF32(in w, rows, cols);
+            if (wf32 != null)
+            {
+                SimdKernels.MatMulBatchedF32(output, wf32, input, N, rows, cols);
+                return;
+            }
+        }
+        SimdKernels.MatMulBatched(output, w.DataPtr, input, N, rows, cols, w.DType);
+    }
+
+    /// <summary>
+    /// Return the F32 dequant of a weight tensor from the issue #189 reuse cache, populating
+    /// it on a miss. Returns <c>null</c> when adding this tensor would exceed the byte budget
+    /// (fill-and-stop, no eviction — the reuse distance is a whole model sweep, so an LRU
+    /// smaller than the model just thrashes) so the caller re-dequants per call instead.
+    /// </summary>
+    private float* GetDequantWeightF32(in TensorRef w, int rows, int cols)
+    {
+        if (_dequantWeightCache.TryGetValue(w.Name, out var hit))
+            return (float*)hit;
+
+        long elems = (long)rows * cols;
+        long totalBytes = DTypeInfo.ByteSize(elems, w.DType);
+        // The quant source span and the F32 destination span are addressed with int lengths.
+        // A weight too large for that can't be cached (it would also break the per-call
+        // MatMulBatched path) — fall back to per-call dequant rather than truncate silently.
+        if (elems > int.MaxValue || totalBytes > int.MaxValue)
+            return null;
+
+        long bytes = elems * sizeof(float);
+        if (_dequantCacheUsedBytes + bytes > _dequantCacheBudgetBytes)
+            return null;
+
+        // Zeroed (not Alloc) so a partial dequant can never leave uninitialized tail bytes;
+        // Dequantize.ToFloat32 writes the full element count for block-aligned GGUF tensors.
+        var buf = (float*)NativeMemory.AllocZeroed((nuint)bytes);
+        try
+        {
+            Dequantize.ToFloat32(
+                new ReadOnlySpan<byte>(w.DataPtr, (int)totalBytes),
+                new Span<float>(buf, (int)elems),
+                w.DType, elems);
+        }
+        catch
+        {
+            NativeMemory.Free(buf); // don't orphan the allocation if dequant throws
+            throw;
+        }
+        _dequantWeightCache[w.Name] = (nint)buf;
+        _dequantCacheUsedBytes += bytes;
+        return buf;
+    }
+
     private ReadOnlySpan<float> PrefillCore(IReadOnlyList<int> tokens, PagedKvCache cache, int startPos)
     {
         int N = tokens.Count;
@@ -637,12 +785,9 @@ public sealed unsafe class ForwardPass : IForwardPass
                     }
 
                     // Batched Q/K/V projections (single GEMM per weight matrix)
-                    SimdKernels.MatMulBatched(batchQ, _wq[layer].DataPtr, batchNorm,
-                        N, qDim, _embDim, _wq[layer].DType);
-                    SimdKernels.MatMulBatched(batchK, _wk[layer].DataPtr, batchNorm,
-                        N, kvDim, _embDim, _wk[layer].DType);
-                    SimdKernels.MatMulBatched(batchV, _wv[layer].DataPtr, batchNorm,
-                        N, kvDim, _embDim, _wv[layer].DType);
+                    MatMulBatchedCached(batchQ, in _wq[layer], batchNorm, N, qDim, _embDim);
+                    MatMulBatchedCached(batchK, in _wk[layer], batchNorm, N, kvDim, _embDim);
+                    MatMulBatchedCached(batchV, in _wv[layer], batchNorm, N, kvDim, _embDim);
 
                     // Apply QKV biases per token (Qwen models)
                     if (_hasAttnBias)
@@ -710,8 +855,7 @@ public sealed unsafe class ForwardPass : IForwardPass
                     }
 
                     // Batched output projection
-                    SimdKernels.MatMulBatched(batchNorm, _wo[layer].DataPtr, batchAttnOut,
-                        N, _embDim, qDim, _wo[layer].DType);
+                    MatMulBatchedCached(batchNorm, in _wo[layer], batchAttnOut, N, _embDim, qDim);
 
                     // Apply output projection bias (Qwen models)
                     if (_hasAttnBias)
@@ -739,18 +883,15 @@ public sealed unsafe class ForwardPass : IForwardPass
                             batchHidden + (long)n * _embDim, ffnNormW, _embDim, _hp.RmsNormEps);
                     }
 
-                    SimdKernels.MatMulBatched(batchFfnGate, _wGate[layer].DataPtr, batchNorm,
-                        N, _intermDim, _embDim, _wGate[layer].DType);
-                    SimdKernels.MatMulBatched(batchFfnUp, _wUp[layer].DataPtr, batchNorm,
-                        N, _intermDim, _embDim, _wUp[layer].DType);
+                    MatMulBatchedCached(batchFfnGate, in _wGate[layer], batchNorm, N, _intermDim, _embDim);
+                    MatMulBatchedCached(batchFfnUp, in _wUp[layer], batchNorm, N, _intermDim, _embDim);
 
                     // Per-token SiLU(gate) * up
                     for (int n = 0; n < N; n++)
                         SimdKernels.SiLuMul(batchFfnGate + (long)n * _intermDim,
                             batchFfnUp + (long)n * _intermDim, _intermDim);
 
-                    SimdKernels.MatMulBatched(batchNorm, _wDown[layer].DataPtr, batchFfnGate,
-                        N, _embDim, _intermDim, _wDown[layer].DType);
+                    MatMulBatchedCached(batchNorm, in _wDown[layer], batchFfnGate, N, _embDim, _intermDim);
 
                     // Residual add
                     for (int n = 0; n < N; n++)
@@ -2122,6 +2263,33 @@ public sealed unsafe class ForwardPass : IForwardPass
     public PagedKvCache CreateCache() =>
         new PagedKvCache(_hp.NumLayers, _hp.NumKvHeads, _headDim);
 
+    // ── IBatchedForwardPass (issue #190) ────────────────────────────────────────
+    // The engine drives this forward pass through the backend-agnostic interface, holding
+    // caches as opaque ISequenceKvCache handles. For the CPU path the handle IS the concrete
+    // PagedKvCache the methods above already take, so these explicit implementations just
+    // unwrap it. SnapKvEnabled / KvBytesPerToken / PrefillDequantCacheActive are public and
+    // satisfy the interface implicitly.
+    ISequenceKvCache IBatchedForwardPass.CreateCache() => CreateCache();
+
+    ReadOnlySpan<float> IBatchedForwardPass.PrefillWithCache(
+        IReadOnlyList<int> tokens, ISequenceKvCache cache, int startPos)
+        => PrefillWithCache(tokens, (PagedKvCache)cache, startPos);
+
+    float[]?[] IBatchedForwardPass.PrefillPackedMulti(
+        ReadOnlyMemory<int>[] chunks, int[] startPos, ISequenceKvCache[] caches, bool[] wantLogits)
+        => PrefillPackedMulti(chunks, startPos, AsPaged(caches), wantLogits);
+
+    float[][] IBatchedForwardPass.BatchForwardMulti(int[] tokens, int[] positions, ISequenceKvCache[] caches)
+        => BatchForwardMulti(tokens, positions, AsPaged(caches));
+
+    private static PagedKvCache[] AsPaged(ISequenceKvCache[] caches)
+    {
+        var r = new PagedKvCache[caches.Length];
+        for (int i = 0; i < caches.Length; i++)
+            r[i] = (PagedKvCache)caches[i];
+        return r;
+    }
+
     /// <summary>
     /// Forward pass for a single token using the provided explicit cache (no TurboQuant).
     /// Used by <see cref="PrefillWithCache"/> for single-token prompts and MoE sequential prefill.
@@ -2462,12 +2630,9 @@ public sealed unsafe class ForwardPass : IForwardPass
                             batchHidden + (long)n * _embDim, normW, _embDim, _hp.RmsNormEps);
                     }
 
-                    SimdKernels.MatMulBatched(batchQ, _wq[layer].DataPtr, batchNorm,
-                        N, qDim, _embDim, _wq[layer].DType);
-                    SimdKernels.MatMulBatched(batchK, _wk[layer].DataPtr, batchNorm,
-                        N, kvDim, _embDim, _wk[layer].DType);
-                    SimdKernels.MatMulBatched(batchV, _wv[layer].DataPtr, batchNorm,
-                        N, kvDim, _embDim, _wv[layer].DType);
+                    MatMulBatchedCached(batchQ, in _wq[layer], batchNorm, N, qDim, _embDim);
+                    MatMulBatchedCached(batchK, in _wk[layer], batchNorm, N, kvDim, _embDim);
+                    MatMulBatchedCached(batchV, in _wv[layer], batchNorm, N, kvDim, _embDim);
 
                     if (_hasAttnBias)
                     {
@@ -2520,8 +2685,7 @@ public sealed unsafe class ForwardPass : IForwardPass
                         }
                     }
 
-                    SimdKernels.MatMulBatched(batchNorm, _wo[layer].DataPtr, batchAttnOut,
-                        N, _embDim, qDim, _wo[layer].DType);
+                    MatMulBatchedCached(batchNorm, in _wo[layer], batchAttnOut, N, _embDim, qDim);
                     if (_hasAttnBias)
                     {
                         for (int n = 0; n < N; n++)
@@ -2541,15 +2705,12 @@ public sealed unsafe class ForwardPass : IForwardPass
                         SimdKernels.RmsNorm(batchNorm + (long)n * _embDim,
                             batchHidden + (long)n * _embDim, ffnNormW, _embDim, _hp.RmsNormEps);
                     }
-                    SimdKernels.MatMulBatched(batchFfnGate, _wGate[layer].DataPtr, batchNorm,
-                        N, _intermDim, _embDim, _wGate[layer].DType);
-                    SimdKernels.MatMulBatched(batchFfnUp, _wUp[layer].DataPtr, batchNorm,
-                        N, _intermDim, _embDim, _wUp[layer].DType);
+                    MatMulBatchedCached(batchFfnGate, in _wGate[layer], batchNorm, N, _intermDim, _embDim);
+                    MatMulBatchedCached(batchFfnUp, in _wUp[layer], batchNorm, N, _intermDim, _embDim);
                     for (int n = 0; n < N; n++)
                         SimdKernels.SiLuMul(batchFfnGate + (long)n * _intermDim,
                             batchFfnUp + (long)n * _intermDim, _intermDim);
-                    SimdKernels.MatMulBatched(batchNorm, _wDown[layer].DataPtr, batchFfnGate,
-                        N, _embDim, _intermDim, _wDown[layer].DType);
+                    MatMulBatchedCached(batchNorm, in _wDown[layer], batchFfnGate, N, _embDim, _intermDim);
                     for (int n = 0; n < N; n++)
                     {
                         float* h = batchHidden + (long)n * _embDim;
@@ -2618,6 +2779,10 @@ public sealed unsafe class ForwardPass : IForwardPass
         foreach (var ptr in _normCache.Values)
             NativeMemory.Free((void*)ptr);
         _normCache.Clear();
+
+        foreach (var ptr in _dequantWeightCache.Values)
+            NativeMemory.Free((void*)ptr);
+        _dequantWeightCache.Clear();
 
         if (_hasAttnBias)
         {

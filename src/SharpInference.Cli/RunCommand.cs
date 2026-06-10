@@ -128,6 +128,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [DefaultValue(0)]
         public int MinBatchBlas { get; init; }
 
+        [CommandOption("--prefill-dequant-cache-mb")]
+        [Description("Dequant-once BLAS weight-cache budget in MiB for CPU prefill (issue #189): caches the F32 dequant per projection weight so chunked prefill re-pays no dequant (bit-identical). Auto (env SHARPI_PREFILL_DEQUANT_MB / fit-25%-RAM) by default; 0 = off, negative = unlimited. CPU only.")]
+        [DefaultValue(long.MinValue)]
+        public long PrefillDequantCacheMb { get; init; }
+
         [CommandOption("--rep-penalty")]
         [Description("Repetition penalty (1.0 = disabled, >1.0 penalizes repeated tokens, default: 1.1)")]
         [DefaultValue(1.1f)]
@@ -291,7 +296,16 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             if (hybridFwd.HasMtpHead) mtpFwd = hybridFwd;
         }
         else if (!hp.IsHybridSsm)
-            fwd = new ForwardPass(model, cpuBackend, hp);
+        {
+            // #189 dequant cache: only the pure-CPU path (no GPU offload) runs the batched
+            // CPU prefill that consults it; under -g it would be a wasted F32 model copy.
+            long dequantBytes = settings.NGpuLayers != 0
+                ? 0
+                : settings.PrefillDequantCacheMb == long.MinValue
+                    ? long.MinValue // auto / SHARPI_PREFILL_DEQUANT_MB
+                    : ForwardPass.MbToBudgetBytes(settings.PrefillDequantCacheMb);
+            fwd = new ForwardPass(model, cpuBackend, hp, prefillDequantCacheBytes: dequantBytes);
+        }
 
         // Create backend-specific forward pass
         IDisposable? gpuBackend = null;

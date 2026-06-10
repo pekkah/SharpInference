@@ -17,7 +17,7 @@ namespace SharpInference.Engine;
 /// all layer pages together. Total memory at any point:
 ///   allocatedBlocks × numLayers × PageSize × kvDim × 2 × sizeof(float)
 /// </summary>
-public sealed unsafe class PagedKvCache : IDisposable
+public sealed unsafe class PagedKvCache : ISequenceKvCache
 {
     /// <summary>Number of KV positions stored per page block.</summary>
     public const int PageSize = 16;

@@ -110,10 +110,22 @@ public sealed class SharpInferenceServerOptions
     /// Prompt tokens prefilled per batcher iteration under continuous batching
     /// (issue #183 Gap 1). Active sequences advance one decode step between chunks, so
     /// a long inbound prompt no longer freezes every in-flight generation. <c>0</c>
-    /// disables chunking (each prompt prefills in one blocking call). Only consulted
-    /// when <see cref="MaxBatchSize"/> &gt; 1. Mirrors <c>SHARPI_PREFILL_CHUNK</c>.
+    /// disables chunking (each prompt prefills in one blocking call). <c>-1</c> = auto
+    /// (issue #189): <c>64</c> when <see cref="PrefillDequantCacheMb"/> makes small chunks
+    /// free, else <c>256</c>. Only consulted when <see cref="MaxBatchSize"/> &gt; 1. Mirrors
+    /// <c>SHARPI_PREFILL_CHUNK</c>.
     /// </summary>
-    public int PrefillChunkTokens { get; set; } = 256;
+    public int PrefillChunkTokens { get; set; } = -1;
+
+    /// <summary>
+    /// Dequant-once BLAS weight-cache budget in MiB (issue #189). The CPU batched-prefill
+    /// path re-dequantizes each projection weight to F32 on every call, so small prefill
+    /// chunks re-pay the full dequant repeatedly; caching the F32 dequant per weight removes
+    /// that cost (bit-identical). <c>null</c> = auto (cache the model iff a full F32 copy fits
+    /// a quarter of available RAM), <c>0</c> = off, negative = unlimited, positive = explicit
+    /// MiB. Only meaningful for the CPU forward pass. Mirrors <c>SHARPI_PREFILL_DEQUANT_MB</c>.
+    /// </summary>
+    public long? PrefillDequantCacheMb { get; set; }
 
     /// <summary>
     /// KV-cache memory budget in MiB gating request admission under continuous batching
