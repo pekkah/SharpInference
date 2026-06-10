@@ -430,8 +430,11 @@ FodyWeavers.xsd
 # JetBrains Rider / IntelliJ
 .idea/
 
-# Claude Code
-.claude/
+# Claude Code — ignore local/personal config, but share the project hook + settings
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+.claude/settings.local.json
 
 # SharpInference specific
 shaders/*.spv
