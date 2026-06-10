@@ -236,6 +236,13 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         var posBuf = new int[_maxBatchSize];
         var cacheBuf = new PagedKvCache[_maxBatchSize];
 
+        // An exception the per-request handlers didn't isolate (e.g. a backend failure
+        // inside BatchForwardMulti) must not kill the batcher silently: without the
+        // catch + finally-drain below, every in-flight caller would hang forever on a
+        // never-completed channel and the per-sequence caches would leak.
+        Exception? fatal = null;
+        try
+        {
         while (!_disposed)
         {
             // Pull everything queued so far into the local pending queue. Channels have
@@ -364,33 +371,41 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                 }
             }
         }
-
-        // Drain: complete everything still in flight. Pull any requests still sitting
-        // in the channel first — written between our last TryRead pass and the writer
-        // completing — or their output channels would never complete and the caller's
-        // await-foreach would hang.
-        while (_queue.Reader.TryRead(out var stranded))
-            pending.Enqueue(stranded);
-        foreach (var req in pending)
-        {
-            Interlocked.Decrement(ref _pendingCount);
-            req.Output.Writer.TryComplete();
         }
-        pending.Clear();
-        foreach (var p in prefilling)
+        catch (Exception ex)
         {
-            p.Req.Output.Writer.TryComplete();
-            p.Cache.Dispose();
-            Interlocked.Decrement(ref _activeCount);
+            fatal = ex;
         }
-        prefilling.Clear();
-        foreach (var seq in active)
+        finally
         {
-            FlushAndComplete(seq);
-            seq.Cache.Dispose();
-            Interlocked.Decrement(ref _activeCount);
+            // Drain: complete everything still in flight — with the fatal exception when
+            // the loop died, so callers observe the failure instead of hanging. Pull any
+            // requests still sitting in the channel first (written between our last
+            // TryRead pass and the writer completing).
+            while (_queue.Reader.TryRead(out var stranded))
+                pending.Enqueue(stranded);
+            foreach (var req in pending)
+            {
+                Interlocked.Decrement(ref _pendingCount);
+                req.Output.Writer.TryComplete(fatal);
+            }
+            pending.Clear();
+            foreach (var p in prefilling)
+            {
+                p.Req.Output.Writer.TryComplete(fatal);
+                p.Cache.Dispose();
+                Interlocked.Decrement(ref _activeCount);
+            }
+            prefilling.Clear();
+            foreach (var seq in active)
+            {
+                if (fatal is null) FlushAndComplete(seq);
+                else seq.Output.Writer.TryComplete(fatal);
+                seq.Cache.Dispose();
+                Interlocked.Decrement(ref _activeCount);
+            }
+            active.Clear();
         }
-        active.Clear();
     }
 
     /// <summary>

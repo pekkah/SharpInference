@@ -51,13 +51,22 @@ internal static class CudaLibraryResolver
         int major = Volatile.Read(ref s_runtimeMajor);
         if (major != 0) return major;
 
+        // Probe the preferred pair first and only fall back to the other major when it
+        // is absent, so the unused version's DLLs are never pulled into the process
+        // (TryLoad maps the library; cublas alone is hundreds of MB of image). Probe
+        // handles are freed — the resolver reloads the chosen pair on demand, which is
+        // a cheap refcount bump on the OS loader cache.
         bool prefer13 = Environment.GetEnvironmentVariable("SHARPI_CUDA13") == "1";
-        bool has13 = CanLoadPair("cudart64_13", "cublas64_13");
-        bool has12 = CanLoadPair("cudart64_12", "cublas64_12");
-        major = prefer13 && has13 ? 13
-              : has12 ? 12
-              : has13 ? 13
-              : 12; // neither loads — keep the pinned name so the standard load error surfaces
+        if (prefer13)
+        {
+            major = CanLoadPair("cudart64_13", "cublas64_13") ? 13 : 12;
+        }
+        else
+        {
+            major = CanLoadPair("cudart64_12", "cublas64_12") ? 12
+                  : CanLoadPair("cudart64_13", "cublas64_13") ? 13
+                  : 12; // neither loads — keep the pinned name so the standard load error surfaces
+        }
         if (major == 13)
         {
             Console.Error.WriteLine("[SharpInference] CUDA runtime: using cudart64_13/cublas64_13"
@@ -66,7 +75,13 @@ internal static class CudaLibraryResolver
         Volatile.Write(ref s_runtimeMajor, major);
         return major;
 
-        static bool CanLoadPair(string cudart, string cublas) =>
-            NativeLibrary.TryLoad(cudart, out _) && NativeLibrary.TryLoad(cublas, out _);
+        static bool CanLoadPair(string cudart, string cublas)
+        {
+            if (!NativeLibrary.TryLoad(cudart, out nint hRt)) return false;
+            bool ok = NativeLibrary.TryLoad(cublas, out nint hBlas);
+            NativeLibrary.Free(hRt);
+            if (ok) NativeLibrary.Free(hBlas);
+            return ok;
+        }
     }
 }
