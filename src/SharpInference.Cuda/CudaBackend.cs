@@ -173,6 +173,16 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _matvecQ5KGemmNKernel;
     private nint   _matvecQ6KGemmNKernel;
     private nint   _matvecQ80GemmNKernel;
+    // Issue #194: weight-stationary small-N batched-decode matvecs — token loop inside
+    // the block so each weight read is amortized across the batch. One handle per
+    // compile-time batch capacity (CudaWsKernels.Variants: 2/4/8/16), indexed by position.
+    private readonly nint[] _matvecF32WsKernels    = new nint[CudaWsKernels.Variants.Length];
+    private readonly nint[] _matvecQ4KWsKernels    = new nint[CudaWsKernels.Variants.Length];
+    private readonly nint[] _matvecQ4KWsSoaKernels = new nint[CudaWsKernels.Variants.Length];
+    private readonly nint[] _matvecQ5KWsKernels    = new nint[CudaWsKernels.Variants.Length];
+    private readonly nint[] _matvecQ6KWsKernels    = new nint[CudaWsKernels.Variants.Length];
+    private readonly nint[] _matvecQ80WsKernels    = new nint[CudaWsKernels.Variants.Length];
+    private readonly nint[] _matvecQ80WsSoaKernels = new nint[CudaWsKernels.Variants.Length];
     // Issue #141: compute-bound prefill GEMM — dequant Q8_0 weight + convert
     // activations to fp16, then one cublasGemmEx (weight read once per batch).
     private nint   _dequantQ80F16Kernel;
@@ -1920,6 +1930,141 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     {
         var dtype = _tensorDTypes.GetValueOrDefault(matrix.Handle, matrix.DType);
         MatMulBatched(outputAll, matrix, inputAll, nTok, dtype);
+    }
+
+    /// <summary>
+    /// Weight-stationary batched matvec for small-N decode (issue #194). Same contract
+    /// and token-major layout as <see cref="MatMulBatched(Tensor,Tensor,Tensor,int,DType)"/>,
+    /// but the token loop runs <b>inside</b> the thread block: each weight element is read
+    /// from HBM once and applied to all <paramref name="nTok"/> activation rows, so the
+    /// weight read — the dominant cost of batched decode — is amortized N× instead of
+    /// re-streamed per token (the GEMM-N grid puts the token on <c>blockIdx.y</c> and only
+    /// gets L2 reuse; #190 measured ~1.4× aggregate at N=8 from that).
+    ///
+    /// <para><b>Bit-exact:</b> each (row, token) pair runs the identical per-element
+    /// reduction chain as the GEMM-N kernel (same loads, same product association, same
+    /// warp/shared reduce order — see <see cref="CudaWsKernels"/>), so output is
+    /// bit-identical to <see cref="MatMulBatched(Tensor,Tensor,Tensor,int,DType)"/> and to
+    /// <paramref name="nTok"/> sequential <see cref="MatMul(Tensor,Tensor,Tensor,DType)"/>
+    /// calls. Callers that need the byte-parity guarantee should still call
+    /// <see cref="MatMulBatched(Tensor,Tensor,Tensor,int,DType)"/> — its contract is the
+    /// documented one; this entry point only promises argmax-stability.</para>
+    ///
+    /// <para>Kernels are stamped per compile-time batch capacity (2/4/8/16; smallest ≥
+    /// <paramref name="nTok"/> wins) so the per-token accumulators stay register-resident.
+    /// <c>nTok == 1</c> and <c>nTok &gt; 16</c> delegate to the GEMM-N path (no weight
+    /// reuse to gain at N=1; capacities above 16 spill registers — large N belongs to the
+    /// compute-bound MMQ/GEMM prefill path). Supports the same dtypes as the GEMM-N matvec:
+    /// Q4_K (AoS + #156 SoA, via per-token Q8_1 quantize + dp4a), Q5_K, Q6_K, Q8_0
+    /// (AoS + #149 SoA), and Float32; anything else delegates (and throws) there too.</para>
+    /// </summary>
+    public void MatMulBatchedWeightStationary(Tensor outputAll, Tensor matrix, Tensor inputAll,
+                                              int nTok, DType weightDType)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available on this system.");
+        if (nTok <= 0)
+            throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be > 0.");
+        if (outputAll.ElementCount % nTok != 0 || inputAll.ElementCount % nTok != 0)
+            throw new ArgumentException(
+                $"MatMulBatchedWeightStationary: outputAll ({outputAll.ElementCount}) and inputAll " +
+                $"({inputAll.ElementCount}) element counts must be divisible by nTok ({nTok}).");
+
+        int maxCapacity = CudaWsKernels.Variants[^1];
+        if (nTok == 1 || nTok > maxCapacity ||
+            weightDType is not (DType.Q4_K or DType.Q5_K or DType.Q6_K or DType.Q8_0 or DType.Float32))
+        {
+            MatMulBatched(outputAll, matrix, inputAll, nTok, weightDType);
+            return;
+        }
+
+        int variant = 0;
+        while (CudaWsKernels.Variants[variant] < nTok) variant++;
+
+        int rows = (int)(outputAll.ElementCount / nTok);
+        int cols = (int)(inputAll.ElementCount / nTok);
+        nint wPtr = GetDevPtr(matrix);
+        nint xPtr = GetDevPtr(inputAll);
+        nint yPtr = GetDevPtr(outputAll);
+
+        if (weightDType == DType.Q4_K)
+        {
+            DispatchMatVecQ4KWs(wPtr, xPtr, yPtr, rows, cols, nTok, variant,
+                                soa: _soaQ4kHandles.ContainsKey(matrix.Handle));
+            return;
+        }
+
+        // F32-input kernels: same (rows+7)/8 × 256-thread geometry as the GEMM-N
+        // dispatch, minus the token grid dimension.
+        bool q80Soa = weightDType == DType.Q8_0 && _soaHandles.ContainsKey(matrix.Handle);
+        nint kernel = weightDType switch
+        {
+            DType.Q6_K => _matvecQ6KWsKernels[variant],
+            DType.Q5_K => _matvecQ5KWsKernels[variant],
+            DType.Q8_0 => q80Soa ? _matvecQ80WsSoaKernels[variant] : _matvecQ80WsKernels[variant],
+            _          => _matvecF32WsKernels[variant],
+        };
+        int pRows = rows, pCols = cols, pN = nTok;
+        nint* args = stackalloc nint[6]
+        {
+            (nint)(&wPtr), (nint)(&xPtr), (nint)(&yPtr),
+            (nint)(&pRows), (nint)(&pCols), (nint)(&pN)
+        };
+        uint gridX = (uint)((rows + 7) / 8);
+        int r = NvrtcInterop.LaunchKernel(kernel, gridX, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_ws) failed: {r}");
+    }
+
+    /// <summary>
+    /// Q4_K weight-stationary launch (#194): quantize all <paramref name="nTok"/> inputs to
+    /// contiguous Q8_1 (identical to <see cref="DispatchMatVecQ4KBatched"/> — per-token
+    /// quantization is unchanged, only the matvec geometry differs), then one
+    /// grid = rows, block = 32 × MATVEC_Q4K_NWARPS launch with the token loop inside.
+    /// </summary>
+    private void DispatchMatVecQ4KWs(nint wPtr, nint xPtr, nint yPtr,
+                                     int rows, int cols, int nTok, int variant, bool soa)
+    {
+        if ((cols & 0xff) != 0)
+            throw new InvalidOperationException(
+                $"CUDA matvec_q4k_ws requires cols % 256 == 0 (got {cols}).");
+
+        int subBlocks = cols / 32;                          // per token
+        long totalSub = (long)subBlocks * nTok;
+        nuint q81Bytes = (nuint)(totalSub * 36L);
+        EnsureQ81BatchBuf(q81Bytes);
+
+        {
+            nint qInPtr  = xPtr;
+            nint qOutPtr = _q81BatchBuf;
+            int  qN      = (int)((long)cols * nTok);
+            if ((long)cols * nTok > int.MaxValue)
+                throw new InvalidOperationException(
+                    $"MatMulBatchedWeightStationary: cols*nTok ({(long)cols * nTok}) exceeds int range.");
+            nint* args = stackalloc nint[3]
+            {
+                (nint)(&qInPtr), (nint)(&qOutPtr), (nint)(&qN)
+            };
+            int rq = NvrtcInterop.LaunchKernel(
+                _quantizeQ81Kernel, (uint)totalSub, 1, 1,
+                32, 1, 1, 0, _stream, args, null);
+            if (rq != 0) throw new InvalidOperationException($"cuLaunchKernel(quantize_q8_1 ws) failed: {rq}");
+        }
+
+        {
+            nint q81Ptr = _q81BatchBuf;
+            int  pRows  = rows, pCols = cols, pN = nTok;
+            nint* args = stackalloc nint[6]
+            {
+                (nint)(&wPtr), (nint)(&q81Ptr), (nint)(&yPtr),
+                (nint)(&pRows), (nint)(&pCols), (nint)(&pN)
+            };
+            // grid = rows; block = 32 × MATVEC_Q4K_NWARPS(8) = 256 threads (token loop inside).
+            nint kernel = soa ? _matvecQ4KWsSoaKernels[variant] : _matvecQ4KWsKernels[variant];
+            int rm = NvrtcInterop.LaunchKernel(kernel, (uint)rows, 1, 1,
+                                               32, 8, 1, 0, _stream, args, null);
+            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_q4k_ws{(soa ? "_soa" : "")}) failed: {rm}");
+        }
     }
 
     /// <summary>
@@ -5127,8 +5272,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         t_primaryCtxBoundOnThisThread = true;
     }
 
-    /// <summary>Combined CUDA source for image + text kernels — one NVRTC compilation.</summary>
-    private static string CombinedKernelSource => CudaKernels.Source + "\n" + CudaTextKernels.Source;
+    /// <summary>Combined CUDA source for image + text + weight-stationary kernels — one
+    /// NVRTC compilation (the cubin cache key hashes this, so adding a source invalidates it).</summary>
+    private static string CombinedKernelSource =>
+        CudaKernels.Source + "\n" + CudaTextKernels.Source + "\n" + CudaWsKernels.Source;
 
     private void CompileAndLoadKernels()
     {
@@ -5353,6 +5500,17 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             if (k != nint.Zero)
                 NvrtcInterop.FuncGetAttribute(out _, NvrtcInterop.CU_FUNC_ATTRIBUTE_NUM_REGS, k);
         }
+        // #194: weight-stationary batched-decode matvec variants.
+        ReadOnlySpan<nint[]> wsKernelSets = [
+            _matvecF32WsKernels, _matvecQ4KWsKernels, _matvecQ4KWsSoaKernels,
+            _matvecQ5KWsKernels, _matvecQ6KWsKernels, _matvecQ80WsKernels, _matvecQ80WsSoaKernels,
+        ];
+        foreach (nint[] set in wsKernelSets)
+            foreach (nint k in set)
+            {
+                if (k != nint.Zero)
+                    NvrtcInterop.FuncGetAttribute(out _, NvrtcInterop.CU_FUNC_ATTRIBUTE_NUM_REGS, k);
+            }
     }
 
     private void LoadKernelFunctions()
@@ -5415,6 +5573,17 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _matvecQ5KGemmNKernel  = GetKernelFunc("llm_matvec_q5k_gemm_n");
         _matvecQ6KGemmNKernel  = GetKernelFunc("llm_matvec_q6k_gemm_n");
         _matvecQ80GemmNKernel  = GetKernelFunc("llm_matvec_q8_0_gemm_n");
+        for (int v = 0; v < CudaWsKernels.Variants.Length; v++)   // #194
+        {
+            int nt = CudaWsKernels.Variants[v];
+            _matvecF32WsKernels[v]    = GetKernelFunc($"llm_matvec_f32_ws_n{nt}");
+            _matvecQ4KWsKernels[v]    = GetKernelFunc($"llm_matvec_q4k_ws_n{nt}");
+            _matvecQ4KWsSoaKernels[v] = GetKernelFunc($"llm_matvec_q4k_ws_soa_n{nt}");
+            _matvecQ5KWsKernels[v]    = GetKernelFunc($"llm_matvec_q5k_ws_n{nt}");
+            _matvecQ6KWsKernels[v]    = GetKernelFunc($"llm_matvec_q6k_ws_n{nt}");
+            _matvecQ80WsKernels[v]    = GetKernelFunc($"llm_matvec_q8_0_ws_n{nt}");
+            _matvecQ80WsSoaKernels[v] = GetKernelFunc($"llm_matvec_q8_0_ws_soa_n{nt}");
+        }
         _dequantQ80F16Kernel   = GetKernelFunc("llm_dequant_q8_0_to_f16");
         _dequantQ4KF16Kernel   = GetKernelFunc("llm_dequant_q4k_to_f16");
         _dequantQ4KF16SoaKernel = GetKernelFunc("llm_dequant_q4k_to_f16_soa");
