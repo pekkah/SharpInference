@@ -156,6 +156,67 @@ public sealed class CudaBatchForwardMultiTests
     }
 
     /// <summary>
+    /// #201 oracle for the opt-in decode MMQ (<c>SHARPI_BATCH_DECODE_MMQ=1</c>): the int8
+    /// tensor-core decode tile is argmax-stable, not bit-exact, so a batched decode step
+    /// must still reproduce the single-user argmax/top-5 within the same cross-path
+    /// tolerance the GEMM toggle holds. Uses the same 2-sequence shape as the headline
+    /// #190 oracle; the env var is pinned around construction (the flag is read once).
+    /// </summary>
+    [Fact]
+    public void Qwen3_8B_BatchForwardMulti_DecodeMmq_MatchesSingleUser()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+
+        var prevMmq = Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_MMQ");
+        Environment.SetEnvironmentVariable("SHARPI_BATCH_DECODE_MMQ", "1");
+        CudaForwardPass fwdTmp;
+        try { fwdTmp = NewFwd(model, gpu, hp); }
+        finally { Environment.SetEnvironmentVariable("SHARPI_BATCH_DECODE_MMQ", prevMmq); }
+        using var fwd = fwdTmp;
+
+        // Single-user reference (per-token matvecs — unaffected by the MMQ toggle).
+        fwd.ResetCache();
+        int tokA = Argmax(fwd.Prefill(PromptA));
+        float[] refLogitsA = fwd.Forward(tokA, PromptA.Length).ToArray();
+
+        fwd.ResetCache();
+        int tokB = Argmax(fwd.Prefill(PromptB));
+        float[] refLogitsB = fwd.Forward(tokB, PromptB.Length).ToArray();
+
+        using var cacheA = fwd.CreateCache();
+        using var cacheB = fwd.CreateCache();
+        fwd.PrefillWithCache(PromptA, cacheA);
+        fwd.PrefillWithCache(PromptB, cacheB);
+
+        var batch = fwd.BatchForwardMulti(
+            [tokA, tokB],
+            [PromptA.Length, PromptB.Length],
+            [cacheA, cacheB]);
+
+        Assert.Equal(2, batch.Length);
+
+        var (maxAbsA, overlapA) = Compare(refLogitsA, batch[0]);
+        Assert.Equal(Argmax(refLogitsA), Argmax(batch[0]));
+        Assert.True(overlapA >= 4,
+            $"Seq A MMQ-decode top-5 overlaps the single-user reference in only {overlapA}/5 slots (maxAbs={maxAbsA}).");
+        Assert.True(maxAbsA < 1.0f,
+            $"Seq A MMQ-decode vs single-user logits diverged beyond tolerance: maxAbs={maxAbsA}.");
+
+        var (maxAbsB, overlapB) = Compare(refLogitsB, batch[1]);
+        Assert.Equal(Argmax(refLogitsB), Argmax(batch[1]));
+        Assert.True(overlapB >= 4,
+            $"Seq B MMQ-decode top-5 overlaps the single-user reference in only {overlapB}/5 slots (maxAbs={maxAbsB}).");
+        Assert.True(maxAbsB < 1.0f,
+            $"Seq B MMQ-decode vs single-user logits diverged beyond tolerance: maxAbs={maxAbsB}.");
+    }
+
+    /// <summary>
     /// A second batched decode step (positions advance by one) must still track the single-user
     /// continuation — catches a per-sequence cache-append / position-indexing bug that a single
     /// decode step would miss (the first step's KV is reused, a second token is appended).

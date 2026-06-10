@@ -26,6 +26,21 @@ namespace SharpInference.Cuda;
 /// bit-identical to the GEMM-N path and to <c>n_tok</c> sequential matvecs
 /// (CudaMatMulBatchedWsTests enforce this). Only the loop nest changes: weight outer,
 /// token inner.</para>
+///
+/// <para><b>#201:</b> <c>llm_matvec_q6k_ws_sw_n*</c> (scale-word) replaces the Q6_K
+/// kernel's 10 dependent per-super-block scale/d byte-gather loads with five aligned
+/// word loads + funnel-shift extracts — same bytes, same chain, bit-identical; it
+/// attacks the gather latency the serial walk stalls on. Two sibling #201 attempts
+/// were measured and REMOVED — re-read the issue before re-trying them: token-warp
+/// (one warp per (row, token), bit-exact by construction) loses everywhere because
+/// the NT× weight-decode replication outweighs the occupancy win (N=8 aggregate
+/// 243→239 even routed only to the grid-starved attn_v shape, 243→182 routed to
+/// ffn_down too); SoA-Q8_1-activation reads (xs) genuinely cut the LSU/L1TEX load
+/// (94.7% → 82%) but the second activation-region pointer costs 7 registers in the
+/// NT-unrolled token loop (48 → 55) and the occupancy loss (80% → 63%) nets −5 t/s
+/// (forcing 48 via launch bounds spills: −36 t/s). The bit-identity contract freezes
+/// the lane geometry, so the remaining q4k headroom belongs to the argmax-stable
+/// decode MMQ (<c>SHARPI_BATCH_DECODE_MMQ=1</c>), not to load-shape tweaks.</para>
 /// </summary>
 internal static class CudaWsKernels
 {
@@ -33,14 +48,16 @@ internal static class CudaWsKernels
     /// matters: dispatch indexes kernel-handle arrays by position.</summary>
     internal static readonly int[] Variants = [2, 4, 8, 16];
 
-    /// <summary>All weight-stationary kernels, one instantiation per variant.</summary>
+    /// <summary>All weight-stationary kernels (one instantiation per variant) plus the
+    /// once-only #201 decode-MMQ kernel.</summary>
     public static string Source { get; } = Build();
 
     private static string Build()
     {
-        var sb = new System.Text.StringBuilder(Template.Length * Variants.Length);
+        var sb = new System.Text.StringBuilder(Template.Length * Variants.Length + DecodeMmq.Length);
         foreach (int nt in Variants)
             sb.Append(Template.Replace("__NT__", nt.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+        sb.Append(DecodeMmq);
         return sb.ToString();
     }
 
@@ -596,5 +613,283 @@ extern ""C"" __global__ void llm_matvec_q4k_ws_soa_n__NT__(
         output_all[(long)lane * (long)rows + row] = s;
     }
 }
+
+// ── #201 Q6_K scale-word (sw) variant ──────────────────────────────────────
+// Identical geometry (8 rows/block × 32 lanes, token loop inside) and identical
+// reduction chain to llm_matvec_q6k_ws_n*, but the per-super-block scale/d
+// decode loads the 18-byte tail [scales[16] ‖ fp16 d] (bytes 192..209) as five
+// aligned words + funnel-shift extracts instead of 10 separate byte-gather
+// loads (8 × sharpi_int8_at + 2 d bytes). Same bytes → same int8 / fp16 values
+// → bit-identical; the serial super-block walk #201 profiled as latency-bound
+// (ffn_down 48% pipe / 19% DRAM) gets 5 independent LDGs instead of a 10-deep
+// gather burst, and the LSU issues ~30% fewer weight-load instructions.
+extern ""C"" __global__ void llm_matvec_q6k_ws_sw_n__NT__(
+    const unsigned int* __restrict__ weights,
+    const float* __restrict__ input_all,   // [n_tok][cols]
+    float* __restrict__ output_all,        // [n_tok][rows]
+    int rows, int cols, int n_tok)
+{
+    const int NT = __NT__;
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    if (row >= rows) return;
+
+    int num_blocks = cols >> 8;
+    long row_base_bytes = (long)row * (long)num_blocks * 210L;
+
+    float acc[NT];
+    #pragma unroll
+    for (int t = 0; t < NT; t++) acc[t] = 0.f;
+
+    // Scale-byte select: original lanes read byte 192 + 2k + isc, isc = lane>>4.
+    unsigned int isc8 = ((unsigned int)lane >> 4) * 8u;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long b0 = row_base_bytes + (long)block * 210L;
+
+        // b0 is always even (210-byte stride from an even base), so the tail
+        // starts at word offset 0 or 2 and five aligned words cover all 18 bytes.
+        // The word covering byte 209 spills ≤2 bytes into the next block — the
+        // same word sharpi_byte_at(b0+209) already reads in the #194 kernel.
+        long sc_word = (b0 + 192) >> 2;
+        unsigned int sw0 = weights[sc_word];
+        unsigned int sw1 = weights[sc_word + 1];
+        unsigned int sw2 = weights[sc_word + 2];
+        unsigned int sw3 = weights[sc_word + 3];
+        unsigned int sw4 = weights[sc_word + 4];
+        unsigned int s01, s23, s45, s67, d_bits;
+        if (((unsigned int)b0 & 3u) != 0u) {   // warp-uniform (b0 is per-block)
+            s01 = __funnelshift_r(sw0, sw1, 16);
+            s23 = __funnelshift_r(sw1, sw2, 16);
+            s45 = __funnelshift_r(sw2, sw3, 16);
+            s67 = __funnelshift_r(sw3, sw4, 16);
+            d_bits = sw4 >> 16;
+        } else {
+            s01 = sw0; s23 = sw1; s45 = sw2; s67 = sw3;
+            d_bits = sw4 & 0xffffu;
+        }
+        float d = sharpi_fp16_to_fp32(d_bits);
+
+        // Same byte, same sign-widening as sharpi_int8_at(weights, b0+192+2k+isc).
+        int v0 = (int)((s01 >> (isc8      )) & 0xFFu); v0 = v0 >= 128 ? v0 - 256 : v0;
+        int v1 = (int)((s01 >> (isc8 + 16u)) & 0xFFu); v1 = v1 >= 128 ? v1 - 256 : v1;
+        int v2 = (int)((s23 >> (isc8      )) & 0xFFu); v2 = v2 >= 128 ? v2 - 256 : v2;
+        int v3 = (int)((s23 >> (isc8 + 16u)) & 0xFFu); v3 = v3 >= 128 ? v3 - 256 : v3;
+        int v4 = (int)((s45 >> (isc8      )) & 0xFFu); v4 = v4 >= 128 ? v4 - 256 : v4;
+        int v5 = (int)((s45 >> (isc8 + 16u)) & 0xFFu); v5 = v5 >= 128 ? v5 - 256 : v5;
+        int v6 = (int)((s67 >> (isc8      )) & 0xFFu); v6 = v6 >= 128 ? v6 - 256 : v6;
+        int v7 = (int)((s67 >> (isc8 + 16u)) & 0xFFu); v7 = v7 >= 128 ? v7 - 256 : v7;
+
+        float sc0 = d * (float)v0;
+        float sc1 = d * (float)v1;
+        float sc2 = d * (float)v2;
+        float sc3 = d * (float)v3;
+        float sc4 = d * (float)v4;
+        float sc5 = d * (float)v5;
+        float sc6 = d * (float)v6;
+        float sc7 = d * (float)v7;
+
+        unsigned int ql0 = sharpi_byte_at(weights, b0 +   0 + lane);
+        unsigned int ql1 = sharpi_byte_at(weights, b0 +  32 + lane);
+        unsigned int ql2 = sharpi_byte_at(weights, b0 +  64 + lane);
+        unsigned int ql3 = sharpi_byte_at(weights, b0 +  96 + lane);
+        unsigned int qh0 = sharpi_byte_at(weights, b0 + 128 + lane);
+        unsigned int qh1 = sharpi_byte_at(weights, b0 + 160 + lane);
+
+        float w0 = sc0 * (float)((int)((ql0 & 0xFu)        | (((qh0 >> 0) & 3u) << 4)) - 32);
+        float w1 = sc1 * (float)((int)((ql1 & 0xFu)        | (((qh0 >> 2) & 3u) << 4)) - 32);
+        float w2 = sc2 * (float)((int)(((ql0 >> 4) & 0xFu) | (((qh0 >> 4) & 3u) << 4)) - 32);
+        float w3 = sc3 * (float)((int)(((ql1 >> 4) & 0xFu) | (((qh0 >> 6) & 3u) << 4)) - 32);
+        float w4 = sc4 * (float)((int)((ql2 & 0xFu)        | (((qh1 >> 0) & 3u) << 4)) - 32);
+        float w5 = sc5 * (float)((int)((ql3 & 0xFu)        | (((qh1 >> 2) & 3u) << 4)) - 32);
+        float w6 = sc6 * (float)((int)(((ql2 >> 4) & 0xFu) | (((qh1 >> 4) & 3u) << 4)) - 32);
+        float w7 = sc7 * (float)((int)(((ql3 >> 4) & 0xFu) | (((qh1 >> 6) & 3u) << 4)) - 32);
+
+        int base_elem = block * 256;
+        #pragma unroll
+        for (int t = 0; t < NT; t++)
+            if (t < n_tok) {
+                const float* input = input_all + (long)t * (long)cols;
+                acc[t] += w0 * input[base_elem +       lane];
+                acc[t] += w1 * input[base_elem +  32 + lane];
+                acc[t] += w2 * input[base_elem +  64 + lane];
+                acc[t] += w3 * input[base_elem +  96 + lane];
+                acc[t] += w4 * input[base_elem + 128 + lane];
+                acc[t] += w5 * input[base_elem + 160 + lane];
+                acc[t] += w6 * input[base_elem + 192 + lane];
+                acc[t] += w7 * input[base_elem + 224 + lane];
+            }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < NT; t++)
+        if (t < n_tok) {
+            float result = sharpi_warp_reduce_sum(acc[t]);
+            if (lane == 0) output_all[(long)t * (long)rows + row] = result;
+        }
+}
+";
+
+    /// <summary>
+    /// #201 decode MMQ (<c>SHARPI_BATCH_DECODE_MMQ=1</c>): the bit-exact WS kernels
+    /// are frozen into a lane geometry whose token loop costs ~30 L1TEX wavefront-heavy
+    /// load instructions per 36-word super-block at NT=8 (~3× the weight-streaming
+    /// floor, #201). This kernel relaxes the contract to argmax-stable — the same
+    /// contract the prefill MMQ holds — and re-tiles <c>llm_mmq_q4k_soa_acts</c> for
+    /// decode batch sizes: BN drops 128 → 16, so grid.y == 1 for N ≤ 16 and each
+    /// weight byte is read from HBM exactly once per step (true weight-stationary)
+    /// while the m16n8k32 int8 mma replaces the per-token dp4a chains. Identical
+    /// K-order accumulation and {d,s} fixup math to the prefill kernel — only the
+    /// tile shape changes (one n-tile per warp, scalar acc0..3 instead of acc[8][4]).
+    /// </summary>
+    private const string DecodeMmq = @"
+// ── #201 decode MMQ: Q4_K SoA weights × SoA Q8_1 activations, BN=16 ─────────
+// grid = (ceil(rows/64), ceil(n_tok/16)), block = 256 (8 warps: 4 row-strips ×
+// 2 token-strips). The K-step is one 256-element SUPER-block: the block stages
+// the raw tile (64×32 quant words + 64 scale tails + 16×64 act words + 16×8
+// act {d,s}) with linear fully-coalesced copies, then runs 8 m16n8k32 s8 mma
+// per warp between one barrier pair — nibble/scale decode happens at
+// fragment-read time from shared. A sub-block-sized K-step (one mma per
+// barrier pair) was measured 1.4-1.7× SLOWER than the WS matvec it replaces:
+// ~50 cycles of mma cannot hide the next tile's global-load latency, so the
+// loop serializes at one latency epoch per 32 elements. The super-block step
+// issues ~14 independent loads per thread per epoch and amortizes it 8×.
+// Argmax-stable, not bit-exact: both operands int8-quantized, min-bias via the
+// fp16 s = d·Σq field (same contract and K-order as the prefill MMQ).
+#define MMQ_BM 64
+#define MMQ_BN 16
+extern ""C"" __global__ void __launch_bounds__(256) llm_mmq_q4k_soa_acts_n16(
+    const unsigned int*  __restrict__ weights,   // SoA [Q][S][D]
+    const unsigned int*  __restrict__ y_qs,      // SoA Q8_1 quants [n_tok × sub_total × 32 B]
+    const unsigned int*  __restrict__ y_ds,      // SoA Q8_1 scales [n_tok × sub_total] {d,s}
+    float* __restrict__ output,                  // [n_tok × rows] fp32
+    int rows, int cols, int n_tok)
+{
+    // Row strides padded +1 word: an unpadded 32/64-word stride would land all 8
+    // grp-lanes of a fragment read on one shared bank (8-way conflict).
+    __shared__ unsigned int sWq[MMQ_BM * 33];    // raw quant words   [row][32+1]
+    __shared__ unsigned int sWs[MMQ_BM * 4];     // raw 16-B sc|mn    [row][4]
+    __shared__ unsigned int sWd[MMQ_BM];         // raw {d,dmin}      [row]
+    __shared__ unsigned int sYq[MMQ_BN * 65];    // raw act words     [tok][64+1]
+    __shared__ unsigned int sYd[MMQ_BN * 8];     // raw act {d,s}     [tok][8]
+
+    int row_block = (int)blockIdx.x * MMQ_BM;
+    int tok_block = (int)blockIdx.y * MMQ_BN;
+    int nb_super  = cols >> 8;
+    int sub_total = cols >> 5;
+    long total_sb = (long)rows * nb_super;
+
+    const unsigned int*  qReg = weights;
+    const unsigned char* sReg = (const unsigned char*)weights + total_sb * 128L;
+    const unsigned int*  dReg = (const unsigned int*)(sReg + total_sb * 16L);
+
+    int tid  = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int grp  = lane >> 2;
+    int tig  = lane & 3;
+    int wr   = warp & 3;
+    int wc   = warp >> 2;
+    int mrow0 = wr * 16;
+    int ncol0 = wc * 8;
+
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+
+    int rowA = row_block + mrow0 + grp;
+    int rowB = rowA + 8;
+    int tokC0 = tok_block + ncol0 + tig * 2;
+    int tokC1 = tokC0 + 1;
+
+    for (int ksb = 0; ksb < nb_super; ksb++) {
+        // Stage the raw super-block tile. All copies are linear in shared and
+        // 128-B-coalesced in global (one row / token segment per warp-instruction).
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {            // 64 rows × 32 quant words
+            int k = tid + j * 256;
+            int r = row_block + (k >> 5);
+            sWq[(k >> 5) * 33 + (k & 31)] =
+                (r < rows) ? qReg[((long)r * nb_super + ksb) * 32L + (k & 31)] : 0u;
+        }
+        {                                        // 64 rows × 4 scale words (16 B sc|mn)
+            int r = row_block + (tid >> 2);
+            sWs[tid] = (r < rows)
+                ? reinterpret_cast<const unsigned int*>(sReg)[((long)r * nb_super + ksb) * 4L + (tid & 3)]
+                : 0u;
+        }
+        if (tid < MMQ_BM) {                      // 64 rows × {d,dmin}
+            int r = row_block + tid;
+            sWd[tid] = (r < rows) ? dReg[(long)r * nb_super + ksb] : 0u;
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {            // 16 tokens × 64 act words (256 B)
+            int k = tid + j * 256;
+            int t = tok_block + (k >> 6);
+            sYq[(k >> 6) * 65 + (k & 63)] =
+                (t < n_tok) ? y_qs[((long)t * sub_total + ksb * 8) * 8L + (k & 63)] : 0u;
+        }
+        if (tid < MMQ_BN * 8) {                  // 16 tokens × 8 act {d,s}
+            int t = tok_block + (tid >> 3);
+            sYd[tid] = (t < n_tok) ? y_ds[(long)t * sub_total + ksb * 8 + (tid & 7)] : 0u;
+        }
+        __syncthreads();
+
+        // 8 sub-blocks per super-block: same per-sub-block fixup math and K-order
+        // as llm_mmq_q4k_soa_acts; nibble polarity and scale bytes decode here.
+        const unsigned char* sWsB = reinterpret_cast<const unsigned char*>(sWs);
+        #pragma unroll
+        for (int sb = 0; sb < 8; sb++) {
+            int chk = sb >> 1, pol = sb & 1;
+            unsigned int wa0 = sWq[(mrow0 + grp) * 33     + chk * 8 + tig];
+            unsigned int wa1 = sWq[(mrow0 + grp + 8) * 33 + chk * 8 + tig];
+            unsigned int wa2 = sWq[(mrow0 + grp) * 33     + chk * 8 + tig + 4];
+            unsigned int wa3 = sWq[(mrow0 + grp + 8) * 33 + chk * 8 + tig + 4];
+            int a0 = (int)(pol ? ((wa0 >> 4) & 0x0F0F0F0Fu) : (wa0 & 0x0F0F0F0Fu));
+            int a1 = (int)(pol ? ((wa1 >> 4) & 0x0F0F0F0Fu) : (wa1 & 0x0F0F0F0Fu));
+            int a2 = (int)(pol ? ((wa2 >> 4) & 0x0F0F0F0Fu) : (wa2 & 0x0F0F0F0Fu));
+            int a3 = (int)(pol ? ((wa3 >> 4) & 0x0F0F0F0Fu) : (wa3 & 0x0F0F0F0Fu));
+
+            unsigned int ddA = sWd[mrow0 + grp];
+            unsigned int ddB = sWd[mrow0 + grp + 8];
+            float dwA = sharpi_fp16_to_fp32(ddA & 0xffffu) * (float)sWsB[(mrow0 + grp) * 16 + sb];
+            float dmA = sharpi_fp16_to_fp32(ddA >> 16)     * (float)sWsB[(mrow0 + grp) * 16 + 8 + sb];
+            float dwB = sharpi_fp16_to_fp32(ddB & 0xffffu) * (float)sWsB[(mrow0 + grp + 8) * 16 + sb];
+            float dmB = sharpi_fp16_to_fp32(ddB >> 16)     * (float)sWsB[(mrow0 + grp + 8) * 16 + 8 + sb];
+
+            int b0 = (int)sYq[(ncol0 + grp) * 65 + sb * 8 + tig];
+            int b1 = (int)sYq[(ncol0 + grp) * 65 + sb * 8 + tig + 4];
+            unsigned int dy0 = sYd[(ncol0 + tig * 2) * 8 + sb];
+            unsigned int dy1 = sYd[(ncol0 + tig * 2 + 1) * 8 + sb];
+            float dC0 = sharpi_fp16_to_fp32(dy0 & 0xffffu), sC0 = sharpi_fp16_to_fp32(dy0 >> 16);
+            float dC1 = sharpi_fp16_to_fp32(dy1 & 0xffffu), sC1 = sharpi_fp16_to_fp32(dy1 >> 16);
+
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            asm(
+              ""mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 ""
+              ""{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};""
+              : ""+r""(c0), ""+r""(c1), ""+r""(c2), ""+r""(c3)
+              : ""r""(a0), ""r""(a1), ""r""(a2), ""r""(a3), ""r""(b0), ""r""(b1));
+            acc0 += (float)c0 * dwA * dC0 - dmA * sC0;
+            acc1 += (float)c1 * dwA * dC1 - dmA * sC1;
+            acc2 += (float)c2 * dwB * dC0 - dmB * sC0;
+            acc3 += (float)c3 * dwB * dC1 - dmB * sC1;
+        }
+        __syncthreads();
+    }
+
+    if (rowA < rows) {
+        if (tokC0 < n_tok) output[(long)tokC0 * rows + rowA] = acc0;
+        if (tokC1 < n_tok) output[(long)tokC1 * rows + rowA] = acc1;
+    }
+    if (rowB < rows) {
+        if (tokC0 < n_tok) output[(long)tokC0 * rows + rowB] = acc2;
+        if (tokC1 < n_tok) output[(long)tokC1 * rows + rowB] = acc3;
+    }
+}
+#undef MMQ_BM
+#undef MMQ_BN
 ";
 }
