@@ -350,21 +350,25 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     private float[]? _decodeLogitsHost;
     private int _decodeLogitsCapacity;
 
-    // Batched-decode matmul path (issue #190). false (default): the GEMM-N matvec
-    // (_gpu.MatMulBatched) — bit-closest to the per-token decode oracle. It reads each weight
-    // tile once PER token-block (grid Y = nTok), so it amortizes launch overhead + L2 weight
-    // reuse, not the weight HBM reads. true (SHARPI_BATCH_DECODE_GEMM=1): the compute-bound
-    // GEMM/MMQ path (GpuMatMulBatchedCore) that reads each weight ONCE per batch — argmax-stable,
-    // not bit-exact (same contract the prefill batched trunk holds).
+    // Batched-decode matmul path (issue #190/#194). Default: the weight-stationary matvec
+    // (_gpu.MatMulBatchedWeightStationary) — token loop inside the block, so each weight HBM
+    // read is amortized across the batch AND the per-(row,token) reduction chain is identical
+    // to the GEMM-N matvec (bit-identical to the per-token decode oracle's kernels).
+    // SHARPI_BATCH_DECODE_WS=0 falls back to the #190 GEMM-N matvec (_gpu.MatMulBatched, grid
+    // Y = nTok: launch-overhead + L2 reuse only — the A/B baseline WS replaced).
+    // SHARPI_BATCH_DECODE_GEMM=1 routes the compute-bound GEMM/MMQ path (GpuMatMulBatchedCore)
+    // — argmax-stable, not bit-exact (same contract the prefill batched trunk holds).
     //
     // Measured on Qwen3-8B Q4_K_M @ 4070 Ti (aggregate t/s, single-user Forward = 75): GEMM-N
     // beats compute-bound at every realistic decode batch — N=1 70 vs 15, N=4 99 vs 57, N=8 106
     // vs 98 — because the compute-bound kernels carry large per-step fixed costs (int8 activation
     // conversion + the Q6_K output-weight fp16 dequant every step) that only amortize at the
-    // N=4096 scale prefill runs at. So GEMM-N is the default; the toggle is kept for very high
-    // concurrency (the curves converge near N=8, so compute-bound may overtake at N≳16).
+    // N=4096 scale prefill runs at. Weight-stationary keeps GEMM-N's near-zero fixed costs and
+    // adds the weight-read amortization GEMM-N lacks (#194).
     private readonly bool _batchDecodeComputeBound =
         Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_GEMM") == "1";
+    private readonly bool _batchDecodeWeightStationary =
+        Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_WS") != "0";
 
     // Empty (no-aliasing) layer set shared by every dense per-sequence cache CreateCache
     // hands out — dense models never share KV across layers (that's the Gemma 4 tail,
@@ -3147,14 +3151,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     private static IReadOnlyList<int> AsList(ReadOnlyMemory<int> mem) =>
         MemoryMarshal.TryGetArray(mem, out ArraySegment<int> seg) ? seg : mem.ToArray();
 
-    /// <summary>One batched-decode matmul, routed by <see cref="_batchDecodeComputeBound"/>:
-    /// the GEMM-N matvec (default) or the compute-bound GEMM/MMQ path that amortizes the weight
-    /// HBM read across the batch (the same routing <see cref="GpuMatMulBatchedCore"/> uses for
-    /// prefill).</summary>
+    /// <summary>One batched-decode matmul. Default: the weight-stationary small-N matvec
+    /// (#194 — weight HBM read amortized across the batch, bit-identical reduction to the
+    /// GEMM-N matvec; N=1 / N&gt;16 delegate to GEMM-N inside the backend).
+    /// SHARPI_BATCH_DECODE_WS=0: the #190 GEMM-N matvec. SHARPI_BATCH_DECODE_GEMM=1: the
+    /// compute-bound GEMM/MMQ path (the same routing <see cref="GpuMatMulBatchedCore"/> uses
+    /// for prefill) — argmax-stable only, kept as the A/B toggle for very high concurrency.</summary>
     private void BatchDecodeMatMul(Tensor outAll, Tensor weights, Tensor inAll, int n)
     {
         if (_batchDecodeComputeBound)
             GpuMatMulBatchedCore(outAll, weights, inAll, n);
+        else if (_batchDecodeWeightStationary)
+            _gpu.MatMulBatchedWeightStationary(outAll, weights, inAll, n, WDType(weights));
         else
             _gpu.MatMulBatched(outAll, weights, inAll, n, WDType(weights));
     }
@@ -3227,9 +3235,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
                 _gpu.CopyDevice(_bpResidual!, _bpHidden!);
                 _gpu.RmsNormBatched(_bpNorm!, _bpHidden!, _wAttnNorm[layer], N, embDim, _hp.RmsNormEps);
 
-                // Batched QKV. Default GEMM-N matvec (bit-closest to the per-token oracle);
-                // SHARPI_BATCH_DECODE_GEMM=1 routes the compute-bound GEMM/MMQ that amortizes
-                // the weight HBM read across the batch (argmax-stable, see BatchDecodeMatMul).
+                // Batched QKV. Default weight-stationary matvec (#194: weight read amortized
+                // across the batch, bit-identical reduction to the per-token oracle's kernels);
+                // SHARPI_BATCH_DECODE_WS=0 / SHARPI_BATCH_DECODE_GEMM=1 select the #190
+                // GEMM-N / compute-bound GEMM-MMQ alternatives (see BatchDecodeMatMul).
                 BatchDecodeMatMul(_bpQ!, _wq[layer], _bpNorm!, N);
                 BatchDecodeMatMul(_bpK!, _wk[layer], _bpNorm!, N);
                 BatchDecodeMatMul(_bpV!, _wv[layer]!, _bpNorm!, N);
