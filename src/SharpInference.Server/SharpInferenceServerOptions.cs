@@ -106,6 +106,26 @@ public sealed class SharpInferenceServerOptions
     /// </summary>
     public int MaxBatchSize { get; set; } = 1;
 
+    /// <summary>
+    /// Prompt tokens prefilled per batcher iteration under continuous batching
+    /// (issue #183 Gap 1). Active sequences advance one decode step between chunks, so
+    /// a long inbound prompt no longer freezes every in-flight generation. <c>0</c>
+    /// disables chunking (each prompt prefills in one blocking call). Only consulted
+    /// when <see cref="MaxBatchSize"/> &gt; 1. Mirrors <c>SHARPI_PREFILL_CHUNK</c>.
+    /// </summary>
+    public int PrefillChunkTokens { get; set; } = 256;
+
+    /// <summary>
+    /// KV-cache memory budget in MiB gating request admission under continuous batching
+    /// (issue #183 Gap 3). Each admitted sequence reserves
+    /// <c>promptTokens + max_tokens</c> worth of KV; when the next request would exceed
+    /// the budget it waits in the queue instead of risking memory exhaustion.
+    /// <c>0</c> = auto (half of available system RAM), negative = unlimited, positive =
+    /// explicit MiB. Only consulted when <see cref="MaxBatchSize"/> &gt; 1. Mirrors
+    /// <c>SHARPI_KV_BUDGET_MB</c>.
+    /// </summary>
+    public long KvBudgetMb { get; set; } = 0;
+
     // ── MoE expert-cache tuning ──────────────────────────────────────────────
     //
     // These knobs only have effect on Vulkan-hybrid MoE today; the engine reads them from

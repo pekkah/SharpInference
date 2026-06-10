@@ -19,6 +19,14 @@ builder.Services.AddSharpInference(builder.Configuration, opts =>
     if (int.TryParse(Environment.GetEnvironmentVariable("SHARPI_MAX_BATCH"), out int maxBatch) && maxBatch > 0)
         opts.MaxBatchSize = maxBatch;
 
+    // Continuous-batching scheduling knobs (issue #183): prefill chunk size (Gap 1)
+    // and KV admission budget in MiB (Gap 3). Same precedence as SHARPI_MAX_BATCH.
+    if (int.TryParse(Environment.GetEnvironmentVariable("SHARPI_PREFILL_CHUNK"), out int prefillChunk) && prefillChunk >= 0)
+        opts.PrefillChunkTokens = prefillChunk;
+
+    if (long.TryParse(Environment.GetEnvironmentVariable("SHARPI_KV_BUDGET_MB"), out long kvBudgetMb) && kvBudgetMb != 0)
+        opts.KvBudgetMb = kvBudgetMb;
+
     // SHARPI_BACKEND ∈ {auto, cpu, cuda, vulkan} — case-insensitive. Lets a
     // smoke test or ad-hoc run override the appsettings.Local.json backend
     // without editing the file (matches the SHARPI_MODEL pattern above).

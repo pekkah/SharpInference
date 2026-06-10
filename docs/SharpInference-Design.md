@@ -1942,6 +1942,44 @@ curl http://localhost:5000/v1/messages \
 
 **Tests**: 7 new tests in `ContinuousBatchingTests` covering `PrefillWithCache` correctness, `BatchForwardMulti` equivalence to sequential decode, concurrent engine requests, and dispose lifecycle. All 152 tests pass.
 
+#### Phase 7c follow-up: scheduling under concurrent load (issue #183, ✅ Complete)
+
+Three saturation gaps closed in the batcher (admission previously prefilled each prompt
+synchronously, stalling every active decode; no memory backpressure existed):
+
+- **Chunked / interleaved prefill (Gap 1)** — admitted prompts prefill
+  `prefillChunkTokens` (default 256, `SHARPI_PREFILL_CHUNK` / `PrefillChunkTokens`
+  option) per batcher iteration; every active sequence advances one
+  `BatchForwardMulti` decode step between chunks (Sarathi/vLLM-style). Cancellation
+  is honoured between chunks. `0` restores blocking prefill; SnapKV-enabled engines
+  fall back to blocking automatically (eviction scoring needs the whole prompt at
+  `startPos == 0`). Measured on SmolLM2 CPU (3 active decoders + 1040-token prompt
+  injection): worst decode stall 25.1 s → 7.9 s, ~12 % aggregate-throughput cost.
+  Smaller chunks cut the stall further but pay the per-GEMM weight-dequant cost more
+  often (CPU prefill collapsed 42 → 13 t/s at chunk 32) — 256 is the compromise.
+- **Packed multi-sequence prefill (Gap 2)** — `ForwardPass.PrefillPackedMulti(chunks,
+  startPos, caches, wantLogits)`: when several prompts are prefilling, their chunks
+  are concatenated into ONE packed batch (cu_seqlens-style: batched GEMMs over the
+  combined token count, per-token RoPE/append/attention against each sequence's own
+  cache, no padding, no cross-sequence attention). Logits are computed only for
+  chunks that complete a prompt. Same guards as `BatchForwardMulti` (no MoE /
+  TurboQuant / gemma4 per-layer head_dim).
+- **KV token-budget admission backpressure (Gap 3)** — each request reserves
+  `min(promptTokens + MaxNewTokens, MaxSeqLen)` KV tokens at admission
+  (`ForwardPass.KvBytesPerToken` converts a byte budget); when the head request
+  would exceed the budget it waits in a local FIFO instead of OOM-ing the host.
+  A lone oversized request is always admitted (no deadlock). Budget:
+  `kvBudgetBytes` ctor arg / `KvBudgetMb` option / `SHARPI_KV_BUDGET_MB`
+  (0 = auto: half of available RAM, negative = unlimited).
+- **Measured PCIe bandwidth** — `HardwareProfile.Detect(CudaBackend)` replaces the
+  VRAM-size-bucket guess with `CudaBackend.MeasurePcieBandwidthGBps()` (pinned
+  64 MiB `cudaMemcpy` probe, min of H2D/D2H, heuristic fallback). On the reference
+  RTX 4070 Ti box: measured ~26 GB/s vs the old 20 GB/s bucket.
+
+A/B harness: `dotnet run --project benchmarks/SharpInference.Bench -c Release -- --cb`
+(3 interactive decoders + injected long prompt; reports per-sequence inter-token gap
+percentiles and aggregate t/s for legacy vs chunked admission).
+
 ---
 
 #### Phase 8: API Completeness — Metrics, Observability, LogitBias (✅ Complete)

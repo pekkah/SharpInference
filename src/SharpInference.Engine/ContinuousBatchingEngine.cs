@@ -10,9 +10,15 @@ namespace SharpInference.Engine;
 ///
 /// Flow:
 ///   1. Caller enqueues requests via <see cref="GenerateChunksAsync"/>.
-///   2. Background batcher admits pending requests one at a time (prefilling each individually).
-///   3. All active sequences are decoded together in a single <see cref="ForwardPass.BatchForwardMulti"/> call.
-///   4. Sequences that hit EOS or max tokens are retired; their caches are returned to the pool.
+///   2. Background batcher admits pending requests under a KV token budget (issue #183 Gap 3:
+///      admission backpressure — a burst of long prompts queues instead of exhausting memory).
+///   3. Admitted prompts prefill in chunks interleaved with decode steps (issue #183 Gap 1:
+///      a long prompt no longer stalls every active sequence). When several prompts are
+///      prefilling at once, their chunks run as one packed forward pass
+///      (<see cref="ForwardPass.PrefillPackedMulti"/>, issue #183 Gap 2) so weight reads are
+///      amortized across prompts exactly like decode batching.
+///   4. All active sequences are decoded together in a single <see cref="ForwardPass.BatchForwardMulti"/> call.
+///   5. Sequences that hit EOS or max tokens are retired; their caches are returned to the pool.
 ///
 /// Not supported for MoE models or when TurboQuant KV cache is enabled.
 ///
@@ -29,6 +35,20 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
     private readonly int _maxBatchSize;
     private readonly int _thinkTokenId;
     private readonly int _endThinkTokenId;
+    private readonly bool _thinkingEnabled;
+
+    // Issue #183 Gap 1: tokens of prompt prefilled per batcher iteration. Between chunks
+    // every active sequence advances one decode step. 0 disables chunking (a prompt
+    // prefills in one blocking call — the pre-#183 behavior). SnapKV also disables
+    // chunking: its prefill eviction only runs on a fresh full-prompt prefill.
+    private readonly int _prefillChunkTokens;
+    private readonly bool _chunkingEnabled;
+
+    // Issue #183 Gap 3: max total KV tokens committed across admitted sequences. Each
+    // sequence reserves promptTokens + MaxNewTokens (clamped to MaxSeqLen) at admission
+    // and releases the reservation when it retires. long.MaxValue = unlimited.
+    private readonly long _kvTokenBudget;
+    private long _committedTokens; // batcher-thread only
 
     private readonly Channel<PendingRequest> _queue =
         Channel.CreateUnbounded<PendingRequest>(new UnboundedChannelOptions { SingleWriter = false, SingleReader = true });
@@ -45,6 +65,17 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         public readonly SamplingParams Sp = sp;
         public readonly CancellationToken Ct = ct;
         public readonly Channel<GenerateChunk> Output = output;
+        public int[]? Tokens; // memoized tokenization (admission may retry under backpressure)
+    }
+
+    /// <summary>A sequence whose prompt is being prefilled chunk-by-chunk.</summary>
+    private sealed class PrefillingSeq
+    {
+        public required PendingRequest Req;
+        public required int[] Tokens;
+        public required PagedKvCache Cache;
+        public required long ProjectedTokens; // KV budget reservation, released on retire
+        public int Consumed;                  // prompt tokens prefilled so far
     }
 
     private sealed class ActiveSeq
@@ -57,6 +88,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         public required System.Collections.Immutable.ImmutableArray<int> StopIds;
         public required Random Rng;
         public required CancellationToken Ct;
+        public required long ProjectedTokens;
         public int TokenCount;
         // Per-sequence stateful UTF-8 decoders: reassembles multi-byte characters
         // split across tokens (CJK, emoji, smart quotes). Independent decoders for
@@ -79,13 +111,23 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
     /// Token ID of the model's <c>&lt;/think&gt;</c> marker, or <c>-1</c>. Must be paired with
     /// a non-negative <paramref name="thinkTokenId"/> to enable reasoning-stream splitting.
     /// </param>
+    /// <param name="prefillChunkTokens">
+    /// Prompt tokens prefilled per batcher iteration (issue #183 Gap 1); active sequences
+    /// decode one step between chunks. <c>0</c> = prefill each prompt in one blocking call.
+    /// </param>
+    /// <param name="kvBudgetBytes">
+    /// KV-memory budget gating admission (issue #183 Gap 3). <c>0</c> = auto (half of
+    /// available system RAM), negative = unlimited, positive = explicit byte budget.
+    /// </param>
     public ContinuousBatchingEngine(
         ForwardPass fwd,
         ITokenizer tokenizer,
         string modelId,
         int maxBatchSize = 8,
         int thinkTokenId = -1,
-        int endThinkTokenId = -1)
+        int endThinkTokenId = -1,
+        int prefillChunkTokens = 256,
+        long kvBudgetBytes = 0)
     {
         _fwd = fwd;
         _tokenizer = tokenizer;
@@ -93,6 +135,21 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         _maxBatchSize = Math.Max(1, maxBatchSize);
         _thinkTokenId = thinkTokenId;
         _endThinkTokenId = endThinkTokenId;
+        _thinkingEnabled = thinkTokenId >= 0 && endThinkTokenId >= 0;
+
+        _prefillChunkTokens = prefillChunkTokens;
+        _chunkingEnabled = prefillChunkTokens > 0 && !fwd.SnapKvEnabled;
+
+        long budgetBytes = kvBudgetBytes switch
+        {
+            < 0 => long.MaxValue,
+            0 => GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / 2,
+            _ => kvBudgetBytes,
+        };
+        _kvTokenBudget = budgetBytes == long.MaxValue
+            ? long.MaxValue
+            : Math.Max(1, budgetBytes / Math.Max(1, fwd.KvBytesPerToken));
+
         _batcherTask = Task.Run(BatcherLoop);
     }
 
@@ -101,8 +158,11 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
     /// <summary>Number of requests queued but not yet being generated.</summary>
     public int QueueDepth => _pendingCount;
 
-    /// <summary>Number of requests currently in the active decode batch.</summary>
+    /// <summary>Number of requests currently being prefilled or decoded.</summary>
     public int ActiveRequests => _activeCount;
+
+    /// <summary>Total KV token budget gating admission (issue #183 Gap 3).</summary>
+    public long KvTokenBudget => _kvTokenBudget;
 
     /// <summary>
     /// Continuous batching does not (yet) share KV state across requests — each admitted
@@ -150,8 +210,18 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
 
         Interlocked.Increment(ref _pendingCount);
-        await _queue.Writer.WriteAsync(new PendingRequest(prompt, sp, ct, channel), ct)
-            .ConfigureAwait(false);
+        try
+        {
+            await _queue.Writer.WriteAsync(new PendingRequest(prompt, sp, ct, channel), ct)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            // Disposed concurrently (writer completed) or caller-cancelled before the
+            // write landed — undo the counter so QueueDepth doesn't drift.
+            Interlocked.Decrement(ref _pendingCount);
+            throw;
+        }
 
         await foreach (var chunk in channel.Reader.ReadAllAsync(ct).ConfigureAwait(false))
             yield return chunk;
@@ -159,31 +229,27 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
 
     private async Task BatcherLoop()
     {
+        var pending = new Queue<PendingRequest>();
+        var prefilling = new List<PrefillingSeq>();
         var active = new List<ActiveSeq>(_maxBatchSize);
         var tokensBuf = new int[_maxBatchSize];
         var posBuf = new int[_maxBatchSize];
         var cacheBuf = new PagedKvCache[_maxBatchSize];
-        bool thinkingEnabled = _thinkTokenId >= 0 && _endThinkTokenId >= 0;
 
         while (!_disposed)
         {
-            // Admit pending requests into available batch slots
-            while (active.Count < _maxBatchSize && _queue.Reader.TryRead(out var req))
-            {
-                Interlocked.Decrement(ref _pendingCount);
-                try
-                {
-                    AdmitRequest(req, active, thinkingEnabled);
-                }
-                catch (Exception ex)
-                {
-                    req.Output.Writer.TryComplete(ex);
-                }
-            }
+            // Pull everything queued so far into the local pending queue. Channels have
+            // no peek, and admission backpressure needs to inspect the head request's
+            // size without consuming it — hence the local FIFO.
+            while (_queue.Reader.TryRead(out var queued))
+                pending.Enqueue(queued);
 
-            if (active.Count == 0)
+            AdmitPending(pending, prefilling, active);
+
+            if (active.Count == 0 && prefilling.Count == 0)
             {
-                // No active work — wait for a new request
+                // No active work — wait for a new request. (Admission always starts the
+                // head request when nothing is running, so pending is empty here.)
                 try
                 {
                     bool hasMore = await _queue.Reader.WaitToReadAsync().ConfigureAwait(false);
@@ -195,6 +261,14 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                 }
                 continue;
             }
+
+            // Advance prefilling prompts by one chunk, then give every active sequence
+            // one decode step — the interleave that keeps decode from stalling.
+            if (prefilling.Count > 0)
+                RunPrefillStep(prefilling, active);
+
+            if (active.Count == 0)
+                continue;
 
             // Build batched inputs
             int n = active.Count;
@@ -219,7 +293,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                 // boundary branch below and is fed back as the next CurrentToken so the
                 // model continues from its post-think state on the next batched step.
                 int next;
-                if (thinkingEnabled && seq.InThinking && seq.Sp.MaxThinkingTokens > 0
+                if (_thinkingEnabled && seq.InThinking && seq.Sp.MaxThinkingTokens > 0
                     && seq.ThinkingCount >= seq.Sp.MaxThinkingTokens && _endThinkTokenId > 0)
                 {
                     next = _endThinkTokenId;
@@ -238,9 +312,8 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                 if (done)
                 {
                     FlushAndComplete(seq);
-                    seq.Cache.Dispose();
+                    RetireSeq(seq);
                     active.RemoveAt(i);
-                    Interlocked.Decrement(ref _activeCount);
                 }
                 else
                 {
@@ -248,20 +321,20 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                     // open, otherwise increment whenever seq.InThinking was true on entry to
                     // this step. That includes the </think> boundary token — so N reasoning
                     // tokens trip the force-close on step N+1.
-                    if (thinkingEnabled && next == _thinkTokenId) seq.ThinkingCount = 0;
+                    if (_thinkingEnabled && next == _thinkTokenId) seq.ThinkingCount = 0;
                     else if (seq.InThinking) seq.ThinkingCount++;
 
                     // Reasoning boundary tokens: flip state, consume the token, do NOT emit content.
                     // Each direction requires the opposite state, so malformed double <think>
                     // or orphan </think> falls through to the content path below.
-                    if (thinkingEnabled && next == _thinkTokenId && !seq.InThinking)
+                    if (_thinkingEnabled && next == _thinkTokenId && !seq.InThinking)
                     {
                         var textTail = seq.TextDec.Flush();
                         if (textTail.Length > 0)
                             seq.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, textTail));
                         seq.InThinking = true;
                     }
-                    else if (thinkingEnabled && next == _endThinkTokenId && seq.InThinking)
+                    else if (_thinkingEnabled && next == _endThinkTokenId && seq.InThinking)
                     {
                         var thinkTail = seq.ThinkDec.Flush();
                         if (thinkTail.Length > 0)
@@ -292,7 +365,25 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             }
         }
 
-        // Drain: complete any remaining active sequences
+        // Drain: complete everything still in flight. Pull any requests still sitting
+        // in the channel first — written between our last TryRead pass and the writer
+        // completing — or their output channels would never complete and the caller's
+        // await-foreach would hang.
+        while (_queue.Reader.TryRead(out var stranded))
+            pending.Enqueue(stranded);
+        foreach (var req in pending)
+        {
+            Interlocked.Decrement(ref _pendingCount);
+            req.Output.Writer.TryComplete();
+        }
+        pending.Clear();
+        foreach (var p in prefilling)
+        {
+            p.Req.Output.Writer.TryComplete();
+            p.Cache.Dispose();
+            Interlocked.Decrement(ref _activeCount);
+        }
+        prefilling.Clear();
         foreach (var seq in active)
         {
             FlushAndComplete(seq);
@@ -300,6 +391,202 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             Interlocked.Decrement(ref _activeCount);
         }
         active.Clear();
+    }
+
+    /// <summary>
+    /// Moves requests from the local pending queue into the prefilling set while batch
+    /// slots are free and the KV token budget allows (issue #183 Gap 3). FIFO: a
+    /// too-large head request blocks the queue until running sequences retire — except
+    /// when nothing is running, where it is always admitted so a single oversized
+    /// request can't deadlock the engine (it then fails in prefill if it truly can't fit).
+    /// </summary>
+    private void AdmitPending(Queue<PendingRequest> pending, List<PrefillingSeq> prefilling, List<ActiveSeq> active)
+    {
+        while (pending.Count > 0 && active.Count + prefilling.Count < _maxBatchSize)
+        {
+            var req = pending.Peek();
+            if (req.Ct.IsCancellationRequested)
+            {
+                pending.Dequeue();
+                Interlocked.Decrement(ref _pendingCount);
+                req.Output.Writer.TryComplete();
+                continue;
+            }
+
+            int[] tokens;
+            try
+            {
+                tokens = req.Tokens ??= _tokenizer.Encode(req.Prompt).ToArray();
+            }
+            catch (Exception ex)
+            {
+                pending.Dequeue();
+                Interlocked.Decrement(ref _pendingCount);
+                req.Output.Writer.TryComplete(ex);
+                continue;
+            }
+            if (tokens.Length == 0)
+            {
+                pending.Dequeue();
+                Interlocked.Decrement(ref _pendingCount);
+                req.Output.Writer.TryComplete();
+                continue;
+            }
+
+            long projected = Math.Min(
+                tokens.Length + Math.Max(0L, req.Sp.MaxNewTokens), _fwd.MaxSeqLen);
+            if (_committedTokens + projected > _kvTokenBudget
+                && (active.Count > 0 || prefilling.Count > 0))
+            {
+                break; // backpressure: re-evaluated next iteration as sequences retire
+            }
+
+            pending.Dequeue();
+            Interlocked.Decrement(ref _pendingCount);
+
+            PagedKvCache cache;
+            try
+            {
+                cache = _fwd.CreateCache();
+            }
+            catch (Exception ex)
+            {
+                req.Output.Writer.TryComplete(ex);
+                continue;
+            }
+
+            _committedTokens += projected;
+            prefilling.Add(new PrefillingSeq
+            {
+                Req = req,
+                Tokens = tokens,
+                Cache = cache,
+                ProjectedTokens = projected,
+            });
+            Interlocked.Increment(ref _activeCount);
+        }
+    }
+
+    /// <summary>
+    /// Advances prefilling prompts by one chunk budget (issue #183 Gap 1). With several
+    /// prompts in flight the chunk budget is split across them and run as one packed
+    /// forward pass (Gap 2) so weight reads amortize across prompts. Prompts whose final
+    /// chunk completes are sampled and promoted to the active decode set.
+    /// </summary>
+    private void RunPrefillStep(List<PrefillingSeq> prefilling, List<ActiveSeq> active)
+    {
+        // Cancellation sweep between chunks — a benefit chunking adds for free:
+        // a cancelled long-prompt request stops mid-prefill instead of running to the end.
+        for (int i = prefilling.Count - 1; i >= 0; i--)
+        {
+            var p = prefilling[i];
+            if (p.Req.Ct.IsCancellationRequested)
+            {
+                p.Req.Output.Writer.TryComplete();
+                DropPrefilling(prefilling, i);
+            }
+        }
+        if (prefilling.Count == 0) return;
+
+        if (!_chunkingEnabled)
+        {
+            // Unchunked path (prefillChunkTokens == 0, or SnapKV active — its prefill
+            // eviction only runs on a whole-prompt startPos==0 prefill). One prompt per
+            // iteration, blocking, exactly the pre-#183 behavior.
+            var p = prefilling[0];
+            float[] logits;
+            try
+            {
+                logits = _fwd.PrefillWithCache(p.Tokens, p.Cache).ToArray();
+            }
+            catch (Exception ex)
+            {
+                p.Req.Output.Writer.TryComplete(ex);
+                DropPrefilling(prefilling, 0);
+                return;
+            }
+            prefilling.RemoveAt(0);
+            ActivateSeq(p, logits, active);
+            return;
+        }
+
+        // Split this iteration's chunk budget across all prefilling prompts (≥1 token
+        // each). The budget bounds the decode stall per iteration regardless of how
+        // many prompts are prefilling, because the packed pass amortizes weights.
+        int sCount = prefilling.Count;
+        int perSeq = Math.Max(1, _prefillChunkTokens / sCount);
+
+        var chunks = new ReadOnlyMemory<int>[sCount];
+        var startPos = new int[sCount];
+        var caches = new PagedKvCache[sCount];
+        var wantLogits = new bool[sCount];
+        var takes = new int[sCount];
+        for (int s = 0; s < sCount; s++)
+        {
+            var p = prefilling[s];
+            int take = Math.Min(p.Tokens.Length - p.Consumed, perSeq);
+            chunks[s] = p.Tokens.AsMemory(p.Consumed, take);
+            startPos[s] = p.Consumed;
+            caches[s] = p.Cache;
+            wantLogits[s] = p.Consumed + take == p.Tokens.Length;
+            takes[s] = take;
+        }
+
+        float[]?[] logitsPerSeq;
+        try
+        {
+            if (sCount == 1)
+            {
+                var p = prefilling[0];
+                var segment = new ArraySegment<int>(p.Tokens, p.Consumed, takes[0]);
+                var logits = _fwd.PrefillWithCache(segment, p.Cache, startPos: p.Consumed);
+                logitsPerSeq = [wantLogits[0] ? logits.ToArray() : null];
+            }
+            else
+            {
+                logitsPerSeq = _fwd.PrefillPackedMulti(chunks, startPos, caches, wantLogits);
+            }
+        }
+        catch (Exception ex)
+        {
+            // A failed packed pass leaves the involved caches in an indeterminate state;
+            // fail every involved request rather than guessing which ones survived.
+            for (int i = prefilling.Count - 1; i >= 0; i--)
+            {
+                prefilling[i].Req.Output.Writer.TryComplete(ex);
+                DropPrefilling(prefilling, i);
+            }
+            return;
+        }
+
+        for (int s = sCount - 1; s >= 0; s--)
+        {
+            var p = prefilling[s];
+            p.Consumed += takes[s];
+            if (logitsPerSeq[s] is { } logits)
+            {
+                prefilling.RemoveAt(s);
+                ActivateSeq(p, logits, active);
+            }
+        }
+    }
+
+    /// <summary>Removes prefilling[i], disposing its cache and releasing its budget reservation.</summary>
+    private void DropPrefilling(List<PrefillingSeq> prefilling, int i)
+    {
+        var p = prefilling[i];
+        p.Cache.Dispose();
+        _committedTokens -= p.ProjectedTokens;
+        prefilling.RemoveAt(i);
+        Interlocked.Decrement(ref _activeCount);
+    }
+
+    /// <summary>Releases a retired decode sequence's cache and budget reservation.</summary>
+    private void RetireSeq(ActiveSeq seq)
+    {
+        seq.Cache.Dispose();
+        _committedTokens -= seq.ProjectedTokens;
+        Interlocked.Decrement(ref _activeCount);
     }
 
     private static void FlushAndComplete(ActiveSeq seq)
@@ -313,23 +600,15 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         seq.Output.Writer.TryComplete();
     }
 
-    private void AdmitRequest(PendingRequest req, List<ActiveSeq> active, bool thinkingEnabled)
+    /// <summary>
+    /// Promotes a fully prefilled prompt to the active decode set: samples the first
+    /// token from the prefill logits, seeds the reasoning state machine, and emits the
+    /// first chunk. A first token that is already a stop token completes the request
+    /// immediately.
+    /// </summary>
+    private void ActivateSeq(PrefillingSeq p, float[] logits, List<ActiveSeq> active)
     {
-        if (req.Ct.IsCancellationRequested)
-        {
-            req.Output.Writer.TryComplete();
-            return;
-        }
-
-        var tokens = _tokenizer.Encode(req.Prompt).ToArray();
-        if (tokens.Length == 0)
-        {
-            req.Output.Writer.TryComplete();
-            return;
-        }
-
-        var cache = _fwd.CreateCache();
-        ReadOnlySpan<float> logits = _fwd.PrefillWithCache(tokens, cache);
+        var req = p.Req;
 
         // Stop on ANY end-of-generation token, not just the configured EOS — matches the
         // single-user InferenceEngine path. A model with an alternate end token (e.g. Gemma's
@@ -345,7 +624,9 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         if (stopIds.Contains(firstToken))
         {
             req.Output.Writer.TryComplete();
-            cache.Dispose();
+            p.Cache.Dispose();
+            _committedTokens -= p.ProjectedTokens;
+            Interlocked.Decrement(ref _activeCount);
             return;
         }
 
@@ -354,9 +635,9 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         // via their chat template, so the model is already inside a reasoning
         // block before the first sampled token.
         bool promptInThinking = false;
-        if (thinkingEnabled)
+        if (_thinkingEnabled)
         {
-            foreach (int tok in tokens)
+            foreach (int tok in p.Tokens)
             {
                 if (tok == _thinkTokenId) promptInThinking = true;
                 else if (tok == _endThinkTokenId) promptInThinking = false;
@@ -366,13 +647,14 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         var seq = new ActiveSeq
         {
             CurrentToken = firstToken,
-            Position = tokens.Length,
-            Cache = cache,
+            Position = p.Tokens.Length,
+            Cache = p.Cache,
             Sp = req.Sp,
             Output = req.Output,
             StopIds = stopIds,
             Rng = rng,
             Ct = req.Ct,
+            ProjectedTokens = p.ProjectedTokens,
             TokenCount = 1,
             InThinking = promptInThinking,
         };
@@ -381,11 +663,11 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         // A `<think>` here without an open block opens one; a `</think>` while in a prompt-
         // seeded block closes it. A stray `</think>` outside a block falls through to
         // content (same fall-through as decode).
-        if (thinkingEnabled && firstToken == _thinkTokenId && !seq.InThinking)
+        if (_thinkingEnabled && firstToken == _thinkTokenId && !seq.InThinking)
         {
             seq.InThinking = true;
         }
-        else if (thinkingEnabled && firstToken == _endThinkTokenId && seq.InThinking)
+        else if (_thinkingEnabled && firstToken == _endThinkTokenId && seq.InThinking)
         {
             seq.InThinking = false;
         }
@@ -407,7 +689,6 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         }
 
         active.Add(seq);
-        Interlocked.Increment(ref _activeCount);
     }
 
     public void Dispose()

@@ -157,6 +157,10 @@ dotnet run --project src/SharpInference.Cli -c Release -- \
   -p "Write a binary search in Rust" --temp 0
 
 # API server (OpenAI /v1/chat/completions + Anthropic /v1/messages, port 5000)
+# Multi-user: SHARPI_MAX_BATCH=8 enables continuous batching (CPU backend). Long-prompt
+# admission prefills in SHARPI_PREFILL_CHUNK-token slices (default 256, 0 = blocking)
+# interleaved with decode, packed across prompts; SHARPI_KV_BUDGET_MB caps total KV
+# memory for admission backpressure (default: half of RAM). See issue #183.
 SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
   dotnet run --project src/SharpInference.Server.Host -c Release
 ```

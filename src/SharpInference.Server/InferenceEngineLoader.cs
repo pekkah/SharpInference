@@ -94,7 +94,9 @@ public static class InferenceEngineLoader
         if (opts.MaxBatchSize > 1 && batchingSupported && fwd is ForwardPass cpuFwd)
         {
             engine = new ContinuousBatchingEngine(cpuFwd, tokenizer, modelId, opts.MaxBatchSize,
-                thinkTokenId, endThinkTokenId);
+                thinkTokenId, endThinkTokenId,
+                prefillChunkTokens: opts.PrefillChunkTokens,
+                kvBudgetBytes: opts.KvBudgetMb > 0 ? opts.KvBudgetMb * 1024 * 1024 : opts.KvBudgetMb);
             // ContinuousBatchingEngine doesn't accept owned[] disposables; transfer
             // disposal responsibility by wrapping it in a composite disposable.
             engine = new OwnedDisposableEngine(engine, owned);

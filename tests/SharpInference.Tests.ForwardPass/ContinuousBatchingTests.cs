@@ -258,4 +258,235 @@ public sealed class ContinuousBatchingTests
         // The engine shut down without crashing — that's the invariant we care about.
         Assert.True(true);
     }
+
+    // ── Issue #183: chunked prefill, packed multi-seq prefill, KV budget ──
+
+    [Fact]
+    public void PrefillWithCache_Chunked_MatchesFull()
+    {
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        using var backend = new CpuBackend();
+
+        using var fwdRef = new Engine.ForwardPass(model, backend, hp);
+        using var fwdTest = new Engine.ForwardPass(model, backend, hp);
+
+        int[] tokens = [1, 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
+
+        using var refCache = fwdRef.CreateCache();
+        float[] refArr = fwdRef.PrefillWithCache(tokens, refCache).ToArray();
+
+        // Same prompt prefilled in 3 chunks via successive startPos calls — the
+        // continuation pattern the chunked-admission engine path uses (issue #183 Gap 1).
+        using var cache = fwdTest.CreateCache();
+        const int chunk = 5;
+        float[] testArr = [];
+        for (int start = 0; start < tokens.Length; start += chunk)
+        {
+            int take = Math.Min(chunk, tokens.Length - start);
+            var segment = new ArraySegment<int>(tokens, start, take);
+            testArr = fwdTest.PrefillWithCache(segment, cache, startPos: start).ToArray();
+        }
+
+        Assert.Equal(tokens.Length, cache.Length);
+        Assert.Equal(refArr.Length, testArr.Length);
+        // Chunk boundaries change GEMM batch sizes (different FP accumulation order),
+        // so assert close logits + same argmax rather than bit equality.
+        for (int i = 0; i < refArr.Length; i++)
+            Assert.Equal(refArr[i], testArr[i], precision: 2);
+        Assert.Equal(Sampler.Greedy(refArr), Sampler.Greedy(testArr));
+    }
+
+    [Fact]
+    public void PrefillPackedMulti_MatchesSequentialPrefill()
+    {
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        using var backend = new CpuBackend();
+
+        int[] promptA = [1, 2, 3, 5, 7, 11, 13];
+        int[] promptB = [4, 5, 6, 8];
+
+        // Reference: each prompt prefilled alone on its own ForwardPass instance.
+        float[] refA, refB;
+        using (var fwdRef = new Engine.ForwardPass(model, backend, hp))
+        {
+            using var cA = fwdRef.CreateCache();
+            refA = fwdRef.PrefillWithCache(promptA, cA).ToArray();
+            using var cB = fwdRef.CreateCache();
+            refB = fwdRef.PrefillWithCache(promptB, cB).ToArray();
+        }
+
+        // Test: both prompts in ONE packed forward pass.
+        using var fwdPacked = new Engine.ForwardPass(model, backend, hp);
+        using var cacheA = fwdPacked.CreateCache();
+        using var cacheB = fwdPacked.CreateCache();
+
+        float[]?[] packed = fwdPacked.PrefillPackedMulti(
+            [promptA.AsMemory(), promptB.AsMemory()],
+            [0, 0],
+            [cacheA, cacheB],
+            [true, true]);
+
+        Assert.Equal(promptA.Length, cacheA.Length);
+        Assert.Equal(promptB.Length, cacheB.Length);
+        Assert.NotNull(packed[0]);
+        Assert.NotNull(packed[1]);
+
+        for (int i = 0; i < refA.Length; i++)
+            Assert.Equal(refA[i], packed[0]![i], precision: 2);
+        for (int i = 0; i < refB.Length; i++)
+            Assert.Equal(refB[i], packed[1]![i], precision: 2);
+        Assert.Equal(Sampler.Greedy(refA), Sampler.Greedy(packed[0]!));
+        Assert.Equal(Sampler.Greedy(refB), Sampler.Greedy(packed[1]!));
+    }
+
+    [Fact]
+    public void PrefillPackedMulti_ChunkedContinuation_MatchesFull()
+    {
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        using var backend = new CpuBackend();
+
+        int[] promptA = [1, 2, 3, 5, 7, 11, 13];
+        int[] promptB = [4, 5, 6, 8];
+
+        float[] refA, refB;
+        using (var fwdRef = new Engine.ForwardPass(model, backend, hp))
+        {
+            using var cA = fwdRef.CreateCache();
+            refA = fwdRef.PrefillWithCache(promptA, cA).ToArray();
+            using var cB = fwdRef.CreateCache();
+            refB = fwdRef.PrefillWithCache(promptB, cB).ToArray();
+        }
+
+        // Two packed rounds: first a partial chunk of each prompt (no logits wanted),
+        // then the remainder (logits wanted) — the exact shape the engine produces when
+        // several prompts prefill chunk-by-chunk (issue #183 Gaps 1+2 combined).
+        using var fwdPacked = new Engine.ForwardPass(model, backend, hp);
+        using var cacheA = fwdPacked.CreateCache();
+        using var cacheB = fwdPacked.CreateCache();
+
+        float[]?[] round1 = fwdPacked.PrefillPackedMulti(
+            [promptA.AsMemory(0, 4), promptB.AsMemory(0, 2)],
+            [0, 0],
+            [cacheA, cacheB],
+            [false, false]);
+        Assert.Null(round1[0]);
+        Assert.Null(round1[1]);
+        Assert.Equal(4, cacheA.Length);
+        Assert.Equal(2, cacheB.Length);
+
+        float[]?[] round2 = fwdPacked.PrefillPackedMulti(
+            [promptA.AsMemory(4), promptB.AsMemory(2)],
+            [4, 2],
+            [cacheA, cacheB],
+            [true, true]);
+
+        Assert.Equal(promptA.Length, cacheA.Length);
+        Assert.Equal(promptB.Length, cacheB.Length);
+
+        for (int i = 0; i < refA.Length; i++)
+            Assert.Equal(refA[i], round2[0]![i], precision: 2);
+        for (int i = 0; i < refB.Length; i++)
+            Assert.Equal(refB[i], round2[1]![i], precision: 2);
+        Assert.Equal(Sampler.Greedy(refA), Sampler.Greedy(round2[0]!));
+        Assert.Equal(Sampler.Greedy(refB), Sampler.Greedy(round2[1]!));
+    }
+
+    [Fact]
+    public async Task ContinuousBatchingEngine_ChunkedPrefill_MatchesUnchunked()
+    {
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var backend = new CpuBackend();
+
+        const string prompt = "The capital of France is";
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 8 };
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(300));
+
+        // Reference: legacy blocking prefill (chunking disabled), single request.
+        string refText;
+        using (var fwdRef = new Engine.ForwardPass(model, backend, hp))
+        using (var engineRef = new ContinuousBatchingEngine(fwdRef, tokenizer, "test-model",
+                   maxBatchSize: 2, prefillChunkTokens: 0))
+        {
+            var sb = new System.Text.StringBuilder();
+            await foreach (var chunk in engineRef.GenerateAsync(prompt, sp, cts.Token))
+                sb.Append(chunk);
+            refText = sb.ToString();
+        }
+        Assert.False(string.IsNullOrEmpty(refText));
+
+        // Test: tiny chunk size + two concurrent identical requests so admission runs
+        // the packed multi-prompt prefill path between decode steps.
+        using var fwd = new Engine.ForwardPass(model, backend, hp);
+        using var engine = new ContinuousBatchingEngine(fwd, tokenizer, "test-model",
+            maxBatchSize: 4, prefillChunkTokens: 4);
+
+        var tasks = Enumerable.Range(0, 2).Select(_ => Task.Run(async () =>
+        {
+            var sb = new System.Text.StringBuilder();
+            await foreach (var chunk in engine.GenerateAsync(prompt, sp, cts.Token))
+                sb.Append(chunk);
+            return sb.ToString();
+        })).ToArray();
+
+        string[] results = await Task.WhenAll(tasks);
+
+        // Greedy decode of the same prompt must reproduce the unchunked output —
+        // decode-coherence assertion, not just "non-null" (see feedback memory).
+        Assert.Equal(refText, results[0]);
+        Assert.Equal(refText, results[1]);
+    }
+
+    [Fact]
+    public async Task ContinuousBatchingEngine_TinyKvBudget_AllRequestsComplete()
+    {
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata);
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var backend = new CpuBackend();
+        using var fwd = new Engine.ForwardPass(model, backend, hp);
+
+        // Budget of 16 KV tokens: one request (prompt ~2 + 4 new = ~6 projected) fits,
+        // three at once (≥18) do not — admission must serialize, not reject or OOM.
+        long budgetBytes = fwd.KvBytesPerToken * 16;
+        using var engine = new ContinuousBatchingEngine(fwd, tokenizer, "test-model",
+            maxBatchSize: 4, prefillChunkTokens: 4, kvBudgetBytes: budgetBytes);
+        Assert.Equal(16, engine.KvTokenBudget);
+
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 4 };
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(300));
+
+        var tasks = new[] { "Hello", "World", "Paris" }.Select(p => Task.Run(async () =>
+        {
+            var sb = new System.Text.StringBuilder();
+            await foreach (var chunk in engine.GenerateAsync(p, sp, cts.Token))
+                sb.Append(chunk);
+            return sb.ToString();
+        })).ToArray();
+
+        string[] results = await Task.WhenAll(tasks);
+
+        // All three complete despite the budget forcing serialized admission.
+        Assert.Equal(3, results.Length);
+        Assert.All(results, r => Assert.NotNull(r));
+    }
 }
