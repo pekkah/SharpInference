@@ -11,11 +11,17 @@ namespace SharpInference.Cuda;
 /// with (<c>nvrtc64_120_0</c>, see <see cref="NvrtcInterop"/>). The driver API
 /// (<c>nvcuda</c>) and CUDA-graph calls are version-independent. On a machine with
 /// several toolkits installed, the loader picks the first 12.x <c>bin</c> on PATH.
+/// <see cref="CudaLibraryResolver"/> can remap the pair to the CUDA 13 SONAMEs
+/// (opt-in via <c>SHARPI_CUDA13=1</c>, or automatically on 13-only installs).
 /// </summary>
 internal static partial class CuBlasInterop
 {
     static CuBlasInterop()
     {
+        // Must run before the first P/Invoke in this class binds, so the
+        // cudart/cublas major-version selection applies (see CudaLibraryResolver).
+        CudaLibraryResolver.Register();
+
         // CUDA 11.7+ defaults to lazy module loading: SASS for each kernel is JIT'd from
         // PTX on the first cuLaunchKernel, not at cuModuleLoadData time. For an LLM that
         // launches ~700 kernels per token, the cold-cache JIT cost lands in the middle
