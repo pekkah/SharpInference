@@ -37,6 +37,10 @@ internal sealed class CudaSequenceKvCache : ISequenceKvCache
 
     public CudaSequenceKvCache(CudaBackend gpu, Tensor[] k, Tensor[] v, IReadOnlySet<int> aliasedLayers)
     {
+        ArgumentNullException.ThrowIfNull(gpu);
+        ArgumentNullException.ThrowIfNull(k);
+        ArgumentNullException.ThrowIfNull(v);
+        ArgumentNullException.ThrowIfNull(aliasedLayers);
         _gpu = gpu;
         K = k;
         V = v;

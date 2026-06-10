@@ -3094,6 +3094,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     /// </summary>
     internal ReadOnlySpan<float> PrefillWithCache(IReadOnlyList<int> tokens, CudaSequenceKvCache cache, int startPos = 0)
     {
+        ArgumentNullException.ThrowIfNull(cache);
         ThrowIfBatchingUnsupported();
         if (tokens is null || tokens.Count == 0)
             throw new ArgumentException("Token list is empty", nameof(tokens));
@@ -3122,6 +3123,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     internal float[]?[] PrefillPackedMulti(
         ReadOnlyMemory<int>[] chunks, int[] startPos, CudaSequenceKvCache[] caches, bool[] wantLogits)
     {
+        ArgumentNullException.ThrowIfNull(chunks);
+        ArgumentNullException.ThrowIfNull(startPos);
+        ArgumentNullException.ThrowIfNull(caches);
+        ArgumentNullException.ThrowIfNull(wantLogits);
         ThrowIfBatchingUnsupported();
         int S = chunks.Length;
         if (S == 0) return Array.Empty<float[]?>();
@@ -3168,6 +3173,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     /// </summary>
     internal float[][] BatchForwardMulti(int[] tokens, int[] positions, CudaSequenceKvCache[] caches)
     {
+        ArgumentNullException.ThrowIfNull(tokens);
+        ArgumentNullException.ThrowIfNull(positions);
+        ArgumentNullException.ThrowIfNull(caches);
         ThrowIfBatchingUnsupported();
         int N = tokens.Length;
         if (N == 0) return Array.Empty<float[]>();
@@ -3188,19 +3196,21 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         // path, so the q/k/v/attn buffers are exactly N×qDim / N×kvDim with no padding stride.
         // (The O-projection bias add needs per-row hidden views too, but only when _hasAttnBias
         // — created inline in that rare branch so the common no-bias path allocates nothing extra.)
+        // Allocated INSIDE the try so a mid-loop View throw still frees the views taken so far.
         var qViews = new Tensor[N];
         var kViews = new Tensor[N];
         var vViews = new Tensor[N];
         var aViews = new Tensor[N];
-        for (int n = 0; n < N; n++)
-        {
-            qViews[n] = _gpu.View(_bpQ!, (long)n * qDim, qDim);
-            kViews[n] = _gpu.View(_bpK!, (long)n * kvDim, kvDim);
-            vViews[n] = _gpu.View(_bpV!, (long)n * kvDim, kvDim);
-            aViews[n] = _gpu.View(_bpAttnOut!, (long)n * qDim, qDim);
-        }
         try
         {
+            for (int n = 0; n < N; n++)
+            {
+                qViews[n] = _gpu.View(_bpQ!, (long)n * qDim, qDim);
+                kViews[n] = _gpu.View(_bpK!, (long)n * kvDim, kvDim);
+                vViews[n] = _gpu.View(_bpV!, (long)n * kvDim, kvDim);
+                aViews[n] = _gpu.View(_bpAttnOut!, (long)n * qDim, qDim);
+            }
+
             // 1. Embed each sequence's current token into the batched hidden buffer. (No
             //    embedding scale: the dense per-token Forward oracle applies none — that
             //    sqrt(embDim) factor is Gemma-only, which is out of scope here.)
@@ -3262,7 +3272,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
                     KvAppendKv(kv, vv, kc, vc, kvDim, pos, _maxSeqLen);
                     AttentionKv(qv, kc, vc, av, _attnScoresScratch,
                         _numHeads, _numKvHeads, _headDim, pos + 1, _maxSeqLen, _attnScale);
-                    caches[n].Length = pos + 1;
+                    // caches[n].Length is advanced once after the pass completes (below), not
+                    // here — a mid-pass throw then leaves the logical length unadvanced.
                 }
 
                 // Batched O-projection + residual. The attn-output bias is per-row, so it needs
@@ -3300,15 +3311,23 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
             {
                 result[n] = new float[vocab];
                 Array.Copy(_decodeLogitsHost!, (long)n * vocab, result[n], 0, vocab);
+                // Advance each sequence's logical length now that the append + attention for
+                // this token have completed and synchronized (transactional: a mid-pass throw
+                // leaves Length untouched).
+                caches[n].Length = positions[n] + 1;
             }
             return result;
         }
         finally
         {
+            // View arrays may be partially populated if a View call above threw — null-check
+            // each (Tensor is a ref type; Free(null) would NRE) so cleanup is exception-safe.
             for (int n = 0; n < N; n++)
             {
-                _gpu.Free(qViews[n]); _gpu.Free(kViews[n]);
-                _gpu.Free(vViews[n]); _gpu.Free(aViews[n]);
+                if (qViews[n] is { } qv) _gpu.Free(qv);
+                if (kViews[n] is { } kv) _gpu.Free(kv);
+                if (vViews[n] is { } vv) _gpu.Free(vv);
+                if (aViews[n] is { } av) _gpu.Free(av);
             }
         }
     }

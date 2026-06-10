@@ -132,6 +132,8 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         int prefillChunkTokens = -1,
         long kvBudgetBytes = 0)
     {
+        ArgumentNullException.ThrowIfNull(fwd);
+        ArgumentNullException.ThrowIfNull(tokenizer);
         _fwd = fwd;
         _tokenizer = tokenizer;
         ModelId = modelId;
