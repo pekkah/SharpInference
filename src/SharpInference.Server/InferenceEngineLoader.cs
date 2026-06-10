@@ -90,22 +90,33 @@ public static class InferenceEngineLoader
 
         // ── 5. Wrap in the right engine. ContinuousBatchingEngine takes the concrete
         // ForwardPass — it isn't built for the GPU / hybrid paths — so we honour
-        // MaxBatchSize > 1 only when batching is structurally possible.
+        // MaxBatchSize > 1 only when batching is structurally possible. Mirror the
+        // BuildForwardPass guard above: if an engine constructor throws, dispose everything
+        // in owned[] (the backend, the multi-GB forward pass, the GGUF handle) rather than
+        // leaking it — ownership only transfers once construction succeeds.
         IInferenceEngine engine;
-        if (opts.MaxBatchSize > 1 && batchingSupported && fwd is IBatchedForwardPass batchFwd)
+        try
         {
-            engine = new ContinuousBatchingEngine(batchFwd, tokenizer, modelId, opts.MaxBatchSize,
-                thinkTokenId, endThinkTokenId,
-                prefillChunkTokens: opts.PrefillChunkTokens,
-                kvBudgetBytes: opts.KvBudgetMb > 0 ? opts.KvBudgetMb * 1024 * 1024 : opts.KvBudgetMb);
-            // ContinuousBatchingEngine doesn't accept owned[] disposables; transfer
-            // disposal responsibility by wrapping it in a composite disposable.
-            engine = new OwnedDisposableEngine(engine, owned);
+            if (opts.MaxBatchSize > 1 && batchingSupported && fwd is IBatchedForwardPass batchFwd)
+            {
+                engine = new ContinuousBatchingEngine(batchFwd, tokenizer, modelId, opts.MaxBatchSize,
+                    thinkTokenId, endThinkTokenId,
+                    prefillChunkTokens: opts.PrefillChunkTokens,
+                    kvBudgetBytes: opts.KvBudgetMb > 0 ? opts.KvBudgetMb * 1024 * 1024 : opts.KvBudgetMb);
+                // ContinuousBatchingEngine doesn't accept owned[] disposables; transfer
+                // disposal responsibility by wrapping it in a composite disposable.
+                engine = new OwnedDisposableEngine(engine, owned);
+            }
+            else
+            {
+                engine = new InferenceEngine(fwd, tokenizer, modelId, thinkTokenId, endThinkTokenId,
+                    owned.ToArray());
+            }
         }
-        else
+        catch
         {
-            engine = new InferenceEngine(fwd, tokenizer, modelId, thinkTokenId, endThinkTokenId,
-                owned.ToArray());
+            foreach (var d in owned) try { d.Dispose(); } catch { /* fall through to rethrow */ }
+            throw;
         }
 
         return new LoadedEngine(engine, arch, tokenizer.ChatTemplate);
@@ -215,7 +226,13 @@ public static class InferenceEngineLoader
             {
                 var cfwd = new CudaForwardPass(model, cuda, hp, ctxSize, enableTurboQuant: turboQuant);
                 owned.Add(cfwd);
-                return (cfwd, BatchingSupported: false);
+                // Issue #190: dense CUDA full-offload supports continuous batching (per-sequence
+                // GPU KV caches + true batched decode). SupportsContinuousBatching is the single
+                // source of truth shared with CudaForwardPass's runtime guard, so the loader gate
+                // can't diverge from what the batched methods accept — it folds in MoE, Gemma-4
+                // (per-layer head_dim), TurboQuant, an auto/explicit SnapKV budget, a final-logit
+                // softcap, and any non-GEMM-N-batchable trunk/output weight dtype (Q4_0).
+                return (cfwd, cfwd.SupportsContinuousBatching);
             }
 
             var planForHybrid = TierPlanner.Plan(model, hp, hwProfile, turboQuant, requestedCtxSize: ctxSize)
