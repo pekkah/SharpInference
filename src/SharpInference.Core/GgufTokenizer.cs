@@ -435,18 +435,40 @@ public sealed class GgufTokenizer : ITokenizer
         var en = System.Globalization.StringInfo.GetTextElementEnumerator(text);
         while (en.MoveNext()) pieces.Add((string)en.Current);
 
-        int n = pieces.Count;
-        if (n == 0) return [];
+        var merged = SpmMergePieces(pieces, _spmMerges!);
 
-        // Symbol doubly-linked list over a flat slot array (llama.cpp llm_tokenizer_spm).
-        // The previous implementation rescanned every adjacent pair to find the single
-        // best merge and applied one merge per pass — O(n²), which made a 40k-token prompt
-        // take minutes to tokenize (the dominant server-request latency). This replaces it
-        // with a min-heap of merge candidates: O(n log n), bit-identical token output.
-        //
-        // Slots are never reused and a symbol's text only ever grows via merges, so a slot's
-        // current string Length uniquely identifies its state — used as an O(1) staleness
-        // check to discard queued candidates whose operands have since been merged away.
+        var ids = new List<int>(merged.Count);
+        foreach (var piece in merged)
+        {
+            if (_vocab.TryGetValue(piece, out int id))
+                ids.Add(id);
+            else if (UnknownTokenId >= 0)
+                ids.Add(UnknownTokenId);
+        }
+        return ids;
+    }
+
+    /// <summary>
+    /// Core SentencePiece merge: given starting symbols (one per code point) and a
+    /// bigram→rank merge table, repeatedly apply the lowest-rank adjacent merge (leftmost on
+    /// a rank tie) until none apply, returning the surviving pieces in order. Matches
+    /// llama.cpp's <c>llm_tokenizer_spm</c>.
+    ///
+    /// <para>O(n log n) via a min-heap of merge candidates over a symbol doubly-linked list.
+    /// The previous implementation rescanned every adjacent pair to find the single best merge
+    /// and applied one merge per pass — O(n²) — which made a 40k-token prompt take minutes to
+    /// tokenize (the dominant server-request latency). Slots are never reused and a symbol's
+    /// text only ever grows via merges, so a slot's current Length uniquely identifies its
+    /// state — used as an O(1) staleness check to discard queued candidates whose operands
+    /// have since merged away. <c>internal</c> so the parity tests can exercise it directly
+    /// with a synthetic merge table (no model file needed).</para>
+    /// </summary>
+    internal static List<string> SpmMergePieces(
+        List<string> pieces, IReadOnlyDictionary<(string, string), int> merges)
+    {
+        int n = pieces.Count;
+        if (n == 0) return pieces;
+
         var sym = new string?[n];
         var prev = new int[n];
         var next = new int[n];
@@ -465,7 +487,7 @@ public sealed class GgufTokenizer : ITokenizer
         {
             if (l < 0 || r < 0) return;
             if (sym[l] is not { } ls || sym[r] is not { } rs) return;
-            if (_spmMerges!.TryGetValue((ls, rs), out int rank))
+            if (merges.TryGetValue((ls, rs), out int rank))
                 pq.Enqueue((l, r, ls.Length, rs.Length), ((long)rank << 32) | (uint)l);
         }
 
@@ -493,16 +515,10 @@ public sealed class GgufTokenizer : ITokenizer
 
         // Walk the surviving symbols in order (slot 0 is always the live head — nothing
         // precedes it, so it is never removed as a right operand).
-        var ids = new List<int>();
+        var result = new List<string>();
         for (int s = 0; s >= 0; s = next[s])
-        {
-            if (sym[s] is not { } piece) continue;
-            if (_vocab.TryGetValue(piece, out int id))
-                ids.Add(id);
-            else if (UnknownTokenId >= 0)
-                ids.Add(UnknownTokenId);
-        }
-        return ids;
+            if (sym[s] is { } piece) result.Add(piece);
+        return result;
     }
 
     /// <summary>
