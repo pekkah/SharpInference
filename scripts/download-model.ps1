@@ -5,7 +5,7 @@
     Downloads from HuggingFace to the models/ directory. Skips if already present.
     Supports: smollm2, qwen3-8b, olmoe-1b-7b, llama31-70b, qwen3-coder-30b-a3b, qwen36-35b-a3b,
               qwen36-27b-mtp, qwen36-27b-mtp-q5, qwen36-35b-a3b-mtp, carnice-35b-a3b-mtp,
-              gemma4-12b-qat, gemma4-12b-q4km,
+              gemma4-12b-qat, gemma4-12b-q4km, gemma4-e4b-qat,
               llama4-scout, z-image-turbo, z-image-turbo-q8, realesrgan-x4
 .PARAMETER Model
     Which model to download. Default: downloads all text models (skips large image models).
@@ -23,6 +23,7 @@
     .\download-model.ps1 -Model carnice-35b-a3b-mtp -DestDir E:\models  # Carnice (Qwen3.6-35B-A3B-MTP, agentic/tool-calling) APEX-MTP I-Compact (17.3 GB)
     .\download-model.ps1 -Model gemma4-12b-qat -DestDir E:\models  # Gemma 4 12B-it QAT q4_0 (~7.0 GB) — issue #124 PRIMARY (official quantization-aware-trained)
     .\download-model.ps1 -Model gemma4-12b-q4km -DestDir E:\models # Gemma 4 12B-it Q4_K_M (~7.3 GB) — issue #124 fallback / K-quant cross-check
+    .\download-model.ps1 -Model gemma4-e4b-qat -DestDir E:\models  # Gemma 4 E4B-it QAT q4_0 (~5.15 GB) — fast small Gemma (~1.6× decode vs Q8_0)
     .\download-model.ps1 -Model llama4-scout            # Llama 4 Scout Q4_K_M (60.9 GB, 2 shards)
     .\download-model.ps1 -Model z-image-turbo           # Z-Image-Turbo Q5_K_M + abliterated encoder (~8.5 GB)
     .\download-model.ps1 -Model z-image-turbo-q8        # Z-Image-Turbo Q8_0 + abliterated encoder Q8_0 (~12 GB)
@@ -31,7 +32,7 @@
 param(
     [ValidateSet("smollm2", "qwen3-8b", "qwen3-0.6b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "qwen36-35b-a3b",
                  "qwen36-27b-mtp", "qwen36-27b-mtp-q5", "qwen36-35b-a3b-mtp", "carnice-35b-a3b-mtp",
-                 "gemma4-12b-qat", "gemma4-12b-q4km",
+                 "gemma4-12b-qat", "gemma4-12b-q4km", "gemma4-e4b-qat",
                  "llama4-scout", "z-image-turbo", "z-image-turbo-q8", "realesrgan-x4")]
     [string]$Model,
     [string]$DestDir
@@ -143,6 +144,18 @@ $Models = @{
         Size  = "~7.0 GB"
         SizeGB = 7.0
         Phase = "issue #124 (PRIMARY — QAT q4_0, dense no-PLE path)"
+    }
+    # Gemma 4 E4B-it — Google's official QAT q4_0 weights for the small (effective-4B)
+    # Gemma 4. ~5.15 GB vs the 8.19 GB Q8_0: ~1.6× fewer bytes/token → ~1.6× faster
+    # decode at near-identical quality (QAT). Same dense gemma4 arch (PLE + 5:1 SWA).
+    # Filename is upstream's `gemma-4-E4B_q4_0-it.gguf` (note the underscore — not the
+    # `-it-qat-q4_0` pattern of the 12B). The repo also ships an mmproj (vision) we skip.
+    "gemma4-e4b-qat" = @{
+        Files = @("gemma-4-E4B_q4_0-it.gguf")
+        Urls  = @("https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/resolve/main/gemma-4-E4B_q4_0-it.gguf")
+        Size  = "~5.15 GB"
+        SizeGB = 5.15
+        Phase = "Gemma 4 E4B QAT q4_0 (fast small Gemma — ~1.6× decode vs Q8_0)"
     }
     # Community K-quant of the (non-QAT) instruct weights — the Q4_K_M fallback /
     # cross-check next to the QAT q4_0 primary. Exercises the K-quant path so both
