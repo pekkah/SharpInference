@@ -430,30 +430,73 @@ public sealed class GgufTokenizer : ITokenizer
     /// </summary>
     private IReadOnlyList<int> EncodeSpm(string text)
     {
+        // Split into Unicode text elements (code points / graphemes), each a start symbol.
         var pieces = new List<string>(text.Length);
         var en = System.Globalization.StringInfo.GetTextElementEnumerator(text);
         while (en.MoveNext()) pieces.Add((string)en.Current);
 
-        while (true)
+        int n = pieces.Count;
+        if (n == 0) return [];
+
+        // Symbol doubly-linked list over a flat slot array (llama.cpp llm_tokenizer_spm).
+        // The previous implementation rescanned every adjacent pair to find the single
+        // best merge and applied one merge per pass — O(n²), which made a 40k-token prompt
+        // take minutes to tokenize (the dominant server-request latency). This replaces it
+        // with a min-heap of merge candidates: O(n log n), bit-identical token output.
+        //
+        // Slots are never reused and a symbol's text only ever grows via merges, so a slot's
+        // current string Length uniquely identifies its state — used as an O(1) staleness
+        // check to discard queued candidates whose operands have since been merged away.
+        var sym = new string?[n];
+        var prev = new int[n];
+        var next = new int[n];
+        for (int i = 0; i < n; i++)
         {
-            int bestIdx = -1;
-            int bestPriority = int.MaxValue;
-            for (int i = 0; i < pieces.Count - 1; i++)
-            {
-                if (_spmMerges!.TryGetValue((pieces[i], pieces[i + 1]), out int pri) && pri < bestPriority)
-                {
-                    bestPriority = pri;
-                    bestIdx = i;
-                }
-            }
-            if (bestIdx < 0) break;
-            pieces[bestIdx] = pieces[bestIdx] + pieces[bestIdx + 1];
-            pieces.RemoveAt(bestIdx + 1);
+            sym[i] = pieces[i];
+            prev[i] = i - 1;
+            next[i] = i + 1 < n ? i + 1 : -1;
         }
 
-        var ids = new List<int>(pieces.Count);
-        foreach (var piece in pieces)
+        // Priority packs merge rank (primary, lower wins — the merges-file order) with the
+        // left slot index (secondary, so ties resolve leftmost, matching the old linear scan).
+        var pq = new PriorityQueue<(int l, int r, int llen, int rlen), long>();
+
+        void TryAdd(int l, int r)
         {
+            if (l < 0 || r < 0) return;
+            if (sym[l] is not { } ls || sym[r] is not { } rs) return;
+            if (_spmMerges!.TryGetValue((ls, rs), out int rank))
+                pq.Enqueue((l, r, ls.Length, rs.Length), ((long)rank << 32) | (uint)l);
+        }
+
+        for (int i = 0; i + 1 < n; i++) TryAdd(i, i + 1);
+
+        while (pq.Count > 0)
+        {
+            var (l, r, llen, rlen) = pq.Dequeue();
+            // Skip a stale candidate: either operand already consumed (null) or grown (len
+            // changed), so this queued pair no longer reflects the current adjacency.
+            if (sym[l] is not { } ls || sym[r] is not { } rs || ls.Length != llen || rs.Length != rlen)
+                continue;
+
+            // Merge r into l and unlink r from the chain.
+            sym[l] = ls + rs;
+            sym[r] = null;
+            int nn = next[r];
+            next[l] = nn;
+            if (nn >= 0) prev[nn] = l;
+
+            // Re-evaluate the two adjacencies created around the merged symbol.
+            TryAdd(prev[l], l);
+            TryAdd(l, nn);
+        }
+
+        // Walk the surviving symbols in order (slot 0 is always the live head — nothing
+        // precedes it, so it is never removed as a right operand).
+        var ids = new List<int>();
+        for (int s = 0; s >= 0; s = next[s])
+        {
+            if (sym[s] is not { } piece) continue;
             if (_vocab.TryGetValue(piece, out int id))
                 ids.Add(id);
             else if (UnknownTokenId >= 0)
