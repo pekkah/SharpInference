@@ -421,19 +421,13 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // pinned so the capture rides the queued D2H stream (issue #30 draft chaining).
     private float* _mtpSelfHidden;
 
-    // Max tokens per BatchVerify call = ring slots + 1. SHARPI_MTP_BATCH_MAX in
-    // [2, 8] bounds the ring reservation. Default 2 (one slot): each slot costs
-    // ~149 MiB of VRAM that TryUploadDenseFfnLayers would otherwise fill with
-    // ~2 dense FFN layers, and the k=2 verify is the measured 27B optimum —
-    // deeper chains only pay once the CPU FFN amortizes more than pairwise
-    // (4-input MatVec follow-up). Instance-resolved so tests can override per
-    // construction.
-    private readonly int _mtpBatchMax = ResolveMtpBatchMax();
-    private static int ResolveMtpBatchMax()
-    {
-        var s = Environment.GetEnvironmentVariable("SHARPI_MTP_BATCH_MAX");
-        return s is not null && int.TryParse(s, out var v) ? Math.Clamp(v, 2, 8) : 2;
-    }
+    // Max tokens per BatchVerify call = ring slots + 1. Each slot costs ~149 MiB
+    // of VRAM that TryUploadDenseFfnLayers would otherwise fill with ~2 dense FFN
+    // layers, hence the conservative default; deeper chains only pay once the CPU
+    // FFN amortizes more than pairwise (4-input MatVec follow-up). Instance-resolved
+    // at construction so tests can override per instance; the knob semantics live
+    // in one place (GdnStateCache.ResolveMtpBatchMax) shared with the CPU pass.
+    private readonly int _mtpBatchMax = GdnStateCache.ResolveMtpBatchMax();
     // Token-2 host FFN scratch (intermediate gate/up post-MatVec2In, pre-SiLuMul).
     private readonly float* _cpuFfnGateBuf2;
     private readonly float* _cpuFfnUpBuf2;
@@ -1349,9 +1343,13 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 _cpuFfnUpBuf2    = Alloc(_intermDim);
             }
 
+            // Host snapshot buffer for BatchForward2's between-token capture — only
+            // the SHARPI_CPU_GDN=1 debug trunk uses it (the default GPU trunk's
+            // batched-verify snapshots live in the device ring); skip the ~150 MB
+            // host allocation otherwise.
             long perLayerBytes = _gdnStateCache.LayerSnapshotBytes;
             long totalSnapBytes = perLayerBytes * _gdnStateCache.NumGdnLayers;
-            if (totalSnapBytes > 0)
+            if (totalSnapBytes > 0 && _cpuGdn)
             {
                 _batchSnapshotBuf = (byte*)NativeMemory.Alloc((nuint)totalSnapBytes);
                 _batchSnapshotCap = totalSnapBytes;
@@ -3583,10 +3581,6 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // length counters still read startPos; fatal for this pass.
         _faulted = true;
         _batchSnapshotValid = false;
-        // Decode-sized batch: keep every batched matmul on the temp-free matvec
-        // re-stream (see GpuMatMulBatched). Cleared before returning; a mid-pass
-        // throw leaves it set, but _faulted already makes the pass unusable then.
-        _matVecBatchedOnly = true;
 
         var stream = _gpuStreamAll!;
 
@@ -3718,7 +3712,6 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             }
         }
 
-        _matVecBatchedOnly = false;
         _batchSnapshotValid = true;
         return result;
     }
@@ -3737,6 +3730,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (_gpuBvFfnAll is { } f) { _gpu.Free(f); _gpuBvFfnAll = null; }
         if (_bvNormHost != null) { CudaBackend.FreePinnedHost((nint)_bvNormHost); _bvNormHost = null; }
         if (_bvFfnHost != null) { CudaBackend.FreePinnedHost((nint)_bvFfnHost); _bvFfnHost = null; }
+        _bvCap = -1;   // a mid-sequence alloc failure must not leave a stale cap
+                       // matching a future k (early return on half-built scratch)
         long logitsTotal = (long)k * _hp.VocabSize;
         if (logitsTotal > int.MaxValue)
             throw new NotSupportedException(
@@ -5071,14 +5066,16 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // bit-parity oracle keeps the matvec path. Q4_K/Q6_K/Q5_K need 256-aligned cols;
         // Q8_0 needs 32 — true for every projection dim, but guarded so we fall back
         // (never throw) on an odd shape.
-        // Issue #30/#207 batched verify: the MMQ/dequant-GEMM compute path only
-        // amortizes its fixed per-call costs (whole-weight dequant to an fp16 temp
-        // for Q6_K/Q5_K — 71 MB per 27B FFN layer, ~600 MB for the lm_head) at
-        // prefill-scale N. At decode-sized k those temps land in WDDM-paged VRAM
-        // behind the post-fill 64 MiB margin and 5-10× every step. The verify path
-        // latches _matVecBatchedOnly so every batched matmul takes the temp-free
-        // matvec re-stream (the same decode kernels the sequential Forward uses).
-        if (GdnPrefillComputeEnabled && nTok > 1 && !_matVecBatchedOnly)
+        // The MMQ/dequant-GEMM compute path only amortizes its fixed per-call costs
+        // (whole-weight dequant to an fp16 temp for Q6_K/Q5_K — 71 MB per 27B FFN
+        // layer, ~600 MB for the lm_head; MMQ's activation re-quant) at prefill-scale
+        // N. At decode-sized N — the #30 batched verify (k ≤ 8 by SHARPI_MTP_BATCH_MAX)
+        // or a tiny prefill tail chunk — those temps land in WDDM-paged VRAM behind
+        // the post-fill 64 MiB margin and 5-10× every step (measured on the verify:
+        // 6.0 → 9.2 t/s from this threshold alone). Small N takes the temp-free
+        // matvec re-stream below — the same decode kernels sequential Forward uses,
+        // and the bit-exact reference path the compute kernels are validated against.
+        if (GdnPrefillComputeEnabled && nTok > MatMulComputeBatchMinN)
         {
             int cols = (int)(inputAll.ElementCount / nTok);
             switch (dt)
@@ -5095,9 +5092,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpu.MatMulBatched(outputAll, matrix, inputAll, nTok, dt);
     }
 
-    // True while BatchVerify drives the batched trunk: forces GpuMatMulBatched onto
-    // the matvec re-stream path (see the comment there). Never set on prefill.
-    private bool _matVecBatchedOnly;
+    // Crossover below which the MMQ/dequant-GEMM compute kernels' fixed per-call
+    // costs exceed the matvec re-stream's k× weight reads. 8 = the verify-batch
+    // ceiling; prefill chunks run at hundreds, so the regimes are well separated.
+    private const int MatMulComputeBatchMinN = 8;
 
     /// Issue #121: true when <paramref name="matrix"/>'s dtype is one of the dtypes
     /// <see cref="CudaBackend.MatMulBatched"/> implements a GEMM-N kernel for. Gates the

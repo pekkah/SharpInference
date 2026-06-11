@@ -43,8 +43,8 @@ coherent (`scripts/bench-all.ps1`); top-1 parity vs llama.cpp b8585 verified on 
 | Llama-4 Scout 17B-16E (MoE) | (same) | 61 GB | CUDA `-g -1` (hybrid) | 1.2 | 2.6 | 7 GPU + 41 CPU layers — model dwarfs the 12 GB card so CPU-only wins; per-expert SLRU streaming (#72/#77) still lifts both (not on bench machine) |
 | Qwen3.6-35B-A3B (GDN+MoE) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | 22 GB | CPU | 9.0 | 9.3 | hybrid GDN/attn, 256 experts / 8 active |
 | Qwen3.6-35B-A3B (GDN+MoE) | (same) | 22 GB | **CUDA** `-g -1` (hybrid) | **55.1** | **23.7** | 10 attn + 30 GDN on GPU; MoE auto-routed to CPU, shared expert on GPU overlapped with the routed loop. Fused GDN scan + batched-query SDPA (#114-B/#118), bit-identical, win grows with ctx. `SHARPI_CPU_MOE=0` forces on-GPU experts (#129 fused MoE-reduce kernel, +20% prefill) |
-| Qwen3.6-27B-MTP (GDN) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) | 16 GB | CPU `--no-thinking` | 3.2 | **3.8** | dense 27B GDN/attn + native MTP head; auto MTP self-spec (#25) at greedy + `--no-thinking`. 95% draft acceptance; batched N=2 verify (#30) over MTP-off |
-| Qwen3.6-27B-MTP (GDN) | (same) | 16 GB | **CUDA** `-g -1 --no-thinking` (hybrid) | **9.3** | **7.2** | 20/64 dense FFN on GPU + GDN/attn KV resident, 44/64 FFN CPU mmap. 95% acceptance; batched trunk + on-GPU dense-FFN (#119/#121), bit-identical |
+| Qwen3.6-27B-MTP (GDN) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) | 16 GB | CPU `--no-thinking` | 3.0 | **3.6** | dense 27B GDN/attn + native MTP head; auto MTP self-spec (#25) at greedy + `--no-thinking`. 90% draft acceptance; folded k-token batched verify (#30/#207) — 1.2× over MTP-off (3.0) |
+| Qwen3.6-27B-MTP (GDN) | (same) | 16 GB | **CUDA** `-g -1 --no-thinking` (hybrid) | **7.3** | **10.4** | 22/64 dense FFN on GPU + GDN/attn KV resident, 42/64 FFN CPU mmap. 90% acceptance; folded k-token batched verify + GDN snapshot ring (#30/#207) — **1.68× over MTP-off (6.4)**. Deeper chains: `--spec-draft-n-max N` + `SHARPI_MTP_BATCH_MAX=N+1` (~150 MiB VRAM/slot) |
 | Qwen3.6-27B-MTP (GDN) | (same) | 19 GB | CPU `--no-thinking` `Q5_K_M` | 2.8 | **3.5** | ~10% slower than Q4_K_M; 100% acceptance |
 | Qwen3.6-27B-MTP (GDN) | (same) | 19 GB | **CUDA** `-g -1 --no-thinking` `Q5_K_M` (hybrid) | 5.9 | **5.5** | 13/64 FFN on GPU, 51/64 CPU mmap. 98% acceptance; batched trunk (#119) bit-identical |
 | Qwen3.6-35B-A3B-MTP (GDN+MoE) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) | 22 GB | CPU `--no-thinking` | 9.1 | **8.5** | GDN/attn + 256-expert MoE + MTP head (#44). 100% acceptance; MoE-MTP batched verify (#45) — routed experts sequential per token, so ~MTP-off parity |
@@ -116,10 +116,14 @@ to ~5 t/s at 6K, so FastScan is ~1.9× decode there.
 
 Models with native MTP heads (Qwen3.6-27B-MTP, Qwen3.5/3.6 A3B-MTP, DeepSeek V3/R1) get self-speculative
 decoding with no separate draft model. It engages automatically when the pass reports `HasMtpHead`, sampling
-is greedy (`--temp 0`), and thinking is off (`--no-thinking`); the CLI prints `MTP accept: N%`. Batched N=2
-verify (#30) is the default for dense MTP; MoE MTP also batches the trunk while routed experts run per token
-(#45). CLI mirrors llama.cpp: `--spec-type`, `--spec-draft-n-max <1|2>`, `--spec-draft-p-min <0..1>`
-(lossy probabilistic accept). `SHARPI_DISABLE_MTP=1` / `SHARPI_DISABLE_BATCH_VERIFY=1` are the off-switches.
+is greedy (`--temp 0`), and thinking is off (`--no-thinking`); the CLI prints `MTP accept: N%`. The default is
+a folded k-token batched verify (#30/#207): the certain token plus a chained draft sequence run through ONE
+batched trunk pass per step, with rejections rolled back via a per-token GDN snapshot ring; a rejected draft's
+correction rides into the next step's batch, so no per-step commit forward exists. MoE MTP batches the trunk
+while routed experts run per token (#45). CLI mirrors llama.cpp: `--spec-type`, `--spec-draft-n-max <N>`
+(drafts/step; default 1 = the measured optimum — deeper chains also need `SHARPI_MTP_BATCH_MAX>=N+1` ring
+slots at ~150 MiB VRAM each), `--spec-draft-p-min <0..1>` (lossy probabilistic accept).
+`SHARPI_DISABLE_MTP=1` / `SHARPI_DISABLE_BATCH_VERIFY=1` are the off-switches.
 
 ### Chat-continuation cache
 

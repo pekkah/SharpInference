@@ -384,6 +384,20 @@ public sealed unsafe class GdnStateCache : IDisposable
     }
 
     /// <summary>
+    /// Resolve the SHARPI_MTP_BATCH_MAX knob: max tokens per batched-verify call
+    /// (= 1 + max MTP draft-chain length), which sizes the per-token-boundary GDN
+    /// snapshot ring at <c>value − 1</c> slots. Clamped to [2, 8]; default 2 — one
+    /// ring slot (~149 MB for 27B on either side of the PCIe bus), the measured
+    /// k=2 optimum until the CPU FFN amortizes more than pairwise. Shared by both
+    /// hybrid GDN passes so the knob means the same thing on every backend.
+    /// </summary>
+    public static int ResolveMtpBatchMax()
+    {
+        var s = Environment.GetEnvironmentVariable("SHARPI_MTP_BATCH_MAX");
+        return s is not null && int.TryParse(s, out var v) ? Math.Clamp(v, 2, 8) : 2;
+    }
+
+    /// <summary>
     /// Set <see cref="Length"/> explicitly. Used by the batched verify path (issue #30)
     /// to rewind length after a per-layer state restore — the per-layer copy does not
     /// itself carry a length header. Throws when negative.

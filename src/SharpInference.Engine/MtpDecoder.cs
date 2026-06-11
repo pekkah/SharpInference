@@ -192,6 +192,14 @@ public sealed class MtpDecoder
         if (Environment.GetEnvironmentVariable("SHARPI_TRACE_MTP") == "1")
             Console.Error.WriteLine(
                 $"[mtp] batched-verify {(batched ? $"ON (draftN={draftN}, maxBatch={_fwd.MaxBatchVerifyTokens})" : "OFF (cache compacted / unsupported config / disabled)")}");
+        // Surface a silent capability clamp (the pre-#30 code threw for draftN > 1;
+        // a server operator asking for a deeper chain than the snapshot ring allows
+        // should see WHY throughput matches a shallower setting).
+        if (batched && draftN > _fwd.MaxBatchVerifyTokens - 1)
+            Console.Error.WriteLine(
+                $"[mtp] requested draft chain {draftN} exceeds the snapshot-ring capacity; " +
+                $"clamping to {_fwd.MaxBatchVerifyTokens - 1} draft(s)/step " +
+                "(raise SHARPI_MTP_BATCH_MAX to reserve more ring slots).");
         if (batched)
         {
             DecodeBatched(maxTokens, stopTokenIds, emitToken, pMin, draftN, ct);
@@ -370,12 +378,20 @@ public sealed class MtpDecoder
             VerifyMs += _phaseSw.Elapsed.TotalMilliseconds;
 
             // ── Greedy accept: count leading agreeing drafts ──────────
+            // An accepted STOP draft also ends the chain here, EXCLUDED from `a`:
+            // like the sequential path, the stop token is neither emitted nor
+            // committed — clamping acceptance before the rollback below keeps
+            // every piece of state (trunk KV, GDN ring restore, MTP KV, hidden
+            // history, _nextPos) consistent at newPos, where the pre-#208-review
+            // emit-loop stop check returned with the caches stranded past _nextPos.
             int a = 0;
+            bool stopHit = false;
             for (int i = 1; i < kEff; i++)
             {
                 int target = ArgMax(batch[i - 1]);
-                if (AcceptDraft(tokens[i], target, batch[i - 1], pMin, out _)) a++;
-                else break;
+                if (!AcceptDraft(tokens[i], target, batch[i - 1], pMin, out _)) break;
+                if (IsStop(tokens[i], stopTokenIds)) { stopHit = true; break; }
+                a++;
             }
             _totalDraftsAccepted += a;
             int newPos = P + 1 + a;
@@ -405,28 +421,22 @@ public sealed class MtpDecoder
                 _ = _fwd.MtpForward(tokens[i], P + i, HiddenAtChecked(P + i - 1));
             DraftMs += _phaseSw.Elapsed.TotalMilliseconds;
 
-            // ── Emit accepted drafts ──────────────────────────────────
+            // ── Emit accepted drafts (stop drafts never reach here — the accept
+            //    loop clamps `a` before the first accepted stop) ────────
             for (int i = 1; i <= a; i++)
             {
-                if (IsStop(tokens[i], stopTokenIds))
-                {
-                    // Don't emit the stop; sync state to "after tokens[i-1]" for a
-                    // consistent follow-up. (The trunk cache may sit past _nextPos —
-                    // same benign overshoot class as the legacy stop-at-t2 path.)
-                    batch[i - 1].CopyTo(_savedMainLogits, 0);
-                    HiddenAtChecked(P + i - 1).CopyTo(_savedHidden);
-                    _nextPos = P + i;
-                    return;
-                }
                 emitToken(tokens[i]); generated++;
             }
 
             // ── Saved state for the next step ─────────────────────────
             // batch[a] predicts position newPos: it is the next certain token —
-            // the correction on a reject, the chain continuation on full accept.
+            // the correction on a reject, the chain continuation on full accept,
+            // or the (un-emitted, un-committed) stop on stopHit. All caches sit
+            // exactly at newPos, so a follow-up call resumes consistently.
             batch[a].CopyTo(_savedMainLogits, 0);
             HiddenAtChecked(newPos - 1).CopyTo(_savedHidden);
             _nextPos = newPos;
+            if (stopHit) return;
         }
     }
 
@@ -495,27 +505,10 @@ public sealed class MtpDecoder
         return (float)(Math.Exp(logits[idx] - max) / sumExp);
     }
 
-    private static int ArgMax(ReadOnlySpan<float> logits)
-    {
-        int best = 0;
-        float bestVal = logits[0];
-        for (int i = 1; i < logits.Length; i++)
-        {
-            if (logits[i] > bestVal) { bestVal = logits[i]; best = i; }
-        }
-        return best;
-    }
-
-    private static int ArgMax(float[] logits)
-    {
-        int best = 0;
-        float bestVal = logits[0];
-        for (int i = 1; i < logits.Length; i++)
-        {
-            if (logits[i] > bestVal) { bestVal = logits[i]; best = i; }
-        }
-        return best;
-    }
+    // Greedy selection delegates to the engine's single argmax implementation —
+    // spec-decode parity contracts hinge on draft selection, verification, and
+    // production sampling all breaking ties identically (first max wins).
+    private static int ArgMax(ReadOnlySpan<float> logits) => Sampler.Greedy(logits);
 
     private static bool IsStop(int token, ReadOnlySpan<int> stopTokenIds)
     {

@@ -152,15 +152,16 @@ public interface IForwardPass : IDisposable
     void PrefillMtp(IReadOnlyList<int> tokens, int startPos = 0) { }
 
     /// <summary>
-    /// True when this pass implements a batched verify path. Two consumers, two methods:
-    /// the MTP decoder dispatches to <see cref="BatchForward2"/> (two-token self-speculative
-    /// verify, issue #30 — implemented by the hybrid GDN passes), and the speculative
-    /// decoder dispatches to <see cref="BatchVerify"/> (k-token draft verification,
-    /// issue #207 — implemented by the rewindable dense passes). The consumers' own gates
-    /// keep the two method sets disjoint: the MTP decoder requires <see cref="HasMtpHead"/>
-    /// (GDN hybrids only), the speculative decoder requires
-    /// <see cref="SupportsPartialRewind"/> (which GDN hybrids never report). A pass that
-    /// returns <c>true</c> here must implement whichever method its reachable consumer calls.
+    /// True when this pass implements <see cref="BatchVerify"/>. Two consumers share the
+    /// method: the speculative decoder (k-token draft verification, issue #207 — rewindable
+    /// dense passes; rollback via <see cref="TruncateTo"/>) and the MTP decoder (k-token
+    /// self-speculative verify, issue #30 — hybrid GDN passes; rollback via
+    /// <see cref="RestoreBatchSnapshot"/> and the per-token GDN snapshot ring, batch size
+    /// capped by <see cref="MaxBatchVerifyTokens"/>). The consumers' own gates pick the
+    /// rollback mechanism: the MTP decoder requires <see cref="HasMtpHead"/> (GDN hybrids
+    /// only), the speculative decoder requires <see cref="SupportsPartialRewind"/> (which
+    /// GDN hybrids never report). GDN passes flip this false while the KV cache is
+    /// SnapKV-compacted (issue #130) — consumers re-check per step.
     /// </summary>
     bool SupportsBatchVerify => false;
 

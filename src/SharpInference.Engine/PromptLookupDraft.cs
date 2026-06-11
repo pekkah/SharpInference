@@ -74,7 +74,7 @@ public sealed class PromptLookupDraft
                 int start = i + n;
                 int count = Math.Min(maxTokens, len - start);
                 var proposal = new int[count];
-                for (int t = 0; t < count; t++) proposal[t] = h[start + t];
+                h.CopyTo(start, proposal, 0, count);
                 return proposal;
             }
         }

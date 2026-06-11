@@ -144,18 +144,11 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     // used as the next chained draft's prevHidden (issue #30 multi-token drafting).
     private float* _mtpSelfHidden;
 
-    // Max tokens per BatchVerify call (= 1 + max MTP draft chain length). The host
-    // snapshot ring grows lazily to k-1 slots of NumGdnLayers × LayerSnapshotBytes
-    // each (~149 MB/slot for 27B), so keep a sane ceiling. SHARPI_MTP_BATCH_MAX in
-    // [2, 8]; default matches the CUDA pass (k=2 is the measured optimum until the
-    // CPU FFN amortizes more than pairwise). Instance-resolved so tests can
-    // override per construction.
-    private readonly int _mtpBatchMax = ResolveMtpBatchMax();
-    private static int ResolveMtpBatchMax()
-    {
-        var s = Environment.GetEnvironmentVariable("SHARPI_MTP_BATCH_MAX");
-        return s is not null && int.TryParse(s, out var v) ? Math.Clamp(v, 2, 8) : 2;
-    }
+    // Max tokens per BatchVerify call (= 1 + max MTP draft chain length); the host
+    // snapshot ring grows lazily to k-1 slots. Instance-resolved at construction so
+    // tests can override per instance; the knob semantics live in one place
+    // (GdnStateCache.ResolveMtpBatchMax) shared with the CUDA pass.
+    private readonly int _mtpBatchMax = GdnStateCache.ResolveMtpBatchMax();
 
     // ── Dimensions (cached) ────────────────────────────────────────────
     private readonly int _embDim;
@@ -1380,14 +1373,17 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         return result;
     }
 
-    /// <summary>Grow the [k × embDim] batched-verify residual streams (grow-only).</summary>
+    /// <summary>Grow the [k × embDim] batched-verify residual streams (grow-only).
+    /// Fields are nulled before each re-allocation so a mid-sequence OOM leaves
+    /// null pointers (clean re-entry / Dispose) instead of dangling ones.</summary>
     private void EnsureBatchVerifyScratch(int k)
     {
         if (_bvCap >= k) return;
         nuint bytes = (nuint)((long)k * _embDim * sizeof(float));
-        if (_bvHiddenAll != null) NativeMemory.Free(_bvHiddenAll);
-        if (_bvResidAll != null) NativeMemory.Free(_bvResidAll);
-        if (_bvNormAll != null) NativeMemory.Free(_bvNormAll);
+        if (_bvHiddenAll != null) { NativeMemory.Free(_bvHiddenAll); _bvHiddenAll = null; }
+        if (_bvResidAll != null) { NativeMemory.Free(_bvResidAll); _bvResidAll = null; }
+        if (_bvNormAll != null) { NativeMemory.Free(_bvNormAll); _bvNormAll = null; }
+        _bvCap = 0;
         _bvHiddenAll = (float*)NativeMemory.AllocZeroed(bytes);
         _bvResidAll = (float*)NativeMemory.AllocZeroed(bytes);
         _bvNormAll = (float*)NativeMemory.AllocZeroed(bytes);
@@ -1395,13 +1391,15 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     }
 
     /// <summary>Grow the GDN snapshot ring to at least <paramref name="slots"/> slots
-    /// (grow-only; contents need not survive — the ring is rewritten every batch).</summary>
+    /// (grow-only; contents need not survive — the ring is rewritten every batch).
+    /// Same null-before-realloc discipline as <see cref="EnsureBatchVerifyScratch"/>.</summary>
     private void EnsureBatchSnapshotSlots(int slots)
     {
         if (_batchSnapshotSlots >= slots) return;
         long slotBytes = _gdnStateCache.LayerSnapshotBytes * _gdnStateCache.NumGdnLayers;
         if (slotBytes <= 0) { _batchSnapshotSlots = slots; return; }
-        if (_batchSnapshotBuf != null) NativeMemory.Free(_batchSnapshotBuf);
+        if (_batchSnapshotBuf != null) { NativeMemory.Free(_batchSnapshotBuf); _batchSnapshotBuf = null; }
+        _batchSnapshotSlots = 0;
         _batchSnapshotBuf = (byte*)NativeMemory.Alloc((nuint)(slotBytes * slots));
         _batchSnapshotCap = slotBytes * slots;
         _batchSnapshotSlots = slots;

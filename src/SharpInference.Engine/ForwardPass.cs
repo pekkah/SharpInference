@@ -1165,10 +1165,19 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
     /// Whether <see cref="BatchVerify"/> can run (issue #207): everything except the two
     /// configurations it throws for — the TurboQuant KV cache (compressed ring can't take
     /// the batched appends) and gemma4-style per-layer head_dim (not wired into the batched
-    /// trunk). MoE stays <c>true</c>: <see cref="BatchVerify"/> itself falls back to
-    /// sequential <see cref="Forward"/> calls for MoE, which is still correct.
+    /// trunk) — and a SnapKV-compacted cache. After <c>Compact</c> the physical slot count
+    /// (<see cref="PagedKvCache.Length"/>) sits below the logical RoPE position
+    /// (<see cref="PagedKvCache.LogicalLength"/>), but <see cref="BatchVerify"/> appends at
+    /// the LOGICAL position via <c>TruncateTo(startPos)</c>, which would declare slots
+    /// past the compacted length valid and read garbage K/V — same #130 gate the CUDA and
+    /// GDN passes already have; the sequential <see cref="Forward"/> fallback handles the
+    /// compacted frame correctly. MoE stays <c>true</c>: <see cref="BatchVerify"/> itself
+    /// falls back to sequential <see cref="Forward"/> calls for MoE, which is still correct.
     /// </summary>
-    public bool SupportsBatchVerify => _tqKvCache is null && _layerHeadDim is null;
+    public bool SupportsBatchVerify =>
+        _tqKvCache is null
+        && _layerHeadDim is null
+        && _kvCache.Length == _kvCache.LogicalLength;
 
     /// <summary>
     /// Batched verification for speculative decoding: processes <paramref name="tokens"/> starting

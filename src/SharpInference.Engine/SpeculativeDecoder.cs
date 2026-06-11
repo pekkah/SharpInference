@@ -300,27 +300,10 @@ public sealed class SpeculativeDecoder
         return result;
     }
 
-    private static int ArgMax(ReadOnlySpan<float> logits)
-    {
-        int best = 0;
-        float bestVal = logits[0];
-        for (int i = 1; i < logits.Length; i++)
-        {
-            if (logits[i] > bestVal) { bestVal = logits[i]; best = i; }
-        }
-        return best;
-    }
-
-    private static int ArgMax(float[] logits)
-    {
-        int best = 0;
-        float bestVal = logits[0];
-        for (int i = 1; i < logits.Length; i++)
-        {
-            if (logits[i] > bestVal) { bestVal = logits[i]; best = i; }
-        }
-        return best;
-    }
+    // Greedy selection delegates to the engine's single argmax implementation —
+    // spec-decode parity contracts hinge on draft selection, verification, and
+    // production sampling all breaking ties identically (first max wins).
+    private static int ArgMax(ReadOnlySpan<float> logits) => Sampler.Greedy(logits);
 
     private static bool IsStop(int token, ReadOnlySpan<int> stopTokenIds)
     {

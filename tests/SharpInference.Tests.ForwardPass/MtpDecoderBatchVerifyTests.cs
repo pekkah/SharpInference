@@ -216,12 +216,24 @@ public sealed class MtpDecoderBatchVerifyTests
     }
 
     [Fact]
-    public void StopToken_NotEmitted_DecodeEnds()
+    public void StopToken_NotEmitted_DecodeEnds_StateConsistent()
     {
         var pass = new ScriptedMtpPass(prefillLen: 10);
-        // Chain from 3: 3, 4, 5, 6, ... — stop at 6.
+        // Chain from 3: 3, 4, 5, 6, ... — stop at 6. Step 1 verifies [10, 14):
+        // t1=3@10, drafts 4@11, 5@12, 6@13; the accepted stop (6) clamps
+        // acceptance at a=2 → rollback to 13, emit 4 and 5, end decode.
         var emitted = Decode(pass, 10, firstToken: 3, maxTokens: 12, draftN: 3, stops: [6]);
         Assert.Equal(new List<int> { 3, 4, 5 }, emitted);
+
+        // The accepted-stop boundary must leave EVERY cache exactly at the last
+        // emitted position + 1 (13) — the stop is neither emitted nor committed.
+        // Pre-#208-review the trunk/MTP caches were stranded at P+1+a past
+        // _nextPos, poisoning the GDN recurrence for any follow-up use.
+        Assert.Equal(13, Assert.Single(pass.RestoreCalls));
+        Assert.Equal(13, pass.MainLen);
+        Assert.True(pass.MtpLen <= 13,
+            $"MTP KV must not hold positions past the stop boundary (len={pass.MtpLen}).");
+        Assert.Equal(13, pass.HistLen);
     }
 
     [Fact]

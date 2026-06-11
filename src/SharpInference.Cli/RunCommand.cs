@@ -768,12 +768,41 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         }
     }
 
+    /// <summary>
+    /// True when a prompt of <paramref name="promptTokens"/> tokens leaves no room to
+    /// speculate inside BOTH context windows (prompt + lookahead + 1 correction token).
+    /// Prints an actionable error: the typical trigger is the CUDA draft's 4096-token
+    /// KV ring cap when <c>-c</c> isn't pinned, where prefilling past the ring would
+    /// write K/V out of range and a tail prompt would silently emit zero tokens.
+    /// </summary>
+    private static bool SpecWindowExhausted(int promptTokens,
+        IForwardPass target, IForwardPass? draft, int lookahead)
+    {
+        int window = Math.Min(target.MaxSeqLen, draft?.MaxSeqLen ?? int.MaxValue);
+        if (promptTokens + lookahead + 1 < window) return false;
+        AnsiConsole.MarkupLine(
+            $"[red]Error:[/] prompt ({promptTokens} tokens) + lookahead ({lookahead}) does not fit the " +
+            $"speculative context window ({window} tokens" +
+            (draft is not null && draft.MaxSeqLen < target.MaxSeqLen
+                ? $", limited by the draft model's KV ring — pass -c to size it explicitly"
+                : "") +
+            "). Shorten the prompt, raise -c, or drop --draft-model/--draft-lookup.");
+        return true;
+    }
+
     private static int RunSpeculativeSinglePrompt(Settings s,
         IForwardPass target, IForwardPass? draft,
         GgufTokenizer tok, SamplingParams sp)
     {
         var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt, enableThinking: !s_noThinking);
         var tokens = tok.Encode(prompt);
+
+        // The prompt must fit BOTH context windows BEFORE any prefill runs — the
+        // draft's ring may be much smaller than the target's (the CUDA spec path
+        // caps it at 4096 when -c isn't pinned), and a too-long prompt would write
+        // K/V past the ring's end during draft.Prefill, not merely cap generation.
+        if (SpecWindowExhausted(tokens.Count, target, draft, s.SpecLookahead))
+            return 1;
 
         if (!s.NoDisplayPrompt)
             Console.Write(s.Prompt);
@@ -799,6 +828,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         // Bound generation by BOTH context windows (the draft's may be smaller — the CUDA
         // spec path caps its KV ring), leaving lookahead headroom for the last spec step.
+        // The guard above ensures maxNew >= 1 here.
         int maxNew = Math.Min(sp.MaxNewTokens,
             Math.Min(target.MaxSeqLen, draft?.MaxSeqLen ?? int.MaxValue) - tokens.Count - s.SpecLookahead - 1);
         if (maxNew < sp.MaxNewTokens)
@@ -847,6 +877,12 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
             var prompt = FormatPrompt(input, s.SystemPrompt, enableThinking: !s_noThinking);
             var tokens = tok.Encode(prompt);
+
+            // Same pre-prefill window guard as the single-prompt runner: the draft
+            // ring may be smaller than the target's window, and prefilling past it
+            // writes K/V out of range rather than just capping generation.
+            if (SpecWindowExhausted(tokens.Count, target, draft, s.SpecLookahead))
+                continue;
 
             target.ResetCache();
             draft?.ResetCache();
@@ -1006,22 +1042,28 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 if (mtpFwd is null || !mtpFwd.HasMtpHead) { rejectReason = "--spec-type mtp requires a model with an MTP head (nextn tensors)."; return false; }
                 if (sp.Temperature > 0f) { rejectReason = "--spec-type mtp requires greedy sampling (--temp 0)."; return false; }
                 if (!noThinking) { rejectReason = "--spec-type mtp requires --no-thinking (chat template must render with enable_thinking=false)."; return false; }
-                if (sp.SpecDraftNMax > maxDraftN)
-                {
-                    rejectReason = $"--spec-draft-n-max={sp.SpecDraftNMax} exceeds this pass's batched-verify capacity " +
-                                   $"({maxDraftN} drafts/step); raise SHARPI_MTP_BATCH_MAX (snapshot-ring slots) to go deeper.";
-                    return false;
-                }
+                WarnIfDraftNClamped(sp.SpecDraftNMax, maxDraftN);
                 return true;
             default: // Auto
-                if (eligible && sp.SpecDraftNMax > maxDraftN)
-                {
-                    rejectReason = $"--spec-draft-n-max={sp.SpecDraftNMax} exceeds this pass's batched-verify capacity " +
-                                   $"({maxDraftN} drafts/step); raise SHARPI_MTP_BATCH_MAX (snapshot-ring slots) to go deeper.";
-                    return false;
-                }
+                if (eligible)
+                    WarnIfDraftNClamped(sp.SpecDraftNMax, maxDraftN);
                 return eligible;
         }
+    }
+
+    /// <summary>
+    /// A draft chain deeper than the snapshot ring's capacity is CLAMPED, not rejected
+    /// (rejecting would disable MTP entirely and run SLOWER — the silent-baseline trap
+    /// the old SpecDraftNMax&gt;1 throw existed to prevent). Warn so the user knows the
+    /// effective depth and the knob that raises it; MtpDecoder clamps per step.
+    /// </summary>
+    private static void WarnIfDraftNClamped(int requested, int maxDraftN)
+    {
+        if (requested > maxDraftN)
+            AnsiConsole.MarkupLine(
+                $"[yellow]Note:[/] --spec-draft-n-max={requested} exceeds the snapshot-ring capacity; " +
+                $"running {maxDraftN} draft(s)/step. Set SHARPI_MTP_BATCH_MAX={requested + 1} to go deeper " +
+                "(each ring slot costs ~150 MiB VRAM on 27B-class models).");
     }
 
     // MTP self-speculative decode path. Reuses the same UTF-8 streaming + EmitToken
