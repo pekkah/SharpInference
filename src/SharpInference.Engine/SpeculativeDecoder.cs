@@ -3,14 +3,17 @@ using SharpInference.Core;
 namespace SharpInference.Engine;
 
 /// <summary>
-/// Speculative decoding (greedy): a small draft model generates K tokens which the target model
-/// verifies via a batched forward pass, accepting each where they agree and generating a
-/// correction token where they first diverge.
+/// Speculative decoding (greedy): a small draft model proposes tokens which the target model
+/// verifies via a batched forward pass, accepting each where they agree and correcting at the
+/// first divergence.
 ///
-/// Expected speedup: E[tokens/step] / E[target-forwards/step] where both equal
-/// (1-α^(k+1))/(1-α) for acceptance rate α, but target uses batched matmuls (k tokens in one
-/// Prefill-style call) reducing memory bandwidth from k×1 to approximately 1×batch.
-/// Typical speedup 1.3–2× depending on model size ratio and acceptance rate.
+/// Each step packs the CERTAIN next token (argmax of the saved target logits) together with
+/// k−1 draft proposals into ONE batched target pass (the llama.cpp formulation): the batch
+/// yields both the verification logits and the next step's saved logits, so the target runs
+/// exactly one batched pass per step — no separate correction-commit forward. On memory-bound
+/// decode paths the batched pass costs ~1–2× a single forward (issue #194/#207 weight
+/// amortization), so the speedup is ≈ E[tokens/step] / (cost_batch/cost_forward + draft
+/// overhead), with E[tokens/step] = 1 + E[accepted of k−1] for per-token acceptance α.
 ///
 /// Both target and draft must share the same tokenizer (same vocab size).
 /// Note: does NOT take ownership of the forward pass instances.
@@ -18,17 +21,47 @@ namespace SharpInference.Engine;
 public sealed class SpeculativeDecoder
 {
     private readonly IForwardPass _target;
-    private readonly IForwardPass _draft;
+    private readonly IForwardPass? _draft;          // model-draft mode
+    private readonly PromptLookupDraft? _lookup;    // prompt-lookup mode (issue #207)
+    private readonly bool _batchVerify;
     private int _lookahead;
 
-    // Generation state
+    // Generation state. Invariant at step boundaries: both caches hold exactly _nextPos
+    // positions and _savedTargetLogits are the target's logits after the token at
+    // _nextPos−1 (so argmax(_savedTargetLogits) is the next emitted token, by greedy
+    // construction). The draft's own last logits are not part of the state — each step's
+    // first proposal requires forwarding the certain token through the draft anyway.
     private int _nextPos;
     private float[] _savedTargetLogits;
-    private float[] _savedDraftLogits;
 
     // Acceptance statistics
     private long _totalAccepted;
     private long _totalEmitted;
+
+    // Phase timing (issue #207 bench reporting): cumulative wall time spent drafting,
+    // batch-verifying, and committing (truncate + correction forwards) across all steps.
+    private readonly System.Diagnostics.Stopwatch _phaseSw = new();
+
+    /// <summary>
+    /// Prompt-lookup mode (issue #207): proposals come from <paramref name="lookup"/>
+    /// (n-gram matches against prompt + generated history) instead of a draft model —
+    /// zero draft-forward cost, and a step with no match degrades to plain decode.
+    /// Initialize with the prompt-token overload so the lookup sees the prompt.
+    /// </summary>
+    public SpeculativeDecoder(IForwardPass target, PromptLookupDraft lookup, int lookahead = 4)
+    {
+        ArgumentNullException.ThrowIfNull(lookup);
+        if (!target.SupportsPartialRewind)
+            throw new ArgumentException(
+                $"Speculative decoding requires the target forward pass to support partial rewind; " +
+                $"{target.GetType().Name} does not.",
+                nameof(target));
+        _target = target;
+        _lookup = lookup;
+        _batchVerify = Environment.GetEnvironmentVariable("SHARPI_SPEC_BATCH_VERIFY") != "0";
+        _lookahead = Math.Max(1, lookahead);
+        _savedTargetLogits = new float[target.VocabSize];
+    }
 
     public SpeculativeDecoder(IForwardPass target, IForwardPass draft, int lookahead = 4)
     {
@@ -54,9 +87,14 @@ public sealed class SpeculativeDecoder
                 nameof(draft));
         _target = target;
         _draft = draft;
+        // Kill-switch (issue #207): SHARPI_SPEC_BATCH_VERIFY=0 forces the sequential
+        // verify fallback even when the target implements BatchVerify. Read once at
+        // construction (same pattern as the forward passes' decode toggles); the
+        // capability itself is re-checked per step — it can flip after construction
+        // (e.g. ForwardPass.EnableTurboQuant).
+        _batchVerify = Environment.GetEnvironmentVariable("SHARPI_SPEC_BATCH_VERIFY") != "0";
         _lookahead = Math.Max(1, lookahead);
         _savedTargetLogits = new float[target.VocabSize];
-        _savedDraftLogits = new float[draft.VocabSize];
     }
 
     /// <summary>Adaptive lookahead: increase/decrease based on recent acceptance rate.</summary>
@@ -69,20 +107,51 @@ public sealed class SpeculativeDecoder
     /// <summary>Running acceptance rate (accepted tokens / total emitted tokens).</summary>
     public float AcceptanceRate => _totalEmitted > 0 ? (float)_totalAccepted / _totalEmitted : 0f;
 
+    /// <summary>Cumulative milliseconds spent in the draft phase (k−1 draft forwards per step).</summary>
+    public double DraftMs { get; private set; }
+
+    /// <summary>Cumulative milliseconds spent batch-verifying with the target.</summary>
+    public double VerifyMs { get; private set; }
+
+    /// <summary>Cumulative milliseconds spent in cache truncation + draft-sync forwards.</summary>
+    public double CommitMs { get; private set; }
+
     /// <summary>
     /// Initialize the decoder after both models have processed the prompt.
     /// Call after prefilling both target and draft with the same prompt tokens.
     /// </summary>
     /// <param name="prefillLength">Number of prompt tokens (= new KV cache length).</param>
     /// <param name="targetLogits">Logits from the target's last prefill step (vocab-size span).</param>
-    /// <param name="draftLogits">Logits from the draft's last prefill step (vocab-size span).</param>
-    public void Initialize(int prefillLength, ReadOnlySpan<float> targetLogits, ReadOnlySpan<float> draftLogits)
+    /// <param name="draftLogits">Accepted for call-site compatibility but no longer consulted:
+    /// each step's first draft proposal requires forwarding the (certain) next token through
+    /// the draft anyway, which produces fresher logits than the prefill tail. The draft must
+    /// still be PREFILLED before calling this — its cache has to hold the prompt.</param>
+    public void Initialize(int prefillLength, ReadOnlySpan<float> targetLogits, ReadOnlySpan<float> draftLogits = default)
     {
         _nextPos = prefillLength;
         targetLogits.CopyTo(_savedTargetLogits);
-        draftLogits.CopyTo(_savedDraftLogits);
         _totalAccepted = 0;
         _totalEmitted = 0;
+        DraftMs = 0;
+        VerifyMs = 0;
+        CommitMs = 0;
+    }
+
+    /// <summary>
+    /// Prompt-lookup-mode initialization: seeds the lookup history with the prompt tokens
+    /// (proposals match against prompt + generated text). Call after prefilling the target.
+    /// </summary>
+    /// <param name="promptTokens">The prompt as fed to the target's prefill.</param>
+    /// <param name="targetLogits">Logits from the target's last prefill step.</param>
+    public void Initialize(IReadOnlyList<int> promptTokens, ReadOnlySpan<float> targetLogits)
+    {
+        if (_lookup is null)
+            throw new InvalidOperationException(
+                "Prompt-token initialization is only valid in prompt-lookup mode; " +
+                "use Initialize(prefillLength, targetLogits, draftLogits) with a draft model.");
+        ArgumentNullException.ThrowIfNull(promptTokens);
+        _lookup.Reset(promptTokens);
+        Initialize(promptTokens.Count, targetLogits);
     }
 
     /// <summary>
@@ -111,108 +180,114 @@ public sealed class SpeculativeDecoder
     }
 
     /// <summary>
-    /// Run one speculative step: draft k tokens, batch-verify with target, accept greedily.
-    /// Returns the emitted token array (accepted_count + 1 tokens, including the correction).
-    /// Updates internal state (_nextPos, _savedTargetLogits, _savedDraftLogits).
+    /// Run one speculative step (llama.cpp formulation): pack the certain next token with
+    /// k−1 draft proposals, batch-verify all k in ONE target pass, accept greedily.
+    /// Returns the emitted token array (1 + accepted tokens). Updates internal state
+    /// (_nextPos, _savedTargetLogits).
     /// </summary>
     private int[] Step(int k)
     {
         int P = _nextPos;
-        int vocabSize = _target.VocabSize;
+
+        // tokens[0] is CERTAIN (greedy argmax of the saved target logits — it would be
+        // emitted by plain decode too); tokens[1..] are draft proposals chained from it.
+        int n0 = ArgMax(_savedTargetLogits);
 
         // ── Draft phase ──────────────────────────────────────────────────────────
-        // d[0] is free: argmax of saved draft logits (no forward pass needed).
-        // d[1..k-1] require k-1 draft Forward calls, appending d[0..k-2] to draft cache.
-        var draftTokens = new int[k];
-        var draftLogitsPerPos = new float[k][];
-
-        draftLogitsPerPos[0] = _savedDraftLogits;
-        draftTokens[0] = ArgMax(_savedDraftLogits);
-
-        for (int i = 1; i < k; i++)
+        _phaseSw.Restart();
+        int[] tokens;
+        if (_lookup is not null)
         {
-            var logits = _draft.Forward(draftTokens[i - 1], P + i - 1);
-            draftLogitsPerPos[i] = new float[vocabSize];
-            logits.CopyTo(draftLogitsPerPos[i]);
-            draftTokens[i] = ArgMax(draftLogitsPerPos[i]);
-        }
-        // Draft cache is now at P + k - 1 (appended d[0..k-2]).
-
-        // ── Target batch-verify ──────────────────────────────────────────────────
-        // Process d[0..k-1] in one batched forward pass.
-        // targetLogitsFromBatch[i] = P_target(·|ctx + d[0..i]) (logits AFTER d[i]).
-        // After this call, target cache is at P + k.
-        float[][] targetLogitsFromBatch = BatchVerifyTarget(draftTokens, P);
-
-        // targetLogits[0]   = saved (before d[0])
-        // targetLogits[i+1] = after d[i]  (from batch)
-        // We use targetLogits[i] to verify d[i]: accept if argmax == d[i].
-
-        // ── Greedy accept/reject ─────────────────────────────────────────────────
-        int accepted = 0;
-        for (int i = 0; i < k; i++)
-        {
-            float[] tLogits = i == 0 ? _savedTargetLogits : targetLogitsFromBatch[i - 1];
-            if (ArgMax(tLogits) == draftTokens[i])
-                accepted++;
-            else
-                break;
-        }
-
-        // targetLogits at position `accepted` (logits for deciding correction token):
-        float[] correctionSourceLogits = accepted == k
-            ? targetLogitsFromBatch[k - 1]  // all accepted: logits after d[k-1]
-            : (accepted == 0 ? _savedTargetLogits : targetLogitsFromBatch[accepted - 1]);
-
-        int correction = ArgMax(correctionSourceLogits);
-
-        // Update acceptance stats
-        _totalAccepted += accepted;
-        _totalEmitted += accepted + 1;
-
-        // ── Truncate caches to accepted position ─────────────────────────────────
-        // Target is at P+k; truncate to P+accepted.
-        _target.TruncateTo(P + accepted);
-
-        // Draft is at P+k-1; truncate to P+accepted.
-        // For all-accepted (accepted == k): need to sync d[k-1] into draft first.
-        if (accepted == k)
-        {
-            // Draft phase only appended d[0..k-2]. Sync d[k-1] now.
-            _draft.Forward(draftTokens[k - 1], P + k - 1);
-            // Draft cache is now at P+k. No truncation needed before commit.
+            // Prompt-lookup: tokens[0] is certain, so it joins the history before
+            // matching; proposals are whatever the tail n-gram match yields (possibly
+            // none — then the step is a plain single-token decode).
+            _lookup.Append(n0);
+            int[] proposals = _lookup.Propose(k - 1);
+            tokens = new int[1 + proposals.Length];
+            tokens[0] = n0;
+            proposals.CopyTo(tokens, 1);
         }
         else
         {
-            _draft.TruncateTo(P + accepted);
+            // Model draft: k−1 draft forwards propose tokens[1..k-1]; the draft cache
+            // advances to P + k - 1 (appended tokens[0..k-2]).
+            tokens = new int[k];
+            tokens[0] = n0;
+            for (int i = 1; i < k; i++)
+            {
+                var logits = _draft!.Forward(tokens[i - 1], P + i - 1);
+                tokens[i] = ArgMax(logits);
+            }
+        }
+        DraftMs += _phaseSw.Elapsed.TotalMilliseconds;
+
+        // ── Target batch-verify ──────────────────────────────────────────────────
+        // One packed pass over tokens[0..k-1] at positions P..P+k-1.
+        // batch[i] = logits AFTER tokens[i]. Target cache advances to P + k.
+        _phaseSw.Restart();
+        float[][] batch = BatchVerifyTarget(tokens, P);
+        VerifyMs += _phaseSw.Elapsed.TotalMilliseconds;
+
+        // ── Greedy accept ────────────────────────────────────────────────────────
+        // tokens[i] (i ≥ 1) is accepted iff the target's logits after tokens[i-1]
+        // pick it. tokens[0] needs no check (it IS the target's pick).
+        int accepted = 0;
+        for (int i = 1; i < tokens.Length; i++)
+        {
+            if (ArgMax(batch[i - 1]) == tokens[i]) accepted++;
+            else break;
         }
 
-        // ── Commit correction to both caches ─────────────────────────────────────
-        int commitPos = accepted == k ? P + k : P + accepted;
-        var newTargetLogits = _target.Forward(correction, commitPos);
-        var newDraftLogits = _draft.Forward(correction, commitPos);
+        _totalAccepted += accepted;
+        _totalEmitted += accepted + 1;
+
+        // ── Roll both caches back to the last emitted token ──────────────────────
+        // Emitted: tokens[0..accepted] → new length newPos. The batch already holds the
+        // logits after the last emitted token (batch[accepted]) — they seed the next step,
+        // so NO separate correction forward is needed on the target.
+        _phaseSw.Restart();
+        int newPos = P + 1 + accepted;
+        _target.TruncateTo(newPos);
+
+        if (_lookup is not null)
+        {
+            // No draft cache to manage; record the accepted proposals (tokens[0] was
+            // appended before matching) so future tail n-grams can match them.
+            for (int i = 1; i <= accepted; i++) _lookup.Append(tokens[i]);
+        }
+        else if (accepted == tokens.Length - 1)
+        {
+            // Fully accepted: the draft never processed tokens[k-1] (its cache is at
+            // P+k-1 = newPos-1). Sync it so the next step's draft chain starts at newPos.
+            _draft!.Forward(tokens[^1], P + tokens.Length - 1);
+        }
+        else
+        {
+            _draft!.TruncateTo(newPos);
+        }
+        CommitMs += _phaseSw.Elapsed.TotalMilliseconds;
 
         // ── Update state ─────────────────────────────────────────────────────────
-        _nextPos = commitPos + 1;
-        newTargetLogits.CopyTo(_savedTargetLogits);
-        newDraftLogits.CopyTo(_savedDraftLogits);
+        _nextPos = newPos;
+        batch[accepted].CopyTo(_savedTargetLogits, 0);
 
-        // ── Build emitted token list: d[0..accepted-1] + correction ──────────────
+        // ── Emitted token list: the certain token + accepted proposals ───────────
         var emitted = new int[accepted + 1];
-        for (int i = 0; i < accepted; i++) emitted[i] = draftTokens[i];
-        emitted[accepted] = correction;
+        for (int i = 0; i <= accepted; i++) emitted[i] = tokens[i];
         return emitted;
     }
 
     /// <summary>
-    /// Batch-verify draft tokens with the target model.
-    /// If target is a ForwardPass, uses its batched BatchVerify for efficiency.
-    /// Falls back to sequential Forward calls otherwise.
+    /// Batch-verify draft tokens with the target model. Targets that report
+    /// <see cref="IForwardPass.SupportsBatchVerify"/> (CPU <see cref="ForwardPass"/>, dense
+    /// <c>CudaForwardPass</c> — issue #207) take the packed k-token pass, which amortizes
+    /// the weight reads k× on memory-bound decode paths. Everything else (and
+    /// <c>SHARPI_SPEC_BATCH_VERIFY=0</c>) falls back to k sequential Forward calls.
     /// </summary>
     private float[][] BatchVerifyTarget(int[] draftTokens, int startPos)
     {
-        if (_target is ForwardPass cpuTarget)
-            return cpuTarget.BatchVerify(draftTokens, startPos);
+        if (_batchVerify && _target.SupportsBatchVerify)
+            return _target.BatchVerify(draftTokens, startPos);
 
         // Generic fallback: sequential Forward calls
         var result = new float[draftTokens.Length][];
@@ -225,16 +300,10 @@ public sealed class SpeculativeDecoder
         return result;
     }
 
-    private static int ArgMax(float[] logits)
-    {
-        int best = 0;
-        float bestVal = logits[0];
-        for (int i = 1; i < logits.Length; i++)
-        {
-            if (logits[i] > bestVal) { bestVal = logits[i]; best = i; }
-        }
-        return best;
-    }
+    // Greedy selection delegates to the engine's single argmax implementation —
+    // spec-decode parity contracts hinge on draft selection, verification, and
+    // production sampling all breaking ties identically (first max wins).
+    private static int ArgMax(ReadOnlySpan<float> logits) => Sampler.Greedy(logits);
 
     private static bool IsStop(int token, ReadOnlySpan<int> stopTokenIds)
     {

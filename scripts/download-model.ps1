@@ -29,7 +29,7 @@
     .\download-model.ps1 -Model realesrgan-x4           # Real-ESRGAN x4plus upscaler (67 MB)
 #>
 param(
-    [ValidateSet("smollm2", "qwen3-8b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "qwen36-35b-a3b",
+    [ValidateSet("smollm2", "qwen3-8b", "qwen3-0.6b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "qwen36-35b-a3b",
                  "qwen36-27b-mtp", "qwen36-27b-mtp-q5", "qwen36-35b-a3b-mtp", "carnice-35b-a3b-mtp",
                  "gemma4-12b-qat", "gemma4-12b-q4km",
                  "llama4-scout", "z-image-turbo", "z-image-turbo-q8", "realesrgan-x4")]
@@ -49,6 +49,15 @@ $Models = @{
         Urls  = @("https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf")
         Size  = "4.9 GB"
         Phase = "2b-3"
+    }
+    # Qwen3-0.6B Q8_0 — speculative-decoding draft for Qwen3-8B (issue #207). Same
+    # tokenizer/vocab (151936) as Qwen3-8B; Q8_0 keeps draft quality high so the
+    # acceptance rate (and thus the spec-decode speedup) stays in the alpha 0.7-0.8 band.
+    "qwen3-0.6b" = @{
+        Files = @("Qwen3-0.6B-Q8_0.gguf")
+        Urls  = @("https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf")
+        Size  = "~0.6 GB"
+        Phase = "spec-decode draft (issue #207)"
     }
     # Smallest MoE model that fits in 12 GB VRAM for full-offload kernel validation.
     # OLMoE arch (allenai) — 7B total params, 1B active, 64 experts × 8 active, softmax routing.

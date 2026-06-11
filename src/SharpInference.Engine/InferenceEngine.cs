@@ -370,16 +370,12 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                             break;
                     }
 
-                    // --spec-draft-n-max parity with llama.cpp. Sharpi's MTP decoder
-                    // is sequential N=1 today; issue #30 (Phase-7 batched verify + per-token
-                    // GDN snapshot ring) is what unlocks N>1. Reject larger values up front
-                    // so users don't silently get the same throughput they'd get without
-                    // the flag.
-                    if (useMtp && sp.SpecDraftNMax > 1)
-                        throw new InvalidOperationException(
-                            $"SamplingParams.SpecDraftNMax={sp.SpecDraftNMax} is not yet supported. " +
-                            "Sharpi's MTP path is sequential N=1; issue #30 (Phase-7 batched verify) " +
-                            "lifts this. Pass --spec-draft-n-max 1 (or omit) until then.");
+                    // --spec-draft-n-max parity with llama.cpp (issue #30): the MTP
+                    // draft-chain length per step. Unset (0) resolves via
+                    // SHARPI_MTP_DRAFT_N → built-in default; MtpDecoder clamps per
+                    // step against the pass's snapshot-ring capacity
+                    // (MaxBatchVerifyTokens), so over-asking degrades gracefully.
+                    int mtpDraftN = MtpDecoder.ResolveDraftN(sp.SpecDraftNMax);
 
                     // Prefix cache decision: two branches.
                     //   (a) Rewindable attention pass — existing FindCacheablePrefix path,
@@ -495,7 +491,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                             if (chunk.Length > 0)
                                 channel.Writer.TryWrite(
                                     new GenerateChunk(GenerateChunkKind.Text, chunk));
-                        }, pMin: sp.SpecDraftPMin, ct: ct);
+                        }, pMin: sp.SpecDraftPMin, draftN: mtpDraftN, ct: ct);
 
                         var textFlushMtp = textDecMtp.Flush();
                         if (textFlushMtp.Length > 0)
@@ -507,7 +503,8 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         {
                             Console.Error.WriteLine(
                                 $"[InferenceEngine] MTP: {mtpDec.TotalDraftsAccepted}/{mtpDec.TotalDraftsEmitted} " +
-                                $"drafts accepted ({mtpDec.AcceptanceRate:P1})");
+                                $"drafts accepted ({mtpDec.AcceptanceRate:P1}); " +
+                                $"phase ms draft={mtpDec.DraftMs:F0} verify={mtpDec.VerifyMs:F0} commit={mtpDec.CommitMs:F0}");
                         }
 
                         // End-of-decode snapshot — see the non-MTP twin below for the

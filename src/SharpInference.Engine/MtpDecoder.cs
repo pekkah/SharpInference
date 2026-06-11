@@ -8,10 +8,19 @@ namespace SharpInference.Engine;
 /// is the MTP head of the same network — not a separate weights file — so
 /// the vocab, tokenizer, and trunk state are all shared.
 ///
-/// <para><b>Algorithm (v1, sequential N=1).</b></para>
+/// <para><b>Primary algorithm — folded k-token batched verify (issues #30/#207).</b>
+/// Per step, the certain next token (argmax of the saved main logits) plus a
+/// chain of <c>draftN</c> MTP proposals run through ONE
+/// <see cref="IForwardPass.BatchVerify"/> pass, which amortizes the trunk's
+/// weight reads k× on memory-bound decode. Leading drafts that match the
+/// verifier's argmax are emitted; on a rejection the trunk rolls back via the
+/// per-token GDN snapshot ring (<see cref="IForwardPass.RestoreBatchSnapshot"/>)
+/// and the correction token rides into the NEXT step's batch — the target never
+/// runs a separate correction forward. See <see cref="DecodeBatched"/>.</para>
 ///
-/// The main pass and the MTP head each maintain their own KV/state caches
-/// that advance in lockstep, one position per emitted token. Per iteration:
+/// <para><b>Fallback algorithm — sequential N=1</b> (<see cref="DecodeSequential"/>),
+/// used when the pass doesn't support batched verify (e.g. SnapKV-compacted
+/// cache, issue #130) or under <c>SHARPI_DISABLE_BATCH_VERIFY=1</c>. Per iter:</para>
 ///
 /// <list type="number">
 ///   <item><c>t1 = argmax(saved_main_logits)</c> — already correct by greedy
@@ -28,13 +37,9 @@ namespace SharpInference.Engine;
 ///         for the next iter.</item>
 /// </list>
 ///
-/// <para><b>Speedup envelope.</b></para>
-/// Sequential N=1 emits 2 tokens per 2 main forwards + 2 MTP forwards. With
-/// MTP ~1/64 the cost of a main forward, the per-iteration wall time is
-/// roughly the same as 2 baseline forwards — i.e. v1 is near-baseline, not
-/// 1.3×. Hitting the issue #25 acceptance criterion (≥1.3×) requires a
-/// batched main verify pass (Phase 7 optimization) plus a per-token GDN
-/// snapshot ring (Phase 11.7 / Risk #6). Both are tracked as follow-ups.
+/// <para>The sequential form emits 2 tokens per 2 main forwards — near-baseline
+/// throughput (the pre-#30 state). The batched form is what realizes the issue
+/// #25 ≥1.3× criterion.</para>
 ///
 /// <para><b>State invariants this class relies on.</b></para>
 /// <list type="bullet">
@@ -57,6 +62,21 @@ public sealed class MtpDecoder
     // Acceptance statistics (per Decode call cumulative)
     private long _totalDraftsEmitted;
     private long _totalDraftsAccepted;
+
+    // Phase timing (issue #207 bench reporting, mirrors SpeculativeDecoder):
+    // cumulative wall time in the MTP draft chain + KV refresh forwards, the
+    // batched main verify, and rollback/state sync. Uniform slowdown across all
+    // three phases under VRAM pressure indicates WDDM paging, not slow kernels.
+    private readonly System.Diagnostics.Stopwatch _phaseSw = new();
+
+    /// <summary>Cumulative ms in MTP head forwards (draft chain + KV refresh).</summary>
+    public double DraftMs { get; private set; }
+
+    /// <summary>Cumulative ms in the batched main verify passes.</summary>
+    public double VerifyMs { get; private set; }
+
+    /// <summary>Cumulative ms in snapshot rollback + saved-state sync.</summary>
+    public double CommitMs { get; private set; }
 
     public MtpDecoder(IForwardPass fwd)
     {
@@ -112,15 +132,38 @@ public sealed class MtpDecoder
         h.CopyTo(_savedHidden);
         _totalDraftsEmitted = 0;
         _totalDraftsAccepted = 0;
+        DraftMs = 0;
+        VerifyMs = 0;
+        CommitMs = 0;
+    }
+
+    /// <summary>
+    /// Resolve the effective MTP draft-chain length (proposed tokens per step) from the
+    /// llama.cpp-parity <c>--spec-draft-n-max</c> value. <c>&lt; 1</c> (unset) falls back
+    /// to <c>SHARPI_MTP_DRAFT_N</c>, then to the built-in default of 1 (a 2-token verify
+    /// batch — the measured 27B optimum: the GPU trunk's matvec re-stream scales linearly
+    /// with k while the CPU FFN only pair-amortizes, so deeper chains don't pay until a
+    /// 4-input CPU FFN kernel lands; see the issue #30 bench). Deeper chains also need
+    /// ring slots: raise <c>SHARPI_MTP_BATCH_MAX</c> alongside. The result is further
+    /// clamped per step against <see cref="IForwardPass.MaxBatchVerifyTokens"/>.
+    /// Shared by <see cref="InferenceEngine"/> and the CLI so both resolve identically.
+    /// </summary>
+    public static int ResolveDraftN(int specDraftNMax)
+    {
+        if (specDraftNMax >= 1) return specDraftNMax;
+        var s = Environment.GetEnvironmentVariable("SHARPI_MTP_DRAFT_N");
+        if (s is not null && int.TryParse(s, out var v) && v >= 1) return v;
+        return 1;
     }
 
     /// <summary>
     /// Decode up to <paramref name="maxTokens"/> tokens. Calls <paramref name="emitToken"/>
     /// for every accepted or correction token. Stops when a token in
     /// <paramref name="stopTokenIds"/> is generated (and does NOT emit the stop token).
-    /// Dispatches to the batched N=2 verify path (<see cref="DecodeBatched"/>) when the
-    /// underlying forward pass implements <see cref="IForwardPass.BatchForward2"/>;
-    /// otherwise falls back to the sequential N=1 algorithm.
+    /// Dispatches to the folded k-token batched verify path (<see cref="DecodeBatched"/>,
+    /// issues #30/#207) when the underlying forward pass implements
+    /// <see cref="IForwardPass.BatchVerify"/>; otherwise falls back to the sequential
+    /// N=1 algorithm.
     /// </summary>
     /// <param name="pMin">Min draft probability for probabilistic accept under MTP
     /// verification (llama.cpp's <c>--spec-draft-p-min</c>, issue #38). <c>1.0</c>
@@ -128,26 +171,38 @@ public sealed class MtpDecoder
     /// <c>p ∈ (0, 1)</c> also accepts when <c>softmax(target)[draft] &gt;= p</c>; the
     /// emitted token then equals the draft, which can differ from baseline greedy.
     /// <c>0.0</c> or negative is treated as <c>1.0</c>.</param>
+    /// <param name="draftN">MTP draft-chain length: proposed tokens per step (the verify
+    /// batch is <c>1 + draftN</c> wide — the certain token rides in the batch). Clamped
+    /// per step to <see cref="IForwardPass.MaxBatchVerifyTokens"/>, the remaining token
+    /// budget, and the context window. <c>1</c> reproduces the legacy N=2 behaviour.</param>
     public void Decode(int maxTokens, ReadOnlySpan<int> stopTokenIds, Action<int> emitToken,
                        float pMin = 1f,
+                       int draftN = 1,
                        CancellationToken ct = default)
     {
         // Treat 0 and negative as the default (argmax-match) for back-compat with
         // callers that left SpecDraftPMin at the previous default of 0f.
         if (pMin <= 0f) pMin = 1f;
-        // SupportsBatchVerify is evaluated once here and we commit to one path for the
-        // whole loop. Issue #130: it returns false when the KV cache is SnapKV-compacted,
-        // so an evicted cache routes to the eviction-safe sequential path. This relies on
-        // eviction being prefill-only (all ApplySnapKvEviction call sites are in Prefill) —
-        // if decode-time/rolling eviction is ever added, BatchForward2's precondition would
-        // need to handle a mid-loop compaction rather than this once-per-Decode gate.
-        bool batched = _fwd.SupportsBatchVerify;
+        draftN = Math.Max(1, draftN);
+        // Initial dispatch; DecodeBatched additionally re-checks the capability per
+        // step (#130: it flips false when the KV cache is SnapKV-compacted) and
+        // hands off to the sequential loop if it ever turns off mid-decode.
+        bool batched = _fwd.SupportsBatchVerify
+            && Environment.GetEnvironmentVariable("SHARPI_DISABLE_BATCH_VERIFY") != "1";
         if (Environment.GetEnvironmentVariable("SHARPI_TRACE_MTP") == "1")
             Console.Error.WriteLine(
-                $"[mtp] batched-verify {(batched ? "ON" : "OFF (cache compacted / unsupported config)")}");
+                $"[mtp] batched-verify {(batched ? $"ON (draftN={draftN}, maxBatch={_fwd.MaxBatchVerifyTokens})" : "OFF (cache compacted / unsupported config / disabled)")}");
+        // Surface a silent capability clamp (the pre-#30 code threw for draftN > 1;
+        // a server operator asking for a deeper chain than the snapshot ring allows
+        // should see WHY throughput matches a shallower setting).
+        if (batched && draftN > _fwd.MaxBatchVerifyTokens - 1)
+            Console.Error.WriteLine(
+                $"[mtp] requested draft chain {draftN} exceeds the snapshot-ring capacity; " +
+                $"clamping to {_fwd.MaxBatchVerifyTokens - 1} draft(s)/step " +
+                "(raise SHARPI_MTP_BATCH_MAX to reserve more ring slots).");
         if (batched)
         {
-            DecodeBatched(maxTokens, stopTokenIds, emitToken, pMin, ct);
+            DecodeBatched(maxTokens, stopTokenIds, emitToken, pMin, draftN, ct);
             return;
         }
         DecodeSequential(maxTokens, stopTokenIds, emitToken, pMin, ct);
@@ -237,118 +292,167 @@ public sealed class MtpDecoder
     }
 
     /// <summary>
-    /// Batched N=2 verify (issue #30). Per iter:
-    ///   t1 = argmax(saved_main_logits); emit t1
-    ///   t2_draft = argmax(MtpForward(t1, P, h_prev))
-    ///   BatchForward2(t1, t2_draft, P) → (l@P+1, l@P+2), LastHiddenT1 = h@P
-    ///   if argmax(l@P+1) == t2_draft: accept; saved_main_logits = l@P+2; emit t2_draft
-    ///   else: reject; RestoreBatchSnapshot(P+1); MtpTruncateTo(P+1);
-    ///         Forward(t2_target, P+1) → l@P+2; saved_main_logits = l@P+2; emit t2_target
-    ///   MtpForward(t2_emitted, P+1, LastHiddenT1)  # commit MTP at P+1
-    ///   _savedHidden = LastHidden   # h@P+1 ready for next iter
+    /// Folded k-token batched verify (issues #30 / #207 goal 4 — the llama.cpp /
+    /// SpeculativeDecoder formulation). Per step, with k = 1 + min(draftN, budget):
+    /// <code>
+    ///   t1 = argmax(saved_main_logits); emit t1                       // CERTAIN token
+    ///   tokens = [t1, d1..d_{k-1}]   d_i chained via MtpForward      // d1 from h@P-1,
+    ///                                                                 // d_{i>1} from MtpLastHidden
+    ///   batch = BatchVerify(tokens, P)        // ONE pass; batch[i] = logits after tokens[i]
+    ///   a = count of leading d_i with Accept(d_i, batch[i-1])
+    ///   if a &lt; k-1: RestoreBatchSnapshot(P + 1 + a)               // GDN ring + KV rewind
+    ///   MtpTruncateTo(P+1); re-run MtpForward for d_1..d_a with trunk hiddens (HiddenAt)
+    ///   emit d_1..d_a
+    ///   saved_main_logits = batch[a]          // the correction (or next certain token)
+    ///   _savedHidden = HiddenAt(P + a); _nextPos = P + 1 + a
+    /// </code>
+    /// The rejected-path correction token is argmax(batch[a]) — it rides into the NEXT
+    /// step's batch as t1, so the trunk runs exactly one batched pass per step and no
+    /// separate correction forward exists (the #207 lesson: a per-step commit forward
+    /// erases the batching win). At draftN=1 this emits exactly the legacy N=2
+    /// sequence: every emitted token is argmax of main logits when pMin == 1.
     /// </summary>
     private void DecodeBatched(int maxTokens, ReadOnlySpan<int> stopTokenIds, Action<int> emitToken,
-                               float pMin, CancellationToken ct)
+                               float pMin, int draftN, CancellationToken ct)
     {
         bool trace = Environment.GetEnvironmentVariable("SHARPI_TRACE_MTP") == "1";
-        // Per-iter copy of h@P (LastHiddenT1) so MtpForward's scratch can't
-        // disturb the slice between batched verify and MTP commit. Sized to the
-        // embedding dim (length of _savedHidden); allocated once outside the loop.
-        Span<float> hAtPCopy = new float[_savedHidden.Length];
+        // Draft-chain hidden scratch: MtpLastHidden points into pass scratch that the
+        // next MtpForward overwrites, so the chain copies it out between calls.
+        var chainHidden = new float[_savedHidden.Length];
         int generated = 0;
         while (generated < maxTokens)
         {
             ct.ThrowIfCancellationRequested();
 
+            int P = _nextPos;
+            // Step sizing: the batch holds t1 + the draft chain, bounded by the
+            // remaining token budget (a step never verifies tokens it can't emit),
+            // the pass's snapshot-ring capacity, and the context window.
+            int kEff = Math.Min(1 + draftN, maxTokens - generated);
+            kEff = Math.Min(kEff, _fwd.MaxBatchVerifyTokens);
+            kEff = Math.Min(kEff, _fwd.MaxSeqLen - P);
+
+            // Per-step capability re-check (#130: SnapKV compaction turns it off).
+            // kEff < 2 also routes here: a 1-token "batch" is just a plain decode
+            // step, which the sequential loop already implements.
+            if (kEff < 2 || !_fwd.SupportsBatchVerify)
+            {
+                DecodeSequential(maxTokens - generated, stopTokenIds, emitToken, pMin, ct);
+                return;
+            }
+
             // ── Token 1: argmax of last main logits (greedy correctness) ──
             int t1 = ArgMax(_savedMainLogits);
             if (IsStop(t1, stopTokenIds)) return;
             emitToken(t1); generated++;
-            if (generated >= maxTokens) return;
 
-            // ── MTP draft for position P+1 ────────────────────────────
-            int P = _nextPos;
-            ReadOnlySpan<float> mtpLogits = _fwd.MtpForward(t1, P, _savedHidden);
-            int t2Draft = ArgMax(mtpLogits);
-            float t2DraftLogit = mtpLogits[t2Draft];
-            _totalDraftsEmitted++;
-
-            // ── Batched main verify (advances main caches through t1 + t2_draft) ─
-            _fwd.BatchForward2(t1, t2Draft, P,
-                out ReadOnlySpan<float> l_atPplus1,
-                out ReadOnlySpan<float> l_atPplus2);
-            int t2Target = ArgMax(l_atPplus1);
-
-            // Snapshot LastHiddenT1 — h@P (t1's pre-output-norm hidden). Needed for
-            // the MTP commit at P+1 regardless of accept/reject. We copy out now
-            // because a subsequent Forward (reject path) doesn't overwrite it but
-            // the value's tied to the batched forward's scratch.
-            var hAtP = _fwd.LastHiddenT1;
-            if (hAtP.Length != _savedHidden.Length)
-                throw new InvalidOperationException(
-                    $"LastHiddenT1 length {hAtP.Length} != EmbeddingDim {_savedHidden.Length}.");
-            // Use a local copy so MtpForward (which writes its own scratch) can't
-            // disturb the slice between now and the commit call.
-            hAtP.CopyTo(hAtPCopy);
-
-            ReadOnlySpan<float> mainLogitsAfter;
-            int t2;
-            bool accept = AcceptDraft(t2Draft, t2Target, l_atPplus1, pMin,
-                                      out float draftProbInMain);
-            if (accept)
+            // ── MTP draft chain: kEff−1 proposals ─────────────────────
+            // d1 is conditioned on the trunk's h@P-1; deeper drafts self-chain on
+            // the MTP block's own output hidden (NEXTN/EAGLE-style — verification
+            // corrects any quality loss, so this only affects acceptance rate).
+            _phaseSw.Restart();
+            var tokens = new int[kEff];
+            tokens[0] = t1;
+            ReadOnlySpan<float> prevH = _savedHidden;
+            for (int i = 1; i < kEff; i++)
             {
-                _totalDraftsAccepted++;
-                // Emit the draft (which equals argmax on argmax-match, or differs
-                // from argmax on a prob-only accept under pMin < 1.0). The batched
-                // forward has already advanced both caches through t2_draft, so
-                // l_at_P+2 is the next iter's saved_main_logits.
-                t2 = t2Draft;
-                mainLogitsAfter = l_atPplus2;
+                ReadOnlySpan<float> mtpLogits = _fwd.MtpForward(tokens[i - 1], P + i - 1, prevH);
+                tokens[i] = ArgMax(mtpLogits);
+                if (i < kEff - 1)
+                {
+                    var selfH = _fwd.MtpLastHidden;
+                    if (selfH.Length != chainHidden.Length)
+                        throw new InvalidOperationException(
+                            $"MtpLastHidden length {selfH.Length} != EmbeddingDim {chainHidden.Length}; " +
+                            "the forward pass must capture the MTP block output for chained drafting.");
+                    selfH.CopyTo(chainHidden);
+                    prevH = chainHidden;
+                }
             }
-            else
+            _totalDraftsEmitted += kEff - 1;
+            DraftMs += _phaseSw.Elapsed.TotalMilliseconds;
+
+            // ── ONE batched main verify over tokens[0..kEff) ──────────
+            _phaseSw.Restart();
+            float[][] batch = _fwd.BatchVerify(tokens, P);
+            VerifyMs += _phaseSw.Elapsed.TotalMilliseconds;
+
+            // ── Greedy accept: count leading agreeing drafts ──────────
+            // An accepted STOP draft also ends the chain here, EXCLUDED from `a`:
+            // like the sequential path, the stop token is neither emitted nor
+            // committed — clamping acceptance before the rollback below keeps
+            // every piece of state (trunk KV, GDN ring restore, MTP KV, hidden
+            // history, _nextPos) consistent at newPos, where the pre-#208-review
+            // emit-loop stop check returned with the caches stranded past _nextPos.
+            int a = 0;
+            bool stopHit = false;
+            for (int i = 1; i < kEff; i++)
             {
-                t2 = t2Target;
-                _fwd.RestoreBatchSnapshot(P + 1);
-                _fwd.MtpTruncateTo(P + 1);
-                mainLogitsAfter = _fwd.Forward(t2Target, P + 1);
+                int target = ArgMax(batch[i - 1]);
+                if (!AcceptDraft(tokens[i], target, batch[i - 1], pMin, out _)) break;
+                if (IsStop(tokens[i], stopTokenIds)) { stopHit = true; break; }
+                a++;
             }
+            _totalDraftsAccepted += a;
+            int newPos = P + 1 + a;
 
             if (trace)
-            {
-                float draftLogitInMain = l_atPplus1[t2Draft];
-                float mainTopLogit = l_atPplus1[t2Target];
                 Console.Error.WriteLine(
-                    $"[mtp-batch] P={P} t1={t1} t2_draft={t2Draft}(draft_logit={t2DraftLogit:F3}, main_logit_at_draft={draftLogitInMain:F3}, p={draftProbInMain:F3}) " +
-                    $"t2_target={t2Target}(main_logit={mainTopLogit:F3}) " +
-                    $"{(accept ? "ACCEPT" : "reject")}");
-            }
+                    $"[mtp-batch] P={P} k={kEff} t1={t1} " +
+                    $"drafts=[{string.Join(",", tokens[1..])}] accepted={a}/{kEff - 1}" +
+                    (a < kEff - 1 ? $" correction={ArgMax(batch[a])}" : ""));
 
-            if (IsStop(t2, stopTokenIds))
+            _phaseSw.Restart();
+            // ── Roll back the rejected tail (no-op when fully accepted) ──
+            if (newPos < P + kEff)
+                _fwd.RestoreBatchSnapshot(newPos);
+            CommitMs += _phaseSw.Elapsed.TotalMilliseconds;
+
+            // ── MTP KV refresh ────────────────────────────────────────
+            // The chain wrote MTP K/V at P (trunk-quality) and P+1..P+kEff-2
+            // (self-hidden quality). Rewind to P+1 and rewrite the ACCEPTED
+            // positions with the trunk hiddens the verify produced, so future
+            // drafts attend over trunk-quality K/V — the same per-position
+            // contract the legacy N=2 commit kept. The rejected-path correction's
+            // MTP entry is written by the NEXT step's first chain call.
+            _phaseSw.Restart();
+            _fwd.MtpTruncateTo(P + 1);
+            for (int i = 1; i <= a; i++)
+                _ = _fwd.MtpForward(tokens[i], P + i, HiddenAtChecked(P + i - 1));
+            DraftMs += _phaseSw.Elapsed.TotalMilliseconds;
+
+            // ── Emit accepted drafts (stop drafts never reach here — the accept
+            //    loop clamps `a` before the first accepted stop) ────────
+            for (int i = 1; i <= a; i++)
             {
-                // Keep state consistent for a follow-up call.
-                _fwd.LastHidden.CopyTo(_savedHidden);
-                mainLogitsAfter.CopyTo(_savedMainLogits);
-                _nextPos = P + 2;
-                return;
-            }
-            emitToken(t2); generated++;
-            if (generated >= maxTokens)
-            {
-                _fwd.LastHidden.CopyTo(_savedHidden);
-                mainLogitsAfter.CopyTo(_savedMainLogits);
-                _nextPos = P + 2;
-                return;
+                emitToken(tokens[i]); generated++;
             }
 
-            // ── MTP commit at P+1 ────────────────────────────────────
-            // prevHidden = h@P (the hidden that came out of the trunk for t1).
-            _ = _fwd.MtpForward(t2, P + 1, hAtPCopy);
-
-            // Update saved state for next iter. _fwd.LastHidden = h@P+1.
-            _fwd.LastHidden.CopyTo(_savedHidden);
-            mainLogitsAfter.CopyTo(_savedMainLogits);
-            _nextPos = P + 2;
+            // ── Saved state for the next step ─────────────────────────
+            // batch[a] predicts position newPos: it is the next certain token —
+            // the correction on a reject, the chain continuation on full accept,
+            // or the (un-emitted, un-committed) stop on stopHit. All caches sit
+            // exactly at newPos, so a follow-up call resumes consistently.
+            batch[a].CopyTo(_savedMainLogits, 0);
+            HiddenAtChecked(newPos - 1).CopyTo(_savedHidden);
+            _nextPos = newPos;
+            if (stopHit) return;
         }
+    }
+
+    /// <summary>
+    /// <see cref="IForwardPass.HiddenAt"/> with an invariant check: the batched verify
+    /// must have populated the hidden-history slot for every batch position.
+    /// </summary>
+    private ReadOnlySpan<float> HiddenAtChecked(int position)
+    {
+        var h = _fwd.HiddenAt(position);
+        if (h.Length != _savedHidden.Length)
+            throw new InvalidOperationException(
+                $"HiddenAt({position}) returned {h.Length} floats, expected {_savedHidden.Length}. " +
+                "BatchVerify must write the per-position trunk hiddens into the MTP hidden " +
+                "history (the PrefillMtp contract, issue #33).");
+        return h;
     }
 
     /// <summary>
@@ -401,27 +505,10 @@ public sealed class MtpDecoder
         return (float)(Math.Exp(logits[idx] - max) / sumExp);
     }
 
-    private static int ArgMax(ReadOnlySpan<float> logits)
-    {
-        int best = 0;
-        float bestVal = logits[0];
-        for (int i = 1; i < logits.Length; i++)
-        {
-            if (logits[i] > bestVal) { bestVal = logits[i]; best = i; }
-        }
-        return best;
-    }
-
-    private static int ArgMax(float[] logits)
-    {
-        int best = 0;
-        float bestVal = logits[0];
-        for (int i = 1; i < logits.Length; i++)
-        {
-            if (logits[i] > bestVal) { bestVal = logits[i]; best = i; }
-        }
-        return best;
-    }
+    // Greedy selection delegates to the engine's single argmax implementation —
+    // spec-decode parity contracts hinge on draft selection, verification, and
+    // production sampling all breaking ties identically (first max wins).
+    private static int ArgMax(ReadOnlySpan<float> logits) => Sampler.Greedy(logits);
 
     private static bool IsStop(int token, ReadOnlySpan<int> stopTokenIds)
     {

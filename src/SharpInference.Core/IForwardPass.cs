@@ -152,12 +152,44 @@ public interface IForwardPass : IDisposable
     void PrefillMtp(IReadOnlyList<int> tokens, int startPos = 0) { }
 
     /// <summary>
-    /// True when this pass implements a batched two-token verify path (issue #30).
-    /// Callers (<see cref="MtpDecoder"/>) dispatch to <see cref="BatchForward2"/> on
-    /// the hybrid GDN passes where it pays off; everything else stays on the
-    /// sequential N=1 algorithm.
+    /// True when this pass implements <see cref="BatchVerify"/>. Two consumers share the
+    /// method: the speculative decoder (k-token draft verification, issue #207 — rewindable
+    /// dense passes; rollback via <see cref="TruncateTo"/>) and the MTP decoder (k-token
+    /// self-speculative verify, issue #30 — hybrid GDN passes; rollback via
+    /// <see cref="RestoreBatchSnapshot"/> and the per-token GDN snapshot ring, batch size
+    /// capped by <see cref="MaxBatchVerifyTokens"/>). The consumers' own gates pick the
+    /// rollback mechanism: the MTP decoder requires <see cref="HasMtpHead"/> (GDN hybrids
+    /// only), the speculative decoder requires <see cref="SupportsPartialRewind"/> (which
+    /// GDN hybrids never report). GDN passes flip this false while the KV cache is
+    /// SnapKV-compacted (issue #130) — consumers re-check per step.
     /// </summary>
     bool SupportsBatchVerify => false;
+
+    /// <summary>
+    /// Batched verification for speculative decoding (issue #207): process
+    /// <paramref name="tokens"/> as one packed pass over the current sequence starting at
+    /// <paramref name="startPos"/> (the cache must hold exactly <paramref name="startPos"/>
+    /// positions), returning <c>result[i]</c> = logits after <c>tokens[i]</c>. All k K/V
+    /// entries are appended to the cache; the caller rewinds rejected tokens via
+    /// <see cref="TruncateTo"/> (rewindable passes) or <see cref="RestoreBatchSnapshot"/>
+    /// (GDN hybrids, issue #30). Amortizes the weight reads k× vs sequential
+    /// <see cref="Forward"/> calls on memory-bound decode paths.
+    /// </summary>
+    float[][] BatchVerify(int[] tokens, int startPos) =>
+        throw new NotSupportedException(
+            $"{GetType().Name} does not implement BatchVerify. " +
+            "Check SupportsBatchVerify before calling.");
+
+    /// <summary>
+    /// Maximum token count accepted by a single <see cref="BatchVerify"/> call.
+    /// Rewindable dense passes have no structural limit (rollback is a cache
+    /// truncate), so the default is unbounded. GDN-hybrid passes (issue #30)
+    /// override this with their snapshot-ring capacity: rolling back to
+    /// position <c>startPos + j</c> requires the post-token-<c>j-1</c> recurrent
+    /// state to have been captured, and the ring holds a fixed number of slots
+    /// sized at construction (<c>SHARPI_MTP_BATCH_MAX</c>).
+    /// </summary>
+    int MaxBatchVerifyTokens => int.MaxValue;
 
     /// <summary>
     /// Last completed <see cref="BatchForward2"/>'s token-1 pre-output-norm hidden.
@@ -190,6 +222,28 @@ public interface IForwardPass : IDisposable
         throw new NotSupportedException(
             $"{GetType().Name} does not implement RestoreBatchSnapshot. " +
             "Check SupportsBatchVerify before calling.");
+
+    /// <summary>
+    /// Post-trunk pre-final-norm hidden of an absolute position, read from the
+    /// hidden-history buffer that <see cref="Prefill"/> / <see cref="Forward"/> /
+    /// <see cref="BatchForward2"/> / <see cref="BatchVerify"/> maintain on MTP-capable
+    /// passes (the <see cref="PrefillMtp"/> contract, issue #33). Used by the batched
+    /// MTP decoder (issue #30) to fetch <c>h_{p}</c> for draft-chain commits and the
+    /// next step's first draft after a multi-token verify. Returns an empty span when
+    /// the position has not been populated (or on passes without an MTP head).
+    /// </summary>
+    ReadOnlySpan<float> HiddenAt(int position) => default;
+
+    /// <summary>
+    /// The MTP block's own residual-stream output from the most recent
+    /// <see cref="MtpForward"/> call, captured before the shared-head norm.
+    /// Multi-token MTP drafting (issue #30) chains the head on itself: draft i+1's
+    /// <c>prevHidden</c> is draft i's block output, exactly the role the trunk's
+    /// <see cref="LastHidden"/> plays for the first draft (the standard NEXTN/EAGLE
+    /// chaining; verification corrects any quality loss). Empty when no
+    /// <see cref="MtpForward"/> has run or the pass has no MTP head.
+    /// </summary>
+    ReadOnlySpan<float> MtpLastHidden => default;
 
     /// <summary>Reset the MTP attention KV cache. No-op when <see cref="HasMtpHead"/> is false.</summary>
     void MtpResetCache() { }

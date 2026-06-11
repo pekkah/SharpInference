@@ -118,12 +118,37 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     private readonly float* _logits2;        // [vocabSize]
     private readonly float* _lastHiddenT1;   // [embDim] — t1's pre-output-norm hidden after BatchForward2
 
-    // Per-layer GDN snapshot buffer holding the "between t1 and t2" state during
-    // BatchForward2. Each gdn-layer slot is _gdnStateCache.LayerSnapshotBytes wide,
-    // contiguous in this buffer. Sized in the constructor when MTP is loaded.
+    // Per-token-boundary GDN snapshot ring used by the batched verify paths
+    // (issues #30 / #207-goal-4). Slot j holds every GDN layer's state AFTER the
+    // batch's token j (j ∈ [0, k-2]), so a rejection at draft position j+1 can
+    // restore via RestoreBatchSnapshot(startPos + j + 1). Slot layout:
+    //   offset(slot, gdnIdx) = slot × NumGdnLayers × LayerSnapshotBytes
+    //                        + gdnIdx × LayerSnapshotBytes
+    // BatchForward2 (the legacy 2-token path) writes slot 0 only. The buffer
+    // starts at 1 slot (constructor) and grows lazily in BatchVerify.
     private byte* _batchSnapshotBuf;
     private long _batchSnapshotCap;
     private bool _batchSnapshotValid;
+    private int _batchSnapshotSlots;   // ring slots currently allocated
+    private int _batchStartPos;        // startPos of the most recent batched verify
+    private int _batchK;               // token count of the most recent batched verify
+
+    // Batched-verify residual streams [k × embDim] (lazily grown; issue #30 k-token
+    // generalization). BatchForward2 keeps its dedicated _hidden2/... pair.
+    private float* _bvHiddenAll;
+    private float* _bvResidAll;
+    private float* _bvNormAll;
+    private int _bvCap;
+
+    // MTP block-out hidden of the most recent MtpForward (pre-shared-head-norm),
+    // used as the next chained draft's prevHidden (issue #30 multi-token drafting).
+    private float* _mtpSelfHidden;
+
+    // Max tokens per BatchVerify call (= 1 + max MTP draft chain length); the host
+    // snapshot ring grows lazily to k-1 slots. Instance-resolved at construction so
+    // tests can override per instance; the knob semantics live in one place
+    // (GdnStateCache.ResolveMtpBatchMax) shared with the CUDA pass.
+    private readonly int _mtpBatchMax = GdnStateCache.ResolveMtpBatchMax();
 
     // ── Dimensions (cached) ────────────────────────────────────────────
     private readonly int _embDim;
@@ -602,6 +627,10 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             // is needed as MTP input. Sized at embDim, refreshed each Forward.
             _lastHidden = Alloc(_embDim);
 
+            // MTP self-chaining hidden (issue #30): the MTP block's own residual
+            // output, captured before the shared-head norm in MtpForward.
+            _mtpSelfHidden = Alloc(_embDim);
+
             // Issue #30 / #45: batched verify scratch. _hidden2/_residual2/_normBuf2/
             // _logits2/_lastHiddenT1 are needed for any MTP-bearing model. The dense
             // FFN intermediate buffers (_ffnGate2/_ffnUp2) are only used on the dense
@@ -622,8 +651,11 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             long totalSnapBytes = perLayerBytes * _gdnStateCache.NumGdnLayers;
             if (totalSnapBytes > 0)
             {
+                // One ring slot up front (covers BatchForward2); BatchVerify grows
+                // the ring lazily via EnsureBatchSnapshotSlots(k - 1).
                 _batchSnapshotBuf = (byte*)NativeMemory.Alloc((nuint)totalSnapBytes);
                 _batchSnapshotCap = totalSnapBytes;
+                _batchSnapshotSlots = 1;
             }
         }
 
@@ -1056,6 +1088,8 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         _gdnStateCache.IncrementPosition();
         _kvCache.IncrementPosition();
         _gdnStateCache.IncrementPosition();
+        _batchStartPos = startPos;
+        _batchK = 2;
 
         // 5. Snapshot the pre-output-norm hiddens before final norm overwrites them.
         var h1Span = new ReadOnlySpan<float>(_hidden,  _embDim);
@@ -1092,29 +1126,36 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     }
 
     /// <summary>
-    /// Roll the caches back to <c>startPos + 1</c> (i.e. token-1 has been processed,
-    /// token-2 has not) using the snapshot taken inside the most recent
-    /// <see cref="BatchForward2"/>. Used by <see cref="MtpDecoder"/> on a rejected
-    /// draft so a single follow-up <see cref="Forward"/> can replay the corrected
-    /// token at position <c>startPos + 1</c>.
+    /// Roll the caches back to an intermediate point of the most recent batched
+    /// verify (<see cref="BatchForward2"/> or <see cref="BatchVerify"/>) using the
+    /// per-token-boundary GDN snapshot ring. <paramref name="lengthAfter"/> selects
+    /// ring slot <c>lengthAfter - startPos - 1</c>: the state captured after the
+    /// batch's token at position <c>lengthAfter - 1</c>. Used by <see cref="MtpDecoder"/>
+    /// on a rejected draft; the correction token then either replays via
+    /// <see cref="Forward"/> (legacy N=2 path) or rides in the next verify batch
+    /// (folded k-token path).
     /// </summary>
-    /// <param name="lengthAfter">Cache length to restore to (always
-    /// <c>startPos + 1</c> for the issue-#30 N=2 path).</param>
+    /// <param name="lengthAfter">Cache length to restore to; must lie in
+    /// <c>[startPos + 1, startPos + k - 1]</c> of the most recent batched verify.</param>
     public void RestoreBatchSnapshot(int lengthAfter)
     {
         if (!_batchSnapshotValid)
             throw new InvalidOperationException(
                 "RestoreBatchSnapshot: no batched-verify snapshot is held. " +
-                "Call BatchForward2 first.");
-        if (lengthAfter < 0)
+                "Call BatchForward2 or BatchVerify first.");
+        int slot = lengthAfter - _batchStartPos - 1;
+        if (slot < 0 || slot >= _batchK - 1)
             throw new ArgumentOutOfRangeException(nameof(lengthAfter), lengthAfter,
-                "lengthAfter must be >= 0.");
+                $"RestoreBatchSnapshot: lengthAfter must be in [{_batchStartPos + 1}, " +
+                $"{_batchStartPos + _batchK - 1}] — the most recent batched verify " +
+                $"covered positions [{_batchStartPos}, {_batchStartPos + _batchK}).");
 
         long layerSnapBytes = _gdnStateCache.LayerSnapshotBytes;
+        long slotBytes = layerSnapBytes * _gdnStateCache.NumGdnLayers;
         for (int gdnIdx = 0; gdnIdx < _gdnStateCache.NumGdnLayers; gdnIdx++)
         {
             _gdnStateCache.RestoreLayerFrom(gdnIdx,
-                _batchSnapshotBuf + (long)gdnIdx * layerSnapBytes,
+                _batchSnapshotBuf + slot * slotBytes + (long)gdnIdx * layerSnapBytes,
                 layerSnapBytes);
         }
         _gdnStateCache.SetLength(lengthAfter);
@@ -1127,6 +1168,241 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         if (_hasMtp && _mtpHiddenHistoryLength > lengthAfter)
             _mtpHiddenHistoryLength = lengthAfter;
         _batchSnapshotValid = false;
+    }
+
+    /// <inheritdoc />
+    public int MaxBatchVerifyTokens => _mtpBatchMax;
+
+    /// <inheritdoc />
+    public ReadOnlySpan<float> HiddenAt(int position)
+    {
+        if (!_hasMtp || position < 0 || position >= _mtpHiddenHistoryLength)
+            return default;
+        return new ReadOnlySpan<float>(_mtpPrefillHiddens + (long)position * _embDim, _embDim);
+    }
+
+    /// <inheritdoc />
+    public ReadOnlySpan<float> MtpLastHidden =>
+        _mtpSelfHidden != null ? new ReadOnlySpan<float>(_mtpSelfHidden, _embDim) : default;
+
+    /// <summary>
+    /// k-token batched verify for the MTP folded decode loop (issue #30 /
+    /// #207 goal 4). Generalizes <see cref="BatchForward2"/>: processes
+    /// <paramref name="tokens"/> at positions <c>[startPos, startPos + k)</c> with
+    /// per-token sequential attn/GDN sublayers (causal order; GDN snapshot ring
+    /// captured after every non-final token) and pair-batched dense FFN / lm_head
+    /// via <see cref="SimdKernels.MatVec2In"/> — each weight row read once per pair.
+    /// Returns <c>result[i]</c> = logits after <c>tokens[i]</c>.
+    /// <para>Per-position outputs are bit-identical regardless of k: every token's
+    /// math runs through the same kernels with the same inputs (the odd-k tail is
+    /// processed as a duplicated-input MatVec2In pair so no kernel switch occurs).
+    /// This matches the BatchForward2 precision class — argmax-stable vs the
+    /// sequential <see cref="Forward"/> path, whose dense FFN uses MatVecDual.</para>
+    /// </summary>
+    public float[][] BatchVerify(int[] tokens, int startPos)
+    {
+        ArgumentNullException.ThrowIfNull(tokens);
+        if (!SupportsBatchVerify)
+            throw new InvalidOperationException(
+                "BatchVerify is only supported on MTP passes with an uncompacted cache. " +
+                "Check SupportsBatchVerify before calling.");
+        int k = tokens.Length;
+        if (k == 0) return Array.Empty<float[]>();
+        if (startPos < 0 || startPos + k > MaxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(startPos),
+                $"BatchVerify range [{startPos}, {startPos + k}) exceeds the context window (maxSeqLen={MaxSeqLen}).");
+        if (k > MaxBatchVerifyTokens)
+            throw new ArgumentOutOfRangeException(nameof(tokens), k,
+                $"BatchVerify token count exceeds MaxBatchVerifyTokens ({MaxBatchVerifyTokens}); " +
+                "raise SHARPI_MTP_BATCH_MAX or shorten the draft chain.");
+        if (k == 1)
+        {
+            // A single token amortizes nothing — same fallback as the dense passes.
+            var l = Forward(tokens[0], startPos);
+            return [l.ToArray()];
+        }
+        if (_kvCache.Length != startPos)
+            throw new InvalidOperationException(
+                $"BatchVerify: _kvCache.Length={_kvCache.Length} != startPos={startPos}. " +
+                "Caches must sit exactly at startPos (a SnapKV-compacted cache is gated off " +
+                "via SupportsBatchVerify).");
+        if (_gdnStateCache.Length != startPos)
+            throw new InvalidOperationException(
+                $"BatchVerify: _gdnStateCache.Length={_gdnStateCache.Length} != startPos={startPos}.");
+
+        int embDim = _embDim;
+        EnsureBatchVerifyScratch(k);
+        EnsureBatchSnapshotSlots(k - 1);
+
+        // 1. Embed all tokens into independent residual streams + reserve KV blocks.
+        for (int i = 0; i < k; i++)
+        {
+            EmbedTokenInto(tokens[i], _bvHiddenAll + (long)i * embDim);
+            _kvCache.ReserveBlockAt(startPos + i);
+        }
+
+        _batchSnapshotValid = false;
+        long layerSnapBytes = _gdnStateCache.LayerSnapshotBytes;
+        long slotBytes = layerSnapBytes * _gdnStateCache.NumGdnLayers;
+
+        // 2. Trunk layers — per-token attn/GDN (t_i before t_{i+1} so each token's
+        //    attention reads its predecessors' K/V and GDN state), batched FFN.
+        for (int layer = 0; layer < _hp.NumLayers; layer++)
+        {
+            var attnNormW = GetNormWeight(_attnNorm[layer]);
+            for (int i = 0; i < k; i++)
+            {
+                float* h = _bvHiddenAll + (long)i * embDim;
+                Copy(_bvResidAll + (long)i * embDim, h, embDim);
+                SimdKernels.RmsNorm(_bvNormAll + (long)i * embDim, h, attnNormW, embDim, _hp.RmsNormEps);
+            }
+
+            bool isAttn = _hp.LayerTypes![layer] == LayerType.Attention;
+            if (isAttn)
+            {
+                for (int i = 0; i < k; i++)
+                    AttnBlockAt(layer, position: startPos + i, kvPosition: startPos + i,
+                                normIn: _bvNormAll + (long)i * embDim,
+                                hiddenOut: _bvHiddenAll + (long)i * embDim);
+            }
+            else
+            {
+                int gdnIdx = _gdnStateCache.GdnLayerOf(layer);
+                for (int i = 0; i < k; i++)
+                {
+                    GdnBlockAt(layer, position: startPos + i,
+                               normIn: _bvNormAll + (long)i * embDim,
+                               hiddenOut: _bvHiddenAll + (long)i * embDim);
+                    // Ring slot i = state after token i (rollback-to-startPos+i+1).
+                    if (i < k - 1)
+                        _gdnStateCache.SnapshotLayerInto(gdnIdx,
+                            _batchSnapshotBuf + i * slotBytes + (long)gdnIdx * layerSnapBytes,
+                            layerSnapBytes);
+                }
+            }
+
+            for (int i = 0; i < k; i++)
+                SimdKernels.AddInPlace(_bvHiddenAll + (long)i * embDim, _bvResidAll + (long)i * embDim, embDim);
+
+            var postNormW = GetNormWeight(_postAttnNorm[layer]);
+            for (int i = 0; i < k; i++)
+            {
+                float* h = _bvHiddenAll + (long)i * embDim;
+                Copy(_bvResidAll + (long)i * embDim, h, embDim);
+                SimdKernels.RmsNorm(_bvNormAll + (long)i * embDim, h, postNormW, embDim, _hp.RmsNormEps);
+            }
+
+            if (_hp.IsMoE)
+            {
+                // Per-token MoE (issue #45): routed top-K differs per token, so no
+                // shared expert weight reads — same as BatchForward2.
+                for (int i = 0; i < k; i++)
+                    MoeFfnCore(
+                        _wGateInp[layer],
+                        _wGateShexp[layer], _wUpShexp[layer], _wDownShexp[layer],
+                        _wGateExps[layer], _wUpExps[layer], _wDownExps[layer],
+                        _wGateInpShexp[layer],
+                        normInExt: _bvNormAll + (long)i * embDim,
+                        hiddenOutExt: _bvHiddenAll + (long)i * embDim);
+            }
+            else
+            {
+                // MatVec2In pairs; the odd tail duplicates its input into both pair
+                // slots (second output → _hidden2 sink) so EVERY token goes through
+                // the identical kernel — per-position bits don't depend on k parity.
+                for (int i = 0; i < k; i += 2)
+                {
+                    bool tail = i + 1 >= k;
+                    int j = tail ? i : i + 1;
+                    DenseFfn2(layer,
+                        _bvNormAll + (long)i * embDim, _bvNormAll + (long)j * embDim,
+                        _bvHiddenAll + (long)i * embDim,
+                        tail ? _hidden2 : _bvHiddenAll + (long)j * embDim);
+                }
+            }
+
+            for (int i = 0; i < k; i++)
+                SimdKernels.AddInPlace(_bvHiddenAll + (long)i * embDim, _bvResidAll + (long)i * embDim, embDim);
+        }
+
+        // 3. Advance both caches by k.
+        for (int i = 0; i < k; i++)
+        {
+            _kvCache.IncrementPosition();
+            _gdnStateCache.IncrementPosition();
+        }
+        _batchStartPos = startPos;
+        _batchK = k;
+
+        // 4. Hidden history (issue #33/#106) + LastHidden before the final norm
+        //    overwrites the streams in place.
+        if (_hasMtp)
+        {
+            EnsureMtpHiddenHistoryCap(startPos + k);
+            for (int i = 0; i < k; i++)
+                new ReadOnlySpan<float>(_bvHiddenAll + (long)i * embDim, embDim).CopyTo(
+                    new Span<float>(_mtpPrefillHiddens + (long)(startPos + i) * embDim, embDim));
+            if (_mtpHiddenHistoryLength < startPos + k)
+                _mtpHiddenHistoryLength = startPos + k;
+            Copy(_lastHidden, _bvHiddenAll + (long)(k - 1) * embDim, embDim);
+        }
+
+        // 5. Final norm + lm_head, MatVec2In pairs (vocab-sized weight read once per
+        //    pair). Odd tail uses the duplicated-input pair with _logits2 as sink.
+        var outNormW = GetNormWeight(_outputNorm);
+        for (int i = 0; i < k; i++)
+        {
+            float* h = _bvHiddenAll + (long)i * embDim;
+            SimdKernels.RmsNorm(h, h, outNormW, embDim, _hp.RmsNormEps);
+        }
+
+        var result = new float[k][];
+        for (int i = 0; i < k; i += 2)
+        {
+            bool tail = i + 1 >= k;
+            int j = tail ? i : i + 1;
+            SimdKernels.MatVec2In(_logits, _logits2, _outputWeight.DataPtr,
+                _bvHiddenAll + (long)i * embDim, _bvHiddenAll + (long)j * embDim,
+                _hp.VocabSize, embDim, _outputWeight.DType);
+            result[i] = new ReadOnlySpan<float>(_logits, _hp.VocabSize).ToArray();
+            if (!tail)
+                result[i + 1] = new ReadOnlySpan<float>(_logits2, _hp.VocabSize).ToArray();
+        }
+
+        _batchSnapshotValid = true;
+        return result;
+    }
+
+    /// <summary>Grow the [k × embDim] batched-verify residual streams (grow-only).
+    /// Fields are nulled before each re-allocation so a mid-sequence OOM leaves
+    /// null pointers (clean re-entry / Dispose) instead of dangling ones.</summary>
+    private void EnsureBatchVerifyScratch(int k)
+    {
+        if (_bvCap >= k) return;
+        nuint bytes = (nuint)((long)k * _embDim * sizeof(float));
+        if (_bvHiddenAll != null) { NativeMemory.Free(_bvHiddenAll); _bvHiddenAll = null; }
+        if (_bvResidAll != null) { NativeMemory.Free(_bvResidAll); _bvResidAll = null; }
+        if (_bvNormAll != null) { NativeMemory.Free(_bvNormAll); _bvNormAll = null; }
+        _bvCap = 0;
+        _bvHiddenAll = (float*)NativeMemory.AllocZeroed(bytes);
+        _bvResidAll = (float*)NativeMemory.AllocZeroed(bytes);
+        _bvNormAll = (float*)NativeMemory.AllocZeroed(bytes);
+        _bvCap = k;
+    }
+
+    /// <summary>Grow the GDN snapshot ring to at least <paramref name="slots"/> slots
+    /// (grow-only; contents need not survive — the ring is rewritten every batch).
+    /// Same null-before-realloc discipline as <see cref="EnsureBatchVerifyScratch"/>.</summary>
+    private void EnsureBatchSnapshotSlots(int slots)
+    {
+        if (_batchSnapshotSlots >= slots) return;
+        long slotBytes = _gdnStateCache.LayerSnapshotBytes * _gdnStateCache.NumGdnLayers;
+        if (slotBytes <= 0) { _batchSnapshotSlots = slots; return; }
+        if (_batchSnapshotBuf != null) { NativeMemory.Free(_batchSnapshotBuf); _batchSnapshotBuf = null; }
+        _batchSnapshotSlots = 0;
+        _batchSnapshotBuf = (byte*)NativeMemory.Alloc((nuint)(slotBytes * slots));
+        _batchSnapshotCap = slotBytes * slots;
+        _batchSnapshotSlots = slots;
     }
 
     /// <summary>
@@ -1510,6 +1786,12 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
 
         // 10. Residual add.
         SimdKernels.AddInPlace(_hidden, _residual, _embDim);
+
+        // 10b. Capture the MTP block's residual output BEFORE the in-place
+        //      shared-head norm overwrites it (issue #30): multi-token drafting
+        //      chains the head on itself, feeding this as the next draft's
+        //      prevHidden. See IForwardPass.MtpLastHidden.
+        Copy(_mtpSelfHidden, _hidden, _embDim);
 
         // 11. shared_head_norm (NOT the main output_norm) → output.weight (shared lm_head).
         SimdKernels.RmsNorm(_hidden, _hidden, _mtpSharedHeadNorm, _embDim, _hp.RmsNormEps);
@@ -2482,6 +2764,10 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             if (_ffnUp2 != null) NativeMemory.Free(_ffnUp2);
             if (_logits2 != null) NativeMemory.Free(_logits2);
             if (_lastHiddenT1 != null) NativeMemory.Free(_lastHiddenT1);
+            if (_mtpSelfHidden != null) NativeMemory.Free(_mtpSelfHidden);
+            if (_bvHiddenAll != null) NativeMemory.Free(_bvHiddenAll);
+            if (_bvResidAll != null) NativeMemory.Free(_bvResidAll);
+            if (_bvNormAll != null) NativeMemory.Free(_bvNormAll);
             if (_batchSnapshotBuf != null)
             {
                 NativeMemory.Free(_batchSnapshotBuf);

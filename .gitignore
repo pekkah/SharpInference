@@ -439,6 +439,8 @@ codebooks/*.bin
 models/
 tools/
 tmp/
+# Nsight Systems/Compute profiling artifacts (multi-GB sqlite/nsys-rep dumps)
+prof/
 
 # Per-developer host overrides (model paths, etc.) — not committed
 **/appsettings.Local.json

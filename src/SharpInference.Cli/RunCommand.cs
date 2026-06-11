@@ -98,10 +98,15 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [Description("Path to a smaller draft model for speculative decoding (greedy only, requires --temp 0)")]
         public string? DraftModelPath { get; init; }
 
-        [CommandOption("--spec-lookahead")]
+        [CommandOption("--spec-lookahead|--draft-tokens")]
         [Description("Number of draft tokens per speculative step with --draft-model (default: 4)")]
         [DefaultValue(4)]
         public int SpecLookahead { get; init; }
+
+        [CommandOption("--draft-lookup")]
+        [Description("Speculative decoding via prompt-lookup (n-gram) drafting — proposes tokens by matching the generated tail against prompt+history; no draft model needed (greedy only, requires --temp 0)")]
+        [DefaultValue(false)]
+        public bool DraftLookup { get; init; }
 
         [CommandOption("--spec-type")]
         [Description("Speculative decoding type: auto (default; enables MTP when supported), none, mtp (alias: draft-mtp). Mirrors llama.cpp.")]
@@ -109,7 +114,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         public string SpecTypeStr { get; init; } = "auto";
 
         [CommandOption("--spec-draft-n-max")]
-        [Description("Max draft tokens per MTP step (default: 1). Currently only N=1 is supported on the MTP path; issue #30 will lift this. Mirrors llama.cpp.")]
+        [Description("Max draft tokens per MTP step (issue #30 batched verify). Unset resolves via SHARPI_MTP_DRAFT_N, then defaults to 1 (a 2-token verify batch — the measured optimum). Values > 1 also need snapshot-ring slots: set SHARPI_MTP_BATCH_MAX >= drafts+1 (default 2; each extra slot costs ~150 MiB VRAM on 27B). Mirrors llama.cpp.")]
         [DefaultValue(0)]
         public int SpecDraftNMax { get; init; }
 
@@ -274,7 +279,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             AnsiConsole.MarkupLine("[red]Error:[/] TurboQuant is not supported for hybrid GDN models (no KV cache on GDN layers).");
             return 1;
         }
-        if (hp.IsHybridSsm && settings.DraftModelPath is not null)
+        if (hp.IsHybridSsm && (settings.DraftModelPath is not null || settings.DraftLookup))
         {
             AnsiConsole.MarkupLine("[red]Error:[/] Speculative decoding is not supported for hybrid GDN models (GDN state is destructively updated and cannot be rewound).");
             return 1;
@@ -633,16 +638,52 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         };
         var rng = settings.Seed >= 0 ? new Random(settings.Seed) : new Random();
 
-        // Speculative decoding path (requires --draft-model and --temp 0)
-        if (settings.DraftModelPath is not null)
+        // Speculative decoding path (requires --draft-model and --temp 0). Supported
+        // targets: pure CPU (-g 0) and full CUDA offload of a dense model (issue #207 —
+        // packed k-token verify via CudaForwardPass.BatchVerify). Vulkan and the partial-
+        // offload hybrids fall back to normal generation: without a batched verify,
+        // speculation costs k sequential target forwards per step and is never a win.
+        if (settings.DraftModelPath is not null || settings.DraftLookup)
         {
+            bool cudaSpecTarget = gpuFwd is CudaForwardPass { SupportsBatchVerify: true };
+            if (settings.DraftModelPath is not null && settings.DraftLookup)
+            {
+                AnsiConsole.MarkupLine("[red]Error:[/] --draft-model and --draft-lookup are mutually exclusive.");
+                return 1;
+            }
             if (settings.Temperature > 0f)
             {
                 AnsiConsole.MarkupLine("[yellow]Warning:[/] Speculative decoding requires greedy sampling (--temp 0). Falling back to normal generation.");
             }
-            else if (nGpuLayers != 0)
+            else if (nGpuLayers != 0 && !cudaSpecTarget)
             {
-                AnsiConsole.MarkupLine("[yellow]Warning:[/] Speculative decoding is only supported for CPU (--n-gpu-layers 0). Falling back to normal generation.");
+                AnsiConsole.MarkupLine("[yellow]Warning:[/] Speculative decoding requires pure CPU (-g 0) or full CUDA offload of a dense model. Falling back to normal generation.");
+            }
+            else if (settings.DraftLookup)
+            {
+                // Prompt-lookup drafting (issue #207): no draft model — proposals come from
+                // n-gram matches against prompt + generated history, verified by the same
+                // batched-verify step. Floor is ~baseline (no match → plain decode step).
+                try
+                {
+                    IForwardPass lookupTarget = cudaSpecTarget ? (CudaForwardPass)gpuFwd! : fwd!;
+                    AnsiConsole.MarkupLine($"[dim]Speculative decoding: prompt-lookup (n-gram) drafting | Lookahead k={settings.SpecLookahead}[/]");
+                    if (settings.Prompt is not null)
+                        return RunSpeculativeSinglePrompt(settings, lookupTarget, null, tokenizer, sp);
+                    return RunSpeculativeInteractive(settings, lookupTarget, null, tokenizer, sp);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine(ex);
+                    return 1;
+                }
+                finally
+                {
+                    gpuFwd?.Dispose();
+                    gpuBackend?.Dispose();
+                    fwd?.Dispose();
+                    hybridFwd?.Dispose();
+                }
             }
             else if (!File.Exists(settings.DraftModelPath))
             {
@@ -656,13 +697,41 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     AnsiConsole.MarkupLine($"[dim]Loading draft model:[/] {settings.DraftModelPath}");
                     using var draftModel = GgufModel.Open(settings.DraftModelPath);
                     var draftHp = ModelHyperparams.FromGgufMetadata(draftModel.Metadata, draftModel);
-                    using var draftCpuBackend = new CpuBackend();
-                    using var draftFwd = new ForwardPass(draftModel, draftCpuBackend, draftHp);
-                    AnsiConsole.MarkupLine($"[dim]Draft model: {draftHp.NumLayers}L, {draftHp.EmbeddingDim}d | Lookahead k={settings.SpecLookahead}[/]");
-
-                    if (settings.Prompt is not null)
-                        return RunSpeculativeSinglePrompt(settings, fwd!, draftFwd, tokenizer, sp);
-                    return RunSpeculativeInteractive(settings, fwd!, draftFwd, tokenizer, sp);
+                    if (cudaSpecTarget)
+                    {
+                        var target = (CudaForwardPass)gpuFwd!;
+                        // The draft gets its OWN CudaBackend: graph capture state is one
+                        // exec graph per backend instance, so sharing the target's backend
+                        // would have the draft's decode graph clobber the target's.
+                        //
+                        // Clamp the draft's context: the decoder advances both passes in
+                        // lockstep, so the draft never sees a position past the target's
+                        // window — and unless the user pinned -c explicitly, cap it at 4096
+                        // (the decode runners bound generation by BOTH windows, so a smaller
+                        // draft ring only caps session length, never indexes out of range).
+                        // Passing 0 would size the draft's KV from the VRAM left AFTER the
+                        // target loaded — measured on the 12 GB 4070 Ti: the 0.6B draft
+                        // grabbed a 34K-ctx / ~7 GB ring next to the 8B target (decode
+                        // 75 → 13 t/s, WDDM paging); even a target-matched 12K fp32 ring
+                        // (~2.8 GB) left so little headroom that the draft's weights paged
+                        // in and out every step (draft forward 2.9 → ~15 ms, decode 34 t/s).
+                        int draftCtx = ctxSize > 0 ? target.MaxSeqLen : Math.Min(target.MaxSeqLen, 4096);
+                        using var draftCuda = CudaBackend.Create();
+                        using var draftFwd = new CudaForwardPass(draftModel, draftCuda, draftHp, draftCtx);
+                        AnsiConsole.MarkupLine($"[dim]Draft model: {draftHp.NumLayers}L, {draftHp.EmbeddingDim}d ([green]CUDA[/]) | Lookahead k={settings.SpecLookahead}[/]");
+                        if (settings.Prompt is not null)
+                            return RunSpeculativeSinglePrompt(settings, target, draftFwd, tokenizer, sp);
+                        return RunSpeculativeInteractive(settings, target, draftFwd, tokenizer, sp);
+                    }
+                    else
+                    {
+                        using var draftCpuBackend = new CpuBackend();
+                        using var draftFwd = new ForwardPass(draftModel, draftCpuBackend, draftHp);
+                        AnsiConsole.MarkupLine($"[dim]Draft model: {draftHp.NumLayers}L, {draftHp.EmbeddingDim}d ([blue]CPU[/]) | Lookahead k={settings.SpecLookahead}[/]");
+                        if (settings.Prompt is not null)
+                            return RunSpeculativeSinglePrompt(settings, fwd!, draftFwd, tokenizer, sp);
+                        return RunSpeculativeInteractive(settings, fwd!, draftFwd, tokenizer, sp);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -699,29 +768,71 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         }
     }
 
+    /// <summary>
+    /// True when a prompt of <paramref name="promptTokens"/> tokens leaves no room to
+    /// speculate inside BOTH context windows (prompt + lookahead + 1 correction token).
+    /// Prints an actionable error: the typical trigger is the CUDA draft's 4096-token
+    /// KV ring cap when <c>-c</c> isn't pinned, where prefilling past the ring would
+    /// write K/V out of range and a tail prompt would silently emit zero tokens.
+    /// </summary>
+    private static bool SpecWindowExhausted(int promptTokens,
+        IForwardPass target, IForwardPass? draft, int lookahead)
+    {
+        int window = Math.Min(target.MaxSeqLen, draft?.MaxSeqLen ?? int.MaxValue);
+        if (promptTokens + lookahead + 1 < window) return false;
+        AnsiConsole.MarkupLine(
+            $"[red]Error:[/] prompt ({promptTokens} tokens) + lookahead ({lookahead}) does not fit the " +
+            $"speculative context window ({window} tokens" +
+            (draft is not null && draft.MaxSeqLen < target.MaxSeqLen
+                ? $", limited by the draft model's KV ring — pass -c to size it explicitly"
+                : "") +
+            "). Shorten the prompt, raise -c, or drop --draft-model/--draft-lookup.");
+        return true;
+    }
+
     private static int RunSpeculativeSinglePrompt(Settings s,
-        ForwardPass target, ForwardPass draft,
+        IForwardPass target, IForwardPass? draft,
         GgufTokenizer tok, SamplingParams sp)
     {
         var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt, enableThinking: !s_noThinking);
         var tokens = tok.Encode(prompt);
 
+        // The prompt must fit BOTH context windows BEFORE any prefill runs — the
+        // draft's ring may be much smaller than the target's (the CUDA spec path
+        // caps it at 4096 when -c isn't pinned), and a too-long prompt would write
+        // K/V past the ring's end during draft.Prefill, not merely cap generation.
+        if (SpecWindowExhausted(tokens.Count, target, draft, s.SpecLookahead))
+            return 1;
+
         if (!s.NoDisplayPrompt)
             Console.Write(s.Prompt);
 
         var sw = Stopwatch.StartNew();
-        // Prefill both models with the same prompt
-        ReadOnlySpan<float> targetLogits = default;
-        ReadOnlySpan<float> draftLogits = default;
-        for (int i = 0; i < tokens.Count; i++)
-        {
-            targetLogits = target.Forward(tokens[i], i);
-            draftLogits = draft.Forward(tokens[i], i);
-        }
+        // Prefill (batched-trunk path — the per-token Forward loop this replaces was
+        // ~30× slower on the CUDA target). A null draft means prompt-lookup mode.
+        ReadOnlySpan<float> targetLogits = target.Prefill(tokens);
+        ReadOnlySpan<float> draftLogits = draft is not null ? draft.Prefill(tokens) : default;
         var prefillMs = sw.Elapsed.TotalMilliseconds;
 
-        var spec = new SpeculativeDecoder(target, draft, s.SpecLookahead);
-        spec.Initialize(tokens.Count, targetLogits, draftLogits);
+        SpeculativeDecoder spec;
+        if (draft is not null)
+        {
+            spec = new SpeculativeDecoder(target, draft, s.SpecLookahead);
+            spec.Initialize(tokens.Count, targetLogits, draftLogits);
+        }
+        else
+        {
+            spec = new SpeculativeDecoder(target, new PromptLookupDraft(), s.SpecLookahead);
+            spec.Initialize(tokens, targetLogits);
+        }
+
+        // Bound generation by BOTH context windows (the draft's may be smaller — the CUDA
+        // spec path caps its KV ring), leaving lookahead headroom for the last spec step.
+        // The guard above ensures maxNew >= 1 here.
+        int maxNew = Math.Min(sp.MaxNewTokens,
+            Math.Min(target.MaxSeqLen, draft?.MaxSeqLen ?? int.MaxValue) - tokens.Count - s.SpecLookahead - 1);
+        if (maxNew < sp.MaxNewTokens)
+            AnsiConsole.MarkupLine($"[yellow]Note:[/] generation capped at {maxNew} tokens by the context window.");
 
         sw.Restart();
         int generated = 0;
@@ -729,7 +840,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         bool inThinking = false;
         var streamDec = new Utf8StreamDecoder();
         bool hideThinking = s.HideThinking;
-        spec.Decode(sp.MaxNewTokens, sp.StopTokenIds ?? [], token =>
+        spec.Decode(maxNew, sp.StopTokenIds ?? [], token =>
         {
             if (EmitToken(token, tok, streamDec, ref inThinking, hideThinking)) generated++;
             totalDecoded++;
@@ -743,16 +854,19 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         AnsiConsole.MarkupLine($"\n[dim]Prefill: {tokens.Count} tokens, {tokens.Count / (prefillMs / 1000):F1} t/s | " +
             $"Decode: {totalDecoded} tokens, {totalDecoded / (decodeMs / 1000):F1} t/s" +
             (totalDecoded > generated ? $" ({generated} visible, {totalDecoded - generated} thinking)" : "") +
-            $" | Acceptance rate: {spec.AcceptanceRate:P0}[/]");
+            $" | Acceptance rate: {spec.AcceptanceRate:P0} | " +
+            $"draft {spec.DraftMs:F0}ms / verify {spec.VerifyMs:F0}ms / commit {spec.CommitMs:F0}ms[/]");
         return 0;
     }
 
     private static int RunSpeculativeInteractive(Settings s,
-        ForwardPass target, ForwardPass draft,
+        IForwardPass target, IForwardPass? draft,
         GgufTokenizer tok, SamplingParams sp)
     {
         AnsiConsole.MarkupLine("[green]Interactive chat (speculative decoding).[/] Type a message, or [yellow]/exit[/] to quit.\n");
-        var spec = new SpeculativeDecoder(target, draft, s.SpecLookahead);
+        var spec = draft is not null
+            ? new SpeculativeDecoder(target, draft, s.SpecLookahead)
+            : new SpeculativeDecoder(target, new PromptLookupDraft(), s.SpecLookahead);
 
         while (true)
         {
@@ -764,19 +878,25 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             var prompt = FormatPrompt(input, s.SystemPrompt, enableThinking: !s_noThinking);
             var tokens = tok.Encode(prompt);
 
-            target.Cache.Reset();
-            draft.Cache.Reset();
+            // Same pre-prefill window guard as the single-prompt runner: the draft
+            // ring may be smaller than the target's window, and prefilling past it
+            // writes K/V out of range rather than just capping generation.
+            if (SpecWindowExhausted(tokens.Count, target, draft, s.SpecLookahead))
+                continue;
 
-            ReadOnlySpan<float> targetLogits = default;
-            ReadOnlySpan<float> draftLogits = default;
+            target.ResetCache();
+            draft?.ResetCache();
+
             var sw = Stopwatch.StartNew();
-            for (int i = 0; i < tokens.Count; i++)
-            {
-                targetLogits = target.Forward(tokens[i], i);
-                draftLogits = draft.Forward(tokens[i], i);
-            }
+            ReadOnlySpan<float> targetLogits = target.Prefill(tokens);
 
-            spec.Initialize(tokens.Count, targetLogits, draftLogits);
+            if (draft is not null)
+                spec.Initialize(tokens.Count, targetLogits, draft.Prefill(tokens));
+            else
+                spec.Initialize(tokens, targetLogits);
+
+            int maxNew = Math.Min(sp.MaxNewTokens,
+                Math.Min(target.MaxSeqLen, draft?.MaxSeqLen ?? int.MaxValue) - tokens.Count - s.SpecLookahead - 1);
 
             sw.Restart();
             int generated = 0;
@@ -784,7 +904,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             bool inThinking = false;
             var streamDec = new Utf8StreamDecoder();
             bool hideThinking = s.HideThinking;
-            spec.Decode(sp.MaxNewTokens, sp.StopTokenIds ?? [], token =>
+            spec.Decode(maxNew, sp.StopTokenIds ?? [], token =>
             {
                 if (EmitToken(token, tok, streamDec, ref inThinking, hideThinking)) generated++;
                 totalDecoded++;
@@ -906,7 +1026,12 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             }
         }
 
-        int maxBatchN = (mtpFwd is not null && mtpFwd.SupportsBatchVerify) ? 2 : 1;
+        // Max drafts per step = batch capacity − 1 (the certain token rides in the
+        // batch). The pass's snapshot-ring capacity bounds the batch (issue #30);
+        // without batched verify the sequential path drafts exactly 1 per step.
+        int maxDraftN = (mtpFwd is not null && mtpFwd.SupportsBatchVerify)
+            ? Math.Max(1, mtpFwd.MaxBatchVerifyTokens - 1)
+            : 1;
 
         switch (sp.SpecType)
         {
@@ -917,20 +1042,28 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 if (mtpFwd is null || !mtpFwd.HasMtpHead) { rejectReason = "--spec-type mtp requires a model with an MTP head (nextn tensors)."; return false; }
                 if (sp.Temperature > 0f) { rejectReason = "--spec-type mtp requires greedy sampling (--temp 0)."; return false; }
                 if (!noThinking) { rejectReason = "--spec-type mtp requires --no-thinking (chat template must render with enable_thinking=false)."; return false; }
-                if (sp.SpecDraftNMax > maxBatchN)
-                {
-                    rejectReason = $"--spec-draft-n-max={sp.SpecDraftNMax} exceeds the supported N=2 batched verify ceiling (issue #30); N>2 is still TODO.";
-                    return false;
-                }
+                WarnIfDraftNClamped(sp.SpecDraftNMax, maxDraftN);
                 return true;
             default: // Auto
-                if (eligible && sp.SpecDraftNMax > maxBatchN)
-                {
-                    rejectReason = $"--spec-draft-n-max={sp.SpecDraftNMax} exceeds the supported N=2 batched verify ceiling (issue #30); N>2 is still TODO.";
-                    return false;
-                }
+                if (eligible)
+                    WarnIfDraftNClamped(sp.SpecDraftNMax, maxDraftN);
                 return eligible;
         }
+    }
+
+    /// <summary>
+    /// A draft chain deeper than the snapshot ring's capacity is CLAMPED, not rejected
+    /// (rejecting would disable MTP entirely and run SLOWER — the silent-baseline trap
+    /// the old SpecDraftNMax&gt;1 throw existed to prevent). Warn so the user knows the
+    /// effective depth and the knob that raises it; MtpDecoder clamps per step.
+    /// </summary>
+    private static void WarnIfDraftNClamped(int requested, int maxDraftN)
+    {
+        if (requested > maxDraftN)
+            AnsiConsole.MarkupLine(
+                $"[yellow]Note:[/] --spec-draft-n-max={requested} exceeds the snapshot-ring capacity; " +
+                $"running {maxDraftN} draft(s)/step. Set SHARPI_MTP_BATCH_MAX={requested + 1} to go deeper " +
+                "(each ring slot costs ~150 MiB VRAM on 27B-class models).");
     }
 
     // MTP self-speculative decode path. Reuses the same UTF-8 streaming + EmitToken
@@ -960,7 +1093,12 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 Console.Error.WriteLine($"[DBG] tok={totalDecoded} next={next}('{tok.Decode([next])}')");
             totalDecoded++;
             if (EmitToken(next, tok, streamDec, ref inThinking, hideThinking)) generated++;
-        }, pMin: sp.SpecDraftPMin, ct: CancellationToken.None);
+        }, pMin: sp.SpecDraftPMin, draftN: MtpDecoder.ResolveDraftN(sp.SpecDraftNMax),
+           ct: CancellationToken.None);
+
+        if (Environment.GetEnvironmentVariable("SHARPI_TRACE_MTP") == "1" && mtpDec.TotalDraftsEmitted > 0)
+            Console.Error.WriteLine(
+                $"[mtp] phase ms: draft={mtpDec.DraftMs:F0} verify={mtpDec.VerifyMs:F0} commit={mtpDec.CommitMs:F0}");
 
         // Flush the UTF-8 decoder tail, applying the same hide-thinking gate as DecodeLoop.
         var tail = streamDec.Flush();
