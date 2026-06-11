@@ -103,6 +103,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [DefaultValue(4)]
         public int SpecLookahead { get; init; }
 
+        [CommandOption("--draft-lookup")]
+        [Description("Speculative decoding via prompt-lookup (n-gram) drafting — proposes tokens by matching the generated tail against prompt+history; no draft model needed (greedy only, requires --temp 0)")]
+        [DefaultValue(false)]
+        public bool DraftLookup { get; init; }
+
         [CommandOption("--spec-type")]
         [Description("Speculative decoding type: auto (default; enables MTP when supported), none, mtp (alias: draft-mtp). Mirrors llama.cpp.")]
         [DefaultValue("auto")]
@@ -274,7 +279,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             AnsiConsole.MarkupLine("[red]Error:[/] TurboQuant is not supported for hybrid GDN models (no KV cache on GDN layers).");
             return 1;
         }
-        if (hp.IsHybridSsm && settings.DraftModelPath is not null)
+        if (hp.IsHybridSsm && (settings.DraftModelPath is not null || settings.DraftLookup))
         {
             AnsiConsole.MarkupLine("[red]Error:[/] Speculative decoding is not supported for hybrid GDN models (GDN state is destructively updated and cannot be rewound).");
             return 1;
@@ -638,9 +643,14 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         // packed k-token verify via CudaForwardPass.BatchVerify). Vulkan and the partial-
         // offload hybrids fall back to normal generation: without a batched verify,
         // speculation costs k sequential target forwards per step and is never a win.
-        if (settings.DraftModelPath is not null)
+        if (settings.DraftModelPath is not null || settings.DraftLookup)
         {
             bool cudaSpecTarget = gpuFwd is CudaForwardPass { SupportsBatchVerify: true };
+            if (settings.DraftModelPath is not null && settings.DraftLookup)
+            {
+                AnsiConsole.MarkupLine("[red]Error:[/] --draft-model and --draft-lookup are mutually exclusive.");
+                return 1;
+            }
             if (settings.Temperature > 0f)
             {
                 AnsiConsole.MarkupLine("[yellow]Warning:[/] Speculative decoding requires greedy sampling (--temp 0). Falling back to normal generation.");
@@ -648,6 +658,32 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             else if (nGpuLayers != 0 && !cudaSpecTarget)
             {
                 AnsiConsole.MarkupLine("[yellow]Warning:[/] Speculative decoding requires pure CPU (-g 0) or full CUDA offload of a dense model. Falling back to normal generation.");
+            }
+            else if (settings.DraftLookup)
+            {
+                // Prompt-lookup drafting (issue #207): no draft model — proposals come from
+                // n-gram matches against prompt + generated history, verified by the same
+                // batched-verify step. Floor is ~baseline (no match → plain decode step).
+                try
+                {
+                    IForwardPass lookupTarget = cudaSpecTarget ? (CudaForwardPass)gpuFwd! : fwd!;
+                    AnsiConsole.MarkupLine($"[dim]Speculative decoding: prompt-lookup (n-gram) drafting | Lookahead k={settings.SpecLookahead}[/]");
+                    if (settings.Prompt is not null)
+                        return RunSpeculativeSinglePrompt(settings, lookupTarget, null, tokenizer, sp);
+                    return RunSpeculativeInteractive(settings, lookupTarget, null, tokenizer, sp);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine(ex);
+                    return 1;
+                }
+                finally
+                {
+                    gpuFwd?.Dispose();
+                    gpuBackend?.Dispose();
+                    fwd?.Dispose();
+                    hybridFwd?.Dispose();
+                }
             }
             else if (!File.Exists(settings.DraftModelPath))
             {
@@ -733,7 +769,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     }
 
     private static int RunSpeculativeSinglePrompt(Settings s,
-        IForwardPass target, IForwardPass draft,
+        IForwardPass target, IForwardPass? draft,
         GgufTokenizer tok, SamplingParams sp)
     {
         var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt, enableThinking: !s_noThinking);
@@ -743,19 +779,28 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             Console.Write(s.Prompt);
 
         var sw = Stopwatch.StartNew();
-        // Prefill both models with the same prompt (batched-trunk path on both — the
-        // per-token Forward loop this replaces was ~30× slower on the CUDA target).
+        // Prefill (batched-trunk path — the per-token Forward loop this replaces was
+        // ~30× slower on the CUDA target). A null draft means prompt-lookup mode.
         ReadOnlySpan<float> targetLogits = target.Prefill(tokens);
-        ReadOnlySpan<float> draftLogits = draft.Prefill(tokens);
+        ReadOnlySpan<float> draftLogits = draft is not null ? draft.Prefill(tokens) : default;
         var prefillMs = sw.Elapsed.TotalMilliseconds;
 
-        var spec = new SpeculativeDecoder(target, draft, s.SpecLookahead);
-        spec.Initialize(tokens.Count, targetLogits, draftLogits);
+        SpeculativeDecoder spec;
+        if (draft is not null)
+        {
+            spec = new SpeculativeDecoder(target, draft, s.SpecLookahead);
+            spec.Initialize(tokens.Count, targetLogits, draftLogits);
+        }
+        else
+        {
+            spec = new SpeculativeDecoder(target, new PromptLookupDraft(), s.SpecLookahead);
+            spec.Initialize(tokens, targetLogits);
+        }
 
         // Bound generation by BOTH context windows (the draft's may be smaller — the CUDA
         // spec path caps its KV ring), leaving lookahead headroom for the last spec step.
         int maxNew = Math.Min(sp.MaxNewTokens,
-            Math.Min(target.MaxSeqLen, draft.MaxSeqLen) - tokens.Count - s.SpecLookahead - 1);
+            Math.Min(target.MaxSeqLen, draft?.MaxSeqLen ?? int.MaxValue) - tokens.Count - s.SpecLookahead - 1);
         if (maxNew < sp.MaxNewTokens)
             AnsiConsole.MarkupLine($"[yellow]Note:[/] generation capped at {maxNew} tokens by the context window.");
 
@@ -785,11 +830,13 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     }
 
     private static int RunSpeculativeInteractive(Settings s,
-        IForwardPass target, IForwardPass draft,
+        IForwardPass target, IForwardPass? draft,
         GgufTokenizer tok, SamplingParams sp)
     {
         AnsiConsole.MarkupLine("[green]Interactive chat (speculative decoding).[/] Type a message, or [yellow]/exit[/] to quit.\n");
-        var spec = new SpeculativeDecoder(target, draft, s.SpecLookahead);
+        var spec = draft is not null
+            ? new SpeculativeDecoder(target, draft, s.SpecLookahead)
+            : new SpeculativeDecoder(target, new PromptLookupDraft(), s.SpecLookahead);
 
         while (true)
         {
@@ -802,16 +849,18 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             var tokens = tok.Encode(prompt);
 
             target.ResetCache();
-            draft.ResetCache();
+            draft?.ResetCache();
 
             var sw = Stopwatch.StartNew();
             ReadOnlySpan<float> targetLogits = target.Prefill(tokens);
-            ReadOnlySpan<float> draftLogits = draft.Prefill(tokens);
 
-            spec.Initialize(tokens.Count, targetLogits, draftLogits);
+            if (draft is not null)
+                spec.Initialize(tokens.Count, targetLogits, draft.Prefill(tokens));
+            else
+                spec.Initialize(tokens, targetLogits);
 
             int maxNew = Math.Min(sp.MaxNewTokens,
-                Math.Min(target.MaxSeqLen, draft.MaxSeqLen) - tokens.Count - s.SpecLookahead - 1);
+                Math.Min(target.MaxSeqLen, draft?.MaxSeqLen ?? int.MaxValue) - tokens.Count - s.SpecLookahead - 1);
 
             sw.Restart();
             int generated = 0;

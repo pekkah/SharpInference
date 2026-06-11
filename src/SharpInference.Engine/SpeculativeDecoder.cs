@@ -21,7 +21,8 @@ namespace SharpInference.Engine;
 public sealed class SpeculativeDecoder
 {
     private readonly IForwardPass _target;
-    private readonly IForwardPass _draft;
+    private readonly IForwardPass? _draft;          // model-draft mode
+    private readonly PromptLookupDraft? _lookup;    // prompt-lookup mode (issue #207)
     private readonly bool _batchVerify;
     private int _lookahead;
 
@@ -40,6 +41,27 @@ public sealed class SpeculativeDecoder
     // Phase timing (issue #207 bench reporting): cumulative wall time spent drafting,
     // batch-verifying, and committing (truncate + correction forwards) across all steps.
     private readonly System.Diagnostics.Stopwatch _phaseSw = new();
+
+    /// <summary>
+    /// Prompt-lookup mode (issue #207): proposals come from <paramref name="lookup"/>
+    /// (n-gram matches against prompt + generated history) instead of a draft model —
+    /// zero draft-forward cost, and a step with no match degrades to plain decode.
+    /// Initialize with the prompt-token overload so the lookup sees the prompt.
+    /// </summary>
+    public SpeculativeDecoder(IForwardPass target, PromptLookupDraft lookup, int lookahead = 4)
+    {
+        ArgumentNullException.ThrowIfNull(lookup);
+        if (!target.SupportsPartialRewind)
+            throw new ArgumentException(
+                $"Speculative decoding requires the target forward pass to support partial rewind; " +
+                $"{target.GetType().Name} does not.",
+                nameof(target));
+        _target = target;
+        _lookup = lookup;
+        _batchVerify = Environment.GetEnvironmentVariable("SHARPI_SPEC_BATCH_VERIFY") != "0";
+        _lookahead = Math.Max(1, lookahead);
+        _savedTargetLogits = new float[target.VocabSize];
+    }
 
     public SpeculativeDecoder(IForwardPass target, IForwardPass draft, int lookahead = 4)
     {
@@ -116,6 +138,23 @@ public sealed class SpeculativeDecoder
     }
 
     /// <summary>
+    /// Prompt-lookup-mode initialization: seeds the lookup history with the prompt tokens
+    /// (proposals match against prompt + generated text). Call after prefilling the target.
+    /// </summary>
+    /// <param name="promptTokens">The prompt as fed to the target's prefill.</param>
+    /// <param name="targetLogits">Logits from the target's last prefill step.</param>
+    public void Initialize(IReadOnlyList<int> promptTokens, ReadOnlySpan<float> targetLogits)
+    {
+        if (_lookup is null)
+            throw new InvalidOperationException(
+                "Prompt-token initialization is only valid in prompt-lookup mode; " +
+                "use Initialize(prefillLength, targetLogits, draftLogits) with a draft model.");
+        ArgumentNullException.ThrowIfNull(promptTokens);
+        _lookup.Reset(promptTokens);
+        Initialize(promptTokens.Count, targetLogits);
+    }
+
+    /// <summary>
     /// Decode up to <paramref name="maxTokens"/> tokens using greedy speculative decoding,
     /// invoking <paramref name="emitToken"/> for each accepted or correction token.
     /// Returns when maxTokens is reached or a stop token is generated.
@@ -151,18 +190,35 @@ public sealed class SpeculativeDecoder
         int P = _nextPos;
 
         // tokens[0] is CERTAIN (greedy argmax of the saved target logits — it would be
-        // emitted by plain decode too); tokens[1..k-1] are draft proposals chained from it.
-        var tokens = new int[k];
-        tokens[0] = ArgMax(_savedTargetLogits);
+        // emitted by plain decode too); tokens[1..] are draft proposals chained from it.
+        int n0 = ArgMax(_savedTargetLogits);
 
-        // ── Draft phase: k−1 draft forwards propose tokens[1..k-1] ───────────────
+        // ── Draft phase ──────────────────────────────────────────────────────────
         _phaseSw.Restart();
-        for (int i = 1; i < k; i++)
+        int[] tokens;
+        if (_lookup is not null)
         {
-            var logits = _draft.Forward(tokens[i - 1], P + i - 1);
-            tokens[i] = ArgMax(logits);
+            // Prompt-lookup: tokens[0] is certain, so it joins the history before
+            // matching; proposals are whatever the tail n-gram match yields (possibly
+            // none — then the step is a plain single-token decode).
+            _lookup.Append(n0);
+            int[] proposals = _lookup.Propose(k - 1);
+            tokens = new int[1 + proposals.Length];
+            tokens[0] = n0;
+            proposals.CopyTo(tokens, 1);
         }
-        // Draft cache is now at P + k - 1 (appended tokens[0..k-2]).
+        else
+        {
+            // Model draft: k−1 draft forwards propose tokens[1..k-1]; the draft cache
+            // advances to P + k - 1 (appended tokens[0..k-2]).
+            tokens = new int[k];
+            tokens[0] = n0;
+            for (int i = 1; i < k; i++)
+            {
+                var logits = _draft!.Forward(tokens[i - 1], P + i - 1);
+                tokens[i] = ArgMax(logits);
+            }
+        }
         DraftMs += _phaseSw.Elapsed.TotalMilliseconds;
 
         // ── Target batch-verify ──────────────────────────────────────────────────
@@ -176,7 +232,7 @@ public sealed class SpeculativeDecoder
         // tokens[i] (i ≥ 1) is accepted iff the target's logits after tokens[i-1]
         // pick it. tokens[0] needs no check (it IS the target's pick).
         int accepted = 0;
-        for (int i = 1; i < k; i++)
+        for (int i = 1; i < tokens.Length; i++)
         {
             if (ArgMax(batch[i - 1]) == tokens[i]) accepted++;
             else break;
@@ -193,15 +249,21 @@ public sealed class SpeculativeDecoder
         int newPos = P + 1 + accepted;
         _target.TruncateTo(newPos);
 
-        if (accepted == k - 1)
+        if (_lookup is not null)
+        {
+            // No draft cache to manage; record the accepted proposals (tokens[0] was
+            // appended before matching) so future tail n-grams can match them.
+            for (int i = 1; i <= accepted; i++) _lookup.Append(tokens[i]);
+        }
+        else if (accepted == tokens.Length - 1)
         {
             // Fully accepted: the draft never processed tokens[k-1] (its cache is at
             // P+k-1 = newPos-1). Sync it so the next step's draft chain starts at newPos.
-            _draft.Forward(tokens[k - 1], P + k - 1);
+            _draft!.Forward(tokens[^1], P + tokens.Length - 1);
         }
         else
         {
-            _draft.TruncateTo(newPos);
+            _draft!.TruncateTo(newPos);
         }
         CommitMs += _phaseSw.Elapsed.TotalMilliseconds;
 

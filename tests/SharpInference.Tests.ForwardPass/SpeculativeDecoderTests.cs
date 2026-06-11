@@ -136,6 +136,43 @@ public sealed class SpeculativeDecoderTests
         Assert.True(target.BatchVerifyCalls > 0);
     }
 
+    [Fact]
+    public void Decode_PromptLookupMode_EmitsTargetChainAndUsesLookupProposals()
+    {
+        var target = new ChainForwardPass(vocab: 16, supportsBatchVerify: true);
+        var spec = new SpeculativeDecoder(target, new PromptLookupDraft(ngramMax: 3, ngramMin: 2), lookahead: 4);
+
+        // Prompt [10,11,12,10]; the target's saved logits continue the chain with 11.
+        // Step 1: certain 11 joins the history → tail [10,11] matches index 0 → proposals
+        // [12,10,11]. The chain target accepts 12 (the chain's true next) and rejects 10,
+        // so the step emits [11,12]. Later steps find no matching tail and degrade to
+        // plain single-token decode steps — the floor behavior.
+        spec.Initialize(new[] { 10, 11, 12, 10 }, ChainForwardPass.Logits(16, next: 11));
+
+        var emitted = new List<int>();
+        spec.Decode(4, [], emitted.Add);
+
+        // The emitted sequence is the target's greedy chain regardless of proposal quality.
+        Assert.Equal(new[] { 11, 12, 13, 14 }, emitted);
+        // Step 1 verified [11,12,10,11] (one batch), steps 2 and 3 verified the lone
+        // certain token; the certain token rides in the verify, so no target Forward runs.
+        Assert.Equal(3, target.BatchVerifyCalls);
+        Assert.Equal(0, target.ForwardCalls);
+        // Exactly one proposal (the 12) was accepted across the run.
+        Assert.True(spec.AcceptanceRate > 0f);
+    }
+
+    [Fact]
+    public void Initialize_PromptOverloadWithoutLookup_Throws()
+    {
+        var target = new ChainForwardPass(vocab: 16, supportsBatchVerify: true);
+        var draft = new ChainForwardPass(vocab: 16, supportsBatchVerify: false);
+        var spec = new SpeculativeDecoder(target, draft);
+
+        Assert.Throws<InvalidOperationException>(
+            () => spec.Initialize(new[] { 1, 2, 3 }, ChainForwardPass.Logits(16, next: 4)));
+    }
+
     /// <summary>
     /// Deterministic "chain" model: greedy next token is always (token+1) mod vocab.
     /// Tracks Forward/BatchVerify call counts; <c>divergeEvery</c> &gt; 0 makes every

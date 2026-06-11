@@ -263,4 +263,51 @@ public sealed class CudaSpecBatchVerifyTests
 
         Assert.Equal(baseline, emitted);
     }
+
+    /// <summary>
+    /// E2E greedy parity for prompt-lookup mode (issue #207 goal 3): with the n-gram
+    /// lookup draft (zero draft forwards, proposal quality irrelevant to correctness),
+    /// the emitted stream must still EXACTLY equal the target's non-spec greedy
+    /// continuation — accepted proposals only ever shortcut tokens the target would
+    /// have picked anyway.
+    /// </summary>
+    [Fact]
+    public void Qwen3_8B_SpecDecode_PromptLookup_GreedyParity_E2E()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var targetPath = FindModelPath(TargetModelFile);
+        if (targetPath is null) return;
+
+        const int DecodeTokens = 48;
+
+        using var targetModel = GgufModel.Open(targetPath);
+        var targetHp = ModelHyperparams.FromGgufMetadata(targetModel.Metadata, targetModel);
+        using var target = NewFwd(targetModel, gpu, targetHp);
+        Assert.True(target.SupportsBatchVerify);
+
+        // Non-spec greedy baseline.
+        target.ResetCache();
+        var logits = target.Prefill(Prompt);
+        int P = Prompt.Length;
+        var baseline = new List<int>();
+        int tok = Argmax(logits);
+        for (int i = 0; i < DecodeTokens; i++)
+        {
+            baseline.Add(tok);
+            logits = target.Forward(tok, P + i);
+            tok = Argmax(logits);
+        }
+
+        // Prompt-lookup spec decode.
+        target.ResetCache();
+        var targetLogits = target.Prefill(Prompt).ToArray();
+        var spec = new SpeculativeDecoder(target, new PromptLookupDraft(), lookahead: 4);
+        spec.Initialize(Prompt, targetLogits);
+
+        var emitted = new List<int>();
+        spec.Decode(DecodeTokens, [], emitted.Add);
+
+        Assert.Equal(baseline, emitted);
+    }
 }
