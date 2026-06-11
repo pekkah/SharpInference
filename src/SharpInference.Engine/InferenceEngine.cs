@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
+using Microsoft.Extensions.Logging;
 using SharpInference.Core;
 
 namespace SharpInference.Engine;
@@ -52,6 +54,14 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
     // pass is leaked rather than freed (see DisposeCore). Overridable by tests via
     // InternalsVisibleTo to exercise the timeout path without a 10s wait.
     internal TimeSpan _disposeDrainTimeout = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Optional logger for per-request diagnostics. Set by the DI registration from the host's
+    /// <see cref="ILoggerFactory"/>; null in non-hosted use (CLI, tests) — calls are no-ops then.
+    /// The per-request perf trace is emitted at <see cref="LogLevel.Debug"/>, so it's off unless
+    /// the host enables Debug for this category (e.g. <c>"SharpInference.Engine": "Debug"</c>).
+    /// </summary>
+    public ILogger? Logger { get; set; }
 
     public string ModelId { get; }
 
@@ -275,9 +285,19 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
             // Run the blocking CPU generation on a thread-pool thread.
             var genTask = Task.Run(() =>
             {
+                // Per-request perf trace (issue: server feels slow on big agentic prompts).
+                // Splits encode / prefill / decode so a huge-prompt request shows where the
+                // wall time went. Emitted via ILogger at Debug, so enable
+                // "SharpInference.Engine": "Debug" in the host's Logging:LogLevel to see it.
+                var swReq = Stopwatch.StartNew();
+                bool logReq = Logger?.IsEnabled(LogLevel.Debug) == true;
+                int promptTokenCount = 0, reusedTokens = 0, decodeTokens = 0;
+                long encodeMs = 0, prefillMs = 0, ttftMs = -1;
                 try
                 {
                     var tokens = _tokenizer.Encode(prompt).ToArray();
+                    promptTokenCount = tokens.Length;
+                    encodeMs = swReq.ElapsedMilliseconds;
                     var rng = new Random();
                     System.Collections.Immutable.ImmutableArray<int> stopIds =
                         sp.StopTokenIds is { } userStops ? [.. userStops] : _tokenizer.EogTokenIds;
@@ -420,6 +440,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                     {
                         // Issue #22 observability: account reused tokens regardless of
                         // mechanism (attention partial-rewind or GDN snapshot).
+                        reusedTokens = prefixLen;
                         Interlocked.Add(ref _prefillTokensReused, prefixLen);
                     }
 
@@ -443,6 +464,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                     // Reused by the MTP path below for PrefillMtp(suffixTokens, prefixLen).
                     int[] suffixTokens = prefixLen > 0 ? tokens[prefixLen..] : tokens;
 
+                    long prefillStartMs = swReq.ElapsedMilliseconds;
                     ReadOnlySpan<float> logits;
                     if (useCanonicalSnapshot)
                     {
@@ -465,6 +487,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         else
                             logits = _fwd.Forward(tokens[^1], tokens.Length - 1);
                     }
+                    prefillMs = swReq.ElapsedMilliseconds - prefillStartMs;
 
                     if (useMtp)
                     {
@@ -485,6 +508,8 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
 
                         mtpDec.Decode(sp.MaxNewTokens, stopIds.AsSpan(), tok =>
                         {
+                            if (ttftMs < 0) ttftMs = swReq.ElapsedMilliseconds;
+                            decodeTokens++;
                             fullSeq.Add(tok);
                             var bytes = _tokenizer.DecodeBytes(tok);
                             var chunk = textDecMtp.Append(bytes);
@@ -567,6 +592,8 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         // Issue #21: chat-continuation prompts for turn N+1 typically extend
                         // turn N's full transcript, not just turn N's prompt.
                         fullSeq.Add(next);
+                        if (ttftMs < 0) ttftMs = swReq.ElapsedMilliseconds;
+                        decodeTokens++;
 
                         if (stopIds.Contains(next)) break;
 
@@ -642,6 +669,26 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                 catch (Exception ex)
                 {
                     channel.Writer.TryComplete(ex);
+                }
+                finally
+                {
+                    if (logReq)
+                    {
+                        long totalMs = swReq.ElapsedMilliseconds;
+                        int newTokens = promptTokenCount - reusedTokens;
+                        double prefTps = prefillMs > 0 ? newTokens * 1000.0 / prefillMs : 0;
+                        // Decode wall = everything after the first token landed. total-ttft
+                        // also folds in the end-of-decode snapshot, a negligible tail.
+                        double decTps = (ttftMs >= 0 && totalMs > ttftMs)
+                            ? decodeTokens * 1000.0 / (totalMs - ttftMs) : 0;
+                        Logger!.LogDebug(
+                            "request prompt={PromptTokens}tok (reused={ReusedTokens} new={NewTokens}) " +
+                            "encode={EncodeMs}ms prefill={PrefillMs}ms ({PrefillTps:F0} tok/s) " +
+                            "ttft={TtftMs}ms decode={DecodeTokens}tok ({DecodeTps:F0} tok/s) total={TotalMs}ms",
+                            promptTokenCount, reusedTokens, newTokens,
+                            encodeMs, prefillMs, prefTps,
+                            ttftMs >= 0 ? ttftMs : totalMs, decodeTokens, decTps, totalMs);
+                    }
                 }
             }, ct);
 

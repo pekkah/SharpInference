@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Http.Json;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SharpInference.Engine;
 
@@ -47,6 +48,11 @@ public static class ServiceCollectionExtensions
         {
             var opts = sp.GetRequiredService<IOptions<SharpInferenceServerOptions>>().Value;
             var loaded = (opts.EngineFactory ?? (s => InferenceEngineLoader.Load(opts)))(sp);
+
+            // Hand the single-user engine the host's logger so its per-request perf trace
+            // (Debug level) flows through the configured logging pipeline rather than stderr.
+            if (loaded.Engine is InferenceEngine ie)
+                ie.Logger = sp.GetService<ILoggerFactory>()?.CreateLogger("SharpInference.Engine");
 
             // Reconfigure the renderer with the model's actual arch + Jinja template now
             // that we have them. Done here rather than as a separate DI registration so
