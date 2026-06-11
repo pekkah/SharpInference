@@ -114,7 +114,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         public string SpecTypeStr { get; init; } = "auto";
 
         [CommandOption("--spec-draft-n-max")]
-        [Description("Max draft tokens per MTP step (default: 1). Currently only N=1 is supported on the MTP path; issue #30 will lift this. Mirrors llama.cpp.")]
+        [Description("Max draft tokens per MTP step (issue #30 batched verify). Unset resolves via SHARPI_MTP_DRAFT_N, then defaults to 1 (a 2-token verify batch — the measured optimum). Values > 1 also need snapshot-ring slots: set SHARPI_MTP_BATCH_MAX >= drafts+1 (default 2; each extra slot costs ~150 MiB VRAM on 27B). Mirrors llama.cpp.")]
         [DefaultValue(0)]
         public int SpecDraftNMax { get; init; }
 
@@ -990,7 +990,12 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             }
         }
 
-        int maxBatchN = (mtpFwd is not null && mtpFwd.SupportsBatchVerify) ? 2 : 1;
+        // Max drafts per step = batch capacity − 1 (the certain token rides in the
+        // batch). The pass's snapshot-ring capacity bounds the batch (issue #30);
+        // without batched verify the sequential path drafts exactly 1 per step.
+        int maxDraftN = (mtpFwd is not null && mtpFwd.SupportsBatchVerify)
+            ? Math.Max(1, mtpFwd.MaxBatchVerifyTokens - 1)
+            : 1;
 
         switch (sp.SpecType)
         {
@@ -1001,16 +1006,18 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 if (mtpFwd is null || !mtpFwd.HasMtpHead) { rejectReason = "--spec-type mtp requires a model with an MTP head (nextn tensors)."; return false; }
                 if (sp.Temperature > 0f) { rejectReason = "--spec-type mtp requires greedy sampling (--temp 0)."; return false; }
                 if (!noThinking) { rejectReason = "--spec-type mtp requires --no-thinking (chat template must render with enable_thinking=false)."; return false; }
-                if (sp.SpecDraftNMax > maxBatchN)
+                if (sp.SpecDraftNMax > maxDraftN)
                 {
-                    rejectReason = $"--spec-draft-n-max={sp.SpecDraftNMax} exceeds the supported N=2 batched verify ceiling (issue #30); N>2 is still TODO.";
+                    rejectReason = $"--spec-draft-n-max={sp.SpecDraftNMax} exceeds this pass's batched-verify capacity " +
+                                   $"({maxDraftN} drafts/step); raise SHARPI_MTP_BATCH_MAX (snapshot-ring slots) to go deeper.";
                     return false;
                 }
                 return true;
             default: // Auto
-                if (eligible && sp.SpecDraftNMax > maxBatchN)
+                if (eligible && sp.SpecDraftNMax > maxDraftN)
                 {
-                    rejectReason = $"--spec-draft-n-max={sp.SpecDraftNMax} exceeds the supported N=2 batched verify ceiling (issue #30); N>2 is still TODO.";
+                    rejectReason = $"--spec-draft-n-max={sp.SpecDraftNMax} exceeds this pass's batched-verify capacity " +
+                                   $"({maxDraftN} drafts/step); raise SHARPI_MTP_BATCH_MAX (snapshot-ring slots) to go deeper.";
                     return false;
                 }
                 return eligible;
@@ -1044,7 +1051,12 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 Console.Error.WriteLine($"[DBG] tok={totalDecoded} next={next}('{tok.Decode([next])}')");
             totalDecoded++;
             if (EmitToken(next, tok, streamDec, ref inThinking, hideThinking)) generated++;
-        }, pMin: sp.SpecDraftPMin, ct: CancellationToken.None);
+        }, pMin: sp.SpecDraftPMin, draftN: MtpDecoder.ResolveDraftN(sp.SpecDraftNMax),
+           ct: CancellationToken.None);
+
+        if (Environment.GetEnvironmentVariable("SHARPI_TRACE_MTP") == "1" && mtpDec.TotalDraftsEmitted > 0)
+            Console.Error.WriteLine(
+                $"[mtp] phase ms: draft={mtpDec.DraftMs:F0} verify={mtpDec.VerifyMs:F0} commit={mtpDec.CommitMs:F0}");
 
         // Flush the UTF-8 decoder tail, applying the same hide-thinking gate as DecodeLoop.
         var tail = streamDec.Flush();

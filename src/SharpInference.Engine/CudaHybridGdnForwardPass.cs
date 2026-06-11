@@ -391,6 +391,49 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private byte* _batchSnapshotBuf;
     private long _batchSnapshotCap;
     private bool _batchSnapshotValid;
+    private int _batchStartPos;        // startPos of the most recent batched verify
+    private int _batchK;               // token count of the most recent batched verify
+
+    // ── Device-side GDN snapshot ring (issues #30/#207 goal 4) ──────────
+    // On the GPU-GDN trunk (!_cpuGdn) the live recurrent state is the per-layer
+    // _gpuGdnScanState/_gpuGdnConvState device tensors, so rollback snapshots must
+    // be captured on-device: ring slot j holds every GDN layer's (scan, conv) state
+    // AFTER batch token j, packed per layer at offset gdnIdx × per-layer-floats.
+    // Allocated in the constructor BEFORE TryUploadDenseFfnLayers fills VRAM
+    // (~100 MB/slot for 27B; landing it in WDDM-paged memory would 5-10× the
+    // verify). _gdnRingSlots is the achieved slot count (alloc stops on OOM);
+    // SupportsBatchVerify requires ≥ 1 slot on this trunk. The host
+    // _batchSnapshotBuf above serves the SHARPI_CPU_GDN=1 debug trunk only.
+    private readonly Tensor?[]? _gpuGdnRingScan;
+    private readonly Tensor?[]? _gpuGdnRingConv;
+    private readonly int _gdnRingSlots;
+
+    // Batched-verify scratch (exact-k; reallocated when the batch size changes the
+    // same way EnsureBatchedFfnScratch is — GEMM-N derives rows from ElementCount/k).
+    private Tensor? _gpuBvLogitsAll;   // [k × vocab] all-position logits
+    private Tensor? _gpuBvFfnAll;      // [k × embDim] CPU-FFN upload staging / combine
+    private float* _bvNormHost;        // pinned [k × embDim] — moeNorm download for CPU FFN
+    private float* _bvFfnHost;         // pinned [k × embDim] — CPU FFN outputs for upload
+    private float[]? _bvLogitsHost;    // managed [k × vocab] download target
+    private int _bvCap;
+
+    // MTP block-out hidden of the most recent MtpForward (pre-shared-head-norm),
+    // pinned so the capture rides the queued D2H stream (issue #30 draft chaining).
+    private float* _mtpSelfHidden;
+
+    // Max tokens per BatchVerify call = ring slots + 1. SHARPI_MTP_BATCH_MAX in
+    // [2, 8] bounds the ring reservation. Default 2 (one slot): each slot costs
+    // ~149 MiB of VRAM that TryUploadDenseFfnLayers would otherwise fill with
+    // ~2 dense FFN layers, and the k=2 verify is the measured 27B optimum —
+    // deeper chains only pay once the CPU FFN amortizes more than pairwise
+    // (4-input MatVec follow-up). Instance-resolved so tests can override per
+    // construction.
+    private readonly int _mtpBatchMax = ResolveMtpBatchMax();
+    private static int ResolveMtpBatchMax()
+    {
+        var s = Environment.GetEnvironmentVariable("SHARPI_MTP_BATCH_MAX");
+        return s is not null && int.TryParse(s, out var v) ? Math.Clamp(v, 2, 8) : 2;
+    }
     // Token-2 host FFN scratch (intermediate gate/up post-MatVec2In, pre-SiLuMul).
     private readonly float* _cpuFfnGateBuf2;
     private readonly float* _cpuFfnUpBuf2;
@@ -1103,6 +1146,53 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // We're conservative — most of the remaining budget is reserved for the
         // attention KV cache (10 layers × maxSeqLen × kvDim × 4 B × 2) and various
         // scratch. Use the GpuKvBytes from placement when the planner sized it.
+        // ── MTP detection + GDN snapshot ring reservation (issues #30/#207) ──
+        // Decided HERE (not at the head-upload block below) because the ring must
+        // be carved out of VRAM BEFORE TryUploadDenseFfnLayers greedily fills it
+        // to a 64 MiB margin — a later allocation would land in WDDM-paged memory
+        // and 5-10× every verify phase. SHARPI_DISABLE_MTP=1 skips the ring so
+        // MTP-off baseline runs keep the VRAM for FFN layers.
+        _hasMtp = hp.NumMtpLayers > 0
+                  && model.FindTensor($"blk.{hp.NumLayers}.nextn.eh_proj.weight") is not null;
+        if (_hasMtp && !_cpuGdn && _gdnStateCache.NumGdnLayers > 0
+            && Environment.GetEnvironmentVariable("SHARPI_DISABLE_MTP") != "1")
+        {
+            int numGdn = _gdnStateCache.NumGdnLayers;
+            int scanF = _gdnStateCache.ScanStateFloatsPerLayer;
+            int convF = _gdnStateCache.ConvStateFloatsPerLayer;
+            int want = _mtpBatchMax - 1;
+            var ringScan = new Tensor?[want];
+            var ringConv = new Tensor?[want];
+            int got = 0;
+            for (int s = 0; s < want; s++)
+            {
+                try
+                {
+                    ringScan[s] = gpu.Allocate(TensorShape.D1((long)numGdn * scanF));
+                    if (convF > 0)
+                        ringConv[s] = gpu.Allocate(TensorShape.D1((long)numGdn * convF));
+                    got = s + 1;
+                }
+                catch (Exception ex)
+                {
+                    // VRAM exhausted (or backend fault) — keep the slots we already
+                    // have; MaxBatchVerifyTokens shrinks to match.
+                    if (ringScan[s] is { } partial) { gpu.Free(partial); ringScan[s] = null; }
+                    Console.Error.WriteLine(
+                        $"[CudaHybridGdnForwardPass] GDN ring slot {s} allocation failed ({ex.GetType().Name}); " +
+                        $"continuing with {got} slot(s).");
+                    break;
+                }
+            }
+            _gpuGdnRingScan = ringScan;
+            _gpuGdnRingConv = ringConv;
+            _gdnRingSlots = got;
+            long slotBytes = (long)numGdn * (scanF + convF) * sizeof(float);
+            Console.Error.WriteLine(
+                $"[CudaHybridGdnForwardPass] MTP batched-verify GDN ring: {got} slot(s) × " +
+                $"{slotBytes / (1024 * 1024)} MiB → max verify batch {got + 1} tokens.");
+        }
+
         if (!hp.IsMoE)
         {
             // Dense FFN — no expert slot manager. Per-layer FFN-on-GPU upload runs
@@ -1132,9 +1222,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // ── MTP / NEXTN head on GPU (issue #29; mirror of HybridGdnForwardPass) ──
         // Loaded when the GGUF reports nextn_predict_layers > 0 AND the expected
         // tensors exist at blk.{NumLayers}. Multi-head MTP (NumMtpLayers > 1) is
-        // out of scope for v1; only the first head is loaded.
-        _hasMtp = hp.NumMtpLayers > 0
-                  && model.FindTensor($"blk.{hp.NumLayers}.nextn.eh_proj.weight") is not null;
+        // out of scope for v1; only the first head is loaded. (_hasMtp itself is
+        // decided earlier, before the dense-FFN VRAM fill, so the batched-verify
+        // GDN ring could be reserved first.)
         if (_hasMtp)
         {
             int mtpLayerIdx = hp.NumLayers;
@@ -1214,6 +1304,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             // stream sync. This lets the lm_head MatMul launch in parallel with
             // the queued PCIe transfer (issue #49).
             _lastHidden = AllocPinned(_embDim);
+
+            // MTP self-chaining hidden (issue #30): the MTP block's residual
+            // output, captured in MtpForward before the in-place shared-head
+            // norm. Pinned for the same queued-D2H reason as _lastHidden.
+            _mtpSelfHidden = AllocPinned(_embDim);
 
             // GPU dense FFN scratch is allocated by TryUploadDenseFfnLayers only
             // when at least one trunk FFN layer lands on GPU. For MTP we need it
@@ -1716,7 +1811,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// its single-token counterpart.
     /// </summary>
     private void TrunkBlockBatched(int layer, int N, int startPos, bool isAttn,
-                                   bool snapKvActive, int wStart)
+                                   bool snapKvActive, int wStart, bool gdnSnapRing = false)
     {
         int embDim = _embDim;
         EnsureBatchedTrunkScratch(N);
@@ -1731,7 +1826,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (isAttn)
             AttnBlockBatched(layer, N, startPos, snapKvActive, wStart, norm, blockOut);
         else
-            GdnBlockBatched(layer, N, norm, blockOut);
+            GdnBlockBatched(layer, N, norm, blockOut, gdnSnapRing);
 
         // postBlock = blockOut + stream (the pre-block residual). blockOut now holds
         // the MoE/FFN residual.
@@ -1768,8 +1863,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     /// <summary>Batched GDN block: projections over N tokens; fused sequential-scan
     /// recurrence + batched conv1d/L2norm/tile by default (issue #114-B), or the
-    /// per-position View loop under <c>SHARPI_BATCHED_GDN_SCAN=0</c>.</summary>
-    private void GdnBlockBatched(int layer, int N, Tensor norm, Tensor blockOut)
+    /// per-position View loop under <c>SHARPI_BATCHED_GDN_SCAN=0</c>.
+    /// <para><paramref name="snapRing"/> (issue #30 batched verify) forces the
+    /// per-position loop — the fused scan only materialises the final state, but
+    /// rollback needs the state after EVERY non-final token — and captures each
+    /// boundary into device ring slot i via <see cref="CaptureGdnRingSlot"/>.
+    /// The per-position loop is the documented bit-identical fallback, so the
+    /// verify trunk stays in the same precision class as prefill/Forward.</para></summary>
+    private void GdnBlockBatched(int layer, int N, Tensor norm, Tensor blockOut, bool snapRing = false)
     {
         int convCh = _gdnConvChannels, valDim = _gdnValueDim, nVH = _gdnNumVHeads;
         int kDim = _gdnKeyDim, hd = _gdnHeadDim;
@@ -1789,7 +1890,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // one batched launch per stage + a single sequential-scan kernel. Output is
         // bit-identical to the per-position View loop below (same per-position math,
         // same reduction order; only the host launch overhead is removed).
-        if (BatchedGdnScanEnabled)
+        if (BatchedGdnScanEnabled && !snapRing)
         {
             var qkvConvAll = _gpuBtQkvConv!;
             var qHeadAll = _gpuBtQHead!;
@@ -1847,6 +1948,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                     scanState, _gpuGdnQHead, _gpuGdnKHead, _gpuGdnVHead, aIn, bIn,
                     _gpuSsmA[layer], _gpuSsmDtBias[layer], _gpuSsmNormW[layer], zIn, outV,
                     nVH, hd, normEps: 1e-6f);
+                // Batched verify (issue #30): capture the post-token-i state into
+                // device ring slot i so a rejection at position startPos+i+1 can
+                // restore it. Stream-ordered D2D, ~2 MB scan + conv per layer.
+                if (snapRing && i < N - 1)
+                    CaptureGdnRingSlot(slot: i, layer);
             }
             finally
             {
@@ -3092,8 +3198,27 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// batched-verify coexist with eviction is the #130 follow-up.
     public bool SupportsBatchVerify => _hasMtp
         && (!_hp.IsMoE || _cpuMoe)
+        && (_cpuGdn || _gdnRingSlots >= 1)
         && !KvCacheCompacted
         && Environment.GetEnvironmentVariable("SHARPI_DISABLE_BATCH_VERIFY") != "1";
+
+    /// <inheritdoc />
+    /// On the GPU-GDN trunk the ceiling is the device snapshot ring's capacity
+    /// (slots + 1, reserved at construction — SHARPI_MTP_BATCH_MAX). The
+    /// SHARPI_CPU_GDN=1 debug trunk keeps the legacy 2-token path.
+    public int MaxBatchVerifyTokens => _cpuGdn ? 2 : _gdnRingSlots + 1;
+
+    /// <inheritdoc />
+    public ReadOnlySpan<float> HiddenAt(int position)
+    {
+        if (!_hasMtp || position < 0 || position >= _mtpHiddenHistoryLength)
+            return default;
+        return new ReadOnlySpan<float>(_mtpPrefillHiddens + (long)position * _embDim, _embDim);
+    }
+
+    /// <inheritdoc />
+    public ReadOnlySpan<float> MtpLastHidden =>
+        _mtpSelfHidden != null ? new ReadOnlySpan<float>(_mtpSelfHidden, _embDim) : default;
 
     /// <inheritdoc />
     public ReadOnlySpan<float> LastHiddenT1 =>
@@ -3168,10 +3293,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             else
             {
                 GpuGdnBlockAt(layer, position: startPos,     normIn: _gpuNormBuf,  hiddenOut: _gpuHidden);
-                int gdnIdx = _gdnStateCache.GdnLayerOf(layer);
-                _gdnStateCache.SnapshotLayerInto(gdnIdx,
-                    _batchSnapshotBuf + (long)gdnIdx * layerSnapBytes,
-                    layerSnapBytes);
+                // Snapshot t1's state into DEVICE ring slot 0 — the live state on
+                // this trunk is the _gpuGdnScanState/_gpuGdnConvState tensors, not
+                // the host _gdnStateCache (which is stale outside CaptureSnapshot;
+                // the pre-#207 host SnapshotLayerInto here silently captured stale
+                // bytes, so a rejected draft never actually rewound the GPU state).
+                CaptureGdnRingSlot(slot: 0, layer);
                 GpuGdnBlockAt(layer, position: startPos + 1, normIn: _gpuNormBuf2, hiddenOut: _gpuHidden2);
             }
 
@@ -3261,6 +3388,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gdnStateCache.IncrementPosition();
         _kvCache.IncrementPosition();
         _gdnStateCache.IncrementPosition();
+        _batchStartPos = startPos;
+        _batchK = 2;
 
         // 5. Snapshot pre-output-norm hiddens for MTP commit + next iter draft.
         //    Issue #49: queue both snapshots via DownloadAsync (pinned host
@@ -3304,22 +3433,42 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     }
 
     /// <inheritdoc />
+    /// <summary>
+    /// Roll the caches back to an intermediate point of the most recent batched
+    /// verify using the GDN snapshot ring: slot <c>lengthAfter - startPos - 1</c>
+    /// holds the state after the batch token at position <c>lengthAfter - 1</c>.
+    /// GPU-GDN trunk: device-to-device ring → live state tensors (the host
+    /// _gdnStateCache stays stale, as in normal GPU operation — only its length
+    /// is bookkept). SHARPI_CPU_GDN=1 trunk: host ring → host state.
+    /// </summary>
     public void RestoreBatchSnapshot(int lengthAfter)
     {
         if (!_batchSnapshotValid)
             throw new InvalidOperationException(
                 "RestoreBatchSnapshot: no batched-verify snapshot is held. " +
-                "Call BatchForward2 first.");
-        if (lengthAfter < 0)
+                "Call BatchForward2 or BatchVerify first.");
+        int slot = lengthAfter - _batchStartPos - 1;
+        if (slot < 0 || slot >= _batchK - 1)
             throw new ArgumentOutOfRangeException(nameof(lengthAfter), lengthAfter,
-                "lengthAfter must be >= 0.");
+                $"RestoreBatchSnapshot: lengthAfter must be in [{_batchStartPos + 1}, " +
+                $"{_batchStartPos + _batchK - 1}] — the most recent batched verify " +
+                $"covered positions [{_batchStartPos}, {_batchStartPos + _batchK}).");
 
-        long layerSnapBytes = _gdnStateCache.LayerSnapshotBytes;
-        for (int gdnIdx = 0; gdnIdx < _gdnStateCache.NumGdnLayers; gdnIdx++)
+        if (_cpuGdn)
         {
-            _gdnStateCache.RestoreLayerFrom(gdnIdx,
-                _batchSnapshotBuf + (long)gdnIdx * layerSnapBytes,
-                layerSnapBytes);
+            long layerSnapBytes = _gdnStateCache.LayerSnapshotBytes;
+            long slotBytes = layerSnapBytes * _gdnStateCache.NumGdnLayers;
+            for (int gdnIdx = 0; gdnIdx < _gdnStateCache.NumGdnLayers; gdnIdx++)
+            {
+                _gdnStateCache.RestoreLayerFrom(gdnIdx,
+                    _batchSnapshotBuf + slot * slotBytes + (long)gdnIdx * layerSnapBytes,
+                    layerSnapBytes);
+            }
+        }
+        else
+        {
+            for (int layer = 0; layer < _hp.NumLayers; layer++)
+                RestoreGdnRingSlot(slot, layer);
         }
         _gdnStateCache.SetLength(lengthAfter);
         _kvCache.TruncateTo(lengthAfter);
@@ -3328,6 +3477,276 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (_hasMtp && _mtpHiddenHistoryLength > lengthAfter)
             _mtpHiddenHistoryLength = lengthAfter;
         _batchSnapshotValid = false;
+    }
+
+    /// <summary>
+    /// Copy one GDN layer's live device state (scan + conv) into ring slot
+    /// <paramref name="slot"/> at the layer's packed offset. No-op for attention
+    /// layers. Device-to-device, stream-ordered — callers issue it right after the
+    /// layer's token-<c>slot</c> recurrence update.
+    /// </summary>
+    private void CaptureGdnRingSlot(int slot, int layer)
+    {
+        int gdnIdx = _gdnStateCache.GdnLayerOf(layer);
+        if (gdnIdx < 0) return;
+        if (_gpuGdnRingScan is null || slot >= _gdnRingSlots)
+            throw new InvalidOperationException(
+                $"CaptureGdnRingSlot({slot}): the GDN snapshot ring has {_gdnRingSlots} slot(s). " +
+                "Callers must clamp the batch to MaxBatchVerifyTokens.");
+        long scanBytes = (long)_gdnStateCache.ScanStateFloatsPerLayer * sizeof(float);
+        long convBytes = (long)_gdnStateCache.ConvStateFloatsPerLayer * sizeof(float);
+        if (_gpuGdnScanState[layer] is { } scanT && scanBytes > 0)
+            _gpu.CopyDeviceRegion(_gpuGdnRingScan[slot]!, gdnIdx * scanBytes, scanT, 0, scanBytes);
+        if (_gpuGdnConvState[layer] is { } convT && convBytes > 0 && _gpuGdnRingConv?[slot] is { } convRing)
+            _gpu.CopyDeviceRegion(convRing, gdnIdx * convBytes, convT, 0, convBytes);
+    }
+
+    /// <summary>Inverse of <see cref="CaptureGdnRingSlot"/>: ring slot → live device state.</summary>
+    private void RestoreGdnRingSlot(int slot, int layer)
+    {
+        int gdnIdx = _gdnStateCache.GdnLayerOf(layer);
+        if (gdnIdx < 0) return;
+        if (_gpuGdnRingScan is null || slot >= _gdnRingSlots)
+            throw new InvalidOperationException(
+                $"RestoreGdnRingSlot({slot}): the GDN snapshot ring has {_gdnRingSlots} slot(s).");
+        long scanBytes = (long)_gdnStateCache.ScanStateFloatsPerLayer * sizeof(float);
+        long convBytes = (long)_gdnStateCache.ConvStateFloatsPerLayer * sizeof(float);
+        if (_gpuGdnScanState[layer] is { } scanT && scanBytes > 0)
+            _gpu.CopyDeviceRegion(scanT, 0, _gpuGdnRingScan[slot]!, gdnIdx * scanBytes, scanBytes);
+        if (_gpuGdnConvState[layer] is { } convT && convBytes > 0 && _gpuGdnRingConv?[slot] is { } convRing)
+            _gpu.CopyDeviceRegion(convT, 0, convRing, gdnIdx * convBytes, convBytes);
+    }
+
+    /// <summary>
+    /// k-token batched verify for the MTP folded decode loop (issues #30 /
+    /// #207 goal 4). The trunk runs as the #111/#114-B batched-prefill launches —
+    /// GEMM-batched projections, batched attention at contiguous positions
+    /// <c>[startPos, startPos+k)</c>, per-position delta-net recurrence with the
+    /// device GDN snapshot ring captured at every token boundary — followed by the
+    /// FFN stage (GEMM-N on GPU dense layers; pair-batched <c>MatVec2In</c> on the
+    /// CPU mmap layers that dominate 27B decode; per-token CPU MoE) and an
+    /// all-position [k × vocab] lm_head. Returns <c>result[i]</c> = logits after
+    /// <c>tokens[i]</c>; rollback is <see cref="RestoreBatchSnapshot"/>.
+    /// </summary>
+    public float[][] BatchVerify(int[] tokens, int startPos)
+    {
+        ThrowIfFaulted();
+        ArgumentNullException.ThrowIfNull(tokens);
+        if (!SupportsBatchVerify)
+            throw new InvalidOperationException(
+                "BatchVerify requires an MTP pass with an uncompacted cache and an " +
+                "available GDN snapshot ring. Check SupportsBatchVerify before calling.");
+        int k = tokens.Length;
+        if (k == 0) return Array.Empty<float[]>();
+        if (startPos < 0 || startPos + k > _maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(startPos),
+                $"BatchVerify range [{startPos}, {startPos + k}) exceeds the context window (maxSeqLen={_maxSeqLen}).");
+        if (k > MaxBatchVerifyTokens)
+            throw new ArgumentOutOfRangeException(nameof(tokens), k,
+                $"BatchVerify token count exceeds MaxBatchVerifyTokens ({MaxBatchVerifyTokens}); " +
+                "raise SHARPI_MTP_BATCH_MAX (ring slots are reserved at construction).");
+        if (k == 1)
+        {
+            // A single token amortizes nothing — plain Forward is strictly better.
+            var l = Forward(tokens[0], startPos);
+            return [l.ToArray()];
+        }
+        if (_cpuGdn)
+        {
+            // SHARPI_CPU_GDN=1 debug trunk: the host-side GDN state is live, so the
+            // legacy 2-token path with its host snapshot is correct as-is.
+            // MaxBatchVerifyTokens caps k at 2 in this config.
+            BatchForward2(tokens[0], tokens[1], startPos, out var l1, out var l2);
+            return [l1.ToArray(), l2.ToArray()];
+        }
+        if (_kvCache.Length != startPos)
+            throw new InvalidOperationException(
+                $"BatchVerify: _kvCache.Length={_kvCache.Length} != startPos={startPos}. " +
+                "Caches must sit exactly at startPos (a SnapKV-compacted cache is gated " +
+                "off via SupportsBatchVerify).");
+        if (_gdnStateCache.Length != startPos)
+            throw new InvalidOperationException(
+                $"BatchVerify: _gdnStateCache.Length={_gdnStateCache.Length} != startPos={startPos}.");
+
+        int embDim = _embDim;
+        long embBytes = (long)embDim * sizeof(float);
+        bool isMoe = _hp.IsMoE;
+
+        EnsureStreamAll(k);
+        EnsureBatchedTrunkScratch(k);
+        if (BatchedFfnEnabled && !isMoe && _denseFfnGpuLayers > 0)
+            EnsureBatchedFfnScratch(k);
+        EnsureBatchVerifyScratch(k);
+
+        // Pessimistic fault latch — same contract as the batched prefills: a
+        // mid-pass throw leaves the recurrent state partially advanced while the
+        // length counters still read startPos; fatal for this pass.
+        _faulted = true;
+        _batchSnapshotValid = false;
+        // Decode-sized batch: keep every batched matmul on the temp-free matvec
+        // re-stream (see GpuMatMulBatched). Cleared before returning; a mid-pass
+        // throw leaves it set, but _faulted already makes the pass unusable then.
+        _matVecBatchedOnly = true;
+
+        var stream = _gpuStreamAll!;
+
+        // 1. Embed every token into the residual-stream buffer + reserve KV blocks.
+        for (int i = 0; i < k; i++)
+        {
+            EmbedToken(_gpuHidden, tokens[i]);
+            _gpu.CopyDeviceRegion(stream, i * embBytes, _gpuHidden, 0, embBytes);
+            _kvCache.ReserveBlockAt(startPos + i);
+        }
+
+        // 2. Trunk (batched, ring-capturing) + FFN stage, layer by layer.
+        for (int layer = 0; layer < _hp.NumLayers; layer++)
+        {
+            bool isAttn = _hp.LayerTypes![layer] == LayerType.Attention;
+            TrunkBlockBatched(layer, k, startPos, isAttn, snapKvActive: false, wStart: 0,
+                              gdnSnapRing: true);
+            var blockOut = _gpuBtBlockOut!;
+            var moeNorm  = _gpuBtMoeNorm!;
+
+            bool denseGpuLayer = !isMoe && _gpuWFfnGate is not null && _gpuWFfnGate[layer] is not null;
+            bool batchLayer = BatchedFfnEnabled && denseGpuLayer
+                && BatchedMatMulSupported(_gpuWFfnGate![layer]!)
+                && BatchedMatMulSupported(_gpuWFfnUp![layer]!)
+                && BatchedMatMulSupported(_gpuWFfnDown![layer]!);
+            if (batchLayer)
+            {
+                // GEMM-N gate/up/down over all k tokens (issue #121 machinery).
+                BatchedGpuDenseFfn(layer, k, moeNorm, _gpuBfHiddenAll!);
+                _gpu.AddInPlace(_gpuBfHiddenAll!, blockOut);
+                _gpu.CopyDeviceRegion(stream, 0, _gpuBfHiddenAll!, 0, k * embBytes);
+            }
+            else if (!isMoe && !denseGpuLayer)
+            {
+                // CPU mmap dense FFN — the 27B/12GB decode cost center (~8.6 GB
+                // weight reads per token). Pair-batched MatVec2In reads each weight
+                // row once per pair; the odd tail re-runs as a duplicated-input
+                // pair (second output → sink) so every token's bits match the pair
+                // kernel regardless of k parity.
+                _gpu.Download(moeNorm, (nint)_bvNormHost, k * embDim);
+                for (int i = 0; i < k; i += 2)
+                {
+                    bool tail = i + 1 >= k;
+                    int j = tail ? i : i + 1;
+                    CpuDenseFfn2(layer,
+                        _bvNormHost + (long)i * embDim, _bvNormHost + (long)j * embDim,
+                        _bvFfnHost + (long)i * embDim,
+                        tail ? _cpuMoeHidden2 : _bvFfnHost + (long)j * embDim);
+                }
+                _gpu.UploadInto(_gpuBvFfnAll!, (nint)_bvFfnHost, k * embDim);
+                _gpu.AddInPlace(_gpuBvFfnAll!, blockOut);
+                _gpu.CopyDeviceRegion(stream, 0, _gpuBvFfnAll!, 0, k * embBytes);
+            }
+            else
+            {
+                // Per-token fallbacks: GPU dense layer with a non-GEMM-N weight
+                // dtype, or CPU MoE (per-token routing, issue #45 — the wins come
+                // from the batched trunk + lm_head, not the routed FFN itself).
+                // Full-GPU MoE never reaches here (SupportsBatchVerify gate).
+                for (int i = 0; i < k; i++)
+                {
+                    _gpu.CopyDeviceRegion(_gpuNormBuf, 0, moeNorm, i * embBytes, embBytes);
+                    if (!isMoe)
+                    {
+                        GpuDenseFfn(layer);
+                    }
+                    else
+                    {
+                        _gpu.Download(_gpuNormBuf, (nint)_cpuNormBuf, embDim);
+                        CpuMoeFfnCore(
+                            _gpuWGateShexp[layer], _gpuWUpShexp[layer], _gpuWDownShexp[layer],
+                            _cpuFfnGateInp![layer], _cpuFfnGateInpShexp![layer],
+                            _cpuFfnGateExps![layer], _cpuFfnUpExps![layer], _cpuFfnDownExps![layer],
+                            gpuNormIn: _gpuNormBuf, gpuSharedOut: _gpuSharedOut,
+                            cpuNormIn: _cpuNormBuf, cpuMoeOut: _cpuMoeHidden);
+                        _gpu.UploadInto(_gpuHidden, (nint)_cpuMoeHidden, embDim);
+                    }
+                    _gpu.CopyDeviceRegion(_gpuResidual, 0, blockOut, i * embBytes, embBytes);
+                    _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+                    _gpu.CopyDeviceRegion(stream, i * embBytes, _gpuHidden, 0, embBytes);
+                }
+            }
+        }
+
+        // 3. Advance the position counters by k.
+        for (int i = 0; i < k; i++)
+        {
+            _kvCache.IncrementPosition();
+            _gdnStateCache.IncrementPosition();
+        }
+        _batchStartPos = startPos;
+        _batchK = k;
+        _faulted = false;
+
+        // 4. MTP hidden history (issues #33/#106): stream[i] holds the
+        //    pre-output-norm hidden for token startPos+i.
+        EnsureMtpHiddenHistoryCap(startPos + k);
+        _gpu.Download(stream, (nint)(_mtpPrefillHiddens + (long)startPos * embDim), k * embDim);
+        if (_mtpHiddenHistoryLength < startPos + k)
+            _mtpHiddenHistoryLength = startPos + k;
+        new ReadOnlySpan<float>(_mtpPrefillHiddens + (long)(startPos + k - 1) * embDim, embDim)
+            .CopyTo(new Span<float>(_lastHidden, embDim));
+
+        // 5. All-position logits: batched output norm + GEMM-N lm_head when the
+        //    weight dtype supports it, else a per-token MatMul loop.
+        var normAll = _gpuBtNorm!;   // free to reuse after the last trunk layer
+        _gpu.RmsNormBatched(normAll, stream, _gpuOutputNorm!, k, embDim, _hp.RmsNormEps);
+        var result = new float[k][];
+        if (BatchedMatMulSupported(_gpuOutputWeight!))
+        {
+            GpuMatMulBatched(_gpuBvLogitsAll!, _gpuOutputWeight!, normAll, k);
+            _gpu.Download(_gpuBvLogitsAll!, _bvLogitsHost.AsSpan(0, k * _hp.VocabSize));
+            for (int i = 0; i < k; i++)
+            {
+                result[i] = new float[_hp.VocabSize];
+                Array.Copy(_bvLogitsHost!, (long)i * _hp.VocabSize, result[i], 0, _hp.VocabSize);
+            }
+        }
+        else
+        {
+            var outDt = _gpuWeightDTypes.TryGetValue(_gpuOutputWeight!.Handle, out var dt)
+                ? dt : DType.Float32;
+            for (int i = 0; i < k; i++)
+            {
+                _gpu.CopyDeviceRegion(_gpuHidden, 0, normAll, i * embBytes, embBytes);
+                _gpu.MatMul(_gpuLogits, _gpuOutputWeight!, _gpuHidden, outDt);
+                _gpu.Download(_gpuLogits, _logitsBuf);
+                result[i] = (float[])_logitsBuf.Clone();
+            }
+        }
+
+        _matVecBatchedOnly = false;
+        _batchSnapshotValid = true;
+        return result;
+    }
+
+    /// <summary>
+    /// (Re)allocate the batched-verify scratch for an exact batch size of
+    /// <paramref name="k"/> tokens: the [k × vocab] all-position logits tensor +
+    /// managed download buffer, the [k × embDim] CPU-FFN staging tensor, and the
+    /// pinned host norm/FFN roundtrip buffers. Exact-size (not grow-only) because
+    /// the GEMM-N kernels derive their row count from <c>ElementCount / k</c>.
+    /// </summary>
+    private void EnsureBatchVerifyScratch(int k)
+    {
+        if (_bvCap == k) return;
+        if (_gpuBvLogitsAll is { } l) { _gpu.Free(l); _gpuBvLogitsAll = null; }
+        if (_gpuBvFfnAll is { } f) { _gpu.Free(f); _gpuBvFfnAll = null; }
+        if (_bvNormHost != null) { CudaBackend.FreePinnedHost((nint)_bvNormHost); _bvNormHost = null; }
+        if (_bvFfnHost != null) { CudaBackend.FreePinnedHost((nint)_bvFfnHost); _bvFfnHost = null; }
+        long logitsTotal = (long)k * _hp.VocabSize;
+        if (logitsTotal > int.MaxValue)
+            throw new NotSupportedException(
+                $"Batched verify logits buffer ({k}×{_hp.VocabSize}) exceeds int.MaxValue.");
+        _gpuBvLogitsAll = _gpu.Allocate(TensorShape.D1(logitsTotal));
+        _gpuBvFfnAll = _gpu.Allocate(TensorShape.D1((long)k * _embDim));
+        _bvNormHost = AllocPinnedL((long)k * _embDim);
+        _bvFfnHost = AllocPinnedL((long)k * _embDim);
+        _bvLogitsHost = new float[(int)logitsTotal];
+        _bvCap = k;
     }
 
     // =================================================================
@@ -3521,6 +3940,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         // 11. Residual add.
         _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+
+        // 11b. Capture the MTP block's residual output BEFORE the in-place
+        //      shared-head norm (issue #30 chained drafting). Queued D2H into the
+        //      pinned _mtpSelfHidden; stream order serializes it ahead of the norm
+        //      kernel, and the logits Download below syncs/drains it.
+        _gpu.DownloadAsync(_gpuHidden, (nint)_mtpSelfHidden, _embDim);
 
         // 12. shared_head_norm (NOT main output_norm) → output.weight (shared lm_head).
         _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuMtpSharedHeadNorm, _hp.RmsNormEps);
@@ -4646,7 +5071,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // bit-parity oracle keeps the matvec path. Q4_K/Q6_K/Q5_K need 256-aligned cols;
         // Q8_0 needs 32 — true for every projection dim, but guarded so we fall back
         // (never throw) on an odd shape.
-        if (GdnPrefillComputeEnabled && nTok > 1)
+        // Issue #30/#207 batched verify: the MMQ/dequant-GEMM compute path only
+        // amortizes its fixed per-call costs (whole-weight dequant to an fp16 temp
+        // for Q6_K/Q5_K — 71 MB per 27B FFN layer, ~600 MB for the lm_head) at
+        // prefill-scale N. At decode-sized k those temps land in WDDM-paged VRAM
+        // behind the post-fill 64 MiB margin and 5-10× every step. The verify path
+        // latches _matVecBatchedOnly so every batched matmul takes the temp-free
+        // matvec re-stream (the same decode kernels the sequential Forward uses).
+        if (GdnPrefillComputeEnabled && nTok > 1 && !_matVecBatchedOnly)
         {
             int cols = (int)(inputAll.ElementCount / nTok);
             switch (dt)
@@ -4662,6 +5094,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         }
         _gpu.MatMulBatched(outputAll, matrix, inputAll, nTok, dt);
     }
+
+    // True while BatchVerify drives the batched trunk: forces GpuMatMulBatched onto
+    // the matvec re-stream path (see the comment there). Never set on prefill.
+    private bool _matVecBatchedOnly;
 
     /// Issue #121: true when <paramref name="matrix"/>'s dtype is one of the dtypes
     /// <see cref="CudaBackend.MatMulBatched"/> implements a GEMM-N kernel for. Gates the
@@ -5367,6 +5803,17 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                     _batchSnapshotBuf = null;
                 }
             }
+            // Issue #30/#207-goal-4 k-token batched verify: device GDN snapshot
+            // ring + exact-k verify scratch + the MTP self-chaining hidden.
+            if (_gpuGdnRingScan is not null)
+                foreach (var t in _gpuGdnRingScan) if (t is { } rs) _gpu.Free(rs);
+            if (_gpuGdnRingConv is not null)
+                foreach (var t in _gpuGdnRingConv) if (t is { } rc) _gpu.Free(rc);
+            if (_gpuBvLogitsAll is { } bvl) _gpu.Free(bvl);
+            if (_gpuBvFfnAll is { } bvf) _gpu.Free(bvf);
+            if (_bvNormHost != null) CudaBackend.FreePinnedHost((nint)_bvNormHost);
+            if (_bvFfnHost != null) CudaBackend.FreePinnedHost((nint)_bvFfnHost);
+            if (_mtpSelfHidden != null) CudaBackend.FreePinnedHost((nint)_mtpSelfHidden);
             _mtpKvCache?.Dispose();
         }
 
