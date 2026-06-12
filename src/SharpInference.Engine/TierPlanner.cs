@@ -151,13 +151,29 @@ public static class TierPlanner
         // decision is made later from actual free VRAM. Zero for dense models.
         long expertCacheBudget = hp.IsMoE ? Math.Max(0, vramBudget - gpuKvBytes) : 0;
 
+        // Issue #215: the full-residency GPU cost of every routed expert (gate/up/down _exps
+        // across all layers). Compared against ExpertCacheBudgetBytes by the CLI to decide
+        // whether full-GPU MoE is viable or the model must use the hybrid path (SLRU streaming
+        // or CPU-MoE). Zero for dense models.
+        long moeRoutedExpertBytes = 0;
+        if (hp.IsMoE)
+        {
+            for (int i = 0; i < hp.NumLayers; i++)
+            {
+                moeRoutedExpertBytes += MeasureGpuTensorBytes(model, $"blk.{i}.ffn_gate_exps.weight");
+                moeRoutedExpertBytes += MeasureGpuTensorBytes(model, $"blk.{i}.ffn_up_exps.weight");
+                moeRoutedExpertBytes += MeasureGpuTensorBytes(model, $"blk.{i}.ffn_down_exps.weight");
+            }
+        }
+
         return new LayerPlacement(
             gpuLayers,
             hp.NumLayers - gpuLayers,
             gpuWeightBytes,
             gpuKvBytes,
             gpuCtxSize,
-            expertCacheBudget);
+            expertCacheBudget,
+            moeRoutedExpertBytes);
     }
 
     // For per-layer-KV models (Gemma 4: SWA window-rings, KV-share aliasing, per-layer
@@ -298,6 +314,9 @@ public static class TierPlanner
 /// Result of tier placement analysis.
 /// <paramref name="ExpertCacheBudgetBytes"/> is the VRAM left over after trunk weights
 /// and KV for the SLRU routed-expert cache (MoE only; 0 for dense — issue #215).
+/// <paramref name="MoeRoutedExpertBytes"/> is the full-residency GPU cost of all routed
+/// experts; when it exceeds <paramref name="ExpertCacheBudgetBytes"/> the model can't keep
+/// every expert resident and must use the hybrid path (MoE only; 0 for dense — issue #215).
 /// </summary>
 public sealed record LayerPlacement(
     int GpuLayers,
@@ -305,14 +324,16 @@ public sealed record LayerPlacement(
     long GpuWeightBytes,
     long GpuKvBytes,
     int RecommendedCtxSize,
-    long ExpertCacheBudgetBytes = 0)
+    long ExpertCacheBudgetBytes = 0,
+    long MoeRoutedExpertBytes = 0)
 {
     public string Summary()
     {
         double gpuWeightMB = GpuWeightBytes / (1024.0 * 1024);
         double gpuKvMB = GpuKvBytes / (1024.0 * 1024);
         string moe = ExpertCacheBudgetBytes > 0
-            ? $", expert-cache budget: {ExpertCacheBudgetBytes / (1024.0 * 1024):F0} MB"
+            ? $", expert-cache budget: {ExpertCacheBudgetBytes / (1024.0 * 1024):F0} MB" +
+              $" (routed experts: {MoeRoutedExpertBytes / (1024.0 * 1024):F0} MB)"
             : "";
         return $"GPU: {GpuLayers} layers ({gpuWeightMB:F0} MB weights, {gpuKvMB:F0} MB KV), CPU: {CpuLayers} layers, ctx: {RecommendedCtxSize}{moe}";
     }

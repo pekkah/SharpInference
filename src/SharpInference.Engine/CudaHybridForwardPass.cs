@@ -60,6 +60,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     private readonly float*[] _cpuQNorm, _cpuKNorm;
     private readonly CpuWeightRef[]? _cpuWGateInp, _cpuWGateShexp, _cpuWUpShexp, _cpuWDownShexp;
     private readonly CpuWeightRef[]? _cpuWGateExps, _cpuWUpExps, _cpuWDownExps;
+    // CPU-MoE mode: routed experts for the GPU-TRUNK layers (0.._nGpuLayers-1) run on the
+    // CPU from mmap instead of streaming through the SLRU cache. Index i maps directly to
+    // model layer i. Sized _nGpuLayers and populated only when _cpuMoe is true; null otherwise.
+    private readonly CpuWeightRef[]? _cpuMoeGateInp, _cpuMoeGateExps, _cpuMoeUpExps, _cpuMoeDownExps;
     private readonly CpuWeightRef _cpuEmbedding, _cpuOutputWeight, _cpuOutputNorm;
     private readonly float* _cpuRouterLogits;
     private readonly float* _cpuSharedOut;
@@ -152,6 +156,12 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     // Null when not MoE or there are no GPU layers. Loads are synchronous on miss
     // (no prefetcher): the GDN path established this is fast enough for k=8 decode.
     private readonly CudaExpertSlotManager? _expertSlotManager;
+
+    // CPU-MoE auto-select (mirror of CudaHybridGdnForwardPass). When the expert-cache
+    // budget can hold fewer than ~half the GPU-trunk experts, routed-expert MoE runs on
+    // the CPU (mmap) instead of streaming through the SLRU cache. Decided in the ctor
+    // before the GPU upload loop. SHARPI_CPU_MOE=0|1 overrides. Always false for non-MoE.
+    private readonly bool _cpuMoe;
 
     // ── Issue #123: batched-trunk prompt prefill ──────────────────────────────
     // Gate (default ON). When set, Prefill dispatches the supported configs to the
@@ -275,6 +285,39 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         _tqFp32Window = enableTq ? Math.Min(tqFp32Window, _maxSeqLen) : 0;
         _tqBlockBytes = enableTq ? TurboQuantOps.BlockSize(tqBits, _headDim) : 0;
         _gpuRouterBuf = _isMoE && _nGpuLayers > 0 ? new float[hp.NumExperts] : null;
+
+        // ── Auto-detect CPU-MoE vs GPU SLRU MoE ─────────────────────────────────
+        // Mirrors CudaHybridGdnForwardPass: SLRU only pays off when most experts fit in
+        // VRAM. Predict the slot count from the planner's expert-cache budget (VRAM left
+        // after trunk + KV) before uploading any MoE weights. Route MoE through CPU when
+        // fewer than ~half of all GPU-trunk experts can be cached on the GPU.
+        if (_isMoE)
+        {
+            string? cpuMoeOverride = Environment.GetEnvironmentVariable("SHARPI_CPU_MOE");
+            if (cpuMoeOverride == "1")
+            {
+                _cpuMoe = true;
+            }
+            else if (cpuMoeOverride == "0")
+            {
+                _cpuMoe = false;
+            }
+            else
+            {
+                long perExpert = PerExpertBytes();
+                long budget = placement.ExpertCacheBudgetBytes;
+                int predictedSlots = perExpert > 0 ? (int)(budget / perExpert) : 0;
+                int totalExperts = _nGpuLayers * hp.NumExperts;
+                double ratio = totalExperts > 0 ? (double)predictedSlots / totalExperts : 1.0;
+                _cpuMoe = ratio < 0.5;
+                Console.Error.WriteLine(
+                    $"[CudaHybridForwardPass] MoE auto-select: expert-cache capacity ≈ {predictedSlots}/{totalExperts} ({ratio:P0}) → {(_cpuMoe ? "CPU" : "GPU SLRU")} MoE.  Override with SHARPI_CPU_MOE=0|1.");
+            }
+        }
+        else
+        {
+            _cpuMoe = false;
+        }
 
         Console.Error.WriteLine($"[HybridForwardPass] {placement.Summary()}{(enableTq ? $" [TQ{tqBits}]" : "")}");
 
@@ -421,7 +464,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 _gpuPostFfwNorm[i]  = UploadWeight($"blk.{i}.post_ffw_norm.weight");
             if (_isMoE)
             {
-                _gpuWGateInp![i]  = UploadWeight($"blk.{i}.ffn_gate_inp.weight");
+                // CPU-MoE: the router (ffn_gate_inp) runs on the CPU in the compute-half,
+                // so leave _gpuWGateInp[i] default/null here. GPU-SLRU mode uploads it.
+                if (!_cpuMoe)
+                    _gpuWGateInp![i]  = UploadWeight($"blk.{i}.ffn_gate_inp.weight");
                 // Routed experts are NOT uploaded here — they stream through the
                 // CudaExpertSlotManager SLRU cache (created after this loop). The router
                 // and shared expert stay resident since they run on every token.
@@ -501,7 +547,13 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         // fits — so there is no new OOM risk; the budget term only *shrinks* capacity
         // when VRAM is tight (e.g. the user forced extra GPU layers via -g), enabling
         // streaming instead of an OOM.
-        if (_isMoE && _nGpuLayers > 0)
+        if (_isMoE && _nGpuLayers > 0 && _cpuMoe)
+        {
+            Console.Error.WriteLine(
+                "[CudaHybridForwardPass] CPU-MoE mode: routed experts for the GPU-trunk layers " +
+                "run on the CPU from mmap; no SLRU expert cache is allocated.");
+        }
+        if (_isMoE && _nGpuLayers > 0 && !_cpuMoe)
         {
             long perExpert = PerExpertBytes();
             long reserve = 512L << 20; // 512 MiB headroom for transient per-GEMM scratch
@@ -539,6 +591,24 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                     break;
             }
             _expertSlotManager = new CudaExpertSlotManager(gpu, model, hp, plan.Slots, _gpuWeightDTypes);
+        }
+
+        // CPU-MoE: resolve the GPU-trunk layers' routed-expert weights as CPU mmap views.
+        // These layers (0.._nGpuLayers-1) keep attention + shared expert on the GPU but run
+        // the router + routed FFN on the CPU. Index i maps directly to model layer i.
+        if (_isMoE && _cpuMoe)
+        {
+            _cpuMoeGateInp  = new CpuWeightRef[_nGpuLayers];
+            _cpuMoeGateExps = new CpuWeightRef[_nGpuLayers];
+            _cpuMoeUpExps   = new CpuWeightRef[_nGpuLayers];
+            _cpuMoeDownExps = new CpuWeightRef[_nGpuLayers];
+            for (int i = 0; i < _nGpuLayers; i++)
+            {
+                _cpuMoeGateInp[i]  = ResolveCpuWeight($"blk.{i}.ffn_gate_inp.weight");
+                _cpuMoeGateExps[i] = ResolveCpuWeight($"blk.{i}.ffn_gate_exps.weight");
+                _cpuMoeUpExps[i]   = ResolveCpuWeight($"blk.{i}.ffn_up_exps.weight");
+                _cpuMoeDownExps[i] = ResolveCpuWeight($"blk.{i}.ffn_down_exps.weight");
+            }
         }
 
         // ── Resolve CPU weights (layers nGpuLayers..numLayers-1) ──
@@ -1318,8 +1388,12 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         {
             _gpu.CopyDeviceRegion(_gpuNormBuf, 0, normAll, (long)t * _embDim * sizeof(float),
                                   (long)_embDim * sizeof(float));
-            if (_isMoE) GpuMoeFfn(i);
-            else        GpuDenseFfn(i);
+            if (_isMoE)
+            {
+                if (_cpuMoe) GpuTrunkCpuMoeFfn(i);
+                else         GpuMoeFfn(i);
+            }
+            else GpuDenseFfn(i);
 
             _gpu.CopyDeviceRegion(_gpuResidual, 0, blockOut, (long)t * _embDim * sizeof(float),
                                   (long)_embDim * sizeof(float));
@@ -1471,7 +1545,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         _gpu.RecordBarrier();
 
         if (_isMoE)
-            GpuMoeFfn(i);
+        {
+            if (_cpuMoe) GpuTrunkCpuMoeFfn(i);
+            else         GpuMoeFfn(i);
+        }
         else
             GpuDenseFfn(i);
         _gpu.RecordBarrier();
@@ -2276,51 +2353,56 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         SimdKernels.AddInPlace(_cpuHidden, _pleY, _embDim);
     }
 
-    private void CpuMoeFfn(int ci)
+    // Router + routed-expert FFN on the CPU. Reads `normIn` ([_embDim]), writes the routed
+    // MoE output into `hiddenOut` ([_embDim], cleared first). Does NOT include the shared
+    // expert (callers add it). Bit-identical to the inlined loop it replaces.
+    private void CpuMoeRouted(CpuWeightRef gateInp, CpuWeightRef gateExps,
+        CpuWeightRef upExps, CpuWeightRef downExps, float* normIn, float* hiddenOut)
     {
         int numExperts = _hp.NumExperts;
-        int numActive = _hp.NumActiveExperts;
+        int numActive  = _hp.NumActiveExperts;
 
-        SimdKernels.MatVec(_cpuRouterLogits, _cpuWGateInp![ci].DataPtr, _cpuNormBuf, numExperts, _embDim, _cpuWGateInp[ci].DType);
-        if (_hp.UseSigmoidGating)
-            SimdKernels.SigmoidInPlace(_cpuRouterLogits, numExperts);
-        else
-            SimdKernels.SoftmaxInPlace(_cpuRouterLogits, numExperts);
+        SimdKernels.MatVec(_cpuRouterLogits, gateInp.DataPtr, normIn, numExperts, _embDim, gateInp.DType);
+        if (_hp.UseSigmoidGating) SimdKernels.SigmoidInPlace(_cpuRouterLogits, numExperts);
+        else                      SimdKernels.SoftmaxInPlace(_cpuRouterLogits, numExperts);
 
-        Span<int> selectedExperts = stackalloc int[numActive];
-        Span<float> expertWeights = stackalloc float[numActive];
+        Span<int>   selectedExperts = stackalloc int[numActive];
+        Span<float> expertWeights   = stackalloc float[numActive];
         SelectTopK(_cpuRouterLogits, numExperts, numActive, selectedExperts, expertWeights,
             normalize: _hp.NormalizeMoeTopKWeights);
 
-        if (_hasSharedExpert)
-        {
-            SimdKernels.MatVec(_cpuExpertGate, _cpuWGateShexp![ci].DataPtr, _cpuNormBuf, _expertDim, _embDim, _cpuWGateShexp[ci].DType);
-            SimdKernels.MatVec(_cpuExpertUp, _cpuWUpShexp![ci].DataPtr, _cpuNormBuf, _expertDim, _embDim, _cpuWUpShexp[ci].DType);
-            SimdKernels.SiLuMul(_cpuExpertGate, _cpuExpertUp, _expertDim);
-            SimdKernels.MatVec(_cpuSharedOut, _cpuWDownShexp![ci].DataPtr, _cpuExpertGate, _embDim, _expertDim, _cpuWDownShexp[ci].DType);
-        }
-
-        new Span<float>(_cpuHidden, _embDim).Clear();
+        new Span<float>(hiddenOut, _embDim).Clear();
 
         for (int k = 0; k < numActive; k++)
         {
             int expertIdx = selectedExperts[k];
-            float weight = expertWeights[k];
+            float weight  = expertWeights[k];
 
-            ExpertMatVec(_cpuExpertGate, _cpuWGateExps![ci], expertIdx, _expertDim, _embDim, _cpuNormBuf);
-            ExpertMatVec(_cpuExpertUp, _cpuWUpExps![ci], expertIdx, _expertDim, _embDim, _cpuNormBuf);
+            ExpertMatVec(_cpuExpertGate, gateExps, expertIdx, _expertDim, _embDim, normIn);
+            ExpertMatVec(_cpuExpertUp,   upExps,   expertIdx, _expertDim, _embDim, normIn);
 
             if (_hp.UseSigmoidGating)
             {
                 SimdKernels.ScaleInPlace(_cpuExpertGate, weight, _expertDim);
-                SimdKernels.ScaleInPlace(_cpuExpertUp, weight, _expertDim);
+                SimdKernels.ScaleInPlace(_cpuExpertUp,   weight, _expertDim);
                 weight = 1.0f;
             }
 
             SimdKernels.SiLuMul(_cpuExpertGate, _cpuExpertUp, _expertDim);
-            ExpertMatVecDown(_cpuHidden, _cpuWDownExps![ci], expertIdx, _embDim, _expertDim, _cpuExpertGate, weight);
+            ExpertMatVecDown(hiddenOut, downExps, expertIdx, _embDim, _expertDim, _cpuExpertGate, weight);
         }
+    }
 
+    private void CpuMoeFfn(int ci)
+    {
+        if (_hasSharedExpert)
+        {
+            SimdKernels.MatVec(_cpuExpertGate, _cpuWGateShexp![ci].DataPtr, _cpuNormBuf, _expertDim, _embDim, _cpuWGateShexp[ci].DType);
+            SimdKernels.MatVec(_cpuExpertUp,   _cpuWUpShexp![ci].DataPtr,   _cpuNormBuf, _expertDim, _embDim, _cpuWUpShexp[ci].DType);
+            SimdKernels.SiLuMul(_cpuExpertGate, _cpuExpertUp, _expertDim);
+            SimdKernels.MatVec(_cpuSharedOut, _cpuWDownShexp![ci].DataPtr, _cpuExpertGate, _embDim, _expertDim, _cpuWDownShexp[ci].DType);
+        }
+        CpuMoeRouted(_cpuWGateInp![ci], _cpuWGateExps![ci], _cpuWUpExps![ci], _cpuWDownExps![ci], _cpuNormBuf, _cpuHidden);
         if (_hasSharedExpert)
             SimdKernels.AddInPlace(_cpuHidden, _cpuSharedOut, _embDim);
     }
@@ -2802,6 +2884,34 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             _gpu.AddInPlace(_gpuHidden, _gpuMoeSharedOut!);
     }
 
+    // CPU-MoE trunk path (issue #215): the GPU computes attention/norms (already done by the
+    // caller, leaving the post-FFN-norm hidden in _gpuNormBuf) plus the shared expert; the
+    // routed experts run on the CPU. Mirrors CudaHybridGdnForwardPass's CPU-MoE per-layer
+    // path. Writes the MoE output into _gpuHidden (no residual add — the caller does that),
+    // exactly like GpuMoeFfn.
+    private void GpuTrunkCpuMoeFfn(int layer)
+    {
+        // Shared expert on the GPU first, overlapping the CPU routed work below. (Targets
+        // Qwen3-Coder / OLMoE have no shared expert, so this branch is dead there; kept for
+        // qwen2moe-class models.)
+        if (_hasSharedExpert)
+        {
+            GpuMatMul(_gpuFfnGate, _gpuWGateShexp![layer], _gpuNormBuf);
+            GpuMatMul(_gpuFfnUp,   _gpuWUpShexp![layer],   _gpuNormBuf);
+            _gpu.SiLuMul(_gpuFfnGate, _gpuFfnUp);
+            GpuMatMul(_gpuMoeSharedOut!, _gpuWDownShexp![layer], _gpuFfnGate);
+        }
+
+        // Download the normed hidden, run router + routed experts on the CPU, upload back.
+        _gpu.Download(_gpuNormBuf, (nint)_cpuNormBuf, _embDim);
+        CpuMoeRouted(_cpuMoeGateInp![layer], _cpuMoeGateExps![layer],
+                     _cpuMoeUpExps![layer], _cpuMoeDownExps![layer], _cpuNormBuf, _cpuHidden);
+        _gpu.UploadInto(_gpuHidden, (nint)_cpuHidden, _embDim);
+
+        if (_hasSharedExpert)
+            _gpu.AddInPlace(_gpuHidden, _gpuMoeSharedOut!);
+    }
+
     // Routed-expert weights are uploaded lazily by CudaExpertSlotManager on cache
     // miss, not eagerly here. (The shared expert and router stay resident.)
 
@@ -2948,7 +3058,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             _gpu.Free(_gpuWo[i]);
             if (_isMoE)
             {
-                _gpu.Free(_gpuWGateInp![i]);
+                // _gpuWGateInp[i] is null on CPU-MoE layers (router runs on CPU; not uploaded).
+                if (_gpuWGateInp![i] is not null) _gpu.Free(_gpuWGateInp[i]);
                 // Routed-expert tensors are owned by _expertSlotManager (freed in its Dispose).
                 if (_hasSharedExpert)
                 {

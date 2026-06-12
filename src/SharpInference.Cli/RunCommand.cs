@@ -442,6 +442,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 // a model bigger than VRAM (e.g. Qwen3-Coder 30B-A3B in 12 GB) would
                 // attempt full-offload via CudaForwardPass and silently OOM.
                 int cudaGpuLayers;
+                bool moeAutoNeedsHybrid = false;
                 if (nGpuLayers == -1)
                 {
                     var hwProfile = HardwareProfile.Detect(cuda);
@@ -476,13 +477,29 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                             cudaGpuLayers = hp.NumLayers;
                         }
                     }
+
+                    // Issue #215: a MoE model whose routed experts can't all stay resident must use the
+                    // hybrid path (which streams experts via SLRU or runs them on CPU), even though the
+                    // planner places the whole attention trunk on GPU (GpuLayers == NumLayers). Without
+                    // this, auto (-g -1) falls through to full-offload CudaForwardPass and thrashes/OOMs —
+                    // the very case TierPlanner was added to avoid.
+                    moeAutoNeedsHybrid = hp.IsMoE
+                        && cudaGpuLayers == hp.NumLayers
+                        && placement.MoeRoutedExpertBytes > placement.ExpertCacheBudgetBytes;
+                    if (moeAutoNeedsHybrid)
+                    {
+                        AnsiConsole.MarkupLine(
+                            $"[dim]MoE routed experts ({placement.MoeRoutedExpertBytes / (1024.0 * 1024):F0} MB) " +
+                            $"exceed the GPU expert-cache budget ({placement.ExpertCacheBudgetBytes / (1024.0 * 1024):F0} MB); " +
+                            $"using the hybrid path (CPU-MoE / SLRU streaming) instead of full offload.[/]");
+                    }
                 }
                 else
                 {
                     cudaGpuLayers = nGpuLayers;
                 }
 
-                bool wantHybrid = cudaGpuLayers > 0 && cudaGpuLayers < hp.NumLayers;
+                bool wantHybrid = (cudaGpuLayers > 0 && cudaGpuLayers < hp.NumLayers) || moeAutoNeedsHybrid;
                 if (wantHybrid)
                 {
                     var hwProfile = HardwareProfile.Detect(cuda);
