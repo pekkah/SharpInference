@@ -14,13 +14,21 @@ public static class TierPlanner
     /// </summary>
     public static LayerPlacement Plan(GgufModel model, ModelHyperparams hp,
         HardwareProfile hardware, bool turboQuant = false, int tqBits = 3,
-        int requestedCtxSize = 0, int tqFp32Window = 256)
+        int requestedCtxSize = 0, int tqFp32Window = 256, DType kvDtype = DType.Float32)
     {
         if (hardware.VramBytes <= 0)
             return new LayerPlacement(0, hp.NumLayers, 0, 0, requestedCtxSize > 0 ? requestedCtxSize : hp.ContextLength);
 
         long vramTotal = hardware.VramBytes;
         int headDim = hp.HeadDim;
+
+        // Gemma-4-class models have per-layer KV shape (SWA window-rings, KV-share
+        // aliasing, per-layer head_dim / kv-heads). Their KV footprint is a piecewise
+        // function of context, so price it via the runtime allocator's own helper
+        // (CudaForwardPass.EstimateKvCacheBytes) rather than the flat per-token formula —
+        // the two can't drift. Uniform-attention models keep the flat formula.
+        bool perLayerKvShape = hp.LayerHeadDim is not null
+            || hp.IsSwaLayer is not null || hp.KvSourceLayer is not null;
 
         // Reserve for Vulkan overhead + scratch buffers
         long scratchBytes = (long)(hp.EmbeddingDim * 3 + hp.NumHeads * headDim
@@ -96,9 +104,16 @@ public static class TierPlanner
         }
         else if (gpuLayers > 0 && vramBudget > 0)
         {
-            long kvBytesPerToken = 2L * gpuLayers * hp.NumKvHeads * headDim * sizeof(float);
-            gpuCtxSize = (int)(vramBudget / kvBytesPerToken);
-            gpuCtxSize = Math.Clamp(gpuCtxSize, 512, autoCtxCap);
+            if (perLayerKvShape)
+            {
+                gpuCtxSize = SolveGpuCtxForPerLayerKv(hp, autoCtxCap, vramBudget, kvDtype, gpuLayers);
+            }
+            else
+            {
+                long kvBytesPerToken = 2L * gpuLayers * DTypeInfo.ByteSize((long)hp.NumKvHeads * headDim, kvDtype);
+                gpuCtxSize = (int)(vramBudget / kvBytesPerToken);
+                gpuCtxSize = Math.Clamp(gpuCtxSize, 512, autoCtxCap);
+            }
         }
         else
         {
@@ -119,10 +134,36 @@ public static class TierPlanner
             long tqPositions = Math.Max(0, gpuCtxSize - fp32Window);
             gpuKvBytes = fp32WindowBytes + tqBytesPerToken * tqPositions;
         }
+        else if (perLayerKvShape)
+        {
+            gpuKvBytes = CudaForwardPass.EstimateKvCacheBytes(hp, gpuCtxSize, kvDtype, gpuLayers);
+        }
         else
         {
-            long kvBytesPerToken = 2L * gpuLayers * hp.NumKvHeads * headDim * sizeof(float);
+            long kvBytesPerToken = 2L * gpuLayers * DTypeInfo.ByteSize((long)hp.NumKvHeads * headDim, kvDtype);
             gpuKvBytes = kvBytesPerToken * gpuCtxSize;
+        }
+
+        // Issue #215: for MoE models the routed experts are NOT charged against the trunk
+        // weight budget (excluded in MeasureLayerBytes); the VRAM left after trunk weights
+        // and KV is the budget the SLRU routed-expert cache can use (or, when too small,
+        // the signal to route MoE to CPU). Diagnostic only — the runtime SLRU/CPU-MoE
+        // decision is made later from actual free VRAM. Zero for dense models.
+        long expertCacheBudget = hp.IsMoE ? Math.Max(0, vramBudget - gpuKvBytes) : 0;
+
+        // Issue #215: the full-residency GPU cost of every routed expert (gate/up/down _exps
+        // across all layers). Compared against ExpertCacheBudgetBytes by the CLI to decide
+        // whether full-GPU MoE is viable or the model must use the hybrid path (SLRU streaming
+        // or CPU-MoE). Zero for dense models.
+        long moeRoutedExpertBytes = 0;
+        if (hp.IsMoE)
+        {
+            for (int i = 0; i < hp.NumLayers; i++)
+            {
+                moeRoutedExpertBytes += MeasureGpuTensorBytes(model, $"blk.{i}.ffn_gate_exps.weight");
+                moeRoutedExpertBytes += MeasureGpuTensorBytes(model, $"blk.{i}.ffn_up_exps.weight");
+                moeRoutedExpertBytes += MeasureGpuTensorBytes(model, $"blk.{i}.ffn_down_exps.weight");
+            }
         }
 
         return new LayerPlacement(
@@ -130,7 +171,35 @@ public static class TierPlanner
             hp.NumLayers - gpuLayers,
             gpuWeightBytes,
             gpuKvBytes,
-            gpuCtxSize);
+            gpuCtxSize,
+            expertCacheBudget,
+            moeRoutedExpertBytes);
+    }
+
+    // For per-layer-KV models (Gemma 4: SWA window-rings, KV-share aliasing, per-layer
+    // head_dim / kv-heads) KV bytes are piecewise in context — SWA layers saturate at
+    // their window ring — so the flat divide the uniform path uses would mis-solve the
+    // context. Binary-search the largest context whose true allocation (the same
+    // CudaForwardPass.EstimateKvCacheBytes the forward pass allocates from) fits the
+    // budget. The function is monotonic non-decreasing in context, so an upper-bound
+    // search converges; the floor (512) mirrors the uniform path's Math.Clamp lower bound.
+    internal static int SolveGpuCtxForPerLayerKv(
+        ModelHyperparams hp, int autoCtxCap, long vramBudget, DType kvDtype, int gpuLayers)
+    {
+        const int floorCtx = 512;
+        if (autoCtxCap <= floorCtx ||
+            CudaForwardPass.EstimateKvCacheBytes(hp, floorCtx, kvDtype, gpuLayers) > vramBudget)
+            return Math.Min(floorCtx, autoCtxCap);
+        int lo = floorCtx, hi = autoCtxCap;
+        while (lo < hi)
+        {
+            int mid = lo + (hi - lo + 1) / 2;
+            if (CudaForwardPass.EstimateKvCacheBytes(hp, mid, kvDtype, gpuLayers) <= vramBudget)
+                lo = mid;
+            else
+                hi = mid - 1;
+        }
+        return lo;
     }
 
     private static long MeasureTensorBytes(GgufModel model, string name)
@@ -162,12 +231,18 @@ public static class TierPlanner
     private static long MeasureLayerBytes(GgufModel model, ModelHyperparams hp, int layer)
     {
         long total = 0;
+        // Issue #215: routed experts (ffn_gate_exps / ffn_up_exps / ffn_down_exps) are
+        // NOT eagerly resident per layer — the runtime streams them via the SLRU slot
+        // manager or runs them on CPU. Charging them against the trunk weight budget
+        // makes the greedy packer over-charge MoE layers and stop placing trunk layers
+        // far too early. Measure MoE layers as trunk-only (attn + norms + router + shared
+        // expert) and exclude the routed experts here. ffn_gate_inp (the router) IS
+        // eagerly resident, so it stays.
         string[] suffixes = hp.IsMoE
             ?
             [
                 "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight",
-                "attn_output.weight", "ffn_norm.weight", "ffn_gate_inp.weight",
-                "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"
+                "attn_output.weight", "ffn_norm.weight", "ffn_gate_inp.weight"
             ]
             :
             [
@@ -235,18 +310,31 @@ public static class TierPlanner
     }
 }
 
-/// <summary>Result of tier placement analysis.</summary>
+/// <summary>
+/// Result of tier placement analysis.
+/// <paramref name="ExpertCacheBudgetBytes"/> is the VRAM left over after trunk weights
+/// and KV for the SLRU routed-expert cache (MoE only; 0 for dense — issue #215).
+/// <paramref name="MoeRoutedExpertBytes"/> is the full-residency GPU cost of all routed
+/// experts; when it exceeds <paramref name="ExpertCacheBudgetBytes"/> the model can't keep
+/// every expert resident and must use the hybrid path (MoE only; 0 for dense — issue #215).
+/// </summary>
 public sealed record LayerPlacement(
     int GpuLayers,
     int CpuLayers,
     long GpuWeightBytes,
     long GpuKvBytes,
-    int RecommendedCtxSize)
+    int RecommendedCtxSize,
+    long ExpertCacheBudgetBytes = 0,
+    long MoeRoutedExpertBytes = 0)
 {
     public string Summary()
     {
         double gpuWeightMB = GpuWeightBytes / (1024.0 * 1024);
         double gpuKvMB = GpuKvBytes / (1024.0 * 1024);
-        return $"GPU: {GpuLayers} layers ({gpuWeightMB:F0} MB weights, {gpuKvMB:F0} MB KV), CPU: {CpuLayers} layers, ctx: {RecommendedCtxSize}";
+        string moe = ExpertCacheBudgetBytes > 0
+            ? $", expert-cache budget: {ExpertCacheBudgetBytes / (1024.0 * 1024):F0} MB" +
+              $" (routed experts: {MoeRoutedExpertBytes / (1024.0 * 1024):F0} MB)"
+            : "";
+        return $"GPU: {GpuLayers} layers ({gpuWeightMB:F0} MB weights, {gpuKvMB:F0} MB KV), CPU: {CpuLayers} layers, ctx: {RecommendedCtxSize}{moe}";
     }
 }

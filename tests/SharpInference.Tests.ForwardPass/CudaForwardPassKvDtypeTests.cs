@@ -699,6 +699,125 @@ public sealed class CudaForwardPassKvDtypeTests
         Assert.Equal(expected, bytes);
     }
 
+    // ── Issues #220 / #215: gpuLayers scoping + per-layer-KV ctx solver ──────
+    // EstimateKvCacheBytes gained a final gpuLayers param: when < 0 it sums ALL
+    // layers (old behavior); when >= 0 it sums only the first gpuLayers (clamped to
+    // NumLayers). TierPlanner.SolveGpuCtxForPerLayerKv binary-searches the largest
+    // context whose scoped KV allocation fits the VRAM budget — the #220 contract is
+    // that the chosen context never UNDER-reserves (the true allocation must fit).
+
+    /// <summary>
+    /// gpuLayers scopes the sum to the first N layers. On a flat/uniform model every
+    /// layer is identical, so the first 2 of 4 is exactly half of all 4; -1 / NumLayers /
+    /// an over-cap value / the no-arg default all mean "all layers"; 0 means nothing.
+    /// </summary>
+    [Fact]
+    public void EstimateKvCacheBytes_GpuLayersScoping_SumsOnlyFirstN()
+    {
+        var hp = FlatHp(numLayers: 4, numKvHeads: 8, headDim: 128);
+        const int ctx = 2048;
+
+        long all = CudaForwardPass.EstimateKvCacheBytes(hp, ctx, DType.Float32, gpuLayers: 4);
+        long firstTwo = CudaForwardPass.EstimateKvCacheBytes(hp, ctx, DType.Float32, gpuLayers: 2);
+        Assert.Equal(all / 2, firstTwo);            // uniform model → first 2 == 2/4 of all 4
+
+        // -1 (default), == NumLayers, and an over-cap value (clamped to NumLayers) all mean "all".
+        Assert.Equal(all, CudaForwardPass.EstimateKvCacheBytes(hp, ctx, DType.Float32, gpuLayers: -1));
+        Assert.Equal(all, CudaForwardPass.EstimateKvCacheBytes(hp, ctx, DType.Float32, gpuLayers: 100));
+        Assert.Equal(all, CudaForwardPass.EstimateKvCacheBytes(hp, ctx, DType.Float32)); // no-arg == -1
+
+        // gpuLayers 0 → no layers summed.
+        Assert.Equal(0L, CudaForwardPass.EstimateKvCacheBytes(hp, ctx, DType.Float32, gpuLayers: 0));
+    }
+
+    /// <summary>
+    /// gpuLayers scoping over the gemma4 per-layer shape: the scoped prefix still honors
+    /// SWA-ring capping and KV-share aliasing. layer0 = global, layer1 = SWA, layer2 aliases
+    /// layer0 (allocates nothing). So gpuLayers 1 = layer0 only; gpuLayers 2 = layer0+layer1;
+    /// gpuLayers 3 (== all) is identical to 2 because the aliased tail contributes 0.
+    /// </summary>
+    [Fact]
+    public void EstimateKvCacheBytes_GpuLayersScoping_Gemma4_SkipsAliasedAndScopes()
+    {
+        const int ctx = 65536;
+        const int window = 1024;
+        var hp = Gemma4ShapedHp(
+            layerHeadDim: [256, 256, 256],
+            layerKvHeads: [8, 8, 8],
+            isSwa: [false, true, false],
+            kvSource: [-1, -1, 0],   // layer 2 aliases layer 0 → no own pages
+            slidingWindow: window);
+
+        int swaRing = SwaRingSizeForTest(ctx, window);
+        long kvDim = 8L * 256;                          // 2048
+        long globalBuf = RoundUpPow2(kvDim * ctx * 2);  // bf16 = 2 B/elem
+        long swaBuf = RoundUpPow2(kvDim * swaRing * 2);
+
+        long expected1 = 2 * globalBuf;                 // layer0 only (K+V)
+        long expected2 = 2 * globalBuf + 2 * swaBuf;    // layer0 + layer1 (SWA)
+        // layer2 is aliased → 0, so all (3) == first 2.
+        Assert.Equal(expected1, CudaForwardPass.EstimateKvCacheBytes(hp, ctx, DType.BFloat16, gpuLayers: 1));
+        Assert.Equal(expected2, CudaForwardPass.EstimateKvCacheBytes(hp, ctx, DType.BFloat16, gpuLayers: 2));
+        Assert.Equal(expected2, CudaForwardPass.EstimateKvCacheBytes(hp, ctx, DType.BFloat16, gpuLayers: 3));
+    }
+
+    /// <summary>
+    /// SolveGpuCtxForPerLayerKv returns the LARGEST context whose scoped KV allocation fits
+    /// the budget (#220). Sizing the budget to exactly a reference context's footprint, the
+    /// solver must (a) fit — never under-reserve, (b) return at least that reference context
+    /// (it fits), and (c) be maximal — the next context up overflows the budget (unless the
+    /// auto cap is hit first).
+    /// </summary>
+    [Fact]
+    public void SolveGpuCtxForPerLayerKv_ReturnsLargestFittingContext()
+    {
+        const int gpuLayers = 3;
+        const int autoCtxCap = 32768;
+        const int refCtx = 8192;
+        var dtype = DType.BFloat16;
+        var hp = Gemma4ShapedHp(
+            layerHeadDim: [256, 256, 256],
+            layerKvHeads: [8, 8, 8],
+            isSwa: [false, true, false],
+            kvSource: [-1, -1, 0],
+            slidingWindow: 1024);
+
+        long budget = CudaForwardPass.EstimateKvCacheBytes(hp, refCtx, dtype, gpuLayers);
+        int got = TierPlanner.SolveGpuCtxForPerLayerKv(hp, autoCtxCap, budget, dtype, gpuLayers);
+
+        Assert.True(CudaForwardPass.EstimateKvCacheBytes(hp, got, dtype, gpuLayers) <= budget,
+            $"solved ctx {got} over-reserves vs budget {budget} — would OOM at runtime (#220).");
+        Assert.True(got >= refCtx,
+            $"solved ctx {got} below the reference {refCtx}, which fits exactly — not maximal.");
+        Assert.True(got == autoCtxCap ||
+            CudaForwardPass.EstimateKvCacheBytes(hp, got + 1, dtype, gpuLayers) > budget,
+            $"ctx {got + 1} also fits budget {budget} — solver did not return the LARGEST fitting context.");
+    }
+
+    /// <summary>
+    /// SolveGpuCtxForPerLayerKv floors at 512: a budget too small for even 512-ctx returns
+    /// the floor (the alloc then fails loudly rather than silently picking a smaller, unusable
+    /// context), and an autoCtxCap below the floor clamps to the cap (Math.Min(512, cap)).
+    /// </summary>
+    [Fact]
+    public void SolveGpuCtxForPerLayerKv_BudgetBelowFloor_ReturnsFloor()
+    {
+        var dtype = DType.BFloat16;
+        var hp = Gemma4ShapedHp(
+            layerHeadDim: [256, 256, 256],
+            layerKvHeads: [8, 8, 8],
+            isSwa: [false, true, false],
+            kvSource: [-1, -1, 0],
+            slidingWindow: 1024);
+
+        // 1 byte can't hold even a 512-ctx cache → floor (512).
+        Assert.Equal(512, TierPlanner.SolveGpuCtxForPerLayerKv(hp, autoCtxCap: 32768, vramBudget: 1, dtype, gpuLayers: 3));
+
+        // autoCtxCap below the floor → clamp to the cap (Math.Min(512, cap)), even with a huge budget.
+        Assert.Equal(256, TierPlanner.SolveGpuCtxForPerLayerKv(
+            hp, autoCtxCap: 256, vramBudget: long.MaxValue, dtype, gpuLayers: 3));
+    }
+
     /// <summary>
     /// Q8KvGeometrySupported returns false when ANY single (non-aliased) layer violates the
     /// %32 rule — not just when all do. A mixed set with one bad layer must fail, matching

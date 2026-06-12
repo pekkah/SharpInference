@@ -286,6 +286,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     };
 
     /// <summary>
+    /// Resolves the configured KV-cache dtype from the SHARPI_KV_DTYPE environment variable
+    /// (fp32 default, bf16, q8_0), reusing the same parser the constructor uses. Exposed so
+    /// the layer planner / loader can price the KV budget at the dtype the forward pass will
+    /// actually allocate, instead of assuming fp32. Throws on an invalid value (same contract
+    /// as the constructor) so a typo can't silently mis-budget.
+    /// </summary>
+    public static DType ResolveConfiguredKvDType() =>
+        ParseKvDType(Environment.GetEnvironmentVariable("SHARPI_KV_DTYPE"));
+
+    /// <summary>
     /// Issue #141: route Q8_0 trunk matmuls in the batched prefill through the
     /// compute-bound cuBLAS GEMM (<see cref="CudaBackend.MatMulBatchedGemm"/>)
     /// instead of the memory-bound matvec GEMM-N. Default on
@@ -3978,13 +3988,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     /// <c>NumLayers × kvDim × maxCtx</c> formula otherwise; KV-share layers (Gemma 4 tail)
     /// alias the source and allocate nothing. Used by the auto-narrow heuristic (#185) to
     /// compare the fp32 / bf16 / q8_0 footprints against <see cref="EstimateAvailableKvVram"/>.
+    /// <paramref name="gpuLayers"/> (default -1 = all) scopes the sum to the first N
+    /// GPU-resident layers, used by TierPlanner to price the GPU KV budget for a candidate split.
     /// </summary>
-    internal static long EstimateKvCacheBytes(ModelHyperparams hp, int maxCtx, DType kvDType)
+    internal static long EstimateKvCacheBytes(ModelHyperparams hp, int maxCtx, DType kvDType, int gpuLayers = -1)
     {
         bool perLayerKv = hp.LayerHeadDim is not null;
         int swaWindow = hp.SlidingWindowSize > 0 ? hp.SlidingWindowSize : maxCtx;
         long total = 0;
-        for (int i = 0; i < hp.NumLayers; i++)
+        int layerCount = gpuLayers < 0 ? hp.NumLayers : Math.Min(gpuLayers, hp.NumLayers);
+        for (int i = 0; i < layerCount; i++)
         {
             if (hp.KvSourceLayer is { } ksl && ksl[i] >= 0) continue; // aliased — no own pages
             int layerHd = perLayerKv ? hp.LayerHeadDim![i] : hp.HeadDim;
