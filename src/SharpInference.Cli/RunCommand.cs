@@ -447,7 +447,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     var hwProfile = HardwareProfile.Detect(cuda);
                     AnsiConsole.MarkupLine($"[dim]Hardware: {hwProfile.Summary()}[/]");
                     var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant,
-                        requestedCtxSize: ctxSize);
+                        requestedCtxSize: ctxSize, kvDtype: CudaForwardPass.ResolveConfiguredKvDType());
                     cudaGpuLayers = placement.GpuLayers;
 
                     // Gemma 4 KV-share constraint: the shared-KV source layers (E4B:
@@ -487,7 +487,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 {
                     var hwProfile = HardwareProfile.Detect(cuda);
                     var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant,
-                        requestedCtxSize: ctxSize);
+                        requestedCtxSize: ctxSize, kvDtype: CudaForwardPass.ResolveConfiguredKvDType());
                     if (nGpuLayers != -1)
                         placement = placement with { GpuLayers = cudaGpuLayers, CpuLayers = hp.NumLayers - cudaGpuLayers };
 

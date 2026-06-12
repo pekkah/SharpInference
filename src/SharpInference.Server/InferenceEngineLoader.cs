@@ -210,7 +210,8 @@ public static class InferenceEngineLoader
             // full-offload / hybrid / CPU based on what we got back.
             var hwProfile = HardwareProfile.Detect(cuda);
             int gpuLayers = nGpuLayers == -1
-                ? TierPlanner.Plan(model, hp, hwProfile, turboQuant, requestedCtxSize: ctxSize).GpuLayers
+                ? TierPlanner.Plan(model, hp, hwProfile, turboQuant, requestedCtxSize: ctxSize,
+                    kvDtype: CudaForwardPass.ResolveConfiguredKvDType()).GpuLayers
                 : nGpuLayers;
             if (nGpuLayers == -1)
                 gpuLayers = ClampGemma4KvShareBoundary(hp, gpuLayers);
@@ -235,7 +236,8 @@ public static class InferenceEngineLoader
                 return (cfwd, cfwd.SupportsContinuousBatching);
             }
 
-            var planForHybrid = TierPlanner.Plan(model, hp, hwProfile, turboQuant, requestedCtxSize: ctxSize)
+            var planForHybrid = TierPlanner.Plan(model, hp, hwProfile, turboQuant, requestedCtxSize: ctxSize,
+                    kvDtype: CudaForwardPass.ResolveConfiguredKvDType())
                 with { GpuLayers = gpuLayers, CpuLayers = hp.NumLayers - gpuLayers };
             var chfwd = new CudaHybridForwardPass(model, cuda, hp, planForHybrid, turboQuant);
             owned.Add(chfwd);
