@@ -5,6 +5,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Logging abstractions only (no provider): lets the engine emit ILogger diagnostics
+         (per-request perf trace) that the host's configured logging pipeline renders. -->
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="*" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\SharpInference.Core\SharpInference.Core.csproj" />
     <ProjectReference Include="..\SharpInference.Cpu\SharpInference.Cpu.csproj" />
     <ProjectReference Include="..\SharpInference.Vulkan\SharpInference.Vulkan.csproj" />
