@@ -290,7 +290,10 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                 // wall time went. Emitted via ILogger at Debug, so enable
                 // "SharpInference.Engine": "Debug" in the host's Logging:LogLevel to see it.
                 var swReq = Stopwatch.StartNew();
-                bool logReq = Logger?.IsEnabled(LogLevel.Debug) == true;
+                // Capture the logger once: Logger has a public setter, so reading it twice
+                // (IsEnabled check here, LogDebug in the finally) could race a concurrent set.
+                var logger = Logger;
+                bool logReq = logger?.IsEnabled(LogLevel.Debug) == true;
                 int promptTokenCount = 0, reusedTokens = 0, decodeTokens = 0;
                 long encodeMs = 0, prefillMs = 0, ttftMs = -1;
                 try
@@ -681,7 +684,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         // also folds in the end-of-decode snapshot, a negligible tail.
                         double decTps = (ttftMs >= 0 && totalMs > ttftMs)
                             ? decodeTokens * 1000.0 / (totalMs - ttftMs) : 0;
-                        Logger!.LogDebug(
+                        logger!.LogDebug(
                             "request prompt={PromptTokens}tok (reused={ReusedTokens} new={NewTokens}) " +
                             "encode={EncodeMs}ms prefill={PrefillMs}ms ({PrefillTps:F0} tok/s) " +
                             "ttft={TtftMs}ms decode={DecodeTokens}tok ({DecodeTps:F0} tok/s) total={TotalMs}ms",
