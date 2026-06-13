@@ -47,6 +47,20 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     // (or a 1-float placeholder when _maxSeqLen ≤ 4096). Shared by both the TQ and
     // FP32 attention shaders when seq_len exceeds the shared-memory fast-path cap.
     private readonly Tensor _gpuAttnScoresScratch;
+    // Flash-decoding split-KV (#235/#237/#238): partials for the split decode-attention path on
+    // the GPU-resident attention layers. Same layout/gate as CudaForwardPass; null → per-head.
+    private Tensor? _splitKvPartialO;
+    private Tensor? _splitKvPartialMeta;
+    private readonly bool _splitDecodeEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_SPLIT_DECODE") != "0";
+    private readonly string? _splitGroupedMode =
+        Environment.GetEnvironmentVariable("SHARPI_SPLIT_DECODE_GROUPED");
+    // Hybrid split threshold (#238) — HIGHER than the dense 2048. Decode A/B (Coder-30B q8, 4070
+    // Ti): split wins 1.49× @6K, 1.63× @8K, 2.08× @16K, but is only break-even at 4096 (1.03×) and
+    // a small fast all-GPU MoE (OLMoE, 16 heads, ctx-capped at 4096) REGRESSES 2× there — attention
+    // is a tiny share of its fast decode, so the split's fixed overhead dominates. seqLen > 4096
+    // excludes OLMoE's whole range while keeping every confirmed Coder win.
+    private const int HybridSplitMinSeq = 4096;
     private readonly Dictionary<nint, DType> _gpuWeightDTypes = new();
 
     // ── CPU resources (layers nGpuLayers..numLayers-1) ──
@@ -477,6 +491,17 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         {
             long scratchElems = _maxSeqLen > 4096 ? (long)_numHeads * _maxSeqLen : 1L;
             _gpuAttnScoresScratch = gpu.Allocate(TensorShape.D1(scratchElems));
+        }
+
+        // Flash-decoding split-KV partials (#238) — allocate when the context is long enough to
+        // benefit and within the combine kernel's split bound. Mirrors CudaForwardPass; skipped
+        // under TurboQuant (TQ decode uses its own TqAttention path, never the split kernels).
+        if (_splitDecodeEnabled && !_tqEnabled
+            && _maxSeqLen > HybridSplitMinSeq && _maxSeqLen <= CudaForwardPass.SplitKvMaxCtx)
+        {
+            long nSplitsMax = (_maxSeqLen + CudaBackend.SplitKvChunk - 1) / CudaBackend.SplitKvChunk;
+            _splitKvPartialO = gpu.Allocate(TensorShape.D1((long)_numHeads * nSplitsMax * _maxHeadDim));
+            _splitKvPartialMeta = gpu.Allocate(TensorShape.D1((long)_numHeads * nSplitsMax * 2));
         }
 
         TraceVram("before per-layer weight upload");
@@ -1514,6 +1539,17 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     private void AttentionKv(Tensor q, Tensor kCache, Tensor vCache, Tensor output, Tensor? scoresScratch,
                              int numHeads, int numKvHeads, int headDim, int seqLen, int maxSeqLen, float attnScale = -1f)
     {
+        // Flash-decoding split-KV (#238): at long ctx the single-block-per-head kernels below
+        // underutilize the GPU. Mirrors the dense CudaForwardPass gate (incl. #237 grouped).
+        if (_splitKvPartialO is { } splitO && _splitKvPartialMeta is { } splitMeta
+            && seqLen > HybridSplitMinSeq && maxSeqLen <= _maxSeqLen)
+        {
+            bool grouped = CudaForwardPass.ShouldUseGroupedSplit(_splitGroupedMode, _kvDType, numHeads, numKvHeads, seqLen);
+            _gpu.AttentionSplitKv(q, kCache, vCache, output, splitO, splitMeta, _kvDType,
+                numHeads, numKvHeads, headDim, seqLen, maxSeqLen, attnScale, grouped: grouped);
+            return;
+        }
+
         if (_kvDType == DType.BFloat16)
             _gpu.AttentionBf16(q, kCache, vCache, output, scoresScratch, numHeads, numKvHeads, headDim, seqLen, maxSeqLen, attnScale);
         else if (_kvDType == DType.Q8_0)
@@ -3172,6 +3208,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         _gpu.Free(_gpuHidden); _gpu.Free(_gpuResidual); _gpu.Free(_gpuNormBuf);
         _gpu.Free(_gpuQ); _gpu.Free(_gpuK); _gpu.Free(_gpuV); _gpu.Free(_gpuAttnOut);
         _gpu.Free(_gpuFfnGate); _gpu.Free(_gpuFfnUp); _gpu.Free(_gpuLogits);
+        if (_splitKvPartialO is { } spo) _gpu.Free(spo);
+        if (_splitKvPartialMeta is { } spm) _gpu.Free(spm);
         if (_gpuRouterLogits is not null) _gpu.Free(_gpuRouterLogits);
         if (_gpuMoeSharedOut is not null) _gpu.Free(_gpuMoeSharedOut);
         if (_gpuMoeExpertOut is not null) _gpu.Free(_gpuMoeExpertOut);
