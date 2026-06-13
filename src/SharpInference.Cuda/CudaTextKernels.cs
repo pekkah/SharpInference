@@ -6895,6 +6895,213 @@ extern ""C"" __global__ void llm_attention_q8_0(
         num_heads, num_kv_heads, head_dim, seq_len, max_seq_len, attn_scale);
 }
 
+// ── Flash-decoding split-KV: partial attention over a KV chunk (issue #235) ──
+// Fixes the decode-attention occupancy collapse: the single-block kernels above
+// launch only num_heads blocks (~13% of the SMs at decode), serializing the whole
+// O(ctx)/token KV scan. This splits each head's causal sequence [0, seq_len) into
+// fixed SPLITKV_CHUNK-sized slices across `num_heads × n_splits` blocks, so the KV
+// read parallelizes across the SMs (flash-decoding; PyTorch/Tri-Dao 2023). Scalar
+// (not tensor-core) per the GQA-ratio-4 analysis in #235.
+//
+// One block = (query head h = blockIdx.x, KV split s = blockIdx.y). It handles slice
+// [s*CHUNK, min((s+1)*CHUNK, seq_len)) and emits the UN-normalized online-softmax
+// partial for that slice: local max m_i, local denom l_i = Σ exp(score−m_i), and the
+// numerator Õ_i[d] = Σ exp(score−m_i)·v[d]. `llm_attention_combine` then LSE-merges
+// the n_splits partials per head. The grid is FIXED at num_heads × n_splits
+// (n_splits = ceil(max_seq_len/CHUNK)) so it is CUDA-graph-capturable with seq_len as
+// the only per-replay-updated param; out-of-range splits (s*CHUNK ≥ seq_len) write
+// (m=−inf, l=0) and return so a stale partial from a prior replay is never merged.
+// K/V are decoded via sharpi_kv_dot / sharpi_kvload → fp32/bf16/q8_0 thunks.
+#define SPLITKV_CHUNK 512
+template<typename KV>
+__device__ void llm_attention_splitkv_impl(
+    const float* __restrict__ q,
+    const KV* __restrict__ k_cache,
+    const KV* __restrict__ v_cache,
+    float* __restrict__ partial_o,     // [num_heads * n_splits * head_dim]
+    float* __restrict__ partial_meta,  // [num_heads * n_splits * 2] : (m_i, l_i)
+    int num_heads, int num_kv_heads, int head_dim,
+    int seq_len, int n_splits, float attn_scale)
+{
+    __shared__ float sk_scores[SPLITKV_CHUNK];
+    __shared__ float sdata[256];
+
+    unsigned int tid = threadIdx.x;
+    int h = (int)blockIdx.x;
+    int s = (int)blockIdx.y;
+    if (h >= num_heads || s >= n_splits) return;
+
+    long meta_off = ((long)h * (long)n_splits + (long)s) * 2;
+    int t0 = s * SPLITKV_CHUNK;
+    // Out-of-range split (fixed grid, short seq_len): mark empty and bail so the
+    // combine skips it (scale = exp(−inf − gmax) = 0) and never reads a stale Õ.
+    if (t0 >= seq_len) {
+        if (tid == 0) { partial_meta[meta_off] = sharpi_neg_inf(); partial_meta[meta_off + 1] = 0.f; }
+        return;
+    }
+    int t1 = t0 + SPLITKV_CHUNK; if (t1 > seq_len) t1 = seq_len;
+    int n = t1 - t0;
+
+    int kv_head = h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
+    long q_off  = (long)h * (long)head_dim;
+
+    // Phase 1: scores for the slice → shared (indexed t − t0).
+    for (int t = (int)tid; t < n; t += 256) {
+        long k_off = (long)(t0 + t) * (long)kv_dim + (long)kv_head * (long)head_dim;
+        sk_scores[t] = sharpi_kv_dot(q + q_off, k_cache, k_off, head_dim) * scale;
+    }
+    __syncthreads();
+
+    // Phase 2: local max over the slice.
+    float local_max = sharpi_neg_inf();
+    for (int t = (int)tid; t < n; t += 256) local_max = fmaxf(local_max, sk_scores[t]);
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (unsigned int r = 128; r > 0; r >>= 1) {
+        if (tid < r) sdata[tid] = fmaxf(sdata[tid], sdata[tid + r]);
+        __syncthreads();
+    }
+    float m_i = sdata[0];
+    __syncthreads();
+
+    // exp(score − m_i) in place + local denom.
+    float local_sum = 0.f;
+    for (int t = (int)tid; t < n; t += 256) {
+        float e = __expf(sk_scores[t] - m_i);
+        sk_scores[t] = e;
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int r = 128; r > 0; r >>= 1) {
+        if (tid < r) sdata[tid] += sdata[tid + r];
+        __syncthreads();
+    }
+    float l_i = sdata[0];
+    __syncthreads();
+
+    if (tid == 0) { partial_meta[meta_off] = m_i; partial_meta[meta_off + 1] = l_i; }
+
+    // Phase 3: UN-normalized weighted-V numerator for this slice (combine divides by Σ).
+    long o_off = ((long)h * (long)n_splits + (long)s) * (long)head_dim;
+    for (int d = (int)tid; d < head_dim; d += 256) {
+        float acc = 0.f;
+        for (int t = 0; t < n; t++) {
+            long v_off = (long)(t0 + t) * (long)kv_dim + (long)kv_head * (long)head_dim;
+            acc += sk_scores[t] * sharpi_kvload(v_cache, v_off + d);
+        }
+        partial_o[o_off + d] = acc;
+    }
+}
+
+extern ""C"" __global__ void llm_attention_splitkv(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_meta,
+    int num_heads, int num_kv_heads, int head_dim,
+    int seq_len, int n_splits, float attn_scale)
+{
+    llm_attention_splitkv_impl<float>(q, k_cache, v_cache, partial_o, partial_meta,
+        num_heads, num_kv_heads, head_dim, seq_len, n_splits, attn_scale);
+}
+
+extern ""C"" __global__ void llm_attention_splitkv_bf16(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_cache,
+    const unsigned short* __restrict__ v_cache,
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_meta,
+    int num_heads, int num_kv_heads, int head_dim,
+    int seq_len, int n_splits, float attn_scale)
+{
+    llm_attention_splitkv_impl<unsigned short>(q, k_cache, v_cache, partial_o, partial_meta,
+        num_heads, num_kv_heads, head_dim, seq_len, n_splits, attn_scale);
+}
+
+extern ""C"" __global__ void llm_attention_splitkv_q8_0(
+    const float* __restrict__ q,
+    const block_q8_0* __restrict__ k_cache,
+    const block_q8_0* __restrict__ v_cache,
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_meta,
+    int num_heads, int num_kv_heads, int head_dim,
+    int seq_len, int n_splits, float attn_scale)
+{
+    llm_attention_splitkv_impl<block_q8_0>(q, k_cache, v_cache, partial_o, partial_meta,
+        num_heads, num_kv_heads, head_dim, seq_len, n_splits, attn_scale);
+}
+
+// ── Flash-decoding combine: LSE-merge the n_splits partials per head (#235) ──
+// One block per query head; merges the per-slice (m_i, l_i, Õ_i) partials into the
+// final attention output with the standard online-softmax rescale:
+//   m = max_i m_i ; l = Σ_i exp(m_i−m)·l_i ; O[d] = (Σ_i exp(m_i−m)·Õ_i[d]) / l
+// Exact (modulo FP reduction order). Empty splits carry m_i=−inf → scale 0 → skipped.
+// SPLITKV_MAX_SPLITS bounds the per-head split count (ceil(131072/512)=256).
+#define SPLITKV_MAX_SPLITS 256
+extern ""C"" __global__ void llm_attention_combine(
+    const float* __restrict__ partial_o,     // [num_heads * n_splits * head_dim]
+    const float* __restrict__ partial_meta,  // [num_heads * n_splits * 2]
+    float* __restrict__ out,                  // [num_heads * head_dim]
+    int num_heads, int head_dim, int n_splits)
+{
+    __shared__ float sh_scale[SPLITKV_MAX_SPLITS];
+    __shared__ float red[256];
+    __shared__ float sh_gmax;
+    __shared__ float sh_denom;
+
+    unsigned int tid = threadIdx.x;
+    int h = (int)blockIdx.x;
+    if (h >= num_heads) return;
+    long base = (long)h * (long)n_splits;
+
+    // Global max over the splits' local maxima.
+    float lmax = sharpi_neg_inf();
+    for (int s = (int)tid; s < n_splits; s += 256)
+        lmax = fmaxf(lmax, partial_meta[(base + s) * 2]);
+    red[tid] = lmax;
+    __syncthreads();
+    for (unsigned int r = 128; r > 0; r >>= 1) {
+        if (tid < r) red[tid] = fmaxf(red[tid], red[tid + r]);
+        __syncthreads();
+    }
+    if (tid == 0) sh_gmax = red[0];
+    __syncthreads();
+    float gmax = sh_gmax;
+
+    // Per-split rescale factor exp(m_i − m) + global denominator Σ exp(m_i−m)·l_i.
+    float ldenom = 0.f;
+    for (int s = (int)tid; s < n_splits; s += 256) {
+        float m = partial_meta[(base + s) * 2];
+        float l = partial_meta[(base + s) * 2 + 1];
+        float sc = __expf(m - gmax);
+        sh_scale[s] = sc;
+        ldenom += sc * l;
+    }
+    red[tid] = ldenom;
+    __syncthreads();
+    for (unsigned int r = 128; r > 0; r >>= 1) {
+        if (tid < r) red[tid] += red[tid + r];
+        __syncthreads();
+    }
+    if (tid == 0) sh_denom = red[0];
+    __syncthreads();
+    float inv = 1.0f / sh_denom;
+
+    // Weighted sum of the per-split numerators across head_dim.
+    for (int d = (int)tid; d < head_dim; d += 256) {
+        float acc = 0.f;
+        for (int s = 0; s < n_splits; s++) {
+            float sc = sh_scale[s];
+            if (sc != 0.f) acc += sc * partial_o[(base + s) * (long)head_dim + d];
+        }
+        out[(long)h * (long)head_dim + d] = acc * inv;
+    }
+}
+
 // ── SnapKV: per-(query, head) attention scoring against the K cache ────────
 // Issue #58. Computes the SnapKV importance signal for ONE captured query
 // vector against the layer's K cache. For each head h, masks positions

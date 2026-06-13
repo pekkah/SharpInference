@@ -325,6 +325,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _attentionSwaBatchedQ8Kernel;
     private nint   _fullSeqAttentionQ8Kernel;
     private nint   _fullSeqAttentionGlobalQ8Kernel;
+    // Issue #235 (flash-decoding): split-KV decode attention + LSE combine. Shared
+    // across fp32/bf16/q8 via the templated splitkv kernel; combine is dtype-agnostic.
+    private nint   _attentionSplitKvKernel;
+    private nint   _attentionSplitKvBf16Kernel;
+    private nint   _attentionSplitKvQ8Kernel;
+    private nint   _attentionCombineKernel;
 
     // Grow-only global score scratch for the wave-based >4096 batched-query SDPA
     // (issue #118). Sized W × num_heads × score_stride floats; W is chosen so this
@@ -3669,6 +3675,81 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         }
     }
 
+    /// <summary>Flash-decoding split-KV chunk (KV tokens per split block). Must match
+    /// the kernel's <c>SPLITKV_CHUNK</c>.</summary>
+    public const int SplitKvChunk = 512;
+
+    /// <summary>
+    /// Flash-decoding decode attention (issue #235). Splits each head's KV sequence
+    /// into <see cref="SplitKvChunk"/>-sized chunks across <c>numHeads × nSplits</c>
+    /// blocks (nSplits = ceil(maxSeqLen/chunk)) so the O(ctx)/token KV read parallelizes
+    /// across the SMs instead of the single-block-per-head <see cref="Attention"/>. Each
+    /// block emits an un-normalized online-softmax partial (m_i, l_i, Õ_i) into
+    /// <paramref name="partialO"/>/<paramref name="partialMeta"/>; the combine kernel
+    /// LSE-merges them into <paramref name="output"/>. Argmax-stable, not bit-identical to
+    /// <see cref="Attention"/> (the combine reorders the softmax reduction). The grid is
+    /// fixed at capture and only seqLen updates per graph replay (out-of-range splits
+    /// early-exit), so it is CUDA-graph-capturable. fp32/bf16/q8_0 via <paramref name="kvDType"/>.
+    /// </summary>
+    public void AttentionSplitKv(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+                                 Tensor partialO, Tensor partialMeta, DType kvDType,
+                                 int numHeads, int numKvHeads, int headDim, int seqLen, int maxSeqLen,
+                                 float attnScale = -1f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        int nSplits = (maxSeqLen + SplitKvChunk - 1) / SplitKvChunk;
+        nint splitKern = kvDType switch
+        {
+            DType.BFloat16 => _attentionSplitKvBf16Kernel,
+            DType.Q8_0     => _attentionSplitKvQ8Kernel,
+            DType.Float32  => _attentionSplitKvKernel,
+            _ => throw new ArgumentOutOfRangeException(nameof(kvDType), kvDType,
+                "AttentionSplitKv supports fp32 / bf16 / q8_0 K/V caches only."),
+        };
+
+        nint qP = GetDevPtr(q);
+        nint kP = GetDevPtr(kCache);
+        nint vP = GetDevPtr(vCache);
+        nint poP = GetDevPtr(partialO);
+        nint pmP = GetDevPtr(partialMeta);
+        nint oP = GetDevPtr(output);
+        int pNH = numHeads, pNKV = numKvHeads, pHD = headDim, pSL = seqLen, pNS = nSplits;
+        float pScale = attnScale;
+
+        // Split kernel: q, k, v, partial_o, partial_meta, num_heads, num_kv_heads, head_dim, seq_len, n_splits, attn_scale
+        nint* sargs = stackalloc nint[11]
+        {
+            (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&poP), (nint)(&pmP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD), (nint)(&pSL), (nint)(&pNS), (nint)(&pScale)
+        };
+        int rs = NvrtcInterop.LaunchKernel(splitKern, (uint)numHeads, (uint)nSplits, 1, 256, 1, 1, 0, _stream, sargs, null);
+        if (rs != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_splitkv {kvDType}) failed: {rs}");
+
+        // Track the split kernel BEFORE the combine launch (single-leaf harvest); only
+        // seqLen (arg 8) varies per replay — the fixed grid + early-exit handle the rest.
+        if (_graphCapturing)
+        {
+            Span<nint> av = stackalloc nint[11];
+            av[0] = qP; av[1] = kP; av[2] = vP; av[3] = poP; av[4] = pmP;
+            av[5] = pNH; av[6] = pNKV; av[7] = pHD; av[8] = pSL; av[9] = pNS;
+            av[10] = GraphFloatBits(pScale);
+            TrackPositionNode(splitKern, (uint)numHeads, (uint)nSplits, 1, 256, 1, 1, 0, av,
+                [(8, GraphPosKind.PositionPlus1, 0)]);
+        }
+
+        // Combine kernel: partial_o, partial_meta, out, num_heads, head_dim, n_splits.
+        // No per-replay-varying args → captured by stream capture, not tracked.
+        nint* cargs = stackalloc nint[6]
+        {
+            (nint)(&poP), (nint)(&pmP), (nint)(&oP), (nint)(&pNH), (nint)(&pHD), (nint)(&pNS)
+        };
+        int rc = NvrtcInterop.LaunchKernel(_attentionCombineKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, cargs, null);
+        if (rc != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_combine) failed: {rc}");
+    }
+
     // ── Ragged-batched decode ops (issue #197) ─────────────────────────────
     //
     // One launch per op covers all N decode sequences: row t of the [N × dim]
@@ -5836,6 +5917,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _kvAppendQ8Kernel, _kvAppendBatchedQ8Kernel,
             _attentionQ8Kernel, _attentionSwaQ8Kernel, _attentionSwaBatchedQ8Kernel,
             _fullSeqAttentionQ8Kernel, _fullSeqAttentionGlobalQ8Kernel,
+            // #235: flash-decoding split-KV + combine.
+            _attentionSplitKvKernel, _attentionSplitKvBf16Kernel, _attentionSplitKvQ8Kernel,
+            _attentionCombineKernel,
             // #197: ragged-batched decode kernels.
             _ropeNeoxRaggedKernel, _ropeInterleavedRaggedKernel,
             _kvAppendRaggedKernel, _kvAppendRaggedBf16Kernel, _kvAppendRaggedQ8Kernel,
@@ -5980,6 +6064,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _attentionSwaBatchedBf16Kernel = GetKernelFunc("llm_attention_swa_batched_bf16");
         _attentionSwaQ8Kernel = GetKernelFunc("llm_attention_swa_q8_0");
         _attentionSwaBatchedQ8Kernel = GetKernelFunc("llm_attention_swa_batched_q8_0");
+        _attentionSplitKvKernel     = GetKernelFunc("llm_attention_splitkv");        // flash-decoding (#235)
+        _attentionSplitKvBf16Kernel = GetKernelFunc("llm_attention_splitkv_bf16");
+        _attentionSplitKvQ8Kernel   = GetKernelFunc("llm_attention_splitkv_q8_0");
+        _attentionCombineKernel     = GetKernelFunc("llm_attention_combine");
         _kvAppendQ8Kernel      = GetKernelFunc("llm_kv_append_q8_0");
         _geluTanhMulKernel     = GetKernelFunc("llm_gelu_tanh_mul");
         _geluTanhMulStridedKernel = GetKernelFunc("llm_gelu_tanh_mul_strided");

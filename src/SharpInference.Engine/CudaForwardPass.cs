@@ -243,6 +243,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
                              int numHeads, int numKvHeads, int headDim, int seqLen, int maxSeqLen,
                              float attnScale = -1f)
     {
+        // Flash-decoding split-KV (#235): at long context the single-block-per-head kernels
+        // below underutilize the GPU (numHeads blocks, serial O(ctx) scan). Split the KV
+        // sequence across the SMs. maxSeqLen ≤ _maxSeqLen keeps nSplits within the partials
+        // buffer (and ≤ 256 for the combine kernel). Reuses the same fp32/bf16/q8 caches.
+        if (_splitKvPartialO is { } splitO && _splitKvPartialMeta is { } splitMeta
+            && seqLen > SplitKvMinSeq && maxSeqLen <= _maxSeqLen)
+        {
+            _gpu.AttentionSplitKv(q, kCache, vCache, output, splitO, splitMeta, _kvDType,
+                numHeads, numKvHeads, headDim, seqLen, maxSeqLen, attnScale);
+            return;
+        }
+
         if (_kvDType == DType.BFloat16)
             _gpu.AttentionBf16(q, kCache, vCache, output, scoresScratch,
                 numHeads, numKvHeads, headDim, seqLen, maxSeqLen, attnScale);
@@ -457,6 +469,24 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     private int _tqCompressedLen;
     private int _fp32WriteIdx;
     private int _fp32Count;
+
+    // Flash-decoding split-KV (#235): partials for the split decode-attention path.
+    // partial_o = [numHeads × nSplitsMax × maxHeadDim], partial_meta = [numHeads × nSplitsMax × 2].
+    // Allocated only when the run's context is long enough to benefit (and bounded so the
+    // combine kernel's per-head split count fits its shared array). Reused per layer (one
+    // serial stream). Null → AttentionKv stays on the single-block kernel.
+    private Tensor? _splitKvPartialO;
+    private Tensor? _splitKvPartialMeta;
+    // Only split once the context is long enough that the 8-block launch underutilizes the
+    // GPU; below this, the single-block kernel is already near the weight-matvec floor.
+    private const int SplitKvMinSeq = 2048;
+    // Upper bound on maxSeqLen for the split path: nSplits = ceil(ctx/512) must fit the
+    // combine kernel's SPLITKV_MAX_SPLITS (256) shared array → ctx ≤ 131072.
+    private const int SplitKvMaxCtx = 131072;
+    // SHARPI_SPLIT_DECODE=0 reverts to the single-block-per-head decode attention (the A/B
+    // baseline; lets parity tests compare the split path against it). Default on.
+    private readonly bool _splitDecodeEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_SPLIT_DECODE") != "0";
 
     // Dtype dispatch for MatMul (mirrors GpuForwardPass._weightDTypes).
     private readonly Dictionary<nint, DType> _weightDTypes = new();
@@ -876,6 +906,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         // kernels accept a null pointer in that case.
         if (_maxSeqLen > 4096)
             _attnScoresScratch = gpu.Allocate(TensorShape.D1((long)_numHeads * _maxSeqLen));
+
+        // Flash-decoding (#235): allocate the split-KV partials when the context is long
+        // enough to benefit and within the combine kernel's split bound. nSplits = ceil(
+        // ctx/chunk); sized at the widest head_dim so per-layer (≤ maxHeadDim) calls fit.
+        if (_splitDecodeEnabled && _maxSeqLen > SplitKvMinSeq && _maxSeqLen <= SplitKvMaxCtx)
+        {
+            long nSplitsMax = (_maxSeqLen + CudaBackend.SplitKvChunk - 1) / CudaBackend.SplitKvChunk;
+            _splitKvPartialO = gpu.Allocate(TensorShape.D1((long)_numHeads * nSplitsMax * _maxHeadDim));
+            _splitKvPartialMeta = gpu.Allocate(TensorShape.D1((long)_numHeads * nSplitsMax * 2));
+        }
 
         // Upload weights to VRAM
         int L = hp.NumLayers;
@@ -4362,6 +4402,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         // allocated; the SnapKV side flags ownership so we free it exactly once
         // here regardless of which path allocated it.
         if (_attnScoresScratch is { } attnScratch) _gpu.Free(attnScratch);
+
+        // Flash-decoding split-KV partials (#235).
+        if (_splitKvPartialO is { } splitO) _gpu.Free(splitO);
+        if (_splitKvPartialMeta is { } splitMeta) _gpu.Free(splitMeta);
 
         // SnapKV (issue #59) scratch (only allocated when active during a prefill).
         if (_snapKvQCapture is { } qc) _gpu.Free(qc);

@@ -68,12 +68,15 @@ public sealed class CudaForwardPassKvDtypeTests
     /// </summary>
     private static (float[][] logits, int[] argmax) RunPrefillDecode(
         CudaBackend gpu, string path, string? kvDtype, string prompt, int steps, int ctx, int[]? forced,
-        bool batchedPrefill = false)
+        bool batchedPrefill = false, string? splitDecode = null)
     {
         var prevKv = Environment.GetEnvironmentVariable("SHARPI_KV_DTYPE");
         var prevSnap = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_BUDGET");
+        var prevSplit = Environment.GetEnvironmentVariable("SHARPI_SPLIT_DECODE");
         Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", kvDtype);
         Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", "0"); // isolate the KV dtype
+        // null → leave the flash-decoding split-KV default (on); "0" forces the single-block path.
+        if (splitDecode is not null) Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE", splitDecode);
         try
         {
             using var model = GgufModel.Open(path);
@@ -109,6 +112,68 @@ public sealed class CudaForwardPassKvDtypeTests
         {
             Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", prevKv);
             Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", prevSnap);
+            Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE", prevSplit);
+        }
+    }
+
+    /// <summary>
+    /// Flash-decoding split-KV parity (issue #235). At long context the decode attention
+    /// switches from the single-block-per-head kernel to the split-KV path (KV sequence
+    /// partitioned across SMs + an LSE combine). The split is mathematically the same
+    /// softmax, only the reduction is reordered, so it must be argmax-stable and very close
+    /// in logits to the single-block path for the SAME KV dtype — the only variable here is
+    /// split-on vs split-off (<c>SHARPI_SPLIT_DECODE</c>). A long prompt (≈5000 tokens,
+    /// ctx 6144) puts every decode step at seqLen &gt; SplitKvMinSeq (2048) so the split
+    /// path is exercised; the single-block run (split off) is the trusted reference. Both
+    /// runs share the prefill (split only affects per-token decode), so positions 1.. are
+    /// where they can differ — by reduction-order rounding only.
+    /// </summary>
+    private static void AssertSplitKvDecodeParity(string filename, string kvDtype, float maxAbsTol)
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath(filename);
+        if (path is null) return;
+
+        const int steps = 6;
+        const int ctx = 6144;          // partials allocated (>2048) and room for the prompt
+        const int promptLen = 5000;    // every decode step lands at seqLen > 2048 → split path
+
+        using (var model = GgufModel.Open(path))
+        {
+            var tok = GgufTokenizer.FromGgufModel(model);
+            var sb = new System.Text.StringBuilder();
+            const string seed = "The quick brown fox jumps over the lazy dog. " +
+                                "Sphinx of black quartz, judge my vow. " +
+                                "Pack my box with five dozen liquor jugs. ";
+            while (tok.Encode(sb.ToString()).Count < promptLen) sb.Append(seed);
+            string prompt = sb.ToString();
+
+            // Single-block reference (split OFF) vs split-KV (split ON, default), same dtype.
+            var (single, singleArgmax) = RunPrefillDecode(gpu, path, kvDtype, prompt, steps, ctx, forced: null, splitDecode: "0");
+            var (split, _) = RunPrefillDecode(gpu, path, kvDtype, prompt, steps, ctx, forced: singleArgmax, splitDecode: "1");
+
+            // Coherence: the reference must be a real decode, not a degenerate repeat.
+            Assert.True(singleArgmax[1] != singleArgmax[0] || single[1].Length > 0,
+                $"{filename}: degenerate {kvDtype} reference decode — not a meaningful split test.");
+
+            for (int p = 0; p <= steps; p++)
+            {
+                Assert.Equal(single[p].Length, split[p].Length);
+                float maxAbs = 0f;
+                for (int i = 0; i < single[p].Length; i++)
+                {
+                    Assert.True(float.IsFinite(split[p][i]),
+                        $"{filename}: non-finite split-KV {kvDtype} logit at pos {p}, idx {i}.");
+                    maxAbs = Math.Max(maxAbs, Math.Abs(single[p][i] - split[p][i]));
+                }
+                Assert.True(TopK(split[p], 5).Contains(singleArgmax[p]),
+                    $"{filename}: pos {p} single-block top-1 ({singleArgmax[p]}) fell out of split-KV {kvDtype}'s top-5 " +
+                    $"(max-abs {maxAbs:F4}) — the split-KV combine reordered the head of the distribution.");
+                Assert.True(maxAbs < maxAbsTol,
+                    $"{filename}: pos {p} split-KV vs single-block {kvDtype} logit max-abs {maxAbs:F4} exceeds the " +
+                    $"reduction-order budget ({maxAbsTol:F2}) — likely a split/combine arithmetic bug, not rounding.");
+            }
         }
     }
 
@@ -374,6 +439,36 @@ public sealed class CudaForwardPassKvDtypeTests
     [Fact]
     public void Gemma4_12B_Q8ChunkedPrefill_MatchesFp32()
         => AssertKvChunkedPrefillParity("gemma-4-12b-it-qat-q4_0.gguf", "q8_0", maxAbsCeiling: 45.0f);
+
+    // ── Issue #235: flash-decoding split-KV decode attention ─────────────────
+    // Long-context decode switches AttentionKv (the global-layer path) from one block
+    // per head to the KV-split + LSE-combine kernels. These compare split-on vs split-off
+    // for the SAME KV dtype on a 5000-token prompt (every decode step at seqLen > 2048),
+    // so the only variable is the split path. The combine reorders the softmax reduction →
+    // argmax-stable, not bit-identical; top-5 stability is the hard gate and the max-abs
+    // budget catches a combine/rescale bug rather than reduction-order rounding. fp32 has
+    // no store rounding so its budget is tightest; bf16/q8 add the narrowed-store noise.
+
+    /// <summary>Gemma 4 E4B Q8_0 model, fp32 KV: split-KV global decode vs single-block.</summary>
+    [Fact]
+    public void Gemma4_E4B_Fp32SplitKv_MatchesSingleBlock()
+        => AssertSplitKvDecodeParity("gemma-4-E4B-it-Q8_0.gguf", "fp32", maxAbsTol: 1.0f);
+
+    /// <summary>Gemma 4 E4B, bf16 KV: split-KV (bf16 thunk) vs single-block bf16.</summary>
+    [Fact]
+    public void Gemma4_E4B_Bf16SplitKv_MatchesSingleBlock()
+        => AssertSplitKvDecodeParity("gemma-4-E4B-it-Q8_0.gguf", "bf16", maxAbsTol: 2.0f);
+
+    /// <summary>Gemma 4 E4B, q8_0 KV: split-KV (q8 thunk, sharpi_kv_dot) vs single-block q8.</summary>
+    [Fact]
+    public void Gemma4_E4B_Q8SplitKv_MatchesSingleBlock()
+        => AssertSplitKvDecodeParity("gemma-4-E4B-it-Q8_0.gguf", "q8_0", maxAbsTol: 2.5f);
+
+    /// <summary>Qwen3-8B Q4_K, fp32 KV: all-global (non-SWA) decode, 32 heads / head_dim 128 —
+    /// a different geometry than E4B's 8 heads / head_dim 512.</summary>
+    [Fact]
+    public void Qwen3_8B_Fp32SplitKv_MatchesSingleBlock()
+        => AssertSplitKvDecodeParity("Qwen3-8B-Q4_K_M.gguf", "fp32", maxAbsTol: 1.0f);
 
     // ── Issue #191: narrowed-KV GREEDY decode coherence (template-correct) ───
     // The parity tests above teacher-force the narrowed dtype onto fp32's trajectory, so
