@@ -4030,12 +4030,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         int maxHeadDim = hp.HeadDim;
         foreach (int hd in lhd) if (hd > maxHeadDim) maxHeadDim = hd;
         long perTokenFloats =
-            hp.EmbeddingDim * 4L                          // hidden + residual + norm + PleY
+            hp.EmbeddingDim * 3L                          // hidden + residual + norm
             + 2L * hp.NumHeads * maxHeadDim               // Q + AttnOut
             + 2L * hp.NumKvHeads * maxHeadDim             // K + V
             + hp.IntermediateDim * 2L;                    // FFN gate + up
-        if (hp.HasPerLayerTokenEmbd)
-            perTokenFloats += 2L * hp.NumLayers * hp.PerLayerEmbeddingWidth + hp.PerLayerEmbeddingWidth;
+        if (hp.HasPerLayerTokenEmbd)                      // PLE: proj/row stacks + gate + PleY
+            perTokenFloats += 2L * hp.NumLayers * hp.PerLayerEmbeddingWidth
+                            + hp.PerLayerEmbeddingWidth + hp.EmbeddingDim;
         long prefillWorkingSet = (long)PrefillBatchChunk * perTokenFloats * sizeof(float);
 
         // Fixed system allowance (CUDA context/framebuffer + cuBLAS workspace + pinned + pool),
