@@ -1009,6 +1009,71 @@ public sealed class CudaForwardPassKvDtypeTests
             $"ctx {got + 1} also fits — not the largest fitting context for the mixed-headdim shape.");
     }
 
+    // ── Issue #228: KvVramReserveBytes — bounded reserve for SWA, unchanged for dense ──
+    // The reserve held back from the KV budget. Dense models keep the proven
+    // max(VRAM/3, 2GB) (guards the #185 spill cliff — their KV fills any budget). SWA/Gemma
+    // models use a bounded system allowance + prefill working set, safe because SWA KV
+    // saturates past the ring (a bigger budget can't grow KV to eat the headroom).
+
+    /// <summary>Dense (no IsSwaLayer) keeps the exact max(VRAM/3, 2 GiB) reserve — unchanged.</summary>
+    [Fact]
+    public void KvVramReserveBytes_DenseModel_KeepsMaxVramThirdOr2GiB()
+    {
+        var hp = FlatHp(numLayers: 32, numKvHeads: 8, headDim: 128);   // IsSwaLayer == null
+        const long GiB = 1024L * 1024 * 1024;
+        // 12 GiB → VRAM/3 (4 GiB) wins the max.
+        Assert.Equal(4 * GiB, CudaForwardPass.KvVramReserveBytes(hp, 12 * GiB));
+        // 3 GiB → the 2 GiB floor wins.
+        Assert.Equal(2 * GiB, CudaForwardPass.KvVramReserveBytes(hp, 3 * GiB));
+        // 48 GiB → VRAM/3 (16 GiB) — the dense reserve scales with total VRAM (the #228 complaint,
+        // intentionally preserved for dense where KV grows linearly to fill the budget).
+        Assert.Equal(16 * GiB, CudaForwardPass.KvVramReserveBytes(hp, 48 * GiB));
+    }
+
+    /// <summary>
+    /// SWA/Gemma reserve is bounded BELOW the dense reserve at the same VRAM (the #228 win):
+    /// a fixed system allowance (≥ 2 GiB floor) plus a positive prefill working set, never the
+    /// VRAM/3 fraction. On a 12 GiB card it's well under the dense 4 GiB.
+    /// </summary>
+    [Fact]
+    public void KvVramReserveBytes_SwaModel_BoundedBelowDense()
+    {
+        const long GiB = 1024L * 1024 * 1024;
+        var swa = Gemma4ShapedHp(
+            layerHeadDim: [256, 256, 256],
+            layerKvHeads: [8, 8, 8],
+            isSwa: [false, true, false],
+            kvSource: [-1, -1, 0],
+            slidingWindow: 1024);
+        var dense = FlatHp(numLayers: 3, numKvHeads: 8, headDim: 256);
+
+        long swaReserve = CudaForwardPass.KvVramReserveBytes(swa, 12 * GiB);
+        long denseReserve = CudaForwardPass.KvVramReserveBytes(dense, 12 * GiB);
+
+        Assert.True(swaReserve > 2 * GiB, "SWA reserve must add a prefill working set on top of the 2 GiB floor.");
+        Assert.True(swaReserve < denseReserve,
+            $"SWA reserve ({swaReserve}) must be below the dense VRAM/3 reserve ({denseReserve}) — the #228 win.");
+        Assert.True(swaReserve < 4 * GiB, $"SWA reserve ({swaReserve}) should be well under the dense 4 GiB at 12 GiB VRAM.");
+    }
+
+    /// <summary>
+    /// The SWA reserve's working-set term scales with MODEL width (not just VRAM): a wider model
+    /// (larger intermediate dim) reserves more. Distinguishes it from a pure VRAM fraction.
+    /// </summary>
+    [Fact]
+    public void KvVramReserveBytes_SwaModel_ScalesWithModelWidth()
+    {
+        const long GiB = 1024L * 1024 * 1024;
+        var narrow = Gemma4ShapedHp([256, 256], [8, 8], [false, true], [-1, -1], 1024);
+        var wide = narrow with { IntermediateDim = narrow.IntermediateDim * 4 };
+
+        long narrowReserve = CudaForwardPass.KvVramReserveBytes(narrow, 12 * GiB);
+        long wideReserve = CudaForwardPass.KvVramReserveBytes(wide, 12 * GiB);
+        Assert.True(wideReserve > narrowReserve,
+            $"wider model (4× intermediate dim) should reserve more for its prefill working set " +
+            $"(narrow={narrowReserve} wide={wideReserve}).");
+    }
+
     /// <summary>
     /// Q8KvGeometrySupported returns false when ANY single (non-aliased) layer violates the
     /// %32 rule — not just when all do. A mixed set with one bad layer must fail, matching

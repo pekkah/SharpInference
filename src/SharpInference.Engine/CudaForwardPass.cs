@@ -574,6 +574,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
             // below never fires for an fp32-sized auto-context, since fp32 fits there by
             // construction).
             _maxSeqLen = EstimateMaxContext(model, gpu, hp, ResolveConfiguredKvDType());
+        // Invariant (#228): the resolved context never exceeds the model's own maximum, whether
+        // it came from an explicit -c or a VRAM-fit estimator. Each branch above already clamps
+        // to hp.ContextLength; this is the single chokepoint that guarantees it so no future
+        // path (or estimator change) can over-shoot the model max.
+        _maxSeqLen = Math.Min(_maxSeqLen, hp.ContextLength);
         // The KV-append/attention kernels index the cache at `pos % _maxSeqLen` (the ring
         // modulo, identity for full caches), so a zero context — e.g. a malformed GGUF with
         // context_length=0 reached via an explicit ctx-size — would be an in-kernel
@@ -3974,18 +3979,45 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
             + hp.NumKvHeads * headDim * 2 + hp.NumHeads * headDim
             + hp.IntermediateDim * 2 + hp.VocabSize) * sizeof(float);
 
-        // Reserve at least 2 GiB (or a third of total) for the driver, the cuBLAS
-        // workspace, the Q8_1 quantization scratch, the pinned host buffer, the GPU
-        // buffer pool's per-bucket reuse list, and CUDA's framebuffer-and-context
-        // overhead. The previous max(vram/5, 1 GiB) left only ~24 MiB free on a
-        // 12 GiB card running Qwen3-8B; the driver then mapped late weight
-        // allocations (notably the 600 MiB lm-head) into system memory, where the
-        // matvec ran at ~22 GB/s over PCIe instead of ~400 GB/s in HBM and prefill
-        // collapsed from ~65 t/s to ~4 t/s.
-        long reserved = Math.Max(vramBytes / 3, 2L * 1024 * 1024 * 1024);
+        long reserved = KvVramReserveBytes(hp, vramBytes);
         long available = vramBytes - weightBytes - scratchBytes - reserved;
         if (available <= 0) available = 64L * 1024 * 1024;
         return available;
+    }
+
+    /// <summary>
+    /// VRAM held back from the KV budget for everything that isn't weights/scratch/KV: the CUDA
+    /// context/framebuffer, the cuBLAS workspace, the Q8_1 quantization scratch, the pinned host
+    /// buffer, the GPU buffer-pool reuse lists, and the transient prefill working set. Pure
+    /// (no GPU/GGUF) so it's unit-testable (cf. <see cref="ResolveKvDType"/>).
+    /// <para><b>Uniform / dense models</b> keep the proven <c>max(VRAM/3, 2 GiB)</c> reserve.
+    /// Their KV grows linearly to fill whatever budget is left, so the reserve is the only thing
+    /// bounding the cache size — and an earlier <c>max(VRAM/5, 1 GiB)</c> once left ~24 MiB free
+    /// on a 12 GiB card running Qwen3-8B, spilling the ~600 MiB lm-head to system RAM over PCIe
+    /// and collapsing prefill ~65→4 t/s (#185). This path is unchanged.</para>
+    /// <para><b>SWA / per-layer (Gemma 4) models</b> use a smaller, bounded reserve — a fixed
+    /// system allowance (NOT a fraction of total VRAM) plus one <see cref="PrefillBatchChunk"/>'s
+    /// activation working set. This is safe precisely because SWA KV <i>saturates</i>: past the
+    /// sliding-window ring only the few global layers grow, so the cache asymptotes to
+    /// <c>KV(modelMax)</c> and a larger budget cannot grow it to consume the headroom (the dense
+    /// failure mode). The old <c>VRAM/3</c> reserve over-reserved ~2.5 GB on a 12 GiB card and
+    /// pinned Gemma 4 12B q8_0 auto-context to ~30 K when the full 256 K fits (#228 / #220).</para>
+    /// </summary>
+    internal static long KvVramReserveBytes(ModelHyperparams hp, long vramBytes)
+    {
+        if (hp.IsSwaLayer is null)
+            return Math.Max(vramBytes / 3, 2L * 1024 * 1024 * 1024);
+
+        // Transient activations for one batched-prefill chunk (norm/qkv/attn/FFN buffers),
+        // sized to the model width — the only reserve term that scales with the model rather
+        // than the GPU. Generous (overlapping buffers) so the budget can't starve a real prefill.
+        long prefillWorkingSet = (long)PrefillBatchChunk *
+            (hp.EmbeddingDim * 4L + hp.IntermediateDim * 2L
+             + (long)hp.NumHeads * hp.HeadDim + 2L * hp.NumKvHeads * hp.HeadDim) * sizeof(float);
+        // Fixed system allowance (CUDA context/framebuffer + cuBLAS workspace + pinned + pool),
+        // floored at 2 GiB and rising to VRAM/6 on larger cards where those costs grow.
+        long systemReserve = Math.Max(2L * 1024 * 1024 * 1024, vramBytes / 6);
+        return systemReserve + prefillWorkingSet;
     }
 
     /// <summary>
