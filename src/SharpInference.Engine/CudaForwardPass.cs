@@ -258,8 +258,21 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         if (_splitKvPartialO is { } splitO && _splitKvPartialMeta is { } splitMeta
             && seqLen > SplitKvMinSeq && maxSeqLen <= _maxSeqLen)
         {
+            // GQA head-sharing (#237). Eligible only when a KV head's query group (G) fits the
+            // grouped kernel's arrays (2..8), divides evenly, and there are ≥2 KV heads (else the
+            // grid X = numKvHeads is too small to fill the SMs). Within that: "0" forces per-head,
+            // "1" forces grouped, unset auto-selects grouped only for fp32 at long ctx (where the
+            // bandwidth-bound read makes the G× traffic saving beat the G× block-count loss).
+            int g = numKvHeads >= 2 ? numHeads / numKvHeads : 0;
+            bool eligible = numKvHeads >= 2 && numHeads % numKvHeads == 0 && g >= 2 && g <= 8;
+            bool grouped = eligible && _splitGroupedMode switch
+            {
+                "0" => false,
+                "1" => true,
+                _   => _kvDType == DType.Float32 && seqLen >= GroupedMinSeqFp32,
+            };
             _gpu.AttentionSplitKv(q, kCache, vCache, output, splitO, splitMeta, _kvDType,
-                numHeads, numKvHeads, headDim, seqLen, maxSeqLen, attnScale);
+                numHeads, numKvHeads, headDim, seqLen, maxSeqLen, attnScale, grouped: grouped);
             return;
         }
 
@@ -496,6 +509,19 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     // baseline; lets parity tests compare the split path against it). Default on.
     private readonly bool _splitDecodeEnabled =
         Environment.GetEnvironmentVariable("SHARPI_SPLIT_DECODE") != "0";
+    // GQA head-sharing (#237): one block per KV head's query group, loading each KV slice once
+    // (G× less KV HBM read at the cost of G× fewer blocks). The decode A/B (E4B, head_dim 512,
+    // 2 KV heads, 4070 Ti) showed it only beats the per-head split when the read is genuinely
+    // bandwidth-bound: fp32 (4 B/elem) at ctx ≥ ~24K (+11% @24K, +23% @32K). q8/bf16 read too few
+    // bytes to be bandwidth-bound, so the G× fewer blocks lose; below ~24K fp32 loses to occupancy.
+    // → AUTO-select only for fp32 at long ctx (GroupedMinSeqFp32) with an eligible head config.
+    // SHARPI_SPLIT_DECODE_GROUPED: "0" forces per-head, "1" forces grouped whenever eligible
+    // (for bisecting); unset = auto. Heuristic tuned to E4B-class shapes — other head_dims shift
+    // the crossover, so the override exists.
+    private readonly string? _splitGroupedMode =
+        Environment.GetEnvironmentVariable("SHARPI_SPLIT_DECODE_GROUPED");
+    // fp32-only long-ctx threshold where grouped's traffic saving beats its occupancy loss (E4B).
+    private const int GroupedMinSeqFp32 = 24576;
 
     // Dtype dispatch for MatMul (mirrors GpuForwardPass._weightDTypes).
     private readonly Dictionary<nint, DType> _weightDTypes = new();

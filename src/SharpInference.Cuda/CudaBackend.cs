@@ -331,6 +331,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _attentionSplitKvBf16Kernel;
     private nint   _attentionSplitKvQ8Kernel;
     private nint   _attentionCombineKernel;
+    // Issue #237 (GQA head-sharing): split-KV variant that processes a KV head's whole
+    // query group per block (grid num_kv_heads × n_splits), loading each K/V slice once.
+    private nint   _attentionSplitKvGroupedKernel;
+    private nint   _attentionSplitKvGroupedBf16Kernel;
+    private nint   _attentionSplitKvGroupedQ8Kernel;
 
     // Grow-only global score scratch for the wave-based >4096 batched-query SDPA
     // (issue #118). Sized W × num_heads × score_stride floats; W is chosen so this
@@ -3695,11 +3700,18 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// <see cref="Attention"/> (the combine reorders the softmax reduction). The grid is
     /// fixed at capture and only seqLen updates per graph replay (out-of-range splits
     /// early-exit), so it is CUDA-graph-capturable. fp32/bf16/q8_0 via <paramref name="kvDType"/>.
+    ///
+    /// <paramref name="grouped"/> (issue #237): one block handles a KV head's whole query
+    /// group (grid <c>numKvHeads × nSplits</c>), loading each K/V slice once and reusing it
+    /// across the <c>G = numHeads/numKvHeads</c> query heads — ~G× less KV HBM read on the
+    /// bandwidth-bound long-ctx decode, at the cost of G× fewer blocks. Emits the SAME
+    /// per-query-head partials (combine + layout unchanged). Requires <c>numHeads % numKvHeads
+    /// == 0</c> and <c>G ≤ 8</c>.
     /// </summary>
     public void AttentionSplitKv(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
                                  Tensor partialO, Tensor partialMeta, DType kvDType,
                                  int numHeads, int numKvHeads, int headDim, int seqLen, int maxSeqLen,
-                                 float attnScale = -1f)
+                                 float attnScale = -1f, bool grouped = false)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
@@ -3713,11 +3725,23 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             throw new ArgumentOutOfRangeException(nameof(maxSeqLen), maxSeqLen,
                 $"AttentionSplitKv: nSplits {nSplits} exceeds SplitKvMaxSplits {SplitKvMaxSplits} " +
                 $"(maxSeqLen must be ≤ {SplitKvMaxSplits * SplitKvChunk}).");
-        nint splitKern = kvDType switch
+
+        // GQA head-sharing (#237): G query heads per block; grid X = numKvHeads, one extern
+        // shared float per (group head × chunk slot). G ≤ 8 (kernel's dots/acc/po_base arrays).
+        int group = grouped ? numHeads / numKvHeads : 1;
+        if (grouped && (numHeads % numKvHeads != 0 || group > 8))
+            throw new ArgumentOutOfRangeException(nameof(numKvHeads), numKvHeads,
+                $"Grouped split-KV requires numHeads % numKvHeads == 0 and G ≤ 8 (got numHeads={numHeads}, numKvHeads={numKvHeads}).");
+        uint gridX = grouped ? (uint)numKvHeads : (uint)numHeads;
+        uint sharedBytes = grouped ? (uint)(group * SplitKvChunk * sizeof(float)) : 0u;
+        nint splitKern = (grouped, kvDType) switch
         {
-            DType.BFloat16 => _attentionSplitKvBf16Kernel,
-            DType.Q8_0     => _attentionSplitKvQ8Kernel,
-            DType.Float32  => _attentionSplitKvKernel,
+            (false, DType.BFloat16) => _attentionSplitKvBf16Kernel,
+            (false, DType.Q8_0)     => _attentionSplitKvQ8Kernel,
+            (false, DType.Float32)  => _attentionSplitKvKernel,
+            (true,  DType.BFloat16) => _attentionSplitKvGroupedBf16Kernel,
+            (true,  DType.Q8_0)     => _attentionSplitKvGroupedQ8Kernel,
+            (true,  DType.Float32)  => _attentionSplitKvGroupedKernel,
             _ => throw new ArgumentOutOfRangeException(nameof(kvDType), kvDType,
                 "AttentionSplitKv supports fp32 / bf16 / q8_0 K/V caches only."),
         };
@@ -3737,8 +3761,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             (nint)(&qP), (nint)(&kP), (nint)(&vP), (nint)(&poP), (nint)(&pmP),
             (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD), (nint)(&pSL), (nint)(&pNS), (nint)(&pScale)
         };
-        int rs = NvrtcInterop.LaunchKernel(splitKern, (uint)numHeads, (uint)nSplits, 1, 256, 1, 1, 0, _stream, sargs, null);
-        if (rs != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_splitkv {kvDType}) failed: {rs}");
+        int rs = NvrtcInterop.LaunchKernel(splitKern, gridX, (uint)nSplits, 1, 256, 1, 1, sharedBytes, _stream, sargs, null);
+        if (rs != 0) throw new InvalidOperationException($"cuLaunchKernel(attention_splitkv {kvDType} grouped={grouped}) failed: {rs}");
 
         // Track the split kernel BEFORE the combine launch (single-leaf harvest); only
         // seqLen (arg 8) varies per replay — the fixed grid + early-exit handle the rest.
@@ -3748,7 +3772,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             av[0] = qP; av[1] = kP; av[2] = vP; av[3] = poP; av[4] = pmP;
             av[5] = pNH; av[6] = pNKV; av[7] = pHD; av[8] = pSL; av[9] = pNS;
             av[10] = GraphFloatBits(pScale);
-            TrackPositionNode(splitKern, (uint)numHeads, (uint)nSplits, 1, 256, 1, 1, 0, av,
+            TrackPositionNode(splitKern, gridX, (uint)nSplits, 1, 256, 1, 1, sharedBytes, av,
                 [(8, GraphPosKind.PositionPlus1, 0)]);
         }
 
@@ -5932,6 +5956,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             // #235: flash-decoding split-KV + combine.
             _attentionSplitKvKernel, _attentionSplitKvBf16Kernel, _attentionSplitKvQ8Kernel,
             _attentionCombineKernel,
+            _attentionSplitKvGroupedKernel, _attentionSplitKvGroupedBf16Kernel, _attentionSplitKvGroupedQ8Kernel,
             // #197: ragged-batched decode kernels.
             _ropeNeoxRaggedKernel, _ropeInterleavedRaggedKernel,
             _kvAppendRaggedKernel, _kvAppendRaggedBf16Kernel, _kvAppendRaggedQ8Kernel,
@@ -6079,6 +6104,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _attentionSplitKvKernel     = GetKernelFunc("llm_attention_splitkv");        // flash-decoding (#235)
         _attentionSplitKvBf16Kernel = GetKernelFunc("llm_attention_splitkv_bf16");
         _attentionSplitKvQ8Kernel   = GetKernelFunc("llm_attention_splitkv_q8_0");
+        _attentionSplitKvGroupedKernel     = GetKernelFunc("llm_attention_splitkv_grouped");      // GQA head-sharing (#237)
+        _attentionSplitKvGroupedBf16Kernel = GetKernelFunc("llm_attention_splitkv_grouped_bf16");
+        _attentionSplitKvGroupedQ8Kernel   = GetKernelFunc("llm_attention_splitkv_grouped_q8_0");
         _attentionCombineKernel     = GetKernelFunc("llm_attention_combine");
         _kvAppendQ8Kernel      = GetKernelFunc("llm_kv_append_q8_0");
         _geluTanhMulKernel     = GetKernelFunc("llm_gelu_tanh_mul");

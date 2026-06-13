@@ -7108,6 +7108,179 @@ extern ""C"" __global__ void llm_attention_combine(
     }
 }
 
+// ── Multi-query dot for GQA head-sharing (#237): one K read, GF FMAs ─────────
+// GF dots of GF query rows (q_base[g*head_dim + .], g=0..GF-1) against one contiguous
+// K row at element offset `off`. Each K element is read ONCE and fused into all GF
+// accumulators, so the K HBM read is amortized across the query group (vs GF separate
+// sharpi_kv_dot calls each re-reading the row). q8_0 keeps the per-32-block scale cache
+// (block-walk identical to sharpi_kv_dot). dots[] must hold ≥ GF (GF ≤ 8, host-enforced).
+__device__ __forceinline__ void sharpi_kv_dot_multi(const float* __restrict__ q_base, int head_dim, int gf,
+                                                     const float* __restrict__ k, long off, float* dots)
+{
+    for (int g = 0; g < gf; g++) dots[g] = 0.f;
+    for (int d = 0; d < head_dim; d++) {
+        float kd = k[off + d];
+        for (int g = 0; g < gf; g++) dots[g] += q_base[(long)g * (long)head_dim + d] * kd;
+    }
+}
+__device__ __forceinline__ void sharpi_kv_dot_multi(const float* __restrict__ q_base, int head_dim, int gf,
+                                                     const unsigned short* __restrict__ k, long off, float* dots)
+{
+    for (int g = 0; g < gf; g++) dots[g] = 0.f;
+    for (int d = 0; d < head_dim; d++) {
+        float kd = sharpi_bf16_to_fp32((unsigned int)k[off + d]);
+        for (int g = 0; g < gf; g++) dots[g] += q_base[(long)g * (long)head_dim + d] * kd;
+    }
+}
+__device__ __forceinline__ void sharpi_kv_dot_multi(const float* __restrict__ q_base, int head_dim, int gf,
+                                                     const block_q8_0* __restrict__ k, long off, float* dots)
+{
+    for (int g = 0; g < gf; g++) dots[g] = 0.f;
+    long b = off >> 5;
+    int lane = (int)(off & 31);
+    for (int d = 0; d < head_dim; ) {
+        float s = sharpi_fp16_to_fp32((unsigned int)k[b].d);
+        for (; lane < 32 && d < head_dim; lane++, d++) {
+            float kd = s * (float)k[b].qs[lane];
+            for (int g = 0; g < gf; g++) dots[g] += q_base[(long)g * (long)head_dim + d] * kd;
+        }
+        lane = 0; b++;
+    }
+}
+
+// ── GQA head-sharing split-KV (#237): one block per (KV head, KV split) ──────
+// Variant of llm_attention_splitkv that loads each K/V slice element ONCE and reuses it
+// across the G = num_heads/num_kv_heads query heads sharing that KV head, instead of G
+// separate blocks each re-reading the slice (the per-head split's G× redundant HBM read,
+// which dominates the now-bandwidth-bound long-ctx decode — #235/#237). grid =
+// (num_kv_heads, n_splits); each block emits the SAME per-query-head partials the per-head
+// kernel does, so llm_attention_combine + the partials layout are unchanged. Dynamic shared
+// = G*SPLITKV_CHUNK floats (per-head exp-weights). G ≤ 8 (dots/acc/po_base arrays).
+template<typename KV>
+__device__ void llm_attention_splitkv_grouped_impl(
+    const float* __restrict__ q,
+    const KV* __restrict__ k_cache,
+    const KV* __restrict__ v_cache,
+    float* __restrict__ partial_o,     // [num_heads * n_splits * head_dim]
+    float* __restrict__ partial_meta,  // [num_heads * n_splits * 2] : (m_i, l_i)
+    int num_heads, int num_kv_heads, int head_dim,
+    int seq_len, int n_splits, float attn_scale)
+{
+    extern __shared__ float g_scores[];   // [G * SPLITKV_CHUNK]
+    __shared__ float sdata[256];
+
+    unsigned int tid = threadIdx.x;
+    int kv = (int)blockIdx.x;
+    int s  = (int)blockIdx.y;
+    if (kv >= num_kv_heads || s >= n_splits) return;
+
+    int G  = num_heads / num_kv_heads;    // query heads per KV head (group size)
+    int h0 = kv * G;                       // first query head of this group
+    int t0 = s * SPLITKV_CHUNK;
+    // Out-of-range split (fixed grid, short seq_len): mark all G heads' partials empty so
+    // the combine skips them (scale = exp(−inf − gmax) = 0) and never reads a stale Õ.
+    if (t0 >= seq_len) {
+        if ((int)tid < G) {
+            long mo = ((long)(h0 + (int)tid) * (long)n_splits + (long)s) * 2;
+            partial_meta[mo] = sharpi_neg_inf(); partial_meta[mo + 1] = 0.f;
+        }
+        return;
+    }
+    int t1 = t0 + SPLITKV_CHUNK; if (t1 > seq_len) t1 = seq_len;
+    int n = t1 - t0;
+
+    int kv_dim = num_kv_heads * head_dim;
+    float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
+    long kv_dim_l = (long)kv_dim;
+    long kv_base  = (long)t0 * kv_dim_l + (long)kv * (long)head_dim;
+    const float* q_base = q + (long)h0 * (long)head_dim;
+    // Per-head partial-O row base, hoisted out of the Phase-3 loops.
+    long po_base[8];
+    for (int g = 0; g < G; g++)
+        po_base[g] = ((long)(h0 + g) * (long)n_splits + (long)s) * (long)head_dim;
+
+    // Phase 1: G dots per slice position — K row read once, GF FMAs.
+    for (int t = (int)tid; t < n; t += 256) {
+        float dots[8];
+        sharpi_kv_dot_multi(q_base, head_dim, G, k_cache, kv_base + (long)t * kv_dim_l, dots);
+        for (int g = 0; g < G; g++) g_scores[g * SPLITKV_CHUNK + t] = dots[g] * scale;
+    }
+    __syncthreads();
+
+    // Phase 2: per query head — max, exp in place, sum → (m_i, l_i). sdata reused per g.
+    for (int g = 0; g < G; g++) {
+        float* sc = g_scores + g * SPLITKV_CHUNK;
+        float lmax = sharpi_neg_inf();
+        for (int t = (int)tid; t < n; t += 256) lmax = fmaxf(lmax, sc[t]);
+        sdata[tid] = lmax;
+        __syncthreads();
+        for (unsigned int r = 128; r > 0; r >>= 1) { if (tid < r) sdata[tid] = fmaxf(sdata[tid], sdata[tid + r]); __syncthreads(); }
+        float m_i = sdata[0];
+        __syncthreads();
+        float lsum = 0.f;
+        for (int t = (int)tid; t < n; t += 256) { float e = __expf(sc[t] - m_i); sc[t] = e; lsum += e; }
+        sdata[tid] = lsum;
+        __syncthreads();
+        for (unsigned int r = 128; r > 0; r >>= 1) { if (tid < r) sdata[tid] += sdata[tid + r]; __syncthreads(); }
+        float l_i = sdata[0];
+        if (tid == 0) {
+            long mo = ((long)(h0 + g) * (long)n_splits + (long)s) * 2;
+            partial_meta[mo] = m_i; partial_meta[mo + 1] = l_i;
+        }
+        __syncthreads();
+    }
+
+    // Phase 3: UN-normalized weighted-V numerator — V row read once, GF FMAs.
+    for (int d = (int)tid; d < head_dim; d += 256) {
+        float acc[8];
+        for (int g = 0; g < G; g++) acc[g] = 0.f;
+        for (int t = 0; t < n; t++) {
+            float vd = sharpi_kvload(v_cache, kv_base + (long)t * kv_dim_l + d);
+            for (int g = 0; g < G; g++) acc[g] += g_scores[g * SPLITKV_CHUNK + t] * vd;
+        }
+        for (int g = 0; g < G; g++) partial_o[po_base[g] + d] = acc[g];
+    }
+}
+
+extern ""C"" __global__ void llm_attention_splitkv_grouped(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_meta,
+    int num_heads, int num_kv_heads, int head_dim,
+    int seq_len, int n_splits, float attn_scale)
+{
+    llm_attention_splitkv_grouped_impl<float>(q, k_cache, v_cache, partial_o, partial_meta,
+        num_heads, num_kv_heads, head_dim, seq_len, n_splits, attn_scale);
+}
+
+extern ""C"" __global__ void llm_attention_splitkv_grouped_bf16(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k_cache,
+    const unsigned short* __restrict__ v_cache,
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_meta,
+    int num_heads, int num_kv_heads, int head_dim,
+    int seq_len, int n_splits, float attn_scale)
+{
+    llm_attention_splitkv_grouped_impl<unsigned short>(q, k_cache, v_cache, partial_o, partial_meta,
+        num_heads, num_kv_heads, head_dim, seq_len, n_splits, attn_scale);
+}
+
+extern ""C"" __global__ void llm_attention_splitkv_grouped_q8_0(
+    const float* __restrict__ q,
+    const block_q8_0* __restrict__ k_cache,
+    const block_q8_0* __restrict__ v_cache,
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_meta,
+    int num_heads, int num_kv_heads, int head_dim,
+    int seq_len, int n_splits, float attn_scale)
+{
+    llm_attention_splitkv_grouped_impl<block_q8_0>(q, k_cache, v_cache, partial_o, partial_meta,
+        num_heads, num_kv_heads, head_dim, seq_len, n_splits, attn_scale);
+}
+
 // ── SnapKV: per-(query, head) attention scoring against the K cache ────────
 // Issue #58. Computes the SnapKV importance signal for ONE captured query
 // vector against the layer's K cache. For each head h, masks positions
