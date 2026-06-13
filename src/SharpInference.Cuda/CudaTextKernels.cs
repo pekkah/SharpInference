@@ -128,6 +128,42 @@ __device__ __forceinline__ float sharpi_kvload(const block_q8_0* __restrict__ p,
     return sharpi_fp16_to_fp32((unsigned int)p[b].d) * (float)p[b].qs[j];
 }
 
+// Issue #213: dot of a query vector q[0..n) with a CONTIGUOUS cache row at element
+// offset `off`, specialized per cache dtype. fp32/bf16 are the same trivial per-element loop
+// the inlined sharpi_kvload produced (no change for those dtypes). The q8_0 overload caches the
+// per-32-block fp16 scale — loading + cvt'ing it once per block instead of 32× per element —
+// while keeping the SAME per-element accumulation order and the SAME scale value, so it is
+// BIT-IDENTICAL to the per-element path. This removes the redundant scale work on the dominant
+// contiguous K-row read of decode attention (#213: q8 attention is compute-bound on the dequant,
+// not KV bandwidth — it reads ~4× fewer bytes than fp32 yet is ~50% slower).
+__device__ __forceinline__ float sharpi_kv_dot(const float* __restrict__ q, const float* __restrict__ k, long off, int n)
+{
+    float dot = 0.f;
+    for (int d = 0; d < n; d++) dot += q[d] * k[off + d];
+    return dot;
+}
+__device__ __forceinline__ float sharpi_kv_dot(const float* __restrict__ q, const unsigned short* __restrict__ k, long off, int n)
+{
+    float dot = 0.f;
+    for (int d = 0; d < n; d++) dot += q[d] * sharpi_bf16_to_fp32((unsigned int)k[off + d]);
+    return dot;
+}
+__device__ __forceinline__ float sharpi_kv_dot(const float* __restrict__ q, const block_q8_0* __restrict__ k, long off, int n)
+{
+    float dot = 0.f;
+    long b = off >> 5;              // block holding element `off`
+    int lane = (int)(off & 31);     // starting lane within that block (0 when off is 32-aligned)
+    for (int d = 0; d < n; )
+    {
+        float s = sharpi_fp16_to_fp32((unsigned int)k[b].d);   // convert the fp16 scale ONCE per block
+        for (; lane < 32 && d < n; lane++, d++)
+            dot += q[d] * (s * (float)k[b].qs[lane]);
+        lane = 0;
+        b++;
+    }
+    return dot;
+}
+
 // Read one byte from a uint32-stride buffer at absolute byte offset B.
 __device__ __forceinline__ unsigned int sharpi_byte_at(const unsigned int* __restrict__ buf, long B)
 {
@@ -6536,10 +6572,8 @@ __device__ void llm_attention_swa_kv_impl(
 
     for (int t = (int)tid; t < eff_seq; t += 256) {
         int abs_t = t + window_start;
-        float dot = 0.f;
         long k_off = (long)(abs_t % max_seq_len) * (long)kv_dim + (long)kv_head * (long)head_dim;
-        for (int d = 0; d < head_dim; d++)
-            dot += q[q_off + d] * sharpi_kvload(k_cache, k_off + d);
+        float dot = sharpi_kv_dot(q + q_off, k_cache, k_off, head_dim);
         float score = dot * scale;
         if (use_shared) shared_scores[t] = score;
         else            head_scratch[t]  = score;
@@ -6775,10 +6809,8 @@ __device__ void llm_attention_kv_impl(
     float* head_scratch = scores_scratch + (long)h * (long)max_seq_len;
 
     for (int t = (int)tid; t < seq_len; t += 256) {
-        float dot = 0.f;
         long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
-        for (int d = 0; d < head_dim; d++)
-            dot += q[q_off + d] * sharpi_kvload(k_cache, k_off + d);
+        float dot = sharpi_kv_dot(q + q_off, k_cache, k_off, head_dim);
         float score = dot * scale;
         if (use_shared) shared_scores[t] = score;
         else            head_scratch[t]  = score;
