@@ -12,11 +12,17 @@ namespace SharpInference.Tests.ForwardPass;
 /// used by Qwen3-Coder-30B-A3B). The batched path
 /// (<c>CudaHybridForwardPass.PrefillBatchedTrunk</c>) batches the attention trunk
 /// of the GPU layers over the N prompt tokens; the FFN/MoE stage stays per-token,
-/// and the CPU layers (Coder-30B splits ~29 GPU + 19 CPU on a 12 GB card) run per
-/// token over the N hidden rows. It must produce bit-identical final-token logits
-/// to the sequential per-token <see cref="CudaHybridForwardPass.Forward"/> loop
-/// (the deterministic reference), toggling only
-/// <see cref="CudaHybridForwardPass.BatchedPrefillEnabled"/>.
+/// and any CPU layers run per token over the N hidden rows. It must produce
+/// bit-identical final-token logits to the sequential per-token
+/// <see cref="CudaHybridForwardPass.Forward"/> loop (the deterministic reference),
+/// toggling only <see cref="CudaHybridForwardPass.BatchedPrefillEnabled"/>.
+///
+/// NOTE: on a 12 GB card the current planner places Coder-30B as 48 GPU / 0 CPU
+/// layers (CPU-MoE handles the routed experts; all attention trunks fit on GPU), so
+/// these natural-placement oracles exercise the all-GPU-layer branch. The CpuLayers&gt;0
+/// branch is covered deterministically by
+/// <see cref="BatchedPrefill_CpuEmbedding_CpuLayersSplit_BitwiseMatchesSequential_Coder"/>
+/// via a synthesized split.
 ///
 /// Skipped silently when CUDA is unavailable, the model isn't on disk, or
 /// construction OOMs — but a failure INSIDE Prefill must FAIL, not skip.
@@ -114,8 +120,9 @@ public sealed class CudaHybridBatchedPrefillTests : IDisposable
     /// <summary>
     /// Single-chunk parity: the batched-trunk path must produce final-token logits
     /// bit-identical to the sequential per-token Forward loop. Exercises the batched
-    /// GPU attention trunk + per-token MoE FFN + the GPU→CPU N-row transfer + per-token
-    /// CPU layers (Coder-30B splits across both tiers on a 12 GB card).
+    /// GPU attention trunk + per-token MoE FFN (on this box Coder-30B places all 48 layers
+    /// on GPU with CPU-MoE, so the GPU→CPU N-row transfer + per-token CPU-layer loop are
+    /// covered by the synthesized-split oracle, not here).
     /// </summary>
     [Fact]
     public void BatchedPrefill_BitwiseMatchesSequential_Coder()
@@ -279,6 +286,99 @@ public sealed class CudaHybridBatchedPrefillTests : IDisposable
     }
 
     /// <summary>
+    /// Issue #218 × #162: the combination that actually SHIPS by default on a 12 GB box —
+    /// CPU-resident embedding (#218) AND compute-routed attention projections
+    /// (<see cref="CudaHybridForwardPass.HybridPrefillComputeEnabled"/> default-on). The
+    /// bit-parity oracles pin compute routing off and the #162 oracle above runs GPU-embed, so
+    /// this exact pairing was previously asserted only by inference (the embed step and the
+    /// MMQ/GEMM routing are independent). This forces both and asserts the compute-routed batched
+    /// prefill stays <b>argmax-stable</b> vs the byte-exact matvec batching (shared top-5 + loose
+    /// fp tolerance) under the CPU-embed staging — the same contract as the GPU-embed variant.
+    /// </summary>
+    [Fact]
+    public void BatchedPrefill_CpuEmbedding_ComputeRouting_ArgmaxStableVsMatvec_Coder()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindCoderPath();
+        if (path is null) return;
+
+        bool prevBatched = CudaHybridForwardPass.BatchedPrefillEnabled;
+        bool prevCompute = CudaHybridForwardPass.HybridPrefillComputeEnabled;
+        bool prevForce = CudaHybridForwardPass.ForceCpuResidentEmbedding;
+        try
+        {
+            CudaHybridForwardPass.ForceCpuResidentEmbedding = true;
+
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+            int ctx = Math.Min(hp.ContextLength, 4096);
+            var placement = PlanCoder(model, hp, gpu, ctx);
+
+            var tokens = tokenizer.Encode(
+                "The quick brown fox jumps over the lazy dog. " +
+                "Pack my box with five dozen liquor jugs. " +
+                "How razorback-jumping frogs can level six piqued gymnasts! " +
+                "The five boxing wizards jump quickly.");
+            Assert.True(tokens.Count >= 8, $"Prompt tokenized to only {tokens.Count} tokens.");
+
+            float[] Run(bool compute)
+            {
+                CudaHybridForwardPass.BatchedPrefillEnabled = true;
+                CudaHybridForwardPass.HybridPrefillComputeEnabled = compute;
+                using var fwd = TryConstruct(model, gpu, hp, placement);
+                if (fwd is null) return Array.Empty<float>();
+                var logits = fwd.Prefill(tokens).ToArray();
+                Assert.True(fwd.LastPrefillWasBatched,
+                    "Batched arm fell back to per-token — the comparison would be vacuous.");
+                return logits;
+            }
+
+            float[] matvec  = Run(false);   // byte-exact GEMM-N matvec, CPU embed
+            float[] compute = Run(true);    // default-on MMQ/GEMM compute routing, CPU embed
+            if (matvec.Length == 0 || compute.Length == 0)
+            {
+                _out.WriteLine("SKIP: construction OOM'd on this box.");
+                return;
+            }
+
+            Assert.Equal(matvec.Length, compute.Length);
+
+            float maxAbs = 0f;
+            for (int i = 0; i < matvec.Length; i++)
+                maxAbs = MathF.Max(maxAbs, MathF.Abs(matvec[i] - compute[i]));
+
+            static HashSet<int> Top5(float[] v)
+            {
+                var idx = new int[v.Length];
+                for (int i = 0; i < idx.Length; i++) idx[i] = i;
+                Array.Sort(idx, (a, b) => v[b].CompareTo(v[a]));
+                var set = new HashSet<int>();
+                for (int i = 0; i < 5 && i < idx.Length; i++) set.Add(idx[i]);
+                return set;
+            }
+            var matvecTop = Top5(matvec);
+            var computeTop = Top5(compute);
+            int overlap = 0;
+            foreach (var t in computeTop) if (matvecTop.Contains(t)) overlap++;
+            Assert.True(overlap >= 4,
+                $"CPU-embed compute-routing top-5 overlaps the byte-exact matvec in only {overlap}/5 slots " +
+                $"(maxAbs={maxAbs:E2}).");
+            Assert.True(maxAbs < 3.0f,
+                $"CPU-embed compute-routing vs matvec logits diverged beyond fp tolerance: maxAbs={maxAbs:E2}.");
+            _out.WriteLine($"OK cpu-embed compute-routing argmax-stable: N={tokens.Count} " +
+                $"greedy={Sampler.Greedy(matvec)} maxAbs={maxAbs:E2}");
+        }
+        finally
+        {
+            CudaHybridForwardPass.BatchedPrefillEnabled = prevBatched;
+            CudaHybridForwardPass.HybridPrefillComputeEnabled = prevCompute;
+            CudaHybridForwardPass.ForceCpuResidentEmbedding = prevForce;
+        }
+    }
+
+    /// <summary>
     /// Multi-chunk parity: prefill the prompt in two segments (<c>[0,k)</c> then
     /// <c>[k,N)</c> with <c>startPos=k</c>) and assert the final-token logits are
     /// bit-identical. Exercises <c>startPos &gt; 0</c>, cross-chunk KV continuity, and
@@ -408,6 +508,309 @@ public sealed class CudaHybridBatchedPrefillTests : IDisposable
         {
             CudaHybridForwardPass.BatchedPrefillEnabled = prev;
             Environment.SetEnvironmentVariable("SHARPI_ATTN_WAVE_BUDGET_MB", prevBudget);
+        }
+    }
+
+    /// <summary>
+    /// Issue #218: batched-trunk prefill with a CPU-resident embedding (the low-VRAM / 12 GB
+    /// default config). <see cref="CudaHybridForwardPass.ForceCpuResidentEmbedding"/> forces the
+    /// embedding + output table onto the CPU (<c>_gpuEmbedding/_gpuOutputWeight</c> null) even
+    /// though Coder-30B's Q4_K embedding fits in VRAM, so the batched path's CPU-embed staging
+    /// (one pinned [N × embDim] block → single async H2D) and the <c>_gpuOutputWeight is null</c>
+    /// CPU output branches are exercised. Final-token logits must be bit-identical to the
+    /// sequential per-token <see cref="CudaHybridForwardPass.Forward"/> loop under the SAME
+    /// (forced-CPU-embed) config — only <see cref="CudaHybridForwardPass.BatchedPrefillEnabled"/>
+    /// toggles. Pre-#218 the batched arm would have fallen back to per-token (gated out); the
+    /// <c>LastPrefillWasBatched</c> assertion guards against a vacuous pass.
+    /// </summary>
+    [Fact]
+    public void BatchedPrefill_CpuEmbedding_BitwiseMatchesSequential_Coder()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindCoderPath();
+        if (path is null) return;
+
+        bool prevBatched = CudaHybridForwardPass.BatchedPrefillEnabled;
+        bool prevForce = CudaHybridForwardPass.ForceCpuResidentEmbedding;
+        try
+        {
+            // Forcing embedding+output to CPU only FREES VRAM, so the planned GPU layers still
+            // fit — no new OOM risk vs the GPU-embed oracle's split.
+            CudaHybridForwardPass.ForceCpuResidentEmbedding = true;
+
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+            int ctx = Math.Min(hp.ContextLength, 4096);
+            var placement = PlanCoder(model, hp, gpu, ctx);
+
+            var tokens = tokenizer.Encode(
+                "The quick brown fox jumps over the lazy dog. " +
+                "Pack my box with five dozen liquor jugs. " +
+                "How razorback-jumping frogs can level six piqued gymnasts! " +
+                "The five boxing wizards jump quickly.");
+            Assert.True(tokens.Count >= 8, $"Prompt tokenized to only {tokens.Count} tokens.");
+
+            float[] Run(bool batched)
+            {
+                CudaHybridForwardPass.BatchedPrefillEnabled = batched;
+                using var fwd = TryConstruct(model, gpu, hp, placement);
+                if (fwd is null) return Array.Empty<float>();
+                var logits = fwd.Prefill(tokens).ToArray();
+                if (batched)
+                    Assert.True(fwd.LastPrefillWasBatched,
+                        "Batched arm fell back to the per-token path — the parity check would be vacuous. " +
+                        "The CPU-resident-embedding gate (#218) must not block the batched path. " +
+                        $"GpuLayers={placement.GpuLayers} CpuLayers={placement.CpuLayers}.");
+                return logits;
+            }
+
+            float[] seq = Run(false);
+            float[] bat = Run(true);
+            if (seq.Length == 0 || bat.Length == 0)
+            {
+                _out.WriteLine("SKIP: construction OOM'd on this box.");
+                return;
+            }
+
+            Assert.Equal(seq.Length, bat.Length);
+            int firstDiff = FirstBitDiff(seq, bat);
+            Assert.True(firstDiff < 0,
+                $"CPU-embed batched-trunk prefill diverges from sequential at index {firstDiff} " +
+                $"(seq={(firstDiff >= 0 ? seq[firstDiff] : 0)} bat={(firstDiff >= 0 ? bat[firstDiff] : 0)}). " +
+                "The batched CPU-embed staging upload must be bit-identical to the per-token CpuEmbedToken loop.");
+            Assert.Equal(Sampler.Greedy(seq), Sampler.Greedy(bat));
+            _out.WriteLine($"OK cpu-embed single-chunk N={tokens.Count} greedy={Sampler.Greedy(seq)}");
+        }
+        finally
+        {
+            CudaHybridForwardPass.BatchedPrefillEnabled = prevBatched;
+            CudaHybridForwardPass.ForceCpuResidentEmbedding = prevForce;
+        }
+    }
+
+    /// <summary>
+    /// Issue #218 multi-chunk: prefill in two segments (<c>[0,k)</c> then <c>[k,N)</c> with
+    /// <c>startPos=k</c>) on the forced CPU-resident-embedding config. Exercises the batched
+    /// CPU-embed upload across <c>startPos &gt; 0</c>, the exact-size pinned-embed buffer reuse
+    /// between two chunks of different length, and cross-chunk KV continuity. Final-token logits
+    /// must be bit-identical to the sequential per-token Forward loop under the same config.
+    /// </summary>
+    [Fact]
+    public void BatchedPrefill_CpuEmbedding_MultiChunk_BitwiseMatchesSequential_Coder()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindCoderPath();
+        if (path is null) return;
+
+        bool prevBatched = CudaHybridForwardPass.BatchedPrefillEnabled;
+        bool prevForce = CudaHybridForwardPass.ForceCpuResidentEmbedding;
+        try
+        {
+            CudaHybridForwardPass.ForceCpuResidentEmbedding = true;
+
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+            int ctx = Math.Min(hp.ContextLength, 4096);
+            var placement = PlanCoder(model, hp, gpu, ctx);
+
+            var tokens = tokenizer.Encode(
+                "The quick brown fox jumps over the lazy dog. " +
+                "Pack my box with five dozen liquor jugs. " +
+                "How razorback-jumping frogs can level six piqued gymnasts! " +
+                "The five boxing wizards jump quickly. Sphinx of black quartz, judge my vow.");
+            int N = tokens.Count;
+            Assert.True(N >= 12, $"Prompt tokenized to only {N} tokens.");
+            int k1 = N / 3;
+
+            float[] RunTwoChunks(bool batched)
+            {
+                CudaHybridForwardPass.BatchedPrefillEnabled = batched;
+                using var fwd = TryConstruct(model, gpu, hp, placement);
+                if (fwd is null) return Array.Empty<float>();
+                fwd.Prefill(tokens.Take(k1).ToList(), 0);
+                var logits = fwd.Prefill(tokens.Skip(k1).ToList(), k1).ToArray();
+                if (batched)
+                    Assert.True(fwd.LastPrefillWasBatched,
+                        "Batched arm fell back to the per-token path — the parity check would be vacuous. " +
+                        $"GpuLayers={placement.GpuLayers} CpuLayers={placement.CpuLayers}.");
+                return logits;
+            }
+
+            float[] seq = RunTwoChunks(false);
+            float[] bat = RunTwoChunks(true);
+            if (seq.Length == 0 || bat.Length == 0)
+            {
+                _out.WriteLine("SKIP: construction OOM'd on this box.");
+                return;
+            }
+
+            Assert.Equal(seq.Length, bat.Length);
+            int firstDiff = FirstBitDiff(seq, bat);
+            Assert.True(firstDiff < 0,
+                $"Multi-chunk CPU-embed batched prefill diverges from sequential at index {firstDiff} " +
+                $"(N={N}, split at {k1}). Cross-chunk KV continuity, the startPos>0 path, or the " +
+                "exact-size pinned-embed buffer reuse is not bit-identical to the sequential loop.");
+            Assert.Equal(Sampler.Greedy(seq), Sampler.Greedy(bat));
+            _out.WriteLine($"OK cpu-embed multi-chunk N={N} split={k1} greedy={Sampler.Greedy(seq)}");
+        }
+        finally
+        {
+            CudaHybridForwardPass.BatchedPrefillEnabled = prevBatched;
+            CudaHybridForwardPass.ForceCpuResidentEmbedding = prevForce;
+        }
+    }
+
+    /// <summary>
+    /// Issue #218 with CPU layers &gt; 0. On a 12 GB card the current planner gives Coder-30B
+    /// 48 GPU / 0 CPU layers (CPU-MoE handles the routed experts), so the natural-placement
+    /// oracles above exercise the all-GPU-layer branch. This test SYNTHESIZES a half/half split
+    /// (overriding <see cref="LayerPlacement.GpuLayers"/>/<c>CpuLayers</c>) so the batched
+    /// CPU-embed staging (step 1) and the per-token CPU-layer download loop (step 3) run
+    /// together — the combination the planner won't produce on this box. The synthetic split
+    /// only uses LESS GPU VRAM than the full plan, so it cannot OOM where the others construct.
+    /// Final-token logits must be bit-identical to the sequential per-token Forward loop.
+    /// </summary>
+    [Fact]
+    public void BatchedPrefill_CpuEmbedding_CpuLayersSplit_BitwiseMatchesSequential_Coder()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindCoderPath();
+        if (path is null) return;
+
+        bool prevBatched = CudaHybridForwardPass.BatchedPrefillEnabled;
+        bool prevForce = CudaHybridForwardPass.ForceCpuResidentEmbedding;
+        try
+        {
+            CudaHybridForwardPass.ForceCpuResidentEmbedding = true;
+
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+            int ctx = Math.Min(hp.ContextLength, 4096);
+            var planned = PlanCoder(model, hp, gpu, ctx);
+            // Force a cross-tier split so CpuLayers > 0 (the planner gives 48/0 here via CPU-MoE).
+            int gpuLayers = hp.NumLayers / 2;
+            var split = planned with { GpuLayers = gpuLayers, CpuLayers = hp.NumLayers - gpuLayers };
+
+            var tokens = tokenizer.Encode(
+                "The quick brown fox jumps over the lazy dog. " +
+                "Pack my box with five dozen liquor jugs. " +
+                "How razorback-jumping frogs can level six piqued gymnasts!");
+            Assert.True(tokens.Count >= 8, $"Prompt tokenized to only {tokens.Count} tokens.");
+
+            float[] Run(bool batched)
+            {
+                CudaHybridForwardPass.BatchedPrefillEnabled = batched;
+                using var fwd = TryConstruct(model, gpu, hp, split);
+                if (fwd is null) return Array.Empty<float>();
+                var logits = fwd.Prefill(tokens).ToArray();
+                if (batched)
+                    Assert.True(fwd.LastPrefillWasBatched,
+                        "Batched arm fell back to the per-token path — the parity check would be vacuous. " +
+                        $"GpuLayers={split.GpuLayers} CpuLayers={split.CpuLayers}.");
+                return logits;
+            }
+
+            float[] seq = Run(false);
+            float[] bat = Run(true);
+            if (seq.Length == 0 || bat.Length == 0)
+            {
+                _out.WriteLine("SKIP: construction OOM'd on this box.");
+                return;
+            }
+
+            Assert.Equal(seq.Length, bat.Length);
+            int firstDiff = FirstBitDiff(seq, bat);
+            Assert.True(firstDiff < 0,
+                $"CPU-embed + CpuLayers>0 batched prefill diverges from sequential at index {firstDiff} " +
+                $"(GpuLayers={split.GpuLayers} CpuLayers={split.CpuLayers}). The batched CPU-embed staging " +
+                "and the per-token CPU-layer download loop must together be bit-identical to the sequential loop.");
+            Assert.Equal(Sampler.Greedy(seq), Sampler.Greedy(bat));
+            _out.WriteLine($"OK cpu-embed CpuLayers>0 N={tokens.Count} split={split.GpuLayers}/{split.CpuLayers} greedy={Sampler.Greedy(seq)}");
+        }
+        finally
+        {
+            CudaHybridForwardPass.BatchedPrefillEnabled = prevBatched;
+            CudaHybridForwardPass.ForceCpuResidentEmbedding = prevForce;
+        }
+    }
+
+    /// <summary>
+    /// Issue #123 with CPU layers &gt; 0 on the GPU-resident-embedding path. The natural-placement
+    /// GPU-embed oracles above run 48 GPU / 0 CPU on a 12 GB card (CPU-MoE), so the per-token
+    /// CPU-layer download loop (<c>PrefillBatchedTrunk</c> step 3) is never exercised there. This
+    /// SYNTHESIZES a half/half split (overriding <see cref="LayerPlacement.GpuLayers"/>/<c>CpuLayers</c>)
+    /// so the GPU attention trunk, the GPU→CPU N-row transfer, and the per-token CPU-layer loop all
+    /// run with a GPU-resident embedding. Mirror of
+    /// <see cref="BatchedPrefill_CpuEmbedding_CpuLayersSplit_BitwiseMatchesSequential_Coder"/> with
+    /// the embedding left on the GPU. The synthetic split only uses LESS GPU VRAM than the full plan,
+    /// so it cannot OOM where the others construct. Final-token logits must be bit-identical to the
+    /// sequential per-token Forward loop.
+    /// </summary>
+    [Fact]
+    public void BatchedPrefill_GpuEmbedding_CpuLayersSplit_BitwiseMatchesSequential_Coder()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindCoderPath();
+        if (path is null) return;
+
+        bool prevBatched = CudaHybridForwardPass.BatchedPrefillEnabled;
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+            int ctx = Math.Min(hp.ContextLength, 4096);
+            var planned = PlanCoder(model, hp, gpu, ctx);
+            // Force a cross-tier split so CpuLayers > 0 (the planner gives 48/0 here via CPU-MoE).
+            int gpuLayers = hp.NumLayers / 2;
+            var split = planned with { GpuLayers = gpuLayers, CpuLayers = hp.NumLayers - gpuLayers };
+
+            var tokens = tokenizer.Encode(
+                "The quick brown fox jumps over the lazy dog. " +
+                "Pack my box with five dozen liquor jugs. " +
+                "How razorback-jumping frogs can level six piqued gymnasts!");
+            Assert.True(tokens.Count >= 8, $"Prompt tokenized to only {tokens.Count} tokens.");
+
+            float[] Run(bool batched)
+            {
+                CudaHybridForwardPass.BatchedPrefillEnabled = batched;
+                using var fwd = TryConstruct(model, gpu, hp, split);
+                if (fwd is null) return Array.Empty<float>();
+                var logits = fwd.Prefill(tokens).ToArray();
+                if (batched)
+                    Assert.True(fwd.LastPrefillWasBatched,
+                        "Batched arm fell back to the per-token path — the parity check would be vacuous. " +
+                        $"GpuLayers={split.GpuLayers} CpuLayers={split.CpuLayers}.");
+                return logits;
+            }
+
+            float[] seq = Run(false);
+            float[] bat = Run(true);
+            if (seq.Length == 0 || bat.Length == 0)
+            {
+                _out.WriteLine("SKIP: construction OOM'd on this box.");
+                return;
+            }
+
+            Assert.Equal(seq.Length, bat.Length);
+            int firstDiff = FirstBitDiff(seq, bat);
+            Assert.True(firstDiff < 0,
+                $"GPU-embed + CpuLayers>0 batched prefill diverges from sequential at index {firstDiff} " +
+                $"(GpuLayers={split.GpuLayers} CpuLayers={split.CpuLayers}). The batched GPU attention trunk " +
+                "and the per-token CPU-layer download loop must together be bit-identical to the sequential loop.");
+            Assert.Equal(Sampler.Greedy(seq), Sampler.Greedy(bat));
+            _out.WriteLine($"OK gpu-embed CpuLayers>0 N={tokens.Count} split={split.GpuLayers}/{split.CpuLayers} greedy={Sampler.Greedy(seq)}");
+        }
+        finally
+        {
+            CudaHybridForwardPass.BatchedPrefillEnabled = prevBatched;
         }
     }
 
