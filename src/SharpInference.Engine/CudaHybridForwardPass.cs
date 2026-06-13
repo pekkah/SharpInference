@@ -321,10 +321,13 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 $"SHARPI_KV_DTYPE={requestedKv} + TurboQuant is not supported (TQ owns the KV quantization). " +
                 "Use one or the other.");
         _kvDType = _tqEnabled ? DType.Float32 : requestedKv;
-        if (_kvDType == DType.Q8_0 && !CudaForwardPass.Q8KvGeometrySupported(hp))
+        // Only the GPU-resident layers carry the narrowed cache (CPU-offloaded layers keep fp32),
+        // so scope the q8 geometry check to them — checking all layers would falsely reject q8
+        // when only a CPU-tail layer is incompatible (and trivially passes when _nGpuLayers == 0).
+        if (_kvDType == DType.Q8_0 && !CudaForwardPass.Q8KvGeometrySupported(hp, _nGpuLayers))
             throw new NotSupportedException(
-                "SHARPI_KV_DTYPE=q8_0 requires every layer's kvDim (kvHeads × headDim) to be a multiple " +
-                "of 32 (the q8_0 block size); this model's geometry is incompatible. Use bf16 or fp32.");
+                "SHARPI_KV_DTYPE=q8_0 requires every GPU-resident layer's kvDim (kvHeads × headDim) to be a " +
+                "multiple of 32 (the q8_0 block size); this model's geometry is incompatible. Use bf16 or fp32.");
 
         _tqFp32Window = enableTq ? Math.Min(tqFp32Window, _maxSeqLen) : 0;
         _tqBlockBytes = enableTq ? TurboQuantOps.BlockSize(tqBits, _headDim) : 0;

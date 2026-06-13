@@ -1152,6 +1152,28 @@ public sealed class CudaForwardPassKvDtypeTests
         Assert.True(CudaForwardPass.Q8KvGeometrySupported(aliased));
     }
 
+    /// <summary>
+    /// #230/#232 review: the gpuLayers scope. CudaHybridForwardPass narrows only the GPU-resident
+    /// layers' KV (CPU-offloaded layers stay fp32), so the q8 geometry check must consider only the
+    /// first N layers — a bad-geometry CPU-tail layer must NOT reject q8 when the GPU layers are fine.
+    /// </summary>
+    [Fact]
+    public void Q8KvGeometry_GpuLayersScope_IgnoresCpuTailLayers()
+    {
+        // layer 0 OK (8×128=1024, %32==0); layer 1 BAD (1×52=52, %32==20).
+        var hp = Gemma4ShapedHp(
+            layerHeadDim: [128, 52],
+            layerKvHeads: [8, 1],
+            isSwa: [false, false],
+            kvSource: [-1, -1],
+            slidingWindow: 4096);
+
+        Assert.False(CudaForwardPass.Q8KvGeometrySupported(hp));              // all layers → bad layer 1 fails
+        Assert.False(CudaForwardPass.Q8KvGeometrySupported(hp, gpuLayers: 2)); // first 2 == all → still fails
+        Assert.True(CudaForwardPass.Q8KvGeometrySupported(hp, gpuLayers: 1));  // only layer 0 on GPU → OK
+        Assert.True(CudaForwardPass.Q8KvGeometrySupported(hp, gpuLayers: 0));  // nothing narrowed → trivially OK
+    }
+
     /// <summary>ResolveKvDType fit comparisons are inclusive (&lt;=): an exact-fit fp32/bf16 is kept, not narrowed past.</summary>
     [Fact]
     public void ResolveKvDType_FitBoundaryIsInclusive()
