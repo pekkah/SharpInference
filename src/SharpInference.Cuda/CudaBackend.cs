@@ -3728,7 +3728,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
         // GQA head-sharing (#237): G query heads per block; grid X = numKvHeads, one extern
         // shared float per (group head × chunk slot). G ≤ 8 (kernel's dots/acc/po_base arrays).
-        int group = grouped ? numHeads / numKvHeads : 1;
+        // numKvHeads ≥ 2 guards the division below (a caller passing grouped with numKvHeads ≤ 0
+        // would otherwise DivideByZero before the guard); the guard's `< 2` short-circuits the `%`.
+        int group = (grouped && numKvHeads >= 2) ? numHeads / numKvHeads : 1;
         if (grouped && (numKvHeads < 2 || numHeads % numKvHeads != 0 || group < 2 || group > 8))
             throw new ArgumentOutOfRangeException(nameof(numKvHeads), numKvHeads,
                 $"Grouped split-KV requires numKvHeads ≥ 2, numHeads % numKvHeads == 0, and G ∈ [2,8] " +
