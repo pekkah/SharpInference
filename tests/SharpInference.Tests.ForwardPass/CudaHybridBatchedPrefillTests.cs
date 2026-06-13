@@ -12,11 +12,17 @@ namespace SharpInference.Tests.ForwardPass;
 /// used by Qwen3-Coder-30B-A3B). The batched path
 /// (<c>CudaHybridForwardPass.PrefillBatchedTrunk</c>) batches the attention trunk
 /// of the GPU layers over the N prompt tokens; the FFN/MoE stage stays per-token,
-/// and the CPU layers (Coder-30B splits ~29 GPU + 19 CPU on a 12 GB card) run per
-/// token over the N hidden rows. It must produce bit-identical final-token logits
-/// to the sequential per-token <see cref="CudaHybridForwardPass.Forward"/> loop
-/// (the deterministic reference), toggling only
-/// <see cref="CudaHybridForwardPass.BatchedPrefillEnabled"/>.
+/// and any CPU layers run per token over the N hidden rows. It must produce
+/// bit-identical final-token logits to the sequential per-token
+/// <see cref="CudaHybridForwardPass.Forward"/> loop (the deterministic reference),
+/// toggling only <see cref="CudaHybridForwardPass.BatchedPrefillEnabled"/>.
+///
+/// NOTE: on a 12 GB card the current planner places Coder-30B as 48 GPU / 0 CPU
+/// layers (CPU-MoE handles the routed experts; all attention trunks fit on GPU), so
+/// these natural-placement oracles exercise the all-GPU-layer branch. The CpuLayers&gt;0
+/// branch is covered deterministically by
+/// <see cref="BatchedPrefill_CpuEmbedding_CpuLayersSplit_BitwiseMatchesSequential_Coder"/>
+/// via a synthesized split.
 ///
 /// Skipped silently when CUDA is unavailable, the model isn't on disk, or
 /// construction OOMs — but a failure INSIDE Prefill must FAIL, not skip.
@@ -114,8 +120,9 @@ public sealed class CudaHybridBatchedPrefillTests : IDisposable
     /// <summary>
     /// Single-chunk parity: the batched-trunk path must produce final-token logits
     /// bit-identical to the sequential per-token Forward loop. Exercises the batched
-    /// GPU attention trunk + per-token MoE FFN + the GPU→CPU N-row transfer + per-token
-    /// CPU layers (Coder-30B splits across both tiers on a 12 GB card).
+    /// GPU attention trunk + per-token MoE FFN (on this box Coder-30B places all 48 layers
+    /// on GPU with CPU-MoE, so the GPU→CPU N-row transfer + per-token CPU-layer loop are
+    /// covered by the synthesized-split oracle, not here).
     /// </summary>
     [Fact]
     public void BatchedPrefill_BitwiseMatchesSequential_Coder()
