@@ -286,6 +286,99 @@ public sealed class CudaHybridBatchedPrefillTests : IDisposable
     }
 
     /// <summary>
+    /// Issue #218 × #162: the combination that actually SHIPS by default on a 12 GB box —
+    /// CPU-resident embedding (#218) AND compute-routed attention projections
+    /// (<see cref="CudaHybridForwardPass.HybridPrefillComputeEnabled"/> default-on). The
+    /// bit-parity oracles pin compute routing off and the #162 oracle above runs GPU-embed, so
+    /// this exact pairing was previously asserted only by inference (the embed step and the
+    /// MMQ/GEMM routing are independent). This forces both and asserts the compute-routed batched
+    /// prefill stays <b>argmax-stable</b> vs the byte-exact matvec batching (shared top-5 + loose
+    /// fp tolerance) under the CPU-embed staging — the same contract as the GPU-embed variant.
+    /// </summary>
+    [Fact]
+    public void BatchedPrefill_CpuEmbedding_ComputeRouting_ArgmaxStableVsMatvec_Coder()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindCoderPath();
+        if (path is null) return;
+
+        bool prevBatched = CudaHybridForwardPass.BatchedPrefillEnabled;
+        bool prevCompute = CudaHybridForwardPass.HybridPrefillComputeEnabled;
+        bool prevForce = CudaHybridForwardPass.ForceCpuResidentEmbedding;
+        try
+        {
+            CudaHybridForwardPass.ForceCpuResidentEmbedding = true;
+
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+            int ctx = Math.Min(hp.ContextLength, 4096);
+            var placement = PlanCoder(model, hp, gpu, ctx);
+
+            var tokens = tokenizer.Encode(
+                "The quick brown fox jumps over the lazy dog. " +
+                "Pack my box with five dozen liquor jugs. " +
+                "How razorback-jumping frogs can level six piqued gymnasts! " +
+                "The five boxing wizards jump quickly.");
+            Assert.True(tokens.Count >= 8, $"Prompt tokenized to only {tokens.Count} tokens.");
+
+            float[] Run(bool compute)
+            {
+                CudaHybridForwardPass.BatchedPrefillEnabled = true;
+                CudaHybridForwardPass.HybridPrefillComputeEnabled = compute;
+                using var fwd = TryConstruct(model, gpu, hp, placement);
+                if (fwd is null) return Array.Empty<float>();
+                var logits = fwd.Prefill(tokens).ToArray();
+                Assert.True(fwd.LastPrefillWasBatched,
+                    "Batched arm fell back to per-token — the comparison would be vacuous.");
+                return logits;
+            }
+
+            float[] matvec  = Run(false);   // byte-exact GEMM-N matvec, CPU embed
+            float[] compute = Run(true);    // default-on MMQ/GEMM compute routing, CPU embed
+            if (matvec.Length == 0 || compute.Length == 0)
+            {
+                _out.WriteLine("SKIP: construction OOM'd on this box.");
+                return;
+            }
+
+            Assert.Equal(matvec.Length, compute.Length);
+
+            float maxAbs = 0f;
+            for (int i = 0; i < matvec.Length; i++)
+                maxAbs = MathF.Max(maxAbs, MathF.Abs(matvec[i] - compute[i]));
+
+            static HashSet<int> Top5(float[] v)
+            {
+                var idx = new int[v.Length];
+                for (int i = 0; i < idx.Length; i++) idx[i] = i;
+                Array.Sort(idx, (a, b) => v[b].CompareTo(v[a]));
+                var set = new HashSet<int>();
+                for (int i = 0; i < 5 && i < idx.Length; i++) set.Add(idx[i]);
+                return set;
+            }
+            var matvecTop = Top5(matvec);
+            var computeTop = Top5(compute);
+            int overlap = 0;
+            foreach (var t in computeTop) if (matvecTop.Contains(t)) overlap++;
+            Assert.True(overlap >= 4,
+                $"CPU-embed compute-routing top-5 overlaps the byte-exact matvec in only {overlap}/5 slots " +
+                $"(maxAbs={maxAbs:E2}).");
+            Assert.True(maxAbs < 3.0f,
+                $"CPU-embed compute-routing vs matvec logits diverged beyond fp tolerance: maxAbs={maxAbs:E2}.");
+            _out.WriteLine($"OK cpu-embed compute-routing argmax-stable: N={tokens.Count} " +
+                $"greedy={Sampler.Greedy(matvec)} maxAbs={maxAbs:E2}");
+        }
+        finally
+        {
+            CudaHybridForwardPass.BatchedPrefillEnabled = prevBatched;
+            CudaHybridForwardPass.HybridPrefillComputeEnabled = prevCompute;
+            CudaHybridForwardPass.ForceCpuResidentEmbedding = prevForce;
+        }
+    }
+
+    /// <summary>
     /// Multi-chunk parity: prefill the prompt in two segments (<c>[0,k)</c> then
     /// <c>[k,N)</c> with <c>startPos=k</c>) and assert the final-token logits are
     /// bit-identical. Exercises <c>startPos &gt; 0</c>, cross-chunk KV continuity, and
