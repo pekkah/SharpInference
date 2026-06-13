@@ -189,6 +189,12 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     // config is gated out (e.g. non-batchable dtype on a given box).
     internal bool LastPrefillWasBatched;
 
+    // Test observable (issue #230): the resolved GPU KV-cache dtype. Lets the parity oracle
+    // confirm --kv-type actually applied (the cache is genuinely narrowed) instead of passing
+    // vacuously if the env plumbing regressed and KV silently stayed fp32 (fp32-vs-fp32 is
+    // trivially argmax-stable).
+    internal DType KvCacheDType => _kvDType;
+
     // Issue #218 test/bench hook: force the low-VRAM "fixed weights on CPU" config
     // (embedding + output table CPU-resident, _gpuEmbedding/_gpuOutputWeight null) even on a
     // box where ShouldKeepFixedWeightsOnCpu would keep them on the GPU. Lets the batched-CPU-
