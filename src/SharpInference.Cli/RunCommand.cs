@@ -198,10 +198,21 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         {
             if (!File.Exists(promptFile))
             {
-                AnsiConsole.MarkupLine($"[red]Prompt file not found:[/] {promptFile}");
+                AnsiConsole.MarkupLine($"[red]Prompt file not found:[/] {Markup.Escape(promptFile)}");
                 return 1;
             }
-            settings.Prompt = File.ReadAllText(promptFile);
+            // Read failures (locked file, permissions, bad path) should fail loud + clean, not
+            // throw a stack trace; Escape the message since paths can carry Spectre markup chars.
+            try
+            {
+                settings.Prompt = File.ReadAllText(promptFile);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                                          or System.Security.SecurityException or NotSupportedException)
+            {
+                AnsiConsole.MarkupLine($"[red]Error reading prompt file:[/] {Markup.Escape(ex.Message)}");
+                return 1;
+            }
         }
 
         if (settings.MinBatchBlas > 0)
