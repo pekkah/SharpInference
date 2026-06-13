@@ -566,7 +566,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         else if (_tqEnabled)
             _maxSeqLen = EstimateMaxContextTq(model, gpu, hp, tqFp32Window, tqBits);
         else
-            _maxSeqLen = EstimateMaxContext(model, gpu, hp);
+            // Size the auto-context for the KV dtype the operator requested (#220): a bf16/q8_0
+            // KV store fits 2×/4× the positions of fp32, but EstimateMaxContext previously priced
+            // fp32 unconditionally, so --kv-type was silently ignored for auto-context. Pass the
+            // *requested* dtype (pre-auto-narrow): an explicit narrowed choice should expand the
+            // window, and the fp32 default still yields the fp32-fit context (the auto-narrow
+            // below never fires for an fp32-sized auto-context, since fp32 fits there by
+            // construction).
+            _maxSeqLen = EstimateMaxContext(model, gpu, hp, ResolveConfiguredKvDType());
         // The KV-append/attention kernels index the cache at `pos % _maxSeqLen` (the ring
         // modulo, identity for full caches), so a zero context — e.g. a malformed GGUF with
         // context_length=0 reached via an explicit ctx-size — would be an in-kernel
@@ -4068,67 +4075,63 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
 
     /// <summary>
     /// VRAM-based context-length estimator: take the KV-cache budget from
-    /// <see cref="EstimateAvailableKvVram"/> and divide what's left between K and V caches
-    /// (each FP32, [maxSeqLen, kvDim] per layer), with per-layer / SWA-ring sizing for
-    /// gemma4-style models.
+    /// <see cref="EstimateAvailableKvVram"/> and find the largest context whose KV cache fits,
+    /// at the element width <paramref name="kvDType"/> the forward pass will actually allocate.
+    /// For gemma4-style models (per-layer head_dim / SWA rings / KV-share aliasing) this binary-
+    /// searches against <see cref="EstimateKvCacheBytes"/> — the same allocator-exact arithmetic
+    /// the constructor reserves — so bf16/q8_0 correctly buy ~2×/4× the positions of fp32 (#220).
+    /// Uniform-attention models keep the flat <c>NumLayers × kvDim × maxCtx</c> fp32 formula.
     /// </summary>
-    public static int EstimateMaxContext(GgufModel model, CudaBackend gpu, ModelHyperparams hp)
-    {
-        long available = EstimateAvailableKvVram(model, gpu, hp);
-        int headDim = hp.HeadDim;
+    public static int EstimateMaxContext(
+        GgufModel model, CudaBackend gpu, ModelHyperparams hp, DType kvDType = DType.Float32)
+        => SolveMaxCtxForKv(hp, EstimateAvailableKvVram(model, gpu, hp), kvDType);
 
-        // Gemma 4 per-layer head-dim path: each layer's K/V buffer takes its own
-        // head_dim, and SWA layers cap at SlidingWindowSize regardless of the
-        // global context window. Solve for the largest maxCtx s.t. the summed
-        // per-layer bytes still fit in `available`. Without this branch the
-        // non-gemma4 formula (NumLayers × headDim × maxCtx) wildly under- or
-        // over-counts depending on which side of the head-dim mix dominates.
-        if (hp.LayerHeadDim is { } lhd && hp.IsSwaLayer is { } swa)
+    /// <summary>
+    /// Pure (GPU-free, GGUF-free) core of <see cref="EstimateMaxContext"/>: the largest context
+    /// whose KV cache fits <paramref name="availableKvBytes"/> at element width
+    /// <paramref name="kvDType"/>. Factored out for unit testing (cf. <see cref="ResolveKvDType"/>).
+    /// <para>Gemma 4-style models (per-layer head_dim + SWA pattern) binary-search against
+    /// <see cref="EstimateKvCacheBytes"/> — the allocator-exact arithmetic (dtype + SWA ring +
+    /// KV-share skip + per-layer KV heads + pow2 round-up) the ctor reserves and
+    /// <c>TierPlanner.SolveGpuCtxForPerLayerKv</c> uses — so the estimate can't drift from what is
+    /// actually allocated and bf16/q8_0 correctly buy more context (#220). Because SWA layers
+    /// stop growing past their ring cap, the gain over fp32 exceeds the bare width ratio once the
+    /// context clears that cap. Uniform-attention models keep the flat fp32 formula unchanged.</para>
+    /// </summary>
+    internal static int SolveMaxCtxForKv(ModelHyperparams hp, long availableKvBytes, DType kvDType)
+    {
+        const int floorCtx = 512;
+        int cap = hp.ContextLength;
+
+        // A model whose context is at/below the floor clamps to the cap (and avoids the
+        // Math.Clamp(_, 512, cap) below throwing when cap < 512). Mirrors the floor convention:
+        // return the small ctx and let the ctor's allocation fail loudly if even that won't fit.
+        if (cap <= floorCtx)
+            return cap;
+
+        if (hp.LayerHeadDim is not null && hp.IsSwaLayer is not null)
         {
-            int swaWindow = hp.SlidingWindowSize > 0 ? hp.SlidingWindowSize : int.MaxValue;
-            // SWA layers are sized as a ring of window + SwaRingHeadroom positions (issue
-            // #162), so the cap for the per-token byte formula is the ring size, not the
-            // bare window. Guard against overflow when swaWindow is "unbounded".
-            long swaCap = swaWindow == int.MaxValue ? long.MaxValue : (long)swaWindow + SwaRingHeadroom;
-            long globalKvDimPerToken = 0;
-            long swaKvDimPerToken    = 0;
-            for (int i = 0; i < hp.NumLayers; i++)
+            // EstimateKvCacheBytes is monotonic non-decreasing in ctx, so an upper-bound binary
+            // search converges. Floor 512 mirrors the uniform clamp below.
+            if (EstimateKvCacheBytes(hp, floorCtx, kvDType) > availableKvBytes)
+                return floorCtx;
+            int lo = floorCtx, hi = cap;
+            while (lo < hi)
             {
-                // KV-share layers don't allocate their own pages (the source layer
-                // already counted). Skip from both buckets.
-                if (hp.KvSourceLayer is { } ksl && ksl[i] >= 0) continue;
-                long layerKvDim = 2L * hp.NumKvHeads * lhd[i] * sizeof(float);
-                if (swa[i]) swaKvDimPerToken    += layerKvDim;
-                else        globalKvDimPerToken += layerKvDim;
+                int mid = lo + (hi - lo + 1) / 2;
+                if (EstimateKvCacheBytes(hp, mid, kvDType) <= availableKvBytes)
+                    lo = mid;
+                else
+                    hi = mid - 1;
             }
-            // For a given maxCtx C: bytes = globalKvDimPerToken * C
-            //                            + swaKvDimPerToken    * min(C, swaCap)
-            // Solve for the largest C ≤ hp.ContextLength that fits in `available`.
-            // Branch on whether C ≤ swaCap:
-            //   if C ≤ swaCap: bytes = (global+swa) * C
-            //   else:          bytes = global * C + swa * swaCap
-            long globalPlusSwa = globalKvDimPerToken + swaKvDimPerToken;
-            int candA = globalPlusSwa > 0 ? (int)(available / globalPlusSwa) : int.MaxValue;
-            int maxCtxL;
-            if (candA <= swaCap)
-            {
-                maxCtxL = candA;
-            }
-            else
-            {
-                // swaCap is finite here (candA ≤ long.MaxValue always takes the branch
-                // above when swaCap is unbounded), so swaKvDimPerToken * swaCap is safe.
-                long remain = available - swaKvDimPerToken * swaCap;
-                int candB = globalKvDimPerToken > 0 && remain > 0
-                    ? (int)(remain / globalKvDimPerToken) : 0;
-                maxCtxL = (int)Math.Max(swaCap, candB);
-            }
-            return Math.Clamp(maxCtxL, 512, hp.ContextLength);
+            return lo;
         }
 
-        long bytesPerToken = 2L * hp.NumLayers * hp.NumKvHeads * headDim * sizeof(float);
-        int maxCtx = (int)(available / bytesPerToken);
-        return Math.Clamp(maxCtx, 512, hp.ContextLength);
+        // Uniform-attention models: unchanged flat fp32 formula (#220 is scoped to the
+        // SWA/per-layer Gemma path; dtype-aware sizing for uniform models is out of scope).
+        long bytesPerToken = 2L * hp.NumLayers * hp.NumKvHeads * hp.HeadDim * sizeof(float);
+        int maxCtx = (int)(availableKvBytes / bytesPerToken);
+        return Math.Clamp(maxCtx, floorCtx, cap);
     }
 
     /// <summary>
