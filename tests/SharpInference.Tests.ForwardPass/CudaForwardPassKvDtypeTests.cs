@@ -913,6 +913,99 @@ public sealed class CudaForwardPassKvDtypeTests
     }
 
     /// <summary>
+    /// (1b) The headline #220 claim: once the context clears the SWA ring cap, the SWA layers
+    /// stop growing, so a narrower KV dtype's freed budget flows entirely into the (few) global
+    /// layers — gaining MORE than the bare width ratio (2×/4×). Shape: 1 global + 5 SWA layers
+    /// with a 512 window (ring = 4608); the budget is sized to an fp32 context (8192) already
+    /// PAST that ring, so all SWA layers are capped for every dtype. Relational asserts (not
+    /// magic numbers) so the test is robust to the exact pow2-bucket arithmetic.
+    /// </summary>
+    [Fact]
+    public void SolveMaxCtxForKv_SwaSaturation_DtypeGainExceedsWidthRatio()
+    {
+        var hp = Gemma4ShapedHp(
+            layerHeadDim: [256, 256, 256, 256, 256, 256],
+            layerKvHeads: [8, 8, 8, 8, 8, 8],                 // kvDim = 2048
+            isSwa: [false, true, true, true, true, true],      // 1 global, 5 SWA → SWA dominates
+            kvSource: [-1, -1, -1, -1, -1, -1],
+            slidingWindow: 512);                               // ring = min(ctx, 512+4096) = 4608
+
+        // Budget = fp32 footprint at ctx 8192 (> 4608 ring → SWA layers capped for all dtypes).
+        long budget = CudaForwardPass.EstimateKvCacheBytes(hp, 8192, DType.Float32);
+
+        int fp32 = CudaForwardPass.SolveMaxCtxForKv(hp, budget, DType.Float32);
+        int bf16 = CudaForwardPass.SolveMaxCtxForKv(hp, budget, DType.BFloat16);
+        int q8   = CudaForwardPass.SolveMaxCtxForKv(hp, budget, DType.Q8_0);
+
+        Assert.True(q8 > bf16 && bf16 > fp32, $"monotonic dtype response expected; got fp32={fp32} bf16={bf16} q8={q8}.");
+        // Super-linear: past the SWA cap only the global layers grow, so narrowing beats the
+        // width ratio. (Asserting strict > the ratio, with margin from the 5:1 SWA:global mix.)
+        Assert.True(bf16 > 2 * fp32, $"bf16 ctx {bf16} should exceed 2× fp32 ({fp32}) once SWA layers are capped.");
+        Assert.True(q8 > 4 * fp32, $"q8_0 ctx {q8} should exceed 4× fp32 ({fp32}) once SWA layers are capped.");
+        // Allocator-maximal for the narrowest dtype (fits + next step overflows or hits the cap).
+        Assert.True(CudaForwardPass.EstimateKvCacheBytes(hp, q8, DType.Q8_0) <= budget);
+        Assert.True(q8 == hp.ContextLength ||
+            CudaForwardPass.EstimateKvCacheBytes(hp, q8 + 1, DType.Q8_0) > budget);
+    }
+
+    /// <summary>
+    /// (1c) Floor and cap clamps on the per-layer branch (distinct from the sibling
+    /// SolveGpuCtxForPerLayerKv floor test — different signature: the cap here is hp.ContextLength).
+    /// A budget too small for even 512-ctx returns the floor (the alloc then fails loudly, not a
+    /// silently-smaller context); a model whose ContextLength is below 512 clamps to that; and a
+    /// huge budget clamps UP to the model max (not unbounded).
+    /// </summary>
+    [Fact]
+    public void SolveMaxCtxForKv_ClampsToFloorAndModelMax()
+    {
+        var hp = Gemma4ShapedHp(
+            layerHeadDim: [256, 256, 256],
+            layerKvHeads: [8, 8, 8],
+            isSwa: [false, true, false],
+            kvSource: [-1, -1, 0],
+            slidingWindow: 1024);
+
+        // Budget = 1 byte → can't hold even a 512-ctx cache → floor (512).
+        Assert.Equal(512, CudaForwardPass.SolveMaxCtxForKv(hp, 1, DType.BFloat16));
+
+        // ContextLength below the floor → clamp to the cap (Math.Min(512, cap)) even with a huge budget.
+        var tinyCap = hp with { ContextLength = 256 };
+        Assert.Equal(256, CudaForwardPass.SolveMaxCtxForKv(tinyCap, long.MaxValue, DType.BFloat16));
+
+        // Huge budget → clamp UP to the model max, not beyond.
+        Assert.Equal(hp.ContextLength, CudaForwardPass.SolveMaxCtxForKv(hp, long.MaxValue, DType.Q8_0));
+    }
+
+    /// <summary>
+    /// (1d) Mixed per-layer head_dim: the solver must price each layer at its own head_dim (via
+    /// EstimateKvCacheBytes), not collapse to hp.HeadDim or layer 0. A shape with distinct
+    /// per-layer dims, asserted allocator-maximal (the contract that depends on the per-layer
+    /// arithmetic being exact).
+    /// </summary>
+    [Fact]
+    public void SolveMaxCtxForKv_MixedPerLayerHeadDim_IsAllocatorMaximal()
+    {
+        const int refCtx = 8192;
+        var dtype = DType.Q8_0;
+        var hp = Gemma4ShapedHp(
+            layerHeadDim: [256, 128, 256, 128],   // mixed per-layer head_dim
+            layerKvHeads: [8, 8, 8, 8],
+            isSwa: [false, true, false, true],
+            kvSource: [-1, -1, -1, -1],
+            slidingWindow: 1024);
+
+        long budget = CudaForwardPass.EstimateKvCacheBytes(hp, refCtx, dtype);
+        int got = CudaForwardPass.SolveMaxCtxForKv(hp, budget, dtype);
+
+        Assert.True(CudaForwardPass.EstimateKvCacheBytes(hp, got, dtype) <= budget,
+            $"mixed-headdim solved ctx {got} over-reserves vs budget {budget}.");
+        Assert.True(got >= refCtx, $"solved ctx {got} below the reference {refCtx}, which fits exactly.");
+        Assert.True(got == hp.ContextLength ||
+            CudaForwardPass.EstimateKvCacheBytes(hp, got + 1, dtype) > budget,
+            $"ctx {got + 1} also fits — not the largest fitting context for the mixed-headdim shape.");
+    }
+
+    /// <summary>
     /// Q8KvGeometrySupported returns false when ANY single (non-aliased) layer violates the
     /// %32 rule — not just when all do. A mixed set with one bad layer must fail, matching
     /// the ctor's per-layer throw (else auto-narrow would pick q8_0 and then crash).
