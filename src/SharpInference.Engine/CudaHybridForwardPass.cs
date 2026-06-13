@@ -182,8 +182,16 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     // Test observable (issue #123): set by Prefill to whether the last call dispatched the
     // batched-trunk path (true) or fell back to the per-token loop (false). Lets the parity
     // oracles assert the batched path actually ran instead of passing vacuously when the
-    // config is gated out (e.g. CPU-resident embedding / non-batchable dtype on a given box).
+    // config is gated out (e.g. non-batchable dtype on a given box).
     internal bool LastPrefillWasBatched;
+
+    // Issue #218 test/bench hook: force the low-VRAM "fixed weights on CPU" config
+    // (embedding + output table CPU-resident, _gpuEmbedding/_gpuOutputWeight null) even on a
+    // box where ShouldKeepFixedWeightsOnCpu would keep them on the GPU. Lets the batched-CPU-
+    // embed prefill path (#218) be exercised and A/B-benched on a model whose embedding fits in
+    // VRAM. Read once in the constructor; OR'd into cpuEmbeddingOutputOnly. Default off.
+    internal static bool ForceCpuResidentEmbedding =
+        Environment.GetEnvironmentVariable("SHARPI_FORCE_CPU_EMBED") == "1";
 
     // Device scratch for the batched attention trunk, allocated lazily by
     // EnsureBatchedTrunkScratch(N) and sized to the largest N seen so far. The
@@ -201,6 +209,13 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     // Pinned host buffer for the batched GPU→CPU hidden transfer [N × embDim].
     private Tensor? _pinnedHiddenAll;
     private int _pinnedHiddenAllN;
+    // Issue #218: dedicated pinned host buffer for the batched CPU→GPU embedding upload
+    // [N × embDim], used only when the embedding is CPU-resident (_gpuEmbedding is null).
+    // Distinct from _pinnedHidden/_pinnedHiddenAll so the embed staging never races the
+    // per-token hidden transfer; the whole block is CPU-written then uploaded in one async
+    // H2D, so there is no per-token write-after-read on a shared buffer.
+    private Tensor? _pinnedEmbedAll;
+    private int _pinnedEmbedAllN;
 
     // Non-transactional fault latch (mirror of CudaHybridGdnForwardPass._faulted):
     // set at batched-prefill entry, cleared only after the KV/position counters have
@@ -276,7 +291,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         if (_isGemma4Like)
             Gemma4ValidateHybridSplit(hp, _nGpuLayers);
 
-        bool cpuEmbeddingOutputOnly = ShouldKeepFixedWeightsOnCpu(
+        bool cpuEmbeddingOutputOnly = ForceCpuResidentEmbedding || ShouldKeepFixedWeightsOnCpu(
             model.FindTensor("token_embd.weight")!.Value,
             model.FindTensor("output.weight"));
         _tqEnabled = enableTq;
@@ -1078,19 +1093,18 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     /// (per-layer head_dim / dual-RoPE / PLE), TurboQuant-KV, non-NEOX RoPE (the only
     /// batched RoPE kernel is NEOX), and L2 QK-norm (no batched HeadNormPure) all fall
     /// back to the per-token <see cref="Forward"/> loop. Qwen3-Coder-30B (NEOX, learned
-    /// QK-norm, no attn-bias, MoE, GPU-resident embedding) is supported.
+    /// QK-norm, no attn-bias, MoE) is supported with either embedding placement.
     /// <para>
-    /// CPU-resident embedding (<c>_gpuEmbedding is null</c>, a low-VRAM config) is gated
-    /// OUT: the batched embed loop would have to drain the stream between tokens to avoid
-    /// a write-after-read race on the shared <c>_pinnedHidden</c> staging buffer (the
-    /// per-token <see cref="Forward"/> path is safe only because it syncs once per token).
-    /// Rather than ship that uncovered path, fall back to the bit-exact per-token loop.
+    /// CPU-resident embedding (<c>_gpuEmbedding is null</c>, the low-VRAM / 12 GB-default
+    /// config) is supported as of issue #218: the embed step dequantizes all N rows into a
+    /// dedicated pinned staging block and uploads them in one async H2D, so there is no
+    /// per-token write-after-read on a shared buffer (which is why <c>_gpuEmbedding is not
+    /// null</c> is no longer required here). See <see cref="PrefillBatchedTrunk"/> step 1.
     /// </para>
     /// </summary>
     private bool IsBatchedPrefillSupported =>
         !_isGemma4Like
         && !_tqEnabled
-        && _gpuEmbedding is not null
         && _hp.IsNeoxRope
         && !(_hasQkNorm && _hp.UseL2QkNorm)
         && !_hasAttnBias
@@ -1172,6 +1186,17 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         return _pinnedHiddenAll;
     }
 
+    // Issue #218: exact-size pinned staging for the batched CPU→GPU embedding upload, so
+    // CopyDevice(stream, pinnedEmbed) has equal element counts on both sides (n × embDim).
+    private Tensor EnsurePinnedEmbedAll(int n)
+    {
+        if (_pinnedEmbedAll is { } p && _pinnedEmbedAllN == n) return p;
+        if (_pinnedEmbedAll is { } old) { _gpu.Free(old); _pinnedEmbedAll = null; }
+        _pinnedEmbedAll = _gpu.AllocatePinned(TensorShape.D1((long)n * _embDim));
+        _pinnedEmbedAllN = n;
+        return _pinnedEmbedAll;
+    }
+
     /// <summary>
     /// Batched-trunk prompt prefill for the pure-attention hybrid path (issue #123).
     /// The attention trunk of the <c>_nGpuLayers</c> GPU layers runs as batched launches
@@ -1207,19 +1232,31 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         _faulted = true;
 
         // 1. Embed every token into the residual-stream buffer [N × embDim].
-        //    Only the GPU-resident-embedding path runs here: CPU-resident embedding is
-        //    gated out of the batched path (IsBatchedPrefillSupported requires
-        //    _gpuEmbedding is not null) because reusing the shared _pinnedHidden staging
-        //    buffer across tokens without a per-token drain would race the async copy.
-        if (_gpuEmbedding is null)
-            throw new InvalidOperationException(
-                "Batched-trunk prefill requires a GPU-resident embedding (gated by IsBatchedPrefillSupported).");
-        for (int i = 0; i < N; i++)
+        if (_gpuEmbedding is not null)
         {
-            if (_embIsQuantized) _gpu.EmbedLookupQ4K(_gpuEmbedding, _gpuHidden, tokens[i], embDim);
-            else                 _gpu.EmbedLookup(_gpuEmbedding, _gpuHidden, tokens[i], embDim);
-            _gpu.CopyDeviceRegion(stream, (long)i * embDim * sizeof(float),
-                                  _gpuHidden, 0, (long)embDim * sizeof(float));
+            // GPU-resident embedding: look each row up on the GPU and scatter into the stream.
+            for (int i = 0; i < N; i++)
+            {
+                if (_embIsQuantized) _gpu.EmbedLookupQ4K(_gpuEmbedding, _gpuHidden, tokens[i], embDim);
+                else                 _gpu.EmbedLookup(_gpuEmbedding, _gpuHidden, tokens[i], embDim);
+                _gpu.CopyDeviceRegion(stream, (long)i * embDim * sizeof(float),
+                                      _gpuHidden, 0, (long)embDim * sizeof(float));
+            }
+        }
+        else
+        {
+            // Issue #218: CPU-resident embedding (low-VRAM config). Dequantize all N rows on
+            // the CPU into a dedicated pinned block [N × embDim] (the SAME per-row dequant as
+            // CpuEmbedToken → byte-identical to the per-token Forward path), then upload the
+            // whole block in ONE async H2D into the stream. The block is fully CPU-written
+            // before the single copy is enqueued, so there is no per-token write-after-read
+            // on a shared staging buffer — the hazard that gated this config out pre-#218.
+            var pinnedEmbed = EnsurePinnedEmbedAll(N);
+            float* host = _gpu.MapPinned(pinnedEmbed);
+            for (int i = 0; i < N; i++)
+                CpuEmbedToken(tokens[i], host + (long)i * embDim);
+            _gpu.UnmapPinned(pinnedEmbed);
+            _gpu.CopyDevice(stream, pinnedEmbed);   // pinned host → device stream (UVA H2D, N × embDim)
         }
 
         // 2. GPU layers: batched attention trunk + per-token FFN/MoE.
@@ -3048,6 +3085,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         // Issue #123: batched-trunk prefill scratch.
         FreeBatchedTrunkScratch();
         if (_pinnedHiddenAll is { } pha) { _gpu.Free(pha); _pinnedHiddenAll = null; }
+        // Issue #218: batched CPU-embed staging buffer.
+        if (_pinnedEmbedAll is { } pea) { _gpu.Free(pea); _pinnedEmbedAll = null; }
 
         for (int i = 0; i < _nGpuLayers; i++)
         {
