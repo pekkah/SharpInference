@@ -100,9 +100,13 @@ public sealed class CudaHybridKvDtypeTests : IDisposable
     /// Flash-decoding split-KV parity on the hybrid pass (#238). At long ctx the hybrid decode
     /// attention switches from the single-block kernel to the split-KV + combine path (the same
     /// kernels the dense #235/#237 tests validate bit-faithfully). This confirms the hybrid WIRING
-    /// (dispatch gate, partials buffer, graph interaction) is correct: a &gt;4096-token prompt puts
-    /// every decode step past the hybrid split threshold, and the single-block run (split off) is the
-    /// trusted reference. Argmax-stable, not bit-identical (the combine reorders the reduction).
+    /// (dispatch gate, partials buffer alloc/free, dtype dispatch) is correct: a &gt;4096-token prompt
+    /// puts every decode step past the hybrid split threshold, and the single-block run (split off) is
+    /// the trusted reference. Argmax-stable, not bit-identical (the combine reorders the reduction).
+    /// NOTE: the MoE hybrid runs decode EAGER (no CUDA-graph capture), so this covers the eager path;
+    /// the split-under-graph-replay interaction is validated on the dense path
+    /// (Gemma4_E4B_SplitKv_GraphReplayCrossesBoundary). A partial-offload Gemma4 hybrid (which DOES
+    /// graph-capture the split branch) is a noted follow-up.
     /// </summary>
     private void AssertHybridSplitKvParity(string? path, string kvDtype, float maxAbsTol)
     {
@@ -285,8 +289,10 @@ public sealed class CudaHybridKvDtypeTests : IDisposable
     /// <summary>Hybrid split-KV decode (#238) vs single-block on Coder-30B q8 at &gt;4096 ctx —
     /// the layer-split MoE hybrid is the model that reaches the hybrid split threshold (OLMoE caps
     /// at 4096 and never splits). Decode A/B confirmed the win (1.49× @6K → 2.08× @16K); this fences
-    /// correctness of the wiring.</summary>
-    [Fact] public void Coder30B_Q8SplitKv_MatchesSingleBlock() => AssertHybridSplitKvParity(CoderPath(), "q8_0", maxAbsTol: 6.0f);
+    /// correctness of the wiring. Same-dtype (q8-vs-q8) so the only divergence is the combine's
+    /// reduction reorder → a tighter budget than the cross-dtype Coder q8-vs-fp32 test (6.0); top-5
+    /// stability is the hard gate.</summary>
+    [Fact] public void Coder30B_Q8SplitKv_MatchesSingleBlock() => AssertHybridSplitKvParity(CoderPath(), "q8_0", maxAbsTol: 4.0f);
 
     /// <summary>
     /// >4096 wave path (AttentionBatchedWaveQ8_0): a single Prefill of &gt;4096 tokens makes

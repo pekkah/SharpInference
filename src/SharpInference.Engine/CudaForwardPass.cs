@@ -508,11 +508,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     private Tensor? _splitKvPartialMeta;
     // Only split once the context is long enough that the 8-block launch underutilizes the
     // GPU; below this, the single-block kernel is already near the weight-matvec floor.
-    // Internal so CudaHybridForwardPass reuses the same gate (#238).
-    internal const int SplitKvMinSeq = 2048;
+    // (CudaHybridForwardPass uses its own higher HybridSplitMinSeq — #238.)
+    private const int SplitKvMinSeq = 2048;
     // Upper bound on maxSeqLen for the split path: nSplits = ceil(ctx/chunk) must fit the
     // combine kernel's SPLITKV_MAX_SPLITS shared array. Derived from the backend constants so
-    // the gate can't drift from the kernel bound (= 256 × 512 = 131072).
+    // the gate can't drift from the kernel bound (= 256 × 512 = 131072). Internal so the hybrid
+    // pass reuses the same bound (#238).
     internal const int SplitKvMaxCtx = CudaBackend.SplitKvMaxSplits * CudaBackend.SplitKvChunk;
     // SHARPI_SPLIT_DECODE=0 reverts to the single-block-per-head decode attention (the A/B
     // baseline; lets parity tests compare the split path against it). Default on.
