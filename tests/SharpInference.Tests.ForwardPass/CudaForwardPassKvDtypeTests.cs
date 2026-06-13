@@ -645,6 +645,34 @@ public sealed class CudaForwardPassKvDtypeTests
     public void Qwen3_8B_Fp32Grouped_MatchesSingleBlock()
         => AssertGroupedSplitKvParity("Qwen3-8B-Q4_K_M.gguf", "fp32", maxAbsTol: 1.0f);
 
+    /// <summary>
+    /// The #237 grouped-split dispatch gate (the shipping default) — pure logic, no GPU. A mis-fire
+    /// (selecting grouped for an ineligible head config) would hit the host-side throw in
+    /// AttentionSplitKv, so the auto/eligibility/override boundaries are fenced here. Note: the
+    /// kernel's G=8 array bound (dots[8]/acc[8]) is not exercised end-to-end (no on-disk model has
+    /// G=8 with numKvHeads≥2); the eligibility boundary (G=8 ok, G=9 rejected) is checked below.
+    /// </summary>
+    [Fact]
+    public void ShouldUseGroupedSplit_GatesCorrectly()
+    {
+        // auto (mode null): grouped only for fp32 at long ctx (≥24576) with an eligible head config.
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit(null, DType.Q8_0,    8, 2, 32768)); // q8 never auto
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit(null, DType.BFloat16, 8, 2, 32768)); // bf16 never auto
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit(null, DType.Float32, 8, 2, 16384)); // below threshold
+        Assert.True (CudaForwardPass.ShouldUseGroupedSplit(null, DType.Float32, 8, 2, 24576)); // fp32 long-ctx
+        Assert.True (CudaForwardPass.ShouldUseGroupedSplit(null, DType.Float32, 8, 2, 65536));
+        // ineligible head configs → never grouped (would otherwise hit the host throw / a 1-wide grid).
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit(null, DType.Float32, 8, 1, 32768)); // MQA: numKvHeads<2
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit(null, DType.Float32, 8, 8, 32768)); // MHA: G=1
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit(null, DType.Float32, 8, 3, 32768)); // not divisible
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit(null, DType.Float32, 18, 2, 32768)); // G=9 > 8
+        Assert.True (CudaForwardPass.ShouldUseGroupedSplit(null, DType.Float32, 16, 2, 32768)); // G=8 boundary ok
+        // overrides.
+        Assert.True (CudaForwardPass.ShouldUseGroupedSplit("1", DType.Q8_0,    8, 2, 100));   // forced on + eligible
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit("1", DType.Float32, 8, 1, 32768)); // forced but ineligible
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit("0", DType.Float32, 8, 2, 32768)); // forced off
+    }
+
     // ── Issue #191: narrowed-KV GREEDY decode coherence (template-correct) ───
     // The parity tests above teacher-force the narrowed dtype onto fp32's trajectory, so
     // they never let bf16/q8_0 pick their OWN greedy tokens — exactly the path a real 12 GB

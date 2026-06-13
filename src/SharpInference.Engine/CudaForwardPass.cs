@@ -258,19 +258,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         if (_splitKvPartialO is { } splitO && _splitKvPartialMeta is { } splitMeta
             && seqLen > SplitKvMinSeq && maxSeqLen <= _maxSeqLen)
         {
-            // GQA head-sharing (#237). Eligible only when a KV head's query group (G) fits the
-            // grouped kernel's arrays (2..8), divides evenly, and there are ≥2 KV heads (else the
-            // grid X = numKvHeads is too small to fill the SMs). Within that: "0" forces per-head,
-            // "1" forces grouped, unset auto-selects grouped only for fp32 at long ctx (where the
-            // bandwidth-bound read makes the G× traffic saving beat the G× block-count loss).
-            int g = numKvHeads >= 2 ? numHeads / numKvHeads : 0;
-            bool eligible = numKvHeads >= 2 && numHeads % numKvHeads == 0 && g >= 2 && g <= 8;
-            bool grouped = eligible && _splitGroupedMode switch
-            {
-                "0" => false,
-                "1" => true,
-                _   => _kvDType == DType.Float32 && seqLen >= GroupedMinSeqFp32,
-            };
+            bool grouped = ShouldUseGroupedSplit(_splitGroupedMode, _kvDType, numHeads, numKvHeads, seqLen);
             _gpu.AttentionSplitKv(q, kCache, vCache, output, splitO, splitMeta, _kvDType,
                 numHeads, numKvHeads, headDim, seqLen, maxSeqLen, attnScale, grouped: grouped);
             return;
@@ -285,6 +273,26 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         else
             _gpu.Attention(q, kCache, vCache, output, scoresScratch,
                 numHeads, numKvHeads, headDim, seqLen, maxSeqLen, attnScale);
+    }
+
+    /// <summary>
+    /// GQA head-sharing dispatch decision (#237) — the production default that routes
+    /// <see cref="AttentionKv"/> to the grouped split-KV kernel. Eligible only when a KV head's
+    /// query group <c>G = numHeads/numKvHeads</c> fits the grouped kernel's arrays (2..8), divides
+    /// evenly, and there are ≥2 KV heads (else grid X = numKvHeads is too small to fill the SMs).
+    /// Within that: <paramref name="mode"/> "0" forces per-head, "1" forces grouped, unset
+    /// auto-selects grouped only for fp32 at long ctx (where the bandwidth-bound read makes the
+    /// G× traffic saving beat the G× block-count loss — see #237 A/B). Pure function so the
+    /// shipping default is unit-tested without a GPU.
+    /// </summary>
+    internal static bool ShouldUseGroupedSplit(string? mode, DType kvDType, int numHeads, int numKvHeads, int seqLen)
+    {
+        if (mode == "0") return false;
+        int g = numKvHeads >= 2 ? numHeads / numKvHeads : 0;
+        bool eligible = numKvHeads >= 2 && numHeads % numKvHeads == 0 && g >= 2 && g <= 8;
+        if (!eligible) return false;                 // can't launch grouped (host would throw)
+        if (mode == "1") return true;                // forced on, eligible
+        return kvDType == DType.Float32 && seqLen >= GroupedMinSeqFp32;   // auto
     }
 
     private void AttentionSwaKv(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
