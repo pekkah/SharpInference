@@ -818,6 +818,100 @@ public sealed class CudaForwardPassKvDtypeTests
             hp, autoCtxCap: 256, vramBudget: long.MaxValue, dtype, gpuLayers: 3));
     }
 
+    // ── Issue #220: dense auto-context is dtype-aware (CudaForwardPass.SolveMaxCtxForKv) ──
+    // The full-GPU Gemma path's auto-context comes from EstimateMaxContext → SolveMaxCtxForKv,
+    // which previously priced fp32 unconditionally, so --kv-type bf16/q8_0 bought NO extra
+    // context (observed 1770 flat across all three dtypes on a 12 GB card). The fix binary-
+    // searches the largest ctx whose EstimateKvCacheBytes(.., kvDType) fits — the same
+    // allocator-exact arithmetic the ctor reserves — so narrowed KV expands the window. These
+    // pin: (1) the dtype response in a linear all-global regime (clean ratios), (2) the
+    // allocator-maximal contract on the SWA shape, (3) uniform-attention models are UNCHANGED.
+
+    /// <summary>
+    /// (1) Dtype response, linear regime. An all-global per-layer model (LayerHeadDim set,
+    /// IsSwaLayer all false → the per-layer binary-search branch, but no SWA-ring capping) is
+    /// linear in ctx, so a budget sized to exactly fit 4096-ctx fp32 yields a clean dtype
+    /// progression: bf16 doubles the ctx (half the per-element width), q8_0 ~3.76× it (its
+    /// 34-byte/32-elem blocks fall short of a clean 4×). Dims chosen so fp32/bf16 buffers land
+    /// exactly on power-of-two pool buckets (kvDim 1024 × power-of-two ctx), isolating the ratio
+    /// from round-up noise.
+    /// </summary>
+    [Fact]
+    public void SolveMaxCtxForKv_RespondsToDtype_LinearRegime()
+    {
+        var hp = Gemma4ShapedHp(
+            layerHeadDim: [128, 128, 128, 128],
+            layerKvHeads: [8, 8, 8, 8],          // kvDim = 1024
+            isSwa: [false, false, false, false], // all global → linear in ctx, no SWA cap
+            kvSource: [-1, -1, -1, -1],
+            slidingWindow: 4096);                // irrelevant (no SWA layer)
+
+        // Budget = exactly the fp32 footprint at 4096 ctx (each [4096×1024] fp32 buffer = 2^24).
+        long budget = CudaForwardPass.EstimateKvCacheBytes(hp, 4096, DType.Float32);
+
+        int fp32 = CudaForwardPass.SolveMaxCtxForKv(hp, budget, DType.Float32);
+        int bf16 = CudaForwardPass.SolveMaxCtxForKv(hp, budget, DType.BFloat16);
+        int q8   = CudaForwardPass.SolveMaxCtxForKv(hp, budget, DType.Q8_0);
+
+        Assert.Equal(4096, fp32);
+        Assert.Equal(8192, bf16);                 // exactly 2× — half the element width
+        Assert.Equal(2 * fp32, bf16);
+        Assert.True(q8 > bf16 && q8 >= 15000,     // ~3.76× (q8_0's 34/32 block overhead < clean 4×)
+            $"q8_0 ctx {q8} should be well past 2× fp32 ({fp32}) — narrowed KV must expand the window.");
+        // Allocator-exact: the chosen q8_0 ctx fits the budget and the next step up does not.
+        Assert.True(CudaForwardPass.EstimateKvCacheBytes(hp, q8, DType.Q8_0) <= budget);
+        Assert.True(CudaForwardPass.EstimateKvCacheBytes(hp, q8 + 1, DType.Q8_0) > budget);
+    }
+
+    /// <summary>
+    /// (2) Allocator-maximal on the SWA shape (the #220 contract). Sizing the budget to a
+    /// reference context's bf16 footprint, the solver must fit (never under-reserve → no
+    /// runtime OOM), return at least the reference, and be maximal (the next ctx overflows).
+    /// Uses the gemma4 shape (per-layer head_dim + SWA ring + KV-share aliasing) so the search
+    /// runs against the real per-layer allocator arithmetic.
+    /// </summary>
+    [Fact]
+    public void SolveMaxCtxForKv_SwaShape_IsAllocatorMaximal()
+    {
+        const int refCtx = 8192;
+        var dtype = DType.BFloat16;
+        var hp = Gemma4ShapedHp(
+            layerHeadDim: [256, 256, 256],
+            layerKvHeads: [8, 8, 8],
+            isSwa: [false, true, false],
+            kvSource: [-1, -1, 0],   // layer 2 aliases layer 0
+            slidingWindow: 1024);
+
+        long budget = CudaForwardPass.EstimateKvCacheBytes(hp, refCtx, dtype);
+        int got = CudaForwardPass.SolveMaxCtxForKv(hp, budget, dtype);
+
+        Assert.True(CudaForwardPass.EstimateKvCacheBytes(hp, got, dtype) <= budget,
+            $"solved ctx {got} over-reserves vs budget {budget} — would OOM at runtime (#220).");
+        Assert.True(got >= refCtx, $"solved ctx {got} below the reference {refCtx}, which fits exactly.");
+        Assert.True(got == hp.ContextLength ||
+            CudaForwardPass.EstimateKvCacheBytes(hp, got + 1, dtype) > budget,
+            $"ctx {got + 1} also fits budget {budget} — solver did not return the LARGEST fitting context.");
+    }
+
+    /// <summary>
+    /// (3) Uniform-attention models are UNCHANGED: a flat model (no LayerHeadDim / IsSwaLayer)
+    /// keeps the fp32 formula regardless of the requested KV dtype, so bf16/q8_0 do NOT alter
+    /// its auto-context. This is the #220 acceptance "no change for uniform-attention models"
+    /// guard — the dtype-aware sizing is scoped to the SWA/per-layer Gemma path only.
+    /// </summary>
+    [Fact]
+    public void SolveMaxCtxForKv_UniformModel_IgnoresDtype()
+    {
+        var hp = FlatHp(numLayers: 8, numKvHeads: 8, headDim: 128, ctx: 131072);
+        long budget = 256L * 1024 * 1024;
+        int fp32 = CudaForwardPass.SolveMaxCtxForKv(hp, budget, DType.Float32);
+        int bf16 = CudaForwardPass.SolveMaxCtxForKv(hp, budget, DType.BFloat16);
+        int q8   = CudaForwardPass.SolveMaxCtxForKv(hp, budget, DType.Q8_0);
+        Assert.True(fp32 > 512, $"sanity: expected a mid-range ctx, got {fp32}.");
+        Assert.Equal(fp32, bf16);   // dtype ignored for uniform models — no change vs pre-#220
+        Assert.Equal(fp32, q8);
+    }
+
     /// <summary>
     /// Q8KvGeometrySupported returns false when ANY single (non-aliased) layer violates the
     /// %32 rule — not just when all do. A mixed set with one bad layer must fail, matching
