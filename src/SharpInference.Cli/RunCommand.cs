@@ -24,7 +24,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         [CommandOption("-p|--prompt")]
         [Description("Input prompt (default: interactive chat)")]
-        public string? Prompt { get; init; }
+        public string? Prompt { get; set; }
+
+        [CommandOption("-f|--file")]
+        [Description("Read the prompt from a file (llama.cpp -f/--file). Overrides -p when both are given; useful for prompts longer than the shell's command-line limit.")]
+        public string? PromptFile { get; init; }
 
         [CommandOption("-n|--n-predict")]
         [Description("Number of tokens to predict (default: 512)")]
@@ -188,6 +192,29 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
     protected override int Execute(CommandContext context, Settings settings, CancellationToken cancellation)
     {
+        // --file/-f (llama.cpp): load the prompt from a file. Overrides -p; lets prompts exceed
+        // the shell command-line length limit. Read as-is (no trailing-newline stripping).
+        if (settings.PromptFile is { Length: > 0 } promptFile)
+        {
+            if (!File.Exists(promptFile))
+            {
+                AnsiConsole.MarkupLine($"[red]Prompt file not found:[/] {Markup.Escape(promptFile)}");
+                return 1;
+            }
+            // Read failures (locked file, permissions, bad path) should fail loud + clean, not
+            // throw a stack trace; Escape the message since paths can carry Spectre markup chars.
+            try
+            {
+                settings.Prompt = File.ReadAllText(promptFile);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                                          or System.Security.SecurityException or NotSupportedException)
+            {
+                AnsiConsole.MarkupLine($"[red]Error reading prompt file:[/] {Markup.Escape(ex.Message)}");
+                return 1;
+            }
+        }
+
         if (settings.MinBatchBlas > 0)
             SimdKernels.MinBatchForBlas = settings.MinBatchBlas;
 
