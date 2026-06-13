@@ -647,6 +647,80 @@ public sealed class CudaHybridBatchedPrefillTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Issue #123 with CPU layers &gt; 0 on the GPU-resident-embedding path. The natural-placement
+    /// GPU-embed oracles above run 48 GPU / 0 CPU on a 12 GB card (CPU-MoE), so the per-token
+    /// CPU-layer download loop (<c>PrefillBatchedTrunk</c> step 3) is never exercised there. This
+    /// SYNTHESIZES a half/half split (overriding <see cref="LayerPlacement.GpuLayers"/>/<c>CpuLayers</c>)
+    /// so the GPU attention trunk, the GPU→CPU N-row transfer, and the per-token CPU-layer loop all
+    /// run with a GPU-resident embedding. Mirror of
+    /// <see cref="BatchedPrefill_CpuEmbedding_CpuLayersSplit_BitwiseMatchesSequential_Coder"/> with
+    /// the embedding left on the GPU. The synthetic split only uses LESS GPU VRAM than the full plan,
+    /// so it cannot OOM where the others construct. Final-token logits must be bit-identical to the
+    /// sequential per-token Forward loop.
+    /// </summary>
+    [Fact]
+    public void BatchedPrefill_GpuEmbedding_CpuLayersSplit_BitwiseMatchesSequential_Coder()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindCoderPath();
+        if (path is null) return;
+
+        bool prevBatched = CudaHybridForwardPass.BatchedPrefillEnabled;
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+            int ctx = Math.Min(hp.ContextLength, 4096);
+            var planned = PlanCoder(model, hp, gpu, ctx);
+            // Force a cross-tier split so CpuLayers > 0 (the planner gives 48/0 here via CPU-MoE).
+            int gpuLayers = hp.NumLayers / 2;
+            var split = planned with { GpuLayers = gpuLayers, CpuLayers = hp.NumLayers - gpuLayers };
+
+            var tokens = tokenizer.Encode(
+                "The quick brown fox jumps over the lazy dog. " +
+                "Pack my box with five dozen liquor jugs. " +
+                "How razorback-jumping frogs can level six piqued gymnasts!");
+            Assert.True(tokens.Count >= 8, $"Prompt tokenized to only {tokens.Count} tokens.");
+
+            float[] Run(bool batched)
+            {
+                CudaHybridForwardPass.BatchedPrefillEnabled = batched;
+                using var fwd = TryConstruct(model, gpu, hp, split);
+                if (fwd is null) return Array.Empty<float>();
+                var logits = fwd.Prefill(tokens).ToArray();
+                if (batched)
+                    Assert.True(fwd.LastPrefillWasBatched,
+                        "Batched arm fell back to the per-token path — the parity check would be vacuous. " +
+                        $"GpuLayers={split.GpuLayers} CpuLayers={split.CpuLayers}.");
+                return logits;
+            }
+
+            float[] seq = Run(false);
+            float[] bat = Run(true);
+            if (seq.Length == 0 || bat.Length == 0)
+            {
+                _out.WriteLine("SKIP: construction OOM'd on this box.");
+                return;
+            }
+
+            Assert.Equal(seq.Length, bat.Length);
+            int firstDiff = FirstBitDiff(seq, bat);
+            Assert.True(firstDiff < 0,
+                $"GPU-embed + CpuLayers>0 batched prefill diverges from sequential at index {firstDiff} " +
+                $"(GpuLayers={split.GpuLayers} CpuLayers={split.CpuLayers}). The batched GPU attention trunk " +
+                "and the per-token CPU-layer download loop must together be bit-identical to the sequential loop.");
+            Assert.Equal(Sampler.Greedy(seq), Sampler.Greedy(bat));
+            _out.WriteLine($"OK gpu-embed CpuLayers>0 N={tokens.Count} split={split.GpuLayers}/{split.CpuLayers} greedy={Sampler.Greedy(seq)}");
+        }
+        finally
+        {
+            CudaHybridForwardPass.BatchedPrefillEnabled = prevBatched;
+        }
+    }
+
     // Construction is the ONLY place allowed to skip (a box without the VRAM to host this
     // 30 GB MoE model under the planned split). A failure INSIDE Prefill must propagate
     // and fail the test — that is exactly the regression these oracles exist to catch.
