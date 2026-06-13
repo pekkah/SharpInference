@@ -574,6 +574,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
             // below never fires for an fp32-sized auto-context, since fp32 fits there by
             // construction).
             _maxSeqLen = EstimateMaxContext(model, gpu, hp, ResolveConfiguredKvDType());
+        // Invariant (#228): the resolved context never exceeds the model's own maximum, whether
+        // it came from an explicit -c or a VRAM-fit estimator. Each branch above already clamps
+        // to hp.ContextLength; this is the single chokepoint that guarantees it so no future
+        // path (or estimator change) can over-shoot the model max.
+        _maxSeqLen = Math.Min(_maxSeqLen, hp.ContextLength);
         // The KV-append/attention kernels index the cache at `pos % _maxSeqLen` (the ring
         // modulo, identity for full caches), so a zero context — e.g. a malformed GGUF with
         // context_length=0 reached via an explicit ctx-size — would be an in-kernel
@@ -3974,18 +3979,71 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
             + hp.NumKvHeads * headDim * 2 + hp.NumHeads * headDim
             + hp.IntermediateDim * 2 + hp.VocabSize) * sizeof(float);
 
-        // Reserve at least 2 GiB (or a third of total) for the driver, the cuBLAS
-        // workspace, the Q8_1 quantization scratch, the pinned host buffer, the GPU
-        // buffer pool's per-bucket reuse list, and CUDA's framebuffer-and-context
-        // overhead. The previous max(vram/5, 1 GiB) left only ~24 MiB free on a
-        // 12 GiB card running Qwen3-8B; the driver then mapped late weight
-        // allocations (notably the 600 MiB lm-head) into system memory, where the
-        // matvec ran at ~22 GB/s over PCIe instead of ~400 GB/s in HBM and prefill
-        // collapsed from ~65 t/s to ~4 t/s.
-        long reserved = Math.Max(vramBytes / 3, 2L * 1024 * 1024 * 1024);
+        long reserved = KvVramReserveBytes(hp, vramBytes);
         long available = vramBytes - weightBytes - scratchBytes - reserved;
         if (available <= 0) available = 64L * 1024 * 1024;
         return available;
+    }
+
+    /// <summary>
+    /// VRAM held back from the KV budget for everything that isn't weights/scratch/KV: the CUDA
+    /// context/framebuffer, the cuBLAS workspace, the Q8_1 quantization scratch, the pinned host
+    /// buffer, the GPU buffer-pool reuse lists, and the transient prefill working set. Pure
+    /// (no GPU/GGUF) so it's unit-testable (cf. <see cref="ResolveKvDType"/>).
+    /// <para><b>Uniform / dense models</b> keep the proven <c>max(VRAM/3, 2 GiB)</c> reserve.
+    /// Their KV grows linearly to fill whatever budget is left, so the reserve is the only thing
+    /// bounding the cache size — and an earlier <c>max(VRAM/5, 1 GiB)</c> once left ~24 MiB free
+    /// on a 12 GiB card running Qwen3-8B, spilling the ~600 MiB lm-head to system RAM over PCIe
+    /// and collapsing prefill ~65→4 t/s (#185). This path is unchanged.</para>
+    /// <para><b>SWA / per-layer (Gemma 4) models</b> use a smaller, bounded reserve — a fixed
+    /// system allowance (NOT a fraction of total VRAM) plus one <see cref="PrefillBatchChunk"/>'s
+    /// activation working set. This is safe precisely because SWA KV <i>saturates</i>: past the
+    /// sliding-window ring only the few global layers grow, so the cache asymptotes to
+    /// <c>KV(modelMax)</c> and a larger budget cannot grow it to consume the headroom (the dense
+    /// failure mode). The old <c>VRAM/3</c> reserve over-reserved ~2.5 GB on a 12 GiB card and
+    /// pinned Gemma 4 12B q8_0 auto-context to ~30 K when the full 256 K fits (#228 / #220).</para>
+    /// </summary>
+    internal static long KvVramReserveBytes(ModelHyperparams hp, long vramBytes)
+    {
+        long dense = Math.Max(vramBytes / 3, 2L * 1024 * 1024 * 1024);
+
+        // The smaller SWA reserve is sound ONLY where the KV cache actually saturates: a model
+        // with per-layer head_dim AND at least one real sliding-window layer (the exact regime
+        // SolveMaxCtxForKv prices with SwaRingSize). A model lacking either — no per-layer dims,
+        // or a Gemma-arch GGUF with an all-false SWA pattern — has linearly-growing KV like a
+        // dense model and MUST keep the dense reserve, or the smaller reserve would let KV grow
+        // into the spill cliff. (Guard kept in lockstep with SolveMaxCtxForKv's branch.)
+        if (hp.LayerHeadDim is not { } lhd || hp.IsSwaLayer is not { } swa)
+            return dense;
+        bool hasSwaLayer = false;
+        foreach (bool s in swa) if (s) { hasSwaLayer = true; break; }
+        if (!hasSwaLayer)
+            return dense;
+
+        // Faithful upper bound on one PrefillBatchChunk's transient activation buffers
+        // (EnsureBatchedTrunkScratch): hidden/residual/norm/PleY at embDim; Q + AttnOut at
+        // numHeads*maxHeadDim; K + V at numKvHeads*maxHeadDim; 2 FFN buffers at intermDim; and —
+        // for Gemma's per-layer token embedding — the stacked PLE proj/row buffers at
+        // NumLayers*pleWidth. These allocate lazily at the first long prefill and coexist with the
+        // (now larger) construction-time KV cache, so the reserve must hold room for them. Buffers
+        // use the WIDEST per-layer head_dim (global 512 on Gemma 4 12B), not the per-layer min.
+        int maxHeadDim = hp.HeadDim;
+        foreach (int hd in lhd) if (hd > maxHeadDim) maxHeadDim = hd;
+        long perTokenFloats =
+            hp.EmbeddingDim * 3L                          // hidden + residual + norm
+            + 2L * hp.NumHeads * maxHeadDim               // Q + AttnOut
+            + 2L * hp.NumKvHeads * maxHeadDim             // K + V
+            + hp.IntermediateDim * 2L;                    // FFN gate + up
+        if (hp.HasPerLayerTokenEmbd)                      // PLE: proj/row stacks + gate + PleY
+            perTokenFloats += 2L * hp.NumLayers * hp.PerLayerEmbeddingWidth
+                            + hp.PerLayerEmbeddingWidth + hp.EmbeddingDim;
+        long prefillWorkingSet = (long)PrefillBatchChunk * perTokenFloats * sizeof(float);
+
+        // Fixed system allowance (CUDA context/framebuffer + cuBLAS workspace + pinned + pool),
+        // floored at 2 GiB and rising to VRAM/6 on larger cards where those costs grow. Always
+        // ≤ the dense VRAM/3 reserve, so an SWA model can never reserve MORE than dense would.
+        long systemReserve = Math.Max(2L * 1024 * 1024 * 1024, vramBytes / 6);
+        return Math.Min(dense, systemReserve + prefillWorkingSet);
     }
 
     /// <summary>
