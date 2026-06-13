@@ -46,10 +46,14 @@ public sealed class CudaHybridKvDtypeTests : IDisposable
     }
 
     private static (float[][] logits, int[] argmax) RunPrefillDecode(
-        CudaBackend gpu, string path, string? kvDtype, string prompt, int steps, int ctx, int[]? forced)
+        CudaBackend gpu, string path, string? kvDtype, string prompt, int steps, int ctx, int[]? forced,
+        string? splitDecode = null)
     {
         var prev = Environment.GetEnvironmentVariable("SHARPI_KV_DTYPE");
+        var prevSplit = Environment.GetEnvironmentVariable("SHARPI_SPLIT_DECODE");
         Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", kvDtype);
+        // null → flash-decoding split default (on, #238); "0" forces the single-block path.
+        if (splitDecode is not null) Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE", splitDecode);
         try
         {
             using var model = GgufModel.Open(path);
@@ -85,7 +89,69 @@ public sealed class CudaHybridKvDtypeTests : IDisposable
             }
             return (perPos, argmax);
         }
-        finally { Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", prev); }
+        finally
+        {
+            Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", prev);
+            Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE", prevSplit);
+        }
+    }
+
+    /// <summary>
+    /// Flash-decoding split-KV parity on the hybrid pass (#238). At long ctx the hybrid decode
+    /// attention switches from the single-block kernel to the split-KV + combine path (the same
+    /// kernels the dense #235/#237 tests validate bit-faithfully). This confirms the hybrid WIRING
+    /// (dispatch gate, partials buffer alloc/free, dtype dispatch) is correct: a &gt;4096-token prompt
+    /// puts every decode step past the hybrid split threshold, and the single-block run (split off) is
+    /// the trusted reference. Argmax-stable, not bit-identical (the combine reorders the reduction).
+    /// NOTE: the MoE hybrid runs decode EAGER (no CUDA-graph capture), so this covers the eager path;
+    /// the split-under-graph-replay interaction is validated on the dense path
+    /// (Gemma4_E4B_SplitKv_GraphReplayCrossesBoundary). A partial-offload Gemma4 hybrid (which DOES
+    /// graph-capture the split branch) is a noted follow-up.
+    /// </summary>
+    private void AssertHybridSplitKvParity(string? path, string kvDtype, float maxAbsTol)
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) { _out.WriteLine("SKIP: no CUDA"); return; }
+        if (path is null) { _out.WriteLine("SKIP: model not on disk"); return; }
+
+        const int steps = 5;
+        const int ctx = 5120;          // > the 4096 hybrid split threshold
+        const int promptLen = 4200;    // every decode step lands at seqLen > 4096 → split path
+
+        string prompt;
+        using (var model = GgufModel.Open(path))
+        {
+            var tok = GgufTokenizer.FromGgufModel(model);
+            var sb = new System.Text.StringBuilder();
+            const string seed = "The quick brown fox jumps over the lazy dog. " +
+                                "Sphinx of black quartz, judge my vow. Pack my box with five dozen liquor jugs. ";
+            while (tok.Encode(sb.ToString()).Count < promptLen) sb.Append(seed);
+            prompt = sb.ToString();
+        }
+
+        float[][] single, split; int[] singleArgmax;
+        try
+        {
+            (single, singleArgmax) = RunPrefillDecode(gpu, path, kvDtype, prompt, steps, ctx, forced: null, splitDecode: "0");
+            (split, _) = RunPrefillDecode(gpu, path, kvDtype, prompt, steps, ctx, forced: singleArgmax, splitDecode: "1");
+        }
+        catch (InvalidOperationException) { _out.WriteLine("SKIP: construction OOM'd"); return; }
+
+        for (int p = 0; p <= steps; p++)
+        {
+            Assert.Equal(single[p].Length, split[p].Length);
+            float maxAbs = 0f;
+            for (int i = 0; i < single[p].Length; i++)
+            {
+                Assert.True(float.IsFinite(split[p][i]), $"{kvDtype}: non-finite split logit at pos {p}, idx {i}.");
+                maxAbs = Math.Max(maxAbs, Math.Abs(single[p][i] - split[p][i]));
+            }
+            Assert.True(TopK(split[p], 5).Contains(singleArgmax[p]),
+                $"{kvDtype}: pos {p} single-block top-1 ({singleArgmax[p]}) fell out of the hybrid split top-5 " +
+                $"(maxAbs {maxAbs:F4}) — the hybrid split-KV wiring reordered the head of the distribution.");
+            Assert.True(maxAbs < maxAbsTol,
+                $"{kvDtype}: pos {p} hybrid split-vs-single logit max-abs {maxAbs:F4} exceeds {maxAbsTol:F2} — a wiring bug.");
+        }
     }
 
     private static HashSet<int> TopK(float[] v, int k)
@@ -219,6 +285,14 @@ public sealed class CudaHybridKvDtypeTests : IDisposable
     [Fact] public void OLMoE_Q8Kv_ArgmaxStable()  => AssertKvParity(OlmoePath(), "q8_0", Prompt, maxAbsTol: 3.5f);
     [Fact] public void Coder30B_Bf16Kv_ArgmaxStable() => AssertKvParity(CoderPath(), "bf16", Prompt, maxAbsTol: 5.0f);
     [Fact] public void Coder30B_Q8Kv_ArgmaxStable()  => AssertKvParity(CoderPath(), "q8_0", Prompt, maxAbsTol: 6.0f);
+
+    /// <summary>Hybrid split-KV decode (#238) vs single-block on Coder-30B q8 at &gt;4096 ctx —
+    /// the layer-split MoE hybrid is the model that reaches the hybrid split threshold (OLMoE caps
+    /// at 4096 and never splits). Decode A/B confirmed the win (1.49× @6K → 2.08× @16K); this fences
+    /// correctness of the wiring. Same-dtype (q8-vs-q8) so the only divergence is the combine's
+    /// reduction reorder → a tighter budget than the cross-dtype Coder q8-vs-fp32 test (6.0); top-5
+    /// stability is the hard gate.</summary>
+    [Fact] public void Coder30B_Q8SplitKv_MatchesSingleBlock() => AssertHybridSplitKvParity(CoderPath(), "q8_0", maxAbsTol: 4.0f);
 
     /// <summary>
     /// >4096 wave path (AttentionBatchedWaveQ8_0): a single Prefill of &gt;4096 tokens makes
