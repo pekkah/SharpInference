@@ -68,15 +68,18 @@ public sealed class CudaForwardPassKvDtypeTests
     /// </summary>
     private static (float[][] logits, int[] argmax) RunPrefillDecode(
         CudaBackend gpu, string path, string? kvDtype, string prompt, int steps, int ctx, int[]? forced,
-        bool batchedPrefill = false, string? splitDecode = null)
+        bool batchedPrefill = false, string? splitDecode = null, string? groupedDecode = null)
     {
         var prevKv = Environment.GetEnvironmentVariable("SHARPI_KV_DTYPE");
         var prevSnap = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_BUDGET");
         var prevSplit = Environment.GetEnvironmentVariable("SHARPI_SPLIT_DECODE");
+        var prevGrouped = Environment.GetEnvironmentVariable("SHARPI_SPLIT_DECODE_GROUPED");
         Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", kvDtype);
         Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", "0"); // isolate the KV dtype
         // null → leave the flash-decoding split-KV default (on); "0" forces the single-block path.
         if (splitDecode is not null) Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE", splitDecode);
+        // null → auto (grouped only for fp32 ≥24K); "1" forces grouped, "0" forces per-head (#237).
+        if (groupedDecode is not null) Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE_GROUPED", groupedDecode);
         try
         {
             using var model = GgufModel.Open(path);
@@ -113,6 +116,7 @@ public sealed class CudaForwardPassKvDtypeTests
             Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", prevKv);
             Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", prevSnap);
             Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE", prevSplit);
+            Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE_GROUPED", prevGrouped);
         }
     }
 
@@ -568,6 +572,105 @@ public sealed class CudaForwardPassKvDtypeTests
             Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", prevSnap);
             Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE", prevSplit);
         }
+    }
+
+    // ── Issue #237: GQA head-sharing (grouped split-KV) ──────────────────────
+    // The grouped kernel processes a KV head's whole query group per block, loading each
+    // K/V slice once. It re-derives the same softmax with a one-KV-read schedule → must be
+    // argmax-stable vs the single-block reference for every dtype (correctness is dtype-
+    // independent; the AUTO gate only enables it for fp32 ≥ 24K, but the kernel must be right
+    // for all three thunks). We FORCE grouped (SHARPI_SPLIT_DECODE_GROUPED=1) so a feasible
+    // 5000-token prompt exercises it, and compare to the single-block run.
+
+    private static void AssertGroupedSplitKvParity(string filename, string kvDtype, float maxAbsTol)
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath(filename);
+        if (path is null) return;
+
+        const int steps = 6;
+        const int ctx = 6144;
+        const int promptLen = 5000;
+        using (var model = GgufModel.Open(path))
+        {
+            var tok = GgufTokenizer.FromGgufModel(model);
+            var sb = new System.Text.StringBuilder();
+            const string seed = "The quick brown fox jumps over the lazy dog. " +
+                                "Sphinx of black quartz, judge my vow. " +
+                                "Pack my box with five dozen liquor jugs. ";
+            while (tok.Encode(sb.ToString()).Count < promptLen) sb.Append(seed);
+            string prompt = sb.ToString();
+
+            var (single, singleArgmax) = RunPrefillDecode(gpu, path, kvDtype, prompt, steps, ctx, forced: null, splitDecode: "0");
+            var (grouped, _) = RunPrefillDecode(gpu, path, kvDtype, prompt, steps, ctx, forced: singleArgmax, splitDecode: "1", groupedDecode: "1");
+
+            for (int p = 0; p <= steps; p++)
+            {
+                Assert.Equal(single[p].Length, grouped[p].Length);
+                float maxAbs = 0f;
+                for (int i = 0; i < single[p].Length; i++)
+                {
+                    Assert.True(float.IsFinite(grouped[p][i]),
+                        $"{filename}: non-finite grouped {kvDtype} logit at pos {p}, idx {i}.");
+                    maxAbs = Math.Max(maxAbs, Math.Abs(single[p][i] - grouped[p][i]));
+                }
+                Assert.True(TopK(grouped[p], 5).Contains(singleArgmax[p]),
+                    $"{filename}: pos {p} single-block top-1 ({singleArgmax[p]}) fell out of grouped {kvDtype}'s top-5 " +
+                    $"(max-abs {maxAbs:F4}) — a GQA head-sharing bug.");
+                Assert.True(maxAbs < maxAbsTol,
+                    $"{filename}: pos {p} grouped vs single-block {kvDtype} logit max-abs {maxAbs:F4} exceeds " +
+                    $"{maxAbsTol:F2} — a head-sharing schedule bug, not reduction-order rounding.");
+            }
+        }
+    }
+
+    /// <summary>Gemma 4 E4B (2 KV heads, G=4): grouped fp32 vs single-block.</summary>
+    [Fact]
+    public void Gemma4_E4B_Fp32Grouped_MatchesSingleBlock()
+        => AssertGroupedSplitKvParity("gemma-4-E4B-it-Q8_0.gguf", "fp32", maxAbsTol: 1.0f);
+
+    /// <summary>Gemma 4 E4B, bf16 KV grouped thunk vs single-block (kernel correct for all dtypes).</summary>
+    [Fact]
+    public void Gemma4_E4B_Bf16Grouped_MatchesSingleBlock()
+        => AssertGroupedSplitKvParity("gemma-4-E4B-it-Q8_0.gguf", "bf16", maxAbsTol: 2.0f);
+
+    /// <summary>Gemma 4 E4B, q8_0 KV grouped thunk (sharpi_kv_dot_multi block-walk) vs single-block.</summary>
+    [Fact]
+    public void Gemma4_E4B_Q8Grouped_MatchesSingleBlock()
+        => AssertGroupedSplitKvParity("gemma-4-E4B-it-Q8_0.gguf", "q8_0", maxAbsTol: 2.5f);
+
+    /// <summary>Qwen3-8B (8 KV heads, G=4): a different group geometry than E4B's 2 KV heads.</summary>
+    [Fact]
+    public void Qwen3_8B_Fp32Grouped_MatchesSingleBlock()
+        => AssertGroupedSplitKvParity("Qwen3-8B-Q4_K_M.gguf", "fp32", maxAbsTol: 1.0f);
+
+    /// <summary>
+    /// The #237 grouped-split dispatch gate (the shipping default) — pure logic, no GPU. A mis-fire
+    /// (selecting grouped for an ineligible head config) would hit the host-side throw in
+    /// AttentionSplitKv, so the auto/eligibility/override boundaries are fenced here. Note: the
+    /// kernel's G=8 array bound (dots[8]/acc[8]) is not exercised end-to-end (no on-disk model has
+    /// G=8 with numKvHeads≥2); the eligibility boundary (G=8 ok, G=9 rejected) is checked below.
+    /// </summary>
+    [Fact]
+    public void ShouldUseGroupedSplit_GatesCorrectly()
+    {
+        // auto (mode null): grouped only for fp32 at long ctx (≥24576) with an eligible head config.
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit(null, DType.Q8_0,    8, 2, 32768)); // q8 never auto
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit(null, DType.BFloat16, 8, 2, 32768)); // bf16 never auto
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit(null, DType.Float32, 8, 2, 16384)); // below threshold
+        Assert.True (CudaForwardPass.ShouldUseGroupedSplit(null, DType.Float32, 8, 2, 24576)); // fp32 long-ctx
+        Assert.True (CudaForwardPass.ShouldUseGroupedSplit(null, DType.Float32, 8, 2, 65536));
+        // ineligible head configs → never grouped (would otherwise hit the host throw / a 1-wide grid).
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit(null, DType.Float32, 8, 1, 32768)); // MQA: numKvHeads<2
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit(null, DType.Float32, 8, 8, 32768)); // MHA: G=1
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit(null, DType.Float32, 8, 3, 32768)); // not divisible
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit(null, DType.Float32, 18, 2, 32768)); // G=9 > 8
+        Assert.True (CudaForwardPass.ShouldUseGroupedSplit(null, DType.Float32, 16, 2, 32768)); // G=8 boundary ok
+        // overrides.
+        Assert.True (CudaForwardPass.ShouldUseGroupedSplit("1", DType.Q8_0,    8, 2, 100));   // forced on + eligible
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit("1", DType.Float32, 8, 1, 32768)); // forced but ineligible
+        Assert.False(CudaForwardPass.ShouldUseGroupedSplit("0", DType.Float32, 8, 2, 32768)); // forced off
     }
 
     // ── Issue #191: narrowed-KV GREEDY decode coherence (template-correct) ───
