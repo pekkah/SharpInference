@@ -24,7 +24,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         [CommandOption("-p|--prompt")]
         [Description("Input prompt (default: interactive chat)")]
-        public string? Prompt { get; init; }
+        public string? Prompt { get; set; }
+
+        [CommandOption("-f|--file")]
+        [Description("Read the prompt from a file (llama.cpp -f/--file). Overrides -p when both are given; useful for prompts longer than the shell's command-line limit.")]
+        public string? PromptFile { get; init; }
 
         [CommandOption("-n|--n-predict")]
         [Description("Number of tokens to predict (default: 512)")]
@@ -188,6 +192,18 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
     protected override int Execute(CommandContext context, Settings settings, CancellationToken cancellation)
     {
+        // --file/-f (llama.cpp): load the prompt from a file. Overrides -p; lets prompts exceed
+        // the shell command-line length limit. Read as-is (no trailing-newline stripping).
+        if (settings.PromptFile is { Length: > 0 } promptFile)
+        {
+            if (!File.Exists(promptFile))
+            {
+                AnsiConsole.MarkupLine($"[red]Prompt file not found:[/] {promptFile}");
+                return 1;
+            }
+            settings.Prompt = File.ReadAllText(promptFile);
+        }
+
         if (settings.MinBatchBlas > 0)
             SimdKernels.MinBatchForBlas = settings.MinBatchBlas;
 
