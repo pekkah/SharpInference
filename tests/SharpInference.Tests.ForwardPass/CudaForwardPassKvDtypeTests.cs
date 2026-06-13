@@ -968,9 +968,13 @@ public sealed class CudaForwardPassKvDtypeTests
         // Budget = 1 byte → can't hold even a 512-ctx cache → floor (512).
         Assert.Equal(512, CudaForwardPass.SolveMaxCtxForKv(hp, 1, DType.BFloat16));
 
-        // ContextLength below the floor → clamp to the cap (Math.Min(512, cap)) even with a huge budget.
-        var tinyCap = hp with { ContextLength = 256 };
-        Assert.Equal(256, CudaForwardPass.SolveMaxCtxForKv(tinyCap, long.MaxValue, DType.BFloat16));
+        // ContextLength below the floor → clamp to the cap even with a huge budget (must NOT throw
+        // — the SWA branch and the uniform branch both route through the cap<=floor guard, else the
+        // uniform Math.Clamp(_, 512, cap) would throw ArgumentException for cap < 512).
+        var tinyCapSwa = hp with { ContextLength = 256 };
+        Assert.Equal(256, CudaForwardPass.SolveMaxCtxForKv(tinyCapSwa, long.MaxValue, DType.BFloat16));
+        var tinyCapUniform = FlatHp(numLayers: 8, numKvHeads: 8, headDim: 128, ctx: 256);
+        Assert.Equal(256, CudaForwardPass.SolveMaxCtxForKv(tinyCapUniform, long.MaxValue, DType.Float32));
 
         // Huge budget → clamp UP to the model max, not beyond.
         Assert.Equal(hp.ContextLength, CudaForwardPass.SolveMaxCtxForKv(hp, long.MaxValue, DType.Q8_0));

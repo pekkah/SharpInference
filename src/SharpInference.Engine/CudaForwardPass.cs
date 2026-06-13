@@ -4103,12 +4103,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         const int floorCtx = 512;
         int cap = hp.ContextLength;
 
+        // A model whose context is at/below the floor clamps to the cap (and avoids the
+        // Math.Clamp(_, 512, cap) below throwing when cap < 512). Mirrors the floor convention:
+        // return the small ctx and let the ctor's allocation fail loudly if even that won't fit.
+        if (cap <= floorCtx)
+            return cap;
+
         if (hp.LayerHeadDim is not null && hp.IsSwaLayer is not null)
         {
             // EstimateKvCacheBytes is monotonic non-decreasing in ctx, so an upper-bound binary
             // search converges. Floor 512 mirrors the uniform clamp below.
-            if (cap <= floorCtx || EstimateKvCacheBytes(hp, floorCtx, kvDType) > availableKvBytes)
-                return Math.Min(floorCtx, cap);
+            if (EstimateKvCacheBytes(hp, floorCtx, kvDType) > availableKvBytes)
+                return floorCtx;
             int lo = floorCtx, hi = cap;
             while (lo < hi)
             {
