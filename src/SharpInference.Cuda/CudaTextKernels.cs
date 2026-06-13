@@ -128,7 +128,7 @@ __device__ __forceinline__ float sharpi_kvload(const block_q8_0* __restrict__ p,
     return sharpi_fp16_to_fp32((unsigned int)p[b].d) * (float)p[b].qs[j];
 }
 
-// Issue #213: dot of a query vector q[0..n) with a CONTIGUOUS cache row at byte/element
+// Issue #213: dot of a query vector q[0..n) with a CONTIGUOUS cache row at element
 // offset `off`, specialized per cache dtype. fp32/bf16 are the same trivial per-element loop
 // the inlined sharpi_kvload produced (no change for those dtypes). The q8_0 overload caches the
 // per-32-block fp16 scale — loading + cvt'ing it once per block instead of 32× per element —
@@ -151,14 +151,15 @@ __device__ __forceinline__ float sharpi_kv_dot(const float* __restrict__ q, cons
 __device__ __forceinline__ float sharpi_kv_dot(const float* __restrict__ q, const block_q8_0* __restrict__ k, long off, int n)
 {
     float dot = 0.f;
-    long curB = -1;
-    float s = 0.f;
-    for (int d = 0; d < n; d++)
+    long b = off >> 5;              // block holding element `off`
+    int lane = (int)(off & 31);     // starting lane within that block (0 when off is 32-aligned)
+    for (int d = 0; d < n; )
     {
-        long i = off + d;
-        long b = i >> 5;
-        if (b != curB) { curB = b; s = sharpi_fp16_to_fp32((unsigned int)k[b].d); }
-        dot += q[d] * (s * (float)k[b].qs[i & 31]);
+        float s = sharpi_fp16_to_fp32((unsigned int)k[b].d);   // convert the fp16 scale ONCE per block
+        for (; lane < 32 && d < n; lane++, d++)
+            dot += q[d] * (s * (float)k[b].qs[lane]);
+        lane = 0;
+        b++;
     }
     return dot;
 }
