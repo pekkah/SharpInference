@@ -85,6 +85,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     private readonly float[]? _gpuRouterBuf;
     private readonly bool _hasAttnBias, _hasQkNorm, _isMoE, _hasSharedExpert;
     private readonly bool _tqEnabled;
+    // GPU-resident KV-cache element dtype (#179/#230): fp32 (default), bf16 (½), or q8_0 (¼),
+    // resolved from SHARPI_KV_DTYPE. Applies to the GPU-trunk layers only — CPU-offloaded layers
+    // keep their own fp32 SimdKernels KV. Forced fp32 under TurboQuant (TQ owns its quantized ring).
+    private readonly DType _kvDType;
     private readonly int _tqFp32Window;
     private readonly int _tqBlockBytes;
     private int _gpuTqCompressedLen;
@@ -184,6 +188,12 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     // oracles assert the batched path actually ran instead of passing vacuously when the
     // config is gated out (e.g. non-batchable dtype on a given box).
     internal bool LastPrefillWasBatched;
+
+    // Test observable (issue #230): the resolved GPU KV-cache dtype. Lets the parity oracle
+    // confirm --kv-type actually applied (the cache is genuinely narrowed) instead of passing
+    // vacuously if the env plumbing regressed and KV silently stayed fp32 (fp32-vs-fp32 is
+    // trivially argmax-stable).
+    internal DType KvCacheDType => _kvDType;
 
     // Issue #218 test/bench hook: force the low-VRAM "fixed weights on CPU" config
     // (embedding + output table CPU-resident, _gpuEmbedding/_gpuOutputWeight null) even on a
@@ -297,6 +307,28 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         _tqEnabled = enableTq;
         if (_tqEnabled && _headDim is not 128 and not 256)
             throw new NotSupportedException($"TurboQuant currently supports head dimensions 128 and 256; model head dim is {_headDim}.");
+
+        // KV-cache dtype (#230): honor SHARPI_KV_DTYPE on this layer-split hybrid path — it was
+        // silently ignored (KV always fp32), so --kv-type q8_0 was a no-op even though TierPlanner
+        // already prices the KV budget at the narrowed dtype (RunCommand passes ResolveConfiguredKvDType
+        // to TierPlanner.Plan). That left a plan/runtime mismatch: the planner reserved a smaller KV
+        // and a larger expert-cache budget while the runtime allocated the full fp32 cache. Narrowing
+        // applies to the GPU-trunk KV only; CPU layers keep their fp32 store. Reuses the dense path's
+        // narrowed append/attention kernels (#179) via the *Kv dispatch helpers below.
+        DType requestedKv = CudaForwardPass.ResolveConfiguredKvDType();
+        if (_tqEnabled && requestedKv != DType.Float32)
+            throw new NotSupportedException(
+                $"SHARPI_KV_DTYPE={requestedKv} + TurboQuant is not supported (TQ owns the KV quantization). " +
+                "Use one or the other.");
+        _kvDType = _tqEnabled ? DType.Float32 : requestedKv;
+        // Only the GPU-resident layers carry the narrowed cache (CPU-offloaded layers keep fp32),
+        // so scope the q8 geometry check to them — checking all layers would falsely reject q8
+        // when only a CPU-tail layer is incompatible (and trivially passes when _nGpuLayers == 0).
+        if (_kvDType == DType.Q8_0 && !CudaForwardPass.Q8KvGeometrySupported(hp, _nGpuLayers))
+            throw new NotSupportedException(
+                "SHARPI_KV_DTYPE=q8_0 requires every GPU-resident layer's kvDim (kvHeads × headDim) to be a " +
+                "multiple of 32 (the q8_0 block size); this model's geometry is incompatible. Use bf16 or fp32.");
+
         _tqFp32Window = enableTq ? Math.Min(tqFp32Window, _maxSeqLen) : 0;
         _tqBlockBytes = enableTq ? TurboQuantOps.BlockSize(tqBits, _headDim) : 0;
         _gpuRouterBuf = _isMoE && _nGpuLayers > 0 ? new float[hp.NumExperts] : null;
@@ -334,7 +366,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             _cpuMoe = false;
         }
 
-        Console.Error.WriteLine($"[HybridForwardPass] {placement.Summary()}{(enableTq ? $" [TQ{tqBits}]" : "")}");
+        string kvTag = _kvDType switch { DType.BFloat16 => " [KV bf16]", DType.Q8_0 => " [KV q8_0]", _ => "" };
+        Console.Error.WriteLine($"[HybridForwardPass] {placement.Summary()}{(enableTq ? $" [TQ{tqBits}]" : "")}{kvTag}");
 
         bool vramTrace = Environment.GetEnvironmentVariable("SHARPI_TRACE_VRAM") == "1";
         void TraceVram(string label)
@@ -546,8 +579,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 int layerCtx = (_isGemma4Like && hp.IsSwaLayer is { } swa && swa[i] && hp.SlidingWindowSize > 0)
                     ? Math.Min(_maxSeqLen, hp.SlidingWindowSize)
                     : _maxSeqLen;
-                _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)layerCtx * layerKvDim));
-                _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)layerCtx * layerKvDim));
+                _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)layerCtx * layerKvDim), _kvDType);
+                _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)layerCtx * layerKvDim), _kvDType);
             }
             Console.Error.Write(".");
         }
@@ -1403,12 +1436,12 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         // ── KV append + SDPA (batched). Shared-scores fast path when startPos+n ≤ 4096,
         //    wave-based global-scratch SDPA above (issue #118). Both bit-identical to the
         //    per-position KvAppend + Attention loop in GpuLayer.
-        _gpu.KvAppendBatched(kAll, vAll, _gpuKCache[i], _gpuVCache[i], kvDim, startPos, _maxSeqLen, n);
+        KvAppendBatchedKv(kAll, vAll, _gpuKCache[i], _gpuVCache[i], kvDim, startPos, _maxSeqLen, n);
         if (startPos + n <= 4096)
-            _gpu.AttentionBatched(qAll, _gpuKCache[i], _gpuVCache[i], attnOut,
+            AttentionBatchedKv(qAll, _gpuKCache[i], _gpuVCache[i], attnOut,
                 _numHeads, _numKvHeads, _headDim, startPos, _maxSeqLen, n);
         else
-            _gpu.AttentionBatchedWave(qAll, _gpuKCache[i], _gpuVCache[i], attnOut,
+            AttentionBatchedWaveKv(qAll, _gpuKCache[i], _gpuVCache[i], attnOut,
                 _numHeads, _numKvHeads, _headDim, startPos, _maxSeqLen, n);
 
         // ── Output projection (batched) → blockOut, then post-attn residual add.
@@ -1466,6 +1499,68 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     // ================================================================
     //  GPU Layer (same pattern as GpuForwardPass)
     // ================================================================
+
+    // ── Narrowed-KV dispatch (#179/#230) ──────────────────────────────────────
+    // Route every GPU-trunk KV append/attention through the dtype the cache was allocated at
+    // (_kvDType). Mirrors CudaForwardPass's KvAppendKv/AttentionKv/AttentionSwaKv; fp32 is the
+    // unchanged default. The TQ path is excluded (forces _kvDType == fp32).
+    private void KvAppendKv(Tensor k, Tensor v, Tensor kCache, Tensor vCache, int kvDim, int position, int maxSeqLen)
+    {
+        if (_kvDType == DType.BFloat16) _gpu.KvAppendBf16(k, v, kCache, vCache, kvDim, position, maxSeqLen);
+        else if (_kvDType == DType.Q8_0) _gpu.KvAppendQ8_0(k, v, kCache, vCache, kvDim, position, maxSeqLen);
+        else _gpu.KvAppend(k, v, kCache, vCache, kvDim, position, maxSeqLen);
+    }
+
+    private void AttentionKv(Tensor q, Tensor kCache, Tensor vCache, Tensor output, Tensor? scoresScratch,
+                             int numHeads, int numKvHeads, int headDim, int seqLen, int maxSeqLen, float attnScale = -1f)
+    {
+        if (_kvDType == DType.BFloat16)
+            _gpu.AttentionBf16(q, kCache, vCache, output, scoresScratch, numHeads, numKvHeads, headDim, seqLen, maxSeqLen, attnScale);
+        else if (_kvDType == DType.Q8_0)
+            _gpu.AttentionQ8_0(q, kCache, vCache, output, scoresScratch, numHeads, numKvHeads, headDim, seqLen, maxSeqLen, attnScale);
+        else
+            _gpu.Attention(q, kCache, vCache, output, scoresScratch, numHeads, numKvHeads, headDim, seqLen, maxSeqLen, attnScale);
+    }
+
+    private void AttentionSwaKv(Tensor q, Tensor kCache, Tensor vCache, Tensor output, Tensor? scoresScratch,
+                                int position, int windowSize, int headDim, int numHeads, int numKvHeads, int maxSeqLen, float attnScale = -1f)
+    {
+        if (_kvDType == DType.BFloat16)
+            _gpu.AttentionSwaBf16(q, kCache, vCache, output, scoresScratch, position, windowSize, headDim, numHeads, numKvHeads, maxSeqLen, attnScale);
+        else if (_kvDType == DType.Q8_0)
+            _gpu.AttentionSwaQ8_0(q, kCache, vCache, output, scoresScratch, position, windowSize, headDim, numHeads, numKvHeads, maxSeqLen, attnScale);
+        else
+            _gpu.AttentionSwa(q, kCache, vCache, output, scoresScratch, position, windowSize, headDim, numHeads, numKvHeads, maxSeqLen, attnScale);
+    }
+
+    private void KvAppendBatchedKv(Tensor kAll, Tensor vAll, Tensor kCache, Tensor vCache, int kvDim, int startPos, int maxSeqLen, int nTok)
+    {
+        if (_kvDType == DType.BFloat16) _gpu.KvAppendBatchedBf16(kAll, vAll, kCache, vCache, kvDim, startPos, maxSeqLen, nTok);
+        else if (_kvDType == DType.Q8_0) _gpu.KvAppendBatchedQ8_0(kAll, vAll, kCache, vCache, kvDim, startPos, maxSeqLen, nTok);
+        else _gpu.KvAppendBatched(kAll, vAll, kCache, vCache, kvDim, startPos, maxSeqLen, nTok);
+    }
+
+    private void AttentionBatchedKv(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
+                                    int numHeads, int numKvHeads, int headDim, int startPos, int maxSeqLen, int nTok)
+    {
+        if (_kvDType == DType.BFloat16)
+            _gpu.AttentionBatchedBf16(qAll, kCache, vCache, outAll, numHeads, numKvHeads, headDim, startPos, maxSeqLen, nTok);
+        else if (_kvDType == DType.Q8_0)
+            _gpu.AttentionBatchedQ8_0(qAll, kCache, vCache, outAll, numHeads, numKvHeads, headDim, startPos, maxSeqLen, nTok);
+        else
+            _gpu.AttentionBatched(qAll, kCache, vCache, outAll, numHeads, numKvHeads, headDim, startPos, maxSeqLen, nTok);
+    }
+
+    private void AttentionBatchedWaveKv(Tensor qAll, Tensor kCache, Tensor vCache, Tensor outAll,
+                                        int numHeads, int numKvHeads, int headDim, int startPos, int maxSeqLen, int nTok)
+    {
+        if (_kvDType == DType.BFloat16)
+            _gpu.AttentionBatchedWaveBf16(qAll, kCache, vCache, outAll, numHeads, numKvHeads, headDim, startPos, maxSeqLen, nTok);
+        else if (_kvDType == DType.Q8_0)
+            _gpu.AttentionBatchedWaveQ8_0(qAll, kCache, vCache, outAll, numHeads, numKvHeads, headDim, startPos, maxSeqLen, nTok);
+        else
+            _gpu.AttentionBatchedWave(qAll, kCache, vCache, outAll, numHeads, numKvHeads, headDim, startPos, maxSeqLen, nTok);
+    }
 
     private void GpuLayer(int i, int position)
     {
@@ -1554,11 +1649,11 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         }
         else
         {
-            _gpu.KvAppend(_gpuK, _gpuV, _gpuKCache[i], _gpuVCache[i],
+            KvAppendKv(_gpuK, _gpuV, _gpuKCache[i], _gpuVCache[i],
                 (_numKvHeads * _headDim), position, _maxSeqLen);
             _gpu.RecordBarrier();
 
-            _gpu.Attention(_gpuQ, _gpuKCache[i], _gpuVCache[i], _gpuAttnOut,
+            AttentionKv(_gpuQ, _gpuKCache[i], _gpuVCache[i], _gpuAttnOut,
                 _gpuAttnScoresScratch,
                 _numHeads, _numKvHeads, _headDim,
                 (position + 1), _maxSeqLen);
@@ -2012,7 +2107,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             int layerCtx = isSwa && _hp.SlidingWindowSize > 0
                 ? Math.Min(_maxSeqLen, _hp.SlidingWindowSize)
                 : _maxSeqLen;
-            _gpu.KvAppend(kView, vView, _gpuKCache[i], _gpuVCache[i], kvDimL, position, layerCtx);
+            KvAppendKv(kView, vView, _gpuKCache[i], _gpuVCache[i], kvDimL, position, layerCtx);
             _gpu.RecordBarrier();
         }
 
@@ -2024,14 +2119,14 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         // Gemma 4: attention_scale = 1.0, passed explicitly (kernel skips its rsqrtf).
         if (isSwa)
         {
-            _gpu.AttentionSwa(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
+            AttentionSwaKv(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                 _gpuAttnScoresScratch,
                 position, _hp.SlidingWindowSize, layerHd,
                 _numHeads, layerKv, effLayerCtx, attnScale: 1f);
         }
         else
         {
-            _gpu.Attention(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
+            AttentionKv(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
                 _gpuAttnScoresScratch,
                 _numHeads, layerKv, layerHd, position + 1, effLayerCtx, attnScale: 1f);
         }

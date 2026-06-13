@@ -4091,10 +4091,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     /// row, so a layer with kvDim % 32 != 0 cannot use q8_0 (the ctor would throw). The
     /// auto-narrow heuristic checks this before falling to q8_0 (#185).
     /// </summary>
-    internal static bool Q8KvGeometrySupported(ModelHyperparams hp)
+    /// <paramref name="gpuLayers"/> (default -1 = all layers) scopes the check to the first N
+    /// GPU-resident layers — used by CudaHybridForwardPass, where only those layers carry the
+    /// narrowed cache (CPU-offloaded layers always use fp32, so their geometry is irrelevant and
+    /// must not falsely reject q8). gpuLayers == 0 returns true (nothing narrowed).
+    internal static bool Q8KvGeometrySupported(ModelHyperparams hp, int gpuLayers = -1)
     {
         bool perLayerKv = hp.LayerHeadDim is not null;
-        for (int i = 0; i < hp.NumLayers; i++)
+        int layerCount = gpuLayers < 0 ? hp.NumLayers : Math.Min(gpuLayers, hp.NumLayers);
+        for (int i = 0; i < layerCount; i++)
         {
             if (hp.KvSourceLayer is { } ksl && ksl[i] >= 0) continue;
             int layerHd = perLayerKv ? hp.LayerHeadDim![i] : hp.HeadDim;
