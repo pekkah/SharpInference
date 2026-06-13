@@ -4005,19 +4005,44 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     /// </summary>
     internal static long KvVramReserveBytes(ModelHyperparams hp, long vramBytes)
     {
-        if (hp.IsSwaLayer is null)
-            return Math.Max(vramBytes / 3, 2L * 1024 * 1024 * 1024);
+        long dense = Math.Max(vramBytes / 3, 2L * 1024 * 1024 * 1024);
 
-        // Transient activations for one batched-prefill chunk (norm/qkv/attn/FFN buffers),
-        // sized to the model width — the only reserve term that scales with the model rather
-        // than the GPU. Generous (overlapping buffers) so the budget can't starve a real prefill.
-        long prefillWorkingSet = (long)PrefillBatchChunk *
-            (hp.EmbeddingDim * 4L + hp.IntermediateDim * 2L
-             + (long)hp.NumHeads * hp.HeadDim + 2L * hp.NumKvHeads * hp.HeadDim) * sizeof(float);
+        // The smaller SWA reserve is sound ONLY where the KV cache actually saturates: a model
+        // with per-layer head_dim AND at least one real sliding-window layer (the exact regime
+        // SolveMaxCtxForKv prices with SwaRingSize). A model lacking either — no per-layer dims,
+        // or a Gemma-arch GGUF with an all-false SWA pattern — has linearly-growing KV like a
+        // dense model and MUST keep the dense reserve, or the smaller reserve would let KV grow
+        // into the spill cliff. (Guard kept in lockstep with SolveMaxCtxForKv's branch.)
+        if (hp.LayerHeadDim is not { } lhd || hp.IsSwaLayer is not { } swa)
+            return dense;
+        bool hasSwaLayer = false;
+        foreach (bool s in swa) if (s) { hasSwaLayer = true; break; }
+        if (!hasSwaLayer)
+            return dense;
+
+        // Faithful upper bound on one PrefillBatchChunk's transient activation buffers
+        // (EnsureBatchedTrunkScratch): hidden/residual/norm/PleY at embDim; Q + AttnOut at
+        // numHeads*maxHeadDim; K + V at numKvHeads*maxHeadDim; 2 FFN buffers at intermDim; and —
+        // for Gemma's per-layer token embedding — the stacked PLE proj/row buffers at
+        // NumLayers*pleWidth. These allocate lazily at the first long prefill and coexist with the
+        // (now larger) construction-time KV cache, so the reserve must hold room for them. Buffers
+        // use the WIDEST per-layer head_dim (global 512 on Gemma 4 12B), not the per-layer min.
+        int maxHeadDim = hp.HeadDim;
+        foreach (int hd in lhd) if (hd > maxHeadDim) maxHeadDim = hd;
+        long perTokenFloats =
+            hp.EmbeddingDim * 4L                          // hidden + residual + norm + PleY
+            + 2L * hp.NumHeads * maxHeadDim               // Q + AttnOut
+            + 2L * hp.NumKvHeads * maxHeadDim             // K + V
+            + hp.IntermediateDim * 2L;                    // FFN gate + up
+        if (hp.HasPerLayerTokenEmbd)
+            perTokenFloats += 2L * hp.NumLayers * hp.PerLayerEmbeddingWidth + hp.PerLayerEmbeddingWidth;
+        long prefillWorkingSet = (long)PrefillBatchChunk * perTokenFloats * sizeof(float);
+
         // Fixed system allowance (CUDA context/framebuffer + cuBLAS workspace + pinned + pool),
-        // floored at 2 GiB and rising to VRAM/6 on larger cards where those costs grow.
+        // floored at 2 GiB and rising to VRAM/6 on larger cards where those costs grow. Always
+        // ≤ the dense VRAM/3 reserve, so an SWA model can never reserve MORE than dense would.
         long systemReserve = Math.Max(2L * 1024 * 1024 * 1024, vramBytes / 6);
-        return systemReserve + prefillWorkingSet;
+        return Math.Min(dense, systemReserve + prefillWorkingSet);
     }
 
     /// <summary>

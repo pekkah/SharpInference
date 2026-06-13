@@ -1075,6 +1075,56 @@ public sealed class CudaForwardPassKvDtypeTests
     }
 
     /// <summary>
+    /// The system-allowance term is max(2 GiB, VRAM/6): the 2 GiB floor wins at ≤ 12 GiB, but
+    /// VRAM/6 takes over on larger cards. The working set is VRAM-independent, so the SWA reserve
+    /// delta between a 48 GiB and a 12 GiB card is exactly the VRAM/6 delta (8 − 2 = 6 GiB) —
+    /// pinning the only VRAM-scaling term (untested when every case uses 12 GiB → /6 == floor).
+    /// </summary>
+    [Fact]
+    public void KvVramReserveBytes_SwaModel_SystemReserveScalesOnLargeCard()
+    {
+        const long GiB = 1024L * 1024 * 1024;
+        var swa = Gemma4ShapedHp([256, 256, 256], [8, 8, 8], [false, true, false], [-1, -1, 0], 1024);
+        long at12 = CudaForwardPass.KvVramReserveBytes(swa, 12 * GiB);
+        long at48 = CudaForwardPass.KvVramReserveBytes(swa, 48 * GiB);
+        // Both below their respective dense caps (workset is tiny here), so neither clamps.
+        Assert.Equal(6 * GiB, at48 - at12);   // (48/6 − 12/6) GiB — the VRAM/6 term, isolated
+    }
+
+    /// <summary>
+    /// The prefill working set must count the buffers EnsureBatchedTrunkScratch actually
+    /// allocates: at the WIDEST per-layer head_dim (Gemma 4 12B's global 512, not the per-layer
+    /// min), and — for a per-layer-token-embedding (PLE) model — the stacked PLE proj/row buffers
+    /// (NumLayers × pleWidth). Dropping either (the original formula did both) under-reserves and
+    /// risks a prefill-time OOM (#231 review). Exact-value pin so a silently-dropped term fails.
+    /// </summary>
+    [Fact]
+    public void KvVramReserveBytes_SwaModel_CountsPleAndWidestHeadDim()
+    {
+        const long GiB = 1024L * 1024 * 1024;
+        // Mixed head_dim (256 SWA / 512 global) + PLE. NumHeads/NumKvHeads = 8 (Gemma4ShapedHp).
+        var hp = Gemma4ShapedHp([256, 512], [8, 8], [false, true], [-1, -1], 1024)
+            with { HasPerLayerTokenEmbd = true, PerLayerEmbeddingWidth = 256 };
+
+        const int chunk = 4096;          // PrefillBatchChunk
+        const int maxHeadDim = 512;      // widest per-layer head_dim
+        long perToken =
+            hp.EmbeddingDim * 4L                          // hidden+residual+norm+PleY
+            + 2L * hp.NumHeads * maxHeadDim               // Q + AttnOut (at maxHeadDim, not 256)
+            + 2L * hp.NumKvHeads * maxHeadDim             // K + V
+            + hp.IntermediateDim * 2L                     // FFN gate + up
+            + 2L * hp.NumLayers * hp.PerLayerEmbeddingWidth + hp.PerLayerEmbeddingWidth; // PLE stack
+        long expected = 2 * GiB + chunk * perToken * sizeof(float);   // systemReserve(2 GiB floor) + workset
+
+        Assert.Equal(expected, CudaForwardPass.KvVramReserveBytes(hp, 12 * GiB));
+
+        // And the PLE term is genuinely load-bearing: the same shape without PLE reserves strictly less.
+        var noPle = hp with { HasPerLayerTokenEmbd = false };
+        Assert.True(CudaForwardPass.KvVramReserveBytes(noPle, 12 * GiB) < expected,
+            "dropping the PLE table must lower the reserve — the PLE stack is part of the prefill working set.");
+    }
+
+    /// <summary>
     /// Q8KvGeometrySupported returns false when ANY single (non-aliased) layer violates the
     /// %32 rule — not just when all do. A mixed set with one bad layer must fail, matching
     /// the ctor's per-layer throw (else auto-narrow would pick q8_0 and then crash).
