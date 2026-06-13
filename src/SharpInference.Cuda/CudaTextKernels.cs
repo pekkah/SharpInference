@@ -6946,10 +6946,13 @@ __device__ void llm_attention_splitkv_impl(
     int kv_dim  = num_kv_heads * head_dim;
     float scale = (attn_scale > 0.f) ? attn_scale : rsqrtf((float)head_dim);
     long q_off  = (long)h * (long)head_dim;
+    // Per-position row stride and this head's invariant base offset, hoisted out of the loops.
+    long kv_dim_l = (long)kv_dim;
+    long kv_base  = (long)t0 * kv_dim_l + (long)kv_head * (long)head_dim;
 
     // Phase 1: scores for the slice → shared (indexed t − t0).
     for (int t = (int)tid; t < n; t += 256) {
-        long k_off = (long)(t0 + t) * (long)kv_dim + (long)kv_head * (long)head_dim;
+        long k_off = kv_base + (long)t * kv_dim_l;
         sk_scores[t] = sharpi_kv_dot(q + q_off, k_cache, k_off, head_dim) * scale;
     }
     __syncthreads();
@@ -6989,7 +6992,7 @@ __device__ void llm_attention_splitkv_impl(
     for (int d = (int)tid; d < head_dim; d += 256) {
         float acc = 0.f;
         for (int t = 0; t < n; t++) {
-            long v_off = (long)(t0 + t) * (long)kv_dim + (long)kv_head * (long)head_dim;
+            long v_off = kv_base + (long)t * kv_dim_l;   // same hoisted base as Phase 1
             acc += sk_scores[t] * sharpi_kvload(v_cache, v_off + d);
         }
         partial_o[o_off + d] = acc;
@@ -7091,14 +7094,17 @@ extern ""C"" __global__ void llm_attention_combine(
     __syncthreads();
     float inv = 1.0f / sh_denom;
 
-    // Weighted sum of the per-split numerators across head_dim.
+    // Weighted sum of the per-split numerators across head_dim. Base offsets hoisted.
+    long head_dim_l = (long)head_dim;
+    long po_base = base * head_dim_l;          // first split's row for this head
+    long out_base = (long)h * head_dim_l;
     for (int d = (int)tid; d < head_dim; d += 256) {
         float acc = 0.f;
         for (int s = 0; s < n_splits; s++) {
             float sc = sh_scale[s];
-            if (sc != 0.f) acc += sc * partial_o[(base + s) * (long)head_dim + d];
+            if (sc != 0.f) acc += sc * partial_o[po_base + (long)s * head_dim_l + d];
         }
-        out[(long)h * (long)head_dim + d] = acc * inv;
+        out[out_base + d] = acc * inv;
     }
 }
 

@@ -3679,6 +3679,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// the kernel's <c>SPLITKV_CHUNK</c>.</summary>
     public const int SplitKvChunk = 512;
 
+    /// <summary>Max KV splits per head — the combine kernel's <c>SPLITKV_MAX_SPLITS</c>
+    /// shared array bound. Callers must keep ceil(maxSeqLen/<see cref="SplitKvChunk"/>) ≤ this
+    /// (i.e. maxSeqLen ≤ 131072); <see cref="AttentionSplitKv"/> enforces it.</summary>
+    public const int SplitKvMaxSplits = 256;
+
     /// <summary>
     /// Flash-decoding decode attention (issue #235). Splits each head's KV sequence
     /// into <see cref="SplitKvChunk"/>-sized chunks across <c>numHeads × nSplits</c>
@@ -3701,6 +3706,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             throw new NotSupportedException("NVRTC kernels are not available.");
 
         int nSplits = (maxSeqLen + SplitKvChunk - 1) / SplitKvChunk;
+        // The combine kernel sizes its per-head rescale array at SPLITKV_MAX_SPLITS; exceeding
+        // it would overrun shared memory. The caller gates maxSeqLen ≤ 131072 so this can't
+        // trigger — fail loud rather than silently corrupt if a future caller forgets.
+        if (nSplits > SplitKvMaxSplits)
+            throw new ArgumentOutOfRangeException(nameof(maxSeqLen), maxSeqLen,
+                $"AttentionSplitKv: nSplits {nSplits} exceeds SplitKvMaxSplits {SplitKvMaxSplits} " +
+                $"(maxSeqLen must be ≤ {SplitKvMaxSplits * SplitKvChunk}).");
         nint splitKern = kvDType switch
         {
             DType.BFloat16 => _attentionSplitKvBf16Kernel,

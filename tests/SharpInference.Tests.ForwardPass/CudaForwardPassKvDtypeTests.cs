@@ -470,6 +470,106 @@ public sealed class CudaForwardPassKvDtypeTests
     public void Qwen3_8B_Fp32SplitKv_MatchesSingleBlock()
         => AssertSplitKvDecodeParity("Qwen3-8B-Q4_K_M.gguf", "fp32", maxAbsTol: 1.0f);
 
+    /// <summary>Gemma 4 12B QAT Q4_0, q8_0 KV: split-KV over the k_eq_v / per-layer-KV global
+    /// layers — the riskiest geometry (V reuses K storage, 8 GQA / 1 MQA) and the headline
+    /// 128K model. The other split tests use E4B (no k_eq_v) / Qwen3 (uniform KV).</summary>
+    [Fact]
+    public void Gemma4_12B_Q8SplitKv_MatchesSingleBlock()
+        => AssertSplitKvDecodeParity("gemma-4-12b-it-qat-q4_0.gguf", "q8_0", maxAbsTol: 4.0f);
+
+    /// <summary>
+    /// Flash-decoding split-KV under CUDA-graph replay ACROSS a split boundary (#235). The
+    /// decode graph is captured once (grid fixed at numHeads × nSplits) and replayed with
+    /// seqLen patched per token. This stresses the one path the steady-state parity tests
+    /// don't: a split that is OUT OF RANGE at capture (its 512-token chunk starts past seqLen)
+    /// must become correctly populated on a later replay as seqLen grows past its boundary —
+    /// and a stale partial from capture must never be merged. Prefill just below a 512 multiple
+    /// so the next split is empty at capture, decode well past it under graphs, assert the graph
+    /// actually instantiated (else the test would vacuously pass on a direct-launch fallback),
+    /// and compare to the single-block reference. fp32 → reduction-order budget only.
+    /// </summary>
+    [Fact]
+    public void Gemma4_E4B_SplitKv_GraphReplayCrossesBoundary()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath("gemma-4-E4B-it-Q8_0.gguf");
+        if (path is null) return;
+
+        const int ctx = 4096;
+        const int boundary = 6 * 512;        // 3072 — a split-chunk boundary
+        const int promptLen = boundary - 8;  // ~3064: splits ≥ 6 are empty at capture
+        const int steps = 24;                // decode well past the boundary
+        // This test's gate is top-5 stability across the graph-replay boundary crossing; the
+        // tight fp32 split-vs-single logit bound is owned by the parity test. max-abs here is a
+        // blow-up ceiling — a stale-partial/boundary bug spikes at the crossing or breaks top-5,
+        // it doesn't nudge a few units (reduction-order divergence over a near-uniform softmax).
+        const float maxAbsCeiling = 6.0f;
+
+        string prompt;
+        using (var model = GgufModel.Open(path))
+        {
+            var tok = GgufTokenizer.FromGgufModel(model);
+            var sb = new System.Text.StringBuilder();
+            const string seed = "The quick brown fox jumps over the lazy dog. " +
+                                "Sphinx of black quartz, judge my vow. " +
+                                "Pack my box with five dozen liquor jugs. ";
+            while (tok.Encode(sb.ToString()).Count < promptLen) sb.Append(seed);
+            prompt = sb.ToString();
+        }
+
+        // Single-block reference (split off) — trajectory + per-position logits.
+        var (single, singleArgmax) = RunPrefillDecode(gpu, path, "fp32", prompt, steps, ctx, forced: null, splitDecode: "0");
+
+        // Split on, graphs on, teacher-forced — keep fwd alive so we can assert GraphReady.
+        var prevKv = Environment.GetEnvironmentVariable("SHARPI_KV_DTYPE");
+        var prevSnap = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_BUDGET");
+        var prevSplit = Environment.GetEnvironmentVariable("SHARPI_SPLIT_DECODE");
+        Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", "fp32");
+        Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", "0");
+        Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE", "1");
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            var tok = GgufTokenizer.FromGgufModel(model);
+            int useCtx = Math.Min(hp.ContextLength, ctx);
+            using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: useCtx) { UseCudaGraph = true };
+            var tokens = tok.Encode(prompt).ToArray();
+            var split = new float[steps + 1][];
+            split[0] = fwd.Prefill(tokens).ToArray();
+            for (int i = 0; i < steps; i++)
+                split[i + 1] = fwd.Forward(singleArgmax[i], tokens.Length + i).ToArray();
+
+            Assert.True(gpu.GraphReady,
+                "E4B split-KV: CUDA graph did not instantiate — the split path silently fell back to " +
+                "direct launches, so this case would not actually validate graph replay across the boundary.");
+
+            for (int p = 0; p <= steps; p++)
+            {
+                Assert.Equal(single[p].Length, split[p].Length);
+                float maxAbs = 0f;
+                for (int i = 0; i < single[p].Length; i++)
+                {
+                    Assert.True(float.IsFinite(split[p][i]), $"non-finite split logit at pos {p}, idx {i}.");
+                    maxAbs = Math.Max(maxAbs, Math.Abs(single[p][i] - split[p][i]));
+                }
+                Assert.True(TopK(split[p], 5).Contains(singleArgmax[p]),
+                    $"pos {p} single-block top-1 ({singleArgmax[p]}) fell out of split's top-5 (max-abs {maxAbs:F4}) — " +
+                    "a graph-replay split-boundary bug (stale partial merged / wrong split activated).");
+                Assert.True(maxAbs < maxAbsCeiling,
+                    $"pos {p} split-vs-single max-abs {maxAbs:F4} exceeds the blow-up ceiling {maxAbsCeiling:F1} — " +
+                    "not reduction-order rounding.");
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", prevKv);
+            Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", prevSnap);
+            Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE", prevSplit);
+        }
+    }
+
     // ── Issue #191: narrowed-KV GREEDY decode coherence (template-correct) ───
     // The parity tests above teacher-force the narrowed dtype onto fp32's trajectory, so
     // they never let bf16/q8_0 pick their OWN greedy tokens — exactly the path a real 12 GB
