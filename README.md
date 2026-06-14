@@ -154,6 +154,9 @@ SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
   dotnet run --project src/SharpInference.Server.Host -c Release
 ```
 
+GPU flags mirror llama.cpp: `-g`/`--ngl`/`--n-gpu-layers` are interchangeable, and `--device <0|CUDA0|none>`
+pins a single GPU (no multi-GPU split).
+
 ## Image generation
 
 Two pipelines, auto-detected from model filename. Benchmarked on AMD Zen 4 + RTX 4070 Ti (CUDA, 4 steps,
