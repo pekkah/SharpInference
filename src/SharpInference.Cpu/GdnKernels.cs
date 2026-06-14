@@ -639,8 +639,8 @@ public static class GdnKernels
                     // ── Forward substitution: u_t = rhs_t − Σ_{s<t} A[t,s] u_s. ──
                     for (int t = 0; t < cN; t++)
                     {
-                        float* kt = kP + (long)(((c0 + t) * hv + h) * d);
-                        float* vt = vP + (long)(((c0 + t) * hv + h) * d);
+                        float* kt = kP + ((long)(c0 + t) * hv + h) * d;
+                        float* vt = vP + ((long)(c0 + t) * hv + h) * d;
                         float* ut = uP + (long)t * d;
                         float bt = bP[t], gT = gP[t];
                         float* pkt = projP + (long)t * d;
@@ -649,7 +649,7 @@ public static class GdnKernels
 
                         for (int s = 0; s < t; s++)
                         {
-                            float* ks = kP + (long)(((c0 + s) * hv + h) * d);
+                            float* ks = kP + ((long)(c0 + s) * hv + h) * d;
                             float kdot = SimdKernels.DotF32(ks, kt, d);
                             float a = bt * (float)Math.Exp(cum[t] - cum[s]) * kdot;
                             if (a != 0f) AxpyF32(ut, uP + (long)s * d, -a, d);
@@ -671,8 +671,8 @@ public static class GdnKernels
                     // ── Outputs + per-head RMSNorm + SiLU(z) gate. ────────────
                     for (int t = 0; t < cN; t++)
                     {
-                        float* qt = qP + (long)(((c0 + t) * hv + h) * d);
-                        float* oh = outPtr + (long)(((c0 + t) * hv + h) * d);
+                        float* qt = qP + ((long)(c0 + t) * hv + h) * d;
+                        float* oh = outPtr + ((long)(c0 + t) * hv + h) * d;
                         float gT = gP[t];
                         float* pqt = projP + (long)t * d;
 
@@ -680,7 +680,7 @@ public static class GdnKernels
 
                         for (int s = 0; s <= t; s++)
                         {
-                            float* ks = kP + (long)(((c0 + s) * hv + h) * d);
+                            float* ks = kP + ((long)(c0 + s) * hv + h) * d;
                             float kqdot = SimdKernels.DotF32(ks, qt, d);
                             float r = (float)Math.Exp(cum[t] - cum[s]) * kqdot;
                             if (r != 0f) AxpyF32(oh, uP + (long)s * d, r, d);
@@ -691,7 +691,7 @@ public static class GdnKernels
                         double sumSq = 0.0;
                         for (int j = 0; j < d; j++) { float ov = oh[j]; sumSq += (double)ov * ov; }
                         float scale = 1.0f / MathF.Sqrt((float)(sumSq / d) + normEps);
-                        float* zt = zP + (long)(((c0 + t) * hv + h) * d);
+                        float* zt = zP + ((long)(c0 + t) * hv + h) * d;
                         for (int j = 0; j < d; j++)
                         {
                             float normed = oh[j] * scale * normP[j];
@@ -706,7 +706,7 @@ public static class GdnKernels
                     for (int idx = 0; idx < dd; idx++) S[idx] *= gLast;
                     for (int s = 0; s < cN; s++)
                     {
-                        float* ks = kP + (long)(((c0 + s) * hv + h) * d);
+                        float* ks = kP + ((long)(c0 + s) * hv + h) * d;
                         float* us = uP + (long)s * d;
                         float rs = (float)Math.Exp(cum[cN - 1] - cum[s]);
                         for (int i = 0; i < d; i++)
@@ -723,7 +723,7 @@ public static class GdnKernels
     /// <summary>Per-token/-head element access into a <c>[tokens, hv, d]</c> buffer.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe float qkAt(float* buf, int tok, int head, int i, int hv, int d) =>
-        buf[(long)((tok * hv + head) * d) + i];
+        buf[((long)tok * hv + head) * d + i];
 
     /// <summary><c>y[0..n] += c · x[0..n]</c> (FMA-accelerated AXPY).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
