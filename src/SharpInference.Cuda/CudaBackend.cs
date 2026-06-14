@@ -4225,8 +4225,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// Issue #147: multi-warp / d-split tensor-core flash-attention prefill — same
     /// args/semantics as <see cref="FlashAttentionPrefillTc"/> but W=4 warps cooperate
     /// on each 16-query tile with the head dim split across them, so O is register-
-    /// resident (no shared-O rescale) and occupancy rises ~10× (RTX 4070 Ti / Ada). Requires
-    /// <paramref name="headDim"/> % 64 == 0 (W·16) and ≤ 512. Argmax-stable, not bit-exact.
+    /// resident (no shared-O rescale) and occupancy rises ~10× (RTX 4070 Ti / Ada).
+    /// Requires <paramref name="headDim"/> % 64 == 0 (W·16) and ≤ 512. Argmax-stable, not bit-exact.
     /// </summary>
     /// <param name="kvCacheType">K/V cache element dtype (issue #179): Float32 (default),
     /// BFloat16, or Q8_0. The matching templated thunk decodes each element to fp32 on

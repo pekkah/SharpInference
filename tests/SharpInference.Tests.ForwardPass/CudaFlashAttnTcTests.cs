@@ -45,6 +45,10 @@ public sealed unsafe class CudaFlashAttnTcTests
         (4, 4, 128, 0, 64, 0),     // MHA (no GQA), small head_dim
 
         // #151 gap 1 — startPos > 0 (continued prefill): K/V carry prior context.
+        // These keep maxSeqLen = startPos+nTok (a flat cache), so they validate the
+        // causal/window mask + key-tile-span interaction with startPos — NOT the SWA
+        // ring wrap (abs_k % maxSeqLen is the identity here). Ring-wrap is covered at
+        // the model level by CudaForwardPassKvDtypeTests' long-prompt chunked prefill.
         (8, 2, 256, 0, 64, 137),   // global, prior context before the new tokens
         (8, 2, 512, 96, 80, 211),  // SWA, window (96) bounded well inside the prior context (startPos 211)
 
