@@ -278,6 +278,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _gdnL2NormPerHeadBatchedKernel;
     private nint   _gdnTileHeadsBatchedKernel;
     private nint   _gdnRecurrenceScanKernel;
+    private nint   _gdnChunkedPrefillKernel;
     private nint   _kvAppendBatchedKernel;
     private nint   _kvAppendBatchedBf16Kernel;
     private nint   _fullSeqAttentionKernel;
@@ -5617,6 +5618,52 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_recurrence_scan) failed: {r}");
     }
 
+    /// <summary>GDN_CHUNK in <c>llm_gdn_chunked_prefill</c> — must match the kernel #define.</summary>
+    public const int GdnChunkSize = 64;
+
+    /// <summary>
+    /// Chunk-parallel GDN prefill over <paramref name="nTok"/> tokens (FlashQLA-style
+    /// chunk_gated_delta_rule). Same inputs/strides and in-place state update as
+    /// <see cref="GdnRecurrenceScan"/>, but resolves each <see cref="GdnChunkSize"/>-token
+    /// block with the parallel delta-rule form instead of the sequential scan — the GPU
+    /// mirror of <c>GdnKernels.GdnRecurrenceChunkedPrefill</c>. Numerically equal to the
+    /// scan up to FP reduction order. One block per v-head, blockDim = headDim.
+    /// </summary>
+    public void GdnChunkedPrefill(
+        Tensor state, Tensor qAll, Tensor kAll, Tensor vAll,
+        Tensor alphaAll, Tensor betaAll, Tensor ssmA, Tensor dtBias,
+        Tensor normWeight, Tensor zAll, Tensor outputAll,
+        int numVHeads, int headDim, float normEps,
+        int qStride, int kStride, int vStride, int vHeadOff, int zStride, int oStride, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint sP = GetDevPtr(state);
+        nint qP = GetDevPtr(qAll), kP = GetDevPtr(kAll), vP = GetDevPtr(vAll);
+        nint aP = GetDevPtr(alphaAll), bP = GetDevPtr(betaAll);
+        nint aaP = GetDevPtr(ssmA), dbP = GetDevPtr(dtBias), nwP = GetDevPtr(normWeight);
+        nint zP = GetDevPtr(zAll), oP = GetDevPtr(outputAll);
+        int pHV = numVHeads, pD = headDim;
+        float pE = normEps;
+        int pQS = qStride, pKS = kStride, pVS = vStride, pVO = vHeadOff, pZS = zStride, pOS = oStride, pN = nTok;
+        nint* args = stackalloc nint[21]
+        {
+            (nint)(&sP), (nint)(&qP), (nint)(&kP), (nint)(&vP),
+            (nint)(&aP), (nint)(&bP), (nint)(&aaP), (nint)(&dbP),
+            (nint)(&nwP), (nint)(&zP), (nint)(&oP),
+            (nint)(&pHV), (nint)(&pD), (nint)(&pE),
+            (nint)(&pQS), (nint)(&pKS), (nint)(&pVS), (nint)(&pVO), (nint)(&pZS), (nint)(&pOS), (nint)(&pN)
+        };
+        // Shared layout (floats): sNormW[d] + sCum/sG/sB[GDN_CHUNK each] +
+        // sKK/sKQ[GDN_CHUNK*GDN_CHUNK each] + sRed[d].
+        uint sharedBytes = (uint)((2 * headDim + 3 * GdnChunkSize + 2 * GdnChunkSize * GdnChunkSize) * sizeof(float));
+        int r = NvrtcInterop.LaunchKernel(_gdnChunkedPrefillKernel,
+            (uint)numVHeads, 1, 1, (uint)headDim, 1, 1, sharedBytes, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_chunked_prefill) failed: {r}");
+    }
+
     public void FullSeqAttention(Tensor output, Tensor q, Tensor k, Tensor v,
                                  int nTok, int nHeads, int headDim, float scale) =>
         throw new NotSupportedException("CudaBackend.FullSeqAttention is not implemented (LLM path uses single-token Attention).");
@@ -5948,6 +5995,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _gdnTileHeadsKernel, _gdnRecurrenceDecodeKernel,
             _gdnConv1dDecodeBatchedKernel, _gdnConv1dStateUpdateBatchedKernel,
             _gdnL2NormPerHeadBatchedKernel, _gdnTileHeadsBatchedKernel, _gdnRecurrenceScanKernel,
+            _gdnChunkedPrefillKernel,
             _kvAppendBatchedKernel, _kvAppendBatchedBf16Kernel,
             _fullSeqAttentionKernel, _fullSeqAttentionBf16Kernel,
             _fullSeqAttentionGlobalKernel, _fullSeqAttentionGlobalBf16Kernel,
@@ -6145,6 +6193,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _gdnL2NormPerHeadBatchedKernel     = GetKernelFunc("llm_gdn_l2_norm_per_head_batched");
         _gdnTileHeadsBatchedKernel         = GetKernelFunc("llm_gdn_tile_heads_batched");
         _gdnRecurrenceScanKernel           = GetKernelFunc("llm_gdn_recurrence_scan");
+        _gdnChunkedPrefillKernel           = GetKernelFunc("llm_gdn_chunked_prefill");
         _kvAppendBatchedKernel             = GetKernelFunc("llm_kv_append_batched");
         _kvAppendBatchedBf16Kernel         = GetKernelFunc("llm_kv_append_batched_bf16");
         _kvAppendBatchedQ8Kernel           = GetKernelFunc("llm_kv_append_batched_q8_0");

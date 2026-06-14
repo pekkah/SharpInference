@@ -280,4 +280,84 @@ public sealed unsafe class CudaGdnKernelsTests
         Assert.True(badStateCount == 0,
             $"GdnRecurrenceDecode state: {badStateCount} / {stateLen} entries exceed 1e-4 (max err = {maxStateErr}).");
     }
+
+    [Fact]
+    public void GdnChunkedPrefill_MatchesCpuSequentialReference()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        // Real GDN shape; n_tok spans more than one GDN_CHUNK (64) to exercise the
+        // multi-chunk state carry.
+        const int Hv = 32;
+        const int D = 128;
+        const int nTok = 70;
+        int qkv = Hv * D;                 // per-token q/k/v/z width
+        int stateLen = Hv * D * D;
+
+        var rng = new Random(20260614);
+        var q = RandomArray(rng, nTok * qkv, -0.5f, 0.5f);
+        var k = RandomArray(rng, nTok * qkv, -0.5f, 0.5f);
+        var v = RandomArray(rng, nTok * qkv, -0.5f, 0.5f);
+        var alpha = RandomArray(rng, nTok * Hv, -0.3f, 0.3f);
+        var beta = RandomArray(rng, nTok * Hv, -0.3f, 0.3f);
+        var ssmA = RandomArray(rng, Hv, -0.5f, -0.01f);
+        var dtBias = RandomArray(rng, Hv, -0.1f, 0.1f);
+        var normW = RandomArray(rng, D, 0.5f, 1.5f);
+        var z = RandomArray(rng, nTok * qkv, -1f, 1f);
+        var state = RandomArray(rng, stateLen, -0.1f, 0.1f);
+
+        // CPU reference: the sequential per-token scan (the byte-parity oracle).
+        var stateCpu = (float[])state.Clone();
+        var outputCpu = new float[nTok * qkv];
+        GdnKernels.GdnRecurrencePrefill(nTok, q, k, v, alpha, beta, ssmA, dtBias, normW, z,
+            stateCpu, outputCpu, Hv, D);
+
+        // GPU chunked prefill. Contiguous [nTok, Hv*D] layout → strides = Hv*D, vHeadOff = 0.
+        var gpuState = gpu.Upload(state, TensorShape.D1(stateLen));
+        var gpuQ = gpu.Upload(q, TensorShape.D1(nTok * qkv));
+        var gpuK = gpu.Upload(k, TensorShape.D1(nTok * qkv));
+        var gpuV = gpu.Upload(v, TensorShape.D1(nTok * qkv));
+        var gpuAlpha = gpu.Upload(alpha, TensorShape.D1(nTok * Hv));
+        var gpuBeta = gpu.Upload(beta, TensorShape.D1(nTok * Hv));
+        var gpuSsmA = gpu.Upload(ssmA, TensorShape.D1(Hv));
+        var gpuDtBias = gpu.Upload(dtBias, TensorShape.D1(Hv));
+        var gpuNormW = gpu.Upload(normW, TensorShape.D1(D));
+        var gpuZ = gpu.Upload(z, TensorShape.D1(nTok * qkv));
+        var gpuOut = gpu.Allocate(TensorShape.D1(nTok * qkv));
+
+        gpu.GdnChunkedPrefill(gpuState, gpuQ, gpuK, gpuV, gpuAlpha, gpuBeta, gpuSsmA, gpuDtBias,
+            gpuNormW, gpuZ, gpuOut, Hv, D, 1e-6f,
+            qStride: qkv, kStride: qkv, vStride: qkv, vHeadOff: 0, zStride: qkv, oStride: qkv, nTok: nTok);
+        gpu.Synchronize();
+
+        var outputGpu = new float[nTok * qkv];
+        var stateGpu = new float[stateLen];
+        gpu.Download(gpuOut, outputGpu);
+        gpu.Download(gpuState, stateGpu);
+
+        gpu.Free(gpuState); gpu.Free(gpuQ); gpu.Free(gpuK); gpu.Free(gpuV);
+        gpu.Free(gpuAlpha); gpu.Free(gpuBeta); gpu.Free(gpuSsmA); gpu.Free(gpuDtBias);
+        gpu.Free(gpuNormW); gpu.Free(gpuZ); gpu.Free(gpuOut);
+
+        // Chunked vs sequential: FP reduction order differs, so compare with a relative
+        // tolerance (the chunked form resolves the same recurrence over 70 tokens).
+        int badOut = 0; float maxOut = 0f;
+        for (int i = 0; i < outputGpu.Length; i++)
+        {
+            float err = MathF.Abs(outputGpu[i] - outputCpu[i]);
+            maxOut = MathF.Max(maxOut, err);
+            if (err > 3e-3f + 3e-3f * MathF.Abs(outputCpu[i])) badOut++;
+        }
+        Assert.True(badOut == 0, $"GdnChunkedPrefill output: {badOut} entries exceed tol (max err {maxOut}).");
+
+        int badState = 0; float maxState = 0f;
+        for (int i = 0; i < stateLen; i++)
+        {
+            float err = MathF.Abs(stateGpu[i] - stateCpu[i]);
+            maxState = MathF.Max(maxState, err);
+            if (err > 3e-3f + 3e-3f * MathF.Abs(stateCpu[i])) badState++;
+        }
+        Assert.True(badState == 0, $"GdnChunkedPrefill state: {badState} entries exceed tol (max err {maxState}).");
+    }
 }
