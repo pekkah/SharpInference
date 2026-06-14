@@ -58,11 +58,9 @@ _Re-measured 2026-06 from warm sweeps (prefill ~1K ctx, decode near-zero ctx), e
 warm-up. Vulkan rows are ~35% below their prior numbers — an unexplained regression (CUDA improved on the
 same box). Llama-4 Scout and Qwen3-Coder Vulkan-hybrid keep prior values (not re-runnable here)._
 
-**Long-context decode** uses flash-decoding (split-KV) on every CUDA path — dense, MoE-hybrid, and
-GDN-hybrid: the per-token KV read parallelizes across SMs instead of one block per head, so decode no longer
-collapses as context grows. At long ctx: Gemma 4 E4B (dense) fp32 13→30 / q8 11→45 t/s @32K; Qwen3-Coder-30B-A3B
-(MoE hybrid) q8 7.7→16.1 t/s @16K; Qwen3.6-35B-A3B (GDN hybrid) bf16 +19% @16K. Engages automatically above
-~2K ctx (dense) / 4K (MoE-hybrid) / 8K (GDN-hybrid); `SHARPI_SPLIT_DECODE=0` reverts.
+**Long-context decode** uses flash-decoding (split-KV) on all CUDA paths (dense + MoE/GDN hybrids): the
+per-token KV read parallelizes across SMs, so decode no longer collapses with context (Gemma 4 E4B q8
+11→45 t/s @32K, up to ~2× on the hybrids). `SHARPI_SPLIT_DECODE=0` reverts.
 
 **Sampling for Gemma 4 E4B-it:** `--temp 1.0 --top-k 64 --top-p 0.95 --min-p 0` (Gemma 3/4 defaults).
 It is **not** a reasoning model — the CLI auto-sets `enable_thinking=false`, else the template renders an
