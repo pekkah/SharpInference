@@ -126,6 +126,63 @@ public sealed class HybridGdnForwardPassTests
     }
 
     /// <summary>
+    /// Parity guard for the opt-in chunk-parallel GDN prefill
+    /// (<see cref="HybridGdnForwardPass.GdnChunkedPrefillEnabled"/>, FlashQLA-style
+    /// chunk_gated_delta_rule). The chunked layer-major prefill must reproduce the
+    /// per-token <see cref="HybridGdnForwardPass.Forward"/> loop: the GDN recurrence
+    /// only reorders floating-point reductions, so the final-position logits must be
+    /// argmax-identical and numerically close. Skipped silently without the GGUF.
+    /// </summary>
+    [Fact]
+    public void HybridGdnChunkedPrefill_MatchesSequentialPrefill()
+    {
+        var path = FindHybridModelPath();
+        if (path is null) return;   // silent skip
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var backend = new CpuBackend();
+        using var fwd = new HybridGdnForwardPass(model, backend, hp);
+
+        // A prompt long enough to span more than one 64-token chunk.
+        var tokens = tokenizer.Encode(
+            "The quick brown fox jumps over the lazy dog. " +
+            "Pack my box with five dozen liquor jugs. " +
+            "How razorback-jumping frogs can level six piqued gymnasts! " +
+            "Sphinx of black quartz, judge my vow.");
+        Assert.True(tokens.Count > 64, $"Prompt too short ({tokens.Count} tokens) to span a chunk.");
+
+        bool prev = HybridGdnForwardPass.GdnChunkedPrefillEnabled;
+        try
+        {
+            HybridGdnForwardPass.GdnChunkedPrefillEnabled = false;
+            var seq = fwd.Prefill(tokens).ToArray();
+
+            fwd.ResetCache();
+
+            HybridGdnForwardPass.GdnChunkedPrefillEnabled = true;
+            var chunk = fwd.Prefill(tokens).ToArray();
+
+            Assert.Equal(seq.Length, chunk.Length);
+            Assert.Equal(Sampler.Greedy(seq), Sampler.Greedy(chunk));   // argmax-identical
+
+            // Numerically close (FP-reorder only). Relative tolerance on the logits.
+            float maxRel = 0f;
+            for (int i = 0; i < seq.Length; i++)
+            {
+                float denom = MathF.Max(1e-3f, MathF.Abs(seq[i]));
+                maxRel = MathF.Max(maxRel, MathF.Abs(seq[i] - chunk[i]) / denom);
+            }
+            Assert.True(maxRel < 5e-2f, $"Chunked prefill logits diverged: max rel diff {maxRel:E2}");
+        }
+        finally
+        {
+            HybridGdnForwardPass.GdnChunkedPrefillEnabled = prev;
+        }
+    }
+
+    /// <summary>
     /// Probes for the qwen35 27B-MTP GGUF in the small-models directory. Tracked
     /// separately from <see cref="FindHybridModelPath"/> because (a) qwen35-MTP
     /// is a different architecture (dense FFN + MTP head, not MoE) and (b) the

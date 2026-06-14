@@ -248,6 +248,14 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     private static readonly bool _bypassMoe =
         Environment.GetEnvironmentVariable("SHARPI_BYPASS_MOE") == "1";
 
+    // Chunk-parallel GDN prompt prefill (FlashQLA-style chunk_gated_delta_rule).
+    // Opt-in: when set, Prefill batches the GDN recurrence over the whole prompt
+    // via GdnKernels.GdnRecurrenceChunkedPrefill instead of the per-token scan.
+    // Default OFF — the per-token Forward loop stays the validated default path.
+    // Exposed as a settable property so a parity test can toggle it without env vars.
+    public static bool GdnChunkedPrefillEnabled { get; set; } =
+        Environment.GetEnvironmentVariable("SHARPI_GDN_CHUNKED_PREFILL") == "1";
+
     // Q3_K_Q8K / Q8_0_Q8K kernel gates. Auto-on when the model has routed-expert
     // weights in that dtype (APEX mixed-precision tier — e.g. Carnice).
     // SHARPI_Q3K_Q8K / SHARPI_Q8_0_Q8K = "1" or "0" override. Mirrors the
@@ -685,10 +693,249 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         if (_hasMtp)
             EnsureMtpHiddenHistoryCap(startPos + tokens.Count);
 
+        // Opt-in chunk-parallel GDN prefill. Falls back to the per-token loop for
+        // single tokens (no chunking benefit), the bypass-debug flags, or a cache
+        // that isn't positioned at startPos (the chunked path assumes a clean append).
+        if (GdnChunkedPrefillEnabled && tokens.Count > 1
+            && !_bypassGdn && !_bypassAttn && !_bypassMoe
+            && _kvCache.Length == startPos && _gdnStateCache.Length == startPos)
+        {
+            return PrefillChunked(tokens, startPos);
+        }
+
         ReadOnlySpan<float> logits = default;
         for (int i = 0; i < tokens.Count; i++)
             logits = Forward(tokens[i], startPos + i);
         return logits;
+    }
+
+    /// <summary>
+    /// Chunk-parallel prompt prefill: processes the prompt layer-major (all tokens
+    /// through layer L before L+1 — provably equivalent to the token-major
+    /// <see cref="Forward"/> loop because each token's per-layer work is independent
+    /// given the prior layer's outputs and the KV/GDN caches are written in position
+    /// order). Attention and MoE/FFN run per-token via the exact same kernels and
+    /// order as <see cref="Forward"/> (byte-identical); only the GDN recurrence is
+    /// replaced by the batched <see cref="GdnKernels.GdnRecurrenceChunkedPrefill"/>
+    /// (FlashQLA-style chunk_gated_delta_rule), which differs from the per-token scan
+    /// only by floating-point reduction order.
+    ///
+    /// <para>Gated behind <see cref="GdnChunkedPrefillEnabled"/>; the per-token loop
+    /// remains the default. Requires the caches positioned at <paramref name="startPos"/>.</para>
+    /// </summary>
+    private ReadOnlySpan<float> PrefillChunked(IReadOnlyList<int> tokens, int startPos)
+    {
+        int n = tokens.Count;
+        int e = _embDim;
+        int valueDim = _gdnValueDim;
+        int hv = _gdnNumVHeads;
+
+        // N-wide host scratch. Allocated per call (prefill is not a per-token hot
+        // path) and released in finally. Hidden/residual/norm are [n × embDim];
+        // the GDN batched inputs are [n × valueDim] (q/k/v/z), [n × numVHeads]
+        // (alpha/beta) and [n × valueDim] (gdn output).
+        float* hid = Alloc(n * e);
+        float* res = Alloc(n * e);
+        float* nrm = Alloc(n * e);
+        float* gQ = Alloc(n * valueDim);
+        float* gK = Alloc(n * valueDim);
+        float* gV = Alloc(n * valueDim);
+        float* gZ = Alloc(n * valueDim);
+        float* gA = Alloc(n * hv);
+        float* gB = Alloc(n * hv);
+        float* gO = Alloc(n * valueDim);
+        try
+        {
+            for (int t = 0; t < n; t++) EmbedTokenInto(tokens[t], hid + (long)t * e);
+            for (int t = 0; t < n; t++) _kvCache.ReserveBlockAt(startPos + t);
+
+            for (int layer = 0; layer < _hp.NumLayers; layer++)
+            {
+                bool isAttn = _hp.LayerTypes![layer] == LayerType.Attention;
+
+                // ── Pre-block residual + attn-norm (per token). ──────────
+                Copy(res, hid, n * e);
+                float* attnNormW = GetNormWeight(_attnNorm[layer]);
+                for (int t = 0; t < n; t++)
+                    SimdKernels.RmsNorm(nrm + (long)t * e, hid + (long)t * e, attnNormW, e, _hp.RmsNormEps);
+
+                if (isAttn)
+                {
+                    // Per-token attention in position order — t reads K/V of 0..t.
+                    for (int t = 0; t < n; t++)
+                        AttnBlockAt(layer, position: startPos + t, kvPosition: startPos + t,
+                            normIn: nrm + (long)t * e, hiddenOut: hid + (long)t * e);
+                }
+                else
+                {
+                    GdnBlockChunked(layer, n, nrm, hid, gQ, gK, gV, gZ, gA, gB, gO);
+                }
+
+                // Residual add (per token).
+                for (int t = 0; t < n; t++)
+                    SimdKernels.AddInPlace(hid + (long)t * e, res + (long)t * e, e);
+
+                // ── Pre-FFN residual + post-attn-norm (per token). ───────
+                Copy(res, hid, n * e);
+                float* postNormW = GetNormWeight(_postAttnNorm[layer]);
+                for (int t = 0; t < n; t++)
+                    SimdKernels.RmsNorm(nrm + (long)t * e, hid + (long)t * e, postNormW, e, _hp.RmsNormEps);
+
+                // ── FFN per token (same kernels/order as Forward). ───────
+                for (int t = 0; t < n; t++)
+                {
+                    float* normIn = nrm + (long)t * e;
+                    float* hiddenOut = hid + (long)t * e;
+                    if (_hp.IsMoE)
+                        MoeFfnCore(
+                            _wGateInp[layer],
+                            _wGateShexp[layer], _wUpShexp[layer], _wDownShexp[layer],
+                            _wGateExps[layer], _wUpExps[layer], _wDownExps[layer],
+                            _wGateInpShexp[layer],
+                            normInExt: normIn, hiddenOutExt: hiddenOut);
+                    else
+                        DenseFfnAt(layer, normIn, hiddenOut);
+                }
+
+                // Post-FFN residual add (per token).
+                for (int t = 0; t < n; t++)
+                    SimdKernels.AddInPlace(hid + (long)t * e, res + (long)t * e, e);
+            }
+
+            // Advance both caches by N (one bump per token, in order).
+            for (int t = 0; t < n; t++)
+            {
+                _kvCache.IncrementPosition();
+                _gdnStateCache.IncrementPosition();
+            }
+
+            // MTP hidden-history capture (pre-output-norm hidden per token).
+            if (_hasMtp)
+            {
+                EnsureMtpHiddenHistoryCap(startPos + n);
+                for (int t = 0; t < n; t++)
+                    new ReadOnlySpan<float>(hid + (long)t * e, e)
+                        .CopyTo(new Span<float>(_mtpPrefillHiddens + (long)(startPos + t) * e, e));
+                if (_mtpHiddenHistoryLength < startPos + n)
+                    _mtpHiddenHistoryLength = startPos + n;
+                new ReadOnlySpan<float>(hid + (long)(n - 1) * e, e)
+                    .CopyTo(new Span<float>(_lastHidden, e));
+            }
+
+            // Final norm + lm_head for the LAST token (prefill returns its logits).
+            float* outNormW = GetNormWeight(_outputNorm);
+            SimdKernels.RmsNorm(_hidden, hid + (long)(n - 1) * e, outNormW, e, _hp.RmsNormEps);
+            FusedMatVec(_logits, _outputWeight, _hidden, _hp.VocabSize, e);
+            return new ReadOnlySpan<float>(_logits, _hp.VocabSize);
+        }
+        finally
+        {
+            NativeMemory.Free(hid); NativeMemory.Free(res); NativeMemory.Free(nrm);
+            NativeMemory.Free(gQ); NativeMemory.Free(gK); NativeMemory.Free(gV);
+            NativeMemory.Free(gZ); NativeMemory.Free(gA); NativeMemory.Free(gB);
+            NativeMemory.Free(gO);
+        }
+    }
+
+    /// <summary>
+    /// Batched GDN block for the chunked-prefill path. Runs the per-token pre-recurrence
+    /// stages (joint QKV + z projection, depthwise conv1d, SiLU, split, per-K-head L2 norm,
+    /// K→V tile, alpha/beta projection) into the [n × …] scratch buffers — using the exact
+    /// same kernels and order as <see cref="GdnBlockAt"/> — then resolves the recurrence for
+    /// all n tokens in one <see cref="GdnKernels.GdnRecurrenceChunkedPrefill"/> call, and
+    /// finally applies the per-token ssm-out projection. Conv state threads token-by-token;
+    /// scan state advances once for the whole chunk (bit-equivalent to n per-token updates
+    /// up to FP reduction order).
+    /// </summary>
+    private void GdnBlockChunked(
+        int layer, int n, float* nrm, float* hid,
+        float* gQ, float* gK, float* gV, float* gZ, float* gA, float* gB, float* gO)
+    {
+        int e = _embDim;
+        int convCh = _gdnConvChannels;
+        int keyDim = _gdnKeyDim;
+        int valueDim = _gdnValueDim;
+        int hv = _gdnNumVHeads;
+        int hd = _gdnHeadDim;
+
+        int gdnIdx = _gdnStateCache.GdnLayerOf(layer);
+        float* scanState = _gdnStateCache.ScanStateAt(gdnIdx);
+        float* convState = _gdnStateCache.ConvStateAt(gdnIdx);
+        int convStateLen = _gdnStateCache.ConvStateFloatsPerLayer;
+        int scanStateLen = _gdnStateCache.ScanStateFloatsPerLayer;
+
+        var aRef = _ssmAlpha[layer];
+        var bRef = _ssmBeta[layer];
+
+        // Pre-recurrence stages, per token (conv state threads in token order).
+        for (int t = 0; t < n; t++)
+        {
+            float* normIn = nrm + (long)t * e;
+
+            FusedMatVec(_qkv, _wQkv[layer], normIn, convCh, e);
+            FusedMatVec(_z, _wZGate[layer], normIn, valueDim, e);
+
+            GdnKernels.CausalDepthwiseConv1dDecode(
+                new ReadOnlySpan<float>(_qkv, convCh),
+                new Span<float>(convState, convStateLen),
+                new ReadOnlySpan<float>(_ssmConv1d[layer], _gdnConvKernel * convCh),
+                new Span<float>(_qkvConv, convCh),
+                convCh, _gdnConvKernel);
+
+            GdnKernels.SiLu(new Span<float>(_qkvConv, convCh), new ReadOnlySpan<float>(_qkvConv, convCh));
+
+            var qPre = new Span<float>(_qkvConv, keyDim);
+            var kPre = new Span<float>(_qkvConv + keyDim, keyDim);
+            new ReadOnlySpan<float>(_qkvConv + 2 * keyDim, valueDim)
+                .CopyTo(new Span<float>(gV + (long)t * valueDim, valueDim));
+
+            GdnKernels.L2NormPerHead(qPre, _gdnNumKHeads, hd, eps: 1e-6f);
+            GdnKernels.L2NormPerHead(kPre, _gdnNumKHeads, hd, eps: 1e-6f);
+            GdnKernels.TileHeads(qPre, new Span<float>(gQ + (long)t * valueDim, valueDim),
+                _gdnNumKHeads, _gdnKvRepeat, hd);
+            GdnKernels.TileHeads(kPre, new Span<float>(gK + (long)t * valueDim, valueDim),
+                _gdnNumKHeads, _gdnKvRepeat, hd);
+
+            new ReadOnlySpan<float>(_z, valueDim).CopyTo(new Span<float>(gZ + (long)t * valueDim, valueDim));
+
+            SimdKernels.MatVecDual(
+                gA + (long)t * hv, aRef.DataPtr,
+                gB + (long)t * hv, bRef.DataPtr,
+                normIn, hv, e, aRef.DType, bRef.DType);
+        }
+
+        // One batched recurrence over all n tokens.
+        GdnKernels.GdnRecurrenceChunkedPrefill(
+            n,
+            new ReadOnlySpan<float>(gQ, n * valueDim),
+            new ReadOnlySpan<float>(gK, n * valueDim),
+            new ReadOnlySpan<float>(gV, n * valueDim),
+            new ReadOnlySpan<float>(gA, n * hv),
+            new ReadOnlySpan<float>(gB, n * hv),
+            new ReadOnlySpan<float>(_ssmA[layer], hv),
+            new ReadOnlySpan<float>(_ssmDtBias[layer], hv),
+            new ReadOnlySpan<float>(_ssmNormW[layer], hd),
+            new ReadOnlySpan<float>(gZ, n * valueDim),
+            new Span<float>(scanState, scanStateLen),
+            new Span<float>(gO, n * valueDim),
+            hv, hd, normEps: 1e-6f);
+
+        // Per-token ssm-out projection → block output.
+        for (int t = 0; t < n; t++)
+            FusedMatVec(hid + (long)t * e, _ssmOut[layer], gO + (long)t * valueDim, e, valueDim);
+    }
+
+    /// <summary>Dense FFN on external in/out pointers (the <see cref="DenseFfn"/> body,
+    /// parameterised for the chunked-prefill per-token loop).</summary>
+    private void DenseFfnAt(int layer, float* normIn, float* hiddenOut)
+    {
+        SimdKernels.MatVecDual(
+            _ffnGate, _wFfnGate[layer].DataPtr,
+            _ffnUp, _wFfnUp[layer].DataPtr,
+            normIn, _intermDim, _embDim,
+            _wFfnGate[layer].DType, _wFfnUp[layer].DType);
+        SimdKernels.SiLuMul(_ffnGate, _ffnUp, _intermDim);
+        FusedMatVec(hiddenOut, _wFfnDown[layer], _ffnGate, _embDim, _intermDim);
     }
 
     private void EnsureMtpHiddenHistoryCap(int requiredTokens)
