@@ -7,4 +7,10 @@ if (args.Contains("--cb"))
     return;
 }
 
+if (args.Contains("--gdn"))
+{
+    SharpInference.Bench.GdnPrefillHarness.Run(args);
+    return;
+}
+
 BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);
