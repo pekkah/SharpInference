@@ -303,6 +303,10 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                                     upscalerBackend = gpu; // auto only: fall back to SGEMM on main backend
                                 }
                             }
+                            if (upscalerBackend is null)
+                                AnsiConsole.MarkupLine(deviceNone
+                                    ? "[dim]Upscaler backend:[/] CPU (--device none)"
+                                    : "[dim]Upscaler backend:[/] CPU");
                             upscaler = RRDBNet.Load(s.UpscalerPath, upscalerBackend);
                             AnsiConsole.MarkupLine($"[dim]Upscaler:[/] RRDBNet ×{upscaler.Scale} loaded");
                         }
