@@ -80,6 +80,45 @@ public sealed class Gemma4CpuForwardPassTests
     }
 
     [Fact]
+    public void Gemma4_E4B_Q4_0_CpuForward_LoadsWithAbsentSharedKvNorm()
+    {
+        // #211: Google's official E4B QAT q4_0 GGUF omits attn_k/attn_v/attn_k_norm for the
+        // 18 shared-KV tail layers (the Q8_0 ships dead, never-read copies). The CPU loader
+        // used to require attn_k_norm unconditionally and threw
+        //   "Missing bias tensor: blk.24.attn_k_norm.weight".
+        // It now skips the K-norm for KV-share layers (where ApplyQkNormLayer passes k=null),
+        // so the file loads and decodes coherently.
+        var path = FindModelPath("gemma-4-E4B_q4_0-it.gguf");
+        if (path is null) return;   // silent skip — file only present on the dev box
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+
+        // Regression precondition: this file must actually have a KV-share layer whose
+        // attn_k_norm is genuinely absent (else the test wouldn't exercise the fix). Confirm
+        // attn_q_norm is still present for that layer — only the shared layers' K-norm is omitted.
+        Assert.NotNull(hp.KvSourceLayer);
+        int sharedLayer = -1;
+        for (int i = 0; i < hp.KvSourceLayer!.Count; i++)
+            if (hp.KvSourceLayer[i] >= 0) { sharedLayer = i; break; }
+        Assert.True(sharedLayer >= 0, "expected a KV-share layer in the E4B q4_0 GGUF — wrong file?");
+        Assert.Null(model.FindTensor($"blk.{sharedLayer}.attn_k_norm.weight"));
+        Assert.NotNull(model.FindTensor($"blk.{sharedLayer}.attn_q_norm.weight"));
+
+        int bosId = ReadIntMetadata(model, "tokenizer.ggml.bos_token_id", fallback: 2);
+        int eosId = ReadIntMetadata(model, "tokenizer.ggml.eos_token_id", fallback: 1);
+        var tokens = new int[] { bosId, 651, 6037, 576, 6081, 603, 1234, 4567, 8901 };
+
+        using var backend = new CpuBackend();
+        // Pre-#211 this constructor threw on blk.24.attn_k_norm.weight.
+        using var fwd = new SharpInference.Engine.ForwardPass(model, backend, hp);
+
+        var logits = fwd.Prefill(tokens);
+        Assert.Equal(hp.VocabSize, logits.Length);
+        AssertCoherentDecode(fwd, eosId, logits, tokens.Length, hp.VocabSize, requireVariety: true);
+    }
+
+    [Fact]
     public void Gemma4_E4B_CpuForward_PleProducesVariety()
     {
         // Phase 4 acceptance signal: with PLE correctly injected, greedy decode over

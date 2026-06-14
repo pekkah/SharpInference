@@ -378,9 +378,17 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
             if (_hasQkNorm && !hp.UseL2QkNorm)
             {
                 int qNormSize = _perChannelQkNorm ? _numHeads * layerHd : layerHd;
-                int kNormSize = _perChannelQkNorm ? _numKvHeads * layerHd : layerHd;
                 _qNorm[i] = LoadBias($"blk.{i}.attn_q_norm.weight", qNormSize);
-                _kNorm[i] = LoadBias($"blk.{i}.attn_k_norm.weight", kNormSize);
+                // KV-share layers (Gemma 4 shared_kv_layers tail) reuse the source layer's
+                // already-normed K, so they carry no attn_k_norm — the QAT q4_0 GGUF omits it
+                // (the Q8_0 ships a dead, never-read copy). ApplyQkNormLayer passes k=null for
+                // these layers, so _kNorm[i] is never dereferenced; leave it null. Mirrors the
+                // attn_k/attn_v guard above and the CUDA/hybrid loaders (#211).
+                if (!kvShared)
+                {
+                    int kNormSize = _perChannelQkNorm ? _numKvHeads * layerHd : layerHd;
+                    _kNorm[i] = LoadBias($"blk.{i}.attn_k_norm.weight", kNormSize);
+                }
             }
 
             if (_postAttnNorm is not null)
