@@ -580,18 +580,25 @@ public static class GdnKernels
         int C = chunkSize;
 
         // Per-chunk scratch, allocated once per call and reused across heads/chunks.
-        //   cum/bScal/g/rLast: per-token scalars (≤ C)
+        //   cum/g/bScal: per-token scalars (≤ C). stackalloc'd for the common
+        //     small-chunk case (no heap traffic / bounds checks on the hot scan);
+        //     a caller passing an atypically large chunkSize falls back to the heap
+        //     so the stack can't overflow (the GPU sibling pins GDN_CHUNK at 64).
         //   u   : pseudo-values U, row-major [C, d]
         //   proj: batched state projection S0ᵀK then (reused) S0ᵀQ, row-major [C, d]
-        double[] cum = new double[C];
-        float[] g = new float[C];           // exp(cum_t)
-        float[] bScal = new float[C];
+        //         (both too large for the stack — always heap).
+        const int stackChunkCap = 256;
+        Span<double> cumSpan = C <= stackChunkCap ? stackalloc double[C] : new double[C];
+        Span<float> gSpan = C <= stackChunkCap ? stackalloc float[C] : new float[C];
+        Span<float> bSpan = C <= stackChunkCap ? stackalloc float[C] : new float[C];
         float[] u = new float[C * d];
         float[] proj = new float[C * d];
 
+        fixed (double* cum = cumSpan)
+        fixed (float* gP = gSpan, bP = bSpan)
         fixed (float* qP = q, kP = k, vP = v, zP = z, normP = normWeight,
                       statePtr = state, outPtr = output,
-                      uP = u, projP = proj, gP = g, bP = bScal)
+                      uP = u, projP = proj)
         {
             for (int h = 0; h < hv; h++)
             {

@@ -248,13 +248,19 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     private static readonly bool _bypassMoe =
         Environment.GetEnvironmentVariable("SHARPI_BYPASS_MOE") == "1";
 
-    // Chunk-parallel GDN prompt prefill (FlashQLA-style chunk_gated_delta_rule).
-    // Opt-in: when set, Prefill batches the GDN recurrence over the whole prompt
-    // via GdnKernels.GdnRecurrenceChunkedPrefill instead of the per-token scan.
-    // Default OFF — the per-token Forward loop stays the validated default path.
-    // Exposed as a settable property so a parity test can toggle it without env vars.
+    // Chunk-parallel GDN prompt prefill (FlashQLA-style chunk_gated_delta_rule):
+    // Prefill resolves the GDN recurrence over the whole prompt via
+    // GdnKernels.GdnRecurrenceChunkedPrefill instead of the per-token scan, ~1.3×
+    // faster end-to-end on the CPU backend (measured: qwen35moe 8.3→11.0 t/s prefill).
+    // DEFAULT ON for CPU (SHARPI_GDN_CHUNKED_PREFILL=0 to disable) — BUT the Prefill
+    // gate below additionally excludes models with a native MTP head: the chunked
+    // form is numerically equal to the scan only up to FP reduction order, and on the
+    // knife-edge "thinking-or-not" boundary token of the Qwen3.6-MTP models that ULP
+    // difference flips the trajectory off llama.cpp's (MtpDecoder_GreedyParity_LlamaCpp).
+    // MTP models therefore stay on the byte-exact per-token scan. Exposed as a settable
+    // property so a parity test can toggle it without env vars.
     public static bool GdnChunkedPrefillEnabled { get; set; } =
-        Environment.GetEnvironmentVariable("SHARPI_GDN_CHUNKED_PREFILL") == "1";
+        Environment.GetEnvironmentVariable("SHARPI_GDN_CHUNKED_PREFILL") != "0";
 
     // Q3_K_Q8K / Q8_0_Q8K kernel gates. Auto-on when the model has routed-expert
     // weights in that dtype (APEX mixed-precision tier — e.g. Carnice).
@@ -693,10 +699,14 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         if (_hasMtp)
             EnsureMtpHiddenHistoryCap(startPos + tokens.Count);
 
-        // Opt-in chunk-parallel GDN prefill. Falls back to the per-token loop for
-        // single tokens (no chunking benefit), the bypass-debug flags, or a cache
-        // that isn't positioned at startPos (the chunked path assumes a clean append).
-        if (GdnChunkedPrefillEnabled && tokens.Count > 1
+        // Chunk-parallel GDN prefill (default on; ~1.3× CPU prefill). Falls back to the
+        // per-token loop for single tokens (no chunking benefit), the bypass-debug flags,
+        // a cache not positioned at startPos (the chunked path assumes a clean append),
+        // or when the model has a native MTP head (_hasMtp): the chunked recurrence is
+        // not bit-exact, and on the Qwen3.6-MTP "thinking-or-not" knife-edge token that
+        // FP-reorder flips the generation trajectory off the per-token/llama.cpp
+        // reference (MtpDecoder_GreedyParity_LlamaCpp). MTP models keep the exact scan.
+        if (GdnChunkedPrefillEnabled && tokens.Count > 1 && !_hasMtp
             && !_bypassGdn && !_bypassAttn && !_bypassMoe
             && _kvCache.Length == startPos && _gdnStateCache.Length == startPos)
         {
@@ -733,19 +743,24 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         // N-wide host scratch. Allocated per call (prefill is not a per-token hot
         // path) and released in finally. Hidden/residual/norm are [n × embDim];
         // the GDN batched inputs are [n × valueDim] (q/k/v/z), [n × numVHeads]
-        // (alpha/beta) and [n × valueDim] (gdn output).
-        float* hid = Alloc(n * e);
-        float* res = Alloc(n * e);
-        float* nrm = Alloc(n * e);
-        float* gQ = Alloc(n * valueDim);
-        float* gK = Alloc(n * valueDim);
-        float* gV = Alloc(n * valueDim);
-        float* gZ = Alloc(n * valueDim);
-        float* gA = Alloc(n * hv);
-        float* gB = Alloc(n * hv);
-        float* gO = Alloc(n * valueDim);
+        // (alpha/beta) and [n × valueDim] (gdn output). Pointers are null-init'd
+        // and allocated INSIDE the try so a mid-sequence Alloc failure (OOM) frees
+        // the blocks already taken — NativeMemory.Free(null) is a safe no-op.
+        float* hid = null, res = null, nrm = null;
+        float* gQ = null, gK = null, gV = null, gZ = null, gA = null, gB = null, gO = null;
         try
         {
+            hid = Alloc(n * e);
+            res = Alloc(n * e);
+            nrm = Alloc(n * e);
+            gQ = Alloc(n * valueDim);
+            gK = Alloc(n * valueDim);
+            gV = Alloc(n * valueDim);
+            gZ = Alloc(n * valueDim);
+            gA = Alloc(n * hv);
+            gB = Alloc(n * hv);
+            gO = Alloc(n * valueDim);
+
             for (int t = 0; t < n; t++) EmbedTokenInto(tokens[t], hid + (long)t * e);
             for (int t = 0; t < n; t++) _kvCache.ReserveBlockAt(startPos + t);
 

@@ -282,6 +282,98 @@ public sealed unsafe class CudaGdnKernelsTests
     }
 
     [Fact]
+    public void GdnChunkedPrefill_ModelStridesMultiChunk_MatchesCpuReference()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        // Reproduce the EXACT buffer layout CudaHybridGdnForwardPass.GdnBlockBatched
+        // feeds the kernel — the one thing the contiguous-stride test above doesn't
+        // cover: q/k from tiled [nTok, valueDim] head buffers, v read in place from the
+        // silu'd conv output [nTok, convCh] at vHeadOff = 2*keyDim (stride convCh), z
+        // from [nTok, valueDim]. n_tok = 136 spans 3 GDN_CHUNK(64) blocks → exercises
+        // the multi-chunk state carry under non-trivial strides. Real qwen35moe dims.
+        const int Hv = 32, D = 128, nTok = 136;
+        const int numKHeads = 16;
+        int valueDim = Hv * D;                 // 4096
+        int keyDim = numKHeads * D;            // 2048
+        int convCh = 2 * keyDim + valueDim;    // 8192 (Q‖K‖V joint conv stream)
+        int vHeadOff = 2 * keyDim;             // 4096
+        int qkv = Hv * D, stateLen = Hv * D * D;
+
+        var rng = new Random(0x57121D);
+        // Logical per-token q/k/v/z (contiguous [nTok, Hv*D]) for the CPU reference.
+        var q = RandomArray(rng, nTok * qkv, -0.5f, 0.5f);
+        var k = RandomArray(rng, nTok * qkv, -0.5f, 0.5f);
+        var v = RandomArray(rng, nTok * qkv, -0.5f, 0.5f);
+        var alpha = RandomArray(rng, nTok * Hv, -0.3f, 0.3f);
+        var beta = RandomArray(rng, nTok * Hv, -0.3f, 0.3f);
+        var ssmA = RandomArray(rng, Hv, -0.5f, -0.01f);
+        var dtBias = RandomArray(rng, Hv, -0.1f, 0.1f);
+        var normW = RandomArray(rng, D, 0.5f, 1.5f);
+        var z = RandomArray(rng, nTok * qkv, -1f, 1f);
+        var state0 = RandomArray(rng, stateLen, -0.1f, 0.1f);
+
+        // CPU double-precision reference (the gold standard).
+        var stateCpu = (float[])state0.Clone();
+        var outCpu = new float[nTok * qkv];
+        GdnKernels.GdnRecurrencePrefill(nTok, q, k, v, alpha, beta, ssmA, dtBias, normW, z,
+            stateCpu, outCpu, Hv, D);
+
+        // Strided V buffer [nTok, convCh]: place each token's v at [t*convCh + vHeadOff].
+        // The conv-stream Q/K regions (before vHeadOff) are filled with noise the kernel
+        // must NOT read for V — a stride/offset bug would pull this garbage into the scan.
+        var vStrided = RandomArray(rng, nTok * convCh, 5f, 6f);   // distinctive out-of-range filler
+        for (int t = 0; t < nTok; t++)
+            Array.Copy(v, t * qkv, vStrided, t * convCh + vHeadOff, qkv);
+
+        var gSt = gpu.Upload(state0, TensorShape.D1(stateLen));
+        var gQ = gpu.Upload(q, TensorShape.D1(nTok * qkv));        // qStride = valueDim
+        var gK = gpu.Upload(k, TensorShape.D1(nTok * qkv));        // kStride = valueDim
+        var gV = gpu.Upload(vStrided, TensorShape.D1(nTok * convCh));
+        var gA = gpu.Upload(alpha, TensorShape.D1(nTok * Hv));
+        var gB = gpu.Upload(beta, TensorShape.D1(nTok * Hv));
+        var gSA = gpu.Upload(ssmA, TensorShape.D1(Hv));
+        var gDB = gpu.Upload(dtBias, TensorShape.D1(Hv));
+        var gNW = gpu.Upload(normW, TensorShape.D1(D));
+        var gZ = gpu.Upload(z, TensorShape.D1(nTok * qkv));        // zStride = valueDim
+        var gO = gpu.Allocate(TensorShape.D1(nTok * qkv));
+
+        gpu.GdnChunkedPrefill(gSt, gQ, gK, gV, gA, gB, gSA, gDB, gNW, gZ, gO,
+            Hv, D, 1e-6f,
+            qStride: valueDim, kStride: valueDim, vStride: convCh, vHeadOff: vHeadOff,
+            zStride: valueDim, oStride: valueDim, nTok: nTok);
+        gpu.Synchronize();
+
+        var outGpu = new float[nTok * qkv];
+        var stateGpu = new float[stateLen];
+        gpu.Download(gO, outGpu);
+        gpu.Download(gSt, stateGpu);
+        gpu.Free(gSt); gpu.Free(gQ); gpu.Free(gK); gpu.Free(gV); gpu.Free(gA); gpu.Free(gB);
+        gpu.Free(gSA); gpu.Free(gDB); gpu.Free(gNW); gpu.Free(gZ); gpu.Free(gO);
+
+        int badOut = 0; float maxOut = 0f;
+        for (int i = 0; i < outGpu.Length; i++)
+        {
+            float err = MathF.Abs(outGpu[i] - outCpu[i]);
+            maxOut = MathF.Max(maxOut, err);
+            if (err > 3e-3f + 3e-3f * MathF.Abs(outCpu[i])) badOut++;
+        }
+        Assert.True(badOut == 0,
+            $"GdnChunkedPrefill (model strides, 3 chunks) output: {badOut} entries exceed tol (max err {maxOut}).");
+
+        int badState = 0; float maxState = 0f;
+        for (int i = 0; i < stateLen; i++)
+        {
+            float err = MathF.Abs(stateGpu[i] - stateCpu[i]);
+            maxState = MathF.Max(maxState, err);
+            if (err > 3e-3f + 3e-3f * MathF.Abs(stateCpu[i])) badState++;
+        }
+        Assert.True(badState == 0,
+            $"GdnChunkedPrefill (model strides, 3 chunks) state: {badState} entries exceed tol (max err {maxState}).");
+    }
+
+    [Fact]
     public void GdnChunkedPrefill_MatchesCpuSequentialReference()
     {
         using var gpu = TryCreate();

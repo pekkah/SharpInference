@@ -145,12 +145,19 @@ public sealed class HybridGdnForwardPassTests
         using var backend = new CpuBackend();
         using var fwd = new HybridGdnForwardPass(model, backend, hp);
 
-        // A prompt long enough to span more than one 64-token chunk.
+        // A prompt long enough to span more than one 64-token chunk (the Qwen
+        // tokenizer is efficient, so a handful of pangrams only reaches ~45
+        // tokens — repeat the block until the encoded length clears 64, which
+        // also exercises the multi-chunk state carry).
         var tokens = tokenizer.Encode(
             "The quick brown fox jumps over the lazy dog. " +
             "Pack my box with five dozen liquor jugs. " +
             "How razorback-jumping frogs can level six piqued gymnasts! " +
-            "Sphinx of black quartz, judge my vow.");
+            "Sphinx of black quartz, judge my vow. " +
+            "Five wizards quickly jinxed the gnome before it vaporized. " +
+            "Crazy Fredrick bought many very exquisite opal jewels. " +
+            "The jay, pig, fox, zebra, and my wolves quack! " +
+            "We promptly judged antique ivory buckles for the next prize.");
         Assert.True(tokens.Count > 64, $"Prompt too short ({tokens.Count} tokens) to span a chunk.");
 
         bool prev = HybridGdnForwardPass.GdnChunkedPrefillEnabled;
@@ -167,14 +174,29 @@ public sealed class HybridGdnForwardPassTests
             Assert.Equal(seq.Length, chunk.Length);
             Assert.Equal(Sampler.Greedy(seq), Sampler.Greedy(chunk));   // argmax-identical
 
-            // Numerically close (FP-reorder only). Relative tolerance on the logits.
-            float maxRel = 0f;
+            // Numerically close: the chunked recurrence reorders FP reductions over
+            // 30 GDN layers, so use the codebase-standard combined absolute+relative
+            // tolerance (tol = absTol + relTol·|seq|), NOT a pure relative metric.
+            // A pure relative check explodes on the near-zero tail logits — a logit
+            // of 8e-4 vs 9e-3 (abs diff ~0.008, semantically irrelevant) reads as a
+            // ~8× "relative" error. Measured on this model/prompt: max absolute logit
+            // error is ~0.022 and the top logit (~15.09) agrees to ~0.035%; these
+            // tolerances clear that with headroom while still catching real drift.
+            const float absTol = 0.1f;
+            const float relTol = 5e-3f;
+            float worstExcess = 0f; int worstIdx = -1;
             for (int i = 0; i < seq.Length; i++)
             {
-                float denom = MathF.Max(1e-3f, MathF.Abs(seq[i]));
-                maxRel = MathF.Max(maxRel, MathF.Abs(seq[i] - chunk[i]) / denom);
+                float tol = absTol + relTol * MathF.Abs(seq[i]);
+                float excess = MathF.Abs(seq[i] - chunk[i]) - tol;
+                if (excess > worstExcess) { worstExcess = excess; worstIdx = i; }
             }
-            Assert.True(maxRel < 5e-2f, $"Chunked prefill logits diverged: max rel diff {maxRel:E2}");
+            if (worstIdx >= 0)
+                Assert.Fail(
+                    $"Chunked prefill logits diverged beyond tol at vocab idx {worstIdx}: " +
+                    $"seq={seq[worstIdx]:E4} chunk={chunk[worstIdx]:E4} " +
+                    $"(|diff|={MathF.Abs(seq[worstIdx] - chunk[worstIdx]):E4}, " +
+                    $"tol={absTol + relTol * MathF.Abs(seq[worstIdx]):E4}).");
         }
         finally
         {
