@@ -3830,8 +3830,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _gpu.KvAppend(_gpuK, _gpuV, _gpuKCache[layer]!, _gpuVCache[layer]!, kvDim, kvPosition, _maxSeqLen);
 
         int seqLen = kvPosition + 1;
-        // Flash-decoding split-KV (#238) at long ctx; else the single-block kernel. Mirrors the
-        // dense/MoE-hybrid gate (incl. the #237 grouped auto-select).
+        // Flash-decoding split-KV (#238) at long ctx; else the single-block kernel. Uses the
+        // #237 grouped auto-select like the dense/MoE-hybrid passes. (No `maxSeqLen <= _maxSeqLen`
+        // guard as on the dense path: this site always passes _maxSeqLen as the cache extent, so
+        // nSplits == the buffer's nSplitsMax exactly — there is no per-call maxSeqLen to bound.)
         if (_splitKvPartialO is { } splitO && _splitKvPartialMeta is { } splitMeta
             && seqLen > GdnSplitMinSeq)
         {
@@ -4015,6 +4017,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // 3. Layer-0 invariant: reserve a block on the MTP KV bookkeeping cache
         //    before any append at a new page boundary.
         mtpCache.ReserveBlock();
+        // The MTP DRAFT head is a single attention layer, so split-KV (#238) is deliberately
+        // not wired here — the occupancy win is negligible for one layer (the main-model verify
+        // via GpuAttnBlockAt does get the split). Stays single-block.
         if (_kvDType == DType.BFloat16)
         {
             _gpu.KvAppendBf16(_gpuK, _gpuV, kCache, vCache, kvDim, position, _maxSeqLen);
