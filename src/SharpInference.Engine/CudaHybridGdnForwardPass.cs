@@ -648,6 +648,19 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     internal static bool BatchedGdnScanEnabled =
         Environment.GetEnvironmentVariable("SHARPI_BATCHED_GDN_SCAN") != "0";
 
+    // FlashQLA chunked GDN prefill (issue #211 follow-up): inside the batched-prefill
+    // fast path, resolve the GDN recurrence with the chunk-parallel
+    // chunk_gated_delta_rule kernel (CudaBackend.GdnChunkedPrefill) instead of the
+    // sequential GdnRecurrenceScan. The chunked form is numerically equal to the scan
+    // only up to FP reduction order (NOT byte-exact), so it is OFF by default — the
+    // bit-parity oracles keep validating the byte-exact scan — and only engages on the
+    // prefill (clean state-carry) path: it lives inside the BatchedGdnScanEnabled &&
+    // !snapRing branch, so decode and batched-verify ring capture stay on the scan.
+    // Mirrors HybridGdnForwardPass.GdnChunkedPrefillEnabled. SHARPI_GDN_CHUNKED_PREFILL=1
+    // opts in; CudaHybridGdnChunkedPrefillTests A/B-toggles it.
+    internal static bool GdnChunkedPrefillEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_GDN_CHUNKED_PREFILL") == "1";
+
     // Issue #114-B: batch the per-position KV-append + SDPA into one launch each
     // (CudaBackend.AttentionBatched). Only used when the chunk stays on the
     // shared-scores path (startPos+N ≤ 4096) and SnapKV Q-capture is inactive;
@@ -1931,15 +1944,27 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             // Tile Q and K heads (GQA broadcast) into the [N × valueDim] head buffers.
             _gpu.GdnTileHeadsBatched(qkvConvAll, 0,    qHeadAll, 0, _gdnNumKHeads, _gdnKvRepeat, hd, convCh, valDim, N);
             _gpu.GdnTileHeadsBatched(qkvConvAll, kDim, kHeadAll, 0, _gdnNumKHeads, _gdnKvRepeat, hd, convCh, valDim, N);
-            // Fused sequential scan: v read straight from the silu'd conv output's V
-            // region (vHeadOff = 2*kDim, stride convCh); q/k from the tiled head buffers.
-            _gpu.GdnRecurrenceScan(
-                scanState, qHeadAll, kHeadAll, qkvConvAll,
-                alphaAll, betaAll, _gpuSsmA[layer], _gpuSsmDtBias[layer], _gpuSsmNormW[layer],
-                zAll, gdnOutAll,
-                nVH, hd, normEps: 1e-6f,
-                qStride: valDim, kStride: valDim, vStride: convCh, vHeadOff: 2 * kDim,
-                zStride: valDim, oStride: valDim, nTok: N);
+            // Recurrence: v read straight from the silu'd conv output's V region
+            // (vHeadOff = 2*kDim, stride convCh); q/k from the tiled head buffers.
+            // GdnChunkedPrefill is a signature-identical drop-in for the sequential
+            // GdnRecurrenceScan — the FlashQLA chunk-parallel form (opt-in, not
+            // byte-exact) vs the byte-exact per-token-equivalent scan (default).
+            if (GdnChunkedPrefillEnabled)
+                _gpu.GdnChunkedPrefill(
+                    scanState, qHeadAll, kHeadAll, qkvConvAll,
+                    alphaAll, betaAll, _gpuSsmA[layer], _gpuSsmDtBias[layer], _gpuSsmNormW[layer],
+                    zAll, gdnOutAll,
+                    nVH, hd, normEps: 1e-6f,
+                    qStride: valDim, kStride: valDim, vStride: convCh, vHeadOff: 2 * kDim,
+                    zStride: valDim, oStride: valDim, nTok: N);
+            else
+                _gpu.GdnRecurrenceScan(
+                    scanState, qHeadAll, kHeadAll, qkvConvAll,
+                    alphaAll, betaAll, _gpuSsmA[layer], _gpuSsmDtBias[layer], _gpuSsmNormW[layer],
+                    zAll, gdnOutAll,
+                    nVH, hd, normEps: 1e-6f,
+                    qStride: valDim, kStride: valDim, vStride: convCh, vHeadOff: 2 * kDim,
+                    zStride: valDim, oStride: valDim, nTok: N);
 
             GpuMatMulBatched(blockOut, _gpuWSsmOut[layer], gdnOutAll, N);
             return;

@@ -480,6 +480,270 @@ public static class GdnKernels
         }
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    //  Chunked (parallel) Gated DeltaNet prefill — the "chunk_gated_delta_rule"
+    //  form popularised by FLA / FlashQLA (https://github.com/QwenLM/FlashQLA).
+    //
+    //  Instead of walking tokens one at a time (GdnRecurrencePrefill), a chunk of
+    //  C tokens is resolved with a handful of dense linear-algebra passes whose
+    //  inner kernels are matmuls — the shape that maps to Tensor Cores on GPU and
+    //  BLAS GEMM on CPU. This is the algorithmic prerequisite for the FlashQLA-style
+    //  GPU kernel: it is the numerical oracle the GPU path is parity-checked against.
+    //
+    //  Derivation (per v-head; incoming chunk state S0, local token index t = 0..C-1,
+    //  i ≡ key axis, j ≡ value axis, layout S[i,j] = state[i*d + j] as elsewhere).
+    //
+    //  Sequential step (token t, S_prev = state after token t-1, S_{-1} = S0):
+    //      a_t      = exp(softplus(alpha_t + dtBias)·ssmA)          // scalar decay, ssmA<0 ⇒ a_t∈(0,1]
+    //      b_t      = sigmoid(beta_t)                               // scalar
+    //      p_t      = a_t · (S_prevᵀ k_t)                           // readout BEFORE the t-th update
+    //      u_t      = b_t · (v_t − p_t)                             // "pseudo-value" (the rank-1 payload)
+    //      S_t      = a_t·S_prev + k_t ⊗ u_t
+    //      o_t      = (S_tᵀ q_t)/√d                                 // readout AFTER the t-th update
+    //
+    //  Unrolling S_t in terms of S0 with cumulative log-decay cum_t = Σ_{s≤t} log a_s
+    //  (so g_t = exp(cum_t) and the inter-token decay product Π_{r=s+1..t} a_r =
+    //  exp(cum_t − cum_s) ≤ 1) yields a strictly-lower-triangular system for U:
+    //
+    //      A[t,s] = b_t · exp(cum_t−cum_s) · (k_sᵀ k_t)             (s < t)
+    //      rhs_t  = b_t·v_t − b_t·g_t·(S0ᵀ k_t)
+    //      (I + A) U = RHS         ⇒  u_t = rhs_t − Σ_{s<t} A[t,s] u_s   (forward substitution)
+    //
+    //  Outputs and the carried-out state are then pure matmul-shaped reductions:
+    //      o_t   = ( g_t·(S0ᵀ q_t) + Σ_{s≤t} exp(cum_t−cum_s)·(k_sᵀ q_t)·u_s ) / √d
+    //      S_new = g_{C-1}·S0 + Σ_s exp(cum_{C-1}−cum_s)·(k_s ⊗ u_s)
+    //
+    //  log a_t is computed directly as softplus(alpha)·ssmA (no log/exp round-trip),
+    //  and all decay products go through cum_t differences so g_t may underflow to 0
+    //  (fully-decayed state) without ever forming an over/underflowing ratio. The
+    //  post-recurrence per-head RMSNorm + SiLU(z) gate is byte-identical to the
+    //  sequential path. Output/state differ from GdnRecurrencePrefill only by FP
+    //  reduction order (this path accumulates in double), i.e. to within tolerance.
+    // ────────────────────────────────────────────────────────────────────
+
+    /// <summary>Default chunk length for <see cref="GdnRecurrenceChunkedPrefill"/>.
+    /// 64 matches the FLA / FlashQLA tile and keeps the intra-chunk decay products
+    /// well-conditioned.</summary>
+    public const int DefaultGdnChunkSize = 64;
+
+    /// <summary>
+    /// Chunk-parallel Gated DeltaNet prefill. Same inputs/outputs and in-place state
+    /// update as <see cref="GdnRecurrencePrefill"/>, but resolves each
+    /// <paramref name="chunkSize"/>-token block with the parallel "chunk_gated_delta_rule"
+    /// form (matmul-shaped) instead of a per-token scan. Numerically equal to the
+    /// sequential path up to floating-point reduction order.
+    /// </summary>
+    /// <param name="chunkSize">Tokens per parallel block (default
+    /// <see cref="DefaultGdnChunkSize"/>). Larger blocks amortise more but widen the
+    /// intra-chunk decay span; 64 is the validated default.</param>
+    public static unsafe void GdnRecurrenceChunkedPrefill(
+        int tokens,
+        ReadOnlySpan<float> q,
+        ReadOnlySpan<float> k,
+        ReadOnlySpan<float> v,
+        ReadOnlySpan<float> alphaIn,
+        ReadOnlySpan<float> beta,
+        ReadOnlySpan<float> ssmA,
+        ReadOnlySpan<float> dtBias,
+        ReadOnlySpan<float> normWeight,
+        ReadOnlySpan<float> z,
+        Span<float> state,
+        Span<float> output,
+        int numVHeads,
+        int headDim,
+        float normEps = 1e-6f,
+        int chunkSize = DefaultGdnChunkSize)
+    {
+        int hv = numVHeads;
+        int d = headDim;
+        int perTokQkv = hv * d;
+        int perTokScalar = hv;
+
+        if (tokens < 0) throw new ArgumentOutOfRangeException(nameof(tokens));
+        if (chunkSize < 1) throw new ArgumentOutOfRangeException(nameof(chunkSize));
+        if (q.Length != tokens * perTokQkv) throw new ArgumentException("q length mismatch");
+        if (k.Length != tokens * perTokQkv) throw new ArgumentException("k length mismatch");
+        if (v.Length != tokens * perTokQkv) throw new ArgumentException("v length mismatch");
+        if (alphaIn.Length != tokens * perTokScalar) throw new ArgumentException("alphaIn length mismatch");
+        if (beta.Length != tokens * perTokScalar) throw new ArgumentException("beta length mismatch");
+        if (ssmA.Length != hv) throw new ArgumentException("ssmA length mismatch");
+        if (dtBias.Length != hv) throw new ArgumentException("dtBias length mismatch");
+        if (normWeight.Length != d) throw new ArgumentException("normWeight length mismatch");
+        if (z.Length != tokens * perTokQkv) throw new ArgumentException("z length mismatch");
+        if (state.Length != hv * d * d) throw new ArgumentException("state length mismatch");
+        if (output.Length != tokens * perTokQkv) throw new ArgumentException("output length mismatch");
+
+        if (tokens == 0) return;
+
+        int dd = d * d;
+        float readoutScale = 1.0f / MathF.Sqrt((float)d);
+        int C = chunkSize;
+
+        // Per-chunk scratch, allocated once per call and reused across heads/chunks.
+        //   cum/g/bScal: per-token scalars (≤ C). stackalloc'd for the common
+        //     small-chunk case (no heap traffic / bounds checks on the hot scan);
+        //     a caller passing an atypically large chunkSize falls back to the heap
+        //     so the stack can't overflow (the GPU sibling pins GDN_CHUNK at 64).
+        //   u   : pseudo-values U, row-major [C, d]
+        //   proj: batched state projection S0ᵀK then (reused) S0ᵀQ, row-major [C, d]
+        //         (both too large for the stack — always heap).
+        const int stackChunkCap = 256;
+        Span<double> cumSpan = C <= stackChunkCap ? stackalloc double[C] : new double[C];
+        Span<float> gSpan = C <= stackChunkCap ? stackalloc float[C] : new float[C];
+        Span<float> bSpan = C <= stackChunkCap ? stackalloc float[C] : new float[C];
+        float[] u = new float[C * d];
+        float[] proj = new float[C * d];
+
+        fixed (double* cum = cumSpan)
+        fixed (float* gP = gSpan, bP = bSpan)
+        fixed (float* qP = q, kP = k, vP = v, zP = z, normP = normWeight,
+                      statePtr = state, outPtr = output,
+                      uP = u, projP = proj)
+        {
+            for (int h = 0; h < hv; h++)
+            {
+                float* S = statePtr + (long)h * dd;
+                float ssmAh = ssmA[h];
+                float dtBiasH = dtBias[h];
+
+                for (int c0 = 0; c0 < tokens; c0 += C)
+                {
+                    int cN = Math.Min(C, tokens - c0);
+
+                    // ── Per-token scalars: cumulative log-decay, g_t, b_t. ────
+                    double run = 0.0;
+                    for (int t = 0; t < cN; t++)
+                    {
+                        int gt = c0 + t;
+                        float alphaX = alphaIn[gt * perTokScalar + h] + dtBiasH;
+                        float dt = alphaX >= 20.0f ? alphaX : MathF.Log(1.0f + MathF.Exp(alphaX));
+                        run += (double)dt * ssmAh;     // log a_t (≤ 0)
+                        cum[t] = run;
+                        gP[t] = (float)Math.Exp(run);
+                        bP[t] = 1.0f / (1.0f + MathF.Exp(-beta[gt * perTokScalar + h]));
+                    }
+
+                    // ── Batched S0ᵀK → proj[t,:] (read S0 once, stream over rows). ──
+                    //   proj[t,j] = Σ_i K_t[i]·S0[i,j].  Outer i keeps the S0 row hot.
+                    new Span<float>(projP, cN * d).Clear();
+                    for (int i = 0; i < d; i++)
+                    {
+                        float* s0row = S + (long)i * d;
+                        for (int t = 0; t < cN; t++)
+                        {
+                            float ki = qkAt(kP, c0 + t, h, i, hv, d);
+                            if (ki != 0f) AxpyF32(projP + (long)t * d, s0row, ki, d);
+                        }
+                    }
+
+                    // ── Forward substitution: u_t = rhs_t − Σ_{s<t} A[t,s] u_s. ──
+                    for (int t = 0; t < cN; t++)
+                    {
+                        float* kt = kP + ((long)(c0 + t) * hv + h) * d;
+                        float* vt = vP + ((long)(c0 + t) * hv + h) * d;
+                        float* ut = uP + (long)t * d;
+                        float bt = bP[t], gT = gP[t];
+                        float* pkt = projP + (long)t * d;
+
+                        for (int j = 0; j < d; j++) ut[j] = bt * (vt[j] - gT * pkt[j]);
+
+                        for (int s = 0; s < t; s++)
+                        {
+                            float* ks = kP + ((long)(c0 + s) * hv + h) * d;
+                            float kdot = SimdKernels.DotF32(ks, kt, d);
+                            float a = bt * (float)Math.Exp(cum[t] - cum[s]) * kdot;
+                            if (a != 0f) AxpyF32(ut, uP + (long)s * d, -a, d);
+                        }
+                    }
+
+                    // ── Batched S0ᵀQ → proj[t,:] (reuse the buffer; K no longer needed). ──
+                    new Span<float>(projP, cN * d).Clear();
+                    for (int i = 0; i < d; i++)
+                    {
+                        float* s0row = S + (long)i * d;
+                        for (int t = 0; t < cN; t++)
+                        {
+                            float qi = qkAt(qP, c0 + t, h, i, hv, d);
+                            if (qi != 0f) AxpyF32(projP + (long)t * d, s0row, qi, d);
+                        }
+                    }
+
+                    // ── Outputs + per-head RMSNorm + SiLU(z) gate. ────────────
+                    for (int t = 0; t < cN; t++)
+                    {
+                        float* qt = qP + ((long)(c0 + t) * hv + h) * d;
+                        float* oh = outPtr + ((long)(c0 + t) * hv + h) * d;
+                        float gT = gP[t];
+                        float* pqt = projP + (long)t * d;
+
+                        for (int j = 0; j < d; j++) oh[j] = gT * pqt[j];
+
+                        for (int s = 0; s <= t; s++)
+                        {
+                            float* ks = kP + ((long)(c0 + s) * hv + h) * d;
+                            float kqdot = SimdKernels.DotF32(ks, qt, d);
+                            float r = (float)Math.Exp(cum[t] - cum[s]) * kqdot;
+                            if (r != 0f) AxpyF32(oh, uP + (long)s * d, r, d);
+                        }
+
+                        for (int j = 0; j < d; j++) oh[j] *= readoutScale;
+
+                        double sumSq = 0.0;
+                        for (int j = 0; j < d; j++) { float ov = oh[j]; sumSq += (double)ov * ov; }
+                        float scale = 1.0f / MathF.Sqrt((float)(sumSq / d) + normEps);
+                        float* zt = zP + ((long)(c0 + t) * hv + h) * d;
+                        for (int j = 0; j < d; j++)
+                        {
+                            float normed = oh[j] * scale * normP[j];
+                            float zv = zt[j];
+                            float silu = zv / (1.0f + MathF.Exp(-zv));
+                            oh[j] = normed * silu;
+                        }
+                    }
+
+                    // ── Carry state out: S_new = g_{C-1}·S0 + Σ_s r_s·(k_s ⊗ u_s). ──
+                    float gLast = gP[cN - 1];
+                    for (int idx = 0; idx < dd; idx++) S[idx] *= gLast;
+                    for (int s = 0; s < cN; s++)
+                    {
+                        float* ks = kP + ((long)(c0 + s) * hv + h) * d;
+                        float* us = uP + (long)s * d;
+                        float rs = (float)Math.Exp(cum[cN - 1] - cum[s]);
+                        for (int i = 0; i < d; i++)
+                        {
+                            float coeff = rs * ks[i];
+                            if (coeff != 0f) AxpyF32(S + (long)i * d, us, coeff, d);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>Per-token/-head element access into a <c>[tokens, hv, d]</c> buffer.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe float qkAt(float* buf, int tok, int head, int i, int hv, int d) =>
+        buf[((long)tok * hv + head) * d + i];
+
+    /// <summary><c>y[0..n] += c · x[0..n]</c> (FMA-accelerated AXPY).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void AxpyF32(float* y, float* x, float c, int n)
+    {
+        int i = 0;
+        if (System.Runtime.Intrinsics.X86.Fma.IsSupported)
+        {
+            var vc = System.Runtime.Intrinsics.Vector256.Create(c);
+            for (; i + 8 <= n; i += 8)
+            {
+                var vy = System.Runtime.Intrinsics.X86.Avx.LoadVector256(y + i);
+                var vx = System.Runtime.Intrinsics.X86.Avx.LoadVector256(x + i);
+                System.Runtime.Intrinsics.X86.Avx.Store(y + i,
+                    System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(vx, vc, vy));
+            }
+        }
+        for (; i < n; i++) y[i] += c * x[i];
+    }
+
     private static void ValidateRecurrenceArgs(
         ReadOnlySpan<float> q, ReadOnlySpan<float> k, ReadOnlySpan<float> v,
         ReadOnlySpan<float> alphaIn, ReadOnlySpan<float> beta,

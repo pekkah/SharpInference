@@ -7939,6 +7939,156 @@ extern ""C"" __global__ void llm_gdn_recurrence_scan(
     }
 }
 
+// ── GDN: chunk-parallel prefill (FlashQLA-style chunk_gated_delta_rule) ───────
+// Mirrors the CPU reference GdnKernels.GdnRecurrenceChunkedPrefill. One block per
+// v-head, blockDim = d; thread j owns value-column j of everything (state column j,
+// proj/u/output element j), so the forward substitution, S0-projections and state
+// carry are FULLY per-thread (no cross-thread sync). Only the per-chunk K·K / K·Q
+// dot matrices (over the key axis, shared by all j) and the per-token RMSNorm
+// reduction need cooperation. Same input strides/layout as llm_gdn_recurrence_scan.
+//
+// Numerically equal to the sequential scan up to FP reduction order (the chunked
+// form resolves the intra-chunk delta-rule coupling via forward substitution over a
+// fixed-size GDN_CHUNK tile). GDN_CHUNK must match the C# wrapper's GdnChunkSize.
+#define GDN_CHUNK 64
+extern ""C"" __global__ void llm_gdn_chunked_prefill(
+    float* __restrict__ state,            // [hv, d, d]
+    const float* __restrict__ q_all,      // [n_tok, q_stride]; head h at h*d
+    const float* __restrict__ k_all,      // [n_tok, k_stride]
+    const float* __restrict__ v_all,      // [n_tok, v_stride]; head h at v_head_off + h*d
+    const float* __restrict__ alpha_all,  // [n_tok, hv]
+    const float* __restrict__ beta_all,   // [n_tok, hv]
+    const float* __restrict__ ssm_a,      // [hv]
+    const float* __restrict__ dt_bias,    // [hv]
+    const float* __restrict__ norm_weight,// [d]
+    const float* __restrict__ z_all,      // [n_tok, z_stride]; head h at h*d
+    float* __restrict__ output_all,       // [n_tok, o_stride]; head h at h*d
+    int hv, int d, float norm_eps,
+    int q_stride, int k_stride, int v_stride, int v_head_off,
+    int z_stride, int o_stride, int n_tok)
+{
+    int h = (int)blockIdx.x;
+    int j = (int)threadIdx.x;
+    if (h >= hv || j >= d) return;
+
+    extern __shared__ float smem[];
+    float* sNormW = smem;                              // [d]
+    float* sCum   = sNormW + d;                        // [GDN_CHUNK]
+    float* sG     = sCum + GDN_CHUNK;                  // [GDN_CHUNK]  exp(cum_t)
+    float* sB     = sG + GDN_CHUNK;                    // [GDN_CHUNK]  sigmoid(beta_t)
+    float* sKK    = sB + GDN_CHUNK;                    // [GDN_CHUNK*GDN_CHUNK]  K_s·K_t
+    float* sKQ    = sKK + GDN_CHUNK * GDN_CHUNK;       // [GDN_CHUNK*GDN_CHUNK]  K_s·Q_t
+    float* sRed   = sKQ + GDN_CHUNK * GDN_CHUNK;       // [d]  RMSNorm reduction
+
+    sNormW[j] = norm_weight[j];
+    long state_base = (long)h * (long)d * (long)d;
+    float inv_sqrt_d = rsqrtf((float)d);
+
+    float projK[GDN_CHUNK];
+    float projQ[GDN_CHUNK];
+    float u[GDN_CHUNK];
+
+    for (int c0 = 0; c0 < n_tok; c0 += GDN_CHUNK) {
+        int cN = n_tok - c0; if (cN > GDN_CHUNK) cN = GDN_CHUNK;
+
+        // Per-token scalars: cumulative log-decay is sequential → thread 0 fills shared.
+        if (j == 0) {
+            float run = 0.f;
+            for (int t = 0; t < cN; t++) {
+                float ax = alpha_all[(long)(c0 + t) * hv + h] + dt_bias[h];
+                float dt = ax >= 20.0f ? ax : __logf(1.0f + __expf(ax));
+                run += dt * ssm_a[h];
+                sCum[t] = run;
+                sG[t]   = __expf(run);
+                sB[t]   = 1.0f / (1.0f + __expf(-beta_all[(long)(c0 + t) * hv + h]));
+            }
+        }
+        __syncthreads();
+
+        // K·K and K·Q dot matrices (lower triangle s<=t); shared across all columns j.
+        for (int idx = j; idx < cN * cN; idx += d) {
+            int t = idx / cN;
+            int s = idx - t * cN;
+            if (s <= t) {
+                long ks = (long)(c0 + s) * k_stride + (long)h * d;
+                long kt = (long)(c0 + t) * k_stride + (long)h * d;
+                long qt = (long)(c0 + t) * q_stride + (long)h * d;
+                float kk = 0.f, kq = 0.f;
+                for (int i = 0; i < d; i++) {
+                    float ksi = k_all[ks + i];
+                    kk += ksi * k_all[kt + i];
+                    kq += ksi * q_all[qt + i];
+                }
+                sKK[t * GDN_CHUNK + s] = kk;
+                sKQ[t * GDN_CHUNK + s] = kq;
+            }
+        }
+        __syncthreads();
+
+        // S0 projections (column j): projK[t]=Σ_i K_t[i]·S0[i,j], projQ[t]=Σ_i Q_t[i]·S0[i,j].
+        for (int t = 0; t < cN; t++) {
+            long kt = (long)(c0 + t) * k_stride + (long)h * d;
+            long qt = (long)(c0 + t) * q_stride + (long)h * d;
+            float pk = 0.f, pq = 0.f;
+            for (int i = 0; i < d; i++) {
+                float sij = state[state_base + (long)i * d + j];
+                pk += k_all[kt + i] * sij;
+                pq += q_all[qt + i] * sij;
+            }
+            projK[t] = pk;
+            projQ[t] = pq;
+        }
+
+        // Forward substitution: u_t = b_t(v_t − g_t·projK_t) − Σ_{s<t} A[t,s] u_s.
+        for (int t = 0; t < cN; t++) {
+            long vt = (long)(c0 + t) * v_stride + v_head_off + (long)h * d;
+            float bt = sB[t];
+            float uj = bt * (v_all[vt + j] - sG[t] * projK[t]);
+            for (int s = 0; s < t; s++) {
+                float a = bt * __expf(sCum[t] - sCum[s]) * sKK[t * GDN_CHUNK + s];
+                uj -= a * u[s];
+            }
+            u[t] = uj;
+        }
+
+        // Output + per-head RMSNorm + SiLU(z) gate.
+        for (int t = 0; t < cN; t++) {
+            float o = sG[t] * projQ[t];
+            for (int s = 0; s <= t; s++)
+                o += __expf(sCum[t] - sCum[s]) * sKQ[t * GDN_CHUNK + s] * u[s];
+            o *= inv_sqrt_d;
+
+            sRed[j] = o * o;
+            __syncthreads();
+            for (int red = d / 2; red > 0; red >>= 1) {
+                if (j < red) sRed[j] += sRed[j + red];
+                __syncthreads();
+            }
+            float scale = rsqrtf(sRed[0] / (float)d + norm_eps);
+            float on = o * scale * sNormW[j];
+            float zv = z_all[(long)(c0 + t) * z_stride + (long)h * d + j];
+            float silu = zv / (1.0f + __expf(-zv));
+            output_all[(long)(c0 + t) * o_stride + (long)h * d + j] = on * silu;
+            __syncthreads();
+        }
+
+        // State carry: S[i,j] = g_{cN-1}·S[i,j] + Σ_s exp(cum_{cN-1}−cum_s)·K_s[i]·u_s.
+        float gLast = sG[cN - 1];
+        float cumLast = sCum[cN - 1];
+        for (int i = 0; i < d; i++) {
+            long off = state_base + (long)i * d + j;
+            float acc = gLast * state[off];
+            for (int s = 0; s < cN; s++) {
+                long ks = (long)(c0 + s) * k_stride + (long)h * d;
+                acc += __expf(cumLast - sCum[s]) * k_all[ks + i] * u[s];
+            }
+            state[off] = acc;
+        }
+        __syncthreads();   // chunk boundary: next chunk overwrites shared
+    }
+}
+#undef GDN_CHUNK
+
 // ════════════════════════════════════════════════════════════════════════════
 //  Issue #114-B: batched-query SDPA for prompt prefill.
 // ════════════════════════════════════════════════════════════════════════════

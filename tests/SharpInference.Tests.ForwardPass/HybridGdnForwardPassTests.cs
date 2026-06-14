@@ -126,6 +126,85 @@ public sealed class HybridGdnForwardPassTests
     }
 
     /// <summary>
+    /// Parity guard for the opt-in chunk-parallel GDN prefill
+    /// (<see cref="HybridGdnForwardPass.GdnChunkedPrefillEnabled"/>, FlashQLA-style
+    /// chunk_gated_delta_rule). The chunked layer-major prefill must reproduce the
+    /// per-token <see cref="HybridGdnForwardPass.Forward"/> loop: the GDN recurrence
+    /// only reorders floating-point reductions, so the final-position logits must be
+    /// argmax-identical and numerically close. Skipped silently without the GGUF.
+    /// </summary>
+    [Fact]
+    public void HybridGdnChunkedPrefill_MatchesSequentialPrefill()
+    {
+        var path = FindHybridModelPath();
+        if (path is null) return;   // silent skip
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var backend = new CpuBackend();
+        using var fwd = new HybridGdnForwardPass(model, backend, hp);
+
+        // A prompt long enough to span more than one 64-token chunk (the Qwen
+        // tokenizer is efficient, so a handful of pangrams only reaches ~45
+        // tokens — repeat the block until the encoded length clears 64, which
+        // also exercises the multi-chunk state carry).
+        var tokens = tokenizer.Encode(
+            "The quick brown fox jumps over the lazy dog. " +
+            "Pack my box with five dozen liquor jugs. " +
+            "How razorback-jumping frogs can level six piqued gymnasts! " +
+            "Sphinx of black quartz, judge my vow. " +
+            "Five wizards quickly jinxed the gnome before it vaporized. " +
+            "Crazy Fredrick bought many very exquisite opal jewels. " +
+            "The jay, pig, fox, zebra, and my wolves quack! " +
+            "We promptly judged antique ivory buckles for the next prize.");
+        Assert.True(tokens.Count > 64, $"Prompt too short ({tokens.Count} tokens) to span a chunk.");
+
+        bool prev = HybridGdnForwardPass.GdnChunkedPrefillEnabled;
+        try
+        {
+            HybridGdnForwardPass.GdnChunkedPrefillEnabled = false;
+            var seq = fwd.Prefill(tokens).ToArray();
+
+            fwd.ResetCache();
+
+            HybridGdnForwardPass.GdnChunkedPrefillEnabled = true;
+            var chunk = fwd.Prefill(tokens).ToArray();
+
+            Assert.Equal(seq.Length, chunk.Length);
+            Assert.Equal(Sampler.Greedy(seq), Sampler.Greedy(chunk));   // argmax-identical
+
+            // Numerically close: the chunked recurrence reorders FP reductions over
+            // 30 GDN layers, so use the codebase-standard combined absolute+relative
+            // tolerance (tol = absTol + relTol·|seq|), NOT a pure relative metric.
+            // A pure relative check explodes on the near-zero tail logits — a logit
+            // of 8e-4 vs 9e-3 (abs diff ~0.008, semantically irrelevant) reads as a
+            // ~8× "relative" error. Measured on this model/prompt: max absolute logit
+            // error is ~0.022 and the top logit (~15.09) agrees to ~0.035%; these
+            // tolerances clear that with headroom while still catching real drift.
+            const float absTol = 0.1f;
+            const float relTol = 5e-3f;
+            float worstExcess = 0f; int worstIdx = -1;
+            for (int i = 0; i < seq.Length; i++)
+            {
+                float tol = absTol + relTol * MathF.Abs(seq[i]);
+                float excess = MathF.Abs(seq[i] - chunk[i]) - tol;
+                if (excess > worstExcess) { worstExcess = excess; worstIdx = i; }
+            }
+            if (worstIdx >= 0)
+                Assert.Fail(
+                    $"Chunked prefill logits diverged beyond tol at vocab idx {worstIdx}: " +
+                    $"seq={seq[worstIdx]:E4} chunk={chunk[worstIdx]:E4} " +
+                    $"(|diff|={MathF.Abs(seq[worstIdx] - chunk[worstIdx]):E4}, " +
+                    $"tol={absTol + relTol * MathF.Abs(seq[worstIdx]):E4}).");
+        }
+        finally
+        {
+            HybridGdnForwardPass.GdnChunkedPrefillEnabled = prev;
+        }
+    }
+
+    /// <summary>
     /// Probes for the qwen35 27B-MTP GGUF in the small-models directory. Tracked
     /// separately from <see cref="FindHybridModelPath"/> because (a) qwen35-MTP
     /// is a different architecture (dense FFN + MTP head, not MoE) and (b) the

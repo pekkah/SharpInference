@@ -366,6 +366,209 @@ public sealed class GdnKernelsTests
     }
 
     // ────────────────────────────────────────────────────────────────────
+    //  Chunked (parallel) Gated DeltaNet prefill — FlashQLA-style scan
+    // ────────────────────────────────────────────────────────────────────
+
+    [Theory]
+    [InlineData(1, 1, 2, 64)]     // single token (degenerate chunk)
+    [InlineData(4, 2, 2, 64)]     // sub-chunk
+    [InlineData(64, 2, 4, 64)]    // exactly one full chunk
+    [InlineData(65, 2, 4, 64)]    // one chunk + 1 remainder token
+    [InlineData(130, 3, 8, 64)]   // two full chunks + remainder
+    [InlineData(100, 2, 16, 16)]  // small chunk size, many blocks
+    [InlineData(50, 4, 8, 7)]     // odd chunk size, uneven blocks
+    public void GdnChunkedPrefill_MatchesSequentialPrefill(int tokens, int hv, int d, int chunkSize)
+    {
+        var rng = new Random(unchecked(0x5EED ^ (tokens * 131 + hv * 17 + d * 7 + chunkSize)));
+
+        float[] q = RandomArray(rng, tokens * hv * d, -0.5f, 0.5f);
+        float[] k = RandomArray(rng, tokens * hv * d, -0.5f, 0.5f);
+        float[] v = RandomArray(rng, tokens * hv * d, -0.5f, 0.5f);
+        float[] alphaIn = RandomArray(rng, tokens * hv, -1f, 1f);
+        float[] beta = RandomArray(rng, tokens * hv, -1f, 1f);
+        float[] ssmA = RandomArray(rng, hv, -0.5f, -0.05f);   // decay coeff is negative
+        float[] dtBias = RandomArray(rng, hv, -0.2f, 0.2f);
+        float[] normWeight = RandomArray(rng, d, 0.5f, 1.5f);
+        float[] z = RandomArray(rng, tokens * hv * d, -1f, 1f);
+
+        // Reference: sequential prefill from zero state.
+        float[] stateSeq = new float[hv * d * d];
+        float[] outSeq = new float[tokens * hv * d];
+        GdnKernels.GdnRecurrencePrefill(tokens, q, k, v, alphaIn, beta, ssmA, dtBias, normWeight, z,
+            stateSeq, outSeq, hv, d);
+
+        // Chunked path from zero state.
+        float[] stateChunk = new float[hv * d * d];
+        float[] outChunk = new float[tokens * hv * d];
+        GdnKernels.GdnRecurrenceChunkedPrefill(tokens, q, k, v, alphaIn, beta, ssmA, dtBias, normWeight, z,
+            stateChunk, outChunk, hv, d, chunkSize: chunkSize);
+
+        AssertClose(outSeq, outChunk, "output", relTol: 2e-3f, absTol: 2e-3f);
+        AssertClose(stateSeq, stateChunk, "state", relTol: 2e-3f, absTol: 2e-3f);
+    }
+
+    [Fact]
+    public void GdnChunkedPrefill_HonoursIncomingState()
+    {
+        // The chunk-parallel form must thread a non-zero incoming state through
+        // exactly like the sequential scan (e.g. a chunk that resumes a prior prompt).
+        const int tokens = 40, hv = 2, d = 8, chunkSize = 16;
+        var rng = new Random(0xC0FFEE);
+
+        float[] q = RandomArray(rng, tokens * hv * d, -0.5f, 0.5f);
+        float[] k = RandomArray(rng, tokens * hv * d, -0.5f, 0.5f);
+        float[] v = RandomArray(rng, tokens * hv * d, -0.5f, 0.5f);
+        float[] alphaIn = RandomArray(rng, tokens * hv, -1f, 1f);
+        float[] beta = RandomArray(rng, tokens * hv, -1f, 1f);
+        float[] ssmA = [-0.3f, -0.15f];
+        float[] dtBias = [0.05f, -0.05f];
+        float[] normWeight = RandomArray(rng, d, 0.5f, 1.5f);
+        float[] z = RandomArray(rng, tokens * hv * d, -1f, 1f);
+
+        // Seed both runs with the same non-trivial incoming state.
+        float[] seed = RandomArray(rng, hv * d * d, -0.2f, 0.2f);
+
+        float[] stateSeq = (float[])seed.Clone();
+        float[] outSeq = new float[tokens * hv * d];
+        GdnKernels.GdnRecurrencePrefill(tokens, q, k, v, alphaIn, beta, ssmA, dtBias, normWeight, z,
+            stateSeq, outSeq, hv, d);
+
+        float[] stateChunk = (float[])seed.Clone();
+        float[] outChunk = new float[tokens * hv * d];
+        GdnKernels.GdnRecurrenceChunkedPrefill(tokens, q, k, v, alphaIn, beta, ssmA, dtBias, normWeight, z,
+            stateChunk, outChunk, hv, d, chunkSize: chunkSize);
+
+        AssertClose(outSeq, outChunk, "output", relTol: 2e-3f, absTol: 2e-3f);
+        AssertClose(stateSeq, stateChunk, "state", relTol: 2e-3f, absTol: 2e-3f);
+    }
+
+    [Fact]
+    public void GdnChunkedPrefill_StrongDecay_StaysFiniteAndMatches()
+    {
+        // Strongly-negative ssmA drives g_t toward underflow inside a chunk; the
+        // log-space cumulative must keep ratios bounded and finite.
+        const int tokens = 70, hv = 2, d = 8, chunkSize = 64;
+        var rng = new Random(0xBEEF);
+
+        float[] q = RandomArray(rng, tokens * hv * d, -1f, 1f);
+        float[] k = RandomArray(rng, tokens * hv * d, -1f, 1f);
+        float[] v = RandomArray(rng, tokens * hv * d, -1f, 1f);
+        float[] alphaIn = RandomArray(rng, tokens * hv, 0f, 2f);   // positive ⇒ larger dt ⇒ stronger decay
+        float[] beta = RandomArray(rng, tokens * hv, -1f, 1f);
+        float[] ssmA = [-5f, -8f];                                  // aggressive decay
+        float[] dtBias = [0.5f, 0.5f];
+        float[] normWeight = RandomArray(rng, d, 0.5f, 1.5f);
+        float[] z = RandomArray(rng, tokens * hv * d, -1f, 1f);
+
+        float[] stateSeq = new float[hv * d * d];
+        float[] outSeq = new float[tokens * hv * d];
+        GdnKernels.GdnRecurrencePrefill(tokens, q, k, v, alphaIn, beta, ssmA, dtBias, normWeight, z,
+            stateSeq, outSeq, hv, d);
+
+        float[] stateChunk = new float[hv * d * d];
+        float[] outChunk = new float[tokens * hv * d];
+        GdnKernels.GdnRecurrenceChunkedPrefill(tokens, q, k, v, alphaIn, beta, ssmA, dtBias, normWeight, z,
+            stateChunk, outChunk, hv, d, chunkSize: chunkSize);
+
+        foreach (var o in outChunk) Assert.True(float.IsFinite(o));
+        foreach (var s in stateChunk) Assert.True(float.IsFinite(s));
+        AssertClose(outSeq, outChunk, "output", relTol: 3e-3f, absTol: 3e-3f);
+        AssertClose(stateSeq, stateChunk, "state", relTol: 3e-3f, absTol: 3e-3f);
+    }
+
+    [Fact]
+    public void GdnBlockBatched_MatchesPerTokenBlock()
+    {
+        // End-to-end validation of the *batched GDN block* — the exact stage chain
+        // HybridGdnForwardPass runs per token, but driven over a whole prompt at once:
+        //   conv1d → SiLU → split Q|K|V → per-K-head L2norm → tile K→V heads → recurrence.
+        // The chunked path (conv1d-prefill + GdnRecurrenceChunkedPrefill) must match
+        // N× the per-token path (conv1d-decode + GdnRecurrenceDecode). This is the
+        // load-bearing correctness claim for wiring the chunked kernel into prefill.
+        const int tokens = 40;
+        const int numKHeads = 2, numVHeads = 4, headDim = 8, kvRepeat = 2;
+        const int keyDim = numKHeads * headDim;      // 16
+        const int valueDim = numVHeads * headDim;    // 32
+        const int convCh = 2 * keyDim + valueDim;    // 64 (Q‖K‖V joint conv stream)
+        const int convKernel = 4;
+
+        var rng = new Random(0x6D6E);
+        float[] qkvMixed = RandomArray(rng, tokens * convCh, -0.5f, 0.5f);   // post-QKV-proj conv input
+        float[] convW = RandomArray(rng, convKernel * convCh, -0.3f, 0.3f);
+        float[] alpha = RandomArray(rng, tokens * numVHeads, -1f, 1f);
+        float[] beta = RandomArray(rng, tokens * numVHeads, -1f, 1f);
+        float[] ssmA = RandomArray(rng, numVHeads, -0.5f, -0.05f);
+        float[] dtBias = RandomArray(rng, numVHeads, -0.2f, 0.2f);
+        float[] normW = RandomArray(rng, headDim, 0.5f, 1.5f);
+        float[] z = RandomArray(rng, tokens * valueDim, -1f, 1f);
+
+        // ── Per-token reference path ─────────────────────────────────────
+        float[] outSeq = new float[tokens * valueDim];
+        {
+            float[] convState = new float[(convKernel - 1) * convCh];
+            float[] scanState = new float[numVHeads * headDim * headDim];
+            float[] conv = new float[convCh];
+            float[] qV = new float[valueDim], kV = new float[valueDim];
+            for (int t = 0; t < tokens; t++)
+            {
+                GdnKernels.CausalDepthwiseConv1dDecode(
+                    qkvMixed.AsSpan(t * convCh, convCh), convState, convW, conv, convCh, convKernel);
+                GdnKernels.SiLu(conv, conv);
+                var qPre = conv.AsSpan(0, keyDim);
+                var kPre = conv.AsSpan(keyDim, keyDim);
+                var vV = conv.AsSpan(2 * keyDim, valueDim);
+                GdnKernels.L2NormPerHead(qPre, numKHeads, headDim);
+                GdnKernels.L2NormPerHead(kPre, numKHeads, headDim);
+                GdnKernels.TileHeads(qPre, qV, numKHeads, kvRepeat, headDim);
+                GdnKernels.TileHeads(kPre, kV, numKHeads, kvRepeat, headDim);
+                GdnKernels.GdnRecurrenceDecode(qV, kV, vV,
+                    alpha.AsSpan(t * numVHeads, numVHeads), beta.AsSpan(t * numVHeads, numVHeads),
+                    ssmA, dtBias, normW, z.AsSpan(t * valueDim, valueDim),
+                    scanState, outSeq.AsSpan(t * valueDim, valueDim), numVHeads, headDim);
+            }
+        }
+
+        // ── Batched path: conv1d-prefill, per-token split/norm/tile, chunked recurrence ──
+        float[] outChunk = new float[tokens * valueDim];
+        {
+            float[] convState = new float[(convKernel - 1) * convCh];
+            float[] scanState = new float[numVHeads * headDim * headDim];
+            float[] conv = new float[tokens * convCh];
+            GdnKernels.CausalDepthwiseConv1dPrefill(qkvMixed, convState, convW, conv, tokens, convCh, convKernel);
+            GdnKernels.SiLu(conv, conv);
+
+            float[] qV = new float[tokens * valueDim], kV = new float[tokens * valueDim], vV = new float[tokens * valueDim];
+            for (int t = 0; t < tokens; t++)
+            {
+                var qPre = conv.AsSpan(t * convCh, keyDim);
+                var kPre = conv.AsSpan(t * convCh + keyDim, keyDim);
+                conv.AsSpan(t * convCh + 2 * keyDim, valueDim).CopyTo(vV.AsSpan(t * valueDim, valueDim));
+                GdnKernels.L2NormPerHead(qPre, numKHeads, headDim);
+                GdnKernels.L2NormPerHead(kPre, numKHeads, headDim);
+                GdnKernels.TileHeads(qPre, qV.AsSpan(t * valueDim, valueDim), numKHeads, kvRepeat, headDim);
+                GdnKernels.TileHeads(kPre, kV.AsSpan(t * valueDim, valueDim), numKHeads, kvRepeat, headDim);
+            }
+
+            GdnKernels.GdnRecurrenceChunkedPrefill(tokens, qV, kV, vV, alpha, beta, ssmA, dtBias, normW, z,
+                scanState, outChunk, numVHeads, headDim, chunkSize: 16);
+        }
+
+        AssertClose(outSeq, outChunk, "gdn-block-out", relTol: 3e-3f, absTol: 3e-3f);
+    }
+
+    private static void AssertClose(float[] expected, float[] actual, string what, float relTol, float absTol)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+        {
+            float e = expected[i], a = actual[i];
+            float tol = absTol + relTol * MathF.Abs(e);
+            Assert.True(MathF.Abs(e - a) <= tol,
+                $"{what}[{i}] mismatch: expected {e}, got {a} (tol {tol})");
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
     //  Element-wise helpers
     // ────────────────────────────────────────────────────────────────────
 
