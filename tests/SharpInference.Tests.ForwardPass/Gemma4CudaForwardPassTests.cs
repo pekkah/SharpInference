@@ -27,12 +27,14 @@ public sealed class Gemma4CudaForwardPassTests
         catch { return null; }
     }
 
-    private static string? FindModelPath()
+    private static string? FindModelPath() => FindModelPath(ModelFile);
+
+    private static string? FindModelPath(string fileName)
     {
         string[] absoluteCandidates =
         {
-            $@"E:\models\{ModelFile}",
-            $@"C:\p\sharpi\models\{ModelFile}",
+            $@"E:\models\{fileName}",
+            $@"C:\p\sharpi\models\{fileName}",
         };
         foreach (var p in absoluteCandidates)
             if (File.Exists(p)) return p;
@@ -40,7 +42,7 @@ public sealed class Gemma4CudaForwardPassTests
         var dir = Directory.GetCurrentDirectory();
         for (int i = 0; i < 8; i++)
         {
-            var p = Path.Combine(dir, "models", ModelFile);
+            var p = Path.Combine(dir, "models", fileName);
             if (File.Exists(p)) return p;
             var parent = Directory.GetParent(dir);
             if (parent is null) break;
@@ -370,6 +372,60 @@ public sealed class Gemma4CudaForwardPassTests
         {
             Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", prev);
         }
+    }
+
+    /// <summary>
+    /// #211: the E4B QAT q4_0 GGUF omits attn_k / attn_v / attn_k_norm for the 18 KV-share
+    /// tail layers (the Q8_0 ships dead copies). CudaForwardPass already guarded the upload
+    /// behind <c>!kvShared</c>; this pins that the full <c>-g -1</c> path loads the file and
+    /// tracks the CPU reference at first-decode argmax. Dev-box-only (silent-skips without the
+    /// file or CUDA), like every other gemma4 test here.
+    /// </summary>
+    [Fact]
+    public void Gemma4_E4B_Q4_0_CudaForward_LoadsAndMatchesCpuArgmax()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath("gemma-4-E4B_q4_0-it.gguf");
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.NotNull(hp.LayerHeadDim);
+
+        // Precondition: a KV-share layer whose attn_k_norm is genuinely absent (the case that
+        // threw pre-#211 on the CPU pass, and that CudaForwardPass's !kvShared guard skips).
+        Assert.NotNull(hp.KvSourceLayer);
+        int sharedLayer = -1;
+        for (int i = 0; i < hp.KvSourceLayer!.Count; i++)
+            if (hp.KvSourceLayer[i] >= 0) { sharedLayer = i; break; }
+        Assert.True(sharedLayer >= 0, "expected a KV-share layer in the E4B q4_0 GGUF — wrong file?");
+        Assert.Null(model.FindTensor($"blk.{sharedLayer}.attn_k_norm.weight"));
+
+        int bosId = ReadIntMetadata(model, "tokenizer.ggml.bos_token_id", fallback: 2);
+        int eosId = ReadIntMetadata(model, "tokenizer.ggml.eos_token_id", fallback: 1);
+        var tokens = new int[] { bosId, 651, 6037, 576, 6081, 603, 1234, 4567, 8901 };
+
+        // CPU reference (the pass that was fixed) — independent of any GPU kernel.
+        int cpuArgmax;
+        using (var cpuBackend = new CpuBackend())
+        using (var cpuFwd = new SharpInference.Engine.ForwardPass(model, cpuBackend, hp))
+            cpuArgmax = Argmax(cpuFwd.Prefill(tokens));
+
+        using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 512);
+        var logits = fwd.Prefill(tokens);
+        Assert.Equal(hp.VocabSize, logits.Length);
+
+        int nonFinite = 0;
+        for (int i = 0; i < logits.Length; i++)
+            if (!float.IsFinite(logits[i])) nonFinite++;
+        Assert.True(nonFinite == 0, $"{nonFinite} non-finite logits in E4B q4_0 CUDA output.");
+
+        int cudaArgmax = Argmax(logits);
+        if (eosId >= 0)
+            Assert.NotEqual(eosId, cudaArgmax);
+        Assert.True(cpuArgmax == cudaArgmax,
+            $"CPU↔CUDA E4B q4_0 first-argmax disagree: CPU={cpuArgmax} CUDA={cudaArgmax}.");
     }
 
     private static int[] TopK(ReadOnlySpan<float> logits, int k)
