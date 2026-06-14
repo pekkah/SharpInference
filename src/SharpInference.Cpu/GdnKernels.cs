@@ -480,6 +480,248 @@ public static class GdnKernels
         }
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    //  Chunked (parallel) Gated DeltaNet prefill — the "chunk_gated_delta_rule"
+    //  form popularised by FLA / FlashQLA (https://github.com/QwenLM/FlashQLA).
+    //
+    //  Instead of walking tokens one at a time (GdnRecurrencePrefill), a chunk of
+    //  C tokens is resolved with a handful of dense linear-algebra passes whose
+    //  inner kernels are matmuls — the shape that maps to Tensor Cores on GPU and
+    //  BLAS GEMM on CPU. This is the algorithmic prerequisite for the FlashQLA-style
+    //  GPU kernel: it is the numerical oracle the GPU path is parity-checked against.
+    //
+    //  Derivation (per v-head; incoming chunk state S0, local token index t = 0..C-1,
+    //  i ≡ key axis, j ≡ value axis, layout S[i,j] = state[i*d + j] as elsewhere).
+    //
+    //  Sequential step (token t, S_prev = state after token t-1, S_{-1} = S0):
+    //      a_t      = exp(softplus(alpha_t + dtBias)·ssmA)          // scalar decay, ssmA<0 ⇒ a_t∈(0,1]
+    //      b_t      = sigmoid(beta_t)                               // scalar
+    //      p_t      = a_t · (S_prevᵀ k_t)                           // readout BEFORE the t-th update
+    //      u_t      = b_t · (v_t − p_t)                             // "pseudo-value" (the rank-1 payload)
+    //      S_t      = a_t·S_prev + k_t ⊗ u_t
+    //      o_t      = (S_tᵀ q_t)/√d                                 // readout AFTER the t-th update
+    //
+    //  Unrolling S_t in terms of S0 with cumulative log-decay cum_t = Σ_{s≤t} log a_s
+    //  (so g_t = exp(cum_t) and the inter-token decay product Π_{r=s+1..t} a_r =
+    //  exp(cum_t − cum_s) ≤ 1) yields a strictly-lower-triangular system for U:
+    //
+    //      A[t,s] = b_t · exp(cum_t−cum_s) · (k_sᵀ k_t)             (s < t)
+    //      rhs_t  = b_t·v_t − b_t·g_t·(S0ᵀ k_t)
+    //      (I + A) U = RHS         ⇒  u_t = rhs_t − Σ_{s<t} A[t,s] u_s   (forward substitution)
+    //
+    //  Outputs and the carried-out state are then pure matmul-shaped reductions:
+    //      o_t   = ( g_t·(S0ᵀ q_t) + Σ_{s≤t} exp(cum_t−cum_s)·(k_sᵀ q_t)·u_s ) / √d
+    //      S_new = g_{C-1}·S0 + Σ_s exp(cum_{C-1}−cum_s)·(k_s ⊗ u_s)
+    //
+    //  log a_t is computed directly as softplus(alpha)·ssmA (no log/exp round-trip),
+    //  and all decay products go through cum_t differences so g_t may underflow to 0
+    //  (fully-decayed state) without ever forming an over/underflowing ratio. The
+    //  post-recurrence per-head RMSNorm + SiLU(z) gate is byte-identical to the
+    //  sequential path. Output/state differ from GdnRecurrencePrefill only by FP
+    //  reduction order (this path accumulates in double), i.e. to within tolerance.
+    // ────────────────────────────────────────────────────────────────────
+
+    /// <summary>Default chunk length for <see cref="GdnRecurrenceChunkedPrefill"/>.
+    /// 64 matches the FLA / FlashQLA tile and keeps the intra-chunk decay products
+    /// well-conditioned.</summary>
+    public const int DefaultGdnChunkSize = 64;
+
+    /// <summary>
+    /// Chunk-parallel Gated DeltaNet prefill. Same inputs/outputs and in-place state
+    /// update as <see cref="GdnRecurrencePrefill"/>, but resolves each
+    /// <paramref name="chunkSize"/>-token block with the parallel "chunk_gated_delta_rule"
+    /// form (matmul-shaped) instead of a per-token scan. Numerically equal to the
+    /// sequential path up to floating-point reduction order.
+    /// </summary>
+    /// <param name="chunkSize">Tokens per parallel block (default
+    /// <see cref="DefaultGdnChunkSize"/>). Larger blocks amortise more but widen the
+    /// intra-chunk decay span; 64 is the validated default.</param>
+    public static void GdnRecurrenceChunkedPrefill(
+        int tokens,
+        ReadOnlySpan<float> q,
+        ReadOnlySpan<float> k,
+        ReadOnlySpan<float> v,
+        ReadOnlySpan<float> alphaIn,
+        ReadOnlySpan<float> beta,
+        ReadOnlySpan<float> ssmA,
+        ReadOnlySpan<float> dtBias,
+        ReadOnlySpan<float> normWeight,
+        ReadOnlySpan<float> z,
+        Span<float> state,
+        Span<float> output,
+        int numVHeads,
+        int headDim,
+        float normEps = 1e-6f,
+        int chunkSize = DefaultGdnChunkSize)
+    {
+        int hv = numVHeads;
+        int d = headDim;
+        int perTokQkv = hv * d;
+        int perTokScalar = hv;
+
+        if (tokens < 0) throw new ArgumentOutOfRangeException(nameof(tokens));
+        if (chunkSize < 1) throw new ArgumentOutOfRangeException(nameof(chunkSize));
+        if (q.Length != tokens * perTokQkv) throw new ArgumentException("q length mismatch");
+        if (k.Length != tokens * perTokQkv) throw new ArgumentException("k length mismatch");
+        if (v.Length != tokens * perTokQkv) throw new ArgumentException("v length mismatch");
+        if (alphaIn.Length != tokens * perTokScalar) throw new ArgumentException("alphaIn length mismatch");
+        if (beta.Length != tokens * perTokScalar) throw new ArgumentException("beta length mismatch");
+        if (ssmA.Length != hv) throw new ArgumentException("ssmA length mismatch");
+        if (dtBias.Length != hv) throw new ArgumentException("dtBias length mismatch");
+        if (normWeight.Length != d) throw new ArgumentException("normWeight length mismatch");
+        if (z.Length != tokens * perTokQkv) throw new ArgumentException("z length mismatch");
+        if (state.Length != hv * d * d) throw new ArgumentException("state length mismatch");
+        if (output.Length != tokens * perTokQkv) throw new ArgumentException("output length mismatch");
+
+        if (tokens == 0) return;
+
+        int dd = d * d;
+        float readoutScale = 1.0f / MathF.Sqrt((float)d);
+
+        // Per-chunk scratch (max chunkSize tokens). Allocated once per call, reused
+        // across heads and chunks — this is a reference kernel, not a hot decode path.
+        int C = chunkSize;
+        var cum = new double[C];            // cumulative log-decay within the chunk
+        var bScal = new float[C];           // sigmoid(beta) per token
+        var u = new double[C * d];          // pseudo-values U, row-major [C, d]
+        var sk0 = new double[d];            // S0ᵀ k_t scratch
+        var sq0 = new double[d];            // S0ᵀ q_t scratch
+
+        for (int h = 0; h < hv; h++)
+        {
+            Span<float> S = state.Slice(h * dd, dd);
+            float ssmAh = ssmA[h];
+            float dtBiasH = dtBias[h];
+
+            for (int c0 = 0; c0 < tokens; c0 += C)
+            {
+                int cN = Math.Min(C, tokens - c0);
+
+                // ── Per-token scalars: cumulative log-decay and b_t. ──────────
+                double run = 0.0;
+                for (int t = 0; t < cN; t++)
+                {
+                    int gt = c0 + t;
+                    float alphaX = alphaIn[gt * perTokScalar + h] + dtBiasH;
+                    float dt = alphaX >= 20.0f ? alphaX : MathF.Log(1.0f + MathF.Exp(alphaX));
+                    run += (double)dt * ssmAh;     // log a_t  (≤ 0)
+                    cum[t] = run;
+                    bScal[t] = 1.0f / (1.0f + MathF.Exp(-beta[gt * perTokScalar + h]));
+                }
+
+                // ── Forward substitution for U = (I + A)^{-1} RHS. ───────────
+                //   u_t = rhs_t − Σ_{s<t} A[t,s] u_s,
+                //   A[t,s] = b_t·exp(cum_t−cum_s)·(k_sᵀ k_t),
+                //   rhs_t = b_t·v_t − b_t·exp(cum_t)·(S0ᵀ k_t).
+                for (int t = 0; t < cN; t++)
+                {
+                    int gt = c0 + t;
+                    ReadOnlySpan<float> kt = k.Slice((gt * hv + h) * d, d);
+                    ReadOnlySpan<float> vt = v.Slice((gt * hv + h) * d, d);
+                    float bt = bScal[t];
+                    double gT = Math.Exp(cum[t]);
+
+                    // S0ᵀ k_t  (uses the chunk's incoming state, before any update).
+                    for (int j = 0; j < d; j++) sk0[j] = 0.0;
+                    for (int i = 0; i < d; i++)
+                    {
+                        double ki = kt[i];
+                        if (ki == 0.0) continue;
+                        int rowBase = i * d;
+                        for (int j = 0; j < d; j++) sk0[j] += ki * S[rowBase + j];
+                    }
+
+                    Span<double> ut = u.AsSpan(t * d, d);
+                    for (int j = 0; j < d; j++)
+                        ut[j] = bt * ((double)vt[j] - gT * sk0[j]);
+
+                    // Subtract the strictly-lower-triangular intra-chunk coupling.
+                    for (int s = 0; s < t; s++)
+                    {
+                        int gs = c0 + s;
+                        ReadOnlySpan<float> ks = k.Slice((gs * hv + h) * d, d);
+                        double kdot = 0.0;
+                        for (int i = 0; i < d; i++) kdot += (double)ks[i] * kt[i];
+                        double a = bt * Math.Exp(cum[t] - cum[s]) * kdot;
+                        if (a == 0.0) continue;
+                        ReadOnlySpan<double> us = u.AsSpan(s * d, d);
+                        for (int j = 0; j < d; j++) ut[j] -= a * us[j];
+                    }
+                }
+
+                // ── Outputs: o_t = (g_t·S0ᵀq_t + Σ_{s≤t} r(t,s)·(k_sᵀq_t)·u_s)/√d ──
+                for (int t = 0; t < cN; t++)
+                {
+                    int gt = c0 + t;
+                    ReadOnlySpan<float> qt = q.Slice((gt * hv + h) * d, d);
+                    double gT = Math.Exp(cum[t]);
+
+                    // g_t · S0ᵀ q_t.
+                    for (int j = 0; j < d; j++) sq0[j] = 0.0;
+                    for (int i = 0; i < d; i++)
+                    {
+                        double qi = qt[i];
+                        if (qi == 0.0) continue;
+                        int rowBase = i * d;
+                        for (int j = 0; j < d; j++) sq0[j] += qi * S[rowBase + j];
+                    }
+
+                    Span<float> oh = output.Slice((gt * hv + h) * d, d);
+                    for (int j = 0; j < d; j++) oh[j] = (float)(gT * sq0[j]);
+
+                    // Intra-chunk causal contribution (s ≤ t, includes current token).
+                    for (int s = 0; s <= t; s++)
+                    {
+                        int gs = c0 + s;
+                        ReadOnlySpan<float> ks = k.Slice((gs * hv + h) * d, d);
+                        double kqdot = 0.0;
+                        for (int i = 0; i < d; i++) kqdot += (double)ks[i] * qt[i];
+                        double r = Math.Exp(cum[t] - cum[s]) * kqdot;
+                        if (r == 0.0) continue;
+                        ReadOnlySpan<double> us = u.AsSpan(s * d, d);
+                        for (int j = 0; j < d; j++) oh[j] += (float)(r * us[j]);
+                    }
+
+                    for (int j = 0; j < d; j++) oh[j] *= readoutScale;
+
+                    // Per-head RMSNorm with shared gain, then SiLU(z) gate — identical
+                    // to GdnStepInternal steps (6)-(7).
+                    double sumSq = 0.0;
+                    for (int j = 0; j < d; j++) { float ov = oh[j]; sumSq += (double)ov * ov; }
+                    float scale = 1.0f / MathF.Sqrt((float)(sumSq / d) + normEps);
+                    ReadOnlySpan<float> zt = z.Slice((gt * hv + h) * d, d);
+                    for (int j = 0; j < d; j++)
+                    {
+                        float normed = oh[j] * scale * normWeight[j];
+                        float zv = zt[j];
+                        float silu = zv / (1.0f + MathF.Exp(-zv));
+                        oh[j] = normed * silu;
+                    }
+                }
+
+                // ── Carry the state out of the chunk: ────────────────────────
+                //   S_new = g_{C-1}·S0 + Σ_s exp(cum_{C-1}−cum_s)·(k_s ⊗ u_s).
+                double cumLast = cum[cN - 1];
+                double gLast = Math.Exp(cumLast);
+                for (int idx = 0; idx < dd; idx++) S[idx] = (float)(gLast * S[idx]);
+                for (int s = 0; s < cN; s++)
+                {
+                    int gs = c0 + s;
+                    ReadOnlySpan<float> ks = k.Slice((gs * hv + h) * d, d);
+                    double r = Math.Exp(cumLast - cum[s]);
+                    ReadOnlySpan<double> us = u.AsSpan(s * d, d);
+                    for (int i = 0; i < d; i++)
+                    {
+                        double ri = r * ks[i];
+                        if (ri == 0.0) continue;
+                        int rowBase = i * d;
+                        for (int j = 0; j < d; j++) S[rowBase + j] += (float)(ri * us[j]);
+                    }
+                }
+            }
+        }
+    }
+
     private static void ValidateRecurrenceArgs(
         ReadOnlySpan<float> q, ReadOnlySpan<float> k, ReadOnlySpan<float> v,
         ReadOnlySpan<float> alphaIn, ReadOnlySpan<float> beta,
