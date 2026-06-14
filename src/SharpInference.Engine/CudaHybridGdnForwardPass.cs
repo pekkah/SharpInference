@@ -97,6 +97,22 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private readonly Tensor _gpuV;           // [numKvHeads * headDim] = 512
     private readonly Tensor _gpuAttnOut;     // [numHeads * headDim] = 4096
     private readonly Tensor _gpuAttnScratch; // attention scores spill scratch
+    // Flash-decoding split-KV (#238) for the GPU attention layers' per-token decode. Same
+    // mechanism as the dense/MoE-hybrid passes; null → single-block. GDN decode is GDN-scan +
+    // MoE dominated with only the attention layers' KV growing, so this is measurement-gated.
+    private Tensor? _splitKvPartialO;
+    private Tensor? _splitKvPartialMeta;
+    private readonly bool _splitDecodeEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_SPLIT_DECODE") != "0";
+    private readonly string? _splitGroupedMode =
+        Environment.GetEnvironmentVariable("SHARPI_SPLIT_DECODE_GROUPED");
+    // GDN attention is a smaller share than the MoE hybrid (only ~10 attention layers vs the GDN
+    // scan + MoE), so the split overhead amortizes only at genuinely long ctx. #238 GDN A/B
+    // (Qwen3.6-35B-A3B, bf16, 4070 Ti, CPU-page-cache-warm) showed a clean +19% at 16K; the 8K
+    // number was cold-cache-confounded (mmap'd CPU-MoE). Threshold conservatively at the
+    // clean-win region (8192) since with so few attention layers a moderate-ctx split risks the
+    // OLMoE-style overhead regression and 4096–8192 is unverified for this pass.
+    private const int GdnSplitMinSeq = 8192;
     private readonly Tensor _gpuRouterLogits;
     private readonly Tensor _gpuFfnGate;
     private readonly Tensor _gpuFfnUp;
@@ -772,6 +788,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // Attention scores scratch — only needed when ctx > 4096; otherwise placeholder.
         long scratchElems = _maxSeqLen > 4096 ? (long)_numHeads * _maxSeqLen : 1L;
         _gpuAttnScratch = gpu.Allocate(TensorShape.D1(scratchElems));
+        // Flash-decoding split-KV partials (#238) — allocate when ctx is long enough and within the
+        // combine kernel's split bound. Uniform head_dim (no per-layer), so size at _headDim.
+        if (_splitDecodeEnabled
+            && _maxSeqLen > GdnSplitMinSeq && _maxSeqLen <= CudaForwardPass.SplitKvMaxCtx)
+        {
+            long nSplitsMax = (_maxSeqLen + CudaBackend.SplitKvChunk - 1) / CudaBackend.SplitKvChunk;
+            _splitKvPartialO = gpu.Allocate(TensorShape.D1((long)_numHeads * nSplitsMax * _headDim));
+            _splitKvPartialMeta = gpu.Allocate(TensorShape.D1((long)_numHeads * nSplitsMax * 2));
+        }
         // MoE-only GPU scratch: router logits, expert intermediate buffers, shared
         // expert output. For dense FFN (qwen35 27B-MTP) these are unused and
         // _numExperts=_expertDim=0, so skip allocation entirely. Fields are
@@ -3800,22 +3825,29 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // logical prompt length — same +1 invariant. BatchForward2 passes
         // kvPosition = startPos[+1] for two sequential appends within one call.
         if (_kvDType == DType.BFloat16)
+            _gpu.KvAppendBf16(_gpuK, _gpuV, _gpuKCache[layer]!, _gpuVCache[layer]!, kvDim, kvPosition, _maxSeqLen);
+        else
+            _gpu.KvAppend(_gpuK, _gpuV, _gpuKCache[layer]!, _gpuVCache[layer]!, kvDim, kvPosition, _maxSeqLen);
+
+        int seqLen = kvPosition + 1;
+        // Flash-decoding split-KV (#238) at long ctx; else the single-block kernel. Mirrors the
+        // dense/MoE-hybrid gate (incl. the #237 grouped auto-select).
+        if (_splitKvPartialO is { } splitO && _splitKvPartialMeta is { } splitMeta
+            && seqLen > GdnSplitMinSeq)
         {
-            _gpu.KvAppendBf16(_gpuK, _gpuV, _gpuKCache[layer]!, _gpuVCache[layer]!,
-                kvDim, kvPosition, _maxSeqLen);
+            bool grouped = CudaForwardPass.ShouldUseGroupedSplit(_splitGroupedMode, _kvDType, _numHeads, _numKvHeads, seqLen);
+            _gpu.AttentionSplitKv(_gpuQ, _gpuKCache[layer]!, _gpuVCache[layer]!, _gpuAttnOut, splitO, splitMeta,
+                _kvDType, _numHeads, _numKvHeads, _headDim, seqLen, _maxSeqLen, attnScale: -1f, grouped: grouped);
+        }
+        else if (_kvDType == DType.BFloat16)
+        {
             _gpu.AttentionBf16(_gpuQ, _gpuKCache[layer]!, _gpuVCache[layer]!, _gpuAttnOut,
-                _gpuAttnScratch,
-                _numHeads, _numKvHeads, _headDim,
-                (kvPosition + 1), _maxSeqLen);
+                _gpuAttnScratch, _numHeads, _numKvHeads, _headDim, seqLen, _maxSeqLen);
         }
         else
         {
-            _gpu.KvAppend(_gpuK, _gpuV, _gpuKCache[layer]!, _gpuVCache[layer]!,
-                kvDim, kvPosition, _maxSeqLen);
             _gpu.Attention(_gpuQ, _gpuKCache[layer]!, _gpuVCache[layer]!, _gpuAttnOut,
-                _gpuAttnScratch,
-                _numHeads, _numKvHeads, _headDim,
-                (kvPosition + 1), _maxSeqLen);
+                _gpuAttnScratch, _numHeads, _numKvHeads, _headDim, seqLen, _maxSeqLen);
         }
 
         _gpu.SigmoidMulInPlace(_gpuAttnOut, _gpuGate);
@@ -5645,6 +5677,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpu.Free(_gpuV);
         _gpu.Free(_gpuAttnOut);
         _gpu.Free(_gpuAttnScratch);
+        if (_splitKvPartialO is { } spo) _gpu.Free(spo);
+        if (_splitKvPartialMeta is { } spm) _gpu.Free(spm);
         if (_hp.IsMoE)
         {
             _gpu.Free(_gpuRouterLogits);
