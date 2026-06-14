@@ -23,6 +23,7 @@
     <Project Path="src/SharpInference.Vulkan/SharpInference.Vulkan.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/SharpInference.Tests.Cli/SharpInference.Tests.Cli.csproj" />
     <Project Path="tests/SharpInference.Tests.Core/SharpInference.Tests.Core.csproj" />
     <Project Path="tests/SharpInference.Tests.ForwardPass/SharpInference.Tests.ForwardPass.csproj" />
     <Project Path="tests/SharpInference.Tests.Pipeline/SharpInference.Tests.Pipeline.csproj" />

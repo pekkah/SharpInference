@@ -244,6 +244,8 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                         //   -g 0                       → CPU only
                         //   default (-1)               → CUDA → Vulkan → CPU fallback
                         string backendChoice = (s.Backend ?? "auto").ToLowerInvariant();
+                        if (deviceNone && (backendChoice is "cuda" or "vulkan"))
+                            AnsiConsole.MarkupLine("[yellow]Note:[/] --device none overrides --backend; running on CPU.");
                         bool forceCpu    = s.NGpuLayers == 0 || backendChoice == "cpu" || deviceNone;
                         bool forceCuda   = backendChoice == "cuda";
                         bool forceVulkan = backendChoice == "vulkan";
@@ -264,7 +266,9 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                                     vulkan.PrintDeviceInfo();
                                     AnsiConsole.MarkupLine("[dim]Backend:[/]  GPU (Vulkan SGEMM)");
                                 }
-                                catch
+                                // Only auto-select (deviceIndex < 0) silently falls back to CPU.
+                                // An explicit --device must surface its error, not vanish into a CPU run.
+                                catch when (deviceIndex < 0)
                                 {
                                     AnsiConsole.MarkupLine("[dim]Backend:[/]  CPU (no GPU detected)");
                                 }
@@ -294,9 +298,9 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                                     upscalerBackend = upscalerGpu;
                                     AnsiConsole.MarkupLine("[dim]Upscaler backend:[/] GPU (Vulkan, native kernels)");
                                 }
-                                catch
+                                catch when (deviceIndex < 0)
                                 {
-                                    upscalerBackend = gpu; // fallback: SGEMM on main backend
+                                    upscalerBackend = gpu; // auto only: fall back to SGEMM on main backend
                                 }
                             }
                             upscaler = RRDBNet.Load(s.UpscalerPath, upscalerBackend);
@@ -424,7 +428,9 @@ public sealed class ImageCommand : Command<ImageCommand.Settings>
                                     upscalerGpu = new VulkanBackend(deviceIndex);
                                     AnsiConsole.MarkupLine("[dim]Upscaler backend:[/] GPU (Vulkan, native kernels)");
                                 }
-                                catch
+                                // An explicit --device error propagates to the outer handler (surfaced,
+                                // not swallowed into a wrong-device or silent-CPU fallback).
+                                catch when (deviceIndex < 0)
                                 {
                                     try
                                     {

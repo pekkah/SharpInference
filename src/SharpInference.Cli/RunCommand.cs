@@ -237,6 +237,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(ex.Message)}");
             return 1;
         }
+        if (deviceNone && settings.NGpuLayers != 0)
+            AnsiConsole.MarkupLine("[yellow]Note:[/] --device none overrides --ngl/-g; running on CPU.");
         int effNGpuLayers = deviceNone ? 0 : settings.NGpuLayers;
 
         // MoE expert-cache knobs are read from the environment inside the engine

@@ -52,4 +52,8 @@
     <None Include="README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="SharpInference.Tests.Cli" />
+  </ItemGroup>
+
 </Project>
