@@ -476,6 +476,86 @@ public sealed class GdnKernelsTests
         AssertClose(stateSeq, stateChunk, "state", relTol: 3e-3f, absTol: 3e-3f);
     }
 
+    [Fact]
+    public void GdnBlockBatched_MatchesPerTokenBlock()
+    {
+        // End-to-end validation of the *batched GDN block* — the exact stage chain
+        // HybridGdnForwardPass runs per token, but driven over a whole prompt at once:
+        //   conv1d → SiLU → split Q|K|V → per-K-head L2norm → tile K→V heads → recurrence.
+        // The chunked path (conv1d-prefill + GdnRecurrenceChunkedPrefill) must match
+        // N× the per-token path (conv1d-decode + GdnRecurrenceDecode). This is the
+        // load-bearing correctness claim for wiring the chunked kernel into prefill.
+        const int tokens = 40;
+        const int numKHeads = 2, numVHeads = 4, headDim = 8, kvRepeat = 2;
+        const int keyDim = numKHeads * headDim;      // 16
+        const int valueDim = numVHeads * headDim;    // 32
+        const int convCh = 2 * keyDim + valueDim;    // 64 (Q‖K‖V joint conv stream)
+        const int convKernel = 4;
+
+        var rng = new Random(0x6D6E);
+        float[] qkvMixed = RandomArray(rng, tokens * convCh, -0.5f, 0.5f);   // post-QKV-proj conv input
+        float[] convW = RandomArray(rng, convKernel * convCh, -0.3f, 0.3f);
+        float[] alpha = RandomArray(rng, tokens * numVHeads, -1f, 1f);
+        float[] beta = RandomArray(rng, tokens * numVHeads, -1f, 1f);
+        float[] ssmA = RandomArray(rng, numVHeads, -0.5f, -0.05f);
+        float[] dtBias = RandomArray(rng, numVHeads, -0.2f, 0.2f);
+        float[] normW = RandomArray(rng, headDim, 0.5f, 1.5f);
+        float[] z = RandomArray(rng, tokens * valueDim, -1f, 1f);
+
+        // ── Per-token reference path ─────────────────────────────────────
+        float[] outSeq = new float[tokens * valueDim];
+        {
+            float[] convState = new float[(convKernel - 1) * convCh];
+            float[] scanState = new float[numVHeads * headDim * headDim];
+            float[] conv = new float[convCh];
+            float[] qV = new float[valueDim], kV = new float[valueDim];
+            for (int t = 0; t < tokens; t++)
+            {
+                GdnKernels.CausalDepthwiseConv1dDecode(
+                    qkvMixed.AsSpan(t * convCh, convCh), convState, convW, conv, convCh, convKernel);
+                GdnKernels.SiLu(conv, conv);
+                var qPre = conv.AsSpan(0, keyDim);
+                var kPre = conv.AsSpan(keyDim, keyDim);
+                var vV = conv.AsSpan(2 * keyDim, valueDim);
+                GdnKernels.L2NormPerHead(qPre, numKHeads, headDim);
+                GdnKernels.L2NormPerHead(kPre, numKHeads, headDim);
+                GdnKernels.TileHeads(qPre, qV, numKHeads, kvRepeat, headDim);
+                GdnKernels.TileHeads(kPre, kV, numKHeads, kvRepeat, headDim);
+                GdnKernels.GdnRecurrenceDecode(qV, kV, vV,
+                    alpha.AsSpan(t * numVHeads, numVHeads), beta.AsSpan(t * numVHeads, numVHeads),
+                    ssmA, dtBias, normW, z.AsSpan(t * valueDim, valueDim),
+                    scanState, outSeq.AsSpan(t * valueDim, valueDim), numVHeads, headDim);
+            }
+        }
+
+        // ── Batched path: conv1d-prefill, per-token split/norm/tile, chunked recurrence ──
+        float[] outChunk = new float[tokens * valueDim];
+        {
+            float[] convState = new float[(convKernel - 1) * convCh];
+            float[] scanState = new float[numVHeads * headDim * headDim];
+            float[] conv = new float[tokens * convCh];
+            GdnKernels.CausalDepthwiseConv1dPrefill(qkvMixed, convState, convW, conv, tokens, convCh, convKernel);
+            GdnKernels.SiLu(conv, conv);
+
+            float[] qV = new float[tokens * valueDim], kV = new float[tokens * valueDim], vV = new float[tokens * valueDim];
+            for (int t = 0; t < tokens; t++)
+            {
+                var qPre = conv.AsSpan(t * convCh, keyDim);
+                var kPre = conv.AsSpan(t * convCh + keyDim, keyDim);
+                conv.AsSpan(t * convCh + 2 * keyDim, valueDim).CopyTo(vV.AsSpan(t * valueDim, valueDim));
+                GdnKernels.L2NormPerHead(qPre, numKHeads, headDim);
+                GdnKernels.L2NormPerHead(kPre, numKHeads, headDim);
+                GdnKernels.TileHeads(qPre, qV.AsSpan(t * valueDim, valueDim), numKHeads, kvRepeat, headDim);
+                GdnKernels.TileHeads(kPre, kV.AsSpan(t * valueDim, valueDim), numKHeads, kvRepeat, headDim);
+            }
+
+            GdnKernels.GdnRecurrenceChunkedPrefill(tokens, qV, kV, vV, alpha, beta, ssmA, dtBias, normW, z,
+                scanState, outChunk, numVHeads, headDim, chunkSize: 16);
+        }
+
+        AssertClose(outSeq, outChunk, "gdn-block-out", relTol: 3e-3f, absTol: 3e-3f);
+    }
+
     private static void AssertClose(float[] expected, float[] actual, string what, float relTol, float absTol)
     {
         Assert.Equal(expected.Length, actual.Length);
