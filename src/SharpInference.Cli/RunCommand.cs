@@ -79,10 +79,15 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [DefaultValue(false)]
         public bool VerbosePrompt { get; init; }
 
-        [CommandOption("--n-gpu-layers|-g")]
-        [Description("Layers on GPU (0=CPU only, -1=all, default: 0)")]
+        [CommandOption("--ngl|--n-gpu-layers|--gpu-layers|-g")]
+        [Description("Layers on GPU (0=CPU only, -1=all, default: 0). Mirrors llama.cpp's --n-gpu-layers/--ngl.")]
         [DefaultValue(0)]
         public int NGpuLayers { get; init; }
+
+        [CommandOption("--device")]
+        [Description("GPU device to offload to: index (0,1,…), name (CUDA0, Vulkan1), or 'none' for CPU. " +
+            "Default: auto. Single-device only (no multi-GPU split). Mirrors llama.cpp's --device.")]
+        public string? Device { get; init; }
 
         [CommandOption("-c|--ctx-size")]
         [Description("Context size / max sequence length (0 = model default)")]
@@ -98,8 +103,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [Description("KV-cache element type for the CUDA backend: fp32 (default), bf16 (half the KV VRAM → ~2x context), or q8_0 (quarter → ~4x). Like llama.cpp --cache-type-k/v. Env: SHARPI_KV_DTYPE.")]
         public string? KvType { get; init; }
 
-        [CommandOption("--draft-model")]
-        [Description("Path to a smaller draft model for speculative decoding (greedy only, requires --temp 0)")]
+        [CommandOption("--model-draft|--draft-model")]
+        [Description("Path to a smaller draft model for speculative decoding (greedy only, requires --temp 0). Mirrors llama.cpp's --model-draft.")]
         public string? DraftModelPath { get; init; }
 
         [CommandOption("--spec-lookahead|--draft-tokens")]
@@ -142,8 +147,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [DefaultValue(long.MinValue)]
         public long PrefillDequantCacheMb { get; init; }
 
-        [CommandOption("--rep-penalty")]
-        [Description("Repetition penalty (1.0 = disabled, >1.0 penalizes repeated tokens, default: 1.1)")]
+        [CommandOption("--repeat-penalty|--rep-penalty")]
+        [Description("Repetition penalty (1.0 = disabled, >1.0 penalizes repeated tokens, default: 1.1). Mirrors llama.cpp's --repeat-penalty.")]
         [DefaultValue(1.1f)]
         public float RepPenalty { get; init; }
 
@@ -217,6 +222,24 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         if (settings.MinBatchBlas > 0)
             SimdKernels.MinBatchForBlas = settings.MinBatchBlas;
+
+        // Resolve --device before any GPU call (it may set CUDA_VISIBLE_DEVICES, which the CUDA
+        // driver only reads at first init; Vulkan takes the index explicitly below). `--device none`
+        // forces the CPU path, overriding --n-gpu-layers.
+        int gpuDeviceIndex;
+        bool deviceNone;
+        try
+        {
+            gpuDeviceIndex = GpuDevice.Resolve(settings.Device, out deviceNone);
+        }
+        catch (InvalidOperationException ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(ex.Message)}");
+            return 1;
+        }
+        if (deviceNone && settings.NGpuLayers != 0)
+            AnsiConsole.MarkupLine("[yellow]Note:[/] --device none overrides --ngl/-g; running on CPU.");
+        int effNGpuLayers = deviceNone ? 0 : settings.NGpuLayers;
 
         // MoE expert-cache knobs are read from the environment inside the engine
         // (WarmPinConfig / HybridForwardPass / slot-manager dispose). Surface them as
@@ -322,7 +345,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         // chosen forward pass ships an MTP head. The actual MTP gating happens later in
         // RunSinglePrompt / RunInteractive based on sp.SpecType.
         IForwardPass? mtpFwd = null;
-        if (hp.IsHybridSsm && settings.NGpuLayers == 0)
+        if (hp.IsHybridSsm && effNGpuLayers == 0)
         {
             hybridFwd = new HybridGdnForwardPass(model, cpuBackend, hp);
             if (hybridFwd.HasMtpHead) mtpFwd = hybridFwd;
@@ -331,7 +354,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         {
             // #189 dequant cache: only the pure-CPU path (no GPU offload) runs the batched
             // CPU prefill that consults it; under -g it would be a wasted F32 model copy.
-            long dequantBytes = settings.NGpuLayers != 0
+            long dequantBytes = effNGpuLayers != 0
                 ? 0
                 : settings.PrefillDequantCacheMb == long.MinValue
                     ? long.MinValue // auto / SHARPI_PREFILL_DEQUANT_MB
@@ -358,7 +381,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             }
         }
 
-        int nGpuLayers = settings.NGpuLayers;
+        int nGpuLayers = effNGpuLayers;
 
         // Issue #2 (MoE on hybrid GPU+CPU produced NaN/garbled output) was resolved by
         // fixing the descriptor-set reuse hazard in ComputePipeline.RecordWith.
@@ -591,7 +614,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 return 1;
             }
 
-            var gpu = new VulkanBackend();
+            var gpu = new VulkanBackend(gpuDeviceIndex);
             gpuBackend = gpu;
             try
             {
@@ -640,8 +663,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     // Hybrid: N layers GPU, rest CPU
                     var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant,
                         requestedCtxSize: ctxSize);
-                    // Override with explicit -g N if user specified it
-                    if (settings.NGpuLayers > 0)
+                    // Override with explicit -g/--ngl N if user specified it
+                    if (effNGpuLayers > 0)
                         placement = placement with { GpuLayers = nGpuLayers, CpuLayers = hp.NumLayers - nGpuLayers };
 
                     var hfwd = new HybridForwardPass(model, gpu, hp, placement, settings.TurboQuant);
