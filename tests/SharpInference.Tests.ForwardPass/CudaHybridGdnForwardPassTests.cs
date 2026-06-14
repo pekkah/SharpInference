@@ -432,4 +432,97 @@ public sealed class CudaHybridGdnForwardPassTests
         Array.Copy(sorted, topK, K);
         return (top1, topK);
     }
+
+    /// <summary>
+    /// Flash-decoding split-KV parity on the GDN hybrid pass (#238). The ~10 GPU attention
+    /// layers' per-token decode (GpuAttnBlockAt) switches to the split-KV + combine path above
+    /// the GDN threshold (8192). This confirms the GDN wiring is correct: a &gt;8192-token prompt
+    /// puts every decode step on the split path, and the single-block run (split off) is the
+    /// reference. Argmax-stable, not bit-identical (the combine reorders the reduction; the GDN
+    /// stack also carries its usual ~1e-3/layer Q8_1 noise over 40 layers, so the max-abs bound is
+    /// a blow-up ceiling and top-5 stability is the hard gate). Slow (22 GB model + &gt;8K GDN
+    /// prefill ×2); skips when the model isn't on disk.
+    /// </summary>
+    [Fact]
+    public void CudaHybridGdnForwardPass_SplitKv_MatchesSingleBlock()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindHybridModelPath();
+        if (path is null) return;
+
+        const int steps = 4;
+        const int ctx = 9216;          // > the 8192 GDN split threshold
+        const int promptLen = 8300;    // every decode step lands at seqLen > 8192 → split path
+        const float maxAbsCeiling = 10.0f;
+
+        (float[][] logits, int[] argmax) RunGdn(string split, int[]? forced)
+        {
+            var pKv = Environment.GetEnvironmentVariable("SHARPI_KV_DTYPE");
+            var pMoe = Environment.GetEnvironmentVariable("SHARPI_CPU_MOE");
+            var pSp = Environment.GetEnvironmentVariable("SHARPI_SPLIT_DECODE");
+            Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", "bf16");
+            Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", "1");
+            Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE", split);
+            try
+            {
+                using var model = GgufModel.Open(path);
+                var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+                var tok = GgufTokenizer.FromGgufModel(model);
+                int useCtx = Math.Min(hp.ContextLength, ctx);
+                var placement = new LayerPlacement(GpuLayers: hp.NumLayers, CpuLayers: 0,
+                    GpuWeightBytes: 0, GpuKvBytes: 0, RecommendedCtxSize: useCtx);
+                using var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
+                var sb = new System.Text.StringBuilder();
+                const string seed = "The quick brown fox jumps over the lazy dog. Sphinx of black quartz. ";
+                while (tok.Encode(sb.ToString()).Count < promptLen) sb.Append(seed);
+                var tokens = tok.Encode(sb.ToString()).ToArray();
+                var perPos = new float[steps + 1][];
+                var argmax = new int[steps + 1];
+                perPos[0] = fwd.Prefill(tokens).ToArray();
+                argmax[0] = Sampler.Greedy(perPos[0]);
+                for (int i = 0; i < steps; i++)
+                {
+                    int fed = forced is not null ? forced[i] : argmax[i];
+                    perPos[i + 1] = fwd.Forward(fed, tokens.Length + i).ToArray();
+                    argmax[i + 1] = Sampler.Greedy(perPos[i + 1]);
+                }
+                return (perPos, argmax);
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", pKv);
+                Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", pMoe);
+                Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE", pSp);
+            }
+        }
+
+        var (single, singleArgmax) = RunGdn("0", forced: null);
+        var (split, _) = RunGdn("1", forced: singleArgmax);
+
+        for (int p = 0; p <= steps; p++)
+        {
+            Assert.Equal(single[p].Length, split[p].Length);
+            float maxAbs = 0f;
+            for (int i = 0; i < single[p].Length; i++)
+            {
+                Assert.True(float.IsFinite(split[p][i]), $"non-finite split logit at pos {p}, idx {i}.");
+                maxAbs = Math.Max(maxAbs, Math.Abs(single[p][i] - split[p][i]));
+            }
+            Assert.True(TopK(split[p], 5).Contains(singleArgmax[p]),
+                $"pos {p} single-block top-1 ({singleArgmax[p]}) fell out of GDN split's top-5 (max-abs {maxAbs:F4}).");
+            Assert.True(maxAbs < maxAbsCeiling,
+                $"pos {p} GDN split-vs-single max-abs {maxAbs:F4} exceeds the blow-up ceiling {maxAbsCeiling:F1}.");
+        }
+    }
+
+    private static HashSet<int> TopK(float[] v, int k)
+    {
+        var idx = new int[v.Length];
+        for (int i = 0; i < v.Length; i++) idx[i] = i;
+        Array.Sort(idx, (a, b) => v[b].CompareTo(v[a]));
+        var set = new HashSet<int>(k);
+        for (int i = 0; i < k && i < idx.Length; i++) set.Add(idx[i]);
+        return set;
+    }
 }
