@@ -6021,11 +6021,12 @@ extern ""C"" __global__ void llm_flash_attn_prefill_tc(
 
 // ── Multi-warp / d-split tensor-core flash-attention prefill (issue #147) ───
 // Fixes the single-warp llm_flash_attn_prefill_tc occupancy limit (1 warp/block +
-// 48 KB shared → ~2 warps/SM). Here a block is W warps that cooperate on ONE
-// 16-query tile, splitting the head dim: warp w owns output columns [w·dW, …) with
-// dW = head_dim/W, so O[16×dW] stays REGISTER-resident (16×128 = 64 regs/lane at
-// d=512,W=4) instead of in shared — no per-key-tile shared-O rescale traffic, and
-// the freed shared lets occupancy rise to ~16-20 warps/SM. Each warp computes a
+// 48 KB shared → ~2 warps/SM, measured on RTX 4070 Ti / Ada). Here a block is W
+// warps that cooperate on ONE 16-query tile, splitting the head dim: warp w owns
+// output columns [w·dW, …) with dW = head_dim/W, so O[16×dW] stays REGISTER-resident
+// (16×128 = 64 regs/lane at d=512,W=4) instead of in shared — no per-key-tile
+// shared-O rescale traffic, and the freed shared lets occupancy rise to ~16-20
+// warps/SM (RTX 4070 Ti / Ada). Each warp computes a
 // PARTIAL QK^T over its d-slice; the partials are summed across warps through a
 // small shared S buffer ([W×16×16] fp32), after which every warp holds the full
 // reduced score tile in its C-fragment and proceeds exactly like the single-warp
