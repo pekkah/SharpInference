@@ -48,7 +48,7 @@ public sealed unsafe class CudaDequantRowsTests
                 bytes[off + 0] = (byte)(dHalf & 0xFF);
                 bytes[off + 1] = (byte)(dHalf >> 8);
                 for (int i = 0; i < 32; i++)
-                    bytes[off + 2 + i] = (byte)(sbyte)(rng.Next(255) - 127);
+                    bytes[off + 2 + i] = (byte)(sbyte)(rng.Next(256) - 128);   // full int8 range incl. -128
             }
         return bytes;
     }

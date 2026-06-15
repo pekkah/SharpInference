@@ -2778,6 +2778,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
             // memcpy per row (no FP work), reading the same table bytes the CPU dequant
             // touched but skipping the dequant math and shrinking the upload 4× (packed
             // quant bytes vs f32). The dequant itself then runs on the GPU.
+            // N ≤ PrefillBatchChunk (4096) and bpr ≤ ~11 KB, so N*bpr (~47 MB) stays well
+            // within int — the int offsets below don't overflow at the chunk cap.
             int bpr = _pleBytesPerRow;
             var qhost = _bpPleQuantHost!;
             System.Threading.Tasks.Parallel.For(0, N, i =>
