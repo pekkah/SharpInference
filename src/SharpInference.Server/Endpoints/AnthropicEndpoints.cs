@@ -3,6 +3,8 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SharpInference.Core;
 using SharpInference.Engine;
@@ -111,17 +113,6 @@ public static class AnthropicEndpoints
             ctx.Response.ContentType = "application/json";
             await ctx.Response.WriteAsync(
                 JsonSerializer.Serialize(new AErrorResponse("invalid_request_error", ex.Message),
-                    SharpInferenceJsonContext.Default.AErrorResponse), ctx.RequestAborted);
-            return;
-        }
-
-        if (images.Count > ImageContent.MaxImagesPerRequest)
-        {
-            ctx.Response.StatusCode = 400;
-            ctx.Response.ContentType = "application/json";
-            await ctx.Response.WriteAsync(
-                JsonSerializer.Serialize(new AErrorResponse("invalid_request_error",
-                        $"too many images in one request ({images.Count}; max {ImageContent.MaxImagesPerRequest})."),
                     SharpInferenceJsonContext.Default.AErrorResponse), ctx.RequestAborted);
             return;
         }
@@ -446,7 +437,11 @@ public static class AnthropicEndpoints
             // SSE response already committed (message_start sent) — status can't change. Swallow so
             // the finally + message_delta/message_stop terminate the stream cleanly instead of the
             // TCP connection resetting mid-stream. Common image errors are rejected at parse (400).
-            _ = ex;
+            // Log it — otherwise a genuine mid-stream failure is invisible (the client sees a clean
+            // end_turn with truncated text).
+            ctx.RequestServices.GetService<ILoggerFactory>()?
+                .CreateLogger("SharpInference.Server.Endpoints")
+                .LogError(ex, "Generation failed after the streaming response was committed; the SSE stream is terminated without an error frame.");
         }
         finally
         {
@@ -620,6 +615,7 @@ public static class AnthropicEndpoints
             }
             else if (type == "image")
             {
+                ImageContent.CheckCap(images.Count);
                 images.Add(ParseAnthropicImageBlock(block));
                 sb.Append(ImageContent.Placeholder);
             }
@@ -726,6 +722,7 @@ public static class AnthropicEndpoints
                         else if (type == "image")
                         {
                             // Issue #253: decode + collect the image, emit a placeholder inline.
+                            ImageContent.CheckCap(images.Count);
                             images.Add(ParseAnthropicImageBlock(block));
                             textSb.Append(ImageContent.Placeholder);
                         }

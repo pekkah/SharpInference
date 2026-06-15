@@ -26,6 +26,17 @@ internal static class ImageContent
     public const int MaxImagesPerRequest = 16;
 
     /// <summary>
+    /// Throws if the running image count has reached the per-request cap. Called BEFORE decoding
+    /// the next image so an over-cap request is rejected without paying to decode every block in it.
+    /// </summary>
+    public static void CheckCap(int currentImageCount)
+    {
+        if (currentImageCount >= MaxImagesPerRequest)
+            throw new ImageContentException(
+                $"too many images in one request (max {MaxImagesPerRequest}).");
+    }
+
+    /// <summary>
     /// Routes to the image-aware generate when images are present, else the text path (#253).
     /// Shared by the OpenAI and Anthropic endpoints — pure engine-level dispatch with no
     /// wire-format dependency, so it lives here rather than being copied into each endpoint.
@@ -78,7 +89,10 @@ internal static class ImageContent
         {
             _ = ImageIO.LoadRgb(new MemoryStream(bytes, writable: false), out _, out _);
         }
-        catch (Exception ex) when (ex is InvalidDataException or NotSupportedException)
+        // ImageIO throws InvalidDataException/NotSupportedException by contract, but a crafted
+        // payload can still trip an IndexOutOfRange/Argument/InvalidOperation deep in the decoder.
+        // Map every decode failure to a clean 400 — only truly fatal conditions (OOM, etc.) escape.
+        catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
         {
             throw new ImageContentException($"unsupported or corrupt image: {ex.Message}");
         }

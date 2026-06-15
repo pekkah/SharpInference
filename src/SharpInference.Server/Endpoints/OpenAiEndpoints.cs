@@ -4,6 +4,8 @@ using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SharpInference.Core;
 using SharpInference.Engine;
@@ -108,17 +110,6 @@ public static class OpenAiEndpoints
             ctx.Response.ContentType = "application/json";
             await ctx.Response.WriteAsync(
                 JsonSerializer.Serialize(new ErrorResponse("invalid_request_error", ex.Message),
-                    SharpInferenceJsonContext.Default.ErrorResponse), ctx.RequestAborted);
-            return;
-        }
-
-        if (images.Count > ImageContent.MaxImagesPerRequest)
-        {
-            ctx.Response.StatusCode = 400;
-            ctx.Response.ContentType = "application/json";
-            await ctx.Response.WriteAsync(
-                JsonSerializer.Serialize(new ErrorResponse("invalid_request_error",
-                        $"too many images in one request ({images.Count}; max {ImageContent.MaxImagesPerRequest})."),
                     SharpInferenceJsonContext.Default.ErrorResponse), ctx.RequestAborted);
             return;
         }
@@ -408,7 +399,11 @@ public static class OpenAiEndpoints
             // The SSE response is already committed (200 + role delta), so the status can't change.
             // Swallow so the finally + final chunk terminate the stream cleanly instead of the TCP
             // connection being reset mid-stream. Common image errors are rejected at parse time (400).
-            _ = ex;
+            // Log it — otherwise a genuine mid-stream failure is invisible (the client sees a clean
+            // finish_reason "stop" with truncated text).
+            ctx.RequestServices.GetService<ILoggerFactory>()?
+                .CreateLogger("SharpInference.Server.Endpoints")
+                .LogError(ex, "Generation failed after the streaming response was committed; the SSE stream is terminated without an error frame.");
         }
         finally
         {
@@ -510,6 +505,7 @@ public static class OpenAiEndpoints
                         : iu.ValueKind == JsonValueKind.Object && iu.TryGetProperty("url", out var u) ? u.GetString() ?? "" : "";
                 if (string.IsNullOrEmpty(url))
                     throw new ImageContentException($"{type} content part is missing a base64 'image_url'.");
+                ImageContent.CheckCap(images.Count);
                 images.Add(ImageContent.FromDataUrl(url));
                 sb.Append(ImageContent.Placeholder);
             }

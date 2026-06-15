@@ -51,6 +51,11 @@ public static class ImageIO
             switch (type)
             {
                 case "IHDR":
+                    // IHDR is always exactly 13 bytes; the fields below read png[dataOff+8..12].
+                    // A shorter declared length (clen < 13) would read past this chunk — when the
+                    // chunk is the last bytes in the buffer that is an out-of-bounds read. Reject it.
+                    if (clen < 13)
+                        throw new InvalidDataException($"PNG IHDR chunk too short: {clen} bytes (need 13).");
                     w = ReadUInt32BE(png, dataOff);
                     h = ReadUInt32BE(png, dataOff + 4);
                     bitDepth = png[dataOff + 8];
