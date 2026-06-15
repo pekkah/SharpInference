@@ -461,45 +461,11 @@ public sealed unsafe class HybridForwardPass : IForwardPass
 
         _cpuKvCache = new KvCache(_nCpuLayers, _maxSeqLen, _numKvHeads, _headDim);
 
-        // Pre-fault mmap pages for CPU layers: touch the first byte of each weight tensor
-        // to ensure OS pages them into RAM before the first forward pass.
-        if (_nCpuLayers > 0)
-        {
-            Console.Error.Write($"[HybridForwardPass] Pre-faulting CPU weight pages...");
-            long touchSum = 0;
-            IEnumerable<CpuWeightRef> weightsToTouch = _cpuWq.Concat(_cpuWk).Concat(_cpuWv).Concat(_cpuWo);
-            if (_isMoE)
-            {
-                weightsToTouch = weightsToTouch
-                    .Concat(_cpuWGateInp!)
-                    .Concat(_cpuWGateExps!)
-                    .Concat(_cpuWUpExps!)
-                    .Concat(_cpuWDownExps!);
-                if (_hasSharedExpert)
-                {
-                    weightsToTouch = weightsToTouch
-                        .Concat(_cpuWGateShexp!)
-                        .Concat(_cpuWUpShexp!)
-                        .Concat(_cpuWDownShexp!);
-                }
-            }
-            else
-            {
-                weightsToTouch = weightsToTouch
-                    .Concat(_cpuWGate)
-                    .Concat(_cpuWUp)
-                    .Concat(_cpuWDown);
-            }
-
-            foreach (var wRef in weightsToTouch)
-            {
-                // Touch first and last cache line of each weight tensor
-                touchSum += wRef.DataPtr[0];
-                long size = wRef.Info.ByteSize;
-                if (size > 64) touchSum += wRef.DataPtr[size - 1];
-            }
-            Console.Error.WriteLine($" done. (touch={touchSum})");
-        }
+        // Pre-fault every CPU-resident mmap weight page so the first request doesn't
+        // stall on demand paging (issue #221). The CPU embedding/output tensors are
+        // resolved even on a pure-GPU split (CPU embed lookup / lm_head), so the sweep
+        // is not gated on _nCpuLayers > 0. MmapPrefault honours SHARPI_PREFAULT.
+        MmapPrefault.Run("HybridForwardPass", BuildCpuPrefaultRegions());
 
         if (_tqEnabled && _nCpuLayers > 0)
         {
@@ -1163,6 +1129,59 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         var info = _model.FindTensor(name)
             ?? throw new InvalidOperationException($"Missing tensor: {name}");
         return new CpuWeightRef(name, info, info.DType, _model.GetTensorDataPtr(info));
+    }
+
+    /// <summary>Collect every CPU-resident mmap weight region for the issue #221
+    /// pre-fault sweep: the CPU embedding/output tensors plus the per-CPU-layer
+    /// attention/FFN weights (dense or MoE + shared experts). Biases and QK-norms are
+    /// excluded — they're dequantized into separate buffers, not read from the mmap.</summary>
+    private List<(nint Ptr, long Bytes)> BuildCpuPrefaultRegions()
+    {
+        var regions = new List<(nint, long)>();
+        void Add1(CpuWeightRef w)
+        {
+            if (w.DataPtr != null) regions.Add(((nint)w.DataPtr, w.Info.ByteSize));
+        }
+        void Add(CpuWeightRef[]? arr)
+        {
+            if (arr is null) return;
+            foreach (var w in arr) Add1(w);
+        }
+
+        // Embedding/output mmap refs are read at inference only when they're NOT
+        // uploaded to VRAM (_gpu* null == cpuEmbeddingOutputOnly). Skipping the
+        // GiB-scale token_embd when it lives on the GPU avoids a large pointless read.
+        if (_gpuEmbedding is null) Add1(_cpuEmbedding);
+        if (_gpuOutputWeight is null)
+        {
+            Add1(_cpuOutputNorm);
+            if (_cpuOutputWeight.DataPtr != _cpuEmbedding.DataPtr) Add1(_cpuOutputWeight); // tied weights alias
+        }
+
+        Add(_cpuAttnNorm); Add(_cpuWq); Add(_cpuWk); Add(_cpuWv); Add(_cpuWo); Add(_cpuFfnNorm);
+
+        if (_isMoE)
+        {
+            Add(_cpuWGateInp); Add(_cpuWGateExps); Add(_cpuWUpExps); Add(_cpuWDownExps);
+            if (_hasSharedExpert) { Add(_cpuWGateShexp); Add(_cpuWUpShexp); Add(_cpuWDownShexp); }
+
+            // GPU-trunk routed experts live in the GPU SLRU cache, but every cache miss
+            // spills to GpuMoeFfnCpuFallback, which reads blk.{0..nGpu-1}.ffn_*_exps
+            // straight from the mmap on the CPU. Fault those too so first-token misses
+            // don't stall (mirrors the CUDA class's _cpuMoe* coverage).
+            for (int li = 0; li < _nGpuLayers; li++)
+            {
+                Add1(ResolveCpuWeight($"blk.{li}.ffn_gate_exps.weight"));
+                Add1(ResolveCpuWeight($"blk.{li}.ffn_up_exps.weight"));
+                Add1(ResolveCpuWeight($"blk.{li}.ffn_down_exps.weight"));
+            }
+        }
+        else
+        {
+            Add(_cpuWGate); Add(_cpuWUp); Add(_cpuWDown);
+        }
+
+        return regions;
     }
 
     private float* LoadCpuBias(string name, int count)

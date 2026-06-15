@@ -468,7 +468,8 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
         _dequantCacheCovers = _dequantCacheEnabled && fullF32Bytes > 0
             && _dequantCacheBudgetBytes >= fullF32Bytes;
 
-        PrefaultWeights();
+        // SHARPI_PREFAULT=0 is the global kill switch (issue #221).
+        if (!MmapPrefault.IsDisabled()) PrefaultWeights();
     }
 
     /// <summary>

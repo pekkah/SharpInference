@@ -1414,6 +1414,13 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _logitsBuf2 = Array.Empty<float>();
             _cpuNormBuf2 = _cpuMoeHidden2 = _lastHiddenT1 = null;
         }
+
+        // Pre-fault CPU-resident mmap weight pages (issue #221). On the CPU-MoE config
+        // (the auto-selected winner on 12 GB) the routed experts / dense FFN weights are
+        // paged in lazily; without this the first request faults them all on the critical
+        // path, ~5× slower than warm. MmapPrefault honours SHARPI_PREFAULT and the
+        // RAM-fit heuristic, and no-ops when nothing is CPU-resident (full-GPU GDN).
+        MmapPrefault.Run("CudaHybridGdnForwardPass", BuildCpuPrefaultRegions());
     }
 
     // =================================================================
@@ -5229,6 +5236,40 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         var info = _model.FindTensor(name)
             ?? throw new InvalidOperationException($"Missing tensor: {name}");
         return new CpuWeightRef(name, info, info.DType, _model.GetTensorDataPtr(info));
+    }
+
+    /// <summary>Collect every CPU-resident mmap weight region for the issue #221
+    /// pre-fault sweep: the CPU-MoE routed experts (or dense FFN weights), the
+    /// SHARPI_CPU_GDN debug GDN weights, and the MoE-MTP head experts. Arrays that
+    /// aren't allocated for this config are null; unpopulated slots (e.g. the GDN
+    /// arrays when not in CPU-GDN mode) have a null <c>DataPtr</c> and are skipped.
+    /// Everything dequantized via LoadF32Tensor/LoadConv1d lives in separate buffers,
+    /// not the mmap, and is excluded.</summary>
+    private List<(nint Ptr, long Bytes)> BuildCpuPrefaultRegions()
+    {
+        var regions = new List<(nint, long)>();
+        void Add1(CpuWeightRef w)
+        {
+            if (w.DataPtr != null) regions.Add(((nint)w.DataPtr, w.Info.ByteSize));
+        }
+        void Add(CpuWeightRef[]? arr)
+        {
+            if (arr is null) return;
+            foreach (var w in arr) Add1(w);
+        }
+
+        // Trunk: CPU-MoE routed experts, or dense FFN weights (Qwen3.6-27B-MTP).
+        Add(_cpuFfnGateInp); Add(_cpuFfnGateExps); Add(_cpuFfnUpExps); Add(_cpuFfnDownExps);
+        Add(_cpuWFfnGate); Add(_cpuWFfnUp); Add(_cpuWFfnDown);
+
+        // SHARPI_CPU_GDN=1 debug path (arrays always allocated, populated only then).
+        Add(_cpuWQkv); Add(_cpuWZGate); Add(_cpuSsmOut); Add(_cpuSsmAlpha); Add(_cpuSsmBeta);
+
+        // MoE-MTP head routed experts (one extra layer; null DataPtr when absent).
+        Add1(_cpuMtpFfnGateInp); Add1(_cpuMtpFfnGateExps);
+        Add1(_cpuMtpFfnUpExps); Add1(_cpuMtpFfnDownExps);
+
+        return regions;
     }
 
     private Tensor UploadWeight(string name)

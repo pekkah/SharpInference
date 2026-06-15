@@ -673,7 +673,8 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             }
         }
 
-        PrefaultWeights();
+        // SHARPI_PREFAULT=0 is the global kill switch (issue #221).
+        if (!MmapPrefault.IsDisabled()) PrefaultWeights();
     }
 
     // ============================================================

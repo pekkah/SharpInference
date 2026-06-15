@@ -930,48 +930,12 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             _gpuRopeFreqs = UploadWeight("rope_freqs.weight");
         }
 
-        // Pre-fault mmap pages for CPU layers: touch the first byte of each weight tensor
-        // to ensure OS pages them into RAM before the first forward pass.
-        if (_nCpuLayers > 0)
-        {
-            Console.Error.Write($"[HybridForwardPass] Pre-faulting CPU weight pages...");
-            long touchSum = 0;
-            IEnumerable<CpuWeightRef> weightsToTouch = _cpuWq.Concat(_cpuWk).Concat(_cpuWv).Concat(_cpuWo);
-            if (_isMoE)
-            {
-                weightsToTouch = weightsToTouch
-                    .Concat(_cpuWGateInp!)
-                    .Concat(_cpuWGateExps!)
-                    .Concat(_cpuWUpExps!)
-                    .Concat(_cpuWDownExps!);
-                if (_hasSharedExpert)
-                {
-                    weightsToTouch = weightsToTouch
-                        .Concat(_cpuWGateShexp!)
-                        .Concat(_cpuWUpShexp!)
-                        .Concat(_cpuWDownShexp!);
-                }
-            }
-            else
-            {
-                weightsToTouch = weightsToTouch
-                    .Concat(_cpuWGate)
-                    .Concat(_cpuWUp)
-                    .Concat(_cpuWDown);
-            }
-
-            foreach (var wRef in weightsToTouch)
-            {
-                // Skip un-resolved slots — KV-share layers on Gemma 4 leave attn_k /
-                // attn_v unresolved by design (the source layer's projections are
-                // reused via the alias dispatch).
-                if (wRef.DataPtr == null) continue;
-                touchSum += wRef.DataPtr[0];
-                long size = wRef.Info.ByteSize;
-                if (size > 64) touchSum += wRef.DataPtr[size - 1];
-            }
-            Console.Error.WriteLine($" done. (touch={touchSum})");
-        }
+        // Pre-fault every CPU-resident mmap weight page so the first request doesn't
+        // stall on demand paging (issue #221). NOT gated on _nCpuLayers > 0: the
+        // CPU-MoE routed experts and the Gemma 4 PLE table are CPU-resident even when
+        // every transformer layer is GPU-offloaded (-g -1), and those are the dominant
+        // cold-start cost. MmapPrefault filters empty configs and honours SHARPI_PREFAULT.
+        MmapPrefault.Run("CudaHybridForwardPass", BuildCpuPrefaultRegions());
 
         if (_tqEnabled && _nCpuLayers > 0)
         {
@@ -2781,6 +2745,59 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         var info = _model.FindTensor(name)
             ?? throw new InvalidOperationException($"Missing tensor: {name}");
         return new CpuWeightRef(name, info, info.DType, _model.GetTensorDataPtr(info));
+    }
+
+    /// <summary>Collect every CPU-resident mmap weight region for the issue #221
+    /// pre-fault sweep. Covers per-CPU-layer weights, the CPU-MoE routed experts (the
+    /// big cold-start cost, present even with all layers GPU-offloaded), and the
+    /// Gemma 4 PLE table. Unresolved slots (null <c>DataPtr</c>) — e.g. Gemma 4
+    /// KV-share / k==v layers — are skipped. Biases and QK-norms are excluded: they're
+    /// dequantized into separate buffers, not read from the mmap at inference time.</summary>
+    private List<(nint Ptr, long Bytes)> BuildCpuPrefaultRegions()
+    {
+        var regions = new List<(nint, long)>();
+        void Add1(CpuWeightRef w)
+        {
+            if (w.DataPtr != null) regions.Add(((nint)w.DataPtr, w.Info.ByteSize));
+        }
+        void Add(CpuWeightRef[]? arr)
+        {
+            if (arr is null) return;
+            foreach (var w in arr) Add1(w);
+        }
+
+        // Embedding/output mmap refs are read at inference only when they're NOT
+        // uploaded to VRAM (_gpu* null == cpuEmbeddingOutputOnly). Skipping the
+        // GiB-scale token_embd when it lives on the GPU avoids a large pointless read.
+        if (_gpuEmbedding is null) Add1(_cpuEmbedding);
+        if (_gpuOutputWeight is null)
+        {
+            Add1(_cpuOutputNorm);
+            if (_cpuOutputWeight.DataPtr != _cpuEmbedding.DataPtr) Add1(_cpuOutputWeight); // tied weights alias
+        }
+
+        Add(_cpuAttnNorm); Add(_cpuWq); Add(_cpuWk); Add(_cpuWv); Add(_cpuWo);
+        Add(_cpuFfnNorm); Add(_cpuPostAttnNorm); Add(_cpuPostFfwNorm);
+
+        if (_isMoE)
+        {
+            Add(_cpuWGateInp); Add(_cpuWGateExps); Add(_cpuWUpExps); Add(_cpuWDownExps);
+            if (_hasSharedExpert) { Add(_cpuWGateShexp); Add(_cpuWUpShexp); Add(_cpuWDownShexp); }
+        }
+        else
+        {
+            Add(_cpuWGate); Add(_cpuWUp); Add(_cpuWDown);
+        }
+
+        // CPU-MoE routed experts for the GPU-trunk layers (the -g -1 cold-start cost).
+        Add(_cpuMoeGateInp); Add(_cpuMoeGateExps); Add(_cpuMoeUpExps); Add(_cpuMoeDownExps);
+
+        // Gemma 4 PLE: the GiB-scale per-layer token-embedding table + per-layer projections.
+        if (_pleTokenEmbed is { } ple) Add1(ple);
+        if (_perLayerProjNorm is { } pln) Add1(pln);
+        Add(_cpuInpGate); Add(_cpuPleProj); Add(_cpuPlePostNorm);
+
+        return regions;
     }
 
     private float* LoadCpuBias(string name, int count)
