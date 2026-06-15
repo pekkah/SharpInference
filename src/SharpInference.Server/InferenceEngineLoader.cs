@@ -276,9 +276,10 @@ public static class InferenceEngineLoader
                 return (cfwd, cfwd.SupportsContinuousBatching);
             }
 
+            // pinGpuLayers (not a `with { GpuLayers = }` override) so the expert-cache budget the
+            // MoE CPU-vs-SLRU auto-decision reads is priced for THIS split, not the auto one (#224).
             var planForHybrid = TierPlanner.Plan(model, hp, hwProfile, turboQuant, requestedCtxSize: ctxSize,
-                    kvDtype: CudaForwardPass.ResolveConfiguredKvDType())
-                with { GpuLayers = gpuLayers, CpuLayers = hp.NumLayers - gpuLayers };
+                kvDtype: CudaForwardPass.ResolveConfiguredKvDType(), pinGpuLayers: gpuLayers);
             var chfwd = new CudaHybridForwardPass(model, cuda, hp, planForHybrid, turboQuant);
             owned.Add(chfwd);
             return (chfwd, BatchingSupported: false);
@@ -312,8 +313,8 @@ public static class InferenceEngineLoader
                 return (gfwd, BatchingSupported: false);
             }
 
-            var planForHybrid = TierPlanner.Plan(model, hp, hwProfile, turboQuant, requestedCtxSize: ctxSize)
-                with { GpuLayers = gpuLayers, CpuLayers = hp.NumLayers - gpuLayers };
+            var planForHybrid = TierPlanner.Plan(model, hp, hwProfile, turboQuant, requestedCtxSize: ctxSize,
+                pinGpuLayers: gpuLayers);
             var hfwd = new HybridForwardPass(model, vulkan, hp, planForHybrid, turboQuant);
             owned.Add(hfwd);
             return (hfwd, BatchingSupported: false);

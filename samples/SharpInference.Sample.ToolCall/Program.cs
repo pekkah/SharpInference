@@ -143,8 +143,9 @@ if (backendStr == "cuda")
         {
             var cpuBack   = new CpuBackend();
             var hw        = HardwareProfile.Detect(cuda);
-            var placement = TierPlanner.Plan(model, hp, hw);
-            placement     = placement with { GpuLayers = gpuLayers, CpuLayers = hp.NumLayers - gpuLayers };
+            // pinGpuLayers (not a `with { GpuLayers = }` override) so the MoE expert-cache budget
+            // is priced for this split, not the greedy auto one (#224).
+            var placement = TierPlanner.Plan(model, hp, hw, pinGpuLayers: gpuLayers);
             var chfwd     = new CudaHybridForwardPass(model, cuda, hp, placement);
             backend       = cpuBack;
             forward       = chfwd;
