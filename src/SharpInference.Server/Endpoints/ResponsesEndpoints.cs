@@ -49,7 +49,12 @@ public static class ResponsesEndpoints
         metrics.RecordRequest();
 
         var messages = BuildMessageList(req);
-        var prompt = chatTemplate.Format(messages);
+        // Apply the same model-family thinking default as the chat endpoints: Gemma 4 defaults
+        // reasoning off (ChatTemplateRenderer.ModelDefaultsThinkingOff), and SHARPI_NO_THINKING
+        // forces it off globally. /v1/responses has no per-request thinking flag, so the family
+        // default + the server kill-switch are the whole decision.
+        bool enableThinking = !chatTemplate.ModelDefaultsThinkingOff && !opts.DisableThinking;
+        var prompt = chatTemplate.Format(messages, enableThinking);
 
         var sp = SamplingParamsBuilder.Build(opts,
             temperature: req.Temperature,

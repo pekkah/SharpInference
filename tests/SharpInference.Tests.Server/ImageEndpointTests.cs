@@ -20,8 +20,16 @@ public sealed class ImageEndpointTests : IClassFixture<WebApplicationFactory<Pro
 
     public ImageEndpointTests(WebApplicationFactory<Program> factory) => _factory = factory;
 
-    // Bytes that pass the endpoint's PNG-signature check (the fake engine never decodes them).
-    private static string FakePngBase64()
+    // A real, fully decodable 2x2 RGB PNG. The endpoint now decode-validates images at parse
+    // time (so format errors become a clean 400 before generation), so the routing tests need a
+    // genuinely decodable payload rather than a bare signature.
+    private const string RealPng2x2Base64 =
+        "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR42mM4IScHRAwQCgAfJgQRSo6NIAAAAABJRU5ErkJggg==";
+
+    private static string FakePngBase64() => RealPng2x2Base64;
+
+    // Valid 8-byte PNG signature but no IHDR — passes a signature-only check, fails a real decode.
+    private static string SignatureOnlyPngBase64()
         => Convert.ToBase64String([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4]);
 
     private HttpClient ClientWith(FakeInferenceEngine engine)
@@ -197,5 +205,55 @@ public sealed class ImageEndpointTests : IClassFixture<WebApplicationFactory<Pro
 
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
         Assert.Contains("data URL", await resp.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task Anthropic_SignatureValidButUndecodablePng_Returns400()
+    {
+        // A payload with a valid 8-byte PNG signature but no decodable body must be rejected with
+        // a clean 400 at parse time, not surface as a 500 deep in the engine's prefill (#259 review).
+        var fake = new FakeInferenceEngine("gemma-4-12b") { SupportsImages = true };
+        var client = ClientWith(fake);
+        var req = new
+        {
+            model = "gemma-4-12b",
+            max_tokens = 8,
+            messages = new object[]
+            {
+                new { role = "user", content = new object[]
+                {
+                    new { type = "image", source = new { type = "base64", media_type = "image/png", data = SignatureOnlyPngBase64() } },
+                } },
+            },
+        };
+
+        var resp = await client.PostAsJsonAsync("/v1/messages", req);
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        Assert.Equal(0, fake.LastImageCount); // never reached the engine
+    }
+
+    [Fact]
+    public async Task OpenAi_TooManyImages_Returns400()
+    {
+        var fake = new FakeInferenceEngine("gemma-4-12b") { SupportsImages = true };
+        var client = ClientWith(fake);
+        var dataUrl = "data:image/png;base64," + RealPng2x2Base64;
+        // 17 images (one over the cap of 16).
+        var parts = new List<object> { new { type = "text", text = "Compare" } };
+        for (int i = 0; i < 17; i++)
+            parts.Add(new { type = "image_url", image_url = new { url = dataUrl } });
+        var req = new
+        {
+            model = "gemma-4-12b",
+            max_tokens = 8,
+            messages = new object[] { new { role = "user", content = parts.ToArray() } },
+        };
+
+        var resp = await client.PostAsJsonAsync("/v1/chat/completions", req);
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        Assert.Contains("too many images", await resp.Content.ReadAsStringAsync());
+        Assert.Equal(0, fake.LastImageCount);
     }
 }

@@ -1,3 +1,6 @@
+using SharpInference.Engine;
+using SharpInference.Vision;
+
 namespace SharpInference.Server.Endpoints;
 
 /// <summary>
@@ -14,6 +17,25 @@ internal static class ImageContent
     /// <c>&lt;|image|&gt;</c> id and expands it to the projected soft tokens during prefill.
     /// </summary>
     public const string Placeholder = "<|image|>";
+
+    /// <summary>
+    /// Upper bound on image content blocks per request. A decoded image is bounded by ImageIO's
+    /// 64M-pixel guard (~hundreds of MB), so without a per-request cap a single request could
+    /// fan out into many large allocations. The chat endpoints reject requests that exceed this.
+    /// </summary>
+    public const int MaxImagesPerRequest = 16;
+
+    /// <summary>
+    /// Routes to the image-aware generate when images are present, else the text path (#253).
+    /// Shared by the OpenAI and Anthropic endpoints — pure engine-level dispatch with no
+    /// wire-format dependency, so it lives here rather than being copied into each endpoint.
+    /// </summary>
+    public static IAsyncEnumerable<GenerateChunk> Generate(
+        IInferenceEngine engine, string prompt, string? canonical, IReadOnlyList<byte[]> images,
+        SamplingParams sp, CancellationToken ct)
+        => images.Count > 0
+            ? engine.GenerateImageChunksAsync(prompt, images, sp, ct)
+            : engine.GenerateChunksAsync(prompt, sp, ct, canonical);
 
     /// <summary>Decode a base64 image payload to bytes and validate it is a PNG.</summary>
     public static byte[] FromBase64(string base64)
@@ -44,12 +66,22 @@ internal static class ImageContent
 
     private static void ValidatePng(byte[] bytes)
     {
-        // PNG 8-byte signature. Validating the magic (rather than the declared media_type) catches
-        // mislabelled or unsupported (JPEG/WebP) payloads regardless of the client's content type.
-        ReadOnlySpan<byte> sig = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        if (bytes.Length < 8 || !bytes.AsSpan(0, 8).SequenceEqual(sig))
-            throw new ImageContentException(
-                "only PNG images are supported (the decoded image data is not a PNG).");
+        // Fully decode the payload here, at request-parse time, rather than only checking the
+        // 8-byte signature. ImageIO supports 8-bit non-interlaced PNG (grayscale/RGB/RGBA) only;
+        // a signature-valid but interlaced / 16-bit / palette / truncated / decompression-bomb
+        // payload would otherwise slip past a signature-only check and fail deep inside the
+        // engine's prefill — on the streaming path that lands AFTER the 200 response has begun,
+        // so it can only abort the connection. Decoding up front turns every such case into a
+        // clean HTTP 400. The decode is bounded (ImageIO caps inflation to the declared pixel
+        // size) and the result is discarded; the engine re-decodes the same bytes during prefill.
+        try
+        {
+            _ = ImageIO.LoadRgb(new MemoryStream(bytes, writable: false), out _, out _);
+        }
+        catch (Exception ex) when (ex is InvalidDataException or NotSupportedException)
+        {
+            throw new ImageContentException($"unsupported or corrupt image: {ex.Message}");
+        }
     }
 }
 

@@ -112,6 +112,17 @@ public static class OpenAiEndpoints
             return;
         }
 
+        if (images.Count > ImageContent.MaxImagesPerRequest)
+        {
+            ctx.Response.StatusCode = 400;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(
+                JsonSerializer.Serialize(new ErrorResponse("invalid_request_error",
+                        $"too many images in one request ({images.Count}; max {ImageContent.MaxImagesPerRequest})."),
+                    SharpInferenceJsonContext.Default.ErrorResponse), ctx.RequestAborted);
+            return;
+        }
+
         if (images.Count > 0 && !engine.SupportsImageInput)
         {
             ctx.Response.StatusCode = 400;
@@ -163,14 +174,6 @@ public static class OpenAiEndpoints
         }
     }
 
-    /// <summary>Route to the image-aware generate when images are present, else the text path (#253).</summary>
-    private static IAsyncEnumerable<GenerateChunk> Generate(
-        IInferenceEngine engine, string prompt, string? canonical, IReadOnlyList<byte[]> images,
-        SamplingParams sp, CancellationToken ct)
-        => images.Count > 0
-            ? engine.GenerateImageChunksAsync(prompt, images, sp, ct)
-            : engine.GenerateChunksAsync(prompt, sp, ct, canonical);
-
     private static async Task HandleNonStreaming(
         HttpContext ctx, IInferenceEngine engine, ServerMetrics metrics, IToolCallAdapter adapter,
         bool toolsActive, string prompt, string? canonicalHistoryPrefix, IReadOnlyList<byte[]> images, SamplingParams sp, string requestId, long created)
@@ -180,18 +183,34 @@ public static class OpenAiEndpoints
         int textTokens = 0;
         int reasoningTokens = 0;
 
-        await foreach (var c in Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
+        try
         {
-            if (c.Kind == GenerateChunkKind.Thinking)
+            await foreach (var c in ImageContent.Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
             {
-                reasoningSb.Append(c.Text);
-                reasoningTokens++;
+                if (c.Kind == GenerateChunkKind.Thinking)
+                {
+                    reasoningSb.Append(c.Text);
+                    reasoningTokens++;
+                }
+                else
+                {
+                    textSb.Append(c.Text);
+                    textTokens++;
+                }
             }
-            else
-            {
-                textSb.Append(c.Text);
-                textTokens++;
-            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A residual generation error (e.g. an image-count mismatch from a user-typed
+            // <|image|>, or a projection failure) would otherwise surface as a bare 500 with no
+            // body. The response hasn't started yet on the non-streaming path, so return a
+            // structured error the OpenAI SDK can parse.
+            ctx.Response.StatusCode = 500;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(
+                JsonSerializer.Serialize(new ErrorResponse("internal_error", ex.Message),
+                    SharpInferenceJsonContext.Default.ErrorResponse), ctx.RequestAborted);
+            return;
         }
 
         int completionTokens = textTokens + reasoningTokens;
@@ -361,7 +380,7 @@ public static class OpenAiEndpoints
         bool truncatedToolCall = false;
         try
         {
-            await foreach (var c in Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
+            await foreach (var c in ImageContent.Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
             {
                 tokenCount++;
                 if (c.Kind == GenerateChunkKind.Thinking)
@@ -383,6 +402,13 @@ public static class OpenAiEndpoints
                     await WriteContentDelta(c.Text);
                 }
             }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // The SSE response is already committed (200 + role delta), so the status can't change.
+            // Swallow so the finally + final chunk terminate the stream cleanly instead of the TCP
+            // connection being reset mid-stream. Common image errors are rejected at parse time (400).
+            _ = ex;
         }
         finally
         {
@@ -465,6 +491,9 @@ public static class OpenAiEndpoints
         var sb = new StringBuilder();
         foreach (var part in el.EnumerateArray())
         {
+            // Content parts must be objects; a bare primitive would make TryGetProperty throw
+            // (it requires an object receiver), so skip non-objects rather than 500.
+            if (part.ValueKind != JsonValueKind.Object) continue;
             var type = part.TryGetProperty("type", out var t) ? t.GetString() : null;
             if (type == "text")
             {
@@ -478,7 +507,7 @@ public static class OpenAiEndpoints
                 if (part.TryGetProperty("image_url", out var iu))
                     url = iu.ValueKind == JsonValueKind.String
                         ? iu.GetString() ?? ""
-                        : iu.TryGetProperty("url", out var u) ? u.GetString() ?? "" : "";
+                        : iu.ValueKind == JsonValueKind.Object && iu.TryGetProperty("url", out var u) ? u.GetString() ?? "" : "";
                 if (string.IsNullOrEmpty(url))
                     throw new ImageContentException($"{type} content part is missing a base64 'image_url'.");
                 images.Add(ImageContent.FromDataUrl(url));

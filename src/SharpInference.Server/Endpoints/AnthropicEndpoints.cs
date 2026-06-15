@@ -115,6 +115,17 @@ public static class AnthropicEndpoints
             return;
         }
 
+        if (images.Count > ImageContent.MaxImagesPerRequest)
+        {
+            ctx.Response.StatusCode = 400;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(
+                JsonSerializer.Serialize(new AErrorResponse("invalid_request_error",
+                        $"too many images in one request ({images.Count}; max {ImageContent.MaxImagesPerRequest})."),
+                    SharpInferenceJsonContext.Default.AErrorResponse), ctx.RequestAborted);
+            return;
+        }
+
         if (images.Count > 0 && !engine.SupportsImageInput)
         {
             ctx.Response.StatusCode = 400;
@@ -153,14 +164,6 @@ public static class AnthropicEndpoints
         }
     }
 
-    /// <summary>Route to the image-aware generate when images are present, else the text path (#253).</summary>
-    private static IAsyncEnumerable<GenerateChunk> Generate(
-        IInferenceEngine engine, string prompt, string? canonical, IReadOnlyList<byte[]> images,
-        SamplingParams sp, CancellationToken ct)
-        => images.Count > 0
-            ? engine.GenerateImageChunksAsync(prompt, images, sp, ct)
-            : engine.GenerateChunksAsync(prompt, sp, ct, canonical);
-
     private static async Task HandleNonStreaming(
         HttpContext ctx, IInferenceEngine engine, ServerMetrics metrics, IToolCallAdapter adapter,
         string prompt, string? canonicalHistoryPrefix, IReadOnlyList<byte[]> images, SamplingParams sp, string msgId, string modelId)
@@ -169,13 +172,28 @@ public static class AnthropicEndpoints
         var textSb = new StringBuilder();
         int totalOutputTokens = 0;
 
-        await foreach (var chunk in Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
+        try
         {
-            totalOutputTokens++;
-            if (chunk.Kind == GenerateChunkKind.Thinking)
-                thinkingSb.Append(chunk.Text);
-            else
-                textSb.Append(chunk.Text);
+            await foreach (var chunk in ImageContent.Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
+            {
+                totalOutputTokens++;
+                if (chunk.Kind == GenerateChunkKind.Thinking)
+                    thinkingSb.Append(chunk.Text);
+                else
+                    textSb.Append(chunk.Text);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Residual generation error (e.g. image-count mismatch from a user-typed <|image|>, or a
+            // projection failure) — return a structured error instead of a bare 500. The response
+            // hasn't started on the non-streaming path. Common image errors are rejected at parse (400).
+            ctx.Response.StatusCode = 500;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(
+                JsonSerializer.Serialize(new AErrorResponse("internal_error", ex.Message),
+                    SharpInferenceJsonContext.Default.AErrorResponse), ctx.RequestAborted);
+            return;
         }
 
         metrics.RecordTokens(totalOutputTokens);
@@ -393,7 +411,7 @@ public static class AnthropicEndpoints
         bool truncatedToolCall = false;
         try
         {
-            await foreach (var chunk in Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
+            await foreach (var chunk in ImageContent.Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
             {
                 outputTokens++;
 
@@ -422,6 +440,13 @@ public static class AnthropicEndpoints
                     await ProcessTextChunk(chunk.Text);
                 }
             }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // SSE response already committed (message_start sent) — status can't change. Swallow so
+            // the finally + message_delta/message_stop terminate the stream cleanly instead of the
+            // TCP connection resetting mid-stream. Common image errors are rejected at parse (400).
+            _ = ex;
         }
         finally
         {
@@ -583,6 +608,10 @@ public static class AnthropicEndpoints
         var sb = new StringBuilder();
         foreach (var block in el.EnumerateArray())
         {
+            // A content array may legally hold only objects; a bare primitive element would make
+            // TryGetProperty throw (it requires an object receiver), so skip non-objects rather
+            // than 500. The model just sees the surrounding text.
+            if (block.ValueKind != JsonValueKind.Object) continue;
             var type = block.TryGetProperty("type", out var t) ? t.GetString() : null;
             if (type == "text")
             {
@@ -600,8 +629,8 @@ public static class AnthropicEndpoints
 
     private static byte[] ParseAnthropicImageBlock(JsonElement block)
     {
-        if (!block.TryGetProperty("source", out var source))
-            throw new ImageContentException("image content block is missing 'source'.");
+        if (!block.TryGetProperty("source", out var source) || source.ValueKind != JsonValueKind.Object)
+            throw new ImageContentException("image content block is missing an object 'source'.");
         var srcType = source.TryGetProperty("type", out var st) ? st.GetString() : null;
         if (srcType != "base64")
             throw new ImageContentException(
@@ -654,6 +683,7 @@ public static class AnthropicEndpoints
 
                     foreach (var block in contentEl.EnumerateArray())
                     {
+                        if (block.ValueKind != JsonValueKind.Object) continue;
                         var type = block.TryGetProperty("type", out var t) ? t.GetString() : null;
                         if (type == "text")
                         {
@@ -686,6 +716,7 @@ public static class AnthropicEndpoints
 
                     foreach (var block in contentEl.EnumerateArray())
                     {
+                        if (block.ValueKind != JsonValueKind.Object) continue;
                         var type = block.TryGetProperty("type", out var t) ? t.GetString() : null;
                         if (type == "text")
                         {

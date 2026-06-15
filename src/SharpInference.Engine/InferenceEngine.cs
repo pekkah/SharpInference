@@ -537,6 +537,13 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                     {
                         // Image input (#253): no prefix reuse — project each image and splice its
                         // soft tokens in place of its placeholder during a fresh prefill.
+                        // Invalidate _prevTokens BEFORE prefilling: the image cache holds soft-token
+                        // KV at expanded positions that don't correspond to plain token positions, so
+                        // a later text request must NOT match this sequence in FindCacheablePrefix and
+                        // TruncateTo into it. Nulling it up front also covers a mid-prefill throw,
+                        // which leaves the cache partially written (the end-of-decode snapshot below
+                        // is already skipped for image requests).
+                        _prevTokens = null;
                         _fwd.ResetCache();
                         suffixTokens = tokens;
                         logits = SplicePrefillImages(tokens, imageBytes, ct, out startPos);
@@ -778,7 +785,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                                 channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, chunk));
                         }
 
-                        logits = _fwd.Forward(next, tokens.Length + i);
+                        logits = _fwd.Forward(next, startPos + i);
                     }
 
                     // End-of-loop: flush both decoders defensively (whichever was active).

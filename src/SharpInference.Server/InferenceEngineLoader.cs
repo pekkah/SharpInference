@@ -106,6 +106,15 @@ public static class InferenceEngineLoader
             (int Open, int Close, int Placeholder) imgIds = default;
             if (!string.IsNullOrWhiteSpace(opts.MmprojPath))
             {
+                // The gemma4uv splice path is specific to Gemma 4 text models. The CPU forward
+                // pass reports SupportsEmbeddingInput=true for every architecture, so without this
+                // arch check a non-Gemma CPU model + a valid gemma4uv mmproj would load and either
+                // splice foreign soft tokens into the wrong trunk (garbage) or throw an opaque
+                // dimension error mid-request. Fail fast at load instead.
+                if (!string.Equals(arch, "gemma4", StringComparison.Ordinal))
+                    throw new InvalidOperationException(
+                        "Image input (MmprojPath / SHARPI_MMPROJ) is only supported for Gemma 4 (gemma4uv) " +
+                        $"text models; this model's architecture is '{arch}'.");
                 if (!fwd.SupportsEmbeddingInput)
                     throw new InvalidOperationException(
                         "MmprojPath / SHARPI_MMPROJ is set but image input requires a forward pass that accepts " +
