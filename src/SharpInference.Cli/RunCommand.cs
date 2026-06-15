@@ -596,10 +596,13 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 if (wantHybrid)
                 {
                     var hwProfile = HardwareProfile.Detect(cuda);
+                    // pinGpuLayers prices the expert-cache budget (read by the MoE CPU-vs-SLRU
+                    // auto-decision) for this exact split. cudaGpuLayers equals the auto value on
+                    // the -g -1 path, so pinning is a no-op there and only matters on explicit -g N
+                    // (#224). A `with { GpuLayers = }` override would leave the budget stale.
                     var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant,
-                        requestedCtxSize: ctxSize, kvDtype: CudaForwardPass.ResolveConfiguredKvDType());
-                    if (nGpuLayers != -1)
-                        placement = placement with { GpuLayers = cudaGpuLayers, CpuLayers = hp.NumLayers - cudaGpuLayers };
+                        requestedCtxSize: ctxSize, kvDtype: CudaForwardPass.ResolveConfiguredKvDType(),
+                        pinGpuLayers: cudaGpuLayers);
 
                     var chfwd = new CudaHybridForwardPass(model, cuda, hp, placement, settings.TurboQuant);
                     gpuFwd = chfwd;
@@ -703,12 +706,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 }
                 else
                 {
-                    // Hybrid: N layers GPU, rest CPU
+                    // Hybrid: N layers GPU, rest CPU. nGpuLayers is the auto value on -g -1 and the
+                    // explicit count otherwise; pinGpuLayers prices weights/KV/budget for it (#224).
                     var placement = TierPlanner.Plan(model, hp, hwProfile, settings.TurboQuant,
-                        requestedCtxSize: ctxSize);
-                    // Override with explicit -g/--ngl N if user specified it
-                    if (effNGpuLayers > 0)
-                        placement = placement with { GpuLayers = nGpuLayers, CpuLayers = hp.NumLayers - nGpuLayers };
+                        requestedCtxSize: ctxSize, pinGpuLayers: nGpuLayers);
 
                     var hfwd = new HybridForwardPass(model, gpu, hp, placement, settings.TurboQuant);
                     gpuFwd = hfwd;

@@ -12,9 +12,18 @@ public static class TierPlanner
     /// <summary>
     /// Compute optimal layer placement for a given model and hardware profile.
     /// </summary>
+    /// <param name="pinGpuLayers">
+    /// When non-null, pins the GPU trunk-layer count (e.g. the user's explicit <c>-g N</c>) instead
+    /// of greedily auto-packing, and prices the trunk weights, KV, and <see cref="LayerPlacement.
+    /// ExpertCacheBudgetBytes"/> for THAT split. Callers must use this rather than a
+    /// <c>placement with { GpuLayers = N }</c> override, which would leave the expert-cache budget
+    /// (and KV/weight bytes) computed for the auto split — a stale value the MoE CPU-vs-SLRU
+    /// auto-decision then reads (issue #224). Clamped to <c>[0, NumLayers]</c>.
+    /// </param>
     public static LayerPlacement Plan(GgufModel model, ModelHyperparams hp,
         HardwareProfile hardware, bool turboQuant = false, int tqBits = 3,
-        int requestedCtxSize = 0, int tqFp32Window = 256, DType kvDtype = DType.Float32)
+        int requestedCtxSize = 0, int tqFp32Window = 256, DType kvDtype = DType.Float32,
+        int? pinGpuLayers = null)
     {
         if (hardware.VramBytes <= 0)
             return new LayerPlacement(0, hp.NumLayers, 0, 0, requestedCtxSize > 0 ? requestedCtxSize : hp.ContextLength);
@@ -65,21 +74,35 @@ public static class TierPlanner
         // Measure per-layer weight bytes
         long perLayerBytes = MeasureLayerBytes(model, hp, 0);
 
-        // Priority 2: Assign layers to GPU, greedily
+        // Priority 2: Assign layers to GPU.
         int gpuLayers = 0;
         long gpuWeightBytes = fixedGpuBytes;
-        for (int i = 0; i < hp.NumLayers; i++)
+        if (pinGpuLayers is int pin)
         {
-            long layerBytes = MeasureLayerBytes(model, hp, i);
-            if (vramBudget >= layerBytes)
+            // Caller pinned an explicit GPU trunk count (e.g. -g N). Honor it exactly and price the
+            // trunk weights / KV / expert-cache budget for THIS split rather than the greedy auto
+            // split. A pin that exceeds VRAM is the user's explicit choice (the forward pass
+            // enforces real fit), so we only clamp the leftover budget to >= 0 here.
+            gpuLayers = Math.Clamp(pin, 0, hp.NumLayers);
+            for (int i = 0; i < gpuLayers; i++)
+                gpuWeightBytes += MeasureLayerBytes(model, hp, i);
+            vramBudget = Math.Max(0, vramBudget - (gpuWeightBytes - fixedGpuBytes));
+        }
+        else
+        {
+            for (int i = 0; i < hp.NumLayers; i++)
             {
-                vramBudget -= layerBytes;
-                gpuWeightBytes += layerBytes;
-                gpuLayers++;
-            }
-            else
-            {
-                break; // layers are contiguous from 0
+                long layerBytes = MeasureLayerBytes(model, hp, i);
+                if (vramBudget >= layerBytes)
+                {
+                    vramBudget -= layerBytes;
+                    gpuWeightBytes += layerBytes;
+                    gpuLayers++;
+                }
+                else
+                {
+                    break; // layers are contiguous from 0
+                }
             }
         }
 
