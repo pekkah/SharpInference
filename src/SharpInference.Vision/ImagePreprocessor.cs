@@ -67,6 +67,7 @@ public static class ImagePreprocessor
             int y0 = Math.Min((int)py, srcHeight - 1);
             int y1 = Math.Min(y0 + 1, srcHeight - 1);
             float yf = py - y0;
+            int y0Off = y0 * srcWidth, y1Off = y1 * srcWidth;   // hoisted out of the x loop
             for (int x = 0; x < w; x++)
             {
                 float px = x * xRatio;
@@ -74,8 +75,8 @@ public static class ImagePreprocessor
                 int x1 = Math.Min(x0 + 1, srcWidth - 1);
                 float xf = px - x0;
 
-                int i00 = (y0 * srcWidth + x0) * 3, i10 = (y0 * srcWidth + x1) * 3;
-                int i01 = (y1 * srcWidth + x0) * 3, i11 = (y1 * srcWidth + x1) * 3;
+                int i00 = (y0Off + x0) * 3, i10 = (y0Off + x1) * 3;
+                int i01 = (y1Off + x0) * 3, i11 = (y1Off + x1) * 3;
                 int outIdx = y * w + x;
                 for (int c = 0; c < 3; c++)
                 {

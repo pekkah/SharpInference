@@ -1175,7 +1175,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             {
                 rgb = ImageIO.LoadRgb(imagePaths[i], out srcW, out srcH);
             }
-            catch (Exception ex) when (ex is IOException or NotSupportedException or InvalidDataException)
+            catch (Exception ex) when (ex is IOException or NotSupportedException or InvalidDataException
+                                          or UnauthorizedAccessException or System.Security.SecurityException)
             {
                 AnsiConsole.MarkupLine($"[red]Error reading image[/] {Markup.Escape(imagePaths[i])}: {Markup.Escape(ex.Message)}");
                 return 1;

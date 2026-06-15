@@ -80,6 +80,8 @@ public sealed class GemmaUvVisionEmbedder
         _m.EnsureNotDisposed();
         if (width % _patch != 0 || height % _patch != 0)
             throw new ArgumentException($"image dims ({width}x{height}) must be multiples of {_patch}.");
+        if (chw.Length < 3L * height * width)
+            throw new ArgumentException($"chw length ({chw.Length}) is too small for a 3x{height}x{width} image.");
         int gx = width / _patch, gy = height / _patch;
         // The learned position tables hold _posSize (1120) entries per axis; a grid larger
         // than that has no position embedding. Preprocessing keeps tokens within
