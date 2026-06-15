@@ -355,11 +355,6 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     return 1;
                 }
             }
-            if (effNGpuLayers != 0)
-            {
-                AnsiConsole.MarkupLine("[red]Error:[/] --image is CPU-only for now; pass [yellow]-g 0[/] (or --device none).");
-                return 1;
-            }
             if (settings.Prompt is not { Length: > 0 })
             {
                 AnsiConsole.MarkupLine("[red]Error:[/] --image requires a text prompt ([yellow]-p \"...\"[/]); interactive image chat is not supported yet.");
@@ -866,7 +861,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         try
         {
             if (settings.ImagePaths is { Length: > 0 })
-                return RunImagePrompt(settings, fwd!, tokenizer, hp, sp, rng);
+                return RunImagePrompt(settings, (gpuFwd as IForwardPass) ?? fwd!, tokenizer, hp, sp, rng);
             if (settings.Prompt is not null)
                 return RunSinglePrompt(settings, forward, prefill, tokenizer, sp, rng, mtpFwd);
             return RunInteractive(settings, forward, prefill, resetCache, tokenizer, sp, rng, mtpFwd);
@@ -1131,12 +1126,14 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     /// embedding-injection seam lives on <see cref="ForwardPass"/>.
     /// </summary>
     private static int RunImagePrompt(Settings s,
-        ForwardPass fwd, GgufTokenizer tok, ModelHyperparams hp,
+        IForwardPass fwd, GgufTokenizer tok, ModelHyperparams hp,
         SamplingParams sp, Random rng)
     {
         if (!fwd.SupportsEmbeddingInput)
         {
-            AnsiConsole.MarkupLine("[red]Error:[/] this forward pass does not support image embedding input.");
+            AnsiConsole.MarkupLine("[red]Error:[/] the selected backend does not support image embedding input. " +
+                "Image input runs on CPU ([yellow]-g 0[/]) or full CUDA offload ([yellow]-g -1[/] of a model that fits VRAM); " +
+                "partial-offload hybrids and the Vulkan backend are not supported yet.");
             return 1;
         }
 
