@@ -71,9 +71,6 @@ public static class TierPlanner
         vramBudget -= fixedGpuBytes;
         if (vramBudget < 0) vramBudget = 0;
 
-        // Measure per-layer weight bytes
-        long perLayerBytes = MeasureLayerBytes(model, hp, 0);
-
         // Priority 2: Assign layers to GPU.
         int gpuLayers = 0;
         long gpuWeightBytes = fixedGpuBytes;
