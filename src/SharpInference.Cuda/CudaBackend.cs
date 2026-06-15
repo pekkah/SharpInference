@@ -1388,9 +1388,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // it lives in the same _devPtrs table and is freed via Free() like any
     // other tensor.
     //
-    // Concurrent UploadBackground* calls are serialized by _asyncUploadLock
-    // because they share the _asyncPinnedBuf staging — the lock also ensures
-    // the previous transfer's DMA drains before we overwrite the staging bytes.
+    // Concurrent UploadBackground* calls are serialized by _asyncUploadLock while
+    // they pick a staging-ring slot and record events. They do NOT serialize on the
+    // prior DMA: each call uses its own ring slot and only drains (host wait) when a
+    // slot wraps around AsyncRingSlots uploads later, so up to AsyncRingSlots transfers
+    // can be in flight at once (see the _asyncRing* fields).
 
     /// <summary>
     /// Async H2D upload on the dedicated upload stream. The returned tensor's
@@ -1538,16 +1540,23 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
             // Backend-owned staging fence for this slot: signals when this slot's DMA (and
             // thus the host's freedom to overwrite its buffer) completes. Created once per
-            // slot, re-recorded on each reuse.
+            // slot, re-recorded on each reuse. On a failure here the caller never receives a
+            // handle, so destroy the just-created caller event ev ourselves to avoid leaking it.
             if (_asyncRingFence[slot] == nint.Zero)
             {
                 int fe = CuBlasInterop.EventCreateWithFlags(out _asyncRingFence[slot], CuBlasInterop.EventDisableTiming);
                 if (fe != 0)
+                {
+                    CuBlasInterop.EventDestroy(ev);
                     throw new InvalidOperationException($"cudaEventCreateWithFlags (staging fence) failed: {fe}");
+                }
             }
             int fr = CuBlasInterop.EventRecord(_asyncRingFence[slot], _uploadStream);
             if (fr != 0)
+            {
+                CuBlasInterop.EventDestroy(ev);
                 throw new InvalidOperationException($"cudaEventRecord (staging fence) failed: {fr}");
+            }
         }
 
         var handleId = (nint)Interlocked.Increment(ref _nextHandle);
