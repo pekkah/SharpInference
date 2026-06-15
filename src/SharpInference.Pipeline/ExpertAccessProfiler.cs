@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 
 namespace SharpInference.Pipeline;
@@ -15,6 +16,12 @@ public sealed class ExpertAccessProfiler
     private readonly long[] _misses; // same layout
     private long _totalHits;
     private long _totalMisses;
+
+    // Wall time (Stopwatch ticks) spent in the SYNCHRONOUS on-miss expert upload —
+    // the stall the issue #217 prefetch/overlap work hides. Driven caller-side so the
+    // timer wraps only the blocking upload, not the cache/lock bookkeeping. An A/B with
+    // prefetch on vs off should show this collapse even as the miss count holds.
+    private long _missStallTicks;
 
     // Warm-pin snapshot. Populated once when the slot manager pins the hot set;
     // PrintStats uses these to compute before/after-warm hit rates so callers can
@@ -47,6 +54,15 @@ public sealed class ExpertAccessProfiler
 
     public long TotalHits => Interlocked.Read(ref _totalHits);
     public long TotalMisses => Interlocked.Read(ref _totalMisses);
+
+    /// <summary>
+    /// Accumulate the wall time of one synchronous on-miss upload. <paramref name="stopwatchTicks"/>
+    /// is a <see cref="Stopwatch.GetTimestamp"/> delta (call site wraps only the blocking upload).
+    /// </summary>
+    public void RecordMissStall(long stopwatchTicks) => Interlocked.Add(ref _missStallTicks, stopwatchTicks);
+
+    /// <summary>Total wall time spent in synchronous on-miss expert uploads, in milliseconds.</summary>
+    public double MissStallMs => Interlocked.Read(ref _missStallTicks) * 1000.0 / Stopwatch.Frequency;
 
     public double OverallHitRate
     {
@@ -180,6 +196,8 @@ public sealed class ExpertAccessProfiler
         long th = TotalHits, tm = TotalMisses;
         double rate = (th + tm) == 0 ? 0.0 : (double)th / (th + tm);
         sb.AppendLine($"[ExpertAccessProfiler] overall hit rate: {rate:P1} ({th} hits / {th + tm} accesses)");
+        double stallMs = MissStallMs;
+        sb.AppendLine($"[ExpertAccessProfiler] sync miss-stall: {stallMs:F1} ms over {tm} misses ({(tm == 0 ? 0.0 : stallMs / tm):F3} ms/miss)");
 
         if (_warmPinned is not null)
         {

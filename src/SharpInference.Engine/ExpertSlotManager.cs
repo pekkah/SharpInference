@@ -93,7 +93,10 @@ public sealed class ExpertSlotManager : IDisposable, IExpertPrefetchTarget
             }
 
             _profiler.RecordMiss(layer, expertId);
+            // Time only the blocking upload — the stall issue #217's overlap hides.
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             slot = UploadExpert(layer, expertId);
+            _profiler.RecordMissStall(System.Diagnostics.Stopwatch.GetTimestamp() - t0);
             _cache.Put(layer, expertId, slot);
             MaybeWarmPin();
             return slot;

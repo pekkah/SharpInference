@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using SharpInference.Core;
 using SharpInference.Cpu;
@@ -114,7 +115,10 @@ public sealed class CudaExpertSlotManager : IDisposable, IExpertPrefetchTarget
             }
 
             _profiler.RecordMiss(layer, expertId);
+            // Time only the blocking upload — the stall issue #217's overlap hides.
+            long t0 = Stopwatch.GetTimestamp();
             slot = UploadExpert(layer, expertId);
+            _profiler.RecordMissStall(Stopwatch.GetTimestamp() - t0);
             _cache.Put(layer, expertId, slot);
             MaybeWarmPin();
             return slot;
