@@ -2836,65 +2836,65 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         return new TensorRef(name, info, info.DType, _model.GetTensorDataPtr(info));
     }
 
+    /// <summary>
+    /// Pre-fault every weight page so the first request doesn't stall on demand paging
+    /// (issue #221). The whole model is mmap-resident on this CPU/Vulkan GDN pass, so
+    /// <see cref="MmapPrefault.RamGate.Always"/> skips the RAM-fit heuristic (subject only
+    /// to the <c>SHARPI_PREFAULT=0</c> kill switch).
+    /// </summary>
     private void PrefaultWeights()
     {
-        var tensors = new List<TensorRef> { _embTensor, _outputNorm, _outputWeight };
+        var regions = new List<(nint, long)>();
+        void Add(TensorRef t)
+        {
+            if (t.DataPtr != null) regions.Add(((nint)t.DataPtr, t.Info.ByteSize));
+        }
+
+        Add(_embTensor); Add(_outputNorm); Add(_outputWeight);
         int L = _hp.NumLayers;
         for (int i = 0; i < L; i++)
         {
-            tensors.Add(_attnNorm[i]);
-            tensors.Add(_postAttnNorm[i]);
+            Add(_attnNorm[i]);
+            Add(_postAttnNorm[i]);
             if (_hp.IsMoE)
             {
-                tensors.Add(_wGateInp[i]);
-                tensors.Add(_wGateShexp[i]); tensors.Add(_wUpShexp[i]); tensors.Add(_wDownShexp[i]);
-                tensors.Add(_wGateExps[i]); tensors.Add(_wUpExps[i]); tensors.Add(_wDownExps[i]);
+                Add(_wGateInp[i]);
+                Add(_wGateShexp[i]); Add(_wUpShexp[i]); Add(_wDownShexp[i]);
+                Add(_wGateExps[i]); Add(_wUpExps[i]); Add(_wDownExps[i]);
             }
             else
             {
-                tensors.Add(_wFfnGate[i]); tensors.Add(_wFfnUp[i]); tensors.Add(_wFfnDown[i]);
+                Add(_wFfnGate[i]); Add(_wFfnUp[i]); Add(_wFfnDown[i]);
             }
             if (_hp.LayerTypes![i] == LayerType.Attention)
             {
-                tensors.Add(_wQGate[i]); tensors.Add(_wK[i]); tensors.Add(_wV[i]); tensors.Add(_wO[i]);
+                Add(_wQGate[i]); Add(_wK[i]); Add(_wV[i]); Add(_wO[i]);
             }
             else
             {
-                tensors.Add(_wQkv[i]); tensors.Add(_wZGate[i]); tensors.Add(_ssmOut[i]);
-                tensors.Add(_ssmAlpha[i]); tensors.Add(_ssmBeta[i]);
+                Add(_wQkv[i]); Add(_wZGate[i]); Add(_ssmOut[i]);
+                Add(_ssmAlpha[i]); Add(_ssmBeta[i]);
             }
         }
 
         if (_hasMtp)
         {
-            tensors.Add(_mtpAttnNorm);
-            tensors.Add(_mtpWQGate); tensors.Add(_mtpWK); tensors.Add(_mtpWV); tensors.Add(_mtpWO);
-            tensors.Add(_mtpPostAttnNorm);
+            Add(_mtpAttnNorm);
+            Add(_mtpWQGate); Add(_mtpWK); Add(_mtpWV); Add(_mtpWO);
+            Add(_mtpPostAttnNorm);
             if (_mtpIsMoE)
             {
-                tensors.Add(_mtpWGateInp);
-                tensors.Add(_mtpWGateShexp); tensors.Add(_mtpWUpShexp); tensors.Add(_mtpWDownShexp);
-                tensors.Add(_mtpWGateExps); tensors.Add(_mtpWUpExps); tensors.Add(_mtpWDownExps);
+                Add(_mtpWGateInp);
+                Add(_mtpWGateShexp); Add(_mtpWUpShexp); Add(_mtpWDownShexp);
+                Add(_mtpWGateExps); Add(_mtpWUpExps); Add(_mtpWDownExps);
             }
             else
             {
-                tensors.Add(_mtpFfnGate); tensors.Add(_mtpFfnUp); tensors.Add(_mtpFfnDown);
+                Add(_mtpFfnGate); Add(_mtpFfnUp); Add(_mtpFfnDown);
             }
         }
 
-        long touchSum = 0;
-        Parallel.ForEach(tensors, tensor =>
-        {
-            long size = tensor.Info.ByteSize;
-            byte* ptr = tensor.DataPtr;
-            long localSum = 0;
-            for (long off = 0; off < size; off += 4096)
-                localSum += ptr[off];
-            if (size > 0)
-                localSum += ptr[size - 1];
-            Interlocked.Add(ref touchSum, localSum);
-        });
-        if (touchSum == long.MinValue) Console.Write(touchSum);
+        MmapPrefault.Run("HybridGdnForwardPass", regions, MmapPrefault.RamGate.Always);
     }
 
     // ============================================================

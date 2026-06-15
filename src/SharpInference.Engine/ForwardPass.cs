@@ -507,54 +507,48 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
         : mb * 1024 * 1024;
 
     /// <summary>
-    /// Touch every 4KB page of all weight tensors to force OS page-in,
-    /// eliminating soft page faults during inference.
+    /// Pre-fault every weight page so the first request doesn't stall on demand paging
+    /// (issue #221). This is the fully-CPU pass — the whole model is mmap-resident, the
+    /// user chose to run it from RAM, so <see cref="MmapPrefault.RamGate.Always"/> skips
+    /// the RAM-fit heuristic (subject only to the <c>SHARPI_PREFAULT=0</c> kill switch).
     /// </summary>
     private void PrefaultWeights()
     {
-        var tensors = new List<TensorRef> { _embTensor, _outputNorm, _outputWeight };
+        var regions = new List<(nint, long)>();
+        void Add(TensorRef t)
+        {
+            if (t.DataPtr != null) regions.Add(((nint)t.DataPtr, t.Info.ByteSize));
+        }
+
+        Add(_embTensor); Add(_outputNorm); Add(_outputWeight);
         int L = _hp.NumLayers;
         for (int i = 0; i < L; i++)
         {
             bool kvShared = _layerKvSrc is not null && _layerKvSrc[i] >= 0;
-            tensors.Add(_attnNorm[i]);
-            tensors.Add(_wq[i]); tensors.Add(_wo[i]);
-            // k_eq_v global layers have no attn_v (_wv[i] is default/unset).
-            if (!kvShared) { tensors.Add(_wk[i]); if (_wv[i].DataPtr is not null) tensors.Add(_wv[i]); }
-            tensors.Add(_ffnNorm[i]);
-            if (_postAttnNorm is not null) tensors.Add(_postAttnNorm[i]);
-            if (_postFfwNorm is not null) tensors.Add(_postFfwNorm[i]);
+            Add(_attnNorm[i]);
+            Add(_wq[i]); Add(_wo[i]);
+            // k_eq_v global layers have no attn_v (_wv[i] is default/unset; Add skips null).
+            if (!kvShared) { Add(_wk[i]); Add(_wv[i]); }
+            Add(_ffnNorm[i]);
+            if (_postAttnNorm is not null) Add(_postAttnNorm[i]);
+            if (_postFfwNorm is not null) Add(_postFfwNorm[i]);
 
             if (_hp.IsMoE)
             {
-                tensors.Add(_wGateInp![i]);
-                tensors.Add(_wGateExps![i]); tensors.Add(_wUpExps![i]); tensors.Add(_wDownExps![i]);
+                Add(_wGateInp![i]);
+                Add(_wGateExps![i]); Add(_wUpExps![i]); Add(_wDownExps![i]);
                 if (_hp.HasSharedExpert)
                 {
-                    tensors.Add(_wGateShexp![i]); tensors.Add(_wUpShexp![i]); tensors.Add(_wDownShexp![i]);
+                    Add(_wGateShexp![i]); Add(_wUpShexp![i]); Add(_wDownShexp![i]);
                 }
             }
             else
             {
-                tensors.Add(_wGate[i]); tensors.Add(_wUp[i]); tensors.Add(_wDown[i]);
+                Add(_wGate[i]); Add(_wUp[i]); Add(_wDown[i]);
             }
         }
 
-        long touchSum = 0;
-        Parallel.ForEach(tensors, tensor =>
-        {
-            long size = tensor.Info.ByteSize;
-            byte* ptr = tensor.DataPtr;
-            long localSum = 0;
-            for (long off = 0; off < size; off += 4096)
-                localSum += ptr[off];
-            if (size > 0)
-                localSum += ptr[size - 1];
-            Interlocked.Add(ref touchSum, localSum);
-        });
-
-        // Prevent dead-code elimination
-        if (touchSum == long.MinValue) Console.Write(touchSum);
+        MmapPrefault.Run("ForwardPass", regions, MmapPrefault.RamGate.Always);
     }
 
     public PagedKvCache Cache => _kvCache;
