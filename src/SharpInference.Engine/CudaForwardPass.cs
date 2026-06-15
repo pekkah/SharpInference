@@ -1628,6 +1628,50 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         }
     }
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Gemma 4 only: image input (issue #250) splices vision soft tokens into the decode
+    /// stream. Non-Gemma arches and partial-offload hybrids don't implement the seam.
+    /// </remarks>
+    public bool SupportsEmbeddingInput => _isGemma4Like;
+
+    /// <summary>
+    /// Forward one position from a PRECOMPUTED embedding (a vision soft token) instead of a
+    /// token-table lookup. The CUDA mirror of <see cref="ForwardPass.ForwardEmbedding"/>:
+    /// uploads the supplied embedding into the device hidden buffer and — per gemma4.cpp —
+    /// skips the sqrt(EmbeddingDim) embedding scale (raw embeddings arrive final, gemma4.cpp:182)
+    /// while still building the per-layer (PLE) projections from the padding token (id 0,
+    /// the multimodal branch of build_inp_per_layer). The device region (and its optional
+    /// CUDA graph) is identical to <see cref="ForwardGemma4"/>, so a graph captured during
+    /// text decode replays unchanged here. Gemma 4 only.
+    /// </summary>
+    public ReadOnlySpan<float> ForwardEmbedding(ReadOnlySpan<float> embedding, int position)
+    {
+        if (!_isGemma4Like)
+            throw new NotSupportedException(
+                "ForwardEmbedding (image input) is only supported for Gemma 4 on the CUDA backend.");
+        if (embedding.Length != _embDim)
+            throw new ArgumentException(
+                $"embedding length {embedding.Length} != model embedding dim {_embDim}.");
+
+        // 1. Upload the precomputed embedding into _hidden. No sqrt(d) scale (gemma4.cpp:182).
+        _gpu.UploadInto(_hidden, embedding);
+
+        // 2. PLE pre-pass from the padding token (multimodal build_inp_per_layer branch).
+        if (_hp.HasPerLayerTokenEmbd)
+            BuildPerLayerProjectionsGpu(0);
+
+        // 3. Transformer layers + final norm/output (same device region as text decode).
+        if (!TryRunGemma4DeviceRegionViaGraph(position))
+            RunGemma4DeviceRegion(position);
+
+        _gpu.Download(_logits, _logitsBuf);
+        _gpu.Synchronize();
+
+        _kvLength = Math.Max(_kvLength, position + 1);
+        return _logitsBuf;
+    }
+
     private ReadOnlySpan<float> ForwardGemma4(int token, int position)
     {
         if (s_regionProfile) return ForwardGemma4RegionProfiled(token, position);

@@ -21,7 +21,7 @@
     .\download-model.ps1 -Model qwen36-27b-mtp-q5       # Qwen3.6 27B-MTP Q5_K_M (18.5 GB) — higher-quality variant for the MTP bench row
     .\download-model.ps1 -Model qwen36-35b-a3b-mtp -DestDir E:\models  # Qwen3.6 35B-A3B-MTP UD-Q4_K_M (22.7 GB) — MoE MTP perf target for issue #25
     .\download-model.ps1 -Model carnice-35b-a3b-mtp -DestDir E:\models  # Carnice (Qwen3.6-35B-A3B-MTP, agentic/tool-calling) APEX-MTP I-Compact (17.3 GB)
-    .\download-model.ps1 -Model gemma4-12b-qat -DestDir E:\models  # Gemma 4 12B-it QAT q4_0 (~7.0 GB) — issue #124 PRIMARY (official quantization-aware-trained)
+    .\download-model.ps1 -Model gemma4-12b-qat -DestDir E:\models  # Gemma 4 12B-it QAT q4_0 + vision/audio mmproj (~7.2 GB) — issue #124 PRIMARY (official quantization-aware-trained)
     .\download-model.ps1 -Model gemma4-12b-q4km -DestDir E:\models # Gemma 4 12B-it Q4_K_M (~7.3 GB) — issue #124 fallback / K-quant cross-check
     .\download-model.ps1 -Model gemma4-e4b-qat -DestDir E:\models  # Gemma 4 E4B-it QAT q4_0 (~5.15 GB) — fast small Gemma (~1.6× decode vs Q8_0)
     .\download-model.ps1 -Model llama4-scout            # Llama 4 Scout Q4_K_M (60.9 GB, 2 shards)
@@ -136,26 +136,48 @@ $Models = @{
     # Google's official quantization-aware-trained (QAT) 4-bit weights. Stored as
     # q4_0 (NOT a K-quant), so this exercises the q4_0 dequant path (gap G0). Best
     # quality-per-byte at 4-bit; fits full-GPU offload on 12 GB VRAM. This is the
-    # PRIMARY iteration-1 target. Text GGUF only — vision mmproj is a separate
-    # follow-up (out of scope for iter 1).
+    # PRIMARY iteration-1 target.
+    #
+    # Gemma 4 12B is an encoder-free *unified* multimodal model (text + image +
+    # audio + video): it projects raw image patches / audio waveforms straight into
+    # the LLM embedding space via lightweight linear layers. In the GGUF ecosystem
+    # those projection tensors still ship as a small companion mmproj (~175 MB), so
+    # we pull it alongside the text GGUF. The mmproj is only consumed once sharpi
+    # grows a multimodal input path (vision plan / issue #250) — the text GGUF runs
+    # fine on its own without it.
     "gemma4-12b-qat" = @{
-        Files = @("gemma-4-12b-it-qat-q4_0.gguf")
-        Urls  = @("https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/main/gemma-4-12b-it-qat-q4_0.gguf")
-        Size  = "~7.0 GB"
-        SizeGB = 7.0
-        Phase = "issue #124 (PRIMARY — QAT q4_0, dense no-PLE path)"
+        Files = @("gemma-4-12b-it-qat-q4_0.gguf", "mmproj-gemma-4-12b-it-qat-q4_0.gguf")
+        Urls  = @(
+            "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/main/gemma-4-12b-it-qat-q4_0.gguf",
+            "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/main/mmproj-gemma-4-12b-it-qat-q4_0.gguf"
+        )
+        Size  = "~7.2 GB (text 7.0 GB + vision/audio mmproj 0.17 GB)"
+        SizeGB = 7.2
+        Phase = "issue #124 (PRIMARY — QAT q4_0, dense no-PLE path) + mmproj (multimodal projector)"
     }
     # Gemma 4 E4B-it — Google's official QAT q4_0 weights for the small (effective-4B)
     # Gemma 4. ~5.15 GB vs the 8.19 GB Q8_0: ~1.6× fewer bytes/token → ~1.6× faster
     # decode at near-identical quality (QAT). Same dense gemma4 arch (PLE + 5:1 SWA).
     # Filename is upstream's `gemma-4-E4B_q4_0-it.gguf` (note the underscore — not the
-    # `-it-qat-q4_0` pattern of the 12B). The repo also ships an mmproj (vision) we skip.
+    # `-it-qat-q4_0` pattern of the 12B).
+    #
+    # The companion mmproj is pulled alongside, but NOTE the E4B vision path is NOT the
+    # 12B's. The E4B mmproj is ~992 MB (vs the 12B's tiny ~175 MB linear projector) —
+    # it carries a full ENCODER. Confirmed from the header: vision projector_type=`gemma4v`
+    # (a 16-block transformer ViT: 768-dim, 12 heads, QK-norm, GeGLU, conv patch-embed) plus
+    # an audio encoder projector_type=`gemma4a`. The 12B is encoder-free `gemma4uv` instead.
+    # So #250's image path does NOT cover E4B; supporting it needs the ViT (and audio)
+    # encoder forward pass (tracked by the E4B vision plan, issue #126). The text GGUF runs
+    # fine on its own without the mmproj.
     "gemma4-e4b-qat" = @{
-        Files = @("gemma-4-E4B_q4_0-it.gguf")
-        Urls  = @("https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/resolve/main/gemma-4-E4B_q4_0-it.gguf")
-        Size  = "~5.15 GB"
-        SizeGB = 5.15
-        Phase = "Gemma 4 E4B QAT q4_0 (fast small Gemma — ~1.6× decode vs Q8_0)"
+        Files = @("gemma-4-E4B_q4_0-it.gguf", "gemma-4-E4B-it-mmproj.gguf")
+        Urls  = @(
+            "https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/resolve/main/gemma-4-E4B_q4_0-it.gguf",
+            "https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/resolve/main/gemma-4-E4B-it-mmproj.gguf"
+        )
+        Size  = "~6.15 GB (text 5.15 GB + vision mmproj 0.99 GB)"
+        SizeGB = 6.15
+        Phase = "Gemma 4 E4B QAT q4_0 (fast small Gemma — ~1.6× decode vs Q8_0) + mmproj (conv vision encoder; NOT the 12B gemma4uv path — issue #126)"
     }
     # Community K-quant of the (non-QAT) instruct weights — the Q4_K_M fallback /
     # cross-check next to the QAT q4_0 primary. Exercises the K-quant path so both
@@ -284,9 +306,15 @@ function Download-Model {
 
     # Guard: refuse to start a download that won't fit (10% headroom for temp/partial files).
     # Only enforced when the model declares a numeric SizeGB. Skipped if files already present.
+    # Subtract bytes already on disk so a small top-up (e.g. adding the mmproj next to an
+    # existing main GGUF) isn't blocked by the full bundle's SizeGB.
     if (-not $allPresent -and $info.ContainsKey('SizeGB') -and $null -ne $freeGB) {
-        $neededGB = [math]::Round($info.SizeGB * 1.1, 1)
-        if ($freeGB -lt $neededGB) {
+        $presentGB = (($info.Files |
+            Where-Object { Test-Path (Join-Path $ModelDir $_) } |
+            ForEach-Object { (Get-Item (Join-Path $ModelDir $_)).Length } |
+            Measure-Object -Sum).Sum) / 1GB
+        $neededGB = [math]::Round([math]::Max($info.SizeGB - $presentGB, 0) * 1.1, 1)
+        if ($neededGB -gt 0 -and $freeGB -lt $neededGB) {
             Write-Error "[$key] Not enough disk space on $driveName : need ~$neededGB GB (incl. headroom), have $freeGB GB. Use -DestDir to pick a drive with more room (e.g. -DestDir E:\models)."
             return
         }
@@ -302,8 +330,10 @@ function Download-Model {
     Write-Host "  Files: $($info.Files -join ', ')"
     Write-Host ""
 
-    # Component labels for image bundles
+    # Component labels for multi-file bundles
     $labels = @{
+        "mmproj-gemma-4-12b-it-qat-q4_0.gguf"               = "Multimodal projector (encoder-free vision/audio)"
+        "gemma-4-E4B-it-mmproj.gguf"                         = "Vision (gemma4v ViT) + audio (gemma4a) encoders; NOT the 12B gemma4uv"
         "z_image_turbo-Q5_K_M.gguf"                         = "DiT (image model)"
         "z_image_turbo-Q8_0.gguf"                           = "DiT (image model)"
         "Z-Image-AbliteratedV1.Q5_K_M.gguf"                 = "Text encoder (abliterated Qwen3-4B)"

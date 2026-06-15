@@ -2,6 +2,31 @@
 
 Status: **research / planning, no code written yet.** Tracked by **issue #126**.
 
+> ## ⚠️ Verification update (2026-06-15) — architecture confirmed from the real mmproj
+> The §1 "verification debt" is now **retired**: the E4B mmproj header was dumped
+> (`E:\models\gemma-4-E4B-it-mmproj.gguf`, ~992 MB). **The Gemma-3n / MobileNet-V5 assumption
+> below is WRONG.** What E4B actually ships:
+> - **Vision** `clip.vision.projector_type = gemma4v` — a **transformer ViT** encoder (NOT a
+>   conv MobileNet): `block_count=16`, `embedding_length=768`, `head_count=12` (head_dim 64,
+>   with QK-norm), GeGLU FFN (`feed_forward_length=3072`), conv patch-embed `v.patch_embd.weight
+>   [16,16,3,768]`, learned 2D position table `v.position_embd.weight [768,10240,2]`, `image_size=224`,
+>   `patch_size=16`, image_mean=0/std=1.
+> - **Audio** `clip.audio.projector_type = gemma4a` — a separate ~12-block conformer-style encoder
+>   (`a.*` tensors, `num_mel_bins=128`); `clip.has_audio_encoder=True`.
+> - Projectors: `mm.input_projection [768→2560]` (vision) and `mm.a.input_projection [1536→2560]`
+>   (audio), into the E4B text embed dim 2560.
+>
+> **Net:** the plan's *conclusion* (E4B is encoder-FULL and needs a real encoder forward pass,
+> unlike the 12B) holds; the *specifics* (MobileNet-V5 conv stack, gemma3n, 768² input, 256 fixed
+> tokens, `<start_of_image>` markers) do not. The good news: a ViT reuses our existing
+> attention/MLP/RMSNorm kernels almost directly — this is the plan's §4 "SigLIP fallback" path,
+> which turns out to be the actual architecture. Phase V2 should target the `gemma4v` ViT, not
+> MobileNet-V5; rewrite §1/§2/§3 hyperparameters against the header facts above before coding.
+>
+> **This is NOT the 12B path.** The Gemma 4 **12B** uses encoder-free `gemma4uv` (raw patches →
+> linear projection, no ViT) and is implemented in `src/SharpInference.Vision` (issue #250, see the
+> gemma4uv section of `docs/SharpInference-Design.md`). E4B (`gemma4v`+`gemma4a`) remains unimplemented.
+
 This doc scopes adding **image input** to the already-working Gemma 4 E4B text path. Audio (the
 other E-model modality) is noted but deferred. It is the multimodal counterpart to
 `docs/gemma4-e4b-implementation-plan.md` (whose *text* phasing is now stale — the gemma4 text

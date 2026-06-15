@@ -40,6 +40,7 @@
   <ItemGroup>
     <ProjectReference Include="..\SharpInference.Diffusion\SharpInference.Diffusion.csproj" />
     <ProjectReference Include="..\SharpInference.Engine\SharpInference.Engine.csproj" />
+    <ProjectReference Include="..\SharpInference.Vision\SharpInference.Vision.csproj" />
     <ProjectReference Include="..\SharpInference.Vulkan\SharpInference.Vulkan.csproj" />
     <ProjectReference Include="..\SharpInference.Cuda\SharpInference.Cuda.csproj" />
   </ItemGroup>

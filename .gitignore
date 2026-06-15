@@ -444,3 +444,7 @@ prof/
 
 # Per-developer host overrides (model paths, etc.) — not committed
 **/appsettings.Local.json
+
+# Gemma 4 vision parity golden — large binary, regenerable via scripts/gemma4uv_ref.py (issue #250).
+# meta.json (the spec) stays tracked.
+tests/fixtures/gemma4uv/*.f32

@@ -22,6 +22,27 @@ public interface IForwardPass : IDisposable
     ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0);
 
     /// <summary>
+    /// Whether this pass implements <see cref="ForwardEmbedding"/> (precomputed-embedding
+    /// input, e.g. multimodal vision soft tokens — issue #250). Defaults to <c>false</c>.
+    /// </summary>
+    bool SupportsEmbeddingInput => false;
+
+    /// <summary>
+    /// Run one position from a PRECOMPUTED embedding (length = EmbeddingDim) instead of a
+    /// token-table lookup, returning next-token logits. Used to splice multimodal soft
+    /// tokens into the decode stream at <paramref name="position"/>. Implementations must
+    /// skip token-only embedding transforms that don't apply to raw embeddings (e.g. Gemma's
+    /// sqrt(EmbeddingDim) scale) AND, on per-layer-embedding (PLE) models, build the per-layer
+    /// projections from the padding token (id 0) rather than a real token — the multimodal
+    /// branch of gemma4.cpp's build_inp_per_layer. These two facts are the correctness contract
+    /// every backend's mirror must keep. No-op passes throw; check <see cref="SupportsEmbeddingInput"/> first.
+    /// </summary>
+    ReadOnlySpan<float> ForwardEmbedding(ReadOnlySpan<float> embedding, int position) =>
+        throw new NotSupportedException(
+            $"{GetType().Name} does not support precomputed-embedding input. " +
+            "Check SupportsEmbeddingInput before calling.");
+
+    /// <summary>
     /// Truncate the KV cache to the given length, discarding positions &gt;= length.
     /// Used by speculative decoding to rewind rejected draft tokens.
     /// <para>
