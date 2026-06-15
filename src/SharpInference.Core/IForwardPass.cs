@@ -10,6 +10,31 @@ public interface IForwardPass : IDisposable
     ReadOnlySpan<float> Forward(int token, int position);
 
     /// <summary>
+    /// Whether <see cref="ForwardArgmax"/> computes the greedy argmax on-device, avoiding the
+    /// per-token full-vocab logits download (issue #219). Defaults to <c>false</c>; GPU passes that
+    /// implement an on-device argmax override this. The engine consults it only on the pure-greedy
+    /// decode path (temperature 0, no logit bias), where the full logits are never needed.
+    /// </summary>
+    bool SupportsGpuArgmax => false;
+
+    /// <summary>
+    /// Run one token and return only the greedy argmax — the highest-logit token id and its value —
+    /// without materializing the full-vocab logits on the host (issue #219). The default falls back
+    /// to <see cref="Forward"/> + a CPU argmax scan; backends reporting
+    /// <see cref="SupportsGpuArgmax"/> override it with a device-side reduction. The argmax MUST match
+    /// a left-to-right strict-<c>&gt;</c> host scan: highest value wins, lowest index on a tie.
+    /// </summary>
+    (int Token, float Logit) ForwardArgmax(int token, int position)
+    {
+        var logits = Forward(token, position);
+        int idx = 0;
+        float max = logits[0];
+        for (int i = 1; i < logits.Length; i++)
+            if (logits[i] > max) { max = logits[i]; idx = i; }
+        return (idx, max);
+    }
+
+    /// <summary>
     /// Batch-process prompt tokens and return logits for the last token.
     /// Faster than sequential Forward() calls for long prompts due to batched GEMM.
     /// </summary>
@@ -200,6 +225,40 @@ public interface IForwardPass : IDisposable
         throw new NotSupportedException(
             $"{GetType().Name} does not implement BatchVerify. " +
             "Check SupportsBatchVerify before calling.");
+
+    /// <summary>
+    /// Whether <see cref="BatchVerifyArgmax"/> computes the per-position verify argmax on-device,
+    /// so a greedy verify (pMin = 1.0) downloads k <c>(index, value)</c> pairs instead of k
+    /// full-vocab logits vectors (issue #219). Defaults to <c>false</c>; GPU verify passes override
+    /// it. Consulted only on the greedy verify path, where the full distributions are never needed.
+    /// </summary>
+    bool SupportsBatchVerifyArgmax => false;
+
+    /// <summary>
+    /// Greedy-verify counterpart of <see cref="BatchVerify"/>: processes the k tokens as one packed
+    /// pass with identical cache effects (the caller rolls back exactly as for BatchVerify), and
+    /// returns <c>result[i]</c> = the argmax (token id + logit value) of the logits after
+    /// <c>tokens[i]</c>, without materializing the full per-position distributions. Only sound when
+    /// the consumer needs the argmax alone (greedy accept / saved next-token). The default falls
+    /// back to <see cref="BatchVerify"/> + a host argmax per position (same lowest-index tie-break);
+    /// GPU passes reporting <see cref="SupportsBatchVerifyArgmax"/> override it with a device-side
+    /// row reduction that skips the k×vocab download.
+    /// </summary>
+    (int Index, float Value)[] BatchVerifyArgmax(int[] tokens, int startPos)
+    {
+        var batch = BatchVerify(tokens, startPos);
+        var result = new (int Index, float Value)[batch.Length];
+        for (int i = 0; i < batch.Length; i++)
+        {
+            var l = batch[i];
+            int idx = 0;
+            float max = l[0];
+            for (int j = 1; j < l.Length; j++)
+                if (l[j] > max) { max = l[j]; idx = j; }
+            result[i] = (idx, max);
+        }
+        return result;
+    }
 
     /// <summary>
     /// Maximum token count accepted by a single <see cref="BatchVerify"/> call.

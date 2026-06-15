@@ -708,6 +708,15 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                     }
                     int thinkingCount = 0;
 
+                    // #219: on the pure-greedy path (temp 0, no logit bias) with a pass that can
+                    // argmax on-device, carry just the next token id instead of downloading the full
+                    // vocab logits every step. gpuNext holds the argmax of the most recent forward;
+                    // the first comes from the prefill logits already on the host.
+                    bool useGpuArgmax = sp.Temperature <= 0f
+                        && _fwd.SupportsGpuArgmax
+                        && sp.LogitBias is not { Count: > 0 };
+                    int gpuNext = useGpuArgmax ? Sampler.Greedy(logits) : 0;
+
                     for (int i = 0; i < sp.MaxNewTokens; i++)
                     {
                         ct.ThrowIfCancellationRequested();
@@ -721,6 +730,10 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                             && thinkingEnabled && endThinkId > 0)
                         {
                             next = endThinkId;
+                        }
+                        else if (useGpuArgmax)
+                        {
+                            next = gpuNext;
                         }
                         else
                         {
@@ -757,7 +770,8 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                             if (textTail.Length > 0)
                                 channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, textTail));
                             inThinking = true;
-                            logits = _fwd.Forward(next, startPos + i);
+                            if (useGpuArgmax) gpuNext = _fwd.ForwardArgmax(next, startPos + i).Token;
+                            else logits = _fwd.Forward(next, startPos + i);
                             continue;
                         }
                         if (thinkingEnabled && next == endThinkId && inThinking)
@@ -767,7 +781,8 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                             if (thinkTail.Length > 0)
                                 channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Thinking, thinkTail));
                             inThinking = false;
-                            logits = _fwd.Forward(next, startPos + i);
+                            if (useGpuArgmax) gpuNext = _fwd.ForwardArgmax(next, startPos + i).Token;
+                            else logits = _fwd.Forward(next, startPos + i);
                             continue;
                         }
 
@@ -785,7 +800,8 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                                 channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, chunk));
                         }
 
-                        logits = _fwd.Forward(next, startPos + i);
+                        if (useGpuArgmax) gpuNext = _fwd.ForwardArgmax(next, startPos + i).Token;
+                        else logits = _fwd.Forward(next, startPos + i);
                     }
 
                     // End-of-loop: flush both decoders defensively (whichever was active).

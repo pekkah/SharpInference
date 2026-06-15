@@ -407,6 +407,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private byte* _batchSnapshotBuf;
     private long _batchSnapshotCap;
     private bool _batchSnapshotValid;
+    private bool _bvArgmaxOnly;                                // #219 greedy-verify fast path
+    private (int Index, float Value)[] _bvArgmaxResult = [];   // #219 result stashed by the tail
     private int _batchStartPos;        // startPos of the most recent batched verify
     private int _batchK;               // token count of the most recent batched verify
 
@@ -3257,6 +3259,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         && !KvCacheCompacted
         && Environment.GetEnvironmentVariable("SHARPI_DISABLE_BATCH_VERIFY") != "1";
 
+    /// <inheritdoc/>
+    // #219: the verify lm_head logits are produced on-device anyway, so the greedy verify can
+    // reduce them to per-position argmaxes here instead of downloading k×vocab. Same kill switch.
+    public bool SupportsBatchVerifyArgmax => SupportsBatchVerify && _gpu.GpuArgmaxEnabled;
+
     /// <inheritdoc />
     /// On the GPU-GDN trunk the ceiling is the device snapshot ring's capacity
     /// (slots + 1, reserved at construction — SHARPI_MTP_BATCH_MAX). The
@@ -3745,6 +3752,32 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         //    weight dtype supports it, else a per-token MatMul loop.
         var normAll = _gpuBtNorm!;   // free to reuse after the last trunk layer
         _gpu.RmsNormBatched(normAll, stream, _gpuOutputNorm!, k, embDim, _hp.RmsNormEps);
+
+        // #219 greedy verify (pMin=1.0): reduce the lm_head output to one (idx, value) per position
+        // on-device — a k*8-byte download — instead of materializing and downloading k×vocab logits.
+        if (_bvArgmaxOnly)
+        {
+            if (BatchedMatMulSupported(_gpuOutputWeight!))
+            {
+                GpuMatMulBatched(_gpuBvLogitsAll!, _gpuOutputWeight!, normAll, k);
+                _bvArgmaxResult = _gpu.ArgmaxRows(_gpuBvLogitsAll!, k, _hp.VocabSize, _hp.VocabSize);
+            }
+            else
+            {
+                var outDtA = _gpuWeightDTypes.TryGetValue(_gpuOutputWeight!.Handle, out var dtA)
+                    ? dtA : DType.Float32;
+                _bvArgmaxResult = new (int, float)[k];
+                for (int i = 0; i < k; i++)
+                {
+                    _gpu.CopyDeviceRegion(_gpuHidden, 0, normAll, i * embBytes, embBytes);
+                    _gpu.MatMul(_gpuLogits, _gpuOutputWeight!, _gpuHidden, outDtA);
+                    _bvArgmaxResult[i] = _gpu.Argmax(_gpuLogits);
+                }
+            }
+            _batchSnapshotValid = true;
+            return [];
+        }
+
         var result = new float[k][];
         if (BatchedMatMulSupported(_gpuOutputWeight!))
         {
@@ -3771,6 +3804,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         _batchSnapshotValid = true;
         return result;
+    }
+
+    /// <inheritdoc/>
+    public (int Index, float Value)[] BatchVerifyArgmax(int[] tokens, int startPos)
+    {
+        _bvArgmaxOnly = true;
+        try { BatchVerify(tokens, startPos); }   // identical trunk + cache effects; tail does the argmax
+        finally { _bvArgmaxOnly = false; }
+        return _bvArgmaxResult;
     }
 
     /// <summary>

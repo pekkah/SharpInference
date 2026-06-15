@@ -58,6 +58,11 @@ public sealed class MtpDecoder
     private int _nextPos;
     private readonly float[] _savedMainLogits;
     private float[] _savedHidden;
+    // #219: on the greedy verify fast path (pMin=1.0 + BatchVerifyArgmax) we carry only the saved
+    // next-token's argmax index, not its full logits. _hasSavedArgmax says which is current; every
+    // full-logits write to _savedMainLogits clears it, every argmax-path save sets it.
+    private int _savedMainArgmax;
+    private bool _hasSavedArgmax;
 
     // Acceptance statistics (per Decode call cumulative)
     private long _totalDraftsEmitted;
@@ -121,6 +126,7 @@ public sealed class MtpDecoder
 
         _nextPos = nextPosition;
         lastMainLogits.CopyTo(_savedMainLogits);
+        _hasSavedArgmax = false;
         // Snapshot the main pass's current LastHidden so the first draft can use it.
         var h = _fwd.LastHidden;
         if (h.IsEmpty)
@@ -220,7 +226,7 @@ public sealed class MtpDecoder
             // Each iter emits up to 2 tokens.
             int remaining = maxTokens - generated;
 
-            int t1 = ArgMax(_savedMainLogits);
+            int t1 = _hasSavedArgmax ? _savedMainArgmax : ArgMax(_savedMainLogits);
             if (IsStop(t1, stopTokenIds)) return;
             emitToken(t1); generated++;
             if (generated >= maxTokens) return;
@@ -257,6 +263,7 @@ public sealed class MtpDecoder
                 // logits so a follow-up call resumes from a consistent state.
                 _fwd.LastHidden.CopyTo(_savedHidden);
                 mainLogits.CopyTo(_savedMainLogits);
+                _hasSavedArgmax = false;
                 _nextPos = P + 1;
                 return;
             }
@@ -265,6 +272,7 @@ public sealed class MtpDecoder
             {
                 _fwd.LastHidden.CopyTo(_savedHidden);
                 mainLogits.CopyTo(_savedMainLogits);
+                _hasSavedArgmax = false;
                 _nextPos = P + 1;
                 return;
             }
@@ -287,6 +295,7 @@ public sealed class MtpDecoder
             // "previous hidden" the next iter's MTP draft will want.
             _fwd.LastHidden.CopyTo(_savedHidden);
             mainLogitsAfter.CopyTo(_savedMainLogits);
+            _hasSavedArgmax = false;
             _nextPos = P + 2;
         }
     }
@@ -342,7 +351,7 @@ public sealed class MtpDecoder
             }
 
             // ── Token 1: argmax of last main logits (greedy correctness) ──
-            int t1 = ArgMax(_savedMainLogits);
+            int t1 = _hasSavedArgmax ? _savedMainArgmax : ArgMax(_savedMainLogits);
             if (IsStop(t1, stopTokenIds)) return;
             emitToken(t1); generated++;
 
@@ -373,9 +382,19 @@ public sealed class MtpDecoder
             DraftMs += _phaseSw.Elapsed.TotalMilliseconds;
 
             // ── ONE batched main verify over tokens[0..kEff) ──────────
+            // #219: a pure-greedy verify (pMin >= 1.0) on a GPU pass fetches only the per-position
+            // argmaxes (k*8 bytes) instead of k full-vocab logits vectors. pMin < 1.0 still needs
+            // the distributions (AcceptDraft's softmax branch), so it keeps the full download.
+            bool argmaxFast = pMin >= 1.0f && _fwd.SupportsBatchVerifyArgmax;
             _phaseSw.Restart();
-            float[][] batch = _fwd.BatchVerify(tokens, P);
+            float[][]? batch = null;
+            (int Index, float Value)[]? verifyArgmax = null;
+            if (argmaxFast) verifyArgmax = _fwd.BatchVerifyArgmax(tokens, P);
+            else            batch = _fwd.BatchVerify(tokens, P);
             VerifyMs += _phaseSw.Elapsed.TotalMilliseconds;
+
+            // Verifier's greedy correction at draft position `pos` (argmax of the logits there).
+            int Target(int pos) => argmaxFast ? verifyArgmax![pos].Index : ArgMax(batch![pos]);
 
             // ── Greedy accept: count leading agreeing drafts ──────────
             // An accepted STOP draft also ends the chain here, EXCLUDED from `a`:
@@ -388,8 +407,11 @@ public sealed class MtpDecoder
             bool stopHit = false;
             for (int i = 1; i < kEff; i++)
             {
-                int target = ArgMax(batch[i - 1]);
-                if (!AcceptDraft(tokens[i], target, batch[i - 1], pMin, out _)) break;
+                int target = Target(i - 1);
+                bool accept = argmaxFast
+                    ? tokens[i] == target                              // pMin>=1.0: argmax-match only
+                    : AcceptDraft(tokens[i], target, batch![i - 1], pMin, out _);
+                if (!accept) break;
                 if (IsStop(tokens[i], stopTokenIds)) { stopHit = true; break; }
                 a++;
             }
@@ -400,7 +422,7 @@ public sealed class MtpDecoder
                 Console.Error.WriteLine(
                     $"[mtp-batch] P={P} k={kEff} t1={t1} " +
                     $"drafts=[{string.Join(",", tokens[1..])}] accepted={a}/{kEff - 1}" +
-                    (a < kEff - 1 ? $" correction={ArgMax(batch[a])}" : ""));
+                    (a < kEff - 1 ? $" correction={Target(a)}" : ""));
 
             _phaseSw.Restart();
             // ── Roll back the rejected tail (no-op when fully accepted) ──
@@ -433,7 +455,8 @@ public sealed class MtpDecoder
             // the correction on a reject, the chain continuation on full accept,
             // or the (un-emitted, un-committed) stop on stopHit. All caches sit
             // exactly at newPos, so a follow-up call resumes consistently.
-            batch[a].CopyTo(_savedMainLogits, 0);
+            if (argmaxFast) { _savedMainArgmax = verifyArgmax![a].Index; _hasSavedArgmax = true; }
+            else            { batch![a].CopyTo(_savedMainLogits, 0); _hasSavedArgmax = false; }
             HiddenAtChecked(newPos - 1).CopyTo(_savedHidden);
             _nextPos = newPos;
             if (stopHit) return;
