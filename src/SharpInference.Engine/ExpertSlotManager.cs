@@ -93,7 +93,13 @@ public sealed class ExpertSlotManager : IDisposable, IExpertPrefetchTarget
             }
 
             _profiler.RecordMiss(layer, expertId);
+            // Time the on-miss UploadExpert call — the synchronous expert-weight streaming
+            // that #217's overlap aimed to hide. Wraps only the upload, not the bookkeeping.
+            // (On the Vulkan path the forward pass services misses via TryGetCached + a CPU
+            // fallback, not GetOrLoad, so this site rarely fires there.)
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             slot = UploadExpert(layer, expertId);
+            _profiler.RecordMissStall(System.Diagnostics.Stopwatch.GetTimestamp() - t0);
             _cache.Put(layer, expertId, slot);
             MaybeWarmPin();
             return slot;

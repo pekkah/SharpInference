@@ -174,6 +174,48 @@ public sealed class CudaAsyncUploadTests
     }
 
     /// <summary>
+    /// Issue #217 staging ring: issuing more uploads than the ring's slot count forces
+    /// slot reuse — the drain-then-re-record of a backend-owned fence + staging-buffer reuse
+    /// the ring exists to make safe. Every upload must still round-trip its own distinct
+    /// payload; a stale staging slot, a wrong-fence drain, or an off-by-one in the slot index
+    /// would corrupt the tensors uploaded after the first wrap. (The other tests issue ≤5
+    /// uploads and never wrap, so this is the only coverage of the reuse path.)
+    /// </summary>
+    [Fact]
+    public void UploadBackground_RingWrap_AllPayloadsRoundTrip()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        const int N = 64;    // > the 32-slot ring → at least one full wrap (each slot reused)
+        const int Len = 257; // distinct, multi-element payload per upload
+        var handles = new CudaUploadHandle[N];
+        var sources = new float[N][];
+        for (int u = 0; u < N; u++)
+        {
+            var s = new float[Len];
+            for (int i = 0; i < Len; i++) s[i] = u * 1000f + i; // unique per (upload, index)
+            sources[u] = s;
+            handles[u] = gpu.UploadBackground(s, TensorShape.D1(Len));
+        }
+
+        for (int u = 0; u < N; u++)
+        {
+            gpu.WaitForUpload(handles[u]);
+            var rt = new float[Len];
+            gpu.Download(handles[u].Tensor, rt);
+            for (int i = 0; i < Len; i++)
+                Assert.Equal(sources[u][i], rt[i]);
+        }
+
+        for (int u = 0; u < N; u++)
+        {
+            gpu.ReleaseUploadHandle(handles[u]);
+            gpu.Free(handles[u].Tensor);
+        }
+    }
+
+    /// <summary>
     /// Backend.UploadStream is nint.Zero until the first background upload, then
     /// becomes non-zero and is reused across subsequent calls. Validates the
     /// lazy-init contract documented on the property.

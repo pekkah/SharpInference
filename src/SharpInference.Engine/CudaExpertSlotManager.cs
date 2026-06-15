@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using SharpInference.Core;
 using SharpInference.Cpu;
@@ -114,7 +115,12 @@ public sealed class CudaExpertSlotManager : IDisposable, IExpertPrefetchTarget
             }
 
             _profiler.RecordMiss(layer, expertId);
+            // Time the on-miss UploadExpert call — the synchronous expert-weight streaming
+            // (host stage + H2D, drained on this or the next call) that #217's overlap aimed
+            // to hide. Wraps only the upload, not the cache/lock bookkeeping.
+            long t0 = Stopwatch.GetTimestamp();
             slot = UploadExpert(layer, expertId);
+            _profiler.RecordMissStall(Stopwatch.GetTimestamp() - t0);
             _cache.Put(layer, expertId, slot);
             MaybeWarmPin();
             return slot;

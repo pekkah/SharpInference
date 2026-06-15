@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 
 namespace SharpInference.Pipeline;
@@ -15,6 +16,15 @@ public sealed class ExpertAccessProfiler
     private readonly long[] _misses; // same layout
     private long _totalHits;
     private long _totalMisses;
+
+    // Wall time (Stopwatch ticks) spent in the SYNCHRONOUS on-miss expert upload, plus the
+    // number of such uploads timed. Driven caller-side (around UploadExpert in GetOrLoad) so
+    // the timer wraps only the blocking upload, not the cache/lock bookkeeping. Reported per
+    // STALLED upload rather than per miss: a backend whose forward pass services misses via
+    // TryGetCached + a separate fallback (the Vulkan path) records the miss but no stall, so
+    // averaging over TotalMisses would understate ms/upload.
+    private long _missStallTicks;
+    private long _missStallCount;
 
     // Warm-pin snapshot. Populated once when the slot manager pins the hot set;
     // PrintStats uses these to compute before/after-warm hit rates so callers can
@@ -47,6 +57,22 @@ public sealed class ExpertAccessProfiler
 
     public long TotalHits => Interlocked.Read(ref _totalHits);
     public long TotalMisses => Interlocked.Read(ref _totalMisses);
+
+    /// <summary>
+    /// Accumulate the wall time of one synchronous on-miss upload. <paramref name="stopwatchTicks"/>
+    /// is a <see cref="Stopwatch.GetTimestamp"/> delta (call site wraps only the blocking upload).
+    /// </summary>
+    public void RecordMissStall(long stopwatchTicks)
+    {
+        Interlocked.Add(ref _missStallTicks, stopwatchTicks);
+        Interlocked.Increment(ref _missStallCount);
+    }
+
+    /// <summary>Total wall time spent in synchronous on-miss expert uploads, in milliseconds.</summary>
+    public double MissStallMs => Interlocked.Read(ref _missStallTicks) * 1000.0 / Stopwatch.Frequency;
+
+    /// <summary>Number of synchronous on-miss uploads timed (the denominator for ms/upload).</summary>
+    public long MissStallCount => Interlocked.Read(ref _missStallCount);
 
     public double OverallHitRate
     {
@@ -180,6 +206,9 @@ public sealed class ExpertAccessProfiler
         long th = TotalHits, tm = TotalMisses;
         double rate = (th + tm) == 0 ? 0.0 : (double)th / (th + tm);
         sb.AppendLine($"[ExpertAccessProfiler] overall hit rate: {rate:P1} ({th} hits / {th + tm} accesses)");
+        double stallMs = MissStallMs;
+        long stallN = MissStallCount;
+        sb.AppendLine($"[ExpertAccessProfiler] sync miss-stall: {stallMs:F1} ms over {stallN} synchronous upload(s) ({(stallN == 0 ? 0.0 : stallMs / stallN):F3} ms each)");
 
         if (_warmPinned is not null)
         {

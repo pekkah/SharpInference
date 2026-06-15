@@ -47,17 +47,24 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // stream without flushing it. Lazily created on first background upload —
     // costs nothing for backends that never prefetch experts.
     private nint   _uploadStream;
-    // Per-upload pinned staging used by UploadBackground*. A second cudaMallocHost'd
-    // buffer that the upload stream reads from. The async-upload lock serializes
-    // concurrent calls so the staging contents stay valid until the in-flight DMA
-    // completes (we wait on the previous event before re-filling the buffer).
-    private nint   _asyncPinnedBuf;
-    private nuint  _asyncPinnedBufSize;
+    // Ring of pinned staging buffers for UploadBackground* (issue #217). Each async upload
+    // copies into the next slot's cudaMallocHost'd buffer, DMAs from it on the upload stream,
+    // and records a BACKEND-OWNED fence event. A slot is only drained (host wait) when it
+    // wraps around AsyncRingSlots uploads later — by which time its DMA has long completed —
+    // so the host can queue a whole layer's expert uploads without blocking, and they
+    // pipeline on the upload stream while the compute stream runs.
+    //
+    // The previous single-buffer design reused the CALLER's handle event as the staging-reuse
+    // fence, but the slot manager's ReleaseUploadHandle destroys that event; the backend then
+    // synchronized a freed event and got cudaErrorDeviceUninitialized (201) the moment the
+    // path was driven from the inference / prefetcher threads. A backend-owned per-slot fence
+    // is never freed by the caller, so it both fixes that and enables the ring.
+    private const int AsyncRingSlots = 32;
+    private readonly nint[]  _asyncRingBuf   = new nint[AsyncRingSlots];
+    private readonly nuint[] _asyncRingSize  = new nuint[AsyncRingSlots];
+    private readonly nint[]  _asyncRingFence = new nint[AsyncRingSlots];
+    private long _asyncRingIdx;
     private readonly object _asyncUploadLock = new();
-    // Event recorded at the end of the most recent UploadBackground; the next
-    // call waits on it before re-using _asyncPinnedBuf to avoid overwriting an
-    // in-flight DMA source. Created lazily, reused for the buffer's lifetime.
-    private nint   _asyncPinnedBufEvent;
 
     // Maximum im2col tile buffer size. All row-aligned tile sizes fit within this bound.
     private const long MaxTileBytes = 2560L * 1024 * 1024; // 2.5 GiB — fits all layers in a single tile
@@ -1381,9 +1388,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // it lives in the same _devPtrs table and is freed via Free() like any
     // other tensor.
     //
-    // Concurrent UploadBackground* calls are serialized by _asyncUploadLock
-    // because they share the _asyncPinnedBuf staging — the lock also ensures
-    // the previous transfer's DMA drains before we overwrite the staging bytes.
+    // Concurrent UploadBackground* calls are serialized by _asyncUploadLock while
+    // they pick a staging-ring slot and record events. They do NOT serialize on the
+    // prior DMA: each call uses its own ring slot and only drains (host wait) when a
+    // slot wraps around AsyncRingSlots uploads later, so up to AsyncRingSlots transfers
+    // can be in flight at once (see the _asyncRing* fields).
 
     /// <summary>
     /// Async H2D upload on the dedicated upload stream. The returned tensor's
@@ -1485,32 +1494,57 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         nint ev;
         lock (_asyncUploadLock)
         {
-            EnsureAsyncPinnedBuf(byteSize);
+            // Bitwise-AND (AsyncRingSlots is a power of two) instead of % so the index stays
+            // in [0, AsyncRingSlots) even in the impossible event the long counter wraps past
+            // 2^63 — a negative `% 32` would yield a negative slot and an IndexOutOfRange.
+            int slot = (int)(_asyncRingIdx++ & (AsyncRingSlots - 1));
 
-            // Drain the previous async upload before overwriting the shared staging
-            // buffer — the in-flight DMA still reads from _asyncPinnedBuf and a
-            // host-side memcpy here would corrupt it. The wait is on the host because
-            // it gates a host memcpy, not another GPU launch.
-            if (_asyncPinnedBufEvent != nint.Zero)
+            // Drain THIS slot's previous DMA (AsyncRingSlots uploads ago) before reusing its
+            // staging buffer. The fence is backend-owned — never destroyed by the caller — so
+            // unlike the old caller-event reuse this can't synchronize a freed event. In steady
+            // state the DMA finished long ago, so this does not block the host.
+            if (_asyncRingFence[slot] != nint.Zero)
             {
-                int sr = CuBlasInterop.EventSynchronize(_asyncPinnedBufEvent);
-                if (sr != 0)
-                    throw new InvalidOperationException($"cudaEventSynchronize (drain prev async upload) failed: {sr}");
+                int dr = CuBlasInterop.EventSynchronize(_asyncRingFence[slot]);
+                if (dr != 0)
+                    throw new InvalidOperationException($"cudaEventSynchronize (drain async staging slot) failed: {dr}");
             }
 
-            Buffer.MemoryCopy(src, (void*)_asyncPinnedBuf, _asyncPinnedBufSize, byteSize);
+            // Grow this slot's staging buffer if the tensor doesn't fit. Free the old buffer and
+            // zero the slot FIRST, so if the MallocHost below fails the slot holds no stale or
+            // garbage pointer for Dispose to (double-)free.
+            if (_asyncRingBuf[slot] == nint.Zero || byteSize > _asyncRingSize[slot])
+            {
+                if (_asyncRingBuf[slot] != nint.Zero)
+                {
+                    CuBlasInterop.FreeHost(_asyncRingBuf[slot]);
+                    _asyncRingBuf[slot] = nint.Zero;
+                }
+                nuint oldSize = _asyncRingSize[slot];
+                _asyncRingSize[slot] = 0;
+                nuint newSize = Math.Max(byteSize, oldSize * 2);
+                if (newSize < 1024 * 1024) newSize = 1024 * 1024;
+                int mr = CuBlasInterop.MallocHost(out _asyncRingBuf[slot], newSize);
+                if (mr != 0)
+                {
+                    _asyncRingBuf[slot] = nint.Zero;
+                    throw new InvalidOperationException($"cudaMallocHost (async upload staging, {newSize} B) failed: {mr}");
+                }
+                _asyncRingSize[slot] = newSize;
+            }
 
-            int rc = CuBlasInterop.CudaMemcpyAsync(devPtr, _asyncPinnedBuf, byteSize,
+            Buffer.MemoryCopy(src, (void*)_asyncRingBuf[slot], _asyncRingSize[slot], byteSize);
+
+            int rc = CuBlasInterop.CudaMemcpyAsync(devPtr, _asyncRingBuf[slot], byteSize,
                 CuBlasInterop.HostToDevice, _uploadStream);
             if (rc != 0)
                 throw new InvalidOperationException($"cudaMemcpyAsync (UploadBackground) failed: {rc}");
 
-            // Per-call event: timing disabled (we never measure these — the readiness
-            // event is consumed by stream-wait or an EventQuery poll only).
+            // Caller's readiness event (consumed by WaitForUpload's cross-stream wait / an
+            // EventQuery poll, then destroyed by ReleaseUploadHandle). DisableTiming.
             int er = CuBlasInterop.EventCreateWithFlags(out ev, CuBlasInterop.EventDisableTiming);
             if (er != 0)
                 throw new InvalidOperationException($"cudaEventCreateWithFlags failed: {er}");
-
             int rr = CuBlasInterop.EventRecord(ev, _uploadStream);
             if (rr != 0)
             {
@@ -1518,10 +1552,25 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 throw new InvalidOperationException($"cudaEventRecord failed: {rr}");
             }
 
-            // Replace the buffer-reuse fence with the freshly recorded event. We
-            // never destroy this reference — ev is owned by the caller's handle;
-            // the *next* UploadBackgroundCore call only reads it via EventSynchronize.
-            _asyncPinnedBufEvent = ev;
+            // Backend-owned staging fence for this slot: signals when this slot's DMA (and
+            // thus the host's freedom to overwrite its buffer) completes. Created once per
+            // slot, re-recorded on each reuse. On a failure here the caller never receives a
+            // handle, so destroy the just-created caller event ev ourselves to avoid leaking it.
+            if (_asyncRingFence[slot] == nint.Zero)
+            {
+                int fe = CuBlasInterop.EventCreateWithFlags(out _asyncRingFence[slot], CuBlasInterop.EventDisableTiming);
+                if (fe != 0)
+                {
+                    CuBlasInterop.EventDestroy(ev);
+                    throw new InvalidOperationException($"cudaEventCreateWithFlags (staging fence) failed: {fe}");
+                }
+            }
+            int fr = CuBlasInterop.EventRecord(_asyncRingFence[slot], _uploadStream);
+            if (fr != 0)
+            {
+                CuBlasInterop.EventDestroy(ev);
+                throw new InvalidOperationException($"cudaEventRecord (staging fence) failed: {fr}");
+            }
         }
 
         var handleId = (nint)Interlocked.Increment(ref _nextHandle);
@@ -1543,23 +1592,6 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 throw new InvalidOperationException($"cudaStreamCreate (upload stream) failed: {r}");
             _uploadStream = s;
         }
-    }
-
-    private void EnsureAsyncPinnedBuf(nuint required)
-    {
-        if (_asyncPinnedBuf != nint.Zero && required <= _asyncPinnedBufSize) return;
-        // Drain any in-flight DMA reading the old buffer before freeing it.
-        if (_asyncPinnedBufEvent != nint.Zero && _asyncPinnedBuf != nint.Zero)
-            CuBlasInterop.EventSynchronize(_asyncPinnedBufEvent);
-        if (_asyncPinnedBuf != nint.Zero)
-            CuBlasInterop.FreeHost(_asyncPinnedBuf);
-
-        nuint newSize = Math.Max(required, _asyncPinnedBufSize * 2);
-        if (newSize < 1024 * 1024) newSize = 1024 * 1024;
-        int r = CuBlasInterop.MallocHost(out _asyncPinnedBuf, newSize);
-        if (r != 0)
-            throw new InvalidOperationException($"cudaMallocHost (async upload staging, {newSize} B) failed: {r}");
-        _asyncPinnedBufSize = newSize;
     }
 
     /// <summary>
@@ -6745,11 +6777,21 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _uploadStream = nint.Zero;
         }
 
-        if (_asyncPinnedBuf != nint.Zero)
+        // Free the async staging ring: each slot's pinned buffer + its backend-owned fence
+        // event (the upload stream was synchronized + destroyed above, so all DMAs are done).
+        for (int i = 0; i < AsyncRingSlots; i++)
         {
-            CuBlasInterop.FreeHost(_asyncPinnedBuf);
-            _asyncPinnedBuf = nint.Zero;
-            _asyncPinnedBufSize = 0;
+            if (_asyncRingFence[i] != nint.Zero)
+            {
+                CuBlasInterop.EventDestroy(_asyncRingFence[i]);
+                _asyncRingFence[i] = nint.Zero;
+            }
+            if (_asyncRingBuf[i] != nint.Zero)
+            {
+                CuBlasInterop.FreeHost(_asyncRingBuf[i]);
+                _asyncRingBuf[i] = nint.Zero;
+                _asyncRingSize[i] = 0;
+            }
         }
 
         if (_pinnedBuf != nint.Zero)

@@ -31,6 +31,37 @@ public sealed class PipelineTests
         Assert.NotNull(evicted);
     }
 
+    // ── issue #217 miss-stall timer ─────────────────────────────────────────
+
+    [Fact]
+    public void Profiler_MissStall_StartsAtZero()
+    {
+        var p = new SharpInference.Pipeline.ExpertAccessProfiler(numLayers: 2, numExperts: 4);
+        Assert.Equal(0.0, p.MissStallMs);
+    }
+
+    [Fact]
+    public void Profiler_MissStall_AccumulatesTicks()
+    {
+        var p = new SharpInference.Pipeline.ExpertAccessProfiler(numLayers: 2, numExperts: 4);
+        // One second's worth of Stopwatch ticks, added twice → ~2000 ms.
+        long oneSecondTicks = System.Diagnostics.Stopwatch.Frequency;
+        p.RecordMissStall(oneSecondTicks);
+        p.RecordMissStall(oneSecondTicks);
+        Assert.Equal(2000.0, p.MissStallMs, precision: 0);
+    }
+
+    [Fact]
+    public void Profiler_MissStall_PrintedInStats()
+    {
+        var p = new SharpInference.Pipeline.ExpertAccessProfiler(numLayers: 1, numExperts: 2);
+        p.RecordMiss(0, 0);
+        p.RecordMissStall(System.Diagnostics.Stopwatch.Frequency / 10); // ~100 ms
+        var sw = new System.IO.StringWriter();
+        p.PrintStats(sw);
+        Assert.Contains("miss-stall", sw.ToString());
+    }
+
     [Fact]
     public void ExpertCache_DifferentLayersSameExpertId_TrackedSeparately()
     {
