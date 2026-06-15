@@ -50,6 +50,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
 
     private readonly float[] _logitsBuf;
 
+    // #219 greedy argmax: when set by ForwardArgmax, the shared logits tail (FinishLogits) runs an
+    // on-device argmax + 8-byte download instead of the full-vocab D2H, and stashes the result here.
+    private bool _argmaxOnly;
+    private (int Token, float Logit) _lastArgmax;
+
     // Scratch buffers in VRAM
     private readonly Tensor _hidden;
     private readonly Tensor _residual;
@@ -1354,6 +1359,46 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     /// </summary>
     public bool UseCudaGraph { get => _useCudaGraph; set => _useCudaGraph = value; }
 
+    /// <summary>
+    /// #219 logits tail shared by <see cref="Forward"/> and <see cref="ForwardGemma4"/>: either the
+    /// full-vocab D2H + sync, or — when called from <see cref="ForwardArgmax"/> — an on-device argmax
+    /// and an 8-byte download. The argmax runs on the same stream after the device region produced
+    /// (and, for Gemma 4, softcapped) <c>_logits</c>, so it sees the final logits.
+    /// </summary>
+    private void FinishLogits()
+    {
+        if (_argmaxOnly)
+            _lastArgmax = _gpu.Argmax(_logits);
+        else
+        {
+            _gpu.Download(_logits, _logitsBuf);
+            _gpu.Synchronize();
+        }
+    }
+
+    /// <inheritdoc/>
+    // #219: only the non-profiled decode paths share FinishLogits; the SHARPI_CUDA_PROFILE /
+    // SHARPI_DECODE_REGIONS variants keep the full download so their phase timings stay meaningful.
+    public bool SupportsGpuArgmax => _gpu.GpuArgmaxEnabled && !s_profile && !s_regionProfile;
+
+    /// <inheritdoc/>
+    public (int Token, float Logit) ForwardArgmax(int token, int position)
+    {
+        if (!SupportsGpuArgmax)
+        {
+            // Kill-switch off or a profiling variant is active (which keeps the full download):
+            // fall back to a full forward + host scan, matching Sampler.Greedy's tie-break.
+            var l = Forward(token, position);
+            int j = 0; float m = l[0];
+            for (int i = 1; i < l.Length; i++) if (l[i] > m) { m = l[i]; j = i; }
+            return (j, m);
+        }
+        _argmaxOnly = true;
+        try { Forward(token, position); }   // dispatches to Forward/ForwardGemma4; tail does the argmax
+        finally { _argmaxOnly = false; }
+        return _lastArgmax;
+    }
+
     /// <inheritdoc/>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
@@ -1399,8 +1444,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
                 _fp32Count++;
         }
 
-        _gpu.Download(_logits, _logitsBuf);
-        _gpu.Synchronize();
+        FinishLogits();
 
         _kvLength = Math.Max(_kvLength, position + 1);
         return _logitsBuf;
@@ -1720,8 +1764,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         if (!TryRunGemma4DeviceRegionViaGraph(position))
             RunGemma4DeviceRegion(position);
 
-        _gpu.Download(_logits, _logitsBuf);
-        _gpu.Synchronize();
+        FinishLogits();
 
         _kvLength = Math.Max(_kvLength, position + 1);
         return _logitsBuf;

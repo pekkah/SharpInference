@@ -247,6 +247,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _geluTanhMulKernel;
     private nint   _geluTanhMulStridedKernel;
     private nint   _softcapKernel;
+    private nint   _argmaxPartialKernel;   // #219 greedy argmax — pass 1 (per-block reduction)
+    private nint   _argmaxFinalKernel;     // #219 greedy argmax — pass 2 (reduce partials)
+    private nint   _argmaxRowsKernel;      // #219 batched argmax — one block per row (MTP/spec verify)
     private nint   _clearF32Kernel;
     private nint   _quantizeQ81Kernel;
     // Track A (#124/#173): SoA Q8_1 activation producer + the SoA-weight+SoA-activation
@@ -399,6 +402,16 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// </summary>
     public bool Q80Dp4aEnabled { get; set; } =
         Environment.GetEnvironmentVariable("SHARPI_Q80_DP4A") != "0";
+
+    /// <summary>
+    /// Issue #219: compute the greedy argmax on-device (<see cref="Argmax"/>) so a decode token
+    /// downloads 8 bytes (index + value) instead of the full-vocab logits with a blocking stream
+    /// sync. Bit-exact with the host scan (<c>Sampler.Greedy</c>) for finite logits. Default on;
+    /// <c>SHARPI_GPU_ARGMAX=0</c> forces the legacy full-download path. Settable so parity oracles
+    /// can pin both sides.
+    /// </summary>
+    public bool GpuArgmaxEnabled { get; set; } =
+        Environment.GetEnvironmentVariable("SHARPI_GPU_ARGMAX") != "0";
 
     /// <summary>
     /// Issue #124: route Q4_0 decode matvecs through the dp4a/Q8_1 kernel
@@ -3384,6 +3397,97 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(softcap_inplace) failed: {r}");
     }
 
+    // #219 GPU greedy argmax scratch (lazily allocated on first Argmax call): the per-block
+    // (value, index) partials and the 8-byte (index-bits, value) output. The index buffer is a
+    // Float32 tensor used as raw int storage — the kernel writes/reads it as int*.
+    private const int ArgmaxBlocks = 256;
+    private const int ArgmaxThreads = 256;
+    private Tensor? _argmaxPartialVal;
+    private Tensor? _argmaxPartialIdx;
+    private Tensor? _argmaxOut;
+
+    /// <summary>
+    /// Issue #219: greedy argmax of <paramref name="logits"/> computed on-device, returning the
+    /// winning <c>(index, value)</c> after a single 8-byte download. Replaces a full-vocab D2H +
+    /// host scan on the greedy decode path. Bit-exact with <c>Sampler.Greedy</c> for finite logits,
+    /// including the lowest-index tie-break. Launched on the same stream as the producing forward
+    /// pass, so it sees the just-computed logits; the final download synchronizes the stream.
+    /// </summary>
+    public (int Index, float Value) Argmax(Tensor logits)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        int n = (int)logits.ElementCount;
+        if (n <= 0) throw new ArgumentException("Argmax requires a non-empty logits tensor.", nameof(logits));
+
+        _argmaxPartialVal ??= Allocate(TensorShape.D1(ArgmaxBlocks));
+        _argmaxPartialIdx ??= Allocate(TensorShape.D1(ArgmaxBlocks));
+        _argmaxOut        ??= Allocate(TensorShape.D1(2));
+
+        int blocks = Math.Min(ArgmaxBlocks, (n + ArgmaxThreads - 1) / ArgmaxThreads);
+
+        nint lPtr = GetDevPtr(logits);
+        nint pvPtr = GetDevPtr(_argmaxPartialVal);
+        nint piPtr = GetDevPtr(_argmaxPartialIdx);
+        int pN = n;
+        nint* a1 = stackalloc nint[4] { (nint)(&lPtr), (nint)(&pN), (nint)(&pvPtr), (nint)(&piPtr) };
+        int r1 = NvrtcInterop.LaunchKernel(_argmaxPartialKernel, (uint)blocks, 1, 1, ArgmaxThreads, 1, 1, 0, _stream, a1, null);
+        if (r1 != 0) throw new InvalidOperationException($"cuLaunchKernel(llm_argmax_partial) failed: {r1}");
+
+        nint outPtr = GetDevPtr(_argmaxOut);
+        int pNumParts = blocks;
+        nint* a2 = stackalloc nint[4] { (nint)(&pvPtr), (nint)(&piPtr), (nint)(&pNumParts), (nint)(&outPtr) };
+        int r2 = NvrtcInterop.LaunchKernel(_argmaxFinalKernel, 1, 1, 1, ArgmaxThreads, 1, 1, 0, _stream, a2, null);
+        if (r2 != 0) throw new InvalidOperationException($"cuLaunchKernel(llm_argmax_final) failed: {r2}");
+
+        // 8-byte D2H + StreamSynchronize (drains the two kernels above). out[0] = index (int bits),
+        // out[1] = value (float).
+        Span<float> result = stackalloc float[2];
+        Download(_argmaxOut, result);
+        return (BitConverter.SingleToInt32Bits(result[0]), result[1]);
+    }
+
+    // #219 batched-argmax scratch: a [maxRows*2] device output + matching host buffer, grown on demand.
+    private Tensor? _argmaxRowsOut;
+    private float[] _argmaxRowsHost = [];
+
+    /// <summary>
+    /// Issue #219: per-row greedy argmax over a packed <c>[rows × rowStride]</c> logits buffer
+    /// (the MTP / speculative verify positions), returning one <c>(index, value)</c> per row after
+    /// a single <c>rows*8</c>-byte download instead of the full <c>rows × vocab</c> D2H. Each row's
+    /// valid length is <paramref name="validLen"/> (<= <paramref name="rowStride"/>); the argmax is
+    /// over <c>[0, validLen)</c>. Same lowest-index tie-break and bit-exactness as <see cref="Argmax"/>.
+    /// </summary>
+    public (int Index, float Value)[] ArgmaxRows(Tensor logits, int rows, int validLen, int rowStride)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (rows <= 0) return [];
+
+        if (_argmaxRowsOut is null || _argmaxRowsOut.ElementCount < rows * 2)
+        {
+            _argmaxRowsOut = Allocate(TensorShape.D1(rows * 2));
+            _argmaxRowsHost = new float[rows * 2];
+        }
+
+        nint lPtr = GetDevPtr(logits);
+        nint outPtr = GetDevPtr(_argmaxRowsOut);
+        int pN = validLen;
+        int pStride = rowStride;
+        nint* args = stackalloc nint[4] { (nint)(&lPtr), (nint)(&pN), (nint)(&pStride), (nint)(&outPtr) };
+        int r = NvrtcInterop.LaunchKernel(_argmaxRowsKernel, (uint)rows, 1, 1, ArgmaxThreads, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(llm_argmax_rows) failed: {r}");
+
+        Download(_argmaxRowsOut, _argmaxRowsHost.AsSpan(0, rows * 2));   // rows*8 bytes + sync
+        var result = new (int, float)[rows];
+        for (int i = 0; i < rows; i++)
+            result[i] = (BitConverter.SingleToInt32Bits(_argmaxRowsHost[i * 2]), _argmaxRowsHost[i * 2 + 1]);
+        return result;
+    }
+
     public void SiLU(Tensor x) =>
         throw new NotSupportedException("Use SiLuMul(gate, up) for fused SwiGLU on CUDA.");
 
@@ -6091,6 +6195,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel, _attentionSwaBatchedKernel,
             _attentionSwaBf16Kernel, _attentionSwaBatchedBf16Kernel,
             _geluTanhMulKernel, _geluTanhMulStridedKernel, _softcapKernel,
+            _argmaxPartialKernel, _argmaxFinalKernel, _argmaxRowsKernel,   // #219
             _clearF32Kernel, _quantizeQ81Kernel,
             _scaleRowsKernel, _moeWeightedReduceKernel,
             _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
@@ -6268,6 +6373,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _geluTanhMulKernel     = GetKernelFunc("llm_gelu_tanh_mul");
         _geluTanhMulStridedKernel = GetKernelFunc("llm_gelu_tanh_mul_strided");
         _softcapKernel         = GetKernelFunc("llm_softcap_inplace");
+        _argmaxPartialKernel   = GetKernelFunc("llm_argmax_partial");   // #219
+        _argmaxFinalKernel     = GetKernelFunc("llm_argmax_final");     // #219
+        _argmaxRowsKernel      = GetKernelFunc("llm_argmax_rows");      // #219
         _clearF32Kernel        = GetKernelFunc("llm_clear_f32");
         _quantizeQ81Kernel     = GetKernelFunc("llm_quantize_q8_1");
         _quantizeQ81SoaKernel  = GetKernelFunc("llm_quantize_q8_1_soa");      // Track A (#124/#173)

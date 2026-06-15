@@ -390,6 +390,107 @@ extern ""C"" __global__ void llm_sigmoid_inplace(float* __restrict__ x, int n)
     x[i] = 1.0f / (1.0f + __expf(-x[i]));
 }
 
+// ── Greedy argmax (#219): two-pass block reduction over the vocab logits ─────
+// Replaces the per-token full-vocab D2H + host scan when the sampler is greedy: the
+// (idx, value) pair is reduced on-device and only 8 bytes are downloaded.
+// Tie-break MUST match Sampler.Greedy (CPU): it scans left-to-right with a strict
+// `>`, so the FIRST (lowest-index) occurrence of the maximum survives. Every reduction
+// step here therefore keeps the LOWER index on an exact value tie. Threads init their
+// running value to -FLT_MAX with index 0; for finite logits (the decode contract, which
+// the coherence tests guard) every element beats the sentinel, so the result is bit-exact
+// with the host scan. (A NaN-at-index-0 buffer is the one degenerate case where the host's
+// `logits[0]` seed and this sentinel disagree — not reachable with finite decode logits.)
+#define SHARPI_ARGMAX_NEG_INF (-3.402823466e38f)
+
+extern ""C"" __global__ void llm_argmax_partial(
+    const float* __restrict__ logits, int n, float* __restrict__ partialVal, int* __restrict__ partialIdx)
+{
+    __shared__ float sVal[256];
+    __shared__ int   sIdx[256];
+    int tid = (int)threadIdx.x;
+    float best = SHARPI_ARGMAX_NEG_INF;
+    int bestIdx = 0;
+    for (int i = (int)(blockIdx.x * blockDim.x) + tid; i < n; i += (int)(gridDim.x * blockDim.x))
+    {
+        float v = logits[i];
+        if (v > best) { best = v; bestIdx = i; }
+    }
+    sVal[tid] = best; sIdx[tid] = bestIdx;
+    __syncthreads();
+    for (int s = (int)blockDim.x >> 1; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            float ov = sVal[tid + s]; int oi = sIdx[tid + s];
+            if (ov > sVal[tid] || (ov == sVal[tid] && oi < sIdx[tid])) { sVal[tid] = ov; sIdx[tid] = oi; }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) { partialVal[blockIdx.x] = sVal[0]; partialIdx[blockIdx.x] = sIdx[0]; }
+}
+
+// Second pass: one block reduces the per-block partials. out[0] holds the winning index
+// (raw int bits), out[1] the winning value (float).
+extern ""C"" __global__ void llm_argmax_final(
+    const float* __restrict__ partialVal, const int* __restrict__ partialIdx, int numParts, void* out)
+{
+    __shared__ float sVal[256];
+    __shared__ int   sIdx[256];
+    int tid = (int)threadIdx.x;
+    float best = SHARPI_ARGMAX_NEG_INF;
+    int bestIdx = 0;
+    for (int i = tid; i < numParts; i += (int)blockDim.x)
+    {
+        float v = partialVal[i]; int idx = partialIdx[i];
+        if (v > best || (v == best && idx < bestIdx)) { best = v; bestIdx = idx; }
+    }
+    sVal[tid] = best; sIdx[tid] = bestIdx;
+    __syncthreads();
+    for (int s = (int)blockDim.x >> 1; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            float ov = sVal[tid + s]; int oi = sIdx[tid + s];
+            if (ov > sVal[tid] || (ov == sVal[tid] && oi < sIdx[tid])) { sVal[tid] = ov; sIdx[tid] = oi; }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) { ((int*)out)[0] = sIdx[0]; ((float*)out)[1] = sVal[0]; }
+}
+
+// Batched argmax (#219, MTP/spec verify): one block per row reduces row `blockIdx.x` of a
+// [rows × rowStride] buffer (the packed per-position verify logits), writing (idx, value) pairs
+// to out[2*row], out[2*row+1]. Same lowest-index tie-break as the single-row kernels. Rows run on
+// separate SMs in parallel, so k argmaxes cost ~one row's reduction instead of k full-vocab D2H.
+extern ""C"" __global__ void llm_argmax_rows(
+    const float* __restrict__ logits, int n, int rowStride, void* out)
+{
+    __shared__ float sVal[256];
+    __shared__ int   sIdx[256];
+    int row = (int)blockIdx.x;
+    int tid = (int)threadIdx.x;
+    const float* r = logits + (long long)row * (long long)rowStride;
+    float best = SHARPI_ARGMAX_NEG_INF;
+    int bestIdx = 0;
+    for (int i = tid; i < n; i += (int)blockDim.x)
+    {
+        float v = r[i];
+        if (v > best) { best = v; bestIdx = i; }
+    }
+    sVal[tid] = best; sIdx[tid] = bestIdx;
+    __syncthreads();
+    for (int s = (int)blockDim.x >> 1; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            float ov = sVal[tid + s]; int oi = sIdx[tid + s];
+            if (ov > sVal[tid] || (ov == sVal[tid] && oi < sIdx[tid])) { sVal[tid] = ov; sIdx[tid] = oi; }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) { ((int*)out)[row * 2] = sIdx[0]; ((float*)out)[row * 2 + 1] = sVal[0]; }
+}
+
 // ── Softmax in place ───────────────────────────────────────────────────────
 // 1 block of 256 threads. 3-pass: max, exp+sum, normalize.
 extern ""C"" __global__ void llm_softmax(float* __restrict__ x, int n)
