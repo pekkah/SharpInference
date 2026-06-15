@@ -63,9 +63,13 @@ public static class OpenAiEndpoints
 
         metrics.RecordRequest();
 
-        // Server-level DisableThinking (SHARPI_NO_THINKING) forces reasoning off regardless of
-        // the per-request enable_thinking flag — for agentic clients that never send it.
-        bool enableThinking = (req.EnableThinking ?? true) && !options.Value.DisableThinking;
+        // When enable_thinking is absent the default depends on the model family — Gemma 4
+        // defaults reasoning off (see ChatTemplateRenderer.ModelDefaultsThinkingOff) while ChatML
+        // models default on; an explicit flag always wins. Server-level DisableThinking
+        // (SHARPI_NO_THINKING) forces reasoning off regardless — for agentic clients that never
+        // send the per-request flag.
+        bool enableThinking = (req.EnableThinking ?? !chatTemplate.ModelDefaultsThinkingOff)
+                              && !options.Value.DisableThinking;
         var adapter = chatTemplate.ToolCallAdapter;
 
         // Tool-aware rendering: if either tool definitions or a history-side
@@ -80,17 +84,45 @@ public static class OpenAiEndpoints
         // storing it as the snapshot anchor is what makes prefix reuse possible across
         // multi-turn agentic loops.
         string? canonicalHistoryPrefix;
-        if (toolsActive)
+        // Image content parts (issue #253) collected (base64 → bytes) and replaced by the
+        // model's <|image|> placeholder; the engine splices each image's soft tokens at it.
+        var images = new List<byte[]>();
+        try
         {
-            var (richMessages, tools) = BuildRichMessageList(req, adapter);
-            prompt = chatTemplate.Format(richMessages, enableThinking, tools);
-            canonicalHistoryPrefix = chatTemplate.Format(richMessages, enableThinking, tools, addGenerationPrompt: false);
+            if (toolsActive)
+            {
+                var (richMessages, tools) = BuildRichMessageList(req, adapter, images);
+                prompt = chatTemplate.Format(richMessages, enableThinking, tools);
+                canonicalHistoryPrefix = chatTemplate.Format(richMessages, enableThinking, tools, addGenerationPrompt: false);
+            }
+            else
+            {
+                var messages = BuildMessageList(req.Messages, req.ResponseFormat?.Type, images);
+                prompt = chatTemplate.Format(messages, enableThinking);
+                canonicalHistoryPrefix = chatTemplate.Format(messages, enableThinking, addGenerationPrompt: false);
+            }
         }
-        else
+        catch (ImageContentException ex)
         {
-            var messages = BuildMessageList(req.Messages, req.ResponseFormat?.Type);
-            prompt = chatTemplate.Format(messages, enableThinking);
-            canonicalHistoryPrefix = chatTemplate.Format(messages, enableThinking, addGenerationPrompt: false);
+            ctx.Response.StatusCode = 400;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(
+                JsonSerializer.Serialize(new ErrorResponse("invalid_request_error", ex.Message),
+                    SharpInferenceJsonContext.Default.ErrorResponse), ctx.RequestAborted);
+            return;
+        }
+
+        if (images.Count > 0 && !engine.SupportsImageInput)
+        {
+            ctx.Response.StatusCode = 400;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(
+                JsonSerializer.Serialize(new ErrorResponse("invalid_request_error",
+                        "This model is not configured for image input. Start the server with a Gemma 4 model and " +
+                        "SHARPI_MMPROJ pointing at its gemma4uv mmproj, on a CPU (NGpuLayers=0) or full-CUDA " +
+                        "(NGpuLayers=-1) backend."),
+                    SharpInferenceJsonContext.Default.ErrorResponse), ctx.RequestAborted);
+            return;
         }
 
         // Safety: only forward the canonical hint when it's a string-prefix of the generating
@@ -123,24 +155,32 @@ public static class OpenAiEndpoints
 
         if (req.Stream == true)
         {
-            await HandleStreaming(ctx, engine, metrics, adapter, toolsActive, prompt, canonicalHistoryPrefix, sp, requestId, created);
+            await HandleStreaming(ctx, engine, metrics, adapter, toolsActive, prompt, canonicalHistoryPrefix, images, sp, requestId, created);
         }
         else
         {
-            await HandleNonStreaming(ctx, engine, metrics, adapter, toolsActive, prompt, canonicalHistoryPrefix, sp, requestId, created);
+            await HandleNonStreaming(ctx, engine, metrics, adapter, toolsActive, prompt, canonicalHistoryPrefix, images, sp, requestId, created);
         }
     }
 
+    /// <summary>Route to the image-aware generate when images are present, else the text path (#253).</summary>
+    private static IAsyncEnumerable<GenerateChunk> Generate(
+        IInferenceEngine engine, string prompt, string? canonical, IReadOnlyList<byte[]> images,
+        SamplingParams sp, CancellationToken ct)
+        => images.Count > 0
+            ? engine.GenerateImageChunksAsync(prompt, images, sp, ct)
+            : engine.GenerateChunksAsync(prompt, sp, ct, canonical);
+
     private static async Task HandleNonStreaming(
         HttpContext ctx, IInferenceEngine engine, ServerMetrics metrics, IToolCallAdapter adapter,
-        bool toolsActive, string prompt, string? canonicalHistoryPrefix, SamplingParams sp, string requestId, long created)
+        bool toolsActive, string prompt, string? canonicalHistoryPrefix, IReadOnlyList<byte[]> images, SamplingParams sp, string requestId, long created)
     {
         var textSb = new StringBuilder();
         var reasoningSb = new StringBuilder();
         int textTokens = 0;
         int reasoningTokens = 0;
 
-        await foreach (var c in engine.GenerateChunksAsync(prompt, sp, ctx.RequestAborted, canonicalHistoryPrefix))
+        await foreach (var c in Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
         {
             if (c.Kind == GenerateChunkKind.Thinking)
             {
@@ -222,7 +262,7 @@ public static class OpenAiEndpoints
 
     private static async Task HandleStreaming(
         HttpContext ctx, IInferenceEngine engine, ServerMetrics metrics, IToolCallAdapter adapter,
-        bool toolsActive, string prompt, string? canonicalHistoryPrefix, SamplingParams sp, string requestId, long created)
+        bool toolsActive, string prompt, string? canonicalHistoryPrefix, IReadOnlyList<byte[]> images, SamplingParams sp, string requestId, long created)
     {
         ctx.Response.ContentType = "text/event-stream";
         ctx.Response.Headers.CacheControl = "no-cache";
@@ -321,7 +361,7 @@ public static class OpenAiEndpoints
         bool truncatedToolCall = false;
         try
         {
-            await foreach (var c in engine.GenerateChunksAsync(prompt, sp, ctx.RequestAborted, canonicalHistoryPrefix))
+            await foreach (var c in Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
             {
                 tokenCount++;
                 if (c.Kind == GenerateChunkKind.Thinking)
@@ -393,7 +433,7 @@ public static class OpenAiEndpoints
     }
 
     private static List<(string role, string content)> BuildMessageList(
-        OaiMessage[] messages, string? responseFormatType = null)
+        OaiMessage[] messages, string? responseFormatType, List<byte[]> images)
     {
         var list = new List<(string, string)>(messages.Length + 1);
         if (responseFormatType == "json_object")
@@ -401,12 +441,51 @@ public static class OpenAiEndpoints
         foreach (var m in messages)
         {
             var role = m.Role ?? "user";
-            var content = m.Content ?? "";
+            var content = FlattenContent(m.Content, images);
             if (role == "assistant")
                 content = ChatTemplate.ScrubAssistantThinking(content);
             list.Add((role, content));
         }
         return list;
+    }
+
+    /// <summary>
+    /// Flatten an OpenAI message <c>content</c> (a plain string, or an array of content parts)
+    /// to text, decoding any <c>image_url</c> / <c>input_image</c> parts into
+    /// <paramref name="images"/> (in document order) and replacing each with the model's
+    /// <c>&lt;|image|&gt;</c> placeholder (issue #253). Only base64 data URLs are supported.
+    /// </summary>
+    private static string FlattenContent(JsonElement? contentEl, List<byte[]> images)
+    {
+        if (contentEl is null) return "";
+        var el = contentEl.Value;
+        if (el.ValueKind == JsonValueKind.String) return el.GetString() ?? "";
+        if (el.ValueKind != JsonValueKind.Array) return "";
+
+        var sb = new StringBuilder();
+        foreach (var part in el.EnumerateArray())
+        {
+            var type = part.TryGetProperty("type", out var t) ? t.GetString() : null;
+            if (type == "text")
+            {
+                if (part.TryGetProperty("text", out var tv))
+                    sb.Append(tv.GetString());
+            }
+            else if (type is "image_url" or "input_image")
+            {
+                // image_url is either {url:"data:..."} (chat completions) or a bare string url.
+                string url = "";
+                if (part.TryGetProperty("image_url", out var iu))
+                    url = iu.ValueKind == JsonValueKind.String
+                        ? iu.GetString() ?? ""
+                        : iu.TryGetProperty("url", out var u) ? u.GetString() ?? "" : "";
+                if (string.IsNullOrEmpty(url))
+                    throw new ImageContentException($"{type} content part is missing a base64 'image_url'.");
+                images.Add(ImageContent.FromDataUrl(url));
+                sb.Append(ImageContent.Placeholder);
+            }
+        }
+        return sb.ToString();
     }
 
     private static bool HasToolMessages(OaiMessage[]? messages)
@@ -427,14 +506,14 @@ public static class OpenAiEndpoints
     /// <c>role:"tool"</c> message with <c>tool_call_id</c>.
     /// </summary>
     private static (List<Dictionary<string, object?>> messages, List<object?>? tools)
-        BuildRichMessageList(ChatCompletionRequest req, IToolCallAdapter adapter)
+        BuildRichMessageList(ChatCompletionRequest req, IToolCallAdapter adapter, List<byte[]> images)
     {
         var messages = new List<Dictionary<string, object?>>();
 
         foreach (var m in req.Messages!)
         {
             var role = m.Role ?? "user";
-            var content = m.Content ?? "";
+            var content = FlattenContent(m.Content, images);
 
             if (role == "tool")
             {
@@ -531,7 +610,9 @@ public sealed record ChatCompletionRequest(
 /// </summary>
 public sealed record OaiMessage(
     string? Role,
-    string? Content,
+    // string for plain text, or an array of content parts ({type:"text"} / {type:"image_url"})
+    // for multimodal requests (issue #253). JsonElement accepts both shapes via source-gen.
+    JsonElement? Content,
     [property: JsonPropertyName("tool_call_id")] string? ToolCallId = null,
     [property: JsonPropertyName("tool_calls")] OaiToolCall[]? ToolCalls = null,
     string? Name = null);

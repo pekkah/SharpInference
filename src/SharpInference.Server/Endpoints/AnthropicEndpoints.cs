@@ -61,33 +61,71 @@ public static class AnthropicEndpoints
 
         metrics.RecordRequest();
 
-        // Anthropic-style thinking control: {"type":"disabled"} turns it off; absence or any
-        // other value (including {"type":"enabled"}) leaves it on. BudgetTokens, when present,
-        // maps to SamplingParams.MaxThinkingTokens — the engine force-closes the <think> block
-        // once that many reasoning tokens have streamed.
+        // Anthropic-style thinking control: {"type":"disabled"} turns it off, {"type":"enabled"}
+        // turns it on. When the field is absent, the default depends on the model family — Gemma 4
+        // defaults reasoning off (see ChatTemplateRenderer.ModelDefaultsThinkingOff) while ChatML
+        // models default on. An explicit value always wins over the family default. BudgetTokens,
+        // when present, maps to SamplingParams.MaxThinkingTokens — the engine force-closes the
+        // <think> block once that many reasoning tokens have streamed.
         // Server-level DisableThinking (SHARPI_NO_THINKING) forces reasoning off regardless of
         // the per-request thinking flag — for agentic clients (e.g. Claude Code) that never send
         // thinking:{"type":"disabled"}.
-        bool enableThinking = req.Thinking?.Type != "disabled" && !options.Value.DisableThinking;
+        bool? requestedThinking = req.Thinking?.Type switch
+        {
+            "enabled"  => true,
+            "disabled" => false,
+            _          => null,
+        };
+        bool enableThinking = (requestedThinking ?? !chatTemplate.ModelDefaultsThinkingOff)
+                              && !options.Value.DisableThinking;
 
         var adapter = chatTemplate.ToolCallAdapter;
 
+        // Image content blocks (issue #253) are collected (base64 → bytes) and replaced by the
+        // model's <|image|> placeholder in the rendered prompt; the engine splices each image's
+        // projected soft tokens at the matching placeholder during prefill.
+        var images = new List<byte[]>();
         string prompt;
         // Issue #102: render history-only canonical alongside the generating prompt so the
         // engine can snapshot at the chat-template's history boundary and reuse KV across
         // multi-turn /v1/messages calls (the long-running pain point on agentic loops).
         string? canonicalHistoryPrefix;
-        if (req.Tools is { Length: > 0 })
+        try
         {
-            var (richMessages, tools) = BuildRichMessageList(req, adapter);
-            prompt = chatTemplate.Format(richMessages, enableThinking, tools);
-            canonicalHistoryPrefix = chatTemplate.Format(richMessages, enableThinking, tools, addGenerationPrompt: false);
+            if (req.Tools is { Length: > 0 })
+            {
+                var (richMessages, tools) = BuildRichMessageList(req, adapter, images);
+                prompt = chatTemplate.Format(richMessages, enableThinking, tools);
+                canonicalHistoryPrefix = chatTemplate.Format(richMessages, enableThinking, tools, addGenerationPrompt: false);
+            }
+            else
+            {
+                var messages = BuildMessageList(req, images);
+                prompt = chatTemplate.Format(messages, enableThinking);
+                canonicalHistoryPrefix = chatTemplate.Format(messages, enableThinking, addGenerationPrompt: false);
+            }
         }
-        else
+        catch (ImageContentException ex)
         {
-            var messages = BuildMessageList(req);
-            prompt = chatTemplate.Format(messages, enableThinking);
-            canonicalHistoryPrefix = chatTemplate.Format(messages, enableThinking, addGenerationPrompt: false);
+            ctx.Response.StatusCode = 400;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(
+                JsonSerializer.Serialize(new AErrorResponse("invalid_request_error", ex.Message),
+                    SharpInferenceJsonContext.Default.AErrorResponse), ctx.RequestAborted);
+            return;
+        }
+
+        if (images.Count > 0 && !engine.SupportsImageInput)
+        {
+            ctx.Response.StatusCode = 400;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(
+                JsonSerializer.Serialize(new AErrorResponse("invalid_request_error",
+                        "This model is not configured for image input. Start the server with a Gemma 4 model and " +
+                        "SHARPI_MMPROJ pointing at its gemma4uv mmproj, on a CPU (NGpuLayers=0) or full-CUDA " +
+                        "(NGpuLayers=-1) backend."),
+                    SharpInferenceJsonContext.Default.AErrorResponse), ctx.RequestAborted);
+            return;
         }
 
         // Same guard as OpenAiEndpoints — only forward the hint if it's a string-prefix
@@ -107,23 +145,31 @@ public static class AnthropicEndpoints
 
         if (req.Stream == true)
         {
-            await HandleStreaming(ctx, engine, metrics, adapter, prompt, canonicalHistoryPrefix, sp, msgId, modelId);
+            await HandleStreaming(ctx, engine, metrics, adapter, prompt, canonicalHistoryPrefix, images, sp, msgId, modelId);
         }
         else
         {
-            await HandleNonStreaming(ctx, engine, metrics, adapter, prompt, canonicalHistoryPrefix, sp, msgId, modelId);
+            await HandleNonStreaming(ctx, engine, metrics, adapter, prompt, canonicalHistoryPrefix, images, sp, msgId, modelId);
         }
     }
 
+    /// <summary>Route to the image-aware generate when images are present, else the text path (#253).</summary>
+    private static IAsyncEnumerable<GenerateChunk> Generate(
+        IInferenceEngine engine, string prompt, string? canonical, IReadOnlyList<byte[]> images,
+        SamplingParams sp, CancellationToken ct)
+        => images.Count > 0
+            ? engine.GenerateImageChunksAsync(prompt, images, sp, ct)
+            : engine.GenerateChunksAsync(prompt, sp, ct, canonical);
+
     private static async Task HandleNonStreaming(
         HttpContext ctx, IInferenceEngine engine, ServerMetrics metrics, IToolCallAdapter adapter,
-        string prompt, string? canonicalHistoryPrefix, SamplingParams sp, string msgId, string modelId)
+        string prompt, string? canonicalHistoryPrefix, IReadOnlyList<byte[]> images, SamplingParams sp, string msgId, string modelId)
     {
         var thinkingSb = new StringBuilder();
         var textSb = new StringBuilder();
         int totalOutputTokens = 0;
 
-        await foreach (var chunk in engine.GenerateChunksAsync(prompt, sp, ctx.RequestAborted, canonicalHistoryPrefix))
+        await foreach (var chunk in Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
         {
             totalOutputTokens++;
             if (chunk.Kind == GenerateChunkKind.Thinking)
@@ -179,7 +225,7 @@ public static class AnthropicEndpoints
 
     private static async Task HandleStreaming(
         HttpContext ctx, IInferenceEngine engine, ServerMetrics metrics, IToolCallAdapter adapter,
-        string prompt, string? canonicalHistoryPrefix, SamplingParams sp, string msgId, string modelId)
+        string prompt, string? canonicalHistoryPrefix, IReadOnlyList<byte[]> images, SamplingParams sp, string msgId, string modelId)
     {
         ctx.Response.ContentType = "text/event-stream";
         ctx.Response.Headers.CacheControl = "no-cache";
@@ -347,7 +393,7 @@ public static class AnthropicEndpoints
         bool truncatedToolCall = false;
         try
         {
-            await foreach (var chunk in engine.GenerateChunksAsync(prompt, sp, ctx.RequestAborted, canonicalHistoryPrefix))
+            await foreach (var chunk in Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
             {
                 outputTokens++;
 
@@ -504,7 +550,7 @@ public static class AnthropicEndpoints
     /// Builds the simple (string-content) message list used when no tools are present.
     /// Handles both plain-string and array-of-content-blocks message formats.
     /// </summary>
-    private static List<(string role, string content)> BuildMessageList(AnthropicMessageRequest req)
+    private static List<(string role, string content)> BuildMessageList(AnthropicMessageRequest req, List<byte[]> images)
     {
         var list = new List<(string, string)>();
         var systemText = ExtractTextContent(req.System);
@@ -513,12 +559,56 @@ public static class AnthropicEndpoints
         foreach (var m in req.Messages!)
         {
             var role = m.Role ?? "user";
-            var content = ExtractTextContent(m.Content) ?? "";
+            var content = ExtractTextAndImages(m.Content, images);
             if (role == "assistant")
                 content = ChatTemplate.ScrubAssistantThinking(content);
             list.Add((role, content));
         }
         return list;
+    }
+
+    /// <summary>
+    /// Like <see cref="ExtractTextContent"/> but also handles Anthropic <c>image</c> content
+    /// blocks (issue #253): each base64 <c>source</c> is decoded into <paramref name="images"/>
+    /// (in document order) and replaced by the model's <c>&lt;|image|&gt;</c> placeholder so the
+    /// engine can splice its soft tokens at the matching position.
+    /// </summary>
+    private static string ExtractTextAndImages(JsonElement? contentEl, List<byte[]> images)
+    {
+        if (contentEl is null) return "";
+        var el = contentEl.Value;
+        if (el.ValueKind == JsonValueKind.String) return el.GetString() ?? "";
+        if (el.ValueKind != JsonValueKind.Array) return "";
+
+        var sb = new StringBuilder();
+        foreach (var block in el.EnumerateArray())
+        {
+            var type = block.TryGetProperty("type", out var t) ? t.GetString() : null;
+            if (type == "text")
+            {
+                if (block.TryGetProperty("text", out var tv))
+                    sb.Append(tv.GetString());
+            }
+            else if (type == "image")
+            {
+                images.Add(ParseAnthropicImageBlock(block));
+                sb.Append(ImageContent.Placeholder);
+            }
+        }
+        return sb.ToString();
+    }
+
+    private static byte[] ParseAnthropicImageBlock(JsonElement block)
+    {
+        if (!block.TryGetProperty("source", out var source))
+            throw new ImageContentException("image content block is missing 'source'.");
+        var srcType = source.TryGetProperty("type", out var st) ? st.GetString() : null;
+        if (srcType != "base64")
+            throw new ImageContentException(
+                $"unsupported image source type '{srcType}'; only base64 image sources are supported (URL fetch is not).");
+        if (!source.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.String)
+            throw new ImageContentException("image source is missing base64 'data'.");
+        return ImageContent.FromBase64(data.GetString() ?? "");
     }
 
     /// <summary>
@@ -529,7 +619,7 @@ public static class AnthropicEndpoints
     /// the adapter specifies (defaults to role="tool").
     /// </summary>
     private static (List<Dictionary<string, object?>> messages, List<object?>? tools)
-        BuildRichMessageList(AnthropicMessageRequest req, IToolCallAdapter adapter)
+        BuildRichMessageList(AnthropicMessageRequest req, IToolCallAdapter adapter, List<byte[]> images)
     {
         var messages = new List<Dictionary<string, object?>>();
 
@@ -601,6 +691,12 @@ public static class AnthropicEndpoints
                         {
                             if (block.TryGetProperty("text", out var tv))
                                 textSb.Append(tv.GetString());
+                        }
+                        else if (type == "image")
+                        {
+                            // Issue #253: decode + collect the image, emit a placeholder inline.
+                            images.Add(ParseAnthropicImageBlock(block));
+                            textSb.Append(ImageContent.Placeholder);
                         }
                         else if (type == "tool_result")
                         {

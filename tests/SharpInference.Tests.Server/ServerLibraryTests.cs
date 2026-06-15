@@ -654,6 +654,33 @@ public sealed class ServiceCollectionExtensionsTests
     }
 
     [Fact]
+    public void AddSharpInference_MmprojPath_ConfigurableViaConfigKeyAndConfigure()
+    {
+        // Issue #253: the vision projector must be settable through SharpInferenceServerOptions
+        // — both the SharpInference:MmprojPath config key and the inline Configure callback —
+        // not only the SHARPI_MMPROJ environment variable.
+        var cfg = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["SharpInference:ModelPath"]  = "/tmp/model.gguf",
+                ["SharpInference:MmprojPath"] = "/tmp/mmproj.gguf",
+            })
+            .Build();
+
+        var fromConfig = new ServiceCollection();
+        fromConfig.AddSharpInference(cfg);
+        using var spConfig = fromConfig.BuildServiceProvider();
+        Assert.Equal("/tmp/mmproj.gguf",
+            spConfig.GetRequiredService<IOptions<SharpInferenceServerOptions>>().Value.MmprojPath);
+
+        var fromConfigure = new ServiceCollection();
+        fromConfigure.AddSharpInference(opts => opts.MmprojPath = "/code/mmproj.gguf");
+        using var spConfigure = fromConfigure.BuildServiceProvider();
+        Assert.Equal("/code/mmproj.gguf",
+            spConfigure.GetRequiredService<IOptions<SharpInferenceServerOptions>>().Value.MmprojPath);
+    }
+
+    [Fact]
     public void AddSharpInference_InlineConfigure_OverridesConfigurationValues()
     {
         // The Action<Options> callback runs AFTER the IConfiguration bind, so inline

@@ -64,6 +64,15 @@ public sealed class ChatTemplateRenderer
     /// <summary>Architecture string used to pick a fallback template when no Jinja is loaded.</summary>
     public string Architecture => _architecture;
 
+    /// <summary>
+    /// True when the loaded model's family should run with reasoning <em>off</em> unless a
+    /// request explicitly opts in. Gemma 4 is not trained for the engine's <c>&lt;|channel&gt;</c>
+    /// thought split the way Qwen3 is — enabling it makes the model ramble in the thought channel
+    /// (and go badly out-of-distribution on multimodal input, producing garbage). Mirrors the
+    /// CLI's <c>modelDefaultsThinkingOff = s_arch == "gemma4"</c> gate so the server and CLI agree.
+    /// </summary>
+    public bool ModelDefaultsThinkingOff => _architecture == "gemma4";
+
     /// <summary>Compiled Jinja template, if the loaded model shipped one.</summary>
     public JinjaChatTemplate? JinjaTemplate => _template;
 

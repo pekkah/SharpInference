@@ -1160,6 +1160,12 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
     /// <summary>The rendered prompt handed to the most recent generation call.</summary>
     public string? LastPrompt { get; private set; }
 
+    /// <summary>Image-input support flag (issue #253) and capture of the most recent image
+    /// dispatch, so wire-level tests can confirm image content reached the engine.</summary>
+    public bool SupportsImages { get; init; }
+    public bool SupportsImageInput => SupportsImages;
+    public int LastImageCount { get; private set; }
+
     public async IAsyncEnumerable<GenerateChunk> GenerateChunksAsync(
         string prompt,
         SamplingParams sp,
@@ -1169,6 +1175,24 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
         LastSamplingParams = sp;
         LastCanonicalHistoryPrefix = canonicalHistoryPrefix;
         LastPrompt = prompt;
+        foreach (var (kind, text) in _script)
+        {
+            ct.ThrowIfCancellationRequested();
+            await Task.Yield();
+            yield return new GenerateChunk(kind, text);
+        }
+    }
+
+    public async IAsyncEnumerable<GenerateChunk> GenerateImageChunksAsync(
+        string prompt,
+        IReadOnlyList<byte[]> imageBytes,
+        SamplingParams sp,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        LastSamplingParams = sp;
+        LastCanonicalHistoryPrefix = null;
+        LastPrompt = prompt;
+        LastImageCount = imageBytes.Count;
         foreach (var (kind, text) in _script)
         {
             ct.ThrowIfCancellationRequested();

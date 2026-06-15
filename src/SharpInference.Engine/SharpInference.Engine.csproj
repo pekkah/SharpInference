@@ -13,6 +13,9 @@
   <ItemGroup>
     <ProjectReference Include="..\SharpInference.Core\SharpInference.Core.csproj" />
     <ProjectReference Include="..\SharpInference.Cpu\SharpInference.Cpu.csproj" />
+    <!-- Vision: Gemma 4 image projection (gemma4uv) for the engine's image-input path (#253).
+         Vision depends only on Core + Cpu, so no dependency cycle. -->
+    <ProjectReference Include="..\SharpInference.Vision\SharpInference.Vision.csproj" />
     <ProjectReference Include="..\SharpInference.Vulkan\SharpInference.Vulkan.csproj" />
     <ProjectReference Include="..\SharpInference.Cuda\SharpInference.Cuda.csproj" />
     <ProjectReference Include="..\SharpInference.TurboQuant\SharpInference.TurboQuant.csproj" />

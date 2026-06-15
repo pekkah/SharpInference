@@ -49,6 +49,8 @@
   <ItemGroup>
     <ProjectReference Include="..\SharpInference.Engine\SharpInference.Engine.csproj" PrivateAssets="all" />
     <ProjectReference Include="..\SharpInference.Cpu\SharpInference.Cpu.csproj" PrivateAssets="all" />
+    <!-- Vision: image-input loader path (#253). Bundled inside the SharpInference meta-package. -->
+    <ProjectReference Include="..\SharpInference.Vision\SharpInference.Vision.csproj" PrivateAssets="all" />
     <ProjectReference Include="..\SharpInference\SharpInference.csproj" />
   </ItemGroup>
 
