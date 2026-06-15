@@ -32,7 +32,10 @@ public interface IForwardPass : IDisposable
     /// token-table lookup, returning next-token logits. Used to splice multimodal soft
     /// tokens into the decode stream at <paramref name="position"/>. Implementations must
     /// skip token-only embedding transforms that don't apply to raw embeddings (e.g. Gemma's
-    /// sqrt(EmbeddingDim) scale). No-op passes throw; check <see cref="SupportsEmbeddingInput"/> first.
+    /// sqrt(EmbeddingDim) scale) AND, on per-layer-embedding (PLE) models, build the per-layer
+    /// projections from the padding token (id 0) rather than a real token — the multimodal
+    /// branch of gemma4.cpp's build_inp_per_layer. These two facts are the correctness contract
+    /// every backend's mirror must keep. No-op passes throw; check <see cref="SupportsEmbeddingInput"/> first.
     /// </summary>
     ReadOnlySpan<float> ForwardEmbedding(ReadOnlySpan<float> embedding, int position) =>
         throw new NotSupportedException(

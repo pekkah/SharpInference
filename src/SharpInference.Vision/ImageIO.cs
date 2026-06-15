@@ -43,7 +43,9 @@ public static class ImageIO
             int clen = ReadUInt32BE(png, pos);
             string type = System.Text.Encoding.ASCII.GetString(png, pos + 4, 4);
             int dataOff = pos + 8;
-            if (dataOff + clen + 4 > len)
+            // ReadUInt32BE returns a signed int; a high-bit-set length is negative and would
+            // wrap past the bounds check, so reject it explicitly (malformed/hostile PNG).
+            if (clen < 0 || dataOff + clen + 4 > len)
                 throw new InvalidDataException($"Truncated PNG chunk '{type}'.");
 
             switch (type)
@@ -68,6 +70,10 @@ public static class ImageIO
         }
 
         if (!seenIhdr) throw new InvalidDataException("PNG missing IHDR.");
+        // IHDR width/height come through ReadUInt32BE (signed) too; reject non-positive or
+        // absurd dimensions before they reach the pixel-buffer allocation below.
+        if (w <= 0 || h <= 0 || (long)w * h > 64_000_000)
+            throw new InvalidDataException($"PNG dimensions out of range: {w}x{h}.");
         if (bitDepth != 8) throw new NotSupportedException($"Only 8-bit PNGs supported (got {bitDepth}-bit).");
         if (interlace != 0) throw new NotSupportedException("Interlaced PNGs are not supported.");
         int channels = colorType switch

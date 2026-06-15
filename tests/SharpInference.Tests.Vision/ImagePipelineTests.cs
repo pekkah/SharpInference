@@ -109,4 +109,37 @@ public class ImagePipelineTests
         var ex = Assert.Throws<ArgumentException>(() => embedder.Forward(chw, m.PatchSize, big, out _));
         Assert.Contains("position-table", ex.Message);
     }
+
+    [Fact]
+    public void LoadRgb_BadSignature_Throws()
+    {
+        using var ms = new MemoryStream([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        Assert.Throws<InvalidDataException>(() => ImageIO.LoadRgb(ms, out _, out _));
+    }
+
+    [Fact]
+    public void LoadRgb_NonPositiveDimensions_Throws()
+    {
+        // Valid signature + an IHDR declaring width=0 (a hostile/corrupt PNG). The decoder
+        // doesn't verify the CRC, so this exercises the dimension guard, not the CRC. It must
+        // throw InvalidDataException (inside the CLI's catch filter), not a raw alloc failure.
+        using var ms = new MemoryStream();
+        ms.Write([137, 80, 78, 71, 13, 10, 26, 10]);   // PNG signature
+        WriteBE(ms, 13);                               // IHDR length
+        ms.Write("IHDR"u8.ToArray());
+        WriteBE(ms, 0);                                // width = 0 (invalid)
+        WriteBE(ms, 1);                                // height
+        ms.WriteByte(8); ms.WriteByte(2);              // bit depth, color type (RGB)
+        ms.WriteByte(0); ms.WriteByte(0); ms.WriteByte(0); // compression, filter, interlace
+        WriteBE(ms, 0);                                // CRC (unchecked)
+        ms.Position = 0;
+
+        Assert.Throws<InvalidDataException>(() => ImageIO.LoadRgb(ms, out _, out _));
+
+        static void WriteBE(Stream s, int v)
+        {
+            s.WriteByte((byte)(v >> 24)); s.WriteByte((byte)(v >> 16));
+            s.WriteByte((byte)(v >> 8)); s.WriteByte((byte)v);
+        }
+    }
 }

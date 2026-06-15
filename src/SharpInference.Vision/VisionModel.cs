@@ -96,7 +96,7 @@ public sealed class VisionModel : IDisposable
                 gguf.FindTensor(name)
                 ?? throw new InvalidDataException($"mmproj '{mmprojPath}' is missing tensor '{name}'.");
 
-            return new VisionModel(gguf)
+            var model = new VisionModel(gguf)
             {
                 ProjectorType    = proj,
                 HasVisionEncoder = gguf.GetMetadata("clip.has_vision_encoder", true),
@@ -117,6 +117,21 @@ public sealed class VisionModel : IDisposable
                 PositionEmbd     = Req("v.position_embd.weight"),
                 MmInputProjection = Req("mm.input_projection.weight"),
             };
+
+            // GemmaUvVisionEmbedder reads these two tensors through cached raw pointers with a
+            // hardcoded element type (patch-embed weight as F32, input-projection as BF16); the
+            // rest go through LoadFloats, which dequantizes any dtype. Fail loudly if an export
+            // differs rather than silently misreading the bytes into garbage soft tokens.
+            RequireDType(model.PatchEmbdWeight, DType.Float32, "v.patch_embd.weight");
+            RequireDType(model.MmInputProjection, DType.BFloat16, "mm.input_projection.weight");
+            return model;
+
+            static void RequireDType(GgufTensorInfo t, DType expected, string name)
+            {
+                if (t.DType != expected)
+                    throw new NotSupportedException(
+                        $"mmproj tensor '{name}' has dtype {t.DType}; the gemma4uv embedder requires {expected}.");
+            }
         }
         catch
         {
