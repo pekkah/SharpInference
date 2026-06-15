@@ -129,6 +129,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _embedLookupQ6KKernel;   // #124: Q6_K tied embedding (Gemma 4 12B)
     private nint   _embedLookupQ80Kernel;
     private nint   _embedLookupQ80BatchedKernel;
+    private nint   _dequantRowsQ80Kernel;   // #247: GPU-side PLE pre-pass (Q8_0 rows → f32)
+    private nint   _dequantRowsQ6KKernel;   // #247: GPU-side PLE pre-pass (Q6_K rows → f32)
     private nint   _matvecF32Kernel;
     private nint   _matvecQ4KKernel;
     private nint   _matvecQ4KSoaKernel;     // #156: scale-pre-unpacked SoA decode matvec
@@ -823,6 +825,24 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         nuint byteSize = (nuint)(src.Length * sizeof(float));
         fixed (float* s = src)
             UploadViaStaging(dstPtr, s, byteSize);
+    }
+
+    /// <summary>
+    /// Copy <paramref name="src"/> raw bytes into an existing device buffer (no allocation).
+    /// Byte-typed sibling of <see cref="UploadInto"/>: the destination is sized for a max
+    /// capacity but a given call may push fewer bytes (e.g. a short final prefill chunk), so
+    /// the only requirement is that <paramref name="src"/> fits within <paramref name="dst"/>'s
+    /// allocation. Used by the GPU-side PLE pre-pass (issue #247) to stage gathered packed
+    /// quant rows before the on-device dequant.
+    /// </summary>
+    public void UploadRawInto(Tensor dst, ReadOnlySpan<byte> src)
+    {
+        if (!_devPtrs.TryGetValue(dst.Handle, out var entry))
+            throw new InvalidOperationException($"UploadRawInto: handle {dst.Handle} not registered.");
+        if ((nuint)src.Length > entry.byteSize)
+            throw new ArgumentException($"UploadRawInto: source ({src.Length} bytes) exceeds destination capacity ({entry.byteSize} bytes).");
+        fixed (byte* s = src)
+            UploadViaStaging(entry.devPtr, s, (nuint)src.Length);
     }
 
     // ── Direct-pinned Download/Upload overloads (issues #48/#49) ──────────
@@ -5301,6 +5321,55 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(embed_lookup_q8_0_batched) failed: {r}");
     }
 
+    /// <summary>
+    /// Dequantize <paramref name="nRows"/> CONTIGUOUS Q8_0-packed rows in
+    /// <paramref name="src"/> into the f32 buffer <paramref name="dst"/> ([nRows × rowDim]):
+    /// row i → row i. Issue #247: moves the Gemma-4 PLE pre-pass dequant off the CPU
+    /// <c>Parallel.For</c> (and shrinks the host→device upload 4× — packed quant bytes
+    /// instead of f32). Bit-identical to <c>Dequantize.ToFloat32(..., Q8_0)</c>.
+    /// <paramref name="rowDim"/> must be a multiple of 256.
+    /// </summary>
+    public void DequantRowsQ8_0(Tensor src, Tensor dst, int nRows, int rowDim)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if ((rowDim & 0xff) != 0)
+            throw new ArgumentException($"DequantRowsQ8_0 requires rowDim to be a multiple of 256 (got {rowDim}).");
+        if (nRows <= 0)
+            throw new ArgumentOutOfRangeException(nameof(nRows), nRows, "nRows must be > 0.");
+
+        nint sP = GetDevPtr(src);
+        nint dP = GetDevPtr(dst);
+        int pN = nRows, pE = rowDim;
+        nint* args = stackalloc nint[4] { (nint)(&sP), (nint)(&dP), (nint)(&pN), (nint)(&pE) };
+        int r = NvrtcInterop.LaunchKernel(_dequantRowsQ80Kernel, (uint)nRows, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(dequant_rows_q8_0) failed: {r}");
+    }
+
+    /// <summary>
+    /// Q6_K analogue of <see cref="DequantRowsQ8_0"/> (issue #247). Bit-identical to
+    /// <c>Dequantize.ToFloat32(..., Q6_K)</c>. <paramref name="rowDim"/> must be a
+    /// multiple of 256.
+    /// </summary>
+    public void DequantRowsQ6K(Tensor src, Tensor dst, int nRows, int rowDim)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if ((rowDim & 0xff) != 0)
+            throw new ArgumentException($"DequantRowsQ6K requires rowDim to be a multiple of 256 (got {rowDim}).");
+        if (nRows <= 0)
+            throw new ArgumentOutOfRangeException(nameof(nRows), nRows, "nRows must be > 0.");
+
+        nint sP = GetDevPtr(src);
+        nint dP = GetDevPtr(dst);
+        int pN = nRows, pE = rowDim;
+        nint* args = stackalloc nint[4] { (nint)(&sP), (nint)(&dP), (nint)(&pN), (nint)(&pE) };
+        int r = NvrtcInterop.LaunchKernel(_dequantRowsQ6KKernel, (uint)nRows, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(dequant_rows_q6k) failed: {r}");
+    }
+
     /// <summary>Set every element of <paramref name="dst"/> to zero.</summary>
     /// <remarks>
     /// The kernel writes fp32-sized lanes; for sub-fp32 dtypes (e.g. BFloat16)
@@ -5968,6 +6037,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _embedLookupF32Kernel, _embedLookupQ4KKernel, _embedLookupQ5KKernel,
             _embedLookupQ6KKernel,
             _embedLookupQ80Kernel, _embedLookupQ80BatchedKernel,
+            _dequantRowsQ80Kernel, _dequantRowsQ6KKernel,
             _matvecF32Kernel, _matvecQ40Kernel, _matvecQ4KKernel, _matvecQ5KKernel, _matvecQ6KKernel,
             _matvecQ80Kernel,
             _matvecF32N2Kernel, _matvecQ4KN2Kernel, _matvecQ5KN2Kernel, _matvecQ6KN2Kernel,
@@ -6073,6 +6143,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _embedLookupQ6KKernel  = GetKernelFunc("llm_embed_lookup_q6k");
         _embedLookupQ80Kernel  = GetKernelFunc("llm_embed_lookup_q8_0");
         _embedLookupQ80BatchedKernel = GetKernelFunc("llm_embed_lookup_q8_0_batched");
+        _dequantRowsQ80Kernel  = GetKernelFunc("llm_dequant_rows_q8_0");
+        _dequantRowsQ6KKernel  = GetKernelFunc("llm_dequant_rows_q6k");
         _matvecF32Kernel       = GetKernelFunc("llm_matvec_f32");
         _matvecQ4KKernel       = GetKernelFunc("llm_matvec_q4k");
         _matvecQ4KSoaKernel    = GetKernelFunc("llm_matvec_q4k_soa");
