@@ -3469,6 +3469,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
         if (_argmaxRowsOut is null || _argmaxRowsOut.ElementCount < rows * 2)
         {
+            if (_argmaxRowsOut is { } prev) Free(prev);   // return the smaller rental before growing
             _argmaxRowsOut = Allocate(TensorShape.D1(rows * 2));
             _argmaxRowsHost = new float[rows * 2];
         }
