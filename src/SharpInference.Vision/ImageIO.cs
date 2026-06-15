@@ -45,7 +45,7 @@ public static class ImageIO
             int dataOff = pos + 8;
             // ReadUInt32BE returns a signed int; a high-bit-set length is negative and would
             // wrap past the bounds check, so reject it explicitly (malformed/hostile PNG).
-            if (clen < 0 || dataOff + clen + 4 > len)
+            if (clen < 0 || (long)dataOff + clen + 4 > len)
                 throw new InvalidDataException($"Truncated PNG chunk '{type}'.");
 
             switch (type)
