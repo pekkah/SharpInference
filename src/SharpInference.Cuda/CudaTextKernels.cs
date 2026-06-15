@@ -1033,6 +1033,94 @@ extern ""C"" __global__ void llm_embed_lookup_q8_0_batched(
     }
 }
 
+// ── Contiguous-row dequant (issue #247: GPU-side Gemma-4 PLE pre-pass) ───────
+// Dequantize n_rows CONTIGUOUS packed rows into an f32 [n_rows × row_dim] buffer:
+// row i of src → row i of dst (no token-id indirection — the caller has already
+// gathered the PLE rows for the prompt's tokens into a packed quant buffer, so the
+// expensive per-element dequant runs on the GPU instead of a CPU Parallel.For + a
+// 4×-larger float upload). The per-row decode is byte-for-byte identical to
+// llm_embed_lookup_q8_0 (same cvt.f32.f16 scale × int8), so the batched PLE row is
+// bit-identical to the CPU Dequantize.ToFloat32 the per-token oracle uses. row_dim
+// must be a multiple of 256 (8 Q8_0 blocks per outer iteration).
+extern ""C"" __global__ void llm_dequant_rows_q8_0(
+    const unsigned char* __restrict__ src,    // [n_rows * row_dim] Q8_0 packed
+    float* __restrict__ dst,                  // [n_rows * row_dim] f32
+    int n_rows, int row_dim)
+{
+    __shared__ unsigned char blk[272];
+    unsigned int tid = threadIdx.x;
+    int i = (int)blockIdx.x;
+    if (i >= n_rows) return;
+
+    int num_blocks = row_dim >> 5;
+    long bytes_per_row = (long)num_blocks * 34L;
+    long row_byte_base = (long)i * bytes_per_row;
+    float* out_row = dst + (long)i * row_dim;
+
+    int outer_iters = row_dim >> 8;
+    for (int outer = 0; outer < outer_iters; outer++) {
+        long base_byte = row_byte_base + (long)(outer * 8) * 34L;
+        if (tid < 272) blk[tid] = src[base_byte + tid];
+        if (tid < 16)  blk[256 + tid] = src[base_byte + 256 + tid];
+        __syncthreads();
+
+        unsigned int block_in_outer = tid >> 5;
+        unsigned int lane           = tid & 31u;
+        unsigned int block_off = block_in_outer * 34u;
+        unsigned int d_bits = (unsigned int)blk[block_off]
+                            | ((unsigned int)blk[block_off + 1u] << 8);
+        float d = sharpi_fp16_to_fp32(d_bits);
+        int q = (int)(signed char)blk[block_off + 2u + lane];
+        out_row[outer * 256 + (int)tid] = d * (float)q;
+        __syncthreads();
+    }
+}
+
+// Q6_K variant of llm_dequant_rows_q8_0. Per-element decode mirrors
+// llm_embed_lookup_q6k / llm_matvec_q6k exactly ((d·scale)·q, same order as the
+// CPU DequantQ6K), so the batched PLE row is bit-identical to the per-token CPU
+// dequant. row_dim must be a multiple of 256.
+extern ""C"" __global__ void llm_dequant_rows_q6k(
+    const unsigned char* __restrict__ src,    // [n_rows * row_dim] Q6_K packed
+    float* __restrict__ dst,                  // [n_rows * row_dim] f32
+    int n_rows, int row_dim)
+{
+    __shared__ unsigned char blk[210];
+    unsigned int tid = threadIdx.x;
+    int i = (int)blockIdx.x;
+    if (i >= n_rows) return;
+
+    int num_blocks = row_dim >> 8;            // row_dim / 256
+    long bytes_per_row = (long)num_blocks * 210L;
+    long row_byte_base = (long)i * bytes_per_row;
+    float* out_row = dst + (long)i * row_dim;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long base = row_byte_base + (long)block * 210L;
+        if (tid < 210) blk[tid] = src[base + tid];
+        __syncthreads();
+
+        unsigned int lane = tid & 31u;          // 0..31
+        unsigned int g    = tid >> 5;           // group 0..7
+        unsigned int isc  = lane >> 4;          // 0 or 1 (scale half)
+
+        float d = sharpi_fp16_to_fp32((unsigned int)blk[208] | ((unsigned int)blk[209] << 8));
+        float scale = d * (float)((signed char)blk[192 + 2u * g + isc]);
+
+        unsigned int ql_index = (g < 4u) ? (g & 1u) : (2u + (g & 1u));
+        unsigned int ql_byte  = blk[ql_index * 32u + lane];
+        unsigned int high     = (g >> 1) & 1u;
+        unsigned int nib      = high ? (ql_byte >> 4) : (ql_byte & 0xFu);
+
+        unsigned int qh_byte = (g < 4u) ? blk[128 + lane] : blk[160 + lane];
+        unsigned int shift   = 2u * (g & 3u);
+        int q = (int)(nib | (((qh_byte >> shift) & 3u) << 4)) - 32;
+
+        out_row[block * 256 + (int)tid] = scale * (float)q;
+        __syncthreads();
+    }
+}
+
 // ── MatVec F32 ─────────────────────────────────────────────────────────────
 // 256 threads/block, 8 rows/block, 32 threads/row → warp reduce.
 // One grid dim x covers ceil(rows/8) blocks.

@@ -159,6 +159,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     // Managed buffer for dequanting the active token's PLE row before upload.
     private readonly float[]? _pleRowHost;
     private readonly int _pleWidth;
+    // Issue #247: PLE table stays CPU-resident, but the batched pre-pass dequant can run
+    // on the GPU when the table is Q8_0/Q6_K (the only quants Gemma 4 E2B/E4B ship) and a
+    // PLE row (L*pleWidth) is a multiple of 256 (the dequant-rows kernel's block stride).
+    private readonly bool _pleGpuDequant;
+    private readonly DType _pleDType;
+    private readonly int _pleBytesPerRow;   // packed bytes per token's PLE row
 
     // Per-layer post-attention / post-FFN RmsNorm weights (Gemma 4). Each is a
     // [embDim] f32 vector. Uploaded with Gemma (w-1)→(w+1) offset baked in.
@@ -388,7 +394,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     private Tensor? _bpProjAll, _bpPleRowAll;             // [N × L*pleWidth]
     private Tensor? _bpPleGate;                            // [N × pleWidth]
     private Tensor? _bpPleY;                               // [N × embDim]
-    private float[]? _bpPleRowHostAll;                     // managed [N × L*pleWidth]
+    private float[]? _bpPleRowHostAll;                     // managed [N × L*pleWidth] (CPU-dequant fallback)
+    // Issue #247: GPU-side PLE pre-pass. When the table is Q8_0/Q6_K we gather the raw
+    // packed rows for the chunk's tokens (a cheap memcpy, no FP math) into a host byte
+    // buffer, upload it (4× smaller than the f32 rows), then dequant on the GPU into
+    // _bpPleRowAll — removing the CPU Parallel.For dequant that profiling pinned at ~30%
+    // of batched prefill. Quant buffers replace _bpPleRowHostAll on the GPU-dequant path.
+    private Tensor? _bpPleQuantDev;                        // [N × _pleBytesPerRow] packed (device)
+    private byte[]? _bpPleQuantHost;                       // managed [N × _pleBytesPerRow] gather buffer
     /// <summary>True if the most recent <see cref="Prefill"/> used the batched trunk.</summary>
     public bool LastPrefillWasBatched { get; private set; }
 
@@ -1124,10 +1137,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         }
 
         // ── Gemma 4 PLE plumbing ───────────────────────────────────────────────
-        // Per-layer-embedding table (~4.2 GB at Q8_0) MUST stay CPU-resident; the
-        // matching TierPlanner branch excludes it from the GPU weight budget.
-        // Forward gathers + dequants one row per token, pipes it through pinned
-        // host memory, then runs the projection on-GPU.
+        // The per-layer-embedding table (~2.3–3 GB; E2B/E4B only — the 12B has no PLE)
+        // MUST stay CPU-resident; the matching TierPlanner branch excludes it from the GPU
+        // weight budget. Per-token decode gathers + dequants one row on the CPU and pipes
+        // it through pinned host memory. The BATCHED prefill pre-pass instead gathers the
+        // chunk's raw packed rows (a memcpy, no FP) and dequants them on the GPU (issue
+        // #247) — the CPU Parallel.For dequant of N×stackedDim elements was ~30% of batched
+        // prefill (#141 profiling), and the packed upload is 4× smaller than the f32 rows.
         // The small per-layer F32 weights (inp_gate / proj / post_norm /
         // per_layer_model_proj / per_layer_proj_norm) all upload at construction —
         // ~215 MB total, trivially absorbed in VRAM and keeps the per-token hot
@@ -1145,6 +1161,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
             }
 
             _cpuPleTokenEmbed = ResolveCpuTensor("per_layer_token_embd.weight");
+
+            // Decide whether the batched pre-pass dequants on the GPU (issue #247). The
+            // dequant-rows kernels cover Q8_0/Q6_K (Gemma 4 E2B/E4B ship one of these) and
+            // require a PLE row (L*pleWidth) to be a multiple of 256. Anything else (F32 /
+            // an exotic quant) keeps the CPU dequant fallback in BuildPerLayerProjectionsBatched.
+            _pleDType = _cpuPleTokenEmbed.Value.DType;
+            int pleStackedDim = L * _pleWidth;
+            _pleGpuDequant = (_pleDType == DType.Q8_0 || _pleDType == DType.Q6_K)
+                          && (pleStackedDim & 0xff) == 0
+                          && Environment.GetEnvironmentVariable("SHARPI_PLE_GPU_DEQUANT") != "0";
+            _pleBytesPerRow = (pleStackedDim / DTypeInfo.BlockSize(_pleDType))
+                            * DTypeInfo.BytesPerBlock(_pleDType);
 
             var projInfo = model.FindTensor("per_layer_model_proj.weight")!.Value;
             var projData = model.GetTensorData(projInfo);
@@ -2602,7 +2630,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
             _bpPleRowAll  = _gpu.Allocate(TensorShape.D1(stacked));
             _bpPleGate    = _gpu.Allocate(TensorShape.D1((long)n * _pleWidth));
             _bpPleY       = _gpu.Allocate(TensorShape.D1(emb));
-            _bpPleRowHostAll = new float[stacked];
+            if (_pleGpuDequant)
+            {
+                // Packed quant rows: gather buffer (host) + staging buffer (device). The
+                // GPU dequant writes _bpPleRowAll, so the f32 host row buffer isn't needed.
+                long quantBytes = (long)n * _pleBytesPerRow;
+                _bpPleQuantDev  = _gpu.AllocateRawBytes(quantBytes, _pleDType, exact: true);
+                _bpPleQuantHost = new byte[quantBytes];
+            }
+            else
+                _bpPleRowHostAll = new float[stacked];
         }
         _bpCapacity = n;
     }
@@ -2611,11 +2648,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     {
         foreach (var t in new[] { _bpHidden, _bpResidual, _bpNorm, _bpQ, _bpAttnOut,
                                   _bpK, _bpV, _bpFfnGate, _bpFfnUp,
-                                  _bpProjAll, _bpPleRowAll, _bpPleGate, _bpPleY })
+                                  _bpProjAll, _bpPleRowAll, _bpPleGate, _bpPleY, _bpPleQuantDev })
             if (t is { } v) _gpu.Free(v);
         _bpHidden = _bpResidual = _bpNorm = _bpQ = _bpAttnOut = _bpK = _bpV =
-            _bpFfnGate = _bpFfnUp = _bpProjAll = _bpPleRowAll = _bpPleGate = _bpPleY = null;
+            _bpFfnGate = _bpFfnUp = _bpProjAll = _bpPleRowAll = _bpPleGate = _bpPleY =
+            _bpPleQuantDev = null;
         _bpPleRowHostAll = null;
+        _bpPleQuantHost = null;
         _bpCapacity = 0;
     }
 
@@ -2722,32 +2761,57 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     /// Batched PLE pre-pass: build <c>_bpProjAll</c> ([N × L*pleWidth]) for all N
     /// tokens. Mirrors <see cref="BuildPerLayerProjectionsGpu"/> kernel-for-kernel,
     /// batched: one proj GEMM-N, per-(token,layer) RmsNormBatched, full-buffer add/scale.
+    /// The PLE row dequant runs on the GPU when the table is Q8_0/Q6_K (issue #247) —
+    /// the CPU <see cref="System.Threading.Tasks.Parallel"/> dequant of N×stackedDim
+    /// elements + a 4×-larger f32 upload was ~30% of batched prefill (#141 profiling).
     /// </summary>
     private void BuildPerLayerProjectionsBatched(IReadOnlyList<int> tokens)
     {
         int N = tokens.Count, L = _hp.NumLayers;
         int stackedDim = L * _pleWidth;
         var pleRef = _cpuPleTokenEmbed!.Value;
-        int bytesPerRow = (stackedDim / DTypeInfo.BlockSize(pleRef.DType))
-                        * DTypeInfo.BytesPerBlock(pleRef.DType);
-
-        // CPU dequant of each token's PLE row into the [N × stackedDim] host buffer.
-        // Parallelized across tokens (each row is independent): for a long prompt
-        // this serial gather+dequant of N×stackedDim Q8_0 elements was ~30% of the
-        // whole batched prefill (issue #141 profiling).
-        var host = _bpPleRowHostAll!;
         byte* basePtr = pleRef.DataPtr;
-        var dtype = pleRef.DType;
-        System.Threading.Tasks.Parallel.For(0, N, i =>
+
+        if (_pleGpuDequant)
         {
-            byte* rowPtr = basePtr + (long)tokens[i] * bytesPerRow;
-            var dst = new Span<float>(host).Slice(i * stackedDim, stackedDim);
-            if (dtype == DType.Float32)
-                new ReadOnlySpan<float>((float*)rowPtr, stackedDim).CopyTo(dst);
+            // Gather the chunk's raw packed PLE rows into the host staging buffer — one
+            // memcpy per row (no FP work), reading the same table bytes the CPU dequant
+            // touched but skipping the dequant math and shrinking the upload 4× (packed
+            // quant bytes vs f32). The dequant itself then runs on the GPU.
+            // N ≤ PrefillBatchChunk (4096) and bpr ≤ ~11 KB, so N*bpr (~47 MB) stays well
+            // within int — the int offsets below don't overflow at the chunk cap.
+            int bpr = _pleBytesPerRow;
+            var qhost = _bpPleQuantHost!;
+            System.Threading.Tasks.Parallel.For(0, N, i =>
+            {
+                byte* rowPtr = basePtr + (long)tokens[i] * bpr;
+                new ReadOnlySpan<byte>(rowPtr, bpr)
+                    .CopyTo(new Span<byte>(qhost).Slice(i * bpr, bpr));
+            });
+            _gpu.UploadRawInto(_bpPleQuantDev!, new ReadOnlySpan<byte>(qhost, 0, N * bpr));
+            if (_pleDType == DType.Q8_0)
+                _gpu.DequantRowsQ8_0(_bpPleQuantDev!, _bpPleRowAll!, N, stackedDim);
             else
-                Dequantize.ToFloat32(new ReadOnlySpan<byte>(rowPtr, bytesPerRow), dst, dtype, stackedDim);
-        });
-        _gpu.UploadInto(_bpPleRowAll!, host);
+                _gpu.DequantRowsQ6K(_bpPleQuantDev!, _bpPleRowAll!, N, stackedDim);
+        }
+        else
+        {
+            // CPU dequant fallback (F32 table or a quant without a dequant-rows kernel).
+            // Parallelized across tokens (each row is independent).
+            int bytesPerRow = _pleBytesPerRow;
+            var host = _bpPleRowHostAll!;
+            var dtype = _pleDType;
+            System.Threading.Tasks.Parallel.For(0, N, i =>
+            {
+                byte* rowPtr = basePtr + (long)tokens[i] * bytesPerRow;
+                var dst = new Span<float>(host).Slice(i * stackedDim, stackedDim);
+                if (dtype == DType.Float32)
+                    new ReadOnlySpan<float>((float*)rowPtr, stackedDim).CopyTo(dst);
+                else
+                    Dequantize.ToFloat32(new ReadOnlySpan<byte>(rowPtr, bytesPerRow), dst, dtype, stackedDim);
+            });
+            _gpu.UploadInto(_bpPleRowAll!, host);
+        }
         _gpu.ScaleInPlace(_bpPleRowAll!, MathF.Sqrt(_pleWidth));
 
         // proj_per_layer = per_layer_model_proj @ hidden, for all N tokens.
