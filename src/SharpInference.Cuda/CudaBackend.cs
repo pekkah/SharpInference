@@ -841,6 +841,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             throw new InvalidOperationException($"UploadRawInto: handle {dst.Handle} not registered.");
         if ((nuint)src.Length > entry.byteSize)
             throw new ArgumentException($"UploadRawInto: source ({src.Length} bytes) exceeds destination capacity ({entry.byteSize} bytes).");
+        if (src.IsEmpty) return;   // nothing to copy; avoids fixed → null-ptr on an empty span
         fixed (byte* s = src)
             UploadViaStaging(entry.devPtr, s, (nuint)src.Length);
     }

@@ -27,8 +27,7 @@ public sealed unsafe class CudaDequantRowsTests
         catch { return null; }
     }
 
-    private static ushort HalfToUshort(Half h) =>
-        BitConverter.ToUInt16(BitConverter.GetBytes(h), 0);
+    private static ushort HalfToUshort(Half h) => BitConverter.HalfToUInt16Bits(h);
 
     /// <summary>
     /// Build <paramref name="rows"/> contiguous Q8_0 rows of <paramref name="rowDim"/>
