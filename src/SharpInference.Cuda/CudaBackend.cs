@@ -1494,7 +1494,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         nint ev;
         lock (_asyncUploadLock)
         {
-            int slot = (int)(_asyncRingIdx++ % AsyncRingSlots);
+            // Bitwise-AND (AsyncRingSlots is a power of two) instead of % so the index stays
+            // in [0, AsyncRingSlots) even in the impossible event the long counter wraps past
+            // 2^63 — a negative `% 32` would yield a negative slot and an IndexOutOfRange.
+            int slot = (int)(_asyncRingIdx++ & (AsyncRingSlots - 1));
 
             // Drain THIS slot's previous DMA (AsyncRingSlots uploads ago) before reusing its
             // staging buffer. The fence is backend-owned — never destroyed by the caller — so
@@ -1507,15 +1510,26 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                     throw new InvalidOperationException($"cudaEventSynchronize (drain async staging slot) failed: {dr}");
             }
 
-            // Grow this slot's staging buffer if the tensor doesn't fit.
+            // Grow this slot's staging buffer if the tensor doesn't fit. Free the old buffer and
+            // zero the slot FIRST, so if the MallocHost below fails the slot holds no stale or
+            // garbage pointer for Dispose to (double-)free.
             if (_asyncRingBuf[slot] == nint.Zero || byteSize > _asyncRingSize[slot])
             {
-                if (_asyncRingBuf[slot] != nint.Zero) CuBlasInterop.FreeHost(_asyncRingBuf[slot]);
-                nuint newSize = Math.Max(byteSize, _asyncRingSize[slot] * 2);
+                if (_asyncRingBuf[slot] != nint.Zero)
+                {
+                    CuBlasInterop.FreeHost(_asyncRingBuf[slot]);
+                    _asyncRingBuf[slot] = nint.Zero;
+                }
+                nuint oldSize = _asyncRingSize[slot];
+                _asyncRingSize[slot] = 0;
+                nuint newSize = Math.Max(byteSize, oldSize * 2);
                 if (newSize < 1024 * 1024) newSize = 1024 * 1024;
                 int mr = CuBlasInterop.MallocHost(out _asyncRingBuf[slot], newSize);
                 if (mr != 0)
+                {
+                    _asyncRingBuf[slot] = nint.Zero;
                     throw new InvalidOperationException($"cudaMallocHost (async upload staging, {newSize} B) failed: {mr}");
+                }
                 _asyncRingSize[slot] = newSize;
             }
 
