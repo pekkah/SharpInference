@@ -2,6 +2,7 @@ using SharpInference.Core;
 using SharpInference.Cpu;
 using SharpInference.Cuda;
 using SharpInference.Engine;
+using SharpInference.Vision;
 using SharpInference.Vulkan;
 
 namespace SharpInference.Server;
@@ -46,7 +47,7 @@ public static class InferenceEngineLoader
             Environment.SetEnvironmentVariable("SHARPI_KV_DTYPE", opts.KvType);
 
         // ── 2. Resolve & open the model.
-        var modelPath = ResolveModelPath(opts.ModelPath);
+        var modelPath = ResolvePath(opts.ModelPath, "model", "SHARPI_MODEL", "ModelPath");
         var model = GgufModel.Open(modelPath);
         var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
         var tokenizer = GgufTokenizer.FromGgufModel(model);
@@ -97,6 +98,42 @@ public static class InferenceEngineLoader
         IInferenceEngine engine;
         try
         {
+            // ── Image input (issue #253): open the mmproj vision projector when configured.
+            // Requires an embedding-capable forward pass (CPU / full-CUDA Gemma 4) and the
+            // single-user InferenceEngine path; reject other configs with a clear error.
+            GemmaUvVisionEmbedder? visionEmbedder = null;
+            VisionModel? visionModel = null;
+            (int Open, int Close, int Placeholder) imgIds = default;
+            if (!string.IsNullOrWhiteSpace(opts.MmprojPath))
+            {
+                // The gemma4uv splice path is specific to Gemma 4 text models. The CPU forward
+                // pass reports SupportsEmbeddingInput=true for every architecture, so without this
+                // arch check a non-Gemma CPU model + a valid gemma4uv mmproj would load and either
+                // splice foreign soft tokens into the wrong trunk (garbage) or throw an opaque
+                // dimension error mid-request. Fail fast at load instead.
+                if (!string.Equals(arch, "gemma4", StringComparison.Ordinal))
+                    throw new InvalidOperationException(
+                        "Image input (MmprojPath / SHARPI_MMPROJ) is only supported for Gemma 4 (gemma4uv) " +
+                        $"text models; this model's architecture is '{arch}'.");
+                if (!fwd.SupportsEmbeddingInput)
+                    throw new InvalidOperationException(
+                        "MmprojPath / SHARPI_MMPROJ is set but image input requires a forward pass that accepts " +
+                        "precomputed-embedding input: CPU (NGpuLayers=0) or full CUDA offload (NGpuLayers=-1) of a " +
+                        $"Gemma 4 model that fits VRAM. The configured pass ({fwd.GetType().Name}) does not support it.");
+                if (opts.MaxBatchSize > 1 && batchingSupported && fwd is IBatchedForwardPass)
+                    throw new InvalidOperationException(
+                        "Image input is not supported with continuous batching (MaxBatchSize > 1). Set MaxBatchSize=1.");
+
+                var mmprojPath = ResolvePath(opts.MmprojPath, "mmproj projector", "SHARPI_MMPROJ", "MmprojPath");
+                visionModel = VisionModel.Open(mmprojPath); // validates clip / gemma4uv projector, else throws
+                owned.Add(visionModel);
+                visionEmbedder = new GemmaUvVisionEmbedder(visionModel);
+                imgIds = (
+                    tokenizer.SpecialTokens.TryGetValue("<|image>", out var o) ? o : 255999,
+                    tokenizer.SpecialTokens.TryGetValue("<image|>", out var c) ? c : 258882,
+                    tokenizer.SpecialTokens.TryGetValue("<|image|>", out var p) ? p : 258880);
+            }
+
             if (opts.MaxBatchSize > 1 && batchingSupported && fwd is IBatchedForwardPass batchFwd)
             {
                 engine = new ContinuousBatchingEngine(batchFwd, tokenizer, modelId, opts.MaxBatchSize,
@@ -109,8 +146,11 @@ public static class InferenceEngineLoader
             }
             else
             {
-                engine = new InferenceEngine(fwd, tokenizer, modelId, thinkTokenId, endThinkTokenId,
+                var ie = new InferenceEngine(fwd, tokenizer, modelId, thinkTokenId, endThinkTokenId,
                     owned.ToArray());
+                if (visionEmbedder is not null)
+                    ie.EnableImageInput(visionEmbedder, visionModel!, imgIds.Open, imgIds.Close, imgIds.Placeholder);
+                engine = ie;
             }
         }
         catch
@@ -363,35 +403,35 @@ public static class InferenceEngineLoader
     /// the process was launched from the repo root, the project directory (as
     /// <c>dotnet run --project</c> sets it), or a published-binary directory.
     /// </summary>
-    private static string ResolveModelPath(string? modelPath)
+    private static string ResolvePath(string? path, string what, string envVar, string configKey)
     {
-        if (string.IsNullOrWhiteSpace(modelPath))
+        if (string.IsNullOrWhiteSpace(path))
             throw new InvalidOperationException(
-                "SharpInferenceServerOptions.ModelPath is required. " +
-                "Set it via Configure(o => o.ModelPath = ...) or the SHARPI_MODEL environment variable.");
+                $"SharpInferenceServerOptions.{configKey} ({what} path) is required. " +
+                $"Set it via Configure(o => o.{configKey} = ...) or the {envVar} environment variable.");
 
-        if (Path.IsPathRooted(modelPath) && File.Exists(modelPath))
-            return modelPath;
+        if (Path.IsPathRooted(path) && File.Exists(path))
+            return path;
 
-        if (File.Exists(modelPath))
-            return Path.GetFullPath(modelPath);
+        if (File.Exists(path))
+            return Path.GetFullPath(path);
 
         var candidates = new List<string>
         {
-            Path.Combine(Directory.GetCurrentDirectory(), modelPath),
-            Path.Combine(AppContext.BaseDirectory, modelPath),
+            Path.Combine(Directory.GetCurrentDirectory(), path),
+            Path.Combine(AppContext.BaseDirectory, path),
         };
         var dir = new DirectoryInfo(Directory.GetCurrentDirectory());
         for (int i = 0; i < 5 && dir is not null; i++, dir = dir.Parent)
-            candidates.Add(Path.Combine(dir.FullName, modelPath));
+            candidates.Add(Path.Combine(dir.FullName, path));
 
         var resolved = candidates.FirstOrDefault(File.Exists);
         if (resolved is not null) return resolved;
 
         throw new InvalidOperationException(
-            $"Model file not found: '{modelPath}'. " +
-            "Set SharpInferenceServerOptions.ModelPath, the SHARPI_MODEL environment variable, " +
-            "or the SharpInference:ModelPath configuration key.");
+            $"{char.ToUpperInvariant(what[0])}{what[1..]} file not found: '{path}'. " +
+            $"Set SharpInferenceServerOptions.{configKey}, the {envVar} environment variable, " +
+            $"or the SharpInference:{configKey} configuration key.");
     }
 }
 

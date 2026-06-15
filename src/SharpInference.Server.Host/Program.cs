@@ -16,6 +16,11 @@ builder.Services.AddSharpInference(builder.Configuration, opts =>
     if (!string.IsNullOrWhiteSpace(envModel))
         opts.ModelPath = envModel;
 
+    // Multimodal projector for image input (issue #253). Mirrors the CLI's --mmproj.
+    var envMmproj = Environment.GetEnvironmentVariable("SHARPI_MMPROJ");
+    if (!string.IsNullOrWhiteSpace(envMmproj))
+        opts.MmprojPath = envMmproj;
+
     if (int.TryParse(Environment.GetEnvironmentVariable("SHARPI_MAX_BATCH"), out int maxBatch) && maxBatch > 0)
         opts.MaxBatchSize = maxBatch;
 

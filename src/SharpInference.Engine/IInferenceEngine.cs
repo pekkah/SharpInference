@@ -60,6 +60,30 @@ public interface IInferenceEngine
         string? canonicalHistoryPrefix = null);
 
     /// <summary>
+    /// Whether this engine can accept image input (issue #253). True only when an mmproj
+    /// vision projector is loaded <i>and</i> the underlying forward pass supports
+    /// precomputed-embedding input (CPU or full-CUDA Gemma 4 today). Endpoints check this
+    /// before routing an image request and return a clear error otherwise.
+    /// </summary>
+    bool SupportsImageInput => false;
+
+    /// <summary>
+    /// Generate from a pre-formatted prompt that contains the model's <c>&lt;|image|&gt;</c>
+    /// placeholder token(s), splicing each image's projected soft-token embeddings in place of
+    /// the i-th placeholder (left to right). <paramref name="imageBytes"/> holds the raw encoded
+    /// image bytes (e.g. base64-decoded PNG), one per placeholder, in the same order. Same typed
+    /// chunk semantics as <see cref="GenerateChunksAsync"/>. The number of placeholders in the
+    /// rendered prompt must equal <c>imageBytes.Count</c>.
+    /// </summary>
+    IAsyncEnumerable<GenerateChunk> GenerateImageChunksAsync(
+        string prompt,
+        IReadOnlyList<byte[]> imageBytes,
+        SamplingParams sp,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            $"{GetType().Name} does not support image input. Check SupportsImageInput first.");
+
+    /// <summary>
     /// Generate text from a pre-formatted prompt string. Yields decoded text chunks
     /// (one or more characters) as they are produced. Reasoning content emitted inside
     /// <c>&lt;think&gt;...&lt;/think&gt;</c> is suppressed — only user-facing answer text

@@ -51,6 +51,11 @@ public static class ImageIO
             switch (type)
             {
                 case "IHDR":
+                    // IHDR is always exactly 13 bytes; the fields below read png[dataOff+8..12].
+                    // A shorter declared length (clen < 13) would read past this chunk — when the
+                    // chunk is the last bytes in the buffer that is an out-of-bounds read. Reject it.
+                    if (clen < 13)
+                        throw new InvalidDataException($"PNG IHDR chunk too short: {clen} bytes (need 13).");
                     w = ReadUInt32BE(png, dataOff);
                     h = ReadUInt32BE(png, dataOff + 4);
                     bitDepth = png[dataOff + 8];
@@ -84,20 +89,22 @@ public static class ImageIO
             _ => throw new NotSupportedException($"PNG color type {colorType} not supported (use grayscale/RGB/RGBA).")
         };
 
-        // Inflate the zlib stream (handles header + adler).
-        idat.Position = 0;
-        byte[] raw;
-        using (var zlib = new ZLibStream(idat, CompressionMode.Decompress))
-        using (var outMs = new MemoryStream(h * (1 + w * channels)))
-        {
-            zlib.CopyTo(outMs);
-            raw = outMs.ToArray();
-        }
-
         int stride = w * channels;
         int expected = h * (1 + stride);
-        if (raw.Length < expected)
-            throw new InvalidDataException($"PNG data too short: {raw.Length} < {expected}.");
+
+        // Inflate the zlib stream (handles header + adler), bounded to the exact size a
+        // non-interlaced 8-bit PNG must produce (one filter byte + one stride per scanline).
+        // Reading only `expected` bytes — and never draining the remainder of the stream —
+        // both bounds the allocation (already capped by the 64M-pixel dimension guard above)
+        // and defeats decompression bombs: a tiny IDAT that would inflate to gigabytes of
+        // zeros can no longer exhaust memory, since we stop after the bytes we actually unfilter.
+        idat.Position = 0;
+        var raw = new byte[expected];
+        int filled;
+        using (var zlib = new ZLibStream(idat, CompressionMode.Decompress))
+            filled = zlib.ReadAtLeast(raw, expected, throwOnEndOfStream: false);
+        if (filled < expected)
+            throw new InvalidDataException($"PNG data too short: {filled} < {expected}.");
 
         // Unfilter scanlines in place into a contiguous pixel buffer.
         var pixels = new byte[h * stride];

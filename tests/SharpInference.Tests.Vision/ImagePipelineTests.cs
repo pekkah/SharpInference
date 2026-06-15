@@ -142,4 +142,65 @@ public class ImagePipelineTests
             s.WriteByte((byte)(v >> 8)); s.WriteByte((byte)v);
         }
     }
+
+    [Fact]
+    public void LoadRgb_HugeInflatingIdat_DecodesToDeclaredSizeOnly()
+    {
+        // Decompression-bomb guard (#259 review): a 1x1 PNG whose IDAT inflates to ~64 MB of
+        // zeros must decode to exactly the declared 1x1 pixel, reading only the `expected` bytes
+        // (4 = one filter byte + one RGB triple). Without the bound the decoder would materialize
+        // the full 64 MB. The decode must succeed (not throw) and return the declared size.
+        byte[] idat = ZlibCompress(new byte[64 * 1024 * 1024]); // 64 MB of zeros -> tiny compressed
+        Assert.True(idat.Length < 100_000, "zlib bomb payload should be small");
+        using var ms = new MemoryStream(BuildPng(1, 1, colorType: 2, idat));
+
+        byte[] rgb = ImageIO.LoadRgb(ms, out int w, out int h);
+
+        Assert.Equal(1, w);
+        Assert.Equal(1, h);
+        Assert.Equal(3, rgb.Length);            // 1x1 RGB
+        Assert.Equal(new byte[] { 0, 0, 0 }, rgb);
+    }
+
+    [Fact]
+    public void LoadRgb_IdatShorterThanDeclared_Throws()
+    {
+        // IHDR declares 4x4 RGB (expected raw = 4*(1+4*3) = 52 bytes) but the IDAT only inflates
+        // to 10 bytes — the bounded read returns fewer than `expected`, which must surface as the
+        // "too short" InvalidDataException rather than reading past the buffer.
+        byte[] idat = ZlibCompress(new byte[10]);
+        using var ms = new MemoryStream(BuildPng(4, 4, colorType: 2, idat));
+
+        Assert.Throws<InvalidDataException>(() => ImageIO.LoadRgb(ms, out _, out _));
+    }
+
+    private static byte[] ZlibCompress(byte[] data)
+    {
+        using var outMs = new MemoryStream();
+        using (var z = new System.IO.Compression.ZLibStream(outMs, System.IO.Compression.CompressionLevel.SmallestSize, leaveOpen: true))
+            z.Write(data, 0, data.Length);
+        return outMs.ToArray();
+    }
+
+    // Builds a minimal PNG (signature + IHDR + IDAT + IEND); CRCs are zero since the decoder
+    // does not verify them. `idat` is the already-zlib-compressed image data.
+    private static byte[] BuildPng(int w, int h, int colorType, byte[] idat)
+    {
+        using var ms = new MemoryStream();
+        ms.Write([137, 80, 78, 71, 13, 10, 26, 10]);
+        WriteBE(ms, 13); ms.Write("IHDR"u8.ToArray());
+        WriteBE(ms, w); WriteBE(ms, h);
+        ms.WriteByte(8); ms.WriteByte((byte)colorType);
+        ms.WriteByte(0); ms.WriteByte(0); ms.WriteByte(0);
+        WriteBE(ms, 0); // IHDR CRC (unchecked)
+        WriteBE(ms, idat.Length); ms.Write("IDAT"u8.ToArray()); ms.Write(idat); WriteBE(ms, 0);
+        WriteBE(ms, 0); ms.Write("IEND"u8.ToArray()); WriteBE(ms, 0);
+        return ms.ToArray();
+
+        static void WriteBE(Stream s, int v)
+        {
+            s.WriteByte((byte)(v >> 24)); s.WriteByte((byte)(v >> 16));
+            s.WriteByte((byte)(v >> 8)); s.WriteByte((byte)v);
+        }
+    }
 }

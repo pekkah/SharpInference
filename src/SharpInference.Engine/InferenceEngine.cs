@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using SharpInference.Core;
+using SharpInference.Vision;
 
 namespace SharpInference.Engine;
 
@@ -36,6 +37,13 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
 
     // Prefix caching state (guarded by _gate — only accessed during generation).
     private int[]? _prevTokens;
+
+    // Image input (issue #253). Set once at load via EnableImageInput; the VisionModel is
+    // owned/disposed elsewhere (in _owned). Image requests splice projected soft tokens at
+    // each placeholder during a fresh (no-prefix-reuse) prefill.
+    private GemmaUvVisionEmbedder? _visionEmbedder;
+    private VisionModel? _visionModel;
+    private int _imgOpenId, _imgCloseId, _imgPlaceholderId;
 
     // Observability counters (updated via Interlocked).
     private int _pendingCount;
@@ -149,6 +157,85 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
     }
 
     /// <summary>
+    /// Enable image (vision) input (issue #253). Call once at load time, before any request.
+    /// The <paramref name="model"/> must already be in this engine's <c>owned</c> disposables
+    /// (the loader adds it) — this method only borrows references. <paramref name="openId"/>,
+    /// <paramref name="closeId"/>, <paramref name="placeholderId"/> are the Gemma 4
+    /// <c>&lt;|image&gt;</c> / <c>&lt;image|&gt;</c> / <c>&lt;|image|&gt;</c> token ids.
+    /// </summary>
+    public void EnableImageInput(GemmaUvVisionEmbedder embedder, VisionModel model,
+        int openId, int closeId, int placeholderId)
+    {
+        _visionEmbedder = embedder;
+        _visionModel = model;
+        _imgOpenId = openId;
+        _imgCloseId = closeId;
+        _imgPlaceholderId = placeholderId;
+    }
+
+    /// <inheritdoc/>
+    public bool SupportsImageInput => _visionEmbedder is not null && _fwd.SupportsEmbeddingInput;
+
+    /// <summary>
+    /// Issue #253 image prefill: project each image to its soft-token block, then walk the
+    /// prompt tokens — emitting ordinary tokens via <see cref="IForwardPass.Forward"/> and
+    /// expanding each <c>&lt;|image|&gt;</c> placeholder to open-marker + per-soft-token
+    /// <see cref="IForwardPass.ForwardEmbedding"/> + close-marker (mirrors the CLI's
+    /// <c>RunImagePrompt</c>). Returns the final prefill logits; <paramref name="endPos"/>
+    /// receives the post-prefill sequence length. Runs on the generation worker thread.
+    /// </summary>
+    private ReadOnlySpan<float> SplicePrefillImages(int[] tokens, IReadOnlyList<byte[]> imageBytes,
+        CancellationToken ct, out int endPos)
+    {
+        var vision = _visionModel!;
+        var embedder = _visionEmbedder!;
+        int embDim = vision.EmbeddingLength;
+
+        // Project every image up front (decode → preprocess → embed), in request order.
+        var blocks = new (float[] Soft, int NTok)[imageBytes.Count];
+        for (int i = 0; i < imageBytes.Count; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            byte[] rgb;
+            int w, h;
+            using (var ms = new MemoryStream(imageBytes[i], writable: false))
+                rgb = ImageIO.LoadRgb(ms, out w, out h);
+            var pre = ImagePreprocessor.Preprocess(rgb, w, h, vision);
+            var soft = embedder.Forward(pre.Chw, pre.Height, pre.Width, out int nTok);
+            blocks[i] = (soft, nTok);
+        }
+
+        int placeholders = 0;
+        foreach (int id in tokens) if (id == _imgPlaceholderId) placeholders++;
+        if (placeholders != imageBytes.Count)
+            throw new InvalidOperationException(
+                $"Image count mismatch: the rendered prompt has {placeholders} <|image|> placeholder(s) " +
+                $"but {imageBytes.Count} image(s) were supplied.");
+
+        int pos = 0;
+        int imgIdx = 0;
+        ReadOnlySpan<float> logits = default;
+        foreach (int id in tokens)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (id == _imgPlaceholderId)
+            {
+                var (soft, nTok) = blocks[imgIdx++];
+                logits = _fwd.Forward(_imgOpenId, pos++);
+                for (int t = 0; t < nTok; t++)
+                    logits = _fwd.ForwardEmbedding(soft.AsSpan(t * embDim, embDim), pos++);
+                logits = _fwd.Forward(_imgCloseId, pos++);
+            }
+            else
+            {
+                logits = _fwd.Forward(id, pos++);
+            }
+        }
+        endPos = pos;
+        return logits;
+    }
+
+    /// <summary>
     /// Prompt-prefill batch size, in tokens. A single <see cref="IForwardPass.Prefill"/> call is
     /// opaque to the request's <see cref="CancellationToken"/> — the engine only checks <c>ct</c>
     /// between decode tokens — so a large-prompt prefill would otherwise run to completion even
@@ -241,11 +328,34 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
     }
 
     /// <inheritdoc/>
-    public async IAsyncEnumerable<GenerateChunk> GenerateChunksAsync(
+    public IAsyncEnumerable<GenerateChunk> GenerateChunksAsync(
         string prompt,
         SamplingParams sp,
-        [EnumeratorCancellation] CancellationToken ct = default,
+        CancellationToken ct = default,
         string? canonicalHistoryPrefix = null)
+        => GenerateCore(prompt, sp, ct, canonicalHistoryPrefix, imageBytes: null);
+
+    /// <inheritdoc/>
+    public IAsyncEnumerable<GenerateChunk> GenerateImageChunksAsync(
+        string prompt,
+        IReadOnlyList<byte[]> imageBytes,
+        SamplingParams sp,
+        CancellationToken ct = default)
+    {
+        if (!SupportsImageInput)
+            throw new NotSupportedException(
+                "This engine is not configured for image input. Load an mmproj (SHARPI_MMPROJ / " +
+                "SharpInferenceServerOptions.MmprojPath) for a Gemma 4 model on a CPU or full-CUDA backend.");
+        ArgumentNullException.ThrowIfNull(imageBytes);
+        return GenerateCore(prompt, sp, ct, canonicalHistoryPrefix: null, imageBytes);
+    }
+
+    private async IAsyncEnumerable<GenerateChunk> GenerateCore(
+        string prompt,
+        SamplingParams sp,
+        [EnumeratorCancellation] CancellationToken ct,
+        string? canonicalHistoryPrefix,
+        IReadOnlyList<byte[]>? imageBytes)
     {
         // Link the caller's token with the engine-shutdown token so Dispose can stop this
         // generation's background worker (issue #132). Everything below uses `ct` — the
@@ -392,6 +502,9 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                                 && !thinkingEnabled;
                             break;
                     }
+                    // Image input (#253) splices precomputed embeddings during prefill; MTP's
+                    // PrefillMtp / batched verify don't model that, so never engage MTP here.
+                    if (imageBytes is { Count: > 0 }) useMtp = false;
 
                     // --spec-draft-n-max parity with llama.cpp (issue #30): the MTP
                     // draft-chain length per step. Unset (0) resolves via
@@ -409,86 +522,112 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                     //       runs too (issue #106) — PrefillMtp accepts startPos > 0 and
                     //       TruncateTo soft-truncates the MTP KV alongside the trunk.
                     // If neither branch hits, fall back to a full ResetCache + Prefill.
-                    int prefixLen = 0;
-                    if (_fwd.SupportsPartialRewind)
-                    {
-                        int candidate = FindCacheablePrefix(tokens);
-                        if (candidate > 0)
-                        {
-                            _fwd.TruncateTo(candidate);
-                            prefixLen = candidate;
-                        }
-                    }
-                    else if (_fwd.SupportsSnapshot && _fwd.SnapshotLength > 0 && _prevTokens != null)
-                    {
-                        int snapLen = _fwd.SnapshotLength;
-                        // The pair (snapshot @ snapLen, _prevTokens) is maintained as an
-                        // invariant: on the canonical path both are written together immediately
-                        // after CaptureSnapshot, on the legacy path both are written together at
-                        // end-of-decode. snapLen must be a strict prefix of the new prompt (need
-                        // at least one suffix token to drive the decoder) AND a token-level
-                        // prefix of _prevTokens — the latter is the actual reuse precondition.
-                        if (snapLen <= tokens.Length - 1 && snapLen <= _prevTokens.Length
-                            && tokens.AsSpan(0, snapLen).SequenceEqual(_prevTokens.AsSpan(0, snapLen)))
-                        {
-                            _fwd.TruncateTo(snapLen);
-                            prefixLen = snapLen;
-                        }
-                    }
-                    if (prefixLen == 0)
-                    {
-                        _fwd.ResetCache();
-                    }
-                    else
-                    {
-                        // Issue #22 observability: account reused tokens regardless of
-                        // mechanism (attention partial-rewind or GDN snapshot).
-                        reusedTokens = prefixLen;
-                        Interlocked.Add(ref _prefillTokensReused, prefixLen);
-                    }
-
-                    // Prefill: process all prompt tokens (or just the suffix after the cached prefix).
-                    //
-                    // Issue #102 split: when a canonical-history boundary lies strictly between
-                    // prefixLen and the end of the prompt, run the prefill in two stages with a
-                    // CaptureSnapshot in between. That snapshot sits at the canonical boundary so
-                    // the next turn — whose generating prompt starts with the same canonical
-                    // history plus a scrubbed assistant response and a fresh user turn — can
-                    // restore it. Issue #106: also applies on MTP runs; the sticky hidden
-                    // history buffer + MTP KV soft-truncate make PrefillMtp(startPos=snapLen)
-                    // viable. Skipped for backends that don't expose a snapshot (the snapshot
-                    // call is a no-op, but skipping the split keeps the prefill in one shot
-                    // for cache efficiency).
-                    bool useCanonicalSnapshot =
-                        canonicalLen > prefixLen
-                        && canonicalLen < tokens.Length
-                        && _fwd.SupportsSnapshot;
-
-                    // Reused by the MTP path below for PrefillMtp(suffixTokens, prefixLen).
-                    int[] suffixTokens = prefixLen > 0 ? tokens[prefixLen..] : tokens;
-
+                    // startPos = the sequence length after prefill. For text it equals
+                    // tokens.Length; for an image request each <|image|> placeholder expands to
+                    // open + soft tokens + close, so startPos > tokens.Length and the decode
+                    // below must advance positions from there.
+                    int startPos;
+                    int prefixLen = 0;      // cached-prefix length; 0 for the image path (no reuse)
+                    int[] suffixTokens;     // suffix after any cached prefix; reused by the MTP path
+                    bool useCanonicalSnapshot = false;
                     long prefillStartMs = swReq.ElapsedMilliseconds;
                     ReadOnlySpan<float> logits;
-                    if (useCanonicalSnapshot)
+
+                    if (imageBytes is { Count: > 0 })
                     {
-                        PrefillChunked(tokens, prefixLen, canonicalLen, ct);
-                        _fwd.CaptureSnapshot();
-                        // Pair _prevTokens with the snapshot atomically: stage-2 failure or
-                        // mid-decode cancellation now leaves snapshot + _prevTokens consistent
-                        // with each other (both describe this turn's canonical state). Without
-                        // the immediate write, a stage-2 throw would leave the snapshot pointing
-                        // at this turn's canonical while _prevTokens still described the prior
-                        // turn — the next request could pass the snapshot-match check and
-                        // TruncateTo to state that doesn't correspond to its prefix.
-                        _prevTokens = tokens[..canonicalLen];
-                        logits = PrefillChunked(tokens, canonicalLen, tokens.Length, ct);
+                        // Image input (#253): no prefix reuse — project each image and splice its
+                        // soft tokens in place of its placeholder during a fresh prefill.
+                        // Invalidate _prevTokens BEFORE prefilling: the image cache holds soft-token
+                        // KV at expanded positions that don't correspond to plain token positions, so
+                        // a later text request must NOT match this sequence in FindCacheablePrefix and
+                        // TruncateTo into it. Nulling it up front also covers a mid-prefill throw,
+                        // which leaves the cache partially written (the end-of-decode snapshot below
+                        // is already skipped for image requests).
+                        _prevTokens = null;
+                        _fwd.ResetCache();
+                        suffixTokens = tokens;
+                        logits = SplicePrefillImages(tokens, imageBytes, ct, out startPos);
                     }
                     else
                     {
-                        if (suffixTokens.Length > 0)
-                            logits = PrefillChunked(tokens, prefixLen, tokens.Length, ct);
+                        if (_fwd.SupportsPartialRewind)
+                        {
+                            int candidate = FindCacheablePrefix(tokens);
+                            if (candidate > 0)
+                            {
+                                _fwd.TruncateTo(candidate);
+                                prefixLen = candidate;
+                            }
+                        }
+                        else if (_fwd.SupportsSnapshot && _fwd.SnapshotLength > 0 && _prevTokens != null)
+                        {
+                            int snapLen = _fwd.SnapshotLength;
+                            // The pair (snapshot @ snapLen, _prevTokens) is maintained as an
+                            // invariant: on the canonical path both are written together immediately
+                            // after CaptureSnapshot, on the legacy path both are written together at
+                            // end-of-decode. snapLen must be a strict prefix of the new prompt (need
+                            // at least one suffix token to drive the decoder) AND a token-level
+                            // prefix of _prevTokens — the latter is the actual reuse precondition.
+                            if (snapLen <= tokens.Length - 1 && snapLen <= _prevTokens.Length
+                                && tokens.AsSpan(0, snapLen).SequenceEqual(_prevTokens.AsSpan(0, snapLen)))
+                            {
+                                _fwd.TruncateTo(snapLen);
+                                prefixLen = snapLen;
+                            }
+                        }
+                        if (prefixLen == 0)
+                        {
+                            _fwd.ResetCache();
+                        }
                         else
-                            logits = _fwd.Forward(tokens[^1], tokens.Length - 1);
+                        {
+                            // Issue #22 observability: account reused tokens regardless of
+                            // mechanism (attention partial-rewind or GDN snapshot).
+                            reusedTokens = prefixLen;
+                            Interlocked.Add(ref _prefillTokensReused, prefixLen);
+                        }
+
+                        // Prefill: process all prompt tokens (or just the suffix after the cached prefix).
+                        //
+                        // Issue #102 split: when a canonical-history boundary lies strictly between
+                        // prefixLen and the end of the prompt, run the prefill in two stages with a
+                        // CaptureSnapshot in between. That snapshot sits at the canonical boundary so
+                        // the next turn — whose generating prompt starts with the same canonical
+                        // history plus a scrubbed assistant response and a fresh user turn — can
+                        // restore it. Issue #106: also applies on MTP runs; the sticky hidden
+                        // history buffer + MTP KV soft-truncate make PrefillMtp(startPos=snapLen)
+                        // viable. Skipped for backends that don't expose a snapshot (the snapshot
+                        // call is a no-op, but skipping the split keeps the prefill in one shot
+                        // for cache efficiency).
+                        useCanonicalSnapshot =
+                            canonicalLen > prefixLen
+                            && canonicalLen < tokens.Length
+                            && _fwd.SupportsSnapshot;
+
+                        suffixTokens = prefixLen > 0 ? tokens[prefixLen..] : tokens;
+
+                        if (useCanonicalSnapshot)
+                        {
+                            PrefillChunked(tokens, prefixLen, canonicalLen, ct);
+                            _fwd.CaptureSnapshot();
+                            // Pair _prevTokens with the snapshot atomically: stage-2 failure or
+                            // mid-decode cancellation now leaves snapshot + _prevTokens consistent
+                            // with each other (both describe this turn's canonical state). Without
+                            // the immediate write, a stage-2 throw would leave the snapshot pointing
+                            // at this turn's canonical while _prevTokens still described the prior
+                            // turn — the next request could pass the snapshot-match check and
+                            // TruncateTo to state that doesn't correspond to its prefix.
+                            _prevTokens = tokens[..canonicalLen];
+                            logits = PrefillChunked(tokens, canonicalLen, tokens.Length, ct);
+                        }
+                        else
+                        {
+                            if (suffixTokens.Length > 0)
+                                logits = PrefillChunked(tokens, prefixLen, tokens.Length, ct);
+                            else
+                                logits = _fwd.Forward(tokens[^1], tokens.Length - 1);
+                        }
+                        startPos = tokens.Length;
                     }
                     prefillMs = swReq.ElapsedMilliseconds - prefillStartMs;
 
@@ -618,7 +757,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                             if (textTail.Length > 0)
                                 channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, textTail));
                             inThinking = true;
-                            logits = _fwd.Forward(next, tokens.Length + i);
+                            logits = _fwd.Forward(next, startPos + i);
                             continue;
                         }
                         if (thinkingEnabled && next == endThinkId && inThinking)
@@ -628,7 +767,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                             if (thinkTail.Length > 0)
                                 channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Thinking, thinkTail));
                             inThinking = false;
-                            logits = _fwd.Forward(next, tokens.Length + i);
+                            logits = _fwd.Forward(next, startPos + i);
                             continue;
                         }
 
@@ -646,7 +785,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                                 channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, chunk));
                         }
 
-                        logits = _fwd.Forward(next, tokens.Length + i);
+                        logits = _fwd.Forward(next, startPos + i);
                     }
 
                     // End-of-loop: flush both decoders defensively (whichever was active).
@@ -661,7 +800,9 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                     // already captured + paired _prevTokens during the split prefill above.
                     // ct.ThrowIfCancellationRequested earlier ensures we don't reach here on a
                     // cancelled token; skip capture in that case to avoid stale state.
-                    if (!useCanonicalSnapshot && !ct.IsCancellationRequested)
+                    // Image requests run fresh each time (no prefix reuse) and their positions
+                    // don't correspond to plain token positions, so don't snapshot them.
+                    if (!useCanonicalSnapshot && !ct.IsCancellationRequested && imageBytes is null)
                     {
                         _fwd.CaptureSnapshot();
                         _prevTokens = fullSeq.ToArray();

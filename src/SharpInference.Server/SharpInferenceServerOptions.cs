@@ -36,6 +36,17 @@ public sealed class SharpInferenceServerOptions
     public string? ModelPath { get; set; }
 
     /// <summary>
+    /// Optional path to a multimodal projector GGUF (mmproj-*.gguf) enabling image input
+    /// (issue #253). Only Gemma 4 <c>gemma4uv</c> projectors are supported today, and only on a
+    /// backend whose forward pass accepts precomputed-embedding input (CPU, i.e.
+    /// <see cref="NGpuLayers"/>=0, or full CUDA offload, <see cref="NGpuLayers"/>=-1, of a model
+    /// that fits VRAM). Set via this property, the <c>SHARPI_MMPROJ</c> environment variable, or
+    /// the <c>SharpInference:MmprojPath</c> configuration key. When unset, image content blocks
+    /// are rejected with a clear error.
+    /// </summary>
+    public string? MmprojPath { get; set; }
+
+    /// <summary>
     /// Architecture hint used by <see cref="ChatTemplateRenderer"/> as a fallback when the
     /// model's GGUF metadata is missing <c>general.architecture</c> and no Jinja template
     /// is bundled. Defaults to <c>"qwen2"</c> (ChatML).

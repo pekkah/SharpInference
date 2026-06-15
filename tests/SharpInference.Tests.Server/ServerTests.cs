@@ -842,19 +842,31 @@ public sealed class ServerTests : IClassFixture<WebApplicationFactory<Program>>
 
     // ── Tool calling ─────────────────────────────────────────────────────────
 
+    // Builds a test host with the qwen <tool_call> tool-call adapter pinned. Without this the
+    // default ChatTemplateRenderer is constructed from the bound Architecture option, which a
+    // developer's (gitignored) appsettings.Local.json can set to a non-qwen value — that file is
+    // loaded by WebApplicationFactory<Program>, so the tool-call tests would otherwise pass in CI
+    // but fail locally with whatever adapter the local config selects.
+    private static WebApplicationFactory<Program> ToolHostFactory(FakeInferenceEngine engine) =>
+        new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s =>
+            {
+                s.AddSingleton(new ChatTemplateRenderer("qwen2"));
+                s.AddSingleton<IInferenceEngine>(engine);
+            }));
+
     [Fact]
     public async Task AnthropicMessages_WithTools_NonStreaming_ReturnsToolUseBlock()
     {
         // Model output contains a <tool_call> block — endpoint must parse it and return
         // a tool_use content block with stop_reason = "tool_use".
-        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
-            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(new FakeInferenceEngine(
-                "test-model",
-                [
-                    (GenerateChunkKind.Text, "<tool_call>\n"),
-                    (GenerateChunkKind.Text, "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}"),
-                    (GenerateChunkKind.Text, "\n</tool_call>"),
-                ]))));
+        var factory = ToolHostFactory(new FakeInferenceEngine(
+            "test-model",
+            [
+                (GenerateChunkKind.Text, "<tool_call>\n"),
+                (GenerateChunkKind.Text, "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}"),
+                (GenerateChunkKind.Text, "\n</tool_call>"),
+            ]));
         var client = factory.CreateClient();
 
         var req = new
@@ -893,13 +905,12 @@ public sealed class ServerTests : IClassFixture<WebApplicationFactory<Program>>
     [Fact]
     public async Task AnthropicMessages_WithTools_NonStreaming_TextBeforeToolCall_ReturnsBothBlocks()
     {
-        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
-            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(new FakeInferenceEngine(
-                "test-model",
-                [
-                    (GenerateChunkKind.Text, "Let me check that for you."),
-                    (GenerateChunkKind.Text, "<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"/foo\"}}\n</tool_call>"),
-                ]))));
+        var factory = ToolHostFactory(new FakeInferenceEngine(
+            "test-model",
+            [
+                (GenerateChunkKind.Text, "Let me check that for you."),
+                (GenerateChunkKind.Text, "<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"/foo\"}}\n</tool_call>"),
+            ]));
         var client = factory.CreateClient();
 
         var req = new
@@ -926,14 +937,13 @@ public sealed class ServerTests : IClassFixture<WebApplicationFactory<Program>>
     [Fact]
     public async Task AnthropicMessages_WithTools_Streaming_EmitsToolUseEvents()
     {
-        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
-            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(new FakeInferenceEngine(
-                "test-model",
-                [
-                    (GenerateChunkKind.Text, "<tool_call>\n"),
-                    (GenerateChunkKind.Text, "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}"),
-                    (GenerateChunkKind.Text, "\n</tool_call>"),
-                ]))));
+        var factory = ToolHostFactory(new FakeInferenceEngine(
+            "test-model",
+            [
+                (GenerateChunkKind.Text, "<tool_call>\n"),
+                (GenerateChunkKind.Text, "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}"),
+                (GenerateChunkKind.Text, "\n</tool_call>"),
+            ]));
         var client = factory.CreateClient();
 
         var req = new
@@ -1160,6 +1170,12 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
     /// <summary>The rendered prompt handed to the most recent generation call.</summary>
     public string? LastPrompt { get; private set; }
 
+    /// <summary>Image-input support flag (issue #253) and capture of the most recent image
+    /// dispatch, so wire-level tests can confirm image content reached the engine.</summary>
+    public bool SupportsImages { get; init; }
+    public bool SupportsImageInput => SupportsImages;
+    public int LastImageCount { get; private set; }
+
     public async IAsyncEnumerable<GenerateChunk> GenerateChunksAsync(
         string prompt,
         SamplingParams sp,
@@ -1169,6 +1185,24 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
         LastSamplingParams = sp;
         LastCanonicalHistoryPrefix = canonicalHistoryPrefix;
         LastPrompt = prompt;
+        foreach (var (kind, text) in _script)
+        {
+            ct.ThrowIfCancellationRequested();
+            await Task.Yield();
+            yield return new GenerateChunk(kind, text);
+        }
+    }
+
+    public async IAsyncEnumerable<GenerateChunk> GenerateImageChunksAsync(
+        string prompt,
+        IReadOnlyList<byte[]> imageBytes,
+        SamplingParams sp,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        LastSamplingParams = sp;
+        LastCanonicalHistoryPrefix = null;
+        LastPrompt = prompt;
+        LastImageCount = imageBytes.Count;
         foreach (var (kind, text) in _script)
         {
             ct.ThrowIfCancellationRequested();
