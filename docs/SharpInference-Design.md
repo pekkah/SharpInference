@@ -935,6 +935,56 @@ public void MoeForward(/* ... */)
 }
 ```
 
+### 8.3 Multimodal Image Input — Gemma 4 encoder-free vision (`gemma4uv`)
+
+The Gemma 4 **12B** is an encoder-free *unified* multimodal model: it has **no vision
+transformer**. Instead a tiny projector (~52M params, shipped as a companion `mmproj` GGUF,
+`general.architecture=clip`, `clip.vision.projector_type=gemma4uv`) maps raw image patches
+straight into the LLM embedding space. SharpInference implements **image → text** for this model
+on CPU and CUDA (issue #250); `SharpInference.Vision` holds the vision-side code.
+
+> **Scope:** this section is the **12B `gemma4uv`** path only. The Gemma 4 **E4B** model uses a
+> *different*, encoder-**full** architecture — a `gemma4v` transformer ViT vision encoder plus a
+> `gemma4a` audio encoder (confirmed from the mmproj header; ~992 MB vs the 12B's ~175 MB). E4B is
+> **not** supported yet; see `docs/gemma4-e4b-vision-plan.md` (issue #126).
+
+**Projector forward (`GemmaUvVisionEmbedder`)** — mirrors llama.cpp `tools/mtmd/models/gemma4uv.cpp`:
+
+1. **Preprocess** (`ImagePreprocessor`, mirroring `mtmd-image.cpp`): `calc_size_preserved_ratio`
+   rounds each side to a multiple of the effective patch (48 = `patch_size` 16 × `n_merge` 3) so the
+   soft-token count lands in **[40, 280]**, then an align-corners bilinear resize and `x/255`
+   normalization to planar CHW.
+2. **im2col** to 6912-vectors (`[c·48·48 + ky·48 + kx]`), one per 48×48 patch.
+3. **LayerNorm ×3** (eps **1e-5**), a linear `6912→3840` patch-embed (+bias), learned 2D position
+   add (`pos_x[col] + pos_y[row]`), then a **weightless RMSNorm** (eps 1e-6).
+4. **`mm.input_projection`** (`3840→3840`, **BF16**) → one soft token per patch
+   (`tokens = (W/48)·(H/48)`).
+
+Parity is gated by a numpy oracle (`scripts/gemma4uv_ref.py`) at cosine > 0.9995.
+
+**Decoder splice (`IForwardPass.ForwardEmbedding`)** — implemented on `ForwardPass` (CPU) and
+`CudaForwardPass` (CUDA full offload), gated by `SupportsEmbeddingInput`. It injects a precomputed
+embedding at a position instead of a token-table lookup, and per `gemma4.cpp` it (a) **skips the
+sqrt(EmbeddingDim) embedding scale** (raw embeddings arrive final), and (b) builds the per-layer
+(PLE) projections from the **padding token (id 0)**, not a real token. Attention is **causal** —
+Gemma's reference toggles bidirectional attention within an image span, but in practice the causal
+path answers correctly, so it is the implemented behavior.
+
+**Prompt wiring (CLI):** Gemma 4's turn format is `<|turn>role\n…<turn|>` (NOT Gemma 3's
+`<start_of_turn>`). The image is referenced by an `<image>` marker in the prompt (repeatable; one
+per `--image`), rendered through the model's own chat template into the `<|image|>` placeholder
+(id 258880), which is then expanded at decode time to `<|image>`(255999) + soft tokens +
+`<image|>`(258882). Each soft token occupies one real position in the KV cache.
+
+```
+sharpi-cli -m gemma-4-12b-it-qat-q4_0.gguf \
+  --mmproj mmproj-gemma-4-12b-it-qat-q4_0.gguf \
+  --image cat.png -p "What is in this image?" -g 0   # or -g -1 for CUDA
+```
+
+Follow-ups: `ForwardEmbedding` on partial-offload hybrids and Vulkan, the E4B `gemma4v`/`gemma4a`
+encoders, audio, and a server image-content-block endpoint.
+
 ---
 
 ## 9. API Server Layer

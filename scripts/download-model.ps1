@@ -159,13 +159,25 @@ $Models = @{
     # Gemma 4. ~5.15 GB vs the 8.19 GB Q8_0: ~1.6× fewer bytes/token → ~1.6× faster
     # decode at near-identical quality (QAT). Same dense gemma4 arch (PLE + 5:1 SWA).
     # Filename is upstream's `gemma-4-E4B_q4_0-it.gguf` (note the underscore — not the
-    # `-it-qat-q4_0` pattern of the 12B). The repo also ships an mmproj (vision) we skip.
+    # `-it-qat-q4_0` pattern of the 12B).
+    #
+    # The companion mmproj is pulled alongside, but NOTE the E4B vision path is NOT the
+    # 12B's. The E4B mmproj is ~992 MB (vs the 12B's tiny ~175 MB linear projector) —
+    # it carries a full ENCODER. Confirmed from the header: vision projector_type=`gemma4v`
+    # (a 16-block transformer ViT: 768-dim, 12 heads, QK-norm, GeGLU, conv patch-embed) plus
+    # an audio encoder projector_type=`gemma4a`. The 12B is encoder-free `gemma4uv` instead.
+    # So #250's image path does NOT cover E4B; supporting it needs the ViT (and audio)
+    # encoder forward pass (tracked by the E4B vision plan, issue #126). The text GGUF runs
+    # fine on its own without the mmproj.
     "gemma4-e4b-qat" = @{
-        Files = @("gemma-4-E4B_q4_0-it.gguf")
-        Urls  = @("https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/resolve/main/gemma-4-E4B_q4_0-it.gguf")
-        Size  = "~5.15 GB"
-        SizeGB = 5.15
-        Phase = "Gemma 4 E4B QAT q4_0 (fast small Gemma — ~1.6× decode vs Q8_0)"
+        Files = @("gemma-4-E4B_q4_0-it.gguf", "gemma-4-E4B-it-mmproj.gguf")
+        Urls  = @(
+            "https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/resolve/main/gemma-4-E4B_q4_0-it.gguf",
+            "https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/resolve/main/gemma-4-E4B-it-mmproj.gguf"
+        )
+        Size  = "~6.15 GB (text 5.15 GB + vision mmproj 0.99 GB)"
+        SizeGB = 6.15
+        Phase = "Gemma 4 E4B QAT q4_0 (fast small Gemma — ~1.6× decode vs Q8_0) + mmproj (conv vision encoder; NOT the 12B gemma4uv path — issue #126)"
     }
     # Community K-quant of the (non-QAT) instruct weights — the Q4_K_M fallback /
     # cross-check next to the QAT q4_0 primary. Exercises the K-quant path so both
@@ -320,7 +332,8 @@ function Download-Model {
 
     # Component labels for multi-file bundles
     $labels = @{
-        "mmproj-gemma-4-12b-it-qat-q4_0.gguf"               = "Multimodal projector (vision/audio)"
+        "mmproj-gemma-4-12b-it-qat-q4_0.gguf"               = "Multimodal projector (encoder-free vision/audio)"
+        "gemma-4-E4B-it-mmproj.gguf"                         = "Vision (gemma4v ViT) + audio (gemma4a) encoders; NOT the 12B gemma4uv"
         "z_image_turbo-Q5_K_M.gguf"                         = "DiT (image model)"
         "z_image_turbo-Q8_0.gguf"                           = "DiT (image model)"
         "Z-Image-AbliteratedV1.Q5_K_M.gguf"                 = "Text encoder (abliterated Qwen3-4B)"
