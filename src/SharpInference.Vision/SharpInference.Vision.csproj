@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Multimodal vision input for SharpInference: Gemma 4 "unified" encoder-free image projector (gemma4uv mmproj) and image preprocessing (issue #250).</Description>
+    <!-- NativeAOT-compatible; AOT/trim analyzers inherited from Directory.Build.props -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Core: GGUF parsing. Cpu: SimdKernels (matmul) + TensorPrimitives helpers. -->
+    <ProjectReference Include="..\SharpInference.Core\SharpInference.Core.csproj" />
+    <ProjectReference Include="..\SharpInference.Cpu\SharpInference.Cpu.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Numerics.Tensors" Version="10.0.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="SharpInference.Tests.Vision" />
+  </ItemGroup>
+
+</Project>

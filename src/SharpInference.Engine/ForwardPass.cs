@@ -1409,6 +1409,54 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
         if (_hp.HasPerLayerTokenEmbd)
             BuildPerLayerProjections(token);
 
+        return RunTrunk(position, token);
+    }
+
+    /// <summary>
+    /// Forward a single position from a PRECOMPUTED embedding (e.g. a vision soft token)
+    /// instead of a token-table lookup, returning the next-token logits.
+    ///
+    /// Differs from <see cref="Forward"/> in two model-faithful ways for multimodal input
+    /// (llama.cpp src/models/gemma4.cpp):
+    ///   • does NOT apply the Gemma sqrt(EmbeddingDim) embedding scale — raw image/audio
+    ///     embeddings arrive already final (gemma4.cpp:182, "do not normalize weights for
+    ///     raw embeddings input"); and
+    ///   • uses the padding token (id 0) for the per-layer-embedding (PLE) table lookup,
+    ///     while still projecting the supplied embedding (gemma4.cpp build_inp_per_layer
+    ///     multimodal branch).
+    ///
+    /// Attention is causal, consistent with the existing sequential Gemma path. (Gemma's
+    /// reference toggles bidirectional attention within an image span; replicating that
+    /// needs the batched layer-by-layer path, which is gated off for per-layer-head-dim
+    /// models — tracked as a follow-up on issue #250.)
+    /// </summary>
+    /// <inheritdoc/>
+    public bool SupportsEmbeddingInput => true;
+
+    public ReadOnlySpan<float> ForwardEmbedding(ReadOnlySpan<float> embedding, int position)
+    {
+        if (embedding.Length != _embDim)
+            throw new ArgumentException(
+                $"embedding length {embedding.Length} != model embedding dim {_embDim}.");
+
+        _currentPos = position;
+        embedding.CopyTo(new Span<float>(_hidden, _embDim));
+
+        // Note: no EmbeddingScale here (see remarks). PLE uses the padding token row.
+        if (_hp.HasPerLayerTokenEmbd)
+            BuildPerLayerProjections(0);
+
+        return RunTrunk(position, traceToken: -1);
+    }
+
+    /// <summary>
+    /// Shared transformer trunk for <see cref="Forward"/> and <see cref="ForwardEmbedding"/>:
+    /// assumes <c>_hidden</c> (and, for PLE models, the per-layer projections) are already
+    /// populated for <paramref name="position"/>. <paramref name="traceToken"/> is used only
+    /// for the optional norm trace (−1 for embedding input).
+    /// </summary>
+    private ReadOnlySpan<float> RunTrunk(int position, int traceToken)
+    {
         float embNorm = _traceNorms ? L2Norm(_hidden, _embDim) : 0f;
 
         // 2. Transformer layers
@@ -1623,7 +1671,7 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
             SimdKernels.SoftcapInPlace(_logits, _hp.VocabSize, _hp.FinalLogitSoftcap);
 
         if (_traceNorms)
-            EmitNormTrace(token, position, embNorm, preFinalNorm, postFinalNorm);
+            EmitNormTrace(traceToken, position, embNorm, preFinalNorm, postFinalNorm);
 
         return new ReadOnlySpan<float>(_logits, _hp.VocabSize);
     }

@@ -6,6 +6,7 @@ using SharpInference.Core;
 using SharpInference.Cpu;
 using SharpInference.Cuda;
 using SharpInference.Engine;
+using SharpInference.Vision;
 using SharpInference.Vulkan;
 
 namespace SharpInference.Cli;
@@ -29,6 +30,14 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [CommandOption("-f|--file")]
         [Description("Read the prompt from a file (llama.cpp -f/--file). Overrides -p when both are given; useful for prompts longer than the shell's command-line limit.")]
         public string? PromptFile { get; init; }
+
+        [CommandOption("--image <PATH>")]
+        [Description("Path to a PNG image for multimodal input (Gemma 4 encoder-free vision). Repeatable for multiple images; reference each with an <image> marker in -p (left-to-right), or omit markers to prepend them. Requires --mmproj and a text prompt (-p). CPU only for now (-g 0).")]
+        public string[]? ImagePaths { get; init; }
+
+        [CommandOption("--mmproj")]
+        [Description("Path to the multimodal projector GGUF (mmproj-*.gguf). Required with --image. Mirrors llama.cpp's --mmproj.")]
+        public string? MmprojPath { get; init; }
 
         [CommandOption("-n|--n-predict")]
         [Description("Number of tokens to predict (default: 512)")]
@@ -317,6 +326,45 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         {
             AnsiConsole.MarkupLine("[yellow]Warning:[/] Greedy decoding (--temp 0) on a reasoning model often produces");
             AnsiConsole.MarkupLine("infinite \"wait, but actually\" loops. Consider [yellow]--temp 0.6 --top-p 0.95 --top-k 20[/].");
+        }
+
+        // Image input (issue #250): encoder-free Gemma 4 vision. CPU-only single-prompt path.
+        // Validate the preconditions up front so we fail fast before building any forward pass.
+        if (settings.ImagePaths is { Length: > 0 } imagePaths)
+        {
+            if (s_arch != "gemma4")
+            {
+                AnsiConsole.MarkupLine($"[red]Error:[/] --image is only supported for Gemma 4 models (model arch: {s_arch}).");
+                return 1;
+            }
+            if (settings.MmprojPath is not { Length: > 0 })
+            {
+                AnsiConsole.MarkupLine("[red]Error:[/] --image requires --mmproj <mmproj.gguf> (the multimodal projector).");
+                return 1;
+            }
+            if (!File.Exists(settings.MmprojPath))
+            {
+                AnsiConsole.MarkupLine($"[red]Error:[/] mmproj file not found: {Markup.Escape(settings.MmprojPath)}");
+                return 1;
+            }
+            foreach (var imgPath in imagePaths)
+            {
+                if (!File.Exists(imgPath))
+                {
+                    AnsiConsole.MarkupLine($"[red]Error:[/] image file not found: {Markup.Escape(imgPath)}");
+                    return 1;
+                }
+            }
+            if (effNGpuLayers != 0)
+            {
+                AnsiConsole.MarkupLine("[red]Error:[/] --image is CPU-only for now; pass [yellow]-g 0[/] (or --device none).");
+                return 1;
+            }
+            if (settings.Prompt is not { Length: > 0 })
+            {
+                AnsiConsole.MarkupLine("[red]Error:[/] --image requires a text prompt ([yellow]-p \"...\"[/]); interactive image chat is not supported yet.");
+                return 1;
+            }
         }
 
         using var cpuBackend = new CpuBackend();
@@ -817,6 +865,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         try
         {
+            if (settings.ImagePaths is { Length: > 0 })
+                return RunImagePrompt(settings, fwd!, tokenizer, hp, sp, rng);
             if (settings.Prompt is not null)
                 return RunSinglePrompt(settings, forward, prefill, tokenizer, sp, rng, mtpFwd);
             return RunInteractive(settings, forward, prefill, resetCache, tokenizer, sp, rng, mtpFwd);
@@ -1060,6 +1110,148 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             (acceptanceRate is float ar ? $" | MTP accept: {ar:P0} ({mtpAccepted}/{mtpEmitted})" : "") +
             "[/]");
         return 0;
+    }
+
+    /// <summary>User-facing prompt marker for an image position (mapped to the model's
+    /// <c>&lt;|image|&gt;</c> placeholder before templating). One per <c>--image</c>, left-to-right.</summary>
+    private const string ImageMarker = "<image>";
+
+    /// <summary>
+    /// Single-prompt image→text for Gemma 4 (issue #250), one or more images. Each image is
+    /// preprocessed and run through the encoder-free projector to soft tokens, then spliced
+    /// into the decoder via <see cref="ForwardPass.ForwardEmbedding"/>, wrapped in the runtime
+    /// markers (<c>&lt;|image&gt;</c> … soft tokens … <c>&lt;image|&gt;</c>).
+    ///
+    /// Placement: each <c>&lt;image&gt;</c> marker in the prompt is mapped to the model's
+    /// <c>&lt;|image|&gt;</c> placeholder (id 258880), the prompt is rendered through the model's
+    /// own chat template (so BOS / <c>&lt;|turn&gt;</c> / thinking handling matches the text path —
+    /// Gemma 4 uses <c>&lt;|turn&gt;role\n…&lt;turn|&gt;</c>, NOT Gemma 3's <c>&lt;start_of_turn&gt;</c>),
+    /// then each placeholder token in the token stream is expanded with its image's soft tokens
+    /// in order. With no markers, the images are prepended to the user turn. CPU-only: the
+    /// embedding-injection seam lives on <see cref="ForwardPass"/>.
+    /// </summary>
+    private static int RunImagePrompt(Settings s,
+        ForwardPass fwd, GgufTokenizer tok, ModelHyperparams hp,
+        SamplingParams sp, Random rng)
+    {
+        if (!fwd.SupportsEmbeddingInput)
+        {
+            AnsiConsole.MarkupLine("[red]Error:[/] this forward pass does not support image embedding input.");
+            return 1;
+        }
+
+        var imagePaths = s.ImagePaths!;
+        int nImages = imagePaths.Length;
+
+        // Reconcile the number of <image> markers in the prompt with the number of --image
+        // files. No markers → prepend one placeholder per image (in --image order). Otherwise
+        // the counts must match so the i-th marker pairs with the i-th --image.
+        int markerCount = CountOccurrences(s.Prompt!, ImageMarker);
+        string userMsg;
+        if (markerCount == 0)
+        {
+            userMsg = string.Concat(Enumerable.Repeat("<|image|>", nImages)) + s.Prompt;
+        }
+        else if (markerCount == nImages)
+        {
+            userMsg = s.Prompt!.Replace(ImageMarker, "<|image|>");
+        }
+        else
+        {
+            AnsiConsole.MarkupLine($"[red]Error:[/] prompt has {markerCount} '{ImageMarker}' marker(s) but " +
+                $"{nImages} --image file(s) were given; the counts must match (or omit markers to prepend the images).");
+            return 1;
+        }
+
+        using var vision = VisionModel.Open(s.MmprojPath!);
+        var embedder = new GemmaUvVisionEmbedder(vision);
+        int embd = hp.EmbeddingDim;
+
+        // Project every image to its soft-token block up front, in --image order.
+        var blocks = new (float[] Soft, int NTok)[nImages];
+        int totalSoft = 0;
+        for (int i = 0; i < nImages; i++)
+        {
+            byte[] rgb;
+            int srcW, srcH;
+            try
+            {
+                rgb = ImageIO.LoadRgb(imagePaths[i], out srcW, out srcH);
+            }
+            catch (Exception ex) when (ex is IOException or NotSupportedException or InvalidDataException)
+            {
+                AnsiConsole.MarkupLine($"[red]Error reading image[/] {Markup.Escape(imagePaths[i])}: {Markup.Escape(ex.Message)}");
+                return 1;
+            }
+            var img = ImagePreprocessor.Preprocess(rgb, srcW, srcH, vision);
+            var soft = embedder.Forward(img.Chw, img.Height, img.Width, out int nTok);
+            blocks[i] = (soft, nTok);
+            totalSoft += nTok;
+            AnsiConsole.MarkupLine($"[dim]Image {i + 1}/{nImages}: {srcW}x{srcH} -> {img.Width}x{img.Height} -> {nTok} soft tokens[/]");
+        }
+
+        int imgOpen = tok.SpecialTokens.TryGetValue("<|image>", out var o) ? o : 255999;
+        int imgClose = tok.SpecialTokens.TryGetValue("<image|>", out var c) ? c : 258882;
+        int placeholder = tok.SpecialTokens.TryGetValue("<|image|>", out var ph) ? ph : 258880;
+
+        var prompt = FormatPrompt(userMsg, s.SystemPrompt, enableThinking: !s_noThinking);
+        var allTokens = tok.Encode(prompt).ToList();
+        int placeholdersFound = allTokens.Count(t => t == placeholder);
+        if (placeholdersFound != nImages)
+        {
+            AnsiConsole.MarkupLine($"[red]Error:[/] expected {nImages} image placeholder token(s) (<|image|>, {placeholder}) " +
+                $"after templating but found {placeholdersFound}; this model may not support image input.");
+            return 1;
+        }
+
+        var sw = Stopwatch.StartNew();
+        int pos = 0;
+        int imgIdx = 0;
+        ReadOnlySpan<float> logits = default;
+        foreach (int id in allTokens)
+        {
+            if (id == placeholder)
+            {
+                var (soft, nTok) = blocks[imgIdx++];
+                logits = fwd.Forward(imgOpen, pos++);
+                for (int t = 0; t < nTok; t++)
+                    logits = fwd.ForwardEmbedding(soft.AsSpan(t * embd, embd), pos++);
+                logits = fwd.Forward(imgClose, pos++);
+            }
+            else
+            {
+                logits = fwd.Forward(id, pos++);
+            }
+        }
+        var prefillMs = sw.Elapsed.TotalMilliseconds;
+
+        if (!s.NoDisplayPrompt)
+            Console.Write(s.Prompt);
+
+        sw.Restart();
+        var (generated, totalDecoded) =
+            DecodeLoop(fwd.Forward, logits, pos, tok, sp, rng, s.VerbosePrompt, s.HideThinking, s.MaxThinkingTokens);
+        var decodeMs = sw.Elapsed.TotalMilliseconds;
+
+        Console.WriteLine();
+        AnsiConsole.MarkupLine($"\n[dim]Prefill: {pos} tokens ({totalSoft} image + {pos - totalSoft} text), " +
+            $"{pos / (prefillMs / 1000):F1} t/s | " +
+            $"Decode: {totalDecoded} tokens, {totalDecoded / (decodeMs / 1000):F1} t/s" +
+            (totalDecoded > generated ? $" ({generated} visible, {totalDecoded - generated} thinking)" : "") +
+            "[/]");
+        return 0;
+    }
+
+    /// <summary>Count non-overlapping occurrences of <paramref name="needle"/> in <paramref name="haystack"/>.</summary>
+    private static int CountOccurrences(string haystack, string needle)
+    {
+        int count = 0, idx = 0;
+        while ((idx = haystack.IndexOf(needle, idx, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            idx += needle.Length;
+        }
+        return count;
     }
 
     // Decides whether to engage the MTP self-speculative path on the CLI side.

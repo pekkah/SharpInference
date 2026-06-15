@@ -21,6 +21,7 @@
     <Project Path="src/SharpInference.Server.Host/SharpInference.Server.Host.csproj" />
     <Project Path="src/SharpInference.TurboQuant/SharpInference.TurboQuant.csproj" />
     <Project Path="src/SharpInference.Vulkan/SharpInference.Vulkan.csproj" />
+    <Project Path="src/SharpInference.Vision/SharpInference.Vision.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/SharpInference.Tests.Cli/SharpInference.Tests.Cli.csproj" />
@@ -29,5 +30,6 @@
     <Project Path="tests/SharpInference.Tests.Pipeline/SharpInference.Tests.Pipeline.csproj" />
     <Project Path="tests/SharpInference.Tests.Server/SharpInference.Tests.Server.csproj" />
     <Project Path="tests/SharpInference.Tests.TurboQuant/SharpInference.Tests.TurboQuant.csproj" />
+    <Project Path="tests/SharpInference.Tests.Vision/SharpInference.Tests.Vision.csproj" />
   </Folder>
 </Solution>
