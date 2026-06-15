@@ -1147,6 +1147,13 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             if (arr is null) return;
             foreach (var w in arr) Add1(w);
         }
+        // Resolve a tensor by name straight from the mmap, tolerating absence — a
+        // pre-fault must never make an otherwise-loadable model fail to load.
+        void AddByName(string name)
+        {
+            if (_model.FindTensor(name) is { } info)
+                regions.Add(((nint)_model.GetTensorDataPtr(info), info.ByteSize));
+        }
 
         // Embedding/output mmap refs are read at inference only when they're NOT
         // uploaded to VRAM (_gpu* null == cpuEmbeddingOutputOnly). Skipping the
@@ -1171,9 +1178,9 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             // don't stall (mirrors the CUDA class's _cpuMoe* coverage).
             for (int li = 0; li < _nGpuLayers; li++)
             {
-                Add1(ResolveCpuWeight($"blk.{li}.ffn_gate_exps.weight"));
-                Add1(ResolveCpuWeight($"blk.{li}.ffn_up_exps.weight"));
-                Add1(ResolveCpuWeight($"blk.{li}.ffn_down_exps.weight"));
+                AddByName($"blk.{li}.ffn_gate_exps.weight");
+                AddByName($"blk.{li}.ffn_up_exps.weight");
+                AddByName($"blk.{li}.ffn_down_exps.weight");
             }
         }
         else

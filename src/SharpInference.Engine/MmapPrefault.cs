@@ -41,12 +41,6 @@ internal static unsafe partial class MmapPrefault
 
     internal readonly record struct Result(bool Ran, long Bytes, double Seconds, string Reason);
 
-    /// <summary>True when <c>SHARPI_PREFAULT=0</c> disables all prefaulting. Lets the
-    /// fully-CPU-resident passes share the one global kill switch without going through
-    /// <see cref="Run"/>.</summary>
-    internal static bool IsDisabled() =>
-        Environment.GetEnvironmentVariable("SHARPI_PREFAULT") == "0";
-
     /// <summary>
     /// Pure gating decision, factored out so it can be unit-tested without touching
     /// memory or the environment. <paramref name="mode"/> is the raw

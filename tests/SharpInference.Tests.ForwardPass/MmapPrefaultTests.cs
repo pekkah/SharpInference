@@ -74,29 +74,6 @@ public sealed class MmapPrefaultTests
         Assert.True(MmapPrefault.ShouldRun(null, 100 * Gib, 0, MmapPrefault.RamGate.FitsInRam, out _));
     }
 
-    // ── IsDisabled / env kill switch ────────────────────────────────────────
-
-    [Fact]
-    public void IsDisabled_ReflectsEnv()
-    {
-        var prev = Environment.GetEnvironmentVariable("SHARPI_PREFAULT");
-        try
-        {
-            Environment.SetEnvironmentVariable("SHARPI_PREFAULT", "0");
-            Assert.True(MmapPrefault.IsDisabled());
-
-            Environment.SetEnvironmentVariable("SHARPI_PREFAULT", "1");
-            Assert.False(MmapPrefault.IsDisabled());
-
-            Environment.SetEnvironmentVariable("SHARPI_PREFAULT", null);
-            Assert.False(MmapPrefault.IsDisabled());
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable("SHARPI_PREFAULT", prev);
-        }
-    }
-
     // ── Integration: real sweep over small buffers ──────────────────────────
 
     [Fact]

@@ -2765,6 +2765,13 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             if (arr is null) return;
             foreach (var w in arr) Add1(w);
         }
+        // Resolve a tensor by name straight from the mmap, tolerating absence — a
+        // pre-fault must never make an otherwise-loadable model fail to load.
+        void AddByName(string name)
+        {
+            if (_model.FindTensor(name) is { } info)
+                regions.Add(((nint)_model.GetTensorDataPtr(info), info.ByteSize));
+        }
 
         // Embedding/output mmap refs are read at inference only when they're NOT
         // uploaded to VRAM (_gpu* null == cpuEmbeddingOutputOnly). Skipping the
@@ -2789,8 +2796,27 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             Add(_cpuWGate); Add(_cpuWUp); Add(_cpuWDown);
         }
 
-        // CPU-MoE routed experts for the GPU-trunk layers (the -g -1 cold-start cost).
-        Add(_cpuMoeGateInp); Add(_cpuMoeGateExps); Add(_cpuMoeUpExps); Add(_cpuMoeDownExps);
+        if (_isMoE && _nGpuLayers > 0)
+        {
+            if (_cpuMoe)
+            {
+                // CPU-MoE: GPU-trunk routed experts run on the CPU from these cached
+                // mmap refs every token (the -g -1 cold-start cost).
+                Add(_cpuMoeGateInp); Add(_cpuMoeGateExps); Add(_cpuMoeUpExps); Add(_cpuMoeDownExps);
+            }
+            else
+            {
+                // GPU-SLRU MoE: the routed experts aren't cached on the host, but the
+                // SLRU streams each one from the mmap on first use. Fault them so the
+                // first request's cache fills don't stall (mirrors the Vulkan path).
+                for (int li = 0; li < _nGpuLayers; li++)
+                {
+                    AddByName($"blk.{li}.ffn_gate_exps.weight");
+                    AddByName($"blk.{li}.ffn_up_exps.weight");
+                    AddByName($"blk.{li}.ffn_down_exps.weight");
+                }
+            }
+        }
 
         // Gemma 4 PLE: the GiB-scale per-layer token-embedding table + per-layer projections.
         if (_pleTokenEmbed is { } ple) Add1(ple);
