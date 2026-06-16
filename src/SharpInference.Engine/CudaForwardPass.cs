@@ -438,14 +438,27 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_GEMM") == "1";
     private readonly bool _batchDecodeWeightStationary =
         Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_WS") != "0";
-    // SHARPI_BATCH_DECODE_MMQ=1 (#201, opt-in): int8 tensor-core decode matmuls for the
-    // big Q4_K-SoA shapes (BN=16 mma tile, weight read once per step) — argmax-stable,
-    // not bit-exact; small/non-Q4_K shapes fall back to weight-stationary per tensor
-    // inside the backend. The bit-exact WS matvecs are L1TEX-bound ~3× above the weight
-    // floor at N=8 and their lane geometry is frozen by the bit-identity contract, so
-    // this toggle is where the remaining batched-decode headroom lives.
-    private readonly bool _batchDecodeMmq =
-        Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_MMQ") == "1";
+    // SHARPI_BATCH_DECODE_MMQ (#201/#206): int8 tensor-core decode matmuls for the big
+    // Q4_K-SoA shapes (BN=16 mma tile, weight read once per step) — argmax-stable, not
+    // bit-exact; small/non-Q4_K shapes fall back to weight-stationary per tensor inside the
+    // backend. The bit-exact WS matvecs are L1TEX-bound ~3× above the weight floor at N=8
+    // and their lane geometry is frozen by the bit-identity contract, so this is where the
+    // remaining batched-decode headroom lives. Measured on Qwen3-8B Q4_K_M @ 4070 Ti
+    // (#206): aggregate t/s N=5 205→228 (+11%), N=6 225→263 (+17%), N=7 242→298 (+23%),
+    // N=8 250→319 (+28%) — all well above the bit-exact WS path it replaces.
+    //
+    // It is therefore DEFAULT-ON for ContinuousBatchingEngine multi-user decode, and
+    // DEFAULT-OFF for the single-user speculative-decode BatchVerify path: BatchVerify
+    // shares BatchForwardMulti but must stay bit-exact to preserve the 48-token greedy
+    // spec-decode parity guarantee (CudaSpecBatchVerifyTests). The decode call passes
+    // allowDecodeMmq; spec-verify passes false. The env var is a tri-state override:
+    //   unset → on for multi-user batched decode, off for spec-verify (default)
+    //   "0"   → off everywhere (bit-exact kill-switch)
+    //   "1"   → on everywhere incl. spec-verify (argmax-stable; perf A/B only)
+    private readonly string? _batchDecodeMmqEnv =
+        Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_MMQ");
+    private bool BatchDecodeMmqKill => _batchDecodeMmqEnv == "0";
+    private bool BatchDecodeMmqForceAll => _batchDecodeMmqEnv == "1";
 
     // Ragged-batched per-sequence attention ops (issue #197). Default on: the per-layer
     // QK-norm/RoPE/KV-append/attention launches collapse from O(N) per-sequence calls
@@ -3467,16 +3480,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     /// <summary>One batched-decode matmul. Default: the weight-stationary small-N matvec
     /// (#194 — weight HBM read amortized across the batch, bit-identical reduction to the
     /// GEMM-N matvec; N=1 / N&gt;16 delegate to GEMM-N inside the backend).
-    /// SHARPI_BATCH_DECODE_WS=0: the #190 GEMM-N matvec. SHARPI_BATCH_DECODE_MMQ=1: the
-    /// #201 int8 tensor-core decode tile for big Q4_K-SoA shapes (argmax-stable, WS
-    /// fallback per tensor). SHARPI_BATCH_DECODE_GEMM=1: the compute-bound GEMM/MMQ path
-    /// (the same routing <see cref="GpuMatMulBatchedCore"/> uses for prefill) —
-    /// argmax-stable only, kept as the A/B toggle for very high concurrency.</summary>
-    private void BatchDecodeMatMul(Tensor outAll, Tensor weights, Tensor inAll, int n)
+    /// SHARPI_BATCH_DECODE_WS=0: the #190 GEMM-N matvec. The #201/#206 int8 tensor-core
+    /// decode tile for big Q4_K-SoA shapes (argmax-stable, WS fallback per tensor) is
+    /// default-on for multi-user decode (<paramref name="allowMmq"/>) and off for the
+    /// bit-exact spec-verify path; SHARPI_BATCH_DECODE_MMQ=0/1 forces it off/on everywhere.
+    /// SHARPI_BATCH_DECODE_GEMM=1: the compute-bound GEMM/MMQ path (the same routing
+    /// <see cref="GpuMatMulBatchedCore"/> uses for prefill) — argmax-stable only, kept as
+    /// the A/B toggle for very high concurrency.</summary>
+    private void BatchDecodeMatMul(Tensor outAll, Tensor weights, Tensor inAll, int n, bool allowMmq)
     {
         if (_batchDecodeComputeBound)
             GpuMatMulBatchedCore(outAll, weights, inAll, n);
-        else if (_batchDecodeMmq)
+        else if (!BatchDecodeMmqKill && (allowMmq || BatchDecodeMmqForceAll))
             _gpu.MatMulBatchedDecodeMmq(outAll, weights, inAll, n, WDType(weights));
         else if (_batchDecodeWeightStationary)
             _gpu.MatMulBatchedWeightStationary(outAll, weights, inAll, n, WDType(weights));
@@ -3496,7 +3511,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     /// per-sequence attention block mirrors the dense <see cref="RunDeviceRegion"/> ordering
     /// exactly (QK-norm before RoPE, #157), so it is argmax-stable vs the single-user loop.
     /// </summary>
-    internal float[][] BatchForwardMulti(int[] tokens, int[] positions, CudaSequenceKvCache[] caches)
+    /// <param name="allowDecodeMmq">When true (multi-user continuous-batching decode) the big
+    /// Q4_K matmuls may use the #201/#206 argmax-stable decode MMQ tile (default-on, the
+    /// +11–28% win); when false (the spec-decode <see cref="BatchVerify"/> wrapper) they stay on
+    /// the bit-exact WS path so greedy spec-decode output is byte-stable. SHARPI_BATCH_DECODE_MMQ
+    /// =0/1 overrides both to off/on everywhere.</param>
+    internal float[][] BatchForwardMulti(int[] tokens, int[] positions, CudaSequenceKvCache[] caches,
+                                         bool allowDecodeMmq = true)
     {
         ArgumentNullException.ThrowIfNull(tokens);
         ArgumentNullException.ThrowIfNull(positions);
@@ -3568,13 +3589,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
                 _gpu.CopyDevice(_bpResidual!, _bpHidden!);
                 _gpu.RmsNormBatched(_bpNorm!, _bpHidden!, _wAttnNorm[layer], N, embDim, _hp.RmsNormEps);
 
-                // Batched QKV. Default weight-stationary matvec (#194: weight read amortized
-                // across the batch, bit-identical reduction to the per-token oracle's kernels);
-                // SHARPI_BATCH_DECODE_WS=0 / SHARPI_BATCH_DECODE_GEMM=1 select the #190
-                // GEMM-N / compute-bound GEMM-MMQ alternatives (see BatchDecodeMatMul).
-                BatchDecodeMatMul(_bpQ!, _wq[layer], _bpNorm!, N);
-                BatchDecodeMatMul(_bpK!, _wk[layer], _bpNorm!, N);
-                BatchDecodeMatMul(_bpV!, _wv[layer]!, _bpNorm!, N);
+                // Batched QKV. For multi-user decode (allowDecodeMmq) the big Q4_K shapes
+                // default to the #201/#206 int8 MMQ tile (argmax-stable, +11–28% at N=5–8),
+                // small/non-Q4_K shapes to the #194 weight-stationary matvec; the bit-exact
+                // spec-verify path forces WS. SHARPI_BATCH_DECODE_WS=0 / _GEMM=1 / _MMQ=0|1
+                // override the routing (see BatchDecodeMatMul).
+                BatchDecodeMatMul(_bpQ!, _wq[layer], _bpNorm!, N, allowDecodeMmq);
+                BatchDecodeMatMul(_bpK!, _wk[layer], _bpNorm!, N, allowDecodeMmq);
+                BatchDecodeMatMul(_bpV!, _wv[layer]!, _bpNorm!, N, allowDecodeMmq);
 
                 bool useRoPE = _hp.NoRopeLayerStep == 0 || (layer + 1) % _hp.NoRopeLayerStep != 0;
 
@@ -3659,7 +3681,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
                 // path adds it in one broadcast launch, the legacy loop via per-sequence hidden
                 // views created inline here (rare branch) to keep the common no-bias decode
                 // path free of unused per-row views.
-                BatchDecodeMatMul(_bpHidden!, _wo[layer], _bpAttnOut!, N);
+                BatchDecodeMatMul(_bpHidden!, _wo[layer], _bpAttnOut!, N, allowDecodeMmq);
                 if (_hasAttnBias)
                 {
                     if (ragged)
@@ -3677,17 +3699,17 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
                 // FFN (dense SwiGLU), batched across N.
                 _gpu.CopyDevice(_bpResidual!, _bpHidden!);
                 _gpu.RmsNormBatched(_bpNorm!, _bpHidden!, _wFfnNorm[layer], N, embDim, _hp.RmsNormEps);
-                BatchDecodeMatMul(_bpFfnGate!, _wGate[layer], _bpNorm!, N);
-                BatchDecodeMatMul(_bpFfnUp!,   _wUp[layer],   _bpNorm!, N);
+                BatchDecodeMatMul(_bpFfnGate!, _wGate[layer], _bpNorm!, N, allowDecodeMmq);
+                BatchDecodeMatMul(_bpFfnUp!,   _wUp[layer],   _bpNorm!, N, allowDecodeMmq);
                 _gpu.SiLuMul(_bpFfnGate!, _bpFfnUp!);
-                BatchDecodeMatMul(_bpHidden!, _wDown[layer], _bpFfnGate!, N);
+                BatchDecodeMatMul(_bpHidden!, _wDown[layer], _bpFfnGate!, N, allowDecodeMmq);
                 _gpu.AddInPlace(_bpHidden!, _bpResidual!);
             }
 
             // 3. Final norm + output projection, batched (the output weight is the largest
             //    single matmul, so amortizing its read across N is the main throughput win).
             _gpu.RmsNormBatched(_bpHidden!, _bpHidden!, _wOutputNorm, N, embDim, _hp.RmsNormEps);
-            BatchDecodeMatMul(_decodeLogitsAll!, _wOutput, _bpHidden!, N);
+            BatchDecodeMatMul(_decodeLogitsAll!, _wOutput, _bpHidden!, N, allowDecodeMmq);
             _gpu.Download(_decodeLogitsAll!, _decodeLogitsHost.AsSpan(0, N * vocab));
             _gpu.Synchronize();
 
@@ -3740,10 +3762,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     /// and row i attends over [0, startPos+i] — i.e. packed causal attention (the legacy
     /// per-sequence fallback loop appends-then-attends in ascending row order, equally
     /// causal). Every matmul routes through <see cref="BatchDecodeMatMul"/>, so the #194
-    /// weight-stationary kernels (or the opt-in #201 decode MMQ) amortize the weight HBM
-    /// reads k×. Each row keeps the per-token kernels' reduction chains (#194/#197), so the
-    /// default WS path is expected bit-identical to k sequential <see cref="Forward"/> calls;
-    /// the opt-in compute-bound/MMQ toggles are argmax-stable only. All k K/V entries land in
+    /// weight-stationary kernels amortize the weight HBM reads k×. This path passes
+    /// <c>allowDecodeMmq: false</c> so it stays on those bit-exact WS kernels even though the
+    /// #201/#206 decode MMQ is default-on for multi-user decode — each row keeps the per-token
+    /// kernels' reduction chains (#194/#197), so verify is bit-identical to k sequential
+    /// <see cref="Forward"/> calls and greedy spec-decode output is byte-stable. (Only the
+    /// SHARPI_BATCH_DECODE_MMQ=1 force-all override or SHARPI_BATCH_DECODE_GEMM=1 route this
+    /// through an argmax-stable-only path.) All k K/V entries land in
     /// the cache; the caller rewinds rejected tokens via <see cref="TruncateTo"/>. Issues
     /// direct launches only — the per-token decode CUDA graph (owned-cache pointers) stays
     /// valid for the surrounding Forward steps.
@@ -3786,7 +3811,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         var caches = new CudaSequenceKvCache[k];
         Array.Fill(caches, _ownedCacheView);
 
-        var result = BatchForwardMulti(tokens, positions, caches);
+        // allowDecodeMmq: false keeps the verify on the bit-exact WS matvecs so greedy
+        // spec-decode output stays byte-stable vs the non-spec baseline (the 48-token
+        // parity oracle in CudaSpecBatchVerifyTests). SHARPI_BATCH_DECODE_MMQ=1 still
+        // forces MMQ here for perf A/B (argmax-stable, not byte-stable).
+        var result = BatchForwardMulti(tokens, positions, caches, allowDecodeMmq: false);
         // Mirror what k sequential Forward calls would leave behind; the speculative
         // decoder's TruncateTo(startPos + accepted) then rewinds the rejected tail.
         _kvLength = Math.Max(_kvLength, startPos + k);
