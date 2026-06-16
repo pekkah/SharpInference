@@ -115,4 +115,117 @@ public sealed unsafe class CudaGemmQ6KTests
                 $"Q6_K GEMM drifted from fp32 reference: {mismatches}/{cpuOut.Length} beyond 4% of RMS ({refRms:E3}), maxAbs={maxAbs:E3}.");
         }
     }
+
+    /// <summary>#204: every Q6_K reader ported to the SoA layout
+    /// (<see cref="CudaBackend.RepackQ6KSoa"/>) must be BIT-IDENTICAL to its AoS counterpart —
+    /// same value, same reduction order. This test runs each reader (single-token
+    /// <c>MatMul</c>, two-input <c>MatMulN2</c>, batched GEMM-N <c>MatMulBatched</c>, and the
+    /// weight-stationary <c>MatMulBatchedWeightStationary</c>) against the SAME weight bytes,
+    /// once via the AoS-uploaded weight and once via the SoA-repacked weight, and asserts the
+    /// two GPU outputs are byte-for-byte equal. (The decode-MMQ tile is only argmax-stable, so
+    /// it is covered separately by <see cref="CudaDecodeMmqTests"/> against the fp32 reference.)
+    /// </summary>
+    [Fact]
+    public void Q6KSoaReaders_AreBitIdenticalToAos()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        // Shapes: attn_v-like (1024 rows → WS/decode-ineligible), ffn_down-half-like (2048),
+        // a partial-tile (300), and a wider multi-superblock (512 rows × 1024 cols).
+        foreach ((int rows, int cols) in new[] { (1024, 512), (2048, 256), (300, 512), (512, 1024) })
+        {
+            var rng = new Random(20260616 + rows * 17 + cols * 3);
+            byte[] weightBytes = BuildQ6KMatrix(rows, cols, rng);
+
+            // Two GPU copies of the SAME bytes: AoS (interleaved) and SoA (repack frees its src).
+            var aosW = gpu.UploadRaw(weightBytes, TensorShape.D1(weightBytes.Length), DType.Q6_K);
+            var soaSrc = gpu.UploadRaw(weightBytes, TensorShape.D1(weightBytes.Length), DType.Q6_K);
+            var soaW = gpu.RepackQ6KSoa(soaSrc, rows, cols);   // frees soaSrc, returns the SoA buffer
+
+            // ── Single-token MatMul ──
+            {
+                var x = new float[cols];
+                for (int i = 0; i < cols; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+                var gx = gpu.Upload(x, TensorShape.D1(cols));
+                var aosY = gpu.Allocate(TensorShape.D1(rows));
+                var soaY = gpu.Allocate(TensorShape.D1(rows));
+                gpu.MatMul(aosY, aosW, gx, DType.Q6_K);
+                gpu.MatMul(soaY, soaW, gx, DType.Q6_K);
+                gpu.Synchronize();
+                AssertBitIdentical(gpu, aosY, soaY, rows, $"MatMul rows={rows} cols={cols}");
+                gpu.Free(gx); gpu.Free(aosY); gpu.Free(soaY);
+            }
+
+            // ── Two-input MatMulN2 ──
+            {
+                var xa = new float[cols];
+                var xb = new float[cols];
+                for (int i = 0; i < cols; i++) { xa[i] = (float)(rng.NextDouble() * 2 - 1); xb[i] = (float)(rng.NextDouble() * 2 - 1); }
+                var gxa = gpu.Upload(xa, TensorShape.D1(cols));
+                var gxb = gpu.Upload(xb, TensorShape.D1(cols));
+                var aosYa = gpu.Allocate(TensorShape.D1(rows));
+                var aosYb = gpu.Allocate(TensorShape.D1(rows));
+                var soaYa = gpu.Allocate(TensorShape.D1(rows));
+                var soaYb = gpu.Allocate(TensorShape.D1(rows));
+                gpu.MatMulN2(aosYa, aosYb, aosW, gxa, gxb, DType.Q6_K);
+                gpu.MatMulN2(soaYa, soaYb, soaW, gxa, gxb, DType.Q6_K);
+                gpu.Synchronize();
+                AssertBitIdentical(gpu, aosYa, soaYa, rows, $"MatMulN2.A rows={rows} cols={cols}");
+                AssertBitIdentical(gpu, aosYb, soaYb, rows, $"MatMulN2.B rows={rows} cols={cols}");
+                gpu.Free(gxa); gpu.Free(gxb);
+                gpu.Free(aosYa); gpu.Free(aosYb); gpu.Free(soaYa); gpu.Free(soaYb);
+            }
+
+            // ── Batched GEMM-N (MatMulBatched) and weight-stationary, across capacities ──
+            foreach (int nTok in new[] { 1, 2, 4, 8, 16 })
+            {
+                var acts = new float[(long)nTok * cols];
+                for (int i = 0; i < acts.Length; i++) acts[i] = (float)(rng.NextDouble() * 2 - 1);
+                var gx = gpu.Upload(acts, TensorShape.D1(acts.Length));
+
+                var aosY = gpu.Allocate(TensorShape.D1((long)nTok * rows));
+                var soaY = gpu.Allocate(TensorShape.D1((long)nTok * rows));
+                gpu.MatMulBatched(aosY, aosW, gx, nTok, DType.Q6_K);
+                gpu.MatMulBatched(soaY, soaW, gx, nTok, DType.Q6_K);
+                gpu.Synchronize();
+                AssertBitIdentical(gpu, aosY, soaY, nTok * rows, $"MatMulBatched n={nTok} rows={rows} cols={cols}");
+
+                // WS path (nTok ≥ 2 uses the WS kernels; nTok == 1 delegates to GEMM-N).
+                var aosWs = gpu.Allocate(TensorShape.D1((long)nTok * rows));
+                var soaWs = gpu.Allocate(TensorShape.D1((long)nTok * rows));
+                gpu.MatMulBatchedWeightStationary(aosWs, aosW, gx, nTok, DType.Q6_K);
+                gpu.MatMulBatchedWeightStationary(soaWs, soaW, gx, nTok, DType.Q6_K);
+                gpu.Synchronize();
+                AssertBitIdentical(gpu, aosWs, soaWs, nTok * rows, $"MatMulBatchedWS n={nTok} rows={rows} cols={cols}");
+
+                // Prefill dequant→fp16→cuBLAS GEMM path (llm_dequant_q6k_to_f16{,_soa}): the SoA
+                // dequant emits the SAME fp16 weight bytes as the AoS dequant, so the GEMM output
+                // is bit-identical too (the hot prefill path — covers the SoA dequant kernel).
+                var aosG = gpu.Allocate(TensorShape.D1((long)nTok * rows));
+                var soaG = gpu.Allocate(TensorShape.D1((long)nTok * rows));
+                gpu.MatMulBatchedGemm(aosG, aosW, gx, nTok, DType.Q6_K);
+                gpu.MatMulBatchedGemm(soaG, soaW, gx, nTok, DType.Q6_K);
+                gpu.Synchronize();
+                AssertBitIdentical(gpu, aosG, soaG, nTok * rows, $"MatMulBatchedGemm n={nTok} rows={rows} cols={cols}");
+
+                gpu.Free(gx); gpu.Free(aosY); gpu.Free(soaY); gpu.Free(aosWs); gpu.Free(soaWs);
+                gpu.Free(aosG); gpu.Free(soaG);
+            }
+
+            gpu.Free(aosW);
+            gpu.Free(soaW);
+        }
+    }
+
+    private static void AssertBitIdentical(CudaBackend gpu, Tensor a, Tensor b, int n, string ctx)
+    {
+        var ha = new float[n];
+        var hb = new float[n];
+        gpu.Download(a, ha);
+        gpu.Download(b, hb);
+        for (int i = 0; i < n; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(ha[i]) == BitConverter.SingleToInt32Bits(hb[i]),
+                $"{ctx}: SoA Q6_K reader not bit-identical to AoS at [{i}]: AoS={ha[i]:R} SoA={hb[i]:R}.");
+    }
 }
