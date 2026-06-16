@@ -38,6 +38,17 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
     // Prefix caching state (guarded by _gate — only accessed during generation).
     private int[]? _prevTokens;
 
+    // Multi-slot prefix cache (issue #212), opt-in via SHARPI_PREFIX_SLOTS=2. Non-null only
+    // when the dense rewindable pass supports it AND the env requested 2 slots; otherwise the
+    // engine stays exactly single-slot (byte-identical default path). Slot 0 = the pass's owned
+    // cache (legacy _prevTokens semantics); slot 1 = a bounded scratch cache for short
+    // interleaved requests so an aux call doesn't evict the long resident prefix in slot 0.
+    // _slotTokens[s] mirrors _prevTokens for slot s. Engine owns/disposes the scratch slot(s).
+    private readonly IMultiSlotKvCache? _multiSlot;
+    private ISequenceKvCache[]? _slots;
+    private int[]?[]? _slotTokens;
+    private readonly int _scratchCap;
+
     // Image input (issue #253). Set once at load via EnableImageInput; the VisionModel is
     // owned/disposed elsewhere (in _owned). Image requests splice projected soft tokens at
     // each placeholder during a fresh (no-prefix-reuse) prefill.
@@ -139,6 +150,46 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                 Console.Error.WriteLine(
                     $"[InferenceEngine] prefix cache disabled — {fwd.GetType().Name} reports SupportsPartialRewind == false " +
                     "and exposes no snapshot facility. Multi-turn requests will re-prefill the full prompt.");
+            }
+        }
+
+        // Multi-slot prefix cache (issue #212): opt-in via SHARPI_PREFIX_SLOTS=2, dense
+        // rewindable path only. A bounded scratch slot (SHARPI_PREFIX_SCRATCH_TOKENS, default
+        // 4096) holds short interleaved requests so they don't evict slot 0's long prefix.
+        // Default (env unset / != 2) leaves _multiSlot null → exact single-slot behavior.
+        _scratchCap = 4096;
+        if (int.TryParse(
+                Environment.GetEnvironmentVariable("SHARPI_PREFIX_SCRATCH_TOKENS"),
+                System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out int sc) && sc > 0)
+            _scratchCap = sc;
+
+        if (int.TryParse(
+                Environment.GetEnvironmentVariable("SHARPI_PREFIX_SLOTS"),
+                System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out int slots)
+            && slots == 2
+            && fwd.SupportsPartialRewind
+            && fwd is IMultiSlotKvCache ms && ms.SupportsMultiSlotPrefix)
+        {
+            // Allocating the extra scratch KV region can OOM: auto-context sizes _maxSeqLen to
+            // fit exactly one full KV cache in VRAM and doesn't budget the scratch slot. Since
+            // the feature is opt-in, degrade to single-slot on failure rather than aborting
+            // engine construction. (Logger is DI-set after construction, so it's unavailable
+            // here — emit to stderr like the other SHARPI_* opt-in traces.)
+            try
+            {
+                var scratch = ms.AllocateScratchSlot(_scratchCap);
+                _multiSlot = ms;
+                _slots = [ms.OwnedSlot, scratch];
+                _slotTokens = new int[]?[2];
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"[InferenceEngine] SHARPI_PREFIX_SLOTS=2: could not allocate the " +
+                    $"{_scratchCap}-token scratch KV slot ({ex.GetType().Name}: {ex.Message}); " +
+                    "falling back to single-slot prefix cache.");
             }
         }
     }
@@ -293,21 +344,76 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
     /// Finds the longest page-aligned prefix shared between the new token array and the cached
     /// previous token array, returning its length (0 if no reusable prefix exists).
     /// </summary>
-    private int FindCacheablePrefix(int[] tokens)
+    private int FindCacheablePrefix(int[] tokens) => PageAlignedSharedPrefix(tokens, _prevTokens, tokens.Length);
+
+    /// <summary>
+    /// Longest page-aligned token prefix shared between <paramref name="a"/> and a cached
+    /// <paramref name="prev"/> array (0 if none). Factored out of <see cref="FindCacheablePrefix"/>
+    /// so the issue-#212 multi-slot selector can score each resident slot with identical logic.
+    /// </summary>
+    private static int PageAlignedSharedPrefix(int[] a, int[]? prev, int newLen)
     {
-        if (_prevTokens == null || tokens.Length <= PagedKvCache.PageSize)
+        if (prev == null || newLen <= PagedKvCache.PageSize)
             return 0;
 
         // Compare up to all-but-last-page tokens (need at least one page to bother).
-        int maxCompare = Math.Min(tokens.Length - 1, _prevTokens.Length);
+        int maxCompare = Math.Min(newLen - 1, prev.Length);
         int match = 0;
-        while (match < maxCompare && tokens[match] == _prevTokens[match])
+        while (match < maxCompare && a[match] == prev[match])
             match++;
 
         // Align down to page boundary (must be at least one full page).
-        int aligned = (match / PagedKvCache.PageSize) * PagedKvCache.PageSize;
-        return aligned;
+        return (match / PagedKvCache.PageSize) * PagedKvCache.PageSize;
     }
+
+    /// <summary>
+    /// Issue #212 multi-slot selection: pick the resident slot to serve <paramref name="tokens"/>.
+    /// Scores each slot's page-aligned shared prefix; reuses the slot with the largest match.
+    /// On no match, picks a victim — the bounded scratch slot when the prompt fits its capacity
+    /// (so a short interleaved request leaves slot 0's long prefix intact), otherwise the
+    /// full-size owned slot. Returns the chosen slot index and the prefix length to reuse
+    /// (0 for the victim). Only called when <see cref="_slots"/> is non-null.
+    /// </summary>
+    private (int SlotIdx, int PrefixLen) SelectSlot(int[] tokens, int maxNewTokens)
+    {
+        int[]?[] slotTokens = _slotTokens!;
+
+        // Worst-case absolute positions this request will occupy: prompt + every decoded token
+        // (decode appends KV at startPos+i for i in [0, maxNewTokens), so the highest written
+        // offset is (footprint-1)*kvDim). A request may bind the BOUNDED scratch slot only if
+        // its whole footprint fits the allocation — otherwise decode would append KV past the
+        // scratch tensor (out-of-bounds VRAM write). The owned slot 0 is full-size (_maxSeqLen),
+        // so it always fits and needs no such gate. Issue #212.
+        long footprint = (long)tokens.Length + Math.Max(0, maxNewTokens);
+        bool scratchFits = footprint <= _scratchCap;
+
+        int bestSlot = -1, bestPrefix = 0;
+        for (int s = 0; s < slotTokens.Length; s++)
+        {
+            // Skip a prefix match against the scratch slot when the request can't safely live
+            // there — fall through to (re-prefilling on) the owned slot instead.
+            if (s == ScratchSlotIdx && !scratchFits) continue;
+            int p = PageAlignedSharedPrefix(tokens, slotTokens[s], tokens.Length);
+            if (p > bestPrefix)
+            {
+                bestPrefix = p;
+                bestSlot = s;
+            }
+        }
+        if (bestSlot >= 0)
+            return (bestSlot, bestPrefix);
+
+        // No reusable prefix: pick a victim. Prefer the bounded scratch slot when the footprint
+        // fits (so a short interleaved request leaves slot 0's long prefix intact); otherwise the
+        // full-size owned slot absorbs it.
+        int victim = scratchFits ? ScratchSlotIdx : OwnedSlotIdx;
+        return (victim, 0);
+    }
+
+    // Issue #212 slot indices: slot 0 is the pass's owned (full-size) cache; slot 1 is the
+    // bounded scratch cache. Named for clarity in SelectSlot's footprint gating.
+    private const int OwnedSlotIdx = 0;
+    private const int ScratchSlotIdx = 1;
 
     /// <summary>
     /// Back-compat string-stream view of <see cref="GenerateChunksAsync"/>: yields only
@@ -406,6 +512,10 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                 bool logReq = logger?.IsEnabled(LogLevel.Debug) == true;
                 int promptTokenCount = 0, reusedTokens = 0, decodeTokens = 0;
                 long encodeMs = 0, prefillMs = 0, ttftMs = -1;
+                // Issue #212: index of the multi-slot prefix slot bound for this request, or -1
+                // when no non-owned slot is active (single-slot mode, or this request stayed on
+                // the owned slot). -1 keeps the finally's DeactivateSlot a no-op.
+                int activeSlotIdx = -1;
                 try
                 {
                     var tokens = _tokenizer.Encode(prompt).ToArray();
@@ -544,12 +654,40 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         // which leaves the cache partially written (the end-of-decode snapshot below
                         // is already skipped for image requests).
                         _prevTokens = null;
+                        // Issue #212: the image path runs on the owned cache (slot 0, no slot
+                        // bind) and ResetCache wipes its KV — invalidate slot 0's token shadow so
+                        // a later text request can't SelectSlot-match the now-overwritten prefix.
+                        // (The bounded scratch slot 1 is untouched and stays valid.)
+                        if (_slotTokens is not null) _slotTokens[0] = null;
                         _fwd.ResetCache();
                         suffixTokens = tokens;
                         logits = SplicePrefillImages(tokens, imageBytes, ct, out startPos);
                     }
                     else
                     {
+                        // Issue #212: multi-slot prefix cache. On the dense rewindable path, pick
+                        // the resident slot (owned slot 0 or bounded scratch slot 1) with the best
+                        // page-aligned prefix, bind it as the active KV region, and point the
+                        // engine's working _prevTokens at that slot's cached tokens so the existing
+                        // FindCacheablePrefix/TruncateTo block below operates on it unchanged. The
+                        // bind is released in this request's finally (DeactivateSlot).
+                        if (_slots is not null && _fwd.SupportsPartialRewind)
+                        {
+                            if (useMtp)
+                            {
+                                // MTP stays single-slot (slot 0 / owned cache) — no slot bind. But
+                                // _prevTokens may still mirror a prior scratch request, so realign
+                                // it to slot 0's shadow so prefix reuse matches the owned KV.
+                                _prevTokens = _slotTokens![0];
+                            }
+                            else
+                            {
+                                (activeSlotIdx, _) = SelectSlot(tokens, sp.MaxNewTokens);
+                                _multiSlot!.ActivateSlot(_slots[activeSlotIdx]);
+                                _prevTokens = _slotTokens![activeSlotIdx];
+                            }
+                        }
+
                         if (_fwd.SupportsPartialRewind)
                         {
                             int candidate = FindCacheablePrefix(tokens);
@@ -679,7 +817,11 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         if (!useCanonicalSnapshot && !ct.IsCancellationRequested)
                         {
                             _fwd.CaptureSnapshot();
-                            _prevTokens = fullSeq.ToArray();
+                            var snapMtp = fullSeq.ToArray();
+                            _prevTokens = snapMtp;
+                            // Issue #212: MTP ran single-slot on slot 0 (owned) — record the
+                            // transcript against slot 0 so the next turn's SelectSlot can rematch.
+                            if (_slotTokens is not null) _slotTokens[0] = snapMtp;
                         }
                         channel.Writer.TryComplete();
                         return;
@@ -821,7 +963,13 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                     if (!useCanonicalSnapshot && !ct.IsCancellationRequested && imageBytes is null)
                     {
                         _fwd.CaptureSnapshot();
-                        _prevTokens = fullSeq.ToArray();
+                        var snap = fullSeq.ToArray();
+                        _prevTokens = snap;
+                        // Issue #212: record the transcript against the active slot so the next
+                        // turn's SelectSlot can rematch it (slot 0 = owned long prefix, slot 1 =
+                        // scratch). When no non-owned slot is bound (single-slot, MTP), this is
+                        // skipped and _prevTokens carries the state as before.
+                        if (activeSlotIdx >= 0) _slotTokens![activeSlotIdx] = snap;
                     }
 
                     channel.Writer.TryComplete();
@@ -832,6 +980,10 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                 }
                 finally
                 {
+                    // Issue #212: always release a bound non-owned slot, even on exception or
+                    // cancellation, so a scratch bind can't leak into the next request's
+                    // owned-cache state (mirrors how RestoreOwned is always in a finally).
+                    if (activeSlotIdx >= 0) _multiSlot!.DeactivateSlot();
                     if (logReq)
                     {
                         long totalMs = swReq.ElapsedMilliseconds;
@@ -944,6 +1096,13 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                 "live worker. Ensure consumers dispose their generation enumerators and that the backend is responsive.");
             return;
         }
+        // Issue #212: dispose the scratch slot(s) the engine allocated (slot 0 is the pass's
+        // OwnedSlot — owned/freed by _fwd.Dispose, never disposed here). Done before _fwd.Dispose
+        // so the scratch tensors free while the backend is still live.
+        if (_slots is not null)
+            for (int s = 1; s < _slots.Length; s++)
+                _slots[s].Dispose();
+
         _fwd.Dispose();
         foreach (var d in _owned)
             d.Dispose();

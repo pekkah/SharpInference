@@ -38,7 +38,7 @@ namespace SharpInference.Engine;
 ///   • MoE + TurboQuant combination not validated (no test model has both;
 ///     should compose but the dispatch never sees the combination today).
 /// </summary>
-public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
+public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, IMultiSlotKvCache
 {
     private readonly CudaBackend _gpu;
     private readonly GgufModel _model;
@@ -485,6 +485,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     // against the owned cache. Never disposed (the owned tensors are freed by Dispose);
     // every layer is marked aliased so even an accidental Dispose can't free them.
     private CudaSequenceKvCache? _ownedCacheView;
+
+    // Issue #212: multi-slot prefix cache (single-user). The engine binds a non-owned
+    // "scratch" slot via ActivateSlot to serve a short interleaved request without evicting
+    // the long resident prefix in the owned cache (slot 0). _activeSlot is the bound slot
+    // (null = owned/no active bind); _savedKvLengthForSlot restores the owned _kvLength on
+    // DeactivateSlot; _activeSlotIsOwned gates the per-token CUDA graph (a captured graph
+    // bakes the owned pointers, so replay is only valid while slot 0 is active).
+    private ISequenceKvCache? _activeSlot;
+    private int _savedKvLengthForSlot;
+    private bool _activeSlotIsOwned = true;
 
     // Ragged attention spill scratch [N × numHeads × maxSeqLen] — the ragged kernel
     // spills per-(sequence, head) score rows when a sequence's length exceeds the
@@ -1662,6 +1672,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         if (_tqEnabled || _kvEvictedCount > 0 || _snapKvCaptureSlot >= 0 || _isMoE)
             return false;
 
+        // Issue #212: a captured graph bakes the OWNED cache's device pointers, so replaying
+        // it while a non-owned scratch slot is bound would touch a stale (foreign) pointer.
+        // Scratch-slot decode therefore uses direct launches; slot 0 keeps the captured graph.
+        if (!_activeSlotIsOwned)
+            return false;
+
         // Steady state: graph already captured — just replay at the new position.
         if (_graphCaptured && _gpu.GraphReady)
         {
@@ -2004,6 +2020,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         // sequentially — so gate on an actual eviction (_kvEvictedCount > 0), not on the
         // budget being set.
         if (_kvEvictedCount > 0 || _tqEnabled)
+            return false;
+
+        // Issue #212: a captured graph bakes the OWNED cache's device pointers, so a non-owned
+        // scratch slot bind must run direct launches (mirrors the dense twin above).
+        if (!_activeSlotIsOwned)
             return false;
 
         // Steady state: graph already captured — just replay at the new position.
@@ -3487,6 +3508,110 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     /// (the engine always builds chunks from <c>int[].AsMemory</c>).</summary>
     private static IReadOnlyList<int> AsList(ReadOnlyMemory<int> mem) =>
         MemoryMarshal.TryGetArray(mem, out ArraySegment<int> seg) ? seg : mem.ToArray();
+
+    // ── IMultiSlotKvCache (issue #212): single-user 2-slot prefix cache ──────────────────
+    //
+    // The single-user InferenceEngine binds a bounded non-owned "scratch" slot to serve a
+    // short interleaved request (Claude Code's auxiliary calls) without evicting the long
+    // resident prefix in the owned cache (slot 0). Only the dense rewindable path participates;
+    // the gate below reuses DenseBatchedDecodeSupported so TQ/SnapKV/MoE/Gemma-4/softcap stay
+    // single-slot. Unlike the batching engine's CreateCache, allocating a scratch slot does NOT
+    // disable CUDA graphs — graphs stay valid for slot 0 via the per-slot _activeSlotIsOwned
+    // gate in TryRunDeviceRegionViaGraph; scratch decode runs direct launches.
+
+    /// <inheritdoc/>
+    public bool SupportsMultiSlotPrefix => _snapKvEffectiveBudget == 0 && DenseBatchedDecodeSupported();
+
+    /// <inheritdoc/>
+    public ISequenceKvCache OwnedSlot
+    {
+        get
+        {
+            if (_ownedCacheView is null)
+            {
+                // Every layer marked aliased so even an accidental Dispose frees nothing — the
+                // owned tensors are freed by CudaForwardPass.Dispose (mirrors the #207 view).
+                var all = new HashSet<int>();
+                for (int l = 0; l < _hp.NumLayers; l++) all.Add(l);
+                _ownedCacheView = new CudaSequenceKvCache(_gpu, _ownedKCache, _ownedVCache, all);
+            }
+            // Hand out the owned region's current logical length so the engine's prefix logic
+            // sees what's actually resident.
+            _ownedCacheView.Length = _kvLength;
+            return _ownedCacheView;
+        }
+    }
+
+    /// <inheritdoc/>
+    public ISequenceKvCache AllocateScratchSlot(int capacityTokens)
+    {
+        if (!SupportsMultiSlotPrefix)
+            throw new NotSupportedException(
+                "AllocateScratchSlot requires the dense single-slot-capable configuration " +
+                "(no MoE / Gemma-4 / TurboQuant / SnapKV / softcap, GEMM-N-batchable weights). " +
+                "Check SupportsMultiSlotPrefix first.");
+
+        int cap = Math.Min(Math.Max(1, capacityTokens), _maxSeqLen);
+        int kvDim = _numKvHeads * _headDim;
+        // q8_0 KV packs 32 elements/block; the store kernels assume each layer's kvDim is a
+        // multiple of 32 (mirrors CreateCache + the owned-cache guard in the constructor).
+        if (_kvDType == DType.Q8_0 && (kvDim & 31) != 0)
+            throw new NotSupportedException(
+                $"SHARPI_KV_DTYPE=q8_0 requires kvDim % 32 == 0 (block_q8_0 = 32 elements/block); kvDim={kvDim}.");
+
+        int L = _hp.NumLayers;
+        var k = new Tensor[L];
+        var v = new Tensor[L];
+        // Free the partial allocations on OOM so a failed scratch alloc doesn't strand VRAM
+        // (mirrors CreateCache); the caller can fall back to single-slot on the throw.
+        try
+        {
+            for (int i = 0; i < L; i++)
+            {
+                k[i] = _gpu.Allocate(TensorShape.D1((long)cap * kvDim), _kvDType);
+                v[i] = _gpu.Allocate(TensorShape.D1((long)cap * kvDim), _kvDType);
+            }
+        }
+        catch
+        {
+            for (int i = 0; i < L; i++)
+            {
+                if (k[i] is { } ki) _gpu.Free(ki);
+                if (v[i] is { } vi) _gpu.Free(vi);
+            }
+            throw;
+        }
+        return new CudaSequenceKvCache(_gpu, k, v, s_noAliasedLayers);
+    }
+
+    /// <inheritdoc/>
+    public void ActivateSlot(ISequenceKvCache slot)
+    {
+        ArgumentNullException.ThrowIfNull(slot);
+        var c = (CudaSequenceKvCache)slot;
+        _savedKvLengthForSlot = _kvLength;
+        _gpuKCache = c.K;
+        _gpuVCache = c.V;
+        // c.Length seeds the position counter, but the engine always follows ActivateSlot with a
+        // TruncateTo (prefix reuse) or ResetCache (fresh) before any KV append, so this seed is
+        // provisional and never drives an append on its own — don't rely on it elsewhere.
+        _kvLength = c.Length;
+        // Slot 0 (the owned region) keeps the captured CUDA graph; any other slot forces
+        // direct launches for the duration of the bind.
+        _activeSlotIsOwned = ReferenceEquals(c, _ownedCacheView) || ReferenceEquals(c.K, _ownedKCache);
+        _activeSlot = slot;
+    }
+
+    /// <inheritdoc/>
+    public void DeactivateSlot()
+    {
+        if (_activeSlot is null) return;
+        ((CudaSequenceKvCache)_activeSlot).Length = _kvLength;
+        RestoreOwned();
+        _kvLength = _savedKvLengthForSlot;
+        _activeSlotIsOwned = true;
+        _activeSlot = null;
+    }
 
     /// <summary>One batched-decode matmul. Default: the weight-stationary small-N matvec
     /// (#194 — weight HBM read amortized across the batch, bit-identical reduction to the
