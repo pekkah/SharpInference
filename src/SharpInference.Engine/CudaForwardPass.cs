@@ -3606,9 +3606,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     public void DeactivateSlot()
     {
         if (_activeSlot is null) return;
+        // Persist the advanced length into the slot so the NEXT ActivateSlot of this slot reloads
+        // it (this is what actually preserves per-slot resident length across requests, including
+        // the owned slot's growth — not _savedKvLengthForSlot).
         ((CudaSequenceKvCache)_activeSlot).Length = _kvLength;
         RestoreOwned();
-        _kvLength = _savedKvLengthForSlot;
+        // Only a non-owned (scratch) bind needs _kvLength rewound to the owned value it displaced;
+        // when the owned slot itself was active, _kvLength already reflects its (advanced) resident
+        // length and must be kept so a follow-up read before the next ActivateSlot sees it.
+        if (!_activeSlotIsOwned)
+            _kvLength = _savedKvLengthForSlot;
         _activeSlotIsOwned = true;
         _activeSlot = null;
     }
