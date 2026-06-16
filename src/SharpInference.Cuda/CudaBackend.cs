@@ -29,6 +29,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private readonly nint _handle;
     private readonly SgemmPrecision _precision;
     private readonly int _smVersion;
+    private readonly int _smCount;   // SM (multiprocessor) count — decode-MMQ tile-size routing (#205)
     private readonly nint _stream;
     private readonly ConcurrentDictionary<nint, (nint devPtr, nuint byteSize)> _devPtrs = new();
     // Issue #111: handles registered by View() — non-owning slices into another
@@ -195,6 +196,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // #201: scale-word Q6_K WS variant + Q4_K decode MMQ (BN=16 int8 mma).
     private readonly nint[] _matvecQ6KWsSwKernels    = new nint[CudaWsKernels.Variants.Length];
     private nint _mmqQ4kSoaActsN16Kernel;
+    private nint _mmqQ4kSoaActsN16Bm32Kernel;   // #205: BM=32 tile for grid-starved low-row shapes
+    // #205 kill-switch: SHARPI_DECODE_MMQ_BM32=0 forces the BM=64 decode-MMQ tile for all
+    // shapes (BM=32 is default-on for grid-starved low-row shapes; output is bit-identical).
+    private readonly bool _decodeMmqBm32Enabled =
+        Environment.GetEnvironmentVariable("SHARPI_DECODE_MMQ_BM32") != "0";
     // Issue #141: compute-bound prefill GEMM — dequant Q8_0 weight + convert
     // activations to fp16, then one cublasGemmEx (weight read once per batch).
     private nint   _dequantQ80F16Kernel;
@@ -590,12 +596,13 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             throw new InvalidOperationException($"cudaMemcpyAsync (D2D region) failed: {r}");
     }
 
-    private CudaBackend(nint handle, SgemmPrecision precision, int smVersion, nint stream,
+    private CudaBackend(nint handle, SgemmPrecision precision, int smVersion, int smCount, nint stream,
                         nint pinnedBuf, nuint pinnedBufSize)
     {
         _handle        = handle;
         _precision     = precision;
         _smVersion     = smVersion;
+        _smCount       = smCount;
         _stream        = stream;
         _pinnedBuf     = pinnedBuf;
         _pinnedBufSize = pinnedBufSize;
@@ -632,6 +639,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             CuBlasInterop.DeviceGetAttribute(out int minor, CuBlasInterop.CudaDevAttrComputeCapabilityMinor, 0) == 0)
             smVersion = major * 10 + minor;
 
+        // SM count drives decode-MMQ tile-size routing (#205): a row tile that yields fewer
+        // than ~2 full waves of blocks starves the grid, so those shapes take the BM=32 tile.
+        int smCount = 0;
+        CuBlasInterop.DeviceGetAttribute(out smCount, CuBlasInterop.CudaDevAttrMultiProcessorCount, 0);
+
         // Dedicated CUDA stream — all memcpy and GEMM are enqueued on this stream,
         // so cudaStreamSynchronize(stream) waits only for our work (not the whole device).
         if (CuBlasInterop.StreamCreate(out nint stream) != 0)
@@ -655,7 +667,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         CuBlasInterop.MallocHost(out nint pinnedBuf, InitialPinnedSize);
 
         var resolvedPrecision = precision ?? DetectBestPrecision(smVersion);
-        var backend = new CudaBackend(handle, resolvedPrecision, smVersion, stream, pinnedBuf, InitialPinnedSize);
+        var backend = new CudaBackend(handle, resolvedPrecision, smVersion, smCount, stream, pinnedBuf, InitialPinnedSize);
 
         // The 2.5 GiB im2col tile buffer is allocated lazily on the first Conv2d call.
         // Pre-allocating it here used to push LLM contexts that estimated max-context based
@@ -2249,10 +2261,22 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 (nint)(&wPtr), (nint)(&qsPtr), (nint)(&dsPtr), (nint)(&yPtr),
                 (nint)(&pRows), (nint)(&pCols), (nint)(&pN)
             };
-            uint gx = (uint)((rows + 63) / 64), gy = (uint)((nTok + 15) / 16);
-            int rm = NvrtcInterop.LaunchKernel(_mmqQ4kSoaActsN16Kernel, gx, gy, 1,
-                                               256, 1, 1, 0, _stream, args, null);
-            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(mmq_q4k_soa_acts_n16) failed: {rm}");
+            uint gy = (uint)((nTok + 15) / 16);
+            // #205: the BM=64 tile yields ceil(rows/64) blocks. When that's below ~2 full SM
+            // waves the grid starves (e.g. rows≈4096 → 64 blocks on a 60-SM 4070 Ti — Q/O
+            // proj + the Q4_K ffn_down half), so route those low-row shapes to the BM=32 tile
+            // (ceil(rows/32) blocks, 128 threads). High-row shapes (gate/up 12288, lm-head
+            // 151936) keep BM=64 — they already fill the grid and BM=32 would double the
+            // per-block activation re-staging. Output is bit-identical between the two tiles.
+            // _smCount == 0 (attribute query failed) disables the BM=32 route (keeps BM=64).
+            bool useBm32 = _decodeMmqBm32Enabled && _mmqQ4kSoaActsN16Bm32Kernel != nint.Zero
+                           && _smCount > 0 && (rows + 63) / 64 < 2 * _smCount;
+            nint kernel = useBm32 ? _mmqQ4kSoaActsN16Bm32Kernel : _mmqQ4kSoaActsN16Kernel;
+            uint gx = useBm32 ? (uint)((rows + 31) / 32) : (uint)((rows + 63) / 64);
+            uint block = useBm32 ? 128u : 256u;
+            int rm = NvrtcInterop.LaunchKernel(kernel, gx, gy, 1,
+                                               block, 1, 1, 0, _stream, args, null);
+            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(mmq_q4k_soa_acts_n16{(useBm32 ? "_bm32" : "")}) failed: {rm}");
         }
     }
 
@@ -6222,7 +6246,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _kvAppendRaggedKernel, _kvAppendRaggedBf16Kernel, _kvAppendRaggedQ8Kernel,
             _attentionRaggedKernel, _attentionRaggedBf16Kernel, _attentionRaggedQ8Kernel,
             _addBiasRowsKernel,
-            _mmqQ4kSoaActsN16Kernel,   // #201
+            _mmqQ4kSoaActsN16Kernel,       // #201
+            _mmqQ4kSoaActsN16Bm32Kernel,   // #205
         ];
         foreach (nint k in kernels)
         {
@@ -6318,6 +6343,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _matvecQ6KWsSwKernels[v]    = GetKernelFunc($"llm_matvec_q6k_ws_sw_n{nt}");      // #201
         }
         _mmqQ4kSoaActsN16Kernel = GetKernelFunc("llm_mmq_q4k_soa_acts_n16");   // #201
+        _mmqQ4kSoaActsN16Bm32Kernel = GetKernelFunc("llm_mmq_q4k_soa_acts_n16_bm32");   // #205
         _dequantQ80F16Kernel   = GetKernelFunc("llm_dequant_q8_0_to_f16");
         _dequantQ4KF16Kernel   = GetKernelFunc("llm_dequant_q4k_to_f16");
         _dequantQ4KF16SoaKernel = GetKernelFunc("llm_dequant_q4k_to_f16_soa");
