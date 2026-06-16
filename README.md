@@ -18,42 +18,170 @@ warm-cache rate at a ~1K-token prompt; decode t/s is near-zero-ctx (forward-pass
 thinking tokens count). Outputs verified coherent; Qwen3-8B is byte-identical to llama.cpp b8585 (60-token
 greedy decode).
 
-| Model | Repo | Size | Backend | Prefill t/s | Decode t/s | Notes |
-|---|---|---:|---|---:|---:|---|
-| SmolLM2 1.7B Instruct | [HuggingFaceTB](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF) | 1 GB | CPU | 39.6 | 42.9 | AVX2 fused dequant-matvec |
-| SmolLM2 1.7B Instruct | (same) | 1 GB | Vulkan `-g -1` | 83.9 | 105.8 | GLSL `subgroupAdd` reduce |
-| SmolLM2 1.7B Instruct | (same) | 1 GB | **CUDA** `-g -1` | **230.6** | **268.0** | NVRTC `__dp4a` + Q8_1 |
-| Qwen3 8B | [Qwen](https://huggingface.co/Qwen/Qwen3-8B-GGUF) | 5 GB | CPU | 10.0 | 13.2 | dense, no KV compression |
-| Qwen3 8B | (same) | 5 GB | CPU `--tq` | 9.4 | 13.2 | 3-bit KV → 40 960 ctx; FastScan K+V (#34) keeps long-ctx decode ~flat (10.2 @ 3K, 9.4 @ 6K) |
-| Qwen3 8B | (same) | 5 GB | Vulkan `-g -1` | 28.0 | 30.9 | 11.4K auto-ctx |
-| Qwen3 8B | (same) | 5 GB | Vulkan `-g -1 --tq` | 25.5 | 30.7 | 3-bit KV → 40 960 ctx |
-| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1` | **2297** | **74.5** | int8 tensor-core MMQ prefill (weight read once as int8) + dp4a/Q8_1 decode matvec + CUDA-graph replay; all argmax-stable. (llama.cpp b8585 pp1008 5764 — gap is its cp.async MMQ + flash attn) |
-| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --no-thinking` | **2314** | **74.8** | reasoning suppressed; same path |
-| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq` | 60.6 | **70.2** | 3-bit KV → 40 960 ctx; 17 t/s @ 8K, 10 @ 16K |
-| Qwen3 8B | (same) | 5 GB | **CUDA** `-g -1 --tq --no-thinking` | 60.6 | **70.4** | as `--tq`, reasoning suppressed |
-| OLMoE 1B-7B Instruct (MoE) | [allenai](https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF) | 4 GB | CPU | 51.7 | 60.5 | 64 experts / 8 active; per-channel QK-norm; `norm_topk_prob=false` |
-| OLMoE 1B-7B Instruct (MoE) | (same) | 4 GB | Vulkan `-g -1` | 74.8 | **91.1** | greedy unstable across backends — use `--temp 0.6 --top-p 0.95` |
-| OLMoE 1B-7B Instruct (MoE) | (same) | 4 GB | **CUDA** `-g -1` | **112.8** | **126.0** | greedy varies, sampling coherent |
-| Qwen3-Coder 30B-A3B (MoE) | [Qwen](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF) | 17 GB | CPU | 19.8 | 22.4 | 128 experts / 8 active |
-| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | CPU `--tq` | 19.6 | 22.6 | 3-bit KV; FastScan (#34) → 15.5 t/s decode @ 3.2K ctx |
-| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | Vulkan `-g -1` (hybrid) | 1.1 | 5.3 | 29 GPU + 19 CPU layers, SLRU expert cache + predictive prefetch (`--no-moe-predict-prefetch` to disable). Vulkan-hybrid errors on the ~1K prompt, so these are the prior short-ctx values |
-| Qwen3-Coder 30B-A3B (MoE) | (same) | 17 GB | **CUDA** `-g -1` (hybrid) | **29.0** | **28.0** | 29 GPU + 19 CPU layers; routed experts stream through `CudaExpertSlotManager` SLRU (#72/#77). Batched-trunk prefill (#123, bit-identical; `SHARPI_BATCHED_PREFILL=0` to bisect); `SHARPI_EXPERT_STATS=path` for hit rates |
-| Llama-4 Scout 17B-16E (MoE) | [meta-llama](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct) | 61 GB | CPU | 2.1 | 4.3 | 48 layers, 17B active; split GGUF (not on bench machine) |
-| Llama-4 Scout 17B-16E (MoE) | (same) | 61 GB | CUDA `-g -1` (hybrid) | 1.2 | 2.6 | 7 GPU + 41 CPU layers — model dwarfs the 12 GB card so CPU-only wins; per-expert SLRU streaming (#72/#77) still lifts both (not on bench machine) |
-| Qwen3.6-35B-A3B (GDN+MoE) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | 22 GB | CPU | **11.3** | 9.3 | hybrid GDN/attn, 256 experts / 8 active. Chunk-parallel (FlashQLA) GDN prefill default-on (1.35× over the 8.4 t/s per-token scan; `SHARPI_GDN_CHUNKED_PREFILL=0` to disable). MTP variants keep the byte-exact scan (FP-reorder flips the thinking-boundary token) |
-| Qwen3.6-35B-A3B (GDN+MoE) | (same) | 22 GB | **CUDA** `-g -1` (hybrid) | **55.1** | **23.7** | 10 attn + 30 GDN on GPU; routed MoE on CPU, shared expert GPU-overlapped. Fused GDN scan + batched SDPA, bit-identical. `SHARPI_CPU_MOE=0` forces on-GPU experts |
-| Qwen3.6-27B-MTP (GDN) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) | 16 GB | CPU `--no-thinking` | 3.0 | **3.6** | dense 27B GDN/attn + native MTP head; auto MTP self-spec (#25) at greedy + `--no-thinking`. 90% draft acceptance; folded k-token batched verify (#30/#207) — 1.2× over MTP-off (3.0) |
-| Qwen3.6-27B-MTP (GDN) | (same) | 16 GB | **CUDA** `-g -1 --no-thinking` (hybrid) | **7.3** | **10.4** | 22/64 dense FFN on GPU + GDN/attn KV resident, rest CPU mmap. 90% acceptance; folded k-token batched verify + GDN snapshot ring — **1.68× over MTP-off (6.4)** |
-| Qwen3.6-27B-MTP (GDN) | (same) | 19 GB | CPU `--no-thinking` `Q5_K_M` | 2.8 | **3.5** | ~10% slower than Q4_K_M; 100% acceptance |
-| Qwen3.6-27B-MTP (GDN) | (same) | 19 GB | **CUDA** `-g -1 --no-thinking` `Q5_K_M` (hybrid) | 5.9 | **5.5** | 13/64 FFN on GPU, 51/64 CPU mmap. 98% acceptance; batched trunk (#119) bit-identical |
-| Qwen3.6-35B-A3B-MTP (GDN+MoE) | [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) | 22 GB | CPU `--no-thinking` | 9.1 | **8.5** | GDN/attn + 256-expert MoE + MTP head (#44). 100% acceptance; MoE-MTP batched verify (#45) — routed experts sequential per token, so ~MTP-off parity |
-| Qwen3.6-35B-A3B-MTP (GDN+MoE) | (same) | 22 GB | **CUDA** `-g -1 --no-thinking` (hybrid) | **55.7** | **21.4** | needs `SHARPI_CPU_MOE=1`: 30 GDN + 10 attn + shared expert on GPU, routed experts CPU mmap. 100% acceptance |
-| Carnice (Qwen3.6-35B-A3B-MTP finetune) | [mudler](https://huggingface.co/mudler/Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-GGUF) | 17 GB | **CUDA** `-g -1 --no-thinking` (hybrid) | **139.2** | **26.5** | agentic finetune; 80% acceptance (`bench-carnice.ps1`). APEX mixed-precision (Q3_K + Q8_0 experts); Q8_KS per-32 int dots auto-enable |
-| Gemma 4 E4B-it Q8 | [unsloth](https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF) | 8 GB | CPU | 5.0 | 5.1 | dense 42-layer gemma4: per-layer head_dim (256 SWA / 512 global), dual-RoPE, KV-share tail (18 layers), 5:1 SWA:global, logit softcap 30, PLE-256 injection (~4.2 GB mmap-resident) |
-| Gemma 4 E4B-it Q8 | (same) | 8 GB | **CUDA** `-g -1 -c 2048` | **3444** | **70.5** | all 42 layers fit at `-c 2048`; KV-share alias + per-layer SWA/global split. Prefill: int8 tensor-core MMQ + tensor-core flash attention + SoA Q8_0 weight repack. Prompts >4096 use a real SWA KV ring on the chunked-flash path (fixes correctness past the 512 window). Decode: dp4a/Q8_1 + CUDA-graph replay; argmax-stable. (llama.cpp ~8475 prefill / ~78 decode) |
-| Gemma 4 E4B-it Q8 | (same) | 8 GB | **CUDA** `-g 22 -c 2048` (hybrid) | 6.7 | 7.0 | 22 GPU + 20 CPU layers. `-g ≤ 22` required so the CPU shared-KV tail can read its own-KV source layers; CPU dense-FFN dominates decode (bandwidth-bound). `SHARPI_CUDA_PROFILE=1` for per-phase breakdown |
-| Gemma 4 E4B-it QAT q4_0 | [google](https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf) | 5 GB | **CUDA** `-g -1 -c 2048` | **3283** | **100.4** | QAT q4_0 (5.15 GB): **~1.4× decode** vs Q8 at near-identical quality, frees ~3 GB for wider KV/context. Same gemma4 path; the shared-KV tail layers omit `attn_k`/`attn_v`/`attn_k_norm` (loaded conditionally). `download-model.ps1 -Model gemma4-e4b-qat` |
-| Gemma 4 12B-it QAT Q4_0 | [google](https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf) | 7 GB | **CUDA** `-g -1 -c 2048` | **1742** | **54.1** | dense 48-layer gemma4, all bulk weights Q4_0 + tied Q6_K embedding; fits 12 GB full-offload. `attention_k_eq_v` (8 global MQA layers reuse K as V), per-layer KV heads (8 GQA / 1 MQA), pure V-norm. Prefill: Q4_0 int8 tensor-core MMQ over a SoA repack; decode: Q4_0 dp4a/Q8_1, argmax-stable, within ~6% of llama.cpp (57 t/s). **Long context:** `--kv-type bf16` halves / `q8_0` quarters the K/V store (fp32 kernel math, argmax-stable) + a bookkeeping-only host KV cache → **`-c 131072` (128K) within 12 GB** (fp32 `cudaMalloc`-fails at 64K). At 128K, q8_0 keeps the tied embed table resident (~53 t/s) where bf16 spills it (~19 t/s). Default fp32; opt-in `--kv-type bf16\|q8_0` |
+Tables are grouped per model, ordered fastest decode first; within each model the rows also run fastest
+decode first. Each model lists a ready-to-run command with that model's recommended sampling (matching the
+upstream / llama.cpp defaults). Commands use the published `sharpi-cli` binary — from source, swap it for
+`dotnet run --project src/SharpInference.Cli -c Release --`.
+
+#### SmolLM2 1.7B Instruct — [HuggingFaceTB](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF) · 1 GB
+
+```bash
+sharpi-cli -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -g -1 \
+  --temp 0.7 --top-p 0.95 --top-k 40 -p "Write a haiku about autumn"
+```
+
+| Backend | Prefill t/s | Decode t/s | Notes |
+|---|---:|---:|---|
+| **CUDA** `-g -1` | **230.6** | **268.0** | NVRTC `__dp4a` + Q8_1 |
+| Vulkan `-g -1` | 83.9 | 105.8 | GLSL `subgroupAdd` reduce |
+| CPU | 39.6 | 42.9 | AVX2 fused dequant-matvec |
+
+#### OLMoE 1B-7B Instruct (MoE) — [allenai](https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF) · 4 GB
+
+```bash
+# greedy is unstable on OLMoE across backends — sample instead
+sharpi-cli -m models/OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf -g -1 \
+  --temp 0.6 --top-p 0.95 -p "Explain mixture-of-experts routing in two sentences"
+```
+
+| Backend | Prefill t/s | Decode t/s | Notes |
+|---|---:|---:|---|
+| **CUDA** `-g -1` | **112.8** | **126.0** | greedy varies, sampling coherent |
+| Vulkan `-g -1` | 74.8 | **91.1** | greedy unstable across backends — use `--temp 0.6 --top-p 0.95` |
+| CPU | 51.7 | 60.5 | 64 experts / 8 active; per-channel QK-norm; `norm_topk_prob=false` |
+
+#### Gemma 4 E4B-it QAT q4_0 — [google](https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf) · 5 GB
+
+```bash
+# Gemma 4 is not a reasoning model — the CLI auto-sets --no-thinking
+sharpi-cli -m models/gemma-4-E4B_q4_0-it.gguf -g -1 -c 2048 \
+  --temp 1.0 --top-k 64 --top-p 0.95 --min-p 0 -p "Summarize the water cycle"
+```
+
+| Backend | Prefill t/s | Decode t/s | Notes |
+|---|---:|---:|---|
+| **CUDA** `-g -1 -c 2048` | **3283** | **100.4** | QAT q4_0 (5.15 GB): **~1.4× decode** vs Q8 at near-identical quality, frees ~3 GB for wider KV/context. Same gemma4 path; the shared-KV tail layers omit `attn_k`/`attn_v`/`attn_k_norm` (loaded conditionally). `download-model.ps1 -Model gemma4-e4b-qat` |
+
+#### Qwen3 8B — [Qwen](https://huggingface.co/Qwen/Qwen3-8B-GGUF) · 5 GB
+
+```bash
+# Qwen3 reasoning defaults; add --no-thinking for the faster non-reasoning rows
+sharpi-cli -m models/Qwen3-8B-Q4_K_M.gguf -g -1 \
+  --temp 0.6 --top-p 0.95 --top-k 20 -p "Write a quicksort in Python"
+```
+
+| Backend | Prefill t/s | Decode t/s | Notes |
+|---|---:|---:|---|
+| **CUDA** `-g -1 --no-thinking` | **2314** | **74.8** | reasoning suppressed; same path |
+| **CUDA** `-g -1` | **2297** | **74.5** | int8 tensor-core MMQ prefill (weight read once as int8) + dp4a/Q8_1 decode matvec + CUDA-graph replay; all argmax-stable. (llama.cpp b8585 pp1008 5764 — gap is its cp.async MMQ + flash attn) |
+| **CUDA** `-g -1 --tq --no-thinking` | 60.6 | **70.4** | as `--tq`, reasoning suppressed |
+| **CUDA** `-g -1 --tq` | 60.6 | **70.2** | 3-bit KV → 40 960 ctx; 17 t/s @ 8K, 10 @ 16K |
+| Vulkan `-g -1` | 28.0 | 30.9 | 11.4K auto-ctx |
+| Vulkan `-g -1 --tq` | 25.5 | 30.7 | 3-bit KV → 40 960 ctx |
+| CPU | 10.0 | 13.2 | dense, no KV compression |
+| CPU `--tq` | 9.4 | 13.2 | 3-bit KV → 40 960 ctx; FastScan K+V (#34) keeps long-ctx decode ~flat (10.2 @ 3K, 9.4 @ 6K) |
+
+#### Gemma 4 E4B-it Q8 — [unsloth](https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF) · 8 GB
+
+```bash
+sharpi-cli -m models/gemma-4-E4B-it-Q8_0.gguf -g -1 -c 2048 \
+  --temp 1.0 --top-k 64 --top-p 0.95 --min-p 0 -p "Summarize the water cycle"
+```
+
+| Backend | Prefill t/s | Decode t/s | Notes |
+|---|---:|---:|---|
+| **CUDA** `-g -1 -c 2048` | **3444** | **70.5** | all 42 layers fit at `-c 2048`; KV-share alias + per-layer SWA/global split. Prefill: int8 tensor-core MMQ + tensor-core flash attention + SoA Q8_0 weight repack. Prompts >4096 use a real SWA KV ring on the chunked-flash path (fixes correctness past the 512 window). Decode: dp4a/Q8_1 + CUDA-graph replay; argmax-stable. (llama.cpp ~8475 prefill / ~78 decode) |
+| **CUDA** `-g 22 -c 2048` (hybrid) | 6.7 | 7.0 | 22 GPU + 20 CPU layers. `-g ≤ 22` required so the CPU shared-KV tail can read its own-KV source layers; CPU dense-FFN dominates decode (bandwidth-bound). `SHARPI_CUDA_PROFILE=1` for per-phase breakdown |
+| CPU | 5.0 | 5.1 | dense 42-layer gemma4: per-layer head_dim (256 SWA / 512 global), dual-RoPE, KV-share tail (18 layers), 5:1 SWA:global, logit softcap 30, PLE-256 injection (~4.2 GB mmap-resident) |
+
+#### Gemma 4 12B-it QAT Q4_0 — [google](https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf) · 7 GB
+
+```bash
+sharpi-cli -m models/gemma-4-12b-it-qat-q4_0.gguf -g -1 -c 2048 \
+  --temp 1.0 --top-k 64 --top-p 0.95 --min-p 0 -p "Describe a sunset in three sentences"
+```
+
+| Backend | Prefill t/s | Decode t/s | Notes |
+|---|---:|---:|---|
+| **CUDA** `-g -1 -c 2048` | **1742** | **54.1** | dense 48-layer gemma4, all bulk weights Q4_0 + tied Q6_K embedding; fits 12 GB full-offload. `attention_k_eq_v` (8 global MQA layers reuse K as V), per-layer KV heads (8 GQA / 1 MQA), pure V-norm. Prefill: Q4_0 int8 tensor-core MMQ over a SoA repack; decode: Q4_0 dp4a/Q8_1, argmax-stable, within ~6% of llama.cpp (57 t/s). **Long context:** `--kv-type bf16` halves / `q8_0` quarters the K/V store (fp32 kernel math, argmax-stable) + a bookkeeping-only host KV cache → **`-c 131072` (128K) within 12 GB** (fp32 `cudaMalloc`-fails at 64K). At 128K, q8_0 keeps the tied embed table resident (~53 t/s) where bf16 spills it (~19 t/s). Default fp32; opt-in `--kv-type bf16\|q8_0` |
+
+#### Qwen3-Coder 30B-A3B (MoE) — [Qwen](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF) · 17 GB
+
+```bash
+sharpi-cli -m models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf -g -1 \
+  --temp 0.7 --top-p 0.8 --top-k 20 --repeat-penalty 1.05 -p "Implement a binary search tree in C#"
+```
+
+| Backend | Prefill t/s | Decode t/s | Notes |
+|---|---:|---:|---|
+| **CUDA** `-g -1` (hybrid) | **29.0** | **28.0** | 29 GPU + 19 CPU layers; routed experts stream through `CudaExpertSlotManager` SLRU (#72/#77). Batched-trunk prefill (#123, bit-identical; `SHARPI_BATCHED_PREFILL=0` to bisect); `SHARPI_EXPERT_STATS=path` for hit rates |
+| CPU `--tq` | 19.6 | 22.6 | 3-bit KV; FastScan (#34) → 15.5 t/s decode @ 3.2K ctx |
+| CPU | 19.8 | 22.4 | 128 experts / 8 active |
+| Vulkan `-g -1` (hybrid) | 1.1 | 5.3 | 29 GPU + 19 CPU layers, SLRU expert cache + predictive prefetch (`--no-moe-predict-prefetch` to disable). Vulkan-hybrid errors on the ~1K prompt, so these are the prior short-ctx values |
+
+#### Carnice (Qwen3.6-35B-A3B-MTP finetune) — [mudler](https://huggingface.co/mudler/Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-GGUF) · 17 GB
+
+```bash
+# greedy + --no-thinking engages MTP self-speculative decoding
+sharpi-cli -m models/Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-I-Compact.gguf -g -1 \
+  --temp 0 --no-thinking -p "List three uses for a paperclip"
+```
+
+| Backend | Prefill t/s | Decode t/s | Notes |
+|---|---:|---:|---|
+| **CUDA** `-g -1 --no-thinking` (hybrid) | **139.2** | **26.5** | agentic finetune; 80% acceptance (`bench-carnice.ps1`). APEX mixed-precision (Q3_K + Q8_0 experts); Q8_KS per-32 int dots auto-enable |
+
+#### Qwen3.6-35B-A3B (GDN+MoE) — [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) · 22 GB
+
+```bash
+sharpi-cli -m models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf -g -1 \
+  --temp 0.6 --top-p 0.95 --top-k 20 -p "Prove that the square root of 2 is irrational"
+```
+
+| Backend | Prefill t/s | Decode t/s | Notes |
+|---|---:|---:|---|
+| **CUDA** `-g -1` (hybrid) | **55.1** | **23.7** | 10 attn + 30 GDN on GPU; routed MoE on CPU, shared expert GPU-overlapped. Fused GDN scan + batched SDPA, bit-identical. `SHARPI_CPU_MOE=0` forces on-GPU experts |
+| CPU | **11.3** | 9.3 | hybrid GDN/attn, 256 experts / 8 active. Chunk-parallel (FlashQLA) GDN prefill default-on (1.35× over the 8.4 t/s per-token scan; `SHARPI_GDN_CHUNKED_PREFILL=0` to disable). MTP variants keep the byte-exact scan (FP-reorder flips the thinking-boundary token) |
+
+#### Qwen3.6-35B-A3B-MTP (GDN+MoE) — [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) · 22 GB
+
+```bash
+# SHARPI_CPU_MOE=1 keeps GDN/attn + shared expert on GPU, routed experts on CPU
+SHARPI_CPU_MOE=1 sharpi-cli -m models/Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf -g -1 \
+  --temp 0 --no-thinking -p "Write a binary search in Rust"
+```
+
+| Backend | Prefill t/s | Decode t/s | Notes |
+|---|---:|---:|---|
+| **CUDA** `-g -1 --no-thinking` (hybrid) | **55.7** | **21.4** | needs `SHARPI_CPU_MOE=1`: 30 GDN + 10 attn + shared expert on GPU, routed experts CPU mmap. 100% acceptance |
+| CPU `--no-thinking` | 9.1 | **8.5** | GDN/attn + 256-expert MoE + MTP head (#44). 100% acceptance; MoE-MTP batched verify (#45) — routed experts sequential per token, so ~MTP-off parity |
+
+#### Qwen3.6-27B-MTP (GDN) — [unsloth](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) · 16 GB (Q4_K_M) / 19 GB (Q5_K_M)
+
+```bash
+sharpi-cli -m models/Qwen3.6-27B-MTP-Q4_K_M.gguf -g -1 \
+  --temp 0 --no-thinking -p "Explain the CAP theorem"
+```
+
+| Backend | Size | Prefill t/s | Decode t/s | Notes |
+|---|---:|---:|---:|---|
+| **CUDA** `-g -1 --no-thinking` (hybrid) | 16 GB | **7.3** | **10.4** | 22/64 dense FFN on GPU + GDN/attn KV resident, rest CPU mmap. 90% acceptance; folded k-token batched verify + GDN snapshot ring — **1.68× over MTP-off (6.4)** |
+| **CUDA** `-g -1 --no-thinking` `Q5_K_M` (hybrid) | 19 GB | 5.9 | **5.5** | 13/64 FFN on GPU, 51/64 CPU mmap. 98% acceptance; batched trunk (#119) bit-identical |
+| CPU `--no-thinking` | 16 GB | 3.0 | **3.6** | dense 27B GDN/attn + native MTP head; auto MTP self-spec (#25) at greedy + `--no-thinking`. 90% draft acceptance; folded k-token batched verify (#30/#207) — 1.2× over MTP-off (3.0) |
+| CPU `--no-thinking` `Q5_K_M` | 19 GB | 2.8 | **3.5** | ~10% slower than Q4_K_M; 100% acceptance |
+
+#### Llama-4 Scout 17B-16E (MoE) — [meta-llama](https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct) · 61 GB
+
+```bash
+# split GGUF — point -m at shard 1; CPU-only wins on a 12 GB card (drop -g)
+sharpi-cli -m models/Llama-4-Scout-17B-16E-Instruct-Q4_K_M-00001-of-00002.gguf \
+  --temp 0.6 --top-p 0.9 -p "Summarize the plot of Hamlet"
+```
+
+| Backend | Prefill t/s | Decode t/s | Notes |
+|---|---:|---:|---|
+| CPU | 2.1 | 4.3 | 48 layers, 17B active; split GGUF (not on bench machine) |
+| CUDA `-g -1` (hybrid) | 1.2 | 2.6 | 7 GPU + 41 CPU layers — model dwarfs the 12 GB card so CPU-only wins; per-expert SLRU streaming (#72/#77) still lifts both (not on bench machine) |
 
 _Re-measured 2026-06 from warm sweeps (prefill ~1K ctx, decode near-zero ctx), each after a discarded
 warm-up. Vulkan rows are ~35% below their prior numbers — an unexplained regression (CUDA improved on the
