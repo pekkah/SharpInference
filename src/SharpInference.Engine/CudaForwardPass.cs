@@ -3501,7 +3501,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     }
 
     /// <summary>
-    /// Ragged batched decode (issue #190): one token per sequence, each at its own position
+    /// Ragged batched decode trunk (issue #190): one token per sequence, each at its own position
     /// against its own per-sequence cache, with the dense weight reads amortized N× across
     /// the batch. This is a TRUE batched pass — it issues direct launches and never replays
     /// the per-token CUDA graph (which would bake in owned-cache pointers). It adapts the
@@ -3511,28 +3511,32 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     /// batched O-proj + batched FFN} → per-row final norm + one batched output GEMM. The
     /// per-sequence attention block mirrors the dense <see cref="RunDeviceRegion"/> ordering
     /// exactly (QK-norm before RoPE, #157), so it is argmax-stable vs the single-user loop.
+    ///
+    /// <para>Leaves the [N×vocab] logits in <see cref="_decodeLogitsAll"/> on the stream (not
+    /// downloaded/synced) and does NOT advance cache lengths — the caller's tail does both:
+    /// <see cref="BatchForwardMulti"/> downloads + splits the full logits, while
+    /// <see cref="BatchForwardMultiArgmax"/> runs the on-device argmax (#205/#206 follow-up).</para>
     /// </summary>
     /// <param name="allowDecodeMmq">When true (multi-user continuous-batching decode) the big
     /// Q4_K matmuls may use the #201/#206 argmax-stable decode MMQ tile (default-on, the
     /// +11–28% win); when false (the spec-decode <see cref="BatchVerify"/> wrapper) they stay on
     /// the bit-exact WS path so greedy spec-decode output is byte-stable. SHARPI_BATCH_DECODE_MMQ
     /// =0/1 overrides both to off/on everywhere.</param>
-    internal float[][] BatchForwardMulti(int[] tokens, int[] positions, CudaSequenceKvCache[] caches,
-                                         bool allowDecodeMmq = true)
+    private void RunBatchedTrunk(int[] tokens, int[] positions, CudaSequenceKvCache[] caches,
+                                 bool allowDecodeMmq)
     {
         ArgumentNullException.ThrowIfNull(tokens);
         ArgumentNullException.ThrowIfNull(positions);
         ArgumentNullException.ThrowIfNull(caches);
         ThrowIfBatchingUnsupported(decodeOnly: true);
         int N = tokens.Length;
-        if (N == 0) return Array.Empty<float[]>();
+        if (N == 0) return;
         if (positions.Length != N || caches.Length != N)
             throw new ArgumentException("tokens/positions/caches lengths must match.");
 
         int embDim = _embDim;
         int qDim = _numHeads * _headDim;
         int kvDim = _numKvHeads * _headDim;
-        int vocab = _hp.VocabSize;
 
         EnsureBatchedTrunkScratch(N);
         EnsureDecodeLogits(N);
@@ -3711,20 +3715,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
             //    single matmul, so amortizing its read across N is the main throughput win).
             _gpu.RmsNormBatched(_bpHidden!, _bpHidden!, _wOutputNorm, N, embDim, _hp.RmsNormEps);
             BatchDecodeMatMul(_decodeLogitsAll!, _wOutput, _bpHidden!, N, allowDecodeMmq);
-            _gpu.Download(_decodeLogitsAll!, _decodeLogitsHost.AsSpan(0, N * vocab));
-            _gpu.Synchronize();
-
-            var result = new float[N][];
-            for (int n = 0; n < N; n++)
-            {
-                result[n] = new float[vocab];
-                Array.Copy(_decodeLogitsHost!, (long)n * vocab, result[n], 0, vocab);
-                // Advance each sequence's logical length now that the append + attention for
-                // this token have completed and synchronized (transactional: a mid-pass throw
-                // leaves Length untouched).
-                caches[n].Length = positions[n] + 1;
-            }
-            return result;
+            // Logits are now in _decodeLogitsAll on the stream (NOT yet downloaded/synced). The
+            // caller's tail completes the pass: BatchForwardMulti downloads + splits the full
+            // N×vocab logits, while BatchForwardMultiArgmax runs the on-device argmax and copies
+            // back only rows*8 bytes (#205/#206 follow-up). Each tail advances caches[n].Length
+            // after its download synchronizes (transactional: a mid-pass throw leaves it untouched).
         }
         finally
         {
@@ -3739,6 +3734,63 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
             }
         }
     }
+
+    /// <summary>Ragged batched decode returning the full per-sequence next-token logits
+    /// (issue #190). Runs the <see cref="RunBatchedTrunk"/> then downloads + splits the
+    /// [N×vocab] logits.</summary>
+    /// <param name="allowDecodeMmq">See <see cref="RunBatchedTrunk"/>.</param>
+    internal float[][] BatchForwardMulti(int[] tokens, int[] positions, CudaSequenceKvCache[] caches,
+                                         bool allowDecodeMmq = true)
+    {
+        RunBatchedTrunk(tokens, positions, caches, allowDecodeMmq);
+        int N = tokens.Length;
+        if (N == 0) return Array.Empty<float[]>();
+        int vocab = _hp.VocabSize;
+
+        _gpu.Download(_decodeLogitsAll!, _decodeLogitsHost.AsSpan(0, N * vocab));
+        _gpu.Synchronize();
+
+        var result = new float[N][];
+        for (int n = 0; n < N; n++)
+        {
+            result[n] = new float[vocab];
+            Array.Copy(_decodeLogitsHost!, (long)n * vocab, result[n], 0, vocab);
+            // Advance each sequence's logical length now that the append + attention for this
+            // token have completed and synchronized (transactional: a mid-pass throw above
+            // leaves Length untouched).
+            caches[n].Length = positions[n] + 1;
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Greedy counterpart of <see cref="BatchForwardMulti"/> (#205/#206 follow-up): runs the same
+    /// trunk, then computes the per-sequence argmax ON-DEVICE (<see cref="CudaBackend.ArgmaxRows"/>,
+    /// the #219 kernel) and copies back only rows*8 bytes — eliminating the full N×vocab logits
+    /// D2H (4.86 MB at N=8 / vocab 151936), the host buffer copy, and the N per-row allocations.
+    /// The argmax is bit-exact to a host scan of the same <see cref="_decodeLogitsAll"/> with
+    /// lowest-index tie-break (matches <c>Sampler.Greedy</c>), so greedy output is identical to
+    /// taking <c>Argmax</c> over <see cref="BatchForwardMulti"/>'s logits. Valid only when every
+    /// sequence is greedy — the engine gates on <see cref="SupportsBatchedGpuArgmax"/>.
+    /// </summary>
+    internal (int Token, float Logit)[] BatchForwardMultiArgmax(
+        int[] tokens, int[] positions, CudaSequenceKvCache[] caches)
+    {
+        RunBatchedTrunk(tokens, positions, caches, allowDecodeMmq: true);
+        int N = tokens.Length;
+        if (N == 0) return Array.Empty<(int, float)>();
+
+        // rows*8-byte D2H (index+value per row) with its own internal sync — completes the pass.
+        var am = _gpu.ArgmaxRows(_decodeLogitsAll!, N, _hp.VocabSize, _hp.VocabSize);
+        for (int n = 0; n < N; n++)
+            caches[n].Length = positions[n] + 1;
+        return am;
+    }
+
+    /// <summary>#205/#206: the batched greedy-argmax tail elides the full logits download when the
+    /// on-device argmax kernel is enabled (mirrors <see cref="SupportsGpuArgmax"/>; the profiling
+    /// variants keep the full download so their region timings stay meaningful).</summary>
+    public bool SupportsBatchedGpuArgmax => _gpu.GpuArgmaxEnabled && !s_profile && !s_regionProfile;
 
     // ── Speculative-decode batched verify (issue #207) ──────────────────────────────────
 
@@ -3913,6 +3965,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
 
     float[][] IBatchedForwardPass.BatchForwardMulti(int[] tokens, int[] positions, ISequenceKvCache[] caches)
         => BatchForwardMulti(tokens, positions, Cast(caches));
+
+    (int Token, float Logit)[] IBatchedForwardPass.BatchForwardMultiArgmax(
+        int[] tokens, int[] positions, ISequenceKvCache[] caches)
+        => BatchForwardMultiArgmax(tokens, positions, Cast(caches));
 
     private static CudaSequenceKvCache[] Cast(ISequenceKvCache[] caches)
     {

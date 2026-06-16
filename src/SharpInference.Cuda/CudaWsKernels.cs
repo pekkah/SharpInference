@@ -49,16 +49,33 @@ internal static class CudaWsKernels
     internal static readonly int[] Variants = [2, 4, 8, 16];
 
     /// <summary>All weight-stationary kernels (one instantiation per variant) plus the
-    /// once-only #201 decode-MMQ kernel.</summary>
+    /// #201/#205 decode-MMQ kernel at both row-tile sizes (BM=64 default, BM=32 for
+    /// grid-starved low-row shapes).</summary>
     public static string Source { get; } = Build();
 
     private static string Build()
     {
-        var sb = new System.Text.StringBuilder(Template.Length * Variants.Length + DecodeMmq.Length);
+        var sb = new System.Text.StringBuilder(Template.Length * Variants.Length + DecodeMmqTemplate.Length * 2);
         foreach (int nt in Variants)
             sb.Append(Template.Replace("__NT__", nt.ToString(System.Globalization.CultureInfo.InvariantCulture)));
-        sb.Append(DecodeMmq);
+        // Decode MMQ, two row-tile sizes (#205). BM/16 row-strips: BM=64 → wr = warp & 3,
+        // wc = warp >> 2; BM=32 → wr = warp & 1, wc = warp >> 1. Quant staging is 8 iters
+        // either way (MMQ_BM*32 == 8*threads); act staging is (16*64)/threads = 4 / 8 iters.
+        sb.Append(EmitDecodeMmq(bm: 64, threads: 256, actJ: 4, wrMask: 3, wcShift: 2, suffix: ""));
+        sb.Append(EmitDecodeMmq(bm: 32, threads: 128, actJ: 8, wrMask: 1, wcShift: 1, suffix: "_bm32"));
         return sb.ToString();
+    }
+
+    private static string EmitDecodeMmq(int bm, int threads, int actJ, int wrMask, int wcShift, string suffix)
+    {
+        static string S(int v) => v.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return DecodeMmqTemplate
+            .Replace("__BM__", S(bm))
+            .Replace("__NTHREADS__", S(threads))
+            .Replace("__ACTJ__", S(actJ))
+            .Replace("__WRMASK__", S(wrMask))
+            .Replace("__WCSHIFT__", S(wcShift))
+            .Replace("__SUF__", suffix);
     }
 
     private const string Template = @"
@@ -745,13 +762,21 @@ extern ""C"" __global__ void llm_matvec_q6k_ws_sw_n__NT__(
     /// while the m16n8k32 int8 mma replaces the per-token dp4a chains. Identical
     /// K-order accumulation and {d,s} fixup math to the prefill kernel — only the
     /// tile shape changes (one n-tile per warp, scalar acc0..3 instead of acc[8][4]).
+    ///
+    /// <para><b>#205:</b> emitted at two row-tile sizes from one template. BM=64 (256
+    /// threads, 8 warps) is the default. BM=32 (<c>_bm32</c>, 128 threads, 4 warps)
+    /// doubles the grid to ceil(rows/32) blocks — the dispatcher routes the grid-starved
+    /// low-row shapes (Q/O proj, the Q4_K ffn_down half: rows≈4096 → only 64 blocks on a
+    /// 60-SM card) there so they fill ≥2 waves instead of stalling at ~1. Output is
+    /// bit-identical to BM=64 (same fragments / mma / accumulation order; only the
+    /// block→row mapping changes), so both share the argmax-stable oracle.</para>
     /// </summary>
-    private const string DecodeMmq = @"
-// ── #201 decode MMQ: Q4_K SoA weights × SoA Q8_1 activations, BN=16 ─────────
-// grid = (ceil(rows/64), ceil(n_tok/16)), block = 256 (8 warps: 4 row-strips ×
-// 2 token-strips). The K-step is one 256-element SUPER-block: the block stages
-// the raw tile (64×32 quant words + 64 scale tails + 16×64 act words + 16×8
-// act {d,s}) with linear fully-coalesced copies, then runs 8 m16n8k32 s8 mma
+    private const string DecodeMmqTemplate = @"
+// ── #201/#205 decode MMQ: Q4_K SoA weights × SoA Q8_1 activations, BN=16 ─────
+// grid = (ceil(rows/MMQ_BM), ceil(n_tok/16)), block = __NTHREADS__ ((MMQ_BM/16)
+// row-strips × 2 token-strips). The K-step is one 256-element SUPER-block: the
+// block stages the raw tile (MMQ_BM×32 quant words + scale tails + 16×64 act
+// words + 16×8 act {d,s}) with linear fully-coalesced copies, then runs 8 m16n8k32 s8 mma
 // per warp between one barrier pair — nibble/scale decode happens at
 // fragment-read time from shared. A sub-block-sized K-step (one mma per
 // barrier pair) was measured 1.4-1.7× SLOWER than the WS matvec it replaces:
@@ -760,9 +785,9 @@ extern ""C"" __global__ void llm_matvec_q6k_ws_sw_n__NT__(
 // issues ~14 independent loads per thread per epoch and amortizes it 8×.
 // Argmax-stable, not bit-exact: both operands int8-quantized, min-bias via the
 // fp16 s = d·Σq field (same contract and K-order as the prefill MMQ).
-#define MMQ_BM 64
+#define MMQ_BM __BM__
 #define MMQ_BN 16
-extern ""C"" __global__ void __launch_bounds__(256) llm_mmq_q4k_soa_acts_n16(
+extern ""C"" __global__ void __launch_bounds__(__NTHREADS__) llm_mmq_q4k_soa_acts_n16__SUF__(
     const unsigned int*  __restrict__ weights,   // SoA [Q][S][D]
     const unsigned int*  __restrict__ y_qs,      // SoA Q8_1 quants [n_tok × sub_total × 32 B]
     const unsigned int*  __restrict__ y_ds,      // SoA Q8_1 scales [n_tok × sub_total] {d,s}
@@ -792,8 +817,8 @@ extern ""C"" __global__ void __launch_bounds__(256) llm_mmq_q4k_soa_acts_n16(
     int lane = tid & 31;
     int grp  = lane >> 2;
     int tig  = lane & 3;
-    int wr   = warp & 3;
-    int wc   = warp >> 2;
+    int wr   = warp & __WRMASK__;
+    int wc   = warp >> __WCSHIFT__;
     int mrow0 = wr * 16;
     int ncol0 = wc * 8;
 
@@ -809,7 +834,7 @@ extern ""C"" __global__ void __launch_bounds__(256) llm_mmq_q4k_soa_acts_n16(
         // 128-B-coalesced in global (one row / token segment per warp-instruction).
         #pragma unroll
         for (int j = 0; j < 8; j++) {            // 64 rows × 32 quant words
-            int k = tid + j * 256;
+            int k = tid + j * __NTHREADS__;
             int r = row_block + (k >> 5);
             sWq[(k >> 5) * 33 + (k & 31)] =
                 (r < rows) ? qReg[((long)r * nb_super + ksb) * 32L + (k & 31)] : 0u;
@@ -825,8 +850,8 @@ extern ""C"" __global__ void __launch_bounds__(256) llm_mmq_q4k_soa_acts_n16(
             sWd[tid] = (r < rows) ? dReg[(long)r * nb_super + ksb] : 0u;
         }
         #pragma unroll
-        for (int j = 0; j < 4; j++) {            // 16 tokens × 64 act words (256 B)
-            int k = tid + j * 256;
+        for (int j = 0; j < __ACTJ__; j++) {     // 16 tokens × 64 act words (256 B)
+            int k = tid + j * __NTHREADS__;
             int t = tok_block + (k >> 6);
             sYq[(k >> 6) * 65 + (k & 63)] =
                 (t < n_tok) ? y_qs[((long)t * sub_total + ksb * 8) * 8L + (k & 63)] : 0u;

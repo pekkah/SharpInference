@@ -131,21 +131,41 @@ public sealed class CudaBatchedDecodeBench
                     poss[s] = Prompt.Length;
                 }
 
+                // #205/#206: SHARPI_BENCH_ARGMAX=1 measures the on-device argmax tail
+                // (BatchForwardMultiArgmax — rows*8-byte D2H instead of the full N×vocab download).
+                // All sequences here are greedy, so this is the all-greedy upper bound of the win.
+                bool useArgmax = Environment.GetEnvironmentVariable("SHARPI_BENCH_ARGMAX") == "1";
                 for (int i = 0; i < warmup; i++)
                 {
-                    var lg = fwd.BatchForwardMulti(toks, poss, caches);
-                    for (int s = 0; s < n; s++) { toks[s] = Argmax(lg[s]); poss[s]++; }
+                    if (useArgmax)
+                    {
+                        var am = fwd.BatchForwardMultiArgmax(toks, poss, caches);
+                        for (int s = 0; s < n; s++) { toks[s] = am[s].Token; poss[s]++; }
+                    }
+                    else
+                    {
+                        var lg = fwd.BatchForwardMulti(toks, poss, caches);
+                        for (int s = 0; s < n; s++) { toks[s] = Argmax(lg[s]); poss[s]++; }
+                    }
                 }
                 var sw2 = Stopwatch.StartNew();
                 for (int i = 0; i < decodeSteps; i++)
                 {
-                    var lg = fwd.BatchForwardMulti(toks, poss, caches);
-                    for (int s = 0; s < n; s++) { toks[s] = Argmax(lg[s]); poss[s]++; }
+                    if (useArgmax)
+                    {
+                        var am = fwd.BatchForwardMultiArgmax(toks, poss, caches);
+                        for (int s = 0; s < n; s++) { toks[s] = am[s].Token; poss[s]++; }
+                    }
+                    else
+                    {
+                        var lg = fwd.BatchForwardMulti(toks, poss, caches);
+                        for (int s = 0; s < n; s++) { toks[s] = Argmax(lg[s]); poss[s]++; }
+                    }
                 }
                 sw2.Stop();
                 double aggTps = (double)n * decodeSteps / sw2.Elapsed.TotalSeconds;
                 double perSeq = (double)decodeSteps / sw2.Elapsed.TotalSeconds;
-                Log($"[bench-190] batched N={n}: aggregate {aggTps:F1} t/s ({perSeq:F1} t/s/seq), " +
+                Log($"[bench-190] batched N={n}{(useArgmax ? " [argmax]" : "")}: aggregate {aggTps:F1} t/s ({perSeq:F1} t/s/seq), " +
                     $"{aggTps / singleTps:F2}× single-user");
             }
             finally

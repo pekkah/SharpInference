@@ -312,6 +312,64 @@ public sealed class CudaBatchForwardMultiTests
     }
 
     /// <summary>
+    /// #205/#206: the on-device greedy argmax tail (<see cref="CudaForwardPass.BatchForwardMultiArgmax"/>,
+    /// reusing the #219 <c>ArgmaxRows</c> kernel) must return exactly what a host argmax of the full
+    /// <see cref="CudaForwardPass.BatchForwardMulti"/> logits would — the whole point is to elide the
+    /// N×vocab download without changing the greedy token. Run a batched step both ways on two
+    /// identically-prefilled cache sets (the trunk is deterministic, so their logits are bit-identical)
+    /// at N=6 (so the decode MMQ engages) and assert, per sequence, the argmax token equals the host
+    /// Argmax of the full logits AND the returned logit equals that row's value at that token.
+    /// </summary>
+    [Fact]
+    public void Qwen3_8B_BatchForwardMultiArgmax_MatchesBatchForwardMulti_N6()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        using var fwd = NewFwd(model, gpu, hp);
+
+        const int N = 6;
+        int[][] prompts = { PromptA, PromptB };
+        var cachesFull = new CudaSequenceKvCache[N];
+        var cachesArg = new CudaSequenceKvCache[N];
+        try
+        {
+            var toks = new int[N];
+            var poss = new int[N];
+            for (int i = 0; i < N; i++)
+            {
+                int[] p = i < 3 ? prompts[0] : prompts[1];
+                cachesFull[i] = fwd.CreateCache();
+                cachesArg[i] = fwd.CreateCache();
+                int t = Argmax(fwd.PrefillWithCache(p, cachesFull[i]));
+                fwd.PrefillWithCache(p, cachesArg[i]);   // identical prefill into the second set
+                toks[i] = t;
+                poss[i] = p.Length;
+            }
+
+            var full = fwd.BatchForwardMulti(toks, poss, cachesFull);
+            var am = fwd.BatchForwardMultiArgmax(toks, poss, cachesArg);
+
+            Assert.Equal(N, am.Length);
+            for (int i = 0; i < N; i++)
+            {
+                int hostArg = Argmax(full[i]);
+                Assert.Equal(hostArg, am[i].Token);
+                Assert.Equal(full[i][am[i].Token], am[i].Logit);
+            }
+        }
+        finally
+        {
+            foreach (var c in cachesFull) c?.Dispose();
+            foreach (var c in cachesArg) c?.Dispose();
+        }
+    }
+
+    /// <summary>
     /// A second batched decode step (positions advance by one) must still track the single-user
     /// continuation — catches a per-sequence cache-append / position-indexing bug that a single
     /// decode step would miss (the first step's KV is reused, a second token is appended).

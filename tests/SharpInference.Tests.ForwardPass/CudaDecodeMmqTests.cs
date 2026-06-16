@@ -102,10 +102,13 @@ public sealed unsafe class CudaDecodeMmqTests
         using var gpu = TryCreate();
         if (gpu is null) return;
 
-        // rows ≥ 2048 (eligible) with non-multiple-of-64 coverage via the second case;
-        // batch sizes cover partial token tiles (2, 5, 11), the full tile (16), and the
-        // grid.y = 2 round-up (17).
-        foreach ((int rows, int cols) in new[] { (2048, 512), (2112, 256) })
+        // rows ≥ 2048 (eligible). #205: the dispatcher routes low-row shapes
+        // (ceil(rows/64) < 2·SM) to the BM=32 tile and high-row shapes to BM=64, so the
+        // cases span both kernels on a ≤64-SM card: 2048 (BM=32, no tail), 2096 (BM=32 with
+        // a non-multiple-of-32 row tail + non-multiple-of-64), 8192 (BM=64). Both tiles are
+        // bit-identical and tracked against the same fp32 CPU reference. Batch sizes cover
+        // partial token tiles (2, 5, 11), the full tile (16), and the grid.y = 2 round-up (17).
+        foreach ((int rows, int cols) in new[] { (2048, 512), (2096, 256), (8192, 512) })
         {
             var rng = new Random(20260610 + rows * 13 + cols * 5);
             byte[] weightBytes = BuildQ4KMatrix(rows, cols, rng);

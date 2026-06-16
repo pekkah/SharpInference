@@ -192,4 +192,6 @@ internal static partial class CuBlasInterop
     // cudaDeviceAttr: compute capability
     internal const int CudaDevAttrComputeCapabilityMajor = 75;
     internal const int CudaDevAttrComputeCapabilityMinor = 76;
+    // cudaDeviceAttr: number of SMs (cudaDevAttrMultiProcessorCount)
+    internal const int CudaDevAttrMultiProcessorCount = 16;
 }
