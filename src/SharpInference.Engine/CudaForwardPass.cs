@@ -455,10 +455,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     //   unset → on for multi-user batched decode, off for spec-verify (default)
     //   "0"   → off everywhere (bit-exact kill-switch)
     //   "1"   → on everywhere incl. spec-verify (argmax-stable; perf A/B only)
-    private readonly string? _batchDecodeMmqEnv =
-        Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_MMQ");
-    private bool BatchDecodeMmqKill => _batchDecodeMmqEnv == "0";
-    private bool BatchDecodeMmqForceAll => _batchDecodeMmqEnv == "1";
+    // Parsed once at construction — BatchDecodeMatMul reads these per matmul per layer per step.
+    private readonly bool _batchDecodeMmqKill =
+        Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_MMQ") == "0";
+    private readonly bool _batchDecodeMmqForceAll =
+        Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_MMQ") == "1";
 
     // Ragged-batched per-sequence attention ops (issue #197). Default on: the per-layer
     // QK-norm/RoPE/KV-append/attention launches collapse from O(N) per-sequence calls
@@ -3491,7 +3492,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     {
         if (_batchDecodeComputeBound)
             GpuMatMulBatchedCore(outAll, weights, inAll, n);
-        else if (!BatchDecodeMmqKill && (allowMmq || BatchDecodeMmqForceAll))
+        else if (!_batchDecodeMmqKill && (allowMmq || _batchDecodeMmqForceAll))
             _gpu.MatMulBatchedDecodeMmq(outAll, weights, inAll, n, WDType(weights));
         else if (_batchDecodeWeightStationary)
             _gpu.MatMulBatchedWeightStationary(outAll, weights, inAll, n, WDType(weights));
