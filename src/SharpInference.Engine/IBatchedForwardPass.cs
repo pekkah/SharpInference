@@ -48,6 +48,25 @@ public interface IBatchedForwardPass
     float[][] BatchForwardMulti(int[] tokens, int[] positions, ISequenceKvCache[] caches);
 
     /// <summary>
+    /// Whether <see cref="BatchForwardMultiArgmax"/> avoids the full per-row logits download by
+    /// running the greedy argmax on-device (mirrors <see cref="IForwardPass.SupportsGpuArgmax"/>,
+    /// issue #219). Default false — backends without a GPU tail to elide use the full path.
+    /// </summary>
+    bool SupportsBatchedGpuArgmax => false;
+
+    /// <summary>
+    /// Greedy counterpart of <see cref="BatchForwardMulti"/>: returns only the per-sequence
+    /// (argmax token, its logit) instead of the full N×vocab logits — a rows*8-byte device→host
+    /// copy in place of the N×vocab download + host split (issue #205/#206 follow-up). Valid only
+    /// when <see cref="SupportsBatchedGpuArgmax"/> and every sequence in the batch is greedy
+    /// (temp ≤ 0, no forced-token override); the caller gates on those before invoking. Default
+    /// throws — callers must check <see cref="SupportsBatchedGpuArgmax"/> first.
+    /// </summary>
+    (int Token, float Logit)[] BatchForwardMultiArgmax(int[] tokens, int[] positions, ISequenceKvCache[] caches) =>
+        throw new NotSupportedException(
+            $"{GetType().Name} does not implement BatchForwardMultiArgmax. Check SupportsBatchedGpuArgmax first.");
+
+    /// <summary>
     /// Whether SnapKV prefill eviction is configured. The engine disables chunked/packed prefill
     /// when true (SnapKV scoring only runs on a fresh full-prompt prefill).
     /// </summary>

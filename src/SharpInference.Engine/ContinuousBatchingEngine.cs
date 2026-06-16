@@ -296,9 +296,26 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                 cacheBuf[i] = active[i].Cache;
             }
 
-            // Batched decode step (shares weight reads across N sequences)
-            float[][] logitsBatch = _fwd.BatchForwardMulti(
-                tokensBuf[..n], posBuf[..n], cacheBuf[..n]);
+            // Batched decode step (shares weight reads across N sequences). When EVERY active
+            // sequence is plain greedy this step (temp ≤ 0, not force-closing </think>), take the
+            // on-device argmax tail (#205/#206): it returns just the per-seq (token, logit) and
+            // skips the full N×vocab logits D2H + host split. A single sampled or force-closing
+            // seq reverts the whole step to the full-logits path (the argmax buffer can't sample).
+            bool allGreedy = _fwd.SupportsBatchedGpuArgmax;
+            for (int i = 0; i < n && allGreedy; i++)
+            {
+                var s = active[i];
+                bool forcedClose = _thinkingEnabled && s.InThinking && s.Sp.MaxThinkingTokens > 0
+                                   && s.ThinkingCount >= s.Sp.MaxThinkingTokens && _endThinkTokenId > 0;
+                if (s.Sp.Temperature > 0f || forcedClose) allGreedy = false;
+            }
+
+            float[][]? logitsBatch = null;
+            (int Token, float Logit)[]? argmaxBatch = null;
+            if (allGreedy)
+                argmaxBatch = _fwd.BatchForwardMultiArgmax(tokensBuf[..n], posBuf[..n], cacheBuf[..n]);
+            else
+                logitsBatch = _fwd.BatchForwardMulti(tokensBuf[..n], posBuf[..n], cacheBuf[..n]);
 
             // Process results in reverse order so RemoveAt indices stay valid
             for (int i = n - 1; i >= 0; i--)
@@ -310,7 +327,13 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                 // boundary branch below and is fed back as the next CurrentToken so the
                 // model continues from its post-think state on the next batched step.
                 int next;
-                if (_thinkingEnabled && seq.InThinking && seq.Sp.MaxThinkingTokens > 0
+                if (argmaxBatch is not null)
+                {
+                    // All-greedy fast path: the on-device argmax already picked each token (the
+                    // gate above excluded any sampled / force-closing seq from this branch).
+                    next = argmaxBatch[i].Token;
+                }
+                else if (_thinkingEnabled && seq.InThinking && seq.Sp.MaxThinkingTokens > 0
                     && seq.ThinkingCount >= seq.Sp.MaxThinkingTokens && _endThinkTokenId > 0)
                 {
                     next = _endThinkTokenId;
@@ -318,8 +341,8 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                 else
                 {
                     next = seq.Sp.Temperature <= 0f
-                        ? Sampler.Greedy(logitsBatch[i])
-                        : Sampler.Sample(logitsBatch[i], seq.Sp, seq.Rng);
+                        ? Sampler.Greedy(logitsBatch![i])
+                        : Sampler.Sample(logitsBatch![i], seq.Sp, seq.Rng);
                 }
 
                 bool done = seq.StopIds.Contains(next)
