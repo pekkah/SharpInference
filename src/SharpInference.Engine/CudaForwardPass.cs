@@ -830,6 +830,25 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
             // isn't wired here yet (#179). Don't auto-enable eviction on top.
             _snapKvEffectiveBudget = 0;
         }
+        else if (MultiSlotPrefixRequested())
+        {
+            // Issue #212: the operator opted into the multi-slot prefix cache
+            // (SHARPI_PREFIX_SLOTS=2), which keeps a long prefix resident for cross-request
+            // reuse — the opposite of SnapKV's prefill eviction, and incompatible with its
+            // compaction (which discards prefix positions and reindexes the cache so logical
+            // position != physical slot). For the agentic workload #212 targets (a huge system
+            // prefix re-sent every turn) prefix reuse beats SnapKV's memory savings, so let the
+            // multi-slot request suppress the SnapKV AUTO-enable; SupportsMultiSlotPrefix can
+            // then see budget==0 and engage. An explicit SHARPI_SNAPKV_BUDGET>0 still wins above
+            // (IsBudgetExplicit) and keeps SnapKV (with multi-slot disabled). Memory-safe: auto
+            // context sizes _maxSeqLen to fit a full KV cache, so dropping the auto-compaction
+            // can't OOM the base cache (the bounded scratch slot has its own OOM fallback).
+            _snapKvEffectiveBudget = 0;
+            Console.Error.WriteLine(
+                "[CudaForwardPass] SnapKV auto-enable suppressed for the multi-slot prefix cache " +
+                "(SHARPI_PREFIX_SLOTS=2, issue #212). Set an explicit SHARPI_SNAPKV_BUDGET>0 to " +
+                "use SnapKV instead (disables multi-slot).");
+        }
         else
         {
             long fullCacheBytes = (long)_hp.NumLayers * _maxSeqLen
@@ -3521,6 +3540,17 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
 
     /// <inheritdoc/>
     public bool SupportsMultiSlotPrefix => _snapKvEffectiveBudget == 0 && DenseBatchedDecodeSupported();
+
+    /// <summary>
+    /// Issue #212: whether the operator requested the multi-slot prefix cache via
+    /// <c>SHARPI_PREFIX_SLOTS=2</c>. Read in the constructor so the SnapKV auto-enable can defer
+    /// to it (the two are mutually exclusive — SnapKV compaction destroys the positional cache
+    /// invariant prefix reuse relies on). Mirrors the engine's own parse of the same var.
+    /// </summary>
+    private static bool MultiSlotPrefixRequested() =>
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPI_PREFIX_SLOTS"),
+            System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture, out int s) && s == 2;
 
     /// <inheritdoc/>
     public ISequenceKvCache OwnedSlot
