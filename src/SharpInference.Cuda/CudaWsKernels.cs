@@ -342,7 +342,7 @@ extern ""C"" __global__ void llm_matvec_q6k_ws_soa_n__NT__(
         long g = (long)row * num_blocks + block;
         const signed char* q = qReg + g * 256L;
         const signed char* s = sReg + g * 16L;
-        unsigned int dbits = (unsigned int)dReg[g * 4L] | ((unsigned int)dReg[g * 4L + 1] << 8);
+        unsigned int dbits = (unsigned int)(*(const unsigned short*)(dReg + g * 4L));   // #204 review: dReg 16-B aligned, g*4 aligned → single 16-bit d load
         float d = sharpi_fp16_to_fp32(dbits);
 
         float sc0 = d * (float)s[ 0 + isc];
