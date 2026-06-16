@@ -217,6 +217,101 @@ public sealed class CudaBatchForwardMultiTests
     }
 
     /// <summary>
+    /// #206 oracle for the decode MMQ at its real engagement size. The #201 tile only
+    /// dispatches at N≥5 (below that <see cref="CudaForwardPass.BatchForwardMulti"/> falls back
+    /// to the bit-exact WS matvecs per tensor), so the N=2 oracle above never actually runs the
+    /// int8 mma kernel — this one does. N=6 (3×PromptA, 3×PromptB) with SHARPI_BATCH_DECODE_MMQ=1
+    /// so every ≥2048-row Q4_K matmul (Q/O proj, gate/up, the Q4_K ffn_down half, lm-head) takes
+    /// the MMQ path, asserting each sequence reproduces its prompt's single-user argmax/top-5
+    /// across TWO decode steps — argmax-stable (not bit-exact), the contract #206 ships
+    /// default-on for multi-user serving. The second step also exercises the per-sequence KV
+    /// append / position indexing on the MMQ path.
+    /// </summary>
+    [Fact]
+    public void Qwen3_8B_BatchForwardMulti_DecodeMmq_N6_MatchesSingleUser()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+
+        var prevMmq = Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_MMQ");
+        Environment.SetEnvironmentVariable("SHARPI_BATCH_DECODE_MMQ", "1");
+        CudaForwardPass fwdTmp;
+        try { fwdTmp = NewFwd(model, gpu, hp); }
+        finally { Environment.SetEnvironmentVariable("SHARPI_BATCH_DECODE_MMQ", prevMmq); }
+        using var fwd = fwdTmp;
+
+        const int Steps = 2;
+        int[][] prompts = { PromptA, PromptB };
+
+        // Single-user reference per distinct prompt: prefill then Steps greedy decode logits,
+        // capturing the token fed at each step (the trajectory the batched run must reproduce).
+        var refLogits = new float[2][][];
+        var refToks = new int[2][];
+        for (int p = 0; p < 2; p++)
+        {
+            fwd.ResetCache();
+            int tok = Argmax(fwd.Prefill(prompts[p]));
+            refLogits[p] = new float[Steps][];
+            refToks[p] = new int[Steps];
+            for (int s = 0; s < Steps; s++)
+            {
+                refToks[p][s] = tok;
+                var lg = fwd.Forward(tok, prompts[p].Length + s).ToArray();
+                refLogits[p][s] = lg;
+                tok = Argmax(lg);
+            }
+        }
+
+        // Batched N=6: sequences 0-2 run PromptA, 3-5 run PromptB, each with its own cache.
+        const int N = 6;
+        var caches = new CudaSequenceKvCache[N];
+        var toks = new int[N];
+        var poss = new int[N];
+        var promptOf = new int[N];
+        try
+        {
+            for (int i = 0; i < N; i++)
+            {
+                int p = i < 3 ? 0 : 1;
+                promptOf[i] = p;
+                caches[i] = fwd.CreateCache();
+                toks[i] = Argmax(fwd.PrefillWithCache(prompts[p], caches[i]));
+                poss[i] = prompts[p].Length;
+            }
+
+            for (int s = 0; s < Steps; s++)
+            {
+                var batch = fwd.BatchForwardMulti(toks, poss, caches);
+                Assert.Equal(N, batch.Length);
+                for (int i = 0; i < N; i++)
+                {
+                    int p = promptOf[i];
+                    // Sanity: the token fed this step tracks the single-user trajectory (else the
+                    // sequences have diverged and the per-step logit comparison is meaningless).
+                    Assert.Equal(refToks[p][s], toks[i]);
+                    var (maxAbs, overlap) = Compare(refLogits[p][s], batch[i]);
+                    Assert.Equal(Argmax(refLogits[p][s]), Argmax(batch[i]));
+                    Assert.True(overlap >= 4,
+                        $"Seq {i} (prompt {p}) step {s}: MMQ top-5 overlaps single-user in only {overlap}/5 (maxAbs={maxAbs}).");
+                    Assert.True(maxAbs < 1.0f,
+                        $"Seq {i} (prompt {p}) step {s}: MMQ logits diverged beyond tolerance: maxAbs={maxAbs}.");
+                    toks[i] = Argmax(batch[i]);
+                    poss[i]++;
+                }
+            }
+        }
+        finally
+        {
+            foreach (var c in caches) c?.Dispose();
+        }
+    }
+
+    /// <summary>
     /// A second batched decode step (positions advance by one) must still track the single-user
     /// continuation — catches a per-sequence cache-append / position-indexing bug that a single
     /// decode step would miss (the first step's KV is reused, a second token is appended).
