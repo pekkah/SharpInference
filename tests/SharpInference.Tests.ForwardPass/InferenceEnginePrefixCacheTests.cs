@@ -413,6 +413,105 @@ public sealed class InferenceEnginePrefixCacheTests
         Assert.Equal(33, fwd.CaptureSnapshotCalls[0]);
     }
 
+    /// <summary>
+    /// Issue #212: with the 2-slot prefix cache enabled (SHARPI_PREFIX_SLOTS=2), a short
+    /// interleaved auxiliary request is served from the bounded scratch slot (slot 1) and does
+    /// NOT evict the long resident prefix in the owned slot (slot 0) — so the next long request
+    /// still reuses it. This is the exact agentic-client (Claude Code) pattern #212 targets.
+    /// Slot activations: long → owned, aux → scratch, long → owned; the second long reuses 48
+    /// (3-page-aligned) tokens of the first long's prefix.
+    /// </summary>
+    [Fact]
+    public async Task GenerateAsync_TwoSlot_ShortAuxRequestDoesNotEvictLongPrefix()
+    {
+        using var _ = new EnvScope(("SHARPI_PREFIX_SLOTS", "2"), ("SHARPI_PREFIX_SCRATCH_TOKENS", "48"));
+
+        var tokenizer = new InterleavedAgenticTokenizer();
+        var fwd = new MultiSlotForwardPass();
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock", thinkTokenId: -1, endThinkTokenId: -1);
+
+        Assert.True(engine.PrefixCacheEnabled);
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 1 };
+
+        await Drain(engine.GenerateAsync("long", sp));   // cold → owned slot 0
+        await Drain(engine.GenerateAsync("aux", sp));    // short, no match → scratch slot 1
+        await Drain(engine.GenerateAsync("long", sp));   // matches slot 0 → reuse
+
+        // The three requests bound owned, scratch, owned in order.
+        Assert.Equal([0, 1, 0], fwd.ActivatedIds);
+
+        // The aux turn never touched the owned slot: it was reset/prefilled exactly once (the
+        // first long turn), then truncated+prefilled for the third (reuse) turn — never by aux.
+        Assert.Equal(1, fwd.Owned.Resets);
+        Assert.Equal([(64, 0), (16, 48)], fwd.Owned.Prefills);
+        Assert.Contains(48, fwd.Owned.Truncates);
+
+        // The aux request lived entirely in the scratch slot.
+        Assert.Single(fwd.Scratch);
+        Assert.Equal([(16, 0)], fwd.Scratch[0].Prefills);
+
+        // Only the third turn reused a prefix (48 page-aligned tokens of the long prefix).
+        Assert.Equal(48, engine.PrefillTokensReused);
+    }
+
+    /// <summary>
+    /// Issue #212 contrast (the bug being fixed): with the default single-slot cache, the short
+    /// interleaved aux request overwrites the one resident sequence, so the next long request
+    /// finds no reusable prefix and re-prefills from scratch — 0 reuse.
+    /// </summary>
+    [Fact]
+    public async Task GenerateAsync_SingleSlot_ShortAuxRequestEvictsLongPrefix()
+    {
+        var tokenizer = new InterleavedAgenticTokenizer();
+        var fwd = new MultiSlotForwardPass();
+        // No SHARPI_PREFIX_SLOTS env → single-slot (default) behavior, even though fwd CAN do 2.
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock", thinkTokenId: -1, endThinkTokenId: -1);
+
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 1 };
+        await Drain(engine.GenerateAsync("long", sp));
+        await Drain(engine.GenerateAsync("aux", sp));
+        await Drain(engine.GenerateAsync("long", sp));
+
+        // Single-slot: the engine never binds a non-owned slot...
+        Assert.Empty(fwd.ActivatedIds);
+        // ...and the aux turn evicted the long prefix, so the second long turn reused nothing.
+        Assert.Equal(0, engine.PrefillTokensReused);
+    }
+
+    /// <summary>
+    /// Issue #212 (review follow-up): a scratch request that resets+overwrites its slot's KV but
+    /// fails mid-decode must NOT leave the slot's token shadow describing the destroyed KV — else
+    /// the next request could SelectSlot-match that stale prefix and TruncateTo into mismatched KV
+    /// (silent garbage). The engine nulls the active slot's shadow before mutating its KV and only
+    /// re-writes it on a complete decode, so the post-failure request reuses nothing.
+    /// </summary>
+    [Fact]
+    public async Task GenerateAsync_TwoSlot_ScratchFailedMidDecode_DoesNotReuseDestroyedPrefix()
+    {
+        using var _ = new EnvScope(("SHARPI_PREFIX_SLOTS", "2"), ("SHARPI_PREFIX_SCRATCH_TOKENS", "48"));
+
+        var tokenizer = new InterleavedAgenticTokenizer();
+        var fwd = new MultiSlotForwardPass { EmitNonStopFirst = true }; // force a decode Forward
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock", thinkTokenId: -1, endThinkTokenId: -1);
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 2 };
+
+        // B1: completes on the scratch slot; its transcript becomes scratch's shadow.
+        await Drain(engine.GenerateAsync("aux32", sp));
+
+        // B2: a disjoint short request resets the scratch KV, then throws mid-decode.
+        fwd.FailNextDecode = true;
+        await Assert.ThrowsAnyAsync<Exception>(async () => await Drain(engine.GenerateAsync("aux2", sp)));
+
+        long reusedBefore = engine.PrefillTokensReused;
+
+        // B3: same prompt as B1. If B2's failure had left the stale B1 shadow in place, B3 would
+        // reuse a 16-token page of it — into KV that B2 reset+overwrote. The shadow-null fix makes
+        // B3 reuse nothing.
+        await Drain(engine.GenerateAsync("aux32", sp));
+
+        Assert.Equal(reusedBefore, engine.PrefillTokensReused);
+    }
+
     private static IAsyncEnumerable<string> GenerateAsync(
         InferenceEngine engine, string prompt, string canonical, SamplingParams sp)
     {
@@ -862,6 +961,167 @@ public sealed class InferenceEnginePrefixCacheTests
             Array.Clear(_logits);
             _logits[Eos] = 1.0f;
             return _logits;
+        }
+    }
+
+    /// <summary>
+    /// Issue #212 tokenizer modelling the agentic interleave: a long stable request, a short
+    /// auxiliary request with disjoint tokens, then the long request again.
+    ///   "long" → [0..64)                 (64 tokens; the stable system-prefix-like sequence)
+    ///   "aux"  → [500..516)              (16 tokens; disjoint, no shared prefix with "long")
+    /// </summary>
+    private sealed class InterleavedAgenticTokenizer : ITokenizer
+    {
+        public int VocabSize => 600;
+        public int BosTokenId => 0;
+        public int EosTokenId => Eos;
+        public int UnknownTokenId => 0;
+        public int PadTokenId => Eos;
+        public bool AddBosToken => false;
+
+        public IReadOnlyList<int> Encode(string text) => text switch
+        {
+            "long"  => Enumerable.Range(0, 64).ToArray(),
+            "aux"   => Enumerable.Range(500, 16).ToArray(),
+            // 32-token (>1 page) scratch-sized prompts for the mid-decode-failure test, where a
+            // reusable prefix requires length > PageSize. "aux2" is disjoint from "aux32".
+            "aux32"  => Enumerable.Range(500, 32).ToArray(),
+            "aux2"   => Enumerable.Range(600, 32).ToArray(),
+            _       => throw new ArgumentException($"unknown prompt: {text}", nameof(text)),
+        };
+
+        public string Decode(IEnumerable<int> tokens) => string.Empty;
+        public byte[] DecodeBytes(int token) => [];
+    }
+
+    /// <summary>
+    /// Rewind-capable forward pass that ALSO implements <see cref="IMultiSlotKvCache"/> (issue
+    /// #212). Each <see cref="Slot"/> records the Prefill/TruncateTo/ResetCache calls routed to it
+    /// while it is the active (bound) slot, so a test can assert which slot served each request and
+    /// that a scratch-bound request never touched the owned slot. Slot 0 is the owned cache; each
+    /// <see cref="AllocateScratchSlot"/> hands out the next id.
+    /// </summary>
+    private sealed class MultiSlotForwardPass : IForwardPass, IMultiSlotKvCache
+    {
+        private readonly float[] _logits = new float[600];
+        private readonly Slot _owned = new(0);
+        private readonly List<Slot> _scratch = [];
+        private Slot _active;
+
+        public MultiSlotForwardPass() => _active = _owned;
+
+        public sealed class Slot(int id) : ISequenceKvCache
+        {
+            public int Id { get; } = id;
+            public int Length;
+            public int Capacity = int.MaxValue;
+            public List<(int Length, int StartPos)> Prefills { get; } = [];
+            public List<int> Truncates { get; } = [];
+            public int Resets;
+            public void Dispose() { }
+        }
+
+        public Slot Owned => _owned;
+        public IReadOnlyList<Slot> Scratch => _scratch;
+        /// <summary>Ids of slots bound via ActivateSlot, in order (empty in single-slot mode).</summary>
+        public List<int> ActivatedIds { get; } = [];
+
+        /// <summary>When set, Prefill returns a non-stop token so the decode loop runs at least
+        /// one Forward (the EOS-on-prefill default breaks before any Forward).</summary>
+        public bool EmitNonStopFirst;
+        /// <summary>One-shot: the next Forward throws, simulating a mid-decode failure/cancel.</summary>
+        public bool FailNextDecode;
+        private const int NonStopToken = 5;
+
+        // ── IForwardPass: route to the active slot ──
+        public bool SupportsPartialRewind => true;
+        public int VocabSize => 600;
+        public int MaxSeqLen => 100_000;
+
+        public ReadOnlySpan<float> Forward(int token, int position)
+        {
+            if (FailNextDecode)
+            {
+                FailNextDecode = false;
+                throw new InvalidOperationException("simulated mid-decode failure");
+            }
+            _active.Length = position + 1;
+            return EosLogits();
+        }
+
+        public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0)
+        {
+            _active.Prefills.Add((tokens.Count, startPos));
+            _active.Length = startPos + tokens.Count;
+            return EmitNonStopFirst ? OneHot(NonStopToken) : EosLogits();
+        }
+
+        public void TruncateTo(int length)
+        {
+            _active.Truncates.Add(length);
+            _active.Length = length;
+        }
+
+        public void ResetCache()
+        {
+            _active.Resets++;
+            _active.Length = 0;
+        }
+
+        public void Dispose() { }
+
+        // ── IMultiSlotKvCache ──
+        public bool SupportsMultiSlotPrefix => true;
+        public ISequenceKvCache OwnedSlot => _owned;
+
+        public ISequenceKvCache AllocateScratchSlot(int capacityTokens)
+        {
+            var s = new Slot(_scratch.Count + 1) { Capacity = capacityTokens };
+            _scratch.Add(s);
+            return s;
+        }
+
+        public void ActivateSlot(ISequenceKvCache slot)
+        {
+            _active = (Slot)slot;
+            ActivatedIds.Add(_active.Id);
+        }
+
+        public void DeactivateSlot() => _active = _owned;
+
+        private ReadOnlySpan<float> EosLogits() => OneHot(Eos);
+
+        private ReadOnlySpan<float> OneHot(int token)
+        {
+            Array.Clear(_logits);
+            _logits[token] = 1.0f;
+            return _logits;
+        }
+    }
+
+    /// <summary>
+    /// Sets environment variables for the duration of a test and restores their prior values on
+    /// dispose. The engine reads SHARPI_PREFIX_* only in its constructor; other engine tests use
+    /// non-multi-slot fakes, so a stray concurrent read of these vars is inert.
+    /// </summary>
+    private sealed class EnvScope : IDisposable
+    {
+        private readonly (string Key, string? Prior)[] _saved;
+
+        public EnvScope(params (string Key, string? Value)[] vars)
+        {
+            _saved = new (string, string?)[vars.Length];
+            for (int i = 0; i < vars.Length; i++)
+            {
+                _saved[i] = (vars[i].Key, Environment.GetEnvironmentVariable(vars[i].Key));
+                Environment.SetEnvironmentVariable(vars[i].Key, vars[i].Value);
+            }
+        }
+
+        public void Dispose()
+        {
+            foreach (var (key, prior) in _saved)
+                Environment.SetEnvironmentVariable(key, prior);
         }
     }
 }
