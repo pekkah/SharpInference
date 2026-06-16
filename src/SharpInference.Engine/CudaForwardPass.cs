@@ -391,6 +391,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
     private bool _forceFlashTc1;             // #147 A/B: pin the single-warp TC kernel
     private readonly bool _mmqSoa;           // #149: repack 2-D Q8_0 weights to SoA at upload
     private readonly bool _q4kSoa;           // #156: repack 2-D Q4_K weights to scale-unpacked SoA
+    private readonly bool _q6kSoa;           // #204: repack 2-D Q6_K weights to SoA (frees AoS)
     private int _bpCapacity;                 // current N the scratch is sized for (0 = none)
     private Tensor? _bpHidden, _bpResidual, _bpNorm;       // [N × embDim]
     private Tensor? _bpQ, _bpAttnOut;                      // [N × numHeads*maxHeadDim]
@@ -611,6 +612,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
         // reverts). Dense-only: the MoE Q4_K readers are not SoA-converted, so the
         // repack is gated on !_isMoE at upload.
         _q4kSoa = Environment.GetEnvironmentVariable("SHARPI_Q4K_SOA") != "0";
+        // Issue #204: repack ALL 2-D Q6_K trunk weights (ffn_down-half / attn_v / lm-head /
+        // output.weight in Qwen3-8B Q4_K_M) into the SoA [(q6−32) int8][scales][d] layout AND
+        // free the interleaved AoS copy — the SoA buffer is the only copy (net ~+0.4 GB over AoS,
+        // no VRAM-doubling companion). Every Q6_K reader is SoA-aware; the big shapes (rows ≥
+        // 2048) route to the int8 decode-MMQ tile, attn_v (rows=1024) to the SoA WS matvec.
+        // Default on; SHARPI_Q6K_SOA=0 keeps the AoS weight everywhere and disables the decode
+        // MMQ. Dense-only: the MoE Q6_K readers are not SoA-converted, so the repack is gated on
+        // !_isMoE at upload.
+        _q6kSoa = Environment.GetEnvironmentVariable("SHARPI_Q6K_SOA") != "0";
         _tqEnabled = enableTurboQuant;
         _tqBits = enableTurboQuant ? tqBits : 0;
 
@@ -4188,6 +4198,24 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass
                 int cols = (int)info.Dimensions[0];
                 int rows = (int)info.Dimensions[1];
                 result = _gpu.RepackQ4KSoa(result, rows, cols);
+            }
+            // #204: repack ALL 2-D Q6_K trunk weights (Qwen3-8B Q4_K_M keeps half of ffn_down +
+            // attn_v + lm-head/output.weight in Q6_K) into the scale-pre-unpacked SoA layout and
+            // FREE the interleaved AoS copy — the SoA buffer becomes the only copy (net ~+0.4 GB
+            // over AoS, no VRAM-doubling companion). Every Q6_K reader is SoA-aware, so this fits
+            // the 12 GB card at N=8 (no spill) while the decode-MMQ holds its win. The token
+            // embedding table is uploaded separately (UploadRaw, read by llm_embed_lookup_q6k —
+            // not a matmul) so it never reaches here, but guard the name defensively. cols % 256
+            // is required (every Q6_K hidden dim satisfies it); the rows ≥ 2048 floor is dropped
+            // for the REPACK (attn_v rows=1024 is repacked too, just routes to the SoA WS reader —
+            // the decode-MMQ rows ≥ 2048 eligibility lives in MatMulBatchedDecodeMmq). Dense-only.
+            else if (_q6kSoa && !_isMoE && info.DType == DType.Q6_K && info.NDimensions == 2
+                     && !name.Contains("token_embd", StringComparison.Ordinal))
+            {
+                int cols = (int)info.Dimensions[0];
+                int rows = (int)info.Dimensions[1];
+                if ((cols & 0xff) == 0)
+                    result = _gpu.RepackQ6KSoa(result, rows, cols);
             }
             // #124/#173: same funnelshift-killing SoA repack for 2-D Q4_0 trunk weights
             // (Gemma 4 12B QAT). cols % 32 required — every Q4_0 hidden dim satisfies it.

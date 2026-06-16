@@ -55,24 +55,36 @@ internal static class CudaWsKernels
 
     private static string Build()
     {
-        var sb = new System.Text.StringBuilder(Template.Length * Variants.Length + DecodeMmqTemplate.Length * 2);
+        var sb = new System.Text.StringBuilder(
+            Template.Length * Variants.Length
+            + (DecodeMmqTemplate.Length + DecodeMmqQ6KTemplate.Length) * 2);
         foreach (int nt in Variants)
             sb.Append(Template.Replace("__NT__", nt.ToString(System.Globalization.CultureInfo.InvariantCulture)));
         // Decode MMQ, two row-tile sizes (#205). BM/16 row-strips: BM=64 → wr = warp & 3,
         // wc = warp >> 2; BM=32 → wr = warp & 1, wc = warp >> 1. Quant staging is 8 iters
         // either way (MMQ_BM*32 == 8*threads); act staging is (16*64)/threads = 4 / 8 iters.
-        sb.Append(EmitDecodeMmq(bm: 64, threads: 256, actJ: 4, wrMask: 3, wcShift: 2, suffix: ""));
-        sb.Append(EmitDecodeMmq(bm: 32, threads: 128, actJ: 8, wrMask: 1, wcShift: 1, suffix: "_bm32"));
+        sb.Append(EmitDecodeMmq(DecodeMmqTemplate, bm: 64, threads: 256, actJ: 4, wrMask: 3, wcShift: 2, suffix: ""));
+        sb.Append(EmitDecodeMmq(DecodeMmqTemplate, bm: 32, threads: 128, actJ: 8, wrMask: 1, wcShift: 1, suffix: "_bm32"));
+        // #204 Q6_K decode MMQ: same two row-tiles. The Q region is 256 int8 / super-block
+        // (64 words/row) — quant staging is MMQ_BM*64/threads = 16 / 16 iters. The SoA weight
+        // is now the ONLY copy of the Q6_K weight (RepackQ6KSoa frees the AoS), so there is no
+        // AoS-direct decode-MMQ variant — every Q6_K reader is SoA-aware.
+        sb.Append(EmitDecodeMmq(DecodeMmqQ6KTemplate, bm: 64, threads: 256, actJ: 4, wrMask: 3, wcShift: 2, suffix: "",
+                                wQuantJ: 16));
+        sb.Append(EmitDecodeMmq(DecodeMmqQ6KTemplate, bm: 32, threads: 128, actJ: 8, wrMask: 1, wcShift: 1, suffix: "_bm32",
+                                wQuantJ: 16));
         return sb.ToString();
     }
 
-    private static string EmitDecodeMmq(int bm, int threads, int actJ, int wrMask, int wcShift, string suffix)
+    private static string EmitDecodeMmq(string template, int bm, int threads, int actJ, int wrMask, int wcShift,
+                                        string suffix, int wQuantJ = 0)
     {
         static string S(int v) => v.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        return DecodeMmqTemplate
+        return template
             .Replace("__BM__", S(bm))
             .Replace("__NTHREADS__", S(threads))
             .Replace("__ACTJ__", S(actJ))
+            .Replace("__WQUANTJ__", S(wQuantJ))
             .Replace("__WRMASK__", S(wrMask))
             .Replace("__WCSHIFT__", S(wcShift))
             .Replace("__SUF__", suffix);
@@ -268,6 +280,88 @@ extern ""C"" __global__ void llm_matvec_q6k_ws_n__NT__(
         float w5 = sc5 * (float)((int)((ql3 & 0xFu)        | (((qh1 >> 2) & 3u) << 4)) - 32);
         float w6 = sc6 * (float)((int)(((ql2 >> 4) & 0xFu) | (((qh1 >> 4) & 3u) << 4)) - 32);
         float w7 = sc7 * (float)((int)(((ql3 >> 4) & 0xFu) | (((qh1 >> 6) & 3u) << 4)) - 32);
+
+        int base_elem = block * 256;
+        #pragma unroll
+        for (int t = 0; t < NT; t++)
+            if (t < n_tok) {
+                const float* input = input_all + (long)t * (long)cols;
+                acc[t] += w0 * input[base_elem +       lane];
+                acc[t] += w1 * input[base_elem +  32 + lane];
+                acc[t] += w2 * input[base_elem +  64 + lane];
+                acc[t] += w3 * input[base_elem +  96 + lane];
+                acc[t] += w4 * input[base_elem + 128 + lane];
+                acc[t] += w5 * input[base_elem + 160 + lane];
+                acc[t] += w6 * input[base_elem + 192 + lane];
+                acc[t] += w7 * input[base_elem + 224 + lane];
+            }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < NT; t++)
+        if (t < n_tok) {
+            float result = sharpi_warp_reduce_sum(acc[t]);
+            if (lane == 0) output_all[(long)t * (long)rows + row] = result;
+        }
+}
+
+// Q6_K SoA (#204): bit-identical to llm_matvec_q6k_ws_n* (and to its scale-word
+// twin llm_matvec_q6k_ws_sw_n*) over the scale-pre-unpacked SoA layout (see
+// llm_matvec_q6k_soa). The 16 int8 scales are already separate, so the scale-word
+// trick is moot — read S[g*16 + 2k + (lane>>4)] directly; the (q6−32) int8 weight is
+// Q[g*256 + e], d is D[g*4]. Same 8-element-group reduction order + same token loop,
+// so the output is bit-identical to both AoS Q6_K WS kernels.
+extern ""C"" __global__ void llm_matvec_q6k_ws_soa_n__NT__(
+    const unsigned char* __restrict__ weights,   // SoA [Q][S][D]
+    const float* __restrict__ input_all,   // [n_tok][cols]
+    float* __restrict__ output_all,        // [n_tok][rows]
+    int rows, int cols, int n_tok)
+{
+    const int NT = __NT__;
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    if (row >= rows) return;
+
+    int num_blocks = cols >> 8;
+    long total_sb = (long)rows * num_blocks;
+    const signed char*   qReg = (const signed char*)weights;
+    const signed char*   sReg = (const signed char*)weights + total_sb * 256L;
+    const unsigned char*  dReg = (const unsigned char*)weights + total_sb * (256L + 16L);
+
+    long isc = (long)(lane >> 4);
+
+    float acc[NT];
+    #pragma unroll
+    for (int t = 0; t < NT; t++) acc[t] = 0.f;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long g = (long)row * num_blocks + block;
+        const signed char* q = qReg + g * 256L;
+        const signed char* s = sReg + g * 16L;
+        unsigned int dbits = (unsigned int)(*(const unsigned short*)(dReg + g * 4L));   // #204 review: dReg 16-B aligned, g*4 aligned → single 16-bit d load
+        float d = sharpi_fp16_to_fp32(dbits);
+
+        float sc0 = d * (float)s[ 0 + isc];
+        float sc1 = d * (float)s[ 2 + isc];
+        float sc2 = d * (float)s[ 4 + isc];
+        float sc3 = d * (float)s[ 6 + isc];
+        float sc4 = d * (float)s[ 8 + isc];
+        float sc5 = d * (float)s[10 + isc];
+        float sc6 = d * (float)s[12 + isc];
+        float sc7 = d * (float)s[14 + isc];
+
+        float w0 = sc0 * (float)q[       lane];
+        float w1 = sc1 * (float)q[ 32 + lane];
+        float w2 = sc2 * (float)q[ 64 + lane];
+        float w3 = sc3 * (float)q[ 96 + lane];
+        float w4 = sc4 * (float)q[128 + lane];
+        float w5 = sc5 * (float)q[160 + lane];
+        float w6 = sc6 * (float)q[192 + lane];
+        float w7 = sc7 * (float)q[224 + lane];
 
         int base_elem = block * 256;
         #pragma unroll
@@ -901,6 +995,176 @@ extern ""C"" __global__ void __launch_bounds__(__NTHREADS__) llm_mmq_q4k_soa_act
             acc1 += (float)c1 * dwA * dC1 - dmA * sC1;
             acc2 += (float)c2 * dwB * dC0 - dmB * sC0;
             acc3 += (float)c3 * dwB * dC1 - dmB * sC1;
+        }
+        __syncthreads();
+    }
+
+    if (rowA < rows) {
+        if (tokC0 < n_tok) output[(long)tokC0 * rows + rowA] = acc0;
+        if (tokC1 < n_tok) output[(long)tokC1 * rows + rowA] = acc1;
+    }
+    if (rowB < rows) {
+        if (tokC0 < n_tok) output[(long)tokC0 * rows + rowB] = acc2;
+        if (tokC1 < n_tok) output[(long)tokC1 * rows + rowB] = acc3;
+    }
+}
+#undef MMQ_BM
+#undef MMQ_BN
+";
+
+    /// <summary>
+    /// #204 decode MMQ for Q6_K weights: the int8 tensor-core analogue of
+    /// <see cref="DecodeMmqTemplate"/> for the Q6_K trunk shapes (Qwen3-8B Q4_K_M keeps
+    /// half of ffn_down + attn_v + lm-head in Q6_K), which otherwise fall to the bit-exact
+    /// <c>llm_matvec_q6k_ws_sw</c> matvec (~2.7-3× the weight-streaming floor at N=8).
+    ///
+    /// <para>The SoA weight (<c>llm_q6k_repack_soa</c>) stores the signed int8
+    /// <c>(q6 − 32)</c> for natural element e at byte e — the SAME natural order the
+    /// shared Q8_1 activation uses — so the a-fragment load and the b-fragment (activation)
+    /// load mirror the Q4_K tile exactly. Q6_K is SYMMETRIC: no min term, the −32 offset
+    /// is baked into the int8 weight. The only structural change vs the Q4_K tile is the
+    /// per-16-element scale boundary inside each 32-element sub-block: registers a0/a1 of
+    /// the m16n8k32 fragment hold k∈[0,16), a2/a3 hold k∈[16,32) — a clean split at that
+    /// boundary — so each sub-block runs TWO masked mmas (mma1 = {a0,a1,0,0}, mma2 =
+    /// {0,0,a2,a3}) and accumulates <c>c1·dwG0·dC + c2·dwG1·dC</c> with dwG0 = d·scales[2·sb],
+    /// dwG1 = d·scales[2·sb+1]. Argmax-stable (both operands int8-quantized), not bit-exact —
+    /// same contract as the Q4_K decode/prefill MMQ.</para>
+    /// </summary>
+    private const string DecodeMmqQ6KTemplate = @"
+// ── #204 decode MMQ: Q6_K SoA weights × SoA Q8_1 activations, BN=16 ──────────
+// grid = (ceil(rows/MMQ_BM), ceil(n_tok/16)), block = __NTHREADS__. K-step is one
+// 256-element super-block: stage the raw tile (MMQ_BM×256 int8 quant words + 16-B
+// scales + {d} + 16×64 act words + 16×8 act {d,s}) with coalesced copies, then 8
+// sub-blocks × TWO m16n8k32 s8 mma per warp between one barrier pair. The two
+// half-fragment mmas split the per-16-element Q6_K scale boundary; the −32 offset is
+// in the int8 weight so there is no min term. Argmax-stable (both operands int8).
+#define MMQ_BM __BM__
+#define MMQ_BN 16
+extern ""C"" __global__ void __launch_bounds__(__NTHREADS__) llm_mmq_q6k_soa_acts_n16__SUF__(
+    const unsigned int*  __restrict__ weights,   // SoA [Q total*256][S total*16][D total*4]
+    const unsigned int*  __restrict__ y_qs,      // SoA Q8_1 quants [n_tok × sub_total × 32 B]
+    const unsigned int*  __restrict__ y_ds,      // SoA Q8_1 scales [n_tok × sub_total] {d,s}
+    float* __restrict__ output,                  // [n_tok × rows] fp32
+    int rows, int cols, int n_tok)
+{
+    // 64 quant words/row (256 int8). +1 word stride avoids the 8-way bank conflict an
+    // unpadded 64-word stride would land on the 8 grp-lanes of a fragment read.
+    __shared__ unsigned int sWq[MMQ_BM * 65];    // raw int8 quant words [row][64+1]
+    __shared__ unsigned int sWs[MMQ_BM * 4];     // 16 int8 scales       [row][4]
+    __shared__ unsigned int sWd[MMQ_BM];         // {d, 0}               [row]
+    __shared__ unsigned int sYq[MMQ_BN * 65];    // raw act words        [tok][64+1]
+    __shared__ unsigned int sYd[MMQ_BN * 8];     // raw act {d,s}        [tok][8]
+
+    int row_block = (int)blockIdx.x * MMQ_BM;
+    int tok_block = (int)blockIdx.y * MMQ_BN;
+    int nb_super  = cols >> 8;
+    int sub_total = cols >> 5;
+    long total_sb = (long)rows * nb_super;
+
+    const unsigned int*  qReg = weights;                                          // [Q] total*256 B
+    const unsigned char* sReg = (const unsigned char*)weights + total_sb * 256L;  // [S] total*16 B
+    const unsigned int*  dReg = (const unsigned int*)(sReg + total_sb * 16L);     // [D] total*4 B
+
+    int tid  = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int grp  = lane >> 2;
+    int tig  = lane & 3;
+    int wr   = warp & __WRMASK__;
+    int wc   = warp >> __WCSHIFT__;
+    int mrow0 = wr * 16;
+    int ncol0 = wc * 8;
+
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+
+    int rowA = row_block + mrow0 + grp;
+    int rowB = rowA + 8;
+    int tokC0 = tok_block + ncol0 + tig * 2;
+    int tokC1 = tokC0 + 1;
+
+    for (int ksb = 0; ksb < nb_super; ksb++) {
+        // Stage the raw super-block tile, fully coalesced.
+        #pragma unroll
+        for (int j = 0; j < __WQUANTJ__; j++) {  // MMQ_BM rows × 64 quant words
+            int k = tid + j * __NTHREADS__;
+            int r = row_block + (k >> 6);
+            sWq[(k >> 6) * 65 + (k & 63)] =
+                (r < rows) ? qReg[((long)r * nb_super + ksb) * 64L + (k & 63)] : 0u;
+        }
+        {                                        // MMQ_BM rows × 4 scale words (16 int8)
+            int r = row_block + (tid >> 2);
+            sWs[tid] = (r < rows)
+                ? reinterpret_cast<const unsigned int*>(sReg)[((long)r * nb_super + ksb) * 4L + (tid & 3)]
+                : 0u;
+        }
+        if (tid < MMQ_BM) {                      // MMQ_BM rows × {d,0}
+            int r = row_block + tid;
+            sWd[tid] = (r < rows) ? dReg[(long)r * nb_super + ksb] : 0u;
+        }
+        #pragma unroll
+        for (int j = 0; j < __ACTJ__; j++) {     // 16 tokens × 64 act words (256 B)
+            int k = tid + j * __NTHREADS__;
+            int t = tok_block + (k >> 6);
+            sYq[(k >> 6) * 65 + (k & 63)] =
+                (t < n_tok) ? y_qs[((long)t * sub_total + ksb * 8) * 8L + (k & 63)] : 0u;
+        }
+        if (tid < MMQ_BN * 8) {                  // 16 tokens × 8 act {d,s}
+            int t = tok_block + (tid >> 3);
+            sYd[tid] = (t < n_tok) ? y_ds[(long)t * sub_total + ksb * 8 + (tid & 7)] : 0u;
+        }
+        __syncthreads();
+
+        const signed char* sWsB = reinterpret_cast<const signed char*>(sWs);
+        #pragma unroll
+        for (int sb = 0; sb < 8; sb++) {
+            // a-fragment: 4 consecutive int8 per word, natural-order (mirrors the Q4_K
+            // tile's word load but reads int8 directly). a0/a1 = k∈[0,16) (words tig of
+            // the lower 16 lanes), a2/a3 = k∈[16,32) (words tig+4). The 65-word row stride
+            // is uint; sub-block sb occupies int8 bytes [sb*32 .. sb*32+31] = uint words
+            // [sb*8 .. sb*8+7] within the row.
+            int wbaseA = (mrow0 + grp) * 65     + sb * 8;
+            int wbaseB = (mrow0 + grp + 8) * 65 + sb * 8;
+            int a0 = (int)sWq[wbaseA + tig];
+            int a1 = (int)sWq[wbaseB + tig];
+            int a2 = (int)sWq[wbaseA + tig + 4];
+            int a3 = (int)sWq[wbaseB + tig + 4];
+
+            // Q6_K symmetric scales: sub-block sb's first 16 elems use scales[2*sb],
+            // second 16 use scales[2*sb+1]. d in low 16 bits of sWd.
+            float dA = sharpi_fp16_to_fp32(sWd[mrow0 + grp]     & 0xffffu);
+            float dB = sharpi_fp16_to_fp32(sWd[mrow0 + grp + 8] & 0xffffu);
+            float dwA0 = dA * (float)sWsB[(mrow0 + grp) * 16 + 2 * sb];
+            float dwA1 = dA * (float)sWsB[(mrow0 + grp) * 16 + 2 * sb + 1];
+            float dwB0 = dB * (float)sWsB[(mrow0 + grp + 8) * 16 + 2 * sb];
+            float dwB1 = dB * (float)sWsB[(mrow0 + grp + 8) * 16 + 2 * sb + 1];
+
+            int b0 = (int)sYq[(ncol0 + grp) * 65 + sb * 8 + tig];
+            int b1 = (int)sYq[(ncol0 + grp) * 65 + sb * 8 + tig + 4];
+            unsigned int dy0 = sYd[(ncol0 + tig * 2) * 8 + sb];
+            unsigned int dy1 = sYd[(ncol0 + tig * 2 + 1) * 8 + sb];
+            float dC0 = sharpi_fp16_to_fp32(dy0 & 0xffffu);
+            float dC1 = sharpi_fp16_to_fp32(dy1 & 0xffffu);
+
+            // mma1 = {a0,a1,0,0} × {b0,b1}: Σ_{k=0..15} (q6−32)·q8 (scale group 2·sb).
+            int zero = 0;
+            int p0 = 0, p1 = 0, p2 = 0, p3 = 0;
+            asm(
+              ""mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 ""
+              ""{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};""
+              : ""+r""(p0), ""+r""(p1), ""+r""(p2), ""+r""(p3)
+              : ""r""(a0), ""r""(a1), ""r""(zero), ""r""(zero), ""r""(b0), ""r""(b1));
+            // mma2 = {0,0,a2,a3} × {b0,b1}: Σ_{k=16..31} (q6−32)·q8 (scale group 2·sb+1).
+            int q0 = 0, q1 = 0, q2 = 0, q3 = 0;
+            asm(
+              ""mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 ""
+              ""{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};""
+              : ""+r""(q0), ""+r""(q1), ""+r""(q2), ""+r""(q3)
+              : ""r""(zero), ""r""(zero), ""r""(a2), ""r""(a3), ""r""(b0), ""r""(b1));
+
+            acc0 += ((float)p0 * dwA0 + (float)q0 * dwA1) * dC0;
+            acc1 += ((float)p1 * dwA0 + (float)q1 * dwA1) * dC1;
+            acc2 += ((float)p2 * dwB0 + (float)q2 * dwB1) * dC0;
+            acc3 += ((float)p3 * dwB0 + (float)q3 * dwB1) * dC1;
         }
         __syncthreads();
     }

@@ -120,6 +120,97 @@ public sealed unsafe class CudaDecodeMmqTests
         }
     }
 
+    // ── #204 Q6_K decode MMQ ────────────────────────────────────────────────
+    private static byte[] BuildQ6KMatrix(int rows, int cols, Random rng)
+    {
+        int blocksPerRow = cols / 256;
+        int bytesPerRow = blocksPerRow * 210;
+        var bytes = new byte[rows * bytesPerRow];
+        for (int r = 0; r < rows; r++)
+            for (int b = 0; b < blocksPerRow; b++)
+            {
+                int off = r * bytesPerRow + b * 210;
+                // ql[0:128], qh[128:192], scales[192:208] (int8), d (208:210 fp16).
+                for (int i = 0; i < 192; i++)
+                    bytes[off + i] = (byte)rng.Next(256);
+                for (int i = 0; i < 16; i++)
+                    bytes[off + 192 + i] = (byte)(sbyte)(rng.Next(127) - 63);   // signed int8 scale
+                float d = (float)(rng.NextDouble() * 0.04 + 0.005);
+                ushort dHalf = HalfToUshort((Half)d);
+                bytes[off + 208] = (byte)(dHalf & 0xFF);
+                bytes[off + 209] = (byte)(dHalf >> 8);
+            }
+        return bytes;
+    }
+
+    private static void RunCaseQ6K(CudaBackend gpu, Tensor gpuW, byte[] weightBytes,
+                                   int rows, int cols, int nTok, Random rng)
+    {
+        var acts = new float[nTok * cols];
+        for (int i = 0; i < acts.Length; i++)
+            acts[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        int bytesPerRow = (cols / 256) * 210;
+        var cpuOut = new float[nTok * rows];
+        fixed (byte* wPtr = weightBytes)
+        fixed (float* aPtr = acts)
+        {
+            for (int t = 0; t < nTok; t++)
+                for (int r = 0; r < rows; r++)
+                    cpuOut[t * rows + r] = SimdKernels.DotQ6K(wPtr + r * bytesPerRow, aPtr + t * cols, cols);
+        }
+
+        var gpuX = gpu.Upload(acts, TensorShape.D1(acts.Length));
+        var gpuY = gpu.Allocate(TensorShape.D1((long)nTok * rows));
+
+        gpu.MatMulBatchedDecodeMmq(gpuY, gpuW, gpuX, nTok, DType.Q6_K);
+        gpu.Synchronize();
+
+        var gpuOut = new float[nTok * rows];
+        gpu.Download(gpuY, gpuOut);
+        gpu.Free(gpuX);
+        gpu.Free(gpuY);
+
+        double sumSq = 0;
+        for (int i = 0; i < cpuOut.Length; i++) sumSq += (double)cpuOut[i] * cpuOut[i];
+        float refRms = (float)Math.Sqrt(sumSq / cpuOut.Length);
+
+        int mismatches = 0;
+        float maxAbs = 0;
+        for (int i = 0; i < cpuOut.Length; i++)
+        {
+            float diff = MathF.Abs(gpuOut[i] - cpuOut[i]);
+            maxAbs = MathF.Max(maxAbs, diff);
+            if (diff > 0.03f * refRms) mismatches++;
+        }
+        Assert.True(mismatches <= cpuOut.Length / 100 + 1,
+            $"Q6_K decode MMQ rows={rows} cols={cols} nTok={nTok} drifted from fp32 reference: " +
+            $"{mismatches}/{cpuOut.Length} beyond 3% of RMS ({refRms:E3}), maxAbs={maxAbs:E3}.");
+    }
+
+    [Fact]
+    public void DecodeMmq_Q6K_Soa_TracksCpuReference()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        // rows ≥ 2048 (eligible). Same #205 dual-tile coverage as the Q4_K case: 2048 (BM=32,
+        // no tail), 2096 (BM=32 with a non-multiple-of-32 row tail), 8192 (BM=64). Batch sizes
+        // cover partial token tiles (2, 5), the full tile (16), and the grid.y = 2 round-up (17).
+        foreach ((int rows, int cols) in new[] { (2048, 512), (2096, 256), (8192, 512) })
+        {
+            var rng = new Random(20260616 + rows * 13 + cols * 5);
+            byte[] weightBytes = BuildQ6KMatrix(rows, cols, rng);
+            var gpuWAos = gpu.UploadRaw(weightBytes, TensorShape.D1(weightBytes.Length), DType.Q6_K);
+            // #204: RepackQ6KSoa now FREES the AoS weight and returns the SoA buffer (the only
+            // copy); MatMulBatchedDecodeMmq reads it directly via llm_mmq_q6k_soa_acts_n16.
+            var gpuW = gpu.RepackQ6KSoa(gpuWAos, rows, cols);
+            foreach (int nTok in new[] { 2, 5, 8, 16, 17 })
+                RunCaseQ6K(gpu, gpuW, weightBytes, rows, cols, nTok, rng);
+            gpu.Free(gpuW);
+        }
+    }
+
     /// <summary>Ineligible shapes (rows &lt; 2048 here) must take the weight-stationary
     /// fallback — same fp32-tracking contract holds trivially (the WS path is bit-exact
     /// to the per-token matvec).</summary>

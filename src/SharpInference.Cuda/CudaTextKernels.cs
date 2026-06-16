@@ -1631,6 +1631,65 @@ extern ""C"" __global__ void llm_q4k_repack_soa(
     for (int i = 0; i < 128; i++) qDst[i] = src[srcOff + 16 + i];
 }
 
+// ── #204 Q6_K → SoA repack for the int8 decode-MMQ tile ─────────────────────
+// One-time repack of an interleaved Q6_K weight [rows × nb × 210 B] into a SoA
+// layout the llm_mmq_q6k_soa_acts_n16 tile consumes:
+//   [Q  total*256][S  total*16][D  total*4]   (total = rows*nb super-blocks)
+// Q stores, for each natural element e of the super-block, the SIGNED int8 weight
+// (q6(e) − 32) at byte position e — i.e. the SAME natural-order layout the shared
+// Q8_1 activation uses (sub-block sb = e>>5, word (e&31)>>2, byte (e&31)&3), so the
+// kernel's a-fragment load mirrors the Q4_K tile's exactly (4 consecutive int8 per
+// word). q6 ∈ [0,63] → q6−32 ∈ [−32,31] fits signed int8. S stores the 16 int8
+// scales verbatim (bytes 192..207); D stores {fp16 d (bytes 208..209), 0 pad}. The
+// reconstruction mirrors llm_dequant_q6k_to_f16 / DotQ6K exactly, so the int8 weight
+// bytes are bit-identical to the matvec's pre-multiply (q − 32). One thread / super-block.
+extern ""C"" __global__ void llm_q6k_repack_soa(
+    const unsigned char* __restrict__ src,   // interleaved, 210 B/super-block
+    unsigned char* __restrict__ dst,         // SoA [Q][S][D]
+    int rows, int cols)
+{
+    long sb = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    int nb = cols >> 8;
+    long total = (long)rows * nb;
+    if (sb >= total) return;
+
+    long srcOff = sb * 210L;
+    signed char*   qDst = (signed char*)(dst + sb * 256L);
+    unsigned char* sDst = dst + total * 256L + sb * 16L;
+    unsigned char* dDst = dst + total * (256L + 16L) + sb * 4L;
+
+    const unsigned char* ql = src + srcOff;          // [0:128]
+    const unsigned char* qh = src + srcOff + 128;    // [128:192]
+
+    // 16 int8 scales (192..207) → S region, verbatim.
+    #pragma unroll
+    for (int i = 0; i < 16; i++) sDst[i] = src[srcOff + 192 + i];
+    // {d (208,209), 0, 0} → D region.
+    dDst[0] = src[srcOff + 208]; dDst[1] = src[srcOff + 209];
+    dDst[2] = 0; dDst[3] = 0;
+
+    // Reconstruct all 256 (q6 − 32) signed int8, element e → byte e (natural order).
+    // group = e>>5 (0..7), lane = e&31; the ql/qh switch is identical to
+    // llm_dequant_q6k_to_f16 (same byte/shift per group).
+    #pragma unroll
+    for (int e = 0; e < 256; e++) {
+        int lane  = e & 31;
+        int group = e >> 5;
+        unsigned int qlb, qhb; int q6;
+        switch (group) {
+            case 0:  qlb = ql[  0 + lane]; qhb = qh[ 0 + lane]; q6 = (int)((qlb & 0xFu)        | (((qhb >> 0) & 3u) << 4)); break;
+            case 1:  qlb = ql[ 32 + lane]; qhb = qh[ 0 + lane]; q6 = (int)((qlb & 0xFu)        | (((qhb >> 2) & 3u) << 4)); break;
+            case 2:  qlb = ql[  0 + lane]; qhb = qh[ 0 + lane]; q6 = (int)(((qlb >> 4) & 0xFu) | (((qhb >> 4) & 3u) << 4)); break;
+            case 3:  qlb = ql[ 32 + lane]; qhb = qh[ 0 + lane]; q6 = (int)(((qlb >> 4) & 0xFu) | (((qhb >> 6) & 3u) << 4)); break;
+            case 4:  qlb = ql[ 64 + lane]; qhb = qh[32 + lane]; q6 = (int)((qlb & 0xFu)        | (((qhb >> 0) & 3u) << 4)); break;
+            case 5:  qlb = ql[ 96 + lane]; qhb = qh[32 + lane]; q6 = (int)((qlb & 0xFu)        | (((qhb >> 2) & 3u) << 4)); break;
+            case 6:  qlb = ql[ 64 + lane]; qhb = qh[32 + lane]; q6 = (int)(((qlb >> 4) & 0xFu) | (((qhb >> 4) & 3u) << 4)); break;
+            default: qlb = ql[ 96 + lane]; qhb = qh[32 + lane]; q6 = (int)(((qlb >> 4) & 0xFu) | (((qhb >> 6) & 3u) << 4)); break;
+        }
+        qDst[e] = (signed char)(q6 - 32);
+    }
+}
+
 // ── MatVec Q6_K ────────────────────────────────────────────────────────────
 // Q6_K block (210 bytes per 256 elements):
 //   [0:128]   ql — lower 4-bit nibbles (two 64-byte halves)
@@ -1695,6 +1754,69 @@ extern ""C"" __global__ void llm_matvec_q6k(
         acc += sc5 * (float)((int)((ql3 & 0xFu)        | (((qh1 >> 2) & 3u) << 4)) - 32) * input[base_elem + 160 + lane];
         acc += sc6 * (float)((int)(((ql2 >> 4) & 0xFu) | (((qh1 >> 4) & 3u) << 4)) - 32) * input[base_elem + 192 + lane];
         acc += sc7 * (float)((int)(((ql3 >> 4) & 0xFu) | (((qh1 >> 6) & 3u) << 4)) - 32) * input[base_elem + 224 + lane];
+    }
+
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output[row] = result;
+}
+
+// ── MatVec Q6_K — SoA (#204) ────────────────────────────────────────────────
+// Bit-identical clone of llm_matvec_q6k over the scale-pre-unpacked SoA layout
+// (llm_q6k_repack_soa): [Q total*256 signed-int8 (q6−32)][S total*16 int8 scales]
+// [D total*4 {fp16 d, 0, 0}], super-block index g = row*nb + block. Element e of
+// the super-block is the signed weight Q[g*256 + e]; its scale is S[g*16 + (e>>4)];
+// d is D[g*4]. The matvec reads the SAME element order (group 0..7, lane) and forms
+// the SAME sc·(q6−32)·input products in the SAME reduction order as the AoS kernel,
+// so the output is bit-identical to llm_matvec_q6k (no bit-unpacking, no scale gather).
+extern ""C"" __global__ void llm_matvec_q6k_soa(
+    const unsigned char* __restrict__ weights,   // SoA [Q][S][D]
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int rows, int cols)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    if (row >= rows) return;
+
+    int num_blocks = cols >> 8;
+    long total_sb = (long)rows * num_blocks;
+    const signed char*   qReg = (const signed char*)weights;                 // [Q] total*256 B
+    const signed char*   sReg = (const signed char*)weights + total_sb * 256L; // [S] total*16 B
+    const unsigned char*  dReg = (const unsigned char*)weights + total_sb * (256L + 16L); // [D] total*4 B
+
+    long isc = (long)(lane >> 4);   // scale half within the 32-element group
+
+    float acc = 0.f;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long g = (long)row * num_blocks + block;
+        const signed char* q = qReg + g * 256L;       // 256 signed int8 (q6-32)
+        const signed char* s = sReg + g * 16L;         // 16 int8 scales
+        unsigned int dbits = (unsigned int)(*(const unsigned short*)(dReg + g * 4L));   // #204 review: dReg 16-B aligned, g*4 aligned → single 16-bit d load
+        float d = sharpi_fp16_to_fp32(dbits);
+
+        float sc0 = d * (float)s[ 0 + isc];
+        float sc1 = d * (float)s[ 2 + isc];
+        float sc2 = d * (float)s[ 4 + isc];
+        float sc3 = d * (float)s[ 6 + isc];
+        float sc4 = d * (float)s[ 8 + isc];
+        float sc5 = d * (float)s[10 + isc];
+        float sc6 = d * (float)s[12 + isc];
+        float sc7 = d * (float)s[14 + isc];
+
+        int base_elem = block * 256;
+        acc += sc0 * (float)q[       lane] * input[base_elem +       lane];
+        acc += sc1 * (float)q[ 32 + lane] * input[base_elem +  32 + lane];
+        acc += sc2 * (float)q[ 64 + lane] * input[base_elem +  64 + lane];
+        acc += sc3 * (float)q[ 96 + lane] * input[base_elem +  96 + lane];
+        acc += sc4 * (float)q[128 + lane] * input[base_elem + 128 + lane];
+        acc += sc5 * (float)q[160 + lane] * input[base_elem + 160 + lane];
+        acc += sc6 * (float)q[192 + lane] * input[base_elem + 192 + lane];
+        acc += sc7 * (float)q[224 + lane] * input[base_elem + 224 + lane];
     }
 
     float result = sharpi_warp_reduce_sum(acc);
@@ -4256,6 +4378,43 @@ extern ""C"" __global__ void llm_dequant_q6k_to_f16(
     }
 }
 
+// ── Dequant Q6_K → FP16 SoA (#204) ──────────────────────────────────────────
+// Bit-identical clone of llm_dequant_q6k_to_f16 over the SoA layout (see
+// llm_matvec_q6k_soa). Thread e owns weight column e of the super-block: scale
+// S[g*16 + group*2 + (lane>>4)], weight (q6-32) = Q[g*256 + e], d = D[g*4].
+// val = d·scale·(q6-32), fp16-rounded — same lossy step + same out index as the AoS kernel.
+extern ""C"" __global__ void llm_dequant_q6k_to_f16_soa(
+    const unsigned char* __restrict__ weights,   // SoA [Q][S][D]
+    unsigned short* __restrict__ out,    // [rows * cols] fp16
+    int rows, int cols)
+{
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    int num_blocks = cols >> 8;                              // cols / 256
+    long out_row = (long)row * (long)cols;
+    long total_sb = (long)rows * num_blocks;
+    const signed char*   qReg = (const signed char*)weights;
+    const signed char*   sReg = (const signed char*)weights + total_sb * 256L;
+    const unsigned char*  dReg = (const unsigned char*)weights + total_sb * (256L + 16L);
+
+    for (int block = 0; block < num_blocks; block++) {
+        long g = (long)row * num_blocks + block;
+        const signed char* q = qReg + g * 256L;
+        const signed char* s = sReg + g * 16L;
+        unsigned int dbits = (unsigned int)(*(const unsigned short*)(dReg + g * 4L));   // #204 review: dReg 16-B aligned, g*4 aligned → single 16-bit d load
+        float d = sharpi_fp16_to_fp32(dbits);
+
+        for (int e = (int)threadIdx.x; e < 256; e += (int)blockDim.x) {
+            int lane  = e & 31;
+            int group = e >> 5;        // 0..7
+            int isc   = lane >> 4;     // 0 or 1
+            float sc  = d * (float)s[group * 2 + isc];
+            float val = sc * (float)q[e];
+            out[out_row + (long)block * 256 + e] = (unsigned short)sharpi_fp32_to_fp16(val);
+        }
+    }
+}
+
 // ── Dequant Q5_K → FP16 for cuBLAS prefill GEMM (issue #162) ────────────────
 // Same motivation as the Q6_K dequant: Q5_K_M mixes keep q/k/o/gate/up in Q5_K, which
 // otherwise fell to the per-token GEMM-N matvec. Element decode mirrors llm_matvec_q5k:
@@ -4636,6 +4795,89 @@ extern ""C"" __global__ void llm_matvec_q6k_n2(
         float q5 = sc5 * (float)((int)((ql3 & 0xFu)        | (((qh1 >> 2) & 3u) << 4)) - 32);
         float q6 = sc6 * (float)((int)(((ql2 >> 4) & 0xFu) | (((qh1 >> 4) & 3u) << 4)) - 32);
         float q7 = sc7 * (float)((int)(((ql3 >> 4) & 0xFu) | (((qh1 >> 6) & 3u) << 4)) - 32);
+
+        acc_a += q0 * input_a[base_elem +       lane];
+        acc_a += q1 * input_a[base_elem +  32 + lane];
+        acc_a += q2 * input_a[base_elem +  64 + lane];
+        acc_a += q3 * input_a[base_elem +  96 + lane];
+        acc_a += q4 * input_a[base_elem + 128 + lane];
+        acc_a += q5 * input_a[base_elem + 160 + lane];
+        acc_a += q6 * input_a[base_elem + 192 + lane];
+        acc_a += q7 * input_a[base_elem + 224 + lane];
+
+        acc_b += q0 * input_b[base_elem +       lane];
+        acc_b += q1 * input_b[base_elem +  32 + lane];
+        acc_b += q2 * input_b[base_elem +  64 + lane];
+        acc_b += q3 * input_b[base_elem +  96 + lane];
+        acc_b += q4 * input_b[base_elem + 128 + lane];
+        acc_b += q5 * input_b[base_elem + 160 + lane];
+        acc_b += q6 * input_b[base_elem + 192 + lane];
+        acc_b += q7 * input_b[base_elem + 224 + lane];
+    }
+
+    float ra = sharpi_warp_reduce_sum(acc_a);
+    float rb = sharpi_warp_reduce_sum(acc_b);
+    if (lane == 0) {
+        output_a[row] = ra;
+        output_b[row] = rb;
+    }
+}
+
+// ── MatVec Q6_K — N=2 SoA (#204) ────────────────────────────────────────────
+// Bit-identical clone of llm_matvec_q6k_n2 over the SoA layout (see
+// llm_matvec_q6k_soa). Same per-element dequant + reduction order for both inputs.
+extern ""C"" __global__ void llm_matvec_q6k_n2_soa(
+    const unsigned char* __restrict__ weights,   // SoA [Q][S][D]
+    const float* __restrict__ input_a,
+    const float* __restrict__ input_b,
+    float* __restrict__ output_a,
+    float* __restrict__ output_b,
+    int rows, int cols)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    if (row >= rows) return;
+
+    int num_blocks = cols >> 8;
+    long total_sb = (long)rows * num_blocks;
+    const signed char*   qReg = (const signed char*)weights;
+    const signed char*   sReg = (const signed char*)weights + total_sb * 256L;
+    const unsigned char*  dReg = (const unsigned char*)weights + total_sb * (256L + 16L);
+
+    long isc = (long)(lane >> 4);
+
+    float acc_a = 0.f, acc_b = 0.f;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long g = (long)row * num_blocks + block;
+        const signed char* q = qReg + g * 256L;
+        const signed char* s = sReg + g * 16L;
+        unsigned int dbits = (unsigned int)(*(const unsigned short*)(dReg + g * 4L));   // #204 review: dReg 16-B aligned, g*4 aligned → single 16-bit d load
+        float d = sharpi_fp16_to_fp32(dbits);
+
+        float sc0 = d * (float)s[ 0 + isc];
+        float sc1 = d * (float)s[ 2 + isc];
+        float sc2 = d * (float)s[ 4 + isc];
+        float sc3 = d * (float)s[ 6 + isc];
+        float sc4 = d * (float)s[ 8 + isc];
+        float sc5 = d * (float)s[10 + isc];
+        float sc6 = d * (float)s[12 + isc];
+        float sc7 = d * (float)s[14 + isc];
+
+        int base_elem = block * 256;
+
+        float q0 = sc0 * (float)q[       lane];
+        float q1 = sc1 * (float)q[ 32 + lane];
+        float q2 = sc2 * (float)q[ 64 + lane];
+        float q3 = sc3 * (float)q[ 96 + lane];
+        float q4 = sc4 * (float)q[128 + lane];
+        float q5 = sc5 * (float)q[160 + lane];
+        float q6 = sc6 * (float)q[192 + lane];
+        float q7 = sc7 * (float)q[224 + lane];
 
         acc_a += q0 * input_a[base_elem +       lane];
         acc_a += q1 * input_a[base_elem +  32 + lane];
@@ -5051,6 +5293,67 @@ extern ""C"" __global__ void llm_matvec_q6k_gemm_n(
         acc += sc5 * (float)((int)((ql3 & 0xFu)        | (((qh1 >> 2) & 3u) << 4)) - 32) * input[base_elem + 160 + lane];
         acc += sc6 * (float)((int)(((ql2 >> 4) & 0xFu) | (((qh1 >> 4) & 3u) << 4)) - 32) * input[base_elem + 192 + lane];
         acc += sc7 * (float)((int)(((ql3 >> 4) & 0xFu) | (((qh1 >> 6) & 3u) << 4)) - 32) * input[base_elem + 224 + lane];
+    }
+
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output_all[(long)token * (long)rows + row] = result;
+}
+
+// ── MatVec Q6_K GEMM-N SoA (#204) ───────────────────────────────────────────
+// Bit-identical clone of llm_matvec_q6k_gemm_n over the SoA layout (see
+// llm_matvec_q6k_soa). Same per-(row,token) reduction order, so a (rows, n_tok)
+// launch is bit-identical to n_tok sequential llm_matvec_q6k_soa calls.
+extern ""C"" __global__ void llm_matvec_q6k_gemm_n_soa(
+    const unsigned char* __restrict__ weights,   // SoA [Q][S][D]
+    const float* __restrict__ input_all,   // [n_tok][cols]
+    float* __restrict__ output_all,        // [n_tok][rows]
+    int rows, int cols, int n_tok)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    int token = (int)blockIdx.y;
+    if (row >= rows || token >= n_tok) return;
+
+    const float* input = input_all + (long)token * (long)cols;
+    int num_blocks = cols >> 8;
+    long total_sb = (long)rows * num_blocks;
+    const signed char*   qReg = (const signed char*)weights;
+    const signed char*   sReg = (const signed char*)weights + total_sb * 256L;
+    const unsigned char*  dReg = (const unsigned char*)weights + total_sb * (256L + 16L);
+
+    long isc = (long)(lane >> 4);
+
+    float acc = 0.f;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long g = (long)row * num_blocks + block;
+        const signed char* q = qReg + g * 256L;
+        const signed char* s = sReg + g * 16L;
+        unsigned int dbits = (unsigned int)(*(const unsigned short*)(dReg + g * 4L));   // #204 review: dReg 16-B aligned, g*4 aligned → single 16-bit d load
+        float d = sharpi_fp16_to_fp32(dbits);
+
+        float sc0 = d * (float)s[ 0 + isc];
+        float sc1 = d * (float)s[ 2 + isc];
+        float sc2 = d * (float)s[ 4 + isc];
+        float sc3 = d * (float)s[ 6 + isc];
+        float sc4 = d * (float)s[ 8 + isc];
+        float sc5 = d * (float)s[10 + isc];
+        float sc6 = d * (float)s[12 + isc];
+        float sc7 = d * (float)s[14 + isc];
+
+        int base_elem = block * 256;
+        acc += sc0 * (float)q[       lane] * input[base_elem +       lane];
+        acc += sc1 * (float)q[ 32 + lane] * input[base_elem +  32 + lane];
+        acc += sc2 * (float)q[ 64 + lane] * input[base_elem +  64 + lane];
+        acc += sc3 * (float)q[ 96 + lane] * input[base_elem +  96 + lane];
+        acc += sc4 * (float)q[128 + lane] * input[base_elem + 128 + lane];
+        acc += sc5 * (float)q[160 + lane] * input[base_elem + 160 + lane];
+        acc += sc6 * (float)q[192 + lane] * input[base_elem + 192 + lane];
+        acc += sc7 * (float)q[224 + lane] * input[base_elem + 224 + lane];
     }
 
     float result = sharpi_warp_reduce_sum(acc);
