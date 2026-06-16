@@ -478,6 +478,40 @@ public sealed class InferenceEnginePrefixCacheTests
         Assert.Equal(0, engine.PrefillTokensReused);
     }
 
+    /// <summary>
+    /// Issue #212 (review follow-up): a scratch request that resets+overwrites its slot's KV but
+    /// fails mid-decode must NOT leave the slot's token shadow describing the destroyed KV — else
+    /// the next request could SelectSlot-match that stale prefix and TruncateTo into mismatched KV
+    /// (silent garbage). The engine nulls the active slot's shadow before mutating its KV and only
+    /// re-writes it on a complete decode, so the post-failure request reuses nothing.
+    /// </summary>
+    [Fact]
+    public async Task GenerateAsync_TwoSlot_ScratchFailedMidDecode_DoesNotReuseDestroyedPrefix()
+    {
+        using var _ = new EnvScope(("SHARPI_PREFIX_SLOTS", "2"), ("SHARPI_PREFIX_SCRATCH_TOKENS", "48"));
+
+        var tokenizer = new InterleavedAgenticTokenizer();
+        var fwd = new MultiSlotForwardPass { EmitNonStopFirst = true }; // force a decode Forward
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock", thinkTokenId: -1, endThinkTokenId: -1);
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 2 };
+
+        // B1: completes on the scratch slot; its transcript becomes scratch's shadow.
+        await Drain(engine.GenerateAsync("aux32", sp));
+
+        // B2: a disjoint short request resets the scratch KV, then throws mid-decode.
+        fwd.FailNextDecode = true;
+        await Assert.ThrowsAnyAsync<Exception>(async () => await Drain(engine.GenerateAsync("aux2", sp)));
+
+        long reusedBefore = engine.PrefillTokensReused;
+
+        // B3: same prompt as B1. If B2's failure had left the stale B1 shadow in place, B3 would
+        // reuse a 16-token page of it — into KV that B2 reset+overwrote. The shadow-null fix makes
+        // B3 reuse nothing.
+        await Drain(engine.GenerateAsync("aux32", sp));
+
+        Assert.Equal(reusedBefore, engine.PrefillTokensReused);
+    }
+
     private static IAsyncEnumerable<string> GenerateAsync(
         InferenceEngine engine, string prompt, string canonical, SamplingParams sp)
     {
@@ -947,9 +981,13 @@ public sealed class InferenceEnginePrefixCacheTests
 
         public IReadOnlyList<int> Encode(string text) => text switch
         {
-            "long" => Enumerable.Range(0, 64).ToArray(),
-            "aux"  => Enumerable.Range(500, 16).ToArray(),
-            _      => throw new ArgumentException($"unknown prompt: {text}", nameof(text)),
+            "long"  => Enumerable.Range(0, 64).ToArray(),
+            "aux"   => Enumerable.Range(500, 16).ToArray(),
+            // 32-token (>1 page) scratch-sized prompts for the mid-decode-failure test, where a
+            // reusable prefix requires length > PageSize. "aux2" is disjoint from "aux32".
+            "aux32"  => Enumerable.Range(500, 32).ToArray(),
+            "aux2"   => Enumerable.Range(600, 32).ToArray(),
+            _       => throw new ArgumentException($"unknown prompt: {text}", nameof(text)),
         };
 
         public string Decode(IEnumerable<int> tokens) => string.Empty;
@@ -988,6 +1026,13 @@ public sealed class InferenceEnginePrefixCacheTests
         /// <summary>Ids of slots bound via ActivateSlot, in order (empty in single-slot mode).</summary>
         public List<int> ActivatedIds { get; } = [];
 
+        /// <summary>When set, Prefill returns a non-stop token so the decode loop runs at least
+        /// one Forward (the EOS-on-prefill default breaks before any Forward).</summary>
+        public bool EmitNonStopFirst;
+        /// <summary>One-shot: the next Forward throws, simulating a mid-decode failure/cancel.</summary>
+        public bool FailNextDecode;
+        private const int NonStopToken = 5;
+
         // ── IForwardPass: route to the active slot ──
         public bool SupportsPartialRewind => true;
         public int VocabSize => 600;
@@ -995,6 +1040,11 @@ public sealed class InferenceEnginePrefixCacheTests
 
         public ReadOnlySpan<float> Forward(int token, int position)
         {
+            if (FailNextDecode)
+            {
+                FailNextDecode = false;
+                throw new InvalidOperationException("simulated mid-decode failure");
+            }
             _active.Length = position + 1;
             return EosLogits();
         }
@@ -1003,7 +1053,7 @@ public sealed class InferenceEnginePrefixCacheTests
         {
             _active.Prefills.Add((tokens.Count, startPos));
             _active.Length = startPos + tokens.Count;
-            return EosLogits();
+            return EmitNonStopFirst ? OneHot(NonStopToken) : EosLogits();
         }
 
         public void TruncateTo(int length)
@@ -1039,10 +1089,12 @@ public sealed class InferenceEnginePrefixCacheTests
 
         public void DeactivateSlot() => _active = _owned;
 
-        private ReadOnlySpan<float> EosLogits()
+        private ReadOnlySpan<float> EosLogits() => OneHot(Eos);
+
+        private ReadOnlySpan<float> OneHot(int token)
         {
             Array.Clear(_logits);
-            _logits[Eos] = 1.0f;
+            _logits[token] = 1.0f;
             return _logits;
         }
     }

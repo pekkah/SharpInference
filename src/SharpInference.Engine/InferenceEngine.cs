@@ -172,11 +172,18 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
             && fwd.SupportsPartialRewind
             && fwd is IMultiSlotKvCache ms && ms.SupportsMultiSlotPrefix)
         {
+            // The scratch tensor is clamped to the model's max context (AllocateScratchSlot caps at
+            // _maxSeqLen); clamp the routing cap to match so SelectSlot's footprint gate can't pass
+            // a request the (clamped) scratch allocation couldn't actually hold.
+            _scratchCap = Math.Min(_scratchCap, fwd.MaxSeqLen);
+
             // Allocating the extra scratch KV region can OOM: auto-context sizes _maxSeqLen to
             // fit exactly one full KV cache in VRAM and doesn't budget the scratch slot. Since
-            // the feature is opt-in, degrade to single-slot on failure rather than aborting
-            // engine construction. (Logger is DI-set after construction, so it's unavailable
-            // here — emit to stderr like the other SHARPI_* opt-in traces.)
+            // the feature is opt-in, degrade to single-slot on a device-allocation failure rather
+            // than aborting engine construction. (Logger is DI-set after construction, so it's
+            // unavailable here — emit to stderr like the other SHARPI_* opt-in traces.) A
+            // NotSupportedException means the capability checks above disagree with
+            // AllocateScratchSlot — a real bug, not an allocation failure — so let it propagate.
             try
             {
                 var scratch = ms.AllocateScratchSlot(_scratchCap);
@@ -184,7 +191,8 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                 _slots = [ms.OwnedSlot, scratch];
                 _slotTokens = new int[]?[2];
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not NotSupportedException and not OutOfMemoryException
+                                       and not OperationCanceledException)
             {
                 Console.Error.WriteLine(
                     $"[InferenceEngine] SHARPI_PREFIX_SLOTS=2: could not allocate the " +
@@ -193,6 +201,14 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
             }
         }
     }
+
+    /// <summary>
+    /// Issue #212: whether the 2-slot prefix cache is active for this engine. False when
+    /// <c>SHARPI_PREFIX_SLOTS</c> wasn't 2, the backend can't multi-slot, or the scratch
+    /// allocation failed and the engine degraded to single-slot. Lets a host observe the
+    /// degraded fallback (which otherwise only writes a one-shot stderr line at construction).
+    /// </summary>
+    public bool MultiSlotPrefixActive => _slots is not null;
 
     /// <summary>
     /// Back-compat constructor preserving the original positional signature
@@ -724,6 +740,15 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                             reusedTokens = prefixLen;
                             Interlocked.Add(ref _prefillTokensReused, prefixLen);
                         }
+
+                        // Issue #212: from here the active slot's KV is mutated (ResetCache wiped
+                        // it, or the upcoming prefill overwrites positions >= prefixLen). _prevTokens
+                        // was already read above for the prefix match, so null the active slot's
+                        // shadow now — a mid-decode throw/cancel skips the end-of-decode shadow
+                        // write, and a stale shadow would let the next request SelectSlot-match a
+                        // prefix whose KV was destroyed. Re-populated only on a complete decode.
+                        if (_slotTokens is not null && activeSlotIdx >= 0)
+                            _slotTokens[activeSlotIdx] = null;
 
                         // Prefill: process all prompt tokens (or just the suffix after the cached prefix).
                         //
