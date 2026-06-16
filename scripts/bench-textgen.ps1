@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory)][string]$Tag,
     [string[]]$ExtraArgs = @(),
     [string]$Prompt = "The capital of France is",
+    [string]$Temp = "0",
     [int]$NTokens = 60,
     [string]$OutDir = "tools\bench",
     [int]$TimeoutSec = 300
@@ -17,7 +18,10 @@ $cliDll = ".\src\SharpInference.Cli\bin\Release\net10.0\sharpi-cli.dll"
 # full-vocabulary LINQ OrderByDescending (262144 elements for Gemma 4) every decode step,
 # which adds ~1.5-2.5 ms/token of CPU overhead and badly understates the measured decode
 # t/s. Benchmarks must run without it to reflect real generation throughput.
-$argList = @("$cliDll", "-m", "$Model", "-p", "$Prompt", "--temp", "0",
+# --temp defaults to 0 (greedy) for back-compat; callers pass each model's
+# recommended sampling temperature via -Temp, with the rest of the sampling
+# knobs (top-p/top-k/min-p/repeat-penalty) supplied through -ExtraArgs.
+$argList = @("$cliDll", "-m", "$Model", "-p", "$Prompt", "--temp", "$Temp",
              "-n", "$NTokens", "--single-turn") + $ExtraArgs
 
 Write-Host "[$Tag] $($ExtraArgs -join ' ') (timeout ${TimeoutSec}s)" -ForegroundColor DarkGray
