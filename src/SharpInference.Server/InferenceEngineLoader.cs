@@ -267,12 +267,13 @@ public static class InferenceEngineLoader
             {
                 var cfwd = new CudaForwardPass(model, cuda, hp, ctxSize, enableTurboQuant: turboQuant);
                 owned.Add(cfwd);
-                // Issue #190: dense CUDA full-offload supports continuous batching (per-sequence
-                // GPU KV caches + true batched decode). SupportsContinuousBatching is the single
-                // source of truth shared with CudaForwardPass's runtime guard, so the loader gate
-                // can't diverge from what the batched methods accept — it folds in MoE, Gemma-4
-                // (per-layer head_dim), TurboQuant, an auto/explicit SnapKV budget, a final-logit
-                // softcap, and any non-GEMM-N-batchable trunk/output weight dtype (Q4_0).
+                // Issue #190 (dense) / #195 (Gemma 4): CUDA full-offload supports continuous
+                // batching (per-sequence GPU KV caches + true batched decode). SupportsContinuous-
+                // Batching is the single source of truth shared with CudaForwardPass's runtime
+                // guard, so the loader gate can't diverge from what the batched methods accept — it
+                // admits dense AND Gemma-4 models and folds OUT MoE, TurboQuant, an auto/explicit
+                // SnapKV budget, a dense final-logit softcap, and any non-GEMM-N-batchable
+                // trunk/output weight dtype (Q4_0).
                 return (cfwd, cfwd.SupportsContinuousBatching);
             }
 
