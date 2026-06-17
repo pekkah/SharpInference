@@ -3023,70 +3023,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
             _gpu.HeadNormPureBatched(vAll, layerKv, layerHd, N, _hp.RmsNormEps);
         ApplyRopeBatched();
 
-        if (!kvShared)
-        {
-            int layerCtx = isSwa && window > 0 ? SwaRingSize(_maxSeqLen, window) : _maxSeqLen;
-            if (_kvDType == DType.BFloat16)
-                _gpu.KvAppendBatchedBf16(kAll, vAll, _gpuKCache[layer], _gpuVCache[layer], kvDimL, startPos, layerCtx, N);
-            else if (_kvDType == DType.Q8_0)
-                _gpu.KvAppendBatchedQ8_0(kAll, vAll, _gpuKCache[layer], _gpuVCache[layer], kvDimL, startPos, layerCtx, N);
-            else
-                _gpu.KvAppendBatched(kAll, vAll, _gpuKCache[layer], _gpuVCache[layer], kvDimL, startPos, layerCtx, N);
-        }
-
+        // Append-target ring (this layer's own KV) and attention-source ring (the effective
+        // layer's — same as `layer` unless shared-KV aliases it). SWA layers wrap a window-
+        // sized ring; everything else is full-context.
+        int appendCtx = isSwa && window > 0 ? SwaRingSize(_maxSeqLen, window) : _maxSeqLen;
         int effLayerCtx = (_hp.IsSwaLayer is { } swaEff && swaEff[effLayer] && window > 0)
             ? SwaRingSize(_maxSeqLen, window) : _maxSeqLen;
-
-        if (s_prefillProfile) { _gpu.Synchronize(); _profSw.Restart(); }
-        // Gemma 4: attention_scale = 1.0, passed explicitly (kernel skips its rsqrtf).
-        // Other models pass _attnScale = -1 so the kernel derives 1/sqrt(head_dim).
-        if (_kvDType is DType.BFloat16 or DType.Q8_0)
-        {
-            // Narrowed KV (bf16/q8_0, #179). The tensor-core flash kernel (Tc2) has a
-            // templated thunk per dtype and streams K/V, so head_dim%64 layers use it for
-            // any length (incl. chunked prefill past 4096). Other head_dims fall to the
-            // scalar batched narrowed kernels, which the gate keeps ≤4096 (canChunkPast4096
-            // requires Tc2 covers all layers). The single-warp Tc and half2 flash kernels
-            // have no narrowed thunk yet — a trivial follow-up only a non-%64 head_dim model
-            // past 4096 would need.
-            if (PrefillFlashTcEnabled && !_forceFlashTc1 && (layerHd & 63) == 0)
-                _gpu.FlashAttentionPrefillTc2(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                    _numHeads, layerKv, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N,
-                    attnScale: _attnScale, kvCacheType: _kvDType);
-            else if (isSwa && _kvDType == DType.BFloat16)
-                _gpu.AttentionSwaBatchedBf16(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                    _numHeads, layerKv, layerHd, startPos, window, effLayerCtx, N, attnScale: _attnScale);
-            else if (isSwa)
-                _gpu.AttentionSwaBatchedQ8_0(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                    _numHeads, layerKv, layerHd, startPos, window, effLayerCtx, N, attnScale: _attnScale);
-            else if (_kvDType == DType.BFloat16)
-                _gpu.AttentionBatchedBf16(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                    _numHeads, layerKv, layerHd, startPos, effLayerCtx, N, attnScale: _attnScale);
-            else
-                _gpu.AttentionBatchedQ8_0(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                    _numHeads, layerKv, layerHd, startPos, effLayerCtx, N, attnScale: _attnScale);
-        }
-        else if (PrefillFlashTcEnabled && (layerHd & 15) == 0)
-        {
-            // #147 multi-warp/d-split when head_dim is a multiple of 64 (W·16); else the
-            // #146 single-warp kernel. SHARPI_PREFILL_FLASH_TC1=1 forces single-warp (A/B).
-            if (!_forceFlashTc1 && (layerHd & 63) == 0)
-                _gpu.FlashAttentionPrefillTc2(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                    _numHeads, layerKv, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
-            else
-                _gpu.FlashAttentionPrefillTc(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                    _numHeads, layerKv, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
-        }
-        else if (PrefillFlashAttnEnabled)
-            _gpu.FlashAttentionPrefill(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                _numHeads, layerKv, layerHd, startPos, isSwa ? window : 0, effLayerCtx, N, attnScale: _attnScale);
-        else if (isSwa)
-            _gpu.AttentionSwaBatched(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                _numHeads, layerKv, layerHd, startPos, window, effLayerCtx, N, attnScale: _attnScale);
-        else
-            _gpu.AttentionBatched(qAll, _gpuKCache[effLayer], _gpuVCache[effLayer], attnAll,
-                _numHeads, layerKv, layerHd, startPos, effLayerCtx, N, attnScale: _attnScale);
-        if (s_prefillProfile) { _gpu.Synchronize(); _profAttnMs += _profSw.Elapsed.TotalMilliseconds; }
+        GpuPrefillAppendAttention(
+            qAll, kAll, vAll, attnAll,
+            kvShared ? null : _gpuKCache[layer], kvShared ? null : _gpuVCache[layer],
+            _gpuKCache[effLayer], _gpuVCache[effLayer],
+            _numHeads, layerKv, layerHd, startPos, N,
+            isSwa, window, appendCtx, effLayerCtx);
 
         GpuMatMulBatched(_bpHidden!, _wo[layer], attnAll, N);
         if (_wPostAttnNorm is not null)
@@ -3127,6 +3075,282 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
             _gpu.ScaleInPlace(_bpHidden!, _layerOutputScale[layer]);
 
         _gpu.Free(qAll); _gpu.Free(kAll); _gpu.Free(vAll); _gpu.Free(attnAll);
+    }
+
+    /// <summary>
+    /// Shared KV-append + attention dispatch for a contiguous span of <paramref name="nTok"/>
+    /// query rows at absolute positions [<paramref name="startPos"/>, startPos+nTok). When
+    /// <paramref name="kAppend"/>/<paramref name="vAppend"/> are non-null the rows' K/V are
+    /// appended into that ring (skipped for Gemma-4 shared-KV layers, which reuse the source
+    /// layer's cache); the queries then attend against <paramref name="kAttn"/>/<paramref
+    /// name="vAttn"/> over [0, startPos+i] (causal, SWA-windowed when <paramref name="isSwa"/>).
+    /// Factored out of <see cref="GpuLayerBatchedTrunk"/> so the packed multi-prompt prefill
+    /// (issue #193) drives the IDENTICAL dispatch per sub-sequence — guaranteeing it is
+    /// argmax-stable with the single-sequence batched trunk it amortizes across prompts.
+    /// </summary>
+    private void GpuPrefillAppendAttention(
+        Tensor qAll, Tensor kAll, Tensor vAll, Tensor attnAll,
+        Tensor? kAppend, Tensor? vAppend, Tensor kAttn, Tensor vAttn,
+        int numHeads, int layerKv, int layerHd, int startPos, int nTok,
+        bool isSwa, int window, int appendCtx, int effLayerCtx)
+    {
+        if (kAppend is not null && vAppend is not null)
+        {
+            int kvDimL = layerKv * layerHd;
+            if (_kvDType == DType.BFloat16)
+                _gpu.KvAppendBatchedBf16(kAll, vAll, kAppend, vAppend, kvDimL, startPos, appendCtx, nTok);
+            else if (_kvDType == DType.Q8_0)
+                _gpu.KvAppendBatchedQ8_0(kAll, vAll, kAppend, vAppend, kvDimL, startPos, appendCtx, nTok);
+            else
+                _gpu.KvAppendBatched(kAll, vAll, kAppend, vAppend, kvDimL, startPos, appendCtx, nTok);
+        }
+
+        if (s_prefillProfile) { _gpu.Synchronize(); _profSw.Restart(); }
+        // Gemma 4: attention_scale = 1.0, passed explicitly (kernel skips its rsqrtf).
+        // Other models pass _attnScale = -1 so the kernel derives 1/sqrt(head_dim).
+        if (_kvDType is DType.BFloat16 or DType.Q8_0)
+        {
+            // Narrowed KV (bf16/q8_0, #179). The tensor-core flash kernel (Tc2) has a
+            // templated thunk per dtype and streams K/V, so head_dim%64 layers use it for
+            // any length (incl. chunked prefill past 4096). Other head_dims fall to the
+            // scalar batched narrowed kernels, which the gate keeps ≤4096 (canChunkPast4096
+            // requires Tc2 covers all layers). The single-warp Tc and half2 flash kernels
+            // have no narrowed thunk yet — a trivial follow-up only a non-%64 head_dim model
+            // past 4096 would need.
+            if (PrefillFlashTcEnabled && !_forceFlashTc1 && (layerHd & 63) == 0)
+                _gpu.FlashAttentionPrefillTc2(qAll, kAttn, vAttn, attnAll,
+                    numHeads, layerKv, layerHd, startPos, isSwa ? window : 0, effLayerCtx, nTok,
+                    attnScale: _attnScale, kvCacheType: _kvDType);
+            else if (isSwa && _kvDType == DType.BFloat16)
+                _gpu.AttentionSwaBatchedBf16(qAll, kAttn, vAttn, attnAll,
+                    numHeads, layerKv, layerHd, startPos, window, effLayerCtx, nTok, attnScale: _attnScale);
+            else if (isSwa)
+                _gpu.AttentionSwaBatchedQ8_0(qAll, kAttn, vAttn, attnAll,
+                    numHeads, layerKv, layerHd, startPos, window, effLayerCtx, nTok, attnScale: _attnScale);
+            else if (_kvDType == DType.BFloat16)
+                _gpu.AttentionBatchedBf16(qAll, kAttn, vAttn, attnAll,
+                    numHeads, layerKv, layerHd, startPos, effLayerCtx, nTok, attnScale: _attnScale);
+            else
+                _gpu.AttentionBatchedQ8_0(qAll, kAttn, vAttn, attnAll,
+                    numHeads, layerKv, layerHd, startPos, effLayerCtx, nTok, attnScale: _attnScale);
+        }
+        else if (PrefillFlashTcEnabled && (layerHd & 15) == 0)
+        {
+            // #147 multi-warp/d-split when head_dim is a multiple of 64 (W·16); else the
+            // #146 single-warp kernel. SHARPI_PREFILL_FLASH_TC1=1 forces single-warp (A/B).
+            if (!_forceFlashTc1 && (layerHd & 63) == 0)
+                _gpu.FlashAttentionPrefillTc2(qAll, kAttn, vAttn, attnAll,
+                    numHeads, layerKv, layerHd, startPos, isSwa ? window : 0, effLayerCtx, nTok, attnScale: _attnScale);
+            else
+                _gpu.FlashAttentionPrefillTc(qAll, kAttn, vAttn, attnAll,
+                    numHeads, layerKv, layerHd, startPos, isSwa ? window : 0, effLayerCtx, nTok, attnScale: _attnScale);
+        }
+        else if (PrefillFlashAttnEnabled)
+            _gpu.FlashAttentionPrefill(qAll, kAttn, vAttn, attnAll,
+                numHeads, layerKv, layerHd, startPos, isSwa ? window : 0, effLayerCtx, nTok, attnScale: _attnScale);
+        else if (isSwa)
+            _gpu.AttentionSwaBatched(qAll, kAttn, vAttn, attnAll,
+                numHeads, layerKv, layerHd, startPos, window, effLayerCtx, nTok, attnScale: _attnScale);
+        else
+            _gpu.AttentionBatched(qAll, kAttn, vAttn, attnAll,
+                numHeads, layerKv, layerHd, startPos, effLayerCtx, nTok, attnScale: _attnScale);
+        if (s_prefillProfile) { _gpu.Synchronize(); _profAttnMs += _profSw.Elapsed.TotalMilliseconds; }
+    }
+
+    /// <summary>
+    /// One transformer layer of the PACKED multi-prompt prefill (issue #193): the dense subset
+    /// of <see cref="GpuLayerBatchedTrunk"/> with the attention block run per sub-sequence. The
+    /// RmsNorm / QKV / O / FFN GEMMs run batched over the full packed N (= Σ chunk_len, so each
+    /// weight read amortizes across all prompts); QK-norm / RoPE / KV-append / attention run per
+    /// sub-sequence on a slice of the packed Q/K/V buffers at that sequence's absolute startPos
+    /// against its own cache (cu_seqlens-style varlen — no cross-sequence attention, no padding).
+    /// Dense-only: the caller's <see cref="ThrowIfBatchingUnsupported"/> (via
+    /// <see cref="DenseBatchedDecodeSupported"/>) rejects every Gemma-4 / softcap model, so no
+    /// PLE / SWA / per-layer-head_dim / shared-KV / k_eq_v / sandwich-norm / layer_output_scale /
+    /// softcap path is reachable here. (<see cref="IsBatchedPrefillSupported"/> alone is NOT
+    /// enough — Gemma 4 satisfies it; <see cref="PrefillPackedTrunkMulti"/> asserts the stronger
+    /// contract.)
+    /// </summary>
+    private void GpuLayerPackedTrunk(int layer, int[] off, int[] startPos, CudaSequenceKvCache[] caches, int S, int N)
+    {
+        int qDim = _numHeads * _headDim;
+        int kvDim = _numKvHeads * _headDim;
+
+        var qAll = _gpu.View(_bpQ!, 0, (long)N * qDim);
+        var kAll = _gpu.View(_bpK!, 0, (long)N * kvDim);
+        var vAll = _gpu.View(_bpV!, 0, (long)N * kvDim);
+        var attnAll = _gpu.View(_bpAttnOut!, 0, (long)N * qDim);
+
+        _gpu.CopyDevice(_bpResidual!, _bpHidden!);
+        _gpu.RmsNormBatched(_bpNorm!, _bpHidden!, _wAttnNorm[layer], N, _embDim, _hp.RmsNormEps);
+
+        GpuMatMulBatched(qAll, _wq[layer], _bpNorm!, N);
+        GpuMatMulBatched(kAll, _wk[layer], _bpNorm!, N);
+        GpuMatMulBatched(vAll, _wv[layer]!, _bpNorm!, N);
+
+        bool useRoPE = _hp.NoRopeLayerStep == 0 || (layer + 1) % _hp.NoRopeLayerStep != 0;
+        float ropeTheta = _hp.RopeTheta;
+
+        // Per sub-sequence: QK-norm before RoPE (#157), then KV-append + varlen attention into
+        // that sequence's own cache via the shared dispatch. Each op acts on the chunk's slice
+        // of the packed buffers at its absolute startPos[s].
+        for (int s = 0; s < S; s++)
+        {
+            int len = off[s + 1] - off[s];
+            var qS = _gpu.View(_bpQ!, (long)off[s] * qDim, (long)len * qDim);
+            var kS = _gpu.View(_bpK!, (long)off[s] * kvDim, (long)len * kvDim);
+            var vS = _gpu.View(_bpV!, (long)off[s] * kvDim, (long)len * kvDim);
+            var aS = _gpu.View(_bpAttnOut!, (long)off[s] * qDim, (long)len * qDim);
+            try
+            {
+                if (_hasQkNorm && !_hp.UseL2QkNorm)
+                    _gpu.HeadNormQkBatched(qS, _wqNorm![layer], kS, _wkNorm![layer],
+                        _numHeads, _numKvHeads, _headDim, len, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                if (useRoPE)
+                {
+                    if (_gpuRopeFreqs is { } rfTbl)
+                    {
+                        _gpu.RoPEWithFactorsBatched(qS, startPos[s], _headDim, ropeTheta, rfTbl, _numHeads, len);
+                        _gpu.RoPEWithFactorsBatched(kS, startPos[s], _headDim, ropeTheta, rfTbl, _numKvHeads, len);
+                    }
+                    else
+                    {
+                        _gpu.RoPEPartialBatched(qS, startPos[s], _headDim, _headDim, ropeTheta, _numHeads, len, neox: true);
+                        _gpu.RoPEPartialBatched(kS, startPos[s], _headDim, _headDim, ropeTheta, _numKvHeads, len, neox: true);
+                    }
+                }
+                var kc = caches[s].K[layer];
+                var vc = caches[s].V[layer];
+                GpuPrefillAppendAttention(qS, kS, vS, aS, kc, vc, kc, vc,
+                    _numHeads, _numKvHeads, _headDim, startPos[s], len,
+                    isSwa: false, window: 0, appendCtx: _maxSeqLen, effLayerCtx: _maxSeqLen);
+            }
+            finally
+            {
+                _gpu.Free(qS); _gpu.Free(kS); _gpu.Free(vS); _gpu.Free(aS);
+            }
+        }
+
+        GpuMatMulBatched(_bpHidden!, _wo[layer], attnAll, N);
+        _gpu.AddInPlace(_bpHidden!, _bpResidual!);
+
+        // FFN.
+        _gpu.CopyDevice(_bpResidual!, _bpHidden!);
+        _gpu.RmsNormBatched(_bpNorm!, _bpHidden!, _wFfnNorm[layer], N, _embDim, _hp.RmsNormEps);
+        GpuMatMulBatched(_bpFfnGate!, _wGate[layer], _bpNorm!, N);
+        GpuMatMulBatched(_bpFfnUp!,   _wUp[layer],   _bpNorm!, N);
+        if (_hp.FfnActivation == FfnActivation.GeluApprox)
+            _gpu.GeluTanhMul(_bpFfnGate!, _bpFfnUp!);
+        else
+            _gpu.SiLuMul(_bpFfnGate!, _bpFfnUp!);
+        GpuMatMulBatched(_bpHidden!, _wDown[layer], _bpFfnGate!, N);
+        _gpu.AddInPlace(_bpHidden!, _bpResidual!);
+
+        _gpu.Free(qAll); _gpu.Free(kAll); _gpu.Free(vAll); _gpu.Free(attnAll);
+    }
+
+    /// <summary>
+    /// True packed multi-prompt prefill (issue #193): concatenate the S chunks token-major into
+    /// the trunk scratch and run one forward pass over N = Σ chunk_len so every trunk + output
+    /// GEMM amortizes its weight read across all prompts (mirrors the CPU
+    /// <see cref="ForwardPass.PrefillPackedMulti"/> and the single-sequence
+    /// <see cref="PrefillBatchedTrunk"/>). Per-sequence RoPE / QK-norm / KV-append / varlen
+    /// attention keep each chunk attending only to its own cache. Advances each cache's logical
+    /// length and returns the final-token logits per sequence where <paramref name="wantLogits"/>
+    /// (the chunk completes that prompt), null otherwise. Dense-only; gated by the caller.
+    /// </summary>
+    private float[]?[] PrefillPackedTrunkMulti(
+        ReadOnlyMemory<int>[] chunks, int[] startPos, CudaSequenceKvCache[] caches, bool[] wantLogits)
+    {
+        // Defense-in-depth: the packed trunk is dense-only — it omits every Gemma-4 step (PLE,
+        // SWA rings, per-layer head_dim, shared-KV aliasing, k_eq_v, sandwich norms,
+        // layer_output_scale) and the final-logit softcap. The caller's
+        // ThrowIfBatchingUnsupported (via DenseBatchedDecodeSupported) already rejects all of
+        // these, so this is unreachable in production; assert it loudly rather than silently
+        // emitting garbage if a future caller skips that guard or relaxes it for another batched
+        // feature. IsBatchedPrefillSupported alone is NOT sufficient — Gemma 4 satisfies it.
+        if (_isGemma4Like || _hp.HasPerLayerTokenEmbd || _hp.LayerHeadDim is not null
+            || _hp.SlidingWindowSize > 0 || _hp.KvSourceLayer is not null || _hp.FinalLogitSoftcap > 0f)
+            throw new InvalidOperationException(
+                "PrefillPackedTrunkMulti is dense-only; this model requires the Gemma-4 / softcap " +
+                "path that ThrowIfBatchingUnsupported should have rejected before reaching here.");
+
+        int S = chunks.Length;
+        var off = new int[S + 1];
+        for (int s = 0; s < S; s++)
+            off[s + 1] = off[s] + chunks[s].Length;
+        int N = off[S];
+        int embDim = _embDim;
+
+        EnsureBatchedTrunkScratch(N);
+
+        // 1. Embed every token token-major into _bpHidden (sequence s's row i at off[s]+i).
+        //    EmbedTokenGpu is the same lookup the single-user prefill uses, so this is
+        //    bit-identical to prefilling each chunk on its own.
+        for (int s = 0; s < S; s++)
+        {
+            var span = chunks[s].Span;
+            for (int i = 0; i < span.Length; i++)
+            {
+                EmbedTokenGpu(span[i]);   // writes _hidden
+                _gpu.CopyDeviceRegion(_bpHidden!, (long)(off[s] + i) * embDim * sizeof(float),
+                                      _hidden, 0, (long)embDim * sizeof(float));
+            }
+        }
+        if (_hp.EmbeddingScale != 1f)
+            _gpu.ScaleInPlace(_bpHidden!, _hp.EmbeddingScale);
+
+        // 2. Transformer layers: batched GEMMs over N, per-sequence attention.
+        for (int layer = 0; layer < _hp.NumLayers; layer++)
+            GpuLayerPackedTrunk(layer, off, startPos, caches, S, N);
+
+        // 3. Per-sequence final norm + output projection on each completed prompt's last token.
+        //    The output GEMM is per-sequence (last rows are at scattered offsets), but it runs
+        //    only for the prompts whose final chunk landed this pass, so it's at most S small
+        //    matvecs against the already-resident lm-head weights.
+        var result = new float[]?[S];
+        int vocab = _hp.VocabSize;
+        for (int s = 0; s < S; s++)
+        {
+            // Lengths advance only here, after the whole layer loop — a throw in the layer loop
+            // leaves every cache length untouched. A throw within THIS step-3 loop can leave
+            // earlier sequences advanced and later ones not, but that is safe: the only caller
+            // (ContinuousBatchingEngine.RunPrefillStep) fails and disposes EVERY involved cache
+            // on any throw, so a partially-committed batch is never observed.
+            caches[s].Length = startPos[s] + (off[s + 1] - off[s]);
+            if (!wantLogits[s]) continue;
+            var lastHidden = _gpu.View(_bpHidden!, (long)(off[s + 1] - 1) * embDim, embDim);
+            _gpu.RmsNorm(_hidden, lastHidden, _wOutputNorm, _hp.RmsNormEps);
+            _gpu.Free(lastHidden);
+            GpuMatMul(_logits, _wOutput, _hidden);
+            // No softcap: ThrowIfBatchingUnsupported (via DenseBatchedDecodeSupported) rejects
+            // any FinalLogitSoftcap model before this method is reached, and the dense-only
+            // assertion at the top re-checks it.
+            _gpu.Download(_logits, _logitsBuf);
+            _gpu.Synchronize();
+            result[s] = _logitsBuf.AsSpan(0, vocab).ToArray();
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Whether the packed multi-prompt prefill can run: every sub-sequence's attention range
+    /// [0, startPos+len) must fit the active prefill attention kernel's cap. The non-flash
+    /// shared-scores AttentionBatched kernel throws above startPos+len=4096; the streaming flash
+    /// kernels have no cap when they cover all layers. Mirrors the single-sequence
+    /// <see cref="Prefill"/> gate (issue #162); dense models have no SWA, so canChunkPast4096
+    /// reduces to "flash covers all layers".
+    /// </summary>
+    private bool AllChunksPackable(ReadOnlyMemory<int>[] chunks, int[] startPos)
+    {
+        bool flashCoversAll = _kvDType is DType.BFloat16 or DType.Q8_0
+            ? NarrowedFlashTc2CoversAllLayers()
+            : PrefillFlashAttnEnabled;
+        bool canChunkPast4096 = flashCoversAll && (_hp.IsSwaLayer is not null || _hp.SlidingWindowSize <= 0);
+        int cap = canChunkPast4096 ? _maxSeqLen : 4096;
+        for (int s = 0; s < chunks.Length; s++)
+            if (startPos[s] + chunks[s].Length > cap) return false;
+        return true;
     }
 
     /// <summary>
@@ -3496,10 +3720,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     }
 
     /// <summary>
-    /// Prefill several pending sequences' chunks. Cross-prompt packing into one forward pass
-    /// is a follow-up (issue #190); for now each chunk prefills sequentially into its own
-    /// per-sequence cache via <see cref="PrefillWithCache"/> — still correct and still
-    /// amortizing the batched-trunk GEMMs within each chunk, just not across prompts.
+    /// Prefill several pending sequences' chunks in ONE packed forward pass (issue #193):
+    /// the S chunks are concatenated token-major and run through the trunk over N = Σ chunk_len
+    /// so every weight read amortizes across all prompts (like <see cref="BatchForwardMulti"/>
+    /// does for decode), with per-sequence varlen attention into each chunk's own cache. Falls
+    /// back to the sequential per-sequence <see cref="PrefillWithCache"/> loop (still correct,
+    /// just not cross-prompt amortized) when the batched trunk can't run this model
+    /// (<see cref="IsBatchedPrefillSupported"/> — e.g. attn bias / L2 QK-norm / non-NEOX RoPE),
+    /// when any sub-sequence's attention range exceeds the kernel cap
+    /// (<see cref="AllChunksPackable"/>), or for a single chunk (nothing to amortize across).
     /// </summary>
     internal float[]?[] PrefillPackedMulti(
         ReadOnlyMemory<int>[] chunks, int[] startPos, CudaSequenceKvCache[] caches, bool[] wantLogits)
@@ -3513,6 +3742,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         if (S == 0) return Array.Empty<float[]?>();
         if (startPos.Length != S || caches.Length != S || wantLogits.Length != S)
             throw new ArgumentException("chunks/startPos/caches/wantLogits lengths must match.");
+        for (int s = 0; s < S; s++)
+        {
+            if (chunks[s].IsEmpty)
+                throw new ArgumentException($"Chunk for sequence {s} is empty.", nameof(chunks));
+            if (startPos[s] < 0 || (long)startPos[s] + chunks[s].Length > _maxSeqLen)
+                throw new ArgumentException(
+                    $"Sequence {s}: startPos {startPos[s]} + chunk {chunks[s].Length} exceeds maxSeqLen {_maxSeqLen}.",
+                    nameof(startPos));
+        }
+
+        if (S >= 2 && IsBatchedPrefillSupported() && AllChunksPackable(chunks, startPos))
+            return PrefillPackedTrunkMulti(chunks, startPos, caches, wantLogits);
 
         var result = new float[]?[S];
         for (int s = 0; s < S; s++)

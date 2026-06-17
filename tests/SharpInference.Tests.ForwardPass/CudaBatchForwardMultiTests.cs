@@ -504,6 +504,178 @@ public sealed class CudaBatchForwardMultiTests
         Assert.True(maxAbs < 1.0f, $"Chunked-vs-full prefill maxAbs={maxAbs}.");
     }
 
+    /// <summary>
+    /// Issue #193: <see cref="CudaForwardPass.PrefillPackedMulti"/> packs two prompts into ONE
+    /// forward pass (weights amortized across both). Each sequence's final-token logits must
+    /// reproduce the per-sequence <see cref="CudaForwardPass.PrefillWithCache"/> oracle (the
+    /// sequential path #193 replaces) — same kernels via the shared dispatch, only the trunk
+    /// GEMMs now batch across prompts, so argmax-stable within the cross-path tolerance.
+    /// </summary>
+    [Fact]
+    public void Qwen3_8B_PrefillPackedMulti_N2_MatchesSequential()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.Null(hp.LayerHeadDim);
+        using var fwd = NewFwd(model, gpu, hp);
+
+        // Sequential reference: each prompt prefilled on its own (the per-sequence loop).
+        using var refA = fwd.CreateCache();
+        using var refB = fwd.CreateCache();
+        float[] seqA = fwd.PrefillWithCache(PromptA, refA).ToArray();
+        float[] seqB = fwd.PrefillWithCache(PromptB, refB).ToArray();
+
+        // Packed: both prompts concatenated into one pass.
+        using var packA = fwd.CreateCache();
+        using var packB = fwd.CreateCache();
+        float[]?[] packed = fwd.PrefillPackedMulti(
+            [PromptA, PromptB],
+            [0, 0],
+            [packA, packB],
+            [true, true]);
+
+        Assert.Equal(2, packed.Length);
+        Assert.NotNull(packed[0]);
+        Assert.NotNull(packed[1]);
+        Assert.Equal(PromptA.Length, packA.Length);
+        Assert.Equal(PromptB.Length, packB.Length);
+
+        var (maxAbsA, overlapA) = Compare(seqA, packed[0]!);
+        Assert.Equal(Argmax(seqA), Argmax(packed[0]!));
+        Assert.True(overlapA >= 4, $"Seq A packed top-5 overlap {overlapA}/5 (maxAbs={maxAbsA}).");
+        Assert.True(maxAbsA < 1.0f, $"Seq A packed vs sequential maxAbs={maxAbsA}.");
+
+        var (maxAbsB, overlapB) = Compare(seqB, packed[1]!);
+        Assert.Equal(Argmax(seqB), Argmax(packed[1]!));
+        Assert.True(overlapB >= 4, $"Seq B packed top-5 overlap {overlapB}/5 (maxAbs={maxAbsB}).");
+        Assert.True(maxAbsB < 1.0f, $"Seq B packed vs sequential maxAbs={maxAbsB}.");
+    }
+
+    /// <summary>
+    /// Issue #193: chunked packed prefill — two prompts of different lengths advance together in
+    /// chunk steps (mirroring the engine's <c>RunPrefillStep</c>), and only each prompt's final
+    /// chunk requests logits. The result must match a single whole-prompt prefill, validating
+    /// that later chunks read prior chunks' KV correctly AND that a step left with one prompt
+    /// (the shorter one finished) falls back through the S&lt;2 sequential path cleanly.
+    /// </summary>
+    [Fact]
+    public void Qwen3_8B_PrefillPackedMulti_Chunked_MatchesWhole()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.Null(hp.LayerHeadDim);
+        using var fwd = NewFwd(model, gpu, hp);
+
+        int[] longA = { 9707, 11, 1879, 0, 358, 1079, 264, 4108, 1614, 13, 220, 17, 18, 19 };
+        int[] longB = { 1079, 264, 4108, 1614, 13, 220, 17, 9707, 11, 1879 };
+
+        using var refA = fwd.CreateCache();
+        using var refB = fwd.CreateCache();
+        float[] wholeA = fwd.PrefillWithCache(longA, refA).ToArray();
+        float[] wholeB = fwd.PrefillWithCache(longB, refB).ToArray();
+
+        using var packA = fwd.CreateCache();
+        using var packB = fwd.CreateCache();
+        int cA = 0, cB = 0;
+        const int chunk = 4;
+        float[]? finalA = null, finalB = null;
+        while (cA < longA.Length || cB < longB.Length)
+        {
+            var chunks = new List<ReadOnlyMemory<int>>();
+            var starts = new List<int>();
+            var caches = new List<CudaSequenceKvCache>();
+            var wants = new List<bool>();
+            var which = new List<int>();
+            if (cA < longA.Length)
+            {
+                int take = Math.Min(chunk, longA.Length - cA);
+                chunks.Add(longA.AsMemory(cA, take)); starts.Add(cA); caches.Add(packA);
+                wants.Add(cA + take == longA.Length); which.Add(0); cA += take;
+            }
+            if (cB < longB.Length)
+            {
+                int take = Math.Min(chunk, longB.Length - cB);
+                chunks.Add(longB.AsMemory(cB, take)); starts.Add(cB); caches.Add(packB);
+                wants.Add(cB + take == longB.Length); which.Add(1); cB += take;
+            }
+            var res = fwd.PrefillPackedMulti(chunks.ToArray(), starts.ToArray(), caches.ToArray(), wants.ToArray());
+            for (int i = 0; i < which.Count; i++)
+                if (res[i] is { } lg) { if (which[i] == 0) finalA = lg; else finalB = lg; }
+        }
+
+        Assert.Equal(longA.Length, packA.Length);
+        Assert.Equal(longB.Length, packB.Length);
+        Assert.NotNull(finalA);
+        Assert.NotNull(finalB);
+
+        Assert.Equal(Argmax(wholeA), Argmax(finalA!));
+        var (maxAbsA, overlapA) = Compare(wholeA, finalA!);
+        Assert.True(overlapA >= 4, $"Chunked A top-5 overlap {overlapA}/5 (maxAbs={maxAbsA}).");
+        Assert.True(maxAbsA < 1.0f, $"Chunked A maxAbs={maxAbsA}.");
+
+        Assert.Equal(Argmax(wholeB), Argmax(finalB!));
+        var (maxAbsB, overlapB) = Compare(wholeB, finalB!);
+        Assert.True(overlapB >= 4, $"Chunked B top-5 overlap {overlapB}/5 (maxAbs={maxAbsB}).");
+        Assert.True(maxAbsB < 1.0f, $"Chunked B maxAbs={maxAbsB}.");
+    }
+
+    /// <summary>
+    /// Issue #193 end-to-end: packed prefill must leave each per-sequence cache in the exact
+    /// state a batched decode step needs. Pack two prompts, then run one
+    /// <see cref="CudaForwardPass.BatchForwardMulti"/> decode step and require each sequence to
+    /// reproduce the single-user prefill+decode next-token logits — the real engine path
+    /// (packed admission → batched decode).
+    /// </summary>
+    [Fact]
+    public void Qwen3_8B_PrefillPackedMulti_ThenBatchedDecode_MatchesSingleUser()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.Null(hp.LayerHeadDim);
+        using var fwd = NewFwd(model, gpu, hp);
+
+        // Single-user reference: prefill, greedy token, one decode step.
+        fwd.ResetCache();
+        int tokA = Argmax(fwd.Prefill(PromptA));
+        float[] refA = fwd.Forward(tokA, PromptA.Length).ToArray();
+        fwd.ResetCache();
+        int tokB = Argmax(fwd.Prefill(PromptB));
+        float[] refB = fwd.Forward(tokB, PromptB.Length).ToArray();
+
+        using var packA = fwd.CreateCache();
+        using var packB = fwd.CreateCache();
+        var packed = fwd.PrefillPackedMulti([PromptA, PromptB], [0, 0], [packA, packB], [true, true]);
+        Assert.Equal(tokA, Argmax(packed[0]!));
+        Assert.Equal(tokB, Argmax(packed[1]!));
+
+        var batch = fwd.BatchForwardMulti([tokA, tokB], [PromptA.Length, PromptB.Length], [packA, packB]);
+
+        var (maxAbsA, overlapA) = Compare(refA, batch[0]);
+        Assert.Equal(Argmax(refA), Argmax(batch[0]));
+        Assert.True(overlapA >= 4, $"Seq A packed→decode top-5 overlap {overlapA}/5 (maxAbs={maxAbsA}).");
+        Assert.True(maxAbsA < 1.0f, $"Seq A packed→decode maxAbs={maxAbsA}.");
+
+        var (maxAbsB, overlapB) = Compare(refB, batch[1]);
+        Assert.Equal(Argmax(refB), Argmax(batch[1]));
+        Assert.True(overlapB >= 4, $"Seq B packed→decode top-5 overlap {overlapB}/5 (maxAbs={maxAbsB}).");
+        Assert.True(maxAbsB < 1.0f, $"Seq B packed→decode maxAbs={maxAbsB}.");
+    }
+
     /// <summary>Empty token list and empty batch are rejected / no-op, matching the CPU path.</summary>
     [Fact]
     public void Qwen3_8B_BatchForwardMulti_EmptyBatch_ReturnsEmpty()
