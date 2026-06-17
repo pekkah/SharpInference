@@ -29,11 +29,23 @@ public sealed class ExpertCache<T> : IDisposable
         // Split: 25% probationary, 75% protected — biased toward retention since routing is skewed.
         int probCap = Math.Max(1, capacity / 4);
         int protCap = Math.Max(1, capacity - probCap);
+        // Both segments floor at 1, so the true max residency is probCap + protCap, which
+        // exceeds the requested capacity at capacity == 1 (1 + 1 = 2). Callers that
+        // pre-provision per-entry resources (e.g. the CUDA slab's fixed slot pool) must
+        // size from this, not the requested capacity, or they under-provision and overflow.
+        Capacity = probCap + protCap;
         Func<(int Layer, int ExpertId), long>? freq =
             frequencyOf is null ? null : k => frequencyOf(k.Layer, k.ExpertId);
         _slru = new SlruCache<(int, int), T>(probCap, protCap, freq);
         _onEvict = onEvict;
     }
+
+    /// <summary>
+    /// The true maximum number of entries that can be simultaneously resident
+    /// (<c>probationary + protected</c> segment capacities). Equals the requested
+    /// capacity for capacity ≥ 2, but is 2 for capacity == 1 (both segments floor at 1).
+    /// </summary>
+    public int Capacity { get; }
 
     public int Count => _slru.Count;
     public int PinnedCount => _slru.PinnedCount;
