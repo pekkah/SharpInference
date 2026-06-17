@@ -163,6 +163,93 @@ public sealed class CudaHybridGdnBatchedPrefillTests : IDisposable
         }
     }
 
+    [Fact]
+    public void BatchVerifyCpuMoe_BitwiseMatchesPerToken_Carnice()
+    {
+        // Issue #210: BatchVerify's routed-expert FFN, grouped by selected expert
+        // (BatchVerifyCpuMoe), must be bit-identical to the per-token CpuMoeFfnCore
+        // loop it replaces. Toggle ONLY SHARPI_MTP_BATCHED_MOE_VERIFY between the two
+        // runs — the trunk, shared expert, and router are shared, so any logit
+        // divergence is the grouped-routed-expert reduction reorder (the greedy-parity
+        // failure mode). Greedy verify (pMin=1) relies on this exactness to keep the
+        // accept/reject decision identical to a sequential decode.
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindCarnicePath();
+        if (path is null) return;
+
+        var prevCpuMoe = Environment.GetEnvironmentVariable("SHARPI_CPU_MOE");
+        Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", "1");
+        bool prevBatchedMoeVerify = CudaHybridGdnForwardPass.BatchedMoeVerifyEnabled;
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            if (!hp.IsMoE) return; // grouped routed-expert path is CPU-MoE only
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+
+            var placement = new LayerPlacement(
+                GpuLayers: hp.NumLayers, CpuLayers: 0,
+                GpuWeightBytes: 0, GpuKvBytes: 0,
+                RecommendedCtxSize: Math.Min(hp.ContextLength, 4096));
+
+            // A prompt long enough that adjacent draft positions collide on experts,
+            // so the grouped-by-expert path actually amortizes a shared read.
+            var prompt = tokenizer.Encode(
+                "The quick brown fox jumps over the lazy dog. " +
+                "Pack my box with five dozen liquor jugs.");
+            Assert.True(prompt.Count >= 4, $"Prompt tokenized to only {prompt.Count} tokens.");
+
+            // Run an identical prefill + k-token verify batch under each toggle.
+            float[][] RunVerify(bool batchedMoeVerify)
+            {
+                CudaHybridGdnForwardPass.BatchedMoeVerifyEnabled = batchedMoeVerify;
+                using var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
+                if (!fwd.SupportsBatchVerify) return Array.Empty<float[]>();
+                var pf = fwd.Prefill(prompt).ToArray();
+                int k = Math.Min(4, fwd.MaxBatchVerifyTokens);
+                if (k < 2) return Array.Empty<float[]>();
+                // Verify computes logits at every position regardless of acceptance;
+                // only the token identities must match across the two runs. Token 0 is
+                // the greedy continuation; the rest are a fixed arbitrary chain.
+                var batch = new int[k];
+                batch[0] = Sampler.Greedy(pf);
+                for (int i = 1; i < k; i++)
+                    batch[i] = (batch[i - 1] * 131 + 7) % hp.VocabSize;
+                return fwd.BatchVerify(batch, prompt.Count);
+            }
+
+            var perTok = RunVerify(false);
+            var batched = RunVerify(true);
+            if (perTok.Length == 0 || batched.Length == 0) return; // verify unsupported here
+
+            Assert.Equal(perTok.Length, batched.Length);
+            for (int t = 0; t < perTok.Length; t++)
+            {
+                Assert.Equal(perTok[t].Length, batched[t].Length);
+                int firstDiff = -1;
+                for (int i = 0; i < perTok[t].Length; i++)
+                    if (BitConverter.SingleToInt32Bits(perTok[t][i])
+                        != BitConverter.SingleToInt32Bits(batched[t][i]))
+                    { firstDiff = i; break; }
+                Assert.True(firstDiff < 0,
+                    $"Batched-MoE verify logits diverge from per-token at position {t}, " +
+                    $"index {firstDiff}: seq={(firstDiff >= 0 ? perTok[t][firstDiff] : 0)} " +
+                    $"bat={(firstDiff >= 0 ? batched[t][firstDiff] : 0)}. BatchVerifyCpuMoe must " +
+                    "be bit-identical to the per-token CpuMoeFfnCore loop.");
+            }
+
+            // Greedy parity at every position — the issue's acceptance contract.
+            for (int t = 0; t < perTok.Length; t++)
+                Assert.Equal(Sampler.Greedy(perTok[t]), Sampler.Greedy(batched[t]));
+        }
+        finally
+        {
+            CudaHybridGdnForwardPass.BatchedMoeVerifyEnabled = prevBatchedMoeVerify;
+            Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", prevCpuMoe);
+        }
+    }
+
     // The MTP head needs the pre-output-norm hidden of the last prompt token as
     // prevHidden. After Prefill, that is exposed via LastHidden.
     private static float[] GetLastHidden(CudaHybridGdnForwardPass fwd) =>
