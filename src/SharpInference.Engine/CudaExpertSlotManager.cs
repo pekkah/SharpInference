@@ -22,6 +22,15 @@ namespace SharpInference.Engine;
 /// it. The two classes should look obviously parallel; if you change one,
 /// consider changing the other.
 /// </para>
+///
+/// <para>
+/// <b>Divergence (issue #216):</b> this CUDA class allocates a preallocated, exact-size
+/// expert <i>slab</i> and carves fixed-stride slot views out of it (no per-expert pool
+/// allocation, no power-of-two bucket rounding, no <c>cudaFree</c> on eviction). The Vulkan
+/// twin still uses pooled per-tensor uploads and is a candidate for the same treatment once
+/// the CUDA slab is validated on hardware — it was left untouched deliberately to avoid
+/// destabilizing the Vulkan hot path.
+/// </para>
 /// </summary>
 public sealed class CudaExpertSlotManager : IDisposable, IExpertPrefetchTarget
 {
@@ -47,7 +56,57 @@ public sealed class CudaExpertSlotManager : IDisposable, IExpertPrefetchTarget
     private readonly int _pinBudget;
     private bool _warmed;
 
+    // ── Exact-size expert slab (issue #216) ──────────────────────────────────
+    // One preallocated slab per expert tensor role (gate/up/down), carved into
+    // fixed-stride slots. Eviction reuses a slot's offsets and never calls cudaFree —
+    // zero fragmentation. Replaces the old per-tensor pooled UploadRaw allocations whose
+    // power-of-two bucket rounding wasted up to ~2× VRAM per expert (e.g. 1.05 MiB Q5_K →
+    // 2 MiB), holding 12 GB cards below the auto-router's 50% capacity threshold.
+    //
+    // Stride sizing: a role's experts do NOT all share one byte size. llama.cpp's K_M
+    // mixes (and Unsloth "UD" dynamic quants) store ffn_down_exps as a larger dtype on a
+    // subset of layers (e.g. Q6_K on some, Q4_K/Q5_K on the rest). The slab is shared
+    // across every MoE layer of a role, so its stride is the MAXIMUM per-expert footprint
+    // over all layers — smaller-quant layers simply under-fill their slot. Sizing from a
+    // single (first-uploaded) layer would overflow when a later, larger-quant expert is
+    // routed (UploadRawInto throws "source exceeds destination capacity"). Each upload
+    // carves a view of its own actual size and tags it with its own dtype, so a slot can
+    // hold a Q4_K expert from one layer and a Q6_K expert from another across evictions.
+    //
+    // The slab is sized for (_slabSlots) slices = the SLRU's true max residency + 1: Put
+    // inserts the new entry *before* evicting the victim, so residency+1 slots are
+    // transiently live — the +1 is the eviction-staging slice, recycled on the very next
+    // miss. The SLRU's residency exceeds the requested slotCapacity at capacity 1 (both
+    // segments floor at 1 → 2), so this is read from ExpertCache.Capacity, not slotCapacity,
+    // to avoid under-provisioning _freeSlots. _freeSlots hands out the offsets.
+    private readonly int _slotCapacity;
+    private readonly int _slabSlots;
+    private readonly Stack<int> _freeSlots;
+    private RoleSlab _gateSlab;
+    private RoleSlab _upSlab;
+    private RoleSlab _downSlab;
+
     public ExpertAccessProfiler Profiler => _profiler;
+
+    /// <summary>
+    /// Total VRAM held by the expert slab(s): <c>_slabSlots × per-role max per-expert bytes</c>
+    /// once all three roles have been allocated (slabs are allocated lazily on first upload).
+    /// Used to verify the cache footprint matches the exact-size accounting (issue #216).
+    /// </summary>
+    public long ExpertCacheVramBytes
+    {
+        get
+        {
+            lock (_lock)
+            {
+                long b = 0;
+                if (_gateSlab.Allocated) b += _gateSlab.Stride * _slabSlots;
+                if (_upSlab.Allocated)   b += _upSlab.Stride   * _slabSlots;
+                if (_downSlab.Allocated) b += _downSlab.Stride  * _slabSlots;
+                return b;
+            }
+        }
+    }
 
     /// <param name="gpu">CUDA backend to allocate/free GPU tensors on.</param>
     /// <param name="model">GGUF model for mmap weight access.</param>
@@ -76,6 +135,15 @@ public sealed class CudaExpertSlotManager : IDisposable, IExpertPrefetchTarget
         _warmPinPerLayer = WarmPinConfig.ResolvePerLayer(hp.NumLayers, hp.NumExperts, hp.NumActiveExperts, slotCapacity);
         _warmPinAfter = WarmPinConfig.AfterAccesses;
         _pinBudget = Math.Max(1, slotCapacity / 2); // never pin more than half the cache
+
+        _slotCapacity = slotCapacity;
+        // Provision physical slots from the SLRU's TRUE max residency (+1 staging), not the
+        // requested slotCapacity: ExpertCache floors both segments at 1, so capacity 1 can hold
+        // 2 entries and the insert-before-evict transient needs a 3rd slot. Under-seeding here
+        // crashes decode with "Pop on empty stack". For slotCapacity ≥ 2 this equals slotCapacity + 1.
+        _slabSlots = _cache.Capacity + 1;
+        _freeSlots = new Stack<int>(_slabSlots);
+        for (int i = _slabSlots - 1; i >= 0; i--) _freeSlots.Push(i);
     }
 
     /// <summary>
@@ -118,8 +186,10 @@ public sealed class CudaExpertSlotManager : IDisposable, IExpertPrefetchTarget
             // Time the on-miss UploadExpert call — the synchronous expert-weight streaming
             // (host stage + H2D, drained on this or the next call) that #217's overlap aimed
             // to hide. Wraps only the upload, not the cache/lock bookkeeping.
+            int slotIdx = _freeSlots.Pop();
             long t0 = Stopwatch.GetTimestamp();
-            slot = UploadExpert(layer, expertId);
+            try { slot = UploadExpert(layer, expertId, slotIdx); }
+            catch { _freeSlots.Push(slotIdx); throw; }
             _profiler.RecordMissStall(Stopwatch.GetTimestamp() - t0);
             _cache.Put(layer, expertId, slot);
             MaybeWarmPin();
@@ -177,7 +247,10 @@ public sealed class CudaExpertSlotManager : IDisposable, IExpertPrefetchTarget
         lock (_lock)
         {
             if (_cache.Contains(layer, expertId)) return;
-            var slot = UploadExpertAsync(layer, expertId);
+            int slotIdx = _freeSlots.Pop();
+            ExpertCudaSlot slot;
+            try { slot = UploadExpertAsync(layer, expertId, slotIdx); }
+            catch { _freeSlots.Push(slotIdx); throw; }
             _cache.Put(layer, expertId, slot);
             MaybeWarmPin();
         }
@@ -207,7 +280,7 @@ public sealed class CudaExpertSlotManager : IDisposable, IExpertPrefetchTarget
     {
         // If a still-pending background upload is being evicted (rare — the
         // cache would only evict an unconsumed prefetch under tight capacity),
-        // drain the event so the DMA isn't writing to a freed pointer.
+        // drain the event so the DMA isn't writing to a slot about to be reused.
         FenceTensorReadyLocked(slot.Gate.Handle);
         FenceTensorReadyLocked(slot.Up.Handle);
         FenceTensorReadyLocked(slot.Down.Handle);
@@ -215,133 +288,226 @@ public sealed class CudaExpertSlotManager : IDisposable, IExpertPrefetchTarget
         _dtypes.Remove(slot.Gate.Handle);
         _dtypes.Remove(slot.Up.Handle);
         _dtypes.Remove(slot.Down.Handle);
+        // The three tensors are non-owning slab views: Free drops their handle
+        // registration only — NO cudaFree. The slab memory is recycled by handing
+        // the slot index back to the free list for the next miss to overwrite.
         _gpu.Free(slot.Gate);
         _gpu.Free(slot.Up);
         _gpu.Free(slot.Down);
+        _freeSlots.Push(slot.SlotIndex);
     }
 
-    private ExpertCudaSlot UploadExpert(int layer, int expertId)
+    private ExpertCudaSlot UploadExpert(int layer, int expertId, int slotIdx)
     {
         return new ExpertCudaSlot(
-            Gate: UploadExpertWeight($"blk.{layer}.ffn_gate_exps.weight",
-                _hp.ExpertIntermediateDim, _hp.EmbeddingDim, expertId),
-            Up: UploadExpertWeight($"blk.{layer}.ffn_up_exps.weight",
-                _hp.ExpertIntermediateDim, _hp.EmbeddingDim, expertId),
-            Down: UploadExpertWeight($"blk.{layer}.ffn_down_exps.weight",
-                _hp.EmbeddingDim, _hp.ExpertIntermediateDim, expertId));
+            Gate: UploadExpertWeight(ref _gateSlab, "ffn_gate_exps", layer,
+                _hp.ExpertIntermediateDim, _hp.EmbeddingDim, expertId, slotIdx),
+            Up: UploadExpertWeight(ref _upSlab, "ffn_up_exps", layer,
+                _hp.ExpertIntermediateDim, _hp.EmbeddingDim, expertId, slotIdx),
+            Down: UploadExpertWeight(ref _downSlab, "ffn_down_exps", layer,
+                _hp.EmbeddingDim, _hp.ExpertIntermediateDim, expertId, slotIdx),
+            SlotIndex: slotIdx);
     }
 
-    private ExpertCudaSlot UploadExpertAsync(int layer, int expertId)
+    private ExpertCudaSlot UploadExpertAsync(int layer, int expertId, int slotIdx)
     {
         return new ExpertCudaSlot(
-            Gate: UploadExpertWeightAsync($"blk.{layer}.ffn_gate_exps.weight",
-                _hp.ExpertIntermediateDim, _hp.EmbeddingDim, expertId),
-            Up: UploadExpertWeightAsync($"blk.{layer}.ffn_up_exps.weight",
-                _hp.ExpertIntermediateDim, _hp.EmbeddingDim, expertId),
-            Down: UploadExpertWeightAsync($"blk.{layer}.ffn_down_exps.weight",
-                _hp.EmbeddingDim, _hp.ExpertIntermediateDim, expertId));
-    }
-
-    private Tensor UploadExpertWeight(string tensorName, int rows, int cols, int expertIdx)
-    {
-        var info = _model.FindTensor(tensorName)
-            ?? throw new InvalidOperationException($"Missing tensor: {tensorName}");
-        var data = _model.GetTensorData(info);
-
-        if (info.DType == DType.Float32)
-        {
-            int elemOffset = expertIdx * rows * cols;
-            var floats = MemoryMarshal.Cast<byte, float>(data).Slice(elemOffset, rows * cols);
-            var result = _gpu.Upload(floats, TensorShape.D1(floats.Length));
-            _dtypes[result.Handle] = DType.Float32;
-            return result;
-        }
-
-        int bytesPerRow = (cols / DTypeInfo.BlockSize(info.DType))
-                        * DTypeInfo.BytesPerBlock(info.DType);
-        int expertBytes = rows * bytesPerRow;
-        int byteOffset = expertIdx * expertBytes;
-        var expertData = data.Slice(byteOffset, expertBytes);
-
-        if (info.DType == DType.Q4_K || info.DType == DType.Q5_K || info.DType == DType.Q6_K)
-        {
-            // CudaBackend.UploadRaw accepts ReadOnlySpan<byte> directly — no need
-            // for the float-cast trick the Vulkan port uses to fit the
-            // single-overload Upload(ReadOnlySpan<float>) signature. Q5_K matters
-            // here: qwen35moe stores ffn_down_exps as Q5_K, so keeping the raw
-            // bytes instead of expanding to F32 halves the per-expert footprint
-            // and ~doubles SLRU capacity.
-            var result = _gpu.UploadRaw(expertData, TensorShape.D1(expertData.Length), info.DType);
-            _dtypes[result.Handle] = info.DType;
-            return result;
-        }
-
-        // Less-common dtypes (Q8_0, Q3_K, …): the CUDA matvec only dispatches on
-        // Q4_K / Q5_K / Q6_K / F32, so dequantize on CPU and upload as F32. Same
-        // fallback strategy the Vulkan port uses.
-        int count = rows * cols;
-        var f32 = new float[count];
-        Dequantize.ToFloat32(expertData, f32, info.DType, count);
-        var tensor = _gpu.Upload(f32, TensorShape.D1(count));
-        _dtypes[tensor.Handle] = DType.Float32;
-        return tensor;
+            Gate: UploadExpertWeightAsync(ref _gateSlab, "ffn_gate_exps", layer,
+                _hp.ExpertIntermediateDim, _hp.EmbeddingDim, expertId, slotIdx),
+            Up: UploadExpertWeightAsync(ref _upSlab, "ffn_up_exps", layer,
+                _hp.ExpertIntermediateDim, _hp.EmbeddingDim, expertId, slotIdx),
+            Down: UploadExpertWeightAsync(ref _downSlab, "ffn_down_exps", layer,
+                _hp.EmbeddingDim, _hp.ExpertIntermediateDim, expertId, slotIdx),
+            SlotIndex: slotIdx);
     }
 
     /// <summary>
-    /// Async sibling of <see cref="UploadExpertWeight"/>. Issues the H2D copy on
-    /// the backend's upload stream and registers the returned event in
-    /// <c>_pendingUploads</c>; the tensor is otherwise indistinguishable from a
-    /// sync-uploaded one once <see cref="FenceTensorReadyLocked"/> has run.
+    /// Lazily allocate the slab for one expert tensor role. The slab is shared by EVERY MoE
+    /// layer of this role, but a role's experts do not all share one byte size (K_M mixes and
+    /// "UD" dynamic quants store ffn_down at a larger dtype on a subset of layers), so the
+    /// stride is the MAXIMUM per-expert footprint over all layers that carry the role — a
+    /// smaller-quant expert simply under-fills its slot. Sizing from one layer would overflow
+    /// when a later, larger-quant expert is routed. Per-upload, Q4_K/Q5_K/Q6_K stay raw and
+    /// any other dtype expands to F32; the stride accounts for whichever is largest. The slab
+    /// holds <c>_slabSlots</c> fixed-stride slices, allocated once with <c>exact: true</c>
+    /// (no pool rounding). Robust to hybrid models whose MoE layers don't start at blk.0.
     /// </summary>
-    private Tensor UploadExpertWeightAsync(string tensorName, int rows, int cols, int expertIdx)
+    private void EnsureRoleSlab(ref RoleSlab role, string roleSuffix, int rows, int cols)
     {
+        if (role.Allocated) return;
+        long stride = MaxRoleExpertBytes(_model, _hp.NumLayers, roleSuffix, rows, cols);
+        if (stride <= 0)
+            throw new InvalidOperationException(
+                $"No '{roleSuffix}' expert tensor found in any layer to size the slab.");
+        long slabBytes = stride * _slabSlots;
+        // dtype tag is cosmetic — every carved view re-tags itself with its own per-layer dtype.
+        role.Slab = _gpu.AllocateRawBytes(slabBytes, DType.Float32, exact: true);
+        role.Stride = stride;
+        role.Allocated = true;
+    }
+
+    /// <summary>
+    /// On-VRAM bytes one expert of the given dtype occupies: raw quant bytes for
+    /// Q4_K/Q5_K/Q6_K (kept quantized by the CUDA matvec), else rows×cols F32 (the
+    /// dequant fallback for dtypes the matvec can't dispatch).
+    /// </summary>
+    private static long ExpertFootprintBytes(DType dt, int rows, int cols) =>
+        dt is DType.Q4_K or DType.Q5_K or DType.Q6_K
+            ? (long)rows * (cols / DTypeInfo.BlockSize(dt)) * DTypeInfo.BytesPerBlock(dt)
+            : (long)rows * cols * sizeof(float);
+
+    /// <summary>
+    /// The fixed slab stride for one expert role = the MAX per-expert footprint over all MoE
+    /// layers (a role's experts do NOT all share one byte size — K_M mixes and Unsloth "UD"
+    /// quants store a role at a larger dtype, sometimes one expanding to F32, on a subset of
+    /// layers). Public so the SLRU capacity planners
+    /// (<see cref="CudaHybridForwardPass"/>.PerExpertBytes /
+    /// <see cref="CudaHybridGdnForwardPass"/>.EstimatePerExpertBytes) price EXACTLY what the slab
+    /// allocates: sizing from blk.0 alone under-counts, so the planner would derive more slots
+    /// than the slab fits and over-commit VRAM (a hard cudaMalloc OOM when a later layer's role
+    /// expands to F32). Returns 0 if no layer carries the role.
+    /// </summary>
+    public static long MaxRoleExpertBytes(GgufModel model, int numLayers, string roleSuffix, int rows, int cols)
+    {
+        long max = 0;
+        for (int l = 0; l < numLayers; l++)
+            if (model.FindTensor($"blk.{l}.{roleSuffix}.weight") is { } info)
+                max = Math.Max(max, ExpertFootprintBytes(info.DType, rows, cols));
+        return max;
+    }
+
+    /// <summary>
+    /// Upload one expert's weight bytes into <paramref name="role"/>'s slab at
+    /// <paramref name="slotIdx"/> and return a non-owning view tensor over that slice. The
+    /// view's dtype is registered in the shared dispatch map so MatMul picks the right kernel.
+    /// </summary>
+    private Tensor UploadExpertWeight(ref RoleSlab role, string roleSuffix, int layer, int rows, int cols, int expertIdx, int slotIdx)
+    {
+        string tensorName = $"blk.{layer}.{roleSuffix}.weight";
         var info = _model.FindTensor(tensorName)
             ?? throw new InvalidOperationException($"Missing tensor: {tensorName}");
+        EnsureRoleSlab(ref role, roleSuffix, rows, cols);
         var data = _model.GetTensorData(info);
+        long byteOffset = (long)slotIdx * role.Stride;
 
-        if (info.DType == DType.Float32)
+        // Raw-vs-F32 is decided per upload from THIS layer's dtype (not a per-slab flag):
+        // mixed-quant roles can land a Q4_K expert and a Q6_K expert in the same recycled slot.
+        if (info.DType is DType.Q4_K or DType.Q5_K or DType.Q6_K)
         {
-            int elemOffset = expertIdx * rows * cols;
-            var floats = MemoryMarshal.Cast<byte, float>(data).Slice(elemOffset, rows * cols);
-            var pending = _gpu.UploadBackground(floats, TensorShape.D1(floats.Length));
-            _dtypes[pending.Tensor.Handle] = DType.Float32;
-            _pendingUploads[pending.Tensor.Handle] = pending;
-            return pending.Tensor;
+            int bytesPerRow = (cols / DTypeInfo.BlockSize(info.DType)) * DTypeInfo.BytesPerBlock(info.DType);
+            int expertBytes = rows * bytesPerRow;
+            var expertData = data.Slice(expertIdx * expertBytes, expertBytes);
+            var view = _gpu.ViewRawBytes(role.Slab, byteOffset, role.Stride,
+                TensorShape.D1(expertData.Length), info.DType);
+            _gpu.UploadRawInto(view, expertData);
+            _dtypes[view.Handle] = info.DType;
+            return view;
         }
 
-        int bytesPerRow = (cols / DTypeInfo.BlockSize(info.DType))
-                        * DTypeInfo.BytesPerBlock(info.DType);
-        int expertBytes = rows * bytesPerRow;
-        int byteOffset = expertIdx * expertBytes;
-        var expertData = data.Slice(byteOffset, expertBytes);
-
-        if (info.DType == DType.Q4_K || info.DType == DType.Q5_K || info.DType == DType.Q6_K)
+        // F32 slab slot: copy native floats or dequantize the source dtype into it.
+        int count = rows * cols;
+        var fView = _gpu.ViewRawBytes(role.Slab, byteOffset, role.Stride,
+            TensorShape.D1(count), DType.Float32);
+        if (info.DType == DType.Float32)
         {
-            var pending = _gpu.UploadBackgroundRaw(expertData, TensorShape.D1(expertData.Length), info.DType);
-            _dtypes[pending.Tensor.Handle] = info.DType;
-            _pendingUploads[pending.Tensor.Handle] = pending;
-            return pending.Tensor;
+            var floats = MemoryMarshal.Cast<byte, float>(data).Slice(expertIdx * count, count);
+            _gpu.UploadInto(fView, floats);
+        }
+        else
+        {
+            int bytesPerRow = (cols / DTypeInfo.BlockSize(info.DType)) * DTypeInfo.BytesPerBlock(info.DType);
+            int expertBytes = rows * bytesPerRow;
+            var expertData = data.Slice(expertIdx * expertBytes, expertBytes);
+            var f32 = new float[count];
+            Dequantize.ToFloat32(expertData, f32, info.DType, count);
+            _gpu.UploadInto(fView, f32);
+        }
+        _dtypes[fView.Handle] = DType.Float32;
+        return fView;
+    }
+
+    /// <summary>
+    /// Async sibling of <see cref="UploadExpertWeight"/>. Issues the H2D copy into the slab
+    /// slot on the backend's upload stream and registers the returned event in
+    /// <c>_pendingUploads</c>; the view is otherwise indistinguishable from a sync-uploaded
+    /// one once <see cref="FenceTensorReadyLocked"/> has run.
+    /// </summary>
+    private Tensor UploadExpertWeightAsync(ref RoleSlab role, string roleSuffix, int layer, int rows, int cols, int expertIdx, int slotIdx)
+    {
+        string tensorName = $"blk.{layer}.{roleSuffix}.weight";
+        var info = _model.FindTensor(tensorName)
+            ?? throw new InvalidOperationException($"Missing tensor: {tensorName}");
+        EnsureRoleSlab(ref role, roleSuffix, rows, cols);
+        var data = _model.GetTensorData(info);
+        long byteOffset = (long)slotIdx * role.Stride;
+
+        // Raw-vs-F32 decided per upload from THIS layer's dtype (see UploadExpertWeight).
+        if (info.DType is DType.Q4_K or DType.Q5_K or DType.Q6_K)
+        {
+            int bytesPerRow = (cols / DTypeInfo.BlockSize(info.DType)) * DTypeInfo.BytesPerBlock(info.DType);
+            int expertBytes = rows * bytesPerRow;
+            var expertData = data.Slice(expertIdx * expertBytes, expertBytes);
+            var view = _gpu.ViewRawBytes(role.Slab, byteOffset, role.Stride,
+                TensorShape.D1(expertData.Length), info.DType);
+            var pending = _gpu.UploadBackgroundRawInto(view, expertData);
+            _dtypes[view.Handle] = info.DType;
+            _pendingUploads[view.Handle] = pending;
+            return view;
         }
 
         int count = rows * cols;
-        var f32 = new float[count];
-        Dequantize.ToFloat32(expertData, f32, info.DType, count);
-        var asyncTensor = _gpu.UploadBackground(f32, TensorShape.D1(count));
-        _dtypes[asyncTensor.Tensor.Handle] = DType.Float32;
-        _pendingUploads[asyncTensor.Tensor.Handle] = asyncTensor;
-        return asyncTensor.Tensor;
+        var fView = _gpu.ViewRawBytes(role.Slab, byteOffset, role.Stride,
+            TensorShape.D1(count), DType.Float32);
+        CudaUploadHandle fPending;
+        if (info.DType == DType.Float32)
+        {
+            var floats = MemoryMarshal.Cast<byte, float>(data).Slice(expertIdx * count, count);
+            fPending = _gpu.UploadBackgroundInto(fView, floats);
+        }
+        else
+        {
+            int bytesPerRow = (cols / DTypeInfo.BlockSize(info.DType)) * DTypeInfo.BytesPerBlock(info.DType);
+            int expertBytes = rows * bytesPerRow;
+            var expertData = data.Slice(expertIdx * expertBytes, expertBytes);
+            var f32 = new float[count];
+            Dequantize.ToFloat32(expertData, f32, info.DType, count);
+            fPending = _gpu.UploadBackgroundInto(fView, f32);
+        }
+        _dtypes[fView.Handle] = DType.Float32;
+        _pendingUploads[fView.Handle] = fPending;
+        return fView;
     }
 
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
-        // Drain cache, invoking EvictSlot for every resident entry to free GPU tensors.
-        // EvictSlot fences any still-pending uploads before the Free, so a teardown
-        // mid-prefetch can't tear down memory the upload stream is still writing to.
+        // Drain cache, invoking EvictSlot for every resident entry. EvictSlot fences any
+        // still-pending uploads and drops the slab-view handle registrations (no cudaFree),
+        // so a teardown mid-prefetch can't tear down memory the upload stream is still
+        // writing to. Then free the slabs themselves — the only owning allocations.
         _cache.Drain(EvictSlot);
+        if (_gateSlab.Allocated) _gpu.Free(_gateSlab.Slab);
+        if (_upSlab.Allocated)   _gpu.Free(_upSlab.Slab);
+        if (_downSlab.Allocated) _gpu.Free(_downSlab.Slab);
+    }
+
+    /// <summary>
+    /// One preallocated expert-tensor slab (gate, up, or down). Carved into
+    /// <c>_slabSlots</c> fixed-stride slots; <see cref="Allocated"/> guards lazy init.
+    /// The stride is the role's MAX per-expert footprint over all layers, so views of
+    /// differing per-layer dtypes (each re-tagged on upload) coexist across recycles.
+    /// </summary>
+    private struct RoleSlab
+    {
+        public Tensor Slab;       // owning exact-size allocation (freed only on Dispose)
+        public long Stride;       // bytes per expert slot (max footprint across the role's layers)
+        public bool Allocated;
     }
 }
 
-/// <summary>GPU tensors for one MoE expert on CUDA: gate, up, and down projection weights.</summary>
-public readonly record struct ExpertCudaSlot(Tensor Gate, Tensor Up, Tensor Down);
+/// <summary>
+/// GPU tensors for one MoE expert on CUDA: gate, up, and down projection weights, plus the
+/// slab <see cref="SlotIndex"/> they occupy (recycled on eviction — see <c>CudaExpertSlotManager</c>).
+/// </summary>
+public readonly record struct ExpertCudaSlot(Tensor Gate, Tensor Up, Tensor Down, int SlotIndex);

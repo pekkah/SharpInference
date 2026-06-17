@@ -116,6 +116,112 @@ public sealed class CudaExpertSlotManagerTests
     }
 
     /// <summary>
+    /// Issue #216 — exact-size slab: the expert cache VRAM footprint equals
+    /// <c>(slotCapacity + 1) × per-expert bytes</c> (the +1 is the eviction-staging slot)
+    /// and does NOT grow as more distinct experts than capacity churn through, proving the
+    /// slab is preallocated once and slots are reused (no per-eviction cudaMalloc/cudaFree).
+    /// </summary>
+    [Fact]
+    public void ExpertCacheVram_IsExactSizeSlab_AndStableUnderChurn()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        var path = FindFirstExisting("models\\OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf");
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        if (!hp.IsMoE) return;
+
+        const int cap = 4;
+        var dtypes = new Dictionary<nint, DType>();
+        using var slots = new CudaExpertSlotManager(gpu, model, hp, slotCapacity: cap, dtypes);
+
+        // Before any upload the slabs are unallocated.
+        Assert.Equal(0, slots.ExpertCacheVramBytes);
+
+        // A role's slab stride is the MAX per-expert footprint across ALL layers (raw bytes
+        // for Q4_K/Q5_K/Q6_K, else F32). OLMoE Q4_K_M (like Coder/35B) stores ffn_down as
+        // Q6_K on a subset of layers and Q4_K/Q5_K on the rest, so sizing from blk.0 alone
+        // would under-size the slab and overflow when a larger-quant expert is routed —
+        // issue #216's mixed-quant regression. The expectation must mirror the max sizing.
+        long MaxRoleBytes(string roleSuffix, int rows, int cols)
+        {
+            long max = 0;
+            for (int l = 0; l < hp.NumLayers; l++)
+            {
+                if (model.FindTensor($"blk.{l}.{roleSuffix}.weight") is not { } info) continue;
+                long b = info.DType is DType.Q4_K or DType.Q5_K or DType.Q6_K
+                    ? (long)rows * (cols / DTypeInfo.BlockSize(info.DType)) * DTypeInfo.BytesPerBlock(info.DType)
+                    : (long)rows * cols * sizeof(float);
+                max = Math.Max(max, b);
+            }
+            return max;
+        }
+        long perExpert =
+            MaxRoleBytes("ffn_gate_exps", hp.ExpertIntermediateDim, hp.EmbeddingDim) +
+            MaxRoleBytes("ffn_up_exps",   hp.ExpertIntermediateDim, hp.EmbeddingDim) +
+            MaxRoleBytes("ffn_down_exps", hp.EmbeddingDim, hp.ExpertIntermediateDim);
+        long expectedSlab = perExpert * (cap + 1); // slotCapacity >= 2 → slab slots == cap + 1
+
+        // First load allocates all three slabs at full (cap+1) stride.
+        slots.GetOrLoad(0, 0);
+        Assert.Equal(expectedSlab, slots.ExpertCacheVramBytes);
+
+        // Churn distinct experts ACROSS LAYERS (not just layer 0) so the larger-quant ffn_down
+        // layers actually exercise the slab. Before the mixed-quant fix this threw
+        // "source exceeds destination capacity" the first time a Q6_K expert hit a Q4_K-seeded
+        // slot. Footprint must stay constant: slab preallocated once, slots recycled, no growth.
+        for (int l = 0; l < hp.NumLayers; l++)
+            for (int e = 0; e < 6; e++)
+                slots.GetOrLoad(l, e);
+
+        Assert.Equal(expectedSlab, slots.ExpertCacheVramBytes);
+    }
+
+    /// <summary>
+    /// Issue #216 regression: <c>slotCapacity == 1</c> must not over-pop the slab's fixed
+    /// free-slot pool. <see cref="ExpertCache{T}"/> floors both SLRU segments at 1, so a
+    /// capacity-1 cache can hold 2 resident entries and the insert-before-evict transient
+    /// momentarily needs a 3rd slot. Provisioning only (slotCapacity + 1) = 2 slices crashed
+    /// decode with <c>InvalidOperationException</c> ("Pop on empty stack"). The fix sizes the
+    /// pool from the SLRU's true residency + 1. A capacity-1 slot count is reachable in
+    /// production via <c>MoeCacheSizing.Plan</c>'s BudgetExhausted clamp under VRAM pressure.
+    /// </summary>
+    [Fact]
+    public void ExpertCacheCapacityOne_ChurnDoesNotOverflowFreeSlots()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        var path = FindFirstExisting("models\\OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf");
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        if (!hp.IsMoE) return;
+
+        var dtypes = new Dictionary<nint, DType>();
+        using var slots = new CudaExpertSlotManager(gpu, model, hp, slotCapacity: 1, dtypes);
+
+        // Promote expert 0 into the protected segment (a hit), so it survives every later Put;
+        // then churn many distinct experts. The protected entry forces the transient peak onto
+        // the 3rd slot that the under-provisioned pool lacked → the exact crashing sequence.
+        slots.GetOrLoad(0, 0);
+        slots.GetOrLoad(0, 0); // hit → promote to protected
+        for (int e = 1; e <= 12; e++)
+            slots.GetOrLoad(0, e); // must not throw (empty-stack Pop)
+
+        // Residency stays within the SLRU's true capacity (2 for slotCapacity 1).
+        int resident = 0;
+        for (int e = 0; e <= 12; e++)
+            if (slots.TryGetCached(0, e, out _)) resident++;
+        Assert.True(resident is >= 1 and <= 2,
+            $"cap=1 SLRU held {resident} entries (expected 1..2).");
+    }
+
+    /// <summary>
     /// Same accounting check against the 22 GB qwen35moe model, only runs when
     /// the file is present at the expected path on this machine. This is the
     /// model the CUDA SLRU is actually intended for — it cannot fit eagerly on

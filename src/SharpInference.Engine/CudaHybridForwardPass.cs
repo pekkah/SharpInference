@@ -3127,26 +3127,20 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     // miss, not eagerly here. (The shared expert and router stay resident.)
 
     /// <summary>
-    /// On-VRAM bytes for one expert's three weight tensors (gate + up + down), used to
-    /// size the SLRU slot capacity. Mirrors CudaExpertSlotManager's upload accounting:
-    /// Q4_K/Q5_K/Q6_K are stored raw; other dtypes expand to F32. Each tensor's raw
-    /// byte size is rounded up to the buffer pool's allocation bucket (power-of-two,
-    /// min 64 B) — otherwise the planner over-estimates capacity by ~2× since pooled
-    /// allocations inflate sub-bucket sizes (e.g. 1.05 MiB Q5_K tensor → 2 MiB).
+    /// On-VRAM bytes for one expert's three weight tensors (gate + up + down), used to size the
+    /// SLRU slot capacity. Sums each role's MAX per-expert footprint over all layers via
+    /// <see cref="CudaExpertSlotManager.MaxRoleExpertBytes"/>, so this prices EXACTLY what the
+    /// exact-size slab allocates (issue #216). Sizing from blk.0 alone under-counts mixed-quant
+    /// (K_M/UD) roles — the planner would then derive more slots than the slab fits and
+    /// over-commit VRAM. Q4_K/Q5_K/Q6_K stay raw; other dtypes expand to F32.
     /// </summary>
     private long PerExpertBytes()
     {
-        long Bytes(string name, int rows, int cols)
-        {
-            if (_model.FindTensor(name) is not { } info) return 0;
-            long raw = info.DType is DType.Q4_K or DType.Q5_K or DType.Q6_K
-                ? (long)rows * (cols / DTypeInfo.BlockSize(info.DType)) * DTypeInfo.BytesPerBlock(info.DType)
-                : (long)rows * cols * sizeof(float); // F32 (native or dequantized)
-            return (long)CudaBackend.RoundUpAllocBytes((nuint)raw);
-        }
-        return Bytes("blk.0.ffn_gate_exps.weight", _expertDim, _embDim)
-             + Bytes("blk.0.ffn_up_exps.weight",   _expertDim, _embDim)
-             + Bytes("blk.0.ffn_down_exps.weight", _embDim,    _expertDim);
+        long Max(string role, int rows, int cols) =>
+            CudaExpertSlotManager.MaxRoleExpertBytes(_model, _hp.NumLayers, role, rows, cols);
+        return Max("ffn_gate_exps", _expertDim, _embDim)
+             + Max("ffn_up_exps",   _expertDim, _embDim)
+             + Max("ffn_down_exps", _embDim,    _expertDim);
     }
 
     private Tensor UploadTqSignPatterns(int layerIndex)

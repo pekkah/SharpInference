@@ -5584,31 +5584,19 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     private long EstimatePerExpertBytes()
     {
-        // Per expert: gate + up + down weight matrices. For qwen35moe Q4_K_M:
-        //   gate/up: [embDim=2048, expertDim=512] each ≈ 588 KiB raw Q4_K
-        //   down:    [expertDim=512, embDim=2048]     ≈ 588 KiB raw Q5_K — with the
-        //   CUDA Q5_K matvec landed (Phase 7b) this matrix now stays as raw bytes
-        //   instead of expanding 4× to F32, halving the per-expert footprint.
-        // Sum: ~1.81 MiB raw. Fall back to F32 expansion only for dtypes the
-        // CUDA matvec still can't handle (Q8_0, Q3_K, etc.).
-        long bytes = 0;
-        foreach (var name in new[] { "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight", "blk.0.ffn_down_exps.weight" })
-        {
-            var info = _model.FindTensor(name);
-            if (info is null) continue;
-            // bytesPerExpert in the packed tensor — total bytes / numExperts.
-            long perExpert = info.Value.ByteSize / Math.Max(1, _numExperts);
-            // If the dtype is something CUDA matvec can't handle, the SLRU will
-            // dequantize to F32, increasing footprint. Compute conservative byte
-            // size by assuming F32 when not Q4_K/Q5_K/Q6_K.
-            if (info.Value.DType != DType.Q4_K && info.Value.DType != DType.Q5_K
-                && info.Value.DType != DType.Q6_K && info.Value.DType != DType.Float32)
-            {
-                int rows = (int)(info.Value.ElementCount / _numExperts);
-                perExpert = (long)rows * sizeof(float);
-            }
-            bytes += perExpert;
-        }
+        // Sum each role's MAX per-expert footprint over ALL layers (issue #216), via the same
+        // CudaExpertSlotManager.MaxRoleExpertBytes the slab uses — so PredictSlruSlots' predicted
+        // capacity equals what the slab actually allocates. Q4_K/Q5_K/Q6_K stay raw; other dtypes
+        // (Q3_K/Q8_0/…) expand to F32. A role's dtype varies per layer in K_M / Unsloth "UD" quants,
+        // so a later F32-expanding layer dominates the stride — blk.0-only sizing would wildly
+        // under-count and over-commit VRAM. Dims match CudaExpertSlotManager.UploadExpert:
+        // gate/up are [ExpertIntermediateDim, EmbeddingDim], down is [EmbeddingDim, ExpertIntermediateDim].
+        long Max(string role, int rows, int cols) =>
+            CudaExpertSlotManager.MaxRoleExpertBytes(_model, _hp.NumLayers, role, rows, cols);
+        long bytes =
+              Max("ffn_gate_exps", _hp.ExpertIntermediateDim, _hp.EmbeddingDim)
+            + Max("ffn_up_exps",   _hp.ExpertIntermediateDim, _hp.EmbeddingDim)
+            + Max("ffn_down_exps", _hp.EmbeddingDim,          _hp.ExpertIntermediateDim);
         return bytes > 0 ? bytes : (long)(1.81 * 1024 * 1024);
     }
 
