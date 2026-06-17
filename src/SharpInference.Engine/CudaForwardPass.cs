@@ -4286,9 +4286,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         // 12B global layers (attention_k_eq_v) carry no attn_v: V reuses the raw K projection.
         bool kEqV = _hp.AttentionKEqV && !isSwa && _wv[layer] is null;
 
+        // K/V batched views are only written + read on KV-owning layers; a shared-KV layer reuses
+        // the source layer's cache and computes no K/V, so skip creating them entirely (avoids two
+        // view alloc/frees per shared layer per decode step).
         var qAll = _gpu.View(_bpQ!, 0, (long)N * qDimL);
-        var kAll = _gpu.View(_bpK!, 0, (long)N * kvDimL);
-        var vAll = _gpu.View(_bpV!, 0, (long)N * kvDimL);
+        Tensor? kAll = kvShared ? null : _gpu.View(_bpK!, 0, (long)N * kvDimL);
+        Tensor? vAll = kvShared ? null : _gpu.View(_bpV!, 0, (long)N * kvDimL);
         var attnAll = _gpu.View(_bpAttnOut!, 0, (long)N * qDimL);
 
         _gpu.CopyDevice(_bpResidual!, _bpHidden!);
@@ -4297,25 +4300,25 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         GpuMatMulBatched(qAll, _wq[layer], _bpNorm!, N);
         if (!kvShared)
         {
-            GpuMatMulBatched(kAll, _wk[layer], _bpNorm!, N);
+            GpuMatMulBatched(kAll!, _wk[layer], _bpNorm!, N);
             if (kEqV)
-                _gpu.CopyDevice(vAll, kAll);   // V = raw K projection (pre-norm, pre-RoPE)
+                _gpu.CopyDevice(vAll!, kAll!);   // V = raw K projection (pre-norm, pre-RoPE)
             else
-                GpuMatMulBatched(vAll, _wv[layer]!, _bpNorm!, N);
+                GpuMatMulBatched(vAll!, _wv[layer]!, _bpNorm!, N);
         }
 
         // Batched QK-norm (before RoPE, #157) + V-norm — both position-independent across N.
         if (_hasQkNorm && !_hp.UseL2QkNorm)
         {
             if (!kvShared)
-                _gpu.HeadNormQkBatched(qAll, _wqNorm![layer], kAll, _wkNorm![layer],
+                _gpu.HeadNormQkBatched(qAll, _wqNorm![layer], kAll!, _wkNorm![layer],
                     _numHeads, layerKv, layerHd, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
             else
                 _gpu.HeadNormBatched(qAll, _wqNorm![layer], _numHeads, layerHd, N, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
         }
         // Gemma 4 V-norm (plain per-head RMSNorm, no learned weight) on every KV-owning layer.
         if (!kvShared)
-            _gpu.HeadNormPureBatched(vAll, layerKv, layerHd, N, _hp.RmsNormEps);
+            _gpu.HeadNormPureBatched(vAll!, layerKv, layerHd, N, _hp.RmsNormEps);
 
         bool useRoPE = _hp.NoRopeLayerStep == 0 || (layer + 1) % _hp.NoRopeLayerStep != 0;
         float ropeTheta = isSwa ? _ropeThetaSwa : _hp.RopeTheta;
@@ -4329,8 +4332,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         {
             int pos = positions[n];
             var qv = _gpu.View(_bpQ!, (long)n * qDimL, qDimL);
-            var kv = _gpu.View(_bpK!, (long)n * kvDimL, kvDimL);
-            var vv = _gpu.View(_bpV!, (long)n * kvDimL, kvDimL);
+            // kv/vv only feed RoPE + KV-append on KV-owning layers; skip on shared-KV layers.
+            Tensor? kv = kvShared ? null : _gpu.View(_bpK!, (long)n * kvDimL, kvDimL);
+            Tensor? vv = kvShared ? null : _gpu.View(_bpV!, (long)n * kvDimL, kvDimL);
             var av = _gpu.View(_bpAttnOut!, (long)n * qDimL, qDimL);
             try
             {
@@ -4339,16 +4343,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                     if (!isSwa && _gpuRopeFreqs is { } rfTbl)
                     {
                         _gpu.RoPEWithFactors(qv, pos, layerHd, ropeTheta, rfTbl);
-                        if (!kvShared) _gpu.RoPEWithFactors(kv, pos, layerHd, ropeTheta, rfTbl);
+                        if (!kvShared) _gpu.RoPEWithFactors(kv!, pos, layerHd, ropeTheta, rfTbl);
                     }
                     else
                     {
                         _gpu.RoPE(qv, pos, layerHd, ropeTheta, _hp.IsNeoxRope);
-                        if (!kvShared) _gpu.RoPE(kv, pos, layerHd, ropeTheta, _hp.IsNeoxRope);
+                        if (!kvShared) _gpu.RoPE(kv!, pos, layerHd, ropeTheta, _hp.IsNeoxRope);
                     }
                 }
                 if (!kvShared)
-                    KvAppendKv(kv, vv, caches[n].K[layer], caches[n].V[layer], kvDimL, pos, appendCtx);
+                    KvAppendKv(kv!, vv!, caches[n].K[layer], caches[n].V[layer], kvDimL, pos, appendCtx);
                 var kc = caches[n].K[effLayer];
                 var vc = caches[n].V[effLayer];
                 if (isSwa)
@@ -4360,7 +4364,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
             }
             finally
             {
-                _gpu.Free(qv); _gpu.Free(kv); _gpu.Free(vv); _gpu.Free(av);
+                _gpu.Free(qv);
+                if (kv is not null) _gpu.Free(kv);
+                if (vv is not null) _gpu.Free(vv);
+                _gpu.Free(av);
             }
         }
 
@@ -4397,7 +4404,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         if (_layerOutputScale is not null)
             _gpu.ScaleInPlace(_bpHidden!, _layerOutputScale[layer]);
 
-        _gpu.Free(qAll); _gpu.Free(kAll); _gpu.Free(vAll); _gpu.Free(attnAll);
+        _gpu.Free(qAll);
+        if (kAll is not null) _gpu.Free(kAll);
+        if (vAll is not null) _gpu.Free(vAll);
+        _gpu.Free(attnAll);
     }
 
     /// <summary>Ragged batched decode returning the full per-sequence next-token logits
