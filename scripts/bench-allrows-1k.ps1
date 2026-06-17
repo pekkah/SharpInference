@@ -21,7 +21,7 @@
 # ignored — take the prefill column from the default (~2K) run and the decode column
 # from the -NearZero run. The per-model long-context falloff lives in the separate
 # "Long-context decode" README section, not in the table.
-param([switch]$CudaOnly, [switch]$NearZero)
+param([switch]$CudaOnly, [switch]$NearZero, [string]$Tag)
 $ErrorActionPreference = "Continue"
 
 $C = "C:\p\sharpi\models"
@@ -161,6 +161,7 @@ $sOlmoe  = @("--top-p","0.95")                          # OLMoE: greedy unstable
 $sSmol   = @("--top-p","0.95","--top-k","40")          # SmolLM2 instruct
 $sCoder  = @("--top-p","0.8","--top-k","20","--repeat-penalty","1.05")  # Qwen3-Coder
 $sGemma  = @("--top-k","64","--top-p","0.95","--min-p","0")             # Gemma 3/4 defaults
+$sVibe   = @("--top-p","0.95","--top-k","0")           # VibeThinker (Qwen2 math/reasoning)
 
 # Job table: Tag, Model, Args, recommended Temp/Samp, Env (CPU_MOE), Timeout. Order
 # groups by model file so the first run of each model warms the OS page cache for
@@ -169,6 +170,10 @@ $jobs = @(
   @{ Tag="smol-cpu";        M="$C\SmolLM2-1.7B-Instruct-Q4_K_M.gguf"; A=@();                                               Temp="0.7"; Samp=$sSmol;  T=300 }
   @{ Tag="smol-vulkan";     M="$C\SmolLM2-1.7B-Instruct-Q4_K_M.gguf"; A=@("-g","-1","--backend","vulkan");                 Temp="0.7"; Samp=$sSmol;  T=300 }
   @{ Tag="smol-cuda";       M="$C\SmolLM2-1.7B-Instruct-Q4_K_M.gguf"; A=@("-g","-1","--backend","cuda");                   Temp="0.7"; Samp=$sSmol;  T=300 }
+
+  @{ Tag="vibe-cpu";        M="$C\VibeThinker-1.5B.Q4_K_M.gguf"; A=@();                                                    Temp="0.6"; Samp=$sVibe;  T=300 }
+  @{ Tag="vibe-vulkan";     M="$C\VibeThinker-1.5B.Q4_K_M.gguf"; A=@("-g","-1","--backend","vulkan");                      Temp="0.6"; Samp=$sVibe;  T=300 }
+  @{ Tag="vibe-cuda";       M="$C\VibeThinker-1.5B.Q4_K_M.gguf"; A=@("-g","-1","--backend","cuda");                        Temp="0.6"; Samp=$sVibe;  T=300 }
 
   @{ Tag="qwen3-cpu";       M="$C\Qwen3-8B-Q4_K_M.gguf"; A=@();                                                            Temp="0.6"; Samp=$sQwen;  T=400 }
   @{ Tag="qwen3-cpu-tq";    M="$C\Qwen3-8B-Q4_K_M.gguf"; A=@("--tq");                                                      Temp="0.6"; Samp=$sQwen;  T=400 }
@@ -214,6 +219,7 @@ $warmed = @{}
 $rows = @()
 foreach ($j in $jobs) {
     if ($CudaOnly -and ($j.A -notcontains "cuda")) { continue }
+    if ($Tag -and ($j.Tag -notlike "*$Tag*")) { continue }
     if (-not (Test-Path $j.M)) { Write-Host "[skip] $($j.Tag): $($j.M) missing" -ForegroundColor Yellow; continue }
     if ($j.CpuMoe) { $env:SHARPI_CPU_MOE = "1" } else { Remove-Item env:SHARPI_CPU_MOE -ErrorAction SilentlyContinue }
 

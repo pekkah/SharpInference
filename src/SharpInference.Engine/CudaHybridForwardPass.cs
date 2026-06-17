@@ -98,6 +98,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     private readonly float[] _logitsBuf;
     private readonly float[]? _gpuRouterBuf;
     private readonly bool _hasAttnBias, _hasQkNorm, _isMoE, _hasSharedExpert;
+    // Qwen2 has Q/K/V bias but no output-projection bias — probed separately.
+    private readonly bool _hasAttnOutputBias;
     private readonly bool _tqEnabled;
     // GPU-resident KV-cache element dtype (#179/#230): fp32 (default), bf16 (½), or q8_0 (¼),
     // resolved from SHARPI_KV_DTYPE. Applies to the GPU-trunk layers only — CPU-offloaded layers
@@ -291,6 +293,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         _intermDim = hp.IntermediateDim;
         _expertDim = hp.IsMoE ? hp.ExpertIntermediateDim : hp.IntermediateDim;
         _hasAttnBias = hp.HasAttnBias;
+        _hasAttnOutputBias = hp.HasAttnOutputBias;
         _hasQkNorm = hp.HasQkNorm;
         _isMoE = hp.IsMoE;
         _hasSharedExpert = hp.HasSharedExpert;
@@ -564,7 +567,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 _gpuBk![i] = UploadWeight($"blk.{i}.attn_k.bias");
                 if (!kEqV)
                     _gpuBv![i] = UploadWeight($"blk.{i}.attn_v.bias");
-                _gpuBo![i] = UploadWeight($"blk.{i}.attn_output.bias");
+                if (_hasAttnOutputBias)
+                    _gpuBo![i] = UploadWeight($"blk.{i}.attn_output.bias");
             }
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
@@ -822,12 +826,14 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 _cpuBk[ci] = LoadCpuBias($"blk.{li}.attn_k.bias", layerKvCpu * layerHd);
                 if (!kEqV)
                     _cpuBv[ci] = LoadCpuBias($"blk.{li}.attn_v.bias", layerKvCpu * layerHd);
-                _cpuBo[ci] = LoadCpuBias($"blk.{li}.attn_output.bias", _embDim);
+                if (_hasAttnOutputBias)
+                    _cpuBo[ci] = LoadCpuBias($"blk.{li}.attn_output.bias", _embDim);
             }
             else if (_hasAttnBias)
             {
                 _cpuBq[ci] = LoadCpuBias($"blk.{li}.attn_q.bias", _numHeads * layerHd);
-                _cpuBo[ci] = LoadCpuBias($"blk.{li}.attn_output.bias", _embDim);
+                if (_hasAttnOutputBias)
+                    _cpuBo[ci] = LoadCpuBias($"blk.{li}.attn_output.bias", _embDim);
             }
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
@@ -1661,7 +1667,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         _gpu.RecordBarrier();
 
         GpuMatMul(_gpuHidden, _gpuWo[i], _gpuAttnOut);
-        if (_hasAttnBias)
+        if (_hasAttnOutputBias)
         {
             _gpu.RecordBarrier();
             _gpu.AddInPlace(_gpuHidden, _gpuBo![i]);
@@ -1780,7 +1786,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
 
         // Output projection
         SimdKernels.MatVec(_cpuHidden, _cpuWo[ci].DataPtr, _cpuAttnOut, _embDim, _numHeads * _headDim, _cpuWo[ci].DType);
-        if (_hasAttnBias)
+        if (_hasAttnOutputBias)
             SimdKernels.AddInPlace(_cpuHidden, _cpuBo[ci], _embDim);
 
         // Residual
@@ -2312,7 +2318,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         // Output projection. _cpuWo is [embDim, qDimL].
         SimdKernels.MatVec(_cpuHidden, _cpuWo[ci].DataPtr, _cpuAttnOut, _embDim, qDimL, _cpuWo[ci].DType);
 
-        if (_hasAttnBias)
+        if (_hasAttnOutputBias)
             SimdKernels.AddInPlace(_cpuHidden, _cpuBo[ci], _embDim);
 
         // Post-attention RmsNorm BEFORE residual add.
@@ -3303,7 +3309,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             }
 
             if (_hasAttnBias)
-            { _gpu.Free(_gpuBq![i]); _gpu.Free(_gpuBk![i]); _gpu.Free(_gpuBv![i]); _gpu.Free(_gpuBo![i]); }
+            {
+                _gpu.Free(_gpuBq![i]); _gpu.Free(_gpuBk![i]); _gpu.Free(_gpuBv![i]);
+                if (_hasAttnOutputBias) _gpu.Free(_gpuBo![i]);
+            }
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             { _gpu.Free(_gpuQNorm![i]); _gpu.Free(_gpuKNorm![i]); }
         }

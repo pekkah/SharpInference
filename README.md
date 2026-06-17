@@ -38,6 +38,22 @@ sharpi-cli -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -g -1 \
 | Vulkan `-g -1` | 83.9 | 105.8 | GLSL `subgroupAdd` reduce |
 | CPU | 39.6 | 42.9 | AVX2 fused dequant-matvec |
 
+#### VibeThinker 1.5B (Qwen2 math/reasoning) — [WeiboAI](https://huggingface.co/WeiboAI/VibeThinker-1.5B) · 1 GB
+
+```bash
+# Fine-tune of Qwen2.5-Math-1.5B. Emits a long <think> chain-of-thought, then a
+# \boxed{} answer. No system prompt needed — the chat template adds the "reason step
+# by step, put your final answer in \boxed{}" default. download-model.ps1 -Model vibethinker
+sharpi-cli -m models/VibeThinker-1.5B.Q4_K_M.gguf -g -1 \
+  --temp 0.6 --top-p 0.95 --top-k 0 -p "If 5x + 3 = 2x + 18, what is x?"
+```
+
+| Backend | Prefill t/s | Decode t/s | Notes |
+|---|---:|---:|---|
+| **CUDA** `-g -1` | **173** | **213.6** | standard `qwen2` dense path: QKV-projection bias **without** an output-projection bias (probed independently — Qwen2 omits `bo`), GQA 12/2 heads, head_dim 128, NEOX RoPE, tied embeddings. Reasoning runs through the generic `<think>`/`</think>` machinery (no parser changes). |
+| Vulkan `-g -1` | 95.9 | 125.5 | full-offload `GpuForwardPass` |
+| CPU | 49.5 | 41.2 | dense AVX2; greedy (`--temp 0`) converges fastest on simple problems |
+
 #### OLMoE 1B-7B Instruct (MoE) — [allenai](https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF) · 4 GB
 
 ```bash
@@ -331,7 +347,7 @@ dotnet run --project src/SharpInference.Cli -c Release -- image \
 
 - Architecture & algorithms: [docs/SharpInference-Design.md](docs/SharpInference-Design.md)
 - All CLI flags: `sharpi-cli --help`, `sharpi-cli image --help`
-- Model downloads: `scripts/download-model.ps1 -Model <smollm2|qwen3-8b|qwen3-coder-30b-a3b|llama4-scout|z-image-turbo|realesrgan-x4|…>`
+- Model downloads: `scripts/download-model.ps1 -Model <smollm2|vibethinker|qwen3-8b|qwen3-coder-30b-a3b|llama4-scout|z-image-turbo|realesrgan-x4|…>`
 - Tests: `dotnet test`
 - NativeAOT publish: `dotnet publish src/SharpInference.Cli -c Release -r win-x64`
 

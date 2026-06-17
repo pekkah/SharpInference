@@ -3,7 +3,7 @@
     Downloads GGUF models for SharpInference development.
 .DESCRIPTION
     Downloads from HuggingFace to the models/ directory. Skips if already present.
-    Supports: smollm2, qwen3-8b, olmoe-1b-7b, llama31-70b, qwen3-coder-30b-a3b, qwen36-35b-a3b,
+    Supports: smollm2, vibethinker, qwen3-8b, olmoe-1b-7b, llama31-70b, qwen3-coder-30b-a3b, qwen36-35b-a3b,
               qwen36-27b-mtp, qwen36-27b-mtp-q5, qwen36-35b-a3b-mtp, carnice-35b-a3b-mtp,
               gemma4-12b-qat, gemma4-12b-q4km, gemma4-e4b-qat,
               llama4-scout, z-image-turbo, z-image-turbo-q8, realesrgan-x4
@@ -12,6 +12,7 @@
 .EXAMPLE
     .\download-model.ps1                                # All text models
     .\download-model.ps1 -Model smollm2                 # SmolLM2 1.7B (1.1 GB)
+    .\download-model.ps1 -Model vibethinker             # VibeThinker-1.5B Q4_K_M (1.1 GB) — Qwen2-based math/reasoning, issue #282
     .\download-model.ps1 -Model qwen3-8b                # Qwen3 8B (4.9 GB)
     .\download-model.ps1 -Model olmoe-1b-7b             # OLMoE 1B-7B Instruct Q4_K_M (~4.4 GB) — small MoE for kernel validation
     .\download-model.ps1 -Model llama31-70b             # Llama 3.1 70B (40.8 GB)
@@ -30,7 +31,7 @@
     .\download-model.ps1 -Model realesrgan-x4           # Real-ESRGAN x4plus upscaler (67 MB)
 #>
 param(
-    [ValidateSet("smollm2", "qwen3-8b", "qwen3-0.6b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "qwen36-35b-a3b",
+    [ValidateSet("smollm2", "vibethinker", "qwen3-8b", "qwen3-0.6b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "qwen36-35b-a3b",
                  "qwen36-27b-mtp", "qwen36-27b-mtp-q5", "qwen36-35b-a3b-mtp", "carnice-35b-a3b-mtp",
                  "gemma4-12b-qat", "gemma4-12b-q4km", "gemma4-e4b-qat",
                  "llama4-scout", "z-image-turbo", "z-image-turbo-q8", "realesrgan-x4")]
@@ -44,6 +45,19 @@ $Models = @{
         Urls  = @("https://huggingface.co/bartowski/SmolLM2-1.7B-Instruct-GGUF/resolve/main/SmolLM2-1.7B-Instruct-Q4_K_M.gguf")
         Size  = "1.1 GB"
         Phase = "1-2"
+    }
+    # VibeThinker-1.5B (WeiboAI) — a fine-tune of Qwen2.5-Math-1.5B, so it loads as a
+    # standard `qwen2` GGUF: 28 layers, hidden 1536, 12 heads / 2 KV heads (GQA), head_dim
+    # 128, vocab 151936, tied embeddings, NEOX RoPE. The Qwen2 quirk is bias terms on the
+    # Q/K/V projections (auto-probed → HasAttnBias) with no QK-norm. ChatML prompt format;
+    # long plain-text chain-of-thought (NOT <think> tags). Recommended sampling: temp 0.6,
+    # top_p 0.95, top_k 0, and no system prompt for math. Verification target for issue #282.
+    "vibethinker" = @{
+        Files = @("VibeThinker-1.5B.Q4_K_M.gguf")
+        Urls  = @("https://huggingface.co/mradermacher/VibeThinker-1.5B-GGUF/resolve/main/VibeThinker-1.5B.Q4_K_M.gguf")
+        Size  = "1.1 GB"
+        SizeGB = 1.1
+        Phase = "issue #282 (Qwen2-based math/reasoning verification)"
     }
     "qwen3-8b" = @{
         Files = @("Qwen3-8B-Q4_K_M.gguf")

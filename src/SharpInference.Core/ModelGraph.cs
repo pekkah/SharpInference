@@ -54,10 +54,18 @@ public sealed record ModelHyperparams
     public float RopeThetaSwa { get; init; }
 
     /// <summary>
-    /// Whether the model has bias terms on Q/K/V/O attention projections (e.g. Qwen models).
+    /// Whether the model has bias terms on the Q/K/V attention projections (e.g. Qwen models).
     /// Detected at load time by probing for "blk.0.attn_q.bias" in the GGUF tensor index.
     /// </summary>
     public bool HasAttnBias { get; init; }
+
+    /// <summary>
+    /// Whether the model also carries a bias on the attention <em>output</em> projection
+    /// (<c>blk.*.attn_output.bias</c>). Qwen2 has Q/K/V bias but no output-projection bias,
+    /// so this is probed independently of <see cref="HasAttnBias"/> (and is only ever true
+    /// when <see cref="HasAttnBias"/> is). Mirrors llama.cpp treating <c>bo</c> as optional.
+    /// </summary>
+    public bool HasAttnOutputBias { get; init; }
 
     /// <summary>
     /// Whether the model has per-head Q/K RMSNorm (e.g. Qwen3).
@@ -260,6 +268,10 @@ public sealed record ModelHyperparams
         // Detect features by probing tensor names
         bool hasAttnBias = metadata.ContainsKey("_sharpi.has_attn_bias")
             || (model?.FindTensor("blk.0.attn_q.bias") is not null);
+        // The output-projection bias is optional even when Q/K/V bias is present (Qwen2 omits it).
+        bool hasAttnOutputBias = hasAttnBias
+            && (metadata.ContainsKey("_sharpi.has_attn_output_bias")
+                || (model?.FindTensor("blk.0.attn_output.bias") is not null));
         bool hasQkNorm = metadata.ContainsKey("_sharpi.has_qk_norm")
             || (model?.FindTensor("blk.0.attn_q_norm.weight") is not null);
         bool perChannelQkNorm = false;
@@ -492,6 +504,7 @@ public sealed record ModelHyperparams
             RmsNormEps = GetFloat(metadata, $"{arch}.attention.layer_norm_rms_epsilon", 1e-5f),
             RopeTheta = GetFloat(metadata, $"{arch}.rope.freq_base", 10_000f),
             HasAttnBias = hasAttnBias,
+            HasAttnOutputBias = hasAttnOutputBias,
             HasQkNorm = hasQkNorm,
             IsPerChannelQkNorm = perChannelQkNorm,
             IsMoE = isMoE,
