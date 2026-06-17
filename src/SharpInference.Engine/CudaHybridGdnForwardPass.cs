@@ -540,6 +540,18 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // SHARPI_GDN_PREFILL_COMPUTE=0 reverts to the byte-exact per-token matvec.
     internal static bool GdnPrefillComputeEnabled =
         Environment.GetEnvironmentVariable("SHARPI_GDN_PREFILL_COMPUTE") != "0";
+    // Issue #210: route the k MTP-draft tokens' routed-expert FFN in BatchVerify
+    // through the #110 group-by-expert core (BatchedRoutedExperts) instead of the
+    // per-token CpuMoeFfnCore loop, so each selected expert's mmap'd gate/up/down
+    // rows are read once and dotted against every draft that routed to it. The win
+    // scales with expert overlap across the (adjacent-position) draft chain. The
+    // routed output is bit-identical to the per-token path (same DispatchDot/
+    // DispatchDotQ8K kernels, same top-k accumulation order) — the shared expert
+    // and (routed+shared)+resid combine mirror the per-token operand order exactly.
+    // SHARPI_MTP_BATCHED_MOE_VERIFY=0 reverts to the per-token loop for parity
+    // bisection. Settable (not readonly) so the A/B parity test can toggle it.
+    internal static bool BatchedMoeVerifyEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_MTP_BATCHED_MOE_VERIFY") != "0";
     private int _bCap;                 // token capacity the batched scratch is sized for (grow-only)
     private Tensor? _gpuStreamAll;     // [N × embDim] inter-layer residual stream for all tokens
     private float* _bResidAll;         // [bCap × embDim] pinned — per-token MoE residual (postBlock hidden)
@@ -3633,12 +3645,21 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         int embDim = _embDim;
         long embBytes = (long)embDim * sizeof(float);
         bool isMoe = _hp.IsMoE;
+        // Snapshot the settable toggle once: the scratch alloc below and the FFN-branch
+        // select in the layer loop must agree, or we'd allocate-without-use (or worse,
+        // use-without-alloc) if the test flipped it mid-call.
+        bool batchedMoeVerify = isMoe && BatchedMoeVerifyEnabled;
 
         EnsureStreamAll(k);
         EnsureBatchedTrunkScratch(k);
         if (BatchedFfnEnabled && !isMoe && _denseFfnGpuLayers > 0)
             EnsureBatchedFfnScratch(k);
         EnsureBatchVerifyScratch(k);
+        // Group-by-expert routed FFN (issue #210) reuses the batched-prefill host
+        // scratch (_bNormAll / _bSelected / _bRoutedAll / bucket buffers). Grow-only;
+        // a no-op when a prior prefill already sized it past k.
+        if (batchedMoeVerify)
+            EnsureBatchedScratch(k);
 
         // Pessimistic fault latch — same contract as the batched prefills: a
         // mid-pass throw leaves the recurrent state partially advanced while the
@@ -3698,11 +3719,19 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 _gpu.AddInPlace(_gpuBvFfnAll!, blockOut);
                 _gpu.CopyDeviceRegion(stream, 0, _gpuBvFfnAll!, 0, k * embBytes);
             }
+            else if (batchedMoeVerify)
+            {
+                // Issue #210: group the k draft tokens by selected expert so each
+                // expert's mmap'd rows are read once across the chain. Bit-identical
+                // routed output to the per-token CpuMoeFfnCore loop below.
+                BatchVerifyCpuMoe(layer, k, moeNorm, blockOut, stream);
+            }
             else
             {
                 // Per-token fallbacks: GPU dense layer with a non-GEMM-N weight
                 // dtype, or CPU MoE (per-token routing, issue #45 — the wins come
-                // from the batched trunk + lm_head, not the routed FFN itself).
+                // from the batched trunk + lm_head, not the routed FFN itself;
+                // SHARPI_MTP_BATCHED_MOE_VERIFY=0 forces this path for MoE too).
                 // Full-GPU MoE never reaches here (SupportsBatchVerify gate).
                 for (int i = 0; i < k; i++)
                 {
@@ -3804,6 +3833,99 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         _batchSnapshotValid = true;
         return result;
+    }
+
+    /// <summary>
+    /// Routed-expert FFN for a <see cref="BatchVerify"/> draft batch, grouped by
+    /// selected expert (issue #210). Mirrors <see cref="CpuMoeFfnCore"/> per token —
+    /// GPU shared expert scaled by the sigmoid gate, host router top-K — but routes the
+    /// dominant routed-expert dots through <see cref="BatchedRoutedExperts"/> so each
+    /// selected expert's mmap'd gate/up/down rows are read once across the chain instead
+    /// of re-read per token. Bit-identical to the per-token loop it replaces: the routed
+    /// dots run the same DispatchDot kernels in the same top-k accumulation order, the
+    /// shared expert uses the identical per-token GPU matvecs, and the (routed + shared)
+    /// + resid combine keeps the per-token operand order (host add of routed+shared, GPU
+    /// add of the block residual over all k tokens).
+    /// </summary>
+    private void BatchVerifyCpuMoe(int layer, int k, Tensor moeNorm, Tensor blockOut, Tensor stream)
+    {
+        int embDim = _embDim;
+        long embBytes = (long)embDim * sizeof(float);
+        int na = _numActiveExperts;
+
+        // All k post-attn norms to host — the routed-expert dot input and the
+        // router / shared-gate input. A pure memcpy, so byte-identical to the
+        // per-token Download(_gpuNormBuf → _cpuNormBuf) the sequential path runs.
+        _gpu.Download(moeNorm, (nint)_bNormAll, k * embDim);
+
+        var routerW = _cpuFfnGateInp![layer];
+        float* gateInpShexp = _cpuFfnGateInpShexp![layer];
+        Tensor gateShexp = _gpuWGateShexp[layer];
+        Tensor upShexp = _gpuWUpShexp[layer];
+        Tensor downShexp = _gpuWDownShexp[layer];
+        Span<int> sel = stackalloc int[na];
+        Span<float> wts = stackalloc float[na];
+
+        // ── Router top-K per token (host) into the grouped-expert bucket inputs.
+        for (int i = 0; i < k; i++)
+        {
+            float* normI = _bNormAll + (long)i * embDim;
+            SimdKernels.MatVec(_cpuRouterLogits, routerW.DataPtr, normI,
+                _numExperts, embDim, routerW.DType);
+            SimdKernels.SoftmaxInPlace(_cpuRouterLogits, _numExperts);
+            SelectTopKPtr(_cpuRouterLogits, _numExperts, na, sel, wts,
+                normalize: _hp.NormalizeMoeTopKWeights);
+            for (int s = 0; s < na; s++)
+            {
+                _bSelected[(long)i * na + s] = sel[s];
+                _bWeights[(long)i * na + s] = wts[s];
+            }
+        }
+
+        // ── Kick the k GPU shared experts (scaled) onto the stream, staged into
+        //    _gpuBvFfnAll. These are enqueued async and NOT synced here, so they run
+        //    on the GPU while the host computes the routed experts below — mirroring
+        //    CpuMoeFfnCore's GPU-shared / CPU-routed overlap, but in bulk. Reusing
+        //    _gpuSharedOut / _gpuFfnGate / _gpuFfnUp across tokens is safe: the single
+        //    stream serializes each token's matvec → scale → stage before the next
+        //    token's matvec overwrites them.
+        for (int i = 0; i < k; i++)
+        {
+            float* normI = _bNormAll + (long)i * embDim;
+            _gpu.CopyDeviceRegion(_gpuNormBuf, 0, moeNorm, i * embBytes, embBytes);
+            GpuMatMul(_gpuFfnGate, gateShexp, _gpuNormBuf);
+            GpuMatMul(_gpuFfnUp, upShexp, _gpuNormBuf);
+            _gpu.SiLuMul(_gpuFfnGate, _gpuFfnUp);
+            GpuMatMul(_gpuSharedOut, downShexp, _gpuFfnGate);
+            float shexpDot = SimdKernels.DotF32(gateInpShexp, normI, embDim);
+            float shexpScale = 1.0f / (1.0f + MathF.Exp(-shexpDot));
+            _gpu.ScaleInPlace(_gpuSharedOut, shexpScale);
+            _gpu.CopyDeviceRegion(_gpuBvFfnAll!, i * embBytes, _gpuSharedOut, 0, embBytes);
+        }
+
+        // ── Group-by-expert routed FFN (the issue's amortization, host). Reads each
+        //    selected expert's rows once; output is bit-identical to the per-token
+        //    routed accumulator CpuMoeFfnCore builds. Overlaps the in-flight GPU
+        //    shared experts above.
+        BatchedRoutedExperts(layer, k);
+
+        // Scaled shared-expert outputs for every token → host (single sync; the GPU
+        // work is largely hidden behind the routed compute that just ran).
+        _gpu.Download(_gpuBvFfnAll!, (nint)_bSharedAll, k * embDim);
+
+        // ── Combine: hidden = routed + sharedScaled on the host (matching
+        //    CpuMoeFfnCore's AddInPlace(moeOut, _cpuSharedOut) operand order), then add
+        //    the block residual on the GPU over all k tokens (element-wise → per-token
+        //    bits). One flat pass over the contiguous [k×embDim] buffers: k is the tiny
+        //    draft batch (2–4), so a sequential loop beats Parallel.For here — TPL
+        //    scheduling plus the closure heap-alloc would dwarf the work. (The prefill
+        //    combine parallelizes only because there N ≈ the prefill chunk size.)
+        long combineCount = (long)k * embDim;
+        for (long r = 0; r < combineCount; r++)
+            _bHiddenAll[r] = _bRoutedAll[r] + _bSharedAll[r];
+        _gpu.UploadInto(_gpuBvFfnAll!, (nint)_bHiddenAll, k * embDim);
+        _gpu.AddInPlace(_gpuBvFfnAll!, blockOut);
+        _gpu.CopyDeviceRegion(stream, 0, _gpuBvFfnAll!, 0, (long)k * embBytes);
     }
 
     /// <inheritdoc/>
