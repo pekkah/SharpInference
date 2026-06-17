@@ -484,6 +484,155 @@ public static unsafe class SimdKernels
         }
     }
 
+    /// <summary>
+    /// Four-input fused mat-vec (issue #209): for each weight row
+    /// <c>output{0..3}[r] = weights[r] · input{0..3}</c>. Decodes each weight row
+    /// ONCE and dots it against four token columns in the same pass — one weight
+    /// HBM/L2 read per four tokens versus <see cref="MatVec2In"/>'s one-per-two. This
+    /// is the dominant lever on the 27B-MTP CUDA-hybrid decode path, where 46/64 dense
+    /// FFN layers are CPU-mmap'd and re-read once per draft token. Per-token
+    /// accumulation order is identical to <see cref="MatVec2In"/> / single
+    /// <see cref="MatVec"/>, so each position's bits are independent of the batch width
+    /// k (the duplicated-input-tail contract — see the BatchVerify callers, which fill
+    /// past-the-end lanes with a duplicate token routed to a sink).
+    /// </summary>
+    public static void MatVec4In(
+        float* output0, float* output1, float* output2, float* output3,
+        byte* weights,
+        float* input0, float* input1, float* input2, float* input3,
+        int rows, int cols, DType dtype)
+    {
+        switch (dtype)
+        {
+            case DType.Q4_K:
+            {
+                int bpr = (cols / 256) * 144;
+                if (rows >= MinRowsForParallel)
+                {
+                    var w = weights; var i0 = input0; var i1 = input1; var i2 = input2; var i3 = input3;
+                    var o0 = output0; var o1 = output1; var o2 = output2; var o3 = output3; int c = cols;
+                    Parallel.For(0, rows, s_parallelOpts, r =>
+                    {
+                        byte* row = w + (long)r * bpr;
+                        DotQ4K_4In(row, i0, i1, i2, i3, c, out float s0, out float s1, out float s2, out float s3);
+                        o0[r] = s0; o1[r] = s1; o2[r] = s2; o3[r] = s3;
+                    });
+                }
+                else
+                {
+                    for (int r = 0; r < rows; r++)
+                    {
+                        byte* row = weights + (long)r * bpr;
+                        DotQ4K_4In(row, input0, input1, input2, input3, cols, out float s0, out float s1, out float s2, out float s3);
+                        output0[r] = s0; output1[r] = s1; output2[r] = s2; output3[r] = s3;
+                    }
+                }
+                break;
+            }
+            case DType.Q5_K:
+            {
+                int bpr = (cols / 256) * 176;
+                if (rows >= MinRowsForParallel)
+                {
+                    var w = weights; var i0 = input0; var i1 = input1; var i2 = input2; var i3 = input3;
+                    var o0 = output0; var o1 = output1; var o2 = output2; var o3 = output3; int c = cols;
+                    Parallel.For(0, rows, s_parallelOpts, r =>
+                    {
+                        byte* row = w + (long)r * bpr;
+                        DotQ5K_4In(row, i0, i1, i2, i3, c, out float s0, out float s1, out float s2, out float s3);
+                        o0[r] = s0; o1[r] = s1; o2[r] = s2; o3[r] = s3;
+                    });
+                }
+                else
+                {
+                    for (int r = 0; r < rows; r++)
+                    {
+                        byte* row = weights + (long)r * bpr;
+                        DotQ5K_4In(row, input0, input1, input2, input3, cols, out float s0, out float s1, out float s2, out float s3);
+                        output0[r] = s0; output1[r] = s1; output2[r] = s2; output3[r] = s3;
+                    }
+                }
+                break;
+            }
+            case DType.Q6_K:
+            {
+                int bpr = (cols / 256) * 210;
+                int scratchBytes = Q8KScratchBytes(cols);
+                // One Q8_K scratch per input; same stack-alloc discipline as MatVec2In.
+                byte* sc0 = stackalloc byte[scratchBytes];
+                byte* sc1 = stackalloc byte[scratchBytes];
+                byte* sc2 = stackalloc byte[scratchBytes];
+                byte* sc3 = stackalloc byte[scratchBytes];
+                QuantizeRowToQ8K(input0, cols, sc0);
+                QuantizeRowToQ8K(input1, cols, sc1);
+                QuantizeRowToQ8K(input2, cols, sc2);
+                QuantizeRowToQ8K(input3, cols, sc3);
+
+                if (rows >= MinRowsForParallel)
+                {
+                    var w = weights; var s0 = sc0; var s1 = sc1; var s2 = sc2; var s3 = sc3;
+                    var o0 = output0; var o1 = output1; var o2 = output2; var o3 = output3; int c = cols;
+                    Parallel.For(0, rows, s_parallelOpts, r =>
+                    {
+                        byte* row = w + (long)r * bpr;
+                        DotQ6K_Q8K_4In(row, s0, s1, s2, s3, c, out float v0, out float v1, out float v2, out float v3);
+                        o0[r] = v0; o1[r] = v1; o2[r] = v2; o3[r] = v3;
+                    });
+                }
+                else
+                {
+                    for (int r = 0; r < rows; r++)
+                    {
+                        byte* row = weights + (long)r * bpr;
+                        DotQ6K_Q8K_4In(row, sc0, sc1, sc2, sc3, cols, out float v0, out float v1, out float v2, out float v3);
+                        output0[r] = v0; output1[r] = v1; output2[r] = v2; output3[r] = v3;
+                    }
+                }
+                break;
+            }
+            case DType.Float32:
+            {
+                var m = (float*)weights;
+                if (rows >= MinRowsForParallel)
+                {
+                    var i0 = input0; var i1 = input1; var i2 = input2; var i3 = input3;
+                    var o0 = output0; var o1 = output1; var o2 = output2; var o3 = output3; int c = cols;
+                    Parallel.For(0, rows, s_parallelOpts, r =>
+                    {
+                        float* row = m + (long)r * c;
+                        o0[r] = DotF32(row, i0, c);
+                        o1[r] = DotF32(row, i1, c);
+                        o2[r] = DotF32(row, i2, c);
+                        o3[r] = DotF32(row, i3, c);
+                    });
+                }
+                else
+                {
+                    for (int r = 0; r < rows; r++)
+                    {
+                        float* row = m + (long)r * cols;
+                        output0[r] = DotF32(row, input0, cols);
+                        output1[r] = DotF32(row, input1, cols);
+                        output2[r] = DotF32(row, input2, cols);
+                        output3[r] = DotF32(row, input3, cols);
+                    }
+                }
+                break;
+            }
+            default:
+                // Fallback: two MatVec2In pairs (each falls back per-dtype as needed).
+                // Never worse than the prior pairwise path, still correct. Q8_0 lands
+                // here deliberately — the single-token dense FFN decode (MatVec /
+                // MatVecDual) and the old MatVec2In path both take the dequant→DotF32
+                // fallback for Q8_0, so routing the quad here keeps the verify path
+                // bit-identical to single-token decode (specialising it would also
+                // require moving the single-token path to DotQ8_0 and re-validating).
+                MatVec2In(output0, output1, weights, input0, input1, rows, cols, dtype);
+                MatVec2In(output2, output3, weights, input2, input3, rows, cols, dtype);
+                break;
+        }
+    }
+
     private static void MatVecDequantFallback(float* output, byte* weights, float* input,
         int rows, int cols, DType dtype)
     {
@@ -853,6 +1002,115 @@ public static unsafe class SimdKernels
 
                 qIdx += 32;
                 scIdx += 2;
+            }
+            elemOff += 256;
+        }
+
+        sum0 = HSum512(Avx512F.Add(accLo0, accHi0));
+        sum1 = HSum512(Avx512F.Add(accLo1, accHi1));
+        sum2 = HSum512(Avx512F.Add(accLo2, accHi2));
+        sum3 = HSum512(Avx512F.Add(accLo3, accHi3));
+    }
+
+    // ================================================================
+    //  Q5_K Fused four-input dot (issue #209) — register-tiled extension
+    //  of DotQ5K_2In: decode each block ONCE and FMA against FOUR inputs.
+    //  Each input's lo/hi accumulator chain matches the single-input order
+    //  exactly, so the result is bit-identical to four DotQ5K calls.
+    // ================================================================
+
+    public static void DotQ5K_4In(byte* row,
+        float* input0, float* input1, float* input2, float* input3, int cols,
+        out float sum0, out float sum1, out float sum2, out float sum3)
+    {
+        int numBlocks = cols / 256;
+
+        if (Avx512F.IsSupported)
+        {
+            DotQ5K_4In_Avx512(row, input0, input1, input2, input3, numBlocks,
+                out sum0, out sum1, out sum2, out sum3);
+            return;
+        }
+        sum0 = DotQ5K(row, input0, cols);
+        sum1 = DotQ5K(row, input1, cols);
+        sum2 = DotQ5K(row, input2, cols);
+        sum3 = DotQ5K(row, input3, cols);
+    }
+
+    private static void DotQ5K_4In_Avx512(byte* row,
+        float* input0, float* input1, float* input2, float* input3, int numBlocks,
+        out float sum0, out float sum1, out float sum2, out float sum3)
+    {
+        var accLo0 = Vector512<float>.Zero; var accHi0 = Vector512<float>.Zero;
+        var accLo1 = Vector512<float>.Zero; var accHi1 = Vector512<float>.Zero;
+        var accLo2 = Vector512<float>.Zero; var accHi2 = Vector512<float>.Zero;
+        var accLo3 = Vector512<float>.Zero; var accHi3 = Vector512<float>.Zero;
+        var mask0F = Vector512.Create(0x0F);
+        var bit16  = Vector512.Create(16);
+        int elemOff = 0;
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            byte* x = row + b * 176;
+            float d = HalfToFloat(x[0], x[1]);
+            float dmin = HalfToFloat(x[2], x[3]);
+            byte* sc = x + 4;
+            byte* qh = x + 16;
+            byte* ql = x + 48;
+
+            int qIdx = 0, scIdx = 0;
+            byte u1 = 1, u2 = 2;
+
+            for (int chunk = 0; chunk < 4; chunk++)
+            {
+                GetScaleMinK4(scIdx, sc, out byte sc1, out byte m1);
+                GetScaleMinK4(scIdx + 1, sc, out byte sc2, out byte m2);
+
+                var d1     = Vector512.Create(d * sc1);
+                var negDm1 = Vector512.Create(-(dmin * m1));
+                var d2     = Vector512.Create(d * sc2);
+                var negDm2 = Vector512.Create(-(dmin * m2));
+
+                int bo = elemOff + chunk * 64;
+
+                for (int l = 0; l < 32; l += 16)
+                {
+                    var qlBytes = Vector128.LoadUnsafe(ref *(ql + qIdx + l));
+                    var qlInts = Avx512F.ConvertToVector512Int32(qlBytes);
+                    var qhBytes = Vector128.LoadUnsafe(ref *(qh + l));
+                    var qhInts = Avx512F.ConvertToVector512Int32(qhBytes);
+
+                    // Low nibble + high bit u1 → q5Lo, dequant once.
+                    var loNib = Avx512F.And(qlInts, mask0F);
+                    var hLoMask = Avx512F.And(qhInts, Vector512.Create((int)u1));
+                    var hLo = Avx512F.And(
+                        Avx512F.CompareGreaterThan(hLoMask, Vector512<int>.Zero).AsInt32(),
+                        bit16);
+                    var q5Lo = Avx512F.Add(loNib, hLo);
+                    var deqLo = Avx512F.FusedMultiplyAdd(d1, Avx512F.ConvertToVector512Single(q5Lo), negDm1);
+                    accLo0 = Avx512F.FusedMultiplyAdd(deqLo, Vector512.LoadUnsafe(ref *(input0 + bo + l)), accLo0);
+                    accLo1 = Avx512F.FusedMultiplyAdd(deqLo, Vector512.LoadUnsafe(ref *(input1 + bo + l)), accLo1);
+                    accLo2 = Avx512F.FusedMultiplyAdd(deqLo, Vector512.LoadUnsafe(ref *(input2 + bo + l)), accLo2);
+                    accLo3 = Avx512F.FusedMultiplyAdd(deqLo, Vector512.LoadUnsafe(ref *(input3 + bo + l)), accLo3);
+
+                    // High nibble + high bit u2 → q5Hi, dequant once.
+                    var hiNib = Avx512F.And(Avx512F.ShiftRightLogical(qlInts, 4), mask0F);
+                    var hHiMask = Avx512F.And(qhInts, Vector512.Create((int)u2));
+                    var hHi = Avx512F.And(
+                        Avx512F.CompareGreaterThan(hHiMask, Vector512<int>.Zero).AsInt32(),
+                        bit16);
+                    var q5Hi = Avx512F.Add(hiNib, hHi);
+                    var deqHi = Avx512F.FusedMultiplyAdd(d2, Avx512F.ConvertToVector512Single(q5Hi), negDm2);
+                    accHi0 = Avx512F.FusedMultiplyAdd(deqHi, Vector512.LoadUnsafe(ref *(input0 + bo + 32 + l)), accHi0);
+                    accHi1 = Avx512F.FusedMultiplyAdd(deqHi, Vector512.LoadUnsafe(ref *(input1 + bo + 32 + l)), accHi1);
+                    accHi2 = Avx512F.FusedMultiplyAdd(deqHi, Vector512.LoadUnsafe(ref *(input2 + bo + 32 + l)), accHi2);
+                    accHi3 = Avx512F.FusedMultiplyAdd(deqHi, Vector512.LoadUnsafe(ref *(input3 + bo + 32 + l)), accHi3);
+                }
+
+                qIdx += 32;
+                scIdx += 2;
+                u1 <<= 2;
+                u2 <<= 2;
             }
             elemOff += 256;
         }
@@ -3249,6 +3507,173 @@ public static unsafe class SimdKernels
         }
         sum1 = HSum256(acc1);
         sum2 = HSum256(acc2);
+    }
+
+    // ================================================================
+    //  Q6_K · Q8_K Fused four-input dot (issue #209) — register-tiled
+    //  extension of DotQ6K_Q8K_2In: decode each Q6_K super-block ONCE and
+    //  inner-int-product it against FOUR pre-quantized Q8_K inputs. Each
+    //  input's sumi/acc chain matches the single-input order exactly, so the
+    //  result is bit-identical to four DotQ6K_Q8K calls.
+    // ================================================================
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void DotQ6K_Q8K_4In(byte* row, byte* scratch0, byte* scratch1,
+                                       byte* scratch2, byte* scratch3, int cols,
+                                       out float sum0, out float sum1, out float sum2, out float sum3)
+    {
+        int numBlocks = cols / 256;
+
+        if (Avx2.IsSupported && Fma.IsSupported)
+        {
+            DotQ6K_Q8K_4In_Avx2(row, scratch0, scratch1, scratch2, scratch3, numBlocks,
+                out sum0, out sum1, out sum2, out sum3);
+            return;
+        }
+        sum0 = DotQ6K_Q8K_Scalar(row, scratch0, numBlocks);
+        sum1 = DotQ6K_Q8K_Scalar(row, scratch1, numBlocks);
+        sum2 = DotQ6K_Q8K_Scalar(row, scratch2, numBlocks);
+        sum3 = DotQ6K_Q8K_Scalar(row, scratch3, numBlocks);
+    }
+
+    private static void DotQ6K_Q8K_4In_Avx2(byte* row,
+        byte* scratch0, byte* scratch1, byte* scratch2, byte* scratch3, int numBlocks,
+        out float sum0, out float sum1, out float sum2, out float sum3)
+    {
+        float* dArr0 = (float*)scratch0;
+        sbyte* qsArr0 = (sbyte*)(scratch0 + numBlocks * 4);
+        short* bsumsArr0 = (short*)(scratch0 + numBlocks * 4 + numBlocks * 256);
+        float* dArr1 = (float*)scratch1;
+        sbyte* qsArr1 = (sbyte*)(scratch1 + numBlocks * 4);
+        short* bsumsArr1 = (short*)(scratch1 + numBlocks * 4 + numBlocks * 256);
+        float* dArr2 = (float*)scratch2;
+        sbyte* qsArr2 = (sbyte*)(scratch2 + numBlocks * 4);
+        short* bsumsArr2 = (short*)(scratch2 + numBlocks * 4 + numBlocks * 256);
+        float* dArr3 = (float*)scratch3;
+        sbyte* qsArr3 = (sbyte*)(scratch3 + numBlocks * 4);
+        short* bsumsArr3 = (short*)(scratch3 + numBlocks * 4 + numBlocks * 256);
+
+        var m3 = Vector256.Create((byte)0x03);
+        var m12 = Vector256.Create((byte)0x0C);
+        var m48 = Vector256.Create((byte)0x30);
+        var m192 = Vector256.Create((byte)0xC0);
+        var m15 = Vector256.Create((byte)0x0F);
+        var acc0 = Vector256<float>.Zero;
+        var acc1 = Vector256<float>.Zero;
+        var acc2 = Vector256<float>.Zero;
+        var acc3 = Vector256<float>.Zero;
+
+        for (int i = 0; i < numBlocks; i++)
+        {
+            byte* x = row + i * 210;
+            byte* ql = x;
+            byte* qh = x + 128;
+            sbyte* sc = (sbyte*)(x + 192);
+            float dw = HalfToFloat(x[208], x[209]);
+            float dSuper0 = dw * dArr0[i];
+            float dSuper1 = dw * dArr1[i];
+            float dSuper2 = dw * dArr2[i];
+            float dSuper3 = dw * dArr3[i];
+
+            // Scales (int16) — shared between all inputs.
+            var scales128 = Vector128.LoadUnsafe(ref *(byte*)sc).AsSByte();
+            var scales16 = Avx2.ConvertToVector256Int16(scales128);
+
+            // Per-input offset corrections.
+            var q8sums0 = Vector256.LoadUnsafe(ref *(bsumsArr0 + i * 16));
+            var q8sclsub0 = Avx2.ShiftLeftLogical(Avx2.MultiplyAddAdjacent(q8sums0, scales16), 5);
+            var q8sums1 = Vector256.LoadUnsafe(ref *(bsumsArr1 + i * 16));
+            var q8sclsub1 = Avx2.ShiftLeftLogical(Avx2.MultiplyAddAdjacent(q8sums1, scales16), 5);
+            var q8sums2 = Vector256.LoadUnsafe(ref *(bsumsArr2 + i * 16));
+            var q8sclsub2 = Avx2.ShiftLeftLogical(Avx2.MultiplyAddAdjacent(q8sums2, scales16), 5);
+            var q8sums3 = Vector256.LoadUnsafe(ref *(bsumsArr3 + i * 16));
+            var q8sclsub3 = Avx2.ShiftLeftLogical(Avx2.MultiplyAddAdjacent(q8sums3, scales16), 5);
+
+            var sumi0 = Vector256<int>.Zero;
+            var sumi1 = Vector256<int>.Zero;
+            var sumi2 = Vector256<int>.Zero;
+            var sumi3 = Vector256<int>.Zero;
+            sbyte* q8a = (sbyte*)(qsArr0 + i * 256);
+            sbyte* q8b = (sbyte*)(qsArr1 + i * 256);
+            sbyte* q8c = (sbyte*)(qsArr2 + i * 256);
+            sbyte* q8d = (sbyte*)(qsArr3 + i * 256);
+
+            for (int j = 0; j < 2; j++)
+            {
+                var q4bits1 = Vector256.LoadUnsafe(ref *(ql + j * 64));
+                var q4bits2 = Vector256.LoadUnsafe(ref *(ql + j * 64 + 32));
+                var q4bitsH = Vector256.LoadUnsafe(ref *(qh + j * 32));
+
+                // Reconstruct 4 sets of 32 unsigned 6-bit values — shared across inputs.
+                var q4h_0 = Avx2.ShiftLeftLogical(Avx2.And(q4bitsH, m3).AsInt16(), 4).AsByte();
+                var q4h_1 = Avx2.ShiftLeftLogical(Avx2.And(q4bitsH, m12).AsInt16(), 2).AsByte();
+                var q4h_2 = Avx2.And(q4bitsH, m48);
+                var q4h_3 = Avx2.ShiftRightLogical(Avx2.And(q4bitsH, m192).AsInt16(), 2).AsByte();
+
+                var q4_0 = Avx2.Or(Avx2.And(q4bits1, m15), q4h_0);
+                var q4_1 = Avx2.Or(Avx2.And(q4bits2, m15), q4h_1);
+                var q4_2 = Avx2.Or(
+                    Avx2.And(Avx2.ShiftRightLogical(q4bits1.AsInt16(), 4).AsByte(), m15), q4h_2);
+                var q4_3 = Avx2.Or(
+                    Avx2.And(Avx2.ShiftRightLogical(q4bits2.AsInt16(), 4).AsByte(), m15), q4h_3);
+
+                int isc = j * 8;
+                var sc16_0 = Vector256.Create(
+                    Vector128.Create((short)sc[isc + 0]), Vector128.Create((short)sc[isc + 1]));
+                var sc16_1 = Vector256.Create(
+                    Vector128.Create((short)sc[isc + 2]), Vector128.Create((short)sc[isc + 3]));
+                var sc16_2 = Vector256.Create(
+                    Vector128.Create((short)sc[isc + 4]), Vector128.Create((short)sc[isc + 5]));
+                var sc16_3 = Vector256.Create(
+                    Vector128.Create((short)sc[isc + 6]), Vector128.Create((short)sc[isc + 7]));
+
+                Q6KAccumInput(q8a, j, q4_0, q4_1, q4_2, q4_3, sc16_0, sc16_1, sc16_2, sc16_3, ref sumi0);
+                Q6KAccumInput(q8b, j, q4_0, q4_1, q4_2, q4_3, sc16_0, sc16_1, sc16_2, sc16_3, ref sumi1);
+                Q6KAccumInput(q8c, j, q4_0, q4_1, q4_2, q4_3, sc16_0, sc16_1, sc16_2, sc16_3, ref sumi2);
+                Q6KAccumInput(q8d, j, q4_0, q4_1, q4_2, q4_3, sc16_0, sc16_1, sc16_2, sc16_3, ref sumi3);
+            }
+
+            acc0 = Fma.MultiplyAdd(Vector256.Create(dSuper0),
+                Avx.ConvertToVector256Single(Avx2.Subtract(sumi0, q8sclsub0)), acc0);
+            acc1 = Fma.MultiplyAdd(Vector256.Create(dSuper1),
+                Avx.ConvertToVector256Single(Avx2.Subtract(sumi1, q8sclsub1)), acc1);
+            acc2 = Fma.MultiplyAdd(Vector256.Create(dSuper2),
+                Avx.ConvertToVector256Single(Avx2.Subtract(sumi2, q8sclsub2)), acc2);
+            acc3 = Fma.MultiplyAdd(Vector256.Create(dSuper3),
+                Avx.ConvertToVector256Single(Avx2.Subtract(sumi3, q8sclsub3)), acc3);
+        }
+        sum0 = HSum256(acc0);
+        sum1 = HSum256(acc1);
+        sum2 = HSum256(acc2);
+        sum3 = HSum256(acc3);
+    }
+
+    /// <summary>One Q8_K input's contribution to a Q6_K super-block half-pair, using
+    /// the already-decoded weight sextets (<paramref name="q4_0"/>..<c>q4_3</c>) and
+    /// per-group scales. Matches the inline input pass of <see cref="DotQ6K_Q8K_2In_Avx2"/>
+    /// exactly so the 4-input path stays bit-identical to the single/pair paths.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void Q6KAccumInput(sbyte* q8, int j,
+        Vector256<byte> q4_0, Vector256<byte> q4_1, Vector256<byte> q4_2, Vector256<byte> q4_3,
+        Vector256<short> sc16_0, Vector256<short> sc16_1, Vector256<short> sc16_2, Vector256<short> sc16_3,
+        ref Vector256<int> sumi)
+    {
+        var qa0 = Vector256.LoadUnsafe(ref *(q8 + j * 128)).AsSByte();
+        var qa1 = Vector256.LoadUnsafe(ref *(q8 + j * 128 + 32)).AsSByte();
+        var qa2 = Vector256.LoadUnsafe(ref *(q8 + j * 128 + 64)).AsSByte();
+        var qa3 = Vector256.LoadUnsafe(ref *(q8 + j * 128 + 96)).AsSByte();
+
+        var pa0 = Avx2.MultiplyAddAdjacent(q4_0, qa0);
+        var pa1 = Avx2.MultiplyAddAdjacent(q4_1, qa1);
+        var pa2 = Avx2.MultiplyAddAdjacent(q4_2, qa2);
+        var pa3 = Avx2.MultiplyAddAdjacent(q4_3, qa3);
+
+        var sa0 = Avx2.MultiplyAddAdjacent(sc16_0, pa0);
+        var sa1 = Avx2.MultiplyAddAdjacent(sc16_1, pa1);
+        var sa2 = Avx2.MultiplyAddAdjacent(sc16_2, pa2);
+        var sa3 = Avx2.MultiplyAddAdjacent(sc16_3, pa3);
+
+        sumi = Avx2.Add(sumi, Avx2.Add(Avx2.Add(sa0, sa1), Avx2.Add(sa2, sa3)));
     }
 
     // ================================================================

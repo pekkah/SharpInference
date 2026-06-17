@@ -146,11 +146,12 @@ public sealed class MtpDecoder
     /// <summary>
     /// Resolve the effective MTP draft-chain length (proposed tokens per step) from the
     /// llama.cpp-parity <c>--spec-draft-n-max</c> value. <c>&lt; 1</c> (unset) falls back
-    /// to <c>SHARPI_MTP_DRAFT_N</c>, then to the built-in default of 1 (a 2-token verify
-    /// batch — the measured 27B optimum: the GPU trunk's matvec re-stream scales linearly
-    /// with k while the CPU FFN only pair-amortizes, so deeper chains don't pay until a
-    /// 4-input CPU FFN kernel lands; see the issue #30 bench). Deeper chains also need
-    /// ring slots: raise <c>SHARPI_MTP_BATCH_MAX</c> alongside. The result is further
+    /// to <c>SHARPI_MTP_DRAFT_N</c>, then to the built-in default of 3 (a 4-token verify
+    /// batch — the measured 27B optimum once the 4-input CPU FFN kernel landed (issue
+    /// #209): the dominant CPU mmap FFN now amortizes its weight read across four draft
+    /// tokens, moving the optimum out from the old pairwise k=2 to k=4. Deeper chains
+    /// need ring slots too: <see cref="GdnStateCache.ResolveMtpBatchMax"/> defaults to 4
+    /// (raise <c>SHARPI_MTP_BATCH_MAX</c> together for k &gt; 4). The result is further
     /// clamped per step against <see cref="IForwardPass.MaxBatchVerifyTokens"/>.
     /// Shared by <see cref="InferenceEngine"/> and the CLI so both resolve identically.
     /// </summary>
@@ -159,7 +160,7 @@ public sealed class MtpDecoder
         if (specDraftNMax >= 1) return specDraftNMax;
         var s = Environment.GetEnvironmentVariable("SHARPI_MTP_DRAFT_N");
         if (s is not null && int.TryParse(s, out var v) && v >= 1) return v;
-        return 1;
+        return 3;
     }
 
     /// <summary>
