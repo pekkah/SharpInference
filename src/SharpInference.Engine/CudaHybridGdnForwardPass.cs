@@ -5584,6 +5584,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     private long EstimatePerExpertBytes()
     {
+        // Raw per-expert bytes, no power-of-two pool rounding. Since issue #216 the SLRU
+        // packs experts into exact-size slabs, so this estimate is now the *actual* per-slot
+        // footprint (previously it under-counted vs. the pooled allocator's bucket inflation,
+        // making the auto-router's predicted capacity optimistic). PredictSlruSlots → the 50%
+        // capacity threshold below now reflects what really fits.
         // Per expert: gate + up + down weight matrices. For qwen35moe Q4_K_M:
         //   gate/up: [embDim=2048, expertDim=512] each ≈ 588 KiB raw Q4_K
         //   down:    [expertDim=512, embDim=2048]     ≈ 588 KiB raw Q5_K — with the

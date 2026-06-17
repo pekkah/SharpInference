@@ -3129,20 +3129,19 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     /// <summary>
     /// On-VRAM bytes for one expert's three weight tensors (gate + up + down), used to
     /// size the SLRU slot capacity. Mirrors CudaExpertSlotManager's upload accounting:
-    /// Q4_K/Q5_K/Q6_K are stored raw; other dtypes expand to F32. Each tensor's raw
-    /// byte size is rounded up to the buffer pool's allocation bucket (power-of-two,
-    /// min 64 B) — otherwise the planner over-estimates capacity by ~2× since pooled
-    /// allocations inflate sub-bucket sizes (e.g. 1.05 MiB Q5_K tensor → 2 MiB).
+    /// Q4_K/Q5_K/Q6_K are stored raw; other dtypes expand to F32. Since issue #216 the
+    /// slot manager packs experts into preallocated exact-size slabs (one slot = the raw
+    /// per-expert bytes, no power-of-two pool rounding), so this is the exact per-slot
+    /// footprint — capacity is no longer deflated ~2× by sub-bucket inflation.
     /// </summary>
     private long PerExpertBytes()
     {
         long Bytes(string name, int rows, int cols)
         {
             if (_model.FindTensor(name) is not { } info) return 0;
-            long raw = info.DType is DType.Q4_K or DType.Q5_K or DType.Q6_K
+            return info.DType is DType.Q4_K or DType.Q5_K or DType.Q6_K
                 ? (long)rows * (cols / DTypeInfo.BlockSize(info.DType)) * DTypeInfo.BytesPerBlock(info.DType)
                 : (long)rows * cols * sizeof(float); // F32 (native or dequantized)
-            return (long)CudaBackend.RoundUpAllocBytes((nuint)raw);
         }
         return Bytes("blk.0.ffn_gate_exps.weight", _expertDim, _embDim)
              + Bytes("blk.0.ffn_up_exps.weight",   _expertDim, _embDim)

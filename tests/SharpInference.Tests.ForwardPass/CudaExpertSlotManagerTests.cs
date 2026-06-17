@@ -116,6 +116,57 @@ public sealed class CudaExpertSlotManagerTests
     }
 
     /// <summary>
+    /// Issue #216 — exact-size slab: the expert cache VRAM footprint equals
+    /// <c>(slotCapacity + 1) × per-expert bytes</c> (the +1 is the eviction-staging slot)
+    /// and does NOT grow as more distinct experts than capacity churn through, proving the
+    /// slab is preallocated once and slots are reused (no per-eviction cudaMalloc/cudaFree).
+    /// </summary>
+    [Fact]
+    public void ExpertCacheVram_IsExactSizeSlab_AndStableUnderChurn()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        var path = FindFirstExisting("models\\OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf");
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        if (!hp.IsMoE) return;
+
+        const int cap = 4;
+        var dtypes = new Dictionary<nint, DType>();
+        using var slots = new CudaExpertSlotManager(gpu, model, hp, slotCapacity: cap, dtypes);
+
+        // Before any upload the slabs are unallocated.
+        Assert.Equal(0, slots.ExpertCacheVramBytes);
+
+        // Exact per-expert bytes for the three roles (raw for Q4_K/Q5_K/Q6_K, else F32).
+        long ExpertBytes(string name, int rows, int cols)
+        {
+            var info = model.FindTensor(name)!.Value;
+            return info.DType is DType.Q4_K or DType.Q5_K or DType.Q6_K
+                ? (long)rows * (cols / DTypeInfo.BlockSize(info.DType)) * DTypeInfo.BytesPerBlock(info.DType)
+                : (long)rows * cols * sizeof(float);
+        }
+        long perExpert =
+            ExpertBytes("blk.0.ffn_gate_exps.weight", hp.ExpertIntermediateDim, hp.EmbeddingDim) +
+            ExpertBytes("blk.0.ffn_up_exps.weight",   hp.ExpertIntermediateDim, hp.EmbeddingDim) +
+            ExpertBytes("blk.0.ffn_down_exps.weight", hp.EmbeddingDim, hp.ExpertIntermediateDim);
+        long expectedSlab = perExpert * (cap + 1);
+
+        // First load allocates all three slabs at full (cap+1) stride.
+        slots.GetOrLoad(0, 0);
+        Assert.Equal(expectedSlab, slots.ExpertCacheVramBytes);
+
+        // Churn many more distinct experts than capacity → forced evictions reuse slots.
+        for (int e = 1; e <= cap + 6; e++) slots.GetOrLoad(0, e);
+
+        // Footprint is unchanged: slab preallocated, slots recycled, no growth.
+        Assert.Equal(expectedSlab, slots.ExpertCacheVramBytes);
+    }
+
+    /// <summary>
     /// Same accounting check against the 22 GB qwen35moe model, only runs when
     /// the file is present at the expected path on this machine. This is the
     /// model the CUDA SLRU is actually intended for — it cannot fit eagerly on

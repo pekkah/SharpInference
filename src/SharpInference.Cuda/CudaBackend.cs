@@ -796,6 +796,30 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         return new Tensor(TensorShape.D1(elemCount), dtype, handle);
     }
 
+    /// <summary>
+    /// Byte-precise sibling of <see cref="View"/> for carving fixed-stride expert slots out
+    /// of a preallocated SLRU slab (issue #216). Registers a non-owning view into
+    /// <paramref name="parent"/> at raw byte offset <paramref name="byteOffset"/> spanning
+    /// <paramref name="byteLength"/> bytes, tagged with <paramref name="dtype"/> and the
+    /// caller-supplied <paramref name="shape"/>. Unlike <see cref="View"/> the offset is in
+    /// raw bytes — <c>BytesPerElement</c> throws for Q4_K/Q5_K/Q6_K, so element-offset
+    /// addressing can't express a quantized slab slot. <see cref="Free"/> on the result drops
+    /// the handle registration only; the parent slab owns and frees the device memory.
+    /// </summary>
+    public Tensor ViewRawBytes(Tensor parent, long byteOffset, long byteLength, TensorShape shape, DType dtype)
+    {
+        if (!_devPtrs.TryGetValue(parent.Handle, out var pe))
+            throw new InvalidOperationException($"ViewRawBytes: parent handle {parent.Handle} not registered.");
+        if (byteOffset < 0 || byteLength < 0 || byteOffset + byteLength > (long)pe.byteSize)
+            throw new ArgumentOutOfRangeException(nameof(byteOffset),
+                $"ViewRawBytes [{byteOffset}, {byteOffset + byteLength}) out of parent bounds ({pe.byteSize}B).");
+        var handle = (nint)Interlocked.Increment(ref _nextHandle);
+        _devPtrs[handle] = (pe.devPtr + (nint)byteOffset, (nuint)byteLength);
+        _viewHandles[handle] = 0;
+        _tensorDTypes[handle] = dtype;
+        return new Tensor(shape, dtype, handle);
+    }
+
     public void Free(Tensor tensor)
     {
         // #149: drop any SoA-layout mark (harmless no-op for non-repacked handles) so
@@ -1473,6 +1497,46 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>
+    /// Async H2D upload of raw bytes into an EXISTING device buffer / view (issue #216
+    /// SLRU slab slots), on the dedicated upload stream. Allocates nothing: the returned
+    /// handle's tensor IS <paramref name="dst"/>. Same readiness model as
+    /// <see cref="UploadBackgroundRaw"/> — the caller must <see cref="WaitForUpload"/> (or
+    /// poll <see cref="IsUploadComplete"/>) before launching kernels that read
+    /// <paramref name="dst"/>, then release the handle via <see cref="ReleaseUploadHandle"/>.
+    /// </summary>
+    public CudaUploadHandle UploadBackgroundRawInto(Tensor dst, ReadOnlySpan<byte> data)
+    {
+        if (!_devPtrs.TryGetValue(dst.Handle, out var entry))
+            throw new InvalidOperationException($"UploadBackgroundRawInto: handle {dst.Handle} not registered.");
+        if ((nuint)data.Length > entry.byteSize)
+            throw new ArgumentException($"UploadBackgroundRawInto: source ({data.Length} B) exceeds destination ({entry.byteSize} B).");
+        fixed (byte* src = data)
+        {
+            nint ev = StageAndRecordAsync(entry.devPtr, src, (nuint)data.Length);
+            return new CudaUploadHandle(dst, ev);
+        }
+    }
+
+    /// <summary>
+    /// Async H2D upload of floats into an EXISTING device buffer / view. Float-typed
+    /// sibling of <see cref="UploadBackgroundRawInto"/> (issue #216 slab slots, F32-dequant
+    /// fallback dtypes). Allocates nothing; the returned handle's tensor IS <paramref name="dst"/>.
+    /// </summary>
+    public CudaUploadHandle UploadBackgroundInto(Tensor dst, ReadOnlySpan<float> data)
+    {
+        if (!_devPtrs.TryGetValue(dst.Handle, out var entry))
+            throw new InvalidOperationException($"UploadBackgroundInto: handle {dst.Handle} not registered.");
+        nuint byteSize = (nuint)(data.Length * sizeof(float));
+        if (byteSize > entry.byteSize)
+            throw new ArgumentException($"UploadBackgroundInto: source ({byteSize} B) exceeds destination ({entry.byteSize} B).");
+        fixed (float* src = data)
+        {
+            nint ev = StageAndRecordAsync(entry.devPtr, src, byteSize);
+            return new CudaUploadHandle(dst, ev);
+        }
+    }
+
+    /// <summary>
     /// Make the compute stream wait for the background upload referenced by
     /// <paramref name="handle"/> to complete before launching any further work.
     /// Cheap if the DMA has already finished. Safe to call from any thread
@@ -1535,6 +1599,27 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 throw new InvalidOperationException($"cudaMalloc failed: {status}");
         }
 
+        nint ev = StageAndRecordAsync(devPtr, src, byteSize);
+
+        var handleId = (nint)Interlocked.Increment(ref _nextHandle);
+        _devPtrs[handleId] = (devPtr, allocSize);
+        if (exact) _exactHandles[handleId] = 0;
+        var tensor = new Tensor(shape, dtype, handleId);
+        return (tensor, ev);
+    }
+
+    /// <summary>
+    /// Stage <paramref name="byteSize"/> bytes from <paramref name="src"/> through the
+    /// pinned async staging ring and issue a <c>cudaMemcpyAsync</c> into
+    /// <paramref name="dstPtr"/> on the upload stream, returning a fresh readiness event
+    /// (caller owns it, destroys via <see cref="ReleaseUploadHandle"/>). Shared by the
+    /// allocating background-upload path (<see cref="UploadBackgroundCore"/>) and the
+    /// upload-into-existing-buffer path (<see cref="UploadBackgroundRawInto"/> /
+    /// <see cref="UploadBackgroundInto"/>, issue #216 slab slots).
+    /// </summary>
+    private nint StageAndRecordAsync(nint dstPtr, void* src, nuint byteSize)
+    {
+        EnsureUploadStream();
         nint ev;
         lock (_asyncUploadLock)
         {
@@ -1579,7 +1664,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
             Buffer.MemoryCopy(src, (void*)_asyncRingBuf[slot], _asyncRingSize[slot], byteSize);
 
-            int rc = CuBlasInterop.CudaMemcpyAsync(devPtr, _asyncRingBuf[slot], byteSize,
+            int rc = CuBlasInterop.CudaMemcpyAsync(dstPtr, _asyncRingBuf[slot], byteSize,
                 CuBlasInterop.HostToDevice, _uploadStream);
             if (rc != 0)
                 throw new InvalidOperationException($"cudaMemcpyAsync (UploadBackground) failed: {rc}");
@@ -1617,11 +1702,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             }
         }
 
-        var handleId = (nint)Interlocked.Increment(ref _nextHandle);
-        _devPtrs[handleId] = (devPtr, allocSize);
-        if (exact) _exactHandles[handleId] = 0;
-        var tensor = new Tensor(shape, dtype, handleId);
-        return (tensor, ev);
+        return ev;
     }
 
     private void EnsureUploadStream()
