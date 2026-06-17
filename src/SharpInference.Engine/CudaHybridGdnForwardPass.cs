@@ -398,11 +398,16 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private readonly Tensor _gpuResidual2;        // [embDim]
     private readonly Tensor _gpuNormBuf2;         // [embDim]
     private readonly Tensor _gpuLogits2;          // [vocabSize]
-    private readonly Tensor _gpuLastHiddenT1;     // [embDim] — h@startPos for the MTP commit
+    // BatchForward2 (SHARPI_CPU_GDN=1 debug trunk) snapshots t1's pre-norm hidden into
+    // these so it can ride the queued DownloadAsync alongside t2's _gpuLastHidden, then
+    // copies it into the MTP hidden history. Internal scratch for that path only — the
+    // production k-token BatchVerify path writes the history straight from the device
+    // stream (the dead public LastHiddenT1 accessor was removed in issue #209).
+    private readonly Tensor _gpuLastHiddenT1;     // [embDim] — t1 hidden device snapshot
     private readonly float[] _logitsBuf2;         // host download for token 2 logits
     private readonly float* _cpuNormBuf2;         // [embDim] — t2's norm download for CPU FFN path
     private readonly float* _cpuMoeHidden2;       // [embDim] — t2's CPU FFN output
-    private readonly float* _lastHiddenT1;        // [embDim] — host span for the t1 hidden
+    private readonly float* _lastHiddenT1;        // [embDim] — pinned t1 hidden host target
 
     private byte* _batchSnapshotBuf;
     private long _batchSnapshotCap;
@@ -441,14 +446,22 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     // Max tokens per BatchVerify call = ring slots + 1. Each slot costs ~149 MiB
     // of VRAM that TryUploadDenseFfnLayers would otherwise fill with ~2 dense FFN
-    // layers, hence the conservative default; deeper chains only pay once the CPU
-    // FFN amortizes more than pairwise (4-input MatVec follow-up). Instance-resolved
-    // at construction so tests can override per instance; the knob semantics live
-    // in one place (GdnStateCache.ResolveMtpBatchMax) shared with the CPU pass.
+    // layers, so the default (4 → 3 slots) is the smallest ring that reaches the
+    // measured k=4 optimum now that the 4-input CPU FFN kernel (issue #209) amortizes
+    // the dominant mmap weight read four ways. Instance-resolved at construction so
+    // tests can override per instance; the knob semantics live in one place
+    // (GdnStateCache.ResolveMtpBatchMax) shared with the CPU pass.
     private readonly int _mtpBatchMax = GdnStateCache.ResolveMtpBatchMax();
     // Token-2 host FFN scratch (intermediate gate/up post-MatVec2In, pre-SiLuMul).
     private readonly float* _cpuFfnGateBuf2;
     private readonly float* _cpuFfnUpBuf2;
+    // Lane-3/4 host FFN scratch (issue #209): CpuDenseFfn4 dots one CPU mmap weight
+    // read against four draft tokens via MatVec4In, so it needs four distinct
+    // gate/up scratch slabs (SiLU reads them per-lane before the down projection).
+    private readonly float* _cpuFfnGateBuf3;
+    private readonly float* _cpuFfnUpBuf3;
+    private readonly float* _cpuFfnGateBuf4;
+    private readonly float* _cpuFfnUpBuf4;
 
     // Host-side hidden history; see HybridGdnForwardPass field-level doc.
     private float* _mtpPrefillHiddens;     // [_mtpPrefillHiddensCap × embDim], slot p = h_p
@@ -1393,6 +1406,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 _gpuFfnUpBufDense2   = gpu.Allocate(TensorShape.D1(_intermDim));
                 _cpuFfnGateBuf2  = Alloc(_intermDim);
                 _cpuFfnUpBuf2    = Alloc(_intermDim);
+                _cpuFfnGateBuf3  = Alloc(_intermDim);
+                _cpuFfnUpBuf3    = Alloc(_intermDim);
+                _cpuFfnGateBuf4  = Alloc(_intermDim);
+                _cpuFfnUpBuf4    = Alloc(_intermDim);
             }
 
             // Host snapshot buffer for BatchForward2's between-token capture — only
@@ -3295,10 +3312,6 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _mtpSelfHidden != null ? new ReadOnlySpan<float>(_mtpSelfHidden, _embDim) : default;
 
     /// <inheritdoc />
-    public ReadOnlySpan<float> LastHiddenT1 =>
-        _lastHiddenT1 != null ? new ReadOnlySpan<float>(_lastHiddenT1, _embDim) : default;
-
-    /// <inheritdoc />
     public void BatchForward2(int t1, int t2, int startPos,
         out ReadOnlySpan<float> logits1, out ReadOnlySpan<float> logits2)
     {
@@ -3701,19 +3714,22 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             else if (!isMoe && !denseGpuLayer)
             {
                 // CPU mmap dense FFN — the 27B/12GB decode cost center (~8.6 GB
-                // weight reads per token). Pair-batched MatVec2In reads each weight
-                // row once per pair; the odd tail re-runs as a duplicated-input
-                // pair (second output → sink) so every token's bits match the pair
-                // kernel regardless of k parity.
+                // weight reads per token). Quad-batched MatVec4In reads each weight
+                // row once per four tokens (issue #209); the final partial group's
+                // duplicated-tail lanes re-run the last real token with their output
+                // routed to a shared sink, so every token's bits match the quad
+                // kernel regardless of k parity (per-position k-parity independence).
                 _gpu.Download(moeNorm, (nint)_bvNormHost, k * embDim);
-                for (int i = 0; i < k; i += 2)
+                for (int i = 0; i < k; i += 4)
                 {
-                    bool tail = i + 1 >= k;
-                    int j = tail ? i : i + 1;
-                    CpuDenseFfn2(layer,
-                        _bvNormHost + (long)i * embDim, _bvNormHost + (long)j * embDim,
-                        _bvFfnHost + (long)i * embDim,
-                        tail ? _cpuMoeHidden2 : _bvFfnHost + (long)j * embDim);
+                    MtpBatchTail.Group4(i, k, out int j0, out int j1, out int j2, out int j3, out int nReal);
+                    CpuDenseFfn4(layer,
+                        _bvNormHost + (long)j0 * embDim, _bvNormHost + (long)j1 * embDim,
+                        _bvNormHost + (long)j2 * embDim, _bvNormHost + (long)j3 * embDim,
+                        _bvFfnHost + (long)j0 * embDim,
+                        nReal > 1 ? _bvFfnHost + (long)j1 * embDim : _cpuMoeHidden2,
+                        nReal > 2 ? _bvFfnHost + (long)j2 * embDim : _cpuMoeHidden2,
+                        nReal > 3 ? _bvFfnHost + (long)j3 * embDim : _cpuMoeHidden2);
                 }
                 _gpu.UploadInto(_gpuBvFfnAll!, (nint)_bvFfnHost, k * embDim);
                 _gpu.AddInPlace(_gpuBvFfnAll!, blockOut);
@@ -4583,6 +4599,40 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // down: silu'd gate buffers are the inputs, output dim = embDim.
         SimdKernels.MatVec2In(cpuHiddenOut1, cpuHiddenOut2, wDown.DataPtr,
             _cpuFfnGateBuf, _cpuFfnGateBuf2, _embDim, _intermDim, wDown.DType);
+    }
+
+    /// <summary>
+    /// Batched four-token CPU dense FFN (issue #209). Each gate/up/down weight row is
+    /// read once from the CPU mmap and dotted against all four tokens via
+    /// <see cref="SimdKernels.MatVec4In"/> — one weight HBM read per four draft tokens
+    /// versus <see cref="CpuDenseFfn2"/>'s one-per-two, halving the dominant decode
+    /// cost on the 27B-MTP CUDA-hybrid path at k = 4. Per-token bits are identical to
+    /// <see cref="CpuDenseFfn2"/> and single-token decode (MatVec4In is bit-identical
+    /// per slot). Lanes that are duplicated-tail fillers point their <c>out</c> at a
+    /// shared sink — the value is recomputed-but-discarded; the four gate/up scratch
+    /// slabs stay distinct because SiLU consumes each lane before the down projection.
+    /// </summary>
+    private void CpuDenseFfn4(int layer,
+        float* n0, float* n1, float* n2, float* n3,
+        float* out0, float* out1, float* out2, float* out3)
+    {
+        var wGate = _cpuWFfnGate![layer];
+        var wUp   = _cpuWFfnUp![layer];
+        var wDown = _cpuWFfnDown![layer];
+
+        SimdKernels.MatVec4In(_cpuFfnGateBuf, _cpuFfnGateBuf2, _cpuFfnGateBuf3, _cpuFfnGateBuf4,
+            wGate.DataPtr, n0, n1, n2, n3, _intermDim, _embDim, wGate.DType);
+        SimdKernels.MatVec4In(_cpuFfnUpBuf, _cpuFfnUpBuf2, _cpuFfnUpBuf3, _cpuFfnUpBuf4,
+            wUp.DataPtr, n0, n1, n2, n3, _intermDim, _embDim, wUp.DType);
+
+        SimdKernels.SiLuMul(_cpuFfnGateBuf,  _cpuFfnUpBuf,  _intermDim);
+        SimdKernels.SiLuMul(_cpuFfnGateBuf2, _cpuFfnUpBuf2, _intermDim);
+        SimdKernels.SiLuMul(_cpuFfnGateBuf3, _cpuFfnUpBuf3, _intermDim);
+        SimdKernels.SiLuMul(_cpuFfnGateBuf4, _cpuFfnUpBuf4, _intermDim);
+
+        SimdKernels.MatVec4In(out0, out1, out2, out3, wDown.DataPtr,
+            _cpuFfnGateBuf, _cpuFfnGateBuf2, _cpuFfnGateBuf3, _cpuFfnGateBuf4,
+            _embDim, _intermDim, wDown.DType);
     }
 
     // =================================================================
@@ -6052,6 +6102,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 if (_gpuFfnUpBufDense2   is { } uB2) _gpu.Free(uB2);
                 if (_cpuFfnGateBuf2 != null) NativeMemory.Free(_cpuFfnGateBuf2);
                 if (_cpuFfnUpBuf2   != null) NativeMemory.Free(_cpuFfnUpBuf2);
+                if (_cpuFfnGateBuf3 != null) NativeMemory.Free(_cpuFfnGateBuf3);
+                if (_cpuFfnUpBuf3   != null) NativeMemory.Free(_cpuFfnUpBuf3);
+                if (_cpuFfnGateBuf4 != null) NativeMemory.Free(_cpuFfnGateBuf4);
+                if (_cpuFfnUpBuf4   != null) NativeMemory.Free(_cpuFfnUpBuf4);
                 if (_batchSnapshotBuf != null)
                 {
                     NativeMemory.Free(_batchSnapshotBuf);

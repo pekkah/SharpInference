@@ -116,7 +116,15 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     private readonly float* _ffnGate2;       // [intermDim]
     private readonly float* _ffnUp2;         // [intermDim]
     private readonly float* _logits2;        // [vocabSize]
-    private readonly float* _lastHiddenT1;   // [embDim] — t1's pre-output-norm hidden after BatchForward2
+    // Lane-3/4 batched-verify scratch (issue #209): DenseFfn4 / the quad lm_head dot
+    // amortize one CPU mmap weight read across four draft tokens via MatVec4In, so they
+    // need four distinct gate/up FFN slabs and four distinct vocab-sized logits sinks.
+    private readonly float* _ffnGate3;       // [intermDim]
+    private readonly float* _ffnUp3;         // [intermDim]
+    private readonly float* _ffnGate4;       // [intermDim]
+    private readonly float* _ffnUp4;         // [intermDim]
+    private readonly float* _logits3;        // [vocabSize]
+    private readonly float* _logits4;        // [vocabSize]
 
     // Per-token-boundary GDN snapshot ring used by the batched verify paths
     // (issues #30 / #207-goal-4). Slot j holds every GDN layer's state AFTER the
@@ -646,19 +654,26 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             _mtpSelfHidden = Alloc(_embDim);
 
             // Issue #30 / #45: batched verify scratch. _hidden2/_residual2/_normBuf2/
-            // _logits2/_lastHiddenT1 are needed for any MTP-bearing model. The dense
-            // FFN intermediate buffers (_ffnGate2/_ffnUp2) are only used on the dense
-            // path; the MoE path runs MoeFfnCore sequentially per token and shares
-            // _expertGate / _expertUp / _expertGateAll / _expertUpAll between t1 and t2.
+            // _logits2 are needed for any MTP-bearing model. The dense FFN intermediate
+            // buffers (_ffnGate2/_ffnUp2) are only used on the dense path; the MoE path
+            // runs MoeFfnCore sequentially per token and shares _expertGate / _expertUp
+            // / _expertGateAll / _expertUpAll between t1 and t2.
             _hidden2 = Alloc(_embDim);
             _residual2 = Alloc(_embDim);
             _normBuf2 = Alloc(_embDim);
             _logits2 = Alloc(hp.VocabSize);
-            _lastHiddenT1 = Alloc(_embDim);
+            // Lane-3/4 lm_head sinks (issue #209) — the quad lm_head dot runs for both
+            // dense and MoE MTP models, so the logits sinks live outside the !IsMoE gate.
+            _logits3 = Alloc(hp.VocabSize);
+            _logits4 = Alloc(hp.VocabSize);
             if (!hp.IsMoE)
             {
                 _ffnGate2 = Alloc(_intermDim);
                 _ffnUp2 = Alloc(_intermDim);
+                _ffnGate3 = Alloc(_intermDim);
+                _ffnUp3 = Alloc(_intermDim);
+                _ffnGate4 = Alloc(_intermDim);
+                _ffnUp4 = Alloc(_intermDim);
             }
 
             long perLayerBytes = _gdnStateCache.LayerSnapshotBytes;
@@ -1192,7 +1207,7 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
     //   <c>_kvCache.Length == startPos + 2</c>,
     //   <c>_gdnStateCache.Length == startPos + 2</c>,
     //   <c>_lastHidden</c> = h@startPos+1 (t2's pre-output-norm hidden),
-    //   <c>LastHiddenT1</c> = h@startPos (t1's pre-output-norm hidden),
+    //   both tokens' pre-output-norm hiddens written to the MTP hidden history,
     //   per-layer GDN snapshot captured at "after t1, before t2" — available for
     //   <see cref="RestoreBatchSnapshot"/>.</para>
     // <para><b>Return:</b> two logit slices (predict-startPos+1, predict-startPos+2).</para>
@@ -1227,14 +1242,6 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         _hasMtp
         && !KvCacheCompacted
         && Environment.GetEnvironmentVariable("SHARPI_DISABLE_BATCH_VERIFY") != "1";
-
-    /// <summary>
-    /// Last completed <see cref="BatchForward2"/>'s token-1 pre-output-norm hidden.
-    /// Used by the <see cref="MtpDecoder"/> commit step to drive the next MTP forward
-    /// at <c>startPos + 1</c>.
-    /// </summary>
-    public ReadOnlySpan<float> LastHiddenT1 =>
-        _lastHiddenT1 != null ? new ReadOnlySpan<float>(_lastHiddenT1, _embDim) : default;
 
     /// <summary>
     /// Run two adjacent tokens (t1 at <paramref name="startPos"/>, t2 at
@@ -1356,8 +1363,7 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         // 5. Snapshot the pre-output-norm hiddens before final norm overwrites them.
         var h1Span = new ReadOnlySpan<float>(_hidden,  _embDim);
         var h2Span = new ReadOnlySpan<float>(_hidden2, _embDim);
-        h1Span.CopyTo(new Span<float>(_lastHiddenT1, _embDim));
-        h2Span.CopyTo(new Span<float>(_lastHidden,   _embDim));
+        h2Span.CopyTo(new Span<float>(_lastHidden, _embDim));
 
         // Issue #106: also write the absolute-position slots in the hidden history
         // buffer so future snapshot-restore + PrefillMtp(startPos = past decode
@@ -1569,17 +1575,20 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             }
             else
             {
-                // MatVec2In pairs; the odd tail duplicates its input into both pair
-                // slots (second output → _hidden2 sink) so EVERY token goes through
-                // the identical kernel — per-position bits don't depend on k parity.
-                for (int i = 0; i < k; i += 2)
+                // MatVec4In quads (issue #209); the final partial group duplicates its
+                // last real token into the empty lanes (output → _hidden2 sink) so EVERY
+                // token goes through the identical kernel — per-position bits don't
+                // depend on k parity.
+                for (int i = 0; i < k; i += 4)
                 {
-                    bool tail = i + 1 >= k;
-                    int j = tail ? i : i + 1;
-                    DenseFfn2(layer,
-                        _bvNormAll + (long)i * embDim, _bvNormAll + (long)j * embDim,
-                        _bvHiddenAll + (long)i * embDim,
-                        tail ? _hidden2 : _bvHiddenAll + (long)j * embDim);
+                    MtpBatchTail.Group4(i, k, out int j0, out int j1, out int j2, out int j3, out int nReal);
+                    DenseFfn4(layer,
+                        _bvNormAll + (long)j0 * embDim, _bvNormAll + (long)j1 * embDim,
+                        _bvNormAll + (long)j2 * embDim, _bvNormAll + (long)j3 * embDim,
+                        _bvHiddenAll + (long)j0 * embDim,
+                        nReal > 1 ? _bvHiddenAll + (long)j1 * embDim : _hidden2,
+                        nReal > 2 ? _bvHiddenAll + (long)j2 * embDim : _hidden2,
+                        nReal > 3 ? _bvHiddenAll + (long)j3 * embDim : _hidden2);
                 }
             }
 
@@ -1609,8 +1618,9 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             Copy(_lastHidden, _bvHiddenAll + (long)(k - 1) * embDim, embDim);
         }
 
-        // 5. Final norm + lm_head, MatVec2In pairs (vocab-sized weight read once per
-        //    pair). Odd tail uses the duplicated-input pair with _logits2 as sink.
+        // 5. Final norm + lm_head, MatVec4In quads (vocab-sized weight read once per
+        //    four tokens — issue #209). The final partial group's duplicated-tail lanes
+        //    re-run the last real token into the _logits{2..4} sinks and are discarded.
         var outNormW = GetNormWeight(_outputNorm);
         for (int i = 0; i < k; i++)
         {
@@ -1619,16 +1629,17 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         }
 
         var result = new float[k][];
-        for (int i = 0; i < k; i += 2)
+        for (int i = 0; i < k; i += 4)
         {
-            bool tail = i + 1 >= k;
-            int j = tail ? i : i + 1;
-            SimdKernels.MatVec2In(_logits, _logits2, _outputWeight.DataPtr,
-                _bvHiddenAll + (long)i * embDim, _bvHiddenAll + (long)j * embDim,
+            MtpBatchTail.Group4(i, k, out int j0, out int j1, out int j2, out int j3, out int nReal);
+            SimdKernels.MatVec4In(_logits, _logits2, _logits3, _logits4, _outputWeight.DataPtr,
+                _bvHiddenAll + (long)j0 * embDim, _bvHiddenAll + (long)j1 * embDim,
+                _bvHiddenAll + (long)j2 * embDim, _bvHiddenAll + (long)j3 * embDim,
                 _hp.VocabSize, embDim, _outputWeight.DType);
-            result[i] = new ReadOnlySpan<float>(_logits, _hp.VocabSize).ToArray();
-            if (!tail)
-                result[i + 1] = new ReadOnlySpan<float>(_logits2, _hp.VocabSize).ToArray();
+            result[j0] = new ReadOnlySpan<float>(_logits, _hp.VocabSize).ToArray();
+            if (nReal > 1) result[j1] = new ReadOnlySpan<float>(_logits2, _hp.VocabSize).ToArray();
+            if (nReal > 2) result[j2] = new ReadOnlySpan<float>(_logits3, _hp.VocabSize).ToArray();
+            if (nReal > 3) result[j3] = new ReadOnlySpan<float>(_logits4, _hp.VocabSize).ToArray();
         }
 
         _batchSnapshotValid = true;
@@ -1691,6 +1702,39 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
         SimdKernels.MatVec2In(
             hiddenOut1, hiddenOut2,
             _wFfnDown[layer].DataPtr, _ffnGate, _ffnGate2,
+            _embDim, _intermDim, _wFfnDown[layer].DType);
+    }
+
+    /// <summary>
+    /// Batched gate × up → down dense FFN for four tokens sharing the same weight
+    /// matrices (issue #209). Each weight row is touched once and dotted against all
+    /// four inputs via <see cref="SimdKernels.MatVec4In"/> — one weight read per four
+    /// tokens versus <see cref="DenseFfn2"/>'s one-per-two. The four gate/up scratch
+    /// slabs stay distinct because SiLU consumes each lane before the down projection;
+    /// duplicated-tail filler lanes point their <c>hiddenOut</c> at a shared sink.
+    /// Per-token bits are identical to <see cref="DenseFfn2"/> / single-token decode.
+    /// </summary>
+    private void DenseFfn4(int layer,
+        float* n0, float* n1, float* n2, float* n3,
+        float* out0, float* out1, float* out2, float* out3)
+    {
+        SimdKernels.MatVec4In(
+            _ffnGate, _ffnGate2, _ffnGate3, _ffnGate4,
+            _wFfnGate[layer].DataPtr, n0, n1, n2, n3,
+            _intermDim, _embDim, _wFfnGate[layer].DType);
+        SimdKernels.MatVec4In(
+            _ffnUp, _ffnUp2, _ffnUp3, _ffnUp4,
+            _wFfnUp[layer].DataPtr, n0, n1, n2, n3,
+            _intermDim, _embDim, _wFfnUp[layer].DType);
+
+        SimdKernels.SiLuMul(_ffnGate,  _ffnUp,  _intermDim);
+        SimdKernels.SiLuMul(_ffnGate2, _ffnUp2, _intermDim);
+        SimdKernels.SiLuMul(_ffnGate3, _ffnUp3, _intermDim);
+        SimdKernels.SiLuMul(_ffnGate4, _ffnUp4, _intermDim);
+
+        SimdKernels.MatVec4In(
+            out0, out1, out2, out3,
+            _wFfnDown[layer].DataPtr, _ffnGate, _ffnGate2, _ffnGate3, _ffnGate4,
             _embDim, _intermDim, _wFfnDown[layer].DType);
     }
 
@@ -3024,8 +3068,13 @@ public sealed unsafe class HybridGdnForwardPass : IForwardPass
             if (_normBuf2 != null) NativeMemory.Free(_normBuf2);
             if (_ffnGate2 != null) NativeMemory.Free(_ffnGate2);
             if (_ffnUp2 != null) NativeMemory.Free(_ffnUp2);
+            if (_ffnGate3 != null) NativeMemory.Free(_ffnGate3);
+            if (_ffnUp3 != null) NativeMemory.Free(_ffnUp3);
+            if (_ffnGate4 != null) NativeMemory.Free(_ffnGate4);
+            if (_ffnUp4 != null) NativeMemory.Free(_ffnUp4);
             if (_logits2 != null) NativeMemory.Free(_logits2);
-            if (_lastHiddenT1 != null) NativeMemory.Free(_lastHiddenT1);
+            if (_logits3 != null) NativeMemory.Free(_logits3);
+            if (_logits4 != null) NativeMemory.Free(_logits4);
             if (_mtpSelfHidden != null) NativeMemory.Free(_mtpSelfHidden);
             if (_bvHiddenAll != null) NativeMemory.Free(_bvHiddenAll);
             if (_bvResidAll != null) NativeMemory.Free(_bvResidAll);

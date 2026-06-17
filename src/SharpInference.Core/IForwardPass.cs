@@ -272,19 +272,12 @@ public interface IForwardPass : IDisposable
     int MaxBatchVerifyTokens => int.MaxValue;
 
     /// <summary>
-    /// Last completed <see cref="BatchForward2"/>'s token-1 pre-output-norm hidden.
-    /// Used by the MTP commit step on the batched verify path. Empty when no batched
-    /// forward has been run.
-    /// </summary>
-    ReadOnlySpan<float> LastHiddenT1 => default;
-
-    /// <summary>
     /// Two-token batched forward (issue #30). On entry both caches must be at length
     /// <paramref name="startPos"/>. On return both caches are at length
-    /// <c>startPos + 2</c>, <see cref="LastHidden"/> holds h@startPos+1, and
-    /// <see cref="LastHiddenT1"/> holds h@startPos. A per-layer GDN snapshot is
-    /// captured at the "between t1 and t2" point so a rejected draft can be rolled
-    /// back via <see cref="RestoreBatchSnapshot"/>.
+    /// <c>startPos + 2</c> and <see cref="LastHidden"/> holds h@startPos+1. A per-layer
+    /// GDN snapshot is captured at the "between t1 and t2" point so a rejected draft can
+    /// be rolled back via <see cref="RestoreBatchSnapshot"/>. Both tokens' pre-output-
+    /// norm hiddens are written to the MTP hidden history for later draft chaining.
     /// </summary>
     void BatchForward2(int t1, int t2, int startPos,
         out ReadOnlySpan<float> logits1, out ReadOnlySpan<float> logits2) =>

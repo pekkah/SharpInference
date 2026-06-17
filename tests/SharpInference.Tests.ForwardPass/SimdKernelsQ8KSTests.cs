@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics.X86;
 using SharpInference.Core;
 using SharpInference.Cpu;
@@ -388,6 +389,93 @@ public sealed unsafe class SimdKernelsQ8KSTests
                 for (int i = 0; i < 128; i++) bytes[off + 48 + i] = (byte)rng.Next(256);
             }
         return bytes;
+    }
+
+    private static byte[] BuildQ6KMatrix(int rows, int cols, Random rng)
+    {
+        int blocksPerRow = cols / 256, bytesPerRow = blocksPerRow * 210;
+        var bytes = new byte[rows * bytesPerRow];
+        for (int r = 0; r < rows; r++)
+            for (int b = 0; b < blocksPerRow; b++)
+            {
+                int off = r * bytesPerRow + b * 210;
+                for (int i = 0; i < 128; i++) bytes[off + i] = (byte)rng.Next(256);          // ql
+                for (int i = 0; i < 64; i++) bytes[off + 128 + i] = (byte)rng.Next(256);      // qh
+                for (int i = 0; i < 16; i++) bytes[off + 192 + i] = (byte)(sbyte)(rng.Next(256) - 128); // int8 scales
+                float d = (float)(rng.NextDouble() * 0.05 + 0.005);
+                ushort dh = HalfToUshort((Half)d);
+                bytes[off + 208] = (byte)(dh & 0xFF); bytes[off + 209] = (byte)(dh >> 8);
+            }
+        return bytes;
+    }
+
+    /// <summary>
+    /// Issue #209: <see cref="SimdKernels.MatVec4In"/> — the four-input dense-FFN
+    /// mat-vec that amortizes the CPU mmap weight read across four MTP draft tokens
+    /// — must be <b>bit-identical</b>, per row and per token slot, to four single
+    /// <see cref="SimdKernels.MatVec"/> calls. This is the per-position
+    /// k-parity-independence contract the batched-verify duplicated-tail relies on:
+    /// a token's logits must not depend on whether it shared a weight read with one
+    /// other token (the old MatVec2In pairing) or three (MatVec4In). Covers every
+    /// dense-FFN dtype: Q4_K/Q5_K/Q6_K (register-tiled quad kernels), F32, and Q8_0
+    /// (which deliberately routes through the dequant fallback to stay identical to
+    /// single-token decode). Includes a rows ≥ 64 case to exercise the Parallel.For
+    /// path, and a deliberately mis-mappable token order so a swapped slot is caught.
+    /// </summary>
+    [Fact]
+    public void MatVec4In_BitwiseMatchesSingleMatVec()
+    {
+        foreach ((int rows, int cols) in new[] { (4, 256), (5, 512), (8, 2048), (3, 4096), (128, 512) })
+        {
+            var rng = new Random(unchecked((int)0x4209C0DE) ^ (rows * 131 + cols));
+            var inputs = new float[4][];
+            for (int t = 0; t < 4; t++)
+            {
+                inputs[t] = new float[cols];
+                for (int i = 0; i < cols; i++) inputs[t][i] = (float)(rng.NextDouble() * 2 - 1);
+            }
+
+            byte[] q4 = BuildQ4KMatrix(rows, cols, rng);
+            byte[] q5 = BuildQ5KMatrix(rows, cols, rng);
+            byte[] q6 = BuildQ6KMatrix(rows, cols, rng);
+            byte[] q8 = BuildQ8_0Matrix(rows, cols, rng);
+            var f32 = new float[rows * cols];
+            for (int i = 0; i < f32.Length; i++) f32[i] = (float)(rng.NextDouble() * 0.2 - 0.1);
+
+            foreach ((byte[] w, DType dt) in new (byte[], DType)[]
+                     {
+                         (q4, DType.Q4_K), (q5, DType.Q5_K), (q6, DType.Q6_K),
+                         (q8, DType.Q8_0), (MemoryMarshal.AsBytes(f32.AsSpan()).ToArray(), DType.Float32),
+                     })
+            {
+                var o0 = new float[rows]; var o1 = new float[rows];
+                var o2 = new float[rows]; var o3 = new float[rows];
+                var refOut = new float[4][];
+                for (int t = 0; t < 4; t++) refOut[t] = new float[rows];
+
+                fixed (byte* wp = w)
+                fixed (float* i0 = inputs[0]) fixed (float* i1 = inputs[1])
+                fixed (float* i2 = inputs[2]) fixed (float* i3 = inputs[3])
+                fixed (float* p0 = o0) fixed (float* p1 = o1) fixed (float* p2 = o2) fixed (float* p3 = o3)
+                fixed (float* r0 = refOut[0]) fixed (float* r1 = refOut[1])
+                fixed (float* r2 = refOut[2]) fixed (float* r3 = refOut[3])
+                {
+                    SimdKernels.MatVec4In(p0, p1, p2, p3, wp, i0, i1, i2, i3, rows, cols, dt);
+                    SimdKernels.MatVec(r0, wp, i0, rows, cols, dt);
+                    SimdKernels.MatVec(r1, wp, i1, rows, cols, dt);
+                    SimdKernels.MatVec(r2, wp, i2, rows, cols, dt);
+                    SimdKernels.MatVec(r3, wp, i3, rows, cols, dt);
+                }
+
+                for (int r = 0; r < rows; r++)
+                {
+                    Assert.Equal(BitConverter.SingleToInt32Bits(refOut[0][r]), BitConverter.SingleToInt32Bits(o0[r]));
+                    Assert.Equal(BitConverter.SingleToInt32Bits(refOut[1][r]), BitConverter.SingleToInt32Bits(o1[r]));
+                    Assert.Equal(BitConverter.SingleToInt32Bits(refOut[2][r]), BitConverter.SingleToInt32Bits(o2[r]));
+                    Assert.Equal(BitConverter.SingleToInt32Bits(refOut[3][r]), BitConverter.SingleToInt32Bits(o3[r]));
+                }
+            }
+        }
     }
 
     /// <summary>

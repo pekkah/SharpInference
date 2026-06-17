@@ -386,15 +386,19 @@ public sealed unsafe class GdnStateCache : IDisposable
     /// <summary>
     /// Resolve the SHARPI_MTP_BATCH_MAX knob: max tokens per batched-verify call
     /// (= 1 + max MTP draft-chain length), which sizes the per-token-boundary GDN
-    /// snapshot ring at <c>value − 1</c> slots. Clamped to [2, 8]; default 2 — one
-    /// ring slot (~149 MB for 27B on either side of the PCIe bus), the measured
-    /// k=2 optimum until the CPU FFN amortizes more than pairwise. Shared by both
-    /// hybrid GDN passes so the knob means the same thing on every backend.
+    /// snapshot ring at <c>value − 1</c> slots. Clamped to [2, 8]; default 4 (three
+    /// ring slots, ~149 MB each for 27B on either side of the PCIe bus) — the measured
+    /// k=4 optimum once the 4-input CPU FFN kernel (issue #209) amortizes the dominant
+    /// CPU mmap weight read across four draft tokens (27B Q4_K_M CUDA-hybrid: k=4 12.2
+    /// vs k=2 10.1 vs k=6 10.4 t/s; the GPU-trunk matvec re-stream and lower acceptance
+    /// erode deeper chains). The ring alloc stops on OOM and SupportsBatchVerify clamps
+    /// MaxBatchVerifyTokens to what fit, so a tight-VRAM card degrades gracefully.
+    /// Shared by both hybrid GDN passes so the knob means the same thing on every backend.
     /// </summary>
     public static int ResolveMtpBatchMax()
     {
         var s = Environment.GetEnvironmentVariable("SHARPI_MTP_BATCH_MAX");
-        return s is not null && int.TryParse(s, out var v) ? Math.Clamp(v, 2, 8) : 2;
+        return s is not null && int.TryParse(s, out var v) ? Math.Clamp(v, 2, 8) : 4;
     }
 
     /// <summary>

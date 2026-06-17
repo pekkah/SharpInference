@@ -167,7 +167,7 @@ sharpi-cli -m models/Qwen3.6-27B-MTP-Q4_K_M.gguf -g -1 \
 
 | Backend | Size | Prefill t/s | Decode t/s | Notes |
 |---|---:|---:|---:|---|
-| **CUDA** `-g -1 --no-thinking` (hybrid) | 16 GB | **10.0** | **10.4** | 22/64 dense FFN on GPU + GDN/attn KV resident, rest CPU mmap. 90% acceptance; folded k-token batched verify + GDN snapshot ring — **1.68× over MTP-off (6.4)** |
+| **CUDA** `-g -1 --no-thinking` (hybrid) | 16 GB | **10.0** | **12.3** | GDN/attn KV resident on GPU, dense FFN on CPU mmap (the k=4 ring reclaims the VRAM the old k=2 default spent on 22 GPU FFN layers). 84% acceptance; 4-input CPU-FFN `MatVec4In` (#209) moves the verify optimum from k=2 → k=4 — **1.9× over MTP-off (6.5)**, +22% over the old k=2 default (10.1) |
 | **CUDA** `-g -1 --no-thinking` `Q5_K_M` (hybrid) | 19 GB | 6.2 | **5.5** | 13/64 FFN on GPU, 51/64 CPU mmap. 98% acceptance; batched trunk (#119) bit-identical |
 | CPU `--no-thinking` | 16 GB | 3.0 | **3.6** | dense 27B GDN/attn + native MTP head; auto MTP self-spec (#25) at greedy + `--no-thinking`. 90% draft acceptance; folded k-token batched verify (#30/#207) — 1.2× over MTP-off (3.0) |
 | CPU `--no-thinking` `Q5_K_M` | 19 GB | 2.8 | **3.5** | ~10% slower than Q4_K_M; 100% acceptance |
