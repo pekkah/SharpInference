@@ -47,7 +47,8 @@ public sealed class Gemma4CudaKEqVBatchedDecodeTests : IDisposable
     public void Dispose()
     {
         foreach (var f in _tempFiles)
-            try { File.Delete(f); } catch { /* best-effort temp cleanup */ }
+            try { File.Delete(f); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* best-effort temp cleanup */ }
     }
 
     private static CudaBackend? TryCreate()
