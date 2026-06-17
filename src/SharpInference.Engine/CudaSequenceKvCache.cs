@@ -30,8 +30,17 @@ internal sealed class CudaSequenceKvCache : ISequenceKvCache
     /// <summary>Layers whose K/V alias a source layer (Gemma 4 shared-KV tail) — never freed here.</summary>
     private readonly IReadOnlySet<int> _aliasedLayers;
 
-    /// <summary>Logical KV positions stored so far (the forward pass reads/advances this).</summary>
+    /// <summary>Physical KV rows stored so far (the forward pass reads/advances this). Equals the
+    /// logical token count unless SnapKV evicted this sequence's prompt, in which case it is the
+    /// post-compaction count and <see cref="EvictedCount"/> bridges back to logical positions.</summary>
     public int Length;
+
+    /// <summary>Logical-minus-physical delta from a SnapKV prefill eviction (issue #196): the
+    /// number of prompt positions dropped during compaction. The batched decode maps a logical
+    /// position <c>p</c> to the physical slot <c>p - EvictedCount</c> for KV append + attention,
+    /// while RoPE keeps the logical <c>p</c> (the kept K rows retain their original RoPE phase).
+    /// 0 for a sequence that was never evicted (physical slot == logical position).</summary>
+    public int EvictedCount;
 
     private bool _disposed;
 
