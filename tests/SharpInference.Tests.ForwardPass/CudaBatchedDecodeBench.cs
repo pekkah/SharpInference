@@ -199,11 +199,15 @@ public sealed class CudaBatchedDecodeBench
         var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
         var tokenizer = GgufTokenizer.FromGgufModel(model);
 
-        // Long prompt that exceeds the SnapKV budget so every per-sequence cache evicts.
+        // Long prompt that exceeds the SnapKV budget so every per-sequence cache evicts. Tokenize the
+        // seed ONCE and repeat the tokens (the exact token stream is irrelevant for the bench — only
+        // the length matters) rather than re-encoding a growing string each iteration (O(n²) on the
+        // SPM tokenizer; see the "SPM O(n²)" fix in #214).
         const string seed = "The quick brown fox jumps over the lazy dog. Sphinx of black quartz, judge my vow. ";
-        var sb = new System.Text.StringBuilder();
-        while (tokenizer.Encode(sb.ToString()).Count < 1200) sb.Append(seed);
-        int[] prompt = tokenizer.Encode(sb.ToString()).ToArray();
+        var seedTokens = tokenizer.Encode(seed);
+        var promptList = new List<int>();
+        while (promptList.Count < 1200) promptList.AddRange(seedTokens);
+        int[] prompt = promptList.ToArray();
 
         var prevBudget = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_BUDGET");
         var prevWindow = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_WINDOW");
