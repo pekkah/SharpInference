@@ -79,7 +79,7 @@ public static class InferenceEngineLoader
         try
         {
             (fwd, batchingSupported) = BuildForwardPass(model, hp, arch, ctxSize, nGpuLayers, opts.Backend, turboQuant, owned,
-                DequantCacheBytes(opts.PrefillDequantCacheMb));
+                DequantCacheBytes(opts.PrefillDequantCacheMb), preferBatchingOverAutoSnapKv: opts.MaxBatchSize > 1);
             owned.Add(model);
         }
         catch
@@ -175,7 +175,8 @@ public static class InferenceEngineLoader
 
     private static (IForwardPass Fwd, bool BatchingSupported) BuildForwardPass(
         GgufModel model, ModelHyperparams hp, string arch, int ctxSize, int nGpuLayers,
-        ServerBackend backend, bool turboQuant, List<IDisposable> owned, long prefillDequantCacheBytes)
+        ServerBackend backend, bool turboQuant, List<IDisposable> owned, long prefillDequantCacheBytes,
+        bool preferBatchingOverAutoSnapKv = false)
     {
         // Resolve "auto" first so the rest of the method can treat backend as concrete.
         if (nGpuLayers != 0 && backend == ServerBackend.Auto)
@@ -265,16 +266,31 @@ public static class InferenceEngineLoader
 
             if (gpuLayers >= hp.NumLayers)
             {
-                var cfwd = new CudaForwardPass(model, cuda, hp, ctxSize, enableTurboQuant: turboQuant);
+                // #196 Option 2: when batching is requested, suppress the VRAM-scaled SnapKV
+                // auto-enable (prefer pure batching over routing every sequence through the slower
+                // per-sequence-eviction decode). An explicit SHARPI_SNAPKV_BUDGET>0 still wins and
+                // composes with batching via #196 Option 1.
+                var cfwd = new CudaForwardPass(model, cuda, hp, ctxSize, enableTurboQuant: turboQuant,
+                    preferBatchingOverAutoSnapKv: preferBatchingOverAutoSnapKv);
                 owned.Add(cfwd);
                 // Issue #190 (dense) / #195 (Gemma 4): CUDA full-offload supports continuous
                 // batching (per-sequence GPU KV caches + true batched decode). SupportsContinuous-
                 // Batching is the single source of truth shared with CudaForwardPass's runtime
                 // guard, so the loader gate can't diverge from what the batched methods accept — it
-                // admits dense AND Gemma-4 models and folds OUT MoE, TurboQuant, an auto/explicit
-                // SnapKV budget, a dense final-logit softcap, and any non-GEMM-N-batchable
-                // trunk/output weight dtype (Q4_0).
-                return (cfwd, cfwd.SupportsContinuousBatching);
+                // admits dense AND Gemma-4 models and folds OUT MoE, TurboQuant, a dense final-logit
+                // softcap, and any non-GEMM-N-batchable trunk/output weight dtype (Q4_0). A SnapKV
+                // budget no longer disqualifies batching (#196 — it composes via per-sequence eviction).
+                bool batches = cfwd.SupportsContinuousBatching;
+                // #196 footgun guard: we suppressed the SnapKV auto-enable because batching was
+                // requested, but this model can't actually batch (e.g. dense softcap / Q4_0) — so it
+                // would fall back to single-user with NO auto-SnapKV either. Warn so the operator can
+                // restore the memory savings with an explicit budget or a narrowed --kv-type.
+                if (preferBatchingOverAutoSnapKv && !batches && !cfwd.SnapKvEnabled)
+                    Console.Error.WriteLine(
+                        "[InferenceEngineLoader] MaxBatchSize>1 suppressed SnapKV auto-enable, but this " +
+                        "model does not support continuous batching (it will run single-user). Set an " +
+                        "explicit SHARPI_SNAPKV_BUDGET>0 or a narrowed --kv-type to keep KV memory bounded.");
+                return (cfwd, batches);
             }
 
             // pinGpuLayers (not a `with { GpuLayers = }` override) so the expert-cache budget the

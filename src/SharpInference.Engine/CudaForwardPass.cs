@@ -603,7 +603,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     public CudaForwardPass(GgufModel model, CudaBackend gpu, ModelHyperparams hp,
         int maxContextLength = 0,
         bool enableTurboQuant = false, int tqFp32Window = 256, int tqBits = 3,
-        bool? mmqSoa = null)
+        bool? mmqSoa = null, bool preferBatchingOverAutoSnapKv = false)
     {
         _model = model;
         _gpu = gpu;
@@ -816,6 +816,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         if (_snapKvCfg.IsBudgetExplicit)
         {
             _snapKvEffectiveBudget = _snapKvCfg.Budget;
+            // Issue #196 (Option 1): an explicit budget is honored even under continuous batching —
+            // per-sequence eviction composes with the batched decode (each CudaSequenceKvCache is
+            // scored + compacted at the end of its own prefill). Non-Gemma-4, fp32-KV only (the
+            // guards above force the budget off for narrowed KV / TQ / Gemma 4).
+            if (preferBatchingOverAutoSnapKv && _snapKvEffectiveBudget > 0)
+                Console.Error.WriteLine(
+                    $"[CudaForwardPass] SnapKV (budget={_snapKvEffectiveBudget}) composes with " +
+                    "continuous batching via per-sequence eviction (issue #196 Option 1).");
         }
         else if (_tqEnabled)
         {
@@ -848,6 +856,21 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                 "[CudaForwardPass] SnapKV auto-enable suppressed for the multi-slot prefix cache " +
                 "(SHARPI_PREFIX_SLOTS=2, issue #212). Set an explicit SHARPI_SNAPKV_BUDGET>0 to " +
                 "use SnapKV instead (disables multi-slot).");
+        }
+        else if (preferBatchingOverAutoSnapKv)
+        {
+            // Issue #196 (Option 2): continuous batching is requested (MaxBatchSize>1). Prefer
+            // pure batching — the ragged-decode fast path with no lossy eviction — over the
+            // VRAM-scaled SnapKV auto-enable, which would otherwise route every sequence through
+            // the slower per-sequence-eviction decode (Option 1). The operator can still opt INTO
+            // per-sequence eviction with an explicit SHARPI_SNAPKV_BUDGET>0 (handled above; it
+            // composes with batching via #196 Option 1), or shrink the KV footprint without
+            // eviction via --kv-type bf16/q8_0.
+            _snapKvEffectiveBudget = 0;
+            Console.Error.WriteLine(
+                "[CudaForwardPass] SnapKV auto-enable suppressed because continuous batching is " +
+                "enabled (MaxBatchSize>1, issue #196). Set SHARPI_SNAPKV_BUDGET>0 for per-sequence " +
+                "eviction that composes with batching, or --kv-type bf16 to shrink KV without it.");
         }
         else
         {
@@ -3234,6 +3257,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
             throw new InvalidOperationException(
                 "PrefillPackedTrunkMulti is dense-only; this model requires the Gemma-4 / softcap " +
                 "path that ThrowIfBatchingUnsupported should have rejected before reaching here.");
+        // The packed trunk does NOT run SnapKV eviction (it never sets EvictedCount), so it must
+        // never be used with an active budget — the resulting full-length cache would mismatch the
+        // evicted decode's physical mapping. The engine disables chunking when SnapKvEnabled, so
+        // packed prefill is unreachable under SnapKV; assert it loudly if that ever changes (#196).
+        if (_snapKvEffectiveBudget > 0)
+            throw new InvalidOperationException(
+                "PrefillPackedTrunkMulti does not run SnapKV eviction; an active budget must use the " +
+                "unchunked per-sequence PrefillWithCache path (the engine disables chunking when SnapKvEnabled).");
 
         int S = chunks.Length;
         var off = new int[S + 1];
@@ -3305,14 +3336,17 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     /// Whether the dense packed multi-prompt prefill trunk (issue #193) can run this model: the
     /// single-sequence batched-trunk prefill is supported AND none of the Gemma-4 / softcap
     /// features the dense packed trunk omits (PLE, SWA rings, per-layer head_dim, shared-KV,
-    /// softcap) are present. Gemma 4 batches its DECODE (#195) but keeps the Gemma-4-capable
-    /// single-sequence batched trunk for prefill, so it returns false here and
-    /// <see cref="PrefillPackedMulti"/> uses the sequential loop for it. This is exactly the
-    /// negation of the dense-only assertion in <see cref="PrefillPackedTrunkMulti"/>.
+    /// softcap) are present, AND SnapKV is not active. Gemma 4 batches its DECODE (#195) but keeps
+    /// the Gemma-4-capable single-sequence batched trunk for prefill; SnapKV (#196) needs the
+    /// per-token eviction the packed trunk doesn't run. Both fall back to <see cref="PrefillPacked
+    /// Multi"/>'s sequential <see cref="PrefillWithCache"/> loop — which IS SnapKV-aware — instead
+    /// of the dense-only assertion in <see cref="PrefillPackedTrunkMulti"/> (kept as a last-resort
+    /// guard). This is the negation of that assertion.
     /// </summary>
     private bool IsDensePackablePrefill() =>
         !_isGemma4Like && !_hp.HasPerLayerTokenEmbd && _hp.LayerHeadDim is null
         && _hp.SlidingWindowSize <= 0 && _hp.KvSourceLayer is null && _hp.FinalLogitSoftcap == 0f
+        && _snapKvEffectiveBudget == 0
         && IsBatchedPrefillSupported();
 
     private bool AllChunksPackable(ReadOnlyMemory<int>[] chunks, int[] startPos)
@@ -3529,14 +3563,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     /// <summary>
     /// Whether this instance can be driven by the continuous-batching engine (issue #190 dense,
     /// #195 Gemma 4). Single source of truth for the loader gate and the runtime guard, so they
-    /// can't diverge: no TurboQuant, no active SnapKV, every trunk + output weight in a GEMM-N-
-    /// batchable dtype (excludes Q4_0), and EITHER a dense transformer
-    /// (<see cref="DenseBatchedDecodeSupported"/>) OR a Gemma-4 model
-    /// (<see cref="Gemma4BatchedDecodeSupported"/> — the batched decode applies its per-layer
-    /// head_dim / SWA rings / shared-KV / k_eq_v / PLE / sandwich norms / final softcap).
+    /// can't diverge: no TurboQuant, every trunk + output weight in a GEMM-N-batchable dtype
+    /// (excludes Q4_0), and EITHER a dense transformer (<see cref="DenseBatchedDecodeSupported"/>)
+    /// OR a Gemma-4 model (<see cref="Gemma4BatchedDecodeSupported"/> — the batched decode applies
+    /// its per-layer head_dim / SWA rings / shared-KV / k_eq_v / PLE / sandwich norms / final
+    /// softcap). An active SnapKV budget no longer disqualifies batching (issue #196): a budget is
+    /// only ever set for dense fp32 KV (the constructor forces it off for Gemma 4 / narrowed KV /
+    /// TQ), and there it composes with batching via per-sequence eviction (Option 1).
     /// </summary>
     public bool SupportsContinuousBatching =>
-        _snapKvEffectiveBudget == 0 && (DenseBatchedDecodeSupported() || Gemma4BatchedDecodeSupported());
+        DenseBatchedDecodeSupported() || Gemma4BatchedDecodeSupported();
 
     /// <summary>
     /// The arch/dtype gate shared by <see cref="SupportsContinuousBatching"/> and
@@ -3602,9 +3638,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
 
     /// <summary>
     /// Guards the batched-serving entry points: continuous batching on the CUDA path is
-    /// implemented for dense transformers (#190) and Gemma-4 models (#195). Anything that needs
-    /// the owned-cache state machine (TQ ring, SnapKV eviction), or a weight dtype the GEMM-N
-    /// matvec can't drive (Q4_0), is out of scope.
+    /// implemented for dense transformers (#190) and Gemma-4 models (#195), and now composes with
+    /// a SnapKV budget via per-sequence eviction (#196). Anything that needs the TurboQuant ring
+    /// state machine, or a weight dtype the GEMM-N matvec can't drive (Q4_0), is out of scope.
     /// </summary>
     private void ThrowIfBatchingUnsupported(bool decodeOnly = false)
     {
@@ -3614,15 +3650,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         if (_tqEnabled)
             throw new NotSupportedException(
                 "CUDA continuous batching is not supported with the TurboQuant KV cache.");
-        // Prefill-capable entry points (CreateCache / PrefillWithCache / PrefillPackedMulti)
-        // reject any configured SnapKV budget — a whole-prompt prefill into a bound cache
-        // could evict. Decode-only batching (BatchForwardMulti, incl. the issue-#207
-        // BatchVerify wrapper) never evicts, so it only rejects an ALREADY-compacted owned
-        // cache, where logical position != physical slot.
-        if (decodeOnly ? _kvEvictedCount > 0 : _snapKvEffectiveBudget > 0)
-            throw new NotSupportedException(decodeOnly
-                ? "CUDA batched decode is not supported on a SnapKV-compacted cache (physical slot != logical position)."
-                : "CUDA continuous batching is not supported with an active SnapKV budget (eviction runs only on a whole-prompt prefill of the owned cache).");
+        // A configured SnapKV budget now composes with batching: prefill into a per-sequence cache
+        // evicts THAT cache and records the delta in CudaSequenceKvCache.EvictedCount (#196 Option
+        // 1), so CreateCache / PrefillWithCache no longer reject it. The decode-only path still
+        // rejects an ALREADY-compacted OWNED cache (e.g. after a single-user SnapKV prefill on this
+        // instance) — the batched decode never touches the owned cache, so its _kvEvictedCount must
+        // be 0; a non-zero value means physical slot != logical position on a cache the batched
+        // kernels would mis-index.
+        if (decodeOnly && _kvEvictedCount > 0)
+            throw new NotSupportedException(
+                "CUDA batched decode is not supported on a SnapKV-compacted OWNED cache (physical slot != logical position).");
         // Dense (#190) and Gemma 4 (#195) are the two supported families; both require every
         // trunk + output (+ Gemma PLE) weight in a GEMM-N-batchable dtype. A dense softcap arch
         // is excluded (the dense decode finisher applies no softcap); the Gemma-4 finisher does.
@@ -3754,6 +3791,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     /// <see cref="Prefill"/> (its batched trunk is both correct and weight-amortized; prefill
     /// captures no per-token graph, so the rebind is safe), writes the advanced length back,
     /// and always restores the owned cache. Returns the logits at the chunk's final token.
+    ///
+    /// <para>SnapKV (issue #196 Option 1): when a budget is active, <see cref="Prefill"/> runs
+    /// per-token + scores + compacts the BOUND cache in place. The eviction state lives on the
+    /// instance (<c>_kvEvictedCount</c> / <c>_kvLength</c>), so this binds the cache's own
+    /// eviction delta in, captures the post-eviction physical length + delta back onto the cache,
+    /// and restores the owned-cache state — keeping per-sequence eviction isolated from the owned
+    /// cache and from other sequences. For a non-evicting prefill (no budget, or prompt below the
+    /// budget) the delta stays 0 and physical == logical, exactly as before.</para>
     /// </summary>
     internal ReadOnlySpan<float> PrefillWithCache(IReadOnlyList<int> tokens, CudaSequenceKvCache cache, int startPos = 0)
     {
@@ -3763,17 +3808,25 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
             throw new ArgumentException("Token list is empty", nameof(tokens));
 
         int savedKvLength = _kvLength;
+        int savedEvicted = _kvEvictedCount;
         BindCache(cache);
+        // Bind this sequence's eviction delta so the per-token SnapKV prefill appends at the right
+        // physical slot (pos - delta); a fresh cache has delta 0. A chunked resume can't co-occur
+        // with SnapKV (the engine disables chunking when SnapKvEnabled), so on the SnapKV path this
+        // is always a fresh whole-prompt prefill at startPos 0.
+        _kvEvictedCount = cache.EvictedCount;
         try
         {
             var logits = Prefill(tokens, startPos);
-            cache.Length = _kvLength;
+            cache.Length = _kvLength;            // physical rows (post-eviction K, or full length)
+            cache.EvictedCount = _kvEvictedCount; // logical-minus-physical delta (0 if not evicted)
             return logits;
         }
         finally
         {
             RestoreOwned();
             _kvLength = savedKvLength;
+            _kvEvictedCount = savedEvicted;
         }
     }
 
@@ -4011,6 +4064,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         // [N×vocab] logits in _decodeLogitsAll, so both BatchForwardMulti tails work unchanged.
         if (_isGemma4Like)
         {
+            // Defense-in-depth: the Gemma-4 decode uses positions[n] directly as the physical slot
+            // (no SnapKV physical/logical mapping). The constructor forces the SnapKV budget off
+            // for Gemma 4, so no Gemma-4 cache is ever evicted — assert it loudly rather than
+            // silently mis-index if that invariant is ever broken (#196).
+            for (int n = 0; n < N; n++)
+                if (caches[n].EvictedCount > 0)
+                    throw new InvalidOperationException(
+                        "Gemma-4 batched decode reached a SnapKV-evicted cache; the constructor forces " +
+                        "the SnapKV budget off for Gemma 4, so this means that invariant was broken.");
             RunBatchedTrunkGemma4(tokens, positions, caches);
             return;
         }
@@ -4022,12 +4084,31 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         EnsureBatchedTrunkScratch(N);
         EnsureDecodeLogits(N);
 
+        // SnapKV-evicted caches (issue #196): a sequence whose prompt was compacted maps a logical
+        // position p to the physical slot p - EvictedCount for KV append + attention (RoPE keeps p).
+        // The ragged kernels take positions[] for BOTH append slot and attention range, so they'd
+        // mis-index an evicted cache — force the per-sequence loop, which threads the physical slot
+        // and logical RoPE position separately, when any cache in the batch carries an eviction.
+        bool anyEvicted = false;
+        for (int n = 0; n < N; n++)
+        {
+            if (caches[n].EvictedCount == 0) continue;
+            anyEvicted = true;
+            // EvictedCount is a public field; a value exceeding the logical position would make the
+            // physical slot negative → out-of-range device access. Fail fast instead (matches the
+            // owned-cache decode's implicit pos - _kvEvictedCount ≥ 0 expectation).
+            if (caches[n].EvictedCount > positions[n])
+                throw new InvalidOperationException(
+                    $"Sequence {n}: EvictedCount {caches[n].EvictedCount} exceeds position {positions[n]} " +
+                    "(negative physical slot); the SnapKV eviction delta is inconsistent.");
+        }
+
         // Ragged path (#197, default): the per-layer QK-norm/RoPE/KV-append/attention run as
         // O(1) ragged-batched launches over all N sequences. Build the [layer][seq] cache
         // tensor table once per batch composition (identity-compared; steps within a stable
         // batch reuse it) and grab the spill scratch only if some sequence is past the
         // 4096-slot shared-memory fast path.
-        bool ragged = _batchDecodeRagged;
+        bool ragged = _batchDecodeRagged && !anyEvicted;
         Tensor? raggedScores = null;
         if (ragged)
         {
@@ -4092,8 +4173,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                     // (bias → QK-norm/RoPE, #157 order → KV append → attention), each op one
                     // launch whose grid covers all N rows at positions[n] against caches[n].
                     // Every kernel keeps its per-token counterpart's reduction chain, so per
-                    // sequence this is bit-identical to the loop it replaces. _kvEvictedCount
-                    // is 0 (SnapKV is rejected for batching), so the physical slot is pos.
+                    // sequence this is bit-identical to the loop it replaces. Reached only when no
+                    // cache in the batch is SnapKV-evicted (the anyEvicted gate above routes an
+                    // evicted batch to the per-sequence loop), so every cache's physical slot
+                    // equals its logical pos — the ragged kernels can take positions[] directly.
                     if (_hasAttnBias)
                     {
                         _gpu.AddBiasBatched(_bpQ!, _bq![layer], qDim, N);
@@ -4123,13 +4206,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                     // caches[n].Length is advanced once after the pass completes (below).
                 }
                 else
-                // Per-sequence (#190, SHARPI_BATCH_DECODE_RAGGED=0): bias → QK-norm/RoPE (same
-                // order as RunDeviceRegion, #157) → KV append into that sequence's own cache →
-                // single-query attention over its [0, pos+1). _kvEvictedCount is 0 (SnapKV is
-                // rejected for batching), so the physical slot is simply pos.
+                // Per-sequence (#190, SHARPI_BATCH_DECODE_RAGGED=0; also forced when any cache is
+                // SnapKV-evicted, #196): bias → QK-norm/RoPE (same order as RunDeviceRegion, #157)
+                // → KV append into that sequence's own cache → single-query attention. RoPE uses
+                // the LOGICAL position; KV append + the attention range use the PHYSICAL slot
+                // pos - EvictedCount (== pos when the sequence was never evicted), matching the
+                // owned-cache SnapKV decode (Forward's kvSlot = position - _kvEvictedCount).
                 for (int n = 0; n < N; n++)
                 {
                     int pos = positions[n];
+                    int physSlot = pos - caches[n].EvictedCount;
                     Tensor qv = qViews[n], kv = kViews[n], vv = vViews[n], av = aViews[n];
 
                     if (_hasAttnBias)
@@ -4156,9 +4242,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                     }
 
                     Tensor kc = caches[n].K[layer], vc = caches[n].V[layer];
-                    KvAppendKv(kv, vv, kc, vc, kvDim, pos, _maxSeqLen);
+                    KvAppendKv(kv, vv, kc, vc, kvDim, physSlot, _maxSeqLen);
                     AttentionKv(qv, kc, vc, av, _attnScoresScratch,
-                        _numHeads, _numKvHeads, _headDim, pos + 1, _maxSeqLen, _attnScale);
+                        _numHeads, _numKvHeads, _headDim, physSlot + 1, _maxSeqLen, _attnScale);
                     // caches[n].Length is advanced once after the pass completes (below), not
                     // here — a mid-pass throw then leaves the logical length unadvanced.
                 }
@@ -4430,10 +4516,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         {
             result[n] = new float[vocab];
             Array.Copy(_decodeLogitsHost!, (long)n * vocab, result[n], 0, vocab);
-            // Advance each sequence's logical length now that the append + attention for this
-            // token have completed and synchronized (transactional: a mid-pass throw above
-            // leaves Length untouched).
-            caches[n].Length = positions[n] + 1;
+            // Advance each sequence's PHYSICAL length now that the append + attention for this
+            // token have completed and synchronized (transactional: a mid-pass throw above leaves
+            // Length untouched). Physical = logical position - EvictedCount + 1 (== position + 1
+            // when the sequence was never SnapKV-evicted, #196).
+            caches[n].Length = positions[n] - caches[n].EvictedCount + 1;
         }
         return result;
     }
@@ -4458,7 +4545,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         // rows*8-byte D2H (index+value per row) with its own internal sync — completes the pass.
         var am = _gpu.ArgmaxRows(_decodeLogitsAll!, N, _hp.VocabSize, _hp.VocabSize);
         for (int n = 0; n < N; n++)
-            caches[n].Length = positions[n] + 1;
+            caches[n].Length = positions[n] - caches[n].EvictedCount + 1; // physical (#196)
         return am;
     }
 
