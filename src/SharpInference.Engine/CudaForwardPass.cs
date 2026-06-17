@@ -4090,7 +4090,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                     throw new InvalidOperationException(
                         "Gemma-4 batched decode reached a SnapKV-evicted cache; the constructor forces " +
                         "the SnapKV budget off for Gemma 4, so this means that invariant was broken.");
-            RunBatchedTrunkGemma4(tokens, positions, caches);
+            RunBatchedTrunkGemma4(tokens, positions, caches, allowDecodeMmq);
             return;
         }
 
@@ -4340,12 +4340,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     /// PLE pre-pass → per layer <see cref="GpuLayerBatchedDecodeGemma4"/> → batched final norm +
     /// output GEMM + final-logit softcap. Leaves [N×vocab] in <see cref="_decodeLogitsAll"/> on
     /// the stream (the caller's tail downloads/argmaxes + advances each cache length), exactly
-    /// like <see cref="RunBatchedTrunk"/>. The matmuls use the prefill GEMM routing
-    /// (<see cref="GpuMatMulBatched"/> — proven for Gemma 4 shapes; weight reads amortize across
-    /// the batch via cuBLAS GEMM), not the dense decode WS/MMQ path (a Gemma-4 follow-up).
-    /// Argmax-stable with the single-user <see cref="ForwardGemma4"/> loop.
+    /// like <see cref="RunBatchedTrunk"/>. The trunk matmuls (Q/K/V/O, gate/up/down, lm-head) route
+    /// through <see cref="BatchDecodeMatMul"/> — the #194 weight-stationary matvec (small-N decode)
+    /// or the #201/#206 int8 decode-MMQ tile for big Q4_K shapes — exactly like the dense
+    /// <see cref="RunBatchedTrunk"/> (issue #275). The PLE pre-pass + injection matmuls stay on the
+    /// cuBLAS GEMM (<see cref="GpuMatMulBatched"/>): their pleWidth shapes aren't a decode-matvec
+    /// win and the GEMM path is proven argmax-stable for them. Argmax-stable with the single-user
+    /// <see cref="ForwardGemma4"/> loop (the same contract as the prior all-GEMM routing).
     /// </summary>
-    private void RunBatchedTrunkGemma4(int[] tokens, int[] positions, CudaSequenceKvCache[] caches)
+    private void RunBatchedTrunkGemma4(int[] tokens, int[] positions, CudaSequenceKvCache[] caches,
+                                       bool allowDecodeMmq)
     {
         int N = tokens.Length;
         int embDim = _embDim;
@@ -4368,13 +4372,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
 
         // 3. Transformer layers.
         for (int layer = 0; layer < _hp.NumLayers; layer++)
-            GpuLayerBatchedDecodeGemma4(layer, N, positions, caches);
+            GpuLayerBatchedDecodeGemma4(layer, N, positions, caches, allowDecodeMmq);
 
         // 4. Final norm + output projection + softcap, batched across N (softcap is monotonic, so
         //    argmax is invariant — but the returned logit values must be softcapped to match the
         //    single-user ForwardGemma4 finisher and the full-logits BatchForwardMulti path).
         _gpu.RmsNormBatched(_bpHidden!, _bpHidden!, _wOutputNorm, N, embDim, _hp.RmsNormEps);
-        GpuMatMulBatched(_decodeLogitsAll!, _wOutput, _bpHidden!, N);
+        BatchDecodeMatMul(_decodeLogitsAll!, _wOutput, _bpHidden!, N, allowDecodeMmq);
         if (_hp.FinalLogitSoftcap > 0f)
             _gpu.SoftcapInPlace(_decodeLogitsAll!, _hp.FinalLogitSoftcap);
     }
@@ -4388,8 +4392,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     /// single-query attention against caches[n] (shared-KV reads the source layer via effLayer).
     /// This is exactly the per-layer attention of the single-token <see cref="RunGemma4DeviceRegion"/>,
     /// run once per sequence on a slice of the batched Q/K/V/attnOut scratch.
+    /// <para>The QKV / O-proj / FFN matmuls route through <see cref="BatchDecodeMatMul"/> (WS /
+    /// decode-MMQ / GEMM-N, issue #275); the PLE-injection matmuls stay on <see cref="GpuMatMulBatched"/>.
+    /// <paramref name="allowDecodeMmq"/> mirrors <see cref="RunBatchedTrunk"/>'s parameter.</para>
     /// </summary>
-    private void GpuLayerBatchedDecodeGemma4(int layer, int N, int[] positions, CudaSequenceKvCache[] caches)
+    private void GpuLayerBatchedDecodeGemma4(int layer, int N, int[] positions, CudaSequenceKvCache[] caches,
+                                             bool allowDecodeMmq)
     {
         int layerHd = _hp.LayerHeadDim is { } lhd ? lhd[layer] : _headDim;
         int layerKv = _hp.LayerKvHeads is { } lkv ? lkv[layer] : _numKvHeads;
@@ -4413,14 +4421,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         _gpu.CopyDevice(_bpResidual!, _bpHidden!);
         _gpu.RmsNormBatched(_bpNorm!, _bpHidden!, _wAttnNorm[layer], N, _embDim, _hp.RmsNormEps);
 
-        GpuMatMulBatched(qAll, _wq[layer], _bpNorm!, N);
+        BatchDecodeMatMul(qAll, _wq[layer], _bpNorm!, N, allowDecodeMmq);
         if (!kvShared)
         {
-            GpuMatMulBatched(kAll!, _wk[layer], _bpNorm!, N);
+            BatchDecodeMatMul(kAll!, _wk[layer], _bpNorm!, N, allowDecodeMmq);
             if (kEqV)
                 _gpu.CopyDevice(vAll!, kAll!);   // V = raw K projection (pre-norm, pre-RoPE)
             else
-                GpuMatMulBatched(vAll!, _wv[layer]!, _bpNorm!, N);
+                BatchDecodeMatMul(vAll!, _wv[layer]!, _bpNorm!, N, allowDecodeMmq);
         }
 
         // Batched QK-norm (before RoPE, #157) + V-norm — both position-independent across N.
@@ -4488,7 +4496,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         }
 
         // O-proj + sandwich post-attn norm + residual.
-        GpuMatMulBatched(_bpHidden!, _wo[layer], attnAll, N);
+        BatchDecodeMatMul(_bpHidden!, _wo[layer], attnAll, N, allowDecodeMmq);
         if (_wPostAttnNorm is not null)
             _gpu.RmsNormBatched(_bpHidden!, _bpHidden!, _wPostAttnNorm[layer], N, _embDim, _hp.RmsNormEps);
         _gpu.AddInPlace(_bpHidden!, _bpResidual!);
@@ -4496,13 +4504,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         // FFN (GEGLU for Gemma 4) + sandwich post-ffn norm + residual.
         _gpu.CopyDevice(_bpResidual!, _bpHidden!);
         _gpu.RmsNormBatched(_bpNorm!, _bpHidden!, _wFfnNorm[layer], N, _embDim, _hp.RmsNormEps);
-        GpuMatMulBatched(_bpFfnGate!, _wGate[layer], _bpNorm!, N);
-        GpuMatMulBatched(_bpFfnUp!,   _wUp[layer],   _bpNorm!, N);
+        BatchDecodeMatMul(_bpFfnGate!, _wGate[layer], _bpNorm!, N, allowDecodeMmq);
+        BatchDecodeMatMul(_bpFfnUp!,   _wUp[layer],   _bpNorm!, N, allowDecodeMmq);
         if (_hp.FfnActivation == FfnActivation.GeluApprox)
             _gpu.GeluTanhMul(_bpFfnGate!, _bpFfnUp!);
         else
             _gpu.SiLuMul(_bpFfnGate!, _bpFfnUp!);
-        GpuMatMulBatched(_bpHidden!, _wDown[layer], _bpFfnGate!, N);
+        BatchDecodeMatMul(_bpHidden!, _wDown[layer], _bpFfnGate!, N, allowDecodeMmq);
         if (_wPostFfwNorm is not null)
             _gpu.RmsNormBatched(_bpHidden!, _bpHidden!, _wPostFfwNorm[layer], N, _embDim, _hp.RmsNormEps);
         _gpu.AddInPlace(_bpHidden!, _bpResidual!);
