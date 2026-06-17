@@ -3336,14 +3336,17 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     /// Whether the dense packed multi-prompt prefill trunk (issue #193) can run this model: the
     /// single-sequence batched-trunk prefill is supported AND none of the Gemma-4 / softcap
     /// features the dense packed trunk omits (PLE, SWA rings, per-layer head_dim, shared-KV,
-    /// softcap) are present. Gemma 4 batches its DECODE (#195) but keeps the Gemma-4-capable
-    /// single-sequence batched trunk for prefill, so it returns false here and
-    /// <see cref="PrefillPackedMulti"/> uses the sequential loop for it. This is exactly the
-    /// negation of the dense-only assertion in <see cref="PrefillPackedTrunkMulti"/>.
+    /// softcap) are present, AND SnapKV is not active. Gemma 4 batches its DECODE (#195) but keeps
+    /// the Gemma-4-capable single-sequence batched trunk for prefill; SnapKV (#196) needs the
+    /// per-token eviction the packed trunk doesn't run. Both fall back to <see cref="PrefillPacked
+    /// Multi"/>'s sequential <see cref="PrefillWithCache"/> loop — which IS SnapKV-aware — instead
+    /// of the dense-only assertion in <see cref="PrefillPackedTrunkMulti"/> (kept as a last-resort
+    /// guard). This is the negation of that assertion.
     /// </summary>
     private bool IsDensePackablePrefill() =>
         !_isGemma4Like && !_hp.HasPerLayerTokenEmbd && _hp.LayerHeadDim is null
         && _hp.SlidingWindowSize <= 0 && _hp.KvSourceLayer is null && _hp.FinalLogitSoftcap == 0f
+        && _snapKvEffectiveBudget == 0
         && IsBatchedPrefillSupported();
 
     private bool AllChunksPackable(ReadOnlyMemory<int>[] chunks, int[] startPos)
