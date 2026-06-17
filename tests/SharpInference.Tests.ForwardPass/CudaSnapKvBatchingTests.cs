@@ -310,6 +310,124 @@ public sealed class CudaSnapKvBatchingTests
     }
 
     /// <summary>
+    /// Issue #277: a SnapKV-evicted batch now stays on the #197 ragged fast path (the
+    /// <c>anyEvicted</c> → per-sequence-loop forcing is gone). The ragged KV-append + attention
+    /// take the PHYSICAL slot <c>pos - EvictedCount</c> while RoPE keeps the logical position — so
+    /// the ragged-evicted decode must be BIT-IDENTICAL to the per-sequence-loop decode it replaces.
+    ///
+    /// A batched decode step is idempotent on the same caches at the same positions (it overwrites
+    /// its own next slot with identical K/V and bounds attention by <c>pos - EvictedCount</c>, never
+    /// by <c>Length</c>), and both paths share every GEMM — so running one instance's ragged path
+    /// then flipping to the per-sequence loop on the SAME caches isolates the attention block and
+    /// asserts exact equality. Two different-length prompts give two different eviction deltas, so a
+    /// physical-slot mis-index would diverge here. (A cross-instance compare can't assert bit-
+    /// identity — prefill isn't bit-exact across instances.)
+    /// </summary>
+    [Fact]
+    public void Qwen3_8B_RaggedEvictedDecode_BitIdentical_To_PerSequenceLoop_N2()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        const int budget = 512;
+        using var env = SnapKvEnv(budget, window: 32);
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 2048);
+        Assert.True(fwd.SnapKvEnabled);
+        Assert.True(fwd.BatchDecodeRaggedForTest, "ragged decode must be enabled to exercise #277.");
+
+        int[] promptA = LongPrompt(tokenizer, 600);
+        int[] promptB = LongPrompt(tokenizer, 1000);
+
+        using var cacheA = fwd.CreateCache();
+        using var cacheB = fwd.CreateCache();
+        int tokA = Argmax(fwd.PrefillWithCache(promptA, cacheA));
+        int tokB = Argmax(fwd.PrefillWithCache(promptB, cacheB));
+        Assert.True(cacheA.EvictedCount > 0 && cacheB.EvictedCount > 0);
+        Assert.NotEqual(cacheA.EvictedCount, cacheB.EvictedCount); // different deltas
+
+        int[] toks = { tokA, tokB };
+        int[] poss = { promptA.Length, promptB.Length };
+
+        // Ragged path (default): handles eviction via the physical-slot array (#277).
+        fwd.BatchDecodeRaggedForTest = true;
+        float[][] ragged = fwd.BatchForwardMulti(toks, poss, [cacheA, cacheB]);
+
+        // Per-sequence loop (#190) on the SAME caches at the SAME positions — idempotent re-run.
+        fwd.BatchDecodeRaggedForTest = false;
+        float[][] perSeq = fwd.BatchForwardMulti(toks, poss, [cacheA, cacheB]);
+
+        for (int n = 0; n < 2; n++)
+        {
+            float maxAbs = MaxAbs(ragged[n], perSeq[n]);
+            Assert.Equal(Argmax(perSeq[n]), Argmax(ragged[n]));
+            Assert.True(maxAbs == 0f,
+                $"Seq {n}: ragged-evicted decode must be bit-identical to the per-sequence loop " +
+                $"(maxAbs={maxAbs}); a nonzero delta means the physical-slot threading diverged.");
+        }
+    }
+
+    /// <summary>
+    /// Issue #277, mixed batch: one SnapKV-evicted sequence and one un-evicted sequence in the same
+    /// ragged decode. The physical-slot array must offset only the evicted one (<c>pos - delta</c>)
+    /// and leave the un-evicted one at <c>pos</c>; the ragged path must still be bit-identical to the
+    /// per-sequence loop for BOTH. Guards the per-sequence <c>slots[n]</c> construction.
+    /// </summary>
+    [Fact]
+    public void Qwen3_8B_RaggedEvictedDecode_BitIdentical_To_PerSequenceLoop_MixedEvictedAndNot()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        const int budget = 512;
+        using var env = SnapKvEnv(budget, window: 32);
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 2048);
+
+        int[] longPrompt = LongPrompt(tokenizer, 900);          // > budget → evicts
+        int[] shortPrompt = { 9707, 11, 1879, 0, 358, 1079 };   // << budget → no eviction
+
+        using var cacheL = fwd.CreateCache();
+        using var cacheS = fwd.CreateCache();
+        int tokL = Argmax(fwd.PrefillWithCache(longPrompt, cacheL));
+        int tokS = Argmax(fwd.PrefillWithCache(shortPrompt, cacheS));
+        Assert.True(cacheL.EvictedCount > 0);
+        Assert.Equal(0, cacheS.EvictedCount);
+
+        int[] toks = { tokL, tokS };
+        int[] poss = { longPrompt.Length, shortPrompt.Length };
+
+        fwd.BatchDecodeRaggedForTest = true;
+        float[][] ragged = fwd.BatchForwardMulti(toks, poss, [cacheL, cacheS]);
+        fwd.BatchDecodeRaggedForTest = false;
+        float[][] perSeq = fwd.BatchForwardMulti(toks, poss, [cacheL, cacheS]);
+
+        for (int n = 0; n < 2; n++)
+        {
+            float maxAbs = MaxAbs(ragged[n], perSeq[n]);
+            Assert.Equal(Argmax(perSeq[n]), Argmax(ragged[n]));
+            Assert.True(maxAbs == 0f,
+                $"Seq {n} (mixed): ragged decode must be bit-identical to the per-sequence loop (maxAbs={maxAbs}).");
+        }
+    }
+
+    private static float MaxAbs(float[] a, float[] b)
+    {
+        Assert.Equal(a.Length, b.Length);
+        float m = 0f;
+        for (int i = 0; i < a.Length; i++) m = MathF.Max(m, MathF.Abs(a[i] - b[i]));
+        return m;
+    }
+
+    /// <summary>
     /// Option 2: when continuous batching is preferred (<c>preferBatchingOverAutoSnapKv</c>), the
     /// VRAM-scaled SnapKV AUTO-enable is suppressed — so a batching server gets the ragged-decode
     /// fast path, not silent lossy eviction. Verified at a context where auto-SnapKV WOULD engage.

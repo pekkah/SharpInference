@@ -174,4 +174,95 @@ public sealed class CudaBatchedDecodeBench
             }
         }
     }
+
+    /// <summary>
+    /// Issue #277: aggregate decode throughput for a SnapKV-EVICTED batch on the ragged fast path
+    /// vs the #190 per-sequence loop it used to be forced onto. Before #277 any evicted cache in the
+    /// batch routed the whole batch through O(N) per-op launches; #277 keeps it on the O(1) ragged
+    /// kernels (physical-slot threaded). The per-sequence loop is reachable here via the
+    /// <see cref="CudaForwardPass.BatchDecodeRaggedForTest"/> seam, so this A/Bs both on one warm
+    /// instance. Long prompts force eviction (budget 512). Surfaces t/s, asserts no threshold.
+    ///
+    /// Opt-in: $env:SHARPI_BENCH_BATCH=1; dotnet test ... --filter
+    ///   "FullyQualifiedName~Decode_Throughput_SnapKvEvicted_Ragged_vs_PerSeq"
+    /// </summary>
+    [Fact]
+    public void Decode_Throughput_SnapKvEvicted_Ragged_vs_PerSeq()
+    {
+        if (!BenchEnabled) return;
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+
+        // Long prompt that exceeds the SnapKV budget so every per-sequence cache evicts.
+        const string seed = "The quick brown fox jumps over the lazy dog. Sphinx of black quartz, judge my vow. ";
+        var sb = new System.Text.StringBuilder();
+        while (tokenizer.Encode(sb.ToString()).Count < 1200) sb.Append(seed);
+        int[] prompt = tokenizer.Encode(sb.ToString()).ToArray();
+
+        var prevBudget = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_BUDGET");
+        var prevWindow = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_WINDOW");
+        var prevSlots = Environment.GetEnvironmentVariable("SHARPI_PREFIX_SLOTS");
+        Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", "512");
+        Environment.SetEnvironmentVariable("SHARPI_SNAPKV_WINDOW", "32");
+        Environment.SetEnvironmentVariable("SHARPI_PREFIX_SLOTS", null);
+        CudaForwardPass fwdTmp;
+        try { fwdTmp = new CudaForwardPass(model, gpu, hp, maxContextLength: 2048); }
+        finally
+        {
+            Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", prevBudget);
+            Environment.SetEnvironmentVariable("SHARPI_SNAPKV_WINDOW", prevWindow);
+            Environment.SetEnvironmentVariable("SHARPI_PREFIX_SLOTS", prevSlots);
+        }
+        using var fwd = fwdTmp;
+
+        int decodeSteps = DecodeSteps;
+        const int warmup = 8;
+        foreach (int n in BatchSizesToRun)
+        {
+            var caches = new CudaSequenceKvCache[n];
+            try
+            {
+                var toks = new int[n];
+                var poss = new int[n];
+                for (int s = 0; s < n; s++)
+                {
+                    caches[s] = fwd.CreateCache();
+                    toks[s] = Argmax(fwd.PrefillWithCache(prompt, caches[s]));
+                    poss[s] = prompt.Length;
+                }
+                if (caches[0].EvictedCount == 0)
+                    throw new InvalidOperationException("bench expects SnapKV eviction; prompt too short for the budget.");
+
+                double Run(bool ragged)
+                {
+                    fwd.BatchDecodeRaggedForTest = ragged;
+                    var t = (int[])toks.Clone();
+                    var p = (int[])poss.Clone();
+                    // Idempotent re-decode at fixed positions keeps the timed window pinned to one
+                    // cache geometry (no cache growth across steps) — a clean per-op A/B.
+                    for (int i = 0; i < warmup; i++) fwd.BatchForwardMulti(t, p, caches);
+                    var sw = Stopwatch.StartNew();
+                    for (int i = 0; i < decodeSteps; i++) fwd.BatchForwardMulti(t, p, caches);
+                    sw.Stop();
+                    return (double)n * decodeSteps / sw.Elapsed.TotalSeconds;
+                }
+
+                double perSeq = Run(ragged: false);
+                double raggedTps = Run(ragged: true);
+                Log($"[bench-277] evicted N={n}: ragged {raggedTps:F1} t/s vs per-seq {perSeq:F1} t/s " +
+                    $"({raggedTps / perSeq:F2}× ragged, EvictedCount={caches[0].EvictedCount})");
+            }
+            finally
+            {
+                fwd.BatchDecodeRaggedForTest = true;
+                foreach (var c in caches) c?.Dispose();
+            }
+        }
+    }
 }
