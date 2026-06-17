@@ -335,12 +335,7 @@ public sealed class CudaExpertSlotManager : IDisposable, IExpertPrefetchTarget
     private void EnsureRoleSlab(ref RoleSlab role, string roleSuffix, int rows, int cols)
     {
         if (role.Allocated) return;
-        long stride = 0;
-        for (int l = 0; l < _hp.NumLayers; l++)
-        {
-            if (_model.FindTensor($"blk.{l}.{roleSuffix}.weight") is not { } li) continue;
-            stride = Math.Max(stride, ExpertFootprintBytes(li.DType, rows, cols));
-        }
+        long stride = MaxRoleExpertBytes(_model, _hp.NumLayers, roleSuffix, rows, cols);
         if (stride <= 0)
             throw new InvalidOperationException(
                 $"No '{roleSuffix}' expert tensor found in any layer to size the slab.");
@@ -360,6 +355,26 @@ public sealed class CudaExpertSlotManager : IDisposable, IExpertPrefetchTarget
         dt is DType.Q4_K or DType.Q5_K or DType.Q6_K
             ? (long)rows * (cols / DTypeInfo.BlockSize(dt)) * DTypeInfo.BytesPerBlock(dt)
             : (long)rows * cols * sizeof(float);
+
+    /// <summary>
+    /// The fixed slab stride for one expert role = the MAX per-expert footprint over all MoE
+    /// layers (a role's experts do NOT all share one byte size — K_M mixes and Unsloth "UD"
+    /// quants store a role at a larger dtype, sometimes one expanding to F32, on a subset of
+    /// layers). Public so the SLRU capacity planners
+    /// (<see cref="CudaHybridForwardPass"/>.PerExpertBytes /
+    /// <see cref="CudaHybridGdnForwardPass"/>.EstimatePerExpertBytes) price EXACTLY what the slab
+    /// allocates: sizing from blk.0 alone under-counts, so the planner would derive more slots
+    /// than the slab fits and over-commit VRAM (a hard cudaMalloc OOM when a later layer's role
+    /// expands to F32). Returns 0 if no layer carries the role.
+    /// </summary>
+    public static long MaxRoleExpertBytes(GgufModel model, int numLayers, string roleSuffix, int rows, int cols)
+    {
+        long max = 0;
+        for (int l = 0; l < numLayers; l++)
+            if (model.FindTensor($"blk.{l}.{roleSuffix}.weight") is { } info)
+                max = Math.Max(max, ExpertFootprintBytes(info.DType, rows, cols));
+        return max;
+    }
 
     /// <summary>
     /// Upload one expert's weight bytes into <paramref name="role"/>'s slab at
