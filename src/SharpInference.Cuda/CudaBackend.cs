@@ -4205,23 +4205,27 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// <summary>
     /// Ragged-batched KV append (issue #197): row <c>t</c> of the fp32
     /// <paramref name="kInputAll"/>/<paramref name="vInputAll"/> (<c>[N × kvDim]</c>)
-    /// is stored into <c>kCaches[t]</c>/<c>vCaches[t]</c> at slot
-    /// <c>positions[t] % maxSeqLen</c>. Per sequence bit-identical to the matching
+    /// is stored into <c>kCaches[t]</c>/<c>vCaches[t]</c> at physical slot
+    /// <c>slots[t] % maxSeqLen</c>. Per sequence bit-identical to the matching
     /// per-token append (<see cref="KvAppend"/> / <see cref="KvAppendBf16"/> /
     /// <see cref="KvAppendQ8_0"/> per <paramref name="kvDType"/>).
+    /// <para><paramref name="slots"/> is the PHYSICAL cache slot, not the logical token position:
+    /// for a SnapKV-compacted cache (#277) the caller passes <c>position - EvictedCount</c> so the
+    /// new token lands in the compacted cache (RoPE still rotates at the logical position). When no
+    /// sequence is evicted slot == position and this is the plain #197 append.</para>
     /// </summary>
     public void KvAppendBatchedRagged(
         Tensor kInputAll, Tensor vInputAll,
         ReadOnlySpan<Tensor> kCaches, ReadOnlySpan<Tensor> vCaches,
-        ReadOnlySpan<int> positions, int kvDim, int maxSeqLen, DType kvDType = DType.Float32)
+        ReadOnlySpan<int> slots, int kvDim, int maxSeqLen, DType kvDType = DType.Float32)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
             throw new NotSupportedException("NVRTC kernels are not available.");
-        int nTok = positions.Length;
+        int nTok = slots.Length;
         if (nTok == 0) return;
         if (kCaches.Length != nTok || vCaches.Length != nTok)
-            throw new ArgumentException("KvAppendBatchedRagged: kCaches/vCaches/positions lengths must match.");
+            throw new ArgumentException("KvAppendBatchedRagged: kCaches/vCaches/slots lengths must match.");
         nint kernel = kvDType switch
         {
             DType.Float32  => _kvAppendRaggedKernel,
@@ -4252,7 +4256,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             {
                 kPtrs[t] = GetDevPtr(kCaches[s + t]);
                 vPtrs[t] = GetDevPtr(vCaches[s + t]);
-                pos[t]   = positions[s + t];
+                pos[t]   = slots[s + t];
             }
             kIn = kBase + (nint)((long)s * rowBytes);
             vIn = vBase + (nint)((long)s * rowBytes);
@@ -4265,13 +4269,18 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// <summary>
     /// Ragged-batched single-query attention (issue #197): query row <c>t</c> of
     /// <paramref name="qAll"/> (<c>[N × numHeads*headDim]</c>) attends over
-    /// <c>kCaches[t]</c>/<c>vCaches[t]</c> positions <c>[0, positions[t] + 1)</c> into
+    /// <c>kCaches[t]</c>/<c>vCaches[t]</c> slots <c>[0, slots[t] + 1)</c> into
     /// row <c>t</c> of <paramref name="outputAll"/>. Grid is (numHeads, N): all N
     /// sequences' attention blocks run concurrently in one launch. Each (head, sequence)
     /// block keeps the per-token <see cref="Attention"/> kernel's exact reduction chain,
     /// so per sequence the output is bit-identical to the sequential call.
     ///
-    /// When every <c>positions[t] + 1 ≤ 4096</c> scores stay in shared memory and
+    /// <para><paramref name="slots"/> is the PHYSICAL last-slot index: the attended range is
+    /// <c>[0, slots[t] + 1)</c>. For a SnapKV-compacted cache (#277) the caller passes
+    /// <c>position - EvictedCount</c>, so each sequence attends over exactly its compacted length;
+    /// when no sequence is evicted slot == position and this is the plain #197 attention.</para>
+    ///
+    /// When every <c>slots[t] + 1 ≤ 4096</c> scores stay in shared memory and
     /// <paramref name="scoresScratch"/> may be null; above that it must hold
     /// <c>N × numHeads × maxSeqLen</c> floats (per-sequence rows of the per-token
     /// kernel's <c>numHeads × maxSeqLen</c> layout).
@@ -4280,15 +4289,15 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         Tensor qAll, ReadOnlySpan<Tensor> kCaches, ReadOnlySpan<Tensor> vCaches,
         Tensor outputAll, Tensor? scoresScratch,
         int numHeads, int numKvHeads, int headDim,
-        ReadOnlySpan<int> positions, int maxSeqLen, float attnScale = -1f, DType kvDType = DType.Float32)
+        ReadOnlySpan<int> slots, int maxSeqLen, float attnScale = -1f, DType kvDType = DType.Float32)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
             throw new NotSupportedException("NVRTC kernels are not available.");
-        int nTok = positions.Length;
+        int nTok = slots.Length;
         if (nTok == 0) return;
         if (kCaches.Length != nTok || vCaches.Length != nTok)
-            throw new ArgumentException("AttentionBatchedRagged: kCaches/vCaches/positions lengths must match.");
+            throw new ArgumentException("AttentionBatchedRagged: kCaches/vCaches/slots lengths must match.");
         nint kernel = kvDType switch
         {
             DType.Float32  => _attentionRaggedKernel,
@@ -4299,7 +4308,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
 
         nint ssBase = scoresScratch is { } sv ? GetDevPtr(sv) : nint.Zero;
         int maxLen = 0;
-        for (int i = 0; i < nTok; i++) maxLen = Math.Max(maxLen, positions[i] + 1);
+        for (int i = 0; i < nTok; i++) maxLen = Math.Max(maxLen, slots[i] + 1);
         if (maxLen > 4096)
         {
             // Fail loud, not corrupt: a too-small/absent scratch would make the kernel
@@ -4336,7 +4345,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             {
                 kPtrs[t] = GetDevPtr(kCaches[s + t]);
                 vPtrs[t] = GetDevPtr(vCaches[s + t]);
-                pos[t]   = positions[s + t];
+                pos[t]   = slots[s + t];
             }
             qPtr  = qBase + (nint)((long)s * qRowBytes);
             oPtr  = oBase + (nint)((long)s * qRowBytes);

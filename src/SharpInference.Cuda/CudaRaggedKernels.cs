@@ -111,6 +111,8 @@ extern ""C"" __global__ void llm_rope_interleaved_ragged(
 // N distinct caches per launch via the pointer table. Same ring-slot convention
 // as llm_kv_append (`position % max_seq_len`; identity for the full-context
 // dense caches batched decode uses). Pure copy — bit-identical trivially.
+// `positions.v[t]` is the PHYSICAL slot the caller chose: position for an
+// uncompacted cache, position - EvictedCount for a SnapKV-compacted one (#277).
 extern ""C"" __global__ void llm_kv_append_ragged(
     const float* __restrict__ k_in_all,
     const float* __restrict__ v_in_all,
@@ -186,6 +188,8 @@ extern ""C"" __global__ void llm_kv_append_ragged_q8_0(
 // reductions, same sequential phase-3 V sum — against that sequence's own
 // cache over its own ragged length seq_len = positions.v[t] + 1, so per
 // sequence the output is bit-identical to the per-token llm_attention call.
+// positions.v[t] is the PHYSICAL last slot (position - EvictedCount for a
+// SnapKV-compacted cache, #277), so seq_len is the compacted length.
 // Spill scratch (seq_len > 4096) is per-(sequence, head):
 // scores_scratch[((t*num_heads)+h) * max_seq_len].
 template<typename KV>

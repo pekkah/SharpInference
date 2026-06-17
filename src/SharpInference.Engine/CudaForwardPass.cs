@@ -468,9 +468,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     // back-to-back) to O(1) ragged kernels whose grid covers all N sequences at their own
     // positions against their own caches (CudaBackend.*BatchedRagged). Bit-identical per
     // sequence to the per-sequence loop (same kernels' reduction chains, batched grid).
-    // SHARPI_BATCH_DECODE_RAGGED=0 restores the #190 per-sequence loop.
-    private readonly bool _batchDecodeRagged =
+    // SHARPI_BATCH_DECODE_RAGGED=0 restores the #190 per-sequence loop. Not readonly only so the
+    // #277 test seam below can A/B both paths on one instance; production sets it once from the env.
+    private bool _batchDecodeRagged =
         Environment.GetEnvironmentVariable("SHARPI_BATCH_DECODE_RAGGED") != "0";
+
+    /// <summary>Test seam (#277): flip the ragged-vs-per-sequence decode path at runtime so a single
+    /// instance can A/B both on the SAME caches at the SAME positions. A batched decode step is
+    /// idempotent there (it overwrites its own next slot with identical K/V and never reads
+    /// <c>Length</c> to bound attention), and both paths share every GEMM, so the two outputs are
+    /// bit-identical when the ragged attention block matches the per-sequence loop. A cross-instance
+    /// compare can't assert that — prefill is not bit-exact across instances.</summary>
+    internal bool BatchDecodeRaggedForTest { get => _batchDecodeRagged; set => _batchDecodeRagged = value; }
 
     // Per-batch-composition cache pointer table for the ragged kernels: [layer][seq]
     // K/V cache tensors, rebuilt only when the caches array composition changes
@@ -502,6 +511,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     // actually occurs (43 MB at N=8 / 40K ctx — don't pay it for short decodes).
     private Tensor? _raggedAttnScores;
     private int _raggedAttnScoresCapacity;
+
+    // Physical cache slots for the ragged KV-append + attention range when some sequence in the
+    // batch is SnapKV-evicted (issue #277): slots[n] = positions[n] - EvictedCount[n]. RoPE keeps
+    // the LOGICAL position, so the ragged path threads these two apart exactly like the per-sequence
+    // loop (KvAppendKv/AttentionKv at physSlot, RoPE at pos). Reused across decode steps and grown
+    // on demand; only built when an eviction is actually present (the common no-eviction batch
+    // passes positions straight through, allocation-free and byte-identical to pre-#277).
+    private int[]? _raggedPhysSlots;
 
     // Empty (no-aliasing) layer set shared by every dense per-sequence cache CreateCache
     // hands out — dense models never share KV across layers (that's the Gemma 4 tail,
@@ -4086,9 +4103,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
 
         // SnapKV-evicted caches (issue #196): a sequence whose prompt was compacted maps a logical
         // position p to the physical slot p - EvictedCount for KV append + attention (RoPE keeps p).
-        // The ragged kernels take positions[] for BOTH append slot and attention range, so they'd
-        // mis-index an evicted cache — force the per-sequence loop, which threads the physical slot
-        // and logical RoPE position separately, when any cache in the batch carries an eviction.
+        // Issue #277: the ragged kernels now take that physical slot for BOTH the append slot and the
+        // attention range (built into `slots` below), so an evicted cache no longer forces the
+        // per-sequence loop — the ragged fast path handles eviction too.
         bool anyEvicted = false;
         for (int n = 0; n < N; n++)
         {
@@ -4108,12 +4125,24 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         // tensor table once per batch composition (identity-compared; steps within a stable
         // batch reuse it) and grab the spill scratch only if some sequence is past the
         // 4096-slot shared-memory fast path.
-        bool ragged = _batchDecodeRagged && !anyEvicted;
+        bool ragged = _batchDecodeRagged;
+        // Physical slots for KV append + attention range (#277): pos - EvictedCount per sequence.
+        // RoPE keeps the logical positions[]. When nothing is evicted these are identical, so reuse
+        // positions[] directly — the common batch stays allocation-free and byte-identical to #197.
+        ReadOnlySpan<int> slots = positions;
+        if (ragged && anyEvicted)
+        {
+            if (_raggedPhysSlots is null || _raggedPhysSlots.Length < N)
+                _raggedPhysSlots = new int[N];
+            for (int n = 0; n < N; n++)
+                _raggedPhysSlots[n] = positions[n] - caches[n].EvictedCount;
+            slots = _raggedPhysSlots.AsSpan(0, N);
+        }
         Tensor? raggedScores = null;
         if (ragged)
         {
             EnsureRaggedCacheTable(caches);
-            raggedScores = EnsureRaggedAttnScores(N, positions);
+            raggedScores = EnsureRaggedAttnScores(N, slots);
         }
 
         // Per-sequence views into the batched Q/K/V/attnOut scratch — only the legacy
@@ -4171,12 +4200,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                 {
                     // Ragged-batched (#197): same op sequence as the per-sequence loop below
                     // (bias → QK-norm/RoPE, #157 order → KV append → attention), each op one
-                    // launch whose grid covers all N rows at positions[n] against caches[n].
-                    // Every kernel keeps its per-token counterpart's reduction chain, so per
-                    // sequence this is bit-identical to the loop it replaces. Reached only when no
-                    // cache in the batch is SnapKV-evicted (the anyEvicted gate above routes an
-                    // evicted batch to the per-sequence loop), so every cache's physical slot
-                    // equals its logical pos — the ragged kernels can take positions[] directly.
+                    // launch whose grid covers all N rows against caches[n]. Every kernel keeps its
+                    // per-token counterpart's reduction chain, so per sequence this is bit-identical
+                    // to the loop it replaces. RoPE rotates at the LOGICAL positions[n]; KV append +
+                    // the attention range use the PHYSICAL `slots[n]` (= positions[n] - EvictedCount,
+                    // == positions[n] when unevicted) — so a SnapKV-compacted cache (#277) lands its
+                    // new token at the right slot and attends over its compacted length, exactly like
+                    // the per-sequence loop's physSlot threading.
                     if (_hasAttnBias)
                     {
                         _gpu.AddBiasBatched(_bpQ!, _bq![layer], qDim, N);
@@ -4199,10 +4229,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                     }
 
                     _gpu.KvAppendBatchedRagged(_bpK!, _bpV!, _raggedKLayers![layer], _raggedVLayers![layer],
-                        positions, kvDim, _maxSeqLen, _kvDType);
+                        slots, kvDim, _maxSeqLen, _kvDType);
                     _gpu.AttentionBatchedRagged(_bpQ!, _raggedKLayers[layer], _raggedVLayers[layer],
                         _bpAttnOut!, raggedScores,
-                        _numHeads, _numKvHeads, _headDim, positions, _maxSeqLen, _attnScale, _kvDType);
+                        _numHeads, _numKvHeads, _headDim, slots, _maxSeqLen, _attnScale, _kvDType);
                     // caches[n].Length is advanced once after the pass completes (below).
                 }
                 else
@@ -4698,10 +4728,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     /// [N × numHeads × maxSeqLen] buffer of per-(sequence, head) score rows, lazily
     /// allocated and re-sized only when the decode batch capacity changes.
     /// </summary>
-    private Tensor? EnsureRaggedAttnScores(int n, int[] positions)
+    private Tensor? EnsureRaggedAttnScores(int n, ReadOnlySpan<int> slots)
     {
         int maxLen = 0;
-        for (int i = 0; i < positions.Length; i++) maxLen = Math.Max(maxLen, positions[i] + 1);
+        for (int i = 0; i < slots.Length; i++) maxLen = Math.Max(maxLen, slots[i] + 1);
         if (maxLen <= 4096) return null;
 
         if (_raggedAttnScoresCapacity != n)
