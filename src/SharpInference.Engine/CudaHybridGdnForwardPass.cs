@@ -3913,21 +3913,16 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // work is largely hidden behind the routed compute that just ran).
         _gpu.Download(_gpuBvFfnAll!, (nint)_bSharedAll, k * embDim);
 
-        // ── Combine: hidden[i] = routed[i] + sharedScaled[i] on the host (matching
-        //    CpuMoeFfnCore's AddInPlace(moeOut, _cpuSharedOut)), then add the block
-        //    residual on the GPU over all k tokens (element-wise → per-token bits).
-        float* routedAll = _bRoutedAll;
-        float* sharedAll = _bSharedAll;
-        float* hiddenAll = _bHiddenAll;
-        int embDimL = embDim;
-        Parallel.For(0, k, s_moeParallelOpts, i =>
-        {
-            float* routed = routedAll + (long)i * embDimL;
-            float* shared = sharedAll + (long)i * embDimL;
-            float* outp = hiddenAll + (long)i * embDimL;
-            for (int r = 0; r < embDimL; r++)
-                outp[r] = routed[r] + shared[r];
-        });
+        // ── Combine: hidden = routed + sharedScaled on the host (matching
+        //    CpuMoeFfnCore's AddInPlace(moeOut, _cpuSharedOut) operand order), then add
+        //    the block residual on the GPU over all k tokens (element-wise → per-token
+        //    bits). One flat pass over the contiguous [k×embDim] buffers: k is the tiny
+        //    draft batch (2–4), so a sequential loop beats Parallel.For here — TPL
+        //    scheduling plus the closure heap-alloc would dwarf the work. (The prefill
+        //    combine parallelizes only because there N ≈ the prefill chunk size.)
+        long combineCount = (long)k * embDim;
+        for (long r = 0; r < combineCount; r++)
+            _bHiddenAll[r] = _bRoutedAll[r] + _bSharedAll[r];
         _gpu.UploadInto(_gpuBvFfnAll!, (nint)_bHiddenAll, k * embDim);
         _gpu.AddInPlace(_gpuBvFfnAll!, blockOut);
         _gpu.CopyDeviceRegion(stream, 0, _gpuBvFfnAll!, 0, (long)k * embBytes);
