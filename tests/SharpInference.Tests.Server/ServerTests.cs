@@ -1142,6 +1142,13 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
     public long PrefillTokensReused => 0;
 
     /// <summary>
+    /// When set, a <see cref="GenerateChunkKind.Usage"/> chunk carrying this prompt-token count
+    /// is emitted before the scripted output — mirroring what the real engines do so endpoint
+    /// tests can assert <c>usage.prompt_tokens</c> / <c>input_tokens</c> (issue #150).
+    /// </summary>
+    public int PromptTokens { get; init; }
+
+    /// <summary>
     /// Captures the <see cref="SamplingParams"/> handed to the most recent
     /// <see cref="GenerateChunksAsync"/> call. Lets wire-level tests confirm that request
     /// fields (e.g. <c>thinking.budget_tokens</c>, <c>max_thinking_tokens</c>) reach the
@@ -1185,6 +1192,8 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
         LastSamplingParams = sp;
         LastCanonicalHistoryPrefix = canonicalHistoryPrefix;
         LastPrompt = prompt;
+        if (PromptTokens > 0)
+            yield return new GenerateChunk(GenerateChunkKind.Usage, "", PromptTokens);
         foreach (var (kind, text) in _script)
         {
             ct.ThrowIfCancellationRequested();
@@ -1203,6 +1212,8 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
         LastCanonicalHistoryPrefix = null;
         LastPrompt = prompt;
         LastImageCount = imageBytes.Count;
+        if (PromptTokens > 0)
+            yield return new GenerateChunk(GenerateChunkKind.Usage, "", PromptTokens);
         foreach (var (kind, text) in _script)
         {
             ct.ThrowIfCancellationRequested();

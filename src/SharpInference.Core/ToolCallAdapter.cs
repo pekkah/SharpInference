@@ -649,6 +649,13 @@ public sealed class Gemma4ToolCallAdapter : IToolCallAdapter
     public const string CallPrefix  = "call:";
     /// <summary>Gemma's string-delimiter token; brackets a string literal on both sides.</summary>
     public const string Quote       = "<|\"|>";
+    /// <summary>
+    /// Turn-boundary control tokens that open/close a tool-result turn. The model frequently
+    /// emits the opening <c>&lt;|tool_response&gt;</c> immediately after a tool call (it is
+    /// starting the next, tool-role, turn) — these are special tokens, never user-facing
+    /// content, so they are scrubbed from the parsed plain text (issue #150).
+    /// </summary>
+    private static readonly string[] ResponseMarkers = ["<|tool_response>", "<tool_response|>"];
 
     public string Architecture => "gemma4";
     public int MaxOpenTagLength => OpenMarker.Length;
@@ -676,7 +683,7 @@ public sealed class Gemma4ToolCallAdapter : IToolCallAdapter
                 // Model stopped mid-call (no <tool_call|>): surface the partial as text and flag
                 // truncation rather than emitting a half-parsed call. Matches the streaming path.
                 plain.Append(rawOutput, contentStart, rawOutput.Length - contentStart);
-                return new ToolCallParseResult(plain.ToString(), calls, Truncated: true);
+                return new ToolCallParseResult(ScrubResponseMarkers(plain), calls, Truncated: true);
             }
 
             string block = rawOutput[contentStart..end];
@@ -684,7 +691,20 @@ public sealed class Gemma4ToolCallAdapter : IToolCallAdapter
             foreach (var c in ParseBlock(block)) calls.Add(c);
         }
 
-        return new ToolCallParseResult(plain.ToString(), calls, Truncated: false);
+        return new ToolCallParseResult(ScrubResponseMarkers(plain), calls, Truncated: false);
+    }
+
+    /// <summary>
+    /// Removes any orphan tool-response turn markers from the accumulated plain text so a
+    /// leftover <c>&lt;|tool_response&gt;</c> (emitted after a tool call) doesn't surface as
+    /// assistant content. Operates on the non-block text only — tool-call blocks were already
+    /// extracted — so a marker that legitimately appears inside a tool argument is untouched.
+    /// </summary>
+    private static string ScrubResponseMarkers(StringBuilder plain)
+    {
+        foreach (var marker in ResponseMarkers)
+            plain.Replace(marker, "");
+        return plain.ToString();
     }
 
     public int FindOpenMarker(string buffer, int startSearch, out int contentStart)

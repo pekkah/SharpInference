@@ -39,8 +39,13 @@ public sealed class InferenceEngineChunkTests
         await foreach (var c in engine.GenerateChunksAsync("seed", sp))
             chunks.Add(c);
 
-        Assert.All(chunks, c => Assert.Equal(GenerateChunkKind.Text, c.Kind));
-        var joined = string.Concat(chunks.Select(c => c.Text));
+        // The engine leads with one out-of-band Usage chunk carrying the prompt-token count
+        // (issue #150) — ScriptedTokenizer.Encode returns a single token. The rest are Text.
+        var usage = Assert.Single(chunks, c => c.Kind == GenerateChunkKind.Usage);
+        Assert.Equal(1, usage.PromptTokens);
+        Assert.All(chunks.Where(c => c.Kind != GenerateChunkKind.Usage),
+            c => Assert.Equal(GenerateChunkKind.Text, c.Kind));
+        var joined = string.Concat(chunks.Where(c => c.Kind == GenerateChunkKind.Text).Select(c => c.Text));
         Assert.Equal("Hi there", joined);
     }
 

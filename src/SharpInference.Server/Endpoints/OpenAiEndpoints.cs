@@ -173,12 +173,17 @@ public static class OpenAiEndpoints
         var reasoningSb = new StringBuilder();
         int textTokens = 0;
         int reasoningTokens = 0;
+        int promptTokens = 0;
 
         try
         {
             await foreach (var c in ImageContent.Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
             {
-                if (c.Kind == GenerateChunkKind.Thinking)
+                if (c.Kind == GenerateChunkKind.Usage)
+                {
+                    promptTokens = c.PromptTokens;
+                }
+                else if (c.Kind == GenerateChunkKind.Thinking)
                 {
                     reasoningSb.Append(c.Text);
                     reasoningTokens++;
@@ -256,7 +261,7 @@ public static class OpenAiEndpoints
             reasoningSb.Length > 0 ? reasoningSb.ToString() : null,
             toolCalls);
         var usage = new ChatUsage(
-            0, completionTokens, completionTokens,
+            promptTokens, completionTokens, promptTokens + completionTokens,
             reasoningTokens > 0 ? new CompletionTokensDetails(reasoningTokens) : null);
 
         var response = new ChatCompletionResponse(
@@ -296,6 +301,11 @@ public static class OpenAiEndpoints
         async Task WriteContentDelta(string text)
         {
             if (text.Length == 0) return;
+            // OpenAI's wire shape carries the assistant's intent in tool_calls once a call has
+            // been emitted; any trailing plain text is model control noise (e.g. Gemma's
+            // <|tool_response> turn marker) and must not leak as a content delta (issue #150).
+            // Preamble before the first call is unaffected (hasToolCalls is still false then).
+            if (hasToolCalls) return;
             var chunk = new ChatCompletionChunk(
                 requestId, "chat.completion.chunk", created, engine.ModelId,
                 [new ChunkChoice(0, new ChunkDelta(null, text), null)]);
@@ -373,6 +383,10 @@ public static class OpenAiEndpoints
         {
             await foreach (var c in ImageContent.Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
             {
+                // Out-of-band usage chunk (issue #150): not a generated token and carries no
+                // text. The streaming response doesn't emit a usage object (OpenAI gates that
+                // behind stream_options.include_usage, unsupported here), so just skip it.
+                if (c.Kind == GenerateChunkKind.Usage) continue;
                 tokenCount++;
                 if (c.Kind == GenerateChunkKind.Thinking)
                 {
