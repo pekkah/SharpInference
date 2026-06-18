@@ -59,29 +59,21 @@ internal static class ConcurrencyLimitExtensions
             if (!gate.TryEnter())
                 return BusyResult(ctx.HttpContext, gate.Limit);
 
-            // Today the generation handlers write to the response and return a bare Task, so
-            // `await next(ctx)` completes only after the (possibly streaming) response is fully
-            // written — the slot is correctly held for the whole request and released below.
-            // But if a handler is ever refactored to RETURN an IResult (e.g. TypedResults.Stream),
-            // `next(ctx)` would complete as soon as the result is constructed, before it executes
-            // — releasing the slot mid-stream and breaking the limit. Hand any returned IResult to
-            // a decorator that releases only after it has finished executing, so the gate stays
-            // correct regardless of handler shape.
-            bool releaseHere = true;
+            // The gated generation handlers write the response and return a bare Task (they do
+            // not return an IResult), so `await next(ctx)` completes only after the response —
+            // including a streaming SSE body — is fully written. The finally then releases the
+            // slot exactly once on every path: normal completion, an exception out of next(), or
+            // a mid-stream client abort (which the streaming handlers catch and return from
+            // normally). A future handler that instead RETURNS an IResult would release the slot
+            // before the result executes — revisit this (e.g. release via Response.OnCompleted)
+            // if that ever changes.
             try
             {
-                var result = await next(ctx);
-                if (result is IResult inner)
-                {
-                    releaseHere = false;
-                    return new GateReleasingResult(inner, gate);
-                }
-                return result;
+                return await next(ctx);
             }
             finally
             {
-                if (releaseHere)
-                    gate.Exit();
+                gate.Exit();
             }
         });
 
@@ -96,22 +88,5 @@ internal static class ConcurrencyLimitExtensions
             "or start the server with SHARPI_MAX_BATCH>1 to enable continuous batching for concurrent requests.");
         return TypedResults.Json(error, SharpInferenceJsonContext.Default.ErrorResponse,
             statusCode: StatusCodes.Status429TooManyRequests);
-    }
-
-    /// <summary>Releases the admission slot only after the wrapped result has finished executing
-    /// (i.e. after a streaming response is fully written), even if execution throws.</summary>
-    private sealed class GateReleasingResult(IResult inner, RequestConcurrencyGate gate) : IResult
-    {
-        public async Task ExecuteAsync(HttpContext httpContext)
-        {
-            try
-            {
-                await inner.ExecuteAsync(httpContext);
-            }
-            finally
-            {
-                gate.Exit();
-            }
-        }
     }
 }
