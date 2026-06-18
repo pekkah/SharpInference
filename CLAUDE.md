@@ -23,11 +23,13 @@ dotnet run --project src/SharpInference.Cli -c Release -- \
   -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -p "prompt" --temp 0 -g -1
 
 # VibeThinker-1.5B (Qwen2-based math/reasoning, issue #282). Loads as a standard
-# qwen2 GGUF (QKV bias, no QK-norm, 28 layers / 2 KV heads, ChatML, tied embeddings).
-# Recommended sampling: temp 0.6, top_p 0.95, top_k 0, and NO system prompt for math.
-# Output is long plain-text chain-of-thought (not <think> tags).
+# qwen2 GGUF (QKV bias but no output-projection bias, no QK-norm, 28 layers / 2 KV
+# heads, ChatML, tied embeddings). Default download is Q8_0 (near-lossless; `-Model
+# vibethinker-q4` for the smaller quant). Recommended sampling: temp 0.6, top_p 0.95,
+# top_k 0, and no system prompt (the chat template supplies the math one). Emits a long
+# <think> chain-of-thought then a \boxed{} answer (handled by the generic think machinery).
 dotnet run --project src/SharpInference.Cli -c Release -- \
-  -m models/VibeThinker-1.5B.Q4_K_M.gguf -g -1 \
+  -m models/VibeThinker-1.5B.Q8_0.gguf -g -1 \
   --temp 0.6 --top-p 0.95 --top-k 0 \
   -p "If 5x + 3 = 2x + 18, what is x? Show your reasoning."
 

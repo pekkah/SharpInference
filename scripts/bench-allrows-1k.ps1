@@ -171,9 +171,9 @@ $jobs = @(
   @{ Tag="smol-vulkan";     M="$C\SmolLM2-1.7B-Instruct-Q4_K_M.gguf"; A=@("-g","-1","--backend","vulkan");                 Temp="0.7"; Samp=$sSmol;  T=300 }
   @{ Tag="smol-cuda";       M="$C\SmolLM2-1.7B-Instruct-Q4_K_M.gguf"; A=@("-g","-1","--backend","cuda");                   Temp="0.7"; Samp=$sSmol;  T=300 }
 
-  @{ Tag="vibe-cpu";        M="$C\VibeThinker-1.5B.Q4_K_M.gguf"; A=@();                                                    Temp="0.6"; Samp=$sVibe;  T=300 }
-  @{ Tag="vibe-vulkan";     M="$C\VibeThinker-1.5B.Q4_K_M.gguf"; A=@("-g","-1","--backend","vulkan");                      Temp="0.6"; Samp=$sVibe;  T=300 }
-  @{ Tag="vibe-cuda";       M="$C\VibeThinker-1.5B.Q4_K_M.gguf"; A=@("-g","-1","--backend","cuda");                        Temp="0.6"; Samp=$sVibe;  T=300 }
+  @{ Tag="vibe-cpu";        M="$C\VibeThinker-1.5B.Q8_0.gguf"; A=@();                                                      Temp="0.6"; Samp=$sVibe;  T=300 }
+  @{ Tag="vibe-vulkan";     M="$C\VibeThinker-1.5B.Q8_0.gguf"; A=@("-g","-1","--backend","vulkan");                        Temp="0.6"; Samp=$sVibe;  T=300 }
+  @{ Tag="vibe-cuda";       M="$C\VibeThinker-1.5B.Q8_0.gguf"; A=@("-g","-1","--backend","cuda");                          Temp="0.6"; Samp=$sVibe;  T=300 }
 
   @{ Tag="qwen3-cpu";       M="$C\Qwen3-8B-Q4_K_M.gguf"; A=@();                                                            Temp="0.6"; Samp=$sQwen;  T=400 }
   @{ Tag="qwen3-cpu-tq";    M="$C\Qwen3-8B-Q4_K_M.gguf"; A=@("--tq");                                                      Temp="0.6"; Samp=$sQwen;  T=400 }
