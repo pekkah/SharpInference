@@ -195,6 +195,19 @@ public sealed class SharpInferenceServerOptions
     /// </summary>
     public string? ExpertStatsPath { get; set; }
 
+    /// <summary>
+    /// Force all routed MoE experts onto the CPU side — the engine's all-or-nothing
+    /// <c>SHARPI_CPU_MOE</c> override, read by <see cref="CudaHybridGdnForwardPass"/> and
+    /// <see cref="CudaHybridForwardPass"/> at construction. Server analogue of the CLI's
+    /// <c>--cpu-moe</c> (issue #80 / #93). <c>true</c> → <c>SHARPI_CPU_MOE=1</c> (all routed
+    /// experts on CPU; e.g. the <c>Qwen3.6-35B-A3B-MTP</c> hybrid only reaches its headline
+    /// decode rate this way). <c>false</c> → <c>SHARPI_CPU_MOE=0</c> (force the on-GPU SLRU
+    /// expert cache). <c>null</c> (default) writes nothing, preserving the engine's VRAM-fit
+    /// auto-select and any <c>SHARPI_CPU_MOE</c> already set in the process environment. Has
+    /// effect only on the CUDA hybrid MoE paths; ignored by CPU/Vulkan and non-MoE models.
+    /// </summary>
+    public bool? CpuMoe { get; set; }
+
     // ── Speculative decoding defaults ────────────────────────────────────────
 
     /// <summary>

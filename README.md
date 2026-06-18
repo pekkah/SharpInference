@@ -209,6 +209,16 @@ MoE expert-cache knobs (`--moe-warmpin`, `--moe-warmpin-after`, `--no-moe-predic
 `--expert-stats`) are CLI-only; the server reads the equivalent `SHARPI_MOE_WARMPIN*`,
 `SHARPI_MOE_PREDICT_PREFETCH=0`, `SHARPI_EXPERT_STATS=<path>` env vars.
 
+MoE expert *placement* matches llama.cpp: `--cpu-moe` (alias `--cmoe`) keeps **all** routed
+experts on the CPU, equivalent to `SHARPI_CPU_MOE=1` (omit for VRAM-fit auto-select;
+`SHARPI_CPU_MOE=0` forces the on-GPU SLRU cache). On the server set `SharpInference:CpuMoe`
+(`true`/`false`) in `appsettings.json`, or export `SHARPI_CPU_MOE` directly. llama.cpp's
+`--n-cpu-moe` (per-layer split) is **not yet supported** — SharpInference's override is
+all-or-nothing, so the flag is recognized but errors with that rationale rather than silently
+behaving like `--cpu-moe`. The llama.cpp single-dash short forms `-cmoe`/`-ncmoe` aren't
+available because Spectre.Console requires single-dash options to be one character; the
+double-dash `--cmoe`/`--ncmoe` aliases stand in.
+
 ### SnapKV (prefill-time KV eviction, issue #51)
 
 On CPU, CUDA (dense + hybrid GDN), and Vulkan. After prefill it scores each prompt position by softmaxed

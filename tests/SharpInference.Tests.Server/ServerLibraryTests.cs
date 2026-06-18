@@ -39,11 +39,12 @@ public sealed class SharpInferenceServerOptionsTests
         Assert.Null(opts.KvType);            // fp32 KV unless explicitly narrowed (#179)
         Assert.Equal(0, opts.MinBatchBlas);
 
-        // MoE knob defaults: predictive prefetch on, nothing pinned.
+        // MoE knob defaults: predictive prefetch on, nothing pinned, placement auto-selected.
         Assert.Null(opts.MoeWarmPin);
         Assert.Equal(0L, opts.MoeWarmPinAfter);
         Assert.True(opts.MoePredictPrefetch);
         Assert.Null(opts.ExpertStatsPath);
+        Assert.Null(opts.CpuMoe);            // null = engine VRAM-fit auto-select (#93)
 
         // Spec-decode defaults: auto-engage MTP when supported, strict argmax-match.
         Assert.Equal(ServerSpecType.Auto, opts.SpecType);
@@ -105,6 +106,7 @@ public sealed class OptionsConfigurationBindingTests
             ["SharpInference:MoeWarmPinAfter"]     = "1024",
             ["SharpInference:MoePredictPrefetch"]  = "false",
             ["SharpInference:ExpertStatsPath"]     = "/tmp/stats.json",
+            ["SharpInference:CpuMoe"]              = "true",
 
             // Spec decode
             ["SharpInference:SpecType"]            = "Mtp",
@@ -127,6 +129,7 @@ public sealed class OptionsConfigurationBindingTests
         Assert.Equal(1024L,            opts.MoeWarmPinAfter);
         Assert.False(opts.MoePredictPrefetch);
         Assert.Equal("/tmp/stats.json", opts.ExpertStatsPath);
+        Assert.True(opts.CpuMoe);
 
         Assert.Equal(ServerSpecType.Mtp, opts.SpecType);
         Assert.Equal(2,    opts.SpecDraftNMax);
@@ -479,6 +482,49 @@ public sealed class InferenceEngineLoaderTests
         var ex = Assert.Throws<InvalidOperationException>(() => InferenceEngineLoader.Load(opts));
         Assert.Contains("Model file not found", ex.Message);
         Assert.Contains("SHARPI_MODEL", ex.Message);
+    }
+}
+
+/// <summary>
+/// Issue #93: the server <see cref="SharpInferenceServerOptions.CpuMoe"/> option must reach the
+/// engine as the <c>SHARPI_CPU_MOE</c> override <em>before</em> the forward pass is built (the
+/// hybrid passes read it once at construction). We drive the real translation path:
+/// <see cref="InferenceEngineLoader.Load"/> runs <c>ApplyMoeEnvironment</c> first, then throws on
+/// the absent model — so the env var the engine would read is observable afterwards. The var is
+/// saved/restored, all cases live in one class so they never race each other, and no other
+/// Tests.Server collection touches it (engines under test come from a FakeEngine factory, which
+/// bypasses the loader entirely). Mirrors the existing MoE-knob coverage.
+/// </summary>
+public sealed class CpuMoeEnvironmentTests : IDisposable
+{
+    private const string Var = "SHARPI_CPU_MOE";
+    private readonly string? _saved;
+
+    public CpuMoeEnvironmentTests() => _saved = Environment.GetEnvironmentVariable(Var);
+
+    public void Dispose() => Environment.SetEnvironmentVariable(Var, _saved);
+
+    // ModelPath null → Load throws at model resolution, but only after ApplyMoeEnvironment has run.
+    private static SharpInferenceServerOptions OptsNoModel(bool? cpuMoe) =>
+        new() { ModelPath = null, CpuMoe = cpuMoe };
+
+    [Theory]
+    [InlineData(true, "1")]
+    [InlineData(false, "0")]
+    public void CpuMoe_Set_WritesEnvAheadOfLoad(bool cpuMoe, string expected)
+    {
+        Environment.SetEnvironmentVariable(Var, null);
+        Assert.Throws<InvalidOperationException>(() => InferenceEngineLoader.Load(OptsNoModel(cpuMoe)));
+        Assert.Equal(expected, Environment.GetEnvironmentVariable(Var));
+    }
+
+    [Fact]
+    public void CpuMoe_Null_LeavesEnvUntouched()
+    {
+        const string sentinel = "preexisting"; // e.g. an operator's directly-exported SHARPI_CPU_MOE
+        Environment.SetEnvironmentVariable(Var, sentinel);
+        Assert.Throws<InvalidOperationException>(() => InferenceEngineLoader.Load(OptsNoModel(null)));
+        Assert.Equal(sentinel, Environment.GetEnvironmentVariable(Var)); // null option = no write
     }
 }
 

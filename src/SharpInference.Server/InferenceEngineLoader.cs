@@ -343,9 +343,10 @@ public static class InferenceEngineLoader
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Sets the SHARPI_MOE_* environment variables from the options object so the engine's
-    /// MoE-cache code picks them up at construction time. The engine code reads these
-    /// once per backend instance, so we have to do this BEFORE the backend is built.
+    /// Sets the MoE-related environment variables (SHARPI_MOE_* cache knobs plus the
+    /// SHARPI_CPU_MOE placement override, issue #93) from the options object so the engine's
+    /// MoE code picks them up at construction time. The engine reads these once per backend
+    /// instance, so we have to do this BEFORE the backend is built.
     /// </summary>
     private static void ApplyMoeEnvironment(SharpInferenceServerOptions opts)
     {
@@ -357,6 +358,13 @@ public static class InferenceEngineLoader
             Environment.SetEnvironmentVariable("SHARPI_MOE_PREDICT_PREFETCH", "0");
         if (!string.IsNullOrEmpty(opts.ExpertStatsPath))
             Environment.SetEnvironmentVariable("SHARPI_EXPERT_STATS", opts.ExpertStatsPath);
+
+        // CPU-MoE placement (issue #93, mirrors the CLI's --cpu-moe issue #80). The hybrid
+        // forward passes read SHARPI_CPU_MOE once at construction, so write it before load.
+        // Nullable: only an explicit option writes — null leaves any externally-set value (and
+        // the engine's VRAM-fit auto-select) untouched.
+        if (opts.CpuMoe is bool cpuMoe)
+            Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", cpuMoe ? "1" : "0");
     }
 
     /// <summary>
