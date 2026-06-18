@@ -16,7 +16,7 @@ public static class OpenAiEndpoints
 {
     public static IEndpointRouteBuilder MapOpenAiEndpoints(this IEndpointRouteBuilder app)
     {
-        app.MapPost("/v1/chat/completions", HandleChatCompletion);
+        app.MapPost("/v1/chat/completions", HandleChatCompletion).WithConcurrencyLimit();
         app.MapGet("/v1/models", HandleListModels);
         return app;
     }

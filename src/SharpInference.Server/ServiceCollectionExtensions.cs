@@ -38,6 +38,13 @@ public static class ServiceCollectionExtensions
         // TryAdd: a test or downstream module may already have registered a fake/replacement
         // for any of these services. We never overwrite an existing registration here.
         services.TryAddSingleton<ServerMetrics>();
+
+        // Request admission gate (issue #109). Resolved lazily so the options object is fully
+        // bound (config + the host's inline Configure, which runs after AddSharpInference) by
+        // the time the first request constructs it. Disabled (passthrough) unless
+        // MaxConcurrentRequests is set.
+        services.TryAddSingleton(sp => new Endpoints.RequestConcurrencyGate(
+            sp.GetRequiredService<IOptions<SharpInferenceServerOptions>>().Value.MaxConcurrentRequests));
         services.TryAddSingleton<ChatTemplateRenderer>(sp =>
         {
             var opts = sp.GetRequiredService<IOptions<SharpInferenceServerOptions>>().Value;

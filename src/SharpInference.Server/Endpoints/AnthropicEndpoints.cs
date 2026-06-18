@@ -15,7 +15,7 @@ public static class AnthropicEndpoints
 {
     public static IEndpointRouteBuilder MapAnthropicEndpoints(this IEndpointRouteBuilder app)
     {
-        app.MapPost("/v1/messages", HandleMessages);
+        app.MapPost("/v1/messages", HandleMessages).WithConcurrencyLimit();
         return app;
     }
 

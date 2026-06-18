@@ -24,6 +24,12 @@ builder.Services.AddSharpInference(builder.Configuration, opts =>
     if (int.TryParse(Environment.GetEnvironmentVariable("SHARPI_MAX_BATCH"), out int maxBatch) && maxBatch > 0)
         opts.MaxBatchSize = maxBatch;
 
+    // Fast-reject overlapping requests with HTTP 429 instead of serializing them on the
+    // single-user engine (issue #109). Set to 1 for a single-user server fronting an agentic
+    // client; unset keeps the legacy serialize-and-queue behaviour.
+    if (int.TryParse(Environment.GetEnvironmentVariable("SHARPI_MAX_CONCURRENT"), out int maxConcurrent) && maxConcurrent > 0)
+        opts.MaxConcurrentRequests = maxConcurrent;
+
     // Continuous-batching scheduling knobs (issue #183): prefill chunk size (Gap 1)
     // and KV admission budget in MiB (Gap 3). Same precedence as SHARPI_MAX_BATCH.
     if (int.TryParse(Environment.GetEnvironmentVariable("SHARPI_PREFILL_CHUNK"), out int prefillChunk) && prefillChunk >= 0)
