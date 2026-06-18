@@ -537,6 +537,11 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                     var tokens = _tokenizer.Encode(prompt).ToArray();
                     promptTokenCount = tokens.Length;
                     encodeMs = swReq.ElapsedMilliseconds;
+                    // Surface the prompt-token count out-of-band so endpoints can report
+                    // usage.prompt_tokens / input_tokens without re-tokenizing (issue #150).
+                    // Emitted before any text/thinking chunk; consumers that only read text
+                    // ignore the Usage kind.
+                    channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Usage, "", promptTokenCount));
                     var rng = new Random();
                     System.Collections.Immutable.ImmutableArray<int> stopIds =
                         sp.StopTokenIds is { } userStops ? [.. userStops] : _tokenizer.EogTokenIds;

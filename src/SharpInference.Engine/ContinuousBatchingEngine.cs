@@ -504,6 +504,10 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             }
 
             _committedTokens += projected;
+            // Surface the prompt-token count out-of-band so endpoints can report
+            // usage.prompt_tokens / input_tokens without re-tokenizing (issue #150).
+            // Emitted at admission, before any text/thinking chunk for this sequence.
+            req.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Usage, "", tokens.Length));
             prefilling.Add(new PrefillingSeq
             {
                 Req = req,

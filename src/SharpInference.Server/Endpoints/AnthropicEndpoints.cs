@@ -162,11 +162,17 @@ public static class AnthropicEndpoints
         var thinkingSb = new StringBuilder();
         var textSb = new StringBuilder();
         int totalOutputTokens = 0;
+        int promptTokens = 0;
 
         try
         {
             await foreach (var chunk in ImageContent.Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
             {
+                if (chunk.Kind == GenerateChunkKind.Usage)
+                {
+                    promptTokens = chunk.PromptTokens;
+                    continue;
+                }
                 totalOutputTokens++;
                 if (chunk.Kind == GenerateChunkKind.Thinking)
                     thinkingSb.Append(chunk.Text);
@@ -224,7 +230,7 @@ public static class AnthropicEndpoints
             msgId, "message", "assistant",
             contentList.ToArray(),
             modelId, stopReason,
-            new AUsage(0, totalOutputTokens));
+            new AUsage(promptTokens, totalOutputTokens));
 
         ctx.Response.ContentType = "application/json";
         await ctx.Response.WriteAsync(
@@ -257,6 +263,7 @@ public static class AnthropicEndpoints
         int nextBlockIndex = 0; // increments as blocks are opened
         var thinkingSb = new StringBuilder();
         int outputTokens = 0;
+        int promptTokens = 0;
         bool hasToolCalls = false;
 
         // Tool-call streaming state machine — adapter-driven so the open/close markers
@@ -404,6 +411,14 @@ public static class AnthropicEndpoints
         {
             await foreach (var chunk in ImageContent.Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
             {
+                // Out-of-band usage chunk (issue #150): not a generated token. Capture the
+                // prompt-token count for the terminal message_delta usage and skip the rest of
+                // the per-token handling.
+                if (chunk.Kind == GenerateChunkKind.Usage)
+                {
+                    promptTokens = chunk.PromptTokens;
+                    continue;
+                }
                 outputTokens++;
 
                 if (chunk.Kind == GenerateChunkKind.Thinking)
@@ -519,7 +534,7 @@ public static class AnthropicEndpoints
             ? "tool_use"
             : truncatedToolCall ? "max_tokens" : "end_turn";
         var msgDelta = new AMessageDeltaEvent("message_delta",
-            new AMessageDelta(stopReason, null), new AUsage(0, outputTokens));
+            new AMessageDelta(stopReason, null), new AUsage(promptTokens, outputTokens));
         await WriteAnthropicEvent(ctx.Response, "message_delta",
             JsonSerializer.Serialize(msgDelta, SharpInferenceJsonContext.Default.AMessageDeltaEvent));
 

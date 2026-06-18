@@ -333,6 +333,30 @@ public sealed class ToolCallAdapterTests
     }
 
     [Fact]
+    public void Gemma4_Parse_ScrubsTrailingToolResponseMarker()
+    {
+        // The model frequently emits the next-turn control token <|tool_response> immediately
+        // after a tool call. It is a special token, never assistant content (issue #150), so it
+        // must not survive in PlainText (which the endpoints surface as the message content).
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|><|tool_response>";
+        var (plain, calls) = a.Parse(raw);
+        Assert.Equal("", plain);
+        Assert.Single(calls);
+        Assert.Equal("get_weather", calls[0].Name);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_KeepsGenuinePreambleButScrubsResponseMarker()
+    {
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "Let me check.<|tool_call>call:a{k:1}<tool_call|><|tool_response>";
+        var (plain, calls) = a.Parse(raw);
+        Assert.Equal("Let me check.", plain);
+        Assert.Single(calls);
+    }
+
+    [Fact]
     public void Gemma4_FindMarkers_RoundTripsBlock()
     {
         var a = new Gemma4ToolCallAdapter();
