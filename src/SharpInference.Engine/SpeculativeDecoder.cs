@@ -3,17 +3,31 @@ using SharpInference.Core;
 namespace SharpInference.Engine;
 
 /// <summary>
-/// Speculative decoding (greedy): a small draft model proposes tokens which the target model
-/// verifies via a batched forward pass, accepting each where they agree and correcting at the
-/// first divergence.
+/// Speculative decoding: a small draft model proposes tokens which the target model verifies
+/// via a batched forward pass, accepting each where they agree and correcting at the first
+/// divergence.
 ///
-/// Each step packs the CERTAIN next token (argmax of the saved target logits) together with
-/// k−1 draft proposals into ONE batched target pass (the llama.cpp formulation): the batch
-/// yields both the verification logits and the next step's saved logits, so the target runs
-/// exactly one batched pass per step — no separate correction-commit forward. On memory-bound
-/// decode paths the batched pass costs ~1–2× a single forward (issue #194/#207 weight
-/// amortization), so the speedup is ≈ E[tokens/step] / (cost_batch/cost_forward + draft
-/// overhead), with E[tokens/step] = 1 + E[accepted of k−1] for per-token acceptance α.
+/// Each step packs the CERTAIN next token together with k−1 draft proposals into ONE batched
+/// target pass (the llama.cpp formulation): the batch yields both the verification logits and
+/// the next step's certain token, so the target runs exactly one batched pass per step — no
+/// separate correction-commit forward. On memory-bound decode paths the batched pass costs
+/// ~1–2× a single forward (issue #194/#207 weight amortization), so the speedup is
+/// ≈ E[tokens/step] / (cost_batch/cost_forward + draft overhead), with
+/// E[tokens/step] = 1 + E[accepted of k−1] for per-token acceptance α.
+///
+/// Two accept modes (issue #178):
+/// <list type="bullet">
+///   <item><b>Greedy</b> (temp ≤ 0, or the non-sampling ctor): the certain token is the argmax
+///         of the saved target logits and a draft token is accepted iff the target's argmax
+///         matches it. Byte-stable vs non-spec greedy.</item>
+///   <item><b>Sampled</b> (temp &gt; 0, the sampling ctor): distribution-preserving speculative
+///         sampling (Leviathan/Chen) — draft tokens are SAMPLED with proposal probability q,
+///         accepted with prob min(1, p/q) against the target distribution p, and a rejection
+///         resamples the correction from the residual max(0, p − q); a full accept samples a
+///         bonus from the last verify position. The emitted-token distribution is identical to
+///         direct target sampling. The opt-in <c>--spec-draft-p-min</c> (p ∈ (0,1)) selects a
+///         looser, distribution-diverging accept (parity with the MTP path's pMin rule).</item>
+/// </list>
 ///
 /// Both target and draft must share the same tokenizer (same vocab size).
 /// Note: does NOT take ownership of the forward pass instances.
@@ -26,13 +40,29 @@ public sealed class SpeculativeDecoder
     private readonly bool _batchVerify;
     private int _lookahead;
 
+    // Sampled-accept mode (issue #178). _sampling is non-null only for temp > 0 + a draft
+    // model; otherwise the greedy path runs (byte-stable). _trueSpecSampling selects the
+    // distribution-preserving rule (default) vs the looser --spec-draft-p-min accept.
+    private readonly SamplingParams? _sampling;
+    private readonly Random? _rng;
+    private readonly bool _trueSpecSampling;
+
     // Generation state. Invariant at step boundaries: both caches hold exactly _nextPos
-    // positions and _savedTargetLogits are the target's logits after the token at
-    // _nextPos−1 (so argmax(_savedTargetLogits) is the next emitted token, by greedy
-    // construction). The draft's own last logits are not part of the state — each step's
-    // first proposal requires forwarding the certain token through the draft anyway.
+    // positions. In GREEDY mode _savedTargetLogits are the target's logits after the token at
+    // _nextPos−1 (so argmax(_savedTargetLogits) is the next emitted token). In SAMPLED mode the
+    // next certain token was already drawn last step (the deferred correction/bonus) and is held
+    // in _savedSampledToken — re-sampling from logits would consume an extra RNG draw and break
+    // determinism. The draft's own last logits are not part of the state — each step's first
+    // proposal requires forwarding the certain token through the draft anyway.
     private int _nextPos;
     private float[] _savedTargetLogits;
+    private int _savedSampledToken;                 // sampled mode: next step's certain token
+
+    // Sampled-mode scratch (lazily sized to vocab; _draftDists to the step's k). _pDist holds the
+    // target's filtered distribution at the verify position; _draftDists[i] retains the draft's
+    // full proposal distribution for token i so a rejection can resample from the residual.
+    private float[]? _pDist;
+    private float[][]? _draftDists;
 
     // Acceptance statistics
     private long _totalAccepted;
@@ -97,6 +127,32 @@ public sealed class SpeculativeDecoder
         _savedTargetLogits = new float[target.VocabSize];
     }
 
+    /// <summary>
+    /// Sampled speculative decoding (issue #178): like the model-draft ctor, but verification
+    /// uses distribution-preserving speculative sampling when <paramref name="sampling"/> has
+    /// Temperature &gt; 0. The SAME <paramref name="sampling"/> params drive the draft proposals
+    /// and the target accept test (so the min(1, p/q) ratio is well-defined), and the SAME
+    /// <paramref name="rng"/> instance must be threaded from the caller for determinism. With
+    /// Temperature ≤ 0 this is exactly the greedy ctor (byte-stable). <c>--spec-draft-p-min</c>
+    /// in (0,1) opts into the looser, distribution-diverging accept.
+    /// </summary>
+    public SpeculativeDecoder(IForwardPass target, IForwardPass draft, SamplingParams sampling, Random rng, int lookahead = 4)
+        : this(target, draft, lookahead)
+    {
+        ArgumentNullException.ThrowIfNull(sampling);
+        ArgumentNullException.ThrowIfNull(rng);
+        if (sampling.Temperature > 0f)
+        {
+            _sampling = sampling;
+            _rng = rng;
+            // Default = true distribution-preserving sampling. SpecDraftPMin ∈ (0,1) → looser,
+            // distribution-diverging accept (same threshold SHAPE as MtpDecoder's pMin rule, but
+            // tested against the FILTERED target prob here — see StepSampled). 1.0 (default) / ≤0
+            // → strict spec sampling.
+            _trueSpecSampling = !(sampling.SpecDraftPMin > 0f && sampling.SpecDraftPMin < 1f);
+        }
+    }
+
     /// <summary>Adaptive lookahead: increase/decrease based on recent acceptance rate.</summary>
     public int Lookahead
     {
@@ -135,6 +191,13 @@ public sealed class SpeculativeDecoder
         DraftMs = 0;
         VerifyMs = 0;
         CommitMs = 0;
+        if (_sampling is not null)
+        {
+            // Draw the first certain token from the prefill tail's target distribution; every
+            // later step inherits its certain token as the prior step's correction/bonus.
+            EnsureSampledScratch(_lookahead);
+            _savedSampledToken = Sampler.SampleWithDistribution(_savedTargetLogits, _sampling, _pDist!, _rng!);
+        }
     }
 
     /// <summary>
@@ -166,7 +229,7 @@ public sealed class SpeculativeDecoder
         {
             int remaining = maxTokens - generated;
             int k = Math.Min(_lookahead, remaining);
-            int[] emitted = Step(k);
+            int[] emitted = _sampling is null ? Step(k) : StepSampled(k);
 
             foreach (int token in emitted)
             {
@@ -275,6 +338,127 @@ public sealed class SpeculativeDecoder
         var emitted = new int[accepted + 1];
         for (int i = 0; i <= accepted; i++) emitted[i] = tokens[i];
         return emitted;
+    }
+
+    /// <summary>
+    /// One sampled speculative step (issue #178). Same folded structure as <see cref="Step"/>,
+    /// but the certain token is SAMPLED (drawn last step as the deferred correction/bonus), draft
+    /// proposals are sampled with proposal probability q, and acceptance is the distribution-
+    /// preserving rule: accept draft token i with prob min(1, p_i/q_i); on first rejection draw
+    /// the correction from the residual max(0, p_i − q_i); on full accept draw a bonus from the
+    /// last verify position. The correction/bonus is deferred to the next step's certain token
+    /// (so the target runs exactly one batched pass per step, like greedy). Returns the emitted
+    /// token array (the certain token + accepted proposals).
+    /// </summary>
+    private int[] StepSampled(int k)
+    {
+        int P = _nextPos;
+        var sampling = _sampling!;
+        var rng = _rng!;
+        EnsureSampledScratch(k);
+        var pDist = _pDist!;
+        var draftDists = _draftDists!;
+
+        // tokens[0] is CERTAIN — it was sampled last step (the deferred correction/bonus), so it
+        // is NOT re-drawn here (re-sampling would consume an extra RNG draw and break determinism).
+        var tokens = new int[k];
+        tokens[0] = _savedSampledToken;
+
+        // ── Draft phase ──────────────────────────────────────────────────────────
+        // Each proposal is SAMPLED from the draft's filtered distribution; the full distribution
+        // is retained in draftDists[i] so a rejection at i can resample from the residual.
+        _phaseSw.Restart();
+        for (int i = 1; i < k; i++)
+        {
+            var draftLogits = _draft!.Forward(tokens[i - 1], P + i - 1);
+            tokens[i] = Sampler.SampleWithDistribution(draftLogits, sampling, draftDists[i], rng);
+        }
+        DraftMs += _phaseSw.Elapsed.TotalMilliseconds;
+
+        // ── Target batch-verify ──────────────────────────────────────────────────
+        // batch[i] = target logits AFTER tokens[i]; target cache advances to P + k.
+        _phaseSw.Restart();
+        float[][] batch = BatchVerifyTarget(tokens, P);
+        VerifyMs += _phaseSw.Elapsed.TotalMilliseconds;
+
+        // ── Speculative-sampling accept / reject ──────────────────────────────────
+        int accepted = 0;
+        int correction = -1;   // residual/bonus token, deferred to next step's tokens[0]
+        for (int i = 1; i < k; i++)
+        {
+            // p_i = target distribution after tokens[i-1] (predicts the slot tokens[i] sits in).
+            Sampler.BuildFilteredDistribution(batch[i - 1], sampling, pDist);
+            float px = pDist[tokens[i]];
+            bool accept;
+            if (_trueSpecSampling)
+            {
+                float qx = draftDists[i][tokens[i]];
+                float a = qx > 0f ? MathF.Min(1f, px / qx) : (px > 0f ? 1f : 0f);
+                accept = rng.NextDouble() < a;
+            }
+            else
+            {
+                // Looser opt-in (--spec-draft-p-min): accept iff the target's prob of the draft
+                // token ≥ pMin OR the draft token is the target's own argmax. Diverges from the
+                // target distribution. Same threshold shape as MtpDecoder.AcceptDraft, but px is
+                // the FILTERED target prob (temp/top-k/top-p/min-p applied) — consistent with the
+                // p used by the strict path — whereas MtpDecoder thresholds a raw temp-1 softmax,
+                // so a given pMin is not numerically identical across the two paths.
+                accept = px >= sampling.SpecDraftPMin || tokens[i] == Sampler.Greedy(batch[i - 1]);
+            }
+            if (accept) { accepted++; continue; }
+
+            // Reject at i: correction from the residual at this position (true sampling) or a
+            // fresh target sample (looser pMin mode — already off-distribution).
+            correction = _trueSpecSampling
+                ? Sampler.ResampleResidual(pDist, draftDists[i], rng)
+                : Sampler.SampleWithDistribution(batch[i - 1], sampling, pDist, rng);
+            break;
+        }
+        if (correction < 0)
+        {
+            // All k−1 drafts accepted: bonus token sampled from the final verify position.
+            correction = Sampler.SampleWithDistribution(batch[k - 1], sampling, pDist, rng);
+        }
+
+        _totalAccepted += accepted;
+        _totalEmitted += accepted + 1;
+
+        // ── Roll caches back; defer the correction/bonus to next step ─────────────
+        _phaseSw.Restart();
+        int newPos = P + 1 + accepted;
+        _target.TruncateTo(newPos);
+        if (accepted == k - 1)
+            // Full accept: the draft never forwarded tokens[k-1] (its cache is at P+k-1). Sync it
+            // so the next chain starts at newPos. (Identical to Step's full-accept branch.)
+            _draft!.Forward(tokens[^1], P + k - 1);
+        else
+            _draft!.TruncateTo(newPos);
+        CommitMs += _phaseSw.Elapsed.TotalMilliseconds;
+
+        // ── Update state ──────────────────────────────────────────────────────────
+        _nextPos = newPos;
+        _savedSampledToken = correction;   // emitted next step as its certain token
+
+        // Emit tokens[0..accepted]; the correction/bonus rides into the next step (folded form).
+        var emitted = new int[accepted + 1];
+        for (int i = 0; i <= accepted; i++) emitted[i] = tokens[i];
+        return emitted;
+    }
+
+    /// <summary>Lazily (re)allocate the sampled-mode scratch: the target distribution buffer and
+    /// per-draft-position distribution buffers, each vocab-sized, growing _draftDists to k.</summary>
+    private void EnsureSampledScratch(int k)
+    {
+        int v = _target.VocabSize;
+        _pDist ??= new float[v];
+        if (_draftDists is null || _draftDists.Length < k)
+        {
+            var old = _draftDists;
+            _draftDists = new float[k][];
+            for (int i = 0; i < k; i++)
+                _draftDists[i] = old is not null && i < old.Length ? old[i] : new float[v];
+        }
     }
 
     /// <summary>

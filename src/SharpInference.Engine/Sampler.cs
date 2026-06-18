@@ -100,6 +100,85 @@ public static class Sampler
     }
 
     /// <summary>
+    /// Build the full-vocabulary, post-filter sampling distribution for <paramref name="logits"/>
+    /// under <paramref name="p"/> into <paramref name="probs"/> (length must equal
+    /// <c>logits.Length</c>; entries outside the kept support are 0 and the kept entries sum to 1).
+    /// Applies the SAME pipeline as <see cref="Sample"/>'s slow path — logit bias, repetition
+    /// penalty, temperature, softmax, top-k (+ renormalise), min-p, top-p, normalise — so a token
+    /// drawn from this distribution is distributed identically to <see cref="Sample"/>.
+    ///
+    /// Used by distribution-preserving speculative sampling (issue #178), which needs the draft
+    /// proposal probability q(x) and the residual max(0, p − q) over a SHARED support: the draft
+    /// and target distributions MUST be built with the same <paramref name="p"/> for the
+    /// min(1, p/q) accept ratio to be meaningful. On Temperature ≤ 0 writes a one-hot at the
+    /// greedy argmax.
+    /// </summary>
+    public static void BuildFilteredDistribution(ReadOnlySpan<float> logits, SamplingParams p, Span<float> probs)
+    {
+        int vocabSize = logits.Length;
+        if (probs.Length != vocabSize)
+            throw new ArgumentException(
+                $"probs length ({probs.Length}) must equal logits length ({vocabSize}).", nameof(probs));
+
+        if (p.Temperature <= 0f)
+        {
+            probs.Clear();
+            probs[Greedy(logits)] = 1f;
+            return;
+        }
+
+        logits.CopyTo(probs);
+
+        // Logit bias (additive, before temperature) — mirrors Sample's slow path.
+        if (p.LogitBias is { Count: > 0 })
+            foreach (var (id, bias) in p.LogitBias)
+                if ((uint)id < (uint)vocabSize)
+                    probs[id] += bias;
+
+        // Repetition penalty (in logit space, before temperature).
+        if (p.RepetitionPenalty != 1.0f && p.PreviousTokens is { Count: > 0 })
+            foreach (int id in p.PreviousTokens)
+                if ((uint)id < (uint)vocabSize)
+                    probs[id] = probs[id] > 0f ? probs[id] / p.RepetitionPenalty : probs[id] * p.RepetitionPenalty;
+
+        if (p.Temperature != 1.0f)
+        {
+            float invTemp = 1.0f / p.Temperature;
+            for (int i = 0; i < vocabSize; i++)
+                probs[i] *= invTemp;
+        }
+
+        Softmax(probs);
+
+        if (p.TopK > 0 && p.TopK < vocabSize)
+        {
+            ApplyTopK(probs, p.TopK);
+            Normalize(probs);
+        }
+        if (p.MinP > 0f)
+            ApplyMinP(probs, p.MinP);
+        if (p.TopP < 1.0f && p.TopP > 0f)
+            ApplyTopP(probs, p.TopP);
+        Normalize(probs);
+    }
+
+    /// <summary>
+    /// Sample like <see cref="Sample"/> but also materialise the full post-filter distribution
+    /// into <paramref name="probs"/> (see <see cref="BuildFilteredDistribution"/>) and return the
+    /// drawn token, so <c>probs[token]</c> is its proposal probability q(token). On Temperature ≤ 0
+    /// returns the greedy argmax. Distribution-preserving speculative sampling (issue #178) uses
+    /// this to propose draft tokens while retaining q for the accept/residual test.
+    /// </summary>
+    public static int SampleWithDistribution(ReadOnlySpan<float> logits, SamplingParams p, Span<float> probs, Random? rng = null)
+    {
+        BuildFilteredDistribution(logits, p, probs);
+        if (p.Temperature <= 0f)
+            return Greedy(logits);
+        rng ??= Random.Shared;
+        return SampleFromDistribution(probs, rng);
+    }
+
+    /// <summary>
     /// Top-k-first sampling fast path (no logit bias). Selects the top-k logits in one
     /// O(vocab) pass, then applies temperature, softmax, min-p, and top-p over only those
     /// k candidates — avoiding the full-vocabulary softmax, sort, and allocation of the
@@ -365,6 +444,48 @@ public static class Sampler
         }
         // Fallback: return last non-zero token (rounding errors)
         return probs.Length - 1;
+    }
+
+    /// <summary>
+    /// Sample a token proportional to the residual max(0, p[x] − q[x]) of two full-vocabulary
+    /// distributions built with the SAME <see cref="SamplingParams"/> (see
+    /// <see cref="BuildFilteredDistribution"/>). This is the rejection correction of speculative
+    /// sampling (Leviathan et al. / Chen et al.): drawing the corrected token from the residual
+    /// after a draft proposal is rejected makes the overall emitted-token distribution identical
+    /// to sampling directly from <paramref name="p"/>. If the residual mass is ≈0 (numerical /
+    /// q already dominated p on the kept support), falls back to sampling from <paramref name="p"/>.
+    /// </summary>
+    public static int ResampleResidual(ReadOnlySpan<float> p, ReadOnlySpan<float> q, Random rng)
+    {
+        ArgumentNullException.ThrowIfNull(rng);
+        if (p.Length != q.Length)
+            throw new ArgumentException(
+                $"p and q must have equal length ({p.Length} vs {q.Length}).", nameof(q));
+
+        float sum = 0f;
+        for (int i = 0; i < p.Length; i++)
+        {
+            float r = p[i] - q[i];
+            if (r > 0f) sum += r;
+        }
+        if (sum <= 0f || float.IsNaN(sum))
+            return SampleFromDistribution(p, rng); // degenerate: empty residual → fall back to p
+
+        float target = (float)rng.NextDouble() * sum;
+        float cum = 0f;
+        for (int i = 0; i < p.Length; i++)
+        {
+            float r = p[i] - q[i];
+            if (r > 0f)
+            {
+                cum += r;
+                if (target <= cum) return i;
+            }
+        }
+        // Rounding fallback: last token with positive residual.
+        for (int i = p.Length - 1; i >= 0; i--)
+            if (p[i] - q[i] > 0f) return i;
+        return SampleFromDistribution(p, rng);
     }
 
     /// <summary>
