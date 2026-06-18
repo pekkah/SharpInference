@@ -78,6 +78,7 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
 
     // Optional attention biases (Qwen models)
     private readonly bool _hasAttnBias;
+    private readonly bool _hasAttnOutputBias;
     private readonly float*[] _bq, _bk, _bv, _bo;
 
     // Optional per-head Q/K RMSNorm (Qwen3-style shared weights of size headDim,
@@ -292,6 +293,7 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
         _wGate = new TensorRef[L]; _wUp = new TensorRef[L]; _wDown = new TensorRef[L];
 
         _hasAttnBias = hp.HasAttnBias;
+        _hasAttnOutputBias = hp.HasAttnOutputBias;
         _bq = new float*[L]; _bk = new float*[L];
         _bv = new float*[L]; _bo = new float*[L];
 
@@ -372,7 +374,9 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
                     _bk[i] = LoadBias($"blk.{i}.attn_k.bias", _numKvHeads * layerHd);
                     _bv[i] = LoadBias($"blk.{i}.attn_v.bias", _numKvHeads * layerHd);
                 }
-                _bo[i] = LoadBias($"blk.{i}.attn_output.bias", _embDim);
+                // Output-projection bias is optional (Qwen2 omits it; left null when absent).
+                if (_hasAttnOutputBias)
+                    _bo[i] = LoadBias($"blk.{i}.attn_output.bias", _embDim);
             }
 
             if (_hasQkNorm && !hp.UseL2QkNorm)
@@ -860,7 +864,7 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
                     MatMulBatchedCached(batchNorm, in _wo[layer], batchAttnOut, N, _embDim, qDim);
 
                     // Apply output projection bias (Qwen models)
-                    if (_hasAttnBias)
+                    if (_hasAttnOutputBias)
                     {
                         for (int n = 0; n < N; n++)
                             SimdKernels.AddInPlace(batchNorm + (long)n * _embDim, _bo[layer], _embDim);
@@ -1076,7 +1080,7 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
                     SimdKernels.MatMulBatched(batchNorm, _wo[layer].DataPtr, batchAttnOut,
                         N, _embDim, qDim, _wo[layer].DType);
 
-                    if (_hasAttnBias)
+                    if (_hasAttnOutputBias)
                     {
                         for (int n = 0; n < N; n++)
                             SimdKernels.AddInPlace(batchNorm + (long)n * _embDim, _bo[layer], _embDim);
@@ -1308,7 +1312,7 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
                     SimdKernels.MatMulBatched(batchNorm, _wo[layer].DataPtr, batchAttnOut,
                         N, _embDim, qDim, _wo[layer].DType);
 
-                    if (_hasAttnBias)
+                    if (_hasAttnOutputBias)
                     {
                         for (int n = 0; n < N; n++)
                             SimdKernels.AddInPlace(batchNorm + (long)n * _embDim, _bo[layer], _embDim);
@@ -1594,7 +1598,7 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
 
             // Output projection (input width is per-layer qDim).
             FusedMatVec(_hidden, _wo[layer], _attnOut, _embDim, qDimL);
-            if (_hasAttnBias)
+            if (_hasAttnOutputBias)
                 SimdKernels.AddInPlace(_hidden, _bo[layer], _embDim);
 
             // Gemma 4: post-attention RmsNorm BEFORE the residual add.
@@ -2402,7 +2406,7 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
                 new ReadOnlySpan<float>(_v, _numKvHeads * _headDim));
             Attention(cache, layer, pos);
             FusedMatVec(_hidden, _wo[layer], _attnOut, _embDim, _numHeads * _headDim);
-            if (_hasAttnBias)
+            if (_hasAttnOutputBias)
                 SimdKernels.AddInPlace(_hidden, _bo[layer], _embDim);
             SimdKernels.AddInPlace(_hidden, _residual, _embDim);
             Copy(_residual, _hidden, _embDim);
@@ -2548,7 +2552,7 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
                     }
                     SimdKernels.MatMulBatched(batchNorm, _wo[layer].DataPtr, batchAttnOut,
                         N, _embDim, qDim, _wo[layer].DType);
-                    if (_hasAttnBias)
+                    if (_hasAttnOutputBias)
                     {
                         for (int n = 0; n < N; n++)
                             SimdKernels.AddInPlace(batchNorm + (long)n * _embDim, _bo[layer], _embDim);
@@ -2754,7 +2758,7 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
                     }
 
                     MatMulBatchedCached(batchNorm, in _wo[layer], batchAttnOut, N, _embDim, qDim);
-                    if (_hasAttnBias)
+                    if (_hasAttnOutputBias)
                     {
                         for (int n = 0; n < N; n++)
                             SimdKernels.AddInPlace(batchNorm + (long)n * _embDim, _bo[layer], _embDim);

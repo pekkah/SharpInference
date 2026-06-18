@@ -53,6 +53,8 @@ public sealed unsafe class GpuForwardPass : IForwardPass
 
     // Optional attention biases in VRAM (Qwen models)
     private readonly bool _hasAttnBias;
+    // Qwen2 has Q/K/V bias but no output-projection bias — probed separately.
+    private readonly bool _hasAttnOutputBias;
     private readonly Tensor[]? _bq, _bk, _bv, _bo;
 
     // Optional per-head Q/K RMSNorm weights in VRAM (Qwen3)
@@ -306,6 +308,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         _wDownShexp = _isMoE && _hasSharedExpert ? new Tensor[L] : null;
 
         _hasAttnBias = hp.HasAttnBias;
+        _hasAttnOutputBias = hp.HasAttnOutputBias;
         if (_hasAttnBias)
         {
             _bq = new Tensor[L]; _bk = new Tensor[L];
@@ -352,7 +355,8 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                 _bq![i] = UploadWeight($"blk.{i}.attn_q.bias");
                 _bk![i] = UploadWeight($"blk.{i}.attn_k.bias");
                 _bv![i] = UploadWeight($"blk.{i}.attn_v.bias");
-                _bo![i] = UploadWeight($"blk.{i}.attn_output.bias");
+                if (_hasAttnOutputBias)
+                    _bo![i] = UploadWeight($"blk.{i}.attn_output.bias");
             }
 
             if (_hasQkNorm && !_hp.UseL2QkNorm)
@@ -723,7 +727,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             _gpu.RecordBarrier(); // attnOut done → output projection
 
             GpuMatMul(_hidden, _wo[layer], _attnOut);
-            if (_hasAttnBias)
+            if (_hasAttnOutputBias)
             {
                 _gpu.RecordBarrier();
                 _gpu.AddInPlace(_hidden, _bo![layer]);
@@ -1177,7 +1181,8 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             if (_hasAttnBias)
             {
                 _gpu.Free(_bq![i]); _gpu.Free(_bk![i]);
-                _gpu.Free(_bv![i]); _gpu.Free(_bo![i]);
+                _gpu.Free(_bv![i]);
+                if (_hasAttnOutputBias) _gpu.Free(_bo![i]);
             }
 
             if (_hasQkNorm && !_hp.UseL2QkNorm)

@@ -80,6 +80,8 @@ public sealed unsafe class HybridForwardPass : IForwardPass
     private readonly float[] _logitsBuf;
     private readonly float[]? _gpuRouterBuf;
     private readonly bool _hasAttnBias, _hasQkNorm, _isMoE, _hasSharedExpert;
+    // Qwen2 has Q/K/V bias but no output-projection bias — probed separately.
+    private readonly bool _hasAttnOutputBias;
     private readonly bool _tqEnabled;
     private readonly int _tqFp32Window;
     private readonly int _tqBlockBytes;
@@ -183,6 +185,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         _intermDim = hp.IntermediateDim;
         _expertDim = hp.IsMoE ? hp.ExpertIntermediateDim : hp.IntermediateDim;
         _hasAttnBias = hp.HasAttnBias;
+        _hasAttnOutputBias = hp.HasAttnOutputBias;
         _hasQkNorm = hp.HasQkNorm;
         _isMoE = hp.IsMoE;
         _hasSharedExpert = hp.HasSharedExpert;
@@ -328,7 +331,8 @@ public sealed unsafe class HybridForwardPass : IForwardPass
                 _gpuBq![i] = UploadWeight($"blk.{i}.attn_q.bias");
                 _gpuBk![i] = UploadWeight($"blk.{i}.attn_k.bias");
                 _gpuBv![i] = UploadWeight($"blk.{i}.attn_v.bias");
-                _gpuBo![i] = UploadWeight($"blk.{i}.attn_output.bias");
+                if (_hasAttnOutputBias)
+                    _gpuBo![i] = UploadWeight($"blk.{i}.attn_output.bias");
             }
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
@@ -448,7 +452,8 @@ public sealed unsafe class HybridForwardPass : IForwardPass
                 _cpuBq[ci] = LoadCpuBias($"blk.{li}.attn_q.bias", _numHeads * _headDim);
                 _cpuBk[ci] = LoadCpuBias($"blk.{li}.attn_k.bias", _numKvHeads * _headDim);
                 _cpuBv[ci] = LoadCpuBias($"blk.{li}.attn_v.bias", _numKvHeads * _headDim);
-                _cpuBo[ci] = LoadCpuBias($"blk.{li}.attn_output.bias", _embDim);
+                if (_hasAttnOutputBias)
+                    _cpuBo[ci] = LoadCpuBias($"blk.{li}.attn_output.bias", _embDim);
             }
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
@@ -728,7 +733,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         _gpu.RecordBarrier();
 
         GpuMatMul(_gpuHidden, _gpuWo[i], _gpuAttnOut);
-        if (_hasAttnBias)
+        if (_hasAttnOutputBias)
         {
             _gpu.RecordBarrier();
             _gpu.AddInPlace(_gpuHidden, _gpuBo![i]);
@@ -844,7 +849,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
 
         // Output projection
         SimdKernels.MatVec(_cpuHidden, _cpuWo[ci].DataPtr, _cpuAttnOut, _embDim, _numHeads * _headDim, _cpuWo[ci].DType);
-        if (_hasAttnBias)
+        if (_hasAttnOutputBias)
             SimdKernels.AddInPlace(_cpuHidden, _cpuBo[ci], _embDim);
 
         // Residual
@@ -1720,7 +1725,10 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             }
 
             if (_hasAttnBias)
-            { _gpu.Free(_gpuBq![i]); _gpu.Free(_gpuBk![i]); _gpu.Free(_gpuBv![i]); _gpu.Free(_gpuBo![i]); }
+            {
+                _gpu.Free(_gpuBq![i]); _gpu.Free(_gpuBk![i]); _gpu.Free(_gpuBv![i]);
+                if (_hasAttnOutputBias) _gpu.Free(_gpuBo![i]);
+            }
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             { _gpu.Free(_gpuQNorm![i]); _gpu.Free(_gpuKNorm![i]); }
         }

@@ -95,6 +95,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
 
     // Optional attention biases
     private readonly bool _hasAttnBias;
+    // Qwen2 has Q/K/V bias but no output-projection bias — probed separately.
+    private readonly bool _hasAttnOutputBias;
     private readonly Tensor[]? _bq, _bk, _bv, _bo;
 
     // Optional per-head QK norm (Qwen3)
@@ -1055,6 +1057,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         }
 
         _hasAttnBias = hp.HasAttnBias;
+        _hasAttnOutputBias = hp.HasAttnOutputBias;
         if (_hasAttnBias)
         {
             _bq = new Tensor[L]; _bk = new Tensor[L];
@@ -1129,7 +1132,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                     _bk![i] = UploadWeight($"blk.{i}.attn_k.bias");
                     _bv![i] = UploadWeight($"blk.{i}.attn_v.bias");
                 }
-                _bo![i] = UploadWeight($"blk.{i}.attn_output.bias");
+                if (_hasAttnOutputBias)
+                    _bo![i] = UploadWeight($"blk.{i}.attn_output.bias");
             }
 
             if (_hasQkNorm && !_hp.UseL2QkNorm)
@@ -1636,7 +1640,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
             }
 
             GpuMatMul(_hidden, _wo[layer], _attnOut);
-            if (_hasAttnBias)
+            if (_hasAttnOutputBias)
                 _gpu.AddInPlace(_hidden, _bo![layer]);
 
             _gpu.AddInPlace(_hidden, _residual);
@@ -2233,7 +2237,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
             AccPhase(PH_KV_ATTN, sw, ref t0);
 
             GpuMatMul(_hidden, _wo[layer], _attnOut);
-            if (_hasAttnBias) _gpu.AddInPlace(_hidden, _bo![layer]);
+            if (_hasAttnOutputBias) _gpu.AddInPlace(_hidden, _bo![layer]);
             _gpu.AddInPlace(_hidden, _residual);
             _gpu.Synchronize();
             AccPhase(PH_O_RES, sw, ref t0);
@@ -4284,7 +4288,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                 // views created inline here (rare branch) to keep the common no-bias decode
                 // path free of unused per-row views.
                 BatchDecodeMatMul(_bpHidden!, _wo[layer], _bpAttnOut!, N, allowDecodeMmq);
-                if (_hasAttnBias)
+                if (_hasAttnOutputBias)
                 {
                     if (ragged)
                         _gpu.AddBiasBatched(_bpHidden!, _bo![layer], embDim, N);
@@ -5443,7 +5447,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                 {
                     _gpu.Free(_bk![i]); _gpu.Free(_bv![i]);
                 }
-                _gpu.Free(_bo![i]);
+                if (_hasAttnOutputBias)
+                    _gpu.Free(_bo![i]);
             }
 
             if (_hasQkNorm && !_hp.UseL2QkNorm)

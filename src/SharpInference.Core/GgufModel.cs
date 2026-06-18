@@ -126,6 +126,12 @@ public sealed unsafe class GgufModel : IDisposable
             foreach (var t in allTensors)
             {
                 if (t.Name == "blk.0.attn_q.bias")     metadata["_sharpi.has_attn_bias"] = true;
+                // Qwen2 carries bias on Q/K/V but NOT on the output projection; Qwen-1 and
+                // some others carry it on the output too. Probe attn_output.bias separately so
+                // the output bias is loaded only when it actually exists (llama.cpp treats `bo`
+                // as optional). Without this, a Qwen2 GGUF fails to load: HasAttnBias is set
+                // from attn_q.bias but the loaders then demand a non-existent attn_output.bias.
+                else if (t.Name == "blk.0.attn_output.bias") metadata["_sharpi.has_attn_output_bias"] = true;
                 else if (t.Name == "blk.0.attn_q_norm.weight") metadata["_sharpi.has_qk_norm"] = true;
                 else if (t.Name == "per_layer_token_embd.weight") metadata["_sharpi.has_ple"] = true;
                 else if (t.Name == "blk.0.post_attention_norm.weight") metadata["_sharpi.has_post_attn_norm"] = true;
