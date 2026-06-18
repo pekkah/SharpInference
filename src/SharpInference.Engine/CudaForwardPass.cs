@@ -4599,16 +4599,22 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     // ── Speculative-decode batched verify (issue #207) ──────────────────────────────────
 
     /// <summary>
-    /// Whether <see cref="BatchVerify"/> can run: the dense batched-decode configuration
-    /// (<see cref="DenseBatchedDecodeSupported"/> — non-MoE, non-Gemma-4, no TurboQuant, no
-    /// final-logit softcap, GEMM-N-batchable weights) with an uncompacted cache. Unlike
-    /// <see cref="SupportsContinuousBatching"/>, a CONFIGURED SnapKV budget does not disable
-    /// verify — only an actual prefill-time eviction does (then physical slot != logical
+    /// Whether <see cref="BatchVerify"/> can run: a batched-decode-capable configuration with an
+    /// uncompacted cache — either the dense path (<see cref="DenseBatchedDecodeSupported"/> —
+    /// non-MoE, non-Gemma-4, no final-logit softcap) OR the Gemma-4 path
+    /// (<see cref="Gemma4BatchedDecodeSupported"/> — per-layer head_dim, SWA rings, shared-KV,
+    /// k_eq_v, PLE, sandwich norms, and the final softcap the Gemma-4 finisher applies; issue
+    /// #178 GPU draft speculation). Both exclude TurboQuant and require GEMM-N-batchable weights.
+    /// Unlike <see cref="SupportsContinuousBatching"/>, a CONFIGURED SnapKV budget does not
+    /// disable verify — only an actual prefill-time eviction does (then physical slot != logical
     /// position and the batched kernels would mis-index). Dynamic: flips false after such a
     /// prefill, so the speculative decoder (which re-checks per step) degrades to sequential
-    /// verify — the same once-evicted gating the GDN passes use (#130).
+    /// verify — the same once-evicted gating the GDN passes use (#130). (For Gemma-4 the SnapKV
+    /// budget is structurally off — the constructor forces it — so <c>_kvEvictedCount</c> is
+    /// always 0 there and the guard is a no-op.)
     /// </summary>
-    public bool SupportsBatchVerify => _kvEvictedCount == 0 && DenseBatchedDecodeSupported();
+    public bool SupportsBatchVerify =>
+        _kvEvictedCount == 0 && (DenseBatchedDecodeSupported() || Gemma4BatchedDecodeSupported());
 
     /// <summary>
     /// Batched k-token verify for single-user speculative decoding (issue #207): one packed
@@ -4629,15 +4635,23 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     /// the cache; the caller rewinds rejected tokens via <see cref="TruncateTo"/>. Issues
     /// direct launches only — the per-token decode CUDA graph (owned-cache pointers) stays
     /// valid for the surrounding Forward steps.
+    /// <para>Gemma-4 (issue #178): <see cref="RunBatchedTrunk"/> dispatches the same packed pass
+    /// to <see cref="RunBatchedTrunkGemma4"/>, whose per-sequence attention loop appends each
+    /// row's K/V into the shared owned cache then attends in ascending row order — the same
+    /// append-then-attend causality. The k contiguous positions write distinct SWA ring slots
+    /// (k ≪ window), shared-KV layers read the source layer's already-filled cache, and the
+    /// finisher applies the Gemma-4 softcap; so the returned logits are the model's softcapped
+    /// logits, consistent with the single-token Gemma-4 <see cref="Forward"/> the k==1 shortcut
+    /// uses.</para>
     /// </summary>
     public float[][] BatchVerify(int[] tokens, int startPos)
     {
         ArgumentNullException.ThrowIfNull(tokens);
         if (!SupportsBatchVerify)
             throw new NotSupportedException(
-                "BatchVerify requires the dense batching-capable configuration (no MoE / " +
-                "Gemma-4 / TurboQuant / SnapKV / softcap, GEMM-N-batchable weights) and an " +
-                "uncompacted cache. Check SupportsBatchVerify before calling.");
+                "BatchVerify requires a batched-decode-capable configuration (dense or Gemma-4, " +
+                "no MoE / TurboQuant, GEMM-N-batchable weights) with an uncompacted cache. " +
+                "Check SupportsBatchVerify before calling.");
         int k = tokens.Length;
         if (k == 0) return Array.Empty<float[]>();
         if (startPos < 0 || startPos + k > _maxSeqLen)

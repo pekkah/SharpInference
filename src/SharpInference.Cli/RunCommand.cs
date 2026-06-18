@@ -757,18 +757,34 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         if (settings.DraftModelPath is not null || settings.DraftLookup)
         {
             bool cudaSpecTarget = gpuFwd is CudaForwardPass { SupportsBatchVerify: true };
+            // Sampled speculative decoding (issue #178): temp>0 now drives distribution-preserving
+            // spec sampling on the model-draft path (greedy at temp 0 stays byte-stable). Gated to
+            // model drafts (lookup proposals expose no q), to non-penalized/-biased sampling (draft
+            // and target must agree on the distribution), and bypassable via SHARPI_SPEC_SAMPLE=0.
+            bool sampledSpec = settings.Temperature > 0f;
+            bool specSampleDisabled = Environment.GetEnvironmentVariable("SHARPI_SPEC_SAMPLE") == "0";
+            bool hasPenalty = sp.RepetitionPenalty != 1f && sp.PreviousTokens is { Count: > 0 };
+            bool hasBias = sp.LogitBias is { Count: > 0 };
             if (settings.DraftModelPath is not null && settings.DraftLookup)
             {
                 AnsiConsole.MarkupLine("[red]Error:[/] --draft-model and --draft-lookup are mutually exclusive.");
                 return 1;
             }
-            if (settings.Temperature > 0f)
+            if (nGpuLayers != 0 && !cudaSpecTarget)
             {
-                AnsiConsole.MarkupLine("[yellow]Warning:[/] Speculative decoding requires greedy sampling (--temp 0). Falling back to normal generation.");
+                AnsiConsole.MarkupLine("[yellow]Warning:[/] Speculative decoding requires pure CPU (-g 0) or full CUDA offload of a dense or Gemma-4 model. Falling back to normal generation.");
             }
-            else if (nGpuLayers != 0 && !cudaSpecTarget)
+            else if (sampledSpec && settings.DraftLookup)
             {
-                AnsiConsole.MarkupLine("[yellow]Warning:[/] Speculative decoding requires pure CPU (-g 0) or full CUDA offload of a dense model. Falling back to normal generation.");
+                AnsiConsole.MarkupLine("[yellow]Warning:[/] --draft-lookup supports greedy (--temp 0) only; sampled speculative decoding needs --draft-model. Falling back to normal generation.");
+            }
+            else if (sampledSpec && specSampleDisabled)
+            {
+                AnsiConsole.MarkupLine("[yellow]Note:[/] SHARPI_SPEC_SAMPLE=0 — sampled speculative decoding disabled; using normal sampled generation.");
+            }
+            else if (sampledSpec && (hasPenalty || hasBias))
+            {
+                AnsiConsole.MarkupLine("[yellow]Warning:[/] sampled speculative decoding does not yet support --repeat-penalty / logit bias (draft and target must share the same distribution); falling back to normal generation.");
             }
             else if (settings.DraftLookup)
             {
@@ -780,8 +796,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     IForwardPass lookupTarget = cudaSpecTarget ? (CudaForwardPass)gpuFwd! : fwd!;
                     AnsiConsole.MarkupLine($"[dim]Speculative decoding: prompt-lookup (n-gram) drafting | Lookahead k={settings.SpecLookahead}[/]");
                     if (settings.Prompt is not null)
-                        return RunSpeculativeSinglePrompt(settings, lookupTarget, null, tokenizer, sp);
-                    return RunSpeculativeInteractive(settings, lookupTarget, null, tokenizer, sp);
+                        return RunSpeculativeSinglePrompt(settings, lookupTarget, null, tokenizer, sp, rng);
+                    return RunSpeculativeInteractive(settings, lookupTarget, null, tokenizer, sp, rng);
                 }
                 catch (Exception ex)
                 {
@@ -831,8 +847,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                         using var draftFwd = new CudaForwardPass(draftModel, draftCuda, draftHp, draftCtx);
                         AnsiConsole.MarkupLine($"[dim]Draft model: {draftHp.NumLayers}L, {draftHp.EmbeddingDim}d ([green]CUDA[/]) | Lookahead k={settings.SpecLookahead}[/]");
                         if (settings.Prompt is not null)
-                            return RunSpeculativeSinglePrompt(settings, target, draftFwd, tokenizer, sp);
-                        return RunSpeculativeInteractive(settings, target, draftFwd, tokenizer, sp);
+                            return RunSpeculativeSinglePrompt(settings, target, draftFwd, tokenizer, sp, rng);
+                        return RunSpeculativeInteractive(settings, target, draftFwd, tokenizer, sp, rng);
                     }
                     else
                     {
@@ -840,8 +856,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                         using var draftFwd = new ForwardPass(draftModel, draftCpuBackend, draftHp);
                         AnsiConsole.MarkupLine($"[dim]Draft model: {draftHp.NumLayers}L, {draftHp.EmbeddingDim}d ([blue]CPU[/]) | Lookahead k={settings.SpecLookahead}[/]");
                         if (settings.Prompt is not null)
-                            return RunSpeculativeSinglePrompt(settings, fwd!, draftFwd, tokenizer, sp);
-                        return RunSpeculativeInteractive(settings, fwd!, draftFwd, tokenizer, sp);
+                            return RunSpeculativeSinglePrompt(settings, fwd!, draftFwd, tokenizer, sp, rng);
+                        return RunSpeculativeInteractive(settings, fwd!, draftFwd, tokenizer, sp, rng);
                     }
                 }
                 catch (Exception ex)
@@ -905,7 +921,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
     private static int RunSpeculativeSinglePrompt(Settings s,
         IForwardPass target, IForwardPass? draft,
-        GgufTokenizer tok, SamplingParams sp)
+        GgufTokenizer tok, SamplingParams sp, Random rng)
     {
         var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt, enableThinking: !s_noThinking);
         var tokens = tok.Encode(prompt);
@@ -930,7 +946,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         SpeculativeDecoder spec;
         if (draft is not null)
         {
-            spec = new SpeculativeDecoder(target, draft, s.SpecLookahead);
+            // temp>0 → sampled (distribution-preserving) accept; temp 0 → greedy (byte-stable).
+            spec = sp.Temperature > 0f
+                ? new SpeculativeDecoder(target, draft, sp, rng, s.SpecLookahead)
+                : new SpeculativeDecoder(target, draft, s.SpecLookahead);
             spec.Initialize(tokens.Count, targetLogits, draftLogits);
         }
         else
@@ -974,11 +993,13 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
     private static int RunSpeculativeInteractive(Settings s,
         IForwardPass target, IForwardPass? draft,
-        GgufTokenizer tok, SamplingParams sp)
+        GgufTokenizer tok, SamplingParams sp, Random rng)
     {
         AnsiConsole.MarkupLine("[green]Interactive chat (speculative decoding).[/] Type a message, or [yellow]/exit[/] to quit.\n");
         var spec = draft is not null
-            ? new SpeculativeDecoder(target, draft, s.SpecLookahead)
+            ? (sp.Temperature > 0f
+                ? new SpeculativeDecoder(target, draft, sp, rng, s.SpecLookahead)
+                : new SpeculativeDecoder(target, draft, s.SpecLookahead))
             : new SpeculativeDecoder(target, new PromptLookupDraft(), s.SpecLookahead);
 
         while (true)

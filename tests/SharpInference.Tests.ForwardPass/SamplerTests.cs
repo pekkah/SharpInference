@@ -328,4 +328,85 @@ public sealed class SamplerTests
         var reach = ReachableSet(logits, p, seed: 2, trials: 500);
         Assert.True(reach.IsSubsetOf(new[] { 0 }), $"got {string.Join(",", reach)}");
     }
+
+    // ── Distribution helpers for speculative sampling (issue #178) ───────────────────
+
+    [Fact]
+    public void BuildFilteredDistribution_NoFilters_MatchesSoftmax()
+    {
+        float[] logits = [1f, 2f, 3f, 0f];
+        var p = new SamplingParams { Temperature = 1f }; // no top-k/top-p/min-p
+        var probs = new float[logits.Length];
+        Sampler.BuildFilteredDistribution(logits, p, probs);
+
+        // Reference softmax.
+        double max = 3.0, sum = 0;
+        var expected = new double[logits.Length];
+        for (int i = 0; i < logits.Length; i++) { expected[i] = Math.Exp(logits[i] - max); sum += expected[i]; }
+        for (int i = 0; i < logits.Length; i++)
+            Assert.Equal(expected[i] / sum, probs[i], 5);
+        Assert.Equal(1f, probs.Sum(), 5);
+    }
+
+    [Fact]
+    public void BuildFilteredDistribution_TempZero_OneHotAtArgmax()
+    {
+        float[] logits = [1f, 9f, 3f, 2f];
+        var probs = new float[logits.Length];
+        Sampler.BuildFilteredDistribution(logits, new SamplingParams { Temperature = 0f }, probs);
+        Assert.Equal(1f, probs[1]);
+        Assert.Equal(0f, probs[0] + probs[2] + probs[3]);
+    }
+
+    [Fact]
+    public void BuildFilteredDistribution_TopK_ZerosOutsideTopKAndSumsToOne()
+    {
+        float[] logits = [5f, 4f, 3f, 2f, 1f];
+        var probs = new float[logits.Length];
+        Sampler.BuildFilteredDistribution(logits, new SamplingParams { Temperature = 1f, TopK = 2 }, probs);
+        Assert.True(probs[0] > 0f && probs[1] > 0f);
+        Assert.Equal(0f, probs[2] + probs[3] + probs[4]);   // outside top-2 zeroed
+        Assert.Equal(1f, probs.Sum(), 5);
+    }
+
+    [Fact]
+    public void SampleWithDistribution_FillsProbsAndReturnsDrawnToken()
+    {
+        // Dominant token 1 → with low temperature the draw is token 1 and probs[1] ≈ 1.
+        float[] logits = [0f, 12f, 0f, 0f];
+        var probs = new float[logits.Length];
+        int tok = Sampler.SampleWithDistribution(logits, new SamplingParams { Temperature = 0.1f }, probs, new Random(7));
+        Assert.Equal(1, tok);
+        Assert.True(probs[1] > 0.99f);
+        Assert.Equal(1f, probs.Sum(), 5);
+    }
+
+    [Fact]
+    public void ResampleResidual_ConcentratedResidual_AlwaysReturnsResidualToken()
+    {
+        // p mass on {1,2}; q takes all of token 1 → residual = {2}. Every draw must be token 2.
+        float[] p = [0f, 0.5f, 0.5f, 0f];
+        float[] q = [0f, 1.0f, 0.0f, 0f];
+        var rng = new Random(3);
+        for (int i = 0; i < 200; i++)
+            Assert.Equal(2, Sampler.ResampleResidual(p, q, rng));
+    }
+
+    [Fact]
+    public void ResampleResidual_EmptyResidual_FallsBackToP()
+    {
+        // q dominates p everywhere on the support → residual is empty → fall back to sampling p.
+        float[] p = [0.25f, 0.25f, 0.25f, 0.25f];
+        float[] q = [0.25f, 0.25f, 0.25f, 0.25f];
+        var rng = new Random(5);
+        int tok = Sampler.ResampleResidual(p, q, rng);
+        Assert.InRange(tok, 0, p.Length - 1);   // a valid token from p, not a sentinel
+    }
+
+    [Fact]
+    public void ResampleResidual_MismatchedLengths_Throws()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            Sampler.ResampleResidual(new float[4], new float[3], new Random(1)));
+    }
 }
