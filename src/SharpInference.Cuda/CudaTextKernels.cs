@@ -8273,6 +8273,39 @@ extern ""C"" __global__ void llm_gdn_conv1d_state_update_batched(
         state[(long)r * channels + c] = tmp[r];
 }
 
+// ── GDN #290: capture intermediate conv1d states into the verify ring ───────
+// One launch writes every batched-verify ring slot's conv state. grid =
+// (ceil(channels/256), n_capture); block (c, slot) writes the conv state AFTER
+// token `slot` (i.e. the state the per-token loop held once it had advanced over
+// the first slot+1 tokens) into ring slot `slot`. Byte-identical to invoking
+// `llm_gdn_conv1d_state_update_batched` with n_tok = slot+1: the per-slot window
+// is [slot+1-retained .. slot], drawing from the carried pre-chunk `state` for the
+// early-token (p < 0) padding. Reads the PRE-update state (the caller must run
+// this BEFORE the in-place state advance). `ring` points to this layer's region
+// in slot 0; `ring_slot_stride` is the float stride between consecutive slots.
+extern ""C"" __global__ void llm_gdn_conv1d_state_capture_ring(
+    const float* __restrict__ x,        // [n_tok, channels] chunk inputs
+    const float* __restrict__ state,    // [(K-1), channels] oldest-first, pre-chunk
+    float* __restrict__ ring,           // layer region in slot 0
+    int channels, int kernel_size, int ring_slot_stride, int n_capture)
+{
+    int c = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int slot = (int)blockIdx.y;
+    if (c >= channels || slot >= n_capture) return;
+
+    int retained = kernel_size - 1;
+    int n_eff = slot + 1;               // state after processing tokens [0, n_eff)
+    float* dst = ring + (long)slot * ring_slot_stride;
+    #pragma unroll 4
+    for (int r = 0; r < retained; r++) {
+        int p = n_eff - retained + r;
+        float v = (p >= 0)
+            ? x[(long)p * channels + c]
+            : state[(long)(p + retained) * channels + c];
+        dst[(long)r * channels + c] = v;
+    }
+}
+
 // ── GDN: L2-norm per head, batched over n_tok rows ──────────────────────────
 // Bit-identical to n_tok sequential `llm_gdn_l2_norm_per_head` calls. grid =
 // (num_heads, n_tok); `data` is the region base (already offset to the Q or K
@@ -8355,7 +8388,17 @@ extern ""C"" __global__ void llm_gdn_recurrence_scan(
     float* __restrict__ output_all,       // [n_tok, o_stride]; head h at h*d
     int hv, int d, float norm_eps,
     int q_stride, int k_stride, int v_stride, int v_head_off,
-    int z_stride, int o_stride, int n_tok)
+    int z_stride, int o_stride, int n_tok,
+    // ── #290 batched-verify ring capture (nullable) ──────────────────────────
+    // When ring_scan != null, the post-token-i state (after Pass B, i.e. exactly
+    // what the live `state` holds at that boundary) is also written into ring
+    // slot i for i ∈ [0, n_capture). ring_scan points to this layer's region in
+    // slot 0; ring_slot_stride is the float stride between consecutive slots
+    // (= numGdnLayers * scanStateFloatsPerLayer). Disjoint from `state`, so the
+    // scan arithmetic and the live `state` evolution stay byte-unchanged — the
+    // capture is purely additional stores to a separate buffer.
+    float* __restrict__ ring_scan,
+    int ring_slot_stride, int n_capture)
 {
     int h = (int)blockIdx.x;
     int j = (int)threadIdx.x;
@@ -8406,11 +8449,17 @@ extern ""C"" __global__ void llm_gdn_recurrence_scan(
         __syncthreads();
 
         // Pass B: rank-1 update S[i,j] += k[i]·d[j], fused with readout o[j].
+        // #290: when capturing, mirror each post-update element into ring slot i
+        // (same value the live `state` now holds → byte-identical to the device
+        // CopyDeviceRegion the per-position loop used to issue).
+        bool capture = ring_scan != nullptr && i < n_capture;
+        float* ring_i = capture ? ring_scan + (long)i * ring_slot_stride + state_base : nullptr;
         float o_local = 0.f;
         for (int ii = 0; ii < d; ii++) {
             long off = state_base + (long)ii * d + j;
             float sij = state[off] + sK[ii] * d_j;
             state[off] = sij;
+            if (capture) ring_i[(long)ii * d + j] = sij;
             o_local += sQ[ii] * sij;
         }
         o_local *= rsqrtf((float)d);
