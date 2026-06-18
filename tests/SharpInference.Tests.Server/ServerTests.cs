@@ -1149,6 +1149,16 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
     public int PromptTokens { get; init; }
 
     /// <summary>
+    /// When set, generation blocks until this task completes — lets a test hold one request
+    /// in flight to exercise the concurrency-limit gate (issue #109).
+    /// </summary>
+    public TaskCompletionSource? Hold { get; init; }
+
+    /// <summary>Signaled when a generation call has started (and, if <see cref="Hold"/> is set,
+    /// is about to block) — so a test knows the first request is genuinely in flight.</summary>
+    public readonly ManualResetEventSlim Entered = new();
+
+    /// <summary>
     /// Captures the <see cref="SamplingParams"/> handed to the most recent
     /// <see cref="GenerateChunksAsync"/> call. Lets wire-level tests confirm that request
     /// fields (e.g. <c>thinking.budget_tokens</c>, <c>max_thinking_tokens</c>) reach the
@@ -1192,6 +1202,9 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
         LastSamplingParams = sp;
         LastCanonicalHistoryPrefix = canonicalHistoryPrefix;
         LastPrompt = prompt;
+        Entered.Set();
+        if (Hold is not null)
+            await Hold.Task.WaitAsync(ct);
         if (PromptTokens > 0)
             yield return new GenerateChunk(GenerateChunkKind.Usage, "", PromptTokens);
         foreach (var (kind, text) in _script)

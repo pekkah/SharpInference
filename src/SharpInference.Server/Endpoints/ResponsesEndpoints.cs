@@ -17,7 +17,7 @@ public static class ResponsesEndpoints
 {
     public static IEndpointRouteBuilder MapResponsesEndpoints(this IEndpointRouteBuilder app)
     {
-        app.MapPost("/v1/responses", HandleCreateResponse);
+        app.MapPost("/v1/responses", HandleCreateResponse).WithConcurrencyLimit();
         return app;
     }
 

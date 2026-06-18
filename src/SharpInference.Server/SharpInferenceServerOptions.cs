@@ -118,6 +118,20 @@ public sealed class SharpInferenceServerOptions
     public int MaxBatchSize { get; set; } = 1;
 
     /// <summary>
+    /// Maximum number of generation requests allowed in flight at once before the server
+    /// fast-rejects with HTTP 429 (issue #109). <c>null</c> (default) keeps the legacy
+    /// behaviour: the single-user <see cref="InferenceEngine"/> serializes overlapping
+    /// requests on an internal gate, so a concurrent request silently blocks for the full
+    /// duration of the in-flight one — which an agentic client (e.g. Claude Code firing
+    /// near-simultaneous requests) experiences as an unbounded hang. Set to <c>1</c> to make
+    /// the single-user limit explicit: overlapping requests get an immediate 429 pointing at
+    /// <c>SHARPI_MAX_BATCH</c> instead of queuing. Leave unset (or use a value matching
+    /// <see cref="MaxBatchSize"/>) when running <see cref="ContinuousBatchingEngine"/>, which
+    /// serves concurrency itself. Mirrors <c>SHARPI_MAX_CONCURRENT</c>.
+    /// </summary>
+    public int? MaxConcurrentRequests { get; set; }
+
+    /// <summary>
     /// Prompt tokens prefilled per batcher iteration under continuous batching
     /// (issue #183 Gap 1). Active sequences advance one decode step between chunks, so
     /// a long inbound prompt no longer freezes every in-flight generation. <c>0</c>
