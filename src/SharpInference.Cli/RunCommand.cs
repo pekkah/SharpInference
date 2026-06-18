@@ -202,6 +202,48 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [CommandOption("--expert-stats")]
         [Description("MoE: write GPU expert-cache (SLRU) hit-rate stats to this file on exit. Env: SHARPI_EXPERT_STATS.")]
         public string? ExpertStatsPath { get; init; }
+
+        // ── MoE expert placement (CPU vs GPU), issue #80. Wraps the existing all-or-nothing
+        // SHARPI_CPU_MOE override the engine reads at forward-pass construction.
+        [CommandOption("--cpu-moe|--cmoe")]
+        [Description("MoE: keep ALL routed expert weights on the CPU (llama.cpp --cpu-moe). Sets SHARPI_CPU_MOE=1, overriding the VRAM-fit auto-select; SHARPI_CPU_MOE=0 in the env still forces on-GPU experts. Alias --cmoe (llama.cpp's single-dash -cmoe isn't representable: Spectre short options must be one character).")]
+        [DefaultValue(false)]
+        public bool CpuMoe { get; init; }
+
+        [CommandOption("--n-cpu-moe|--ncmoe <N>")]
+        [Description("MoE: keep the routed experts of N layers on the CPU (llama.cpp --n-cpu-moe). DEFERRED / not yet supported — SharpInference's expert placement is all-or-nothing (no per-layer split in the engine), so passing any value errors with that rationale. Use --cpu-moe (all on CPU) or omit (auto).")]
+        public int? NCpuMoe { get; init; }
+    }
+
+    /// <summary>
+    /// Translates the llama.cpp-style MoE placement flags (<c>--cpu-moe</c> / <c>--n-cpu-moe</c>,
+    /// issue #80) into the <c>SHARPI_CPU_MOE</c> override the engine reads when it builds the
+    /// hybrid forward pass. <paramref name="cpuMoe"/> forces every routed expert onto the CPU
+    /// (equivalent to <c>SHARPI_CPU_MOE=1</c> and the server's <c>CpuMoe=true</c>, issue #93); an
+    /// explicit flag wins over an inherited env var, and its absence leaves the env (hence the
+    /// engine's VRAM-fit auto-select) untouched. <paramref name="nCpuMoe"/> (partial per-layer
+    /// placement) is <b>deferred</b>: the engine override is all-or-nothing, so any value is
+    /// rejected via <paramref name="error"/>. Returns <c>false</c> (with <paramref name="error"/>
+    /// set) when the caller should abort; the env side effect mirrors <see cref="GpuDevice.Resolve"/>.
+    /// </summary>
+    internal static bool TryApplyCpuMoeFlags(bool cpuMoe, int? nCpuMoe, out string? error)
+    {
+        if (nCpuMoe is int n)
+        {
+            error =
+                $"--n-cpu-moe/--ncmoe ({n}) is not supported yet: SharpInference places routed MoE " +
+                "experts all-or-nothing (the SHARPI_CPU_MOE override the engine reads has no per-layer " +
+                "granularity), so a partial per-layer split can't be honored. Use --cpu-moe to keep all " +
+                "routed experts on the CPU, or omit it to let VRAM fit auto-select (SHARPI_CPU_MOE=0 " +
+                "forces on-GPU experts). Tracked in issue #80.";
+            return false;
+        }
+
+        if (cpuMoe)
+            Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", "1");
+
+        error = null;
+        return true;
     }
 
     protected override int Execute(CommandContext context, Settings settings, CancellationToken cancellation)
@@ -260,6 +302,15 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             Environment.SetEnvironmentVariable("SHARPI_MOE_WARMPIN_AFTER", settings.MoeWarmPinAfter.ToString());
         if (settings.NoMoePredictPrefetch)
             Environment.SetEnvironmentVariable("SHARPI_MOE_PREDICT_PREFETCH", "0");
+
+        // MoE expert placement (#80): --cpu-moe sets SHARPI_CPU_MOE=1; --n-cpu-moe is deferred
+        // (the engine override is all-or-nothing) and fails fast with the rationale. Done here,
+        // before any forward pass is built, so the engine constructor sees the override.
+        if (!TryApplyCpuMoeFlags(settings.CpuMoe, settings.NCpuMoe, out string? cpuMoeError))
+        {
+            AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(cpuMoeError!)}");
+            return 1;
+        }
 
         // KV-cache dtype (issue #179): surface SHARPI_KV_DTYPE as a flag. Set before
         // any forward pass is built so an explicit flag overrides; env-only use still
