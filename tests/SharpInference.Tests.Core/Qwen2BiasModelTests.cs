@@ -62,7 +62,7 @@ public sealed class Qwen2BiasModelTests
     }
 
     /// <summary>
-    /// Integration test against the real VibeThinker-1.5B Q4_K_M GGUF. Gated on the file
+    /// Integration test against the real VibeThinker-1.5B Q8_0 GGUF. Gated on the file
     /// being present (downloaded via <c>scripts/download-model.ps1 -Model vibethinker</c>),
     /// like the other model-dependent tests in this project — returns early (skips) when the
     /// file is absent so CI without the weights stays green. Exercises the real tensor-probe
@@ -71,7 +71,7 @@ public sealed class Qwen2BiasModelTests
     [Fact]
     public void VibeThinkerGguf_ParsesAsQwen2WithBiasNoQkNorm()
     {
-        var path = FindModelPath("models/VibeThinker-1.5B.Q4_K_M.gguf");
+        var path = FindModelPath("models/VibeThinker-1.5B.Q8_0.gguf");
         if (path is null) return; // Model file not available — skip.
 
         using var model = GgufModel.Open(path);
