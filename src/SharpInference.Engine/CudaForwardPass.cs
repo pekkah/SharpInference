@@ -4107,6 +4107,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         if (N == 0) return;
         if (positions.Length != N || caches.Length != N)
             throw new ArgumentException("tokens/positions/caches lengths must match.");
+        // Single choke point for batched decode + speculative verify (BatchForwardMulti /
+        // BatchVerify route here, and it dispatches to RunBatchedTrunkGemma4): a draft model
+        // with a mismatched vocab could hand an out-of-range token to the batched embed kernels,
+        // which would abort the CUDA context like the prefill path (issue #267).
+        for (int n = 0; n < N; n++)
+            EnsureTokenInVocab(tokens[n]);
 
         // Gemma 4 (issue #195): per-layer head_dim / SWA rings / shared-KV / k_eq_v / PLE /
         // sandwich norms / softcap need the dedicated batched decode. It leaves the same
