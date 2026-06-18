@@ -1456,9 +1456,27 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         return _lastArgmax;
     }
 
+    /// <summary>
+    /// Guards against a token id outside the model's embedding table (valid range
+    /// <c>0..VocabSize-1</c>). The GPU embedding gather kernels have no bounds check, so an
+    /// out-of-range id reads past the uploaded table and aborts the entire CUDA context with an
+    /// illegal-address error (700) — unrecoverable for the process. Surface it as a clear managed
+    /// exception instead (issue #267). The tokenizer normally guarantees in-range ids; this
+    /// catches a future tokenizer/model mismatch before it corrupts the context.
+    /// </summary>
+    private void EnsureTokenInVocab(int token)
+    {
+        if ((uint)token >= (uint)_hp.VocabSize)
+            throw new ArgumentOutOfRangeException(nameof(token), token,
+                $"Token id is outside the model vocabulary (0..{_hp.VocabSize - 1}); the GPU embedding " +
+                "gather would read out of bounds and abort the CUDA context. This indicates a " +
+                "tokenizer/model mismatch (issue #267).");
+    }
+
     /// <inheritdoc/>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
+        EnsureTokenInVocab(token);
         if (_isGemma4Like) return s_profile ? ForwardProfiledGemma4(token, position) : ForwardGemma4(token, position);
 
         if (s_profile) return ForwardProfiled(token, position);
@@ -2442,6 +2460,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
             throw new ArgumentException("Token list is empty", nameof(tokens));
 
         int N = tokens.Count;
+        // Validate the whole prompt up front: the batched-trunk prefill path embeds via batched
+        // kernels that never reach Forward's per-token guard, so an out-of-range id would still
+        // abort the CUDA context there (issue #267).
+        for (int i = 0; i < N; i++)
+            EnsureTokenInVocab(tokens[i]);
         LastPrefillWasBatched = false;
 
         // Issue #142: pre-grow the dp4a Q8_1 input scratch to the widest decode

@@ -410,7 +410,7 @@ public sealed class GgufTokenizer : ITokenizer
 
         var ids = _inner.EncodeToIds(text);
 
-        if (ids.Count > 0) return ids;
+        if (ids.Count > 0) return RemapOutOfVocab(ids);
 
         var result = new List<int>(text.Length);
         foreach (char c in text)
@@ -419,6 +419,44 @@ public sealed class GgufTokenizer : ITokenizer
             char bpe = _needsByteEncoding ? c : EncodeByteToGpt2(c);
             if (_vocab.TryGetValue(bpe.ToString(), out int id))
                 result.Add(id);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Guarantees every emitted id is &lt; <see cref="VocabSize"/>, i.e. addressable in the
+    /// model's embedding table. <see cref="CodeGenTokenizer"/> injects model-independent
+    /// consecutive-whitespace tokens (ids beyond the supplied vocab — e.g. 2–8-space runs at
+    /// ids 49152+) that this GGUF has no embedding row for; feeding one to the GPU embedding
+    /// gather reads out of bounds and aborts the CUDA context with error 700 (issue #267), while
+    /// the CPU silently reads an adjacent tensor. Any such id is decomposed into its constituent
+    /// single-byte tokens (always present in a byte-level BPE vocab), so the whitespace is
+    /// preserved as in-vocab tokens rather than dropped. The fast path returns the input
+    /// unchanged when every id is already in range, so normal models pay only one scan.
+    /// </summary>
+    private IReadOnlyList<int> RemapOutOfVocab(IReadOnlyList<int> ids)
+    {
+        int oob = -1;
+        for (int i = 0; i < ids.Count; i++)
+            if ((uint)ids[i] >= (uint)VocabSize) { oob = i; break; }
+        if (oob < 0) return ids; // common case: nothing to remap
+
+        var result = new List<int>(ids.Count + 4);
+        for (int i = 0; i < ids.Count; i++)
+        {
+            int id = ids[i];
+            if ((uint)id < (uint)VocabSize) { result.Add(id); continue; }
+
+            // Decode the offending token to its raw text, then re-map each UTF-8 byte to its
+            // single-byte GPT-2 vocab token (the base alphabet of a byte-level BPE — always
+            // in-vocab). Falls back to the unknown token if a byte somehow isn't present.
+            string piece = _inner.Decode(new[] { id }) ?? string.Empty;
+            foreach (char gpt2 in EncodeToGpt2Bytes(piece))
+            {
+                result.Add(_vocab.TryGetValue(gpt2.ToString(), out int byteId) && byteId < VocabSize
+                    ? byteId
+                    : UnknownTokenId);
+            }
         }
         return result;
     }

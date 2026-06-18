@@ -51,6 +51,50 @@ public sealed class GgufTokenizerTests
     }
 
     [Fact]
+    public void Encode_IndentedCode_StaysWithinVocab()
+    {
+        // Issue #267: CodeGenTokenizer injects model-independent consecutive-whitespace tokens
+        // at ids beyond this GGUF's 49152-row embedding (e.g. an 8-space run → id 50280). Feeding
+        // one to the GPU embedding gather reads out of bounds and aborts the CUDA context (error
+        // 700). The tokenizer must decompose such tokens into in-vocab byte tokens so every id is
+        // addressable in the embedding table.
+        var tokenizer = CreateTokenizer();
+        if (tokenizer is null) return;
+
+        foreach (var text in new[]
+                 {
+                     "        private const int PageSize = 16;", // the original repro (8-space indent)
+                     "    if (x) {\n        return;\n    }",      // 4- and 8-space runs + newlines/tabs
+                     new string(' ', 8) + "x",
+                 })
+        {
+            var ids = tokenizer.Encode(text);
+            Assert.NotEmpty(ids);
+            Assert.All(ids, id => Assert.InRange(id, 0, tokenizer.VocabSize - 1));
+        }
+    }
+
+    [Fact]
+    public void Encode_MultiSpaceRun_DecomposesToInVocabSpaceTokens()
+    {
+        // The 2–8-space CodeGenTokenizer tokens (ids 50280–50286) decompose into repeated
+        // single-space in-vocab tokens (issue #267), preserving the whitespace rather than
+        // dropping it or emitting an unembeddable id.
+        var tokenizer = CreateTokenizer();
+        if (tokenizer is null) return;
+
+        // Encode N spaces followed by a sentinel and confirm the count of leading whitespace
+        // tokens scales with N and every id is in range.
+        var four = tokenizer.Encode(new string(' ', 4) + "X");
+        var eight = tokenizer.Encode(new string(' ', 8) + "X");
+        Assert.All(four, id => Assert.InRange(id, 0, tokenizer.VocabSize - 1));
+        Assert.All(eight, id => Assert.InRange(id, 0, tokenizer.VocabSize - 1));
+        // More spaces → at least as many tokens (decomposition is per-space).
+        Assert.True(eight.Count > four.Count,
+            $"expected more tokens for 8 spaces ({eight.Count}) than 4 ({four.Count})");
+    }
+
+    [Fact]
     public void Decode_RoundTrips_SimpleText()
     {
         var tokenizer = CreateTokenizer();
