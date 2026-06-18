@@ -311,6 +311,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // Issue #114-B: batched GDN trunk + batched-query SDPA kernels.
     private nint   _gdnConv1dDecodeBatchedKernel;
     private nint   _gdnConv1dStateUpdateBatchedKernel;
+    private nint   _gdnConv1dStateCaptureRingKernel;   // #290
     private nint   _gdnL2NormPerHeadBatchedKernel;
     private nint   _gdnTileHeadsBatchedKernel;
     private nint   _gdnRecurrenceScanKernel;
@@ -6003,7 +6004,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         Tensor alphaAll, Tensor betaAll, Tensor ssmA, Tensor dtBias,
         Tensor normWeight, Tensor zAll, Tensor outputAll,
         int numVHeads, int headDim, float normEps,
-        int qStride, int kStride, int vStride, int vHeadOff, int zStride, int oStride, int nTok)
+        int qStride, int kStride, int vStride, int vHeadOff, int zStride, int oStride, int nTok,
+        Tensor? ringScan = null, long ringScanFloatOffset = 0, int ringSlotStride = 0, int nCapture = 0)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
@@ -6017,18 +6019,53 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         int pHV = numVHeads, pD = headDim;
         float pE = normEps;
         int pQS = qStride, pKS = kStride, pVS = vStride, pVO = vHeadOff, pZS = zStride, pOS = oStride, pN = nTok;
-        nint* args = stackalloc nint[21]
+        // #290 ring capture: null tensor → null pointer + 0 captures (no-op).
+        nint rsP = ringScan is null ? 0 : GetDevPtr(ringScan) + (nint)(ringScanFloatOffset * sizeof(float));
+        int pRSS = ringSlotStride, pNC = ringScan is null ? 0 : nCapture;
+        nint* args = stackalloc nint[24]
         {
             (nint)(&sP), (nint)(&qP), (nint)(&kP), (nint)(&vP),
             (nint)(&aP), (nint)(&bP), (nint)(&aaP), (nint)(&dbP),
             (nint)(&nwP), (nint)(&zP), (nint)(&oP),
             (nint)(&pHV), (nint)(&pD), (nint)(&pE),
-            (nint)(&pQS), (nint)(&pKS), (nint)(&pVS), (nint)(&pVO), (nint)(&pZS), (nint)(&pOS), (nint)(&pN)
+            (nint)(&pQS), (nint)(&pKS), (nint)(&pVS), (nint)(&pVO), (nint)(&pZS), (nint)(&pOS), (nint)(&pN),
+            (nint)(&rsP), (nint)(&pRSS), (nint)(&pNC)
         };
         uint sharedBytes = (uint)(8 * headDim * sizeof(float));
         int r = NvrtcInterop.LaunchKernel(_gdnRecurrenceScanKernel,
             (uint)numVHeads, 1, 1, (uint)headDim, 1, 1, sharedBytes, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_recurrence_scan) failed: {r}");
+    }
+
+    /// <summary>
+    /// #290: capture the per-token conv1d states of a batched-verify chunk into the
+    /// device snapshot ring in a single launch. Slot <c>i</c> (i ∈ [0,
+    /// <paramref name="nCapture"/>)) receives the conv state the sequential decode
+    /// loop would hold after token <c>i</c> — byte-identical to
+    /// <see cref="GdnConv1dStateUpdateBatched"/> with <c>nTok = i+1</c>. Reads the
+    /// PRE-update <paramref name="state"/>, so call it BEFORE advancing the live
+    /// conv state. <paramref name="ring"/> points to this layer's region in slot 0;
+    /// <paramref name="ringFloatOffset"/> offsets to it; <paramref name="ringSlotStride"/>
+    /// is the float stride between consecutive slots.
+    /// </summary>
+    public void GdnConv1dStateCaptureRing(Tensor x, Tensor state, Tensor ring, long ringFloatOffset,
+                                          int channels, int kernelSize, int ringSlotStride, int nCapture)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (nCapture <= 0) return;
+
+        nint xP = GetDevPtr(x), sP = GetDevPtr(state);
+        nint rP = GetDevPtr(ring) + (nint)(ringFloatOffset * sizeof(float));
+        int pC = channels, pK = kernelSize, pRSS = ringSlotStride, pNC = nCapture;
+        nint* args = stackalloc nint[7]
+        {
+            (nint)(&xP), (nint)(&sP), (nint)(&rP), (nint)(&pC), (nint)(&pK), (nint)(&pRSS), (nint)(&pNC)
+        };
+        uint grid = (uint)((channels + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_gdnConv1dStateCaptureRingKernel, grid, (uint)nCapture, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_conv1d_state_capture_ring) failed: {r}");
     }
 
     /// <summary>GDN_CHUNK in <c>llm_gdn_chunked_prefill</c> — must match the kernel #define.</summary>
@@ -6412,6 +6449,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _siluInplaceKernel, _gdnConv1dDecodeKernel, _gdnL2NormPerHeadKernel,
             _gdnTileHeadsKernel, _gdnRecurrenceDecodeKernel,
             _gdnConv1dDecodeBatchedKernel, _gdnConv1dStateUpdateBatchedKernel,
+            _gdnConv1dStateCaptureRingKernel,   // #290
             _gdnL2NormPerHeadBatchedKernel, _gdnTileHeadsBatchedKernel, _gdnRecurrenceScanKernel,
             _gdnChunkedPrefillKernel,
             _kvAppendBatchedKernel, _kvAppendBatchedBf16Kernel,
@@ -6625,6 +6663,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         // qwen35moe GDN batched trunk + batched-query SDPA kernels (issue #114-B).
         _gdnConv1dDecodeBatchedKernel      = GetKernelFunc("llm_gdn_conv1d_decode_batched");
         _gdnConv1dStateUpdateBatchedKernel = GetKernelFunc("llm_gdn_conv1d_state_update_batched");
+        _gdnConv1dStateCaptureRingKernel   = GetKernelFunc("llm_gdn_conv1d_state_capture_ring");   // #290
         _gdnL2NormPerHeadBatchedKernel     = GetKernelFunc("llm_gdn_l2_norm_per_head_batched");
         _gdnTileHeadsBatchedKernel         = GetKernelFunc("llm_gdn_tile_heads_batched");
         _gdnRecurrenceScanKernel           = GetKernelFunc("llm_gdn_recurrence_scan");

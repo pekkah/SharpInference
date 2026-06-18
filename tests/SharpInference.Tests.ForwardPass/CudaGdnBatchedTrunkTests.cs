@@ -237,6 +237,150 @@ public sealed unsafe class CudaGdnBatchedTrunkTests
         }
     }
 
+    // ── #290 fused-scan ring capture: each slot == a fresh scan over the prefix ──
+    // The capturing scan must (a) leave its output/final-state byte-unchanged (the
+    // ring writes are disjoint stores) and (b) write into ring slot i exactly the
+    // state a scan over the first i+1 tokens produces. A non-zero target layer in a
+    // multi-layer ring exercises the per-layer float offset + inter-slot stride.
+    [Fact]
+    public void GdnRecurrenceScan_RingCapture_BitwiseMatchesPerSlotState()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        const int hv = 4, d = 128, scanF = hv * d * d, hd = hv * d;
+        const int numGdn = 3, gdnIdx = 1;
+        foreach (int N in new[] { 2, 4, 8 })
+        {
+            int nCapture = N - 1;
+            var rng = new Random(900 + N);
+            var state0 = Rand(scanF, rng);
+            var qAll = Rand(N * hd, rng); var kAll = Rand(N * hd, rng);
+            var vAll = Rand(N * hd, rng); var zAll = Rand(N * hd, rng);
+            var alphaAll = Rand(N * hv, rng); var betaAll = Rand(N * hv, rng);
+            var ssmA = Rand(hv, rng); var dtBias = Rand(hv, rng); var normW = Rand(d, rng);
+
+            var gpuSsmA = gpu.Upload(ssmA, TensorShape.D1(hv));
+            var gpuDt = gpu.Upload(dtBias, TensorShape.D1(hv));
+            var gpuNw = gpu.Upload(normW, TensorShape.D1(d));
+            var gQ = gpu.Upload(qAll, TensorShape.D1((long)N * hd));
+            var gK = gpu.Upload(kAll, TensorShape.D1((long)N * hd));
+            var gV = gpu.Upload(vAll, TensorShape.D1((long)N * hd));
+            var gZ = gpu.Upload(zAll, TensorShape.D1((long)N * hd));
+            var gA = gpu.Upload(alphaAll, TensorShape.D1((long)N * hv));
+            var gB = gpu.Upload(betaAll, TensorShape.D1((long)N * hv));
+
+            // Capturing scan over all N tokens into a zero-cleared multi-layer ring.
+            var gState = gpu.Upload(state0, TensorShape.D1(scanF));
+            var gOut = gpu.Allocate(TensorShape.D1((long)N * hd));
+            long ringFloats = (long)nCapture * numGdn * scanF;
+            var gRing = gpu.Allocate(TensorShape.D1(ringFloats));
+            gpu.Clear(gRing);
+            gpu.GdnRecurrenceScan(gState, gQ, gK, gV, gA, gB, gpuSsmA, gpuDt, gpuNw, gZ, gOut,
+                hv, d, 1e-6f, qStride: hd, kStride: hd, vStride: hd, vHeadOff: 0, zStride: hd, oStride: hd, nTok: N,
+                ringScan: gRing, ringScanFloatOffset: (long)gdnIdx * scanF,
+                ringSlotStride: numGdn * scanF, nCapture: nCapture);
+            gpu.Synchronize();
+            var ring = new float[ringFloats]; gpu.Download(gRing, ring);
+            var capFinalState = new float[scanF]; gpu.Download(gState, capFinalState);
+            var capOut = new float[(long)N * hd]; gpu.Download(gOut, capOut);
+
+            // (a) A non-capturing scan over all N must match the capturing one byte-for-byte.
+            var gStateRef = gpu.Upload(state0, TensorShape.D1(scanF));
+            var gOutRef = gpu.Allocate(TensorShape.D1((long)N * hd));
+            gpu.GdnRecurrenceScan(gStateRef, gQ, gK, gV, gA, gB, gpuSsmA, gpuDt, gpuNw, gZ, gOutRef,
+                hv, d, 1e-6f, qStride: hd, kStride: hd, vStride: hd, vHeadOff: 0, zStride: hd, oStride: hd, nTok: N);
+            gpu.Synchronize();
+            var refFinalState = new float[scanF]; gpu.Download(gStateRef, refFinalState);
+            var refOut = new float[(long)N * hd]; gpu.Download(gOutRef, refOut);
+            AssertBitId($"capture-must-not-perturb final state N={N}", capFinalState, refFinalState);
+            AssertBitId($"capture-must-not-perturb output N={N}", capOut, refOut);
+            gpu.Free(gStateRef); gpu.Free(gOutRef);
+
+            // (b) Each slot i == a fresh scan over the first i+1 tokens; other layers untouched.
+            for (int slot = 0; slot < nCapture; slot++)
+            {
+                var gStateS = gpu.Upload(state0, TensorShape.D1(scanF));
+                var gOutS = gpu.Allocate(TensorShape.D1((long)(slot + 1) * hd));
+                gpu.GdnRecurrenceScan(gStateS, gQ, gK, gV, gA, gB, gpuSsmA, gpuDt, gpuNw, gZ, gOutS,
+                    hv, d, 1e-6f, qStride: hd, kStride: hd, vStride: hd, vHeadOff: 0, zStride: hd, oStride: hd, nTok: slot + 1);
+                gpu.Synchronize();
+                var expState = new float[scanF]; gpu.Download(gStateS, expState);
+                gpu.Free(gStateS); gpu.Free(gOutS);
+
+                var slotLayer = new float[scanF];
+                Array.Copy(ring, (long)slot * numGdn * scanF + (long)gdnIdx * scanF, slotLayer, 0, scanF);
+                AssertBitId($"ring slot {slot} (N={N})", slotLayer, expState);
+
+                for (int g = 0; g < numGdn; g++)
+                {
+                    if (g == gdnIdx) continue;
+                    long baseOff = (long)slot * numGdn * scanF + (long)g * scanF;
+                    for (long e = 0; e < scanF; e++)
+                        if (ring[baseOff + e] != 0f)
+                            Assert.Fail($"ring slot {slot} layer {g} elem {e} = {ring[baseOff + e]} (expected untouched 0).");
+                }
+            }
+
+            gpu.Free(gpuSsmA); gpu.Free(gpuDt); gpu.Free(gpuNw);
+            gpu.Free(gQ); gpu.Free(gK); gpu.Free(gV); gpu.Free(gZ); gpu.Free(gA); gpu.Free(gB);
+            gpu.Free(gState); gpu.Free(gOut); gpu.Free(gRing);
+        }
+    }
+
+    // ── #290 conv-state ring capture: each slot == state-update over the prefix ──
+    [Fact]
+    public void GdnConv1dStateCaptureRing_BitwiseMatchesPerSlotUpdate()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        const int channels = 8192, kernelSize = 4, retained = kernelSize - 1, convF = retained * channels;
+        const int numGdn = 3, gdnIdx = 2;
+        foreach (int N in new[] { 2, 4, 8 })
+        {
+            int nCapture = N - 1;
+            var rng = new Random(950 + N);
+            var xAll = Rand(N * channels, rng);
+            var state0 = Rand(retained * channels, rng);
+
+            var gX = gpu.Upload(xAll, TensorShape.D1((long)N * channels));
+            var gState = gpu.Upload(state0, TensorShape.D1(retained * channels));
+            long ringFloats = (long)nCapture * numGdn * convF;
+            var gRing = gpu.Allocate(TensorShape.D1(ringFloats));
+            gpu.Clear(gRing);
+            gpu.GdnConv1dStateCaptureRing(gX, gState, gRing, (long)gdnIdx * convF,
+                channels, kernelSize, numGdn * convF, nCapture);
+            gpu.Synchronize();
+            var ring = new float[ringFloats]; gpu.Download(gRing, ring);
+
+            for (int slot = 0; slot < nCapture; slot++)
+            {
+                // Reference: in-place state-update over the first slot+1 tokens.
+                var gStateRef = gpu.Upload(state0, TensorShape.D1(retained * channels));
+                gpu.GdnConv1dStateUpdateBatched(gX, gStateRef, channels, kernelSize, slot + 1);
+                gpu.Synchronize();
+                var expState = new float[convF]; gpu.Download(gStateRef, expState);
+                gpu.Free(gStateRef);
+
+                var slotLayer = new float[convF];
+                Array.Copy(ring, (long)slot * numGdn * convF + (long)gdnIdx * convF, slotLayer, 0, convF);
+                AssertBitId($"conv ring slot {slot} (N={N})", slotLayer, expState);
+
+                for (int g = 0; g < numGdn; g++)
+                {
+                    if (g == gdnIdx) continue;
+                    long baseOff = (long)slot * numGdn * convF + (long)g * convF;
+                    for (long e = 0; e < convF; e++)
+                        if (ring[baseOff + e] != 0f)
+                            Assert.Fail($"conv ring slot {slot} layer {g} elem {e} touched.");
+                }
+            }
+
+            gpu.Free(gX); gpu.Free(gState); gpu.Free(gRing);
+        }
+    }
+
     // ── Batched KV-append + SDPA (fp32) ─────────────────────────────────────
     [Fact]
     public void AttentionBatched_F32_BitwiseMatchesSequential()

@@ -417,18 +417,22 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private int _batchStartPos;        // startPos of the most recent batched verify
     private int _batchK;               // token count of the most recent batched verify
 
-    // ── Device-side GDN snapshot ring (issues #30/#207 goal 4) ──────────
+    // ── Device-side GDN snapshot ring (issues #30/#207 goal 4, #290) ────
     // On the GPU-GDN trunk (!_cpuGdn) the live recurrent state is the per-layer
     // _gpuGdnScanState/_gpuGdnConvState device tensors, so rollback snapshots must
     // be captured on-device: ring slot j holds every GDN layer's (scan, conv) state
     // AFTER batch token j, packed per layer at offset gdnIdx × per-layer-floats.
-    // Allocated in the constructor BEFORE TryUploadDenseFfnLayers fills VRAM
-    // (~100 MB/slot for 27B; landing it in WDDM-paged memory would 5-10× the
-    // verify). _gdnRingSlots is the achieved slot count (alloc stops on OOM);
+    // #290: the ring is one flat contiguous tensor per (scan, conv) — slot j sits
+    // at j × (numGdn × per-layer-floats) — so the fused #114-B scan kernel can
+    // stride across slots and dump each token's state in place (dropping the
+    // per-position relaunch + the bulk CopyDeviceRegion fan-out). Allocated in the
+    // constructor BEFORE TryUploadDenseFfnLayers fills VRAM (~60 MB/slot for 27B;
+    // landing it in WDDM-paged memory would 5-10× the verify). _gdnRingSlots is
+    // the achieved slot count (alloc retries with fewer slots on OOM);
     // SupportsBatchVerify requires ≥ 1 slot on this trunk. The host
     // _batchSnapshotBuf above serves the SHARPI_CPU_GDN=1 debug trunk only.
-    private readonly Tensor?[]? _gpuGdnRingScan;
-    private readonly Tensor?[]? _gpuGdnRingConv;
+    private readonly Tensor? _gpuGdnRingScan;   // [slots × numGdn × scanFloatsPerLayer]
+    private readonly Tensor? _gpuGdnRingConv;   // [slots × numGdn × convFloatsPerLayer]
     private readonly int _gdnRingSlots;
 
     // Batched-verify scratch (exact-k; reallocated when the batch size changes the
@@ -681,8 +685,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // sequential GdnRecurrenceScan. The chunked form is numerically equal to the scan
     // only up to FP reduction order (NOT byte-exact), so it is OFF by default — the
     // bit-parity oracles keep validating the byte-exact scan — and only engages on the
-    // prefill (clean state-carry) path: it lives inside the BatchedGdnScanEnabled &&
-    // !snapRing branch, so decode and batched-verify ring capture stay on the scan.
+    // prefill (clean state-carry) path: GdnBlockBatched short-circuits to the byte-exact
+    // ring-capturing scan whenever snapRing is set (if (snapRing) … else if
+    // (GdnChunkedPrefillEnabled) …), so decode and batched-verify ring capture stay on the scan.
     // Mirrors HybridGdnForwardPass.GdnChunkedPrefillEnabled. SHARPI_GDN_CHUNKED_PREFILL=1
     // opts in; CudaHybridGdnChunkedPrefillTests A/B-toggles it.
     internal static bool GdnChunkedPrefillEnabled =
@@ -1220,31 +1225,39 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             int scanF = _gdnStateCache.ScanStateFloatsPerLayer;
             int convF = _gdnStateCache.ConvStateFloatsPerLayer;
             int want = _mtpBatchMax - 1;
-            var ringScan = new Tensor?[want];
-            var ringConv = new Tensor?[want];
+            // #290: one flat contiguous tensor per (scan, conv) sized for `got`
+            // slots, so the fused scan/conv-capture kernels can stride across slots.
+            // A single allocation can't partially succeed, so retry with fewer slots
+            // on OOM — total footprint matches the old slot-by-slot sum, preserving
+            // the graceful-degradation semantics.
+            Tensor? scanFlat = null, convFlat = null;
             int got = 0;
-            for (int s = 0; s < want; s++)
+            for (int trySlots = want; trySlots >= 1; trySlots--)
             {
+                Tensor? s = null, c = null;
                 try
                 {
-                    ringScan[s] = gpu.Allocate(TensorShape.D1((long)numGdn * scanF));
+                    s = gpu.Allocate(TensorShape.D1((long)trySlots * numGdn * scanF));
                     if (convF > 0)
-                        ringConv[s] = gpu.Allocate(TensorShape.D1((long)numGdn * convF));
-                    got = s + 1;
+                        c = gpu.Allocate(TensorShape.D1((long)trySlots * numGdn * convF));
+                    scanFlat = s;
+                    convFlat = c;
+                    got = trySlots;
+                    break;
                 }
                 catch (Exception ex)
                 {
-                    // VRAM exhausted (or backend fault) — keep the slots we already
-                    // have; MaxBatchVerifyTokens shrinks to match.
-                    if (ringScan[s] is { } partial) { gpu.Free(partial); ringScan[s] = null; }
+                    // Free any partial allocation (e.g. scan succeeded but conv threw)
+                    // before retrying with fewer slots.
+                    if (s is { } ps) gpu.Free(ps);
+                    if (c is { } pc) gpu.Free(pc);
                     Console.Error.WriteLine(
-                        $"[CudaHybridGdnForwardPass] GDN ring slot {s} allocation failed ({ex.GetType().Name}); " +
-                        $"continuing with {got} slot(s).");
-                    break;
+                        $"[CudaHybridGdnForwardPass] GDN ring allocation for {trySlots} slot(s) failed " +
+                        $"({ex.GetType().Name}); retrying with fewer.");
                 }
             }
-            _gpuGdnRingScan = ringScan;
-            _gpuGdnRingConv = ringConv;
+            _gpuGdnRingScan = scanFlat;
+            _gpuGdnRingConv = convFlat;
             _gdnRingSlots = got;
             long slotBytes = (long)numGdn * (scanF + convF) * sizeof(float);
             Console.Error.WriteLine(
@@ -1938,12 +1951,17 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// <summary>Batched GDN block: projections over N tokens; fused sequential-scan
     /// recurrence + batched conv1d/L2norm/tile by default (issue #114-B), or the
     /// per-position View loop under <c>SHARPI_BATCHED_GDN_SCAN=0</c>.
-    /// <para><paramref name="snapRing"/> (issue #30 batched verify) forces the
-    /// per-position loop — the fused scan only materialises the final state, but
-    /// rollback needs the state after EVERY non-final token — and captures each
-    /// boundary into device ring slot i via <see cref="CaptureGdnRingSlot"/>.
-    /// The per-position loop is the documented bit-identical fallback, so the
-    /// verify trunk stays in the same precision class as prefill/Forward.</para></summary>
+    /// <para><paramref name="snapRing"/> (issues #30/#290 batched verify) keeps the
+    /// fused path and captures the post-token-i (scan, conv) state into device ring
+    /// slot i AS IT SCANS: the sequential-scan kernel mirrors each token's
+    /// post-update state into the ring (zero extra launches), and a single
+    /// conv-capture launch dumps the per-token conv states. This replaces the old
+    /// per-position relaunch (k×8 launches/layer) + the per-slot
+    /// <see cref="CaptureGdnRingSlot"/> CopyDeviceRegion fan-out. Verify always uses
+    /// the byte-exact scan (never the chunked prefill form), so it stays in the same
+    /// precision class as prefill/Forward. The per-position View loop below remains
+    /// the <c>SHARPI_BATCHED_GDN_SCAN=0</c> fallback and keeps its CopyDeviceRegion
+    /// capture.</para></summary>
     private void GdnBlockBatched(int layer, int N, Tensor norm, Tensor blockOut, bool snapRing = false)
     {
         int convCh = _gdnConvChannels, valDim = _gdnValueDim, nVH = _gdnNumVHeads;
@@ -1963,16 +1981,31 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // Issue #114-B: fuse the per-position conv1d + delta-net recurrence into
         // one batched launch per stage + a single sequential-scan kernel. Output is
         // bit-identical to the per-position View loop below (same per-position math,
-        // same reduction order; only the host launch overhead is removed).
-        if (BatchedGdnScanEnabled && !snapRing)
+        // same reduction order; only the host launch overhead is removed). Issue
+        // #290: this path also serves batched verify (snapRing) — the scan/conv
+        // captures dump each token's state into the ring during the fused pass.
+        if (BatchedGdnScanEnabled)
         {
             var qkvConvAll = _gpuBtQkvConv!;
             var qHeadAll = _gpuBtQHead!;
             var kHeadAll = _gpuBtKHead!;
 
-            // conv1d over all tokens (read-only state), then advance the state.
+            // #290 ring geometry (only when capturing): this layer's dense GDN index,
+            // per-layer float counts, and the inter-slot stride (= numGdn × per-layer
+            // floats). gdnIdx ≥ 0 here — GdnBlockBatched only runs for GDN layers.
+            int gdnIdx = snapRing ? _gdnStateCache.GdnLayerOf(layer) : -1;
+            int numGdn = _gdnStateCache.NumGdnLayers;
+            int scanF = _gdnStateCache.ScanStateFloatsPerLayer;
+            int convF = _gdnStateCache.ConvStateFloatsPerLayer;
+            int nCapture = N - 1;   // slots [0, N-1): state after each non-final token
+
+            // conv1d over all tokens (read-only state), capture the per-token conv
+            // states (BEFORE advancing the live state), then advance the state.
             _gpu.GdnConv1dDecodeBatched(qkvAll, convState, _gpuSsmConv1d[layer], qkvConvAll,
                 convCh, _gdnConvKernel, N);
+            if (snapRing && nCapture > 0 && convF > 0 && _gpuGdnRingConv is { } ringConv)
+                _gpu.GdnConv1dStateCaptureRing(qkvAll, convState, ringConv, (long)gdnIdx * convF,
+                    convCh, _gdnConvKernel, numGdn * convF, nCapture);
             _gpu.GdnConv1dStateUpdateBatched(qkvAll, convState, convCh, _gdnConvKernel, N);
             // SiLU over the whole [N × convCh] (matches the per-token full-convCh SiLU).
             _gpu.SiLUInPlace(qkvConvAll);
@@ -1984,10 +2017,19 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _gpu.GdnTileHeadsBatched(qkvConvAll, kDim, kHeadAll, 0, _gdnNumKHeads, _gdnKvRepeat, hd, convCh, valDim, N);
             // Recurrence: v read straight from the silu'd conv output's V region
             // (vHeadOff = 2*kDim, stride convCh); q/k from the tiled head buffers.
-            // GdnChunkedPrefill is a signature-identical drop-in for the sequential
-            // GdnRecurrenceScan — the FlashQLA chunk-parallel form (opt-in, not
-            // byte-exact) vs the byte-exact per-token-equivalent scan (default).
-            if (GdnChunkedPrefillEnabled)
+            // Verify (snapRing) always uses the byte-exact scan with ring capture;
+            // GdnChunkedPrefill (opt-in, NOT byte-exact) only serves clean prefill.
+            if (snapRing)
+                _gpu.GdnRecurrenceScan(
+                    scanState, qHeadAll, kHeadAll, qkvConvAll,
+                    alphaAll, betaAll, _gpuSsmA[layer], _gpuSsmDtBias[layer], _gpuSsmNormW[layer],
+                    zAll, gdnOutAll,
+                    nVH, hd, normEps: 1e-6f,
+                    qStride: valDim, kStride: valDim, vStride: convCh, vHeadOff: 2 * kDim,
+                    zStride: valDim, oStride: valDim, nTok: N,
+                    ringScan: _gpuGdnRingScan, ringScanFloatOffset: (long)gdnIdx * scanF,
+                    ringSlotStride: numGdn * scanF, nCapture: nCapture);
+            else if (GdnChunkedPrefillEnabled)
                 _gpu.GdnChunkedPrefill(
                     scanState, qHeadAll, kHeadAll, qkvConvAll,
                     alphaAll, betaAll, _gpuSsmA[layer], _gpuSsmDtBias[layer], _gpuSsmNormW[layer],
@@ -3580,12 +3622,17 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             throw new InvalidOperationException(
                 $"CaptureGdnRingSlot({slot}): the GDN snapshot ring has {_gdnRingSlots} slot(s). " +
                 "Callers must clamp the batch to MaxBatchVerifyTokens.");
-        long scanBytes = (long)_gdnStateCache.ScanStateFloatsPerLayer * sizeof(float);
-        long convBytes = (long)_gdnStateCache.ConvStateFloatsPerLayer * sizeof(float);
+        long scanF = _gdnStateCache.ScanStateFloatsPerLayer;
+        long convF = _gdnStateCache.ConvStateFloatsPerLayer;
+        long numGdn = _gdnStateCache.NumGdnLayers;
+        long scanBytes = scanF * sizeof(float);
+        long convBytes = convF * sizeof(float);
         if (_gpuGdnScanState[layer] is { } scanT && scanBytes > 0)
-            _gpu.CopyDeviceRegion(_gpuGdnRingScan[slot]!, gdnIdx * scanBytes, scanT, 0, scanBytes);
-        if (_gpuGdnConvState[layer] is { } convT && convBytes > 0 && _gpuGdnRingConv?[slot] is { } convRing)
-            _gpu.CopyDeviceRegion(convRing, gdnIdx * convBytes, convT, 0, convBytes);
+            _gpu.CopyDeviceRegion(_gpuGdnRingScan, ((long)slot * numGdn * scanF + gdnIdx * scanF) * sizeof(float),
+                scanT, 0, scanBytes);
+        if (_gpuGdnConvState[layer] is { } convT && convBytes > 0 && _gpuGdnRingConv is { } convRing)
+            _gpu.CopyDeviceRegion(convRing, ((long)slot * numGdn * convF + gdnIdx * convF) * sizeof(float),
+                convT, 0, convBytes);
     }
 
     /// <summary>Inverse of <see cref="CaptureGdnRingSlot"/>: ring slot → live device state.</summary>
@@ -3596,12 +3643,17 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (_gpuGdnRingScan is null || slot >= _gdnRingSlots)
             throw new InvalidOperationException(
                 $"RestoreGdnRingSlot({slot}): the GDN snapshot ring has {_gdnRingSlots} slot(s).");
-        long scanBytes = (long)_gdnStateCache.ScanStateFloatsPerLayer * sizeof(float);
-        long convBytes = (long)_gdnStateCache.ConvStateFloatsPerLayer * sizeof(float);
+        long scanF = _gdnStateCache.ScanStateFloatsPerLayer;
+        long convF = _gdnStateCache.ConvStateFloatsPerLayer;
+        long numGdn = _gdnStateCache.NumGdnLayers;
+        long scanBytes = scanF * sizeof(float);
+        long convBytes = convF * sizeof(float);
         if (_gpuGdnScanState[layer] is { } scanT && scanBytes > 0)
-            _gpu.CopyDeviceRegion(scanT, 0, _gpuGdnRingScan[slot]!, gdnIdx * scanBytes, scanBytes);
-        if (_gpuGdnConvState[layer] is { } convT && convBytes > 0 && _gpuGdnRingConv?[slot] is { } convRing)
-            _gpu.CopyDeviceRegion(convT, 0, convRing, gdnIdx * convBytes, convBytes);
+            _gpu.CopyDeviceRegion(scanT, 0, _gpuGdnRingScan, ((long)slot * numGdn * scanF + gdnIdx * scanF) * sizeof(float),
+                scanBytes);
+        if (_gpuGdnConvState[layer] is { } convT && convBytes > 0 && _gpuGdnRingConv is { } convRing)
+            _gpu.CopyDeviceRegion(convT, 0, convRing, ((long)slot * numGdn * convF + gdnIdx * convF) * sizeof(float),
+                convBytes);
     }
 
     /// <summary>
@@ -6114,10 +6166,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             }
             // Issue #30/#207-goal-4 k-token batched verify: device GDN snapshot
             // ring + exact-k verify scratch + the MTP self-chaining hidden.
-            if (_gpuGdnRingScan is not null)
-                foreach (var t in _gpuGdnRingScan) if (t is { } rs) _gpu.Free(rs);
-            if (_gpuGdnRingConv is not null)
-                foreach (var t in _gpuGdnRingConv) if (t is { } rc) _gpu.Free(rc);
+            if (_gpuGdnRingScan is { } ringScan) _gpu.Free(ringScan);
+            if (_gpuGdnRingConv is { } ringConv) _gpu.Free(ringConv);
             if (_gpuBvLogitsAll is { } bvl) _gpu.Free(bvl);
             if (_gpuBvFfnAll is { } bvf) _gpu.Free(bvf);
             if (_bvNormHost != null) CudaBackend.FreePinnedHost((nint)_bvNormHost);
