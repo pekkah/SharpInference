@@ -409,10 +409,12 @@ public sealed class SpeculativeDecoder
             if (accept) { accepted++; continue; }
 
             // Reject at i: correction from the residual at this position (true sampling) or a
-            // fresh target sample (looser pMin mode — already off-distribution).
+            // fresh target sample (looser pMin mode — already off-distribution). pDist already
+            // holds BuildFilteredDistribution(batch[i-1]) from the accept test above, so the
+            // looser path samples it directly rather than rebuilding it.
             correction = _trueSpecSampling
                 ? Sampler.ResampleResidual(pDist, draftDists[i], rng)
-                : Sampler.SampleWithDistribution(batch[i - 1], sampling, pDist, rng);
+                : Sampler.SampleFromProbs(pDist, rng);
             break;
         }
         if (correction < 0)

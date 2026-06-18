@@ -171,10 +171,28 @@ public static class Sampler
     /// </summary>
     public static int SampleWithDistribution(ReadOnlySpan<float> logits, SamplingParams p, Span<float> probs, Random? rng = null)
     {
-        BuildFilteredDistribution(logits, p, probs);
         if (p.Temperature <= 0f)
-            return Greedy(logits);
+        {
+            // One-hot at the greedy argmax — no filter pipeline, no RNG draw.
+            int argmax = Greedy(logits);
+            probs.Clear();
+            probs[argmax] = 1f;
+            return argmax;
+        }
+        BuildFilteredDistribution(logits, p, probs);
         rng ??= Random.Shared;
+        return SampleFromDistribution(probs, rng);
+    }
+
+    /// <summary>
+    /// Draw a token from a pre-computed normalized distribution (e.g. one already built by
+    /// <see cref="BuildFilteredDistribution"/>), avoiding a redundant rebuild. Used by the
+    /// speculative decoder's looser-accept reject branch, where the target distribution at the
+    /// rejection position is already in hand.
+    /// </summary>
+    public static int SampleFromProbs(ReadOnlySpan<float> probs, Random rng)
+    {
+        ArgumentNullException.ThrowIfNull(rng);
         return SampleFromDistribution(probs, rng);
     }
 
@@ -473,19 +491,19 @@ public static class Sampler
 
         float target = (float)rng.NextDouble() * sum;
         float cum = 0f;
+        int lastPositive = -1;
         for (int i = 0; i < p.Length; i++)
         {
             float r = p[i] - q[i];
             if (r > 0f)
             {
+                lastPositive = i;
                 cum += r;
                 if (target <= cum) return i;
             }
         }
-        // Rounding fallback: last token with positive residual.
-        for (int i = p.Length - 1; i >= 0; i--)
-            if (p[i] - q[i] > 0f) return i;
-        return SampleFromDistribution(p, rng);
+        // Rounding fallback: the last token with positive residual (tracked above, no extra pass).
+        return lastPositive >= 0 ? lastPositive : SampleFromDistribution(p, rng);
     }
 
     /// <summary>
