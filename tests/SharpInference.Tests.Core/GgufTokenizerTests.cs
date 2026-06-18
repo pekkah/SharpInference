@@ -75,6 +75,21 @@ public sealed class GgufTokenizerTests
     }
 
     [Fact]
+    public void Encode_IndentedCode_RoundTripsThroughDecode()
+    {
+        // Semantic guard for the #267 remap: the decomposed in-vocab tokens must still decode
+        // back to the original indented text. A remap that produced wrong-but-in-vocab ids would
+        // pass the in-range check but fail here.
+        var tokenizer = CreateTokenizer();
+        if (tokenizer is null) return;
+
+        var text = "    if (x) {\n        return 0;\n    }";
+        var ids = tokenizer.Encode(text);
+        Assert.All(ids, id => Assert.InRange(id, 0, tokenizer.VocabSize - 1));
+        Assert.Equal(text, tokenizer.Decode(ids));
+    }
+
+    [Fact]
     public void Encode_MultiSpaceRun_DecomposesToInVocabSpaceTokens()
     {
         // The 2–8-space CodeGenTokenizer tokens (ids 50280–50286) decompose into repeated

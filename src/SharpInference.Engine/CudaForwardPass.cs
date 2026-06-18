@@ -3906,6 +3906,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                 throw new ArgumentException(
                     $"Sequence {s}: startPos {startPos[s]} + chunk {chunks[s].Length} exceeds maxSeqLen {_maxSeqLen}.",
                     nameof(startPos));
+            // The packed-trunk path below embeds via batched kernels that never reach Forward's
+            // per-token guard, so validate token range up front here too (issue #267).
+            var span = chunks[s].Span;
+            for (int i = 0; i < span.Length; i++)
+                EnsureTokenInVocab(span[i]);
         }
 
         if (S >= 2 && IsDensePackablePrefill() && AllChunksPackable(chunks, startPos))

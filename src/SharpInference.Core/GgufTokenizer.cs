@@ -441,21 +441,29 @@ public sealed class GgufTokenizer : ITokenizer
             if ((uint)ids[i] >= (uint)VocabSize) { oob = i; break; }
         if (oob < 0) return ids; // common case: nothing to remap
 
+        // Last-resort id for a byte not found in the vocab. UnknownTokenId is normally 0 and
+        // in-vocab, but guard so a pathological model (unk = -1 or ≥ VocabSize) can't make the
+        // remap itself emit an out-of-range id — that would defeat the whole point.
+        int unk = (uint)UnknownTokenId < (uint)VocabSize ? UnknownTokenId : 0;
+
         var result = new List<int>(ids.Count + 4);
         for (int i = 0; i < ids.Count; i++)
         {
             int id = ids[i];
             if ((uint)id < (uint)VocabSize) { result.Add(id); continue; }
 
-            // Decode the offending token to its raw text, then re-map each UTF-8 byte to its
-            // single-byte GPT-2 vocab token (the base alphabet of a byte-level BPE — always
-            // in-vocab). Falls back to the unknown token if a byte somehow isn't present.
+            // Decode the offending token and map each GPT-2 byte-level char to its single-byte
+            // vocab token (the base alphabet of a byte-level BPE — always in-vocab). The two inner
+            // tokenizers decode differently (see Decode): CodeGenTokenizer returns clean UTF-8, so
+            // re-encode each byte to its GPT-2 char; the BpeTokenizer fallback already returns the
+            // GPT-2 byte-level form, so use it as-is (re-encoding would double-encode it).
             string piece = _inner.Decode(new[] { id }) ?? string.Empty;
-            foreach (char gpt2 in EncodeToGpt2Bytes(piece))
+            string gpt2 = _needsByteEncoding ? piece : EncodeToGpt2Bytes(piece);
+            foreach (char ch in gpt2)
             {
-                result.Add(_vocab.TryGetValue(gpt2.ToString(), out int byteId) && byteId < VocabSize
+                result.Add(_vocab.TryGetValue(ch.ToString(), out int byteId) && byteId < VocabSize
                     ? byteId
-                    : UnknownTokenId);
+                    : unk);
             }
         }
         return result;
