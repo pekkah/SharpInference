@@ -438,6 +438,55 @@ public sealed class ToolCallEndpointTests
         Assert.Contains("\"finish_reason\":\"tool_calls\"", body);
     }
 
+    [Fact]
+    public async Task Anthropic_Gemma4_Streaming_ToolResponseMarkerNotLeakedAsTextBlock()
+    {
+        var fake = new FakeInferenceEngine("gemma-4", [
+            (GenerateChunkKind.Text, "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>"),
+            (GenerateChunkKind.Text, "<|tool_response>"),
+        ]);
+        var client = CreateClient(fake, "gemma4");
+
+        var req = new
+        {
+            model = "gemma-4",
+            messages = new[] { new { role = "user", content = "Weather?" } },
+            max_tokens = 50,
+            stream = true,
+            tools = new[] { new { name = "get_weather", description = "w", input_schema = new { type = "object" } } }
+        };
+        var response = await client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+
+        // The leaked marker is JSON-escaped and may be split across multiple text_delta events,
+        // so a raw substring match would miss it — decode + concatenate the text_delta payloads.
+        var streamedText = ConcatTextDeltas(body);
+        Assert.DoesNotContain("tool_response", streamedText);
+        Assert.Contains("\"type\":\"tool_use\"", body);
+        Assert.Equal("tool_use", ExtractMessageDeltaStopReason(body));
+    }
+
+    /// <summary>Concatenates every Anthropic <c>text_delta</c> payload in an SSE body so an
+    /// assertion sees the full streamed text regardless of chunk splitting / JSON escaping.</summary>
+    private static string ConcatTextDeltas(string sseBody)
+    {
+        var sb = new System.Text.StringBuilder();
+        int i = 0;
+        while ((i = sseBody.IndexOf("\"text_delta\"", i, StringComparison.Ordinal)) >= 0)
+        {
+            int dataStart = sseBody.LastIndexOf("data: ", i, StringComparison.Ordinal);
+            int dataEnd = sseBody.IndexOf('\n', i);
+            if (dataStart < 0 || dataEnd < 0) break;
+            dataStart += "data: ".Length;
+            using var doc = JsonDocument.Parse(sseBody[dataStart..dataEnd]);
+            if (doc.RootElement.TryGetProperty("delta", out var d) && d.TryGetProperty("text", out var t))
+                sb.Append(t.GetString());
+            i = dataEnd;
+        }
+        return sb.ToString();
+    }
+
     // ── usage.prompt_tokens populated from the engine's Usage chunk (#150) ──────
 
     [Fact]

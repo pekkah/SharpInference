@@ -278,6 +278,11 @@ public static class AnthropicEndpoints
         async Task FlushTextDelta(string text)
         {
             if (text.Length == 0) return;
+            // Once a tool_use block has been emitted, any trailing plain text is model control
+            // noise (e.g. Gemma's <|tool_response> turn marker) — not assistant content — so it
+            // must not open a stray text block (issue #150). Preamble before the first call is
+            // unaffected (hasToolCalls is still false then). Mirrors the OpenAI streaming guard.
+            if (hasToolCalls) return;
             if (!textOpen)
             {
                 // Close thinking block first if it was opened without a follow-up text block.
