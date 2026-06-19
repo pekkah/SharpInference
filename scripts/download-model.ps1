@@ -26,7 +26,7 @@
     .\download-model.ps1 -Model gemma4-12b-qat -DestDir E:\models  # Gemma 4 12B-it QAT q4_0 + vision/audio mmproj (~7.2 GB) — issue #124 PRIMARY (official quantization-aware-trained)
     .\download-model.ps1 -Model gemma4-12b-q4km -DestDir E:\models # Gemma 4 12B-it Q4_K_M (~7.3 GB) — issue #124 fallback / K-quant cross-check
     .\download-model.ps1 -Model gemma4-e4b-qat -DestDir E:\models  # Gemma 4 E4B-it QAT q4_0 (~5.15 GB) — fast small Gemma (~1.6× decode vs Q8_0)
-    .\download-model.ps1 -Model gemma4-12b-agentic -DestDir E:\models  # Gemma 4 12B agentic/tool-use finetune (yuxinlu1) Q4_K_M (~7.3 GB) — dense gemma4 arch
+    .\download-model.ps1 -Model gemma4-12b-agentic -DestDir E:\models  # Gemma 4 12B agentic/tool-use finetune (yuxinlu1) Q4_K_M (~7.4 GB) — dense gemma4 arch (reasoning; pass --thinking for the thought chain)
     .\download-model.ps1 -Model llama4-scout            # Llama 4 Scout Q4_K_M (60.9 GB, 2 shards)
     .\download-model.ps1 -Model z-image-turbo           # Z-Image-Turbo Q5_K_M + abliterated encoder (~8.5 GB)
     .\download-model.ps1 -Model z-image-turbo-q8        # Z-Image-Turbo Q8_0 + abliterated encoder Q8_0 (~12 GB)
@@ -221,18 +221,24 @@ $Models = @{
     # ── Gemma 4 12B agentic finetune (community) ───────────────────────────────
     # yuxinlu1's agentic/tool-use + coding finetune of google/gemma-4-12B-it,
     # distributed as a standard dense `gemma4` (gemma4_unified) GGUF — same arch
-    # as gemma4-12b-q4km, so it loads on the existing dense Gemma 4 text path with
-    # no engine changes. Tuned on multi-step tool-use trajectories (tau2) and
-    # verified coding CoT; emits a <think> chain then the answer. Text-only repo
-    # (no companion mmproj). The upstream Q4_K_M filename follows the same
-    # `gemma4-<variant>-Q4_K_M.gguf` convention as the author's coder v1 repo
-    # (gemma4-coding-Q4_K_M.gguf) — VERIFY against the repo file list before use:
+    # as gemma4-12b-q4km, so it runs on the existing dense Gemma 4 text path.
+    # Tuned on multi-step tool-use trajectories (tau2) and verified coding CoT.
+    # Text-only repo (no companion mmproj). Filenames verified against the repo:
+    # the GGUFs are `gemma4-v2-<quant>.gguf` (NOT the author's coder-v1
+    # `gemma4-<variant>-Q4_K_M.gguf` convention). Q4_K_M (~7.4 GB) is the 12 GB
+    # full-offload pick; the repo also has Q3_K_M (~6.1 GB), Q6_K (~9.8 GB) and
+    # Q8_0 (~12.7 GB).
     #   https://huggingface.co/yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF/tree/main
+    #
+    # Unlike stock Gemma 4 instruct (not reasoning-trained), THIS reasoning finetune
+    # thinks in Gemma's native thought channel. It answers fine in the default mode;
+    # to get the reasoning chain pass `--thinking` (Gemma 4 defaults thinking off for
+    # the stock models). Recommended sampling: --temp 1.0 --top-k 64 --top-p 0.95.
     "gemma4-12b-agentic" = @{
-        Files = @("gemma4-agentic-Q4_K_M.gguf")
-        Urls  = @("https://huggingface.co/yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF/resolve/main/gemma4-agentic-Q4_K_M.gguf")
-        Size  = "~7.3 GB"
-        SizeGB = 7.3
+        Files = @("gemma4-v2-Q4_K_M.gguf")
+        Urls  = @("https://huggingface.co/yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF/resolve/main/gemma4-v2-Q4_K_M.gguf")
+        Size  = "~7.4 GB"
+        SizeGB = 7.4
         Phase = "Gemma 4 12B agentic/tool-use finetune (yuxinlu1) — dense gemma4 text path"
     }
     "llama4-scout" = @{
