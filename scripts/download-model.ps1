@@ -5,7 +5,7 @@
     Downloads from HuggingFace to the models/ directory. Skips if already present.
     Supports: smollm2, vibethinker, qwen3-8b, olmoe-1b-7b, llama31-70b, qwen3-coder-30b-a3b, qwen36-35b-a3b,
               qwen36-27b-mtp, qwen36-27b-mtp-q5, qwen36-35b-a3b-mtp, carnice-35b-a3b-mtp,
-              gemma4-12b-qat, gemma4-12b-q4km, gemma4-e4b-qat,
+              gemma4-12b-qat, gemma4-12b-q4km, gemma4-e4b-qat, gemma4-12b-agentic,
               llama4-scout, z-image-turbo, z-image-turbo-q8, realesrgan-x4
 .PARAMETER Model
     Which model to download. Default: downloads all text models (skips large image models).
@@ -26,6 +26,7 @@
     .\download-model.ps1 -Model gemma4-12b-qat -DestDir E:\models  # Gemma 4 12B-it QAT q4_0 + vision/audio mmproj (~7.2 GB) — issue #124 PRIMARY (official quantization-aware-trained)
     .\download-model.ps1 -Model gemma4-12b-q4km -DestDir E:\models # Gemma 4 12B-it Q4_K_M (~7.3 GB) — issue #124 fallback / K-quant cross-check
     .\download-model.ps1 -Model gemma4-e4b-qat -DestDir E:\models  # Gemma 4 E4B-it QAT q4_0 (~5.15 GB) — fast small Gemma (~1.6× decode vs Q8_0)
+    .\download-model.ps1 -Model gemma4-12b-agentic -DestDir E:\models  # Gemma 4 12B agentic/tool-use finetune (yuxinlu1) Q4_K_M (~7.3 GB) — dense gemma4 arch
     .\download-model.ps1 -Model llama4-scout            # Llama 4 Scout Q4_K_M (60.9 GB, 2 shards)
     .\download-model.ps1 -Model z-image-turbo           # Z-Image-Turbo Q5_K_M + abliterated encoder (~8.5 GB)
     .\download-model.ps1 -Model z-image-turbo-q8        # Z-Image-Turbo Q8_0 + abliterated encoder Q8_0 (~12 GB)
@@ -34,7 +35,7 @@
 param(
     [ValidateSet("smollm2", "vibethinker", "vibethinker-q4", "qwen3-8b", "qwen3-0.6b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "qwen36-35b-a3b",
                  "qwen36-27b-mtp", "qwen36-27b-mtp-q5", "qwen36-35b-a3b-mtp", "carnice-35b-a3b-mtp",
-                 "gemma4-12b-qat", "gemma4-12b-q4km", "gemma4-e4b-qat",
+                 "gemma4-12b-qat", "gemma4-12b-q4km", "gemma4-e4b-qat", "gemma4-12b-agentic",
                  "llama4-scout", "z-image-turbo", "z-image-turbo-q8", "realesrgan-x4")]
     [string]$Model,
     [string]$DestDir
@@ -216,6 +217,23 @@ $Models = @{
         Size  = "~7.3 GB"
         SizeGB = 7.3
         Phase = "issue #124 (fallback — Q4_K_M K-quant cross-check)"
+    }
+    # ── Gemma 4 12B agentic finetune (community) ───────────────────────────────
+    # yuxinlu1's agentic/tool-use + coding finetune of google/gemma-4-12B-it,
+    # distributed as a standard dense `gemma4` (gemma4_unified) GGUF — same arch
+    # as gemma4-12b-q4km, so it loads on the existing dense Gemma 4 text path with
+    # no engine changes. Tuned on multi-step tool-use trajectories (tau2) and
+    # verified coding CoT; emits a <think> chain then the answer. Text-only repo
+    # (no companion mmproj). The upstream Q4_K_M filename follows the same
+    # `gemma4-<variant>-Q4_K_M.gguf` convention as the author's coder v1 repo
+    # (gemma4-coding-Q4_K_M.gguf) — VERIFY against the repo file list before use:
+    #   https://huggingface.co/yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF/tree/main
+    "gemma4-12b-agentic" = @{
+        Files = @("gemma4-agentic-Q4_K_M.gguf")
+        Urls  = @("https://huggingface.co/yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF/resolve/main/gemma4-agentic-Q4_K_M.gguf")
+        Size  = "~7.3 GB"
+        SizeGB = 7.3
+        Phase = "Gemma 4 12B agentic/tool-use finetune (yuxinlu1) — dense gemma4 text path"
     }
     "llama4-scout" = @{
         Files = @(
