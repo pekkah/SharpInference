@@ -171,6 +171,12 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [DefaultValue(false)]
         public bool NoThinking { get; init; }
 
+        [CommandOption("--thinking")]
+        [Description("Enable reasoning mode (sets enable_thinking=true). Needed for Gemma 4 reasoning " +
+            "finetunes, which default off because stock Gemma 4 instruct models aren't reasoning-trained.")]
+        [DefaultValue(false)]
+        public bool Thinking { get; init; }
+
         [CommandOption("--hide-thinking")]
         [Description("Hide reasoning output (the model still reasons; only the answer is shown)")]
         [DefaultValue(false)]
@@ -360,15 +366,19 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             s_endThinkTokenId = endChannelId;
         }
 
-        // Gemma 4 E4B-it brackets a <|channel>thought block in its chat template but is
-        // NOT a reasoning model — rendering enable_thinking=true makes it try to fill a
-        // think section it wasn't trained for and the output degenerates. Default thinking
-        // OFF for Gemma 4 (its recommended config); --no-thinking still forces it off for
-        // every other model. Pass --temp 1.0 --top-k 64 --top-p 0.95 for Gemma 4.
-        bool modelDefaultsThinkingOff = s_arch == "gemma4";
-        s_noThinking = settings.NoThinking || modelDefaultsThinkingOff;
-        if (modelDefaultsThinkingOff && !settings.NoThinking)
-            AnsiConsole.MarkupLine("[dim]Gemma 4 is not a reasoning model — defaulting to --no-thinking " +
+        // Gemma 4's stock instruct models (E4B-it, 12B-it) bracket a <|channel>thought block in
+        // their chat template but are NOT trained to reason — rendering enable_thinking=true makes
+        // them try to fill a think section they weren't trained for and the output degenerates. So
+        // Gemma 4 defaults thinking OFF (its recommended config). Reasoning FINETUNES that share the
+        // same arch/template (e.g. the agentic v2) DO need it on — and nothing in the GGUF metadata
+        // distinguishes a reasoning-trained Gemma 4 from a stock one (identical chat template, tokens,
+        // sampling hints), so --thinking is the explicit opt-in. (--no-thinking forces it off for any
+        // model and wins if both are passed.)
+        bool gemma4DefaultsThinkingOff = s_arch == "gemma4" && !settings.Thinking;
+        s_noThinking = settings.NoThinking || gemma4DefaultsThinkingOff;
+        if (gemma4DefaultsThinkingOff && !settings.NoThinking)
+            AnsiConsole.MarkupLine("[dim]Gemma 4 defaults to --no-thinking (stock instruct models aren't " +
+                "reasoning-trained). For a reasoning finetune pass --thinking " +
                 "(recommended: --temp 1.0 --top-k 64 --top-p 0.95).[/]");
 
         // Greedy on a reasoning model tends to "wait, but actually" itself into infinite
