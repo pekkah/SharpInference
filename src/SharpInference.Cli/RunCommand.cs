@@ -366,17 +366,16 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             s_endThinkTokenId = endChannelId;
         }
 
+        // Resolve reasoning on/off (see ResolveThinkingOff for the full precedence). --no-thinking
+        // and --thinking are opposites; if both are passed --no-thinking wins, so warn rather than
+        // silently dropping --thinking.
+        if (settings.Thinking && settings.NoThinking)
+            AnsiConsole.MarkupLine("[yellow]Warning:[/] both --thinking and --no-thinking given; --no-thinking wins.");
+        s_noThinking = ResolveThinkingOff(s_arch, settings.Thinking, settings.NoThinking);
         // Gemma 4's stock instruct models (E4B-it, 12B-it) bracket a <|channel>thought block in
-        // their chat template but are NOT trained to reason — rendering enable_thinking=true makes
-        // them try to fill a think section they weren't trained for and the output degenerates. So
-        // Gemma 4 defaults thinking OFF (its recommended config). Reasoning FINETUNES that share the
-        // same arch/template (e.g. the agentic v2) DO need it on — and nothing in the GGUF metadata
-        // distinguishes a reasoning-trained Gemma 4 from a stock one (identical chat template, tokens,
-        // sampling hints), so --thinking is the explicit opt-in. (--no-thinking forces it off for any
-        // model and wins if both are passed.)
-        bool gemma4DefaultsThinkingOff = s_arch == "gemma4" && !settings.Thinking;
-        s_noThinking = settings.NoThinking || gemma4DefaultsThinkingOff;
-        if (gemma4DefaultsThinkingOff && !settings.NoThinking)
+        // their chat template but are NOT trained to reason, so Gemma 4 defaults thinking off.
+        // Surface that default (and how to override it) only when we actually defaulted off.
+        if (s_arch == "gemma4" && !settings.Thinking && !settings.NoThinking)
             AnsiConsole.MarkupLine("[dim]Gemma 4 defaults to --no-thinking (stock instruct models aren't " +
                 "reasoning-trained). For a reasoning finetune pass --thinking " +
                 "(recommended: --temp 1.0 --top-k 64 --top-p 0.95).[/]");
@@ -1601,6 +1600,21 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     /// it as literal text.
     /// </summary>
     private static IReadOnlyList<int> BuildStopTokenIds(GgufTokenizer tokenizer) => tokenizer.EogTokenIds;
+
+    /// <summary>
+    /// Resolves whether reasoning ("thinking") should be OFF for this run.
+    /// Precedence: <c>--no-thinking</c> forces it off and wins if both flags are passed;
+    /// <c>--thinking</c> forces it on; with neither, Gemma 4 defaults off (its stock instruct
+    /// models aren't reasoning-trained — nothing in the GGUF metadata distinguishes a reasoning
+    /// finetune from a stock model, so reasoning is opt-in there) while every other architecture
+    /// defaults on. Pure and side-effect-free so the precedence is unit-testable.
+    /// </summary>
+    internal static bool ResolveThinkingOff(string arch, bool thinking, bool noThinking)
+    {
+        if (noThinking) return true;   // explicit off wins over a conflicting --thinking
+        if (thinking)   return false;  // explicit on
+        return arch == "gemma4";       // default: off only for Gemma 4
+    }
 
     // Accept llama.cpp's "draft-mtp" alongside the shorter "mtp" so existing command
     // lines copy-paste over. Unknown values fall back to auto with a console warning.
