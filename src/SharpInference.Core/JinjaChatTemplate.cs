@@ -35,6 +35,15 @@ public sealed class JinjaChatTemplate
 {
     private readonly List<INode> _nodes;
 
+    /// <summary>
+    /// BOS token string for this model (e.g. <c>&lt;bos&gt;</c>), or null if the model doesn't
+    /// prepend BOS. Seeded by <see cref="GgufTokenizer"/> at construction. Chat templates routinely
+    /// open with <c>{{- bos_token -}}</c>; without a value the variable renders empty and the prompt
+    /// ships with no BOS token — Gemma in particular degenerates without it. <see cref="Render"/>
+    /// injects this into the context unless the caller already supplied its own <c>bos_token</c>.
+    /// </summary>
+    public string? BosToken { get; init; }
+
     public JinjaChatTemplate(string source) => _nodes = ParseTemplate(source);
 
     /// <summary>
@@ -45,6 +54,10 @@ public sealed class JinjaChatTemplate
     public string Render(IReadOnlyDictionary<string, object?> context)
     {
         var ctx = new Dictionary<string, object?>(context, StringComparer.Ordinal);
+        // Templates that open with `{{- bos_token -}}` need the BOS string at render time. Seed it
+        // from the model metadata unless the caller passed its own — otherwise the prompt gets no BOS.
+        if (BosToken != null && !ctx.ContainsKey("bos_token"))
+            ctx["bos_token"] = BosToken;
         var sb  = new StringBuilder();
         EvalNodes(_nodes, ctx, sb);
         return sb.ToString();

@@ -289,7 +289,11 @@ public sealed class GgufTokenizer : ITokenizer
 
         if (model.Metadata.TryGetValue("tokenizer.chat_template", out var tmpl) && tmpl is string tmplStr)
         {
-            try { tokenizer.ChatTemplate = new JinjaChatTemplate(tmplStr); }
+            // Seed the BOS string so the template's `{{- bos_token -}}` (Gemma, Llama, …) renders
+            // it instead of an empty string — otherwise the prompt ships with no BOS token, which
+            // Gemma is sensitive to (the model degenerates). Only when the model actually prepends
+            // BOS (add_bos_token); add_bos_token=false models (e.g. Qwen) keep bos_token empty.
+            try { tokenizer.ChatTemplate = new JinjaChatTemplate(tmplStr) { BosToken = addBosToken ? bosToken : null }; }
             catch { /* malformed template — ChatTemplate stays null */ }
         }
 

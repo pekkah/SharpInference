@@ -83,6 +83,42 @@ public sealed class JinjaChatTemplateTests
         Assert.Equal("42", Render(src, ctx));
     }
 
+    // ── bos_token seeding ─────────────────────────────────────────────────────────
+    // Chat templates (Gemma, Llama, …) open with `{{- bos_token -}}`. The model's BOS string is
+    // injected by GgufTokenizer via JinjaChatTemplate.BosToken; without it the prompt ships with
+    // no BOS token and Gemma degenerates. These lock the seeding semantics.
+
+    [Fact]
+    public void BosToken_WhenSet_RendersIntoTemplate()
+    {
+        var tmpl = new JinjaChatTemplate("{{- bos_token -}}<|turn>user\n") { BosToken = "<bos>" };
+        Assert.Equal("<bos><|turn>user\n", tmpl.Render(new Dictionary<string, object?>()));
+    }
+
+    [Fact]
+    public void BosToken_WhenNull_RendersEmpty()
+    {
+        // Default (no BosToken, e.g. add_bos_token=false models like Qwen) — byte-identical to before.
+        var tmpl = new JinjaChatTemplate("{{- bos_token -}}<|turn>user\n");
+        Assert.Equal("<|turn>user\n", tmpl.Render(new Dictionary<string, object?>()));
+    }
+
+    [Fact]
+    public void BosToken_ExplicitContextValue_Wins()
+    {
+        var tmpl = new JinjaChatTemplate("{{- bos_token -}}x") { BosToken = "<bos>" };
+        var ctx = new Dictionary<string, object?> { ["bos_token"] = "<s>" };
+        Assert.Equal("<s>x", tmpl.Render(ctx));
+    }
+
+    [Fact]
+    public void BosToken_WhenTemplateIgnoresIt_OutputUnchanged()
+    {
+        // Seeding a BOS string must not alter templates that never reference bos_token.
+        var tmpl = new JinjaChatTemplate("<|turn>user\nhi") { BosToken = "<bos>" };
+        Assert.Equal("<|turn>user\nhi", tmpl.Render(new Dictionary<string, object?>()));
+    }
+
     // ── loop.previtem / loop.nextitem tests ──────────────────────────────────────
 
     [Fact]
