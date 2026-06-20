@@ -726,17 +726,17 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             InThinking = promptInThinking,
         };
 
-        // Route the first sampled token through the same state machine as the decode loop.
-        // A `<think>` here without an open block opens one; a `</think>` while in a prompt-
-        // seeded block closes it. A stray `</think>` outside a block falls through to
-        // content (same fall-through as decode).
-        if (_thinkingEnabled && firstToken == _thinkTokenId && !seq.InThinking)
+        // Route the first sampled token through the same always-consume state machine as the
+        // decode loop: a reasoning boundary token is consumed and never emitted, with the state
+        // flip gated on the current InThinking. A bare `<channel|>` close (or a double-open) is
+        // swallowed rather than leaking its literal marker as text — issue #304.
+        if (_thinkingEnabled && firstToken == _thinkTokenId)
         {
-            seq.InThinking = true;
+            if (!seq.InThinking) seq.InThinking = true;
         }
-        else if (_thinkingEnabled && firstToken == _endThinkTokenId && seq.InThinking)
+        else if (_thinkingEnabled && firstToken == _endThinkTokenId)
         {
-            seq.InThinking = false;
+            if (seq.InThinking) seq.InThinking = false;
         }
         else
         {

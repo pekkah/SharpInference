@@ -61,11 +61,20 @@ public static class InferenceEngineLoader
         // adapter markers (Gemma 4: <|tool_response>) against the vocab. The chat endpoints add
         // these to the stop set on tool-active requests so the model halts the instant it finishes
         // its tool calls instead of opening a hallucinated trailing turn.
-        var toolBoundaryStopTokenIds = ToolCallAdapterRegistry.Get(arch).ToolBoundaryStopMarkers
+        var toolBoundaryMarkers = ToolCallAdapterRegistry.Get(arch).ToolBoundaryStopMarkers;
+        var toolBoundaryStopTokenIds = toolBoundaryMarkers
             .Select(m => tokenizer.SpecialTokens.TryGetValue(m, out int id) ? id : -1)
             .Where(id => id > 0)
             .Distinct()
             .ToArray();
+        // The adapter declared it needs a tool-boundary stop but none resolved to a vocab id —
+        // agentic generation will run past the tool calls (the #304 symptom) with no other clue.
+        // Warn rather than fail silently (mirrors the image-input diagnostic below).
+        if (toolBoundaryMarkers.Count > 0 && toolBoundaryStopTokenIds.Length == 0)
+            Console.Error.WriteLine(
+                $"[SharpInference] {arch} declares tool-boundary stop markers [{string.Join(", ", toolBoundaryMarkers)}] " +
+                "that were not found in this model's vocab; agentic tool-call generation may run past " +
+                "the tool calls (issue #304).");
 
         // ── 3. Validate TurboQuant up-front so a mis-shaped request fails fast (and not
         // after the model has already been mmap'd into VRAM).
