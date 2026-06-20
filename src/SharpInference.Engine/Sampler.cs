@@ -639,7 +639,7 @@ public sealed record SamplingParams
         if (AdditionalStopTokenIds is not { Length: > 0 } extra)
             return StopTokenIds is { } userStops ? [.. userStops] : eog;
 
-        var set = new HashSet<int>(StopTokenIds ?? (IEnumerable<int>)eog);
+        var set = StopTokenIds is { } baseStops ? new HashSet<int>(baseStops) : new HashSet<int>(eog);
         foreach (int id in extra) set.Add(id);
         return [.. set];
     }

@@ -289,7 +289,11 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
         ITokenizer tokenizer,
         string modelId,
         params IDisposable[] owned)
-        : this(fwd, tokenizer, modelId,
+        // Guard tokenizer before the base initializer dereferences ReasoningTokens, so a null
+        // surfaces as a clear ArgumentNullException rather than an opaque NullReferenceException.
+        : this(fwd ?? throw new ArgumentNullException(nameof(fwd)),
+               tokenizer ?? throw new ArgumentNullException(nameof(tokenizer)),
+               modelId,
                tokenizer.ReasoningTokens.Open, tokenizer.ReasoningTokens.Close, owned)
     {
     }
