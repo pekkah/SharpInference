@@ -327,7 +327,15 @@ public sealed class SamplingDefaults
 /// Compiled Jinja chat template from the model's GGUF metadata, or null when the model
 /// has no <c>tokenizer.chat_template</c> key.
 /// </param>
+/// <param name="ToolBoundaryStopTokenIds">
+/// Token IDs that mark the end of the tool-call section for this model family (Gemma 4:
+/// <c>&lt;|tool_response&gt;</c>), resolved from the adapter's
+/// <see cref="SharpInference.Core.IToolCallAdapter.ToolBoundaryStopMarkers"/> against the vocab.
+/// The chat endpoints add these to the stop set on tool-active requests so the model halts the
+/// instant it finishes its tool calls (issue #304). Null/empty when the family needs none.
+/// </param>
 public sealed record LoadedEngine(
     IInferenceEngine Engine,
     string Architecture,
-    SharpInference.Core.JinjaChatTemplate? ChatTemplate);
+    SharpInference.Core.JinjaChatTemplate? ChatTemplate,
+    IReadOnlyList<int>? ToolBoundaryStopTokenIds = null);

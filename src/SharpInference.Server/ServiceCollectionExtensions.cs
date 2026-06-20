@@ -66,7 +66,8 @@ public static class ServiceCollectionExtensions
             // resolving ChatTemplateRenderer doesn't transitively trigger model loading
             // — important for tests that override IInferenceEngine but expect the
             // renderer to use the safe fallback path.
-            sp.GetRequiredService<ChatTemplateRenderer>().Configure(loaded.Architecture, loaded.ChatTemplate);
+            sp.GetRequiredService<ChatTemplateRenderer>().Configure(
+                loaded.Architecture, loaded.ChatTemplate, loaded.ToolBoundaryStopTokenIds);
 
             return loaded.Engine;
         });

@@ -96,6 +96,18 @@ public interface IToolCallAdapter
     /// <c>{role:"tool", content:string}</c>; some families wrap differently.
     /// </summary>
     Dictionary<string, object?> RenderToolResult(string toolUseId, string resultContent);
+
+    /// <summary>
+    /// Special-token strings that mark the END of this model's tool-call section — i.e. the model
+    /// has finished emitting tool calls and is opening the next (tool-result) turn. A host driving
+    /// an agentic loop can resolve these against the tokenizer's special tokens and add them to its
+    /// stop set so generation halts the instant the tool calls are complete, instead of running on
+    /// and hallucinating a trailing turn. Returns the model-family token so the host doesn't have to
+    /// hardcode it. Empty for families whose end-of-turn / EOG token already covers this boundary;
+    /// Gemma 4 returns <c>&lt;|tool_response&gt;</c> (this QAT line opens a response turn rather than
+    /// emitting <c>&lt;end_of_turn&gt;</c>). See issue #304.
+    /// </summary>
+    IReadOnlyList<string> ToolBoundaryStopMarkers => [];
 }
 
 /// <summary>
@@ -657,8 +669,23 @@ public sealed class Gemma4ToolCallAdapter : IToolCallAdapter
     /// </summary>
     private static readonly string[] ResponseMarkers = ["<|tool_response>", "<tool_response|>"];
 
+    /// <summary>Open/close of Gemma 4's reasoning ("thought") channel — same asymmetric-pipe
+    /// convention as the tool markers: open <c>&lt;|channel&gt;</c>, close <c>&lt;channel|&gt;</c>,
+    /// with a channel label (e.g. <c>thought</c>) and any reasoning content between them.</summary>
+    public const string ChannelOpen  = "<|channel>";
+    public const string ChannelClose = "<channel|>";
+
     public string Architecture => "gemma4";
     public int MaxOpenTagLength => OpenMarker.Length;
+
+    private static readonly string[] s_toolBoundaryStopMarkers = ["<|tool_response>"];
+
+    /// <inheritdoc/>
+    /// <remarks>Gemma 4's QAT instruct line opens a <c>&lt;|tool_response&gt;</c> turn after its
+    /// tool calls instead of emitting <c>&lt;end_of_turn&gt;</c>, so without this stop the engine
+    /// runs on past the (complete, parseable) tool-call block and hallucinates a trailing turn —
+    /// issue #304. The block is left intact because the stop token is consumed, not emitted.</remarks>
+    public IReadOnlyList<string> ToolBoundaryStopMarkers => s_toolBoundaryStopMarkers;
 
     public ToolCallParseResult Parse(string rawOutput)
     {
@@ -683,7 +710,7 @@ public sealed class Gemma4ToolCallAdapter : IToolCallAdapter
                 // Model stopped mid-call (no <tool_call|>): surface the partial as text and flag
                 // truncation rather than emitting a half-parsed call. Matches the streaming path.
                 plain.Append(rawOutput, contentStart, rawOutput.Length - contentStart);
-                return new ToolCallParseResult(ScrubResponseMarkers(plain), calls, Truncated: true);
+                return new ToolCallParseResult(ScrubControlMarkup(plain), calls, Truncated: true);
             }
 
             string block = rawOutput[contentStart..end];
@@ -691,20 +718,60 @@ public sealed class Gemma4ToolCallAdapter : IToolCallAdapter
             foreach (var c in ParseBlock(block)) calls.Add(c);
         }
 
-        return new ToolCallParseResult(ScrubResponseMarkers(plain), calls, Truncated: false);
+        return new ToolCallParseResult(ScrubControlMarkup(plain), calls, Truncated: false);
     }
 
     /// <summary>
-    /// Removes any orphan tool-response turn markers from the accumulated plain text so a
-    /// leftover <c>&lt;|tool_response&gt;</c> (emitted after a tool call) doesn't surface as
-    /// assistant content. Operates on the non-block text only — tool-call blocks were already
-    /// extracted — so a marker that legitimately appears inside a tool argument is untouched.
+    /// Scrubs Gemma 4 turn/channel control markup from the accumulated plain text so it doesn't
+    /// surface as assistant content. Operates on the non-block text only — tool-call blocks were
+    /// already extracted — so a marker that legitimately appears inside a tool argument is untouched.
+    /// Two kinds of markup are removed:
+    /// <list type="bullet">
+    /// <item>orphan tool-response turn markers (<c>&lt;|tool_response&gt;</c>/<c>&lt;tool_response|&gt;</c>),
+    /// emitted when the model opens the next turn after a tool call (issue #150); and</item>
+    /// <item>reasoning-channel blocks (<c>&lt;|channel&gt;label … &lt;channel|&gt;</c>): the header,
+    /// label, and any reasoning content up to the close are dropped, keeping the text before
+    /// <c>&lt;|channel&gt;</c> and after <c>&lt;channel|&gt;</c> — mirroring the GGUF chat template's
+    /// own history scrubber (issue #304). An unterminated <c>&lt;|channel&gt;</c> (no close) drops to
+    /// the end; a bare <c>&lt;channel|&gt;</c> close with no open is removed in place (the
+    /// post-tool generation prompt can prime <c>&lt;|channel&gt;</c>, so the answer pass emits a
+    /// lone close).</item>
+    /// </list>
     /// </summary>
-    private static string ScrubResponseMarkers(StringBuilder plain)
+    private static string ScrubControlMarkup(StringBuilder plain)
     {
         foreach (var marker in ResponseMarkers)
             plain.Replace(marker, "");
-        return plain.ToString();
+
+        string s = plain.ToString();
+        if (s.IndexOf(ChannelOpen, StringComparison.Ordinal) < 0
+            && s.IndexOf(ChannelClose, StringComparison.Ordinal) < 0)
+            return s;
+
+        var sb = new StringBuilder(s.Length);
+        int pos = 0;
+        while (pos < s.Length)
+        {
+            int open = s.IndexOf(ChannelOpen, pos, StringComparison.Ordinal);
+            int closeOnly = s.IndexOf(ChannelClose, pos, StringComparison.Ordinal);
+
+            // A close that precedes the next open (or stands alone) is a bare/orphan close —
+            // drop the marker, keep the surrounding text.
+            if (closeOnly >= 0 && (open < 0 || closeOnly < open))
+            {
+                sb.Append(s, pos, closeOnly - pos);
+                pos = closeOnly + ChannelClose.Length;
+                continue;
+            }
+
+            if (open < 0) { sb.Append(s, pos, s.Length - pos); break; }
+
+            sb.Append(s, pos, open - pos);                                  // text before the block
+            int close = s.IndexOf(ChannelClose, open + ChannelOpen.Length, StringComparison.Ordinal);
+            if (close < 0) break;                                           // unterminated: drop to end
+            pos = close + ChannelClose.Length;                             // resume after the close
+        }
+        return sb.ToString();
     }
 
     public int FindOpenMarker(string buffer, int startSearch, out int contentStart)

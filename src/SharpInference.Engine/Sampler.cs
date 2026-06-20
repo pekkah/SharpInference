@@ -1,3 +1,5 @@
+using System.Collections.Immutable;
+
 namespace SharpInference.Engine;
 
 /// <summary>
@@ -542,7 +544,24 @@ public sealed record SamplingParams
     public float MinP { get; init; } = 0.0f;
     public float RepetitionPenalty { get; init; } = 1.0f;
     public int MaxNewTokens { get; init; } = 512;
+
+    /// <summary>
+    /// Token IDs that halt generation. <b>Replace semantics</b>: when non-null this <em>replaces</em>
+    /// the tokenizer's end-of-generation set (<see cref="ITokenizer.EogTokenIds"/>) rather than
+    /// adding to it — a caller that sets this to add one stop silently loses the EOG tokens unless it
+    /// re-includes them. To ADD stops while keeping EOG, leave this null and use
+    /// <see cref="AdditionalStopTokenIds"/> instead (issue #304).
+    /// </summary>
     public int[]? StopTokenIds { get; init; }
+
+    /// <summary>
+    /// Extra stop token IDs that are <b>always unioned</b> with the effective stop set
+    /// (<see cref="StopTokenIds"/> when set, otherwise <see cref="ITokenizer.EogTokenIds"/>) —
+    /// never replacing it. This is the footgun-free way to add a stop, e.g. a tool-boundary token
+    /// from <see cref="IToolCallAdapter.ToolBoundaryStopMarkers"/> for an agentic loop, without
+    /// dropping the model's end-of-turn / EOS tokens. Null or empty = no additions. See issue #304.
+    /// </summary>
+    public int[]? AdditionalStopTokenIds { get; init; }
 
     /// <summary>
     /// Additive logit bias applied before temperature scaling.
@@ -607,6 +626,23 @@ public sealed record SamplingParams
     /// Issue #38.
     /// </summary>
     public float SpecDraftPMin { get; init; } = 1f;
+
+    /// <summary>
+    /// Resolves the effective stop-token set for a request. <see cref="StopTokenIds"/> REPLACES
+    /// <paramref name="eog"/> when non-null (replace semantics); otherwise <paramref name="eog"/>
+    /// is the base. <see cref="AdditionalStopTokenIds"/> is then unioned on top (de-duplicated),
+    /// never replacing — so adding a stop can't drop the EOG set. With no additions this returns
+    /// the base unchanged, byte-identical to the pre-#304 behavior.
+    /// </summary>
+    internal ImmutableArray<int> ResolveStopSet(ImmutableArray<int> eog)
+    {
+        if (AdditionalStopTokenIds is not { Length: > 0 } extra)
+            return StopTokenIds is { } userStops ? [.. userStops] : eog;
+
+        var set = StopTokenIds is { } baseStops ? new HashSet<int>(baseStops) : new HashSet<int>(eog);
+        foreach (int id in extra) set.Add(id);
+        return [.. set];
+    }
 }
 
 /// <summary>Speculative-decoding type. Mirrors llama.cpp's <c>--spec-type</c>.</summary>

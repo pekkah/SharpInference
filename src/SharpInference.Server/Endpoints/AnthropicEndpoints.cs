@@ -142,6 +142,14 @@ public static class AnthropicEndpoints
             maxTokens:   req.MaxTokens,
             maxThinking: req.Thinking?.BudgetTokens);
 
+        // Tool-active turn: add the model family's tool-boundary stop (Gemma 4: <|tool_response>)
+        // so generation halts when the tool calls finish instead of running on. Additive — keeps
+        // the EOG set (issue #304). Gated on req.Tools to match THIS endpoint's tool-aware
+        // rendering condition above (Anthropic only routes through the rich/tool path when tools
+        // are declared); OpenAI also folds in tool messages in history, mirroring its wider gate.
+        if (req.Tools is { Length: > 0 } && chatTemplate.ToolBoundaryStopTokenIds is { Count: > 0 } toolStops)
+            sp = sp with { AdditionalStopTokenIds = [.. toolStops] };
+
         var msgId = $"msg_{Guid.NewGuid():N}";
         var modelId = engine.ModelId;
 

@@ -330,6 +330,23 @@ public sealed class ChatTemplateRendererTests
     }
 
     [Fact]
+    public void ToolBoundaryStopTokenIds_DefaultEmpty_AndSetByConfigure()
+    {
+        // Issue #304: the loader resolves the adapter's tool-boundary markers (Gemma 4:
+        // <|tool_response>) against the vocab and stashes the IDs here; the chat endpoints add them
+        // to the stop set on tool-active turns. Default is empty until Configure supplies them.
+        var r = new ChatTemplateRenderer("gemma4");
+        Assert.Empty(r.ToolBoundaryStopTokenIds);
+
+        r.Configure("gemma4", null, [50]);
+        Assert.Equal([50], r.ToolBoundaryStopTokenIds);
+
+        // A subsequent Configure without IDs clears them back to empty.
+        r.Configure("gemma4", null);
+        Assert.Empty(r.ToolBoundaryStopTokenIds);
+    }
+
+    [Fact]
     public void JinjaTemplate_TakesPrecedenceOverArchFallback()
     {
         // Once configured with a Jinja template, the architecture fallback is bypassed.

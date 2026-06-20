@@ -347,24 +347,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         var tokenizer = GgufTokenizer.FromGgufModel(model);
         s_jinja = tokenizer.ChatTemplate;
 
-        // Reasoning models (Qwen3, DeepSeek-R1, SmolLM3, ...) register <think>/</think>
-        // as control tokens in their GGUF. The decode loops no-op when these IDs are -1.
-        if (tokenizer.SpecialTokens.TryGetValue("<think>", out int thinkId)
-            && tokenizer.SpecialTokens.TryGetValue("</think>", out int endThinkId)
-            && thinkId > 0 && endThinkId > 0)
-        {
-            s_thinkTokenId = thinkId;
-            s_endThinkTokenId = endThinkId;
-        }
-        // Gemma 4 brackets its reasoning in <|channel>thought … <channel|> instead. Route it
-        // through the same think/end-think machinery so the markers don't leak into output.
-        else if (tokenizer.SpecialTokens.TryGetValue("<|channel>", out int channelId)
-            && tokenizer.SpecialTokens.TryGetValue("<channel|>", out int endChannelId)
-            && channelId > 0 && endChannelId > 0)
-        {
-            s_thinkTokenId = channelId;
-            s_endThinkTokenId = endChannelId;
-        }
+        // Reasoning boundary tokens: ChatML <think>/</think> (Qwen3, DeepSeek-R1, SmolLM3, ...)
+        // or Gemma 4's <|channel>thought … <channel|>. Resolved once on the tokenizer so the CLI,
+        // server, and engine share one definition. The decode loops no-op when these IDs are -1.
+        (s_thinkTokenId, s_endThinkTokenId) = tokenizer.ReasoningTokens;
 
         // Resolve reasoning on/off (see ResolveThinkingOff for the full precedence). --no-thinking
         // and --thinking are opposites; if both are passed --no-thinking wins, so warn rather than
@@ -1559,18 +1545,28 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     /// </summary>
     private static bool EmitToken(int next, GgufTokenizer tok, Utf8StreamDecoder streamDec, ref bool inThinking, bool hideThinking = false)
     {
+        // Reasoning boundary tokens are always consumed (never printed), with the state flip
+        // gated on the current mode so a malformed double-open or a bare close — e.g. Gemma 4's
+        // post-tool prompt primes <|channel>, so the answer pass emits a lone <channel|> with no
+        // open — is swallowed rather than rendered as a literal marker (issue #304).
         if (next == s_thinkTokenId)
         {
-            inThinking = true;
-            // No trailing \n: the model often emits its own leading newline inside the block,
-            // and a double break before the reasoning starts looks noisy.
-            Console.Write("\x1b[2m[Thinking...] ");
+            if (!inThinking)
+            {
+                inThinking = true;
+                // No trailing \n: the model often emits its own leading newline inside the block,
+                // and a double break before the reasoning starts looks noisy.
+                Console.Write("\x1b[2m[Thinking...] ");
+            }
             return false;
         }
-        if (next == s_endThinkTokenId && inThinking)
+        if (next == s_endThinkTokenId)
         {
-            inThinking = false;
-            Console.Write("\x1b[0m\n");
+            if (inThinking)
+            {
+                inThinking = false;
+                Console.Write("\x1b[0m\n");
+            }
             return false;
         }
         // Stream through the same UTF-8 decoder regardless of mode so multibyte
