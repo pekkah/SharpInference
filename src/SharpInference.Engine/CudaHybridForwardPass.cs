@@ -257,6 +257,13 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     public int VocabSize => _hp.VocabSize;
 
     /// <summary>
+    /// Bind this pass's CUDA context to the calling thread (issue #302). The engine calls it on
+    /// the worker thread that drives the forward pass before any CUDA work, so a non-interactive
+    /// session doesn't hang on the first unbound-thread CUDA call.
+    /// </summary>
+    public void BindToCurrentThread() => _gpu.BindContextToCurrentThread();
+
+    /// <summary>
     /// Truncate the KV cache to the given length, discarding positions >= length.
     /// Used by speculative decoding to rewind rejected draft tokens.
     /// </summary>

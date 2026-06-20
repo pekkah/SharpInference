@@ -1,3 +1,5 @@
+using SharpInference.Core;
+
 namespace SharpInference.Engine;
 
 /// <summary>
@@ -19,7 +21,7 @@ public interface ISequenceKvCache : IDisposable
 /// today; a CUDA implementation (per-sequence GPU KV caches + batched decode) can slot in behind
 /// the same interface without the engine knowing which backend it drives.
 /// </summary>
-public interface IBatchedForwardPass
+public interface IBatchedForwardPass : IThreadAffineBackend
 {
     /// <summary>Allocate a fresh, empty per-sequence KV cache for one admitted sequence.</summary>
     ISequenceKvCache CreateCache();

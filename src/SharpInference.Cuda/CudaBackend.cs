@@ -6195,6 +6195,18 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private static          bool     t_primaryCtxBoundOnThisThread;
 
     /// <summary>
+    /// Make the process-wide device-0 primary CUDA context current on the calling thread (issue
+    /// #302). CUDA contexts are thread-affine; a consumer that drives the forward pass from a
+    /// thread other than the one that loaded the model (e.g. an engine worker thread, or a
+    /// thread-pool continuation) must bind the context first, or in a non-interactive session the
+    /// first CUDA call on that thread can hang forever. Idempotent and cheap after the first call
+    /// per thread (the underlying <see cref="EnsurePrimaryContextCurrent"/> short-circuits on a
+    /// ThreadStatic flag). The forward passes expose this through
+    /// <c>IThreadAffineBackend.BindToCurrentThread</c>.
+    /// </summary>
+    public void BindContextToCurrentThread() => EnsurePrimaryContextCurrent();
+
+    /// <summary>
     /// Ensure the device's primary context is current on the calling thread. Cheap after
     /// the first call per thread (single ThreadStatic check). The retained primary context
     /// is the same one cuBLAS attaches to, so once it's current on a thread the entire
