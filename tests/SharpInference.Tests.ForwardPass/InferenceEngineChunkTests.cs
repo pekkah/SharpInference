@@ -263,6 +263,103 @@ public sealed class InferenceEngineChunkTests
         Assert.Equal("Y", answerText);
     }
 
+    // ── Bare / orphan boundary tokens (issue #304) ──────────────────────────
+
+    [Fact]
+    public async Task GenerateChunksAsync_BareCloseWithNoOpen_IsSwallowedNotLeaked()
+    {
+        // Gemma 4's post-tool generation prompt can prime <|channel>, so the answer pass emits a
+        // bare close (here </think>) with no matching open while NOT in thinking mode. The boundary
+        // token must be consumed, never decoded as literal text into the Text stream.
+        var scripted = new int[] { TokX, TokEndThink, TokY, TokEos };
+        var tokenizer = new ScriptedTokenizer();   // prompt = [TokHi], decode starts outside thinking
+        var fwd = new ScriptedForwardPass(scripted, tokenizer.VocabSize);
+        using var engine = new InferenceEngine(
+            fwd, tokenizer, "mock",
+            thinkTokenId: TokThink, endThinkTokenId: TokEndThink);
+
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 10 };
+        var chunks = new List<GenerateChunk>();
+        await foreach (var c in engine.GenerateChunksAsync("seed", sp))
+            chunks.Add(c);
+
+        var thinkingText = string.Concat(chunks.Where(c => c.Kind == GenerateChunkKind.Thinking).Select(c => c.Text));
+        var answerText = string.Concat(chunks.Where(c => c.Kind == GenerateChunkKind.Text).Select(c => c.Text));
+
+        Assert.Equal("", thinkingText);
+        Assert.Equal("XY", answerText);   // the bare </think> never reached the stream
+        foreach (var c in chunks)
+            Assert.DoesNotContain("</think>", c.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GenerateChunksAsync_ConvenienceCtor_AutoResolvesReasoningSplit()
+    {
+        // Issue #304: an in-process consumer using the convenience constructor (no explicit think
+        // IDs) must still get the reasoning split, resolved from ITokenizer.ReasoningTokens — else
+        // a Gemma 4 host leaks <|channel> markers into Text.
+        var scripted = new int[] { TokThink, TokX, TokEndThink, TokY, TokEos };
+        var tokenizer = new ScriptedTokenizer { ReasoningOverride = (TokThink, TokEndThink) };
+        var fwd = new ScriptedForwardPass(scripted, tokenizer.VocabSize);
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock");   // convenience ctor
+
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 10 };
+        var chunks = new List<GenerateChunk>();
+        await foreach (var c in engine.GenerateChunksAsync("seed", sp))
+            chunks.Add(c);
+
+        var thinkingText = string.Concat(chunks.Where(c => c.Kind == GenerateChunkKind.Thinking).Select(c => c.Text));
+        var answerText = string.Concat(chunks.Where(c => c.Kind == GenerateChunkKind.Text).Select(c => c.Text));
+        Assert.Equal("X", thinkingText);
+        Assert.Equal("Y", answerText);
+    }
+
+    [Fact]
+    public async Task GenerateChunksAsync_AdditionalStopTokenIds_AddsStopWithoutDroppingEog()
+    {
+        // AdditionalStopTokenIds is unioned with EOG, not a replacement (issue #304). Stop fires on
+        // the added token (TokThere) even though EOG (TokEos) is unchanged.
+        var scripted = new int[] { TokHi, TokThere, TokX, TokEos };
+        var tokenizer = new ScriptedTokenizer();
+        var fwd = new ScriptedForwardPass(scripted, tokenizer.VocabSize);
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock", thinkTokenId: -1, endThinkTokenId: -1);
+
+        var sp = new SamplingParams
+        {
+            Temperature = 0f,
+            MaxNewTokens = 10,
+            AdditionalStopTokenIds = [TokThere],   // no StopTokenIds → base set stays EOG
+        };
+        var sb = new StringBuilder();
+        await foreach (var s in engine.GenerateAsync("seed", sp))
+            sb.Append(s);
+
+        Assert.Equal("Hi", sb.ToString());   // stopped at the added token, TokX never reached
+    }
+
+    [Fact]
+    public async Task GenerateChunksAsync_AdditionalStopTokenIds_KeepsEogStop()
+    {
+        // The companion case: with an additional stop set that the model never emits, the EOG token
+        // (TokEos) must still halt generation — proving the union didn't drop EOG.
+        var scripted = new int[] { TokHi, TokEos, TokX };
+        var tokenizer = new ScriptedTokenizer();
+        var fwd = new ScriptedForwardPass(scripted, tokenizer.VocabSize);
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock", thinkTokenId: -1, endThinkTokenId: -1);
+
+        var sp = new SamplingParams
+        {
+            Temperature = 0f,
+            MaxNewTokens = 10,
+            AdditionalStopTokenIds = [TokThere],   // never emitted by the script
+        };
+        var sb = new StringBuilder();
+        await foreach (var s in engine.GenerateAsync("seed", sp))
+            sb.Append(s);
+
+        Assert.Equal("Hi", sb.ToString());   // halted on EOS; "<eos>" never leaked as text
+    }
+
     // ── Mocks ─────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -287,6 +384,11 @@ public sealed class InferenceEngineChunkTests
         /// <summary>When set, overrides the end-of-generation set (default is just EOS).</summary>
         public System.Collections.Immutable.ImmutableArray<int>? EogOverride { get; set; }
         public System.Collections.Immutable.ImmutableArray<int> EogTokenIds => EogOverride ?? [EosTokenId];
+
+        /// <summary>Reasoning boundary tokens reported to the engine's convenience constructor
+        /// (default disabled). Set to exercise <see cref="ITokenizer.ReasoningTokens"/> auto-resolution.</summary>
+        public (int Open, int Close) ReasoningOverride { get; set; } = (-1, -1);
+        public (int Open, int Close) ReasoningTokens => ReasoningOverride;
 
         public int[] PromptTokens { get; set; } = [TokHi];
 

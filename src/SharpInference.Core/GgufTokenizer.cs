@@ -49,6 +49,9 @@ public sealed class GgufTokenizer : ITokenizer
     /// <summary>All special (control) tokens keyed by their string representation.</summary>
     public IReadOnlyDictionary<string, int> SpecialTokens => _specialTokens;
 
+    /// <inheritdoc/>
+    public (int Open, int Close) ReasoningTokens { get; }
+
     /// <summary>The type name of the inner tokenizer (for diagnostics).</summary>
     public string InnerTokenizerType => _inner.GetType().Name;
 
@@ -90,6 +93,30 @@ public sealed class GgufTokenizer : ITokenizer
         PadTokenId = padTokenId;
         AddBosToken = addBosToken;
         EogTokenIds = eogTokenIds;
+        ReasoningTokens = ResolveReasoningTokens(specialTokens);
+    }
+
+    /// <summary>
+    /// Resolves the open/close special-token IDs that bracket a model's reasoning stream so an
+    /// engine can split it into a separate thinking channel. Tries the ChatML
+    /// <c>&lt;think&gt;</c>/<c>&lt;/think&gt;</c> convention first, then Gemma 4's
+    /// <c>&lt;|channel&gt;</c>/<c>&lt;channel|&gt;</c> "thought" channel (single special tokens —
+    /// the template strips every channel block from history, so treating the whole block as
+    /// reasoning matches the model's own content/thought split). Both IDs must be positive — id 0
+    /// is usually <c>&lt;pad&gt;</c>/<c>&lt;unk&gt;</c> and would mis-trigger — and both must be
+    /// present. No match returns <c>(-1, -1)</c>, leaving reasoning-stream splitting disabled.
+    /// </summary>
+    internal static (int Open, int Close) ResolveReasoningTokens(IReadOnlyDictionary<string, int> specialTokens)
+    {
+        if (specialTokens.TryGetValue("<think>", out int tid)
+            && specialTokens.TryGetValue("</think>", out int eid)
+            && tid > 0 && eid > 0)
+            return (tid, eid);
+        if (specialTokens.TryGetValue("<|channel>", out int cid)
+            && specialTokens.TryGetValue("<channel|>", out int ceid)
+            && cid > 0 && ceid > 0)
+            return (cid, ceid);
+        return (-1, -1);
     }
 
     /// <summary>

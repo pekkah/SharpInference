@@ -142,6 +142,12 @@ public static class AnthropicEndpoints
             maxTokens:   req.MaxTokens,
             maxThinking: req.Thinking?.BudgetTokens);
 
+        // Tool-active turn: add the model family's tool-boundary stop (Gemma 4: <|tool_response>)
+        // so generation halts when the tool calls finish instead of running on. Additive — keeps
+        // the EOG set (issue #304).
+        if (req.Tools is { Length: > 0 } && chatTemplate.ToolBoundaryStopTokenIds is { Count: > 0 } toolStops)
+            sp = sp with { AdditionalStopTokenIds = [.. toolStops] };
+
         var msgId = $"msg_{Guid.NewGuid():N}";
         var modelId = engine.ModelId;
 

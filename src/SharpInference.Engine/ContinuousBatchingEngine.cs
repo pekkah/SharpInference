@@ -371,22 +371,29 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                     if (_thinkingEnabled && next == _thinkTokenId) seq.ThinkingCount = 0;
                     else if (seq.InThinking) seq.ThinkingCount++;
 
-                    // Reasoning boundary tokens: flip state, consume the token, do NOT emit content.
-                    // Each direction requires the opposite state, so malformed double <think>
-                    // or orphan </think> falls through to the content path below.
-                    if (_thinkingEnabled && next == _thinkTokenId && !seq.InThinking)
+                    // Reasoning boundary tokens are ALWAYS consumed and never emitted. State flips
+                    // only on a valid transition, so a malformed double-open or an orphan close is
+                    // swallowed rather than leaking its literal marker as text — e.g. a bare Gemma 4
+                    // <channel|> close with no preceding open (issue #304).
+                    if (_thinkingEnabled && next == _thinkTokenId)
                     {
-                        var textTail = seq.TextDec.Flush();
-                        if (textTail.Length > 0)
-                            seq.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, textTail));
-                        seq.InThinking = true;
+                        if (!seq.InThinking)
+                        {
+                            var textTail = seq.TextDec.Flush();
+                            if (textTail.Length > 0)
+                                seq.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, textTail));
+                            seq.InThinking = true;
+                        }
                     }
-                    else if (_thinkingEnabled && next == _endThinkTokenId && seq.InThinking)
+                    else if (_thinkingEnabled && next == _endThinkTokenId)
                     {
-                        var thinkTail = seq.ThinkDec.Flush();
-                        if (thinkTail.Length > 0)
-                            seq.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Thinking, thinkTail));
-                        seq.InThinking = false;
+                        if (seq.InThinking)
+                        {
+                            var thinkTail = seq.ThinkDec.Flush();
+                            if (thinkTail.Length > 0)
+                                seq.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Thinking, thinkTail));
+                            seq.InThinking = false;
+                        }
                     }
                     else
                     {
@@ -672,8 +679,9 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         // Stop on ANY end-of-generation token, not just the configured EOS — matches the
         // single-user InferenceEngine path. A model with an alternate end token (e.g. Gemma's
         // <eos>, distinct from its <turn|> EOS) would otherwise decode it as text and run on.
+        // StopTokenIds replaces this set; AdditionalStopTokenIds is unioned on top (issue #304).
         System.Collections.Immutable.ImmutableArray<int> stopIds =
-            req.Sp.StopTokenIds is { } userStops ? [.. userStops] : _tokenizer.EogTokenIds;
+            req.Sp.ResolveStopSet(_tokenizer.EogTokenIds);
         var rng = new Random();
 
         int firstToken = req.Sp.Temperature <= 0f

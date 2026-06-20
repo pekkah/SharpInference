@@ -356,6 +356,88 @@ public sealed class ToolCallAdapterTests
         Assert.Single(calls);
     }
 
+    // ── Gemma 4 reasoning-channel scrub (issue #304) ────────────────────────────
+
+    [Fact]
+    public void Gemma4_Parse_ScrubsChannelHeader_KeepsAnswer()
+    {
+        // enable_thinking=false primes an empty thought channel; the answer follows the close.
+        // The <|channel>thought<channel|> header must not survive in PlainText; the answer must.
+        var a = new Gemma4ToolCallAdapter();
+        var (plain, calls) = a.Parse("<|channel>thought<channel|>The answer is 42.");
+        Assert.Equal("The answer is 42.", plain);
+        Assert.Empty(calls);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_ScrubsChannelBlockWithReasoningContent()
+    {
+        // A full thought block (header + reasoning content) is dropped entirely; only the text
+        // before <|channel> and after <channel|> survives — mirrors the chat template's scrubber.
+        var a = new Gemma4ToolCallAdapter();
+        var (plain, _) = a.Parse("Sure. <|channel>thought\nlet me think hard<channel|>Done.");
+        Assert.Equal("Sure. Done.", plain);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_ScrubsBareChannelClose()
+    {
+        // The post-tool generation prompt can prime <|channel>, so the answer pass emits a lone
+        // <channel|> close with no preceding open. The bare marker is removed, surrounding text kept.
+        var a = new Gemma4ToolCallAdapter();
+        var (plain, _) = a.Parse("<channel|>The file reads three variables.");
+        Assert.Equal("The file reads three variables.", plain);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_ScrubsUnterminatedChannelOpen()
+    {
+        // An unterminated <|channel> (model stopped mid-thought) drops the marker and everything
+        // after it — matching the template's split-on-close history scrubber.
+        var a = new Gemma4ToolCallAdapter();
+        var (plain, _) = a.Parse("Prefix.<|channel>thought\nreasoning with no close");
+        Assert.Equal("Prefix.", plain);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_ScrubsChannelAfterToolCall()
+    {
+        // The exact #304 agentic-loop shape: a tool call, then a channel-wrapped answer.
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:read_file{path:<|\"|>a.cs<|\"|>}<tool_call|><|channel>thought<channel|>It imports two modules.";
+        var (plain, calls) = a.Parse(raw);
+        Assert.Equal("It imports two modules.", plain);
+        Assert.Single(calls);
+        Assert.Equal("read_file", calls[0].Name);
+    }
+
+    [Fact]
+    public void Gemma4_Parse_DoesNotScrubChannelMarkupInsideToolArgument()
+    {
+        // A channel-looking substring inside a quoted tool argument is part of the extracted
+        // block, not PlainText, so it must round-trip into the argument untouched.
+        var a = new Gemma4ToolCallAdapter();
+        var raw = "<|tool_call>call:echo{text:<|\"|>say <|channel>hi<channel|> now<|\"|>}<tool_call|>";
+        var (plain, calls) = a.Parse(raw);
+        Assert.Equal("", plain);
+        Assert.Single(calls);
+        Assert.Equal("say <|channel>hi<channel|> now", calls[0].Arguments["text"]);
+    }
+
+    [Fact]
+    public void Gemma4_ToolBoundaryStopMarkers_IsToolResponseOpen()
+    {
+        Assert.Equal(["<|tool_response>"], new Gemma4ToolCallAdapter().ToolBoundaryStopMarkers);
+    }
+
+    [Theory]
+    [InlineData("qwen2")]
+    [InlineData("qwen3coder")]
+    [InlineData("llama")]
+    [InlineData("deepseek2")]
+    public void NonGemma4_ToolBoundaryStopMarkers_AreEmpty(string arch) =>
+        Assert.Empty(ToolCallAdapterRegistry.Get(arch).ToolBoundaryStopMarkers);
+
     [Fact]
     public void Gemma4_FindMarkers_RoundTripsBlock()
     {

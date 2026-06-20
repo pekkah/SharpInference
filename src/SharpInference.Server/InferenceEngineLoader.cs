@@ -55,7 +55,17 @@ public static class InferenceEngineLoader
             ? (string)a
             : opts.Architecture;
         var modelId = Path.GetFileNameWithoutExtension(modelPath);
-        var (thinkTokenId, endThinkTokenId) = ResolveReasoningTokens(tokenizer);
+        var (thinkTokenId, endThinkTokenId) = tokenizer.ReasoningTokens;
+
+        // Tool-boundary stop tokens for agentic loops (issue #304): resolve the architecture's
+        // adapter markers (Gemma 4: <|tool_response>) against the vocab. The chat endpoints add
+        // these to the stop set on tool-active requests so the model halts the instant it finishes
+        // its tool calls instead of opening a hallucinated trailing turn.
+        var toolBoundaryStopTokenIds = ToolCallAdapterRegistry.Get(arch).ToolBoundaryStopMarkers
+            .Select(m => tokenizer.SpecialTokens.TryGetValue(m, out int id) ? id : -1)
+            .Where(id => id > 0)
+            .Distinct()
+            .ToArray();
 
         // ── 3. Validate TurboQuant up-front so a mis-shaped request fails fast (and not
         // after the model has already been mmap'd into VRAM).
@@ -159,7 +169,7 @@ public static class InferenceEngineLoader
             throw;
         }
 
-        return new LoadedEngine(engine, arch, tokenizer.ChatTemplate);
+        return new LoadedEngine(engine, arch, tokenizer.ChatTemplate, toolBoundaryStopTokenIds);
     }
 
     // ── Backend dispatch ─────────────────────────────────────────────────────
@@ -365,32 +375,6 @@ public static class InferenceEngineLoader
         // the engine's VRAM-fit auto-select) untouched.
         if (opts.CpuMoe is bool cpuMoe)
             Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", cpuMoe ? "1" : "0");
-    }
-
-    /// <summary>
-    /// Resolves the open/close special-token IDs that bracket a model's reasoning stream so
-    /// the engine can split it into a separate <c>Thinking</c> channel. Tries the ChatML
-    /// <c>&lt;think&gt;</c>/<c>&lt;/think&gt;</c> convention first, then Gemma 4's
-    /// <c>&lt;|channel&gt;</c>/<c>&lt;channel|&gt;</c> "thought" channel. Both IDs must be
-    /// positive — id 0 is usually <c>&lt;pad&gt;</c>/<c>&lt;unk&gt;</c> and would mis-trigger —
-    /// and both must be present. No match leaves reasoning-stream splitting disabled (the
-    /// engine emits Text chunks only), which is why a Gemma model would otherwise leak raw
-    /// <c>&lt;|channel&gt;thought…&lt;channel|&gt;</c> markers into the assistant content.
-    /// </summary>
-    private static (int thinkTokenId, int endThinkTokenId) ResolveReasoningTokens(GgufTokenizer tokenizer)
-    {
-        if (tokenizer.SpecialTokens.TryGetValue("<think>", out int tid)
-            && tokenizer.SpecialTokens.TryGetValue("</think>", out int eid)
-            && tid > 0 && eid > 0)
-            return (tid, eid);
-        // Gemma 4 wraps reasoning in <|channel>thought … <channel|> (single special tokens).
-        // The template strips every channel block from history, so treating the whole block
-        // as reasoning matches the model's own content/thought split.
-        if (tokenizer.SpecialTokens.TryGetValue("<|channel>", out int cid)
-            && tokenizer.SpecialTokens.TryGetValue("<channel|>", out int ceid)
-            && cid > 0 && ceid > 0)
-            return (cid, ceid);
-        return (-1, -1);
     }
 
     /// <summary>

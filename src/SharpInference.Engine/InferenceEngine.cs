@@ -275,15 +275,22 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
     public bool MultiSlotPrefixActive => _slots is not null;
 
     /// <summary>
-    /// Back-compat constructor preserving the original positional signature
-    /// (no reasoning-token IDs). Equivalent to passing <c>thinkTokenId = -1</c>.
+    /// Convenience constructor that auto-resolves the reasoning-stream boundary tokens from the
+    /// tokenizer (<see cref="ITokenizer.ReasoningTokens"/>) so an in-process consumer gets the
+    /// same Thinking/Text split the server and CLI configure — without having to re-derive the
+    /// model-family convention. A tokenizer that defines none (the default) yields
+    /// <c>(-1, -1)</c>, leaving the engine in plain text-only mode exactly as before. Pass the
+    /// explicit five-argument constructor with <c>thinkTokenId = -1</c> to force the split off.
+    /// (Fixes issue #304: a Gemma 4 host using this constructor leaked <c>&lt;|channel&gt;</c>
+    /// markers because the split was hardcoded off here.)
     /// </summary>
     public InferenceEngine(
         IForwardPass fwd,
         ITokenizer tokenizer,
         string modelId,
         params IDisposable[] owned)
-        : this(fwd, tokenizer, modelId, thinkTokenId: -1, endThinkTokenId: -1, owned)
+        : this(fwd, tokenizer, modelId,
+               tokenizer.ReasoningTokens.Open, tokenizer.ReasoningTokens.Close, owned)
     {
     }
 
@@ -613,8 +620,11 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                     // ignore the Usage kind.
                     channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Usage, "", promptTokenCount));
                     var rng = new Random();
+                    // Explicit StopTokenIds REPLACE the EOG set; AdditionalStopTokenIds are unioned
+                    // on top so a caller can add a stop (e.g. a tool-boundary token) without dropping
+                    // EOG — issue #304.
                     System.Collections.Immutable.ImmutableArray<int> stopIds =
-                        sp.StopTokenIds is { } userStops ? [.. userStops] : _tokenizer.EogTokenIds;
+                        sp.ResolveStopSet(_tokenizer.EogTokenIds);
 
                     // Issue #102: canonical-history prefix resolution. The endpoint passes a
                     // chat-template render of just the message history (add_generation_prompt=false);
@@ -1001,28 +1011,36 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         if (thinkingEnabled && next == thinkId) thinkingCount = 0;
                         else if (inThinking) thinkingCount++;
 
-                        // Reasoning boundary tokens: flip state, consume the token, do NOT emit.
-                        // Both directions require the *opposite* state — a malformed second
-                        // <think> mid-reasoning, or a stray </think> with no open block, falls
-                        // through to the content path below rather than silently corrupting state.
-                        if (thinkingEnabled && next == thinkId && !inThinking)
+                        // Reasoning boundary tokens are ALWAYS consumed and never emitted (the
+                        // documented contract). State flips only on a valid transition, so a
+                        // malformed double-open or an orphan close is swallowed instead of leaking
+                        // its literal marker as text — e.g. Gemma 4's post-tool generation prompt
+                        // primes <|channel>, so the answer pass can emit a bare <channel|> close
+                        // with no preceding open (issue #304).
+                        if (thinkingEnabled && next == thinkId)
                         {
-                            // Flush any pending text bytes before entering thinking mode.
-                            var textTail = textDec.Flush();
-                            if (textTail.Length > 0)
-                                channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, textTail));
-                            inThinking = true;
+                            if (!inThinking)
+                            {
+                                // Flush any pending text bytes before entering thinking mode.
+                                var textTail = textDec.Flush();
+                                if (textTail.Length > 0)
+                                    channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Text, textTail));
+                                inThinking = true;
+                            }
                             if (useGpuArgmax) gpuNext = _fwd.ForwardArgmax(next, startPos + i).Token;
                             else logits = _fwd.Forward(next, startPos + i);
                             continue;
                         }
-                        if (thinkingEnabled && next == endThinkId && inThinking)
+                        if (thinkingEnabled && next == endThinkId)
                         {
-                            // Flush thinking-decoder tail as a final Thinking chunk.
-                            var thinkTail = thinkDec.Flush();
-                            if (thinkTail.Length > 0)
-                                channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Thinking, thinkTail));
-                            inThinking = false;
+                            if (inThinking)
+                            {
+                                // Flush thinking-decoder tail as a final Thinking chunk.
+                                var thinkTail = thinkDec.Flush();
+                                if (thinkTail.Length > 0)
+                                    channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Thinking, thinkTail));
+                                inThinking = false;
+                            }
                             if (useGpuArgmax) gpuNext = _fwd.ForwardArgmax(next, startPos + i).Token;
                             else logits = _fwd.Forward(next, startPos + i);
                             continue;

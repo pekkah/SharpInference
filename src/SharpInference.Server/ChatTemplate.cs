@@ -83,6 +83,15 @@ public sealed class ChatTemplateRenderer
     /// </summary>
     public IToolCallAdapter ToolCallAdapter => _toolCallAdapter;
 
+    /// <summary>
+    /// Token IDs that mark the end of the loaded model's tool-call section (Gemma 4:
+    /// <c>&lt;|tool_response&gt;</c>), resolved at <see cref="Configure"/> time from the adapter's
+    /// <see cref="IToolCallAdapter.ToolBoundaryStopMarkers"/> against the model vocab. The chat
+    /// endpoints union these into the stop set on tool-active requests so generation halts when the
+    /// tool calls finish instead of running on (issue #304). Empty for families that need none.
+    /// </summary>
+    public IReadOnlyList<int> ToolBoundaryStopTokenIds { get; private set; } = [];
+
     /// <param name="architecture">Default architecture (used both for fallback and exposed via <see cref="Architecture"/>).</param>
     /// <param name="template">Optional compiled Jinja template; null means "use the hardcoded fallback".</param>
     public ChatTemplateRenderer(string architecture = "qwen2", JinjaChatTemplate? template = null)
@@ -96,12 +105,16 @@ public sealed class ChatTemplateRenderer
     /// Reconfigures the renderer with model-specific metadata. Called by the built-in
     /// engine loader once the GGUF file has been opened. Safe to call once; subsequent
     /// calls overwrite previous values (used by hot-reload scenarios).
+    /// <paramref name="toolBoundaryStopTokenIds"/> are the vocab-resolved tool-boundary stops
+    /// (see <see cref="ToolBoundaryStopTokenIds"/>); null leaves the set empty.
     /// </summary>
-    public void Configure(string architecture, JinjaChatTemplate? template)
+    public void Configure(string architecture, JinjaChatTemplate? template,
+        IReadOnlyList<int>? toolBoundaryStopTokenIds = null)
     {
         _architecture = architecture;
         _template = template;
         _toolCallAdapter = ToolCallAdapterRegistry.Get(architecture);
+        ToolBoundaryStopTokenIds = toolBoundaryStopTokenIds ?? [];
     }
 
     /// <param name="messages">Messages in order (system, user, assistant, ...).</param>

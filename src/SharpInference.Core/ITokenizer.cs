@@ -38,4 +38,16 @@ public interface ITokenizer
 
     /// <summary>Whether BOS token should be automatically prepended.</summary>
     bool AddBosToken { get; }
+
+    /// <summary>
+    /// The <c>(Open, Close)</c> special-token IDs that bracket this model's reasoning stream, or
+    /// <c>(-1, -1)</c> when the vocabulary defines none. An engine uses these to split the
+    /// reasoning channel out of the user-facing text stream (boundary tokens themselves are
+    /// consumed, never emitted). Covers both the ChatML <c>&lt;think&gt;</c>/<c>&lt;/think&gt;</c>
+    /// convention and Gemma 4's <c>&lt;|channel&gt;</c>/<c>&lt;channel|&gt;</c> "thought" channel.
+    /// Default: none — only a vocab-backed tokenizer (e.g. <see cref="GgufTokenizer"/>) resolves a
+    /// real pair, so every consumer that constructs an engine gets the same split without
+    /// re-deriving the convention itself.
+    /// </summary>
+    (int Open, int Close) ReasoningTokens => (-1, -1);
 }

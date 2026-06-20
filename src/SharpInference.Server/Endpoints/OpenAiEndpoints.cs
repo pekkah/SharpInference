@@ -152,6 +152,12 @@ public static class OpenAiEndpoints
             maxThinking: req.MaxThinkingTokens,
             logitBias:   logitBias);
 
+        // Tool-active agentic turn: add the model family's tool-boundary stop (Gemma 4:
+        // <|tool_response>) so generation halts the instant the tool calls finish rather than
+        // running on into a hallucinated trailing turn. Additive — keeps the EOG set (issue #304).
+        if (toolsActive && chatTemplate.ToolBoundaryStopTokenIds is { Count: > 0 } toolStops)
+            sp = sp with { AdditionalStopTokenIds = [.. toolStops] };
+
         var requestId = $"chatcmpl-{Guid.NewGuid():N}";
         long created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 

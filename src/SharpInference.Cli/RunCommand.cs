@@ -347,24 +347,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         var tokenizer = GgufTokenizer.FromGgufModel(model);
         s_jinja = tokenizer.ChatTemplate;
 
-        // Reasoning models (Qwen3, DeepSeek-R1, SmolLM3, ...) register <think>/</think>
-        // as control tokens in their GGUF. The decode loops no-op when these IDs are -1.
-        if (tokenizer.SpecialTokens.TryGetValue("<think>", out int thinkId)
-            && tokenizer.SpecialTokens.TryGetValue("</think>", out int endThinkId)
-            && thinkId > 0 && endThinkId > 0)
-        {
-            s_thinkTokenId = thinkId;
-            s_endThinkTokenId = endThinkId;
-        }
-        // Gemma 4 brackets its reasoning in <|channel>thought … <channel|> instead. Route it
-        // through the same think/end-think machinery so the markers don't leak into output.
-        else if (tokenizer.SpecialTokens.TryGetValue("<|channel>", out int channelId)
-            && tokenizer.SpecialTokens.TryGetValue("<channel|>", out int endChannelId)
-            && channelId > 0 && endChannelId > 0)
-        {
-            s_thinkTokenId = channelId;
-            s_endThinkTokenId = endChannelId;
-        }
+        // Reasoning boundary tokens: ChatML <think>/</think> (Qwen3, DeepSeek-R1, SmolLM3, ...)
+        // or Gemma 4's <|channel>thought … <channel|>. Resolved once on the tokenizer so the CLI,
+        // server, and engine share one definition. The decode loops no-op when these IDs are -1.
+        (s_thinkTokenId, s_endThinkTokenId) = tokenizer.ReasoningTokens;
 
         // Resolve reasoning on/off (see ResolveThinkingOff for the full precedence). --no-thinking
         // and --thinking are opposites; if both are passed --no-thinking wins, so warn rather than
