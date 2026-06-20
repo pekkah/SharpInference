@@ -1511,10 +1511,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             }
             if (verbosePromptLogging)
             {
-                var logitsArr = logits.ToArray();
-                var top5 = Enumerable.Range(0, logitsArr.Length).OrderByDescending(j => logitsArr[j]).Take(5)
-                    .Select(j => $"{j}({logitsArr[j]:F2})");
-                Console.Error.WriteLine($"[DBG] tok={i} next={next}('{tok.Decode([next])}') stop={sp.StopTokenIds.Contains(next)} top5:{string.Join(" ", top5)}");
+                Console.Error.WriteLine($"[DBG] tok={i} next={next}('{tok.Decode([next])}') stop={sp.StopTokenIds.Contains(next)} top5:{FormatTopLogits(logits, 5)}");
             }
             if (sp.StopTokenIds.Contains(next)) break;
             // Counter resets on each <think> open (in case the model opens multiple blocks)
@@ -1577,6 +1574,48 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         if (!(hideThinking && inThinking))
             Console.Write(rendered);
         return !inThinking;
+    }
+
+    /// <summary>
+    /// Formats the <paramref name="k"/> highest-logit token candidates as
+    /// <c>idx(value) idx(value) …</c> (descending by value, ties broken by lower index) for the
+    /// <c>--verbose-prompt</c> debug line. Issue #155: a single O(V·k) pass over the logits span
+    /// keeping the k best — no <c>logits.ToArray()</c> copy and no full O(V·logV) vocab sort per
+    /// decode token (a ~1 MB alloc + sort on Gemma 4's 262144-token vocab that badly skewed
+    /// decode t/s under <c>--verbose-prompt</c>).
+    /// </summary>
+    internal static string FormatTopLogits(ReadOnlySpan<float> logits, int k)
+    {
+        k = Math.Min(k, logits.Length);
+        if (k <= 0) return "";
+
+        Span<float> bestVal = stackalloc float[k];
+        Span<int> bestIdx = stackalloc int[k];
+        bestVal.Fill(float.NegativeInfinity);
+        bestIdx.Fill(-1);
+
+        for (int i = 0; i < logits.Length; i++)
+        {
+            float v = logits[i];
+            // Strict '>' keeps the earliest (lowest) index on ties, matching a stable
+            // OrderByDescending over ascending indices: a later equal value never displaces.
+            if (v <= bestVal[k - 1]) continue;
+            bestVal[k - 1] = v;
+            bestIdx[k - 1] = i;
+            for (int j = k - 1; j > 0 && bestVal[j] > bestVal[j - 1]; j--)
+            {
+                (bestVal[j], bestVal[j - 1]) = (bestVal[j - 1], bestVal[j]);
+                (bestIdx[j], bestIdx[j - 1]) = (bestIdx[j - 1], bestIdx[j]);
+            }
+        }
+
+        var sb = new System.Text.StringBuilder(k * 12);
+        for (int j = 0; j < k && bestIdx[j] >= 0; j++)
+        {
+            if (j > 0) sb.Append(' ');
+            sb.Append(bestIdx[j]).Append('(').Append($"{bestVal[j]:F2}").Append(')');
+        }
+        return sb.ToString();
     }
 
     private static string s_arch = "qwen2"; // set during model load
