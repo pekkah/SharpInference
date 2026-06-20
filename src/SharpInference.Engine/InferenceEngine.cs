@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
@@ -34,6 +35,19 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
     // shutdown stops the in-flight background worker promptly rather than letting it
     // run to MaxNewTokens (issue #132).
     private readonly CancellationTokenSource _shutdownCts = new();
+
+    // Issue #302: a single dedicated, long-lived thread that drives every forward pass for this
+    // engine. CUDA contexts are thread-affine — running the forward pass on arbitrary Task.Run
+    // pool threads (the old model) deadlocks the first CUDA call in a non-interactive session,
+    // where the driver does not keep the device's primary context current on freshly-scheduled
+    // worker threads. A stable thread binds the backend context once (the first request's
+    // _fwd.BindToCurrentThread, idempotent thereafter) and keeps CUDA streams/graphs on one
+    // consistent thread for the engine's lifetime. _gate already serializes requests to one at a
+    // time, so a single engine thread per device is sufficient. The per-request streaming
+    // Channel<GenerateChunk> is unchanged; only the producer's execution context moved off the
+    // thread pool. Background so a leaked/undisposed engine never blocks process exit.
+    private readonly BlockingCollection<Action> _engineWork = new();
+    private readonly Thread _engineThread;
 
     // Prefix caching state (guarded by _gate — only accessed during generation).
     private int[]? _prevTokens;
@@ -200,6 +214,56 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                     "falling back to single-slot prefix cache.");
             }
         }
+
+        // Issue #302: start the dedicated forward-pass thread. It binds the backend's thread-
+        // affine context on the first work item and then serves generation work in arrival order
+        // until Dispose completes the queue.
+        _engineThread = new Thread(EngineThreadLoop)
+        {
+            IsBackground = true,
+            Name = "sharpi-engine",
+        };
+        _engineThread.Start();
+    }
+
+    /// <summary>
+    /// Body of the dedicated forward-pass thread (issue #302). Runs queued generation work items
+    /// in arrival order until <see cref="Dispose"/> / <see cref="DisposeAsync"/> completes the
+    /// queue. Each work item binds the CUDA context (idempotent; a no-op on CPU/Vulkan) and routes
+    /// its own exceptions to its per-request channel, so this loop only needs a last-resort guard
+    /// to keep a surprise escape from tearing down the shared thread and stranding later requests.
+    /// </summary>
+    private void EngineThreadLoop()
+    {
+        foreach (var work in _engineWork.GetConsumingEnumerable())
+        {
+            try
+            {
+                work();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[InferenceEngine] forward-pass work item threw unexpectedly: {ex}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Issue #302: queue <paramref name="work"/> onto the dedicated forward-pass thread and return
+    /// a task that completes when it finishes. Replaces the old <c>Task.Run</c>, which dispatched
+    /// the forward pass to an arbitrary pool thread the CUDA context wasn't bound to. The work item
+    /// reports its own errors through the request's channel and never throws, so this only needs to
+    /// signal completion (so the generation's drain in the <c>finally</c> can release the gate).
+    /// </summary>
+    private Task RunOnEngineThread(Action work)
+    {
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _engineWork.Add(() =>
+        {
+            try { work(); }
+            finally { tcs.TrySetResult(); }
+        });
+        return tcs.Task;
     }
 
     /// <summary>
@@ -514,8 +578,9 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
             int endThinkId = _endThinkTokenId;
             bool thinkingEnabled = thinkId >= 0 && endThinkId >= 0;
 
-            // Run the blocking CPU generation on a thread-pool thread.
-            var genTask = Task.Run(() =>
+            // Run the blocking generation on the engine's dedicated forward-pass thread (issue
+            // #302), not an arbitrary thread-pool thread — CUDA contexts are thread-affine.
+            var genTask = RunOnEngineThread(() =>
             {
                 // Per-request perf trace (issue: server feels slow on big agentic prompts).
                 // Splits encode / prefill / decode so a huge-prompt request shows where the
@@ -534,6 +599,11 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                 int activeSlotIdx = -1;
                 try
                 {
+                    // Issue #302: bind the backend's thread-affine context (CUDA) to this thread
+                    // before the first CUDA call. No-op on CPU/Vulkan and free after the first
+                    // call on the (stable) engine thread; kept inside the try so a bind failure
+                    // surfaces through this request's channel instead of hanging the consumer.
+                    _fwd.BindToCurrentThread();
                     var tokens = _tokenizer.Encode(prompt).ToArray();
                     promptTokenCount = tokens.Length;
                     encodeMs = swReq.ElapsedMilliseconds;
@@ -1032,7 +1102,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                             ttftMs >= 0 ? ttftMs : totalMs, decodeTokens, decTps, totalMs);
                     }
                 }
-            }, ct);
+            });
 
             try
             {
@@ -1126,6 +1196,30 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                 "live worker. Ensure consumers dispose their generation enumerators and that the backend is responsive.");
             return;
         }
+        // Issue #302: stop the dedicated forward-pass thread before freeing the pass it drives.
+        // Safe here because `drained` means the gate was re-acquired — no work item is running,
+        // and request admission is gated by that same gate, so none can be enqueued after this.
+        // CompleteAdding ends the thread's consuming loop; Join awaits its exit (it is idle, so
+        // this returns at once) before the forward pass is disposed below.
+        _engineWork.CompleteAdding();
+        _engineThread.Join();
+        _engineWork.Dispose();
+
+        // Issue #302: the teardown below frees thread-affine backend resources (CUDA device
+        // buffers / streams / modules) on this disposing thread, not the now-exited engine
+        // thread. Bind the context here too, so a host that disposes from an unbound pool thread
+        // (e.g. StopAsync) frees cleanly instead of failing on an invalid current context. The
+        // engine thread has already been joined, so the context is no longer current there.
+        // No-op on CPU/Vulkan; idempotent. Best-effort: a bind failure here must not abort
+        // teardown (the frees below may then fail, but we still free everything we can).
+        try { _fwd.BindToCurrentThread(); }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                $"[InferenceEngine] could not bind backend context for teardown ({ex.GetType().Name}: {ex.Message}); " +
+                "freeing anyway.");
+        }
+
         // Issue #212: dispose the scratch slot(s) the engine allocated (slot 0 is the pass's
         // OwnedSlot — owned/freed by _fwd.Dispose, never disposed here). Done before _fwd.Dispose
         // so the scratch tensors free while the backend is still live.

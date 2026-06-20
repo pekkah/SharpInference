@@ -4,7 +4,7 @@ namespace SharpInference.Core;
 /// Abstraction over a transformer forward pass. Supports both autoregressive decode (Forward)
 /// and position truncation needed by speculative decoding.
 /// </summary>
-public interface IForwardPass : IDisposable
+public interface IForwardPass : IDisposable, IThreadAffineBackend
 {
     /// <summary>Run one token through the model and return logits[vocabSize].</summary>
     ReadOnlySpan<float> Forward(int token, int position);

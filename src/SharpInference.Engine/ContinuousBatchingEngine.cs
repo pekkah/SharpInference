@@ -255,6 +255,13 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         {
         while (!_disposed)
         {
+            // Issue #302: rebind the backend's thread-affine context (CUDA) before any forward
+            // work this iteration. The loop's `await WaitToReadAsync().ConfigureAwait(false)` on
+            // the idle path can resume the continuation on a different thread-pool thread than the
+            // one that ran the previous step, so a single bind before the loop wouldn't hold. The
+            // call is a no-op on CPU/Vulkan and free after the first call per thread.
+            _fwd.BindToCurrentThread();
+
             // Pull everything queued so far into the local pending queue. Channels have
             // no peek, and admission backpressure needs to inspect the head request's
             // size without consuming it — hence the local FIFO.

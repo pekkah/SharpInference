@@ -706,6 +706,13 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     public LayerPlacement Placement => _placement;
 
     /// <summary>
+    /// Bind this pass's CUDA context to the calling thread (issue #302). The engine calls it on
+    /// the worker thread that drives the forward pass before any CUDA work, so a non-interactive
+    /// session doesn't hang on the first unbound-thread CUDA call.
+    /// </summary>
+    public void BindToCurrentThread() => _gpu.BindContextToCurrentThread();
+
+    /// <summary>
     /// Host-side bookkeeping cache. Holds slot/length state only — the actual K/V
     /// payload for attention layers lives on the GPU in <c>_gpuKCache</c> /
     /// <c>_gpuVCache</c>. Exposed so tests can assert SnapKV (issue #58)

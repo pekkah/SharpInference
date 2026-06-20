@@ -614,6 +614,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     public int MaxSeqLen => _maxSeqLen;
 
     /// <summary>
+    /// Bind this pass's CUDA context to the calling thread (issue #302). One public method
+    /// satisfies <see cref="IThreadAffineBackend.BindToCurrentThread"/> for both
+    /// <see cref="IForwardPass"/> and <see cref="IBatchedForwardPass"/> — the engines call it on
+    /// the worker thread that drives the forward pass before issuing any CUDA work, so a
+    /// non-interactive session doesn't hang on the first unbound-thread CUDA call.
+    /// </summary>
+    public void BindToCurrentThread() => _gpu.BindContextToCurrentThread();
+
+    /// <summary>
     /// Test-only accessor for the post-prefill KV slot count. After a SnapKV-active
     /// prefill this is the keep-set size (≤ budget); otherwise it's the prompt length.
     /// </summary>
