@@ -1511,10 +1511,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             }
             if (verbosePromptLogging)
             {
-                var logitsArr = logits.ToArray();
-                var top5 = Enumerable.Range(0, logitsArr.Length).OrderByDescending(j => logitsArr[j]).Take(5)
-                    .Select(j => $"{j}({logitsArr[j]:F2})");
-                Console.Error.WriteLine($"[DBG] tok={i} next={next}('{tok.Decode([next])}') stop={sp.StopTokenIds.Contains(next)} top5:{string.Join(" ", top5)}");
+                Console.Error.WriteLine($"[DBG] tok={i} next={next}('{tok.Decode([next])}') stop={sp.StopTokenIds.Contains(next)} top5:{FormatTopLogits(logits, 5)}");
             }
             if (sp.StopTokenIds.Contains(next)) break;
             // Counter resets on each <think> open (in case the model opens multiple blocks)
@@ -1577,6 +1574,66 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         if (!(hideThinking && inThinking))
             Console.Write(rendered);
         return !inThinking;
+    }
+
+    /// <summary>
+    /// Formats the <paramref name="k"/> highest-logit token candidates as
+    /// <c>idx(value) idx(value) …</c> (descending by value, ties broken by lower index) for the
+    /// <c>--verbose-prompt</c> debug line. Issue #155: a single O(V·k) pass over the logits span
+    /// keeping the k best — no <c>logits.ToArray()</c> copy and no full O(V·logV) vocab sort per
+    /// decode token (a ~1 MB alloc + sort on Gemma 4's 262144-token vocab that badly skewed
+    /// decode t/s under <c>--verbose-prompt</c>).
+    /// </summary>
+    internal static string FormatTopLogits(ReadOnlySpan<float> logits, int k)
+    {
+        k = Math.Min(k, logits.Length);
+        if (k <= 0) return "";
+
+        // count-tracked insertion (not a value sentinel) so a real -Infinity logit still occupies
+        // a slot and is printed — the old LINQ path showed it, and --verbose-prompt is exactly the
+        // tool you reach for when a model emits non-finite garbage (#155 review). Stackalloc only
+        // for small k (matches Sampler.FindKthLargest); heap-fall back guards against a large k
+        // passed by some other caller stack-overflowing (#155 review).
+        Span<float> bestVal = k <= 256 ? stackalloc float[k] : new float[k];
+        Span<int> bestIdx = k <= 256 ? stackalloc int[k] : new int[k];
+        int count = 0;
+
+        for (int i = 0; i < logits.Length; i++)
+        {
+            float v = logits[i];
+            // Skip only when the set is full AND v doesn't outrank the current worst. Ranking
+            // matches a stable OrderByDescending: higher value first, NaN sorts last, equal values
+            // keep the earlier (lower) index — so a later equal value never displaces.
+            if (count == k && !SortsBefore(v, bestVal[k - 1])) continue;
+
+            int pos = count < k ? count : k - 1;
+            while (pos > 0 && SortsBefore(v, bestVal[pos - 1]))
+            {
+                bestVal[pos] = bestVal[pos - 1];
+                bestIdx[pos] = bestIdx[pos - 1];
+                pos--;
+            }
+            bestVal[pos] = v;
+            bestIdx[pos] = i;
+            if (count < k) count++;
+        }
+
+        var sb = new System.Text.StringBuilder(k * 12);
+        for (int j = 0; j < count; j++)
+        {
+            if (j > 0) sb.Append(' ');
+            sb.Append(bestIdx[j]).Append('(').Append($"{bestVal[j]:F2}").Append(')');
+        }
+        return sb.ToString();
+
+        // True when a ranks strictly above b in a descending sort (higher value first; NaN is
+        // least), matching Comparer<float> as used by OrderByDescending.
+        static bool SortsBefore(float a, float b)
+        {
+            if (float.IsNaN(a)) return false;
+            if (float.IsNaN(b)) return true;
+            return a > b;
+        }
     }
 
     private static string s_arch = "qwen2"; // set during model load
