@@ -53,6 +53,26 @@ public sealed class VerbosePromptTopKTests
         Assert.Equal(ReferenceTopK(logits, 5), RunCommand.FormatTopLogits(logits, 5));
     }
 
+    [Fact]
+    public void NegativeInfinity_IsPrintedNotDropped()
+    {
+        // --verbose-prompt is the tool you use when a model emits non-finite garbage, so a
+        // -Infinity entry that lands in the top-k must still be shown (matches the old LINQ path).
+        float[] logits = [float.NegativeInfinity, 1f, float.NegativeInfinity];
+        Assert.Equal("1(1.00) 0(-Infinity) 2(-Infinity)", RunCommand.FormatTopLogits(logits, 3));
+        Assert.Equal(ReferenceTopK(logits, 3), RunCommand.FormatTopLogits(logits, 3));
+    }
+
+    [Fact]
+    public void NonFiniteValues_MatchReference()
+    {
+        // Mixed ±Infinity and NaN against the LINQ oracle: NaN sorts last, -Infinity above NaN,
+        // +Infinity first — exactly Comparer<float> / OrderByDescending semantics.
+        float[] logits = [float.NaN, 2f, float.PositiveInfinity, float.NegativeInfinity, float.NaN, 2f];
+        foreach (int k in new[] { 1, 2, 4, 6 })
+            Assert.Equal(ReferenceTopK(logits, k), RunCommand.FormatTopLogits(logits, k));
+    }
+
     [Theory]
     [InlineData(1)]
     [InlineData(5)]

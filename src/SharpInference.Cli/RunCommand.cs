@@ -1589,33 +1589,49 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         k = Math.Min(k, logits.Length);
         if (k <= 0) return "";
 
+        // count-tracked insertion (not a value sentinel) so a real -Infinity logit still occupies
+        // a slot and is printed — the old LINQ path showed it, and --verbose-prompt is exactly the
+        // tool you reach for when a model emits non-finite garbage (#155 review).
         Span<float> bestVal = stackalloc float[k];
         Span<int> bestIdx = stackalloc int[k];
-        bestVal.Fill(float.NegativeInfinity);
-        bestIdx.Fill(-1);
+        int count = 0;
 
         for (int i = 0; i < logits.Length; i++)
         {
             float v = logits[i];
-            // Strict '>' keeps the earliest (lowest) index on ties, matching a stable
-            // OrderByDescending over ascending indices: a later equal value never displaces.
-            if (v <= bestVal[k - 1]) continue;
-            bestVal[k - 1] = v;
-            bestIdx[k - 1] = i;
-            for (int j = k - 1; j > 0 && bestVal[j] > bestVal[j - 1]; j--)
+            // Skip only when the set is full AND v doesn't outrank the current worst. Ranking
+            // matches a stable OrderByDescending: higher value first, NaN sorts last, equal values
+            // keep the earlier (lower) index — so a later equal value never displaces.
+            if (count == k && !SortsBefore(v, bestVal[k - 1])) continue;
+
+            int pos = count < k ? count : k - 1;
+            while (pos > 0 && SortsBefore(v, bestVal[pos - 1]))
             {
-                (bestVal[j], bestVal[j - 1]) = (bestVal[j - 1], bestVal[j]);
-                (bestIdx[j], bestIdx[j - 1]) = (bestIdx[j - 1], bestIdx[j]);
+                bestVal[pos] = bestVal[pos - 1];
+                bestIdx[pos] = bestIdx[pos - 1];
+                pos--;
             }
+            bestVal[pos] = v;
+            bestIdx[pos] = i;
+            if (count < k) count++;
         }
 
         var sb = new System.Text.StringBuilder(k * 12);
-        for (int j = 0; j < k && bestIdx[j] >= 0; j++)
+        for (int j = 0; j < count; j++)
         {
             if (j > 0) sb.Append(' ');
             sb.Append(bestIdx[j]).Append('(').Append($"{bestVal[j]:F2}").Append(')');
         }
         return sb.ToString();
+
+        // True when a ranks strictly above b in a descending sort (higher value first; NaN is
+        // least), matching Comparer<float> as used by OrderByDescending.
+        static bool SortsBefore(float a, float b)
+        {
+            if (float.IsNaN(a)) return false;
+            if (float.IsNaN(b)) return true;
+            return a > b;
+        }
     }
 
     private static string s_arch = "qwen2"; // set during model load
