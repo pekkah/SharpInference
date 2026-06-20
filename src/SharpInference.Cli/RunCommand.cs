@@ -1591,9 +1591,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         // count-tracked insertion (not a value sentinel) so a real -Infinity logit still occupies
         // a slot and is printed — the old LINQ path showed it, and --verbose-prompt is exactly the
-        // tool you reach for when a model emits non-finite garbage (#155 review).
-        Span<float> bestVal = stackalloc float[k];
-        Span<int> bestIdx = stackalloc int[k];
+        // tool you reach for when a model emits non-finite garbage (#155 review). Stackalloc only
+        // for small k (matches Sampler.FindKthLargest); heap-fall back guards against a large k
+        // passed by some other caller stack-overflowing (#155 review).
+        Span<float> bestVal = k <= 256 ? stackalloc float[k] : new float[k];
+        Span<int> bestIdx = k <= 256 ? stackalloc int[k] : new int[k];
         int count = 0;
 
         for (int i = 0; i < logits.Length; i++)
