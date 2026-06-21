@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using Vortice.Vulkan;
 
 namespace SharpInference.Vulkan;
@@ -32,6 +33,43 @@ public sealed unsafe class ComputePipeline : IDisposable
 
     // Public for tests/diagnostics that need to assert per-recording DS isolation.
     public int CurrentRecordingDispatchCount => _recordingIdx;
+
+    // Matches "local_size_x = <N>" inside a GLSL layout(...) qualifier (scoped to the
+    // qualifier so a stray mention in a comment can't false-match). Every compute shader in
+    // this backend declares it as a literal; used to decide subgroup-size pinning (issue #318).
+    private static readonly Regex LocalSizeXRegex =
+        new(@"layout\s*\([^)]*local_size_x\s*=\s*(\d+)", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Parse the <c>local_size_x</c> workgroup dimension from GLSL source.
+    /// Returns 0 if not found (which disables subgroup-size pinning — every real compute
+    /// shader declares one, so a 0 result signals a malformed/non-compute source).
+    /// </summary>
+    internal static int ParseLocalSizeX(string glsl)
+    {
+        var m = LocalSizeXRegex.Match(glsl);
+        return m.Success ? int.Parse(m.Groups[1].Value) : 0;
+    }
+
+    /// <summary>
+    /// Whether requiredSubgroupSize=32 should be pinned for a shader with the given
+    /// <paramref name="localSizeX"/> on the given <paramref name="backend"/> (issue #318).
+    /// True only when:
+    ///   • the extension is present, AND
+    ///   • 32 lies within the supported subgroup-size range, AND
+    ///   • the device is NOT already locked to exactly 32 (min==max==32) — on such devices
+    ///     (e.g. NVIDIA) every subgroup is already 32 wide, so pinning is a pure no-op and we
+    ///     skip it to avoid forcing the driver's required-subgroup-size pipeline path, AND
+    ///   • the workgroup x-dimension is a whole multiple of 32 (so a 32-wide subgroup is valid —
+    ///     pinning 32 on the 16-thread image-op workgroups would make pipeline creation fail).
+    /// The bug only manifests when the device could pick a non-32 subgroup (AMD Wave64 → 64;
+    /// Intel → possibly &lt;32), which is exactly the !(min==max==32) case.
+    /// </summary>
+    internal static bool ShouldPinSubgroupSize32(VulkanBackend backend, int localSizeX) =>
+        backend.HasSubgroupSizeControl
+        && backend.MinSubgroupSize <= 32 && 32 <= backend.MaxSubgroupSize
+        && !(backend.MinSubgroupSize == 32 && backend.MaxSubgroupSize == 32)
+        && localSizeX > 0 && localSizeX % 32 == 0;
 
     /// <summary>
     /// Create a compute pipeline from GLSL source.
@@ -101,14 +139,31 @@ public sealed unsafe class ComputePipeline : IDisposable
         vkd.vkCreatePipelineLayout(&pipelineLayoutCI, null, &pipeLayout).CheckResult();
         _pipelineLayout = pipeLayout;
 
-        // 4. Compute pipeline
+        // 4. Compute pipeline.
+        // Pin requiredSubgroupSize=32 for reduction shaders (issue #318): they pack
+        // "8 rows × 32 lanes" and assume a 32-wide subgroup, which breaks on AMD Wave64
+        // (subgroup 64 → subgroupAdd sums across two rows). Pin only when the workgroup
+        // x-dim is a multiple of 32 (the 256/128 reduction shaders) — pinning 32 on the
+        // 16-thread image-op shaders would make the workgroup smaller than one subgroup and
+        // pipeline creation would fail. On NVIDIA (subgroup already 32) this is a no-op.
+        int localSizeX = ParseLocalSizeX(glslSource);
+        bool pinSubgroup = ShouldPinSubgroupSize32(backend, localSizeX);
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo requiredSgSize = new()
+        {
+            requiredSubgroupSize = 32,
+        };
+
         var entryName = "main"u8;
+        // requiredSgSize is a stack local; &requiredSgSize stays valid for the whole synchronous
+        // vkCreateComputePipelines call below. It is chained into the shader-stage pNext only when
+        // pinning is enabled (issue #318).
         fixed (byte* entryPtr = entryName)
         {
             VkComputePipelineCreateInfo pipelineCI = new()
             {
                 stage = new VkPipelineShaderStageCreateInfo
                 {
+                    pNext = pinSubgroup ? &requiredSgSize : null,
                     stage = VkShaderStageFlags.Compute,
                     module = _shaderModule,
                     pName = entryPtr,
