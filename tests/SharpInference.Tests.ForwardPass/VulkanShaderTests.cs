@@ -432,6 +432,15 @@ public sealed unsafe class VulkanShaderTests
         AssertVulkanMatVecMatchesCpu(weights, matRows, matCols, DType.Q4_0, inputSeed: 7);
     }
 
+    [Fact]
+    public void MatVecQ5KMatchesCpu()
+    {
+        const int matRows = 131;      // not a multiple of 8 → partial workgroup
+        const int matCols = 512;      // 2 blocks of 256
+        var weights = BuildQ5_K(matRows, matCols, seed: 5151);
+        AssertVulkanMatVecMatchesCpu(weights, matRows, matCols, DType.Q5_K, inputSeed: 7);
+    }
+
     private static void AssertVulkanMatVecMatchesCpu(
         byte[] weightBytes, int matRows, int matCols, DType dtype, int inputSeed)
     {
@@ -528,6 +537,29 @@ public sealed unsafe class VulkanShaderTests
             PutHalf(bytes, off, (float)(rng.NextDouble() * 0.045 + 0.005));
             for (int j = 0; j < qk / 2; j++)
                 bytes[off + 2 + j] = (byte)(rng.Next(0, 256)); // two packed nibbles
+            off += blockBytes;
+        }
+        return bytes;
+    }
+
+    // Q5_K: 176 bytes/block over 256 elements. Layout matches DequantQ5K:
+    //   [0:2] FP16 d, [2:4] FP16 dmin, [4:16] 12 packed 6-bit scale/min bytes,
+    //   [16:48] 32 qh high-bit bytes, [48:176] 128 ql low-4-bit bytes.
+    // Any byte values are valid for the scale/qh/ql arrays (the 6-bit unpack just
+    // reads them); cols must be a multiple of 256.
+    private static byte[] BuildQ5_K(int rows, int cols, int seed)
+    {
+        const int qk = 256, blockBytes = 176;
+        int blocksPerRow = cols / qk;
+        var bytes = new byte[rows * blocksPerRow * blockBytes];
+        var rng = new Random(seed);
+        int off = 0;
+        for (int b = 0; b < rows * blocksPerRow; b++)
+        {
+            PutHalf(bytes, off, (float)(rng.NextDouble() * 0.045 + 0.005));      // d
+            PutHalf(bytes, off + 2, (float)(rng.NextDouble() * 0.002 + 0.0005)); // dmin
+            for (int j = 4; j < blockBytes; j++)                                 // scales+qh+ql
+                bytes[off + j] = (byte)rng.Next(0, 256);
             off += blockBytes;
         }
         return bytes;

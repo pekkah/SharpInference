@@ -1192,6 +1192,120 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Matrix-vector multiply with Q5_K dequantization.
+    /// Each workgroup computes 8 output rows (8 rows × 32 lanes = 256 threads).
+    /// Push constants: { uint rows, uint cols }.
+    /// Bindings: 0=quantized weights (uint8), 1=input vector (float), 2=output (float).
+    ///
+    /// Q5_K block layout (176 bytes per 256 elements):
+    ///   [0:2]     FP16 d (super-block scale)
+    ///   [2:4]     FP16 dmin (super-block minimum)
+    ///   [4:16]    12 bytes packed 6-bit (scale, min) pairs (8 pairs, same packing as Q4_K)
+    ///   [16:48]   qh[32] — high bit per element (one bit, 8 polarities × 32 lanes)
+    ///   [48:176]  ql[128] — lower 4 bits, two elements per byte
+    /// Dequant per chunk c∈0..3, lane l∈0..31 (matches CPU DequantQ5K / CUDA llm_matvec_q5k):
+    ///   y[64c+l]    = d*sc[2c]  * ((ql[32c+l]&0xF) + (qh[l]&(1<<2c)   ?16:0)) - dmin*m[2c]
+    ///   y[64c+l+32] = d*sc[2c+1]* ((ql[32c+l]>>4)  + (qh[l]&(1<<(2c+1))?16:0)) - dmin*m[2c+1]
+    /// The 6-bit (scale, min) unpack reuses the exact Q4_K logic (Q5_K packs scales
+    /// identically); Q5_K only adds the qh high bit (+16) per quant. The super-block
+    /// d/dmin and the 12 scale/min bytes occupy bytes [0:16] of each 176-byte block,
+    /// which is 4-byte aligned, so they're read as four aligned uint words (like
+    /// MatVecQ4K); the per-lane qh/ql bytes are byte-granular and use the byte-gather
+    /// helper. Mirrors the CUDA llm_matvec_q5k kernel and the CPU DequantQ5K path.
+    /// </summary>
+    internal const string MatVecQ5K = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+        #extension GL_KHR_shader_subgroup_arithmetic : enable
+
+        #define N_ROWS 8
+        #define THREADS_PER_ROW 32
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Weights { uint weights_data[]; };
+        layout(binding = 1) readonly buffer Input   { float input_data[]; };
+        layout(binding = 2) writeonly buffer Output  { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint rows;
+            uint cols;
+        };
+
+        uint gByte(uint b) { return (weights_data[b >> 2] >> ((b & 3) * 8)) & 0xFF; }
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint row_in_wg = tid / THREADS_PER_ROW;
+            uint lane = tid % THREADS_PER_ROW;
+            uint row = gl_WorkGroupID.x * N_ROWS + row_in_wg;
+            if (row >= rows) return;
+
+            uint num_blocks = cols >> 8;            // cols / 256
+            uint boff_base = row * num_blocks * 176;
+
+            float acc = 0.0;
+
+            for (uint block = 0; block < num_blocks; block++) {
+                uint b0 = boff_base + block * 176;
+
+                // b0 is always a multiple of 176 (hence 4-byte aligned), so the first
+                // 16 bytes (d/dmin + 12 scale/min bytes) read as four aligned uint words,
+                // exactly like MatVecQ4K — 4 global reads instead of 16 gByte gathers.
+                uint word_base = b0 >> 2;
+                vec2 dm = unpackHalf2x16(weights_data[word_base]);
+                float d    = dm.x;
+                float dmin = dm.y;
+
+                // 12 packed scale/min bytes at b0+4 (identical packing to Q4_K).
+                // sm0 = scales[0..3], sm1 = scales[4..7], sm2 = scales[8..11].
+                uint sm0 = weights_data[word_base + 1];
+                uint sm1 = weights_data[word_base + 2];
+                uint sm2 = weights_data[word_base + 3];
+
+                float dsc[8], dmn[8];
+                dsc[0] = d * float((sm0) & 63);         dmn[0] = dmin * float((sm1) & 63);
+                dsc[1] = d * float((sm0 >> 8) & 63);    dmn[1] = dmin * float((sm1 >> 8) & 63);
+                dsc[2] = d * float((sm0 >> 16) & 63);   dmn[2] = dmin * float((sm1 >> 16) & 63);
+                dsc[3] = d * float((sm0 >> 24) & 63);   dmn[3] = dmin * float((sm1 >> 24) & 63);
+                dsc[4] = d * float((sm2 & 0xF) | (((sm0 >> 6) & 3) << 4));
+                dmn[4] = dmin * float(((sm2 >> 4) & 0xF) | (((sm1 >> 6) & 3) << 4));
+                dsc[5] = d * float(((sm2 >> 8) & 0xF) | (((sm0 >> 14) & 3) << 4));
+                dmn[5] = dmin * float(((sm2 >> 12) & 0xF) | (((sm1 >> 14) & 3) << 4));
+                dsc[6] = d * float(((sm2 >> 16) & 0xF) | (((sm0 >> 22) & 3) << 4));
+                dmn[6] = dmin * float(((sm2 >> 20) & 0xF) | (((sm1 >> 22) & 3) << 4));
+                dsc[7] = d * float(((sm2 >> 24) & 0xF) | (((sm0 >> 30) & 3) << 4));
+                dmn[7] = dmin * float(((sm2 >> 28) & 0xF) | (((sm1 >> 30) & 3) << 4));
+
+                // High bit for this lane: one qh byte per lane (qh[lane]), bits 2c / 2c+1
+                // select the +16 polarity for chunk c low/high nibble respectively.
+                uint qh_byte = gByte(b0 + 16 + lane);
+                uint base_elem = block * 256;
+
+                [[unroll]] for (uint c = 0; c < 4; c++) {
+                    uint ql_byte = gByte(b0 + 48 + c * 32 + lane);
+                    uint low4 = ql_byte & 0xF;
+                    uint hi4  = (ql_byte >> 4) & 0xF;
+
+                    uint u1 = 1u << (2u * c);
+                    uint u2 = u1 << 1;
+                    float hLo = (qh_byte & u1) != 0u ? 16.0 : 0.0;
+                    float hHi = (qh_byte & u2) != 0u ? 16.0 : 0.0;
+
+                    uint si = 2u * c;
+                    uint elem_lo = base_elem + c * 64 + lane;
+                    acc += (dsc[si]     * (float(low4) + hLo) - dmn[si])     * input_data[elem_lo];
+                    acc += (dsc[si + 1] * (float(hi4)  + hHi) - dmn[si + 1]) * input_data[elem_lo + 32];
+                }
+            }
+
+            float result = subgroupAdd(acc);
+            if (subgroupElect())
+                output_data[row] = result;
+        }
+        """;
+
+    /// <summary>
     /// Matrix-vector multiply with Q8_0 dequantization.
     /// Each workgroup computes 8 output rows (8 rows × 32 lanes = 256 threads).
     /// Push constants: { uint rows, uint cols }.
