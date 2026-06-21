@@ -949,15 +949,13 @@ public sealed unsafe class VulkanShaderTests
     }
 
     /// <summary>
-    /// Flash-decoding split-KV (issue #312): a 2-split case with a tiny tail (seq_len=4097 ⇒
-    /// splits [0,512..3584,4096..4097) — the last split holds a single position). Validates the
-    /// combine LSE merge across an almost-empty trailing split.
+    /// Flash-decoding split-KV (issue #312): seq_len=4097 ⇒ ceil(4097/512) = 9 splits, the last
+    /// covering a single position. Validates the combine LSE merge across an almost-empty
+    /// trailing split.
     /// </summary>
     [Fact]
     public void AttentionSplitKv_TinyTail_MatchesCpuReference()
     {
-        // seqLen 4097 → ceil(4097/512) = 9 splits, the last covering a single position —
-        // exercises the combine LSE merge across an almost-empty trailing split.
         AttentionSplitKvMatchesCpuReference(seqLen: 4097, numHeads: 2, numKvHeads: 2, headDim: 32);
     }
 

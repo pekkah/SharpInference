@@ -1405,12 +1405,12 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         Tensor partialO, Tensor partialMeta,
         uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen)
     {
-        uint nSplits = (seqLen + 511) / 512;
-        // The combine shader bounds its per-head rescale array at 256 splits (MAX_SPLITS).
-        // The caller's allocation gate keeps maxSeqLen within this, but guard direct callers.
-        if (nSplits > 256)
+        // The combine shader bounds its per-head rescale array at 256 splits (MAX_SPLITS) ⇔
+        // seqLen <= 256*512 = 131072. Check seqLen directly so the +511 can't overflow.
+        if (seqLen > 131072)
             throw new ArgumentOutOfRangeException(nameof(seqLen),
-                $"split-KV supports up to 256 splits (seqLen <= 131072); got seqLen={seqLen} → {nSplits} splits.");
+                $"split-KV supports up to 256 splits (seqLen <= 131072); got seqLen={seqLen}.");
+        uint nSplits = (seqLen + 511) / 512;
         _splitKvPartialPipeline ??= new ComputePipeline(this, Shaders.AttentionSplitKvPartial, 5, pushConstantSize: sizeof(SplitKvPartialParams));
         _splitKvCombinePipeline ??= new ComputePipeline(this, Shaders.AttentionSplitKvCombine, 3, pushConstantSize: sizeof(SplitKvCombineParams));
 

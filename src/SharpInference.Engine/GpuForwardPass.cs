@@ -402,14 +402,13 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         // ceil(maxSeqLen/512); the combine's sh_scale[256] caps it at 256). Otherwise we leave
         // these null and the decode falls back to the spill path. headDim%32==0 is also required
         // at dispatch time (the gate below) but does not affect buffer sizing.
-        if (_splitKvEnabled && _maxSeqLen > 4096)
+        // maxSplits <= 256 (combine shader bound) ⇔ maxSeqLen <= 131072; bound it directly
+        // so the (_maxSeqLen + 511) split-count math can't overflow on a pathological ctx.
+        if (_splitKvEnabled && _maxSeqLen > 4096 && _maxSeqLen <= 131072)
         {
             int maxSplits = (_maxSeqLen + 511) / 512;
-            if (maxSplits <= 256)
-            {
-                _splitKvPartialO = gpu.Allocate(TensorShape.D1((long)_numHeads * maxSplits * _headDim));
-                _splitKvPartialMeta = gpu.Allocate(TensorShape.D1((long)_numHeads * maxSplits * 2));
-            }
+            _splitKvPartialO = gpu.Allocate(TensorShape.D1((long)_numHeads * maxSplits * _headDim));
+            _splitKvPartialMeta = gpu.Allocate(TensorShape.D1((long)_numHeads * maxSplits * 2));
         }
 
         // Upload all weights to VRAM
