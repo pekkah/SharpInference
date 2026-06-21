@@ -312,6 +312,25 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         HasSubgroupSizeControl  = extNames.Contains("VK_EXT_subgroup_size_control");
         HasShaderBfloat16       = hasBfloat16;
         HasShaderFloat8         = hasFloat8;
+        bool hasSubgroupSizeControl = HasSubgroupSizeControl;
+
+        // 5b. Query the supported subgroup-size range (issue #318). The reduction shaders pack
+        // "8 rows × 32 lanes" per workgroup and assume the subgroup is exactly 32 wide; on AMD
+        // Wave64 a subgroup would span two row groups and corrupt subgroupAdd/subgroupElect.
+        // We pin requiredSubgroupSize=32 at pipeline creation (ComputePipeline) when the device
+        // could pick a non-32 subgroup (see ComputePipeline.ShouldPinSubgroupSize32). If the
+        // extension is absent these stay 0 → pinning disabled.
+        if (hasSubgroupSizeControl)
+        {
+            VkPhysicalDeviceSubgroupSizeControlProperties sgProps = new();
+            VkPhysicalDeviceProperties2 props2 = new()
+            {
+                pNext = &sgProps,
+            };
+            _vki.vkGetPhysicalDeviceProperties2(_physicalDevice, &props2);
+            MinSubgroupSize = sgProps.minSubgroupSize;
+            MaxSubgroupSize = sgProps.maxSubgroupSize;
+        }
 
         // 6. Create logical device with one compute queue, enabling detected extensions
         float queuePriority = 1.0f;
@@ -329,10 +348,12 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         byte[] intDotNameBytes    = System.Text.Encoding.UTF8.GetBytes("VK_KHR_shader_integer_dot_product\0");
         byte[] bf16NameBytes      = System.Text.Encoding.UTF8.GetBytes("VK_KHR_shader_bfloat16\0");
         byte[] fp8NameBytes       = System.Text.Encoding.UTF8.GetBytes("VK_EXT_shader_float8\0");
+        byte[] sgSizeNameBytes    = System.Text.Encoding.UTF8.GetBytes("VK_EXT_subgroup_size_control\0");
 
         int enabledExtCount = (hasFloat16Int8 ? 1 : 0) + (has16BitStorage ? 1 : 0)
                             + (has8BitStorage ? 1 : 0) + (hasIntDot ? 1 : 0)
-                            + (hasBfloat16 ? 1 : 0) + (hasFloat8 ? 1 : 0);
+                            + (hasBfloat16 ? 1 : 0) + (hasFloat8 ? 1 : 0)
+                            + (hasSubgroupSizeControl ? 1 : 0);
         int extIdx = 0;
 
         fixed (byte* pF16Int8   = f16Int8NameBytes,
@@ -340,7 +361,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
                      pStorage8  = storage8NameBytes,
                      pIntDot    = intDotNameBytes,
                      pBf16      = bf16NameBytes,
-                     pFp8       = fp8NameBytes)
+                     pFp8       = fp8NameBytes,
+                     pSgSize    = sgSizeNameBytes)
         {
             byte** extPtrs = stackalloc byte*[enabledExtCount > 0 ? enabledExtCount : 1];
             if (hasFloat16Int8)  extPtrs[extIdx++] = pF16Int8;
@@ -349,6 +371,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             if (hasIntDot)       extPtrs[extIdx++] = pIntDot;
             if (hasBfloat16)     extPtrs[extIdx++] = pBf16;
             if (hasFloat8)       extPtrs[extIdx++] = pFp8;
+            if (hasSubgroupSizeControl) extPtrs[extIdx++] = pSgSize;
 
             // Build pNext feature chain (back to front so earlier structs point to later ones)
             VkPhysicalDevice8BitStorageFeatures storage8Features = new()
@@ -385,10 +408,24 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
                 pNext = hasFloat8 ? (void*)&fp8Features : baseChain,
             };
 
-            void* pNextChain =
+            void* featureChain =
                 hasBfloat16 ? (void*)&bf16Features :
                 hasFloat8   ? (void*)&fp8Features :
                 baseChain;
+
+            // Prepend the subgroup-size-control feature (issue #318). We only enable
+            // subgroupSizeControl; computeFullSubgroups is unnecessary because every pinned
+            // shader has local_size_x a multiple of 32 (so the workgroup already fills whole
+            // subgroups). The actual requiredSubgroupSize=32 is set per pipeline stage.
+            VkPhysicalDeviceSubgroupSizeControlFeatures sgSizeFeatures = new()
+            {
+                subgroupSizeControl = VkBool32.True,
+                pNext = featureChain,
+            };
+
+            void* pNextChain =
+                hasSubgroupSizeControl ? (void*)&sgSizeFeatures :
+                featureChain;
 
             VkDeviceCreateInfo deviceCI = new()
             {
@@ -468,6 +505,11 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     public bool HasShaderIntegerDotProduct { get; private set; }
     public bool HasShaderBfloat16 { get; private set; }
     public bool HasShaderFloat8 { get; private set; }
+
+    // Subgroup-size range reported by VK_EXT_subgroup_size_control (issue #318).
+    // 0 when the extension is absent (subgroup-size pinning then stays disabled).
+    public uint MinSubgroupSize { get; private set; }
+    public uint MaxSubgroupSize { get; private set; }
 
     public SgemmPrecision BestSgemmPrecision =>
         HasShaderFloat16Int8 && Has16BitStorage ? SgemmPrecision.Fp16 :
