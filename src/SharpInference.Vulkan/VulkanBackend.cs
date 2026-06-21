@@ -39,6 +39,12 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     // Serializes vkQueueSubmit from both main and background threads.
     private readonly object _queueLock = new();
 
+    // Opt-in Vulkan validation layers (SHARPI_VULKAN_VALIDATION=1). Used to turn
+    // flaky native access-violations into deterministic validation diagnostics
+    // (issue #153). Null when validation is off (the default).
+    private VkDebugUtilsMessengerEXT _debugMessenger;
+    private readonly bool _validationEnabled;
+
     private bool _disposed;
 
     public string Name { get; }
@@ -260,17 +266,66 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         // 1. Initialize Vulkan loader
         vkInitialize().CheckResult();
 
+        // Opt-in validation layers (issue #153): when SHARPI_VULKAN_VALIDATION=1 we
+        // enable the Khronos validation layer + VK_EXT_debug_utils so invalid buffer/
+        // descriptor/pipeline usage is reported deterministically (even on runs that
+        // don't crash). Default (env unset/0) keeps the instance exactly as before —
+        // no extra layers, no debug-utils, zero validation overhead.
+        _validationEnabled =
+            Environment.GetEnvironmentVariable("SHARPI_VULKAN_VALIDATION") is "1" or "true" or "TRUE";
+
         // 2. Create instance (Vulkan 1.3+)
         VkApplicationInfo appInfo = new()
         {
             apiVersion = VkVersion.Version_1_3, // Vortice may not have 1.4 constant yet
         };
-        VkInstanceCreateInfo instanceCI = new()
+
+        // Validation-layer name + debug-utils extension name (null-terminated UTF-8).
+        byte[] validationLayerBytes = System.Text.Encoding.UTF8.GetBytes("VK_LAYER_KHRONOS_validation\0");
+        byte[] debugUtilsExtBytes   = System.Text.Encoding.UTF8.GetBytes("VK_EXT_debug_utils\0");
+
+        // A messenger create-info chained into pNext also catches validation errors
+        // raised *during* vkCreateInstance/vkDestroyInstance themselves.
+        VkDebugUtilsMessengerCreateInfoEXT dbgCI = MakeDebugMessengerCreateInfo();
+
+        fixed (byte* pValidationLayer = validationLayerBytes)
+        fixed (byte* pDebugUtilsExt   = debugUtilsExtBytes)
         {
-            pApplicationInfo = &appInfo,
-        };
-        vkCreateInstance(in instanceCI, out _instance).CheckResult();
+            byte** layerPtrs = stackalloc byte*[1];
+            byte** instExtPtrs = stackalloc byte*[1];
+            layerPtrs[0] = pValidationLayer;
+            instExtPtrs[0] = pDebugUtilsExt;
+
+            VkInstanceCreateInfo instanceCI = new()
+            {
+                pApplicationInfo = &appInfo,
+                pNext = _validationEnabled ? &dbgCI : null,
+                enabledLayerCount = _validationEnabled ? 1u : 0u,
+                ppEnabledLayerNames = _validationEnabled ? layerPtrs : null,
+                enabledExtensionCount = _validationEnabled ? 1u : 0u,
+                ppEnabledExtensionNames = _validationEnabled ? instExtPtrs : null,
+            };
+            vkCreateInstance(in instanceCI, out _instance).CheckResult();
+        }
         _vki = new VkInstanceApi(in _instance);
+
+        // Register the standalone debug messenger now that we have an instance + loaded
+        // instance-extension entry points. Errors/warnings go to Console.Error.
+        if (_validationEnabled)
+        {
+            VkDebugUtilsMessengerEXT messenger;
+            var res = _vki.vkCreateDebugUtilsMessengerEXT(&dbgCI, &messenger);
+            if (res == VkResult.Success)
+            {
+                _debugMessenger = messenger;
+                Console.Error.WriteLine("[VK-VALIDATION] Vulkan validation layers ENABLED (SHARPI_VULKAN_VALIDATION=1)");
+            }
+            else
+            {
+                Console.Error.WriteLine($"[VK-VALIDATION] WARNING: vkCreateDebugUtilsMessengerEXT failed ({res}); " +
+                    "validation messages from pNext-chained create/destroy still fire, standalone messenger disabled.");
+            }
+        }
 
         // 3. Select physical device (prefer discrete GPU)
         _physicalDevice = SelectPhysicalDevice(deviceIndex);
@@ -1833,6 +1888,57 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     //  Disposal
     // ================================================================
 
+    // ── Vulkan validation layer support (issue #153, opt-in) ──────────────
+
+    /// <summary>
+    /// Build the debug-messenger create-info used both for the pNext chain on
+    /// instance creation and for the standalone messenger. Severity is limited to
+    /// WARNING + ERROR; all message types are reported.
+    /// </summary>
+    private static VkDebugUtilsMessengerCreateInfoEXT MakeDebugMessengerCreateInfo() => new()
+    {
+        messageSeverity = VkDebugUtilsMessageSeverityFlagsEXT.Warning
+                        | VkDebugUtilsMessageSeverityFlagsEXT.Error,
+        messageType = VkDebugUtilsMessageTypeFlagsEXT.General
+                    | VkDebugUtilsMessageTypeFlagsEXT.Validation
+                    | VkDebugUtilsMessageTypeFlagsEXT.Performance,
+        pfnUserCallback = &DebugCallback,
+    };
+
+    /// <summary>
+    /// Validation-layer callback. AOT-safe: a <c>[UnmanagedCallersOnly]</c> static method
+    /// (no managed delegate to keep alive / GC). Writes WARNING/ERROR lines — including any
+    /// named objects involved — to <see cref="Console.Error"/> with a <c>[VK-VALIDATION]</c> prefix.
+    /// </summary>
+    [System.Runtime.InteropServices.UnmanagedCallersOnly]
+    private static uint DebugCallback(
+        VkDebugUtilsMessageSeverityFlagsEXT severity,
+        VkDebugUtilsMessageTypeFlagsEXT messageTypes,
+        VkDebugUtilsMessengerCallbackDataEXT* data,
+        void* userData)
+    {
+        // Return VK_FALSE (0): the callback does not abort the triggering API call.
+        if (data == null) return 0u;
+
+        string sev = severity.HasFlag(VkDebugUtilsMessageSeverityFlagsEXT.Error) ? "ERROR" : "WARNING";
+        string msg = data->pMessage != null ? new string((sbyte*)data->pMessage) : "(no message)";
+        string idName = data->pMessageIdName != null ? new string((sbyte*)data->pMessageIdName) : "";
+
+        Console.Error.WriteLine($"[VK-VALIDATION] {sev} ({messageTypes}) [{idName}] {msg}");
+
+        // Dump any named objects involved (buffer / descriptor set / pipeline / etc.)
+        for (uint i = 0; i < data->objectCount; i++)
+        {
+            VkDebugUtilsObjectNameInfoEXT obj = data->pObjects[i];
+            string objName = obj.pObjectName != null ? new string((sbyte*)obj.pObjectName) : "(unnamed)";
+            Console.Error.WriteLine(
+                $"[VK-VALIDATION]   object[{i}] type={obj.objectType} handle=0x{obj.objectHandle:X} name={objName}");
+        }
+        Console.Error.Flush();
+
+        return 0u; // VK_FALSE
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
@@ -1869,6 +1975,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _attentionQ8Pipeline?.Dispose();
         _snapKvScorePipeline?.Dispose();
         _kvCompactPipeline?.Dispose();
+        _tqRotateQueryPipeline?.Dispose();
+        _tqKvAppendPipeline?.Dispose();
+        _tqAttentionPipeline?.Dispose();
         _embedLookupPipeline?.Dispose();
         _embedLookupQ4KPipeline?.Dispose();
         _bufCopyPipeline?.Dispose();
@@ -1900,6 +2009,11 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _vkd.vkDestroyCommandPool(_commandPool, null);
         _vkd.vkDestroyCommandPool(_asyncPool, null);
         _vkd.vkDestroyDevice(null);
+
+        // Tear down the validation messenger (if registered) before the instance.
+        if (_validationEnabled && _debugMessenger.IsNotNull)
+            _vki.vkDestroyDebugUtilsMessengerEXT(_debugMessenger);
+
         _vki.vkDestroyInstance(null);
     }
 }
