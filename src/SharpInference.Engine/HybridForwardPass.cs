@@ -1267,7 +1267,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
 
     private static long EstimateGpuTensorBytes(GgufTensorInfo tensor)
     {
-        if (tensor.DType == DType.Float32 || tensor.DType == DType.Q4_K || tensor.DType == DType.Q6_K)
+        if (tensor.DType == DType.Float32 || tensor.DType == DType.Q4_K || tensor.DType == DType.Q5_K || tensor.DType == DType.Q6_K)
             return (tensor.ByteSize + 3) & ~3L;
 
         return tensor.ElementCount * sizeof(float);
@@ -1328,7 +1328,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             result = _gpu.Upload(floats, TensorShape.D1(floats.Length));
             _gpuWeightDTypes[result.Handle] = DType.Float32;
         }
-        else if (info.DType == DType.Q4_K || info.DType == DType.Q6_K)
+        else if (info.DType == DType.Q4_K || info.DType == DType.Q5_K || info.DType == DType.Q6_K)
         {
             int floatCount = data.Length / 4;
             var rawFloats = new float[floatCount];
@@ -1584,7 +1584,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
         int byteOffset = expertIdx * expertBytes;
         var expertData = data.Slice(byteOffset, expertBytes);
 
-        if (info.DType == DType.Q4_K || info.DType == DType.Q6_K)
+        if (info.DType == DType.Q4_K || info.DType == DType.Q5_K || info.DType == DType.Q6_K)
         {
             int floatCount = expertData.Length / 4;
             var rawFloats = new float[floatCount];

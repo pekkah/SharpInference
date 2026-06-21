@@ -228,10 +228,14 @@ public static class TierPlanner
         return info is not null ? ((info.Value.ByteSize + 3) & ~3L) : 0;
     }
 
-    // Embedding-aware: Q4_K / Q8_0 / Q6_K embeddings stay quantized on GPU (each has a
-    // dedicated EmbedLookup* kernel — Q6_K added for the Gemma 4 12B QAT tied table,
-    // issue #124). Anything else is dequantized to F32 at upload, so its post-upload
-    // footprint is 4 bytes per element.
+    // Embedding-aware: Q4_K / Q8_0 / Q6_K embeddings have a dedicated GPU EmbedLookup* kernel
+    // on BOTH backends, so they stay raw (Q6_K added for the Gemma 4 12B QAT tied table, #124).
+    // Q5_K is deliberately NOT listed: the CUDA path has EmbedLookupQ5K, but the Vulkan path
+    // does not — it dequantizes a Q5_K token_embd to F32 at upload. TierPlanner is backend-
+    // agnostic, so estimating Q5_K embeddings as F32 here is correct for Vulkan and merely
+    // conservative for CUDA (the safe direction — never under-budget VRAM). #73 keeps the
+    // matrix *weights* raw on both backends (the dominant VRAM cost); embeddings are a single
+    // tensor and not what the issue targets. A Vulkan EmbedLookupQ5K would let this go raw too.
     private static long MeasureGpuEmbeddingBytes(GgufModel model, string name)
     {
         var info = model.FindTensor(name);
@@ -301,13 +305,15 @@ public static class TierPlanner
 
     private static long EstimateGpuTensorBytes(GgufTensorInfo tensor)
     {
-        // Dtypes the CUDA forward pass keeps packed in VRAM (CudaForwardPass.UploadWeight):
-        // Q4_0 (Gemma 4 12B QAT, #124), Q4_K, Q6_K, Q8_0. Others (incl. Q5_K) dequant to F32.
+        // Dtypes the CUDA and Vulkan forward passes keep packed in VRAM
+        // (CudaForwardPass.UploadWeight / GpuForwardPass.IsRawGpuQuant):
+        // Q4_0 (Gemma 4 12B QAT, #124), Q4_K, Q5_K (#73), Q6_K, Q8_0. Others dequant to F32.
         switch (tensor.DType)
         {
             case DType.Float32:
             case DType.Q4_0:
             case DType.Q4_K:
+            case DType.Q5_K:
             case DType.Q6_K:
             case DType.Q8_0:
                 return (tensor.ByteSize + 3) & ~3L;
