@@ -1085,6 +1085,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _attentionBf16Pipeline;
     private ComputePipeline? _kvAppendQ8Pipeline;
     private ComputePipeline? _attentionQ8Pipeline;
+    private ComputePipeline? _splitKvPartialPipeline;
+    private ComputePipeline? _splitKvCombinePipeline;
     private ComputePipeline? _snapKvScorePipeline;
     private ComputePipeline? _kvCompactPipeline;
     private ComputePipeline? _embedLookupPipeline;
@@ -1119,6 +1121,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private struct EmbedParams { public uint tokenId; public uint embDim; }
     private struct KvAppendParams { public uint kvDim; public uint position; public uint maxSeqLen; }
     private struct AttentionParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint seqLen; public uint maxSeqLen; }
+    private struct SplitKvPartialParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint seqLen; public uint nSplits; }
+    private struct SplitKvCombineParams { public uint numHeads; public uint headDim; public uint nSplits; }
     private struct SnapKvScoreParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint promptLen; public uint qAbsPos; public uint maxSeqLen; }
     private struct KvCompactParams { public uint K; public uint kvDim; }
     private struct TqRotateQueryParams { public uint numHeads; public uint numKvHeads; public uint headDim; }
@@ -1381,6 +1385,57 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(output),
              GetBuffer(scoresScratch)],
             numHeads, &p);
+    }
+
+    /// <summary>
+    /// Flash-decoding split-KV attention (issue #312) — the Vulkan mirror of CUDA's
+    /// <c>SHARPI_SPLIT_DECODE</c> path. Splits each head's causal KV range into fixed 512-position
+    /// slices dispatched across a 2D grid of <c>numHeads × nSplits</c> workgroups (parallelizing
+    /// the long-context KV read instead of serially scanning it in one workgroup like
+    /// <see cref="Attention"/>), then LSE-merges the per-slice partials in a second combine pass.
+    /// fp32 K/V only. Opt-in (DEFAULT-OFF) via the caller's <c>SHARPI_VULKAN_SPLIT_DECODE</c> gate;
+    /// when the gate is off this method is never reached, so the spill path is byte-identical.
+    ///
+    /// <paramref name="partialO"/> is <c>[numHeads * maxSplits * headDim]</c> (un-normalized
+    /// weighted-V numerators) and <paramref name="partialMeta"/> is <c>[numHeads * maxSplits * 2]</c>
+    /// ((m_i, l_i) per (head, split)); the caller allocates both sized to maxSplits =
+    /// ceil(maxSeqLen/512). nSplits = ceil(seqLen/512) ≤ maxSplits selects the live grid.
+    /// </summary>
+    public void AttentionSplitKv(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+        Tensor partialO, Tensor partialMeta,
+        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen)
+    {
+        uint nSplits = (seqLen + 511) / 512;
+        // The combine shader bounds its per-head rescale array at 256 splits (MAX_SPLITS).
+        // The caller's allocation gate keeps maxSeqLen within this, but guard direct callers.
+        if (nSplits > 256)
+            throw new ArgumentOutOfRangeException(nameof(seqLen),
+                $"split-KV supports up to 256 splits (seqLen <= 131072); got seqLen={seqLen} → {nSplits} splits.");
+        _splitKvPartialPipeline ??= new ComputePipeline(this, Shaders.AttentionSplitKvPartial, 5, pushConstantSize: sizeof(SplitKvPartialParams));
+        _splitKvCombinePipeline ??= new ComputePipeline(this, Shaders.AttentionSplitKvCombine, 3, pushConstantSize: sizeof(SplitKvCombineParams));
+
+        // Partial pass: numHeads × nSplits workgroups (2D dispatch; workgroup (x=head, y=split)).
+        var pp = new SplitKvPartialParams
+        {
+            numHeads = numHeads, numKvHeads = numKvHeads,
+            headDim = headDim, seqLen = seqLen, nSplits = nSplits
+        };
+        DispatchOrRecord(_splitKvPartialPipeline,
+            [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(partialO),
+             GetBuffer(partialMeta)],
+            numHeads, &pp, groupY: nSplits);
+
+        // Combine reads the partials the partial pass just wrote, so the two dispatches must be
+        // ordered. When recording (the engine path) insert a compute→compute barrier; in the
+        // immediate path (DispatchWith) each dispatch is its own submit + fence-wait, so the
+        // partial pass has fully completed before the combine is submitted — no barrier needed,
+        // and RecordBarrier on a non-recording command buffer would be invalid.
+        if (_recording) RecordBarrier();
+
+        var cp = new SplitKvCombineParams { numHeads = numHeads, headDim = headDim, nSplits = nSplits };
+        DispatchOrRecord(_splitKvCombinePipeline,
+            [GetBuffer(partialO), GetBuffer(partialMeta), GetBuffer(output)],
+            numHeads, &cp);
     }
 
     /// <summary>
@@ -1988,6 +2043,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _attentionBf16Pipeline?.Dispose();
         _kvAppendQ8Pipeline?.Dispose();
         _attentionQ8Pipeline?.Dispose();
+        _splitKvPartialPipeline?.Dispose();
+        _splitKvCombinePipeline?.Dispose();
         _snapKvScorePipeline?.Dispose();
         _kvCompactPipeline?.Dispose();
         _tqRotateQueryPipeline?.Dispose();
