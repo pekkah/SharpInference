@@ -161,13 +161,15 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         if (kvNarrowed && _kvDType is not (DType.BFloat16 or DType.Q8_0))
             throw new NotSupportedException(
                 "Vulkan KV cache supports fp32, bf16, and q8_0 only (issue #325).");
-        // The bf16 path packs two fp16 per uint, so a KV row (numKvHeads*headDim) must be
-        // even for rows to stay word-aligned. True for all supported head dims (64/128/256),
-        // but enforce it so a future odd-head_dim model fails loudly instead of corrupting KV.
-        if (_kvDType == DType.BFloat16 && ((hp.NumKvHeads * hp.HeadDim) & 1) != 0)
+        // The bf16 path packs two fp16 per uint, so each KV head must START on a uint-word
+        // boundary for the AttentionBf16 two-at-a-time reads (issue #324) to address words
+        // correctly: a head begins at kv_head*head_dim, which is word-even iff head_dim itself
+        // is even. True for all supported head dims (64/128/256), but enforce it so a future
+        // odd-head_dim model fails loudly instead of corrupting KV reads.
+        if (_kvDType == DType.BFloat16 && (hp.HeadDim & 1) != 0)
             throw new NotSupportedException(
-                $"bf16 KV requires an even KV-row width (numKvHeads*headDim); got " +
-                $"{hp.NumKvHeads}*{hp.HeadDim}. Use fp32 KV for this model (issue #311).");
+                $"bf16 KV requires an even head dimension; got {hp.HeadDim}. " +
+                "Use fp32 KV (issue #324).");
         // The q8_0 path quantizes per 32-element block (one thread per block), so a KV row must
         // be a multiple of 32 for blocks to align to row boundaries (no straddling).
         if (_kvDType == DType.Q8_0 && ((hp.NumKvHeads * hp.HeadDim) & 31) != 0)
