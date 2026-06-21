@@ -987,6 +987,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _attentionPipeline;
     private ComputePipeline? _kvAppendBf16Pipeline;
     private ComputePipeline? _attentionBf16Pipeline;
+    private ComputePipeline? _kvAppendQ8Pipeline;
+    private ComputePipeline? _attentionQ8Pipeline;
     private ComputePipeline? _snapKvScorePipeline;
     private ComputePipeline? _kvCompactPipeline;
     private ComputePipeline? _embedLookupPipeline;
@@ -1322,6 +1324,49 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             headDim = headDim, seqLen = seqLen, maxSeqLen = maxSeqLen
         };
         DispatchOrRecord(_attentionBf16Pipeline,
+            [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(output),
+             GetBuffer(scoresScratch)],
+            numHeads, &p);
+    }
+
+    /// <summary>
+    /// q8_0 (issue #325) variant of <see cref="KvAppend"/>: block-quantizes the K/V vectors
+    /// into the cache as ggml <c>block_q8_0</c> (34 bytes/block = fp16 scale + 32 int8, per 32
+    /// elements; ~4× smaller than fp32). The cache buffers are bound as <c>uint[]</c> and
+    /// indexed identically to the fp32 path (<c>position * kv_dim + i</c>, expressed in blocks).
+    /// Dispatched ONE THREAD PER 32-ELEMENT BLOCK; kv_dim must be a multiple of 32 (enforced in
+    /// GpuForwardPass). The shader owns a whole 34-byte block per thread and uses masked atomics
+    /// for the (non-4-aligned) seam words shared between adjacent blocks.
+    /// </summary>
+    public void KvAppendQ8_0(Tensor kInput, Tensor vInput, Tensor kCache, Tensor vCache,
+        uint kvDim, uint position, uint maxSeqLen)
+    {
+        _kvAppendQ8Pipeline ??= new ComputePipeline(this, Shaders.KvAppendQ8_0, 4, pushConstantSize: sizeof(KvAppendParams));
+        var p = new KvAppendParams { kvDim = kvDim, position = position, maxSeqLen = maxSeqLen };
+        DispatchOrRecord(_kvAppendQ8Pipeline,
+            [GetBuffer(kInput), GetBuffer(vInput), GetBuffer(kCache), GetBuffer(vCache)],
+            ((kvDim >> 5) + 255) / 256, &p);
+    }
+
+    /// <summary>
+    /// q8_0 (issue #325) variant of <see cref="Attention"/>: identical control flow to the fp32
+    /// path, but the K/V cache buffers hold ggml <c>block_q8_0</c> (34 bytes/block) and are read
+    /// via a per-element byte-gather + dequant (<c>fp16(d) * int8</c>). All arithmetic (scores /
+    /// softmax / value accumulation) stays fp32 — only the stored K/V is narrowed.
+    /// <paramref name="scoresScratch"/> stays fp32 (see <see cref="Attention"/> for the spill
+    /// convention).
+    /// </summary>
+    public void AttentionQ8_0(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+        Tensor scoresScratch,
+        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen)
+    {
+        _attentionQ8Pipeline ??= new ComputePipeline(this, Shaders.AttentionQ8_0, 5, pushConstantSize: sizeof(AttentionParams));
+        var p = new AttentionParams
+        {
+            numHeads = numHeads, numKvHeads = numKvHeads,
+            headDim = headDim, seqLen = seqLen, maxSeqLen = maxSeqLen
+        };
+        DispatchOrRecord(_attentionQ8Pipeline,
             [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(output),
              GetBuffer(scoresScratch)],
             numHeads, &p);
@@ -1778,6 +1823,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _attentionPipeline?.Dispose();
         _kvAppendBf16Pipeline?.Dispose();
         _attentionBf16Pipeline?.Dispose();
+        _kvAppendQ8Pipeline?.Dispose();
+        _attentionQ8Pipeline?.Dispose();
         _snapKvScorePipeline?.Dispose();
         _kvCompactPipeline?.Dispose();
         _embedLookupPipeline?.Dispose();

@@ -739,10 +739,9 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
                 if (nGpuLayers >= hp.NumLayers)
                 {
-                    // All layers on GPU. Pass the configured KV dtype (issue #311): fp32 default,
-                    // bf16 = half-width KV. The Vulkan ctor rejects q8_0 with a clear message
-                    // (q8_0 KV is CUDA-only for now). Reuses the same --kv-type/SHARPI_KV_DTYPE
-                    // parser the CUDA path uses.
+                    // All layers on GPU. Pass the configured KV dtype (issues #311 / #325): fp32
+                    // default, bf16 = half-width KV, q8_0 = block-quantized (~quarter) KV. Reuses
+                    // the same --kv-type/SHARPI_KV_DTYPE parser the CUDA path uses.
                     var gfwd = new GpuForwardPass(model, gpu, hp, ctxSize,
                         enableTurboQuant: settings.TurboQuant,
                         kvDtype: CudaForwardPass.ResolveConfiguredKvDType());
