@@ -876,10 +876,14 @@ internal static class Shaders
             for (uint t = tid; t < seq_len; t += 256) {
                 float dot = 0.0;
                 uint k_off = t * kv_dim + kv_head * head_dim;
-                for (uint d = 0; d < head_dim; d++) {
-                    uint e = k_off + d;
-                    float kv = unpackHalf2x16(k_cache[e >> 1])[e & 1u];
-                    dot += q_data[q_off + d] * kv;
+                // Read each packed fp16 word once (two K elements at a time). k_off is even
+                // (head_dim is even — see the GpuForwardPass guard) so k_off>>1 is the exact
+                // word base and consecutive d,d+1 are the two halves of word k_off_half+dh.
+                uint k_off_half = k_off >> 1;
+                for (uint dh = 0; dh < (head_dim >> 1); dh++) {
+                    uint d = dh << 1;
+                    vec2 kv = unpackHalf2x16(k_cache[k_off_half + dh]);
+                    dot += q_data[q_off + d] * kv.x + q_data[q_off + d + 1u] * kv.y;
                 }
                 float score = dot * scale;
                 if (use_shared) scores[t] = score;
@@ -931,13 +935,20 @@ internal static class Shaders
 
             // ─── Phase 3: weighted V sum. K is NOT re-derived here. ───
             for (uint d = tid; d < head_dim; d += 256) {
+                // Each thread owns ONE output dim d (threads are 256 apart, so adjacent d can't
+                // be paired). Hoist the per-d word/component selection out of the t-loop and walk
+                // the V row word base incrementally. v_off = t*kv_dim + kv_head*head_dim is even
+                // (head_dim is even — see the GpuForwardPass guard), so v_off>>1 is the exact word.
+                uint d_half = d >> 1;
+                uint component = d & 1u;
+                uint v_off_half = (kv_head * head_dim) >> 1;   // t = 0 row word base
+                uint kv_dim_half = kv_dim >> 1;
                 float sum = 0.0;
                 for (uint t = 0; t < seq_len; t++) {
                     float weight = use_shared ? scores[t] : scores_scratch[scratch_base + t];
-                    uint v_off = t * kv_dim + kv_head * head_dim;
-                    uint e = v_off + d;
-                    float vv = unpackHalf2x16(v_cache[e >> 1])[e & 1u];
+                    float vv = unpackHalf2x16(v_cache[v_off_half + d_half])[component];
                     sum += weight * vv;
+                    v_off_half += kv_dim_half;
                 }
                 out_data[out_off + d] = sum;
             }
@@ -1080,19 +1091,21 @@ internal static class Shaders
         shared float scores[MAX_SHARED_SCORES];
         shared float sdata[256];   // reduction scratch
 
-        uint gByteK(uint b) { return (k_cache[b >> 2] >> ((b & 3u) * 8u)) & 0xFFu; }
-        int  gInt8K(uint b) { int v = int(gByteK(b)); return v >= 128 ? v - 256 : v; }
-        uint gByteV(uint b) { return (v_cache[b >> 2] >> ((b & 3u) * 8u)) & 0xFFu; }
-        int  gInt8V(uint b) { int v = int(gByteV(b)); return v >= 128 ? v - 256 : v; }
+        // Sign-extend a single int8 byte in one bitfieldExtract (no ternary branch).
+        int gInt8K(uint b) { return bitfieldExtract(int(k_cache[b >> 2]), int((b & 3u) * 8u), 8); }
+        int gInt8V(uint b) { return bitfieldExtract(int(v_cache[b >> 2]), int((b & 3u) * 8u), 8); }
 
         float loadK(uint e) {
             uint blk = e >> 5; uint lane = e & 31u; uint b0 = blk * 34u;
-            float dsc = unpackHalf2x16(gByteK(b0) | (gByteK(b0 + 1u) << 8)).x;
+            // b0 = blk*34 is even, so the two scale bytes [b0, b0+1] live in the same uint word.
+            uint w = k_cache[b0 >> 2];
+            float dsc = unpackHalf2x16((w >> ((b0 & 3u) * 8u)) & 0xFFFFu).x;
             return dsc * float(gInt8K(b0 + 2u + lane));
         }
         float loadV(uint e) {
             uint blk = e >> 5; uint lane = e & 31u; uint b0 = blk * 34u;
-            float dsc = unpackHalf2x16(gByteV(b0) | (gByteV(b0 + 1u) << 8)).x;
+            uint w = v_cache[b0 >> 2];
+            float dsc = unpackHalf2x16((w >> ((b0 & 3u) * 8u)) & 0xFFFFu).x;
             return dsc * float(gInt8V(b0 + 2u + lane));
         }
 
