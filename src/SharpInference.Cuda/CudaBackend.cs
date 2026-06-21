@@ -3687,8 +3687,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         return result;
     }
 
-    public void SiLU(Tensor x) =>
-        throw new NotSupportedException("Use SiLuMul(gate, up) for fused SwiGLU on CUDA.");
+    // IComputeBackend contract (#314): standalone in-place SiLU. The fused SwiGLU
+    // path still prefers SiLuMul(gate, up); this delegates to the existing NVRTC
+    // in-place kernel so the interface is honored uniformly across backends.
+    public void SiLU(Tensor x) => SiLUInPlace(x);
 
     public void RoPE(Tensor x, int position, int headDim, float ropeTheta = 10000f, bool neox = false)
     {

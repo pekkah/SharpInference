@@ -58,6 +58,34 @@ public sealed unsafe class CudaGdnKernelsTests
     }
 
     [Fact]
+    public void SiLU_HonorsInterfaceContract()
+    {
+        // Issue #314: IComputeBackend.SiLU(Tensor) must not throw (it previously
+        // did on CUDA); it delegates to the in-place NVRTC kernel.
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        const int N = 257;
+        var rng = new Random(321);
+        var x = RandomArray(rng, N, -4f, 4f);
+
+        var expected = new float[N];
+        for (int i = 0; i < N; i++)
+            expected[i] = x[i] / (1f + MathF.Exp(-x[i]));
+
+        var gpuX = gpu.Upload(x, TensorShape.D1(N));
+        ((IComputeBackend)gpu).SiLU(gpuX);
+        gpu.Synchronize();
+        var result = new float[N];
+        gpu.Download(gpuX, result);
+        gpu.Free(gpuX);
+
+        for (int i = 0; i < N; i++)
+            Assert.True(MathF.Abs(result[i] - expected[i]) < 1e-5f,
+                $"SiLU mismatch at [{i}]: gpu={result[i]} cpu={expected[i]}");
+    }
+
+    [Fact]
     public void GdnConv1dDecode_MatchesCpuReference()
     {
         using var gpu = TryCreate();
