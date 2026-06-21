@@ -731,6 +731,7 @@ internal static class Shaders
             uint head_dim;
             uint seq_len;
             uint max_seq_len;
+            uint window;        // SWA: attend only [start_seq, seq_len); 0 = full attention
         };
 
         // Score-storage strategy mirrors the CUDA `llm_attention` kernel:
@@ -754,11 +755,16 @@ internal static class Shaders
             uint q_off = h * head_dim;
             uint out_off = h * head_dim;
 
+            // Sliding-window bound (Gemma SWA layers): mirror the CPU ForwardPass.Attention
+            // start_seq = window > 0 ? max(0, seq_len - window) : 0. Computed with the uint
+            // underflow guard (window < seq_len) so window==0 OR window>=seq_len ⇒ full attention.
+            uint start_seq = (window != 0u && window < seq_len) ? (seq_len - window) : 0u;
+
             bool use_shared = (seq_len <= MAX_SHARED_SCORES);
             uint scratch_base = h * max_seq_len;
 
-            // ─── Phase 1: per-position Q·K scores ───
-            for (uint t = tid; t < seq_len; t += 256) {
+            // ─── Phase 1: per-position Q·K scores over [start_seq, seq_len) ───
+            for (uint t = start_seq + tid; t < seq_len; t += 256) {
                 float dot = 0.0;
                 uint k_off = t * kv_dim + kv_head * head_dim;
                 for (uint d = 0; d < head_dim; d++)
@@ -767,17 +773,17 @@ internal static class Shaders
                 if (use_shared) scores[t] = score;
                 else            scores_scratch[scratch_base + t] = score;
             }
-            // Pad shared tail so the max scan ignores stale slots. The scratch
-            // scans iterate only [0, seq_len), so no padding needed.
+            // Pad the shared tail so the max scan ignores stale slots. The masked-off head
+            // ([0, start_seq)) is never read because every scan below starts at start_seq.
             if (use_shared) {
                 for (uint t = seq_len + tid; t < MAX_SHARED_SCORES; t += 256)
                     scores[t] = -1.0/0.0;
             }
             barrier();
 
-            // ─── Phase 2: in-place softmax over [0, seq_len) ───
+            // ─── Phase 2: in-place softmax over [start_seq, seq_len) ───
             float local_max = -1.0/0.0;
-            for (uint t = tid; t < seq_len; t += 256) {
+            for (uint t = start_seq + tid; t < seq_len; t += 256) {
                 float s = use_shared ? scores[t] : scores_scratch[scratch_base + t];
                 local_max = max(local_max, s);
             }
@@ -791,7 +797,7 @@ internal static class Shaders
             barrier();
 
             float local_sum = 0.0;
-            for (uint t = tid; t < seq_len; t += 256) {
+            for (uint t = start_seq + tid; t < seq_len; t += 256) {
                 float s = use_shared ? scores[t] : scores_scratch[scratch_base + t];
                 float e = exp(s - max_val);
                 if (use_shared) scores[t] = e;
@@ -807,16 +813,16 @@ internal static class Shaders
             float inv_sum = 1.0 / sdata[0];
             barrier();
 
-            for (uint t = tid; t < seq_len; t += 256) {
+            for (uint t = start_seq + tid; t < seq_len; t += 256) {
                 if (use_shared) scores[t] *= inv_sum;
                 else            scores_scratch[scratch_base + t] *= inv_sum;
             }
             barrier();
 
-            // ─── Phase 3: weighted V sum. K is NOT re-derived here. ───
+            // ─── Phase 3: weighted V sum over [start_seq, seq_len). K is NOT re-derived here. ───
             for (uint d = tid; d < head_dim; d += 256) {
                 float sum = 0.0;
-                for (uint t = 0; t < seq_len; t++) {
+                for (uint t = start_seq; t < seq_len; t++) {
                     float weight = use_shared ? scores[t] : scores_scratch[scratch_base + t];
                     uint v_off = t * kv_dim + kv_head * head_dim;
                     sum += weight * v_cache[v_off + d];
@@ -902,6 +908,7 @@ internal static class Shaders
             uint head_dim;
             uint seq_len;
             uint max_seq_len;
+            uint window;        // SWA: attend only [start_seq, seq_len); 0 = full attention
         };
 
         // Score-storage strategy mirrors the fp32 Attention shader.
@@ -920,11 +927,14 @@ internal static class Shaders
             uint q_off = h * head_dim;
             uint out_off = h * head_dim;
 
+            // SWA bound — mirrors the fp32 Attention shader (CPU ForwardPass.Attention).
+            uint start_seq = (window != 0u && window < seq_len) ? (seq_len - window) : 0u;
+
             bool use_shared = (seq_len <= MAX_SHARED_SCORES);
             uint scratch_base = h * max_seq_len;
 
-            // ─── Phase 1: per-position Q·K scores ───
-            for (uint t = tid; t < seq_len; t += 256) {
+            // ─── Phase 1: per-position Q·K scores over [start_seq, seq_len) ───
+            for (uint t = start_seq + tid; t < seq_len; t += 256) {
                 float dot = 0.0;
                 uint k_off = t * kv_dim + kv_head * head_dim;
                 // Read each packed fp16 word once (two K elements at a time). k_off is even
@@ -946,9 +956,9 @@ internal static class Shaders
             }
             barrier();
 
-            // ─── Phase 2: in-place softmax over [0, seq_len) ───
+            // ─── Phase 2: in-place softmax over [start_seq, seq_len) ───
             float local_max = -1.0/0.0;
-            for (uint t = tid; t < seq_len; t += 256) {
+            for (uint t = start_seq + tid; t < seq_len; t += 256) {
                 float s = use_shared ? scores[t] : scores_scratch[scratch_base + t];
                 local_max = max(local_max, s);
             }
@@ -962,7 +972,7 @@ internal static class Shaders
             barrier();
 
             float local_sum = 0.0;
-            for (uint t = tid; t < seq_len; t += 256) {
+            for (uint t = start_seq + tid; t < seq_len; t += 256) {
                 float s = use_shared ? scores[t] : scores_scratch[scratch_base + t];
                 float e = exp(s - max_val);
                 if (use_shared) scores[t] = e;
@@ -978,13 +988,13 @@ internal static class Shaders
             float inv_sum = 1.0 / sdata[0];
             barrier();
 
-            for (uint t = tid; t < seq_len; t += 256) {
+            for (uint t = start_seq + tid; t < seq_len; t += 256) {
                 if (use_shared) scores[t] *= inv_sum;
                 else            scores_scratch[scratch_base + t] *= inv_sum;
             }
             barrier();
 
-            // ─── Phase 3: weighted V sum. K is NOT re-derived here. ───
+            // ─── Phase 3: weighted V sum over [start_seq, seq_len). K is NOT re-derived here. ───
             for (uint d = tid; d < head_dim; d += 256) {
                 // Each thread owns ONE output dim d (threads are 256 apart, so adjacent d can't
                 // be paired). Hoist the per-d word/component selection out of the t-loop and walk
@@ -992,10 +1002,10 @@ internal static class Shaders
                 // (head_dim is even — see the GpuForwardPass guard), so v_off>>1 is the exact word.
                 uint d_half = d >> 1;
                 uint component = d & 1u;
-                uint v_off_half = (kv_head * head_dim) >> 1;   // t = 0 row word base
+                uint v_off_half = ((start_seq * kv_dim) + kv_head * head_dim) >> 1;   // t = start_seq row word base
                 uint kv_dim_half = kv_dim >> 1;
                 float sum = 0.0;
-                for (uint t = 0; t < seq_len; t++) {
+                for (uint t = start_seq; t < seq_len; t++) {
                     float weight = use_shared ? scores[t] : scores_scratch[scratch_base + t];
                     float vv = unpackHalf2x16(v_cache[v_off_half + d_half])[component];
                     sum += weight * vv;
@@ -1135,6 +1145,7 @@ internal static class Shaders
             uint head_dim;
             uint seq_len;
             uint max_seq_len;
+            uint window;        // SWA: attend only [start_seq, seq_len); 0 = full attention
         };
 
         // Score-storage strategy mirrors the fp32 Attention shader.
@@ -1171,11 +1182,14 @@ internal static class Shaders
             uint q_off = h * head_dim;
             uint out_off = h * head_dim;
 
+            // SWA bound — mirrors the fp32 Attention shader (CPU ForwardPass.Attention).
+            uint start_seq = (window != 0u && window < seq_len) ? (seq_len - window) : 0u;
+
             bool use_shared = (seq_len <= MAX_SHARED_SCORES);
             uint scratch_base = h * max_seq_len;
 
-            // ─── Phase 1: per-position Q·K scores ───
-            for (uint t = tid; t < seq_len; t += 256) {
+            // ─── Phase 1: per-position Q·K scores over [start_seq, seq_len) ───
+            for (uint t = start_seq + tid; t < seq_len; t += 256) {
                 float dot = 0.0;
                 uint k_off = t * kv_dim + kv_head * head_dim;
                 for (uint d = 0; d < head_dim; d++)
@@ -1190,9 +1204,9 @@ internal static class Shaders
             }
             barrier();
 
-            // ─── Phase 2: in-place softmax over [0, seq_len) ───
+            // ─── Phase 2: in-place softmax over [start_seq, seq_len) ───
             float local_max = -1.0/0.0;
-            for (uint t = tid; t < seq_len; t += 256) {
+            for (uint t = start_seq + tid; t < seq_len; t += 256) {
                 float s = use_shared ? scores[t] : scores_scratch[scratch_base + t];
                 local_max = max(local_max, s);
             }
@@ -1206,7 +1220,7 @@ internal static class Shaders
             barrier();
 
             float local_sum = 0.0;
-            for (uint t = tid; t < seq_len; t += 256) {
+            for (uint t = start_seq + tid; t < seq_len; t += 256) {
                 float s = use_shared ? scores[t] : scores_scratch[scratch_base + t];
                 float e = exp(s - max_val);
                 if (use_shared) scores[t] = e;
@@ -1222,16 +1236,16 @@ internal static class Shaders
             float inv_sum = 1.0 / sdata[0];
             barrier();
 
-            for (uint t = tid; t < seq_len; t += 256) {
+            for (uint t = start_seq + tid; t < seq_len; t += 256) {
                 if (use_shared) scores[t] *= inv_sum;
                 else            scores_scratch[scratch_base + t] *= inv_sum;
             }
             barrier();
 
-            // ─── Phase 3: weighted V sum. K is NOT re-derived here. ───
+            // ─── Phase 3: weighted V sum over [start_seq, seq_len). K is NOT re-derived here. ───
             for (uint d = tid; d < head_dim; d += 256) {
                 float sum = 0.0;
-                for (uint t = 0; t < seq_len; t++) {
+                for (uint t = start_seq; t < seq_len; t++) {
                     float weight = use_shared ? scores[t] : scores_scratch[scratch_base + t];
                     uint v_off = t * kv_dim + kv_head * head_dim;
                     sum += weight * loadV(v_off + d);
@@ -3085,7 +3099,7 @@ internal static class Shaders
     /// the caller's n_splits = ceil(seq_len/CHUNK)) write (m=−inf, l=0) and return so the combine
     /// scale exp(m−gmax)=0 skips them. GQA: kv_head = h / (num_heads/num_kv_heads).
     ///
-    /// Push constants: { uint num_heads, uint num_kv_heads, uint head_dim, uint seq_len, uint n_splits }.
+    /// Push constants: { uint num_heads, uint num_kv_heads, uint head_dim, uint seq_len, uint n_splits, uint window }.
     /// Bindings: 0=Q[num_heads*head_dim], 1=K_cache[seq_len*kv_dim], 2=V_cache[seq_len*kv_dim],
     ///           3=partial_o[num_heads*n_splits*head_dim], 4=partial_meta[num_heads*n_splits*2].
     /// </summary>
@@ -3107,6 +3121,7 @@ internal static class Shaders
             uint head_dim;
             uint seq_len;
             uint n_splits;
+            uint window;        // SWA: attend only [start_seq, seq_len); 0 = full attention
         };
 
         const uint CHUNK = 512u;
@@ -3120,21 +3135,26 @@ internal static class Shaders
             if (h >= num_heads || s >= n_splits) return;
 
             uint meta_off = (h * n_splits + s) * 2u;
+            // SWA bound — mirrors the fp32 Attention shader (CPU ForwardPass.Attention).
+            uint start_seq = (window != 0u && window < seq_len) ? (seq_len - window) : 0u;
             uint t0 = s * CHUNK;
-            // Out-of-range split (fixed n_splits, short seq_len): mark empty and bail so the
-            // combine skips it (scale = exp(−inf − gmax) = 0) and never reads a stale numerator.
-            if (t0 >= seq_len) {
+            uint t1 = t0 + CHUNK; if (t1 > seq_len) t1 = seq_len;
+            // Empty for this split: out-of-range (t0 >= seq_len, fixed n_splits) OR entirely below
+            // the sliding window (t1 <= start_seq). Mark empty and bail so the combine skips it
+            // (scale = exp(−inf − gmax) = 0) and never reads a stale numerator.
+            if (t0 >= seq_len || t1 <= start_seq) {
                 if (tid == 0u) { partial_meta[meta_off] = -1.0/0.0; partial_meta[meta_off + 1u] = 0.0; }
                 return;
             }
-            uint t1 = t0 + CHUNK; if (t1 > seq_len) t1 = seq_len;
+            // Clamp the slice's start to the window so positions < start_seq never contribute.
+            if (t0 < start_seq) t0 = start_seq;
             uint n = t1 - t0;   // 1 ≤ n ≤ CHUNK
 
             uint kv_head = h / (num_heads / num_kv_heads);
             uint kv_dim  = num_kv_heads * head_dim;
             float scale  = inversesqrt(float(head_dim));
             uint q_off   = h * head_dim;
-            uint kv_base = t0 * kv_dim + kv_head * head_dim;   // first row of this slice for this kv head
+            uint kv_base = t0 * kv_dim + kv_head * head_dim;   // first row of this (clamped) slice for this kv head
 
             // ─── Phase 1: scores for the slice → shared (indexed t − t0) ───
             for (uint t = tid; t < n; t += 256u) {
@@ -3288,7 +3308,7 @@ internal static class Shaders
     /// stored K/V mantissa is narrowed. The companion (dtype-agnostic, reads the fp32 partial
     /// buffers) <see cref="AttentionSplitKvCombine"/> is reused unchanged.
     ///
-    /// Push constants: { uint num_heads, uint num_kv_heads, uint head_dim, uint seq_len, uint n_splits }.
+    /// Push constants: { uint num_heads, uint num_kv_heads, uint head_dim, uint seq_len, uint n_splits, uint window }.
     /// Bindings: 0=Q[num_heads*head_dim] (float), 1=K_cache (uint, fp16-packed),
     ///           2=V_cache (uint, fp16-packed), 3=partial_o[num_heads*n_splits*head_dim] (float),
     ///           4=partial_meta[num_heads*n_splits*2] (float).
@@ -3311,6 +3331,7 @@ internal static class Shaders
             uint head_dim;
             uint seq_len;
             uint n_splits;
+            uint window;        // SWA: attend only [start_seq, seq_len); 0 = full attention
         };
 
         const uint CHUNK = 512u;
@@ -3324,21 +3345,26 @@ internal static class Shaders
             if (h >= num_heads || s >= n_splits) return;
 
             uint meta_off = (h * n_splits + s) * 2u;
+            // SWA bound — mirrors the fp32 split-KV partial.
+            uint start_seq = (window != 0u && window < seq_len) ? (seq_len - window) : 0u;
             uint t0 = s * CHUNK;
-            // Out-of-range split (fixed n_splits, short seq_len): mark empty and bail so the
-            // combine skips it (scale = exp(−inf − gmax) = 0) and never reads a stale numerator.
-            if (t0 >= seq_len) {
+            uint t1 = t0 + CHUNK; if (t1 > seq_len) t1 = seq_len;
+            // Empty for this split: out-of-range (t0 >= seq_len) OR entirely below the sliding
+            // window (t1 <= start_seq). Mark empty and bail so the combine skips it
+            // (scale = exp(−inf − gmax) = 0) and never reads a stale numerator.
+            if (t0 >= seq_len || t1 <= start_seq) {
                 if (tid == 0u) { partial_meta[meta_off] = -1.0/0.0; partial_meta[meta_off + 1u] = 0.0; }
                 return;
             }
-            uint t1 = t0 + CHUNK; if (t1 > seq_len) t1 = seq_len;
+            // Clamp the slice's start to the window so positions < start_seq never contribute.
+            if (t0 < start_seq) t0 = start_seq;
             uint n = t1 - t0;   // 1 ≤ n ≤ CHUNK
 
             uint kv_head = h / (num_heads / num_kv_heads);
             uint kv_dim  = num_kv_heads * head_dim;
             float scale  = inversesqrt(float(head_dim));
             uint q_off   = h * head_dim;
-            uint kv_base = t0 * kv_dim + kv_head * head_dim;   // first row of this slice for this kv head
+            uint kv_base = t0 * kv_dim + kv_head * head_dim;   // first row of this (clamped) slice for this kv head
 
             // ─── Phase 1: scores for the slice → shared (indexed t − t0) ───
             // Read each packed fp16 word once (two K elements at a time). kv_base + t*kv_dim is
@@ -3419,7 +3445,7 @@ internal static class Shaders
     /// accumulation stay fp32; only the stored K/V is narrowed. The companion
     /// <see cref="AttentionSplitKvCombine"/> (reads the fp32 partial buffers) is reused unchanged.
     ///
-    /// Push constants: { uint num_heads, uint num_kv_heads, uint head_dim, uint seq_len, uint n_splits }.
+    /// Push constants: { uint num_heads, uint num_kv_heads, uint head_dim, uint seq_len, uint n_splits, uint window }.
     /// Bindings: 0=Q[num_heads*head_dim] (float), 1=K_cache (uint, block_q8_0),
     ///           2=V_cache (uint, block_q8_0), 3=partial_o[num_heads*n_splits*head_dim] (float),
     ///           4=partial_meta[num_heads*n_splits*2] (float).
@@ -3442,6 +3468,7 @@ internal static class Shaders
             uint head_dim;
             uint seq_len;
             uint n_splits;
+            uint window;        // SWA: attend only [start_seq, seq_len); 0 = full attention
         };
 
         const uint CHUNK = 512u;
@@ -3459,21 +3486,28 @@ internal static class Shaders
             if (h >= num_heads || s >= n_splits) return;
 
             uint meta_off = (h * n_splits + s) * 2u;
+            // SWA bound — mirrors the fp32 split-KV partial.
+            uint start_seq = (window != 0u && window < seq_len) ? (seq_len - window) : 0u;
             uint t0 = s * CHUNK;
-            // Out-of-range split (fixed n_splits, short seq_len): mark empty and bail so the
-            // combine skips it (scale = exp(−inf − gmax) = 0) and never reads a stale numerator.
-            if (t0 >= seq_len) {
+            uint t1 = t0 + CHUNK; if (t1 > seq_len) t1 = seq_len;
+            // Empty for this split: out-of-range (t0 >= seq_len) OR entirely below the sliding
+            // window (t1 <= start_seq). Mark empty and bail so the combine skips it
+            // (scale = exp(−inf − gmax) = 0) and never reads a stale numerator.
+            if (t0 >= seq_len || t1 <= start_seq) {
                 if (tid == 0u) { partial_meta[meta_off] = -1.0/0.0; partial_meta[meta_off + 1u] = 0.0; }
                 return;
             }
-            uint t1 = t0 + CHUNK; if (t1 > seq_len) t1 = seq_len;
+            // Clamp the slice's start to the window so positions < start_seq never contribute.
+            // kv_base stays a multiple of 32 (kv_dim & head_dim are multiples of 32), so the
+            // block addressing (kv_base >> 5) is still exact after the clamp.
+            if (t0 < start_seq) t0 = start_seq;
             uint n = t1 - t0;   // 1 ≤ n ≤ CHUNK
 
             uint kv_head = h / (num_heads / num_kv_heads);
             uint kv_dim  = num_kv_heads * head_dim;
             float scale  = inversesqrt(float(head_dim));
             uint q_off   = h * head_dim;
-            uint kv_base = t0 * kv_dim + kv_head * head_dim;   // first row of this slice for this kv head
+            uint kv_base = t0 * kv_dim + kv_head * head_dim;   // first row of this (clamped) slice for this kv head
 
             // ─── Phase 1: scores for the slice → shared (indexed t − t0) ───
             // Load each block's fp16 scale ONCE per 32-element block (head_dim & kv_dim are

@@ -728,7 +728,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             _gpu.Attention(_gpuQ, _gpuKCache[i], _gpuVCache[i], _gpuAttnOut,
                 _gpuAttnScoresScratch,
                 (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
-                (uint)(position + 1), (uint)_maxSeqLen);
+                (uint)(position + 1), (uint)_maxSeqLen, window: 0u);
         }
         _gpu.RecordBarrier();
 

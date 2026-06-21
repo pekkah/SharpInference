@@ -1124,8 +1124,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private struct MatVecParams { public uint rows; public uint cols; }
     private struct EmbedParams { public uint tokenId; public uint embDim; }
     private struct KvAppendParams { public uint kvDim; public uint position; public uint maxSeqLen; }
-    private struct AttentionParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint seqLen; public uint maxSeqLen; }
-    private struct SplitKvPartialParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint seqLen; public uint nSplits; }
+    private struct AttentionParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint seqLen; public uint maxSeqLen; public uint window; }
+    private struct SplitKvPartialParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint seqLen; public uint nSplits; public uint window; }
     private struct SplitKvCombineParams { public uint numHeads; public uint headDim; public uint nSplits; }
     private struct SnapKvScoreParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint promptLen; public uint qAbsPos; public uint maxSeqLen; }
     private struct KvCompactParams { public uint K; public uint kvDim; }
@@ -1392,13 +1392,14 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     /// </summary>
     public void Attention(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
         Tensor scoresScratch,
-        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen)
+        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen,
+        uint window = 0u)
     {
         _attentionPipeline ??= new ComputePipeline(this, Shaders.Attention, 5, pushConstantSize: sizeof(AttentionParams));
         var p = new AttentionParams
         {
             numHeads = numHeads, numKvHeads = numKvHeads,
-            headDim = headDim, seqLen = seqLen, maxSeqLen = maxSeqLen
+            headDim = headDim, seqLen = seqLen, maxSeqLen = maxSeqLen, window = window
         };
         DispatchOrRecord(_attentionPipeline,
             [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(output),
@@ -1422,7 +1423,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     /// </summary>
     public void AttentionSplitKv(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
         Tensor partialO, Tensor partialMeta,
-        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen)
+        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen,
+        uint window = 0u)
     {
         // The combine shader bounds its per-head rescale array at 256 splits (MAX_SPLITS) ⇔
         // seqLen <= 256*512 = 131072. Check seqLen directly so the +511 can't overflow.
@@ -1437,7 +1439,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         var pp = new SplitKvPartialParams
         {
             numHeads = numHeads, numKvHeads = numKvHeads,
-            headDim = headDim, seqLen = seqLen, nSplits = nSplits
+            headDim = headDim, seqLen = seqLen, nSplits = nSplits, window = window
         };
         DispatchOrRecord(_splitKvPartialPipeline,
             [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(partialO),
@@ -1466,7 +1468,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     /// </summary>
     public void AttentionSplitKvBf16(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
         Tensor partialO, Tensor partialMeta,
-        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen)
+        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen,
+        uint window = 0u)
     {
         // Mirrors AttentionSplitKv's guard (combine bounds the per-head rescale at 256 splits).
         if (seqLen > 131072)
@@ -1479,7 +1482,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         var pp = new SplitKvPartialParams
         {
             numHeads = numHeads, numKvHeads = numKvHeads,
-            headDim = headDim, seqLen = seqLen, nSplits = nSplits
+            headDim = headDim, seqLen = seqLen, nSplits = nSplits, window = window
         };
         DispatchOrRecord(_splitKvPartialBf16Pipeline,
             [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(partialO),
@@ -1504,7 +1507,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     /// </summary>
     public void AttentionSplitKvQ8(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
         Tensor partialO, Tensor partialMeta,
-        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen)
+        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen,
+        uint window = 0u)
     {
         if (seqLen > 131072)
             throw new ArgumentOutOfRangeException(nameof(seqLen),
@@ -1516,7 +1520,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         var pp = new SplitKvPartialParams
         {
             numHeads = numHeads, numKvHeads = numKvHeads,
-            headDim = headDim, seqLen = seqLen, nSplits = nSplits
+            headDim = headDim, seqLen = seqLen, nSplits = nSplits, window = window
         };
         DispatchOrRecord(_splitKvPartialQ8Pipeline,
             [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(partialO),
@@ -1559,13 +1563,14 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     /// </summary>
     public void AttentionBf16(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
         Tensor scoresScratch,
-        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen)
+        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen,
+        uint window = 0u)
     {
         _attentionBf16Pipeline ??= new ComputePipeline(this, Shaders.AttentionBf16, 5, pushConstantSize: sizeof(AttentionParams));
         var p = new AttentionParams
         {
             numHeads = numHeads, numKvHeads = numKvHeads,
-            headDim = headDim, seqLen = seqLen, maxSeqLen = maxSeqLen
+            headDim = headDim, seqLen = seqLen, maxSeqLen = maxSeqLen, window = window
         };
         DispatchOrRecord(_attentionBf16Pipeline,
             [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(output),
@@ -1602,13 +1607,14 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     /// </summary>
     public void AttentionQ8_0(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
         Tensor scoresScratch,
-        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen)
+        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen,
+        uint window = 0u)
     {
         _attentionQ8Pipeline ??= new ComputePipeline(this, Shaders.AttentionQ8_0, 5, pushConstantSize: sizeof(AttentionParams));
         var p = new AttentionParams
         {
             numHeads = numHeads, numKvHeads = numKvHeads,
-            headDim = headDim, seqLen = seqLen, maxSeqLen = maxSeqLen
+            headDim = headDim, seqLen = seqLen, maxSeqLen = maxSeqLen, window = window
         };
         DispatchOrRecord(_attentionQ8Pipeline,
             [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(output),

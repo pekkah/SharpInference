@@ -1022,6 +1022,245 @@ public sealed unsafe class VulkanShaderTests
         backend.Free(gpuScratch);
     }
 
+    // ── sliding-window attention (SWA, issue #309) ──────────────────────────────────────────
+
+    /// <summary>
+    /// SWA (issue #309): window &lt; seqLen ⇒ the score / softmax / V-aggregation must run only
+    /// over the last <c>window</c> KV positions. seqLen=2000 (&gt; 256 stored-scores path),
+    /// window=512. Compared to a CPU reference that softmaxes ONLY [seqLen-window, seqLen).
+    /// </summary>
+    [Fact]
+    public void AttentionShader_Windowed_MasksToWindow()
+    {
+        AttentionWindowedMatchesCpuReference(seqLen: 2000, window: 512, numHeads: 2, numKvHeads: 2, headDim: 32);
+    }
+
+    /// <summary>
+    /// SWA (issue #309): window &gt;= seqLen ⇒ start_seq clamps to 0, i.e. FULL attention. The
+    /// windowed shader output must match the unwindowed (full-attention) CPU reference. seqLen=300,
+    /// window=512.
+    /// </summary>
+    [Fact]
+    public void AttentionShader_WindowGeqSeqLen_IsFullAttention()
+    {
+        AttentionWindowedMatchesCpuReference(seqLen: 300, window: 512, numHeads: 2, numKvHeads: 2, headDim: 32);
+    }
+
+    /// <summary>
+    /// SWA (issue #309): GQA (num_heads &gt; num_kv_heads) with a window that masks. seqLen=2000,
+    /// window=700, 4 heads / 2 KV heads, headDim=64.
+    /// </summary>
+    [Fact]
+    public void AttentionShader_WindowedGqa_MasksToWindow()
+    {
+        AttentionWindowedMatchesCpuReference(seqLen: 2000, window: 700, numHeads: 4, numKvHeads: 2, headDim: 64);
+    }
+
+    /// <summary>
+    /// SWA (issue #309) CRITICAL regression: window=0 MUST be byte-identical to full attention.
+    /// Runs the same shape as the fp32 short/long parity tests with window=0 and compares to the
+    /// full (unwindowed) CPU reference — confirms window=0 == today's behavior.
+    /// </summary>
+    [Fact]
+    public void AttentionShader_WindowZero_IsFullAttention()
+    {
+        // window=0 ⇒ full attention reference (AttentionWindowedMatchesCpuReference uses
+        // effectiveWindow = window==0 ? seqLen : window, so the reference spans [0, seqLen)).
+        AttentionWindowedMatchesCpuReference(seqLen: 512, window: 0, numHeads: 4, numKvHeads: 2, headDim: 32);
+        AttentionWindowedMatchesCpuReference(seqLen: 64, window: 0, numHeads: 2, numKvHeads: 2, headDim: 32);
+    }
+
+    /// <summary>
+    /// SWA (issue #309) bf16 KV: windowed attention over the fp16-packed cache. seqLen=2000,
+    /// window=512. Tolerance &lt; 1e-2 (fp16 K/V is lossy).
+    /// </summary>
+    [Fact]
+    public void AttentionBf16Shader_Windowed_MasksToWindow()
+    {
+        AttentionBf16WindowedMatchesCpuReference(seqLen: 2000, window: 512, numHeads: 2, numKvHeads: 2, headDim: 32);
+    }
+
+    /// <summary>
+    /// SWA (issue #309) q8_0 KV: windowed attention over the block_q8_0 cache. seqLen=2000,
+    /// window=512, headDim=32 (kvDim multiple of 32). q8_0 dequant is exact on both sides; only FP
+    /// accumulation order differs ⇒ &lt; 1e-2.
+    /// </summary>
+    [Fact]
+    public void AttentionQ8Shader_Windowed_MasksToWindow()
+    {
+        AttentionQ8WindowedMatchesCpuReference(seqLen: 2000, window: 512, numHeads: 2, numKvHeads: 2, headDim: 32);
+    }
+
+    /// <summary>
+    /// fp32 single-pass windowed parity: builds an fp32 K/V cache, runs
+    /// <see cref="Vulkan.VulkanBackend.Attention"/> with the given <paramref name="window"/>, and
+    /// compares to <see cref="WindowedSdpaReference"/> over [max(0,seqLen-window), seqLen) (or the
+    /// full range when window==0). Tolerance &lt; 1e-3.
+    /// </summary>
+    private static void AttentionWindowedMatchesCpuReference(
+        int seqLen, int window, int numHeads, int numKvHeads, int headDim)
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        int kvDim = numKvHeads * headDim;
+        int maxSeqLen = seqLen + 16;
+
+        var rng = new Random(42);
+        var q = new float[numHeads * headDim];
+        var kCache = new float[maxSeqLen * kvDim];
+        var vCache = new float[maxSeqLen * kvDim];
+        for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < seqLen * kvDim; i++) kCache[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < seqLen * kvDim; i++) vCache[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var cpuOutput = WindowedSdpaReference(q, kCache, vCache, seqLen, window, kvDim, numHeads, numKvHeads, headDim);
+
+        var gpuQ = backend.Upload(q, TensorShape.D1(q.Length));
+        var gpuK = backend.Upload(kCache, TensorShape.D2(maxSeqLen, kvDim));
+        var gpuV = backend.Upload(vCache, TensorShape.D2(maxSeqLen, kvDim));
+        var gpuOut = backend.Allocate(TensorShape.D1(numHeads * headDim));
+        long scratchElems = maxSeqLen > 4096 ? (long)numHeads * maxSeqLen : 1L;
+        var gpuScratch = backend.Allocate(TensorShape.D1(scratchElems));
+        ((Vulkan.VulkanBackend)backend).Attention(
+            gpuQ, gpuK, gpuV, gpuOut, gpuScratch,
+            (uint)numHeads, (uint)numKvHeads, (uint)headDim,
+            (uint)seqLen, (uint)maxSeqLen, window: (uint)window);
+
+        var gpuResult = new float[numHeads * headDim];
+        backend.Download(gpuOut, gpuResult);
+
+        for (int i = 0; i < cpuOutput.Length; i++)
+            Assert.True(MathF.Abs(gpuResult[i] - cpuOutput[i]) < 1e-3f,
+                $"Windowed attention mismatch at [{i}] (seqLen={seqLen}, window={window}): " +
+                $"gpu={gpuResult[i]:F5} cpu={cpuOutput[i]:F5}");
+
+        backend.Free(gpuQ);
+        backend.Free(gpuK);
+        backend.Free(gpuV);
+        backend.Free(gpuOut);
+        backend.Free(gpuScratch);
+    }
+
+    /// <summary>bf16 single-pass windowed parity — mirrors <see cref="AttentionWindowedMatchesCpuReference"/>
+    /// but the K/V cache is fp16-packed (the bytes <see cref="Vulkan.VulkanBackend.AttentionBf16"/>
+    /// unpacks) and the CPU reference dequantizes from the SAME fp16 bits. Tolerance &lt; 1e-2.</summary>
+    private static void AttentionBf16WindowedMatchesCpuReference(
+        int seqLen, int window, int numHeads, int numKvHeads, int headDim)
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        int kvDim = numKvHeads * headDim;
+        int maxSeqLen = seqLen + 16;
+
+        var rng = new Random(42);
+        var q = new float[numHeads * headDim];
+        for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var kHalf = new ushort[maxSeqLen * kvDim];
+        var vHalf = new ushort[maxSeqLen * kvDim];
+        var kRef = new float[maxSeqLen * kvDim];
+        var vRef = new float[maxSeqLen * kvDim];
+        for (int i = 0; i < seqLen * kvDim; i++)
+        {
+            Half hk = (Half)(rng.NextDouble() * 2 - 1);
+            Half hv = (Half)(rng.NextDouble() * 2 - 1);
+            kHalf[i] = BitConverter.HalfToUInt16Bits(hk); kRef[i] = (float)hk;
+            vHalf[i] = BitConverter.HalfToUInt16Bits(hv); vRef[i] = (float)hv;
+        }
+
+        var cpuOutput = WindowedSdpaReference(q, kRef, vRef, seqLen, window, kvDim, numHeads, numKvHeads, headDim);
+
+        int kvWords = maxSeqLen * kvDim / 2;
+        var kPacked = new float[kvWords];
+        var vPacked = new float[kvWords];
+        PackHalfPairs(kHalf, kPacked);
+        PackHalfPairs(vHalf, vPacked);
+
+        var gpuQ = backend.Upload(q, TensorShape.D1(q.Length));
+        var gpuK = backend.Upload(kPacked, TensorShape.D1(kvWords));
+        var gpuV = backend.Upload(vPacked, TensorShape.D1(kvWords));
+        var gpuOut = backend.Allocate(TensorShape.D1(numHeads * headDim));
+        long scratchElems = maxSeqLen > 4096 ? (long)numHeads * maxSeqLen : 1L;
+        var gpuScratch = backend.Allocate(TensorShape.D1(scratchElems));
+        ((Vulkan.VulkanBackend)backend).AttentionBf16(
+            gpuQ, gpuK, gpuV, gpuOut, gpuScratch,
+            (uint)numHeads, (uint)numKvHeads, (uint)headDim,
+            (uint)seqLen, (uint)maxSeqLen, window: (uint)window);
+
+        var gpuResult = new float[numHeads * headDim];
+        backend.Download(gpuOut, gpuResult);
+
+        for (int i = 0; i < cpuOutput.Length; i++)
+            Assert.True(MathF.Abs(gpuResult[i] - cpuOutput[i]) < 1e-2f,
+                $"Windowed bf16 attention mismatch at [{i}] (seqLen={seqLen}, window={window}): " +
+                $"gpu={gpuResult[i]:F5} cpu={cpuOutput[i]:F5}");
+
+        backend.Free(gpuQ);
+        backend.Free(gpuK);
+        backend.Free(gpuV);
+        backend.Free(gpuOut);
+        backend.Free(gpuScratch);
+    }
+
+    /// <summary>q8_0 single-pass windowed parity — mirrors <see cref="AttentionWindowedMatchesCpuReference"/>
+    /// but the K/V cache is block_q8_0 (the bytes <see cref="Vulkan.VulkanBackend.AttentionQ8_0"/>
+    /// byte-gathers) and the CPU reference dequantizes from the SAME blocks. Tolerance &lt; 1e-2.</summary>
+    private static void AttentionQ8WindowedMatchesCpuReference(
+        int seqLen, int window, int numHeads, int numKvHeads, int headDim)
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        int kvDim = numKvHeads * headDim;
+        int maxSeqLen = seqLen + 16;
+        Assert.True(kvDim % 32 == 0);
+
+        var rng = new Random(42);
+        var q = new float[numHeads * headDim];
+        for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        int blocksPerRow = kvDim / 32;
+        int totalBlocks = maxSeqLen * blocksPerRow;
+        var kBytes = new byte[totalBlocks * 34];
+        var vBytes = new byte[totalBlocks * 34];
+        var kRef = new float[maxSeqLen * kvDim];
+        var vRef = new float[maxSeqLen * kvDim];
+        for (int t = 0; t < seqLen; t++)
+            for (int blk = 0; blk < blocksPerRow; blk++)
+            {
+                int b0 = (t * blocksPerRow + blk) * 34;
+                int e0 = t * kvDim + blk * 32;
+                QuantizeBlockQ8_0(rng, kBytes, b0, kRef, e0);
+                QuantizeBlockQ8_0(rng, vBytes, b0, vRef, e0);
+            }
+
+        var cpuOutput = WindowedSdpaReference(q, kRef, vRef, seqLen, window, kvDim, numHeads, numKvHeads, headDim);
+
+        var gpuK = UploadBytesAsFloats(backend, kBytes);
+        var gpuV = UploadBytesAsFloats(backend, vBytes);
+        var gpuQ = backend.Upload(q, TensorShape.D1(q.Length));
+        var gpuOut = backend.Allocate(TensorShape.D1(numHeads * headDim));
+        long scratchElems = maxSeqLen > 4096 ? (long)numHeads * maxSeqLen : 1L;
+        var gpuScratch = backend.Allocate(TensorShape.D1(scratchElems));
+        ((Vulkan.VulkanBackend)backend).AttentionQ8_0(
+            gpuQ, gpuK, gpuV, gpuOut, gpuScratch,
+            (uint)numHeads, (uint)numKvHeads, (uint)headDim,
+            (uint)seqLen, (uint)maxSeqLen, window: (uint)window);
+
+        var gpuResult = new float[numHeads * headDim];
+        backend.Download(gpuOut, gpuResult);
+
+        for (int i = 0; i < cpuOutput.Length; i++)
+            Assert.True(MathF.Abs(gpuResult[i] - cpuOutput[i]) < 1e-2f,
+                $"Windowed q8_0 attention mismatch at [{i}] (seqLen={seqLen}, window={window}): " +
+                $"gpu={gpuResult[i]:F5} cpu={cpuOutput[i]:F5}");
+
+        backend.Free(gpuQ);
+        backend.Free(gpuK);
+        backend.Free(gpuV);
+        backend.Free(gpuOut);
+        backend.Free(gpuScratch);
+    }
+
     /// <summary>
     /// Flash-decoding split-KV (issue #312): seq_len=4097 ⇒ ceil(4097/512) = 9 splits, the last
     /// covering a single position. Validates the combine LSE merge across an almost-empty
@@ -1122,6 +1361,82 @@ public sealed unsafe class VulkanShaderTests
         for (int i = 0; i < cpuOutput.Length; i++)
             Assert.True(MathF.Abs(gpuResult[i] - cpuOutput[i]) < 1e-3f,
                 $"SplitKv mismatch at [{i}] (seqLen={seqLen}, nSplits={nSplits}): " +
+                $"gpu={gpuResult[i]:F5} cpu={cpuOutput[i]:F5}");
+
+        backend.Free(gpuQ);
+        backend.Free(gpuK);
+        backend.Free(gpuV);
+        backend.Free(gpuOut);
+        backend.Free(gpuPartialO);
+        backend.Free(gpuPartialMeta);
+    }
+
+    // ── sliding-window split-KV (SWA, issue #309) ──────────────────────────────────────────
+
+    /// <summary>
+    /// SWA split-KV (issue #309): seq_len=5000, window=1024 ⇒ start_seq=3976. The early chunks
+    /// (chunk 0..6 cover [0,3584), chunk 7 covers [3584,4096)) — chunks 0..6 are ENTIRELY below
+    /// start_seq=3976 and MUST be skipped (empty meta); chunk 7 is partially below (clamped to
+    /// 3976). Compared to the CPU windowed reference &lt; 1e-3.
+    /// </summary>
+    [Fact]
+    public void AttentionSplitKvWindowed_MasksToWindow()
+    {
+        AttentionSplitKvWindowedMatchesCpuReference(seqLen: 5000, window: 1024, numHeads: 4, numKvHeads: 2, headDim: 128);
+    }
+
+    /// <summary>
+    /// SWA split-KV (issue #309) CRITICAL regression: window=0 MUST be byte-identical to full
+    /// split-KV attention. Same shape as <see cref="AttentionSplitKv_Gqa_MatchesCpuReference"/>
+    /// with window=0, compared to the FULL (unwindowed) reference.
+    /// </summary>
+    [Fact]
+    public void AttentionSplitKvWindowZero_IsFullAttention()
+    {
+        AttentionSplitKvWindowedMatchesCpuReference(seqLen: 5000, window: 0, numHeads: 4, numKvHeads: 2, headDim: 128);
+    }
+
+    /// <summary>
+    /// fp32 split-KV windowed parity: runs <see cref="Vulkan.VulkanBackend.AttentionSplitKv"/>
+    /// with the given <paramref name="window"/> and compares to <see cref="WindowedSdpaReference"/>.
+    /// Exercises the partial-pass chunk-skip (chunks fully below start_seq) and chunk-clamp paths.
+    /// </summary>
+    private static void AttentionSplitKvWindowedMatchesCpuReference(
+        int seqLen, int window, int numHeads, int numKvHeads, int headDim)
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        int kvDim = numKvHeads * headDim;
+        int maxSeqLen = seqLen + 16;
+
+        var rng = new Random(1312);
+        var q = new float[numHeads * headDim];
+        var kCache = new float[maxSeqLen * kvDim];
+        var vCache = new float[maxSeqLen * kvDim];
+        for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < seqLen * kvDim; i++) kCache[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < seqLen * kvDim; i++) vCache[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var cpuOutput = WindowedSdpaReference(q, kCache, vCache, seqLen, window, kvDim, numHeads, numKvHeads, headDim);
+
+        int nSplits = (seqLen + 511) / 512;
+        var gpuQ = backend.Upload(q, TensorShape.D1(q.Length));
+        var gpuK = backend.Upload(kCache, TensorShape.D2(maxSeqLen, kvDim));
+        var gpuV = backend.Upload(vCache, TensorShape.D2(maxSeqLen, kvDim));
+        var gpuOut = backend.Allocate(TensorShape.D1(numHeads * headDim));
+        var gpuPartialO = backend.Allocate(TensorShape.D1((long)numHeads * nSplits * headDim));
+        var gpuPartialMeta = backend.Allocate(TensorShape.D1((long)numHeads * nSplits * 2));
+        ((Vulkan.VulkanBackend)backend).AttentionSplitKv(
+            gpuQ, gpuK, gpuV, gpuOut, gpuPartialO, gpuPartialMeta,
+            (uint)numHeads, (uint)numKvHeads, (uint)headDim,
+            (uint)seqLen, (uint)maxSeqLen, window: (uint)window);
+
+        var gpuResult = new float[numHeads * headDim];
+        backend.Download(gpuOut, gpuResult);
+
+        for (int i = 0; i < cpuOutput.Length; i++)
+            Assert.True(MathF.Abs(gpuResult[i] - cpuOutput[i]) < 1e-3f,
+                $"Windowed SplitKv mismatch at [{i}] (seqLen={seqLen}, window={window}, nSplits={nSplits}): " +
                 $"gpu={gpuResult[i]:F5} cpu={cpuOutput[i]:F5}");
 
         backend.Free(gpuQ);
@@ -1341,6 +1656,46 @@ public sealed unsafe class VulkanShaderTests
                 float sum = 0f;
                 for (int t = 0; t < seqLen; t++)
                     sum += scores[t] * vCache[t * kvDim + kvHead * headDim + d];
+                output[h * headDim + d] = sum;
+            }
+        }
+        return output;
+    }
+
+    /// <summary>Sliding-window scaled-dot-product attention with GQA — the same SDPA as
+    /// <see cref="SdpaReference"/> but softmax + V-aggregation run ONLY over
+    /// [max(0, seqLen-window), seqLen). <paramref name="window"/> == 0 ⇒ full attention
+    /// ([0, seqLen)), mirroring the shader's window==0 contract. Matches the CPU
+    /// ForwardPass.Attention start_seq = window > 0 ? max(0, endSeq - window) : 0.</summary>
+    private static float[] WindowedSdpaReference(
+        float[] q, float[] kCache, float[] vCache,
+        int seqLen, int window, int kvDim, int numHeads, int numKvHeads, int headDim)
+    {
+        int startSeq = window > 0 ? Math.Max(0, seqLen - window) : 0;
+        float scale = 1f / MathF.Sqrt(headDim);
+        var output = new float[numHeads * headDim];
+        for (int h = 0; h < numHeads; h++)
+        {
+            int kvHead = h / (numHeads / numKvHeads);
+            int n = seqLen - startSeq;
+            var scores = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                int t = startSeq + i;
+                float dot = 0f;
+                for (int d = 0; d < headDim; d++)
+                    dot += q[h * headDim + d] * kCache[t * kvDim + kvHead * headDim + d];
+                scores[i] = dot * scale;
+            }
+            float maxS = scores.Max();
+            float sumE = 0f;
+            for (int i = 0; i < n; i++) { scores[i] = MathF.Exp(scores[i] - maxS); sumE += scores[i]; }
+            for (int i = 0; i < n; i++) scores[i] /= sumE;
+            for (int d = 0; d < headDim; d++)
+            {
+                float sum = 0f;
+                for (int i = 0; i < n; i++)
+                    sum += scores[i] * vCache[(startSeq + i) * kvDim + kvHead * headDim + d];
                 output[h * headDim + d] = sum;
             }
         }

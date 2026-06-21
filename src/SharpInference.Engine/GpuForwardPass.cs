@@ -846,14 +846,14 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                     _gpu.AttentionSplitKvBf16(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
                         _splitKvPartialO, _splitKvPartialMeta!,
                         (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
-                        (uint)(position + 1), (uint)_maxSeqLen);
+                        (uint)(position + 1), (uint)_maxSeqLen, window: 0u);
                 }
                 else
                 {
                     _gpu.AttentionBf16(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
                         _attnScoresScratch,
                         (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
-                        (uint)(position + 1), (uint)_maxSeqLen);
+                        (uint)(position + 1), (uint)_maxSeqLen, window: 0u);
                 }
             }
             else if (_kvDType == DType.Q8_0)
@@ -873,14 +873,14 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                     _gpu.AttentionSplitKvQ8(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
                         _splitKvPartialO, _splitKvPartialMeta!,
                         (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
-                        (uint)(position + 1), (uint)_maxSeqLen);
+                        (uint)(position + 1), (uint)_maxSeqLen, window: 0u);
                 }
                 else
                 {
                     _gpu.AttentionQ8_0(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
                         _attnScoresScratch,
                         (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
-                        (uint)(position + 1), (uint)_maxSeqLen);
+                        (uint)(position + 1), (uint)_maxSeqLen, window: 0u);
                 }
             }
             else
@@ -898,14 +898,14 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                     _gpu.AttentionSplitKv(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
                         _splitKvPartialO, _splitKvPartialMeta!,
                         (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
-                        (uint)(position + 1), (uint)_maxSeqLen);
+                        (uint)(position + 1), (uint)_maxSeqLen, window: 0u);
                 }
                 else
                 {
                     _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
                         _attnScoresScratch,
                         (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
-                        (uint)(position + 1), (uint)_maxSeqLen);
+                        (uint)(position + 1), (uint)_maxSeqLen, window: 0u);
                 }
             }
             _gpu.RecordBarrier(); // attnOut done → output projection
