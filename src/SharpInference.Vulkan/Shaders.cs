@@ -1207,9 +1207,11 @@ internal static class Shaders
     ///   y[64c+l]    = d*sc[2c]  * ((ql[32c+l]&0xF) + (qh[l]&(1<<2c)   ?16:0)) - dmin*m[2c]
     ///   y[64c+l+32] = d*sc[2c+1]* ((ql[32c+l]>>4)  + (qh[l]&(1<<(2c+1))?16:0)) - dmin*m[2c+1]
     /// The 6-bit (scale, min) unpack reuses the exact Q4_K logic (Q5_K packs scales
-    /// identically); Q5_K only adds the qh high bit (+16) per quant. Weight bytes are
-    /// read through the byte-gather helper so the kernel works against uint32-strided
-    /// uploads. Mirrors the CUDA llm_matvec_q5k kernel and the CPU DequantQ5K path.
+    /// identically); Q5_K only adds the qh high bit (+16) per quant. The super-block
+    /// d/dmin and the 12 scale/min bytes occupy bytes [0:16] of each 176-byte block,
+    /// which is 4-byte aligned, so they're read as four aligned uint words (like
+    /// MatVecQ4K); the per-lane qh/ql bytes are byte-granular and use the byte-gather
+    /// helper. Mirrors the CUDA llm_matvec_q5k kernel and the CPU DequantQ5K path.
     /// </summary>
     internal const string MatVecQ5K = """
         #version 450
@@ -1247,14 +1249,19 @@ internal static class Shaders
             for (uint block = 0; block < num_blocks; block++) {
                 uint b0 = boff_base + block * 176;
 
-                float d    = unpackHalf2x16(gByte(b0)     | (gByte(b0 + 1) << 8)).x;
-                float dmin = unpackHalf2x16(gByte(b0 + 2) | (gByte(b0 + 3) << 8)).x;
+                // b0 is always a multiple of 176 (hence 4-byte aligned), so the first
+                // 16 bytes (d/dmin + 12 scale/min bytes) read as four aligned uint words,
+                // exactly like MatVecQ4K — 4 global reads instead of 16 gByte gathers.
+                uint word_base = b0 >> 2;
+                vec2 dm = unpackHalf2x16(weights_data[word_base]);
+                float d    = dm.x;
+                float dmin = dm.y;
 
                 // 12 packed scale/min bytes at b0+4 (identical packing to Q4_K).
                 // sm0 = scales[0..3], sm1 = scales[4..7], sm2 = scales[8..11].
-                uint sm0 = gByte(b0 + 4)  | (gByte(b0 + 5)  << 8) | (gByte(b0 + 6)  << 16) | (gByte(b0 + 7)  << 24);
-                uint sm1 = gByte(b0 + 8)  | (gByte(b0 + 9)  << 8) | (gByte(b0 + 10) << 16) | (gByte(b0 + 11) << 24);
-                uint sm2 = gByte(b0 + 12) | (gByte(b0 + 13) << 8) | (gByte(b0 + 14) << 16) | (gByte(b0 + 15) << 24);
+                uint sm0 = weights_data[word_base + 1];
+                uint sm1 = weights_data[word_base + 2];
+                uint sm2 = weights_data[word_base + 3];
 
                 float dsc[8], dmn[8];
                 dsc[0] = d * float((sm0) & 63);         dmn[0] = dmin * float((sm1) & 63);
