@@ -22,6 +22,13 @@ public static class ShaderCompiler
     internal static int GlslcFallbackCount;
 
     /// <summary>
+    /// When true, <see cref="Compile"/> skips the precompiled table and always invokes glslc.
+    /// Set by the SpirvGen build tool so regeneration recompiles from GLSL source — picking up
+    /// shader edits or glslc-flag changes — instead of reusing the (possibly stale) table.
+    /// </summary>
+    internal static bool BypassPrecompiled;
+
+    /// <summary>
     /// Deterministic FNV-1a 64-bit hash over the UTF-8 bytes of the source. Unlike
     /// <see cref="string.GetHashCode()"/> (per-process randomized) this is stable across
     /// processes/builds, so the build-time precompiled table can be keyed by it.
@@ -43,7 +50,7 @@ public static class ShaderCompiler
         ulong key = StableHash(glslSource);
 
         // 1. Precompiled, committed table — the runtime path for every shipped shader.
-        if (ShadersPrecompiled.TryGet(key, out var precompiled))
+        if (!BypassPrecompiled && ShadersPrecompiled.TryGet(key, out var precompiled))
             return precompiled;
 
         // 2. In-process cache (for repeated misses, e.g. ad-hoc test shaders).
@@ -59,9 +66,10 @@ public static class ShaderCompiler
         var glslcPath = FindGlslc()
             ?? throw new FileNotFoundException("glslc not found. Install the Vulkan SDK.");
 
-        // Write source to temp file, compile to SPIR-V
-        var tempGlsl = Path.GetTempFileName() + ".comp";
-        var tempSpv = Path.GetTempFileName() + ".spv";
+        // Write source to temp file, compile to SPIR-V. Use GetRandomFileName (not
+        // GetTempFileName, which creates — and would leak — an empty .tmp per call).
+        var tempGlsl = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName() + ".comp");
+        var tempSpv = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName() + ".spv");
         try
         {
             File.WriteAllText(tempGlsl, glslSource);
