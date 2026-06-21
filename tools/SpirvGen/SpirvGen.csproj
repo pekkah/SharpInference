@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Dev/build tool ONLY. Generates src/SharpInference.Vulkan/Shaders.Precompiled.g.cs by
+    compiling every GLSL shader const in Shaders.cs to SPIR-V via glslc. Not in the solution,
+    not referenced by any shipping project, never packed/published. Requires the Vulkan SDK
+    (glslc) to RUN; the committed output it produces compiles with no glslc.
+
+    Run via scripts/gen-spirv.ps1 (or: dotnet run on this project).
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <!-- Reflection-based generator that is never trimmed/AOT-published; the repo-wide
+         trim/AOT analyzers would flag the BindingFlags reflection otherwise. -->
+    <IsTrimmable>false</IsTrimmable>
+    <EnableTrimAnalyzer>false</EnableTrimAnalyzer>
+    <EnableAotAnalyzer>false</EnableAotAnalyzer>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\SharpInference.Vulkan\SharpInference.Vulkan.csproj" />
+  </ItemGroup>
+
+</Project>

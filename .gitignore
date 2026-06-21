@@ -437,7 +437,13 @@ FodyWeavers.xsd
 shaders/*.spv
 codebooks/*.bin
 models/
-tools/
+# Ignore everything under tools/ (downloaded binaries, dev scratch) EXCEPT the
+# committed SpirvGen build-tool source. `tools/*` (not `tools/`) leaves the dir
+# walkable so the negation can re-include SpirvGen; its build output stays ignored.
+tools/*
+!tools/SpirvGen/
+tools/SpirvGen/bin/
+tools/SpirvGen/obj/
 tmp/
 # Nsight Systems/Compute profiling artifacts (multi-GB sqlite/nsys-rep dumps)
 prof/

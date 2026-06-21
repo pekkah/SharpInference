@@ -10,6 +10,14 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- SpirvGen (the dev-only SPIR-V table generator) reflects internal Shaders consts and
+         calls internal ShaderCompiler.Compile/StableHash; the test project asserts the table
+         covers every shader and that the precompiled path is taken at runtime. -->
+    <InternalsVisibleTo Include="SpirvGen" />
+    <InternalsVisibleTo Include="SharpInference.Tests.ForwardPass" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Vortice.Vulkan" Version="*" />
   </ItemGroup>
 

@@ -120,7 +120,7 @@ Shared settings live in `Directory.Build.props` (net10.0, LangVersion 14, Nullab
 - **TreatWarningsAsErrors** is enabled globally — all warnings must be resolved.
 - **Trim and AOT analyzers** are enabled (`IsTrimmable`, `EnableTrimAnalyzer`, `EnableAotAnalyzer`, warnings not suppressed) — code must be NativeAOT-compatible (no reflection-heavy patterns, no dynamic code generation). Server JSON uses a source-generated `SharpInferenceJsonContext`.
 - **InvariantGlobalization** is on — no culture-specific string operations.
-- Vulkan shaders (GLSL) are in `shaders/` and compiled to SPIR-V.
+- Vulkan shaders are GLSL `const string`s in `src/SharpInference.Vulkan/Shaders.cs`, precompiled to SPIR-V committed in `Shaders.Precompiled.g.cs` (keyed by an FNV-1a `ShaderCompiler.StableHash`) so the NativeAOT binary needs no glslc at runtime; `ShaderCompiler.Compile` falls back to glslc only on a table miss. After adding/editing/removing a shader const, regenerate the table with `scripts/gen-spirv.ps1` (runs `tools/SpirvGen`, needs the Vulkan SDK) — `VulkanPrecompiledShaderTests` fails on drift. Shaders needing extensions the bundled glslc lacks (`SgemmBf16`, `SgemmFp8`) are recorded in `SkippedShaders` and fall back at runtime by design.
 - Versioning is MinVer-derived from git tags (`v*`); only the `SharpInference` meta-package, `SharpInference.Server`, and `SharpInference.Cli` are packable.
 
 ## Test Projects
