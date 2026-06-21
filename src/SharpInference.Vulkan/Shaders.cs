@@ -945,6 +945,239 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// q8_0 (issue #325) variant of <see cref="KvAppend"/>: block-quantizes the K/V vectors
+    /// into the cache as ggml <c>block_q8_0</c> (34 bytes = fp16 scale + 32 int8, per 32
+    /// elements; ~4× smaller than fp32). Mirrors the CUDA <c>llm_kv_append_q8_0</c> /
+    /// <c>sharpi_q8_append_one</c> ground truth: per 32-element block, <c>amax = max(|x|)</c>,
+    /// <c>d = amax / 127</c>, <c>invd = (d &lt; 1e-30) ? 0 : 1/d</c> (the 1e-30 guard avoids
+    /// 0*inf=NaN — replicated verbatim), <c>q = clamp(round(x*invd), -127, 127)</c>.
+    ///
+    /// Dispatched ONE THREAD PER 32-ELEMENT BLOCK (not a subgroup — subgroup width is
+    /// hardware-dependent; one-thread-per-block sidesteps that). Each thread owns all 34
+    /// bytes of its destination block. Because the cache is bound as <c>uint[]</c> and a
+    /// 34-byte block is not 4-aligned, adjacent blocks share the seam <c>uint</c> word but
+    /// write DISJOINT bytes; the masked <c>atomicAnd</c>+<c>atomicOr</c> byte writer makes the
+    /// disjoint-bitfield RMW correct under any thread interleaving (the atomicAnd clears the
+    /// byte first, so ring-reuse overwrites cleanly — no zero-init needed).
+    ///
+    /// CRITICAL: indexes the cache IDENTICALLY to the fp32 <see cref="KvAppend"/>
+    /// (<c>position * kv_dim + i</c> element addressing, expressed in blocks). No
+    /// <c>% max_seq_len</c> ring modulo, matching the fp32/bf16 shaders. kv_dim is always a
+    /// multiple of 32 (enforced in GpuForwardPass), so a KV row's blocks never straddle a row.
+    ///
+    /// Push constants: { uint kv_dim, position, max_seq_len } — unchanged.
+    /// Bindings: 0=k_input[kv_dim] (float), 1=v_input[kv_dim] (float),
+    ///           2=k_cache (uint, packed block_q8_0), 3=v_cache (uint, packed block_q8_0).
+    /// </summary>
+    internal const string KvAppendQ8_0 = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer KIn  { float k_input[]; };
+        layout(binding = 1) readonly buffer VIn  { float v_input[]; };
+        layout(binding = 2) buffer KCache { uint k_cache[]; };
+        layout(binding = 3) buffer VCache { uint v_cache[]; };
+
+        layout(push_constant) uniform Params {
+            uint kv_dim;
+            uint position;
+            uint max_seq_len;
+        };
+
+        // Masked-atomic byte writers: clear the target byte, then OR in the value.
+        // Disjoint bytes within a shared uint stay correct under any interleaving.
+        void sByteK(uint b, uint val) {
+            uint w = b >> 2; uint sh = (b & 3u) * 8u;
+            atomicAnd(k_cache[w], ~(0xFFu << sh));
+            atomicOr (k_cache[w], (val & 0xFFu) << sh);
+        }
+        void sByteV(uint b, uint val) {
+            uint w = b >> 2; uint sh = (b & 3u) * 8u;
+            atomicAnd(v_cache[w], ~(0xFFu << sh));
+            atomicOr (v_cache[w], (val & 0xFFu) << sh);
+        }
+
+        void main() {
+            uint blk = gl_GlobalInvocationID.x;
+            uint blocks_per_row = kv_dim >> 5;   // kv_dim % 32 == 0
+            if (blk >= blocks_per_row) return;
+
+            // Same element address as fp32 (position * kv_dim + i), expressed in blocks.
+            uint dst_block = position * blocks_per_row + blk;
+            uint b0 = dst_block * 34u;
+            uint src = blk << 5;                 // first source element of this block
+
+            // ── K block ──
+            {
+                float amax = 0.0;
+                for (uint j = 0u; j < 32u; j++)
+                    amax = max(amax, abs(k_input[src + j]));
+                float d = amax / 127.0;
+                float invd = (d < 1e-30) ? 0.0 : (1.0 / d);
+                uint dh = packHalf2x16(vec2(d, 0.0)) & 0xFFFFu;
+                sByteK(b0, dh & 0xFFu);
+                sByteK(b0 + 1u, dh >> 8);
+                for (uint j = 0u; j < 32u; j++) {
+                    int q = clamp(int(round(k_input[src + j] * invd)), -127, 127);
+                    sByteK(b0 + 2u + j, uint(q & 0xFF));
+                }
+            }
+            // ── V block ──
+            {
+                float amax = 0.0;
+                for (uint j = 0u; j < 32u; j++)
+                    amax = max(amax, abs(v_input[src + j]));
+                float d = amax / 127.0;
+                float invd = (d < 1e-30) ? 0.0 : (1.0 / d);
+                uint dh = packHalf2x16(vec2(d, 0.0)) & 0xFFFFu;
+                sByteV(b0, dh & 0xFFu);
+                sByteV(b0 + 1u, dh >> 8);
+                for (uint j = 0u; j < 32u; j++) {
+                    int q = clamp(int(round(v_input[src + j] * invd)), -127, 127);
+                    sByteV(b0 + 2u + j, uint(q & 0xFF));
+                }
+            }
+        }
+        """;
+
+    /// <summary>
+    /// q8_0 (issue #325) variant of <see cref="Attention"/>: control flow is IDENTICAL to the
+    /// fp32 shader; the only difference is that the K/V cache buffers (bindings 1, 2) are
+    /// <c>uint[]</c> holding ggml <c>block_q8_0</c> (34 bytes/block: fp16 scale + 32 int8), so
+    /// every element read becomes a byte-gather + dequant <c>value = fp16(d) * int8</c>. All
+    /// scores / softmax / value accumulation stay fp32 — only the stored K/V is narrowed.
+    /// scores_scratch (binding 4) stays fp32. The <c>inversesqrt(head_dim)</c> scale is kept
+    /// exactly as the fp32 shader has it. Element addressing (<c>off = t*kv_dim + kv_head*head_dim</c>,
+    /// <c>e = off + d</c>) is identical to fp32/bf16; per element <c>blk=e&gt;&gt;5</c>,
+    /// <c>lane=e&amp;31</c>, <c>b0=blk*34</c>. kv_dim%32==0, so blocks never straddle a KV row.
+    ///
+    /// Push constants: { uint num_heads, num_kv_heads, head_dim, seq_len, max_seq_len } — unchanged.
+    /// Bindings: 0=Q (float), 1=K_cache (uint, block_q8_0), 2=V_cache (uint, block_q8_0),
+    ///           3=output (float), 4=scores_scratch (float).
+    /// </summary>
+    internal const string AttentionQ8_0 = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Q     { float q_data[]; };
+        layout(binding = 1) readonly buffer KCache { uint k_cache[]; };
+        layout(binding = 2) readonly buffer VCache { uint v_cache[]; };
+        layout(binding = 3) buffer Out             { float out_data[]; };
+        layout(binding = 4) buffer ScoresScratch   { float scores_scratch[]; };
+
+        layout(push_constant) uniform Params {
+            uint num_heads;
+            uint num_kv_heads;
+            uint head_dim;
+            uint seq_len;
+            uint max_seq_len;
+        };
+
+        // Score-storage strategy mirrors the fp32 Attention shader.
+        const uint MAX_SHARED_SCORES = 4096u;
+        shared float scores[MAX_SHARED_SCORES];
+        shared float sdata[256];   // reduction scratch
+
+        uint gByteK(uint b) { return (k_cache[b >> 2] >> ((b & 3u) * 8u)) & 0xFFu; }
+        int  gInt8K(uint b) { int v = int(gByteK(b)); return v >= 128 ? v - 256 : v; }
+        uint gByteV(uint b) { return (v_cache[b >> 2] >> ((b & 3u) * 8u)) & 0xFFu; }
+        int  gInt8V(uint b) { int v = int(gByteV(b)); return v >= 128 ? v - 256 : v; }
+
+        float loadK(uint e) {
+            uint blk = e >> 5; uint lane = e & 31u; uint b0 = blk * 34u;
+            float dsc = unpackHalf2x16(gByteK(b0) | (gByteK(b0 + 1u) << 8)).x;
+            return dsc * float(gInt8K(b0 + 2u + lane));
+        }
+        float loadV(uint e) {
+            uint blk = e >> 5; uint lane = e & 31u; uint b0 = blk * 34u;
+            float dsc = unpackHalf2x16(gByteV(b0) | (gByteV(b0 + 1u) << 8)).x;
+            return dsc * float(gInt8V(b0 + 2u + lane));
+        }
+
+        void main() {
+            uint h = gl_WorkGroupID.x;
+            uint tid = gl_LocalInvocationID.x;
+            if (h >= num_heads) return;
+
+            uint kv_head = h / (num_heads / num_kv_heads);
+            uint kv_dim = num_kv_heads * head_dim;
+            float scale = inversesqrt(float(head_dim));
+            uint q_off = h * head_dim;
+            uint out_off = h * head_dim;
+
+            bool use_shared = (seq_len <= MAX_SHARED_SCORES);
+            uint scratch_base = h * max_seq_len;
+
+            // ─── Phase 1: per-position Q·K scores ───
+            for (uint t = tid; t < seq_len; t += 256) {
+                float dot = 0.0;
+                uint k_off = t * kv_dim + kv_head * head_dim;
+                for (uint d = 0; d < head_dim; d++)
+                    dot += q_data[q_off + d] * loadK(k_off + d);
+                float score = dot * scale;
+                if (use_shared) scores[t] = score;
+                else            scores_scratch[scratch_base + t] = score;
+            }
+            if (use_shared) {
+                for (uint t = seq_len + tid; t < MAX_SHARED_SCORES; t += 256)
+                    scores[t] = -1.0/0.0;
+            }
+            barrier();
+
+            // ─── Phase 2: in-place softmax over [0, seq_len) ───
+            float local_max = -1.0/0.0;
+            for (uint t = tid; t < seq_len; t += 256) {
+                float s = use_shared ? scores[t] : scores_scratch[scratch_base + t];
+                local_max = max(local_max, s);
+            }
+            sdata[tid] = local_max;
+            barrier();
+            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
+                barrier();
+            }
+            float max_val = sdata[0];
+            barrier();
+
+            float local_sum = 0.0;
+            for (uint t = tid; t < seq_len; t += 256) {
+                float s = use_shared ? scores[t] : scores_scratch[scratch_base + t];
+                float e = exp(s - max_val);
+                if (use_shared) scores[t] = e;
+                else            scores_scratch[scratch_base + t] = e;
+                local_sum += e;
+            }
+            sdata[tid] = local_sum;
+            barrier();
+            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] += sdata[tid + s];
+                barrier();
+            }
+            float inv_sum = 1.0 / sdata[0];
+            barrier();
+
+            for (uint t = tid; t < seq_len; t += 256) {
+                if (use_shared) scores[t] *= inv_sum;
+                else            scores_scratch[scratch_base + t] *= inv_sum;
+            }
+            barrier();
+
+            // ─── Phase 3: weighted V sum. K is NOT re-derived here. ───
+            for (uint d = tid; d < head_dim; d += 256) {
+                float sum = 0.0;
+                for (uint t = 0; t < seq_len; t++) {
+                    float weight = use_shared ? scores[t] : scores_scratch[scratch_base + t];
+                    uint v_off = t * kv_dim + kv_head * head_dim;
+                    sum += weight * loadV(v_off + d);
+                }
+                out_data[out_off + d] = sum;
+            }
+        }
+        """;
+
+    /// <summary>
     /// SnapKV (issue #59) — per-head attention scoring across a layer's K cache.
     /// Mirrors the CUDA `llm_snapkv_score` kernel: one workgroup per query head,
     /// 256 threads. Phase 1 computes causal-masked dot(q_head, k_cache[t, kvHead, :]) * scale

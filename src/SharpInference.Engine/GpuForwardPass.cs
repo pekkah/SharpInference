@@ -128,11 +128,12 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     private bool _snapKvScoreScratchOwned; // false if aliased to _attnScoresScratch
     private int _snapKvCaptureSlot = -1; // 0..W-1 for tokens in the capture window; -1 otherwise
 
-    // KV-cache store dtype (issue #311). Float32 (default) keeps the original fp32 cache;
-    // BFloat16 selects the half-width KV path. On Vulkan "bf16" means "half-width KV" but the
-    // value is stored as IEEE fp16 packed two-per-uint (more precise than bf16 for the small KV
-    // magnitudes, and packHalf2x16 is core GLSL so no device extension is needed). Arithmetic
-    // stays fp32 — only the stored value is narrowed. q8_0 is CUDA-only for now (rejected below).
+    // KV-cache store dtype (issues #311 / #325). Float32 (default) keeps the original fp32 cache;
+    // BFloat16 selects the half-width KV path (stored as IEEE fp16 packed two-per-uint — more
+    // precise than bf16 for the small KV magnitudes, and packHalf2x16 is core GLSL so no device
+    // extension is needed); Q8_0 selects the block-quantized store (34 bytes per 32 elements,
+    // ~4× smaller than fp32) added in #325. Arithmetic everywhere stays fp32 — only the stored
+    // value is narrowed.
     private readonly DType _kvDType;
 
     public GpuForwardPass(GgufModel model, VulkanBackend gpu, ModelHyperparams hp,
@@ -154,20 +155,25 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         _tqEnabled = enableTurboQuant;
         _kvDType = kvDtype;
 
-        // Issue #311: the Vulkan KV cache supports fp32 and a half-width (bf16) store only.
-        // q8_0 KV is CUDA-only for now (block-quantized append/attention kernels not ported),
-        // so reject anything that isn't fp32 or bf16 up front rather than silently mis-store.
+        // Issues #311 / #325: the Vulkan KV cache supports fp32, a half-width (bf16) store, and a
+        // block-quantized q8_0 store. Reject anything else up front rather than silently mis-store.
         bool kvNarrowed = _kvDType != DType.Float32;
-        if (kvNarrowed && _kvDType != DType.BFloat16)
+        if (kvNarrowed && _kvDType is not (DType.BFloat16 or DType.Q8_0))
             throw new NotSupportedException(
-                "Vulkan KV cache supports fp32 and bf16 only (q8_0 is CUDA-only for now; issue #311).");
+                "Vulkan KV cache supports fp32, bf16, and q8_0 only (issue #325).");
         // The bf16 path packs two fp16 per uint, so a KV row (numKvHeads*headDim) must be
         // even for rows to stay word-aligned. True for all supported head dims (64/128/256),
         // but enforce it so a future odd-head_dim model fails loudly instead of corrupting KV.
-        if (kvNarrowed && ((hp.NumKvHeads * hp.HeadDim) & 1) != 0)
+        if (_kvDType == DType.BFloat16 && ((hp.NumKvHeads * hp.HeadDim) & 1) != 0)
             throw new NotSupportedException(
                 $"bf16 KV requires an even KV-row width (numKvHeads*headDim); got " +
                 $"{hp.NumKvHeads}*{hp.HeadDim}. Use fp32 KV for this model (issue #311).");
+        // The q8_0 path quantizes per 32-element block (one thread per block), so a KV row must
+        // be a multiple of 32 for blocks to align to row boundaries (no straddling).
+        if (_kvDType == DType.Q8_0 && ((hp.NumKvHeads * hp.HeadDim) & 31) != 0)
+            throw new NotSupportedException(
+                $"q8_0 KV requires kvDim % 32 == 0; got {hp.NumKvHeads}*{hp.HeadDim}. " +
+                "Use fp32 or bf16 (issue #325).");
         // bf16 KV narrows the store the same way TurboQuant does; the two are mutually
         // exclusive (TQ owns the KV quantization).
         if (kvNarrowed && _tqEnabled)
@@ -194,8 +200,14 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         // Bookkeeping-only: KV lives in GPU buffers, this tracks only the position counter.
         // Allocating the full host K/V buffers is pure waste (tens of GB at long ctx, #179).
         _kvCache = Engine.KvCache.CreateBookkeepingOnly(hp.NumLayers, _maxSeqLen, hp.NumKvHeads, hp.HeadDim);
+        string kvTag = _kvDType switch
+        {
+            DType.BFloat16 => " [KV bf16]",
+            DType.Q8_0 => " [KV q8_0]",
+            _ => "",
+        };
         Console.Error.WriteLine($"[GpuForwardPass] Context size: {_maxSeqLen} (model max: {hp.ContextLength})" +
-            $"{(enableTurboQuant ? " [TQ3]" : "")}{(_kvDType == DType.BFloat16 ? " [KV bf16]" : "")}");
+            $"{(enableTurboQuant ? " [TQ3]" : "")}{kvTag}");
 
         _embDim = hp.EmbeddingDim;
         _headDim = hp.HeadDim;
@@ -220,15 +232,15 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             throw new NotSupportedException(
                 "SnapKV + TurboQuant composition is not yet implemented (issue #60). " +
                 "Set SHARPI_SNAPKV_BUDGET=0 to disable or disable --tq.");
-        // Issue #311: SnapKV's score/compact shaders read the cache as fp32 floats, so they
-        // would read garbage from a packed-fp16 buffer. bf16 + SnapKV is not yet wired; reject
-        // an explicit budget and force the auto path off (bf16 already shrinks the KV footprint
-        // SnapKV chases).
+        // Issues #311 / #325: SnapKV's score/compact shaders read the cache as fp32 floats, so
+        // they would read garbage from a narrowed buffer (fp16-packed for bf16, block-quantized
+        // for q8_0). Narrowed KV + SnapKV is not yet wired; reject an explicit budget and force
+        // the auto path off (the narrowed store already shrinks the KV footprint SnapKV chases).
         if (kvNarrowed && _snapKvCfg.IsBudgetExplicit && _snapKvCfg.Budget > 0)
             throw new NotSupportedException(
                 $"SHARPI_KV_DTYPE={_kvDType} + SnapKV is not yet implemented on Vulkan " +
-                "(SnapKvScore/KvCompact read the cache as fp32, but bf16 stores it fp16-packed; " +
-                "issue #311). Set SHARPI_SNAPKV_BUDGET=0 to disable SnapKV.");
+                "(SnapKvScore/KvCompact read the cache as fp32, but the narrowed store packs it; " +
+                "issue #325). Set SHARPI_SNAPKV_BUDGET=0 to disable SnapKV.");
         if (_snapKvCfg.IsBudgetExplicit)
         {
             _snapKvEffectiveBudget = _snapKvCfg.Budget;
@@ -239,8 +251,9 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         }
         else if (kvNarrowed)
         {
-            // bf16 already shrinks the KV footprint (the memory win SnapKV auto-enable chases),
-            // and its compaction shaders read fp32; don't auto-enable eviction on the packed cache.
+            // A narrowed store (bf16/q8_0) already shrinks the KV footprint (the memory win SnapKV
+            // auto-enable chases), and the compaction shaders read fp32; don't auto-enable
+            // eviction on the packed cache (issues #311 / #325).
             _snapKvEffectiveBudget = 0;
         }
         else
@@ -334,6 +347,21 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             {
                 _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim), DType.BFloat16);
                 _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim), DType.BFloat16);
+            }
+        }
+        else if (_kvDType == DType.Q8_0)
+        {
+            // Block-quantized KV (issue #325): the cache holds ggml block_q8_0 (34 bytes per 32
+            // elements). Vulkan's Allocate(shape, DType) computes bytes via BytesPerElement, which
+            // THROWS for quantized dtypes, so allocate a raw uint-word buffer sized to the exact
+            // q8_0 byte count (rounded up to whole words). The append/attention shaders bind it as
+            // uint[] and index it by block regardless of the declared dtype — same pattern as bf16.
+            long q8Bytes = DTypeInfo.ByteSize((long)_maxSeqLen * kvDim, DType.Q8_0); // (count/32)*34
+            long words = (q8Bytes + 3) / 4;
+            for (int i = 0; i < hp.NumLayers; i++)
+            {
+                _gpuKCache[i] = gpu.Allocate(TensorShape.D1(words));
+                _gpuVCache[i] = gpu.Allocate(TensorShape.D1(words));
             }
         }
         else
@@ -787,6 +815,19 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                     (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
                     (uint)(position + 1), (uint)_maxSeqLen);
             }
+            else if (_kvDType == DType.Q8_0)
+            {
+                // Block-quantized KV (issue #325): same args as the fp32/bf16 paths; the q8_0
+                // shaders quantize/dequantize the cache (block_q8_0) but index it identically.
+                _gpu.KvAppendQ8_0(_k, _v, _gpuKCache[layer], _gpuVCache[layer],
+                    (uint)(_numKvHeads * _headDim), (uint)position, (uint)_maxSeqLen);
+                _gpu.RecordBarrier();
+
+                _gpu.AttentionQ8_0(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                    _attnScoresScratch,
+                    (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
+                    (uint)(position + 1), (uint)_maxSeqLen);
+            }
             else
             {
                 _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer],
@@ -1214,11 +1255,12 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         long available = vramBytes - weightBytes - scratchBytes - reserved;
         if (available <= 0) available = 64L * 1024 * 1024; // minimum fallback
 
-        // KV cache: 2 (K+V) * numLayers * numKvHeads * headDim * (bytes/elem) per token.
-        // bf16 (issue #311) halves the per-element store (2 bytes vs fp32's 4), so the
-        // auto-context actually buys ~2× the tokens under --kv-type bf16.
-        int kvElemBytes = DTypeInfo.BytesPerElement(kvDType);
-        long bytesPerToken = 2L * hp.NumLayers * hp.NumKvHeads * headDim * kvElemBytes;
+        // KV cache: 2 (K+V) * numLayers * ByteSize(kvDim) per token. DTypeInfo.ByteSize handles
+        // every store dtype (fp32 = kvDim*4, bf16 = kvDim*2, q8_0 = (kvDim/32)*34), so use it
+        // instead of BytesPerElement (which THROWS for the quantized q8_0 store, issue #325).
+        // bf16 (#311) ~halves the per-token store and q8_0 (#325) ~quarters it, so the
+        // auto-context buys ~2×/~4× the tokens under --kv-type bf16/q8_0 respectively.
+        long bytesPerToken = 2L * hp.NumLayers * DTypeInfo.ByteSize(hp.NumKvHeads * headDim, kvDType);
 
         int maxCtx = (int)(available / bytesPerToken);
         maxCtx = Math.Clamp(maxCtx, 512, hp.ContextLength);

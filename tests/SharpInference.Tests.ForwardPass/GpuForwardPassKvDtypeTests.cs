@@ -5,23 +5,27 @@ using SharpInference.Vulkan;
 namespace SharpInference.Tests.ForwardPass;
 
 /// <summary>
-/// bf16 KV-cache parity for the Vulkan <see cref="GpuForwardPass"/> (issue #311). With
-/// <c>kvDtype: DType.BFloat16</c> the K/V cache is stored half-width (IEEE fp16 packed
-/// two-per-uint via core-GLSL <c>packHalf2x16</c>); kernel arithmetic stays fp32, so decode
-/// must be argmax-stable vs the fp32 cache at short context — only the stored value's mantissa
-/// is narrowed. The bf16 decode is teacher-forced onto the fp32 trajectory so the KV dtype is
-/// the only variable at each position. Asserts, per teacher-forced position:
+/// Narrowed KV-cache parity for the Vulkan <see cref="GpuForwardPass"/> (issues #311 / #325).
+/// With <c>kvDtype: DType.BFloat16</c> the K/V cache is stored half-width (IEEE fp16 packed
+/// two-per-uint via core-GLSL <c>packHalf2x16</c>); with <c>DType.Q8_0</c> it is block-quantized
+/// (ggml <c>block_q8_0</c>: fp16 scale + 32 int8 per 32 elements, ~4× smaller than fp32). Kernel
+/// arithmetic stays fp32 in both, so decode must be argmax-stable vs the fp32 cache at short
+/// context — only the stored value is narrowed. The narrowed decode is teacher-forced onto the
+/// fp32 trajectory so the KV dtype is the only variable at each position. Asserts, per
+/// teacher-forced position:
 /// <list type="bullet">
-///   <item>all bf16 logits are finite,</item>
-///   <item>fp32's top-1 stays within bf16's top-5 — the reorder-tolerant "argmax-stable"
-///         criterion (a genuine near-tie can flip top-1 with no kernel bug),</item>
-///   <item>the logit max-abs gap is within a small rounding budget.</item>
+///   <item>all narrowed logits are finite,</item>
+///   <item>fp32's top-1 stays within the narrowed run's top-K — the reorder-tolerant
+///         "argmax-stable" criterion (a genuine near-tie can flip top-1 with no kernel bug),</item>
+///   <item>the logit max-abs gap is within a per-dtype rounding budget.</item>
 /// </list>
 ///
-/// The parity test is the correctness gate for the <c>AttentionBf16</c> read shader: a failure
-/// most likely means the <c>unpackHalf2x16(buf[idx&gt;&gt;1])[idx&amp;1]</c> lane-select or an
-/// indexing divergence from the fp32 shader. SnapKV is forced off so the KV dtype is the only
-/// variable. Each case is skipped silently when Vulkan is unavailable or the GGUF isn't on disk.
+/// The parity test is the correctness gate for the narrowed read shader: a bf16 failure most
+/// likely means the <c>unpackHalf2x16(buf[idx&gt;&gt;1])[idx&amp;1]</c> lane-select; a q8_0 failure
+/// most likely means the append-quant (amax/invd/round/clamp), the masked-atomic byte store
+/// (seam corruption), or the block/lane indexing in <c>AttentionQ8_0</c>. SnapKV is forced off so
+/// the KV dtype is the only variable. Each case is skipped silently when Vulkan is unavailable or
+/// the GGUF isn't on disk.
 /// </summary>
 public sealed class GpuForwardPassKvDtypeTests
 {
@@ -191,5 +195,84 @@ public sealed class GpuForwardPassKvDtypeTests
         Assert.True(seen.Count >= 2,
             $"bf16 greedy decode produced only {seen.Count} distinct token(s) " +
             $"([{string.Join(",", argmax)}]) — bf16-KV greedy decode is degenerate.");
+    }
+
+    /// <summary>
+    /// q8_0 KV must stay argmax-stable vs fp32 KV on the SAME teacher-forced trajectory (issue
+    /// #325). q8_0 is lossier than bf16, so the bound is looser (max-abs &lt; 2.5, top-5 overlap).
+    /// This is the correctness gate for the full q8_0 round-trip: the KvAppendQ8_0 append-quant +
+    /// masked-atomic byte store and the AttentionQ8_0 byte-gather + dequant read.
+    /// Qwen3-8B has kvDim = 8*128 = 1024 (% 32 == 0), so the q8_0 path is engaged.
+    /// </summary>
+    [Fact]
+    public void Q8Kv_ArgmaxStable_VsFp32()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        const int steps = 6;
+        const int ctx = 2048;
+        const float maxAbsTol = 2.5f; // q8_0 is lossier than bf16 — looser than Bf16Kv's 2.0
+
+        var (f32, f32Argmax) = RunPrefillDecode(gpu, path, DType.Float32, LowEntropyPrompt, steps, ctx, forced: null);
+        var (kv, _) = RunPrefillDecode(gpu, path, DType.Q8_0, LowEntropyPrompt, steps, ctx, forced: f32Argmax);
+
+        for (int p = 0; p <= steps; p++)
+        {
+            Assert.Equal(f32[p].Length, kv[p].Length);
+            float maxAbs = 0f;
+            for (int i = 0; i < f32[p].Length; i++)
+            {
+                Assert.True(float.IsFinite(kv[p][i]), $"non-finite q8_0 logit at pos {p}, idx {i}.");
+                maxAbs = Math.Max(maxAbs, Math.Abs(f32[p][i] - kv[p][i]));
+            }
+            Assert.True(maxAbs < maxAbsTol,
+                $"pos {p} q8_0 vs fp32 logit max-abs {maxAbs:F3} exceeds the rounding budget " +
+                $"({maxAbsTol:F1}) — likely a KvAppendQ8_0 quant/byte-store bug or an AttentionQ8_0 " +
+                "block/lane indexing bug, not q8_0-store rounding.");
+            Assert.True(TopK(kv[p], 5).Contains(f32Argmax[p]),
+                $"pos {p} fp32 top-1 ({f32Argmax[p]}) fell out of q8_0's top-5 (max-abs {maxAbs:F3}) — " +
+                "the q8_0 attention read reordered the head of the distribution.");
+        }
+    }
+
+    /// <summary>
+    /// q8_0 KV greedy decode (the path picks its OWN tokens — not teacher-forced) on a
+    /// template-correct prompt must stay coherent: all logits finite, the first generated token
+    /// is not EOS, and ≥2 distinct argmaxes over the run (catches NaN / single-token collapse
+    /// from a wrong append-quant or attention read). Issue #325.
+    /// </summary>
+    [Fact]
+    public void Q8Kv_GreedyDecode_Coherent()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        int eosId;
+        using (var model = GgufModel.Open(path))
+            eosId = GgufTokenizer.FromGgufModel(model).EosTokenId;
+
+        const int steps = 5;
+        const int ctx = 2048;
+
+        var (logits, argmax) = RunPrefillDecode(gpu, path, DType.Q8_0, Qwen3TemplatePrompt, steps, ctx, forced: null);
+
+        for (int p = 0; p <= steps; p++)
+            for (int i = 0; i < logits[p].Length; i++)
+                Assert.True(float.IsFinite(logits[p][i]),
+                    $"q8_0 greedy: non-finite logit at pos {p}, idx {i} — a q8_0-KV attention read bug.");
+
+        Assert.True(argmax[0] != eosId,
+            "q8_0 greedy: first token was EOS — the template-correct prompt should have a real " +
+            "continuation, so this means the q8_0 greedy path collapsed.");
+
+        var seen = new HashSet<int>(argmax);
+        Assert.True(seen.Count >= 2,
+            $"q8_0 greedy decode produced only {seen.Count} distinct token(s) " +
+            $"([{string.Join(",", argmax)}]) — q8_0-KV greedy decode is degenerate.");
     }
 }
