@@ -3266,10 +3266,6 @@ internal static class Shaders
         shared float sk_scores[512];   // per-slice scores (≤ CHUNK)
         shared float sdata[256];       // reduction scratch
 
-        // Dequant one cache element from the fp16-packed uint[] (word e>>1, component e&1).
-        float loadK(uint e) { return unpackHalf2x16(k_cache[e >> 1])[e & 1u]; }
-        float loadV(uint e) { return unpackHalf2x16(v_cache[e >> 1])[e & 1u]; }
-
         void main() {
             uint tid = gl_LocalInvocationID.x;
             uint h = gl_WorkGroupID.x;   // query head
@@ -3294,11 +3290,17 @@ internal static class Shaders
             uint kv_base = t0 * kv_dim + kv_head * head_dim;   // first row of this slice for this kv head
 
             // ─── Phase 1: scores for the slice → shared (indexed t − t0) ───
+            // Read each packed fp16 word once (two K elements at a time). kv_base + t*kv_dim is
+            // even (head_dim is even — see the GpuForwardPass guard) so >>1 is the exact word base
+            // and consecutive d,d+1 are the two halves of word k_off_half+dh — mirrors AttentionBf16.
             for (uint t = tid; t < n; t += 256u) {
                 float dot = 0.0;
-                uint k_off = kv_base + t * kv_dim;
-                for (uint d = 0u; d < head_dim; d++)
-                    dot += q_data[q_off + d] * loadK(k_off + d);
+                uint k_off_half = (kv_base + t * kv_dim) >> 1;
+                for (uint dh = 0u; dh < (head_dim >> 1); dh++) {
+                    uint d = dh << 1;
+                    vec2 kv = unpackHalf2x16(k_cache[k_off_half + dh]);
+                    dot += q_data[q_off + d] * kv.x + q_data[q_off + d + 1u] * kv.y;
+                }
                 sk_scores[t] = dot * scale;
             }
             barrier();
@@ -3334,12 +3336,20 @@ internal static class Shaders
             if (tid == 0u) { partial_meta[meta_off] = m_i; partial_meta[meta_off + 1u] = l_i; }
 
             // ─── Phase 3: UN-normalized weighted-V numerator for this slice ───
+            // Each thread owns ONE output dim d. Hoist the per-d word/component selection out of the
+            // t-loop and walk the V row word base incrementally (kv_base>>1 is this slice's t=0 word
+            // base; head_dim is even) — mirrors AttentionBf16's Phase 3.
             uint o_off = (h * n_splits + s) * head_dim;
             for (uint d = tid; d < head_dim; d += 256u) {
+                uint d_half = d >> 1;
+                uint component = d & 1u;
+                uint v_off_half = (kv_base >> 1) + d_half;
+                uint kv_dim_half = kv_dim >> 1;
                 float acc = 0.0;
                 for (uint t = 0u; t < n; t++) {
-                    uint v_off = kv_base + t * kv_dim;   // same hoisted base as Phase 1
-                    acc += sk_scores[t] * loadV(v_off + d);
+                    float vv = unpackHalf2x16(v_cache[v_off_half])[component];
+                    acc += sk_scores[t] * vv;
+                    v_off_half += kv_dim_half;
                 }
                 partial_o[o_off + d] = acc;
             }
@@ -3391,20 +3401,6 @@ internal static class Shaders
         int gInt8K(uint b) { return bitfieldExtract(int(k_cache[b >> 2]), int((b & 3u) * 8u), 8); }
         int gInt8V(uint b) { return bitfieldExtract(int(v_cache[b >> 2]), int((b & 3u) * 8u), 8); }
 
-        float loadK(uint e) {
-            uint blk = e >> 5; uint lane = e & 31u; uint b0 = blk * 34u;
-            // b0 = blk*34 is even, so the two scale bytes [b0, b0+1] live in the same uint word.
-            uint w = k_cache[b0 >> 2];
-            float dsc = unpackHalf2x16((w >> ((b0 & 3u) * 8u)) & 0xFFFFu).x;
-            return dsc * float(gInt8K(b0 + 2u + lane));
-        }
-        float loadV(uint e) {
-            uint blk = e >> 5; uint lane = e & 31u; uint b0 = blk * 34u;
-            uint w = v_cache[b0 >> 2];
-            float dsc = unpackHalf2x16((w >> ((b0 & 3u) * 8u)) & 0xFFFFu).x;
-            return dsc * float(gInt8V(b0 + 2u + lane));
-        }
-
         void main() {
             uint tid = gl_LocalInvocationID.x;
             uint h = gl_WorkGroupID.x;   // query head
@@ -3429,11 +3425,23 @@ internal static class Shaders
             uint kv_base = t0 * kv_dim + kv_head * head_dim;   // first row of this slice for this kv head
 
             // ─── Phase 1: scores for the slice → shared (indexed t − t0) ───
+            // Load each block's fp16 scale ONCE per 32-element block (head_dim & kv_dim are
+            // multiples of 32 — enforced in GpuForwardPass), then dequant the 32 int8 lanes with it.
+            // Mirrors AttentionQ8_0's read pattern; scale-once instead of per-element loadK.
             for (uint t = tid; t < n; t += 256u) {
                 float dot = 0.0;
                 uint k_off = kv_base + t * kv_dim;
-                for (uint d = 0u; d < head_dim; d++)
-                    dot += q_data[q_off + d] * loadK(k_off + d);
+                uint blk_start = k_off >> 5;
+                for (uint blk = 0u; blk < (head_dim >> 5); blk++) {
+                    uint b0 = (blk_start + blk) * 34u;
+                    // b0 = blk*34 is even, so the two scale bytes [b0, b0+1] live in the same word.
+                    uint w = k_cache[b0 >> 2];
+                    float dsc = unpackHalf2x16((w >> ((b0 & 3u) * 8u)) & 0xFFFFu).x;
+                    uint q_blk_off = q_off + blk * 32u;
+                    for (uint lane = 0u; lane < 32u; lane++) {
+                        dot += q_data[q_blk_off + lane] * (dsc * float(gInt8K(b0 + 2u + lane)));
+                    }
+                }
                 sk_scores[t] = dot * scale;
             }
             barrier();
@@ -3469,12 +3477,22 @@ internal static class Shaders
             if (tid == 0u) { partial_meta[meta_off] = m_i; partial_meta[meta_off + 1u] = l_i; }
 
             // ─── Phase 3: UN-normalized weighted-V numerator for this slice ───
+            // Each thread owns ONE output dim d. Hoist the block index to a linear recurrence over t
+            // (base_blk = this slice's t=0 block for dim d; stride_blk = kv_dim in blocks) so the
+            // per-block scale is read once per t — mirrors AttentionQ8_0's Phase 3.
             uint o_off = (h * n_splits + s) * head_dim;
             for (uint d = tid; d < head_dim; d += 256u) {
+                uint d_blk = d >> 5;
+                uint lane = d & 31u;
+                uint base_blk = (kv_base >> 5) + d_blk;
+                uint stride_blk = kv_dim >> 5;
                 float acc = 0.0;
                 for (uint t = 0u; t < n; t++) {
-                    uint v_off = kv_base + t * kv_dim;   // same hoisted base as Phase 1
-                    acc += sk_scores[t] * loadV(v_off + d);
+                    uint b0 = (base_blk + t * stride_blk) * 34u;
+                    uint w = v_cache[b0 >> 2];
+                    float dsc = unpackHalf2x16((w >> ((b0 & 3u) * 8u)) & 0xFFFFu).x;
+                    float vv = dsc * float(gInt8V(b0 + 2u + lane));
+                    acc += sk_scores[t] * vv;
                 }
                 partial_o[o_off + d] = acc;
             }
