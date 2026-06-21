@@ -985,6 +985,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _matVecF32Pipeline;
     private ComputePipeline? _kvAppendPipeline;
     private ComputePipeline? _attentionPipeline;
+    private ComputePipeline? _kvAppendBf16Pipeline;
+    private ComputePipeline? _attentionBf16Pipeline;
     private ComputePipeline? _snapKvScorePipeline;
     private ComputePipeline? _kvCompactPipeline;
     private ComputePipeline? _embedLookupPipeline;
@@ -1278,6 +1280,48 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             headDim = headDim, seqLen = seqLen, maxSeqLen = maxSeqLen
         };
         DispatchOrRecord(_attentionPipeline,
+            [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(output),
+             GetBuffer(scoresScratch)],
+            numHeads, &p);
+    }
+
+    /// <summary>
+    /// bf16 (issue #311) variant of <see cref="KvAppend"/>: writes the K/V vectors into the
+    /// cache as IEEE fp16 packed two-per-uint (core-GLSL <c>packHalf2x16</c>, no extension).
+    /// The cache buffers (<paramref name="kCache"/>/<paramref name="vCache"/>) are bound as
+    /// <c>uint[]</c> in the shader regardless of the tensor's declared dtype. Indexes the
+    /// cache identically to the fp32 path (<c>position * kv_dim + i</c>, just word-granular).
+    /// kv_dim is even, so one thread covers 2 elements.
+    /// </summary>
+    public void KvAppendBf16(Tensor kInput, Tensor vInput, Tensor kCache, Tensor vCache,
+        uint kvDim, uint position, uint maxSeqLen)
+    {
+        _kvAppendBf16Pipeline ??= new ComputePipeline(this, Shaders.KvAppendBf16, 4, pushConstantSize: sizeof(KvAppendParams));
+        var p = new KvAppendParams { kvDim = kvDim, position = position, maxSeqLen = maxSeqLen };
+        DispatchOrRecord(_kvAppendBf16Pipeline,
+            [GetBuffer(kInput), GetBuffer(vInput), GetBuffer(kCache), GetBuffer(vCache)],
+            ((kvDim >> 1) + 255) / 256, &p);
+    }
+
+    /// <summary>
+    /// bf16 (issue #311) variant of <see cref="Attention"/>: identical control flow to the
+    /// fp32 path, but the K/V cache buffers (<paramref name="kCache"/>/<paramref name="vCache"/>)
+    /// hold IEEE fp16 packed two-per-uint and are read via <c>unpackHalf2x16</c>. All
+    /// arithmetic (scores / softmax / value accumulation) stays fp32 — only the stored K/V
+    /// mantissa is narrowed. <paramref name="scoresScratch"/> stays fp32 (see
+    /// <see cref="Attention"/> for the spill-buffer convention).
+    /// </summary>
+    public void AttentionBf16(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+        Tensor scoresScratch,
+        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen)
+    {
+        _attentionBf16Pipeline ??= new ComputePipeline(this, Shaders.AttentionBf16, 5, pushConstantSize: sizeof(AttentionParams));
+        var p = new AttentionParams
+        {
+            numHeads = numHeads, numKvHeads = numKvHeads,
+            headDim = headDim, seqLen = seqLen, maxSeqLen = maxSeqLen
+        };
+        DispatchOrRecord(_attentionBf16Pipeline,
             [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(output),
              GetBuffer(scoresScratch)],
             numHeads, &p);
@@ -1732,6 +1776,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _matVecF32Pipeline?.Dispose();
         _kvAppendPipeline?.Dispose();
         _attentionPipeline?.Dispose();
+        _kvAppendBf16Pipeline?.Dispose();
+        _attentionBf16Pipeline?.Dispose();
         _snapKvScorePipeline?.Dispose();
         _kvCompactPipeline?.Dispose();
         _embedLookupPipeline?.Dispose();

@@ -344,7 +344,8 @@ public static class InferenceEngineLoader
 
             if (gpuLayers >= hp.NumLayers)
             {
-                var gfwd = new GpuForwardPass(model, vulkan, hp, ctxSize, enableTurboQuant: turboQuant);
+                var gfwd = new GpuForwardPass(model, vulkan, hp, ctxSize, enableTurboQuant: turboQuant,
+                    kvDtype: CudaForwardPass.ResolveConfiguredKvDType());
                 owned.Add(gfwd);
                 return (gfwd, BatchingSupported: false);
             }
