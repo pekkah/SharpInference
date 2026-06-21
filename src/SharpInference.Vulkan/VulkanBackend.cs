@@ -271,8 +271,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         // descriptor/pipeline usage is reported deterministically (even on runs that
         // don't crash). Default (env unset/0) keeps the instance exactly as before —
         // no extra layers, no debug-utils, zero validation overhead.
+        var validationEnv = Environment.GetEnvironmentVariable("SHARPI_VULKAN_VALIDATION");
         _validationEnabled =
-            Environment.GetEnvironmentVariable("SHARPI_VULKAN_VALIDATION") is "1" or "true" or "TRUE";
+            validationEnv is "1" || string.Equals(validationEnv, "true", StringComparison.OrdinalIgnoreCase);
 
         // 2. Create instance (Vulkan 1.3+)
         VkApplicationInfo appInfo = new()
@@ -280,16 +281,14 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             apiVersion = VkVersion.Version_1_3, // Vortice may not have 1.4 constant yet
         };
 
-        // Validation-layer name + debug-utils extension name (null-terminated UTF-8).
-        byte[] validationLayerBytes = System.Text.Encoding.UTF8.GetBytes("VK_LAYER_KHRONOS_validation\0");
-        byte[] debugUtilsExtBytes   = System.Text.Encoding.UTF8.GetBytes("VK_EXT_debug_utils\0");
-
         // A messenger create-info chained into pNext also catches validation errors
         // raised *during* vkCreateInstance/vkDestroyInstance themselves.
         VkDebugUtilsMessengerCreateInfoEXT dbgCI = MakeDebugMessengerCreateInfo();
 
-        fixed (byte* pValidationLayer = validationLayerBytes)
-        fixed (byte* pDebugUtilsExt   = debugUtilsExtBytes)
+        // Validation-layer name + debug-utils extension name (null-terminated UTF-8 literals
+        // → no heap allocation; only consumed when validation is enabled).
+        fixed (byte* pValidationLayer = "VK_LAYER_KHRONOS_validation\0"u8)
+        fixed (byte* pDebugUtilsExt   = "VK_EXT_debug_utils\0"u8)
         {
             byte** layerPtrs = stackalloc byte*[1];
             byte** instExtPtrs = stackalloc byte*[1];
@@ -1917,24 +1916,40 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         VkDebugUtilsMessengerCallbackDataEXT* data,
         void* userData)
     {
-        // Return VK_FALSE (0): the callback does not abort the triggering API call.
-        if (data == null) return 0u;
-
-        string sev = severity.HasFlag(VkDebugUtilsMessageSeverityFlagsEXT.Error) ? "ERROR" : "WARNING";
-        string msg = data->pMessage != null ? new string((sbyte*)data->pMessage) : "(no message)";
-        string idName = data->pMessageIdName != null ? new string((sbyte*)data->pMessageIdName) : "";
-
-        Console.Error.WriteLine($"[VK-VALIDATION] {sev} ({messageTypes}) [{idName}] {msg}");
-
-        // Dump any named objects involved (buffer / descriptor set / pipeline / etc.)
-        for (uint i = 0; i < data->objectCount; i++)
+        // An exception escaping an [UnmanagedCallersOnly] callback fail-fasts the process,
+        // so swallow everything. PtrToStringUTF8 decodes the native strings as UTF-8
+        // (new string((sbyte*)..) would use the ANSI code page on Windows).
+        try
         {
-            VkDebugUtilsObjectNameInfoEXT obj = data->pObjects[i];
-            string objName = obj.pObjectName != null ? new string((sbyte*)obj.pObjectName) : "(unnamed)";
-            Console.Error.WriteLine(
-                $"[VK-VALIDATION]   object[{i}] type={obj.objectType} handle=0x{obj.objectHandle:X} name={objName}");
+            // Return VK_FALSE (0): the callback does not abort the triggering API call.
+            if (data == null) return 0u;
+
+            string sev = severity.HasFlag(VkDebugUtilsMessageSeverityFlagsEXT.Error) ? "ERROR" : "WARNING";
+            string msg = data->pMessage != null
+                ? System.Runtime.InteropServices.Marshal.PtrToStringUTF8((nint)data->pMessage) ?? "(no message)"
+                : "(no message)";
+            string idName = data->pMessageIdName != null
+                ? System.Runtime.InteropServices.Marshal.PtrToStringUTF8((nint)data->pMessageIdName) ?? ""
+                : "";
+
+            Console.Error.WriteLine($"[VK-VALIDATION] {sev} ({messageTypes}) [{idName}] {msg}");
+
+            // Dump any named objects involved (buffer / descriptor set / pipeline / etc.)
+            for (uint i = 0; i < data->objectCount; i++)
+            {
+                VkDebugUtilsObjectNameInfoEXT obj = data->pObjects[i];
+                string objName = obj.pObjectName != null
+                    ? System.Runtime.InteropServices.Marshal.PtrToStringUTF8((nint)obj.pObjectName) ?? "(unnamed)"
+                    : "(unnamed)";
+                Console.Error.WriteLine(
+                    $"[VK-VALIDATION]   object[{i}] type={obj.objectType} handle=0x{obj.objectHandle:X} name={objName}");
+            }
+            Console.Error.Flush();
         }
-        Console.Error.Flush();
+        catch
+        {
+            // Never let a managed exception cross back into the Vulkan driver.
+        }
 
         return 0u; // VK_FALSE
     }
