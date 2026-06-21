@@ -1088,7 +1088,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     {
         _siluPipeline ??= new ComputePipeline(this, Shaders.SiLU, 1, pushConstantSize: sizeof(CountParams));
         var p = new CountParams { n = (uint)x.ElementCount };
-        DispatchOrRecord(_siluPipeline, [GetBuffer(x)], ((uint)x.ElementCount + 255) / 256, &p);
+        // 64-bit arithmetic before the cast (activation buffers are small, but avoids
+        // any theoretical uint wrap that would dispatch 0 workgroups).
+        DispatchOrRecord(_siluPipeline, [GetBuffer(x)], (uint)((x.ElementCount + 255) / 256), &p);
     }
 
     public void SiLuMul(Tensor gate, Tensor up)
