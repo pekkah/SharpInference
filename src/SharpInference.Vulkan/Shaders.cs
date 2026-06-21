@@ -3012,4 +3012,215 @@ internal static class Shaders
             output_data[idx] = input_data[c * h * w + (oh / 2u) * w + (ow / 2u)];
         }
         """;
+
+    /// <summary>
+    /// Flash-decoding split-KV partial attention (issue #312) — the Vulkan mirror of the CUDA
+    /// <c>llm_attention_splitkv</c> kernel. The single-workgroup <see cref="Attention"/> shader
+    /// launches only <c>num_heads</c> workgroups and serially scans the whole KV range, which
+    /// collapses decode throughput at very long context (the two earlier single-workgroup
+    /// online-softmax attempts regressed for exactly this reason). This kernel splits each head's
+    /// causal sequence <c>[0, seq_len)</c> into fixed <c>CHUNK</c>-sized slices and dispatches a
+    /// 2D grid of <c>num_heads × n_splits</c> workgroups, so the KV read parallelizes across the
+    /// GPU. Each workgroup emits the UN-normalized online-softmax partial for its slice; the
+    /// companion <see cref="AttentionSplitKvCombine"/> LSE-merges the per-head partials.
+    ///
+    /// fp32 K/V only (bf16/q8_0 keep the spill path). Scalar (no subgroup ops) — uses plain
+    /// shared-memory tree reductions, so #318's subgroup-size pin is irrelevant here.
+    ///
+    /// Workgroup (h = gl_WorkGroupID.x, s = gl_WorkGroupID.y) handles slice
+    /// <c>[s*CHUNK, min((s+1)*CHUNK, seq_len))</c>. Out-of-range splits (s*CHUNK ≥ seq_len, from
+    /// the caller's n_splits = ceil(seq_len/CHUNK)) write (m=−inf, l=0) and return so the combine
+    /// scale exp(m−gmax)=0 skips them. GQA: kv_head = h / (num_heads/num_kv_heads).
+    ///
+    /// Push constants: { uint num_heads, uint num_kv_heads, uint head_dim, uint seq_len, uint n_splits }.
+    /// Bindings: 0=Q[num_heads*head_dim], 1=K_cache[seq_len*kv_dim], 2=V_cache[seq_len*kv_dim],
+    ///           3=partial_o[num_heads*n_splits*head_dim], 4=partial_meta[num_heads*n_splits*2].
+    /// </summary>
+    internal const string AttentionSplitKvPartial = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Q          { float q_data[]; };
+        layout(binding = 1) readonly buffer KCache     { float k_cache[]; };
+        layout(binding = 2) readonly buffer VCache     { float v_cache[]; };
+        layout(binding = 3) buffer PartialO            { float partial_o[]; };
+        layout(binding = 4) buffer PartialMeta         { float partial_meta[]; };
+
+        layout(push_constant) uniform Params {
+            uint num_heads;
+            uint num_kv_heads;
+            uint head_dim;
+            uint seq_len;
+            uint n_splits;
+        };
+
+        const uint CHUNK = 512u;
+        shared float sk_scores[512];   // per-slice scores (≤ CHUNK)
+        shared float sdata[256];       // reduction scratch
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint h = gl_WorkGroupID.x;   // query head
+            uint s = gl_WorkGroupID.y;   // KV split
+            if (h >= num_heads || s >= n_splits) return;
+
+            uint meta_off = (h * n_splits + s) * 2u;
+            uint t0 = s * CHUNK;
+            // Out-of-range split (fixed n_splits, short seq_len): mark empty and bail so the
+            // combine skips it (scale = exp(−inf − gmax) = 0) and never reads a stale numerator.
+            if (t0 >= seq_len) {
+                if (tid == 0u) { partial_meta[meta_off] = -1.0/0.0; partial_meta[meta_off + 1u] = 0.0; }
+                return;
+            }
+            uint t1 = t0 + CHUNK; if (t1 > seq_len) t1 = seq_len;
+            uint n = t1 - t0;   // 1 ≤ n ≤ CHUNK
+
+            uint kv_head = h / (num_heads / num_kv_heads);
+            uint kv_dim  = num_kv_heads * head_dim;
+            float scale  = inversesqrt(float(head_dim));
+            uint q_off   = h * head_dim;
+            uint kv_base = t0 * kv_dim + kv_head * head_dim;   // first row of this slice for this kv head
+
+            // ─── Phase 1: scores for the slice → shared (indexed t − t0) ───
+            for (uint t = tid; t < n; t += 256u) {
+                float dot = 0.0;
+                uint k_off = kv_base + t * kv_dim;
+                for (uint d = 0u; d < head_dim; d++)
+                    dot += q_data[q_off + d] * k_cache[k_off + d];
+                sk_scores[t] = dot * scale;
+            }
+            barrier();
+
+            // ─── Phase 2: local max over the slice ───
+            float local_max = -1.0/0.0;
+            for (uint t = tid; t < n; t += 256u) local_max = max(local_max, sk_scores[t]);
+            sdata[tid] = local_max;
+            barrier();
+            [[unroll]] for (uint r = 128u; r > 0u; r >>= 1) {
+                if (tid < r) sdata[tid] = max(sdata[tid], sdata[tid + r]);
+                barrier();
+            }
+            float m_i = sdata[0];
+            barrier();
+
+            // exp(score − m_i) in place + local denom.
+            float local_sum = 0.0;
+            for (uint t = tid; t < n; t += 256u) {
+                float e = exp(sk_scores[t] - m_i);
+                sk_scores[t] = e;
+                local_sum += e;
+            }
+            sdata[tid] = local_sum;
+            barrier();
+            [[unroll]] for (uint r = 128u; r > 0u; r >>= 1) {
+                if (tid < r) sdata[tid] += sdata[tid + r];
+                barrier();
+            }
+            float l_i = sdata[0];
+            barrier();
+
+            if (tid == 0u) { partial_meta[meta_off] = m_i; partial_meta[meta_off + 1u] = l_i; }
+
+            // ─── Phase 3: UN-normalized weighted-V numerator for this slice ───
+            uint o_off = (h * n_splits + s) * head_dim;
+            for (uint d = tid; d < head_dim; d += 256u) {
+                float acc = 0.0;
+                for (uint t = 0u; t < n; t++) {
+                    uint v_off = kv_base + t * kv_dim;   // same hoisted base as Phase 1
+                    acc += sk_scores[t] * v_cache[v_off + d];
+                }
+                partial_o[o_off + d] = acc;
+            }
+        }
+        """;
+
+    /// <summary>
+    /// Flash-decoding combine (issue #312) — the Vulkan mirror of the CUDA
+    /// <c>llm_attention_combine</c> kernel. One workgroup per query head; LSE-merges the
+    /// <c>n_splits</c> per-slice partials emitted by <see cref="AttentionSplitKvPartial"/> into
+    /// the final attention output with the standard online-softmax rescale:
+    ///   <c>m = max_s m_s ; l = Σ_s exp(m_s−m)·l_s ; out[d] = (Σ_s exp(m_s−m)·Õ_s[d]) / l</c>.
+    /// Exact modulo FP reduction order. Empty splits carry m_s=−inf → scale 0 → skipped.
+    /// MAX_SPLITS bounds the per-head split count (ceil(131072/512)=256).
+    ///
+    /// Push constants: { uint num_heads, uint head_dim, uint n_splits }.
+    /// Bindings: 0=partial_o[num_heads*n_splits*head_dim], 1=partial_meta[num_heads*n_splits*2],
+    ///           2=output[num_heads*head_dim].
+    /// </summary>
+    internal const string AttentionSplitKvCombine = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer PartialO    { float partial_o[]; };
+        layout(binding = 1) readonly buffer PartialMeta { float partial_meta[]; };
+        layout(binding = 2) buffer Out                  { float out_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint num_heads;
+            uint head_dim;
+            uint n_splits;
+        };
+
+        const uint MAX_SPLITS = 256u;
+        shared float sh_scale[256];   // per-split rescale exp(m_s − gmax)
+        shared float red[256];        // reduction scratch
+        shared float sh_gmax;
+        shared float sh_denom;
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint h = gl_WorkGroupID.x;
+            if (h >= num_heads) return;
+            uint base = h * n_splits;
+
+            // Global max over the splits' local maxima.
+            float lmax = -1.0/0.0;
+            for (uint s = tid; s < n_splits; s += 256u)
+                lmax = max(lmax, partial_meta[(base + s) * 2u]);
+            red[tid] = lmax;
+            barrier();
+            [[unroll]] for (uint r = 128u; r > 0u; r >>= 1) {
+                if (tid < r) red[tid] = max(red[tid], red[tid + r]);
+                barrier();
+            }
+            if (tid == 0u) sh_gmax = red[0];
+            barrier();
+            float gmax = sh_gmax;
+
+            // Per-split rescale factor exp(m_s − gmax) + global denom Σ exp(m_s−gmax)·l_s.
+            float ldenom = 0.0;
+            for (uint s = tid; s < n_splits; s += 256u) {
+                float m = partial_meta[(base + s) * 2u];
+                float l = partial_meta[(base + s) * 2u + 1u];
+                float sc = exp(m - gmax);
+                sh_scale[s] = sc;
+                ldenom += sc * l;
+            }
+            red[tid] = ldenom;
+            barrier();
+            [[unroll]] for (uint r = 128u; r > 0u; r >>= 1) {
+                if (tid < r) red[tid] += red[tid + r];
+                barrier();
+            }
+            if (tid == 0u) sh_denom = red[0];
+            barrier();
+            float inv = 1.0 / sh_denom;
+
+            // Weighted sum of the per-split numerators across head_dim.
+            uint po_base  = base * head_dim;     // first split's row for this head
+            uint out_base = h * head_dim;
+            for (uint d = tid; d < head_dim; d += 256u) {
+                float acc = 0.0;
+                for (uint s = 0u; s < n_splits; s++) {
+                    float sc = sh_scale[s];
+                    if (sc != 0.0) acc += sc * partial_o[po_base + s * head_dim + d];
+                }
+                out_data[out_base + d] = acc * inv;
+            }
+        }
+        """;
 }

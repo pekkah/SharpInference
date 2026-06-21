@@ -105,6 +105,17 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     private Tensor? _evictK;           // [numKvHeads * headDim] scratch for evicted FP32 entry
     private Tensor? _evictV;
     private Tensor _attnScoresScratch = default!; // [numHeads * maxSeqLen] long-context softmax-score spill; 1-float placeholder for short contexts
+
+    // Flash-decoding split-KV (issue #312): OPT-IN, DEFAULT-OFF via SHARPI_VULKAN_SPLIT_DECODE.
+    // When enabled (and maxSeqLen > 4096 with a representable split count), the fp32 decode
+    // attention parallelizes its long-context KV scan across numHeads × nSplits workgroups and
+    // LSE-merges the partials, mirroring CUDA's SHARPI_SPLIT_DECODE. Default-ON (measured ~2×
+    // decode at 10.5K ctx vs the VRAM score-spill; the win grows with context); the ≤4096 path
+    // is untouched. SHARPI_VULKAN_SPLIT_DECODE=0 reverts to the spill path (kill switch).
+    private readonly bool _splitKvEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_VULKAN_SPLIT_DECODE") != "0";
+    private Tensor? _splitKvPartialO;   // [numHeads * maxSplits * headDim] un-normalized weighted-V numerators
+    private Tensor? _splitKvPartialMeta; // [numHeads * maxSplits * 2] (m_i, l_i) per (head, split)
     private Tensor? _routerLogits;
     private Tensor? _moeSharedOut;
     private Tensor? _moeExpertOut;
@@ -383,6 +394,21 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         {
             long scratchElems = _maxSeqLen > 4096 ? (long)_numHeads * _maxSeqLen : 1L;
             _attnScoresScratch = gpu.Allocate(TensorShape.D1(scratchElems));
+        }
+
+        // Flash-decoding split-KV partial buffers (issue #312), allocated ONLY when the opt-in
+        // gate is set, the context exceeds the 4096-slot shared-memory fast path, and the split
+        // count fits the combine shader's 256-split shared array (CHUNK=512 ⇒ maxSplits =
+        // ceil(maxSeqLen/512); the combine's sh_scale[256] caps it at 256). Otherwise we leave
+        // these null and the decode falls back to the spill path. headDim%32==0 is also required
+        // at dispatch time (the gate below) but does not affect buffer sizing.
+        // maxSplits <= 256 (combine shader bound) ⇔ maxSeqLen <= 131072; bound it directly
+        // so the (_maxSeqLen + 511) split-count math can't overflow on a pathological ctx.
+        if (_splitKvEnabled && _maxSeqLen > 4096 && _maxSeqLen <= 131072)
+        {
+            int maxSplits = (_maxSeqLen + 511) / 512;
+            _splitKvPartialO = gpu.Allocate(TensorShape.D1((long)_numHeads * maxSplits * _headDim));
+            _splitKvPartialMeta = gpu.Allocate(TensorShape.D1((long)_numHeads * maxSplits * 2));
         }
 
         // Upload all weights to VRAM
@@ -836,10 +862,24 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                     (uint)(_numKvHeads * _headDim), (uint)position, (uint)_maxSeqLen);
                 _gpu.RecordBarrier();
 
-                _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
-                    _attnScoresScratch,
-                    (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
-                    (uint)(position + 1), (uint)_maxSeqLen);
+                // Flash-decoding split-KV (issue #312, OPT-IN): only past the 4096-slot
+                // shared-memory fast path (where the single-workgroup scan collapses), with
+                // headDim a multiple of 32 (matches the CUDA gate) and the partial buffers
+                // allocated (gate + maxSplits≤256). Otherwise the byte-identical spill path runs.
+                if (_splitKvEnabled && position + 1 > 4096 && _headDim % 32 == 0 && _splitKvPartialO is not null)
+                {
+                    _gpu.AttentionSplitKv(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                        _splitKvPartialO, _splitKvPartialMeta!,
+                        (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
+                        (uint)(position + 1), (uint)_maxSeqLen);
+                }
+                else
+                {
+                    _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                        _attnScoresScratch,
+                        (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
+                        (uint)(position + 1), (uint)_maxSeqLen);
+                }
             }
             _gpu.RecordBarrier(); // attnOut done → output projection
 
@@ -1339,6 +1379,10 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             _gpu.Free(_evictV!);
         }
         _gpu.Free(_attnScoresScratch);
+
+        // Flash-decoding split-KV (#312) partial buffers (null unless the opt-in gate enabled them)
+        if (_splitKvPartialO is { } skO) _gpu.Free(skO);
+        if (_splitKvPartialMeta is { } skM) _gpu.Free(skM);
 
         // SnapKV (#59) buffers
         if (_snapKvQCapture is { } capBuf) _gpu.Free(capBuf);

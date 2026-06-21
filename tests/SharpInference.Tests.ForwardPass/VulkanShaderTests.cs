@@ -948,6 +948,116 @@ public sealed unsafe class VulkanShaderTests
         backend.Free(gpuScratch);
     }
 
+    /// <summary>
+    /// Flash-decoding split-KV (issue #312): seq_len=4097 ⇒ ceil(4097/512) = 9 splits, the last
+    /// covering a single position. Validates the combine LSE merge across an almost-empty
+    /// trailing split.
+    /// </summary>
+    [Fact]
+    public void AttentionSplitKv_TinyTail_MatchesCpuReference()
+    {
+        AttentionSplitKvMatchesCpuReference(seqLen: 4097, numHeads: 2, numKvHeads: 2, headDim: 32);
+    }
+
+    /// <summary>
+    /// Flash-decoding split-KV (issue #312): GQA (num_heads &gt; num_kv_heads) with headDim=128,
+    /// seq_len=5000 ⇒ 10 splits. Validates the per-(head,split) partial layout under GQA.
+    /// </summary>
+    [Fact]
+    public void AttentionSplitKv_Gqa_MatchesCpuReference()
+    {
+        AttentionSplitKvMatchesCpuReference(seqLen: 5000, numHeads: 4, numKvHeads: 2, headDim: 128);
+    }
+
+    /// <summary>
+    /// Flash-decoding split-KV (issue #312): many splits (seq_len=8000 ⇒ 16 splits) with
+    /// headDim=64. Validates the global-max + denominator reduction across many partials.
+    /// </summary>
+    [Fact]
+    public void AttentionSplitKv_ManySplits_MatchesCpuReference()
+    {
+        AttentionSplitKvMatchesCpuReference(seqLen: 8000, numHeads: 2, numKvHeads: 2, headDim: 64);
+    }
+
+    /// <summary>
+    /// Correctness gate for the split-KV partial layout + combine LSE merge. Calls
+    /// <see cref="Vulkan.VulkanBackend.AttentionSplitKv"/> directly (no env gate — the gate only
+    /// controls whether <c>GpuForwardPass</c> routes here) against the same scaled-dot-product +
+    /// softmax + GQA reference as <see cref="AttentionShaderMatchesCpuReference"/>. The result
+    /// must match the single-pass attention to &lt; 1e-3.
+    /// </summary>
+    private static void AttentionSplitKvMatchesCpuReference(
+        int seqLen, int numHeads, int numKvHeads, int headDim)
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        int kvDim = numKvHeads * headDim;
+        int maxSeqLen = seqLen + 16;
+
+        var rng = new Random(1312);
+        var q = new float[numHeads * headDim];
+        var kCache = new float[maxSeqLen * kvDim];
+        var vCache = new float[maxSeqLen * kvDim];
+        for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < seqLen * kvDim; i++) kCache[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < seqLen * kvDim; i++) vCache[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // CPU reference: scaled dot-product attention with GQA (matches the single-pass test).
+        float scale = 1f / MathF.Sqrt(headDim);
+        var cpuOutput = new float[numHeads * headDim];
+        for (int h = 0; h < numHeads; h++)
+        {
+            int kvHead = h / (numHeads / numKvHeads);
+            var scores = new float[seqLen];
+            for (int t = 0; t < seqLen; t++)
+            {
+                float dot = 0f;
+                for (int d = 0; d < headDim; d++)
+                    dot += q[h * headDim + d] * kCache[t * kvDim + kvHead * headDim + d];
+                scores[t] = dot * scale;
+            }
+            float maxS = scores.Max();
+            float sumE = 0f;
+            for (int t = 0; t < seqLen; t++) { scores[t] = MathF.Exp(scores[t] - maxS); sumE += scores[t]; }
+            for (int t = 0; t < seqLen; t++) scores[t] /= sumE;
+            for (int d = 0; d < headDim; d++)
+            {
+                float sum = 0f;
+                for (int t = 0; t < seqLen; t++)
+                    sum += scores[t] * vCache[t * kvDim + kvHead * headDim + d];
+                cpuOutput[h * headDim + d] = sum;
+            }
+        }
+
+        // GPU split-KV: allocate the two partial buffers sized to the live split count.
+        int nSplits = (seqLen + 511) / 512;
+        var gpuQ = backend.Upload(q, TensorShape.D1(q.Length));
+        var gpuK = backend.Upload(kCache, TensorShape.D2(maxSeqLen, kvDim));
+        var gpuV = backend.Upload(vCache, TensorShape.D2(maxSeqLen, kvDim));
+        var gpuOut = backend.Allocate(TensorShape.D1(numHeads * headDim));
+        var gpuPartialO = backend.Allocate(TensorShape.D1((long)numHeads * nSplits * headDim));
+        var gpuPartialMeta = backend.Allocate(TensorShape.D1((long)numHeads * nSplits * 2));
+        ((Vulkan.VulkanBackend)backend).AttentionSplitKv(
+            gpuQ, gpuK, gpuV, gpuOut, gpuPartialO, gpuPartialMeta,
+            (uint)numHeads, (uint)numKvHeads, (uint)headDim,
+            (uint)seqLen, (uint)maxSeqLen);
+
+        var gpuResult = new float[numHeads * headDim];
+        backend.Download(gpuOut, gpuResult);
+
+        for (int i = 0; i < cpuOutput.Length; i++)
+            Assert.True(MathF.Abs(gpuResult[i] - cpuOutput[i]) < 1e-3f,
+                $"SplitKv mismatch at [{i}] (seqLen={seqLen}, nSplits={nSplits}): " +
+                $"gpu={gpuResult[i]:F5} cpu={cpuOutput[i]:F5}");
+
+        backend.Free(gpuQ);
+        backend.Free(gpuK);
+        backend.Free(gpuV);
+        backend.Free(gpuOut);
+        backend.Free(gpuPartialO);
+        backend.Free(gpuPartialMeta);
+    }
+
     private static string? FindModelPath()
     {
         return FindModelPath(
