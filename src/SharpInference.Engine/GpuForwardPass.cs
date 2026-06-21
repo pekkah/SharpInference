@@ -838,10 +838,23 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                     (uint)(_numKvHeads * _headDim), (uint)position, (uint)_maxSeqLen);
                 _gpu.RecordBarrier();
 
-                _gpu.AttentionBf16(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
-                    _attnScoresScratch,
-                    (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
-                    (uint)(position + 1), (uint)_maxSeqLen);
+                // Flash-decoding split-KV (issue #332): bf16 cache, same gate as the fp32 path
+                // (#312). Below it / split-disabled / headDim%32!=0 runs the byte-identical
+                // single-workgroup bf16 spill path. The combine pass is dtype-agnostic.
+                if (_splitKvEnabled && position + 1 > 4096 && _headDim % 32 == 0 && _splitKvPartialO is not null)
+                {
+                    _gpu.AttentionSplitKvBf16(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                        _splitKvPartialO, _splitKvPartialMeta!,
+                        (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
+                        (uint)(position + 1), (uint)_maxSeqLen);
+                }
+                else
+                {
+                    _gpu.AttentionBf16(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                        _attnScoresScratch,
+                        (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
+                        (uint)(position + 1), (uint)_maxSeqLen);
+                }
             }
             else if (_kvDType == DType.Q8_0)
             {
@@ -851,10 +864,24 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                     (uint)(_numKvHeads * _headDim), (uint)position, (uint)_maxSeqLen);
                 _gpu.RecordBarrier();
 
-                _gpu.AttentionQ8_0(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
-                    _attnScoresScratch,
-                    (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
-                    (uint)(position + 1), (uint)_maxSeqLen);
+                // Flash-decoding split-KV (issue #332): q8_0 cache, same gate as the fp32 path
+                // (#312). q8_0 already guarantees kv_dim%32==0 so headDim%32==0 holds, but the
+                // gate is kept uniform. Below it / split-disabled runs the byte-identical q8_0
+                // single-workgroup spill path. The combine pass is dtype-agnostic.
+                if (_splitKvEnabled && position + 1 > 4096 && _headDim % 32 == 0 && _splitKvPartialO is not null)
+                {
+                    _gpu.AttentionSplitKvQ8(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                        _splitKvPartialO, _splitKvPartialMeta!,
+                        (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
+                        (uint)(position + 1), (uint)_maxSeqLen);
+                }
+                else
+                {
+                    _gpu.AttentionQ8_0(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                        _attnScoresScratch,
+                        (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
+                        (uint)(position + 1), (uint)_maxSeqLen);
+                }
             }
             else
             {

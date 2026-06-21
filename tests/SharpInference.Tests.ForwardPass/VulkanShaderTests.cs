@@ -1058,6 +1058,264 @@ public sealed unsafe class VulkanShaderTests
         backend.Free(gpuPartialMeta);
     }
 
+    // ── bf16 split-KV (issue #332) ──────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// bf16 split-KV (issue #332): GQA, headDim=128, seq_len=5000 ⇒ 10 splits (forces multiple
+    /// splits). Builds the K/V cache in the fp16-packed format the bf16 shader reads, runs
+    /// <see cref="Vulkan.VulkanBackend.AttentionSplitKvBf16"/>, and compares to a CPU SDPA
+    /// reference dequantized from the SAME fp16 bytes (isolates the split-KV combine from fp16
+    /// loss). Tolerance &lt; 1e-2 (fp16 K/V is lossy).
+    /// </summary>
+    [Fact]
+    public void AttentionSplitKvBf16_MatchesCpuReference()
+    {
+        AttentionSplitKvBf16MatchesCpuReference(seqLen: 5000, numHeads: 4, numKvHeads: 2, headDim: 128);
+    }
+
+    /// <summary>
+    /// bf16 split-KV (issue #332): tiny-tail (seq_len=4097 ⇒ 9 splits, last covers a single
+    /// position) — validates the combine LSE merge over an almost-empty trailing split with the
+    /// fp16 read path.
+    /// </summary>
+    [Fact]
+    public void AttentionSplitKvBf16_TinyTail_MatchesCpuReference()
+    {
+        AttentionSplitKvBf16MatchesCpuReference(seqLen: 4097, numHeads: 2, numKvHeads: 2, headDim: 32);
+    }
+
+    private static void AttentionSplitKvBf16MatchesCpuReference(
+        int seqLen, int numHeads, int numKvHeads, int headDim)
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        int kvDim = numKvHeads * headDim;
+        int maxSeqLen = seqLen + 16;
+
+        var rng = new Random(1312);
+        var q = new float[numHeads * headDim];
+        for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Build the K/V cache as IEEE fp16 (the exact bits the bf16 shader unpacks), element
+        // layout [t*kvDim + e]. Keep a dequantized fp32 copy for the CPU reference so the
+        // comparison isolates split-KV from fp16 rounding.
+        var kHalf = new ushort[maxSeqLen * kvDim];
+        var vHalf = new ushort[maxSeqLen * kvDim];
+        var kRef = new float[maxSeqLen * kvDim];
+        var vRef = new float[maxSeqLen * kvDim];
+        for (int i = 0; i < seqLen * kvDim; i++)
+        {
+            Half hk = (Half)(rng.NextDouble() * 2 - 1);
+            Half hv = (Half)(rng.NextDouble() * 2 - 1);
+            kHalf[i] = BitConverter.HalfToUInt16Bits(hk); kRef[i] = (float)hk;
+            vHalf[i] = BitConverter.HalfToUInt16Bits(hv); vRef[i] = (float)hv;
+        }
+
+        var cpuOutput = SdpaReference(q, kRef, vRef, seqLen, kvDim, numHeads, numKvHeads, headDim);
+
+        // Pack two fp16 elements per uint (== float storage word) for upload.
+        int kvWords = maxSeqLen * kvDim / 2;
+        var kPacked = new float[kvWords];
+        var vPacked = new float[kvWords];
+        PackHalfPairs(kHalf, kPacked);
+        PackHalfPairs(vHalf, vPacked);
+
+        int nSplits = (seqLen + 511) / 512;
+        var gpuQ = backend.Upload(q, TensorShape.D1(q.Length));
+        var gpuK = backend.Upload(kPacked, TensorShape.D1(kvWords));
+        var gpuV = backend.Upload(vPacked, TensorShape.D1(kvWords));
+        var gpuOut = backend.Allocate(TensorShape.D1(numHeads * headDim));
+        var gpuPartialO = backend.Allocate(TensorShape.D1((long)numHeads * nSplits * headDim));
+        var gpuPartialMeta = backend.Allocate(TensorShape.D1((long)numHeads * nSplits * 2));
+        ((Vulkan.VulkanBackend)backend).AttentionSplitKvBf16(
+            gpuQ, gpuK, gpuV, gpuOut, gpuPartialO, gpuPartialMeta,
+            (uint)numHeads, (uint)numKvHeads, (uint)headDim,
+            (uint)seqLen, (uint)maxSeqLen);
+
+        var gpuResult = new float[numHeads * headDim];
+        backend.Download(gpuOut, gpuResult);
+
+        for (int i = 0; i < cpuOutput.Length; i++)
+            Assert.True(MathF.Abs(gpuResult[i] - cpuOutput[i]) < 1e-2f,
+                $"SplitKvBf16 mismatch at [{i}] (seqLen={seqLen}, nSplits={nSplits}): " +
+                $"gpu={gpuResult[i]:F5} cpu={cpuOutput[i]:F5}");
+
+        backend.Free(gpuQ);
+        backend.Free(gpuK);
+        backend.Free(gpuV);
+        backend.Free(gpuOut);
+        backend.Free(gpuPartialO);
+        backend.Free(gpuPartialMeta);
+    }
+
+    // ── q8_0 split-KV (issue #332) ──────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// q8_0 split-KV (issue #332): GQA, headDim=128, seq_len=5000 ⇒ 10 splits. Builds the K/V
+    /// cache as ggml block_q8_0 (the exact bytes the q8_0 shader byte-gathers), runs
+    /// <see cref="Vulkan.VulkanBackend.AttentionSplitKvQ8"/>, and compares to a CPU SDPA
+    /// reference dequantized from the SAME blocks (isolates split-KV from q8_0 loss). q8_0 is
+    /// 8-bit so the dequant is exact on both sides; only FP accumulation order differs ⇒ &lt; 1e-2.
+    /// </summary>
+    [Fact]
+    public void AttentionSplitKvQ8_MatchesCpuReference()
+    {
+        AttentionSplitKvQ8MatchesCpuReference(seqLen: 5000, numHeads: 4, numKvHeads: 2, headDim: 128);
+    }
+
+    /// <summary>
+    /// q8_0 split-KV (issue #332): tiny-tail (seq_len=4097 ⇒ 9 splits, last covers a single
+    /// position) — validates the combine LSE merge over an almost-empty trailing split with the
+    /// block_q8_0 byte-gather read path.
+    /// </summary>
+    [Fact]
+    public void AttentionSplitKvQ8_TinyTail_MatchesCpuReference()
+    {
+        AttentionSplitKvQ8MatchesCpuReference(seqLen: 4097, numHeads: 2, numKvHeads: 2, headDim: 32);
+    }
+
+    private static void AttentionSplitKvQ8MatchesCpuReference(
+        int seqLen, int numHeads, int numKvHeads, int headDim)
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        int kvDim = numKvHeads * headDim;          // multiple of 32 (headDim 32/128) ⇒ whole blocks
+        int maxSeqLen = seqLen + 16;
+        Assert.True(kvDim % 32 == 0);
+
+        var rng = new Random(1312);
+        var q = new float[numHeads * headDim];
+        for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Build the K/V cache as block_q8_0 in the SAME block order KvAppendQ8_0 writes:
+        // dst_block = position * blocksPerRow + blk, b0 = dst_block * 34. Dequantize back for the
+        // CPU reference so the comparison isolates split-KV from q8_0 loss.
+        int blocksPerRow = kvDim / 32;
+        int totalBlocks = maxSeqLen * blocksPerRow;
+        var kBytes = new byte[totalBlocks * 34];
+        var vBytes = new byte[totalBlocks * 34];
+        var kRef = new float[maxSeqLen * kvDim];
+        var vRef = new float[maxSeqLen * kvDim];
+        for (int t = 0; t < seqLen; t++)
+            for (int blk = 0; blk < blocksPerRow; blk++)
+            {
+                int b0 = (t * blocksPerRow + blk) * 34;
+                int e0 = t * kvDim + blk * 32;
+                QuantizeBlockQ8_0(rng, kBytes, b0, kRef, e0);
+                QuantizeBlockQ8_0(rng, vBytes, b0, vRef, e0);
+            }
+
+        var cpuOutput = SdpaReference(q, kRef, vRef, seqLen, kvDim, numHeads, numKvHeads, headDim);
+
+        // Upload the raw block bytes reinterpreted as floats (the q8_0 shader binds uint[]).
+        var gpuK = UploadBytesAsFloats(backend, kBytes);
+        var gpuV = UploadBytesAsFloats(backend, vBytes);
+
+        int nSplits = (seqLen + 511) / 512;
+        var gpuQ = backend.Upload(q, TensorShape.D1(q.Length));
+        var gpuOut = backend.Allocate(TensorShape.D1(numHeads * headDim));
+        var gpuPartialO = backend.Allocate(TensorShape.D1((long)numHeads * nSplits * headDim));
+        var gpuPartialMeta = backend.Allocate(TensorShape.D1((long)numHeads * nSplits * 2));
+        ((Vulkan.VulkanBackend)backend).AttentionSplitKvQ8(
+            gpuQ, gpuK, gpuV, gpuOut, gpuPartialO, gpuPartialMeta,
+            (uint)numHeads, (uint)numKvHeads, (uint)headDim,
+            (uint)seqLen, (uint)maxSeqLen);
+
+        var gpuResult = new float[numHeads * headDim];
+        backend.Download(gpuOut, gpuResult);
+
+        for (int i = 0; i < cpuOutput.Length; i++)
+            Assert.True(MathF.Abs(gpuResult[i] - cpuOutput[i]) < 1e-2f,
+                $"SplitKvQ8 mismatch at [{i}] (seqLen={seqLen}, nSplits={nSplits}): " +
+                $"gpu={gpuResult[i]:F5} cpu={cpuOutput[i]:F5}");
+
+        backend.Free(gpuQ);
+        backend.Free(gpuK);
+        backend.Free(gpuV);
+        backend.Free(gpuOut);
+        backend.Free(gpuPartialO);
+        backend.Free(gpuPartialMeta);
+    }
+
+    // ── shared helpers for the bf16/q8_0 split-KV tests ─────────────────────────────────────
+
+    /// <summary>Scaled-dot-product attention with GQA over an fp32 K/V cache laid out
+    /// [t*kvDim + kvHead*headDim + d] — the same reference the fp32 split-KV test uses.</summary>
+    private static float[] SdpaReference(
+        float[] q, float[] kCache, float[] vCache,
+        int seqLen, int kvDim, int numHeads, int numKvHeads, int headDim)
+    {
+        float scale = 1f / MathF.Sqrt(headDim);
+        var output = new float[numHeads * headDim];
+        for (int h = 0; h < numHeads; h++)
+        {
+            int kvHead = h / (numHeads / numKvHeads);
+            var scores = new float[seqLen];
+            for (int t = 0; t < seqLen; t++)
+            {
+                float dot = 0f;
+                for (int d = 0; d < headDim; d++)
+                    dot += q[h * headDim + d] * kCache[t * kvDim + kvHead * headDim + d];
+                scores[t] = dot * scale;
+            }
+            float maxS = scores.Max();
+            float sumE = 0f;
+            for (int t = 0; t < seqLen; t++) { scores[t] = MathF.Exp(scores[t] - maxS); sumE += scores[t]; }
+            for (int t = 0; t < seqLen; t++) scores[t] /= sumE;
+            for (int d = 0; d < headDim; d++)
+            {
+                float sum = 0f;
+                for (int t = 0; t < seqLen; t++)
+                    sum += scores[t] * vCache[t * kvDim + kvHead * headDim + d];
+                output[h * headDim + d] = sum;
+            }
+        }
+        return output;
+    }
+
+    /// <summary>Packs an array of fp16 bit-patterns two-per-uint into a float[] (so each float's
+    /// storage word holds the two halves the bf16 shader reads via unpackHalf2x16).</summary>
+    private static void PackHalfPairs(ushort[] halves, float[] packed)
+    {
+        for (int w = 0; w < packed.Length; w++)
+        {
+            uint lo = halves[2 * w];
+            uint hi = halves[2 * w + 1];
+            packed[w] = BitConverter.UInt32BitsToSingle(lo | (hi << 16));
+        }
+    }
+
+    /// <summary>Quantizes 32 random elements into a block_q8_0 (34 bytes at <paramref name="b0"/>)
+    /// using the exact amax/d/clamp recipe of KvAppendQ8_0, and writes the dequantized fp32 back
+    /// into <paramref name="deq"/> at <paramref name="e0"/> for the CPU reference.</summary>
+    private static void QuantizeBlockQ8_0(Random rng, byte[] dst, int b0, float[] deq, int e0)
+    {
+        var x = new float[32];
+        float amax = 0f;
+        for (int j = 0; j < 32; j++) { x[j] = (float)(rng.NextDouble() * 2 - 1); amax = MathF.Max(amax, MathF.Abs(x[j])); }
+        float d = amax / 127f;
+        float invd = d < 1e-30f ? 0f : 1f / d;
+        Half hd = (Half)d;
+        float dDeq = (float)hd;   // scale is stored as fp16 in the block
+        PutHalf(dst, b0, d);
+        for (int j = 0; j < 32; j++)
+        {
+            int qv = Math.Clamp((int)MathF.Round(x[j] * invd), -127, 127);
+            dst[b0 + 2 + j] = (byte)(sbyte)qv;
+            deq[e0 + j] = dDeq * qv;
+        }
+    }
+
+    /// <summary>Uploads raw bytes reinterpreted as a float[] (4-byte rounded up) — the upload
+    /// idiom the quantized-matvec tests use to feed uint[]-bound shader buffers.</summary>
+    private static Tensor UploadBytesAsFloats(Vulkan.VulkanBackend backend, byte[] bytes)
+    {
+        int floatCount = (bytes.Length + 3) / 4;
+        var asFloats = new float[floatCount];
+        bytes.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsBytes(asFloats.AsSpan()));
+        return backend.Upload(asFloats, TensorShape.D1(floatCount));
+    }
+
     private static string? FindModelPath()
     {
         return FindModelPath(

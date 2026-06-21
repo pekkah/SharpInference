@@ -1086,6 +1086,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _kvAppendQ8Pipeline;
     private ComputePipeline? _attentionQ8Pipeline;
     private ComputePipeline? _splitKvPartialPipeline;
+    private ComputePipeline? _splitKvPartialBf16Pipeline;
+    private ComputePipeline? _splitKvPartialQ8Pipeline;
     private ComputePipeline? _splitKvCombinePipeline;
     private ComputePipeline? _snapKvScorePipeline;
     private ComputePipeline? _kvCompactPipeline;
@@ -1430,6 +1432,80 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         // immediate path (DispatchWith) each dispatch is its own submit + fence-wait, so the
         // partial pass has fully completed before the combine is submitted — no barrier needed,
         // and RecordBarrier on a non-recording command buffer would be invalid.
+        if (_recording) RecordBarrier();
+
+        var cp = new SplitKvCombineParams { numHeads = numHeads, headDim = headDim, nSplits = nSplits };
+        DispatchOrRecord(_splitKvCombinePipeline,
+            [GetBuffer(partialO), GetBuffer(partialMeta), GetBuffer(output)],
+            numHeads, &cp);
+    }
+
+    /// <summary>
+    /// bf16 (issue #332) variant of <see cref="AttentionSplitKv"/>: identical 2-pass split-KV
+    /// flow, but the partial pass reads the K/V cache as IEEE fp16 packed two-per-uint (via
+    /// <c>AttentionSplitKvPartialBf16</c>). The combine pass is the SAME dtype-agnostic
+    /// <c>AttentionSplitKvCombine</c> as fp32 (it reads only the fp32 partial buffers). Same
+    /// nSplits guard, dispatch, and barrier as <see cref="AttentionSplitKv"/>.
+    /// </summary>
+    public void AttentionSplitKvBf16(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+        Tensor partialO, Tensor partialMeta,
+        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen)
+    {
+        // Mirrors AttentionSplitKv's guard (combine bounds the per-head rescale at 256 splits).
+        if (seqLen > 131072)
+            throw new ArgumentOutOfRangeException(nameof(seqLen),
+                $"split-KV supports up to 256 splits (seqLen <= 131072); got seqLen={seqLen}.");
+        uint nSplits = (seqLen + 511) / 512;
+        _splitKvPartialBf16Pipeline ??= new ComputePipeline(this, Shaders.AttentionSplitKvPartialBf16, 5, pushConstantSize: sizeof(SplitKvPartialParams));
+        _splitKvCombinePipeline ??= new ComputePipeline(this, Shaders.AttentionSplitKvCombine, 3, pushConstantSize: sizeof(SplitKvCombineParams));
+
+        var pp = new SplitKvPartialParams
+        {
+            numHeads = numHeads, numKvHeads = numKvHeads,
+            headDim = headDim, seqLen = seqLen, nSplits = nSplits
+        };
+        DispatchOrRecord(_splitKvPartialBf16Pipeline,
+            [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(partialO),
+             GetBuffer(partialMeta)],
+            numHeads, &pp, groupY: nSplits);
+
+        if (_recording) RecordBarrier();
+
+        var cp = new SplitKvCombineParams { numHeads = numHeads, headDim = headDim, nSplits = nSplits };
+        DispatchOrRecord(_splitKvCombinePipeline,
+            [GetBuffer(partialO), GetBuffer(partialMeta), GetBuffer(output)],
+            numHeads, &cp);
+    }
+
+    /// <summary>
+    /// q8_0 (issue #332) variant of <see cref="AttentionSplitKv"/>: identical 2-pass split-KV
+    /// flow, but the partial pass reads the K/V cache as ggml <c>block_q8_0</c> (34 bytes/block,
+    /// dequant <c>fp16(d) * int8</c> per element) via <c>AttentionSplitKvPartialQ8</c>. The
+    /// combine pass is the SAME dtype-agnostic <c>AttentionSplitKvCombine</c> as fp32 (it reads
+    /// only the fp32 partial buffers). Same nSplits guard, dispatch, and barrier as
+    /// <see cref="AttentionSplitKv"/>.
+    /// </summary>
+    public void AttentionSplitKvQ8(Tensor q, Tensor kCache, Tensor vCache, Tensor output,
+        Tensor partialO, Tensor partialMeta,
+        uint numHeads, uint numKvHeads, uint headDim, uint seqLen, uint maxSeqLen)
+    {
+        if (seqLen > 131072)
+            throw new ArgumentOutOfRangeException(nameof(seqLen),
+                $"split-KV supports up to 256 splits (seqLen <= 131072); got seqLen={seqLen}.");
+        uint nSplits = (seqLen + 511) / 512;
+        _splitKvPartialQ8Pipeline ??= new ComputePipeline(this, Shaders.AttentionSplitKvPartialQ8, 5, pushConstantSize: sizeof(SplitKvPartialParams));
+        _splitKvCombinePipeline ??= new ComputePipeline(this, Shaders.AttentionSplitKvCombine, 3, pushConstantSize: sizeof(SplitKvCombineParams));
+
+        var pp = new SplitKvPartialParams
+        {
+            numHeads = numHeads, numKvHeads = numKvHeads,
+            headDim = headDim, seqLen = seqLen, nSplits = nSplits
+        };
+        DispatchOrRecord(_splitKvPartialQ8Pipeline,
+            [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(partialO),
+             GetBuffer(partialMeta)],
+            numHeads, &pp, groupY: nSplits);
+
         if (_recording) RecordBarrier();
 
         var cp = new SplitKvCombineParams { numHeads = numHeads, headDim = headDim, nSplits = nSplits };
@@ -2044,6 +2120,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _kvAppendQ8Pipeline?.Dispose();
         _attentionQ8Pipeline?.Dispose();
         _splitKvPartialPipeline?.Dispose();
+        _splitKvPartialBf16Pipeline?.Dispose();
+        _splitKvPartialQ8Pipeline?.Dispose();
         _splitKvCombinePipeline?.Dispose();
         _snapKvScorePipeline?.Dispose();
         _kvCompactPipeline?.Dispose();
