@@ -34,10 +34,11 @@ public sealed unsafe class ComputePipeline : IDisposable
     // Public for tests/diagnostics that need to assert per-recording DS isolation.
     public int CurrentRecordingDispatchCount => _recordingIdx;
 
-    // Matches "local_size_x = <N>" in a GLSL layout qualifier. Every compute shader in this
-    // backend declares it as a literal; used to decide subgroup-size pinning (issue #318).
+    // Matches "local_size_x = <N>" inside a GLSL layout(...) qualifier (scoped to the
+    // qualifier so a stray mention in a comment can't false-match). Every compute shader in
+    // this backend declares it as a literal; used to decide subgroup-size pinning (issue #318).
     private static readonly Regex LocalSizeXRegex =
-        new(@"local_size_x\s*=\s*(\d+)", RegexOptions.Compiled);
+        new(@"layout\s*\([^)]*local_size_x\s*=\s*(\d+)", RegexOptions.Compiled);
 
     /// <summary>
     /// Parse the <c>local_size_x</c> workgroup dimension from GLSL source.
