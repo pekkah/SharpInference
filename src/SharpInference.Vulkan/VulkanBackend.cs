@@ -1063,6 +1063,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _headNormPipeline;
     private ComputePipeline? _headNormPurePipeline;
     private ComputePipeline? _siluMulPipeline;
+    private ComputePipeline? _geluTanhMulPipeline;
+    private ComputePipeline? _softcapPipeline;
     private ComputePipeline? _siluPipeline;
     private ComputePipeline? _addInPlacePipeline;
     private ComputePipeline? _addScaledInPlacePipeline;
@@ -1205,6 +1207,21 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _siluMulPipeline ??= new ComputePipeline(this, Shaders.SiLuMul, 2, pushConstantSize: sizeof(CountParams));
         var p = new CountParams { n = (uint)gate.ElementCount };
         DispatchOrRecord(_siluMulPipeline, [GetBuffer(gate), GetBuffer(up)], ((uint)gate.ElementCount + 255) / 256, &p);
+    }
+
+    public void GeluTanhMul(Tensor gate, Tensor up)
+    {
+        _geluTanhMulPipeline ??= new ComputePipeline(this, Shaders.GeluTanhMul, 2, pushConstantSize: sizeof(CountParams));
+        var p = new CountParams { n = (uint)gate.ElementCount };
+        DispatchOrRecord(_geluTanhMulPipeline, [GetBuffer(gate), GetBuffer(up)], ((uint)gate.ElementCount + 255) / 256, &p);
+    }
+
+    public void SoftcapInPlace(Tensor x, float cap)
+    {
+        // Reuse the { uint n, float scale } push-constant layout (scale carries the cap).
+        _softcapPipeline ??= new ComputePipeline(this, Shaders.Softcap, 1, pushConstantSize: sizeof(ScaleParams));
+        var p = new ScaleParams { n = (uint)x.ElementCount, scale = cap };
+        DispatchOrRecord(_softcapPipeline, [GetBuffer(x)], ((uint)x.ElementCount + 255) / 256, &p);
     }
 
     public void AddInPlace(Tensor dst, Tensor src)
@@ -2097,6 +2114,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _headNormPipeline?.Dispose();
         _headNormPurePipeline?.Dispose();
         _siluMulPipeline?.Dispose();
+        _geluTanhMulPipeline?.Dispose();
+        _softcapPipeline?.Dispose();
         _siluPipeline?.Dispose();
         _addInPlacePipeline?.Dispose();
         _addScaledInPlacePipeline?.Dispose();

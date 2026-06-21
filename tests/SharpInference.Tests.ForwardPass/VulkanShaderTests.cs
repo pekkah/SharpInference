@@ -161,6 +161,80 @@ public sealed unsafe class VulkanShaderTests
     }
 
     [Fact]
+    public void GeluTanhMulMatchesCpu()
+    {
+        // Issue #309: Gemma FFN tanh-approximate GELU(gate)*up, in place into gate.
+        // Vulkan previously threw NotSupportedException for this op.
+        using var backend = new Vulkan.VulkanBackend();
+
+        const int N = 2048;
+        var gate = new float[N];
+        var up = new float[N];
+        var rng = new Random(42);
+        for (int i = 0; i < N; i++)
+        {
+            gate[i] = (float)(rng.NextDouble() * 8 - 4);
+            up[i] = (float)(rng.NextDouble() * 2 - 1);
+        }
+
+        // CPU reference (matches SimdKernels.GeluTanhMul_Scalar / CUDA llm_gelu_tanh_mul):
+        //   inner = sqrt(2/π) * (g + 0.044715 * g^3); out = 0.5 * g * (1 + tanh(inner)) * up.
+        const float kAlpha = 0.7978845608028654f;
+        const float kBeta = 0.044715f;
+        var expected = new float[N];
+        for (int i = 0; i < N; i++)
+        {
+            float g = gate[i];
+            float inner = kAlpha * (g + kBeta * g * g * g);
+            expected[i] = 0.5f * g * (1f + MathF.Tanh(inner)) * up[i];
+        }
+
+        var gpuGate = backend.Upload(gate, TensorShape.D1(N));
+        var gpuUp = backend.Upload(up, TensorShape.D1(N));
+        backend.GeluTanhMul(gpuGate, gpuUp);
+
+        var result = new float[N];
+        backend.Download(gpuGate, result);
+
+        for (int i = 0; i < N; i++)
+            Assert.True(MathF.Abs(result[i] - expected[i]) < 1e-3f,
+                $"GeluTanhMul mismatch at [{i}]: gpu={result[i]}, cpu={expected[i]}");
+
+        backend.Free(gpuGate);
+        backend.Free(gpuUp);
+    }
+
+    [Fact]
+    public void SoftcapMatchesCpu()
+    {
+        // Issue #309: Gemma final-logit softcap x[i] = tanh(x[i]/cap)*cap, in place.
+        // Vulkan previously threw NotSupportedException for this op.
+        using var backend = new Vulkan.VulkanBackend();
+
+        const int N = 2049; // not a multiple of 256 → exercises the bounds guard
+        const float cap = 30f; // Gemma's final_logit_softcapping
+        var x = new float[N];
+        var rng = new Random(123);
+        for (int i = 0; i < N; i++) x[i] = (float)(rng.NextDouble() * 200 - 100); // span [-100, 100]
+
+        // CPU reference (matches SimdKernels.SoftcapInPlace / CUDA llm_softcap_inplace).
+        var expected = new float[N];
+        for (int i = 0; i < N; i++) expected[i] = MathF.Tanh(x[i] / cap) * cap;
+
+        var gpuX = backend.Upload(x, TensorShape.D1(N));
+        backend.SoftcapInPlace(gpuX, cap);
+
+        var result = new float[N];
+        backend.Download(gpuX, result);
+
+        for (int i = 0; i < N; i++)
+            Assert.True(MathF.Abs(result[i] - expected[i]) < 1e-3f,
+                $"Softcap mismatch at [{i}]: gpu={result[i]}, cpu={expected[i]}");
+
+        backend.Free(gpuX);
+    }
+
+    [Fact]
     public void RoPEMatchesCpu()
     {
         using var backend = new Vulkan.VulkanBackend();

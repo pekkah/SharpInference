@@ -84,6 +84,32 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Fused tanh-approximate GELU(gate) * up (Gemma FFN activation):
+    /// gate[i] = 0.5 * g * (1 + tanh(0.7978845608028654 * (g + 0.044715 * g^3))) * up[i]
+    /// where g = gate[i]. Clone of <see cref="SiLuMul"/> with SiLU swapped for GELU-tanh.
+    /// Push constants: { uint n }.
+    /// Bindings: 0=gate (in/out), 1=up (in).
+    /// Matches the CPU reference SimdKernels.GeluTanhMul / CUDA llm_gelu_tanh_mul.
+    /// </summary>
+    internal const string GeluTanhMul = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer Gate { float gate_data[]; };
+        layout(binding = 1) readonly buffer Up { float up_data[]; };
+
+        layout(push_constant) uniform Params { uint n; };
+
+        void main() {
+            uint i = gl_GlobalInvocationID.x;
+            if (i >= n) return;
+            float g = gate_data[i];
+            float inner = 0.7978845608028654 * (g + 0.044715 * g * g * g);
+            gate_data[i] = 0.5 * g * (1.0 + tanh(inner)) * up_data[i];
+        }
+        """;
+
+    /// <summary>
     /// SiLU (Swish) activation in-place: x[i] = x[i] * sigmoid(x[i]) = x[i] / (1 + exp(-x[i])).
     /// Push constants: { uint n }.
     /// Bindings: 0=x (in/out).
@@ -171,6 +197,31 @@ internal static class Shaders
             uint i = gl_GlobalInvocationID.x;
             if (i >= n) return;
             data[i] *= scale;
+        }
+        """;
+
+    /// <summary>
+    /// In-place final-logit softcap: x[i] = tanh(x[i] / cap) * cap for i in [0, n).
+    /// Used by Gemma to clip extreme logits before sampling (cap=30).
+    /// Push constants: { uint n, float cap } (reuses the ScaleParams layout, scale=cap).
+    /// Bindings: 0=data (in/out).
+    /// Matches the CPU reference SimdKernels.SoftcapInPlace / CUDA llm_softcap_inplace.
+    /// </summary>
+    internal const string Softcap = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer Data { float data[]; };
+
+        layout(push_constant) uniform Params {
+            uint n;
+            float cap;
+        };
+
+        void main() {
+            uint i = gl_GlobalInvocationID.x;
+            if (i >= n) return;
+            data[i] = tanh(data[i] / cap) * cap;
         }
         """;
 
