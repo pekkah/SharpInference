@@ -1168,6 +1168,124 @@ internal static class Shaders
         }
         """;
 
+    /// <summary>
+    /// Matrix-vector multiply with Q8_0 dequantization.
+    /// Each workgroup computes 8 output rows (8 rows × 32 lanes = 256 threads).
+    /// Push constants: { uint rows, uint cols }.
+    /// Bindings: 0=quantized weights (uint8), 1=input vector (float), 2=output (float).
+    ///
+    /// Q8_0 block layout (34 bytes per 32 elements):
+    ///   [0:2]  FP16 d (block scale)
+    ///   [2:34] 32 int8 quantized values
+    /// Dequant: value = d * int8. One lane handles one element per block.
+    /// Mirrors the CUDA llm_matvec_q8_0 kernel and the CPU DequantQ8_0 path.
+    /// </summary>
+    internal const string MatVecQ8_0 = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+        #extension GL_KHR_shader_subgroup_arithmetic : enable
+
+        #define N_ROWS 8
+        #define THREADS_PER_ROW 32
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Weights { uint weights_data[]; };
+        layout(binding = 1) readonly buffer Input   { float input_data[]; };
+        layout(binding = 2) writeonly buffer Output  { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint rows;
+            uint cols;
+        };
+
+        uint gByte(uint b) { return (weights_data[b >> 2] >> ((b & 3) * 8)) & 0xFF; }
+        int  gInt8(uint b) { int v = int(gByte(b)); return v >= 128 ? v - 256 : v; }
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint row_in_wg = tid / THREADS_PER_ROW;
+            uint lane = tid % THREADS_PER_ROW;
+            uint row = gl_WorkGroupID.x * N_ROWS + row_in_wg;
+            if (row >= rows) return;
+
+            uint num_blocks = cols >> 5;            // cols / 32
+            uint boff_base = row * num_blocks * 34;
+
+            float acc = 0.0;
+            for (uint block = 0; block < num_blocks; block++) {
+                uint b0 = boff_base + block * 34;
+                float d = unpackHalf2x16(gByte(b0) | (gByte(b0 + 1) << 8)).x;
+                int q = gInt8(b0 + 2 + lane);
+                acc += d * float(q) * input_data[block * 32 + lane];
+            }
+
+            float result = subgroupAdd(acc);
+            if (subgroupElect())
+                output_data[row] = result;
+        }
+        """;
+
+    /// <summary>
+    /// Matrix-vector multiply with Q4_0 dequantization.
+    /// Each workgroup computes 8 output rows (8 rows × 32 lanes = 256 threads).
+    /// Push constants: { uint rows, uint cols }.
+    /// Bindings: 0=quantized weights (uint8), 1=input vector (float), 2=output (float).
+    ///
+    /// Q4_0 block layout (18 bytes per 32 elements):
+    ///   [0:2]  FP16 d (block scale)
+    ///   [2:18] 16 bytes of packed 4-bit nibbles (two signed nibbles per byte)
+    /// Element j (0..15) = low nibble of qs[j]; element j+16 = high nibble of qs[j].
+    /// Dequant: value = (nibble - 8) * d. One lane handles one element per block.
+    /// Mirrors the CUDA llm_matvec_q4_0 kernel and the CPU DequantQ4_0 path.
+    /// </summary>
+    internal const string MatVecQ4_0 = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+        #extension GL_KHR_shader_subgroup_arithmetic : enable
+
+        #define N_ROWS 8
+        #define THREADS_PER_ROW 32
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Weights { uint weights_data[]; };
+        layout(binding = 1) readonly buffer Input   { float input_data[]; };
+        layout(binding = 2) writeonly buffer Output  { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint rows;
+            uint cols;
+        };
+
+        uint gByte(uint b) { return (weights_data[b >> 2] >> ((b & 3) * 8)) & 0xFF; }
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint row_in_wg = tid / THREADS_PER_ROW;
+            uint lane = tid % THREADS_PER_ROW;
+            uint row = gl_WorkGroupID.x * N_ROWS + row_in_wg;
+            if (row >= rows) return;
+
+            uint num_blocks = cols >> 5;            // cols / 32
+            uint boff_base = row * num_blocks * 18;
+
+            float acc = 0.0;
+            for (uint block = 0; block < num_blocks; block++) {
+                uint b0 = boff_base + block * 18;
+                float d = unpackHalf2x16(gByte(b0) | (gByte(b0 + 1) << 8)).x;
+                // lane 0..15: low nibble of qs[lane]; lane 16..31: high nibble of qs[lane-16].
+                uint qbyte = gByte(b0 + 2 + (lane & 15));
+                int nib = (lane < 16) ? int(qbyte & 0xF) : int(qbyte >> 4);
+                acc += d * float(nib - 8) * input_data[block * 32 + lane];
+            }
+
+            float result = subgroupAdd(acc);
+            if (subgroupElect())
+                output_data[row] = result;
+        }
+        """;
+
     // ================================================================
     //  TurboQuant KV Cache Compression Shaders
     // ================================================================
