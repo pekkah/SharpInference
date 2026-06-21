@@ -3024,8 +3024,10 @@ internal static class Shaders
     /// GPU. Each workgroup emits the UN-normalized online-softmax partial for its slice; the
     /// companion <see cref="AttentionSplitKvCombine"/> LSE-merges the per-head partials.
     ///
-    /// fp32 K/V only (bf16/q8_0 keep the spill path). Scalar (no subgroup ops) — uses plain
-    /// shared-memory tree reductions, so #318's subgroup-size pin is irrelevant here.
+    /// fp32 K/V (the bf16/q8_0 caches use <see cref="AttentionSplitKvPartialBf16"/> /
+    /// <see cref="AttentionSplitKvPartialQ8"/>, which differ only in the K/V read — issue #332).
+    /// Scalar (no subgroup ops) — uses plain shared-memory tree reductions, so #318's
+    /// subgroup-size pin is irrelevant here.
     ///
     /// Workgroup (h = gl_WorkGroupID.x, s = gl_WorkGroupID.y) handles slice
     /// <c>[s*CHUNK, min((s+1)*CHUNK, seq_len))</c>. Out-of-range splits (s*CHUNK ≥ seq_len, from
@@ -3220,6 +3222,279 @@ internal static class Shaders
                     if (sc != 0.0) acc += sc * partial_o[po_base + s * head_dim + d];
                 }
                 out_data[out_base + d] = acc * inv;
+            }
+        }
+        """;
+
+    /// <summary>
+    /// bf16 (issue #332) variant of <see cref="AttentionSplitKvPartial"/>: control flow is
+    /// IDENTICAL to the fp32 partial; the ONLY difference is that the K/V cache buffers
+    /// (bindings 1, 2) hold IEEE fp16 packed two-per-uint and are read via
+    /// <c>unpackHalf2x16</c> (same idiom as <see cref="AttentionBf16"/>). The element addressing
+    /// (<c>kv_base + t*kv_dim + d</c>) is identical to fp32; per element <c>e</c> the packed word
+    /// is <c>e&gt;&gt;1</c> and the component is <c>e&amp;1</c> (head_dim/kv_dim are even — see the
+    /// GpuForwardPass guard). All scores / softmax / value accumulation stay fp32; only the
+    /// stored K/V mantissa is narrowed. The companion (dtype-agnostic, reads the fp32 partial
+    /// buffers) <see cref="AttentionSplitKvCombine"/> is reused unchanged.
+    ///
+    /// Push constants: { uint num_heads, uint num_kv_heads, uint head_dim, uint seq_len, uint n_splits }.
+    /// Bindings: 0=Q[num_heads*head_dim] (float), 1=K_cache (uint, fp16-packed),
+    ///           2=V_cache (uint, fp16-packed), 3=partial_o[num_heads*n_splits*head_dim] (float),
+    ///           4=partial_meta[num_heads*n_splits*2] (float).
+    /// </summary>
+    internal const string AttentionSplitKvPartialBf16 = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Q          { float q_data[]; };
+        layout(binding = 1) readonly buffer KCache     { uint k_cache[]; };
+        layout(binding = 2) readonly buffer VCache     { uint v_cache[]; };
+        layout(binding = 3) buffer PartialO            { float partial_o[]; };
+        layout(binding = 4) buffer PartialMeta         { float partial_meta[]; };
+
+        layout(push_constant) uniform Params {
+            uint num_heads;
+            uint num_kv_heads;
+            uint head_dim;
+            uint seq_len;
+            uint n_splits;
+        };
+
+        const uint CHUNK = 512u;
+        shared float sk_scores[512];   // per-slice scores (≤ CHUNK)
+        shared float sdata[256];       // reduction scratch
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint h = gl_WorkGroupID.x;   // query head
+            uint s = gl_WorkGroupID.y;   // KV split
+            if (h >= num_heads || s >= n_splits) return;
+
+            uint meta_off = (h * n_splits + s) * 2u;
+            uint t0 = s * CHUNK;
+            // Out-of-range split (fixed n_splits, short seq_len): mark empty and bail so the
+            // combine skips it (scale = exp(−inf − gmax) = 0) and never reads a stale numerator.
+            if (t0 >= seq_len) {
+                if (tid == 0u) { partial_meta[meta_off] = -1.0/0.0; partial_meta[meta_off + 1u] = 0.0; }
+                return;
+            }
+            uint t1 = t0 + CHUNK; if (t1 > seq_len) t1 = seq_len;
+            uint n = t1 - t0;   // 1 ≤ n ≤ CHUNK
+
+            uint kv_head = h / (num_heads / num_kv_heads);
+            uint kv_dim  = num_kv_heads * head_dim;
+            float scale  = inversesqrt(float(head_dim));
+            uint q_off   = h * head_dim;
+            uint kv_base = t0 * kv_dim + kv_head * head_dim;   // first row of this slice for this kv head
+
+            // ─── Phase 1: scores for the slice → shared (indexed t − t0) ───
+            // Read each packed fp16 word once (two K elements at a time). kv_base + t*kv_dim is
+            // even (head_dim is even — see the GpuForwardPass guard) so >>1 is the exact word base
+            // and consecutive d,d+1 are the two halves of word k_off_half+dh — mirrors AttentionBf16.
+            for (uint t = tid; t < n; t += 256u) {
+                float dot = 0.0;
+                uint k_off_half = (kv_base + t * kv_dim) >> 1;
+                for (uint dh = 0u; dh < (head_dim >> 1); dh++) {
+                    uint d = dh << 1;
+                    vec2 kv = unpackHalf2x16(k_cache[k_off_half + dh]);
+                    dot += q_data[q_off + d] * kv.x + q_data[q_off + d + 1u] * kv.y;
+                }
+                sk_scores[t] = dot * scale;
+            }
+            barrier();
+
+            // ─── Phase 2: local max over the slice ───
+            float local_max = -1.0/0.0;
+            for (uint t = tid; t < n; t += 256u) local_max = max(local_max, sk_scores[t]);
+            sdata[tid] = local_max;
+            barrier();
+            [[unroll]] for (uint r = 128u; r > 0u; r >>= 1) {
+                if (tid < r) sdata[tid] = max(sdata[tid], sdata[tid + r]);
+                barrier();
+            }
+            float m_i = sdata[0];
+            barrier();
+
+            // exp(score − m_i) in place + local denom.
+            float local_sum = 0.0;
+            for (uint t = tid; t < n; t += 256u) {
+                float e = exp(sk_scores[t] - m_i);
+                sk_scores[t] = e;
+                local_sum += e;
+            }
+            sdata[tid] = local_sum;
+            barrier();
+            [[unroll]] for (uint r = 128u; r > 0u; r >>= 1) {
+                if (tid < r) sdata[tid] += sdata[tid + r];
+                barrier();
+            }
+            float l_i = sdata[0];
+            barrier();
+
+            if (tid == 0u) { partial_meta[meta_off] = m_i; partial_meta[meta_off + 1u] = l_i; }
+
+            // ─── Phase 3: UN-normalized weighted-V numerator for this slice ───
+            // Each thread owns ONE output dim d. Hoist the per-d word/component selection out of the
+            // t-loop and walk the V row word base incrementally (kv_base>>1 is this slice's t=0 word
+            // base; head_dim is even) — mirrors AttentionBf16's Phase 3.
+            uint o_off = (h * n_splits + s) * head_dim;
+            for (uint d = tid; d < head_dim; d += 256u) {
+                uint d_half = d >> 1;
+                uint component = d & 1u;
+                uint v_off_half = (kv_base >> 1) + d_half;
+                uint kv_dim_half = kv_dim >> 1;
+                float acc = 0.0;
+                for (uint t = 0u; t < n; t++) {
+                    float vv = unpackHalf2x16(v_cache[v_off_half])[component];
+                    acc += sk_scores[t] * vv;
+                    v_off_half += kv_dim_half;
+                }
+                partial_o[o_off + d] = acc;
+            }
+        }
+        """;
+
+    /// <summary>
+    /// q8_0 (issue #332) variant of <see cref="AttentionSplitKvPartial"/>: control flow is
+    /// IDENTICAL to the fp32 partial; the ONLY difference is that the K/V cache buffers
+    /// (bindings 1, 2) hold ggml <c>block_q8_0</c> (34 bytes/block = fp16 scale + 32 int8) and
+    /// every element read becomes a byte-gather + dequant <c>value = fp16(d) * int8</c> — the
+    /// same <c>loadK</c>/<c>loadV</c> idiom as <see cref="AttentionQ8_0"/>. Element addressing
+    /// (<c>kv_base + t*kv_dim + d</c>) is identical to fp32; per absolute element <c>e</c>:
+    /// <c>blk=e&gt;&gt;5</c>, <c>lane=e&amp;31</c>, <c>b0=blk*34</c>. kv_dim%32==0 (enforced in
+    /// GpuForwardPass), so a KV row's blocks never straddle a row. All scores / softmax / value
+    /// accumulation stay fp32; only the stored K/V is narrowed. The companion
+    /// <see cref="AttentionSplitKvCombine"/> (reads the fp32 partial buffers) is reused unchanged.
+    ///
+    /// Push constants: { uint num_heads, uint num_kv_heads, uint head_dim, uint seq_len, uint n_splits }.
+    /// Bindings: 0=Q[num_heads*head_dim] (float), 1=K_cache (uint, block_q8_0),
+    ///           2=V_cache (uint, block_q8_0), 3=partial_o[num_heads*n_splits*head_dim] (float),
+    ///           4=partial_meta[num_heads*n_splits*2] (float).
+    /// </summary>
+    internal const string AttentionSplitKvPartialQ8 = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Q          { float q_data[]; };
+        layout(binding = 1) readonly buffer KCache     { uint k_cache[]; };
+        layout(binding = 2) readonly buffer VCache     { uint v_cache[]; };
+        layout(binding = 3) buffer PartialO            { float partial_o[]; };
+        layout(binding = 4) buffer PartialMeta         { float partial_meta[]; };
+
+        layout(push_constant) uniform Params {
+            uint num_heads;
+            uint num_kv_heads;
+            uint head_dim;
+            uint seq_len;
+            uint n_splits;
+        };
+
+        const uint CHUNK = 512u;
+        shared float sk_scores[512];   // per-slice scores (≤ CHUNK)
+        shared float sdata[256];       // reduction scratch
+
+        // Sign-extend a single int8 byte in one bitfieldExtract (no ternary branch).
+        int gInt8K(uint b) { return bitfieldExtract(int(k_cache[b >> 2]), int((b & 3u) * 8u), 8); }
+        int gInt8V(uint b) { return bitfieldExtract(int(v_cache[b >> 2]), int((b & 3u) * 8u), 8); }
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint h = gl_WorkGroupID.x;   // query head
+            uint s = gl_WorkGroupID.y;   // KV split
+            if (h >= num_heads || s >= n_splits) return;
+
+            uint meta_off = (h * n_splits + s) * 2u;
+            uint t0 = s * CHUNK;
+            // Out-of-range split (fixed n_splits, short seq_len): mark empty and bail so the
+            // combine skips it (scale = exp(−inf − gmax) = 0) and never reads a stale numerator.
+            if (t0 >= seq_len) {
+                if (tid == 0u) { partial_meta[meta_off] = -1.0/0.0; partial_meta[meta_off + 1u] = 0.0; }
+                return;
+            }
+            uint t1 = t0 + CHUNK; if (t1 > seq_len) t1 = seq_len;
+            uint n = t1 - t0;   // 1 ≤ n ≤ CHUNK
+
+            uint kv_head = h / (num_heads / num_kv_heads);
+            uint kv_dim  = num_kv_heads * head_dim;
+            float scale  = inversesqrt(float(head_dim));
+            uint q_off   = h * head_dim;
+            uint kv_base = t0 * kv_dim + kv_head * head_dim;   // first row of this slice for this kv head
+
+            // ─── Phase 1: scores for the slice → shared (indexed t − t0) ───
+            // Load each block's fp16 scale ONCE per 32-element block (head_dim & kv_dim are
+            // multiples of 32 — enforced in GpuForwardPass), then dequant the 32 int8 lanes with it.
+            // Mirrors AttentionQ8_0's read pattern; scale-once instead of per-element loadK.
+            for (uint t = tid; t < n; t += 256u) {
+                float dot = 0.0;
+                uint k_off = kv_base + t * kv_dim;
+                uint blk_start = k_off >> 5;
+                for (uint blk = 0u; blk < (head_dim >> 5); blk++) {
+                    uint b0 = (blk_start + blk) * 34u;
+                    // b0 = blk*34 is even, so the two scale bytes [b0, b0+1] live in the same word.
+                    uint w = k_cache[b0 >> 2];
+                    float dsc = unpackHalf2x16((w >> ((b0 & 3u) * 8u)) & 0xFFFFu).x;
+                    uint q_blk_off = q_off + blk * 32u;
+                    for (uint lane = 0u; lane < 32u; lane++) {
+                        dot += q_data[q_blk_off + lane] * (dsc * float(gInt8K(b0 + 2u + lane)));
+                    }
+                }
+                sk_scores[t] = dot * scale;
+            }
+            barrier();
+
+            // ─── Phase 2: local max over the slice ───
+            float local_max = -1.0/0.0;
+            for (uint t = tid; t < n; t += 256u) local_max = max(local_max, sk_scores[t]);
+            sdata[tid] = local_max;
+            barrier();
+            [[unroll]] for (uint r = 128u; r > 0u; r >>= 1) {
+                if (tid < r) sdata[tid] = max(sdata[tid], sdata[tid + r]);
+                barrier();
+            }
+            float m_i = sdata[0];
+            barrier();
+
+            // exp(score − m_i) in place + local denom.
+            float local_sum = 0.0;
+            for (uint t = tid; t < n; t += 256u) {
+                float e = exp(sk_scores[t] - m_i);
+                sk_scores[t] = e;
+                local_sum += e;
+            }
+            sdata[tid] = local_sum;
+            barrier();
+            [[unroll]] for (uint r = 128u; r > 0u; r >>= 1) {
+                if (tid < r) sdata[tid] += sdata[tid + r];
+                barrier();
+            }
+            float l_i = sdata[0];
+            barrier();
+
+            if (tid == 0u) { partial_meta[meta_off] = m_i; partial_meta[meta_off + 1u] = l_i; }
+
+            // ─── Phase 3: UN-normalized weighted-V numerator for this slice ───
+            // Each thread owns ONE output dim d. Hoist the block index to a linear recurrence over t
+            // (base_blk = this slice's t=0 block for dim d; stride_blk = kv_dim in blocks) so the
+            // per-block scale is read once per t — mirrors AttentionQ8_0's Phase 3.
+            uint o_off = (h * n_splits + s) * head_dim;
+            for (uint d = tid; d < head_dim; d += 256u) {
+                uint d_blk = d >> 5;
+                uint lane = d & 31u;
+                uint base_blk = (kv_base >> 5) + d_blk;
+                uint stride_blk = kv_dim >> 5;
+                float acc = 0.0;
+                for (uint t = 0u; t < n; t++) {
+                    uint b0 = (base_blk + t * stride_blk) * 34u;
+                    uint w = v_cache[b0 >> 2];
+                    float dsc = unpackHalf2x16((w >> ((b0 & 3u) * 8u)) & 0xFFFFu).x;
+                    float vv = dsc * float(gInt8V(b0 + 2u + lane));
+                    acc += sk_scores[t] * vv;
+                }
+                partial_o[o_off + d] = acc;
             }
         }
         """;
