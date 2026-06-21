@@ -945,10 +945,11 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             result = _gpu.Upload(floats, TensorShape.D1(floats.Length));
             _weightDTypes[result.Handle] = DType.Float32;
         }
-        else if (info.DType == DType.Q4_K || info.DType == DType.Q6_K)
+        else if (IsRawGpuQuant(info.DType))
         {
-            // Upload raw quantized bytes (reinterpret as floats for storage buffer)
-            int floatCount = data.Length / 4;
+            // Upload raw quantized bytes (reinterpret as floats for storage buffer).
+            // Round up: Q8_0 (34B) / Q4_0 (18B) blocks can make a non-4-multiple total.
+            int floatCount = (data.Length + 3) / 4;
             var rawFloats = new float[floatCount];
             data.CopyTo(MemoryMarshal.AsBytes(rawFloats.AsSpan()));
             result = _gpu.Upload(rawFloats, TensorShape.D1(floatCount));
@@ -1007,9 +1008,9 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         int byteOffset = expertIdx * expertBytes;
         var expertData = data.Slice(byteOffset, expertBytes);
 
-        if (info.DType == DType.Q4_K || info.DType == DType.Q6_K)
+        if (IsRawGpuQuant(info.DType))
         {
-            int floatCount = expertData.Length / 4;
+            int floatCount = (expertData.Length + 3) / 4;
             var rawFloats = new float[floatCount];
             expertData.CopyTo(MemoryMarshal.AsBytes(rawFloats.AsSpan()));
             var result = _gpu.Upload(rawFloats, TensorShape.D1(floatCount));
@@ -1227,9 +1228,17 @@ public sealed unsafe class GpuForwardPass : IForwardPass
 
     private static long EstimateGpuTensorBytes(GgufTensorInfo tensor)
     {
-        if (tensor.DType == DType.Float32 || tensor.DType == DType.Q4_K || tensor.DType == DType.Q6_K)
+        if (tensor.DType == DType.Float32 || IsRawGpuQuant(tensor.DType))
             return (tensor.ByteSize + 3) & ~3L;
 
         return tensor.ElementCount * sizeof(float);
     }
+
+    /// <summary>
+    /// Weight quantizations uploaded to the GPU as raw blocks (dequantized in-shader by the
+    /// matching <c>VulkanBackend.MatMul</c> matvec dispatch) rather than expanded to F32 on
+    /// the CPU. Keeping these quantized is the whole point of the GPU matvec shaders.
+    /// </summary>
+    private static bool IsRawGpuQuant(DType dtype) =>
+        dtype is DType.Q4_K or DType.Q6_K or DType.Q8_0 or DType.Q4_0;
 }

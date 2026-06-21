@@ -379,6 +379,131 @@ public sealed unsafe class VulkanShaderTests
         backend.Free(gpuOutput);
     }
 
+    // Q8_0 / Q4_0 matvec parity (issue #310). These use synthetic quantized blocks
+    // (no GGUF fixture needed): the bytes are dequantized by the codebase's own
+    // Dequantize.ToFloat32 for the CPU reference and by the new GLSL shader on the GPU,
+    // so identical bytes must yield matching dot products (only float-accumulation order
+    // differs). matRows is deliberately not a multiple of 8 to exercise the row guard.
+
+    [Fact]
+    public void MatVecQ8_0MatchesCpu()
+    {
+        const int matRows = 131;      // not a multiple of 8 → partial workgroup
+        const int matCols = 160;      // 5 blocks of 32
+        var weights = BuildQ8_0(matRows, matCols, seed: 1234);
+        AssertVulkanMatVecMatchesCpu(weights, matRows, matCols, DType.Q8_0, inputSeed: 7);
+    }
+
+    [Fact]
+    public void MatVecQ4_0MatchesCpu()
+    {
+        const int matRows = 131;
+        const int matCols = 160;
+        var weights = BuildQ4_0(matRows, matCols, seed: 4321);
+        AssertVulkanMatVecMatchesCpu(weights, matRows, matCols, DType.Q4_0, inputSeed: 7);
+    }
+
+    private static void AssertVulkanMatVecMatchesCpu(
+        byte[] weightBytes, int matRows, int matCols, DType dtype, int inputSeed)
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        // CPU reference: dequantize the same bytes, then naive matvec.
+        int totalElements = matRows * matCols;
+        var f32Weights = new float[totalElements];
+        SharpInference.Cpu.Dequantize.ToFloat32(weightBytes, f32Weights, dtype, totalElements);
+
+        var input = new float[matCols];
+        var rng = new Random(inputSeed);
+        for (int i = 0; i < matCols; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var cpuOutput = new float[matRows];
+        for (int r = 0; r < matRows; r++)
+        {
+            float sum = 0;
+            for (int c = 0; c < matCols; c++)
+                sum += f32Weights[r * matCols + c] * input[c];
+            cpuOutput[r] = sum;
+        }
+
+        // GPU: upload raw quantized bytes reinterpreted as floats (round up to 4 bytes).
+        int floatCount = (weightBytes.Length + 3) / 4;
+        var rawAsFloats = new float[floatCount];
+        weightBytes.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsBytes(rawAsFloats.AsSpan()));
+
+        var gpuWeights = backend.Upload(rawAsFloats, TensorShape.D1(floatCount));
+        var gpuInput = backend.Upload(input, TensorShape.D1(matCols));
+        var gpuOutput = backend.Allocate(TensorShape.D1(matRows));
+
+        backend.MatMul(gpuOutput, gpuWeights, gpuInput, dtype);
+
+        var gpuResult = new float[matRows];
+        backend.Download(gpuOutput, gpuResult);
+
+        int mismatches = 0;
+        for (int i = 0; i < matRows; i++)
+        {
+            float diff = MathF.Abs(gpuResult[i] - cpuOutput[i]);
+            float relDiff = diff / (MathF.Abs(cpuOutput[i]) + 1e-6f);
+            // Exact dequant on both sides → only accumulation-order error remains.
+            if (diff > 0.1f && relDiff > 0.02f)
+            {
+                if (mismatches < 3)
+                    Console.WriteLine($"  [{i}]: gpu={gpuResult[i]:F4} cpu={cpuOutput[i]:F4} abs={diff:E2} rel={relDiff:P2}");
+                mismatches++;
+            }
+        }
+        Console.WriteLine($"MatVec{dtype}: {mismatches}/{matRows} mismatches");
+        Assert.Equal(0, mismatches);
+
+        backend.Free(gpuWeights);
+        backend.Free(gpuInput);
+        backend.Free(gpuOutput);
+    }
+
+    private static void PutHalf(byte[] dst, int off, float value)
+    {
+        ushort h = BitConverter.HalfToUInt16Bits((Half)value);
+        dst[off] = (byte)(h & 0xFF);
+        dst[off + 1] = (byte)(h >> 8);
+    }
+
+    // Q8_0: 34 bytes/block = FP16 scale + 32 int8. Layout matches DequantQ8_0.
+    private static byte[] BuildQ8_0(int rows, int cols, int seed)
+    {
+        const int qk = 32, blockBytes = 34;
+        int blocksPerRow = cols / qk;
+        var bytes = new byte[rows * blocksPerRow * blockBytes];
+        var rng = new Random(seed);
+        int off = 0;
+        for (int b = 0; b < rows * blocksPerRow; b++)
+        {
+            PutHalf(bytes, off, (float)(rng.NextDouble() * 0.045 + 0.005));
+            for (int j = 0; j < qk; j++)
+                bytes[off + 2 + j] = (byte)(sbyte)(rng.Next(-127, 128));
+            off += blockBytes;
+        }
+        return bytes;
+    }
+
+    // Q4_0: 18 bytes/block = FP16 scale + 16 nibble bytes. Layout matches DequantQ4_0.
+    private static byte[] BuildQ4_0(int rows, int cols, int seed)
+    {
+        const int qk = 32, blockBytes = 18;
+        int blocksPerRow = cols / qk;
+        var bytes = new byte[rows * blocksPerRow * blockBytes];
+        var rng = new Random(seed);
+        int off = 0;
+        for (int b = 0; b < rows * blocksPerRow; b++)
+        {
+            PutHalf(bytes, off, (float)(rng.NextDouble() * 0.045 + 0.005));
+            for (int j = 0; j < qk / 2; j++)
+                bytes[off + 2 + j] = (byte)(rng.Next(0, 256)); // two packed nibbles
+            off += blockBytes;
+        }
+        return bytes;
+    }
+
     [Fact]
     public void GpuEmbedThenRmsNormMatchesCpu()
     {

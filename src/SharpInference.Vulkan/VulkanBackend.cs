@@ -978,6 +978,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _sigmoidPipeline;
     private ComputePipeline? _matVecQ4KPipeline;
     private ComputePipeline? _matVecQ6KPipeline;
+    private ComputePipeline? _matVecQ8_0Pipeline;
+    private ComputePipeline? _matVecQ4_0Pipeline;
     private ComputePipeline? _matVecF32Pipeline;
     private ComputePipeline? _kvAppendPipeline;
     private ComputePipeline? _attentionPipeline;
@@ -1201,6 +1203,14 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             case DType.Q6_K:
                 _matVecQ6KPipeline ??= new ComputePipeline(this, Shaders.MatVecQ6K, 3, pushConstantSize: sizeof(MatVecParams));
                 DispatchOrRecord(_matVecQ6KPipeline, bufs, (totalRows + 7) / 8, &p);
+                break;
+            case DType.Q8_0:
+                _matVecQ8_0Pipeline ??= new ComputePipeline(this, Shaders.MatVecQ8_0, 3, pushConstantSize: sizeof(MatVecParams));
+                DispatchOrRecord(_matVecQ8_0Pipeline, bufs, (totalRows + 7) / 8, &p);
+                break;
+            case DType.Q4_0:
+                _matVecQ4_0Pipeline ??= new ComputePipeline(this, Shaders.MatVecQ4_0, 3, pushConstantSize: sizeof(MatVecParams));
+                DispatchOrRecord(_matVecQ4_0Pipeline, bufs, (totalRows + 7) / 8, &p);
                 break;
             default: // Q4_K — 256 threads, 8 rows per workgroup, subgroupAdd reduction
                 _matVecQ4KPipeline ??= new ComputePipeline(this, Shaders.MatVecQ4K, 3, pushConstantSize: sizeof(MatVecParams));
@@ -1702,6 +1712,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _sigmoidPipeline?.Dispose();
         _matVecQ4KPipeline?.Dispose();
         _matVecQ6KPipeline?.Dispose();
+        _matVecQ8_0Pipeline?.Dispose();
+        _matVecQ4_0Pipeline?.Dispose();
         _matVecF32Pipeline?.Dispose();
         _kvAppendPipeline?.Dispose();
         _attentionPipeline?.Dispose();
