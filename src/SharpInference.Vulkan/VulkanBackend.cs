@@ -967,6 +967,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _headNormPipeline;
     private ComputePipeline? _headNormPurePipeline;
     private ComputePipeline? _siluMulPipeline;
+    private ComputePipeline? _siluPipeline;
     private ComputePipeline? _addInPlacePipeline;
     private ComputePipeline? _addScaledInPlacePipeline;
     private ComputePipeline? _scaleInPlacePipeline;
@@ -1083,7 +1084,14 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         DispatchOrRecord(_headNormPurePipeline, [GetBuffer(data)], numHeads, &p);
     }
 
-    public void SiLU(Tensor x) => throw new NotImplementedException("Use SiLuMul for fused SiLU*gate");
+    public void SiLU(Tensor x)
+    {
+        _siluPipeline ??= new ComputePipeline(this, Shaders.SiLU, 1, pushConstantSize: sizeof(CountParams));
+        var p = new CountParams { n = (uint)x.ElementCount };
+        // 64-bit arithmetic before the cast (activation buffers are small, but avoids
+        // any theoretical uint wrap that would dispatch 0 workgroups).
+        DispatchOrRecord(_siluPipeline, [GetBuffer(x)], (uint)((x.ElementCount + 255) / 256), &p);
+    }
 
     public void SiLuMul(Tensor gate, Tensor up)
     {
@@ -1701,6 +1709,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _headNormPipeline?.Dispose();
         _headNormPurePipeline?.Dispose();
         _siluMulPipeline?.Dispose();
+        _siluPipeline?.Dispose();
         _addInPlacePipeline?.Dispose();
         _addScaledInPlacePipeline?.Dispose();
         _scaleInPlacePipeline?.Dispose();

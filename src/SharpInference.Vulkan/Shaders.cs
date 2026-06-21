@@ -84,6 +84,29 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// SiLU (Swish) activation in-place: x[i] = x[i] * sigmoid(x[i]) = x[i] / (1 + exp(-x[i])).
+    /// Push constants: { uint n }.
+    /// Bindings: 0=x (in/out).
+    /// Standalone (unfused) counterpart to <see cref="SiLuMul"/>; matches the CPU
+    /// GdnKernels.SiLu / CUDA SiLUInPlace formula.
+    /// </summary>
+    internal const string SiLU = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer X { float x_data[]; };
+
+        layout(push_constant) uniform Params { uint n; };
+
+        void main() {
+            uint i = gl_GlobalInvocationID.x;
+            if (i >= n) return;
+            float x = x_data[i];
+            x_data[i] = x / (1.0 + exp(-x));
+        }
+        """;
+
+    /// <summary>
     /// Vector add in-place: dst[i] += src[i]
     /// Push constants: { uint n }.
     /// Bindings: 0=dst (in/out), 1=src (in).

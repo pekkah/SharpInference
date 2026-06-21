@@ -71,6 +71,35 @@ public sealed unsafe class VulkanShaderTests
     }
 
     [Fact]
+    public void SiLUMatchesCpu()
+    {
+        // Issue #314: standalone SiLU must honor the IComputeBackend contract
+        // (CPU and CUDA implement it; Vulkan previously threw NotImplementedException).
+        using var backend = new Vulkan.VulkanBackend();
+
+        const int N = 1031; // not a multiple of 256 → exercises the bounds guard
+        var input = new float[N];
+        var rng = new Random(123);
+        for (int i = 0; i < N; i++) input[i] = (float)(rng.NextDouble() * 20 - 10);
+
+        var gpuX = backend.Upload(input, TensorShape.D1(N));
+        backend.SiLU(gpuX);
+
+        var result = new float[N];
+        backend.Download(gpuX, result);
+
+        // CPU reference: x * sigmoid(x) = x / (1 + exp(-x)) (matches GdnKernels.SiLu).
+        for (int i = 0; i < N; i++)
+        {
+            float expected = input[i] / (1f + MathF.Exp(-input[i]));
+            Assert.True(MathF.Abs(result[i] - expected) < 1e-5f,
+                $"SiLU mismatch at [{i}]: gpu={result[i]}, cpu={expected}");
+        }
+
+        backend.Free(gpuX);
+    }
+
+    [Fact]
     public void SoftmaxSumsToOne()
     {
         using var backend = new Vulkan.VulkanBackend();
