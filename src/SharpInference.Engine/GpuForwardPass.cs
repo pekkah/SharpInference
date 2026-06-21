@@ -225,7 +225,10 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         // max(_intermDim, _expertDim) would make an expert MatMul write _intermDim rows
         // when only _expertDim are valid — the MoE-on-Vulkan garble that's been chased
         // since #2. Pure-MoE and pure-dense models both fall out correctly from this.
-        int ffnScratchDim = _isMoE ? _expertDim : _intermDim;
+        // Sizing is centralized in ComputeFfnScratchDim and enforced by
+        // ValidateFfnScratchDim so the MoE-vs-dense distinction can't drift (issue #315).
+        int ffnScratchDim = ComputeFfnScratchDim(_isMoE, _intermDim, _expertDim);
+        ValidateFfnScratchDim(_isMoE, ffnScratchDim, _intermDim, _expertDim);
         _ffnGate = gpu.Allocate(TensorShape.D1(ffnScratchDim));
         _ffnUp = gpu.Allocate(TensorShape.D1(ffnScratchDim));
         _logits = gpu.Allocate(TensorShape.D1(hp.VocabSize));
@@ -1224,6 +1227,39 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         if (_snapKvScoreScratch is { } scrBuf && _snapKvScoreScratchOwned) _gpu.Free(scrBuf);
 
         _kvCache.Dispose();
+    }
+
+    /// <summary>
+    /// FFN scratch dimension: MoE expert FFNs write _expertDim rows; dense FFNs write _intermDim.
+    /// Centralized so the MoE-vs-dense distinction can't drift (issue #315).
+    /// </summary>
+    internal static int ComputeFfnScratchDim(bool isMoE, int intermDim, int expertDim)
+        => isMoE ? expertDim : intermDim;
+
+    /// <summary>
+    /// Invariant guard for the FFN scratch buffers (issue #315 / "the MoE-on-Vulkan garble
+    /// chased since #2"). VulkanBackend.MatMul derives output row count from
+    /// output.ElementCount, so an expert MatMul writing into a buffer sized
+    /// max(_intermDim,_expertDim) would silently corrupt expert output. Fail loudly instead.
+    /// </summary>
+    internal static void ValidateFfnScratchDim(bool isMoE, int scratchDim, int intermDim, int expertDim)
+    {
+        if (isMoE)
+        {
+            if (expertDim <= 0)
+                throw new InvalidOperationException(
+                    "MoE model (IsMoE=true) but ExpertIntermediateDim is 0 — check GGUF metadata.");
+            if (scratchDim != expertDim)
+                throw new InvalidOperationException(
+                    $"MoE FFN scratch dim {scratchDim} must equal _expertDim {expertDim}, " +
+                    $"not max(_intermDim={intermDim}, _expertDim={expertDim}). Expert MatMuls write " +
+                    "_expertDim rows; an oversized buffer corrupts expert output (issue #315).");
+        }
+        else if (scratchDim != intermDim)
+        {
+            throw new InvalidOperationException(
+                $"Dense FFN scratch dim {scratchDim} must equal _intermDim {intermDim} (issue #315).");
+        }
     }
 
     private static long EstimateGpuTensorBytes(GgufTensorInfo tensor)
