@@ -676,8 +676,9 @@ internal static class Shaders
             uint h = idx / head_dim;
             uint j = idx % head_dim;
             uint src_base = h * head_dim * 2u;
-            q_data[h * head_dim + j] = qg_data[src_base + j];
-            g_data[h * head_dim + j] = qg_data[src_base + head_dim + j];
+            // dst index == idx (h*head_dim + j); only the src stride needs the 2x.
+            q_data[idx] = qg_data[src_base + j];
+            g_data[idx] = qg_data[src_base + head_dim + j];
         }
         """;
 

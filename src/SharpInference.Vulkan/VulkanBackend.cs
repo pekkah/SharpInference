@@ -1487,6 +1487,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     {
         if (!neox)
             throw new ArgumentException("RoPEPartial currently supports only neox=true.", nameof(neox));
+        if (headDim < 1)
+            throw new ArgumentOutOfRangeException(nameof(headDim), headDim, "headDim must be >= 1.");
         if (ropeDim <= 0 || (ropeDim & 1) != 0)
             throw new ArgumentException("ropeDim must be a positive even number.", nameof(ropeDim));
         if (ropeDim > headDim)
@@ -1515,6 +1517,13 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     /// </summary>
     public void SplitQG(Tensor q, Tensor g, Tensor qg, int numHeads, int headDim)
     {
+        // Guard positivity first: a negative numHeads/headDim could make the products below
+        // positive (e.g. -1 * -256 * 2 = 512) and slip past the element-count checks, then cast
+        // to a huge uint dispatch / OOB access.
+        if (numHeads < 1)
+            throw new ArgumentOutOfRangeException(nameof(numHeads), numHeads, "numHeads must be >= 1.");
+        if (headDim < 1)
+            throw new ArgumentOutOfRangeException(nameof(headDim), headDim, "headDim must be >= 1.");
         long expected = (long)numHeads * headDim * 2;
         if (qg.ElementCount != expected)
             throw new ArgumentException(
