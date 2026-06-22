@@ -806,6 +806,13 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         if (settings.DraftModelPath is not null || settings.DraftLookup)
         {
             bool cudaSpecTarget = gpuFwd is CudaForwardPass { SupportsBatchVerify: true };
+            // Vulkan full-offload of a dense Q4_K/Q6_K model exposes the same weight-amortized
+            // BatchVerify (issue #308). gemma4/TurboQuant report SupportsBatchVerify=false (no spec);
+            // MoE/bias models report true but stay on the bit-exact K-loop fallback (still lossless,
+            // just not weight-amortized). --draft-LOOKUP only on Vulkan; --draft-model (needs a 2nd
+            // GpuForwardPass + VRAM mgmt) is a CUDA-only follow-up.
+            bool vulkanSpecTarget = gpuFwd is GpuForwardPass { SupportsBatchVerify: true };
+            bool gpuSpecTarget = cudaSpecTarget || vulkanSpecTarget;
             // Sampled speculative decoding (issue #178): temp>0 now drives distribution-preserving
             // spec sampling on the model-draft path (greedy at temp 0 stays byte-stable). Gated to
             // model drafts (lookup proposals expose no q), to non-penalized/-biased sampling (draft
@@ -819,9 +826,15 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 AnsiConsole.MarkupLine("[red]Error:[/] --draft-model and --draft-lookup are mutually exclusive.");
                 return 1;
             }
-            if (nGpuLayers != 0 && !cudaSpecTarget)
+            if (nGpuLayers != 0 && !gpuSpecTarget)
             {
-                AnsiConsole.MarkupLine("[yellow]Warning:[/] Speculative decoding requires pure CPU (-g 0) or full CUDA offload of a dense or Gemma-4 model. Falling back to normal generation.");
+                AnsiConsole.MarkupLine("[yellow]Warning:[/] Speculative decoding requires pure CPU (-g 0), full CUDA offload of a dense or Gemma-4 model, or full Vulkan offload of a dense Q4_K/Q6_K model (--draft-lookup). Falling back to normal generation.");
+            }
+            else if (vulkanSpecTarget && settings.DraftModelPath is not null)
+            {
+                // --draft-model needs a 2nd GpuForwardPass + VRAM management on Vulkan; not yet
+                // wired. Guard before the draft-model branch's (CudaForwardPass)gpuFwd cast.
+                AnsiConsole.MarkupLine("[yellow]Warning:[/] --draft-model speculative decoding is not yet supported on Vulkan (use --draft-lookup, or CUDA); falling back to normal generation.");
             }
             else if (sampledSpec && settings.DraftLookup)
             {
@@ -842,7 +855,9 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 // batched-verify step. Floor is ~baseline (no match → plain decode step).
                 try
                 {
-                    IForwardPass lookupTarget = cudaSpecTarget ? (CudaForwardPass)gpuFwd! : fwd!;
+                    // gpuFwd is the CudaForwardPass or GpuForwardPass (both IForwardPass) on a GPU
+                    // spec target; fall back to the CPU pass otherwise.
+                    IForwardPass lookupTarget = gpuSpecTarget ? (IForwardPass)gpuFwd! : fwd!;
                     AnsiConsole.MarkupLine($"[dim]Speculative decoding: prompt-lookup (n-gram) drafting | Lookahead k={settings.SpecLookahead}[/]");
                     if (settings.Prompt is not null)
                         return RunSpeculativeSinglePrompt(settings, lookupTarget, null, tokenizer, sp, rng);
