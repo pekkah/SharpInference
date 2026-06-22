@@ -37,9 +37,10 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     private readonly Tensor _ffnUp;      // [intermDim]
     private readonly Tensor _logits;     // [vocabSize]
 
-    // Embedding table in VRAM (quantized for large vocabs, F32 for small)
+    // Embedding table in VRAM (kept raw-quantized for Q4_K/Q6_K large vocabs, F32 for small/other).
+    // _embDType records which path was taken so the lookup dispatches the matching shader.
     private readonly Tensor _gpuEmbedding;
-    private readonly bool _embIsQuantized;
+    private readonly DType _embDType;
 
     // GPU weight tensors (Q4_K/Q6_K bytes uploaded to VRAM)
     private readonly Tensor[] _wAttnNorm;
@@ -147,24 +148,67 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     // value is narrowed.
     private readonly DType _kvDType;
 
+    // ── Gemma 4 (issue #309) ────────────────────────────────────────────────
+    // The whole gemma4 trunk is dispatched from ForwardGemma4 when _isGemma4. The
+    // per-layer head_dim varies (256 SWA / 512 global), so _maxHeadDim sizes the
+    // Q/K/V/attnOut scratch for the widest layer and per-layer Tensor VIEWS carve
+    // out the active rows. This gemma4-v2 variant has PLE disabled
+    // (embedding_length_per_layer_input=0) and shared_kv_layers=0 (no KV aliasing),
+    // so neither path is wired here.
+    private readonly bool _isGemma4;
+    private readonly int _maxHeadDim;
+    private readonly float _ropeThetaSwa;
+    // Per-layer post-norms (sandwich norm), per-head Q/K norm, per-layer output scale.
+    private readonly Tensor[]? _wPostAttnNorm;
+    private readonly Tensor[]? _wPostFfwNorm;
+    private readonly Tensor[]? _wQNormG4;   // per-layer attn_q_norm (gemma4; [layerHd])
+    private readonly Tensor[]? _wKNormG4;   // per-layer attn_k_norm (gemma4; [layerHd])
+    private readonly float[]? _layerOutputScale;
+    // Optional rope_freqs.weight table (size = maxHeadDim/2), applied on global layers only.
+    private readonly Tensor? _gpuRopeFreqs;
+
     public GpuForwardPass(GgufModel model, VulkanBackend gpu, ModelHyperparams hp,
         int maxContextLength = 0, bool enableTurboQuant = false, int tqFp32Window = 256, int tqBits = 3,
         DType kvDtype = DType.Float32)
     {
-        // Gemma 4's per-layer head_dim, sliding-window attention, PLE injection, KV-share tail,
-        // and final-logit softcap have no Vulkan implementation — only CUDA and CPU. Running it
-        // here would silently produce garbage (generic dense path with wrong dims / no PLE / no
-        // softcap), so reject up front. hp.LayerHeadDim is the gemma4 master switch.
-        if (hp.LayerHeadDim is not null)
-            throw new NotSupportedException(
-                "Gemma 4 models are not supported on the Vulkan backend (no SWA / PLE / per-layer " +
-                "head_dim / softcap kernels). Use the CUDA backend (-g) or CPU (NGpuLayers=0).");
+        // Gemma 4 master switch: hp.LayerHeadDim is non-null only for gemma4-family models.
+        // The full gemma4 trunk (per-layer head_dim, SWA, dual RoPE + rope_freqs, sandwich
+        // norms, V-norm, attn_scale=1.0, final softcap, k_eq_v globals) is implemented in
+        // ForwardGemma4 / RunGemma4Layers (issue #309). PLE and shared-KV are NOT wired (this
+        // gemma4-v2 variant has both disabled); reject up front if a future GGUF enables them.
+        _isGemma4 = hp.LayerHeadDim is not null;
+        if (_isGemma4)
+        {
+            if (hp.HasPerLayerTokenEmbd)
+                throw new NotSupportedException(
+                    "Gemma 4 PLE (embedding_length_per_layer_input > 0) is not implemented on the " +
+                    "Vulkan backend (issue #309 scope: PLE-disabled gemma4 only). Use CUDA (-g) or CPU.");
+            if (hp.KvSourceLayer is { } ksl)
+                for (int i = 0; i < ksl.Count; i++)
+                    if (ksl[i] >= 0)
+                        throw new NotSupportedException(
+                            "Gemma 4 shared-KV layers (shared_kv_layers > 0) are not implemented on the " +
+                            "Vulkan backend (issue #309 scope). Use CUDA (-g) or CPU.");
+            if (enableTurboQuant)
+                throw new NotSupportedException("TurboQuant is not supported for Gemma 4 on Vulkan.");
+            if (kvDtype != DType.Float32)
+                throw new NotSupportedException(
+                    "Gemma 4 on Vulkan supports only fp32 KV (the narrowed-KV append/attention shaders " +
+                    "are not wired for per-layer head_dim / SWA). Use --kv-type fp32.");
+        }
 
         _model = model;
         _gpu = gpu;
         _hp = hp;
         _tqEnabled = enableTurboQuant;
         _kvDType = kvDtype;
+
+        // Per-layer-max head_dim (gemma4: 256 SWA / 512 global). Mirrors CudaForwardPass.
+        _maxHeadDim = hp.HeadDim;
+        if (hp.LayerHeadDim is { } lhdMax)
+            for (int i = 0; i < hp.NumLayers; i++)
+                if (lhdMax[i] > _maxHeadDim) _maxHeadDim = lhdMax[i];
+        _ropeThetaSwa = hp.RopeThetaSwa;
 
         // Issues #311 / #325: the Vulkan KV cache supports fp32, a half-width (bf16) store, and a
         // block-quantized q8_0 store. Reject anything else up front rather than silently mis-store.
@@ -254,7 +298,19 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                 $"SHARPI_KV_DTYPE={_kvDType} + SnapKV is not yet implemented on Vulkan " +
                 "(SnapKvScore/KvCompact read the cache as fp32, but the narrowed store packs it; " +
                 "issue #325). Set SHARPI_SNAPKV_BUDGET=0 to disable SnapKV.");
-        if (_snapKvCfg.IsBudgetExplicit)
+        if (_isGemma4)
+        {
+            // SnapKV cannot compose with Gemma 4: its score/compaction shaders use the uniform
+            // _numHeads/_headDim, but gemma4 caches are per-layer-dimensioned (head_dim 256 SWA /
+            // 512 global, per-layer KV heads), so eviction would mis-index and corrupt the cache.
+            // Force it off (mirrors CudaForwardPass); warn only if a budget was explicitly set.
+            if (_snapKvCfg.IsBudgetExplicit && _snapKvCfg.Budget > 0)
+                Console.Error.WriteLine(
+                    "[GpuForwardPass] SnapKV is not supported for Gemma 4 (per-layer head_dim / SWA); " +
+                    "ignoring the budget and using the full KV cache.");
+            _snapKvEffectiveBudget = 0;
+        }
+        else if (_snapKvCfg.IsBudgetExplicit)
         {
             _snapKvEffectiveBudget = _snapKvCfg.Budget;
         }
@@ -288,10 +344,12 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         _hidden = gpu.Allocate(TensorShape.D1(_embDim));
         _residual = gpu.Allocate(TensorShape.D1(_embDim));
         _normBuf = gpu.Allocate(TensorShape.D1(_embDim));
-        _q = gpu.Allocate(TensorShape.D1(_numHeads * _headDim));
-        _k = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
-        _v = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
-        _attnOut = gpu.Allocate(TensorShape.D1(_numHeads * _headDim));
+        // Sized for the widest layer head_dim so gemma4 per-layer view tensors (256 SWA /
+        // 512 global) can carve out the active rows. Identity to _headDim for non-gemma4.
+        _q = gpu.Allocate(TensorShape.D1((long)_numHeads * _maxHeadDim));
+        _k = gpu.Allocate(TensorShape.D1((long)_numKvHeads * _maxHeadDim));
+        _v = gpu.Allocate(TensorShape.D1((long)_numKvHeads * _maxHeadDim));
+        _attnOut = gpu.Allocate(TensorShape.D1((long)_numHeads * _maxHeadDim));
         // Match CudaForwardPass: size scratch to the path this model actually uses.
         // MatMul derives row count from output.ElementCount, so a buffer sized
         // max(_intermDim, _expertDim) would make an expert MatMul write _intermDim rows
@@ -377,6 +435,22 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                 _gpuVCache[i] = gpu.Allocate(TensorShape.D1(words));
             }
         }
+        else if (_isGemma4)
+        {
+            // Gemma 4: per-layer KV geometry (8 GQA on SWA at head_dim 256, 1 MQA on global at
+            // head_dim 512). The Vulkan KvAppend shader has NO ring modulo, so EVERY layer —
+            // SWA included — is allocated at FULL context (more VRAM than CUDA's SWA ring, but
+            // correct). Mirrors FillKvCacheArrays minus the ring/alias (shared_kv=0 here). fp32
+            // is enforced for gemma4 above.
+            for (int i = 0; i < hp.NumLayers; i++)
+            {
+                int layerHd = hp.LayerHeadDim![i];
+                int layerKv = hp.LayerKvHeads is { } lkv ? lkv[i] : _numKvHeads;
+                long layerKvDim = (long)layerKv * layerHd;
+                _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * layerKvDim));
+                _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * layerKvDim));
+            }
+        }
         else
         {
             // Full FP32 cache: [maxSeqLen, kvDim] per layer
@@ -438,15 +512,40 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             _wqNorm = new Tensor[L]; _wkNorm = new Tensor[L];
         }
 
+        // Gemma 4: per-layer post-norms (sandwich norm), per-head Q/K norm (gemma4 keeps these in
+        // their own arrays so the per-layer-head_dim HeadNorm dims are unambiguous), and the
+        // per-layer scalar output gain. PLE is disabled in this variant.
+        if (_isGemma4)
+        {
+            if (hp.HasPostAttnNorm) _wPostAttnNorm = new Tensor[L];
+            if (hp.HasPostFfwNorm) _wPostFfwNorm = new Tensor[L];
+            if (hp.HasLayerOutputScale) _layerOutputScale = new float[L];
+            if (_hasQkNorm) { _wQNormG4 = new Tensor[L]; _wKNormG4 = new Tensor[L]; }
+        }
+
         Console.Error.Write($"[GpuForwardPass] Uploading {L} layers to VRAM...");
         for (int i = 0; i < L; i++)
         {
             _wAttnNorm[i] = UploadWeight($"blk.{i}.attn_norm.weight");
             _wq[i] = UploadWeight($"blk.{i}.attn_q.weight");
             _wk[i] = UploadWeight($"blk.{i}.attn_k.weight");
-            _wv[i] = UploadWeight($"blk.{i}.attn_v.weight");
+            // Gemma 4 12B global layers omit attn_v (attention_k_eq_v): V reuses the raw K
+            // projection — leave _wv[i] null and copy K→V at runtime. All other models always
+            // carry attn_v. Mirrors the CUDA upload probe.
+            if (!_isGemma4 || model.FindTensor($"blk.{i}.attn_v.weight") is not null)
+                _wv[i] = UploadWeight($"blk.{i}.attn_v.weight");
             _wo[i] = UploadWeight($"blk.{i}.attn_output.weight");
             _wFfnNorm[i] = UploadWeight($"blk.{i}.ffn_norm.weight");
+
+            if (_isGemma4)
+            {
+                if (_wPostAttnNorm is not null)
+                    _wPostAttnNorm[i] = UploadWeight($"blk.{i}.post_attention_norm.weight");
+                if (_wPostFfwNorm is not null)
+                    _wPostFfwNorm[i] = UploadWeight($"blk.{i}.post_ffw_norm.weight");
+                if (_layerOutputScale is not null)
+                    _layerOutputScale[i] = LoadScalarF32($"blk.{i}.layer_output_scale.weight");
+            }
             if (_isMoE)
             {
                 _wGateInp![i] = UploadWeight($"blk.{i}.ffn_gate_inp.weight");
@@ -478,16 +577,27 @@ public sealed unsafe class GpuForwardPass : IForwardPass
 
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
-                _wqNorm![i] = UploadWeight($"blk.{i}.attn_q_norm.weight");
-                _wkNorm![i] = UploadWeight($"blk.{i}.attn_k_norm.weight");
+                if (_isGemma4)
+                {
+                    // Gemma 4 has per-head Q/K norm too, but the weight is [layerHd] so it lives in
+                    // a separate array indexed at the layer's head_dim (256 SWA / 512 global).
+                    _wQNormG4![i] = UploadWeight($"blk.{i}.attn_q_norm.weight");
+                    _wKNormG4![i] = UploadWeight($"blk.{i}.attn_k_norm.weight");
+                }
+                else
+                {
+                    _wqNorm![i] = UploadWeight($"blk.{i}.attn_q_norm.weight");
+                    _wkNorm![i] = UploadWeight($"blk.{i}.attn_k_norm.weight");
+                }
             }
 
             Console.Error.Write(".");
         }
-        // Upload embedding table to VRAM — keep quantized for Q4_K to save VRAM
+        // Upload embedding table to VRAM — keep raw-quantized for Q4_K/Q6_K to save VRAM
+        // (the F32 dequant of a [3840, 262144] Q6_K table would burn ~4 GB; raw stays ~787 MiB).
         Console.Error.Write(" emb...");
         var embInfo = model.FindTensor("token_embd.weight")!.Value;
-        if (embInfo.DType == DType.Q4_K)
+        if (embInfo.DType is DType.Q4_K or DType.Q6_K)
         {
             // Upload raw quantized bytes (reinterpret as uint32 for storage buffer)
             var embData = model.GetTensorData(embInfo);
@@ -495,8 +605,8 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             var raw = new float[floatCount];
             embData.CopyTo(MemoryMarshal.AsBytes(raw.AsSpan()));
             _gpuEmbedding = gpu.Upload(raw, TensorShape.D1(floatCount));
-            _embIsQuantized = true;
-            _weightDTypes[_gpuEmbedding.Handle] = DType.Q4_K;
+            _embDType = embInfo.DType;
+            _weightDTypes[_gpuEmbedding.Handle] = embInfo.DType;
         }
         else
         {
@@ -505,7 +615,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             var embF32 = new float[(int)embInfo.ElementCount];
             Dequantize.ToFloat32(embData, embF32, embInfo.DType, embInfo.ElementCount);
             _gpuEmbedding = gpu.Upload(embF32, TensorShape.D1(embF32.Length));
-            _embIsQuantized = false;
+            _embDType = DType.Float32;
             _weightDTypes[_gpuEmbedding.Handle] = DType.Float32;
         }
 
@@ -513,6 +623,18 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         _wOutput = model.FindTensor("output.weight") is not null
             ? UploadWeight("output.weight")
             : _gpuEmbedding;
+
+        // Gemma 4: optional `rope_freqs.weight` (size = maxHeadDim/2) masks the global-layer RoPE
+        // high-frequency tail (~identity for long context). CPU bakes this into its precomputed
+        // RoPE table; here it's applied live via RoPEWithFactors on non-SWA layers. Uploaded as a
+        // plain F32 tensor (matches CUDA's UploadWeight + RoPEWithFactors path).
+        if (_isGemma4
+            && model.FindTensor("rope_freqs.weight") is GgufTensorInfo rfInfo
+            && rfInfo.DType == DType.Float32
+            && rfInfo.ElementCount == _maxHeadDim / 2)
+        {
+            _gpuRopeFreqs = UploadWeight("rope_freqs.weight");
+        }
 
         Console.Error.WriteLine(" done.");
     }
@@ -708,14 +830,14 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     /// </summary>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
+        if (_isGemma4)
+            return ForwardGemma4(token, position);
+
         // Record ALL dispatches into ONE command buffer
         _gpu.BeginRecord();
 
         // Embed token (GPU lookup from cached table — no PCIe transfer)
-        if (_embIsQuantized)
-            _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, (uint)token, (uint)_embDim);
-        else
-            _gpu.EmbedLookup(_gpuEmbedding, _hidden, (uint)token, (uint)_embDim);
+        DispatchEmbedLookup(token);
         _gpu.RecordBarrier();
 
         for (int layer = 0; layer < _hp.NumLayers; layer++)
@@ -963,6 +1085,231 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         _gpu.ReadFromStaging(_logitsBuf);
         _kvLength = Math.Max(_kvLength, position + 1);
         return _logitsBuf;
+    }
+
+    // ================================================================
+    //  Gemma 4 (issue #309)
+    // ================================================================
+
+    /// <summary>
+    /// Run one token through the Gemma 4 transformer on Vulkan. The faithful mirror of
+    /// <see cref="CudaForwardPass"/>'s <c>ForwardGemma4</c> + <c>RunGemma4DeviceRegion</c>:
+    /// per-layer head_dim (256 SWA / 512 global), per-head Q/K norm + plain V-norm, dual RoPE
+    /// (global theta + rope_freqs vs SWA theta), attention_scale = 1.0 (via a √head_dim Q
+    /// prescale so the shader's 1/√head_dim cancels), SWA windowing, k_eq_v global layers
+    /// (V = raw K projection), sandwich norm (post-attn / post-ffw RMSNorm BEFORE the residual
+    /// add), GELU-tanh FFN, per-layer output scale, and the final-logit softcap. PLE and
+    /// shared-KV are disabled in this variant (rejected at construction). All dispatches are
+    /// recorded into one command buffer and submitted once, like the dense Forward.
+    /// </summary>
+    private ReadOnlySpan<float> ForwardGemma4(int token, int position)
+    {
+        _gpu.BeginRecord();
+
+        // 1. Embedding lookup → scale by sqrt(embDim).
+        EmbedTokenGemma4(token);
+        _gpu.RecordBarrier();
+        if (_hp.EmbeddingScale != 1f)
+        {
+            _gpu.ScaleInPlace(_hidden, _hp.EmbeddingScale);
+            _gpu.RecordBarrier();
+        }
+
+        // 2. Transformer layers.
+        RunGemma4Layers(position);
+
+        // 3. Final norm + output projection + softcap.
+        _gpu.RmsNorm(_hidden, _hidden, _wOutputNorm, _hp.RmsNormEps);
+        _gpu.RecordBarrier();
+        GpuMatMul(_logits, _wOutput, _hidden);
+        if (_hp.FinalLogitSoftcap > 0f)
+        {
+            _gpu.RecordBarrier();
+            _gpu.SoftcapInPlace(_logits, _hp.FinalLogitSoftcap);
+        }
+
+        _gpu.RecordComputeToTransferBarrier();
+        _gpu.RecordDownloadToStaging(_logits, _logitsBuf.Length);
+        _gpu.EndRecordAndSubmit();
+        _gpu.ReadFromStaging(_logitsBuf);
+
+        _kvLength = Math.Max(_kvLength, position + 1);
+        return _logitsBuf;
+    }
+
+    /// <summary>Gemma 4 embedding gather. Mirrors the CUDA path, but Vulkan ships only
+    /// F32 + Q4_K + Q6_K embed-lookup shaders (the Q4_K_M tied embedding is Q4_K, the Q6_K
+    /// variant stays raw via EmbedLookupQ6K; any other quant is dequantized to F32 at
+    /// upload, taking the EmbedLookup path here).</summary>
+    private void EmbedTokenGemma4(int token) => DispatchEmbedLookup(token);
+
+    /// <summary>
+    /// Dispatch the embedding lookup for <paramref name="token"/> into <see cref="_hidden"/>,
+    /// choosing the shader by the embedding table's dtype. Q4_K and Q6_K tables are kept raw
+    /// in VRAM (see embedding-upload branch); everything else was dequantized to F32 at upload.
+    /// </summary>
+    private void DispatchEmbedLookup(int token)
+    {
+        switch (_embDType)
+        {
+            case DType.Q4_K:
+                _gpu.EmbedLookupQ4K(_gpuEmbedding, _hidden, (uint)token, (uint)_embDim);
+                break;
+            case DType.Q6_K:
+                _gpu.EmbedLookupQ6K(_gpuEmbedding, _hidden, (uint)token, (uint)_embDim);
+                break;
+            default:
+                _gpu.EmbedLookup(_gpuEmbedding, _hidden, (uint)token, (uint)_embDim);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// The per-layer Gemma 4 trunk, mirroring CUDA's <c>RunGemma4DeviceRegion</c> op-for-op.
+    /// Records into the in-progress command buffer (caller owns BeginRecord/EndRecordAndSubmit).
+    /// </summary>
+    private void RunGemma4Layers(int position)
+    {
+        int L = _hp.NumLayers;
+        for (int layer = 0; layer < L; layer++)
+        {
+            int layerHd = _hp.LayerHeadDim![layer];
+            int layerKv = _hp.LayerKvHeads is { } lkv ? lkv[layer] : _numKvHeads;
+            int qDimL = _numHeads * layerHd;
+            int kvDimL = layerKv * layerHd;
+            bool isSwa = _hp.IsSwaLayer is { } swa && swa[layer];
+            // Gemma 4 12B global layers carry no attn_v: V reuses the raw K projection
+            // (attention_k_eq_v). These layers always own their KV (shared_kv_layers=0).
+            bool kEqV = _hp.AttentionKEqV && !isSwa && _wv[layer] is null;
+
+            // Per-layer view tensors so each dispatch addresses exactly the active rows.
+            var qView = new Tensor(TensorShape.D1(qDimL), DType.Float32, _q.Handle);
+            var kView = new Tensor(TensorShape.D1(kvDimL), DType.Float32, _k.Handle);
+            var vView = new Tensor(TensorShape.D1(kvDimL), DType.Float32, _v.Handle);
+            var attnOutView = new Tensor(TensorShape.D1(qDimL), DType.Float32, _attnOut.Handle);
+
+            // a. attn_norm.
+            CopyBuffer(_residual, _hidden);
+            _gpu.RecordBarrier();
+            _gpu.RmsNorm(_normBuf, _hidden, _wAttnNorm[layer], _hp.RmsNormEps);
+            _gpu.RecordBarrier();
+
+            // b. Q/K/V projections (read normBuf; no conflict between them).
+            GpuMatMul(qView, _wq[layer], _normBuf);
+            GpuMatMul(kView, _wk[layer], _normBuf);
+            _gpu.RecordBarrier();
+            if (kEqV)
+                _gpu.RecordComputeCopy(vView, kView); // V = raw K projection (pre-norm, pre-RoPE)
+            else
+                GpuMatMul(vView, _wv[layer]!, _normBuf);
+            _gpu.RecordBarrier();
+
+            // c. Per-head Q/K norm (gemma4: shared [layerHd] weight per head, BEFORE RoPE).
+            if (_hasQkNorm && !_hp.UseL2QkNorm)
+            {
+                _gpu.HeadNorm(qView, _wQNormG4![layer], (uint)_numHeads, (uint)layerHd,
+                    _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                _gpu.HeadNorm(kView, _wKNormG4![layer], (uint)layerKv, (uint)layerHd,
+                    _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                _gpu.RecordBarrier();
+            }
+
+            // d. V-norm (REQUIRED): plain per-head RMSNorm (no learned weight) on every
+            //    KV-owning layer (E4B and 12B alike). V is never RoPE'd.
+            _gpu.HeadNormPure(vView, (uint)layerKv, (uint)layerHd, _hp.RmsNormEps);
+            _gpu.RecordBarrier();
+
+            // e. RoPE: global (non-SWA) layers use the rope_freqs table; SWA layers use plain
+            //    NEOX RoPE at the SWA theta. Gemma uses NEOX/half rotation.
+            float ropeTheta = isSwa ? _ropeThetaSwa : _hp.RopeTheta;
+            if (!isSwa && _gpuRopeFreqs is { } rfTbl)
+            {
+                _gpu.RoPEWithFactors(qView, position, layerHd, ropeTheta, rfTbl);
+                _gpu.RoPEWithFactors(kView, position, layerHd, ropeTheta, rfTbl);
+            }
+            else
+            {
+                _gpu.RoPE(qView, position, layerHd, ropeTheta, _hp.IsNeoxRope);
+                _gpu.RoPE(kView, position, layerHd, ropeTheta, _hp.IsNeoxRope);
+            }
+            _gpu.RecordBarrier();
+
+            // f. KV append (full context — the Vulkan shader has no SWA ring modulo).
+            _gpu.KvAppend(kView, vView, _gpuKCache[layer], _gpuVCache[layer],
+                (uint)kvDimL, (uint)position, (uint)_maxSeqLen);
+            _gpu.RecordBarrier();
+
+            // g. attn_scale = 1.0: gemma4 does NOT use 1/sqrt(head_dim). The shader divides the
+            //    score by sqrt(head_dim), so pre-scale Q by sqrt(head_dim) to cancel it to 1.0.
+            _gpu.ScaleInPlace(qView, MathF.Sqrt(layerHd));
+            _gpu.RecordBarrier();
+
+            // h. Attention. SWA layers pass the sliding-window bound; global layers pass 0
+            //    (full causal). Base fp32 Attention (Q4_K-free; fp32 KV).
+            _gpu.Attention(qView, _gpuKCache[layer], _gpuVCache[layer], attnOutView,
+                _attnScoresScratch,
+                (uint)_numHeads, (uint)layerKv, (uint)layerHd,
+                (uint)(position + 1), (uint)_maxSeqLen,
+                window: isSwa ? (uint)_hp.SlidingWindowSize : 0u);
+            _gpu.RecordBarrier();
+
+            // i. Output projection: _wo[layer] is [embDim, qDimL]; attnOutView has qDimL rows.
+            GpuMatMul(_hidden, _wo[layer], attnOutView);
+            _gpu.RecordBarrier();
+
+            // j. Sandwich norm: post-attn RMSNorm on the O output BEFORE the residual add.
+            if (_wPostAttnNorm is not null)
+            {
+                _gpu.RmsNorm(_hidden, _hidden, _wPostAttnNorm[layer], _hp.RmsNormEps);
+                _gpu.RecordBarrier();
+            }
+            _gpu.AddInPlace(_hidden, _residual);
+            _gpu.RecordBarrier();
+
+            // k. FFN: ffn_norm → gate/up → GELU-tanh → down.
+            CopyBuffer(_residual, _hidden);
+            _gpu.RecordBarrier();
+            _gpu.RmsNorm(_normBuf, _hidden, _wFfnNorm[layer], _hp.RmsNormEps);
+            _gpu.RecordBarrier();
+            GpuMatMul(_ffnGate, _wGate[layer], _normBuf);
+            GpuMatMul(_ffnUp, _wUp[layer], _normBuf);
+            _gpu.RecordBarrier();
+            _gpu.GeluTanhMul(_ffnGate, _ffnUp);
+            _gpu.RecordBarrier();
+            GpuMatMul(_hidden, _wDown[layer], _ffnGate);
+            _gpu.RecordBarrier();
+
+            // l. Sandwich norm: post-ffw RMSNorm on the down output BEFORE the residual add.
+            if (_wPostFfwNorm is not null)
+            {
+                _gpu.RmsNorm(_hidden, _hidden, _wPostFfwNorm[layer], _hp.RmsNormEps);
+                _gpu.RecordBarrier();
+            }
+            _gpu.AddInPlace(_hidden, _residual);
+            _gpu.RecordBarrier();
+
+            // m. Per-layer scalar output gain.
+            if (_layerOutputScale is not null)
+            {
+                _gpu.ScaleInPlace(_hidden, _layerOutputScale[layer]);
+                _gpu.RecordBarrier();
+            }
+        }
+    }
+
+    /// <summary>Load a single F32 scalar tensor (any source dtype) into a managed float. Used for
+    /// Gemma 4's per-layer <c>layer_output_scale.weight</c>. Mirrors the CUDA helper.</summary>
+    private float LoadScalarF32(string name)
+    {
+        var info = _model.FindTensor(name)
+            ?? throw new InvalidOperationException($"Missing tensor: {name}");
+        var data = _model.GetTensorData(info);
+        Span<float> buf = stackalloc float[1];
+        if (info.DType == DType.Float32)
+            MemoryMarshal.Cast<byte, float>(data).Slice(0, 1).CopyTo(buf);
+        else
+            Dequantize.ToFloat32(data, buf, info.DType, 1);
+        return buf[0];
     }
 
     // ================================================================
@@ -1329,7 +1676,23 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         // instead of BytesPerElement (which THROWS for the quantized q8_0 store, issue #325).
         // bf16 (#311) ~halves the per-token store and q8_0 (#325) ~quarters it, so the
         // auto-context buys ~2×/~4× the tokens under --kv-type bf16/q8_0 respectively.
-        long bytesPerToken = 2L * hp.NumLayers * DTypeInfo.ByteSize(hp.NumKvHeads * headDim, kvDType);
+        long bytesPerToken;
+        if (hp.LayerHeadDim is { } lhd)
+        {
+            // Gemma 4: per-layer KV geometry (head_dim 256/512, kv_heads 8/1). Every layer is
+            // allocated at full context on Vulkan (no SWA ring), so sum the per-layer K+V bytes.
+            long perToken = 0;
+            for (int i = 0; i < hp.NumLayers; i++)
+            {
+                int layerKv = hp.LayerKvHeads is { } lkv ? lkv[i] : hp.NumKvHeads;
+                perToken += 2L * DTypeInfo.ByteSize(layerKv * lhd[i], kvDType);
+            }
+            bytesPerToken = perToken;
+        }
+        else
+        {
+            bytesPerToken = 2L * hp.NumLayers * DTypeInfo.ByteSize(hp.NumKvHeads * headDim, kvDType);
+        }
 
         int maxCtx = (int)(available / bytesPerToken);
         maxCtx = Math.Clamp(maxCtx, 512, hp.ContextLength);
@@ -1349,7 +1712,10 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         for (int i = 0; i < _hp.NumLayers; i++)
         {
             _gpu.Free(_wAttnNorm[i]); _gpu.Free(_wFfnNorm[i]);
-            _gpu.Free(_wq[i]); _gpu.Free(_wk[i]); _gpu.Free(_wv[i]); _gpu.Free(_wo[i]);
+            _gpu.Free(_wq[i]); _gpu.Free(_wk[i]);
+            // Gemma 4 k_eq_v global layers have no attn_v (V reuses raw K) — _wv[i] is null.
+            if (_wv[i] is not null) _gpu.Free(_wv[i]);
+            _gpu.Free(_wo[i]);
             if (_isMoE)
             {
                 _gpu.Free(_wGateInp![i]);
@@ -1377,8 +1743,19 @@ public sealed unsafe class GpuForwardPass : IForwardPass
 
             if (_hasQkNorm && !_hp.UseL2QkNorm)
             {
-                _gpu.Free(_wqNorm![i]); _gpu.Free(_wkNorm![i]);
+                if (_isGemma4)
+                {
+                    _gpu.Free(_wQNormG4![i]); _gpu.Free(_wKNormG4![i]);
+                }
+                else
+                {
+                    _gpu.Free(_wqNorm![i]); _gpu.Free(_wkNorm![i]);
+                }
             }
+
+            // Gemma 4 sandwich-norm weights.
+            if (_wPostAttnNorm is not null) _gpu.Free(_wPostAttnNorm[i]);
+            if (_wPostFfwNorm is not null) _gpu.Free(_wPostFfwNorm[i]);
         }
         _gpu.Free(_wOutputNorm);
         if (_wOutput.Handle != _gpuEmbedding.Handle)
@@ -1406,6 +1783,9 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             _gpu.Free(_evictV!);
         }
         _gpu.Free(_attnScoresScratch);
+
+        // Gemma 4 rope_freqs table (#309), null unless present + sized for the model.
+        if (_gpuRopeFreqs is { } ropeFreqs) _gpu.Free(ropeFreqs);
 
         // Flash-decoding split-KV (#312) partial buffers (null unless the opt-in gate enabled them)
         if (_splitKvPartialO is { } skO) _gpu.Free(skO);

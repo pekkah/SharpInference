@@ -1073,6 +1073,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _elementwiseMulPipeline;
     private ComputePipeline? _ropePipeline;
     private ComputePipeline? _ropeNeoxPipeline;
+    private ComputePipeline? _ropeNeoxWithFactorsPipeline;
     private ComputePipeline? _softmaxPipeline;
     private ComputePipeline? _sigmoidPipeline;
     private ComputePipeline? _matVecQ4KPipeline;
@@ -1095,6 +1096,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _kvCompactPipeline;
     private ComputePipeline? _embedLookupPipeline;
     private ComputePipeline? _embedLookupQ4KPipeline;
+    private ComputePipeline? _embedLookupQ6KPipeline;
     private ComputePipeline? _tqRotateQueryPipeline;
     private ComputePipeline? _tqKvAppendPipeline;
     private ComputePipeline? _tqAttentionPipeline;
@@ -1300,6 +1302,21 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         DispatchOrRecord(pipeline, [GetBuffer(x)], (totalPairs + 255) / 256, &p);
     }
 
+    /// <summary>
+    /// NEOX RoPE with a per-half-dim <paramref name="freqFactors"/> table (size head_dim/2) that
+    /// divides each pair's frequency. The Vulkan mirror of CUDA's <c>RoPEWithFactors</c>: Gemma 4
+    /// global (non-SWA) layers apply <c>rope_freqs.weight</c> here to mask the high-frequency tail,
+    /// while SWA layers use the plain <see cref="RoPE"/>. Computes cos/sin in-shader (no tables).
+    /// </summary>
+    public void RoPEWithFactors(Tensor x, int position, int headDim, float ropeTheta, Tensor freqFactors)
+    {
+        _ropeNeoxWithFactorsPipeline ??= new ComputePipeline(this, Shaders.RoPENeoxWithFactors, 2, pushConstantSize: sizeof(RoPEParams));
+        uint numHeads = (uint)(x.ElementCount / headDim);
+        uint totalPairs = numHeads * (uint)(headDim / 2);
+        var p = new RoPEParams { numHeads = numHeads, headDim = (uint)headDim, position = position, theta = ropeTheta };
+        DispatchOrRecord(_ropeNeoxWithFactorsPipeline, [GetBuffer(x), GetBuffer(freqFactors)], (totalPairs + 255) / 256, &p);
+    }
+
     public void Softmax(Tensor x)
     {
         _softmaxPipeline ??= new ComputePipeline(this, Shaders.Softmax, 1, pushConstantSize: sizeof(CountParams));
@@ -1371,6 +1388,19 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _embedLookupQ4KPipeline ??= new ComputePipeline(this, Shaders.EmbedLookupQ4K, 2, pushConstantSize: sizeof(EmbedParams));
         var p = new EmbedParams { tokenId = tokenId, embDim = embDim };
         DispatchOrRecord(_embedLookupQ4KPipeline, [GetBuffer(embTable), GetBuffer(output)], 1, &p);
+    }
+
+    /// <summary>
+    /// Dequantize one row from a Q6_K-packed embedding table directly into
+    /// <paramref name="output"/> (issue #124, Gemma 4 12B tied token_embd). Keeps the large
+    /// Q6_K table packed (~787 MiB for [3840, 262144]) off the F32 dequant path that would
+    /// burn ~4 GB of VRAM. <paramref name="embDim"/> must be a multiple of 256 (Q6_K block size).
+    /// </summary>
+    public void EmbedLookupQ6K(Tensor embTable, Tensor output, uint tokenId, uint embDim)
+    {
+        _embedLookupQ6KPipeline ??= new ComputePipeline(this, Shaders.EmbedLookupQ6K, 2, pushConstantSize: sizeof(EmbedParams));
+        var p = new EmbedParams { tokenId = tokenId, embDim = embDim };
+        DispatchOrRecord(_embedLookupQ6KPipeline, [GetBuffer(embTable), GetBuffer(output)], 1, &p);
     }
 
     public void KvAppend(Tensor kInput, Tensor vInput, Tensor kCache, Tensor vCache,
@@ -2130,6 +2160,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _elementwiseMulPipeline?.Dispose();
         _ropePipeline?.Dispose();
         _ropeNeoxPipeline?.Dispose();
+        _ropeNeoxWithFactorsPipeline?.Dispose();
         _softmaxPipeline?.Dispose();
         _sigmoidPipeline?.Dispose();
         _matVecQ4KPipeline?.Dispose();
@@ -2155,6 +2186,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _tqAttentionPipeline?.Dispose();
         _embedLookupPipeline?.Dispose();
         _embedLookupQ4KPipeline?.Dispose();
+        _embedLookupQ6KPipeline?.Dispose();
         _bufCopyPipeline?.Dispose();
         _sgemmF32Pipeline?.Dispose();
         _sgemmF16Pipeline?.Dispose();
