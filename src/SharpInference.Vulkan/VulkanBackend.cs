@@ -1206,6 +1206,12 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _gdnL2NormPerHeadPipeline;
     private ComputePipeline? _gdnTileHeadsPipeline;
     private ComputePipeline? _gdnRecurrenceDecodePipeline;
+    // #356 PR5a: batched + fused-scan GDN pipelines (for the batched prefill trunk).
+    private ComputePipeline? _gdnConv1dDecodeBatchedPipeline;
+    private ComputePipeline? _gdnConv1dStateUpdateBatchedPipeline;
+    private ComputePipeline? _gdnL2NormPerHeadBatchedPipeline;
+    private ComputePipeline? _gdnTileHeadsBatchedPipeline;
+    private ComputePipeline? _gdnRecurrenceScanPipeline;
 
     // qwen35moe/qwen36 Gated-Attention support pipelines (issue #356)
     private ComputePipeline? _ropeNeoxPartialPipeline;
@@ -1249,6 +1255,17 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private struct GdnL2NormParams { public uint headDim; public uint numHeads; public float eps; public uint offset; }
     private struct GdnTileHeadsParams { public uint srcHeads; public uint repeat; public uint headDim; public uint srcOffset; public uint dstOffset; }
     private struct GdnRecurrenceDecodeParams { public uint hv; public uint d; public float normEps; }
+    // #356 PR5a: batched + fused-scan GDN push constants.
+    private struct GdnConv1dBatchedParams { public uint channels; public uint kernelSize; public uint nTok; }
+    private struct GdnL2NormBatchedParams { public uint headDim; public uint numHeads; public float eps; public uint offset; public uint rowStride; public uint nTok; }
+    private struct GdnTileHeadsBatchedParams { public uint srcHeads; public uint repeat; public uint headDim; public uint srcOffset; public uint dstOffset; public uint srcStride; public uint dstStride; public uint nTok; }
+    private struct GdnRecurrenceScanParams
+    {
+        public uint hv; public uint d; public float normEps;
+        public uint qStride; public uint kStride; public uint vStride; public uint vHeadOff;
+        public uint zStride; public uint oStride; public uint nTok;
+        public uint ringSlotStride; public uint nCapture; public uint ringScanOff;
+    }
     private struct RoPEPartialParams { public uint numHeads; public uint headDim; public uint ropeDim; public int position; public float theta; }
     private struct SplitQgParams { public uint numHeads; public uint headDim; }
 
@@ -1473,6 +1490,176 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             [GetBuffer(state), GetBuffer(q), GetBuffer(k), GetBuffer(v),
              GetBuffer(alphaIn), GetBuffer(beta), GetBuffer(ssmA), GetBuffer(dtBias),
              GetBuffer(normWeight), GetBuffer(z), GetBuffer(output)],
+            (uint)numVHeads, &p);
+    }
+
+    // ── Issue #356 PR5a: batched GDN trunk over a chunk of N prompt tokens ──────
+
+    /// <summary>
+    /// Batched GDN depthwise conv1d over <paramref name="nTok"/> tokens (read-only state).
+    /// <paramref name="x"/>/<paramref name="output"/> are <c>[nTok × channels]</c>;
+    /// <paramref name="state"/> is the carried <c>[(K-1) × channels]</c>. Bit-identical to
+    /// <paramref name="nTok"/> sequential <see cref="GdnConv1dDecode"/> calls. State is advanced
+    /// separately by <see cref="GdnConv1dStateUpdateBatched"/> (so concurrent token groups read one
+    /// snapshot). Mirrors CUDA <c>CudaBackend.GdnConv1dDecodeBatched</c>.
+    /// </summary>
+    public void GdnConv1dDecodeBatched(Tensor x, Tensor state, Tensor weight, Tensor output,
+                                       int channels, int kernelSize, int nTok)
+    {
+        // Same fixed-size `float tmp/s_old[4]` constraint as the single-token shader.
+        if (kernelSize is < 1 or > 5)
+            throw new ArgumentOutOfRangeException(nameof(kernelSize), kernelSize, "kernelSize must be in [1, 5].");
+        // Positivity guards: a negative value would cast to a huge uint dispatch / OOB on the GPU.
+        if (channels < 1) throw new ArgumentOutOfRangeException(nameof(channels), channels, "channels must be >= 1.");
+        if (nTok < 1) throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be >= 1.");
+        _gdnConv1dDecodeBatchedPipeline ??= new ComputePipeline(this, Shaders.GdnConv1dDecodeBatched, 4,
+            pushConstantSize: sizeof(GdnConv1dBatchedParams));
+        var p = new GdnConv1dBatchedParams { channels = (uint)channels, kernelSize = (uint)kernelSize, nTok = (uint)nTok };
+        DispatchOrRecord(_gdnConv1dDecodeBatchedPipeline,
+            [GetBuffer(x), GetBuffer(state), GetBuffer(weight), GetBuffer(output)],
+            (uint)(((long)channels + 255) / 256), &p, groupY: (uint)nTok);
+    }
+
+    /// <summary>Advance the GDN conv1d state past a chunk of <paramref name="nTok"/> tokens (matches
+    /// the sequential state evolution). See <see cref="GdnConv1dDecodeBatched"/>. Mirrors CUDA
+    /// <c>CudaBackend.GdnConv1dStateUpdateBatched</c>.</summary>
+    public void GdnConv1dStateUpdateBatched(Tensor x, Tensor state, int channels, int kernelSize, int nTok)
+    {
+        if (kernelSize is < 1 or > 5)
+            throw new ArgumentOutOfRangeException(nameof(kernelSize), kernelSize, "kernelSize must be in [1, 5].");
+        if (channels < 1) throw new ArgumentOutOfRangeException(nameof(channels), channels, "channels must be >= 1.");
+        if (nTok < 1) throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be >= 1.");
+        _gdnConv1dStateUpdateBatchedPipeline ??= new ComputePipeline(this, Shaders.GdnConv1dStateUpdateBatched, 2,
+            pushConstantSize: sizeof(GdnConv1dBatchedParams));
+        var p = new GdnConv1dBatchedParams { channels = (uint)channels, kernelSize = (uint)kernelSize, nTok = (uint)nTok };
+        DispatchOrRecord(_gdnConv1dStateUpdateBatchedPipeline,
+            [GetBuffer(x), GetBuffer(state)],
+            (uint)(((long)channels + 255) / 256), &p);
+    }
+
+    /// <summary>
+    /// Batched per-head GDN L2-norm over <paramref name="nTok"/> tokens. The bound buffer is the
+    /// data region; <paramref name="elementOffset"/> is the float base (host-offset to the Q or K
+    /// region), <paramref name="rowStride"/> the per-token element stride. Dispatch grid is
+    /// (numHeads, nTok). Bit-identical to <paramref name="nTok"/> sequential
+    /// <see cref="GdnL2NormPerHead"/> calls. Mirrors CUDA <c>CudaBackend.GdnL2NormPerHeadBatched</c>.
+    /// </summary>
+    public void GdnL2NormPerHeadBatched(Tensor data, long elementOffset, int numHeads, int headDim,
+                                        int rowStride, int nTok, float eps = 1e-6f)
+    {
+        if (numHeads < 1) throw new ArgumentOutOfRangeException(nameof(numHeads), numHeads, "numHeads must be >= 1.");
+        if (headDim < 1) throw new ArgumentOutOfRangeException(nameof(headDim), headDim, "headDim must be >= 1.");
+        if (nTok < 1) throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be >= 1.");
+        _gdnL2NormPerHeadBatchedPipeline ??= new ComputePipeline(this, Shaders.GdnL2NormPerHeadBatched, 1,
+            pushConstantSize: sizeof(GdnL2NormBatchedParams));
+        var p = new GdnL2NormBatchedParams
+        {
+            headDim = (uint)headDim,
+            numHeads = (uint)numHeads,
+            eps = eps,
+            offset = (uint)elementOffset,
+            rowStride = (uint)rowStride,
+            nTok = (uint)nTok,
+        };
+        DispatchOrRecord(_gdnL2NormPerHeadBatchedPipeline, [GetBuffer(data)], (uint)numHeads, &p, groupY: (uint)nTok);
+    }
+
+    /// <summary>
+    /// Batched GDN GQA-broadcast tile over <paramref name="nTok"/> tokens.
+    /// <paramref name="srcOffset"/>/<paramref name="dstOffset"/> are float base offsets;
+    /// <paramref name="srcStride"/>/<paramref name="dstStride"/> are per-token strides. Bit-identical
+    /// to <paramref name="nTok"/> sequential <see cref="GdnTileHeads"/> calls. Mirrors CUDA
+    /// <c>CudaBackend.GdnTileHeadsBatched</c>.
+    /// </summary>
+    public void GdnTileHeadsBatched(Tensor src, long srcOffset, Tensor dst, long dstOffset,
+                                    int srcHeads, int repeat, int headDim,
+                                    int srcStride, int dstStride, int nTok)
+    {
+        if (srcHeads < 1) throw new ArgumentOutOfRangeException(nameof(srcHeads), srcHeads, "srcHeads must be >= 1.");
+        if (repeat < 1) throw new ArgumentOutOfRangeException(nameof(repeat), repeat, "repeat must be >= 1.");
+        if (headDim < 1) throw new ArgumentOutOfRangeException(nameof(headDim), headDim, "headDim must be >= 1.");
+        if (nTok < 1) throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be >= 1.");
+        _gdnTileHeadsBatchedPipeline ??= new ComputePipeline(this, Shaders.GdnTileHeadsBatched, 2,
+            pushConstantSize: sizeof(GdnTileHeadsBatchedParams));
+        var p = new GdnTileHeadsBatchedParams
+        {
+            srcHeads = (uint)srcHeads,
+            repeat = (uint)repeat,
+            headDim = (uint)headDim,
+            srcOffset = (uint)srcOffset,
+            dstOffset = (uint)dstOffset,
+            srcStride = (uint)srcStride,
+            dstStride = (uint)dstStride,
+            nTok = (uint)nTok,
+        };
+        long total = (long)srcHeads * repeat * headDim;
+        DispatchOrRecord(_gdnTileHeadsBatchedPipeline, [GetBuffer(src), GetBuffer(dst)],
+            (uint)((total + 255) / 256), &p, groupY: (uint)nTok);
+    }
+
+    /// <summary>
+    /// Fused sequential GDN recurrence scan over <paramref name="nTok"/> tokens: ONE dispatch
+    /// (one workgroup per v-head) loops the positions internally, carrying the per-head state in
+    /// place. Bit-identical to <paramref name="nTok"/> sequential <see cref="GdnRecurrenceDecode"/>
+    /// calls — the fused form of the per-token decode, NOT the parallel chunked-scan. Per-head input
+    /// strides let q/k come from the tiled <c>[nTok × valueDim]</c> buffers, v from the silu'd conv
+    /// output (<paramref name="vHeadOff"/> into a <c>[nTok × convChannels]</c> buffer), z from a
+    /// <c>[nTok × valueDim]</c> gate, alpha/beta from <c>[nTok × numVHeads]</c>. Mirrors CUDA
+    /// <c>CudaBackend.GdnRecurrenceScan</c>.
+    /// </summary>
+    /// <remarks>
+    /// #290/#357 ring capture: when <paramref name="ringScan"/> is non-null and
+    /// <paramref name="nCapture"/> &gt; 0, the post-Pass-B state of each token i &lt; nCapture is
+    /// also mirrored into <paramref name="ringScan"/> (disjoint from <paramref name="state"/>, so
+    /// the scan math is byte-unchanged). The ring binding is ALWAYS present; when
+    /// <paramref name="ringScan"/> is null it binds <paramref name="state"/> as a placeholder and
+    /// forces nCapture=0 so the shader (which guards every ring write behind <c>nCapture &gt; 0</c>)
+    /// never writes it. PR5a's prefill use and the unit test pass ringScan=null.
+    /// </remarks>
+    public void GdnRecurrenceScan(
+        Tensor state, Tensor qAll, Tensor kAll, Tensor vAll,
+        Tensor alphaAll, Tensor betaAll, Tensor ssmA, Tensor dtBias,
+        Tensor normWeight, Tensor zAll, Tensor outputAll,
+        int numVHeads, int headDim, float normEps,
+        int qStride, int kStride, int vStride, int vHeadOff, int zStride, int oStride, int nTok,
+        Tensor? ringScan = null, long ringScanFloatOffset = 0, int ringSlotStride = 0, int nCapture = 0)
+    {
+        if (headDim != 128)
+            throw new ArgumentOutOfRangeException(nameof(headDim), headDim,
+                "The Vulkan GDN recurrence scan shader is specialized for headDim=128.");
+        if (numVHeads < 1)
+            throw new ArgumentOutOfRangeException(nameof(numVHeads), numVHeads, "numVHeads must be >= 1.");
+        if (nTok < 1)
+            throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be >= 1.");
+        if (ringScan is not null && (nCapture < 0 || ringSlotStride < 0 || ringScanFloatOffset < 0))
+            throw new ArgumentOutOfRangeException(nameof(nCapture),
+                "ring-capture params (nCapture, ringSlotStride, ringScanFloatOffset) must be non-negative when ringScan is provided.");
+
+        _gdnRecurrenceScanPipeline ??= new ComputePipeline(this, Shaders.GdnRecurrenceScan, 12,
+            pushConstantSize: sizeof(GdnRecurrenceScanParams));
+        // #290 ring capture: null tensor → bind `state` as placeholder + force 0 captures (no-op).
+        bool capture = ringScan is not null;
+        var p = new GdnRecurrenceScanParams
+        {
+            hv = (uint)numVHeads,
+            d = (uint)headDim,
+            normEps = normEps,
+            qStride = (uint)qStride,
+            kStride = (uint)kStride,
+            vStride = (uint)vStride,
+            vHeadOff = (uint)vHeadOff,
+            zStride = (uint)zStride,
+            oStride = (uint)oStride,
+            nTok = (uint)nTok,
+            ringSlotStride = (uint)ringSlotStride,
+            nCapture = capture ? (uint)nCapture : 0u,
+            ringScanOff = capture ? (uint)ringScanFloatOffset : 0u,
+        };
+        DispatchOrRecord(_gdnRecurrenceScanPipeline,
+            [GetBuffer(state), GetBuffer(qAll), GetBuffer(kAll), GetBuffer(vAll),
+             GetBuffer(alphaAll), GetBuffer(betaAll), GetBuffer(ssmA), GetBuffer(dtBias),
+             GetBuffer(normWeight), GetBuffer(zAll), GetBuffer(outputAll),
+             GetBuffer(capture ? ringScan! : state)],
             (uint)numVHeads, &p);
     }
 
@@ -2925,6 +3112,11 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _gdnL2NormPerHeadPipeline?.Dispose();
         _gdnTileHeadsPipeline?.Dispose();
         _gdnRecurrenceDecodePipeline?.Dispose();
+        _gdnConv1dDecodeBatchedPipeline?.Dispose();
+        _gdnConv1dStateUpdateBatchedPipeline?.Dispose();
+        _gdnL2NormPerHeadBatchedPipeline?.Dispose();
+        _gdnTileHeadsBatchedPipeline?.Dispose();
+        _gdnRecurrenceScanPipeline?.Dispose();
         _ropeNeoxPartialPipeline?.Dispose();
         _splitQgPipeline?.Dispose();
         _sigmoidMulInPlacePipeline?.Dispose();

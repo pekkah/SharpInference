@@ -2938,6 +2938,278 @@ public sealed unsafe class VulkanShaderTests
         backend.Free(gpuNormW); backend.Free(gpuZ); backend.Free(gpuOut);
     }
 
+    // ── Batched + fused-scan GDN shaders (issue #356 PR5a; batched prefill trunk) ──
+    // Each asserts the batched/fused op is BYTE-IDENTICAL to N sequential single-token
+    // calls of the PR1/PR2 op — GPU self-parity, no CPU oracle needed.
+
+    [Fact]
+    public void GdnConv1dBatchedMatchesSequential()
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        const int n = 5;
+        const int channels = 8192;   // qwen35moe conv channels
+        const int kernel = 4;        // qwen35moe conv kernel
+        const int retained = kernel - 1;
+        int stateLen = retained * channels;
+        int weightLen = kernel * channels;
+
+        var rng = new Random(56789);
+        var x = new float[n * channels];          // chunk inputs [n, channels]
+        var state0 = new float[stateLen];         // shared initial state
+        var weight = new float[weightLen];
+        for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < stateLen; i++) state0[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < weightLen; i++) weight[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // ── Batched path: read-only state → [n, channels] output, then advance state ──
+        var gpuX = backend.Upload(x, TensorShape.D1(n * channels));
+        var gpuState = backend.Upload(state0, TensorShape.D1(stateLen));
+        var gpuWeight = backend.Upload(weight, TensorShape.D1(weightLen));
+        var gpuOut = backend.Allocate(TensorShape.D1(n * channels));
+        backend.GdnConv1dDecodeBatched(gpuX, gpuState, gpuWeight, gpuOut, channels, kernel, n);
+        backend.GdnConv1dStateUpdateBatched(gpuX, gpuState, channels, kernel, n);
+
+        var batchedOut = new float[n * channels];
+        var batchedState = new float[stateLen];
+        backend.Download(gpuOut, batchedOut);
+        backend.Download(gpuState, batchedState);
+
+        // ── Sequential reference: N single-token GdnConv1dDecode on a cloned state ──
+        var seqState = backend.Upload(state0, TensorShape.D1(stateLen));
+        var seqOutAll = new float[n * channels];
+        for (int t = 0; t < n; t++)
+        {
+            var tokX = new float[channels];
+            Array.Copy(x, (long)t * channels, tokX, 0, channels);
+            var gpuTokX = backend.Upload(tokX, TensorShape.D1(channels));
+            var gpuTokOut = backend.Allocate(TensorShape.D1(channels));
+            backend.GdnConv1dDecode(gpuTokX, seqState, gpuWeight, gpuTokOut, channels, kernel);
+            var tokOut = new float[channels];
+            backend.Download(gpuTokOut, tokOut);
+            Array.Copy(tokOut, 0, seqOutAll, (long)t * channels, channels);
+            backend.Free(gpuTokX); backend.Free(gpuTokOut);
+        }
+        var seqStateAfter = new float[stateLen];
+        backend.Download(seqState, seqStateAfter);
+
+        for (int i = 0; i < n * channels; i++)
+            Assert.True(MathF.Abs(batchedOut[i] - seqOutAll[i]) < 1e-6f,
+                $"conv1d batched output mismatch at [{i}]: batched={batchedOut[i]}, seq={seqOutAll[i]}");
+        for (int i = 0; i < stateLen; i++)
+            Assert.True(MathF.Abs(batchedState[i] - seqStateAfter[i]) < 1e-6f,
+                $"conv1d batched state mismatch at [{i}]: batched={batchedState[i]}, seq={seqStateAfter[i]}");
+
+        backend.Free(gpuX); backend.Free(gpuState); backend.Free(gpuWeight); backend.Free(gpuOut);
+        backend.Free(seqState);
+    }
+
+    [Fact]
+    public void GdnL2NormPerHeadBatchedMatchesSequential()
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        const int n = 4;
+        const int numHeads = 16;
+        const int headDim = 128;
+        const int rowStride = 8192;   // conv channels (the Q region sits at offset 0 of each row)
+        const float eps = 1e-6f;
+        int region = numHeads * headDim;
+        int total = n * rowStride;
+
+        var rng = new Random(31337);
+        var data = new float[total];
+        for (int i = 0; i < total; i++) data[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Batched: normalize the Q region (offset 0) of each of n rows in one dispatch.
+        var gpuBatched = backend.Upload(data, TensorShape.D1(total));
+        backend.GdnL2NormPerHeadBatched(gpuBatched, 0, numHeads, headDim, rowStride, n, eps);
+        var batchedResult = new float[total];
+        backend.Download(gpuBatched, batchedResult);
+
+        // Sequential: n single-row GdnL2NormPerHead, each at the row's float offset.
+        var gpuSeq = backend.Upload(data, TensorShape.D1(total));
+        for (int t = 0; t < n; t++)
+            backend.GdnL2NormPerHead(gpuSeq, (long)t * rowStride, numHeads, headDim, eps);
+        var seqResult = new float[total];
+        backend.Download(gpuSeq, seqResult);
+
+        for (int t = 0; t < n; t++)
+            for (int i = 0; i < region; i++)
+            {
+                int idx = t * rowStride + i;
+                Assert.True(MathF.Abs(batchedResult[idx] - seqResult[idx]) < 1e-6f,
+                    $"L2-norm batched mismatch at row {t} [{i}]: batched={batchedResult[idx]}, seq={seqResult[idx]}");
+            }
+
+        backend.Free(gpuBatched); backend.Free(gpuSeq);
+    }
+
+    [Fact]
+    public void GdnTileHeadsBatchedMatchesSequential()
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        const int n = 4;
+        const int srcHeads = 16;
+        const int repeat = 2;
+        const int headDim = 128;
+        const int srcStride = 8192;   // conv channels
+        const int dstStride = 4096;   // value_dim (srcHeads*repeat*headDim = 4096)
+        int srcTotal = n * srcStride;
+        int dstTotal = n * dstStride;
+
+        var rng = new Random(2468);
+        var src = new float[srcTotal];
+        for (int i = 0; i < srcTotal; i++) src[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Batched: tile every row in one dispatch.
+        var gpuSrc = backend.Upload(src, TensorShape.D1(srcTotal));
+        var gpuDstBatched = backend.Allocate(TensorShape.D1(dstTotal));
+        backend.GdnTileHeadsBatched(gpuSrc, 0, gpuDstBatched, 0, srcHeads, repeat, headDim,
+            srcStride, dstStride, n);
+        var batchedDst = new float[dstTotal];
+        backend.Download(gpuDstBatched, batchedDst);
+
+        // Sequential: n single-row GdnTileHeads at the row's src/dst float offsets.
+        var gpuDstSeq = backend.Allocate(TensorShape.D1(dstTotal));
+        for (int t = 0; t < n; t++)
+            backend.GdnTileHeads(gpuSrc, (long)t * srcStride, gpuDstSeq, (long)t * dstStride,
+                srcHeads, repeat, headDim);
+        var seqDst = new float[dstTotal];
+        backend.Download(gpuDstSeq, seqDst);
+
+        // Pure copy → exact equality.
+        for (int i = 0; i < dstTotal; i++)
+            Assert.Equal(seqDst[i], batchedDst[i]);
+
+        backend.Free(gpuSrc); backend.Free(gpuDstBatched); backend.Free(gpuDstSeq);
+    }
+
+    [Fact]
+    public void GdnRecurrenceScanMatchesSequentialDecode()
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        const int n = 5;
+        const int hv = 32;            // qwen36 v-head count
+        const int d = 128;            // qwen36 head dim (specialized to 128)
+        const float eps = 1e-6f;
+        int valueDim = hv * d;        // 4096
+        const int convChannels = 8192;
+        const int vHeadOff = 2 * 2048; // 2*keyDim; keyDim = 2048 here (placement inside conv row)
+        int stateLen = hv * d * d;
+
+        var rng = new Random(20260622);
+
+        // Tiled batched inputs: q/k/z over [n, valueDim]; v over [n, convChannels] at vHeadOff;
+        // alpha/beta over [n, hv].
+        var qAll = new float[n * valueDim];
+        var kAll = new float[n * valueDim];
+        var zAll = new float[n * valueDim];
+        for (int i = 0; i < n * valueDim; i++)
+        {
+            qAll[i] = (float)(rng.NextDouble() * 2 - 1);
+            kAll[i] = (float)(rng.NextDouble() * 2 - 1);
+            zAll[i] = (float)(rng.NextDouble() * 2 - 1);
+        }
+        var vAll = new float[n * convChannels];
+        for (int t = 0; t < n; t++)
+            for (int e = 0; e < valueDim; e++)
+                vAll[t * convChannels + vHeadOff + e] = (float)(rng.NextDouble() * 2 - 1);
+
+        var alphaAll = new float[n * hv];
+        var betaAll = new float[n * hv];
+        for (int i = 0; i < n * hv; i++)
+        {
+            alphaAll[i] = (float)(rng.NextDouble() * 4 - 2);    // [-2, 2]
+            betaAll[i] = (float)(rng.NextDouble() * 4 - 2);     // [-2, 2]
+        }
+        var ssmA = new float[hv];
+        var dtBias = new float[hv];
+        for (int h = 0; h < hv; h++)
+        {
+            ssmA[h] = (float)(rng.NextDouble() * -0.09 - 0.01); // [-0.1, -0.01] negative decay
+            dtBias[h] = (float)(rng.NextDouble() - 0.5);        // [-0.5, 0.5]
+        }
+        var normWeight = new float[d];
+        for (int i = 0; i < d; i++) normWeight[i] = (float)(rng.NextDouble() + 0.5);  // [0.5, 1.5]
+        var state0 = new float[stateLen];
+        for (int i = 0; i < stateLen; i++) state0[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // ── Fused scan (ringScan=null → nCapture=0, no ring writes) ──
+        var gpuState = backend.Upload(state0, TensorShape.D1(stateLen));
+        var gpuQ = backend.Upload(qAll, TensorShape.D1(n * valueDim));
+        var gpuK = backend.Upload(kAll, TensorShape.D1(n * valueDim));
+        var gpuV = backend.Upload(vAll, TensorShape.D1(n * convChannels));
+        var gpuAlpha = backend.Upload(alphaAll, TensorShape.D1(n * hv));
+        var gpuBeta = backend.Upload(betaAll, TensorShape.D1(n * hv));
+        var gpuSsmA = backend.Upload(ssmA, TensorShape.D1(hv));
+        var gpuDtBias = backend.Upload(dtBias, TensorShape.D1(hv));
+        var gpuNormW = backend.Upload(normWeight, TensorShape.D1(d));
+        var gpuZ = backend.Upload(zAll, TensorShape.D1(n * valueDim));
+        var gpuOut = backend.Allocate(TensorShape.D1(n * valueDim));
+
+        backend.GdnRecurrenceScan(gpuState, gpuQ, gpuK, gpuV, gpuAlpha, gpuBeta,
+            gpuSsmA, gpuDtBias, gpuNormW, gpuZ, gpuOut, hv, d, eps,
+            qStride: valueDim, kStride: valueDim, vStride: convChannels, vHeadOff: vHeadOff,
+            zStride: valueDim, oStride: valueDim, nTok: n);
+
+        var scanOut = new float[n * valueDim];
+        var scanStateAfter = new float[stateLen];
+        backend.Download(gpuOut, scanOut);
+        backend.Download(gpuState, scanStateAfter);
+
+        // ── Sequential reference: N single-token GdnRecurrenceDecode on a cloned state,
+        //    reading the SAME per-token slices (extract head-contiguous q/k/v/z [hv*d]). ──
+        var seqState = backend.Upload(state0, TensorShape.D1(stateLen));
+        var seqOutAll = new float[n * valueDim];
+        for (int t = 0; t < n; t++)
+        {
+            var qt = new float[valueDim];
+            var kt = new float[valueDim];
+            var vt = new float[valueDim];
+            var zt = new float[valueDim];
+            Array.Copy(qAll, (long)t * valueDim, qt, 0, valueDim);
+            Array.Copy(kAll, (long)t * valueDim, kt, 0, valueDim);
+            Array.Copy(zAll, (long)t * valueDim, zt, 0, valueDim);
+            Array.Copy(vAll, (long)t * convChannels + vHeadOff, vt, 0, valueDim);
+            var at = new float[hv];
+            var bt = new float[hv];
+            Array.Copy(alphaAll, (long)t * hv, at, 0, hv);
+            Array.Copy(betaAll, (long)t * hv, bt, 0, hv);
+
+            var gQ = backend.Upload(qt, TensorShape.D1(valueDim));
+            var gK = backend.Upload(kt, TensorShape.D1(valueDim));
+            var gV = backend.Upload(vt, TensorShape.D1(valueDim));
+            var gZ = backend.Upload(zt, TensorShape.D1(valueDim));
+            var gA = backend.Upload(at, TensorShape.D1(hv));
+            var gB = backend.Upload(bt, TensorShape.D1(hv));
+            var gO = backend.Allocate(TensorShape.D1(valueDim));
+            backend.GdnRecurrenceDecode(seqState, gQ, gK, gV, gA, gB, gpuSsmA, gpuDtBias,
+                gpuNormW, gZ, gO, hv, d, eps);
+            var ot = new float[valueDim];
+            backend.Download(gO, ot);
+            Array.Copy(ot, 0, seqOutAll, (long)t * valueDim, valueDim);
+            backend.Free(gQ); backend.Free(gK); backend.Free(gV); backend.Free(gZ);
+            backend.Free(gA); backend.Free(gB); backend.Free(gO);
+        }
+        var seqStateAfter = new float[stateLen];
+        backend.Download(seqState, seqStateAfter);
+
+        // The scan is the fused form of the decode — same math + reduction order → ~bit-exact.
+        for (int i = 0; i < stateLen; i++)
+            Assert.True(MathF.Abs(scanStateAfter[i] - seqStateAfter[i]) < 1e-5f,
+                $"scan state mismatch at [{i}]: scan={scanStateAfter[i]}, seq={seqStateAfter[i]}");
+        for (int i = 0; i < n * valueDim; i++)
+            Assert.True(MathF.Abs(scanOut[i] - seqOutAll[i]) < 1e-5f,
+                $"scan output mismatch at [{i}]: scan={scanOut[i]}, seq={seqOutAll[i]}");
+
+        backend.Free(gpuState); backend.Free(gpuQ); backend.Free(gpuK); backend.Free(gpuV);
+        backend.Free(gpuAlpha); backend.Free(gpuBeta); backend.Free(gpuSsmA); backend.Free(gpuDtBias);
+        backend.Free(gpuNormW); backend.Free(gpuZ); backend.Free(gpuOut); backend.Free(seqState);
+    }
+
     // ── qwen35moe/qwen36 Gated-Attention support shaders (issue #356) ──────────
 
     [Fact]
