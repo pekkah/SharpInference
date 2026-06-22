@@ -63,6 +63,7 @@ sharpi-cli -m models/gemma-4-E4B_q4_0-it.gguf -g -1 -c 2048 \
 | Backend | Prefill t/s | Decode t/s | Notes |
 |---|---:|---:|---|
 | **CUDA** `-g -1 -c 2048` | **3666** | **100.4** | QAT q4_0 (5.15 GB): **~1.4× decode** vs Q8 at near-identical quality, frees ~3 GB for wider KV/context. Same gemma4 path; the shared-KV tail layers omit `attn_k`/`attn_v`/`attn_k_norm` (loaded conditionally). `download-model.ps1 -Model gemma4-e4b-qat` |
+| Vulkan `-g -1 -c 2048` | 35 | 39.5 | full gemma4 trunk incl. PLE injection + shared-KV tail (#351); per-token prefill (no batched-prefill path). `--kv-type bf16\|q8_0` for long-context KV (byte-identical greedy vs fp32). The 5 GB q4_0 fits Vulkan full-offload (the 8 GB Q8 build OOMs on a 12 GB card) |
 
 #### Qwen3 8B — [Qwen](https://huggingface.co/Qwen/Qwen3-8B-GGUF) · 5 GB
 
@@ -94,6 +95,7 @@ sharpi-cli -m models/gemma-4-E4B-it-Q8_0.gguf -g -1 -c 2048 \
 |---|---:|---:|---|
 | **CUDA** `-g -1 -c 2048` | **4145** | **70.5** | all 42 layers fit at `-c 2048`; KV-share alias + per-layer SWA/global split. Prefill: int8 tensor-core MMQ + tensor-core flash attention + SoA Q8_0 weight repack. Prompts >4096 use a real SWA KV ring on the chunked-flash path (fixes correctness past the 512 window). Decode: dp4a/Q8_1 + CUDA-graph replay; argmax-stable. (llama.cpp ~8475 prefill / ~78 decode) |
 | **CUDA** `-g 22 -c 2048` (hybrid) | 6.8 | 7.0 | 22 GPU + 20 CPU layers. `-g ≤ 22` required so the CPU shared-KV tail can read its own-KV source layers; CPU dense-FFN dominates decode (bandwidth-bound). `SHARPI_CUDA_PROFILE=1` for per-phase breakdown |
+| Vulkan `-g -1` | — | — | full gemma4 trunk runs on Vulkan (#351), but the 8 GB Q8 weights **OOM on a 12 GB card** at full-offload (CUDA fits it via a tighter SWA KV ring). Use the q4_0 QAT build above for Vulkan; Vulkan partial-offload (`-g N`) is not yet wired for gemma4 (#252) |
 | CPU | 5.0 | 5.1 | dense 42-layer gemma4: per-layer head_dim (256 SWA / 512 global), dual-RoPE, KV-share tail (18 layers), 5:1 SWA:global, logit softcap 30, PLE-256 injection (~4.2 GB mmap-resident) |
 
 #### Gemma 4 12B-it QAT Q4_0 — [google](https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf) · 7 GB
@@ -106,7 +108,7 @@ sharpi-cli -m models/gemma-4-12b-it-qat-q4_0.gguf -g -1 -c 2048 \
 | Backend | Prefill t/s | Decode t/s | Notes |
 |---|---:|---:|---|
 | **CUDA** `-g -1 -c 2048` | **1714** | **54.1** | dense 48-layer gemma4, all bulk weights Q4_0 + tied Q6_K embedding; fits 12 GB full-offload. `attention_k_eq_v` (8 global MQA layers reuse K as V), per-layer KV heads (8 GQA / 1 MQA), pure V-norm. Prefill: Q4_0 int8 tensor-core MMQ over a SoA repack; decode: Q4_0 dp4a/Q8_1, argmax-stable, within ~6% of llama.cpp (57 t/s). **Long context:** `--kv-type bf16` halves / `q8_0` quarters the K/V store (fp32 kernel math, argmax-stable) + a bookkeeping-only host KV cache → **`-c 131072` (128K) within 12 GB** (fp32 `cudaMalloc`-fails at 64K). At 128K, q8_0 keeps the tied embed table resident (~53 t/s) where bf16 spills it (~19 t/s). Default fp32; opt-in `--kv-type bf16\|q8_0` |
-| Vulkan `-g -1 -c 2048` | 17.0 | 19.1 | PLE-free 12B only (E4B's PLE unsupported on Vulkan, #309); per-token prefill (no batched-prefill path) |
+| Vulkan `-g -1 -c 2048` | 17.0 | 19.1 | per-token prefill (no batched-prefill path). The 12B is PLE-free; the E4B family's PLE + shared-KV are now supported on Vulkan too (#351) |
 
 #### Qwen3-Coder 30B-A3B (MoE) — [Qwen](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF) · 17 GB
 
@@ -189,8 +191,10 @@ sharpi-cli -m models/Llama-4-Scout-17B-16E-Instruct-Q4_K_M-00001-of-00002.gguf \
 _CUDA columns re-measured 2026-06-16 with each model's recommended sampling (`scripts/bench-allrows-1k.ps1
 -CudaOnly`): prefill warm at a realistic ~2K-token working context, decode at near-zero ctx (`-NearZero`),
 each after a discarded warm-clock warm-up. The CPU and Vulkan rows are from the prior 2026-06 sweep (prefill
-~1K ctx). Vulkan rows remain ~35% below their earlier numbers — an unexplained regression (CUDA improved on
-the same box). Llama-4 Scout and Qwen3-Coder Vulkan-hybrid keep prior values (not re-runnable here)._
+~1K ctx), except the Gemma 4 E4B q4_0 Vulkan row, freshly measured 2026-06-22 with the same convention after
+the #351 gemma4-on-Vulkan work (PLE + shared-KV + narrowed KV). Vulkan rows remain ~35% below their earlier
+numbers — an unexplained regression (CUDA improved on the same box). Llama-4 Scout and Qwen3-Coder
+Vulkan-hybrid keep prior values (not re-runnable here)._
 
 **Long-context decode** uses flash-decoding (split-KV) on all CUDA paths (dense + MoE/GDN hybrids): the
 per-token KV read parallelizes across SMs, so decode no longer collapses with context (Gemma 4 E4B q8
