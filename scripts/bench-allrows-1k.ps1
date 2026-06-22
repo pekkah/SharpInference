@@ -206,11 +206,14 @@ $jobs = @(
 
   @{ Tag="carnice-cuda";    M="$E\Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-I-Compact.gguf"; A=@("-g","-1","--backend","cuda","--no-thinking"); Temp="0"; Samp=@(); CpuMoe=$true; T=900 }
 
-  @{ Tag="gemma4-e4b-q4-cuda"; M="$E\gemma-4-E4B_q4_0-it.gguf"; A=@("-g","-1","--backend","cuda","--ctx-size","2048");    Temp="1.0"; Samp=$sGemma; T=900 }
+  @{ Tag="gemma4-e4b-q4-cuda";   M="$E\gemma-4-E4B_q4_0-it.gguf"; A=@("-g","-1","--backend","cuda","--ctx-size","2048");    Temp="1.0"; Samp=$sGemma; T=900 }
+  @{ Tag="gemma4-e4b-q4-vulkan"; M="$E\gemma-4-E4B_q4_0-it.gguf"; A=@("-g","-1","--backend","vulkan","--ctx-size","2048"); Temp="1.0"; Samp=$sGemma; T=900 }
 
   @{ Tag="gemma4-cpu";      M="$E\gemma-4-E4B-it-Q8_0.gguf"; A=@();                                                       Temp="1.0"; Samp=$sGemma; T=900 }
   @{ Tag="gemma4-cuda";     M="$E\gemma-4-E4B-it-Q8_0.gguf"; A=@("-g","-1","--backend","cuda","--ctx-size","2048");       Temp="1.0"; Samp=$sGemma; T=900 }
   @{ Tag="gemma4-cuda-hyb"; M="$E\gemma-4-E4B-it-Q8_0.gguf"; A=@("-g","22","--backend","cuda","--ctx-size","2048");       Temp="1.0"; Samp=$sGemma; T=900 }
+  # Q8 E4B (8 GB) does NOT fit Vulkan full-offload on a 12 GB card (OOMs on weight upload even
+  # at -c 512); CUDA fits it via a tighter SWA KV ring. Use the q4_0 QAT build for Vulkan.
 
   @{ Tag="gemma4-12b-cuda"; M="$E\gemma-4-12b-it-qat-q4_0.gguf"; A=@("-g","-1","--backend","cuda","--ctx-size","2048");  Temp="1.0"; Samp=$sGemma; T=900 }
 )
