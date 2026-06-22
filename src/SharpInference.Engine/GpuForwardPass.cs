@@ -777,7 +777,10 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         // QKV/output bias is excluded too: the batched trunk wires a bias gather/add/scatter
         // path but no local Q4_K bias model (e.g. a Q4 Qwen2) exercises it yet, so keep bias
         // models on the verified K-loop fallback until a parity test covers that path.
-        if (_isMoE || _isGemma4 || _hasAttnBias || _hasAttnOutputBias) return false;
+        // L2 QK-norm (HeadNormPure post-RoPE, Llama-4) is excluded EXPLICITLY: the batched trunk
+        // has no L2 path (it would silently skip the norm), and the Debug.Assert that guards it is
+        // stripped in Release — so don't rely on the L2⟹Llama4⟹MoE coupling, exclude it directly.
+        if (_isMoE || _isGemma4 || _hasAttnBias || _hasAttnOutputBias || _hp.UseL2QkNorm) return false;
 
         bool IsBatchable(Tensor w) =>
             _weightDTypes.GetValueOrDefault(w.Handle, DType.Q4_K) is DType.Q4_K or DType.Q6_K;
