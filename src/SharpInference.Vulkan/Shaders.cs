@@ -1045,6 +1045,42 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Batched fp32 <see cref="KvAppend"/> (issue #308): appends K rows of K/V into the cache in ONE
+    /// dispatch. 2D grid <c>(ceil(kv_dim/256), K)</c>: column = <c>gl_GlobalInvocationID.x</c> (guarded
+    /// against <c>kv_dim</c>), token row = <c>gl_WorkGroupID.y</c>. Row r is written at cache slot
+    /// <c>base_pos + r</c>, reading input row r at <c>r * kv_dim</c>. Bit-identical to K separate
+    /// <see cref="KvAppend"/> calls at positions base_pos, base_pos+1, … (same element addressing,
+    /// no ring modulo). Push constants reuse the <see cref="KvAppend"/> layout (<c>position</c>
+    /// carries base_pos). Bindings: 0=k_input[K*kv_dim], 1=v_input[K*kv_dim], 2=k_cache, 3=v_cache.
+    /// </summary>
+    internal const string KvAppendBatched = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer KIn  { float k_input[]; };
+        layout(binding = 1) readonly buffer VIn  { float v_input[]; };
+        layout(binding = 2) buffer KCache { float k_cache[]; };
+        layout(binding = 3) buffer VCache { float v_cache[]; };
+
+        layout(push_constant) uniform Params {
+            uint kv_dim;
+            uint position;     // base_pos; row r writes slot base_pos + r
+            uint max_seq_len;
+        };
+
+        void main() {
+            uint col = gl_GlobalInvocationID.x;
+            uint row = gl_WorkGroupID.y;
+            if (col >= kv_dim) return;
+            // Same element address as the single KvAppend: (position + row) * kv_dim + col.
+            uint cache_off = (position + row) * kv_dim + col;
+            uint in_off    = row * kv_dim + col;
+            k_cache[cache_off] = k_input[in_off];
+            v_cache[cache_off] = v_input[in_off];
+        }
+        """;
+
+    /// <summary>
     /// Scaled dot-product attention with GQA support.
     /// One workgroup per query head. Each workgroup computes:
     ///   scores[t] = Q_h · K[t, kvHead] / sqrt(headDim) for t=0..seqLen
@@ -1171,6 +1207,130 @@ internal static class Shaders
                     float weight = use_shared ? scores[t] : scores_scratch[scratch_base + t];
                     uint v_off = t * kv_dim + kv_head * head_dim;
                     sum += weight * v_cache[v_off + d];
+                }
+                out_data[out_off + d] = sum;
+            }
+        }
+        """;
+
+    /// <summary>
+    /// Batched fp32 attention (issue #308): the spec-decode batched-verify crux. Runs K queries in
+    /// ONE dispatch over a 2D grid <c>num_heads × num_queries</c> workgroups, where query qi (at
+    /// absolute position <c>base_pos + qi</c>) attends causally over <c>[0, base_pos + qi]</c> — i.e.
+    /// query qi's <c>seq_len_i = base_pos + qi + 1</c>. This reproduces the causal-among-K behavior of
+    /// K separate single-query <see cref="Attention"/> calls at seqLens base_pos+1 … base_pos+K
+    /// WITHOUT the per-token gather/scatter.
+    ///
+    /// CRITICAL — bit-exactness: each <c>(h, qi)</c> workgroup is an INDEPENDENT copy of the
+    /// single-query <see cref="Attention"/> ≤4096 shared-memory fast path with <c>seq_len = seq_len_i</c>
+    /// and <c>window = 0</c> (no SWA — spec verify never windows). Score iteration order, the
+    /// <c>sdata[256]</c> tree reduce, the <c>exp</c>/<c>inv_sum</c> softmax, and the Phase-3 V-sum
+    /// order are kept VERBATIM, so the result is bit-identical to the single-query shader. The shared
+    /// <c>scores[]</c> tail is padded with -inf up to <c>seq_len_i</c> (per-row bound, NOT a fixed
+    /// seqLen) so the max scan ignores stale slots. There is no split-KV / scratch fallback here:
+    /// the caller restricts the batched attention to <c>base_pos + K ≤ 4096</c>.
+    ///
+    /// Q is read from <c>q_data</c> at <c>qi*(num_heads*head_dim) + h*head_dim</c> and output written
+    /// to <c>out_data</c> at the same offset (no gather/scatter). K/V are read from the cache exactly
+    /// like the single-query shader (<c>t*kv_dim + kv_head*head_dim + d</c>, GQA
+    /// <c>kv_head = h/(num_heads/num_kv_heads)</c>, scale <c>inversesqrt(head_dim)</c>).
+    ///
+    /// Push constants: { uint num_heads, num_kv_heads, head_dim, base_pos, max_seq_len, num_queries }.
+    /// Bindings: 0=q_data[K*num_heads*head_dim], 1=K_cache, 2=V_cache, 3=out_data[K*num_heads*head_dim].
+    /// </summary>
+    internal const string AttentionBatched = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Q     { float q_data[]; };
+        layout(binding = 1) readonly buffer KCache { float k_cache[]; };
+        layout(binding = 2) readonly buffer VCache { float v_cache[]; };
+        layout(binding = 3) buffer Out             { float out_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint num_heads;
+            uint num_kv_heads;
+            uint head_dim;
+            uint base_pos;      // query qi is at absolute position base_pos + qi
+            uint max_seq_len;
+            uint num_queries;   // K
+        };
+
+        // seq_len_i = base_pos + qi + 1 ≤ base_pos + K, and the caller guarantees base_pos + K ≤ 4096,
+        // so the whole causal range always fits in shared memory — no scratch-spill path here.
+        const uint MAX_SHARED_SCORES = 4096u;
+        shared float scores[MAX_SHARED_SCORES];
+        shared float sdata[256];   // reduction scratch
+
+        void main() {
+            uint h   = gl_WorkGroupID.x;
+            uint qi  = gl_WorkGroupID.y;
+            uint tid = gl_LocalInvocationID.x;
+            if (h >= num_heads || qi >= num_queries) return;
+
+            uint kv_head = h / (num_heads / num_kv_heads);
+            uint kv_dim = num_kv_heads * head_dim;
+            float scale = inversesqrt(float(head_dim));
+            uint row_stride = num_heads * head_dim;
+            uint q_off   = qi * row_stride + h * head_dim;
+            uint out_off = qi * row_stride + h * head_dim;
+
+            // Per-query causal length: query qi (abs pos base_pos+qi) attends [0, base_pos+qi].
+            // window = 0 (no SWA), start_seq = 0.
+            uint seq_len_i = base_pos + qi + 1u;
+
+            // ─── Phase 1: per-position Q·K scores over [0, seq_len_i) ───
+            for (uint t = tid; t < seq_len_i; t += 256) {
+                float dot = 0.0;
+                uint k_off = t * kv_dim + kv_head * head_dim;
+                for (uint d = 0; d < head_dim; d++)
+                    dot += q_data[q_off + d] * k_cache[k_off + d];
+                scores[t] = dot * scale;
+            }
+            // No tail padding needed: every later phase (max scan, exp/sum, V-aggregate) is
+            // strictly bounded by seq_len_i, so scores[t >= seq_len_i] is never read.
+            barrier();
+
+            // ─── Phase 2: in-place softmax over [0, seq_len_i) ───
+            float local_max = -1.0/0.0;
+            for (uint t = tid; t < seq_len_i; t += 256)
+                local_max = max(local_max, scores[t]);
+            sdata[tid] = local_max;
+            barrier();
+            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] = max(sdata[tid], sdata[tid + s]);
+                barrier();
+            }
+            float max_val = sdata[0];
+            barrier();
+
+            float local_sum = 0.0;
+            for (uint t = tid; t < seq_len_i; t += 256) {
+                float e = exp(scores[t] - max_val);
+                scores[t] = e;
+                local_sum += e;
+            }
+            sdata[tid] = local_sum;
+            barrier();
+            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] += sdata[tid + s];
+                barrier();
+            }
+            float inv_sum = 1.0 / sdata[0];
+            barrier();
+
+            for (uint t = tid; t < seq_len_i; t += 256)
+                scores[t] *= inv_sum;
+            barrier();
+
+            // ─── Phase 3: weighted V sum over [0, seq_len_i). ───
+            for (uint d = tid; d < head_dim; d += 256) {
+                float sum = 0.0;
+                for (uint t = 0; t < seq_len_i; t++) {
+                    uint v_off = t * kv_dim + kv_head * head_dim;
+                    sum += scores[t] * v_cache[v_off + d];
                 }
                 out_data[out_off + d] = sum;
             }
