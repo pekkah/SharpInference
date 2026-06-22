@@ -597,6 +597,353 @@ internal static class Shaders
         }
         """;
 
+    // ════════════════════════════════════════════════════════════════════════════
+    //  Issue #356 PR5a: batched + fused-scan GDN shaders for the one-dispatch-per-
+    //  stage batched PREFILL trunk (PR5b consumes them). Each is BYTE-IDENTICAL to
+    //  N sequential single-token GDN calls (same per-row / per-position arithmetic
+    //  and reduction order as the PR1/PR2 single-token shaders above); only the
+    //  per-token host dispatch overhead is removed. Mirror the CUDA #114-B / #290
+    //  kernels (llm_gdn_*_batched / llm_gdn_recurrence_scan) op-for-op.
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Batched GDN depthwise causal conv1d over a chunk of <c>n_tok</c> tokens (read-only
+    /// state). Bit-identical to <c>n_tok</c> sequential <see cref="GdnConv1dDecode"/> calls.
+    /// Each (channel, token) invocation computes <c>output[i,c]</c> reading the chunk inputs
+    /// <c>x[n_tok, channels]</c> plus the carried pre-chunk <c>state[(K-1), channels]</c>
+    /// (oldest-first); state is NOT mutated here (the advance is a separate dispatch, so all
+    /// concurrent token groups read one snapshot). Sum order matches the single-token shader:
+    /// current tap weight[K-1] first, then taps k=0..K-2 oldest→newest. Mirrors CUDA
+    /// <c>llm_gdn_conv1d_decode_batched</c>.
+    /// Push constants: { uint channels, uint kernel_size, uint n_tok }.
+    /// Bindings: 0=x (in), 1=state (in, read-only), 2=weight (in), 3=output (out).
+    /// Dispatch: (ceil(channels/256), n_tok) workgroups of 256 threads.
+    /// </summary>
+    internal const string GdnConv1dDecodeBatched = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly  buffer X     { float x_data[]; };
+        layout(binding = 1) readonly  buffer State { float state_data[]; };
+        layout(binding = 2) readonly  buffer W     { float w_data[]; };
+        layout(binding = 3) writeonly buffer O     { float o_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint channels;
+            uint kernel_size;
+            uint n_tok;
+        };
+
+        void main() {
+            uint c = gl_GlobalInvocationID.x;
+            uint i = gl_WorkGroupID.y;
+            if (c >= channels || i >= n_tok) return;
+
+            int retained = int(kernel_size) - 1;
+            float x_c = x_data[i * channels + c];
+            float sum = w_data[uint(retained) * channels + c] * x_c;
+            for (int k = 0; k < retained; k++) {
+                int p = int(i) - retained + k;   // chunk-relative position of tap k
+                float val = (p >= 0)
+                    ? x_data[uint(p) * channels + c]
+                    : state_data[uint(p + retained) * channels + c];
+                sum += w_data[uint(k) * channels + c] * val;
+            }
+            o_data[i * channels + c] = sum;
+        }
+        """;
+
+    /// <summary>
+    /// Advance the GDN conv1d state past a chunk of <c>n_tok</c> tokens (matches the sequential
+    /// state evolution after <c>n_tok</c> <see cref="GdnConv1dDecode"/> calls). Reproduces the
+    /// retained-window exactly: <c>new_state[r,c]</c> is the chunk input at position
+    /// <c>(n_tok-(K-1)+r)</c>, or the carried old state when that index is still before the chunk.
+    /// All sources are read into a <c>float tmp[4]</c> (K-1 ≤ 4) BEFORE any write to tolerate the
+    /// in-place aliasing of the small-N case. Mirrors CUDA <c>llm_gdn_conv1d_state_update_batched</c>.
+    /// Push constants: { uint channels, uint kernel_size, uint n_tok }.
+    /// Bindings: 0=x (in), 1=state (in/out).
+    /// Dispatch: ceil(channels/256) workgroups of 256 threads.
+    /// </summary>
+    internal const string GdnConv1dStateUpdateBatched = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer X     { float x_data[]; };
+        layout(binding = 1)          buffer State { float state_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint channels;
+            uint kernel_size;
+            uint n_tok;
+        };
+
+        void main() {
+            uint c = gl_GlobalInvocationID.x;
+            if (c >= channels) return;
+
+            int retained = int(kernel_size) - 1;
+            float tmp[4];   // K-1 <= 4 for our models
+            for (int r = 0; r < retained; r++) {
+                int p = int(n_tok) - retained + r;
+                tmp[r] = (p >= 0)
+                    ? x_data[uint(p) * channels + c]
+                    : state_data[uint(p + retained) * channels + c];
+            }
+            for (int r = 0; r < retained; r++)
+                state_data[uint(r) * channels + c] = tmp[r];
+        }
+        """;
+
+    /// <summary>
+    /// Batched GDN L2-norm per head over <c>n_tok</c> rows. One workgroup per (head, token),
+    /// 256-thread tree reduction. The bound buffer is the data region; <c>offset</c> is the float
+    /// base (host-offset to the Q or K region), <c>row_stride</c> the per-token element stride
+    /// (= conv channels). Per (head, token) ggml L2: <c>scale = 1 / max(sqrt(Σ x²), eps)</c>.
+    /// Bit-identical to <c>n_tok</c> sequential <see cref="GdnL2NormPerHead"/> calls. Mirrors CUDA
+    /// <c>llm_gdn_l2_norm_per_head_batched</c>.
+    /// Push constants: { uint head_dim, uint num_heads, float eps, uint offset, uint row_stride, uint n_tok }.
+    /// Bindings: 0=data (in/out).
+    /// Dispatch: (num_heads, n_tok) workgroups of 256 threads.
+    /// </summary>
+    internal const string GdnL2NormPerHeadBatched = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer Data { float data_buf[]; };
+
+        layout(push_constant) uniform Params {
+            uint head_dim;
+            uint num_heads;
+            float eps;
+            uint offset;
+            uint row_stride;
+            uint n_tok;
+        };
+
+        shared float sdata[256];
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint head = gl_WorkGroupID.x;
+            uint i = gl_WorkGroupID.y;
+            if (head >= num_heads || i >= n_tok) return;
+
+            uint base_off = offset + i * row_stride + head * head_dim;
+
+            float sum = 0.0;
+            for (uint e = tid; e < head_dim; e += 256u) {
+                float v = data_buf[base_off + e];
+                sum += v * v;
+            }
+            sdata[tid] = sum;
+            barrier();
+
+            [[unroll]] for (uint s = 128u; s > 0u; s >>= 1) {
+                if (tid < s) sdata[tid] += sdata[tid + s];
+                barrier();
+            }
+
+            float norm = sqrt(sdata[0]);
+            float divisor = norm > eps ? norm : eps;
+            float inv = 1.0 / divisor;
+            for (uint e = tid; e < head_dim; e += 256u)
+                data_buf[base_off + e] = data_buf[base_off + e] * inv;
+        }
+        """;
+
+    /// <summary>
+    /// Batched GDN tile-heads (GQA-style broadcast) over <c>n_tok</c> rows. One thread per dst
+    /// element: <c>dst[i,idx] = src[i*src_stride + (idx/head_dim % src_heads)*head_dim + idx%head_dim]</c>
+    /// (tile, NOT torch repeat_interleave). <c>src_offset</c>/<c>dst_offset</c> are float base
+    /// offsets (host-offset to Q or K region); <c>src_stride</c>/<c>dst_stride</c> are per-token
+    /// strides (= conv channels / value_dim). Bit-identical to <c>n_tok</c> sequential
+    /// <see cref="GdnTileHeads"/> calls. Mirrors CUDA <c>llm_gdn_tile_heads_batched</c>.
+    /// Push constants: { uint src_heads, uint repeat, uint head_dim, uint src_offset, uint dst_offset, uint src_stride, uint dst_stride, uint n_tok }.
+    /// Bindings: 0=src (in), 1=dst (out).
+    /// Dispatch: (ceil(src_heads*repeat*head_dim/256), n_tok) workgroups of 256 threads.
+    /// </summary>
+    internal const string GdnTileHeadsBatched = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly  buffer Src { float src_data[]; };
+        layout(binding = 1) writeonly buffer Dst { float dst_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint src_heads;
+            uint repeat;
+            uint head_dim;
+            uint src_offset;
+            uint dst_offset;
+            uint src_stride;
+            uint dst_stride;
+            uint n_tok;
+        };
+
+        void main() {
+            uint idx = gl_GlobalInvocationID.x;
+            uint i = gl_WorkGroupID.y;
+            uint total = src_heads * repeat * head_dim;
+            if (idx >= total || i >= n_tok) return;
+            uint j = idx % head_dim;
+            uint h_dst = idx / head_dim;
+            uint h_src = h_dst % src_heads;
+            dst_data[dst_offset + i * dst_stride + idx] =
+                src_data[src_offset + i * src_stride + h_src * head_dim + j];
+        }
+        """;
+
+    /// <summary>
+    /// Fused sequential GDN recurrence scan over a chunk of <c>n_tok</c> tokens (issue #356 PR5a).
+    /// ONE workgroup per v-head, <c>local_size_x = headDim</c> (HARDCODED 128 — same specialization
+    /// as <see cref="GdnRecurrenceDecode"/>); each thread owns output column <c>j</c>. The workgroup
+    /// loops the <c>n_tok</c> positions INTERNALLY, running the EXACT passes of the single-token
+    /// decode at each step (decay→p[j]→d[j]→rank-1+readout→1/√d→RMSNorm→SiLU(z)) and carrying the
+    /// per-head <c>D×D</c> state in the global state buffer between steps; a trailing
+    /// <c>barrier()</c> makes the position boundary clean before the next step reloads shared inputs.
+    /// This is the bit-identical fused form of <c>n_tok</c> sequential
+    /// <see cref="GdnRecurrenceDecode"/> launches — NOT the parallel chunked-scan (which reorders
+    /// the FP reductions). Mirrors CUDA <c>llm_gdn_recurrence_scan</c> op-for-op.
+    ///
+    /// Per-head input strides let q/k come from the tiled <c>[n_tok, value_dim]</c> buffers
+    /// (q_stride/k_stride; head h at <c>i*stride + h*d</c>), v straight from the silu'd conv output
+    /// <c>[n_tok, conv_ch]</c> at <c>v_head_off + h*d</c> (v_stride), z from <c>[n_tok, value_dim]</c>
+    /// (z_stride), alpha/beta from <c>[n_tok, num_v_heads]</c>, output to <c>[n_tok, value_dim]</c>
+    /// (o_stride).
+    ///
+    /// #290/#357 ring capture: when <c>n_capture &gt; 0</c> and <c>i &lt; n_capture</c>, each
+    /// post-Pass-B state element is ALSO written into the ring buffer at
+    /// <c>ring_scan_off + i*ring_slot_stride + state_base + ii*d + j</c> (the exact value the live
+    /// state now holds → byte-identical to the device copy the per-position loop would issue). The
+    /// ring binding is ALWAYS present; PR5a's prefill use and the unit test bind <c>state</c> as a
+    /// placeholder and pass <c>n_capture = 0</c> so nothing is written (every ring store is guarded
+    /// by <c>n_capture &gt; 0 &amp;&amp; i &lt; n_capture</c>). The scan arithmetic and the live
+    /// state evolution are byte-unchanged regardless of capture.
+    /// Push constants: { uint hv, uint d, float norm_eps, uint q_stride, uint k_stride, uint v_stride,
+    ///   uint v_head_off, uint z_stride, uint o_stride, uint n_tok, uint ring_slot_stride,
+    ///   uint n_capture, uint ring_scan_off }.
+    /// Bindings: 0=state (in/out), 1=q, 2=k, 3=v, 4=alpha_in, 5=beta, 6=ssm_a, 7=dt_bias,
+    ///   8=norm_weight, 9=z (all readonly), 10=output (writeonly), 11=ring (writeonly).
+    /// Dispatch: hv workgroups of 128 threads (groupY=1; loops n_tok internally).
+    /// </summary>
+    internal const string GdnRecurrenceScan = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 128) in;
+
+        layout(binding = 0)            buffer State  { float state_data[]; };
+        layout(binding = 1) readonly   buffer Q      { float q_data[]; };
+        layout(binding = 2) readonly   buffer K      { float k_data[]; };
+        layout(binding = 3) readonly   buffer V      { float v_data[]; };
+        layout(binding = 4) readonly   buffer AlphaIn{ float alpha_data[]; };
+        layout(binding = 5) readonly   buffer Beta   { float beta_data[]; };
+        layout(binding = 6) readonly   buffer SsmA   { float ssma_data[]; };
+        layout(binding = 7) readonly   buffer DtBias { float dtbias_data[]; };
+        layout(binding = 8) readonly   buffer NormW  { float normw_data[]; };
+        layout(binding = 9) readonly   buffer Z      { float z_data[]; };
+        layout(binding = 10) writeonly buffer O      { float o_data[]; };
+        layout(binding = 11) writeonly buffer Ring   { float ring_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint hv;
+            uint d;
+            float norm_eps;
+            uint q_stride;
+            uint k_stride;
+            uint v_stride;
+            uint v_head_off;
+            uint z_stride;
+            uint o_stride;
+            uint n_tok;
+            uint ring_slot_stride;
+            uint n_capture;
+            uint ring_scan_off;
+        };
+
+        shared float sK[128];
+        shared float sQ[128];
+        shared float sV[128];
+        shared float sZ[128];
+        shared float sNormW[128];
+        shared float sP[128];
+        shared float sD[128];
+        shared float sRed[128];
+
+        void main() {
+            uint h = gl_WorkGroupID.x;
+            uint j = gl_LocalInvocationID.x;
+
+            sNormW[j] = normw_data[j];          // layer-constant; each thread reads own j
+            // d is fixed at 128 (== local_size_x == headDim, enforced by the wrapper). Using the
+            // literal lets the SPIR-V compiler strength-reduce i*128 → i<<7 and unroll the loops.
+            uint state_base = h * 16384u;       // h * d * d
+
+            for (uint i = 0u; i < n_tok; i++) {
+                uint qoff = i * q_stride + h * d;
+                uint koff = i * k_stride + h * d;
+                uint voff = i * v_stride + v_head_off + h * d;
+                uint zoff = i * z_stride + h * d;
+                sK[j] = k_data[koff + j];
+                sQ[j] = q_data[qoff + j];
+                sV[j] = v_data[voff + j];
+                sZ[j] = z_data[zoff + j];
+                barrier();
+
+                float alpha_x = alpha_data[i * hv + h] + dtbias_data[h];
+                float dt      = alpha_x >= 20.0 ? alpha_x : log(1.0 + exp(alpha_x));   // softplus
+                float decay   = exp(dt * ssma_data[h]);
+                float b_sc    = 1.0 / (1.0 + exp(-beta_data[i * hv + h]));
+
+                // Pass A: decay S, accumulate p[j] = Σ_i k[i]·S[i,j].
+                float p_local = 0.0;
+                for (uint ii = 0u; ii < 128u; ii++) {
+                    uint off = state_base + ii * 128u + j;
+                    float sij = state_data[off] * decay;
+                    state_data[off] = sij;
+                    p_local += sK[ii] * sij;
+                }
+                sP[j] = p_local;
+                barrier();
+
+                float d_j = b_sc * (sV[j] - sP[j]);
+                sD[j] = d_j;
+                barrier();
+
+                // Pass B: rank-1 update S[i,j] += k[i]·d[j], fused with readout o[j].
+                // #290 ring capture: mirror each post-update element into ring slot i (same value
+                // the live state now holds → byte-identical to the per-position device copy).
+                bool capture = n_capture > 0u && i < n_capture;
+                uint ring_i = ring_scan_off + i * ring_slot_stride + state_base;
+                float o_local = 0.0;
+                for (uint ii = 0u; ii < 128u; ii++) {
+                    uint off = state_base + ii * 128u + j;
+                    float sij = state_data[off] + sK[ii] * d_j;
+                    state_data[off] = sij;
+                    if (capture) ring_data[ring_i + ii * 128u + j] = sij;
+                    o_local += sQ[ii] * sij;
+                }
+                o_local *= inversesqrt(128.0);
+
+                sRed[j] = o_local * o_local;
+                barrier();
+                [[unroll]] for (uint s = 64u; s > 0u; s >>= 1) {
+                    if (j < s) sRed[j] += sRed[j + s];
+                    barrier();
+                }
+                float scale = inversesqrt(sRed[0] / 128.0 + norm_eps);
+                float o_normed = o_local * scale * sNormW[j];
+
+                float zv = sZ[j];
+                float silu = zv / (1.0 + exp(-zv));
+                o_data[i * o_stride + h * d + j] = o_normed * silu;
+                barrier();                       // position boundary: next step reloads shared
+            }
+        }
+        """;
+
     /// <summary>
     /// RoPE NEOX *partial* rotation: rotates only the first <c>rope_dim</c> of each
     /// <c>head_dim</c>-wide head and passes dims <c>[rope_dim, head_dim)</c> through untouched.
