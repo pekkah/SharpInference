@@ -2672,6 +2672,254 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Quantize FP32 activations → Q8_1 (per 32-element sub-block), int8 path for the DP4A
+    /// batched Q4_K matvec (issue #308 P0/P1). Mirrors CUDA's <c>llm_quantize_q8_1</c> exactly:
+    /// per 32-element sub-block compute <c>amax = max|x|</c> over the 32 lanes, <c>d = amax/127</c>,
+    /// <c>q = clamp(round(x/d), -127, 127)</c> (int8), and <c>qsum = Σq</c>. Each 32-element
+    /// sub-block emits ONE 36-byte Q8_1 block:
+    ///   bytes [0:2]  = fp16 d
+    ///   bytes [2:4]  = fp16 (d · qsum)   (the min-bias scale `s` — only the Q4_K MMQ reads it)
+    ///   bytes [4:36] = 32 × int8 quants
+    /// Input is row-major <c>[nTok][cols]</c> FP32; output is row-major
+    /// <c>[nTok][cols/32 × 36 bytes]</c> (one block per 32 input elements). 36 % 4 == 0, so each
+    /// 36-byte block is exactly 9 word-aligned, mutually disjoint uints — the header is word 0
+    /// ({d, s}) and the 32 int8 quants fill words 1..8. The output binds as a <c>uint[]</c> SSBO
+    /// and every word is written PLAINLY (no atomics, no pre-zero dependency): lanes 0..7 each
+    /// assemble one quant word from 4 lanes' int8s via <c>subgroupShuffle</c>, and lane 0 writes
+    /// the header. Each output word is written by exactly one lane.
+    ///
+    /// local_size_x = 256 → 8 sub-blocks per workgroup, 32 lanes each (#318 pins the subgroup to 32,
+    /// which the subgroupMax/subgroupAdd reductions + the subgroupShuffle packing require).
+    ///
+    /// Bindings: 0 = input (float, [nTok][cols]), 1 = output (uint, Q8_1 packed bytes).
+    /// Push constants: { uint rows, uint cols, uint nTok } — `rows` is unused (kept for the shared
+    /// MatVecBatchedParams push-constant struct); the dispatch covers nTok·(cols/32) sub-blocks.
+    /// </summary>
+    internal const string QuantizeQ8_1 = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+        #extension GL_KHR_shader_subgroup_arithmetic : enable
+        #extension GL_KHR_shader_subgroup_shuffle : enable
+
+        // 8 sub-blocks per workgroup, 32 lanes per sub-block = 256 threads.
+        #define SUBBLOCKS_PER_WG 8
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly  buffer Input  { float input_data[]; };
+        layout(binding = 1) writeonly buffer Output { uint  out_data[];   };
+
+        layout(push_constant) uniform Params {
+            uint rows;   // unused (shared param struct)
+            uint cols;
+            uint nTok;
+        };
+
+        void main() {
+            uint tid  = gl_LocalInvocationID.x;
+            uint lane = tid & 31u;
+
+            uint sub_blocks_per_tok = cols >> 5;            // cols / 32
+            uint total_sub_blocks   = nTok * sub_blocks_per_tok;
+            uint sb = gl_WorkGroupID.x * SUBBLOCKS_PER_WG + (tid >> 5);
+            if (sb >= total_sub_blocks) return;
+
+            uint tok    = sb / sub_blocks_per_tok;
+            uint sb_tok = sb - tok * sub_blocks_per_tok;    // sub-block index within the token
+
+            float val = input_data[tok * cols + sb_tok * 32u + lane];
+
+            // amax / d / q / qsum over the 32-lane sub-block (mirrors CUDA llm_quantize_q8_1).
+            float a    = subgroupMax(abs(val));
+            float d    = a / 127.0;
+            float invd = (d == 0.0) ? 0.0 : (1.0 / d);
+            int   q    = clamp(int(round(val * invd)), -127, 127);
+            int   qsum = subgroupAdd(q);
+
+            // 36-byte Q8_1 block = 9 aligned, disjoint words: word 0 = {fp16 d, fp16 d·qsum},
+            // words 1..8 = 32 int8 quants. Each output word written by exactly one lane.
+            uint word_base = sb * 9u;
+            uint qb = uint(q) & 0xFFu;                       // this lane's int8 quant (low byte)
+
+            // Pack 4 adjacent lanes' quants per word. subgroupShuffle must run in UNIFORM control
+            // flow (all 32 lanes active) — its source lanes span the whole subgroup — so the shuffle
+            // happens for every lane and only lanes 0..7 store. Word w (w = lane) gathers lanes 4w..4w+3.
+            uint src = (lane * 4u) & 31u;                    // in-range for all lanes; only lane<8 stores
+            uint b0 = subgroupShuffle(qb, src + 0u);
+            uint b1 = subgroupShuffle(qb, src + 1u);
+            uint b2 = subgroupShuffle(qb, src + 2u);
+            uint b3 = subgroupShuffle(qb, src + 3u);
+            if (lane < 8u)
+                out_data[word_base + 1u + lane] = b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+
+            if (lane == 0u) {
+                uint d_bits = packHalf2x16(vec2(d, 0.0)) & 0xFFFFu;
+                uint s_bits = packHalf2x16(vec2(d * float(qsum), 0.0)) & 0xFFFFu;
+                out_data[word_base] = d_bits | (s_bits << 16u);
+            }
+        }
+        """;
+
+    /// <summary>
+    /// Batched (weight-stationary) Q4_K matvec via int8-activation DP4A — the make-or-break
+    /// weight-amortization for Vulkan speculative decoding (issue #308 P1). Drop-in replacement
+    /// for <see cref="MatVecBatchedQ4K"/> when <c>VK_KHR_shader_integer_dot_product</c> is present;
+    /// the FP variant remains the fallback. Mirrors CUDA's <c>llm_matvec_q4k_ws_n</c> exactly.
+    ///
+    /// The expensive per-weight work (read the Q4_K nibble word, unpack the 6-bit (sc, mn) pair,
+    /// fold super_d·sc / super_dmin·mn — all token-INVARIANT) is hoisted ONCE per output element.
+    /// The per-token inner cost collapses from 8 FP loads+FMAs/weight-word to: load one int8
+    /// activation word + its fp16 scale, then two <c>dotPacked4x8AccSatEXT</c> intrinsics
+    ///   dot = ⟨nibbles, q_act⟩,   sum = ⟨0x01010101, q_act⟩ (the Σq min-bias),
+    /// and fold the scales onto the int32 dot. Identity (per 32-element sub-block):
+    ///   Σ w·a = (super_d · sc · d8) · Σ(nibble · q)  −  (super_dmin · mn · d8) · Σq.
+    /// The activation is read from the Q8_1 buffer (<see cref="QuantizeQ8_1"/>), NOT FP32.
+    ///
+    /// LOSSY (int8 activation quant) but ARGMAX-STABLE vs <see cref="MatVecBatchedQ4K"/> — the same
+    /// trade-off as the CUDA DP4A path. Spec-decode verify accepts on argmax, so greedy spec stays
+    /// lossless; the parity test relaxes to argmax-match + maxAbs &lt; 1.0 (not bit-exact).
+    ///
+    /// SaturatING dp4a (<c>...AccSatEXT</c>) — the int32 acc starts at 0 and the per-call partial
+    /// sums (4×|nibble≤15|×|q≤127| ≤ 7620, or 4×127 for Σq) never overflow, so the saturation is
+    /// inert and the result equals a plain <c>dotPacked4x8EXT</c>; the Sat overload is used only
+    /// because it is the most broadly supported entry point.
+    ///
+    /// Lane→element layout is IDENTICAL to <see cref="MatVecBatchedQ4K"/> / the single-row
+    /// MatVecQ4K (chunk = lane>>3, the 8 weight uints per chunk, sub-block 2·chunk = low nibbles,
+    /// 2·chunk+1 = high nibbles), so the dp4a sum reproduces the same weight·activation pairing.
+    ///
+    /// Bindings: 0 = Q4_K weights (uint8), 1 = Q8_1 activations (uint, [nTok][cols/32 × 36 B]),
+    /// 2 = outputs (float, row-major [nTok][rows]). Push constants: { uint rows, uint cols, uint nTok }.
+    /// local_size_x = 256 (8 rows × 32 lanes) → #318 pins the subgroup to 32 (THREADS_PER_ROW == 32).
+    /// </summary>
+    internal const string MatVecBatchedQ4KInt8 = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+        #extension GL_KHR_shader_subgroup_arithmetic : enable
+        #extension GL_EXT_integer_dot_product : require
+
+        #define N_ROWS 8
+        #define THREADS_PER_ROW 32
+        #define MAX_NTOK 8
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Weights { uint weights_data[]; };
+        layout(binding = 1) readonly buffer Acts    { uint act_data[];     }; // Q8_1 packed
+        layout(binding = 2) writeonly buffer Output { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint rows;
+            uint cols;
+            uint nTok;
+        };
+
+        // Read a uint at an arbitrary BYTE offset from the (uint-typed) Q8_1 buffer. The Q8_1
+        // 36-byte stride keeps every header 4-aligned, but the 4-int8 activation reads at
+        // byte_off ∈ {0,4,…,28} land at base+4, which is 4-aligned too (block base is a multiple
+        // of 36 → base%4 == 0). So a direct word index suffices; assert via the >>2.
+        uint actWord(uint byteAddr) { return act_data[byteAddr >> 2]; }
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint row_in_wg = tid / THREADS_PER_ROW;
+            uint lane = tid % THREADS_PER_ROW;
+            uint row = gl_WorkGroupID.x * N_ROWS + row_in_wg;
+            if (row >= rows) return;
+
+            uint num_blocks = cols >> 8;                 // 256-element super-blocks per row
+            uint word_row_base = row * num_blocks * 36u; // 36 uints per super-block
+
+            // Q8_1 activation row stride: (cols/32) sub-blocks × 36 bytes.
+            uint tok_byte_stride = (cols >> 5) * 36u;
+
+            uint chunk     = lane >> 3;                  // 0..3
+            uint byte_off  = (lane & 7u) * 4u;           // 0,4,…,28
+            uint q4_offset = 4u + chunk * 8u + (lane & 7u);
+
+            float acc[MAX_NTOK];
+            [[unroll]] for (uint k = 0; k < MAX_NTOK; k++) acc[k] = 0.0;
+
+            for (uint block = 0; block < num_blocks; block++) {
+                uint word_base = word_row_base + block * 36u;
+
+                vec2 dm = unpackHalf2x16(weights_data[word_base]);
+                float super_d    = dm.x;
+                float super_dmin = dm.y;
+
+                uint sm0 = weights_data[word_base + 1];
+                uint sm1 = weights_data[word_base + 2];
+                uint sm2 = weights_data[word_base + 3];
+
+                // Unpack this lane's two 6-bit (sc, mn) pairs: lo = sub-block 2·chunk, hi = 2·chunk+1.
+                uint sc_lo, mn_lo, sc_hi, mn_hi;
+                if (chunk == 0u) {
+                    sc_lo = (sm0)        & 63u; mn_lo = (sm1)        & 63u;
+                    sc_hi = (sm0 >>  8u) & 63u; mn_hi = (sm1 >>  8u) & 63u;
+                } else if (chunk == 1u) {
+                    sc_lo = (sm0 >> 16u) & 63u; mn_lo = (sm1 >> 16u) & 63u;
+                    sc_hi = (sm0 >> 24u) & 63u; mn_hi = (sm1 >> 24u) & 63u;
+                } else if (chunk == 2u) {
+                    sc_lo = (sm2         & 0xFu) | (((sm0 >>  6u) & 3u) << 4u);
+                    mn_lo = ((sm2 >>  4u) & 0xFu) | (((sm1 >>  6u) & 3u) << 4u);
+                    sc_hi = ((sm2 >>  8u) & 0xFu) | (((sm0 >> 14u) & 3u) << 4u);
+                    mn_hi = ((sm2 >> 12u) & 0xFu) | (((sm1 >> 14u) & 3u) << 4u);
+                } else {
+                    sc_lo = ((sm2 >> 16u) & 0xFu) | (((sm0 >> 22u) & 3u) << 4u);
+                    mn_lo = ((sm2 >> 20u) & 0xFu) | (((sm1 >> 22u) & 3u) << 4u);
+                    sc_hi = ((sm2 >> 24u) & 0xFu) | (((sm0 >> 30u) & 3u) << 4u);
+                    mn_hi = ((sm2 >> 28u) & 0xFu) | (((sm1 >> 30u) & 3u) << 4u);
+                }
+
+                // Load this lane's weight word once; split into 4 low + 4 high nibbles.
+                uint wq    = weights_data[word_base + q4_offset];
+                uint wq_lo = wq & 0x0F0F0F0Fu;          // 4 low nibbles  → sub-block 2·chunk
+                uint wq_hi = (wq >> 4u) & 0x0F0F0F0Fu;  // 4 high nibbles → sub-block 2·chunk+1
+
+                // Token-invariant folded scales (weight read amortized across all nTok tokens).
+                float sd_sc_lo = super_d    * float(sc_lo);
+                float sm_mn_lo = super_dmin * float(mn_lo);
+                float sd_sc_hi = super_d    * float(sc_hi);
+                float sm_mn_hi = super_dmin * float(mn_hi);
+
+                // Q8_1 byte base for the two sub-blocks (within a token's activation row).
+                uint q81_base_lo = (block * 8u + chunk * 2u)      * 36u;
+                uint q81_base_hi = (block * 8u + chunk * 2u + 1u) * 36u;
+
+                for (uint k = 0; k < nTok; k++) {
+                    uint tok_base = k * tok_byte_stride;
+
+                    // fp16 activation scale d8 (low 16 bits of each block header).
+                    float d8_lo = unpackHalf2x16(actWord(tok_base + q81_base_lo)).x;
+                    float d8_hi = unpackHalf2x16(actWord(tok_base + q81_base_hi)).x;
+
+                    // 4 int8 activations per sub-block at byte offset (4 + byte_off).
+                    uint act_lo = actWord(tok_base + q81_base_lo + 4u + byte_off);
+                    uint act_hi = actWord(tok_base + q81_base_hi + 4u + byte_off);
+
+                    // dp4a (signed×signed int8): dot(4 nibbles, 4 int8 acts) + Σq via
+                    // dot(0x01010101, acts). The signed EXT overload takes int args, so the
+                    // packed uints are bit-reinterpreted to int (nibbles 0..15 are positive →
+                    // identical bits; mirrors CUDA's (int)wq_lo / (int)0x01010101 casts).
+                    int dot_lo = dotPacked4x8AccSatEXT(int(wq_lo),       int(act_lo), 0);
+                    int dot_hi = dotPacked4x8AccSatEXT(int(wq_hi),       int(act_hi), 0);
+                    int sum_lo = dotPacked4x8AccSatEXT(int(0x01010101u), int(act_lo), 0);
+                    int sum_hi = dotPacked4x8AccSatEXT(int(0x01010101u), int(act_hi), 0);
+
+                    acc[k] += (sd_sc_lo * d8_lo) * float(dot_lo) - (sm_mn_lo * d8_lo) * float(sum_lo);
+                    acc[k] += (sd_sc_hi * d8_hi) * float(dot_hi) - (sm_mn_hi * d8_hi) * float(sum_hi);
+                }
+            }
+
+            for (uint k = 0; k < nTok; k++) {
+                float r = subgroupAdd(acc[k]);
+                if (subgroupElect())
+                    output_data[k * rows + row] = r;
+            }
+        }
+        """;
+
+    /// <summary>
     /// Batched (M=K) weight-stationary matrix-vector multiply with Q6_K dequantization —
     /// the Q6_K sibling of <see cref="MatVecBatchedQ4K"/>. Q4_K_M models pack most weights
     /// as Q4_K but keep ffn_down and token_embd/output as Q6_K, so the batched trunk needs

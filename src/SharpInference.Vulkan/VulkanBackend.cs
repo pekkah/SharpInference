@@ -192,6 +192,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     {
         var fence = _fence;
         _vkd.vkWaitForFences(1, &fence, true, ulong.MaxValue).CheckResult();
+        FlushPendingScratchFrees();
     }
 
     // ── Image-ops batch recording (IImageOpsBackend) ──────────────────────
@@ -241,6 +242,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             _vkd.vkQueueSubmit(_computeQueue, 1, &submit, _fence).CheckResult();
         }
         _vkd.vkWaitForFences(1, &fence, true, ulong.MaxValue).CheckResult();
+        FlushPendingScratchFrees();
     }
 
     /// <summary>Submit the async command buffer (background thread) and wait via its fence.</summary>
@@ -481,9 +483,22 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
                 hasSubgroupSizeControl ? (void*)&sgSizeFeatures :
                 featureChain;
 
+            // Prepend the integer-dot-product feature (issue #308 int8-DP4A batched matvec). The
+            // dotPacked4x8AccSatEXT intrinsic emits OpSDotAccSat, which the Vulkan spec requires
+            // shaderIntegerDotProduct to be ENABLED for (VUID-RuntimeSpirv-shaderIntegerDotProduct-
+            // 06279) — enabling the extension alone is insufficient. NVIDIA tolerates it, but strict
+            // drivers reject the pipeline and validation layers flag every dispatch without this.
+            VkPhysicalDeviceShaderIntegerDotProductFeatures intDotFeatures = new()
+            {
+                shaderIntegerDotProduct = VkBool32.True,
+                pNext = pNextChain,
+            };
+
+            void* finalChain = hasIntDot ? (void*)&intDotFeatures : pNextChain;
+
             VkDeviceCreateInfo deviceCI = new()
             {
-                pNext = pNextChain,
+                pNext = finalChain,
                 queueCreateInfoCount = 1,
                 pQueueCreateInfos = &queueCI,
                 enabledExtensionCount = (uint)enabledExtCount,
@@ -846,6 +861,49 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private GpuBuffer? _downloadStaging;
     private ulong _downloadStagingSize;
 
+    // Q8_1 activation scratch for the DP4A batched Q4_K matvec (issue #308). Holds the
+    // int8-quantized inputs for all nTok tokens: nTok · (cols/32) blocks × 36 bytes. Grown on
+    // demand (current capacity tracked in bytes), reused across MatMulBatched calls, freed in
+    // Dispose. Bound as an Int8 tensor; the shaders alias it as a uint[] SSBO.
+    private Tensor? _q81BatchBuf;
+    private long _q81BatchBufBytes;
+    // When the scratch must grow MID-RECORDING (the BatchVerify trunk records many matmuls of
+    // different cols into one submission), the old buffer is still referenced by already-recorded
+    // dispatches — freeing it immediately is a use-after-free that faults the device. Stash it here
+    // and free it after the next submit (when the GPU is idle), via FlushPendingScratchFrees().
+    private readonly List<Tensor> _pendingScratchFrees = new();
+
+    /// <summary>
+    /// Ensure <see cref="_q81BatchBuf"/> is at least nTok·(cols/32)·36 bytes. Grows (re-allocates)
+    /// on demand; the buffer is reused across calls and freed in Dispose. Growing during a recording
+    /// session defers the old buffer's free until after the next submit (it may still be referenced
+    /// by recorded-but-unsubmitted dispatches).
+    /// </summary>
+    private void EnsureQ81BatchBuf(int nTok, int cols)
+    {
+        long needed = (long)nTok * (cols / 32) * 36L;
+        if (_q81BatchBuf is not null && _q81BatchBufBytes >= needed)
+            return;
+        if (_q81BatchBuf is not null)
+        {
+            if (_recording) _pendingScratchFrees.Add(_q81BatchBuf); // free after submit (GPU idle)
+            else Free(_q81BatchBuf);
+        }
+        // Allocate as Int8 (1 byte/element) so ElementCount == byte count; the shaders alias it as
+        // a uint[] SSBO. needed is a multiple of 36, hence a multiple of 4 → safe as uint words.
+        _q81BatchBuf = Allocate(TensorShape.D1(needed), DType.Int8);
+        _q81BatchBufBytes = needed;
+    }
+
+    /// <summary>Free Q8_1 scratch buffers stranded by a mid-recording grow. Called after a submit
+    /// completes (the GPU is idle, so no recorded dispatch still references them).</summary>
+    private void FlushPendingScratchFrees()
+    {
+        if (_pendingScratchFrees.Count == 0) return;
+        foreach (var t in _pendingScratchFrees) Free(t);
+        _pendingScratchFrees.Clear();
+    }
+
     public void Download(Tensor src, Span<float> dst)
     {
         var gpuBuf = GetBuffer(src);
@@ -1082,6 +1140,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _sigmoidPipeline;
     private ComputePipeline? _matVecQ4KPipeline;
     private ComputePipeline? _matVecBatchedQ4KPipeline;
+    private ComputePipeline? _matVecBatchedQ4KInt8Pipeline;
+    private ComputePipeline? _quantizeQ8_1Pipeline;
     private ComputePipeline? _matVecBatchedQ6KPipeline;
     private ComputePipeline? _matVecQ6KPipeline;
     private ComputePipeline? _matVecQ5KPipeline;
@@ -1531,8 +1591,64 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             return;
         }
 
-        _matVecBatchedQ4KPipeline ??= new ComputePipeline(this, Shaders.MatVecBatchedQ4K, 3, pushConstantSize: sizeof(MatVecBatchedParams));
         var p = new MatVecBatchedParams { rows = (uint)rows, cols = (uint)cols, nTok = (uint)nTok };
+
+        // DP4A int8-activation path (issue #308 P1): quantize the FP32 inputs to Q8_1 once, then the
+        // matvec reads packed int8 + two dotPacked4x8AccSatEXT per weight word — the per-token cost
+        // collapses from 8 FP loads+FMAs/word to ~2 int loads + 2 dp4a. LOSSY but argmax-stable vs
+        // the FP path (spec-decode verify accepts on argmax → lossless greedy). Capability-gated;
+        // try/catch falls back to the FP shader (mirrors Sgemm) if pipeline creation fails.
+        if (HasShaderIntegerDotProduct)
+        {
+            try
+            {
+                _quantizeQ8_1Pipeline ??= new ComputePipeline(this, Shaders.QuantizeQ8_1, 2, pushConstantSize: sizeof(MatVecBatchedParams));
+                _matVecBatchedQ4KInt8Pipeline ??= new ComputePipeline(this, Shaders.MatVecBatchedQ4KInt8, 3, pushConstantSize: sizeof(MatVecBatchedParams));
+
+                EnsureQ81BatchBuf(nTok, cols);
+                var q81 = GetBuffer(_q81BatchBuf!);
+
+                // The Q8_1 scratch is SHARED across all MatMulBatched calls in a recording session
+                // (e.g. the BatchVerify trunk's many matmuls). A prior call's matvec READ of the
+                // scratch must complete before THIS quantize OVERWRITES it (WAR hazard) — and the
+                // matvec must see this quantize's writes (RAW). In recording mode bracket both with
+                // compute→compute barriers; in immediate mode each DispatchWith submits+waits, so the
+                // prior read is already retired and the quant pass completes before the matvec begins.
+                if (_recording) RecordBarrier();
+
+                // Quantize: nTok·(cols/32) sub-blocks, 8 per workgroup.
+                uint subBlocks = (uint)nTok * ((uint)cols >> 5);
+                uint qGroups = (subBlocks + 7u) / 8u;
+                DispatchOrRecord(_quantizeQ8_1Pipeline, [GetBuffer(inputAll), q81], qGroups, &p);
+
+                if (_recording) RecordBarrier();
+
+                DispatchOrRecord(_matVecBatchedQ4KInt8Pipeline,
+                    [GetBuffer(matrix), q81, GetBuffer(outputAll)], ((uint)rows + 7) / 8, &p);
+                return;
+            }
+            catch (Exception)
+            {
+                HasShaderIntegerDotProduct = false;
+                _quantizeQ8_1Pipeline?.Dispose();
+                _quantizeQ8_1Pipeline = null;
+                _matVecBatchedQ4KInt8Pipeline?.Dispose();
+                _matVecBatchedQ4KInt8Pipeline = null;
+                // The int8 path is now permanently disabled — release its scratch (a prior
+                // successful call may have allocated it). Defer the free if a recorded-but-
+                // unsubmitted dispatch could still reference it (same UAF guard as the grow path).
+                if (_q81BatchBuf is not null)
+                {
+                    if (_recording) _pendingScratchFrees.Add(_q81BatchBuf);
+                    else Free(_q81BatchBuf);
+                    _q81BatchBuf = null;
+                    _q81BatchBufBytes = 0;
+                }
+                // Fall through to the FP fallback below.
+            }
+        }
+
+        _matVecBatchedQ4KPipeline ??= new ComputePipeline(this, Shaders.MatVecBatchedQ4K, 3, pushConstantSize: sizeof(MatVecBatchedParams));
         var bufs = (ReadOnlySpan<GpuBuffer>)[GetBuffer(matrix), GetBuffer(inputAll), GetBuffer(outputAll)];
         DispatchOrRecord(_matVecBatchedQ4KPipeline, bufs, ((uint)rows + 7) / 8, &p);
     }
@@ -2457,6 +2573,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _sigmoidPipeline?.Dispose();
         _matVecQ4KPipeline?.Dispose();
         _matVecBatchedQ4KPipeline?.Dispose();
+        _matVecBatchedQ4KInt8Pipeline?.Dispose();
+        _quantizeQ8_1Pipeline?.Dispose();
         _matVecBatchedQ6KPipeline?.Dispose();
         _matVecQ6KPipeline?.Dispose();
         _matVecQ5KPipeline?.Dispose();

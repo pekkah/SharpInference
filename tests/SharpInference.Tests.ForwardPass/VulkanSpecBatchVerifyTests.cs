@@ -231,19 +231,22 @@ public sealed class VulkanSpecBatchVerifyTests
 
         Assert.Equal(k, batch.Length);
         float worst = 0f;
+        // The batched trunk runs the int8-activation DP4A Q4_K matvec (issue #308 P1): LOSSY vs the
+        // K-loop's FP single-row matvec, so it is ARGMAX-stable, not bit-exact. The Q8_0 K-loop
+        // fallback model stays bit-exact (no int8 path for Q8_0).
+        bool int8Trunk = fwd.CanBatchedTrunk;
+        float tol = int8Trunk ? 1.0f : 1e-4f;
         for (int i = 0; i < k; i++)
         {
             Assert.Equal(Argmax(reference[i]), Argmax(batch[i]));
             float maxAbs = MaxAbsDiff(reference[i], batch[i]);
             worst = MathF.Max(worst, maxAbs);
-            // Batched path is bit-exact to the K-loop for the SAME KV dtype (same narrowed reads +
-            // same per-query causal range) → maxAbs is 0 in practice. Keep a tiny tolerance only as
-            // a guard against any future FP-association change in a shared kernel.
-            Assert.True(maxAbs < 1e-4f,
-                $"Position {i}: batched vs sequential logits diverged beyond the bit-exact " +
-                $"K-loop tolerance (kv={kvDtype}): maxAbs={maxAbs}.");
+            Assert.True(maxAbs < tol,
+                $"Position {i}: batched vs sequential logits diverged beyond the " +
+                $"{(int8Trunk ? "int8 argmax-stable" : "bit-exact K-loop")} tolerance " +
+                $"(kv={kvDtype}): maxAbs={maxAbs}.");
         }
-        _out.WriteLine($"{modelFile} kv={kvDtype} k={k} batchedTrunk={fwd.CanBatchedTrunk} worstMaxAbs={worst:E3}");
+        _out.WriteLine($"{modelFile} kv={kvDtype} k={k} batchedTrunk={fwd.CanBatchedTrunk} int8Trunk={int8Trunk} worstMaxAbs={worst:E3}");
 
         // After BatchVerify the cache must hold exactly P + k positions (all k K/V appended).
         Assert.Equal(P + k, fwd.KvLength);
@@ -294,11 +297,13 @@ public sealed class VulkanSpecBatchVerifyTests
             float[][] batch = fwd.BatchVerify(tokens, P);
 
             Assert.Equal(k, batch.Length);
+            // Batched trunk = int8 DP4A matvec → argmax-stable (not bit-exact) vs the FP K-loop.
             for (int i = 0; i < k; i++)
             {
                 Assert.Equal(Argmax(reference[i]), Argmax(batch[i]));
-                Assert.True(MaxAbsDiff(reference[i], batch[i]) < 1e-4f,
-                    $"k={k} pos={i}: batched diverged from the K-loop oracle (scratch-sizing).");
+                Assert.True(MaxAbsDiff(reference[i], batch[i]) < 1.0f,
+                    $"k={k} pos={i}: batched diverged from the K-loop oracle beyond the int8 " +
+                    "argmax-stable tolerance (scratch-sizing).");
             }
             _out.WriteLine($"variable-k: k={k} OK");
         }
@@ -346,10 +351,17 @@ public sealed class VulkanSpecBatchVerifyTests
         fwd.TruncateTo(P + 1);
         float[] committed = fwd.Forward(t1, P + 1).ToArray();
 
+        // The commit is a pure FP Forward, but it ATTENDS to the K/V at position P that BatchVerify
+        // wrote from int8-DP4A-computed activations (the batched trunk, issue #308 P1). So the
+        // committed logits differ from the all-FP reference by int8 noise, not bit-exactly — the
+        // contract is argmax stability (the accepted-token trajectory is unchanged), with a tolerance
+        // matching the int8 path. On the Q8_0 K-loop fallback model the trunk is FP → bit-exact.
         Assert.Equal(Argmax(reference), Argmax(committed));
+        float tol = fwd.CanBatchedTrunk ? 1.0f : 1e-4f;
         float maxAbs = MaxAbsDiff(reference, committed);
-        Assert.True(maxAbs < 1e-4f,
-            $"Post-rollback commit diverged from the sequential trajectory: maxAbs={maxAbs}.");
+        Assert.True(maxAbs < tol,
+            $"Post-rollback commit diverged from the sequential trajectory beyond the " +
+            $"{(fwd.CanBatchedTrunk ? "int8 argmax-stable" : "bit-exact")} tolerance: maxAbs={maxAbs}.");
     }
 
     /// <summary>
@@ -434,5 +446,92 @@ public sealed class VulkanSpecBatchVerifyTests
         Assert.True(medBatched <= medKloop * 1.5,
             $"Batched trunk should not be much slower than the K-loop: " +
             $"batched={medBatched:F2}ms vs kloop={medKloop:F2}ms.");
+    }
+
+    /// <summary>
+    /// Micro-bench (GPU-only, gated on SHARPI_RUN_VULKAN_SPEC_BENCH=1): the PER-MATVEC arbiter for
+    /// issue #308 P1. Times one int8-DP4A <c>MatMulBatched(Q4_K, k)</c> against k single-row
+    /// <c>MatMul(Q4_K)</c> calls on a realistic Q4_K weight (rows×cols ≈ a Qwen3-8B trunk matmul),
+    /// and reports the ratio. GO if k=4 ≤ ~1.5× a single matvec (the FP batched path was ~2.1×):
+    /// the per-token cost must collapse for the verify to win. Logs the ratio; asserts only a loose
+    /// non-regression so it never gates CI on timing noise. Synthetic weights (no model file needed).
+    /// </summary>
+    [Theory]
+    [InlineData(4)]
+    [InlineData(6)]
+    [InlineData(8)]
+    public void MatVecBatchedQ4KInt8_PerMatVec_MicroBench(int k)
+    {
+        if (Environment.GetEnvironmentVariable("SHARPI_RUN_VULKAN_SPEC_BENCH") != "1")
+            return;
+
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        // Qwen3-8B-ish trunk matmul: ffn_down is [4096 × 12288]; use that (largest cols).
+        const int rows = 4096;
+        const int cols = 12288;
+        int blocksPerRow = cols / 256;
+        const int blockBytes = 144;
+        var weightBytes = new byte[rows * blocksPerRow * blockBytes];
+        var wr = new Random(4242);
+        for (int b = 0, off = 0; b < rows * blocksPerRow; b++, off += blockBytes)
+        {
+            PutHalf16(weightBytes, off, (float)(wr.NextDouble() * 0.045 + 0.005));
+            PutHalf16(weightBytes, off + 2, (float)(wr.NextDouble() * 0.002 + 0.0005));
+            for (int j = 4; j < blockBytes; j++) weightBytes[off + j] = (byte)wr.Next(0, 256);
+        }
+        int floatCount = (weightBytes.Length + 3) / 4;
+        var rawAsFloats = new float[floatCount];
+        weightBytes.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsBytes(rawAsFloats.AsSpan()));
+        var gpuWeights = gpu.Upload(rawAsFloats, TensorShape.D1(floatCount));
+
+        var inputAll = new float[k * cols];
+        var ir = new Random(7);
+        for (int i = 0; i < inputAll.Length; i++) inputAll[i] = (float)(ir.NextDouble() * 2 - 1);
+        var gpuInputAll = gpu.Upload(inputAll, TensorShape.D1(k * cols));
+        var gpuOutputAll = gpu.Allocate(TensorShape.D1(k * rows));
+        var gpuInK = gpu.Upload(inputAll.AsSpan(0, cols).ToArray(), TensorShape.D1(cols));
+        var gpuOutK = gpu.Allocate(TensorShape.D1(rows));
+
+        // Warm up.
+        gpu.MatMulBatched(gpuOutputAll, gpuWeights, gpuInputAll, k, DType.Q4_K);
+        for (int i = 0; i < k; i++) gpu.MatMul(gpuOutK, gpuWeights, gpuInK, DType.Q4_K);
+
+        const int iters = 15;
+        var batchedMs = new double[iters];
+        var singleMs = new double[iters];
+        var sw = new Stopwatch();
+        for (int it = 0; it < iters; it++)
+        {
+            sw.Restart();
+            gpu.MatMulBatched(gpuOutputAll, gpuWeights, gpuInputAll, k, DType.Q4_K);
+            sw.Stop();
+            batchedMs[it] = sw.Elapsed.TotalMilliseconds;
+
+            sw.Restart();
+            for (int i = 0; i < k; i++) gpu.MatMul(gpuOutK, gpuWeights, gpuInK, DType.Q4_K);
+            sw.Stop();
+            singleMs[it] = sw.Elapsed.TotalMilliseconds;
+        }
+        Array.Sort(batchedMs);
+        Array.Sort(singleMs);
+        double medBatched = batchedMs[iters / 2];
+        double medSingle = singleMs[iters / 2];
+        double perMatvecRatio = medBatched / (medSingle / k); // batched-k cost ÷ one single matvec
+
+        _out.WriteLine($"MatVecBatchedQ4KInt8 [{rows}x{cols}] k={k}: batched={medBatched:F3}ms, " +
+            $"{k}xSingle={medSingle:F3}ms (1x={medSingle / k:F3}ms) → per-matvec ratio={perMatvecRatio:F2}x " +
+            $"(GO if ≤ ~1.5x); batched-vs-Ksingle speedup={medSingle / medBatched:F2}x");
+
+        gpu.Free(gpuWeights); gpu.Free(gpuInputAll); gpu.Free(gpuOutputAll);
+        gpu.Free(gpuInK); gpu.Free(gpuOutK);
+    }
+
+    private static void PutHalf16(byte[] dst, int off, float value)
+    {
+        ushort h = (ushort)System.Runtime.CompilerServices.Unsafe.BitCast<Half, short>((Half)value);
+        dst[off] = (byte)(h & 0xFF);
+        dst[off + 1] = (byte)(h >> 8);
     }
 }
