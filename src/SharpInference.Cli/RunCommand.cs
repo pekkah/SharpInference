@@ -32,7 +32,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         public string? PromptFile { get; init; }
 
         [CommandOption("--image <PATH>")]
-        [Description("Path to a PNG image for multimodal input (Gemma 4 encoder-free vision). Repeatable for multiple images; reference each with an <image> marker in -p (left-to-right), or omit markers to prepend them. Requires --mmproj and a text prompt (-p). Runs on CPU, CUDA, and Vulkan (full offload).")]
+        [Description("Path to a PNG image for multimodal input (Gemma 4 encoder-free vision). Repeatable for multiple images; reference each with an <image> marker in -p (left-to-right), or omit markers to prepend them. Requires --mmproj and a text prompt (-p). Runs on CPU, CUDA (full + partial offload), and Vulkan (full offload).")]
         public string[]? ImagePaths { get; init; }
 
         [CommandOption("--mmproj")]
@@ -1208,8 +1208,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     /// own chat template (so BOS / <c>&lt;|turn&gt;</c> / thinking handling matches the text path —
     /// Gemma 4 uses <c>&lt;|turn&gt;role\n…&lt;turn|&gt;</c>, NOT Gemma 3's <c>&lt;start_of_turn&gt;</c>),
     /// then each placeholder token in the token stream is expanded with its image's soft tokens
-    /// in order. With no markers, the images are prepended to the user turn. CPU-only: the
-    /// embedding-injection seam lives on <see cref="ForwardPass"/>.
+    /// in order. With no markers, the images are prepended to the user turn. The
+    /// embedding-injection seam (<see cref="IForwardPass.ForwardEmbedding"/>) is implemented by
+    /// <see cref="ForwardPass"/> (CPU), <see cref="CudaForwardPass"/> (full CUDA offload), and
+    /// <see cref="CudaHybridForwardPass"/> (CUDA partial offload, issue #252).
     /// </summary>
     private static int RunImagePrompt(Settings s,
         IForwardPass fwd, GgufTokenizer tok, ModelHyperparams hp,
@@ -1218,8 +1220,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         if (!fwd.SupportsEmbeddingInput)
         {
             AnsiConsole.MarkupLine("[red]Error:[/] the selected backend does not support image embedding input. " +
-                "Image input runs on CPU ([yellow]-g 0[/]) or full CUDA offload ([yellow]-g -1[/] of a model that fits VRAM); " +
-                "partial-offload hybrids and the Vulkan backend are not supported yet.");
+                "Image input runs on CPU ([yellow]-g 0[/]), full CUDA offload ([yellow]-g -1[/]), or CUDA " +
+                "partial-offload ([yellow]-g N[/]); the Vulkan partial-offload hybrid is not supported yet.");
             return 1;
         }
 
