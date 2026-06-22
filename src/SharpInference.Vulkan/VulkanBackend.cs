@@ -1509,6 +1509,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         // Same fixed-size `float tmp/s_old[4]` constraint as the single-token shader.
         if (kernelSize is < 1 or > 5)
             throw new ArgumentOutOfRangeException(nameof(kernelSize), kernelSize, "kernelSize must be in [1, 5].");
+        // Positivity guards: a negative value would cast to a huge uint dispatch / OOB on the GPU.
+        if (channels < 1) throw new ArgumentOutOfRangeException(nameof(channels), channels, "channels must be >= 1.");
+        if (nTok < 1) throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be >= 1.");
         _gdnConv1dDecodeBatchedPipeline ??= new ComputePipeline(this, Shaders.GdnConv1dDecodeBatched, 4,
             pushConstantSize: sizeof(GdnConv1dBatchedParams));
         var p = new GdnConv1dBatchedParams { channels = (uint)channels, kernelSize = (uint)kernelSize, nTok = (uint)nTok };
@@ -1524,6 +1527,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     {
         if (kernelSize is < 1 or > 5)
             throw new ArgumentOutOfRangeException(nameof(kernelSize), kernelSize, "kernelSize must be in [1, 5].");
+        if (channels < 1) throw new ArgumentOutOfRangeException(nameof(channels), channels, "channels must be >= 1.");
+        if (nTok < 1) throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be >= 1.");
         _gdnConv1dStateUpdateBatchedPipeline ??= new ComputePipeline(this, Shaders.GdnConv1dStateUpdateBatched, 2,
             pushConstantSize: sizeof(GdnConv1dBatchedParams));
         var p = new GdnConv1dBatchedParams { channels = (uint)channels, kernelSize = (uint)kernelSize, nTok = (uint)nTok };
@@ -1542,6 +1547,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     public void GdnL2NormPerHeadBatched(Tensor data, long elementOffset, int numHeads, int headDim,
                                         int rowStride, int nTok, float eps = 1e-6f)
     {
+        if (numHeads < 1) throw new ArgumentOutOfRangeException(nameof(numHeads), numHeads, "numHeads must be >= 1.");
+        if (headDim < 1) throw new ArgumentOutOfRangeException(nameof(headDim), headDim, "headDim must be >= 1.");
+        if (nTok < 1) throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be >= 1.");
         _gdnL2NormPerHeadBatchedPipeline ??= new ComputePipeline(this, Shaders.GdnL2NormPerHeadBatched, 1,
             pushConstantSize: sizeof(GdnL2NormBatchedParams));
         var p = new GdnL2NormBatchedParams
@@ -1567,6 +1575,10 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
                                     int srcHeads, int repeat, int headDim,
                                     int srcStride, int dstStride, int nTok)
     {
+        if (srcHeads < 1) throw new ArgumentOutOfRangeException(nameof(srcHeads), srcHeads, "srcHeads must be >= 1.");
+        if (repeat < 1) throw new ArgumentOutOfRangeException(nameof(repeat), repeat, "repeat must be >= 1.");
+        if (headDim < 1) throw new ArgumentOutOfRangeException(nameof(headDim), headDim, "headDim must be >= 1.");
+        if (nTok < 1) throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be >= 1.");
         _gdnTileHeadsBatchedPipeline ??= new ComputePipeline(this, Shaders.GdnTileHeadsBatched, 2,
             pushConstantSize: sizeof(GdnTileHeadsBatchedParams));
         var p = new GdnTileHeadsBatchedParams
@@ -1617,6 +1629,11 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
                 "The Vulkan GDN recurrence scan shader is specialized for headDim=128.");
         if (numVHeads < 1)
             throw new ArgumentOutOfRangeException(nameof(numVHeads), numVHeads, "numVHeads must be >= 1.");
+        if (nTok < 1)
+            throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be >= 1.");
+        if (ringScan is not null && (nCapture < 0 || ringSlotStride < 0 || ringScanFloatOffset < 0))
+            throw new ArgumentOutOfRangeException(nameof(nCapture),
+                "ring-capture params (nCapture, ringSlotStride, ringScanFloatOffset) must be non-negative when ringScan is provided.");
 
         _gdnRecurrenceScanPipeline ??= new ComputePipeline(this, Shaders.GdnRecurrenceScan, 12,
             pushConstantSize: sizeof(GdnRecurrenceScanParams));
