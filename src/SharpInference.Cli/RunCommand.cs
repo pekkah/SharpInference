@@ -32,7 +32,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         public string? PromptFile { get; init; }
 
         [CommandOption("--image <PATH>")]
-        [Description("Path to a PNG image for multimodal input (Gemma 4 encoder-free vision). Repeatable for multiple images; reference each with an <image> marker in -p (left-to-right), or omit markers to prepend them. Requires --mmproj and a text prompt (-p). CPU only for now (-g 0).")]
+        [Description("Path to a PNG image for multimodal input (Gemma 4 encoder-free vision). Repeatable for multiple images; reference each with an <image> marker in -p (left-to-right), or omit markers to prepend them. Requires --mmproj and a text prompt (-p). Runs on CPU, CUDA, and Vulkan (full offload).")]
         public string[]? ImagePaths { get; init; }
 
         [CommandOption("--mmproj")]

@@ -1137,6 +1137,68 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         return _logitsBuf;
     }
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Gemma 4 only: image input (issue #252) splices vision soft tokens into the decode
+    /// stream. Other arches and the partial-offload hybrids don't implement the seam.
+    /// </remarks>
+    public bool SupportsEmbeddingInput => _isGemma4;
+
+    /// <summary>
+    /// Forward one position from a PRECOMPUTED embedding (a vision soft token) instead of a
+    /// token-table lookup. The Vulkan mirror of <see cref="ForwardGemma4"/> (and of
+    /// <c>ForwardPass.ForwardEmbedding</c> / <c>CudaForwardPass.ForwardEmbedding</c>): the
+    /// supplied embedding is uploaded into the device hidden buffer and — per the
+    /// <see cref="IForwardPass.ForwardEmbedding"/> contract and gemma4.cpp:182 — the
+    /// sqrt(EmbeddingDim) embedding scale is SKIPPED (the soft tokens arrive already final).
+    /// The transformer trunk + final norm/output/softcap are identical to
+    /// <see cref="ForwardGemma4"/>. Gemma 4 only (PLE/shared-KV are rejected at construction
+    /// on this backend, so there is no per-layer-projection pre-pass to mirror). The upload
+    /// runs BEFORE <c>BeginRecord</c> because <see cref="UploadToExisting"/> owns its own
+    /// command-buffer begin/submit/wait and cannot be nested inside an in-progress record.
+    /// </summary>
+    public ReadOnlySpan<float> ForwardEmbedding(ReadOnlySpan<float> embedding, int position)
+    {
+        if (!_isGemma4)
+            throw new NotSupportedException(
+                "ForwardEmbedding (image input) is only supported for Gemma 4 on the Vulkan backend.");
+        if (embedding.Length != _embDim)
+            throw new ArgumentException(
+                $"embedding length {embedding.Length} != model embedding dim {_embDim}.");
+
+        // 1. Upload the precomputed embedding into _hidden. No sqrt(d) scale (gemma4.cpp:182).
+        //    Done OUTSIDE the record block: UploadToExisting submits + waits its own command
+        //    buffer, so it cannot be nested between BeginRecord and EndRecordAndSubmit.
+        UploadToExisting(_hidden, embedding);
+
+        // 2. Transformer layers + final norm/output/softcap (same device region as text decode).
+        _gpu.BeginRecord();
+        // The upload above is a transfer write in a prior (fence-waited) submission; insert a
+        // transfer→compute barrier so the first layer's _hidden read is ordered after it and the
+        // write is made visible to the shader (host fence-wait alone doesn't guarantee visibility
+        // to this submission's compute reads). The barrier's first scope includes the earlier
+        // transfer submission in queue order.
+        _gpu.RecordTransferBarrier();
+        RunGemma4Layers(position);
+
+        _gpu.RmsNorm(_hidden, _hidden, _wOutputNorm, _hp.RmsNormEps);
+        _gpu.RecordBarrier();
+        GpuMatMul(_logits, _wOutput, _hidden);
+        if (_hp.FinalLogitSoftcap > 0f)
+        {
+            _gpu.RecordBarrier();
+            _gpu.SoftcapInPlace(_logits, _hp.FinalLogitSoftcap);
+        }
+
+        _gpu.RecordComputeToTransferBarrier();
+        _gpu.RecordDownloadToStaging(_logits, _logitsBuf.Length);
+        _gpu.EndRecordAndSubmit();
+        _gpu.ReadFromStaging(_logitsBuf);
+
+        _kvLength = Math.Max(_kvLength, position + 1);
+        return _logitsBuf;
+    }
+
     /// <summary>Gemma 4 embedding gather. Mirrors the CUDA path, but Vulkan ships only
     /// F32 + Q4_K + Q6_K embed-lookup shaders (the Q4_K_M tied embedding is Q4_K, the Q6_K
     /// variant stays raw via EmbedLookupQ6K; any other quant is dequantized to F32 at
