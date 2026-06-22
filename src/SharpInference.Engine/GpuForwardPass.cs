@@ -1173,6 +1173,12 @@ public sealed unsafe class GpuForwardPass : IForwardPass
 
         // 2. Transformer layers + final norm/output/softcap (same device region as text decode).
         _gpu.BeginRecord();
+        // The upload above is a transfer write in a prior (fence-waited) submission; insert a
+        // transfer→compute barrier so the first layer's _hidden read is ordered after it and the
+        // write is made visible to the shader (host fence-wait alone doesn't guarantee visibility
+        // to this submission's compute reads). The barrier's first scope includes the earlier
+        // transfer submission in queue order.
+        _gpu.RecordTransferBarrier();
         RunGemma4Layers(position);
 
         _gpu.RmsNorm(_hidden, _hidden, _wOutputNorm, _hp.RmsNormEps);
