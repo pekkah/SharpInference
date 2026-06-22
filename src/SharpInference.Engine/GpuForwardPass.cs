@@ -90,6 +90,60 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     /// <inheritdoc />
     public bool SupportsPartialRewind => true;
 
+    // ── Speculative-decode batched verify (issue #308) ───────────────────────────────────
+
+    /// <summary>
+    /// Whether <see cref="BatchVerify"/> can run on this Vulkan dense full-offload pass. Gated to
+    /// the dense path (non-Gemma-4 — its per-layer head_dim / SWA rings / shared-KV / softcap need
+    /// a separate batched path, a later PR — and non-TurboQuant, whose ring bookkeeping breaks the
+    /// contiguous [startPos, startPos+k) layout) with an uncompacted cache. Mirrors
+    /// <see cref="CudaForwardPass.SupportsBatchVerify"/>: a CONFIGURED SnapKV budget does not
+    /// disable verify — only an actual prefill-time eviction does (then physical slot != logical
+    /// position and the cache geometry the K-loop relies on no longer holds), so this flips false
+    /// after such a prefill and the speculative decoder (which re-checks per step) degrades to
+    /// sequential verify.
+    /// </summary>
+    public bool SupportsBatchVerify => !_isGemma4 && !_tqEnabled && !_kvEvicted;
+
+    /// <summary>
+    /// Batched k-token verify for single-user speculative decoding (issue #308): processes
+    /// <paramref name="tokens"/> over the cache starting at <paramref name="startPos"/> (the cache
+    /// must hold exactly <paramref name="startPos"/> positions), returning <c>result[i]</c> = logits
+    /// after <c>tokens[i]</c>. All k K/V entries are appended at contiguous positions
+    /// [<paramref name="startPos"/>, <paramref name="startPos"/> + k); the caller rewinds rejected
+    /// tokens via <see cref="TruncateTo"/>.
+    /// <para>This is the FOUNDATION K-loop reference: it loops the existing single-query
+    /// <see cref="Forward"/> k times, which establishes the interface, the contiguous-append
+    /// semantics, and the rollback contract that the parity-test harness asserts. It does NOT yet
+    /// amortize the weight HBM reads — each Forward re-streams the weights — that is the batched
+    /// matvec of the next PR (which will reuse this gate and these tests). Bit-identical to k
+    /// sequential <see cref="Forward"/> calls by construction (it IS those calls).</para>
+    /// </summary>
+    public float[][] BatchVerify(int[] tokens, int startPos)
+    {
+        ArgumentNullException.ThrowIfNull(tokens);
+        if (!SupportsBatchVerify)
+            throw new NotSupportedException(
+                "BatchVerify requires a dense (non-Gemma-4, non-TurboQuant) Vulkan pass with an " +
+                "uncompacted cache. Check SupportsBatchVerify before calling.");
+        int k = tokens.Length;
+        if (k == 0) return Array.Empty<float[]>();
+        if (startPos < 0 || startPos + k > _maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(startPos),
+                $"BatchVerify range [{startPos}, {startPos + k}) exceeds the context window (maxSeqLen={_maxSeqLen}).");
+
+        // The cache must hold exactly startPos positions; soft-truncate to make it so (the K-loop
+        // then appends the k K/V rows over any stale rewound slots, position by position).
+        TruncateTo(startPos);
+        var result = new float[k][];
+        for (int i = 0; i < k; i++)
+            // Forward appends one K/V slot at startPos+i and returns logits-after-tokens[i]; the
+            // returned span is reused across calls, so copy each. After the loop the cache holds
+            // startPos+k positions — matching "all k K/V entries appended".
+            result[i] = Forward(tokens[i], startPos + i).ToArray();
+        return result;
+    }
+
     // CPU KV cache kept for fallback (not used when GPU attention works)
     private readonly Engine.KvCache _kvCache;
 
@@ -139,6 +193,11 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     private Tensor? _snapKvScoreScratch; // [numHeads × maxSeqLen] f32, lazy scratch for the score kernel
     private bool _snapKvScoreScratchOwned; // false if aliased to _attnScoresScratch
     private int _snapKvCaptureSlot = -1; // 0..W-1 for tokens in the capture window; -1 otherwise
+    // True once a prefill-time SnapKV eviction has actually compacted the cache, so the
+    // physical slot layout no longer equals the logical position. Mirrors CudaForwardPass's
+    // `_kvEvictedCount > 0` guard: a CONFIGURED-but-unevicted budget keeps this false (and
+    // BatchVerify available). Set in ApplySnapKvEviction, reset in ResetCache.
+    private bool _kvEvicted;
 
     // KV-cache store dtype (issues #311 / #325). Float32 (default) keeps the original fp32 cache;
     // BFloat16 selects the half-width KV path (stored as IEEE fp16 packed two-per-uint — more
@@ -648,6 +707,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         _tqCompressedLen = 0;
         _fp32WriteIdx = 0;
         _fp32Count = 0;
+        _kvEvicted = false; // fresh sequence — standard sequential slot==position layout restored
     }
 
     /// <inheritdoc/>
@@ -785,6 +845,10 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         // GpuForwardPass — actual data lives in _gpuKCache/_gpuVCache.
         _kvLength = K;
         _kvCache.TruncateTo(K);
+        // The compaction broke the logical-position ↔ physical-slot identity, so the
+        // contiguous-position assumption BatchVerify (and the future batched matvec) rely on
+        // no longer holds. Flip the verify gate off, like CudaForwardPass's _kvEvictedCount.
+        _kvEvicted = true;
     }
 
     private void EnsureSnapKvCaptureBuffer(int W)
