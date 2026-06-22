@@ -1634,6 +1634,16 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
                 _quantizeQ8_1Pipeline = null;
                 _matVecBatchedQ4KInt8Pipeline?.Dispose();
                 _matVecBatchedQ4KInt8Pipeline = null;
+                // The int8 path is now permanently disabled — release its scratch (a prior
+                // successful call may have allocated it). Defer the free if a recorded-but-
+                // unsubmitted dispatch could still reference it (same UAF guard as the grow path).
+                if (_q81BatchBuf is not null)
+                {
+                    if (_recording) _pendingScratchFrees.Add(_q81BatchBuf);
+                    else Free(_q81BatchBuf);
+                    _q81BatchBuf = null;
+                    _q81BatchBufBytes = 0;
+                }
                 // Fall through to the FP fallback below.
             }
         }
