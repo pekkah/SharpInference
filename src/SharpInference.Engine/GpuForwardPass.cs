@@ -1079,6 +1079,14 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     /// </summary>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
+        // The GPU embedding gather shaders have no bounds check, and the Gemma 4 PLE row gather
+        // (BuildPerLayerRowUpload) reads the mmap'd table at token*bytesPerRow on the HOST — an
+        // out-of-range token id would OOB-read (a device fault or a host access violation). Guard
+        // at the entry, mirroring CudaForwardPass.Forward. Indicates a tokenizer/model mismatch.
+        if ((uint)token >= (uint)_hp.VocabSize)
+            throw new ArgumentOutOfRangeException(nameof(token), token,
+                $"Token id is outside the model vocabulary (0..{_hp.VocabSize - 1}).");
+
         if (_isGemma4)
             return ForwardGemma4(token, position);
 
