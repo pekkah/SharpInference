@@ -194,7 +194,9 @@ each after a discarded warm-clock warm-up. The CPU and Vulkan rows are from the 
 ~1K ctx), except the Gemma 4 E4B q4_0 Vulkan row, freshly measured 2026-06-22 with the same convention after
 the #351 gemma4-on-Vulkan work (PLE + shared-KV + narrowed KV). Vulkan rows remain ~35% below their earlier
 numbers — an unexplained regression (CUDA improved on the same box). Llama-4 Scout and Qwen3-Coder
-Vulkan-hybrid keep prior values (not re-runnable here)._
+Vulkan-hybrid keep prior values (not re-runnable here). The Qwen3.6 family (Gated-DeltaNet + MoE/MTP:
+35B-A3B, 27B-MTP, 35B-A3B-MTP, Carnice) has no Vulkan rows — GDN is not yet implemented on Vulkan (#356;
+the MTP self-spec speedup is the #357 follow-up), so those models require `--backend cuda` or `-g 0` (CPU)._
 
 **Long-context decode** uses flash-decoding (split-KV) on all CUDA paths (dense + MoE/GDN hybrids): the
 per-token KV read parallelizes across SMs, so decode no longer collapses with context (Gemma 4 E4B q8
