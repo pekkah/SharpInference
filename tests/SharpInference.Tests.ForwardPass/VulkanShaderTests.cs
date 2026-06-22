@@ -515,6 +515,73 @@ public sealed unsafe class VulkanShaderTests
         AssertVulkanMatVecMatchesCpu(weights, matRows, matCols, DType.Q5_K, inputSeed: 7);
     }
 
+    // Batched (weight-stationary) Q4_K matvec parity (issue #308). The batched shader reads
+    // each Q4_K weight nibble from VRAM ONCE and multiplies it into nTok accumulators; the
+    // element-iteration order, per-element dequant, and subgroupAdd reduction are identical to
+    // the single-row MatVecQ4K, so each token's output must be BIT-EXACT to a separate
+    // single-row MatMul call against the same weight matrix and that token's input vector.
+    [Theory]
+    [InlineData(1)]   // degenerate single-token
+    [InlineData(4)]
+    [InlineData(6)]
+    public void MatVecBatchedQ4KMatchesSingleRow(int nTok)
+    {
+        Vulkan.VulkanBackend backend;
+        try { backend = new Vulkan.VulkanBackend(); }
+        catch { return; } // no Vulkan device on this host — skip
+
+        using (backend)
+        {
+            const int matRows = 64;
+            const int matCols = 512;  // 2 Q4_K blocks of 256
+            var weightBytes = BuildQ4_K(matRows, matCols, seed: 4242);
+
+            // Upload raw Q4_K bytes reinterpreted as floats (round up to 4 bytes).
+            int floatCount = (weightBytes.Length + 3) / 4;
+            var rawAsFloats = new float[floatCount];
+            weightBytes.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsBytes(rawAsFloats.AsSpan()));
+            var gpuWeights = backend.Upload(rawAsFloats, TensorShape.D1(floatCount));
+
+            // K random input vectors laid out row-major [nTok][cols].
+            var inputAll = new float[nTok * matCols];
+            var rng = new Random(7 + nTok);
+            for (int i = 0; i < inputAll.Length; i++) inputAll[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            var gpuInputAll = backend.Upload(inputAll, TensorShape.D1(nTok * matCols));
+            var gpuOutputAll = backend.Allocate(TensorShape.D1(nTok * matRows));
+
+            backend.MatMulBatched(gpuOutputAll, gpuWeights, gpuInputAll, nTok, DType.Q4_K);
+
+            var batchedOut = new float[nTok * matRows];
+            backend.Download(gpuOutputAll, batchedOut);
+
+            // Reference: nTok separate single-row MatMul calls against the SAME weight matrix.
+            var gpuOutputK = backend.Allocate(TensorShape.D1(matRows));
+            var singleOut = new float[matRows];
+            for (int k = 0; k < nTok; k++)
+            {
+                var gpuInputK = backend.Upload(inputAll.AsSpan(k * matCols, matCols), TensorShape.D1(matCols));
+                backend.MatMul(gpuOutputK, gpuWeights, gpuInputK, DType.Q4_K);
+                backend.Download(gpuOutputK, singleOut);
+                backend.Free(gpuInputK);
+
+                for (int r = 0; r < matRows; r++)
+                {
+                    float b = batchedOut[k * matRows + r];
+                    float s = singleOut[r];
+                    // Bit-exact: same dequant + identical accumulation order per (row, token).
+                    Assert.True(b == s,
+                        $"nTok={nTok} k={k} row={r}: batched={b:R} single={s:R} (diff={MathF.Abs(b - s):E2})");
+                }
+            }
+
+            backend.Free(gpuWeights);
+            backend.Free(gpuInputAll);
+            backend.Free(gpuOutputAll);
+            backend.Free(gpuOutputK);
+        }
+    }
+
     private static void AssertVulkanMatVecMatchesCpu(
         byte[] weightBytes, int matRows, int matCols, DType dtype, int inputSeed)
     {
@@ -633,6 +700,29 @@ public sealed unsafe class VulkanShaderTests
             PutHalf(bytes, off, (float)(rng.NextDouble() * 0.045 + 0.005));      // d
             PutHalf(bytes, off + 2, (float)(rng.NextDouble() * 0.002 + 0.0005)); // dmin
             for (int j = 4; j < blockBytes; j++)                                 // scales+qh+ql
+                bytes[off + j] = (byte)rng.Next(0, 256);
+            off += blockBytes;
+        }
+        return bytes;
+    }
+
+    // Q4_K: 144 bytes/block over 256 elements. Layout matches DequantQ4K:
+    //   [0:2] FP16 d, [2:4] FP16 dmin, [4:16] 12 packed 6-bit scale/min bytes,
+    //   [16:144] 128 qs low-/high-nibble bytes (two 4-bit quants per byte).
+    // Any byte values are valid for the scale/qs arrays (the 6-bit unpack and nibble
+    // reads just consume them); cols must be a multiple of 256.
+    private static byte[] BuildQ4_K(int rows, int cols, int seed)
+    {
+        const int qk = 256, blockBytes = 144;
+        int blocksPerRow = cols / qk;
+        var bytes = new byte[rows * blocksPerRow * blockBytes];
+        var rng = new Random(seed);
+        int off = 0;
+        for (int b = 0; b < rows * blocksPerRow; b++)
+        {
+            PutHalf(bytes, off, (float)(rng.NextDouble() * 0.045 + 0.005));      // d
+            PutHalf(bytes, off + 2, (float)(rng.NextDouble() * 0.002 + 0.0005)); // dmin
+            for (int j = 4; j < blockBytes; j++)                                 // scales + qs
                 bytes[off + j] = (byte)rng.Next(0, 256);
             off += blockBytes;
         }

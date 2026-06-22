@@ -1791,6 +1791,120 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Batched (weight-stationary) matrix-vector multiply with Q4_K dequantization —
+    /// the core weight-amortization for Vulkan speculative decoding (issue #308).
+    ///
+    /// Computes <c>nTok</c> independent matvecs against the SAME Q4_K weight matrix. The
+    /// expensive part (reading + unpacking each weight nibble from VRAM) is done ONCE per
+    /// output element and then multiplied into <c>nTok</c> accumulators (one per input
+    /// vector), so the weight is read from VRAM once for all K tokens instead of K times.
+    /// Only the per-token input reads are repeated.
+    ///
+    /// Bindings: 0=quantized weights (uint8), 1=inputs (float, row-major [nTok][cols]),
+    /// 2=outputs (float, row-major [nTok][rows]). Push constants: { uint rows, uint cols, uint nTok }.
+    ///
+    /// BIT-EXACT vs nTok separate single-row <see cref="MatVecQ4K"/> calls: the element
+    /// iteration order, the per-element dequant, and the subgroupAdd reduction are IDENTICAL
+    /// to the single-row shader — only the k (token) dimension is added on top. The same
+    /// floating-point accumulation order is therefore preserved per (row, token).
+    ///
+    /// local_size_x = 256 (8 rows × 32 lanes) so #318 pins the subgroup size to 32, which the
+    /// subgroupAdd reduction requires (THREADS_PER_ROW == 32).
+    ///
+    /// nTok is capped at 8 (the acc[] register array size; matches the spec-decode draft cap).
+    /// </summary>
+    internal const string MatVecBatchedQ4K = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+        #extension GL_KHR_shader_subgroup_arithmetic : enable
+
+        // 8 rows per workgroup, 32 threads per row = 256 threads.
+        // Register-based scale precomputation. subgroupAdd for reduction.
+        #define N_ROWS 8
+        #define THREADS_PER_ROW 32
+        #define MAX_NTOK 8
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Weights { uint weights_data[]; };
+        layout(binding = 1) readonly buffer Input   { float input_data[]; };
+        layout(binding = 2) writeonly buffer Output  { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint rows;
+            uint cols;
+            uint nTok;
+        };
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint row_in_wg = tid / THREADS_PER_ROW;
+            uint lane = tid % THREADS_PER_ROW;
+            uint row = gl_WorkGroupID.x * N_ROWS + row_in_wg;
+            if (row >= rows) return;
+
+            uint num_blocks = cols >> 8;
+            uint word_row_base = row * num_blocks * 36;
+
+            float acc[MAX_NTOK];
+            [[unroll]] for (uint k = 0; k < MAX_NTOK; k++) acc[k] = 0.0;
+
+            for (uint block = 0; block < num_blocks; block++) {
+                uint word_base = word_row_base + block * 36;
+
+                vec2 dm = unpackHalf2x16(weights_data[word_base]);
+                float d = dm.x;
+                float dmin = dm.y;
+
+                // Preload scale/min into registers (3 global reads instead of ~32)
+                uint sm0 = weights_data[word_base + 1];
+                uint sm1 = weights_data[word_base + 2];
+                uint sm2 = weights_data[word_base + 3];
+
+                float dsc[8], dmn[8];
+                dsc[0] = d * float((sm0) & 63);         dmn[0] = dmin * float((sm1) & 63);
+                dsc[1] = d * float((sm0 >> 8) & 63);    dmn[1] = dmin * float((sm1 >> 8) & 63);
+                dsc[2] = d * float((sm0 >> 16) & 63);   dmn[2] = dmin * float((sm1 >> 16) & 63);
+                dsc[3] = d * float((sm0 >> 24) & 63);   dmn[3] = dmin * float((sm1 >> 24) & 63);
+                dsc[4] = d * float((sm2 & 0xF) | (((sm0 >> 6) & 3) << 4));
+                dmn[4] = dmin * float(((sm2 >> 4) & 0xF) | (((sm1 >> 6) & 3) << 4));
+                dsc[5] = d * float(((sm2 >> 8) & 0xF) | (((sm0 >> 14) & 3) << 4));
+                dmn[5] = dmin * float(((sm2 >> 12) & 0xF) | (((sm1 >> 14) & 3) << 4));
+                dsc[6] = d * float(((sm2 >> 16) & 0xF) | (((sm0 >> 22) & 3) << 4));
+                dmn[6] = dmin * float(((sm2 >> 20) & 0xF) | (((sm1 >> 22) & 3) << 4));
+                dsc[7] = d * float(((sm2 >> 24) & 0xF) | (((sm0 >> 30) & 3) << 4));
+                dmn[7] = dmin * float(((sm2 >> 28) & 0xF) | (((sm1 >> 30) & 3) << 4));
+
+                // Each of 32 threads handles 8 elements: lane, lane+32, ..., lane+224
+                [[unroll]] for (uint e = 0; e < 8; e++) {
+                    uint elem_idx = lane + e * 32;
+                    uint chunk = elem_idx >> 6;
+                    uint sub = elem_idx & 63;
+                    bool is_upper = sub >= 32;
+                    uint byte_pos = sub & 31;
+
+                    uint qs_off = word_base + 4 + (chunk * 8 + (byte_pos >> 2));
+                    uint qbyte = (weights_data[qs_off] >> ((byte_pos & 3) * 8)) & 0xFF;
+                    uint nibble = is_upper ? (qbyte >> 4) : (qbyte & 0xF);
+
+                    uint si = chunk * 2 + (is_upper ? 1u : 0u);
+                    // Dequantized weight read+unpacked ONCE here; shared across all nTok inputs.
+                    float w = dsc[si] * float(nibble) - dmn[si];
+                    uint in_idx = block * 256 + elem_idx;
+                    for (uint k = 0; k < nTok; k++)
+                        acc[k] += w * input_data[k * cols + in_idx];
+                }
+            }
+
+            for (uint k = 0; k < nTok; k++) {
+                float r = subgroupAdd(acc[k]);
+                if (subgroupElect())
+                    output_data[k * rows + row] = r;
+            }
+        }
+        """;
+
+    /// <summary>
     /// Matrix-vector multiply with Q5_K dequantization.
     /// Each workgroup computes 8 output rows (8 rows × 32 lanes = 256 threads).
     /// Push constants: { uint rows, uint cols }.
