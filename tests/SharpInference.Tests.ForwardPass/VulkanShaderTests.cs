@@ -2823,6 +2823,121 @@ public sealed unsafe class VulkanShaderTests
         backend.Free(gpuSrc); backend.Free(gpuDst);
     }
 
+    [Fact]
+    public void GdnRecurrenceDecodeRejectsNon128HeadDim()
+    {
+        using var backend = new Vulkan.VulkanBackend();
+        // Tiny buffers; the headDim guard throws before any GPU work.
+        const int hv = 1, d = 64;
+        var state = backend.Allocate(TensorShape.D1(hv * d * d));
+        var q = backend.Allocate(TensorShape.D1(hv * d));
+        var k = backend.Allocate(TensorShape.D1(hv * d));
+        var v = backend.Allocate(TensorShape.D1(hv * d));
+        var alphaIn = backend.Allocate(TensorShape.D1(hv));
+        var beta = backend.Allocate(TensorShape.D1(hv));
+        var ssmA = backend.Allocate(TensorShape.D1(hv));
+        var dtBias = backend.Allocate(TensorShape.D1(hv));
+        var normW = backend.Allocate(TensorShape.D1(d));
+        var z = backend.Allocate(TensorShape.D1(hv * d));
+        var output = backend.Allocate(TensorShape.D1(hv * d));
+        try
+        {
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                backend.GdnRecurrenceDecode(state, q, k, v, alphaIn, beta, ssmA, dtBias,
+                    normW, z, output, hv, d));
+        }
+        finally
+        {
+            backend.Free(state); backend.Free(q); backend.Free(k); backend.Free(v);
+            backend.Free(alphaIn); backend.Free(beta); backend.Free(ssmA); backend.Free(dtBias);
+            backend.Free(normW); backend.Free(z); backend.Free(output);
+        }
+    }
+
+    [Fact]
+    public void GdnRecurrenceDecodeMatchesCpu()
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        const int hv = 32;        // qwen36 v-head count
+        const int d = 128;        // qwen36 head dim (shader is specialized to 128)
+        const float eps = 1e-6f;
+        int qkvLen = hv * d;
+        int stateLen = hv * d * d;
+
+        var rng = new Random(20260622);
+        // Sane ranges to avoid degenerate gates.
+        var q = new float[qkvLen];
+        var k = new float[qkvLen];
+        var v = new float[qkvLen];
+        var z = new float[qkvLen];
+        for (int i = 0; i < qkvLen; i++)
+        {
+            q[i] = (float)(rng.NextDouble() * 2 - 1);   // [-1, 1]
+            k[i] = (float)(rng.NextDouble() * 2 - 1);
+            v[i] = (float)(rng.NextDouble() * 2 - 1);
+            z[i] = (float)(rng.NextDouble() * 2 - 1);
+        }
+        var alphaIn = new float[hv];
+        var beta = new float[hv];
+        var ssmA = new float[hv];
+        var dtBias = new float[hv];
+        for (int h = 0; h < hv; h++)
+        {
+            alphaIn[h] = (float)(rng.NextDouble() * 4 - 2);          // [-2, 2]
+            beta[h] = (float)(rng.NextDouble() * 4 - 2);             // [-2, 2]
+            ssmA[h] = (float)(rng.NextDouble() * -0.09 - 0.01);      // [-0.1, -0.01] negative decay coeff
+            dtBias[h] = (float)(rng.NextDouble() - 0.5);             // [-0.5, 0.5]
+        }
+        var normWeight = new float[d];
+        for (int i = 0; i < d; i++)
+            normWeight[i] = (float)(rng.NextDouble() + 0.5);         // [0.5, 1.5]
+        var state = new float[stateLen];
+        for (int i = 0; i < stateLen; i++)
+            state[i] = (float)(rng.NextDouble() * 2 - 1);            // [-1, 1]
+
+        // GPU
+        var gpuState = backend.Upload(state, TensorShape.D1(stateLen));
+        var gpuQ = backend.Upload(q, TensorShape.D1(qkvLen));
+        var gpuK = backend.Upload(k, TensorShape.D1(qkvLen));
+        var gpuV = backend.Upload(v, TensorShape.D1(qkvLen));
+        var gpuAlpha = backend.Upload(alphaIn, TensorShape.D1(hv));
+        var gpuBeta = backend.Upload(beta, TensorShape.D1(hv));
+        var gpuSsmA = backend.Upload(ssmA, TensorShape.D1(hv));
+        var gpuDtBias = backend.Upload(dtBias, TensorShape.D1(hv));
+        var gpuNormW = backend.Upload(normWeight, TensorShape.D1(d));
+        var gpuZ = backend.Upload(z, TensorShape.D1(qkvLen));
+        var gpuOut = backend.Allocate(TensorShape.D1(qkvLen));
+
+        backend.GdnRecurrenceDecode(gpuState, gpuQ, gpuK, gpuV, gpuAlpha, gpuBeta,
+            gpuSsmA, gpuDtBias, gpuNormW, gpuZ, gpuOut, hv, d, eps);
+
+        var gpuOutput = new float[qkvLen];
+        var gpuStateAfter = new float[stateLen];
+        backend.Download(gpuOut, gpuOutput);
+        backend.Download(gpuState, gpuStateAfter);
+
+        // CPU reference (clone state so the GPU's pre-call state is preserved for comparison).
+        var cpuState = (float[])state.Clone();
+        var cpuOutput = new float[qkvLen];
+        SharpInference.Cpu.GdnKernels.GdnRecurrenceDecode(
+            q, k, v, alphaIn, beta, ssmA, dtBias, normWeight, z,
+            cpuState, cpuOutput, hv, d, eps);
+
+        // Mutated state is an elementwise decay + rank-1 update → tight.
+        for (int i = 0; i < stateLen; i++)
+            Assert.True(MathF.Abs(gpuStateAfter[i] - cpuState[i]) < 1e-4f,
+                $"GdnRecurrenceDecode state mismatch at [{i}]: gpu={gpuStateAfter[i]}, cpu={cpuState[i]}");
+        // Output carries the RMSNorm fp32-tree vs CPU-double reduction → looser tolerance.
+        for (int i = 0; i < qkvLen; i++)
+            Assert.True(MathF.Abs(gpuOutput[i] - cpuOutput[i]) < 2e-3f,
+                $"GdnRecurrenceDecode output mismatch at [{i}]: gpu={gpuOutput[i]}, cpu={cpuOutput[i]}");
+
+        backend.Free(gpuState); backend.Free(gpuQ); backend.Free(gpuK); backend.Free(gpuV);
+        backend.Free(gpuAlpha); backend.Free(gpuBeta); backend.Free(gpuSsmA); backend.Free(gpuDtBias);
+        backend.Free(gpuNormW); backend.Free(gpuZ); backend.Free(gpuOut);
+    }
+
     private static float[] RandomUnit(Random rng, int dim)
     {
         var v = new float[dim];

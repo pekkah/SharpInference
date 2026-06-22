@@ -1205,6 +1205,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _gdnConv1dDecodePipeline;
     private ComputePipeline? _gdnL2NormPerHeadPipeline;
     private ComputePipeline? _gdnTileHeadsPipeline;
+    private ComputePipeline? _gdnRecurrenceDecodePipeline;
 
     // Image ops pipelines (IImageOpsBackend)
     private ComputePipeline? _conv2dPipeline;
@@ -1242,6 +1243,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private struct GdnConv1dParams { public uint channels; public uint kernelSize; }
     private struct GdnL2NormParams { public uint headDim; public uint numHeads; public float eps; public uint offset; }
     private struct GdnTileHeadsParams { public uint srcHeads; public uint repeat; public uint headDim; public uint srcOffset; public uint dstOffset; }
+    private struct GdnRecurrenceDecodeParams { public uint hv; public uint d; public float normEps; }
 
     // Image ops push constant structs
     private struct Conv2dParams   { public uint inCh; public uint outCh; public uint height; public uint width; public uint ksize; public uint padding; }
@@ -1403,6 +1405,68 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         long total = (long)srcHeads * repeat * headDim;
         DispatchOrRecord(_gdnTileHeadsPipeline, [GetBuffer(src), GetBuffer(dst)],
             (uint)((total + 255) / 256), &p);
+    }
+
+    /// <summary>
+    /// Single-token Gated-DeltaNet recurrence delta-rule scan. Updates per-head <c>D×D</c>
+    /// state matrices in place and writes per-head post-norm, post-gate output. State layout
+    /// <c>[numVHeads, headDim, headDim]</c> row-major (i = key axis, j = value/output axis).
+    /// Mirrors CUDA <c>CudaBackend.GdnRecurrenceDecode</c> / CPU
+    /// <c>GdnKernels.GdnRecurrenceDecode</c> op-for-op.
+    /// </summary>
+    /// <remarks>
+    /// The shader is specialized for <c>headDim == 128</c> (<c>local_size_x = 128</c>), which both
+    /// target models (qwen36-35b-a3b / qwen36-27b-mtp) use. This guarantees one active invocation
+    /// per output column with no per-thread early return before a <c>barrier()</c>, so every
+    /// invocation reaches every barrier.
+    /// </remarks>
+    public void GdnRecurrenceDecode(
+        Tensor state, Tensor q, Tensor k, Tensor v,
+        Tensor alphaIn, Tensor beta, Tensor ssmA, Tensor dtBias,
+        Tensor normWeight, Tensor z, Tensor output,
+        int numVHeads, int headDim, float normEps = 1e-6f)
+    {
+        if (headDim != 128)
+            throw new ArgumentOutOfRangeException(nameof(headDim), headDim,
+                "The Vulkan GDN recurrence shader is specialized for headDim=128.");
+        if (numVHeads < 1)
+            throw new ArgumentOutOfRangeException(nameof(numVHeads), numVHeads,
+                "numVHeads must be >= 1.");
+
+        // Validate tensor sizes on the CPU: a too-small buffer would index out of bounds on the
+        // GPU (silent corruption / device-lost), which the shader cannot guard against.
+        long qkvLen = (long)numVHeads * headDim;
+        long stateLen = qkvLen * headDim;
+        static void Require(Tensor t, long min, string name)
+        {
+            if (t.ElementCount < min)
+                throw new ArgumentException($"{name} must have at least {min} elements (has {t.ElementCount}).", name);
+        }
+        Require(state, stateLen, nameof(state));
+        Require(q, qkvLen, nameof(q));
+        Require(k, qkvLen, nameof(k));
+        Require(v, qkvLen, nameof(v));
+        Require(z, qkvLen, nameof(z));
+        Require(output, qkvLen, nameof(output));
+        Require(alphaIn, numVHeads, nameof(alphaIn));
+        Require(beta, numVHeads, nameof(beta));
+        Require(ssmA, numVHeads, nameof(ssmA));
+        Require(dtBias, numVHeads, nameof(dtBias));
+        Require(normWeight, headDim, nameof(normWeight));
+
+        _gdnRecurrenceDecodePipeline ??= new ComputePipeline(this, Shaders.GdnRecurrenceDecode, 11,
+            pushConstantSize: sizeof(GdnRecurrenceDecodeParams));
+        var p = new GdnRecurrenceDecodeParams
+        {
+            hv = (uint)numVHeads,
+            d = (uint)headDim,
+            normEps = normEps,
+        };
+        DispatchOrRecord(_gdnRecurrenceDecodePipeline,
+            [GetBuffer(state), GetBuffer(q), GetBuffer(k), GetBuffer(v),
+             GetBuffer(alphaIn), GetBuffer(beta), GetBuffer(ssmA), GetBuffer(dtBias),
+             GetBuffer(normWeight), GetBuffer(z), GetBuffer(output)],
+            (uint)numVHeads, &p);
     }
 
     public void SiLU(Tensor x)
@@ -2772,6 +2836,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _gdnConv1dDecodePipeline?.Dispose();
         _gdnL2NormPerHeadPipeline?.Dispose();
         _gdnTileHeadsPipeline?.Dispose();
+        _gdnRecurrenceDecodePipeline?.Dispose();
         _conv2dPipeline?.Dispose();
         _leakyReluPipeline?.Dispose();
         _clampPipeline?.Dispose();

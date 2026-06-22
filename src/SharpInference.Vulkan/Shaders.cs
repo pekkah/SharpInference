@@ -476,6 +476,128 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Gated-DeltaNet recurrence delta-rule scan for a single decode token (issue #356).
+    /// One workgroup per v-head; <c>local_size_x = headDim</c> (HARDCODED 128 — both target
+    /// models qwen36-35b-a3b / qwen36-27b-mtp have headDim=128, so every one of the 128
+    /// invocations is active and reaches every <c>barrier()</c>). Each thread owns output
+    /// column <c>j</c>. State layout <c>S[h*d*d + i*d + j]</c> (i=key axis, j=value/output
+    /// axis), updated in place. Per head:
+    ///   decay = exp(softplus(alpha_in[h]+dt_bias[h]) · ssm_a[h]); b = sigmoid(beta[h])
+    ///   pass A: S *= decay; p[j] = Σ_i k[i]·S[i,j]
+    ///   d[j]   = b·(v[j] − p[j])
+    ///   pass B: S[i,j] += k[i]·d[j]; o[j] = (1/√d)·Σ_i q[i]·S[i,j]
+    ///   o = RMSNorm(o)·norm_weight; o *= SiLU(z)
+    /// Mirrors CUDA <c>llm_gdn_recurrence_decode</c> / CPU <c>GdnKernels.GdnRecurrenceDecode</c>
+    /// op-for-op (full-precision exp/log/inversesqrt to track the CPU oracle tightly).
+    /// Push constants: { uint hv, uint d, float norm_eps }.
+    /// Bindings: 0=state (in/out), 1=q, 2=k, 3=v, 4=alpha_in, 5=beta, 6=ssm_a, 7=dt_bias,
+    ///           8=norm_weight, 9=z (all readonly), 10=output (writeonly).
+    /// Dispatch: hv workgroups of 128 threads.
+    /// </summary>
+    internal const string GdnRecurrenceDecode = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 128) in;
+
+        layout(binding = 0)           buffer State  { float state_data[]; };
+        layout(binding = 1) readonly  buffer Q      { float q_data[]; };
+        layout(binding = 2) readonly  buffer K      { float k_data[]; };
+        layout(binding = 3) readonly  buffer V      { float v_data[]; };
+        layout(binding = 4) readonly  buffer AlphaIn{ float alpha_data[]; };
+        layout(binding = 5) readonly  buffer Beta   { float beta_data[]; };
+        layout(binding = 6) readonly  buffer SsmA   { float ssma_data[]; };
+        layout(binding = 7) readonly  buffer DtBias { float dtbias_data[]; };
+        layout(binding = 8) readonly  buffer NormW  { float normw_data[]; };
+        layout(binding = 9) readonly  buffer Z      { float z_data[]; };
+        layout(binding = 10) writeonly buffer O     { float o_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint hv;
+            uint d;
+            float norm_eps;
+        };
+
+        shared float sK[128];
+        shared float sQ[128];
+        shared float sV[128];
+        shared float sZ[128];
+        shared float sNormW[128];
+        shared float sP[128];
+        shared float sD[128];
+        shared float sRed[128];
+
+        void main() {
+            uint h = gl_WorkGroupID.x;
+            uint j = gl_LocalInvocationID.x;
+
+            // Load per-head Q, K, V, Z and per-dim norm weight into shared memory.
+            uint hd_off = h * d;
+            sK[j]     = k_data[hd_off + j];
+            sQ[j]     = q_data[hd_off + j];
+            sV[j]     = v_data[hd_off + j];
+            sZ[j]     = z_data[hd_off + j];
+            sNormW[j] = normw_data[j];
+            barrier();
+
+            // Per-head scalar gates.
+            float alpha_x = alpha_data[h] + dtbias_data[h];
+            float dt      = alpha_x >= 20.0 ? alpha_x : log(1.0 + exp(alpha_x));   // softplus
+            float decay   = exp(dt * ssma_data[h]);
+            float b_sc    = 1.0 / (1.0 + exp(-beta_data[h]));
+
+            // d is fixed at 128 (== local_size_x == headDim, enforced by the wrapper). Using the
+            // literal lets the SPIR-V compiler strength-reduce i*128 → i<<7 and unroll the loops.
+            uint state_base = h * 16384u;   // h * d * d
+
+            // Pass A: decay S, then accumulate p[j] = Σ_i k[i] · S[i,j].
+            float p_local = 0.0;
+            for (uint i = 0u; i < 128u; i++) {
+                uint off = state_base + i * 128u + j;
+                float sij = state_data[off] * decay;
+                state_data[off] = sij;
+                p_local += sK[i] * sij;
+            }
+            sP[j] = p_local;
+            barrier();
+
+            // Compute d[j].
+            float d_j = b_sc * (sV[j] - sP[j]);
+            sD[j] = d_j;
+            barrier();
+
+            // Pass B: rank-1 update S[i,j] += k[i] · d[j], fused with readout o[j].
+            float o_local = 0.0;
+            for (uint i = 0u; i < 128u; i++) {
+                uint off = state_base + i * 128u + j;
+                float sij = state_data[off] + sK[i] * d_j;
+                state_data[off] = sij;
+                o_local += sQ[i] * sij;
+            }
+
+            // Scale by 1/sqrt(d), d=128.
+            o_local *= inversesqrt(128.0);
+
+            // RMSNorm: scale = rsqrt(sumSq/d + eps), then o = o * scale * normWeight.
+            sRed[j] = o_local * o_local;
+            barrier();
+            [[unroll]] for (uint s = 64u; s > 0u; s >>= 1) {
+                if (j < s) sRed[j] += sRed[j + s];
+                barrier();
+            }
+            float scale = inversesqrt(sRed[0] / 128.0 + norm_eps);
+
+            float o_normed = o_local * scale * sNormW[j];
+
+            // SiLU(z) gate.
+            float zv = sZ[j];
+            float silu = zv / (1.0 + exp(-zv));
+
+            o_data[hd_off + j] = o_normed * silu;
+        }
+        """;
+
+    /// <summary>
     /// Per-head RMSNorm: applies RMSNorm independently to each head-sized chunk.
     /// data[h*head_dim + i] = data[h*head_dim + i] / rms_h * weight[i]
     /// where rms_h = sqrt(mean(data[h*head_dim .. (h+1)*head_dim]^2) + eps).
