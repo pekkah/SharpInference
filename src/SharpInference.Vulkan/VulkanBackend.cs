@@ -1090,6 +1090,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _matVecF32Pipeline;
     private ComputePipeline? _kvAppendPipeline;
     private ComputePipeline? _attentionPipeline;
+    private ComputePipeline? _kvAppendBatchedPipeline;
+    private ComputePipeline? _attentionBatchedPipeline;
     private ComputePipeline? _kvAppendBf16Pipeline;
     private ComputePipeline? _attentionBf16Pipeline;
     private ComputePipeline? _kvAppendQ8Pipeline;
@@ -1136,6 +1138,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private struct EmbedParams { public uint tokenId; public uint embDim; }
     private struct KvAppendParams { public uint kvDim; public uint position; public uint maxSeqLen; }
     private struct AttentionParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint seqLen; public uint maxSeqLen; public uint window; }
+    private struct AttentionBatchedParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint basePos; public uint maxSeqLen; public uint numQueries; }
     private struct SplitKvPartialParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint seqLen; public uint nSplits; public uint window; }
     private struct SplitKvCombineParams { public uint numHeads; public uint headDim; public uint nSplits; }
     private struct SnapKvScoreParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint promptLen; public uint qAbsPos; public uint maxSeqLen; }
@@ -1593,6 +1596,47 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             [GetBuffer(q), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(output),
              GetBuffer(scoresScratch)],
             numHeads, &p);
+    }
+
+    /// <summary>
+    /// Batched fp32 KV append (issue #308): appends <paramref name="numTokens"/> rows of K/V from the
+    /// packed <c>[numTokens][kvDim]</c> inputs <paramref name="kK"/>/<paramref name="vK"/> into the
+    /// cache in ONE dispatch, row r at cache slot <paramref name="basePos"/> + r. Bit-identical to
+    /// <paramref name="numTokens"/> separate <see cref="KvAppend"/> calls. 2D grid
+    /// <c>(ceil(kvDim/256), numTokens)</c>. Used by the spec-decode batched verify; fp32 KV only.
+    /// </summary>
+    public void KvAppendBatched(Tensor kK, Tensor vK, Tensor kCache, Tensor vCache,
+        uint kvDim, uint basePos, int numTokens, uint maxSeqLen)
+    {
+        _kvAppendBatchedPipeline ??= new ComputePipeline(this, Shaders.KvAppendBatched, 4, pushConstantSize: sizeof(KvAppendParams));
+        var p = new KvAppendParams { kvDim = kvDim, position = basePos, maxSeqLen = maxSeqLen };
+        DispatchOrRecord(_kvAppendBatchedPipeline,
+            [GetBuffer(kK), GetBuffer(vK), GetBuffer(kCache), GetBuffer(vCache)],
+            (kvDim + 255) / 256, &p, groupY: (uint)numTokens);
+    }
+
+    /// <summary>
+    /// Batched fp32 attention (issue #308): runs <paramref name="numQueries"/> queries from the packed
+    /// <c>[numQueries][numHeads*headDim]</c> buffer <paramref name="qK"/> in ONE dispatch over a 2D grid
+    /// of <c>numHeads × numQueries</c> workgroups, writing the packed <c>[numQueries][numHeads*headDim]</c>
+    /// output <paramref name="attnOutK"/>. Query qi (absolute position <paramref name="basePos"/> + qi)
+    /// attends causally over <c>[0, basePos+qi]</c> — bit-identical to <paramref name="numQueries"/>
+    /// separate single-query <see cref="Attention"/> calls at seqLens basePos+1 … basePos+numQueries.
+    /// fp32 KV only; the caller must guarantee <c>basePos + numQueries ≤ 4096</c> (the shared-memory
+    /// score fast path has no scratch-spill fallback). No SWA window (spec verify is full-causal).
+    /// </summary>
+    public void AttentionBatched(Tensor qK, Tensor kCache, Tensor vCache, Tensor attnOutK,
+        uint numHeads, uint numKvHeads, uint headDim, uint basePos, int numQueries, uint maxSeqLen)
+    {
+        _attentionBatchedPipeline ??= new ComputePipeline(this, Shaders.AttentionBatched, 4, pushConstantSize: sizeof(AttentionBatchedParams));
+        var p = new AttentionBatchedParams
+        {
+            numHeads = numHeads, numKvHeads = numKvHeads, headDim = headDim,
+            basePos = basePos, maxSeqLen = maxSeqLen, numQueries = (uint)numQueries
+        };
+        DispatchOrRecord(_attentionBatchedPipeline,
+            [GetBuffer(qK), GetBuffer(kCache), GetBuffer(vCache), GetBuffer(attnOutK)],
+            numHeads, &p, groupY: (uint)numQueries);
     }
 
     /// <summary>
@@ -2335,6 +2379,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _matVecF32Pipeline?.Dispose();
         _kvAppendPipeline?.Dispose();
         _attentionPipeline?.Dispose();
+        _kvAppendBatchedPipeline?.Dispose();
+        _attentionBatchedPipeline?.Dispose();
         _kvAppendBf16Pipeline?.Dispose();
         _attentionBf16Pipeline?.Dispose();
         _kvAppendQ8Pipeline?.Dispose();

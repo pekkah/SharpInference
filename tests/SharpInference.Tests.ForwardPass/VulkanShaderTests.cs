@@ -813,6 +813,156 @@ public sealed unsafe class VulkanShaderTests
         }
     }
 
+    /// <summary>
+    /// Issue #308: the batched fp32 KvAppend must be bit-identical to K separate single-token
+    /// KvAppend calls — row r appended at cache slot basePos+r, same element addressing, no ring.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    [InlineData(8)]
+    public void KvAppendBatchedMatchesSingleRow(int k)
+    {
+        Vulkan.VulkanBackend backend;
+        try { backend = new Vulkan.VulkanBackend(); }
+        catch { return; } // no Vulkan device on this host — skip
+
+        using (backend)
+        {
+            const int numKvHeads = 2;
+            const int headDim = 64;
+            const int kvDim = numKvHeads * headDim;
+            const int basePos = 20;
+            const int maxSeqLen = basePos + 8 + 16;
+
+            var rng = new Random(73 + k);
+            var kIn = new float[k * kvDim];
+            var vIn = new float[k * kvDim];
+            for (int i = 0; i < kIn.Length; i++) kIn[i] = (float)(rng.NextDouble() * 2 - 1);
+            for (int i = 0; i < vIn.Length; i++) vIn[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            // Batched: all k rows appended in one dispatch, row r at slot basePos+r.
+            var gpuKIn = backend.Upload(kIn, TensorShape.D1(k * kvDim));
+            var gpuVIn = backend.Upload(vIn, TensorShape.D1(k * kvDim));
+            var gpuKCacheB = backend.Allocate(TensorShape.D1((long)maxSeqLen * kvDim));
+            var gpuVCacheB = backend.Allocate(TensorShape.D1((long)maxSeqLen * kvDim));
+            backend.KvAppendBatched(gpuKIn, gpuVIn, gpuKCacheB, gpuVCacheB,
+                (uint)kvDim, (uint)basePos, k, (uint)maxSeqLen);
+            var batchedK = new float[maxSeqLen * kvDim];
+            var batchedV = new float[maxSeqLen * kvDim];
+            backend.Download(gpuKCacheB, batchedK);
+            backend.Download(gpuVCacheB, batchedV);
+
+            // Reference: k separate single-token KvAppend calls at slots basePos, basePos+1, …
+            var gpuKCacheS = backend.Allocate(TensorShape.D1((long)maxSeqLen * kvDim));
+            var gpuVCacheS = backend.Allocate(TensorShape.D1((long)maxSeqLen * kvDim));
+            for (int t = 0; t < k; t++)
+            {
+                var gpuKRow = backend.Upload(kIn.AsSpan(t * kvDim, kvDim), TensorShape.D1(kvDim));
+                var gpuVRow = backend.Upload(vIn.AsSpan(t * kvDim, kvDim), TensorShape.D1(kvDim));
+                backend.KvAppend(gpuKRow, gpuVRow, gpuKCacheS, gpuVCacheS,
+                    (uint)kvDim, (uint)(basePos + t), (uint)maxSeqLen);
+                backend.Free(gpuKRow);
+                backend.Free(gpuVRow);
+            }
+            var singleK = new float[maxSeqLen * kvDim];
+            var singleV = new float[maxSeqLen * kvDim];
+            backend.Download(gpuKCacheS, singleK);
+            backend.Download(gpuVCacheS, singleV);
+
+            // Compare only the slots the appends touched ([basePos, basePos+k)).
+            for (int t = 0; t < k; t++)
+                for (int i = 0; i < kvDim; i++)
+                {
+                    int idx = (basePos + t) * kvDim + i;
+                    Assert.True(batchedK[idx] == singleK[idx],
+                        $"K mismatch k={k} row={t} i={i}: batched={batchedK[idx]:R} single={singleK[idx]:R}");
+                    Assert.True(batchedV[idx] == singleV[idx],
+                        $"V mismatch k={k} row={t} i={i}: batched={batchedV[idx]:R} single={singleV[idx]:R}");
+                }
+
+            backend.Free(gpuKIn); backend.Free(gpuVIn);
+            backend.Free(gpuKCacheB); backend.Free(gpuVCacheB);
+            backend.Free(gpuKCacheS); backend.Free(gpuVCacheS);
+        }
+    }
+
+    /// <summary>
+    /// Issue #308 (the crux): the batched fp32 attention must be BIT-IDENTICAL to K separate
+    /// single-query Attention calls, where query qi attends causally over [0, basePos+qi]
+    /// (seqLen = basePos+qi+1). GQA (numHeads=8, numKvHeads=2), headDim=64, basePos=20, K=4. The
+    /// K/V cache holds basePos prefix rows + K batch rows (so query qi at slot basePos+qi can attend
+    /// to its own appended K/V). Asserts exact float equality (==) — the batched shader is an
+    /// independent per-(head,query) copy of the single-query fast path.
+    /// </summary>
+    [Theory]
+    [InlineData(4)]
+    [InlineData(6)]
+    public void AttentionBatchedMatchesSingleQuery(int k)
+    {
+        Vulkan.VulkanBackend backend;
+        try { backend = new Vulkan.VulkanBackend(); }
+        catch { return; } // no Vulkan device on this host — skip
+
+        using (backend)
+        {
+            const int numHeads = 8;
+            const int numKvHeads = 2;
+            const int headDim = 64;
+            const int kvDim = numKvHeads * headDim;
+            const int qDim = numHeads * headDim;
+            const int basePos = 20;             // prefix length; batch tokens at slots basePos..basePos+k
+            int seqMax = basePos + k;           // cache holds prefix + the k batch K/V rows
+            int maxSeqLen = seqMax + 16;
+
+            var rng = new Random(91 + k);
+            var qK = new float[k * qDim];
+            for (int i = 0; i < qK.Length; i++) qK[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            // Cache: fill [0, basePos+k) with K/V so query qi (slot basePos+qi) can attend [0, basePos+qi].
+            var kCache = new float[maxSeqLen * kvDim];
+            var vCache = new float[maxSeqLen * kvDim];
+            for (int i = 0; i < seqMax * kvDim; i++) kCache[i] = (float)(rng.NextDouble() * 2 - 1);
+            for (int i = 0; i < seqMax * kvDim; i++) vCache[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            var gpuKCache = backend.Upload(kCache, TensorShape.D1((long)maxSeqLen * kvDim));
+            var gpuVCache = backend.Upload(vCache, TensorShape.D1((long)maxSeqLen * kvDim));
+
+            // Batched: k queries in one dispatch (each causal over [0, basePos+qi]).
+            var gpuQK = backend.Upload(qK, TensorShape.D1(k * qDim));
+            var gpuAttnOutK = backend.Allocate(TensorShape.D1(k * qDim));
+            backend.AttentionBatched(gpuQK, gpuKCache, gpuVCache, gpuAttnOutK,
+                (uint)numHeads, (uint)numKvHeads, (uint)headDim, (uint)basePos, k, (uint)maxSeqLen);
+            var batchedOut = new float[k * qDim];
+            backend.Download(gpuAttnOutK, batchedOut);
+
+            // Reference: k separate single-query Attention calls at seqLen = basePos+qi+1.
+            long scratchElems = maxSeqLen > 4096 ? (long)numHeads * maxSeqLen : 1L;
+            var gpuScratch = backend.Allocate(TensorShape.D1(scratchElems));
+            var singleOut = new float[qDim];
+            for (int qi = 0; qi < k; qi++)
+            {
+                var gpuQ = backend.Upload(qK.AsSpan(qi * qDim, qDim), TensorShape.D1(qDim));
+                var gpuOut = backend.Allocate(TensorShape.D1(qDim));
+                backend.Attention(gpuQ, gpuKCache, gpuVCache, gpuOut, gpuScratch,
+                    (uint)numHeads, (uint)numKvHeads, (uint)headDim,
+                    (uint)(basePos + qi + 1), (uint)maxSeqLen, window: 0u);
+                backend.Download(gpuOut, singleOut);
+                backend.Free(gpuQ);
+                backend.Free(gpuOut);
+                for (int i = 0; i < qDim; i++)
+                {
+                    float b = batchedOut[qi * qDim + i], s = singleOut[i];
+                    Assert.True(b == s, $"k={k} query={qi} i={i}: batched={b:R} single={s:R}");
+                }
+            }
+
+            backend.Free(gpuKCache); backend.Free(gpuVCache);
+            backend.Free(gpuQK); backend.Free(gpuAttnOutK);
+            backend.Free(gpuScratch);
+        }
+    }
+
     private static void AssertVulkanMatVecMatchesCpu(
         byte[] weightBytes, int matRows, int matCols, DType dtype, int inputSeed)
     {

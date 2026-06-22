@@ -1658,21 +1658,39 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                 _gpu.RecordBarrier();
             }
 
-            // KvAppend + Attention per token, INTERLEAVED so token i attends to [0, startPos+i]
-            // (causal among the k tokens). seqLen = startPos+i+1 — bit-identical to k sequential
-            // Forwards. Appends the post-RoPE k/v at slot startPos+i, then attends.
-            for (int i = 0; i < k; i++)
+            // KvAppend + Attention over the k tokens so token i attends to [0, startPos+i] (causal
+            // among the k tokens; seqLen = startPos+i+1) — bit-identical to k sequential Forwards.
+            // fp32 KV with the whole causal range in shared memory (startPos+k ≤ 4096): one BATCHED
+            // KvAppend (all k K/V appended at once) + one BATCHED attention dispatch (k queries, each
+            // query i causal over [0, startPos+i]) reading _qK / writing _attnOutK directly — no
+            // per-token gather/scatter. The batched attention shader is an independent per-(head,
+            // query) copy of the single-query fast path with seqLen=startPos+i+1, so it is
+            // bit-identical to the per-token K-loop below. Otherwise (bf16/q8_0 KV, or startPos+k
+            // beyond the 4096 shared-score fast path) fall back to the interleaved per-token K-loop.
+            if (_kvDType == DType.Float32 && startPos + k <= 4096)
             {
-                int position = startPos + i;
-                _gpu.RecordComputeCopyRegion(_q, 0, _qK, (long)i * qDim * f32, (long)qDim * f32);
-                _gpu.RecordComputeCopyRegion(_k, 0, _kK, (long)i * kvDim * f32, (long)kvDim * f32);
-                _gpu.RecordComputeCopyRegion(_v, 0, _vK, (long)i * kvDim * f32, (long)kvDim * f32);
+                _gpu.KvAppendBatched(_kK, _vK, _gpuKCache[layer], _gpuVCache[layer],
+                    (uint)kvDim, (uint)startPos, k, (uint)_maxSeqLen);
                 _gpu.RecordBarrier();
-
-                BatchVerifyAppendAttend(layer, position);
-
-                _gpu.RecordComputeCopyRegion(_attnOutK, (long)i * qDim * f32, _attnOut, 0, (long)qDim * f32);
+                _gpu.AttentionBatched(_qK, _gpuKCache[layer], _gpuVCache[layer], _attnOutK,
+                    (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim, (uint)startPos, k, (uint)_maxSeqLen);
                 _gpu.RecordBarrier();
+            }
+            else
+            {
+                for (int i = 0; i < k; i++)
+                {
+                    int position = startPos + i;
+                    _gpu.RecordComputeCopyRegion(_q, 0, _qK, (long)i * qDim * f32, (long)qDim * f32);
+                    _gpu.RecordComputeCopyRegion(_k, 0, _kK, (long)i * kvDim * f32, (long)kvDim * f32);
+                    _gpu.RecordComputeCopyRegion(_v, 0, _vK, (long)i * kvDim * f32, (long)kvDim * f32);
+                    _gpu.RecordBarrier();
+
+                    BatchVerifyAppendAttend(layer, position);
+
+                    _gpu.RecordComputeCopyRegion(_attnOutK, (long)i * qDim * f32, _attnOut, 0, (long)qDim * f32);
+                    _gpu.RecordBarrier();
+                }
             }
 
             // O projection: batched (weight read once). hiddenK = Wo · attnOutK.
