@@ -1833,26 +1833,43 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     private void EnsureBatchVerifyScratch(int k)
     {
         if (_bvK >= k) return;
-        if (_bvK > 0) FreeBatchVerifyScratch();
+        if (_bvK > 0) FreeBatchVerifyScratch(); // free the prior (fully-allocated) generation
 
         int qDim = _numHeads * _headDim;
         int kvDim = _numKvHeads * _headDim;
         int ffnDim = ComputeFfnScratchDim(_isMoE, _intermDim, _expertDim);
 
-        _hiddenK = _gpu.Allocate(TensorShape.D1((long)k * _embDim));
-        _residualK = _gpu.Allocate(TensorShape.D1((long)k * _embDim));
-        _normK = _gpu.Allocate(TensorShape.D1((long)k * _embDim));
-        _qK = _gpu.Allocate(TensorShape.D1((long)k * qDim));
-        _kK = _gpu.Allocate(TensorShape.D1((long)k * kvDim));
-        _vK = _gpu.Allocate(TensorShape.D1((long)k * kvDim));
-        _attnOutK = _gpu.Allocate(TensorShape.D1((long)k * qDim));
-        _ffnGateK = _gpu.Allocate(TensorShape.D1((long)k * ffnDim));
-        _ffnUpK = _gpu.Allocate(TensorShape.D1((long)k * ffnDim));
-        _logitsK = _gpu.Allocate(TensorShape.D1((long)k * _hp.VocabSize));
-        _logitsKBuf = new float[(long)k * _hp.VocabSize];
-        _bvK = k;
+        // Track each allocation so a mid-way throw (e.g. OOM on a later buffer) frees the
+        // partial set instead of leaking it (the fields would otherwise hold live-but-orphaned
+        // tensors with _bvK==0).
+        var allocated = new List<Tensor>(10);
+        Tensor Alloc(long n) { var t = _gpu.Allocate(TensorShape.D1(n)); allocated.Add(t); return t; }
+        try
+        {
+            _hiddenK = Alloc((long)k * _embDim);
+            _residualK = Alloc((long)k * _embDim);
+            _normK = Alloc((long)k * _embDim);
+            _qK = Alloc((long)k * qDim);
+            _kK = Alloc((long)k * kvDim);
+            _vK = Alloc((long)k * kvDim);
+            _attnOutK = Alloc((long)k * qDim);
+            _ffnGateK = Alloc((long)k * ffnDim);
+            _ffnUpK = Alloc((long)k * ffnDim);
+            _logitsK = Alloc((long)k * _hp.VocabSize);
+            _logitsKBuf = new float[k * _hp.VocabSize]; // k ≤ 8, vocab small → fits int
+            _bvK = k;
+        }
+        catch
+        {
+            foreach (var t in allocated) _gpu.Free(t);
+            _bvK = 0; // fields hold freed tensors; next call (re)allocates, Dispose skips (_bvK==0)
+            throw;
+        }
     }
 
+    // Called only when fully allocated (_bvK > 0); the tensors are non-null here. A partial
+    // allocation that threw is freed in EnsureBatchVerifyScratch's catch, not here (the fields
+    // would be null/freed). Free dereferences tensor.Handle, so it is NOT null-safe.
     private void FreeBatchVerifyScratch()
     {
         _gpu.Free(_hiddenK); _gpu.Free(_residualK); _gpu.Free(_normK);
@@ -2336,7 +2353,8 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         if (_snapKvScoreAccum is { } accBuf) _gpu.Free(accBuf);
         if (_snapKvScoreScratch is { } scrBuf && _snapKvScoreScratchOwned) _gpu.Free(scrBuf);
 
-        // Batched-verify scratch (#308 PR1c), null/zero unless BatchVerifyBatched ran.
+        // Batched-verify scratch (#308 PR1c). Guarded: only fully-allocated when _bvK > 0 (a
+        // partial alloc that threw is freed in EnsureBatchVerifyScratch's catch, leaving _bvK==0).
         if (_bvK > 0) FreeBatchVerifyScratch();
 
         _kvCache.Dispose();
