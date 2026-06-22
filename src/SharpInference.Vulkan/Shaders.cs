@@ -546,12 +546,14 @@ internal static class Shaders
             float decay   = exp(dt * ssma_data[h]);
             float b_sc    = 1.0 / (1.0 + exp(-beta_data[h]));
 
-            uint state_base = h * d * d;
+            // d is fixed at 128 (== local_size_x == headDim, enforced by the wrapper). Using the
+            // literal lets the SPIR-V compiler strength-reduce i*128 → i<<7 and unroll the loops.
+            uint state_base = h * 16384u;   // h * d * d
 
             // Pass A: decay S, then accumulate p[j] = Σ_i k[i] · S[i,j].
             float p_local = 0.0;
-            for (uint i = 0u; i < d; i++) {
-                uint off = state_base + i * d + j;
+            for (uint i = 0u; i < 128u; i++) {
+                uint off = state_base + i * 128u + j;
                 float sij = state_data[off] * decay;
                 state_data[off] = sij;
                 p_local += sK[i] * sij;
@@ -566,15 +568,15 @@ internal static class Shaders
 
             // Pass B: rank-1 update S[i,j] += k[i] · d[j], fused with readout o[j].
             float o_local = 0.0;
-            for (uint i = 0u; i < d; i++) {
-                uint off = state_base + i * d + j;
+            for (uint i = 0u; i < 128u; i++) {
+                uint off = state_base + i * 128u + j;
                 float sij = state_data[off] + sK[i] * d_j;
                 state_data[off] = sij;
                 o_local += sQ[i] * sij;
             }
 
-            // Scale by 1/sqrt(d).
-            o_local *= inversesqrt(float(d));
+            // Scale by 1/sqrt(d), d=128.
+            o_local *= inversesqrt(128.0);
 
             // RMSNorm: scale = rsqrt(sumSq/d + eps), then o = o * scale * normWeight.
             sRed[j] = o_local * o_local;
@@ -583,7 +585,7 @@ internal static class Shaders
                 if (j < s) sRed[j] += sRed[j + s];
                 barrier();
             }
-            float scale = inversesqrt(sRed[0] / float(d) + norm_eps);
+            float scale = inversesqrt(sRed[0] / 128.0 + norm_eps);
 
             float o_normed = o_local * scale * sNormW[j];
 

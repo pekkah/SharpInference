@@ -1433,6 +1433,27 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             throw new ArgumentOutOfRangeException(nameof(numVHeads), numVHeads,
                 "numVHeads must be >= 1.");
 
+        // Validate tensor sizes on the CPU: a too-small buffer would index out of bounds on the
+        // GPU (silent corruption / device-lost), which the shader cannot guard against.
+        long qkvLen = (long)numVHeads * headDim;
+        long stateLen = qkvLen * headDim;
+        static void Require(Tensor t, long min, string name)
+        {
+            if (t.ElementCount < min)
+                throw new ArgumentException($"{name} must have at least {min} elements (has {t.ElementCount}).", name);
+        }
+        Require(state, stateLen, nameof(state));
+        Require(q, qkvLen, nameof(q));
+        Require(k, qkvLen, nameof(k));
+        Require(v, qkvLen, nameof(v));
+        Require(z, qkvLen, nameof(z));
+        Require(output, qkvLen, nameof(output));
+        Require(alphaIn, numVHeads, nameof(alphaIn));
+        Require(beta, numVHeads, nameof(beta));
+        Require(ssmA, numVHeads, nameof(ssmA));
+        Require(dtBias, numVHeads, nameof(dtBias));
+        Require(normWeight, headDim, nameof(normWeight));
+
         _gdnRecurrenceDecodePipeline ??= new ComputePipeline(this, Shaders.GdnRecurrenceDecode, 11,
             pushConstantSize: sizeof(GdnRecurrenceDecodeParams));
         var p = new GdnRecurrenceDecodeParams
