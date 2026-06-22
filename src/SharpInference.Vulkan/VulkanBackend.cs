@@ -1347,6 +1347,12 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     public void GdnConv1dDecode(Tensor x, Tensor state, Tensor weight, Tensor output,
                                 int channels, int kernelSize)
     {
+        // The shader keeps the prior taps in a fixed-size `float s_old[4]` register array and
+        // computes `retained = kernel_size - 1u` in uint, so kernelSize must be in [1, 5]:
+        // 0 would underflow to a ~4-billion loop bound; >5 would index s_old out of bounds.
+        // (qwen35moe/qwen36 use kernelSize 4. CUDA's reference is unguarded; we fail loud.)
+        if (kernelSize is < 1 or > 5)
+            throw new ArgumentOutOfRangeException(nameof(kernelSize), kernelSize, "kernelSize must be in [1, 5].");
         _gdnConv1dDecodePipeline ??= new ComputePipeline(this, Shaders.GdnConv1dDecode, 4, pushConstantSize: sizeof(GdnConv1dParams));
         var p = new GdnConv1dParams { channels = (uint)channels, kernelSize = (uint)kernelSize };
         DispatchOrRecord(_gdnConv1dDecodePipeline,

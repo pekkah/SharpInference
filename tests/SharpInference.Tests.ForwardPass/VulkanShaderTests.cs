@@ -2676,6 +2676,28 @@ public sealed unsafe class VulkanShaderTests
 
     // ── Gated-DeltaNet (GDN) shader parity (issue #356; qwen35moe/qwen36 hybrid) ──
 
+    [Theory]
+    [InlineData(0)]   // would underflow `kernel_size - 1u` to a ~4-billion shader loop bound
+    [InlineData(6)]   // would index the fixed `float s_old[4]` out of bounds
+    public void GdnConv1dDecodeRejectsOutOfRangeKernel(int kernelSize)
+    {
+        using var backend = new Vulkan.VulkanBackend();
+        const int channels = 16;
+        var x = backend.Allocate(TensorShape.D1(channels));
+        var state = backend.Allocate(TensorShape.D1(channels));   // size irrelevant; guard throws first
+        var weight = backend.Allocate(TensorShape.D1(channels));
+        var output = backend.Allocate(TensorShape.D1(channels));
+        try
+        {
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                backend.GdnConv1dDecode(x, state, weight, output, channels, kernelSize));
+        }
+        finally
+        {
+            backend.Free(x); backend.Free(state); backend.Free(weight); backend.Free(output);
+        }
+    }
+
     [Fact]
     public void GdnConv1dDecodeMatchesCpu()
     {
