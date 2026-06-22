@@ -1905,6 +1905,134 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Batched (M=K) weight-stationary matrix-vector multiply with Q6_K dequantization —
+    /// the Q6_K sibling of <see cref="MatVecBatchedQ4K"/>. Q4_K_M models pack most weights
+    /// as Q4_K but keep ffn_down and token_embd/output as Q6_K, so the batched trunk needs
+    /// a Q6_K batched matvec too (issue #308). Computes <c>output[k][row] = Σ_c W[row][c] *
+    /// input[k][c]</c> for k ∈ [0, nTok). The expensive part (reading + unpacking each weight
+    /// from VRAM) is done ONCE per output element and then multiplied into <c>nTok</c>
+    /// accumulators (one per input vector), so the weight is read from VRAM once for all K
+    /// tokens instead of K times. Only the per-token input reads are repeated.
+    ///
+    /// Bindings: 0=quantized weights (uint8), 1=inputs (float, row-major [nTok][cols]),
+    /// 2=outputs (float, row-major [nTok][rows]). Push constants: { uint rows, uint cols, uint nTok }.
+    ///
+    /// BIT-EXACT vs nTok separate single-row <see cref="MatVecQ6K"/> calls: the element
+    /// iteration order (the 8 explicit per-lane elements at lane, lane+32, …, lane+224), the
+    /// per-element Q6_K dequant, and the subgroupAdd reduction are IDENTICAL to the single-row
+    /// shader — only the k (token) dimension is added on top. The same floating-point
+    /// accumulation order is therefore preserved per (row, token).
+    ///
+    /// local_size_x = 256 (8 rows × 32 lanes) so #318 pins the subgroup size to 32, which the
+    /// subgroupAdd reduction requires (THREADS_PER_ROW == 32).
+    ///
+    /// nTok is capped at 8 (the acc[] register array size; matches the spec-decode draft cap).
+    /// </summary>
+    internal const string MatVecBatchedQ6K = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+        #extension GL_KHR_shader_subgroup_arithmetic : enable
+
+        // 8 rows per workgroup, 32 threads per row = 256 threads.
+        // Q6_K block layout (210 bytes per 256 elements):
+        //   [0:128]   ql — lower 4-bit nibbles (two 64-byte halves)
+        //   [128:192] qh — upper 2-bit pairs (two 32-byte halves)
+        //   [192:208] 16 int8 scale values
+        //   [208:210] FP16 super-block scale d
+        // Thread layout: each lane handles 8 elements (lane, lane+32, ..., lane+224).
+        #define N_ROWS 8
+        #define THREADS_PER_ROW 32
+        #define MAX_NTOK 8
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Weights { uint weights_data[]; };
+        layout(binding = 1) readonly buffer Input   { float input_data[]; };
+        layout(binding = 2) writeonly buffer Output  { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint rows;
+            uint cols;
+            uint nTok;
+        };
+
+        uint gByte(uint b) { return (weights_data[b >> 2] >> ((b & 3) * 8)) & 0xFF; }
+        int  gInt8(uint b) { int v = int(gByte(b)); return v >= 128 ? v - 256 : v; }
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint row_in_wg = tid / THREADS_PER_ROW;
+            uint lane = tid % THREADS_PER_ROW;
+            uint row = gl_WorkGroupID.x * N_ROWS + row_in_wg;
+            if (row >= rows) return;
+
+            uint num_blocks = cols >> 8;
+            uint boff_base = row * num_blocks * 210;
+
+            float acc[MAX_NTOK];
+            [[unroll]] for (uint k = 0; k < MAX_NTOK; k++) acc[k] = 0.0;
+
+            for (uint block = 0; block < num_blocks; block++) {
+                uint b0 = boff_base + block * 210;
+
+                float d = unpackHalf2x16(gByte(b0 + 208) | (gByte(b0 + 209) << 8)).x;
+
+                // Precompute the 8 scale floats needed by this lane.
+                // isc = lane>>4 selects lower (0) or upper (1) sub-scale row per group.
+                uint isc = lane >> 4;
+                float sc0 = d * float(gInt8(b0 + 192 + isc));
+                float sc1 = d * float(gInt8(b0 + 194 + isc));
+                float sc2 = d * float(gInt8(b0 + 196 + isc));
+                float sc3 = d * float(gInt8(b0 + 198 + isc));
+                float sc4 = d * float(gInt8(b0 + 200 + isc));
+                float sc5 = d * float(gInt8(b0 + 202 + isc));
+                float sc6 = d * float(gInt8(b0 + 204 + isc));
+                float sc7 = d * float(gInt8(b0 + 206 + isc));
+
+                // Load the 6 quantized bytes needed by this lane.
+                // Byte layout: groups 0,1 share nibbles from the same byte; 2,3 use upper nibble.
+                uint ql0 = gByte(b0 + lane);          // half=0, ql[lane]
+                uint ql1 = gByte(b0 + 32 + lane);     // half=0, ql[32+lane]
+                uint ql2 = gByte(b0 + 64 + lane);     // half=1, ql[64+lane]
+                uint ql3 = gByte(b0 + 96 + lane);     // half=1, ql[96+lane]
+                uint qh0 = gByte(b0 + 128 + lane);    // half=0, qh[lane]
+                uint qh1 = gByte(b0 + 160 + lane);    // half=1, qh[32+lane]
+
+                uint base_elem = block * 256;
+
+                // Each weight value w is dequantized ONCE here, then multiplied into all nTok
+                // input accumulators. Same element order + same w as single-row MatVecQ6K.
+                float w0 = sc0 * float(int((ql0 & 0xF)        | (((qh0 >> 0) & 3) << 4)) - 32);
+                float w1 = sc1 * float(int((ql1 & 0xF)        | (((qh0 >> 2) & 3) << 4)) - 32);
+                float w2 = sc2 * float(int(((ql0 >> 4) & 0xF) | (((qh0 >> 4) & 3) << 4)) - 32);
+                float w3 = sc3 * float(int(((ql1 >> 4) & 0xF) | (((qh0 >> 6) & 3) << 4)) - 32);
+                float w4 = sc4 * float(int((ql2 & 0xF)        | (((qh1 >> 0) & 3) << 4)) - 32);
+                float w5 = sc5 * float(int((ql3 & 0xF)        | (((qh1 >> 2) & 3) << 4)) - 32);
+                float w6 = sc6 * float(int(((ql2 >> 4) & 0xF) | (((qh1 >> 4) & 3) << 4)) - 32);
+                float w7 = sc7 * float(int(((ql3 >> 4) & 0xF) | (((qh1 >> 6) & 3) << 4)) - 32);
+
+                for (uint k = 0; k < nTok; k++) {
+                    uint in_base = k * cols + base_elem + lane;
+                    acc[k] += w0 * input_data[in_base];
+                    acc[k] += w1 * input_data[in_base +  32];
+                    acc[k] += w2 * input_data[in_base +  64];
+                    acc[k] += w3 * input_data[in_base +  96];
+                    acc[k] += w4 * input_data[in_base + 128];
+                    acc[k] += w5 * input_data[in_base + 160];
+                    acc[k] += w6 * input_data[in_base + 192];
+                    acc[k] += w7 * input_data[in_base + 224];
+                }
+            }
+
+            for (uint k = 0; k < nTok; k++) {
+                float r = subgroupAdd(acc[k]);
+                if (subgroupElect())
+                    output_data[k * rows + row] = r;
+            }
+        }
+        """;
+
+    /// <summary>
     /// Matrix-vector multiply with Q5_K dequantization.
     /// Each workgroup computes 8 output rows (8 rows × 32 lanes = 256 threads).
     /// Push constants: { uint rows, uint cols }.

@@ -1078,6 +1078,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _sigmoidPipeline;
     private ComputePipeline? _matVecQ4KPipeline;
     private ComputePipeline? _matVecBatchedQ4KPipeline;
+    private ComputePipeline? _matVecBatchedQ6KPipeline;
     private ComputePipeline? _matVecQ6KPipeline;
     private ComputePipeline? _matVecQ5KPipeline;
     private ComputePipeline? _matVecQ8_0Pipeline;
@@ -1376,18 +1377,18 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
 
     /// <summary>
     /// Batched (weight-stationary) matrix-vector multiply: computes <paramref name="nTok"/>
-    /// independent matvecs against the SAME weight matrix. The Q4_K weight is read from VRAM
-    /// once and multiplied into <paramref name="nTok"/> accumulators — the weight-amortization
+    /// independent matvecs against the SAME weight matrix. For Q4_K/Q6_K the weight is read from
+    /// VRAM once and multiplied into <paramref name="nTok"/> accumulators — the weight-amortization
     /// behind Vulkan speculative decoding (issue #308).
     ///
     /// Layouts: <paramref name="inputAll"/> is row-major [nTok][cols], <paramref name="outputAll"/>
     /// is row-major [nTok][rows]. <c>rows = outputAll.ElementCount / nTok</c>,
     /// <c>cols = inputAll.ElementCount / nTok</c>.
     ///
-    /// For Q4_K this dispatches the batched shader (the win). For every other dtype it falls
-    /// back to a correctness-only loop of the single-row <see cref="MatMul"/> over the K
+    /// For Q4_K and Q6_K this dispatches the batched shader (the win). For every other dtype it
+    /// falls back to a correctness-only loop of the single-row <see cref="MatMul"/> over the K
     /// input/output slices (no amortization), so the method is total across all weight dtypes.
-    /// The Q4_K batched result is bit-identical to nTok separate single-row MatMul calls.
+    /// The Q4_K/Q6_K batched results are bit-identical to nTok separate single-row MatMul calls.
     /// </summary>
     public void MatMulBatched(Tensor outputAll, Tensor matrix, Tensor inputAll, int nTok, DType weightDType)
     {
@@ -1405,6 +1406,20 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             throw new ArgumentException(
                 $"Q4_K batched matvec requires cols ({cols}) to be a multiple of 256 (the Q4_K block size); " +
                 "the shader derives num_blocks = cols >> 8.", nameof(inputAll));
+
+        if (weightDType == DType.Q6_K)
+        {
+            if (cols % 256 != 0)
+                throw new ArgumentException(
+                    $"Q6_K batched matvec requires cols ({cols}) to be a multiple of 256 (the Q6_K block size); " +
+                    "the shader derives num_blocks = cols >> 8.", nameof(inputAll));
+
+            _matVecBatchedQ6KPipeline ??= new ComputePipeline(this, Shaders.MatVecBatchedQ6K, 3, pushConstantSize: sizeof(MatVecBatchedParams));
+            var pq6 = new MatVecBatchedParams { rows = (uint)rows, cols = (uint)cols, nTok = (uint)nTok };
+            var bufsQ6 = (ReadOnlySpan<GpuBuffer>)[GetBuffer(matrix), GetBuffer(inputAll), GetBuffer(outputAll)];
+            DispatchOrRecord(_matVecBatchedQ6KPipeline, bufsQ6, ((uint)rows + 7) / 8, &pq6);
+            return;
+        }
 
         if (weightDType != DType.Q4_K)
         {
@@ -2234,6 +2249,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _sigmoidPipeline?.Dispose();
         _matVecQ4KPipeline?.Dispose();
         _matVecBatchedQ4KPipeline?.Dispose();
+        _matVecBatchedQ6KPipeline?.Dispose();
         _matVecQ6KPipeline?.Dispose();
         _matVecQ5KPipeline?.Dispose();
         _matVecQ8_0Pipeline?.Dispose();
