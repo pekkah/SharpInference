@@ -2674,6 +2674,155 @@ public sealed unsafe class VulkanShaderTests
         return output;
     }
 
+    // ── Gated-DeltaNet (GDN) shader parity (issue #356; qwen35moe/qwen36 hybrid) ──
+
+    [Theory]
+    [InlineData(0)]   // would underflow `kernel_size - 1u` to a ~4-billion shader loop bound
+    [InlineData(6)]   // would index the fixed `float s_old[4]` out of bounds
+    public void GdnConv1dDecodeRejectsOutOfRangeKernel(int kernelSize)
+    {
+        using var backend = new Vulkan.VulkanBackend();
+        const int channels = 16;
+        var x = backend.Allocate(TensorShape.D1(channels));
+        var state = backend.Allocate(TensorShape.D1(channels));   // size irrelevant; guard throws first
+        var weight = backend.Allocate(TensorShape.D1(channels));
+        var output = backend.Allocate(TensorShape.D1(channels));
+        try
+        {
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                backend.GdnConv1dDecode(x, state, weight, output, channels, kernelSize));
+        }
+        finally
+        {
+            backend.Free(x); backend.Free(state); backend.Free(weight); backend.Free(output);
+        }
+    }
+
+    [Fact]
+    public void GdnConv1dDecodeMatchesCpu()
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        const int channels = 8192;   // qwen35moe conv channel count
+        const int kernel = 4;        // qwen35moe conv kernel
+        int stateLen = (kernel - 1) * channels;
+        int weightLen = kernel * channels;
+
+        var rng = new Random(1234);
+        var x = new float[channels];
+        var state = new float[stateLen];
+        var weight = new float[weightLen];
+        for (int i = 0; i < channels; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < stateLen; i++) state[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < weightLen; i++) weight[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // GPU
+        var gpuX = backend.Upload(x, TensorShape.D1(channels));
+        var gpuState = backend.Upload(state, TensorShape.D1(stateLen));
+        var gpuWeight = backend.Upload(weight, TensorShape.D1(weightLen));
+        var gpuOut = backend.Allocate(TensorShape.D1(channels));
+        backend.GdnConv1dDecode(gpuX, gpuState, gpuWeight, gpuOut, channels, kernel);
+
+        var gpuOutput = new float[channels];
+        var gpuStateAfter = new float[stateLen];
+        backend.Download(gpuOut, gpuOutput);
+        backend.Download(gpuState, gpuStateAfter);
+
+        // CPU reference (clone the state so we keep the GPU's pre-call state for comparison).
+        var cpuState = (float[])state.Clone();
+        var cpuOutput = new float[channels];
+        SharpInference.Cpu.GdnKernels.CausalDepthwiseConv1dDecode(
+            x, cpuState, weight, cpuOutput, channels, kernel);
+
+        for (int i = 0; i < channels; i++)
+            Assert.True(MathF.Abs(gpuOutput[i] - cpuOutput[i]) < 1e-4f,
+                $"GdnConv1dDecode output mismatch at [{i}]: gpu={gpuOutput[i]}, cpu={cpuOutput[i]}");
+        for (int i = 0; i < stateLen; i++)
+            Assert.True(MathF.Abs(gpuStateAfter[i] - cpuState[i]) < 1e-4f,
+                $"GdnConv1dDecode state mismatch at [{i}]: gpu={gpuStateAfter[i]}, cpu={cpuState[i]}");
+
+        backend.Free(gpuX); backend.Free(gpuState); backend.Free(gpuWeight); backend.Free(gpuOut);
+    }
+
+    [Theory]
+    [InlineData(0)]              // contiguous from start
+    [InlineData(16 * 128 * 5)]   // normalize a sub-region embedded at a non-zero offset
+    public void GdnL2NormPerHeadMatchesCpu(int elementOffset)
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        const int numHeads = 16;
+        const int headDim = 128;
+        const float eps = 1e-6f;
+        int region = numHeads * headDim;
+        int total = elementOffset + region;
+
+        var rng = new Random(777 + elementOffset);
+        var data = new float[total];
+        for (int i = 0; i < total; i++) data[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // GPU: bind whole buffer, normalize only the sub-region [offset, offset+region).
+        var gpuData = backend.Upload(data, TensorShape.D1(total));
+        backend.GdnL2NormPerHead(gpuData, elementOffset, numHeads, headDim, eps);
+        var gpuResult = new float[total];
+        backend.Download(gpuData, gpuResult);
+
+        // CPU reference on the same sub-region.
+        var cpuRegion = new float[region];
+        Array.Copy(data, elementOffset, cpuRegion, 0, region);
+        SharpInference.Cpu.GdnKernels.L2NormPerHead(cpuRegion, numHeads, headDim, eps);
+
+        // Bytes before the offset must be untouched.
+        for (int i = 0; i < elementOffset; i++)
+            Assert.Equal(data[i], gpuResult[i], 6);
+        for (int i = 0; i < region; i++)
+            Assert.True(MathF.Abs(gpuResult[elementOffset + i] - cpuRegion[i]) < 1e-4f,
+                $"GdnL2NormPerHead mismatch at region [{i}]: gpu={gpuResult[elementOffset + i]}, cpu={cpuRegion[i]}");
+
+        backend.Free(gpuData);
+    }
+
+    [Theory]
+    [InlineData(0, 0)]           // contiguous
+    [InlineData(64, 256)]        // non-zero src/dst offsets (sub-regions)
+    public void GdnTileHeadsMatchesCpu(int srcOffset, int dstOffset)
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        const int srcHeads = 16;
+        const int repeat = 2;
+        const int headDim = 128;
+        int srcLen = srcHeads * headDim;
+        int dstLen = srcHeads * repeat * headDim;
+
+        var rng = new Random(99);
+        var src = new float[srcOffset + srcLen];
+        for (int i = 0; i < src.Length; i++) src[i] = (float)(rng.NextDouble() * 2 - 1);
+        var dst = new float[dstOffset + dstLen];   // tail filled by the op; head left zeroed
+
+        // GPU
+        var gpuSrc = backend.Upload(src, TensorShape.D1(src.Length));
+        var gpuDst = backend.Upload(dst, TensorShape.D1(dst.Length));
+        backend.GdnTileHeads(gpuSrc, srcOffset, gpuDst, dstOffset, srcHeads, repeat, headDim);
+        var gpuResult = new float[dst.Length];
+        backend.Download(gpuDst, gpuResult);
+
+        // CPU reference on the sub-regions.
+        var cpuSrc = new float[srcLen];
+        Array.Copy(src, srcOffset, cpuSrc, 0, srcLen);
+        var cpuDst = new float[dstLen];
+        SharpInference.Cpu.GdnKernels.TileHeads(cpuSrc, cpuDst, srcHeads, repeat, headDim);
+
+        // Bytes before dstOffset must be untouched (still zero).
+        for (int i = 0; i < dstOffset; i++)
+            Assert.Equal(0f, gpuResult[i]);
+        // Pure copy → exact equality.
+        for (int i = 0; i < dstLen; i++)
+            Assert.Equal(cpuDst[i], gpuResult[dstOffset + i]);
+
+        backend.Free(gpuSrc); backend.Free(gpuDst);
+    }
+
     private static float[] RandomUnit(Random rng, int dim)
     {
         var v = new float[dim];
