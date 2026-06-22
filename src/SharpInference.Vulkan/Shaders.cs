@@ -3048,6 +3048,179 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Batched (weight-stationary) Q6_K matvec via int8-activation DP4A — the Q6_K sibling of
+    /// <see cref="MatVecBatchedQ4KInt8"/> (issue #308 P2). Q4_K_M models keep ffn_down and
+    /// token_embd/output as Q6_K, so the Q4_K-only int8 path of P1 left ~⅓ of the trunk on the
+    /// slow FP <see cref="MatVecBatchedQ6K"/>; this shader pushes Q6_K onto the same DP4A path so
+    /// the WHOLE spec-decode trunk amortizes the weight read across all nTok draft tokens. Drop-in
+    /// replacement for <see cref="MatVecBatchedQ6K"/> when <c>VK_KHR_shader_integer_dot_product</c>
+    /// is present; the FP variant remains the fallback. Mirrors CUDA's Q6_K decode-MMQ int8 dot.
+    ///
+    /// The expensive per-weight work (read the ql/qh bytes, reconstruct the 6-bit quant, fold the
+    /// int8 sub-scale and super-block d — all token-INVARIANT) is hoisted ONCE per output element.
+    /// The per-token inner cost collapses to: load one int8 activation word + its fp16 scale, then
+    /// one <c>dotPacked4x8AccSatEXT</c>. Q6_K has NO min/dmin term (unlike Q4_K), so the identity is
+    /// simpler — no Σq bias, no 0x01010101 dot:
+    ///   Σ w·a = (d · scale · d8) · Σ((q6 − 32) · q8)   over each group of 4 elements.
+    /// The activation is read from the SAME Q8_1 buffer as the Q4_K int8 path
+    /// (<see cref="QuantizeQ8_1"/>) — Q6_K reuses the identical int8 activations, no new quant.
+    ///
+    /// LOSSY (int8 activation quant) but ARGMAX-STABLE vs <see cref="MatVecBatchedQ6K"/> — the same
+    /// trade-off as the CUDA DP4A path and the Q4_K int8 sibling. Spec-decode verify accepts on
+    /// argmax, so greedy spec stays lossless; the parity test relaxes to argmax-match + maxAbs &lt; 1.0.
+    ///
+    /// The int8 weight is <c>(q6 − 32) ∈ [−32, 31]</c>, which fits signed int8 — packed 4 per uint
+    /// for the signed dp4a. Lane→element layout: each lane owns 8 CONTIGUOUS columns
+    /// <c>lane·8 .. lane·8+7</c> of the 256-element super-block (32 lanes × 8 = 256), split into two
+    /// dp4a groups of 4 contiguous columns. Each group lands wholly inside one 32-element Q8_1
+    /// sub-block (its 4 int8 activations are one aligned word) and inside one 16-element Q6_K scale
+    /// group (scale index <c>lane/2</c>, shared by both groups of the lane). This differs from the
+    /// FP shader's strided per-lane element order, but it pairs each weight column with its OWN
+    /// activation column — the products Σ w[c]·a[c] are identical (only the FP reduction order
+    /// changes, which argmax-stability permits). The per-column (q6 − 32) reconstruction reuses the
+    /// exact ql/qh nibble + qh-pair-shift recipe of <see cref="MatVecBatchedQ6K"/> / MatVecQ6K
+    /// (column c → l = c%32, j = c/32), so the dequantized quant matches the FP path bit-for-bit.
+    ///
+    /// Bindings: 0 = Q6_K weights (uint8), 1 = Q8_1 activations (uint, [nTok][cols/32 × 36 B]),
+    /// 2 = outputs (float, row-major [nTok][rows]). Push constants: { uint rows, uint cols, uint nTok }.
+    /// local_size_x = 256 (8 rows × 32 lanes) → #318 pins the subgroup to 32 (THREADS_PER_ROW == 32).
+    /// </summary>
+    internal const string MatVecBatchedQ6KInt8 = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+        #extension GL_KHR_shader_subgroup_arithmetic : enable
+        #extension GL_EXT_integer_dot_product : require
+
+        // 8 rows per workgroup, 32 threads per row = 256 threads.
+        // Q6_K block layout (210 bytes per 256 elements):
+        //   [0:128]   ql — lower 4-bit nibbles (two 64-byte halves)
+        //   [128:192] qh — upper 2-bit pairs (two 32-byte halves)
+        //   [192:208] 16 int8 scale values
+        //   [208:210] FP16 super-block scale d
+        // Lane layout: each lane owns 8 contiguous columns lane*8 .. lane*8+7, split into
+        // two dp4a groups of 4 contiguous columns. Both groups share scale index lane/2.
+        #define N_ROWS 8
+        #define THREADS_PER_ROW 32
+        #define MAX_NTOK 8
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Weights { uint weights_data[]; };
+        layout(binding = 1) readonly buffer Acts    { uint act_data[];     }; // Q8_1 packed
+        layout(binding = 2) writeonly buffer Output { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint rows;
+            uint cols;
+            uint nTok;
+        };
+
+        uint gByte(uint b) { return (weights_data[b >> 2] >> ((b & 3) * 8)) & 0xFF; }
+        // Read a uint at a 4-aligned BYTE offset of the (uint-typed) Q8_1 buffer (see Q4K int8).
+        uint actWord(uint byteAddr) { return act_data[byteAddr >> 2]; }
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint row_in_wg = tid / THREADS_PER_ROW;
+            uint lane = tid % THREADS_PER_ROW;
+            uint row = gl_WorkGroupID.x * N_ROWS + row_in_wg;
+            if (row >= rows) return;
+
+            uint num_blocks = cols >> 8;                 // 256-element super-blocks per row
+            uint boff_base  = row * num_blocks * 210u;   // Q6_K weights are byte-addressed (210 B/block)
+
+            // Q8_1 activation row stride: (cols/32) sub-blocks × 36 bytes.
+            uint tok_byte_stride = (cols >> 5) * 36u;
+
+            // This lane's 8 contiguous columns within a block: groupA = base0..+3, groupB = base1..+3.
+            uint base0   = lane * 8u;        // first column of group A within the block
+            uint base1   = base0 + 4u;       // first column of group B
+            uint isc     = lane >> 1;        // shared Q6_K scale index (lane/2) for both groups
+
+            // Group A column j = base0/32; group B column j = base1/32 (constant within a 4-group).
+            uint jA = base0 >> 5;            // 0..7
+            uint jB = base1 >> 5;
+            uint lA = base0 & 31u;           // first of 4 consecutive ql/qh lanes
+            uint lB = base1 & 31u;
+
+            // ql byte base + high-nibble flag + qh byte base + qh 2-bit shift, per j (mirrors the
+            // MatVecBatchedQ6K per-element extraction; see /tmp derivation in PR notes).
+            //   j: 0->(ql 0,  lo, qh 128, sh0) 1->(ql 32, lo, qh 128, sh2) 2->(ql 0,  hi, qh 128, sh4)
+            //      3->(ql 32, hi, qh 128, sh6) 4->(ql 64, lo, qh 160, sh0) 5->(ql 96, lo, qh 160, sh2)
+            //      6->(ql 64, hi, qh 160, sh4) 7->(ql 96, hi, qh 160, sh6)
+            uint qlbaseA = ((jA & 1u) == 0u) ? ((jA < 4u) ? 0u : 64u) : ((jA < 4u) ? 32u : 96u);
+            uint qlbaseB = ((jB & 1u) == 0u) ? ((jB < 4u) ? 0u : 64u) : ((jB < 4u) ? 32u : 96u);
+            bool hiA = (jA == 2u) || (jA == 3u) || (jA == 6u) || (jA == 7u);
+            bool hiB = (jB == 2u) || (jB == 3u) || (jB == 6u) || (jB == 7u);
+            uint qhbaseA = (jA < 4u) ? 128u : 160u;
+            uint qhbaseB = (jB < 4u) ? 128u : 160u;
+            uint qhshA = (jA & 3u) * 2u;     // 0,2,4,6
+            uint qhshB = (jB & 3u) * 2u;
+
+            // Q8_1 byte base for each group's sub-block + the 4-int8 word offset within it.
+            uint subA      = base0 >> 5;     // == jA (sub-block index within the block)
+            uint subB      = base1 >> 5;
+            uint wordOffA  = (base0 & 31u);  // int8 position of the 4-group within its sub-block (0,4,..,28)
+            uint wordOffB  = (base1 & 31u);
+
+            float acc[MAX_NTOK];
+            [[unroll]] for (uint k = 0; k < MAX_NTOK; k++) acc[k] = 0.0;
+
+            for (uint block = 0; block < num_blocks; block++) {
+                uint b0 = boff_base + block * 210u;
+
+                float d = unpackHalf2x16(gByte(b0 + 208u) | (gByte(b0 + 209u) << 8u)).x;
+                int   sc = int(gByte(b0 + 192u + isc));
+                sc = (sc >= 128) ? sc - 256 : sc;           // int8 sub-scale
+                float dsc = d * float(sc);                   // token-invariant folded scale (both groups)
+
+                // Reconstruct the 4 int8 weights (q6 − 32) ∈ [−32,31] for each group, pack 4/int.
+                uint wpackA = 0u, wpackB = 0u;
+                [[unroll]] for (uint t = 0u; t < 4u; t++) {
+                    uint qlA = gByte(b0 + qlbaseA + lA + t);
+                    uint qhA = gByte(b0 + qhbaseA + lA + t);
+                    int  q6A = int((hiA ? ((qlA >> 4u) & 0xFu) : (qlA & 0xFu)) | (((qhA >> qhshA) & 3u) << 4u)) - 32;
+                    wpackA |= (uint(q6A) & 0xFFu) << (t * 8u);
+
+                    uint qlB = gByte(b0 + qlbaseB + lB + t);
+                    uint qhB = gByte(b0 + qhbaseB + lB + t);
+                    int  q6B = int((hiB ? ((qlB >> 4u) & 0xFu) : (qlB & 0xFu)) | (((qhB >> qhshB) & 3u) << 4u)) - 32;
+                    wpackB |= (uint(q6B) & 0xFFu) << (t * 8u);
+                }
+
+                // Q8_1 byte base for the two sub-blocks (within a token's activation row).
+                uint q81_base_A = (block * 8u + subA) * 36u;
+                uint q81_base_B = (block * 8u + subB) * 36u;
+
+                for (uint k = 0; k < nTok; k++) {
+                    uint tok_base = k * tok_byte_stride;
+
+                    // fp16 activation scale d8 (low 16 bits of each sub-block header).
+                    float d8A = unpackHalf2x16(actWord(tok_base + q81_base_A)).x;
+                    float d8B = unpackHalf2x16(actWord(tok_base + q81_base_B)).x;
+
+                    // 4 int8 activations per group at byte offset (4 + wordOff).
+                    uint actA = actWord(tok_base + q81_base_A + 4u + wordOffA);
+                    uint actB = actWord(tok_base + q81_base_B + 4u + wordOffB);
+
+                    // Signed×signed dp4a: Σ((q6−32)·q8). NO min term (Q6_K has no dmin). The Sat
+                    // overload is inert here (|partial| ≤ 4·32·127 = 16256, far below int32 overflow).
+                    int dotA = dotPacked4x8AccSatEXT(int(wpackA), int(actA), 0);
+                    int dotB = dotPacked4x8AccSatEXT(int(wpackB), int(actB), 0);
+
+                    acc[k] += (dsc * d8A) * float(dotA) + (dsc * d8B) * float(dotB);
+                }
+            }
+
+            for (uint k = 0; k < nTok; k++) {
+                float r = subgroupAdd(acc[k]);
+                if (subgroupElect())
+                    output_data[k * rows + row] = r;
+            }
+        }
+        """;
+
+    /// <summary>
     /// Matrix-vector multiply with Q5_K dequantization.
     /// Each workgroup computes 8 output rows (8 rows × 32 lanes = 256 threads).
     /// Push constants: { uint rows, uint cols }.

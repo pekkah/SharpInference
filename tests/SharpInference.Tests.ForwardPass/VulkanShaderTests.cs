@@ -631,12 +631,19 @@ public sealed unsafe class VulkanShaderTests
         return overlap;
     }
 
-    // Batched (weight-stationary) Q6_K matvec parity (issue #308). Q4_K_M models keep ffn_down
-    // and token_embd/output as Q6_K, so the batched trunk needs Q6_K batched too. Same invariant
-    // as the Q4_K test: the batched shader reads each Q6_K weight from VRAM ONCE and multiplies
-    // it into nTok accumulators; element order + per-element dequant + subgroupAdd reduction are
-    // identical to single-row MatVecQ6K, so each token's output must be BIT-EXACT to a separate
-    // single-row MatMul call against the same weight matrix and that token's input vector.
+    // Batched (weight-stationary) Q6_K matvec parity (issue #308 P2). Q4_K_M models keep ffn_down
+    // and token_embd/output as Q6_K, so the batched trunk needs a Q6_K batched matvec too. On GPUs
+    // with VK_KHR_shader_integer_dot_product, MatMulBatched(Q6_K) now routes through the int8-DP4A
+    // MatVecBatchedQ6KInt8 (the Q6_K sibling of the Q4_K int8 path): quantize the inputs to Q8_1 once
+    // and run dotPacked4x8AccSatEXT over (q6−32) int8 weights — LOSSY (int8 activations) but ARGMAX-
+    // STABLE vs the FP single-row MatVecQ6K, exactly the trade-off as CUDA's DP4A WS kernel and the
+    // Q4_K int8 path. Spec-decode verify accepts on argmax, so greedy spec stays lossless. This
+    // asserts (mirroring MatVecBatchedQ4KMatchesSingleRow), per token:
+    //   • maxAbs(batched − FP single-row) < a relative bound (int8 error is tiny at this scale),
+    //   • top-5 overlap ≥ 4 (the heavy hitters survive int8 quant),
+    //   • argmax(batched) == argmax(FP) whenever the FP top-1/top-2 margin exceeds the int8 error.
+    // On no-int-dot GPUs MatMulBatched falls back to the FP shader (bit-exact); the relative bound
+    // is then trivially satisfied, so this test stays valid on both paths.
     [Theory]
     [InlineData(1)]   // degenerate single-token
     [InlineData(4)]
@@ -650,8 +657,9 @@ public sealed unsafe class VulkanShaderTests
 
         using (backend)
         {
-            const int matRows = 64;
-            const int matCols = 512;  // 2 Q6_K blocks of 256
+            // Larger matrix so the argmax has a real margin (fewer synthetic near-ties).
+            const int matRows = 256;
+            const int matCols = 1024;  // 4 Q6_K blocks of 256
             var weightBytes = BuildQ6_K(matRows, matCols, seed: 4242);
 
             // Upload raw Q6_K bytes reinterpreted as floats (round up to 4 bytes).
@@ -673,7 +681,7 @@ public sealed unsafe class VulkanShaderTests
             var batchedOut = new float[nTok * matRows];
             backend.Download(gpuOutputAll, batchedOut);
 
-            // Reference: nTok separate single-row MatMul calls against the SAME weight matrix.
+            // Reference: nTok separate single-row MatMul calls (FP dequant — the bit-exact path).
             var gpuOutputK = backend.Allocate(TensorShape.D1(matRows));
             var singleOut = new float[matRows];
             for (int k = 0; k < nTok; k++)
@@ -683,14 +691,31 @@ public sealed unsafe class VulkanShaderTests
                 backend.Download(gpuOutputK, singleOut);
                 backend.Free(gpuInputK);
 
+                var batchRow = batchedOut.AsSpan(k * matRows, matRows).ToArray();
+                var fpRow = singleOut.ToArray();
+
+                float maxAbs = 0f, fpMag = 0f;
                 for (int r = 0; r < matRows; r++)
                 {
-                    float b = batchedOut[k * matRows + r];
-                    float s = singleOut[r];
-                    // Bit-exact: same dequant + identical accumulation order per (row, token).
-                    Assert.True(b == s,
-                        $"nTok={nTok} k={k} row={r}: batched={b:R} single={s:R} (diff={MathF.Abs(b - s):E2})");
+                    maxAbs = MathF.Max(maxAbs, MathF.Abs(batchRow[r] - fpRow[r]));
+                    fpMag = MathF.Max(fpMag, MathF.Abs(fpRow[r]));
                 }
+                // int8-activation quant gives a RELATIVE error ~O(1/127) of the output dynamic
+                // range. BuildQ6_K uses fully-random int8 scales → a much wider weight range than a
+                // real model, so the absolute error scales with the (large) FP output magnitude.
+                // Assert a relative bound (well within the ~0.8% int8 step); real-model logits are
+                // tame, so the spec-verify oracle (RunParity) keeps the tighter maxAbs<1.0.
+                float relTol = 0.02f * fpMag + 1e-3f;
+                Assert.True(maxAbs < relTol,
+                    $"nTok={nTok} k={k}: int8 matvec maxAbs={maxAbs:E3} ≥ relTol={relTol:E3} (fpMag={fpMag:E3})");
+
+                int overlap = TopKOverlap(fpRow, batchRow, 5);
+                Assert.True(overlap >= 4, $"nTok={nTok} k={k}: top-5 overlap {overlap} < 4 (maxAbs={maxAbs:E3})");
+
+                // Argmax stability only required when the FP winner is clear of the int8 noise.
+                (int a0, float v0, float v1) = Top2(fpRow);
+                if (v0 - v1 > 2f * maxAbs)
+                    Assert.Equal(a0, Argmax(batchRow));
             }
 
             backend.Free(gpuWeights);
