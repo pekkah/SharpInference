@@ -485,6 +485,54 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// RoPE NEOX with per-half-dim freq_factors (Gemma 4 global / non-SWA layers). Identical to
+    /// <see cref="RoPENeox"/> except each pair's frequency is divided by <c>freq_factors[i]</c>
+    /// (binding 1, size head_dim/2), masking the high-frequency tail to ~identity for long
+    /// context. Mirrors the CUDA <c>llm_rope_neox_with_factors</c> kernel and the CPU
+    /// <c>SimdKernels.BuildRopeTable(..., globalFreqFactors)</c> path. llama.cpp gemma4.cpp:191
+    /// applies this only to non-SWA layers; SWA layers use plain <see cref="RoPENeox"/>.
+    /// Push constants: { uint num_heads, uint head_dim, int position, float theta }.
+    /// </summary>
+    internal const string RoPENeoxWithFactors = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer X { float x_data[]; };
+        layout(binding = 1) readonly buffer FreqFactors { float freq_factors[]; };
+
+        layout(push_constant) uniform Params {
+            uint num_heads;
+            uint head_dim;
+            int position;
+            float theta;
+        };
+
+        void main() {
+            uint pair_idx = gl_GlobalInvocationID.x;
+            uint half_dim = head_dim / 2;
+            uint total_pairs = num_heads * half_dim;
+            if (pair_idx >= total_pairs) return;
+
+            uint h = pair_idx / half_dim;
+            uint i = pair_idx % half_dim;
+
+            float freq = 1.0 / pow(theta, 2.0 * float(i) / float(head_dim));
+            freq /= freq_factors[i];
+            float angle = float(position) * freq;
+            float cos_a = cos(angle);
+            float sin_a = sin(angle);
+
+            uint head_base = h * head_dim;
+            uint a_idx = head_base + i;
+            uint b_idx = head_base + i + half_dim;
+            float x0 = x_data[a_idx];
+            float x1 = x_data[b_idx];
+            x_data[a_idx] = x0 * cos_a - x1 * sin_a;
+            x_data[b_idx] = x0 * sin_a + x1 * cos_a;
+        }
+        """;
+
+    /// <summary>
     /// Softmax in-place (3-pass: max, exp+sum, normalize).
     /// Uses workgroup shared memory for reductions.
     /// Push constants: { uint n }.
@@ -666,6 +714,77 @@ internal static class Shaders
                 output_data[block * 256 + tid] = d * sc * float(nibble) - dmin * mn;
 
                 barrier();
+            }
+        }
+        """;
+
+    /// <summary>
+    /// Embedding lookup from a Q6_K quantized table: dequantize one row to F32 output.
+    /// Mirrors the CUDA <c>llm_embed_lookup_q6k</c> kernel (and thus <see cref="MatVecQ6K"/>
+    /// and the CPU <c>DequantQ6K</c>) — keeps a large Q6_K tied embedding (e.g. Gemma 4 12B,
+    /// [3840, 262144] ≈ 787 MiB raw) off the F32 dequant path that would burn ~4 GB of VRAM.
+    ///
+    /// 256 threads cooperate: each processes one block (256 elements) sequentially, thread
+    /// <c>tid</c> emitting element <c>tid</c> of each 256-element super-block.
+    /// Q6_K block (210 bytes per 256 elements):
+    ///   [0:128]   ql — lower 4 bits
+    ///   [128:192] qh — upper 2 bits
+    ///   [192:208] 16 int8 scales
+    ///   [208:210] FP16 d (super-block scale)
+    ///
+    /// Push constants: { uint token_id, uint emb_dim }.
+    /// Bindings: 0=quantized_table (uint8 via uint32[]), 1=output[emb_dim].
+    /// Dispatch: 1 workgroup.
+    /// </summary>
+    internal const string EmbedLookupQ6K = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer EmbTable { uint emb_data[]; };
+        layout(binding = 1) writeonly buffer Output  { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint token_id;
+            uint emb_dim;
+        };
+
+        // Read directly from global memory with absolute byte offsets (no shared
+        // memory): Q6_K blocks are 210 bytes, so a block's start is not necessarily
+        // 4-byte aligned, which would break a uint32-indexed shared-memory copy.
+        // Same byte-addressing approach as MatVecQ6K's gByte.
+        uint gByte(uint b) { return (emb_data[b >> 2] >> ((b & 3) * 8)) & 0xFF; }
+        int  gInt8(uint b) { int v = int(gByte(b)); return v >= 128 ? v - 256 : v; }
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint num_blocks = emb_dim >> 8; // emb_dim / 256
+
+            // Byte offset to the start of this token's row (210 bytes/block).
+            uint bytes_per_row = num_blocks * 210;
+            uint row_byte_base = token_id * bytes_per_row;
+
+            uint lane = tid & 31u;          // 0..31
+            uint g    = tid >> 5;           // group 0..7
+            uint isc  = lane >> 4;          // 0 or 1 (scale half)
+
+            for (uint block = 0; block < num_blocks; block++) {
+                uint b0 = row_byte_base + block * 210;
+
+                float d = unpackHalf2x16(gByte(b0 + 208) | (gByte(b0 + 209) << 8)).x;
+                float scale = d * float(gInt8(b0 + 192 + 2u * g + isc));
+
+                // ql byte: groups {0,2}->ql0, {1,3}->ql1, {4,6}->ql2, {5,7}->ql3 (+lane).
+                uint ql_index = (g < 4u) ? (g & 1u) : (2u + (g & 1u));
+                uint ql_byte  = gByte(b0 + ql_index * 32u + lane);
+                uint high     = (g >> 1) & 1u;  // groups 2,3,6,7 use the high nibble
+                uint nib      = (high != 0u) ? (ql_byte >> 4) : (ql_byte & 0xFu);
+
+                // qh: groups 0-3 from qh0 (offset 128), 4-7 from qh1 (160); 2-bit field per group.
+                uint qh_byte = (g < 4u) ? gByte(b0 + 128 + lane) : gByte(b0 + 160 + lane);
+                uint shift   = 2u * (g & 3u);
+                int q = int(nib | (((qh_byte >> shift) & 3u) << 4)) - 32;
+
+                output_data[block * 256 + tid] = scale * float(q);
             }
         }
         """;

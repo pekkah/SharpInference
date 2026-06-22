@@ -639,6 +639,82 @@ public sealed unsafe class VulkanShaderTests
         return bytes;
     }
 
+    // Q6_K: 210 bytes/block over 256 elements. Layout matches DequantQ6K:
+    //   [0:128] ql (lower 4 bits), [128:192] qh (upper 2 bits),
+    //   [192:208] 16 int8 scales, [208:210] FP16 d (super-block scale).
+    // Any byte values are valid for ql/qh (the 6-bit unpack just reads them); scales
+    // are int8. cols must be a multiple of 256.
+    private static byte[] BuildQ6_K(int rows, int cols, int seed)
+    {
+        const int qk = 256, blockBytes = 210;
+        int blocksPerRow = cols / qk;
+        var bytes = new byte[rows * blocksPerRow * blockBytes];
+        var rng = new Random(seed);
+        int off = 0;
+        for (int b = 0; b < rows * blocksPerRow; b++)
+        {
+            for (int j = 0; j < 192; j++)                                        // ql + qh
+                bytes[off + j] = (byte)rng.Next(0, 256);
+            for (int j = 192; j < 208; j++)                                      // 16 int8 scales
+                bytes[off + j] = (byte)(sbyte)rng.Next(-64, 65);
+            PutHalf(bytes, off + 208, (float)(rng.NextDouble() * 0.045 + 0.005)); // d
+            off += blockBytes;
+        }
+        return bytes;
+    }
+
+    [Fact]
+    public void EmbedLookupQ6KMatchesCpu()
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        // Synthetic Q6_K embedding: a few rows, embDim a multiple of 256.
+        const int vocab = 5;
+        const int embDim = 512;          // 2 Q6_K blocks per row
+        const int blockBytes = 210;
+        int blocksPerRow = embDim / 256;
+        var embBytes = BuildQ6_K(vocab, embDim, seed: 6262);
+
+        // Upload raw Q6_K bytes reinterpreted as floats (round up to 4 bytes), exactly
+        // as GpuForwardPass keeps the Q6_K embedding table raw in VRAM.
+        int floatCount = (embBytes.Length + 3) / 4;
+        var rawAsFloats = new float[floatCount];
+        embBytes.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsBytes(rawAsFloats.AsSpan()));
+        var gpuEmb = backend.Upload(rawAsFloats, TensorShape.D1(floatCount));
+        var gpuOut = backend.Allocate(TensorShape.D1(embDim));
+
+        int totalMismatches = 0;
+        for (uint token = 0; token < vocab; token++)
+        {
+            backend.EmbedLookupQ6K(gpuEmb, gpuOut, token, embDim);
+            var gpuRow = new float[embDim];
+            backend.Download(gpuOut, gpuRow);
+
+            // CPU reference: dequantize the SAME bytes for this row. Both sides decode
+            // identical bytes via the same (d * scale * q) recipe, so they must match.
+            var cpuRow = new float[embDim];
+            int rowOff = (int)token * blocksPerRow * blockBytes;
+            SharpInference.Cpu.Dequantize.ToFloat32(
+                embBytes.AsSpan(rowOff, blocksPerRow * blockBytes), cpuRow, DType.Q6_K, embDim);
+
+            for (int i = 0; i < embDim; i++)
+            {
+                float diff = MathF.Abs(gpuRow[i] - cpuRow[i]);
+                if (diff > 1e-2f)
+                {
+                    if (totalMismatches < 5)
+                        Console.WriteLine($"  tok={token} [{i}]: gpu={gpuRow[i]:F4} cpu={cpuRow[i]:F4} abs={diff:E2}");
+                    totalMismatches++;
+                }
+            }
+        }
+        Console.WriteLine($"EmbedLookupQ6K: {totalMismatches} mismatches over {vocab * embDim} values");
+        Assert.Equal(0, totalMismatches);
+
+        backend.Free(gpuEmb);
+        backend.Free(gpuOut);
+    }
+
     [Fact]
     public void GpuEmbedThenRmsNormMatchesCpu()
     {
