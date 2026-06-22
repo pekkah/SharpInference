@@ -1931,7 +1931,62 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         if (_hp.HasPerLayerTokenEmbd)
             BuildPerLayerProjectionsCpu(token);
 
-        // Re-upload the (possibly scaled) hidden state to GPU for the GPU half.
+        return RunGemma4Trunk(position);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Gemma 4 only: image input (issue #250/#252) splices vision soft tokens into the decode
+    /// stream. Reported on the CUDA partial-offload hybrid once the per-layer-head-dim Gemma 4
+    /// trunk is present (<see cref="_isGemma4Like"/>); non-Gemma arches don't implement the seam.
+    /// </remarks>
+    public bool SupportsEmbeddingInput => _isGemma4Like;
+
+    /// <summary>
+    /// Forward one position from a PRECOMPUTED embedding (a vision soft token) instead of a
+    /// token-table lookup. The CUDA partial-offload mirror of
+    /// <see cref="ForwardPass.ForwardEmbedding"/> and <see cref="CudaForwardPass.ForwardEmbedding"/>:
+    /// places the supplied embedding into the host hidden buffer and — per gemma4.cpp —
+    /// skips the sqrt(EmbeddingDim) embedding scale (raw embeddings arrive final, gemma4.cpp:182)
+    /// while still building the per-layer (PLE) projections from the padding token (id 0,
+    /// the multimodal branch of build_inp_per_layer). The trunk
+    /// (<see cref="RunGemma4Trunk"/> — GPU layers + CPU layers + KV append + finalise) is
+    /// byte-identical to the token <see cref="Forward"/> path; only the embedding source and
+    /// the PLE token (0 vs the input token) differ. Gemma 4 only.
+    /// </summary>
+    public ReadOnlySpan<float> ForwardEmbedding(ReadOnlySpan<float> embedding, int position)
+    {
+        if (!_isGemma4Like)
+            throw new NotSupportedException(
+                "ForwardEmbedding (image input) is only supported for Gemma 4 on the CUDA backend.");
+        if (embedding.Length != _embDim)
+            throw new ArgumentException(
+                $"embedding length {embedding.Length} != model embedding dim {_embDim}.");
+
+        // 1. Place the precomputed embedding into the host hidden buffer (the trunk's source
+        //    of truth — it re-uploads _cpuHidden to the GPU half). No sqrt(d) scale here:
+        //    raw vision embeddings arrive already final (gemma4.cpp:182).
+        embedding.CopyTo(new Span<float>(_cpuHidden, _embDim));
+
+        // 2. PLE pre-pass from the padding token (multimodal build_inp_per_layer branch);
+        //    the proj MatVec still reads the supplied embedding via _cpuHidden.
+        if (_hp.HasPerLayerTokenEmbd)
+            BuildPerLayerProjectionsCpu(0);
+
+        // 3. Same trunk (GPU+CPU layers + KV append + logits) as the token Forward.
+        return RunGemma4Trunk(position);
+    }
+
+    // ================================================================
+    //  Gemma 4 trunk — shared by ForwardGemma4 (token input) and ForwardEmbedding
+    //  (precomputed vision embedding, issue #252). Assumes _cpuHidden holds the
+    //  pre-trunk hidden state and, for PLE models, _projPerLayer is populated for
+    //  `position`. Re-uploads to the GPU half, runs the GPU + CPU layer loops with
+    //  KV append, finalises norm/output/softcap, and returns the logits.
+    // ================================================================
+    private ReadOnlySpan<float> RunGemma4Trunk(int position)
+    {
+        // Re-upload the hidden state to GPU for the GPU half.
         if (_nGpuLayers > 0)
         {
             float* pinned = _gpu.MapPinned(_pinnedHidden);

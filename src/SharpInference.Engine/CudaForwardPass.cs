@@ -1793,7 +1793,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     /// <inheritdoc/>
     /// <remarks>
     /// Gemma 4 only: image input (issue #250) splices vision soft tokens into the decode
-    /// stream. Non-Gemma arches and partial-offload hybrids don't implement the seam.
+    /// stream. The CUDA partial-offload hybrid implements the same seam (issue #252,
+    /// <see cref="CudaHybridForwardPass.ForwardEmbedding"/>); non-Gemma arches and the
+    /// Vulkan partial-offload hybrid don't.
     /// </remarks>
     public bool SupportsEmbeddingInput => _isGemma4Like;
 

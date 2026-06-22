@@ -1301,7 +1301,9 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     /// <inheritdoc/>
     /// <remarks>
     /// Gemma 4 only: image input (issue #252) splices vision soft tokens into the decode
-    /// stream. Other arches and the partial-offload hybrids don't implement the seam.
+    /// stream. Other arches don't implement the seam, and neither does the Vulkan
+    /// partial-offload hybrid (<see cref="HybridForwardPass"/> has no Gemma 4 trunk); the
+    /// CUDA partial-offload hybrid does (<see cref="CudaHybridForwardPass.ForwardEmbedding"/>).
     /// </remarks>
     public bool SupportsEmbeddingInput => _isGemma4;
 
