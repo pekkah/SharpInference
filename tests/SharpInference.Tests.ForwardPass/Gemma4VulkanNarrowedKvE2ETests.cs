@@ -146,13 +146,7 @@ public sealed class Gemma4VulkanNarrowedKvE2ETests
                 "Narrowed KV is argmax-stable vs fp32 (issue #311 / #325) — a divergence at the " +
                 "first token is a per-layer append/attention dispatch or allocation bug, not store noise.");
 
-            int distinct = 0;
-            for (int i = 0; i < decoded.Length; i++)
-            {
-                bool seen = false;
-                for (int j = 0; j < i; j++) if (decoded[j] == decoded[i]) { seen = true; break; }
-                if (!seen) distinct++;
-            }
+            int distinct = new HashSet<int>(decoded).Count;
             Assert.True(distinct >= 6,
                 $"E4B q4_0 Vulkan KV {kvDtype} {NSteps}-step decode collapsed to {distinct} distinct " +
                 $"token(s): [{string.Join(",", decoded)}]. Output is degenerate.");

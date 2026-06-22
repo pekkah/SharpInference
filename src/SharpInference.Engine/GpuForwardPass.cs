@@ -581,8 +581,10 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             // dtype using its OWN per-layer kvDim (bf16 fp16-packed, q8_0 block_q8_0, else fp32).
             // For E4B the per-layer kvDim is 512 (SWA, head_dim 256) or 1024 (global, head_dim
             // 512) — both even (bf16 ✓) and multiples of 32 (q8_0 blocks align to row boundaries
-            // ✓), already enforced on the model max dims by the ctor guards above. Aliased layers
-            // copy the source handle regardless of dtype.
+            // ✓). The ctor guards above validate the scalar model max dims (hp.HeadDim); the
+            // per-layer SWA/global dims are validated explicitly below so a future gemma variant
+            // with an odd SWA head_dim or a per-layer kvDim not divisible by 32 fails loud rather
+            // than mis-storing. Aliased layers copy the source handle regardless of dtype.
             for (int i = 0; i < hp.NumLayers; i++)
             {
                 int kvSrc = hp.KvSourceLayer is { } ksl ? ksl[i] : -1;
@@ -602,11 +604,19 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                 long layerKvDim = (long)layerKv * layerHd;
                 if (_kvDType == DType.BFloat16)
                 {
+                    if ((layerHd & 1) != 0)
+                        throw new NotSupportedException(
+                            $"bf16 KV requires an even per-layer head dimension; layer {i} has {layerHd}. " +
+                            "Use fp32 KV (issue #324).");
                     _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * layerKvDim), DType.BFloat16);
                     _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * layerKvDim), DType.BFloat16);
                 }
                 else if (_kvDType == DType.Q8_0)
                 {
+                    if ((layerKvDim & 31) != 0)
+                        throw new NotSupportedException(
+                            $"q8_0 KV requires per-layer kvDim % 32 == 0; layer {i} has {layerKv}*{layerHd}. " +
+                            "Use fp32 or bf16 (issue #325).");
                     long layerQ8Bytes = DTypeInfo.ByteSize((long)_maxSeqLen * layerKvDim, DType.Q8_0);
                     long layerWords = (layerQ8Bytes + 3) / 4;
                     _gpuKCache[i] = gpu.Allocate(TensorShape.D1(layerWords));
