@@ -35,7 +35,7 @@ sharpi-cli -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -g -1 \
 | Backend | Prefill t/s | Decode t/s | Notes |
 |---|---:|---:|---|
 | **CUDA** `-g -1` | **194** | **268.0** | NVRTC `__dp4a` + Q8_1 |
-| Vulkan `-g -1` | 83.9 | 105.8 | GLSL `subgroupAdd` reduce |
+| Vulkan `-g -1` | 128.6 | 184.3 | GLSL `subgroupAdd` reduce |
 | CPU | 39.6 | 42.9 | AVX2 fused dequant-matvec |
 
 #### OLMoE 1B-7B Instruct (MoE) — [allenai](https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF) · 4 GB
@@ -49,7 +49,7 @@ sharpi-cli -m models/OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf -g -1 \
 | Backend | Prefill t/s | Decode t/s | Notes |
 |---|---:|---:|---|
 | **CUDA** `-g -1` | **97.4** | **126.0** | greedy varies, sampling coherent |
-| Vulkan `-g -1` | 74.8 | **91.1** | greedy unstable across backends — use `--temp 0.6 --top-p 0.95` |
+| Vulkan `-g -1` | 119.6 | **143.8** | greedy unstable across backends — use `--temp 0.6 --top-p 0.95` |
 | CPU | 51.7 | 60.5 | 64 experts / 8 active; per-channel QK-norm; `norm_topk_prob=false` |
 
 #### Gemma 4 E4B-it QAT q4_0 — [google](https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf) · 5 GB
@@ -78,8 +78,8 @@ sharpi-cli -m models/Qwen3-8B-Q4_K_M.gguf -g -1 \
 | **CUDA** `-g -1` | **2287** | **74.5** | int8 tensor-core MMQ prefill (weight read once as int8) + dp4a/Q8_1 decode matvec + CUDA-graph replay; all argmax-stable. (llama.cpp b8585 pp1008 5764 — gap is its cp.async MMQ + flash attn) |
 | **CUDA** `-g -1 --tq --no-thinking` | 54.0 | **70.4** | as `--tq`, reasoning suppressed |
 | **CUDA** `-g -1 --tq` | 54.1 | **70.2** | 3-bit KV → 40 960 ctx; 17 t/s @ 8K, 10 @ 16K |
-| Vulkan `-g -1` | 28.0 | 30.9 | 11.4K auto-ctx |
-| Vulkan `-g -1 --tq` | 25.5 | 30.7 | 3-bit KV → 40 960 ctx |
+| Vulkan `-g -1` | 43.5 | 51.2 | int8 dp4a/Q8_1 matvec + split-KV flash-decode |
+| Vulkan `-g -1 --tq` | 36.0 | 51.0 | 3-bit KV → 40 960 ctx |
 | CPU | 10.0 | 13.2 | dense, no KV compression |
 | CPU `--tq` | 9.4 | 13.2 | 3-bit KV → 40 960 ctx; FastScan K+V (#34) keeps long-ctx decode ~flat (10.2 @ 3K, 9.4 @ 6K) |
 
@@ -106,6 +106,7 @@ sharpi-cli -m models/gemma-4-12b-it-qat-q4_0.gguf -g -1 -c 2048 \
 | Backend | Prefill t/s | Decode t/s | Notes |
 |---|---:|---:|---|
 | **CUDA** `-g -1 -c 2048` | **1714** | **54.1** | dense 48-layer gemma4, all bulk weights Q4_0 + tied Q6_K embedding; fits 12 GB full-offload. `attention_k_eq_v` (8 global MQA layers reuse K as V), per-layer KV heads (8 GQA / 1 MQA), pure V-norm. Prefill: Q4_0 int8 tensor-core MMQ over a SoA repack; decode: Q4_0 dp4a/Q8_1, argmax-stable, within ~6% of llama.cpp (57 t/s). **Long context:** `--kv-type bf16` halves / `q8_0` quarters the K/V store (fp32 kernel math, argmax-stable) + a bookkeeping-only host KV cache → **`-c 131072` (128K) within 12 GB** (fp32 `cudaMalloc`-fails at 64K). At 128K, q8_0 keeps the tied embed table resident (~53 t/s) where bf16 spills it (~19 t/s). Default fp32; opt-in `--kv-type bf16\|q8_0` |
+| Vulkan `-g -1 -c 2048` | 17.0 | 19.1 | PLE-free 12B only (E4B's PLE unsupported on Vulkan, #309); per-token prefill (no batched-prefill path) |
 
 #### Qwen3-Coder 30B-A3B (MoE) — [Qwen](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF) · 17 GB
 
@@ -119,7 +120,7 @@ sharpi-cli -m models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf -g -1 \
 | **CUDA** `-g -1` (hybrid) | **29.4** | **28.0** | 29 GPU + 19 CPU layers; routed experts stream through `CudaExpertSlotManager` SLRU (#72/#77). Batched-trunk prefill (#123, bit-identical; `SHARPI_BATCHED_PREFILL=0` to bisect); `SHARPI_EXPERT_STATS=path` for hit rates |
 | CPU `--tq` | 19.6 | 22.6 | 3-bit KV; FastScan (#34) → 15.5 t/s decode @ 3.2K ctx |
 | CPU | 19.8 | 22.4 | 128 experts / 8 active |
-| Vulkan `-g -1` (hybrid) | 1.1 | 5.3 | 29 GPU + 19 CPU layers, SLRU expert cache + predictive prefetch (`--no-moe-predict-prefetch` to disable). Vulkan-hybrid errors on the ~1K prompt, so these are the prior short-ctx values |
+| Vulkan `-g -1` (hybrid) | 1.2 | 4.9 | 29 GPU + 19 CPU layers, SLRU expert cache + predictive prefetch (`--no-moe-predict-prefetch` to disable). PCIe/expert-stream bound; short-ctx values |
 
 #### Carnice (Qwen3.6-35B-A3B-MTP finetune) — [mudler](https://huggingface.co/mudler/Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-GGUF) · 17 GB
 
