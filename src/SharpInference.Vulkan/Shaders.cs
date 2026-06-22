@@ -598,6 +598,114 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// RoPE NEOX *partial* rotation: rotates only the first <c>rope_dim</c> of each
+    /// <c>head_dim</c>-wide head and passes dims <c>[rope_dim, head_dim)</c> through untouched.
+    /// qwen35moe/qwen36 Gated-Attention rotates only the first 64 of each 256-dim head; the
+    /// frequency exponent uses <c>rope_dim</c> (NOT <c>head_dim</c>) — matching CUDA
+    /// <c>llm_rope_neox_partial</c> and CPU <c>SimdKernels.ApplyRoPECachedNeoxPartial</c>.
+    /// Pair layout: (i, i + rope_dim/2) for i ∈ [0, rope_dim/2). One thread per pair.
+    /// Push constants: { uint num_heads, uint head_dim, uint rope_dim, int position, float theta }.
+    /// Bindings: 0=x (in/out). Distinct from <see cref="RoPENeox"/>, which rotates the full head_dim.
+    /// </summary>
+    internal const string RoPENeoxPartial = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer X { float x_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint num_heads;
+            uint head_dim;
+            uint rope_dim;
+            int position;
+            float theta;
+        };
+
+        void main() {
+            uint pair_idx = gl_GlobalInvocationID.x;
+            uint rope_half = rope_dim / 2u;
+            uint total_pairs = num_heads * rope_half;
+            if (pair_idx >= total_pairs) return;
+
+            uint h = pair_idx / rope_half;
+            uint i = pair_idx % rope_half;
+
+            float freq = 1.0 / pow(theta, 2.0 * float(i) / float(rope_dim));
+            float angle = float(position) * freq;
+            float cos_a = cos(angle);
+            float sin_a = sin(angle);
+
+            uint head_base = h * head_dim;
+            uint a_idx = head_base + i;
+            uint b_idx = head_base + i + rope_half;
+            float x0 = x_data[a_idx];
+            float x1 = x_data[b_idx];
+            x_data[a_idx] = x0 * cos_a - x1 * sin_a;
+            x_data[b_idx] = x0 * sin_a + x1 * cos_a;
+            // Dims [rope_dim, head_dim) pass through untouched (never written).
+        }
+        """;
+
+    /// <summary>
+    /// Strided de-interleave of qwen35moe's Gated-Attention <c>[Q‖G]</c> output. The input
+    /// <paramref name="qg"/> is laid out per head as <c>[Q[head_dim] ‖ G[head_dim]]</c>
+    /// (stride <c>2*head_dim</c> per head); this splits it into contiguous
+    /// <c>q[num_heads*head_dim]</c> and <c>g[num_heads*head_dim]</c>. Mirrors CUDA
+    /// <c>llm_split_qg</c> op-for-op. One thread per (h, j).
+    /// Push constants: { uint num_heads, uint head_dim }.
+    /// Bindings: 0=qg (in), 1=q (out), 2=g (out).
+    /// </summary>
+    internal const string SplitQG = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly  buffer QG { float qg_data[]; };
+        layout(binding = 1) writeonly buffer Q  { float q_data[]; };
+        layout(binding = 2) writeonly buffer G  { float g_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint num_heads;
+            uint head_dim;
+        };
+
+        void main() {
+            uint idx = gl_GlobalInvocationID.x;
+            uint total = num_heads * head_dim;
+            if (idx >= total) return;
+
+            uint h = idx / head_dim;
+            uint j = idx % head_dim;
+            uint src_base = h * head_dim * 2u;
+            // dst index == idx (h*head_dim + j); only the src stride needs the 2x.
+            q_data[idx] = qg_data[src_base + j];
+            g_data[idx] = qg_data[src_base + head_dim + j];
+        }
+        """;
+
+    /// <summary>
+    /// Fused in-place sigmoid-gate: <c>x[i] *= 1/(1+exp(-gate[i]))</c>. Replaces a Sigmoid +
+    /// ElementwiseMul pair for the qwen35moe Gated-Attention output gate. Mirrors CUDA
+    /// <c>llm_sigmoid_mul_inplace</c>. One thread per element.
+    /// Push constants: { uint n }.
+    /// Bindings: 0=x (in/out), 1=gate (in).
+    /// </summary>
+    internal const string SigmoidMulInPlace = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer X { float x_data[]; };
+        layout(binding = 1) readonly buffer Gate { float gate_data[]; };
+
+        layout(push_constant) uniform Params { uint n; };
+
+        void main() {
+            uint i = gl_GlobalInvocationID.x;
+            if (i >= n) return;
+            x_data[i] *= 1.0 / (1.0 + exp(-gate_data[i]));
+        }
+        """;
+
+    /// <summary>
     /// Per-head RMSNorm: applies RMSNorm independently to each head-sized chunk.
     /// data[h*head_dim + i] = data[h*head_dim + i] / rms_h * weight[i]
     /// where rms_h = sqrt(mean(data[h*head_dim .. (h+1)*head_dim]^2) + eps).
