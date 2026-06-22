@@ -318,17 +318,14 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         // The full gemma4 trunk (per-layer head_dim, SWA, dual RoPE + rope_freqs, sandwich
         // norms, V-norm, attn_scale=1.0, final softcap, k_eq_v globals) is implemented in
         // ForwardGemma4 / RunGemma4Layers (issue #309); PLE injection + shared-KV aliasing
-        // are wired in issue #351 (the E4B family). TurboQuant and narrowed KV remain
-        // unsupported on the gemma4 path (later phases) and are rejected up front.
+        // are wired in issue #351 (the E4B family). Narrowed KV (bf16 / q8_0) is wired in
+        // issue #351 Phase 2 — the per-layer append/attention now dtype-branch like the dense
+        // path. TurboQuant remains unsupported on the gemma4 path and is rejected up front.
         _isGemma4 = hp.LayerHeadDim is not null;
         if (_isGemma4)
         {
             if (enableTurboQuant)
                 throw new NotSupportedException("TurboQuant is not supported for Gemma 4 on Vulkan.");
-            if (kvDtype != DType.Float32)
-                throw new NotSupportedException(
-                    "Gemma 4 on Vulkan supports only fp32 KV (the narrowed-KV append/attention shaders " +
-                    "are not wired for per-layer head_dim / SWA). Use --kv-type fp32.");
         }
 
         _model = model;
@@ -542,25 +539,27 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             _evictV = gpu.Allocate(TensorShape.D1(_numKvHeads * _headDim));
 
         }
-        else if (_kvDType == DType.BFloat16)
+        else if (_kvDType == DType.BFloat16 && !_isGemma4)
         {
             // Half-width KV (issue #311): allocate the cache as BFloat16 so byte accounting is
             // honest (2 bytes/elem = the packed-fp16-word byte count). The append/attention
             // shaders bind the buffer as uint[] (2 fp16 per word) regardless of the declared
             // dtype, and index it identically to the fp32 path (no ring modulo).
+            // gemma4 needs PER-LAYER geometry, so it falls through to the _isGemma4 branch.
             for (int i = 0; i < hp.NumLayers; i++)
             {
                 _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim), DType.BFloat16);
                 _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * kvDim), DType.BFloat16);
             }
         }
-        else if (_kvDType == DType.Q8_0)
+        else if (_kvDType == DType.Q8_0 && !_isGemma4)
         {
             // Block-quantized KV (issue #325): the cache holds ggml block_q8_0 (34 bytes per 32
             // elements). Vulkan's Allocate(shape, DType) computes bytes via BytesPerElement, which
             // THROWS for quantized dtypes, so allocate a raw uint-word buffer sized to the exact
             // q8_0 byte count (rounded up to whole words). The append/attention shaders bind it as
             // uint[] and index it by block regardless of the declared dtype — same pattern as bf16.
+            // gemma4 needs PER-LAYER geometry, so it falls through to the _isGemma4 branch.
             long q8Bytes = DTypeInfo.ByteSize((long)_maxSeqLen * kvDim, DType.Q8_0); // (count/32)*34
             long words = (q8Bytes + 3) / 4;
             for (int i = 0; i < hp.NumLayers; i++)
@@ -576,8 +575,16 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             // SWA included — is allocated at FULL context (more VRAM than CUDA's SWA ring, but
             // correct). Shared-KV tail layers (issue #351) ALIAS their source layer's K/V handles
             // instead of allocating: the GGUF puts shared layers after their source, so the
-            // source is already allocated (ascending i). Mirrors FillKvCacheArrays. fp32 is
-            // enforced for gemma4 above.
+            // source is already allocated (ascending i). Mirrors FillKvCacheArrays.
+            //
+            // Narrowed KV (issue #351 Phase 2): each owning layer is allocated in the active KV
+            // dtype using its OWN per-layer kvDim (bf16 fp16-packed, q8_0 block_q8_0, else fp32).
+            // For E4B the per-layer kvDim is 512 (SWA, head_dim 256) or 1024 (global, head_dim
+            // 512) — both even (bf16 ✓) and multiples of 32 (q8_0 blocks align to row boundaries
+            // ✓). The ctor guards above validate the scalar model max dims (hp.HeadDim); the
+            // per-layer SWA/global dims are validated explicitly below so a future gemma variant
+            // with an odd SWA head_dim or a per-layer kvDim not divisible by 32 fails loud rather
+            // than mis-storing. Aliased layers copy the source handle regardless of dtype.
             for (int i = 0; i < hp.NumLayers; i++)
             {
                 int kvSrc = hp.KvSourceLayer is { } ksl ? ksl[i] : -1;
@@ -595,8 +602,31 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                 int layerHd = hp.LayerHeadDim![i];
                 int layerKv = hp.LayerKvHeads is { } lkv ? lkv[i] : _numKvHeads;
                 long layerKvDim = (long)layerKv * layerHd;
-                _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * layerKvDim));
-                _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * layerKvDim));
+                if (_kvDType == DType.BFloat16)
+                {
+                    if ((layerHd & 1) != 0)
+                        throw new NotSupportedException(
+                            $"bf16 KV requires an even per-layer head dimension; layer {i} has {layerHd}. " +
+                            "Use fp32 KV (issue #324).");
+                    _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * layerKvDim), DType.BFloat16);
+                    _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * layerKvDim), DType.BFloat16);
+                }
+                else if (_kvDType == DType.Q8_0)
+                {
+                    if ((layerKvDim & 31) != 0)
+                        throw new NotSupportedException(
+                            $"q8_0 KV requires per-layer kvDim % 32 == 0; layer {i} has {layerKv}*{layerHd}. " +
+                            "Use fp32 or bf16 (issue #325).");
+                    long layerQ8Bytes = DTypeInfo.ByteSize((long)_maxSeqLen * layerKvDim, DType.Q8_0);
+                    long layerWords = (layerQ8Bytes + 3) / 4;
+                    _gpuKCache[i] = gpu.Allocate(TensorShape.D1(layerWords));
+                    _gpuVCache[i] = gpu.Allocate(TensorShape.D1(layerWords));
+                }
+                else // fp32
+                {
+                    _gpuKCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * layerKvDim));
+                    _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_maxSeqLen * layerKvDim));
+                }
             }
         }
         else
@@ -1589,11 +1619,21 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             _gpu.RecordBarrier();
 
             // f. KV append (KV-owning layers only; full context — no SWA ring modulo). Shared
-            //    layers read the source layer's pages (effLayer) below without appending.
+            //    layers read the source layer's pages (effLayer) below without appending. Dtype-
+            //    branched (issue #351 Phase 2): the bf16/q8_0 shaders take the SAME args as fp32
+            //    and narrow the cache store internally; the fp32 K/V scratch views are the inputs
+            //    regardless of cache dtype.
             if (!kvShared)
             {
-                _gpu.KvAppend(kView, vView, _gpuKCache[layer], _gpuVCache[layer],
-                    (uint)kvDimL, (uint)position, (uint)_maxSeqLen);
+                if (_kvDType == DType.BFloat16)
+                    _gpu.KvAppendBf16(kView, vView, _gpuKCache[layer], _gpuVCache[layer],
+                        (uint)kvDimL, (uint)position, (uint)_maxSeqLen);
+                else if (_kvDType == DType.Q8_0)
+                    _gpu.KvAppendQ8_0(kView, vView, _gpuKCache[layer], _gpuVCache[layer],
+                        (uint)kvDimL, (uint)position, (uint)_maxSeqLen);
+                else
+                    _gpu.KvAppend(kView, vView, _gpuKCache[layer], _gpuVCache[layer],
+                        (uint)kvDimL, (uint)position, (uint)_maxSeqLen);
                 _gpu.RecordBarrier();
             }
 
@@ -1604,12 +1644,25 @@ public sealed unsafe class GpuForwardPass : IForwardPass
 
             // h. Attention against the OWNING layer's cache (effLayer). SWA layers pass the
             //    sliding-window bound (the shared layer's OWN isSwa); global layers pass 0 (full
-            //    causal). Base fp32 Attention (Q4_K-free; fp32 KV).
-            _gpu.Attention(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
-                _attnScoresScratch,
-                (uint)_numHeads, (uint)layerKv, (uint)layerHd,
-                (uint)(position + 1), (uint)_maxSeqLen,
-                window: isSwa ? (uint)_hp.SlidingWindowSize : 0u);
+            //    causal). Dtype-branched (issue #351 Phase 2): bf16/q8_0 use the plain narrowed
+            //    Attention variants (NO split-KV on gemma4), same args as the fp32 path; the
+            //    shaders dequantize the per-layer cache internally. Q4_K-free; per-layer KV dtype.
+            uint window = isSwa ? (uint)_hp.SlidingWindowSize : 0u;
+            if (_kvDType == DType.BFloat16)
+                _gpu.AttentionBf16(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
+                    _attnScoresScratch,
+                    (uint)_numHeads, (uint)layerKv, (uint)layerHd,
+                    (uint)(position + 1), (uint)_maxSeqLen, window: window);
+            else if (_kvDType == DType.Q8_0)
+                _gpu.AttentionQ8_0(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
+                    _attnScoresScratch,
+                    (uint)_numHeads, (uint)layerKv, (uint)layerHd,
+                    (uint)(position + 1), (uint)_maxSeqLen, window: window);
+            else
+                _gpu.Attention(qView, _gpuKCache[effLayer], _gpuVCache[effLayer], attnOutView,
+                    _attnScoresScratch,
+                    (uint)_numHeads, (uint)layerKv, (uint)layerHd,
+                    (uint)(position + 1), (uint)_maxSeqLen, window: window);
             _gpu.RecordBarrier();
 
             // i. Output projection: _wo[layer] is [embDim, qDimL]; attnOutView has qDimL rows.
