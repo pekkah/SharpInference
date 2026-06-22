@@ -250,6 +250,61 @@ public sealed class VulkanSpecBatchVerifyTests
     }
 
     /// <summary>
+    /// Regression (#308 scratch-sizing): BatchVerify must be correct when k VARIES across calls on
+    /// one instance — k shrinks to 2/3 at the generation tail (and on partial prompt-lookup matches).
+    /// The batched scratch was grow-only (`_bvK >= k`), so a smaller k after a larger one reused an
+    /// OVERSIZED buffer and MatMulBatched derived rows/cols = ElementCount/k against the wrong size →
+    /// garbage logits (or an ArgumentException when k didn't divide the oversized count). This drives
+    /// the batched trunk through k = 4 → 2 → 3 → 6 → 1 on ONE GpuForwardPass and asserts each matches
+    /// the K-loop oracle. Pre-fix the k=2/k=3 steps crash or diverge; the existing fixed-k tests
+    /// missed it because each used a fresh instance with a single k.
+    /// </summary>
+    [Fact]
+    public void Qwen3_8B_Q4K_BatchVerify_VariableK_MatchesSequentialForward()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindModelPath(BatchedModel);
+        if (path is null) return;
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+
+        using var fwd = NewFwd(model, gpu, hp, ctx: 64);
+        Assert.True(fwd.CanBatchedTrunk, "needs the batched trunk to exercise the scratch-sizing path.");
+
+        int P = Prompt.Length;
+        // A fixed token sequence (plausible ids) — the oracle and the batched run use the same first-k.
+        int[] seq = { 9707, 11, 1879, 0, 358, 1079, 264, 4108 };
+
+        // Larger-k first (sizes _bvK=4), then SMALLER k that pre-fix reused the oversized buffer.
+        foreach (int k in new[] { 4, 2, 3, 6, 1 })
+        {
+            var tokens = seq[..k];
+
+            // K-loop oracle from the prefilled state.
+            fwd.ResetCache();
+            fwd.Prefill(Prompt);
+            var reference = new float[k][];
+            for (int i = 0; i < k; i++)
+                reference[i] = fwd.Forward(tokens[i], P + i).ToArray();
+
+            // Batched verify on the SAME instance (so _bvK carries over from the prior k).
+            fwd.TruncateTo(P);
+            float[][] batch = fwd.BatchVerify(tokens, P);
+
+            Assert.Equal(k, batch.Length);
+            for (int i = 0; i < k; i++)
+            {
+                Assert.Equal(Argmax(reference[i]), Argmax(batch[i]));
+                Assert.True(MaxAbsDiff(reference[i], batch[i]) < 1e-4f,
+                    $"k={k} pos={i}: batched diverged from the K-loop oracle (scratch-sizing).");
+            }
+            _out.WriteLine($"variable-k: k={k} OK");
+        }
+    }
+
+    /// <summary>
     /// Rollback oracle — the full speculative-step shape: BatchVerify k tokens (some deliberately
     /// wrong), TruncateTo(P+accepted), then Forward the correction. Post-rollback logits must match
     /// the sequential trajectory that never saw the rejected tokens (catches stale-KV leaks past the

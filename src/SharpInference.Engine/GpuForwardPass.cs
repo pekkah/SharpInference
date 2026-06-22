@@ -1848,8 +1848,14 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     /// </summary>
     private void EnsureBatchVerifyScratch(int k)
     {
-        if (_bvK >= k) return;
-        if (_bvK > 0) FreeBatchVerifyScratch(); // free the prior (fully-allocated) generation
+        // EXACT sizing (not grow-only): BatchVerifyBatched passes the WHOLE [k][dim] buffers to
+        // MatMulBatched, which derives rows/cols = ElementCount/nTok. A grow-only guard (>=) would
+        // reuse an OVERSIZED buffer when a later step has smaller k (k shrinks to 2/3 at the
+        // generation tail, or on a partial prompt-lookup match) → wrong rows/cols → garbage logits
+        // (or an ArgumentException if k doesn't divide the oversized count). Mirror CUDA's exact
+        // `_decodeLogitsCapacity == n` sizing. (Was `>=` — a latent crash/divergence in #308.)
+        if (_bvK == k) return;
+        if (_bvK > 0) FreeBatchVerifyScratch(); // free the prior generation (any size)
 
         int qDim = _numHeads * _headDim;
         int kvDim = _numKvHeads * _headDim;
