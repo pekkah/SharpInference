@@ -92,6 +92,40 @@ public sealed unsafe class GpuForwardPass : IForwardPass
 
     // ── Speculative-decode batched verify (issue #308) ───────────────────────────────────
 
+    /// <summary>Maximum k for the batched-trunk verify path (matches MatMulBatched's nTok cap of 8
+    /// and the lazily-sized <see cref="EnsureBatchVerifyScratch"/> buffers).</summary>
+    private const int MaxBatchVerifyK = 8;
+
+    /// <summary>
+    /// Whether the weight-amortizing batched trunk (<see cref="BatchVerifyBatched"/>) is usable: a
+    /// dense (non-MoE) model whose EVERY trunk matmul weight is Q4_K or Q6_K — the only dtypes
+    /// <c>MatMulBatched</c> amortizes (every other dtype hits its per-token single-row fallback,
+    /// which allocates/frees temp tensors mid-recording — a recording hazard, and no speedup). When
+    /// false, <see cref="BatchVerify"/> uses the bit-exact <see cref="BatchVerifyKLoop"/>. Computed
+    /// once in the ctor: Qwen3-8B-Q4_K_M ⇒ true; Qwen3-0.6B-Q8_0 ⇒ false (Q8_0 weights).
+    /// </summary>
+    private readonly bool _canBatchedTrunk;
+
+    /// <summary>Test hook: whether <see cref="BatchVerify"/> takes the weight-amortizing batched
+    /// trunk (true) or the K-loop fallback (false). True for an all-Q4_K/Q6_K dense model.</summary>
+    internal bool CanBatchedTrunk => _canBatchedTrunk;
+
+    // Batched-verify scratch buffers [K][dim] (token-major contiguous), lazily allocated by
+    // EnsureBatchVerifyScratch on first use (K ≤ MaxBatchVerifyK) and freed in Dispose. Sized at
+    // the single-query dims × the allocated K; reused across calls when K is non-decreasing.
+    private int _bvK;                          // K the buffers below are currently sized for (0 = unallocated)
+    private Tensor _hiddenK = default!;        // [K * embDim]
+    private Tensor _residualK = default!;      // [K * embDim]
+    private Tensor _normK = default!;          // [K * embDim]
+    private Tensor _qK = default!;             // [K * numHeads * headDim]
+    private Tensor _kK = default!;             // [K * numKvHeads * headDim]
+    private Tensor _vK = default!;             // [K * numKvHeads * headDim]
+    private Tensor _attnOutK = default!;       // [K * numHeads * headDim]
+    private Tensor _ffnGateK = default!;       // [K * ffnScratchDim]
+    private Tensor _ffnUpK = default!;         // [K * ffnScratchDim]
+    private Tensor _logitsK = default!;        // [K * vocabSize]
+    private float[]? _logitsKBuf;              // host download buffer [K * vocabSize]
+
     /// <summary>
     /// Whether <see cref="BatchVerify"/> can run on this Vulkan dense full-offload pass. Gated to
     /// the dense path (non-Gemma-4 — its per-layer head_dim / SWA rings / shared-KV / softcap need
@@ -112,12 +146,16 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     /// after <c>tokens[i]</c>. All k K/V entries are appended at contiguous positions
     /// [<paramref name="startPos"/>, <paramref name="startPos"/> + k); the caller rewinds rejected
     /// tokens via <see cref="TruncateTo"/>.
-    /// <para>This is the FOUNDATION K-loop reference: it loops the existing single-query
-    /// <see cref="Forward"/> k times, which establishes the interface, the contiguous-append
-    /// semantics, and the rollback contract that the parity-test harness asserts. It does NOT yet
-    /// amortize the weight HBM reads — each Forward re-streams the weights — that is the batched
-    /// matvec of the next PR (which will reuse this gate and these tests). Bit-identical to k
-    /// sequential <see cref="Forward"/> calls by construction (it IS those calls).</para>
+    /// <para>The payoff path (issue #308 PR1c): when <see cref="_canBatchedTrunk"/> (a dense model
+    /// whose every trunk matmul weight is Q4_K or Q6_K), this dispatches to
+    /// <see cref="BatchVerifyBatched"/>, which streams the K draft tokens through ONE command buffer
+    /// and reads each weight matrix from VRAM exactly once via <c>MatMulBatched</c> (the
+    /// weight-amortization). Otherwise (mixed/other weight dtype) it falls back to
+    /// <see cref="BatchVerifyKLoop"/>, the bit-exact K-sequential-<see cref="Forward"/> reference.
+    /// k == 1 short-circuits to a single <see cref="Forward"/> (mirrors CUDA). The batched path is
+    /// bit-exact to the K-loop by construction (<c>MatMulBatched</c> is bit-identical to single-row
+    /// matvec, the gather/scatter copies are exact, and the per-token RmsNorm/QK-norm/RoPE/append/
+    /// attention reuse the single-query shaders with the same positions/seqLens).</para>
     /// </summary>
     public float[][] BatchVerify(int[] tokens, int startPos)
     {
@@ -132,6 +170,29 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             throw new ArgumentOutOfRangeException(nameof(startPos),
                 $"BatchVerify range [{startPos}, {startPos + k}) exceeds the context window (maxSeqLen={_maxSeqLen}).");
 
+        // k == 1 has nothing to amortize — one Forward is strictly cheaper than the batched
+        // gather/scatter machinery (and bit-identical). Mirrors CudaForwardPass.BatchVerify.
+        if (k == 1)
+        {
+            TruncateTo(startPos);
+            return [Forward(tokens[0], startPos).ToArray()];
+        }
+
+        if (_canBatchedTrunk && k <= MaxBatchVerifyK)
+            return BatchVerifyBatched(tokens, startPos);
+
+        return BatchVerifyKLoop(tokens, startPos);
+    }
+
+    /// <summary>
+    /// FOUNDATION K-loop reference: loops the single-query <see cref="Forward"/> k times. Establishes
+    /// the contiguous-append semantics and the rollback contract; bit-identical to k sequential
+    /// <see cref="Forward"/> calls by construction (it IS those calls). Used as the fallback when the
+    /// model's trunk weights are not all Q4_K/Q6_K, and as the parity oracle for the batched path.
+    /// </summary>
+    private float[][] BatchVerifyKLoop(int[] tokens, int startPos)
+    {
+        int k = tokens.Length;
         // The cache must hold exactly startPos positions; soft-truncate to make it so (the K-loop
         // then appends the k K/V rows over any stale rewound slots, position by position).
         TruncateTo(startPos);
@@ -695,7 +756,40 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             _gpuRopeFreqs = UploadWeight("rope_freqs.weight");
         }
 
+        // Batched-trunk verify gate (issue #308 PR1c): only when this is a dense model and every
+        // trunk matmul weight (Q/K/V/O + gate/up/down per layer, plus the lm-head) is Q4_K or
+        // Q6_K — the dtypes MatMulBatched amortizes. Gemma 4 uses ForwardGemma4 (a separate batched
+        // path is a later PR) so it never qualifies. Computed here, after all weights are uploaded
+        // and _weightDTypes is populated.
+        _canBatchedTrunk = ComputeCanBatchedTrunk();
+
         Console.Error.WriteLine(" done.");
+    }
+
+    /// <summary>
+    /// Determine <see cref="_canBatchedTrunk"/>: dense (non-MoE, non-Gemma-4) with every trunk
+    /// matmul weight in {Q4_K, Q6_K}. Reads the per-weight dtype recorded at upload in
+    /// <see cref="_weightDTypes"/> (defaulting to Q4_K matches <see cref="GpuMatMul"/>).
+    /// </summary>
+    private bool ComputeCanBatchedTrunk()
+    {
+        // MoE (mid-trunk router submit), gemma4 (per-layer dims), and TQ are excluded.
+        // QKV/output bias is excluded too: the batched trunk wires a bias gather/add/scatter
+        // path but no local Q4_K bias model (e.g. a Q4 Qwen2) exercises it yet, so keep bias
+        // models on the verified K-loop fallback until a parity test covers that path.
+        if (_isMoE || _isGemma4 || _hasAttnBias || _hasAttnOutputBias) return false;
+
+        bool IsBatchable(Tensor w) =>
+            _weightDTypes.GetValueOrDefault(w.Handle, DType.Q4_K) is DType.Q4_K or DType.Q6_K;
+
+        for (int i = 0; i < _hp.NumLayers; i++)
+        {
+            if (!IsBatchable(_wq[i]) || !IsBatchable(_wk[i]) || !IsBatchable(_wv[i]) ||
+                !IsBatchable(_wo[i]) || !IsBatchable(_wGate[i]) || !IsBatchable(_wUp[i]) ||
+                !IsBatchable(_wDown[i]))
+                return false;
+        }
+        return IsBatchable(_wOutput);
     }
 
     public Engine.KvCache Cache => _kvCache;
@@ -1444,8 +1538,345 @@ public sealed unsafe class GpuForwardPass : IForwardPass
 
     private void GpuMatMul(Tensor output, Tensor weights, Tensor input)
     {
-        var dtype = _weightDTypes.GetValueOrDefault(weights.Handle, DType.Q4_K);
-        _gpu.MatMul(output, weights, input, dtype);
+        _gpu.MatMul(output, weights, input, WeightDType(weights));
+    }
+
+    /// <summary>Recorded weight dtype (defaults to Q4_K to match <see cref="GpuMatMul"/>).</summary>
+    private DType WeightDType(Tensor weights) =>
+        _weightDTypes.GetValueOrDefault(weights.Handle, DType.Q4_K);
+
+    /// <summary>
+    /// Batched trunk for k-token speculative verify (issue #308 PR1c). Processes all k draft tokens
+    /// through ONE command buffer, reading each weight matrix from VRAM exactly once via
+    /// <c>MatMulBatched</c> (the weight-amortization). The per-token reductions (RmsNorm, QK-norm,
+    /// RoPE) and the position-dependent KV-append + causal attention run as a K-loop with
+    /// gather/scatter to single-token temp buffers (the existing single-query scratch), while the
+    /// position-independent elementwise ops (residual copy/add, SiLuMul) run once over the whole
+    /// [K][dim] buffer. Bit-exact to <see cref="BatchVerifyKLoop"/> by construction.
+    /// <para>Op ordering MIRRORS the single-query <see cref="Forward"/> exactly (the #157 QK-norm /
+    /// RoPE ordering branches included). RoPE position for token i is startPos+i; the attention
+    /// seqLen for token i is startPos+i+1 (causal among the k tokens). Only the non-TQ fp32 KV path
+    /// is reachable here — <see cref="SupportsBatchVerify"/> excludes TurboQuant, and
+    /// <see cref="_canBatchedTrunk"/> excludes Gemma-4/MoE; bf16/q8_0 KV stores still work (the
+    /// per-token append/attention dispatch the matching narrowed shaders).</para>
+    /// </summary>
+    private float[][] BatchVerifyBatched(int[] tokens, int startPos)
+    {
+        int k = tokens.Length;
+        EnsureBatchVerifyScratch(k);
+
+        // Cache must hold exactly startPos positions; soft-truncate (the per-token KvAppend below
+        // overwrites any stale rewound slots at [startPos, startPos+k)).
+        TruncateTo(startPos);
+
+        int qDim = _numHeads * _headDim;
+        int kvDim = _numKvHeads * _headDim;
+        int embDim = _embDim;
+        const int f32 = sizeof(float);
+
+        // Per-token single-token temps (reuse the single-query scratch buffers as gather targets).
+        // _hidden/_normBuf are [embDim], _q is [numHeads*headDim], _k/_v [numKvHeads*headDim],
+        // _attnOut [numHeads*headDim], _ffnGate/_ffnUp [ffnScratchDim].
+
+        _gpu.BeginRecord();
+
+        // ── Embed: K-loop lookup into the [K][embDim] hidden buffer. ──
+        // DispatchEmbedLookup writes _hidden (offset 0); copy each token's row into _hiddenK[i].
+        for (int i = 0; i < k; i++)
+        {
+            DispatchEmbedLookup(tokens[i]);
+            _gpu.RecordBarrier();
+            _gpu.RecordComputeCopyRegion(_hiddenK, (long)i * embDim * f32, _hidden, 0, (long)embDim * f32);
+            _gpu.RecordBarrier();
+        }
+
+        for (int layer = 0; layer < _hp.NumLayers; layer++)
+        {
+            // residualK = hiddenK (whole buffer, elementwise).
+            _gpu.RecordComputeCopy(_residualK, _hiddenK);
+            _gpu.RecordBarrier();
+
+            // attn RmsNorm per token: hiddenK[i] → _hidden temp → RmsNorm → normK[i].
+            for (int i = 0; i < k; i++)
+            {
+                _gpu.RecordComputeCopyRegion(_hidden, 0, _hiddenK, (long)i * embDim * f32, (long)embDim * f32);
+                _gpu.RecordBarrier();
+                _gpu.RmsNorm(_normBuf, _hidden, _wAttnNorm[layer], _hp.RmsNormEps);
+                _gpu.RecordBarrier();
+                _gpu.RecordComputeCopyRegion(_normK, (long)i * embDim * f32, _normBuf, 0, (long)embDim * f32);
+                _gpu.RecordBarrier();
+            }
+
+            // Q/K/V projections: batched (weight read once for all k tokens).
+            _gpu.MatMulBatched(_qK, _wq[layer], _normK, k, WeightDType(_wq[layer]));
+            _gpu.MatMulBatched(_kK, _wk[layer], _normK, k, WeightDType(_wk[layer]));
+            _gpu.MatMulBatched(_vK, _wv[layer], _normK, k, WeightDType(_wv[layer]));
+            _gpu.RecordBarrier();
+
+            if (_hasAttnBias)
+            {
+                // Bias is per-channel and identical across tokens; replicate per token via views.
+                for (int i = 0; i < k; i++)
+                {
+                    _gpu.RecordComputeCopyRegion(_q, 0, _qK, (long)i * qDim * f32, (long)qDim * f32);
+                    _gpu.RecordComputeCopyRegion(_k, 0, _kK, (long)i * kvDim * f32, (long)kvDim * f32);
+                    _gpu.RecordComputeCopyRegion(_v, 0, _vK, (long)i * kvDim * f32, (long)kvDim * f32);
+                    _gpu.RecordBarrier();
+                    _gpu.AddInPlace(_q, _bq![layer]);
+                    _gpu.AddInPlace(_k, _bk![layer]);
+                    _gpu.AddInPlace(_v, _bv![layer]);
+                    _gpu.RecordBarrier();
+                    _gpu.RecordComputeCopyRegion(_qK, (long)i * qDim * f32, _q, 0, (long)qDim * f32);
+                    _gpu.RecordComputeCopyRegion(_kK, (long)i * kvDim * f32, _k, 0, (long)kvDim * f32);
+                    _gpu.RecordComputeCopyRegion(_vK, (long)i * kvDim * f32, _v, 0, (long)kvDim * f32);
+                    _gpu.RecordBarrier();
+                }
+            }
+
+            bool useRoPE = _hp.NoRopeLayerStep == 0
+                || (layer + 1) % _hp.NoRopeLayerStep != 0;
+
+            // Per-token QK-norm / RoPE / L2-norm (issue #157 ordering, mirrors Forward). Each op
+            // reduces or is position-dependent per token, so gather → temp → op → scatter.
+            for (int i = 0; i < k; i++)
+            {
+                int position = startPos + i;
+                _gpu.RecordComputeCopyRegion(_q, 0, _qK, (long)i * qDim * f32, (long)qDim * f32);
+                _gpu.RecordComputeCopyRegion(_k, 0, _kK, (long)i * kvDim * f32, (long)kvDim * f32);
+                _gpu.RecordBarrier();
+
+                if (_hasQkNorm && !_hp.UseL2QkNorm)
+                {
+                    _gpu.HeadNorm(_q, _wqNorm![layer], (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                    _gpu.HeadNorm(_k, _wkNorm![layer], (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                    _gpu.RecordBarrier();
+                }
+
+                if (useRoPE)
+                {
+                    _gpu.RoPE(_q, position, _headDim, _hp.RopeTheta, _hp.IsNeoxRope);
+                    _gpu.RoPE(_k, position, _headDim, _hp.RopeTheta, _hp.IsNeoxRope);
+                    _gpu.RecordBarrier();
+                }
+
+                if (_hasQkNorm && _hp.UseL2QkNorm && useRoPE)
+                {
+                    _gpu.HeadNormPure(_q, (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps);
+                    _gpu.HeadNormPure(_k, (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps);
+                    _gpu.RecordBarrier();
+                }
+
+                _gpu.RecordComputeCopyRegion(_qK, (long)i * qDim * f32, _q, 0, (long)qDim * f32);
+                _gpu.RecordComputeCopyRegion(_kK, (long)i * kvDim * f32, _k, 0, (long)kvDim * f32);
+                _gpu.RecordBarrier();
+            }
+
+            // KvAppend + Attention per token, INTERLEAVED so token i attends to [0, startPos+i]
+            // (causal among the k tokens). seqLen = startPos+i+1 — bit-identical to k sequential
+            // Forwards. Appends the post-RoPE k/v at slot startPos+i, then attends.
+            for (int i = 0; i < k; i++)
+            {
+                int position = startPos + i;
+                _gpu.RecordComputeCopyRegion(_q, 0, _qK, (long)i * qDim * f32, (long)qDim * f32);
+                _gpu.RecordComputeCopyRegion(_k, 0, _kK, (long)i * kvDim * f32, (long)kvDim * f32);
+                _gpu.RecordComputeCopyRegion(_v, 0, _vK, (long)i * kvDim * f32, (long)kvDim * f32);
+                _gpu.RecordBarrier();
+
+                BatchVerifyAppendAttend(layer, position);
+
+                _gpu.RecordComputeCopyRegion(_attnOutK, (long)i * qDim * f32, _attnOut, 0, (long)qDim * f32);
+                _gpu.RecordBarrier();
+            }
+
+            // O projection: batched (weight read once). hiddenK = Wo · attnOutK.
+            _gpu.MatMulBatched(_hiddenK, _wo[layer], _attnOutK, k, WeightDType(_wo[layer]));
+            _gpu.RecordBarrier();
+
+            if (_hasAttnOutputBias)
+            {
+                for (int i = 0; i < k; i++)
+                {
+                    _gpu.RecordComputeCopyRegion(_hidden, 0, _hiddenK, (long)i * embDim * f32, (long)embDim * f32);
+                    _gpu.RecordBarrier();
+                    _gpu.AddInPlace(_hidden, _bo![layer]);
+                    _gpu.RecordBarrier();
+                    _gpu.RecordComputeCopyRegion(_hiddenK, (long)i * embDim * f32, _hidden, 0, (long)embDim * f32);
+                    _gpu.RecordBarrier();
+                }
+            }
+
+            // + residual (whole buffer), then residualK = hiddenK for the FFN.
+            _gpu.AddInPlace(_hiddenK, _residualK);
+            _gpu.RecordBarrier();
+            _gpu.RecordComputeCopy(_residualK, _hiddenK);
+            _gpu.RecordBarrier();
+
+            // ffn RmsNorm per token.
+            for (int i = 0; i < k; i++)
+            {
+                _gpu.RecordComputeCopyRegion(_hidden, 0, _hiddenK, (long)i * embDim * f32, (long)embDim * f32);
+                _gpu.RecordBarrier();
+                _gpu.RmsNorm(_normBuf, _hidden, _wFfnNorm[layer], _hp.RmsNormEps);
+                _gpu.RecordBarrier();
+                _gpu.RecordComputeCopyRegion(_normK, (long)i * embDim * f32, _normBuf, 0, (long)embDim * f32);
+                _gpu.RecordBarrier();
+            }
+
+            // gate/up: batched. SiLuMul over the whole [K][ffnDim] buffer. down: batched.
+            _gpu.MatMulBatched(_ffnGateK, _wGate[layer], _normK, k, WeightDType(_wGate[layer]));
+            _gpu.MatMulBatched(_ffnUpK, _wUp[layer], _normK, k, WeightDType(_wUp[layer]));
+            _gpu.RecordBarrier();
+            _gpu.SiLuMul(_ffnGateK, _ffnUpK); // [K*ffnDim] elementwise, K-agnostic
+            _gpu.RecordBarrier();
+            _gpu.MatMulBatched(_hiddenK, _wDown[layer], _ffnGateK, k, WeightDType(_wDown[layer]));
+            _gpu.RecordBarrier();
+
+            _gpu.AddInPlace(_hiddenK, _residualK);
+            _gpu.RecordBarrier();
+        }
+
+        // Final norm per token + batched output projection → logitsK.
+        for (int i = 0; i < k; i++)
+        {
+            _gpu.RecordComputeCopyRegion(_hidden, 0, _hiddenK, (long)i * embDim * f32, (long)embDim * f32);
+            _gpu.RecordBarrier();
+            _gpu.RmsNorm(_hidden, _hidden, _wOutputNorm, _hp.RmsNormEps);
+            _gpu.RecordBarrier();
+            _gpu.RecordComputeCopyRegion(_hiddenK, (long)i * embDim * f32, _hidden, 0, (long)embDim * f32);
+            _gpu.RecordBarrier();
+        }
+        _gpu.MatMulBatched(_logitsK, _wOutput, _hiddenK, k, WeightDType(_wOutput));
+
+        _gpu.RecordComputeToTransferBarrier();
+        _gpu.RecordDownloadToStaging(_logitsK, _logitsKBuf!.Length);
+        _gpu.EndRecordAndSubmit();
+        _gpu.ReadFromStaging(_logitsKBuf);
+
+        // The per-token KvAppend wrote slots [startPos, startPos+k); advance the length counter.
+        _kvLength = Math.Max(_kvLength, startPos + k);
+
+        // Split into k logit rows.
+        int vocab = _hp.VocabSize;
+        var result = new float[k][];
+        for (int i = 0; i < k; i++)
+        {
+            var row = new float[vocab];
+            Array.Copy(_logitsKBuf, (long)i * vocab, row, 0, vocab);
+            result[i] = row;
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// KvAppend the single-token K/V in <see cref="_k"/>/<see cref="_v"/> at <paramref name="position"/>
+    /// then run causal attention into <see cref="_attnOut"/> for that token (seqLen = position+1).
+    /// Dispatches the matching KV-store shaders for the active <see cref="_kvDType"/> (fp32 / bf16 /
+    /// q8_0) — identical to the single-query <see cref="Forward"/> non-TQ branches. TurboQuant is
+    /// excluded by <see cref="SupportsBatchVerify"/>, so the TQ path is unreachable here.
+    /// </summary>
+    private void BatchVerifyAppendAttend(int layer, int position)
+    {
+        int kvDim = _numKvHeads * _headDim;
+        uint seqLen = (uint)(position + 1);
+
+        if (_kvDType == DType.BFloat16)
+        {
+            _gpu.KvAppendBf16(_k, _v, _gpuKCache[layer], _gpuVCache[layer],
+                (uint)kvDim, (uint)position, (uint)_maxSeqLen);
+            _gpu.RecordBarrier();
+            if (_splitKvEnabled && position + 1 > 4096 && _headDim % 32 == 0 && _splitKvPartialO is not null)
+                _gpu.AttentionSplitKvBf16(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                    _splitKvPartialO, _splitKvPartialMeta!,
+                    (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim, seqLen, (uint)_maxSeqLen, window: 0u);
+            else
+                _gpu.AttentionBf16(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                    _attnScoresScratch,
+                    (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim, seqLen, (uint)_maxSeqLen, window: 0u);
+        }
+        else if (_kvDType == DType.Q8_0)
+        {
+            _gpu.KvAppendQ8_0(_k, _v, _gpuKCache[layer], _gpuVCache[layer],
+                (uint)kvDim, (uint)position, (uint)_maxSeqLen);
+            _gpu.RecordBarrier();
+            if (_splitKvEnabled && position + 1 > 4096 && _headDim % 32 == 0 && _splitKvPartialO is not null)
+                _gpu.AttentionSplitKvQ8(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                    _splitKvPartialO, _splitKvPartialMeta!,
+                    (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim, seqLen, (uint)_maxSeqLen, window: 0u);
+            else
+                _gpu.AttentionQ8_0(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                    _attnScoresScratch,
+                    (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim, seqLen, (uint)_maxSeqLen, window: 0u);
+        }
+        else
+        {
+            _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer],
+                (uint)kvDim, (uint)position, (uint)_maxSeqLen);
+            _gpu.RecordBarrier();
+            if (_splitKvEnabled && position + 1 > 4096 && _headDim % 32 == 0 && _splitKvPartialO is not null)
+                _gpu.AttentionSplitKv(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                    _splitKvPartialO, _splitKvPartialMeta!,
+                    (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim, seqLen, (uint)_maxSeqLen, window: 0u);
+            else
+                _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                    _attnScoresScratch,
+                    (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim, seqLen, (uint)_maxSeqLen, window: 0u);
+        }
+        _gpu.RecordBarrier();
+    }
+
+    /// <summary>
+    /// Lazily allocate the batched-verify [K][dim] scratch (and the host logits buffer) for
+    /// <paramref name="k"/> tokens. Sizes each buffer at the single-query dim × K; reused when the
+    /// requested K is ≤ the currently-allocated K. Reallocates (freeing the old set) on a larger K.
+    /// Freed in <see cref="Dispose"/>. K is bounded by <see cref="MaxBatchVerifyK"/>.
+    /// </summary>
+    private void EnsureBatchVerifyScratch(int k)
+    {
+        if (_bvK >= k) return;
+        if (_bvK > 0) FreeBatchVerifyScratch(); // free the prior (fully-allocated) generation
+
+        int qDim = _numHeads * _headDim;
+        int kvDim = _numKvHeads * _headDim;
+        int ffnDim = ComputeFfnScratchDim(_isMoE, _intermDim, _expertDim);
+
+        // Track each allocation so a mid-way throw (e.g. OOM on a later buffer) frees the
+        // partial set instead of leaking it (the fields would otherwise hold live-but-orphaned
+        // tensors with _bvK==0).
+        var allocated = new List<Tensor>(10);
+        Tensor Alloc(long n) { var t = _gpu.Allocate(TensorShape.D1(n)); allocated.Add(t); return t; }
+        try
+        {
+            _hiddenK = Alloc((long)k * _embDim);
+            _residualK = Alloc((long)k * _embDim);
+            _normK = Alloc((long)k * _embDim);
+            _qK = Alloc((long)k * qDim);
+            _kK = Alloc((long)k * kvDim);
+            _vK = Alloc((long)k * kvDim);
+            _attnOutK = Alloc((long)k * qDim);
+            _ffnGateK = Alloc((long)k * ffnDim);
+            _ffnUpK = Alloc((long)k * ffnDim);
+            _logitsK = Alloc((long)k * _hp.VocabSize);
+            _logitsKBuf = new float[k * _hp.VocabSize]; // k ≤ 8, vocab small → fits int
+            _bvK = k;
+        }
+        catch
+        {
+            foreach (var t in allocated) _gpu.Free(t);
+            _bvK = 0; // fields hold freed tensors; next call (re)allocates, Dispose skips (_bvK==0)
+            throw;
+        }
+    }
+
+    // Called only when fully allocated (_bvK > 0); the tensors are non-null here. A partial
+    // allocation that threw is freed in EnsureBatchVerifyScratch's catch, not here (the fields
+    // would be null/freed). Free dereferences tensor.Handle, so it is NOT null-safe.
+    private void FreeBatchVerifyScratch()
+    {
+        _gpu.Free(_hiddenK); _gpu.Free(_residualK); _gpu.Free(_normK);
+        _gpu.Free(_qK); _gpu.Free(_kK); _gpu.Free(_vK); _gpu.Free(_attnOutK);
+        _gpu.Free(_ffnGateK); _gpu.Free(_ffnUpK); _gpu.Free(_logitsK);
+        _logitsKBuf = null;
+        _bvK = 0;
     }
 
     private void GpuDenseFfn(int layer)
@@ -1921,6 +2352,10 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         if (_snapKvQCapture is { } capBuf) _gpu.Free(capBuf);
         if (_snapKvScoreAccum is { } accBuf) _gpu.Free(accBuf);
         if (_snapKvScoreScratch is { } scrBuf && _snapKvScoreScratchOwned) _gpu.Free(scrBuf);
+
+        // Batched-verify scratch (#308 PR1c). Guarded: only fully-allocated when _bvK > 0 (a
+        // partial alloc that threw is freed in EnsureBatchVerifyScratch's catch, leaving _bvK==0).
+        if (_bvK > 0) FreeBatchVerifyScratch();
 
         _kvCache.Dispose();
     }
