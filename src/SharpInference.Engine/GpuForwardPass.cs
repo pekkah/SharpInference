@@ -777,7 +777,10 @@ public sealed unsafe class GpuForwardPass : IForwardPass
         // QKV/output bias is excluded too: the batched trunk wires a bias gather/add/scatter
         // path but no local Q4_K bias model (e.g. a Q4 Qwen2) exercises it yet, so keep bias
         // models on the verified K-loop fallback until a parity test covers that path.
-        if (_isMoE || _isGemma4 || _hasAttnBias || _hasAttnOutputBias) return false;
+        // L2 QK-norm (HeadNormPure post-RoPE, Llama-4) is excluded EXPLICITLY: the batched trunk
+        // has no L2 path (it would silently skip the norm), and the Debug.Assert that guards it is
+        // stripped in Release — so don't rely on the L2⟹Llama4⟹MoE coupling, exclude it directly.
+        if (_isMoE || _isGemma4 || _hasAttnBias || _hasAttnOutputBias || _hp.UseL2QkNorm) return false;
 
         bool IsBatchable(Tensor w) =>
             _weightDTypes.GetValueOrDefault(w.Handle, DType.Q4_K) is DType.Q4_K or DType.Q6_K;
@@ -1596,16 +1599,11 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             _gpu.RecordComputeCopy(_residualK, _hiddenK);
             _gpu.RecordBarrier();
 
-            // attn RmsNorm per token: hiddenK[i] → _hidden temp → RmsNorm → normK[i].
-            for (int i = 0; i < k; i++)
-            {
-                _gpu.RecordComputeCopyRegion(_hidden, 0, _hiddenK, (long)i * embDim * f32, (long)embDim * f32);
-                _gpu.RecordBarrier();
-                _gpu.RmsNorm(_normBuf, _hidden, _wAttnNorm[layer], _hp.RmsNormEps);
-                _gpu.RecordBarrier();
-                _gpu.RecordComputeCopyRegion(_normK, (long)i * embDim * f32, _normBuf, 0, (long)embDim * f32);
-                _gpu.RecordBarrier();
-            }
+            // attn RmsNorm: all k rows of [K][embDim] in one batched dispatch (was a per-token
+            // gather/op/scatter K-loop). Bit-identical: each row normalized independently with the
+            // shared attn-norm weight.
+            _gpu.RmsNormBatched(_normK, _hiddenK, _wAttnNorm[layer], embDim, k, _hp.RmsNormEps);
+            _gpu.RecordBarrier();
 
             // Q/K/V projections: batched (weight read once for all k tokens).
             _gpu.MatMulBatched(_qK, _wq[layer], _normK, k, WeightDType(_wq[layer]));
@@ -1636,38 +1634,27 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             bool useRoPE = _hp.NoRopeLayerStep == 0
                 || (layer + 1) % _hp.NoRopeLayerStep != 0;
 
-            // Per-token QK-norm / RoPE / L2-norm (issue #157 ordering, mirrors Forward). Each op
-            // reduces or is position-dependent per token, so gather → temp → op → scatter.
-            for (int i = 0; i < k; i++)
+            // QK-norm + RoPE (issue #157 ordering, mirrors Forward), now BATCHED over all k rows
+            // of _qK/_kK in a handful of dispatches instead of the per-token gather/op/scatter
+            // K-loop. The L2-norm QK-norm path (UseL2QkNorm) is Llama4-only and excluded by
+            // _canBatchedTrunk (MoE), so it is unreachable here — asserted, not batched.
+            System.Diagnostics.Debug.Assert(!_hp.UseL2QkNorm, "Batched trunk excludes L2 QK-norm (Llama4/MoE).");
+
+            if (_hasQkNorm)
             {
-                int position = startPos + i;
-                _gpu.RecordComputeCopyRegion(_q, 0, _qK, (long)i * qDim * f32, (long)qDim * f32);
-                _gpu.RecordComputeCopyRegion(_k, 0, _kK, (long)i * kvDim * f32, (long)kvDim * f32);
+                // Per-head RMS QK-norm: each of the k rows normalized independently with the
+                // shared per-head weight — bit-identical to k HeadNorm calls.
+                _gpu.HeadNormBatched(_qK, _wqNorm![layer], (uint)_numHeads, (uint)_headDim, k, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+                _gpu.HeadNormBatched(_kK, _wkNorm![layer], (uint)_numKvHeads, (uint)_headDim, k, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
                 _gpu.RecordBarrier();
+            }
 
-                if (_hasQkNorm && !_hp.UseL2QkNorm)
-                {
-                    _gpu.HeadNorm(_q, _wqNorm![layer], (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
-                    _gpu.HeadNorm(_k, _wkNorm![layer], (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
-                    _gpu.RecordBarrier();
-                }
-
-                if (useRoPE)
-                {
-                    _gpu.RoPE(_q, position, _headDim, _hp.RopeTheta, _hp.IsNeoxRope);
-                    _gpu.RoPE(_k, position, _headDim, _hp.RopeTheta, _hp.IsNeoxRope);
-                    _gpu.RecordBarrier();
-                }
-
-                if (_hasQkNorm && _hp.UseL2QkNorm && useRoPE)
-                {
-                    _gpu.HeadNormPure(_q, (uint)_numHeads, (uint)_headDim, _hp.RmsNormEps);
-                    _gpu.HeadNormPure(_k, (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps);
-                    _gpu.RecordBarrier();
-                }
-
-                _gpu.RecordComputeCopyRegion(_qK, (long)i * qDim * f32, _q, 0, (long)qDim * f32);
-                _gpu.RecordComputeCopyRegion(_kK, (long)i * kvDim * f32, _k, 0, (long)kvDim * f32);
+            if (useRoPE)
+            {
+                // RoPE: row r uses position startPos+r (per-token absolute position via base_pos
+                // + gl_WorkGroupID.y in the shader) — bit-identical to k RoPE calls.
+                _gpu.RoPEBatched(_qK, startPos, _headDim, _numHeads, k, _hp.RopeTheta, _hp.IsNeoxRope);
+                _gpu.RoPEBatched(_kK, startPos, _headDim, _numKvHeads, k, _hp.RopeTheta, _hp.IsNeoxRope);
                 _gpu.RecordBarrier();
             }
 
@@ -1711,16 +1698,10 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             _gpu.RecordComputeCopy(_residualK, _hiddenK);
             _gpu.RecordBarrier();
 
-            // ffn RmsNorm per token.
-            for (int i = 0; i < k; i++)
-            {
-                _gpu.RecordComputeCopyRegion(_hidden, 0, _hiddenK, (long)i * embDim * f32, (long)embDim * f32);
-                _gpu.RecordBarrier();
-                _gpu.RmsNorm(_normBuf, _hidden, _wFfnNorm[layer], _hp.RmsNormEps);
-                _gpu.RecordBarrier();
-                _gpu.RecordComputeCopyRegion(_normK, (long)i * embDim * f32, _normBuf, 0, (long)embDim * f32);
-                _gpu.RecordBarrier();
-            }
+            // ffn RmsNorm: all k rows of [K][embDim] in one batched dispatch (bit-identical to the
+            // per-token K-loop).
+            _gpu.RmsNormBatched(_normK, _hiddenK, _wFfnNorm[layer], embDim, k, _hp.RmsNormEps);
+            _gpu.RecordBarrier();
 
             // gate/up: batched. SiLuMul over the whole [K][ffnDim] buffer. down: batched.
             _gpu.MatMulBatched(_ffnGateK, _wGate[layer], _normK, k, WeightDType(_wGate[layer]));
@@ -1735,16 +1716,11 @@ public sealed unsafe class GpuForwardPass : IForwardPass
             _gpu.RecordBarrier();
         }
 
-        // Final norm per token + batched output projection → logitsK.
-        for (int i = 0; i < k; i++)
-        {
-            _gpu.RecordComputeCopyRegion(_hidden, 0, _hiddenK, (long)i * embDim * f32, (long)embDim * f32);
-            _gpu.RecordBarrier();
-            _gpu.RmsNorm(_hidden, _hidden, _wOutputNorm, _hp.RmsNormEps);
-            _gpu.RecordBarrier();
-            _gpu.RecordComputeCopyRegion(_hiddenK, (long)i * embDim * f32, _hidden, 0, (long)embDim * f32);
-            _gpu.RecordBarrier();
-        }
+        // Final norm: all k rows of [K][embDim] in one batched dispatch (in-place is safe — each
+        // row's sum-of-squares is reduced into shared memory before any element is written back).
+        // Then batched output projection → logitsK.
+        _gpu.RmsNormBatched(_hiddenK, _hiddenK, _wOutputNorm, embDim, k, _hp.RmsNormEps);
+        _gpu.RecordBarrier();
         _gpu.MatMulBatched(_logitsK, _wOutput, _hiddenK, k, WeightDType(_wOutput));
 
         _gpu.RecordComputeToTransferBarrier();
