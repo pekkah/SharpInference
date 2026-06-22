@@ -1289,9 +1289,8 @@ internal static class Shaders
                     dot += q_data[q_off + d] * k_cache[k_off + d];
                 scores[t] = dot * scale;
             }
-            // Pad the shared tail (per-row bound seq_len_i) so the max scan ignores stale slots.
-            for (uint t = seq_len_i + tid; t < MAX_SHARED_SCORES; t += 256)
-                scores[t] = -1.0/0.0;
+            // No tail padding needed: every later phase (max scan, exp/sum, V-aggregate) is
+            // strictly bounded by seq_len_i, so scores[t >= seq_len_i] is never read.
             barrier();
 
             // ─── Phase 2: in-place softmax over [0, seq_len_i) ───
