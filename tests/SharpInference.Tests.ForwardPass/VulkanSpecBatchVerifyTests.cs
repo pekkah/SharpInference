@@ -65,11 +65,12 @@ public sealed class VulkanSpecBatchVerifyTests
     // SnapKV pinned off: BatchVerify is unsupported once SnapKV evicts, and VRAM-scaled
     // auto-SnapKV could otherwise engage and flip SupportsBatchVerify to false. Pinning
     // mirrors CudaSpecBatchVerifyTests.NewFwd.
-    private static GpuForwardPass NewFwd(GgufModel model, VulkanBackend gpu, ModelHyperparams hp, int ctx = 512)
+    private static GpuForwardPass NewFwd(GgufModel model, VulkanBackend gpu, ModelHyperparams hp,
+        int ctx = 512, DType kvDtype = DType.Float32)
     {
         var prev = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_BUDGET");
         Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", "0");
-        try { return new GpuForwardPass(model, gpu, hp, maxContextLength: ctx); }
+        try { return new GpuForwardPass(model, gpu, hp, maxContextLength: ctx, kvDtype: kvDtype); }
         finally { Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", prev); }
     }
 
@@ -160,7 +161,37 @@ public sealed class VulkanSpecBatchVerifyTests
     public void Qwen3_8B_Q4K_BatchVerify_MatchesSequentialForward(int k)
         => RunParity(BatchedModel, k, expectBatchedTrunk: true);
 
-    private void RunParity(string modelFile, int k, bool expectBatchedTrunk)
+    /// <summary>
+    /// Parity oracle (issue #308 follow-up — bf16 KV batched attention/append). BatchVerify on the
+    /// batched trunk with <c>--kv-type bf16</c> must match k sequential Forward calls (also bf16 KV)
+    /// bit-exactly: the batched bf16 KvAppend/Attention shaders reuse the SAME packHalf2x16 store /
+    /// unpackHalf2x16 read idioms and the SAME per-query causal range as the single-token shaders, so
+    /// BatchVerify(bf16) == k× Forward(bf16). This is batched-vs-K-loop on the SAME dtype (NOT vs fp32).
+    /// </summary>
+    [Theory]
+    [InlineData(4)]
+    [InlineData(6)]
+    [InlineData(8)]
+    public void Qwen3_8B_Q4K_BatchVerify_Bf16Kv_MatchesSequentialForward(int k)
+        => RunParity(BatchedModel, k, expectBatchedTrunk: true, kvDtype: DType.BFloat16);
+
+    /// <summary>
+    /// Parity oracle (issue #308 follow-up — q8_0 KV batched attention/append). BatchVerify on the
+    /// batched trunk with <c>--kv-type q8_0</c> must match k sequential Forward calls (also q8_0 KV)
+    /// bit-exactly: the batched q8_0 KvAppend uses the SAME amax→quant + masked-atomic byte store and
+    /// the batched AttentionQ8_0 the SAME byte-gather dequant as the single-token shaders, over the
+    /// SAME per-query causal range, so BatchVerify(q8_0) == k× Forward(q8_0). The batched append's
+    /// masked atomics write disjoint bytes (independent of dispatch order), matching the single-token
+    /// append exactly.
+    /// </summary>
+    [Theory]
+    [InlineData(4)]
+    [InlineData(6)]
+    [InlineData(8)]
+    public void Qwen3_8B_Q4K_BatchVerify_Q8Kv_MatchesSequentialForward(int k)
+        => RunParity(BatchedModel, k, expectBatchedTrunk: true, kvDtype: DType.Q8_0);
+
+    private void RunParity(string modelFile, int k, bool expectBatchedTrunk, DType kvDtype = DType.Float32)
     {
         using var gpu = TryCreate();
         if (gpu is null) return;
@@ -173,7 +204,7 @@ public sealed class VulkanSpecBatchVerifyTests
         Assert.False(hp.IsMoE);
 
         // 8B Q4_K KV at ctx 64 fits comfortably; small ctx keeps the test fast.
-        using var fwd = NewFwd(model, gpu, hp, ctx: 64);
+        using var fwd = NewFwd(model, gpu, hp, ctx: 64, kvDtype: kvDtype);
         Assert.True(fwd.SupportsBatchVerify);
         Assert.Equal(expectBatchedTrunk, fwd.CanBatchedTrunk);
 
@@ -205,11 +236,14 @@ public sealed class VulkanSpecBatchVerifyTests
             Assert.Equal(Argmax(reference[i]), Argmax(batch[i]));
             float maxAbs = MaxAbsDiff(reference[i], batch[i]);
             worst = MathF.Max(worst, maxAbs);
+            // Batched path is bit-exact to the K-loop for the SAME KV dtype (same narrowed reads +
+            // same per-query causal range) → maxAbs is 0 in practice. Keep a tiny tolerance only as
+            // a guard against any future FP-association change in a shared kernel.
             Assert.True(maxAbs < 1e-4f,
                 $"Position {i}: batched vs sequential logits diverged beyond the bit-exact " +
-                $"K-loop tolerance: maxAbs={maxAbs}.");
+                $"K-loop tolerance (kv={kvDtype}): maxAbs={maxAbs}.");
         }
-        _out.WriteLine($"{modelFile} k={k} batchedTrunk={fwd.CanBatchedTrunk} worstMaxAbs={worst:E3}");
+        _out.WriteLine($"{modelFile} kv={kvDtype} k={k} batchedTrunk={fwd.CanBatchedTrunk} worstMaxAbs={worst:E3}");
 
         // After BatchVerify the cache must hold exactly P + k positions (all k K/V appended).
         Assert.Equal(P + k, fwd.KvLength);
@@ -287,7 +321,13 @@ public sealed class VulkanSpecBatchVerifyTests
 
         int prefillLen = int.TryParse(Environment.GetEnvironmentVariable("SHARPI_SPEC_BENCH_PREFILL"), out var pl) ? pl : 512;
         int k = int.TryParse(Environment.GetEnvironmentVariable("SHARPI_SPEC_BENCH_K"), out var kk) ? kk : 4;
-        using var fwd = NewFwd(model, gpu, hp, ctx: prefillLen + 64);
+        DType kvDtype = Environment.GetEnvironmentVariable("SHARPI_SPEC_BENCH_KV")?.ToLowerInvariant() switch
+        {
+            "bf16" => DType.BFloat16,
+            "q8_0" or "q8" => DType.Q8_0,
+            _ => DType.Float32,
+        };
+        using var fwd = NewFwd(model, gpu, hp, ctx: prefillLen + 64, kvDtype: kvDtype);
         Assert.True(fwd.SupportsBatchVerify);
         Assert.True(fwd.CanBatchedTrunk);
 
@@ -333,7 +373,7 @@ public sealed class VulkanSpecBatchVerifyTests
         double medKloop = kloopMs[iters / 2];
         double ratio = medKloop / medBatched; // >1 ⇒ batched is faster
 
-        _out.WriteLine($"BatchVerify(k={k}, prefill={prefillLen}) median: batched={medBatched:F2}ms, " +
+        _out.WriteLine($"BatchVerify(k={k}, prefill={prefillLen}, kv={kvDtype}) median: batched={medBatched:F2}ms, " +
             $"{k}xForward={medKloop:F2}ms, speedup={ratio:F2}x");
 
         Assert.True(medBatched <= medKloop * 1.5,
