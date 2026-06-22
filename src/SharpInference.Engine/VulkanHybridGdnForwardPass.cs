@@ -255,6 +255,22 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
 
     private bool _disposed;
 
+    // Pessimistic fault latch (mirror CudaHybridGdnForwardPass._faulted): the batched prefill
+    // mutates the GDN recurrent state + advances the host length counters non-transactionally,
+    // so a mid-chunk failure (Vulkan device-lost / OOM) leaves the state corrupted. Latch true
+    // for the whole batched region, clear only on consistent completion; ThrowIfFaulted() then
+    // blocks any retry on the poisoned state (discard the instance + reload the model).
+    private bool _faulted;
+
+    private void ThrowIfFaulted()
+    {
+        if (_faulted)
+            throw new InvalidOperationException(
+                "VulkanHybridGdnForwardPass: a prior batched prefill faulted mid-chunk, leaving the " +
+                "GDN recurrent state corrupted. This instance can no longer produce correct output — " +
+                "discard it and reload the model.");
+    }
+
     public VulkanHybridGdnForwardPass(GgufModel model, VulkanBackend gpu, ModelHyperparams hp,
         LayerPlacement placement, int maxContextLength = 0)
     {
@@ -618,6 +634,7 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
 
     public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0)
     {
+        ThrowIfFaulted();
         if (tokens is null || tokens.Count == 0)
             throw new ArgumentException("Token list is empty", nameof(tokens));
 
@@ -644,6 +661,7 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
     /// <summary>Forward one token through the hybrid Vulkan + CPU stack (mirror :3164-3301).</summary>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
+        ThrowIfFaulted();
         // 1. Embedding → _gpuHidden (own record/submit bracket so the per-layer trunk
         //    starts from a fresh session; EmbedToken writes then a barrier before reads).
         _gpu.BeginRecord();
@@ -727,6 +745,11 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         EnsureBatchedScratch(MaxBatchChunk);
         int total = tokens.Count;
         int processed = 0;
+        // Pessimistic fault latch (mirror CudaHybridGdnForwardPass): the per-chunk GDN-state
+        // mutation + host length-counter advance is non-transactional, so poison the pass for the
+        // whole region and clear only after every chunk completed consistently. A throw mid-chunk
+        // (device-lost / OOM) leaves _faulted set, blocking any retry on corrupt recurrent state.
+        _faulted = true;
         while (processed < total)
         {
             int n = Math.Min(MaxBatchChunk, total - processed);
@@ -735,6 +758,7 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
             PrefillChunk(tokens, processed, n, chunkStartPos, lastChunk);
             processed += n;
         }
+        _faulted = false;
         return _logitsBuf;
     }
 
