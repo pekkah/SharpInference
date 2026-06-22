@@ -323,13 +323,25 @@ public static class InferenceEngineLoader
 
         if (backend == ServerBackend.Vulkan)
         {
-            if (hp.IsHybridSsm)
-                throw new InvalidOperationException(
-                    "Hybrid GDN models (qwen35moe) are not supported on the Vulkan backend. " +
-                    "Set Backend=Cuda or NGpuLayers=0.");
-
             var vulkan = new VulkanBackend();
             owned.Add(vulkan);
+
+            if (hp.IsHybridSsm)
+            {
+                // Layer placement for hybrid GDN is driven by hp.LayerTypes, not VRAM budget —
+                // so TierPlanner is skipped and we claim "all layers on GPU" (GDN/attn routing
+                // is implicit; FFN is per-layer GPU/CPU). Mirrors the CUDA loader branch.
+                // (PR4 Round 1 — dense FFN; Round 2 — MoE FFN via CPU-MoE / GPU-SLRU.)
+                var placement = new LayerPlacement(
+                    GpuLayers: hp.NumLayers,
+                    CpuLayers: 0,
+                    GpuWeightBytes: 0,
+                    GpuKvBytes: 0,
+                    RecommendedCtxSize: ctxSize > 0 ? ctxSize : Math.Min(hp.ContextLength, 4096));
+                var vhgdn = new VulkanHybridGdnForwardPass(model, vulkan, hp, placement);
+                owned.Add(vhgdn);
+                return (vhgdn, BatchingSupported: false);
+            }
 
             var hwProfile = HardwareProfile.Detect(vulkan);
             int gpuLayers = nGpuLayers == -1
