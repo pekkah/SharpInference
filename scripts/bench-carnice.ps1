@@ -59,6 +59,7 @@ finally {
 }
 
 $results | Format-Table Tag, PrefillTok, PrefillTps, DecodeTok, DecodeTps, MtpAccept, WallSec, TimedOut
+if (-not (Test-Path "bench-out")) { New-Item -ItemType Directory -Path "bench-out" | Out-Null }
 $results | Export-Csv -NoTypeInformation -Path "bench-out\bench-carnice.csv"
 Write-Host ""
 Write-Host "Results written to bench-out\bench-carnice.csv" -ForegroundColor Green
