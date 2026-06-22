@@ -698,14 +698,6 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         }
         else
         {
-            // Vulkan path. There is no Vulkan equivalent of CudaHybridGdnForwardPass yet,
-            // so qwen35moe must use --backend cuda or -g 0.
-            if (hp.IsHybridSsm)
-            {
-                AnsiConsole.MarkupLine("[red]Error:[/] Hybrid GDN models (qwen35moe) are not supported on the Vulkan backend yet. Use [yellow]--backend cuda[/] or [yellow]-g 0[/] (CPU).");
-                return 1;
-            }
-
             var gpu = new VulkanBackend(gpuDeviceIndex);
             gpuBackend = gpu;
             try
@@ -714,6 +706,31 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
                 var hwProfile = HardwareProfile.Detect(gpu);
                 AnsiConsole.MarkupLine($"[dim]Hardware: {hwProfile.Summary()}[/]");
+
+                // qwen35moe / qwen36 (hybrid GDN + attention) takes a dedicated Vulkan forward
+                // pass. Layer placement is implicit (driven by hp.LayerTypes — GDN + attn on GPU,
+                // FFN per-layer GPU/CPU), so TierPlanner is skipped, mirroring the CUDA branch above.
+                // (PR4 Round 1 — dense FFN; Round 2 — MoE FFN via CPU-MoE / GPU-SLRU.)
+                if (hp.IsHybridSsm)
+                {
+                    var placement = new LayerPlacement(
+                        GpuLayers: hp.NumLayers,
+                        CpuLayers: 0,
+                        GpuWeightBytes: 0,
+                        GpuKvBytes: 0,
+                        RecommendedCtxSize: ctxSize > 0 ? ctxSize : Math.Min(hp.ContextLength, 4096));
+                    var vhgdn = new VulkanHybridGdnForwardPass(model, gpu, hp, placement);
+                    gpuFwd = vhgdn;
+                    forward = vhgdn.Forward;
+                    prefill = tokens => vhgdn.Prefill(tokens);
+                    resetCache = vhgdn.ResetCache;
+                    int gdnLayers = 0, attnLayers = 0;
+                    for (int i = 0; i < hp.NumLayers; i++)
+                        if (hp.LayerTypes![i] == LayerType.Attention) attnLayers++; else gdnLayers++;
+                    string vkFfnKind = hp.IsMoE ? "MoE FFN (CPU/SLRU)" : "dense FFN GPU/CPU";
+                    AnsiConsole.MarkupLine($"[dim]Backend: [green]Vulkan hybrid GDN[/] ({gpu.Name}, {gdnLayers} GDN + {attnLayers} attn on GPU + {vkFfnKind})[/]");
+                    goto backendConfigured;
+                }
 
                 // Auto-detect layer count when -g -1
                 if (nGpuLayers == -1)
