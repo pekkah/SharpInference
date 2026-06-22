@@ -1060,7 +1060,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     // ================================================================
 
     private ComputePipeline? _rmsNormPipeline;
+    private ComputePipeline? _rmsNormBatchedPipeline;
     private ComputePipeline? _headNormPipeline;
+    private ComputePipeline? _headNormBatchedPipeline;
     private ComputePipeline? _headNormPurePipeline;
     private ComputePipeline? _siluMulPipeline;
     private ComputePipeline? _geluTanhMulPipeline;
@@ -1072,7 +1074,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _clearPipeline;
     private ComputePipeline? _elementwiseMulPipeline;
     private ComputePipeline? _ropePipeline;
+    private ComputePipeline? _ropeBatchedPipeline;
     private ComputePipeline? _ropeNeoxPipeline;
+    private ComputePipeline? _ropeNeoxBatchedPipeline;
     private ComputePipeline? _ropeNeoxWithFactorsPipeline;
     private ComputePipeline? _softmaxPipeline;
     private ComputePipeline? _sigmoidPipeline;
@@ -1120,8 +1124,10 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _upsample2xPipeline;
 
     private struct RmsNormParams{ public uint n; public float eps; }
+    private struct RmsNormBatchedParams { public uint n; public float eps; public uint numTokens; }
     private struct HeadNormParams { public uint headDim; public uint numHeads; public float eps; }
     private struct WeightedHeadNormParams { public uint headDim; public uint numHeads; public float eps; public uint weightStride; }
+    private struct WeightedHeadNormBatchedParams { public uint headDim; public uint numHeads; public float eps; public uint weightStride; public uint numTokens; }
     private struct CountParams { public uint n; }
     private struct ScaleParams { public uint n; public float scale; }
     private struct RoPEParams { public uint numHeads; public uint headDim; public int position; public float theta; }
@@ -1170,6 +1176,21 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         DispatchOrRecord(_rmsNormPipeline, [GetBuffer(x), GetBuffer(weight), GetBuffer(output)], 1, &p);
     }
 
+    /// <summary>
+    /// Batched RMS norm: normalizes each of <paramref name="numTokens"/> independent rows (length
+    /// <paramref name="rowDim"/>) of the <c>[numTokens][rowDim]</c> buffers <paramref name="x"/> →
+    /// <paramref name="output"/> in ONE dispatch. <paramref name="weight"/> is the shared
+    /// <c>[rowDim]</c> vector applied to every row. Bit-identical to <paramref name="numTokens"/>
+    /// separate <see cref="RmsNorm"/> calls — used by the spec-decode batched verify (issue #308)
+    /// to replace the per-token gather/op/scatter K-loop.
+    /// </summary>
+    public void RmsNormBatched(Tensor output, Tensor x, Tensor weight, int rowDim, int numTokens, float eps = 1e-5f)
+    {
+        _rmsNormBatchedPipeline ??= new ComputePipeline(this, Shaders.RmsNormBatched, 3, pushConstantSize: sizeof(RmsNormBatchedParams));
+        var p = new RmsNormBatchedParams { n = (uint)rowDim, eps = eps, numTokens = (uint)numTokens };
+        DispatchOrRecord(_rmsNormBatchedPipeline, [GetBuffer(x), GetBuffer(weight), GetBuffer(output)], (uint)numTokens, &p);
+    }
+
     /// <summary>Per-head RMS norm with learned weights. <paramref name="perChannelWeight"/>
     /// false → weight is shared <c>[headDim]</c> vector applied identically per head (Qwen3);
     /// true → weight is <c>[numHeads * headDim]</c> with one slice per head (OLMoE).</summary>
@@ -1185,6 +1206,29 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             weightStride = perChannelWeight ? headDim : 0u,
         };
         DispatchOrRecord(_headNormPipeline, [GetBuffer(data), GetBuffer(weight)], numHeads, &p);
+    }
+
+    /// <summary>
+    /// Batched per-head RMS norm: applies <see cref="HeadNorm"/> to each of
+    /// <paramref name="numTokens"/> rows of the <c>[numTokens][numHeads*headDim]</c> buffer
+    /// <paramref name="data"/> in ONE dispatch (numHeads × numTokens head-groups). The weight is
+    /// shared across rows (per <paramref name="perChannelWeight"/>, as in <see cref="HeadNorm"/>).
+    /// Bit-identical to <paramref name="numTokens"/> separate <see cref="HeadNorm"/> calls — used
+    /// by the spec-decode batched verify (issue #308).
+    /// </summary>
+    public void HeadNormBatched(Tensor data, Tensor weight, uint numHeads, uint headDim, int numTokens,
+        float eps = 1e-6f, bool perChannelWeight = false)
+    {
+        _headNormBatchedPipeline ??= new ComputePipeline(this, Shaders.HeadNormBatched, 2, pushConstantSize: sizeof(WeightedHeadNormBatchedParams));
+        var p = new WeightedHeadNormBatchedParams
+        {
+            headDim = headDim,
+            numHeads = numHeads,
+            eps = eps,
+            weightStride = perChannelWeight ? headDim : 0u,
+            numTokens = (uint)numTokens,
+        };
+        DispatchOrRecord(_headNormBatchedPipeline, [GetBuffer(data), GetBuffer(weight)], numHeads, &p, groupY: (uint)numTokens);
     }
 
     /// <summary>
@@ -1303,6 +1347,36 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         uint totalPairs = numHeads * (uint)(headDim / 2);
         var p = new RoPEParams { numHeads = numHeads, headDim = (uint)headDim, position = position, theta = ropeTheta };
         DispatchOrRecord(pipeline, [GetBuffer(x)], (totalPairs + 255) / 256, &p);
+    }
+
+    /// <summary>
+    /// Batched RoPE: rotates each of <paramref name="numTokens"/> rows (each <paramref name="numHeads"/>
+    /// heads of <paramref name="headDim"/>) of the <c>[numTokens][numHeads*headDim]</c> buffer
+    /// <paramref name="x"/> in ONE dispatch, where row r uses position = <paramref name="basePos"/> + r
+    /// (per-token absolute position). Selects the NEOX or interleaved-pair variant via
+    /// <paramref name="neox"/>. Bit-identical to <paramref name="numTokens"/> separate
+    /// <see cref="RoPE"/> calls at positions basePos, basePos+1, … — used by the spec-decode
+    /// batched verify (issue #308). RoPE with freq_factors is Gemma-4-only and excluded from the
+    /// batched path, so no batched freq-factors variant is provided.
+    /// </summary>
+    public void RoPEBatched(Tensor x, int basePos, int headDim, int numHeads, int numTokens,
+        float ropeTheta = 10000f, bool neox = false)
+    {
+        ComputePipeline pipeline;
+        if (neox)
+        {
+            _ropeNeoxBatchedPipeline ??= new ComputePipeline(this, Shaders.RoPENeoxBatched, 1, pushConstantSize: sizeof(RoPEParams));
+            pipeline = _ropeNeoxBatchedPipeline;
+        }
+        else
+        {
+            _ropeBatchedPipeline ??= new ComputePipeline(this, Shaders.RoPEBatched, 1, pushConstantSize: sizeof(RoPEParams));
+            pipeline = _ropeBatchedPipeline;
+        }
+        uint totalPairs = (uint)numHeads * (uint)(headDim / 2);
+        // RoPEParams.position carries base_pos; the shader adds the row (gl_WorkGroupID.y) index.
+        var p = new RoPEParams { numHeads = (uint)numHeads, headDim = (uint)headDim, position = basePos, theta = ropeTheta };
+        DispatchOrRecord(pipeline, [GetBuffer(x)], (totalPairs + 255) / 256, &p, groupY: (uint)numTokens);
     }
 
     /// <summary>
@@ -2231,7 +2305,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
 
         // Dispose compute pipelines
         _rmsNormPipeline?.Dispose();
+        _rmsNormBatchedPipeline?.Dispose();
         _headNormPipeline?.Dispose();
+        _headNormBatchedPipeline?.Dispose();
         _headNormPurePipeline?.Dispose();
         _siluMulPipeline?.Dispose();
         _geluTanhMulPipeline?.Dispose();
@@ -2243,7 +2319,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _clearPipeline?.Dispose();
         _elementwiseMulPipeline?.Dispose();
         _ropePipeline?.Dispose();
+        _ropeBatchedPipeline?.Dispose();
         _ropeNeoxPipeline?.Dispose();
+        _ropeNeoxBatchedPipeline?.Dispose();
         _ropeNeoxWithFactorsPipeline?.Dispose();
         _softmaxPipeline?.Dispose();
         _sigmoidPipeline?.Dispose();

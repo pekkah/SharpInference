@@ -651,6 +651,168 @@ public sealed unsafe class VulkanShaderTests
         }
     }
 
+    // ── Batched cheap-op parity (issue #308 PR1c-opt). Each batched cheap-op processes K rows of
+    // a [K][dim] buffer in ONE dispatch; the spec-decode batched verify uses them to replace the
+    // per-token gather/op/scatter K-loop. Each must be BIT-EXACT to K separate single-row calls
+    // (each row normalized/rotated independently with the same math + position). ──
+
+    [Theory]
+    [InlineData(1)]   // degenerate single-token
+    [InlineData(4)]
+    [InlineData(6)]
+    [InlineData(8)]
+    public void RmsNormBatchedMatchesSingleRow(int k)
+    {
+        Vulkan.VulkanBackend backend;
+        try { backend = new Vulkan.VulkanBackend(); }
+        catch { return; } // no Vulkan device on this host — skip
+
+        using (backend)
+        {
+            const int dim = 2048;
+            const float eps = 1e-5f;
+            var rng = new Random(11 + k);
+            var weight = new float[dim];
+            for (int i = 0; i < dim; i++) weight[i] = (float)(rng.NextDouble() * 0.5 + 0.75);
+            var inputAll = new float[k * dim];
+            for (int i = 0; i < inputAll.Length; i++) inputAll[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            var gpuWeight = backend.Upload(weight, TensorShape.D1(dim));
+
+            // Batched: all k rows in one dispatch.
+            var gpuInAll = backend.Upload(inputAll, TensorShape.D1(k * dim));
+            var gpuOutAll = backend.Allocate(TensorShape.D1(k * dim));
+            backend.RmsNormBatched(gpuOutAll, gpuInAll, gpuWeight, dim, k, eps);
+            var batchedOut = new float[k * dim];
+            backend.Download(gpuOutAll, batchedOut);
+
+            // Reference: k separate single-row RmsNorm calls.
+            var gpuInK = backend.Allocate(TensorShape.D1(dim));
+            var gpuOutK = backend.Allocate(TensorShape.D1(dim));
+            var singleOut = new float[dim];
+            for (int t = 0; t < k; t++)
+            {
+                var gpuInRow = backend.Upload(inputAll.AsSpan(t * dim, dim), TensorShape.D1(dim));
+                backend.RmsNorm(gpuOutK, gpuInRow, gpuWeight, eps);
+                backend.Download(gpuOutK, singleOut);
+                backend.Free(gpuInRow);
+                for (int i = 0; i < dim; i++)
+                {
+                    float b = batchedOut[t * dim + i], s = singleOut[i];
+                    Assert.True(b == s, $"k={k} row={t} i={i}: batched={b:R} single={s:R}");
+                }
+            }
+
+            backend.Free(gpuWeight);
+            backend.Free(gpuInAll);
+            backend.Free(gpuOutAll);
+            backend.Free(gpuInK);
+            backend.Free(gpuOutK);
+        }
+    }
+
+    [Theory]
+    [InlineData(1, false)]  // shared weight (Qwen3 style)
+    [InlineData(4, false)]
+    [InlineData(8, false)]
+    [InlineData(4, true)]   // per-channel weight (OLMoE style)
+    [InlineData(6, true)]
+    public void HeadNormBatchedMatchesSingleRow(int k, bool perChannel)
+    {
+        Vulkan.VulkanBackend backend;
+        try { backend = new Vulkan.VulkanBackend(); }
+        catch { return; } // no Vulkan device on this host — skip
+
+        using (backend)
+        {
+            const int numHeads = 8;
+            const int headDim = 128;
+            const int dim = numHeads * headDim;
+            const float eps = 1e-6f;
+            var rng = new Random(23 + k + (perChannel ? 100 : 0));
+
+            int weightLen = perChannel ? dim : headDim;
+            var weight = new float[weightLen];
+            for (int i = 0; i < weightLen; i++) weight[i] = (float)(rng.NextDouble() * 0.5 + 0.75);
+            var inputAll = new float[k * dim];
+            for (int i = 0; i < inputAll.Length; i++) inputAll[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            var gpuWeight = backend.Upload(weight, TensorShape.D1(weightLen));
+
+            // Batched: all k rows in one dispatch (in-place on the [k][dim] buffer).
+            var gpuDataAll = backend.Upload(inputAll, TensorShape.D1(k * dim));
+            backend.HeadNormBatched(gpuDataAll, gpuWeight, numHeads, headDim, k, eps, perChannel);
+            var batchedOut = new float[k * dim];
+            backend.Download(gpuDataAll, batchedOut);
+
+            // Reference: k separate single-row HeadNorm calls (in-place per row).
+            var singleOut = new float[dim];
+            for (int t = 0; t < k; t++)
+            {
+                var gpuRow = backend.Upload(inputAll.AsSpan(t * dim, dim), TensorShape.D1(dim));
+                backend.HeadNorm(gpuRow, gpuWeight, numHeads, headDim, eps, perChannel);
+                backend.Download(gpuRow, singleOut);
+                backend.Free(gpuRow);
+                for (int i = 0; i < dim; i++)
+                {
+                    float b = batchedOut[t * dim + i], s = singleOut[i];
+                    Assert.True(b == s, $"k={k} perCh={perChannel} row={t} i={i}: batched={b:R} single={s:R}");
+                }
+            }
+
+            backend.Free(gpuWeight);
+            backend.Free(gpuDataAll);
+        }
+    }
+
+    [Theory]
+    [InlineData(1, false)]  // interleaved RoPE, single token
+    [InlineData(4, false)]
+    [InlineData(8, false)]
+    [InlineData(4, true)]   // NEOX RoPE
+    [InlineData(6, true)]
+    public void RoPEBatchedMatchesSingleRow(int k, bool neox)
+    {
+        Vulkan.VulkanBackend backend;
+        try { backend = new Vulkan.VulkanBackend(); }
+        catch { return; } // no Vulkan device on this host — skip
+
+        using (backend)
+        {
+            const int numHeads = 8;
+            const int headDim = 128;
+            const int dim = numHeads * headDim;
+            const int basePos = 37;       // row r uses position basePos + r
+            const float theta = 10000f;
+            var rng = new Random(41 + k + (neox ? 100 : 0));
+            var inputAll = new float[k * dim];
+            for (int i = 0; i < inputAll.Length; i++) inputAll[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            // Batched: all k rows in one dispatch, row r at position basePos+r.
+            var gpuXAll = backend.Upload(inputAll, TensorShape.D1(k * dim));
+            backend.RoPEBatched(gpuXAll, basePos, headDim, numHeads, k, theta, neox);
+            var batchedOut = new float[k * dim];
+            backend.Download(gpuXAll, batchedOut);
+
+            // Reference: k separate single-row RoPE calls at positions basePos, basePos+1, …
+            var singleOut = new float[dim];
+            for (int t = 0; t < k; t++)
+            {
+                var gpuRow = backend.Upload(inputAll.AsSpan(t * dim, dim), TensorShape.D1(dim));
+                backend.RoPE(gpuRow, basePos + t, headDim, theta, neox);
+                backend.Download(gpuRow, singleOut);
+                backend.Free(gpuRow);
+                for (int i = 0; i < dim; i++)
+                {
+                    float b = batchedOut[t * dim + i], s = singleOut[i];
+                    Assert.True(b == s, $"k={k} neox={neox} row={t} i={i}: batched={b:R} single={s:R}");
+                }
+            }
+
+            backend.Free(gpuXAll);
+        }
+    }
+
     private static void AssertVulkanMatVecMatchesCpu(
         byte[] weightBytes, int matRows, int matCols, DType dtype, int inputSeed)
     {

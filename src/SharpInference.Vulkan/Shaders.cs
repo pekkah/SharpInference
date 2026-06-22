@@ -62,6 +62,68 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Batched RMS Normalization: normalizes each of <c>num_tokens</c> independent rows of a
+    /// <c>[num_tokens][n]</c> buffer in a single dispatch. Row r (token r) is normalized EXACTLY
+    /// as the single-row <see cref="RmsNorm"/> — its own sum-of-squares reduction over its n
+    /// elements, then scale + the shared <c>[n]</c> weight. Bit-identical to <c>num_tokens</c>
+    /// separate <see cref="RmsNorm"/> calls (the per-row math is independent; floating-point
+    /// reduction order within a row matches the single-row shader's 256-stride + tree reduction).
+    ///
+    /// One workgroup per row: row index r = <c>gl_WorkGroupID.x</c> (dispatch num_tokens groups).
+    /// Push constants: { uint n, float eps, uint num_tokens }.
+    /// Bindings: 0=input ([num_tokens][n]), 1=weight ([n], shared), 2=output ([num_tokens][n]).
+    /// </summary>
+    internal const string RmsNormBatched = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly buffer Input  { float input_data[]; };
+        layout(binding = 1) readonly buffer Weight { float weight_data[]; };
+        layout(binding = 2) writeonly buffer Output { float output_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint n;
+            float eps;
+            uint num_tokens;
+        };
+
+        shared float sdata[256];
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint row = gl_WorkGroupID.x;
+            if (row >= num_tokens) return;
+
+            uint base_off = row * n;
+
+            // Phase 1: each thread accumulates sum of squares for its stride within this row.
+            float sum = 0.0;
+            for (uint i = tid; i < n; i += 256) {
+                float v = input_data[base_off + i];
+                sum += v * v;
+            }
+            sdata[tid] = sum;
+            barrier();
+
+            // Phase 2: parallel reduction in shared memory.
+            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] += sdata[tid + s];
+                barrier();
+            }
+
+            // Phase 3: compute scale factor.
+            float scale = inversesqrt(sdata[0] / float(n) + eps);
+
+            // Phase 4: apply normalization and the shared weight.
+            for (uint i = tid; i < n; i += 256) {
+                output_data[base_off + i] = input_data[base_off + i] * scale * weight_data[i];
+            }
+        }
+        """;
+
+    /// <summary>
     /// Fused SiLU(gate) * up: gate[i] = gate[i] * sigmoid(gate[i]) * up[i]
     /// Push constants: { uint n }.
     /// Bindings: 0=gate (in/out), 1=up (in).
@@ -334,6 +396,71 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Batched per-head RMSNorm: applies <see cref="HeadNorm"/> independently to each head of
+    /// each of <c>num_tokens</c> rows in a <c>[num_tokens][num_heads*head_dim]</c> buffer, in a
+    /// single dispatch. Processes <c>num_tokens * num_heads</c> head-groups: head index
+    /// h = <c>gl_WorkGroupID.x</c>, token row r = <c>gl_WorkGroupID.y</c> (dispatch
+    /// num_heads × num_tokens groups). The weight (shared <c>[head_dim]</c> for Qwen3, or
+    /// per-channel <c>[num_heads*head_dim]</c> for OLMoE via weight_stride) is shared across rows.
+    /// Bit-identical to <c>num_tokens</c> separate <see cref="HeadNorm"/> calls.
+    /// Push constants: { uint head_dim, uint num_heads, float eps, uint weight_stride, uint num_tokens }.
+    /// Bindings: 0=data ([num_tokens][num_heads*head_dim], in/out), 1=weight (in).
+    /// </summary>
+    internal const string HeadNormBatched = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer Data   { float data_buf[]; };
+        layout(binding = 1) readonly buffer Weight { float weight_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint head_dim;
+            uint num_heads;
+            float eps;
+            // 0 = weight shared across heads (Qwen3, len = head_dim).
+            // head_dim = per-channel weight (OLMoE, len = num_heads*head_dim).
+            uint weight_stride;
+            uint num_tokens;
+        };
+
+        shared float sdata[256];
+
+        void main() {
+            uint tid  = gl_LocalInvocationID.x;
+            uint head = gl_WorkGroupID.x;
+            uint row  = gl_WorkGroupID.y;
+            if (head >= num_heads || row >= num_tokens) return;
+
+            uint row_off  = row * num_heads * head_dim;
+            uint base_off = row_off + head * head_dim;
+            uint w_off    = head * weight_stride;
+
+            // Phase 1: accumulate sum of squares for this token's head.
+            float sum = 0.0;
+            for (uint i = tid; i < head_dim; i += 256) {
+                float v = data_buf[base_off + i];
+                sum += v * v;
+            }
+            sdata[tid] = sum;
+            barrier();
+
+            // Phase 2: parallel reduction.
+            [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] += sdata[tid + s];
+                barrier();
+            }
+
+            // Phase 3: normalize in-place with weight.
+            float scale = inversesqrt(sdata[0] / float(head_dim) + eps);
+            for (uint i = tid; i < head_dim; i += 256) {
+                data_buf[base_off + i] = data_buf[base_off + i] * scale * weight_data[w_off + i];
+            }
+        }
+        """;
+
+    /// <summary>
     /// Per-head RMS normalization without learned weights (L2 normalize).
     /// Used for Llama4TextL2Norm in QK-norm.
     /// Push constants: { uint head_dim, uint num_heads, float eps }.
@@ -475,6 +602,105 @@ internal static class Shaders
             float sin_a = sin(angle);
 
             uint head_base = h * head_dim;
+            uint a_idx = head_base + i;
+            uint b_idx = head_base + i + half_dim;
+            float x0 = x_data[a_idx];
+            float x1 = x_data[b_idx];
+            x_data[a_idx] = x0 * cos_a - x1 * sin_a;
+            x_data[b_idx] = x0 * sin_a + x1 * cos_a;
+        }
+        """;
+
+    /// <summary>
+    /// Batched interleaved-pair RoPE: applies <see cref="RoPE"/> to each of <c>num_tokens</c>
+    /// independent rows of a <c>[num_tokens][num_heads*head_dim]</c> buffer in one dispatch, where
+    /// row r uses position = <c>base_pos + r</c> (per-token absolute position). Pair index in
+    /// <c>gl_GlobalInvocationID.x</c>, token row r = <c>gl_WorkGroupID.y</c> (dispatch
+    /// ceil(total_pairs/256) × num_tokens groups). Each row computes its own cos/sin from
+    /// base_pos+r, so it is bit-identical to <c>num_tokens</c> separate <see cref="RoPE"/> calls
+    /// with positions base_pos, base_pos+1, ….
+    /// Push constants: { uint num_heads, uint head_dim, int base_pos, float theta }.
+    /// Bindings: 0=x ([num_tokens][num_heads*head_dim], in/out).
+    /// (num_tokens comes from the dispatched Y group count; no separate push-constant needed.)
+    /// </summary>
+    internal const string RoPEBatched = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer X { float x_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint num_heads;
+            uint head_dim;
+            int base_pos;
+            float theta;
+        };
+
+        void main() {
+            uint pair_idx = gl_GlobalInvocationID.x;
+            uint row      = gl_WorkGroupID.y;
+            uint half_dim = head_dim / 2;
+            uint total_pairs = num_heads * half_dim;
+            if (pair_idx >= total_pairs) return;
+
+            uint h = pair_idx / half_dim;
+            uint i = pair_idx % half_dim;
+
+            int position = base_pos + int(row);
+            float freq = 1.0 / pow(theta, 2.0 * float(i) / float(head_dim));
+            float angle = float(position) * freq;
+            float cos_a = cos(angle);
+            float sin_a = sin(angle);
+
+            uint row_off = row * num_heads * head_dim;
+            uint base_idx = row_off + h * head_dim + 2 * i;
+            float x0 = x_data[base_idx];
+            float x1 = x_data[base_idx + 1];
+            x_data[base_idx]     = x0 * cos_a - x1 * sin_a;
+            x_data[base_idx + 1] = x0 * sin_a + x1 * cos_a;
+        }
+        """;
+
+    /// <summary>
+    /// Batched NEOX/half-rotation RoPE: the <see cref="RoPENeox"/> sibling of
+    /// <see cref="RoPEBatched"/>. Applies NEOX RoPE to each of <c>num_tokens</c> rows of a
+    /// <c>[num_tokens][num_heads*head_dim]</c> buffer in one dispatch; row r uses position
+    /// = <c>base_pos + r</c>. Bit-identical to <c>num_tokens</c> separate <see cref="RoPENeox"/>
+    /// calls. Push constants: { uint num_heads, uint head_dim, int base_pos, float theta }.
+    /// Bindings: 0=x (in/out). Pair index = <c>gl_GlobalInvocationID.x</c>, token row =
+    /// <c>gl_WorkGroupID.y</c>.
+    /// </summary>
+    internal const string RoPENeoxBatched = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer X { float x_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint num_heads;
+            uint head_dim;
+            int base_pos;
+            float theta;
+        };
+
+        void main() {
+            uint pair_idx = gl_GlobalInvocationID.x;
+            uint row      = gl_WorkGroupID.y;
+            uint half_dim = head_dim / 2;
+            uint total_pairs = num_heads * half_dim;
+            if (pair_idx >= total_pairs) return;
+
+            uint h = pair_idx / half_dim;
+            uint i = pair_idx % half_dim;
+
+            int position = base_pos + int(row);
+            float freq = 1.0 / pow(theta, 2.0 * float(i) / float(head_dim));
+            float angle = float(position) * freq;
+            float cos_a = cos(angle);
+            float sin_a = sin(angle);
+
+            uint row_off = row * num_heads * head_dim;
+            uint head_base = row_off + h * head_dim;
             uint a_idx = head_base + i;
             uint b_idx = head_base + i + half_dim;
             float x0 = x_data[a_idx];
