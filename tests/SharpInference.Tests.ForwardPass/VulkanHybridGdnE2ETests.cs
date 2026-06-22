@@ -208,6 +208,91 @@ public sealed class VulkanHybridGdnE2ETests
     }
 
     /// <summary>
+    /// Byte-exact self-parity for the Vulkan GDN batched prefill (issue #356 PR5b): prefill a
+    /// fixed ~16-token prompt on the dense 27B-MTP GDN model TWICE on two independent
+    /// <see cref="VulkanHybridGdnForwardPass"/> instances — once with
+    /// <c>SHARPI_VULKAN_BATCHED_PREFILL=1</c> (the batched trunk) and once with <c>=0</c> (the
+    /// sequential per-token Forward loop) — then greedy-decode <see cref="DecodeSteps"/> tokens on
+    /// each. The two token streams must be BYTE-IDENTICAL: the batched trunk reproduces N
+    /// sequential Forwards op-for-op, so any divergence is a wiring/barrier bug, not Q4_K noise.
+    /// No CUDA needed (pure Vulkan self-parity). Silent-skips when Vulkan or the GGUF is absent;
+    /// graceful skip on device OOM.
+    /// </summary>
+    [Fact]
+    public void VulkanHybridGdn_BatchedPrefill_MatchesSequential()
+    {
+        var path = FindDenseModelPath();
+        if (path is null) return;                                   // model-gated
+        using (var probe = TryCreateVulkan())
+            if (probe is null) return;                             // Vulkan-gated
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.True(hp.IsHybridSsm, "Expected hp.IsHybridSsm for the qwen36 GDN model");
+        Assert.NotNull(hp.Gdn);
+        Assert.NotNull(hp.LayerTypes);
+
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        // A ~16-token prompt, all positions < 4096 (the AttentionBatched shared-scores range).
+        var prompt = tokenizer.Encode("The quick brown fox jumps over the lazy dog near the river bank at dawn.");
+        Assert.True(prompt.Count > 1, "Need a multi-token prompt to exercise the batched path.");
+        Assert.True(prompt.Count + DecodeSteps <= 4096);
+
+        // Run a full prefill + greedy decode on a fresh pass with the batched gate set to `gateVal`.
+        int[] RunWithGate(string gateVal)
+        {
+            string? prev = Environment.GetEnvironmentVariable("SHARPI_VULKAN_BATCHED_PREFILL");
+            Environment.SetEnvironmentVariable("SHARPI_VULKAN_BATCHED_PREFILL", gateVal);
+            try
+            {
+                VulkanBackend gpu;
+                try { gpu = new VulkanBackend(); }
+                catch { return Array.Empty<int>(); }   // Vulkan vanished → caller skips
+                using (gpu)
+                {
+                    VulkanHybridGdnForwardPass fwd;
+                    try { fwd = new VulkanHybridGdnForwardPass(model, gpu, hp, GdnPlacement(hp)); }
+                    catch (VkException ex) when (ex.Result == VkResult.ErrorOutOfDeviceMemory)
+                    {
+                        return Array.Empty<int>();      // device too small → caller skips
+                    }
+                    using (fwd)
+                    {
+                        var outTokens = new int[DecodeSteps];
+                        var logits = fwd.Prefill(prompt);
+                        AssertFinite(logits, $"Vulkan prefill (gate={gateVal})");
+                        outTokens[0] = Argmax(logits);
+                        int pos = prompt.Count;
+                        for (int i = 1; i < DecodeSteps; i++)
+                        {
+                            var step = fwd.Forward(outTokens[i - 1], pos++);
+                            AssertFinite(step, $"Vulkan decode step {i} (gate={gateVal})");
+                            outTokens[i] = Argmax(step);
+                        }
+                        return outTokens;
+                    }
+                }
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("SHARPI_VULKAN_BATCHED_PREFILL", prev);
+            }
+        }
+
+        int[] batched = RunWithGate("1");
+        if (batched.Length == 0) return;               // OOM / Vulkan-gone → skip
+        int[] sequential = RunWithGate("0");
+        if (sequential.Length == 0) return;            // OOM / Vulkan-gone → skip
+
+        for (int i = 0; i < DecodeSteps; i++)
+            Assert.True(batched[i] == sequential[i],
+                $"Batched vs sequential prefill diverge at step {i}: batched={batched[i]} sequential={sequential[i]}. " +
+                $"batched=[{string.Join(",", batched)}] sequential=[{string.Join(",", sequential)}]. " +
+                "The batched trunk must be byte-identical to N sequential Forwards (#356 PR5b contract) — " +
+                "likely a missing RecordBarrier (e.g. the GDN conv WAR) or a chunk-boundary state-advance bug.");
+    }
+
+    /// <summary>
     /// Greedy-decode argmax parity Vulkan vs CUDA on the GDN+MoE model (Qwen3.6-35B-A3B,
     /// PR4 Round 2). On a 12 GB-class card neither backend can cache the 256 experts × 40
     /// layers in VRAM, so both auto-select (and we pin via SHARPI_CPU_MOE=1) the CPU-MoE

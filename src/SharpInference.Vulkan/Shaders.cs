@@ -994,6 +994,62 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Batched partial NEOX RoPE: the <see cref="RoPENeoxPartial"/> sibling of
+    /// <see cref="RoPENeoxBatched"/>. Rotates only the first <c>rope_dim</c> of each
+    /// <c>head_dim</c>-wide head over each of <c>n_tok</c> rows of a
+    /// <c>[n_tok][num_heads*head_dim]</c> buffer in ONE dispatch; token t (row
+    /// <c>gl_WorkGroupID.y</c>) uses position = <c>base_position + t</c>. The frequency exponent
+    /// uses <c>rope_dim</c> (NOT <c>head_dim</c>) — matching CUDA <c>llm_rope_neox_partial_batched</c>
+    /// and <see cref="RoPENeoxPartial"/>. Bit-identical to <c>n_tok</c> separate
+    /// <see cref="RoPENeoxPartial"/> calls at positions base_position, base_position+1, ….
+    /// Pair index = <c>gl_GlobalInvocationID.x</c>, token row t = <c>gl_WorkGroupID.y</c> (dispatch
+    /// ceil(total_pairs/256) × n_tok groups). Dims <c>[rope_dim, head_dim)</c> pass through untouched.
+    /// Push constants: { uint num_heads, uint head_dim, uint rope_dim, int position, float theta }
+    /// (position carries base_position; n_tok comes from the dispatched Y group count).
+    /// Bindings: 0=x (in/out).
+    /// </summary>
+    internal const string RoPENeoxPartialBatched = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer X { float x_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint num_heads;
+            uint head_dim;
+            uint rope_dim;
+            int position;
+            float theta;
+        };
+
+        void main() {
+            uint pair_idx = gl_GlobalInvocationID.x;
+            uint token    = gl_WorkGroupID.y;
+            uint rope_half = rope_dim / 2u;
+            uint total_pairs = num_heads * rope_half;
+            if (pair_idx >= total_pairs) return;
+
+            uint h = pair_idx / rope_half;
+            uint i = pair_idx % rope_half;
+
+            int pos = position + int(token);
+            float freq = 1.0 / pow(theta, 2.0 * float(i) / float(rope_dim));
+            float angle = float(pos) * freq;
+            float cos_a = cos(angle);
+            float sin_a = sin(angle);
+
+            uint head_base = token * num_heads * head_dim + h * head_dim;
+            uint a_idx = head_base + i;
+            uint b_idx = head_base + i + rope_half;
+            float x0 = x_data[a_idx];
+            float x1 = x_data[b_idx];
+            x_data[a_idx] = x0 * cos_a - x1 * sin_a;
+            x_data[b_idx] = x0 * sin_a + x1 * cos_a;
+            // Dims [rope_dim, head_dim) pass through untouched (never written).
+        }
+        """;
+
+    /// <summary>
     /// Strided de-interleave of qwen35moe's Gated-Attention <c>[Q‖G]</c> output. The input
     /// <paramref name="qg"/> is laid out per head as <c>[Q[head_dim] ‖ G[head_dim]]</c>
     /// (stride <c>2*head_dim</c> per head); this splits it into contiguous
@@ -1026,6 +1082,44 @@ internal static class Shaders
             // dst index == idx (h*head_dim + j); only the src stride needs the 2x.
             q_data[idx] = qg_data[src_base + j];
             g_data[idx] = qg_data[src_base + head_dim + j];
+        }
+        """;
+
+    /// <summary>
+    /// Batched strided de-interleave: applies <see cref="SplitQG"/> to each of <c>n_tok</c> rows of
+    /// the <c>[n_tok][num_heads*head_dim*2]</c> input in ONE dispatch (the <see cref="SplitQG"/>
+    /// sibling of the batched ops). The <paramref name="qg"/> row stride is
+    /// <c>num_heads*head_dim*2</c>; the q/g row stride is <c>num_heads*head_dim</c>. Token index
+    /// t = <c>gl_WorkGroupID.y</c>, (h, j) index = <c>gl_GlobalInvocationID.x</c>. Bit-identical to
+    /// <c>n_tok</c> separate <see cref="SplitQG"/> calls. Mirrors CUDA <c>llm_split_qg_batched</c>.
+    /// Push constants: { uint num_heads, uint head_dim } (n_tok from the dispatched Y group count).
+    /// Bindings: 0=qg (in), 1=q (out), 2=g (out).
+    /// </summary>
+    internal const string SplitQGBatched = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly  buffer QG { float qg_data[]; };
+        layout(binding = 1) writeonly buffer Q  { float q_data[]; };
+        layout(binding = 2) writeonly buffer G  { float g_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint num_heads;
+            uint head_dim;
+        };
+
+        void main() {
+            uint idx = gl_GlobalInvocationID.x;
+            uint token = gl_WorkGroupID.y;
+            uint total = num_heads * head_dim;
+            if (idx >= total) return;
+
+            uint h = idx / head_dim;
+            uint j = idx % head_dim;
+            uint qg_base  = token * num_heads * head_dim * 2u + h * head_dim * 2u;
+            uint out_base = token * total + h * head_dim;
+            q_data[out_base + j] = qg_data[qg_base + j];
+            g_data[out_base + j] = qg_data[qg_base + head_dim + j];
         }
         """;
 
