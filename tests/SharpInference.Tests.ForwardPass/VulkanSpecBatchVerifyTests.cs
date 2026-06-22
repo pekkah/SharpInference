@@ -83,6 +83,18 @@ public sealed class VulkanSpecBatchVerifyTests
         return best;
     }
 
+    // Argmax index + the top-1 and top-2 values (the margin gates argmax-stability checks).
+    private static (int idx, float top1, float top2) Top2(ReadOnlySpan<float> v)
+    {
+        int i0 = 0; float t1 = float.NegativeInfinity, t2 = float.NegativeInfinity;
+        for (int i = 0; i < v.Length; i++)
+        {
+            if (v[i] > t1) { t2 = t1; t1 = v[i]; i0 = i; }
+            else if (v[i] > t2) { t2 = v[i]; }
+        }
+        return (i0, t1, t2);
+    }
+
     private static float MaxAbsDiff(float[] reference, float[] candidate)
     {
         Assert.Equal(reference.Length, candidate.Length);
@@ -238,9 +250,19 @@ public sealed class VulkanSpecBatchVerifyTests
         float tol = int8Trunk ? 1.0f : 1e-4f;
         for (int i = 0; i < k; i++)
         {
-            Assert.Equal(Argmax(reference[i]), Argmax(batch[i]));
             float maxAbs = MaxAbsDiff(reference[i], batch[i]);
             worst = MathF.Max(worst, maxAbs);
+
+            // Argmax stability is the spec-accept contract — but only required when the FP winner is
+            // clear of the int8 noise. With P2 (issue #308) the Q6_K output projection that PRODUCES
+            // the logits now runs on the int8-DP4A path too (token_embd/output are Q6_K), so a flip
+            // between two near-tied logits (margin below the int8 step) is legal — exactly the gate the
+            // standalone MatVecBatchedQ4K/Q6K parity tests use. On the FP K-loop fallback (int8Trunk ==
+            // false) the trunk is bit-exact, so the margin gate is vacuous and the argmax must match.
+            (int a0, float v0, float v1) = Top2(reference[i]);
+            if (!int8Trunk || v0 - v1 > 2f * maxAbs)
+                Assert.Equal(a0, Argmax(batch[i]));
+
             Assert.True(maxAbs < tol,
                 $"Position {i}: batched vs sequential logits diverged beyond the " +
                 $"{(int8Trunk ? "int8 argmax-stable" : "bit-exact K-loop")} tolerance " +
@@ -297,11 +319,16 @@ public sealed class VulkanSpecBatchVerifyTests
             float[][] batch = fwd.BatchVerify(tokens, P);
 
             Assert.Equal(k, batch.Length);
-            // Batched trunk = int8 DP4A matvec → argmax-stable (not bit-exact) vs the FP K-loop.
+            // Batched trunk = int8 DP4A matvec → argmax-stable (not bit-exact) vs the FP K-loop. With
+            // P2 the Q6_K output projection is int8 too, so a near-tie logit flip (margin below the
+            // int8 step) is legal; gate the argmax check on a clear FP margin (same as RunParity).
             for (int i = 0; i < k; i++)
             {
-                Assert.Equal(Argmax(reference[i]), Argmax(batch[i]));
-                Assert.True(MaxAbsDiff(reference[i], batch[i]) < 1.0f,
+                float maxAbs = MaxAbsDiff(reference[i], batch[i]);
+                (int a0, float v0, float v1) = Top2(reference[i]);
+                if (v0 - v1 > 2f * maxAbs)
+                    Assert.Equal(a0, Argmax(batch[i]));
+                Assert.True(maxAbs < 1.0f,
                     $"k={k} pos={i}: batched diverged from the K-loop oracle beyond the int8 " +
                     "argmax-stable tolerance (scratch-sizing).");
             }
@@ -337,14 +364,23 @@ public sealed class VulkanSpecBatchVerifyTests
         int t0 = Argmax(prefillLogits);
 
         // Sequential reference trajectory: accept t0, then the correction t1.
-        int t1 = Argmax(fwd.Forward(t0, P));
+        float[] afterT0 = fwd.Forward(t0, P).ToArray(); // FP logits after t0 (margin oracle for the t1 pick)
+        int t1 = Argmax(afterT0);
         float[] reference = fwd.Forward(t1, P + 1).ToArray();
 
         // Spec-step shape: rewind to P, verify [t0, junk, junk, junk] (junk rejected), accept t0.
         fwd.TruncateTo(P);
         int junk = (t0 + 7919) % hp.VocabSize;
         float[][] batch = fwd.BatchVerify([t0, junk, junk, junk], P);
-        Assert.Equal(t1, Argmax(batch[0])); // verify logits after t0 must still pick t1
+        // verify logits after t0 must still pick t1 — but with P2 the int8 Q6_K output projection can
+        // flip a near-tie at the logit layer, so on the batched trunk only require it when the FP t1
+        // pick clears the int8 noise (margin gate vs the FP afterT0 oracle; vacuous on the K-loop).
+        {
+            float vm = MaxAbsDiff(afterT0, batch[0]);
+            (_, float v0, float v1) = Top2(afterT0);
+            if (!fwd.CanBatchedTrunk || v0 - v1 > 2f * vm)
+                Assert.Equal(t1, Argmax(batch[0]));
+        }
 
         // Roll back the rejected tail; rejected K/V at [P+1, P+4) stays but must be ignored and
         // overwritten by the commit.
@@ -356,9 +392,12 @@ public sealed class VulkanSpecBatchVerifyTests
         // committed logits differ from the all-FP reference by int8 noise, not bit-exactly — the
         // contract is argmax stability (the accepted-token trajectory is unchanged), with a tolerance
         // matching the int8 path. On the Q8_0 K-loop fallback model the trunk is FP → bit-exact.
-        Assert.Equal(Argmax(reference), Argmax(committed));
-        float tol = fwd.CanBatchedTrunk ? 1.0f : 1e-4f;
         float maxAbs = MaxAbsDiff(reference, committed);
+        // Argmax stability, gated on a clear FP margin (the int8-derived KV can flip a near-tie).
+        (int ra0, float rv0, float rv1) = Top2(reference);
+        if (!fwd.CanBatchedTrunk || rv0 - rv1 > 2f * maxAbs)
+            Assert.Equal(ra0, Argmax(committed));
+        float tol = fwd.CanBatchedTrunk ? 1.0f : 1e-4f;
         Assert.True(maxAbs < tol,
             $"Post-rollback commit diverged from the sequential trajectory beyond the " +
             $"{(fwd.CanBatchedTrunk ? "int8 argmax-stable" : "bit-exact")} tolerance: maxAbs={maxAbs}.");

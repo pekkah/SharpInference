@@ -872,6 +872,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     // dispatches — freeing it immediately is a use-after-free that faults the device. Stash it here
     // and free it after the next submit (when the GPU is idle), via FlushPendingScratchFrees().
     private readonly List<Tensor> _pendingScratchFrees = new();
+    // int8 pipelines stranded by a mid-recording fallback (their Dispose must wait until the
+    // recorded dispatches that reference them have been submitted + the GPU is idle).
+    private readonly List<ComputePipeline> _pendingPipelineFrees = new();
 
     /// <summary>
     /// Ensure <see cref="_q81BatchBuf"/> is at least nTok·(cols/32)·36 bytes. Grows (re-allocates)
@@ -899,9 +902,26 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     /// completes (the GPU is idle, so no recorded dispatch still references them).</summary>
     private void FlushPendingScratchFrees()
     {
-        if (_pendingScratchFrees.Count == 0) return;
-        foreach (var t in _pendingScratchFrees) Free(t);
-        _pendingScratchFrees.Clear();
+        if (_pendingScratchFrees.Count > 0)
+        {
+            foreach (var t in _pendingScratchFrees) Free(t);
+            _pendingScratchFrees.Clear();
+        }
+        if (_pendingPipelineFrees.Count > 0)
+        {
+            foreach (var p in _pendingPipelineFrees) p.Dispose();
+            _pendingPipelineFrees.Clear();
+        }
+    }
+
+    /// <summary>Dispose an int8 pipeline stranded by a mid-recording fallback. Defers the actual
+    /// Dispose until after the next submit (GPU idle) if a recorded dispatch could still reference
+    /// it (the quantize/matvec pipelines are shared across a recording session's matmuls).</summary>
+    private void DisposeInt8PipelineDeferred(ComputePipeline? p)
+    {
+        if (p is null) return;
+        if (_recording) _pendingPipelineFrees.Add(p);
+        else p.Dispose();
     }
 
     public void Download(Tensor src, Span<float> dst)
@@ -1143,6 +1163,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _matVecBatchedQ4KInt8Pipeline;
     private ComputePipeline? _quantizeQ8_1Pipeline;
     private ComputePipeline? _matVecBatchedQ6KPipeline;
+    private ComputePipeline? _matVecBatchedQ6KInt8Pipeline;
     private ComputePipeline? _matVecQ6KPipeline;
     private ComputePipeline? _matVecQ5KPipeline;
     private ComputePipeline? _matVecQ8_0Pipeline;
@@ -1555,8 +1576,60 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
                     $"Q6_K batched matvec requires cols ({cols}) to be a multiple of 256 (the Q6_K block size); " +
                     "the shader derives num_blocks = cols >> 8.", nameof(inputAll));
 
-            _matVecBatchedQ6KPipeline ??= new ComputePipeline(this, Shaders.MatVecBatchedQ6K, 3, pushConstantSize: sizeof(MatVecBatchedParams));
             var pq6 = new MatVecBatchedParams { rows = (uint)rows, cols = (uint)cols, nTok = (uint)nTok };
+
+            // DP4A int8-activation path (issue #308 P2): the Q6_K sibling of the Q4_K int8 path.
+            // Q4_K_M models keep ffn_down + token_embd/output as Q6_K, so without this the spec-decode
+            // trunk left ~⅓ of its matmuls on the slow FP MatVecBatchedQ6K (no weight amortization).
+            // Quantize the FP32 inputs to the SAME Q8_1 buffer as Q4_K (Q6_K reuses the identical int8
+            // activations — no new quant), then one dotPacked4x8AccSatEXT per weight word. LOSSY but
+            // argmax-stable; capability-gated with a try/catch fallback to the FP shader (mirrors Q4_K).
+            if (HasShaderIntegerDotProduct)
+            {
+                try
+                {
+                    _quantizeQ8_1Pipeline ??= new ComputePipeline(this, Shaders.QuantizeQ8_1, 2, pushConstantSize: sizeof(MatVecBatchedParams));
+                    _matVecBatchedQ6KInt8Pipeline ??= new ComputePipeline(this, Shaders.MatVecBatchedQ6KInt8, 3, pushConstantSize: sizeof(MatVecBatchedParams));
+
+                    EnsureQ81BatchBuf(nTok, cols);
+                    var q81q6 = GetBuffer(_q81BatchBuf!);
+
+                    // Same WAR/RAW bracketing as the Q4_K int8 path: the Q8_1 scratch is shared across
+                    // all MatMulBatched calls in a recording session, so the quantize must wait for any
+                    // prior matvec read (recording mode) and the matvec must see this quantize's writes.
+                    if (_recording) RecordBarrier();
+                    uint subBlocksQ6 = (uint)nTok * ((uint)cols >> 5);
+                    uint qGroupsQ6 = (subBlocksQ6 + 7u) / 8u;
+                    DispatchOrRecord(_quantizeQ8_1Pipeline, [GetBuffer(inputAll), q81q6], qGroupsQ6, &pq6);
+
+                    if (_recording) RecordBarrier();
+                    DispatchOrRecord(_matVecBatchedQ6KInt8Pipeline,
+                        [GetBuffer(matrix), q81q6, GetBuffer(outputAll)], ((uint)rows + 7) / 8, &pq6);
+                    return;
+                }
+                catch (Exception)
+                {
+                    HasShaderIntegerDotProduct = false;
+                    // Defer pipeline disposal (see the Q4_K catch): the shared _quantizeQ8_1Pipeline
+                    // may be referenced by a prior recorded dispatch — disposing now would UAF.
+                    DisposeInt8PipelineDeferred(_quantizeQ8_1Pipeline);
+                    _quantizeQ8_1Pipeline = null;
+                    DisposeInt8PipelineDeferred(_matVecBatchedQ6KInt8Pipeline);
+                    _matVecBatchedQ6KInt8Pipeline = null;
+                    // The int8 path is now permanently disabled — release its scratch (same UAF guard
+                    // as the grow path: defer the free if a recorded dispatch could still reference it).
+                    if (_q81BatchBuf is not null)
+                    {
+                        if (_recording) _pendingScratchFrees.Add(_q81BatchBuf);
+                        else Free(_q81BatchBuf);
+                        _q81BatchBuf = null;
+                        _q81BatchBufBytes = 0;
+                    }
+                    // Fall through to the FP fallback below.
+                }
+            }
+
+            _matVecBatchedQ6KPipeline ??= new ComputePipeline(this, Shaders.MatVecBatchedQ6K, 3, pushConstantSize: sizeof(MatVecBatchedParams));
             var bufsQ6 = (ReadOnlySpan<GpuBuffer>)[GetBuffer(matrix), GetBuffer(inputAll), GetBuffer(outputAll)];
             DispatchOrRecord(_matVecBatchedQ6KPipeline, bufsQ6, ((uint)rows + 7) / 8, &pq6);
             return;
@@ -1630,9 +1703,12 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             catch (Exception)
             {
                 HasShaderIntegerDotProduct = false;
-                _quantizeQ8_1Pipeline?.Dispose();
+                // Defer pipeline disposal: a prior int8 matmul in this recording session may have
+                // recorded a dispatch referencing the SHARED _quantizeQ8_1Pipeline (or this dtype's
+                // matvec pipeline) — disposing mid-recording would UAF on submit.
+                DisposeInt8PipelineDeferred(_quantizeQ8_1Pipeline);
                 _quantizeQ8_1Pipeline = null;
-                _matVecBatchedQ4KInt8Pipeline?.Dispose();
+                DisposeInt8PipelineDeferred(_matVecBatchedQ4KInt8Pipeline);
                 _matVecBatchedQ4KInt8Pipeline = null;
                 // The int8 path is now permanently disabled — release its scratch (a prior
                 // successful call may have allocated it). Defer the free if a recorded-but-
@@ -2549,6 +2625,11 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
 
         _vkd.vkDeviceWaitIdle();
 
+        // Dispose int8 pipelines deferred by a mid-recording fallback (their fields were nulled,
+        // so the per-field disposals below won't cover them). GPU is now idle.
+        foreach (var p in _pendingPipelineFrees) p.Dispose();
+        _pendingPipelineFrees.Clear();
+
         // Dispose compute pipelines
         _rmsNormPipeline?.Dispose();
         _rmsNormBatchedPipeline?.Dispose();
@@ -2576,6 +2657,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _matVecBatchedQ4KInt8Pipeline?.Dispose();
         _quantizeQ8_1Pipeline?.Dispose();
         _matVecBatchedQ6KPipeline?.Dispose();
+        _matVecBatchedQ6KInt8Pipeline?.Dispose();
         _matVecQ6KPipeline?.Dispose();
         _matVecQ5KPipeline?.Dispose();
         _matVecQ8_0Pipeline?.Dispose();
