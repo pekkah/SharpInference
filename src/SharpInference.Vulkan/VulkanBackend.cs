@@ -1401,11 +1401,20 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         int rows = (int)(outputAll.ElementCount / nTok);
         int cols = (int)(inputAll.ElementCount / nTok);
 
+        if (weightDType == DType.Q4_K && cols % 256 != 0)
+            throw new ArgumentException(
+                $"Q4_K batched matvec requires cols ({cols}) to be a multiple of 256 (the Q4_K block size); " +
+                "the shader derives num_blocks = cols >> 8.", nameof(inputAll));
+
         if (weightDType != DType.Q4_K)
         {
             // Fallback: K independent single-row matvecs over the [nTok][·] slices. Correct for
             // all dtypes but with NO weight amortization (later PRs add batched shaders). Tensor
             // has no offset sub-view, so each slice is staged through a per-token temp F32 tensor.
+            // NOTE: the shared tmpIn/tmpOut are reused across k, so this is only hazard-free on the
+            // immediate (fence-serialized) dispatch path. When BatchVerify wires the batched trunk
+            // (a recording session), non-Q4_K callers must add per-iteration barriers or use the
+            // Q4_K batched shader — addressed in the wiring PR (#308 PR1c).
             const int f32Bytes = 4;
             var tmpIn = Allocate(TensorShape.D1(cols));
             var tmpOut = Allocate(TensorShape.D1(rows));
