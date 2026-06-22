@@ -582,6 +582,75 @@ public sealed unsafe class VulkanShaderTests
         }
     }
 
+    // Batched (weight-stationary) Q6_K matvec parity (issue #308). Q4_K_M models keep ffn_down
+    // and token_embd/output as Q6_K, so the batched trunk needs Q6_K batched too. Same invariant
+    // as the Q4_K test: the batched shader reads each Q6_K weight from VRAM ONCE and multiplies
+    // it into nTok accumulators; element order + per-element dequant + subgroupAdd reduction are
+    // identical to single-row MatVecQ6K, so each token's output must be BIT-EXACT to a separate
+    // single-row MatMul call against the same weight matrix and that token's input vector.
+    [Theory]
+    [InlineData(1)]   // degenerate single-token
+    [InlineData(4)]
+    [InlineData(6)]
+    [InlineData(8)]   // MAX_NTOK / acc[8] upper bound
+    public void MatVecBatchedQ6KMatchesSingleRow(int nTok)
+    {
+        Vulkan.VulkanBackend backend;
+        try { backend = new Vulkan.VulkanBackend(); }
+        catch { return; } // no Vulkan device on this host — skip
+
+        using (backend)
+        {
+            const int matRows = 64;
+            const int matCols = 512;  // 2 Q6_K blocks of 256
+            var weightBytes = BuildQ6_K(matRows, matCols, seed: 4242);
+
+            // Upload raw Q6_K bytes reinterpreted as floats (round up to 4 bytes).
+            int floatCount = (weightBytes.Length + 3) / 4;
+            var rawAsFloats = new float[floatCount];
+            weightBytes.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsBytes(rawAsFloats.AsSpan()));
+            var gpuWeights = backend.Upload(rawAsFloats, TensorShape.D1(floatCount));
+
+            // K random input vectors laid out row-major [nTok][cols].
+            var inputAll = new float[nTok * matCols];
+            var rng = new Random(7 + nTok);
+            for (int i = 0; i < inputAll.Length; i++) inputAll[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            var gpuInputAll = backend.Upload(inputAll, TensorShape.D1(nTok * matCols));
+            var gpuOutputAll = backend.Allocate(TensorShape.D1(nTok * matRows));
+
+            backend.MatMulBatched(gpuOutputAll, gpuWeights, gpuInputAll, nTok, DType.Q6_K);
+
+            var batchedOut = new float[nTok * matRows];
+            backend.Download(gpuOutputAll, batchedOut);
+
+            // Reference: nTok separate single-row MatMul calls against the SAME weight matrix.
+            var gpuOutputK = backend.Allocate(TensorShape.D1(matRows));
+            var singleOut = new float[matRows];
+            for (int k = 0; k < nTok; k++)
+            {
+                var gpuInputK = backend.Upload(inputAll.AsSpan(k * matCols, matCols), TensorShape.D1(matCols));
+                backend.MatMul(gpuOutputK, gpuWeights, gpuInputK, DType.Q6_K);
+                backend.Download(gpuOutputK, singleOut);
+                backend.Free(gpuInputK);
+
+                for (int r = 0; r < matRows; r++)
+                {
+                    float b = batchedOut[k * matRows + r];
+                    float s = singleOut[r];
+                    // Bit-exact: same dequant + identical accumulation order per (row, token).
+                    Assert.True(b == s,
+                        $"nTok={nTok} k={k} row={r}: batched={b:R} single={s:R} (diff={MathF.Abs(b - s):E2})");
+                }
+            }
+
+            backend.Free(gpuWeights);
+            backend.Free(gpuInputAll);
+            backend.Free(gpuOutputAll);
+            backend.Free(gpuOutputK);
+        }
+    }
+
     private static void AssertVulkanMatVecMatchesCpu(
         byte[] weightBytes, int matRows, int matCols, DType dtype, int inputSeed)
     {
