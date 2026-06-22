@@ -335,6 +335,147 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Gated-DeltaNet depthwise causal conv1d for a single decode token. One thread per
+    /// channel. State layout <c>[(kernel-1), channels]</c> row-major, oldest first; updated
+    /// in place. Weight layout <c>[kernel, channels]</c>.
+    ///   output[c] = weight[K-1,c]*x[c] + Σ_{k=0..K-2} weight[k,c]*state[k,c]
+    ///   shift state: state[0..K-3] = state[1..K-2]; state[K-2] = x[c]
+    /// Mirrors CUDA llm_gdn_conv1d_decode / CPU GdnKernels.CausalDepthwiseConv1dDecode.
+    /// Push constants: { uint channels, uint kernel_size }.
+    /// Bindings: 0=x (in), 1=state (in/out), 2=weight (in), 3=output (out).
+    /// Dispatch: ceil(channels / 256) workgroups of 256 threads.
+    /// </summary>
+    internal const string GdnConv1dDecode = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly  buffer X     { float x_data[]; };
+        layout(binding = 1)           buffer State { float state_data[]; };
+        layout(binding = 2) readonly  buffer W     { float w_data[]; };
+        layout(binding = 3) writeonly buffer O     { float o_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint channels;
+            uint kernel_size;
+        };
+
+        void main() {
+            uint c = gl_GlobalInvocationID.x;
+            if (c >= channels) return;
+
+            uint retained = kernel_size - 1u;
+
+            // Read old state values into registers (kernel_size <= 4 in our models).
+            float s_old[4];
+            for (uint k = 0u; k < retained; k++)
+                s_old[k] = state_data[k * channels + c];
+
+            float x_c = x_data[c];
+            float sum = w_data[retained * channels + c] * x_c;
+            for (uint k = 0u; k < retained; k++)
+                sum += w_data[k * channels + c] * s_old[k];
+            o_data[c] = sum;
+
+            // Shift state forward in time (drop oldest, append x).
+            for (uint k = 0u; k + 1u < retained; k++)
+                state_data[k * channels + c] = s_old[k + 1u];
+            if (retained >= 1u)
+                state_data[(retained - 1u) * channels + c] = x_c;
+        }
+        """;
+
+    /// <summary>
+    /// Gated-DeltaNet L2 normalization per head (no learned weights). One workgroup per head,
+    /// 256-thread tree reduction. Matches GdnKernels.L2NormPerHead / CUDA llm_gdn_l2_norm_per_head:
+    ///   scale = 1 / max(sqrt(Σ x²), eps).
+    /// This differs from <see cref="HeadNormPure"/> which divides by sqrt(mean + eps). Operates on
+    /// the sub-region of the bound buffer starting at <c>offset</c> float elements.
+    /// Push constants: { uint head_dim, uint num_heads, float eps, uint offset }.
+    /// Bindings: 0=data (in/out).
+    /// Dispatch: num_heads workgroups of 256 threads.
+    /// </summary>
+    internal const string GdnL2NormPerHead = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) buffer Data { float data_buf[]; };
+
+        layout(push_constant) uniform Params {
+            uint head_dim;
+            uint num_heads;
+            float eps;
+            uint offset;
+        };
+
+        shared float sdata[256];
+
+        void main() {
+            uint tid = gl_LocalInvocationID.x;
+            uint head = gl_WorkGroupID.x;
+            if (head >= num_heads) return;
+
+            uint base_off = offset + head * head_dim;
+
+            float sum = 0.0;
+            for (uint i = tid; i < head_dim; i += 256u) {
+                float v = data_buf[base_off + i];
+                sum += v * v;
+            }
+            sdata[tid] = sum;
+            barrier();
+
+            [[unroll]] for (uint s = 128u; s > 0u; s >>= 1) {
+                if (tid < s) sdata[tid] += sdata[tid + s];
+                barrier();
+            }
+
+            float norm = sqrt(sdata[0]);
+            float divisor = norm > eps ? norm : eps;
+            float inv = 1.0 / divisor;
+            for (uint i = tid; i < head_dim; i += 256u) {
+                data_buf[base_off + i] = data_buf[base_off + i] * inv;
+            }
+        }
+        """;
+
+    /// <summary>
+    /// Gated-DeltaNet tile-heads (GQA-style broadcast). One thread per dst element.
+    ///   dst[h_dst, j] = src[h_dst % src_heads, j] for h_dst in [0, src_heads*repeat).
+    /// Matches GdnKernels.TileHeads / CUDA llm_gdn_tile_heads (tile, NOT torch repeat_interleave).
+    /// <c>src_offset</c>/<c>dst_offset</c> are float-element offsets into the bound buffers.
+    /// Push constants: { uint src_heads, uint repeat, uint head_dim, uint src_offset, uint dst_offset }.
+    /// Bindings: 0=src (in), 1=dst (out).
+    /// Dispatch: ceil(src_heads*repeat*head_dim / 256) workgroups of 256 threads.
+    /// </summary>
+    internal const string GdnTileHeads = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly  buffer Src { float src_data[]; };
+        layout(binding = 1) writeonly buffer Dst { float dst_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint src_heads;
+            uint repeat;
+            uint head_dim;
+            uint src_offset;
+            uint dst_offset;
+        };
+
+        void main() {
+            uint idx = gl_GlobalInvocationID.x;
+            uint total = src_heads * repeat * head_dim;
+            if (idx >= total) return;
+            uint j = idx % head_dim;
+            uint h_dst = idx / head_dim;
+            uint h_src = h_dst % src_heads;
+            dst_data[dst_offset + idx] = src_data[src_offset + h_src * head_dim + j];
+        }
+        """;
+
+    /// <summary>
     /// Per-head RMSNorm: applies RMSNorm independently to each head-sized chunk.
     /// data[h*head_dim + i] = data[h*head_dim + i] / rms_h * weight[i]
     /// where rms_h = sqrt(mean(data[h*head_dim .. (h+1)*head_dim]^2) + eps).

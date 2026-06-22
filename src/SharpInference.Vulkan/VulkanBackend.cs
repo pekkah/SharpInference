@@ -1201,6 +1201,11 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _dequantQ5KMPipeline;
     private ComputePipeline? _dequantQ4KMPipeline;
 
+    // Gated-DeltaNet (GDN) pipelines (issue #356; qwen35moe/qwen36 hybrid)
+    private ComputePipeline? _gdnConv1dDecodePipeline;
+    private ComputePipeline? _gdnL2NormPerHeadPipeline;
+    private ComputePipeline? _gdnTileHeadsPipeline;
+
     // Image ops pipelines (IImageOpsBackend)
     private ComputePipeline? _conv2dPipeline;
     private ComputePipeline? _leakyReluPipeline;
@@ -1234,6 +1239,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private struct BufCopyParams { public uint count; public uint srcOffset; public uint dstOffset; }
     private struct SgemmParams { public uint M; public uint N; public uint K; }
     private struct DequantParams { public uint numBlocks; }
+    private struct GdnConv1dParams { public uint channels; public uint kernelSize; }
+    private struct GdnL2NormParams { public uint headDim; public uint numHeads; public float eps; public uint offset; }
+    private struct GdnTileHeadsParams { public uint srcHeads; public uint repeat; public uint headDim; public uint srcOffset; public uint dstOffset; }
 
     // Image ops push constant structs
     private struct Conv2dParams   { public uint inCh; public uint outCh; public uint height; public uint width; public uint ksize; public uint padding; }
@@ -1328,6 +1336,67 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _headNormPurePipeline ??= new ComputePipeline(this, Shaders.HeadNormPure, 1, pushConstantSize: sizeof(HeadNormParams));
         var p = new HeadNormParams { headDim = headDim, numHeads = numHeads, eps = eps };
         DispatchOrRecord(_headNormPurePipeline, [GetBuffer(data)], numHeads, &p);
+    }
+
+    /// <summary>
+    /// GDN depthwise causal conv1d for a single decode token. State layout
+    /// <c>[(kernel-1), channels]</c> row-major, oldest first; updated in place. Weight
+    /// layout <c>[kernel, channels]</c>. Mirrors CUDA <c>CudaBackend.GdnConv1dDecode</c>
+    /// / CPU <c>GdnKernels.CausalDepthwiseConv1dDecode</c>.
+    /// </summary>
+    public void GdnConv1dDecode(Tensor x, Tensor state, Tensor weight, Tensor output,
+                                int channels, int kernelSize)
+    {
+        _gdnConv1dDecodePipeline ??= new ComputePipeline(this, Shaders.GdnConv1dDecode, 4, pushConstantSize: sizeof(GdnConv1dParams));
+        var p = new GdnConv1dParams { channels = (uint)channels, kernelSize = (uint)kernelSize };
+        DispatchOrRecord(_gdnConv1dDecodePipeline,
+            [GetBuffer(x), GetBuffer(state), GetBuffer(weight), GetBuffer(output)],
+            (uint)(((long)channels + 255) / 256), &p);
+    }
+
+    /// <summary>
+    /// L2 normalize each <paramref name="headDim"/>-sized slice independently (no learned
+    /// weights). Matches <c>GdnKernels.L2NormPerHead</c>: <c>scale = 1 / max(sqrt(Σ x²), eps)</c>.
+    /// Operates on the sub-region of <paramref name="data"/> starting at
+    /// <paramref name="elementOffset"/> for <paramref name="numHeads"/> × <paramref name="headDim"/>
+    /// floats. Mirrors CUDA <c>CudaBackend.GdnL2NormPerHead</c> (which uses pointer arithmetic;
+    /// here the whole buffer is bound and the offset is a push constant).
+    /// </summary>
+    public void GdnL2NormPerHead(Tensor data, long elementOffset, int numHeads, int headDim, float eps = 1e-6f)
+    {
+        _gdnL2NormPerHeadPipeline ??= new ComputePipeline(this, Shaders.GdnL2NormPerHead, 1, pushConstantSize: sizeof(GdnL2NormParams));
+        var p = new GdnL2NormParams
+        {
+            headDim = (uint)headDim,
+            numHeads = (uint)numHeads,
+            eps = eps,
+            offset = (uint)elementOffset,
+        };
+        DispatchOrRecord(_gdnL2NormPerHeadPipeline, [GetBuffer(data)], (uint)numHeads, &p);
+    }
+
+    /// <summary>
+    /// Tile pattern: <c>dst[h_dst, j] = src[h_dst % srcHeads, j]</c> for
+    /// <c>h_dst ∈ [0, srcHeads·repeat)</c>. Matches <c>GdnKernels.TileHeads</c> (GQA-style
+    /// broadcast, NOT torch repeat_interleave). <paramref name="srcOffset"/> and
+    /// <paramref name="dstOffset"/> are FP32 element offsets passed as push constants.
+    /// Mirrors CUDA <c>CudaBackend.GdnTileHeads</c>.
+    /// </summary>
+    public void GdnTileHeads(Tensor src, long srcOffset, Tensor dst, long dstOffset,
+                             int srcHeads, int repeat, int headDim)
+    {
+        _gdnTileHeadsPipeline ??= new ComputePipeline(this, Shaders.GdnTileHeads, 2, pushConstantSize: sizeof(GdnTileHeadsParams));
+        var p = new GdnTileHeadsParams
+        {
+            srcHeads = (uint)srcHeads,
+            repeat = (uint)repeat,
+            headDim = (uint)headDim,
+            srcOffset = (uint)srcOffset,
+            dstOffset = (uint)dstOffset,
+        };
+        long total = (long)srcHeads * repeat * headDim;
+        DispatchOrRecord(_gdnTileHeadsPipeline, [GetBuffer(src), GetBuffer(dst)],
+            (uint)((total + 255) / 256), &p);
     }
 
     public void SiLU(Tensor x)
@@ -2694,6 +2763,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _sgemmFp8Pipeline?.Dispose();
         _dequantQ5KMPipeline?.Dispose();
         _dequantQ4KMPipeline?.Dispose();
+        _gdnConv1dDecodePipeline?.Dispose();
+        _gdnL2NormPerHeadPipeline?.Dispose();
+        _gdnTileHeadsPipeline?.Dispose();
         _conv2dPipeline?.Dispose();
         _leakyReluPipeline?.Dispose();
         _clampPipeline?.Dispose();
