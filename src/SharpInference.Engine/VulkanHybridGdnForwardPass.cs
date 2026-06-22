@@ -220,7 +220,56 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
     // against VramBytes − this estimate − a safety margin (mirrors CUDA's EstimateUploadedVram).
     private long _uploadedVramBytes;
 
+    // ── Batched prefill (issue #356 PR5b) ───────────────────────────────
+    // One dispatch per trunk stage over a chunk of tokens, amortizing weight reads + removing
+    // per-token launch overhead. Gated by SHARPI_VULKAN_BATCHED_PREFILL (default ON; =0 forces
+    // the sequential per-token Forward loop). Byte-identical to the sequential path by
+    // composition (each batched op == N sequential single-token ops; verified per-op in PR5a/#308).
+    // MatMulBatched caps nTok at 8, so the batched path processes the admissible N in sub-chunks
+    // of at most MaxBatchChunk tokens; each sub-chunk advances the device state by its size.
+    private const int MaxBatchChunk = 8;
+    private readonly bool _batchedPrefillEnabled;
+    private int _btCap;   // currently-allocated batched-scratch capacity (tokens); 0 = unallocated.
+
+    // Batched trunk residual / norm (all [_btCap × embDim]). The GDN/attn blocks write the block
+    // output directly into _gpuBtHidden (mirroring the scalar blocks, which write _gpuHidden).
+    private Tensor? _gpuBtHidden;
+    private Tensor? _gpuBtResidual;
+    private Tensor? _gpuBtNorm;
+    // Batched GDN scratch.
+    private Tensor? _gpuBtQkv;       // [_btCap × convChannels]
+    private Tensor? _gpuBtQkvConv;   // [_btCap × convChannels]
+    private Tensor? _gpuBtZ;         // [_btCap × valueDim]
+    private Tensor? _gpuBtQHead;     // [_btCap × valueDim]
+    private Tensor? _gpuBtKHead;     // [_btCap × valueDim]
+    private Tensor? _gpuBtAlpha;     // [_btCap × numVHeads]
+    private Tensor? _gpuBtBeta;      // [_btCap × numVHeads]
+    private Tensor? _gpuBtGdnOut;    // [_btCap × valueDim]
+    // Batched attention scratch.
+    private Tensor? _gpuBtQGate;     // [_btCap × qDim*2]
+    private Tensor? _gpuBtQ;         // [_btCap × qDim]
+    private Tensor? _gpuBtGate;      // [_btCap × qDim]
+    private Tensor? _gpuBtK;         // [_btCap × kvDim]
+    private Tensor? _gpuBtV;         // [_btCap × kvDim]
+    private Tensor? _gpuBtAttnOut;   // [_btCap × qDim]
+
     private bool _disposed;
+
+    // Pessimistic fault latch (mirror CudaHybridGdnForwardPass._faulted): the batched prefill
+    // mutates the GDN recurrent state + advances the host length counters non-transactionally,
+    // so a mid-chunk failure (Vulkan device-lost / OOM) leaves the state corrupted. Latch true
+    // for the whole batched region, clear only on consistent completion; ThrowIfFaulted() then
+    // blocks any retry on the poisoned state (discard the instance + reload the model).
+    private bool _faulted;
+
+    private void ThrowIfFaulted()
+    {
+        if (_faulted)
+            throw new InvalidOperationException(
+                "VulkanHybridGdnForwardPass: a prior batched prefill faulted mid-chunk, leaving the " +
+                "GDN recurrent state corrupted. This instance can no longer produce correct output — " +
+                "discard it and reload the model.");
+    }
 
     public VulkanHybridGdnForwardPass(GgufModel model, VulkanBackend gpu, ModelHyperparams hp,
         LayerPlacement placement, int maxContextLength = 0)
@@ -560,6 +609,11 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         // Pre-fault the CPU-resident mmap FFN weight pages (issue #221). Mirrors the CUDA
         // pass + HybridForwardPass.cs:473.
         MmapPrefault.Run("VulkanHybridGdnForwardPass", BuildCpuPrefaultRegions());
+
+        // Batched prefill gate (issue #356 PR5b): default ON; SHARPI_VULKAN_BATCHED_PREFILL=0
+        // forces the byte-identical sequential per-token Prefill loop so regressions isolate.
+        _batchedPrefillEnabled =
+            Environment.GetEnvironmentVariable("SHARPI_VULKAN_BATCHED_PREFILL") != "0";
     }
 
     // ================================================================
@@ -580,10 +634,24 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
 
     public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0)
     {
+        ThrowIfFaulted();
         if (tokens is null || tokens.Count == 0)
             throw new ArgumentException("Token list is empty", nameof(tokens));
 
-        // No batched prefill on the Vulkan GDN pass (v1) — walk tokens sequentially.
+        // Batched prefill (issue #356 PR5b): one dispatch per trunk stage over a chunk of tokens.
+        // Admissible when: more than one token; the whole prefill stays within the AttentionBatched
+        // shared-scores range (startPos + N ≤ 4096); and both host caches are a clean append at
+        // startPos (device state advances chunk-by-chunk from there). Otherwise fall back to the
+        // byte-identical sequential per-token Forward loop. The gate kill-switch forces sequential.
+        if (_batchedPrefillEnabled
+            && tokens.Count > 1
+            && startPos + tokens.Count <= 4096
+            && _kvCache.Length == startPos
+            && _gdnStateCache.Length == startPos)
+        {
+            return PrefillBatched(tokens, startPos);
+        }
+
         ReadOnlySpan<float> logits = default;
         for (int i = 0; i < tokens.Count; i++)
             logits = Forward(tokens[i], startPos + i);
@@ -593,6 +661,7 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
     /// <summary>Forward one token through the hybrid Vulkan + CPU stack (mirror :3164-3301).</summary>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
+        ThrowIfFaulted();
         // 1. Embedding → _gpuHidden (own record/submit bracket so the per-layer trunk
         //    starts from a fresh session; EmbedToken writes then a barrier before reads).
         _gpu.BeginRecord();
@@ -659,6 +728,330 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         _gpu.ReadFromStaging(_logitsBuf);
 
         return _logitsBuf;
+    }
+
+    // ================================================================
+    //  Batched prefill (issue #356 PR5b) — one dispatch per trunk stage over a chunk of
+    //  tokens. Byte-identical to N sequential Forward calls: each batched op reproduces the
+    //  per-row computation of its single-token sibling (GdnRecurrenceScan ≡ N
+    //  GdnRecurrenceDecode, MatMulBatched ≡ N MatMul, AttentionBatched ≡ N Attention, …).
+    //  The GDN+attention TRUNK is batched (the win); the FFN runs per-row through the existing
+    //  scalar helpers (MoE/CPU-FFN batching is out of scope for PR5b). MatMulBatched caps nTok
+    //  at 8, so the admissible N is processed in sub-chunks of ≤ MaxBatchChunk tokens.
+    // ================================================================
+
+    private ReadOnlySpan<float> PrefillBatched(IReadOnlyList<int> tokens, int startPos)
+    {
+        EnsureBatchedScratch(MaxBatchChunk);
+        int total = tokens.Count;
+        int processed = 0;
+        // Pessimistic fault latch (mirror CudaHybridGdnForwardPass): the per-chunk GDN-state
+        // mutation + host length-counter advance is non-transactional, so poison the pass for the
+        // whole region and clear only after every chunk completed consistently. A throw mid-chunk
+        // (device-lost / OOM) leaves _faulted set, blocking any retry on corrupt recurrent state.
+        _faulted = true;
+        while (processed < total)
+        {
+            int n = Math.Min(MaxBatchChunk, total - processed);
+            int chunkStartPos = startPos + processed;
+            bool lastChunk = processed + n >= total;
+            PrefillChunk(tokens, processed, n, chunkStartPos, lastChunk);
+            processed += n;
+        }
+        _faulted = false;
+        return _logitsBuf;
+    }
+
+    /// <summary>Run one ≤8-token chunk through the batched trunk. On the final chunk, the last
+    /// token's final-norm + lm_head produces <see cref="_logitsBuf"/> (prefill returns last-token
+    /// logits). Advances both host caches by <paramref name="n"/> on return.</summary>
+    private void PrefillChunk(IReadOnlyList<int> tokens, int baseIdx, int n, int chunkStartPos, bool lastChunk)
+    {
+        int embDim = _embDim;
+        // n-sized aliases: AddInPlace dispatches over dst.ElementCount, so the residual buffers
+        // must report exactly n×embDim (not the MaxBatchChunk cap) to avoid touching stale rows.
+        // RmsNormBatched takes an explicit n; CopyGpuBuffer copies the whole buffer (size-based),
+        // both harmless on the cap-sized buffers — but aliasing keeps the extent honest throughout.
+        Tensor hidden   = Alias(_gpuBtHidden!,   n, embDim);
+        Tensor residual = Alias(_gpuBtResidual!, n, embDim);
+        Tensor norm     = Alias(_gpuBtNorm!,     n, embDim);
+
+        // Reserve KV pages covering this chunk's positions (one per token, like the scalar
+        // Forward's per-token ReserveBlock), then open the trunk session and embed all N tokens.
+        for (int i = 0; i < n; i++)
+            _kvCache.ReserveBlockAt(chunkStartPos + i);
+
+        long rowBytes = (long)embDim * sizeof(float);
+        _gpu.BeginRecord();
+        for (int i = 0; i < n; i++)
+        {
+            // VulkanBackend has no offset sub-view, so embed into the scalar _gpuHidden (offset 0)
+            // then copy that row into row i of the batched hidden buffer. The embed shaders are
+            // deterministic regardless of destination buffer, so this is byte-identical to a direct
+            // per-row embed. A barrier separates the embed write from the copy read each iteration.
+            EmbedToken(_gpuHidden, tokens[baseIdx + i]);
+            _gpu.RecordBarrier();
+            CopyGpuBufferRegion(hidden, (long)i * rowBytes, _gpuHidden, 0, rowBytes);
+            _gpu.RecordBarrier();
+        }
+
+        for (int layer = 0; layer < _hp.NumLayers; layer++)
+        {
+            // Pre-block residual + norm over all N rows.
+            CopyGpuBuffer(residual, hidden);
+            _gpu.RecordBarrier();
+            _gpu.RmsNormBatched(norm, hidden, _gpuAttnNorm[layer], embDim, n, _hp.RmsNormEps);
+            _gpu.RecordBarrier();
+
+            if (_hp.LayerTypes![layer] == LayerType.Attention)
+                GpuAttnBlockBatched(layer, n, chunkStartPos);
+            else
+                GpuGdnBlockBatched(layer, n);
+
+            // Block residual add (block wrote `hidden`).
+            _gpu.RecordBarrier();
+            _gpu.AddInPlace(hidden, residual);
+            _gpu.RecordBarrier();
+
+            // Pre-FFN residual + norm over all N rows.
+            CopyGpuBuffer(residual, hidden);
+            _gpu.RecordBarrier();
+            _gpu.RmsNormBatched(norm, hidden, _gpuPostAttnNorm[layer], embDim, n, _hp.RmsNormEps);
+            _gpu.RecordBarrier();
+
+            // FFN per-row through the existing scalar helpers (byte-identical to sequential).
+            FfnDispatchBatched(layer, n);
+
+            // FFN residual add.
+            _gpu.RecordBarrier();
+            _gpu.AddInPlace(hidden, residual);
+            _gpu.RecordBarrier();
+        }
+
+        // Advance the host caches by N (device state advanced over the chunk inside the scan/conv
+        // + KV-append). The session is still recording here.
+        for (int i = 0; i < n; i++) { _kvCache.IncrementPosition(); _gdnStateCache.IncrementPosition(); }
+
+        if (!lastChunk)
+        {
+            // Intermediate chunk: just submit the recorded trunk; no logits needed.
+            _gpu.EndRecordAndSubmit();
+            return;
+        }
+
+        // Final chunk: final norm + output projection on the LAST token's row only, then download.
+        // Copy the last row into the scalar _gpuHidden (no offset sub-view on Vulkan), then RmsNorm
+        // in place — exactly the scalar Forward's final-norm step.
+        CopyGpuBufferRegion(_gpuHidden, 0, hidden, (long)(n - 1) * embDim * sizeof(float), (long)embDim * sizeof(float));
+        _gpu.RecordBarrier();
+        _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuOutputNorm, _hp.RmsNormEps);
+        _gpu.RecordBarrier();
+        GpuMatMul(_gpuLogits, _gpuOutputWeight, _gpuHidden);
+        _gpu.RecordComputeToTransferBarrier();
+        _gpu.RecordDownloadToStaging(_gpuLogits, _logitsBuf.Length);
+        _gpu.EndRecordAndSubmit();
+        _gpu.ReadFromStaging(_logitsBuf);
+    }
+
+    /// <summary>Batched GDN block over N tokens — the op-for-op batched mirror of
+    /// <see cref="GpuGdnBlock"/> (which is the byte-exact reference). Writes the block output into
+    /// rows [0,N) of <see cref="_gpuBtHidden"/>.</summary>
+    private void GpuGdnBlockBatched(int layer, int n)
+    {
+        int convCh = _gdnConvChannels, valDim = _gdnValueDim, nVH = _gdnNumVHeads;
+        int kDim = _gdnKeyDim, hd = _gdnHeadDim, embDim = _embDim;
+        // n-sized aliases so MatMulBatched (rows/cols = ElementCount/n) and SiLU (ElementCount
+        // dispatch bound) see the active chunk's extent, not the MaxBatchChunk cap.
+        Tensor hidden = Alias(_gpuBtHidden!, n, embDim), norm = Alias(_gpuBtNorm!, n, embDim);
+        Tensor qkvAll = Alias(_gpuBtQkv!, n, convCh), qkvConvAll = Alias(_gpuBtQkvConv!, n, convCh), zAll = Alias(_gpuBtZ!, n, valDim);
+        Tensor qHeadAll = Alias(_gpuBtQHead!, n, valDim), kHeadAll = Alias(_gpuBtKHead!, n, valDim);
+        Tensor alphaAll = Alias(_gpuBtAlpha!, n, nVH), betaAll = Alias(_gpuBtBeta!, n, nVH), gdnOutAll = Alias(_gpuBtGdnOut!, n, valDim);
+        var scanState = _gpuGdnScanState[layer]!;
+        var convState = _gpuGdnConvState[layer]!;
+
+        // 1. Joint QKV + z (gate) + alpha/beta projections, batched.
+        GpuMatMulBatched(qkvAll,   _gpuWAttnQkv[layer],  norm, n);
+        GpuMatMulBatched(zAll,     _gpuWAttnGate[layer], norm, n);
+        GpuMatMulBatched(alphaAll, _gpuWSsmAlpha[layer], norm, n);
+        GpuMatMulBatched(betaAll,  _gpuWSsmBeta[layer],  norm, n);
+        _gpu.RecordBarrier();
+
+        // 2. Depthwise causal conv1d over all tokens (reads convState), then advance convState.
+        //    WAR barrier between the read (decode) and the write (state update).
+        _gpu.GdnConv1dDecodeBatched(qkvAll, convState, _gpuSsmConv1d[layer], qkvConvAll,
+            convCh, _gdnConvKernel, n);
+        _gpu.RecordBarrier();
+        _gpu.GdnConv1dStateUpdateBatched(qkvAll, convState, convCh, _gdnConvKernel, n);
+        _gpu.RecordBarrier();
+
+        // 3. SiLU over the whole [N × convCh].
+        _gpu.SiLU(qkvConvAll);
+        _gpu.RecordBarrier();
+
+        // 4. L2-norm the Q (offset 0) and K (offset kDim) regions per head per token.
+        _gpu.GdnL2NormPerHeadBatched(qkvConvAll, 0,    _gdnNumKHeads, hd, convCh, n, eps: 1e-6f);
+        _gpu.GdnL2NormPerHeadBatched(qkvConvAll, kDim, _gdnNumKHeads, hd, convCh, n, eps: 1e-6f);
+        _gpu.RecordBarrier();
+
+        // 5. Tile Q and K heads (GQA broadcast) into the [N × valueDim] head buffers.
+        _gpu.GdnTileHeadsBatched(qkvConvAll, 0,    qHeadAll, 0, _gdnNumKHeads, _gdnKvRepeat, hd, convCh, valDim, n);
+        _gpu.GdnTileHeadsBatched(qkvConvAll, kDim, kHeadAll, 0, _gdnNumKHeads, _gdnKvRepeat, hd, convCh, valDim, n);
+        _gpu.RecordBarrier();
+
+        // 6. Fused sequential recurrence scan over the chunk (byte-exact vs N GdnRecurrenceDecode).
+        //    v reads from the silu'd conv output's V region (vHeadOff = 2*kDim, stride convCh);
+        //    q/k from the tiled head buffers; alpha/beta from [N × nVH]; z from [N × valDim].
+        _gpu.GdnRecurrenceScan(
+            scanState, qHeadAll, kHeadAll, qkvConvAll,
+            alphaAll, betaAll, _gpuSsmA[layer], _gpuSsmDtBias[layer], _gpuSsmNormW[layer],
+            zAll, gdnOutAll,
+            nVH, hd, normEps: 1e-6f,
+            qStride: valDim, kStride: valDim, vStride: convCh, vHeadOff: 2 * kDim,
+            zStride: valDim, oStride: valDim, nTok: n);
+        _gpu.RecordBarrier();
+
+        // 7. Output projection: blockOut = WSsmOut @ gdnOutAll → _gpuBtHidden.
+        GpuMatMulBatched(hidden, _gpuWSsmOut[layer], gdnOutAll, n);
+    }
+
+    /// <summary>Batched attention block over N tokens — the op-for-op batched mirror of
+    /// <see cref="GpuAttnBlock"/>. Writes the block output into rows [0,N) of
+    /// <see cref="_gpuBtHidden"/>. Caller guarantees <c>chunkStartPos + N ≤ 4096</c>.</summary>
+    private void GpuAttnBlockBatched(int layer, int n, int chunkStartPos)
+    {
+        int kvDim = _numKvHeads * _headDim, qDim = _numHeads * _headDim, embDim = _embDim;
+        // n-sized aliases (see GpuGdnBlockBatched): MatMulBatched, SplitQGBatched's size check, and
+        // SigmoidMulInPlace's ElementCount dispatch all need the active chunk extent, not the cap.
+        Tensor hidden = Alias(_gpuBtHidden!, n, embDim), norm = Alias(_gpuBtNorm!, n, embDim);
+        Tensor qGateAll = Alias(_gpuBtQGate!, n, qDim * 2), qAll = Alias(_gpuBtQ!, n, qDim), gateAll = Alias(_gpuBtGate!, n, qDim);
+        Tensor kAll = Alias(_gpuBtK!, n, kvDim), vAll = Alias(_gpuBtV!, n, kvDim), attnOutAll = Alias(_gpuBtAttnOut!, n, qDim);
+
+        // 1. Batched Q‖G / K / V projections.
+        GpuMatMulBatched(qGateAll, _gpuWQGate[layer], norm, n);
+        GpuMatMulBatched(kAll,     _gpuWK[layer],     norm, n);
+        GpuMatMulBatched(vAll,     _gpuWV[layer],     norm, n);
+        _gpu.RecordBarrier();
+
+        // 2. De-interleave [Q‖G] → Q, G (arg order q, g, qg).
+        _gpu.SplitQGBatched(qAll, gateAll, qGateAll, _numHeads, _headDim, n);
+        _gpu.RecordBarrier();
+
+        // 3. Per-head Q/K RMSNorm BEFORE RoPE.
+        _gpu.HeadNormBatched(qAll, _gpuQNorm[layer], (uint)_numHeads,   (uint)_headDim, n, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+        _gpu.HeadNormBatched(kAll, _gpuKNorm[layer], (uint)_numKvHeads, (uint)_headDim, n, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+        _gpu.RecordBarrier();
+
+        // 4. Partial NEOX RoPE on the first ropeDim of each head; token i at position chunkStartPos+i.
+        _gpu.RoPEPartialBatched(qAll, chunkStartPos, _headDim, _ropeDim, _hp.RopeTheta, _numHeads,   n, neox: true);
+        _gpu.RoPEPartialBatched(kAll, chunkStartPos, _headDim, _ropeDim, _hp.RopeTheta, _numKvHeads, n, neox: true);
+        _gpu.RecordBarrier();
+
+        // 5. Batched KV-append (token i → slot chunkStartPos+i; fp32 KV).
+        _gpu.KvAppendBatched(kAll, vAll, _gpuKCache[layer]!, _gpuVCache[layer]!,
+            (uint)kvDim, (uint)chunkStartPos, n, (uint)_maxSeqLen);
+        _gpu.RecordBarrier();
+
+        // 6. Batched GQA SDPA: query i (pos chunkStartPos+i) attends causally over [0, chunkStartPos+i].
+        _gpu.AttentionBatched(qAll, _gpuKCache[layer]!, _gpuVCache[layer]!, attnOutAll,
+            (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim, (uint)chunkStartPos, n, (uint)_maxSeqLen);
+        _gpu.RecordBarrier();
+
+        // 7. Fused sigmoid GLU gate over the whole [N × qDim], then batched O projection.
+        _gpu.SigmoidMulInPlace(attnOutAll, gateAll);
+        _gpu.RecordBarrier();
+        GpuMatMulBatched(hidden, _gpuWO[layer], attnOutAll, n);
+    }
+
+    /// <summary>Per-row FFN dispatch for the batched trunk: copies each row of the batched
+    /// post-attn norm into the scalar <see cref="_gpuNormBuf"/>, runs the existing scalar FFN
+    /// helper (dense-GPU / dense-CPU / CPU-MoE / GPU-SLRU — which writes <see cref="_gpuHidden"/>
+    /// and manages its own session breaks), then copies <see cref="_gpuHidden"/> back into the
+    /// row of the batched hidden buffer. Byte-identical to sequential because each scalar FFN call
+    /// reproduces exactly the per-token FFN. On entry/return the session is recording.</summary>
+    private void FfnDispatchBatched(int layer, int n)
+    {
+        int embDim = _embDim;
+        Tensor hidden = _gpuBtHidden!, norm = _gpuBtNorm!;
+        long rowBytes = (long)embDim * sizeof(float);
+        for (int i = 0; i < n; i++)
+        {
+            // Row i of the batched post-attn norm → scalar norm buffer (compute-stage copy,
+            // covered by the surrounding RecordBarrier()s; same as CopyGpuBuffer).
+            CopyGpuBufferRegion(_gpuNormBuf, 0, norm, (long)i * rowBytes, rowBytes);
+            _gpu.RecordBarrier();
+
+            // Existing scalar FFN (reads _gpuNormBuf, writes _gpuHidden; may close/reopen session).
+            FfnDispatch(layer);
+
+            // _gpuHidden (row result) → row i of the batched hidden buffer.
+            _gpu.RecordBarrier();
+            CopyGpuBufferRegion(hidden, (long)i * rowBytes, _gpuHidden, 0, rowBytes);
+            _gpu.RecordBarrier();
+        }
+    }
+
+    /// <summary>Batched weight-stationary matvec over N rows (Q4_K/Q6_K amortize the weight read;
+    /// other dtypes fall back to N single-row matvecs inside <see cref="VulkanBackend.MatMulBatched"/>).
+    /// Byte-identical to N <see cref="GpuMatMul"/> calls. The dtype is the one recorded at upload.</summary>
+    private void GpuMatMulBatched(Tensor outputAll, Tensor matrix, Tensor inputAll, int n)
+    {
+        _gpu.MatMulBatched(outputAll, matrix, inputAll, n,
+            _gpuWeightDTypes.TryGetValue(matrix.Handle, out var dt) ? dt : DType.Float32);
+    }
+
+    /// <summary>
+    /// Lightweight aliasing view: a new <see cref="Tensor"/> sharing <paramref name="full"/>'s GPU
+    /// buffer handle but reporting only the first <paramref name="rows"/> tokens × <paramref name="dim"/>
+    /// elements. The batched-scratch buffers are sized for the fixed <see cref="MaxBatchChunk"/>; ops
+    /// that derive their extent from <c>ElementCount</c> (MatMulBatched rows/cols; SplitQGBatched's
+    /// size check; AddInPlace / SiLU dispatch bounds) must see the active chunk's <c>n</c>, not the
+    /// cap. A <see cref="Tensor"/> is just (shape, dtype, handle), so this is free and reads/writes
+    /// the same buffer from offset 0 — bit-identical to operating on a natively n-sized buffer.
+    /// </summary>
+    private static Tensor Alias(Tensor full, int rows, int dim) =>
+        new(TensorShape.D1((long)rows * dim), full.DType, full.Handle);
+
+    /// <summary>Allocate the batched-trunk scratch sized for <paramref name="cap"/> tokens (once;
+    /// cap is the fixed MaxBatchChunk so no resize churn). All buffers are [cap × dim] row-major.</summary>
+    private void EnsureBatchedScratch(int cap)
+    {
+        if (_btCap >= cap) return;
+        FreeBatchedScratch();
+        int embDim = _embDim, convCh = _gdnConvChannels, valDim = _gdnValueDim, nVH = _gdnNumVHeads;
+        int qDim = _numHeads * _headDim, kvDim = _numKvHeads * _headDim;
+
+        _gpuBtHidden   = _gpu.Allocate(TensorShape.D1((long)cap * embDim));
+        _gpuBtResidual = _gpu.Allocate(TensorShape.D1((long)cap * embDim));
+        _gpuBtNorm     = _gpu.Allocate(TensorShape.D1((long)cap * embDim));
+
+        _gpuBtQkv     = _gpu.Allocate(TensorShape.D1((long)cap * convCh));
+        _gpuBtQkvConv = _gpu.Allocate(TensorShape.D1((long)cap * convCh));
+        _gpuBtZ       = _gpu.Allocate(TensorShape.D1((long)cap * valDim));
+        _gpuBtQHead   = _gpu.Allocate(TensorShape.D1((long)cap * valDim));
+        _gpuBtKHead   = _gpu.Allocate(TensorShape.D1((long)cap * valDim));
+        _gpuBtAlpha   = _gpu.Allocate(TensorShape.D1((long)cap * nVH));
+        _gpuBtBeta    = _gpu.Allocate(TensorShape.D1((long)cap * nVH));
+        _gpuBtGdnOut  = _gpu.Allocate(TensorShape.D1((long)cap * valDim));
+
+        _gpuBtQGate   = _gpu.Allocate(TensorShape.D1((long)cap * qDim * 2));
+        _gpuBtQ       = _gpu.Allocate(TensorShape.D1((long)cap * qDim));
+        _gpuBtGate    = _gpu.Allocate(TensorShape.D1((long)cap * qDim));
+        _gpuBtK       = _gpu.Allocate(TensorShape.D1((long)cap * kvDim));
+        _gpuBtV       = _gpu.Allocate(TensorShape.D1((long)cap * kvDim));
+        _gpuBtAttnOut = _gpu.Allocate(TensorShape.D1((long)cap * qDim));
+
+        _btCap = cap;
+    }
+
+    private void FreeBatchedScratch()
+    {
+        if (_btCap == 0) return;
+        void F(ref Tensor? t) { if (t is { } v) { _gpu.Free(v); t = null; } }
+        F(ref _gpuBtHidden); F(ref _gpuBtResidual); F(ref _gpuBtNorm);
+        F(ref _gpuBtQkv); F(ref _gpuBtQkvConv); F(ref _gpuBtZ); F(ref _gpuBtQHead); F(ref _gpuBtKHead);
+        F(ref _gpuBtAlpha); F(ref _gpuBtBeta); F(ref _gpuBtGdnOut);
+        F(ref _gpuBtQGate); F(ref _gpuBtQ); F(ref _gpuBtGate); F(ref _gpuBtK); F(ref _gpuBtV); F(ref _gpuBtAttnOut);
+        _btCap = 0;
     }
 
     public void ResetCache()
@@ -1635,6 +2028,9 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
 
         if (_gpuFfnGateBufDense is { } gB) _gpu.Free(gB);
         if (_gpuFfnUpBufDense   is { } uB) _gpu.Free(uB);
+
+        // Batched-prefill scratch (issue #356 PR5b).
+        FreeBatchedScratch();
 
         // MoE GPU scratch.
         if (_gpuRouterLogits is { } rl) _gpu.Free(rl);

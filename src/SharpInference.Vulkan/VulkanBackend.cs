@@ -1216,6 +1216,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     // qwen35moe/qwen36 Gated-Attention support pipelines (issue #356)
     private ComputePipeline? _ropeNeoxPartialPipeline;
     private ComputePipeline? _splitQgPipeline;
+    // #356 PR5b: batched Gated-Attention support (batched prefill trunk).
+    private ComputePipeline? _ropeNeoxPartialBatchedPipeline;
+    private ComputePipeline? _splitQgBatchedPipeline;
     private ComputePipeline? _sigmoidMulInPlacePipeline;
 
     // Image ops pipelines (IImageOpsBackend)
@@ -1696,6 +1699,45 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     }
 
     /// <summary>
+    /// Batched partial NEOX RoPE over <paramref name="nTok"/> rows of the
+    /// <c>[nTok][numHeads*headDim]</c> buffer <paramref name="x"/>: token t (row
+    /// <c>gl_WorkGroupID.y</c>) rotates only the first <paramref name="ropeDim"/> of each head at
+    /// absolute position <paramref name="basePosition"/> + t (prefill assigns contiguous positions).
+    /// Bit-identical to <paramref name="nTok"/> sequential <see cref="RoPEPartial"/> calls at the
+    /// matching positions. The Vulkan mirror of CUDA's <c>RoPEPartialBatched</c>. Only NEOX
+    /// (matches CUDA + <see cref="RoPEPartial"/>).
+    /// </summary>
+    public void RoPEPartialBatched(Tensor x, int basePosition, int headDim, int ropeDim,
+        float ropeTheta, int numHeads, int nTok, bool neox)
+    {
+        if (!neox)
+            throw new ArgumentException("RoPEPartialBatched currently supports only neox=true.", nameof(neox));
+        if (headDim < 1)
+            throw new ArgumentOutOfRangeException(nameof(headDim), headDim, "headDim must be >= 1.");
+        if (numHeads < 1)
+            throw new ArgumentOutOfRangeException(nameof(numHeads), numHeads, "numHeads must be >= 1.");
+        if (nTok < 1)
+            throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be >= 1.");
+        if (ropeDim <= 0 || (ropeDim & 1) != 0)
+            throw new ArgumentException("ropeDim must be a positive even number.", nameof(ropeDim));
+        if (ropeDim > headDim)
+            throw new ArgumentException("ropeDim must be <= headDim.", nameof(ropeDim));
+
+        _ropeNeoxPartialBatchedPipeline ??= new ComputePipeline(this, Shaders.RoPENeoxPartialBatched, 1, pushConstantSize: sizeof(RoPEPartialParams));
+        long totalPairs = (long)numHeads * (ropeDim / 2);
+        var p = new RoPEPartialParams
+        {
+            numHeads = (uint)numHeads,
+            headDim = (uint)headDim,
+            ropeDim = (uint)ropeDim,
+            position = basePosition,   // shader adds the row (gl_WorkGroupID.y) token index
+            theta = ropeTheta,
+        };
+        DispatchOrRecord(_ropeNeoxPartialBatchedPipeline, [GetBuffer(x)],
+            (uint)((totalPairs + 255) / 256), &p, groupY: (uint)nTok);
+    }
+
+    /// <summary>
     /// Strided de-interleave of qwen35moe's Gated-Attention output. <paramref name="qg"/> is laid
     /// out per head as <c>[Q[headDim] ‖ G[headDim]]</c> (stride <c>2*headDim</c>); this splits it
     /// into contiguous <paramref name="q"/> <c>[numHeads*headDim]</c> and <paramref name="g"/>
@@ -1725,6 +1767,40 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         long total = (long)numHeads * headDim;
         DispatchOrRecord(_splitQgPipeline, [GetBuffer(qg), GetBuffer(q), GetBuffer(g)],
             (uint)((total + 255) / 256), &p);
+    }
+
+    /// <summary>
+    /// Batched strided de-interleave over <paramref name="nTok"/> rows: applies <see cref="SplitQG"/>
+    /// to each row of the <c>[nTok][numHeads*headDim*2]</c> input <paramref name="qg"/> in ONE
+    /// dispatch, writing the contiguous <c>[nTok][numHeads*headDim]</c> outputs <paramref name="q"/>
+    /// and <paramref name="g"/>. Token index t = <c>gl_WorkGroupID.y</c>. Bit-identical to
+    /// <paramref name="nTok"/> sequential <see cref="SplitQG"/> calls. The Vulkan mirror of CUDA's
+    /// <c>SplitQGBatched</c> (note arg order is q, g, qg; bind qg, q, g).
+    /// </summary>
+    public void SplitQGBatched(Tensor q, Tensor g, Tensor qg, int numHeads, int headDim, int nTok)
+    {
+        // Guard positivity first (same rationale as SplitQG): a negative dim could slip past the
+        // element-count checks and cast to a huge uint dispatch / OOB access.
+        if (numHeads < 1)
+            throw new ArgumentOutOfRangeException(nameof(numHeads), numHeads, "numHeads must be >= 1.");
+        if (headDim < 1)
+            throw new ArgumentOutOfRangeException(nameof(headDim), headDim, "headDim must be >= 1.");
+        if (nTok < 1)
+            throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be >= 1.");
+        long expected = (long)nTok * numHeads * headDim * 2;
+        if (qg.ElementCount != expected)
+            throw new ArgumentException(
+                $"SplitQGBatched: qg.ElementCount {qg.ElementCount} != nTok*numHeads*headDim*2 ({expected}).");
+        long perOut = (long)nTok * numHeads * headDim;
+        if (q.ElementCount != perOut || g.ElementCount != perOut)
+            throw new ArgumentException(
+                $"SplitQGBatched: q/g element counts must each equal nTok*numHeads*headDim ({perOut}); got q={q.ElementCount}, g={g.ElementCount}.");
+
+        _splitQgBatchedPipeline ??= new ComputePipeline(this, Shaders.SplitQGBatched, 3, pushConstantSize: sizeof(SplitQgParams));
+        var p = new SplitQgParams { numHeads = (uint)numHeads, headDim = (uint)headDim };
+        long total = (long)numHeads * headDim;
+        DispatchOrRecord(_splitQgBatchedPipeline, [GetBuffer(qg), GetBuffer(q), GetBuffer(g)],
+            (uint)((total + 255) / 256), &p, groupY: (uint)nTok);
     }
 
     /// <summary>
@@ -2054,26 +2130,45 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
             // Fallback: K independent single-row matvecs over the [nTok][·] slices. Correct for
             // all dtypes but with NO weight amortization (later PRs add batched shaders). Tensor
             // has no offset sub-view, so each slice is staged through a per-token temp F32 tensor.
-            // NOTE: the shared tmpIn/tmpOut are reused across k, so this is only hazard-free on the
-            // immediate (fence-serialized) dispatch path. When BatchVerify wires the batched trunk
-            // (a recording session), non-Q4_K callers must add per-iteration barriers or use the
-            // Q4_K batched shader — addressed in the wiring PR (#308 PR1c).
+            // The shared tmpIn/tmpOut are reused across k. On the immediate (fence-serialized)
+            // dispatch path each DispatchWith submits+waits, so the reuse is already hazard-free.
+            // In a RECORDING session (e.g. the #356 PR5b GDN batched-prefill trunk's F32 ssm_alpha /
+            // ssm_beta matvecs) the copy→matvec→copy chain and the cross-k reuse race unless we
+            // insert explicit compute→compute barriers: tmpIn write before the matvec read, tmpOut
+            // write before the output-copy read, and the output copy before the next k overwrites
+            // tmpIn. Guard them behind `_recording` so the immediate path is byte-unchanged.
             const int f32Bytes = 4;
             var tmpIn = Allocate(TensorShape.D1(cols));
             var tmpOut = Allocate(TensorShape.D1(rows));
+            bool recording = _recording;
             try
             {
                 for (int k = 0; k < nTok; k++)
                 {
                     RecordComputeCopyRegion(tmpIn, 0, inputAll, (long)k * cols * f32Bytes, (long)cols * f32Bytes);
+                    if (recording) RecordBarrier();
                     MatMul(tmpOut, matrix, tmpIn, weightDType);
+                    if (recording) RecordBarrier();
                     RecordComputeCopyRegion(outputAll, (long)k * rows * f32Bytes, tmpOut, 0, (long)rows * f32Bytes);
+                    if (recording) RecordBarrier();
                 }
             }
             finally
             {
-                Free(tmpIn);
-                Free(tmpOut);
+                // Immediate path: each DispatchWith already submitted+waited, so the temps are
+                // dead now — free directly. Recording path: the recorded copies/matvecs reference
+                // these temps and execute later at EndRecordAndSubmit; defer the free until after
+                // that submit drains _pendingScratchFrees (GPU idle), or it would be a UAF.
+                if (recording)
+                {
+                    _pendingScratchFrees.Add(tmpIn);
+                    _pendingScratchFrees.Add(tmpOut);
+                }
+                else
+                {
+                    Free(tmpIn);
+                    Free(tmpOut);
+                }
             }
             return;
         }
@@ -3119,6 +3214,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _gdnRecurrenceScanPipeline?.Dispose();
         _ropeNeoxPartialPipeline?.Dispose();
         _splitQgPipeline?.Dispose();
+        _ropeNeoxPartialBatchedPipeline?.Dispose();
+        _splitQgBatchedPipeline?.Dispose();
         _sigmoidMulInPlacePipeline?.Dispose();
         _conv2dPipeline?.Dispose();
         _leakyReluPipeline?.Dispose();
