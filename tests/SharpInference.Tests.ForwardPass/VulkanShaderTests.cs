@@ -2938,6 +2938,161 @@ public sealed unsafe class VulkanShaderTests
         backend.Free(gpuNormW); backend.Free(gpuZ); backend.Free(gpuOut);
     }
 
+    // ── qwen35moe/qwen36 Gated-Attention support shaders (issue #356) ──────────
+
+    [Fact]
+    public void SplitQGMatchesCpu()
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        const int numHeads = 16;
+        const int headDim = 256;
+        int interleavedLen = numHeads * headDim * 2;
+        int perOut = numHeads * headDim;
+
+        var rng = new Random(2024);
+        var qg = new float[interleavedLen];
+        for (int i = 0; i < interleavedLen; i++) qg[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var gpuQg = backend.Upload(qg, TensorShape.D1(interleavedLen));
+        var gpuQ = backend.Allocate(TensorShape.D1(perOut));
+        var gpuG = backend.Allocate(TensorShape.D1(perOut));
+        backend.SplitQG(gpuQ, gpuG, gpuQg, numHeads, headDim);
+
+        var gpuQOut = new float[perOut];
+        var gpuGOut = new float[perOut];
+        backend.Download(gpuQ, gpuQOut);
+        backend.Download(gpuG, gpuGOut);
+
+        // CPU de-interleave: per head, [Q[headDim] ‖ G[headDim]] → contiguous q, g.
+        for (int h = 0; h < numHeads; h++)
+        {
+            int srcBase = h * headDim * 2;
+            for (int j = 0; j < headDim; j++)
+            {
+                Assert.Equal(qg[srcBase + j], gpuQOut[h * headDim + j]);
+                Assert.Equal(qg[srcBase + headDim + j], gpuGOut[h * headDim + j]);
+            }
+        }
+
+        backend.Free(gpuQg); backend.Free(gpuQ); backend.Free(gpuG);
+    }
+
+    [Fact]
+    public void RoPEPartialMatchesCpu()
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        const int numHeads = 16;
+        const int headDim = 256;
+        const int ropeDim = 64;
+        const int position = 7;
+        const float theta = 1e7f;
+        int N = numHeads * headDim;
+
+        var rng = new Random(555);
+        var input = new float[N];
+        for (int i = 0; i < N; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // CPU partial-NEOX reference: rotate dims [0, ropeDim); pass [ropeDim, headDim) through.
+        // Frequency exponent uses ropeDim (NOT headDim) — matches CUDA llm_rope_neox_partial.
+        var expected = (float[])input.Clone();
+        int ropeHalf = ropeDim / 2;
+        for (int h = 0; h < numHeads; h++)
+        {
+            for (int i = 0; i < ropeHalf; i++)
+            {
+                float freq = 1f / MathF.Pow(theta, 2f * i / ropeDim);
+                float angle = position * freq;
+                float cos = MathF.Cos(angle);
+                float sin = MathF.Sin(angle);
+                int a = h * headDim + i;
+                int b = h * headDim + i + ropeHalf;
+                float x0 = expected[a], x1 = expected[b];
+                expected[a] = x0 * cos - x1 * sin;
+                expected[b] = x0 * sin + x1 * cos;
+            }
+        }
+
+        var gpuX = backend.Upload(input, TensorShape.D1(N));
+        backend.RoPEPartial(gpuX, position, headDim, ropeDim, theta, neox: true);
+        var result = new float[N];
+        backend.Download(gpuX, result);
+
+        for (int h = 0; h < numHeads; h++)
+        {
+            // Rotated dims [0, ropeDim): within tolerance.
+            for (int i = 0; i < ropeDim; i++)
+            {
+                int idx = h * headDim + i;
+                Assert.True(MathF.Abs(result[idx] - expected[idx]) < 1e-4f,
+                    $"RoPEPartial rotated mismatch at [{idx}]: gpu={result[idx]}, cpu={expected[idx]}");
+            }
+            // Pass-through dims [ropeDim, headDim): byte-unchanged from the original input.
+            for (int i = ropeDim; i < headDim; i++)
+            {
+                int idx = h * headDim + i;
+                Assert.Equal(input[idx], result[idx]);
+            }
+        }
+
+        backend.Free(gpuX);
+    }
+
+    [Fact]
+    public void RoPEPartialRejectsBadArgs()
+    {
+        using var backend = new Vulkan.VulkanBackend();
+        // Tiny buffer; every guard throws before any dispatch.
+        var gpuX = backend.Allocate(TensorShape.D1(256));
+        try
+        {
+            Assert.Throws<ArgumentException>(() =>
+                backend.RoPEPartial(gpuX, 0, 256, 64, 1e7f, neox: false));   // non-NEOX
+            Assert.Throws<ArgumentException>(() =>
+                backend.RoPEPartial(gpuX, 0, 256, 63, 1e7f, neox: true));     // odd ropeDim
+            Assert.Throws<ArgumentException>(() =>
+                backend.RoPEPartial(gpuX, 0, 256, 512, 1e7f, neox: true));    // ropeDim > headDim
+        }
+        finally
+        {
+            backend.Free(gpuX);
+        }
+    }
+
+    [Fact]
+    public void SigmoidMulInPlaceMatchesCpu()
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        const int N = 1031;   // not a multiple of 256 → exercises the bounds guard
+
+        var rng = new Random(8181);
+        var x = new float[N];
+        var gate = new float[N];
+        for (int i = 0; i < N; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < N; i++) gate[i] = (float)(rng.NextDouble() * 8 - 4);
+
+        var gpuX = backend.Upload(x, TensorShape.D1(N));
+        var gpuGate = backend.Upload(gate, TensorShape.D1(N));
+        backend.SigmoidMulInPlace(gpuX, gpuGate);
+        var result = new float[N];
+        backend.Download(gpuX, result);
+
+        for (int i = 0; i < N; i++)
+        {
+            float expected = x[i] * (1f / (1f + MathF.Exp(-gate[i])));
+            Assert.True(MathF.Abs(result[i] - expected) < 1e-5f,
+                $"SigmoidMulInPlace mismatch at [{i}]: gpu={result[i]}, cpu={expected}");
+        }
+
+        // Mismatched element counts must throw before any GPU work.
+        var gpuShort = backend.Allocate(TensorShape.D1(N - 1));
+        Assert.Throws<ArgumentException>(() => backend.SigmoidMulInPlace(gpuX, gpuShort));
+
+        backend.Free(gpuX); backend.Free(gpuGate); backend.Free(gpuShort);
+    }
+
     private static float[] RandomUnit(Random rng, int dim)
     {
         var v = new float[dim];

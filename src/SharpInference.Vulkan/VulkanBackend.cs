@@ -1207,6 +1207,11 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _gdnTileHeadsPipeline;
     private ComputePipeline? _gdnRecurrenceDecodePipeline;
 
+    // qwen35moe/qwen36 Gated-Attention support pipelines (issue #356)
+    private ComputePipeline? _ropeNeoxPartialPipeline;
+    private ComputePipeline? _splitQgPipeline;
+    private ComputePipeline? _sigmoidMulInPlacePipeline;
+
     // Image ops pipelines (IImageOpsBackend)
     private ComputePipeline? _conv2dPipeline;
     private ComputePipeline? _leakyReluPipeline;
@@ -1244,6 +1249,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private struct GdnL2NormParams { public uint headDim; public uint numHeads; public float eps; public uint offset; }
     private struct GdnTileHeadsParams { public uint srcHeads; public uint repeat; public uint headDim; public uint srcOffset; public uint dstOffset; }
     private struct GdnRecurrenceDecodeParams { public uint hv; public uint d; public float normEps; }
+    private struct RoPEPartialParams { public uint numHeads; public uint headDim; public uint ropeDim; public int position; public float theta; }
+    private struct SplitQgParams { public uint numHeads; public uint headDim; }
 
     // Image ops push constant structs
     private struct Conv2dParams   { public uint inCh; public uint outCh; public uint height; public uint width; public uint ksize; public uint padding; }
@@ -1467,6 +1474,78 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
              GetBuffer(alphaIn), GetBuffer(beta), GetBuffer(ssmA), GetBuffer(dtBias),
              GetBuffer(normWeight), GetBuffer(z), GetBuffer(output)],
             (uint)numVHeads, &p);
+    }
+
+    /// <summary>
+    /// Partial NEOX RoPE: rotates only the first <paramref name="ropeDim"/> of each
+    /// <paramref name="headDim"/>-wide head, passing dims <c>[ropeDim, headDim)</c> through
+    /// untouched. The Vulkan mirror of CUDA's <c>RoPEPartial</c> for qwen35moe/qwen36
+    /// Gated-Attention (rotates the first 64 of each 256-dim head). The frequency exponent uses
+    /// <paramref name="ropeDim"/> (not headDim). Only NEOX is supported (matches CUDA).
+    /// </summary>
+    public void RoPEPartial(Tensor x, int position, int headDim, int ropeDim, float ropeTheta, bool neox)
+    {
+        if (!neox)
+            throw new ArgumentException("RoPEPartial currently supports only neox=true.", nameof(neox));
+        if (ropeDim <= 0 || (ropeDim & 1) != 0)
+            throw new ArgumentException("ropeDim must be a positive even number.", nameof(ropeDim));
+        if (ropeDim > headDim)
+            throw new ArgumentException("ropeDim must be <= headDim.", nameof(ropeDim));
+
+        _ropeNeoxPartialPipeline ??= new ComputePipeline(this, Shaders.RoPENeoxPartial, 1, pushConstantSize: sizeof(RoPEPartialParams));
+        int numHeads = (int)(x.ElementCount / headDim);
+        long totalPairs = (long)numHeads * (ropeDim / 2);
+        var p = new RoPEPartialParams
+        {
+            numHeads = (uint)numHeads,
+            headDim = (uint)headDim,
+            ropeDim = (uint)ropeDim,
+            position = position,
+            theta = ropeTheta,
+        };
+        DispatchOrRecord(_ropeNeoxPartialPipeline, [GetBuffer(x)], (uint)((totalPairs + 255) / 256), &p);
+    }
+
+    /// <summary>
+    /// Strided de-interleave of qwen35moe's Gated-Attention output. <paramref name="qg"/> is laid
+    /// out per head as <c>[Q[headDim] ‖ G[headDim]]</c> (stride <c>2*headDim</c>); this splits it
+    /// into contiguous <paramref name="q"/> <c>[numHeads*headDim]</c> and <paramref name="g"/>
+    /// <c>[numHeads*headDim]</c>. The Vulkan mirror of CUDA's <c>SplitQG</c> (note arg order is
+    /// q, g, qg).
+    /// </summary>
+    public void SplitQG(Tensor q, Tensor g, Tensor qg, int numHeads, int headDim)
+    {
+        long expected = (long)numHeads * headDim * 2;
+        if (qg.ElementCount != expected)
+            throw new ArgumentException(
+                $"SplitQG: qg.ElementCount {qg.ElementCount} != numHeads*headDim*2 ({expected}).");
+        long perOut = (long)numHeads * headDim;
+        if (q.ElementCount != perOut || g.ElementCount != perOut)
+            throw new ArgumentException(
+                $"SplitQG: q/g element counts must each equal numHeads*headDim ({perOut}); got q={q.ElementCount}, g={g.ElementCount}.");
+
+        _splitQgPipeline ??= new ComputePipeline(this, Shaders.SplitQG, 3, pushConstantSize: sizeof(SplitQgParams));
+        var p = new SplitQgParams { numHeads = (uint)numHeads, headDim = (uint)headDim };
+        long total = (long)numHeads * headDim;
+        DispatchOrRecord(_splitQgPipeline, [GetBuffer(qg), GetBuffer(q), GetBuffer(g)],
+            (uint)((total + 255) / 256), &p);
+    }
+
+    /// <summary>
+    /// Fused in-place sigmoid-gate: <c>x[i] *= sigmoid(gate[i])</c>. The Vulkan mirror of CUDA's
+    /// <c>SigmoidMulInPlace</c>; replaces a Sigmoid + ElementwiseMul pair for the qwen35moe
+    /// Gated-Attention output gate.
+    /// </summary>
+    public void SigmoidMulInPlace(Tensor x, Tensor gate)
+    {
+        if (x.ElementCount != gate.ElementCount)
+            throw new ArgumentException(
+                $"SigmoidMulInPlace element-count mismatch: x={x.ElementCount} gate={gate.ElementCount}.");
+
+        _sigmoidMulInPlacePipeline ??= new ComputePipeline(this, Shaders.SigmoidMulInPlace, 2, pushConstantSize: sizeof(CountParams));
+        var p = new CountParams { n = (uint)x.ElementCount };
+        DispatchOrRecord(_sigmoidMulInPlacePipeline, [GetBuffer(x), GetBuffer(gate)],
+            (uint)((x.ElementCount + 255) / 256), &p);
     }
 
     public void SiLU(Tensor x)
@@ -2837,6 +2916,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _gdnL2NormPerHeadPipeline?.Dispose();
         _gdnTileHeadsPipeline?.Dispose();
         _gdnRecurrenceDecodePipeline?.Dispose();
+        _ropeNeoxPartialPipeline?.Dispose();
+        _splitQgPipeline?.Dispose();
+        _sigmoidMulInPlacePipeline?.Dispose();
         _conv2dPipeline?.Dispose();
         _leakyReluPipeline?.Dispose();
         _clampPipeline?.Dispose();
