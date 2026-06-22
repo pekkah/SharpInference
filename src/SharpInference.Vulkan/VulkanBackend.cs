@@ -1077,6 +1077,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _softmaxPipeline;
     private ComputePipeline? _sigmoidPipeline;
     private ComputePipeline? _matVecQ4KPipeline;
+    private ComputePipeline? _matVecBatchedQ4KPipeline;
     private ComputePipeline? _matVecQ6KPipeline;
     private ComputePipeline? _matVecQ5KPipeline;
     private ComputePipeline? _matVecQ8_0Pipeline;
@@ -1124,6 +1125,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private struct ScaleParams { public uint n; public float scale; }
     private struct RoPEParams { public uint numHeads; public uint headDim; public int position; public float theta; }
     private struct MatVecParams { public uint rows; public uint cols; }
+    private struct MatVecBatchedParams { public uint rows; public uint cols; public uint nTok; }
     private struct EmbedParams { public uint tokenId; public uint embDim; }
     private struct KvAppendParams { public uint kvDim; public uint position; public uint maxSeqLen; }
     private struct AttentionParams { public uint numHeads; public uint numKvHeads; public uint headDim; public uint seqLen; public uint maxSeqLen; public uint window; }
@@ -1370,6 +1372,73 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
                 DispatchOrRecord(_matVecQ4KPipeline, bufs, (totalRows + 7) / 8, &p);
                 break;
         }
+    }
+
+    /// <summary>
+    /// Batched (weight-stationary) matrix-vector multiply: computes <paramref name="nTok"/>
+    /// independent matvecs against the SAME weight matrix. The Q4_K weight is read from VRAM
+    /// once and multiplied into <paramref name="nTok"/> accumulators — the weight-amortization
+    /// behind Vulkan speculative decoding (issue #308).
+    ///
+    /// Layouts: <paramref name="inputAll"/> is row-major [nTok][cols], <paramref name="outputAll"/>
+    /// is row-major [nTok][rows]. <c>rows = outputAll.ElementCount / nTok</c>,
+    /// <c>cols = inputAll.ElementCount / nTok</c>.
+    ///
+    /// For Q4_K this dispatches the batched shader (the win). For every other dtype it falls
+    /// back to a correctness-only loop of the single-row <see cref="MatMul"/> over the K
+    /// input/output slices (no amortization), so the method is total across all weight dtypes.
+    /// The Q4_K batched result is bit-identical to nTok separate single-row MatMul calls.
+    /// </summary>
+    public void MatMulBatched(Tensor outputAll, Tensor matrix, Tensor inputAll, int nTok, DType weightDType)
+    {
+        if (nTok is < 1 or > 8)
+            throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be in [1, 8].");
+        if (outputAll.ElementCount % nTok != 0)
+            throw new ArgumentException($"outputAll.ElementCount ({outputAll.ElementCount}) must be divisible by nTok ({nTok}).", nameof(outputAll));
+        if (inputAll.ElementCount % nTok != 0)
+            throw new ArgumentException($"inputAll.ElementCount ({inputAll.ElementCount}) must be divisible by nTok ({nTok}).", nameof(inputAll));
+
+        int rows = (int)(outputAll.ElementCount / nTok);
+        int cols = (int)(inputAll.ElementCount / nTok);
+
+        if (weightDType == DType.Q4_K && cols % 256 != 0)
+            throw new ArgumentException(
+                $"Q4_K batched matvec requires cols ({cols}) to be a multiple of 256 (the Q4_K block size); " +
+                "the shader derives num_blocks = cols >> 8.", nameof(inputAll));
+
+        if (weightDType != DType.Q4_K)
+        {
+            // Fallback: K independent single-row matvecs over the [nTok][·] slices. Correct for
+            // all dtypes but with NO weight amortization (later PRs add batched shaders). Tensor
+            // has no offset sub-view, so each slice is staged through a per-token temp F32 tensor.
+            // NOTE: the shared tmpIn/tmpOut are reused across k, so this is only hazard-free on the
+            // immediate (fence-serialized) dispatch path. When BatchVerify wires the batched trunk
+            // (a recording session), non-Q4_K callers must add per-iteration barriers or use the
+            // Q4_K batched shader — addressed in the wiring PR (#308 PR1c).
+            const int f32Bytes = 4;
+            var tmpIn = Allocate(TensorShape.D1(cols));
+            var tmpOut = Allocate(TensorShape.D1(rows));
+            try
+            {
+                for (int k = 0; k < nTok; k++)
+                {
+                    RecordComputeCopyRegion(tmpIn, 0, inputAll, (long)k * cols * f32Bytes, (long)cols * f32Bytes);
+                    MatMul(tmpOut, matrix, tmpIn, weightDType);
+                    RecordComputeCopyRegion(outputAll, (long)k * rows * f32Bytes, tmpOut, 0, (long)rows * f32Bytes);
+                }
+            }
+            finally
+            {
+                Free(tmpIn);
+                Free(tmpOut);
+            }
+            return;
+        }
+
+        _matVecBatchedQ4KPipeline ??= new ComputePipeline(this, Shaders.MatVecBatchedQ4K, 3, pushConstantSize: sizeof(MatVecBatchedParams));
+        var p = new MatVecBatchedParams { rows = (uint)rows, cols = (uint)cols, nTok = (uint)nTok };
+        var bufs = (ReadOnlySpan<GpuBuffer>)[GetBuffer(matrix), GetBuffer(inputAll), GetBuffer(outputAll)];
+        DispatchOrRecord(_matVecBatchedQ4KPipeline, bufs, ((uint)rows + 7) / 8, &p);
     }
 
     // ================================================================
@@ -2164,6 +2233,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _softmaxPipeline?.Dispose();
         _sigmoidPipeline?.Dispose();
         _matVecQ4KPipeline?.Dispose();
+        _matVecBatchedQ4KPipeline?.Dispose();
         _matVecQ6KPipeline?.Dispose();
         _matVecQ5KPipeline?.Dispose();
         _matVecQ8_0Pipeline?.Dispose();
