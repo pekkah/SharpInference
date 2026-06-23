@@ -1212,6 +1212,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _gdnL2NormPerHeadBatchedPipeline;
     private ComputePipeline? _gdnTileHeadsBatchedPipeline;
     private ComputePipeline? _gdnRecurrenceScanPipeline;
+    // #357 PR1: GDN conv-state ring-capture pipeline (MTP batched-verify rollback snapshot).
+    private ComputePipeline? _gdnConv1dStateCaptureRingPipeline;
     // #356 PR5c: chunk-parallel GDN prefill pipeline.
     private ComputePipeline? _gdnChunkedPrefillPipeline;
 
@@ -1271,6 +1273,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         public uint zStride; public uint oStride; public uint nTok;
         public uint ringSlotStride; public uint nCapture; public uint ringScanOff;
     }
+    // #357 PR1: GDN conv-state ring-capture push constants.
+    private struct GdnConvCaptureRingParams { public uint channels; public uint kernelSize; public uint ringSlotStride; public uint ringFloatOffset; public uint nCapture; }
     // #356 PR5c: chunk-parallel GDN prefill push constants (no ring — clean-prefill only).
     private struct GdnChunkedPrefillParams
     {
@@ -1547,6 +1551,44 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         DispatchOrRecord(_gdnConv1dStateUpdateBatchedPipeline,
             [GetBuffer(x), GetBuffer(state)],
             (uint)(((long)channels + 255) / 256), &p);
+    }
+
+    /// <summary>
+    /// #357 PR1: capture the per-token conv1d states of a batched-verify chunk into the device
+    /// snapshot ring in a SINGLE launch. Slot <c>i</c> (i ∈ [0, <paramref name="nCapture"/>))
+    /// receives the conv state the sequential decode loop would hold after token <c>i</c> —
+    /// byte-identical to <see cref="GdnConv1dStateUpdateBatched"/> with <c>nTok = i+1</c>. Reads the
+    /// PRE-update <paramref name="state"/>, so call it BEFORE advancing the live conv state.
+    /// <paramref name="ring"/> points to this layer's region in slot 0;
+    /// <paramref name="ringFloatOffset"/> offsets to it; <paramref name="ringSlotStride"/> is the
+    /// float stride between consecutive slots. Mirrors CUDA
+    /// <c>CudaBackend.GdnConv1dStateCaptureRing</c>.
+    /// </summary>
+    public void GdnConv1dStateCaptureRing(Tensor x, Tensor state, Tensor ring, long ringFloatOffset,
+                                          int channels, int kernelSize, int ringSlotStride, int nCapture)
+    {
+        if (nCapture <= 0) return;
+        if (kernelSize is < 1 or > 5)
+            throw new ArgumentOutOfRangeException(nameof(kernelSize), kernelSize, "kernelSize must be in [1, 5].");
+        if (channels < 1) throw new ArgumentOutOfRangeException(nameof(channels), channels, "channels must be >= 1.");
+        if (ringSlotStride < 0) throw new ArgumentOutOfRangeException(nameof(ringSlotStride), ringSlotStride, "ringSlotStride must be >= 0.");
+        // ringFloatOffset is narrowed to a uint push constant; guard the (unreachable-in-practice)
+        // overflow so a too-large ring offset fails loud rather than silently wrapping.
+        if (ringFloatOffset is < 0 or > uint.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(ringFloatOffset), ringFloatOffset, "ringFloatOffset must be in [0, uint.MaxValue].");
+        _gdnConv1dStateCaptureRingPipeline ??= new ComputePipeline(this, Shaders.GdnConv1dStateCaptureRing, 3,
+            pushConstantSize: sizeof(GdnConvCaptureRingParams));
+        var p = new GdnConvCaptureRingParams
+        {
+            channels = (uint)channels,
+            kernelSize = (uint)kernelSize,
+            ringSlotStride = (uint)ringSlotStride,
+            ringFloatOffset = (uint)ringFloatOffset,
+            nCapture = (uint)nCapture,
+        };
+        DispatchOrRecord(_gdnConv1dStateCaptureRingPipeline,
+            [GetBuffer(x), GetBuffer(state), GetBuffer(ring)],
+            (uint)(((long)channels + 255) / 256), &p, groupY: (uint)nCapture);
     }
 
     /// <summary>
@@ -3301,6 +3343,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _gdnL2NormPerHeadBatchedPipeline?.Dispose();
         _gdnTileHeadsBatchedPipeline?.Dispose();
         _gdnRecurrenceScanPipeline?.Dispose();
+        _gdnConv1dStateCaptureRingPipeline?.Dispose();
         _gdnChunkedPrefillPipeline?.Dispose();
         _ropeNeoxPartialPipeline?.Dispose();
         _splitQgPipeline?.Dispose();

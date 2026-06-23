@@ -695,6 +695,53 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// #357 PR1: capture every batched-verify ring slot's GDN conv1d state in ONE launch. Slot
+    /// <c>i</c> (i ∈ [0, <c>n_capture</c>)) receives the conv state the sequential decode loop would
+    /// hold AFTER token <c>i</c> — byte-identical to <see cref="GdnConv1dStateUpdateBatched"/> with
+    /// <c>n_tok = i+1</c>. Reads the PRE-update <c>state</c> (the caller runs this BEFORE advancing
+    /// the live conv state). Per slot the retained window is <c>[i+1-(K-1) .. i]</c>, drawing from the
+    /// carried pre-chunk <c>state</c> for the early-token (p &lt; 0) padding. <c>ring_float_offset</c>
+    /// offsets to this layer's region in slot 0; <c>ring_slot_stride</c> is the float stride between
+    /// consecutive slots. No barriers (pure per-(c,slot) writes). Mirrors CUDA
+    /// <c>llm_gdn_conv1d_state_capture_ring</c> / <c>CudaBackend.GdnConv1dStateCaptureRing</c>.
+    /// Push constants: { uint channels, uint kernel_size, uint ring_slot_stride, uint ring_float_offset, uint n_capture }.
+    /// Bindings: 0=x (in), 1=state (in, read-only), 2=ring (out).
+    /// Dispatch: (ceil(channels/256), n_capture) workgroups of 256 threads.
+    /// </summary>
+    internal const string GdnConv1dStateCaptureRing = """
+        #version 450
+        layout(local_size_x = 256) in;
+
+        layout(binding = 0) readonly  buffer X     { float x_data[]; };
+        layout(binding = 1) readonly  buffer State { float state_data[]; };
+        layout(binding = 2) writeonly buffer Ring  { float ring_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint channels;
+            uint kernel_size;
+            uint ring_slot_stride;
+            uint ring_float_offset;
+            uint n_capture;
+        };
+
+        void main() {
+            uint c = gl_GlobalInvocationID.x;
+            uint slot = gl_WorkGroupID.y;
+            if (c >= channels || slot >= n_capture) return;
+
+            int retained = int(kernel_size) - 1;
+            int n_eff = int(slot) + 1;   // state after processing tokens [0, n_eff)
+            for (int r = 0; r < retained; r++) {
+                int p = n_eff - retained + r;
+                float v = (p >= 0)
+                    ? x_data[uint(p) * channels + c]
+                    : state_data[uint(p + retained) * channels + c];
+                ring_data[ring_float_offset + slot * ring_slot_stride + uint(r) * channels + c] = v;
+            }
+        }
+        """;
+
+    /// <summary>
     /// Batched GDN L2-norm per head over <c>n_tok</c> rows. One workgroup per (head, token),
     /// 256-thread tree reduction. The bound buffer is the data region; <c>offset</c> is the float
     /// base (host-offset to the Q or K region), <c>row_stride</c> the per-token element stride
