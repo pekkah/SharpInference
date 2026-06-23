@@ -1239,15 +1239,20 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         if (k == 1)
         {
             // A single token amortizes nothing — plain Forward is strictly better (and still
-            // advances the caches by one, matching the k-token contract for k=1).
+            // advances the caches by one). It captures no ring snapshot, so afterward there is
+            // no restorable batched-verify state: clear the flag so RestoreBatchSnapshot reports
+            // "no snapshot held" rather than acting on a stale prior k>1 verify's bounds.
             var l = Forward(tokens[0], startPos);
-            _batchStartPos = startPos; _batchK = 1; _batchSnapshotValid = true;
+            _batchSnapshotValid = false;
             return [l.ToArray()];
         }
 
         int embDim = _embDim;
         long rowBytes = (long)embDim * sizeof(float);
-        EnsureBatchedScratch(MaxBatchChunk);   // trunk scratch (cap 8 ≥ k)
+        // k ≤ MaxBatchVerifyTokens ≤ MaxBatchChunk today (ResolveMtpBatchMax clamps to [2,8]), but
+        // Math.Max keeps the trunk scratch correctly sized if that coupling ever loosens — the
+        // n-sized Alias views below would otherwise read past an undersized buffer on the GPU.
+        EnsureBatchedScratch(Math.Max(MaxBatchChunk, k));
         EnsureBatchVerifyScratch(k);           // [k×vocab] logits
 
         // Pessimistic fault latch (mirror the batched prefill): the GDN-state mutation + length
