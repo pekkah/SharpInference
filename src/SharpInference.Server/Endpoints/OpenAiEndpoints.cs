@@ -158,6 +158,18 @@ public static class OpenAiEndpoints
         if (toolsActive && chatTemplate.ToolBoundaryStopTokenIds is { Count: > 0 } toolStops)
             sp = sp with { AdditionalStopTokenIds = [.. toolStops] };
 
+        // Schema/grammar-constrained tool-argument decoding (issue #374): opt-in, and skipped when
+        // the client forces no tool use (tool_choice:"none"). Restricts the sampler to tokens that
+        // keep the arguments schema-conformant in the model's native call syntax.
+        if (toolsActive && req.Tools is { Length: > 0 } && ToolGrammarHelper.Enabled(opts)
+            && !IsToolChoiceNone(req.ToolChoice))
+        {
+            var schemas = ToolGrammarHelper.ToSchemas(
+                req.Tools.Select(t => (t.Function?.Name, t.Function?.Parameters)));
+            if (chatTemplate.BuildToolArgumentConstraint(schemas) is { } constraint)
+                sp = sp with { Constraint = constraint };
+        }
+
         var requestId = $"chatcmpl-{Guid.NewGuid():N}";
         long created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
@@ -532,6 +544,12 @@ public static class OpenAiEndpoints
         }
         return sb.ToString();
     }
+
+    /// <summary>True when OpenAI <c>tool_choice</c> is the string <c>"none"</c> (no tool use forced
+    /// off) — the one value for which argument-grammar constraint must not engage.</summary>
+    private static bool IsToolChoiceNone(JsonElement? toolChoice) =>
+        toolChoice is { ValueKind: JsonValueKind.String } tc
+        && string.Equals(tc.GetString(), "none", StringComparison.Ordinal);
 
     private static bool HasToolMessages(OaiMessage[]? messages)
     {

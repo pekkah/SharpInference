@@ -282,6 +282,20 @@ stream. `--no-thinking` disables it at the template level, `--hide-thinking` kee
 `--temp 0.6 --top-p 0.95 --top-k 20`. The server emits reasoning per protocol (Anthropic `thinking`,
 OpenAI `reasoning_content`).
 
+### Tool-call argument grammar (`SHARPI_TOOL_GRAMMAR`, issue #374)
+
+Opt-in constrained decoding that forces a tool call's **arguments** to satisfy the request's JSON Schema,
+expressed in the model's native call syntax. Gemma 4's instruct line emits the call *envelope* correctly
+but, at `temp 0`, substitutes memorized priors for the schema — `get_weather` drops the required `location`
+(emits `{}`), `web_search` invents a `{queries:[…]}` array instead of the schema's `query` string. With the
+flag on, a byte-level grammar over Gemma's `<|tool_call>call:NAME{…}` form masks the sampler so non-conforming
+tokens are unreachable: only declared keys, every required key once, value shapes per type, enums limited to
+the declared set (free string content stays unconstrained). On the same probes the arguments become
+`{"location":"Berlin"}` and `{"query":"…"}`. Enable on the server with `SHARPI_TOOL_GRAMMAR=1` (or
+`SharpInference:ToolGrammar`); default off is byte-identical to unconstrained decoding. Honored by the
+single-user engine (not yet continuous batching); other families (Qwen/Llama JSON) generate unconstrained
+for now via the same per-adapter hook.
+
 ### CLI examples
 
 ```bash

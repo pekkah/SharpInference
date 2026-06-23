@@ -67,7 +67,7 @@ public static class ServiceCollectionExtensions
             // — important for tests that override IInferenceEngine but expect the
             // renderer to use the safe fallback path.
             sp.GetRequiredService<ChatTemplateRenderer>().Configure(
-                loaded.Architecture, loaded.ChatTemplate, loaded.ToolBoundaryStopTokenIds);
+                loaded.Architecture, loaded.ChatTemplate, loaded.ToolBoundaryStopTokenIds, loaded.Grammar);
 
             return loaded.Engine;
         });

@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using SharpInference.Core.Grammar;
 
 namespace SharpInference.Core;
 
@@ -108,6 +109,18 @@ public interface IToolCallAdapter
     /// emitting <c>&lt;end_of_turn&gt;</c>). See issue #304.
     /// </summary>
     IReadOnlyList<string> ToolBoundaryStopMarkers => [];
+
+    /// <summary>
+    /// Builds an optional grammar/FSM constraint (issue #374) that forces this model's tool-call
+    /// <em>arguments</em> to satisfy the supplied schemas, expressed in this adapter's native call
+    /// syntax. Returns <c>null</c> when the family has no constrained-decoding support or no
+    /// constrainable tool was supplied — the engine then samples unconstrained (byte-identical to
+    /// the default path). Each adapter owns its wire format (Gemma's bespoke <c>&lt;|"|&gt;</c> form
+    /// vs Qwen/Llama JSON), so the constraint targets the actual emitted tokens, not generic JSON.
+    /// </summary>
+    /// <param name="tools">The active tool definitions (name + parsed argument schema).</param>
+    /// <param name="vocab">Vocabulary view used to resolve structural tokens and match candidates.</param>
+    ITokenConstraint? BuildArgumentConstraint(IReadOnlyList<ToolSchema> tools, GrammarVocabulary vocab) => null;
 }
 
 /// <summary>
@@ -686,6 +699,18 @@ public sealed class Gemma4ToolCallAdapter : IToolCallAdapter
     /// runs on past the (complete, parseable) tool-call block and hallucinates a trailing turn —
     /// issue #304. The block is left intact because the stop token is consumed, not emitted.</remarks>
     public IReadOnlyList<string> ToolBoundaryStopMarkers => s_toolBoundaryStopMarkers;
+
+    /// <inheritdoc/>
+    /// <remarks>Constrains the argument object of Gemma's native
+    /// <c>&lt;|tool_call&gt;call:NAME{...}&lt;tool_call|&gt;</c> wire format (issue #374). Returns
+    /// null when no supplied tool is fully constrainable (then generation is unconstrained).</remarks>
+    public ITokenConstraint? BuildArgumentConstraint(IReadOnlyList<ToolSchema> tools, GrammarVocabulary vocab)
+    {
+        ArgumentNullException.ThrowIfNull(tools);
+        ArgumentNullException.ThrowIfNull(vocab);
+        var constraint = new GemmaToolArgumentConstraint(vocab, tools);
+        return constraint.HasConstrainableTools ? constraint : null;
+    }
 
     public ToolCallParseResult Parse(string rawOutput)
     {

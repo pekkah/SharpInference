@@ -26,6 +26,16 @@ public sealed class SharpInferenceServerOptions
     /// </summary>
     public bool DisableThinking { get; set; }
 
+    /// <summary>
+    /// Enable schema/grammar-constrained decoding for tool-call arguments (issue #374). When on and
+    /// a tool-active request is served by a family with constraint support (Gemma 4 today), the
+    /// sampler is restricted to tokens that satisfy the supplied JSON Schema in the model's native
+    /// call syntax — required keys can't be dropped, only declared keys/enum values appear, value
+    /// shapes match the declared type. Default off → byte-identical to unconstrained decoding. Also
+    /// turned on by the <c>SHARPI_TOOL_GRAMMAR=1</c> environment variable.
+    /// </summary>
+    public bool ToolGrammar { get; set; }
+
     // ── Model loading ────────────────────────────────────────────────────────
 
     /// <summary>
@@ -334,8 +344,15 @@ public sealed class SamplingDefaults
 /// The chat endpoints add these to the stop set on tool-active requests so the model halts the
 /// instant it finishes its tool calls (issue #304). Null/empty when the family needs none.
 /// </param>
+/// <param name="Grammar">
+/// Vocabulary view used to build grammar-constrained tool-call decoders (issue #374), or null when
+/// the family has no constraint support. The built-in GGUF loader always supplies one; a custom
+/// <see cref="SharpInferenceServerOptions.EngineFactory"/> may leave it null (tool-grammar then
+/// unavailable for that engine).
+/// </param>
 public sealed record LoadedEngine(
     IInferenceEngine Engine,
     string Architecture,
     SharpInference.Core.JinjaChatTemplate? ChatTemplate,
-    IReadOnlyList<int>? ToolBoundaryStopTokenIds = null);
+    IReadOnlyList<int>? ToolBoundaryStopTokenIds = null,
+    SharpInference.Core.Grammar.GrammarVocabulary? Grammar = null);

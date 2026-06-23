@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.RegularExpressions;
 using SharpInference.Core;
+using SharpInference.Core.Grammar;
 
 namespace SharpInference.Server;
 
@@ -92,6 +93,13 @@ public sealed class ChatTemplateRenderer
     /// </summary>
     public IReadOnlyList<int> ToolBoundaryStopTokenIds { get; private set; } = [];
 
+    /// <summary>
+    /// Vocabulary view for grammar-constrained tool-call decoding (issue #374), set at
+    /// <see cref="Configure"/> time. Null until the model is loaded, or when a custom engine factory
+    /// supplied no vocabulary — <see cref="BuildToolArgumentConstraint"/> then returns null.
+    /// </summary>
+    private GrammarVocabulary? _grammarVocabulary;
+
     /// <param name="architecture">Default architecture (used both for fallback and exposed via <see cref="Architecture"/>).</param>
     /// <param name="template">Optional compiled Jinja template; null means "use the hardcoded fallback".</param>
     public ChatTemplateRenderer(string architecture = "qwen2", JinjaChatTemplate? template = null)
@@ -102,6 +110,19 @@ public sealed class ChatTemplateRenderer
     }
 
     /// <summary>
+    /// Builds an argument-grammar constraint (issue #374) for the active tools using the loaded
+    /// model's adapter + vocabulary, or null when the family has no constraint support, no
+    /// vocabulary is available, or no supplied tool is constrainable. Endpoints attach the result to
+    /// <see cref="Engine.SamplingParams.Constraint"/> on a tool-active request when tool-grammar is
+    /// enabled.
+    /// </summary>
+    public ITokenConstraint? BuildToolArgumentConstraint(IReadOnlyList<ToolSchema> tools)
+    {
+        if (_grammarVocabulary is null || tools.Count == 0) return null;
+        return _toolCallAdapter.BuildArgumentConstraint(tools, _grammarVocabulary);
+    }
+
+    /// <summary>
     /// Reconfigures the renderer with model-specific metadata. Called by the built-in
     /// engine loader once the GGUF file has been opened. Safe to call once; subsequent
     /// calls overwrite previous values (used by hot-reload scenarios).
@@ -109,12 +130,14 @@ public sealed class ChatTemplateRenderer
     /// (see <see cref="ToolBoundaryStopTokenIds"/>); null leaves the set empty.
     /// </summary>
     public void Configure(string architecture, JinjaChatTemplate? template,
-        IReadOnlyList<int>? toolBoundaryStopTokenIds = null)
+        IReadOnlyList<int>? toolBoundaryStopTokenIds = null,
+        GrammarVocabulary? grammarVocabulary = null)
     {
         _architecture = architecture;
         _template = template;
         _toolCallAdapter = ToolCallAdapterRegistry.Get(architecture);
         ToolBoundaryStopTokenIds = toolBoundaryStopTokenIds ?? [];
+        _grammarVocabulary = grammarVocabulary;
     }
 
     /// <param name="messages">Messages in order (system, user, assistant, ...).</param>
