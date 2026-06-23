@@ -229,6 +229,15 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
     // of at most MaxBatchChunk tokens; each sub-chunk advances the device state by its size.
     private const int MaxBatchChunk = 8;
     private readonly bool _batchedPrefillEnabled;
+    // PR5c (#356): opt-in FlashQLA chunk-parallel recurrence scan (GdnChunkedPrefill) in place of
+    // the byte-exact fused GdnRecurrenceScan during clean batched prefill. Default OFF
+    // (SHARPI_VULKAN_GDN_CHUNKED_PREFILL=1 to enable) + requires the device to fit the ~34 KB
+    // shared-mem tile (SupportsGdnChunkedPrefill). Argmax-stable, NOT byte-exact (FP reduction
+    // order differs). NOTE: meaningful speedup needs 64-token chunks, but the batched trunk is
+    // capped at MaxBatchChunk=8 by MatMulBatched (#308 acc[8]); this drop-in runs the chunked scan
+    // over the ≤8-token sub-chunk, so the end-to-end win is small until a "decoupled-64" rewiring
+    // (or a larger batched matvec) lands. The validated kernel ships now; the wiring is a follow-up.
+    private readonly bool _chunkedPrefillEnabled;
     private int _btCap;   // currently-allocated batched-scratch capacity (tokens); 0 = unallocated.
 
     // Batched trunk residual / norm (all [_btCap × embDim]). The GDN/attn blocks write the block
@@ -614,6 +623,17 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         // forces the byte-identical sequential per-token Prefill loop so regressions isolate.
         _batchedPrefillEnabled =
             Environment.GetEnvironmentVariable("SHARPI_VULKAN_BATCHED_PREFILL") != "0";
+
+        // PR5c (#356): opt-in chunked recurrence scan. Default OFF; only when the device fits the
+        // ~34 KB shared tile (SupportsGdnChunkedPrefill). Argmax-stable, not byte-exact.
+        bool chunkedRequested =
+            Environment.GetEnvironmentVariable("SHARPI_VULKAN_GDN_CHUNKED_PREFILL") == "1";
+        _chunkedPrefillEnabled = chunkedRequested && gpu.SupportsGdnChunkedPrefill;
+        if (chunkedRequested && !gpu.SupportsGdnChunkedPrefill)
+            Console.Error.WriteLine(
+                "[VulkanHybridGdnForwardPass] SHARPI_VULKAN_GDN_CHUNKED_PREFILL=1 requested but the device's " +
+                $"maxComputeSharedMemorySize ({gpu.MaxComputeSharedMemoryBytes} B) is below the ~34 KB the chunked " +
+                "scan needs — falling back to the byte-exact fused GdnRecurrenceScan.");
     }
 
     // ================================================================
@@ -898,16 +918,28 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         _gpu.GdnTileHeadsBatched(qkvConvAll, kDim, kHeadAll, 0, _gdnNumKHeads, _gdnKvRepeat, hd, convCh, valDim, n);
         _gpu.RecordBarrier();
 
-        // 6. Fused sequential recurrence scan over the chunk (byte-exact vs N GdnRecurrenceDecode).
-        //    v reads from the silu'd conv output's V region (vHeadOff = 2*kDim, stride convCh);
-        //    q/k from the tiled head buffers; alpha/beta from [N × nVH]; z from [N × valDim].
-        _gpu.GdnRecurrenceScan(
-            scanState, qHeadAll, kHeadAll, qkvConvAll,
-            alphaAll, betaAll, _gpuSsmA[layer], _gpuSsmDtBias[layer], _gpuSsmNormW[layer],
-            zAll, gdnOutAll,
-            nVH, hd, normEps: 1e-6f,
-            qStride: valDim, kStride: valDim, vStride: convCh, vHeadOff: 2 * kDim,
-            zStride: valDim, oStride: valDim, nTok: n);
+        // 6. Recurrence scan over the chunk. Default: fused sequential scan (byte-exact vs N
+        //    GdnRecurrenceDecode). Opt-in (PR5c): FlashQLA chunk-parallel scan (argmax-stable, not
+        //    byte-exact). Both take identical args; v reads from the silu'd conv output's V region
+        //    (vHeadOff = 2*kDim, stride convCh), q/k from the tiled head buffers, alpha/beta from
+        //    [N × nVH], z from [N × valDim]. (The chunked win is small until N can exceed
+        //    MaxBatchChunk=8 — see _chunkedPrefillEnabled; the validated kernel ships regardless.)
+        if (_chunkedPrefillEnabled)
+            _gpu.GdnChunkedPrefill(
+                scanState, qHeadAll, kHeadAll, qkvConvAll,
+                alphaAll, betaAll, _gpuSsmA[layer], _gpuSsmDtBias[layer], _gpuSsmNormW[layer],
+                zAll, gdnOutAll,
+                nVH, hd, normEps: 1e-6f,
+                qStride: valDim, kStride: valDim, vStride: convCh, vHeadOff: 2 * kDim,
+                zStride: valDim, oStride: valDim, nTok: n);
+        else
+            _gpu.GdnRecurrenceScan(
+                scanState, qHeadAll, kHeadAll, qkvConvAll,
+                alphaAll, betaAll, _gpuSsmA[layer], _gpuSsmDtBias[layer], _gpuSsmNormW[layer],
+                zAll, gdnOutAll,
+                nVH, hd, normEps: 1e-6f,
+                qStride: valDim, kStride: valDim, vStride: convCh, vHeadOff: 2 * kDim,
+                zStride: valDim, oStride: valDim, nTok: n);
         _gpu.RecordBarrier();
 
         // 7. Output projection: blockOut = WSsmOut @ gdnOutAll → _gpuBtHidden.

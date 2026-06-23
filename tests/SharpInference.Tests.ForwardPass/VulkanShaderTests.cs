@@ -3210,6 +3210,153 @@ public sealed unsafe class VulkanShaderTests
         backend.Free(gpuNormW); backend.Free(gpuZ); backend.Free(gpuOut); backend.Free(seqState);
     }
 
+    // ── #356 PR5c: chunk-parallel ("FlashQLA") GDN prefill scan ────────────────
+    // The chunked path is numerically EQUAL to the sequential scan up to FP reduction order
+    // (it reorders the reductions), so it is argmax-stable but NOT byte-exact: we compare to the
+    // byte-exact GdnRecurrenceScan with a tolerance and ALSO assert the per-row argmax matches.
+    //   N=64: a full GDN_CHUNK — exercises the chunked algorithm proper.
+    //   N=20: cN < GDN_CHUNK — exercises the partial-chunk path.
+    [Theory]
+    [InlineData(64)]
+    [InlineData(20)]
+    public void GdnChunkedPrefillMatchesSequentialScan(int n)
+    {
+        using var backend = new Vulkan.VulkanBackend();
+        // Silent-skip on a device whose shared memory can't fit the ≈34,560 B chunked shader.
+        if (!backend.SupportsGdnChunkedPrefill) return;
+
+        const int hv = 32;            // qwen36 v-head count
+        const int d = 128;            // qwen36 head dim (specialized to 128)
+        const float eps = 1e-6f;
+        int valueDim = hv * d;        // 4096
+        const int convChannels = 8192;
+        const int vHeadOff = 2 * 2048; // 2*keyDim; placement of v inside the conv row
+        int stateLen = hv * d * d;
+
+        var rng = new Random(20260623);
+
+        // Tiled batched inputs (same layout as the PR5a scan test): q/k/z over [n, valueDim];
+        // v over [n, convChannels] at vHeadOff; alpha/beta over [n, hv].
+        var qAll = new float[n * valueDim];
+        var kAll = new float[n * valueDim];
+        var zAll = new float[n * valueDim];
+        for (int i = 0; i < n * valueDim; i++)
+        {
+            qAll[i] = (float)(rng.NextDouble() * 2 - 1);
+            kAll[i] = (float)(rng.NextDouble() * 2 - 1);
+            zAll[i] = (float)(rng.NextDouble() * 2 - 1);
+        }
+        // L2-normalize K per (token, head) — the real GDN block runs GdnL2NormPerHead before the
+        // recurrence, so the chunked delta-rule sees UNIT-norm K (K·K ≤ 1). That keeps the
+        // intra-chunk forward-substitution well-conditioned; un-normalized random K at d=128 drives
+        // the K·K coupling matrix far out of the model's regime and the chunked/sequential FP paths
+        // diverge by orders of magnitude (an artifact of the test inputs, not the shader).
+        for (int t = 0; t < n; t++)
+            for (int h = 0; h < hv; h++)
+            {
+                int b = t * valueDim + h * d;
+                double ss = 0;
+                for (int e = 0; e < d; e++) ss += (double)kAll[b + e] * kAll[b + e];
+                float inv = 1f / MathF.Sqrt((float)ss + 1e-12f);
+                for (int e = 0; e < d; e++) kAll[b + e] *= inv;
+            }
+        var vAll = new float[n * convChannels];
+        for (int t = 0; t < n; t++)
+            for (int e = 0; e < valueDim; e++)
+                vAll[t * convChannels + vHeadOff + e] = (float)(rng.NextDouble() * 2 - 1);
+
+        var alphaAll = new float[n * hv];
+        var betaAll = new float[n * hv];
+        for (int i = 0; i < n * hv; i++)
+        {
+            alphaAll[i] = (float)(rng.NextDouble() * 4 - 2);    // [-2, 2]
+            betaAll[i] = (float)(rng.NextDouble() * 4 - 2);     // [-2, 2]
+        }
+        var ssmA = new float[hv];
+        var dtBias = new float[hv];
+        for (int h = 0; h < hv; h++)
+        {
+            ssmA[h] = (float)(rng.NextDouble() * -0.09 - 0.01); // [-0.1, -0.01] negative decay
+            dtBias[h] = (float)(rng.NextDouble() - 0.5);        // [-0.5, 0.5]
+        }
+        var normWeight = new float[d];
+        for (int i = 0; i < d; i++) normWeight[i] = (float)(rng.NextDouble() + 0.5);  // [0.5, 1.5]
+        var state0 = new float[stateLen];
+        for (int i = 0; i < stateLen; i++) state0[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Shared (read-only) GPU inputs reused by both paths.
+        var gpuQ = backend.Upload(qAll, TensorShape.D1(n * valueDim));
+        var gpuK = backend.Upload(kAll, TensorShape.D1(n * valueDim));
+        var gpuV = backend.Upload(vAll, TensorShape.D1(n * convChannels));
+        var gpuAlpha = backend.Upload(alphaAll, TensorShape.D1(n * hv));
+        var gpuBeta = backend.Upload(betaAll, TensorShape.D1(n * hv));
+        var gpuSsmA = backend.Upload(ssmA, TensorShape.D1(hv));
+        var gpuDtBias = backend.Upload(dtBias, TensorShape.D1(hv));
+        var gpuNormW = backend.Upload(normWeight, TensorShape.D1(d));
+        var gpuZ = backend.Upload(zAll, TensorShape.D1(n * valueDim));
+
+        // ── Chunk-parallel prefill over one state. ──
+        var chunkState = backend.Upload(state0, TensorShape.D1(stateLen));
+        var gpuChunkOut = backend.Allocate(TensorShape.D1(n * valueDim));
+        backend.GdnChunkedPrefill(chunkState, gpuQ, gpuK, gpuV, gpuAlpha, gpuBeta,
+            gpuSsmA, gpuDtBias, gpuNormW, gpuZ, gpuChunkOut, hv, d, eps,
+            qStride: valueDim, kStride: valueDim, vStride: convChannels, vHeadOff: vHeadOff,
+            zStride: valueDim, oStride: valueDim, nTok: n);
+        var chunkOut = new float[n * valueDim];
+        var chunkStateAfter = new float[stateLen];
+        backend.Download(gpuChunkOut, chunkOut);
+        backend.Download(chunkState, chunkStateAfter);
+
+        // ── Byte-exact sequential scan (PR5a) over a CLONE of the same initial state. ──
+        var scanState = backend.Upload(state0, TensorShape.D1(stateLen));
+        var gpuScanOut = backend.Allocate(TensorShape.D1(n * valueDim));
+        backend.GdnRecurrenceScan(scanState, gpuQ, gpuK, gpuV, gpuAlpha, gpuBeta,
+            gpuSsmA, gpuDtBias, gpuNormW, gpuZ, gpuScanOut, hv, d, eps,
+            qStride: valueDim, kStride: valueDim, vStride: convChannels, vHeadOff: vHeadOff,
+            zStride: valueDim, oStride: valueDim, nTok: n);
+        var scanOut = new float[n * valueDim];
+        var scanStateAfter = new float[stateLen];
+        backend.Download(gpuScanOut, scanOut);
+        backend.Download(scanState, scanStateAfter);
+
+        // Tolerance: chunked reorders the FP reductions → not byte-exact (argmax-stable parity
+        // class). With unit-norm K the observed worst drift is ~2.5e-6 (output) / ~1.5e-6 (state)
+        // on this GPU; 1e-4 keeps ~40× headroom for driver/GPU variation while still catching a
+        // real regression (a genuine algorithm bug diverges by orders of magnitude).
+        const float tol = 1e-4f;
+        float maxOutDiff = 0f, maxStateDiff = 0f;
+        for (int i = 0; i < n * valueDim; i++)
+            maxOutDiff = MathF.Max(maxOutDiff, MathF.Abs(chunkOut[i] - scanOut[i]));
+        for (int i = 0; i < stateLen; i++)
+            maxStateDiff = MathF.Max(maxStateDiff, MathF.Abs(chunkStateAfter[i] - scanStateAfter[i]));
+
+        Assert.True(maxOutDiff < tol,
+            $"chunked output drift {maxOutDiff} exceeds tol {tol} (N={n})");
+        Assert.True(maxStateDiff < tol,
+            $"chunked state drift {maxStateDiff} exceeds tol {tol} (N={n})");
+
+        // Argmax stability: per token (row of valueDim), the position of the max output matches.
+        for (int t = 0; t < n; t++)
+        {
+            int chunkArg = 0, scanArg = 0;
+            float chunkMax = float.NegativeInfinity, scanMax = float.NegativeInfinity;
+            for (int e = 0; e < valueDim; e++)
+            {
+                float cv = chunkOut[t * valueDim + e];
+                float sv = scanOut[t * valueDim + e];
+                if (cv > chunkMax) { chunkMax = cv; chunkArg = e; }
+                if (sv > scanMax) { scanMax = sv; scanArg = e; }
+            }
+            Assert.Equal(scanArg, chunkArg);
+        }
+
+        backend.Free(gpuQ); backend.Free(gpuK); backend.Free(gpuV);
+        backend.Free(gpuAlpha); backend.Free(gpuBeta); backend.Free(gpuSsmA); backend.Free(gpuDtBias);
+        backend.Free(gpuNormW); backend.Free(gpuZ);
+        backend.Free(chunkState); backend.Free(gpuChunkOut);
+        backend.Free(scanState); backend.Free(gpuScanOut);
+    }
+
     // ── qwen35moe/qwen36 Gated-Attention support shaders (issue #356) ──────────
 
     [Fact]
