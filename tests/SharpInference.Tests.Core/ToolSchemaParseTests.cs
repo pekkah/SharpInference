@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using SharpInference.Core.Grammar;
 
@@ -97,5 +98,25 @@ public sealed class ToolSchemaParseTests
     {
         var s = Parse("t", """{"type":"object","properties":{"x":{"type":["string","null"]}}}""");
         Assert.Equal(JsonSchemaKind.String, s.Arguments.Properties[0].Value.Kind);
+    }
+
+    [Fact]
+    public void DeeplyNestedSchema_DoesNotStackOverflow_DegradesPastCap()
+    {
+        // A property nested past the parser's depth cap (via arrays — 1 JSON level each, so we stay
+        // under System.Text.Json's own depth limit) must parse without recursing unbounded and
+        // blowing the stack (a .NET StackOverflowException is uncatchable). Deep levels degrade to
+        // Any rather than recursing forever.
+        const int n = 55;   // > ToolSchema parse cap (32), < System.Text.Json depth limit (64)
+        var sb = new StringBuilder();
+        sb.Append("""{"type":"object","properties":{"x":""");
+        for (int i = 0; i < n; i++) sb.Append("""{"type":"array","items":""");
+        sb.Append("""{"type":"string"}""");
+        for (int i = 0; i < n; i++) sb.Append('}');
+        sb.Append("}}");
+
+        var s = Parse("t", sb.ToString());
+        Assert.Single(s.Arguments.Properties);
+        Assert.Equal(JsonSchemaKind.Array, s.Arguments.Properties[0].Value.Kind);  // top levels parse
     }
 }

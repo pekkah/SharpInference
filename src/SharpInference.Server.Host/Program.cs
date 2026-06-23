@@ -79,6 +79,15 @@ builder.Services.AddSharpInference(builder.Configuration, opts =>
     {
         opts.ToolGrammar = true;
     }
+
+    // Config-time conflict surface: tool-grammar (#374) is honored only by the single-user engine,
+    // not continuous batching. Warn at boot — when an operator is watching logs — so the conflict
+    // isn't discovered only via the engine's once-per-process runtime warning.
+    if (opts.ToolGrammar && opts.MaxBatchSize > 1)
+        Console.Error.WriteLine(
+            "[SharpInference] SHARPI_TOOL_GRAMMAR is set together with continuous batching " +
+            "(SHARPI_MAX_BATCH > 1); tool-call argument grammar is NOT applied under batching. " +
+            "Run without batching to use it (issue #374).");
 });
 
 var app = builder.Build();

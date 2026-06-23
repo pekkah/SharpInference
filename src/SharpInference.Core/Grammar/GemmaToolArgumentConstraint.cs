@@ -104,6 +104,16 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
                 if (compiled is not null) _tools[t.Name] = compiled;
             }
         }
+        else if (tools.Count > 0)
+        {
+            // The caller asked for a constraint (tools present) but this vocabulary doesn't define
+            // Gemma's structural tokens — the constraint is inert. Surface it once so an operator who
+            // enabled SHARPI_TOOL_GRAMMAR on a non-Gemma / mistokenized model isn't left wondering
+            // why arguments are still unconstrained.
+            WarnOnce("no-structural-tokens",
+                "structural tokens <|tool_call> / <|\"|> not found in this vocabulary — tool-grammar is "
+                + "inert for this model (arguments generate unconstrained).");
+        }
 
         // Names we can safely engage on the instant the model finishes typing them (before the '{'),
         // so a merged "{}" token can't slip an empty argument object past the constraint. A name that
@@ -310,6 +320,14 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
         if (IsConstraining)
         {
             bool ok = RunToken(token);
+            // Under both greedy and temperature sampling the engine draws from the masked logits, so
+            // a permitted token must replay cleanly. A rejection here is an invariant violation (a
+            // Filter/Accept divergence — e.g. a mask-vs-simulate bug), distinct from the normal
+            // end-of-object transition (ok && _depth == 0). Flag it once; either way, stop constraining.
+            if (!ok)
+                WarnOnce("accept-divergence",
+                    "a sampled token permitted by the mask was rejected by the grammar — constraint "
+                    + "disabled for the rest of this call (possible Filter/Accept divergence).");
             if (!ok || _depth == 0) { _depth = 0; _armed = false; _nameBuf.Clear(); }
             return;
         }
@@ -375,9 +393,16 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
         PushObject(obj);     // starts in OExpectKeyOrClose (already past '{')
 
         // Rare: the '{' token carried trailing argument bytes (e.g. "{location"). Replay them now;
-        // if they don't fit the grammar, abandon constraining rather than wedge generation.
+        // if they don't fit the grammar, abandon constraining rather than wedge generation. (The
+        // early-engage path avoids this entirely for prefix-unambiguous tool names; a name that's a
+        // prefix of another tool relies on this replay, so surface a failure once.)
         if (!trailing.IsEmpty && !FeedRawBytes(trailing))
+        {
             _depth = 0;
+            WarnOnce($"trailing-replay:{name}",
+                $"could not replay argument bytes after '{{' for tool '{name}' — arguments generate "
+                + "unconstrained for this call.");
+        }
     }
 
     public ReadOnlySpan<float> Filter(ReadOnlySpan<float> logits)
@@ -389,8 +414,19 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
         logits.CopyTo(masked);
 
         int allowedCount = ComputeMask(masked);
-        // Dead state (no legal token): leave logits untouched so generation never wedges.
-        return allowedCount == 0 ? logits : masked;
+        // Dead state (no legal token): leave logits untouched so generation never wedges. A valid
+        // grammar state always has at least one legal token (a key, '}', a value byte, or free
+        // content), so reaching zero indicates the model is at an off-schema point OR a grammar bug —
+        // either way the call continues unconstrained, so flag it once rather than fail silently.
+        if (allowedCount == 0)
+        {
+            ref var top = ref _stack[_depth - 1];
+            WarnOnce($"dead-state:{top.Kind}:{top.State}",
+                $"grammar reached a dead state (no legal token) at kind={top.Kind} state={top.State} "
+                + "— tool arguments continue unconstrained from here.");
+            return logits;
+        }
+        return masked;
     }
 
     /// <summary>Sets every forbidden token to -inf in <paramref name="buf"/>; returns the count kept.</summary>
@@ -403,13 +439,13 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
         // per-token byte simulation for speed.
         if (top.Kind == FK.Str && top.State == SContent)
         {
-            // Any non-forbidden token stays in content; the quote token closes. Forbid only EOG.
-            for (int id = 0; id < buf.Length; id++)
-            {
-                if (_forbidden.Contains(id)) { buf[id] = float.NegativeInfinity; }
-                else kept++;
-            }
-            return kept;
+            // Any non-forbidden token stays in content; the quote token closes. Forbid only EOG —
+            // a tiny set, so mask those ids directly rather than testing all 262k tokens against it.
+            int forbidden = 0;
+            foreach (int id in _forbidden)
+                if ((uint)id < (uint)buf.Length && !float.IsNegativeInfinity(buf[id]))
+                { buf[id] = float.NegativeInfinity; forbidden++; }
+            return buf.Length - forbidden;
         }
         if ((top.Kind == FK.Str && top.State == SExpectOpen)
             || (top.Kind == FK.StrEnum && top.State == SeExpectOpen))
@@ -902,4 +938,16 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
     }
 
     private static bool AnyComplete(byte[][] lits, ulong cand, int matchLen) => CompleteIndex(lits, cand, matchLen) >= 0;
+
+    // One diagnostic per distinct event per process (mirrors JinjaChatTemplate.WarnUnsupportedOnce):
+    // Console.Error is the only channel from this dependency-free Core type, deduped so a recurring
+    // condition can't spam the decode loop. Used for the otherwise-silent degradation paths — an
+    // opt-in best-effort feature must never wedge generation, but a *silent* no-op defeats the point
+    // of enabling it, so each abandonment leaves exactly one breadcrumb.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> s_warned = new();
+    private static void WarnOnce(string key, string message)
+    {
+        if (s_warned.TryAdd(key, 0))
+            Console.Error.WriteLine($"[SharpInference.ToolGrammar] {message}");
+    }
 }

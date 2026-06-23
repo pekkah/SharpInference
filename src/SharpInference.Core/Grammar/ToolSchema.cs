@@ -99,15 +99,24 @@ public sealed record ToolSchema(string Name, ToolSchemaObject Arguments)
     /// non-object / malformed schema yields an <see cref="ToolSchemaObject.Open"/> argument object
     /// (the grammar then constrains nothing for that tool — never blocks generation).
     /// </summary>
+    // Cap on schema nesting parsed. Tool schemas come straight from the request body, so an
+    // adversarially/accidentally deep schema must not blow the stack (a .NET StackOverflow is
+    // uncatchable and crashes the process). Past the cap a node degrades to Any / an open object,
+    // which the constraint leaves unconstrained anyway — no correctness loss for realistic schemas.
+    private const int MaxParseDepth = 32;
+
     public static ToolSchema FromOpenAiFunction(string name, JsonElement? parameters)
     {
         if (parameters is not { ValueKind: JsonValueKind.Object } p)
             return new ToolSchema(name, new ToolSchemaObject([], open: true));
-        return new ToolSchema(name, ParseObject(p));
+        return new ToolSchema(name, ParseObject(p, depth: 0));
     }
 
-    private static ToolSchemaObject ParseObject(JsonElement schema)
+    private static ToolSchemaObject ParseObject(JsonElement schema, int depth)
     {
+        if (depth >= MaxParseDepth)
+            return new ToolSchemaObject([], open: true);   // too deep — treat as unconstrained
+
         var required = new HashSet<string>(StringComparer.Ordinal);
         if (schema.TryGetProperty("required", out var req) && req.ValueKind == JsonValueKind.Array)
             foreach (var r in req.EnumerateArray())
@@ -124,7 +133,7 @@ public sealed record ToolSchema(string Name, ToolSchemaObject Arguments)
         {
             foreach (var prop in properties.EnumerateObject())
             {
-                var node = ParseNode(prop.Value);
+                var node = ParseNode(prop.Value, depth + 1);
                 props.Add(new ToolSchemaProperty(prop.Name, node, required.Contains(prop.Name)));
             }
         }
@@ -132,9 +141,9 @@ public sealed record ToolSchema(string Name, ToolSchemaObject Arguments)
         return new ToolSchemaObject(props, open);
     }
 
-    private static ToolSchemaNode ParseNode(JsonElement node)
+    private static ToolSchemaNode ParseNode(JsonElement node, int depth)
     {
-        if (node.ValueKind != JsonValueKind.Object)
+        if (node.ValueKind != JsonValueKind.Object || depth >= MaxParseDepth)
             return ToolSchemaNode.Any;
 
         var kind = ParseKind(node);
@@ -167,11 +176,11 @@ public sealed record ToolSchema(string Name, ToolSchemaObject Arguments)
 
         ToolSchemaNode? items = null;
         if (kind == JsonSchemaKind.Array && node.TryGetProperty("items", out var it))
-            items = ParseNode(it);
+            items = ParseNode(it, depth + 1);
 
         ToolSchemaObject? obj = null;
         if (kind == JsonSchemaKind.Object)
-            obj = ParseObject(node);
+            obj = ParseObject(node, depth + 1);
 
         return new ToolSchemaNode(kind, enumValues, items, obj);
     }
