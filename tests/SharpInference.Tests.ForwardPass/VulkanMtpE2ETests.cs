@@ -82,7 +82,9 @@ public sealed class VulkanMtpE2ETests
         const int N = 32;
         int[] stops = tokenizer.EogTokenIds.ToArray();
 
-        // ── MTP-OFF reference: plain greedy scalar Forward. ──
+        // ── MTP-OFF reference: plain greedy scalar Forward. Stop BEFORE emitting an EOG token,
+        //    matching MtpDecoder's convention (it commits content tokens and halts at a stop
+        //    without emitting it) so the two streams are length-comparable. ──
         var plain = new List<int>(N);
         {
             var logits = fwd.Prefill(prompt);
@@ -90,8 +92,8 @@ public sealed class VulkanMtpE2ETests
             int pos = prompt.Length;
             for (int i = 0; i < N; i++)
             {
-                plain.Add(tok);
                 if (Array.IndexOf(stops, tok) >= 0) break;
+                plain.Add(tok);
                 tok = ArgMax(fwd.Forward(tok, pos++));
             }
         }
@@ -116,6 +118,10 @@ public sealed class VulkanMtpE2ETests
         int firstDiff = -1;
         for (int i = 0; i < common; i++)
             if (plain[i] != mtp[i]) { firstDiff = i; break; }
+        // A common-prefix match with mismatched lengths is still a divergence (e.g. one stream
+        // stopped early); flag it at the first uncompared index so the assert below fires.
+        if (firstDiff < 0 && plain.Count != mtp.Count)
+            firstDiff = common;
 
         // MTP must actually speculate (chained drafts landing accepts on a repetitive prompt).
         Assert.True(emitted > 0, "MTP emitted no drafts — the head/decoder wiring is dead.");
