@@ -147,9 +147,15 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
 
     // ── Compilation ───────────────────────────────────────────────────────────
 
-    private static CompiledObject? TryCompileObject(ToolSchemaObject obj)
+    private static CompiledObject? TryCompileObject(ToolSchemaObject obj) => TryCompileObject(obj, 0);
+
+    // Depth-capped so compilation can't recurse unbounded — the parser already caps nesting, but the
+    // ToolSchema records are public, so a caller that builds a deeply-nested schema in-memory (not via
+    // the parser) would otherwise risk an uncatchable StackOverflow. Past the cap the tool is simply
+    // treated as non-constrainable (null), matching the "loosely-typed → unconstrained" contract.
+    private static CompiledObject? TryCompileObject(ToolSchemaObject obj, int depth)
     {
-        if (obj.Open || obj.Properties.Count is 0 or > 64) return null;
+        if (depth >= MaxDepth || obj.Open || obj.Properties.Count is 0 or > 64) return null;
         var keys = new byte[obj.Properties.Count][];
         var values = new CompiledNode[obj.Properties.Count];
         ulong reqMask = 0;
@@ -158,7 +164,7 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
             var p = obj.Properties[i];
             if (p.Name.Length == 0) return null;
             keys[i] = ToolSchema.Utf8(p.Name);
-            var node = TryCompileNode(p.Value);
+            var node = TryCompileNode(p.Value, depth + 1);
             if (node is null) return null;                  // a non-constrainable value → skip the tool
             values[i] = node;
             if (p.Required) reqMask |= 1UL << i;
@@ -169,8 +175,9 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
     private static readonly byte[][] s_boolLiterals = [ToolSchema.Utf8("true"), ToolSchema.Utf8("false")];
     private static readonly byte[][] s_nullLiterals = [ToolSchema.Utf8("null")];
 
-    private static CompiledNode? TryCompileNode(ToolSchemaNode node)
+    private static CompiledNode? TryCompileNode(ToolSchemaNode node, int depth)
     {
+        if (depth >= MaxDepth) return null;
         switch (node.Kind)
         {
             case JsonSchemaKind.String:
@@ -197,12 +204,12 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
             case JsonSchemaKind.Array:
                 // An untyped array (no items) isn't fully constrainable — skip the tool.
                 if (node.Items is null) return null;
-                var item = TryCompileNode(node.Items);
+                var item = TryCompileNode(node.Items, depth + 1);
                 return item is null ? null : new CompiledNode { Kind = JsonSchemaKind.Array, Items = item };
 
             case JsonSchemaKind.Object:
                 if (node.Object is null) return null;
-                var obj = TryCompileObject(node.Object);
+                var obj = TryCompileObject(node.Object, depth + 1);
                 return obj is null ? null : new CompiledNode { Kind = JsonSchemaKind.Object, Object = obj };
 
             default:
@@ -450,12 +457,13 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
         if ((top.Kind == FK.Str && top.State == SExpectOpen)
             || (top.Kind == FK.StrEnum && top.State == SeExpectOpen))
         {
-            for (int id = 0; id < buf.Length; id++)
-            {
-                if (id == _quoteId) kept++;
-                else buf[id] = float.NegativeInfinity;
-            }
-            return kept;
+            // Only the opening quote is legal — blanket -inf then restore the quote logit (faster
+            // than a branchy per-id loop over the 262k vocab).
+            float quoteLogit = (uint)_quoteId < (uint)buf.Length ? buf[_quoteId] : float.NegativeInfinity;
+            Array.Fill(buf, float.NegativeInfinity);
+            if (float.IsNegativeInfinity(quoteLogit)) return 0;
+            buf[_quoteId] = quoteLogit;
+            return 1;
         }
 
         // General path: prune by allowed first byte, then full-simulate the survivors. The quote
@@ -482,10 +490,13 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
 
     private bool SimulateToken(int token)
     {
+        // Save/restore the active frames around a trial replay. _depth is tiny (1–3 in practice), and
+        // this runs for every surviving candidate token, so a manual copy beats Array.Copy's per-call
+        // overhead.
         int savedDepth = _depth;
-        Array.Copy(_stack, _scratch, _depth);
+        for (int i = 0; i < savedDepth; i++) _scratch[i] = _stack[i];
         bool ok = RunToken(token);
-        Array.Copy(_scratch, _stack, savedDepth);
+        for (int i = 0; i < savedDepth; i++) _stack[i] = _scratch[i];
         _depth = savedDepth;
         return ok;
     }
