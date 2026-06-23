@@ -1212,6 +1212,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     private ComputePipeline? _gdnL2NormPerHeadBatchedPipeline;
     private ComputePipeline? _gdnTileHeadsBatchedPipeline;
     private ComputePipeline? _gdnRecurrenceScanPipeline;
+    // #356 PR5c: chunk-parallel GDN prefill pipeline.
+    private ComputePipeline? _gdnChunkedPrefillPipeline;
 
     // qwen35moe/qwen36 Gated-Attention support pipelines (issue #356)
     private ComputePipeline? _ropeNeoxPartialPipeline;
@@ -1268,6 +1270,13 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         public uint qStride; public uint kStride; public uint vStride; public uint vHeadOff;
         public uint zStride; public uint oStride; public uint nTok;
         public uint ringSlotStride; public uint nCapture; public uint ringScanOff;
+    }
+    // #356 PR5c: chunk-parallel GDN prefill push constants (no ring — clean-prefill only).
+    private struct GdnChunkedPrefillParams
+    {
+        public uint hv; public uint d; public float normEps;
+        public uint qStride; public uint kStride; public uint vStride; public uint vHeadOff;
+        public uint zStride; public uint oStride; public uint nTok;
     }
     private struct RoPEPartialParams { public uint numHeads; public uint headDim; public uint ropeDim; public int position; public float theta; }
     private struct SplitQgParams { public uint numHeads; public uint headDim; }
@@ -1663,6 +1672,86 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
              GetBuffer(alphaAll), GetBuffer(betaAll), GetBuffer(ssmA), GetBuffer(dtBias),
              GetBuffer(normWeight), GetBuffer(zAll), GetBuffer(outputAll),
              GetBuffer(capture ? ringScan! : state)],
+            (uint)numVHeads, &p);
+    }
+
+    /// <summary>GDN chunk size of the chunk-parallel prefill shader (matches CUDA GDN_CHUNK).</summary>
+    public const int GdnChunkSize = 64;
+
+    /// <summary>
+    /// Max bytes of compute shared memory the selected physical device guarantees
+    /// (<c>VkPhysicalDeviceProperties.limits.maxComputeSharedMemorySize</c>). The Vulkan minimum is
+    /// 16 KB; many GPUs guarantee only 32 KB.
+    /// </summary>
+    public uint MaxComputeSharedMemoryBytes => _deviceProperties.limits.maxComputeSharedMemorySize;
+
+    /// <summary>Shared-memory bytes the chunk-parallel prefill shader needs:
+    /// <c>(2·d + 3·C + 2·C·C) · 4</c> floats with d=128, C=<see cref="GdnChunkSize"/> (≈ 34,560 B).</summary>
+    private const uint GdnChunkedPrefillSharedBytes =
+        (uint)((2 * 128 + 3 * GdnChunkSize + 2 * GdnChunkSize * GdnChunkSize) * sizeof(float));
+
+    /// <summary>
+    /// True when the device's <see cref="MaxComputeSharedMemoryBytes"/> can fit the chunk-parallel GDN
+    /// prefill shader (≈ 34,560 B). On a device that can't (only the 32 KB minimum), the caller must
+    /// fall back to <see cref="GdnRecurrenceScan"/>; <see cref="GdnChunkedPrefill"/> throws
+    /// <see cref="NotSupportedException"/> rather than launch a shader that exceeds the limit.
+    /// </summary>
+    public bool SupportsGdnChunkedPrefill => MaxComputeSharedMemoryBytes >= GdnChunkedPrefillSharedBytes;
+
+    /// <summary>
+    /// Chunk-parallel ("FlashQLA-style chunk_gated_delta_rule") GDN prefill scan over
+    /// <paramref name="nTok"/> tokens: ONE dispatch (one workgroup per v-head) walks the chunk grid
+    /// (<see cref="GdnChunkSize"/> tokens per block), resolving each block's intra-chunk delta-rule
+    /// coupling by forward substitution and carrying the per-head state in place. Same inputs/strides
+    /// and in-place state update as <see cref="GdnRecurrenceScan"/> (minus the ring args — chunked is
+    /// clean-prefill only). Mirrors CUDA <c>CudaBackend.GdnChunkedPrefill</c>.
+    /// </summary>
+    /// <remarks>
+    /// Numerically EQUAL to the sequential scan up to floating-point reduction order: the chunked form
+    /// reorders the FP reductions, so it is argmax-stable but NOT byte-exact against
+    /// <see cref="GdnRecurrenceScan"/>. The shader needs ≈ 34,560 B of shared memory; this throws
+    /// <see cref="NotSupportedException"/> when <see cref="SupportsGdnChunkedPrefill"/> is false so the
+    /// caller can fall back to the scan.
+    /// </remarks>
+    public void GdnChunkedPrefill(
+        Tensor state, Tensor qAll, Tensor kAll, Tensor vAll,
+        Tensor alphaAll, Tensor betaAll, Tensor ssmA, Tensor dtBias,
+        Tensor normWeight, Tensor zAll, Tensor outputAll,
+        int numVHeads, int headDim, float normEps,
+        int qStride, int kStride, int vStride, int vHeadOff, int zStride, int oStride, int nTok)
+    {
+        if (headDim != 128)
+            throw new ArgumentOutOfRangeException(nameof(headDim), headDim,
+                "The Vulkan GDN chunked-prefill shader is specialized for headDim=128.");
+        if (numVHeads < 1)
+            throw new ArgumentOutOfRangeException(nameof(numVHeads), numVHeads, "numVHeads must be >= 1.");
+        if (nTok < 1)
+            throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be >= 1.");
+        if (!SupportsGdnChunkedPrefill)
+            throw new NotSupportedException(
+                $"The chunk-parallel GDN prefill shader needs {GdnChunkedPrefillSharedBytes} bytes of " +
+                $"compute shared memory but the device guarantees only {MaxComputeSharedMemoryBytes}. " +
+                "Fall back to GdnRecurrenceScan (check SupportsGdnChunkedPrefill before calling).");
+
+        _gdnChunkedPrefillPipeline ??= new ComputePipeline(this, Shaders.GdnChunkedPrefill, 11,
+            pushConstantSize: sizeof(GdnChunkedPrefillParams));
+        var p = new GdnChunkedPrefillParams
+        {
+            hv = (uint)numVHeads,
+            d = (uint)headDim,
+            normEps = normEps,
+            qStride = (uint)qStride,
+            kStride = (uint)kStride,
+            vStride = (uint)vStride,
+            vHeadOff = (uint)vHeadOff,
+            zStride = (uint)zStride,
+            oStride = (uint)oStride,
+            nTok = (uint)nTok,
+        };
+        DispatchOrRecord(_gdnChunkedPrefillPipeline,
+            [GetBuffer(state), GetBuffer(qAll), GetBuffer(kAll), GetBuffer(vAll),
+             GetBuffer(alphaAll), GetBuffer(betaAll), GetBuffer(ssmA), GetBuffer(dtBias),
+             GetBuffer(normWeight), GetBuffer(zAll), GetBuffer(outputAll)],
             (uint)numVHeads, &p);
     }
 
@@ -3212,6 +3301,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         _gdnL2NormPerHeadBatchedPipeline?.Dispose();
         _gdnTileHeadsBatchedPipeline?.Dispose();
         _gdnRecurrenceScanPipeline?.Dispose();
+        _gdnChunkedPrefillPipeline?.Dispose();
         _ropeNeoxPartialPipeline?.Dispose();
         _splitQgPipeline?.Dispose();
         _ropeNeoxPartialBatchedPipeline?.Dispose();

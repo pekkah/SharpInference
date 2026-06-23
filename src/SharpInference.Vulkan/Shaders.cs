@@ -945,6 +945,188 @@ internal static class Shaders
         """;
 
     /// <summary>
+    /// Chunk-parallel ("FlashQLA-style chunk_gated_delta_rule") GDN prefill scan over
+    /// <c>n_tok</c> tokens (issue #356 PR5c). ONE workgroup per v-head, <c>local_size_x = headDim</c>
+    /// (HARDCODED 128 — same specialization as <see cref="GdnRecurrenceScan"/>); thread <c>j</c> owns
+    /// value-column <c>j</c> of the state, projections, pseudo-values and output. The workgroup walks
+    /// the chunk grid (<c>GDN_CHUNK = 64</c> tokens per block) and resolves each block's intra-chunk
+    /// delta-rule coupling by forward substitution over a fixed tile, rather than the per-token scan of
+    /// <see cref="GdnRecurrenceScan"/>. Mirrors CUDA <c>llm_gdn_chunked_prefill</c> /
+    /// CPU <c>GdnKernels.GdnRecurrenceChunkedPrefill</c> op-for-op.
+    ///
+    /// Numerically EQUAL to the sequential scan up to floating-point reduction order: the chunked form
+    /// reorders the FP reductions, so it is argmax-stable but NOT byte-exact against
+    /// <see cref="GdnRecurrenceScan"/> (the same parity class as the CUDA/CPU chunked path).
+    ///
+    /// Same per-head input strides as <see cref="GdnRecurrenceScan"/>: q/k from the tiled
+    /// <c>[n_tok, value_dim]</c> buffers (q_stride/k_stride; head h at <c>i*stride + h*d</c>), v from
+    /// the silu'd conv output <c>[n_tok, conv_ch]</c> at <c>v_head_off + h*d</c> (v_stride), z from
+    /// <c>[n_tok, value_dim]</c> (z_stride), alpha/beta from <c>[n_tok, num_v_heads]</c>, output to
+    /// <c>[n_tok, value_dim]</c> (o_stride). NO ring binding — chunked is clean-prefill only.
+    ///
+    /// Shared memory ≈ 34,560 bytes (<c>sNormW[128] + sCum/sG/sB[64] + sKK/sKQ[64*64] + sRed[128]</c>),
+    /// over the 32 KB some GPUs guarantee — the wrapper gates on
+    /// <c>VulkanBackend.SupportsGdnChunkedPrefill</c> and falls back to the scan otherwise.
+    /// Push constants: { uint hv, uint d, float norm_eps, uint q_stride, uint k_stride, uint v_stride,
+    ///   uint v_head_off, uint z_stride, uint o_stride, uint n_tok }.
+    /// Bindings: 0=state (in/out), 1=q, 2=k, 3=v, 4=alpha_in, 5=beta, 6=ssm_a, 7=dt_bias,
+    ///   8=norm_weight, 9=z (all readonly), 10=output (writeonly).
+    /// Dispatch: hv workgroups of 128 threads (groupY=1; loops the chunk grid internally).
+    /// </summary>
+    internal const string GdnChunkedPrefill = """
+        #version 450
+        #extension GL_EXT_control_flow_attributes : enable
+
+        layout(local_size_x = 128) in;
+
+        layout(binding = 0)            buffer State  { float state_data[]; };
+        layout(binding = 1) readonly   buffer Q      { float q_data[]; };
+        layout(binding = 2) readonly   buffer K      { float k_data[]; };
+        layout(binding = 3) readonly   buffer V      { float v_data[]; };
+        layout(binding = 4) readonly   buffer AlphaIn{ float alpha_data[]; };
+        layout(binding = 5) readonly   buffer Beta   { float beta_data[]; };
+        layout(binding = 6) readonly   buffer SsmA   { float ssma_data[]; };
+        layout(binding = 7) readonly   buffer DtBias { float dtbias_data[]; };
+        layout(binding = 8) readonly   buffer NormW  { float normw_data[]; };
+        layout(binding = 9) readonly   buffer Z      { float z_data[]; };
+        layout(binding = 10) writeonly buffer O      { float o_data[]; };
+
+        layout(push_constant) uniform Params {
+            uint hv;
+            uint d;
+            float norm_eps;
+            uint q_stride;
+            uint k_stride;
+            uint v_stride;
+            uint v_head_off;
+            uint z_stride;
+            uint o_stride;
+            uint n_tok;
+        };
+
+        // GDN_CHUNK = 64 (compile-time). d is fixed at 128 (== local_size_x == headDim).
+        shared float sNormW[128];
+        shared float sCum[64];          // cumulative log-decay (sequential)
+        shared float sG[64];            // exp(cum_t)
+        shared float sB[64];            // sigmoid(beta_t)
+        shared float sKK[64 * 64];      // K_s·K_t  (lower triangle s<=t)
+        shared float sKQ[64 * 64];      // K_s·Q_t  (lower triangle s<=t)
+        shared float sRed[128];         // RMSNorm reduction
+
+        void main() {
+            uint h = gl_WorkGroupID.x;
+            uint j = gl_LocalInvocationID.x;
+
+            sNormW[j] = normw_data[j];          // layer-constant; each thread reads own j
+            uint state_base = h * 16384u;       // h * d * d
+            float inv_sqrt_d = inversesqrt(128.0);
+
+            float projK[64];
+            float projQ[64];
+            float u[64];
+
+            for (uint c0 = 0u; c0 < n_tok; c0 += 64u) {
+                uint cN = n_tok - c0; if (cN > 64u) cN = 64u;
+
+                // Per-token scalars: cumulative log-decay is sequential → thread 0 fills shared.
+                if (j == 0u) {
+                    float run = 0.0;
+                    for (uint t = 0u; t < cN; t++) {
+                        float ax = alpha_data[(c0 + t) * hv + h] + dtbias_data[h];
+                        float dt = ax >= 20.0 ? ax : log(1.0 + exp(ax));     // softplus
+                        run += dt * ssma_data[h];
+                        sCum[t] = run;
+                        sG[t]   = exp(run);
+                        sB[t]   = 1.0 / (1.0 + exp(-beta_data[(c0 + t) * hv + h]));
+                    }
+                }
+                barrier();
+
+                // K·K and K·Q dot matrices (lower triangle s<=t); shared across all columns j.
+                for (uint idx = j; idx < cN * cN; idx += 128u) {
+                    uint t = idx / cN;
+                    uint s = idx - t * cN;
+                    if (s <= t) {
+                        uint ks = (c0 + s) * k_stride + h * d;
+                        uint kt = (c0 + t) * k_stride + h * d;
+                        uint qt = (c0 + t) * q_stride + h * d;
+                        float kk = 0.0, kq = 0.0;
+                        for (uint i = 0u; i < 128u; i++) {
+                            float ksi = k_data[ks + i];
+                            kk += ksi * k_data[kt + i];
+                            kq += ksi * q_data[qt + i];
+                        }
+                        sKK[t * 64u + s] = kk;
+                        sKQ[t * 64u + s] = kq;
+                    }
+                }
+                barrier();
+
+                // S0 projections (column j): projK[t]=Σ_i K_t[i]·S0[i,j], projQ[t]=Σ_i Q_t[i]·S0[i,j].
+                for (uint t = 0u; t < cN; t++) {
+                    uint kt = (c0 + t) * k_stride + h * d;
+                    uint qt = (c0 + t) * q_stride + h * d;
+                    float pk = 0.0, pq = 0.0;
+                    for (uint i = 0u; i < 128u; i++) {
+                        float sij = state_data[state_base + i * 128u + j];
+                        pk += k_data[kt + i] * sij;
+                        pq += q_data[qt + i] * sij;
+                    }
+                    projK[t] = pk;
+                    projQ[t] = pq;
+                }
+
+                // Forward substitution: u_t = b_t(v_t − g_t·projK_t) − Σ_{s<t} A[t,s] u_s.
+                for (uint t = 0u; t < cN; t++) {
+                    uint vt = (c0 + t) * v_stride + v_head_off + h * d;
+                    float bt = sB[t];
+                    float uj = bt * (v_data[vt + j] - sG[t] * projK[t]);
+                    for (uint s = 0u; s < t; s++) {
+                        float a = bt * exp(sCum[t] - sCum[s]) * sKK[t * 64u + s];
+                        uj -= a * u[s];
+                    }
+                    u[t] = uj;
+                }
+
+                // Output + per-head RMSNorm + SiLU(z) gate.
+                for (uint t = 0u; t < cN; t++) {
+                    float o = sG[t] * projQ[t];
+                    for (uint s = 0u; s <= t; s++)
+                        o += exp(sCum[t] - sCum[s]) * sKQ[t * 64u + s] * u[s];
+                    o *= inv_sqrt_d;
+
+                    sRed[j] = o * o;
+                    barrier();
+                    [[unroll]] for (uint red = 64u; red > 0u; red >>= 1) {
+                        if (j < red) sRed[j] += sRed[j + red];
+                        barrier();
+                    }
+                    float scale = inversesqrt(sRed[0] / 128.0 + norm_eps);
+                    float on = o * scale * sNormW[j];
+                    float zv = z_data[(c0 + t) * z_stride + h * d + j];
+                    float silu = zv / (1.0 + exp(-zv));
+                    o_data[(c0 + t) * o_stride + h * d + j] = on * silu;
+                    barrier();
+                }
+
+                // State carry: S[i,j] = g_{cN-1}·S[i,j] + Σ_s exp(cum_{cN-1}−cum_s)·K_s[i]·u_s.
+                float gLast = sG[cN - 1u];
+                float cumLast = sCum[cN - 1u];
+                for (uint i = 0u; i < 128u; i++) {
+                    uint off = state_base + i * 128u + j;
+                    float acc = gLast * state_data[off];
+                    for (uint s = 0u; s < cN; s++) {
+                        uint ks = (c0 + s) * k_stride + h * d;
+                        acc += exp(cumLast - sCum[s]) * k_data[ks + i] * u[s];
+                    }
+                    state_data[off] = acc;
+                }
+                barrier();   // chunk boundary: next chunk overwrites shared
+            }
+        }
+        """;
+
+    /// <summary>
     /// RoPE NEOX *partial* rotation: rotates only the first <c>rope_dim</c> of each
     /// <c>head_dim</c>-wide head and passes dims <c>[rope_dim, head_dim)</c> through untouched.
     /// qwen35moe/qwen36 Gated-Attention rotates only the first 64 of each 256-dim head; the

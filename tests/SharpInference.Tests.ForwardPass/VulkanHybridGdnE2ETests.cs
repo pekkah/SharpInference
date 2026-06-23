@@ -293,6 +293,87 @@ public sealed class VulkanHybridGdnE2ETests
     }
 
     /// <summary>
+    /// Self-parity for the opt-in FlashQLA chunked prefill scan (issue #356 PR5c): prefill the same
+    /// prompt on the dense 27B-MTP GDN model with the batched trunk in both runs, toggling only
+    /// <c>SHARPI_VULKAN_GDN_CHUNKED_PREFILL</c> (1 = the chunk-parallel GdnChunkedPrefill, unset =
+    /// the byte-exact fused GdnRecurrenceScan), then greedy-decode <see cref="DecodeSteps"/> tokens
+    /// on each. The chunked scan is argmax-stable (FP reduction order differs, not byte-exact), so
+    /// the gate is argmax agreement (the per-step token streams must match). Silent-skips when
+    /// Vulkan/GGUF absent or the device can't fit the ~34 KB chunked-scan shared tile.
+    /// </summary>
+    [Fact]
+    public void VulkanHybridGdn_ChunkedPrefill_MatchesFusedScanArgmax()
+    {
+        var path = FindDenseModelPath();
+        if (path is null) return;                                   // model-gated
+        using (var probe = TryCreateVulkan())
+        {
+            if (probe is null) return;                             // Vulkan-gated
+            if (!probe.SupportsGdnChunkedPrefill) return;          // device shared-mem too small
+        }
+
+        using var model = GgufModel.Open(path);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        Assert.True(hp.IsHybridSsm, "Expected hp.IsHybridSsm for the qwen36 GDN model");
+
+        var tokenizer = GgufTokenizer.FromGgufModel(model);
+        var prompt = tokenizer.Encode("The quick brown fox jumps over the lazy dog near the river bank at dawn.");
+        Assert.True(prompt.Count > 1 && prompt.Count + DecodeSteps <= 4096);
+
+        // Run prefill + greedy decode with the chunked-scan gate set to `gateVal` (batched ON).
+        int[] RunWithChunked(string gateVal)
+        {
+            string? prev = Environment.GetEnvironmentVariable("SHARPI_VULKAN_GDN_CHUNKED_PREFILL");
+            Environment.SetEnvironmentVariable("SHARPI_VULKAN_GDN_CHUNKED_PREFILL", gateVal);
+            try
+            {
+                VulkanBackend gpu;
+                try { gpu = new VulkanBackend(); }
+                catch { return Array.Empty<int>(); }
+                using (gpu)
+                {
+                    VulkanHybridGdnForwardPass fwd;
+                    try { fwd = new VulkanHybridGdnForwardPass(model, gpu, hp, GdnPlacement(hp)); }
+                    catch (VkException ex) when (ex.Result == VkResult.ErrorOutOfDeviceMemory)
+                    {
+                        return Array.Empty<int>();
+                    }
+                    using (fwd)
+                    {
+                        var outTokens = new int[DecodeSteps];
+                        var logits = fwd.Prefill(prompt);
+                        AssertFinite(logits, $"Vulkan prefill (chunked={gateVal})");
+                        outTokens[0] = Argmax(logits);
+                        int pos = prompt.Count;
+                        for (int i = 1; i < DecodeSteps; i++)
+                        {
+                            var step = fwd.Forward(outTokens[i - 1], pos++);
+                            AssertFinite(step, $"Vulkan decode step {i} (chunked={gateVal})");
+                            outTokens[i] = Argmax(step);
+                        }
+                        return outTokens;
+                    }
+                }
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("SHARPI_VULKAN_GDN_CHUNKED_PREFILL", prev);
+            }
+        }
+
+        int[] chunked = RunWithChunked("1");
+        if (chunked.Length == 0) return;
+        int[] fused = RunWithChunked("0");
+        if (fused.Length == 0) return;
+
+        for (int i = 0; i < DecodeSteps; i++)
+            Assert.True(chunked[i] == fused[i],
+                $"Chunked vs fused-scan prefill argmax diverge at step {i}: chunked={chunked[i]} fused={fused[i]}. " +
+                $"chunked=[{string.Join(",", chunked)}] fused=[{string.Join(",", fused)}]. " +
+                "GdnChunkedPrefill is argmax-stable vs GdnRecurrenceScan (FP-noise close for L2-normed inputs).");
+    }
+
+    /// <summary>
     /// Greedy-decode argmax parity Vulkan vs CUDA on the GDN+MoE model (Qwen3.6-35B-A3B,
     /// PR4 Round 2). On a 12 GB-class card neither backend can cache the 256 experts × 40
     /// layers in VRAM, so both auto-select (and we pin via SHARPI_CPU_MOE=1) the CPU-MoE
