@@ -1571,7 +1571,11 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         if (kernelSize is < 1 or > 5)
             throw new ArgumentOutOfRangeException(nameof(kernelSize), kernelSize, "kernelSize must be in [1, 5].");
         if (channels < 1) throw new ArgumentOutOfRangeException(nameof(channels), channels, "channels must be >= 1.");
-        if (ringFloatOffset < 0) throw new ArgumentOutOfRangeException(nameof(ringFloatOffset), ringFloatOffset, "ringFloatOffset must be >= 0.");
+        if (ringSlotStride < 0) throw new ArgumentOutOfRangeException(nameof(ringSlotStride), ringSlotStride, "ringSlotStride must be >= 0.");
+        // ringFloatOffset is narrowed to a uint push constant; guard the (unreachable-in-practice)
+        // overflow so a too-large ring offset fails loud rather than silently wrapping.
+        if (ringFloatOffset is < 0 or > uint.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(ringFloatOffset), ringFloatOffset, "ringFloatOffset must be in [0, uint.MaxValue].");
         _gdnConv1dStateCaptureRingPipeline ??= new ComputePipeline(this, Shaders.GdnConv1dStateCaptureRing, 3,
             pushConstantSize: sizeof(GdnConvCaptureRingParams));
         var p = new GdnConvCaptureRingParams
