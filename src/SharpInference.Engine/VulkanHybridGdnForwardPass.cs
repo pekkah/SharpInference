@@ -626,11 +626,10 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
 
         // PR5c (#356): opt-in chunked recurrence scan. Default OFF; only when the device fits the
         // ~34 KB shared tile (SupportsGdnChunkedPrefill). Argmax-stable, not byte-exact.
-        _chunkedPrefillEnabled =
-            Environment.GetEnvironmentVariable("SHARPI_VULKAN_GDN_CHUNKED_PREFILL") == "1"
-            && gpu.SupportsGdnChunkedPrefill;
-        if (Environment.GetEnvironmentVariable("SHARPI_VULKAN_GDN_CHUNKED_PREFILL") == "1"
-            && !gpu.SupportsGdnChunkedPrefill)
+        bool chunkedRequested =
+            Environment.GetEnvironmentVariable("SHARPI_VULKAN_GDN_CHUNKED_PREFILL") == "1";
+        _chunkedPrefillEnabled = chunkedRequested && gpu.SupportsGdnChunkedPrefill;
+        if (chunkedRequested && !gpu.SupportsGdnChunkedPrefill)
             Console.Error.WriteLine(
                 "[VulkanHybridGdnForwardPass] SHARPI_VULKAN_GDN_CHUNKED_PREFILL=1 requested but the device's " +
                 $"maxComputeSharedMemorySize ({gpu.MaxComputeSharedMemoryBytes} B) is below the ~34 KB the chunked " +
