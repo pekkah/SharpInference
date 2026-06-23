@@ -172,6 +172,7 @@ sharpi-cli -m models/Qwen3.6-27B-MTP-Q4_K_M.gguf -g -1 \
 |---|---:|---:|---:|---|
 | **CUDA** `-g -1 --no-thinking` (hybrid) | 16 GB | **10.0** | **12.3** | GDN/attn KV resident on GPU, dense FFN on CPU mmap (the k=4 ring reclaims the VRAM the old k=2 default spent on 22 GPU FFN layers). 84% acceptance; 4-input CPU-FFN `MatVec4In` (#209) moves the verify optimum from k=2 → k=4 — **1.9× over MTP-off (6.5)**, +22% over the old k=2 default (10.1) |
 | **CUDA** `-g -1 --no-thinking` `Q5_K_M` (hybrid) | 19 GB | 6.2 | **5.5** | 13/64 FFN on GPU, 51/64 CPU mmap. 98% acceptance; batched trunk (#119) bit-identical |
+| Vulkan `-g -1 --no-thinking` (hybrid) | 16 GB | 6.0 | **5.8** | GDN/attn on GPU, dense FFN CPU mmap; MTP self-spec now runs on Vulkan (#357), greedy **byte-identical** to its MTP-off decode. 98% acceptance; **1.14× over MTP-off (5.1)** — modest vs CUDA's 1.9× because the per-row CPU FFN dominates the 12 GB hybrid and isn't amortized in batched verify (the #356 batched-trunk limitation); full-offload configs gain more |
 | CPU `--no-thinking` | 16 GB | 3.0 | **3.6** | dense 27B GDN/attn + native MTP head; auto MTP self-spec (#25) at greedy + `--no-thinking`. 90% draft acceptance; folded k-token batched verify (#30/#207) — 1.2× over MTP-off (3.0) |
 | CPU `--no-thinking` `Q5_K_M` | 19 GB | 2.8 | **3.5** | ~10% slower than Q4_K_M; 100% acceptance |
 
@@ -194,9 +195,11 @@ each after a discarded warm-clock warm-up. The CPU and Vulkan rows are from the 
 ~1K ctx), except the Gemma 4 E4B q4_0 Vulkan row, freshly measured 2026-06-22 with the same convention after
 the #351 gemma4-on-Vulkan work (PLE + shared-KV + narrowed KV). Vulkan rows remain ~35% below their earlier
 numbers — an unexplained regression (CUDA improved on the same box). Llama-4 Scout and Qwen3-Coder
-Vulkan-hybrid keep prior values (not re-runnable here). The Qwen3.6 family (Gated-DeltaNet + MoE/MTP:
-35B-A3B, 27B-MTP, 35B-A3B-MTP, Carnice) has no Vulkan rows — GDN is not yet implemented on Vulkan (#356;
-the MTP self-spec speedup is the #357 follow-up), so those models require `--backend cuda` or `-g 0` (CPU)._
+Vulkan-hybrid keep prior values (not re-runnable here). The Qwen3.6 Gated-DeltaNet family now runs on
+`--backend vulkan` too (#356) — including MTP self-speculative decoding (#357), greedy byte-identical to the
+MTP-off Vulkan decode. The 27B-MTP Vulkan row above is freshly measured 2026-06-23 with the same convention;
+the 35B-A3B / 35B-A3B-MTP / Carnice MoE+GDN models also run on Vulkan (CPU-MoE on a 12 GB card) but are
+benched only on CUDA so far._
 
 **Long-context decode** uses flash-decoding (split-KV) on all CUDA paths (dense + MoE/GDN hybrids): the
 per-token KV read parallelizes across SMs, so decode no longer collapses with context (Gemma 4 E4B q8
