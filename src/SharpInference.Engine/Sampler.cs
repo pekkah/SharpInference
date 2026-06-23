@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using SharpInference.Core.Grammar;
 
 namespace SharpInference.Engine;
 
@@ -575,6 +576,21 @@ public sealed record SamplingParams
     /// Typically a sliding window of the last N generated tokens.
     /// </summary>
     public IReadOnlyList<int>? PreviousTokens { get; init; }
+
+    /// <summary>
+    /// Optional grammar/FSM constraint applied during decoding (issue #374). The engine advances it
+    /// with every emitted token and, while it reports <see cref="ITokenConstraint.IsConstraining"/>,
+    /// masks the logits to only the tokens it permits before sampling — forcing e.g. a tool call's
+    /// arguments to satisfy the supplied JSON Schema in the model's native call syntax. The
+    /// constraint is stateful and single-request. <c>null</c> (default) = unconstrained decoding,
+    /// byte-identical to the pre-#374 path.
+    /// <para>
+    /// Honored by the single-user <c>InferenceEngine</c> only. <c>ContinuousBatchingEngine</c>
+    /// (<c>SHARPI_MAX_BATCH</c>) does not yet apply it — it samples each batched sequence directly
+    /// and warns once when a constraint-bearing request is admitted.
+    /// </para>
+    /// </summary>
+    public ITokenConstraint? Constraint { get; init; }
 
     /// <summary>
     /// Maximum thinking-mode tokens before the engine forces a <c>&lt;/think&gt;</c> close.

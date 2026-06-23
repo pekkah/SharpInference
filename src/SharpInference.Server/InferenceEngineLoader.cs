@@ -178,7 +178,12 @@ public static class InferenceEngineLoader
             throw;
         }
 
-        return new LoadedEngine(engine, arch, tokenizer.ChatTemplate, toolBoundaryStopTokenIds);
+        // Grammar-constrained tool-call decoding (issue #374): expose a vocabulary view built from
+        // the model's tokenizer. The full-vocab byte table inside it is materialised lazily on first
+        // constrained request, so this costs nothing unless tool-grammar is actually used.
+        var grammarVocab = new SharpInference.Core.Grammar.GrammarVocabulary(tokenizer);
+
+        return new LoadedEngine(engine, arch, tokenizer.ChatTemplate, toolBoundaryStopTokenIds, grammarVocab);
     }
 
     // ── Backend dispatch ─────────────────────────────────────────────────────

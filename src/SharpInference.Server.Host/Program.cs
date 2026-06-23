@@ -70,6 +70,15 @@ builder.Services.AddSharpInference(builder.Configuration, opts =>
     {
         opts.DisableThinking = true;
     }
+
+    // SHARPI_TOOL_GRAMMAR ∈ {1, true} enables schema/grammar-constrained tool-call argument
+    // decoding (issue #374). Off by default → byte-identical to unconstrained decoding.
+    var envToolGrammar = Environment.GetEnvironmentVariable("SHARPI_TOOL_GRAMMAR");
+    if (!string.IsNullOrWhiteSpace(envToolGrammar)
+        && (envToolGrammar == "1" || envToolGrammar.Equals("true", StringComparison.OrdinalIgnoreCase)))
+    {
+        opts.ToolGrammar = true;
+    }
 });
 
 var app = builder.Build();

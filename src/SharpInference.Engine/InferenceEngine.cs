@@ -721,6 +721,12 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                     // PrefillMtp / batched verify don't model that, so never engage MTP here.
                     if (imageBytes is { Count: > 0 }) useMtp = false;
 
+                    // Grammar-constrained decoding (#374) masks logits per token, which the MTP
+                    // batched-verify path doesn't model — fall back to per-token decode so the
+                    // constraint sees and gates every sampled token.
+                    var constraint = sp.Constraint;
+                    if (constraint is not null) { useMtp = false; constraint.Reset(); }
+
                     // --spec-draft-n-max parity with llama.cpp (issue #30): the MTP
                     // draft-chain length per step. Unset (0) resolves via
                     // SHARPI_MTP_DRAFT_N → built-in default; MtpDecoder clamps per
@@ -968,9 +974,12 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                     // argmax on-device, carry just the next token id instead of downloading the full
                     // vocab logits every step. gpuNext holds the argmax of the most recent forward;
                     // the first comes from the prefill logits already on the host.
+                    // A constraint masks logits before sampling, so the device-side argmax fast path
+                    // (which never downloads the full vocab) can't be used while one is attached.
                     bool useGpuArgmax = sp.Temperature <= 0f
                         && _fwd.SupportsGpuArgmax
-                        && sp.LogitBias is not { Count: > 0 };
+                        && sp.LogitBias is not { Count: > 0 }
+                        && constraint is null;
                     int gpuNext = useGpuArgmax ? Sampler.Greedy(logits) : 0;
 
                     for (int i = 0; i < sp.MaxNewTokens; i++)
@@ -993,10 +1002,20 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         }
                         else
                         {
+                            // While the constraint is inside a constrained region, sample from the
+                            // masked logits (grammar-forbidden tokens set to -inf); otherwise sample
+                            // the raw logits exactly as the unconstrained path would.
+                            var sampleLogits = constraint is { IsConstraining: true }
+                                ? constraint.Filter(logits)
+                                : logits;
                             next = sp.Temperature <= 0f
-                                ? Sampler.Greedy(logits)
-                                : Sampler.Sample(logits, sp, rng);
+                                ? Sampler.Greedy(sampleLogits)
+                                : Sampler.Sample(sampleLogits, sp, rng);
                         }
+
+                        // Advance the grammar constraint with the just-chosen token (every token,
+                        // so it can detect a tool-call boundary and begin/end constraining).
+                        constraint?.Accept(next);
 
                         // Record every emitted/consumed token (stop tokens included) so the
                         // post-decode snapshot of _prevTokens reflects the full transcript.

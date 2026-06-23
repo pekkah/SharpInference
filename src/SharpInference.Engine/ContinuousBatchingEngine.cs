@@ -59,6 +59,10 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
     private int _pendingCount;
     private int _activeCount;
 
+    // Set once (Interlocked) the first time a constraint-bearing request is seen, so the
+    // tool-grammar-ignored warning (issue #374) is emitted at most once per engine.
+    private int _warnedConstraintIgnored;
+
     private sealed class PendingRequest(string prompt, SamplingParams sp, CancellationToken ct, Channel<GenerateChunk> output)
     {
         public readonly string Prompt = prompt;
@@ -216,6 +220,18 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         string? canonicalHistoryPrefix = null)
     {
         _ = canonicalHistoryPrefix; // intentionally ignored; see XML remarks
+
+        // Grammar-constrained decoding (issue #374) is not wired into the batched sampler — each
+        // sequence is sampled directly from its logits with no per-token mask/advance. Rather than
+        // silently drop the constraint (the request would generate unconstrained tool arguments with
+        // no signal), warn once so an operator who set SHARPI_TOOL_GRAMMAR alongside SHARPI_MAX_BATCH
+        // knows the two don't yet compose. Single-user InferenceEngine honors the constraint.
+        if (sp.Constraint is not null && Interlocked.Exchange(ref _warnedConstraintIgnored, 1) == 0)
+            Console.Error.WriteLine(
+                "[ContinuousBatchingEngine] tool-grammar constraint is ignored under continuous " +
+                "batching (SHARPI_MAX_BATCH); tool-call arguments will be generated unconstrained. " +
+                "Run without batching to use SHARPI_TOOL_GRAMMAR (issue #374).");
+
         var channel = Channel.CreateUnbounded<GenerateChunk>(
             new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
 

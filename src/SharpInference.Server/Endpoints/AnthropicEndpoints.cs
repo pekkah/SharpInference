@@ -150,6 +150,15 @@ public static class AnthropicEndpoints
         if (req.Tools is { Length: > 0 } && chatTemplate.ToolBoundaryStopTokenIds is { Count: > 0 } toolStops)
             sp = sp with { AdditionalStopTokenIds = [.. toolStops] };
 
+        // Schema/grammar-constrained tool-argument decoding (issue #374): opt-in. Restricts the
+        // sampler to tokens that keep the arguments schema-conformant in the model's native syntax.
+        if (req.Tools is { Length: > 0 } && ToolGrammarHelper.Enabled(opts))
+        {
+            var schemas = ToolGrammarHelper.ToSchemas(req.Tools.Select(t => (t.Name, t.InputSchema)));
+            if (chatTemplate.BuildToolArgumentConstraint(schemas) is { } constraint)
+                sp = sp with { Constraint = constraint };
+        }
+
         var msgId = $"msg_{Guid.NewGuid():N}";
         var modelId = engine.ModelId;
 

@@ -40,6 +40,14 @@ public interface ITokenizer
     bool AddBosToken { get; }
 
     /// <summary>
+    /// Special-token name → vocab id map (control / user-defined tokens such as Gemma's
+    /// <c>&lt;|"|&gt;</c>, <c>&lt;|tool_call&gt;</c>). Empty for tokenizers that don't expose one.
+    /// Used by grammar-constrained decoding (issue #374) to resolve a model's structural tokens to
+    /// ids; a vocab-backed tokenizer (<see cref="GgufTokenizer"/>) returns the real map.
+    /// </summary>
+    IReadOnlyDictionary<string, int> SpecialTokens => ImmutableDictionary<string, int>.Empty;
+
+    /// <summary>
     /// The <c>(Open, Close)</c> special-token IDs that bracket this model's reasoning stream, or
     /// <c>(-1, -1)</c> when the vocabulary defines none. An engine uses these to split the
     /// reasoning channel out of the user-facing text stream (boundary tokens themselves are
