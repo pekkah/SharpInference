@@ -721,6 +721,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                         RecommendedCtxSize: ctxSize > 0 ? ctxSize : Math.Min(hp.ContextLength, 4096));
                     var vhgdn = new VulkanHybridGdnForwardPass(model, gpu, hp, placement);
                     gpuFwd = vhgdn;
+                    // #357 PR4: the Vulkan GDN hybrid now ships an MTP/NEXTN head (HasMtpHead +
+                    // SupportsBatchVerify), so admit it into the MtpDecoder path exactly like the
+                    // CUDA branch above. ResolveCliMtp gates the rest on --spec-type / greedy / no-think.
+                    if (vhgdn.HasMtpHead) mtpFwd = vhgdn;
                     forward = vhgdn.Forward;
                     prefill = tokens => vhgdn.Prefill(tokens);
                     resetCache = vhgdn.ResetCache;
