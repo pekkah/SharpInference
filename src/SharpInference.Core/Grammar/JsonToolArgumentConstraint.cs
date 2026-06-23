@@ -348,17 +348,30 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
         Array.Clear(_firstByteOk);
         CollectFirstBytes(_depth - 1, _firstByteOk);
 
+        // Fast-path free string content. Inside a JSON string value (SContent) the close delimiter and
+        // escape are ordinary bytes, so CollectStr marks all 256 first-bytes — without this every step
+        // would SimulateToken (frame copy + byte walk) the WHOLE vocabulary (150k+ tokens on Qwen/Llama),
+        // costing ~seconds/token. But a token that contains neither '"' nor '\' is pure content that
+        // can only keep the string open, so it's legal without simulation; only tokens that could close
+        // or escape need the full replay. Disabled mid-escape (the next byte is consumed literally), so
+        // those tokens fall back to SimulateToken. This is the byte-level analogue of the Gemma sibling's
+        // token-level free-content shortcut.
+        bool fastStrContent;
+        {
+            ref var top = ref _stack[_depth - 1];
+            fastStrContent = top.Kind == FK.Str && top.State == SContent && !top.Escaped;
+        }
+
         int kept = 0;
         for (int id = 0; id < buf.Length; id++)
         {
             var bytes = _vocab.TokenBytes(id);
             // Empty-byte tokens (EOG / control) never advance the structure — forbidding them keeps
             // an end-of-generation token from truncating the call mid-object.
-            bool candidate = bytes.Length != 0 && _firstByteOk[bytes[0]];
-            if (candidate && SimulateToken(id))
-                kept++;
-            else
-                buf[id] = float.NegativeInfinity;
+            if (bytes.Length == 0 || !_firstByteOk[bytes[0]]) { buf[id] = float.NegativeInfinity; continue; }
+            bool ok = (fastStrContent && !ContainsQuoteOrBackslash(bytes)) || SimulateToken(id);
+            if (ok) kept++;
+            else buf[id] = float.NegativeInfinity;
         }
 
         // Belt-and-suspenders: forbid every EOG id regardless of its bytes (a tokenizer whose EOS
@@ -368,6 +381,13 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
             { buf[id] = float.NegativeInfinity; kept--; }
 
         return kept;
+    }
+
+    private static bool ContainsQuoteOrBackslash(ReadOnlySpan<byte> bytes)
+    {
+        for (int i = 0; i < bytes.Length; i++)
+            if (bytes[i] is (byte)'"' or (byte)'\\') return true;
+        return false;
     }
 
     private bool SimulateToken(int token)
