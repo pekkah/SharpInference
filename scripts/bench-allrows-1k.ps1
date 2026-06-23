@@ -195,16 +195,23 @@ $jobs = @(
 
   @{ Tag="qwen36-35b-cpu";  M="$E\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"; A=@();                                                 Temp="0.6"; Samp=$sQwen;  T=900 }
   @{ Tag="qwen36-35b-cuda"; M="$E\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"; A=@("-g","-1","--backend","cuda");                     Temp="0.6"; Samp=$sQwen;  T=900 }
+  # Vulkan GDN+MoE hybrid (#356): GDN/attn + shared expert on GPU, routed experts CPU mmap (auto
+  # CPU-MoE on a 12 GB card; CpuMoe pins it deterministically).
+  @{ Tag="qwen36-35b-vulkan"; M="$E\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"; A=@("-g","-1","--backend","vulkan");               Temp="0.6"; Samp=$sQwen; CpuMoe=$true; T=1800 }
 
   @{ Tag="27b-mtp-q4-cpu";  M="$E\Qwen3.6-27B-MTP-Q4_K_M.gguf"; A=@("--no-thinking");                                     Temp="0"; Samp=@();       T=1200 }
   @{ Tag="27b-mtp-q4-cuda"; M="$E\Qwen3.6-27B-MTP-Q4_K_M.gguf"; A=@("-g","-1","--backend","cuda","--no-thinking");        Temp="0"; Samp=@();       T=1200 }
+  # Vulkan MTP self-spec (#357): dense FFN CPU mmap, GDN/attn + MTP head on GPU.
+  @{ Tag="27b-mtp-q4-vulkan"; M="$E\Qwen3.6-27B-MTP-Q4_K_M.gguf"; A=@("-g","-1","--backend","vulkan","--no-thinking");    Temp="0"; Samp=@();       T=1800 }
   @{ Tag="27b-mtp-q5-cpu";  M="$E\Qwen3.6-27B-MTP-Q5_K_M.gguf"; A=@("--no-thinking");                                     Temp="0"; Samp=@();       T=1200 }
   @{ Tag="27b-mtp-q5-cuda"; M="$E\Qwen3.6-27B-MTP-Q5_K_M.gguf"; A=@("-g","-1","--backend","cuda","--no-thinking");        Temp="0"; Samp=@();       T=1200 }
 
   @{ Tag="35b-mtp-cpu";     M="$E\Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf"; A=@("--no-thinking");                       Temp="0"; Samp=@(); CpuMoe=$true; T=900 }
   @{ Tag="35b-mtp-cuda";    M="$E\Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf"; A=@("-g","-1","--backend","cuda","--no-thinking"); Temp="0"; Samp=@(); CpuMoe=$true; T=900 }
+  @{ Tag="35b-mtp-vulkan";  M="$E\Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf"; A=@("-g","-1","--backend","vulkan","--no-thinking"); Temp="0"; Samp=@(); CpuMoe=$true; T=1800 }
 
   @{ Tag="carnice-cuda";    M="$E\Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-I-Compact.gguf"; A=@("-g","-1","--backend","cuda","--no-thinking"); Temp="0"; Samp=@(); CpuMoe=$true; T=900 }
+  @{ Tag="carnice-vulkan";  M="$E\Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-I-Compact.gguf"; A=@("-g","-1","--backend","vulkan","--no-thinking"); Temp="0"; Samp=@(); CpuMoe=$true; T=1800 }
 
   @{ Tag="gemma4-e4b-q4-cuda";   M="$E\gemma-4-E4B_q4_0-it.gguf"; A=@("-g","-1","--backend","cuda","--ctx-size","2048");    Temp="1.0"; Samp=$sGemma; T=900 }
   @{ Tag="gemma4-e4b-q4-vulkan"; M="$E\gemma-4-E4B_q4_0-it.gguf"; A=@("-g","-1","--backend","vulkan","--ctx-size","2048"); Temp="1.0"; Samp=$sGemma; T=900 }
