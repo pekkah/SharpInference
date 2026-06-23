@@ -3004,6 +3004,99 @@ public sealed unsafe class VulkanShaderTests
         backend.Free(seqState);
     }
 
+    // #357 PR1: the conv-state ring-capture op. Slot i must equal what
+    // GdnConv1dStateUpdateBatched(x[0..i+1], state, ...) produces (the PR5a-verified self-parity
+    // oracle). Also exercises a non-zero ringFloatOffset + a multi-"layer" ring stride to mirror
+    // the real packed-ring layout (slots interleaved across layers), and checks bytes outside the
+    // written region stay untouched.
+    [Fact]
+    public void GdnConv1dStateCaptureRingMatchesSequential()
+    {
+        using var backend = new Vulkan.VulkanBackend();
+
+        const int n = 5;
+        const int channels = 8192;   // qwen35moe conv channels
+        const int kernel = 4;        // qwen35moe conv kernel
+        const int retained = kernel - 1;
+        const int nCapture = n - 1;  // ring captures the per-token states the loop holds after token i
+        int stateLen = retained * channels;
+        int slotFloats = retained * channels;   // floats per ring slot (one layer's conv state)
+
+        var rng = new Random(35711);
+        var x = new float[n * channels];     // chunk inputs [n, channels]
+        var state0 = new float[stateLen];    // shared initial (pre-chunk) state
+        for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < stateLen; i++) state0[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var gpuX = backend.Upload(x, TensorShape.D1(n * channels));
+        var gpuState = backend.Upload(state0, TensorShape.D1(stateLen));
+
+        // ── Per-slot reference: GdnConv1dStateUpdateBatched advances a cloned state to exactly the
+        //    state held after (slot+1) tokens — that is what ring slot `slot` should contain. ──
+        var refSlots = new float[nCapture][];
+        for (int slot = 0; slot < nCapture; slot++)
+        {
+            int nTok = slot + 1;
+            var prefixX = backend.Upload(x.AsSpan(0, nTok * channels), TensorShape.D1(nTok * channels));
+            var refState = backend.Upload(state0, TensorShape.D1(stateLen)); // fresh clone of the initial state
+            backend.GdnConv1dStateUpdateBatched(prefixX, refState, channels, kernel, nTok);
+            var refOut = new float[stateLen];
+            backend.Download(refState, refOut);
+            refSlots[slot] = refOut;
+            backend.Free(prefixX); backend.Free(refState);
+        }
+
+        // ── Case A: contiguous single-layer ring (ringFloatOffset = 0, stride = one slot). ──
+        {
+            int ringSlotStride = slotFloats;
+            int ringLen = nCapture * ringSlotStride;
+            var gpuRing = backend.Upload(new float[ringLen], TensorShape.D1(ringLen)); // zero-init to detect stray writes
+            backend.GdnConv1dStateCaptureRing(gpuX, gpuState, gpuRing, 0, channels, kernel, ringSlotStride, nCapture);
+            var ring = new float[ringLen];
+            backend.Download(gpuRing, ring);
+            for (int slot = 0; slot < nCapture; slot++)
+                for (int j = 0; j < slotFloats; j++)
+                    Assert.True(MathF.Abs(ring[(long)slot * ringSlotStride + j] - refSlots[slot][j]) < 1e-6f,
+                        $"ring-capture (case A) slot {slot} mismatch at [{j}]: " +
+                        $"ring={ring[(long)slot * ringSlotStride + j]}, ref={refSlots[slot][j]}");
+            backend.Free(gpuRing);
+        }
+
+        // ── Case B: 2-layer packed ring — slots interleaved across layers. Slot `slot`'s state for
+        //    layer L lives at ringFloatOffset + slot*ringSlotStride where ringSlotStride spans both
+        //    layers and ringFloatOffset = L*slotFloats. Capture into layer 1 and assert layer 0
+        //    (and all bytes outside the written cells) are untouched. ──
+        {
+            const int numLayers = 2;
+            const int layerIdx = 1;
+            int ringSlotStride = numLayers * slotFloats;
+            long ringFloatOffset = (long)layerIdx * slotFloats;
+            int ringLen = nCapture * ringSlotStride;
+            var ringInit = new float[ringLen];
+            for (int i = 0; i < ringLen; i++) ringInit[i] = -7.5f; // sentinel: any sentinel left == not overwritten
+            var gpuRing = backend.Upload(ringInit, TensorShape.D1(ringLen));
+            backend.GdnConv1dStateCaptureRing(gpuX, gpuState, gpuRing, ringFloatOffset, channels, kernel, ringSlotStride, nCapture);
+            var ring = new float[ringLen];
+            backend.Download(gpuRing, ring);
+
+            for (int slot = 0; slot < nCapture; slot++)
+            {
+                long slotBase = (long)slot * ringSlotStride;
+                // layer 1 region must hold the reference state for this slot
+                for (int j = 0; j < slotFloats; j++)
+                    Assert.True(MathF.Abs(ring[slotBase + ringFloatOffset + j] - refSlots[slot][j]) < 1e-6f,
+                        $"ring-capture (case B) slot {slot} layer {layerIdx} mismatch at [{j}]: " +
+                        $"ring={ring[slotBase + ringFloatOffset + j]}, ref={refSlots[slot][j]}");
+                // layer 0 region (the other layer) must be untouched (still the sentinel)
+                for (int j = 0; j < slotFloats; j++)
+                    Assert.Equal(-7.5f, ring[slotBase + j]);
+            }
+            backend.Free(gpuRing);
+        }
+
+        backend.Free(gpuX); backend.Free(gpuState);
+    }
+
     [Fact]
     public void GdnL2NormPerHeadBatchedMatchesSequential()
     {
