@@ -49,9 +49,12 @@ namespace SharpInference.Engine;
 /// <para>Scope (issue #356 PR4): the DENSE GDN model (Round 1) and the GDN+MoE model
 /// (Round 2). Batched prefill (#356 PR5) and the k-token MTP batched-verify MECHANISM
 /// (<see cref="BatchVerify"/> + <see cref="RestoreBatchSnapshot"/> + the device GDN snapshot
-/// ring, #357 PR2) are implemented, but the MTP head weights aren't loaded yet, so the public
-/// gates <see cref="SupportsBatchVerify"/> / <see cref="HasMtpHead"/> /
-/// <see cref="SupportsPartialRewind"/> still report false until #357 PR3 wires the head.</para>
+/// ring, #357 PR2) are implemented. #357 PR3 wires the NEXTN/MTP head itself
+/// (<see cref="MtpForward"/> + <see cref="GpuMtpAttnBlock"/> + <see cref="PrefillMtp"/> + the MTP
+/// KV cache + the absolute-position hidden-history surface), so <see cref="HasMtpHead"/> and
+/// <see cref="SupportsBatchVerify"/> now report true on an MTP-bearing GGUF and the Qwen3.6 -MTP
+/// GDN models do self-speculative decoding on Vulkan. (<see cref="SupportsPartialRewind"/> stays
+/// false — the GDN recurrence is still destructively updated; rollback goes through the snapshot ring.)</para>
 /// </summary>
 public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
 {
@@ -168,6 +171,57 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
     // GGUF declares a NEXTN/MTP head → reserve the verify ring. The head WEIGHTS + HasMtpHead +
     // SupportsBatchVerify are wired in #357 PR3; PR2 only builds the verify+rollback mechanism.
     private bool _hasMtp;
+
+    // ── MTP / NEXTN head (#357 PR3; mirror CudaHybridGdnForwardPass :340-473) ──
+    // Loaded by LoadMtpHead when _hasMtp; the head is a single attention+FFN block plus the
+    // NEXTN enorm/hnorm/eh_proj/shared_head_norm fusion. Dense (27B-MTP) and MoE (35B-A3B-MTP)
+    // FFN tensor sets are mutually exclusive: the unused set stays null.
+    private bool _mtpIsMoE;                      // MTP block uses MoE FFN (else dense)
+    private Tensor? _gpuMtpAttnNorm;             // attn_norm.weight
+    private Tensor? _gpuMtpWQGate;               // attn_q (Q‖gate interleaved, output qDim*2)
+    private Tensor? _gpuMtpWK;                   // attn_k.weight
+    private Tensor? _gpuMtpWV;                   // attn_v.weight
+    private Tensor? _gpuMtpWO;                   // attn_output.weight
+    private Tensor? _gpuMtpQNorm;                // attn_q_norm.weight [headDim] F32
+    private Tensor? _gpuMtpKNorm;                // attn_k_norm.weight [headDim] F32
+    private Tensor? _gpuMtpPostAttnNorm;         // post_attention_norm.weight
+    // Dense MTP FFN (only when !_mtpIsMoE).
+    private Tensor? _gpuMtpFfnGate;              // ffn_gate.weight
+    private Tensor? _gpuMtpFfnUp;                // ffn_up.weight
+    private Tensor? _gpuMtpFfnDown;              // ffn_down.weight
+    // MoE MTP FFN (only when _mtpIsMoE): shared expert on GPU, routed/router on CPU (mmap).
+    private Tensor? _gpuMtpWGateShexp;           // ffn_gate_shexp.weight
+    private Tensor? _gpuMtpWUpShexp;             // ffn_up_shexp.weight
+    private Tensor? _gpuMtpWDownShexp;           // ffn_down_shexp.weight
+    private CpuWeightRef _cpuMtpFfnGateInp;      // router F32 [embDim, numExperts]
+    private CpuWeightRef _cpuMtpFfnGateExps;     // [numExperts, expertDim, embDim]
+    private CpuWeightRef _cpuMtpFfnUpExps;
+    private CpuWeightRef _cpuMtpFfnDownExps;
+    private float* _cpuMtpFfnGateInpShexp;       // [embDim] F32 shared-expert sigmoid gate (preloaded)
+    // NEXTN fusion weights.
+    private Tensor? _gpuMtpEnorm;                // nextn.enorm.weight
+    private Tensor? _gpuMtpHnorm;                // nextn.hnorm.weight
+    private Tensor? _gpuMtpSharedHeadNorm;       // nextn.shared_head_norm.weight
+    private Tensor? _gpuMtpEhProj;               // nextn.eh_proj.weight (Q8_0→F32, [embDim*2 → embDim])
+    // MTP attention KV cache (one slot; same layout as a trunk attention layer). fp32.
+    private Tensor? _gpuMtpKCache;               // [maxSeq × kvDim]
+    private Tensor? _gpuMtpVCache;               // [maxSeq × kvDim]
+    private PagedKvCache? _mtpKvCache;           // length bookkeeping; data lives on GPU
+    // Per-step MTP scratch (device).
+    private Tensor? _gpuMtpEmbedBuf;             // [embDim] embedded MTP token
+    private Tensor? _gpuMtpEnormBuf;             // [embDim] enorm(embedding)
+    private Tensor? _gpuMtpHnormBuf;             // [embDim] hnorm(prevHidden)
+    private Tensor? _gpuMtpConcatBuf;            // [embDim*2] [enorm ‖ hnorm]
+    private Tensor? _gpuLastHidden;              // [embDim] prevHidden upload target
+    private Tensor? _gpuMtpSelfHiddenDev;        // [embDim] device capture of the MTP pre-shared-head-norm hidden
+    private Tensor? _gpuMtpHistDev;              // [embDim] device capture of the pre-output-norm trunk hidden (Forward)
+    private Tensor? _pinnedMtpHidden;            // [embDim] dedicated pinned buffer for MTP host downloads/uploads
+    // MTP host buffers (plain native memory; freed in Dispose).
+    private float* _lastHidden;                  // [embDim] pre-output-norm hidden of the last main Forward
+    private float* _mtpSelfHidden;               // [embDim] MTP block residual output (issue #30 chained drafting)
+    private float* _mtpPrefillHiddens;           // [_mtpPrefillHiddensCap × embDim], slot p = h_p
+    private int _mtpPrefillHiddensCap;           // allocated capacity in tokens
+    private int _mtpHiddenHistoryLength;         // slots [0.._mtpHiddenHistoryLength) populated
 
     // ── Embedding + output ──────────────────────────────────────────────
     private readonly Tensor _gpuEmbedding;
@@ -687,6 +741,13 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         }
         // CPU-MoE: no SLRU manager; routed experts read from mmap per token.
 
+        // ── MTP / NEXTN head (#357 PR3) ────────────────────────────────
+        // Loaded AFTER the dense-FFN routing so _gpuFfnGateBufDense/_gpuFfnUpBufDense exist for the
+        // dense MTP FFN (allocated by TryUploadDenseFfnLayers when ≥1 trunk FFN layer lands on GPU;
+        // LoadMtpHead allocates them itself when no trunk FFN layer did). _hasMtp + the verify ring
+        // are decided above; this loads the actual head weights + flips the public gates.
+        LoadMtpHead(gpu);
+
         // Pre-fault the CPU-resident mmap FFN weight pages (issue #221). Mirrors the CUDA
         // pass + HybridForwardPass.cs:473.
         MmapPrefault.Run("VulkanHybridGdnForwardPass", BuildCpuPrefaultRegions());
@@ -715,12 +776,16 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
     public int VocabSize => _hp.VocabSize;
     public int MaxSeqLen => _maxSeqLen;
     public bool SupportsPartialRewind => false;
-    public bool HasMtpHead => false;
+    public bool HasMtpHead => _hasMtp;
 
-    // PR2 keeps this false: the MTP head (the draft source) isn't loaded until #357 PR3, so MtpDecoder
-    // must not select this pass yet. PR3 flips it to `_hasMtp && _gdnRingSlots >= 1`. The ring + the
-    // BatchVerify mechanism are exercised directly by the PR2 unit test.
-    public bool SupportsBatchVerify => false;
+    // #357 PR3: the MTP head is now loaded, so the draft source exists and MtpDecoder may select
+    // this pass. Mirror CUDA SupportsBatchVerify :3334, minus the terms that don't apply on Vulkan:
+    // there is no SnapKV on this pass (no KvCacheCompacted term) and GDN always runs on GPU here
+    // (no _cpuGdn term; the ring is the only rollback mechanism, so _gdnRingSlots >= 1 is required).
+    public bool SupportsBatchVerify => _hasMtp
+        && (!_hp.IsMoE || _cpuMoe)
+        && _gdnRingSlots >= 1
+        && Environment.GetEnvironmentVariable("SHARPI_DISABLE_BATCH_VERIFY") != "1";
 
     /// <summary>Ceiling for a single <see cref="BatchVerify"/> batch = ring slots + 1
     /// (the slots reserved at construction, SHARPI_MTP_BATCH_MAX). 1 when no ring.</summary>
@@ -817,7 +882,16 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         _kvCache.IncrementPosition();
         _gdnStateCache.IncrementPosition();
 
-        // 5. Final norm + output projection on GPU (:3268-3269), then queue the logits D2H
+        // 5. Capture the pre-output-norm hidden for MTP (issue #29; mirror CUDA :3253-3265) into a
+        //    dedicated device buffer BEFORE the in-place output-norm overwrites _gpuHidden. The host
+        //    download happens after the submit (the in-session pinned-map idiom of this backend).
+        if (_hasMtp)
+        {
+            CopyGpuBuffer(_gpuMtpHistDev!, _gpuHidden);
+            _gpu.RecordBarrier();
+        }
+
+        // 6. Final norm + output projection on GPU (:3268-3269), then queue the logits D2H
         //    in-session and submit (mirror HybridForwardPass.cs:597-605).
         _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuOutputNorm, _hp.RmsNormEps);
         _gpu.RecordBarrier();
@@ -827,7 +901,31 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         _gpu.EndRecordAndSubmit();
         _gpu.ReadFromStaging(_logitsBuf);
 
+        // 7. Download the captured pre-output-norm hidden into _lastHidden + the absolute-position
+        //    history slot (mirror CUDA :3279-3290). Own session via the dedicated pinned buffer.
+        if (_hasMtp)
+            DownloadMtpHidden(_gpuMtpHistDev!, position);
+
         return _logitsBuf;
+    }
+
+    /// <summary>Download a captured pre-output-norm device hidden into the host MTP <see cref="_lastHidden"/>
+    /// buffer and the absolute-position history slot for <paramref name="position"/>. Uses the dedicated
+    /// pinned buffer in its own session so it never clashes with the shared logits staging.</summary>
+    private void DownloadMtpHidden(Tensor src, int position)
+    {
+        _gpu.BeginRecord();
+        CopyGpuBuffer(_pinnedMtpHidden!, src);
+        _gpu.RecordComputeToHostBarrier();
+        _gpu.EndRecordAndSubmit();
+        float* p = _gpu.MapPinned(_pinnedMtpHidden!);
+        var hidden = new ReadOnlySpan<float>(p, _embDim);
+        hidden.CopyTo(new Span<float>(_lastHidden, _embDim));
+        EnsureMtpHiddenHistoryCap(position + 1);
+        hidden.CopyTo(new Span<float>(_mtpPrefillHiddens + (long)position * _embDim, _embDim));
+        _gpu.UnmapPinned(_pinnedMtpHidden!);
+        if (_mtpHiddenHistoryLength < position + 1)
+            _mtpHiddenHistoryLength = position + 1;
     }
 
     // ================================================================
@@ -936,12 +1034,16 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         {
             // Intermediate chunk: just submit the recorded trunk; no logits needed.
             _gpu.EndRecordAndSubmit();
+            // MTP hidden history: _gpuBtHidden now holds this chunk's n pre-output-norm hiddens.
+            if (_hasMtp) CaptureMtpChunkHiddens(hidden, chunkStartPos, n, setLastFromLastRow: false);
             return;
         }
 
         // Final chunk: final norm + output projection on the LAST token's row only, then download.
         // Copy the last row into the scalar _gpuHidden (no offset sub-view on Vulkan), then RmsNorm
-        // in place — exactly the scalar Forward's final-norm step.
+        // in place — exactly the scalar Forward's final-norm step. _gpuBtHidden (= `hidden`) is
+        // preserved (the final-norm writes _gpuHidden, a copy of the last row), so the MTP capture
+        // below reads the unmodified pre-output-norm rows.
         CopyGpuBufferRegion(_gpuHidden, 0, hidden, (long)(n - 1) * embDim * sizeof(float), (long)embDim * sizeof(float));
         _gpu.RecordBarrier();
         _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuOutputNorm, _hp.RmsNormEps);
@@ -951,6 +1053,26 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         _gpu.RecordDownloadToStaging(_gpuLogits, _logitsBuf.Length);
         _gpu.EndRecordAndSubmit();
         _gpu.ReadFromStaging(_logitsBuf);
+
+        // MTP hidden history for the final chunk + set _lastHidden from its last token (mirror the
+        // scalar Forward's _lastHidden population so batched prefill drives MTP too; CUDA :2573-2577).
+        if (_hasMtp) CaptureMtpChunkHiddens(hidden, chunkStartPos, n, setLastFromLastRow: true);
+    }
+
+    /// <summary>Download a batched chunk's n pre-output-norm hiddens (rows of <paramref name="hidden"/>,
+    /// = <see cref="_gpuBtHidden"/>) into <c>_mtpPrefillHiddens[chunkStartPos..]</c> + bump the history
+    /// length. When <paramref name="setLastFromLastRow"/>, also copy the last row into
+    /// <see cref="_lastHidden"/>. Own submit (no session open) via the grow-on-demand staging path.</summary>
+    private void CaptureMtpChunkHiddens(Tensor hidden, int chunkStartPos, int n, bool setLastFromLastRow)
+    {
+        EnsureMtpHiddenHistoryCap(chunkStartPos + n);
+        var dst = new Span<float>(_mtpPrefillHiddens + (long)chunkStartPos * _embDim, n * _embDim);
+        _gpu.Download(Alias(hidden, n, _embDim), dst);
+        if (_mtpHiddenHistoryLength < chunkStartPos + n)
+            _mtpHiddenHistoryLength = chunkStartPos + n;
+        if (setLastFromLastRow)
+            new ReadOnlySpan<float>(_mtpPrefillHiddens + (long)(chunkStartPos + n - 1) * _embDim, _embDim)
+                .CopyTo(new Span<float>(_lastHidden, _embDim));
     }
 
     /// <summary>Batched GDN block over N tokens — the op-for-op batched mirror of
@@ -1309,6 +1431,8 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         _faulted = false;
 
         // All-position logits: batched output-norm over the k post-trunk hiddens + batched lm_head.
+        // The output-norm writes _gpuBtNorm (normAll), so `hidden` (= _gpuBtHidden) is preserved
+        // and still holds the k pre-output-norm hiddens for the MTP capture below.
         Tensor normAll   = Alias(_gpuBtNorm!, k, embDim);
         Tensor logitsAll = Alias(_gpuBvLogitsAll!, k, _hp.VocabSize);
         _gpu.RmsNormBatched(normAll, hidden, _gpuOutputNorm, embDim, k, _hp.RmsNormEps);
@@ -1318,6 +1442,10 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         _gpu.RecordDownloadToStaging(_gpuBvLogitsAll!, k * _hp.VocabSize);
         _gpu.EndRecordAndSubmit();
         _gpu.ReadFromStaging(_bvLogitsHost.AsSpan(0, k * _hp.VocabSize));
+
+        // MTP hidden history (issues #33/#106; mirror CUDA :3846-3853): row i of `hidden` holds the
+        // pre-output-norm hidden for token startPos+i; _lastHidden = row k-1. Own submit (no session).
+        if (_hasMtp) CaptureMtpChunkHiddens(hidden, startPos, k, setLastFromLastRow: true);
 
         _batchSnapshotValid = true;
         int vocab = _hp.VocabSize;
@@ -1391,6 +1519,12 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
 
         _gdnStateCache.SetLength(lengthAfter);
         _kvCache.TruncateTo(lengthAfter);
+        // Atomic with the trunk rewind (mirror CUDA :3612-3614): rewind MTP attention KV (the device
+        // _gpuMtpKCache is a flat ring — future KvAppends overwrite stale slots) and clamp the
+        // hidden-history length so PrefillMtp(suffix, startPos=lengthAfter) sees a consistent view.
+        _mtpKvCache?.TruncateTo(lengthAfter);
+        if (_hasMtp && _mtpHiddenHistoryLength > lengthAfter)
+            _mtpHiddenHistoryLength = lengthAfter;
         _batchSnapshotValid = false;
     }
 
@@ -1399,14 +1533,23 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         _kvCache.Reset();
         _gdnStateCache.Reset();
         // Zero GPU-resident scan + conv state for every GDN layer (mirror :3057-3062),
-        // bracketed in its own record/submit session.
+        // bracketed in its own record/submit session. Also zero the MTP KV cache when present.
         _gpu.BeginRecord();
         for (int i = 0; i < _hp.NumLayers; i++)
         {
             if (_gpuGdnScanState[i] is { } scan) _gpu.Clear(scan);
             if (_gpuGdnConvState[i] is { } conv) _gpu.Clear(conv);
         }
+        if (_hasMtp)
+        {
+            if (_gpuMtpKCache is { } kT) _gpu.Clear(kT);
+            if (_gpuMtpVCache is { } vT) _gpu.Clear(vT);
+        }
         _gpu.EndRecordAndSubmit();
+        // MTP cache + hidden-history reset (mirror CUDA :3064-3074). Unconditional history reset
+        // (no-op on non-MTP passes; guards against a future late-bind leaving stale state).
+        if (_hasMtp) _mtpKvCache?.Reset();
+        _mtpHiddenHistoryLength = 0;
     }
 
     public void TruncateTo(int length)
@@ -1416,6 +1559,9 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         if (length == _gdnStateCache.Length)
         {
             _kvCache.TruncateTo(length);
+            // Keep MTP attention KV in lockstep with the trunk (mirror CUDA :2990-2993) so a future
+            // RestoreBatchSnapshot-without-MtpTruncateTo caller can't leave stale entries past length.
+            _mtpKvCache?.TruncateTo(length);
             return;
         }
         if (length == 0)
@@ -1539,6 +1685,469 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         _gpu.RecordBarrier();
 
         GpuMatMul(_gpuHidden, _gpuWO[layer], _gpuAttnOut);
+    }
+
+    // ================================================================
+    //  MTP / NEXTN head (#357 PR3) — the Vulkan analogue of
+    //  CudaHybridGdnForwardPass.MtpForward / GpuMtpAttnBlock / PrefillMtp,
+    //  translated to the record/submit + pinned-map session model.
+    //  Mirror CUDA :4151-4383 op-for-op; the only deviations are the Vulkan
+    //  explicit-barrier requirement and the host download/upload going through
+    //  the dedicated _pinnedMtpHidden buffer (no UploadInto / async D2H here).
+    // ================================================================
+
+    /// <inheritdoc />
+    public ReadOnlySpan<float> LastHidden =>
+        _hasMtp ? new ReadOnlySpan<float>(_lastHidden, _embDim) : default;
+
+    /// <inheritdoc />
+    public ReadOnlySpan<float> MtpLastHidden =>
+        _mtpSelfHidden != null ? new ReadOnlySpan<float>(_mtpSelfHidden, _embDim) : default;
+
+    /// <inheritdoc />
+    public ReadOnlySpan<float> HiddenAt(int position)
+    {
+        if (!_hasMtp || position < 0 || position >= _mtpHiddenHistoryLength)
+            return default;
+        return new ReadOnlySpan<float>(_mtpPrefillHiddens + (long)position * _embDim, _embDim);
+    }
+
+    /// <summary>Load the NEXTN/MTP head weights + caches + per-step scratch (mirror CUDA :1301-1448).
+    /// No-op when the GGUF declares no MTP head. Called from the ctor AFTER the dense-FFN routing so
+    /// the dense FFN scratch buffers exist (allocated here when no trunk FFN layer landed on GPU).</summary>
+    private void LoadMtpHead(VulkanBackend gpu)
+    {
+        if (!_hasMtp) return;
+        int mtpLayerIdx = _hp.NumLayers;
+
+        _gpuMtpAttnNorm     = UploadWeight($"blk.{mtpLayerIdx}.attn_norm.weight");
+        _gpuMtpWQGate       = UploadWeight($"blk.{mtpLayerIdx}.attn_q.weight");
+        _gpuMtpWK           = UploadWeight($"blk.{mtpLayerIdx}.attn_k.weight");
+        _gpuMtpWV           = UploadWeight($"blk.{mtpLayerIdx}.attn_v.weight");
+        _gpuMtpWO           = UploadWeight($"blk.{mtpLayerIdx}.attn_output.weight");
+        _gpuMtpQNorm        = UploadWeight($"blk.{mtpLayerIdx}.attn_q_norm.weight");
+        _gpuMtpKNorm        = UploadWeight($"blk.{mtpLayerIdx}.attn_k_norm.weight");
+        _gpuMtpPostAttnNorm = UploadWeight($"blk.{mtpLayerIdx}.post_attention_norm.weight");
+
+        // MoE-MTP vs dense-MTP probe (mirror CUDA :1325-1333). MoE MTP requires trunk MoE + CPU-MoE
+        // (the routed-expert stack at the MTP block won't co-reside with the trunk experts on a
+        // 12 GB GPU; the GPU-SLRU cache reserves no slots for the extra layer).
+        _mtpIsMoE = _model.FindTensor($"blk.{mtpLayerIdx}.ffn_gate_exps.weight") is not null;
+        if (_mtpIsMoE && !_hp.IsMoE)
+            throw new NotSupportedException(
+                "MoE MTP head requires trunk MoE. Dense-trunk + MoE-MTP-head is not a supported configuration.");
+        if (_mtpIsMoE && !_cpuMoe)
+            throw new NotSupportedException(
+                "MoE MTP head requires CPU MoE mode (SHARPI_CPU_MOE=1). The GPU-SLRU expert cache " +
+                "doesn't reserve slots for the MTP block.");
+
+        if (_mtpIsMoE)
+        {
+            _gpuMtpWGateShexp = UploadWeight($"blk.{mtpLayerIdx}.ffn_gate_shexp.weight");
+            _gpuMtpWUpShexp   = UploadWeight($"blk.{mtpLayerIdx}.ffn_up_shexp.weight");
+            _gpuMtpWDownShexp = UploadWeight($"blk.{mtpLayerIdx}.ffn_down_shexp.weight");
+            _cpuMtpFfnGateInp = ResolveCpuWeight($"blk.{mtpLayerIdx}.ffn_gate_inp.weight");
+            _cpuMtpFfnGateExps = ResolveCpuWeight($"blk.{mtpLayerIdx}.ffn_gate_exps.weight");
+            _cpuMtpFfnUpExps   = ResolveCpuWeight($"blk.{mtpLayerIdx}.ffn_up_exps.weight");
+            _cpuMtpFfnDownExps = ResolveCpuWeight($"blk.{mtpLayerIdx}.ffn_down_exps.weight");
+            _cpuMtpFfnGateInpShexp = LoadF32Tensor($"blk.{mtpLayerIdx}.ffn_gate_inp_shexp.weight", _embDim);
+        }
+        else
+        {
+            _gpuMtpFfnGate = UploadWeight($"blk.{mtpLayerIdx}.ffn_gate.weight");
+            _gpuMtpFfnUp   = UploadWeight($"blk.{mtpLayerIdx}.ffn_up.weight");
+            _gpuMtpFfnDown = UploadWeight($"blk.{mtpLayerIdx}.ffn_down.weight");
+        }
+
+        _gpuMtpEnorm          = UploadWeight($"blk.{mtpLayerIdx}.nextn.enorm.weight");
+        _gpuMtpHnorm          = UploadWeight($"blk.{mtpLayerIdx}.nextn.hnorm.weight");
+        _gpuMtpSharedHeadNorm = UploadWeight($"blk.{mtpLayerIdx}.nextn.shared_head_norm.weight");
+        // eh_proj is Q8_0 in GGUF; UploadWeight dequants non-{F32,Q4_K,Q5_K,Q6_K,Q8_0,Q4_0} to F32,
+        // but Q8_0 is kept raw on Vulkan and the matvec dispatches on it directly — either way the
+        // [embDim*2 → embDim] projection serves _gpuMtpConcatBuf.
+        _gpuMtpEhProj         = UploadWeight($"blk.{mtpLayerIdx}.nextn.eh_proj.weight");
+
+        // MTP attention KV cache on GPU (one slot; same fp32 layout as a trunk attention layer).
+        int mtpKvDim = _numKvHeads * _headDim;
+        _gpuMtpKCache = AllocateTracked(TensorShape.D1((long)_maxSeqLen * mtpKvDim));
+        _gpuMtpVCache = AllocateTracked(TensorShape.D1((long)_maxSeqLen * mtpKvDim));
+        ClearBracketed(_gpuMtpKCache);
+        ClearBracketed(_gpuMtpVCache);
+
+        // Per-step scratch (device).
+        _gpuMtpEmbedBuf     = gpu.Allocate(TensorShape.D1(_embDim));
+        _gpuMtpEnormBuf     = gpu.Allocate(TensorShape.D1(_embDim));
+        _gpuMtpHnormBuf     = gpu.Allocate(TensorShape.D1(_embDim));
+        _gpuMtpConcatBuf    = gpu.Allocate(TensorShape.D1(_embDim * 2));
+        _gpuLastHidden      = gpu.Allocate(TensorShape.D1(_embDim));
+        _gpuMtpSelfHiddenDev = gpu.Allocate(TensorShape.D1(_embDim));
+        _gpuMtpHistDev      = gpu.Allocate(TensorShape.D1(_embDim));
+        _pinnedMtpHidden    = gpu.AllocatePinned(TensorShape.D1(_embDim));
+
+        // Bookkeeping cache (PagedKvCache for the layer-0 invariant + length tracking).
+        _mtpKvCache = new PagedKvCache(numLayers: 1, _numKvHeads, _headDim);
+
+        // Host MTP buffers.
+        _lastHidden    = Alloc(_embDim);
+        _mtpSelfHidden = Alloc(_embDim);
+
+        // The MTP dense FFN runs on GPU regardless of trunk FFN placement; allocate the dense FFN
+        // scratch when TryUploadDenseFfnLayers didn't (no trunk FFN layer landed on GPU). Mirror
+        // CUDA :1398-1402; cost is 2 × intermDim × 4 B.
+        if (!_hp.IsMoE && _gpuFfnGateBufDense is null)
+        {
+            _gpuFfnGateBufDense = AllocateTracked(TensorShape.D1(_intermDim));
+            _gpuFfnUpBufDense   = AllocateTracked(TensorShape.D1(_intermDim));
+        }
+
+        Console.Error.WriteLine(
+            $"[VulkanHybridGdnForwardPass] MTP/NEXTN head loaded (blk.{mtpLayerIdx}, {(_mtpIsMoE ? "MoE" : "dense")} FFN). " +
+            "HasMtpHead + SupportsBatchVerify enabled.");
+    }
+
+    /// <inheritdoc />
+    public ReadOnlySpan<float> MtpForward(int token, int position, ReadOnlySpan<float> prevHidden)
+    {
+        ThrowIfFaulted();
+        if (!_hasMtp)
+            throw new InvalidOperationException(
+                "MtpForward called on a VulkanHybridGdnForwardPass that did not load an MTP head. " +
+                "Check HasMtpHead before calling.");
+        if (prevHidden.Length != _embDim)
+            throw new ArgumentException(
+                $"prevHidden length {prevHidden.Length} != EmbeddingDim {_embDim}.", nameof(prevHidden));
+
+        long embBytes = (long)_embDim * sizeof(float);
+
+        // 1. Upload prevHidden into _gpuLastHidden via the dedicated pinned buffer (no UploadInto on
+        //    Vulkan): map → copy host span in → unmap → device copy in-session.
+        {
+            float* p = _gpu.MapPinned(_pinnedMtpHidden!);
+            prevHidden.CopyTo(new Span<float>(p, _embDim));
+            _gpu.UnmapPinned(_pinnedMtpHidden!);
+        }
+
+        _gpu.BeginRecord();
+        CopyGpuBuffer(_gpuLastHidden!, _pinnedMtpHidden!);
+        _gpu.RecordBarrier();
+
+        // 2. Embed token → _gpuMtpEmbedBuf.
+        EmbedToken(_gpuMtpEmbedBuf!, token);
+        _gpu.RecordBarrier();
+
+        // 3. enorm(embedding) → _gpuMtpEnormBuf; hnorm(prevHidden) → _gpuMtpHnormBuf.
+        _gpu.RmsNorm(_gpuMtpEnormBuf!, _gpuMtpEmbedBuf!, _gpuMtpEnorm!, _hp.RmsNormEps);
+        _gpu.RmsNorm(_gpuMtpHnormBuf!, _gpuLastHidden!,  _gpuMtpHnorm!, _hp.RmsNormEps);
+        _gpu.RecordBarrier();
+
+        // 4. Concat [enorm(e) ‖ hnorm(h)] into _gpuMtpConcatBuf [embDim*2]. The enorm half comes
+        //    FIRST (the transformers Qwen3NextNextNDecoderLayer order); the inverted order produces
+        //    0% draft acceptance (see the CPU/CUDA MtpForward notes).
+        CopyGpuBufferRegion(_gpuMtpConcatBuf!, 0,        _gpuMtpEnormBuf!, 0, embBytes);
+        CopyGpuBufferRegion(_gpuMtpConcatBuf!, embBytes, _gpuMtpHnormBuf!, 0, embBytes);
+        _gpu.RecordBarrier();
+
+        // 5. eh_proj @ concat → _gpuHidden.
+        GpuMatMul(_gpuHidden, _gpuMtpEhProj!, _gpuMtpConcatBuf!);
+        _gpu.RecordBarrier();
+
+        // 6. Residual + attn_norm.
+        CopyGpuBuffer(_gpuResidual, _gpuHidden);
+        _gpu.RecordBarrier();
+        _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuMtpAttnNorm!, _hp.RmsNormEps);
+        _gpu.RecordBarrier();
+
+        // 7. MTP attention block (writes _gpuHidden).
+        GpuMtpAttnBlock(position);
+        _gpu.RecordBarrier();
+
+        // 8. Residual add.
+        _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+        _gpu.RecordBarrier();
+
+        // 9. Residual + post_attention_norm.
+        CopyGpuBuffer(_gpuResidual, _gpuHidden);
+        _gpu.RecordBarrier();
+        _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuMtpPostAttnNorm!, _hp.RmsNormEps);
+        _gpu.RecordBarrier();
+
+        // 10. FFN — dense (27B-MTP on GPU) or MoE (35B-A3B-MTP via CPU MoE). Both write _gpuHidden;
+        //     the MoE path closes/reopens the session like the trunk CpuMoeFfn.
+        if (_mtpIsMoE)
+        {
+            CpuMtpMoeFfn();
+        }
+        else
+        {
+            GpuMatMul(_gpuFfnGateBufDense!, _gpuMtpFfnGate!, _gpuNormBuf);
+            GpuMatMul(_gpuFfnUpBufDense!,   _gpuMtpFfnUp!,   _gpuNormBuf);
+            _gpu.RecordBarrier();
+            _gpu.SiLuMul(_gpuFfnGateBufDense!, _gpuFfnUpBufDense!);
+            _gpu.RecordBarrier();
+            GpuMatMul(_gpuHidden, _gpuMtpFfnDown!, _gpuFfnGateBufDense!);
+        }
+        _gpu.RecordBarrier();
+
+        // 11. Residual add.
+        _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+        _gpu.RecordBarrier();
+
+        // 11b. Capture the MTP block's residual output BEFORE the in-place shared-head norm (issue
+        //      #30 chained drafting). Device copy now; host download after the logits submit.
+        CopyGpuBuffer(_gpuMtpSelfHiddenDev!, _gpuHidden);
+        _gpu.RecordBarrier();
+
+        // 12. shared_head_norm (NOT the main output_norm) → output.weight (shared lm_head).
+        _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuMtpSharedHeadNorm!, _hp.RmsNormEps);
+        _gpu.RecordBarrier();
+        GpuMatMul(_gpuLogits, _gpuOutputWeight, _gpuHidden);
+        _gpu.RecordComputeToTransferBarrier();
+        _gpu.RecordDownloadToStaging(_gpuLogits, _logitsBuf.Length);
+        _gpu.EndRecordAndSubmit();
+        _gpu.ReadFromStaging(_logitsBuf);
+
+        // 13. Download the captured self-hidden into the host _mtpSelfHidden (issue #30) via the
+        //     dedicated pinned buffer in its own session.
+        _gpu.BeginRecord();
+        CopyGpuBuffer(_pinnedMtpHidden!, _gpuMtpSelfHiddenDev!);
+        _gpu.RecordComputeToHostBarrier();
+        _gpu.EndRecordAndSubmit();
+        {
+            float* p = _gpu.MapPinned(_pinnedMtpHidden!);
+            new ReadOnlySpan<float>(p, _embDim).CopyTo(new Span<float>(_mtpSelfHidden, _embDim));
+            _gpu.UnmapPinned(_pinnedMtpHidden!);
+        }
+
+        return _logitsBuf;
+    }
+
+    /// <summary>MTP attention block on GPU. Mirrors <see cref="GpuAttnBlock"/> but uses the MTP
+    /// head's per-head norm + projection weights + its own KV cache. Reuses the trunk attention
+    /// scratch (_gpuQGate/_gpuQ/_gpuGate/_gpuK/_gpuV/_gpuAttnOut). Writes _gpuHidden.
+    /// Mirror CUDA :4265-4314.</summary>
+    private void GpuMtpAttnBlock(int position)
+    {
+        int kvDim = _numKvHeads * _headDim;
+        var mtpCache = _mtpKvCache!;
+        var kCache = _gpuMtpKCache!;
+        var vCache = _gpuMtpVCache!;
+
+        GpuMatMul(_gpuQGate, _gpuMtpWQGate!, _gpuNormBuf);
+        GpuMatMul(_gpuK,     _gpuMtpWK!,     _gpuNormBuf);
+        GpuMatMul(_gpuV,     _gpuMtpWV!,     _gpuNormBuf);
+        _gpu.RecordBarrier();
+
+        // De-interleave Q‖gate per head (arg order q, g, qg).
+        _gpu.SplitQG(_gpuQ, _gpuGate, _gpuQGate, _numHeads, _headDim);
+        _gpu.RecordBarrier();
+
+        // Per-head Q/K RMSNorm BEFORE RoPE.
+        _gpu.HeadNorm(_gpuQ, _gpuMtpQNorm!, (uint)_numHeads,   (uint)_headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+        _gpu.HeadNorm(_gpuK, _gpuMtpKNorm!, (uint)_numKvHeads, (uint)_headDim, _hp.RmsNormEps, _hp.IsPerChannelQkNorm);
+        _gpu.RecordBarrier();
+
+        // Partial NEOX RoPE on the first ropeDim of each head.
+        _gpu.RoPEPartial(_gpuQ, position, _headDim, _ropeDim, _hp.RopeTheta, neox: true);
+        _gpu.RoPEPartial(_gpuK, position, _headDim, _ropeDim, _hp.RopeTheta, neox: true);
+        _gpu.RecordBarrier();
+
+        // Layer-0 invariant: reserve a block before appending at a new page boundary.
+        mtpCache.ReserveBlock();
+        int kvPosition = mtpCache.Length;
+        _gpu.KvAppend(_gpuK, _gpuV, kCache, vCache, (uint)kvDim, (uint)kvPosition, (uint)_maxSeqLen);
+        _gpu.RecordBarrier();
+
+        int seqLen = kvPosition + 1;
+        _gpu.Attention(_gpuQ, kCache, vCache, _gpuAttnOut, _gpuAttnScratch,
+            (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim, (uint)seqLen, (uint)_maxSeqLen, window: 0u);
+        _gpu.RecordBarrier();
+
+        // Fused sigmoid GLU gate.
+        _gpu.SigmoidMulInPlace(_gpuAttnOut, _gpuGate);
+        _gpu.RecordBarrier();
+
+        GpuMatMul(_gpuHidden, _gpuMtpWO!, _gpuAttnOut);
+
+        mtpCache.IncrementPosition();
+    }
+
+    /// <summary>CPU-MoE FFN for the MTP block (mirror of <see cref="CpuMoeFfn"/> with the single MTP
+    /// weight set). On entry the session is recording; on return it is recording again. Writes _gpuHidden.</summary>
+    private void CpuMtpMoeFfn()
+    {
+        int numExperts = _numExperts;
+        int numActive = _numActiveExperts;
+        int expertDim = _expertDim;
+
+        // 1. Shared expert on GPU, in-session (UNSCALED; the sigmoid scalar gate is applied later).
+        GpuMatMul(_gpuFfnGate!, _gpuMtpWGateShexp!, _gpuNormBuf);
+        GpuMatMul(_gpuFfnUp!,   _gpuMtpWUpShexp!,   _gpuNormBuf);
+        _gpu.RecordBarrier();
+        _gpu.SiLuMul(_gpuFfnGate!, _gpuFfnUp!);
+        _gpu.RecordBarrier();
+        GpuMatMul(_gpuSharedOut!, _gpuMtpWDownShexp!, _gpuFfnGate!);
+        _gpu.RecordBarrier();
+
+        // 2. Copy the post-RmsNorm hidden → pinned, host-barrier, submit so the CPU can read it.
+        CopyGpuBuffer(_pinnedNorm!, _gpuNormBuf);
+        _gpu.RecordComputeToHostBarrier();
+        _gpu.EndRecordAndSubmit();
+
+        float* normPtr = _gpu.MapPinned(_pinnedNorm!);
+        new ReadOnlySpan<float>(normPtr, _embDim).CopyTo(new Span<float>(_cpuNormBuf, _embDim));
+        _gpu.UnmapPinned(_pinnedNorm!);
+
+        // 3. Shared-expert scalar gate = sigmoid(ffn_gate_inp_shexp · norm).
+        float shexpDot = SimdKernels.DotF32(_cpuMtpFfnGateInpShexp, _cpuNormBuf, _embDim);
+        float shexpScale = 1.0f / (1.0f + MathF.Exp(-shexpDot));
+
+        // 4. Router: F32 [embDim, numExperts] MatVec → softmax → top-K.
+        var routerW = _cpuMtpFfnGateInp;
+        SimdKernels.MatVec(_cpuRouterLogits, routerW.DataPtr, _cpuNormBuf,
+            numExperts, _embDim, routerW.DType);
+        SimdKernels.SoftmaxInPlace(_cpuRouterLogits, numExperts);
+
+        Span<int> selectedExperts = stackalloc int[numActive];
+        Span<float> expertWeights = stackalloc float[numActive];
+        SelectTopKPtr(_cpuRouterLogits, numExperts, numActive, selectedExperts, expertWeights,
+            normalize: _hp.NormalizeMoeTopKWeights);
+
+        // 5. Routed experts (sparse top-K): two batched Parallel.For sweeps (mirror CpuMoeFfn).
+        var gateExps = _cpuMtpFfnGateExps;
+        var upExps   = _cpuMtpFfnUpExps;
+        var downExps = _cpuMtpFfnDownExps;
+
+        int bprG = (_embDim   / DTypeInfo.BlockSize(gateExps.DType)) * DTypeInfo.BytesPerBlock(gateExps.DType);
+        int bprU = (_embDim   / DTypeInfo.BlockSize(upExps.DType))   * DTypeInfo.BytesPerBlock(upExps.DType);
+        int bprD = (expertDim / DTypeInfo.BlockSize(downExps.DType)) * DTypeInfo.BytesPerBlock(downExps.DType);
+
+        int* sePtr = stackalloc int[numActive];
+        float* ewPtr = stackalloc float[numActive];
+        for (int i = 0; i < numActive; i++) { sePtr[i] = selectedExperts[i]; ewPtr[i] = expertWeights[i]; }
+
+        byte* gateP = gateExps.DataPtr; byte* upP = upExps.DataPtr; byte* downP = downExps.DataPtr;
+        DType gateDt = gateExps.DType, upDt = upExps.DType, downDt = downExps.DType;
+        float* gateAll = _cpuExpertGateAll, upAll = _cpuExpertUpAll;
+        float* normBuf = _cpuNormBuf, moeOut = _cpuMoeHidden;
+        int embDimL = _embDim, expertDimL = expertDim, numActiveL = numActive;
+        int bprGL = bprG, bprUL = bprU, bprDL = bprD;
+
+        Parallel.For(0, numActiveL * expertDimL, s_moeParallelOpts, idx =>
+        {
+            int k = idx / expertDimL;
+            int r = idx % expertDimL;
+            int expertIdx = sePtr[k];
+            long offG = (long)expertIdx * expertDimL * bprGL + (long)r * bprGL;
+            long offU = (long)expertIdx * expertDimL * bprUL + (long)r * bprUL;
+            gateAll[idx] = DispatchDot(gateP + offG, normBuf, embDimL, gateDt);
+            upAll[idx]   = DispatchDot(upP   + offU, normBuf, embDimL, upDt);
+        });
+
+        SimdKernels.SiLuMul(_cpuExpertGateAll, _cpuExpertUpAll, numActive * expertDim);
+
+        Parallel.For(0, embDimL, s_moeParallelOpts, r =>
+        {
+            float sum = 0f;
+            for (int k = 0; k < numActiveL; k++)
+            {
+                int expertIdx = sePtr[k];
+                float w = ewPtr[k];
+                long offD = (long)expertIdx * embDimL * bprDL + (long)r * bprDL;
+                sum += w * DispatchDot(downP + offD, gateAll + (long)k * expertDimL, expertDimL, downDt);
+            }
+            moeOut[r] = sum;
+        });
+
+        // 6. Reopen the session: upload the routed accumulator → _gpuHidden, then combine the scaled
+        //    GPU shared expert.
+        float* outPtr = _gpu.MapPinned(_pinnedHidden);
+        new ReadOnlySpan<float>(_cpuMoeHidden, _embDim).CopyTo(new Span<float>(outPtr, _embDim));
+        _gpu.UnmapPinned(_pinnedHidden);
+
+        _gpu.BeginRecord();
+        CopyGpuBuffer(_gpuHidden, _pinnedHidden);
+        _gpu.RecordBarrier();
+        _gpu.ScaleInPlace(_gpuSharedOut!, shexpScale);
+        _gpu.RecordBarrier();
+        _gpu.AddInPlace(_gpuHidden, _gpuSharedOut!);
+        _gpu.RecordBarrier();
+    }
+
+    /// <inheritdoc />
+    public void MtpResetCache()
+    {
+        if (!_hasMtp) return;
+        _mtpKvCache?.Reset();
+        _gpu.BeginRecord();
+        if (_gpuMtpKCache is { } kT) _gpu.Clear(kT);
+        if (_gpuMtpVCache is { } vT) _gpu.Clear(vT);
+        _gpu.EndRecordAndSubmit();
+    }
+
+    /// <inheritdoc />
+    public void MtpTruncateTo(int length)
+    {
+        if (!_hasMtp) return;
+        if (length == 0) { MtpResetCache(); return; }
+        // Soft truncate — the device _gpuMtpKCache is a flat ring, so future KvAppends overwrite
+        // stale slots; only the bookkeeping length rewinds (mirror CUDA :4326-4335).
+        _mtpKvCache?.TruncateTo(length);
+    }
+
+    /// <inheritdoc />
+    /// <remarks>Walks the prompt and calls <see cref="MtpForward"/> at each position to populate the
+    /// GPU MTP KV cache. prevHidden h_{startPos+i-1} is read from the absolute-position hidden history
+    /// populated by the preceding Prefill/Forward/BatchVerify sweeps (mirror CUDA :4348-4383).</remarks>
+    public void PrefillMtp(IReadOnlyList<int> tokens, int startPos = 0)
+    {
+        ThrowIfFaulted();
+        if (!_hasMtp) return;
+        if (tokens is null || tokens.Count == 0) return;
+
+        int N = tokens.Count;
+        int requiredHistory = startPos + N;
+        if (_mtpHiddenHistoryLength < requiredHistory)
+            throw new InvalidOperationException(
+                $"PrefillMtp({N} tokens, startPos={startPos}) requires a preceding Prefill / Forward " +
+                $"sweep covering positions [0..{requiredHistory}); the hidden history only goes to " +
+                $"{_mtpHiddenHistoryLength}.");
+
+        float* zeroHidden = startPos == 0
+            ? (float*)NativeMemory.AllocZeroed((nuint)((long)_embDim * sizeof(float)))
+            : null;
+        try
+        {
+            for (int i = 0; i < N; i++)
+            {
+                int absPos = startPos + i;
+                float* prevH = absPos == 0
+                    ? zeroHidden!
+                    : _mtpPrefillHiddens + (long)(absPos - 1) * _embDim;
+                _ = MtpForward(tokens[i], absPos, new ReadOnlySpan<float>(prevH, _embDim));
+            }
+        }
+        finally
+        {
+            if (zeroHidden != null) NativeMemory.Free(zeroHidden);
+        }
+    }
+
+    /// <summary>Grow the MTP hidden-history buffer to hold at least <paramref name="requiredTokens"/>
+    /// rows (grow-by-doubling, realloc + copy). Mirror CUDA :2967-2983.</summary>
+    private void EnsureMtpHiddenHistoryCap(int requiredTokens)
+    {
+        if (_mtpPrefillHiddensCap >= requiredTokens) return;
+        int newCap = Math.Max(requiredTokens, _mtpPrefillHiddensCap * 2);
+        long oldBytes = (long)_mtpHiddenHistoryLength * _embDim * sizeof(float);
+        float* fresh = (float*)NativeMemory.Alloc((nuint)((long)newCap * _embDim * sizeof(float)));
+        if (_mtpPrefillHiddens != null)
+        {
+            if (oldBytes > 0)
+                NativeMemory.Copy(_mtpPrefillHiddens, fresh, (nuint)oldBytes);
+            NativeMemory.Free(_mtpPrefillHiddens);
+        }
+        _mtpPrefillHiddens = fresh;
+        _mtpPrefillHiddensCap = newCap;
     }
 
     // ================================================================
@@ -2376,6 +2985,41 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         if (_gpuGdnRingScan is { } ringScan) _gpu.Free(ringScan);
         if (_gpuGdnRingConv is { } ringConv) _gpu.Free(ringConv);
         if (_gpuBvLogitsAll is { } bvLogits) _gpu.Free(bvLogits);
+
+        // MTP / NEXTN head (#357 PR3): weights, caches, per-step scratch, host buffers.
+        if (_gpuMtpAttnNorm     is { } t01) _gpu.Free(t01);
+        if (_gpuMtpWQGate       is { } t02) _gpu.Free(t02);
+        if (_gpuMtpWK           is { } t03) _gpu.Free(t03);
+        if (_gpuMtpWV           is { } t04) _gpu.Free(t04);
+        if (_gpuMtpWO           is { } t05) _gpu.Free(t05);
+        if (_gpuMtpQNorm        is { } t06) _gpu.Free(t06);
+        if (_gpuMtpKNorm        is { } t07) _gpu.Free(t07);
+        if (_gpuMtpPostAttnNorm is { } t08) _gpu.Free(t08);
+        if (_gpuMtpFfnGate      is { } t09) _gpu.Free(t09);
+        if (_gpuMtpFfnUp        is { } t10) _gpu.Free(t10);
+        if (_gpuMtpFfnDown      is { } t11) _gpu.Free(t11);
+        if (_gpuMtpWGateShexp   is { } t12) _gpu.Free(t12);
+        if (_gpuMtpWUpShexp     is { } t13) _gpu.Free(t13);
+        if (_gpuMtpWDownShexp   is { } t14) _gpu.Free(t14);
+        if (_gpuMtpEnorm        is { } t15) _gpu.Free(t15);
+        if (_gpuMtpHnorm        is { } t16) _gpu.Free(t16);
+        if (_gpuMtpSharedHeadNorm is { } t17) _gpu.Free(t17);
+        if (_gpuMtpEhProj       is { } t18) _gpu.Free(t18);
+        if (_gpuMtpKCache       is { } t19) _gpu.Free(t19);
+        if (_gpuMtpVCache       is { } t20) _gpu.Free(t20);
+        if (_gpuMtpEmbedBuf     is { } t21) _gpu.Free(t21);
+        if (_gpuMtpEnormBuf     is { } t22) _gpu.Free(t22);
+        if (_gpuMtpHnormBuf     is { } t23) _gpu.Free(t23);
+        if (_gpuMtpConcatBuf    is { } t24) _gpu.Free(t24);
+        if (_gpuLastHidden      is { } t25) _gpu.Free(t25);
+        if (_gpuMtpSelfHiddenDev is { } t26) _gpu.Free(t26);
+        if (_gpuMtpHistDev      is { } t27) _gpu.Free(t27);
+        if (_pinnedMtpHidden    is { } t28) _gpu.Free(t28);
+        _mtpKvCache?.Dispose();
+        if (_lastHidden        != null) NativeMemory.Free(_lastHidden);
+        if (_mtpSelfHidden     != null) NativeMemory.Free(_mtpSelfHidden);
+        if (_mtpPrefillHiddens != null) NativeMemory.Free(_mtpPrefillHiddens);
+        if (_cpuMtpFfnGateInpShexp != null) NativeMemory.Free(_cpuMtpFfnGateInpShexp);
 
         // MoE GPU scratch.
         if (_gpuRouterLogits is { } rl) _gpu.Free(rl);
