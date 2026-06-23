@@ -1,6 +1,7 @@
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
 using SharpInference.Core;
+using SharpInference.Core.Grammar;
 
 namespace SharpInference.Engine;
 
@@ -59,10 +60,6 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
     private int _pendingCount;
     private int _activeCount;
 
-    // Set once (Interlocked) the first time a constraint-bearing request is seen, so the
-    // tool-grammar-ignored warning (issue #374) is emitted at most once per engine.
-    private int _warnedConstraintIgnored;
-
     private sealed class PendingRequest(string prompt, SamplingParams sp, CancellationToken ct, Channel<GenerateChunk> output)
     {
         public readonly string Prompt = prompt;
@@ -93,6 +90,12 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         public required Random Rng;
         public required CancellationToken Ct;
         public required long ProjectedTokens;
+        // Per-sequence grammar/FSM constraint (issue #374/#377). Null = unconstrained decoding for
+        // this sequence (the common case). When non-null the batcher advances it with every emitted
+        // token via Accept and, while it reports IsConstraining, masks this sequence's logits row via
+        // Filter before sampling — forcing tool-call arguments to satisfy the schema. The instance is
+        // built per request (ChatTemplateRenderer.BuildToolArgumentConstraint) and is single-request.
+        public ITokenConstraint? Constraint;
         public int TokenCount;
         // Per-sequence stateful UTF-8 decoders: reassembles multi-byte characters
         // split across tokens (CJK, emoji, smart quotes). Independent decoders for
@@ -221,16 +224,9 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
     {
         _ = canonicalHistoryPrefix; // intentionally ignored; see XML remarks
 
-        // Grammar-constrained decoding (issue #374) is not wired into the batched sampler — each
-        // sequence is sampled directly from its logits with no per-token mask/advance. Rather than
-        // silently drop the constraint (the request would generate unconstrained tool arguments with
-        // no signal), warn once so an operator who set SHARPI_TOOL_GRAMMAR alongside SHARPI_MAX_BATCH
-        // knows the two don't yet compose. Single-user InferenceEngine honors the constraint.
-        if (sp.Constraint is not null && Interlocked.Exchange(ref _warnedConstraintIgnored, 1) == 0)
-            Console.Error.WriteLine(
-                "[ContinuousBatchingEngine] tool-grammar constraint is ignored under continuous " +
-                "batching (SHARPI_MAX_BATCH); tool-call arguments will be generated unconstrained. " +
-                "Run without batching to use SHARPI_TOOL_GRAMMAR (issue #374).");
+        // Grammar-constrained decoding (issue #374) is wired into the batched sampler (issue #377):
+        // sp.Constraint flows through admission onto the per-sequence ActiveSeq, where the batcher
+        // masks that sequence's logits row while it is constraining and advances it on every token.
 
         var channel = Channel.CreateUnbounded<GenerateChunk>(
             new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
@@ -324,13 +320,18 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             // on-device argmax tail (#205/#206): it returns just the per-seq (token, logit) and
             // skips the full N×vocab logits D2H + host split. A single sampled or force-closing
             // seq reverts the whole step to the full-logits path (the argmax buffer can't sample).
+            // A sequence that is actively constraining (issue #377) also needs the full logits row to
+            // mask, so it likewise reverts the step — but only WHILE constraining: a constraint-bearing
+            // request keeps the fast path in its unconstrained spans (its tokens still flow through
+            // Accept below from the argmax tail). With no constraint anywhere this is byte-identical.
             bool allGreedy = _fwd.SupportsBatchedGpuArgmax;
             for (int i = 0; i < n && allGreedy; i++)
             {
                 var s = active[i];
                 bool forcedClose = _thinkingEnabled && s.InThinking && s.Sp.MaxThinkingTokens > 0
                                    && s.ThinkingCount >= s.Sp.MaxThinkingTokens && _endThinkTokenId > 0;
-                if (s.Sp.Temperature > 0f || forcedClose) allGreedy = false;
+                if (s.Sp.Temperature > 0f || forcedClose || s.Constraint is { IsConstraining: true })
+                    allGreedy = false;
             }
 
             float[][]? logitsBatch = null;
@@ -363,10 +364,22 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                 }
                 else
                 {
+                    // While this sequence's constraint is inside a constrained region, sample from the
+                    // masked logits (grammar-forbidden tokens set to -inf); otherwise sample the raw
+                    // logits exactly as the unconstrained path would (issue #377). The gate above kept
+                    // a constraining seq off the argmax fast path, so logitsBatch is populated here.
+                    var rowLogits = seq.Constraint is { IsConstraining: true } ctr
+                        ? ctr.Filter(logitsBatch![i])
+                        : (ReadOnlySpan<float>)logitsBatch![i];
                     next = seq.Sp.Temperature <= 0f
-                        ? Sampler.Greedy(logitsBatch![i])
-                        : Sampler.Sample(logitsBatch![i], seq.Sp, seq.Rng);
+                        ? Sampler.Greedy(rowLogits)
+                        : Sampler.Sample(rowLogits, seq.Sp, seq.Rng);
                 }
+
+                // Advance the grammar constraint with the just-chosen token (every token, including the
+                // argmax-tail and force-close paths, so it can detect a tool-call boundary and
+                // begin/end constraining). No-op when this sequence has no constraint.
+                seq.Constraint?.Accept(next);
 
                 bool done = seq.StopIds.Contains(next)
                     || seq.TokenCount >= seq.Sp.MaxNewTokens
@@ -700,9 +713,20 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             req.Sp.ResolveStopSet(_tokenizer.EogTokenIds);
         var rng = new Random();
 
+        // Per-request grammar constraint (issue #374/#377). Reset to its watching state so a reused
+        // instance can't carry state across requests, then mask the first sampled token if it is
+        // already constraining (rare — would require the prompt to end mid-call). Advance it with the
+        // first token below, exactly as the decode loop does for every subsequent token.
+        var constraint = req.Sp.Constraint;
+        constraint?.Reset();
+
+        var firstLogits = constraint is { IsConstraining: true } ctr
+            ? ctr.Filter(logits)
+            : (ReadOnlySpan<float>)logits;
         int firstToken = req.Sp.Temperature <= 0f
-            ? Sampler.Greedy(logits)
-            : Sampler.Sample(logits, req.Sp, rng);
+            ? Sampler.Greedy(firstLogits)
+            : Sampler.Sample(firstLogits, req.Sp, rng);
+        constraint?.Accept(firstToken);
 
         if (stopIds.Contains(firstToken))
         {
@@ -738,6 +762,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             Rng = rng,
             Ct = req.Ct,
             ProjectedTokens = p.ProjectedTokens,
+            Constraint = constraint,
             TokenCount = 1,
             InThinking = promptInThinking,
         };
