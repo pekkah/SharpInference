@@ -135,6 +135,7 @@ sharpi-cli -m models/Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-I-Compact.gguf -g -1 \
 | Backend | Prefill t/s | Decode t/s | Notes |
 |---|---:|---:|---|
 | **CUDA** `-g -1 --no-thinking` (hybrid) | **144.3** | **26.5** | agentic finetune; 80% acceptance (`bench-carnice.ps1`). APEX mixed-precision (Q3_K + Q8_0 experts); Q8_KS per-32 int dots auto-enable |
+| Vulkan `-g -1 --no-thinking` (hybrid) | 18.4 | 12.2 | runs on Vulkan (#357); 47% acceptance. MTP self-spec **regresses** vs plain MoE decode (~22 t/s, cf. 35B-A3B) — routed-expert verify is un-amortized on Vulkan (#370). Lossless; use `--spec-type none` for speed |
 
 #### Qwen3.6-35B-A3B (GDN+MoE) — [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) · 22 GB
 
@@ -146,6 +147,7 @@ sharpi-cli -m models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf -g -1 \
 | Backend | Prefill t/s | Decode t/s | Notes |
 |---|---:|---:|---|
 | **CUDA** `-g -1` (hybrid) | **67.5** | **23.7** | 10 attn + 30 GDN on GPU; routed MoE on CPU, shared expert GPU-overlapped. Fused GDN scan + batched SDPA, bit-identical. `SHARPI_CPU_MOE=0` forces on-GPU experts |
+| Vulkan `-g -1` (hybrid) | 17.3 | 22.8 | 10 attn + 30 GDN on GPU; routed MoE + shared expert on CPU mmap (#356). Decode ~matches CUDA (CPU-routed-expert bound); prefill trails CUDA — per-row CPU FFN not yet batched (#371) |
 | CPU | **11.3** | 9.3 | hybrid GDN/attn, 256 experts / 8 active. Chunk-parallel (FlashQLA) GDN prefill default-on (1.35× over the 8.4 t/s per-token scan; `SHARPI_GDN_CHUNKED_PREFILL=0` to disable). MTP variants keep the byte-exact scan (FP-reorder flips the thinking-boundary token) |
 
 #### Qwen3.6-35B-A3B-MTP (GDN+MoE) — [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) · 22 GB
@@ -159,6 +161,7 @@ SHARPI_CPU_MOE=1 sharpi-cli -m models/Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf -g -1 \
 | Backend | Prefill t/s | Decode t/s | Notes |
 |---|---:|---:|---|
 | **CUDA** `-g -1 --no-thinking` (hybrid) | **67.2** | **21.4** | needs `SHARPI_CPU_MOE=1`: 30 GDN + 10 attn + shared expert on GPU, routed experts CPU mmap. 100% acceptance |
+| Vulkan `-g -1 --no-thinking` (hybrid) | 15.4 | 9.3 | needs `SHARPI_CPU_MOE=1`; runs on Vulkan (#357). 61% acceptance, but MTP self-spec **regresses** vs ~22 t/s plain MoE decode — routed-expert verify un-amortized on Vulkan (#370). Use `--spec-type none` for speed |
 | CPU `--no-thinking` | 9.1 | **8.5** | GDN/attn + 256-expert MoE + MTP head (#44). 100% acceptance; MoE-MTP batched verify (#45) — routed experts sequential per token, so ~MTP-off parity |
 
 #### Qwen3.6-27B-MTP (GDN) — [unsloth](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF) · 16 GB (Q4_K_M) / 19 GB (Q5_K_M)
@@ -172,7 +175,7 @@ sharpi-cli -m models/Qwen3.6-27B-MTP-Q4_K_M.gguf -g -1 \
 |---|---:|---:|---:|---|
 | **CUDA** `-g -1 --no-thinking` (hybrid) | 16 GB | **10.0** | **12.3** | GDN/attn KV resident on GPU, dense FFN on CPU mmap (the k=4 ring reclaims the VRAM the old k=2 default spent on 22 GPU FFN layers). 84% acceptance; 4-input CPU-FFN `MatVec4In` (#209) moves the verify optimum from k=2 → k=4 — **1.9× over MTP-off (6.5)**, +22% over the old k=2 default (10.1) |
 | **CUDA** `-g -1 --no-thinking` `Q5_K_M` (hybrid) | 19 GB | 6.2 | **5.5** | 13/64 FFN on GPU, 51/64 CPU mmap. 98% acceptance; batched trunk (#119) bit-identical |
-| Vulkan `-g -1 --no-thinking` (hybrid) | 16 GB | 6.0 | **5.8** | GDN/attn on GPU, dense FFN CPU mmap; MTP self-spec now runs on Vulkan (#357), greedy **byte-identical** to its MTP-off decode. 98% acceptance; **1.14× over MTP-off (5.1)** — modest vs CUDA's 1.9× because the per-row CPU FFN dominates the 12 GB hybrid and isn't amortized in batched verify (the #356 batched-trunk limitation); full-offload configs gain more |
+| Vulkan `-g -1 --no-thinking` (hybrid) | 16 GB | 7.6 | **3.9** | GDN/attn + MTP head on GPU, dense FFN CPU mmap. MTP self-spec runs on Vulkan (#357), greedy **byte-identical** to MTP-off — but currently a **slight loss** on throughput (3.9 @ 54% accept vs **4.9 MTP-off**; only wins at very high acceptance, ~5.8 @ 98%) because the dense CPU FFN isn't amortized in batched verify (#371) |
 | CPU `--no-thinking` | 16 GB | 3.0 | **3.6** | dense 27B GDN/attn + native MTP head; auto MTP self-spec (#25) at greedy + `--no-thinking`. 90% draft acceptance; folded k-token batched verify (#30/#207) — 1.2× over MTP-off (3.0) |
 | CPU `--no-thinking` `Q5_K_M` | 19 GB | 2.8 | **3.5** | ~10% slower than Q4_K_M; 100% acceptance |
 
@@ -195,11 +198,12 @@ each after a discarded warm-clock warm-up. The CPU and Vulkan rows are from the 
 ~1K ctx), except the Gemma 4 E4B q4_0 Vulkan row, freshly measured 2026-06-22 with the same convention after
 the #351 gemma4-on-Vulkan work (PLE + shared-KV + narrowed KV). Vulkan rows remain ~35% below their earlier
 numbers — an unexplained regression (CUDA improved on the same box). Llama-4 Scout and Qwen3-Coder
-Vulkan-hybrid keep prior values (not re-runnable here). The Qwen3.6 Gated-DeltaNet family now runs on
-`--backend vulkan` too (#356) — including MTP self-speculative decoding (#357), greedy byte-identical to the
-MTP-off Vulkan decode. The 27B-MTP Vulkan row above is freshly measured 2026-06-23 with the same convention;
-the 35B-A3B / 35B-A3B-MTP / Carnice MoE+GDN models also run on Vulkan (CPU-MoE on a 12 GB card) but are
-benched only on CUDA so far._
+Vulkan-hybrid keep prior values (not re-runnable here). The Qwen3.6 Gated-DeltaNet family (35B-A3B, 27B-MTP,
+35B-A3B-MTP, Carnice) now runs on `--backend vulkan` too (#356), freshly measured 2026-06-23 with the same
+convention. MTP self-speculative decoding works on Vulkan (#357) and is greedy byte-identical to MTP-off, **but
+it currently regresses throughput** there — the batched-verify FFN is un-amortized (routed experts read
+k×/token on MoE, #370; dense CPU FFN not quad-batched, #371), so plain decode (`--spec-type none`) is faster
+than MTP on Vulkan today. The MoE GDN models' plain decode ~matches CUDA (CPU-routed-expert bound)._
 
 **Long-context decode** uses flash-decoding (split-KV) on all CUDA paths (dense + MoE/GDN hybrids): the
 per-token KV read parallelizes across SMs, so decode no longer collapses with context (Gemma 4 E4B q8
