@@ -1070,7 +1070,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         bool hasQ4KRouted  = HasRoutedExpertsOfDType(model, hp, DType.Q4_K);
         _q3kQ8KEnabled  = ResolveGate("SHARPI_Q3K_Q8K",  hasQ3KRouted);
         _q8_0Q8KEnabled = ResolveGate("SHARPI_Q8_0_Q8K", hasQ8_0Routed);
-        _q4kQ8KEnabled  = ResolveGate("SHARPI_Q4K_Q8K",  hasQ4KRouted);
+        // Q4_K int8 (DotQ4K_Q8KS) is AVX2-only, but the f32 DotQ4K has an AVX-512 path
+        // (DotQ4K_Avx512). On AVX-512 hardware the f32-AVX512 dot + no activation-quant
+        // overhead BEATS the int8-AVX2 dot — measured ~8% faster on a Q4_K_M model (Zen4).
+        // So only auto-enable Q4_K int8 where AVX-512 is absent (there f32 falls to AVX2 and
+        // the int8 dot can win); on AVX-512 default OFF. Still forceable via SHARPI_Q4K_Q8K=1.
+        // (Q3_K/Q8_0 int8 have no f32-AVX512 competitor, so they stay auto-on.)
+        _q4kQ8KEnabled  = ResolveGate("SHARPI_Q4K_Q8K",
+            hasQ4KRouted && !System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated);
         if (_cpuMoe && (_q3kQ8KEnabled || _q8_0Q8KEnabled || _q4kQ8KEnabled))
         {
             var enabled = new List<string>(3);
