@@ -1549,12 +1549,18 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // RAM-fit heuristic, and no-ops when nothing is CPU-resident (full-GPU GDN).
         MmapPrefault.Run("CudaHybridGdnForwardPass", BuildCpuPrefaultRegions());
 
-        // Op-offload (SHARPI_MOE_GPU_PREFILL): build the pinned expert-weight buffer at LOAD
-        // (one-time ~14 GB cudaMallocHost + copy), not lazily on the first prefill — otherwise
-        // the setup cost lands on the critical path of the first request and tanks its TTFT.
-        // EnsureGpuOffloadScratch's later call is then a no-op (the _goPinAttempted guard).
+        // Op-offload (SHARPI_MOE_GPU_PREFILL): build ALL op-offload scratch at LOAD — the
+        // ~14 GB pinned cudaMallocHost + copy AND the GPU gather/scatter/layer buffers —
+        // not lazily on the first prefill, otherwise the one-time setup lands on the first
+        // request's critical path (tanking its TTFT and polluting single-turn benchmarks).
+        // EnsureGpuOffloadScratch is grow-only, so a larger chunk later just re-grows the
+        // (small) GPU buffers; the dominant pinned-buffer cost is N-independent and done here.
         if (_gpuMoePrefill)
-            EnsureExpertWeightsPinned();
+        {
+            int warmChunk = int.TryParse(Environment.GetEnvironmentVariable("SHARPI_PREFILL_CHUNK"),
+                out int pc) && pc > 0 ? pc : 512;
+            EnsureGpuOffloadScratch(warmChunk);
+        }
     }
 
     // =================================================================
