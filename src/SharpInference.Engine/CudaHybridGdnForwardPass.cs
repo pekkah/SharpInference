@@ -3123,12 +3123,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         else if (layerPinned)
         {
             // First MoE layer of the chunk (or any non-prefetched raw-quant layer): DMA straight
-            // from the pinned buffer into the current slot, then host-wait so the GEMMs below
-            // (on _stream) read complete weights. Direct (no staging) + full bandwidth.
+            // from the pinned buffer into the current slot, then FENCE the compute stream behind
+            // the copies (not a host block) so the GEMMs below (on _stream) read complete weights
+            // while the CPU keeps launching kernels — mirrors the consumedPrefetch branch (Gemini
+            // review). Direct (no staging) + full bandwidth. Waits stay unconditional to match the
+            // three unconditional DMAs just issued.
             var gh = _gpu.UploadRawIntoAsyncDirect(_gpuLayerGate[_goCurSlot]!, pinGate, (long)numExperts * gateRawBytes);
             var uh = _gpu.UploadRawIntoAsyncDirect(_gpuLayerUp[_goCurSlot]!,   pinUp,   (long)numExperts * upRawBytes);
             var dh = _gpu.UploadRawIntoAsyncDirect(_gpuLayerDown[_goCurSlot]!, pinDown, (long)numExperts * downRawBytes);
-            _gpu.WaitForUploadHost(gh); _gpu.WaitForUploadHost(uh); _gpu.WaitForUploadHost(dh);
+            _gpu.WaitForUpload(gh); _gpu.WaitForUpload(uh); _gpu.WaitForUpload(dh);
             _gpu.ReleaseUploadHandle(gh); _gpu.ReleaseUploadHandle(uh); _gpu.ReleaseUploadHandle(dh);
         }
         else
