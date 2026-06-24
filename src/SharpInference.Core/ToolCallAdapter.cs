@@ -319,6 +319,21 @@ public sealed class QwenToolCallAdapter(string architecture) : IToolCallAdapter
     public string Architecture { get; } = architecture;
     public int MaxOpenTagLength => OpenMarker.Length;
 
+    /// <inheritdoc/>
+    /// <remarks>Constrains the JSON argument object of Qwen's
+    /// <c>&lt;tool_call&gt;{"name":"NAME","arguments":{...}}&lt;/tool_call&gt;</c> wire format
+    /// (issue #376). Inert (returns null) when no supplied tool is constrainable, when
+    /// <c>&lt;tool_call&gt;</c> isn't a vocabulary token, or when the model emits the Qwen3.6 XML
+    /// shape instead of JSON (the constraint simply never engages).</remarks>
+    public ITokenConstraint? BuildArgumentConstraint(IReadOnlyList<ToolSchema> tools, GrammarVocabulary vocab)
+    {
+        ArgumentNullException.ThrowIfNull(tools);
+        ArgumentNullException.ThrowIfNull(vocab);
+        var c = new JsonToolArgumentConstraint(
+            vocab, tools, OpenMarker, JsonToolEnvelope.NameValueObject, argsKeys: ["arguments", "parameters"]);
+        return c.HasConstrainableTools ? c : null;
+    }
+
     public ToolCallParseResult Parse(string rawOutput)
     {
         var calls = new List<ParsedToolCall>();
@@ -472,6 +487,19 @@ public sealed class LlamaToolCallAdapter : IToolCallAdapter
     public string Architecture => "llama";
     public int MaxOpenTagLength => OpenMarker.Length;
 
+    /// <inheritdoc/>
+    /// <remarks>Constrains the JSON argument object of Llama-3's
+    /// <c>&lt;|python_tag|&gt;{"name":"NAME","parameters":{...}}</c> wire format (issue #376). Inert
+    /// (null) when no tool is constrainable or <c>&lt;|python_tag|&gt;</c> isn't a vocabulary token.</remarks>
+    public ITokenConstraint? BuildArgumentConstraint(IReadOnlyList<ToolSchema> tools, GrammarVocabulary vocab)
+    {
+        ArgumentNullException.ThrowIfNull(tools);
+        ArgumentNullException.ThrowIfNull(vocab);
+        var c = new JsonToolArgumentConstraint(
+            vocab, tools, OpenMarker, JsonToolEnvelope.NameValueObject, argsKeys: ["parameters", "arguments"]);
+        return c.HasConstrainableTools ? c : null;
+    }
+
     public ToolCallParseResult Parse(string rawOutput)
     {
         var calls = new List<ParsedToolCall>();
@@ -565,6 +593,21 @@ public sealed class DeepSeekToolCallAdapter : IToolCallAdapter
 
     public string Architecture => "deepseek2";
     public int MaxOpenTagLength => OuterOpen.Length;
+
+    /// <inheritdoc/>
+    /// <remarks>Constrains the JSON argument object of DeepSeek's
+    /// <c>&lt;|tool_call_begin|&gt;NAME&lt;|tool_sep|&gt;{...}&lt;|tool_call_end|&gt;</c> wire format
+    /// (issue #376): the name is bare text up to <c>&lt;|tool_sep|&gt;</c>, then the argument object
+    /// is emitted directly. Inert (null) when no tool is constrainable or those structural tokens are
+    /// absent from the vocabulary.</remarks>
+    public ITokenConstraint? BuildArgumentConstraint(IReadOnlyList<ToolSchema> tools, GrammarVocabulary vocab)
+    {
+        ArgumentNullException.ThrowIfNull(tools);
+        ArgumentNullException.ThrowIfNull(vocab);
+        var c = new JsonToolArgumentConstraint(
+            vocab, tools, InnerOpen, JsonToolEnvelope.NameThenSeparator, separatorMarker: Separator);
+        return c.HasConstrainableTools ? c : null;
+    }
 
     public ToolCallParseResult Parse(string rawOutput)
     {
