@@ -18,12 +18,7 @@ concurrency:
 jobs:
   publish:
     name: Pack and push
-    # windows-latest (not ubuntu) so the native AVX-512-VNNI helper
-    # (native/cpu_vnni/q8k_vnni.c → sharpi_cpu_vnni.dll, built by build-vnni.ps1 with
-    # clang-cl) is produced and packed into the win-x64 native runtime asset. The
-    # runner ships LLVM + VS 2022 + the Windows SDK, which build-vnni.ps1 auto-discovers.
-    # The managed packages are RID-agnostic; only the native DLL is win-x64-specific.
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     permissions:
       contents: read
 
@@ -38,20 +33,6 @@ jobs:
         uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '10.0.x'
-
-      # Build the VNNI DLL explicitly (also runs via the csproj BeforeBuild target during
-      # pack, but doing it here makes success/failure visible in the logs). Non-fatal:
-      # if the toolchain is unavailable the script exits 0 and the package omits the DLL
-      # (consumers fall back to the managed AVX2 path), so the release never breaks.
-      - name: Build native VNNI DLL
-        shell: pwsh
-        run: |
-          ./scripts/build-vnni.ps1
-          if (Test-Path native/cpu_vnni/sharpi_cpu_vnni.dll) {
-            Write-Host "::notice::sharpi_cpu_vnni.dll built — VNNI path will ship in the win-x64 native asset."
-          } else {
-            Write-Host "::warning::sharpi_cpu_vnni.dll NOT built — package ships without VNNI (AVX2 fallback)."
-          }
 
       - name: Pack
         run: dotnet pack -c Release -o ./artifacts/nupkg

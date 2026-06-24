@@ -2736,12 +2736,6 @@ public static unsafe class SimdKernels
     {
         int numBlocks = cols / 256;
 
-        // Native AVX-512-VNNI (vpdpbusd) path: ~4× the AVX2 chain on Zen4 and
-        // matches llama.cpp's ggml-cpu-zen4 kernel. Integer result is identical
-        // to the scalar reference; degrades to AVX2 if the DLL/CPU is absent.
-        if (Q8VnniInterop.IsAvailable)
-            return Q8VnniInterop.DotQ3K_Q8KS(row, scratch, numBlocks);
-
         if (Avx2.IsSupported && Fma.IsSupported)
             return DotQ3K_Q8KS_Avx2(row, scratch, numBlocks);
 
@@ -2944,14 +2938,6 @@ public static unsafe class SimdKernels
                                        out float sum1, out float sum2)
     {
         int numBlocks = cols / 256;
-        // Native AVX-512-VNNI (vpdpbusd): decode the weight once, dot both inputs.
-        // Each accumulation is integer-identical to a single native dot; degrades
-        // to the AVX2 chain if the DLL/CPU is absent.
-        if (Q8VnniInterop.IsAvailable)
-        {
-            Q8VnniInterop.DotQ3K_Q8KS_2In(row, scratch1, scratch2, numBlocks, out sum1, out sum2);
-            return;
-        }
         if (Avx2.IsSupported && Fma.IsSupported)
         {
             DotQ3K_Q8KS_2In_Avx2(row, scratch1, scratch2, numBlocks, out sum1, out sum2);
@@ -3094,15 +3080,6 @@ public static unsafe class SimdKernels
         out float sum0, out float sum1, out float sum2, out float sum3)
     {
         int numBlocks = cols / 256;
-        // Native AVX-512-VNNI (vpdpbusd): decode the weight once, dot all four
-        // inputs. Each accumulation is integer-identical to a single native dot;
-        // degrades to the AVX2 chain if the DLL/CPU is absent.
-        if (Q8VnniInterop.IsAvailable)
-        {
-            Q8VnniInterop.DotQ3K_Q8KS_4In(row, scratch0, scratch1, scratch2, scratch3, numBlocks,
-                out sum0, out sum1, out sum2, out sum3);
-            return;
-        }
         if (Avx2.IsSupported && Fma.IsSupported)
         {
             DotQ3K_Q8KS_4In_Avx2(row, scratch0, scratch1, scratch2, scratch3, numBlocks,

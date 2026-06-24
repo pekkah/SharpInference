@@ -455,10 +455,3 @@ prof/
 # Gemma 4 vision parity golden — large binary, regenerable via scripts/gemma4uv_ref.py (issue #250).
 # meta.json (the spec) stays tracked.
 tests/fixtures/gemma4uv/*.f32
-
-# Native AVX-512-VNNI CPU kernel build artifact — regenerable from the tracked
-# q8k_vnni.c via scripts/build-vnni.ps1 (clang-cl). Source stays tracked.
-native/cpu_vnni/*.dll
-native/cpu_vnni/*.lib
-native/cpu_vnni/*.exp
-native/cpu_vnni/*.obj

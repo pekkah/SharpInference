@@ -12,43 +12,4 @@
     <InternalsVisibleTo Include="SharpInference.Tests.ForwardPass" />
   </ItemGroup>
 
-  <!--
-    Native AVX-512-VNNI CPU kernel (sharpi_cpu_vnni.dll). OPTIONAL: built by
-    scripts/build-vnni.ps1 with clang-cl. If clang/VS/SDK is absent the script
-    exits 0 without producing the DLL, and the managed AVX2 path is used at
-    runtime. The build target is non-fatal (ContinueOnError) so `dotnet build`
-    always succeeds.
-  -->
-  <PropertyGroup>
-    <VnniSource>$(MSBuildThisFileDirectory)..\..\native\cpu_vnni\q8k_vnni.c</VnniSource>
-    <VnniDll>$(MSBuildThisFileDirectory)..\..\native\cpu_vnni\sharpi_cpu_vnni.dll</VnniDll>
-    <VnniScript>$(MSBuildThisFileDirectory)..\..\scripts\build-vnni.ps1</VnniScript>
-  </PropertyGroup>
-
-  <!--
-    Rebuild the VNNI DLL only when it is missing or older than the source. The
-    Inputs/Outputs let MSBuild's up-to-date check decide (a missing output, or a
-    source newer than the output, runs the target; otherwise it is skipped). The
-    Exec is non-fatal so a missing clang/VS/SDK never fails the managed build.
-  -->
-  <Target Name="BuildVnniDll" BeforeTargets="BeforeBuild"
-          Condition="('$(OS)' == 'Windows_NT') And Exists('$(VnniSource)')"
-          Inputs="$(VnniSource)" Outputs="$(VnniDll)">
-    <!-- Prefer pwsh (PS 7+); fall back to Windows PowerShell. Non-fatal. -->
-    <Exec Command="pwsh -NoProfile -ExecutionPolicy Bypass -File &quot;$(VnniScript)&quot;"
-          ContinueOnError="true" />
-    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(VnniScript)&quot;"
-          Condition="!Exists('$(VnniDll)')"
-          ContinueOnError="true" />
-  </Target>
-
-  <ItemGroup>
-    <None Include="$(MSBuildThisFileDirectory)..\..\native\cpu_vnni\sharpi_cpu_vnni.dll"
-          Condition="Exists('$(MSBuildThisFileDirectory)..\..\native\cpu_vnni\sharpi_cpu_vnni.dll')">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>sharpi_cpu_vnni.dll</Link>
-      <Visible>false</Visible>
-    </None>
-  </ItemGroup>
-
 </Project>

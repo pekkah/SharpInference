@@ -28,21 +28,6 @@
     <None Include="README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
-  <!--
-    Ship the native AVX-512-VNNI helper (native/cpu_vnni/sharpi_cpu_vnni.dll, built by
-    build-vnni.ps1 with clang-cl) as a win-x64 native runtime asset so a win-x64 library
-    consumer gets it next to the assemblies and Q8VnniInterop loads it by name. The custom
-    IncludeProjectReferenceOutputs target above only routes managed .dll/.xml/.pdb, so the
-    native DLL must be added here explicitly. Only packs when it was actually built (clang/
-    VS present) — otherwise the package omits it and the managed AVX2 path runs. Linux and
-    other RIDs get nothing (the project has no Linux native build for any dependency).
-    NOTE: the release workflow must run on Windows so build-vnni.ps1 produces this DLL.
-  -->
-  <ItemGroup Condition="Exists('$(MSBuildThisFileDirectory)..\..\native\cpu_vnni\sharpi_cpu_vnni.dll')">
-    <None Include="$(MSBuildThisFileDirectory)..\..\native\cpu_vnni\sharpi_cpu_vnni.dll"
-          Pack="true" PackagePath="runtimes/win-x64/native/" Visible="false" />
-  </ItemGroup>
-
   <!-- PrivateAssets=all stops the referenced projects from being listed as nuget
        dependencies (their DLLs ride inside this package instead). The third-party
        package deps used by those libraries are re-declared below. -->
