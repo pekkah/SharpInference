@@ -151,6 +151,28 @@ public sealed class ToolGrammarConstraintTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public void PartiallyTyped_RequiredTypedKey_Enforced_LooseValueFree()
+    {
+        var tok = Tok();
+        if (tok is null) { output.WriteLine("missing model — skip"); return; }
+        var vocab = new GrammarVocabulary(tok);
+
+        // 'location' is a required string; 'context' is an open object (free value). Issue #378: the
+        // tool is now constrained on its typed/required parts instead of being dropped wholesale.
+        var schema = Schema("get_weather",
+            """{"type":"object","properties":{"location":{"type":"string"},"context":{"type":"object"}},"required":["location"]}""");
+        var c = new Gemma4ToolCallAdapter().BuildArgumentConstraint([schema], vocab);
+        Assert.NotNull(c);
+
+        Feed(c!, tok, "<|tool_call>call:get_weather{");
+        Assert.True(c!.IsConstraining);
+        // Required 'location' not yet emitted → may not close; both declared keys reachable.
+        Assert.False(Allowed(c, tok, vocab.VocabSize, Id(tok, "}")));
+        Assert.True(Allowed(c, tok, vocab.VocabSize, tok.Encode("location")[0]));
+        Assert.True(Allowed(c, tok, vocab.VocabSize, tok.Encode("context")[0]));
+    }
+
+    [Fact]
     public void NonGemmaAdapter_BuildsNoConstraint()
     {
         var tok = Tok();

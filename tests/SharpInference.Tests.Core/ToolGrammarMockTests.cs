@@ -213,4 +213,60 @@ public sealed class ToolGrammarMockTests
         c.Reset();
         Assert.False(c.IsConstraining);
     }
+
+    [Fact]
+    public void TypedArray_OfFreeItems_AcceptsStringAndObjectItems()
+    {
+        // A typed array of loose items ({}): a free string item opens on the <|"|> quote, a free
+        // object on '{', a scalar bare. Regression for the array-item first-byte / quote path.
+        var (c, tok, vocab) = Build(
+            """{"type":"object","properties":{"items":{"type":"array","items":{}}},"required":["items"]}""",
+            "save");
+
+        Feed(c, tok, "<|tool_call>call:save{items:[");
+        Assert.True(c.IsConstraining);
+        Assert.True(Allowed(c, vocab, FakeGemmaTokenizer.Quote));     // free string item opens on the quote
+        Assert.True(Allowed(c, vocab, FakeGemmaTokenizer.Char('{'))); // free object item
+        Assert.True(Allowed(c, vocab, FakeGemmaTokenizer.Char('5'))); // bare scalar item
+        Assert.True(Allowed(c, vocab, FakeGemmaTokenizer.Char(']'))); // or close (empty)
+
+        c.Accept(FakeGemmaTokenizer.Quote); Feed(c, tok, "a"); c.Accept(FakeGemmaTokenizer.Quote);
+        Feed(c, tok, ",{k:3}]");
+        Assert.True(Allowed(c, vocab, FakeGemmaTokenizer.Char('}')));
+    }
+
+    [Fact]
+    public void PartiallyTyped_FreeValue_StillEnforcesTypedRequiredKey()
+    {
+        // 'context' is an open object → a free value; 'location' stays a required string. Before #378
+        // the whole tool was dropped (Build would return null); now it compiles and enforces the
+        // typed/required parts while leaving 'context' free.
+        var (c, tok, vocab) = Build(
+            """{"type":"object","properties":{"location":{"type":"string"},"context":{"type":"object"}},"required":["location"]}""",
+            "get_weather");
+
+        Feed(c, tok, "<|tool_call>call:get_weather{");
+        Assert.True(c.IsConstraining);
+        Assert.False(Allowed(c, vocab, FakeGemmaTokenizer.Char('}')));   // required 'location' missing
+
+        // Emit the loosely-typed 'context' first — its value may be a string, object, array, or scalar.
+        Feed(c, tok, "context:");
+        Assert.True(Allowed(c, vocab, FakeGemmaTokenizer.Quote));        // <|"|> string
+        Assert.True(Allowed(c, vocab, FakeGemmaTokenizer.Char('{')));    // object
+        Assert.True(Allowed(c, vocab, FakeGemmaTokenizer.Char('[')));    // array
+        Assert.True(Allowed(c, vocab, FakeGemmaTokenizer.Char('3')));    // bare scalar
+
+        // A free object with a <|"|>-string value and a nested array is balanced whole.
+        Feed(c, tok, "{a:");
+        c.Accept(FakeGemmaTokenizer.Quote); Feed(c, tok, "x"); c.Accept(FakeGemmaTokenizer.Quote);
+        Feed(c, tok, ",b:[1,2]}");
+        Assert.True(c.IsConstraining);
+        Assert.False(Allowed(c, vocab, FakeGemmaTokenizer.Char('}')));   // 'location' STILL required
+
+        Feed(c, tok, ",location:");
+        c.Accept(FakeGemmaTokenizer.Quote); Feed(c, tok, "Paris"); c.Accept(FakeGemmaTokenizer.Quote);
+        Assert.True(Allowed(c, vocab, FakeGemmaTokenizer.Char('}')));    // required satisfied
+        c.Accept(FakeGemmaTokenizer.Char('}'));
+        Assert.False(c.IsConstraining);                                  // clean close
+    }
 }

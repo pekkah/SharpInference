@@ -262,6 +262,78 @@ public sealed class JsonToolGrammarMockTests
     }
 
     [Fact]
+    public void PartiallyTyped_FreeValue_StillEnforcesTypedRequiredKey()
+    {
+        // 'context' is an open object (no properties) → a free value; 'location' stays a required
+        // string. Before #378 the whole tool was dropped (Build would return null); now it compiles.
+        var (c, tok, vocab) = Build(
+            """{"type":"object","properties":{"location":{"type":"string"},"context":{"type":"object"}},"required":["location"]}""",
+            "get_weather");
+
+        Feed(c, tok, QwenPreamble + "{");
+        Assert.True(c.IsConstraining);
+        Assert.False(Allowed(c, vocab, tok.Char('}')));   // required 'location' still missing
+
+        // Emit the loosely-typed 'context' first — its value may be an object, string, or bare scalar.
+        Feed(c, tok, "\"context\":");
+        Assert.True(Allowed(c, vocab, tok.Char('{')));
+        Assert.True(Allowed(c, vocab, tok.Char('"')));
+        Assert.True(Allowed(c, vocab, tok.Char('5')));
+        Assert.False(Allowed(c, vocab, tok.Char(',')));   // a value can't be empty
+
+        // A free object with arbitrary inner keys/nesting is accepted whole.
+        Feed(c, tok, "{\"anything\":42,\"nested\":{\"x\":[1,2]}}");
+        Assert.True(c.IsConstraining);
+        Assert.False(Allowed(c, vocab, tok.Char('}')));   // 'location' STILL required after the free value
+
+        Feed(c, tok, ",\"location\":\"Paris\"");
+        Assert.True(Allowed(c, vocab, tok.Char('}')));    // required satisfied → may close
+        Feed(c, tok, "}");
+        Assert.False(c.IsConstraining);
+    }
+
+    [Fact]
+    public void PartiallyTyped_AnyValue_AndUntypedArray_AreFree()
+    {
+        // 'meta' has no type (Any) and 'tags' is an untyped array — both free; 'id' stays required int.
+        var (c, tok, vocab) = Build(
+            """{"type":"object","properties":{"id":{"type":"integer"},"meta":{},"tags":{"type":"array"}},"required":["id"]}""",
+            "save");
+
+        Feed(c, tok, "<tool_call>{\"name\":\"save\",\"arguments\":{");
+        Assert.True(c.IsConstraining);
+
+        Feed(c, tok, "\"meta\":");
+        Assert.True(Allowed(c, vocab, tok.Char('"')));    // Any → free: string ok
+        Assert.True(Allowed(c, vocab, tok.Char('[')));    // …or array
+        Feed(c, tok, "\"x\",\"tags\":[1,\"a\",{\"k\":2}]");  // free string, then free untyped array
+        Assert.False(Allowed(c, vocab, tok.Char('}')));   // required 'id' still missing
+        Feed(c, tok, ",\"id\":7");
+        Assert.True(Allowed(c, vocab, tok.Char('}')));
+    }
+
+    [Fact]
+    public void TypedArray_OfFreeItems_AcceptsAnyItemShape()
+    {
+        // A typed array whose ITEM type is loose ({}) — the array structure is enforced, each item is
+        // free. Regression: the first-byte prune must admit non-numeric free items (string/object), not
+        // only numbers.
+        var (c, tok, vocab) = Build(
+            """{"type":"object","properties":{"items":{"type":"array","items":{}}},"required":["items"]}""",
+            "save");
+
+        Feed(c, tok, "<tool_call>{\"name\":\"save\",\"arguments\":{\"items\":[");
+        Assert.True(c.IsConstraining);
+        Assert.True(Allowed(c, vocab, tok.Char('"')));   // string item
+        Assert.True(Allowed(c, vocab, tok.Char('{')));   // object item
+        Assert.True(Allowed(c, vocab, tok.Char('5')));   // number item
+        Assert.True(Allowed(c, vocab, tok.Char(']')));   // or close (empty)
+
+        Feed(c, tok, "1,\"a\",{\"k\":2}]");              // mixed free items
+        Assert.True(Allowed(c, vocab, tok.Char('}')));   // array done, 'items' satisfied
+    }
+
+    [Fact]
     public void NonConstrainableTool_BuildsNoConstraint()
     {
         var tok = new FakeJsonTokenizer();
