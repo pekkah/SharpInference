@@ -404,7 +404,7 @@ public static class InferenceEngineLoader
             Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", cpuMoe ? "1" : "0");
 
         // GPU op-offload of the CPU-MoE routed prefill (mirrors the CLI's --gpu-moe-prefill).
-        // Default ON in the engine; nullable here so only an explicit option overrides.
+        // Opt-in, default OFF in the engine; nullable here so only an explicit option overrides.
         if (opts.GpuMoePrefill is bool gpuMoePrefill)
             Environment.SetEnvironmentVariable("SHARPI_MOE_GPU_PREFILL", gpuMoePrefill ? "1" : "0");
     }

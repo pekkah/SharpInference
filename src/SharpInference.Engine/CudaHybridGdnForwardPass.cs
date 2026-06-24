@@ -6178,6 +6178,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         var v = Environment.GetEnvironmentVariable(envName);
         if (v == "1") return true;
         if (v == "0") return false;
+        // Also accept the natural string forms (true/false/True/False) so a direct-env user who
+        // types SHARPI_..=true isn't silently defaulted — the CLI/server plumbing writes "1"/"0",
+        // but humans set these by hand. Anything else still falls through to the auto-default.
+        if (bool.TryParse(v, out bool b)) return b;
         return autoDetect;
     }
 
