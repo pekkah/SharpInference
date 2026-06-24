@@ -12,16 +12,13 @@ namespace SharpInference.Server.Endpoints;
 internal static class ToolGrammarHelper
 {
     /// <summary>
-    /// Whether grammar-constrained tool decoding is enabled — via the
-    /// <see cref="SharpInferenceServerOptions.ToolGrammar"/> option or the
-    /// <c>SHARPI_TOOL_GRAMMAR=1</c> environment variable (mirrors the SHARPI_* env pattern).
+    /// Whether grammar-constrained tool decoding is enabled — driven solely by the
+    /// <see cref="SharpInferenceServerOptions.ToolGrammar"/> option, the single source of truth.
+    /// The runnable host still honours <c>SHARPI_TOOL_GRAMMAR=1</c> by mapping that environment
+    /// variable onto the option at startup (mirrors the SHARPI_* env pattern), so the library layer
+    /// doesn't re-read the environment here.
     /// </summary>
-    public static bool Enabled(SharpInferenceServerOptions opts)
-    {
-        if (opts.ToolGrammar) return true;
-        var env = Environment.GetEnvironmentVariable("SHARPI_TOOL_GRAMMAR");
-        return env is "1" || string.Equals(env, "true", StringComparison.OrdinalIgnoreCase);
-    }
+    public static bool Enabled(SharpInferenceServerOptions opts) => opts.ToolGrammar;
 
     /// <summary>Parses (name, JSON-Schema) pairs into <see cref="ToolSchema"/>s, skipping nameless entries.</summary>
     public static List<ToolSchema> ToSchemas(IEnumerable<(string? Name, JsonElement? Parameters)> tools)

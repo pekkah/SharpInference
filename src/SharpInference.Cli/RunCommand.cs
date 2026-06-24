@@ -1,8 +1,11 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
 using Spectre.Console;
 using Spectre.Console.Cli;
 using SharpInference.Core;
+using SharpInference.Core.Grammar;
 using SharpInference.Cpu;
 using SharpInference.Cuda;
 using SharpInference.Engine;
@@ -186,6 +189,16 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [Description("Maximum reasoning tokens before forcing </think>. 0 = unlimited (default). Not honored on the speculative-decode path.")]
         [DefaultValue(0)]
         public int MaxThinkingTokens { get; init; }
+
+        // ── Tool calling ──
+        [CommandOption("--tools <PATH>")]
+        [Description("Path to a JSON file of OpenAI-format tool definitions ([{type:\"function\", function:{name, description, parameters}}, ...], or a {\"tools\":[...]} wrapper). Advertised to the model via its chat template; on a single-prompt (-p) run the parsed tool calls are printed after generation.")]
+        public string? ToolsPath { get; init; }
+
+        [CommandOption("--tool-grammar")]
+        [Description("Constrain tool-call arguments to the --tools JSON Schemas (issue #374): required keys can't be dropped, only declared keys/enum values appear, value shapes match the declared type. Needs --tools and a model family with constraint support (Gemma 4 today). Default off → byte-identical to unconstrained decoding.")]
+        [DefaultValue(false)]
+        public bool ToolGrammar { get; init; }
 
         // ── MoE expert-cache tuning (offloaded MoE models) ──
         // Good defaults are automatic: frequency-aware SLRU eviction, VRAM-sized cache,
@@ -803,6 +816,55 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         AnsiConsole.MarkupLine($"[dim]Model loaded in {sw.Elapsed.TotalSeconds:F1}s — " +
             $"{hp.NumLayers}L, {hp.EmbeddingDim}d, headDim={hp.HeadDim}, {hp.VocabSize} vocab, ctx={hp.ContextLength}[/]");
 
+        // ── Tool calling (optional) ───────────────────────────────────────────────
+        // --tools advertises OpenAI-format tool definitions to the model via its chat template;
+        // --tool-grammar additionally constrains the argument bytes to the supplied JSON Schemas
+        // (issue #374) for families with constraint support. Both are single-prompt features.
+        List<ToolSchema>? toolSchemas = null;
+        ITokenConstraint? toolConstraint = null;
+        int[] toolBoundaryStops = [];
+        if (settings.ToolsPath is { Length: > 0 } toolsPath)
+        {
+            if (!File.Exists(toolsPath))
+            {
+                AnsiConsole.MarkupLine($"[red]Error:[/] tools file not found: {Markup.Escape(toolsPath)}");
+                return 1;
+            }
+            try
+            {
+                (s_tools, toolSchemas) = LoadTools(toolsPath);
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine($"[red]Error:[/] could not parse --tools file: {Markup.Escape(ex.Message)}");
+                return 1;
+            }
+            AnsiConsole.MarkupLine($"[dim]Loaded {toolSchemas.Count} tool(s) from {Markup.Escape(Path.GetFileName(toolsPath))}.[/]");
+
+            var adapter = ToolCallAdapterRegistry.Get(s_arch);
+
+            // Halt right after the tool call(s) instead of running into a hallucinated trailing
+            // turn (issue #304): add the adapter's tool-boundary markers (Gemma 4: <|tool_response>)
+            // to the stop set, resolved against the vocab.
+            toolBoundaryStops = adapter.ToolBoundaryStopMarkers
+                .Select(m => tokenizer.SpecialTokens.TryGetValue(m, out int id) ? id : -1)
+                .Where(id => id > 0)
+                .Distinct()
+                .ToArray();
+
+            if (settings.ToolGrammar)
+            {
+                toolConstraint = adapter.BuildArgumentConstraint(toolSchemas, new GrammarVocabulary(tokenizer));
+                AnsiConsole.MarkupLine(toolConstraint is not null
+                    ? "[dim]Tool-call arguments are grammar-constrained (issue #374).[/]"
+                    : $"[yellow]Warning:[/] --tool-grammar has no effect for arch '{s_arch}' (no constraint support, or no supplied tool is constrainable); arguments generate unconstrained.");
+            }
+        }
+        else if (settings.ToolGrammar)
+        {
+            AnsiConsole.MarkupLine("[yellow]Warning:[/] --tool-grammar requires --tools (a schema to constrain against); ignoring.");
+        }
+
         var sp = new SamplingParams
         {
             Temperature = settings.Temperature,
@@ -810,12 +872,15 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             TopP = settings.TopP,
             MinP = settings.MinP,
             MaxNewTokens = settings.NPredict,
-            StopTokenIds = [.. BuildStopTokenIds(tokenizer)],
+            StopTokenIds = toolBoundaryStops.Length > 0
+                ? [.. BuildStopTokenIds(tokenizer), .. toolBoundaryStops]
+                : [.. BuildStopTokenIds(tokenizer)],
             RepetitionPenalty = settings.RepPenalty,
             SpecType = ParseSpecType(settings.SpecTypeStr),
             SpecDraftNMax = settings.SpecDraftNMax,
             SpecDraftNMin = settings.SpecDraftNMin,
             SpecDraftPMin = settings.SpecDraftPMin,
+            Constraint = toolConstraint,
         };
         var rng = settings.Seed >= 0 ? new Random(settings.Seed) : new Random();
 
@@ -824,7 +889,16 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         // packed k-token verify via CudaForwardPass.BatchVerify). Vulkan and the partial-
         // offload hybrids fall back to normal generation: without a batched verify,
         // speculation costs k sequential target forwards per step and is never a win.
-        if (settings.DraftModelPath is not null || settings.DraftLookup)
+        bool specRequested = settings.DraftModelPath is not null || settings.DraftLookup;
+        if (specRequested && toolConstraint is not null)
+        {
+            // The constraint masks one token at a time against the running argument state; a
+            // multi-token speculative verify can't honor it. Drop speculation so the constraint
+            // actually applies (the standard decode path below reads sp.Constraint).
+            AnsiConsole.MarkupLine("[yellow]Warning:[/] --tool-grammar is not applied with speculative decoding (--draft-model/--draft-lookup); generating without speculation so the argument constraint takes effect.");
+            specRequested = false;
+        }
+        if (specRequested)
         {
             bool cudaSpecTarget = gpuFwd is CudaForwardPass { SupportsBatchVerify: true };
             // Vulkan full-offload of a dense Q4_K/Q6_K model exposes the same weight-amortized
@@ -1189,6 +1263,12 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             return 1;
         }
 
+        // When --tools is active, capture the raw token stream so the calls can be parsed and shown
+        // afterward, and route through the standard decode loop: the MTP fast path can't honor the
+        // argument-grammar constraint (sp.Constraint) and has no capture hook.
+        List<int>? toolCapture = s.ToolsPath is { Length: > 0 } ? new List<int>() : null;
+        if (toolCapture is not null) useMtp = false;
+
         sw.Restart();
         int generated, totalDecoded;
         float? acceptanceRate = null;
@@ -1201,7 +1281,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         else
         {
             (generated, totalDecoded) =
-                DecodeLoop(forward, logits, tokens.Count, tok, sp, rng, s.VerbosePrompt, s.HideThinking, s.MaxThinkingTokens);
+                DecodeLoop(forward, logits, tokens.Count, tok, sp, rng, s.VerbosePrompt, s.HideThinking, s.MaxThinkingTokens, toolCapture);
         }
         var decodeMs = sw.Elapsed.TotalMilliseconds;
 
@@ -1211,6 +1291,9 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             (totalDecoded > generated ? $" ({generated} visible, {totalDecoded - generated} thinking)" : "") +
             (acceptanceRate is float ar ? $" | MTP accept: {ar:P0} ({mtpAccepted}/{mtpEmitted})" : "") +
             "[/]");
+
+        if (toolCapture is not null)
+            PrintToolCalls(tok, toolCapture);
         return 0;
     }
 
@@ -1525,7 +1608,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         Random rng,
         bool verbosePromptLogging = false,
         bool hideThinking = false,
-        int maxThinkingTokens = 0)
+        int maxThinkingTokens = 0,
+        List<int>? captureTokens = null)
     {
         var logits = initialLogits;
         int generated = 0;
@@ -1534,6 +1618,9 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         int thinkingTokenCount = 0;
         var recentTokens = new List<int>(64);
         var streamDec = new Utf8StreamDecoder();
+        // Tool-call grammar constraint (issue #374): start each response from the watching state so
+        // a reused instance serves this generation fresh. No-op when no constraint is attached.
+        sp.Constraint?.Reset();
         for (int i = 0; i < sp.MaxNewTokens; i++)
         {
             var spWithHistory = sp.RepetitionPenalty != 1.0f && recentTokens.Count > 0
@@ -1548,13 +1635,20 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             }
             else
             {
-                next = sp.Temperature <= 0 ? Sampler.Greedy(logits) : Sampler.Sample(logits, spWithHistory, rng);
+                // While the grammar is restricting the vocabulary, sample from the masked logits so
+                // only a grammar-legal token can be chosen; otherwise sample exactly as before.
+                var sampleLogits = sp.Constraint is { IsConstraining: true } ctr ? ctr.Filter(logits) : logits;
+                next = sp.Temperature <= 0 ? Sampler.Greedy(sampleLogits) : Sampler.Sample(sampleLogits, spWithHistory, rng);
             }
             if (verbosePromptLogging)
             {
                 Console.Error.WriteLine($"[DBG] tok={i} next={next}('{tok.Decode([next])}') stop={sp.StopTokenIds.Contains(next)} top5:{FormatTopLogits(logits, 5)}");
             }
             if (sp.StopTokenIds.Contains(next)) break;
+            // Advance the constraint by every emitted token (so it can detect a tool call beginning
+            // and ending) and capture the raw stream for post-generation tool-call parsing.
+            sp.Constraint?.Accept(next);
+            captureTokens?.Add(next);
             // Counter resets on each <think> open (in case the model opens multiple blocks)
             // and counts every token emitted while inThinking is true on entry, including
             // the boundary tokens themselves — that keeps the budget predictable: N tokens
@@ -1684,6 +1778,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     private static int s_thinkTokenId = -1;    // <think> token for any model using the <think>/</think> special-token convention
     private static int s_endThinkTokenId = -1; // </think> token for any model using the <think>/</think> special-token convention
     private static JinjaChatTemplate? s_jinja;  // parsed from GGUF tokenizer.chat_template
+    // Tool definitions loaded from --tools (template-facing object graph: a list of
+    // {type, function:{…}} dicts), rendered into the chat template's `tools` variable. Null
+    // unless --tools was given, in which case the prompt advertises no tools (legacy behaviour).
+    private static IReadOnlyList<object?>? s_tools;
 
     /// <summary>
     /// Builds the stop token ID list. Delegates to <see cref="GgufTokenizer.EogTokenIds"/> —
@@ -1694,6 +1792,103 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     /// it as literal text.
     /// </summary>
     private static IReadOnlyList<int> BuildStopTokenIds(GgufTokenizer tokenizer) => tokenizer.EogTokenIds;
+
+    // ── Tool calling (--tools / --tool-grammar) ────────────────────────────────
+
+    /// <summary>
+    /// Loads OpenAI-format tool definitions from a JSON file: a bare array of
+    /// <c>{type:"function", function:{name, description, parameters}}</c> objects, or a
+    /// <c>{ "tools": [ … ] }</c> wrapper. Returns the template-facing object graph (passed to the
+    /// chat template's <c>tools</c> variable) and the parsed <see cref="ToolSchema"/>s (used to build
+    /// the argument-grammar constraint). Eagerly materialised so the backing <see cref="JsonDocument"/>
+    /// can be disposed here. Throws <see cref="FormatException"/> / <see cref="JsonException"/> on a
+    /// malformed file.
+    /// </summary>
+    private static (IReadOnlyList<object?> Tools, List<ToolSchema> Schemas) LoadTools(string path)
+    {
+        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        var root = doc.RootElement;
+        JsonElement arr = root.ValueKind == JsonValueKind.Object && root.TryGetProperty("tools", out var t) ? t : root;
+        if (arr.ValueKind != JsonValueKind.Array)
+            throw new FormatException("expected a JSON array of tool definitions (or a { \"tools\": [ … ] } wrapper).");
+
+        var tools = new List<object?>();
+        var schemas = new List<ToolSchema>();
+        foreach (var el in arr.EnumerateArray())
+        {
+            tools.Add(JsonToObject(el));   // detached object graph for the template
+            if (el.TryGetProperty("function", out var fn) && fn.ValueKind == JsonValueKind.Object
+                && fn.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String
+                && n.GetString() is { Length: > 0 } name)
+            {
+                JsonElement? parameters = fn.TryGetProperty("parameters", out var p) ? p : null;
+                schemas.Add(ToolSchema.FromOpenAiFunction(name, parameters));
+            }
+        }
+        if (schemas.Count == 0)
+            throw new FormatException("no tool with a function.name was found.");
+        return (tools, schemas);
+    }
+
+    /// <summary>Recursively converts a <see cref="JsonElement"/> into a detached object graph
+    /// (<see cref="Dictionary{TKey,TValue}"/> / <see cref="List{T}"/> / scalar) the Jinja engine
+    /// consumes — reflection-free, so it survives NativeAOT trimming.</summary>
+    private static object? JsonToObject(JsonElement el) => el.ValueKind switch
+    {
+        JsonValueKind.Object => el.EnumerateObject().ToDictionary(p => p.Name, p => JsonToObject(p.Value), StringComparer.Ordinal),
+        JsonValueKind.Array  => el.EnumerateArray().Select(JsonToObject).ToList(),
+        JsonValueKind.String => el.GetString(),
+        JsonValueKind.Number => el.TryGetInt64(out long l) ? l : el.TryGetDouble(out double d) ? d : (object?)el.GetRawText(),
+        JsonValueKind.True   => true,
+        JsonValueKind.False  => false,
+        _                    => null,
+    };
+
+    /// <summary>Parses the captured raw output with the model's tool-call adapter and prints the
+    /// structured calls (name + JSON arguments). No-op when the model emitted no tool call.</summary>
+    private static void PrintToolCalls(GgufTokenizer tok, List<int> tokens)
+    {
+        if (tokens.Count == 0) return;
+        var (_, calls) = ToolCallAdapterRegistry.Get(s_arch).Parse(tok.Decode(tokens));
+        if (calls.Count == 0) return;
+        AnsiConsole.MarkupLine($"\n[green]Parsed {calls.Count} tool call(s):[/]");
+        foreach (var c in calls)
+            AnsiConsole.MarkupLine($"  [bold]{Markup.Escape(c.Name)}[/]({Markup.Escape(RenderArgs(c.Arguments))})");
+    }
+
+    /// <summary>Renders a parsed tool call's argument object as compact JSON via a manual
+    /// <see cref="Utf8JsonWriter"/> walk (no reflection-based serialization → AOT-safe).</summary>
+    private static string RenderArgs(IReadOnlyDictionary<string, object?> args)
+    {
+        var buffer = new System.Buffers.ArrayBufferWriter<byte>();
+        using (var w = new Utf8JsonWriter(buffer))
+            WriteJsonValue(w, args);
+        return Encoding.UTF8.GetString(buffer.WrittenSpan);
+    }
+
+    private static void WriteJsonValue(Utf8JsonWriter w, object? value)
+    {
+        switch (value)
+        {
+            case null:                                       w.WriteNullValue(); break;
+            case bool b:                                     w.WriteBooleanValue(b); break;
+            case string s:                                   w.WriteStringValue(s); break;
+            case long l:                                     w.WriteNumberValue(l); break;
+            case int i:                                      w.WriteNumberValue(i); break;
+            case double d:                                   w.WriteNumberValue(d); break;
+            case IReadOnlyDictionary<string, object?> map:
+                w.WriteStartObject();
+                foreach (var kv in map) { w.WritePropertyName(kv.Key); WriteJsonValue(w, kv.Value); }
+                w.WriteEndObject();
+                break;
+            case System.Collections.IEnumerable seq:
+                w.WriteStartArray();
+                foreach (var item in seq) WriteJsonValue(w, item);
+                w.WriteEndArray();
+                break;
+            default:                                         w.WriteStringValue(value.ToString() ?? ""); break;
+        }
+    }
 
     /// <summary>
     /// Resolves whether reasoning ("thinking") should be OFF for this run.
@@ -1753,7 +1948,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             {
                 ["messages"]             = messages,
                 ["add_generation_prompt"] = true,
-                ["tools"]                = null,
+                ["tools"]                = (object?)s_tools,
                 ["enable_thinking"]      = enableThinking,
             });
         }
