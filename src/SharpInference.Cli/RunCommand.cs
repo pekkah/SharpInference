@@ -823,6 +823,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         List<ToolSchema>? toolSchemas = null;
         ITokenConstraint? toolConstraint = null;
         int[] toolBoundaryStops = [];
+        s_tools = null;   // reset: this run advertises tools only if --tools is given (no leak across in-process runs)
         if (settings.ToolsPath is { Length: > 0 } toolsPath)
         {
             if (!File.Exists(toolsPath))
@@ -834,7 +835,9 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             {
                 (s_tools, toolSchemas) = LoadTools(toolsPath);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                                          or System.Security.SecurityException or NotSupportedException
+                                          or JsonException or FormatException)
             {
                 AnsiConsole.MarkupLine($"[red]Error:[/] could not parse --tools file: {Markup.Escape(ex.Message)}");
                 return 1;
