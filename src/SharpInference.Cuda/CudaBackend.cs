@@ -67,6 +67,14 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private long _asyncRingIdx;
     private readonly object _asyncUploadLock = new();
 
+    // Host ranges page-locked via cudaHostRegister (TryRegisterHostPinned) — tracked so
+    // DisposeCore can cudaHostUnregister each one. The caller (the MoE op-offload prefill)
+    // registers the mmap'd expert weights once so the DMA engine copies directly from them
+    // at full PCIe bandwidth (no staging hop). Guarded by _pinnedRegLock; entries are the
+    // (ptr, size) originally registered.
+    private readonly List<(nint Ptr, nuint Bytes)> _pinnedHostRanges = new();
+    private readonly object _pinnedRegLock = new();
+
     // Maximum im2col tile buffer size. All row-aligned tile sizes fit within this bound.
     private const long MaxTileBytes = 2560L * 1024 * 1024; // 2.5 GiB — fits all layers in a single tile
 
@@ -1567,6 +1575,22 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>
+    /// HOST-blocking wait: block the calling thread until the background upload referenced by
+    /// <paramref name="handle"/> has actually completed on the device (<c>cudaEventSynchronize</c>).
+    /// Unlike <see cref="WaitForUpload"/> — which only inserts an async cross-stream fence and
+    /// returns immediately — this guarantees the DMA has drained, so it is safe to FREE or
+    /// overwrite the destination buffer afterwards. Used when tearing down / regrowing the
+    /// double-buffer scratch with a prefetch still in flight.
+    /// </summary>
+    public void WaitForUploadHost(CudaUploadHandle handle)
+    {
+        if (handle.UploadEvent == nint.Zero) return;
+        int sr = CuBlasInterop.EventSynchronize(handle.UploadEvent);
+        if (sr != 0)
+            throw new InvalidOperationException($"cudaEventSynchronize (WaitForUploadHost) failed: {sr}");
+    }
+
+    /// <summary>
     /// Non-blocking poll: returns true if the background upload has completed
     /// (cudaEventQuery == cudaSuccess). Allows callers (e.g. SLRU GetOrLoad)
     /// to skip the WaitForUpload fence when the DMA has already drained.
@@ -1590,6 +1614,98 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     {
         if (handle.UploadEvent != nint.Zero)
             CuBlasInterop.EventDestroy(handle.UploadEvent);
+    }
+
+    // ── Page-lock an existing host range for direct DMA (Part A) ──────────
+    //
+    // Registering a large mmap range page-locks it (cudaHostRegister) so the DMA
+    // engine can copy directly from it at full PCIe bandwidth — no staging hop. The
+    // caller registers ONCE (e.g. the whole layer's expert weights at setup) and pairs
+    // each successful register with UnregisterHostPinned / DisposeCore cleanup. After a
+    // successful registration the range may be the `src` of UploadRawIntoAsyncDirect.
+
+    /// <summary>
+    /// Page-lock the host range <c>[ptr, ptr+bytes)</c> read-only via
+    /// <c>cudaHostRegister(..., cudaHostRegisterReadOnly)</c> so subsequent
+    /// <see cref="UploadRawIntoAsyncDirect"/> calls can DMA directly from it at full
+    /// PCIe bandwidth (no pinned-staging copy). Returns <c>true</c> on success; on ANY
+    /// failure (already registered, unsupported flag, out of memory, no context) returns
+    /// <c>false</c> and never throws — the caller falls back to the synchronous staged
+    /// upload path with zero regression. Registering large ranges page-locks them in
+    /// physical RAM for the backend's lifetime, so register once and reuse.
+    /// </summary>
+    public bool TryRegisterHostPinned(nint ptr, long bytes)
+    {
+        if (ptr == nint.Zero || bytes <= 0) return false;
+        try
+        {
+            EnsurePrimaryContextCurrent();
+            int rc = CuBlasInterop.HostRegister(ptr, (nuint)bytes, CuBlasInterop.HostRegisterReadOnly);
+            if (rc != 0) return false;
+            lock (_pinnedRegLock)
+                _pinnedHostRanges.Add((ptr, (nuint)bytes));
+            return true;
+        }
+        catch
+        {
+            // Defensive: EnsurePrimaryContextCurrent / interop must never propagate out of
+            // the opt-in pin path. Any failure → caller uses the synchronous upload.
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Un-page-lock a host range previously registered by <see cref="TryRegisterHostPinned"/>
+    /// (<c>cudaHostUnregister</c>) and drop it from the tracked set. Safe to call with a
+    /// pointer that was never registered (no-op). Idempotent.
+    /// </summary>
+    public void UnregisterHostPinned(nint ptr)
+    {
+        if (ptr == nint.Zero) return;
+        bool tracked;
+        lock (_pinnedRegLock)
+            tracked = _pinnedHostRanges.RemoveAll(r => r.Ptr == ptr) > 0;
+        if (tracked)
+            CuBlasInterop.HostUnregister(ptr);
+    }
+
+    /// <summary>
+    /// Direct async H2D DMA into an EXISTING device buffer / view, with NO staging hop.
+    /// <paramref name="src"/> MUST be a page-locked (pinned) host pointer — typically a
+    /// range registered via <see cref="TryRegisterHostPinned"/>; pageable memory here
+    /// silently degrades cudaMemcpyAsync to a slow synchronous copy. Issues the copy on
+    /// the dedicated upload stream, records a fresh readiness event, and returns a
+    /// <see cref="CudaUploadHandle"/> whose tensor IS <paramref name="dst"/>. The caller
+    /// MUST <see cref="WaitForUpload"/> (cross-stream fence) before any kernel reads
+    /// <paramref name="dst"/>, then <see cref="ReleaseUploadHandle"/>. Unlike
+    /// <see cref="UploadBackgroundRawInto"/> this skips <c>StageAndRecordAsync</c> entirely
+    /// (no host memcpy into the staging ring) — the whole point of pinning the source.
+    /// </summary>
+    public CudaUploadHandle UploadRawIntoAsyncDirect(Tensor dst, byte* src, long len)
+    {
+        if (!_devPtrs.TryGetValue(dst.Handle, out var entry))
+            throw new InvalidOperationException($"UploadRawIntoAsyncDirect: handle {dst.Handle} not registered.");
+        if (len < 0 || (nuint)len > entry.byteSize)
+            throw new ArgumentException($"UploadRawIntoAsyncDirect: source ({len} B) exceeds destination ({entry.byteSize} B).");
+
+        EnsureUploadStream();
+
+        // Direct DMA straight from the pinned source — no _asyncRing staging slot.
+        int rc = CuBlasInterop.CudaMemcpyAsync(entry.devPtr, (nint)src, (nuint)len,
+            CuBlasInterop.HostToDevice, _uploadStream);
+        if (rc != 0)
+            throw new InvalidOperationException($"cudaMemcpyAsync (UploadRawIntoAsyncDirect) failed: {rc}");
+
+        int er = CuBlasInterop.EventCreateWithFlags(out nint ev, CuBlasInterop.EventDisableTiming);
+        if (er != 0)
+            throw new InvalidOperationException($"cudaEventCreateWithFlags (direct DMA) failed: {er}");
+        int rr = CuBlasInterop.EventRecord(ev, _uploadStream);
+        if (rr != 0)
+        {
+            CuBlasInterop.EventDestroy(ev);
+            throw new InvalidOperationException($"cudaEventRecord (direct DMA) failed: {rr}");
+        }
+        return new CudaUploadHandle(dst, ev);
     }
 
     private (Tensor tensor, nint ev) UploadBackgroundCore(void* src, nuint byteSize, TensorShape shape, DType dtype, bool exact)
@@ -7222,6 +7338,16 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             CuBlasInterop.StreamSynchronize(_uploadStream);
             CuBlasInterop.StreamDestroy(_uploadStream);
             _uploadStream = nint.Zero;
+        }
+
+        // Un-page-lock every host range registered via TryRegisterHostPinned (the MoE
+        // op-offload expert mmap). The upload stream was synchronized + destroyed above,
+        // so no DMA is still reading these ranges.
+        lock (_pinnedRegLock)
+        {
+            foreach (var (ptr, _) in _pinnedHostRanges)
+                CuBlasInterop.HostUnregister(ptr);
+            _pinnedHostRanges.Clear();
         }
 
         // Free the async staging ring: each slot's pinned buffer + its backend-owned fence
