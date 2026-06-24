@@ -114,7 +114,7 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
 
     // ── Frame stack ───────────────────────────────────────────────────────────
 
-    private enum FK : byte { Object, Array, Str, StrEnum, Num, Lit }
+    private enum FK : byte { Object, Array, Str, StrEnum, Num, Lit, Free }
 
     private struct Frame
     {
@@ -125,6 +125,7 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
         public ulong Emitted;           // Object: keys emitted
         public ulong Cand;              // Object key-match candidates / StrEnum / Lit candidates
         public int MatchLen;            // chars into current key / literal
+        public int FreeDepth;           // Free: nesting balance of {}/[] in a free value
         public bool SeenDigit;          // Num
         public bool SeenDot;            // Num
         public bool SeenSign;           // Num
@@ -159,6 +160,14 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
 
     // Lit sub-state: single matching state.
     private const int LMatch = 0;
+
+    // Free-value sub-states (issue #378): a permissive value of unknown type, balanced to completion.
+    // Strings are token-level (the <|"|> quote, via HandleQuote); structure is byte-level.
+    private const int FrStart = 0;        // value not yet started
+    private const int FrBare = 1;         // a bare scalar — ends at a top-level delimiter
+    private const int FrBalanced = 2;     // inside {…}/[…], FreeDepth ≥ 1, not in a string
+    private const int FrStr = 3;          // a top-level <|"|>…<|"|> string value (token-level content)
+    private const int FrBalancedStr = 4;  // a <|"|>…<|"|> string inside a balanced free value
 
     private void PushObject(CompiledObject obj)
     {
@@ -197,6 +206,9 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
                 break;
             case JsonSchemaKind.Array:
                 f.Kind = FK.Array; f.State = AExpectOpen;
+                break;
+            case JsonSchemaKind.Any:                        // free value (issue #378)
+                f.Kind = FK.Free; f.State = FrStart;
                 break;
             default: // Number / Integer / Boolean / Null
                 if (node.Literals is not null) { f.Kind = FK.Lit; f.State = LMatch; f.Cand = AllBits(node.Literals.Length); }
@@ -331,8 +343,10 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
         int kept = 0;
 
         // Token-level tops: free string content and the open/close quote. Handle without a
-        // per-token byte simulation for speed.
-        if (top.Kind == FK.Str && top.State == SContent)
+        // per-token byte simulation for speed. Free-value string content (issue #378) behaves
+        // identically — any non-EOG token stays, the quote token closes.
+        if ((top.Kind == FK.Str && top.State == SContent)
+            || (top.Kind == FK.Free && top.State is FrStr or FrBalancedStr))
         {
             // Any non-forbidden token stays in content; the quote token closes. Forbid only EOG —
             // a tiny set, so mask those ids directly rather than testing all 262k tokens against it.
@@ -360,6 +374,12 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
         Array.Clear(_firstByteOk);
         bool quoteAllowed = CollectFirstBytes(_depth - 1, _firstByteOk) || IsQuoteAccepted();
 
+        // A free value's non-string states (issue #378) mark all first-bytes, so without a shortcut
+        // every step would simulate the whole vocabulary. A non-quote token carrying none of the
+        // bytes that can balance / delimit a free value is pure content that keeps it alive — admit it
+        // without the per-token replay (the analogue of the token-level free-content path above).
+        bool fastFree = top.Kind == FK.Free && top.State is FrStart or FrBare or FrBalanced;
+
         for (int id = 0; id < buf.Length; id++)
         {
             var bytes = _vocab.TokenBytes(id);
@@ -368,12 +388,31 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
             else if (bytes.Length == 0) candidate = false;
             else candidate = _firstByteOk[bytes[0]];
 
-            if (candidate && SimulateToken(id))
-                kept++;
-            else
-                buf[id] = float.NegativeInfinity;
+            bool ok = candidate
+                && ((fastFree && id != _quoteId && !ContainsFreeStructural(bytes)) || SimulateToken(id));
+            if (ok) kept++;
+            else buf[id] = float.NegativeInfinity;
         }
+
+        // Belt-and-suspenders: forbid every EOG id regardless of its bytes. The fastFree shortcut
+        // admits content tokens without simulation, so a tokenizer whose EOS decodes to ordinary
+        // (non-structural) text could otherwise pass first-byte pruning inside a free value and
+        // truncate the call mid-object. (Mirrors the JSON constraint's sweep.)
+        foreach (int id in _forbidden)
+            if ((uint)id < (uint)buf.Length && !float.IsNegativeInfinity(buf[id]))
+            { buf[id] = float.NegativeInfinity; kept--; }
+
         return kept;
+    }
+
+    /// <summary>Whether a token carries any byte that can balance or delimit a free value (and so
+    /// must be simulated rather than fast-pathed as pure content). Gemma strings are the <c>&lt;|"|&gt;</c>
+    /// token, so the quote is not a structural byte here.</summary>
+    private static bool ContainsFreeStructural(ReadOnlySpan<byte> bytes)
+    {
+        for (int i = 0; i < bytes.Length; i++)
+            if (bytes[i] is (byte)'{' or (byte)'}' or (byte)'[' or (byte)']' or (byte)',') return true;
+        return false;
     }
 
     private bool SimulateToken(int token)
@@ -409,6 +448,7 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
             case FK.StrEnum when top.State == SeExpectOpen:
                 return false;
             case FK.Str when top.State == SContent:       // free content: any non-EOG token stays
+            case FK.Free when top.State is FrStr or FrBalancedStr:  // free-value string content
                 return !_forbidden.Contains(tokenId);
             case FK.StrEnum when top.State == SeMatch:
                 break;                                    // enum content → byte-walk below
@@ -436,15 +476,29 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
             case FK.Array when top.State is AExpectItemOrClose or AExpectItem:
             {
                 var item = top.Node!.Items!;
-                if (item.Kind != JsonSchemaKind.String) return false;  // only a string item opens on a quote
+                // A string item — or a FREE item (issue #378) — opens on the quote token (other item
+                // kinds open on a structural byte instead).
+                if (item.Kind is not (JsonSchemaKind.String or JsonSchemaKind.Any)) return false;
                 top.State = AExpectCommaOrClose;                       // resume here after the item
                 if (_depth >= MaxDepth) return false;
                 ref var f = ref _stack[_depth++];
                 f = default; f.Node = item;
-                if (item.Literals is not null) { f.Kind = FK.StrEnum; f.State = SeMatch; f.Cand = AllBits(item.Literals.Length); }
+                if (item.Kind == JsonSchemaKind.Any) { f.Kind = FK.Free; f.State = FrStr; }      // free string item
+                else if (item.Literals is not null) { f.Kind = FK.StrEnum; f.State = SeMatch; f.Cand = AllBits(item.Literals.Length); }
                 else { f.Kind = FK.Str; f.State = SContent; }
                 return true;
             }
+            case FK.Free:
+                // A free value's strings are <|"|>…<|"|>: open one at the value start or inside a
+                // balanced object/array; close the one currently open.
+                switch (top.State)
+                {
+                    case FrStart: top.State = FrStr; return true;            // open top-level string value
+                    case FrStr: _depth--; return PostValue();                // close → value done
+                    case FrBalanced: top.State = FrBalancedStr; return true; // open string inside {}/[]
+                    case FrBalancedStr: top.State = FrBalanced; return true; // close inner string
+                    default: return false;                                   // FrBare: a quote isn't legal
+                }
             default:
                 return false;                                          // quote not legal here
         }
@@ -461,7 +515,10 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
             FK.StrEnum => top.State == SeExpectOpen
                           || (top.State == SeMatch && AnyComplete(top.Node!.Literals!, top.Cand, top.MatchLen)),
             FK.Array => top.State is AExpectItemOrClose or AExpectItem
-                        && top.Node!.Items!.Kind == JsonSchemaKind.String,
+                        && top.Node!.Items!.Kind is JsonSchemaKind.String or JsonSchemaKind.Any,
+            // A free value can open a string at its start or inside a balanced object/array; the close
+            // of an open free string is handled by the free-content mask path, not here.
+            FK.Free => top.State is FrStart or FrBalanced,
             _ => false,
         };
     }
@@ -492,7 +549,8 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
     }
 
     private static bool IsTokenLevel(in Frame f) =>
-        (f.Kind == FK.Str) || (f.Kind == FK.StrEnum && f.State == SeExpectOpen);
+        (f.Kind == FK.Str) || (f.Kind == FK.StrEnum && f.State == SeExpectOpen)
+        || (f.Kind == FK.Free && f.State is FrStr or FrBalancedStr);
 
     private enum Step { Consume, Retry, Reject }
 
@@ -505,7 +563,40 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
             case FK.Num: return StepNum(ref top, b);
             case FK.Lit: return StepLit(ref top, b);
             case FK.StrEnum: return StepStrEnum(ref top, b);   // SeMatch only reaches here
+            case FK.Free: return StepFree(ref top, b);
             default: return Step.Reject;
+        }
+    }
+
+    /// <summary>Free-value (issue #378) byte handling: balance a bare scalar / object / array to
+    /// completion, then pop so the enclosing object resumes enforcing its declared/required keys.
+    /// Strings (<c>&lt;|"|&gt;…&lt;|"|&gt;</c>) are opened/closed by the quote token in HandleQuote,
+    /// never byte-walked here.</summary>
+    private Step StepFree(ref Frame f, byte b)
+    {
+        switch (f.State)
+        {
+            case FrStart:
+                if (IsWs(b)) return Step.Consume;
+                if (b is (byte)'{' or (byte)'[') { f.FreeDepth = 1; f.State = FrBalanced; return Step.Consume; }
+                if (b is (byte)',' or (byte)'}' or (byte)']') return Step.Reject;   // a value can't be empty
+                f.State = FrBare; return Step.Consume;                              // bare scalar start
+
+            case FrBare:
+                if (b is (byte)',' or (byte)'}' or (byte)']') { _depth--; return PostValueRetry(); }
+                return Step.Consume;
+
+            case FrBalanced:
+                if (b is (byte)'{' or (byte)'[') { f.FreeDepth++; return Step.Consume; }
+                if (b is (byte)'}' or (byte)']')
+                {
+                    if (--f.FreeDepth == 0) { _depth--; return PostValueOrDone(); }
+                    return Step.Consume;
+                }
+                return Step.Consume;                        // bare keys / ':' / ',' / scalars are content
+
+            default:
+                return Step.Reject;                         // FrStr / FrBalancedStr are token-level
         }
     }
 
@@ -708,11 +799,24 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
                     CollectStrEnum(ref f, set, ref quote);
                     popThrough = false;
                     break;
+                case FK.Free:
+                    CollectFree(ref f, set);                // quote handled by IsQuoteAccepted
+                    popThrough = false;
+                    break;
             }
             if (!popThrough) break;
             d--;                                            // bare value can end here — parent's bytes also start a token
         }
         return quote;
+    }
+
+    private static void CollectFree(ref Frame f, bool[] set)
+    {
+        // A free value admits almost anything — mark broadly and let the (fast-pathed) simulate pass
+        // decide. The only restriction is that the value can't START with a parent delimiter (empty
+        // value). FrStr/FrBalancedStr never reach here (token-level free content is masked separately).
+        for (int i = 0; i < 256; i++) set[i] = true;
+        if (f.State == FrStart) { set[','] = false; set['}'] = false; set[']'] = false; }
     }
 
     private static bool CollectObject(ref Frame f, bool[] set)
@@ -816,6 +920,15 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
             case JsonSchemaKind.Array: set['['] = true; break;
             case JsonSchemaKind.Object: set['{'] = true; break;
             case JsonSchemaKind.String: break;             // opens with the quote token, not a byte
+            case JsonSchemaKind.Any:
+                // A free array item (issue #378) can be any value — mark every value-START byte. A
+                // string item opens on the <|"|> quote token (admitted by IsQuoteAccepted, not a byte),
+                // so the quote is not marked here. (Don't touch ']'; the array frame marks it for the
+                // empty-array close, and unsetting it here would wrongly forbid closing.)
+                set['{'] = true; set['['] = true; set['-'] = true;
+                MarkDigits(set);
+                set['t'] = true; set['f'] = true; set['n'] = true;   // true / false / null
+                break;
             default:
                 if (node.Literals is { } lits)
                     foreach (var l in lits) { if (l.Length > 0) set[l[0]] = true; }

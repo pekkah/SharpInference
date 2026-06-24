@@ -7,10 +7,10 @@ namespace SharpInference.Core.Grammar;
 // wire-format-agnostic — both the Gemma constraint (GemmaToolArgumentConstraint, bespoke
 // <|"|>-quoted syntax) and the JSON constraint (JsonToolArgumentConstraint, standard JSON for
 // Qwen/Llama/DeepSeek) consume the same CompiledObject/CompiledNode and only differ in how they
-// walk the structural bytes. Only tools whose schema is FULLY constrainable (every value is a
-// concrete type / typed array / nested typed object — no Any-typed value, no open object) are
-// compiled; a tool that isn't is left out of the constraint and generates its arguments
-// unconstrained, so the constraint never blocks generation.
+// walk the structural bytes. A loosely-typed VALUE no longer disqualifies its tool (issue #378): it
+// compiles to a FreeValue node the constraints accept as any well-formed value, so the surrounding
+// structure stays enforced. A tool is left unconstrained only when its argument OBJECT itself is open
+// (no declared properties) — the constraint then never blocks generation.
 
 /// <summary>Compiled value-type descriptor (see <see cref="ToolSchemaNode"/>).</summary>
 internal sealed class CompiledNode
@@ -40,12 +40,24 @@ internal sealed class CompiledObject
 /// <summary>
 /// Compiles a parsed <see cref="ToolSchemaObject"/> into the match tables the argument-grammar
 /// state machines drive. Shared by every architecture's constraint so the "which schemas are
-/// constrainable" rule lives in exactly one place. Returns <c>null</c> for any schema that isn't
-/// fully constrainable (open body, an <c>Any</c>-typed value, an untyped array, …) — the caller
-/// then leaves that tool unconstrained.
+/// constrainable" rule lives in exactly one place.
+///
+/// <para>
+/// A loosely-typed VALUE (an <c>Any</c>-typed value with no <c>type</c>, an open object, or an
+/// untyped array) no longer disqualifies the whole tool (issue #378): it compiles to the
+/// <see cref="FreeValue"/> node (<see cref="JsonSchemaKind.Any"/>), which the constraints accept as
+/// any single well-formed value while still enforcing the object's <em>structure</em> — declared key
+/// names, required-once, and the typed siblings. <see cref="TryCompileObject"/> returns <c>null</c>
+/// only when the object body ITSELF is open (no declared properties to enforce), so a partially-typed
+/// tool stays constrained on its typed/required parts instead of being dropped wholesale.
+/// </para>
 /// </summary>
 internal static class ToolSchemaCompiler
 {
+    /// <summary>A fully-free value: any single well-formed value (string, scalar, array, object) the
+    /// constraints balance to completion without restricting its contents. Shared singleton.</summary>
+    public static CompiledNode FreeValue { get; } = new() { Kind = JsonSchemaKind.Any };
+
     // Depth-capped so compilation can't recurse unbounded — the parser already caps nesting, but the
     // ToolSchema records are public, so a caller that builds a deeply-nested schema in-memory (not via
     // the parser) would otherwise risk an uncatchable StackOverflow. Past the cap the tool is simply
@@ -68,17 +80,20 @@ internal static class ToolSchemaCompiler
             var p = obj.Properties[i];
             if (p.Name.Length == 0) return null;
             keys[i] = ToolSchema.Utf8(p.Name);
-            var node = TryCompileNode(p.Value, depth + 1);
-            if (node is null) return null;                  // a non-constrainable value → skip the tool
-            values[i] = node;
+            // A loosely-typed value compiles to FreeValue (issue #378) rather than disqualifying the
+            // tool — the key/required structure stays enforced, only the value is left free.
+            values[i] = CompileNode(p.Value, depth + 1);
             if (p.Required) reqMask |= 1UL << i;
         }
         return new CompiledObject { KeyBytes = keys, Values = values, RequiredMask = reqMask };
     }
 
-    private static CompiledNode? TryCompileNode(ToolSchemaNode node, int depth)
+    /// <summary>Compiles one value node, degrading any loosely-typed value (Any / untyped array /
+    /// open or too-deep object) to <see cref="FreeValue"/> rather than null — so a partially-typed
+    /// object still constrains its typed siblings (issue #378).</summary>
+    private static CompiledNode CompileNode(ToolSchemaNode node, int depth)
     {
-        if (depth >= MaxDepth) return null;
+        if (depth >= MaxDepth) return FreeValue;            // too deep to constrain → free
         switch (node.Kind)
         {
             case JsonSchemaKind.String:
@@ -103,18 +118,17 @@ internal static class ToolSchemaCompiler
                 return new CompiledNode { Kind = JsonSchemaKind.Null, Literals = s_nullLiterals };
 
             case JsonSchemaKind.Array:
-                // An untyped array (no items) isn't fully constrainable — skip the tool.
-                if (node.Items is null) return null;
-                var item = TryCompileNode(node.Items, depth + 1);
-                return item is null ? null : new CompiledNode { Kind = JsonSchemaKind.Array, Items = item };
+                // An untyped array (no item shape) is left free; a typed array constrains its items.
+                if (node.Items is null) return FreeValue;
+                return new CompiledNode { Kind = JsonSchemaKind.Array, Items = CompileNode(node.Items, depth + 1) };
 
             case JsonSchemaKind.Object:
-                if (node.Object is null) return null;
-                var obj = TryCompileObject(node.Object, depth + 1);
-                return obj is null ? null : new CompiledNode { Kind = JsonSchemaKind.Object, Object = obj };
+                // An open / too-deep nested object is left free; a typed nested object recurses.
+                var obj = node.Object is null ? null : TryCompileObject(node.Object, depth + 1);
+                return obj is null ? FreeValue : new CompiledNode { Kind = JsonSchemaKind.Object, Object = obj };
 
             default:
-                return null;   // Any / unknown — not constrainable
+                return FreeValue;   // Any / unknown — free value
         }
     }
 

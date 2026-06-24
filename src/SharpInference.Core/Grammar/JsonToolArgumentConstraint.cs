@@ -153,7 +153,7 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
 
     // ── Frame stack ───────────────────────────────────────────────────────────
 
-    private enum FK : byte { Object, Array, Str, StrEnum, Num, Lit }
+    private enum FK : byte { Object, Array, Str, StrEnum, Num, Lit, Free }
 
     private struct Frame
     {
@@ -165,10 +165,11 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
         public ulong Cand;              // Object key-match / StrEnum / Lit candidates
         public int MatchLen;            // chars into current key / literal
         public int PendingKey;          // Object: key index whose value to push at ':'
+        public int FreeDepth;           // Free: nesting balance of {}/[] in a free value
         public bool SeenDigit;          // Num
         public bool SeenDot;            // Num
         public bool SeenSign;           // Num
-        public bool Escaped;            // Str content: previous byte was '\'
+        public bool Escaped;            // Str / Free content: previous byte was '\'
     }
 
     // Object sub-states.
@@ -201,6 +202,13 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
 
     // Lit sub-state.
     private const int LMatch = 0;
+
+    // Free-value sub-states (issue #378): a permissive value of unknown type, balanced to completion.
+    private const int FrStart = 0;       // value not yet started
+    private const int FrStr = 1;         // a top-level string value
+    private const int FrBare = 2;        // a bare scalar — ends at a top-level delimiter
+    private const int FrBalanced = 3;    // inside {…}/[…], FreeDepth ≥ 1
+    private const int FrBalancedStr = 4; // a string inside a balanced free value
 
     // Preamble (watching) sub-states.
     private const int WStart = 0;        // before envelope '{' (NameValueObject) / scanning name (NameThenSeparator)
@@ -239,6 +247,9 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
                 break;
             case JsonSchemaKind.Array:
                 f.Kind = FK.Array; f.State = AExpectOpen;
+                break;
+            case JsonSchemaKind.Any:                        // free value (issue #378)
+                f.Kind = FK.Free; f.State = FrStart;
                 break;
             default: // Number / Integer / Boolean / Null
                 if (node.Literals is not null) { f.Kind = FK.Lit; f.State = LMatch; f.Cand = AllBits(node.Literals.Length); }
@@ -356,10 +367,14 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
         // or escape need the full replay. Disabled mid-escape (the next byte is consumed literally), so
         // those tokens fall back to SimulateToken. This is the byte-level analogue of the Gemma sibling's
         // token-level free-content shortcut.
-        bool fastStrContent;
+        bool fastStrContent, fastFree;
         {
             ref var top = ref _stack[_depth - 1];
             fastStrContent = top.Kind == FK.Str && top.State == SContent && !top.Escaped;
+            // A free value (issue #378) marks all 256 first-bytes too; a token carrying none of the
+            // structural bytes that can balance / delimit / quote it is pure content valid in any free
+            // state, so it skips SimulateToken — same shape as the string-content fast-path.
+            fastFree = top.Kind == FK.Free && !top.Escaped;
         }
 
         int kept = 0;
@@ -369,7 +384,9 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
             // Empty-byte tokens (EOG / control) never advance the structure — forbidding them keeps
             // an end-of-generation token from truncating the call mid-object.
             if (bytes.Length == 0 || !_firstByteOk[bytes[0]]) { buf[id] = float.NegativeInfinity; continue; }
-            bool ok = (fastStrContent && !ContainsQuoteOrBackslash(bytes)) || SimulateToken(id);
+            bool ok = (fastStrContent && !ContainsQuoteOrBackslash(bytes))
+                   || (fastFree && !ContainsFreeStructural(bytes))
+                   || SimulateToken(id);
             if (ok) kept++;
             else buf[id] = float.NegativeInfinity;
         }
@@ -387,6 +404,16 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
     {
         for (int i = 0; i < bytes.Length; i++)
             if (bytes[i] is (byte)'"' or (byte)'\\') return true;
+        return false;
+    }
+
+    /// <summary>Whether a token carries any byte that could balance, delimit, quote, or escape a free
+    /// value (and so must be fully simulated rather than fast-pathed as pure content).</summary>
+    private static bool ContainsFreeStructural(ReadOnlySpan<byte> bytes)
+    {
+        for (int i = 0; i < bytes.Length; i++)
+            if (bytes[i] is (byte)'{' or (byte)'}' or (byte)'[' or (byte)']'
+                         or (byte)'"' or (byte)'\\' or (byte)',') return true;
         return false;
     }
 
@@ -435,7 +462,53 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
             case FK.StrEnum: return StepStrEnum(ref top, b);
             case FK.Num: return StepNum(ref top, b);
             case FK.Lit: return StepLit(ref top, b);
+            case FK.Free: return StepFree(ref top, b);
             default: return Step.Reject;
+        }
+    }
+
+    /// <summary>Free-value (issue #378): accept any single well-formed JSON value — a string, a bare
+    /// scalar, or a balanced {…}/[…] — and pop when it completes, so the enclosing object resumes and
+    /// keeps enforcing its declared/required keys. The value's contents are unconstrained.</summary>
+    private Step StepFree(ref Frame f, byte b)
+    {
+        switch (f.State)
+        {
+            case FrStart:
+                if (IsWs(b)) return Step.Consume;
+                if (b is (byte)'{' or (byte)'[') { f.FreeDepth = 1; f.State = FrBalanced; return Step.Consume; }
+                if (b == (byte)'"') { f.State = FrStr; return Step.Consume; }
+                if (b is (byte)',' or (byte)'}' or (byte)']') return Step.Reject;   // a value can't be empty
+                f.State = FrBare; return Step.Consume;                              // bare scalar start
+
+            case FrStr:
+                if (f.Escaped) { f.Escaped = false; return Step.Consume; }
+                if (b == (byte)'\\') { f.Escaped = true; return Step.Consume; }
+                if (b == (byte)'"') { _depth--; return PostValueOrDone(); }         // string closes the value
+                return Step.Consume;
+
+            case FrBare:
+                if (b is (byte)',' or (byte)'}' or (byte)']') { _depth--; return PostValueRetry(); }
+                return Step.Consume;
+
+            case FrBalanced:
+                if (b == (byte)'"') { f.State = FrBalancedStr; return Step.Consume; }
+                if (b is (byte)'{' or (byte)'[') { f.FreeDepth++; return Step.Consume; }
+                if (b is (byte)'}' or (byte)']')
+                {
+                    if (--f.FreeDepth == 0) { _depth--; return PostValueOrDone(); }
+                    return Step.Consume;
+                }
+                return Step.Consume;
+
+            case FrBalancedStr:
+                if (f.Escaped) { f.Escaped = false; return Step.Consume; }
+                if (b == (byte)'\\') { f.Escaped = true; return Step.Consume; }
+                if (b == (byte)'"') { f.State = FrBalanced; return Step.Consume; }
+                return Step.Consume;
+
+            default:
+                return Step.Reject;
         }
     }
 
@@ -817,6 +890,7 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
                 case FK.StrEnum: CollectStrEnum(ref f, set); break;
                 case FK.Num: popThrough = CollectNum(ref f, set); break;
                 case FK.Lit: popThrough = CollectLit(ref f, set); break;
+                case FK.Free: CollectFree(ref f, set); break;
             }
             if (!popThrough) break;
             d--;                                            // bare value can end here — parent bytes also start a token
@@ -874,6 +948,15 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
         for (int i = 0; i < 256; i++) set[i] = true;
     }
 
+    private static void CollectFree(ref Frame f, bool[] set)
+    {
+        // A free value admits almost anything — mark broadly and let the (fast-pathed) simulate pass
+        // decide. The only structural restriction is that the value can't START with a parent
+        // delimiter (that would be an empty value).
+        for (int i = 0; i < 256; i++) set[i] = true;
+        if (f.State == FrStart) { set[','] = false; set['}'] = false; set[']'] = false; }
+    }
+
     private static void CollectStrEnum(ref Frame f, bool[] set)
     {
         if (f.State == SeExpectOpen) { MarkWs(set); set['"'] = true; return; }
@@ -923,6 +1006,14 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
             case JsonSchemaKind.Array: set['['] = true; break;
             case JsonSchemaKind.Object: set['{'] = true; break;
             case JsonSchemaKind.String: set['"'] = true; break;   // JSON strings open with a '"' byte
+            case JsonSchemaKind.Any:
+                // A free array item (issue #378) can be any JSON value — mark every value-START byte.
+                // (Don't touch ']'; the array frame marks it for the empty-array close, and unsetting
+                // it here would wrongly forbid closing.)
+                set['"'] = true; set['{'] = true; set['['] = true; set['-'] = true;
+                MarkDigits(set);
+                set['t'] = true; set['f'] = true; set['n'] = true;   // true / false / null
+                break;
             default:
                 if (node.Literals is { } lits)
                     foreach (var l in lits) { if (l.Length > 0) set[l[0]] = true; }
