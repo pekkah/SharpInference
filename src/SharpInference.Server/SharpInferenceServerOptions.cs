@@ -222,13 +222,14 @@ public sealed class SharpInferenceServerOptions
     /// GPU op-offload of the CPU-MoE routed prefill — the engine's <c>SHARPI_MOE_GPU_PREFILL</c>
     /// gate, read by <see cref="CudaHybridGdnForwardPass"/> at construction. Uploads each used
     /// expert's host-resident weights to the GPU for the batched prefill matmul (like llama.cpp's
-    /// op-offload) instead of running the dots on the CPU — ~+46% prefill on Carnice-class CUDA
-    /// hybrids. Server analogue of the CLI's <c>--gpu-moe-prefill</c>. <b>Default ON in the
-    /// engine.</b> <c>false</c> → <c>SHARPI_MOE_GPU_PREFILL=0</c> (byte-exact CPU path); <c>true</c>
-    /// → force on; <c>null</c> (default) writes nothing, preserving the engine default and any
-    /// value already in the environment. Argmax-stable (the GPU runs the MoE in F32, more precise
-    /// than the CPU int8 path), not bit-identical to the CPU path. Effective only on the CUDA
-    /// hybrid + CPU-MoE config; auto-falls-back to the CPU path if its scratch can't allocate.
+    /// op-offload) instead of running the dots on the CPU. Server analogue of the CLI's
+    /// <c>--gpu-moe-prefill</c>. <b>OPT-IN, default OFF in the engine.</b> <c>true</c> →
+    /// <c>SHARPI_MOE_GPU_PREFILL=1</c> (enable); <c>false</c> → force off; <c>null</c> (default)
+    /// writes nothing, preserving the engine default and any value already in the environment.
+    /// ~+15-44% prefill, but ~-25% decode (its ~14 GB pinned weight copy evicts the page cache
+    /// single-token decode's CPU expert-streaming relies on), so enable only for prefill-heavy
+    /// workloads. Argmax-stable (the GPU runs the MoE in F32), not bit-identical to the CPU path.
+    /// CUDA hybrid + CPU-MoE only; auto-falls-back to the CPU path if its scratch can't allocate.
     /// </summary>
     public bool? GpuMoePrefill { get; set; }
 

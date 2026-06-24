@@ -235,7 +235,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         // ── GPU op-offload of the CPU-MoE routed prefill. Wraps SHARPI_MOE_GPU_PREFILL.
         [CommandOption("--gpu-moe-prefill <BOOL>")]
-        [Description("CPU-MoE: run the routed-expert prefill matmuls on the GPU (transient weight upload, like llama.cpp's op-offload) instead of CPU dots — ~+46% prefill on Carnice-class CUDA hybrids. DEFAULT ON; pass 'false' to disable (byte-exact CPU path), 'true' to force. Sets SHARPI_MOE_GPU_PREFILL. Argmax-stable (the GPU runs the MoE in F32 — more precise than the CPU int8 path), not bit-identical to CPU. Only applies to the CUDA hybrid + CPU-MoE config; auto-falls-back to the CPU path if the ~14 GB pinned buffer / GPU scratch can't allocate.")]
+        [Description("CPU-MoE: run the routed-expert prefill matmuls on the GPU (transient weight upload, like llama.cpp's op-offload) instead of CPU dots. OPT-IN, default OFF; pass 'true' to enable. Sets SHARPI_MOE_GPU_PREFILL. ~+15-44% PREFILL on the CUDA GDN-hybrid CPU-MoE models, but ~-25% DECODE (its ~14 GB pinned weight copy evicts the page cache that single-token decode's CPU expert-streaming relies on) — so it's a win for prefill-heavy workloads only, not interactive/agentic. Argmax-stable (GPU runs the MoE in F32), not bit-identical to CPU. Auto-falls-back to the CPU path if the pinned buffer / GPU scratch can't allocate.")]
         public bool? GpuMoePrefill { get; init; }
     }
 
