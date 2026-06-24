@@ -218,6 +218,20 @@ public sealed class SharpInferenceServerOptions
     /// </summary>
     public bool? CpuMoe { get; set; }
 
+    /// <summary>
+    /// GPU op-offload of the CPU-MoE routed prefill — the engine's <c>SHARPI_MOE_GPU_PREFILL</c>
+    /// gate, read by <see cref="CudaHybridGdnForwardPass"/> at construction. Uploads each used
+    /// expert's host-resident weights to the GPU for the batched prefill matmul (like llama.cpp's
+    /// op-offload) instead of running the dots on the CPU — ~+46% prefill on Carnice-class CUDA
+    /// hybrids. Server analogue of the CLI's <c>--gpu-moe-prefill</c>. <b>Default ON in the
+    /// engine.</b> <c>false</c> → <c>SHARPI_MOE_GPU_PREFILL=0</c> (byte-exact CPU path); <c>true</c>
+    /// → force on; <c>null</c> (default) writes nothing, preserving the engine default and any
+    /// value already in the environment. Argmax-stable (the GPU runs the MoE in F32, more precise
+    /// than the CPU int8 path), not bit-identical to the CPU path. Effective only on the CUDA
+    /// hybrid + CPU-MoE config; auto-falls-back to the CPU path if its scratch can't allocate.
+    /// </summary>
+    public bool? GpuMoePrefill { get; set; }
+
     // ── Speculative decoding defaults ────────────────────────────────────────
 
     /// <summary>

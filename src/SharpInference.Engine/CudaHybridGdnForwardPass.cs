@@ -665,18 +665,21 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private int*   _bfGathTokI;     // [N] gather list: row r of gather buffer ← token _bfGathTokI[r]
 
     // ── GPU op-offload for the CPU-MoE routed prefill (perf/carnice-vnni-moe) ──
-    // Opt-in (SHARPI_MOE_GPU_PREFILL=1, default OFF — strict superset): instead of
-    // running BatchedRoutedExperts' grouped int8/F32 dots on the CPU, transiently
-    // upload each used expert's host-resident gate/up/down weight to a reused GPU
-    // buffer and run the gather → GEMM-N gate/up → SiLuMul → GEMM-N down on the GPU
-    // (mirrors llama.cpp uploading CPU-resident MoE weights for the batched prefill
-    // matmul). Raw-quant dtypes (Q4_K/Q5_K/Q6_K/Q8_0) upload raw bytes and dispatch the
-    // quantized GEMM; Q3_K/Float32 dequantize on the host into an F32 staging buffer and
-    // upload F32 (MatMulBatched has no Q3_K kernel). The bucketing + weighted reduce stay
-    // identical to BatchedRoutedExperts, so downstream combine is untouched. NOT bit-exact
-    // (F32 GEMM for Q3_K is more accurate than the CPU Q3_K dot; raw quant GPU GEMM ≈ CPU
-    // dot) — argmax-stable only. Default OFF keeps the byte-exact CPU path for A/B.
-    private readonly bool _gpuMoePrefill = ResolveGate("SHARPI_MOE_GPU_PREFILL", false);
+    // DEFAULT ON (SHARPI_MOE_GPU_PREFILL=0 to disable; CLI --gpu-moe-prefill / server
+    // GpuMoePrefill override): instead of running BatchedRoutedExperts' grouped int8/F32
+    // dots on the CPU, transiently upload each used expert's host-resident gate/up/down
+    // weight to a reused GPU buffer and run the gather → GEMM-N gate/up → SiLuMul → GEMM-N
+    // down on the GPU (mirrors llama.cpp uploading CPU-resident MoE weights for the batched
+    // prefill matmul) — ~+46% prefill on Carnice. Raw-quant dtypes (Q3_K via the #100
+    // in-kernel-dequant GEMM, Q4_K/Q5_K/Q6_K/Q8_0) upload raw bytes and dispatch the
+    // quantized GEMM; only Float32 weights dequant-stage. The bucketing + weighted reduce
+    // stay identical to BatchedRoutedExperts, so downstream combine is untouched. NOT
+    // bit-exact — argmax-stable (the GPU runs the MoE in F32, *more* precise than the CPU
+    // int8 path), so greedy output can diverge sub-noise from the CPU path. Falls back to
+    // the CPU path (the field is cleared) if the op-offload scratch can't be allocated
+    // (e.g. low host RAM for the ~14 GB pinned buffer, or tight VRAM) — see the ctor.
+    // Not readonly: the ctor clears it on a setup failure.
+    private bool _gpuMoePrefill = ResolveGate("SHARPI_MOE_GPU_PREFILL", true);
     private int     _goCap;            // token capacity the GPU-offload scratch is sized for
     private Tensor? _gpuOffNorm;       // [N × embDim] uploaded norm activations (per layer call)
     private Tensor? _gpuOffGather;     // [totalSel × embDim] CSR-ordered gathered routed-token norms (ONE gather)
@@ -1566,7 +1569,23 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         {
             int warmChunk = int.TryParse(Environment.GetEnvironmentVariable("SHARPI_PREFILL_CHUNK"),
                 out int pc) && pc > 0 ? pc : 512;
-            EnsureGpuOffloadScratch(warmChunk);
+            // Safety fallback for the default-on path: if the op-offload scratch can't be
+            // allocated (low host RAM for the ~14 GB pinned buffer, or tight VRAM for the GPU
+            // gather/scatter/layer buffers), disable op-offload and run the CPU MoE prefill
+            // rather than failing model load. The pinned-buffer alloc already self-falls-back
+            // to synchronous upload; this catches the harder allocation failures.
+            try
+            {
+                EnsureGpuOffloadScratch(warmChunk);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"[CudaHybridGdnForwardPass] GPU op-offload setup failed ({ex.GetType().Name}: {ex.Message}); " +
+                    "falling back to the CPU MoE prefill. Set SHARPI_MOE_GPU_PREFILL=0 to silence.");
+                FreeGpuOffloadScratch();
+                _gpuMoePrefill = false;
+            }
         }
     }
 
