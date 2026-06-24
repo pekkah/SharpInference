@@ -187,7 +187,8 @@ public sealed class QwenCoderToolArgumentConstraint : ITokenConstraint
     /// post-value resume state (so mask pop-through sees the right state). Free values consume their own
     /// <c>&lt;/parameter&gt;</c> and resume at <see cref="FSeekTag"/>; typed scalars resume at
     /// <see cref="FParamClose"/> to match the close tag after the value. Returns false if the stack is
-    /// full (the value is then left unconstrained but the function structure stays enforced).</summary>
+    /// full (the caller then rejects the token); unreachable for Coder in practice since values never
+    /// nest, so depth never exceeds Func + one value frame — well under <see cref="MaxDepth"/>.</summary>
     private bool PushValue(CompiledNode node, ref Frame parent)
     {
         if (_depth >= MaxDepth) return false;
