@@ -28,11 +28,11 @@ public sealed class SharpInferenceServerOptions
 
     /// <summary>
     /// Enable schema/grammar-constrained decoding for tool-call arguments (issue #374). When on and
-    /// a tool-active request is served by a family with constraint support (Gemma 4 today), the
-    /// sampler is restricted to tokens that satisfy the supplied JSON Schema in the model's native
-    /// call syntax — required keys can't be dropped, only declared keys/enum values appear, value
-    /// shapes match the declared type. Default off → byte-identical to unconstrained decoding. Also
-    /// turned on by the <c>SHARPI_TOOL_GRAMMAR=1</c> environment variable.
+    /// a tool-active request is served by a family with constraint support (Gemma 4, Qwen and
+    /// Qwen3-Coder, Llama-3, DeepSeek), the sampler is restricted to tokens that satisfy the supplied
+    /// JSON Schema in the model's native call syntax — required keys can't be dropped, only declared
+    /// keys/enum values appear, value shapes match the declared type. Default off → byte-identical to
+    /// unconstrained decoding. Also turned on by the <c>SHARPI_TOOL_GRAMMAR=1</c> environment variable.
     /// </summary>
     public bool ToolGrammar { get; set; }
 

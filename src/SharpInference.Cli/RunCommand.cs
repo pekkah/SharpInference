@@ -196,7 +196,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         public string? ToolsPath { get; init; }
 
         [CommandOption("--tool-grammar")]
-        [Description("Constrain tool-call arguments to the --tools JSON Schemas (issue #374): required keys can't be dropped, only declared keys/enum values appear, value shapes match the declared type. Needs --tools and a model family with constraint support (Gemma 4 today). Default off → byte-identical to unconstrained decoding.")]
+        [Description("Constrain tool-call arguments to the --tools JSON Schemas (issue #374): required keys can't be dropped, only declared keys/enum values appear, value shapes match the declared type. Needs --tools and a model family with constraint support (Gemma 4, Qwen/Qwen3-Coder, Llama-3, DeepSeek). Default off → byte-identical to unconstrained decoding.")]
         [DefaultValue(false)]
         public bool ToolGrammar { get; init; }
 

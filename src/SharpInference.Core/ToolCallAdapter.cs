@@ -403,9 +403,28 @@ public sealed class QwenCoderToolCallAdapter : IToolCallAdapter
 {
     public const string OpenMarker  = "<function=";
     public const string CloseMarker = "</function>";
+    /// <summary>Qwen's tool-call envelope tokens. Qwen3-Coder wraps each XML call in
+    /// <c>&lt;tool_call&gt;…&lt;/tool_call&gt;</c>; these are single special tokens used by the
+    /// argument-grammar constraint as a leak-proof arming gate (the inner <c>&lt;function=&gt;</c> tags
+    /// are ordinary text). Mirrors <see cref="QwenToolCallAdapter.OpenMarker"/>.</summary>
+    public const string ArmMarker      = "<tool_call>";
+    public const string ArmCloseMarker = "</tool_call>";
 
     public string Architecture => "qwen3coder";
     public int MaxOpenTagLength => OpenMarker.Length;
+
+    /// <inheritdoc/>
+    /// <remarks>Constrains the XML argument body of Qwen3-Coder's
+    /// <c>&lt;tool_call&gt;&lt;function=NAME&gt;&lt;parameter=KEY&gt;VALUE&lt;/parameter&gt;…&lt;/function&gt;&lt;/tool_call&gt;</c>
+    /// wire format (issue #383) — the XML sibling of the JSON/Gemma constraints. Inert (returns null)
+    /// when no supplied tool is constrainable or <c>&lt;tool_call&gt;</c> isn't a vocabulary token.</remarks>
+    public ITokenConstraint? BuildArgumentConstraint(IReadOnlyList<ToolSchema> tools, GrammarVocabulary vocab)
+    {
+        ArgumentNullException.ThrowIfNull(tools);
+        ArgumentNullException.ThrowIfNull(vocab);
+        var c = new QwenCoderToolArgumentConstraint(vocab, tools);
+        return c.HasConstrainableTools ? c : null;
+    }
 
     public ToolCallParseResult Parse(string rawOutput)
     {
