@@ -585,9 +585,10 @@ public sealed record SamplingParams
     /// constraint is stateful and single-request. <c>null</c> (default) = unconstrained decoding,
     /// byte-identical to the pre-#374 path.
     /// <para>
-    /// Honored by the single-user <c>InferenceEngine</c> only. <c>ContinuousBatchingEngine</c>
-    /// (<c>SHARPI_MAX_BATCH</c>) does not yet apply it — it samples each batched sequence directly
-    /// and warns once when a constraint-bearing request is admitted.
+    /// Honored by both the single-user <c>InferenceEngine</c> and <c>ContinuousBatchingEngine</c>
+    /// (<c>SHARPI_MAX_BATCH</c>, issue #377): under batching the instance is carried per sequence and
+    /// masks only that sequence's logits row each step, so concurrent unconstrained requests are
+    /// unaffected. A single instance must not be shared across concurrent requests.
     /// </para>
     /// </summary>
     public ITokenConstraint? Constraint { get; init; }
