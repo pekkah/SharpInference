@@ -343,4 +343,43 @@ public sealed class JsonToolGrammarMockTests
         var schema = ToolSchema.FromOpenAiFunction("noop", doc.RootElement.Clone());
         Assert.Null(new QwenToolCallAdapter("qwen3").BuildArgumentConstraint([schema], vocab));
     }
+
+    // The Qwen adapter overlays the JSON (#376) and Qwen3-Coder XML (#383) constraints in a
+    // CompositeToolArgumentConstraint, because the same architecture hosts both formats (#383). These
+    // exercise the composite's format dispatch model-free, so a CI runner without the GGUFs covers it.
+
+    [Fact]
+    public void Composite_DispatchesToXmlSub_OnCoderOutput()
+    {
+        var (c, tok, vocab) = Build(
+            """{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}""",
+            "get_weather");
+        Assert.IsType<CompositeToolArgumentConstraint>(c);
+
+        // Coder XML output engages the XML sub through the composite and enforces the required param.
+        Feed(c, tok, "<tool_call>\n<function=get_weather>");
+        Assert.True(c.IsConstraining);
+        Feed(c, tok, "<");
+        Assert.True(Allowed(c, vocab, tok.Char('p')));    // <parameter=
+        Assert.False(Allowed(c, vocab, tok.Char('/')));   // </function> forbidden — 'location' missing
+    }
+
+    [Fact]
+    public void Composite_DispatchesToJsonSub_OnJsonOutput()
+    {
+        var (c, tok, vocab) = Build(
+            """{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}""",
+            "get_weather");
+        Assert.IsType<CompositeToolArgumentConstraint>(c);
+
+        // JSON output engages the JSON sub through the composite — unchanged from #376.
+        Feed(c, tok, QwenPreamble);
+        Assert.True(c.IsConstraining);
+        Assert.False(Allowed(c, vocab, tok.Merged("{}")));  // merged empty-object still rejected
+        Assert.True(Allowed(c, vocab, tok.Char('{')));
+
+        // Reset returns the whole composite to the watching (pass-through) state.
+        c.Reset();
+        Assert.False(c.IsConstraining);
+    }
 }

@@ -113,15 +113,35 @@ public sealed class JsonToolGrammarConstraintTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public void NonJsonOutput_DoesNotEngage()
+    public void XmlOutput_EngagesViaComposite()
     {
         var tok = Tok();
         if (tok is null) { output.WriteLine("missing model — skip"); return; }
         var vocab = new GrammarVocabulary(tok);
         var c = new QwenToolCallAdapter("qwen3").BuildArgumentConstraint([Schema("get_weather", Weather)], vocab)!;
 
-        // Qwen3.6 also emits an XML <function=…> shape — the JSON constraint must stay inert on it.
+        // The Qwen adapter now overlays the JSON (#376) and Qwen3-Coder XML (#383) constraints (the two
+        // can't be told apart from the GGUF architecture alone). Feeding the XML <function=…> shape
+        // engages the XML sub-constraint through the composite — the previously-uncovered case.
         Feed(c, tok, "<tool_call>\n<function=get_weather>");
-        Assert.False(c.IsConstraining);
+        Assert.True(c.IsConstraining);
+        // Required 'location' missing → the function can't close yet.
+        Feed(c, tok, "<");
+        Assert.True(Allowed(c, vocab.VocabSize, tok.Encode("p")[0]));    // <parameter=
+        Assert.False(Allowed(c, vocab.VocabSize, tok.Encode("/")[0]));   // </function> forbidden
+    }
+
+    [Fact]
+    public void JsonOutput_StillEngages_ViaComposite()
+    {
+        var tok = Tok();
+        if (tok is null) { output.WriteLine("missing model — skip"); return; }
+        var vocab = new GrammarVocabulary(tok);
+        var c = new QwenToolCallAdapter("qwen3").BuildArgumentConstraint([Schema("get_weather", Weather)], vocab)!;
+
+        // The JSON path is unchanged: the JSON sub-constraint still engages at the args-key colon.
+        Feed(c, tok, "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": ");
+        Assert.True(c.IsConstraining);
+        Assert.False(Allowed(c, vocab.VocabSize, Single(tok, "{}")));   // merged empty-object still rejected
     }
 }

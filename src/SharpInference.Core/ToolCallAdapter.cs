@@ -320,18 +320,33 @@ public sealed class QwenToolCallAdapter(string architecture) : IToolCallAdapter
     public int MaxOpenTagLength => OpenMarker.Length;
 
     /// <inheritdoc/>
-    /// <remarks>Constrains the JSON argument object of Qwen's
-    /// <c>&lt;tool_call&gt;{"name":"NAME","arguments":{...}}&lt;/tool_call&gt;</c> wire format
-    /// (issue #376). Inert (returns null) when no supplied tool is constrainable, when
-    /// <c>&lt;tool_call&gt;</c> isn't a vocabulary token, or when the model emits the Qwen3.6 XML
-    /// shape instead of JSON (the constraint simply never engages).</remarks>
+    /// <remarks>Constrains the argument body of Qwen's <c>&lt;tool_call&gt;…&lt;/tool_call&gt;</c> wire
+    /// format. The same architecture (<c>qwen3moe</c>/<c>qwen2</c>/<c>qwen3</c>) hosts two formats that
+    /// the GGUF metadata can't tell apart — standard JSON
+    /// (<c>{"name":"NAME","arguments":{...}}</c>, issue #376) and Qwen3-Coder's XML
+    /// (<c>&lt;function=NAME&gt;&lt;parameter=K&gt;V&lt;/parameter&gt;…&lt;/function&gt;</c>, issue
+    /// #383) — and they're only distinguishable by the chat template, which isn't visible here. So we
+    /// build BOTH and overlay them with a <see cref="CompositeToolArgumentConstraint"/>: both arm on
+    /// <c>&lt;tool_call&gt;</c> and diverge on the first body byte, so whichever matches the model's
+    /// actual output engages and the other stays inert. Returns null when no supplied tool is
+    /// constrainable or <c>&lt;tool_call&gt;</c> isn't a vocabulary token.</remarks>
     public ITokenConstraint? BuildArgumentConstraint(IReadOnlyList<ToolSchema> tools, GrammarVocabulary vocab)
     {
         ArgumentNullException.ThrowIfNull(tools);
         ArgumentNullException.ThrowIfNull(vocab);
-        var c = new JsonToolArgumentConstraint(
+        var json = new JsonToolArgumentConstraint(
             vocab, tools, OpenMarker, JsonToolEnvelope.NameValueObject, argsKeys: ["arguments", "parameters"]);
-        return c.HasConstrainableTools ? c : null;
+        var xml = new QwenCoderToolArgumentConstraint(vocab, tools);
+
+        var active = new List<ITokenConstraint>(2);
+        if (json.HasConstrainableTools) active.Add(json);
+        if (xml.HasConstrainableTools) active.Add(xml);
+        return active.Count switch
+        {
+            0 => null,
+            1 => active[0],
+            _ => new CompositeToolArgumentConstraint(active),
+        };
     }
 
     public ToolCallParseResult Parse(string rawOutput)
@@ -403,9 +418,28 @@ public sealed class QwenCoderToolCallAdapter : IToolCallAdapter
 {
     public const string OpenMarker  = "<function=";
     public const string CloseMarker = "</function>";
+    /// <summary>Qwen's tool-call envelope tokens. Qwen3-Coder wraps each XML call in
+    /// <c>&lt;tool_call&gt;…&lt;/tool_call&gt;</c>; these are single special tokens used by the
+    /// argument-grammar constraint as a leak-proof arming gate (the inner <c>&lt;function=&gt;</c> tags
+    /// are ordinary text). Mirrors <see cref="QwenToolCallAdapter.OpenMarker"/>.</summary>
+    public const string ArmMarker      = "<tool_call>";
+    public const string ArmCloseMarker = "</tool_call>";
 
     public string Architecture => "qwen3coder";
     public int MaxOpenTagLength => OpenMarker.Length;
+
+    /// <inheritdoc/>
+    /// <remarks>Constrains the XML argument body of Qwen3-Coder's
+    /// <c>&lt;tool_call&gt;&lt;function=NAME&gt;&lt;parameter=KEY&gt;VALUE&lt;/parameter&gt;…&lt;/function&gt;&lt;/tool_call&gt;</c>
+    /// wire format (issue #383) — the XML sibling of the JSON/Gemma constraints. Inert (returns null)
+    /// when no supplied tool is constrainable or <c>&lt;tool_call&gt;</c> isn't a vocabulary token.</remarks>
+    public ITokenConstraint? BuildArgumentConstraint(IReadOnlyList<ToolSchema> tools, GrammarVocabulary vocab)
+    {
+        ArgumentNullException.ThrowIfNull(tools);
+        ArgumentNullException.ThrowIfNull(vocab);
+        var c = new QwenCoderToolArgumentConstraint(vocab, tools);
+        return c.HasConstrainableTools ? c : null;
+    }
 
     public ToolCallParseResult Parse(string rawOutput)
     {
