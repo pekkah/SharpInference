@@ -85,8 +85,10 @@ public sealed class QwenCoderToolArgumentConstraint : ITokenConstraint
 
         _forbidden = new HashSet<int>(vocab.EogTokenIds);
         _ = vocab.TryGetSpecialToken(QwenCoderToolCallAdapter.ArmMarker, out _toolCallOpenId);
-        _toolCallCloseId = -1;
-        _ = vocab.TryGetSpecialToken(QwenCoderToolCallAdapter.ArmCloseMarker, out _toolCallCloseId);
+        // -1 (not the out-param's 0-on-miss) so a missing </tool_call> can never match a real token id
+        // — token 0 (pad/unk) would otherwise spuriously disarm the constraint.
+        if (!vocab.TryGetSpecialToken(QwenCoderToolCallAdapter.ArmCloseMarker, out _toolCallCloseId))
+            _toolCallCloseId = -1;
 
         _tools = new Dictionary<string, CompiledObject>(StringComparer.Ordinal);
         if (_toolCallOpenId > 0)
