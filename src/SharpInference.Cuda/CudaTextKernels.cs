@@ -537,6 +537,42 @@ extern ""C"" __global__ void llm_clear_f32(float* __restrict__ dst, int n)
     dst[i] = 0.f;
 }
 
+// ── Index-based row gather / scatter (GPU op-offload MoE prefill) ───────────
+// One launch each replaces the per-row CopyDeviceRegion loops in the CPU-MoE
+// GPU-offload routed-prefill path: rowIdx is CSR-ordered (expert-bucketed) so a
+// single grid-stride pass moves all nRows·cols floats. Each destination slot is
+// written exactly once (the CSR covers every (token,slot) selection once), so no
+// atomics are needed in the scatter.
+//   gather:  dst[g*cols + c] = src[rowIdx[g]*cols + c]
+extern ""C"" __global__ void llm_gather_rows(
+    float* __restrict__ dst, const float* __restrict__ src,
+    const int* __restrict__ rowIdx, int nRows, int cols)
+{
+    long total = (long)nRows * cols;
+    for (long t = (long)blockIdx.x * blockDim.x + threadIdx.x; t < total;
+         t += (long)gridDim.x * blockDim.x)
+    {
+        int g = (int)(t / cols);
+        int c = (int)(t - (long)g * cols);
+        dst[t] = src[(long)rowIdx[g] * cols + c];
+    }
+}
+
+//   scatter: dst[dstRowIdx[g]*cols + c] = src[g*cols + c]
+extern ""C"" __global__ void llm_scatter_rows(
+    float* __restrict__ dst, const float* __restrict__ src,
+    const int* __restrict__ dstRowIdx, int nRows, int cols)
+{
+    long total = (long)nRows * cols;
+    for (long t = (long)blockIdx.x * blockDim.x + threadIdx.x; t < total;
+         t += (long)gridDim.x * blockDim.x)
+    {
+        int g = (int)(t / cols);
+        int c = (int)(t - (long)g * cols);
+        dst[(long)dstRowIdx[g] * cols + c] = src[t];
+    }
+}
+
 // ── Memory-bound baseline (diagnostic only) ────────────────────────────────
 // Each thread reads/writes one uint4 (16 bytes), the access width NVIDIA's
 // own bandwidthTest uses. Saturates HBM at ~400 GB/s on RTX 4070 Ti when the
@@ -5354,6 +5390,118 @@ extern ""C"" __global__ void llm_matvec_q6k_gemm_n_soa(
         acc += sc5 * (float)q[160 + lane] * input[base_elem + 160 + lane];
         acc += sc6 * (float)q[192 + lane] * input[base_elem + 192 + lane];
         acc += sc7 * (float)q[224 + lane] * input[base_elem + 224 + lane];
+    }
+
+    float result = sharpi_warp_reduce_sum(acc);
+    if (lane == 0) output_all[(long)token * (long)rows + row] = result;
+}
+
+// ── MatVec Q3_K GEMM-N (issue #100) ────────────────────────────────────────
+// Raw in-kernel-dequant Q3_K GEMM-N so the op-offload MoE prefill can upload the
+// compact Q3_K bytes (110 B / 256-elem super-block) and matmul on GPU directly —
+// no host dequant→F32 (the 24.6s / 79% prefill cost this kernel removes). F32
+// input, per-element Q3_K weight decode, 8 rows/block × 32 thr/row warp reduce —
+// same geometry + output layout output_all[token*rows + row] as the Q5_K/Q6_K/Q8_0
+// GEMM-N siblings, so it is a drop-in MatMulBatched dispatch target.
+//
+// Q3_K super-block (110 bytes, mirrors SimdKernels.DotQ3K / ggml block_q3_K):
+//   [0:32]    hmask — one high bit per element (bit s of byte e for sub-block s)
+//   [32:96]   qs    — 2 low bits per element (64 bytes; half h at qs[h*32 + e])
+//   [96:108]  12 scale bytes → 16 signed 6-bit scales via the kmask1/kmask2 aux
+//             unpack (identical to DotQ3K_Scalar / ggml get_scale)
+//   [108:110] dAll  — FP16 super-block scale
+// Element value qu = ((qs[..]>>shift)&3) + (hmask bit ? 4 : 0) ∈ [0,7]; the weight
+// contribution is dAll·(scale_g−32)·(qu−4)·act, summed over all 256 elements.
+//
+// Lane layout (lane 0..31, one warp/row): the 8 sub-blocks s=0..7 are walked in
+// order; lane handles element e = s*32 + lane. shift = (s&3)*2, mask bit m = 1<<s,
+// qs byte = qs[(s>>2)*32 + lane], hmask byte = hmask[lane], scale group = lane>>4
+// (so scale index si = 2*s + (lane>>4)). This reproduces the SAME per-element
+// products as DotQ3K_Scalar (only the warp lanes parallelize the inner l-loop;
+// each lane's term is identical), giving an exact F32 dequant-and-dot — argmax-
+// stable vs the host DotQ3K F32 reference (no activation quantization here).
+//
+// 110 is not 4-aligned per super-block, so every weight byte is read via
+// sharpi_byte_at / sharpi_int8_at byte gathers (cf. llm_matvec_q6k), never a
+// uint-indexed load that would assume 4-alignment. The three scale uint32 words
+// are likewise assembled from byte gathers before the aux unpack.
+//
+// Reference: llama.cpp ggml-cuda dequantize_block_q3_K (convert.cu) /
+// vec_dot_q3_K_q8_1 (vecdotq.cuh) for the 3-bit unpack + 6-bit scale decode (MIT);
+// adapted to our 110-byte AoS layout and the GEMM-N output convention.
+extern ""C"" __global__ void llm_matvec_q3k_gemm_n(
+    const unsigned int* __restrict__ weights,
+    const float* __restrict__ input_all,   // [n_tok][cols]
+    float* __restrict__ output_all,        // [n_tok][rows]
+    int rows, int cols, int n_tok)
+{
+    const int N_ROWS = 8;
+    const int THREADS_PER_ROW = 32;
+    unsigned int tid = threadIdx.x;
+    int row_in_wg = (int)tid / THREADS_PER_ROW;
+    int lane = (int)tid & (THREADS_PER_ROW - 1);
+    int row = (int)blockIdx.x * N_ROWS + row_in_wg;
+    int token = (int)blockIdx.y;
+    if (row >= rows || token >= n_tok) return;
+
+    const float* input = input_all + (long)token * (long)cols;
+    int num_blocks = cols >> 8;
+    long row_base_bytes = (long)row * (long)num_blocks * 110L;
+
+    int group = lane >> 4;          // 0 → first-16 scale, 1 → second-16 scale
+
+    float acc = 0.f;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long b0 = row_base_bytes + (long)block * 110L;
+
+        // dAll: FP16 at bytes [108:110].
+        unsigned int dlo = sharpi_byte_at(weights, b0 + 108);
+        unsigned int dhi = sharpi_byte_at(weights, b0 + 109);
+        float dAll = sharpi_fp16_to_fp32(dlo | (dhi << 8));
+
+        // The 12 scale bytes [96:108) → three uint32 words (byte gathers, no
+        // 4-alignment assumed), then the kmask1/kmask2 aux unpack producing 16
+        // signed 6-bit scales (identical to DotQ3K_Scalar / ggml get_scale).
+        const unsigned int kmask1 = 0x03030303u;
+        const unsigned int kmask2 = 0x0f0f0f0fu;
+        unsigned int a0 = sharpi_byte_at(weights, b0 + 96)
+                        | (sharpi_byte_at(weights, b0 + 97) << 8)
+                        | (sharpi_byte_at(weights, b0 + 98) << 16)
+                        | (sharpi_byte_at(weights, b0 + 99) << 24);
+        unsigned int a1 = sharpi_byte_at(weights, b0 + 100)
+                        | (sharpi_byte_at(weights, b0 + 101) << 8)
+                        | (sharpi_byte_at(weights, b0 + 102) << 16)
+                        | (sharpi_byte_at(weights, b0 + 103) << 24);
+        unsigned int tmp = sharpi_byte_at(weights, b0 + 104)
+                        | (sharpi_byte_at(weights, b0 + 105) << 8)
+                        | (sharpi_byte_at(weights, b0 + 106) << 16)
+                        | (sharpi_byte_at(weights, b0 + 107) << 24);
+        unsigned int aux[4];
+        aux[2] = ((a0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((a1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (a0 & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (a1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+        int base_elem = block * 256;
+
+        // Walk the 8 sub-blocks; lane handles element s*32 + lane each.
+        #pragma unroll
+        for (int s = 0; s < 8; s++) {
+            int half  = s >> 2;
+            int shift = (s & 3) * 2;
+            unsigned int m = 1u << s;
+
+            int si = 2 * s + group;                       // scale index 0..15
+            int sc = (int)((aux[si >> 2] >> ((si & 3) * 8)) & 0xFFu);
+            sc -= 32;                                     // signed 6-bit scale − 32
+
+            unsigned int qsb = sharpi_byte_at(weights, b0 + 32 + half * 32 + lane);
+            unsigned int hmb = sharpi_byte_at(weights, b0 + lane);
+            int qval = (int)((qsb >> shift) & 3u) - ((hmb & m) != 0u ? 0 : 4);
+
+            acc += dAll * (float)sc * (float)qval * input[base_elem + s * 32 + lane];
+        }
     }
 
     float result = sharpi_warp_reduce_sum(acc);

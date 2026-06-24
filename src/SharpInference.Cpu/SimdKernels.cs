@@ -3348,6 +3348,345 @@ public static unsafe class SimdKernels
     }
 
     // ================================================================
+    //  Q4_K · Q8_KS Dot Product  (one row, per-32 prequantized input)
+    // ================================================================
+    // Q4_K super-block = 256 elements / 144 bytes. Each 32-element
+    // sub-block (8 per super-block) has its own 6-bit scale `sc` and
+    // 6-bit min `m` (decoded by GetScaleMinK4) plus the per-super-block
+    // FP `d` / `dmin`. The 4-bit weight nibble is UNSIGNED [0,15], so the
+    // inner Σ nibble·q8 is the same u8·s8 (vpmaddubsw) pattern as the
+    // Q3_K kernel — but the offset correction is `-dmin·m·Σq8` (a true
+    // per-sub-block min, NOT Q3_K's constant -4). The per-32 activation
+    // scale `dSub[sub]` folds into the per-sub-block FP FMA, so the dot
+    // is dw-quantized in the int domain and FP-scaled per sub-block:
+    //   acc += dSub·( d·sc·Σ(nibble·q8) − dmin·m·Σq8 ).
+    // This replaces the slow f32-dequant fallback (DotQ4K) for routed
+    // Q4_K MoE experts on the int8 path (Carnice: 9/41 expert layers).
+
+    public static float DotQ4K_Q8KS(byte* row, byte* scratch, int cols)
+    {
+        int numBlocks = cols / 256;
+
+        if (Avx2.IsSupported && Fma.IsSupported)
+            return DotQ4K_Q8KS_Avx2(row, scratch, numBlocks);
+
+        return DotQ4K_Q8KS_Scalar(row, scratch, numBlocks);
+    }
+
+    public static float DotQ4K_Q8KS(byte* row, float* input, int cols)
+    {
+        int scratchBytes = Q8KSScratchBytes(cols);
+        byte* scratch = stackalloc byte[scratchBytes];
+        QuantizeRowToQ8KS(input, cols, scratch);
+        return DotQ4K_Q8KS(row, scratch, cols);
+    }
+
+    internal static float DotQ4K_Q8KS_Scalar(byte* row, byte* scratch, int numBlocks)
+    {
+        float* dArr = (float*)scratch;
+        sbyte* qsArr = (sbyte*)(scratch + numBlocks * 32);
+        short* bsumsArr = (short*)(scratch + numBlocks * 32 + numBlocks * 256);
+
+        float acc = 0f;
+        for (int b = 0; b < numBlocks; b++)
+        {
+            byte* x = row + b * 144;
+            float d = HalfToFloat(x[0], x[1]);
+            float dmin = HalfToFloat(x[2], x[3]);
+            byte* sc = x + 4;
+            byte* qs = x + 16;
+
+            float* dSub = dArr + b * 8;
+            sbyte* q8 = qsArr + b * 256;
+            short* bsums = bsumsArr + b * 16;
+
+            for (int chunk = 0; chunk < 4; chunk++)
+            {
+                GetScaleMinK4(2 * chunk, sc, out byte sc1, out byte m1);     // s0 (low nibbles)
+                GetScaleMinK4(2 * chunk + 1, sc, out byte sc2, out byte m2); // s1 (high nibbles)
+
+                // Sub-block s0 (32 elems at chunk*64).
+                int sub0 = 0;
+                int eo0 = chunk * 64;
+                for (int l = 0; l < 32; l++)
+                    sub0 += (qs[chunk * 32 + l] & 0x0F) * (int)q8[eo0 + l];
+                int s0 = 2 * chunk;
+                int bsum0 = (int)bsums[2 * s0] + (int)bsums[2 * s0 + 1];
+                acc += dSub[s0] * (d * sc1 * sub0 - dmin * m1 * bsum0);
+
+                // Sub-block s1 (32 elems at chunk*64+32).
+                int sub1 = 0;
+                int eo1 = chunk * 64 + 32;
+                for (int l = 0; l < 32; l++)
+                    sub1 += (qs[chunk * 32 + l] >> 4) * (int)q8[eo1 + l];
+                int s1 = 2 * chunk + 1;
+                int bsum1 = (int)bsums[2 * s1] + (int)bsums[2 * s1 + 1];
+                acc += dSub[s1] * (d * sc2 * sub1 - dmin * m2 * bsum1);
+            }
+        }
+        return acc;
+    }
+
+    private static float DotQ4K_Q8KS_Avx2(byte* row, byte* scratch, int numBlocks)
+    {
+        float* dArr = (float*)scratch;
+        sbyte* qsArr = (sbyte*)(scratch + numBlocks * 32);
+        short* bsumsArr = (short*)(scratch + numBlocks * 32 + numBlocks * 256);
+
+        var m0F = Vector256.Create((byte)0x0F);
+        var one16 = Vector256.Create((short)1);
+        float acc = 0f;
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            byte* x = row + b * 144;
+            float d = HalfToFloat(x[0], x[1]);
+            float dmin = HalfToFloat(x[2], x[3]);
+            byte* sc = x + 4;
+            byte* qs = x + 16;
+
+            float* dSub = dArr + b * 8;
+            sbyte* q8 = qsArr + b * 256;
+            short* bsums = bsumsArr + b * 16;
+
+            for (int chunk = 0; chunk < 4; chunk++)
+            {
+                GetScaleMinK4(2 * chunk, sc, out byte sc1, out byte m1);     // s0 (low nibbles)
+                GetScaleMinK4(2 * chunk + 1, sc, out byte sc2, out byte m2); // s1 (high nibbles)
+
+                // 32 packed nibble-bytes for this chunk → low/high nibble halves.
+                var qbytes = Vector256.LoadUnsafe(ref *(qs + chunk * 32));
+                var lo = Avx2.And(qbytes, m0F);
+                var hi = Avx2.And(Avx2.ShiftRightLogical(qbytes.AsInt16(), 4).AsByte(), m0F);
+
+                int s0 = 2 * chunk;
+                int s1 = 2 * chunk + 1;
+
+                // Sub-block s0 (low nibbles · q8 at chunk*64).
+                {
+                    var q8_v = Vector256.LoadUnsafe(ref *(q8 + chunk * 64)).AsSByte();
+                    var p16 = Avx2.MultiplyAddAdjacent(lo, q8_v);                 // u8·s8 → i16 pairs
+                    int sub0 = HSumI32_256(Avx2.MultiplyAddAdjacent(p16, one16));
+                    int bsum0 = (int)bsums[2 * s0] + (int)bsums[2 * s0 + 1];
+                    acc += dSub[s0] * (d * sc1 * sub0 - dmin * m1 * bsum0);
+                }
+                // Sub-block s1 (high nibbles · q8 at chunk*64+32).
+                {
+                    var q8_v = Vector256.LoadUnsafe(ref *(q8 + chunk * 64 + 32)).AsSByte();
+                    var p16 = Avx2.MultiplyAddAdjacent(hi, q8_v);
+                    int sub1 = HSumI32_256(Avx2.MultiplyAddAdjacent(p16, one16));
+                    int bsum1 = (int)bsums[2 * s1] + (int)bsums[2 * s1 + 1];
+                    acc += dSub[s1] * (d * sc2 * sub1 - dmin * m2 * bsum1);
+                }
+            }
+        }
+        return acc;
+    }
+
+    // ================================================================
+    //  Q4_K · Q8_KS Dot Product — two/four-input dequant-once (#112/#114)
+    // ================================================================
+    // Decodes the Q4_K weight row ONCE (the nibble unpack + 6-bit scale/min
+    // decode) and dots it against 2/4 Q8_KS-prepacked inputs. Each input's
+    // accumulation is byte-for-byte identical to <see cref="DotQ4K_Q8KS"/> —
+    // same sub-block order, same int MAdd / min-correction / FP FMA chain —
+    // so it is bit-identical to N single dots. Used by the batched routed-MoE
+    // path to amortize the unpack across tokens routing to the same expert.
+    public static void DotQ4K_Q8KS_2In(byte* row, byte* scratch1, byte* scratch2, int cols,
+                                       out float sum1, out float sum2)
+    {
+        int numBlocks = cols / 256;
+        if (Avx2.IsSupported && Fma.IsSupported)
+        {
+            DotQ4K_Q8KS_2In_Avx2(row, scratch1, scratch2, numBlocks, out sum1, out sum2);
+            return;
+        }
+        sum1 = DotQ4K_Q8KS_Scalar(row, scratch1, numBlocks);
+        sum2 = DotQ4K_Q8KS_Scalar(row, scratch2, numBlocks);
+    }
+
+    private static void DotQ4K_Q8KS_2In_Avx2(byte* row, byte* scratch1, byte* scratch2,
+                                             int numBlocks, out float sum1, out float sum2)
+    {
+        float* dArr1 = (float*)scratch1;
+        sbyte* qsArr1 = (sbyte*)(scratch1 + numBlocks * 32);
+        short* bsumsArr1 = (short*)(scratch1 + numBlocks * 32 + numBlocks * 256);
+        float* dArr2 = (float*)scratch2;
+        sbyte* qsArr2 = (sbyte*)(scratch2 + numBlocks * 32);
+        short* bsumsArr2 = (short*)(scratch2 + numBlocks * 32 + numBlocks * 256);
+
+        var m0F = Vector256.Create((byte)0x0F);
+        var one16 = Vector256.Create((short)1);
+        float acc1 = 0f;
+        float acc2 = 0f;
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            byte* x = row + b * 144;
+            float d = HalfToFloat(x[0], x[1]);
+            float dmin = HalfToFloat(x[2], x[3]);
+            byte* sc = x + 4;
+            byte* qs = x + 16;
+
+            float* dSub1 = dArr1 + b * 8;
+            sbyte* q8a = qsArr1 + b * 256;
+            short* bsums1 = bsumsArr1 + b * 16;
+            float* dSub2 = dArr2 + b * 8;
+            sbyte* q8b = qsArr2 + b * 256;
+            short* bsums2 = bsumsArr2 + b * 16;
+
+            for (int chunk = 0; chunk < 4; chunk++)
+            {
+                GetScaleMinK4(2 * chunk, sc, out byte sc1, out byte m1);
+                GetScaleMinK4(2 * chunk + 1, sc, out byte sc2, out byte m2);
+
+                var qbytes = Vector256.LoadUnsafe(ref *(qs + chunk * 32));   // shared weight nibbles
+                var lo = Avx2.And(qbytes, m0F);
+                var hi = Avx2.And(Avx2.ShiftRightLogical(qbytes.AsInt16(), 4).AsByte(), m0F);
+
+                int s0 = 2 * chunk;
+                int s1 = 2 * chunk + 1;
+                float dsc1 = d * sc1, dm1 = dmin * m1;
+                float dsc2 = d * sc2, dm2 = dmin * m2;
+
+                // Input 1.
+                {
+                    var qlo = Vector256.LoadUnsafe(ref *(q8a + chunk * 64)).AsSByte();
+                    var qhi = Vector256.LoadUnsafe(ref *(q8a + chunk * 64 + 32)).AsSByte();
+                    int sub0 = HSumI32_256(Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(lo, qlo), one16));
+                    int sub1 = HSumI32_256(Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(hi, qhi), one16));
+                    int bsum0 = (int)bsums1[2 * s0] + (int)bsums1[2 * s0 + 1];
+                    int bsum1 = (int)bsums1[2 * s1] + (int)bsums1[2 * s1 + 1];
+                    acc1 += dSub1[s0] * (dsc1 * sub0 - dm1 * bsum0);
+                    acc1 += dSub1[s1] * (dsc2 * sub1 - dm2 * bsum1);
+                }
+                // Input 2 — reuses decoded lo/hi.
+                {
+                    var qlo = Vector256.LoadUnsafe(ref *(q8b + chunk * 64)).AsSByte();
+                    var qhi = Vector256.LoadUnsafe(ref *(q8b + chunk * 64 + 32)).AsSByte();
+                    int sub0 = HSumI32_256(Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(lo, qlo), one16));
+                    int sub1 = HSumI32_256(Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(hi, qhi), one16));
+                    int bsum0 = (int)bsums2[2 * s0] + (int)bsums2[2 * s0 + 1];
+                    int bsum1 = (int)bsums2[2 * s1] + (int)bsums2[2 * s1 + 1];
+                    acc2 += dSub2[s0] * (dsc1 * sub0 - dm1 * bsum0);
+                    acc2 += dSub2[s1] * (dsc2 * sub1 - dm2 * bsum1);
+                }
+            }
+        }
+        sum1 = acc1;
+        sum2 = acc2;
+    }
+
+    public static void DotQ4K_Q8KS_4In(byte* row,
+        byte* scratch0, byte* scratch1, byte* scratch2, byte* scratch3, int cols,
+        out float sum0, out float sum1, out float sum2, out float sum3)
+    {
+        int numBlocks = cols / 256;
+        if (Avx2.IsSupported && Fma.IsSupported)
+        {
+            DotQ4K_Q8KS_4In_Avx2(row, scratch0, scratch1, scratch2, scratch3, numBlocks,
+                out sum0, out sum1, out sum2, out sum3);
+            return;
+        }
+        sum0 = DotQ4K_Q8KS_Scalar(row, scratch0, numBlocks);
+        sum1 = DotQ4K_Q8KS_Scalar(row, scratch1, numBlocks);
+        sum2 = DotQ4K_Q8KS_Scalar(row, scratch2, numBlocks);
+        sum3 = DotQ4K_Q8KS_Scalar(row, scratch3, numBlocks);
+    }
+
+    private static void DotQ4K_Q8KS_4In_Avx2(byte* row,
+        byte* scratch0, byte* scratch1, byte* scratch2, byte* scratch3, int numBlocks,
+        out float sum0, out float sum1, out float sum2, out float sum3)
+    {
+        float* dArr0 = (float*)scratch0;
+        sbyte* qsArr0 = (sbyte*)(scratch0 + numBlocks * 32);
+        short* bsumsArr0 = (short*)(scratch0 + numBlocks * 32 + numBlocks * 256);
+        float* dArr1 = (float*)scratch1;
+        sbyte* qsArr1 = (sbyte*)(scratch1 + numBlocks * 32);
+        short* bsumsArr1 = (short*)(scratch1 + numBlocks * 32 + numBlocks * 256);
+        float* dArr2 = (float*)scratch2;
+        sbyte* qsArr2 = (sbyte*)(scratch2 + numBlocks * 32);
+        short* bsumsArr2 = (short*)(scratch2 + numBlocks * 32 + numBlocks * 256);
+        float* dArr3 = (float*)scratch3;
+        sbyte* qsArr3 = (sbyte*)(scratch3 + numBlocks * 32);
+        short* bsumsArr3 = (short*)(scratch3 + numBlocks * 32 + numBlocks * 256);
+
+        var m0F = Vector256.Create((byte)0x0F);
+        var one16 = Vector256.Create((short)1);
+        float acc0 = 0f;
+        float acc1 = 0f;
+        float acc2 = 0f;
+        float acc3 = 0f;
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            byte* x = row + b * 144;
+            float d = HalfToFloat(x[0], x[1]);
+            float dmin = HalfToFloat(x[2], x[3]);
+            byte* sc = x + 4;
+            byte* qs = x + 16;
+
+            float* dSub0 = dArr0 + b * 8;
+            sbyte* q8_0 = qsArr0 + b * 256;
+            short* bsums0 = bsumsArr0 + b * 16;
+            float* dSub1 = dArr1 + b * 8;
+            sbyte* q8_1 = qsArr1 + b * 256;
+            short* bsums1 = bsumsArr1 + b * 16;
+            float* dSub2 = dArr2 + b * 8;
+            sbyte* q8_2 = qsArr2 + b * 256;
+            short* bsums2 = bsumsArr2 + b * 16;
+            float* dSub3 = dArr3 + b * 8;
+            sbyte* q8_3 = qsArr3 + b * 256;
+            short* bsums3 = bsumsArr3 + b * 16;
+
+            for (int chunk = 0; chunk < 4; chunk++)
+            {
+                GetScaleMinK4(2 * chunk, sc, out byte sc1, out byte m1);
+                GetScaleMinK4(2 * chunk + 1, sc, out byte sc2, out byte m2);
+
+                var qbytes = Vector256.LoadUnsafe(ref *(qs + chunk * 32));   // shared weight nibbles
+                var lo = Avx2.And(qbytes, m0F);
+                var hi = Avx2.And(Avx2.ShiftRightLogical(qbytes.AsInt16(), 4).AsByte(), m0F);
+
+                int s0 = 2 * chunk;
+                int s1 = 2 * chunk + 1;
+                float dsc1 = d * sc1, dm1 = dmin * m1;
+                float dsc2 = d * sc2, dm2 = dmin * m2;
+
+                AccumQ4KInput(lo, hi, one16, q8_0, bsums0, dSub0, chunk, s0, s1, dsc1, dm1, dsc2, dm2, ref acc0);
+                AccumQ4KInput(lo, hi, one16, q8_1, bsums1, dSub1, chunk, s0, s1, dsc1, dm1, dsc2, dm2, ref acc1);
+                AccumQ4KInput(lo, hi, one16, q8_2, bsums2, dSub2, chunk, s0, s1, dsc1, dm1, dsc2, dm2, ref acc2);
+                AccumQ4KInput(lo, hi, one16, q8_3, bsums3, dSub3, chunk, s0, s1, dsc1, dm1, dsc2, dm2, ref acc3);
+            }
+        }
+        sum0 = acc0;
+        sum1 = acc1;
+        sum2 = acc2;
+        sum3 = acc3;
+    }
+
+    // One input's per-chunk accumulation for the Q4_K_Q8KS quad kernel. The two
+    // sub-block terms (s0 then s1) are added to the running `acc` left-to-right,
+    // identical to the single-input kernel's `acc += s0term; acc += s1term;`
+    // ordering — so each input is bit-identical (not just FP-close) to a single
+    // <see cref="DotQ4K_Q8KS"/> dot, the per-token k-independence the routed-MoE
+    // byte-parity oracle relies on.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void AccumQ4KInput(Vector256<byte> lo, Vector256<byte> hi, Vector256<short> one16,
+        sbyte* q8, short* bsums, float* dSub, int chunk, int s0, int s1,
+        float dsc1, float dm1, float dsc2, float dm2, ref float acc)
+    {
+        var qlo = Vector256.LoadUnsafe(ref *(q8 + chunk * 64)).AsSByte();
+        var qhi = Vector256.LoadUnsafe(ref *(q8 + chunk * 64 + 32)).AsSByte();
+        int sub0 = HSumI32_256(Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(lo, qlo), one16));
+        int sub1 = HSumI32_256(Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(hi, qhi), one16));
+        int bsum0 = (int)bsums[2 * s0] + (int)bsums[2 * s0 + 1];
+        int bsum1 = (int)bsums[2 * s1] + (int)bsums[2 * s1 + 1];
+        acc += dSub[s0] * (dsc1 * sub0 - dm1 * bsum0);
+        acc += dSub[s1] * (dsc2 * sub1 - dm2 * bsum1);
+    }
+
+    // ================================================================
     //  Q6_K · Q8_K Fused two-input dot (issue #42) — decode each Q6_K
     //  super-block ONCE in registers and inner-int-product it against
     //  TWO pre-quantized Q8_K inputs in the same pass. Mirrors the
@@ -4388,6 +4727,18 @@ public static unsafe class SimdKernels
         sum = Sse.Add(sum, Sse.MoveHighToLow(sum, sum));
         sum = Sse.AddScalar(sum, Sse.Shuffle(sum, sum, 1));
         return sum.ToScalar();
+    }
+
+    /// <summary>Horizontal sum of a Vector256&lt;int&gt; to a single int (exact, no FP).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int HSumI32_256(Vector256<int> v)
+    {
+        var lo = v.GetLower();
+        var hi = Avx.ExtractVector128(v, 1);
+        var s = Sse2.Add(lo, hi);
+        s = Sse2.Add(s, Sse2.Shuffle(s, 0x4E)); // [2,3,0,1]
+        s = Sse2.Add(s, Sse2.Shuffle(s, 0xB1)); // [1,0,3,2]
+        return s.ToScalar();
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

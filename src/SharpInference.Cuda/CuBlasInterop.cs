@@ -166,6 +166,22 @@ internal static partial class CuBlasInterop
     [LibraryImport("cudart64_12", EntryPoint = "cudaFreeHost")]
     internal static partial int FreeHost(nint ptr);
 
+    // ── Page-lock an EXISTING host range (cudaHostRegister) ────────────────
+    //
+    // Unlike cudaMallocHost (allocate-pinned), cudaHostRegister page-locks a host
+    // buffer the caller already owns — here the mmap'd GGUF expert weights — so the
+    // DMA engine can copy directly from it at full PCIe bandwidth without a staging
+    // hop. cudaHostRegisterReadOnly (0x08) registers the range read-only, which is
+    // both correct for the immutable weights and avoids needing write permission.
+    [LibraryImport("cudart64_12", EntryPoint = "cudaHostRegister")]
+    internal static partial int HostRegister(nint ptr, nuint size, uint flags);
+
+    [LibraryImport("cudart64_12", EntryPoint = "cudaHostUnregister")]
+    internal static partial int HostUnregister(nint ptr);
+
+    // cudaHostRegister flags
+    internal const uint HostRegisterReadOnly = 0x08;  // CU_MEMHOSTREGISTER_READ_ONLY
+
     // ── Constants ─────────────────────────────────────────────────────────
 
     internal const int HostToDevice   = 1;

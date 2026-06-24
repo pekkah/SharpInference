@@ -278,6 +278,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // the FP path on every prompt measured.
     private readonly bool _q3kQ8KEnabled;
     private readonly bool _q8_0Q8KEnabled;
+    private readonly bool _q4kQ8KEnabled;
 
     // ── CPU MoE state (only allocated/populated when _cpuMoe == true) ──
     // Packed MoE weight refs (mmap pointers; routed experts stay quantized on disk).
@@ -663,6 +664,88 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private int*   _bfUsedExperts;  // [numExperts] compact list of experts with ≥1 token
     private int*   _bfGathTokI;     // [N] gather list: row r of gather buffer ← token _bfGathTokI[r]
 
+    // ── GPU op-offload for the CPU-MoE routed prefill (perf/carnice-vnni-moe) ──
+    // OPT-IN, default OFF (SHARPI_MOE_GPU_PREFILL=1; CLI --gpu-moe-prefill true / server
+    // GpuMoePrefill=true): instead of running BatchedRoutedExperts' grouped int8/F32 dots on
+    // the CPU, transiently upload each used expert's host-resident gate/up/down weight to a
+    // reused GPU buffer and run the gather → GEMM-N gate/up → SiLuMul → GEMM-N down on the GPU
+    // (mirrors llama.cpp uploading CPU-resident MoE weights for the batched prefill matmul) —
+    // measured +15-44% prefill on the GDN-hybrid CPU-MoE models. Raw-quant dtypes (Q3_K via
+    // the #100 in-kernel-dequant GEMM, Q4_K/Q5_K/Q6_K/Q8_0) upload raw bytes and dispatch the
+    // quantized GEMM; only Float32 weights dequant-stage. NOT bit-exact — argmax-stable (the
+    // GPU runs the MoE in F32, *more* precise than the CPU int8 path).
+    //   *** Default OFF because it trades decode for prefill: the ~14 GB pinned cudaMallocHost
+    //   weight copy duplicates the experts in RAM (mmap + pinned), evicting the page cache
+    //   that single-token DECODE's CPU expert-streaming relies on — measured ~-25% decode on
+    //   Carnice (clean A/B) vs the +44% prefill. So it's a win only for prefill-heavy
+    //   workloads; interactive/agentic (decode-heavy) use should leave it off. ***
+    // Falls back to the CPU path (the field is cleared) if the scratch can't be allocated —
+    // see the ctor. Not readonly: the ctor clears it on a setup failure.
+    private bool _gpuMoePrefill = ResolveGate("SHARPI_MOE_GPU_PREFILL", false);
+    private int     _goCap;            // token capacity the GPU-offload scratch is sized for
+    private Tensor? _gpuOffNorm;       // [N × embDim] uploaded norm activations (per layer call)
+    private Tensor? _gpuOffGather;     // [totalSel × embDim] CSR-ordered gathered routed-token norms (ONE gather)
+    private Tensor? _gpuOffGate;       // [totalSel × expertDim] gate projection (CSR-ordered, per-expert slices)
+    private Tensor? _gpuOffUp;         // [totalSel × expertDim] up projection (CSR-ordered, per-expert slices)
+    private Tensor? _gpuOffDownCsr;    // [totalSel × embDim] CSR-ordered down output (per-expert slices; ONE scatter)
+    private Tensor? _gpuOffWGate;      // reused transient gate weight buffer (max raw/F32 bytes; Float32 fallback only)
+    private Tensor? _gpuOffWUp;        // reused transient up weight buffer (Float32 fallback only)
+    private Tensor? _gpuOffWDown;      // reused transient down weight buffer (Float32 fallback only)
+    // Whole-layer raw-quant weight buffers: one big contiguous UploadRawInto of the WHOLE
+    // layer's ffn_*_exps tensor (all numExperts experts back-to-back) per layer call,
+    // then per-expert ViewRawBytes carves each expert's matrix out for the GEMM. Replaces
+    // ~30k tiny per-expert uploads with 3 big transfers/layer (the upload floor). Sized to
+    // the MAX raw layer bytes over all MoE layers so every dtype/dim fits. Raw-quant only
+    // (Q3_K/Q4_K/Q5_K/Q6_K/Q8_0); Float32 falls back to the per-expert _gpuOffW* buffers above.
+    // Double-buffered (ping-pong) whole-layer raw-quant weight buffers. Slot 0 is the legacy
+    // single buffer (used for the synchronous path and the first MoE layer of every chunk);
+    // when the expert weights are in the pinned cudaMallocHost buffer (_goHostPinned), the NEXT
+    // layer's weights are DMA'd into the OTHER slot via UploadRawIntoAsyncDirect while THIS
+    // layer's GEMMs run, overlapping the upload with compute. Doubles layer-weight VRAM (~330→660 MB).
+    private readonly Tensor?[] _gpuLayerGate = new Tensor?[2]; // [slot][numExperts × expertDim × bprMaxG]
+    private readonly Tensor?[] _gpuLayerUp   = new Tensor?[2]; // [slot][numExperts × expertDim × bprMaxU]
+    private readonly Tensor?[] _gpuLayerDown = new Tensor?[2]; // [slot][numExperts × embDim × bprMaxD]
+    // Async double-buffer prefetch state (only used when _goHostPinned):
+    //   _goHostPinned     — the expert weights were copied into a truly-pinned cudaMallocHost
+    //                       buffer → DMA reads run at full PCIe bandwidth + overlap compute.
+    //   _goPinAttempted   — the pinned-buffer alloc+copy ran for the current scratch (one-time guard).
+    //   _goCurSlot        — slot holding THIS layer's weights (the one the GEMMs read).
+    //   _goPrefetchedLayer— layer index whose weights were prefetched into the OTHER slot (-1 = none).
+    //   _goPrefetchSlot   — the slot the prefetch landed in (becomes _goCurSlot when we consume it).
+    //   _goPrefetch{Gate,Up,Down}H — in-flight DMA handles for the prefetched layer (waited then released).
+    private bool _goHostPinned;
+    private bool _goPinAttempted;
+    // The N-independent static scratch (the ~14 GB pinned weight copy, the whole-layer GPU weight
+    // buffers, the F32 dequant staging) is allocated ONCE and survives a dynamic per-N regrow —
+    // re-copying the pinned buffer on every batch-size growth caused multi-second spikes +
+    // fragmentation risk (Gemini review). Only the per-N gather/scatter/GEMM scratch re-grows.
+    private bool _goStaticAllocated;
+    // Truly-pinned (cudaMallocHost) host copy of all MoE expert weights — the DMA source. A
+    // file-backed mmap registered via cudaHostRegister overlaps but tops out at ~13 GB/s; a
+    // genuine pinned allocation reaches full PCIe (~26 GB/s). Copied once at first scratch
+    // alloc (~1s, pages already pre-faulted) and freed in FreeGpuOffloadScratch/Dispose.
+    private nint    _goPinnedBuf;         // base of the big cudaMallocHost buffer (Zero = not pinned)
+    private byte*[]? _goPinnedGate;       // [L] per-layer gate_exps base inside _goPinnedBuf
+    private byte*[]? _goPinnedUp;         // [L] per-layer up_exps base
+    private byte*[]? _goPinnedDown;       // [L] per-layer down_exps base
+    private int  _goCurSlot;
+    private int  _goPrefetchedLayer = -1;
+    private int  _goPrefetchSlot;
+    private CudaUploadHandle _goPrefetchGateH;
+    private CudaUploadHandle _goPrefetchUpH;
+    private CudaUploadHandle _goPrefetchDownH;
+    private bool _goPrefetchValid;   // a prefetch DMA is in flight and its handles are live
+    private float*  _hGpuOffDeq;       // [expertDim·embDim] host F32 staging for Q3_K/F32 dequant
+    private float*  _hGpuOffDownDl;    // [≤N·na × embDim] pinned host download buffer (final routed result)
+    private Tensor? _gpuOffDownPartial; // [N × na × embDim] device unweighted down partials (GPU scatter target)
+    private Tensor? _gpuOffRouted;     // [N × embDim] device weighted-reduce output (downloaded ONCE)
+    private Tensor? _gpuOffWeightsDev; // [N × na] device top-k weights for the reduce kernel
+    private Tensor? _gpuOffGatherIdx;  // [N·na] int32 device — CSR gather row indices (= expTokI[p])
+    private Tensor? _gpuOffScatterIdx; // [N·na] int32 device — CSR scatter slot indices (= expTokI[p]*na + expTokK[p])
+    private int*    _hGpuOffScatterIdx; // [N·na] host int32 staging for the scatter index upload
+    // GPU-offload per-phase profiling (printed once per chunk under SHARPI_PREFILL_PROFILE).
+    private long _profGoDequant, _profGoUpload, _profGoGather, _profGoGemm, _profGoDownScatter;
+
     // Issue #121: batch the per-token FFN/MoE stage of PrefillBatchedTrunkGpuFfn into
     // GEMM-N launches (dense gate/up/down over N) and a grouped-by-expert routed-MoE
     // pass (each cached expert loaded once, matmul'd against all its tokens), with a
@@ -994,15 +1077,25 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // Carnice). SHARPI_Q3K_Q8K / SHARPI_Q8_0_Q8K = "1" or "0" override.
         bool hasQ3KRouted  = HasRoutedExpertsOfDType(model, hp, DType.Q3_K);
         bool hasQ8_0Routed = HasRoutedExpertsOfDType(model, hp, DType.Q8_0);
+        bool hasQ4KRouted  = HasRoutedExpertsOfDType(model, hp, DType.Q4_K);
         _q3kQ8KEnabled  = ResolveGate("SHARPI_Q3K_Q8K",  hasQ3KRouted);
         _q8_0Q8KEnabled = ResolveGate("SHARPI_Q8_0_Q8K", hasQ8_0Routed);
-        if (_cpuMoe && (_q3kQ8KEnabled || _q8_0Q8KEnabled))
+        // Q4_K int8 (DotQ4K_Q8KS) is AVX2-only, but the f32 DotQ4K has an AVX-512 path
+        // (DotQ4K_Avx512). On AVX-512 hardware the f32-AVX512 dot + no activation-quant
+        // overhead BEATS the int8-AVX2 dot — measured ~8% faster on a Q4_K_M model (Zen4).
+        // So only auto-enable Q4_K int8 where AVX-512 is absent (there f32 falls to AVX2 and
+        // the int8 dot can win); on AVX-512 default OFF. Still forceable via SHARPI_Q4K_Q8K=1.
+        // (Q3_K/Q8_0 int8 have no f32-AVX512 competitor, so they stay auto-on.)
+        _q4kQ8KEnabled  = ResolveGate("SHARPI_Q4K_Q8K",
+            hasQ4KRouted && !System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated);
+        if (_cpuMoe && (_q3kQ8KEnabled || _q8_0Q8KEnabled || _q4kQ8KEnabled))
         {
-            var enabled = new List<string>(2);
+            var enabled = new List<string>(3);
             if (_q3kQ8KEnabled)  enabled.Add($"Q3_K_Q8K (Q3_K routed: {hasQ3KRouted})");
             if (_q8_0Q8KEnabled) enabled.Add($"Q8_0_Q8K (Q8_0 routed: {hasQ8_0Routed})");
+            if (_q4kQ8KEnabled)  enabled.Add($"Q4_K_Q8K (Q4_K routed: {hasQ4KRouted})");
             Console.Error.WriteLine(
-                $"[CudaHybridGdnForwardPass] Routed-MoE Q8_K-input kernels enabled: {string.Join(", ", enabled)}. Override with SHARPI_Q3K_Q8K=0 / SHARPI_Q8_0_Q8K=0.");
+                $"[CudaHybridGdnForwardPass] Routed-MoE Q8_K-input kernels enabled: {string.Join(", ", enabled)}. Override with SHARPI_Q3K_Q8K=0 / SHARPI_Q8_0_Q8K=0 / SHARPI_Q4K_Q8K=0.");
         }
 
         // ── Per-layer tensor arrays ────────────────────────────────────
@@ -1058,7 +1151,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _cpuSharedOut = Alloc(_embDim);
             _cpuExpertGateAll = Alloc(_numActiveExperts * _expertDim);
             _cpuExpertUpAll = Alloc(_numActiveExperts * _expertDim);
-            if (_q3kQ8KEnabled || _q8_0Q8KEnabled)
+            if (_q3kQ8KEnabled || _q8_0Q8KEnabled || _q4kQ8KEnabled)
             {
                 // Q8_KS layout (per-32-element sub-block scales) closes the
                 // parity gap that #103 surfaced — see DotQ3K_Q8KS / #107.
@@ -1472,6 +1565,35 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // path, ~5× slower than warm. MmapPrefault honours SHARPI_PREFAULT and the
         // RAM-fit heuristic, and no-ops when nothing is CPU-resident (full-GPU GDN).
         MmapPrefault.Run("CudaHybridGdnForwardPass", BuildCpuPrefaultRegions());
+
+        // Op-offload (SHARPI_MOE_GPU_PREFILL): build ALL op-offload scratch at LOAD — the
+        // ~14 GB pinned cudaMallocHost + copy AND the GPU gather/scatter/layer buffers —
+        // not lazily on the first prefill, otherwise the one-time setup lands on the first
+        // request's critical path (tanking its TTFT and polluting single-turn benchmarks).
+        // EnsureGpuOffloadScratch is grow-only, so a larger chunk later just re-grows the
+        // (small) GPU buffers; the dominant pinned-buffer cost is N-independent and done here.
+        if (_gpuMoePrefill)
+        {
+            int warmChunk = int.TryParse(Environment.GetEnvironmentVariable("SHARPI_PREFILL_CHUNK"),
+                out int pc) && pc > 0 ? pc : 512;
+            // Safety fallback (op-offload is opt-in but can still hit allocation limits): if the
+            // scratch can't be allocated (low host RAM for the ~14 GB pinned buffer, or tight
+            // VRAM for the GPU gather/scatter/layer buffers), disable op-offload and run the CPU
+            // MoE prefill rather than failing model load. The pinned-buffer alloc already
+            // self-falls-back to synchronous upload; this catches the harder allocation failures.
+            try
+            {
+                EnsureGpuOffloadScratch(warmChunk);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"[CudaHybridGdnForwardPass] GPU op-offload setup failed ({ex.GetType().Name}: {ex.Message}); " +
+                    "falling back to the CPU MoE prefill. Set SHARPI_MOE_GPU_PREFILL=0 to silence.");
+                FreeGpuOffloadScratch();
+                _gpuMoePrefill = false;
+            }
+        }
     }
 
     // =================================================================
@@ -1650,7 +1772,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _bExpTokI    = (int*)NativeMemory.Alloc((nuint)perTokSel * sizeof(int));
         _bExpTokK    = (int*)NativeMemory.Alloc((nuint)perTokSel * sizeof(int));
 
-        if (_q3kQ8KEnabled || _q8_0Q8KEnabled)
+        if (_q3kQ8KEnabled || _q8_0Q8KEnabled || _q4kQ8KEnabled)
         {
             _bQ8KEmbStride = SimdKernels.Q8KSScratchBytes(embDim);
             _bQ8KExpStride = SimdKernels.Q8KSScratchBytes(_expertDim);
@@ -2284,6 +2406,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         long t0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         long trunkTicks = 0, routerTicks = 0, routedTicks = 0, combineTicks = 0;
         _profMoeNormQ = _profMoePhaseA = _profMoeSilu = _profMoeGateQ = _profMoePhaseC = _profMoeBucket = 0;
+        _profGoDequant = _profGoUpload = _profGoGather = _profGoGemm = _profGoDownScatter = 0;
 
         // Pessimistic fault latch: the GDN recurrent-state mutation + deferred
         // length-counter bookkeeping below is non-transactional, so mark the pass
@@ -2299,6 +2422,16 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _gpu.CopyDeviceRegion(_gpuStreamAll!, (long)i * embDim * sizeof(float),
                                   _gpuHidden, 0, (long)embDim * sizeof(float));
             _kvCache.ReserveBlockAt(startPos + i);
+        }
+
+        // Chunk-start reset for the GPU op-offload double-buffer: drain any stale prefetch
+        // (handles freed/released) and reset to slot 0 so layer 0 of THIS chunk always uploads
+        // synchronously into slot 0 rather than consuming a prefetch from the previous chunk.
+        if (_gpuMoePrefill)
+        {
+            DrainPrefetch();
+            _goCurSlot = 0;
+            _goPrefetchedLayer = -1;
         }
 
         // 2. Trunk + batched MoE, layer by layer.
@@ -2343,8 +2476,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
             long lt2 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
-            // ── Batched routed experts (host, DRAM-amortized).
-            BatchedRoutedExperts(layer, N);
+            // ── Batched routed experts: CPU grouped-dot (default, byte-exact) or
+            //    GPU op-offload (transient weight upload + GEMM, opt-in, argmax-stable).
+            if (_gpuMoePrefill)
+                BatchedRoutedExpertsGpuOffload(layer, N);
+            else
+                BatchedRoutedExperts(layer, N);
 
             long lt3 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
@@ -2419,6 +2556,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 $"[moe-subphase] bucket={_profMoeBucket * f:F0}ms normQ={_profMoeNormQ * f:F0}ms " +
                 $"phaseA(gate+up)={_profMoePhaseA * f:F0}ms silu/reduce={_profMoeSilu * f:F0}ms " +
                 $"gateQ={_profMoeGateQ * f:F0}ms phaseC(down)={_profMoePhaseC * f:F0}ms");
+            if (_gpuMoePrefill)
+                Console.Error.WriteLine(
+                    $"[gpu-offload] dequant={_profGoDequant * f:F0}ms upload={_profGoUpload * f:F0}ms " +
+                    $"gather={_profGoGather * f:F0}ms gemm={_profGoGemm * f:F0}ms " +
+                    $"download+scatter={_profGoDownScatter * f:F0}ms");
         }
         return _logitsBuf;
     }
@@ -2623,9 +2765,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         int bprU = (embDim    / DTypeInfo.BlockSize(upDt))   * DTypeInfo.BytesPerBlock(upDt);
         int bprD = (expertDim / DTypeInfo.BlockSize(downDt)) * DTypeInfo.BytesPerBlock(downDt);
 
-        bool useQ8KGate = (_q3kQ8KEnabled && gateDt == DType.Q3_K) || (_q8_0Q8KEnabled && gateDt == DType.Q8_0);
-        bool useQ8KUp   = (_q3kQ8KEnabled && upDt   == DType.Q3_K) || (_q8_0Q8KEnabled && upDt   == DType.Q8_0);
-        bool useQ8KDown = (_q3kQ8KEnabled && downDt == DType.Q3_K) || (_q8_0Q8KEnabled && downDt == DType.Q8_0);
+        bool useQ8KGate = (_q3kQ8KEnabled && gateDt == DType.Q3_K) || (_q8_0Q8KEnabled && gateDt == DType.Q8_0) || (_q4kQ8KEnabled && gateDt == DType.Q4_K);
+        bool useQ8KUp   = (_q3kQ8KEnabled && upDt   == DType.Q3_K) || (_q8_0Q8KEnabled && upDt   == DType.Q8_0) || (_q4kQ8KEnabled && upDt   == DType.Q4_K);
+        bool useQ8KDown = (_q3kQ8KEnabled && downDt == DType.Q3_K) || (_q8_0Q8KEnabled && downDt == DType.Q8_0) || (_q4kQ8KEnabled && downDt == DType.Q4_K);
 
         long sp0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         // Bucket (token, slot) pairs by selected expert (CSR layout).
@@ -2837,6 +2979,666 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         });
         // Fold the top-k reduce into the silu/reduce bucket (both are cheap element-wise passes).
         if (_prefillProfile) _profMoeSilu += System.Diagnostics.Stopwatch.GetTimestamp() - sp6;
+    }
+
+    /// <summary>
+    /// GPU op-offload sibling of <see cref="BatchedRoutedExperts"/> (perf/carnice-vnni-moe).
+    /// Same CSR bucketing + same UNWEIGHTED partial scatter + same weighted reduce, but the
+    /// gate/up/down matmuls run on the GPU: <see cref="_bNormAll"/> is uploaded once per layer
+    /// call, then ONE <see cref="CudaBackend.GatherRows"/> launch fills the whole
+    /// <c>[totalSel × embDim]</c> CSR-ordered gathered-norm buffer (<see cref="_gpuOffGather"/>),
+    /// and for each used expert its host-resident gate/up/down weight is transiently uploaded
+    /// into a reused GPU buffer and the GEMM-N gate/up → SiLuMul → GEMM-N down runs over that
+    /// expert's contiguous CSR slice (the <see cref="BatchedGpuMoeFfn"/> structure, but with a
+    /// transient upload in place of the resident SLRU slab). Raw-quant dtypes (Q4_K/Q5_K/
+    /// Q6_K/Q8_0) upload raw bytes and dispatch the quantized GEMM via <see cref="GpuMatMulBatched"/>;
+    /// Q3_K and Float32 dequantize on the host into <see cref="_hGpuOffDeq"/> and upload F32
+    /// (<see cref="CudaBackend.MatMulBatched"/> has no Q3_K kernel). The CSR-ordered down output
+    /// (<see cref="_gpuOffDownCsr"/>) is scattered into <see cref="_gpuOffDownPartial"/> by ONE
+    /// <see cref="CudaBackend.ScatterRows"/> launch (no per-row CopyDeviceRegion), then a single
+    /// GPU weighted reduce (<see cref="CudaBackend.MoeWeightedReduce"/> over a zeroed
+    /// <see cref="_gpuOffRouted"/>) produces the routed sum, which is downloaded ONCE into
+    /// <see cref="_bRoutedAll"/> — eliminating the ~256·layers tiny per-expert downloads + host
+    /// scatter. The downstream combine is untouched. Argmax-stable, NOT byte-exact (gated off).
+    /// </summary>
+    private void BatchedRoutedExpertsGpuOffload(int layer, int N)
+    {
+        int embDim = _embDim;
+        int na = _numActiveExperts;
+        int expertDim = _expertDim;
+        int numExperts = _numExperts;
+
+        var gateExps = _cpuFfnGateExps![layer];
+        var upExps   = _cpuFfnUpExps![layer];
+        var downExps = _cpuFfnDownExps![layer];
+        byte* gateP = gateExps.DataPtr; byte* upP = upExps.DataPtr; byte* downP = downExps.DataPtr;
+        DType gateDt = gateExps.DType, upDt = upExps.DType, downDt = downExps.DType;
+
+        // Raw bytes per expert weight (gate/up are [expertDim × embDim]; down is
+        // [embDim × expertDim] — both expertDim·embDim elements, same per-block layout).
+        int bprG = (embDim    / DTypeInfo.BlockSize(gateDt)) * DTypeInfo.BytesPerBlock(gateDt);
+        int bprU = (embDim    / DTypeInfo.BlockSize(upDt))   * DTypeInfo.BytesPerBlock(upDt);
+        int bprD = (expertDim / DTypeInfo.BlockSize(downDt)) * DTypeInfo.BytesPerBlock(downDt);
+        long gateRawBytes = (long)expertDim * bprG;   // whole gate matrix per expert
+        long upRawBytes   = (long)expertDim * bprU;
+        long downRawBytes = (long)embDim    * bprD;
+
+        EnsureGpuOffloadScratch(N);
+
+        long sp0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        // Bucket (token, slot) pairs by selected expert (CSR layout) — IDENTICAL to
+        // BatchedRoutedExperts so the partial scatter + weighted reduce line up.
+        int* expStart = _bExpStart!; int* cursor = _bExpCursor!; int* used = _bUsedExperts!;
+        int* selected = _bSelected!;
+        for (int e = 0; e <= numExperts; e++) expStart[e] = 0;
+        long totalSel = (long)N * na;
+        for (long s = 0; s < totalSel; s++) expStart[selected[s] + 1]++;
+        for (int e = 0; e < numExperts; e++) expStart[e + 1] += expStart[e];
+        for (int e = 0; e < numExperts; e++) cursor[e] = expStart[e];
+        int* expTokI = _bExpTokI!; int* expTokK = _bExpTokK!;
+        for (int i = 0; i < N; i++)
+            for (int k = 0; k < na; k++)
+            {
+                int e = selected[(long)i * na + k];
+                int p = cursor[e]++;
+                expTokI[p] = i; expTokK[p] = k;
+            }
+        int numUsed = 0;
+        for (int e = 0; e < numExperts; e++)
+            if (expStart[e + 1] > expStart[e]) used[numUsed++] = e;
+        if (_prefillProfile) _profGoUpload += System.Diagnostics.Stopwatch.GetTimestamp() - sp0;
+
+        // Upload the host norm activations [N × embDim] once per layer call. The scratch is
+        // grow-only (sized for _goCap ≥ N), so view it to exactly N·embDim for the pinned
+        // upload (which requires floatCount == dst.ElementCount).
+        long su0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        var normAll = _gpu.View(_gpuOffNorm!, 0, (long)N * embDim);
+        _gpu.UploadInto(normAll, (nint)_bNormAll, N * embDim);
+        if (_prefillProfile) _profGoUpload += System.Diagnostics.Stopwatch.GetTimestamp() - su0;
+        var downPartialDev = _gpuOffDownPartial!;   // [N × na × embDim] device, GPU scatter target
+
+        // ── Build + upload the CSR gather/scatter index arrays (one launch each below). ──
+        // The CSR bucketing already orders the totalSel selections by expert, so expTokI[p]
+        // is exactly the source token row for gathered position p, and expTokI[p]*na+expTokK[p]
+        // is the (token,slot) partial slot p scatters into. Both index arrays are int32 device
+        // buffers; the gather indices ARE _bExpTokI[0..totalSel), uploaded raw verbatim.
+        long sg0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        for (long p = 0; p < totalSel; p++)
+            _hGpuOffScatterIdx![p] = expTokI[p] * na + expTokK[p];
+        var gatherIdxV  = _gpu.View(_gpuOffGatherIdx!,  0, totalSel, DType.Int32);
+        var scatterIdxV = _gpu.View(_gpuOffScatterIdx!, 0, totalSel, DType.Int32);
+        _gpu.UploadRawInto(gatherIdxV,  new ReadOnlySpan<byte>(expTokI,           (int)(totalSel * sizeof(int))));
+        _gpu.UploadRawInto(scatterIdxV, new ReadOnlySpan<byte>(_hGpuOffScatterIdx, (int)(totalSel * sizeof(int))));
+
+        // ONE gather: fill the whole [totalSel × embDim] CSR-ordered gathered-norm buffer.
+        _gpu.GatherRows(_gpuOffGather!, normAll, gatherIdxV, (int)totalSel, embDim);
+        _gpu.Free(gatherIdxV);
+        if (_prefillProfile) _profGoGather += System.Diagnostics.Stopwatch.GetTimestamp() - sg0;
+
+        // ── Whole-layer batched weight upload (raw-quant only), double-buffered ──────────
+        // The host expert weights are contiguous per layer: gateP/upP/downP each point at the
+        // WHOLE layer's ffn_*_exps tensor (all numExperts experts back-to-back). For raw-quant
+        // dtypes (Q4_K/Q5_K/Q6_K/Q8_0) the bytes upload unchanged, so do ONE big contiguous
+        // transfer per weight into the CURRENT ping-pong slot — the per-expert matrix is then a
+        // non-owning ViewRawBytes into that slot. (One ~tens-of-MB transfer is bandwidth-bound;
+        // thousands of tiny ones from non-pinned mmap are latency-bound — the upload floor.)
+        // Only Float32 keeps the per-expert host-dequant fallback below.
+        //
+        // When the expert weights are in the pinned cudaMallocHost buffer (_goHostPinned):
+        //   • If THIS layer was prefetched into the opposite slot by the previous call, just
+        //     WaitForUpload its 3 DMA handles (cross-stream fence so the GEMMs can't race the
+        //     copy), release them, and adopt that slot — no synchronous upload at all.
+        //   • Otherwise DMA THIS layer synchronously into _goCurSlot from the pinned buffer
+        //     (first MoE layer of the chunk) — direct, full-bandwidth, then host-wait.
+        //   • Then issue a DIRECT async DMA of layer+1's weights into the OTHER slot
+        //     (UploadRawIntoAsyncDirect straight from the pinned buffer — no staging), overlapping
+        //     with this layer's GEMMs. routed-MoE ≈ max(upload, compute) instead of their sum.
+        // When NOT pinned this is byte-identical to the old single-buffer synchronous path
+        // (slot stays 0, no prefetch ever issued; UploadLayerRaw straight from the mmap).
+        bool layerGate = IsRawOffloadQuant(gateDt);
+        bool layerUp   = IsRawOffloadQuant(upDt);
+        bool layerDown = IsRawOffloadQuant(downDt);
+        long swu0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
+        // Per-layer pinned-buffer bases (null for a Float32 layer or when not pinned → mmap path).
+        byte* pinGate = _goPinnedGate != null ? _goPinnedGate[layer] : null;
+        byte* pinUp   = _goPinnedUp   != null ? _goPinnedUp[layer]   : null;
+        byte* pinDown = _goPinnedDown != null ? _goPinnedDown[layer] : null;
+        bool layerPinned = _goHostPinned && pinGate != null && pinUp != null && pinDown != null;
+
+        bool consumedPrefetch = _goHostPinned && _goPrefetchValid && _goPrefetchedLayer == layer;
+        if (consumedPrefetch)
+        {
+            // THIS layer's weights are already (being) DMA'd into _goPrefetchSlot. Fence the
+            // compute stream behind those copies, release the handles, and read from that slot.
+            if (layerGate) _gpu.WaitForUpload(_goPrefetchGateH);
+            if (layerUp)   _gpu.WaitForUpload(_goPrefetchUpH);
+            if (layerDown) _gpu.WaitForUpload(_goPrefetchDownH);
+            _gpu.ReleaseUploadHandle(_goPrefetchGateH);
+            _gpu.ReleaseUploadHandle(_goPrefetchUpH);
+            _gpu.ReleaseUploadHandle(_goPrefetchDownH);
+            _goPrefetchValid = false;
+            _goCurSlot = _goPrefetchSlot;
+        }
+        else if (layerPinned)
+        {
+            // First MoE layer of the chunk (or any non-prefetched raw-quant layer): DMA straight
+            // from the pinned buffer into the current slot, then FENCE the compute stream behind
+            // the copies (not a host block) so the GEMMs below (on _stream) read complete weights
+            // while the CPU keeps launching kernels — mirrors the consumedPrefetch branch (Gemini
+            // review). Direct (no staging) + full bandwidth. Waits stay unconditional to match the
+            // three unconditional DMAs just issued.
+            var gh = _gpu.UploadRawIntoAsyncDirect(_gpuLayerGate[_goCurSlot]!, pinGate, (long)numExperts * gateRawBytes);
+            var uh = _gpu.UploadRawIntoAsyncDirect(_gpuLayerUp[_goCurSlot]!,   pinUp,   (long)numExperts * upRawBytes);
+            var dh = _gpu.UploadRawIntoAsyncDirect(_gpuLayerDown[_goCurSlot]!, pinDown, (long)numExperts * downRawBytes);
+            _gpu.WaitForUpload(gh); _gpu.WaitForUpload(uh); _gpu.WaitForUpload(dh);
+            _gpu.ReleaseUploadHandle(gh); _gpu.ReleaseUploadHandle(uh); _gpu.ReleaseUploadHandle(dh);
+        }
+        else
+        {
+            // Not pinned (or Float32 layer): synchronous whole-layer upload straight from the
+            // mmap into the current slot — the original op-offload path (byte-identical fallback).
+            if (layerGate) UploadLayerRaw(_gpuLayerGate[_goCurSlot]!, gateP, (long)numExperts * gateRawBytes);
+            if (layerUp)   UploadLayerRaw(_gpuLayerUp[_goCurSlot]!,   upP,   (long)numExperts * upRawBytes);
+            if (layerDown) UploadLayerRaw(_gpuLayerDown[_goCurSlot]!, downP, (long)numExperts * downRawBytes);
+        }
+        // Tag the live-slot layer buffers so ResolveExpertWeight/GpuMatMulBatched dispatch on
+        // the raw dtype (re-tag every call — the slot's handle persists but the tag could have
+        // been dropped by a prior FreeExpertWeightView on the recycled handle space).
+        Tensor liveGate = _gpuLayerGate[_goCurSlot]!;
+        Tensor liveUp   = _gpuLayerUp[_goCurSlot]!;
+        Tensor liveDown = _gpuLayerDown[_goCurSlot]!;
+        if (layerGate) _gpuWeightDTypes[liveGate.Handle] = gateDt;
+        if (layerUp)   _gpuWeightDTypes[liveUp.Handle]   = upDt;
+        if (layerDown) _gpuWeightDTypes[liveDown.Handle] = downDt;
+
+        // ── Prefetch layer+1 into the OTHER slot (direct DMA from the pinned buffer). ──
+        // Only when pinned and a next MoE layer exists. The prefetch targets the opposite slot
+        // so this layer's reads (from _goCurSlot) never see a half-written buffer. A layer is
+        // prefetched only if all three of its weights are raw-quant AND were copied into the
+        // pinned buffer (Float32 takes the host-dequant fallback, which the next call does
+        // synchronously) — so the consume branch above can adopt the slot wholesale.
+        if (_goHostPinned && layer + 1 < _hp.NumLayers)
+        {
+            int nl = layer + 1;
+            byte* npGate = _goPinnedGate![nl], npUp = _goPinnedUp![nl], npDown = _goPinnedDown![nl];
+            DType ngDt = _cpuFfnGateExps![nl].DType, nuDt = _cpuFfnUpExps![nl].DType, ndDt = _cpuFfnDownExps![nl].DType;
+            if (npGate != null && npUp != null && npDown != null
+                && IsRawOffloadQuant(ngDt) && IsRawOffloadQuant(nuDt) && IsRawOffloadQuant(ndDt))
+            {
+                int nbprG = (embDim    / DTypeInfo.BlockSize(ngDt)) * DTypeInfo.BytesPerBlock(ngDt);
+                int nbprU = (embDim    / DTypeInfo.BlockSize(nuDt)) * DTypeInfo.BytesPerBlock(nuDt);
+                int nbprD = (expertDim / DTypeInfo.BlockSize(ndDt)) * DTypeInfo.BytesPerBlock(ndDt);
+                long ngBytes = (long)numExperts * expertDim * nbprG;
+                long nuBytes = (long)numExperts * expertDim * nbprU;
+                long ndBytes = (long)numExperts * embDim    * nbprD;
+                int otherSlot = _goCurSlot ^ 1;
+                _goPrefetchGateH = _gpu.UploadRawIntoAsyncDirect(_gpuLayerGate[otherSlot]!, npGate, ngBytes);
+                _goPrefetchUpH   = _gpu.UploadRawIntoAsyncDirect(_gpuLayerUp[otherSlot]!,   npUp,   nuBytes);
+                _goPrefetchDownH = _gpu.UploadRawIntoAsyncDirect(_gpuLayerDown[otherSlot]!, npDown, ndBytes);
+                _goPrefetchSlot = otherSlot;
+                _goPrefetchedLayer = nl;
+                _goPrefetchValid = true;
+            }
+            else
+            {
+                // Next layer has a Float32 weight → no prefetch; it'll upload synchronously.
+                _goPrefetchedLayer = -1;
+            }
+        }
+        if (_prefillProfile) _profGoUpload += System.Diagnostics.Stopwatch.GetTimestamp() - swu0;
+
+        for (int u = 0; u < numUsed; u++)
+        {
+            int e = used[u];
+            int pStart = expStart[e], pEnd = expStart[e + 1];
+            int cnt = pEnd - pStart;
+            if (cnt == 0) continue;
+
+            // a. Resolve each weight matrix for this expert. Raw-quant dtypes are a non-owning
+            //    ViewRawBytes into the whole-layer buffer uploaded once above (no per-expert
+            //    transfer). Float32 still host-dequant→F32 into the per-expert _gpuOffW* buffer
+            //    (UploadOffloadWeight). The matrix tensor passed to the GEMM is the same in both
+            //    cases; views additionally carry an entry in _gpuWeightDTypes so
+            //    GpuMatMulBatched dispatches on the raw dtype.
+            long sd0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            Tensor gateW = ResolveExpertWeight(layerGate, liveGate, _gpuOffWGate!,
+                gateP, e, gateRawBytes, gateDt, expertDim, embDim, ref sd0);
+            Tensor upW = ResolveExpertWeight(layerUp, liveUp, _gpuOffWUp!,
+                upP, e, upRawBytes, upDt, expertDim, embDim, ref sd0);
+            Tensor downW = ResolveExpertWeight(layerDown, liveDown, _gpuOffWDown!,
+                downP, e, downRawBytes, downDt, embDim, expertDim, ref sd0);
+            if (_prefillProfile) _profGoUpload += System.Diagnostics.Stopwatch.GetTimestamp() - sd0;
+
+            // b. GEMM-N gate/up over this expert's CONTIGUOUS CSR slice [pStart..pEnd) of the
+            //    pre-gathered norms → SiLuMul → GEMM-N down, writing each output CSR-ordered
+            //    into its [pStart..pEnd) slice. No per-row gather/scatter inside the loop.
+            long sm0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            var normV = _gpu.View(_gpuOffGather!,  (long)pStart * embDim,    (long)cnt * embDim);
+            var gateV = _gpu.View(_gpuOffGate!,    (long)pStart * expertDim, (long)cnt * expertDim);
+            var upV   = _gpu.View(_gpuOffUp!,      (long)pStart * expertDim, (long)cnt * expertDim);
+            var downV = _gpu.View(_gpuOffDownCsr!, (long)pStart * embDim,    (long)cnt * embDim);
+            try
+            {
+                GpuMatMulBatched(gateV, gateW, normV, cnt);
+                GpuMatMulBatched(upV,   upW,   normV, cnt);
+                _gpu.SiLuMul(gateV, upV);
+                GpuMatMulBatched(downV, downW, gateV, cnt);
+            }
+            finally
+            {
+                _gpu.Free(normV); _gpu.Free(gateV); _gpu.Free(upV); _gpu.Free(downV);
+                // Per-expert weight views are non-owning (Free drops only the handle/devptr
+                // registration; the layer buffer keeps the memory) — but also drop the
+                // engine-side dtype tag so the recycled handle doesn't leak an entry.
+                FreeExpertWeightView(layerGate, gateW);
+                FreeExpertWeightView(layerUp,   upW);
+                FreeExpertWeightView(layerDown, downW);
+            }
+            if (_prefillProfile) _profGoGemm += System.Diagnostics.Stopwatch.GetTimestamp() - sm0;
+        }
+        _gpu.Free(normAll);   // drop the norm view (non-owning; underlying buffer kept)
+
+        // ONE scatter: the [totalSel × embDim] CSR down output → the per-(token,slot) partials
+        // (gathered position p → slot expTokI[p]*na+expTokK[p]). Each slot is written exactly
+        // once (the CSR covers every (token,slot) selection once — no atomics needed). Folded
+        // into the download+scatter bucket below.
+        long sx0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        _gpu.ScatterRows(downPartialDev, _gpuOffDownCsr!, scatterIdxV, (int)totalSel, embDim);
+        _gpu.Free(scatterIdxV);
+        if (_prefillProfile) _profGoDownScatter += System.Diagnostics.Stopwatch.GetTimestamp() - sx0;
+
+        // Weighted reduce ON THE GPU: routedAll[i,r] = Σ_k weights[i,k]·downPartial[(i*na+k),r].
+        // Reuse BatchedGpuMoeFfn's Phase-3 reduce (CudaHybridGdnForwardPass.cs:5244-5245):
+        // upload the host top-k weights once, then ONE MoeWeightedReduce launch. That kernel
+        // also adds its `shared` operand (acc += shared[i*embDim+e]); the offload path has no
+        // shared term here (the downstream combine adds shared*scale separately), so we zero
+        // _gpuOffRouted first → acc += 0, leaving the pure routed weighted sum. The result is
+        // downloaded ONCE into _bRoutedAll — the single D2H replacing the old per-expert ones.
+        long sr0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        var routedDev = _gpu.View(_gpuOffRouted!, 0, (long)N * embDim);
+        var weightsDev = _gpu.View(_gpuOffWeightsDev!, 0, (long)N * na);
+        try
+        {
+            _gpu.ClearRegion(routedDev, 0, N * embDim);
+            _gpu.UploadInto(weightsDev, new ReadOnlySpan<float>(_bWeights!, (int)((long)N * na)));
+            _gpu.MoeWeightedReduce(downPartialDev, weightsDev, routedDev, N, na, embDim);
+            // Single final download of the [N × embDim] routed result into the pinned staging
+            // buffer, then one bulk copy into _bRoutedAll (the downstream combine's input).
+            _gpu.Download(routedDev, (nint)_hGpuOffDownDl, N * embDim);
+        }
+        finally { _gpu.Free(routedDev); _gpu.Free(weightsDev); }
+        Buffer.MemoryCopy(_hGpuOffDownDl, _bRoutedAll!,
+                          (long)N * embDim * sizeof(float), (long)N * embDim * sizeof(float));
+        if (_prefillProfile) _profGoDownScatter += System.Diagnostics.Stopwatch.GetTimestamp() - sr0;
+    }
+
+    /// <summary>
+    /// Resolves the GPU weight matrix for expert <paramref name="e"/> on the op-offload path.
+    /// When <paramref name="isRawLayer"/> (raw-quant dtype whose whole layer was uploaded once
+    /// into <paramref name="layerBuf"/>), returns a non-owning <see cref="CudaBackend.ViewRawBytes"/>
+    /// into that layer buffer at this expert's byte offset (<c>e·rawBytes</c>) — no per-expert
+    /// transfer — and tags the view handle in <see cref="_gpuWeightDTypes"/> so
+    /// <see cref="GpuMatMulBatched"/> dispatches on <paramref name="dt"/>. Otherwise (Float32)
+    /// host-dequantizes this expert into the per-expert <paramref name="perExpertBuf"/> via
+    /// <see cref="UploadOffloadWeight"/> and returns that buffer, tagged with the effective dtype.
+    /// </summary>
+    private Tensor ResolveExpertWeight(bool isRawLayer, Tensor layerBuf, Tensor perExpertBuf,
+                                       byte* basePtr, int e, long rawBytes, DType dt,
+                                       int rows, int cols, ref long dequantTimer)
+    {
+        if (isRawLayer)
+        {
+            // Non-owning byte view into the whole-layer buffer at this expert's slot.
+            var view = _gpu.ViewRawBytes(layerBuf, (long)e * rawBytes, rawBytes,
+                                         TensorShape.D2(rows, cols), dt);
+            // ViewRawBytes tags the backend-side _tensorDTypes, but GpuMatMulBatched reads the
+            // engine-side _gpuWeightDTypes — tag the view handle there explicitly.
+            _gpuWeightDTypes[view.Handle] = dt;
+            return view;
+        }
+        // Float32: host-dequant → F32 into the reused per-expert buffer (over-sized to F32 max).
+        DType eff = UploadOffloadWeight(perExpertBuf, basePtr + (long)e * rawBytes,
+                                        rawBytes, dt, rows, cols, ref dequantTimer);
+        _gpuWeightDTypes[perExpertBuf.Handle] = eff;
+        return perExpertBuf;
+    }
+
+    /// <summary>
+    /// Releases the per-expert weight matrix returned by <see cref="ResolveExpertWeight"/>.
+    /// For the raw-quant view path the tensor is a non-owning <see cref="CudaBackend.ViewRawBytes"/>:
+    /// drop its engine-side dtype tag and its backend handle registration (the layer buffer keeps
+    /// the device memory). The Float32 per-expert buffer is reused across experts, so nothing
+    /// to free there (its dtype tag is overwritten on the next expert / cleared on scratch free).
+    /// </summary>
+    private void FreeExpertWeightView(bool isRawLayer, Tensor weight)
+    {
+        if (!isRawLayer) return;
+        _gpuWeightDTypes.Remove(weight.Handle);
+        _gpu.Free(weight);   // non-owning view: drops handle registration only
+    }
+
+    /// <summary>
+    /// Uploads one expert weight matrix into a reused GPU buffer for the offload path and
+    /// returns the dtype the GPU GEMM should dispatch on. Raw-quant dtypes (Q4_K/Q5_K/Q6_K/
+    /// Q8_0) upload the raw quantized bytes unchanged and return the same dtype. Q3_K and
+    /// Float32 are dequantized on the host into <see cref="_hGpuOffDeq"/> (Q3_K has no MMQ/
+    /// GEMM-N kernel) and uploaded as F32, returning Float32. <paramref name="rows"/>/
+    /// <paramref name="cols"/> are the matrix dimensions (gate/up: expertDim×embDim;
+    /// down: embDim×expertDim) used to size the F32 dequant.
+    /// </summary>
+    private DType UploadOffloadWeight(Tensor dst, byte* src, long rawBytes, DType dt,
+                                      int rows, int cols, ref long dequantTimer)
+    {
+        if (dt is DType.Q3_K or DType.Q4_K or DType.Q5_K or DType.Q6_K or DType.Q8_0)
+        {
+            // Q3_K now has a raw GPU GEMM-N kernel (#100) — upload the compact quantized
+            // bytes and dequant in-kernel, eliminating the host F32 dequant (was ~79% of
+            // the offload wall). The buffer is over-allocated to F32-max size; UploadRawInto
+            // is byte-based and tolerates the over-sized dst.
+            _gpu.UploadRawInto(dst, new ReadOnlySpan<byte>(src, (int)rawBytes));
+            return dt;
+        }
+        // Float32: dequantize the whole matrix to F32 on the host, then upload F32.
+        long count = (long)rows * cols;
+        long dq0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        Dequantize.ToFloat32(new ReadOnlySpan<byte>(src, (int)rawBytes),
+                             new Span<float>(_hGpuOffDeq, (int)count), dt, count);
+        if (_prefillProfile)
+        {
+            long dq1 = System.Diagnostics.Stopwatch.GetTimestamp();
+            _profGoDequant += dq1 - dq0;
+            dequantTimer += dq1 - dq0;   // exclude dequant from the upload bucket
+        }
+        // The weight buffer is over-allocated to the F32-max size; view it to exactly
+        // count elements for the F32 upload (UploadInto requires src.Length == dst.ElementCount).
+        // The subsequent GpuMatMulBatched derives shape from the input/output element counts,
+        // not the matrix buffer's, so the over-sized backing buffer is fine.
+        var dstV = _gpu.View(dst, 0, count);
+        try { _gpu.UploadInto(dstV, new ReadOnlySpan<float>(_hGpuOffDeq, (int)count)); }
+        finally { _gpu.Free(dstV); }
+        return DType.Float32;
+    }
+
+    /// <summary>
+    /// Grow-only allocation of the GPU op-offload routed-prefill scratch (sized for
+    /// <paramref name="N"/> tokens). The GEMM gather buffers are sized to N·na rows
+    /// (the worst case when every selection routes to one expert); the transient weight
+    /// buffers are sized to the max raw-quant bytes OR the F32 dequant size (whichever is
+    /// larger — F32 is the worst case for every quant) over gate/up and down. Frees the
+    /// prior allocation on growth. Only reached on the opt-in CPU-MoE GPU-offload path.
+    /// </summary>
+    private void EnsureGpuOffloadScratch(int N)
+    {
+        int embDim = _embDim;
+        int expertDim = _expertDim;
+        int na = _numActiveExperts;
+
+        // ── N-independent static scratch: allocate ONCE and keep across regrows ──
+        // The ~14 GB pinned weight copy + the whole-layer GPU weight buffers + the F32 dequant
+        // staging don't depend on the batch size N, so a later token-count growth must NOT free
+        // and re-copy them — re-building the pinned buffer is multi-second and fragmentation-prone
+        // (Gemini review). Only the per-N gather/scatter/GEMM scratch below re-grows.
+        if (!_goStaticAllocated)
+        {
+            // Transient weight buffers: an F32 dequant of a [expertDim×embDim] (or [embDim×
+            // expertDim]) matrix is expertDim·embDim·4 bytes, which dominates any raw-quant
+            // byte count for the same matrix — size all three to that and reuse for raw too.
+            long wBytes = (long)expertDim * embDim * sizeof(float);
+            _gpuOffWGate = _gpu.AllocateRawBytes(wBytes, DType.Float32);
+            _gpuOffWUp   = _gpu.AllocateRawBytes(wBytes, DType.Float32);
+            _gpuOffWDown = _gpu.AllocateRawBytes(wBytes, DType.Float32);
+            _hGpuOffDeq  = (float*)NativeMemory.Alloc((nuint)((long)expertDim * embDim) * sizeof(float));
+
+            // Whole-layer raw-quant weight buffers (one big UploadRawInto per layer, then
+            // per-expert ViewRawBytes). Sized to the MAX raw layer bytes over every MoE layer so
+            // a single allocation fits each layer's dtype (e.g. mixed Q4_K / Q5_K / Q6_K K_M).
+            // gate/up rows = expertDim, cols = embDim; down rows = embDim, cols = expertDim. The
+            // per-row byte count depends on the column count's block layout, so it differs per
+            // dtype — take the max raw bytes-per-row over all layers for each of the three.
+            long maxLayerGateBytes = 0, maxLayerUpBytes = 0, maxLayerDownBytes = 0;
+            for (int l = 0; l < _hp.NumLayers; l++)
+            {
+                DType gDt = _cpuFfnGateExps![l].DType;
+                DType uDt = _cpuFfnUpExps![l].DType;
+                DType dDt = _cpuFfnDownExps![l].DType;
+                long bg = (long)(embDim    / DTypeInfo.BlockSize(gDt)) * DTypeInfo.BytesPerBlock(gDt);
+                long bu = (long)(embDim    / DTypeInfo.BlockSize(uDt)) * DTypeInfo.BytesPerBlock(uDt);
+                long bd = (long)(expertDim / DTypeInfo.BlockSize(dDt)) * DTypeInfo.BytesPerBlock(dDt);
+                maxLayerGateBytes = Math.Max(maxLayerGateBytes, (long)_numExperts * expertDim * bg);
+                maxLayerUpBytes   = Math.Max(maxLayerUpBytes,   (long)_numExperts * expertDim * bu);
+                maxLayerDownBytes = Math.Max(maxLayerDownBytes, (long)_numExperts * embDim    * bd);
+            }
+            // Two ping-pong slots so the next layer can DMA into the idle slot while this layer's
+            // GEMMs read the live one (double-buffer; ~330→660 MB). Slot 0 doubles as the legacy
+            // single buffer used by the synchronous path / first MoE layer of every chunk.
+            for (int s = 0; s < 2; s++)
+            {
+                _gpuLayerGate[s] = _gpu.AllocateRawBytes(maxLayerGateBytes, DType.Float32);
+                _gpuLayerUp[s]   = _gpu.AllocateRawBytes(maxLayerUpBytes,   DType.Float32);
+                _gpuLayerDown[s] = _gpu.AllocateRawBytes(maxLayerDownBytes, DType.Float32);
+            }
+
+            // Copy the expert weights ONCE into a truly-pinned cudaMallocHost buffer so
+            // UploadRawIntoAsyncDirect DMAs from page-locked memory at full PCIe bandwidth (~26 GB/s
+            // vs ~13 GB/s for a cudaHostRegister'd file-backed mmap) and the prefetch overlaps
+            // compute. If the (large, ~15 GB) alloc fails we leave _goHostPinned=false and the path
+            // runs fully synchronous (today's UploadRawInto from mmap), with zero regression.
+            EnsureExpertWeightsPinned();
+            _goStaticAllocated = true;
+        }
+
+        if (N <= _goCap) return;
+        FreeGpuOffloadScratch(freeStatic: false);   // free only the per-N scratch; keep the static buffers above
+
+        long maxRows = (long)N * na;   // worst-case gathered token rows for a single expert
+        Tensor A(long elems) => _gpu.Allocate(TensorShape.D1(elems));
+        // maxRows == N·na == the worst-case totalSel, so a single CSR-ordered gather/down
+        // buffer of maxRows rows holds every (token,slot) selection.
+        _gpuOffNorm    = A((long)N * embDim);
+        _gpuOffGather  = A(maxRows * embDim);     // [totalSel × embDim] CSR-ordered gathered norms
+        _gpuOffGate    = A(maxRows * expertDim);  // [totalSel × expertDim]
+        _gpuOffUp      = A(maxRows * expertDim);  // [totalSel × expertDim]
+        _gpuOffDownCsr = A(maxRows * embDim);     // [totalSel × embDim] CSR-ordered down output
+
+        // GPU-side scatter target + weighted-reduce output + device top-k weights, mirroring
+        // BatchedGpuMoeFfn's _gpuBfMoeDownPartial / hiddenAll / _gpuBfMoeWeightsDev. The
+        // down partials are per-(token,slot): N·na rows of embDim (= maxRows·embDim).
+        _gpuOffDownPartial = A(maxRows * embDim);   // [N × na × embDim]
+        _gpuOffRouted      = A((long)N * embDim);    // [N × embDim] reduce output (downloaded once)
+        _gpuOffWeightsDev  = A(maxRows);             // [N × na] top-k weights (device)
+
+        // Int32 CSR gather/scatter index buffers (one launch each fills the whole gathered /
+        // scattered buffer). Sized to N·na (== maxRows) selections; uploaded raw per layer call.
+        _gpuOffGatherIdx  = _gpu.AllocateRawBytes(maxRows * sizeof(int), DType.Int32, exact: true);
+        _gpuOffScatterIdx = _gpu.AllocateRawBytes(maxRows * sizeof(int), DType.Int32, exact: true);
+        _hGpuOffScatterIdx = (int*)NativeMemory.Alloc((nuint)maxRows * sizeof(int));
+
+        nint dl = CudaBackend.AllocatePinnedHost((nuint)(maxRows * embDim) * sizeof(float));
+        if (dl == nint.Zero)
+            throw new InvalidOperationException($"AllocatePinnedHost({maxRows * embDim} floats) failed for GPU-offload download scratch.");
+        _hGpuOffDownDl = (float*)dl;
+
+        _goCap = N;
+    }
+
+    /// <summary>
+    /// One-time allocation of a single big pinned (<c>cudaMallocHost</c>) host buffer holding a
+    /// contiguous copy of every MoE layer's gate/up/down expert weights, copied straight from
+    /// the mmap <c>DataPtr</c>s (pages already pre-faulted by the loader). The pinned buffer is
+    /// the DMA source for <see cref="CudaBackend.UploadRawIntoAsyncDirect"/>, so the H2D copy
+    /// runs at full PCIe bandwidth and overlaps compute. Sets <see cref="_goHostPinned"/> on
+    /// success; on ANY failure (alloc returns Zero — typically ENOMEM for the ~15 GB) leaves it
+    /// false so the path stays on the synchronous mmap upload (no regression). Only raw-quant
+    /// layers are copied/DMA'd — Float32 layers host-dequant from the mmap as before, so a
+    /// Float32 layer leaves its per-layer pinned base null and falls back per call. Guarded by
+    /// <see cref="_goPinAttempted"/> so it runs at most once per scratch sizing. The mmap
+    /// (<see cref="_cpuFfnGateExps"/> etc.) is never touched — the CPU-MoE path keeps using it.
+    /// </summary>
+    private void EnsureExpertWeightsPinned()
+    {
+        if (_goPinAttempted) return;
+        _goPinAttempted = true;
+
+        int embDim = _embDim;
+        int expertDim = _expertDim;
+        int numExperts = _numExperts;
+        int L = _hp.NumLayers;
+
+        // Whole-layer raw byte length for one ffn_*_exps tensor (all experts back to back) — the
+        // count we both allocate and copy. Zero (skip, mmap fallback) for a Float32 weight or a
+        // missing tensor. "cols" is the per-row dim (embDim for gate/up, expertDim for down);
+        // "rows" the outer count (expertDim for gate/up, embDim for down).
+        long PinnedBytes(byte* src, DType dt, int rows, int cols)
+        {
+            if (src == null || !IsRawOffloadQuant(dt)) return 0;
+            long bpr = (long)(cols / DTypeInfo.BlockSize(dt)) * DTypeInfo.BytesPerBlock(dt);
+            return (long)numExperts * rows * bpr;
+        }
+
+        // 1. Sum the total bytes to allocate (raw-quant, present layers only). Uses the SAME
+        //    predicate as the copy below so the buffer size and the copied bytes stay in lockstep.
+        long total = 0;
+        for (int l = 0; l < L; l++)
+        {
+            total += PinnedBytes(_cpuFfnGateExps![l].DataPtr, _cpuFfnGateExps![l].DType, expertDim, embDim);
+            total += PinnedBytes(_cpuFfnUpExps![l].DataPtr,   _cpuFfnUpExps![l].DType,   expertDim, embDim);
+            total += PinnedBytes(_cpuFfnDownExps![l].DataPtr, _cpuFfnDownExps![l].DType, embDim,    expertDim);
+        }
+        if (total <= 0) { _goHostPinned = false; return; }   // nothing raw-quant → mmap path
+
+        // 2. Allocate the big pinned buffer. On failure (ENOMEM) fall back to the mmap path.
+        nint buf = CudaBackend.AllocatePinnedHost((nuint)total);
+        if (buf == nint.Zero)
+        {
+            Console.Error.WriteLine($"[moe-offload] cudaMallocHost({total / (1024.0 * 1024.0):F0} MiB) for pinned expert weights FAILED — falling back to synchronous mmap upload.");
+            _goHostPinned = false;
+            return;
+        }
+
+        // 3. Copy each raw-quant layer's gate/up/down tensor into the buffer, contiguously, and
+        //    record the per-layer base pointers the DMA source will use. Float32 layers leave a
+        //    null base (per-layer sync host-dequant fallback in BatchedRoutedExpertsGpuOffload).
+        _goPinnedGate = new byte*[L];
+        _goPinnedUp   = new byte*[L];
+        _goPinnedDown = new byte*[L];
+        byte* dst = (byte*)buf;
+        long off = 0;
+        void CopyOne(byte* src, DType dt, int rows, int cols, ref byte* slot)
+        {
+            long bytes = PinnedBytes(src, dt, rows, cols);
+            if (bytes == 0) { slot = null; return; }   // Float32 / missing → mmap fallback
+            byte* d = dst + off;
+            Buffer.MemoryCopy(src, d, bytes, bytes);
+            slot = d;
+            off += bytes;
+        }
+        for (int l = 0; l < L; l++)
+        {
+            CopyOne(_cpuFfnGateExps![l].DataPtr, _cpuFfnGateExps![l].DType, expertDim, embDim, ref _goPinnedGate[l]);
+            CopyOne(_cpuFfnUpExps![l].DataPtr,   _cpuFfnUpExps![l].DType,   expertDim, embDim, ref _goPinnedUp[l]);
+            CopyOne(_cpuFfnDownExps![l].DataPtr, _cpuFfnDownExps![l].DType, embDim,    expertDim, ref _goPinnedDown[l]);
+        }
+
+        _goPinnedBuf = buf;
+        _goHostPinned = true;
+        Console.Error.WriteLine($"[moe-offload] pinned expert-weight buffer ready: {total / (1024.0 * 1024.0 * 1024.0):F2} GiB (cudaMallocHost) — DMA source for op-offload prefill.");
+    }
+
+    /// <summary>True when the offload weight dtype uploads raw quantized bytes unchanged
+    /// (Q3_K/Q4_K/Q5_K/Q6_K/Q8_0) — eligible for the whole-layer batched upload + per-expert
+    /// view. Q3_K has an in-kernel-dequant GEMM-N (#100) so it too uploads compact raw bytes
+    /// and dispatches a raw kernel. Only Float32 host-dequantizes and takes the per-expert
+    /// fallback (mirrors the raw-vs-F32 split inside <see cref="UploadOffloadWeight"/>).</summary>
+    private static bool IsRawOffloadQuant(DType dt) =>
+        dt is DType.Q3_K or DType.Q4_K or DType.Q5_K or DType.Q6_K or DType.Q8_0;
+
+    /// <summary>
+    /// Uploads <paramref name="byteLength"/> raw bytes from host <paramref name="src"/> into the
+    /// front of <paramref name="dst"/>. <see cref="CudaBackend.UploadRawInto"/> takes a
+    /// <c>ReadOnlySpan&lt;byte&gt;</c> (int length), so a layer-weight tensor larger than 2 GiB is
+    /// uploaded in ≤int.MaxValue chunks via byte-addressed destination views (none of the current
+    /// MoE models reach this, but the chunk loop keeps the span length from silently truncating).
+    /// </summary>
+    private void UploadLayerRaw(Tensor dst, byte* src, long byteLength)
+    {
+        long off = 0;
+        while (off < byteLength)
+        {
+            int chunk = (int)Math.Min(byteLength - off, int.MaxValue);
+            if (off == 0 && byteLength <= int.MaxValue)
+            {
+                _gpu.UploadRawInto(dst, new ReadOnlySpan<byte>(src, chunk));
+                return;
+            }
+            var dstV = _gpu.ViewRawBytes(dst, off, chunk, TensorShape.D1(chunk), DType.Int8);
+            try { _gpu.UploadRawInto(dstV, new ReadOnlySpan<byte>(src + off, chunk)); }
+            finally { _gpu.Free(dstV); }
+            off += chunk;
+        }
+    }
+
+    /// <param name="freeStatic">
+    /// <c>false</c> (the per-N regrow path) frees ONLY the batch-size-dependent gather/scatter/GEMM
+    /// scratch, keeping the N-independent static buffers — the ~14 GB pinned weight copy, the
+    /// whole-layer GPU weight buffers, the F32 dequant staging — so a token-count growth doesn't
+    /// re-copy the multi-second pinned buffer (Gemini review). <c>true</c> (full teardown / Dispose)
+    /// additionally frees those static buffers and resets the pin + static-alloc state.
+    /// </param>
+    private void FreeGpuOffloadScratch(bool freeStatic = true)
+    {
+        // Drain any in-flight prefetch DMA before freeing the buffers it targets (else the
+        // backend would free a device buffer with a live H2D copy still draining into it).
+        DrainPrefetch();
+
+        void F(ref Tensor? t) { if (t is { } v) { _gpu.Free(v); t = null; } }
+        // Drop the engine-side dtype tag before freeing so the handle dict doesn't leak the
+        // layer-buffer entry across a scratch regrow (the handle is recycled by the backend).
+        void FW(ref Tensor? t) { if (t is { } v) { _gpuWeightDTypes.Remove(v.Handle); _gpu.Free(v); t = null; } }
+
+        // ── Per-N dynamic scratch: always freed (re-grown by EnsureGpuOffloadScratch) ──
+        F(ref _gpuOffNorm); F(ref _gpuOffGather); F(ref _gpuOffGate); F(ref _gpuOffUp); F(ref _gpuOffDownCsr);
+        F(ref _gpuOffDownPartial); F(ref _gpuOffRouted); F(ref _gpuOffWeightsDev);
+        F(ref _gpuOffGatherIdx); F(ref _gpuOffScatterIdx);
+        if (_hGpuOffScatterIdx != null) { NativeMemory.Free(_hGpuOffScatterIdx); _hGpuOffScatterIdx = null; }
+        if (_hGpuOffDownDl != null) { CudaBackend.FreePinnedHost((nint)_hGpuOffDownDl); _hGpuOffDownDl = null; }
+        _goCurSlot = 0;
+        _goPrefetchedLayer = -1;
+        _goCap = 0;
+
+        if (!freeStatic) return;
+
+        // ── N-independent static buffers + the ~14 GB pinned weight copy: only on full teardown ──
+        // (DrainPrefetch above ensured no DMA is still reading the slot buffers / pinned source.)
+        F(ref _gpuOffWGate); F(ref _gpuOffWUp); F(ref _gpuOffWDown);
+        if (_hGpuOffDeq != null) { NativeMemory.Free(_hGpuOffDeq); _hGpuOffDeq = null; }
+        for (int s = 0; s < 2; s++) { FW(ref _gpuLayerGate[s]); FW(ref _gpuLayerUp[s]); FW(ref _gpuLayerDown[s]); }
+        if (_goPinnedBuf != nint.Zero) { CudaBackend.FreePinnedHost(_goPinnedBuf); _goPinnedBuf = nint.Zero; }
+        _goPinnedGate = null; _goPinnedUp = null; _goPinnedDown = null;
+        _goHostPinned = false;
+        _goPinAttempted = false;
+        _goStaticAllocated = false;
+    }
+
+    /// <summary>
+    /// Wait for any in-flight prefetch DMA to complete and release its handles. Idempotent —
+    /// a no-op when no prefetch is outstanding. Called at chunk start (so a stale prefetch
+    /// never bleeds across chunks) and before freeing the scratch buffers it targets.
+    /// </summary>
+    private void DrainPrefetch()
+    {
+        if (!_goPrefetchValid) return;
+        // HOST-block until the DMAs have actually drained — DrainPrefetch precedes freeing /
+        // regrowing the target buffers, so an async cross-stream fence (WaitForUpload) is not
+        // enough; the copy must be complete from the host's perspective before we release them.
+        _gpu.WaitForUploadHost(_goPrefetchGateH);
+        _gpu.WaitForUploadHost(_goPrefetchUpH);
+        _gpu.WaitForUploadHost(_goPrefetchDownH);
+        _gpu.ReleaseUploadHandle(_goPrefetchGateH);
+        _gpu.ReleaseUploadHandle(_goPrefetchUpH);
+        _gpu.ReleaseUploadHandle(_goPrefetchDownH);
+        _goPrefetchValid = false;
+        _goPrefetchedLayer = -1;
     }
 
     /// <summary>
@@ -5136,9 +5938,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // BatchForward2 safety: each CpuMoeFfnCore call writes its own
         // _cpuNormInQ8K from its own cpuNormIn, so t1 and t2 do not collide.
         bool useQ8KGate = (_q3kQ8KEnabled  && gateDt == DType.Q3_K)
-                       || (_q8_0Q8KEnabled && gateDt == DType.Q8_0);
+                       || (_q8_0Q8KEnabled && gateDt == DType.Q8_0)
+                       || (_q4kQ8KEnabled  && gateDt == DType.Q4_K);
         bool useQ8KUp   = (_q3kQ8KEnabled  && upDt   == DType.Q3_K)
-                       || (_q8_0Q8KEnabled && upDt   == DType.Q8_0);
+                       || (_q8_0Q8KEnabled && upDt   == DType.Q8_0)
+                       || (_q4kQ8KEnabled  && upDt   == DType.Q4_K);
         byte* normInQ8K = _cpuNormInQ8K;
         if (useQ8KGate || useQ8KUp)
             SimdKernels.QuantizeRowToQ8KS(cpuNormIn, _embDim, normInQ8K);
@@ -5169,7 +5973,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // so we quantise numActive slices into a stacked Q8_K buffer once before
         // the embDim-row Parallel.For, and the inner loop indexes by k * stride.
         bool useQ8KDown = (_q3kQ8KEnabled  && downDt == DType.Q3_K)
-                       || (_q8_0Q8KEnabled && downDt == DType.Q8_0);
+                       || (_q8_0Q8KEnabled && downDt == DType.Q8_0)
+                       || (_q4kQ8KEnabled  && downDt == DType.Q4_K);
         byte* gateAllQ8K = _cpuExpertGateAllQ8K;
         int   gateAllQ8KStride = _cpuExpertGateAllQ8KStride;
         if (useQ8KDown)
@@ -5213,13 +6018,26 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         SimdKernels.AddInPlace(cpuMoeOut, _cpuSharedOut, _embDim);
     }
 
-    // ParallelOptions for the routed-MoE Parallel.For sweeps. Matches the
-    // CPU core count exactly so workers don't oversubscribe the CPU with
-    // the (concurrently running) GPU shared-expert host launches.
+    // ParallelOptions for the routed-MoE Parallel.For sweeps. Defaults to the
+    // logical processor count, but SHARPI_MOE_THREADS overrides it: the int8
+    // dot sweeps are heavy on the per-core SIMD pipeline (especially the
+    // AVX-512 VNNI path, where two SMT siblings share one 512-bit unit), so
+    // pinning to the physical core count often beats oversubscribing all
+    // logical processors. It also caps oversubscription against the
+    // concurrently running GPU shared-expert host launches.
     private static readonly ParallelOptions s_moeParallelOpts = new()
     {
-        MaxDegreeOfParallelism = Environment.ProcessorCount
+        MaxDegreeOfParallelism = ResolveMoeThreads()
     };
+
+    private static int ResolveMoeThreads()
+    {
+        var v = Environment.GetEnvironmentVariable("SHARPI_MOE_THREADS");
+        if (int.TryParse(v, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out int n) && n > 0)
+            return n;
+        return Environment.ProcessorCount;
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static float DispatchDot(byte* row, float* input, int cols, DType dtype) =>
@@ -5267,6 +6085,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         switch (dtype)
         {
             case DType.Q3_K: SimdKernels.DotQ3K_Q8KS_2In(row, scr1, scr2, cols, out v1, out v2); break;
+            case DType.Q4_K: SimdKernels.DotQ4K_Q8KS_2In(row, scr1, scr2, cols, out v1, out v2); break;
             default:
                 v1 = DispatchDotQ8K(row, scr1, cols, dtype);
                 v2 = DispatchDotQ8K(row, scr2, cols, dtype);
@@ -5310,6 +6129,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             case DType.Q3_K:
                 SimdKernels.DotQ3K_Q8KS_4In(row, s0, s1, s2, s3, cols, out v0, out v1, out v2, out v3);
                 break;
+            case DType.Q4_K:
+                SimdKernels.DotQ4K_Q8KS_4In(row, s0, s1, s2, s3, cols, out v0, out v1, out v2, out v3);
+                break;
             default:
                 DispatchDotQ8K2In(row, s0, s1, cols, dtype, out v0, out v1);
                 DispatchDotQ8K2In(row, s2, s3, cols, dtype, out v2, out v3);
@@ -5320,14 +6142,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // Same idea as DispatchDot but the input is already prepacked to Q8_KS
     // (per-32-element scales — issue #107) once per CpuMoeFfnCore call (Phase A:
     // cpuNormIn; Phase C: each gateAll slice), so individual rows hit the
-    // int-domain dot kernels. Only Q3_K and Q8_0 are wired today — the caller
-    // guards entry via the corresponding useQ8K* flag, so other dtypes throw
-    // if they ever reach here.
+    // int-domain dot kernels. Only Q3_K, Q8_0, and Q4_K are wired today — the
+    // caller guards entry via the corresponding useQ8K* flag, so other dtypes
+    // throw if they ever reach here.
     private static float DispatchDotQ8K(byte* row, byte* q8kScratch, int cols, DType dtype) =>
         dtype switch
         {
             DType.Q3_K => SimdKernels.DotQ3K_Q8KS(row, q8kScratch, cols),
             DType.Q8_0 => SimdKernels.DotQ8_0_Q8KS(row, q8kScratch, cols),
+            DType.Q4_K => SimdKernels.DotQ4K_Q8KS(row, q8kScratch, cols),
             _ => throw new NotSupportedException($"Q8_KS-prepacked dispatch not implemented for dtype {dtype}"),
         };
 
@@ -5355,6 +6178,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         var v = Environment.GetEnvironmentVariable(envName);
         if (v == "1") return true;
         if (v == "0") return false;
+        // Also accept the natural string forms (true/false/True/False) so a direct-env user who
+        // types SHARPI_..=true isn't silently defaulted — the CLI/server plumbing writes "1"/"0",
+        // but humans set these by hand. Anything else still falls through to the auto-default.
+        if (bool.TryParse(v, out bool b)) return b;
         return autoDetect;
     }
 
@@ -5938,6 +6765,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (_bfExpStart    != null) NativeMemory.Free(_bfExpStart);
         if (_bfExpCursor   != null) NativeMemory.Free(_bfExpCursor);
         if (_bfUsedExperts != null) NativeMemory.Free(_bfUsedExperts);
+        // GPU op-offload routed-prefill scratch (perf/carnice-vnni-moe).
+        FreeGpuOffloadScratch();
 
         // CPU buffers — _cpuNormBuf is pinned (issue #48).
         CudaBackend.FreePinnedHost((nint)_cpuNormBuf);
