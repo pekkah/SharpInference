@@ -6424,6 +6424,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 case DType.Q6_K when (cols & 0xff) == 0:
                 case DType.Q5_K when (cols & 0xff) == 0:
                     _gpu.MatMulBatchedGemm(outputAll, matrix, inputAll, nTok, dt); return;
+                case DType.Q3_K when Q3kDequantGemmEnabled && (cols & 0xff) == 0:
+                    _gpu.MatMulBatchedGemm(outputAll, matrix, inputAll, nTok, dt); return;
             }
         }
         _gpu.MatMulBatched(outputAll, matrix, inputAll, nTok, dt);
@@ -6433,6 +6435,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // costs exceed the matvec re-stream's k× weight reads. 8 = the verify-batch
     // ceiling; prefill chunks run at hundreds, so the regimes are well separated.
     private const int MatMulComputeBatchMinN = 8;
+
+    // #388: route prefill-scale Q3_K (routed MoE experts) through the dequant→fp16→cuBLAS GEMM
+    // (weight read once) instead of the per-token-re-reading GEMM-N. Argmax-stable (fp16-rounded
+    // weight, same class as the Q5_K/Q6_K dequant-GEMM). SHARPI_Q3K_DEQUANT_GEMM=0 → GEMM-N.
+    private static readonly bool Q3kDequantGemmEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_Q3K_DEQUANT_GEMM") != "0";
 
     /// Issue #121: true when <paramref name="matrix"/>'s dtype is one of the dtypes
     /// <see cref="CudaBackend.MatMulBatched"/> implements a GEMM-N kernel for. Gates the

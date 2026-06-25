@@ -4303,6 +4303,63 @@ extern ""C"" __global__ void llm_dequant_q4k_to_f16(
     }
 }
 
+// ── Dequant Q3_K → FP16 (issue #388) ───────────────────────────────────────
+// Standalone dequant of the 110-byte Q3_K super-block to a row-major [rows×cols]
+// fp16 temp that cuBLAS GEMMs, mirroring llm_dequant_q4k_to_f16's output layout
+// and llm_matvec_q3k_gemm_n's decode (same 110-byte AoS format + 6-bit scale aux
+// unpack). One block of 256 threads per row; thread tid is element e_local in the
+// 256-elem super-block, decoded as s=tid>>5, lane=tid&31 — the SAME (s,lane)→
+// element mapping the matvec uses (input[base + s*32 + lane]), so f16(weight)×act
+// via cuBLAS matches the in-kernel F32 GEMM-N dot (argmax-stable, fp16-rounded).
+extern ""C"" __global__ void llm_dequant_q3k_to_f16(
+    const unsigned int* __restrict__ weights,
+    unsigned short* __restrict__ out,    // [rows * cols] fp16
+    int rows, int cols)
+{
+    int row = (int)blockIdx.x;
+    if (row >= rows) return;
+    unsigned int tid = threadIdx.x;          // 0..255 = element within super-block
+    int num_blocks = cols >> 8;              // cols / 256
+    long row_base_bytes = (long)row * (long)num_blocks * 110L;
+    long out_row = (long)row * (long)cols;
+
+    int s     = (int)(tid >> 5);             // 0..7 sub-block
+    int lane  = (int)(tid & 31u);            // 0..31
+    int group = lane >> 4;                    // 0/1
+    int si    = 2 * s + group;               // scale index 0..15
+    int half  = s >> 2;
+    int shift = (s & 3) * 2;
+    unsigned int m = 1u << s;
+
+    const unsigned int kmask1 = 0x03030303u;
+    const unsigned int kmask2 = 0x0f0f0f0fu;
+
+    for (int block = 0; block < num_blocks; block++) {
+        long b0 = row_base_bytes + (long)block * 110L;
+
+        unsigned int dlo = sharpi_byte_at(weights, b0 + 108);
+        unsigned int dhi = sharpi_byte_at(weights, b0 + 109);
+        float dAll = sharpi_fp16_to_fp32(dlo | (dhi << 8));
+
+        unsigned int a0 = sharpi_byte_at(weights,b0+96)|(sharpi_byte_at(weights,b0+97)<<8)|(sharpi_byte_at(weights,b0+98)<<16)|(sharpi_byte_at(weights,b0+99)<<24);
+        unsigned int a1 = sharpi_byte_at(weights,b0+100)|(sharpi_byte_at(weights,b0+101)<<8)|(sharpi_byte_at(weights,b0+102)<<16)|(sharpi_byte_at(weights,b0+103)<<24);
+        unsigned int tmp= sharpi_byte_at(weights,b0+104)|(sharpi_byte_at(weights,b0+105)<<8)|(sharpi_byte_at(weights,b0+106)<<16)|(sharpi_byte_at(weights,b0+107)<<24);
+        unsigned int aux[4];
+        aux[2] = ((a0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((a1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (a0 & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (a1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+        int sc = (int)((aux[si >> 2] >> ((si & 3) * 8)) & 0xFFu) - 32;   // signed 6-bit − 32
+        unsigned int qsb = sharpi_byte_at(weights, b0 + 32 + half * 32 + lane);
+        unsigned int hmb = sharpi_byte_at(weights, b0 + lane);
+        int qval = (int)((qsb >> shift) & 3u) - ((hmb & m) != 0u ? 0 : 4);
+
+        float val = dAll * (float)sc * (float)qval;
+        out[out_row + (long)block * 256 + (int)tid] = (unsigned short)sharpi_fp32_to_fp16(val);
+    }
+}
+
 // ── Dequant Q4_K → FP16 over the scale-pre-unpacked SoA weight (issue #156) ──
 // SoA twin of llm_dequant_q4k_to_f16: same d*sc*nibble − dmin*mn decode, only the
 // (scale, min) come from the pre-unpacked SoA bytes (sblk[si] / sblk[8+si]) and
