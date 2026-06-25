@@ -674,14 +674,25 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // the #100 in-kernel-dequant GEMM, Q4_K/Q5_K/Q6_K/Q8_0) upload raw bytes and dispatch the
     // quantized GEMM; only Float32 weights dequant-stage. NOT bit-exact — argmax-stable (the
     // GPU runs the MoE in F32, *more* precise than the CPU int8 path).
-    //   *** Default OFF because it trades decode for prefill: the ~14 GB pinned cudaMallocHost
-    //   weight copy duplicates the experts in RAM (mmap + pinned), evicting the page cache
-    //   that single-token DECODE's CPU expert-streaming relies on — measured ~-25% decode on
-    //   Carnice (clean A/B) vs the +44% prefill. So it's a win only for prefill-heavy
-    //   workloads; interactive/agentic (decode-heavy) use should leave it off. ***
+    //   *** Default ON (#390). The original opt-in #387 path traded decode for prefill: a ~14 GB
+    //   pinned cudaMallocHost copy duplicated the experts in RAM (mmap + pinned), and that copy
+    //   could evict the page cache single-token DECODE's CPU expert-streaming relies on (the
+    //   measured ~-25% decode blocker). #390 fixes it two ways: (1) the register-in-place pin mode
+    //   (SHARPI_MOE_PIN_MODE=register, now default) cudaHostRegisters the expert mmap pages instead
+    //   of copying — no 14 GB duplicate, no page-cache eviction (measured decode within noise of the
+    //   CPU path, clean A/B); (2) a token gate (_gpuMoePrefillMinTokens) keeps tiny prefills + all
+    //   decode on the byte-exact CPU path, so op-offload engages only where it wins (+28-67% prefill
+    //   from ~120 tokens up). SHARPI_MOE_GPU_PREFILL=0 restores the pure CPU MoE prefill. ***
     // Falls back to the CPU path (the field is cleared) if the scratch can't be allocated —
     // see the ctor. Not readonly: the ctor clears it on a setup failure.
-    private bool _gpuMoePrefill = ResolveGate("SHARPI_MOE_GPU_PREFILL", false);
+    private bool _gpuMoePrefill = ResolveGate("SHARPI_MOE_GPU_PREFILL", true);
+    // #390: op-offload only engages for prefill batches of at least this many tokens. The op-offload
+    // uploads the WHOLE expert tensor (~14 GB) per layer regardless of N, so a tiny batch goes
+    // upload-bound and loses to the CPU MoE (measured register mode: trails CPU below ~50 tokens,
+    // wins +28-67% from ~120 up). Below the gate — and for ALL single-token decode / MTP-verify
+    // steps, which never reach this batched-prefill path anyway — the byte-exact CPU MoE runs.
+    // Env override SHARPI_MOE_GPU_PREFILL_MIN_TOKENS (0 = always engage when op-offload is on).
+    private readonly int _gpuMoePrefillMinTokens = ResolveIntGate("SHARPI_MOE_GPU_PREFILL_MIN_TOKENS", 64);
     private int     _goCap;            // token capacity the GPU-offload scratch is sized for
     private Tensor? _gpuOffNorm;       // [N × embDim] uploaded norm activations (per layer call)
     private Tensor? _gpuOffGather;     // [totalSel × embDim] CSR-ordered gathered routed-token norms (ONE gather)
@@ -725,9 +736,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // genuine pinned allocation reaches full PCIe (~26 GB/s). Copied once at first scratch
     // alloc (~1s, pages already pre-faulted) and freed in FreeGpuOffloadScratch/Dispose.
     private nint    _goPinnedBuf;         // base of the big cudaMallocHost buffer (Zero = not pinned)
-    private byte*[]? _goPinnedGate;       // [L] per-layer gate_exps base inside _goPinnedBuf
+    // In register mode (#390) _goPinnedBuf is nint.Zero and these per-layer pointers alias the
+    // mmap DataPtrs directly; in copy mode they point inside _goPinnedBuf.
+    private byte*[]? _goPinnedGate;       // [L] per-layer gate_exps base (mmap DataPtr in register mode, inside _goPinnedBuf in copy mode)
     private byte*[]? _goPinnedUp;         // [L] per-layer up_exps base
     private byte*[]? _goPinnedDown;       // [L] per-layer down_exps base
+    // #390 register-in-place mode: the page-aligned mmap ranges registered via cudaHostRegister
+    // (no owned buffer). Tracked so FreeGpuOffloadScratch can cudaHostUnregister them. Null in
+    // copy mode (which owns _goPinnedBuf instead). The two modes are mutually exclusive.
+    private nint[]? _goRegisteredRanges;
     private int  _goCurSlot;
     private int  _goPrefetchedLayer = -1;
     private int  _goPrefetchSlot;
@@ -1572,6 +1589,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // request's critical path (tanking its TTFT and polluting single-turn benchmarks).
         // EnsureGpuOffloadScratch is grow-only, so a larger chunk later just re-grows the
         // (small) GPU buffers; the dominant pinned-buffer cost is N-independent and done here.
+        // This eager setup is independent of _gpuMoePrefillMinTokens by design: that gate only
+        // affects whether a given per-call dispatch uses op-offload, not whether the scratch /
+        // pin is built at load.
         if (_gpuMoePrefill)
         {
             int warmChunk = int.TryParse(Environment.GetEnvironmentVariable("SHARPI_PREFILL_CHUNK"),
@@ -2477,8 +2497,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             long lt2 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
             // ── Batched routed experts: CPU grouped-dot (default, byte-exact) or
-            //    GPU op-offload (transient weight upload + GEMM, opt-in, argmax-stable).
-            if (_gpuMoePrefill)
+            //    GPU op-offload (transient weight upload + GEMM, argmax-stable). The op-offload
+            //    only engages for large-enough batches (_gpuMoePrefillMinTokens) — tiny prefills
+            //    go upload-bound on the ~14 GB whole-tensor upload and lose to the CPU path.
+            if (_gpuMoePrefill && N >= _gpuMoePrefillMinTokens)
                 BatchedRoutedExpertsGpuOffload(layer, N);
             else
                 BatchedRoutedExperts(layer, N);
@@ -3375,10 +3397,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         int na = _numActiveExperts;
 
         // ── N-independent static scratch: allocate ONCE and keep across regrows ──
-        // The ~14 GB pinned weight copy + the whole-layer GPU weight buffers + the F32 dequant
-        // staging don't depend on the batch size N, so a later token-count growth must NOT free
-        // and re-copy them — re-building the pinned buffer is multi-second and fragmentation-prone
-        // (Gemini review). Only the per-N gather/scatter/GEMM scratch below re-grows.
+        // The pinned expert-weight DMA source (copy-mode ~14 GB cudaMallocHost buffer, or the
+        // in-place cudaHostRegister of the mmap pages, per SHARPI_MOE_PIN_MODE) + the whole-layer
+        // GPU weight buffers + the F32 dequant staging don't depend on the batch size N, so a later
+        // token-count growth must NOT free and re-build them — re-building the pinned source is
+        // multi-second and fragmentation-prone (Gemini review). Only the per-N gather/scatter/GEMM
+        // scratch below re-grows.
         if (!_goStaticAllocated)
         {
             // Transient weight buffers: an F32 dequant of a [expertDim×embDim] (or [embDim×
@@ -3419,11 +3443,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 _gpuLayerDown[s] = _gpu.AllocateRawBytes(maxLayerDownBytes, DType.Float32);
             }
 
-            // Copy the expert weights ONCE into a truly-pinned cudaMallocHost buffer so
-            // UploadRawIntoAsyncDirect DMAs from page-locked memory at full PCIe bandwidth (~26 GB/s
-            // vs ~13 GB/s for a cudaHostRegister'd file-backed mmap) and the prefetch overlaps
-            // compute. If the (large, ~15 GB) alloc fails we leave _goHostPinned=false and the path
-            // runs fully synchronous (today's UploadRawInto from mmap), with zero regression.
+            // Pin the expert weights as the DMA source for UploadRawIntoAsyncDirect. SHARPI_MOE_PIN_MODE
+            // selects how: "register" (default, #390) cudaHostRegisters the mmap pages in place — zero
+            // RAM copy, decode-safe; "copy" (#387) makes the ~14 GB cudaMallocHost duplicate (faster DMA
+            // but evicts the page cache CPU decode streams from). On any failure it self-falls-back to
+            // the synchronous mmap upload (_goHostPinned=false), with zero regression.
             EnsureExpertWeightsPinned();
             _goStaticAllocated = true;
         }
@@ -3463,17 +3487,20 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     }
 
     /// <summary>
-    /// One-time allocation of a single big pinned (<c>cudaMallocHost</c>) host buffer holding a
-    /// contiguous copy of every MoE layer's gate/up/down expert weights, copied straight from
-    /// the mmap <c>DataPtr</c>s (pages already pre-faulted by the loader). The pinned buffer is
-    /// the DMA source for <see cref="CudaBackend.UploadRawIntoAsyncDirect"/>, so the H2D copy
-    /// runs at full PCIe bandwidth and overlaps compute. Sets <see cref="_goHostPinned"/> on
-    /// success; on ANY failure (alloc returns Zero — typically ENOMEM for the ~15 GB) leaves it
-    /// false so the path stays on the synchronous mmap upload (no regression). Only raw-quant
-    /// layers are copied/DMA'd — Float32 layers host-dequant from the mmap as before, so a
-    /// Float32 layer leaves its per-layer pinned base null and falls back per call. Guarded by
-    /// <see cref="_goPinAttempted"/> so it runs at most once per scratch sizing. The mmap
-    /// (<see cref="_cpuFfnGateExps"/> etc.) is never touched — the CPU-MoE path keeps using it.
+    /// One-time setup of the pinned host DMA source for every MoE layer's gate/up/down expert
+    /// weights, in one of two modes selected by <c>SHARPI_MOE_PIN_MODE</c>: <c>register</c>
+    /// (default, #390) <c>cudaHostRegister</c>s the expert mmap pages in place — no RAM copy, so
+    /// the CPU page cache the decode path streams experts from is never evicted; <c>copy</c>
+    /// (#387) allocates a single big <c>cudaMallocHost</c> buffer (~14 GB) and copies every
+    /// tensor in contiguously (higher DMA bandwidth but evicts that page cache). Either way the
+    /// result is the DMA source for <see cref="CudaBackend.UploadRawIntoAsyncDirect"/>, so the
+    /// H2D copy runs without per-call staging and overlaps compute. Sets <see cref="_goHostPinned"/>
+    /// on success; on ANY failure (e.g. the copy-mode alloc returns Zero — typically ENOMEM for the
+    /// ~14 GB) leaves it false so the path stays on the synchronous mmap upload (no regression).
+    /// Only raw-quant layers are registered/copied/DMA'd — Float32 layers host-dequant from the
+    /// mmap as before, so a Float32 layer leaves its per-layer pinned base null and falls back per
+    /// call. Guarded by <see cref="_goPinAttempted"/> so it runs at most once per scratch sizing.
+    /// The mmap (<see cref="_cpuFfnGateExps"/> etc.) is never touched — the CPU-MoE path keeps using it.
     /// </summary>
     private void EnsureExpertWeightsPinned()
     {
@@ -3507,6 +3534,52 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         }
         if (total <= 0) { _goHostPinned = false; return; }   // nothing raw-quant → mmap path
 
+        // #390: pin mode. "register" (default) = cudaHostRegister the expert mmap pages in place
+        // (zero RAM copy → no page-cache eviction → no decode regression; DMA ~13 GB/s). "copy" =
+        // the original ~14 GB cudaMallocHost duplicate (DMA ~26 GB/s but evicts the page cache CPU
+        // decode streams experts from → ~-25% decode). Default register so op-offload is decode-safe.
+        string pinMode = (Environment.GetEnvironmentVariable("SHARPI_MOE_PIN_MODE") ?? "register")
+            .Trim().ToLowerInvariant();
+
+        _goPinnedGate = new byte*[L];
+        _goPinnedUp   = new byte*[L];
+        _goPinnedDown = new byte*[L];
+
+        if (pinMode == "register")
+        {
+            // Set each raw-quant layer's DMA base straight to the mmap pointer (Float32 / missing →
+            // null, per-layer host-dequant fallback). Collect each tensor's raw byte range, then
+            // page-align + merge them via MergePageAlignedRanges for cudaHostRegister. GGUF tensors
+            // are 32-byte aligned (not page-aligned), so adjacent tensors can share a page — merging
+            // ensures no page is registered twice (a double register returns false → that range
+            // silently DMAs as pageable; merging avoids it).
+            var rawRanges = new List<(long ptr, long bytes)>(3 * L);
+            void Reg(byte* src, DType dt, int rows, int cols, ref byte* slot)
+            {
+                long bytes = PinnedBytes(src, dt, rows, cols);
+                if (bytes == 0) { slot = null; return; }
+                slot = src;
+                rawRanges.Add(((long)src, bytes));
+            }
+            for (int l = 0; l < L; l++)
+            {
+                Reg(_cpuFfnGateExps![l].DataPtr, _cpuFfnGateExps![l].DType, expertDim, embDim, ref _goPinnedGate[l]);
+                Reg(_cpuFfnUpExps![l].DataPtr,   _cpuFfnUpExps![l].DType,   expertDim, embDim, ref _goPinnedUp[l]);
+                Reg(_cpuFfnDownExps![l].DataPtr, _cpuFfnDownExps![l].DType, embDim,    expertDim, ref _goPinnedDown[l]);
+            }
+            var merged = MergePageAlignedRanges(rawRanges, 4096);
+            var reg = new List<nint>(merged.Count);
+            int ok = 0;
+            foreach (var (s, e) in merged)
+                if (_gpu.TryRegisterHostPinned((nint)s, e - s)) { reg.Add((nint)s); ok++; }
+            _goRegisteredRanges = reg.ToArray();
+            _goPinnedBuf = nint.Zero;
+            _goHostPinned = true;
+            Console.Error.WriteLine($"[moe-offload] registered {ok}/{merged.Count} mmap expert-weight ranges in place ({total / (1024.0 * 1024.0 * 1024.0):F2} GiB, cudaHostRegister) — no RAM copy, DMA source for op-offload prefill.");
+            return;
+        }
+
+        // ── "copy" mode (#387): one big pinned cudaMallocHost buffer + copy (max DMA bandwidth) ──
         // 2. Allocate the big pinned buffer. On failure (ENOMEM) fall back to the mmap path.
         nint buf = CudaBackend.AllocatePinnedHost((nuint)total);
         if (buf == nint.Zero)
@@ -3519,9 +3592,6 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // 3. Copy each raw-quant layer's gate/up/down tensor into the buffer, contiguously, and
         //    record the per-layer base pointers the DMA source will use. Float32 layers leave a
         //    null base (per-layer sync host-dequant fallback in BatchedRoutedExpertsGpuOffload).
-        _goPinnedGate = new byte*[L];
-        _goPinnedUp   = new byte*[L];
-        _goPinnedDown = new byte*[L];
         byte* dst = (byte*)buf;
         long off = 0;
         void CopyOne(byte* src, DType dt, int rows, int cols, ref byte* slot)
@@ -3580,9 +3650,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     /// <param name="freeStatic">
     /// <c>false</c> (the per-N regrow path) frees ONLY the batch-size-dependent gather/scatter/GEMM
-    /// scratch, keeping the N-independent static buffers — the ~14 GB pinned weight copy, the
-    /// whole-layer GPU weight buffers, the F32 dequant staging — so a token-count growth doesn't
-    /// re-copy the multi-second pinned buffer (Gemini review). <c>true</c> (full teardown / Dispose)
+    /// scratch, keeping the N-independent static buffers — the pinned expert-weight DMA source
+    /// (copy-mode ~14 GB buffer or the in-place mmap registration, per <c>SHARPI_MOE_PIN_MODE</c>),
+    /// the whole-layer GPU weight buffers, the F32 dequant staging — so a token-count growth doesn't
+    /// re-build the multi-second pinned source (Gemini review). <c>true</c> (full teardown / Dispose)
     /// additionally frees those static buffers and resets the pin + static-alloc state.
     /// </param>
     private void FreeGpuOffloadScratch(bool freeStatic = true)
@@ -3608,12 +3679,19 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         if (!freeStatic) return;
 
-        // ── N-independent static buffers + the ~14 GB pinned weight copy: only on full teardown ──
-        // (DrainPrefetch above ensured no DMA is still reading the slot buffers / pinned source.)
+        // ── N-independent static buffers + the pinned expert-weight DMA source (copy-mode ~14 GB
+        //    buffer or the in-place mmap registration, per SHARPI_MOE_PIN_MODE): only on full
+        //    teardown ── (DrainPrefetch above ensured no DMA is still reading the slot buffers /
+        //    pinned source.)
         F(ref _gpuOffWGate); F(ref _gpuOffWUp); F(ref _gpuOffWDown);
         if (_hGpuOffDeq != null) { NativeMemory.Free(_hGpuOffDeq); _hGpuOffDeq = null; }
         for (int s = 0; s < 2; s++) { FW(ref _gpuLayerGate[s]); FW(ref _gpuLayerUp[s]); FW(ref _gpuLayerDown[s]); }
         if (_goPinnedBuf != nint.Zero) { CudaBackend.FreePinnedHost(_goPinnedBuf); _goPinnedBuf = nint.Zero; }
+        if (_goRegisteredRanges != null)
+        {
+            foreach (var p in _goRegisteredRanges) _gpu.UnregisterHostPinned(p);
+            _goRegisteredRanges = null;
+        }
         _goPinnedGate = null; _goPinnedUp = null; _goPinnedDown = null;
         _goHostPinned = false;
         _goPinAttempted = false;
@@ -6183,6 +6261,46 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // but humans set these by hand. Anything else still falls through to the auto-default.
         if (bool.TryParse(v, out bool b)) return b;
         return autoDetect;
+    }
+
+    /// <summary>Parse a non-negative integer env override, falling back to <paramref name="dflt"/>
+    /// for an unset/blank/invalid value (used for the op-offload token gate).</summary>
+    private static int ResolveIntGate(string envName, int dflt)
+    {
+        var v = Environment.GetEnvironmentVariable(envName);
+        return int.TryParse(v, out int n) && n >= 0 ? n : dflt;
+    }
+
+    /// <summary>
+    /// Convert raw host byte ranges <c>(ptr, bytes)</c> into page-aligned, sorted, merged
+    /// <c>[start, end)</c> ranges suitable for <c>cudaHostRegister</c> — each input range is
+    /// rounded out to whole <paramref name="pageSize"/> pages (floor start, ceil end), then
+    /// overlapping or exactly-adjacent ranges are coalesced so a page shared by two
+    /// 32-byte-aligned GGUF tensors is never registered twice. Ranges with non-positive
+    /// <c>bytes</c> are skipped. Internal + static so it can be covered by a CPU-only unit test.
+    /// </summary>
+    internal static List<(long start, long end)> MergePageAlignedRanges(
+        List<(long ptr, long bytes)> ranges, long pageSize)
+    {
+        var aligned = new List<(long start, long end)>(ranges.Count);
+        foreach (var (ptr, bytes) in ranges)
+        {
+            if (bytes <= 0) continue;
+            long s = ptr / pageSize * pageSize;
+            long e = (ptr + bytes + pageSize - 1) / pageSize * pageSize;
+            aligned.Add((s, e));
+        }
+        aligned.Sort((a, b) => a.start.CompareTo(b.start));
+        var merged = new List<(long start, long end)>(aligned.Count);
+        foreach (var r in aligned)
+        {
+            if (merged.Count > 0 && r.start <= merged[^1].end)
+            {
+                if (r.end > merged[^1].end) merged[^1] = (merged[^1].start, r.end);
+            }
+            else merged.Add(r);
+        }
+        return merged;
     }
 
     private static void SelectTopKPtr(float* logits, int n, int k,
