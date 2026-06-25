@@ -793,15 +793,20 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // fast path, resolve the GDN recurrence with the chunk-parallel
     // chunk_gated_delta_rule kernel (CudaBackend.GdnChunkedPrefill) instead of the
     // sequential GdnRecurrenceScan. The chunked form is numerically equal to the scan
-    // only up to FP reduction order (NOT byte-exact), so it is OFF by default — the
-    // bit-parity oracles keep validating the byte-exact scan — and only engages on the
-    // prefill (clean state-carry) path: GdnBlockBatched short-circuits to the byte-exact
-    // ring-capturing scan whenever snapRing is set (if (snapRing) … else if
-    // (GdnChunkedPrefillEnabled) …), so decode and batched-verify ring capture stay on the scan.
-    // Mirrors HybridGdnForwardPass.GdnChunkedPrefillEnabled. SHARPI_GDN_CHUNKED_PREFILL=1
-    // opts in; CudaHybridGdnChunkedPrefillTests A/B-toggles it.
-    internal static bool GdnChunkedPrefillEnabled =
-        Environment.GetEnvironmentVariable("SHARPI_GDN_CHUNKED_PREFILL") == "1";
+    // only up to FP reduction order (NOT byte-exact). It only engages on the prefill
+    // (clean state-carry) path: GdnBlockBatched short-circuits to the byte-exact
+    // ring-capturing scan whenever snapRing is set (if (snapRing) … else if (chunked) …),
+    // so decode and batched-verify ring capture always stay on the scan.
+    //   #388: this is now AUTO-ON when the GPU MoE op-offload is active (_gpuMoePrefill) —
+    //   that prefill path is already argmax-stable (the routed MoE runs in F32/int8, not
+    //   the CPU's byte-exact dots), so the chunked GDN's FP-reorder is consistent and free
+    //   (measured ~+8% Carnice prefill). When op-offload is OFF (byte-exact CPU MoE) the
+    //   scan is kept. Tri-state SHARPI_GDN_CHUNKED_PREFILL: "1" forces chunked even with
+    //   op-offload off, "0" forces the byte-exact scan, unset = auto. The test sets the
+    //   override directly. Mirrors HybridGdnForwardPass's chunked gate (which excludes MTP).
+    internal static bool? GdnChunkedPrefillOverride =
+        Environment.GetEnvironmentVariable("SHARPI_GDN_CHUNKED_PREFILL") switch
+        { "1" => true, "0" => false, _ => null };
 
     // Issue #114-B: batch the per-position KV-append + SDPA into one launch each
     // (CudaBackend.AttentionBatched). Only used when the chunk stays on the
@@ -2209,7 +2214,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                     zStride: valDim, oStride: valDim, nTok: N,
                     ringScan: _gpuGdnRingScan, ringScanFloatOffset: (long)gdnIdx * scanF,
                     ringSlotStride: numGdn * scanF, nCapture: nCapture);
-            else if (GdnChunkedPrefillEnabled)
+            else if (GdnChunkedPrefillOverride ?? _gpuMoePrefill)
                 _gpu.GdnChunkedPrefill(
                     scanState, qHeadAll, kHeadAll, qkvConvAll,
                     alphaAll, betaAll, _gpuSsmA[layer], _gpuSsmDtBias[layer], _gpuSsmNormW[layer],
