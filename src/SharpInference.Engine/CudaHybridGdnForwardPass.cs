@@ -1104,6 +1104,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 $"[CudaHybridGdnForwardPass] Dense FFN mode (intermDim={_intermDim}): per-layer ffn_gate/up/down run on CPU from mmap; attn + GDN stay on GPU.");
         }
 
+        // Op-offload (GPU offload of the routed-MoE prefill, #390) only applies to CPU-MoE
+        // models — there are no CPU-resident routed experts to offload on the dense or
+        // experts-on-GPU (SLRU) paths. Clamp the gate to _cpuMoe so its eager scratch/pin
+        // setup, per-call dispatch, AND the chunked-GDN auto-enable (which keys off
+        // _gpuMoePrefill) never engage for those models. Without this, the #390 default-on
+        // flip ran the eager GPU-scratch alloc for the dense 27B-MTP, perturbing cuBLAS
+        // workspace/algo selection enough to break the dense batched-trunk bitwise-parity tests.
+        _gpuMoePrefill &= _cpuMoe;
+
         // Resolve Q3_K_Q8K / Q8_0_Q8K kernel gates. Auto-on when the model has
         // routed-expert weights in that dtype (APEX mixed-precision tier — e.g.
         // Carnice). SHARPI_Q3K_Q8K / SHARPI_Q8_0_Q8K = "1" or "0" override.
