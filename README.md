@@ -134,7 +134,7 @@ sharpi-cli -m models/Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-I-Compact.gguf -g -1 \
 
 | Backend | Prefill t/s | Decode t/s | Notes |
 |---|---:|---:|---|
-| **CUDA** `-g -1 --no-thinking` (hybrid) | **241.8** | **26.5** | agentic finetune; 80% acceptance (`bench-carnice.ps1`). APEX mixed-precision (Q3_K + Q8_0 experts); Q8_KS per-32 int dots auto-enable. Prefill: GPU MoE op-offload default-on (#390, register-in-place pin) — **+54%** over the CPU MoE path, decode within noise (`--gpu-moe-prefill false` to force CPU) |
+| **CUDA** `-g -1 --no-thinking` (hybrid) | **275.4** | **26.5** | agentic finetune; 80% acceptance (`bench-carnice.ps1`). APEX mixed-precision (Q3_K + Q8_0 experts); Q8_KS per-32 int dots auto-enable. Prefill: GPU MoE op-offload (#390, register-in-place pin) **+ on-GPU router** (#388) default-on — **+75%** over the CPU MoE path (157→275), decode within noise (`--gpu-moe-prefill false` / `SHARPI_MOE_GPU_ROUTER=0` to force CPU) |
 | Vulkan `-g -1 --no-thinking` (hybrid) | 18.4 | 12.2 | runs on Vulkan (#357); 47% acceptance. MTP self-spec **regresses** vs plain MoE decode (~22 t/s, cf. 35B-A3B) — routed-expert verify is un-amortized on Vulkan (#370). Lossless; use `--spec-type none` for speed |
 
 #### Qwen3.6-35B-A3B (GDN+MoE) — [unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) · 22 GB
@@ -146,7 +146,7 @@ sharpi-cli -m models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf -g -1 \
 
 | Backend | Prefill t/s | Decode t/s | Notes |
 |---|---:|---:|---|
-| **CUDA** `-g -1` (hybrid) | **109.6** | **23.7** | 10 attn + 30 GDN on GPU; routed MoE on CPU, shared expert GPU-overlapped. Fused GDN scan + batched SDPA, bit-identical. `SHARPI_CPU_MOE=0` forces on-GPU experts. Prefill: GPU MoE op-offload default-on (#390) — **+65%** over the CPU MoE path, decode within noise |
+| **CUDA** `-g -1` (hybrid) | **113.8** | **23.7** | 10 attn + 30 GDN on GPU; routed MoE on CPU, shared expert GPU-overlapped. Fused GDN scan + batched SDPA, bit-identical. `SHARPI_CPU_MOE=0` forces on-GPU experts. Prefill: GPU MoE op-offload (#390) + on-GPU router (#388) default-on — **+71%** over the CPU MoE path, decode within noise |
 | Vulkan `-g -1` (hybrid) | 17.3 | 22.8 | 10 attn + 30 GDN on GPU; routed MoE + shared expert on CPU mmap (#356). Decode ~matches CUDA (CPU-routed-expert bound); prefill trails CUDA — per-row CPU FFN not yet batched (#371) |
 | CPU | **11.3** | 9.3 | hybrid GDN/attn, 256 experts / 8 active. Chunk-parallel (FlashQLA) GDN prefill default-on (1.35× over the 8.4 t/s per-token scan; `SHARPI_GDN_CHUNKED_PREFILL=0` to disable). MTP variants keep the byte-exact scan (FP-reorder flips the thinking-boundary token) |
 
@@ -160,7 +160,7 @@ SHARPI_CPU_MOE=1 sharpi-cli -m models/Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf -g -1 \
 
 | Backend | Prefill t/s | Decode t/s | Notes |
 |---|---:|---:|---|
-| **CUDA** `-g -1 --no-thinking` (hybrid) | **108.6** | **21.4** | needs `SHARPI_CPU_MOE=1`: 30 GDN + 10 attn + shared expert on GPU, routed experts CPU mmap. 100% acceptance. Prefill: GPU MoE op-offload default-on (#390) — **+66%** over the CPU MoE path, decode within noise |
+| **CUDA** `-g -1 --no-thinking` (hybrid) | **114.2** | **21.4** | needs `SHARPI_CPU_MOE=1`: 30 GDN + 10 attn + shared expert on GPU, routed experts CPU mmap. 100% acceptance. Prefill: GPU MoE op-offload (#390) + on-GPU router (#388) default-on — **+74%** over the CPU MoE path, decode within noise |
 | Vulkan `-g -1 --no-thinking` (hybrid) | 15.4 | 9.3 | needs `SHARPI_CPU_MOE=1`; runs on Vulkan (#357). 61% acceptance, but MTP self-spec **regresses** vs ~22 t/s plain MoE decode — routed-expert verify un-amortized on Vulkan (#370). Use `--spec-type none` for speed |
 | CPU `--no-thinking` | 9.1 | **8.5** | GDN/attn + 256-expert MoE + MTP head (#44). 100% acceptance; MoE-MTP batched verify (#45) — routed experts sequential per token, so ~MTP-off parity |
 

@@ -574,6 +574,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private Tensor? _gpuStreamAll;     // [N × embDim] inter-layer residual stream for all tokens
     private float* _bResidAll;         // [bCap × embDim] pinned — per-token MoE residual (postBlock hidden)
     private float* _bNormAll;          // [bCap × embDim] pinned — per-token post-attn-norm (MoE input)
+    private float* _btRouterAll;       // [N × numExperts] router-logit readback (CPU-MoE GPU-router, #388)
     private float* _bSharedAll;        // [bCap × embDim] pinned — per-token shared-expert out (unscaled)
     private float* _bHiddenAll;        // [bCap × embDim] pinned — combined hidden, uploaded to _gpuStreamAll
     private float* _bRoutedAll;        // [bCap × embDim] — routed-expert accumulator (host only)
@@ -608,6 +609,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private Tensor? _gpuBtNorm;      // [N × embDim] attn-norm output (block input)
     private Tensor? _gpuBtBlockOut;  // [N × embDim] block output → postBlock (resid)
     private Tensor? _gpuBtMoeNorm;   // [N × embDim] post-attn-norm (MoE input)
+    private Tensor? _gpuBtRouterAll; // [N × numExperts] batched router logits (CPU-MoE GPU-router, #388)
     private Tensor? _gpuBtShared;    // [N × embDim] shared-expert output (unscaled)
     private Tensor? _gpuBtQkv;       // [N × convChannels] GDN joint QKV
     private Tensor? _gpuBtZ;         // [N × valueDim] GDN z-gate
@@ -686,6 +688,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // Falls back to the CPU path (the field is cleared) if the scratch can't be allocated —
     // see the ctor. Not readonly: the ctor clears it on a setup failure.
     private bool _gpuMoePrefill = ResolveGate("SHARPI_MOE_GPU_PREFILL", true);
+    // #388: run the CPU-MoE prefill router matvec on the GPU (batched GEMM over the on-GPU
+    // post-attn norm) instead of the per-token CPU matvec (~16% of CPU-MoE prefill). RAW logits
+    // download; softmax + top-k stay on the host. Argmax-stable vs the CPU matvec (same FP class
+    // as BatchedGpuMoeFfn's already-default GPU router). SHARPI_MOE_GPU_ROUTER=0 forces CPU.
+    private readonly bool _gpuRouterPrefill = ResolveGate("SHARPI_MOE_GPU_ROUTER", true);
+    // Set per layer by TrunkLayerBatched: true when it issued the GPU router GEMM+download for
+    // this layer, so PrefillBatchedCpuMoe's router loop reads _btRouterAll instead of matvec'ing.
+    private bool _btRouterGpuValid;
     // #390: op-offload only engages for prefill batches of at least this many tokens. The op-offload
     // uploads the WHOLE expert tensor (~14 GB) per layer regardless of N, so a tiny batch goes
     // upload-bound and loses to the CPU MoE (measured register mode: trails CPU below ~50 tokens,
@@ -1243,6 +1253,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 }
                 else
                 {
+                    // #388: also upload the small (F32, ~2 MiB/layer) router weight to GPU so the
+                    // prefill router matvec can run on-GPU (SHARPI_MOE_GPU_ROUTER); the routed
+                    // expert weights still stream from CPU mmap. _cpuFfnGateInp stays resolved for
+                    // the CPU-router fallback (SHARPI_MOE_GPU_ROUTER=0 / sequential trunk).
+                    if (_gpuRouterPrefill)
+                        _gpuWGateInp[i] = UploadWeight($"blk.{i}.ffn_gate_inp.weight");
                     _cpuFfnGateInp![i] = ResolveCpuWeight($"blk.{i}.ffn_gate_inp.weight");
                     _cpuFfnGateExps![i] = ResolveCpuWeight($"blk.{i}.ffn_gate_exps.weight");
                     _cpuFfnUpExps![i] = ResolveCpuWeight($"blk.{i}.ffn_up_exps.weight");
@@ -1779,6 +1795,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         _bResidAll  = AllocPinnedL(perTokEmb);
         _bNormAll   = AllocPinnedL(perTokEmb);
+        if (_cpuMoe && _gpuRouterPrefill)
+            _btRouterAll = AllocPinnedL((long)N * _numExperts);   // #388: pinned for fast D2H of the GPU router logits
         _bSharedAll = AllocPinnedL(perTokEmb);
         _bHiddenAll = AllocPinnedL(perTokEmb);
         _bRoutedAll = AllocL(perTokEmb);
@@ -1850,6 +1868,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpuBtNorm     = A((long)N * embDim);
         _gpuBtBlockOut = A((long)N * embDim);
         _gpuBtMoeNorm  = A((long)N * embDim);
+        if (_cpuMoe && _gpuRouterPrefill)
+            _gpuBtRouterAll = A((long)N * _numExperts);   // batched router logits (#388, CPU-MoE GPU-router)
         if (_cpuMoe)
             _gpuBtShared = A((long)N * embDim);   // shared-expert out (CPU-MoE combine only)
         _gpuBtQkv      = A((long)N * _gdnConvChannels);
@@ -1883,7 +1903,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private void FreeBatchedTrunkScratch()
     {
         void F(ref Tensor? t) { if (t is { } v) { _gpu.Free(v); t = null; } }
-        F(ref _gpuBtNorm); F(ref _gpuBtBlockOut); F(ref _gpuBtMoeNorm); F(ref _gpuBtShared);
+        F(ref _gpuBtNorm); F(ref _gpuBtBlockOut); F(ref _gpuBtMoeNorm); F(ref _gpuBtRouterAll); F(ref _gpuBtShared);
         F(ref _gpuBtQkv); F(ref _gpuBtZ); F(ref _gpuBtAlpha); F(ref _gpuBtBeta); F(ref _gpuBtGdnOut);
         F(ref _gpuBtQGate); F(ref _gpuBtQ); F(ref _gpuBtGate); F(ref _gpuBtK); F(ref _gpuBtV); F(ref _gpuBtAttnOut);
         F(ref _gpuBtSGate); F(ref _gpuBtSUp);
@@ -2094,7 +2114,18 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         GpuMatMulBatched(shared, _gpuWDownShexp[layer], _gpuBtSGate!, N);
         _gpu.DownloadAsync(shared, (nint)_bSharedAll, (int)((long)N * embDim));
 
-        _gpu.Synchronize();   // drain all queued D2H: resid/norm/shared now host-valid
+        // #388: batched GPU router GEMM, overlapping the trunk's D2H. RAW logits → host (softmax +
+        // top-k run on the host in PrefillBatchedCpuMoe, reading _btRouterAll). Skipped (→ CPU router)
+        // when the router weight isn't batched-GEMM-supported. moeNorm (_gpuBtMoeNorm) is valid here.
+        _btRouterGpuValid = _gpuRouterPrefill && _cpuMoe && _gpuBtRouterAll is not null
+                            && BatchedMatMulSupported(_gpuWGateInp[layer]);
+        if (_btRouterGpuValid)
+        {
+            GpuMatMulBatched(_gpuBtRouterAll!, _gpuWGateInp[layer], moeNorm, N);
+            _gpu.DownloadAsync(_gpuBtRouterAll!, (nint)_btRouterAll, (int)((long)N * _numExperts));
+        }
+
+        _gpu.Synchronize();   // drain all queued D2H: resid/norm/shared (+ router) now host-valid
     }
 
     /// <summary>Batched GDN block: projections over N tokens; fused sequential-scan
@@ -2375,6 +2406,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     {
         if (_bResidAll  != null) { CudaBackend.FreePinnedHost((nint)_bResidAll);  _bResidAll = null; }
         if (_bNormAll   != null) { CudaBackend.FreePinnedHost((nint)_bNormAll);   _bNormAll = null; }
+        if (_btRouterAll != null) { CudaBackend.FreePinnedHost((nint)_btRouterAll); _btRouterAll = null; }
         if (_bSharedAll != null) { CudaBackend.FreePinnedHost((nint)_bSharedAll); _bSharedAll = null; }
         if (_bHiddenAll != null) { CudaBackend.FreePinnedHost((nint)_bHiddenAll); _bHiddenAll = null; }
         if (_bRoutedAll != null) { NativeMemory.Free(_bRoutedAll); _bRoutedAll = null; }
@@ -2465,6 +2497,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             //    Both produce host _bResidAll / _bNormAll / _bSharedAll, then the
             //    batched MoE below runs identically. The batched trunk is bit-identical
             //    to the sequential one (same kernels, same per-row FP reduction).
+            // #388: cleared here so the sequential-trunk path (which never issues the GPU
+            // router GEMM) leaves it false → the host router loop below matvecs on the CPU.
+            // TrunkLayerBatched sets it true per layer when it ran the batched router.
+            _btRouterGpuValid = false;
             if (BatchedTrunkEnabled && !_cpuGdn)
             {
                 TrunkLayerBatched(layer, N, startPos, isAttn, snapKvActive, wStart);
@@ -2481,10 +2517,24 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             for (int i = 0; i < N; i++)
             {
                 float* normI = _bNormAll + (long)i * embDim;
-                SimdKernels.MatVec(_cpuRouterLogits, routerW.DataPtr, normI,
-                    _numExperts, embDim, routerW.DType);
-                SimdKernels.SoftmaxInPlace(_cpuRouterLogits, _numExperts);
-                SelectTopKPtr(_cpuRouterLogits, _numExperts, na, sel, wts, _hp.NormalizeMoeTopKWeights);
+                // #388: router logits from the GPU batched GEMM (TrunkLayerBatched downloaded
+                // them into _btRouterAll) when available; else the per-token CPU matvec.
+                // Softmax + top-k run on the host either way; the shexp dot below is unchanged
+                // (it still reads normI from the host post-attn norm).
+                float* logitsI;
+                if (_btRouterGpuValid)
+                {
+                    logitsI = _btRouterAll + (long)i * _numExperts;
+                    SimdKernels.SoftmaxInPlace(logitsI, _numExperts);
+                }
+                else
+                {
+                    logitsI = _cpuRouterLogits;
+                    SimdKernels.MatVec(_cpuRouterLogits, routerW.DataPtr, normI,
+                        _numExperts, embDim, routerW.DType);
+                    SimdKernels.SoftmaxInPlace(_cpuRouterLogits, _numExperts);
+                }
+                SelectTopKPtr(logitsI, _numExperts, na, sel, wts, _hp.NormalizeMoeTopKWeights);
                 for (int k = 0; k < na; k++)
                 {
                     _bSelected[(long)i * na + k] = sel[k];
@@ -6992,6 +7042,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 {
                     _gpu.Free(_gpuWGateInp[i]);
                     _gpu.Free(_gpuWGateInpShexp[i]);
+                }
+                else if (_gpuRouterPrefill && _gpuWGateInp[i] is { } routerW)
+                {
+                    _gpu.Free(routerW);   // #388: router weight uploaded for the GPU prefill router
                 }
             }
             if (_hp.LayerTypes![i] == LayerType.Attention)
