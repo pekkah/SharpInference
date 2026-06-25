@@ -68,6 +68,22 @@ public sealed class MtpDecoder
     private long _totalDraftsEmitted;
     private long _totalDraftsAccepted;
 
+    // Adaptive MTP (decode perf): self-spec only pays above a break-even acceptance — the
+    // k-token verify re-runs the trunk + CPU-MoE, so below ~0.55 accept it's slower than plain
+    // per-token decode (measured Carnice 26.6 t/s @43% vs 31.9 plain). Probe with MTP for the
+    // first _mtpProbeSteps steps; if the measured acceptance is below _mtpMinAccept, COMMIT to
+    // plain per-token decode for the rest of the call (no re-probe: the MTP KV would be stale
+    // across a plain-decode gap, and content type is stable within a response). Greedy MTP is
+    // byte-identical to plain greedy, so the switch never changes output. SHARPI_MTP_MIN_ACCEPT=0
+    // disables adaptivity (always MTP); SHARPI_MTP_PROBE_STEPS tunes the probe length.
+    private static readonly float _mtpMinAccept = ResolveMtpMinAccept();
+    private static readonly int _mtpProbeSteps =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPI_MTP_PROBE_STEPS"), out var ps) && ps >= 1 ? ps : 8;
+    private bool _specCommitted;   // probe finished, decision made for the rest of this Decode call
+    private bool _specOn = true;   // current decision (true = run the MTP step)
+    private int _probeStepsDone;
+    private long _probeAccepted, _probeDrafted;
+
     // Phase timing (issue #207 bench reporting, mirrors SpeculativeDecoder):
     // cumulative wall time in the MTP draft chain + KV refresh forwards, the
     // batched main verify, and rollback/state sync. Uniform slowdown across all
@@ -138,6 +154,11 @@ public sealed class MtpDecoder
         h.CopyTo(_savedHidden);
         _totalDraftsEmitted = 0;
         _totalDraftsAccepted = 0;
+        _specCommitted = false;
+        _specOn = true;
+        _probeStepsDone = 0;
+        _probeAccepted = 0;
+        _probeDrafted = 0;
         DraftMs = 0;
         VerifyMs = 0;
         CommitMs = 0;
@@ -161,6 +182,18 @@ public sealed class MtpDecoder
         var s = Environment.GetEnvironmentVariable("SHARPI_MTP_DRAFT_N");
         if (s is not null && int.TryParse(s, out var v) && v >= 1) return v;
         return 3;
+    }
+
+    /// <summary>Break-even draft acceptance below which MTP self-spec is slower than plain
+    /// per-token decode (the k-token verify re-runs the trunk + CPU-MoE). Default 0.55 (the
+    /// measured Carnice crossover); SHARPI_MTP_MIN_ACCEPT overrides, 0 disables adaptivity.</summary>
+    private static float ResolveMtpMinAccept()
+    {
+        var s = Environment.GetEnvironmentVariable("SHARPI_MTP_MIN_ACCEPT");
+        if (s is not null && float.TryParse(s, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var v) && v >= 0f && v <= 1f)
+            return v;
+        return 0.55f;
     }
 
     /// <summary>
@@ -335,6 +368,23 @@ public sealed class MtpDecoder
             ct.ThrowIfCancellationRequested();
 
             int P = _nextPos;
+            // Adaptive: once the probe committed to plain decode, run a per-token step (no
+            // draft/verify). Greedy-identical to the MTP path; just emits argmax(saved) and
+            // advances one position via a single Forward. Keeps the saved-state contract
+            // (saved logits predict _nextPos, _savedHidden = hidden at _nextPos-1).
+            if (pMin >= 1.0f && _specCommitted && !_specOn)
+            {
+                int tp = _hasSavedArgmax ? _savedMainArgmax : ArgMax(_savedMainLogits);
+                if (IsStop(tp, stopTokenIds)) return;
+                emitToken(tp); generated++;
+                if (generated >= maxTokens) return;
+                ReadOnlySpan<float> lg = _fwd.Forward(tp, P);
+                lg.CopyTo(_savedMainLogits);
+                _hasSavedArgmax = false;
+                _fwd.LastHidden.CopyTo(_savedHidden);
+                _nextPos = P + 1;
+                continue;
+            }
             // Step sizing: the batch holds t1 + the draft chain, bounded by the
             // remaining token budget (a step never verifies tokens it can't emit),
             // the pass's snapshot-ring capacity, and the context window.
@@ -418,6 +468,22 @@ public sealed class MtpDecoder
             }
             _totalDraftsAccepted += a;
             int newPos = P + 1 + a;
+
+            if (pMin >= 1.0f && !_specCommitted)
+            {
+                _probeAccepted += a;
+                _probeDrafted += kEff - 1;
+                if (++_probeStepsDone >= _mtpProbeSteps)
+                {
+                    float probeAcc = _probeDrafted > 0 ? (float)_probeAccepted / _probeDrafted : 0f;
+                    _specOn = _mtpMinAccept <= 0f || probeAcc >= _mtpMinAccept;
+                    _specCommitted = true;
+                    if (Environment.GetEnvironmentVariable("SHARPI_TRACE_MTP") == "1")
+                        Console.Error.WriteLine(
+                            $"[mtp-adaptive] probe acceptance {probeAcc:P0} over {_probeStepsDone} steps → " +
+                            (_specOn ? "KEEP MTP" : "switch to plain per-token decode"));
+                }
+            }
 
             if (trace)
                 Console.Error.WriteLine(
