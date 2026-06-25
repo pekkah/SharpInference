@@ -167,6 +167,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _matvecQ80Kernel;
     // Issue #142: dp4a/Q8_1 decode matvec (quantize activation to int8, __dp4a dot).
     private nint   _matvecQ80Dp4aKernel;
+    // Issue #405: high-MLP mmvq decode matvec (faithful port of llama.cpp's
+    // mul_mat_vec_q<Q8_0,1> — 128 thr/block, 1 row/block, vdr=2 independent loads).
+    private nint   _matvecQ80MmvqKernel;
     // Issue #149: SoA-layout dp4a decode matvec + the interleaved→SoA repack kernel.
     private nint   _matvecQ80Dp4aSoaKernel;
     private nint   _q80RepackSoaKernel;
@@ -321,6 +324,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _gdnL2NormPerHeadKernel;
     private nint   _gdnTileHeadsKernel;
     private nint   _gdnRecurrenceDecodeKernel;
+    private nint   _gdnRecurrenceDecodeFastKernel;   // #404 Option B
+    private nint   _gdnDecodeNormGateKernel;          // #404 Option B
+    private nint   _gdnStateTransposeKernel;          // #404 Option B (row-major ⇄ transposed)
 
     // Issue #114-B: batched GDN trunk + batched-query SDPA kernels.
     private nint   _gdnConv1dDecodeBatchedKernel;
@@ -441,6 +447,20 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// </summary>
     public bool Q80Dp4aEnabled { get; set; } =
         Environment.GetEnvironmentVariable("SHARPI_Q80_DP4A") != "0";
+
+    /// <summary>
+    /// Issue #405: route the single-token (N=1) Q8_0 decode matvec through the high-MLP
+    /// <c>llm_matvec_q8_0_mmvq</c> kernel (a faithful port of llama.cpp's
+    /// <c>mul_mat_vec_q&lt;Q8_0,1&gt;</c>) instead of <c>llm_matvec_q8_0_dp4a</c>. Both quantize
+    /// the activation to Q8_1 (int8 + __dp4a), so this is argmax-stable, NOT byte-exact —
+    /// the SAME contract as <see cref="Q80Dp4aEnabled"/>. The win is cold/in-context DRAM
+    /// bandwidth: mmvq keeps far more independent weight loads in flight (128 thr/block,
+    /// 1 row/block, vdr=2 independent loads, grid-stride over 32 blocks/iter), where the
+    /// dp4a kernel's per-lane funnelshift load chain stalls cold reads at ~215 GB/s.
+    /// OFF by default; the GDN-hybrid plain-decode trunk sets it from
+    /// <c>SHARPI_TRUNK_MATVEC_FAST</c>. Only affects the <see cref="MatMul"/> N=1 path.
+    /// </summary>
+    public bool TrunkMatVecFast { get; set; }
 
     /// <summary>
     /// Issue #219: compute the greedy argmax on-device (<see cref="Argmax"/>) so a decode token
@@ -2200,7 +2220,14 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         // hidden dim qualifies). Falls back to the fp32-decode kernel otherwise.
         if (weightDType == DType.Q8_0 && Q80Dp4aEnabled && (cols & 31) == 0)
         {
-            DispatchMatVecQ80Dp4a(wPtr, xPtr, yPtr, rows, cols, soa: _soaHandles.ContainsKey(matrix.Handle));
+            bool q80Soa = _soaHandles.ContainsKey(matrix.Handle);
+            // Issue #405: the high-MLP mmvq kernel for the GDN-hybrid plain-decode trunk
+            // (AoS only — it reads the same 34-B/block layout the trunk uploads raw). SoA
+            // weights stay on the existing dp4a-soa path.
+            if (TrunkMatVecFast && !q80Soa)
+                DispatchMatVecQ80Mmvq(wPtr, xPtr, yPtr, rows, cols);
+            else
+                DispatchMatVecQ80Dp4a(wPtr, xPtr, yPtr, rows, cols, soa: q80Soa);
             return;
         }
         // Issue #124: Q4_0 decode matvec via dp4a/Q8_1 (cols % 32 == 0). Falls back to
@@ -3439,6 +3466,55 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 soa ? _matvecQ80Dp4aSoaKernel : _matvecQ80Dp4aKernel, (uint)rows, 1, 1,
                 32, 8, 1, 0, _stream, args, null);
             if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_q8_0_dp4a) failed: {rm}");
+        }
+    }
+
+    /// <summary>
+    /// Issue #405: high-MLP Q8_0 decode matvec — a faithful port of llama.cpp's
+    /// <c>mul_mat_vec_q&lt;Q8_0, ncols_dst=1&gt;</c> for the cold single-token trunk read.
+    /// Same Q8_1 activation quantization as <see cref="DispatchMatVecQ80Dp4a"/>, but the
+    /// matvec uses 128 threads/block, one output row per block, and a grid-stride loop
+    /// with two independent int-word loads per thread — keeping enough weight loads in
+    /// flight to saturate cold DRAM (the dp4a kernel's funnelshift load chain does not).
+    /// Reads the AoS 34-B/block weight (no SoA repack). Requires <c>cols % 32 == 0</c>.
+    /// Argmax-stable, NOT byte-exact — identical contract to the dp4a path.
+    /// </summary>
+    private void DispatchMatVecQ80Mmvq(nint wPtr, nint xPtr, nint yPtr, int rows, int cols)
+    {
+        if ((cols & 31) != 0)
+            throw new InvalidOperationException(
+                $"CUDA matvec_q8_0_mmvq requires cols % 32 == 0 (got {cols}).");
+
+        int subBlocks = cols / 32;
+        EnsureQ81Buf((nuint)((long)subBlocks * 36L));
+
+        // Quantize input → Q8_1 (32 threads per sub-block) — identical to the dp4a path.
+        {
+            nint qInPtr  = xPtr;
+            nint qOutPtr = _q81Buf;
+            int  qN      = cols;
+            nint* args = stackalloc nint[3] { (nint)(&qInPtr), (nint)(&qOutPtr), (nint)(&qN) };
+            int rq = NvrtcInterop.LaunchKernel(
+                _quantizeQ81Kernel, (uint)subBlocks, 1, 1,
+                32, 1, 1, 0, _stream, args, null);
+            if (rq != 0) throw new InvalidOperationException($"cuLaunchKernel(quantize_q8_1 for q8_0 mmvq) failed: {rq}");
+        }
+
+        // mmvq matvec: 1 row/block, 4 warps × 32 lanes = 128 threads (block dims 32×4).
+        // NOTE: the warp count here MUST equal MATVEC_Q80_MMVQ_NWARPS in the kernel string
+        // (CudaTextKernels.cs) — the kernel sizes tmp_shared and the per-warp reduce by it.
+        {
+            nint q81Ptr = _q81Buf;
+            int  pRows  = rows, pCols = cols;
+            nint* args = stackalloc nint[5]
+            {
+                (nint)(&wPtr), (nint)(&q81Ptr), (nint)(&yPtr),
+                (nint)(&pRows), (nint)(&pCols)
+            };
+            int rm = NvrtcInterop.LaunchKernel(
+                _matvecQ80MmvqKernel, (uint)rows, 1, 1,
+                32, 4, 1, 0, _stream, args, null);
+            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_q8_0_mmvq) failed: {rm}");
         }
     }
 
@@ -6200,6 +6276,87 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_recurrence_decode) failed: {r}");
     }
 
+    /// <summary>
+    /// High-occupancy single-token GDN recurrence (issue #404, Option B). Drop-in
+    /// numeric sibling of <see cref="GdnRecurrenceDecode"/> for the PLAIN per-token
+    /// decode path: a warp-per-column kernel (full GPU occupancy, state read once)
+    /// writes the raw per-head readout, then a separate per-head RMSNorm + SiLU(z)
+    /// gate kernel finishes the output. The warp-reduced dot products reorder the FP
+    /// sums → argmax-stable, NOT byte-exact (same class as the chunked GDN prefill), so
+    /// callers must restrict this to the plain-decode path (NOT MTP verify / the
+    /// bit-parity oracle). Requires headDim % 32 == 0 and headDim ≤ 128 (qwen35moe
+    /// value head_dim = 128). State layout matches <see cref="GdnRecurrenceDecode"/> —
+    /// interchangeable per step.
+    /// </summary>
+    public void GdnRecurrenceDecodeFast(
+        Tensor state, Tensor q, Tensor k, Tensor v,
+        Tensor alphaIn, Tensor beta, Tensor ssmA, Tensor dtBias,
+        Tensor normWeight, Tensor z, Tensor output,
+        int numVHeads, int headDim, float normEps = 1e-6f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (headDim % 32 != 0 || headDim > 128)
+            throw new NotSupportedException(
+                $"GdnRecurrenceDecodeFast requires headDim % 32 == 0 and headDim <= 128 (got {headDim}).");
+
+        const int numWarps = 4;   // block.y; grid.z = ceil(headDim / numWarps)
+
+        // Kernel 1: warp-per-column recurrence → raw readout in `output`.
+        nint sP = GetDevPtr(state);
+        nint qP = GetDevPtr(q), kP = GetDevPtr(k), vP = GetDevPtr(v);
+        nint aP = GetDevPtr(alphaIn), bP = GetDevPtr(beta);
+        nint aaP = GetDevPtr(ssmA), dbP = GetDevPtr(dtBias);
+        nint oP = GetDevPtr(output);
+        int pHV = numVHeads, pD = headDim;
+        nint* args1 = stackalloc nint[11]
+        {
+            (nint)(&sP), (nint)(&qP), (nint)(&kP), (nint)(&vP),
+            (nint)(&aP), (nint)(&bP), (nint)(&aaP), (nint)(&dbP),
+            (nint)(&oP), (nint)(&pHV), (nint)(&pD)
+        };
+        uint gridZ = (uint)((headDim + numWarps - 1) / numWarps);
+        int r1 = NvrtcInterop.LaunchKernel(_gdnRecurrenceDecodeFastKernel,
+            (uint)numVHeads, 1, gridZ, 32, (uint)numWarps, 1, 0, _stream, args1, null);
+        if (r1 != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_recurrence_decode_fast) failed: {r1}");
+
+        // Kernel 2: per-head RMSNorm + SiLU(z) gate over the raw readout (in place).
+        nint nwP = GetDevPtr(normWeight), zP = GetDevPtr(z);
+        float pE = normEps;
+        nint* args2 = stackalloc nint[6]
+        {
+            (nint)(&oP), (nint)(&nwP), (nint)(&zP), (nint)(&pHV), (nint)(&pD), (nint)(&pE)
+        };
+        uint sharedBytes = (uint)(headDim * sizeof(float));
+        int r2 = NvrtcInterop.LaunchKernel(_gdnDecodeNormGateKernel,
+            (uint)numVHeads, 1, 1, (uint)headDim, 1, 1, sharedBytes, _stream, args2, null);
+        if (r2 != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_decode_norm_gate) failed: {r2}");
+    }
+
+    /// <summary>
+    /// In-place per-head square transpose of the <c>[numVHeads, headDim, headDim]</c>
+    /// GDN state (issue #404, Option B). Converts the canonical row-major layout
+    /// <c>S[h·d·d + i·d + j]</c> to the column-major layout <see cref="GdnRecurrenceDecodeFast"/>
+    /// reads coalesced — and back (the transpose is its own inverse). Used only at
+    /// layout transitions, so it is not perf-critical.
+    /// </summary>
+    public void GdnStateTranspose(Tensor state, int numVHeads, int headDim)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint sP = GetDevPtr(state);
+        int pHV = numVHeads, pD = headDim;
+        nint* args = stackalloc nint[3] { (nint)(&sP), (nint)(&pHV), (nint)(&pD) };
+        const uint tile = 16;
+        uint gx = (uint)((headDim + tile - 1) / tile);
+        int r = NvrtcInterop.LaunchKernel(_gdnStateTransposeKernel,
+            gx, gx, (uint)numVHeads, tile, tile, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_state_transpose) failed: {r}");
+    }
+
     // ── Issue #114-B: batched GDN trunk over a chunk of N prompt tokens ────────
 
     /// <summary>
@@ -6745,7 +6902,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _matvecQ5KGemmNKernel, _matvecQ6KGemmNKernel,
             _matvecQ6KGemmNSoaKernel,                                  // #204
             _matvecQ80GemmNKernel, _mmqQ80Kernel, _mmqQ80SoaKernel, _mmqQ4kKernel, _mmqQ4kSoaKernel,
-            _matvecQ80Dp4aSoaKernel, _q80RepackSoaKernel,
+            _matvecQ80Dp4aKernel, _matvecQ80MmvqKernel, _q80RepackSoaKernel,   // #142/#405
             _matvecQ80SoaKernel, _matvecQ80GemmNSoaKernel, _dequantQ80F16SoaKernel,
             // #156/#160: Q4_K SoA repack + decode/N2/GEMM-N/dequant readers, and the
             // AoS dequant (all were missing — eager-JIT them so first decode pays no stutter).
@@ -6766,6 +6923,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
             _siluInplaceKernel, _gdnConv1dDecodeKernel, _gdnL2NormPerHeadKernel,
             _gdnTileHeadsKernel, _gdnRecurrenceDecodeKernel,
+            _gdnRecurrenceDecodeFastKernel, _gdnDecodeNormGateKernel,   // #404
+            _gdnStateTransposeKernel,   // #404
             _gdnConv1dDecodeBatchedKernel, _gdnConv1dStateUpdateBatchedKernel,
             _gdnConv1dStateCaptureRingKernel,   // #290
             _gdnL2NormPerHeadBatchedKernel, _gdnTileHeadsBatchedKernel, _gdnRecurrenceScanKernel,
@@ -6864,6 +7023,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _matvecQ40Dp4aKernel   = GetKernelFunc("llm_matvec_q4_0_dp4a");   // #124
         _matvecQ80Kernel       = GetKernelFunc("llm_matvec_q8_0");
         _matvecQ80Dp4aKernel   = GetKernelFunc("llm_matvec_q8_0_dp4a");
+        _matvecQ80MmvqKernel   = GetKernelFunc("llm_matvec_q8_0_mmvq");   // #405
         _matvecF32N2Kernel     = GetKernelFunc("llm_matvec_f32_n2");
         _matvecQ4KN2Kernel     = GetKernelFunc("llm_matvec_q4k_n2");
         _matvecQ4KN2SoaKernel  = GetKernelFunc("llm_matvec_q4k_n2_soa");
@@ -6981,6 +7141,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _gdnL2NormPerHeadKernel   = GetKernelFunc("llm_gdn_l2_norm_per_head");
         _gdnTileHeadsKernel       = GetKernelFunc("llm_gdn_tile_heads");
         _gdnRecurrenceDecodeKernel = GetKernelFunc("llm_gdn_recurrence_decode");
+        _gdnRecurrenceDecodeFastKernel = GetKernelFunc("llm_gdn_recurrence_decode_fast");   // #404
+        _gdnDecodeNormGateKernel       = GetKernelFunc("llm_gdn_decode_norm_gate");          // #404
+        _gdnStateTransposeKernel       = GetKernelFunc("llm_gdn_state_transpose");           // #404
 
         // qwen35moe GDN batched trunk + batched-query SDPA kernels (issue #114-B).
         _gdnConv1dDecodeBatchedKernel      = GetKernelFunc("llm_gdn_conv1d_decode_batched");
