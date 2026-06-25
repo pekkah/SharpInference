@@ -522,6 +522,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private long _profMoeTicks;
     private long _profTotalTicks;
     private int _profTokens;
+    // Decode profiling (SHARPI_DECODE_PROFILE=1): per-token GPU-trunk vs CPU-MoE split. The
+    // trunk launches are async and already drained at the per-layer MoE Download sync, so adding
+    // an explicit sync right after the trunk just moves that drain earlier (≈no perturbation) and
+    // attributes the GPU compute. Read the trunk:moe ratio to find the decode pole.
+    private static readonly bool _decodeProfile =
+        Environment.GetEnvironmentVariable("SHARPI_DECODE_PROFILE") == "1";
+    private long _pdTrunkTicks, _pdMoeTicks;
+    private int _pdTokens;
     // Sub-phase breakdown of the batched routed-MoE (BatchedRoutedExperts), accumulated
     // across the layer loop and printed once per chunk on the [moe-subphase] line when
     // SHARPI_PREFILL_PROFILE=1. Establishes whether routed-MoE prefill cost is in the
@@ -4134,6 +4142,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // 3. Trunk layers
         for (int layer = 0; layer < _hp.NumLayers; layer++)
         {
+            long ltp0 = _decodeProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             // ── Pre-block residual + norm on GPU ────────────────────
             _gpu.CopyDevice(_gpuResidual, _gpuHidden);
             _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuAttnNorm[layer], _hp.RmsNormEps);
@@ -4160,6 +4169,13 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             // ── Pre-MoE residual + norm on GPU ──────────────────────
             _gpu.CopyDevice(_gpuResidual, _gpuHidden);
             _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuPostAttnNorm[layer], _hp.RmsNormEps);
+
+            if (_decodeProfile)
+            {
+                _gpu.Synchronize();   // drain the trunk to attribute its GPU time (the MoE Download would drain it anyway)
+                _pdTrunkTicks += System.Diagnostics.Stopwatch.GetTimestamp() - ltp0;
+            }
+            long mtp0 = _decodeProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
             if (!_hp.IsMoE)
             {
@@ -4200,6 +4216,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
             // Residual add
             _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+
+            if (_decodeProfile) _pdMoeTicks += System.Diagnostics.Stopwatch.GetTimestamp() - mtp0;
 
             if (_traceLayers) TraceGpuTensor(position, layer, "moe-resid", _gpuHidden, _embDim);
         }
@@ -4253,6 +4271,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         {
             _profTotalTicks += System.Diagnostics.Stopwatch.GetTimestamp() - fwdT0;
             _profTokens++;
+        }
+
+        if (_decodeProfile && ++_pdTokens % 50 == 0)
+        {
+            double f = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            Console.Error.WriteLine(
+                $"[decode-profile] {_pdTokens} tok: trunk={_pdTrunkTicks * f / _pdTokens:F2} ms/tok " +
+                $"moe(dl+cpu+ul)={_pdMoeTicks * f / _pdTokens:F2} ms/tok " +
+                $"(trunk {100.0 * _pdTrunkTicks / (_pdTrunkTicks + _pdMoeTicks):F0}% / moe {100.0 * _pdMoeTicks / (_pdTrunkTicks + _pdMoeTicks):F0}%)");
         }
 
         return _logitsBuf;
