@@ -8408,6 +8408,171 @@ extern ""C"" __global__ void llm_gdn_recurrence_decode(
     output[hd_off + j] = o_normed * silu;
 }
 
+// ── GDN: high-occupancy warp-per-column recurrence decode (single token) ─────
+// Issue #404 / Option B: the occupancy-optimized sibling of
+// llm_gdn_recurrence_decode, mirroring llama.cpp's gated_delta_net_cuda. The
+// original launches only `hv` blocks (one per v-head) — leaving most SMs idle — and
+// re-reads the [d×d] state from global memory twice. This launches one WARP PER
+// OUTPUT COLUMN (grid (hv, 1, ceil(d/blockDim.y)), block (32, blockDim.y)), so the d
+// columns of every head spread across many blocks → full occupancy. Within a token
+// each warp holds its column's d state rows in registers (sharded ~d/32 per lane),
+// reads the state ONCE, and warp-reduces the two key/query dot products. The decay is
+// folded into the kv dot (kv from the OLD state, like llama.cpp) so the rank-1 update
+// + readout is a single fused pass with one state write. Because columns now span
+// multiple blocks, the per-head ssm_norm (RMSNorm) + SiLU(z) gate the original did
+// in-block CANNOT reduce here — it is a SEPARATE launch (llm_gdn_decode_norm_gate)
+// over the raw readout. The warp-reduce changes the FP reduction order vs the original
+// → argmax-stable, NOT byte-exact (same numeric class as the chunked GDN prefill).
+//
+// State layout: TRANSPOSED (column-major within head) — state[h*d*d + col*d + i] holds
+// S[i][col]. This is what makes the per-lane shard read COALESCED: lane reads rows
+// i = r*32+lane of column `col` at consecutive addresses (col*d + r*32 + lane). The
+// canonical state is row-major S[i*d+col]; the host transposes a layer in-place
+// (llm_gdn_state_transpose) on entry to the fast-decode regime and back before any
+// row-major consumer (scan / snapshot). GDN_DECODE_MAX_RPL = 4 supports head_dim ≤ 128
+// (the qwen35moe value head_dim); the host wrapper requires headDim % 32 == 0 and ≤ 128.
+#define GDN_DECODE_MAX_RPL 4
+extern ""C"" __global__ void __launch_bounds__(128, 2) llm_gdn_recurrence_decode_fast(
+    float* __restrict__ state,
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ alpha_in,
+    const float* __restrict__ beta,
+    const float* __restrict__ ssm_a,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ readout,
+    int hv, int d)
+{
+    int h    = (int)blockIdx.x;
+    int col  = (int)(blockIdx.z * blockDim.y + threadIdx.y);
+    int lane = (int)threadIdx.x;              // 0..31
+    if (h >= hv || col >= d) return;          // whole warp shares col ⇒ no intra-warp divergence
+
+    int rpl = (d + 31) / 32;                  // rows per lane (= d/32 since d%32==0; ≤ GDN_DECODE_MAX_RPL)
+
+    // Per-head scalar gates: the softplus/exp/sigmoid chain is identical for every
+    // column of a head, so compute it once on lane 0 and broadcast across the warp —
+    // doing it per-lane would be 32× redundant SFU work in an otherwise tiny kernel.
+    float decay = 0.f, b_sc = 0.f;
+    if (lane == 0) {
+        float alpha_x = alpha_in[h] + dt_bias[h];
+        float dt      = alpha_x >= 20.0f ? alpha_x : __logf(1.0f + __expf(alpha_x));
+        decay = __expf(dt * ssm_a[h]);
+        b_sc  = 1.0f / (1.0f + __expf(-beta[h]));
+    }
+    decay = __shfl_sync(0xffffffffu, decay, 0);
+    b_sc  = __shfl_sync(0xffffffffu, b_sc, 0);
+
+    long state_base = (long)h * (long)d * (long)d;
+    long hd_off     = (long)h * d;
+
+    // Load this warp's column shard of the state + the row-sharded k/q into registers.
+    // Transposed state: column `col` is contiguous (col*d + i) ⇒ coalesced across lanes.
+    // d%32==0 ⇒ i = r*32+lane < d whenever r < rpl, so no per-element bounds test needed.
+    long col_base = state_base + (long)col * d;
+    float s_shard[GDN_DECODE_MAX_RPL];
+    float k_reg[GDN_DECODE_MAX_RPL];
+    float q_reg[GDN_DECODE_MAX_RPL];
+    #pragma unroll
+    for (int r = 0; r < GDN_DECODE_MAX_RPL; r++) {
+        int i = r * 32 + lane;
+        bool ok = (r < rpl);
+        s_shard[r] = ok ? state[col_base + i] : 0.f;
+        k_reg[r]   = ok ? k[hd_off + i] : 0.f;
+        q_reg[r]   = ok ? q[hd_off + i] : 0.f;
+    }
+
+    // Pass A: kv[col] = Σ_i k[i]·S[i,col] over the OLD state; p[col] = decay·kv[col].
+    float kv_shard = 0.f;
+    #pragma unroll
+    for (int r = 0; r < GDN_DECODE_MAX_RPL; r++)
+        kv_shard += s_shard[r] * k_reg[r];
+    float kv_col = sharpi_warp_reduce_sum(kv_shard);
+    float p_col  = decay * kv_col;
+
+    float delta_col = b_sc * (v[hd_off + col] - p_col);
+
+    // Pass B: fused rank-1 update S[i,col] = decay·S[i,col] + k[i]·delta, readout
+    // o[col] = (1/√d)·Σ_i q[i]·S'[i,col].
+    float attn_shard = 0.f;
+    #pragma unroll
+    for (int r = 0; r < GDN_DECODE_MAX_RPL; r++) {
+        s_shard[r]  = decay * s_shard[r] + k_reg[r] * delta_col;
+        attn_shard += s_shard[r] * q_reg[r];
+    }
+    float o_col = sharpi_warp_reduce_sum(attn_shard) * rsqrtf((float)d);
+
+    // Write the updated state shard back (transposed, coalesced) + raw readout.
+    #pragma unroll
+    for (int r = 0; r < GDN_DECODE_MAX_RPL; r++) {
+        int i = r * 32 + lane;
+        if (r < rpl)
+            state[col_base + i] = s_shard[r];
+    }
+    if (lane == 0)
+        readout[hd_off + col] = o_col;
+}
+
+// ── GDN: per-head RMSNorm(readout)·norm_weight · SiLU(z) gate ─────────────────
+// Issue #404 / Option B: the split tail of llm_gdn_recurrence_decode_fast. The fast
+// recurrence kernel spreads each head's d columns across blocks, so it cannot do the
+// per-head RMSNorm reduction in-kernel; this kernel does it as a separate launch. One
+// block per v-head, blockDim = d (thread j owns column j). Reads the raw readout
+// o[h*d+j] (the 1/√d-scaled Σ q·S'), applies RMSNorm with the same tree reduction +
+// eps floor as the original kernel's tail, scales by norm_weight[j], then by
+// SiLU(z[h*d+j]), and writes the final gated output back in place. Byte-identical to
+// the original kernel's tail given the same readout input.
+extern ""C"" __global__ void llm_gdn_decode_norm_gate(
+    float* __restrict__ output,
+    const float* __restrict__ norm_weight,
+    const float* __restrict__ z,
+    int hv, int d, float norm_eps)
+{
+    int h = (int)blockIdx.x;
+    int j = (int)threadIdx.x;
+    if (h >= hv || j >= d) return;
+
+    extern __shared__ float sRed[];
+    long hd_off = (long)h * d;
+
+    float o_local = output[hd_off + j];
+    sRed[j] = o_local * o_local;
+    __syncthreads();
+    for (int s = d / 2; s > 0; s >>= 1) {
+        if (j < s) sRed[j] += sRed[j + s];
+        __syncthreads();
+    }
+    float scale = rsqrtf(sRed[0] / (float)d + norm_eps);
+    float o_normed = o_local * scale * norm_weight[j];
+
+    float zv = z[hd_off + j];
+    float silu = zv / (1.0f + __expf(-zv));
+    output[hd_off + j] = o_normed * silu;
+}
+
+// ── GDN: in-place per-head square transpose of the [d×d] state ────────────────
+// Issue #404 / Option B: converts the canonical row-major state S[h*d*d + i*d + j]
+// to the transposed (column-major) layout the fast decode kernel reads coalesced —
+// and back again (the transpose is its own inverse). One thread per (i,j) upper-
+// triangle pair swaps state[i*d+j] ↔ state[j*d+i]; the diagonal is left untouched.
+// Used only at layout transitions (fast-decode entry / before any row-major consumer
+// such as the batched scan or the end-of-decode snapshot), so it is not perf-critical.
+extern ""C"" __global__ void llm_gdn_state_transpose(
+    float* __restrict__ state, int hv, int d)
+{
+    int h = (int)blockIdx.z;
+    int i = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    int j = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (h >= hv || i >= d || j >= d || i >= j) return;   // upper triangle only (i < j)
+    long base = (long)h * (long)d * (long)d;
+    long a = base + (long)i * d + j;
+    long b = base + (long)j * d + i;
+    float tmp = state[a];
+    state[a]  = state[b];
+    state[b]  = tmp;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 //  Issue #114-B: batched GDN trunk kernels — collapse the per-position decode
 //  launches into one launch each over all N prompt tokens. Every kernel runs the

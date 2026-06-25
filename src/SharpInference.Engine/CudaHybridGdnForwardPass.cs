@@ -197,6 +197,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private readonly Tensor?[] _gpuGdnScanState;     // [numGdn] F32 [num_v_heads, head_dim, head_dim]
     private readonly Tensor?[] _gpuGdnConvState;     // [numGdn] F32 [kernel-1, conv_channels] oldest-first
 
+    // #404 Option B: per-layer flag — is _gpuGdnScanState[layer] currently in the
+    // transposed (column-major) layout the fast decode kernel reads coalesced? Mirrors
+    // _gpuGdnScanState indexing (non-GDN layers stay false). Lazily flipped by
+    // EnsureGdnStateTransposed / EnsureGdnStateRowMajor at layout transitions; the
+    // fast path runs only when MTP is off (_gpuGdnRingScan is null), so the transposed
+    // layout never coexists with the row-major scan/snapshot/ring consumers.
+    private bool[] _gdnStateTransposed = [];
+
     // GPU scratch reused across GDN layers.
     private readonly Tensor _gpuGdnQkv;              // [conv_channels]
     private readonly Tensor _gpuGdnQkvConv;          // [conv_channels] post-conv1d + SiLU
@@ -593,6 +601,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // to the F32-dequant upload (the byte-exact reference the bit-parity oracle pins).
     internal static bool RawQ80WeightsEnabled =
         Environment.GetEnvironmentVariable("SHARPI_GDN_RAW_Q8_0") != "0";
+
+    // Issue #404 (Option B): use the high-occupancy warp-per-column GDN recurrence
+    // decode kernel (GdnRecurrenceDecodeFast) for the PLAIN per-token decode path.
+    // The warp-reduced sums reorder the FP accumulation → argmax-stable, NOT byte-exact,
+    // so this is restricted to plain decode: the MTP draft sub-decode (which must match
+    // the verify scan's GdnRecurrenceScan state) and the bit-parity oracle keep the
+    // original byte-exact kernel. Default OFF; SHARPI_GDN_DECODE_FAST=1 enables.
+    internal static bool GdnDecodeFastEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_GDN_DECODE_FAST") == "1";
     // Issue #210: route the k MTP-draft tokens' routed-expert FFN in BatchVerify
     // through the #110 group-by-expert core (BatchedRoutedExperts) instead of the
     // per-token CpuMoeFfnCore loop, so each selected expert's mmap'd gate/up/down
@@ -1215,6 +1232,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpuSsmConv1d = new Tensor[L];
         _gpuGdnScanState = new Tensor?[L];
         _gpuGdnConvState = new Tensor?[L];
+        _gdnStateTransposed = new bool[L];   // #404: all row-major at start
 
         if (_cpuMoe)
         {
@@ -2209,6 +2227,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         var scanState = _gpuGdnScanState[layer]!;
         var convState = _gpuGdnConvState[layer]!;
+
+        // #404: the batched scan reads/writes row-major; flip back if a prior fast
+        // decode left this layer transposed (defensive — fast runs only when MTP is off,
+        // where this batched path does not interleave with it).
+        EnsureGdnStateRowMajor(layer, scanState);
 
         // Issue #114-B: fuse the per-position conv1d + delta-net recurrence into
         // one batched launch per stage + a single sequential-scan kernel. Output is
@@ -4014,6 +4037,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                     {
                         float* hostScan = _gdnStateCache.ScanStateAt(g);
                         _gpu.UploadInto(scanT, new ReadOnlySpan<float>(hostScan, scanFloats));
+                        _gdnStateTransposed[layer] = false;   // #404: uploaded host state is row-major
                     }
                     if (_gpuGdnConvState[layer] is { } convT && convFloats > 0)
                     {
@@ -4056,6 +4080,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 if (_gpuGdnScanState[i] is { } scan) _gpu.Clear(scan);
                 if (_gpuGdnConvState[i] is { } conv) _gpu.Clear(conv);
             }
+            Array.Clear(_gdnStateTransposed);   // #404: zeroed state is row-major
         }
         if (_hasMtp)
         {
@@ -4106,6 +4131,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 if (g < 0) continue;
                 if (_gpuGdnScanState[layer] is { } scanT && scanFloats > 0)
                 {
+                    // #404: the host cache is row-major; flip back if plain-decode left
+                    // this layer's live state transposed before downloading it.
+                    EnsureGdnStateRowMajor(layer, scanT);
                     float* hostScan = _gdnStateCache.ScanStateAt(g);
                     _gpu.Download(scanT, new Span<float>(hostScan, scanFloats));
                 }
@@ -4739,8 +4767,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         long scanBytes = scanF * sizeof(float);
         long convBytes = convF * sizeof(float);
         if (_gpuGdnScanState[layer] is { } scanT && scanBytes > 0)
+        {
+            EnsureGdnStateRowMajor(layer, scanT);   // #404: ring holds row-major snapshots
             _gpu.CopyDeviceRegion(_gpuGdnRingScan, ((long)slot * numGdn * scanF + gdnIdx * scanF) * sizeof(float),
                 scanT, 0, scanBytes);
+        }
         if (_gpuGdnConvState[layer] is { } convT && convBytes > 0 && _gpuGdnRingConv is { } convRing)
             _gpu.CopyDeviceRegion(convRing, ((long)slot * numGdn * convF + gdnIdx * convF) * sizeof(float),
                 convT, 0, convBytes);
@@ -4760,8 +4791,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         long scanBytes = scanF * sizeof(float);
         long convBytes = convF * sizeof(float);
         if (_gpuGdnScanState[layer] is { } scanT && scanBytes > 0)
+        {
+            // #404: ring slots are row-major; mark the restored live state row-major too.
             _gpu.CopyDeviceRegion(scanT, 0, _gpuGdnRingScan, ((long)slot * numGdn * scanF + gdnIdx * scanF) * sizeof(float),
                 scanBytes);
+            _gdnStateTransposed[layer] = false;
+        }
         if (_gpuGdnConvState[layer] is { } convT && convBytes > 0 && _gpuGdnRingConv is { } convRing)
             _gpu.CopyDeviceRegion(convT, 0, convRing, ((long)slot * numGdn * convF + gdnIdx * convF) * sizeof(float),
                 convBytes);
@@ -5586,7 +5621,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // =================================================================
 
     private void GpuGdnBlock(int layer, int position) =>
-        GpuGdnBlockAt(layer, position, normIn: _gpuNormBuf, hiddenOut: _gpuHidden);
+        GpuGdnBlockAt(layer, position, normIn: _gpuNormBuf, hiddenOut: _gpuHidden,
+                      allowFastDecode: true);
 
     /// <summary>
     /// GPU GDN block parameterised on input-norm / output-hidden tensors. The
@@ -5594,7 +5630,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// <see cref="_gpuGdnConvState"/> slot; the caller is responsible for
     /// snapshotting it between calls when running the batched verify path.
     /// </summary>
-    private void GpuGdnBlockAt(int layer, int position, Tensor normIn, Tensor hiddenOut)
+    private void GpuGdnBlockAt(int layer, int position, Tensor normIn, Tensor hiddenOut,
+                               bool allowFastDecode = false)
     {
         var scanState = _gpuGdnScanState[layer]!;
         var convState = _gpuGdnConvState[layer]!;
@@ -5638,15 +5675,62 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             (long)_gdnValueDim * sizeof(float));
 
         // 8. Recurrence: rank-1 state update + per-head RMSNorm + SiLU(z) gate (GPU).
-        _gpu.GdnRecurrenceDecode(
-            scanState, _gpuGdnQHead, _gpuGdnKHead, _gpuGdnVHead,
-            _gpuGdnAlpha, _gpuGdnBeta,
-            _gpuSsmA[layer], _gpuSsmDtBias[layer], _gpuSsmNormW[layer],
-            _gpuGdnZVec, _gpuGdnOut,
-            _gdnNumVHeads, _gdnHeadDim, normEps: 1e-6f);
+        //    #404 Option B: the high-occupancy warp-per-column kernel for PLAIN decode
+        //    (argmax-stable, coalesced via the transposed state layout). Gated to MTP-off
+        //    runs (_gpuGdnRingScan is null) so the transposed layout never coexists with
+        //    the row-major scan/snapshot/ring consumers, and excluded from the decode
+        //    CUDA-graph path (the transpose flip is a host-side decision, not capturable).
+        //    MTP draft/verify + the fallback trunk keep the original byte-exact kernel.
+        if (allowFastDecode && GdnDecodeFastEnabled && _gdnHeadDim == 128
+            && _gpuGdnRingScan is null && !_decodeCudaGraph)
+        {
+            EnsureGdnStateTransposed(layer, scanState);
+            _gpu.GdnRecurrenceDecodeFast(
+                scanState, _gpuGdnQHead, _gpuGdnKHead, _gpuGdnVHead,
+                _gpuGdnAlpha, _gpuGdnBeta,
+                _gpuSsmA[layer], _gpuSsmDtBias[layer], _gpuSsmNormW[layer],
+                _gpuGdnZVec, _gpuGdnOut,
+                _gdnNumVHeads, _gdnHeadDim, normEps: 1e-6f);
+        }
+        else
+        {
+            EnsureGdnStateRowMajor(layer, scanState);   // #404: defensive — original kernel needs row-major
+            _gpu.GdnRecurrenceDecode(
+                scanState, _gpuGdnQHead, _gpuGdnKHead, _gpuGdnVHead,
+                _gpuGdnAlpha, _gpuGdnBeta,
+                _gpuSsmA[layer], _gpuSsmDtBias[layer], _gpuSsmNormW[layer],
+                _gpuGdnZVec, _gpuGdnOut,
+                _gdnNumVHeads, _gdnHeadDim, normEps: 1e-6f);
+        }
 
         // 9. Output projection: ssm_out (input value_dim=4096, output emb_dim=2048).
         GpuMatMul(hiddenOut, _gpuWSsmOut[layer], _gpuGdnOut);
+    }
+
+    // ── #404 Option B: GDN state layout transitions (row-major ⇄ transposed) ──────
+    // The fast decode kernel reads/writes the per-head [d×d] state in a TRANSPOSED
+    // (column-major) layout so each warp's column shard is coalesced; every other
+    // consumer (the batched scan, snapshot download/upload, the MTP ring, the original
+    // recurrence kernel) uses the canonical row-major layout. These lazily flip a
+    // layer's live state in place and track the current layout in _gdnStateTransposed,
+    // so a transpose only fires at an actual transition (e.g. once at fast-decode entry).
+
+    /// <summary>Ensure layer <paramref name="layer"/>'s GDN state is in the transposed
+    /// layout the fast decode kernel expects (no-op if already transposed).</summary>
+    private void EnsureGdnStateTransposed(int layer, Tensor scanState)
+    {
+        if (_gdnStateTransposed[layer]) return;
+        _gpu.GdnStateTranspose(scanState, _gdnNumVHeads, _gdnHeadDim);
+        _gdnStateTransposed[layer] = true;
+    }
+
+    /// <summary>Ensure layer <paramref name="layer"/>'s GDN state is in the canonical
+    /// row-major layout every non-fast consumer expects (no-op if already row-major).</summary>
+    private void EnsureGdnStateRowMajor(int layer, Tensor scanState)
+    {
+        if (!_gdnStateTransposed[layer]) return;
+        _gpu.GdnStateTranspose(scanState, _gdnNumVHeads, _gdnHeadDim);
+        _gdnStateTransposed[layer] = false;
     }
 
     // =================================================================

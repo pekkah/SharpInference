@@ -310,6 +310,133 @@ public sealed unsafe class CudaGdnKernelsTests
     }
 
     [Fact]
+    public void GdnRecurrenceDecodeFast_ArgmaxStableVsCpuReference()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        // #404 Option B: the high-occupancy warp-per-column decode kernel. It reads/writes
+        // the per-head state in the TRANSPOSED layout (via GdnStateTranspose), and the
+        // warp-reduced sums reorder the FP accumulation vs the sequential CPU reference →
+        // argmax-stable, NOT byte-exact, so compare with a relative tolerance (same class as
+        // the chunked-prefill parity test) plus a finiteness check. This also exercises the
+        // transpose kernel round-trip (row-major → transposed → fast → row-major). Model
+        // shape: 32 v-heads × 128.
+        const int Hv = 32;
+        const int D = 128;
+        int qkv = Hv * D;
+        int stateLen = Hv * D * D;
+
+        var rng = new Random(0x404B);
+        var q = RandomArray(rng, qkv, -0.5f, 0.5f);
+        var k = RandomArray(rng, qkv, -0.5f, 0.5f);
+        var v = RandomArray(rng, qkv, -0.5f, 0.5f);
+        var alphaIn = RandomArray(rng, Hv, -0.3f, 0.3f);
+        var beta = RandomArray(rng, Hv, -0.3f, 0.3f);
+        var ssmA = RandomArray(rng, Hv, -0.5f, -0.01f);
+        var dtBias = RandomArray(rng, Hv, -0.1f, 0.1f);
+        var normW = RandomArray(rng, D, 0.5f, 1.5f);
+        var z = RandomArray(rng, qkv, -1f, 1f);
+        var state = RandomArray(rng, stateLen, -0.1f, 0.1f);
+
+        // CPU reference: the byte-exact per-token decode.
+        var stateCpu = (float[])state.Clone();
+        var outputCpu = new float[qkv];
+        GdnKernels.GdnRecurrenceDecode(q, k, v, alphaIn, beta, ssmA, dtBias, normW, z,
+            stateCpu, outputCpu, Hv, D);
+
+        var gpuState = gpu.Upload(state, TensorShape.D1(stateLen));
+        var gpuQ = gpu.Upload(q, TensorShape.D1(qkv));
+        var gpuK = gpu.Upload(k, TensorShape.D1(qkv));
+        var gpuV = gpu.Upload(v, TensorShape.D1(qkv));
+        var gpuAlpha = gpu.Upload(alphaIn, TensorShape.D1(Hv));
+        var gpuBeta = gpu.Upload(beta, TensorShape.D1(Hv));
+        var gpuSsmA = gpu.Upload(ssmA, TensorShape.D1(Hv));
+        var gpuDtBias = gpu.Upload(dtBias, TensorShape.D1(Hv));
+        var gpuNormW = gpu.Upload(normW, TensorShape.D1(D));
+        var gpuZ = gpu.Upload(z, TensorShape.D1(qkv));
+        var gpuOut = gpu.Allocate(TensorShape.D1(qkv));
+
+        // The fast kernel reads/writes the transposed layout: row-major → transposed,
+        // run, then transposed → row-major (the transpose is its own inverse) so the
+        // downloaded state compares directly against the row-major CPU reference.
+        gpu.GdnStateTranspose(gpuState, Hv, D);
+        gpu.GdnRecurrenceDecodeFast(gpuState, gpuQ, gpuK, gpuV,
+            gpuAlpha, gpuBeta, gpuSsmA, gpuDtBias, gpuNormW, gpuZ, gpuOut, Hv, D);
+        gpu.GdnStateTranspose(gpuState, Hv, D);
+        gpu.Synchronize();
+
+        var outputGpu = new float[qkv];
+        var stateGpu = new float[stateLen];
+        gpu.Download(gpuOut, outputGpu);
+        gpu.Download(gpuState, stateGpu);
+
+        gpu.Free(gpuState); gpu.Free(gpuQ); gpu.Free(gpuK); gpu.Free(gpuV);
+        gpu.Free(gpuAlpha); gpu.Free(gpuBeta); gpu.Free(gpuSsmA); gpu.Free(gpuDtBias);
+        gpu.Free(gpuNormW); gpu.Free(gpuZ); gpu.Free(gpuOut);
+
+        int badOut = 0; float maxOut = 0f;
+        for (int i = 0; i < qkv; i++)
+        {
+            Assert.True(float.IsFinite(outputGpu[i]), $"non-finite output at [{i}]: {outputGpu[i]}");
+            float err = MathF.Abs(outputGpu[i] - outputCpu[i]);
+            maxOut = MathF.Max(maxOut, err);
+            if (err > 3e-3f + 3e-3f * MathF.Abs(outputCpu[i])) badOut++;
+        }
+        Assert.True(badOut == 0,
+            $"GdnRecurrenceDecodeFast output: {badOut} / {qkv} exceed tol (max err {maxOut}).");
+
+        int badState = 0; float maxState = 0f;
+        for (int i = 0; i < stateLen; i++)
+        {
+            Assert.True(float.IsFinite(stateGpu[i]), $"non-finite state at [{i}]");
+            float err = MathF.Abs(stateGpu[i] - stateCpu[i]);
+            maxState = MathF.Max(maxState, err);
+            if (err > 3e-3f + 3e-3f * MathF.Abs(stateCpu[i])) badState++;
+        }
+        Assert.True(badState == 0,
+            $"GdnRecurrenceDecodeFast state: {badState} / {stateLen} exceed tol (max err {maxState}).");
+    }
+
+    [Fact]
+    public void GdnStateTranspose_IsInvolutionAndMatchesCpu()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+
+        // #404 Option B: the in-place per-head [d×d] transpose used to flip the GDN
+        // state between row-major and the fast kernel's column-major layout. It is a
+        // pure data move (byte-exact) and its own inverse.
+        const int Hv = 32, D = 128;
+        int stateLen = Hv * D * D;
+        var rng = new Random(0x404C);
+        var state = RandomArray(rng, stateLen, -1f, 1f);
+
+        // CPU transpose per head: T[h,i,j] = S[h,j,i].
+        var expectedT = new float[stateLen];
+        for (int h = 0; h < Hv; h++)
+            for (int i = 0; i < D; i++)
+                for (int j = 0; j < D; j++)
+                    expectedT[(long)h * D * D + i * D + j] = state[(long)h * D * D + j * D + i];
+
+        var g = gpu.Upload(state, TensorShape.D1(stateLen));
+        gpu.GdnStateTranspose(g, Hv, D);
+        gpu.Synchronize();
+        var once = new float[stateLen];
+        gpu.Download(g, once);
+        gpu.GdnStateTranspose(g, Hv, D);   // second transpose restores the original
+        gpu.Synchronize();
+        var twice = new float[stateLen];
+        gpu.Download(g, twice);
+        gpu.Free(g);
+
+        for (int n = 0; n < stateLen; n++)
+            Assert.Equal(expectedT[n], once[n]);    // byte-exact data move
+        for (int n = 0; n < stateLen; n++)
+            Assert.Equal(state[n], twice[n]);        // involution
+    }
+
+    [Fact]
     public void GdnChunkedPrefill_ModelStridesMultiChunk_MatchesCpuReference()
     {
         using var gpu = TryCreate();

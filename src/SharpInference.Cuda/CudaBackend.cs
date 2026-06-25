@@ -321,6 +321,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _gdnL2NormPerHeadKernel;
     private nint   _gdnTileHeadsKernel;
     private nint   _gdnRecurrenceDecodeKernel;
+    private nint   _gdnRecurrenceDecodeFastKernel;   // #404 Option B
+    private nint   _gdnDecodeNormGateKernel;          // #404 Option B
+    private nint   _gdnStateTransposeKernel;          // #404 Option B (row-major ⇄ transposed)
 
     // Issue #114-B: batched GDN trunk + batched-query SDPA kernels.
     private nint   _gdnConv1dDecodeBatchedKernel;
@@ -6200,6 +6203,87 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_recurrence_decode) failed: {r}");
     }
 
+    /// <summary>
+    /// High-occupancy single-token GDN recurrence (issue #404, Option B). Drop-in
+    /// numeric sibling of <see cref="GdnRecurrenceDecode"/> for the PLAIN per-token
+    /// decode path: a warp-per-column kernel (full GPU occupancy, state read once)
+    /// writes the raw per-head readout, then a separate per-head RMSNorm + SiLU(z)
+    /// gate kernel finishes the output. The warp-reduced dot products reorder the FP
+    /// sums → argmax-stable, NOT byte-exact (same class as the chunked GDN prefill), so
+    /// callers must restrict this to the plain-decode path (NOT MTP verify / the
+    /// bit-parity oracle). Requires headDim % 32 == 0 and headDim ≤ 128 (qwen35moe
+    /// value head_dim = 128). State layout matches <see cref="GdnRecurrenceDecode"/> —
+    /// interchangeable per step.
+    /// </summary>
+    public void GdnRecurrenceDecodeFast(
+        Tensor state, Tensor q, Tensor k, Tensor v,
+        Tensor alphaIn, Tensor beta, Tensor ssmA, Tensor dtBias,
+        Tensor normWeight, Tensor z, Tensor output,
+        int numVHeads, int headDim, float normEps = 1e-6f)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (headDim % 32 != 0 || headDim > 128)
+            throw new NotSupportedException(
+                $"GdnRecurrenceDecodeFast requires headDim % 32 == 0 and headDim <= 128 (got {headDim}).");
+
+        const int numWarps = 4;   // block.y; grid.z = ceil(headDim / numWarps)
+
+        // Kernel 1: warp-per-column recurrence → raw readout in `output`.
+        nint sP = GetDevPtr(state);
+        nint qP = GetDevPtr(q), kP = GetDevPtr(k), vP = GetDevPtr(v);
+        nint aP = GetDevPtr(alphaIn), bP = GetDevPtr(beta);
+        nint aaP = GetDevPtr(ssmA), dbP = GetDevPtr(dtBias);
+        nint oP = GetDevPtr(output);
+        int pHV = numVHeads, pD = headDim;
+        nint* args1 = stackalloc nint[11]
+        {
+            (nint)(&sP), (nint)(&qP), (nint)(&kP), (nint)(&vP),
+            (nint)(&aP), (nint)(&bP), (nint)(&aaP), (nint)(&dbP),
+            (nint)(&oP), (nint)(&pHV), (nint)(&pD)
+        };
+        uint gridZ = (uint)((headDim + numWarps - 1) / numWarps);
+        int r1 = NvrtcInterop.LaunchKernel(_gdnRecurrenceDecodeFastKernel,
+            (uint)numVHeads, 1, gridZ, 32, (uint)numWarps, 1, 0, _stream, args1, null);
+        if (r1 != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_recurrence_decode_fast) failed: {r1}");
+
+        // Kernel 2: per-head RMSNorm + SiLU(z) gate over the raw readout (in place).
+        nint nwP = GetDevPtr(normWeight), zP = GetDevPtr(z);
+        float pE = normEps;
+        nint* args2 = stackalloc nint[6]
+        {
+            (nint)(&oP), (nint)(&nwP), (nint)(&zP), (nint)(&pHV), (nint)(&pD), (nint)(&pE)
+        };
+        uint sharedBytes = (uint)(headDim * sizeof(float));
+        int r2 = NvrtcInterop.LaunchKernel(_gdnDecodeNormGateKernel,
+            (uint)numVHeads, 1, 1, (uint)headDim, 1, 1, sharedBytes, _stream, args2, null);
+        if (r2 != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_decode_norm_gate) failed: {r2}");
+    }
+
+    /// <summary>
+    /// In-place per-head square transpose of the <c>[numVHeads, headDim, headDim]</c>
+    /// GDN state (issue #404, Option B). Converts the canonical row-major layout
+    /// <c>S[h·d·d + i·d + j]</c> to the column-major layout <see cref="GdnRecurrenceDecodeFast"/>
+    /// reads coalesced — and back (the transpose is its own inverse). Used only at
+    /// layout transitions, so it is not perf-critical.
+    /// </summary>
+    public void GdnStateTranspose(Tensor state, int numVHeads, int headDim)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint sP = GetDevPtr(state);
+        int pHV = numVHeads, pD = headDim;
+        nint* args = stackalloc nint[3] { (nint)(&sP), (nint)(&pHV), (nint)(&pD) };
+        const uint tile = 16;
+        uint gx = (uint)((headDim + tile - 1) / tile);
+        int r = NvrtcInterop.LaunchKernel(_gdnStateTransposeKernel,
+            gx, gx, (uint)numVHeads, tile, tile, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(gdn_state_transpose) failed: {r}");
+    }
+
     // ── Issue #114-B: batched GDN trunk over a chunk of N prompt tokens ────────
 
     /// <summary>
@@ -6766,6 +6850,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
             _siluInplaceKernel, _gdnConv1dDecodeKernel, _gdnL2NormPerHeadKernel,
             _gdnTileHeadsKernel, _gdnRecurrenceDecodeKernel,
+            _gdnRecurrenceDecodeFastKernel, _gdnDecodeNormGateKernel,   // #404
+            _gdnStateTransposeKernel,   // #404
             _gdnConv1dDecodeBatchedKernel, _gdnConv1dStateUpdateBatchedKernel,
             _gdnConv1dStateCaptureRingKernel,   // #290
             _gdnL2NormPerHeadBatchedKernel, _gdnTileHeadsBatchedKernel, _gdnRecurrenceScanKernel,
@@ -6981,6 +7067,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _gdnL2NormPerHeadKernel   = GetKernelFunc("llm_gdn_l2_norm_per_head");
         _gdnTileHeadsKernel       = GetKernelFunc("llm_gdn_tile_heads");
         _gdnRecurrenceDecodeKernel = GetKernelFunc("llm_gdn_recurrence_decode");
+        _gdnRecurrenceDecodeFastKernel = GetKernelFunc("llm_gdn_recurrence_decode_fast");   // #404
+        _gdnDecodeNormGateKernel       = GetKernelFunc("llm_gdn_decode_norm_gate");          // #404
+        _gdnStateTransposeKernel       = GetKernelFunc("llm_gdn_state_transpose");           // #404
 
         // qwen35moe GDN batched trunk + batched-query SDPA kernels (issue #114-B).
         _gdnConv1dDecodeBatchedKernel      = GetKernelFunc("llm_gdn_conv1d_decode_batched");
