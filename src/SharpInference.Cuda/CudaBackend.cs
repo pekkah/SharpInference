@@ -1205,7 +1205,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _graphPosNodes.Clear();
         _graphCaptureFailed = false;
         _capturingGraphId = id;
-        int rc = NvrtcInterop.StreamBeginCapture(_stream, NvrtcInterop.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+        // RELAXED (mirrors llama.cpp ggml-cuda): the per-layer decode trunk does a one-time
+        // on-demand scratch cudaMalloc on its first capture (settled after warmup); THREAD_LOCAL
+        // ERRORS the capture on that alloc → silent fallback (the ~0% bug). RELAXED tolerates it
+        // (the alloc executes un-captured; subsequent replays reuse the now-grown scratch).
+        int rc = NvrtcInterop.StreamBeginCapture(_stream, NvrtcInterop.CU_STREAM_CAPTURE_MODE_RELAXED);
         if (rc != 0) { _graphCaptureSupported = false; _capturingGraphId = int.MinValue; return false; }
         _graphCapturing = true;
         return true;

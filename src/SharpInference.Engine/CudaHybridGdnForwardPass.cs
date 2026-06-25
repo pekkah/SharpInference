@@ -543,6 +543,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         Environment.GetEnvironmentVariable("SHARPI_DECODE_CUDA_GRAPH") == "1";
     private bool[]? _layerGraphCaptured;       // per-layer: graph captured+ready
     private bool _decodeGraphDisabled;         // latched off after any capture failure
+    private int _decodeTokensSeen;             // warmup counter: capture only after on-demand scratch settles (mirrors llama.cpp's 2-token warmup)
+    private const int GraphWarmupTokens = 2;
+    private bool _graphDiagLogged;             // one-shot [graph-diag] capture-coverage log
     // Sub-phase breakdown of the batched routed-MoE (BatchedRoutedExperts), accumulated
     // across the layer loop and printed once per chunk on the [moe-subphase] line when
     // SHARPI_PREFILL_PROFILE=1. Establishes whether routed-MoE prefill cost is in the
@@ -4184,6 +4187,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     public ReadOnlySpan<float> Forward(int token, int position)
     {
         ThrowIfFaulted();
+        if (_decodeCudaGraph) _decodeTokensSeen++;   // warmup counter for the per-layer trunk graph
         long fwdT0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         // 1. Embedding → _gpuHidden
         EmbedToken(_gpuHidden, token);
@@ -4203,7 +4207,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             // (capture once on the first eligible token, replay at the new position after).
             // The CPU-MoE stays OUTSIDE the graph (it does an illegal-in-capture Download).
             bool useGraph = _decodeCudaGraph && !_decodeGraphDisabled && !_cpuGdn
-                && _hp.IsMoE && _layerGraphCaptured is not null;
+                && _hp.IsMoE && _layerGraphCaptured is not null
+                && _decodeTokensSeen >= GraphWarmupTokens;   // warmup: let on-demand scratch settle before capturing a stable graph
             if (useGraph && _layerGraphCaptured![layer] && _gpu.GraphReadyFor(layer))
             {
                 // Steady state: replay this layer's captured trunk at the new position.
@@ -4286,6 +4291,13 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             if (_decodeProfile) _pdMoeTicks += System.Diagnostics.Stopwatch.GetTimestamp() - mtp0;
 
             if (_traceLayers) TraceGpuTensor(position, layer, "moe-resid", _gpuHidden, _embDim);
+        }
+
+        if (_decodeCudaGraph && !_graphDiagLogged && _decodeTokensSeen > GraphWarmupTokens && _layerGraphCaptured is not null)
+        {
+            int cap = 0; foreach (bool b in _layerGraphCaptured) if (b) cap++;
+            Console.Error.WriteLine($"[graph-diag] captured {cap}/{_hp.NumLayers} layers, disabled={_decodeGraphDisabled}");
+            _graphDiagLogged = true;
         }
 
         // 4. Advance position counters
