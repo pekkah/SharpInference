@@ -541,11 +541,6 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // Gated SHARPI_DECODE_CUDA_GRAPH (default OFF). Falls back to direct launches on any capture failure.
     private static readonly bool _decodeCudaGraph =
         Environment.GetEnvironmentVariable("SHARPI_DECODE_CUDA_GRAPH") == "1";
-    // DIAGNOSTIC ONLY (not shipped): skip the per-layer CPU-MoE Download/dots/Upload in decode so
-    // decode t/s measures PURE GPU trunk execution (40 layers + 1 final logits sync), isolating
-    // trunk-execution from the 40 per-layer blocking syncs. Output is garbage; timing is valid.
-    private static readonly bool _decodeTrunkOnly =
-        Environment.GetEnvironmentVariable("SHARPI_DECODE_TRUNK_ONLY") == "1";
     private bool[]? _layerGraphCaptured;       // per-layer: graph captured+ready
     private bool _decodeGraphDisabled;         // latched off after any capture failure
     private int _decodeTokensSeen;             // warmup counter: capture only after on-demand scratch settles (mirrors llama.cpp's 2-token warmup)
@@ -4279,12 +4274,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 // so an explicit Synchronize before it would just stall the host twice.
                 // Pinned overloads (issue #48): skip the _pinnedBuf staging hop.
                 long moeT0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                if (!_decodeTrunkOnly)   // diagnostic: skip MoE (+ its per-layer sync) to time pure trunk
-                {
-                    _gpu.Download(_gpuNormBuf, (nint)_cpuNormBuf, _embDim);
-                    CpuMoeFfn(layer);
-                    _gpu.UploadInto(_gpuHidden, (nint)_cpuMoeHidden, _embDim);
-                }
+                _gpu.Download(_gpuNormBuf, (nint)_cpuNormBuf, _embDim);
+                CpuMoeFfn(layer);
+                _gpu.UploadInto(_gpuHidden, (nint)_cpuMoeHidden, _embDim);
                 if (_prefillProfile)
                     _profMoeTicks += System.Diagnostics.Stopwatch.GetTimestamp() - moeT0;
             }
