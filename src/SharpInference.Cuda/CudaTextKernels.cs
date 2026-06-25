@@ -8476,8 +8476,12 @@ extern ""C"" __global__ void __launch_bounds__(128, 2) llm_gdn_recurrence_decode
     float q_reg[GDN_DECODE_MAX_RPL];
     #pragma unroll
     for (int r = 0; r < GDN_DECODE_MAX_RPL; r++) {
-        int i = r * 32 + lane;
         bool ok = (r < rpl);
+        // Clamp the index to 0 for inactive register slots: a predicated/select form
+        // (`ok ? load : 0`) can still let the compiler emit the load to an out-of-range
+        // address for r ≥ rpl (e.g. d=96 ⇒ rpl=3, slot 3 would read past the head). For
+        // d=128 (rpl=4) every slot is active, so this is a no-op (i == r*32+lane).
+        int i = ok ? (r * 32 + lane) : 0;
         s_shard[r] = ok ? state[col_base + i] : 0.f;
         k_reg[r]   = ok ? k[hd_off + i] : 0.f;
         q_reg[r]   = ok ? q[hd_off + i] : 0.f;
@@ -8539,8 +8543,12 @@ extern ""C"" __global__ void llm_gdn_decode_norm_gate(
     float o_local = output[hd_off + j];
     sRed[j] = o_local * o_local;
     __syncthreads();
-    for (int s = d / 2; s > 0; s >>= 1) {
-        if (j < s) sRed[j] += sRed[j + s];
+    // Tree reduction robust to non-power-of-two d (≤ 128): start at 64 and mask the
+    // out-of-range partner with `j + s < d`. For d=128 (power of two) `j + s < d`
+    // holds exactly when `j < s`, so this is byte-identical to the plain `s = d/2`
+    // halving; for d=96 it correctly folds the upper tail instead of dropping it.
+    for (int s = 64; s > 0; s >>= 1) {
+        if (j < s && j + s < d) sRed[j] += sRed[j + s];
         __syncthreads();
     }
     float scale = rsqrtf(sRed[0] / (float)d + norm_eps);
