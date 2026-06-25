@@ -529,6 +529,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private static readonly bool _decodeProfile =
         Environment.GetEnvironmentVariable("SHARPI_DECODE_PROFILE") == "1";
     private long _pdTrunkTicks, _pdMoeTicks;
+    // Finer CPU-MoE decode breakdown (also gated on _decodeProfile): router (matvec+softmax+top-k),
+    // Phase-A (gate+up dots), Phase-C (down dots), and the GPU shared-expert download+combine.
+    // Pinpoints whether the MoE wall time is the RAM-bound expert dots or the coordination overhead.
+    private long _pdRouterTicks, _pdPhaseATicks, _pdPhaseCTicks, _pdSharedTicks;
     private int _pdTokens;
     // Sub-phase breakdown of the batched routed-MoE (BatchedRoutedExperts), accumulated
     // across the layer loop and printed once per chunk on the [moe-subphase] line when
@@ -4280,6 +4284,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 $"[decode-profile] {_pdTokens} tok: trunk={_pdTrunkTicks * f / _pdTokens:F2} ms/tok " +
                 $"moe(dl+cpu+ul)={_pdMoeTicks * f / _pdTokens:F2} ms/tok " +
                 $"(trunk {100.0 * _pdTrunkTicks / (_pdTrunkTicks + _pdMoeTicks):F0}% / moe {100.0 * _pdMoeTicks / (_pdTrunkTicks + _pdMoeTicks):F0}%)");
+            Console.Error.WriteLine(
+                $"[decode-moe] router={_pdRouterTicks * f / _pdTokens:F2} phaseA(gate+up)={_pdPhaseATicks * f / _pdTokens:F2} " +
+                $"phaseC(down)={_pdPhaseCTicks * f / _pdTokens:F2} shared(dl+comb)={_pdSharedTicks * f / _pdTokens:F2} ms/tok " +
+                $"(sum of CPU-MoE per-layer phases; remainder of moe = norm download + result upload)");
         }
 
         return _logitsBuf;
@@ -6062,6 +6070,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpu.ScaleInPlace(gpuSharedOut, shexpScale);
 
         // 2. Router: ffn_gate_inp.weight is F32 [embDim, numExperts]; softmax then top-K.
+        long sdRouter = _decodeProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         var routerW = cpuRouter;
         SimdKernels.MatVec(_cpuRouterLogits, routerW.DataPtr, cpuNormIn,
             numExperts, _embDim, routerW.DType);
@@ -6071,6 +6080,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         Span<float> expertWeights = stackalloc float[numActive];
         SelectTopKPtr(_cpuRouterLogits, numExperts, numActive, selectedExperts, expertWeights,
             normalize: _hp.NormalizeMoeTopKWeights);
+        if (_decodeProfile) _pdRouterTicks += System.Diagnostics.Stopwatch.GetTimestamp() - sdRouter;
 
         // 3. Routed experts (sparse top-K). Two batched Parallel.For sweeps
         //    instead of 16 per-expert ones — gate+up across all 8 experts in
@@ -6127,6 +6137,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                        || (_q8_0Q8KEnabled && upDt   == DType.Q8_0)
                        || (_q4kQ8KEnabled  && upDt   == DType.Q4_K);
         byte* normInQ8K = _cpuNormInQ8K;
+        long sdPhaseA = _decodeProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (useQ8KGate || useQ8KUp)
             SimdKernels.QuantizeRowToQ8KS(cpuNormIn, _embDim, normInQ8K);
 
@@ -6145,6 +6156,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 ? DispatchDotQ8K(upP + offU, normInQ8K, embDimL, upDt)
                 : DispatchDot(upP   + offU, normBuf, embDimL, upDt);
         });
+        if (_decodeProfile) _pdPhaseATicks += System.Diagnostics.Stopwatch.GetTimestamp() - sdPhaseA;
+        long sdPhaseC = _decodeProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
         // Phase B: one fused SiLuMul over (numActive × expertDim) contiguous
         // floats. SiLuMul is element-wise, so expert boundaries don't matter —
@@ -6194,11 +6207,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             }
             moeOut[r] = sum;
         });
+        if (_decodeProfile) _pdPhaseCTicks += System.Diagnostics.Stopwatch.GetTimestamp() - sdPhaseC;
 
         // 4. Wait for GPU shared expert, download, and combine into routed accumulator
         //    (Download self-syncs the stream).
+        long sdShared = _decodeProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         _gpu.Download(gpuSharedOut, new Span<float>(_cpuSharedOut, _embDim));
         SimdKernels.AddInPlace(cpuMoeOut, _cpuSharedOut, _embDim);
+        if (_decodeProfile) _pdSharedTicks += System.Diagnostics.Stopwatch.GetTimestamp() - sdShared;
     }
 
     // ParallelOptions for the routed-MoE Parallel.For sweeps. Defaults to the
