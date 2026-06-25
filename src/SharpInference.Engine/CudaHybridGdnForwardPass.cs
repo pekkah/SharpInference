@@ -182,9 +182,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     // GPU-resident GDN weights (per layer, only populated for GDN-type layers).
     // The new GPU GDN block path (default) uses these.
-    private readonly Tensor[] _gpuWAttnQkv;          // [L] Q4_K [conv_channels, embDim]
-    private readonly Tensor[] _gpuWAttnGate;         // [L] Q4_K [value_dim, embDim]
-    private readonly Tensor[] _gpuWSsmOut;           // [L] Q4_K [embDim, value_dim]
+    private readonly Tensor[] _gpuWAttnQkv;          // [L] raw-quant/F32 [conv_channels, embDim]
+    private readonly Tensor[] _gpuWAttnGate;         // [L] raw-quant/F32 [value_dim, embDim]
+    private readonly Tensor[] _gpuWSsmOut;           // [L] raw-quant/F32 [embDim, value_dim]
     private readonly Tensor[] _gpuWSsmAlpha;         // [L] F32 [num_v_heads, embDim]
     private readonly Tensor[] _gpuWSsmBeta;          // [L] F32 [num_v_heads, embDim]
     private readonly Tensor[] _gpuSsmA;              // [L] F32 [num_v_heads]
@@ -582,6 +582,17 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // SHARPI_GDN_PREFILL_COMPUTE=0 reverts to the byte-exact per-token matvec.
     internal static bool GdnPrefillComputeEnabled =
         Environment.GetEnvironmentVariable("SHARPI_GDN_PREFILL_COMPUTE") != "0";
+    // Keep Q8_0 trunk weights raw on the GPU instead of dequantizing them to F32 at
+    // upload. CUDA has the full raw-Q8_0 kernel suite for both phases — llm_matvec_q8_0
+    // (+ dp4a int8) for decode and llm_mmq_q8_0 (int8 MMQ) / llm_matvec_q8_0_gemm_n for
+    // batched prefill — so the only thing the legacy F32 dequant bought was the
+    // memory-bound llm_matvec_f32_gemm_n path (the prefill #1 GPU cost on Q8_0-trunk
+    // models such as Qwen3.6-35B-A3B-UD: 78% of GPU time) plus 4× the trunk VRAM. The
+    // MMQ/dp4a kernels are argmax-stable, NOT byte-exact (Q8_1 int8 activations), so this
+    // shares the same contract as GdnPrefillComputeEnabled; SHARPI_GDN_RAW_Q8_0=0 reverts
+    // to the F32-dequant upload (the byte-exact reference the bit-parity oracle pins).
+    internal static bool RawQ80WeightsEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_GDN_RAW_Q8_0") != "0";
     // Issue #210: route the k MTP-draft tokens' routed-expert FFN in BatchVerify
     // through the #110 group-by-expert core (BatchedRoutedExperts) instead of the
     // per-token CpuMoeFfnCore loop, so each selected expert's mmap'd gate/up/down
@@ -6745,15 +6756,19 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             result = _gpu.Upload(floats, TensorShape.D1(floats.Length), exact: true);
             _gpuWeightDTypes[result.Handle] = DType.Float32;
         }
-        else if (info.DType == DType.Q4_K || info.DType == DType.Q5_K || info.DType == DType.Q6_K)
+        else if (info.DType == DType.Q4_K || info.DType == DType.Q5_K || info.DType == DType.Q6_K
+                 || (info.DType == DType.Q8_0 && RawQ80WeightsEnabled))
         {
-            // CUDA matvec dispatches on Q4_K / Q5_K / Q6_K via dedicated kernels.
+            // CUDA matvec/MMQ dispatch on Q4_K / Q5_K / Q6_K / Q8_0 via dedicated kernels
+            // (GpuMatMul → MatMul; GpuMatMulBatched → MatMulBatchedMmq). Keeping the weight
+            // raw avoids the F32 dequant's 4× VRAM and the memory-bound F32 GEMM-N path.
             result = _gpu.UploadRaw(data, TensorShape.D1(data.Length), info.DType, exact: true);
             _gpuWeightDTypes[result.Handle] = info.DType;
         }
         else
         {
-            // Q8_0, Q3_K, etc. — CUDA matvec doesn't dispatch on these. Dequantize to F32.
+            // Q3_K, etc. (and Q8_0 under SHARPI_GDN_RAW_Q8_0=0) — no raw GPU matvec used
+            // here, or the reverted reference path. Dequantize to F32.
             int count = (int)info.ElementCount;
             var f32 = new float[count];
             Dequantize.ToFloat32(data, f32, info.DType, count);
