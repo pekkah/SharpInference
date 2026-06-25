@@ -105,6 +105,24 @@ public sealed class MergePageAlignedRangesTests
     }
 
     [Fact]
+    public void HighBitPointer_AlignsViaUnsigned()
+    {
+        // A host pointer with bit 63 set is negative as a signed long; signed division would floor
+        // the wrong way (truncate toward zero) and misorder it. The unsigned alignment must still
+        // floor the start down to the page boundary and ceil the end up (Gemini #390 review).
+        long ptr = unchecked((long)0x8000_0000_0000_0010UL);  // page base + 16 bytes
+        var merged = CudaHybridGdnForwardPass.MergePageAlignedRanges(
+            new List<(long ptr, long bytes)> { (ptr, 32) }, Page);
+
+        Assert.Single(merged);
+        long expStart = unchecked((long)0x8000_0000_0000_0000UL);  // floored to the page boundary
+        long expEnd   = unchecked((long)0x8000_0000_0000_1000UL);  // ceiled to the next page
+        Assert.Equal((expStart, expEnd), merged[0]);
+        // end − start is the correct positive byte count (one page) regardless of sign.
+        Assert.Equal(4096L, merged[0].end - merged[0].start);
+    }
+
+    [Fact]
     public void EmptyInput_ProducesNoRanges()
     {
         var merged = CudaHybridGdnForwardPass.MergePageAlignedRanges(

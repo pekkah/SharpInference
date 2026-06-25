@@ -2,7 +2,7 @@
 # Op-offload stays ON (the #390 default) throughout; we toggle SHARPI_MOE_GPU_ROUTER.
 # 2K-token prompt. Prefill is the win; decode should be unchanged (decode uses the CPU router).
 param(
-    [string]$PromptFile = "C:\Users\pekka\AppData\Local\Temp\claude\C--p-sharpi\e585495f-574a-494e-820c-3cfea3d513e6\scratchpad\prefill_prompt.txt",
+    [string]$PromptFile = "prompt.txt",   # a ~2K-token prompt file; pass -PromptFile to override
     [int]$NTokens = 40,
     [int]$TimeoutSec = 900
 )
