@@ -26,9 +26,29 @@ public sealed class CudaHybridGdnBatchedPrefillTests : IDisposable
     // GEMM) is argmax-stable, NOT byte-exact, so pin it OFF for the whole class to keep
     // the batched side on the byte-exact GEMM-N matvec. The MMQ/GEMM kernels' correctness
     // is covered separately by CudaMmqQ4K/Q8_0Tests + CudaGemmQ6K/Q5KTests. Restored in Dispose.
+    // RawQ80WeightsEnabled is pinned OFF for the same reason: keeping Q8_0 trunk weights as
+    // raw makes the sequential reference take the int8 dp4a matvec while the batched side
+    // takes the f32 GEMM-N — argmax-stable but not byte-exact. The F32-dequant upload keeps
+    // both sides on the byte-exact f32 matvec so the batching invariant stays provable, and
+    // (verified) makes this change a byte-for-byte no-op on this oracle.
+    // NOTE: this Carnice oracle is independently pre-existing-RED on master — op-offload
+    // (#390), on-GPU router (#388) and Q3_K dequant-GEMM (#393), all default-on and all
+    // argmax-stable-not-byte-exact, diverge the batched arm from the sequential CPU path.
+    // Pinning RawQ80 off keeps THIS change from adding a further divergence; restoring the
+    // oracle to green (pin those three off, or convert to argmax assertions) is tracked
+    // separately. Restored in Dispose.
     private readonly bool _prevGdnCompute = CudaHybridGdnForwardPass.GdnPrefillComputeEnabled;
-    public CudaHybridGdnBatchedPrefillTests() => CudaHybridGdnForwardPass.GdnPrefillComputeEnabled = false;
-    public void Dispose() => CudaHybridGdnForwardPass.GdnPrefillComputeEnabled = _prevGdnCompute;
+    private readonly bool _prevRawQ80 = CudaHybridGdnForwardPass.RawQ80WeightsEnabled;
+    public CudaHybridGdnBatchedPrefillTests()
+    {
+        CudaHybridGdnForwardPass.GdnPrefillComputeEnabled = false;
+        CudaHybridGdnForwardPass.RawQ80WeightsEnabled = false;
+    }
+    public void Dispose()
+    {
+        CudaHybridGdnForwardPass.GdnPrefillComputeEnabled = _prevGdnCompute;
+        CudaHybridGdnForwardPass.RawQ80WeightsEnabled = _prevRawQ80;
+    }
 
     private static CudaBackend? TryCreate()
     {

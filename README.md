@@ -146,7 +146,7 @@ sharpi-cli -m models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf -g -1 \
 
 | Backend | Prefill t/s | Decode t/s | Notes |
 |---|---:|---:|---|
-| **CUDA** `-g -1` (hybrid) | **113.8** | **23.7** | 10 attn + 30 GDN on GPU; routed MoE on CPU, shared expert GPU-overlapped. Fused GDN scan + batched SDPA, bit-identical. `SHARPI_CPU_MOE=0` forces on-GPU experts. Prefill: GPU MoE op-offload (#390) + on-GPU router (#388) default-on — **+71%** over the CPU MoE path, decode within noise |
+| **CUDA** `-g -1` (hybrid) | **475.4** | **24.5** | 10 attn + 30 GDN on GPU; routed MoE on CPU, shared expert GPU-overlapped. `SHARPI_CPU_MOE=0` forces on-GPU experts. Prefill: GPU MoE op-offload (#390) + on-GPU router (#388) + **raw-Q8_0 trunk** (the all-Q8_0 attn/GDN/shared-expert projections run int8 MMQ instead of a dequant-to-F32 GEMM — **4.2×** prefill over the prior F32-trunk path, `SHARPI_GDN_RAW_Q8_0=0` reverts). Argmax-stable, not byte-exact |
 | Vulkan `-g -1` (hybrid) | 17.3 | 22.8 | 10 attn + 30 GDN on GPU; routed MoE + shared expert on CPU mmap (#356). Decode ~matches CUDA (CPU-routed-expert bound); prefill trails CUDA — per-row CPU FFN not yet batched (#371) |
 | CPU | **11.3** | 9.3 | hybrid GDN/attn, 256 experts / 8 active. Chunk-parallel (FlashQLA) GDN prefill default-on (1.35× over the 8.4 t/s per-token scan; `SHARPI_GDN_CHUNKED_PREFILL=0` to disable). MTP variants keep the byte-exact scan (FP-reorder flips the thinking-boundary token) |
 
@@ -160,7 +160,7 @@ SHARPI_CPU_MOE=1 sharpi-cli -m models/Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf -g -1 \
 
 | Backend | Prefill t/s | Decode t/s | Notes |
 |---|---:|---:|---|
-| **CUDA** `-g -1 --no-thinking` (hybrid) | **114.2** | **21.4** | needs `SHARPI_CPU_MOE=1`: 30 GDN + 10 attn + shared expert on GPU, routed experts CPU mmap. 100% acceptance. Prefill: GPU MoE op-offload (#390) + on-GPU router (#388) default-on — **+74%** over the CPU MoE path, decode within noise |
+| **CUDA** `-g -1 --no-thinking` (hybrid) | **480.2** | **33.3** | needs `SHARPI_CPU_MOE=1`: 30 GDN + 10 attn + shared expert on GPU, routed experts CPU mmap; MTP self-spec (~74% accept, this prompt). Prefill: GPU MoE op-offload (#390) + on-GPU router (#388) + **raw-Q8_0 trunk** (int8 MMQ over the all-Q8_0 attn/GDN/shared-expert projections — **4.2×** prefill over the prior F32-trunk dequant-GEMM, `SHARPI_GDN_RAW_Q8_0=0` reverts). Decode +15% (faster int8 trunk matvec in MTP verify). Argmax-stable |
 | Vulkan `-g -1 --no-thinking` (hybrid) | 15.4 | 9.3 | needs `SHARPI_CPU_MOE=1`; runs on Vulkan (#357). 61% acceptance, but MTP self-spec **regresses** vs ~22 t/s plain MoE decode — routed-expert verify un-amortized on Vulkan (#370). Use `--spec-type none` for speed |
 | CPU `--no-thinking` | 9.1 | **8.5** | GDN/attn + 256-expert MoE + MTP head (#44). 100% acceptance; MoE-MTP batched verify (#45) — routed experts sequential per token, so ~MTP-off parity |
 
@@ -194,7 +194,9 @@ sharpi-cli -m models/Llama-4-Scout-17B-16E-Instruct-Q4_K_M-00001-of-00002.gguf \
 
 _CUDA columns re-measured 2026-06-16 with each model's recommended sampling (`scripts/bench-allrows-1k.ps1
 -CudaOnly`): prefill warm at a realistic ~2K-token working context, decode at near-zero ctx (`-NearZero`),
-each after a discarded warm-clock warm-up. The CPU and Vulkan rows are from the prior 2026-06 sweep (prefill
+each after a discarded warm-clock warm-up. The two unsloth Qwen3.6-35B-A3B GDN rows' CUDA prefill/decode were
+re-measured 2026-06-25 for the raw-Q8_0 trunk (4.2× prefill; same 2K-ctx convention, old F32-trunk value
+reproduced the prior 113.x reading). The CPU and Vulkan rows are from the prior 2026-06 sweep (prefill
 ~1K ctx), except the Gemma 4 E4B q4_0 Vulkan row, freshly measured 2026-06-22 with the same convention after
 the #351 gemma4-on-Vulkan work (PLE + shared-KV + narrowed KV). Vulkan rows remain ~35% below their earlier
 numbers — an unexplained regression (CUDA improved on the same box). Llama-4 Scout and Qwen3-Coder

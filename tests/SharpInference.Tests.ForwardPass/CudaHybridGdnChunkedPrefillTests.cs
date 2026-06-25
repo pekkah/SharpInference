@@ -22,12 +22,22 @@ namespace SharpInference.Tests.ForwardPass;
 public sealed class CudaHybridGdnChunkedPrefillTests : IDisposable
 {
     // Isolate the variable under test: pin the trunk projection matmuls byte-exact
-    // (GdnPrefillComputeEnabled = false) so the ONLY difference between the two arms
-    // is the GDN recurrence kernel (scan vs chunked), not the MMQ/GEMM matmul choice
-    // (which is argmax-stable, not byte-exact). Restored in Dispose.
+    // (GdnPrefillComputeEnabled = false, plus RawQ80WeightsEnabled = false so Q8_0 trunk
+    // weights stay on the F32 matvec rather than the int8 dp4a/MMQ path) so the ONLY
+    // difference between the two arms is the GDN recurrence kernel (scan vs chunked), not
+    // the matmul choice (which is argmax-stable, not byte-exact). Restored in Dispose.
     private readonly bool _prevGdnCompute = CudaHybridGdnForwardPass.GdnPrefillComputeEnabled;
-    public CudaHybridGdnChunkedPrefillTests() => CudaHybridGdnForwardPass.GdnPrefillComputeEnabled = false;
-    public void Dispose() => CudaHybridGdnForwardPass.GdnPrefillComputeEnabled = _prevGdnCompute;
+    private readonly bool _prevRawQ80 = CudaHybridGdnForwardPass.RawQ80WeightsEnabled;
+    public CudaHybridGdnChunkedPrefillTests()
+    {
+        CudaHybridGdnForwardPass.GdnPrefillComputeEnabled = false;
+        CudaHybridGdnForwardPass.RawQ80WeightsEnabled = false;
+    }
+    public void Dispose()
+    {
+        CudaHybridGdnForwardPass.GdnPrefillComputeEnabled = _prevGdnCompute;
+        CudaHybridGdnForwardPass.RawQ80WeightsEnabled = _prevRawQ80;
+    }
 
     private static CudaBackend? TryCreate()
     {
