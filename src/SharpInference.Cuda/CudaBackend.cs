@@ -239,6 +239,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _dequantQ6KF16Kernel;
     private nint   _dequantQ6KF16SoaKernel;  // #204: dequant over the Q6_K SoA layout
     private nint   _dequantQ5KF16Kernel;   // #162: same path for Q5_K_M mixes
+    private nint   _dequantQ3KF16Kernel;   // #388: Q3_K weight → fp16 (Carnice MoE routed experts, AoS only)
     private nint   _dequantQ40F16Kernel;   // #124: Q4_0 weight → fp16 (Gemma 4 12B QAT)
     private nint   _f32ToF16Kernel;
     // Issue #141 (MMQ): int8 tensor-core Q8_0×Q8_1 matmul — weight read once as
@@ -2561,9 +2562,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
             throw new NotSupportedException("NVRTC kernels are not available on this system.");
-        if (weightDType is not (DType.Q8_0 or DType.Q4_K or DType.Q6_K or DType.Q5_K or DType.Q4_0))
+        if (weightDType is not (DType.Q8_0 or DType.Q4_0 or DType.Q4_K or DType.Q3_K or DType.Q6_K or DType.Q5_K))
             throw new NotSupportedException(
-                $"CUDA MatMulBatchedGemm: weight dtype {weightDType} not supported (Q8_0, Q4_0, Q4_K, Q5_K, or Q6_K).");
+                $"CUDA MatMulBatchedGemm: weight dtype {weightDType} not supported (Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, or Q6_K).");
         if (nTok <= 0)
             throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be > 0.");
         if (outputAll.ElementCount % nTok != 0 || inputAll.ElementCount % nTok != 0)
@@ -2575,7 +2576,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         int cols = (int)(inputAll.ElementCount / nTok);
         // Q8_0 sub-block is 32 elements; Q4_K/Q5_K/Q6_K super-block is 256. Each dequant
         // kernel loops over the row in its native block size, so cols must align to it.
-        int colAlign = weightDType is DType.Q4_K or DType.Q5_K or DType.Q6_K ? 256 : 32;
+        int colAlign = weightDType is DType.Q4_K or DType.Q5_K or DType.Q6_K or DType.Q3_K ? 256 : 32;
         if ((cols % colAlign) != 0)
             throw new InvalidOperationException(
                 $"CUDA MatMulBatchedGemm ({weightDType}) requires cols % {colAlign} == 0 (got {cols}).");
@@ -2600,6 +2601,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 DType.Q4_K => _soaQ4kHandles.ContainsKey(matrix.Handle) ? _dequantQ4KF16SoaKernel : _dequantQ4KF16Kernel,
                 DType.Q6_K => _soaQ6kHandles.ContainsKey(matrix.Handle) ? _dequantQ6KF16SoaKernel : _dequantQ6KF16Kernel,   // #162/#204
                 DType.Q5_K => _dequantQ5KF16Kernel,   // #162
+                DType.Q3_K => _dequantQ3KF16Kernel,   // #388 (AoS only — routed MoE experts)
                 DType.Q4_0 => _soaQ40Handles.ContainsKey(matrix.Handle) ? _dequantQ40F16SoaKernel : _dequantQ40F16Kernel,   // #124/#173
                 _          => _soaHandles.ContainsKey(matrix.Handle) ? _dequantQ80F16SoaKernel : _dequantQ80F16Kernel,
             };
@@ -6773,6 +6775,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _dequantQ6KF16Kernel   = GetKernelFunc("llm_dequant_q6k_to_f16");
         _dequantQ6KF16SoaKernel = GetKernelFunc("llm_dequant_q6k_to_f16_soa");   // #204
         _dequantQ5KF16Kernel   = GetKernelFunc("llm_dequant_q5k_to_f16");
+        _dequantQ3KF16Kernel   = GetKernelFunc("llm_dequant_q3k_to_f16");   // #388
         _dequantQ40F16Kernel   = GetKernelFunc("llm_dequant_q4_0_to_f16");   // #124
         _headNormPureBatchedKernel = GetKernelFunc("llm_head_norm_pure_batched");   // #124
         _f32ToF16Kernel        = GetKernelFunc("llm_f32_to_f16");
