@@ -112,6 +112,10 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
     private float* _rotatedQuery;  // scratch for WHT-rotated query [headDim]
     private float* _decompBuf;     // scratch for decompressed TQ value [headDim]
 
+    // Optional KVarN KV cache (issue #180, P0 CPU reference). Mutually exclusive
+    // with the TurboQuant cache; shares the _rotatedQuery scratch.
+    private KVarNKvCache? _kvarnCache;
+
     // SnapKV (issue #51) prefill-time KV eviction. Activated via the
     // SHARPI_SNAPKV_BUDGET env var; the selector is lazily allocated on the
     // first prefill long enough to require eviction.
@@ -601,6 +605,8 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
     {
         if (_tqKvCache != null)
             _tqKvCache.TruncateTo(length);
+        else if (_kvarnCache != null)
+            _kvarnCache.TruncateTo(length);
         else
             _kvCache.TruncateTo(length);
     }
@@ -612,6 +618,8 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
     {
         if (_tqKvCache != null)
             _tqKvCache.Reset();
+        else if (_kvarnCache != null)
+            _kvarnCache.Reset();
         else
             _kvCache.Reset();
     }
@@ -633,6 +641,26 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
     public TurboQuantKvCache? TqCache => _tqKvCache;
 
     /// <summary>
+    /// Enables the KVarN KV cache (issue #180): variance-normalized 4-bit keys /
+    /// 2-bit values. Must be called before any forward pass and is mutually
+    /// exclusive with TurboQuant. Requires a power-of-two head dimension.
+    /// </summary>
+    public void EnableKVarN(int fp32WindowSize = 256, int sinkhornIters = KVarN.DefaultSinkhornIters)
+    {
+        if (_tqKvCache != null)
+            throw new InvalidOperationException("KVarN and TurboQuant caches are mutually exclusive.");
+        _kvarnCache = new KVarNKvCache(
+            _hp.NumLayers, _ctxLen, _numKvHeads, _headDim,
+            Math.Min(fp32WindowSize, _ctxLen), sinkhornIters,
+            layerIndexBase: 0, totalLayerCountForSeeds: _hp.NumLayers);
+        if (_rotatedQuery == null) _rotatedQuery = Alloc(_numHeads * _headDim);
+        if (_decompBuf == null) _decompBuf = Alloc(_numHeads * _headDim);
+    }
+
+    /// <summary>The KVarN KV cache, if enabled.</summary>
+    public KVarNKvCache? KVarNCache => _kvarnCache;
+
+    /// <summary>
     /// Prefill: process all prompt tokens layer-by-layer.
     /// Weights stay hot in L3 cache across tokens within each layer,
     /// amortizing DRAM reads ~N× vs sequential Forward() calls.
@@ -648,8 +676,11 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
         // Per-layer head-dim models (Gemma 4): the batched PrefillCore path assumes a
         // single qDim/kvDim across layers, so fall back to sequential Forward until
         // Phase 8 plumbs per-layer head_dim through the batched paths.
-        if (_hp.IsMoE || _layerHeadDim is not null)
+        if (_hp.IsMoE || _layerHeadDim is not null || _kvarnCache != null)
         {
+            // KVarN (issue #180, P0): the batched prefill path is a P1+ follow-on;
+            // the reference cache prefills sequentially through Forward, which
+            // routes K/V into the KVarN cache and uses KVarNAttention per token.
             ReadOnlySpan<float> logits = default;
             for (int i = 0; i < N; i++)
                 logits = Forward(tokens[i], startPos + i);
@@ -1582,6 +1613,12 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
                         new ReadOnlySpan<float>(_k, appendLen),
                         new ReadOnlySpan<float>(_v, appendLen));
                 }
+                else if (_kvarnCache != null)
+                {
+                    _kvarnCache.Append(layer,
+                        new ReadOnlySpan<float>(_k, appendLen),
+                        new ReadOnlySpan<float>(_v, appendLen));
+                }
                 else
                 {
                     _kvCache.Append(layer,
@@ -1593,6 +1630,8 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
             // Attention
             if (_tqKvCache != null)
                 TqAttention(layer, position);
+            else if (_kvarnCache != null)
+                KVarNAttention(layer, position);
             else
                 Attention(_kvCache, effLayer, layer, position, layerHd, windowSize, layerKv);
 
@@ -1650,6 +1689,8 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
         // Increment KV cache position
         if (_tqKvCache != null)
             _tqKvCache.IncrementPosition();
+        else if (_kvarnCache != null)
+            _kvarnCache.IncrementPosition();
         else
             _kvCache.IncrementPosition();
 
@@ -1909,6 +1950,66 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
                     for (int d = 0; d < hd; d++)
                         outHead[d] += w * vVec[d];
                 }
+            }
+        });
+    }
+
+    // ================================================================
+    //  KVarN Attention (issue #180, P0 CPU reference)
+    // ================================================================
+
+    private void KVarNAttention(int layer, int position)
+    {
+        var kv = _kvarnCache!;
+        int seqLen = Math.Min(position + 1, kv.Length + 1);
+        int tqLen = kv.GetTqLength(layer);
+        int fp32Start = tqLen;
+        float scale = 1.0f / MathF.Sqrt(_headDim);
+        int ctxLen = _ctxLen; int hd = _headDim; int hpkg = _headsPerKvGroup;
+        var q = _q; var attnOut = _attnOut; var scores = _attnScores;
+        var rotated = _rotatedQuery;
+
+        Parallel.For(0, _numHeads, h =>
+        {
+            int kvHead = h / hpkg;
+            float* qHead = q + h * hd;
+            float* outHead = attnOut + h * hd;
+            float* headScores = scores + (long)h * ctxLen;
+            float* headRotated = rotated + h * hd;
+
+            // Pre-rotate the query once per head (key sign pattern), then score
+            // the compressed tiles via the fused dequant-dot path.
+            kv.RotateQueryKey(layer, kvHead,
+                new ReadOnlySpan<float>(qHead, hd),
+                new Span<float>(headRotated, hd));
+
+            kv.ComputeKScores(layer, kvHead,
+                new ReadOnlySpan<float>(headRotated, hd), scale,
+                new Span<float>(headScores, tqLen));
+
+            // FP32 window positions: exact dot product.
+            for (int t = fp32Start; t < seqLen; t++)
+            {
+                float* kVec = kv.Fp32KeyAt(layer, t) + kvHead * hd;
+                headScores[t] = SimdKernels.DotF32(qHead, kVec, hd) * scale;
+            }
+
+            SimdKernels.SoftmaxInPlace(headScores, seqLen);
+
+            for (int d = 0; d < hd; d++) outHead[d] = 0;
+
+            // Compressed-tile V-aggregation (deferred sign-flip + IWHT inside),
+            // then the FP32 window accumulates on top in the original domain.
+            kv.ComputeVAggregation(layer, kvHead,
+                new ReadOnlySpan<float>(headScores, tqLen),
+                new Span<float>(outHead, hd));
+
+            for (int t = fp32Start; t < seqLen; t++)
+            {
+                float* vVec = kv.Fp32ValueAt(layer, t) + kvHead * hd;
+                float w = headScores[t];
+                for (int d = 0; d < hd; d++)
+                    outHead[d] += w * vVec[d];
             }
         });
     }

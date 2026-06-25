@@ -552,14 +552,26 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             }
             else
             {
+                // KVarN (issue #180, P0): opt-in via the SHARPI_KVARN env flag
+                // on the CPU path. Mutually exclusive with --tq (TurboQuant).
+                bool useKVarN = !settings.TurboQuant
+                    && string.Equals(Environment.GetEnvironmentVariable("SHARPI_KVARN"), "1",
+                        StringComparison.Ordinal);
                 if (settings.TurboQuant)
                 {
                     fwd!.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
                     AnsiConsole.MarkupLine("[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
                 }
+                else if (useKVarN)
+                {
+                    fwd!.EnableKVarN(fp32WindowSize: 256);
+                    AnsiConsole.MarkupLine("[dim]KVarN: [green]enabled[/] (4-bit K / 2-bit V, window=256)[/]");
+                }
                 forward = fwd!.Forward;
                 prefill = tokens => fwd.Prefill(tokens);
-                resetCache = settings.TurboQuant ? fwd.TqCache!.Reset : fwd.Cache.Reset;
+                resetCache = settings.TurboQuant ? fwd.TqCache!.Reset
+                    : useKVarN ? fwd.KVarNCache!.Reset
+                    : fwd.Cache.Reset;
                 AnsiConsole.MarkupLine("[dim]Backend: [blue]CPU[/][/]");
             }
         }
