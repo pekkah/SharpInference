@@ -6,7 +6,7 @@ namespace SharpInference.Tests.ForwardPass;
 
 /// <summary>
 /// Parity guard for the opt-in FlashQLA chunked GDN prefill on the CUDA hybrid path
-/// (<see cref="CudaHybridGdnForwardPass.GdnChunkedPrefillEnabled"/>). Inside the
+/// (<see cref="CudaHybridGdnForwardPass.GdnChunkedPrefillOverride"/>). Inside the
 /// batched-prefill fast path, the chunk-parallel <c>chunk_gated_delta_rule</c> kernel
 /// (<see cref="CudaBackend.GdnChunkedPrefill"/>) replaces the sequential
 /// <c>GdnRecurrenceScan</c>. Unlike the other batched-prefill oracles
@@ -68,7 +68,7 @@ public sealed class CudaHybridGdnChunkedPrefillTests : IDisposable
     }
 
     /// <summary>
-    /// The chunked-prefill GDN recurrence (<c>GdnChunkedPrefillEnabled = true</c>) must
+    /// The chunked-prefill GDN recurrence (<c>GdnChunkedPrefillOverride = true</c>) must
     /// produce <b>argmax-identical, finite</b> final-token logits versus the sequential
     /// scan (<c>= false</c>, the default). Both arms run under batched prefill + trunk +
     /// GDN-scan (the chunked kernel lives inside the <c>BatchedGdnScanEnabled</c> fast
@@ -100,7 +100,7 @@ public sealed class CudaHybridGdnChunkedPrefillTests : IDisposable
         bool prevPrefill = CudaHybridGdnForwardPass.BatchedPrefillEnabled;
         bool prevTrunk = CudaHybridGdnForwardPass.BatchedTrunkEnabled;
         bool prevScan = CudaHybridGdnForwardPass.BatchedGdnScanEnabled;
-        bool prevChunked = CudaHybridGdnForwardPass.GdnChunkedPrefillEnabled;
+        bool? prevChunked = CudaHybridGdnForwardPass.GdnChunkedPrefillOverride;
         try
         {
             using var model = GgufModel.Open(path);
@@ -124,7 +124,7 @@ public sealed class CudaHybridGdnChunkedPrefillTests : IDisposable
 
             float[] RunWith(bool chunked)
             {
-                CudaHybridGdnForwardPass.GdnChunkedPrefillEnabled = chunked;
+                CudaHybridGdnForwardPass.GdnChunkedPrefillOverride = chunked;
                 using var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
                 return fwd.Prefill(tokens).ToArray();
             }
@@ -153,7 +153,7 @@ public sealed class CudaHybridGdnChunkedPrefillTests : IDisposable
             CudaHybridGdnForwardPass.BatchedPrefillEnabled = prevPrefill;
             CudaHybridGdnForwardPass.BatchedTrunkEnabled = prevTrunk;
             CudaHybridGdnForwardPass.BatchedGdnScanEnabled = prevScan;
-            CudaHybridGdnForwardPass.GdnChunkedPrefillEnabled = prevChunked;
+            CudaHybridGdnForwardPass.GdnChunkedPrefillOverride = prevChunked;
             Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", prevCpuMoe);
         }
     }
