@@ -534,6 +534,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // Pinpoints whether the MoE wall time is the RAM-bound expert dots or the coordination overhead.
     private long _pdRouterTicks, _pdPhaseATicks, _pdPhaseCTicks, _pdSharedTicks;
     private int _pdTokens;
+    // #388: per-layer CUDA-graph of the decode GPU trunk block (eliminates ~600 kernel launches/token
+    // that starve the launch-bound decode). Each layer's pure-GPU trunk (norms + attn/GDN block + residual
+    // adds) is captured into a per-layer graph (keyed by layer index) on the first eligible decode token and
+    // replayed after; the CPU-MoE (Download/CpuMoeFfn/Upload) stays OUTSIDE the graph between replays.
+    // Gated SHARPI_DECODE_CUDA_GRAPH (default OFF). Falls back to direct launches on any capture failure.
+    private static readonly bool _decodeCudaGraph =
+        Environment.GetEnvironmentVariable("SHARPI_DECODE_CUDA_GRAPH") == "1";
+    private bool[]? _layerGraphCaptured;       // per-layer: graph captured+ready
+    private bool _decodeGraphDisabled;         // latched off after any capture failure
     // Sub-phase breakdown of the batched routed-MoE (BatchedRoutedExperts), accumulated
     // across the layer loop and printed once per chunk on the [moe-subphase] line when
     // SHARPI_PREFILL_PROFILE=1. Establishes whether routed-MoE prefill cost is in the
@@ -899,6 +908,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         int L = hp.NumLayers;
         int qDim = _numHeads * _headDim;        // 4096
         int kvDim = _numKvHeads * _headDim;     // 512
+
+        // #388: per-layer decode-trunk graph readiness, only when the gate is on.
+        _layerGraphCaptured = _decodeCudaGraph ? new bool[L] : null;
 
         // SHARPI_KV_DTYPE: fp32 | bf16 (default bf16). Issue #27.
         _kvDType = ParseKvDType(Environment.GetEnvironmentVariable("SHARPI_KV_DTYPE"));
@@ -4130,6 +4142,44 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         }
     }
 
+    /// <summary>
+    /// #388: the pure-GPU decode "trunk block" for one layer — the unit that runs directly OR
+    /// gets captured into a per-layer CUDA graph. Pre-block residual+norm, the attn/GDN block,
+    /// the residual add, then the pre-MoE residual+norm; leaves <c>_gpuNormBuf</c> (the MoE input)
+    /// and <c>_gpuResidual</c> ready for the CPU-MoE step that runs OUTSIDE the graph. Position
+    /// dependence lives only in the attn block's RoPE/KvAppend/Attention kernels, which self-register
+    /// position nodes via TrackPositionNode so graph replay rewrites the position; GDN decode kernels
+    /// mutate state in place (position-independent → capture-once).
+    /// </summary>
+    private void RunDecodeTrunkBlock(int layer, int position, bool isAttn)
+    {
+        // ── Pre-block residual + norm on GPU ────────────────────
+        _gpu.CopyDevice(_gpuResidual, _gpuHidden);
+        _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuAttnNorm[layer], _hp.RmsNormEps);
+
+        if (isAttn)
+        {
+            GpuAttnBlock(layer, position);
+        }
+        else if (_cpuGdn)
+        {
+            CpuGdnBlock(layer, position);
+        }
+        else
+        {
+            GpuGdnBlock(layer, position);
+        }
+
+        // Residual add on GPU
+        _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+
+        if (_traceLayers) TraceGpuTensor(position, layer, isAttn ? "attn-resid" : "gdn-resid", _gpuHidden, _embDim);
+
+        // ── Pre-MoE residual + norm on GPU ──────────────────────
+        _gpu.CopyDevice(_gpuResidual, _gpuHidden);
+        _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuPostAttnNorm[layer], _hp.RmsNormEps);
+    }
+
     /// <summary>Forward one token through the hybrid CUDA + CPU stack.</summary>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
@@ -4147,32 +4197,44 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         for (int layer = 0; layer < _hp.NumLayers; layer++)
         {
             long ltp0 = _decodeProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-            // ── Pre-block residual + norm on GPU ────────────────────
-            _gpu.CopyDevice(_gpuResidual, _gpuHidden);
-            _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuAttnNorm[layer], _hp.RmsNormEps);
 
             bool isAttn = _hp.LayerTypes![layer] == LayerType.Attention;
-            if (isAttn)
+            // #388: run the pure-GPU trunk block directly, or via a per-layer CUDA graph
+            // (capture once on the first eligible token, replay at the new position after).
+            // The CPU-MoE stays OUTSIDE the graph (it does an illegal-in-capture Download).
+            bool useGraph = _decodeCudaGraph && !_decodeGraphDisabled && !_cpuGdn
+                && _hp.IsMoE && _layerGraphCaptured is not null;
+            if (useGraph && _layerGraphCaptured![layer] && _gpu.GraphReadyFor(layer))
             {
-                GpuAttnBlock(layer, position);
+                // Steady state: replay this layer's captured trunk at the new position.
+                try { _gpu.LaunchGraphForPosition(layer, position); }
+                catch { _decodeGraphDisabled = true; RunDecodeTrunkBlock(layer, position, isAttn); }
             }
-            else if (_cpuGdn)
+            else if (useGraph)
             {
-                CpuGdnBlock(layer, position);
+                // First eligible token for this layer: pre-grow on-demand scratch (capture forbids
+                // cudaMalloc), capture the trunk block (records, no execute), instantiate, then launch.
+                _gpu.EnsureQ81Scratch(Math.Max(_embDim, _expertDim));   // dp4a/Q8_1 input scratch for the trunk matvecs
+                try
+                {
+                    if (_gpu.TryBeginGraphCapture(layer))
+                    {
+                        RunDecodeTrunkBlock(layer, position, isAttn);
+                        if (_gpu.TryEndGraphCaptureAndInstantiate(layer))
+                        {
+                            _gpu.LaunchGraphForPosition(layer, position);
+                            _layerGraphCaptured![layer] = true;
+                        }
+                        else { _decodeGraphDisabled = true; RunDecodeTrunkBlock(layer, position, isAttn); }
+                    }
+                    else { _decodeGraphDisabled = true; RunDecodeTrunkBlock(layer, position, isAttn); }
+                }
+                catch { _gpu.AbortGraphCapture(); _decodeGraphDisabled = true; RunDecodeTrunkBlock(layer, position, isAttn); }
             }
             else
             {
-                GpuGdnBlock(layer, position);
+                RunDecodeTrunkBlock(layer, position, isAttn);
             }
-
-            // Residual add on GPU
-            _gpu.AddInPlace(_gpuHidden, _gpuResidual);
-
-            if (_traceLayers) TraceGpuTensor(position, layer, isAttn ? "attn-resid" : "gdn-resid", _gpuHidden, _embDim);
-
-            // ── Pre-MoE residual + norm on GPU ──────────────────────
-            _gpu.CopyDevice(_gpuResidual, _gpuHidden);
-            _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuPostAttnNorm[layer], _hp.RmsNormEps);
 
             if (_decodeProfile)
             {
