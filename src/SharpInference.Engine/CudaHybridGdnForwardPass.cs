@@ -3622,6 +3622,20 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             int ok = 0;
             foreach (var (s, e) in merged)
                 if (_gpu.TryRegisterHostPinned((nint)s, e - s)) { reg.Add((nint)s); ok++; }
+            if (ok < merged.Count)
+            {
+                // Partial registration (e.g. Linux RLIMIT_MEMLOCK / `ulimit -l`) would leave the
+                // un-registered ranges pageable, silently degrading UploadRawIntoAsyncDirect to a
+                // slow synchronous staged copy while _goHostPinned claims otherwise. Don't keep a
+                // half-pinned state: unregister what succeeded and fall back wholesale to the
+                // synchronous mmap upload (_goHostPinned=false) — correct, no perf cliff (Gemini).
+                Console.Error.WriteLine($"[moe-offload] registered only {ok}/{merged.Count} mmap expert-weight ranges (locked-memory limit?) — falling back to synchronous mmap upload.");
+                foreach (var p in reg) _gpu.UnregisterHostPinned(p);
+                _goRegisteredRanges = null;
+                _goPinnedBuf = nint.Zero;
+                _goHostPinned = false;
+                return;
+            }
             _goRegisteredRanges = reg.ToArray();
             _goPinnedBuf = nint.Zero;
             _goHostPinned = true;
@@ -6332,16 +6346,22 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     internal static List<(long start, long end)> MergePageAlignedRanges(
         List<(long ptr, long bytes)> ranges, long pageSize)
     {
-        var aligned = new List<(long start, long end)>(ranges.Count);
+        // Work in UNSIGNED: a host pointer with the high bit set is negative as a signed long,
+        // which would floor the wrong way under signed division and misorder under signed compare
+        // (Gemini). The returned tuples carry the unsigned address bit-pattern in `long` (callers
+        // cast to nint / take end−start, both bit-pattern-correct), so callers are unaffected.
+        ulong upage = (ulong)pageSize;
+        var aligned = new List<(ulong start, ulong end)>(ranges.Count);
         foreach (var (ptr, bytes) in ranges)
         {
             if (bytes <= 0) continue;
-            long s = ptr / pageSize * pageSize;
-            long e = (ptr + bytes + pageSize - 1) / pageSize * pageSize;
+            ulong uptr = (ulong)ptr;
+            ulong s = uptr / upage * upage;
+            ulong e = (uptr + (ulong)bytes + upage - 1) / upage * upage;
             aligned.Add((s, e));
         }
-        aligned.Sort((a, b) => a.start.CompareTo(b.start));
-        var merged = new List<(long start, long end)>(aligned.Count);
+        aligned.Sort((a, b) => a.start.CompareTo(b.start));   // unsigned compare
+        var merged = new List<(ulong start, ulong end)>(aligned.Count);
         foreach (var r in aligned)
         {
             if (merged.Count > 0 && r.start <= merged[^1].end)
@@ -6350,7 +6370,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             }
             else merged.Add(r);
         }
-        return merged;
+        var result = new List<(long start, long end)>(merged.Count);
+        foreach (var (s, e) in merged) result.Add(((long)s, (long)e));
+        return result;
     }
 
     private static void SelectTopKPtr(float* logits, int n, int k,
