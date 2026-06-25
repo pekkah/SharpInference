@@ -534,6 +534,18 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // Pinpoints whether the MoE wall time is the RAM-bound expert dots or the coordination overhead.
     private long _pdRouterTicks, _pdPhaseATicks, _pdPhaseCTicks, _pdSharedTicks;
     private int _pdTokens;
+    // #388: per-layer CUDA-graph of the decode GPU trunk block (eliminates ~600 kernel launches/token
+    // that starve the launch-bound decode). Each layer's pure-GPU trunk (norms + attn/GDN block + residual
+    // adds) is captured into a per-layer graph (keyed by layer index) on the first eligible decode token and
+    // replayed after; the CPU-MoE (Download/CpuMoeFfn/Upload) stays OUTSIDE the graph between replays.
+    // Gated SHARPI_DECODE_CUDA_GRAPH (default OFF). Falls back to direct launches on any capture failure.
+    private static readonly bool _decodeCudaGraph =
+        Environment.GetEnvironmentVariable("SHARPI_DECODE_CUDA_GRAPH") == "1";
+    private bool[]? _layerGraphCaptured;       // per-layer: graph captured+ready
+    private bool _decodeGraphDisabled;         // latched off after any capture failure
+    private int _decodeTokensSeen;             // warmup counter: capture only after on-demand scratch settles (mirrors llama.cpp's 2-token warmup)
+    private const int GraphWarmupTokens = 2;
+    private bool _graphDiagLogged;             // one-shot [graph-diag] capture-coverage log
     // Sub-phase breakdown of the batched routed-MoE (BatchedRoutedExperts), accumulated
     // across the layer loop and printed once per chunk on the [moe-subphase] line when
     // SHARPI_PREFILL_PROFILE=1. Establishes whether routed-MoE prefill cost is in the
@@ -899,6 +911,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         int L = hp.NumLayers;
         int qDim = _numHeads * _headDim;        // 4096
         int kvDim = _numKvHeads * _headDim;     // 512
+
+        // #388: per-layer decode-trunk graph readiness, only when the gate is on.
+        _layerGraphCaptured = _decodeCudaGraph ? new bool[L] : null;
 
         // SHARPI_KV_DTYPE: fp32 | bf16 (default bf16). Issue #27.
         _kvDType = ParseKvDType(Environment.GetEnvironmentVariable("SHARPI_KV_DTYPE"));
@@ -4130,10 +4145,63 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         }
     }
 
+    /// <summary>
+    /// #388: the pure-GPU decode "trunk block" for one layer — the unit that runs directly OR
+    /// gets captured into a per-layer CUDA graph. Pre-block residual+norm, the attn/GDN block,
+    /// the residual add, then the pre-MoE residual+norm; leaves <c>_gpuNormBuf</c> (the MoE input)
+    /// and <c>_gpuResidual</c> ready for the CPU-MoE step that runs OUTSIDE the graph. Position
+    /// dependence lives only in the attn block's RoPE/KvAppend/Attention kernels, which self-register
+    /// position nodes via TrackPositionNode so graph replay rewrites the position; GDN decode kernels
+    /// mutate state in place (position-independent → capture-once).
+    /// NOTE: the embedded <c>_traceLayers</c> trace does a Synchronize+Download, which is illegal
+    /// during stream capture — so SHARPI_TRACE_LAYERS + SHARPI_DECODE_CUDA_GRAPH together make the
+    /// first capture fail and latch graphs off (graceful fallback to direct launches). Both are
+    /// developer diagnostics; don't combine them when measuring the graph path.
+    /// </summary>
+    private void RunDecodeTrunkBlock(int layer, int position, bool isAttn)
+    {
+        // ── Pre-block residual + norm on GPU ────────────────────
+        _gpu.CopyDevice(_gpuResidual, _gpuHidden);
+        _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuAttnNorm[layer], _hp.RmsNormEps);
+
+        if (isAttn)
+        {
+            GpuAttnBlock(layer, position);
+        }
+        else if (_cpuGdn)
+        {
+            CpuGdnBlock(layer, position);
+        }
+        else
+        {
+            GpuGdnBlock(layer, position);
+        }
+
+        // Residual add on GPU
+        _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+
+        if (_traceLayers) TraceGpuTensor(position, layer, isAttn ? "attn-resid" : "gdn-resid", _gpuHidden, _embDim);
+
+        // ── Pre-MoE residual + norm on GPU ──────────────────────
+        _gpu.CopyDevice(_gpuResidual, _gpuHidden);
+        _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuPostAttnNorm[layer], _hp.RmsNormEps);
+    }
+
+    /// <summary>Latch the decode CUDA-graph path off after a capture/replay failure, logging the
+    /// cause once. The fallback (direct RunDecodeTrunkBlock) is always correct; this only surfaces
+    /// WHY the opt-in graph disabled (a persistent root cause still re-throws via the direct re-run).</summary>
+    private void DisableDecodeGraph(int layer, string reason)
+    {
+        if (!_decodeGraphDisabled)
+            Console.Error.WriteLine($"[graph-diag] decode CUDA-graph disabled at layer {layer}: {reason}");
+        _decodeGraphDisabled = true;
+    }
+
     /// <summary>Forward one token through the hybrid CUDA + CPU stack.</summary>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
         ThrowIfFaulted();
+        if (_decodeCudaGraph) _decodeTokensSeen++;   // warmup counter for the per-layer trunk graph
         long fwdT0 = _prefillProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         // 1. Embedding → _gpuHidden
         EmbedToken(_gpuHidden, token);
@@ -4147,32 +4215,57 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         for (int layer = 0; layer < _hp.NumLayers; layer++)
         {
             long ltp0 = _decodeProfile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-            // ── Pre-block residual + norm on GPU ────────────────────
-            _gpu.CopyDevice(_gpuResidual, _gpuHidden);
-            _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuAttnNorm[layer], _hp.RmsNormEps);
 
             bool isAttn = _hp.LayerTypes![layer] == LayerType.Attention;
-            if (isAttn)
+            // #388: run the pure-GPU trunk block directly, or via a per-layer CUDA graph
+            // (capture once on the first eligible token, replay at the new position after).
+            // The CPU-MoE stays OUTSIDE the graph (it does an illegal-in-capture Download).
+            // TRADE-OFF (correctness-safe, perf-only; see #401): the attention kernel choice
+            // (single-block vs split-KV) is frozen at capture-time context (short, just after
+            // warmup), so a graphed run keeps the single-block kernel even past the split-KV
+            // threshold. Single-block is the bit-exact reference for any seqLen ≤ maxSeqLen, so
+            // output stays correct — but long-context decode silently forgoes the split-KV speedup.
+            // Acceptable while opt-in/short-ctx; revisit before any default-on (#401).
+            bool useGraph = _decodeCudaGraph && !_decodeGraphDisabled && !_cpuGdn
+                && _hp.IsMoE && _layerGraphCaptured is not null
+                && _decodeTokensSeen >= GraphWarmupTokens;   // warmup: let on-demand scratch settle before capturing a stable graph
+            if (useGraph && _layerGraphCaptured![layer] && _gpu.GraphReadyFor(layer))
             {
-                GpuAttnBlock(layer, position);
+                // Steady state: replay this layer's captured trunk at the new position.
+                try { _gpu.LaunchGraphForPosition(layer, position); }
+                catch (Exception ex) { DisableDecodeGraph(layer, $"replay: {ex.Message}"); RunDecodeTrunkBlock(layer, position, isAttn); }
             }
-            else if (_cpuGdn)
+            else if (useGraph)
             {
-                CpuGdnBlock(layer, position);
+                // First eligible token for this layer: pre-grow on-demand scratch (capture forbids
+                // cudaMalloc), capture the trunk block (records, no execute), instantiate, then launch.
+                // Size to the WIDEST vector the trunk quantizes for a dp4a/Q8_1 matvec — not just
+                // _embDim: the attn o-proj input is qDim (_numHeads*_headDim) and the GDN out-proj
+                // input is _gdnValueDim, both > _embDim. Undersizing here would let the first wide
+                // matvec cudaFree+cudaMalloc the grow-only _q81Buf DURING capture; under RELAXED that
+                // alloc passes through and the captured node binds a since-freed pointer → silent
+                // garbage on replay. Sizing it correctly makes correctness independent of the warmup.
+                _gpu.EnsureQ81Scratch(Math.Max(_embDim, Math.Max(_numHeads * _headDim, _gdnValueDim)));
+                try
+                {
+                    if (_gpu.TryBeginGraphCapture(layer))
+                    {
+                        RunDecodeTrunkBlock(layer, position, isAttn);
+                        if (_gpu.TryEndGraphCaptureAndInstantiate(layer))
+                        {
+                            _gpu.LaunchGraphForPosition(layer, position);
+                            _layerGraphCaptured![layer] = true;
+                        }
+                        else { DisableDecodeGraph(layer, "TryEndGraphCaptureAndInstantiate returned false"); RunDecodeTrunkBlock(layer, position, isAttn); }
+                    }
+                    else { DisableDecodeGraph(layer, "TryBeginGraphCapture returned false"); RunDecodeTrunkBlock(layer, position, isAttn); }
+                }
+                catch (Exception ex) { _gpu.AbortGraphCapture(); DisableDecodeGraph(layer, $"capture/launch: {ex.Message}"); RunDecodeTrunkBlock(layer, position, isAttn); }
             }
             else
             {
-                GpuGdnBlock(layer, position);
+                RunDecodeTrunkBlock(layer, position, isAttn);
             }
-
-            // Residual add on GPU
-            _gpu.AddInPlace(_gpuHidden, _gpuResidual);
-
-            if (_traceLayers) TraceGpuTensor(position, layer, isAttn ? "attn-resid" : "gdn-resid", _gpuHidden, _embDim);
-
-            // ── Pre-MoE residual + norm on GPU ──────────────────────
-            _gpu.CopyDevice(_gpuResidual, _gpuHidden);
-            _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuPostAttnNorm[layer], _hp.RmsNormEps);
 
             if (_decodeProfile)
             {
@@ -4224,6 +4317,13 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             if (_decodeProfile) _pdMoeTicks += System.Diagnostics.Stopwatch.GetTimestamp() - mtp0;
 
             if (_traceLayers) TraceGpuTensor(position, layer, "moe-resid", _gpuHidden, _embDim);
+        }
+
+        if (_decodeCudaGraph && !_graphDiagLogged && _decodeTokensSeen > GraphWarmupTokens && _layerGraphCaptured is not null)
+        {
+            int cap = 0; foreach (bool b in _layerGraphCaptured) if (b) cap++;
+            Console.Error.WriteLine($"[graph-diag] captured {cap}/{_hp.NumLayers} layers, disabled={_decodeGraphDisabled}");
+            _graphDiagLogged = true;
         }
 
         // 4. Advance position counters

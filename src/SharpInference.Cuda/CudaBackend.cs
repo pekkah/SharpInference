@@ -1137,6 +1137,22 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// <summary>True once a graph is captured + instantiated and ready to replay.</summary>
     public bool GraphReady => _graphExec != nint.Zero;
 
+    // ── Multi-graph (per-id) capture (Phase 1 of GDN-hybrid decode CUDA-graph trunk) ──
+    // The same capture machinery (_graphCapturing / _graphPosNodes / TrackPositionNode /
+    // _graphCaptureFailed) is shared with the single-graph path above — only one capture
+    // runs at a time. The indexed API captures into per-id entries instead of the single
+    // _capturedGraph/_graphExec, so the engine can later key one graph per trunk layer.
+    private sealed class MultiGraphEntry
+    {
+        public nint CapturedGraph;   // CUgraph
+        public nint GraphExec;       // CUgraphExec
+        public GraphPosNode[] PosNodes = [];
+    }
+    private readonly Dictionary<int, MultiGraphEntry> _multiGraphs = new();
+    // The id of the capture currently open via the indexed API; int.MinValue means either
+    // no capture is open or the legacy single-graph (no-arg) capture is the one in flight.
+    private int _capturingGraphId = int.MinValue;
+
     private enum GraphPosKind { Position, PositionPlus1, SwaWindowStart, SwaWindowEnd }
 
     // One captured kernel node whose params carry per-token-varying position scalars.
@@ -1166,6 +1182,35 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _graphCaptureFailed = false;
         int rc = NvrtcInterop.StreamBeginCapture(_stream, NvrtcInterop.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
         if (rc != 0) { _graphCaptureSupported = false; return false; }
+        _graphCapturing = true;
+        return true;
+    }
+
+    /// <summary>
+    /// Begin capturing into the per-id graph slot <paramref name="id"/>. Mirrors the no-arg
+    /// <see cref="TryBeginGraphCapture()"/> but targets the multi-graph store: any existing
+    /// entry for the id is disposed first (the single-graph handles are left untouched).
+    /// Returns false (and disables graphs) if the driver rejects capture.
+    /// </summary>
+    public bool TryBeginGraphCapture(int id)
+    {
+        if (!_graphCaptureSupported || _graphCapturing) return false;
+        Synchronize();                 // drain in-flight H2D/D2H before capture starts
+        if (_multiGraphs.TryGetValue(id, out var existing))
+        {
+            if (existing.GraphExec != nint.Zero) NvrtcInterop.GraphExecDestroy(existing.GraphExec);
+            if (existing.CapturedGraph != nint.Zero) NvrtcInterop.GraphDestroy(existing.CapturedGraph);
+            _multiGraphs.Remove(id);
+        }
+        _graphPosNodes.Clear();
+        _graphCaptureFailed = false;
+        _capturingGraphId = id;
+        // RELAXED (mirrors llama.cpp ggml-cuda): the per-layer decode trunk does a one-time
+        // on-demand scratch cudaMalloc on its first capture (settled after warmup); THREAD_LOCAL
+        // ERRORS the capture on that alloc → silent fallback (the ~0% bug). RELAXED tolerates it
+        // (the alloc executes un-captured; subsequent replays reuse the now-grown scratch).
+        int rc = NvrtcInterop.StreamBeginCapture(_stream, NvrtcInterop.CU_STREAM_CAPTURE_MODE_RELAXED);
+        if (rc != 0) { _graphCaptureSupported = false; _capturingGraphId = int.MinValue; return false; }
         _graphCapturing = true;
         return true;
     }
@@ -1201,6 +1246,47 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>
+    /// End the in-progress per-id capture (opened via <see cref="TryBeginGraphCapture(int)"/>)
+    /// and instantiate it into the multi-graph store under <paramref name="id"/>. Returns
+    /// false if no matching capture is open or on any capture/instantiate error. Mirrors the
+    /// no-arg <see cref="TryEndGraphCaptureAndInstantiate()"/>.
+    /// </summary>
+    public bool TryEndGraphCaptureAndInstantiate(int id)
+    {
+        if (!_graphCapturing || _capturingGraphId != id) return false;
+        int rc = NvrtcInterop.StreamEndCapture(_stream, out nint graph);
+        _graphCapturing = false;
+        _capturingGraphId = int.MinValue;
+        if (rc != 0 || graph == nint.Zero || _graphCaptureFailed)
+        {
+            if (graph != nint.Zero) NvrtcInterop.GraphDestroy(graph);
+            _graphPosNodes.Clear();
+            _graphCaptureSupported = false;
+            return false;
+        }
+        rc = NvrtcInterop.GraphInstantiate(out nint exec, graph, 0);
+        if (rc != 0 || exec == nint.Zero)
+        {
+            NvrtcInterop.GraphDestroy(graph);
+            _graphPosNodes.Clear();
+            _graphCaptureSupported = false;
+            return false;
+        }
+        _multiGraphs[id] = new MultiGraphEntry
+        {
+            CapturedGraph = graph,
+            GraphExec = exec,
+            PosNodes = _graphPosNodes.ToArray(),
+        };
+        _graphPosNodes.Clear();
+        return true;
+    }
+
+    /// <summary>True once the per-id graph <paramref name="id"/> is captured + ready to replay.</summary>
+    public bool GraphReadyFor(int id) =>
+        _multiGraphs.TryGetValue(id, out var e) && e.GraphExec != nint.Zero;
+
+    /// <summary>
     /// Abort an in-progress capture (drains the stream out of capture mode) and give up
     /// on graphs for this backend. Safe to call when not capturing.
     /// </summary>
@@ -1212,11 +1298,18 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _graphCapturing = false;
             if (g != nint.Zero) NvrtcInterop.GraphDestroy(g);
         }
+        _capturingGraphId = int.MinValue;
         // A failure can also reach here *after* TryEndGraphCaptureAndInstantiate already
         // built _graphExec/_capturedGraph (e.g. the first LaunchGraphForPosition threw):
         // at that point _graphCapturing is already false, so free those handles too —
         // otherwise "abort" leaks an exec graph and leaves GraphReady stuck true.
         DiscardGraph();
+        // Same post-instantiate-failure case for the multi-graph (per-id) path: a layer's
+        // entry may already be stored when its first LaunchGraphForPosition(id,…) threw.
+        // The caller latches graphs off on abort, so freeing every entry here is correct
+        // (none will be replayed) and prevents a per-layer exec-graph leak until Dispose.
+        // No-op for single-graph users (empty map).
+        DiscardMultiGraphs();
         _graphPosNodes.Clear();
         _graphCaptureSupported = false;
     }
@@ -1230,10 +1323,31 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     {
         if (_graphExec == nint.Zero)
             throw new InvalidOperationException("LaunchGraphForPosition called before a graph was captured.");
+        LaunchGraphNodes(_graphPosNodes, _graphExec, position);
+    }
 
+    /// <summary>
+    /// Replay the per-id graph <paramref name="id"/> for <paramref name="position"/>: the
+    /// indexed analogue of <see cref="LaunchGraphForPosition(int)"/>, over the entry's own
+    /// node list + exec graph. Throws if no graph was captured for the id.
+    /// </summary>
+    public void LaunchGraphForPosition(int id, int position)
+    {
+        if (!_multiGraphs.TryGetValue(id, out var entry) || entry.GraphExec == nint.Zero)
+            throw new InvalidOperationException(
+                $"LaunchGraphForPosition({id}) called before a graph was captured for that id.");
+        LaunchGraphNodes(entry.PosNodes, entry.GraphExec, position);
+    }
+
+    // Shared replay core: rewrite each tracked node's position-derived scalar params on
+    // <paramref name="graphExec"/>, then launch it on the compute stream. Used by both the
+    // single-graph and per-id LaunchGraphForPosition overloads — behavior is identical to
+    // the original inlined loop.
+    private void LaunchGraphNodes(IReadOnlyList<GraphPosNode> nodes, nint graphExec, int position)
+    {
         nint* cells = stackalloc nint[GraphMaxKernelArgs];
         nint* ptrs  = stackalloc nint[GraphMaxKernelArgs];
-        foreach (var n in _graphPosNodes)
+        foreach (var n in nodes)
         {
             int cnt = n.ArgValues.Length;
             for (int i = 0; i < cnt; i++) cells[i] = n.ArgValues[i];
@@ -1257,12 +1371,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 KernelParams = (nint)ptrs,
                 Extra = nint.Zero,
             };
-            int rc = NvrtcInterop.GraphExecKernelNodeSetParams(_graphExec, n.Node, &p);
+            int rc = NvrtcInterop.GraphExecKernelNodeSetParams(graphExec, n.Node, &p);
             if (rc != 0)
                 throw new InvalidOperationException($"cuGraphExecKernelNodeSetParams failed: {rc}");
         }
 
-        int lr = NvrtcInterop.GraphLaunch(_graphExec, _stream);
+        int lr = NvrtcInterop.GraphLaunch(graphExec, _stream);
         if (lr != 0)
             throw new InvalidOperationException($"cuGraphLaunch failed: {lr}");
     }
@@ -1271,6 +1385,18 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     {
         if (_graphExec != nint.Zero) { NvrtcInterop.GraphExecDestroy(_graphExec); _graphExec = nint.Zero; }
         if (_capturedGraph != nint.Zero) { NvrtcInterop.GraphDestroy(_capturedGraph); _capturedGraph = nint.Zero; }
+    }
+
+    // Destroy every per-id captured graph so no CUDA handles leak at backend teardown.
+    // Called from the same Dispose path that runs DiscardGraph().
+    private void DiscardMultiGraphs()
+    {
+        foreach (var e in _multiGraphs.Values)
+        {
+            if (e.GraphExec != nint.Zero) NvrtcInterop.GraphExecDestroy(e.GraphExec);
+            if (e.CapturedGraph != nint.Zero) NvrtcInterop.GraphDestroy(e.CapturedGraph);
+        }
+        _multiGraphs.Clear();
     }
 
     // Called by the position-varying op methods immediately after their cuLaunchKernel
@@ -7328,6 +7454,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (_graphCapturing)
             NvrtcInterop.StreamEndCapture(_stream, out _);
         DiscardGraph();
+        DiscardMultiGraphs();
 
         CuBlasInterop.Destroy(_handle);
 
