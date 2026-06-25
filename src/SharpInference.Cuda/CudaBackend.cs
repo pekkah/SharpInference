@@ -1304,6 +1304,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         // at that point _graphCapturing is already false, so free those handles too —
         // otherwise "abort" leaks an exec graph and leaves GraphReady stuck true.
         DiscardGraph();
+        // Same post-instantiate-failure case for the multi-graph (per-id) path: a layer's
+        // entry may already be stored when its first LaunchGraphForPosition(id,…) threw.
+        // The caller latches graphs off on abort, so freeing every entry here is correct
+        // (none will be replayed) and prevents a per-layer exec-graph leak until Dispose.
+        // No-op for single-graph users (empty map).
+        DiscardMultiGraphs();
         _graphPosNodes.Clear();
         _graphCaptureSupported = false;
     }

@@ -4153,6 +4153,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// dependence lives only in the attn block's RoPE/KvAppend/Attention kernels, which self-register
     /// position nodes via TrackPositionNode so graph replay rewrites the position; GDN decode kernels
     /// mutate state in place (position-independent → capture-once).
+    /// NOTE: the embedded <c>_traceLayers</c> trace does a Synchronize+Download, which is illegal
+    /// during stream capture — so SHARPI_TRACE_LAYERS + SHARPI_DECODE_CUDA_GRAPH together make the
+    /// first capture fail and latch graphs off (graceful fallback to direct launches). Both are
+    /// developer diagnostics; don't combine them when measuring the graph path.
     /// </summary>
     private void RunDecodeTrunkBlock(int layer, int position, bool isAttn)
     {
@@ -4183,6 +4187,16 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _gpu.RmsNorm(_gpuNormBuf, _gpuHidden, _gpuPostAttnNorm[layer], _hp.RmsNormEps);
     }
 
+    /// <summary>Latch the decode CUDA-graph path off after a capture/replay failure, logging the
+    /// cause once. The fallback (direct RunDecodeTrunkBlock) is always correct; this only surfaces
+    /// WHY the opt-in graph disabled (a persistent root cause still re-throws via the direct re-run).</summary>
+    private void DisableDecodeGraph(int layer, string reason)
+    {
+        if (!_decodeGraphDisabled)
+            Console.Error.WriteLine($"[graph-diag] decode CUDA-graph disabled at layer {layer}: {reason}");
+        _decodeGraphDisabled = true;
+    }
+
     /// <summary>Forward one token through the hybrid CUDA + CPU stack.</summary>
     public ReadOnlySpan<float> Forward(int token, int position)
     {
@@ -4206,6 +4220,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             // #388: run the pure-GPU trunk block directly, or via a per-layer CUDA graph
             // (capture once on the first eligible token, replay at the new position after).
             // The CPU-MoE stays OUTSIDE the graph (it does an illegal-in-capture Download).
+            // TRADE-OFF (correctness-safe, perf-only; see #401): the attention kernel choice
+            // (single-block vs split-KV) is frozen at capture-time context (short, just after
+            // warmup), so a graphed run keeps the single-block kernel even past the split-KV
+            // threshold. Single-block is the bit-exact reference for any seqLen ≤ maxSeqLen, so
+            // output stays correct — but long-context decode silently forgoes the split-KV speedup.
+            // Acceptable while opt-in/short-ctx; revisit before any default-on (#401).
             bool useGraph = _decodeCudaGraph && !_decodeGraphDisabled && !_cpuGdn
                 && _hp.IsMoE && _layerGraphCaptured is not null
                 && _decodeTokensSeen >= GraphWarmupTokens;   // warmup: let on-demand scratch settle before capturing a stable graph
@@ -4213,13 +4233,19 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             {
                 // Steady state: replay this layer's captured trunk at the new position.
                 try { _gpu.LaunchGraphForPosition(layer, position); }
-                catch { _decodeGraphDisabled = true; RunDecodeTrunkBlock(layer, position, isAttn); }
+                catch (Exception ex) { DisableDecodeGraph(layer, $"replay: {ex.Message}"); RunDecodeTrunkBlock(layer, position, isAttn); }
             }
             else if (useGraph)
             {
                 // First eligible token for this layer: pre-grow on-demand scratch (capture forbids
                 // cudaMalloc), capture the trunk block (records, no execute), instantiate, then launch.
-                _gpu.EnsureQ81Scratch(Math.Max(_embDim, _expertDim));   // dp4a/Q8_1 input scratch for the trunk matvecs
+                // Size to the WIDEST vector the trunk quantizes for a dp4a/Q8_1 matvec — not just
+                // _embDim: the attn o-proj input is qDim (_numHeads*_headDim) and the GDN out-proj
+                // input is _gdnValueDim, both > _embDim. Undersizing here would let the first wide
+                // matvec cudaFree+cudaMalloc the grow-only _q81Buf DURING capture; under RELAXED that
+                // alloc passes through and the captured node binds a since-freed pointer → silent
+                // garbage on replay. Sizing it correctly makes correctness independent of the warmup.
+                _gpu.EnsureQ81Scratch(Math.Max(_embDim, Math.Max(_numHeads * _headDim, _gdnValueDim)));
                 try
                 {
                     if (_gpu.TryBeginGraphCapture(layer))
@@ -4230,11 +4256,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                             _gpu.LaunchGraphForPosition(layer, position);
                             _layerGraphCaptured![layer] = true;
                         }
-                        else { _decodeGraphDisabled = true; RunDecodeTrunkBlock(layer, position, isAttn); }
+                        else { DisableDecodeGraph(layer, "TryEndGraphCaptureAndInstantiate returned false"); RunDecodeTrunkBlock(layer, position, isAttn); }
                     }
-                    else { _decodeGraphDisabled = true; RunDecodeTrunkBlock(layer, position, isAttn); }
+                    else { DisableDecodeGraph(layer, "TryBeginGraphCapture returned false"); RunDecodeTrunkBlock(layer, position, isAttn); }
                 }
-                catch { _gpu.AbortGraphCapture(); _decodeGraphDisabled = true; RunDecodeTrunkBlock(layer, position, isAttn); }
+                catch (Exception ex) { _gpu.AbortGraphCapture(); DisableDecodeGraph(layer, $"capture/launch: {ex.Message}"); RunDecodeTrunkBlock(layer, position, isAttn); }
             }
             else
             {
