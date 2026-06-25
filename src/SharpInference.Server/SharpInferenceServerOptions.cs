@@ -223,12 +223,14 @@ public sealed class SharpInferenceServerOptions
     /// gate, read by <see cref="CudaHybridGdnForwardPass"/> at construction. Uploads each used
     /// expert's host-resident weights to the GPU for the batched prefill matmul (like llama.cpp's
     /// op-offload) instead of running the dots on the CPU. Server analogue of the CLI's
-    /// <c>--gpu-moe-prefill</c>. <b>OPT-IN, default OFF in the engine.</b> <c>true</c> →
-    /// <c>SHARPI_MOE_GPU_PREFILL=1</c> (enable); <c>false</c> → force off; <c>null</c> (default)
-    /// writes nothing, preserving the engine default and any value already in the environment.
-    /// ~+15-44% prefill, but ~-25% decode (its ~14 GB pinned weight copy evicts the page cache
-    /// single-token decode's CPU expert-streaming relies on), so enable only for prefill-heavy
-    /// workloads. Argmax-stable (the GPU runs the MoE in F32), not bit-identical to the CPU path.
+    /// <c>--gpu-moe-prefill</c>. <b>Default ON in the engine (#390).</b> <c>true</c> →
+    /// <c>SHARPI_MOE_GPU_PREFILL=1</c>; <c>false</c> → force the CPU MoE prefill; <c>null</c>
+    /// (default) writes nothing, preserving the engine default and any value already in the
+    /// environment. ~+28-67% prefill with decode within noise of the CPU path: the register-in-place
+    /// pin mode (<c>SHARPI_MOE_PIN_MODE</c>, default <c>register</c>) cudaHostRegisters the expert
+    /// mmap pages instead of a ~14 GB copy (no RAM duplicate, no page-cache eviction), and a token
+    /// gate (<c>SHARPI_MOE_GPU_PREFILL_MIN_TOKENS</c>, default 64) keeps tiny prefills + decode on
+    /// the CPU path. Argmax-stable (the GPU runs the MoE in F32), not bit-identical to the CPU path.
     /// CUDA hybrid + CPU-MoE only; auto-falls-back to the CPU path if its scratch can't allocate.
     /// </summary>
     public bool? GpuMoePrefill { get; set; }
