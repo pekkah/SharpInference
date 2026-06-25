@@ -167,6 +167,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _matvecQ80Kernel;
     // Issue #142: dp4a/Q8_1 decode matvec (quantize activation to int8, __dp4a dot).
     private nint   _matvecQ80Dp4aKernel;
+    // Issue #405: high-MLP mmvq decode matvec (faithful port of llama.cpp's
+    // mul_mat_vec_q<Q8_0,1> — 128 thr/block, 1 row/block, vdr=2 independent loads).
+    private nint   _matvecQ80MmvqKernel;
     // Issue #149: SoA-layout dp4a decode matvec + the interleaved→SoA repack kernel.
     private nint   _matvecQ80Dp4aSoaKernel;
     private nint   _q80RepackSoaKernel;
@@ -444,6 +447,20 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// </summary>
     public bool Q80Dp4aEnabled { get; set; } =
         Environment.GetEnvironmentVariable("SHARPI_Q80_DP4A") != "0";
+
+    /// <summary>
+    /// Issue #405: route the single-token (N=1) Q8_0 decode matvec through the high-MLP
+    /// <c>llm_matvec_q8_0_mmvq</c> kernel (a faithful port of llama.cpp's
+    /// <c>mul_mat_vec_q&lt;Q8_0,1&gt;</c>) instead of <c>llm_matvec_q8_0_dp4a</c>. Both quantize
+    /// the activation to Q8_1 (int8 + __dp4a), so this is argmax-stable, NOT byte-exact —
+    /// the SAME contract as <see cref="Q80Dp4aEnabled"/>. The win is cold/in-context DRAM
+    /// bandwidth: mmvq keeps far more independent weight loads in flight (128 thr/block,
+    /// 1 row/block, vdr=2 independent loads, grid-stride over 32 blocks/iter), where the
+    /// dp4a kernel's per-lane funnelshift load chain stalls cold reads at ~215 GB/s.
+    /// OFF by default; the GDN-hybrid plain-decode trunk sets it from
+    /// <c>SHARPI_TRUNK_MATVEC_FAST</c>. Only affects the <see cref="MatMul"/> N=1 path.
+    /// </summary>
+    public bool TrunkMatVecFast { get; set; }
 
     /// <summary>
     /// Issue #219: compute the greedy argmax on-device (<see cref="Argmax"/>) so a decode token
@@ -2203,7 +2220,14 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         // hidden dim qualifies). Falls back to the fp32-decode kernel otherwise.
         if (weightDType == DType.Q8_0 && Q80Dp4aEnabled && (cols & 31) == 0)
         {
-            DispatchMatVecQ80Dp4a(wPtr, xPtr, yPtr, rows, cols, soa: _soaHandles.ContainsKey(matrix.Handle));
+            bool q80Soa = _soaHandles.ContainsKey(matrix.Handle);
+            // Issue #405: the high-MLP mmvq kernel for the GDN-hybrid plain-decode trunk
+            // (AoS only — it reads the same 34-B/block layout the trunk uploads raw). SoA
+            // weights stay on the existing dp4a-soa path.
+            if (TrunkMatVecFast && !q80Soa)
+                DispatchMatVecQ80Mmvq(wPtr, xPtr, yPtr, rows, cols);
+            else
+                DispatchMatVecQ80Dp4a(wPtr, xPtr, yPtr, rows, cols, soa: q80Soa);
             return;
         }
         // Issue #124: Q4_0 decode matvec via dp4a/Q8_1 (cols % 32 == 0). Falls back to
@@ -3442,6 +3466,55 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
                 soa ? _matvecQ80Dp4aSoaKernel : _matvecQ80Dp4aKernel, (uint)rows, 1, 1,
                 32, 8, 1, 0, _stream, args, null);
             if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_q8_0_dp4a) failed: {rm}");
+        }
+    }
+
+    /// <summary>
+    /// Issue #405: high-MLP Q8_0 decode matvec — a faithful port of llama.cpp's
+    /// <c>mul_mat_vec_q&lt;Q8_0, ncols_dst=1&gt;</c> for the cold single-token trunk read.
+    /// Same Q8_1 activation quantization as <see cref="DispatchMatVecQ80Dp4a"/>, but the
+    /// matvec uses 128 threads/block, one output row per block, and a grid-stride loop
+    /// with two independent int-word loads per thread — keeping enough weight loads in
+    /// flight to saturate cold DRAM (the dp4a kernel's funnelshift load chain does not).
+    /// Reads the AoS 34-B/block weight (no SoA repack). Requires <c>cols % 32 == 0</c>.
+    /// Argmax-stable, NOT byte-exact — identical contract to the dp4a path.
+    /// </summary>
+    private void DispatchMatVecQ80Mmvq(nint wPtr, nint xPtr, nint yPtr, int rows, int cols)
+    {
+        if ((cols & 31) != 0)
+            throw new InvalidOperationException(
+                $"CUDA matvec_q8_0_mmvq requires cols % 32 == 0 (got {cols}).");
+
+        int subBlocks = cols / 32;
+        EnsureQ81Buf((nuint)((long)subBlocks * 36L));
+
+        // Quantize input → Q8_1 (32 threads per sub-block) — identical to the dp4a path.
+        {
+            nint qInPtr  = xPtr;
+            nint qOutPtr = _q81Buf;
+            int  qN      = cols;
+            nint* args = stackalloc nint[3] { (nint)(&qInPtr), (nint)(&qOutPtr), (nint)(&qN) };
+            int rq = NvrtcInterop.LaunchKernel(
+                _quantizeQ81Kernel, (uint)subBlocks, 1, 1,
+                32, 1, 1, 0, _stream, args, null);
+            if (rq != 0) throw new InvalidOperationException($"cuLaunchKernel(quantize_q8_1 for q8_0 mmvq) failed: {rq}");
+        }
+
+        // mmvq matvec: 1 row/block, 4 warps × 32 lanes = 128 threads (block dims 32×4).
+        // NOTE: the warp count here MUST equal MATVEC_Q80_MMVQ_NWARPS in the kernel string
+        // (CudaTextKernels.cs) — the kernel sizes tmp_shared and the per-warp reduce by it.
+        {
+            nint q81Ptr = _q81Buf;
+            int  pRows  = rows, pCols = cols;
+            nint* args = stackalloc nint[5]
+            {
+                (nint)(&wPtr), (nint)(&q81Ptr), (nint)(&yPtr),
+                (nint)(&pRows), (nint)(&pCols)
+            };
+            int rm = NvrtcInterop.LaunchKernel(
+                _matvecQ80MmvqKernel, (uint)rows, 1, 1,
+                32, 4, 1, 0, _stream, args, null);
+            if (rm != 0) throw new InvalidOperationException($"cuLaunchKernel(matvec_q8_0_mmvq) failed: {rm}");
         }
     }
 
@@ -6829,7 +6902,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _matvecQ5KGemmNKernel, _matvecQ6KGemmNKernel,
             _matvecQ6KGemmNSoaKernel,                                  // #204
             _matvecQ80GemmNKernel, _mmqQ80Kernel, _mmqQ80SoaKernel, _mmqQ4kKernel, _mmqQ4kSoaKernel,
-            _matvecQ80Dp4aSoaKernel, _q80RepackSoaKernel,
+            _matvecQ80Dp4aKernel, _matvecQ80MmvqKernel, _q80RepackSoaKernel,   // #142/#405
             _matvecQ80SoaKernel, _matvecQ80GemmNSoaKernel, _dequantQ80F16SoaKernel,
             // #156/#160: Q4_K SoA repack + decode/N2/GEMM-N/dequant readers, and the
             // AoS dequant (all were missing — eager-JIT them so first decode pays no stutter).
@@ -6950,6 +7023,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _matvecQ40Dp4aKernel   = GetKernelFunc("llm_matvec_q4_0_dp4a");   // #124
         _matvecQ80Kernel       = GetKernelFunc("llm_matvec_q8_0");
         _matvecQ80Dp4aKernel   = GetKernelFunc("llm_matvec_q8_0_dp4a");
+        _matvecQ80MmvqKernel   = GetKernelFunc("llm_matvec_q8_0_mmvq");   // #405
         _matvecF32N2Kernel     = GetKernelFunc("llm_matvec_f32_n2");
         _matvecQ4KN2Kernel     = GetKernelFunc("llm_matvec_q4k_n2");
         _matvecQ4KN2SoaKernel  = GetKernelFunc("llm_matvec_q4k_n2_soa");

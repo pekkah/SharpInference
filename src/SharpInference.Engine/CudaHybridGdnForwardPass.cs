@@ -610,6 +610,17 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // original byte-exact kernel. Default OFF; SHARPI_GDN_DECODE_FAST=1 enables.
     internal static bool GdnDecodeFastEnabled =
         Environment.GetEnvironmentVariable("SHARPI_GDN_DECODE_FAST") == "1";
+
+    // Issue #405: route the single-token (N=1) Q8_0 trunk decode matvecs through the
+    // high-MLP llm_matvec_q8_0_mmvq kernel (faithful port of llama.cpp's mul_mat_vec_q
+    // <Q8_0,1>), the #1 decode lever on the Q8_0-trunk Qwen3.6-35B-A3B-MTP model
+    // (llm_matvec_q8_0_dp4a is ~51% of GPU decode time and only reaches ~215 GB/s cold).
+    // Q8_1 int8 activations make it argmax-stable, NOT byte-exact — same contract as the
+    // dp4a path it replaces. The MatMulBatched MTP-verify path (int8 MMQ) is unaffected;
+    // the byte-exact prefill oracle pins RawQ80WeightsEnabled OFF (F32 trunk → never hits
+    // a Q8_0 matvec). Default OFF; SHARPI_TRUNK_MATVEC_FAST=1 enables.
+    internal static bool TrunkMatVecFastEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_TRUNK_MATVEC_FAST") == "1";
     // Issue #210: route the k MTP-draft tokens' routed-expert FFN in BatchVerify
     // through the #110 group-by-expert core (BatchedRoutedExperts) instead of the
     // per-token CpuMoeFfnCore loop, so each selected expert's mmap'd gate/up/down
@@ -908,6 +919,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         _model = model;
         _gpu = gpu;
+        // #405: opt-in high-MLP mmvq kernel for the N=1 Q8_0 trunk decode matvecs.
+        // Only meaningful when the trunk is kept raw Q8_0 (RawQ80WeightsEnabled); a
+        // F32-dequant trunk never reaches the Q8_0 matvec. Argmax-stable contract.
+        _gpu.TrunkMatVecFast = TrunkMatVecFastEnabled && RawQ80WeightsEnabled;
         _hp = hp;
         _gdn = hp.Gdn;
         _placement = placement;

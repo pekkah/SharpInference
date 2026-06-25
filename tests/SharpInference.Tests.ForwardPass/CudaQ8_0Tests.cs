@@ -197,6 +197,94 @@ public sealed unsafe class CudaQ8_0Tests
         }
     }
 
+    /// <summary>
+    /// Issue #405: the high-MLP mmvq Q8_0 decode matvec (<c>llm_matvec_q8_0_mmvq</c>,
+    /// gated by <see cref="CudaBackend.TrunkMatVecFast"/>) is a faithful port of
+    /// llama.cpp's <c>mul_mat_vec_q&lt;Q8_0,1&gt;</c>. It quantizes the activation to the
+    /// SAME Q8_1 layout and runs the SAME int8 __dp4a dot as <c>llm_matvec_q8_0_dp4a</c>,
+    /// only with a higher-MLP load/reduce schedule (128 thr/block, 1 row/block, vdr=2
+    /// independent loads). The two int8 dot results are therefore the same integer sum
+    /// per row; they can differ only in the float scale/accumulation ORDER across blocks.
+    /// So the mmvq output must match the dp4a output to a tight relative envelope (much
+    /// tighter than either's drift from the fp32 reference) — and be exactly argmax-stable.
+    /// </summary>
+    [Fact]
+    public void MatVec_Q8_0_Mmvq_MatchesDp4a()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        gpu.Q80Dp4aEnabled = true;   // both paths live under the dp4a branch
+
+        // Shapes mirror the real Qwen3.6-35B-A3B trunk Q8_0 matrices (#405): attn_qkv
+        // 2048→8192, attn_gate 2048→4096, ssm_out 4096→2048, ffn shexp 2048→512 / 512→2048.
+        foreach ((int rows, int cols) in new[]
+                 { (8192, 2048), (4096, 2048), (2048, 4096), (512, 2048), (2048, 512), (33, 512) })
+        {
+            var rng = new Random(20260625 + rows * 31 + cols);
+            byte[] weightBytes = BuildQ8_0Matrix(rows, cols, rng);
+
+            var input = new float[cols];
+            for (int i = 0; i < cols; i++)
+                input[i] = (float)(rng.NextDouble() * 2 - 1);
+
+            var gpuWeights = gpu.UploadRaw(weightBytes, TensorShape.D1(weightBytes.Length), DType.Q8_0);
+            var gpuInput = gpu.Upload(input, TensorShape.D1(cols));
+            var gpuOutput = gpu.Allocate(TensorShape.D1(rows));
+
+            // Reference: the existing dp4a kernel.
+            gpu.TrunkMatVecFast = false;
+            gpu.MatMul(gpuOutput, gpuWeights, gpuInput, DType.Q8_0);
+            gpu.Synchronize();
+            var dp4aResult = new float[rows];
+            gpu.Download(gpuOutput, dp4aResult);
+
+            // New path: the mmvq kernel.
+            gpu.TrunkMatVecFast = true;
+            gpu.MatMul(gpuOutput, gpuWeights, gpuInput, DType.Q8_0);
+            gpu.Synchronize();
+            var mmvqResult = new float[rows];
+            gpu.Download(gpuOutput, mmvqResult);
+            gpu.TrunkMatVecFast = false;
+
+            gpu.Free(gpuWeights);
+            gpu.Free(gpuInput);
+            gpu.Free(gpuOutput);
+
+            // Per-row magnitude scale for a relative bound.
+            float refRms = 0f;
+            for (int r = 0; r < rows; r++) refRms += dp4aResult[r] * dp4aResult[r];
+            refRms = MathF.Sqrt(refRms / rows);
+
+            int mismatches = 0;
+            float maxAbs = 0;
+            for (int r = 0; r < rows; r++)
+            {
+                float diff = MathF.Abs(mmvqResult[r] - dp4aResult[r]);
+                maxAbs = MathF.Max(maxAbs, diff);
+                // Same int8 dot, only float accumulation order differs → ~1e-4 of row RMS.
+                if (diff > 1e-3f * refRms + 1e-4f) mismatches++;
+            }
+            // argmax must be identical (decode picks the max row).
+            int aDp4a = ArgMax(dp4aResult), aMmvq = ArgMax(mmvqResult);
+
+            Console.WriteLine(
+                $"MatVecQ8_0-mmvq vs dp4a rows={rows} cols={cols}: maxAbs={maxAbs:E2} refRms={refRms:E2} " +
+                $"mismatches={mismatches}/{rows} argmax dp4a={aDp4a} mmvq={aMmvq}");
+            Assert.True(mismatches == 0,
+                $"mmvq Q8_0 matvec diverged from dp4a: {mismatches}/{rows} rows beyond 0.1% of row RMS ({refRms:E3}), maxAbs={maxAbs:E3}.");
+            Assert.True(aDp4a == aMmvq,
+                $"mmvq Q8_0 matvec argmax {aMmvq} != dp4a argmax {aDp4a} for rows={rows} cols={cols}.");
+        }
+    }
+
+    private static int ArgMax(float[] v)
+    {
+        int best = 0;
+        for (int i = 1; i < v.Length; i++)
+            if (v[i] > v[best]) best = i;
+        return best;
+    }
+
     [Fact]
     public void EmbedLookup_Q8_0_MatchesCpuReference()
     {

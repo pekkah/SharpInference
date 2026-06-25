@@ -2243,6 +2243,92 @@ extern ""C"" __global__ void llm_matvec_q8_0_dp4a_soa(
     }
 }
 
+// ── MatVec Q8_0 — high-MLP mmvq decode (issue #405) ───────────────────────
+// A faithful port of llama.cpp's mul_mat_vec_q<Q8_0, ncols_dst=1> for the cold
+// single-token (N=1) decode of the Q8_0 trunk. The existing llm_matvec_q8_0_dp4a
+// is occupancy- and DRAM-throughput-saturated under ncu's WARM replay, but COLD /
+// in-context it only reaches ~215 GB/s (4070 Ti peak ~504): the access pattern
+// keeps too few independent weight loads in flight to hide DRAM latency on a cold
+// read (each lane assembles ONE int-word via two dependent funnelshift loads, and
+// at 256 threads/block the per-block memory-level parallelism is low). llama.cpp's
+// mmvq fixes exactly this by:
+//   • 128 threads/block (4 warps × 32), ONE output row per block — so each weight
+//     load is a fully independent in-flight transaction (no funnelshift dependency);
+//   • each thread issuing vdr=2 INDEPENDENT consecutive int-word loads per block
+//     (get_int_b2: the AoS qs is 2-byte aligned, so two uint16 reads assemble each
+//     int — no cross-word dependency), doubling loads-in-flight per thread;
+//   • a grid-stride loop over blocks_per_iter = vdr·nwarps·warp_size/qi = 32 blocks,
+//     so all 128 threads have many independent (weight, activation) loads queued —
+//     raising MLP enough to saturate cold DRAM;
+//   • one __dp4a per int-word against the Q8_1 activation, then a per-warp partial
+//     reduce (shared mem across the 4 warps) + a single 32-lane warp_reduce_sum.
+// Reads the SAME 34-B/block AoS Q8_0 weight the dp4a kernel reads (no SoA repack),
+// and the SAME 36-B/block Q8_1 activation. Argmax-stable, NOT byte-exact (int8 Q8_1
+// activation + warp-reduce order) — identical contract to llm_matvec_q8_0_dp4a.
+//
+// Layout constants (Q8_0): qk=32, qi=8 (int-words/block), vdr=2; activation QK8_1=32.
+// Block (32, MATVEC_Q80_MMVQ_NWARPS); grid = rows; tmp_shared = nwarps×warp_size.
+#define MATVEC_Q80_MMVQ_NWARPS 4
+
+// Read int-word i32 from a 2-byte-aligned int8 quant region (mirrors get_int_b2).
+__device__ __forceinline__ int sharpi_get_int_b2(const unsigned char* __restrict__ p, int i32)
+{
+    const unsigned short* p16 = reinterpret_cast<const unsigned short*>(p);
+    return (int)((unsigned int)p16[2 * i32] | ((unsigned int)p16[2 * i32 + 1] << 16));
+}
+
+extern ""C"" __global__ void llm_matvec_q8_0_mmvq(
+    const unsigned char* __restrict__ weights,   // AoS: rows × nb × 34 B
+    const unsigned char* __restrict__ y_q81,      // Q8_1: nb × 36 B (fp16 d at [0:2], 32 int8 at [4:36])
+    float* __restrict__ output,
+    int rows, int cols)
+{
+    const int row = (int)blockIdx.x;              // one output row per block
+    if (row >= rows) return;
+
+    const int warp_size = 32;
+    const int qi  = 8;                            // int-words per Q8_0 block
+    const int vdr = 2;                            // int-words handled per thread per block
+    const int tid = warp_size * (int)threadIdx.y + (int)threadIdx.x;   // 0..127
+    const int nb  = cols >> 5;                    // Q8_0 blocks per row
+    const int blocks_per_iter = vdr * MATVEC_Q80_MMVQ_NWARPS * warp_size / qi;  // = 32
+
+    const long row_base = (long)row * (long)nb * 34L;
+
+    float tmp = 0.f;
+    // kbx = block index this thread starts on; kqs = first int-word within the block.
+    for (int kbx = tid / (qi / vdr); kbx < nb; kbx += blocks_per_iter)
+    {
+        const int kqs = vdr * (tid % (qi / vdr));         // 0,2,4,6
+        const long b0 = row_base + (long)kbx * 34L;       // block base byte
+        const unsigned char* qs = weights + b0 + 2;       // int8 quants (2-byte aligned)
+        unsigned int d_bits = (unsigned int)qs[-2] | ((unsigned int)qs[-1] << 8);
+        const float dw = sharpi_fp16_to_fp32(d_bits);     // weight block scale
+
+        const long ab = (long)kbx * 36L;                  // activation block base
+        unsigned int da_bits = (*reinterpret_cast<const unsigned int*>(y_q81 + ab)) & 0xffffu;
+        const float da = sharpi_fp16_to_fp32(da_bits);    // activation block scale
+        const int* aq = reinterpret_cast<const int*>(y_q81 + ab + 4);
+
+        int sumi = 0;
+        #pragma unroll
+        for (int i = 0; i < vdr; i++)
+            sumi = __dp4a(sharpi_get_int_b2(qs, kqs + i), aq[kqs + i], sumi);
+        tmp += dw * da * (float)sumi;
+    }
+
+    // Per-warp partials → shared, warp 0 sums across warps then 32-lane warp reduce.
+    __shared__ float tmp_shared[MATVEC_Q80_MMVQ_NWARPS][warp_size];
+    tmp_shared[threadIdx.y][threadIdx.x] = tmp;
+    __syncthreads();
+    if (threadIdx.y != 0) return;
+    float acc = tmp_shared[0][threadIdx.x];
+    #pragma unroll
+    for (int w = 1; w < MATVEC_Q80_MMVQ_NWARPS; w++) acc += tmp_shared[w][threadIdx.x];
+    acc = sharpi_warp_reduce_sum(acc);
+    if (threadIdx.x == 0) output[row] = acc;
+}
+
 // ── MatVec Q4_0 — __dp4a / Q8_1 path (issue #124) ─────────────────────────
 // Decode matvec mirroring llama.cpp's mul_mat_vec_q4_0_q8_1. The input vector is
 // pre-quantized to Q8_1 (36-byte sub-blocks: fp16 d at [0:2], fp16 s=d·Σq at
