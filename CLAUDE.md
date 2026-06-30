@@ -58,9 +58,20 @@ dotnet publish src/SharpInference.Server.Host -c Release -r win-x64
 dotnet run --project benchmarks/SharpInference.Bench -c Release -- --filter '*'
 
 # Models: scripts/download-model.ps1 fetches known presets (smollm2, vibethinker,
-# qwen3-8b, olmoe-1b-7b, qwen3-coder-30b-a3b, qwen36-35b-a3b[-mtp], gemma4-12b-qat,
-# gemma4-e4b-qat, llama4-scout, z-image-turbo[-q8], realesrgan-x4, ...). Run with
-# `-Model <name>` (PowerShell). See the script header for the full ValidateSet.
+# qwen3-8b, olmoe-1b-7b, qwen3-coder-30b-a3b, qwen36-35b-a3b[-mtp], ornith-9b/-35b,
+# gemma4-12b-qat, gemma4-e4b-qat, llama4-scout, z-image-turbo[-q8], realesrgan-x4, ...).
+# Run with `-Model <name>` (PowerShell). See the script header for the full ValidateSet.
+
+# Ornith-1.0 (DeepReinforce, MIT) — agentic-coding "self-scaffolding" RL finetunes of
+# Qwen3.5 / Gemma 4 bases, NOT a new architecture. Self-scaffolding is a training-time
+# technique; at inference they're ordinary transformers. GGUF arches reduce to ones
+# already dispatched: 9B = dense `qwen35`, 35B/397B = `qwen35moe` (so the MoE variants
+# ride the existing Gated-DeltaNet + sparse-attention MoE path, incl. --cpu-moe, and the
+# qwen35moe QwenToolCallAdapter). They're tagged image-text-to-text, but the Qwen3.5
+# vision projector is unimplemented — the text GGUF path is text-only, which is what the
+# coding use case needs. `download-model.ps1 -Model ornith-9b` (Q4_K_M, ~5.6 GB).
+dotnet run --project src/SharpInference.Cli -c Release -- \
+  -m models/deepreinforce-ai_Ornith-1.0-9B-Q4_K_M.gguf -g -1 -p "Write a Python LRU cache."
 
 # Image generation with upscaling (Z-Image-Turbo + RRDBNet). ImageCommand auto-detects
 # Z-Image vs FLUX from the model. Z-Image uses a Qwen3-4B text encoder; FLUX uses CLIP-L + T5.

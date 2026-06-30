@@ -5,6 +5,7 @@
     Downloads from HuggingFace to the models/ directory. Skips if already present.
     Supports: smollm2, vibethinker, qwen3-8b, olmoe-1b-7b, llama31-70b, qwen3-coder-30b-a3b, qwen36-35b-a3b,
               qwen36-27b-mtp, qwen36-27b-mtp-q5, qwen36-35b-a3b-mtp, carnice-35b-a3b-mtp,
+              ornith-9b, ornith-35b,
               gemma4-12b-qat, gemma4-12b-q4km, gemma4-e4b-qat, gemma4-12b-agentic,
               llama4-scout, z-image-turbo, z-image-turbo-q8, realesrgan-x4
 .PARAMETER Model
@@ -23,6 +24,8 @@
     .\download-model.ps1 -Model qwen36-27b-mtp-q5       # Qwen3.6 27B-MTP Q5_K_M (18.5 GB) — higher-quality variant for the MTP bench row
     .\download-model.ps1 -Model qwen36-35b-a3b-mtp -DestDir E:\models  # Qwen3.6 35B-A3B-MTP UD-Q4_K_M (22.7 GB) — MoE MTP perf target for issue #25
     .\download-model.ps1 -Model carnice-35b-a3b-mtp -DestDir E:\models  # Carnice (Qwen3.6-35B-A3B-MTP, agentic/tool-calling) APEX-MTP I-Compact (17.3 GB)
+    .\download-model.ps1 -Model ornith-9b              # Ornith-1.0-9B Q4_K_M (~5.6 GB) — DeepReinforce agentic-coding finetune of Qwen3.5 (dense qwen35 arch)
+    .\download-model.ps1 -Model ornith-35b -DestDir E:\models  # Ornith-1.0-35B Q4_K_M (~21 GB) — agentic-coding MoE on the existing qwen35moe path
     .\download-model.ps1 -Model gemma4-12b-qat -DestDir E:\models  # Gemma 4 12B-it QAT q4_0 + vision/audio mmproj (~7.2 GB) — issue #124 PRIMARY (official quantization-aware-trained)
     .\download-model.ps1 -Model gemma4-12b-q4km -DestDir E:\models # Gemma 4 12B-it Q4_K_M (~7.3 GB) — issue #124 fallback / K-quant cross-check
     .\download-model.ps1 -Model gemma4-e4b-qat -DestDir E:\models  # Gemma 4 E4B-it QAT q4_0 (~5.15 GB) — fast small Gemma (~1.6× decode vs Q8_0)
@@ -35,6 +38,7 @@
 param(
     [ValidateSet("smollm2", "vibethinker", "vibethinker-q4", "qwen3-8b", "qwen3-0.6b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "qwen36-35b-a3b",
                  "qwen36-27b-mtp", "qwen36-27b-mtp-q5", "qwen36-35b-a3b-mtp", "carnice-35b-a3b-mtp",
+                 "ornith-9b", "ornith-35b",
                  "gemma4-12b-qat", "gemma4-12b-q4km", "gemma4-e4b-qat", "gemma4-12b-agentic",
                  "llama4-scout", "z-image-turbo", "z-image-turbo-q8", "realesrgan-x4")]
     [string]$Model,
@@ -160,6 +164,39 @@ $Models = @{
         Urls  = @("https://huggingface.co/mudler/Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-GGUF/resolve/main/Carnice-Qwen3.6-MoE-35B-A3B-APEX-MTP-I-Compact.gguf")
         Size  = "17.3 GB"
         Phase = "assistant (agentic/tool-calling orchestrator on the qwen35moe MTP path)"
+    }
+    # ── Ornith-1.0 (DeepReinforce, MIT) — agentic-coding finetunes ────────────
+    # Ornith-1.0 is NOT a new architecture: it's DeepReinforce's "self-scaffolding"
+    # RL post-train of existing Qwen3.5 / Gemma 4 bases. Self-scaffolding (the model
+    # learns to emit its own task harness alongside solution rollouts) is a TRAINING
+    # technique — at inference these are ordinary autoregressive transformers and need
+    # no special runtime support. HF arches: 9B = `qwen3_5` (dense), 35B/397B =
+    # `qwen3_5_moe`. After llama.cpp conversion the GGUF arch strings are `qwen35`
+    # (dense) and `qwen35moe` (MoE), both already dispatched by ModelGraph — so the
+    # MoE variants ride the existing Gated-DeltaNet + sparse-attention MoE path and
+    # tool-calling via the qwen35moe QwenToolCallAdapter. (The models are tagged
+    # image-text-to-text; the Qwen3.5 vision projector is not yet implemented, so the
+    # text GGUF path here is text-only — fine for the agentic-coding use case.)
+    #
+    # Sources are bartowski's GGUF republishes (deterministic `<ns>_<model>-<Quant>.gguf`
+    # naming). Ornith-1.0-9B is the edge target (43.1 Terminal-Bench 2.1, 69.4 SWE-Bench
+    # Verified). If the 9B GGUF carries GDN tensors the hybrid-SSM probe activates
+    # automatically; otherwise it loads as a plain dense qwen35 transformer.
+    "ornith-9b" = @{
+        Files = @("deepreinforce-ai_Ornith-1.0-9B-Q4_K_M.gguf")
+        Urls  = @("https://huggingface.co/bartowski/deepreinforce-ai_Ornith-1.0-9B-GGUF/resolve/main/deepreinforce-ai_Ornith-1.0-9B-Q4_K_M.gguf")
+        Size  = "~5.6 GB"
+        Phase = "agentic coding (Qwen3.5-based dense, qwen35 arch)"
+    }
+    # Ornith-1.0-35B — qwen35moe (Qwen3.5 35B-A3B base): runs on the existing hybrid
+    # Gated-DeltaNet + sparse-attention MoE path (same arch as qwen36-35b-a3b), incl.
+    # --cpu-moe expert offload. MTP-augmented community quants exist separately and
+    # would ride the MtpDecoder path.
+    "ornith-35b" = @{
+        Files = @("deepreinforce-ai_Ornith-1.0-35B-Q4_K_M.gguf")
+        Urls  = @("https://huggingface.co/bartowski/deepreinforce-ai_Ornith-1.0-35B-GGUF/resolve/main/deepreinforce-ai_Ornith-1.0-35B-Q4_K_M.gguf")
+        Size  = "~21 GB"
+        Phase = "agentic coding (qwen35moe MoE path)"
     }
     # ── Gemma 4 12B (dense gemma4_unified) — issue #124 ───────────────────────
     # Google's official quantization-aware-trained (QAT) 4-bit weights. Stored as
