@@ -25,7 +25,7 @@ Released draft heads (checked against the HF hub) target architectures we alread
 |---|---|---|
 | `deepseek-ai/dspark_qwen3_4b_block7` | 1.39B | qwen3 |
 | `deepseek-ai/dspark_qwen3_8b_block7` | 2.37B | qwen3 |
-| `deepseek-ai/dspark_qwen3_14b_block7` | — | qwen3 |
+| `deepseek-ai/dspark_qwen3_14b_block7` | 3.42B | qwen3 |
 | `deepseek-ai/dspark_gemma4_12b_block7` | 3.43B | gemma4_text |
 
 Important correction vs. the "lightweight" marketing framing: these heads are **not** a
@@ -43,10 +43,15 @@ not an afterthought. This spec is about that decision.
   already supports **mixed backends** in principle — nothing in its constructor requires
   target and draft to share a backend.
 - `RunCommand.cs`'s existing `--draft-model` wiring (~line 994–1034) is the one precedent for
-  choosing a draft backend today, and it's **naive**: the draft backend always mirrors the
-  target's (CUDA target → CUDA draft via a second `CudaBackend`; anything else → CPU draft).
-  There is no "GPU target + CPU draft" option today even though the draft model is usually
-  much smaller than the target and would often fit better on the side with spare capacity.
+  choosing a draft backend today, and it's **naive**: for a CUDA target it spins up a second
+  `CudaBackend` for the draft; for a CPU target it uses a CPU draft. For a **Vulkan** target,
+  `--draft-model` is rejected outright (the `vulkanSpecTarget` guard at ~line 942–946 warns
+  and falls back to normal, non-speculative generation) — it does *not* fall back to a CPU
+  draft. So today there are exactly two reachable combinations (CUDA+CUDA, CPU+CPU), never a
+  mixed CUDA-target/CPU-draft or Vulkan-target/CPU-draft pair, even though nothing in
+  `SpeculativeDecoder` itself prevents it (see below). There is no "GPU target + CPU draft"
+  option today even though the draft model is usually much smaller than the target and would
+  often fit better on the side with spare capacity.
 - `HardwareProfile.Detect(...)` (`src/SharpInference.Engine/HardwareProfile.cs`) already
   auto-detects `VramBytes`, `RamBytes`, `CpuCores`, `HasAvx512`, and measured PCIe bandwidth —
   everything a placement decision needs is already collected once per run.
@@ -70,7 +75,11 @@ A DSpark draft head can run in one of four modes:
 
 ## 4. Auto-placement algorithm
 
-New type, `DSparkPlacementPlanner` in `SharpInference.Engine`, mirroring `TierPlanner`'s shape:
+New type, `DSparkPlacementPlanner` in `SharpInference.Engine`, mirroring `TierPlanner`'s shape.
+It should call a shared `TierPlanner.ReservedVramBytes(long vramTotal)` helper (factor the
+existing inline `Math.Max(vramTotal / 10, 512L * 1024 * 1024)` out of `TierPlanner.Plan` into
+one) rather than re-deriving the 10%-or-512MB floor independently — otherwise the two planners
+drift the moment either heuristic changes.
 
 ```csharp
 public enum DSparkPlacement { Auto, Gpu, Cpu, Off }
@@ -103,8 +112,13 @@ requested mode, see §5):
    using the same 10%-or-512MB `reserved` floor `TierPlanner` already uses. If
    `vramFree >= draftHeadBytesGpuQuant * 1.15` (15% margin for the draft's own KV/scratch,
    mirroring the scratch-reservation pattern in `TierPlanner.Plan`) → **`Gpu`**.
-3. **Else compute RAM headroom.** `ramFree = hardware.RamBytes - targetPlacement.CpuLayers-worth
-   of trunk weights (already resident if the target itself is CPU/hybrid) - reserved`. If
+3. **Else compute RAM headroom.** `LayerPlacement` today only exposes `GpuWeightBytes`/
+   `GpuKvBytes`/`CpuLayers` (a count, not a byte size) — it has no per-CPU-layer weight-byte
+   field, so this step needs one new piece of plumbing: either add a `CpuWeightBytes` field to
+   `LayerPlacement` (computed the same way `TierPlanner.Plan` already sums `GpuWeightBytes`,
+   just for the layers it *didn't* place on GPU) or have the caller re-derive it via
+   `TierPlanner`'s existing `MeasureLayerBytes` helper for `targetPlacement.CpuLayers` layers.
+   With that available: `ramFree = hardware.RamBytes - cpuResidentTrunkBytes - reserved`. If
    `ramFree >= draftHeadBytesCpuQuant * 1.15` **and** `hardware.CpuCores >= 4` (a floor below
    which a sequential-ish per-token draft chain would itself become the bottleneck) → **`Cpu`**.
 4. **Else `Off`**, with a `Reason` explaining which budget was insufficient (VRAM, RAM, or
@@ -131,7 +145,12 @@ Two refinements worth calling out because they're **not** just "bigger number wi
   pattern: `Auto` picks a *starting* placement from the static estimate before any model is
   loaded, but the actual draft-head allocation should re-check real free VRAM (CUDA
   `cudaMemGetInfo`-equivalent) right before allocating, and fall back to `Cpu`/`Off` if the
-  static estimate undershot fragmentation/driver overhead.
+  static estimate undershot fragmentation/driver overhead. Concretely, this means
+  `DSparkPlacementDecision` is not the last word: the code that actually constructs the draft
+  head's backend (the `DSparkDecoder` init path, Phase 2/3) must re-run the free-VRAM check
+  immediately before allocating and downgrade `Gpu → Cpu → Off` on the spot if the static
+  decision no longer holds — the planner's record isn't self-enforcing, so this recheck has to
+  be called out as a concrete step in Phase 3, not left implicit.
 
 ## 5. User overrides
 
@@ -161,10 +180,16 @@ explicit choice; the forward pass enforces real fit"). It should still print wha
 Placement is the piece this request is scoped to, but it only matters once DSpark can run at
 all. For completeness, the surrounding work:
 
-- **Safetensors loader.** SharpInference is GGUF-only end to end; the released draft heads are
-  HF safetensors. Needs a minimal reader (just enough to pull the DFlash backbone + Markov head
-  + confidence head tensors — not a general safetensors-to-GGUF converter) rather than
-  extending the GGUF path.
+- **Safetensors loader.** The main inference path (Core/Engine/backends) is GGUF-only, but
+  `SharpInference.Diffusion` already ships a `SafetensorsLoader` (single-file and multi-shard,
+  used for FLUX/Z-Image weights) — reuse/extract that rather than writing a second, unrelated
+  safetensors reader. It only needs to grow enough to pull the DFlash backbone + Markov head +
+  confidence head tensors, not become a general safetensors-to-GGUF converter. Per CLAUDE.md's
+  Build Constraints (trim/AOT analyzers enabled, no reflection-heavy patterns), the tensor-index
+  JSON (`model.safetensors.index.json`) must be parsed via a source-generated `JsonSerializerContext`
+  (extending `SharpInferenceJsonContext` or a sibling context) rather than reflection-based
+  `System.Text.Json` deserialization — check how the existing `SafetensorsLoader` handles this
+  before assuming it already does.
 - **`DSparkForwardPass`** (or an extension of the existing MTP-head capability surface on
   `IForwardPass`): parallel backbone forward producing k positions' logits in one pass, then
   the rank-256 sequential bias correction. The exact Markov-head math isn't in any of the
@@ -187,6 +212,12 @@ is below `--dspark-min-confidence` before calling `BatchVerify`. For the server
 (`ContinuousBatchingEngine`), load = current batch occupancy — a natural follow-on once the
 CLI path is validated, analogous to how `SHARPI_KV_BUDGET_MB` already gates admission by a
 live resource signal rather than a static config.
+
+Note the coupling back to §4: the placement decision's `draftHeadBytesGpuQuant`/`Cpu` margin
+math assumes a fixed `--dspark-verify-len` batch width `k`. Once the scheduler can trim `k`
+per step, a placement that was marginal at the configured max `k` may in practice run at a
+smaller effective `k` most of the time — Phase 5 should re-validate (not just extend) the
+Phase 3 placement heuristics rather than treat them as already-settled.
 
 ## 8. Phased rollout
 
