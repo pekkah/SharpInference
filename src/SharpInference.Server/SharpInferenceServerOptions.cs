@@ -27,6 +27,17 @@ public sealed class SharpInferenceServerOptions
     public bool DisableThinking { get; set; }
 
     /// <summary>
+    /// Globally keep prior assistant turns' reasoning in the chat-template history instead of
+    /// stripping it (server-side default for the per-request <c>preserve_thinking</c> flag /
+    /// <c>SHARPI_PRESERVE_THINKING</c>). Off by default: reasoning-model chat templates (Qwen3,
+    /// DeepSeek-R1, ...) are trained assuming historical assistant turns contain no reasoning, so
+    /// <see cref="ChatTemplate.ScrubAssistantThinking"/> strips it unless this (or the per-request
+    /// flag) says otherwise. Useful for agentic clients that never send the per-request opt-in but
+    /// want the model to see its own prior reasoning across turns.
+    /// </summary>
+    public bool PreserveThinking { get; set; }
+
+    /// <summary>
     /// Enable schema/grammar-constrained decoding for tool-call arguments (issue #374). When on and
     /// a tool-active request is served by a family with constraint support (Gemma 4, Qwen and
     /// Qwen3-Coder, Llama-3, DeepSeek), the sampler is restricted to tokens that satisfy the supplied

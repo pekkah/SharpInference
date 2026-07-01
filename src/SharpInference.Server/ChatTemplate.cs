@@ -46,6 +46,23 @@ public static partial class ChatTemplate
         result = OrphanCloseRegex().Replace(result, string.Empty);
         return result;
     }
+
+    /// <summary>
+    /// Re-wraps a prior assistant turn's reasoning as a leading <c>&lt;think&gt;...&lt;/think&gt;</c>
+    /// block — the mirror image of <see cref="ScrubAssistantThinking"/> — used when the request opts
+    /// into <c>preserve_thinking</c>. Endpoints carry reasoning out-of-band from the model's answer
+    /// text (OpenAI's <c>reasoning_content</c> field, Anthropic's <c>thinking</c> content block), so
+    /// it has to be re-inlined here before the chat template sees a single content string. No-op when
+    /// there's no reasoning to inject, or <paramref name="content"/> already has its own
+    /// <c>&lt;think&gt;</c> tag (a client echoing the model's literal output rather than the separate
+    /// reasoning channel — nothing to add).
+    /// </summary>
+    public static string InjectThinking(string content, string? reasoning)
+    {
+        if (string.IsNullOrEmpty(reasoning) || content.Contains("<think>", StringComparison.Ordinal))
+            return content;
+        return $"<think>\n{reasoning}\n</think>\n\n{content}";
+    }
 }
 
 /// <summary>

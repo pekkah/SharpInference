@@ -72,6 +72,11 @@ public static class OpenAiEndpoints
         // send the per-request flag.
         bool enableThinking = (req.EnableThinking ?? !chatTemplate.ModelDefaultsThinkingOff)
                               && !options.Value.DisableThinking;
+
+        // preserve_thinking (per-request) or SHARPI_PRESERVE_THINKING (server-wide) keeps prior
+        // assistant turns' reasoning in the rendered history instead of the default
+        // ChatTemplate.ScrubAssistantThinking strip — see SharpInferenceServerOptions.PreserveThinking.
+        bool preserveThinking = req.PreserveThinking ?? options.Value.PreserveThinking;
         var adapter = chatTemplate.ToolCallAdapter;
 
         // Tool-aware rendering: if either tool definitions or a history-side
@@ -93,13 +98,13 @@ public static class OpenAiEndpoints
         {
             if (toolsActive)
             {
-                var (richMessages, tools) = BuildRichMessageList(req, adapter, images);
+                var (richMessages, tools) = BuildRichMessageList(req, adapter, images, preserveThinking);
                 prompt = chatTemplate.Format(richMessages, enableThinking, tools);
                 canonicalHistoryPrefix = chatTemplate.Format(richMessages, enableThinking, tools, addGenerationPrompt: false);
             }
             else
             {
-                var messages = BuildMessageList(req.Messages, req.ResponseFormat?.Type, images);
+                var messages = BuildMessageList(req.Messages, req.ResponseFormat?.Type, images, preserveThinking);
                 prompt = chatTemplate.Format(messages, enableThinking);
                 canonicalHistoryPrefix = chatTemplate.Format(messages, enableThinking, addGenerationPrompt: false);
             }
@@ -486,7 +491,7 @@ public static class OpenAiEndpoints
     }
 
     private static List<(string role, string content)> BuildMessageList(
-        OaiMessage[] messages, string? responseFormatType, List<byte[]> images)
+        OaiMessage[] messages, string? responseFormatType, List<byte[]> images, bool preserveThinking)
     {
         var list = new List<(string, string)>(messages.Length + 1);
         if (responseFormatType == "json_object")
@@ -496,7 +501,9 @@ public static class OpenAiEndpoints
             var role = m.Role ?? "user";
             var content = FlattenContent(m.Content, images);
             if (role == "assistant")
-                content = ChatTemplate.ScrubAssistantThinking(content);
+                content = preserveThinking
+                    ? ChatTemplate.InjectThinking(content, m.ReasoningContent)
+                    : ChatTemplate.ScrubAssistantThinking(content);
             list.Add((role, content));
         }
         return list;
@@ -569,7 +576,7 @@ public static class OpenAiEndpoints
     /// <c>role:"tool"</c> message with <c>tool_call_id</c>.
     /// </summary>
     private static (List<Dictionary<string, object?>> messages, List<object?>? tools)
-        BuildRichMessageList(ChatCompletionRequest req, IToolCallAdapter adapter, List<byte[]> images)
+        BuildRichMessageList(ChatCompletionRequest req, IToolCallAdapter adapter, List<byte[]> images, bool preserveThinking)
     {
         var messages = new List<Dictionary<string, object?>>();
 
@@ -586,7 +593,9 @@ public static class OpenAiEndpoints
 
             if (role == "assistant")
             {
-                string textStr = ChatTemplate.ScrubAssistantThinking(content);
+                string textStr = preserveThinking
+                    ? ChatTemplate.InjectThinking(content, m.ReasoningContent)
+                    : ChatTemplate.ScrubAssistantThinking(content);
                 var msg = new Dictionary<string, object?>(StringComparer.Ordinal)
                 {
                     ["role"]    = "assistant",
@@ -662,7 +671,12 @@ public sealed record ChatCompletionRequest(
     [property: JsonPropertyName("enable_thinking")] bool? EnableThinking = null,
     [property: JsonPropertyName("max_thinking_tokens")] int? MaxThinkingTokens = null,
     OaiTool[]? Tools = null,
-    [property: JsonPropertyName("tool_choice")] JsonElement? ToolChoice = null);
+    [property: JsonPropertyName("tool_choice")] JsonElement? ToolChoice = null,
+    // When true, prior assistant turns' reasoning_content is re-inlined as a leading <think>
+    // block instead of being stripped (SharpInferenceServerOptions.PreserveThinking is the
+    // server-wide default when this is absent). Off by default, matching the pre-existing
+    // ChatTemplate.ScrubAssistantThinking behavior.
+    [property: JsonPropertyName("preserve_thinking")] bool? PreserveThinking = null);
 
 /// <summary>
 /// Message in an OpenAI <c>/v1/chat/completions</c> request. Both single-string
@@ -678,7 +692,12 @@ public sealed record OaiMessage(
     JsonElement? Content,
     [property: JsonPropertyName("tool_call_id")] string? ToolCallId = null,
     [property: JsonPropertyName("tool_calls")] OaiToolCall[]? ToolCalls = null,
-    string? Name = null);
+    string? Name = null,
+    // Reasoning from a prior assistant turn, as echoed back by a client that captured it from
+    // this same field on the response (see OaiAssistantMessage.ReasoningContent). Only consulted
+    // when the request sets preserve_thinking; ChatTemplate.InjectThinking re-inlines it as a
+    // leading <think> block ahead of Content.
+    [property: JsonPropertyName("reasoning_content")] string? ReasoningContent = null);
 
 /// <summary>
 /// OpenAI tool definition. <c>function.parameters</c> is the JSON Schema; we keep it
