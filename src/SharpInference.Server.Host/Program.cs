@@ -71,6 +71,16 @@ builder.Services.AddSharpInference(builder.Configuration, opts =>
         opts.DisableThinking = true;
     }
 
+    // SHARPI_PRESERVE_THINKING ∈ {1, true} globally keeps prior assistant turns' reasoning in
+    // the chat-template history instead of stripping it, for agentic clients that never send the
+    // per-request preserve_thinking opt-in.
+    var envPreserveThink = Environment.GetEnvironmentVariable("SHARPI_PRESERVE_THINKING");
+    if (!string.IsNullOrWhiteSpace(envPreserveThink)
+        && (envPreserveThink == "1" || envPreserveThink.Equals("true", StringComparison.OrdinalIgnoreCase)))
+    {
+        opts.PreserveThinking = true;
+    }
+
     // SHARPI_TOOL_GRAMMAR ∈ {1, true} enables schema/grammar-constrained tool-call argument
     // decoding (issue #374). Off by default → byte-identical to unconstrained decoding.
     var envToolGrammar = Environment.GetEnvironmentVariable("SHARPI_TOOL_GRAMMAR");

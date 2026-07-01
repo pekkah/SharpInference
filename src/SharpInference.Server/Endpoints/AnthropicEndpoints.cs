@@ -81,6 +81,14 @@ public static class AnthropicEndpoints
         bool enableThinking = (requestedThinking ?? !chatTemplate.ModelDefaultsThinkingOff)
                               && !options.Value.DisableThinking;
 
+        // preserve_thinking (per-request) or SHARPI_PRESERVE_THINKING (server-wide) keeps prior
+        // assistant turns' thinking content blocks in the rendered history instead of the default
+        // ChatTemplate.ScrubAssistantThinking strip — see SharpInferenceServerOptions.PreserveThinking.
+        // Server-level DisableThinking still wins: an operator who has decided this deployment never
+        // exposes <think> content to the model shouldn't have historical reasoning re-injected either.
+        bool preserveThinking = (req.PreserveThinking ?? options.Value.PreserveThinking)
+                                && !options.Value.DisableThinking;
+
         var adapter = chatTemplate.ToolCallAdapter;
 
         // Image content blocks (issue #253) are collected (base64 → bytes) and replaced by the
@@ -96,13 +104,13 @@ public static class AnthropicEndpoints
         {
             if (req.Tools is { Length: > 0 })
             {
-                var (richMessages, tools) = BuildRichMessageList(req, adapter, images);
+                var (richMessages, tools) = BuildRichMessageList(req, adapter, images, preserveThinking);
                 prompt = chatTemplate.Format(richMessages, enableThinking, tools);
                 canonicalHistoryPrefix = chatTemplate.Format(richMessages, enableThinking, tools, addGenerationPrompt: false);
             }
             else
             {
-                var messages = BuildMessageList(req, images);
+                var messages = BuildMessageList(req, images, preserveThinking);
                 prompt = chatTemplate.Format(messages, enableThinking);
                 canonicalHistoryPrefix = chatTemplate.Format(messages, enableThinking, addGenerationPrompt: false);
             }
@@ -607,7 +615,8 @@ public static class AnthropicEndpoints
     /// Builds the simple (string-content) message list used when no tools are present.
     /// Handles both plain-string and array-of-content-blocks message formats.
     /// </summary>
-    private static List<(string role, string content)> BuildMessageList(AnthropicMessageRequest req, List<byte[]> images)
+    private static List<(string role, string content)> BuildMessageList(
+        AnthropicMessageRequest req, List<byte[]> images, bool preserveThinking)
     {
         var list = new List<(string, string)>();
         var systemText = ExtractTextContent(req.System);
@@ -616,12 +625,61 @@ public static class AnthropicEndpoints
         foreach (var m in req.Messages!)
         {
             var role = m.Role ?? "user";
-            var content = ExtractTextAndImages(m.Content, images);
             if (role == "assistant")
-                content = ChatTemplate.ScrubAssistantThinking(content);
-            list.Add((role, content));
+            {
+                var (text, thinking) = ExtractAssistantTextAndThinking(m.Content, images);
+                var content = preserveThinking
+                    ? ChatTemplate.InjectThinking(text, thinking)
+                    : ChatTemplate.ScrubAssistantThinking(text);
+                list.Add((role, content));
+            }
+            else
+            {
+                list.Add((role, ExtractTextAndImages(m.Content, images)));
+            }
         }
         return list;
+    }
+
+    /// <summary>
+    /// Like <see cref="ExtractTextAndImages"/> but also pulls out <c>thinking</c> content blocks
+    /// separately from <c>text</c> — Anthropic carries an assistant turn's reasoning as its own
+    /// block type, not inlined into the text, so the two channels have to be split before
+    /// <see cref="ChatTemplate.ScrubAssistantThinking"/> / <see cref="ChatTemplate.InjectThinking"/>
+    /// can decide what happens to the reasoning independently of the answer text.
+    /// </summary>
+    private static (string text, string? thinking) ExtractAssistantTextAndThinking(
+        JsonElement? contentEl, List<byte[]> images)
+    {
+        if (contentEl is null) return ("", null);
+        var el = contentEl.Value;
+        if (el.ValueKind == JsonValueKind.String) return (el.GetString() ?? "", null);
+        if (el.ValueKind != JsonValueKind.Array) return ("", null);
+
+        var textSb = new StringBuilder();
+        var thinkingSb = new StringBuilder();
+        foreach (var block in el.EnumerateArray())
+        {
+            if (block.ValueKind != JsonValueKind.Object) continue;
+            var type = block.TryGetProperty("type", out var t) ? t.GetString() : null;
+            if (type == "text")
+            {
+                if (block.TryGetProperty("text", out var tv))
+                    textSb.Append(tv.GetString());
+            }
+            else if (type == "thinking")
+            {
+                if (block.TryGetProperty("thinking", out var tk))
+                    thinkingSb.Append(tk.GetString());
+            }
+            else if (type == "image")
+            {
+                ImageContent.CheckCap(images.Count);
+                images.Add(ParseAnthropicImageBlock(block));
+                textSb.Append(ImageContent.Placeholder);
+            }
+        }
+        return (textSb.ToString(), thinkingSb.Length > 0 ? thinkingSb.ToString() : null);
     }
 
     /// <summary>
@@ -681,7 +739,7 @@ public static class AnthropicEndpoints
     /// the adapter specifies (defaults to role="tool").
     /// </summary>
     private static (List<Dictionary<string, object?>> messages, List<object?>? tools)
-        BuildRichMessageList(AnthropicMessageRequest req, IToolCallAdapter adapter, List<byte[]> images)
+        BuildRichMessageList(AnthropicMessageRequest req, IToolCallAdapter adapter, List<byte[]> images, bool preserveThinking)
     {
         var messages = new List<Dictionary<string, object?>>();
 
@@ -704,7 +762,8 @@ public static class AnthropicEndpoints
             if (contentEl.ValueKind == JsonValueKind.String)
             {
                 var str = contentEl.GetString() ?? "";
-                if (role == "assistant") str = ChatTemplate.ScrubAssistantThinking(str);
+                if (role == "assistant")
+                    str = preserveThinking ? str : ChatTemplate.ScrubAssistantThinking(str);
                 messages.Add(new() { ["role"] = role, ["content"] = str });
             }
             else if (contentEl.ValueKind == JsonValueKind.Array)
@@ -712,6 +771,7 @@ public static class AnthropicEndpoints
                 if (role == "assistant")
                 {
                     var textSb = new StringBuilder();
+                    var thinkingSb = new StringBuilder();
                     var toolCalls = new List<object?>();
 
                     foreach (var block in contentEl.EnumerateArray())
@@ -722,6 +782,11 @@ public static class AnthropicEndpoints
                         {
                             if (block.TryGetProperty("text", out var tv))
                                 textSb.Append(tv.GetString());
+                        }
+                        else if (type == "thinking")
+                        {
+                            if (block.TryGetProperty("thinking", out var tk))
+                                thinkingSb.Append(tk.GetString());
                         }
                         else if (type == "tool_use")
                         {
@@ -738,7 +803,9 @@ public static class AnthropicEndpoints
                         }
                     }
 
-                    string textStr = ChatTemplate.ScrubAssistantThinking(textSb.ToString());
+                    string textStr = preserveThinking
+                        ? ChatTemplate.InjectThinking(textSb.ToString(), thinkingSb.Length > 0 ? thinkingSb.ToString() : null)
+                        : ChatTemplate.ScrubAssistantThinking(textSb.ToString());
                     var msg = new Dictionary<string, object?> { ["role"] = "assistant", ["content"] = textStr };
                     if (toolCalls.Count > 0) msg["tool_calls"] = (object?)toolCalls;
                     messages.Add(msg);
@@ -854,7 +921,14 @@ public sealed record AnthropicMessageRequest(
     float? TopP,
     int? TopK,
     AnthropicThinking? Thinking = null,
-    AnthropicTool[]? Tools = null);
+    AnthropicTool[]? Tools = null,
+    // When true, a prior assistant turn's `thinking` content block is re-inlined as a leading
+    // <think> block instead of being dropped (SharpInferenceServerOptions.PreserveThinking is
+    // the server-wide default when this is absent). Off by default, matching the pre-existing
+    // ChatTemplate.ScrubAssistantThinking behavior — and the pre-existing behavior of silently
+    // dropping `thinking` blocks entirely on the tool-active path. Maps to the wire field
+    // `preserve_thinking` via the server's snake_case JSON naming policy.
+    bool? PreserveThinking = null);
 
 public sealed record AnthropicThinking(string? Type, int? BudgetTokens);
 

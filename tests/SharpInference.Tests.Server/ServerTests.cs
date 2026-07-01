@@ -1122,6 +1122,241 @@ public sealed class ChatTemplateScrubTests
         Assert.NotNull(fake.LastPrompt);
         Assert.Contains("<<NOTHINK>>", fake.LastPrompt);
     }
+
+    // ── ChatTemplate.InjectThinking (the mirror of ScrubAssistantThinking) ────
+
+    [Fact]
+    public void InjectThinking_WrapsReasoningAheadOfContent()
+    {
+        Assert.Equal("<think>\nplan\n</think>\n\nanswer", ChatTemplate.InjectThinking("answer", "plan"));
+    }
+
+    [Fact]
+    public void InjectThinking_NoReasoning_ReturnsContentUnchanged()
+    {
+        Assert.Equal("answer", ChatTemplate.InjectThinking("answer", null));
+        Assert.Equal("answer", ChatTemplate.InjectThinking("answer", ""));
+    }
+
+    [Fact]
+    public void InjectThinking_ContentAlreadyHasThinkTag_LeavesUntouched()
+    {
+        var input = "<think>already here</think>answer";
+        Assert.Equal(input, ChatTemplate.InjectThinking(input, "other reasoning"));
+    }
+}
+
+/// <summary>
+/// Wire-level tests for <c>preserve_thinking</c> (per-request) and
+/// <see cref="SharpInferenceServerOptions.PreserveThinking"/> (server-wide default): whether a
+/// prior assistant turn's reasoning survives into the rendered chat-template history instead of
+/// being stripped by <see cref="ChatTemplate.ScrubAssistantThinking"/>.
+/// </summary>
+public sealed class PreserveThinkingTests
+{
+    // Echoes role/content verbatim so the test can see exactly what reached the template,
+    // independent of enable_thinking (unlike ThinkProbeTemplate above, which only probes that flag).
+    private const string EchoTemplate =
+        "{% for m in messages %}[{{ m.role }}:{{ m.content }}]{% endfor %}";
+
+    private static (HttpClient client, FakeInferenceEngine fake) ProbeClient(
+        bool serverPreserveThinking = false, bool disableThinking = false)
+    {
+        var fake = new FakeInferenceEngine("m");
+        var renderer = new ChatTemplateRenderer("test", new JinjaChatTemplate(EchoTemplate));
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s =>
+            {
+                s.AddSingleton(renderer);
+                s.AddSingleton<IInferenceEngine>(fake);
+                s.Configure<SharpInferenceServerOptions>(o =>
+                {
+                    o.PreserveThinking = serverPreserveThinking;
+                    o.DisableThinking = disableThinking;
+                });
+            }));
+        return (factory.CreateClient(), fake);
+    }
+
+    [Fact]
+    public async Task OpenAi_Default_ScrubsPriorAssistantReasoning()
+    {
+        var (client, fake) = ProbeClient();
+        var req = new
+        {
+            model = "m",
+            max_tokens = 16,
+            messages = new object[]
+            {
+                new { role = "user", content = "What is 2+2?" },
+                new { role = "assistant", content = "4", reasoning_content = "two plus two is four" },
+                new { role = "user", content = "And 3+3?" },
+            },
+        };
+        var resp = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        Assert.NotNull(fake.LastPrompt);
+        Assert.DoesNotContain("<think>", fake.LastPrompt);
+        Assert.Contains("[assistant:4]", fake.LastPrompt);
+    }
+
+    [Fact]
+    public async Task OpenAi_PreserveThinkingRequest_InjectsReasoningAheadOfContent()
+    {
+        var (client, fake) = ProbeClient();
+        var req = new
+        {
+            model = "m",
+            max_tokens = 16,
+            preserve_thinking = true,
+            messages = new object[]
+            {
+                new { role = "user", content = "What is 2+2?" },
+                new { role = "assistant", content = "4", reasoning_content = "two plus two is four" },
+                new { role = "user", content = "And 3+3?" },
+            },
+        };
+        var resp = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        Assert.NotNull(fake.LastPrompt);
+        Assert.Contains("<think>\ntwo plus two is four\n</think>\n\n4", fake.LastPrompt);
+    }
+
+    [Fact]
+    public async Task OpenAi_ServerWidePreserveThinking_AppliesWithoutPerRequestFlag()
+    {
+        var (client, fake) = ProbeClient(serverPreserveThinking: true);
+        var req = new
+        {
+            model = "m",
+            max_tokens = 16,
+            messages = new object[]
+            {
+                new { role = "user", content = "hi" },
+                new { role = "assistant", content = "hello", reasoning_content = "greet back" },
+                new { role = "user", content = "again" },
+            },
+        };
+        var resp = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        Assert.NotNull(fake.LastPrompt);
+        Assert.Contains("<think>\ngreet back\n</think>\n\nhello", fake.LastPrompt);
+    }
+
+    [Fact]
+    public async Task Anthropic_Default_DropsPriorAssistantThinkingBlock()
+    {
+        var (client, fake) = ProbeClient();
+        var req = new
+        {
+            model = "m",
+            max_tokens = 16,
+            messages = new object[]
+            {
+                new { role = "user", content = "What is 2+2?" },
+                new
+                {
+                    role = "assistant",
+                    content = new object[]
+                    {
+                        new { type = "thinking", thinking = "two plus two is four" },
+                        new { type = "text", text = "4" },
+                    },
+                },
+                new { role = "user", content = "And 3+3?" },
+            },
+        };
+        var resp = await client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        Assert.NotNull(fake.LastPrompt);
+        Assert.DoesNotContain("<think>", fake.LastPrompt);
+        Assert.Contains("[assistant:4]", fake.LastPrompt);
+    }
+
+    [Fact]
+    public async Task Anthropic_PreserveThinkingRequest_InjectsThinkingBlockAheadOfText()
+    {
+        var (client, fake) = ProbeClient();
+        var req = new
+        {
+            model = "m",
+            max_tokens = 16,
+            preserve_thinking = true,
+            messages = new object[]
+            {
+                new { role = "user", content = "What is 2+2?" },
+                new
+                {
+                    role = "assistant",
+                    content = new object[]
+                    {
+                        new { type = "thinking", thinking = "two plus two is four" },
+                        new { type = "text", text = "4" },
+                    },
+                },
+                new { role = "user", content = "And 3+3?" },
+            },
+        };
+        var resp = await client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        Assert.NotNull(fake.LastPrompt);
+        Assert.Contains("<think>\ntwo plus two is four\n</think>\n\n4", fake.LastPrompt);
+    }
+
+    // ── DisableThinking (SHARPI_NO_THINKING) wins over preserve_thinking ───────
+
+    [Fact]
+    public async Task OpenAi_DisableThinking_OverridesPreserveThinkingRequest()
+    {
+        var (client, fake) = ProbeClient(disableThinking: true);
+        var req = new
+        {
+            model = "m",
+            max_tokens = 16,
+            preserve_thinking = true,
+            messages = new object[]
+            {
+                new { role = "user", content = "What is 2+2?" },
+                new { role = "assistant", content = "4", reasoning_content = "two plus two is four" },
+                new { role = "user", content = "And 3+3?" },
+            },
+        };
+        var resp = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        Assert.NotNull(fake.LastPrompt);
+        Assert.DoesNotContain("<think>", fake.LastPrompt);
+        Assert.Contains("[assistant:4]", fake.LastPrompt);
+    }
+
+    [Fact]
+    public async Task Anthropic_DisableThinking_OverridesServerWidePreserveThinking()
+    {
+        var (client, fake) = ProbeClient(serverPreserveThinking: true, disableThinking: true);
+        var req = new
+        {
+            model = "m",
+            max_tokens = 16,
+            messages = new object[]
+            {
+                new { role = "user", content = "What is 2+2?" },
+                new
+                {
+                    role = "assistant",
+                    content = new object[]
+                    {
+                        new { type = "thinking", thinking = "two plus two is four" },
+                        new { type = "text", text = "4" },
+                    },
+                },
+                new { role = "user", content = "And 3+3?" },
+            },
+        };
+        var resp = await client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        Assert.NotNull(fake.LastPrompt);
+        Assert.DoesNotContain("<think>", fake.LastPrompt);
+        Assert.Contains("[assistant:4]", fake.LastPrompt);
+    }
 }
 
 /// <summary>
