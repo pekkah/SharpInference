@@ -33,7 +33,9 @@ public sealed class SharpInferenceServerOptions
     /// DeepSeek-R1, ...) are trained assuming historical assistant turns contain no reasoning, so
     /// <see cref="ChatTemplate.ScrubAssistantThinking"/> strips it unless this (or the per-request
     /// flag) says otherwise. Useful for agentic clients that never send the per-request opt-in but
-    /// want the model to see its own prior reasoning across turns.
+    /// want the model to see its own prior reasoning across turns. <see cref="DisableThinking"/>
+    /// still wins over this (and over the per-request flag): a deployment that never exposes
+    /// <c>&lt;think&gt;</c> content to the model shouldn't have historical reasoning re-injected either.
     /// </summary>
     public bool PreserveThinking { get; set; }
 

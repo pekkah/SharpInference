@@ -84,7 +84,10 @@ public static class AnthropicEndpoints
         // preserve_thinking (per-request) or SHARPI_PRESERVE_THINKING (server-wide) keeps prior
         // assistant turns' thinking content blocks in the rendered history instead of the default
         // ChatTemplate.ScrubAssistantThinking strip — see SharpInferenceServerOptions.PreserveThinking.
-        bool preserveThinking = req.PreserveThinking ?? options.Value.PreserveThinking;
+        // Server-level DisableThinking still wins: an operator who has decided this deployment never
+        // exposes <think> content to the model shouldn't have historical reasoning re-injected either.
+        bool preserveThinking = (req.PreserveThinking ?? options.Value.PreserveThinking)
+                                && !options.Value.DisableThinking;
 
         var adapter = chatTemplate.ToolCallAdapter;
 
