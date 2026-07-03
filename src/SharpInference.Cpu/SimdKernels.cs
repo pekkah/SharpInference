@@ -174,6 +174,9 @@ public static unsafe class SimdKernels
             case DType.Q3_K:
                 MatVecQ3K(output, weights, input, rows, cols);
                 break;
+            case DType.Q8_0:
+                MatVecQ8_0(output, weights, input, rows, cols);
+                break;
             default:
                 MatVecDequantFallback(output, weights, input, rows, cols, dtype);
                 break;
@@ -319,6 +322,29 @@ public static unsafe class SimdKernels
                 }
                 break;
             }
+            case DType.Q8_0:
+            {
+                int bpr = (cols / 32) * 34;
+                if (rows >= MinRowsForParallel)
+                {
+                    var w1 = weights1; var w2 = weights2; var inp = input;
+                    var o1 = output1; var o2 = output2; int c = cols;
+                    Parallel.For(0, rows, s_parallelOpts, r =>
+                    {
+                        o1[r] = DotQ8_0(w1 + (long)r * bpr, inp, c);
+                        o2[r] = DotQ8_0(w2 + (long)r * bpr, inp, c);
+                    });
+                }
+                else
+                {
+                    for (int r = 0; r < rows; r++)
+                    {
+                        output1[r] = DotQ8_0(weights1 + (long)r * bpr, input, cols);
+                        output2[r] = DotQ8_0(weights2 + (long)r * bpr, input, cols);
+                    }
+                }
+                break;
+            }
             case DType.Float32:
             {
                 if (rows >= MinRowsForParallel)
@@ -446,6 +472,35 @@ public static unsafe class SimdKernels
                         DotQ6K_Q8K_2In(row, sc1, sc2, cols, out float v1, out float v2);
                         output1[r] = v1;
                         output2[r] = v2;
+                    }
+                }
+                break;
+            }
+            case DType.Q8_0:
+            {
+                // No fused 2In kernel: Q8_0 has no expensive nibble unpack to amortize,
+                // so two sequential DotQ8_0 per row keep the weight-row-in-L1 reuse and
+                // stay bit-identical to single MatVec calls (and to the batched paths'
+                // DispatchDot2In, whose Q8_0 case is the same two-single-dots fallback).
+                int bpr = (cols / 32) * 34;
+                if (rows >= MinRowsForParallel)
+                {
+                    var w = weights; var i1 = input1; var i2 = input2;
+                    var o1 = output1; var o2 = output2; int c = cols;
+                    Parallel.For(0, rows, s_parallelOpts, r =>
+                    {
+                        byte* row = w + (long)r * bpr;
+                        o1[r] = DotQ8_0(row, i1, c);
+                        o2[r] = DotQ8_0(row, i2, c);
+                    });
+                }
+                else
+                {
+                    for (int r = 0; r < rows; r++)
+                    {
+                        byte* row = weights + (long)r * bpr;
+                        output1[r] = DotQ8_0(row, input1, cols);
+                        output2[r] = DotQ8_0(row, input2, cols);
                     }
                 }
                 break;
@@ -590,6 +645,39 @@ public static unsafe class SimdKernels
                 }
                 break;
             }
+            case DType.Q8_0:
+            {
+                // Same rationale as the MatVec2In Q8_0 case (issue #417): no expensive
+                // unpack to amortize, so four sequential DotQ8_0 per row — one weight-row
+                // read per four tokens, bit-identical to four single MatVec calls and to
+                // DispatchDot4In's Q8_0 fallback (two 2In pairs → four single dots).
+                int bpr = (cols / 32) * 34;
+                if (rows >= MinRowsForParallel)
+                {
+                    var w = weights; var i0 = input0; var i1 = input1; var i2 = input2; var i3 = input3;
+                    var o0 = output0; var o1 = output1; var o2 = output2; var o3 = output3; int c = cols;
+                    Parallel.For(0, rows, s_parallelOpts, r =>
+                    {
+                        byte* row = w + (long)r * bpr;
+                        o0[r] = DotQ8_0(row, i0, c);
+                        o1[r] = DotQ8_0(row, i1, c);
+                        o2[r] = DotQ8_0(row, i2, c);
+                        o3[r] = DotQ8_0(row, i3, c);
+                    });
+                }
+                else
+                {
+                    for (int r = 0; r < rows; r++)
+                    {
+                        byte* row = weights + (long)r * bpr;
+                        output0[r] = DotQ8_0(row, input0, cols);
+                        output1[r] = DotQ8_0(row, input1, cols);
+                        output2[r] = DotQ8_0(row, input2, cols);
+                        output3[r] = DotQ8_0(row, input3, cols);
+                    }
+                }
+                break;
+            }
             case DType.Float32:
             {
                 var m = (float*)weights;
@@ -621,12 +709,7 @@ public static unsafe class SimdKernels
             }
             default:
                 // Fallback: two MatVec2In pairs (each falls back per-dtype as needed).
-                // Never worse than the prior pairwise path, still correct. Q8_0 lands
-                // here deliberately — the single-token dense FFN decode (MatVec /
-                // MatVecDual) and the old MatVec2In path both take the dequant→DotF32
-                // fallback for Q8_0, so routing the quad here keeps the verify path
-                // bit-identical to single-token decode (specialising it would also
-                // require moving the single-token path to DotQ8_0 and re-validating).
+                // Never worse than the prior pairwise path, still correct.
                 MatVec2In(output0, output1, weights, input0, input1, rows, cols, dtype);
                 MatVec2In(output2, output3, weights, input2, input3, rows, cols, dtype);
                 break;
@@ -1595,8 +1678,37 @@ public static unsafe class SimdKernels
     //  AVX2 path expands 32 int8 → 4× 8 f32 per block and FMAs against
     //  the f32 input. APEX-mixed quants (e.g. Carnice MoE) interleave
     //  Q8_0 with K-quants, so this lives next to DotQ4K/DotQ5K/DotQ6K
-    //  for use by the routed-expert DispatchDot path.
+    //  for use by the routed-expert DispatchDot path and (issue #417)
+    //  the MatVec/MatVecDual/MatVec2In/MatVec4In dispatchers.
     // ================================================================
+
+    /// <summary>
+    /// Fused Q8_0 mat-vec (issue #417): per-row <see cref="DotQ8_0"/>, mirroring
+    /// <see cref="MatVecQ4K"/>. Replaces the dequant→DotF32 fallback that Q8_0
+    /// previously took through <see cref="MatVec"/> — one pass over the weight
+    /// bytes, no per-row F32 scratch. Accumulation order changes vs the old
+    /// fallback (argmax-stable, same class as the #162 compute routing), and is
+    /// identical to the batched paths' DispatchDot Q8_0 route, which re-admits
+    /// Q8_0 to the #415 batched CPU prefill dtype lists.
+    /// </summary>
+    public static void MatVecQ8_0(float* output, byte* weights, float* input, int rows, int cols)
+    {
+        int bytesPerRow = (cols / 32) * 34;
+
+        if (rows >= MinRowsForParallel)
+        {
+            var w = weights; var inp = input; var outp = output;
+            Parallel.For(0, rows, s_parallelOpts, i =>
+            {
+                outp[i] = DotQ8_0(w + (long)i * bytesPerRow, inp, cols);
+            });
+        }
+        else
+        {
+            for (int i = 0; i < rows; i++)
+                output[i] = DotQ8_0(weights + (long)i * bytesPerRow, input, cols);
+        }
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static float DotQ8_0(byte* row, float* input, int cols)

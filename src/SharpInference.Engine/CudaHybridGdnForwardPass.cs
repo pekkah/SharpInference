@@ -2984,13 +2984,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         && DenseDotSupported(_cpuWFfnUp![layer], _embDim)
         && DenseDotSupported(_cpuWFfnDown![layer], _intermDim);
 
-    // Q8_0 is excluded: the per-token oracle (SimdKernels.MatVec/MatVecDual) has no
-    // fused Q8_0 case — it dequant-falls-back to DotF32, which is not bit-identical
-    // to the batched DotQ8_0 — so a Q8_0 FFN layer must stay on the per-token path.
+    // Q8_0 qualifies since issue #417 wired MatVecQ8_0 into the per-token oracle
+    // (SimdKernels.MatVec/MatVecDual/MatVec2In/MatVec4In): both paths now run the
+    // same per-row DotQ8_0 in the same order, so the batched dense stage is
+    // bit-identical to the per-token loop for Q8_0 FFN layers too.
     private static bool DenseDotSupported(in CpuWeightRef w, int cols) =>
         w.DataPtr != null
         && w.DType is DType.Q3_K or DType.Q4_K or DType.Q5_K or DType.Q6_K
-                    or DType.Float32
+                    or DType.Q8_0 or DType.Float32
         && cols % DTypeInfo.BlockSize(w.DType) == 0;
 
     /// <summary>
