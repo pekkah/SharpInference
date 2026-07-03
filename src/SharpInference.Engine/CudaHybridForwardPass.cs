@@ -1366,7 +1366,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     /// kernel. Everything else falls back to the per-token FFN loop.
     /// </summary>
     private bool UseBatchedCpuMoe(int n) =>
-        BatchedCpuMoePrefillEnabled && _isMoE && _cpuMoe && n >= 2
+        // n >= 4: below a quad the grouped tiers never engage, so the batched stage is
+        // pure overhead (CSR bucketing, Parallel.For scheduling, slab traffic) over the
+        // per-token loop — which IS the sequential fallback for tiny chunks.
+        BatchedCpuMoePrefillEnabled && _isMoE && _cpuMoe && n >= 4
         && !_hasSharedExpert && !_hp.UseSigmoidGating
         // Int-safety (mirror of the GDN pass's cpuMoeBatchSafe guard): Phase B's SiLuMul
         // takes an int element count over [N × numActive × expertDim] — an enormous

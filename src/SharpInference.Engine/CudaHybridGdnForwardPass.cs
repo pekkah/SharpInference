@@ -2975,7 +2975,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// scratch element counts (SiLuMul / UploadInto take int counts).
     /// </summary>
     private bool UseBatchedCpuDenseFfn(int layer, int n) =>
-        BatchedCpuDenseFfnEnabled && n >= 2
+        // n >= 4: below a quad the grouped tiers never engage, so the batched stage is
+        // pure overhead over the per-token loop — the sequential fallback for tiny chunks.
+        BatchedCpuDenseFfnEnabled && n >= 4
         && _cpuWFfnGate is not null
         && (long)n * _intermDim <= int.MaxValue
         && DenseDotSupported(_cpuWFfnGate[layer], _embDim)
