@@ -212,10 +212,12 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     // (issues #110/#112/#114): ONE D2H of all N post-FFN-norm rows per layer, host
     // router + top-k per token, per-expert (token,slot) bucketing, grouped gate/up/
     // down dots that decode each quantized weight row once per token-quad, then ONE
-    // H2D of the routed outputs. Bit-identical to the per-token path (the 2In/4In
-    // kernels mirror the single-dot accumulation order; the weighted reduce runs in
-    // top-k order). Default OFF until validated (issue #410 constraint); the
-    // per-token loop remains the byte-exact oracle either way.
+    // H2D of the routed outputs. The f32 tier is bit-identical to the per-token path
+    // (the 2In/4In kernels mirror the single-dot accumulation order; the weighted
+    // reduce runs in top-k order) — but the Q8_KS int8 tier AUTO-ENABLES per expert
+    // dtype (see _q3kQ8KEnabled et al.) and is argmax-stable, NOT byte-exact: pin
+    // SHARPI_Q3K_Q8K=0 / SHARPI_Q8_0_Q8K=0 / SHARPI_Q4K_Q8K=0 for byte parity with
+    // the per-token oracle. Default OFF until validated (issue #410 constraint).
     internal static bool BatchedCpuMoePrefillEnabled =
         Environment.GetEnvironmentVariable("SHARPI_HYBRID_BATCHED_MOE") == "1";
 
@@ -270,7 +272,6 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     // buffers so the routed writes never race the norm reads that Phase A is doing.
     private Tensor? _bmPinnedNorm;     // pinned [N × embDim] — post-FFN-norm rows (D2H)
     private Tensor? _bmPinnedRouted;   // pinned [N × embDim] — routed-MoE outputs (H2D)
-    private int   _bmPinnedN;
     private int*   _bmSelected;        // [N × numActive] — per-token selected experts
     private float* _bmWeights;         // [N × numActive] — per-token expert weights
     private int*   _bmExpStart;        // [numExperts+1] — CSR offsets into _bmExpTok*
@@ -446,9 +447,12 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         // Issue #410 (int8 tier): resolve the Q8_KS activation-prepack gates for the
         // batched CPU-MoE prefill — the same auto logic as CudaHybridGdnForwardPass
         // (Q4_K int8 only where AVX-512 is absent; there the f32 AVX-512 dot wins).
-        // Only meaningful under CPU-MoE + the batched prefill flag; left false otherwise
-        // so EnsureBatchedMoeScratch never allocates the prepack slabs.
-        if (_cpuMoe && BatchedCpuMoePrefillEnabled)
+        // Resolved for every CPU-MoE instance regardless of BatchedCpuMoePrefillEnabled:
+        // that static is mutable (tests toggle it between constructions), and gating the
+        // readonly fields on its ctor-time value would silently pin the int8 tier off
+        // for an instance constructed before the flag was enabled. The gates are a cheap
+        // metadata scan; the prepack slabs are only allocated when the path actually runs.
+        if (_cpuMoe)
         {
             _q3kQ8KEnabled = CudaHybridGdnForwardPass.ResolveGate("SHARPI_Q3K_Q8K",
                 CudaHybridGdnForwardPass.HasRoutedExpertsOfDType(model, hp, DType.Q3_K));
@@ -1315,19 +1319,9 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     //  Issue #410: batched CPU-MoE routed-expert prefill
     // ================================================================
 
-    private static readonly ParallelOptions s_moeParallelOpts = new()
-    {
-        MaxDegreeOfParallelism = ResolveMoeThreads()
-    };
-
-    private static int ResolveMoeThreads()
-    {
-        var v = Environment.GetEnvironmentVariable("SHARPI_MOE_THREADS");
-        if (int.TryParse(v, System.Globalization.NumberStyles.Integer,
-                System.Globalization.CultureInfo.InvariantCulture, out int n) && n > 0)
-            return n;
-        return Environment.ProcessorCount;
-    }
+    // Shared with the GDN pass (SHARPI_MOE_THREADS-resolved ParallelOptions), same as
+    // the DispatchDot* kernels below — one resolver, not a fourth per-file copy.
+    private static ParallelOptions s_moeParallelOpts => CudaHybridGdnForwardPass.MoeParallelOpts;
 
     // Dot-dispatch shims over the GDN pass's shared kernels (issues #112/#114): decode a
     // quantized weight row once and dot it against 1/2/4 token inputs. Bit-identical to
@@ -1374,13 +1368,19 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     private bool UseBatchedCpuMoe(int n) =>
         BatchedCpuMoePrefillEnabled && _isMoE && _cpuMoe && n >= 2
         && !_hasSharedExpert && !_hp.UseSigmoidGating
+        // Int-safety (mirror of the GDN pass's cpuMoeBatchSafe guard): Phase B's SiLuMul
+        // takes an int element count over [N × numActive × expertDim] — an enormous
+        // unchunked prefill must fall back rather than silently truncate the cast.
+        && (long)n * _hp.NumActiveExperts * Math.Max(_expertDim, _embDim) <= int.MaxValue
         && BatchedCpuMoeWeightsSupported();
 
     private bool? _bmWeightsSupported;
 
-    // The batched routed-expert dots only cover the dtypes DispatchDot handles, and the
-    // per-row byte stride below assumes cols divides the block size evenly. Checked once
-    // (immutable weights), cached.
+    // The batched routed-expert dots only cover the dtypes whose per-token oracle
+    // (SimdKernels.MatVec) uses the SAME per-row Dot* kernel — Q8_0 is excluded because
+    // MatVec has no fused Q8_0 case (it dequant-falls-back to DotF32, which is not
+    // bit-identical to the batched DotQ8_0). The per-row byte stride below also assumes
+    // cols divides the block size evenly. Checked once (immutable weights), cached.
     private bool BatchedCpuMoeWeightsSupported()
     {
         if (_bmWeightsSupported is { } cached) return cached;
@@ -1395,7 +1395,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         static bool Supported(in CpuWeightRef w, int cols) =>
             w.DataPtr != null
             && w.DType is DType.Q3_K or DType.Q4_K or DType.Q5_K or DType.Q6_K
-                        or DType.Q8_0 or DType.Float32
+                        or DType.Float32
             && cols % DTypeInfo.BlockSize(w.DType) == 0;
     }
 
@@ -1430,15 +1430,9 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 _bmNormAllQ8K = (byte*)NativeMemory.Alloc((nuint)((long)n * _bmQ8KEmbStride));
                 _bmGateAllQ8K = (byte*)NativeMemory.Alloc((nuint)(sel * _bmQ8KExpStride));
             }
-            _bmCapN = n;
-        }
-        if (_bmPinnedN != n)
-        {
-            if (_bmPinnedNorm is { } pn)   { _gpu.Free(pn); _bmPinnedNorm = null; }
-            if (_bmPinnedRouted is { } pr) { _gpu.Free(pr); _bmPinnedRouted = null; }
             _bmPinnedNorm   = _gpu.AllocatePinned(TensorShape.D1((long)n * _embDim));
             _bmPinnedRouted = _gpu.AllocatePinned(TensorShape.D1((long)n * _embDim));
-            _bmPinnedN = n;
+            _bmCapN = n;
         }
     }
 
@@ -1453,6 +1447,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         if (_bmDownPartial != null) { NativeMemory.Free(_bmDownPartial); _bmDownPartial = null; }
         if (_bmNormAllQ8K  != null) { NativeMemory.Free(_bmNormAllQ8K);  _bmNormAllQ8K = null; }
         if (_bmGateAllQ8K  != null) { NativeMemory.Free(_bmGateAllQ8K);  _bmGateAllQ8K = null; }
+        if (_bmPinnedNorm is { } pn)   { _gpu.Free(pn); _bmPinnedNorm = null; }
+        if (_bmPinnedRouted is { } pr) { _gpu.Free(pr); _bmPinnedRouted = null; }
         _bmCapN = 0;
     }
 
@@ -1462,9 +1458,6 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         if (_bmExpStart    != null) { NativeMemory.Free(_bmExpStart);    _bmExpStart = null; }
         if (_bmExpCursor   != null) { NativeMemory.Free(_bmExpCursor);   _bmExpCursor = null; }
         if (_bmUsedExperts != null) { NativeMemory.Free(_bmUsedExperts); _bmUsedExperts = null; }
-        if (_bmPinnedNorm is { } pn)   { _gpu.Free(pn); _bmPinnedNorm = null; }
-        if (_bmPinnedRouted is { } pr) { _gpu.Free(pr); _bmPinnedRouted = null; }
-        _bmPinnedN = 0;
     }
 
     /// <summary>
@@ -1612,33 +1605,35 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 long o1 = ((long)i1 * naL + k1) * expertDimL;
                 long o2 = ((long)i2 * naL + k2) * expertDimL;
                 long o3 = ((long)i3 * naL + k3) * expertDimL;
+                // Per-PROJECTION int8/f32 branch (mirrors the pair/single tiers and the
+                // GDN original): gate and up may have different dtypes (mixed-quant
+                // GGUFs), so a merged branch would push a Q8K-less dtype through the
+                // int8 dispatch (throws) or silently override a per-dtype gate.
+                float* f0 = normAll + (long)i0 * embDimL, f1 = normAll + (long)i1 * embDimL;
+                float* f2 = normAll + (long)i2 * embDimL, f3 = normAll + (long)i3 * embDimL;
+                byte* q0 = null, q1 = null, q2 = null, q3 = null;
                 if (useQ8KGate || useQ8KUp)
                 {
-                    byte* q0 = normAllQ8K + (long)i0 * q8kEmbStride, q1 = normAllQ8K + (long)i1 * q8kEmbStride;
-                    byte* q2 = normAllQ8K + (long)i2 * q8kEmbStride, q3 = normAllQ8K + (long)i3 * q8kEmbStride;
-                    for (int r = rStart; r < rEnd; r++)
-                    {
+                    q0 = normAllQ8K + (long)i0 * q8kEmbStride; q1 = normAllQ8K + (long)i1 * q8kEmbStride;
+                    q2 = normAllQ8K + (long)i2 * q8kEmbStride; q3 = normAllQ8K + (long)i3 * q8kEmbStride;
+                }
+                for (int r = rStart; r < rEnd; r++)
+                {
+                    float a0, a1, a2, a3;
+                    if (useQ8KGate)
                         DispatchDotQ8K4In(gateBase + (long)r * bprG, q0, q1, q2, q3, embDimL, gateDt,
-                            out float a0, out float a1, out float a2, out float a3);
-                        gateAll[o0 + r] = a0; gateAll[o1 + r] = a1; gateAll[o2 + r] = a2; gateAll[o3 + r] = a3;
+                            out a0, out a1, out a2, out a3);
+                    else
+                        DispatchDot4In(gateBase + (long)r * bprG, f0, f1, f2, f3, embDimL, gateDt,
+                            out a0, out a1, out a2, out a3);
+                    gateAll[o0 + r] = a0; gateAll[o1 + r] = a1; gateAll[o2 + r] = a2; gateAll[o3 + r] = a3;
+                    if (useQ8KUp)
                         DispatchDotQ8K4In(upBase + (long)r * bprU, q0, q1, q2, q3, embDimL, upDt,
                             out a0, out a1, out a2, out a3);
-                        upAll[o0 + r] = a0; upAll[o1 + r] = a1; upAll[o2 + r] = a2; upAll[o3 + r] = a3;
-                    }
-                }
-                else
-                {
-                    float* f0 = normAll + (long)i0 * embDimL, f1 = normAll + (long)i1 * embDimL;
-                    float* f2 = normAll + (long)i2 * embDimL, f3 = normAll + (long)i3 * embDimL;
-                    for (int r = rStart; r < rEnd; r++)
-                    {
-                        DispatchDot4In(gateBase + (long)r * bprG, f0, f1, f2, f3, embDimL, gateDt,
-                            out float a0, out float a1, out float a2, out float a3);
-                        gateAll[o0 + r] = a0; gateAll[o1 + r] = a1; gateAll[o2 + r] = a2; gateAll[o3 + r] = a3;
+                    else
                         DispatchDot4In(upBase + (long)r * bprU, f0, f1, f2, f3, embDimL, upDt,
                             out a0, out a1, out a2, out a3);
-                        upAll[o0 + r] = a0; upAll[o1 + r] = a1; upAll[o2 + r] = a2; upAll[o3 + r] = a3;
-                    }
+                    upAll[o0 + r] = a0; upAll[o1 + r] = a1; upAll[o2 + r] = a2; upAll[o3 + r] = a3;
                 }
             }
             for (; p + 1 < pEnd; p += 2)
@@ -2010,32 +2005,35 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         // ── FFN / MoE stage. Issue #410: when the batched CPU-MoE path qualifies, run the
         //    routed experts for ALL n tokens in one CSR-bucketed pass (one D2H of normAll,
         //    host router + grouped expert dots, one H2D of the routed outputs) instead of
-        //    the per-token loop below — bit-identical, just amortized.
+        //    the per-token loop — bit-identical in the f32 tier (int8 tier argmax-stable,
+        //    see BatchedCpuMoePrefillEnabled), just amortized.
         if (UseBatchedCpuMoe(n))
         {
             BatchedCpuMoeFfnStage(i, n, normAll, blockOut, stream);
-            return;
         }
-
-        // ── FFN / MoE stage: per token (issue #123 scope is the trunk). Reuse the exact
-        //    single-token GpuMoeFfn/GpuDenseFfn (reads _gpuNormBuf, writes _gpuHidden), then
-        //    add the post-attn residual row and scatter the new hidden back into the stream.
-        for (int t = 0; t < n; t++)
+        else
         {
-            _gpu.CopyDeviceRegion(_gpuNormBuf, 0, normAll, (long)t * _embDim * sizeof(float),
-                                  (long)_embDim * sizeof(float));
-            if (_isMoE)
+            // ── FFN / MoE stage: per token (issue #123 scope is the trunk). Reuse the exact
+            //    single-token GpuMoeFfn/GpuDenseFfn (reads _gpuNormBuf, writes _gpuHidden),
+            //    then add the post-attn residual row and scatter the new hidden back into
+            //    the stream.
+            for (int t = 0; t < n; t++)
             {
-                if (_cpuMoe) GpuTrunkCpuMoeFfn(i);
-                else         GpuMoeFfn(i);
-            }
-            else GpuDenseFfn(i);
+                _gpu.CopyDeviceRegion(_gpuNormBuf, 0, normAll, (long)t * _embDim * sizeof(float),
+                                      (long)_embDim * sizeof(float));
+                if (_isMoE)
+                {
+                    if (_cpuMoe) GpuTrunkCpuMoeFfn(i);
+                    else         GpuMoeFfn(i);
+                }
+                else GpuDenseFfn(i);
 
-            _gpu.CopyDeviceRegion(_gpuResidual, 0, blockOut, (long)t * _embDim * sizeof(float),
-                                  (long)_embDim * sizeof(float));
-            _gpu.AddInPlace(_gpuHidden, _gpuResidual);
-            _gpu.CopyDeviceRegion(stream, (long)t * _embDim * sizeof(float),
-                                  _gpuHidden, 0, (long)_embDim * sizeof(float));
+                _gpu.CopyDeviceRegion(_gpuResidual, 0, blockOut, (long)t * _embDim * sizeof(float),
+                                      (long)_embDim * sizeof(float));
+                _gpu.AddInPlace(_gpuHidden, _gpuResidual);
+                _gpu.CopyDeviceRegion(stream, (long)t * _embDim * sizeof(float),
+                                      _gpuHidden, 0, (long)_embDim * sizeof(float));
+            }
         }
     }
 

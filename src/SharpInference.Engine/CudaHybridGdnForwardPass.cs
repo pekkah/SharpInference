@@ -895,9 +895,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     internal static bool BatchedCpuDenseFfnEnabled =
         Environment.GetEnvironmentVariable("SHARPI_BATCHED_CPU_FFN") == "1";
 
-    // Test observable (issue #410): whether the last Prefill ran the batched CPU
-    // dense-FFN stage for at least one layer (vs the per-token fallback loop).
-    internal bool LastPrefillUsedBatchedCpuFfn;
+    // Test observable (issue #410): how many layers of the last Prefill ran the batched
+    // CPU dense-FFN stage (vs the per-token fallback loop). A count, not a bool, so the
+    // parity oracles can assert EVERY eligible layer took the batched stage — an
+    // any-layer bool would stay green if a dtype-gate regression silently dropped all
+    // but one layer back to the per-token path.
+    internal int LastPrefillBatchedCpuFfnLayers;
 
     // Issue #410: host scratch for the batched CPU dense-FFN prefill, allocated lazily
     // by EnsureBatchedDenseScratch(N) (exact-size on N change). The gate/up slabs are
@@ -915,11 +918,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // this needs register-blocking on the ROW dimension as well (an R×4 multi-row
     // multi-input kernel that reuses each input load R times), or a BLAS tile path.
     // Hence the flag stays default-off; re-evaluate on the desktop (issue #410).
-    private float* _bdNormAll;     // [N × embDim]       — FFN-norm inputs (one D2H)
-    private float* _bdResidAll;    // [N × embDim]       — post-block residuals (one D2H)
-    private float* _bdGateAll;     // [tile × intermDim] — gate projections → silu'd
-    private float* _bdUpAll;       // [tile × intermDim] — up projections
-    private float* _bdHiddenAll;   // [N × embDim]       — FFN output + residual (one H2D)
+    private float* _bdNormAll;     // pinned [N × embDim] — FFN-norm inputs (one D2H)
+    private float* _bdGateAll;     // [tile × intermDim]  — gate projections → silu'd
+    private float* _bdUpAll;       // [tile × intermDim]  — up projections
+    private float* _bdHiddenAll;   // pinned [N × embDim] — FFN outputs, no residual (one H2D)
     private int _bdCapN;
     private int _bdTile;           // tokens per tile (~8 MB of gate slab, multiple of 4)
 
@@ -1772,7 +1774,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             throw new ArgumentException("Token list is empty", nameof(tokens));
 
         int N = tokens.Count;
-        LastPrefillUsedBatchedCpuFfn = false;   // set by the #410 dense-FFN stage when it runs
+        LastPrefillBatchedCpuFfnLayers = 0;   // counted up by the #410 dense-FFN stage per layer
 
         // Size the hidden buffer up front so Forward's per-step writes don't
         // each trigger a grow.
@@ -2980,10 +2982,13 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         && DenseDotSupported(_cpuWFfnUp![layer], _embDim)
         && DenseDotSupported(_cpuWFfnDown![layer], _intermDim);
 
+    // Q8_0 is excluded: the per-token oracle (SimdKernels.MatVec/MatVecDual) has no
+    // fused Q8_0 case — it dequant-falls-back to DotF32, which is not bit-identical
+    // to the batched DotQ8_0 — so a Q8_0 FFN layer must stay on the per-token path.
     private static bool DenseDotSupported(in CpuWeightRef w, int cols) =>
         w.DataPtr != null
         && w.DType is DType.Q3_K or DType.Q4_K or DType.Q5_K or DType.Q6_K
-                    or DType.Q8_0 or DType.Float32
+                    or DType.Float32
         && cols % DTypeInfo.BlockSize(w.DType) == 0;
 
     /// <summary>
@@ -2997,11 +3002,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (_bdCapN == n) return;
         FreeBatchedDenseScratch();
         _bdTile = Math.Clamp((int)(8_000_000L / ((long)_intermDim * sizeof(float))), 4, 256) & ~3;
-        nuint emb = (nuint)((long)n * _embDim * sizeof(float));
+        long emb = (long)n * _embDim;
         nuint interm = (nuint)((long)_bdTile * _intermDim * sizeof(float));
-        _bdNormAll   = (float*)NativeMemory.Alloc(emb);
-        _bdResidAll  = (float*)NativeMemory.Alloc(emb);
-        _bdHiddenAll = (float*)NativeMemory.Alloc(emb);
+        // Norm/hidden stage through the Download/UploadInto direct-pointer overloads,
+        // whose contract requires cudaMallocHost memory (pageable degrades to a slow
+        // synchronous staged copy) — same as every other host slab on this path
+        // (_bNormAll/_bHiddenAll…). The gate/up slabs never cross PCIe: plain native.
+        _bdNormAll   = AllocPinnedL(emb);
+        _bdHiddenAll = AllocPinnedL(emb);
         _bdGateAll   = (float*)NativeMemory.Alloc(interm);
         _bdUpAll     = (float*)NativeMemory.Alloc(interm);
         _bdCapN = n;
@@ -3009,9 +3017,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     private void FreeBatchedDenseScratch()
     {
-        if (_bdNormAll   != null) { NativeMemory.Free(_bdNormAll);   _bdNormAll = null; }
-        if (_bdResidAll  != null) { NativeMemory.Free(_bdResidAll);  _bdResidAll = null; }
-        if (_bdHiddenAll != null) { NativeMemory.Free(_bdHiddenAll); _bdHiddenAll = null; }
+        if (_bdNormAll   != null) { CudaBackend.FreePinnedHost((nint)_bdNormAll);   _bdNormAll = null; }
+        if (_bdHiddenAll != null) { CudaBackend.FreePinnedHost((nint)_bdHiddenAll); _bdHiddenAll = null; }
         if (_bdGateAll   != null) { NativeMemory.Free(_bdGateAll);   _bdGateAll = null; }
         if (_bdUpAll     != null) { NativeMemory.Free(_bdUpAll);     _bdUpAll = null; }
         _bdCapN = 0;
@@ -3021,32 +3028,29 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// Issue #410: the batched CPU dense-FFN stage of one CPU-mmap layer inside
     /// <see cref="PrefillBatchedTrunkGpuFfn"/> — replaces the per-token
     /// Download → <see cref="CpuDenseFfn"/> → UploadInto loop. ONE D2H of all
-    /// <paramref name="n"/> FFN-norm rows + ONE of the post-block residuals, the
-    /// grouped weight-row dots of <see cref="BatchedCpuDenseFfn"/>, a host residual
-    /// add (fp32 a+b — the same values the per-token GPU AddInPlace produces), then
-    /// ONE H2D of the new residual-stream rows.
+    /// <paramref name="n"/> FFN-norm rows, the grouped weight-row dots of
+    /// <see cref="BatchedCpuDenseFfn"/>, then ONE H2D of the FFN outputs back into
+    /// <paramref name="moeNorm"/> (dead once its rows are downloaded) and the residual
+    /// add + stream scatter on the GPU — the same batched AddInPlace + CopyDeviceRegion
+    /// tail as the GPU-FFN batched branch, adding the same fp32 values the per-token
+    /// loop's row-wise AddInPlace produces.
     /// </summary>
     private void BatchedCpuDenseFfnStage(int layer, int n, Tensor moeNorm, Tensor blockOut, Tensor stream)
     {
-        LastPrefillUsedBatchedCpuFfn = true;
+        LastPrefillBatchedCpuFfnLayers++;
         int embDim = _embDim;
         EnsureBatchedDenseScratch(n);
 
-        _gpu.Download(moeNorm,  (nint)_bdNormAll,  n * embDim);
-        _gpu.Download(blockOut, (nint)_bdResidAll, n * embDim);
+        _gpu.Download(moeNorm, (nint)_bdNormAll, n * embDim);
 
         BatchedCpuDenseFfn(layer, n);
 
-        // hidden += resid, matching the per-token AddInPlace(_gpuHidden, _gpuResidual)
-        // operand order (fp32 add is placement-invariant), then one stream upload.
-        float* hid = _bdHiddenAll; float* res = _bdResidAll;
-        Parallel.For(0, n, s_moeParallelOpts, i =>
-        {
-            float* h = hid + (long)i * embDim;
-            float* r = res + (long)i * embDim;
-            for (int c = 0; c < embDim; c++) h[c] += r[c];
-        });
-        _gpu.UploadInto(stream, (nint)_bdHiddenAll, n * embDim);
+        // moeNorm ← FFN outputs, += postBlock residual, scatter the stream slice —
+        // moeNorm and blockOut are exact-size [n × embDim] (EnsureBatchedTrunkScratch),
+        // so the whole-tensor AddInPlace element counts match.
+        _gpu.UploadInto(moeNorm, (nint)_bdHiddenAll, n * embDim);
+        _gpu.AddInPlace(moeNorm, blockOut);
+        _gpu.CopyDeviceRegion(stream, 0, moeNorm, 0, (long)n * embDim * sizeof(float));
     }
 
     /// <summary>
@@ -6719,6 +6723,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     {
         MaxDegreeOfParallelism = ResolveMoeThreads()
     };
+
+    // Issue #410: shared with CudaHybridForwardPass's batched CPU-MoE prefill (like the
+    // DispatchDot* kernels) so the SHARPI_MOE_THREADS resolver has one owner per backend.
+    internal static ParallelOptions MoeParallelOpts => s_moeParallelOpts;
 
     private static int ResolveMoeThreads()
     {

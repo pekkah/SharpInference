@@ -625,9 +625,11 @@ public sealed class CudaHybridGdnBatchedPrefillTests : IDisposable
                 using var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
                 var logits = fwd.Prefill(tokens).ToArray();
                 if (batchedCpuFfn)
-                    Assert.True(fwd.LastPrefillUsedBatchedCpuFfn,
-                        "Batched arm did not take the batched CPU dense-FFN stage (per-token " +
-                        "fallback) — the #410 parity check would be vacuous.");
+                    // Every layer is CPU-mmap'd (margin override) and 27B FFN dtypes are
+                    // all batchable, so EVERY layer must take the batched stage — a
+                    // partial count means a dtype-gate regression silently dropped
+                    // layers back to the per-token path.
+                    Assert.Equal(hp.NumLayers, fwd.LastPrefillBatchedCpuFfnLayers);
                 return logits;
             }
 
