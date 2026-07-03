@@ -315,7 +315,12 @@ public sealed class CudaHybridGdnBatchedPrefillTests : IDisposable
 
         var prevCpuMoe = Environment.GetEnvironmentVariable("SHARPI_CPU_MOE");
         var prevBudget = Environment.GetEnvironmentVariable("SHARPI_ATTN_WAVE_BUDGET_MB");
+        var prevSplit = Environment.GetEnvironmentVariable("SHARPI_SPLIT_DECODE");
         Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", "1");
+        // #419 hardening: keep the per-position reference on the monolithic single-block
+        // attention (GdnSplitMinSeq=8192 already exceeds this test's ~4300 ctx today; pin
+        // so a lowered threshold can't silently break bit-parity — split is argmax-stable).
+        Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE", "0");
         bool prevBatchedPrefill = CudaHybridGdnForwardPass.BatchedPrefillEnabled;
         bool prevBatchedTrunk = CudaHybridGdnForwardPass.BatchedTrunkEnabled;
         bool prevAttn = CudaHybridGdnForwardPass.BatchedAttnEnabled;
@@ -365,6 +370,7 @@ public sealed class CudaHybridGdnBatchedPrefillTests : IDisposable
             CudaHybridGdnForwardPass.BatchedAttnEnabled = prevAttn;
             Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", prevCpuMoe);
             Environment.SetEnvironmentVariable("SHARPI_ATTN_WAVE_BUDGET_MB", prevBudget);
+            Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE", prevSplit);
         }
     }
 
@@ -905,8 +911,14 @@ public sealed class CudaHybridGdnBatchedPrefillTests : IDisposable
         var prevCpuMoe = Environment.GetEnvironmentVariable("SHARPI_CPU_MOE");
         var prevBudget = Environment.GetEnvironmentVariable("SHARPI_ATTN_WAVE_BUDGET_MB");
         var prevSnap = Environment.GetEnvironmentVariable("SHARPI_SNAPKV_BUDGET");
+        var prevSplit = Environment.GetEnvironmentVariable("SHARPI_SPLIT_DECODE");
         Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", "1");
         Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", "128");
+        // #419 hardening: the sequential reference must stay on the monolithic single-block
+        // attention. Today GdnSplitMinSeq (8192) already exceeds this test's ~4300 ctx, but
+        // pin split decode off so lowering that threshold can't silently break bit-parity
+        // (the flash-decoding split reduction is argmax-stable, not bitwise).
+        Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE", "0");
         bool prevBatchedPrefill = CudaHybridGdnForwardPass.BatchedPrefillEnabled;
         bool prevBatchedTrunk = CudaHybridGdnForwardPass.BatchedTrunkEnabled;
         bool prevAttn = CudaHybridGdnForwardPass.BatchedAttnEnabled;
@@ -961,6 +973,7 @@ public sealed class CudaHybridGdnBatchedPrefillTests : IDisposable
             Environment.SetEnvironmentVariable("SHARPI_CPU_MOE", prevCpuMoe);
             Environment.SetEnvironmentVariable("SHARPI_ATTN_WAVE_BUDGET_MB", prevBudget);
             Environment.SetEnvironmentVariable("SHARPI_SNAPKV_BUDGET", prevSnap);
+            Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE", prevSplit);
         }
     }
 

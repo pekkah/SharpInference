@@ -1801,7 +1801,11 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     /// <para>Produces bit-identical KV cache and final-token logits to the sequential
     /// per-token <see cref="Forward"/> loop: every batched trunk kernel runs the same
     /// per-row math as its single-token counterpart (proven by the backend per-kernel
-    /// oracles), and the FFN/CPU stages run the identical single-token sequences.</para>
+    /// oracles), and the FFN/CPU stages run the identical single-token sequences.
+    /// Caveat (#419): the parity is against the sequential loop's monolithic single-block
+    /// attention. With flash-decoding split-KV enabled (default at seqLen &gt; 4096, #238)
+    /// the sequential loop reorders the softmax reduction, so parity there is
+    /// argmax-stable rather than bitwise; the parity oracles pin SHARPI_SPLIT_DECODE=0.</para>
     ///
     /// <para><b>Not transactional</b> (mirror of CudaHybridGdnForwardPass): the KV pages are
     /// written as the trunk runs but <c>_kvLength</c> / the CPU KV position counters are
@@ -1991,7 +1995,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
 
         // ── KV append + SDPA (batched). Shared-scores fast path when startPos+n ≤ 4096,
         //    wave-based global-scratch SDPA above (issue #118). Both bit-identical to the
-        //    per-position KvAppend + Attention loop in GpuLayer.
+        //    per-position KvAppend + single-block Attention loop in GpuLayer (see the
+        //    #419 split-KV caveat in the PrefillBatchedTrunk doc).
         KvAppendBatchedKv(kAll, vAll, _gpuKCache[i], _gpuVCache[i], kvDim, startPos, _maxSeqLen, n);
         if (startPos + n <= 4096)
             AttentionBatchedKv(qAll, _gpuKCache[i], _gpuVCache[i], attnOut,

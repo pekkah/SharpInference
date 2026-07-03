@@ -453,6 +453,14 @@ public sealed class CudaHybridBatchedPrefillTests : IDisposable
     /// the wave-based batched SDPA (<c>AttentionBatchedWave</c>, issue #118) inside the
     /// trunk. A small wave budget forces the multi-wave loop. Final-token logits must be
     /// bit-identical to the sequential per-token Forward loop (the deterministic reference).
+    ///
+    /// <para>Issue #419: both arms pin <c>SHARPI_SPLIT_DECODE=0</c>. The hybrid split-KV
+    /// gate (#238) otherwise reroutes the sequential arm's per-token attention to the
+    /// flash-decoding split kernels once seqLen &gt; 4096 — exactly this test's regime —
+    /// whose chunked softmax + LSE combine reorders the reduction (argmax-stable, not
+    /// bitwise). The wave kernel clones the monolithic single-block path, so that is the
+    /// reference it must be compared against; split-vs-single parity has its own oracle
+    /// (<see cref="CudaHybridKvDtypeTests"/>).</para>
     /// </summary>
     [Fact]
     public void BatchedPrefill_Over4096_BitwiseMatchesSequential_Coder()
@@ -463,9 +471,11 @@ public sealed class CudaHybridBatchedPrefillTests : IDisposable
         if (path is null) return;
 
         var prevBudget = Environment.GetEnvironmentVariable("SHARPI_ATTN_WAVE_BUDGET_MB");
+        var prevSplit = Environment.GetEnvironmentVariable("SHARPI_SPLIT_DECODE");
         bool prev = CudaHybridForwardPass.BatchedPrefillEnabled;
         try
         {
+            Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE", "0"); // read at pass construction; see doc comment
             using var model = GgufModel.Open(path);
             var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
             if (hp.ContextLength < 4400) { _out.WriteLine("SKIP: ctx < 4400"); return; }
@@ -509,6 +519,7 @@ public sealed class CudaHybridBatchedPrefillTests : IDisposable
         {
             CudaHybridForwardPass.BatchedPrefillEnabled = prev;
             Environment.SetEnvironmentVariable("SHARPI_ATTN_WAVE_BUDGET_MB", prevBudget);
+            Environment.SetEnvironmentVariable("SHARPI_SPLIT_DECODE", prevSplit);
         }
     }
 
