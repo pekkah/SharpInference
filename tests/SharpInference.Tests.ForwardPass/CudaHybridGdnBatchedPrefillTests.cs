@@ -79,6 +79,7 @@ public sealed class CudaHybridGdnBatchedPrefillTests : IDisposable
     // Dense GDN-hybrid (no MoE routing) — issue #119 path 1.
     private static string? FindDense27BMtpPath() => FirstExisting(
         @"C:\p\sharpi\models\Qwen3.6-27B-MTP-Q4_K_M.gguf",
+        @"C:\models\Qwen3.6-27B-MTP-Q4_K_M.gguf",
         @"E:\models\Qwen3.6-27B-MTP-Q4_K_M.gguf");
 
     // GDN-hybrid MoE model with Q4_K experts (GPU-SLRU friendly) — issue #119 path 2.
@@ -572,6 +573,85 @@ public sealed class CudaHybridGdnBatchedPrefillTests : IDisposable
             CudaHybridGdnForwardPass.BatchedPrefillEnabled = prevPrefill;
             CudaHybridGdnForwardPass.BatchedTrunkEnabled = prevTrunk;
             CudaHybridGdnForwardPass.BatchedFfnEnabled = prevFfn;
+        }
+    }
+
+    /// <summary>
+    /// Issue #410: the batched CPU dense-FFN prefill stage (<c>BatchedCpuDenseFfnStage</c>,
+    /// <c>SHARPI_BATCHED_CPU_FFN=1</c>) must be bit-identical to the per-token
+    /// Download → <c>CpuDenseFfn</c> → UploadInto loop it replaces. Both arms run under
+    /// batched prefill + batched trunk with <c>SHARPI_DENSE_FFN_GPU_MARGIN_MB</c> set
+    /// absurdly high so every FFN layer stays CPU-mmap'd (deterministic across boxes —
+    /// otherwise a large card uploads all layers to GPU and the CPU stage never runs);
+    /// only the CPU-FFN strategy differs. The batched arm asserts
+    /// <c>LastPrefillUsedBatchedCpuFfn</c> so a gated-out config fails loudly instead of
+    /// comparing the per-token loop against itself.
+    /// </summary>
+    [Fact]
+    public void BatchedCpuDenseFfn_BitwiseMatchesPerTokenCpuFfn_Dense27BMtp()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        var path = FindDense27BMtpPath();
+        if (path is null) return;
+
+        bool prevPrefill = CudaHybridGdnForwardPass.BatchedPrefillEnabled;
+        bool prevTrunk = CudaHybridGdnForwardPass.BatchedTrunkEnabled;
+        bool prevCpuFfn = CudaHybridGdnForwardPass.BatchedCpuDenseFfnEnabled;
+        var prevMargin = Environment.GetEnvironmentVariable("SHARPI_DENSE_FFN_GPU_MARGIN_MB");
+        Environment.SetEnvironmentVariable("SHARPI_DENSE_FFN_GPU_MARGIN_MB", "1000000");
+        try
+        {
+            using var model = GgufModel.Open(path);
+            var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+            if (hp.IsMoE) return; // dense-only path
+            var tokenizer = GgufTokenizer.FromGgufModel(model);
+            var placement = new LayerPlacement(
+                GpuLayers: hp.NumLayers, CpuLayers: 0, GpuWeightBytes: 0, GpuKvBytes: 0,
+                RecommendedCtxSize: Math.Min(hp.ContextLength, 4096));
+            var tokens = tokenizer.Encode(
+                "The quick brown fox jumps over the lazy dog. " +
+                "Pack my box with five dozen liquor jugs. " +
+                "How razorback-jumping frogs can level six piqued gymnasts!");
+            Assert.True(tokens.Count >= 8);
+
+            // Hold prefill + trunk batching on; toggle ONLY the CPU dense-FFN strategy.
+            CudaHybridGdnForwardPass.BatchedPrefillEnabled = true;
+            CudaHybridGdnForwardPass.BatchedTrunkEnabled = true;
+
+            float[] RunWithCpuFfn(bool batchedCpuFfn)
+            {
+                CudaHybridGdnForwardPass.BatchedCpuDenseFfnEnabled = batchedCpuFfn;
+                using var fwd = new CudaHybridGdnForwardPass(model, gpu, hp, placement);
+                var logits = fwd.Prefill(tokens).ToArray();
+                if (batchedCpuFfn)
+                    // Every layer is CPU-mmap'd (margin override) and 27B FFN dtypes are
+                    // all batchable, so EVERY layer must take the batched stage — a
+                    // partial count means a dtype-gate regression silently dropped
+                    // layers back to the per-token path.
+                    Assert.Equal(hp.NumLayers, fwd.LastPrefillBatchedCpuFfnLayers);
+                return logits;
+            }
+
+            float[] perToken = RunWithCpuFfn(false);
+            float[] batched  = RunWithCpuFfn(true);
+
+            Assert.Equal(perToken.Length, batched.Length);
+            int firstDiff = -1;
+            for (int i = 0; i < perToken.Length; i++)
+                if (BitConverter.SingleToInt32Bits(perToken[i]) != BitConverter.SingleToInt32Bits(batched[i]))
+                { firstDiff = i; break; }
+            Assert.True(firstDiff < 0,
+                $"Batched CPU dense-FFN prefill diverges from the per-token CPU FFN at index {firstDiff}. " +
+                "BatchedCpuDenseFfnStage must be bit-identical to the per-token CpuDenseFfn loop.");
+            Assert.Equal(Sampler.Greedy(perToken), Sampler.Greedy(batched));
+        }
+        finally
+        {
+            CudaHybridGdnForwardPass.BatchedPrefillEnabled = prevPrefill;
+            CudaHybridGdnForwardPass.BatchedTrunkEnabled = prevTrunk;
+            CudaHybridGdnForwardPass.BatchedCpuDenseFfnEnabled = prevCpuFfn;
+            Environment.SetEnvironmentVariable("SHARPI_DENSE_FFN_GPU_MARGIN_MB", prevMargin);
         }
     }
 

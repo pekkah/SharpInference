@@ -51,6 +51,7 @@ public sealed class CudaHybridBatchedPrefillTests : IDisposable
 
     private static string? FindCoderPath() => FirstExisting(
         @"C:\p\sharpi\models\Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+        @"C:\models\Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
         @"E:\models\Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf");
 
     private static string? FirstExisting(params string[] candidates)
