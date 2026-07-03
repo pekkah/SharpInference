@@ -879,6 +879,50 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     internal static bool BatchedAttnEnabled =
         Environment.GetEnvironmentVariable("SHARPI_BATCHED_ATTN") != "0";
 
+    // ── Issue #410: batched CPU dense-FFN prefill ────────────────────────────
+    // On dense GDN models whose FFN layers stay CPU-mmap'd (27B-MTP: 46 of 64 layers,
+    // ~8.6 GB at Q4_K_M — TryUploadDenseFfnLayers couldn't fit them), the batched-trunk
+    // prefill still ran the dense FFN per token: N × (D2H norm → CpuDenseFfn matvec →
+    // H2D), re-streaming the FFN weights from DRAM for every prompt token. When ON,
+    // those layers instead run ONE D2H of all N norm rows, then grouped gate/up/down
+    // dots that read each quantized weight row ONCE and dot it against all N tokens in
+    // quads (#114) / pairs (#112) / a single — N/tile DRAM passes over the FFN weights
+    // per chunk instead of N — then ONE H2D of the new stream rows. Bit-identical to the
+    // per-token path (the multi-input kernels mirror the single accumulation order).
+    // Default OFF until validated (issue #410 constraint) — and see the KNOWN LIMIT note
+    // on the _bd* scratch fields: without row-blocked kernels the activation cache
+    // traffic currently outweighs the weight-read win. Decode is untouched.
+    internal static bool BatchedCpuDenseFfnEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_BATCHED_CPU_FFN") == "1";
+
+    // Test observable (issue #410): whether the last Prefill ran the batched CPU
+    // dense-FFN stage for at least one layer (vs the per-token fallback loop).
+    internal bool LastPrefillUsedBatchedCpuFfn;
+
+    // Issue #410: host scratch for the batched CPU dense-FFN prefill, allocated lazily
+    // by EnsureBatchedDenseScratch(N) (exact-size on N change). The gate/up slabs are
+    // TILE-sized, not N-sized: the phases process tokens in tiles of _bdTile so the
+    // [tile × intermDim] silu'd-gate slab stays cache-resident while Phase C sweeps the
+    // down rows (untiled at N=810 it is ~56 MB — no L3 holds that, so every down row
+    // re-streamed it from DRAM). Weights are re-read N/tile times per layer instead of
+    // once — still ~tile× fewer weight passes than the per-token loop.
+    //
+    // KNOWN LIMIT (laptop measurement, 2026-07-02, Core Ultra 9 185H / 24 MB L3): the
+    // grouped 1-row × 4-input dots trade the per-token path's weight DRAM traffic for
+    // ACTIVATION cache traffic that tiling does not reduce — every weight row re-reads
+    // its tile's inputs (rows × N × dim × 4 B per layer ≈ 290 GB at N=810), so the
+    // stage measured 1.2 t/s vs the per-token path's DRAM-bound 3.1 t/s there. Closing
+    // this needs register-blocking on the ROW dimension as well (an R×4 multi-row
+    // multi-input kernel that reuses each input load R times), or a BLAS tile path.
+    // Hence the flag stays default-off; re-evaluate on the desktop (issue #410).
+    private float* _bdNormAll;     // [N × embDim]       — FFN-norm inputs (one D2H)
+    private float* _bdResidAll;    // [N × embDim]       — post-block residuals (one D2H)
+    private float* _bdGateAll;     // [tile × intermDim] — gate projections → silu'd
+    private float* _bdUpAll;       // [tile × intermDim] — up projections
+    private float* _bdHiddenAll;   // [N × embDim]       — FFN output + residual (one H2D)
+    private int _bdCapN;
+    private int _bdTile;           // tokens per tile (~8 MB of gate slab, multiple of 4)
+
     public int VocabSize => _hp.VocabSize;
     public int MaxSeqLen => _maxSeqLen;
     public LayerPlacement Placement => _placement;
@@ -1728,6 +1772,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             throw new ArgumentException("Token list is empty", nameof(tokens));
 
         int N = tokens.Count;
+        LastPrefillUsedBatchedCpuFfn = false;   // set by the #410 dense-FFN stage when it runs
 
         // Size the hidden buffer up front so Forward's per-step writes don't
         // each trigger a grow.
@@ -2821,6 +2866,13 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 _gpu.AddInPlace(_gpuBfHiddenAll!, blockOut);
                 _gpu.CopyDeviceRegion(stream, 0, _gpuBfHiddenAll!, 0, (long)N * embDim * sizeof(float));
             }
+            else if (!isMoe && !denseGpuLayer && UseBatchedCpuDenseFfn(layer, N))
+            {
+                // Issue #410: CPU-mmap dense-FFN layer, batched over all N prompt tokens —
+                // one D2H, grouped weight-row dots, one H2D — instead of the per-token
+                // Download → CpuDenseFfn → UploadInto loop below. Bit-identical.
+                BatchedCpuDenseFfnStage(layer, N, moeNorm, blockOut, stream);
+            }
             else
             {
                 for (int i = 0; i < N; i++)
@@ -2910,6 +2962,235 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// <see cref="CpuMoeFfnCore"/> is preserved: identical dot kernels, identical
     /// per-token top-k accumulation order in the final reduce.
     /// </summary>
+    // ================================================================
+    //  Issue #410: batched CPU dense-FFN prefill (dense GDN, e.g. 27B-MTP)
+    // ================================================================
+
+    /// <summary>
+    /// Whether the #410 batched CPU dense-FFN stage handles this layer's prefill FFN.
+    /// Requires the flag, dtypes the grouped dot dispatch covers, block-aligned dims
+    /// (the per-row byte stride assumes cols divides the block size), and int-safe
+    /// scratch element counts (SiLuMul / UploadInto take int counts).
+    /// </summary>
+    private bool UseBatchedCpuDenseFfn(int layer, int n) =>
+        BatchedCpuDenseFfnEnabled && n >= 2
+        && _cpuWFfnGate is not null
+        && (long)n * _intermDim <= int.MaxValue
+        && DenseDotSupported(_cpuWFfnGate[layer], _embDim)
+        && DenseDotSupported(_cpuWFfnUp![layer], _embDim)
+        && DenseDotSupported(_cpuWFfnDown![layer], _intermDim);
+
+    private static bool DenseDotSupported(in CpuWeightRef w, int cols) =>
+        w.DataPtr != null
+        && w.DType is DType.Q3_K or DType.Q4_K or DType.Q5_K or DType.Q6_K
+                    or DType.Q8_0 or DType.Float32
+        && cols % DTypeInfo.BlockSize(w.DType) == 0;
+
+    /// <summary>
+    /// (Re)allocate the batched dense-FFN host scratch for <paramref name="n"/> tokens
+    /// (exact-size on N change). The gate/up slabs are tile-sized: the tile targets
+    /// ~8 MB of silu'd-gate slab (L3-resident on commodity parts), rounded down to a
+    /// multiple of 4 so the quad tier does the bulk of the work.
+    /// </summary>
+    private void EnsureBatchedDenseScratch(int n)
+    {
+        if (_bdCapN == n) return;
+        FreeBatchedDenseScratch();
+        _bdTile = Math.Clamp((int)(8_000_000L / ((long)_intermDim * sizeof(float))), 4, 256) & ~3;
+        nuint emb = (nuint)((long)n * _embDim * sizeof(float));
+        nuint interm = (nuint)((long)_bdTile * _intermDim * sizeof(float));
+        _bdNormAll   = (float*)NativeMemory.Alloc(emb);
+        _bdResidAll  = (float*)NativeMemory.Alloc(emb);
+        _bdHiddenAll = (float*)NativeMemory.Alloc(emb);
+        _bdGateAll   = (float*)NativeMemory.Alloc(interm);
+        _bdUpAll     = (float*)NativeMemory.Alloc(interm);
+        _bdCapN = n;
+    }
+
+    private void FreeBatchedDenseScratch()
+    {
+        if (_bdNormAll   != null) { NativeMemory.Free(_bdNormAll);   _bdNormAll = null; }
+        if (_bdResidAll  != null) { NativeMemory.Free(_bdResidAll);  _bdResidAll = null; }
+        if (_bdHiddenAll != null) { NativeMemory.Free(_bdHiddenAll); _bdHiddenAll = null; }
+        if (_bdGateAll   != null) { NativeMemory.Free(_bdGateAll);   _bdGateAll = null; }
+        if (_bdUpAll     != null) { NativeMemory.Free(_bdUpAll);     _bdUpAll = null; }
+        _bdCapN = 0;
+    }
+
+    /// <summary>
+    /// Issue #410: the batched CPU dense-FFN stage of one CPU-mmap layer inside
+    /// <see cref="PrefillBatchedTrunkGpuFfn"/> — replaces the per-token
+    /// Download → <see cref="CpuDenseFfn"/> → UploadInto loop. ONE D2H of all
+    /// <paramref name="n"/> FFN-norm rows + ONE of the post-block residuals, the
+    /// grouped weight-row dots of <see cref="BatchedCpuDenseFfn"/>, a host residual
+    /// add (fp32 a+b — the same values the per-token GPU AddInPlace produces), then
+    /// ONE H2D of the new residual-stream rows.
+    /// </summary>
+    private void BatchedCpuDenseFfnStage(int layer, int n, Tensor moeNorm, Tensor blockOut, Tensor stream)
+    {
+        LastPrefillUsedBatchedCpuFfn = true;
+        int embDim = _embDim;
+        EnsureBatchedDenseScratch(n);
+
+        _gpu.Download(moeNorm,  (nint)_bdNormAll,  n * embDim);
+        _gpu.Download(blockOut, (nint)_bdResidAll, n * embDim);
+
+        BatchedCpuDenseFfn(layer, n);
+
+        // hidden += resid, matching the per-token AddInPlace(_gpuHidden, _gpuResidual)
+        // operand order (fp32 add is placement-invariant), then one stream upload.
+        float* hid = _bdHiddenAll; float* res = _bdResidAll;
+        Parallel.For(0, n, s_moeParallelOpts, i =>
+        {
+            float* h = hid + (long)i * embDim;
+            float* r = res + (long)i * embDim;
+            for (int c = 0; c < embDim; c++) h[c] += r[c];
+        });
+        _gpu.UploadInto(stream, (nint)_bdHiddenAll, n * embDim);
+    }
+
+    /// <summary>
+    /// Dense sibling of <see cref="BatchedRoutedExperts"/> (issues #110/#112/#114): the
+    /// FFN weights are shared by every token, so there is no bucketing — each gate/up/
+    /// down weight row is read ONCE PER TILE and dotted against the tile's tokens in
+    /// quads → pairs → a single (each tier bit-identical to the per-token dot). Tokens
+    /// are processed in tiles of <see cref="_bdTile"/> so the [tile × intermDim] silu'd-
+    /// gate slab stays cache-resident while Phase C sweeps the down rows (see the
+    /// scratch-field comment for the measured untiled failure mode); the weights are
+    /// re-read N/tile times per layer — still tile× fewer DRAM passes than per-token.
+    /// Reads <see cref="_bdNormAll"/>, writes the FFN output (no residual) to
+    /// <see cref="_bdHiddenAll"/> — the same math as <see cref="CpuDenseFfnAt"/>:
+    /// gate/up matvecs → SiLU·mul → down matvec.
+    /// </summary>
+    private void BatchedCpuDenseFfn(int layer, int N)
+    {
+        int embDim = _embDim, intermDim = _intermDim;
+        var gateW = _cpuWFfnGate![layer];
+        var upW   = _cpuWFfnUp![layer];
+        var downW = _cpuWFfnDown![layer];
+        byte* gateP = gateW.DataPtr; byte* upP = upW.DataPtr; byte* downP = downW.DataPtr;
+        DType gateDt = gateW.DType, upDt = upW.DType, downDt = downW.DType;
+
+        int bprG = (embDim    / DTypeInfo.BlockSize(gateDt)) * DTypeInfo.BytesPerBlock(gateDt);
+        int bprU = (embDim    / DTypeInfo.BlockSize(upDt))   * DTypeInfo.BytesPerBlock(upDt);
+        int bprD = (intermDim / DTypeInfo.BlockSize(downDt)) * DTypeInfo.BytesPerBlock(downDt);
+
+        float* gateAll = _bdGateAll!; float* upAll = _bdUpAll!;
+
+        // Row-block sizes: keep a block's weight rows L2-resident (~256 KB) while the
+        // quad loop cycles them, so each 4-input activation quad loaded into L1/L2 is
+        // reused across the whole row block — the activation traffic that made the
+        // 1-row-per-unit sweep L3-bound (see the KNOWN LIMIT note) divides by the
+        // block height. Quads OUTER, rows INNER; per-(row, token-quad) math and
+        // accumulation order are unchanged → still bit-identical.
+        int rbA = Math.Clamp(262144 / Math.Max(bprG, bprU), 8, 64);
+        int rbC = Math.Clamp(262144 / bprD, 8, 64);
+
+        for (int t0 = 0; t0 < N; t0 += _bdTile)
+        {
+            int T = Math.Min(_bdTile, N - t0);
+            float* normT = _bdNormAll! + (long)t0 * embDim;   // tile's norm rows
+            float* hidT  = _bdHiddenAll! + (long)t0 * embDim; // tile's FFN outputs
+
+            // Phase A: gate + up over the tile. Parallelize over row BLOCKS; inside a
+            // block, token quads are the outer loop so their 4 input rows are reused
+            // across every row of the block.
+            int blocksA = (intermDim + rbA - 1) / rbA;
+            Parallel.For(0, blocksA, s_moeParallelOpts, b =>
+            {
+                int rStart = b * rbA, rEnd = Math.Min(rStart + rbA, intermDim);
+                int i = 0;
+                for (; i + 3 < T; i += 4)
+                {
+                    float* n0 = normT + (long)i * embDim,       n1 = normT + (long)(i + 1) * embDim;
+                    float* n2 = normT + (long)(i + 2) * embDim, n3 = normT + (long)(i + 3) * embDim;
+                    for (int r = rStart; r < rEnd; r++)
+                    {
+                        DispatchDot4In(gateP + (long)r * bprG, n0, n1, n2, n3, embDim, gateDt,
+                            out float a0, out float a1, out float a2, out float a3);
+                        gateAll[(long)i * intermDim + r]       = a0;
+                        gateAll[(long)(i + 1) * intermDim + r] = a1;
+                        gateAll[(long)(i + 2) * intermDim + r] = a2;
+                        gateAll[(long)(i + 3) * intermDim + r] = a3;
+                        DispatchDot4In(upP + (long)r * bprU, n0, n1, n2, n3, embDim, upDt,
+                            out a0, out a1, out a2, out a3);
+                        upAll[(long)i * intermDim + r]       = a0;
+                        upAll[(long)(i + 1) * intermDim + r] = a1;
+                        upAll[(long)(i + 2) * intermDim + r] = a2;
+                        upAll[(long)(i + 3) * intermDim + r] = a3;
+                    }
+                }
+                for (; i + 1 < T; i += 2)
+                {
+                    float* n0 = normT + (long)i * embDim, n1 = normT + (long)(i + 1) * embDim;
+                    for (int r = rStart; r < rEnd; r++)
+                    {
+                        DispatchDot2In(gateP + (long)r * bprG, n0, n1, embDim, gateDt,
+                            out float a0, out float a1);
+                        gateAll[(long)i * intermDim + r]       = a0;
+                        gateAll[(long)(i + 1) * intermDim + r] = a1;
+                        DispatchDot2In(upP + (long)r * bprU, n0, n1, embDim, upDt, out a0, out a1);
+                        upAll[(long)i * intermDim + r]       = a0;
+                        upAll[(long)(i + 1) * intermDim + r] = a1;
+                    }
+                }
+                if (i < T) // odd remainder
+                {
+                    float* n0 = normT + (long)i * embDim;
+                    for (int r = rStart; r < rEnd; r++)
+                    {
+                        gateAll[(long)i * intermDim + r] = DispatchDot(gateP + (long)r * bprG, n0, embDim, gateDt);
+                        upAll[(long)i * intermDim + r]   = DispatchDot(upP   + (long)r * bprU, n0, embDim, upDt);
+                    }
+                }
+            });
+
+            // Phase B: SiLU(gate) * up over the tile's contiguous [T × intermDim] block.
+            SimdKernels.SiLuMul(gateAll, upAll, (int)((long)T * intermDim));
+
+            // Phase C: down over the tile, same row-block structure — the 4 silu'd gate
+            // slices of a quad are reused across the block's down rows.
+            int blocksC = (embDim + rbC - 1) / rbC;
+            Parallel.For(0, blocksC, s_moeParallelOpts, b =>
+            {
+                int rStart = b * rbC, rEnd = Math.Min(rStart + rbC, embDim);
+                int i = 0;
+                for (; i + 3 < T; i += 4)
+                {
+                    float* g0 = gateAll + (long)i * intermDim,       g1 = gateAll + (long)(i + 1) * intermDim;
+                    float* g2 = gateAll + (long)(i + 2) * intermDim, g3 = gateAll + (long)(i + 3) * intermDim;
+                    for (int r = rStart; r < rEnd; r++)
+                    {
+                        DispatchDot4In(downP + (long)r * bprD, g0, g1, g2, g3, intermDim, downDt,
+                            out float d0, out float d1, out float d2, out float d3);
+                        hidT[(long)i * embDim + r]       = d0;
+                        hidT[(long)(i + 1) * embDim + r] = d1;
+                        hidT[(long)(i + 2) * embDim + r] = d2;
+                        hidT[(long)(i + 3) * embDim + r] = d3;
+                    }
+                }
+                for (; i + 1 < T; i += 2)
+                {
+                    float* g0 = gateAll + (long)i * intermDim, g1 = gateAll + (long)(i + 1) * intermDim;
+                    for (int r = rStart; r < rEnd; r++)
+                    {
+                        DispatchDot2In(downP + (long)r * bprD, g0, g1, intermDim, downDt,
+                            out float d0, out float d1);
+                        hidT[(long)i * embDim + r]       = d0;
+                        hidT[(long)(i + 1) * embDim + r] = d1;
+                    }
+                }
+                if (i < T) // odd remainder
+                {
+                    float* g0 = gateAll + (long)i * intermDim;
+                    for (int r = rStart; r < rEnd; r++)
+                        hidT[(long)i * embDim + r] =
+                            DispatchDot(downP + (long)r * bprD, g0, intermDim, downDt);
+                }
+            });
+        }
+    }
+
     private void BatchedRoutedExperts(int layer, int N)
     {
         int embDim = _embDim;
@@ -6449,7 +6730,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static float DispatchDot(byte* row, float* input, int cols, DType dtype) =>
+    internal static float DispatchDot(byte* row, float* input, int cols, DType dtype) =>
         dtype switch
         {
             DType.Q3_K    => SimdKernels.DotQ3K(row, input, cols),
@@ -6469,7 +6750,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // holds. Dtypes without a 2In kernel fall back to two single dots (no win, still
     // correct).
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void DispatchDot2In(byte* row, float* in1, float* in2, int cols, DType dtype,
+    internal static void DispatchDot2In(byte* row, float* in1, float* in2, int cols, DType dtype,
         out float v1, out float v2)
     {
         switch (dtype)
@@ -6488,7 +6769,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // Bit-identical to two <see cref="DispatchDotQ8K"/> calls. Q8_0 has no expensive
     // unpack, so it falls back to two single dots.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void DispatchDotQ8K2In(byte* row, byte* scr1, byte* scr2, int cols, DType dtype,
+    internal static void DispatchDotQ8K2In(byte* row, byte* scr1, byte* scr2, int cols, DType dtype,
         out float v1, out float v2)
     {
         switch (dtype)
@@ -6554,7 +6835,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // int-domain dot kernels. Only Q3_K, Q8_0, and Q4_K are wired today — the
     // caller guards entry via the corresponding useQ8K* flag, so other dtypes
     // throw if they ever reach here.
-    private static float DispatchDotQ8K(byte* row, byte* q8kScratch, int cols, DType dtype) =>
+    internal static float DispatchDotQ8K(byte* row, byte* q8kScratch, int cols, DType dtype) =>
         dtype switch
         {
             DType.Q3_K => SimdKernels.DotQ3K_Q8KS(row, q8kScratch, cols),
@@ -6567,7 +6848,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // is encoded in `target`. Used to auto-enable the matching Q8_K-input kernel
     // gate at model load — see _q3kQ8KEnabled / _q8_0Q8KEnabled. Scans the GGUF
     // tensor index without allocating, so it is cheap to call from the constructor.
-    private static bool HasRoutedExpertsOfDType(GgufModel model, ModelHyperparams hp, DType target)
+    internal static bool HasRoutedExpertsOfDType(GgufModel model, ModelHyperparams hp, DType target)
     {
         if (!hp.IsMoE) return false;
         int L = hp.NumLayers;
@@ -6582,7 +6863,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
     // Three-state env-var resolver: "1" forces on, "0" forces off, anything else
     // (including unset) falls through to the auto-detected default.
-    private static bool ResolveGate(string envName, bool autoDetect)
+    internal static bool ResolveGate(string envName, bool autoDetect)
     {
         var v = Environment.GetEnvironmentVariable(envName);
         if (v == "1") return true;
@@ -7236,6 +7517,8 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (_bfUsedExperts != null) NativeMemory.Free(_bfUsedExperts);
         // GPU op-offload routed-prefill scratch (perf/carnice-vnni-moe).
         FreeGpuOffloadScratch();
+        // Issue #410: batched CPU dense-FFN prefill scratch.
+        FreeBatchedDenseScratch();
 
         // CPU buffers — _cpuNormBuf is pinned (issue #48).
         CudaBackend.FreePinnedHost((nint)_cpuNormBuf);

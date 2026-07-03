@@ -205,6 +205,25 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     // config is gated out (e.g. non-batchable dtype on a given box).
     internal bool LastPrefillWasBatched;
 
+    // ── Issue #410: batched CPU-MoE routed-expert prefill ────────────────────
+    // When ON and the config qualifies (CPU-MoE, no shared expert, softmax gating,
+    // supported expert dtypes), the batched-trunk prefill replaces the per-token
+    // FFN/MoE loop with the GDN pass's CSR-bucketed batched routed-expert scheme
+    // (issues #110/#112/#114): ONE D2H of all N post-FFN-norm rows per layer, host
+    // router + top-k per token, per-expert (token,slot) bucketing, grouped gate/up/
+    // down dots that decode each quantized weight row once per token-quad, then ONE
+    // H2D of the routed outputs. Bit-identical to the per-token path (the 2In/4In
+    // kernels mirror the single-dot accumulation order; the weighted reduce runs in
+    // top-k order). Default OFF until validated (issue #410 constraint); the
+    // per-token loop remains the byte-exact oracle either way.
+    internal static bool BatchedCpuMoePrefillEnabled =
+        Environment.GetEnvironmentVariable("SHARPI_HYBRID_BATCHED_MOE") == "1";
+
+    // Test observable (issue #410): whether the last Prefill's FFN stage ran the batched
+    // CPU-MoE path (vs the per-token loop). Non-vacuous parity assertions, same idea as
+    // LastPrefillWasBatched.
+    internal bool LastPrefillUsedBatchedCpuMoe;
+
     // Test observable (issue #230): the resolved GPU KV-cache dtype. Lets the parity oracle
     // confirm --kv-type actually applied (the cache is genuinely narrowed) instead of passing
     // vacuously if the env plumbing regressed and KV silently stayed fp32 (fp32-vs-fp32 is
@@ -242,6 +261,40 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     // H2D, so there is no per-token write-after-read on a shared buffer.
     private Tensor? _pinnedEmbedAll;
     private int _pinnedEmbedAllN;
+
+    // Issue #410: host scratch for the batched CPU-MoE prefill, allocated lazily by
+    // EnsureBatchedMoeScratch(N) (exact-size on N change; the CSR arrays whose size
+    // depends only on numExperts are allocated once). Two dedicated pinned staging
+    // buffers carry the per-layer batched transfers: _bmPinnedNorm (D2H, all N post-
+    // FFN-norm rows) and _bmPinnedRouted (H2D, all N routed-MoE outputs) — distinct
+    // buffers so the routed writes never race the norm reads that Phase A is doing.
+    private Tensor? _bmPinnedNorm;     // pinned [N × embDim] — post-FFN-norm rows (D2H)
+    private Tensor? _bmPinnedRouted;   // pinned [N × embDim] — routed-MoE outputs (H2D)
+    private int   _bmPinnedN;
+    private int*   _bmSelected;        // [N × numActive] — per-token selected experts
+    private float* _bmWeights;         // [N × numActive] — per-token expert weights
+    private int*   _bmExpStart;        // [numExperts+1] — CSR offsets into _bmExpTok*
+    private int*   _bmExpCursor;       // [numExperts]   — CSR fill cursors
+    private int*   _bmUsedExperts;     // [numExperts]   — experts with ≥1 token
+    private int*   _bmExpTokI;         // [N × numActive] — CSR (token) pairs
+    private int*   _bmExpTokK;         // [N × numActive] — CSR (slot) pairs
+    private float* _bmGateAll;         // [N × numActive × expertDim] — gate projections
+    private float* _bmUpAll;           // [N × numActive × expertDim] — up projections
+    private float* _bmDownPartial;     // [N × numActive × embDim] — unweighted down partials
+    private int _bmCapN;               // current token capacity of the N-sized slabs
+
+    // Issue #410 (int8 tier): Q8_KS-prepacked activations for the batched routed dots,
+    // mirroring the GDN pass (issue #107). Each token's norm row (Phase A) and silu'd
+    // gate slice (Phase C) is quantized ONCE and every weight row hits the int-domain
+    // dot kernels — ~4× less activation read traffic plus AVX2-VNNI int8 dots. Gates
+    // resolve like the GDN pass: auto-on per routed dtype, except Q4_K stays off on
+    // AVX-512 hardware where the f32 AVX-512 dot wins (SHARPI_Q3K_Q8K / SHARPI_Q8_0_Q8K /
+    // SHARPI_Q4K_Q8K override). NOT byte-exact vs the f32 dots — the bitwise oracles pin
+    // these OFF; argmax-stability is asserted separately.
+    private readonly bool _q3kQ8KEnabled, _q8_0Q8KEnabled, _q4kQ8KEnabled;
+    private byte* _bmNormAllQ8K;       // [N × _bmQ8KEmbStride] — prepacked norm rows
+    private byte* _bmGateAllQ8K;       // [N × numActive × _bmQ8KExpStride] — prepacked silu'd gates
+    private readonly int _bmQ8KEmbStride, _bmQ8KExpStride;
 
     // Non-transactional fault latch (mirror of CudaHybridGdnForwardPass._faulted):
     // set at batched-prefill entry, cleared only after the KV/position counters have
@@ -388,6 +441,31 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         else
         {
             _cpuMoe = false;
+        }
+
+        // Issue #410 (int8 tier): resolve the Q8_KS activation-prepack gates for the
+        // batched CPU-MoE prefill — the same auto logic as CudaHybridGdnForwardPass
+        // (Q4_K int8 only where AVX-512 is absent; there the f32 AVX-512 dot wins).
+        // Only meaningful under CPU-MoE + the batched prefill flag; left false otherwise
+        // so EnsureBatchedMoeScratch never allocates the prepack slabs.
+        if (_cpuMoe && BatchedCpuMoePrefillEnabled)
+        {
+            _q3kQ8KEnabled = CudaHybridGdnForwardPass.ResolveGate("SHARPI_Q3K_Q8K",
+                CudaHybridGdnForwardPass.HasRoutedExpertsOfDType(model, hp, DType.Q3_K));
+            _q8_0Q8KEnabled = CudaHybridGdnForwardPass.ResolveGate("SHARPI_Q8_0_Q8K",
+                CudaHybridGdnForwardPass.HasRoutedExpertsOfDType(model, hp, DType.Q8_0));
+            _q4kQ8KEnabled = CudaHybridGdnForwardPass.ResolveGate("SHARPI_Q4K_Q8K",
+                CudaHybridGdnForwardPass.HasRoutedExpertsOfDType(model, hp, DType.Q4_K)
+                && !System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated);
+            if (_q3kQ8KEnabled || _q8_0Q8KEnabled || _q4kQ8KEnabled)
+            {
+                _bmQ8KEmbStride = SimdKernels.Q8KSScratchBytes(_embDim);
+                _bmQ8KExpStride = SimdKernels.Q8KSScratchBytes(_expertDim);
+                Console.Error.WriteLine(
+                    $"[CudaHybridForwardPass] Batched CPU-MoE Q8_K-input kernels enabled " +
+                    $"(Q3_K:{_q3kQ8KEnabled} Q8_0:{_q8_0Q8KEnabled} Q4_K:{_q4kQ8KEnabled}). " +
+                    "Override with SHARPI_Q3K_Q8K=0 / SHARPI_Q8_0_Q8K=0 / SHARPI_Q4K_Q8K=0.");
+            }
         }
 
         string kvTag = _kvDType switch { DType.BFloat16 => " [KV bf16]", DType.Q8_0 => " [KV q8_0]", _ => "" };
@@ -1106,6 +1184,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     {
         ThrowIfFaulted();
         int n = tokens.Count;
+        LastPrefillUsedBatchedCpuMoe = false;   // set by the #410 FFN stage when it runs
         // Issue #123: batched-trunk prefill for the supported pure-attention configs
         // (non-Gemma4, non-TurboQuant, NEOX RoPE, learned/no QK-norm — never L2). The
         // batched trunk collapses the per-position attention launches whose cost grows
@@ -1230,6 +1309,481 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         _pinnedEmbedAll = _gpu.AllocatePinned(TensorShape.D1((long)n * _embDim));
         _pinnedEmbedAllN = n;
         return _pinnedEmbedAll;
+    }
+
+    // ================================================================
+    //  Issue #410: batched CPU-MoE routed-expert prefill
+    // ================================================================
+
+    private static readonly ParallelOptions s_moeParallelOpts = new()
+    {
+        MaxDegreeOfParallelism = ResolveMoeThreads()
+    };
+
+    private static int ResolveMoeThreads()
+    {
+        var v = Environment.GetEnvironmentVariable("SHARPI_MOE_THREADS");
+        if (int.TryParse(v, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out int n) && n > 0)
+            return n;
+        return Environment.ProcessorCount;
+    }
+
+    // Dot-dispatch shims over the GDN pass's shared kernels (issues #112/#114): decode a
+    // quantized weight row once and dot it against 1/2/4 token inputs. Bit-identical to
+    // repeated single dots — the multi-input kernels mirror the single accumulation order.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float DispatchDot(byte* row, float* input, int cols, DType dtype) =>
+        CudaHybridGdnForwardPass.DispatchDot(row, input, cols, dtype);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void DispatchDot2In(byte* row, float* in1, float* in2, int cols, DType dtype,
+        out float v1, out float v2) =>
+        CudaHybridGdnForwardPass.DispatchDot2In(row, in1, in2, cols, dtype, out v1, out v2);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void DispatchDot4In(byte* row, float* in0, float* in1, float* in2, float* in3,
+        int cols, DType dtype, out float v0, out float v1, out float v2, out float v3) =>
+        CudaHybridGdnForwardPass.DispatchDot4In(row, in0, in1, in2, in3, cols, dtype,
+            out v0, out v1, out v2, out v3);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float DispatchDotQ8K(byte* row, byte* q8kScratch, int cols, DType dtype) =>
+        CudaHybridGdnForwardPass.DispatchDotQ8K(row, q8kScratch, cols, dtype);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void DispatchDotQ8K2In(byte* row, byte* s0, byte* s1, int cols, DType dtype,
+        out float v0, out float v1) =>
+        CudaHybridGdnForwardPass.DispatchDotQ8K2In(row, s0, s1, cols, dtype, out v0, out v1);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void DispatchDotQ8K4In(byte* row, byte* s0, byte* s1, byte* s2, byte* s3,
+        int cols, DType dtype, out float v0, out float v1, out float v2, out float v3) =>
+        CudaHybridGdnForwardPass.DispatchDotQ8K4In(row, s0, s1, s2, s3, cols, dtype,
+            out v0, out v1, out v2, out v3);
+
+    /// <summary>
+    /// Whether the #410 batched CPU-MoE FFN stage handles this prefill. Requires the
+    /// flag, a CPU-MoE routed model, and the configs the batched scheme reproduces
+    /// bit-identically: no shared expert (Qwen3-Coder / OLMoE have none — the shared-
+    /// expert GPU overlap of <see cref="GpuTrunkCpuMoeFfn"/> is not ported), softmax
+    /// gating (the batched weighted reduce runs post-SiLU; sigmoid gating scales
+    /// gate/up PRE-SiLU, a different dataflow), and expert dtypes with a host dot
+    /// kernel. Everything else falls back to the per-token FFN loop.
+    /// </summary>
+    private bool UseBatchedCpuMoe(int n) =>
+        BatchedCpuMoePrefillEnabled && _isMoE && _cpuMoe && n >= 2
+        && !_hasSharedExpert && !_hp.UseSigmoidGating
+        && BatchedCpuMoeWeightsSupported();
+
+    private bool? _bmWeightsSupported;
+
+    // The batched routed-expert dots only cover the dtypes DispatchDot handles, and the
+    // per-row byte stride below assumes cols divides the block size evenly. Checked once
+    // (immutable weights), cached.
+    private bool BatchedCpuMoeWeightsSupported()
+    {
+        if (_bmWeightsSupported is { } cached) return cached;
+        bool ok = _cpuMoeGateInp is not null && _cpuMoeGateExps is not null;
+        for (int i = 0; ok && i < _nGpuLayers; i++)
+            ok = Supported(_cpuMoeGateExps![i], _embDim)
+              && Supported(_cpuMoeUpExps![i],   _embDim)
+              && Supported(_cpuMoeDownExps![i], _expertDim);
+        _bmWeightsSupported = ok;
+        return ok;
+
+        static bool Supported(in CpuWeightRef w, int cols) =>
+            w.DataPtr != null
+            && w.DType is DType.Q3_K or DType.Q4_K or DType.Q5_K or DType.Q6_K
+                        or DType.Q8_0 or DType.Float32
+            && cols % DTypeInfo.BlockSize(w.DType) == 0;
+    }
+
+    /// <summary>
+    /// (Re)allocate the batched CPU-MoE host scratch for <paramref name="n"/> tokens.
+    /// The pinned staging buffers are exact-size (whole-buffer CopyDevice needs equal
+    /// element counts on both sides); the native slabs follow the same policy for
+    /// simplicity. The CSR arrays sized only by numExperts are allocated once.
+    /// </summary>
+    private void EnsureBatchedMoeScratch(int n)
+    {
+        int numExperts = _hp.NumExperts;
+        if (_bmExpStart == null)
+        {
+            _bmExpStart    = (int*)NativeMemory.Alloc((nuint)((numExperts + 1) * sizeof(int)));
+            _bmExpCursor   = (int*)NativeMemory.Alloc((nuint)(numExperts * sizeof(int)));
+            _bmUsedExperts = (int*)NativeMemory.Alloc((nuint)(numExperts * sizeof(int)));
+        }
+        if (_bmCapN != n)
+        {
+            FreeBatchedMoeTokenScratch();
+            long sel = (long)n * _hp.NumActiveExperts;
+            _bmSelected    = (int*)NativeMemory.Alloc((nuint)(sel * sizeof(int)));
+            _bmExpTokI     = (int*)NativeMemory.Alloc((nuint)(sel * sizeof(int)));
+            _bmExpTokK     = (int*)NativeMemory.Alloc((nuint)(sel * sizeof(int)));
+            _bmWeights     = (float*)NativeMemory.Alloc((nuint)(sel * sizeof(float)));
+            _bmGateAll     = (float*)NativeMemory.Alloc((nuint)(sel * _expertDim * sizeof(float)));
+            _bmUpAll       = (float*)NativeMemory.Alloc((nuint)(sel * _expertDim * sizeof(float)));
+            _bmDownPartial = (float*)NativeMemory.Alloc((nuint)(sel * _embDim * sizeof(float)));
+            if (_q3kQ8KEnabled || _q8_0Q8KEnabled || _q4kQ8KEnabled)
+            {
+                _bmNormAllQ8K = (byte*)NativeMemory.Alloc((nuint)((long)n * _bmQ8KEmbStride));
+                _bmGateAllQ8K = (byte*)NativeMemory.Alloc((nuint)(sel * _bmQ8KExpStride));
+            }
+            _bmCapN = n;
+        }
+        if (_bmPinnedN != n)
+        {
+            if (_bmPinnedNorm is { } pn)   { _gpu.Free(pn); _bmPinnedNorm = null; }
+            if (_bmPinnedRouted is { } pr) { _gpu.Free(pr); _bmPinnedRouted = null; }
+            _bmPinnedNorm   = _gpu.AllocatePinned(TensorShape.D1((long)n * _embDim));
+            _bmPinnedRouted = _gpu.AllocatePinned(TensorShape.D1((long)n * _embDim));
+            _bmPinnedN = n;
+        }
+    }
+
+    private void FreeBatchedMoeTokenScratch()
+    {
+        if (_bmSelected    != null) { NativeMemory.Free(_bmSelected);    _bmSelected = null; }
+        if (_bmExpTokI     != null) { NativeMemory.Free(_bmExpTokI);     _bmExpTokI = null; }
+        if (_bmExpTokK     != null) { NativeMemory.Free(_bmExpTokK);     _bmExpTokK = null; }
+        if (_bmWeights     != null) { NativeMemory.Free(_bmWeights);     _bmWeights = null; }
+        if (_bmGateAll     != null) { NativeMemory.Free(_bmGateAll);     _bmGateAll = null; }
+        if (_bmUpAll       != null) { NativeMemory.Free(_bmUpAll);       _bmUpAll = null; }
+        if (_bmDownPartial != null) { NativeMemory.Free(_bmDownPartial); _bmDownPartial = null; }
+        if (_bmNormAllQ8K  != null) { NativeMemory.Free(_bmNormAllQ8K);  _bmNormAllQ8K = null; }
+        if (_bmGateAllQ8K  != null) { NativeMemory.Free(_bmGateAllQ8K);  _bmGateAllQ8K = null; }
+        _bmCapN = 0;
+    }
+
+    private void FreeBatchedMoeScratch()
+    {
+        FreeBatchedMoeTokenScratch();
+        if (_bmExpStart    != null) { NativeMemory.Free(_bmExpStart);    _bmExpStart = null; }
+        if (_bmExpCursor   != null) { NativeMemory.Free(_bmExpCursor);   _bmExpCursor = null; }
+        if (_bmUsedExperts != null) { NativeMemory.Free(_bmUsedExperts); _bmUsedExperts = null; }
+        if (_bmPinnedNorm is { } pn)   { _gpu.Free(pn); _bmPinnedNorm = null; }
+        if (_bmPinnedRouted is { } pr) { _gpu.Free(pr); _bmPinnedRouted = null; }
+        _bmPinnedN = 0;
+    }
+
+    /// <summary>
+    /// Issue #410: the batched CPU-MoE FFN stage of one GPU layer — replaces the
+    /// per-token FFN/MoE loop at the tail of <see cref="GpuLayerBatchedTrunk"/> for
+    /// the configs <see cref="UseBatchedCpuMoe"/> admits. ONE D2H of all
+    /// <paramref name="n"/> post-FFN-norm rows, host router + top-k per token (the
+    /// exact <see cref="CpuMoeRouted"/> head on the same downloaded bytes), the
+    /// CSR-bucketed grouped expert dots of <see cref="BatchedRoutedExpertsCpu"/>,
+    /// then ONE H2D of the routed outputs and a single batched residual add:
+    /// stream = routed + (o-proj + pre-attn residual) — element-for-element the
+    /// values the per-token loop's row-wise AddInPlace produces.
+    /// </summary>
+    private void BatchedCpuMoeFfnStage(int layer, int n, Tensor normAll, Tensor blockOut, Tensor stream)
+    {
+        LastPrefillUsedBatchedCpuMoe = true;
+        int embDim = _embDim;
+        int na = _hp.NumActiveExperts;
+        int numExperts = _hp.NumExperts;
+
+        EnsureBatchedMoeScratch(n);
+
+        // 1. ONE D2H: every token's post-FFN-norm row.
+        _gpu.CopyDevice(_bmPinnedNorm!, normAll);
+        _gpu.Synchronize();
+        float* normHost = _gpu.MapPinned(_bmPinnedNorm!);
+
+        // 2. Router + top-k per token on the host. Same MatVec → Softmax → SelectTopK
+        //    sequence as CpuMoeRouted (sigmoid gating is gated out by UseBatchedCpuMoe)
+        //    on the same downloaded bytes → identical selections and weights.
+        var gateInp = _cpuMoeGateInp![layer];
+        Span<int> sel = stackalloc int[na];
+        Span<float> wts = stackalloc float[na];
+        for (int i = 0; i < n; i++)
+        {
+            float* normI = normHost + (long)i * embDim;
+            SimdKernels.MatVec(_cpuRouterLogits, gateInp.DataPtr, normI, numExperts, embDim, gateInp.DType);
+            SimdKernels.SoftmaxInPlace(_cpuRouterLogits, numExperts);
+            SelectTopK(_cpuRouterLogits, numExperts, na, sel, wts, _hp.NormalizeMoeTopKWeights);
+            for (int k = 0; k < na; k++)
+            {
+                _bmSelected[(long)i * na + k] = sel[k];
+                _bmWeights[(long)i * na + k] = wts[k];
+            }
+        }
+
+        // 3. Routed experts, CSR-bucketed grouped dots.
+        float* routedHost = _gpu.MapPinned(_bmPinnedRouted!);
+        BatchedRoutedExpertsCpu(layer, n, normHost, routedHost);
+        _gpu.UnmapPinned(_bmPinnedRouted!);
+        _gpu.UnmapPinned(_bmPinnedNorm!);
+
+        // 4. ONE H2D into the residual stream (its pre-attn contents are dead once
+        //    blockOut exists), then one batched elementwise add.
+        _gpu.CopyDevice(stream, _bmPinnedRouted!);
+        _gpu.AddInPlace(stream, blockOut);
+    }
+
+    /// <summary>
+    /// Port of <see cref="CudaHybridGdnForwardPass.BatchedRoutedExperts"/> (issues
+    /// #110/#112/#114) for the pure-attention qwen3moe path — f32-input tiers only
+    /// (no Q8_KS prepack yet). Buckets the (token, slot) pairs by selected expert
+    /// (CSR), then reads each expert weight row ONCE and dots it against all its
+    /// bucketed tokens in quads → pairs → single (each tier bit-identical to the
+    /// per-token dot), and finally reduces the unweighted down partials per token in
+    /// top-k order — the same `out += w · dot` accumulation order as
+    /// <see cref="ExpertMatVecDown"/> from a cleared output.
+    /// </summary>
+    private void BatchedRoutedExpertsCpu(int layer, int N, float* normAll, float* routedAll)
+    {
+        int embDim = _embDim;
+        int na = _hp.NumActiveExperts;
+        int expertDim = _expertDim;
+        int numExperts = _hp.NumExperts;
+
+        var gateExps = _cpuMoeGateExps![layer];
+        var upExps   = _cpuMoeUpExps![layer];
+        var downExps = _cpuMoeDownExps![layer];
+        byte* gateP = gateExps.DataPtr; byte* upP = upExps.DataPtr; byte* downP = downExps.DataPtr;
+        DType gateDt = gateExps.DType, upDt = upExps.DType, downDt = downExps.DType;
+
+        int bprG = (embDim    / DTypeInfo.BlockSize(gateDt)) * DTypeInfo.BytesPerBlock(gateDt);
+        int bprU = (embDim    / DTypeInfo.BlockSize(upDt))   * DTypeInfo.BytesPerBlock(upDt);
+        int bprD = (expertDim / DTypeInfo.BlockSize(downDt)) * DTypeInfo.BytesPerBlock(downDt);
+
+        bool useQ8KGate = (_q3kQ8KEnabled && gateDt == DType.Q3_K) || (_q8_0Q8KEnabled && gateDt == DType.Q8_0) || (_q4kQ8KEnabled && gateDt == DType.Q4_K);
+        bool useQ8KUp   = (_q3kQ8KEnabled && upDt   == DType.Q3_K) || (_q8_0Q8KEnabled && upDt   == DType.Q8_0) || (_q4kQ8KEnabled && upDt   == DType.Q4_K);
+        bool useQ8KDown = (_q3kQ8KEnabled && downDt == DType.Q3_K) || (_q8_0Q8KEnabled && downDt == DType.Q8_0) || (_q4kQ8KEnabled && downDt == DType.Q4_K);
+        byte* normAllQ8K = _bmNormAllQ8K; byte* gateAllQ8K = _bmGateAllQ8K;
+        int q8kEmbStride = _bmQ8KEmbStride, q8kExpStride = _bmQ8KExpStride;
+
+        // Bucket (token, slot) pairs by selected expert (CSR layout).
+        int* expStart = _bmExpStart!; int* cursor = _bmExpCursor!; int* used = _bmUsedExperts!;
+        int* selected = _bmSelected!;
+        for (int e = 0; e <= numExperts; e++) expStart[e] = 0;
+        long totalSel = (long)N * na;
+        for (long s = 0; s < totalSel; s++) expStart[selected[s] + 1]++;
+        for (int e = 0; e < numExperts; e++) expStart[e + 1] += expStart[e];
+        for (int e = 0; e < numExperts; e++) cursor[e] = expStart[e];
+        int* expTokI = _bmExpTokI!; int* expTokK = _bmExpTokK!;
+        for (int i = 0; i < N; i++)
+            for (int k = 0; k < na; k++)
+            {
+                int e = selected[(long)i * na + k];
+                int p = cursor[e]++;
+                expTokI[p] = i; expTokK[p] = k;
+            }
+        int numUsed = 0;
+        for (int e = 0; e < numExperts; e++)
+            if (expStart[e + 1] > expStart[e]) used[numUsed++] = e;
+
+        float* gateAll = _bmGateAll!; float* upAll = _bmUpAll!; float* downPartial = _bmDownPartial!;
+
+        // Q8_KS-prepack each token's norm once (shared across all gate/up rows).
+        if (useQ8KGate || useQ8KUp)
+            Parallel.For(0, N, s_moeParallelOpts, i =>
+                SimdKernels.QuantizeRowToQ8KS(normAll + (long)i * embDim, embDim,
+                    normAllQ8K + (long)i * q8kEmbStride));
+
+        // Phase A: gate + up. Parallelize over (used expert, row BLOCK); token quads are
+        // the OUTER loop inside a block so their 4 input rows, loaded into L1/L2 once,
+        // are reused across every weight row of the block (issue #410 row-blocking —
+        // without it the activation re-reads scale as rows × tokens and go L3-bound).
+        // Per-(row, token) math and accumulation order are unchanged → bit-identical.
+        int naL = na, expertDimL = expertDim, embDimL = embDim;
+        int rbA = Math.Clamp(262144 / Math.Max(bprG, bprU), 8, 64);
+        int blocksPerExpA = (expertDim + rbA - 1) / rbA;
+        Parallel.For(0, numUsed * blocksPerExpA, s_moeParallelOpts, idx =>
+        {
+            int u = idx / blocksPerExpA;
+            int e = used[u];
+            int rStart = (idx % blocksPerExpA) * rbA;
+            int rEnd = Math.Min(rStart + rbA, expertDimL);
+            byte* gateBase = gateP + (long)e * expertDimL * bprG;
+            byte* upBase   = upP   + (long)e * expertDimL * bprU;
+            int pStart = expStart[e], pEnd = expStart[e + 1];
+            int p = pStart;
+            for (; p + 3 < pEnd; p += 4)
+            {
+                int i0 = expTokI[p],     k0 = expTokK[p];
+                int i1 = expTokI[p + 1], k1 = expTokK[p + 1];
+                int i2 = expTokI[p + 2], k2 = expTokK[p + 2];
+                int i3 = expTokI[p + 3], k3 = expTokK[p + 3];
+                long o0 = ((long)i0 * naL + k0) * expertDimL;
+                long o1 = ((long)i1 * naL + k1) * expertDimL;
+                long o2 = ((long)i2 * naL + k2) * expertDimL;
+                long o3 = ((long)i3 * naL + k3) * expertDimL;
+                if (useQ8KGate || useQ8KUp)
+                {
+                    byte* q0 = normAllQ8K + (long)i0 * q8kEmbStride, q1 = normAllQ8K + (long)i1 * q8kEmbStride;
+                    byte* q2 = normAllQ8K + (long)i2 * q8kEmbStride, q3 = normAllQ8K + (long)i3 * q8kEmbStride;
+                    for (int r = rStart; r < rEnd; r++)
+                    {
+                        DispatchDotQ8K4In(gateBase + (long)r * bprG, q0, q1, q2, q3, embDimL, gateDt,
+                            out float a0, out float a1, out float a2, out float a3);
+                        gateAll[o0 + r] = a0; gateAll[o1 + r] = a1; gateAll[o2 + r] = a2; gateAll[o3 + r] = a3;
+                        DispatchDotQ8K4In(upBase + (long)r * bprU, q0, q1, q2, q3, embDimL, upDt,
+                            out a0, out a1, out a2, out a3);
+                        upAll[o0 + r] = a0; upAll[o1 + r] = a1; upAll[o2 + r] = a2; upAll[o3 + r] = a3;
+                    }
+                }
+                else
+                {
+                    float* f0 = normAll + (long)i0 * embDimL, f1 = normAll + (long)i1 * embDimL;
+                    float* f2 = normAll + (long)i2 * embDimL, f3 = normAll + (long)i3 * embDimL;
+                    for (int r = rStart; r < rEnd; r++)
+                    {
+                        DispatchDot4In(gateBase + (long)r * bprG, f0, f1, f2, f3, embDimL, gateDt,
+                            out float a0, out float a1, out float a2, out float a3);
+                        gateAll[o0 + r] = a0; gateAll[o1 + r] = a1; gateAll[o2 + r] = a2; gateAll[o3 + r] = a3;
+                        DispatchDot4In(upBase + (long)r * bprU, f0, f1, f2, f3, embDimL, upDt,
+                            out a0, out a1, out a2, out a3);
+                        upAll[o0 + r] = a0; upAll[o1 + r] = a1; upAll[o2 + r] = a2; upAll[o3 + r] = a3;
+                    }
+                }
+            }
+            for (; p + 1 < pEnd; p += 2)
+            {
+                int i0 = expTokI[p],     k0 = expTokK[p];
+                int i1 = expTokI[p + 1], k1 = expTokK[p + 1];
+                long o0 = ((long)i0 * naL + k0) * expertDimL;
+                long o1 = ((long)i1 * naL + k1) * expertDimL;
+                for (int r = rStart; r < rEnd; r++)
+                {
+                    float a0, a1;
+                    if (useQ8KGate)
+                        DispatchDotQ8K2In(gateBase + (long)r * bprG, normAllQ8K + (long)i0 * q8kEmbStride,
+                            normAllQ8K + (long)i1 * q8kEmbStride, embDimL, gateDt, out a0, out a1);
+                    else
+                        DispatchDot2In(gateBase + (long)r * bprG, normAll + (long)i0 * embDimL,
+                            normAll + (long)i1 * embDimL, embDimL, gateDt, out a0, out a1);
+                    gateAll[o0 + r] = a0; gateAll[o1 + r] = a1;
+                    if (useQ8KUp)
+                        DispatchDotQ8K2In(upBase + (long)r * bprU, normAllQ8K + (long)i0 * q8kEmbStride,
+                            normAllQ8K + (long)i1 * q8kEmbStride, embDimL, upDt, out a0, out a1);
+                    else
+                        DispatchDot2In(upBase + (long)r * bprU, normAll + (long)i0 * embDimL,
+                            normAll + (long)i1 * embDimL, embDimL, upDt, out a0, out a1);
+                    upAll[o0 + r] = a0; upAll[o1 + r] = a1;
+                }
+            }
+            if (p < pEnd) // odd remainder
+            {
+                int i = expTokI[p], k = expTokK[p];
+                long oBase = ((long)i * naL + k) * expertDimL;
+                for (int r = rStart; r < rEnd; r++)
+                {
+                    gateAll[oBase + r] = useQ8KGate
+                        ? DispatchDotQ8K(gateBase + (long)r * bprG, normAllQ8K + (long)i * q8kEmbStride, embDimL, gateDt)
+                        : DispatchDot(gateBase + (long)r * bprG, normAll + (long)i * embDimL, embDimL, gateDt);
+                    upAll[oBase + r] = useQ8KUp
+                        ? DispatchDotQ8K(upBase + (long)r * bprU, normAllQ8K + (long)i * q8kEmbStride, embDimL, upDt)
+                        : DispatchDot(upBase + (long)r * bprU, normAll + (long)i * embDimL, embDimL, upDt);
+                }
+            }
+        });
+
+        // Phase B: SiLU(gate) * up over the whole contiguous (token × slot × expertDim) block.
+        SimdKernels.SiLuMul(gateAll, upAll, (int)(totalSel * expertDim));
+
+        // Q8_KS-prepack each silu'd gate slice for the down dots.
+        if (useQ8KDown)
+            Parallel.For(0, (int)totalSel, s_moeParallelOpts, s =>
+                SimdKernels.QuantizeRowToQ8KS(gateAll + (long)s * expertDim, expertDim,
+                    gateAllQ8K + (long)s * q8kExpStride));
+
+        // Phase C: down. Parallelize over (used expert, emb-row BLOCK); same row-block
+        // structure as Phase A — a quad's 4 silu'd-gate slices are reused across every
+        // down row of the block. Store unweighted partials.
+        int rbC = Math.Clamp(262144 / bprD, 8, 64);
+        int blocksPerExpC = (embDim + rbC - 1) / rbC;
+        Parallel.For(0, numUsed * blocksPerExpC, s_moeParallelOpts, idx =>
+        {
+            int u = idx / blocksPerExpC;
+            int e = used[u];
+            int rStart = (idx % blocksPerExpC) * rbC;
+            int rEnd = Math.Min(rStart + rbC, embDimL);
+            byte* downBase = downP + (long)e * embDimL * bprD;
+            int pStart = expStart[e], pEnd = expStart[e + 1];
+            int p = pStart;
+            for (; p + 3 < pEnd; p += 4)
+            {
+                long s0 = (long)expTokI[p]     * naL + expTokK[p];
+                long s1 = (long)expTokI[p + 1] * naL + expTokK[p + 1];
+                long s2 = (long)expTokI[p + 2] * naL + expTokK[p + 2];
+                long s3 = (long)expTokI[p + 3] * naL + expTokK[p + 3];
+                if (useQ8KDown)
+                {
+                    byte* q0 = gateAllQ8K + s0 * q8kExpStride, q1 = gateAllQ8K + s1 * q8kExpStride;
+                    byte* q2 = gateAllQ8K + s2 * q8kExpStride, q3 = gateAllQ8K + s3 * q8kExpStride;
+                    for (int r = rStart; r < rEnd; r++)
+                    {
+                        DispatchDotQ8K4In(downBase + (long)r * bprD, q0, q1, q2, q3, expertDimL, downDt,
+                            out float d0, out float d1, out float d2, out float d3);
+                        downPartial[s0 * embDimL + r] = d0;
+                        downPartial[s1 * embDimL + r] = d1;
+                        downPartial[s2 * embDimL + r] = d2;
+                        downPartial[s3 * embDimL + r] = d3;
+                    }
+                }
+                else
+                {
+                    float* g0 = gateAll + s0 * expertDimL, g1 = gateAll + s1 * expertDimL;
+                    float* g2 = gateAll + s2 * expertDimL, g3 = gateAll + s3 * expertDimL;
+                    for (int r = rStart; r < rEnd; r++)
+                    {
+                        DispatchDot4In(downBase + (long)r * bprD, g0, g1, g2, g3, expertDimL, downDt,
+                            out float d0, out float d1, out float d2, out float d3);
+                        downPartial[s0 * embDimL + r] = d0;
+                        downPartial[s1 * embDimL + r] = d1;
+                        downPartial[s2 * embDimL + r] = d2;
+                        downPartial[s3 * embDimL + r] = d3;
+                    }
+                }
+            }
+            for (; p + 1 < pEnd; p += 2)
+            {
+                long s0 = (long)expTokI[p]     * naL + expTokK[p];
+                long s1 = (long)expTokI[p + 1] * naL + expTokK[p + 1];
+                for (int r = rStart; r < rEnd; r++)
+                {
+                    float d0, d1;
+                    if (useQ8KDown)
+                        DispatchDotQ8K2In(downBase + (long)r * bprD, gateAllQ8K + s0 * q8kExpStride,
+                            gateAllQ8K + s1 * q8kExpStride, expertDimL, downDt, out d0, out d1);
+                    else
+                        DispatchDot2In(downBase + (long)r * bprD, gateAll + s0 * expertDimL,
+                            gateAll + s1 * expertDimL, expertDimL, downDt, out d0, out d1);
+                    downPartial[s0 * embDimL + r] = d0;
+                    downPartial[s1 * embDimL + r] = d1;
+                }
+            }
+            if (p < pEnd) // odd remainder
+            {
+                long slot = (long)expTokI[p] * naL + expTokK[p];
+                for (int r = rStart; r < rEnd; r++)
+                    downPartial[slot * embDimL + r] = useQ8KDown
+                        ? DispatchDotQ8K(downBase + (long)r * bprD, gateAllQ8K + slot * q8kExpStride, expertDimL, downDt)
+                        : DispatchDot(downBase + (long)r * bprD, gateAll + slot * expertDimL, expertDimL, downDt);
+            }
+        });
+
+        // Reduce: per token, sum the numActive weighted down partials in top-k order —
+        // bit-identical to the sequential `out += w * dot` loop from a cleared output.
+        float* weights = _bmWeights!;
+        Parallel.For(0, N, s_moeParallelOpts, i =>
+        {
+            float* outp = routedAll + (long)i * embDimL;
+            for (int r = 0; r < embDimL; r++)
+            {
+                float sum = 0f;
+                for (int k = 0; k < naL; k++)
+                {
+                    long slot = (long)i * naL + k;
+                    sum += weights[slot] * downPartial[slot * embDimL + r];
+                }
+                outp[r] = sum;
+            }
+        });
     }
 
     /// <summary>
@@ -1452,6 +2006,16 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
 
         // ── FFN norm (batched) over the post-attn residual.
         _gpu.RmsNormBatched(normAll, blockOut, _gpuFfnNorm[i], n, _embDim, _hp.RmsNormEps);
+
+        // ── FFN / MoE stage. Issue #410: when the batched CPU-MoE path qualifies, run the
+        //    routed experts for ALL n tokens in one CSR-bucketed pass (one D2H of normAll,
+        //    host router + grouped expert dots, one H2D of the routed outputs) instead of
+        //    the per-token loop below — bit-identical, just amortized.
+        if (UseBatchedCpuMoe(n))
+        {
+            BatchedCpuMoeFfnStage(i, n, normAll, blockOut, stream);
+            return;
+        }
 
         // ── FFN / MoE stage: per token (issue #123 scope is the trunk). Reuse the exact
         //    single-token GpuMoeFfn/GpuDenseFfn (reads _gpuNormBuf, writes _gpuHidden), then
@@ -3325,6 +3889,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         if (_pinnedHiddenAll is { } pha) { _gpu.Free(pha); _pinnedHiddenAll = null; }
         // Issue #218: batched CPU-embed staging buffer.
         if (_pinnedEmbedAll is { } pea) { _gpu.Free(pea); _pinnedEmbedAll = null; }
+        // Issue #410: batched CPU-MoE prefill scratch (native slabs + pinned staging).
+        FreeBatchedMoeScratch();
 
         for (int i = 0; i < _nGpuLayers; i++)
         {
