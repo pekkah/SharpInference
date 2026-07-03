@@ -67,7 +67,7 @@ public sealed unsafe class SimdKernelsMatVecQ8_0Tests
                 int off = r * bytesPerRow + b * bytesPerBlock;
 
                 float d = (float)(rng.NextDouble() * 0.09 + 0.01);
-                ushort dHalf = BitConverter.ToUInt16(BitConverter.GetBytes((Half)d), 0);
+                ushort dHalf = BitConverter.HalfToUInt16Bits((Half)d);
                 bytes[off + 0] = (byte)(dHalf & 0xFF);
                 bytes[off + 1] = (byte)(dHalf >> 8);
 
