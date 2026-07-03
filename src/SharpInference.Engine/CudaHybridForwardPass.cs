@@ -1380,10 +1380,12 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     private bool? _bmWeightsSupported;
 
     // The batched routed-expert dots only cover the dtypes whose per-token oracle
-    // (SimdKernels.MatVec) uses the SAME per-row Dot* kernel — Q8_0 is excluded because
-    // MatVec has no fused Q8_0 case (it dequant-falls-back to DotF32, which is not
-    // bit-identical to the batched DotQ8_0). The per-row byte stride below also assumes
-    // cols divides the block size evenly. Checked once (immutable weights), cached.
+    // (SimdKernels.MatVec) uses the SAME per-row Dot* kernel. Q8_0 qualifies since
+    // issue #417 wired MatVecQ8_0 into MatVec — the f32 tier is now bit-identical to
+    // the per-token DotQ8_0 route (the Q8_KS int8 tier stays argmax-stable-only, as
+    // for every dtype; pin SHARPI_Q8_0_Q8K=0 for byte parity). The per-row byte
+    // stride below also assumes cols divides the block size evenly. Checked once
+    // (immutable weights), cached.
     private bool BatchedCpuMoeWeightsSupported()
     {
         if (_bmWeightsSupported is { } cached) return cached;
@@ -1398,7 +1400,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         static bool Supported(in CpuWeightRef w, int cols) =>
             w.DataPtr != null
             && w.DType is DType.Q3_K or DType.Q4_K or DType.Q5_K or DType.Q6_K
-                        or DType.Float32
+                        or DType.Q8_0 or DType.Float32
             && cols % DTypeInfo.BlockSize(w.DType) == 0;
     }
 
