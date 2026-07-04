@@ -200,6 +200,7 @@ public static class OpenAiEndpoints
         int textTokens = 0;
         int reasoningTokens = 0;
         int promptTokens = 0;
+        bool truncatedByMaxTokens = false;
 
         try
         {
@@ -208,6 +209,10 @@ public static class OpenAiEndpoints
                 if (c.Kind == GenerateChunkKind.Usage)
                 {
                     promptTokens = c.PromptTokens;
+                }
+                else if (c.Kind == GenerateChunkKind.Stop)
+                {
+                    truncatedByMaxTokens = c.TruncatedByMaxTokens;
                 }
                 else if (c.Kind == GenerateChunkKind.Thinking)
                 {
@@ -278,6 +283,13 @@ public static class OpenAiEndpoints
             // Model hit max_tokens / EOS inside an unterminated tool call. The partial was
             // surfaced as content by Parse; report length so the client knows it was cut off
             // and does NOT receive a half-parsed call. Mirrors the streaming path.
+            finishReason = "length";
+        }
+        else if (truncatedByMaxTokens)
+        {
+            // No tool call in progress, but the engine's Stop chunk says the MaxNewTokens
+            // budget was exhausted rather than a natural stop token (issue #411 follow-up:
+            // this case previously fell through to the "stop" default below, unconditionally).
             finishReason = "length";
         }
 
@@ -405,6 +417,7 @@ public static class OpenAiEndpoints
         }
 
         bool truncatedToolCall = false;
+        bool truncatedByMaxTokens = false;
         try
         {
             await foreach (var c in ImageContent.Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
@@ -413,6 +426,11 @@ public static class OpenAiEndpoints
                 // text. The streaming response doesn't emit a usage object (OpenAI gates that
                 // behind stream_options.include_usage, unsupported here), so just skip it.
                 if (c.Kind == GenerateChunkKind.Usage) continue;
+                if (c.Kind == GenerateChunkKind.Stop)
+                {
+                    truncatedByMaxTokens = c.TruncatedByMaxTokens;
+                    continue;
+                }
                 tokenCount++;
                 if (c.Kind == GenerateChunkKind.Thinking)
                 {
@@ -469,10 +487,13 @@ public static class OpenAiEndpoints
             }
         }
 
-        // Final chunk with finish_reason
+        // Final chunk with finish_reason. Falls back to the engine's own Stop-chunk signal when
+        // the response was truncated mid-thought/text with no tool call in progress (issue #411
+        // follow-up: this case previously fell through to "stop" unconditionally).
         var finishReason = hasToolCalls
             ? "tool_calls"
-            : truncatedToolCall ? "length" : "stop";
+            : truncatedToolCall ? "length"
+            : truncatedByMaxTokens ? "length" : "stop";
         var finalChunk = new ChatCompletionChunk(
             requestId, "chat.completion.chunk", created, engine.ModelId,
             [new ChunkChoice(0, new ChunkDelta(null, null), finishReason)]);

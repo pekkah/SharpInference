@@ -439,6 +439,132 @@ public sealed class ServerTests : IClassFixture<WebApplicationFactory<Program>>
         Assert.Equal(3, doc.RootElement.GetProperty("usage").GetProperty("completion_tokens").GetInt32());
     }
 
+    // ── finish_reason / stop_reason on MaxNewTokens truncation (issue #411 follow-up) ─────────
+    // Regression coverage for a bug found while validating Ornith-1.0 through the server: a
+    // plain-text/thinking response cut off by the token budget with no tool call in progress
+    // used to always report finish_reason "stop" / stop_reason "end_turn" instead of "length" /
+    // "max_tokens". The engine now emits a GenerateChunkKind.Stop chunk carrying whether the
+    // budget was exhausted; FakeInferenceEngine.TruncatedByMaxTokens simulates it.
+
+    [Fact]
+    public async Task ChatCompletion_NonStreaming_TruncatedByMaxTokens_ReportsLengthFinishReason()
+    {
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(new FakeInferenceEngine(
+                "test-model",
+                [(GenerateChunkKind.Text, "cut off mid-sen")])
+            { TruncatedByMaxTokens = true })));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Write an essay." } },
+            max_tokens = 5,
+            stream = false,
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal("length", doc.RootElement.GetProperty("choices")[0].GetProperty("finish_reason").GetString());
+    }
+
+    [Fact]
+    public async Task ChatCompletion_Streaming_TruncatedByMaxTokens_ReportsLengthFinishReason()
+    {
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(new FakeInferenceEngine(
+                "test-model",
+                [(GenerateChunkKind.Text, "cut off mid-sen")])
+            { TruncatedByMaxTokens = true })));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Write an essay." } },
+            max_tokens = 5,
+            stream = true,
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.Contains("\"finish_reason\":\"length\"", body);
+    }
+
+    [Fact]
+    public async Task Messages_NonStreaming_TruncatedByMaxTokens_ReportsMaxTokensStopReason()
+    {
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(new FakeInferenceEngine(
+                "test-model",
+                [(GenerateChunkKind.Text, "cut off mid-sen")])
+            { TruncatedByMaxTokens = true })));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            max_tokens = 5,
+            messages = new[] { new { role = "user", content = "Write an essay." } },
+        };
+        var response = await client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal("max_tokens", doc.RootElement.GetProperty("stop_reason").GetString());
+    }
+
+    [Fact]
+    public async Task Messages_Streaming_TruncatedByMaxTokens_ReportsMaxTokensStopReason()
+    {
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(new FakeInferenceEngine(
+                "test-model",
+                [(GenerateChunkKind.Text, "cut off mid-sen")])
+            { TruncatedByMaxTokens = true })));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            max_tokens = 5,
+            messages = new[] { new { role = "user", content = "Write an essay." } },
+            stream = true,
+        };
+        var response = await client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.Contains("\"stop_reason\":\"max_tokens\"", body);
+    }
+
+    [Fact]
+    public async Task ChatCompletion_NotTruncated_StillReportsStopFinishReason()
+    {
+        // Guards against a regression where the new Stop-chunk handling accidentally flips
+        // finish_reason to "length" for ordinary, non-truncated completions.
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s => s.AddSingleton<IInferenceEngine>(new FakeInferenceEngine(
+                "test-model",
+                [(GenerateChunkKind.Text, "Hi"), (GenerateChunkKind.Text, "!")])
+            { TruncatedByMaxTokens = false })));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            max_tokens = 10,
+            stream = false,
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal("stop", doc.RootElement.GetProperty("choices")[0].GetProperty("finish_reason").GetString());
+    }
+
     [Fact]
     public async Task ChatCompletion_Streaming_TextOnly_NoReasoningContentDeltas()
     {
@@ -1389,6 +1515,14 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
     /// </summary>
     public TaskCompletionSource? Hold { get; init; }
 
+    /// <summary>
+    /// When set, a <see cref="GenerateChunkKind.Stop"/> chunk with <c>TruncatedByMaxTokens=true</c>
+    /// is emitted after the scripted output — mirroring the real engines' end-of-generation
+    /// signal so endpoint tests can assert <c>finish_reason</c>/<c>stop_reason</c> report
+    /// <c>"length"</c>/<c>"max_tokens"</c> when the budget was exhausted (issue #411 follow-up).
+    /// </summary>
+    public bool TruncatedByMaxTokens { get; init; }
+
     /// <summary>Signaled when a generation call has started (and, if <see cref="Hold"/> is set,
     /// is about to block) — so a test knows the first request is genuinely in flight.</summary>
     public readonly ManualResetEventSlim Entered = new();
@@ -1448,6 +1582,8 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
             await Task.Yield();
             yield return new GenerateChunk(kind, text);
         }
+        if (TruncatedByMaxTokens)
+            yield return new GenerateChunk(GenerateChunkKind.Stop, "", TruncatedByMaxTokens: true);
     }
 
     public async IAsyncEnumerable<GenerateChunk> GenerateImageChunksAsync(
@@ -1468,5 +1604,7 @@ internal sealed class FakeInferenceEngine : IInferenceEngine
             await Task.Yield();
             yield return new GenerateChunk(kind, text);
         }
+        if (TruncatedByMaxTokens)
+            yield return new GenerateChunk(GenerateChunkKind.Stop, "", TruncatedByMaxTokens: true);
     }
 }

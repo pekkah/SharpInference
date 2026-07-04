@@ -188,6 +188,7 @@ public static class AnthropicEndpoints
         var textSb = new StringBuilder();
         int totalOutputTokens = 0;
         int promptTokens = 0;
+        bool truncatedByMaxTokens = false;
 
         try
         {
@@ -196,6 +197,11 @@ public static class AnthropicEndpoints
                 if (chunk.Kind == GenerateChunkKind.Usage)
                 {
                     promptTokens = chunk.PromptTokens;
+                    continue;
+                }
+                if (chunk.Kind == GenerateChunkKind.Stop)
+                {
+                    truncatedByMaxTokens = chunk.TruncatedByMaxTokens;
                     continue;
                 }
                 totalOutputTokens++;
@@ -247,9 +253,12 @@ public static class AnthropicEndpoints
             contentList.Add(new AContent("text", Text: ""));
 
         // A trailing unterminated tool call was surfaced as text (not a tool_use block); report
-        // max_tokens so the client sees it was cut off. Mirrors the streaming path.
+        // max_tokens so the client sees it was cut off. Mirrors the streaming path. Falls back to
+        // the engine's own Stop-chunk signal when the response was truncated mid-thought/text with
+        // no tool call in progress (issue #411 follow-up: was always "end_turn" before).
         var stopReason = toolCalls.Count > 0 ? "tool_use"
-                       : truncatedCall ? "max_tokens" : "end_turn";
+                       : truncatedCall ? "max_tokens"
+                       : truncatedByMaxTokens ? "max_tokens" : "end_turn";
 
         var response = new AnthropicMessageResponse(
             msgId, "message", "assistant",
@@ -437,6 +446,7 @@ public static class AnthropicEndpoints
         }
 
         bool truncatedToolCall = false;
+        bool truncatedByMaxTokens = false;
         try
         {
             await foreach (var chunk in ImageContent.Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
@@ -447,6 +457,11 @@ public static class AnthropicEndpoints
                 if (chunk.Kind == GenerateChunkKind.Usage)
                 {
                     promptTokens = chunk.PromptTokens;
+                    continue;
+                }
+                if (chunk.Kind == GenerateChunkKind.Stop)
+                {
+                    truncatedByMaxTokens = chunk.TruncatedByMaxTokens;
                     continue;
                 }
                 outputTokens++;
@@ -559,10 +574,13 @@ public static class AnthropicEndpoints
             catch (IOException) { /* response stream closed */ }
         }
 
-        // message_delta
+        // message_delta. Falls back to the engine's own Stop-chunk signal when the response was
+        // truncated mid-thought/text with no tool call in progress (issue #411 follow-up: was
+        // always "end_turn" before).
         var stopReason = hasToolCalls
             ? "tool_use"
-            : truncatedToolCall ? "max_tokens" : "end_turn";
+            : truncatedToolCall ? "max_tokens"
+            : truncatedByMaxTokens ? "max_tokens" : "end_turn";
         var msgDelta = new AMessageDeltaEvent("message_delta",
             new AMessageDelta(stopReason, null), new AUsage(promptTokens, outputTokens));
         await WriteAnthropicEvent(ctx.Response, "message_delta",

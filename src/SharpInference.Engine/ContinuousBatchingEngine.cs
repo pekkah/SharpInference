@@ -381,13 +381,17 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                 // begin/end constraining). No-op when this sequence has no constraint.
                 seq.Constraint?.Accept(next);
 
-                bool done = seq.StopIds.Contains(next)
+                bool stoppedByStopToken = seq.StopIds.Contains(next);
+                bool cancelled = seq.Ct.IsCancellationRequested;
+                bool done = stoppedByStopToken
                     || seq.TokenCount >= seq.Sp.MaxNewTokens
-                    || seq.Ct.IsCancellationRequested;
+                    || cancelled;
 
                 if (done)
                 {
-                    FlushAndComplete(seq);
+                    // Only "not a stop token and not cancelled" can mean the MaxNewTokens
+                    // disjunct fired — the three conditions are mutually exhaustive above.
+                    FlushAndComplete(seq, truncatedByMaxTokens: !stoppedByStopToken && !cancelled);
                     RetireSeq(seq);
                     active.RemoveAt(i);
                 }
@@ -684,7 +688,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         Interlocked.Decrement(ref _activeCount);
     }
 
-    private static void FlushAndComplete(ActiveSeq seq)
+    private static void FlushAndComplete(ActiveSeq seq, bool truncatedByMaxTokens = false)
     {
         var textTail = seq.TextDec.Flush();
         if (textTail.Length > 0)
@@ -692,6 +696,7 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         var thinkTail = seq.ThinkDec.Flush();
         if (thinkTail.Length > 0)
             seq.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Thinking, thinkTail));
+        seq.Output.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Stop, "", TruncatedByMaxTokens: truncatedByMaxTokens));
         seq.Output.Writer.TryComplete();
     }
 
