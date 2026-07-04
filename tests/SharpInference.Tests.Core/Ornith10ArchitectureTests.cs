@@ -51,8 +51,10 @@ public sealed class Ornith10ArchitectureTests
         Assert.Equal(LayerType.GatedDeltaNet, hp.LayerTypes[0]);
     }
 
-    // Ornith-1.0-9B: HF arch `qwen3_5` (dense) → GGUF arch `qwen35`. Recognized as a
-    // NEOX-RoPE dense transformer; not MoE, and not hybrid unless GDN tensors are present.
+    // Ornith-1.0-9B: HF arch `qwen3_5` → GGUF arch `qwen35`. Recognized as a NEOX-RoPE
+    // transformer; not MoE. Hybrid GDN activation depends solely on whether GDN tensors
+    // are present in the file (validated below) — this fixture omits them to pin the
+    // plain-dense fallback in isolation.
     [Fact]
     public void Ornith9BDense_IsRecognizedAsNeoxDense()
     {
@@ -77,8 +79,13 @@ public sealed class Ornith10ArchitectureTests
         Assert.Equal(48, hp.NumLayers);
     }
 
-    // If the 9B (or any dense qwen35) ships Gated-DeltaNet tensors, GgufModel.Open
-    // injects `_sharpi.is_hybrid_ssm` and the hybrid path activates automatically.
+    // If the 9B (or any qwen35) ships Gated-DeltaNet tensors, GgufModel.Open injects
+    // `_sharpi.is_hybrid_ssm` and the hybrid path activates automatically. This is NOT
+    // a hypothetical: validated end-to-end (issue #411) against the real bartowski
+    // Ornith-1.0-9B-Q4_K_M.gguf — it does carry GDN tensors, so the "dense" arch name
+    // is misleading; the shipped model actually takes this hybrid path (24 GDN + 8
+    // full-attention layers of 32, full_attention_interval=4), the same shape as the
+    // 35B/397B MoE variants minus the MoE FFN.
     [Fact]
     public void Ornith9BDense_ActivatesHybridWhenGdnTensorsProbed()
     {

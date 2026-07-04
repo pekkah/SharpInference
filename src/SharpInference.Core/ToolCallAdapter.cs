@@ -142,6 +142,7 @@ public static class ToolCallAdapterRegistry
             ["qwen2"]      = new QwenToolCallAdapter("qwen2"),
             ["qwen3"]      = new QwenToolCallAdapter("qwen3"),
             ["qwen3moe"]   = new QwenToolCallAdapter("qwen3moe"),
+            ["qwen35"]     = new QwenToolCallAdapter("qwen35"),
             ["qwen35moe"]  = new QwenToolCallAdapter("qwen35moe"),
 
             // Qwen3-Coder: bare <function=name>...</function> with no <tool_call>

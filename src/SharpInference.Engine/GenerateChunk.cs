@@ -23,6 +23,19 @@ public enum GenerateChunkKind
     /// <see cref="IInferenceEngine.GenerateAsync"/> adapter) ignore it.
     /// </summary>
     Usage,
+
+    /// <summary>
+    /// Out-of-band chunk emitted once, at the very end of a successful (non-cancelled,
+    /// non-errored) generation — after all Text/Thinking chunks. Its
+    /// <see cref="GenerateChunk.Text"/> is empty; <see cref="GenerateChunk.TruncatedByMaxTokens"/>
+    /// tells the caller whether decoding stopped because the token budget
+    /// (<c>SamplingParams.MaxNewTokens</c>) was exhausted rather than a natural stop
+    /// token/EOS. Endpoints use this to report <c>finish_reason: "length"</c> /
+    /// <c>stop_reason: "max_tokens"</c> instead of <c>"stop"</c>/<c>"end_turn"</c> when the
+    /// response was cut off mid-thought with no tool call in progress. Engines that don't
+    /// emit this chunk (e.g. test doubles) leave callers defaulting to "not truncated".
+    /// </summary>
+    Stop,
 }
 
 /// <summary>
@@ -32,7 +45,9 @@ public enum GenerateChunkKind
 /// never emitted as content — they're protocol markers consumed by the engine.
 /// <para>
 /// <see cref="PromptTokens"/> is meaningful only on a <see cref="GenerateChunkKind.Usage"/>
-/// chunk (0 on Text/Thinking chunks).
+/// chunk (0 on Text/Thinking chunks). <see cref="TruncatedByMaxTokens"/> is meaningful only
+/// on a <see cref="GenerateChunkKind.Stop"/> chunk (false on Text/Thinking/Usage chunks).
 /// </para>
 /// </summary>
-public readonly record struct GenerateChunk(GenerateChunkKind Kind, string Text, int PromptTokens = 0);
+public readonly record struct GenerateChunk(
+    GenerateChunkKind Kind, string Text, int PromptTokens = 0, bool TruncatedByMaxTokens = false);

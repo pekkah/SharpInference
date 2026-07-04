@@ -65,13 +65,21 @@ dotnet run --project benchmarks/SharpInference.Bench -c Release -- --filter '*'
 # Ornith-1.0 (DeepReinforce, MIT) — agentic-coding "self-scaffolding" RL finetunes of
 # Qwen3.5 / Gemma 4 bases, NOT a new architecture. Self-scaffolding is a training-time
 # technique; at inference they're ordinary transformers. GGUF arches reduce to ones
-# already dispatched: 9B = dense `qwen35`, 35B/397B = `qwen35moe` (so the MoE variants
-# ride the existing Gated-DeltaNet + sparse-attention MoE path, incl. --cpu-moe, and the
-# qwen35moe QwenToolCallAdapter). They're tagged image-text-to-text, but the Qwen3.5
-# vision projector is unimplemented — the text GGUF path is text-only, which is what the
-# coding use case needs. `download-model.ps1 -Model ornith-9b` (Q4_K_M, ~5.6 GB).
+# already dispatched: 9B = `qwen35`, 35B/397B = `qwen35moe`. Validated end-to-end
+# (issue #411): the bartowski 9B Q4_K_M GGUF actually ships GDN tensors, so
+# `_sharpi.is_hybrid_ssm` auto-activates and it takes the SAME hybrid Gated-DeltaNet +
+# attention path as the 35B/397B MoE variants (24 GDN + 8 full-attention layers,
+# full_attention_interval=4) — not a plain dense transformer as the arch name alone
+# suggests. Full CUDA offload (-g -1) fits comfortably in 8 GB VRAM (~3 GB weights
+# uploaded; GDN state + dense FFN run on CPU by design of CudaHybridGdnForwardPass).
+# Chat template loads via JinjaChatTemplate and tool calls parse via the qwen35moe-style
+# QwenToolCallAdapter (Qwen3.6 XML `<function=..><parameter=..>` inside `<tool_call>`).
+# They're tagged image-text-to-text, but the Qwen3.5 vision projector is unimplemented —
+# the text GGUF path is text-only, which is what the coding use case needs.
+# `download-model.ps1 -Model ornith-9b` (Q4_K_M, 5.5 GB).
 dotnet run --project src/SharpInference.Cli -c Release -- \
-  -m models/deepreinforce-ai_Ornith-1.0-9B-Q4_K_M.gguf -g -1 -p "Write a Python LRU cache."
+  -m models/deepreinforce-ai_Ornith-1.0-9B-Q4_K_M.gguf -g -1 \
+  --temp 0.6 --top-p 0.95 --top-k 20 -p "Write a Python LRU cache."
 
 # Image generation with upscaling (Z-Image-Turbo + RRDBNet). ImageCommand auto-detects
 # Z-Image vs FLUX from the model. Z-Image uses a Qwen3-4B text encoder; FLUX uses CLIP-L + T5.

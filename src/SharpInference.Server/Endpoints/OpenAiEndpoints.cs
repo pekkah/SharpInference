@@ -200,6 +200,7 @@ public static class OpenAiEndpoints
         int textTokens = 0;
         int reasoningTokens = 0;
         int promptTokens = 0;
+        bool truncatedByMaxTokens = false;
 
         try
         {
@@ -208,6 +209,10 @@ public static class OpenAiEndpoints
                 if (c.Kind == GenerateChunkKind.Usage)
                 {
                     promptTokens = c.PromptTokens;
+                }
+                else if (c.Kind == GenerateChunkKind.Stop)
+                {
+                    truncatedByMaxTokens = c.TruncatedByMaxTokens;
                 }
                 else if (c.Kind == GenerateChunkKind.Thinking)
                 {
@@ -258,7 +263,6 @@ public static class OpenAiEndpoints
         }
 
         OaiToolCall[]? toolCalls = null;
-        string finishReason = "stop";
         string? content = plainText;
         if (parsedCalls.Count > 0)
         {
@@ -268,18 +272,15 @@ public static class OpenAiEndpoints
                     Type: "function",
                     Function: new OaiToolCallFunction(c.Name, JinjaChatTemplate.SerializeToJson(c.Arguments))))
                 .ToArray();
-            finishReason = "tool_calls";
             // OpenAI returns content: null when a tool_calls array is present and there
             // was no accompanying text; an empty string would be a wire-shape mismatch.
             if (plainText.Length == 0) content = null;
         }
-        else if (truncatedCall)
-        {
-            // Model hit max_tokens / EOS inside an unterminated tool call. The partial was
-            // surfaced as content by Parse; report length so the client knows it was cut off
-            // and does NOT receive a half-parsed call. Mirrors the streaming path.
-            finishReason = "length";
-        }
+        // truncatedCall: model hit max_tokens / EOS inside an unterminated tool call — the
+        // partial was surfaced as content by Parse, so report length instead of tool_calls.
+        // truncatedByMaxTokens: no tool call in progress, but the budget was exhausted on
+        // plain text/thinking. Mirrors the streaming path.
+        string finishReason = DetermineFinishReason(parsedCalls.Count > 0, truncatedCall, truncatedByMaxTokens);
 
         var message = new OaiAssistantMessage(
             "assistant",
@@ -405,6 +406,7 @@ public static class OpenAiEndpoints
         }
 
         bool truncatedToolCall = false;
+        bool truncatedByMaxTokens = false;
         try
         {
             await foreach (var c in ImageContent.Generate(engine, prompt, canonicalHistoryPrefix, images, sp, ctx.RequestAborted))
@@ -413,6 +415,11 @@ public static class OpenAiEndpoints
                 // text. The streaming response doesn't emit a usage object (OpenAI gates that
                 // behind stream_options.include_usage, unsupported here), so just skip it.
                 if (c.Kind == GenerateChunkKind.Usage) continue;
+                if (c.Kind == GenerateChunkKind.Stop)
+                {
+                    truncatedByMaxTokens = c.TruncatedByMaxTokens;
+                    continue;
+                }
                 tokenCount++;
                 if (c.Kind == GenerateChunkKind.Thinking)
                 {
@@ -470,9 +477,7 @@ public static class OpenAiEndpoints
         }
 
         // Final chunk with finish_reason
-        var finishReason = hasToolCalls
-            ? "tool_calls"
-            : truncatedToolCall ? "length" : "stop";
+        var finishReason = DetermineFinishReason(hasToolCalls, truncatedToolCall, truncatedByMaxTokens);
         var finalChunk = new ChatCompletionChunk(
             requestId, "chat.completion.chunk", created, engine.ModelId,
             [new ChunkChoice(0, new ChunkDelta(null, null), finishReason)]);
@@ -658,6 +663,13 @@ public static class OpenAiEndpoints
         await response.WriteAsync($"data: {data}\n\n", response.HttpContext.RequestAborted);
         await response.Body.FlushAsync(response.HttpContext.RequestAborted);
     }
+
+    /// <summary>Shared priority order for the streaming and non-streaming handlers: a tool call
+    /// in progress always wins, then any form of budget truncation, else a natural stop.</summary>
+    private static string DetermineFinishReason(bool hasToolCalls, bool truncatedCall, bool truncatedByMaxTokens) =>
+        hasToolCalls ? "tool_calls"
+        : truncatedCall || truncatedByMaxTokens ? "length"
+        : "stop";
 }
 
 // ── Request / Response types ──────────────────────────────────────────────────

@@ -943,6 +943,11 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                             // transcript against slot 0 so the next turn's SelectSlot can rematch.
                             if (_slotTokens is not null) _slotTokens[0] = snapMtp;
                         }
+                        // MtpDecoder.Decode never invokes emitToken for the stop token itself
+                        // (documented contract), so decodeTokens reaching MaxNewTokens here means
+                        // the budget was exhausted before a stop token was seen.
+                        channel.Writer.TryWrite(new GenerateChunk(
+                            GenerateChunkKind.Stop, "", TruncatedByMaxTokens: decodeTokens >= sp.MaxNewTokens));
                         channel.Writer.TryComplete();
                         return;
                     }
@@ -981,6 +986,11 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         && sp.LogitBias is not { Count: > 0 }
                         && constraint is null;
                     int gpuNext = useGpuArgmax ? Sampler.Greedy(logits) : 0;
+
+                    // Assume the budget was exhausted unless the loop finds an explicit stop
+                    // token below; that's the only other way out of the loop (cancellation
+                    // throws and skips the Stop-chunk write entirely).
+                    bool hitMaxTokens = true;
 
                     for (int i = 0; i < sp.MaxNewTokens; i++)
                     {
@@ -1025,7 +1035,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         if (ttftMs < 0) ttftMs = swReq.ElapsedMilliseconds;
                         decodeTokens++;
 
-                        if (stopIds.Contains(next)) break;
+                        if (stopIds.Contains(next)) { hitMaxTokens = false; break; }
 
                         // Counter update mirrors RunCommand.DecodeLoop: reset on each <think>
                         // open, otherwise increment whenever inThinking was true on entry to
@@ -1113,6 +1123,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         if (activeSlotIdx >= 0) _slotTokens![activeSlotIdx] = snap;
                     }
 
+                    channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Stop, "", TruncatedByMaxTokens: hitMaxTokens));
                     channel.Writer.TryComplete();
                 }
                 catch (Exception ex)

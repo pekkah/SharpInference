@@ -36,12 +36,14 @@ public interface IInferenceEngine
     /// <summary>
     /// Generate typed chunks from a pre-formatted prompt string. Each chunk is tagged as
     /// user-facing <see cref="GenerateChunkKind.Text"/>, internal
-    /// <see cref="GenerateChunkKind.Thinking"/> reasoning, or a single out-of-band
+    /// <see cref="GenerateChunkKind.Thinking"/> reasoning, a single out-of-band
     /// <see cref="GenerateChunkKind.Usage"/> metadata chunk (emitted once, before any text,
-    /// carrying the prompt-token count). The boundary tokens
-    /// (<c>&lt;think&gt;</c> / <c>&lt;/think&gt;</c>) are consumed by the engine and never
-    /// surface in chunk text. Requests are serialized — concurrent calls block until
-    /// the current request finishes.
+    /// carrying the prompt-token count), or a single out-of-band
+    /// <see cref="GenerateChunkKind.Stop"/> chunk (emitted once, after all text/thinking, on
+    /// any non-cancelled/non-errored completion — carries whether the MaxNewTokens budget
+    /// was exhausted). The boundary tokens (<c>&lt;think&gt;</c> / <c>&lt;/think&gt;</c>) are
+    /// consumed by the engine and never surface in chunk text. Requests are serialized —
+    /// concurrent calls block until the current request finishes.
     /// </summary>
     /// <param name="canonicalHistoryPrefix">
     /// Optional chat-template render of the request's message history rendered with
