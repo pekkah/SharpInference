@@ -24,8 +24,8 @@
     .\download-model.ps1 -Model qwen36-27b-mtp-q5       # Qwen3.6 27B-MTP Q5_K_M (18.5 GB) — higher-quality variant for the MTP bench row
     .\download-model.ps1 -Model qwen36-35b-a3b-mtp -DestDir E:\models  # Qwen3.6 35B-A3B-MTP UD-Q4_K_M (22.7 GB) — MoE MTP perf target for issue #25
     .\download-model.ps1 -Model carnice-35b-a3b-mtp -DestDir E:\models  # Carnice (Qwen3.6-35B-A3B-MTP, agentic/tool-calling) APEX-MTP I-Compact (17.3 GB)
-    .\download-model.ps1 -Model ornith-9b              # Ornith-1.0-9B Q4_K_M (~5.6 GB) — DeepReinforce agentic-coding finetune of Qwen3.5 (dense qwen35 arch)
-    .\download-model.ps1 -Model ornith-35b -DestDir E:\models  # Ornith-1.0-35B Q4_K_M (~21 GB) — agentic-coding MoE on the existing qwen35moe path
+    .\download-model.ps1 -Model ornith-9b              # Ornith-1.0-9B Q4_K_M (5.5 GB) — DeepReinforce agentic-coding finetune of Qwen3.5 (hybrid GDN+attention, qwen35 arch)
+    .\download-model.ps1 -Model ornith-35b -DestDir E:\models  # Ornith-1.0-35B Q4_K_M (19.9 GB) — agentic-coding MoE on the existing qwen35moe path
     .\download-model.ps1 -Model gemma4-12b-qat -DestDir E:\models  # Gemma 4 12B-it QAT q4_0 + vision/audio mmproj (~7.2 GB) — issue #124 PRIMARY (official quantization-aware-trained)
     .\download-model.ps1 -Model gemma4-12b-q4km -DestDir E:\models # Gemma 4 12B-it Q4_K_M (~7.3 GB) — issue #124 fallback / K-quant cross-check
     .\download-model.ps1 -Model gemma4-e4b-qat -DestDir E:\models  # Gemma 4 E4B-it QAT q4_0 (~5.15 GB) — fast small Gemma (~1.6× decode vs Q8_0)
@@ -179,14 +179,19 @@ $Models = @{
     # text GGUF path here is text-only — fine for the agentic-coding use case.)
     #
     # Sources are bartowski's GGUF republishes (deterministic `<ns>_<model>-<Quant>.gguf`
-    # naming). Ornith-1.0-9B is the edge target (43.1 Terminal-Bench 2.1, 69.4 SWE-Bench
-    # Verified). If the 9B GGUF carries GDN tensors the hybrid-SSM probe activates
-    # automatically; otherwise it loads as a plain dense qwen35 transformer.
+    # naming; URLs verified against the live repos 2026-07-04 — both Q4_K_M quants are
+    # single files, only the 35B bf16 is sharded). Ornith-1.0-9B is the edge target (43.1
+    # Terminal-Bench 2.1, 69.4 SWE-Bench Verified). Validated end-to-end (issue #411):
+    # the GGUF DOES carry GDN tensors, so the hybrid-SSM probe activates automatically —
+    # it takes the same hybrid Gated-DeltaNet + attention path as the 35B/397B MoE
+    # variants (24 GDN + 8 full-attention layers), not a plain dense transformer.
+    # -g -1 fits comfortably in 8 GB VRAM.
     "ornith-9b" = @{
         Files = @("deepreinforce-ai_Ornith-1.0-9B-Q4_K_M.gguf")
         Urls  = @("https://huggingface.co/bartowski/deepreinforce-ai_Ornith-1.0-9B-GGUF/resolve/main/deepreinforce-ai_Ornith-1.0-9B-Q4_K_M.gguf")
-        Size  = "~5.6 GB"
-        Phase = "agentic coding (Qwen3.5-based dense, qwen35 arch)"
+        Size  = "5.5 GB"
+        SizeGB = 5.5
+        Phase = "agentic coding (Qwen3.5-based hybrid GDN+attention, qwen35 arch)"
     }
     # Ornith-1.0-35B — qwen35moe (Qwen3.5 35B-A3B base): runs on the existing hybrid
     # Gated-DeltaNet + sparse-attention MoE path (same arch as qwen36-35b-a3b), incl.
@@ -195,7 +200,8 @@ $Models = @{
     "ornith-35b" = @{
         Files = @("deepreinforce-ai_Ornith-1.0-35B-Q4_K_M.gguf")
         Urls  = @("https://huggingface.co/bartowski/deepreinforce-ai_Ornith-1.0-35B-GGUF/resolve/main/deepreinforce-ai_Ornith-1.0-35B-Q4_K_M.gguf")
-        Size  = "~21 GB"
+        Size  = "19.9 GB"
+        SizeGB = 19.9
         Phase = "agentic coding (qwen35moe MoE path)"
     }
     # ── Gemma 4 12B (dense gemma4_unified) — issue #124 ───────────────────────
@@ -361,7 +367,8 @@ function Download-File {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
     }
     if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
-        & curl.exe -L -o $path -C - --progress-bar $url
+        # --fail: without it a 404 saves the HTML error page as the .gguf
+        & curl.exe -L --fail -o $path -C - --progress-bar $url
         if ($LASTEXITCODE -ne 0) { throw "curl exited with code $LASTEXITCODE" }
     }
     else {

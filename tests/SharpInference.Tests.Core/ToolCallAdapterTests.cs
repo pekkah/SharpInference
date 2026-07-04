@@ -17,6 +17,7 @@ public sealed class ToolCallAdapterTests
         Assert.IsType<QwenToolCallAdapter>(ToolCallAdapterRegistry.Get("qwen2"));
         Assert.IsType<QwenToolCallAdapter>(ToolCallAdapterRegistry.Get("qwen3"));
         Assert.IsType<QwenToolCallAdapter>(ToolCallAdapterRegistry.Get("qwen3moe"));
+        Assert.IsType<QwenToolCallAdapter>(ToolCallAdapterRegistry.Get("qwen35"));
         Assert.IsType<QwenToolCallAdapter>(ToolCallAdapterRegistry.Get("qwen35moe"));
     }
 
