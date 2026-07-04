@@ -479,7 +479,10 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             prefilling.Clear();
             foreach (var seq in active)
             {
-                if (fatal is null) FlushAndComplete(seq);
+                // Engine shutdown mid-generation (e.g. Dispose()) cuts these sequences off
+                // involuntarily, not via a natural stop token — report it as truncated so
+                // the client doesn't see a false "stop"/"end_turn" for incomplete content.
+                if (fatal is null) FlushAndComplete(seq, truncatedByMaxTokens: true);
                 else seq.Output.Writer.TryComplete(fatal);
                 seq.Cache.Dispose();
                 Interlocked.Decrement(ref _activeCount);

@@ -253,12 +253,8 @@ public static class AnthropicEndpoints
             contentList.Add(new AContent("text", Text: ""));
 
         // A trailing unterminated tool call was surfaced as text (not a tool_use block); report
-        // max_tokens so the client sees it was cut off. Mirrors the streaming path. Falls back to
-        // the engine's own Stop-chunk signal when the response was truncated mid-thought/text with
-        // no tool call in progress (issue #411 follow-up: was always "end_turn" before).
-        var stopReason = toolCalls.Count > 0 ? "tool_use"
-                       : truncatedCall ? "max_tokens"
-                       : truncatedByMaxTokens ? "max_tokens" : "end_turn";
+        // max_tokens so the client sees it was cut off. Mirrors the streaming path.
+        var stopReason = DetermineStopReason(toolCalls.Count > 0, truncatedCall, truncatedByMaxTokens);
 
         var response = new AnthropicMessageResponse(
             msgId, "message", "assistant",
@@ -574,13 +570,8 @@ public static class AnthropicEndpoints
             catch (IOException) { /* response stream closed */ }
         }
 
-        // message_delta. Falls back to the engine's own Stop-chunk signal when the response was
-        // truncated mid-thought/text with no tool call in progress (issue #411 follow-up: was
-        // always "end_turn" before).
-        var stopReason = hasToolCalls
-            ? "tool_use"
-            : truncatedToolCall ? "max_tokens"
-            : truncatedByMaxTokens ? "max_tokens" : "end_turn";
+        // message_delta
+        var stopReason = DetermineStopReason(hasToolCalls, truncatedToolCall, truncatedByMaxTokens);
         var msgDelta = new AMessageDeltaEvent("message_delta",
             new AMessageDelta(stopReason, null), new AUsage(promptTokens, outputTokens));
         await WriteAnthropicEvent(ctx.Response, "message_delta",
@@ -610,6 +601,13 @@ public static class AnthropicEndpoints
         var b64 = Convert.ToBase64String(bytes);
         return b64.Length > 32 ? b64[..32] : b64;
     }
+
+    /// <summary>Shared priority order for the streaming and non-streaming handlers: a tool call
+    /// in progress always wins, then any form of budget truncation, else a natural end_turn.</summary>
+    private static string DetermineStopReason(bool hasToolCalls, bool truncatedCall, bool truncatedByMaxTokens) =>
+        hasToolCalls ? "tool_use"
+        : truncatedCall || truncatedByMaxTokens ? "max_tokens"
+        : "end_turn";
 
     /// <summary>Pre-built empty JSON object used for the <c>input</c> field of tool_use blocks.</summary>
     private static readonly JsonElement EmptyJsonObject = JsonDocument.Parse("{}").RootElement.Clone();
