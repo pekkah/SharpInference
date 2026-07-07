@@ -414,13 +414,17 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
     {
         var masked = _masked ??= new float[_vocab.VocabSize];
         if (masked.Length != logits.Length) return logits;     // vocab mismatch — never wedge
-        logits.CopyTo(masked);
 
+        // _forbidden (the EOG id set) is tiny (typically 1-5 ids) against a vocab that can be
+        // 150k+ tokens -- fill once (vectorized) and sparsely restore just the EOG logits, instead
+        // of a HashSet.Contains check per vocab entry on this per-token hot path.
+        Array.Fill(masked, float.NegativeInfinity);
         bool anyEog = false;
-        for (int i = 0; i < masked.Length; i++)
+        foreach (int id in _forbidden)
         {
-            if (_forbidden.Contains(i)) { anyEog = true; continue; }
-            masked[i] = float.NegativeInfinity;
+            if ((uint)id >= (uint)masked.Length) continue;
+            masked[id] = logits[id];
+            anyEog = true;
         }
         // No EOG id in this vocabulary (shouldn't happen for a real tokenizer): never wedge.
         return anyEog ? masked : logits;
