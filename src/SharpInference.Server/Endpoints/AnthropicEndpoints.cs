@@ -7,6 +7,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SharpInference.Core;
+using SharpInference.Core.Grammar;
 using SharpInference.Engine;
 
 namespace SharpInference.Server.Endpoints;
@@ -160,12 +161,18 @@ public static class AnthropicEndpoints
 
         // Schema/grammar-constrained tool-argument decoding (issue #374): opt-in. Restricts the
         // sampler to tokens that keep the arguments schema-conformant in the model's native syntax.
+        ITokenConstraint? toolConstraint = null;
         if (req.Tools is { Length: > 0 } && ToolGrammarHelper.Enabled(opts))
         {
             var schemas = ToolGrammarHelper.ToSchemas(req.Tools.Select(t => (t.Name, t.InputSchema)));
-            if (chatTemplate.BuildToolArgumentConstraint(schemas) is { } constraint)
-                sp = sp with { Constraint = constraint };
+            toolConstraint = chatTemplate.BuildToolArgumentConstraint(schemas);
         }
+
+        // Caller-supplied whole-turn output constraint (issue #423): independent of tool schemas,
+        // AND-composed with the tool-argument constraint above rather than one overriding the other.
+        var outputConstraint = opts.OutputConstraintFactory?.Invoke(ctx.RequestServices);
+        if (TokenConstraints.Combine(outputConstraint, toolConstraint) is { } constraint)
+            sp = sp with { Constraint = constraint };
 
         var msgId = $"msg_{Guid.NewGuid():N}";
         var modelId = engine.ModelId;

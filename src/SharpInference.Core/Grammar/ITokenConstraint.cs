@@ -35,7 +35,9 @@ public interface ITokenConstraint
     /// token. The returned span is owned by the constraint and reused across calls — sample from it
     /// immediately. Only valid to call when <see cref="IsConstraining"/> is true. If the grammar
     /// reaches a dead state (no legal token), returns <paramref name="logits"/> unchanged so
-    /// generation never wedges.
+    /// generation never wedges. "Unchanged" means literally returning the same span passed in (not
+    /// a value-equal copy) — composing constraints such as <see cref="AndTokenConstraint"/> rely on
+    /// reference equality to detect a dead-state punt without an O(vocab) comparison.
     /// </summary>
     ReadOnlySpan<float> Filter(ReadOnlySpan<float> logits);
 

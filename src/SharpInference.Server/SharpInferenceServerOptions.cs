@@ -1,3 +1,4 @@
+using SharpInference.Core.Grammar;
 using SharpInference.Engine;
 
 namespace SharpInference.Server;
@@ -48,6 +49,21 @@ public sealed class SharpInferenceServerOptions
     /// unconstrained decoding. Also turned on by the <c>SHARPI_TOOL_GRAMMAR=1</c> environment variable.
     /// </summary>
     public bool ToolGrammar { get; set; }
+
+    /// <summary>
+    /// Optional factory for a caller-supplied, whole-turn output constraint (issue #423) -- the
+    /// output-stream sibling of <see cref="ToolGrammar"/>'s argument-scoped constraint. Invoked once
+    /// per request (via <c>HttpContext.RequestServices</c>) by the chat endpoints; must return a
+    /// <b>fresh</b> instance each call (an <see cref="ITokenConstraint"/> is stateful and
+    /// single-request, the same contract <see cref="ChatTemplateRenderer.BuildToolArgumentConstraint"/>
+    /// already has), or <c>null</c> to leave the turn unconstrained. When a tool call is also active
+    /// and <see cref="ToolGrammar"/> is on, the two constraints are AND-composed (via
+    /// <see cref="TokenConstraints.Combine"/>) rather than one overriding the other. A host resolves
+    /// whatever it needs from the supplied <see cref="IServiceProvider"/> to build the constraint --
+    /// e.g. the loaded model's vocabulary via <see cref="ChatTemplateRenderer.Grammar"/>. <c>null</c>
+    /// (default) = no output-level constraint, byte-identical to the pre-#423 path.
+    /// </summary>
+    public Func<IServiceProvider, ITokenConstraint?>? OutputConstraintFactory { get; set; }
 
     // ── Model loading ────────────────────────────────────────────────────────
 

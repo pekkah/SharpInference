@@ -200,6 +200,18 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [DefaultValue(false)]
         public bool ToolGrammar { get; init; }
 
+        // ── JSON-Schema-constrained output (issue #423 follow-up) ──
+        // Whole-turn structured output, the SharpInference analogue of OpenAI/llama.cpp's
+        // response_format:json_schema. Mirrors llama.cpp's own flag names (-j/--json-schema,
+        // --json-schema-file) where Spectre.Console.Cli can represent them.
+        [CommandOption("-j|--json-schema <SCHEMA>")]
+        [Description("JSON schema to constrain the entire response to (https://json-schema.org/), e.g. '{\"type\":\"object\",\"properties\":{...},\"required\":[...]}' (llama.cpp -j/--json-schema). Root must be an object schema declaring at least one property; unsupported keywords ($ref, oneOf/anyOf, pattern, minLength/maxLength, minimum/maximum) degrade to unconstrained. Mutually exclusive with --json-schema-file.")]
+        public string? JsonSchema { get; init; }
+
+        [CommandOption("--json-schema-file|--jf <PATH>")]
+        [Description("File containing a JSON schema to constrain the entire response to (llama.cpp --json-schema-file/-jf; alias --jf since llama.cpp's single-dash -jf isn't representable: Spectre short options must be one character). Mutually exclusive with --json-schema.")]
+        public string? JsonSchemaFile { get; init; }
+
         // ── MoE expert-cache tuning (offloaded MoE models) ──
         // Good defaults are automatic: frequency-aware SLRU eviction, VRAM-sized cache,
         // and next-layer predictive prefetch are all ON without any flag. These knobs only
@@ -268,6 +280,80 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         error = null;
         return true;
+    }
+
+    /// <summary>
+    /// Builds a whole-turn <see cref="JsonSchemaOutputConstraint"/> (issue #423 follow-up) from
+    /// <c>--json-schema</c> (inline) or <c>--json-schema-file</c>/<c>--jf</c> (file), or leaves
+    /// <paramref name="constraint"/> <c>null</c> when neither flag is given. Returns <c>false</c>
+    /// (with <paramref name="error"/> set) on mutual exclusivity, a missing/unreadable file,
+    /// malformed JSON, or a schema that can't be compiled to a constraint -- an explicit schema
+    /// request is a hard requirement, so failures are reported rather than silently ignored.
+    /// </summary>
+    internal static bool TryLoadJsonSchemaConstraint(
+        string? inlineSchema, string? schemaFilePath, GrammarVocabulary vocab,
+        out ITokenConstraint? constraint, out string? error)
+    {
+        constraint = null;
+        error = null;
+
+        if (inlineSchema is { Length: > 0 } && schemaFilePath is { Length: > 0 })
+        {
+            error = "--json-schema and --json-schema-file/--jf are mutually exclusive; pass only one.";
+            return false;
+        }
+
+        string schemaText;
+        if (schemaFilePath is { Length: > 0 })
+        {
+            if (!File.Exists(schemaFilePath))
+            {
+                error = $"schema file not found: {schemaFilePath}";
+                return false;
+            }
+            try
+            {
+                schemaText = File.ReadAllText(schemaFilePath);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                                          or System.Security.SecurityException or NotSupportedException)
+            {
+                error = $"could not read --json-schema-file: {ex.Message}";
+                return false;
+            }
+        }
+        else if (inlineSchema is { Length: > 0 })
+        {
+            schemaText = inlineSchema;
+        }
+        else
+        {
+            return true;   // neither flag given -- no-op
+        }
+
+        JsonElement root;
+        try
+        {
+            using var doc = JsonDocument.Parse(schemaText);
+            root = doc.RootElement.Clone();
+        }
+        catch (JsonException ex)
+        {
+            error = $"could not parse JSON schema: {ex.Message}";
+            return false;
+        }
+
+        try
+        {
+            var schemaObject = ToolSchema.FromOpenAiFunction("_", root).Arguments;
+            constraint = new JsonSchemaOutputConstraint(vocab, schemaObject);
+            return true;
+        }
+        catch (ArgumentException ex)
+        {
+            error = $"--json-schema could not be compiled: {ex.Message}";
+            return false;
+        }
     }
 
     protected override int Execute(CommandContext context, Settings settings, CancellationToken cancellation)
@@ -831,6 +917,9 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         // --tools advertises OpenAI-format tool definitions to the model via its chat template;
         // --tool-grammar additionally constrains the argument bytes to the supplied JSON Schemas
         // (issue #374) for families with constraint support. Both are single-prompt features.
+        // Shared by --json-schema/--json-schema-file below (issue #423 follow-up) -- constructing
+        // this is free even when unused (the expensive per-token byte table builds lazily).
+        var grammarVocab = new GrammarVocabulary(tokenizer);
         List<ToolSchema>? toolSchemas = null;
         ITokenConstraint? toolConstraint = null;
         int[] toolBoundaryStops = [];
@@ -868,7 +957,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
             if (settings.ToolGrammar)
             {
-                toolConstraint = adapter.BuildArgumentConstraint(toolSchemas, new GrammarVocabulary(tokenizer));
+                toolConstraint = adapter.BuildArgumentConstraint(toolSchemas, grammarVocab);
                 AnsiConsole.MarkupLine(toolConstraint is not null
                     ? "[dim]Tool-call arguments are grammar-constrained (issue #374).[/]"
                     : $"[yellow]Warning:[/] --tool-grammar has no effect for arch '{s_arch}' (no constraint support, or no supplied tool is constrainable); arguments generate unconstrained.");
@@ -877,6 +966,23 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         else if (settings.ToolGrammar)
         {
             AnsiConsole.MarkupLine("[yellow]Warning:[/] --tool-grammar requires --tools (a schema to constrain against); ignoring.");
+        }
+
+        // ── JSON-Schema-constrained output (issue #423 follow-up) ─────────────────
+        if (!TryLoadJsonSchemaConstraint(settings.JsonSchema, settings.JsonSchemaFile, grammarVocab,
+                out ITokenConstraint? jsonSchemaConstraint, out string? jsonSchemaError))
+        {
+            AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(jsonSchemaError!)}");
+            return 1;
+        }
+        if (jsonSchemaConstraint is not null)
+        {
+            AnsiConsole.MarkupLine("[dim]Response is constrained to the supplied JSON schema.[/]");
+            if (toolConstraint is not null)
+                AnsiConsole.MarkupLine(
+                    "[yellow]Warning:[/] --json-schema/--json-schema-file combined with --tool-grammar likely " +
+                    "makes tool calls unreachable (the schema constrains the whole response from the first " +
+                    "token) — use one or the other.");
         }
 
         var sp = new SamplingParams
@@ -894,7 +1000,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             SpecDraftNMax = settings.SpecDraftNMax,
             SpecDraftNMin = settings.SpecDraftNMin,
             SpecDraftPMin = settings.SpecDraftPMin,
-            Constraint = toolConstraint,
+            Constraint = TokenConstraints.Combine(jsonSchemaConstraint, toolConstraint),
         };
         var rng = settings.Seed >= 0 ? new Random(settings.Seed) : new Random();
 
@@ -904,12 +1010,13 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         // offload hybrids fall back to normal generation: without a batched verify,
         // speculation costs k sequential target forwards per step and is never a win.
         bool specRequested = settings.DraftModelPath is not null || settings.DraftLookup;
-        if (specRequested && toolConstraint is not null)
+        if (specRequested && sp.Constraint is not null)
         {
-            // The constraint masks one token at a time against the running argument state; a
-            // multi-token speculative verify can't honor it. Drop speculation so the constraint
-            // actually applies (the standard decode path below reads sp.Constraint).
-            AnsiConsole.MarkupLine("[yellow]Warning:[/] --tool-grammar is not applied with speculative decoding (--draft-model/--draft-lookup); generating without speculation so the argument constraint takes effect.");
+            // Any active constraint (--tool-grammar and/or --json-schema/--json-schema-file, issue
+            // #423 follow-up) masks one token at a time against running grammar state; a multi-token
+            // speculative verify can't honor it. Drop speculation so the constraint actually applies
+            // (the standard decode path below reads sp.Constraint).
+            AnsiConsole.MarkupLine("[yellow]Warning:[/] --tool-grammar/--json-schema is not applied with speculative decoding (--draft-model/--draft-lookup); generating without speculation so the constraint takes effect.");
             specRequested = false;
         }
         if (specRequested)

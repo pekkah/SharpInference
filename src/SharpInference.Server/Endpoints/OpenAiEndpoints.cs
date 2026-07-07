@@ -8,6 +8,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SharpInference.Core;
+using SharpInference.Core.Grammar;
 using SharpInference.Engine;
 
 namespace SharpInference.Server.Endpoints;
@@ -169,14 +170,80 @@ public static class OpenAiEndpoints
         // Schema/grammar-constrained tool-argument decoding (issue #374): opt-in, and skipped when
         // the client forces no tool use (tool_choice:"none"). Restricts the sampler to tokens that
         // keep the arguments schema-conformant in the model's native call syntax.
+        ITokenConstraint? toolConstraint = null;
         if (toolsActive && req.Tools is { Length: > 0 } && ToolGrammarHelper.Enabled(opts)
             && !IsToolChoiceNone(req.ToolChoice))
         {
             var schemas = ToolGrammarHelper.ToSchemas(
                 req.Tools.Select(t => (t.Function?.Name, t.Function?.Parameters)));
-            if (chatTemplate.BuildToolArgumentConstraint(schemas) is { } constraint)
-                sp = sp with { Constraint = constraint };
+            toolConstraint = chatTemplate.BuildToolArgumentConstraint(schemas);
         }
+
+        // Whole-turn JSON-Schema-constrained output (issue #423 follow-up): the SharpInference
+        // analogue of OpenAI/llama.cpp's response_format:json_schema (and llama.cpp's flat
+        // json_object.schema extension). An explicit schema request is a hard requirement, so
+        // failures return 400 rather than silently generating unconstrained output.
+        ITokenConstraint? jsonSchemaConstraint = null;
+        JsonElement? requestedSchema = null;
+        if (req.ResponseFormat?.Type == "json_schema")
+        {
+            // Unlike "json_object" (below), a schema is REQUIRED here -- the client explicitly asked
+            // for schema-constrained output, so a missing json_schema.schema is a client error, not a
+            // silent no-op (issue #423 follow-up: an explicit schema request is a hard requirement).
+            if (req.ResponseFormat.JsonSchema?.Schema is { } s)
+                requestedSchema = s;
+            else
+            {
+                ctx.Response.StatusCode = 400;
+                ctx.Response.ContentType = "application/json";
+                await ctx.Response.WriteAsync(
+                    JsonSerializer.Serialize(new ErrorResponse("invalid_request_error",
+                            "response_format.type is \"json_schema\" but no json_schema.schema was provided."),
+                        SharpInferenceJsonContext.Default.ErrorResponse), ctx.RequestAborted);
+                return;
+            }
+        }
+        else if (req.ResponseFormat?.Type == "json_object")
+        {
+            // llama.cpp's flat extension: an optional schema alongside the plain "valid JSON" request.
+            // Absent here just means "valid JSON, no shape enforced" -- the pre-existing behavior.
+            requestedSchema = req.ResponseFormat.Schema;
+        }
+        if (requestedSchema is { } schemaElement)
+        {
+            if (chatTemplate.Grammar is not { } vocab)
+            {
+                ctx.Response.StatusCode = 400;
+                ctx.Response.ContentType = "application/json";
+                await ctx.Response.WriteAsync(
+                    JsonSerializer.Serialize(new ErrorResponse("invalid_request_error",
+                            "response_format.json_schema requires a loaded model vocabulary, which isn't available for this engine."),
+                        SharpInferenceJsonContext.Default.ErrorResponse), ctx.RequestAborted);
+                return;
+            }
+            try
+            {
+                var schemaObject = ToolSchema.FromOpenAiFunction("_", schemaElement).Arguments;
+                jsonSchemaConstraint = new JsonSchemaOutputConstraint(vocab, schemaObject);
+            }
+            catch (ArgumentException ex)
+            {
+                ctx.Response.StatusCode = 400;
+                ctx.Response.ContentType = "application/json";
+                await ctx.Response.WriteAsync(
+                    JsonSerializer.Serialize(new ErrorResponse("invalid_request_error",
+                            $"response_format.json_schema could not be compiled: {ex.Message}"),
+                        SharpInferenceJsonContext.Default.ErrorResponse), ctx.RequestAborted);
+                return;
+            }
+        }
+
+        // Caller-supplied whole-turn output constraint (issue #423): independent of tool schemas,
+        // AND-composed with the tool-argument and json-schema constraints above rather than one
+        // overriding the others.
+        var outputConstraint = opts.OutputConstraintFactory?.Invoke(ctx.RequestServices);
+        if (TokenConstraints.Combine(outputConstraint, jsonSchemaConstraint, toolConstraint) is { } constraint)
+            sp = sp with { Constraint = constraint };
 
         var requestId = $"chatcmpl-{Guid.NewGuid():N}";
         long created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -790,6 +857,18 @@ public sealed record OaiToolCallDelta(
 public sealed record ModelsResponse(string Object, ModelInfo[] Data);
 public sealed record ModelInfo(string Id, string Object, long Created, string OwnedBy);
 
-public sealed record ResponseFormat(string? Type);
+/// <summary>
+/// OpenAI <c>response_format</c> (issue #423 follow-up). <c>type:"json_schema"</c> follows OpenAI's
+/// own nested wire shape (<see cref="JsonSchema"/>.Schema); <c>type:"json_object"</c> additionally
+/// accepts a flat <see cref="Schema"/> (llama.cpp's <c>response_format.schema</c> extension) for a
+/// schema without the OpenAI envelope's <c>name</c>/<c>strict</c>. Either shape, when a schema is
+/// present, constrains the whole response via <see cref="SharpInference.Core.Grammar.JsonSchemaOutputConstraint"/>.
+/// </summary>
+public sealed record ResponseFormat(string? Type, JsonSchemaSpec? JsonSchema = null, JsonElement? Schema = null);
+
+/// <summary>OpenAI's <c>response_format.json_schema</c> envelope. Only <see cref="Schema"/> is
+/// consumed; <see cref="Name"/>/<see cref="Strict"/> round-trip but aren't validated (matching
+/// llama.cpp's own server behavior).</summary>
+public sealed record JsonSchemaSpec(string? Name, JsonElement? Schema, bool? Strict = null);
 
 public sealed record ErrorResponse(string Type, string Message);
