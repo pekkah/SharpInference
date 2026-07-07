@@ -36,6 +36,7 @@ namespace SharpInference.Server;
 [JsonSerializable(typeof(ModelInfo[]))]
 [JsonSerializable(typeof(ErrorResponse))]
 [JsonSerializable(typeof(ResponseFormat))]
+[JsonSerializable(typeof(JsonSchemaSpec))]
 [JsonSerializable(typeof(AnthropicMessageRequest))]
 [JsonSerializable(typeof(AnthropicThinking))]
 [JsonSerializable(typeof(AnthropicTool))]

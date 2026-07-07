@@ -64,6 +64,16 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
     private readonly byte[][] _argsKeys;            // NameValueObject: "arguments"/"parameters" bytes
     private static readonly byte[] s_nameKey = Encoding.UTF8.GetBytes("name");
 
+    // Whole-body mode (issue #423 follow-up, JsonSchemaOutputConstraint): when set, there is no
+    // envelope/preamble at all -- the object is constrained from the very first token. Reset() must
+    // re-engage immediately rather than return to the watching-idle state (see Reset() below).
+    private readonly CompiledObject? _wholeBodyRoot;
+
+    // Whole-body mode only: set once the root object closes successfully. From here on Filter()
+    // forces EOG-only (no further content is legal) instead of returning to the tool-argument path's
+    // "watching" idle state -- "the ENTIRE response" means nothing may follow the object.
+    private bool _wholeBodyDone;
+
     // Watching / preamble state.
     private bool _armed;                            // saw the open marker, scanning the preamble
     private int _watchState;                        // preamble FSM state (W* constants)
@@ -128,16 +138,45 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
         }
     }
 
-    /// <summary>Whether this constraint can ever restrict anything (any tool was constrainable).</summary>
-    public bool HasConstrainableTools => _tools.Count > 0;
+    /// <summary>
+    /// Whole-body mode (issue #423 follow-up): constrains the ENTIRE output to
+    /// <paramref name="wholeBodyRoot"/> from the first token — no tool-call envelope, no preamble.
+    /// Used via <see cref="ForWholeBody"/> by <see cref="JsonSchemaOutputConstraint"/>.
+    /// </summary>
+    private JsonToolArgumentConstraint(GrammarVocabulary vocab, CompiledObject wholeBodyRoot)
+    {
+        ArgumentNullException.ThrowIfNull(vocab);
+        ArgumentNullException.ThrowIfNull(wholeBodyRoot);
+        _vocab = vocab;
+        _envelope = JsonToolEnvelope.NameValueObject;   // unused in this mode
+        _argsKeys = [];
+        _forbidden = new HashSet<int>(vocab.EogTokenIds);
+        _openMarkerId = 0;
+        _separatorId = -1;
+        _tools = new Dictionary<string, CompiledObject>(StringComparer.Ordinal);
+        _wholeBodyRoot = wholeBodyRoot;
+        Reset();
+    }
 
-    public bool IsConstraining => _depth > 0;
+    /// <summary>Builds a whole-body constraint (see the private ctor above) for <see cref="JsonSchemaOutputConstraint"/>.</summary>
+    internal static JsonToolArgumentConstraint ForWholeBody(GrammarVocabulary vocab, CompiledObject root) =>
+        new(vocab, root);
+
+    /// <summary>Whether this constraint can ever restrict anything (any tool was constrainable, or
+    /// whole-body mode is active).</summary>
+    public bool HasConstrainableTools => _tools.Count > 0 || _wholeBodyRoot is not null;
+
+    public bool IsConstraining => _depth > 0 || _wholeBodyDone;
 
     public void Reset()
     {
         _armed = false;
         _depth = 0;
+        _wholeBodyDone = false;
         ResetPreamble();
+        // Whole-body mode has no envelope to watch for -- re-engage immediately so the very first
+        // token of the (new) generation is already constrained, rather than going permanently inert.
+        if (_wholeBodyRoot is not null) PushObject(_wholeBodyRoot, OExpectOpenBrace);
     }
 
     private void ResetPreamble()
@@ -265,6 +304,12 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
 
     public void Accept(int token)
     {
+        if (_wholeBodyDone)
+        {
+            // Terminal state: Filter() only ever offered EOG ids here, so there's nothing further
+            // to track regardless of what was actually sampled.
+            return;
+        }
         if (IsConstraining)
         {
             bool ok = !_forbidden.Contains(token) && RunToken(token);
@@ -275,7 +320,14 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
                 WarnOnce("accept-divergence",
                     "a sampled token permitted by the mask was rejected by the grammar — constraint "
                     + "disabled for the rest of this call (possible Filter/Accept divergence).");
-            if (!ok || _depth == 0) { _depth = 0; _armed = false; ResetPreamble(); }
+            if (ok && _depth == 0 && _wholeBodyRoot is not null)
+            {
+                // Whole-body mode's root object closed successfully: force EOG-only for the rest of
+                // the turn instead of returning to the tool-argument path's "watching" idle state,
+                // which has no envelope to (re-)arm on in this mode anyway.
+                _wholeBodyDone = true;
+            }
+            else if (!ok || _depth == 0) { _depth = 0; _armed = false; ResetPreamble(); }
             return;
         }
 
@@ -335,6 +387,7 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
 
     public ReadOnlySpan<float> Filter(ReadOnlySpan<float> logits)
     {
+        if (_wholeBodyDone) return FilterEogOnly(logits);
         if (_depth == 0) return logits;
 
         var masked = _masked ??= new float[_vocab.VocabSize];
@@ -351,6 +404,26 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
             return logits;
         }
         return masked;
+    }
+
+    /// <summary>Whole-body mode's terminal state (after the root object closed): only an
+    /// end-of-generation token is legal, so nothing can follow the object. Reuses
+    /// <see cref="_forbidden"/> (the EOG id set) as the allow-list here, inverted from its normal
+    /// "never legal inside the object" meaning.</summary>
+    private ReadOnlySpan<float> FilterEogOnly(ReadOnlySpan<float> logits)
+    {
+        var masked = _masked ??= new float[_vocab.VocabSize];
+        if (masked.Length != logits.Length) return logits;     // vocab mismatch — never wedge
+        logits.CopyTo(masked);
+
+        bool anyEog = false;
+        for (int i = 0; i < masked.Length; i++)
+        {
+            if (_forbidden.Contains(i)) { anyEog = true; continue; }
+            masked[i] = float.NegativeInfinity;
+        }
+        // No EOG id in this vocabulary (shouldn't happen for a real tokenizer): never wedge.
+        return anyEog ? masked : logits;
     }
 
     /// <summary>Sets every forbidden token to -inf in <paramref name="buf"/>; returns the count kept.</summary>

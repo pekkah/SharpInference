@@ -117,6 +117,15 @@ public sealed class ChatTemplateRenderer
     /// </summary>
     private GrammarVocabulary? _grammarVocabulary;
 
+    /// <summary>
+    /// Public view of <see cref="_grammarVocabulary"/> (issue #423), so a host's
+    /// <see cref="SharpInferenceServerOptions.OutputConstraintFactory"/> can build a
+    /// vocabulary-aware whole-turn constraint the same way <see cref="BuildToolArgumentConstraint"/>
+    /// builds tool-argument constraints. Null until the model is loaded, or when a custom engine
+    /// factory supplied no vocabulary.
+    /// </summary>
+    public GrammarVocabulary? Grammar => _grammarVocabulary;
+
     /// <param name="architecture">Default architecture (used both for fallback and exposed via <see cref="Architecture"/>).</param>
     /// <param name="template">Optional compiled Jinja template; null means "use the hardcoded fallback".</param>
     public ChatTemplateRenderer(string architecture = "qwen2", JinjaChatTemplate? template = null)
