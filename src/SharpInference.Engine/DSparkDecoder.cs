@@ -30,6 +30,10 @@ public sealed class DSparkDecoder
 
     private int _nextPos;
     private readonly float[] _savedLogits;
+    // #219 fast-path carry: on the argmax verify path only the next certain
+    // token's index is carried, not full logits (mirrors MtpDecoder).
+    private int _savedArgmax;
+    private bool _hasSavedArgmax;
     private float[] _tapScratch = [];
 
     private long _totalDraftsEmitted;
@@ -122,6 +126,7 @@ public sealed class DSparkDecoder
                 "called BEFORE Prefill.");
 
         lastMainLogits.CopyTo(_savedLogits);
+        _hasSavedArgmax = false;
         _nextPos = promptLength;
         _draft.ResetContext();
         AppendTapsRange(0, promptLength);
@@ -154,7 +159,7 @@ public sealed class DSparkDecoder
             if (P >= _target.MaxSeqLen || P >= _draft.MaxContext) return;
 
             // ── Certain token: argmax of the saved logits ─────────────
-            int t1 = ArgMax(_savedLogits);
+            int t1 = _hasSavedArgmax ? _savedArgmax : ArgMax(_savedLogits);
             if (IsStop(t1, stopTokenIds)) return;
             emitToken(t1); generated++;
 
@@ -193,10 +198,18 @@ public sealed class DSparkDecoder
             for (int i = 0; i < kDraft; i++) tokens[i + 1] = proposal.Tokens[i];
             _totalDraftsEmitted += kDraft;
 
-            // ── ONE batched target verify over tokens[0..k] ───────────
+            // ── ONE batched target verify over tokens[0..k]. Greedy verify only
+            //    needs per-position argmaxes, so passes with a device-side row
+            //    argmax (#219) skip the k×vocab logits download entirely. ──
             _phaseSw.Restart();
-            float[][] batch = VerifyTokens(tokens, P);
+            bool argmaxFast = _target.SupportsBatchVerify && _target.SupportsBatchVerifyArgmax;
+            float[][]? batch = null;
+            (int Index, float Value)[]? verifyArgmax = null;
+            if (argmaxFast) verifyArgmax = _target.BatchVerifyArgmax(tokens, P);
+            else            batch = VerifyTokens(tokens, P);
             VerifyMs += _phaseSw.Elapsed.TotalMilliseconds;
+
+            int Target(int pos) => argmaxFast ? verifyArgmax![pos].Index : ArgMax(batch![pos]);
 
             // ── Greedy accept: leading argmax-matching drafts. An accepted
             //    STOP draft ends the chain, EXCLUDED from `a` (neither emitted
@@ -205,7 +218,7 @@ public sealed class DSparkDecoder
             bool stopHit = false;
             for (int i = 1; i <= kDraft; i++)
             {
-                if (tokens[i] != ArgMax(batch[i - 1])) break;
+                if (tokens[i] != Target(i - 1)) break;
                 if (IsStop(tokens[i], stopTokenIds)) { stopHit = true; break; }
                 a++;
             }
@@ -224,9 +237,10 @@ public sealed class DSparkDecoder
                 emitToken(tokens[i]); generated++;
             }
 
-            // batch[a] predicts position newPos: the correction on a reject,
-            // the continuation on full accept, or the (un-emitted) stop.
-            batch[a].CopyTo(_savedLogits, 0);
+            // Position `a`'s verify result predicts newPos: the correction on a
+            // reject, the continuation on full accept, or the (un-emitted) stop.
+            if (argmaxFast) { _savedArgmax = verifyArgmax![a].Index; _hasSavedArgmax = true; }
+            else            { batch![a].CopyTo(_savedLogits, 0); _hasSavedArgmax = false; }
             _nextPos = newPos;
             if (stopHit) return;
         }

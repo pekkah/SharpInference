@@ -41,17 +41,16 @@ public sealed unsafe class DSparkDraftModel : IDSparkDraft
     private float* _hiddenNormW;   // [embDim]
     private float* _finalNormW;    // [embDim]
     private float* _lmHead;        // [vocab, embDim]
-    private float* _markovW2;      // [vocab, rank] (bias[v] = dot(w2[v], w1[prev]))
-    private float* _confW;         // [embDim + rank] or [embDim]; null when no head
-    private float _confB;
     private readonly float*[] _wq, _wk, _wv, _wo;          // [qDim|kvDim|kvDim, embDim], [embDim, qDim]
     private readonly float*[] _qNormW, _kNormW;            // [headDim]
     private readonly float*[] _inNormW, _ffnNormW;         // [embDim]
     private readonly float*[] _wGate, _wUp, _wDown;        // [interm, embDim] ×2, [embDim, interm]
 
-    // Row-gathered tables in storage dtype (BF16 kept raw; F32 checkpoints kept F32).
+    // Sequential heads (Markov re-bias + confidence), shared with the CUDA backbone.
+    private DSparkHostHeads? _heads;
+
+    // Row-gathered table in storage dtype (BF16 kept raw; F32 checkpoints kept F32).
     private ushort* _embedBf16; private float* _embedF32;      // [vocab, embDim]
-    private ushort* _markovW1Bf16; private float* _markovW1F32; // [vocab, rank]
 
     // RoPE tables [maxCtx + block, headDim/2].
     private float* _ropeCos, _ropeSin;
@@ -70,9 +69,7 @@ public sealed unsafe class DSparkDraftModel : IDSparkDraft
     private float* _kBlock, _vBlock;             // [block, kvDim]
     private float* _attnOut;                     // [block, qDim]
     private float* _gate, _up;                   // [block, interm]
-    private float* _logits, _bias;               // [vocab]
-    private float* _w1Rows;                      // [block, rank] — markov_w1[prev_j] per position
-    private float* _confFeat;                    // [embDim + rank]
+    private float* _baseLogits;                  // [block, vocab]
     private bool _disposed;
 
     public int BlockSize => _block;
@@ -117,43 +114,28 @@ public sealed unsafe class DSparkDraftModel : IDSparkDraft
 
         try
         {
-            _fc = LoadF32(weights, "fc.weight", [_embDim, _tapDim]);
-            _hiddenNormW = LoadF32(weights, "hidden_norm.weight", [_embDim]);
-            _finalNormW = LoadF32(weights, "norm.weight", [_embDim]);
-            _lmHead = LoadF32(weights, "lm_head.weight", [_vocab, _embDim]);
-            LoadRowTable(weights, "embed_tokens.weight", [_vocab, _embDim],
+            _fc = DSparkWeightLoading.LoadF32(weights, "fc.weight", [_embDim, _tapDim]);
+            _hiddenNormW = DSparkWeightLoading.LoadF32(weights, "hidden_norm.weight", [_embDim]);
+            _finalNormW = DSparkWeightLoading.LoadF32(weights, "norm.weight", [_embDim]);
+            _lmHead = DSparkWeightLoading.LoadF32(weights, "lm_head.weight", [_vocab, _embDim]);
+            DSparkWeightLoading.LoadRowTable(weights, "embed_tokens.weight", [_vocab, _embDim],
                 out _embedBf16, out _embedF32);
 
-            if (_rank > 0)
-            {
-                _markovW2 = LoadF32(weights, "markov_head.markov_w2.weight", [_vocab, _rank]);
-                LoadRowTable(weights, "markov_head.markov_w1.weight", [_vocab, _rank],
-                    out _markovW1Bf16, out _markovW1F32);
-            }
-
-            if (cfg.EnableConfidenceHead)
-            {
-                int confIn = _embDim + (cfg.ConfidenceHeadWithMarkov ? _rank : 0);
-                _confW = LoadF32(weights, "confidence_head.proj.weight", [1, confIn]);
-                var b = weights.ReadF32("confidence_head.proj.bias");
-                if (b.Length != 1)
-                    throw new InvalidDataException("confidence_head.proj.bias must be a scalar.");
-                _confB = b[0];
-            }
+            _heads = new DSparkHostHeads(cfg, weights);
 
             for (int l = 0; l < L; l++)
             {
-                _wq[l] = LoadF32(weights, $"layers.{l}.self_attn.q_proj.weight", [_qDim, _embDim]);
-                _wk[l] = LoadF32(weights, $"layers.{l}.self_attn.k_proj.weight", [_kvDim, _embDim]);
-                _wv[l] = LoadF32(weights, $"layers.{l}.self_attn.v_proj.weight", [_kvDim, _embDim]);
-                _wo[l] = LoadF32(weights, $"layers.{l}.self_attn.o_proj.weight", [_embDim, _qDim]);
-                _qNormW[l] = LoadF32(weights, $"layers.{l}.self_attn.q_norm.weight", [_headDim]);
-                _kNormW[l] = LoadF32(weights, $"layers.{l}.self_attn.k_norm.weight", [_headDim]);
-                _inNormW[l] = LoadF32(weights, $"layers.{l}.input_layernorm.weight", [_embDim]);
-                _ffnNormW[l] = LoadF32(weights, $"layers.{l}.post_attention_layernorm.weight", [_embDim]);
-                _wGate[l] = LoadF32(weights, $"layers.{l}.mlp.gate_proj.weight", [_interm, _embDim]);
-                _wUp[l] = LoadF32(weights, $"layers.{l}.mlp.up_proj.weight", [_interm, _embDim]);
-                _wDown[l] = LoadF32(weights, $"layers.{l}.mlp.down_proj.weight", [_embDim, _interm]);
+                _wq[l] = DSparkWeightLoading.LoadF32(weights, $"layers.{l}.self_attn.q_proj.weight", [_qDim, _embDim]);
+                _wk[l] = DSparkWeightLoading.LoadF32(weights, $"layers.{l}.self_attn.k_proj.weight", [_kvDim, _embDim]);
+                _wv[l] = DSparkWeightLoading.LoadF32(weights, $"layers.{l}.self_attn.v_proj.weight", [_kvDim, _embDim]);
+                _wo[l] = DSparkWeightLoading.LoadF32(weights, $"layers.{l}.self_attn.o_proj.weight", [_embDim, _qDim]);
+                _qNormW[l] = DSparkWeightLoading.LoadF32(weights, $"layers.{l}.self_attn.q_norm.weight", [_headDim]);
+                _kNormW[l] = DSparkWeightLoading.LoadF32(weights, $"layers.{l}.self_attn.k_norm.weight", [_headDim]);
+                _inNormW[l] = DSparkWeightLoading.LoadF32(weights, $"layers.{l}.input_layernorm.weight", [_embDim]);
+                _ffnNormW[l] = DSparkWeightLoading.LoadF32(weights, $"layers.{l}.post_attention_layernorm.weight", [_embDim]);
+                _wGate[l] = DSparkWeightLoading.LoadF32(weights, $"layers.{l}.mlp.gate_proj.weight", [_interm, _embDim]);
+                _wUp[l] = DSparkWeightLoading.LoadF32(weights, $"layers.{l}.mlp.up_proj.weight", [_interm, _embDim]);
+                _wDown[l] = DSparkWeightLoading.LoadF32(weights, $"layers.{l}.mlp.down_proj.weight", [_embDim, _interm]);
             }
 
             int ropePositions = _maxCtx + _block;
@@ -170,10 +152,7 @@ public sealed unsafe class DSparkDraftModel : IDSparkDraft
             _attnOut = Alloc((long)_block * _qDim);
             _gate = Alloc((long)_block * _interm);
             _up = Alloc((long)_block * _interm);
-            _logits = Alloc(_vocab);
-            _bias = Alloc(_vocab);
-            _w1Rows = Alloc((long)_block * Math.Max(_rank, 1));
-            _confFeat = Alloc(_embDim + Math.Max(_rank, 1));
+            _baseLogits = Alloc((long)_block * _vocab);
         }
         catch
         {
@@ -342,49 +321,14 @@ public sealed unsafe class DSparkDraftModel : IDSparkDraft
             SimdKernels.RmsNorm(_x + (long)j * _embDim, _x + (long)j * _embDim,
                 _finalNormW, _embDim, _eps);
 
-        // Parallel base logits + sequential Markov correction, greedy. Each
-        // position's markov_w1[prev_j] row is gathered once into _w1Rows and
-        // reused by the confidence head below (same prev-token schedule:
-        // anchor for j=0, tokens[j-1] after).
-        // Note: the B lm_head matvecs re-stream the [vocab, embDim] weight per
-        // position; a multi-input F32 kernel (MatVec4In-style) could amortize
-        // that — Phase 4 perf work alongside the GPU draft path.
-        var tokens = new int[B];
-        int prev = anchorToken;
+        // Parallel base logits (the B lm_head matvecs re-stream the [vocab, embDim]
+        // weight per position; a multi-input F32 kernel could amortize that — noted
+        // Phase 4 perf work), then the shared sequential Markov + confidence heads.
         for (int j = 0; j < B; j++)
-        {
-            SimdKernels.MatVecF32(_logits, _lmHead, _x + (long)j * _embDim, _vocab, _embDim);
-            if (_rank > 0)
-            {
-                float* w1Row = _w1Rows + (long)j * _rank;
-                MarkovW1Row(prev, w1Row);
-                SimdKernels.MatVecF32(_bias, _markovW2, w1Row, _vocab, _rank);
-                SimdKernels.AddInPlace(_logits, _bias, _vocab);
-            }
-            tokens[j] = Sampler.Greedy(new ReadOnlySpan<float>(_logits, _vocab));
-            prev = tokens[j];
-        }
+            SimdKernels.MatVecF32(_baseLogits + (long)j * _vocab, _lmHead,
+                _x + (long)j * _embDim, _vocab, _embDim);
 
-        // Confidence head: features = [hidden_j ‖ markov_w1[prev_j]].
-        var conf = new float[B];
-        if (_confW != null)
-        {
-            int confIn = _embDim + (_cfg.ConfidenceHeadWithMarkov ? _rank : 0);
-            for (int j = 0; j < B; j++)
-            {
-                Copy(_confFeat, _x + (long)j * _embDim, _embDim);
-                if (_cfg.ConfidenceHeadWithMarkov)
-                    Copy(_confFeat + _embDim, _w1Rows + (long)j * _rank, _rank);
-                float logit = SimdKernels.DotF32(_confW, _confFeat, confIn) + _confB;
-                conf[j] = 1f / (1f + MathF.Exp(-logit));
-            }
-        }
-        else
-        {
-            Array.Fill(conf, 1f);
-        }
-
-        return new DSparkProposal(tokens, conf);
+        return _heads!.GreedyBlock(_baseLogits, _x, anchorToken);
     }
 
     public void TruncateContext(int length)
@@ -493,70 +437,11 @@ public sealed unsafe class DSparkDraftModel : IDSparkDraft
         }
     }
 
-    private void MarkovW1Row(int token, float* dst)
-    {
-        if (_markovW1F32 != null)
-        {
-            Copy(dst, _markovW1F32 + (long)token * _rank, _rank);
-        }
-        else
-        {
-            var src = new ReadOnlySpan<byte>((byte*)(_markovW1Bf16 + (long)token * _rank),
-                _rank * sizeof(ushort));
-            Dequantize.ToFloat32(src, new Span<float>(dst, _rank), DType.BFloat16, _rank);
-        }
-    }
-
     private static float* Alloc(long floats) =>
         (float*)NativeMemory.AllocZeroed((nuint)(floats * sizeof(float)));
 
     private static void Copy(float* dst, float* src, long floats) =>
         NativeMemory.Copy(src, dst, (nuint)(floats * sizeof(float)));
-
-    private static void ValidateShape(SafetensorsLoader st, string name, int[] expectedShape)
-    {
-        var shape = st.GetShape(name);
-        if (!shape.AsSpan().SequenceEqual(expectedShape))
-            throw new InvalidDataException(
-                $"DSpark tensor '{name}' has shape [{string.Join(",", shape)}], " +
-                $"expected [{string.Join(",", expectedShape)}].");
-    }
-
-    private static float* LoadF32(SafetensorsLoader st, string name, int[] expectedShape)
-    {
-        ValidateShape(st, name, expectedShape);
-        var managed = st.ReadF32(name);
-        var buf = Alloc(managed.Length);
-        managed.AsSpan().CopyTo(new Span<float>(buf, managed.Length));
-        return buf;
-    }
-
-    /// <summary>
-    /// Load a large row-gathered table in its storage dtype: BF16 stays BF16
-    /// (half the resident bytes; rows are dequantized on access), anything else
-    /// goes through the F32 conversion path.
-    /// </summary>
-    private static void LoadRowTable(SafetensorsLoader st, string name, int[] expectedShape,
-        out ushort* bf16, out float* f32)
-    {
-        ValidateShape(st, name, expectedShape);
-
-        long elems = (long)expectedShape[0] * expectedShape[1];
-        var raw = st.ReadRaw(name, out string dtype);
-        if (dtype == "BF16")
-        {
-            f32 = null;
-            bf16 = (ushort*)NativeMemory.Alloc((nuint)raw.LongLength);
-            raw.AsSpan().CopyTo(new Span<byte>(bf16, raw.Length));
-        }
-        else
-        {
-            bf16 = null;
-            var managed = st.ReadF32(name);
-            f32 = Alloc(elems);
-            managed.AsSpan().CopyTo(new Span<float>(f32, managed.Length));
-        }
-    }
 
     public void Dispose()
     {
@@ -567,21 +452,19 @@ public sealed unsafe class DSparkDraftModel : IDSparkDraft
 
     private void FreeAll()
     {
+        _heads?.Dispose(); _heads = null;
         Free(ref _fc); Free(ref _hiddenNormW); Free(ref _finalNormW);
-        Free(ref _lmHead); Free(ref _markovW2); Free(ref _confW);
+        Free(ref _lmHead);
         FreeArr(_wq); FreeArr(_wk); FreeArr(_wv); FreeArr(_wo);
         FreeArr(_qNormW); FreeArr(_kNormW); FreeArr(_inNormW); FreeArr(_ffnNormW);
         FreeArr(_wGate); FreeArr(_wUp); FreeArr(_wDown);
         FreeArr(_ctxK); FreeArr(_ctxV);
         if (_embedBf16 != null) { NativeMemory.Free(_embedBf16); _embedBf16 = null; }
         Free(ref _embedF32);
-        if (_markovW1Bf16 != null) { NativeMemory.Free(_markovW1Bf16); _markovW1Bf16 = null; }
-        Free(ref _markovW1F32);
         Free(ref _ropeCos); Free(ref _ropeSin);
         Free(ref _x); Free(ref _resid); Free(ref _norm);
         Free(ref _q); Free(ref _kBlock); Free(ref _vBlock); Free(ref _attnOut);
-        Free(ref _gate); Free(ref _up); Free(ref _logits); Free(ref _bias);
-        Free(ref _w1Rows); Free(ref _confFeat);
+        Free(ref _gate); Free(ref _up); Free(ref _baseLogits);
 
         static void Free(ref float* p) { if (p != null) { NativeMemory.Free(p); p = null; } }
         static void FreeArr(float*[]? arr)

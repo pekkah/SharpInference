@@ -2798,6 +2798,75 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>
+    /// Dense batched GEMM against a RESIDENT fp16 weight with f32 device activations
+    /// (DSpark GPU draft head, PR #413 Phase 4): converts the activations f32→f16 into
+    /// internal scratch, then one <c>cublasGemmEx</c> f16×f16→f32 with fp32 accumulation.
+    /// <c>outputAll[nTok×rows] f32 = inputAll[nTok×cols] f32 × weightF16[rows×cols]ᵀ</c>,
+    /// all row-major. The weight skips <see cref="MatMulBatchedGemm"/>'s per-call dequant —
+    /// it is already fp16 in VRAM (via <see cref="UploadHalf"/>). NOT bit-exact vs the
+    /// f32 matvec path (activations rounded to fp16); draft-side use only, where numerics
+    /// affect acceptance rate, never emitted-token correctness.
+    /// </summary>
+    public void MatMulBatchedGemmF16W(Tensor outputAll, Tensor weightF16, Tensor inputAll, int nTok)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available on this system.");
+        if (weightF16.DType != DType.Float16)
+            throw new ArgumentException(
+                $"MatMulBatchedGemmF16W expects an fp16 weight, got {weightF16.DType}.", nameof(weightF16));
+        if (nTok <= 0)
+            throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be > 0.");
+        if (outputAll.ElementCount % nTok != 0 || inputAll.ElementCount % nTok != 0)
+            throw new ArgumentException(
+                $"MatMulBatchedGemmF16W: outputAll ({outputAll.ElementCount}) and inputAll " +
+                $"({inputAll.ElementCount}) element counts must be divisible by nTok ({nTok}).");
+
+        int rows = (int)(outputAll.ElementCount / nTok);
+        int cols = (int)(inputAll.ElementCount / nTok);
+        if ((long)rows * cols != weightF16.ElementCount)
+            throw new ArgumentException(
+                $"MatMulBatchedGemmF16W: weight has {weightF16.ElementCount} elements, " +
+                $"expected rows×cols = {(long)rows * cols}.");
+
+        nint wPtr = GetDevPtr(weightF16);
+        nint xPtr = GetDevPtr(inputAll);
+        nint yPtr = GetDevPtr(outputAll);
+
+        EnsureGemmAf16((nuint)((long)nTok * cols * 2L));
+
+        // 1) Convert activations fp32 → fp16 (same kernel MatMulBatchedGemm uses).
+        {
+            nint ip = xPtr, op = _gemmAf16Buf;
+            int n = nTok * cols;
+            nint* args = stackalloc nint[3] { (nint)(&ip), (nint)(&op), (nint)(&n) };
+            uint grid = (uint)((n + 255) / 256);
+            int r = NvrtcInterop.LaunchKernel(_f32ToF16Kernel, grid, 1, 1,
+                                              256, 1, 1, 0, _stream, args, null);
+            if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(f32_to_f16) failed: {r}");
+        }
+
+        // 2) GemmEx: C[nTok×rows] f32 = A[nTok×cols] f16 × B[rows×cols] f16ᵀ, fp32 accum.
+        {
+            float alpha = 1f, beta = 0f;
+            int M = nTok, K = cols, N = rows;
+            int status = CuBlasInterop.GemmEx(
+                _handle,
+                CuBlasInterop.OpT, CuBlasInterop.OpN,
+                N, M, K,
+                ref alpha,
+                wPtr, CuBlasInterop.CUDA_R_16F, K,
+                _gemmAf16Buf, CuBlasInterop.CUDA_R_16F, K,
+                ref beta,
+                yPtr, CuBlasInterop.CUDA_R_32F, N,
+                CuBlasInterop.CUBLAS_COMPUTE_32F,
+                CuBlasInterop.CUBLAS_GEMM_DEFAULT);
+            if (status != 0)
+                throw new InvalidOperationException($"cublasGemmEx (f16-weight GEMM) failed: {status}");
+        }
+    }
+
+    /// <summary>
     /// Issue #141 (MMQ): int8 tensor-core batched matmul for Q8_0 weights.
     /// C[nTok×rows] f32 = X[nTok×cols] · Wᵀ where W is Q8_0 [rows×cols]. The input is
     /// quantized to Q8_1 (per-32-block int8 + fp16 scale) and multiplied by the Q8_0

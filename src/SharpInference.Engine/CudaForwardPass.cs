@@ -497,6 +497,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     // every layer is marked aliased so even an accidental Dispose can't free them.
     private CudaSequenceKvCache? _ownedCacheView;
 
+    // Hidden-state taps (DSpark draft conditioning, PR #413 Phase 4a). Host-side
+    // position-indexed buffer shared with the CPU pass (HiddenTapBuffer); layer
+    // outputs are downloaded at the capture points (a stream sync per tapped
+    // layer). Taps disable the decode CUDA graph — a captured memcpy node would
+    // bake the first position's tap destination (same failure mode as the
+    // SnapKV Q-capture bail in TryRunDeviceRegionViaGraph).
+    private HiddenTapBuffer? _taps;
+    private float[] _tapDownloadScratch = [];
+
     // Issue #212: multi-slot prefix cache (single-user). The engine binds a non-owned
     // "scratch" slot via ActivateSlot to serve a short interleaved request without evicting
     // the long resident prefix in the owned cache (slot 0). _activeSlot is the bound slot
@@ -1689,6 +1698,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
             }
 
             _gpu.AddInPlace(_hidden, _residual);
+
+            // Hidden-state tap: _hidden now holds this layer's output. Never runs
+            // under graph capture (TryRunDeviceRegionViaGraph bails while tapping) —
+            // the Download inside would be illegal mid-capture.
+            if (_taps is { } taps && taps.SlotOf(layer) is int tapSlot && tapSlot >= 0)
+                CaptureTapSingle(position, tapSlot);
         }
 
         _gpu.RmsNorm(_hidden, _hidden, _wOutputNorm, _hp.RmsNormEps);
@@ -1719,7 +1734,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         //    capture block is dormant and never enters the captured graph.
         //  • MoE — MoeFfn does a router Download + Synchronize mid-layer, which is illegal
         //    during stream capture (it would error the stream).
-        if (_tqEnabled || _kvEvictedCount > 0 || _snapKvCaptureSlot >= 0 || _isMoE)
+        //  • Active hidden-state taps (PR #413) — the per-layer tap Download both
+        //    syncs mid-region (illegal during capture) and would need a
+        //    position-varying memcpy destination a replayed graph can't retarget.
+        if (_tqEnabled || _kvEvictedCount > 0 || _snapKvCaptureSlot >= 0 || _isMoE
+            || _taps is not null)
             return false;
 
         // Issue #212: a captured graph bakes the OWNED cache's device pointers, so replaying
@@ -3112,6 +3131,12 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         if (_layerOutputScale is not null)
             _gpu.ScaleInPlace(_bpHidden!, _layerOutputScale[layer]);
 
+        // Hidden-state taps: _bpHidden rows are this layer's outputs for
+        // positions startPos..startPos+N-1 (dense-only — the Gemma transforms
+        // above are excluded by the SupportsHiddenTaps guard).
+        if (_taps is { } taps && taps.SlotOf(layer) is int tapSlot && tapSlot >= 0)
+            CaptureTapRows(_bpHidden!, N, startPos, null, tapSlot);
+
         _gpu.Free(qAll); _gpu.Free(kAll); _gpu.Free(vAll); _gpu.Free(attnAll);
     }
 
@@ -3556,6 +3581,66 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
 
     /// <inheritdoc />
     public bool SupportsPartialRewind => true;
+
+    // ── Hidden-state taps (DSpark draft conditioning, PR #413 Phase 4a) ──
+
+    /// <summary>
+    /// Dense transformer paths only: MoE downloads mid-layer (different capture
+    /// flow), the Gemma-4-like path applies post-layer transforms the batched
+    /// capture point misses (same guard as the CPU pass), TurboQuant compresses
+    /// the region taps index into, and SnapKV eviction shifts positions relative
+    /// to slots. The SnapKV gate is on the CONFIGURED budget, not just the
+    /// runtime eviction counter — a budgeted pass would otherwise accept
+    /// EnableHiddenTaps pre-prefill and then desync at the first eviction
+    /// (same up-front declination the CPU pass makes).
+    /// </summary>
+    public bool SupportsHiddenTaps =>
+        !_tqEnabled && !_isMoE && !_isGemma4Like
+        && _snapKvEffectiveBudget <= 0 && _kvEvictedCount == 0;
+
+    public int HiddenTapDim => _taps is { } tb ? tb.TapDim : 0;
+
+    public void EnableHiddenTaps(ReadOnlySpan<int> layerIds)
+    {
+        if (!SupportsHiddenTaps)
+            throw new NotSupportedException(
+                "Hidden-state taps require the dense CUDA path (no MoE / Gemma-4 transforms / " +
+                "TurboQuant / SnapKV eviction). Check SupportsHiddenTaps before calling.");
+        _taps?.Dispose();
+        _taps = new HiddenTapBuffer(layerIds, _hp.NumLayers, _embDim, _hp.ContextLength);
+        // Any previously captured decode graph must not be replayed: it neither
+        // contains the tap copies nor could a captured memcpy node retarget the
+        // position-indexed destination. TryRunDeviceRegionViaGraph also bails
+        // while taps are active, so no new graph is captured either.
+        _graphCaptured = false;
+    }
+
+    public ReadOnlySpan<float> HiddenTapsAt(int position) =>
+        _taps is { } tb ? tb.At(position) : default;
+
+    /// <summary>Download the single-token layer output (_hidden) into a tap cell.</summary>
+    private void CaptureTapSingle(int position, int slot)
+    {
+        _gpu.Download(_hidden, _taps!.RowSlot(position, slot));
+    }
+
+    /// <summary>
+    /// Download the first <paramref name="n"/> rows of a batched [N×embDim] hidden
+    /// buffer and scatter them into tap cells. <paramref name="positions"/> is null
+    /// for contiguous rows at <paramref name="startPos"/>.
+    /// </summary>
+    private void CaptureTapRows(Tensor batchedHidden, int n, int startPos, int[]? positions, int slot)
+    {
+        int needed = n * _embDim;
+        if (_tapDownloadScratch.Length < needed) _tapDownloadScratch = new float[needed];
+        var scratch = _tapDownloadScratch.AsSpan(0, needed);
+        _gpu.Download(batchedHidden, scratch);
+        for (int r = 0; r < n; r++)
+        {
+            int position = positions is null ? startPos + r : positions[r];
+            scratch.Slice(r * _embDim, _embDim).CopyTo(_taps!.RowSlot(position, slot));
+        }
+    }
 
     /// <inheritdoc/>
     public void ResetCache()
@@ -4355,6 +4440,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                 _gpu.SiLuMul(_bpFfnGate!, _bpFfnUp!);
                 BatchDecodeMatMul(_bpHidden!, _wDown[layer], _bpFfnGate!, N, allowDecodeMmq);
                 _gpu.AddInPlace(_bpHidden!, _bpResidual!);
+
+                // Hidden-state taps: row n is the layer output at positions[n].
+                // Capture ONLY for the single-sequence spec-verify drive (every
+                // cache is the owned view) — a multi-sequence continuous-batching
+                // batch interleaves positions from different sequences and would
+                // silently corrupt the position-indexed buffer.
+                if (_taps is { } taps && taps.SlotOf(layer) is int tapSlot && tapSlot >= 0
+                    && ReferenceEquals(caches[0], _ownedCacheView))
+                    CaptureTapRows(_bpHidden!, N, 0, positions, tapSlot);
             }
 
             // 3. Final norm + output projection, batched (the output weight is the largest
@@ -4623,9 +4717,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     /// sequence is greedy — the engine gates on <see cref="SupportsBatchedGpuArgmax"/>.
     /// </summary>
     internal (int Token, float Logit)[] BatchForwardMultiArgmax(
-        int[] tokens, int[] positions, CudaSequenceKvCache[] caches)
+        int[] tokens, int[] positions, CudaSequenceKvCache[] caches,
+        bool allowDecodeMmq = true)
     {
-        RunBatchedTrunk(tokens, positions, caches, allowDecodeMmq: true);
+        RunBatchedTrunk(tokens, positions, caches, allowDecodeMmq);
         int N = tokens.Length;
         if (N == 0) return Array.Empty<(int, float)>();
 
@@ -4735,6 +4830,55 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         // Mirror what k sequential Forward calls would leave behind; the speculative
         // decoder's TruncateTo(startPos + accepted) then rewinds the rejected tail.
         _kvLength = Math.Max(_kvLength, startPos + k);
+        return result;
+    }
+
+    /// <summary>
+    /// Greedy verify needs only per-position argmaxes, so the #219 device row
+    /// argmax replaces the k×vocab logits download (4.86 MB at k=8 / vocab
+    /// 151936) with k×8 bytes. Same WS-matvec trunk and cache effects as
+    /// <see cref="BatchVerify"/> (allowDecodeMmq stays false for byte-stability
+    /// of the underlying logits, hence argmax-stability vs plain decode).
+    /// </summary>
+    public bool SupportsBatchVerifyArgmax => SupportsBatchVerify && _gpu.GpuArgmaxEnabled;
+
+    /// <inheritdoc cref="IForwardPass.BatchVerifyArgmax"/>
+    public (int Index, float Value)[] BatchVerifyArgmax(int[] tokens, int startPos)
+    {
+        ArgumentNullException.ThrowIfNull(tokens);
+        if (!SupportsBatchVerifyArgmax)
+            throw new NotSupportedException(
+                "BatchVerifyArgmax requires SupportsBatchVerify and the device argmax kernel. " +
+                "Check SupportsBatchVerifyArgmax before calling.");
+        int k = tokens.Length;
+        if (k == 0) return Array.Empty<(int, float)>();
+        if (startPos < 0 || startPos + k > _maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(startPos),
+                $"BatchVerifyArgmax range [{startPos}, {startPos + k}) exceeds the context window (maxSeqLen={_maxSeqLen}).");
+
+        if (k == 1)
+        {
+            var (token, logit) = ForwardArgmax(tokens[0], startPos);
+            return [(token, logit)];
+        }
+
+        if (_ownedCacheView is null)
+        {
+            var all = new HashSet<int>();
+            for (int l = 0; l < _hp.NumLayers; l++) all.Add(l);
+            _ownedCacheView = new CudaSequenceKvCache(_gpu, _ownedKCache, _ownedVCache, all);
+        }
+        _ownedCacheView.Length = startPos;
+
+        var positions = new int[k];
+        for (int i = 0; i < k; i++) positions[i] = startPos + i;
+        var caches = new CudaSequenceKvCache[k];
+        Array.Fill(caches, _ownedCacheView);
+
+        var am = BatchForwardMultiArgmax(tokens, positions, caches, allowDecodeMmq: false);
+        _kvLength = Math.Max(_kvLength, startPos + k);
+        var result = new (int Index, float Value)[k];
+        for (int i = 0; i < k; i++) result[i] = (am[i].Token, am[i].Logit);
         return result;
     }
 
@@ -5458,6 +5602,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     public void Dispose()
     {
         DumpProfile();
+        _taps?.Dispose();
         _gpu.Free(_hidden); _gpu.Free(_residual); _gpu.Free(_normBuf);
         _gpu.Free(_q); _gpu.Free(_k); _gpu.Free(_v); _gpu.Free(_attnOut);
         _gpu.Free(_ffnGate); _gpu.Free(_ffnUp); _gpu.Free(_logits);

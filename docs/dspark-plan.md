@@ -15,10 +15,36 @@
 > head), `DSparkDecoder` (folded batched verify, greedy-parity), `DSparkPlacementPlanner`
 > (+ shared `TierPlanner.ReservedVramBytes`, `LayerPlacement.CpuWeightBytes`), the four
 > CLI flags/env vars from §5, and `SpecType.DSpark`. The confidence-threshold trim (§7's
-> CLI reduction) shipped with the decoder. Still open: Phase 4 (GPU draft path +
-> heterogeneous benchmarking — `--dspark-place gpu` currently downgrades to CPU with a
-> note), Phase 5 (load-aware scheduling beyond the threshold trim), Phase 6 (server).
+> CLI reduction) shipped with the decoder. Still open: Phase 5 (load-aware scheduling
+> beyond the threshold trim), Phase 6 (server).
 > Fetch weights with `download-model.ps1 -Model qwen3-4b` + `-Model dspark-qwen3-4b`.
+>
+> **Phase 4 status (2026-07-08):** the GPU draft path is implemented and validated.
+> `CudaForwardPass` captures hidden taps (Forward/Prefill/BatchVerify; taps disable the
+> decode CUDA graph — a captured memcpy node can't retarget the position-indexed
+> destination, the same reason the SnapKV Q-capture bails); `CudaDSparkDraftModel` runs
+> the backbone as resident-fp16 cuBLAS GEMMs (`MatMulBatchedGemmF16W`) with the block K/V
+> projected into the tail of the device ctx cache and the mask-free `llm_attention`
+> kernel looped per block query (bidirectional over ctx+block by construction); the
+> Markov/confidence heads stay on the host (`DSparkHostHeads`, shared with the CPU
+> model). `DSparkDecoder` gained the #219 `BatchVerifyArgmax` fast path. All three
+> placements work: CPU target + CPU draft, CUDA target + CPU draft, CUDA target + GPU
+> draft — each byte-exact greedy-parity-tested against the real
+> `dspark_qwen3_4b_block7` head.
+>
+> **Measured on the 4070 Laptop (8 GB), Qwen3-4B Q4_K_M, `-c 4096`:** plain CUDA decode
+> 64 t/s; DSpark GPU draft 52.6 t/s at 36% block acceptance, 55.6 t/s with
+> `--dspark-min-confidence 0.8` (83% acceptance) — after wiring the #219 device-argmax
+> verify into `DSparkDecoder` + `CudaForwardPass.BatchVerifyArgmax` (k×8-byte D2H
+> instead of k×vocab logits). The draft itself is cheap (~27 ms/round); the remaining
+> gap is the *verify* pass — an un-graphed batched trunk can't beat graph-replayed
+> 15.6 ms/token plain decode on a model this small. §4's "is it worth it" heuristic now
+> has real numbers: the crossover needs targets whose per-token decode cost dominates
+> launch overhead (8B/14B heads — too big for 8 GB next to their targets; desktop
+> validation) and/or a graph-captured / MMQ verify path (the same batched-decode gap
+> tracked in issues #405–#409). Placement note: with `-c` unset the target's VRAM-fit KV
+> solve consumes the card and the planner correctly lands on `Cpu` — bound the context
+> to free headroom for the head.
 
 ## 1. Background
 

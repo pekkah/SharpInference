@@ -1206,6 +1206,21 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 return 1;
             }
 
+            // Supported targets: pure CPU (-g 0) and dense full CUDA offload (-g -1,
+            // Phase 4). Vulkan and the partial-offload hybrids fall back — no tap
+            // capture there yet.
+            IForwardPass? dsparkTarget = null;
+            CudaBackend? dsparkCuda = null;
+            if (nGpuLayers == 0 && fwd is not null)
+            {
+                dsparkTarget = fwd;
+            }
+            else if (gpuFwd is CudaForwardPass cudaTarget && gpuBackend is CudaBackend cudaBk)
+            {
+                dsparkTarget = cudaTarget;
+                dsparkCuda = cudaBk;
+            }
+
             string? dsparkReject = null;
             if (sp.SpecType == SpecType.None)
                 dsparkReject = "--spec-type none explicitly disables speculation";
@@ -1215,10 +1230,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 dsparkReject = "--tools capture is not wired on the DSpark path (same restriction as MTP)";
             else if (settings.Temperature > 0f)
                 dsparkReject = "DSpark is greedy-only for now; pass --temp 0";
-            else if (nGpuLayers != 0 || fwd is null)
-                dsparkReject = "DSpark currently requires a pure CPU target (-g 0); the GPU draft path is spec Phase 4";
-            else if (!((IForwardPass)fwd).SupportsHiddenTaps)
-                dsparkReject = "the target pass can't capture hidden taps (SnapKV eviction or TurboQuant KV is active)";
+            else if (dsparkTarget is null)
+                dsparkReject = "DSpark requires a pure CPU target (-g 0) or dense full CUDA offload (-g -1); Vulkan and partial-offload hybrids have no tap capture";
+            else if (!dsparkTarget.SupportsHiddenTaps)
+                dsparkReject = "the target pass can't capture hidden taps (SnapKV eviction, TurboQuant KV, MoE, or Gemma-4 transforms active)";
 
             if (dsparkReject is not null)
             {
@@ -1233,7 +1248,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 int rc;
                 try
                 {
-                    rc = TryRunDSparkSinglePrompt(settings, model, hp, fwd!, tokenizer, sp, ctxSize);
+                    rc = TryRunDSparkSinglePrompt(settings, model, hp, dsparkTarget!, dsparkCuda,
+                        tokenizer, sp, ctxSize);
                 }
                 catch (Exception ex)
                 {
@@ -1438,12 +1454,13 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     /// <summary>
     /// DSpark single-prompt runner (docs/dspark-plan.md, PR #413): resolves the draft-head
     /// files (model.safetensors + sibling config.json), validates head↔target compatibility,
-    /// runs the placement planner, loads the head, enables hidden taps on the target, and
-    /// drives <see cref="DSparkDecoder"/>. Returns 0/1 like the other runners, or -1 when
-    /// the placement decision is Off — the caller falls back to normal generation.
+    /// runs the placement planner, loads the head (GPU or CPU per the decision — Phase 4),
+    /// enables hidden taps on the target, and drives <see cref="DSparkDecoder"/>. Returns
+    /// 0/1 like the other runners, or -1 when the placement decision is Off — the caller
+    /// falls back to normal generation.
     /// </summary>
     private static int TryRunDSparkSinglePrompt(Settings s, GgufModel model, ModelHyperparams hp,
-        ForwardPass target, GgufTokenizer tok, SamplingParams sp, int ctxSize)
+        IForwardPass target, CudaBackend? cuda, GgufTokenizer tok, SamplingParams sp, int ctxSize)
     {
         string stPath = s.DSparkModelPath!;
         if (Directory.Exists(stPath)) stPath = Path.Combine(stPath, "model.safetensors");
@@ -1482,38 +1499,55 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             return 1;
         }
 
-        // Static placement estimate. The target runs on CPU here (Phase 1–3 gate), so
-        // detect with no GPU: the planner decides Cpu vs Off from RAM headroom. The
-        // CPU-side figure also carries the target's hidden-tap buffer, which grows to
-        // ctx × TapDim × 4 bytes alongside the head itself.
-        var hwProfile = HardwareProfile.Detect();
+        // Static placement estimate (spec §4). With a CUDA target the profile carries
+        // real VRAM + a measured PCIe probe; a CPU target detects no GPU, so the
+        // planner decides Cpu vs Off from RAM headroom. The CPU-side figure also
+        // carries the target's hidden-tap buffer, which grows to ctx × TapDim × 4
+        // bytes on the host regardless of where the draft runs.
+        var hwProfile = cuda is not null ? HardwareProfile.Detect(cuda) : HardwareProfile.Detect();
         var targetPlacement = TierPlanner.Plan(model, hp, hwProfile, s.TurboQuant,
             requestedCtxSize: ctxSize);
-        long headBytes = DSparkDraftModel.EstimateResidentBytes(cfg);
+        long headBytesGpu = CudaDSparkDraftModel.EstimateGpuResidentBytes(cfg);
+        long headBytesCpu = DSparkDraftModel.EstimateResidentBytes(cfg);
         long tapBytes = (long)targetPlacement.RecommendedCtxSize * cfg.TapDim * sizeof(float);
         var decision = DSparkPlacementPlanner.Plan(
-            hwProfile, targetPlacement, headBytes, headBytes + tapBytes, userPlace);
+            hwProfile, targetPlacement, headBytesGpu, headBytesCpu + tapBytes, userPlace);
         AnsiConsole.MarkupLine($"[dim]DSpark placement: {decision.Placement} — {decision.Reason.EscapeMarkup()}[/]");
         if (decision.Placement == DSparkPlacement.Off)
         {
             AnsiConsole.MarkupLine("[yellow]Note:[/] DSpark placement is off; falling back to normal generation.");
             return -1;
         }
-        if (decision.Placement == DSparkPlacement.Gpu)
+        if (decision.Placement == DSparkPlacement.Gpu && cuda is null)
         {
-            // The GPU draft path is spec Phase 4 — the head actually loads into RAM,
-            // so re-validate the CPU budget instead of trusting the VRAM-worded decision.
+            // A GPU draft needs the target's CudaBackend (shared stream orders the tap
+            // producer and draft consumer); with a CPU target the head runs on CPU.
+            // Re-plan in AUTO over a GPU-less profile so the RAM budget is actually
+            // checked (a Cpu OVERRIDE would skip it by contract) — the spec's
+            // Gpu → Cpu → Off graceful fallback.
             var cpuCheck = DSparkPlacementPlanner.Plan(
-                hwProfile, targetPlacement, headBytes, headBytes + tapBytes, DSparkPlacement.Cpu);
+                hwProfile with { VramBytes = 0 }, targetPlacement,
+                headBytesGpu, headBytesCpu + tapBytes, DSparkPlacement.Auto);
             AnsiConsole.MarkupLine(
-                "[yellow]Note:[/] the DSpark GPU draft path is not implemented yet (spec Phase 4); " +
-                $"running the draft on CPU — {cpuCheck.Reason.EscapeMarkup()}");
+                "[yellow]Note:[/] a GPU DSpark draft requires a CUDA target (-g -1); " +
+                $"re-planned for CPU — {cpuCheck.Reason.EscapeMarkup()}");
+            if (cpuCheck.Placement == DSparkPlacement.Off)
+            {
+                AnsiConsole.MarkupLine("[yellow]Note:[/] DSpark placement is off; falling back to normal generation.");
+                return -1;
+            }
+            decision = cpuCheck;
         }
 
         AnsiConsole.MarkupLine($"[dim]Loading DSpark draft head:[/] {stPath}");
         using var st = SafetensorsLoader.Open(stPath);
-        using var draft = new DSparkDraftModel(cfg, st, target.MaxSeqLen);
-        ((IForwardPass)target).EnableHiddenTaps(cfg.TargetLayerIds);
+        using IDSparkDraft draft = decision.Placement == DSparkPlacement.Gpu
+            ? new CudaDSparkDraftModel(cfg, st, cuda!, target.MaxSeqLen)
+            : new DSparkDraftModel(cfg, st, target.MaxSeqLen);
+        AnsiConsole.MarkupLine(
+            $"[dim]DSpark draft: {cfg.NumLayers}L block-{cfg.BlockSize} " +
+            $"([{(decision.Placement == DSparkPlacement.Gpu ? "green]GPU" : "blue]CPU")}[/])[/]");
+        target.EnableHiddenTaps(cfg.TargetLayerIds);
 
         var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt, enableThinking: !s_noThinking);
         var tokens = tok.Encode(prompt);
