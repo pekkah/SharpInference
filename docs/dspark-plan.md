@@ -15,9 +15,27 @@
 > head), `DSparkDecoder` (folded batched verify, greedy-parity), `DSparkPlacementPlanner`
 > (+ shared `TierPlanner.ReservedVramBytes`, `LayerPlacement.CpuWeightBytes`), the four
 > CLI flags/env vars from §5, and `SpecType.DSpark`. The confidence-threshold trim (§7's
-> CLI reduction) shipped with the decoder. Still open: Phase 5 (load-aware scheduling
-> beyond the threshold trim), Phase 6 (server).
+> CLI reduction) shipped with the decoder.
 > Fetch weights with `download-model.ps1 -Model qwen3-4b` + `-Model dspark-qwen3-4b`.
+>
+> **Phase 6 status (2026-07-08):** the single-user server path is implemented.
+> `InferenceEngine.AttachDSparkDraft` + a `useDSpark` decode branch (mirroring the MTP
+> block; greedy + no-thinking gate, DSpark outranks MTP on `Auto` since an attached head
+> is an explicit operator choice); prefix-cache reuse works because tap validity tracks
+> KV validity (both describe the last processed sequence), while the multi-slot prefix
+> cache (`SHARPI_PREFIX_SLOTS=2`) is rejected at attach — a scratch-slot request would
+> clobber tap rows the owned slot still needs. `InferenceEngineLoader` wires
+> `SHARPI_DSPARK_MODEL` / `SHARPI_DSPARK_PLACE` (options `DSparkModelPath`/`DSparkPlace`)
+> with the same placement planner as the CLI — but throws instead of falling back when an
+> explicitly configured head can't be honored, and rejects `MaxBatchSize > 1`. Enabling
+> the engine's no-thinking fast paths on thinking-capable models required threading the
+> per-request `enable_thinking=false` rendering into the engine
+> (`SamplingParams.ThinkingDisabled`, set by all three endpoint families) — this also
+> un-blocks server-side MTP on thinking models, which the model-static gate previously
+> made unreachable. Validated live: OpenAI chat completion with `"enable_thinking": false`
+> decoded through DSpark at 6/7 drafts accepted; sampled/thinking requests fall back to
+> the plain loop. Still open: continuous-batching integration + load-aware verify length
+> (§7's server half — the threshold trim resolves from `SHARPI_DSPARK_*` per request).
 >
 > **Phase 4 status (2026-07-08):** the GPU draft path is implemented and validated.
 > `CudaForwardPass` captures hidden taps (Forward/Prefill/BatchVerify; taps disable the

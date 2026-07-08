@@ -159,7 +159,8 @@ public static class OpenAiEndpoints
             topP:        req.TopP,
             maxTokens:   req.MaxTokens,
             maxThinking: req.MaxThinkingTokens,
-            logitBias:   logitBias);
+            logitBias:   logitBias,
+            thinkingDisabled: !enableThinking);
 
         // Tool-active agentic turn: add the model family's tool-boundary stop (Gemma 4:
         // <|tool_response>) so generation halts the instant the tool calls finish rather than

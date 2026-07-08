@@ -67,6 +67,9 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
     // owned/disposed elsewhere (in _owned). Image requests splice projected soft tokens at
     // each placeholder during a fresh (no-prefix-reuse) prefill.
     private GemmaUvVisionEmbedder? _visionEmbedder;
+    // DSpark draft head (PR #413 Phase 6) — attached post-construction by the loader;
+    // engine-owned (disposed in DisposeCore before the forward pass it drafts against).
+    private IDSparkDraft? _dspark;
     private VisionModel? _visionModel;
     private int _imgOpenId, _imgCloseId, _imgPlaceholderId;
 
@@ -313,6 +316,40 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
         _imgOpenId = openId;
         _imgCloseId = closeId;
         _imgPlaceholderId = placeholderId;
+    }
+
+    /// <summary>
+    /// Attach a DSpark draft head (docs/dspark-plan.md Phase 6, PR #413) so greedy
+    /// no-thinking requests decode through <see cref="DSparkDecoder"/>. The caller
+    /// must have called <see cref="IForwardPass.EnableHiddenTaps"/> on the forward
+    /// pass with the head's target layer ids BEFORE any request runs (the loader
+    /// does this at setup — the tap buffer must cover every prompt position the
+    /// decoder later replays). The engine takes ownership and disposes the draft.
+    /// </summary>
+    public void AttachDSparkDraft(IDSparkDraft draft)
+    {
+        ArgumentNullException.ThrowIfNull(draft);
+        if (_dspark is not null)
+            throw new InvalidOperationException("A DSpark draft is already attached.");
+        if (!_fwd.SupportsPartialRewind || !_fwd.SupportsHiddenTaps)
+            throw new InvalidOperationException(
+                $"DSpark requires a partial-rewind, tap-capable forward pass; {_fwd.GetType().Name} " +
+                "reports SupportsPartialRewind=" + _fwd.SupportsPartialRewind +
+                ", SupportsHiddenTaps=" + _fwd.SupportsHiddenTaps + ".");
+        if (_fwd.HiddenTapDim != draft.TapDim)
+            throw new InvalidOperationException(
+                $"Hidden taps not enabled for this head: target HiddenTapDim={_fwd.HiddenTapDim}, " +
+                $"draft TapDim={draft.TapDim}. Call EnableHiddenTaps(head.TargetLayerIds) before attaching.");
+        if (_fwd.VocabSize != draft.VocabSize)
+            throw new InvalidOperationException(
+                $"DSpark head vocab ({draft.VocabSize}) != model vocab ({_fwd.VocabSize}).");
+        if (_multiSlot is not null)
+            throw new InvalidOperationException(
+                "DSpark is incompatible with the multi-slot prefix cache (SHARPI_PREFIX_SLOTS=2): " +
+                "the tap buffer is position-indexed against a single KV region, and a scratch-slot " +
+                "request would overwrite tap rows the owned slot's cached prefix still needs. " +
+                "Unset SHARPI_PREFIX_SLOTS to use DSpark.");
+        _dspark = draft;
     }
 
     /// <inheritdoc/>
@@ -585,9 +622,13 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                 new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
 
             // Capture reasoning-token IDs into locals to avoid repeated field reads in the hot loop.
+            // A request whose template was rendered with enable_thinking=false
+            // (sp.ThinkingDisabled) opts out of reasoning entirely: the model was told
+            // not to think, so the engine skips the think/text stream split AND the
+            // speculative fast paths' no-thinking gates pass (CLI --no-thinking parity).
             int thinkId = _thinkTokenId;
             int endThinkId = _endThinkTokenId;
-            bool thinkingEnabled = thinkId >= 0 && endThinkId >= 0;
+            bool thinkingEnabled = thinkId >= 0 && endThinkId >= 0 && !sp.ThinkingDisabled;
 
             // Run the blocking generation on the engine's dedicated forward-pass thread (issue
             // #302), not an arbitrary thread-pool thread — CUDA contexts are thread-affine.
@@ -686,19 +727,29 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                     // and Mtp (so existing benchmarking scripts that set it keep working).
                     bool mtpEnvDisabled = Environment.GetEnvironmentVariable("SHARPI_DISABLE_MTP") == "1";
                     bool useMtp;
+                    bool useDSpark = false;
                     switch (sp.SpecType)
                     {
                         case SpecType.None:
                             useMtp = false;
                             break;
                         case SpecType.DSpark:
-                            // The engine has no DSpark path yet (spec Phase 6 — server
-                            // integration). Failing fast beats silently swapping in
-                            // Auto/MTP behavior the caller didn't ask for.
-                            throw new InvalidOperationException(
-                                "SamplingParams.SpecType=DSpark is not supported by the inference " +
-                                "engine yet (docs/dspark-plan.md Phase 6); DSpark currently runs on " +
-                                "the CLI single-prompt path only. Use SpecType.Auto or None here.");
+                            if (_dspark is null)
+                                throw new InvalidOperationException(
+                                    "SamplingParams.SpecType=DSpark but no DSpark draft head is attached. " +
+                                    "Configure one at load time (SHARPI_DSPARK_MODEL / DSparkModelPath) or " +
+                                    "use SpecType.Auto/None.");
+                            if (sp.Temperature > 0f)
+                                throw new InvalidOperationException(
+                                    "SamplingParams.SpecType=DSpark requires greedy sampling (Temperature=0). " +
+                                    "DSpark verification is greedy (argmax match).");
+                            if (thinkingEnabled)
+                                throw new InvalidOperationException(
+                                    "SamplingParams.SpecType=DSpark is incompatible with reasoning mode. " +
+                                    "Render the chat template with enable_thinking=false.");
+                            useDSpark = true;
+                            useMtp = false;
+                            break;
                         case SpecType.Mtp:
                             if (mtpEnvDisabled)
                                 throw new InvalidOperationException(
@@ -719,21 +770,27 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                             useMtp = true;
                             break;
                         default: // Auto
-                            useMtp = _fwd.HasMtpHead
+                            // An attached DSpark head is an explicit operator choice, so it
+                            // outranks the model's innate MTP head when both are eligible.
+                            useDSpark = _dspark is not null
+                                && sp.Temperature <= 0f
+                                && !thinkingEnabled;
+                            useMtp = !useDSpark
+                                && _fwd.HasMtpHead
                                 && !mtpEnvDisabled
                                 && sp.Temperature <= 0f
                                 && !thinkingEnabled;
                             break;
                     }
-                    // Image input (#253) splices precomputed embeddings during prefill; MTP's
-                    // PrefillMtp / batched verify don't model that, so never engage MTP here.
-                    if (imageBytes is { Count: > 0 }) useMtp = false;
+                    // Image input (#253) splices precomputed embeddings during prefill; neither
+                    // MTP's PrefillMtp / batched verify nor DSpark's tap replay model that.
+                    if (imageBytes is { Count: > 0 }) { useMtp = false; useDSpark = false; }
 
-                    // Grammar-constrained decoding (#374) masks logits per token, which the MTP
-                    // batched-verify path doesn't model — fall back to per-token decode so the
+                    // Grammar-constrained decoding (#374) masks logits per token, which the
+                    // batched-verify paths don't model — fall back to per-token decode so the
                     // constraint sees and gates every sampled token.
                     var constraint = sp.Constraint;
-                    if (constraint is not null) { useMtp = false; constraint.Reset(); }
+                    if (constraint is not null) { useMtp = false; useDSpark = false; constraint.Reset(); }
 
                     // --spec-draft-n-max parity with llama.cpp (issue #30): the MTP
                     // draft-chain length per step. Unset (0) resolves via
@@ -896,6 +953,67 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         startPos = tokens.Length;
                     }
                     prefillMs = swReq.ElapsedMilliseconds - prefillStartMs;
+
+                    if (useDSpark)
+                    {
+                        // DSpark block-speculative decode (PR #413 Phase 6). Initialize
+                        // copies the prefill logits and replays the tap buffer's rows
+                        // [0, promptLen) into the draft's context — cached-prefix
+                        // positions were captured by the earlier request that owns the
+                        // matching KV (tap validity tracks KV validity: both describe
+                        // the last processed sequence, and prefix reuse already
+                        // guarantees the tokens match).
+                        var dsDec = new DSparkDecoder(_fwd, _dspark!);
+                        dsDec.Initialize(tokens.Length, logits);
+
+                        var textDecDs = new Utf8StreamDecoder();
+                        dsDec.Decode(sp.MaxNewTokens, stopIds.AsSpan(), tok =>
+                        {
+                            if (ttftMs < 0) ttftMs = swReq.ElapsedMilliseconds;
+                            decodeTokens++;
+                            fullSeq.Add(tok);
+                            var bytes = _tokenizer.DecodeBytes(tok);
+                            var chunk = textDecDs.Append(bytes);
+                            if (chunk.Length > 0)
+                                channel.Writer.TryWrite(
+                                    new GenerateChunk(GenerateChunkKind.Text, chunk));
+                        },
+                            minConfidence: DSparkDecoder.ResolveMinConfidence(-1f),
+                            verifyLenCap: DSparkDecoder.ResolveVerifyLen(0),
+                            ct: ct);
+
+                        var textFlushDs = textDecDs.Flush();
+                        if (textFlushDs.Length > 0)
+                            channel.Writer.TryWrite(
+                                new GenerateChunk(GenerateChunkKind.Text, textFlushDs));
+
+                        if (Environment.GetEnvironmentVariable("SHARPI_TRACE_DSPARK") == "1"
+                            && dsDec.TotalDraftsEmitted > 0)
+                        {
+                            Console.Error.WriteLine(
+                                $"[InferenceEngine] DSpark: {dsDec.TotalDraftsAccepted}/{dsDec.TotalDraftsEmitted} " +
+                                $"drafts accepted ({dsDec.AcceptanceRate:P1}); " +
+                                $"phase ms draft={dsDec.DraftMs:F0} verify={dsDec.VerifyMs:F0} commit={dsDec.CommitMs:F0}");
+                        }
+
+                        // End-of-decode snapshot — see the non-MTP twin below for the
+                        // !useCanonicalSnapshot rationale. DSpark requires a rewindable
+                        // pass, so CaptureSnapshot is a no-op and only the _prevTokens
+                        // pairing matters (prefix reuse for the next turn).
+                        if (!useCanonicalSnapshot && !ct.IsCancellationRequested)
+                        {
+                            _fwd.CaptureSnapshot();
+                            var snapDs = fullSeq.ToArray();
+                            _prevTokens = snapDs;
+                            if (_slotTokens is not null) _slotTokens[0] = snapDs;
+                        }
+                        // DSparkDecoder.Decode never emits the stop token itself, so
+                        // decodeTokens reaching MaxNewTokens means budget exhaustion.
+                        channel.Writer.TryWrite(new GenerateChunk(
+                            GenerateChunkKind.Stop, "", TruncatedByMaxTokens: decodeTokens >= sp.MaxNewTokens));
+                        channel.Writer.TryComplete();
+                        return;
+                    }
 
                     if (useMtp)
                     {
@@ -1279,6 +1397,10 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                 $"[InferenceEngine] could not bind backend context for teardown ({ex.GetType().Name}: {ex.Message}); " +
                 "freeing anyway.");
         }
+
+        // DSpark draft (PR #413): a CUDA draft frees device buffers through the shared
+        // backend, so dispose it while the backend is still live (before _fwd/_owned).
+        _dspark?.Dispose();
 
         // Issue #212: dispose the scratch slot(s) the engine allocated (slot 0 is the pass's
         // OwnedSlot — owned/freed by _fwd.Dispose, never disposed here). Done before _fwd.Dispose

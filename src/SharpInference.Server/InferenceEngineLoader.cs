@@ -153,8 +153,17 @@ public static class InferenceEngineLoader
                     tokenizer.SpecialTokens.TryGetValue("<|image|>", out var p) ? p : 258880);
             }
 
+            string? dsparkPath = !string.IsNullOrWhiteSpace(opts.DSparkModelPath)
+                ? opts.DSparkModelPath
+                : Environment.GetEnvironmentVariable("SHARPI_DSPARK_MODEL");
+
             if (opts.MaxBatchSize > 1 && batchingSupported && fwd is IBatchedForwardPass batchFwd)
             {
+                if (!string.IsNullOrWhiteSpace(dsparkPath))
+                    throw new InvalidOperationException(
+                        "DSpark (DSparkModelPath / SHARPI_DSPARK_MODEL) is not supported with " +
+                        "continuous batching (MaxBatchSize > 1) — the tap buffer is " +
+                        "single-sequence (docs/dspark-plan.md Phase 6). Set MaxBatchSize=1.");
                 engine = new ContinuousBatchingEngine(batchFwd, tokenizer, modelId, opts.MaxBatchSize,
                     thinkTokenId, endThinkTokenId,
                     prefillChunkTokens: opts.PrefillChunkTokens,
@@ -169,6 +178,8 @@ public static class InferenceEngineLoader
                     owned.ToArray());
                 if (visionEmbedder is not null)
                     ie.EnableImageInput(visionEmbedder, visionModel!, imgIds.Open, imgIds.Close, imgIds.Placeholder);
+                if (!string.IsNullOrWhiteSpace(dsparkPath))
+                    AttachDSpark(ie, fwd, model, hp, owned, opts, dsparkPath, ctxSize);
                 engine = ie;
             }
         }
@@ -184,6 +195,94 @@ public static class InferenceEngineLoader
         var grammarVocab = new SharpInference.Core.Grammar.GrammarVocabulary(tokenizer);
 
         return new LoadedEngine(engine, arch, tokenizer.ChatTemplate, toolBoundaryStopTokenIds, grammarVocab);
+    }
+
+    // ── DSpark draft head (docs/dspark-plan.md Phase 6, PR #413) ─────────────
+
+    /// <summary>
+    /// Load the configured DSpark draft head and attach it to the single-user engine:
+    /// resolve the safetensors + sibling config.json, validate head↔target compatibility
+    /// and tap support, run the placement planner (GPU draft on the target's CudaBackend,
+    /// CPU draft otherwise), enable hidden taps BEFORE any request runs, and hand
+    /// ownership of the draft to the engine. Unlike the CLI (which falls back to normal
+    /// generation), an explicitly configured server head that can't be honored throws —
+    /// silent degradation at startup would misreport the deployment's capabilities.
+    /// </summary>
+    private static void AttachDSpark(InferenceEngine ie, IForwardPass fwd, GgufModel model,
+        ModelHyperparams hp, List<IDisposable> owned, SharpInferenceServerOptions opts,
+        string configuredPath, int ctxSize)
+    {
+        string stPath = configuredPath;
+        if (Directory.Exists(stPath)) stPath = Path.Combine(stPath, "model.safetensors");
+        if (!File.Exists(stPath))
+            throw new FileNotFoundException($"DSpark model not found: {stPath}");
+        string cfgPath = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(stPath))!, "config.json");
+        if (!File.Exists(cfgPath))
+            throw new FileNotFoundException($"DSpark config.json not found next to the safetensors: {cfgPath}");
+
+        var cfg = DSparkConfig.FromJsonFile(cfgPath);
+        if (cfg.VocabSize != hp.VocabSize || cfg.NumTargetLayers != hp.NumLayers
+            || cfg.HiddenSize != hp.EmbeddingDim)
+            throw new InvalidOperationException(
+                $"DSpark head/target mismatch — head expects vocab {cfg.VocabSize}, " +
+                $"{cfg.NumTargetLayers} target layers, hidden {cfg.HiddenSize}; target has " +
+                $"vocab {hp.VocabSize}, {hp.NumLayers} layers, hidden {hp.EmbeddingDim}.");
+        if (!fwd.SupportsHiddenTaps)
+            throw new InvalidOperationException(
+                "DSpark requires a tap-capable dense forward pass (CPU, NGpuLayers=0, or full " +
+                "CUDA offload, NGpuLayers=-1; no MoE / Gemma-4 / TurboQuant / SnapKV). " +
+                $"The configured pass ({fwd.GetType().Name}) can't capture hidden taps.");
+
+        // The GPU draft shares the TARGET's CudaBackend (one stream orders the tap
+        // producer and draft consumer); only meaningful for the dense CUDA pass.
+        CudaBackend? cuda = null;
+        if (fwd is CudaForwardPass)
+            foreach (var d in owned)
+                if (d is CudaBackend cb) { cuda = cb; break; }
+
+        var userPlace = !string.IsNullOrWhiteSpace(opts.DSparkPlace)
+            ? DSparkPlacementPlanner.ParsePlacement(opts.DSparkPlace)
+            : DSparkPlacementPlanner.ResolvePlacement(null);
+        var hwProfile = cuda is not null ? HardwareProfile.Detect(cuda) : HardwareProfile.Detect();
+        var targetPlacement = TierPlanner.Plan(model, hp, hwProfile, requestedCtxSize: ctxSize);
+        long headBytesGpu = CudaDSparkDraftModel.EstimateGpuResidentBytes(cfg);
+        long headBytesCpu = DSparkDraftModel.EstimateResidentBytes(cfg);
+        long tapBytes = (long)targetPlacement.RecommendedCtxSize * cfg.TapDim * sizeof(float);
+        var decision = DSparkPlacementPlanner.Plan(
+            hwProfile, targetPlacement, headBytesGpu, headBytesCpu + tapBytes, userPlace);
+
+        if (decision.Placement == DSparkPlacement.Gpu && cuda is null)
+        {
+            // Gpu → Cpu → Off graceful fallback: re-plan in Auto over a GPU-less
+            // profile so the RAM budget is actually checked.
+            decision = DSparkPlacementPlanner.Plan(
+                hwProfile with { VramBytes = 0 }, targetPlacement,
+                headBytesGpu, headBytesCpu + tapBytes, DSparkPlacement.Auto);
+        }
+        Console.Error.WriteLine($"[InferenceEngine] DSpark placement: {decision.Placement} — {decision.Reason}");
+        if (decision.Placement == DSparkPlacement.Off)
+            throw new InvalidOperationException(
+                $"DSpark was configured (SHARPI_DSPARK_MODEL / DSparkModelPath) but placement " +
+                $"resolved to Off — {decision.Reason}. Free resources, pass DSparkPlace=cpu/gpu " +
+                "explicitly, or unset the head.");
+
+        fwd.EnableHiddenTaps(cfg.TargetLayerIds);
+        using var st = SafetensorsLoader.Open(stPath);
+        IDSparkDraft draft = decision.Placement == DSparkPlacement.Gpu
+            ? new CudaDSparkDraftModel(cfg, st, cuda!, fwd.MaxSeqLen)
+            : new DSparkDraftModel(cfg, st, fwd.MaxSeqLen);
+        try
+        {
+            ie.AttachDSparkDraft(draft);
+        }
+        catch
+        {
+            draft.Dispose();
+            throw;
+        }
+        Console.Error.WriteLine(
+            $"[InferenceEngine] DSpark draft attached: {cfg.NumLayers}L block-{cfg.BlockSize} " +
+            $"({decision.Placement}) from {stPath}");
     }
 
     // ── Backend dispatch ─────────────────────────────────────────────────────

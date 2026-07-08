@@ -59,7 +59,8 @@ public static class ResponsesEndpoints
         var sp = SamplingParamsBuilder.Build(opts,
             temperature: req.Temperature,
             topP:        req.TopP,
-            maxTokens:   req.MaxOutputTokens);
+            maxTokens:   req.MaxOutputTokens,
+            thinkingDisabled: !enableThinking);
 
         var responseId = $"resp_{Guid.NewGuid():N}";
         var itemId = $"msg_{Guid.NewGuid():N}";
