@@ -118,6 +118,17 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
     private readonly SnapKvConfig _snapKvCfg;
     private SnapKvSelector? _snapKv;
 
+    // Hidden-state taps (DSpark / EAGLE-3-style draft conditioning, PR #413 spec).
+    // _tapSlotByLayer maps layer index → slot in a tap row (-1 = untapped).
+    // Buffer layout is position-major: row for position p starts at
+    // _tapBuf + (long)p * _tapCount * _embDim; slot s occupies embDim floats at
+    // offset s * _embDim within the row. Grows geometrically as positions advance.
+    private int[]? _tapSlotByLayer;
+    private int _tapCount;
+    private float* _tapBuf;
+    private long _tapCapacityPositions;
+    private int _tapHighWater;   // positions [0.._tapHighWater) captured at least once
+
     // Diagnostic: per-layer residual L2-norm trace (env: SHARPI_TRACE_NORMS=1).
     private static readonly bool _traceNorms =
         Environment.GetEnvironmentVariable("SHARPI_TRACE_NORMS") == "1";
@@ -906,6 +917,11 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
                         Copy(h, batchNorm + (long)n * _embDim, _embDim);
                         SimdKernels.AddInPlace(h, batchResidual + (long)n * _embDim, _embDim);
                     }
+
+                    // Hidden-state taps: batchHidden rows are this layer's outputs.
+                    if (_tapSlotByLayer is { } tapSlots && tapSlots[layer] >= 0)
+                        for (int n = 0; n < N; n++)
+                            CaptureTap(startPos + n, tapSlots[layer], batchHidden + (long)n * _embDim);
                 }
 
                 // Set KV cache length to startPos + N for subsequent decode calls.
@@ -1180,6 +1196,95 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
     /// compacted frame correctly. MoE stays <c>true</c>: <see cref="BatchVerify"/> itself
     /// falls back to sequential <see cref="Forward"/> calls for MoE, which is still correct.
     /// </summary>
+    // ── Hidden-state taps (DSpark draft conditioning, PR #413 spec) ──
+
+    /// <summary>
+    /// Taps require stable absolute positions, which SnapKV compaction breaks,
+    /// and are captured on the standard dense paths only (no TurboQuant KV).
+    /// </summary>
+    public bool SupportsHiddenTaps => !_snapKvCfg.Enabled && _tqKvCache is null;
+
+    public int HiddenTapDim => _tapCount * _embDim;
+
+    public void EnableHiddenTaps(ReadOnlySpan<int> layerIds)
+    {
+        if (!SupportsHiddenTaps)
+            throw new NotSupportedException(
+                "Hidden-state taps are not supported with SnapKV eviction or a TurboQuant KV cache " +
+                "(both break the absolute-position indexing taps rely on).");
+        // Gemma-family post-layer transforms (post-FFW norm, PLE injection, per-layer
+        // output scale) run only on the sequential RunTrunk path; the batched
+        // Prefill/BatchVerify cores capture at the plain FFN-residual point. Until the
+        // batched cores mirror those transforms, taps on such models would record
+        // different values per path — reject rather than desync silently. (Gemma 4
+        // per-layer head_dim models already route every batched call to sequential
+        // Forward, but the guard keeps the contract explicit.)
+        if (_postFfwNorm is not null || _layerOutputScale is not null || _hp.HasPerLayerTokenEmbd)
+            throw new NotSupportedException(
+                "Hidden-state taps are not supported on models with post-FFW norm / per-layer " +
+                "output scale / PLE (capture points differ between sequential and batched paths).");
+        if (layerIds.Length == 0)
+            throw new ArgumentException("At least one tap layer is required.", nameof(layerIds));
+
+        var slots = new int[_hp.NumLayers];
+        Array.Fill(slots, -1);
+        int prev = -1;
+        for (int s = 0; s < layerIds.Length; s++)
+        {
+            int layer = layerIds[s];
+            if (layer <= prev || layer >= _hp.NumLayers)
+                throw new ArgumentOutOfRangeException(nameof(layerIds),
+                    $"Tap layer ids must be strictly increasing within [0, {_hp.NumLayers - 1}]; got {layer}.");
+            slots[layer] = s;
+            prev = layer;
+        }
+
+        if (_tapBuf != null) { NativeMemory.Free(_tapBuf); _tapBuf = null; }
+        _tapSlotByLayer = slots;
+        _tapCount = layerIds.Length;
+        _tapCapacityPositions = 0;
+        _tapHighWater = 0;
+    }
+
+    public ReadOnlySpan<float> HiddenTapsAt(int position)
+    {
+        if (_tapSlotByLayer is null || position < 0 || position >= _tapHighWater)
+            return default;
+        return new ReadOnlySpan<float>(_tapBuf + (long)position * _tapCount * _embDim,
+            _tapCount * _embDim);
+    }
+
+    /// <summary>Grow the tap buffer so rows for positions [0..position] exist.</summary>
+    private void EnsureTapCapacity(int position)
+    {
+        if (position < _tapCapacityPositions) return;
+        long needed = position + 1L;
+        // Geometric growth from 256, capped at the model context so the last
+        // doubling can't overshoot it; `needed` always wins when it's larger.
+        long newCap = Math.Max(Math.Min(
+            _tapCapacityPositions == 0 ? 256 : _tapCapacityPositions * 2,
+            _hp.ContextLength), needed);
+        long rowFloats = (long)_tapCount * _embDim;
+        var newBuf = (float*)NativeMemory.AllocZeroed((nuint)(newCap * rowFloats * sizeof(float)));
+        if (_tapBuf != null)
+        {
+            NativeMemory.Copy(_tapBuf, newBuf,
+                (nuint)(_tapCapacityPositions * rowFloats * sizeof(float)));
+            NativeMemory.Free(_tapBuf);
+        }
+        _tapBuf = newBuf;
+        _tapCapacityPositions = newCap;
+    }
+
+    /// <summary>Copy one tapped layer output (embDim floats) into position/slot.</summary>
+    private void CaptureTap(int position, int slot, float* layerOutput)
+    {
+        EnsureTapCapacity(position);
+        float* dst = _tapBuf + ((long)position * _tapCount + slot) * _embDim;
+        Copy(dst, layerOutput, _embDim);
+        if (position >= _tapHighWater) _tapHighWater = position + 1;
+    }
+
     public bool SupportsBatchVerify =>
         _tqKvCache is null
         && _layerHeadDim is null
@@ -1353,6 +1458,11 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
                         Copy(h, batchNorm + (long)n * _embDim, _embDim);
                         SimdKernels.AddInPlace(h, batchResidual + (long)n * _embDim, _embDim);
                     }
+
+                    // Hidden-state taps: batchHidden rows are this layer's outputs.
+                    if (_tapSlotByLayer is { } tapSlots && tapSlots[layer] >= 0)
+                        for (int n = 0; n < N; n++)
+                            CaptureTap(startPos + n, tapSlots[layer], batchHidden + (long)n * _embDim);
                 }
 
                 // Ensure cache length is startPos + N
@@ -1643,6 +1753,10 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
             // residual balance and produces unbounded hidden L2 growth).
             if (_layerOutputScale is not null)
                 SimdKernels.ScaleInPlace(_hidden, _layerOutputScale[layer], _embDim);
+
+            // Hidden-state tap: _hidden now holds this layer's output (= next layer's input).
+            if (_tapSlotByLayer is { } tapSlots && tapSlots[layer] >= 0)
+                CaptureTap(position, tapSlots[layer], _hidden);
 
             if (_traceNorms) _normTraceFfn![layer] = L2Norm(_hidden, _embDim);
         }
@@ -2847,6 +2961,7 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
         NativeMemory.Free(_ropeSinTable);
         if (_ropeCosTableSwa != null) NativeMemory.Free(_ropeCosTableSwa);
         if (_ropeSinTableSwa != null) NativeMemory.Free(_ropeSinTableSwa);
+        if (_tapBuf != null) { NativeMemory.Free(_tapBuf); _tapBuf = null; }
 
         foreach (var ptr in _normCache.Values)
             NativeMemory.Free((void*)ptr);

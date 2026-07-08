@@ -26,7 +26,14 @@ public static class TierPlanner
         int? pinGpuLayers = null)
     {
         if (hardware.VramBytes <= 0)
-            return new LayerPlacement(0, hp.NumLayers, 0, 0, requestedCtxSize > 0 ? requestedCtxSize : hp.ContextLength);
+        {
+            long allCpuBytes = 0;
+            for (int i = 0; i < hp.NumLayers; i++)
+                allCpuBytes += MeasureLayerBytes(model, hp, i);
+            return new LayerPlacement(0, hp.NumLayers, 0, 0,
+                requestedCtxSize > 0 ? requestedCtxSize : hp.ContextLength,
+                CpuWeightBytes: allCpuBytes);
+        }
 
         long vramTotal = hardware.VramBytes;
         int headDim = hp.HeadDim;
@@ -44,7 +51,7 @@ public static class TierPlanner
             + hp.NumKvHeads * headDim * 2 + hp.NumHeads * headDim
             + Math.Max(hp.IntermediateDim, hp.IsMoE ? hp.ExpertIntermediateDim : hp.IntermediateDim) * 2
             + hp.VocabSize + (hp.IsMoE ? hp.NumExperts + hp.EmbeddingDim * 2 : 0)) * sizeof(float);
-        long reserved = Math.Max(vramTotal / 10, 512L * 1024 * 1024); // 10% or 512 MB min
+        long reserved = ReservedVramBytes(vramTotal); // 10% or 512 MB min
         long vramBudget = vramTotal - scratchBytes - reserved;
 
         // Priority 1: Embedding + output projection (always on GPU)
@@ -186,6 +193,14 @@ public static class TierPlanner
             }
         }
 
+        // CPU-resident trunk weights (the layers NOT placed on GPU), priced with the
+        // same MeasureLayerBytes the packer uses. Routed MoE experts stay excluded
+        // (they stream via SLRU or mmap on demand). Diagnostic input for the DSpark
+        // placement planner's RAM-headroom check (PR #413 spec §4).
+        long cpuWeightBytes = 0;
+        for (int i = gpuLayers; i < hp.NumLayers; i++)
+            cpuWeightBytes += MeasureLayerBytes(model, hp, i);
+
         return new LayerPlacement(
             gpuLayers,
             hp.NumLayers - gpuLayers,
@@ -193,8 +208,18 @@ public static class TierPlanner
             gpuKvBytes,
             gpuCtxSize,
             expertCacheBudget,
-            moeRoutedExpertBytes);
+            moeRoutedExpertBytes,
+            cpuWeightBytes);
     }
+
+    /// <summary>
+    /// VRAM held back from any placement budget for driver/display overhead:
+    /// 10% of the card or 512 MB, whichever is larger. Shared by
+    /// <see cref="Plan"/> and <see cref="DSparkPlacementPlanner"/> so the two
+    /// planners can't drift (PR #413 spec §4).
+    /// </summary>
+    public static long ReservedVramBytes(long vramTotal) =>
+        Math.Max(vramTotal / 10, 512L * 1024 * 1024);
 
     // For per-layer-KV models (Gemma 4: SWA window-rings, KV-share aliasing, per-layer
     // head_dim / kv-heads) KV bytes are piecewise in context — SWA layers saturate at
@@ -343,6 +368,10 @@ public static class TierPlanner
 /// <paramref name="MoeRoutedExpertBytes"/> is the full-residency GPU cost of all routed
 /// experts; when it exceeds <paramref name="ExpertCacheBudgetBytes"/> the model can't keep
 /// every expert resident and must use the hybrid path (MoE only; 0 for dense — issue #215).
+/// <paramref name="CpuWeightBytes"/> is the estimated CPU-resident trunk weight cost of the
+/// layers NOT placed on GPU (routed MoE experts excluded — they stream); diagnostic input
+/// for the DSpark placement planner's RAM-headroom check (PR #413 spec §4). Hand-built
+/// placements (hybrid-GDN paths) may leave it 0.
 /// </summary>
 public sealed record LayerPlacement(
     int GpuLayers,
@@ -351,7 +380,8 @@ public sealed record LayerPlacement(
     long GpuKvBytes,
     int RecommendedCtxSize,
     long ExpertCacheBudgetBytes = 0,
-    long MoeRoutedExpertBytes = 0)
+    long MoeRoutedExpertBytes = 0,
+    long CpuWeightBytes = 0)
 {
     public string Summary()
     {

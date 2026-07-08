@@ -329,4 +329,47 @@ public interface IForwardPass : IDisposable, IThreadAffineBackend
     /// separate concern handled via <see cref="TruncateTo"/> / snapshots.
     /// </summary>
     void MtpTruncateTo(int length) { }
+
+    // ── Hidden-state taps (EAGLE-3-style draft conditioning, e.g. DSpark — PR #413 spec) ──
+    //
+    // Draft heads like DSpark condition on the TARGET model's intermediate hidden
+    // states from a fixed set of layers (config `target_layer_ids`). A pass that
+    // supports taps captures, for every processed position, the output of each
+    // tapped layer (the value that feeds the next layer — HF's hidden_states[i+1]
+    // convention) into an absolute-position-indexed buffer that survives until the
+    // position is overwritten by a later pass at the same position.
+
+    /// <summary>
+    /// True when this pass can capture per-layer hidden-state taps via
+    /// <see cref="EnableHiddenTaps"/>. Passes may report <c>false</c> transiently
+    /// when a cache transform breaks absolute positioning (e.g. SnapKV compaction).
+    /// </summary>
+    bool SupportsHiddenTaps => false;
+
+    /// <summary>
+    /// Begin capturing hidden-state taps for the given strictly-increasing layer
+    /// indices (0-based; layer i's tap is that layer's output, i.e. the input of
+    /// layer i+1). Capture applies to every subsequent <see cref="Forward"/>,
+    /// <see cref="Prefill"/>, and <see cref="BatchVerify"/> call. Taps are stored
+    /// per absolute position; <see cref="TruncateTo"/> does not clear them — a
+    /// re-processed position simply overwrites its slot. Single-sequence use only.
+    /// </summary>
+    void EnableHiddenTaps(ReadOnlySpan<int> layerIds) =>
+        throw new NotSupportedException(
+            $"{GetType().Name} does not support hidden-state taps. " +
+            "Check SupportsHiddenTaps before calling.");
+
+    /// <summary>
+    /// Width of one tap row: tappedLayerCount × EmbeddingDim once
+    /// <see cref="EnableHiddenTaps"/> has been called; 0 before/without taps.
+    /// </summary>
+    int HiddenTapDim => 0;
+
+    /// <summary>
+    /// The concatenated tapped hidden states of an absolute position, in
+    /// <see cref="EnableHiddenTaps"/> layer order (length = <see cref="HiddenTapDim"/>).
+    /// Empty when the position has not been captured. Valid until the next
+    /// forward/prefill/verify call that reaches the same position.
+    /// </summary>
+    ReadOnlySpan<float> HiddenTapsAt(int position) => default;
 }

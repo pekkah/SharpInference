@@ -2,6 +2,24 @@
 
 *Drafted 2026-07-01, on branch `claude/dspark-feasibility-61y4au`.*
 
+> **Implementation status (2026-07-07):** Phases 0–3 are implemented. Phase 0 findings
+> (exact backbone math, tensor schema, inference protocol reverse-engineered from
+> `deepspec/modeling/dspark/` + `deepspec/eval/`) corrected one §6 assumption: the DFlash
+> backbone is NOT a k-sequential drafter — it is an EAGLE-3-style block drafter whose
+> per-layer context K/V is projected from TARGET hidden-state taps
+> (`target_layer_ids`, fused via `fc` + RMSNorm), with mask-token block positions decoded
+> bidirectionally in one pass. Landed pieces: `SafetensorsLoader` moved to Core (+
+> `ReadRaw`), hidden-state taps on `IForwardPass`/`ForwardPass`
+> (`EnableHiddenTaps`/`HiddenTapsAt`, captured in Forward/Prefill/BatchVerify),
+> `DSparkConfig`, `DSparkDraftModel` (CPU backbone + vanilla Markov head + confidence
+> head), `DSparkDecoder` (folded batched verify, greedy-parity), `DSparkPlacementPlanner`
+> (+ shared `TierPlanner.ReservedVramBytes`, `LayerPlacement.CpuWeightBytes`), the four
+> CLI flags/env vars from §5, and `SpecType.DSpark`. The confidence-threshold trim (§7's
+> CLI reduction) shipped with the decoder. Still open: Phase 4 (GPU draft path +
+> heterogeneous benchmarking — `--dspark-place gpu` currently downgrades to CPU with a
+> note), Phase 5 (load-aware scheduling beyond the threshold trim), Phase 6 (server).
+> Fetch weights with `download-model.ps1 -Model qwen3-4b` + `-Model dspark-qwen3-4b`.
+
 ## 1. Background
 
 [DSpark](https://github.com/deepseek-ai/DeepSpec) ("Confidence-Scheduled Speculative

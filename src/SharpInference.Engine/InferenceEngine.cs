@@ -691,6 +691,14 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         case SpecType.None:
                             useMtp = false;
                             break;
+                        case SpecType.DSpark:
+                            // The engine has no DSpark path yet (spec Phase 6 — server
+                            // integration). Failing fast beats silently swapping in
+                            // Auto/MTP behavior the caller didn't ask for.
+                            throw new InvalidOperationException(
+                                "SamplingParams.SpecType=DSpark is not supported by the inference " +
+                                "engine yet (docs/dspark-plan.md Phase 6); DSpark currently runs on " +
+                                "the CLI single-prompt path only. Use SpecType.Auto or None here.");
                         case SpecType.Mtp:
                             if (mtpEnvDisabled)
                                 throw new InvalidOperationException(

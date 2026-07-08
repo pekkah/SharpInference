@@ -1,7 +1,7 @@
 using System.Runtime.InteropServices;
 using System.Text.Json;
 
-namespace SharpInference.Diffusion;
+namespace SharpInference.Core;
 
 /// <summary>
 /// Safetensors file reader supporting both single-file and multi-shard directory layouts.
@@ -152,6 +152,31 @@ public sealed class SafetensorsLoader : IWeightLoader
         return result;
     }
 
+    /// <summary>
+    /// Read a tensor's raw (unconverted) bytes plus its safetensors dtype string
+    /// (e.g. "BF16", "F32"). For consumers that keep large tensors in their storage
+    /// dtype and convert rows on demand (e.g. the DSpark draft head's BF16
+    /// embedding/markov tables) instead of materializing a full F32 copy.
+    /// </summary>
+    public byte[] ReadRaw(string name, out string dtype)
+    {
+        if (!_tensors.TryGetValue(name, out var info))
+            throw new KeyNotFoundException($"Safetensors tensor not found: '{name}'");
+
+        long byteLen = info.End - info.Start;
+        var raw = new byte[byteLen];
+        var (file, dataOffset) = _shards[info.ShardIndex];
+
+        lock (file)
+        {
+            file.Seek(dataOffset + info.Start, SeekOrigin.Begin);
+            file.ReadExactly(raw);
+        }
+
+        dtype = info.Dtype;
+        return raw;
+    }
+
     /// <summary>Read tensor shape without loading data.</summary>
     public int[] GetShape(string name)
     {
@@ -237,7 +262,7 @@ public sealed class SafetensorsLoader : IWeightLoader
     /// <see cref="ReadF32"/>. Raw pointer access is not supported for this backend.
     public unsafe bool TryGetRaw(string name,
         out nint dataPtr, out long byteLen,
-        out SharpInference.Core.DType dtype, out int rows, out int cols)
+        out DType dtype, out int rows, out int cols)
     {
         dataPtr = 0; byteLen = 0; dtype = default; rows = 0; cols = 0;
         return false;

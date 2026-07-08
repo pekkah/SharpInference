@@ -3,7 +3,7 @@
     Downloads GGUF models for SharpInference development.
 .DESCRIPTION
     Downloads from HuggingFace to the models/ directory. Skips if already present.
-    Supports: smollm2, vibethinker, qwen3-8b, olmoe-1b-7b, llama31-70b, qwen3-coder-30b-a3b, qwen36-35b-a3b,
+    Supports: smollm2, vibethinker, qwen3-8b, qwen3-4b, dspark-qwen3-4b, olmoe-1b-7b, llama31-70b, qwen3-coder-30b-a3b, qwen36-35b-a3b,
               qwen36-27b-mtp, qwen36-27b-mtp-q5, qwen36-35b-a3b-mtp, carnice-35b-a3b-mtp,
               ornith-9b, ornith-35b,
               gemma4-12b-qat, gemma4-12b-q4km, gemma4-e4b-qat, gemma4-12b-agentic,
@@ -16,6 +16,8 @@
     .\download-model.ps1 -Model vibethinker             # VibeThinker-1.5B Q8_0 (1.76 GB) — Qwen2-based math/reasoning (default), issue #282
     .\download-model.ps1 -Model vibethinker-q4          # VibeThinker-1.5B Q4_K_M (1.1 GB) — smaller/faster, slightly lossy
     .\download-model.ps1 -Model qwen3-8b                # Qwen3 8B (4.9 GB)
+    .\download-model.ps1 -Model qwen3-4b                # Qwen3 4B Q4_K_M (~2.5 GB) — DSpark speculative-decoding target (PR #413)
+    .\download-model.ps1 -Model dspark-qwen3-4b         # DSpark draft head for Qwen3-4B (2.8 GB BF16 safetensors + config.json)
     .\download-model.ps1 -Model olmoe-1b-7b             # OLMoE 1B-7B Instruct Q4_K_M (~4.4 GB) — small MoE for kernel validation
     .\download-model.ps1 -Model llama31-70b             # Llama 3.1 70B (40.8 GB)
     .\download-model.ps1 -Model qwen3-coder-30b-a3b     # Qwen3-Coder 30B-A3B Q4_K_M (18.6 GB)
@@ -36,7 +38,7 @@
     .\download-model.ps1 -Model realesrgan-x4           # Real-ESRGAN x4plus upscaler (67 MB)
 #>
 param(
-    [ValidateSet("smollm2", "vibethinker", "vibethinker-q4", "qwen3-8b", "qwen3-0.6b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "qwen36-35b-a3b",
+    [ValidateSet("smollm2", "vibethinker", "vibethinker-q4", "qwen3-8b", "qwen3-0.6b", "qwen3-4b", "dspark-qwen3-4b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "qwen36-35b-a3b",
                  "qwen36-27b-mtp", "qwen36-27b-mtp-q5", "qwen36-35b-a3b-mtp", "carnice-35b-a3b-mtp",
                  "ornith-9b", "ornith-35b",
                  "gemma4-12b-qat", "gemma4-12b-q4km", "gemma4-e4b-qat", "gemma4-12b-agentic",
@@ -92,6 +94,33 @@ $Models = @{
         Urls  = @("https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf")
         Size  = "~0.6 GB"
         Phase = "spec-decode draft (issue #207)"
+    }
+    # Qwen3-4B Q4_K_M — the DSpark speculative-decoding target (docs/dspark-plan.md,
+    # PR #413): deepseek-ai's dspark_qwen3_4b_block7 draft head was trained against
+    # Qwen/Qwen3-4B, so greedy-parity E2E validation pairs this GGUF with the
+    # `dspark-qwen3-4b` head below.
+    "qwen3-4b" = @{
+        Files = @("Qwen3-4B-Q4_K_M.gguf")
+        Urls  = @("https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf")
+        Size  = "~2.5 GB"
+        Phase = "DSpark target (PR #413)"
+    }
+    # DSpark draft head for Qwen3-4B (deepseek-ai/DeepSpec, MIT): DFlash block-parallel
+    # backbone (5 qwen3-style layers conditioned on target hidden-state taps) + rank-256
+    # Markov head + confidence head, BF16 safetensors. Used by
+    # `sharpi -m models/Qwen3-4B-Q4_K_M.gguf --dspark-model models/dspark_qwen3_4b_block7 --temp 0 -g 0`.
+    # config.json must sit next to model.safetensors (the CLI resolves it as a sibling).
+    "dspark-qwen3-4b" = @{
+        Files = @(
+            "dspark_qwen3_4b_block7\model.safetensors",
+            "dspark_qwen3_4b_block7\config.json"
+        )
+        Urls  = @(
+            "https://huggingface.co/deepseek-ai/dspark_qwen3_4b_block7/resolve/main/model.safetensors",
+            "https://huggingface.co/deepseek-ai/dspark_qwen3_4b_block7/resolve/main/config.json"
+        )
+        Size  = "2.8 GB"
+        Phase = "DSpark draft head (PR #413)"
     }
     # Smallest MoE model that fits in 12 GB VRAM for full-offload kernel validation.
     # OLMoE arch (allenai) — 7B total params, 1B active, 64 experts × 8 active, softmax routing.

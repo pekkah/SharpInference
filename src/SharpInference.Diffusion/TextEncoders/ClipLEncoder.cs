@@ -1,3 +1,5 @@
+using SharpInference.Core;
+
 namespace SharpInference.Diffusion.TextEncoders;
 
 /// <summary>

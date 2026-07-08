@@ -671,4 +671,6 @@ public enum SpecType
     None = 1,
     /// <summary>Multi-Token Prediction self-speculative decoding via the model's own MTP head.</summary>
     Mtp = 2,
+    /// <summary>DSpark block-parallel draft head (deepseek-ai/DeepSpec) — requires a --dspark-model head.</summary>
+    DSpark = 3,
 }
