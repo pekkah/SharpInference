@@ -3,7 +3,7 @@
     Downloads GGUF models for SharpInference development.
 .DESCRIPTION
     Downloads from HuggingFace to the models/ directory. Skips if already present.
-    Supports: smollm2, vibethinker, qwen3-8b, qwen3-4b, dspark-qwen3-4b, olmoe-1b-7b, llama31-70b, qwen3-coder-30b-a3b, qwen36-35b-a3b,
+    Supports: smollm2, vibethinker, qwen3-8b, qwen3-4b, dspark-qwen3-4b, dspark-qwen3-8b, olmoe-1b-7b, llama31-70b, qwen3-coder-30b-a3b, qwen36-35b-a3b,
               qwen36-27b-mtp, qwen36-27b-mtp-q5, qwen36-35b-a3b-mtp, carnice-35b-a3b-mtp,
               ornith-9b, ornith-35b,
               gemma4-12b-qat, gemma4-12b-q4km, gemma4-e4b-qat, gemma4-12b-agentic,
@@ -18,6 +18,7 @@
     .\download-model.ps1 -Model qwen3-8b                # Qwen3 8B (4.9 GB)
     .\download-model.ps1 -Model qwen3-4b                # Qwen3 4B Q4_K_M (~2.5 GB) — DSpark speculative-decoding target (PR #413)
     .\download-model.ps1 -Model dspark-qwen3-4b         # DSpark draft head for Qwen3-4B (2.8 GB BF16 safetensors + config.json)
+    .\download-model.ps1 -Model dspark-qwen3-8b         # DSpark draft head for Qwen3-8B (4.7 GB BF16 safetensors + config.json) — pairs with qwen3-8b (issue #428)
     .\download-model.ps1 -Model olmoe-1b-7b             # OLMoE 1B-7B Instruct Q4_K_M (~4.4 GB) — small MoE for kernel validation
     .\download-model.ps1 -Model llama31-70b             # Llama 3.1 70B (40.8 GB)
     .\download-model.ps1 -Model qwen3-coder-30b-a3b     # Qwen3-Coder 30B-A3B Q4_K_M (18.6 GB)
@@ -38,7 +39,7 @@
     .\download-model.ps1 -Model realesrgan-x4           # Real-ESRGAN x4plus upscaler (67 MB)
 #>
 param(
-    [ValidateSet("smollm2", "vibethinker", "vibethinker-q4", "qwen3-8b", "qwen3-0.6b", "qwen3-4b", "dspark-qwen3-4b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "qwen36-35b-a3b",
+    [ValidateSet("smollm2", "vibethinker", "vibethinker-q4", "qwen3-8b", "qwen3-0.6b", "qwen3-4b", "dspark-qwen3-4b", "dspark-qwen3-8b", "olmoe-1b-7b", "llama31-70b", "qwen3-coder-30b-a3b", "qwen36-35b-a3b",
                  "qwen36-27b-mtp", "qwen36-27b-mtp-q5", "qwen36-35b-a3b-mtp", "carnice-35b-a3b-mtp",
                  "ornith-9b", "ornith-35b",
                  "gemma4-12b-qat", "gemma4-12b-q4km", "gemma4-e4b-qat", "gemma4-12b-agentic",
@@ -121,6 +122,22 @@ $Models = @{
         )
         Size  = "2.8 GB"
         Phase = "DSpark draft head (PR #413)"
+    }
+    # DSpark draft head for Qwen3-8B (issue #428 crossover validation): same DFlash
+    # block-7 layout as the 4B head (verified single model.safetensors + config.json
+    # on the hub), trained against Qwen/Qwen3-8B — pair with the `qwen3-8b` GGUF.
+    # Needs a 12 GB+ card for the GPU-draft placement next to the 8B target.
+    "dspark-qwen3-8b" = @{
+        Files = @(
+            "dspark_qwen3_8b_block7\model.safetensors",
+            "dspark_qwen3_8b_block7\config.json"
+        )
+        Urls  = @(
+            "https://huggingface.co/deepseek-ai/dspark_qwen3_8b_block7/resolve/main/model.safetensors",
+            "https://huggingface.co/deepseek-ai/dspark_qwen3_8b_block7/resolve/main/config.json"
+        )
+        Size  = "4.7 GB"
+        Phase = "DSpark draft head (issue #428)"
     }
     # Smallest MoE model that fits in 12 GB VRAM for full-offload kernel validation.
     # OLMoE arch (allenai) — 7B total params, 1B active, 64 experts × 8 active, softmax routing.

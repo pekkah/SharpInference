@@ -82,6 +82,21 @@
 > emitted tokens byte-identical to the host-heads path on the bench workload; the
 > new `CudaDSparkDraftModelTests` pin CUDA-vs-CPU proposal parity on the synthetic
 > head. Lever 2 (verify fixed cost) is now the whole remaining gap.
+>
+> **#428 lever 2, MMQ half (2026-07-09): measured, and rejected on parity.** The
+> existing `SHARPI_BATCH_DECODE_MMQ=1` A/B (which force-routes the pinned
+> `allowDecodeMmq:false` verify onto the int8 decode-MMQ tile) gives verify
+> 3350→2233 ms and 60.5→**79.5 t/s** on the same 4B workload — but the 256-token
+> parity oracle FAILS: the output text diverges from plain greedy mid-sequence
+> (acceptance shifts 37%→31% along the changed trajectory). The MMQ verify logits
+> flip argmaxes on near-ties vs the per-token decode path, so the "argmax-stable"
+> property that holds for batched-vs-batched (#201/#206) does NOT extend to
+> batched-MMQ-vs-per-token — the `allowDecodeMmq:false` pin is load-bearing and
+> stays. The +19 t/s is only reachable as an explicit parity-relaxed opt-in (the
+> output is still self-consistent greedy under MMQ numerics), or via the other
+> lever-2 half: a CUDA-graph-captured k-token verify to cut the ~10.6 ms fixed
+> launch overhead of the un-graphed 36-layer batched trunk while staying on the
+> bit-exact WS matvecs.
 
 ## 1. Background
 
