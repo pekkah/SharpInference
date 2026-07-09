@@ -5913,6 +5913,52 @@ extern ""C"" __global__ void llm_rope_neox_partial_batched(
     x[b] = x0 * s + x1 * c;
 }
 
+// Fused q+k partial NEOX RoPE over N tokens (DSpark GPU draft, issue #428):
+// one launch rotates both the query rows (q, [n_tok × num_q_heads*head_dim])
+// and the key rows (k, [n_tok × num_kv_heads*head_dim]) at position
+// base_position + t. The pair space is the union of both buffers' pairs:
+// [0, q_pairs) hits q, the rest hits k. The per-pair rotation math is the
+// same as llm_rope_neox_partial_batched, so per buffer the result is
+// bit-identical to two separate launches.
+extern ""C"" __global__ void llm_rope_neox_partial_batched_qk(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    int num_q_heads, int num_kv_heads, int head_dim, int rope_dim,
+    int base_position, float theta, int n_tok)
+{
+    int pair_idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int rope_half_dim = rope_dim / 2;
+    int q_pairs = num_q_heads * rope_half_dim;
+    int total_pairs = (num_q_heads + num_kv_heads) * rope_half_dim;
+    int token = (int)blockIdx.y;
+    if (pair_idx >= total_pairs || token >= n_tok) return;
+
+    float* x;
+    int h, i, num_heads;
+    if (pair_idx < q_pairs) {
+        x = q; h = pair_idx / rope_half_dim; i = pair_idx % rope_half_dim;
+        num_heads = num_q_heads;
+    } else {
+        int p = pair_idx - q_pairs;
+        x = k; h = p / rope_half_dim; i = p % rope_half_dim;
+        num_heads = num_kv_heads;
+    }
+    int position = base_position + token;
+
+    float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)rope_dim);
+    float angle = (float)position * freq;
+    float c = cosf(angle);
+    float s = sinf(angle);
+
+    long head_base = (long)token * (long)num_heads * (long)head_dim + (long)h * head_dim;
+    long a = head_base + i;
+    long b = head_base + i + rope_half_dim;
+    float x0 = x[a];
+    float x1 = x[b];
+    x[a] = x0 * c - x1 * s;
+    x[b] = x0 * s + x1 * c;
+}
+
 // ── TurboQuant rotate_query ────────────────────────────────────────────────
 // Applies the Walsh-Hadamard transform + per-layer sign flip to each query
 // head. One block per query head, head_dim threads per block.

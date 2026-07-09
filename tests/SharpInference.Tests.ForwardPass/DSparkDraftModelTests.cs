@@ -171,7 +171,9 @@ public sealed class DSparkDraftModelTests
     /// xorshift stream, keeps them as the reference ground truth (BF16 tensors
     /// pre-rounded), and writes a temp .safetensors file the real loader reads.
     /// </summary>
-    private sealed class SyntheticHead : IDisposable
+    // Internal (not private): CudaDSparkDraftModelTests reuses the same synthetic
+    // checkpoint to compare the CUDA draft backbone against this CPU model.
+    internal sealed class SyntheticHead : IDisposable
     {
         public string FilePath { get; }
         public DSparkConfig Config { get; }
@@ -281,6 +283,12 @@ public sealed class DSparkDraftModelTests
             return new DSparkDraftModel(Config, st, maxContextLength);
         }
 
+        public CudaDSparkDraftModel CreateCudaModel(Cuda.CudaBackend gpu, int maxContextLength = MaxCtx)
+        {
+            using var st = SafetensorsLoader.Open(FilePath);
+            return new CudaDSparkDraftModel(Config, st, gpu, maxContextLength);
+        }
+
         public void Dispose()
         {
             try { File.Delete(FilePath); } catch (IOException) { }
@@ -373,7 +381,7 @@ public sealed class DSparkDraftModelTests
         return a;
     }
 
-    private static float[] MakeTaps(int count, uint seed)
+    internal static float[] MakeTaps(int count, uint seed)
     {
         var rng = new XorShift(seed);
         var taps = new float[count * TapDim];

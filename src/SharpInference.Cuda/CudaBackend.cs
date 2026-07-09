@@ -274,6 +274,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _headNormQkBatchedKernel;
     private nint   _splitQgBatchedKernel;
     private nint   _ropeNeoxPartialBatchedKernel;
+    private nint   _ropeNeoxPartialBatchedQkKernel;
     private nint   _attentionKernel;
     // Gemma 4 (Phase 7): sliding-window attention, tanh-GELU FFN, final-logit
     // softcap. Kernel work only — forward-pass wiring lands in Phase 8.
@@ -2801,13 +2802,24 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// Dense batched GEMM against a RESIDENT fp16 weight with f32 device activations
     /// (DSpark GPU draft head, PR #413 Phase 4): converts the activations f32→f16 into
     /// internal scratch, then one <c>cublasGemmEx</c> f16×f16→f32 with fp32 accumulation.
-    /// <c>outputAll[nTok×rows] f32 = inputAll[nTok×cols] f32 × weightF16[rows×cols]ᵀ</c>,
-    /// all row-major. The weight skips <see cref="MatMulBatchedGemm"/>'s per-call dequant —
-    /// it is already fp16 in VRAM (via <see cref="UploadHalf"/>). NOT bit-exact vs the
-    /// f32 matvec path (activations rounded to fp16); draft-side use only, where numerics
-    /// affect acceptance rate, never emitted-token correctness.
+    /// <c>outputAll[nTok×rows] f32 = inputAll[nTok×cols] f32 × weightF16[rows×cols]ᵀ
+    /// + beta × outputAll</c>, all row-major. The weight skips
+    /// <see cref="MatMulBatchedGemm"/>'s per-call dequant — it is already fp16 in VRAM
+    /// (via <see cref="UploadHalf"/>). NOT bit-exact vs the f32 matvec path (activations
+    /// rounded to fp16); draft-side use only, where numerics affect acceptance rate,
+    /// never emitted-token correctness.
     /// </summary>
-    public void MatMulBatchedGemmF16W(Tensor outputAll, Tensor weightF16, Tensor inputAll, int nTok)
+    /// <param name="beta">GemmEx epilogue scale on the existing output: 0 (default)
+    /// overwrites, 1 accumulates — folding a residual add that would otherwise cost a
+    /// separate <see cref="AddInPlace"/> launch (issue #428).</param>
+    /// <param name="reuseConvertedInput">Skip the f32→f16 activation conversion and reuse
+    /// the internal scratch as-is. ONLY valid when the previous call to a
+    /// MatMulBatchedGemm* method converted the SAME <paramref name="inputAll"/> contents
+    /// at the same nTok×cols size (back-to-back projections of one normed block, e.g.
+    /// DSpark's q/k/v). The scratch is private to these methods; interleaved non-GEMM
+    /// launches don't disturb it.</param>
+    public void MatMulBatchedGemmF16W(Tensor outputAll, Tensor weightF16, Tensor inputAll, int nTok,
+                                      float beta = 0f, bool reuseConvertedInput = false)
     {
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
@@ -2836,6 +2848,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         EnsureGemmAf16((nuint)((long)nTok * cols * 2L));
 
         // 1) Convert activations fp32 → fp16 (same kernel MatMulBatchedGemm uses).
+        //    Skipped when the caller certifies the scratch already holds this input
+        //    (reuseConvertedInput contract above); EnsureGemmAf16 was a no-op then —
+        //    the size matches the converting call by contract, so no realloc occurred.
+        if (!reuseConvertedInput)
         {
             nint ip = xPtr, op = _gemmAf16Buf;
             int n = nTok * cols;
@@ -2846,9 +2862,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(f32_to_f16) failed: {r}");
         }
 
-        // 2) GemmEx: C[nTok×rows] f32 = A[nTok×cols] f16 × B[rows×cols] f16ᵀ, fp32 accum.
+        // 2) GemmEx: C[nTok×rows] f32 = A[nTok×cols] f16 × B[rows×cols] f16ᵀ + beta·C, fp32 accum.
         {
-            float alpha = 1f, beta = 0f;
+            float alpha = 1f;
             int M = nTok, K = cols, N = rows;
             int status = CuBlasInterop.GemmEx(
                 _handle,
@@ -4188,6 +4204,40 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         uint grid = (uint)((totalPairs + 255) / 256);
         int r = NvrtcInterop.LaunchKernel(_ropeNeoxPartialBatchedKernel, grid, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(rope_neox_partial_batched) failed: {r}");
+    }
+
+    /// <summary>
+    /// Fused q+k variant of <see cref="RoPEPartialBatched"/> (DSpark GPU draft, issue
+    /// #428): rotates <paramref name="q"/> (<c>[nTok × numQHeads × headDim]</c>) and
+    /// <paramref name="k"/> (<c>[nTok × numKvHeads × headDim]</c>) at position
+    /// basePosition + t in ONE launch. Per buffer bit-identical to the two separate
+    /// <see cref="RoPEPartialBatched"/> calls it replaces.
+    /// </summary>
+    public void RoPEPartialBatchedQk(Tensor q, Tensor k, int basePosition, int headDim,
+        int ropeDim, float ropeTheta, int numQHeads, int numKvHeads, int nTok, bool neox)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (!neox)
+            throw new ArgumentException("RoPEPartialBatchedQk currently supports only neox=true.", nameof(neox));
+        if (ropeDim <= 0 || (ropeDim & 1) != 0)
+            throw new ArgumentException("ropeDim must be a positive even number.", nameof(ropeDim));
+        if (ropeDim > headDim)
+            throw new ArgumentException("ropeDim must be <= headDim.", nameof(ropeDim));
+
+        int totalPairs = (numQHeads + numKvHeads) * (ropeDim / 2);
+        nint qPtr = GetDevPtr(q), kPtr = GetDevPtr(k);
+        int  pNQ = numQHeads, pNKV = numKvHeads, pHD = headDim, pRD = ropeDim, pPos = basePosition, pNT = nTok;
+        float pT = ropeTheta;
+        nint* args = stackalloc nint[9]
+        {
+            (nint)(&qPtr), (nint)(&kPtr),
+            (nint)(&pNQ), (nint)(&pNKV), (nint)(&pHD), (nint)(&pRD), (nint)(&pPos), (nint)(&pT), (nint)(&pNT)
+        };
+        uint grid = (uint)((totalPairs + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_ropeNeoxPartialBatchedQkKernel, grid, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(rope_neox_partial_batched_qk) failed: {r}");
     }
 
     /// <summary>
@@ -6983,6 +7033,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _matvecQ40Dp4aSoaKernel, _dequantQ40F16SoaKernel,   // #124/#173
             _rmsNormBatchedKernel, _headNormBatchedKernel, _headNormQkKernel, _headNormQkBatchedKernel,
             _splitQgBatchedKernel, _ropeNeoxPartialBatchedKernel,
+            _ropeNeoxPartialBatchedQkKernel,   // #428
             _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel, _attentionSwaBatchedKernel,
             _attentionSwaBf16Kernel, _attentionSwaBatchedBf16Kernel,
             _geluTanhMulKernel, _geluTanhMulStridedKernel, _softcapKernel,
@@ -7161,6 +7212,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _headNormQkBatchedKernel = GetKernelFunc("llm_head_norm_qk_batched");
         _splitQgBatchedKernel  = GetKernelFunc("llm_split_qg_batched");
         _ropeNeoxPartialBatchedKernel = GetKernelFunc("llm_rope_neox_partial_batched");
+        _ropeNeoxPartialBatchedQkKernel = GetKernelFunc("llm_rope_neox_partial_batched_qk");
         _ropeNeoxWithFactorsBatchedKernel = GetKernelFunc("llm_rope_neox_with_factors_batched");
         _attentionKernel       = GetKernelFunc("llm_attention");
         _attentionBf16Kernel   = GetKernelFunc("llm_attention_bf16");
