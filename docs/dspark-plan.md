@@ -63,6 +63,25 @@
 > tracked in issues #405–#409). Placement note: with `-c` unset the target's VRAM-fit KV
 > solve consumes the card and the planner correctly lands on `Cpu` — bound the context
 > to free headroom for the head.
+>
+> **#428 lever 1 (2026-07-09): the draft round is 11.8 ms, down from 27.8.** The
+> `SHARPI_DSPARK_TIMING=1` breakdown overturned the launch-bound theory: the old round
+> was ~1 ms launch enqueue + ~8.6 ms GPU + **~17.6 ms host Markov chain** — the
+> `DSparkHostHeads` GreedyBlock re-streams the 155 MB f32 `markov_w2` once per block
+> position (7×/round) at host DRAM bandwidth. Two changes:
+> (1) launch trims — one `AttentionBatchedRagged` launch/layer instead of the
+> per-query loop (35→5), beta=1 GemmEx residuals (no CopyDevice/AddInPlace), fused
+> q+k RoPE, shared f32→f16 activation converts; (2) the Markov re-bias, greedy
+> argmax chain, and confidence head moved on-device (fp16 `markov_w1`/`markov_w2`
+> resident, +156 MB VRAM at 4B-head shapes, gather→beta=1-GEMV→`llm_argmax_rows`
+> per position, zero host syncs inside the chain) so only [B] tokens + [B]
+> confidences cross PCIe per round. Same prompt/settings as above: draft
+> 1971→836 ms over ~71 rounds; DSpark default 50.0→61.1 t/s, `min-confidence 0.8`
+> 46.5→58.0 t/s, plain 55–62 t/s (thermal window) — DSpark now sits at plain-decode
+> speed on 4B, still verify-bound (verify ≈ 47 ms/round at k≈7). Acceptance and
+> emitted tokens byte-identical to the host-heads path on the bench workload; the
+> new `CudaDSparkDraftModelTests` pin CUDA-vs-CPU proposal parity on the synthetic
+> head. Lever 2 (verify fixed cost) is now the whole remaining gap.
 
 ## 1. Background
 

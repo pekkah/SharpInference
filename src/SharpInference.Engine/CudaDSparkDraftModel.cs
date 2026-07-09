@@ -7,8 +7,8 @@ namespace SharpInference.Engine;
 /// <summary>
 /// CUDA implementation of the DSpark draft head (docs/dspark-plan.md Phase 4,
 /// PR #413). Same math as <see cref="DSparkDraftModel"/> — an EAGLE-3-style
-/// block drafter over fused target hidden-state taps — with the backbone on
-/// the GPU and the sequential heads on the host:
+/// block drafter over fused target hidden-state taps — fully resident on the
+/// GPU, sequential Markov/confidence heads included (issue #428):
 ///
 /// <list type="bullet">
 /// <item>Projections (fc, q/k/v/o, gate/up/down, lm_head) are resident fp16
@@ -24,15 +24,19 @@ namespace SharpInference.Engine;
 /// (query, head) to the per-query <see cref="CudaBackend.Attention"/> loop it
 /// replaces (issue #428: 35 launches → 5), no crop, identical semantics to the
 /// CPU model's scratch-block attention.</item>
-/// <item>Base logits and final hiddens are downloaded once per block
-/// (~[B×vocab] + [B×embDim] floats, into pinned host buffers behind a single
-/// stream sync) and the shared <see cref="DSparkHostHeads"/> applies the Markov
-/// re-bias, greedy chain, and confidence scoring on the host — the
-/// semi-autoregressive part is tiny and inherently sequential.</item>
-/// <item>Launch-count trims (issue #428, the draft round is launch-bound on
-/// WDDM): residual adds ride the o/down GEMMs' beta=1 epilogue (no CopyDevice +
-/// AddInPlace pairs), q+k RoPE is one fused launch, and back-to-back projections
-/// of one normed block reuse the f32→f16 activation conversion.</item>
+/// <item>The Markov re-bias, greedy chain, and confidence head run ON-DEVICE
+/// (issue #428): per position, a gather kernel pulls markov_w1[prev] (prev read
+/// on-stream from the previous position's argmax), one beta=1 GemmEx adds the
+/// markov_w2 bias into the logits row, and llm_argmax_rows picks the token —
+/// no host sync inside the chain. Measured host-side, the old
+/// <see cref="DSparkHostHeads"/> chain re-streamed the [vocab × rank] markov_w2
+/// 7× per round at ~17.6 ms — ~65% of the whole draft round; on-device the same
+/// traffic runs at HBM bandwidth and the [B×vocab] logits download disappears —
+/// only [B] tokens + [B] confidences cross PCIe, behind a single stream sync.</item>
+/// <item>Launch-count trims (issue #428): residual adds ride the o/down GEMMs'
+/// beta=1 epilogue (no CopyDevice + AddInPlace pairs), q+k RoPE is one fused
+/// launch, and back-to-back projections of one normed block reuse the f32→f16
+/// activation conversion.</item>
 /// </list>
 ///
 /// Draft-side numerics (fp16 GEMMs) affect acceptance rate only, never emitted
@@ -58,9 +62,20 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
     private Tensor? _hiddenNormW, _finalNormW;
     private readonly Tensor?[] _qNormW, _kNormW, _inNormW, _ffnNormW;
 
-    // Host-side pieces shared with the CPU model.
-    private DSparkHostHeads? _heads;
+    // Draft-only embedding table stays host-side (two rows gathered per block).
     private ushort* _embedBf16; private float* _embedF32;   // [vocab, embDim]
+
+    // Device-side Markov/confidence heads (issue #428; semantics mirror
+    // DSparkHostHeads exactly — see its GreedyBlock).
+    private readonly int _rank;
+    private readonly bool _confWithMarkov;
+    private Tensor? _markovW1F16, _markovW2F16;  // [vocab, rank] fp16
+    private Tensor? _confWDev;                   // [embDim (+ rank)] f32
+    private float _confB;
+    private Tensor? _w1RowDev;                   // [rank] — the bias GEMV activation
+    private Tensor? _w1RowsDev;                  // [B, rank] — confidence feature tails
+    private Tensor? _argmaxDev;                  // [B*2] llm_argmax_rows (idx bits, value)
+    private Tensor? _confDev;                    // [B]
 
     // Device context K/V per layer: [_ctxCap, kvDim] f32, filled to _ctxLen,
     // with _block slack rows at the tail for the in-place block K/V.
@@ -76,10 +91,10 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
     private Tensor? _gate, _up;                // [B × interm]
     private Tensor? _logitsDev;                // [B × vocab]
     private readonly float[] _xHost;           // [B × embDim] block input assembly
-    // Pinned host landing zones for the per-block download pair — one async +
+    // Pinned host landing zones for the per-block result pair — one async +
     // one sync copy share a single StreamSynchronize (issue #49 pattern).
-    private nint _pinnedLogits;                // [B × vocab] floats
-    private nint _pinnedHidden;                // [B × embDim] floats
+    private nint _pinnedArgmax;                // [B*2] floats (idx bits, value)
+    private nint _pinnedConf;                  // [B] floats
     // One-launch ragged attention args: every block query attends this layer's
     // ctx cache over the same [0, ctxLen+B) range (issue #428).
     private readonly Tensor[] _raggedK, _raggedV;
@@ -100,14 +115,16 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
 
     private readonly System.Diagnostics.Stopwatch _phaseSw = new();
 
-    /// <summary>Milliseconds spent waiting on the per-block download pair — the
-    /// stream sync collapses the whole enqueued GPU pipeline into this window,
-    /// so it reads as "GPU execution + D2H transfer" per round (issue #428).</summary>
+    /// <summary>Milliseconds spent waiting on the per-block result download —
+    /// the stream sync collapses the whole enqueued GPU pipeline (backbone +
+    /// device-side heads) into this window, so it reads as "GPU execution +
+    /// D2H transfer" per round (issue #428).</summary>
     public double GpuWaitMs { get; private set; }
 
-    /// <summary>Milliseconds spent in the host-side Markov/confidence heads
-    /// (<see cref="DSparkHostHeads.GreedyBlock"/>) — the stage-C candidate
-    /// for on-device offload (issue #428).</summary>
+    /// <summary>Milliseconds spent host-side after the download (proposal
+    /// assembly). The Markov/confidence chain itself runs on-device (issue
+    /// #428), so this should stay near zero — a regression here means the
+    /// heads fell back to the host somehow.</summary>
     public double HostHeadsMs { get; private set; }
 
     /// <summary>Layer ids to pass to <see cref="IForwardPass.EnableHiddenTaps"/> on the target.</summary>
@@ -148,7 +165,27 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
             _finalNormW = UploadF32(weights, "norm.weight", [_embDim]);
             DSparkWeightLoading.LoadRowTable(weights, "embed_tokens.weight", [_vocab, _embDim],
                 out _embedBf16, out _embedF32);
-            _heads = new DSparkHostHeads(cfg, weights);
+
+            // Device-side Markov/confidence heads (issue #428): fp16 markov
+            // tables (BF16→FP16 exact for weight-range values, like the
+            // projections), f32 confidence projection. Loading mirrors
+            // DSparkHostHeads' names, shapes and optionality.
+            _rank = cfg.MarkovRank;
+            _confWithMarkov = cfg.ConfidenceHeadWithMarkov;
+            if (_rank > 0)
+            {
+                _markovW1F16 = UploadF16(weights, "markov_head.markov_w1.weight", [_vocab, _rank]);
+                _markovW2F16 = UploadF16(weights, "markov_head.markov_w2.weight", [_vocab, _rank]);
+            }
+            if (cfg.EnableConfidenceHead)
+            {
+                int confIn = _embDim + (_confWithMarkov ? _rank : 0);
+                _confWDev = UploadF32(weights, "confidence_head.proj.weight", [1, confIn]);
+                var b = weights.ReadF32("confidence_head.proj.bias");
+                if (b.Length != 1)
+                    throw new InvalidDataException("confidence_head.proj.bias must be a scalar.");
+                _confB = b[0];
+            }
 
             for (int l = 0; l < L; l++)
             {
@@ -173,12 +210,19 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
             _up = AllocF32((long)_block * _interm);
             _logitsDev = AllocF32((long)_block * _vocab);
             _xHost = new float[_block * _embDim];
-            _pinnedLogits = CudaBackend.AllocatePinnedHost((nuint)((long)_block * _vocab * sizeof(float)));
-            _pinnedHidden = CudaBackend.AllocatePinnedHost((nuint)((long)_block * _embDim * sizeof(float)));
-            if (_pinnedLogits == nint.Zero || _pinnedHidden == nint.Zero)
+            if (_rank > 0)
+            {
+                _w1RowDev = AllocF32(_rank);    // exactly rank: the GEMV derives cols from it
+                _w1RowsDev = AllocF32((long)_block * _rank);
+            }
+            _argmaxDev = AllocF32((long)_block * 2);
+            _confDev = AllocF32(_block);
+            _pinnedArgmax = CudaBackend.AllocatePinnedHost((nuint)((long)_block * 2 * sizeof(float)));
+            _pinnedConf = CudaBackend.AllocatePinnedHost((nuint)((long)_block * sizeof(float)));
+            if (_pinnedArgmax == nint.Zero || _pinnedConf == nint.Zero)
                 throw new InvalidOperationException(
-                    "cudaMallocHost failed for the DSpark block download buffers " +
-                    $"({(long)_block * _vocab * 4 + (long)_block * _embDim * 4} bytes pinned).");
+                    "cudaMallocHost failed for the DSpark block result buffers " +
+                    $"({(long)_block * 3 * sizeof(float)} bytes pinned).");
             _raggedK = new Tensor[_block];
             _raggedV = new Tensor[_block];
             _raggedSlots = new int[_block];
@@ -192,8 +236,9 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
 
     /// <summary>
     /// Approximate VRAM-resident bytes of a loaded head at this config: fp16
-    /// projections + f32 norms (embeddings and the Markov/confidence heads stay
-    /// on the host). Context K/V and scratch grow separately.
+    /// projections + fp16 Markov tables (issue #428 device-side heads) + f32
+    /// norms/confidence proj (embeddings stay on the host). Context K/V and
+    /// scratch grow separately.
     /// </summary>
     public static long EstimateGpuResidentBytes(DSparkConfig cfg)
     {
@@ -204,8 +249,11 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
             + (long)cfg.IntermediateSize * embDim * 3;
         long f16Elems = embDim * (long)cfg.TapDim
             + (long)cfg.VocabSize * embDim
-            + perLayer * cfg.NumLayers;
+            + perLayer * cfg.NumLayers
+            + 2L * cfg.VocabSize * cfg.MarkovRank;   // markov_w1 + markov_w2 (#428)
         long f32Elems = (embDim * 2 + (cfg.HeadDim * 2 + embDim * 2) * (long)cfg.NumLayers);
+        if (cfg.EnableConfidenceHead)
+            f32Elems += embDim + (cfg.ConfidenceHeadWithMarkov ? cfg.MarkovRank : 0);
         return f16Elems * 2 + f32Elems * 4;
     }
 
@@ -375,17 +423,58 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
         _gpu.RmsNormBatched(_x!, _x!, _finalNormW!, B, _embDim, _eps);
         _gpu.MatMulBatchedGemmF16W(_logitsDev!, _lmHead!, _x!, B);
 
-        // One stream sync drains both copies: the async logits land before the
-        // sync hidden download's StreamSynchronize returns (issue #49 pattern).
+        // Device-side Markov chain (issue #428), semantics of
+        // DSparkHostHeads.GreedyBlock: per position j, gather markov_w1[prev]
+        // (prev = anchor at j=0, else position j-1's argmax, read on-stream),
+        // bias the logits row in place via a beta=1 GEMV against markov_w2,
+        // then argmax the row. No host sync anywhere in the chain.
+        if (_rank > 0)
+        {
+            for (int j = 0; j < B; j++)
+            {
+                _gpu.DSparkGatherW1(_markovW1F16!, _argmaxDev!, j, anchorToken,
+                    _w1RowDev!, _w1RowsDev!, _rank);
+                var logitsRow = _gpu.View(_logitsDev!, (long)j * _vocab, _vocab);
+                var amRow = _gpu.View(_argmaxDev!, (long)j * 2, 2);
+                try
+                {
+                    _gpu.MatMulBatchedGemmF16W(logitsRow, _markovW2F16!, _w1RowDev!, 1, beta: 1f);
+                    _gpu.ArgmaxRowsToDevice(logitsRow, amRow, 1, _vocab, _vocab);
+                }
+                finally
+                {
+                    _gpu.Free(logitsRow);
+                    _gpu.Free(amRow);
+                }
+            }
+        }
+        else
+        {
+            // No Markov head: the block's argmaxes are independent — one launch.
+            _gpu.ArgmaxRowsToDevice(_logitsDev!, _argmaxDev!, B, _vocab, _vocab);
+        }
+
+        bool hasConf = _confWDev is not null;
         _phaseSw.Restart();
-        _gpu.DownloadAsync(_logitsDev!, _pinnedLogits, B * _vocab);
-        _gpu.Download(_x!, _pinnedHidden, B * _embDim);
+        if (hasConf)
+        {
+            _gpu.DSparkConfidence(_x!, _w1RowsDev ?? _confDev!, _confWDev!, _confB, _confDev!,
+                _embDim, _rank, withMarkov: _confWithMarkov && _rank > 0, B);
+            _gpu.DownloadAsync(_confDev!, _pinnedConf, B);
+        }
+        // One sync drains the whole pipeline + both result copies (issue #49).
+        _gpu.Download(_argmaxDev!, _pinnedArgmax, B * 2);
         GpuWaitMs += _phaseSw.Elapsed.TotalMilliseconds;
 
         _phaseSw.Restart();
-        var proposal = _heads!.GreedyBlock((float*)_pinnedLogits, (float*)_pinnedHidden, anchorToken);
+        var tokens = new int[B];
+        var conf = new float[B];
+        int* am = (int*)_pinnedArgmax;
+        for (int j = 0; j < B; j++) tokens[j] = am[j * 2];
+        if (hasConf) new ReadOnlySpan<float>((float*)_pinnedConf, B).CopyTo(conf);
+        else Array.Fill(conf, 1f);
         HostHeadsMs += _phaseSw.Elapsed.TotalMilliseconds;
-        return proposal;
+        return new DSparkProposal(tokens, conf);
     }
 
     public void TruncateContext(int length)
@@ -487,7 +576,6 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
 
     private void FreeAll()
     {
-        _heads?.Dispose(); _heads = null;
         if (_embedBf16 != null)
         {
             System.Runtime.InteropServices.NativeMemory.Free(_embedBf16);
@@ -510,8 +598,11 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
         FreeTensor(ref _q); FreeTensor(ref _attnOut);
         FreeTensor(ref _gate); FreeTensor(ref _up); FreeTensor(ref _logitsDev);
         FreeTensor(ref _tapsDev); FreeTensor(ref _fusedDev);
-        CudaBackend.FreePinnedHost(_pinnedLogits); _pinnedLogits = nint.Zero;
-        CudaBackend.FreePinnedHost(_pinnedHidden); _pinnedHidden = nint.Zero;
+        FreeTensor(ref _markovW1F16); FreeTensor(ref _markovW2F16); FreeTensor(ref _confWDev);
+        FreeTensor(ref _w1RowDev); FreeTensor(ref _w1RowsDev);
+        FreeTensor(ref _argmaxDev); FreeTensor(ref _confDev);
+        CudaBackend.FreePinnedHost(_pinnedArgmax); _pinnedArgmax = nint.Zero;
+        CudaBackend.FreePinnedHost(_pinnedConf); _pinnedConf = nint.Zero;
 
         void FreeTensor(ref Tensor? t)
         {

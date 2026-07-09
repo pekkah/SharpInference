@@ -491,6 +491,67 @@ extern ""C"" __global__ void llm_argmax_rows(
     if (tid == 0) { ((int*)out)[row * 2] = sIdx[0]; ((float*)out)[row * 2 + 1] = sVal[0]; }
 }
 
+// ── DSpark device-side Markov/confidence heads (issue #428) ────────────────
+// The rank-r Markov chain is sequential per block position j: gather
+// markov_w1[prev_j] (prev_0 = anchor, else the argmax of position j-1), bias
+// the base logits row with markov_w2 @ w1row (a beta=1 GemmEx on the host
+// side), argmax the row. Keeping the whole chain on-stream removes the
+// [block × vocab] logits download AND the host-side 7× re-stream of the
+// [vocab × rank] markov_w2 — the dominant cost of the GPU draft round.
+
+// Gather markov_w1[prev] (fp16 [vocab, rank]) as f32 into `w1row` (the GEMV
+// activation) and `w1rows_all[step]` (the confidence head's per-position
+// feature tail). `prev` is read on-device from the argmax_rows output layout
+// (int index bits at out[(step-1)*2]) so the chain never syncs to the host.
+extern ""C"" __global__ void llm_dspark_gather_w1(
+    const unsigned short* __restrict__ w1_f16,   // [vocab, rank]
+    const void* __restrict__ argmax_out,         // [block*2] llm_argmax_rows layout
+    int step, int anchor_token,
+    float* __restrict__ w1row,                   // [rank]
+    float* __restrict__ w1rows_all,              // [block, rank]
+    int rank)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= rank) return;
+    int prev = (step == 0) ? anchor_token : ((const int*)argmax_out)[(step - 1) * 2];
+    float v = sharpi_fp16_to_fp32((unsigned int)w1_f16[(long long)prev * rank + i]);
+    w1row[i] = v;
+    w1rows_all[(long long)step * rank + i] = v;
+}
+
+// Confidence head over the whole block, one 256-thread block per position j:
+// out[j] = sigmoid(conf_w . [hidden_j (|| w1rows[j])] + conf_b). w1rows[j] is
+// the row the Markov chain gathered for position j (= markov_w1[prev_j]),
+// matching the host DSparkHostHeads feature exactly.
+extern ""C"" __global__ void llm_dspark_confidence(
+    const float* __restrict__ hidden,     // [block, emb_dim] final-normed
+    const float* __restrict__ w1rows,     // [block, rank]; unread when with_markov == 0
+    const float* __restrict__ conf_w,     // [emb_dim (+ rank)]
+    float conf_b,
+    float* __restrict__ out,              // [block]
+    int emb_dim, int rank, int with_markov, int n_rows)
+{
+    __shared__ float sdata[256];
+    int j = (int)blockIdx.x;
+    int tid = (int)threadIdx.x;
+    if (j >= n_rows) return;
+
+    float acc = 0.f;
+    for (int d = tid; d < emb_dim; d += (int)blockDim.x)
+        acc += conf_w[d] * hidden[(long long)j * emb_dim + d];
+    if (with_markov)
+        for (int r = tid; r < rank; r += (int)blockDim.x)
+            acc += conf_w[emb_dim + r] * w1rows[(long long)j * rank + r];
+    sdata[tid] = acc;
+    __syncthreads();
+    for (int s = (int)blockDim.x >> 1; s > 0; s >>= 1)
+    {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) out[j] = 1.f / (1.f + __expf(-(sdata[0] + conf_b)));
+}
+
 // ── Softmax in place ───────────────────────────────────────────────────────
 // 1 block of 256 threads. 3-pass: max, exp+sum, normalize.
 extern ""C"" __global__ void llm_softmax(float* __restrict__ x, int n)

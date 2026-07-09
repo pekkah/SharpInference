@@ -275,6 +275,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _splitQgBatchedKernel;
     private nint   _ropeNeoxPartialBatchedKernel;
     private nint   _ropeNeoxPartialBatchedQkKernel;
+    private nint   _dsparkGatherW1Kernel;
+    private nint   _dsparkConfidenceKernel;
     private nint   _attentionKernel;
     // Gemma 4 (Phase 7): sliding-window attention, tanh-GELU FFN, final-logit
     // softcap. Kernel work only — forward-pass wiring lands in Phase 8.
@@ -4104,6 +4106,91 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         return result;
     }
 
+    /// <summary>
+    /// <see cref="ArgmaxRows"/>'s launch-only sibling (issue #428): the per-row
+    /// (index-bits, value) pairs land in the caller's device buffer
+    /// <paramref name="outIdxVal"/> (<c>rows*2</c> floats, llm_argmax_rows layout)
+    /// with NO download and NO sync — for on-stream consumers like the DSpark
+    /// device-side Markov chain, which reads the index back in a later kernel.
+    /// </summary>
+    public void ArgmaxRowsToDevice(Tensor logits, Tensor outIdxVal, int rows, int validLen, int rowStride)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (rows <= 0) return;
+        if (outIdxVal.ElementCount < (long)rows * 2)
+            throw new ArgumentException(
+                $"ArgmaxRowsToDevice: outIdxVal needs {rows}*2 floats, has {outIdxVal.ElementCount}.");
+
+        nint lPtr = GetDevPtr(logits);
+        nint outPtr = GetDevPtr(outIdxVal);
+        int pN = validLen;
+        int pStride = rowStride;
+        nint* args = stackalloc nint[4] { (nint)(&lPtr), (nint)(&pN), (nint)(&pStride), (nint)(&outPtr) };
+        int r = NvrtcInterop.LaunchKernel(_argmaxRowsKernel, (uint)rows, 1, 1, ArgmaxThreads, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(llm_argmax_rows) failed: {r}");
+    }
+
+    /// <summary>
+    /// DSpark device-side Markov chain, step <paramref name="step"/> (issue #428):
+    /// gathers <c>markov_w1[prev]</c> (fp16 <c>[vocab, rank]</c>) as f32 into
+    /// <paramref name="w1Row"/> (the bias GEMV's activation) and row
+    /// <paramref name="step"/> of <paramref name="w1RowsAll"/> (the confidence
+    /// feature tail). <c>prev</c> is the anchor token at step 0, else read
+    /// on-device from <paramref name="argmaxOut"/> (llm_argmax_rows layout,
+    /// index bits at <c>[(step-1)*2]</c>) — the chain never syncs to the host.
+    /// </summary>
+    public void DSparkGatherW1(Tensor w1F16, Tensor argmaxOut, int step, int anchorToken,
+        Tensor w1Row, Tensor w1RowsAll, int rank)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (w1F16.DType != DType.Float16)
+            throw new ArgumentException($"DSparkGatherW1 expects an fp16 w1 table, got {w1F16.DType}.", nameof(w1F16));
+
+        nint wPtr = GetDevPtr(w1F16), amPtr = GetDevPtr(argmaxOut);
+        nint rowPtr = GetDevPtr(w1Row), allPtr = GetDevPtr(w1RowsAll);
+        int pStep = step, pAnchor = anchorToken, pRank = rank;
+        nint* args = stackalloc nint[7]
+        {
+            (nint)(&wPtr), (nint)(&amPtr), (nint)(&pStep), (nint)(&pAnchor),
+            (nint)(&rowPtr), (nint)(&allPtr), (nint)(&pRank)
+        };
+        uint grid = (uint)((rank + 255) / 256);
+        int r = NvrtcInterop.LaunchKernel(_dsparkGatherW1Kernel, grid, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(llm_dspark_gather_w1) failed: {r}");
+    }
+
+    /// <summary>
+    /// DSpark confidence head over a whole block (issue #428), one launch:
+    /// <c>out[j] = sigmoid(confW · [hidden_j (‖ w1Rows[j])] + confB)</c>, matching
+    /// the host <c>DSparkHostHeads</c> feature layout exactly. When
+    /// <paramref name="withMarkov"/> is false the w1 tail is ignored (pass any
+    /// valid tensor for <paramref name="w1Rows"/>).
+    /// </summary>
+    public void DSparkConfidence(Tensor hidden, Tensor w1Rows, Tensor confW, float confB,
+        Tensor outConf, int embDim, int rank, bool withMarkov, int nRows)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (nRows <= 0) return;
+
+        nint hPtr = GetDevPtr(hidden), wrPtr = GetDevPtr(w1Rows);
+        nint cwPtr = GetDevPtr(confW), outPtr = GetDevPtr(outConf);
+        float pB = confB;
+        int pEmb = embDim, pRank = rank, pWith = withMarkov ? 1 : 0, pRows = nRows;
+        nint* args = stackalloc nint[9]
+        {
+            (nint)(&hPtr), (nint)(&wrPtr), (nint)(&cwPtr), (nint)(&pB), (nint)(&outPtr),
+            (nint)(&pEmb), (nint)(&pRank), (nint)(&pWith), (nint)(&pRows)
+        };
+        int r = NvrtcInterop.LaunchKernel(_dsparkConfidenceKernel, (uint)nRows, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(llm_dspark_confidence) failed: {r}");
+    }
+
     // IComputeBackend contract (#314): standalone in-place SiLU. The fused SwiGLU
     // path still prefers SiLuMul(gate, up); this delegates to the existing NVRTC
     // in-place kernel so the interface is honored uniformly across backends.
@@ -7033,7 +7120,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _matvecQ40Dp4aSoaKernel, _dequantQ40F16SoaKernel,   // #124/#173
             _rmsNormBatchedKernel, _headNormBatchedKernel, _headNormQkKernel, _headNormQkBatchedKernel,
             _splitQgBatchedKernel, _ropeNeoxPartialBatchedKernel,
-            _ropeNeoxPartialBatchedQkKernel,   // #428
+            _ropeNeoxPartialBatchedQkKernel, _dsparkGatherW1Kernel, _dsparkConfidenceKernel,   // #428
             _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel, _attentionSwaBatchedKernel,
             _attentionSwaBf16Kernel, _attentionSwaBatchedBf16Kernel,
             _geluTanhMulKernel, _geluTanhMulStridedKernel, _softcapKernel,
@@ -7213,6 +7300,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _splitQgBatchedKernel  = GetKernelFunc("llm_split_qg_batched");
         _ropeNeoxPartialBatchedKernel = GetKernelFunc("llm_rope_neox_partial_batched");
         _ropeNeoxPartialBatchedQkKernel = GetKernelFunc("llm_rope_neox_partial_batched_qk");
+        _dsparkGatherW1Kernel = GetKernelFunc("llm_dspark_gather_w1");
+        _dsparkConfidenceKernel = GetKernelFunc("llm_dspark_confidence");
         _ropeNeoxWithFactorsBatchedKernel = GetKernelFunc("llm_rope_neox_with_factors_batched");
         _attentionKernel       = GetKernelFunc("llm_attention");
         _attentionBf16Kernel   = GetKernelFunc("llm_attention_bf16");
