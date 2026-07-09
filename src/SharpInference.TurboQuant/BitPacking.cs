@@ -3,17 +3,45 @@ using System.Runtime.CompilerServices;
 namespace SharpInference.TurboQuant;
 
 /// <summary>
-/// 3-bit and 4-bit packing/unpacking for TurboQuant compressed KV cache.
+/// 2-bit, 3-bit and 4-bit packing/unpacking for TurboQuant/KVarN compressed KV cache.
+/// 128 2-bit values pack into 32 bytes (256 bits).
 /// 128 3-bit values pack into 48 bytes (384 bits).
 /// 128 4-bit values pack into 64 bytes (512 bits).
 /// </summary>
 public static class BitPacking
 {
+    /// <summary>Bytes needed for 128 packed 2-bit indices.</summary>
+    public const int PackedBytes2Bit = 32; // 128 * 2 / 8
+
     /// <summary>Bytes needed for 128 packed 3-bit indices.</summary>
     public const int PackedBytes3Bit = 48; // 128 * 3 / 8
 
     /// <summary>Bytes needed for 128 packed 4-bit indices.</summary>
     public const int PackedBytes4Bit = 64; // 128 * 4 / 8
+
+    /// <summary>
+    /// Pack a 2-bit index (0..3) at the given position into a byte buffer.
+    /// Position p maps to bits (p &amp; 3) * 2 of byte p / 4. The target field is
+    /// masked before writing, so no pre-clear of the buffer is required.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void PackBits2(Span<byte> buffer, int byteOffset, int position, int value)
+    {
+        int byteIdx = byteOffset + (position >> 2);
+        int bitShift = (position & 3) << 1;
+        buffer[byteIdx] = (byte)((buffer[byteIdx] & ~(0x3 << bitShift)) | ((value & 0x3) << bitShift));
+    }
+
+    /// <summary>
+    /// Unpack a 2-bit index (0..3) from the given position in a byte buffer.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int UnpackBits2(ReadOnlySpan<byte> buffer, int byteOffset, int position)
+    {
+        int byteIdx = byteOffset + (position >> 2);
+        int bitShift = (position & 3) << 1;
+        return (buffer[byteIdx] >> bitShift) & 0x3;
+    }
 
     /// <summary>
     /// Pack a 3-bit index (0..7) at the given position into a byte buffer.
