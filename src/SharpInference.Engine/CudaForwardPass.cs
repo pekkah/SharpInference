@@ -611,7 +611,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     // Mirrors the CudaHybridGdnForwardPass layout, minus the GDN per-layer-type
     // indirection: every layer in CudaForwardPass is an attention layer.
     private readonly SnapKvConfig _snapKvCfg;
-    private readonly int _snapKvEffectiveBudget;
+    // Not readonly: EnableHiddenTaps switches an AUTO-enabled budget off (taps and
+    // eviction are mutually exclusive; an explicit user budget rejects taps instead).
+    private int _snapKvEffectiveBudget;
     private Tensor? _snapKvQCapture;     // [numLayers × W × qDim] f32, captured during Prefill
     private int _snapKvQCaptureW;        // cached W the buffer was sized for
     private Tensor? _snapKvScoreAccum;   // [maxSeqLen] f32, per-position importance accumulator
@@ -3589,14 +3591,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     /// flow), the Gemma-4-like path applies post-layer transforms the batched
     /// capture point misses (same guard as the CPU pass), TurboQuant compresses
     /// the region taps index into, and SnapKV eviction shifts positions relative
-    /// to slots. The SnapKV gate is on the CONFIGURED budget, not just the
-    /// runtime eviction counter — a budgeted pass would otherwise accept
-    /// EnableHiddenTaps pre-prefill and then desync at the first eviction
-    /// (same up-front declination the CPU pass makes).
+    /// to slots. The SnapKV gate is on the EXPLICITLY configured budget, not
+    /// just the runtime eviction counter — a user-budgeted pass would otherwise
+    /// accept EnableHiddenTaps pre-prefill and then desync at the first eviction
+    /// (same up-front declination the CPU pass makes). An AUTO-enabled budget
+    /// (the long-context heuristic default) does NOT block taps: the caller's
+    /// explicit tap request wins and <see cref="EnableHiddenTaps"/> switches the
+    /// heuristic off, mirroring the preferBatchingOverAutoSnapKv precedent.
     /// </summary>
     public bool SupportsHiddenTaps =>
         !_tqEnabled && !_isMoE && !_isGemma4Like
-        && _snapKvEffectiveBudget <= 0 && _kvEvictedCount == 0;
+        && !(_snapKvCfg.IsBudgetExplicit && _snapKvCfg.Budget > 0)
+        && _kvEvictedCount == 0;
 
     public int HiddenTapDim => _taps is { } tb ? tb.TapDim : 0;
 
@@ -3606,6 +3612,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
             throw new NotSupportedException(
                 "Hidden-state taps require the dense CUDA path (no MoE / Gemma-4 transforms / " +
                 "TurboQuant / SnapKV eviction). Check SupportsHiddenTaps before calling.");
+        // Auto-SnapKV and taps are mutually exclusive (eviction shifts positions
+        // relative to slots). The tap request is explicit, the auto budget is a
+        // heuristic — turn it off before any prefill can evict.
+        if (_snapKvEffectiveBudget > 0)
+        {
+            Console.Error.WriteLine(
+                $"[CudaForwardPass] SnapKV auto-budget ({_snapKvEffectiveBudget}) disabled — " +
+                "hidden-state taps (DSpark) require stable absolute positions.");
+            _snapKvEffectiveBudget = 0;
+        }
         _taps?.Dispose();
         _taps = new HiddenTapBuffer(layerIds, _hp.NumLayers, _embDim, _hp.ContextLength);
         // Any previously captured decode graph must not be replayed: it neither
