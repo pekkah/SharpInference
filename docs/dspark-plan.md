@@ -77,11 +77,15 @@
 > per position, zero host syncs inside the chain) so only [B] tokens + [B]
 > confidences cross PCIe per round. Same prompt/settings as above: draft
 > 1971→836 ms over ~71 rounds; DSpark default 50.0→61.1 t/s, `min-confidence 0.8`
-> 46.5→58.0 t/s, plain 55–62 t/s (thermal window) — DSpark now sits at plain-decode
-> speed on 4B, still verify-bound (verify ≈ 47 ms/round at k≈7). Acceptance and
-> emitted tokens byte-identical to the host-heads path on the bench workload; the
-> new `CudaDSparkDraftModelTests` pin CUDA-vs-CPU proposal parity on the synthetic
-> head. Lever 2 (verify fixed cost) is now the whole remaining gap.
+> 46.5→58.0 t/s, plain 55–62 t/s (thermal window). With the draft flat at ~12 ms the
+> verify-length sweep now CROSSES plain on this 37%-acceptance content:
+> k=1 55.1 / k=2 64.7 / **k=3 67.9** / k=5 65.8 / k=7 59.9 t/s vs plain 61.5 —
+> `--dspark-verify-len 3` is a 1.10× win on the exact 4B pairing that lost 50-vs-64
+> pre-#428 (k=7, the block-size default, is the worst config on hard content; the
+> confidence trim at 0.8 only reaches 58.0 — a fixed short cap beats it here).
+> Acceptance and emitted tokens byte-identical to the host-heads path on the bench
+> workload; the new `CudaDSparkDraftModelTests` pin CUDA-vs-CPU proposal parity on
+> the synthetic head. Lever 2 (verify fixed cost) is the remaining upside.
 >
 > **#428 lever 2, MMQ half (2026-07-09): measured, and rejected on parity.** The
 > existing `SHARPI_BATCH_DECODE_MMQ=1` A/B (which force-routes the pinned
