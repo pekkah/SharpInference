@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Text;
 
 namespace SharpInference.Core.Grammar;
@@ -299,6 +300,26 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
     }
 
     private static ulong AllBits(int n) => n >= 64 ? ulong.MaxValue : (1UL << n) - 1;
+
+    /// <summary>
+    /// Candidate mask for the next key at an object's key boundary. Unordered (default): every
+    /// not-yet-emitted key. Ordered (issue #425): keys must appear in declaration order, so the
+    /// window runs from just past the highest emitted index (emission is ascending, enforced by this
+    /// very mask) up to and INCLUDING the first required key — an optional key may be skipped, but
+    /// skipping a required key could never be repaired later and would dead-end at the close brace.
+    /// </summary>
+    private static ulong NextKeyCandidates(CompiledObject obj, ulong emitted)
+    {
+        if (!obj.Ordered) return AllBits(obj.Count) & ~emitted;
+        int next = 64 - BitOperations.LeadingZeroCount(emitted);    // highest emitted index + 1
+        ulong cand = 0;
+        for (int i = next; i < obj.Count; i++)
+        {
+            cand |= 1UL << i;
+            if ((obj.RequiredMask & (1UL << i)) != 0) break;
+        }
+        return cand;
+    }
 
     // ── Public lifecycle ──────────────────────────────────────────────────────
 
@@ -629,11 +650,10 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
                 }
                 if (b == (byte)'"')
                 {
-                    // Begin a key: candidates are every not-yet-emitted key.
-                    ulong cand = 0;
-                    for (int i = 0; i < obj.Count; i++)
-                        if ((f.Emitted & (1UL << i)) == 0) cand |= 1UL << i;
-                    if (cand == 0) return Step.Reject;     // all keys emitted; only '}' is legal
+                    // Begin a key: candidates are every not-yet-emitted key (unordered), or the
+                    // declaration-order window (ordered, issue #425).
+                    ulong cand = NextKeyCandidates(obj, f.Emitted);
+                    if (cand == 0) return Step.Reject;     // no key may appear here; only '}' is legal
                     f.Cand = cand; f.MatchLen = 0; f.State = OKeyContent;
                     return Step.Consume;
                 }
@@ -671,7 +691,14 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
 
             case OExpectCommaOrClose:
                 if (IsWs(b)) return Step.Consume;
-                if (b == (byte)',') { f.State = OExpectKey; return Step.Consume; }
+                if (b == (byte)',')
+                {
+                    // A ',' commits to another key — reject it when none can follow (all keys
+                    // emitted, or the ordered window is exhausted) so the machine can't be steered
+                    // into a dead OExpectKey state where only '}' was ever viable.
+                    if (NextKeyCandidates(obj, f.Emitted) == 0) return Step.Reject;
+                    f.State = OExpectKey; return Step.Consume;
+                }
                 if (b == (byte)'}')
                 {
                     if ((f.Emitted & obj.RequiredMask) != obj.RequiredMask) return Step.Reject;
@@ -984,9 +1011,9 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
             case OExpectKey:
                 MarkWs(set);
                 if (f.State == OExpectKeyOrClose && (f.Emitted & obj.RequiredMask) == obj.RequiredMask) set['}'] = true;
-                // A key opens with '"' whenever any key remains unemitted.
-                for (int i = 0; i < obj.Count; i++)
-                    if ((f.Emitted & (1UL << i)) == 0) { set['"'] = true; break; }
+                // A key opens with '"' whenever a candidate remains (any unemitted key, or the
+                // ordered declaration-order window — issue #425).
+                if (NextKeyCandidates(obj, f.Emitted) != 0) set['"'] = true;
                 break;
             case OKeyContent:
                 // Either a content byte continuing a candidate key, or '"' if a candidate is complete.
@@ -997,7 +1024,8 @@ public sealed class JsonToolArgumentConstraint : ITokenConstraint
                 break;
             case OExpectColon: MarkWs(set); set[':'] = true; break;
             case OExpectCommaOrClose:
-                MarkWs(set); set[','] = true;
+                MarkWs(set);
+                if (NextKeyCandidates(obj, f.Emitted) != 0) set[','] = true;   // ',' commits to a key
                 if ((f.Emitted & obj.RequiredMask) == obj.RequiredMask) set['}'] = true;
                 break;
         }

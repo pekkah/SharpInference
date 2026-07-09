@@ -186,13 +186,17 @@ public static class OpenAiEndpoints
         // failures return 400 rather than silently generating unconstrained output.
         ITokenConstraint? jsonSchemaConstraint = null;
         JsonElement? requestedSchema = null;
+        bool schemaOrdered = false;     // json_schema.ordered / response_format.ordered (issue #425)
         if (req.ResponseFormat?.Type == "json_schema")
         {
             // Unlike "json_object" (below), a schema is REQUIRED here -- the client explicitly asked
             // for schema-constrained output, so a missing json_schema.schema is a client error, not a
             // silent no-op (issue #423 follow-up: an explicit schema request is a hard requirement).
             if (req.ResponseFormat.JsonSchema?.Schema is { } s)
+            {
                 requestedSchema = s;
+                schemaOrdered = req.ResponseFormat.JsonSchema.Ordered == true;
+            }
             else
             {
                 ctx.Response.StatusCode = 400;
@@ -209,6 +213,7 @@ public static class OpenAiEndpoints
             // llama.cpp's flat extension: an optional schema alongside the plain "valid JSON" request.
             // Absent here just means "valid JSON, no shape enforced" -- the pre-existing behavior.
             requestedSchema = req.ResponseFormat.Schema;
+            schemaOrdered = req.ResponseFormat.Ordered == true;
         }
         if (requestedSchema is { } schemaElement)
         {
@@ -225,7 +230,7 @@ public static class OpenAiEndpoints
             try
             {
                 var schemaObject = ToolSchema.FromOpenAiFunction("_", schemaElement).Arguments;
-                jsonSchemaConstraint = new JsonSchemaOutputConstraint(vocab, schemaObject);
+                jsonSchemaConstraint = new JsonSchemaOutputConstraint(vocab, schemaObject, schemaOrdered);
             }
             catch (ArgumentException ex)
             {
@@ -865,11 +870,12 @@ public sealed record ModelInfo(string Id, string Object, long Created, string Ow
 /// schema without the OpenAI envelope's <c>name</c>/<c>strict</c>. Either shape, when a schema is
 /// present, constrains the whole response via <see cref="SharpInference.Core.Grammar.JsonSchemaOutputConstraint"/>.
 /// </summary>
-public sealed record ResponseFormat(string? Type, JsonSchemaSpec? JsonSchema = null, JsonElement? Schema = null);
+public sealed record ResponseFormat(string? Type, JsonSchemaSpec? JsonSchema = null, JsonElement? Schema = null, bool? Ordered = null);
 
-/// <summary>OpenAI's <c>response_format.json_schema</c> envelope. Only <see cref="Schema"/> is
-/// consumed; <see cref="Name"/>/<see cref="Strict"/> round-trip but aren't validated (matching
-/// llama.cpp's own server behavior).</summary>
-public sealed record JsonSchemaSpec(string? Name, JsonElement? Schema, bool? Strict = null);
+/// <summary>OpenAI's <c>response_format.json_schema</c> envelope. Only <see cref="Schema"/> and
+/// <see cref="Ordered"/> (SharpInference extension, issue #425: require properties in declaration
+/// order) are consumed; <see cref="Name"/>/<see cref="Strict"/> round-trip but aren't validated
+/// (matching llama.cpp's own server behavior).</summary>
+public sealed record JsonSchemaSpec(string? Name, JsonElement? Schema, bool? Strict = null, bool? Ordered = null);
 
 public sealed record ErrorResponse(string Type, string Message);

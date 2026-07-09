@@ -108,7 +108,55 @@ public sealed class JsonSchemaResponseFormatEndpointTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
         Assert.NotNull(fake.LastSamplingParams);
-        Assert.IsType<JsonSchemaOutputConstraint>(fake.LastSamplingParams!.Constraint);
+        var constraint = Assert.IsType<JsonSchemaOutputConstraint>(fake.LastSamplingParams!.Constraint);
+        Assert.False(constraint.OrderedProperties);   // ordered mode (issue #425) is opt-in
+    }
+
+    [Fact]
+    public async Task JsonSchemaType_OrderedExtension_IsThreadedIntoConstraint()
+    {
+        // SharpInference extension (issue #425): json_schema.ordered:true requires properties in
+        // declaration order so a streaming client can rely on an early field arriving first.
+        var fake = new FakeInferenceEngine("test-model");
+        var client = CreateClient(fake, renderer: RendererWithVocab());
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "hi" } },
+            max_tokens = 10,
+            stream = false,
+            response_format = new { type = "json_schema", json_schema = new { name = "answer", schema = ValidSchema, ordered = true } },
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        Assert.NotNull(fake.LastSamplingParams);
+        var constraint = Assert.IsType<JsonSchemaOutputConstraint>(fake.LastSamplingParams!.Constraint);
+        Assert.True(constraint.OrderedProperties);
+    }
+
+    [Fact]
+    public async Task JsonObjectType_FlatOrderedExtension_IsThreadedIntoConstraint()
+    {
+        // The flat llama.cpp-style shape gets the same opt-in: response_format.ordered:true.
+        var fake = new FakeInferenceEngine("test-model");
+        var client = CreateClient(fake, renderer: RendererWithVocab());
+
+        var req = new
+        {
+            model = "test-model",
+            messages = new[] { new { role = "user", content = "hi" } },
+            max_tokens = 10,
+            stream = false,
+            response_format = new { type = "json_object", schema = ValidSchema, ordered = true },
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        Assert.NotNull(fake.LastSamplingParams);
+        var constraint = Assert.IsType<JsonSchemaOutputConstraint>(fake.LastSamplingParams!.Constraint);
+        Assert.True(constraint.OrderedProperties);
     }
 
     [Fact]

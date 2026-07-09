@@ -110,7 +110,9 @@ public sealed class JsonToolGrammarMockTests
 
         Feed(c, tok, "Berlin\"");
         Assert.True(Allowed(c, vocab, tok.Char('}')));    // required satisfied → may close
-        Assert.True(Allowed(c, vocab, tok.Char(',')));
+        // Every declared key is emitted, so ',' would commit to a key that cannot exist — masked
+        // (issue #425's comma gate), where it previously dead-ended and disabled the constraint.
+        Assert.False(Allowed(c, vocab, tok.Char(',')));
 
         Feed(c, tok, "}");
         Assert.False(c.IsConstraining);                   // object closed → back to watching

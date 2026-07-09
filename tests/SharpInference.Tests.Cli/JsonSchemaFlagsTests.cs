@@ -99,6 +99,24 @@ public sealed class JsonSchemaFlagsTests
     }
 
     [Fact]
+    public void OrderedFlag_IsThreadedIntoConstraint()
+    {
+        // --json-schema-ordered (issue #425): declaration-order property emission, default off.
+        const string schema =
+            """{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}""";
+
+        bool ok = RunCommand.TryLoadJsonSchemaConstraint(
+            schema, null, Vocab, out var constraint, out var error, ordered: true);
+        Assert.True(ok);
+        Assert.Null(error);
+        Assert.True(Assert.IsType<JsonSchemaOutputConstraint>(constraint).OrderedProperties);
+
+        ok = RunCommand.TryLoadJsonSchemaConstraint(schema, null, Vocab, out constraint, out error);
+        Assert.True(ok);
+        Assert.False(Assert.IsType<JsonSchemaOutputConstraint>(constraint).OrderedProperties);
+    }
+
+    [Fact]
     public void SchemaFile_ValidObjectSchema_Succeeds()
     {
         string path = Path.GetTempFileName();

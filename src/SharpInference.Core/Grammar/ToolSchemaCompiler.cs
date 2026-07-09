@@ -34,6 +34,9 @@ internal sealed class CompiledObject
     public required byte[][] KeyBytes { get; init; }
     public required CompiledNode[] Values { get; init; }
     public required ulong RequiredMask { get; init; }
+    /// <summary>Ordered mode (issue #425): keys must appear in declaration order — optional keys may
+    /// be skipped, but a later key can never precede an earlier one.</summary>
+    public bool Ordered { get; init; }
     public int Count => KeyBytes.Length;
 }
 
@@ -67,9 +70,13 @@ internal static class ToolSchemaCompiler
     private static readonly byte[][] s_boolLiterals = [ToolSchema.Utf8("true"), ToolSchema.Utf8("false")];
     private static readonly byte[][] s_nullLiterals = [ToolSchema.Utf8("null")];
 
-    public static CompiledObject? TryCompileObject(ToolSchemaObject obj) => TryCompileObject(obj, 0);
+    public static CompiledObject? TryCompileObject(ToolSchemaObject obj) => TryCompileObject(obj, ordered: false, 0);
 
-    private static CompiledObject? TryCompileObject(ToolSchemaObject obj, int depth)
+    /// <summary>Compiles with ordered-properties mode (issue #425): every object in the schema tree
+    /// requires its keys in declaration order (optional keys skippable, never reordered).</summary>
+    public static CompiledObject? TryCompileObject(ToolSchemaObject obj, bool ordered) => TryCompileObject(obj, ordered, 0);
+
+    private static CompiledObject? TryCompileObject(ToolSchemaObject obj, bool ordered, int depth)
     {
         if (depth >= MaxDepth || obj.Open || obj.Properties.Count is 0 or > 64) return null;
         var keys = new byte[obj.Properties.Count][];
@@ -82,16 +89,16 @@ internal static class ToolSchemaCompiler
             keys[i] = ToolSchema.Utf8(p.Name);
             // A loosely-typed value compiles to FreeValue (issue #378) rather than disqualifying the
             // tool — the key/required structure stays enforced, only the value is left free.
-            values[i] = CompileNode(p.Value, depth + 1);
+            values[i] = CompileNode(p.Value, ordered, depth + 1);
             if (p.Required) reqMask |= 1UL << i;
         }
-        return new CompiledObject { KeyBytes = keys, Values = values, RequiredMask = reqMask };
+        return new CompiledObject { KeyBytes = keys, Values = values, RequiredMask = reqMask, Ordered = ordered };
     }
 
     /// <summary>Compiles one value node, degrading any loosely-typed value (Any / untyped array /
     /// open or too-deep object) to <see cref="FreeValue"/> rather than null — so a partially-typed
     /// object still constrains its typed siblings (issue #378).</summary>
-    private static CompiledNode CompileNode(ToolSchemaNode node, int depth)
+    private static CompiledNode CompileNode(ToolSchemaNode node, bool ordered, int depth)
     {
         if (depth >= MaxDepth) return FreeValue;            // too deep to constrain → free
         switch (node.Kind)
@@ -120,11 +127,11 @@ internal static class ToolSchemaCompiler
             case JsonSchemaKind.Array:
                 // An untyped array (no item shape) is left free; a typed array constrains its items.
                 if (node.Items is null) return FreeValue;
-                return new CompiledNode { Kind = JsonSchemaKind.Array, Items = CompileNode(node.Items, depth + 1) };
+                return new CompiledNode { Kind = JsonSchemaKind.Array, Items = CompileNode(node.Items, ordered, depth + 1) };
 
             case JsonSchemaKind.Object:
                 // An open / too-deep nested object is left free; a typed nested object recurses.
-                var obj = node.Object is null ? null : TryCompileObject(node.Object, depth + 1);
+                var obj = node.Object is null ? null : TryCompileObject(node.Object, ordered, depth + 1);
                 return obj is null ? FreeValue : new CompiledNode { Kind = JsonSchemaKind.Object, Object = obj };
 
             default:
