@@ -491,6 +491,67 @@ extern ""C"" __global__ void llm_argmax_rows(
     if (tid == 0) { ((int*)out)[row * 2] = sIdx[0]; ((float*)out)[row * 2 + 1] = sVal[0]; }
 }
 
+// ── DSpark device-side Markov/confidence heads (issue #428) ────────────────
+// The rank-r Markov chain is sequential per block position j: gather
+// markov_w1[prev_j] (prev_0 = anchor, else the argmax of position j-1), bias
+// the base logits row with markov_w2 @ w1row (a beta=1 GemmEx on the host
+// side), argmax the row. Keeping the whole chain on-stream removes the
+// [block × vocab] logits download AND the host-side 7× re-stream of the
+// [vocab × rank] markov_w2 — the dominant cost of the GPU draft round.
+
+// Gather markov_w1[prev] (fp16 [vocab, rank]) as f32 into `w1row` (the GEMV
+// activation) and `w1rows_all[step]` (the confidence head's per-position
+// feature tail). `prev` is read on-device from the argmax_rows output layout
+// (int index bits at out[(step-1)*2]) so the chain never syncs to the host.
+extern ""C"" __global__ void llm_dspark_gather_w1(
+    const unsigned short* __restrict__ w1_f16,   // [vocab, rank]
+    const void* __restrict__ argmax_out,         // [block*2] llm_argmax_rows layout
+    int step, int anchor_token,
+    float* __restrict__ w1row,                   // [rank]
+    float* __restrict__ w1rows_all,              // [block, rank]
+    int rank)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= rank) return;
+    int prev = (step == 0) ? anchor_token : ((const int*)argmax_out)[(step - 1) * 2];
+    float v = sharpi_fp16_to_fp32((unsigned int)w1_f16[(long long)prev * rank + i]);
+    w1row[i] = v;
+    w1rows_all[(long long)step * rank + i] = v;
+}
+
+// Confidence head over the whole block, one 256-thread block per position j:
+// out[j] = sigmoid(conf_w . [hidden_j (|| w1rows[j])] + conf_b). w1rows[j] is
+// the row the Markov chain gathered for position j (= markov_w1[prev_j]),
+// matching the host DSparkHostHeads feature exactly.
+extern ""C"" __global__ void llm_dspark_confidence(
+    const float* __restrict__ hidden,     // [block, emb_dim] final-normed
+    const float* __restrict__ w1rows,     // [block, rank]; unread when with_markov == 0
+    const float* __restrict__ conf_w,     // [emb_dim (+ rank)]
+    float conf_b,
+    float* __restrict__ out,              // [block]
+    int emb_dim, int rank, int with_markov, int n_rows)
+{
+    __shared__ float sdata[256];
+    int j = (int)blockIdx.x;
+    int tid = (int)threadIdx.x;
+    if (j >= n_rows) return;
+
+    float acc = 0.f;
+    for (int d = tid; d < emb_dim; d += (int)blockDim.x)
+        acc += conf_w[d] * hidden[(long long)j * emb_dim + d];
+    if (with_markov)
+        for (int r = tid; r < rank; r += (int)blockDim.x)
+            acc += conf_w[emb_dim + r] * w1rows[(long long)j * rank + r];
+    sdata[tid] = acc;
+    __syncthreads();
+    for (int s = (int)blockDim.x >> 1; s > 0; s >>= 1)
+    {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) out[j] = 1.f / (1.f + __expf(-(sdata[0] + conf_b)));
+}
+
 // ── Softmax in place ───────────────────────────────────────────────────────
 // 1 block of 256 threads. 3-pass: max, exp+sum, normalize.
 extern ""C"" __global__ void llm_softmax(float* __restrict__ x, int n)
@@ -5897,6 +5958,52 @@ extern ""C"" __global__ void llm_rope_neox_partial_batched(
 
     int h = pair_idx / rope_half_dim;
     int i = pair_idx % rope_half_dim;
+    int position = base_position + token;
+
+    float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)rope_dim);
+    float angle = (float)position * freq;
+    float c = cosf(angle);
+    float s = sinf(angle);
+
+    long head_base = (long)token * (long)num_heads * (long)head_dim + (long)h * head_dim;
+    long a = head_base + i;
+    long b = head_base + i + rope_half_dim;
+    float x0 = x[a];
+    float x1 = x[b];
+    x[a] = x0 * c - x1 * s;
+    x[b] = x0 * s + x1 * c;
+}
+
+// Fused q+k partial NEOX RoPE over N tokens (DSpark GPU draft, issue #428):
+// one launch rotates both the query rows (q, [n_tok × num_q_heads*head_dim])
+// and the key rows (k, [n_tok × num_kv_heads*head_dim]) at position
+// base_position + t. The pair space is the union of both buffers' pairs:
+// [0, q_pairs) hits q, the rest hits k. The per-pair rotation math is the
+// same as llm_rope_neox_partial_batched, so per buffer the result is
+// bit-identical to two separate launches.
+extern ""C"" __global__ void llm_rope_neox_partial_batched_qk(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    int num_q_heads, int num_kv_heads, int head_dim, int rope_dim,
+    int base_position, float theta, int n_tok)
+{
+    int pair_idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int rope_half_dim = rope_dim / 2;
+    int q_pairs = num_q_heads * rope_half_dim;
+    int total_pairs = (num_q_heads + num_kv_heads) * rope_half_dim;
+    int token = (int)blockIdx.y;
+    if (pair_idx >= total_pairs || token >= n_tok) return;
+
+    float* x;
+    int h, i, num_heads;
+    if (pair_idx < q_pairs) {
+        x = q; h = pair_idx / rope_half_dim; i = pair_idx % rope_half_dim;
+        num_heads = num_q_heads;
+    } else {
+        int p = pair_idx - q_pairs;
+        x = k; h = p / rope_half_dim; i = p % rope_half_dim;
+        num_heads = num_kv_heads;
+    }
     int position = base_position + token;
 
     float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)rope_dim);

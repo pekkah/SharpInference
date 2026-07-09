@@ -63,6 +63,44 @@
 > tracked in issues #405–#409). Placement note: with `-c` unset the target's VRAM-fit KV
 > solve consumes the card and the planner correctly lands on `Cpu` — bound the context
 > to free headroom for the head.
+>
+> **#428 lever 1 (2026-07-09): the draft round is 11.8 ms, down from 27.8.** The
+> `SHARPI_DSPARK_TIMING=1` breakdown overturned the launch-bound theory: the old round
+> was ~1 ms launch enqueue + ~8.6 ms GPU + **~17.6 ms host Markov chain** — the
+> `DSparkHostHeads` GreedyBlock re-streams the 155 MB f32 `markov_w2` once per block
+> position (7×/round) at host DRAM bandwidth. Two changes:
+> (1) launch trims — one `AttentionBatchedRagged` launch/layer instead of the
+> per-query loop (35→5), beta=1 GemmEx residuals (no CopyDevice/AddInPlace), fused
+> q+k RoPE, shared f32→f16 activation converts; (2) the Markov re-bias, greedy
+> argmax chain, and confidence head moved on-device (fp16 `markov_w1`/`markov_w2`
+> resident, +156 MB VRAM at 4B-head shapes, gather→beta=1-GEMV→`llm_argmax_rows`
+> per position, zero host syncs inside the chain) so only [B] tokens + [B]
+> confidences cross PCIe per round. Same prompt/settings as above: draft
+> 1971→836 ms over ~71 rounds; DSpark default 50.0→61.1 t/s, `min-confidence 0.8`
+> 46.5→58.0 t/s, plain 55–62 t/s (thermal window). With the draft flat at ~12 ms the
+> verify-length sweep now CROSSES plain on this 37%-acceptance content:
+> k=1 55.1 / k=2 64.7 / **k=3 67.9** / k=5 65.8 / k=7 59.9 t/s vs plain 61.5 —
+> `--dspark-verify-len 3` is a 1.10× win on the exact 4B pairing that lost 50-vs-64
+> pre-#428 (k=7, the block-size default, is the worst config on hard content; the
+> confidence trim at 0.8 only reaches 58.0 — a fixed short cap beats it here).
+> Acceptance and emitted tokens byte-identical to the host-heads path on the bench
+> workload; the new `CudaDSparkDraftModelTests` pin CUDA-vs-CPU proposal parity on
+> the synthetic head. Lever 2 (verify fixed cost) is the remaining upside.
+>
+> **#428 lever 2, MMQ half (2026-07-09): measured, and rejected on parity.** The
+> existing `SHARPI_BATCH_DECODE_MMQ=1` A/B (which force-routes the pinned
+> `allowDecodeMmq:false` verify onto the int8 decode-MMQ tile) gives verify
+> 3350→2233 ms and 60.5→**79.5 t/s** on the same 4B workload — but the 256-token
+> parity oracle FAILS: the output text diverges from plain greedy mid-sequence
+> (acceptance shifts 37%→31% along the changed trajectory). The MMQ verify logits
+> flip argmaxes on near-ties vs the per-token decode path, so the "argmax-stable"
+> property that holds for batched-vs-batched (#201/#206) does NOT extend to
+> batched-MMQ-vs-per-token — the `allowDecodeMmq:false` pin is load-bearing and
+> stays. The +19 t/s is only reachable as an explicit parity-relaxed opt-in (the
+> output is still self-consistent greedy under MMQ numerics), or via the other
+> lever-2 half: a CUDA-graph-captured k-token verify to cut the ~10.6 ms fixed
+> launch overhead of the un-graphed 36-layer batched trunk while staying on the
+> bit-exact WS matvecs.
 
 ## 1. Background
 

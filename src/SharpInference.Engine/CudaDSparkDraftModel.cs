@@ -7,8 +7,8 @@ namespace SharpInference.Engine;
 /// <summary>
 /// CUDA implementation of the DSpark draft head (docs/dspark-plan.md Phase 4,
 /// PR #413). Same math as <see cref="DSparkDraftModel"/> — an EAGLE-3-style
-/// block drafter over fused target hidden-state taps — with the backbone on
-/// the GPU and the sequential heads on the host:
+/// block drafter over fused target hidden-state taps — fully resident on the
+/// GPU, sequential Markov/confidence heads included (issue #428):
 ///
 /// <list type="bullet">
 /// <item>Projections (fc, q/k/v/o, gate/up/down, lm_head) are resident fp16
@@ -17,14 +17,26 @@ namespace SharpInference.Engine;
 /// fp32 activations/accumulation). Norm weights stay f32.</item>
 /// <item>Per-layer context K/V lives in device buffers, grown geometrically,
 /// with <see cref="DSparkConfig.BlockSize"/> slack rows at the tail: the block's
-/// own K/V is projected straight into rows [ctxLen, ctxLen+B), and the
-/// mask-free <see cref="CudaBackend.Attention"/> kernel over seqLen = ctxLen+B
-/// gives every block query bidirectional visibility of context + block —
-/// no crop, identical semantics to the CPU model's scratch-block attention.</item>
-/// <item>Base logits and final hiddens are downloaded once per block
-/// (~[B×vocab] + [B×embDim] floats) and the shared <see cref="DSparkHostHeads"/>
-/// applies the Markov re-bias, greedy chain, and confidence scoring on the
-/// host — the semi-autoregressive part is tiny and inherently sequential.</item>
+/// own K/V is projected straight into rows [ctxLen, ctxLen+B), and ONE mask-free
+/// <see cref="CudaBackend.AttentionBatchedRagged"/> launch per layer (every
+/// query row aliased to this layer's cache, slot = ctxLen+B-1) gives every
+/// block query bidirectional visibility of context + block — bit-identical per
+/// (query, head) to the per-query <see cref="CudaBackend.Attention"/> loop it
+/// replaces (issue #428: 35 launches → 5), no crop, identical semantics to the
+/// CPU model's scratch-block attention.</item>
+/// <item>The Markov re-bias, greedy chain, and confidence head run ON-DEVICE
+/// (issue #428): per position, a gather kernel pulls markov_w1[prev] (prev read
+/// on-stream from the previous position's argmax), one beta=1 GemmEx adds the
+/// markov_w2 bias into the logits row, and llm_argmax_rows picks the token —
+/// no host sync inside the chain. Measured host-side, the old
+/// <see cref="DSparkHostHeads"/> chain re-streamed the [vocab × rank] markov_w2
+/// 7× per round at ~17.6 ms — ~65% of the whole draft round; on-device the same
+/// traffic runs at HBM bandwidth and the [B×vocab] logits download disappears —
+/// only [B] tokens + [B] confidences cross PCIe, behind a single stream sync.</item>
+/// <item>Launch-count trims (issue #428): residual adds ride the o/down GEMMs'
+/// beta=1 epilogue (no CopyDevice + AddInPlace pairs), q+k RoPE is one fused
+/// launch, and back-to-back projections of one normed block reuse the f32→f16
+/// activation conversion.</item>
 /// </list>
 ///
 /// Draft-side numerics (fp16 GEMMs) affect acceptance rate only, never emitted
@@ -50,25 +62,43 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
     private Tensor? _hiddenNormW, _finalNormW;
     private readonly Tensor?[] _qNormW, _kNormW, _inNormW, _ffnNormW;
 
-    // Host-side pieces shared with the CPU model.
-    private DSparkHostHeads? _heads;
+    // Draft-only embedding table stays host-side (two rows gathered per block).
     private ushort* _embedBf16; private float* _embedF32;   // [vocab, embDim]
+
+    // Device-side Markov/confidence heads (issue #428; semantics mirror
+    // DSparkHostHeads exactly — see its GreedyBlock).
+    private readonly int _rank;
+    private readonly bool _confWithMarkov;
+    private Tensor? _markovW1F16, _markovW2F16;  // [vocab, rank] fp16
+    private Tensor? _confWDev;                   // [embDim (+ rank)] f32
+    private float _confB;
+    private Tensor? _w1RowDev;                   // [rank] — the bias GEMV activation
+    private Tensor? _w1RowsDev;                  // [B, rank] — confidence feature tails
+    private Tensor? _argmaxDev;                  // [B*2] llm_argmax_rows (idx bits, value)
+    private Tensor? _confDev;                    // [B]
 
     // Device context K/V per layer: [_ctxCap, kvDim] f32, filled to _ctxLen,
     // with _block slack rows at the tail for the in-place block K/V.
     private readonly Tensor?[] _ctxK, _ctxV;
     private int _ctxCap;
     private int _ctxLen;
-    private Tensor? _attnScratch;              // [numHeads × _ctxCap] once cap > 4096
+    private Tensor? _attnScratch;              // [B × numHeads × _ctxCap] once cap > 4096
 
-    // Block scratch (fixed B rows).
-    private Tensor? _x, _resid, _norm;         // [B × embDim]
+    // Block scratch (fixed B rows). No residual buffer: x itself carries the
+    // residual — the o/down GEMMs accumulate onto it via beta=1 (issue #428).
+    private Tensor? _x, _norm;                 // [B × embDim]
     private Tensor? _q, _attnOut;              // [B × qDim]
     private Tensor? _gate, _up;                // [B × interm]
     private Tensor? _logitsDev;                // [B × vocab]
     private readonly float[] _xHost;           // [B × embDim] block input assembly
-    private readonly float[] _baseLogitsHost;  // [B × vocab]
-    private readonly float[] _blockHiddenHost; // [B × embDim]
+    // Pinned host landing zones for the per-block result pair — one async +
+    // one sync copy share a single StreamSynchronize (issue #49 pattern).
+    private nint _pinnedArgmax;                // [B*2] floats (idx bits, value)
+    private nint _pinnedConf;                  // [B] floats
+    // One-launch ragged attention args: every block query attends this layer's
+    // ctx cache over the same [0, ctxLen+B) range (issue #428).
+    private readonly Tensor[] _raggedK, _raggedV;
+    private readonly int[] _raggedSlots;
 
     // AppendContext scratch, grown to the chunk size.
     private const int AppendChunkRows = 256;
@@ -82,6 +112,20 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
     public int TapDim => _tapDim;
     public int ContextLength => _ctxLen;
     public int MaxContext => _maxCtx;
+
+    private readonly System.Diagnostics.Stopwatch _phaseSw = new();
+
+    /// <summary>Milliseconds spent waiting on the per-block result download —
+    /// the stream sync collapses the whole enqueued GPU pipeline (backbone +
+    /// device-side heads) into this window, so it reads as "GPU execution +
+    /// D2H transfer" per round (issue #428).</summary>
+    public double GpuWaitMs { get; private set; }
+
+    /// <summary>Milliseconds spent host-side after the download (proposal
+    /// assembly). The Markov/confidence chain itself runs on-device (issue
+    /// #428), so this should stay near zero — a regression here means the
+    /// heads fell back to the host somehow.</summary>
+    public double HostHeadsMs { get; private set; }
 
     /// <summary>Layer ids to pass to <see cref="IForwardPass.EnableHiddenTaps"/> on the target.</summary>
     public int[] TargetLayerIds => _cfg.TargetLayerIds;
@@ -121,7 +165,27 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
             _finalNormW = UploadF32(weights, "norm.weight", [_embDim]);
             DSparkWeightLoading.LoadRowTable(weights, "embed_tokens.weight", [_vocab, _embDim],
                 out _embedBf16, out _embedF32);
-            _heads = new DSparkHostHeads(cfg, weights);
+
+            // Device-side Markov/confidence heads (issue #428): fp16 markov
+            // tables (BF16→FP16 exact for weight-range values, like the
+            // projections), f32 confidence projection. Loading mirrors
+            // DSparkHostHeads' names, shapes and optionality.
+            _rank = cfg.MarkovRank;
+            _confWithMarkov = cfg.ConfidenceHeadWithMarkov;
+            if (_rank > 0)
+            {
+                _markovW1F16 = UploadF16(weights, "markov_head.markov_w1.weight", [_vocab, _rank]);
+                _markovW2F16 = UploadF16(weights, "markov_head.markov_w2.weight", [_vocab, _rank]);
+            }
+            if (cfg.EnableConfidenceHead)
+            {
+                int confIn = _embDim + (_confWithMarkov ? _rank : 0);
+                _confWDev = UploadF32(weights, "confidence_head.proj.weight", [1, confIn]);
+                var b = weights.ReadF32("confidence_head.proj.bias");
+                if (b.Length != 1)
+                    throw new InvalidDataException("confidence_head.proj.bias must be a scalar.");
+                _confB = b[0];
+            }
 
             for (int l = 0; l < L; l++)
             {
@@ -139,7 +203,6 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
             }
 
             _x = AllocF32((long)_block * _embDim);
-            _resid = AllocF32((long)_block * _embDim);
             _norm = AllocF32((long)_block * _embDim);
             _q = AllocF32((long)_block * _qDim);
             _attnOut = AllocF32((long)_block * _qDim);
@@ -147,8 +210,22 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
             _up = AllocF32((long)_block * _interm);
             _logitsDev = AllocF32((long)_block * _vocab);
             _xHost = new float[_block * _embDim];
-            _baseLogitsHost = new float[_block * _vocab];
-            _blockHiddenHost = new float[_block * _embDim];
+            if (_rank > 0)
+            {
+                _w1RowDev = AllocF32(_rank);    // exactly rank: the GEMV derives cols from it
+                _w1RowsDev = AllocF32((long)_block * _rank);
+            }
+            _argmaxDev = AllocF32((long)_block * 2);
+            _confDev = AllocF32(_block);
+            _pinnedArgmax = CudaBackend.AllocatePinnedHost((nuint)((long)_block * 2 * sizeof(float)));
+            _pinnedConf = CudaBackend.AllocatePinnedHost((nuint)((long)_block * sizeof(float)));
+            if (_pinnedArgmax == nint.Zero || _pinnedConf == nint.Zero)
+                throw new InvalidOperationException(
+                    "cudaMallocHost failed for the DSpark block result buffers " +
+                    $"({(long)_block * 3 * sizeof(float)} bytes pinned).");
+            _raggedK = new Tensor[_block];
+            _raggedV = new Tensor[_block];
+            _raggedSlots = new int[_block];
         }
         catch
         {
@@ -159,8 +236,9 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
 
     /// <summary>
     /// Approximate VRAM-resident bytes of a loaded head at this config: fp16
-    /// projections + f32 norms (embeddings and the Markov/confidence heads stay
-    /// on the host). Context K/V and scratch grow separately.
+    /// projections + fp16 Markov tables (issue #428 device-side heads) + f32
+    /// norms/confidence proj (embeddings stay on the host). Context K/V and
+    /// scratch grow separately.
     /// </summary>
     public static long EstimateGpuResidentBytes(DSparkConfig cfg)
     {
@@ -171,8 +249,11 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
             + (long)cfg.IntermediateSize * embDim * 3;
         long f16Elems = embDim * (long)cfg.TapDim
             + (long)cfg.VocabSize * embDim
-            + perLayer * cfg.NumLayers;
+            + perLayer * cfg.NumLayers
+            + 2L * cfg.VocabSize * cfg.MarkovRank;   // markov_w1 + markov_w2 (#428)
         long f32Elems = (embDim * 2 + (cfg.HeadDim * 2 + embDim * 2) * (long)cfg.NumLayers);
+        if (cfg.EnableConfidenceHead)
+            f32Elems += embDim + (cfg.ConfidenceHeadWithMarkov ? cfg.MarkovRank : 0);
         return f16Elems * 2 + f32Elems * 4;
     }
 
@@ -229,17 +310,23 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
             _gpu.MatMulBatchedGemmF16W(fused, _fc!, tapsN, n);
             _gpu.RmsNormBatched(fused, fused, _hiddenNormW!, n, _embDim, _eps);
 
+            // All 2L projections below read the SAME normed `fused` rows: the first
+            // k GEMM converts them f32→f16 once, the rest reuse the scratch (#428).
+            bool converted = false;
             for (int l = 0; l < _cfg.NumLayers; l++)
             {
                 var kRows = _gpu.View(_ctxK[l]!, (long)startPos * _kvDim, (long)n * _kvDim);
                 var vRows = _gpu.View(_ctxV[l]!, (long)startPos * _kvDim, (long)n * _kvDim);
                 try
                 {
-                    _gpu.MatMulBatchedGemmF16W(kRows, _wk[l]!, fused, n);
+                    _gpu.MatMulBatchedGemmF16W(kRows, _wk[l]!, fused, n,
+                        reuseConvertedInput: converted);
+                    converted = true;
                     _gpu.HeadNormBatched(kRows, _kNormW[l]!, _numKvHeads, _headDim, n, _eps);
                     _gpu.RoPEPartialBatched(kRows, startPos, _headDim, _headDim,
                         _cfg.RopeTheta, _numKvHeads, n, neox: true);
-                    _gpu.MatMulBatchedGemmF16W(vRows, _wv[l]!, fused, n);
+                    _gpu.MatMulBatchedGemmF16W(vRows, _wv[l]!, fused, n,
+                        reuseConvertedInput: true);
                 }
                 finally
                 {
@@ -281,12 +368,20 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
         _gpu.UploadInto(_x!, _xHost);
 
         int seqLen = anchorPos + B;
+        // One-launch ragged attention args: every block query attends the same
+        // bidirectional [0, seqLen) range of this layer's ctx buffers (the ragged
+        // kernel attends [0, slots[j]+1) of caches[j]; aliasing all B rows to one
+        // cache with slot seqLen-1 is exactly the per-query Attention loop it
+        // replaces, bit-identical per (query, head)).
+        for (int j = 0; j < B; j++) _raggedSlots[j] = seqLen - 1;
+
         for (int l = 0; l < _cfg.NumLayers; l++)
         {
             // Attention. Block K/V is projected directly into the ctx buffers'
             // rows [anchorPos, anchorPos+B) — the next AppendContext at
             // startPos=anchorPos overwrites them, mirroring the reference crop.
-            _gpu.CopyDevice(_resid!, _x!);
+            // `_x` stays untouched below the norm and carries the residual: the
+            // o-projection accumulates onto it via beta=1 (no copy, no add).
             _gpu.RmsNormBatched(_norm!, _x!, _inNormW[l]!, B, _embDim, _eps);
             _gpu.MatMulBatchedGemmF16W(_q!, _wq[l]!, _norm!, B);
 
@@ -294,14 +389,12 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
             var vRows = _gpu.View(_ctxV[l]!, (long)anchorPos * _kvDim, (long)B * _kvDim);
             try
             {
-                _gpu.MatMulBatchedGemmF16W(kRows, _wk[l]!, _norm!, B);
-                _gpu.MatMulBatchedGemmF16W(vRows, _wv[l]!, _norm!, B);
+                _gpu.MatMulBatchedGemmF16W(kRows, _wk[l]!, _norm!, B, reuseConvertedInput: true);
+                _gpu.MatMulBatchedGemmF16W(vRows, _wv[l]!, _norm!, B, reuseConvertedInput: true);
                 _gpu.HeadNormQkBatched(_q!, _qNormW[l]!, kRows, _kNormW[l]!,
                     _numHeads, _numKvHeads, _headDim, B, _eps);
-                _gpu.RoPEPartialBatched(_q!, anchorPos, _headDim, _headDim,
-                    _cfg.RopeTheta, _numHeads, B, neox: true);
-                _gpu.RoPEPartialBatched(kRows, anchorPos, _headDim, _headDim,
-                    _cfg.RopeTheta, _numKvHeads, B, neox: true);
+                _gpu.RoPEPartialBatchedQk(_q!, kRows, anchorPos, _headDim, _headDim,
+                    _cfg.RopeTheta, _numHeads, _numKvHeads, B, neox: true);
             }
             finally
             {
@@ -309,48 +402,79 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
                 _gpu.Free(vRows);
             }
 
-            // Bidirectional GQA: the kernel has no causal mask — every block query
-            // scans all seqLen = ctx+block keys.
-            for (int j = 0; j < B; j++)
-            {
-                var qRow = _gpu.View(_q!, (long)j * _qDim, _qDim);
-                var oRow = _gpu.View(_attnOut!, (long)j * _qDim, _qDim);
-                try
-                {
-                    _gpu.Attention(qRow, _ctxK[l]!, _ctxV[l]!, oRow, _attnScratch,
-                        _numHeads, _numKvHeads, _headDim, seqLen, _ctxCap);
-                }
-                finally
-                {
-                    _gpu.Free(qRow);
-                    _gpu.Free(oRow);
-                }
-            }
+            // Bidirectional GQA, one launch for all B queries (no causal mask —
+            // every block query scans all seqLen = ctx+block keys).
+            _raggedK.AsSpan().Fill(_ctxK[l]!);
+            _raggedV.AsSpan().Fill(_ctxV[l]!);
+            _gpu.AttentionBatchedRagged(_q!, _raggedK, _raggedV, _attnOut!, _attnScratch,
+                _numHeads, _numKvHeads, _headDim, _raggedSlots, _ctxCap);
 
-            _gpu.MatMulBatchedGemmF16W(_x!, _wo[l]!, _attnOut!, B);
-            _gpu.AddInPlace(_x!, _resid!);
+            _gpu.MatMulBatchedGemmF16W(_x!, _wo[l]!, _attnOut!, B, beta: 1f);
 
-            // FFN (SwiGLU).
-            _gpu.CopyDevice(_resid!, _x!);
+            // FFN (SwiGLU); `_x` again carries the residual through the down
+            // projection's beta=1, and gate/up share one activation conversion.
             _gpu.RmsNormBatched(_norm!, _x!, _ffnNormW[l]!, B, _embDim, _eps);
             _gpu.MatMulBatchedGemmF16W(_gate!, _wGate[l]!, _norm!, B);
-            _gpu.MatMulBatchedGemmF16W(_up!, _wUp[l]!, _norm!, B);
+            _gpu.MatMulBatchedGemmF16W(_up!, _wUp[l]!, _norm!, B, reuseConvertedInput: true);
             _gpu.SiLuMul(_gate!, _up!);
-            _gpu.MatMulBatchedGemmF16W(_x!, _wDown[l]!, _gate!, B);
-            _gpu.AddInPlace(_x!, _resid!);
+            _gpu.MatMulBatchedGemmF16W(_x!, _wDown[l]!, _gate!, B, beta: 1f);
         }
 
         _gpu.RmsNormBatched(_x!, _x!, _finalNormW!, B, _embDim, _eps);
         _gpu.MatMulBatchedGemmF16W(_logitsDev!, _lmHead!, _x!, B);
 
-        _gpu.Download(_logitsDev!, _baseLogitsHost);
-        _gpu.Download(_x!, _blockHiddenHost);
-
-        fixed (float* logits = _baseLogitsHost)
-        fixed (float* hidden = _blockHiddenHost)
+        // Device-side Markov chain (issue #428), semantics of
+        // DSparkHostHeads.GreedyBlock: per position j, gather markov_w1[prev]
+        // (prev = anchor at j=0, else position j-1's argmax, read on-stream),
+        // bias the logits row in place via a beta=1 GEMV against markov_w2,
+        // then argmax the row. No host sync anywhere in the chain.
+        if (_rank > 0)
         {
-            return _heads!.GreedyBlock(logits, hidden, anchorToken);
+            for (int j = 0; j < B; j++)
+            {
+                _gpu.DSparkGatherW1(_markovW1F16!, _argmaxDev!, j, anchorToken,
+                    _w1RowDev!, _w1RowsDev!, _rank);
+                var logitsRow = _gpu.View(_logitsDev!, (long)j * _vocab, _vocab);
+                var amRow = _gpu.View(_argmaxDev!, (long)j * 2, 2);
+                try
+                {
+                    _gpu.MatMulBatchedGemmF16W(logitsRow, _markovW2F16!, _w1RowDev!, 1, beta: 1f);
+                    _gpu.ArgmaxRowsToDevice(logitsRow, amRow, 1, _vocab, _vocab);
+                }
+                finally
+                {
+                    _gpu.Free(logitsRow);
+                    _gpu.Free(amRow);
+                }
+            }
         }
+        else
+        {
+            // No Markov head: the block's argmaxes are independent — one launch.
+            _gpu.ArgmaxRowsToDevice(_logitsDev!, _argmaxDev!, B, _vocab, _vocab);
+        }
+
+        bool hasConf = _confWDev is not null;
+        _phaseSw.Restart();
+        if (hasConf)
+        {
+            _gpu.DSparkConfidence(_x!, _w1RowsDev ?? _confDev!, _confWDev!, _confB, _confDev!,
+                _embDim, _rank, withMarkov: _confWithMarkov && _rank > 0, B);
+            _gpu.DownloadAsync(_confDev!, _pinnedConf, B);
+        }
+        // One sync drains the whole pipeline + both result copies (issue #49).
+        _gpu.Download(_argmaxDev!, _pinnedArgmax, B * 2);
+        GpuWaitMs += _phaseSw.Elapsed.TotalMilliseconds;
+
+        _phaseSw.Restart();
+        var tokens = new int[B];
+        var conf = new float[B];
+        int* am = (int*)_pinnedArgmax;
+        for (int j = 0; j < B; j++) tokens[j] = am[j * 2];
+        if (hasConf) new ReadOnlySpan<float>((float*)_pinnedConf, B).CopyTo(conf);
+        else Array.Fill(conf, 1f);
+        HostHeadsMs += _phaseSw.Elapsed.TotalMilliseconds;
+        return new DSparkProposal(tokens, conf);
     }
 
     public void TruncateContext(int length)
@@ -379,11 +503,12 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
         }
 
         // The attention kernel spills scores to scratch past 4096 keys; size it
-        // for the full capacity so seqLen can reach _ctxCap.
+        // for the full capacity so seqLen can reach _ctxCap. The one-launch ragged
+        // kernel spills per (query, head) — B × numHeads × cap floats (issue #428).
         if (newCap > 4096)
         {
             if (_attnScratch is { } old) _gpu.Free(old);
-            _attnScratch = AllocF32((long)_numHeads * newCap);
+            _attnScratch = AllocF32((long)_block * _numHeads * newCap);
         }
         _ctxCap = newCap;
 
@@ -451,7 +576,6 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
 
     private void FreeAll()
     {
-        _heads?.Dispose(); _heads = null;
         if (_embedBf16 != null)
         {
             System.Runtime.InteropServices.NativeMemory.Free(_embedBf16);
@@ -470,10 +594,15 @@ public sealed unsafe class CudaDSparkDraftModel : IDSparkDraft
         FreeArr(_qNormW); FreeArr(_kNormW); FreeArr(_inNormW); FreeArr(_ffnNormW);
         FreeArr(_ctxK); FreeArr(_ctxV);
         FreeTensor(ref _attnScratch);
-        FreeTensor(ref _x); FreeTensor(ref _resid); FreeTensor(ref _norm);
+        FreeTensor(ref _x); FreeTensor(ref _norm);
         FreeTensor(ref _q); FreeTensor(ref _attnOut);
         FreeTensor(ref _gate); FreeTensor(ref _up); FreeTensor(ref _logitsDev);
         FreeTensor(ref _tapsDev); FreeTensor(ref _fusedDev);
+        FreeTensor(ref _markovW1F16); FreeTensor(ref _markovW2F16); FreeTensor(ref _confWDev);
+        FreeTensor(ref _w1RowDev); FreeTensor(ref _w1RowsDev);
+        FreeTensor(ref _argmaxDev); FreeTensor(ref _confDev);
+        CudaBackend.FreePinnedHost(_pinnedArgmax); _pinnedArgmax = nint.Zero;
+        CudaBackend.FreePinnedHost(_pinnedConf); _pinnedConf = nint.Zero;
 
         void FreeTensor(ref Tensor? t)
         {

@@ -1606,6 +1606,14 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             (totalDecoded > generated ? $" ({generated} visible, {totalDecoded - generated} thinking)" : "") +
             $" | DSpark accept: {decoder.AcceptanceRate:P0} ({decoder.TotalDraftsAccepted}/{decoder.TotalDraftsEmitted}) | " +
             $"draft {decoder.DraftMs:F0}ms / verify {decoder.VerifyMs:F0}ms / commit {decoder.CommitMs:F0}ms[/]");
+        // Draft-internal breakdown for the #428 perf work: enqueue = launch-issue CPU
+        // time, gpu-wait = GPU execution + D2H collapsed into the per-block download
+        // sync, heads = host Markov/confidence chain.
+        if (Environment.GetEnvironmentVariable("SHARPI_DSPARK_TIMING") == "1"
+            && draft is CudaDSparkDraftModel cudaDraft)
+            AnsiConsole.MarkupLine(
+                $"[dim]DSpark draft breakdown: enqueue {decoder.DraftMs - cudaDraft.GpuWaitMs - cudaDraft.HostHeadsMs:F0}ms / " +
+                $"gpu-wait {cudaDraft.GpuWaitMs:F0}ms / heads {cudaDraft.HostHeadsMs:F0}ms[/]");
         return 0;
     }
 
