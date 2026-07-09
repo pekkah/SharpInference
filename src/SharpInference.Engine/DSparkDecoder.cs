@@ -182,6 +182,18 @@ public sealed class DSparkDecoder
                 proposal = _draft.ProposeBlock(t1, P);
                 DraftMs += _phaseSw.Elapsed.TotalMilliseconds;
 
+                // Validate the proposal shape up front: a default(DSparkProposal) or a
+                // confidence array shorter than the tokens would otherwise surface as an
+                // opaque NRE / IndexOutOfRange deep in the trim loop.
+                if (proposal.Tokens is null)
+                    throw new InvalidOperationException(
+                        $"{_draft.GetType().Name}.ProposeBlock returned a default proposal (null Tokens).");
+                if (minConfidence > 0f
+                    && (proposal.Confidences is null || proposal.Confidences.Length < proposal.Tokens.Length))
+                    throw new InvalidOperationException(
+                        $"{_draft.GetType().Name}.ProposeBlock returned {proposal.Confidences?.Length ?? 0} " +
+                        $"confidences for {proposal.Tokens.Length} tokens; the confidence trim needs one per draft.");
+
                 kDraft = proposal.Tokens.Length;
                 if (minConfidence > 0f)
                 {

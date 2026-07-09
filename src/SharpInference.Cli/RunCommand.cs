@@ -1511,7 +1511,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         long headBytesCpu = DSparkDraftModel.EstimateResidentBytes(cfg);
         long tapBytes = (long)targetPlacement.RecommendedCtxSize * cfg.TapDim * sizeof(float);
         var decision = DSparkPlacementPlanner.Plan(
-            hwProfile, targetPlacement, headBytesGpu, headBytesCpu + tapBytes, userPlace);
+            hwProfile, targetPlacement, headBytesGpu, headBytesCpu, userPlace,
+            hostTapBytes: tapBytes);
         AnsiConsole.MarkupLine($"[dim]DSpark placement: {decision.Placement} — {decision.Reason.EscapeMarkup()}[/]");
         if (decision.Placement == DSparkPlacement.Off)
         {
@@ -1527,7 +1528,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             // Gpu → Cpu → Off graceful fallback.
             var cpuCheck = DSparkPlacementPlanner.Plan(
                 hwProfile with { VramBytes = 0 }, targetPlacement,
-                headBytesGpu, headBytesCpu + tapBytes, DSparkPlacement.Auto);
+                headBytesGpu, headBytesCpu, DSparkPlacement.Auto,
+                hostTapBytes: tapBytes);
             AnsiConsole.MarkupLine(
                 "[yellow]Note:[/] a GPU DSpark draft requires a CUDA target (-g -1); " +
                 $"re-planned for CPU — {cpuCheck.Reason.EscapeMarkup()}");

@@ -44,15 +44,21 @@ public static class DSparkPlacementPlanner
     /// <summary>Below this core count a CPU draft chain becomes the bottleneck.</summary>
     private const int MinCpuCores = 4;
 
+    /// <param name="hostTapBytes">Host-RAM cost of the TARGET's hidden-tap buffer
+    /// (ctx × TapDim × 4 bytes). Resident regardless of where the DRAFT runs, so it
+    /// is charged against RAM before both the Gpu and Cpu branches — a Gpu placement
+    /// without host headroom for the taps would still OOM the host.</param>
     public static DSparkPlacementDecision Plan(
         HardwareProfile hardware,
         LayerPlacement targetPlacement,
         long draftHeadBytesGpuQuant,
         long draftHeadBytesCpuQuant,
-        DSparkPlacement userOverride = DSparkPlacement.Auto)
+        DSparkPlacement userOverride = DSparkPlacement.Auto,
+        long hostTapBytes = 0)
     {
         long vramFree = VramHeadroom(hardware, targetPlacement);
-        long ramFree = RamHeadroom(hardware, targetPlacement);
+        long ramFreeRaw = RamHeadroom(hardware, targetPlacement);
+        long ramFree = Math.Max(0, ramFreeRaw - hostTapBytes);
 
         // Explicit override skips the budget math entirely (still reports the
         // headroom so the caller can print what it's doing instead of silently
@@ -76,8 +82,9 @@ public static class DSparkPlacementPlanner
 
         // Auto: prefer GPU colocation (no PCIe round-trip per draft step),
         // fall back to CPU when VRAM is tight but RAM and cores allow, else Off.
+        // Even a GPU draft needs host RAM for the target's tap buffer.
         long gpuNeed = (long)(draftHeadBytesGpuQuant * ScratchMargin);
-        if (hardware.VramBytes > 0 && vramFree >= gpuNeed)
+        if (hardware.VramBytes > 0 && vramFree >= gpuNeed && ramFreeRaw >= hostTapBytes)
         {
             return new DSparkPlacementDecision(DSparkPlacement.Gpu,
                 $"auto: gpu — {Mb(vramFree)} MB free VRAM ≥ {Mb(gpuNeed)} MB needed",

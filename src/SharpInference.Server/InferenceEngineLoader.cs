@@ -179,7 +179,21 @@ public static class InferenceEngineLoader
                 if (visionEmbedder is not null)
                     ie.EnableImageInput(visionEmbedder, visionModel!, imgIds.Open, imgIds.Close, imgIds.Placeholder);
                 if (!string.IsNullOrWhiteSpace(dsparkPath))
-                    AttachDSpark(ie, fwd, model, hp, owned, opts, dsparkPath, ctxSize);
+                {
+                    try
+                    {
+                        AttachDSpark(ie, fwd, model, hp, owned, opts, dsparkPath, ctxSize);
+                    }
+                    catch
+                    {
+                        // The engine already owns fwd + owned[] and runs a background
+                        // worker thread; dispose IT (which tears all of that down) and
+                        // clear the list so the outer catch can't double-dispose.
+                        ie.Dispose();
+                        owned.Clear();
+                        throw;
+                    }
+                }
                 engine = ie;
             }
         }
@@ -249,7 +263,8 @@ public static class InferenceEngineLoader
         long headBytesCpu = DSparkDraftModel.EstimateResidentBytes(cfg);
         long tapBytes = (long)targetPlacement.RecommendedCtxSize * cfg.TapDim * sizeof(float);
         var decision = DSparkPlacementPlanner.Plan(
-            hwProfile, targetPlacement, headBytesGpu, headBytesCpu + tapBytes, userPlace);
+            hwProfile, targetPlacement, headBytesGpu, headBytesCpu, userPlace,
+            hostTapBytes: tapBytes);
 
         if (decision.Placement == DSparkPlacement.Gpu && cuda is null)
         {
@@ -257,7 +272,8 @@ public static class InferenceEngineLoader
             // profile so the RAM budget is actually checked.
             decision = DSparkPlacementPlanner.Plan(
                 hwProfile with { VramBytes = 0 }, targetPlacement,
-                headBytesGpu, headBytesCpu + tapBytes, DSparkPlacement.Auto);
+                headBytesGpu, headBytesCpu, DSparkPlacement.Auto,
+                hostTapBytes: tapBytes);
         }
         Console.Error.WriteLine($"[InferenceEngine] DSpark placement: {decision.Placement} — {decision.Reason}");
         if (decision.Placement == DSparkPlacement.Off)

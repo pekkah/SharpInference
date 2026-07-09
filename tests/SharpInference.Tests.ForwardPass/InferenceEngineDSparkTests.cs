@@ -46,6 +46,7 @@ public sealed class InferenceEngineDSparkTests
 
         public ReadOnlySpan<float> Forward(int token, int position)
         {
+            Assert.Equal(CacheLen, position);   // appends exactly at the cache end
             CacheLen = position + 1;
             if (CacheLen > TapHighWater) TapHighWater = CacheLen;
             return Logits((token + 1) % Vocab);
@@ -53,6 +54,7 @@ public sealed class InferenceEngineDSparkTests
 
         public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0)
         {
+            Assert.Equal(CacheLen, startPos);   // suffix prefill resumes at the cache end
             CacheLen = startPos + tokens.Count;
             if (CacheLen > TapHighWater) TapHighWater = CacheLen;
             return Logits((tokens[^1] + 1) % Vocab);
@@ -133,7 +135,8 @@ public sealed class InferenceEngineDSparkTests
         public int PadTokenId => TokEos;
         public bool AddBosToken => false;
         public System.Collections.Immutable.ImmutableArray<int> EogTokenIds => [TokEos];
-        public (int Open, int Close) ReasoningTokens => (-1, -1);
+        public (int Open, int Close) ReasoningOverride { get; init; } = (-1, -1);
+        public (int Open, int Close) ReasoningTokens => ReasoningOverride;
         public IReadOnlyList<int> Encode(string text) => [0];   // prompt = "A"
         public string Decode(IEnumerable<int> tokens)
         {
@@ -181,6 +184,75 @@ public sealed class InferenceEngineDSparkTests
         }
         Assert.True(draft.ProposeCalls > 0, "The draft never proposed — the DSpark path didn't engage.");
         Assert.True(fwd.BatchVerifyCalls > 0);
+    }
+
+    /// <summary>
+    /// Thinking-CAPABLE model (reasoning ids registered) + a request rendered with
+    /// enable_thinking=false: DSpark must engage (the per-request gate, not the
+    /// model-static one) and any stray boundary token in the chain must be consumed,
+    /// never emitted — output identical to the plain path, which routes the same
+    /// markers through the think/text splitter.
+    /// </summary>
+    [Fact]
+    public async Task ThinkingModel_ThinkingDisabled_EngagesDSparkAndSwallowsMarkers()
+    {
+        // Chain A→B→C→D→E→eos with tokens 2 ("C") / 3 ("D") registered as the
+        // reasoning boundary pair: the plain path consumes them as <think>/</think>
+        // markers, so visible text is "BE".
+        var tokenizer = new ChainTokenizer { ReasoningOverride = (2, 3) };
+        var spOn = new SamplingParams { Temperature = 0f, MaxNewTokens = 10 };
+
+        string baseline;
+        using (var engine = new InferenceEngine(new TapChainPass(), tokenizer, "mock",
+                   thinkTokenId: 2, endThinkTokenId: 3))
+        {
+            baseline = await GenerateText(engine, spOn);
+        }
+        Assert.Equal("BE", baseline);
+
+        var fwd = new TapChainPass();
+        ((IForwardPass)fwd).EnableHiddenTaps([0, 2]);
+        var draft = new ChainDraft();
+        var spOff = new SamplingParams { Temperature = 0f, MaxNewTokens = 10, ThinkingDisabled = true };
+        using (var engine = new InferenceEngine(fwd, tokenizer, "mock",
+                   thinkTokenId: 2, endThinkTokenId: 3))
+        {
+            engine.AttachDSparkDraft(draft);
+            var text = await GenerateText(engine, spOff);
+            Assert.Equal(baseline, text);
+        }
+        Assert.True(draft.ProposeCalls > 0,
+            "ThinkingDisabled did not unlock the DSpark path on a thinking-capable model.");
+
+        // Without the per-request opt-out the model-static gate keeps DSpark off.
+        var fwd2 = new TapChainPass();
+        ((IForwardPass)fwd2).EnableHiddenTaps([0, 2]);
+        var draft2 = new ChainDraft();
+        using (var engine = new InferenceEngine(fwd2, tokenizer, "mock",
+                   thinkTokenId: 2, endThinkTokenId: 3))
+        {
+            engine.AttachDSparkDraft(draft2);
+            var text = await GenerateText(engine, spOn);
+            Assert.Equal(baseline, text);
+        }
+        Assert.Equal(0, draft2.ProposeCalls);
+    }
+
+    [Fact]
+    public async Task SpecTypeDSpark_ThinkingModel_WithoutOptOut_Throws()
+    {
+        var tokenizer = new ChainTokenizer { ReasoningOverride = (2, 3) };
+        var fwd = new TapChainPass();
+        ((IForwardPass)fwd).EnableHiddenTaps([0, 2]);
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock",
+            thinkTokenId: 2, endThinkTokenId: 3);
+        engine.AttachDSparkDraft(new ChainDraft());
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 4, SpecType = SpecType.DSpark };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            await foreach (var _ in engine.GenerateAsync("seed", sp)) { }
+        });
     }
 
     [Fact]

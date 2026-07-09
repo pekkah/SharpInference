@@ -622,13 +622,20 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                 new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
 
             // Capture reasoning-token IDs into locals to avoid repeated field reads in the hot loop.
-            // A request whose template was rendered with enable_thinking=false
-            // (sp.ThinkingDisabled) opts out of reasoning entirely: the model was told
-            // not to think, so the engine skips the think/text stream split AND the
-            // speculative fast paths' no-thinking gates pass (CLI --no-thinking parity).
+            // Two distinct concerns, deliberately separated:
+            //  • thinkingEnabled — MODEL-STATIC: the model has reasoning boundary tokens, so the
+            //    stream splitter must always consume them and route thinking to Thinking chunks
+            //    (a model can emit <think> even when the template rendered reasoning off — e.g.
+            //    Gemma 4's post-tool bare channel close, issue #304). Never per-request.
+            //  • requestReasoningOff — PER-REQUEST: the template was rendered with
+            //    enable_thinking=false (sp.ThinkingDisabled), so this request won't produce a
+            //    reasoning phase and the greedy no-thinking fast paths (MTP, DSpark) may engage
+            //    (CLI --no-thinking parity). Their decode blocks swallow any stray boundary
+            //    token like the CLI's EmitToken does.
             int thinkId = _thinkTokenId;
             int endThinkId = _endThinkTokenId;
-            bool thinkingEnabled = thinkId >= 0 && endThinkId >= 0 && !sp.ThinkingDisabled;
+            bool thinkingEnabled = thinkId >= 0 && endThinkId >= 0;
+            bool requestReasoningOff = sp.ThinkingDisabled || !thinkingEnabled;
 
             // Run the blocking generation on the engine's dedicated forward-pass thread (issue
             // #302), not an arbitrary thread-pool thread — CUDA contexts are thread-affine.
@@ -743,10 +750,11 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                                 throw new InvalidOperationException(
                                     "SamplingParams.SpecType=DSpark requires greedy sampling (Temperature=0). " +
                                     "DSpark verification is greedy (argmax match).");
-                            if (thinkingEnabled)
+                            if (!requestReasoningOff)
                                 throw new InvalidOperationException(
                                     "SamplingParams.SpecType=DSpark is incompatible with reasoning mode. " +
-                                    "Render the chat template with enable_thinking=false.");
+                                    "Render the chat template with enable_thinking=false " +
+                                    "(SamplingParams.ThinkingDisabled).");
                             useDSpark = true;
                             useMtp = false;
                             break;
@@ -763,7 +771,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                                 throw new InvalidOperationException(
                                     "SamplingParams.SpecType=Mtp requires greedy sampling (Temperature=0). " +
                                     "MTP verification is greedy (argmax match); sampling support is not yet implemented.");
-                            if (thinkingEnabled)
+                            if (!requestReasoningOff)
                                 throw new InvalidOperationException(
                                     "SamplingParams.SpecType=Mtp is incompatible with reasoning mode. " +
                                     "Pass --no-thinking (or render the chat template with enable_thinking=false).");
@@ -774,12 +782,12 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                             // outranks the model's innate MTP head when both are eligible.
                             useDSpark = _dspark is not null
                                 && sp.Temperature <= 0f
-                                && !thinkingEnabled;
+                                && requestReasoningOff;
                             useMtp = !useDSpark
                                 && _fwd.HasMtpHead
                                 && !mtpEnvDisabled
                                 && sp.Temperature <= 0f
-                                && !thinkingEnabled;
+                                && requestReasoningOff;
                             break;
                     }
                     // Image input (#253) splices precomputed embeddings during prefill; neither
@@ -910,6 +918,16 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         if (_slotTokens is not null && activeSlotIdx >= 0)
                             _slotTokens[activeSlotIdx] = null;
 
+                        // Same hazard for the single-slot _prevTokens itself (PR #413 Phase 6
+                        // review): a request cancelled mid-decode skips the end-of-decode
+                        // _prevTokens write, and a stale value describing the PRIOR sequence
+                        // would let the next request TruncateTo into KV (and, under DSpark,
+                        // replay tap rows) that this request already overwrote — a silent
+                        // prefix-reuse corruption. Invalidate before mutating; every complete
+                        // decode path (DSpark / MTP / plain, canonical or end-of-decode)
+                        // re-pairs it with the cache state it describes.
+                        _prevTokens = null;
+
                         // Prefill: process all prompt tokens (or just the suffix after the cached prefix).
                         //
                         // Issue #102 split: when a canonical-history boundary lies strictly between
@@ -972,6 +990,10 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                             if (ttftMs < 0) ttftMs = swReq.ElapsedMilliseconds;
                             decodeTokens++;
                             fullSeq.Add(tok);
+                            // Reasoning boundary tokens are consumed, never emitted (the
+                            // ITokenizer contract; CLI EmitToken parity) — a no-thinking
+                            // request can still see a stray marker (e.g. an orphan close).
+                            if (thinkingEnabled && (tok == thinkId || tok == endThinkId)) return;
                             var bytes = _tokenizer.DecodeBytes(tok);
                             var chunk = textDecDs.Append(bytes);
                             if (chunk.Length > 0)
@@ -1037,6 +1059,10 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                             if (ttftMs < 0) ttftMs = swReq.ElapsedMilliseconds;
                             decodeTokens++;
                             fullSeq.Add(tok);
+                            // Reasoning boundary tokens are consumed, never emitted (the
+                            // ITokenizer contract; CLI EmitToken parity) — a no-thinking
+                            // request can still see a stray marker (e.g. an orphan close).
+                            if (thinkingEnabled && (tok == thinkId || tok == endThinkId)) return;
                             var bytes = _tokenizer.DecodeBytes(tok);
                             var chunk = textDecMtp.Append(bytes);
                             if (chunk.Length > 0)

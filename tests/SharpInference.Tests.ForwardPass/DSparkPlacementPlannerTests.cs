@@ -202,6 +202,38 @@ public sealed class DSparkPlacementPlannerTests
         }
     }
 
+    // ── Host tap-buffer budget (PR #413 Phase 6 review) ──────────────────────────
+
+    [Fact]
+    public void Auto_HostTapBytes_GateGpu_AndChargeCpu()
+    {
+        // The target's hidden-tap buffer is HOST-resident regardless of where the
+        // draft runs. 24 GB card fits the head easily, but 4 GB RAM (2 GB reserve →
+        // ~2 GB raw headroom) can't hold a 3 GB tap buffer → neither Gpu nor Cpu.
+        var tightRam = Hw(24 * GiB, 4 * GiB, 16);
+        var target = new LayerPlacement(36, 0, 4 * GiB, 1 * GiB, 8192);
+
+        var blocked = DSparkPlacementPlanner.Plan(tightRam, target,
+            draftHeadBytesGpuQuant: 2 * GiB, draftHeadBytesCpuQuant: 3 * GiB,
+            hostTapBytes: 3 * GiB);
+        Assert.Equal(DSparkPlacement.Off, blocked.Placement);
+
+        // Same card with ample RAM → Gpu as before.
+        var ampleRam = Hw(24 * GiB, 64 * GiB, 16);
+        var ok = DSparkPlacementPlanner.Plan(ampleRam, target,
+            draftHeadBytesGpuQuant: 2 * GiB, draftHeadBytesCpuQuant: 3 * GiB,
+            hostTapBytes: 3 * GiB);
+        Assert.Equal(DSparkPlacement.Gpu, ok.Placement);
+
+        // No GPU: the tap bytes are charged against the Cpu budget on top of the
+        // head itself — 8 GB RAM (2 GB reserve) fits a 3 GB head but not head + 3 GB taps.
+        var noGpuTight = Hw(0, 8 * GiB, 16);
+        var cpuBlocked = DSparkPlacementPlanner.Plan(noGpuTight, new LayerPlacement(0, 36, 0, 0, 4096),
+            draftHeadBytesGpuQuant: 2 * GiB, draftHeadBytesCpuQuant: 3 * GiB,
+            hostTapBytes: 3 * GiB);
+        Assert.Equal(DSparkPlacement.Off, cpuBlocked.Placement);
+    }
+
     // ── MoE interplay ────────────────────────────────────────────────────────────
 
     [Fact]
