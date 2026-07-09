@@ -87,7 +87,9 @@ public sealed class ToolGrammarMockTests
         Feed(c, tok, "Berlin");
         c.Accept(FakeGemmaTokenizer.Quote);                 // close string
         Assert.True(Allowed(c, vocab, FakeGemmaTokenizer.Char('}')));   // required satisfied
-        Assert.True(Allowed(c, vocab, FakeGemmaTokenizer.Char(',')));
+        // Every declared key is emitted, so ',' would commit to a key that cannot exist — masked
+        // (the comma gate), where it previously livelocked in a whitespace-only OExpectKey state.
+        Assert.False(Allowed(c, vocab, FakeGemmaTokenizer.Char(',')));
 
         c.Accept(FakeGemmaTokenizer.Char('}'));
         Assert.False(c.IsConstraining);                     // object closed → watching

@@ -230,6 +230,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [Description("File containing a JSON schema to constrain the entire response to (llama.cpp --json-schema-file/-jf; alias --jf since llama.cpp's single-dash -jf isn't representable: Spectre short options must be one character). Mutually exclusive with --json-schema.")]
         public string? JsonSchemaFile { get; init; }
 
+        [CommandOption("--json-schema-ordered")]
+        [Description("With --json-schema/--json-schema-file: require properties in declaration order (issue #425) -- optional properties may be skipped but never reordered. Lets a streaming consumer act on an early field before a later, larger one finishes.")]
+        [DefaultValue(false)]
+        public bool JsonSchemaOrdered { get; init; }
+
         // ── MoE expert-cache tuning (offloaded MoE models) ──
         // Good defaults are automatic: frequency-aware SLRU eviction, VRAM-sized cache,
         // and next-layer predictive prefetch are all ON without any flag. These knobs only
@@ -303,14 +308,16 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     /// <summary>
     /// Builds a whole-turn <see cref="JsonSchemaOutputConstraint"/> (issue #423 follow-up) from
     /// <c>--json-schema</c> (inline) or <c>--json-schema-file</c>/<c>--jf</c> (file), or leaves
-    /// <paramref name="constraint"/> <c>null</c> when neither flag is given. Returns <c>false</c>
-    /// (with <paramref name="error"/> set) on mutual exclusivity, a missing/unreadable file,
-    /// malformed JSON, or a schema that can't be compiled to a constraint -- an explicit schema
-    /// request is a hard requirement, so failures are reported rather than silently ignored.
+    /// <paramref name="constraint"/> <c>null</c> when neither flag is given.
+    /// <paramref name="ordered"/> maps <c>--json-schema-ordered</c> (issue #425: properties in
+    /// declaration order). Returns <c>false</c> (with <paramref name="error"/> set) on mutual
+    /// exclusivity, a missing/unreadable file, malformed JSON, or a schema that can't be compiled
+    /// to a constraint -- an explicit schema request is a hard requirement, so failures are
+    /// reported rather than silently ignored.
     /// </summary>
     internal static bool TryLoadJsonSchemaConstraint(
         string? inlineSchema, string? schemaFilePath, GrammarVocabulary vocab,
-        out ITokenConstraint? constraint, out string? error)
+        out ITokenConstraint? constraint, out string? error, bool ordered = false)
     {
         constraint = null;
         error = null;
@@ -346,6 +353,13 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         }
         else
         {
+            // An explicit ordered request without a schema is user error, not a no-op -- silently
+            // generating unconstrained output would violate the fail-loudly contract above.
+            if (ordered)
+            {
+                error = "--json-schema-ordered requires --json-schema or --json-schema-file/--jf.";
+                return false;
+            }
             return true;   // neither flag given -- no-op
         }
 
@@ -364,7 +378,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         try
         {
             var schemaObject = ToolSchema.FromOpenAiFunction("_", root).Arguments;
-            constraint = new JsonSchemaOutputConstraint(vocab, schemaObject);
+            constraint = new JsonSchemaOutputConstraint(vocab, schemaObject, ordered);
             return true;
         }
         catch (ArgumentException ex)
@@ -988,7 +1002,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         // ── JSON-Schema-constrained output (issue #423 follow-up) ─────────────────
         if (!TryLoadJsonSchemaConstraint(settings.JsonSchema, settings.JsonSchemaFile, grammarVocab,
-                out ITokenConstraint? jsonSchemaConstraint, out string? jsonSchemaError))
+                out ITokenConstraint? jsonSchemaConstraint, out string? jsonSchemaError,
+                ordered: settings.JsonSchemaOrdered))
         {
             AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(jsonSchemaError!)}");
             return 1;
