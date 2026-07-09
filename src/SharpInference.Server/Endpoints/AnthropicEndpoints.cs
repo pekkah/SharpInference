@@ -149,7 +149,8 @@ public static class AnthropicEndpoints
             topP:        req.TopP,
             topK:        req.TopK,
             maxTokens:   req.MaxTokens,
-            maxThinking: req.Thinking?.BudgetTokens);
+            maxThinking: req.Thinking?.BudgetTokens,
+            thinkingDisabled: !enableThinking);
 
         // Tool-active turn: add the model family's tool-boundary stop (Gemma 4: <|tool_response>)
         // so generation halts when the tool calls finish instead of running on. Additive — keeps

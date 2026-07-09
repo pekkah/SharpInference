@@ -1,10 +1,9 @@
-using SharpInference.Core;
-
-namespace SharpInference.Diffusion;
+namespace SharpInference.Core;
 
 /// <summary>
 /// Abstraction over weight storage backends (safetensors or GGUF).
-/// ZImageDiT and VaeDecoder depend on this interface rather than concrete loaders.
+/// Diffusion pipelines (ZImageDiT, VaeDecoder) and the DSpark draft-head loader
+/// depend on this interface rather than concrete loaders.
 /// </summary>
 public interface IWeightLoader : IDisposable
 {
@@ -21,7 +20,7 @@ public interface IWeightLoader : IDisposable
     /// along with dtype and shape (rows = output features = ne1, cols = input features = ne0).
     /// The pointer is valid for the lifetime of this loader — no allocation, no copy.
     /// Returns <c>false</c> for safetensors or 1-D tensors; caller falls back to
-    /// <see cref="ReadF32"/> + <see cref="DiffusionOps.Linear"/>.
+    /// <see cref="ReadF32"/> plus a dense F32 linear.
     /// </summary>
     unsafe bool TryGetRaw(string name,
         out nint dataPtr, out long byteLen,

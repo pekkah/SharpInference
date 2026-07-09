@@ -118,6 +118,10 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
     private readonly SnapKvConfig _snapKvCfg;
     private SnapKvSelector? _snapKv;
 
+    // Hidden-state taps (DSpark / EAGLE-3-style draft conditioning, PR #413 spec).
+    // Non-null once EnableHiddenTaps has run; see HiddenTapBuffer for layout.
+    private HiddenTapBuffer? _taps;
+
     // Diagnostic: per-layer residual L2-norm trace (env: SHARPI_TRACE_NORMS=1).
     private static readonly bool _traceNorms =
         Environment.GetEnvironmentVariable("SHARPI_TRACE_NORMS") == "1";
@@ -906,6 +910,11 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
                         Copy(h, batchNorm + (long)n * _embDim, _embDim);
                         SimdKernels.AddInPlace(h, batchResidual + (long)n * _embDim, _embDim);
                     }
+
+                    // Hidden-state taps: batchHidden rows are this layer's outputs.
+                    if (_taps is { } taps && taps.SlotOf(layer) is int tapSlot && tapSlot >= 0)
+                        for (int n = 0; n < N; n++)
+                            CaptureTap(startPos + n, tapSlot, batchHidden + (long)n * _embDim);
                 }
 
                 // Set KV cache length to startPos + N for subsequent decode calls.
@@ -1180,6 +1189,47 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
     /// compacted frame correctly. MoE stays <c>true</c>: <see cref="BatchVerify"/> itself
     /// falls back to sequential <see cref="Forward"/> calls for MoE, which is still correct.
     /// </summary>
+    // ── Hidden-state taps (DSpark draft conditioning, PR #413 spec) ──
+
+    /// <summary>
+    /// Taps require stable absolute positions, which SnapKV compaction breaks,
+    /// and are captured on the standard dense paths only (no TurboQuant KV).
+    /// </summary>
+    public bool SupportsHiddenTaps => !_snapKvCfg.Enabled && _tqKvCache is null;
+
+    public int HiddenTapDim => _taps?.TapDim ?? 0;
+
+    public void EnableHiddenTaps(ReadOnlySpan<int> layerIds)
+    {
+        if (!SupportsHiddenTaps)
+            throw new NotSupportedException(
+                "Hidden-state taps are not supported with SnapKV eviction or a TurboQuant KV cache " +
+                "(both break the absolute-position indexing taps rely on).");
+        // Gemma-family post-layer transforms (post-FFW norm, PLE injection, per-layer
+        // output scale) run only on the sequential RunTrunk path; the batched
+        // Prefill/BatchVerify cores capture at the plain FFN-residual point. Until the
+        // batched cores mirror those transforms, taps on such models would record
+        // different values per path — reject rather than desync silently. (Gemma 4
+        // per-layer head_dim models already route every batched call to sequential
+        // Forward, but the guard keeps the contract explicit.)
+        if (_postFfwNorm is not null || _layerOutputScale is not null || _hp.HasPerLayerTokenEmbd)
+            throw new NotSupportedException(
+                "Hidden-state taps are not supported on models with post-FFW norm / per-layer " +
+                "output scale / PLE (capture points differ between sequential and batched paths).");
+
+        _taps?.Dispose();
+        _taps = new HiddenTapBuffer(layerIds, _hp.NumLayers, _embDim, _hp.ContextLength);
+    }
+
+    public ReadOnlySpan<float> HiddenTapsAt(int position) =>
+        _taps is { } tb ? tb.At(position) : default;
+
+    /// <summary>Copy one tapped layer output (embDim floats) into position/slot.</summary>
+    private void CaptureTap(int position, int slot, float* layerOutput)
+    {
+        new ReadOnlySpan<float>(layerOutput, _embDim).CopyTo(_taps!.RowSlot(position, slot));
+    }
+
     public bool SupportsBatchVerify =>
         _tqKvCache is null
         && _layerHeadDim is null
@@ -1353,6 +1403,11 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
                         Copy(h, batchNorm + (long)n * _embDim, _embDim);
                         SimdKernels.AddInPlace(h, batchResidual + (long)n * _embDim, _embDim);
                     }
+
+                    // Hidden-state taps: batchHidden rows are this layer's outputs.
+                    if (_taps is { } taps && taps.SlotOf(layer) is int tapSlot && tapSlot >= 0)
+                        for (int n = 0; n < N; n++)
+                            CaptureTap(startPos + n, tapSlot, batchHidden + (long)n * _embDim);
                 }
 
                 // Ensure cache length is startPos + N
@@ -1643,6 +1698,10 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
             // residual balance and produces unbounded hidden L2 growth).
             if (_layerOutputScale is not null)
                 SimdKernels.ScaleInPlace(_hidden, _layerOutputScale[layer], _embDim);
+
+            // Hidden-state tap: _hidden now holds this layer's output (= next layer's input).
+            if (_taps is { } taps && taps.SlotOf(layer) is int tapSlot && tapSlot >= 0)
+                CaptureTap(position, tapSlot, _hidden);
 
             if (_traceNorms) _normTraceFfn![layer] = L2Norm(_hidden, _embDim);
         }
@@ -2847,6 +2906,7 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
         NativeMemory.Free(_ropeSinTable);
         if (_ropeCosTableSwa != null) NativeMemory.Free(_ropeCosTableSwa);
         if (_ropeSinTableSwa != null) NativeMemory.Free(_ropeSinTableSwa);
+        _taps?.Dispose();
 
         foreach (var ptr in _normCache.Values)
             NativeMemory.Free((void*)ptr);

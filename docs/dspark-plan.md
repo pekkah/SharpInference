@@ -2,6 +2,68 @@
 
 *Drafted 2026-07-01, on branch `claude/dspark-feasibility-61y4au`.*
 
+> **Implementation status (2026-07-07):** Phases 0–3 are implemented. Phase 0 findings
+> (exact backbone math, tensor schema, inference protocol reverse-engineered from
+> `deepspec/modeling/dspark/` + `deepspec/eval/`) corrected one §6 assumption: the DFlash
+> backbone is NOT a k-sequential drafter — it is an EAGLE-3-style block drafter whose
+> per-layer context K/V is projected from TARGET hidden-state taps
+> (`target_layer_ids`, fused via `fc` + RMSNorm), with mask-token block positions decoded
+> bidirectionally in one pass. Landed pieces: `SafetensorsLoader` moved to Core (+
+> `ReadRaw`), hidden-state taps on `IForwardPass`/`ForwardPass`
+> (`EnableHiddenTaps`/`HiddenTapsAt`, captured in Forward/Prefill/BatchVerify),
+> `DSparkConfig`, `DSparkDraftModel` (CPU backbone + vanilla Markov head + confidence
+> head), `DSparkDecoder` (folded batched verify, greedy-parity), `DSparkPlacementPlanner`
+> (+ shared `TierPlanner.ReservedVramBytes`, `LayerPlacement.CpuWeightBytes`), the four
+> CLI flags/env vars from §5, and `SpecType.DSpark`. The confidence-threshold trim (§7's
+> CLI reduction) shipped with the decoder.
+> Fetch weights with `download-model.ps1 -Model qwen3-4b` + `-Model dspark-qwen3-4b`.
+>
+> **Phase 6 status (2026-07-08):** the single-user server path is implemented.
+> `InferenceEngine.AttachDSparkDraft` + a `useDSpark` decode branch (mirroring the MTP
+> block; greedy + no-thinking gate, DSpark outranks MTP on `Auto` since an attached head
+> is an explicit operator choice); prefix-cache reuse works because tap validity tracks
+> KV validity (both describe the last processed sequence), while the multi-slot prefix
+> cache (`SHARPI_PREFIX_SLOTS=2`) is rejected at attach — a scratch-slot request would
+> clobber tap rows the owned slot still needs. `InferenceEngineLoader` wires
+> `SHARPI_DSPARK_MODEL` / `SHARPI_DSPARK_PLACE` (options `DSparkModelPath`/`DSparkPlace`)
+> with the same placement planner as the CLI — but throws instead of falling back when an
+> explicitly configured head can't be honored, and rejects `MaxBatchSize > 1`. Enabling
+> the engine's no-thinking fast paths on thinking-capable models required threading the
+> per-request `enable_thinking=false` rendering into the engine
+> (`SamplingParams.ThinkingDisabled`, set by all three endpoint families) — this also
+> un-blocks server-side MTP on thinking models, which the model-static gate previously
+> made unreachable. Validated live: OpenAI chat completion with `"enable_thinking": false`
+> decoded through DSpark at 6/7 drafts accepted; sampled/thinking requests fall back to
+> the plain loop. Still open: continuous-batching integration + load-aware verify length
+> (§7's server half — the threshold trim resolves from `SHARPI_DSPARK_*` per request).
+>
+> **Phase 4 status (2026-07-08):** the GPU draft path is implemented and validated.
+> `CudaForwardPass` captures hidden taps (Forward/Prefill/BatchVerify; taps disable the
+> decode CUDA graph — a captured memcpy node can't retarget the position-indexed
+> destination, the same reason the SnapKV Q-capture bails); `CudaDSparkDraftModel` runs
+> the backbone as resident-fp16 cuBLAS GEMMs (`MatMulBatchedGemmF16W`) with the block K/V
+> projected into the tail of the device ctx cache and the mask-free `llm_attention`
+> kernel looped per block query (bidirectional over ctx+block by construction); the
+> Markov/confidence heads stay on the host (`DSparkHostHeads`, shared with the CPU
+> model). `DSparkDecoder` gained the #219 `BatchVerifyArgmax` fast path. All three
+> placements work: CPU target + CPU draft, CUDA target + CPU draft, CUDA target + GPU
+> draft — each byte-exact greedy-parity-tested against the real
+> `dspark_qwen3_4b_block7` head.
+>
+> **Measured on the 4070 Laptop (8 GB), Qwen3-4B Q4_K_M, `-c 4096`:** plain CUDA decode
+> 64 t/s; DSpark GPU draft 52.6 t/s at 36% block acceptance, 55.6 t/s with
+> `--dspark-min-confidence 0.8` (83% acceptance) — after wiring the #219 device-argmax
+> verify into `DSparkDecoder` + `CudaForwardPass.BatchVerifyArgmax` (k×8-byte D2H
+> instead of k×vocab logits). The draft itself is cheap (~27 ms/round); the remaining
+> gap is the *verify* pass — an un-graphed batched trunk can't beat graph-replayed
+> 15.6 ms/token plain decode on a model this small. §4's "is it worth it" heuristic now
+> has real numbers: the crossover needs targets whose per-token decode cost dominates
+> launch overhead (8B/14B heads — too big for 8 GB next to their targets; desktop
+> validation) and/or a graph-captured / MMQ verify path (the same batched-decode gap
+> tracked in issues #405–#409). Placement note: with `-c` unset the target's VRAM-fit KV
+> solve consumes the card and the planner correctly lands on `Cpu` — bound the context
+> to free headroom for the head.
+
 ## 1. Background
 
 [DSpark](https://github.com/deepseek-ai/DeepSpec) ("Confidence-Scheduled Speculative

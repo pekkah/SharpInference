@@ -86,6 +86,23 @@ public sealed class SharpInferenceServerOptions
     public string? MmprojPath { get; set; }
 
     /// <summary>
+    /// Optional path to a DSpark draft head — model.safetensors, or its directory with
+    /// config.json alongside (docs/dspark-plan.md, PR #413 Phase 6). Set via this
+    /// property or the <c>SHARPI_DSPARK_MODEL</c> environment variable. When set, greedy
+    /// no-thinking requests decode through <c>DSparkDecoder</c>; requires the single-user
+    /// engine (<see cref="MaxBatchSize"/> 1) on a tap-capable dense forward pass
+    /// (CPU, <see cref="NGpuLayers"/>=0, or full CUDA offload, <see cref="NGpuLayers"/>=-1).
+    /// </summary>
+    public string? DSparkModelPath { get; set; }
+
+    /// <summary>
+    /// Where the DSpark draft head runs: <c>auto</c> (default; the placement planner
+    /// decides from VRAM/RAM headroom), <c>gpu</c>, <c>cpu</c>, or <c>off</c>. Set via
+    /// this property or the <c>SHARPI_DSPARK_PLACE</c> environment variable.
+    /// </summary>
+    public string? DSparkPlace { get; set; }
+
+    /// <summary>
     /// Architecture hint used by <see cref="ChatTemplateRenderer"/> as a fallback when the
     /// model's GGUF metadata is missing <c>general.architecture</c> and no Jinja template
     /// is bundled. Defaults to <c>"qwen2"</c> (ChatML).

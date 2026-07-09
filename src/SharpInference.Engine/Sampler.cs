@@ -602,6 +602,16 @@ public sealed record SamplingParams
     public int MaxThinkingTokens { get; init; } = 0;
 
     /// <summary>
+    /// True when the caller rendered this request's chat template with
+    /// <c>enable_thinking=false</c>. The engine's reasoning machinery is otherwise
+    /// gated only on the MODEL exposing think tokens, which would keep the
+    /// speculative fast paths (MTP, DSpark — both greedy + no-thinking only)
+    /// permanently disabled on thinking-capable models even for requests that
+    /// turned reasoning off. Mirrors the CLI's <c>--no-thinking</c> contract.
+    /// </summary>
+    public bool ThinkingDisabled { get; init; }
+
+    /// <summary>
     /// Speculative decoding type. Mirrors llama.cpp's <c>--spec-type</c>:
     /// <c>Auto</c> (default) lets the engine pick (currently: enable MTP when the
     /// model ships an MTP head AND greedy AND not in thinking mode);
@@ -671,4 +681,6 @@ public enum SpecType
     None = 1,
     /// <summary>Multi-Token Prediction self-speculative decoding via the model's own MTP head.</summary>
     Mtp = 2,
+    /// <summary>DSpark block-parallel draft head (deepseek-ai/DeepSpec) — requires a --dspark-model head.</summary>
+    DSpark = 3,
 }

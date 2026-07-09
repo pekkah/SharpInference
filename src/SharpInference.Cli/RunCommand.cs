@@ -130,9 +130,27 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         public bool DraftLookup { get; init; }
 
         [CommandOption("--spec-type")]
-        [Description("Speculative decoding type: auto (default; enables MTP when supported), none, mtp (alias: draft-mtp). Mirrors llama.cpp.")]
+        [Description("Speculative decoding type: auto (default; enables MTP when supported), none, mtp (alias: draft-mtp), dspark (requires --dspark-model). Mirrors llama.cpp.")]
         [DefaultValue("auto")]
         public string SpecTypeStr { get; init; } = "auto";
+
+        [CommandOption("--dspark-model <PATH>")]
+        [Description("Path to a DSpark draft-head model.safetensors (deepseek-ai/DeepSpec, e.g. dspark_qwen3_4b_block7) with its config.json alongside. Enables DSpark block-speculative decoding (greedy only, CPU target for now — PR #413 spec).")]
+        public string? DSparkModelPath { get; init; }
+
+        [CommandOption("--dspark-place <MODE>")]
+        [Description("Where the DSpark draft head runs: auto (default; planner decides from VRAM/RAM headroom), gpu, cpu, off. Unset resolves via SHARPI_DSPARK_PLACE. An explicit value pins the mode outright, like -g pins the layer split.")]
+        public string? DSparkPlaceStr { get; init; }
+
+        [CommandOption("--dspark-verify-len <N>")]
+        [Description("Cap on draft tokens verified per DSpark step. Unset resolves via SHARPI_DSPARK_VERIFY_LEN, then 0 = the confidence scheduler decides (up to the head's block size).")]
+        [DefaultValue(0)]
+        public int DSparkVerifyLen { get; init; }
+
+        [CommandOption("--dspark-min-confidence <P>")]
+        [Description("Floor on the DSpark confidence head's predicted acceptance probability; positions below it are trimmed from the verify batch. Unset resolves via SHARPI_DSPARK_MIN_CONFIDENCE, then 0 = verify the whole block.")]
+        [DefaultValue(-1f)]
+        public float DSparkMinConfidence { get; init; }
 
         [CommandOption("--spec-draft-n-max")]
         [Description("Max draft tokens per MTP step (issue #30 batched verify). Unset resolves via SHARPI_MTP_DRAFT_N, then defaults to 1 (a 2-token verify batch — the measured optimum). Values > 1 also need snapshot-ring slots: set SHARPI_MTP_BATCH_MAX >= drafts+1 (default 2; each extra slot costs ~150 MiB VRAM on 27B). Mirrors llama.cpp.")]
@@ -1155,6 +1173,101 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             }
         }
 
+        // DSpark block-speculative decoding (docs/dspark-plan.md, PR #413): a DeepSpec
+        // draft head conditioned on target hidden-state taps. Greedy-only and CPU-target
+        // for now (spec Phases 1–3; the CUDA draft path is Phase 4). Placement Off (auto
+        // or explicit) falls through to normal generation rather than erroring.
+        bool dsparkRequested = settings.DSparkModelPath is not null || sp.SpecType == SpecType.DSpark;
+        if (dsparkRequested)
+        {
+            if (settings.DSparkModelPath is null)
+            {
+                AnsiConsole.MarkupLine("[red]Error:[/] --spec-type dspark requires --dspark-model <path-to-model.safetensors>.");
+                return 1;
+            }
+            if (settings.DraftModelPath is not null || settings.DraftLookup)
+            {
+                AnsiConsole.MarkupLine("[red]Error:[/] --dspark-model and --draft-model/--draft-lookup are mutually exclusive.");
+                return 1;
+            }
+            if (sp.SpecType == SpecType.Mtp)
+            {
+                // An explicit conflicting --spec-type must not be silently outranked
+                // by the presence of --dspark-model.
+                AnsiConsole.MarkupLine("[red]Error:[/] --spec-type mtp conflicts with --dspark-model; pick one.");
+                return 1;
+            }
+            if (settings.DSparkMinConfidence > 1f)
+            {
+                // Same [0,1] contract the --spec-draft-p-min validation enforces;
+                // a threshold above any sigmoid output would silently disable all
+                // drafting instead of doing what the user meant.
+                AnsiConsole.MarkupLine($"[red]Error:[/] --dspark-min-confidence={settings.DSparkMinConfidence} must be in [0, 1].");
+                return 1;
+            }
+
+            // Supported targets: pure CPU (-g 0) and dense full CUDA offload (-g -1,
+            // Phase 4). Vulkan and the partial-offload hybrids fall back — no tap
+            // capture there yet.
+            IForwardPass? dsparkTarget = null;
+            CudaBackend? dsparkCuda = null;
+            if (nGpuLayers == 0 && fwd is not null)
+            {
+                dsparkTarget = fwd;
+            }
+            else if (gpuFwd is CudaForwardPass cudaTarget && gpuBackend is CudaBackend cudaBk)
+            {
+                dsparkTarget = cudaTarget;
+                dsparkCuda = cudaBk;
+            }
+
+            string? dsparkReject = null;
+            if (sp.SpecType == SpecType.None)
+                dsparkReject = "--spec-type none explicitly disables speculation";
+            else if (sp.Constraint is not null)
+                dsparkReject = "--tool-grammar/--json-schema is active (a multi-token verify can't honor a token-level constraint)";
+            else if (settings.ToolsPath is not null)
+                dsparkReject = "--tools capture is not wired on the DSpark path (same restriction as MTP)";
+            else if (settings.Temperature > 0f)
+                dsparkReject = "DSpark is greedy-only for now; pass --temp 0";
+            else if (dsparkTarget is null)
+                dsparkReject = "DSpark requires a pure CPU target (-g 0) or dense full CUDA offload (-g -1); Vulkan and partial-offload hybrids have no tap capture";
+            else if (!dsparkTarget.SupportsHiddenTaps)
+                dsparkReject = "the target pass can't capture hidden taps (SnapKV eviction, TurboQuant KV, MoE, or Gemma-4 transforms active)";
+
+            if (dsparkReject is not null)
+            {
+                AnsiConsole.MarkupLine($"[yellow]Warning:[/] DSpark disabled — {dsparkReject}. Falling back to normal generation.");
+            }
+            else if (settings.Prompt is null)
+            {
+                AnsiConsole.MarkupLine("[yellow]Warning:[/] DSpark is wired for single-prompt runs only (like MTP); interactive mode falls back to normal generation.");
+            }
+            else
+            {
+                int rc;
+                try
+                {
+                    rc = TryRunDSparkSinglePrompt(settings, model, hp, dsparkTarget!, dsparkCuda,
+                        tokenizer, sp, ctxSize);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine(ex);
+                    rc = 1;
+                }
+                if (rc >= 0)
+                {
+                    gpuFwd?.Dispose();
+                    gpuBackend?.Dispose();
+                    fwd?.Dispose();
+                    hybridFwd?.Dispose();
+                    return rc;
+                }
+                // rc < 0: placement said Off — fall through to normal generation.
+            }
+        }
+
         try
         {
             if (settings.ImagePaths is { Length: > 0 })
@@ -1335,6 +1448,164 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
             if (s.SingleTurn) break;
         }
+        return 0;
+    }
+
+    /// <summary>
+    /// DSpark single-prompt runner (docs/dspark-plan.md, PR #413): resolves the draft-head
+    /// files (model.safetensors + sibling config.json), validates head↔target compatibility,
+    /// runs the placement planner, loads the head (GPU or CPU per the decision — Phase 4),
+    /// enables hidden taps on the target, and drives <see cref="DSparkDecoder"/>. Returns
+    /// 0/1 like the other runners, or -1 when the placement decision is Off — the caller
+    /// falls back to normal generation.
+    /// </summary>
+    private static int TryRunDSparkSinglePrompt(Settings s, GgufModel model, ModelHyperparams hp,
+        IForwardPass target, CudaBackend? cuda, GgufTokenizer tok, SamplingParams sp, int ctxSize)
+    {
+        string stPath = s.DSparkModelPath!;
+        if (Directory.Exists(stPath)) stPath = Path.Combine(stPath, "model.safetensors");
+        if (!File.Exists(stPath))
+        {
+            AnsiConsole.MarkupLine($"[red]Error:[/] DSpark model not found: {stPath}");
+            return 1;
+        }
+        string cfgPath = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(stPath))!, "config.json");
+        if (!File.Exists(cfgPath))
+        {
+            AnsiConsole.MarkupLine($"[red]Error:[/] DSpark config.json not found next to the safetensors: {cfgPath}");
+            return 1;
+        }
+
+        var cfg = DSparkConfig.FromJsonFile(cfgPath);
+        if (cfg.VocabSize != hp.VocabSize || cfg.NumTargetLayers != hp.NumLayers
+            || cfg.HiddenSize != hp.EmbeddingDim)
+        {
+            AnsiConsole.MarkupLine(
+                $"[red]Error:[/] DSpark head/target mismatch — head expects vocab {cfg.VocabSize}, " +
+                $"{cfg.NumTargetLayers} target layers, hidden {cfg.HiddenSize}; target has " +
+                $"vocab {hp.VocabSize}, {hp.NumLayers} layers, hidden {hp.EmbeddingDim}. " +
+                "The head must be trained for this target model.");
+            return 1;
+        }
+
+        DSparkPlacement userPlace;
+        try
+        {
+            userPlace = DSparkPlacementPlanner.ResolvePlacement(s.DSparkPlaceStr);
+        }
+        catch (ArgumentException ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Error:[/] {ex.Message}");
+            return 1;
+        }
+
+        // Static placement estimate (spec §4). With a CUDA target the profile carries
+        // real VRAM + a measured PCIe probe; a CPU target detects no GPU, so the
+        // planner decides Cpu vs Off from RAM headroom. The CPU-side figure also
+        // carries the target's hidden-tap buffer, which grows to ctx × TapDim × 4
+        // bytes on the host regardless of where the draft runs.
+        var hwProfile = cuda is not null ? HardwareProfile.Detect(cuda) : HardwareProfile.Detect();
+        var targetPlacement = TierPlanner.Plan(model, hp, hwProfile, s.TurboQuant,
+            requestedCtxSize: ctxSize);
+        long headBytesGpu = CudaDSparkDraftModel.EstimateGpuResidentBytes(cfg);
+        long headBytesCpu = DSparkDraftModel.EstimateResidentBytes(cfg);
+        long tapBytes = (long)targetPlacement.RecommendedCtxSize * cfg.TapDim * sizeof(float);
+        var decision = DSparkPlacementPlanner.Plan(
+            hwProfile, targetPlacement, headBytesGpu, headBytesCpu, userPlace,
+            hostTapBytes: tapBytes);
+        AnsiConsole.MarkupLine($"[dim]DSpark placement: {decision.Placement} — {decision.Reason.EscapeMarkup()}[/]");
+        if (decision.Placement == DSparkPlacement.Off)
+        {
+            AnsiConsole.MarkupLine("[yellow]Note:[/] DSpark placement is off; falling back to normal generation.");
+            return -1;
+        }
+        if (decision.Placement == DSparkPlacement.Gpu && cuda is null)
+        {
+            // A GPU draft needs the target's CudaBackend (shared stream orders the tap
+            // producer and draft consumer); with a CPU target the head runs on CPU.
+            // Re-plan in AUTO over a GPU-less profile so the RAM budget is actually
+            // checked (a Cpu OVERRIDE would skip it by contract) — the spec's
+            // Gpu → Cpu → Off graceful fallback.
+            var cpuCheck = DSparkPlacementPlanner.Plan(
+                hwProfile with { VramBytes = 0 }, targetPlacement,
+                headBytesGpu, headBytesCpu, DSparkPlacement.Auto,
+                hostTapBytes: tapBytes);
+            AnsiConsole.MarkupLine(
+                "[yellow]Note:[/] a GPU DSpark draft requires a CUDA target (-g -1); " +
+                $"re-planned for CPU — {cpuCheck.Reason.EscapeMarkup()}");
+            if (cpuCheck.Placement == DSparkPlacement.Off)
+            {
+                AnsiConsole.MarkupLine("[yellow]Note:[/] DSpark placement is off; falling back to normal generation.");
+                return -1;
+            }
+            decision = cpuCheck;
+        }
+
+        AnsiConsole.MarkupLine($"[dim]Loading DSpark draft head:[/] {stPath}");
+        using var st = SafetensorsLoader.Open(stPath);
+        using IDSparkDraft draft = decision.Placement == DSparkPlacement.Gpu
+            ? new CudaDSparkDraftModel(cfg, st, cuda!, target.MaxSeqLen)
+            : new DSparkDraftModel(cfg, st, target.MaxSeqLen);
+        AnsiConsole.MarkupLine(
+            $"[dim]DSpark draft: {cfg.NumLayers}L block-{cfg.BlockSize} " +
+            $"([{(decision.Placement == DSparkPlacement.Gpu ? "green]GPU" : "blue]CPU")}[/])[/]");
+        target.EnableHiddenTaps(cfg.TargetLayerIds);
+
+        var prompt = FormatPrompt(s.Prompt!, s.SystemPrompt, enableThinking: !s_noThinking);
+        var tokens = tok.Encode(prompt);
+        // The head's RoPE window (max_position_embeddings) can be smaller than the
+        // target's — bound the whole session by BOTH, like the spec-decode runner does.
+        int window = Math.Min(target.MaxSeqLen, draft.MaxContext);
+        if (tokens.Count + cfg.BlockSize + 1 >= window)
+        {
+            AnsiConsole.MarkupLine(
+                $"[red]Error:[/] prompt ({tokens.Count} tokens) + DSpark block ({cfg.BlockSize}) " +
+                $"does not fit the context window ({window} tokens" +
+                (draft.MaxContext < target.MaxSeqLen ? ", limited by the draft head's RoPE window" : "") +
+                ").");
+            return 1;
+        }
+
+        if (!s.NoDisplayPrompt)
+            Console.Write(s.Prompt);
+
+        var sw = Stopwatch.StartNew();
+        ReadOnlySpan<float> logits = target.Prefill(tokens);
+        var prefillMs = sw.Elapsed.TotalMilliseconds;
+
+        var decoder = new DSparkDecoder(target, draft);
+        decoder.Initialize(tokens.Count, logits);
+
+        int maxNew = Math.Min(sp.MaxNewTokens,
+            window - tokens.Count - cfg.BlockSize - 1);
+        if (maxNew < sp.MaxNewTokens)
+            AnsiConsole.MarkupLine($"[yellow]Note:[/] generation capped at {maxNew} tokens by the context window.");
+
+        float minConfidence = DSparkDecoder.ResolveMinConfidence(s.DSparkMinConfidence);
+        int verifyLenCap = DSparkDecoder.ResolveVerifyLen(s.DSparkVerifyLen);
+
+        sw.Restart();
+        int generated = 0;
+        int totalDecoded = 0;
+        bool inThinking = false;
+        var streamDec = new Utf8StreamDecoder();
+        bool hideThinking = s.HideThinking;
+        decoder.Decode(maxNew, sp.StopTokenIds ?? [], token =>
+        {
+            if (EmitToken(token, tok, streamDec, ref inThinking, hideThinking)) generated++;
+            totalDecoded++;
+        }, minConfidence, verifyLenCap);
+        var tail = streamDec.Flush();
+        if (!(hideThinking && inThinking)) Console.Write(tail);
+        if (inThinking) Console.Write("\x1b[0m");
+        var decodeMs = sw.Elapsed.TotalMilliseconds;
+
+        Console.WriteLine();
+        AnsiConsole.MarkupLine($"\n[dim]Prefill: {tokens.Count} tokens, {tokens.Count / (prefillMs / 1000):F1} t/s | " +
+            $"Decode: {totalDecoded} tokens, {totalDecoded / (decodeMs / 1000):F1} t/s" +
+            (totalDecoded > generated ? $" ({generated} visible, {totalDecoded - generated} thinking)" : "") +
+            $" | DSpark accept: {decoder.AcceptanceRate:P0} ({decoder.TotalDraftsAccepted}/{decoder.TotalDraftsEmitted}) | " +
+            $"draft {decoder.DraftMs:F0}ms / verify {decoder.VerifyMs:F0}ms / commit {decoder.CommitMs:F0}ms[/]");
         return 0;
     }
 
@@ -1606,6 +1877,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         switch (sp.SpecType)
         {
             case SpecType.None:
+                return false;
+            case SpecType.DSpark:
+                // The user asked for DSpark; if that path already rejected/fell back
+                // upstream, silently swapping in MTP would contradict the printed
+                // "falling back to normal generation" warning.
                 return false;
             case SpecType.Mtp:
                 if (envDisabled) { rejectReason = "--spec-type mtp conflicts with SHARPI_DISABLE_MTP=1."; return false; }
@@ -2036,12 +2312,13 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             "auto" or "" => SpecType.Auto,
             "none" or "off" or "disabled" => SpecType.None,
             "mtp" or "draft-mtp" => SpecType.Mtp,
+            "dspark" => SpecType.DSpark,
             _ => WarnUnknownSpecType(value),
         };
 
         static SpecType WarnUnknownSpecType(string v)
         {
-            AnsiConsole.MarkupLine($"[yellow]Warning:[/] Unknown --spec-type [yellow]{Markup.Escape(v)}[/]; expected auto|none|mtp. Falling back to auto.");
+            AnsiConsole.MarkupLine($"[yellow]Warning:[/] Unknown --spec-type [yellow]{Markup.Escape(v)}[/]; expected auto|none|mtp|dspark. Falling back to auto.");
             return SpecType.Auto;
         }
     }

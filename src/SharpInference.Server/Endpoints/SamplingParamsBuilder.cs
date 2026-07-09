@@ -20,7 +20,8 @@ internal static class SamplingParamsBuilder
         float? repPenalty   = null,
         int?   maxTokens    = null,
         int?   maxThinking  = null,
-        IReadOnlyDictionary<int, float>? logitBias = null)
+        IReadOnlyDictionary<int, float>? logitBias = null,
+        bool   thinkingDisabled = false)
     {
         var d = options.Sampling;
 
@@ -34,6 +35,10 @@ internal static class SamplingParamsBuilder
             MaxNewTokens      = maxTokens   ?? d.MaxNewTokens,
             MaxThinkingTokens = maxThinking ?? d.MaxThinkingTokens,
             LogitBias         = logitBias,
+            // The chat template for this request rendered enable_thinking=false —
+            // lets the engine's greedy no-thinking fast paths (MTP, DSpark) engage
+            // on thinking-capable models (CLI --no-thinking parity).
+            ThinkingDisabled  = thinkingDisabled,
 
             SpecType          = MapSpecType(options.SpecType),
             SpecDraftNMax     = options.SpecDraftNMax,
