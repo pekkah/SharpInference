@@ -1,3 +1,5 @@
+using System.Numerics;
+
 namespace SharpInference.Core.Grammar;
 
 // ── Compiled schema ───────────────────────────────────────────────────────────
@@ -35,9 +37,45 @@ internal sealed class CompiledObject
     public required CompiledNode[] Values { get; init; }
     public required ulong RequiredMask { get; init; }
     /// <summary>Ordered mode (issue #425): keys must appear in declaration order — optional keys may
-    /// be skipped, but a later key can never precede an earlier one.</summary>
+    /// be skipped, but a later key can never precede an earlier one. Enforced by the JSON walker
+    /// (<see cref="JsonToolArgumentConstraint"/> / <see cref="JsonSchemaOutputConstraint"/>) via
+    /// <see cref="NextKeyCandidates"/>; the Gemma and Qwen-Coder walkers use their own key-candidate
+    /// scans and do not honor this flag.</summary>
     public bool Ordered { get; init; }
     public int Count => KeyBytes.Length;
+
+    /// <summary>
+    /// Candidate mask for the next key at a key boundary, given the emitted-keys mask. Unordered:
+    /// every not-yet-emitted key. Ordered (issue #425): keys must appear in declaration order, so
+    /// the window runs from just past the highest emitted index (emission is ascending, enforced by
+    /// this very mask) up to and INCLUDING the first required key — an optional key may be skipped,
+    /// but skipping a required key could never be repaired later and would dead-end at the close
+    /// brace.
+    /// </summary>
+    public ulong NextKeyCandidates(ulong emitted)
+    {
+        if (!Ordered) return AllBits(Count) & ~emitted;
+        ulong cand = 0;
+        for (int i = NextIndex(emitted); i < Count; i++)
+        {
+            cand |= 1UL << i;
+            if ((RequiredMask & (1UL << i)) != 0) break;
+        }
+        return cand;
+    }
+
+    /// <summary>O(1) "any key may still open here" check — <see cref="NextKeyCandidates"/> is
+    /// non-empty. Ordered: the window is non-empty iff any declared key lies past the highest
+    /// emitted one. Used on the per-simulated-byte hot path (the ',' gate), where building the full
+    /// window mask would be wasted work.</summary>
+    public bool HasNextKey(ulong emitted) =>
+        Ordered ? NextIndex(emitted) < Count : (AllBits(Count) & ~emitted) != 0;
+
+    /// <summary>Ordered mode: the lowest declaration index the next key may take — one past the
+    /// highest emitted key (0 when none emitted yet).</summary>
+    private static int NextIndex(ulong emitted) => 64 - BitOperations.LeadingZeroCount(emitted);
+
+    private static ulong AllBits(int n) => n >= 64 ? ulong.MaxValue : (1UL << n) - 1;
 }
 
 /// <summary>
@@ -70,11 +108,12 @@ internal static class ToolSchemaCompiler
     private static readonly byte[][] s_boolLiterals = [ToolSchema.Utf8("true"), ToolSchema.Utf8("false")];
     private static readonly byte[][] s_nullLiterals = [ToolSchema.Utf8("null")];
 
-    public static CompiledObject? TryCompileObject(ToolSchemaObject obj) => TryCompileObject(obj, ordered: false, 0);
-
-    /// <summary>Compiles with ordered-properties mode (issue #425): every object in the schema tree
-    /// requires its keys in declaration order (optional keys skippable, never reordered).</summary>
-    public static CompiledObject? TryCompileObject(ToolSchemaObject obj, bool ordered) => TryCompileObject(obj, ordered, 0);
+    /// <summary>Compiles an object schema, optionally in ordered-properties mode (issue #425):
+    /// every typed object in the schema tree then requires its keys in declaration order (see
+    /// <see cref="CompiledObject.Ordered"/>). Subtrees that degrade to <see cref="FreeValue"/>
+    /// (open/untyped/too-deep) are not order-enforced.</summary>
+    public static CompiledObject? TryCompileObject(ToolSchemaObject obj, bool ordered = false) =>
+        TryCompileObject(obj, ordered, 0);
 
     private static CompiledObject? TryCompileObject(ToolSchemaObject obj, bool ordered, int depth)
     {

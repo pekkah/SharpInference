@@ -27,11 +27,14 @@ public sealed class JsonSchemaOutputConstraint : ITokenConstraint
     /// declaring at least one property.
     /// </param>
     /// <param name="orderedProperties">
-    /// Ordered mode (issue #425): when <c>true</c>, every object in the schema tree must emit its
-    /// properties in declaration order — optional properties may be skipped, but a later property
-    /// can never precede an earlier one, and a required property is never skippable. Lets a
-    /// streaming consumer act on an early field (e.g. a short spoken <c>say</c>) before a later,
-    /// larger one (<c>show</c>) finishes. Default <c>false</c> preserves the any-order behavior.
+    /// Ordered mode (issue #425): when <c>true</c>, every typed object in the schema tree must emit
+    /// its properties in declaration order — optional properties may be skipped, but a later
+    /// property can never precede an earlier one, and a required property is never skippable. Lets
+    /// a streaming consumer act on an early field (e.g. a short spoken <c>say</c>) before a later,
+    /// larger one (<c>show</c>) finishes. Subtrees that degrade to a free value (open objects,
+    /// untyped arrays, past-depth-cap nesting — see <see cref="ToolSchemaCompiler"/>) remain
+    /// unordered like the rest of their content. Default <c>false</c> preserves the any-order
+    /// behavior.
     /// </param>
     /// <exception cref="ArgumentException">
     /// The schema could not be compiled to a constraint -- it isn't an object schema, declares no

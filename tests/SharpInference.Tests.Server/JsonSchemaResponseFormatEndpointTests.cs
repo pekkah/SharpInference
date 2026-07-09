@@ -112,11 +112,10 @@ public sealed class JsonSchemaResponseFormatEndpointTests
         Assert.False(constraint.OrderedProperties);   // ordered mode (issue #425) is opt-in
     }
 
-    [Fact]
-    public async Task JsonSchemaType_OrderedExtension_IsThreadedIntoConstraint()
+    /// <summary>POSTs a chat completion with <paramref name="responseFormat"/> and asserts the
+    /// engine received a <see cref="JsonSchemaOutputConstraint"/> with ordered mode ON.</summary>
+    private static async Task AssertOrderedConstraint(object responseFormat)
     {
-        // SharpInference extension (issue #425): json_schema.ordered:true requires properties in
-        // declaration order so a streaming client can rely on an early field arriving first.
         var fake = new FakeInferenceEngine("test-model");
         var client = CreateClient(fake, renderer: RendererWithVocab());
 
@@ -126,7 +125,7 @@ public sealed class JsonSchemaResponseFormatEndpointTests
             messages = new[] { new { role = "user", content = "hi" } },
             max_tokens = 10,
             stream = false,
-            response_format = new { type = "json_schema", json_schema = new { name = "answer", schema = ValidSchema, ordered = true } },
+            response_format = responseFormat,
         };
         var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
@@ -135,29 +134,23 @@ public sealed class JsonSchemaResponseFormatEndpointTests
         var constraint = Assert.IsType<JsonSchemaOutputConstraint>(fake.LastSamplingParams!.Constraint);
         Assert.True(constraint.OrderedProperties);
     }
+
+    // SharpInference extension (issue #425): ordered:true requires properties in declaration order
+    // so a streaming client can rely on an early field arriving first. The flag is honored wherever
+    // the client puts it -- nested on the json_schema envelope or flat on response_format -- for
+    // both response_format shapes.
 
     [Fact]
-    public async Task JsonObjectType_FlatOrderedExtension_IsThreadedIntoConstraint()
-    {
-        // The flat llama.cpp-style shape gets the same opt-in: response_format.ordered:true.
-        var fake = new FakeInferenceEngine("test-model");
-        var client = CreateClient(fake, renderer: RendererWithVocab());
+    public Task JsonSchemaType_NestedOrdered_IsThreadedIntoConstraint() =>
+        AssertOrderedConstraint(new { type = "json_schema", json_schema = new { name = "answer", schema = ValidSchema, ordered = true } });
 
-        var req = new
-        {
-            model = "test-model",
-            messages = new[] { new { role = "user", content = "hi" } },
-            max_tokens = 10,
-            stream = false,
-            response_format = new { type = "json_object", schema = ValidSchema, ordered = true },
-        };
-        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    [Fact]
+    public Task JsonSchemaType_FlatOrdered_IsThreadedIntoConstraint() =>
+        AssertOrderedConstraint(new { type = "json_schema", ordered = true, json_schema = new { name = "answer", schema = ValidSchema } });
 
-        Assert.NotNull(fake.LastSamplingParams);
-        var constraint = Assert.IsType<JsonSchemaOutputConstraint>(fake.LastSamplingParams!.Constraint);
-        Assert.True(constraint.OrderedProperties);
-    }
+    [Fact]
+    public Task JsonObjectType_FlatOrdered_IsThreadedIntoConstraint() =>
+        AssertOrderedConstraint(new { type = "json_object", schema = ValidSchema, ordered = true });
 
     [Fact]
     public async Task JsonObjectType_WithFlatSchemaExtension_ConstraintIsJsonSchemaOutputConstraint()

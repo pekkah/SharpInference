@@ -111,7 +111,8 @@ public sealed class JsonToolGrammarMockTests
         Feed(c, tok, "Berlin\"");
         Assert.True(Allowed(c, vocab, tok.Char('}')));    // required satisfied → may close
         // Every declared key is emitted, so ',' would commit to a key that cannot exist — masked
-        // (issue #425's comma gate), where it previously dead-ended and disabled the constraint.
+        // (issue #425's comma gate), where it previously livelocked in a whitespace-only
+        // OExpectKey state ('}' isn't legal there and EOG is forbidden mid-call).
         Assert.False(Allowed(c, vocab, tok.Char(',')));
 
         Feed(c, tok, "}");

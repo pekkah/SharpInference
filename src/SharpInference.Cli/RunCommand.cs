@@ -353,6 +353,13 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         }
         else
         {
+            // An explicit ordered request without a schema is user error, not a no-op -- silently
+            // generating unconstrained output would violate the fail-loudly contract above.
+            if (ordered)
+            {
+                error = "--json-schema-ordered requires --json-schema or --json-schema-file/--jf.";
+                return false;
+            }
             return true;   // neither flag given -- no-op
         }
 

@@ -186,17 +186,18 @@ public static class OpenAiEndpoints
         // failures return 400 rather than silently generating unconstrained output.
         ITokenConstraint? jsonSchemaConstraint = null;
         JsonElement? requestedSchema = null;
-        bool schemaOrdered = false;     // json_schema.ordered / response_format.ordered (issue #425)
+        // Ordered-properties opt-in (issue #425): honored wherever the client put it -- nested on
+        // the json_schema envelope or flat on response_format -- so the flag never silently no-ops
+        // based on which response_format shape carries it.
+        bool schemaOrdered = req.ResponseFormat?.Ordered == true
+                          || req.ResponseFormat?.JsonSchema?.Ordered == true;
         if (req.ResponseFormat?.Type == "json_schema")
         {
             // Unlike "json_object" (below), a schema is REQUIRED here -- the client explicitly asked
             // for schema-constrained output, so a missing json_schema.schema is a client error, not a
             // silent no-op (issue #423 follow-up: an explicit schema request is a hard requirement).
             if (req.ResponseFormat.JsonSchema?.Schema is { } s)
-            {
                 requestedSchema = s;
-                schemaOrdered = req.ResponseFormat.JsonSchema.Ordered == true;
-            }
             else
             {
                 ctx.Response.StatusCode = 400;
@@ -213,7 +214,6 @@ public static class OpenAiEndpoints
             // llama.cpp's flat extension: an optional schema alongside the plain "valid JSON" request.
             // Absent here just means "valid JSON, no shape enforced" -- the pre-existing behavior.
             requestedSchema = req.ResponseFormat.Schema;
-            schemaOrdered = req.ResponseFormat.Ordered == true;
         }
         if (requestedSchema is { } schemaElement)
         {

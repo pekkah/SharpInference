@@ -117,6 +117,18 @@ public sealed class JsonSchemaFlagsTests
     }
 
     [Fact]
+    public void OrderedFlag_WithoutSchema_IsError()
+    {
+        // --json-schema-ordered alone must fail loudly, not silently generate unconstrained output.
+        bool ok = RunCommand.TryLoadJsonSchemaConstraint(
+            null, null, Vocab, out var constraint, out var error, ordered: true);
+
+        Assert.False(ok);
+        Assert.Null(constraint);
+        Assert.Contains("--json-schema-ordered requires", error);
+    }
+
+    [Fact]
     public void SchemaFile_ValidObjectSchema_Succeeds()
     {
         string path = Path.GetTempFileName();

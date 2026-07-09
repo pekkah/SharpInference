@@ -662,7 +662,15 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
 
             case OExpectCommaOrClose:
                 if (IsWs(b)) return Step.Consume;
-                if (b == (byte)',') { f.State = OExpectKey; return Step.Consume; }
+                if (b == (byte)',')
+                {
+                    // A ',' commits to another key — reject it when every declared key is already
+                    // emitted, else the machine livelocks in OExpectKey where only whitespace is
+                    // legal ('}' isn't accepted there and EOG is forbidden mid-call). Mirrors the
+                    // JSON walker's comma gate (issue #425 follow-through).
+                    if (!obj.HasNextKey(f.Emitted)) return Step.Reject;
+                    f.State = OExpectKey; return Step.Consume;
+                }
                 if (b == (byte)'}')
                 {
                     if ((f.Emitted & obj.RequiredMask) != obj.RequiredMask) return Step.Reject;
@@ -846,7 +854,7 @@ public sealed class GemmaToolArgumentConstraint : ITokenConstraint
                 return false;
             case OExpectCommaOrClose:
                 MarkWs(set);
-                set[','] = true;
+                if (obj.HasNextKey(f.Emitted)) set[','] = true;   // ',' commits to a key
                 if ((f.Emitted & obj.RequiredMask) == obj.RequiredMask) set['}'] = true;
                 return false;
             default:

@@ -205,22 +205,21 @@ public sealed class JsonSchemaOutputConstraintTests
     public void AllKeysEmitted_TrailingComma_IsMasked()
     {
         // Regression for the comma gate (applies to ordered AND unordered): once every declared key
-        // is emitted a ',' commits to a key that cannot exist, which previously reached a dead state
-        // (constraint gave up) instead of forcing '}'.
+        // is emitted a ',' commits to a key that cannot exist, which previously livelocked in a
+        // whitespace-only OExpectKey state instead of forcing '}'.
         var (c, tok, vocab) = Build(
             """{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}""");
 
         Feed(c, tok, "{\"answer\":\"hi\"");
         Assert.False(Allowed(c, vocab, tok.Char(',')));
+        Assert.False(Allowed(c, vocab, tok.Merged(",\"")));   // merged BPE comma+quote too
         Assert.True(Allowed(c, vocab, tok.Char('}')));
     }
 
     [Fact]
     public void OrderedProperties_Flag_IsExposed()
     {
-        var tok = new FakeJsonTokenizer();
-        var vocab = new GrammarVocabulary(tok);
-        Assert.False(new JsonSchemaOutputConstraint(vocab, Schema(SaySchemaJson)).OrderedProperties);
-        Assert.True(new JsonSchemaOutputConstraint(vocab, Schema(SaySchemaJson), orderedProperties: true).OrderedProperties);
+        Assert.False(((JsonSchemaOutputConstraint)Build(SaySchemaJson).c).OrderedProperties);
+        Assert.True(((JsonSchemaOutputConstraint)Build(SaySchemaJson, ordered: true).c).OrderedProperties);
     }
 }
