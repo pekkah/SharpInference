@@ -1,5 +1,8 @@
 using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace SharpInference.TurboQuant;
 
@@ -83,6 +86,16 @@ public sealed class KVarNCompressor
     // normalization untouched and reconstruct exactly.
     private const float RmsEpsilon = 1e-12f;
 
+    /// <summary>
+    /// Test hook: forces the scalar read kernels (<see cref="KeyScores"/> /
+    /// <see cref="AggregateValues"/>) even when AVX2 is available so the parity
+    /// suite and micro-benchmarks can compare both implementations on the same
+    /// hardware. Not intended for production use; both paths compute the same
+    /// algebra (the AVX2 path reassociates the floating-point accumulation and
+    /// contracts mul+add into FMA — one rounding instead of two).
+    /// </summary>
+    internal static bool ForceScalar;
+
     private readonly int _headDim;
     private readonly int _valueGroups;
     private readonly int _sinkhornIterations;
@@ -106,8 +119,8 @@ public sealed class KVarNCompressor
     //                  BitPacking.PackBits4 convention), so a tile-scores
     //                  kernel walks each channel's codes sequentially while
     //                  accumulating into scores[0..127] — the FastScan-style
-    //                  loop inversion a future SIMD kernel (P1) vectorizes
-    //                  along tokens.
+    //                  loop inversion <see cref="KeyScoresAvx2"/> vectorizes
+    //                  along tokens (P1).
     //
     //   dequant:  k̂'[t,c] = rowScale[t] · (chanMin[c] + chanStep[c] · code[c,t])
     //
@@ -435,7 +448,10 @@ public sealed class KVarNCompressor
     /// Compute q·k̂ for every token in a K tile. The per-channel factors
     /// (chanStep/chanMin, which already carry the Sinkhorn channel scale) are
     /// folded into the query once for the whole tile; the code walk is
-    /// channel-major, matching the packed layout.
+    /// channel-major, matching the packed layout. Dispatches to a fused AVX2
+    /// kernel when available (<see cref="KeyScoresAvx2"/>); the scalar path is
+    /// the reference implementation. The two paths differ only in
+    /// floating-point accumulation order.
     /// </summary>
     /// <param name="tile">Compressed K tile.</param>
     /// <param name="rotatedQuery">Pre-rotated query (<see cref="RotateQuery"/>).</param>
@@ -450,6 +466,15 @@ public sealed class KVarNCompressor
         if (scoresOut.Length < TileTokens)
             throw new ArgumentException($"scoresOut must hold {TileTokens} floats.", nameof(scoresOut));
 
+        if (Avx2.IsSupported && Fma.IsSupported && !ForceScalar)
+            KeyScoresAvx2(tile, rotatedQuery, scoresOut);
+        else
+            KeyScoresScalar(tile, rotatedQuery, scoresOut);
+    }
+
+    private void KeyScoresScalar(ReadOnlySpan<byte> tile, ReadOnlySpan<float> rotatedQuery, Span<float> scoresOut)
+    {
+        int d = _headDim;
         ReadOnlySpan<float> f32 = MemoryMarshal.Cast<byte, float>(tile);
         ReadOnlySpan<float> rowScale = f32.Slice(0, TileTokens);
         ReadOnlySpan<float> chanStep = f32.Slice(_kChanStepF32, d);
@@ -481,6 +506,93 @@ public sealed class KVarNCompressor
 
         for (int t = 0; t < TileTokens; t++)
             scoresOut[t] = rowScale[t] * (acc[t] + bias);
+    }
+
+    /// <summary>
+    /// AVX2 K-score kernel. Same algebra as <see cref="KeyScoresScalar"/> —
+    /// per-channel factors folded into the query, channel-major code walk —
+    /// but the 128 token scores are held in Vector256 accumulators, processed
+    /// in four chunks of 32 tokens so the working set (4 accumulators + unpack
+    /// temporaries) stays within the 16 YMM registers. Per channel and chunk:
+    /// one 16-byte load covers 32 nibbles (byte b = tokens 2b low / 2b+1 high,
+    /// the PackBits4 convention); low/high nibble extraction + byte interleave
+    /// (UnpackLow/High) restores token order, then vpmovzxbd + cvtdq2ps widens
+    /// to f32 for four FMAs against the broadcast folded query weight.
+    /// Numerics differ from scalar by FP reassociation + FMA contraction only.
+    /// </summary>
+    private unsafe void KeyScoresAvx2(ReadOnlySpan<byte> tile, ReadOnlySpan<float> rotatedQuery, Span<float> scoresOut)
+    {
+        int d = _headDim;
+        const int runBytes = TileTokens / 2;   // 64 code bytes per channel
+        const int chunkBytes = 16;             // bytes per chunk = 32 tokens
+
+        fixed (byte* tilePtr = tile)
+        fixed (float* qPtr = rotatedQuery)
+        fixed (float* scoresPtr = scoresOut)
+        {
+            float* f32 = (float*)tilePtr;
+            float* rowScale = f32;                 // [TileTokens]
+            float* chanStep = f32 + _kChanStepF32; // [d]
+            float* chanMin = f32 + _kChanMinF32;   // [d]
+            byte* codes = tilePtr + _kCodesOffset;
+
+            // bias = Σ_c q_c · chanMin_c — vectorized; d is a power of 2 ≥ 8,
+            // so the 8-lane loop has no tail.
+            var biasAcc = Vector256<float>.Zero;
+            for (int c = 0; c + 8 <= d; c += 8)
+                biasAcc = Fma.MultiplyAdd(Avx.LoadVector256(qPtr + c), Avx.LoadVector256(chanMin + c), biasAcc);
+            float bias = Vector256.Sum(biasAcc);
+
+            float* acc = stackalloc float[TileTokens];
+            var nibbleMask = Vector128.Create((byte)0x0F);
+
+            for (int chunk = 0; chunk < TileTokens / 32; chunk++)
+            {
+                byte* chunkCodes = codes + chunk * chunkBytes;
+                var a0 = Vector256<float>.Zero;
+                var a1 = Vector256<float>.Zero;
+                var a2 = Vector256<float>.Zero;
+                var a3 = Vector256<float>.Zero;
+
+                for (int c = 0; c < d; c++)
+                {
+                    float qw = qPtr[c] * chanStep[c];
+                    if (qw == 0f)
+                        continue;
+
+                    var pairs = Sse2.LoadVector128(chunkCodes + c * runBytes);
+                    var lo = Sse2.And(pairs, nibbleMask); // even tokens
+                    var hi = Sse2.And(                     // odd tokens
+                        Sse2.ShiftRightLogical(pairs.AsInt16(), 4).AsByte(),
+                        nibbleMask);
+                    var t01 = Sse2.UnpackLow(lo, hi);  // chunk tokens 0..15, in order
+                    var t23 = Sse2.UnpackHigh(lo, hi); // chunk tokens 16..31
+
+                    var qwv = Vector256.Create(qw);
+                    a0 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(t01)), qwv, a0);
+                    a1 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(
+                        Sse2.ShiftRightLogical128BitLane(t01, 8))), qwv, a1);
+                    a2 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(t23)), qwv, a2);
+                    a3 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(
+                        Sse2.ShiftRightLogical128BitLane(t23, 8))), qwv, a3);
+                }
+
+                int baseT = chunk * 32;
+                Avx.Store(acc + baseT, a0);
+                Avx.Store(acc + baseT + 8, a1);
+                Avx.Store(acc + baseT + 16, a2);
+                Avx.Store(acc + baseT + 24, a3);
+            }
+
+            // score_t = rowScale_t · (acc_t + bias)
+            var biasV = Vector256.Create(bias);
+            for (int t = 0; t < TileTokens; t += 8)
+            {
+                Avx.Store(scoresPtr + t, Avx.Multiply(
+                    Avx.LoadVector256(rowScale + t),
+                    Avx.Add(Avx.LoadVector256(acc + t), biasV)));
+            }
+        }
     }
 
     /// <summary>
@@ -532,7 +644,6 @@ public sealed class KVarNCompressor
     public void AggregateValues(ReadOnlySpan<byte> tile, ReadOnlySpan<float> weights, Span<float> rotatedAccInOut)
     {
         int d = _headDim;
-        int groups = _valueGroups;
         if (tile.Length < ValueTileBytes)
             throw new ArgumentException($"tile must be at least {ValueTileBytes} bytes.", nameof(tile));
         if (weights.Length < TileTokens)
@@ -540,6 +651,19 @@ public sealed class KVarNCompressor
         if (rotatedAccInOut.Length < d)
             throw new ArgumentException($"rotatedAccInOut must hold {d} floats.", nameof(rotatedAccInOut));
 
+        // The AVX2 kernel consumes 16 code bytes (64 channels) per step, so it
+        // needs every channel group to span a multiple of 64 channels — true
+        // for all shipping head dims (64/128/256); d ∈ {8,16,32} falls back.
+        if (Avx2.IsSupported && Fma.IsSupported && !ForceScalar && (d & 63) == 0)
+            AggregateValuesAvx2(tile, weights, rotatedAccInOut);
+        else
+            AggregateValuesScalar(tile, weights, rotatedAccInOut);
+    }
+
+    private void AggregateValuesScalar(ReadOnlySpan<byte> tile, ReadOnlySpan<float> weights, Span<float> rotatedAccInOut)
+    {
+        int d = _headDim;
+        int groups = _valueGroups;
         ReadOnlySpan<float> f32 = MemoryMarshal.Cast<byte, float>(tile);
         ReadOnlySpan<float> colScale = f32.Slice(0, d);
         ReadOnlySpan<float> tokStep = f32.Slice(_vTokStepF32, TileTokens * groups);
@@ -585,6 +709,116 @@ public sealed class KVarNCompressor
 
         for (int c = 0; c < d; c++)
             rotatedAccInOut[c] += colScale[c] * (acc[c] + groupBias[c / ValueGroupSize]);
+    }
+
+    /// <summary>
+    /// AVX2 V-aggregate kernel. Same algebra and skip semantics as
+    /// <see cref="AggregateValuesScalar"/> (w == 0 tokens and ws == 0 groups
+    /// are skipped; the group-min term accumulates once per token/group), but
+    /// the token-major code walk unpacks 16 bytes = 64 channels per step: four
+    /// crumb planes (bits 0-1/2-3/4-5/6-7, the PackBits2 convention) are
+    /// extracted with shift+mask, then a two-level byte/word interleave
+    /// (UnpackLow/High) restores channel order before vpmovzxbd + cvtdq2ps and
+    /// an FMA against the broadcast w·tokStep into the stack accumulator.
+    /// Requires d to be a multiple of 64 (see the dispatch in
+    /// <see cref="AggregateValues"/>). Numerics differ from scalar by FP
+    /// reassociation + FMA contraction only.
+    /// </summary>
+    private unsafe void AggregateValuesAvx2(ReadOnlySpan<byte> tile, ReadOnlySpan<float> weights, Span<float> rotatedAccInOut)
+    {
+        int d = _headDim;
+        int groups = _valueGroups;
+        int bytesPerToken = d / 4;
+
+        fixed (byte* tilePtr = tile)
+        fixed (float* wPtr = weights)
+        fixed (float* outPtr = rotatedAccInOut)
+        {
+            float* f32 = (float*)tilePtr;
+            float* colScale = f32;                // [d]
+            float* tokStep = f32 + _vTokStepF32;  // [T·G]
+            float* tokMin = f32 + _vTokMinF32;    // [T·G]
+            byte* codes = tilePtr + _vCodesOffset;
+
+            float* acc = stackalloc float[d];     // d ≤ 1024 (validated) → ≤ 4 KiB
+            new Span<float>(acc, d).Clear();
+            float* groupBias = stackalloc float[groups];
+            new Span<float>(groupBias, groups).Clear();
+
+            var crumbMask = Vector128.Create((byte)0x03);
+
+            for (int t = 0; t < TileTokens; t++)
+            {
+                float w = wPtr[t];
+                if (w == 0f)
+                    continue;
+
+                byte* run = codes + t * bytesPerToken;
+                for (int g = 0; g < groups; g++)
+                {
+                    groupBias[g] += w * tokMin[t * groups + g];
+                    float ws = w * tokStep[t * groups + g];
+                    if (ws == 0f)
+                        continue;
+
+                    var wsv = Vector256.Create(ws);
+                    int b0 = (g * ValueGroupSize) >> 2;
+                    int b1 = Math.Min((g + 1) * ValueGroupSize, d) >> 2;
+                    for (int b = b0; b < b1; b += 16)
+                    {
+                        // Byte j of the load holds channels 4j..4j+3 in crumbs.
+                        var quads = Sse2.LoadVector128(run + b);
+                        var c0 = Sse2.And(quads, crumbMask);
+                        var c1 = Sse2.And(Sse2.ShiftRightLogical(quads.AsInt16(), 2).AsByte(), crumbMask);
+                        var c2 = Sse2.And(Sse2.ShiftRightLogical(quads.AsInt16(), 4).AsByte(), crumbMask);
+                        var c3 = Sse2.And(Sse2.ShiftRightLogical(quads.AsInt16(), 6).AsByte(), crumbMask);
+
+                        // Byte interleave → channel pairs (4j, 4j+1) / (4j+2, 4j+3),
+                        // then word interleave → channels in order, 16 per vector.
+                        var p01Lo = Sse2.UnpackLow(c0, c1);
+                        var p23Lo = Sse2.UnpackLow(c2, c3);
+                        var p01Hi = Sse2.UnpackHigh(c0, c1);
+                        var p23Hi = Sse2.UnpackHigh(c2, c3);
+
+                        var q0 = Sse2.UnpackLow(p01Lo.AsInt16(), p23Lo.AsInt16()).AsByte();  // ch +0..15
+                        var q1 = Sse2.UnpackHigh(p01Lo.AsInt16(), p23Lo.AsInt16()).AsByte(); // ch +16..31
+                        var q2 = Sse2.UnpackLow(p01Hi.AsInt16(), p23Hi.AsInt16()).AsByte();  // ch +32..47
+                        var q3 = Sse2.UnpackHigh(p01Hi.AsInt16(), p23Hi.AsInt16()).AsByte(); // ch +48..63
+
+                        float* accBase = acc + (b << 2);
+                        FmaCodes16(accBase, q0, wsv);
+                        FmaCodes16(accBase + 16, q1, wsv);
+                        FmaCodes16(accBase + 32, q2, wsv);
+                        FmaCodes16(accBase + 48, q3, wsv);
+                    }
+                }
+            }
+
+            // out_c += colScale_c · (acc_c + groupBias_{c/G}) — the group index
+            // is constant across each 8-lane block because ValueGroupSize (128,
+            // clamped to d ≥ 64 here) is a multiple of 8.
+            for (int c = 0; c < d; c += 8)
+            {
+                var gb = Vector256.Create(groupBias[c / ValueGroupSize]);
+                var v = Avx.Add(Avx.LoadVector256(acc + c), gb);
+                var prev = Avx.LoadVector256(outPtr + c);
+                Avx.Store(outPtr + c, Fma.MultiplyAdd(Avx.LoadVector256(colScale + c), v, prev));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Widen 16 in-order code bytes to f32 and FMA them (× the broadcast
+    /// weight) into 16 consecutive accumulator floats.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void FmaCodes16(float* accBase, Vector128<byte> codes16, Vector256<float> wsv)
+    {
+        var lo = Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(codes16));
+        var hi = Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(
+            Sse2.ShiftRightLogical128BitLane(codes16, 8)));
+        Avx.Store(accBase, Fma.MultiplyAdd(lo, wsv, Avx.LoadVector256(accBase)));
+        Avx.Store(accBase + 8, Fma.MultiplyAdd(hi, wsv, Avx.LoadVector256(accBase + 8)));
     }
 
     /// <summary>
