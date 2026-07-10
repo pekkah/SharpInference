@@ -49,6 +49,7 @@ Flag names are intentionally compatible with `llama.cpp` / `llama-cli`.
 | `-g, --n-gpu-layers` | `0` | Layers on GPU (`0` = CPU only, `-1` = all) |
 | `-c, --ctx-size` | model default | Context / max sequence length |
 | `--tq` | off | TurboQuant KV cache compression (3-bit, ~5× VRAM reduction) |
+| `--tq-mode` | `lloydmax` | TurboQuant quantizer: `lloydmax` (3-bit codebooks) or `kvarn` (4-bit K / 2-bit V Sinkhorn RTN, 128-token tiles; CPU only, no SnapKV) |
 
 Run `sharpi-cli --help` for the full reference.
 

@@ -111,6 +111,13 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [DefaultValue(false)]
         public bool TurboQuant { get; init; }
 
+        [CommandOption("--tq-mode")]
+        [Description("TurboQuant quantizer for --tq: lloydmax (default; 3-bit Lloyd-Max codebooks) or kvarn " +
+            "(issue #180: Sinkhorn-normalized asymmetric RTN, 4-bit K / 2-bit V, 128-token tiles; " +
+            "CPU only (-g 0), any power-of-2 head dim, no SnapKV).")]
+        [DefaultValue("lloydmax")]
+        public string TqModeStr { get; init; } = "lloydmax";
+
         [CommandOption("--kv-type")]
         [Description("KV-cache element type for the CUDA backend: fp32 (default), bf16 (half the KV VRAM → ~2x context), or q8_0 (quarter → ~4x). Like llama.cpp --cache-type-k/v. Env: SHARPI_KV_DTYPE.")]
         public string? KvType { get; init; }
@@ -601,11 +608,57 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         Func<IReadOnlyList<int>, ReadOnlySpan<float>> prefill;
         Action resetCache;
 
-        // Validate TurboQuant head-dimension compatibility before any GPU allocation
+        // Resolve the TurboQuant quantizer (issue #180). KVarN is the CPU-only P0
+        // prototype: reject GPU offload and SnapKV up-front with actionable errors
+        // (ForwardPass.EnableTurboQuant re-checks the SnapKV combo as the config-time
+        // guard of last resort).
+        TqQuantizer tqQuantizer;
+        switch (settings.TqModeStr.Trim().ToLowerInvariant())
+        {
+            case "" or "lloydmax" or "lloyd-max":
+                tqQuantizer = TqQuantizer.LloydMax;
+                break;
+            case "kvarn":
+                tqQuantizer = TqQuantizer.KVarN;
+                break;
+            default:
+                AnsiConsole.MarkupLine($"[red]Error:[/] Unknown --tq-mode value '{Markup.Escape(settings.TqModeStr)}'. Expected one of: lloydmax, kvarn.");
+                return 1;
+        }
+        if (tqQuantizer == TqQuantizer.KVarN)
+        {
+            if (!settings.TurboQuant)
+            {
+                AnsiConsole.MarkupLine("[red]Error:[/] --tq-mode kvarn requires [yellow]--tq[/].");
+                return 1;
+            }
+            if (effNGpuLayers != 0)
+            {
+                AnsiConsole.MarkupLine("[red]Error:[/] --tq-mode kvarn runs on the CPU forward pass only (issue #180 P0); use [yellow]-g 0[/].");
+                return 1;
+            }
+            if (SnapKvConfig.FromEnvironment().Enabled)
+            {
+                AnsiConsole.MarkupLine("[red]Error:[/] --tq-mode kvarn does not compose with SnapKV eviction yet (issue #180 follow-up); unset [yellow]SHARPI_SNAPKV_BUDGET[/].");
+                return 1;
+            }
+        }
+
+        // Validate TurboQuant head-dimension compatibility before any GPU allocation.
+        // Lloyd-Max ships hardcoded codebooks for 128/256; KVarN is calibration-free
+        // and accepts any power-of-2 head dim in [8, 1024].
         if (settings.TurboQuant)
         {
             int headDim = hp.HeadDim;
-            if (headDim is not 128 and not 256)
+            if (tqQuantizer == TqQuantizer.KVarN)
+            {
+                if ((headDim & (headDim - 1)) != 0 || headDim is < 8 or > 1024)
+                {
+                    AnsiConsole.MarkupLine($"[red]Error:[/] --tq-mode kvarn requires a power-of-2 head dimension in [[8, 1024]]; this model has head dim {headDim}.");
+                    return 1;
+                }
+            }
+            else if (headDim is not 128 and not 256)
             {
                 AnsiConsole.MarkupLine($"[red]Error:[/] TurboQuant requires head dimension 128 or 256; this model has head dim {headDim}. Remove [yellow]--tq[/] to run without KV compression.");
                 return 1;
@@ -672,8 +725,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             {
                 if (settings.TurboQuant)
                 {
-                    fwd!.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
-                    AnsiConsole.MarkupLine("[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
+                    fwd!.EnableTurboQuant(fp32WindowSize: 256, bits: 3, quantizer: tqQuantizer);
+                    AnsiConsole.MarkupLine(tqQuantizer == TqQuantizer.KVarN
+                        ? "[dim]TurboQuant: [green]enabled[/] (KVarN K4V2, window=256)[/]"
+                        : "[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
                 }
                 forward = fwd!.Forward;
                 prefill = tokens => fwd.Prefill(tokens);

@@ -5,9 +5,31 @@ using SharpInference.TurboQuant;
 namespace SharpInference.Engine;
 
 /// <summary>
-/// Hybrid FP32/TurboQuant KV cache: recent tokens in FP32, older tokens compressed to 3-4 bits.
+/// Selects the codec used for the compressed region of <see cref="TurboQuantKvCache"/>
+/// (issue #180: KVarN is built as a selectable quantizer inside the existing TurboQuant
+/// cache machinery, not a second cache type).
+/// </summary>
+public enum TqQuantizer
+{
+    /// <summary>
+    /// Lloyd-Max codebooks in FastScan tiles (3-4 bit, 32-position tiles with
+    /// per-block staging) — the shipping TurboQuant path.
+    /// </summary>
+    LloydMax = 0,
+
+    /// <summary>
+    /// KVarN (issue #180): Hadamard rotation + dual-axis Sinkhorn variance
+    /// normalization + asymmetric RTN — 4-bit keys / 2-bit values in whole
+    /// 128-token tiles assembled directly from the FP32 window.
+    /// </summary>
+    KVarN = 1,
+}
+
+/// <summary>
+/// Hybrid FP32/TurboQuant KV cache: recent tokens in FP32, older tokens compressed to 2-4 bits.
 /// The FP32 window provides full-precision attention for recently generated tokens.
-/// When tokens age out of the window, they are compressed to TQ format.
+/// When tokens age out of the window, they are compressed via the configured
+/// <see cref="TqQuantizer"/>: Lloyd-Max FastScan tiles (default) or KVarN 128-token tiles.
 /// </summary>
 public sealed unsafe class TurboQuantKvCache : IDisposable
 {
@@ -18,26 +40,41 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     private readonly int _kvDim;         // numKvHeads * headDim
     private readonly int _fp32WindowSize; // recent tokens in FP32
 
-    // Per-layer FP32 window (ring buffer)
+    // Per-layer FP32 window (linear shift-down buffer, slot 0 = oldest — not a ring)
     private readonly float*[] _fp32Keys;
     private readonly float*[] _fp32Values;
 
-    // Per-layer TQ compressed storage. Both keys and values live in FastScan
-    // tile layout (one tile = 32 positions, contiguous per kv-head) with the
-    // in-flight 0..31 positions staged in per-block format. K and V tiles use
-    // different internal layouts (K is dim-major, V is position-major — see
-    // FastScan.TileBytes / VTileBytes) but happen to be the same total bytes.
-    private readonly byte*[] _tqKeyTiles;      // [layer][numTiles * numKvHeads * _tileBytes]
-    private readonly byte*[] _tqKeyStaging;    // [layer][numKvHeads * TileSize * _tqBlockSize]
-    private readonly byte*[] _tqValueTiles;    // [layer][numTiles * numKvHeads * _vTileBytes]
-    private readonly byte*[] _tqValueStaging;  // [layer][numKvHeads * TileSize * _tqBlockSize]
-    private readonly KvCacheCompressor[][] _keyCompressors;   // [layer][kvHead]
-    private readonly KvCacheCompressor[][] _valueCompressors;
+    // Per-layer TQ compressed storage. In Lloyd-Max mode both keys and values
+    // live in FastScan tile layout (one tile = 32 positions, contiguous per
+    // kv-head) with the in-flight 0..31 positions staged in per-block format.
+    // K and V tiles use different internal layouts (K is dim-major, V is
+    // position-major — see FastScan.TileBytes / VTileBytes) but happen to be
+    // the same total bytes. In KVarN mode the same pointers hold KVarN 128-token
+    // tiles (strides KVarNCompressor.KeyTileBytes / ValueTileBytes); there is no
+    // staging — whole tiles are compressed straight out of the FP32 window, so
+    // the window owns everything mod 128 and the staging buffers stay null.
+    private readonly byte*[] _tqKeyTiles;      // [layer][numTiles * numKvHeads * _keyTileStride]
+    private readonly byte*[] _tqKeyStaging;    // [layer][numKvHeads * TileSize * _tqBlockSize] (Lloyd-Max only)
+    private readonly byte*[] _tqValueTiles;    // [layer][numTiles * numKvHeads * _valueTileStride]
+    private readonly byte*[] _tqValueStaging;  // [layer][numKvHeads * TileSize * _tqBlockSize] (Lloyd-Max only)
+    private readonly KvCacheCompressor[][]? _keyCompressors;   // [layer][kvHead] (Lloyd-Max only)
+    private readonly KvCacheCompressor[][]? _valueCompressors;
 
-    private readonly int _tqBlockSize;        // bytes per compressed block per KV head
-    private readonly int _tileBytes;          // FastScan.TileBytes(_headDim)  (K-layout)
-    private readonly int _vTileBytes;         // FastScan.VTileBytes(_headDim) (V-layout)
-    private readonly int _stagingBytesPerHead; // TileSize * _tqBlockSize
+    // KVarN mode (issue #180). One shared compressor: the write path (tile
+    // compression inside Append) is single-threaded, and the read methods
+    // (RotateQuery / KeyScores / AggregateValues) are stateless and safe to
+    // call from the per-head Parallel.For in TqAttention.
+    private readonly KVarNCompressor? _kvarn;
+    private readonly float[]? _kvarnGather;   // [TileTokens * headDim] per-head gather scratch (write path)
+
+    private readonly TqQuantizer _quantizer;
+    private readonly int _tileTokens;         // positions per compressed tile (32 FastScan / 128 KVarN)
+    private readonly int _keyTileStride;      // bytes per (tile, kv-head) K tile
+    private readonly int _valueTileStride;    // bytes per (tile, kv-head) V tile
+    private readonly int _tqBlockSize;        // bytes per compressed block per KV head (Lloyd-Max only)
+    private readonly int _tileBytes;          // FastScan.TileBytes(_headDim)  (K-layout, Lloyd-Max only)
+    private readonly int _vTileBytes;         // FastScan.VTileBytes(_headDim) (V-layout, Lloyd-Max only)
+    private readonly int _stagingBytesPerHead; // TileSize * _tqBlockSize (Lloyd-Max only)
     private readonly int _bits;
 
     private int _totalLength;    // total positions stored (TQ + FP32)
@@ -65,8 +102,15 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     public int TileBytes => _tileBytes;
     public int FastScanTileSize => SharpInference.TurboQuant.FastScan.TileSize;
 
+    /// <summary>The quantizer used for the compressed region.</summary>
+    public TqQuantizer Quantizer => _quantizer;
+
+    /// <summary>Positions per compressed tile (32 for Lloyd-Max FastScan, 128 for KVarN).</summary>
+    public int TileSizeTokens => _tileTokens;
+
     public TurboQuantKvCache(int numLayers, int maxSeqLen, int numKvHeads, int headDim,
-        int fp32WindowSize = 256, int bits = 3, int layerIndexBase = 0, int totalLayerCountForSeeds = 0)
+        int fp32WindowSize = 256, int bits = 3, int layerIndexBase = 0, int totalLayerCountForSeeds = 0,
+        TqQuantizer quantizer = TqQuantizer.LloydMax)
     {
         _numLayers = numLayers;
         _maxSeqLen = maxSeqLen;
@@ -75,10 +119,40 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
         _kvDim = numKvHeads * headDim;
         _fp32WindowSize = fp32WindowSize;
         _bits = bits;
-        _tqBlockSize = TurboQuantOps.BlockSize(bits, headDim);
-        _tileBytes = SharpInference.TurboQuant.FastScan.TileBytes(headDim);
-        _vTileBytes = SharpInference.TurboQuant.FastScan.VTileBytes(headDim);
-        _stagingBytesPerHead = SharpInference.TurboQuant.FastScan.TileSize * _tqBlockSize;
+        _quantizer = quantizer;
+        if (quantizer == TqQuantizer.KVarN)
+        {
+            // KVarN (issue #180): whole 128-token tiles are compressed straight
+            // out of the FP32 window (the dual-axis Sinkhorn normalization needs
+            // the full tile assembled; partial tiles are rejected by design), so
+            // the window must be able to hold at least one tile whenever a
+            // compressed region can exist.
+            if (maxSeqLen > fp32WindowSize && fp32WindowSize < KVarNCompressor.TileTokens)
+                throw new ArgumentException(
+                    $"KVarN quantizer requires fp32WindowSize >= {KVarNCompressor.TileTokens} (one full tile) " +
+                    $"when maxSeqLen ({maxSeqLen}) exceeds the FP32 window; got fp32WindowSize={fp32WindowSize}.",
+                    nameof(fp32WindowSize));
+            _kvarn = new KVarNCompressor(headDim); // validates power-of-2 head dim in [8, 1024]
+            _kvarnGather = new float[KVarNCompressor.TileTokens * headDim];
+            _tileTokens = KVarNCompressor.TileTokens;
+            _keyTileStride = _kvarn.KeyTileBytes;
+            _valueTileStride = _kvarn.ValueTileBytes;
+            // Lloyd-Max per-block/FastScan sizing is unused in KVarN mode.
+            _tqBlockSize = 0;
+            _tileBytes = 0;
+            _vTileBytes = 0;
+            _stagingBytesPerHead = 0;
+        }
+        else
+        {
+            _tqBlockSize = TurboQuantOps.BlockSize(bits, headDim);
+            _tileBytes = SharpInference.TurboQuant.FastScan.TileBytes(headDim);
+            _vTileBytes = SharpInference.TurboQuant.FastScan.VTileBytes(headDim);
+            _stagingBytesPerHead = SharpInference.TurboQuant.FastScan.TileSize * _tqBlockSize;
+            _tileTokens = SharpInference.TurboQuant.FastScan.TileSize;
+            _keyTileStride = _tileBytes;
+            _valueTileStride = _vTileBytes;
+        }
         if (totalLayerCountForSeeds == 0)
             totalLayerCountForSeeds = numLayers;
         _layerTqLengths = new int[numLayers];
@@ -93,12 +167,17 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
             _fp32Values[i] = (float*)NativeMemory.AllocZeroed(fp32Bytes);
         }
 
-        // TQ compressed storage per layer: K and V each get tile + 32-slot
-        // per-block staging, with K and V tile layouts being transposes of
-        // each other (same total bytes per (tile, head)).
+        // TQ compressed storage per layer. Lloyd-Max: K and V each get tile +
+        // 32-slot per-block staging, with K and V tile layouts being transposes
+        // of each other (same total bytes per (tile, head)). KVarN: K4/V2 tiles
+        // only (no staging — whole tiles come out of the FP32 window). The
+        // ceil-divide tile count covers both promotion cadences: Lloyd-Max
+        // promotes one position at a time (max TQ length maxSeqLen − window),
+        // KVarN promotes 128 at a time (max TQ length maxSeqLen − window + 127,
+        // reached only in whole-tile steps — the same ceiling).
         int maxTqPositions = maxSeqLen - fp32WindowSize;
         if (maxTqPositions < 0) maxTqPositions = 0;
-        int maxTiles = (maxTqPositions + SharpInference.TurboQuant.FastScan.TileSize - 1) / SharpInference.TurboQuant.FastScan.TileSize;
+        int maxTiles = (maxTqPositions + _tileTokens - 1) / _tileTokens;
 
         _tqKeyTiles     = new byte*[numLayers];
         _tqKeyStaging   = new byte*[numLayers];
@@ -106,38 +185,45 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
         _tqValueStaging = new byte*[numLayers];
         if (maxTqPositions > 0)
         {
-            var keyTileBytes   = (nuint)((long)maxTiles * numKvHeads * _tileBytes);
-            var valueTileBytes = (nuint)((long)maxTiles * numKvHeads * _vTileBytes);
+            var keyTileBytes   = (nuint)((long)maxTiles * numKvHeads * _keyTileStride);
+            var valueTileBytes = (nuint)((long)maxTiles * numKvHeads * _valueTileStride);
             var stageBytes     = (nuint)((long)numKvHeads * _stagingBytesPerHead);
             for (int i = 0; i < numLayers; i++)
             {
-                _tqKeyTiles[i]     = (byte*)NativeMemory.AllocZeroed(keyTileBytes);
-                _tqKeyStaging[i]   = (byte*)NativeMemory.AllocZeroed(stageBytes);
-                _tqValueTiles[i]   = (byte*)NativeMemory.AllocZeroed(valueTileBytes);
-                _tqValueStaging[i] = (byte*)NativeMemory.AllocZeroed(stageBytes);
+                _tqKeyTiles[i]   = (byte*)NativeMemory.AllocZeroed(keyTileBytes);
+                _tqValueTiles[i] = (byte*)NativeMemory.AllocZeroed(valueTileBytes);
+                if (quantizer == TqQuantizer.LloydMax)
+                {
+                    _tqKeyStaging[i]   = (byte*)NativeMemory.AllocZeroed(stageBytes);
+                    _tqValueStaging[i] = (byte*)NativeMemory.AllocZeroed(stageBytes);
+                }
             }
         }
 
-        // Create compressors per layer per KV head
-        _keyCompressors = new KvCacheCompressor[numLayers][];
-        _valueCompressors = new KvCacheCompressor[numLayers][];
-        for (int layer = 0; layer < numLayers; layer++)
+        // Create Lloyd-Max compressors per layer per KV head (KVarN needs no
+        // per-(layer, head) state — no codebooks, no sign-pattern seeds).
+        if (quantizer == TqQuantizer.LloydMax)
         {
-            _keyCompressors[layer] = new KvCacheCompressor[numKvHeads];
-            _valueCompressors[layer] = new KvCacheCompressor[numKvHeads];
-            for (int head = 0; head < numKvHeads; head++)
+            _keyCompressors = new KvCacheCompressor[numLayers][];
+            _valueCompressors = new KvCacheCompressor[numLayers][];
+            for (int layer = 0; layer < numLayers; layer++)
             {
-                int globalLayer = layer + layerIndexBase;
-                _keyCompressors[layer][head] = new KvCacheCompressor(bits, headDim, globalLayer * numKvHeads + head);
-                _valueCompressors[layer][head] = new KvCacheCompressor(bits, headDim, (globalLayer + totalLayerCountForSeeds) * numKvHeads + head);
+                _keyCompressors[layer] = new KvCacheCompressor[numKvHeads];
+                _valueCompressors[layer] = new KvCacheCompressor[numKvHeads];
+                for (int head = 0; head < numKvHeads; head++)
+                {
+                    int globalLayer = layer + layerIndexBase;
+                    _keyCompressors[layer][head] = new KvCacheCompressor(bits, headDim, globalLayer * numKvHeads + head);
+                    _valueCompressors[layer][head] = new KvCacheCompressor(bits, headDim, (globalLayer + totalLayerCountForSeeds) * numKvHeads + head);
+                }
             }
         }
     }
 
     public TurboQuantKvCache(ModelHyperparams hp, int fp32WindowSize = 256, int bits = 3,
-        int layerIndexBase = 0, int totalLayerCountForSeeds = 0)
+        int layerIndexBase = 0, int totalLayerCountForSeeds = 0, TqQuantizer quantizer = TqQuantizer.LloydMax)
         : this(hp.NumLayers, hp.ContextLength, hp.NumKvHeads, hp.HeadDim,
-               fp32WindowSize, bits, layerIndexBase, totalLayerCountForSeeds)
+               fp32WindowSize, bits, layerIndexBase, totalLayerCountForSeeds, quantizer)
     {
     }
 
@@ -153,10 +239,14 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
 
         int fp32Count = _totalLength - _layerTqLengths[layer];
 
-        // If FP32 window is full, compress the oldest FP32 entry
+        // If FP32 window is full, promote the oldest entries into the compressed
+        // region: one position (Lloyd-Max staging) or one whole tile (KVarN).
         if (fp32Count >= _fp32WindowSize)
         {
-            CompressOldestFp32(layer);
+            if (_quantizer == TqQuantizer.KVarN)
+                CompressOldestFp32TileKVarN(layer);
+            else
+                CompressOldestFp32(layer);
             fp32Count = _totalLength - _layerTqLengths[layer];
         }
 
@@ -201,13 +291,15 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     }
 
     /// <summary>
-    /// Pointer to a FastScan K-tile (32 positions × one kv-head). Tile index
-    /// is 0..NumKeyTiles(layer)-1; positions beyond <c>NumKeyTiles × 32</c> are
-    /// in the staging buffer and accessed via <see cref="KeyStagingBlockAt"/>.
+    /// Pointer to a compressed K-tile (<see cref="TileSizeTokens"/> positions ×
+    /// one kv-head): FastScan layout in Lloyd-Max mode, KVarN packed layout in
+    /// KVarN mode. Tile index is 0..NumKeyTiles(layer)-1; in Lloyd-Max mode
+    /// positions beyond <c>NumKeyTiles × 32</c> are in the staging buffer and
+    /// accessed via <see cref="KeyStagingBlockAt"/> (KVarN has no staging).
     /// </summary>
     public byte* KeyTileAt(int layer, int tileIdx, int kvHead)
     {
-        long byteOffset = ((long)tileIdx * _numKvHeads + kvHead) * _tileBytes;
+        long byteOffset = ((long)tileIdx * _numKvHeads + kvHead) * _keyTileStride;
         return _tqKeyTiles[layer] + byteOffset;
     }
 
@@ -221,18 +313,21 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
         return _tqKeyStaging[layer] + byteOffset;
     }
 
-    /// <summary>Number of complete FastScan tiles for this layer's K cache.</summary>
+    /// <summary>Number of complete compressed tiles for this layer's K cache.</summary>
     public int NumKeyTiles(int layer) =>
-        _layerTqLengths[layer] / SharpInference.TurboQuant.FastScan.TileSize;
+        _layerTqLengths[layer] / _tileTokens;
 
-    /// <summary>Number of positions currently in the staging buffer (0..31).</summary>
+    /// <summary>
+    /// Number of positions currently in the staging buffer (0..31 in Lloyd-Max
+    /// mode; always 0 in KVarN mode — the TQ length only grows in whole tiles).
+    /// </summary>
     public int KeyStagingCount(int layer) =>
-        _layerTqLengths[layer] % SharpInference.TurboQuant.FastScan.TileSize;
+        _layerTqLengths[layer] % _tileTokens;
 
-    /// <summary>Pointer to a FastScan V-tile (32 positions × one kv-head).</summary>
+    /// <summary>Pointer to a compressed V-tile (<see cref="TileSizeTokens"/> positions × one kv-head).</summary>
     public byte* ValueTileAt(int layer, int tileIdx, int kvHead)
     {
-        long byteOffset = ((long)tileIdx * _numKvHeads + kvHead) * _vTileBytes;
+        long byteOffset = ((long)tileIdx * _numKvHeads + kvHead) * _valueTileStride;
         return _tqValueTiles[layer] + byteOffset;
     }
 
@@ -244,17 +339,39 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     }
 
     /// <summary>
-    /// Returns the key compressor for the given layer and KV head.
-    /// Used to rotate queries and compute fused dequant-dot.
+    /// Returns the Lloyd-Max key compressor for the given layer and KV head.
+    /// Used to rotate queries and compute fused dequant-dot. Unavailable in
+    /// KVarN mode — use <see cref="RotateQuery"/> / <see cref="ComputeKScores"/>.
     /// </summary>
     public KvCacheCompressor GetKeyCompressor(int layer, int kvHead) =>
-        _keyCompressors[layer][kvHead];
+        _keyCompressors is { } kc
+            ? kc[layer][kvHead]
+            : throw new InvalidOperationException(
+                "Lloyd-Max compressors are unavailable in KVarN quantizer mode; use RotateQuery/ComputeKScores/ComputeVAggregation.");
 
     /// <summary>
-    /// Returns the value compressor for the given layer and KV head.
+    /// Returns the Lloyd-Max value compressor for the given layer and KV head.
+    /// Unavailable in KVarN mode.
     /// </summary>
     public KvCacheCompressor GetValueCompressor(int layer, int kvHead) =>
-        _valueCompressors[layer][kvHead];
+        _valueCompressors is { } vc
+            ? vc[layer][kvHead]
+            : throw new InvalidOperationException(
+                "Lloyd-Max compressors are unavailable in KVarN quantizer mode; use RotateQuery/ComputeKScores/ComputeVAggregation.");
+
+    /// <summary>
+    /// Rotate a query vector into this cache's compressed-domain basis: plain
+    /// Walsh-Hadamard in KVarN mode, per-(layer, kv-head) sign-flip +
+    /// Walsh-Hadamard in Lloyd-Max mode. Call once per head per decode step;
+    /// the result feeds <see cref="ComputeKScores"/>. Thread-safe (stateless).
+    /// </summary>
+    public void RotateQuery(int layer, int kvHead, ReadOnlySpan<float> query, Span<float> rotatedQuery)
+    {
+        if (_quantizer == TqQuantizer.KVarN)
+            _kvarn!.RotateQuery(query, rotatedQuery);
+        else
+            _keyCompressors![layer][kvHead].RotateQuery(query, rotatedQuery);
+    }
 
     /// <summary>
     /// Sets the global position counter to <paramref name="length"/> without
@@ -278,6 +395,10 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     /// Truncates the cache to the given length, which must fall within the FP32 window
     /// (i.e., length >= TqLength). Positions in the compressed TQ region cannot be undone.
     /// Throws <see cref="NotSupportedException"/> if length would truncate into TQ-compressed data.
+    /// Note the guaranteed rewind depth differs by quantizer: Lloyd-Max promotes 32 positions
+    /// at a time (depth ≥ window − 31), KVarN promotes whole 128-token tiles (depth ≥
+    /// window − 127 — just 1 position at the minimum window of 128). Callers that rewind
+    /// (speculative decoding) must keep the window comfortably above their draft length.
     /// </summary>
     public void TruncateTo(int length)
     {
@@ -298,22 +419,23 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
         int maxTqPositions = _maxSeqLen - _fp32WindowSize;
         if (maxTqPositions <= 0) return fp32Bytes;
 
-        int maxTiles = (maxTqPositions + SharpInference.TurboQuant.FastScan.TileSize - 1)
-                       / SharpInference.TurboQuant.FastScan.TileSize;
-        long keyTileBytes   = (long)_numLayers * maxTiles * _numKvHeads * _tileBytes;
-        long valueTileBytes = (long)_numLayers * maxTiles * _numKvHeads * _vTileBytes;
+        int maxTiles = (maxTqPositions + _tileTokens - 1) / _tileTokens;
+        long keyTileBytes   = (long)_numLayers * maxTiles * _numKvHeads * _keyTileStride;
+        long valueTileBytes = (long)_numLayers * maxTiles * _numKvHeads * _valueTileStride;
         long stageBytes     = (long)_numLayers * 2 * _numKvHeads * _stagingBytesPerHead;
         return fp32Bytes + keyTileBytes + valueTileBytes + stageBytes;
     }
 
     /// <summary>
     /// Compute K-scores (q·k for all TQ-compressed positions) for one
-    /// (layer, kv-head). Walks complete FastScan tiles via the i8 LUT kernel
-    /// and the staging tail via per-block <c>DequantDot</c>. Final score per
-    /// position is multiplied by <paramref name="attnScale"/>.
+    /// (layer, kv-head). Lloyd-Max: walks complete FastScan tiles via the i8
+    /// LUT kernel and the staging tail via per-block <c>DequantDot</c>. KVarN:
+    /// walks whole 128-token tiles via <see cref="KVarNCompressor.KeyScores"/>
+    /// (no staging tail exists). Final score per position is multiplied by
+    /// <paramref name="attnScale"/>.
     /// </summary>
     /// <param name="rotatedQuery">Pre-rotated query (caller invokes
-    /// <see cref="KvCacheCompressor.RotateQuery"/> once per head).</param>
+    /// <see cref="RotateQuery"/> once per head).</param>
     /// <param name="attnScale">Attention scale, typically 1/√headDim.</param>
     /// <param name="scoresOut">Output buffer, length ≥ <c>TqLength</c>.</param>
     public void ComputeKScores(
@@ -323,6 +445,12 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
         float attnScale,
         float* scoresOut)
     {
+        if (_quantizer == TqQuantizer.KVarN)
+        {
+            ComputeKScoresKVarN(layer, kvHead, rotatedQuery, attnScale, scoresOut);
+            return;
+        }
+
         int hd = _headDim;
         int totalTq = _layerTqLengths[layer];
         int numFullTiles = totalTq / SharpInference.TurboQuant.FastScan.TileSize;
@@ -355,7 +483,7 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
 
         if (stagingCount > 0)
         {
-            var keyCompressor = _keyCompressors[layer][kvHead];
+            var keyCompressor = _keyCompressors![layer][kvHead];
             var rotatedQuerySpan = new ReadOnlySpan<float>(rotatedQuery, hd);
             int tailStart = numFullTiles * SharpInference.TurboQuant.FastScan.TileSize;
             for (int s = 0; s < stagingCount; s++)
@@ -366,6 +494,35 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
                     rotatedQuerySpan);
                 scoresOut[tailStart + s] = dot * attnScale;
             }
+        }
+    }
+
+    /// <summary>
+    /// KVarN K-scoring (issue #180): the compressed region always holds whole
+    /// 128-token tiles (the FP32 window owns everything mod 128), each scored
+    /// via the fused <see cref="KVarNCompressor.KeyScores"/> which folds the
+    /// per-channel Sinkhorn/RTN factors into the query once per tile.
+    /// </summary>
+    private void ComputeKScoresKVarN(
+        int layer,
+        int kvHead,
+        float* rotatedQuery,
+        float attnScale,
+        float* scoresOut)
+    {
+        int tileTokens = KVarNCompressor.TileTokens;
+        int numTiles = _layerTqLengths[layer] / tileTokens;
+        if (numTiles == 0) return;
+
+        var comp = _kvarn!;
+        var rotatedQuerySpan = new ReadOnlySpan<float>(rotatedQuery, _headDim);
+        for (int tileIdx = 0; tileIdx < numTiles; tileIdx++)
+        {
+            var tile = new ReadOnlySpan<byte>(KeyTileAt(layer, tileIdx, kvHead), _keyTileStride);
+            var scores = new Span<float>(scoresOut + (long)tileIdx * tileTokens, tileTokens);
+            comp.KeyScores(tile, rotatedQuerySpan, scores);
+            for (int t = 0; t < tileTokens; t++)
+                scores[t] *= attnScale;
         }
     }
 
@@ -383,6 +540,12 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
         float* weights,
         float* outAcc)
     {
+        if (_quantizer == TqQuantizer.KVarN)
+        {
+            ComputeVAggregationKVarN(layer, kvHead, weights, outAcc);
+            return;
+        }
+
         int hd = _headDim;
         int totalTq = _layerTqLengths[layer];
         int numFullTiles = totalTq / SharpInference.TurboQuant.FastScan.TileSize;
@@ -451,12 +614,49 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
         // Phase 3: deferred sign-flip + inverse Walsh-Hadamard (once per head),
         // then fold into the caller's accumulator. Both operations are linear,
         // so they commute with the Σ_t accumulation above.
-        var signPattern = _valueCompressors[layer][kvHead].SignPattern;
+        var signPattern = _valueCompressors![layer][kvHead].SignPattern;
         for (int d = 0; d < hd; d++)
             rotatedAcc[d] *= signPattern[d];
 
         SharpInference.TurboQuant.WalshHadamard.Transform(rotatedAcc, rotatedAcc, hd);
 
+        for (int d = 0; d < hd; d++)
+            outAcc[d] += rotatedAcc[d];
+    }
+
+    /// <summary>
+    /// KVarN V-aggregation (issue #180): all tiles share the same channel
+    /// rotation, so they accumulate into one rotated-domain accumulator and the
+    /// inverse Walsh-Hadamard runs ONCE per head
+    /// (<see cref="KVarNCompressor.UnrotateOutput"/>) before folding into
+    /// <paramref name="outAcc"/>. The caller then adds the FP32-window V
+    /// contribution on top of <paramref name="outAcc"/> in the un-rotated
+    /// (original) domain — the same deferred-inverse contract the FastScan
+    /// path uses.
+    /// </summary>
+    private void ComputeVAggregationKVarN(
+        int layer,
+        int kvHead,
+        float* weights,
+        float* outAcc)
+    {
+        int hd = _headDim;
+        int tileTokens = KVarNCompressor.TileTokens;
+        int numTiles = _layerTqLengths[layer] / tileTokens;
+        if (numTiles == 0) return;
+
+        var comp = _kvarn!;
+        Span<float> rotatedAcc = stackalloc float[hd]; // hd ≤ 1024, validated by KVarNCompressor
+        rotatedAcc.Clear();
+
+        for (int tileIdx = 0; tileIdx < numTiles; tileIdx++)
+        {
+            var tile = new ReadOnlySpan<byte>(ValueTileAt(layer, tileIdx, kvHead), _valueTileStride);
+            var w = new ReadOnlySpan<float>(weights + (long)tileIdx * tileTokens, tileTokens);
+            comp.AggregateValues(tile, w, rotatedAcc);
+        }
+
+        comp.UnrotateOutput(rotatedAcc);
         for (int d = 0; d < hd; d++)
             outAcc[d] += rotatedAcc[d];
     }
@@ -481,8 +681,8 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
             var keyDest = new Span<byte>(_tqKeyStaging[layer]   + stagingOffset, _tqBlockSize);
             var valDest = new Span<byte>(_tqValueStaging[layer] + stagingOffset, _tqBlockSize);
 
-            _keyCompressors[layer][head].Compress(keySpan, keyDest);
-            _valueCompressors[layer][head].Compress(valSpan, valDest);
+            _keyCompressors![layer][head].Compress(keySpan, keyDest);
+            _valueCompressors![layer][head].Compress(valSpan, valDest);
         }
 
         _layerTqLengths[layer]++;
@@ -527,6 +727,55 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     }
 
     /// <summary>
+    /// KVarN promotion (issue #180): compress the oldest
+    /// <see cref="KVarNCompressor.TileTokens"/> FP32-window positions into one
+    /// K tile + one V tile per kv-head, then shift the window down by a whole
+    /// tile. Unlike the Lloyd-Max path there is no per-position staging — the
+    /// dual-axis Sinkhorn normalization needs the entire tile assembled before
+    /// it can quantize, so promotion is all-or-nothing per tile and the FP32
+    /// window always owns the trailing <c>totalLength mod 128</c> positions.
+    /// The constructor guarantees <c>fp32WindowSize >= TileTokens</c> whenever
+    /// a compressed region can exist, so a full window always contains a tile.
+    /// </summary>
+    private void CompressOldestFp32TileKVarN(int layer)
+    {
+        int tileTokens = KVarNCompressor.TileTokens;
+        var comp = _kvarn!;
+        int tileIdx = _layerTqLengths[layer] / tileTokens;
+        int fp32Count = _totalLength - _layerTqLengths[layer];
+        Span<float> gather = _kvarnGather.AsSpan();
+
+        // Per head: gather the oldest 128 window rows into a contiguous
+        // [token, channel] tile and compress. Write path is single-threaded
+        // (see the _kvarn field note), so the shared gather scratch is safe.
+        for (int head = 0; head < _numKvHeads; head++)
+        {
+            int headOffset = head * _headDim;
+
+            for (int t = 0; t < tileTokens; t++)
+                new ReadOnlySpan<float>(_fp32Keys[layer] + (long)t * _kvDim + headOffset, _headDim)
+                    .CopyTo(gather.Slice(t * _headDim, _headDim));
+            comp.CompressKeyTile(gather, new Span<byte>(KeyTileAt(layer, tileIdx, head), _keyTileStride));
+
+            for (int t = 0; t < tileTokens; t++)
+                new ReadOnlySpan<float>(_fp32Values[layer] + (long)t * _kvDim + headOffset, _headDim)
+                    .CopyTo(gather.Slice(t * _headDim, _headDim));
+            comp.CompressValueTile(gather, new Span<byte>(ValueTileAt(layer, tileIdx, head), _valueTileStride));
+        }
+
+        _layerTqLengths[layer] += tileTokens;
+
+        // Shift the remaining FP32 entries down by a whole tile.
+        int remaining = fp32Count - tileTokens;
+        if (remaining > 0)
+        {
+            long copyBytes = (long)remaining * _kvDim * sizeof(float);
+            Buffer.MemoryCopy(_fp32Keys[layer] + (long)tileTokens * _kvDim, _fp32Keys[layer], copyBytes, copyBytes);
+            Buffer.MemoryCopy(_fp32Values[layer] + (long)tileTokens * _kvDim, _fp32Values[layer], copyBytes, copyBytes);
+        }
+    }
+
+    /// <summary>
     /// SnapKV (issue #60) compaction for the TurboQuant cache: keep only the K/V
     /// positions listed in <paramref name="keep"/> (sorted ascending, all in
     /// <c>[0, N)</c>); discard the rest. After compaction the cache holds
@@ -550,6 +799,11 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     public void Compact(int[] keep, int N)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(TurboQuantKvCache));
+        if (_quantizer == TqQuantizer.KVarN)
+            throw new NotSupportedException(
+                "SnapKV compaction is not yet supported with the KVarN quantizer (issue #180 follow-up): " +
+                "re-quantizing survivors requires re-assembling whole 128-token tiles. " +
+                "Disable SnapKV (unset SHARPI_SNAPKV_BUDGET) or use the Lloyd-Max quantizer.");
         if (keep is null) throw new ArgumentNullException(nameof(keep));
         if (N != _totalLength)
             throw new ArgumentException(
@@ -708,8 +962,8 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
                                 var keyDst = new Span<byte>(tmpKeyStage   + stageOff, _tqBlockSize);
                                 var valDst = new Span<byte>(tmpValueStage + stageOff, _tqBlockSize);
 
-                                _keyCompressors[layer][head].Compress(keySrc, keyDst);
-                                _valueCompressors[layer][head].Compress(valSrc, valDst);
+                                _keyCompressors![layer][head].Compress(keySrc, keyDst);
+                                _valueCompressors![layer][head].Compress(valSrc, valDst);
                             }
 
                             // If we just completed a tile (slot 31 of tileSize),
@@ -847,7 +1101,7 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     {
         int tileSize = SharpInference.TurboQuant.FastScan.TileSize;
         int numFullTiles = _layerTqLengths[layer] / tileSize;
-        var compressor = _keyCompressors[layer][kvHead];
+        var compressor = _keyCompressors![layer][kvHead];
 
         if (position < numFullTiles * tileSize)
         {
@@ -872,7 +1126,7 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     {
         int tileSize = SharpInference.TurboQuant.FastScan.TileSize;
         int numFullTiles = _layerTqLengths[layer] / tileSize;
-        var compressor = _valueCompressors[layer][kvHead];
+        var compressor = _valueCompressors![layer][kvHead];
 
         if (position < numFullTiles * tileSize)
         {
