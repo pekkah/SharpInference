@@ -1154,8 +1154,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private readonly List<GraphPosNode> _graphPosNodes = new();
     // Upper bound on a tracked kernel's arg count — sizes the reusable stackalloc cell/ptr
     // buffers in LaunchGraphForPosition and bounds the per-node snapshot in TrackPositionNode.
-    // The widest position-varying op (AttentionSwa) has 12 args; 16 leaves headroom.
-    private const int GraphMaxKernelArgs = 16;
+    // The widest position-varying op (llm_kvarn_attention) has 16 args; 20 leaves headroom.
+    // Exceeding this fails capture gracefully (session falls back to direct launches) but
+    // with no build-time signal — keep the widest-op note current when adding args.
+    private const int GraphMaxKernelArgs = 20;
 
     /// <summary>True while a graph capture is in progress on <see cref="Stream"/>.</summary>
     public bool GraphCapturing => _graphCapturing;
@@ -1180,7 +1182,16 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // no capture is open or the legacy single-graph (no-arg) capture is the one in flight.
     private int _capturingGraphId = int.MinValue;
 
-    private enum GraphPosKind { Position, PositionPlus1, SwaWindowStart, SwaWindowEnd }
+    // KvarnAppendSlot / KvarnFp32SeqLen / KvarnTqLen (issue #180 Task 5b): KVarN decode
+    // params that vary per token but are NOT pure functions of position — the linear FP32
+    // window count and the compressed length advance on the host (window count drops by a
+    // whole 128-token tile at each promotion). The engine publishes them per replay via
+    // SetGraphKvarnState; the kinds resolve against those fields in LaunchGraphNodes.
+    private enum GraphPosKind
+    {
+        Position, PositionPlus1, SwaWindowStart, SwaWindowEnd,
+        KvarnAppendSlot, KvarnFp32SeqLen, KvarnTqLen,
+    }
 
     // One captured kernel node whose params carry per-token-varying position scalars.
     private sealed class GraphPosNode
@@ -1190,6 +1201,31 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         public uint Gx, Gy, Gz, Bx, By, Bz, Sh;
         public nint[] ArgValues = [];                         // snapshot of every kernel-arg cell
         public (int Slot, GraphPosKind Kind, int Window)[] Updates = [];
+    }
+
+    // ── KVarN graph state (issue #180 Task 5b) ──
+    // While a KVarN decode region is being captured, the position-varying ops it shares
+    // with the plain path (KvAppend, Attention) must register their seqLen/slot args with
+    // the Kvarn* kinds above instead of Position/PositionPlus1 — the KVarN append slot is
+    // the window fill count, not the absolute position. The engine flips GraphKvarnTracking
+    // on around capture only; replay resolves the kinds from the SetGraphKvarnState values.
+    private bool _graphKvarnTrack;
+    private int _graphKvarnTqLen;
+    private int _graphKvarnFp32Count;
+
+    /// <summary>Register KVarN-tracked (window-relative) graph params during capture —
+    /// set true only while capturing a KVarN decode region (issue #180 Task 5b).</summary>
+    public bool GraphKvarnTracking { get => _graphKvarnTrack; set => _graphKvarnTrack = value; }
+
+    /// <summary>Publish the KVarN host state a graph replay should bake into its tracked
+    /// kernel-node params: <paramref name="tqLen"/> = compressed positions (whole tiles),
+    /// <paramref name="fp32Count"/> = window rows already appended (also this token's
+    /// append slot; the attention length is <c>fp32Count + 1</c>). Call before every
+    /// <see cref="LaunchGraphForPosition(int,int)"/> of a KVarN graph.</summary>
+    public void SetGraphKvarnState(int tqLen, int fp32Count)
+    {
+        _graphKvarnTqLen = tqLen;
+        _graphKvarnFp32Count = fp32Count;
     }
 
     // Pack a float's bit pattern into an arg cell (the kernel reads its low 4 bytes).
@@ -1381,11 +1417,14 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             foreach (var u in n.Updates)
                 cells[u.Slot] = u.Kind switch
                 {
-                    GraphPosKind.Position       => position,
-                    GraphPosKind.PositionPlus1  => position + 1,
-                    GraphPosKind.SwaWindowStart => Math.Max(0, position + 1 - u.Window),
-                    GraphPosKind.SwaWindowEnd   => position + 1,
-                    _                           => cells[u.Slot],
+                    GraphPosKind.Position        => position,
+                    GraphPosKind.PositionPlus1   => position + 1,
+                    GraphPosKind.SwaWindowStart  => Math.Max(0, position + 1 - u.Window),
+                    GraphPosKind.SwaWindowEnd    => position + 1,
+                    GraphPosKind.KvarnAppendSlot => _graphKvarnFp32Count,
+                    GraphPosKind.KvarnFp32SeqLen => _graphKvarnFp32Count + 1,
+                    GraphPosKind.KvarnTqLen      => _graphKvarnTqLen,
+                    _                            => cells[u.Slot],
                 };
             for (int i = 0; i < cnt; i++) ptrs[i] = (nint)(cells + i);
 
@@ -4530,7 +4569,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             Span<nint> av = stackalloc nint[7];
             av[0] = kPtr; av[1] = vPtr; av[2] = kcP; av[3] = vcP;
             av[4] = pKD; av[5] = pPos; av[6] = pMSL;
-            TrackPositionNode(_kvAppendKernel, grid, 1, 1, 256, 1, 1, 0, av, [(5, GraphPosKind.Position, 0)]);
+            // KVarN capture (issue #180 Task 5b): the append slot is the window fill
+            // count (host state), not the absolute position — track it as such.
+            TrackPositionNode(_kvAppendKernel, grid, 1, 1, 256, 1, 1, 0, av,
+                [(5, _graphKvarnTrack ? GraphPosKind.KvarnAppendSlot : GraphPosKind.Position, 0)]);
         }
     }
 
@@ -4575,9 +4617,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             av[0] = qP; av[1] = kP; av[2] = vP; av[3] = oP; av[4] = ssP;
             av[5] = pNH; av[6] = pNKV; av[7] = pHD; av[8] = pSL; av[9] = pMSL;
             av[10] = GraphFloatBits(pScale);
-            // pSL = seqLen = position + 1 in the decode path.
+            // pSL = seqLen = position + 1 in the decode path; under a KVarN capture
+            // (issue #180 Task 5b) it is the window fill count + 1 instead.
             TrackPositionNode(_attentionKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, av,
-                [(8, GraphPosKind.PositionPlus1, 0)]);
+                [(8, _graphKvarnTrack ? GraphPosKind.KvarnFp32SeqLen : GraphPosKind.PositionPlus1, 0)]);
         }
     }
 
@@ -6171,6 +6214,24 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         int r = NvrtcInterop.LaunchKernel(_kvarnAttentionKernel,
             (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kvarn_attention) failed: {r}");
+
+        // Steady-state KVarN graph capture (issue #180 Task 5b): tqSeqLen (arg 11) and
+        // fp32SeqLen (arg 12) advance on the host per token/promotion, so replay rewrites
+        // them from the SetGraphKvarnState values. Grid/shared are fixed; the shared-vs-
+        // scratch score choice is a runtime branch inside the kernel on those scalars, so
+        // a graph captured under 4096 total positions stays valid past it (the scratch
+        // pointer is pre-sized to max_seq_len at construction and baked at capture).
+        if (_graphCapturing)
+        {
+            Span<nint> av = stackalloc nint[16];
+            av[0] = qP;  av[1] = rqP; av[2] = ktP; av[3] = vtP;
+            av[4] = kfP; av[5] = vfP; av[6] = oP;  av[7] = ssP;
+            av[8] = pNH; av[9] = pNKV; av[10] = pHD;
+            av[11] = pTQ; av[12] = pFP; av[13] = pMSL;
+            av[14] = pKTB; av[15] = pVTB;
+            TrackPositionNode(_kvarnAttentionKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, av,
+                [(11, GraphPosKind.KvarnTqLen, 0), (12, GraphPosKind.KvarnFp32SeqLen, 0)]);
+        }
     }
 
     /// <summary>Look up one row from an F32 embedding table into <paramref name="output"/>.</summary>

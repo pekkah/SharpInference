@@ -1610,29 +1610,44 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         else
             _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
 
+        // KVarN whole-tile promotion (issue #180 Task 5b): hoisted OUT of the device
+        // region so the region keeps a static per-phase topology and can be captured
+        // into a CUDA graph. Once per 128 decode steps: compress + shift every layer's
+        // window with direct launches, then advance the shared host state so the region
+        // (graphed or direct) sees clean post-promotion values. All launches/copies are
+        // stream-ordered, so the region's work queues behind the promotion; numerically
+        // identical to the former in-region interleaving (each layer's promotion touches
+        // only that layer's window/tiles, which the region reads afterwards — same
+        // compress inputs, same tile index, same append slot / attention lengths).
+        if (_tqEnabled && _tqQuantizer == TqQuantizer.KVarN && _fp32Count >= _tqFp32Window)
+        {
+            int kvDimP = _numKvHeads * _headDim;
+            for (int layer = 0; layer < _hp.NumLayers; layer++)
+                PromoteKvarnTile(layer, kvDimP);
+            _tqCompressedLen += KVarNCompressor.TileTokens;
+            _fp32Count -= KVarNCompressor.TileTokens;
+        }
+
         // Transformer layers + final norm/output — static topology across tokens (only
-        // `position` varies), so optionally capture it once into a CUDA graph and replay
-        // per token to kill the ~1k-launch/token host overhead (#136/#158). The token-
-        // varying embedding ran above; the TQ ring-advance (host state) and logits
-        // download run after.
+        // `position` varies; KVarN adds three host-tracked scalars, see
+        // TryRunKvarnRegionViaGraph), so optionally capture it once into a CUDA graph
+        // and replay per token to kill the ~1k-launch/token host overhead (#136/#158).
+        // The token-varying embedding ran above; the TQ ring-advance (host state) and
+        // logits download run after.
         if (!TryRunDeviceRegionViaGraph(position))
             RunDeviceRegion(position);
 
         // After all layers have used the same FP32 indices for this token, advance the
         // TQ ring-buffer state (shared across layers). Pure host-state mutation for the
-        // NEXT token — kept outside the captured region (it would break static topology,
-        // and TQ already bails graphs off anyway).
+        // NEXT token — kept outside the captured region (it would break static topology;
+        // the Lloyd-Max ring path also still bails graphs off entirely).
         if (_tqEnabled)
         {
             if (_tqQuantizer == TqQuantizer.KVarN)
             {
-                // Whole-tile promotion cadence (mirrors TurboQuantKvCache.Append):
-                // a full window promotes 128 positions, then the fresh row appends.
-                if (_fp32Count >= _tqFp32Window)
-                {
-                    _tqCompressedLen += KVarNCompressor.TileTokens;
-                    _fp32Count -= KVarNCompressor.TileTokens;
-                }
+                // Whole-tile promotion (if due) already ran BEFORE the region (Task 5b
+                // hoist above, mirroring TurboQuantKvCache.Append's cadence); only the
+                // fresh row's append is left to count here.
                 _fp32Count++;
             }
             else
@@ -1724,24 +1739,21 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                 // KVarN (issue #180 Task 5a): the FP32 window is LINEAR (slot 0 =
                 // oldest), mirroring the CPU TurboQuantKvCache exactly, so CPU and
                 // CUDA agree position-for-position:
-                //   • window full → compress the oldest 128 rows into one packed
-                //     K+V tile per kv-head, shift the remainder down a whole tile;
-                //   • the fresh row appends at slot fp32Count (post-promotion);
+                //   • the fresh row appends at slot fp32Count;
                 //   • the TQ length only grows in 128-token steps.
-                // _fp32Count/_tqCompressedLen are shared host state advanced once
-                // per token AFTER the region (all layers see identical values).
-                bool promote = _fp32Count >= _tqFp32Window;
-                if (promote)
-                    PromoteKvarnTile(layer, kvDim);
-
-                int appendSlot = promote ? _fp32Count - KVarNCompressor.TileTokens : _fp32Count;
+                // Whole-tile promotion is hoisted into Forward (Task 5b) so this
+                // block is capture-clean: appendSlot / fp32SeqLen / tqLen are pure
+                // reads of post-promotion host state, registered as graph-tracked
+                // kernel params during capture (CudaBackend.GraphKvarnTracking).
+                // _fp32Count/_tqCompressedLen advance once per token AFTER the
+                // region (all layers see identical values).
+                int appendSlot = _fp32Count;
                 _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer],
                     kvDim, appendSlot, _tqFp32Window);
 
                 int fp32SeqLen = appendSlot + 1;
-                int tqLen = promote ? _tqCompressedLen + KVarNCompressor.TileTokens : _tqCompressedLen;
 
-                if (tqLen == 0)
+                if (_tqCompressedLen == 0)
                 {
                     // Pre-promotion fast path: everything is FP32 at its natural
                     // slot, so the plain attention kernel reads the window directly.
@@ -1760,7 +1772,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                         _gpuKCache[layer], _gpuVCache[layer], _attnOut,
                         _attnScoresScratch,
                         _numHeads, _numKvHeads, _headDim,
-                        tqLen, fp32SeqLen, _maxSeqLen,
+                        _tqCompressedLen, fp32SeqLen, _maxSeqLen,
                         _kvarnKeyTileBytes, _kvarnValueTileBytes);
                 }
             }
@@ -1872,7 +1884,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     /// bounces through <see cref="_kvarnShiftScratch"/> because a same-buffer
     /// overlapping memcpy is undefined once window &gt; 256. All launches/copies
     /// are stream-ordered, so the compress kernel reads the rows before the
-    /// shift overwrites them. Runs once per 128 decode steps per layer.
+    /// shift overwrites them. Runs once per 128 decode steps per layer, called
+    /// from <see cref="Forward"/> BEFORE the device region (Task 5b) so the
+    /// region itself stays CUDA-graph-capturable — always direct launches,
+    /// never inside a capture.
     /// </summary>
     private void PromoteKvarnTile(int layer, int kvDim)
     {
@@ -1908,10 +1923,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
             return false;
 
         // Graphs bake in the standard decode invariant (fixed topology, seqLen ==
-        // position+1, no host-varying device offsets). Three things break that and must
-        // bail to direct launches:
-        //  • TurboQuant — extra host-synced rotate/compress ops + a ring whose advance is
-        //    host state (the if/else attention branch also flips once a row evicts).
+        // position+1, no host-varying device offsets). Things that break that must
+        // bail to direct launches (or take a dedicated graph path):
+        //  • TurboQuant Lloyd-Max — extra host-synced rotate/compress ops + a ring whose
+        //    advance is host state (the if/else attention branch also flips once a row
+        //    evicts). KVarN (issue #180 Task 5b) instead dispatches to its own per-phase
+        //    graphs below: its promotion is hoisted out of the region and its three
+        //    host-varying scalars ride as tracked kernel params.
         //  • An actual SnapKV eviction — the cache is compacted, so cache-fill != absolute
         //    position. A configured-but-unevicted budget keeps _kvEvictedCount == 0 and is
         //    fine (the cache still fills sequentially).
@@ -1924,7 +1942,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         //  • Active hidden-state taps (PR #413) — the per-layer tap Download both
         //    syncs mid-region (illegal during capture) and would need a
         //    position-varying memcpy destination a replayed graph can't retarget.
-        if (_tqEnabled || _kvEvictedCount > 0 || _snapKvCaptureSlot >= 0 || _isMoE
+        if (_tqEnabled)
+            return _tqQuantizer == TqQuantizer.KVarN && TryRunKvarnRegionViaGraph(position);
+        if (_kvEvictedCount > 0 || _snapKvCaptureSlot >= 0 || _isMoE
             || _taps is not null)
             return false;
 
@@ -1967,6 +1987,104 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
             _gpu.AbortGraphCapture();
             _useCudaGraph = false;
             return false;
+        }
+    }
+
+    // Multi-graph ids for the two KVarN decode phases (issue #180 Task 5b). Negative so
+    // they can never collide with the per-layer ids the GDN-hybrid trunk capture uses.
+    // Internal (not private) so the CUDA KVarN tests can assert the graphs really engaged.
+    internal const int KvarnGraphPre = -101;     // _tqCompressedLen == 0: append + plain attention
+    internal const int KvarnGraphSteady = -102;  // _tqCompressedLen > 0: append + rotate + kvarn attention
+
+    // Instance-level capture latches (mirror _graphCaptured on the dense path): the backend's
+    // per-id graph store outlives this forward pass, so replay must be gated on THIS instance
+    // having captured the entry — a second instance sharing the backend would otherwise replay
+    // a graph whose baked device pointers belong to a disposed sibling.
+    private bool _kvarnPreGraphCaptured;
+    private bool _kvarnSteadyGraphCaptured;
+
+    // CUDA-graph capture/replay for the KVarN decode region (issue #180 Task 5b). The
+    // region has TWO static topologies keyed on the host `_tqCompressedLen == 0` branch:
+    //  • pre-promotion — byte-for-byte the plain fp32 path over the linear window
+    //    (append + plain attention), so it reuses the standard kernels;
+    //  • steady-state — append + rotate-query + hybrid KVarN attention.
+    // Each phase captures once into its own per-id graph and replays thereafter; the
+    // phase flip at the first promotion simply switches which graph replays (the pre
+    // graph stays valid for a post-ResetCache fresh sequence). Whole-tile promotion
+    // (compress + 4 D2D shifts per layer, once per 128 tokens) runs OUTSIDE the graph —
+    // Forward hoists it before this call — so the captured topology never changes.
+    //
+    // Three scalars vary per replay beyond `position` (RoPE): the append slot
+    // (= _fp32Count), the window attention length (= _fp32Count + 1), and the compressed
+    // length (_tqCompressedLen). They ride the same tracked-kernel-param mechanism as
+    // position (GraphKvarnTracking registers them during capture; SetGraphKvarnState
+    // publishes fresh values before every replay). The score-scratch question is moot:
+    // _attnScoresScratch is pre-sized to numHeads × maxSeqLen at construction whenever
+    // maxSeqLen > 4096, its pointer is baked at capture, and the shared-vs-scratch choice
+    // is a runtime branch inside the kernels on the tracked scalars — so one graph stays
+    // valid from capture through the deepest context.
+    //
+    // Returns true if the logits were produced via a graph; false → direct launches.
+    // Any capture/replay failure disables graphs for the session (mirrors the dense path).
+    private bool TryRunKvarnRegionViaGraph(int position)
+    {
+        if (!_useCudaGraph || !_gpu.GraphCaptureSupported)
+            return false;
+
+        // Defensive mirrors of the dense-path bails. All are structurally unreachable
+        // under KVarN today (SnapKV/MoE/taps/batching are rejected up front), but keep
+        // the invariants explicit so a future composition can't silently bake a bad graph.
+        if (_kvEvictedCount > 0 || _snapKvCaptureSlot >= 0 || _isMoE || _taps is not null)
+            return false;
+        if (!_activeSlotIsOwned)
+            return false;
+
+        bool steady = _tqCompressedLen > 0;
+        int graphId = steady ? KvarnGraphSteady : KvarnGraphPre;
+
+        // Publish this token's KVarN host state for the tracked-param rewrite (needed by
+        // both the replay below and the capture's own first launch).
+        _gpu.SetGraphKvarnState(_tqCompressedLen, _fp32Count);
+
+        if ((steady ? _kvarnSteadyGraphCaptured : _kvarnPreGraphCaptured)
+            && _gpu.GraphReadyFor(graphId))
+        {
+            try { _gpu.LaunchGraphForPosition(graphId, position); return true; }
+            catch
+            {
+                _useCudaGraph = false;
+                _kvarnPreGraphCaptured = _kvarnSteadyGraphCaptured = false;
+                return false;
+            }
+        }
+
+        // First token of this phase: pre-grow the Q4_K/Q8_0 dp4a Q8_1 input scratch to the
+        // widest decode matvec BEFORE capture (capture forbids cudaMalloc — mirrors the
+        // dense capture path).
+        _gpu.EnsureQ81Scratch(Math.Max(_embDim, _intermDim));
+
+        try
+        {
+            _gpu.GraphKvarnTracking = true;
+            if (!_gpu.TryBeginGraphCapture(graphId))
+                return false;
+            RunDeviceRegion(position);
+            if (!_gpu.TryEndGraphCaptureAndInstantiate(graphId))
+                return false;
+            _gpu.LaunchGraphForPosition(graphId, position);
+            if (steady) _kvarnSteadyGraphCaptured = true;
+            else _kvarnPreGraphCaptured = true;
+            return true;
+        }
+        catch
+        {
+            _gpu.AbortGraphCapture();
+            _useCudaGraph = false;
+            return false;
+        }
+        finally
+        {
+            _gpu.GraphKvarnTracking = false;
         }
     }
 

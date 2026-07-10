@@ -441,6 +441,105 @@ public sealed unsafe class CudaKvarnTests(ITestOutputHelper output)
             Assert.True(float.IsFinite(logits[i]), $"Non-finite logit at idx {i} after post-truncate decode");
     }
 
+    /// <summary>
+    /// Task 5b: graph-mode KVarN decode parity vs direct-launch decode. The same
+    /// 400-token stream runs through two forward passes — one with CUDA graphs forced
+    /// ON (captures the pre-promotion graph at pos 0 and the steady-state graph at the
+    /// first promotion), one forced OFF — crossing TWO promotion boundaries (window
+    /// 256 → promotions at positions 256 and 384), so replays exercise the tracked
+    /// appendSlot / fp32SeqLen / tqLen params across a tile-count change. A graph
+    /// replay issues the exact same kernel sequence with the same args as the direct
+    /// path, so logits are expected bit-identical; asserted to 1e-5 abs per element
+    /// with argmax equality at every step.
+    /// </summary>
+    [Fact]
+    public void CudaForwardPass_Kvarn_GraphDecode_MatchesDirectLaunch()
+    {
+        if (!CudaBackend.IsAvailable()) return;
+        var path = FindModelPath();
+        if (path is null) return;
+
+        const int Steps = 400;
+        int[] checkpoints = [0, 255, 256, 257, 300, 383, 384, 385, 399];
+
+        // Sequential runs (dispose between) keep VRAM flat; each run gets a fresh
+        // backend so the graphs-off run can't accidentally see graphs-on state.
+        var (argmaxOn, snapsOn, graphsEngaged, captureSupported) = RunKvarnDecode(path, useGraphs: true, Steps, checkpoints);
+        var (argmaxOff, snapsOff, _, _) = RunKvarnDecode(path, useGraphs: false, Steps, checkpoints);
+
+        if (!graphsEngaged)
+        {
+            // A capture-time regression that only breaks the KVarN graphs (e.g. a new
+            // untrackable kernel arg) silently drops the whole 5b perf win — that must
+            // fail here, not soft-skip. Only a driver that refused capture outright
+            // (GraphCaptureSupported latched false during the run) downgrades this to
+            // a direct-vs-direct comparison.
+            Assert.False(captureSupported,
+                "KVarN graphs did not engage although the device supports graph capture — capture regression.");
+            output.WriteLine("CUDA graph capture unavailable on this device — parity trivially direct-vs-direct.");
+            return;
+        }
+
+        int argmaxMismatches = 0;
+        for (int pos = 0; pos < Steps; pos++)
+            if (argmaxOn[pos] != argmaxOff[pos]) argmaxMismatches++;
+        Assert.True(argmaxMismatches == 0,
+            $"{argmaxMismatches}/{Steps} argmax mismatches between graph and direct-launch KVarN decode.");
+
+        float maxDiff = 0f;
+        foreach (int pos in checkpoints)
+        {
+            var a = snapsOn[pos];
+            var b = snapsOff[pos];
+            for (int i = 0; i < a.Length; i++)
+            {
+                float d = MathF.Abs(a[i] - b[i]);
+                if (d > maxDiff) maxDiff = d;
+                Assert.True(d <= 1e-5f,
+                    $"Logit mismatch at pos {pos} idx {i}: graph={a[i]:G9} direct={b[i]:G9}");
+            }
+        }
+        output.WriteLine($"graph vs direct max |Δlogit| over {checkpoints.Length} checkpoints: {maxDiff:E2}");
+    }
+
+    private static (int[] Argmax, Dictionary<int, float[]> Snaps, bool GraphsEngaged, bool CaptureSupported) RunKvarnDecode(
+        string modelPath, bool useGraphs, int steps, int[] checkpoints)
+    {
+        using var gpu = TryCreate() ?? throw new InvalidOperationException("CUDA availability checked by caller");
+        using var model = GgufModel.Open(modelPath);
+        var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
+        using var fwd = new CudaForwardPass(model, gpu, hp, maxContextLength: 640,
+            enableTurboQuant: true, tqFp32Window: 256, tqQuantizer: TqQuantizer.KVarN);
+        fwd.UseCudaGraph = useGraphs;
+
+        var rng = new Random(5150);
+        var argmax = new int[steps];
+        var snaps = new Dictionary<int, float[]>();
+        var checkpointSet = new HashSet<int>(checkpoints);
+
+        for (int pos = 0; pos < steps; pos++)
+        {
+            int token = rng.Next(0, Math.Min(hp.VocabSize, 32000));
+            var logits = fwd.Forward(token, pos);
+
+            int best = 0;
+            float bestVal = logits[0];
+            for (int i = 1; i < logits.Length; i++)
+                if (logits[i] > bestVal) { bestVal = logits[i]; best = i; }
+            argmax[pos] = best;
+
+            if (checkpointSet.Contains(pos))
+                snaps[pos] = logits.ToArray();
+        }
+
+        // Both phase graphs must actually be resident after crossing a promotion —
+        // otherwise the "graphs on" run silently tested the direct path twice.
+        bool engaged = useGraphs
+            && gpu.GraphReadyFor(CudaForwardPass.KvarnGraphPre)
+            && gpu.GraphReadyFor(CudaForwardPass.KvarnGraphSteady);
+        return (argmax, snaps, engaged, gpu.GraphCaptureSupported);
+    }
+
     /// <summary>Construction-time guard parity with TQ: SnapKV and narrowed-KV combos throw.</summary>
     [Fact]
     public void CudaForwardPass_Kvarn_RejectsSnapKvAndNarrowedKv()

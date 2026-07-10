@@ -6718,6 +6718,11 @@ extern ""C"" __global__ void llm_kvarn_attention(
     __shared__ float shared_scores[MAX_SHARED_SCORES];
     __shared__ float sdata[256];           // reductions + the deferred inverse WHT
     __shared__ float qfold[256];           // per-tile folded query (rotq·chanStep)
+    // Task 5b coalesced-walk scratch: phase 1a stages 8 per-warp token-partial rows
+    // (8 warps × T), phase 3a reuses the same pool as 256 × 4 channel-quad partials.
+    __shared__ float acc_pool[8 * 128];
+    __shared__ float ws_sh[256];           // 3a: per-tile w·tokStep, [groups × T]
+    __shared__ float vbias[2];             // 3a: per-group Σ_t w·tokMin (groups ≤ 2)
 
     int h = (int)blockIdx.x;
     int tid = (int)threadIdx.x;
@@ -6760,21 +6765,47 @@ extern ""C"" __global__ void llm_kvarn_attention(
         float bias = sdata[0];
         __syncthreads();
 
-        // One thread per token: walk the channel-major nibble runs.
-        for (int t = tid; t < T; t += 256) {
-            const unsigned char* col = codes + (t >> 1);
-            int shift = (t & 1) ? 4 : 0;
-            float acc = 0.0f;
-            for (int c = 0; c < head_dim; c++) {
-                int code = (col[c * (T / 2)] >> shift) & 0xF;
-                acc += qfold[c] * (float)code;
+        // Coalesced warp-per-channel walk (issue #180 Task 5b). The old layout —
+        // one thread per token striding T/2 bytes per channel — serialized
+        // head_dim dependent byte loads per thread with half the block idle.
+        // Now warp w covers channels {w, w+8, …}; within a channel, lane l
+        // reads the two consecutive code bytes for tokens 4l..4l+3 (a channel's
+        // whole 64-byte run = exactly 2 coalesced 32B sectors per warp) and
+        // accumulates qfold[c]·code into 4 per-token register partials. Tokens
+        // are owned exclusively by one lane within each warp, so the partials
+        // stage to the per-warp acc_pool row without atomics; a token's score
+        // then sums the 8 warp rows. FP reassociation vs the serial channel
+        // loop is within the attention parity band (max(1e-3, 1e-2·|x|)).
+        {
+            int warp = tid >> 5;
+            int lane = tid & 31;
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+            for (int c = warp; c < head_dim; c += 8) {
+                float qf = qfold[c];
+                const unsigned char* run = codes + c * (T / 2) + lane * 2;
+                unsigned int b0 = run[0];
+                unsigned int b1 = run[1];
+                a0 += qf * (float)(b0 & 0xFu);   // even token → low nibble (PackBits4)
+                a1 += qf * (float)(b0 >> 4);
+                a2 += qf * (float)(b1 & 0xFu);
+                a3 += qf * (float)(b1 >> 4);
             }
+            float* accw = acc_pool + warp * T + lane * 4;
+            accw[0] = a0; accw[1] = a1; accw[2] = a2; accw[3] = a3;
+        }
+        __syncthreads();
+
+        for (int t = tid; t < T; t += 256) {
+            float acc = acc_pool[t]         + acc_pool[T + t]
+                      + acc_pool[2 * T + t] + acc_pool[3 * T + t]
+                      + acc_pool[4 * T + t] + acc_pool[5 * T + t]
+                      + acc_pool[6 * T + t] + acc_pool[7 * T + t];
             float score = row_scale[t] * (acc + bias) * scale;
             int idx = tile * T + t;
             if (use_shared) shared_scores[idx] = score;
             else            head_scratch[idx]  = score;
         }
-        __syncthreads();   // qfold/sdata are rewritten by the next tile
+        __syncthreads();   // qfold/sdata/acc_pool are rewritten by the next tile
     }
 
     // 1b — FP32 recent window (unrotated q, linear slots).
@@ -6838,15 +6869,27 @@ extern ""C"" __global__ void llm_kvarn_attention(
     //  Phase 3: V aggregation
     // ────────────────────────────────────────────────────────────────────
 
-    // 3a — compressed tiles, rotated domain. One thread per output channel.
+    // 3a — compressed tiles, rotated domain. Coalesced flat-index walk (issue
+    // #180 Task 5b): the old layout — one thread per channel walking all T
+    // token rows at a bytes_per_token stride, with 128+ threads idle — chained
+    // T·tiles dependent byte loads per thread. Now thread tid owns code byte
+    // (tid & (bpt−1)) of token rows t = tid/bpt, +256/bpt, …: every block pass
+    // reads 256 consecutive code bytes (fully coalesced), each thread keeps 4
+    // register partials for its lane-stable channel quad, and the per-(token,
+    // group) w·tokStep / w·tokMin factors — channel-invariant, previously
+    // re-read per channel — fold once per tile in shared. Per tile the quads
+    // reduce across token-strips and fold the per-tile col_scale + weighted-
+    // min bias into rot_acc: the same AggregateValues algebra, reassociated
+    // within the attention parity band. bpt = head_dim/4 ∈ {2,…,64} (pow2)
+    // always divides 256, so the byte/quad assignment is lane-stable.
     float rot_acc = 0.0f;
-    if (tid < head_dim) {
-        int d = tid;
+    {
         int groups = (head_dim + 127) >> 7;
-        int g = d >> 7;
         int bytes_per_token = head_dim >> 2;
-        int code_shift = (d & 3) * 2;
-        int code_byte = d >> 2;
+        int my_byte = tid & (bytes_per_token - 1);
+        int my_g = (my_byte << 2) >> 7;            // group of this thread's channel quad
+        int t_stride = 256 / bytes_per_token;
+        int t_first = tid / bytes_per_token;
 
         for (int tile = 0; tile < num_tiles; tile++) {
             const float* f32 = (const float*)((const unsigned char*)v_tiles
@@ -6856,18 +6899,55 @@ extern ""C"" __global__ void llm_kvarn_attention(
             const float* tok_min   = f32 + head_dim + T * groups;    // [T·G]
             const unsigned char* codes = (const unsigned char*)f32 + (head_dim + 2 * T * groups) * 4;
 
-            // acc_c = Σ_t (w_t·tokStep_tg)·code[t,c]; the min term folds once
-            // per (token, group) — same algebra as AggregateValues.
-            float acc = 0.0f, group_bias = 0.0f;
-            for (int t = 0; t < T; t++) {
-                int idx = tile * T + t;
-                float w = use_shared ? shared_scores[idx] : head_scratch[idx];
-                group_bias += w * tok_min[t * groups + g];
-                float ws = w * tok_step[t * groups + g];
-                int code = (codes[t * bytes_per_token + code_byte] >> code_shift) & 0x3;
-                acc += ws * (float)code;
+            // ws[g,t] = w_t·tokStep_tg once per tile (T·groups ≤ 256 entries).
+            for (int i = tid; i < T * groups; i += 256) {
+                int t = i & (T - 1);
+                int g = i >> 7;                    // i / T
+                float w = use_shared ? shared_scores[tile * T + t] : head_scratch[tile * T + t];
+                ws_sh[g * T + t] = w * tok_step[t * groups + g];
             }
-            rot_acc += col_scale[d] * (acc + group_bias);
+            // Per-group weighted-min bias Σ_t w_t·tokMin_tg (tree-reduced —
+            // reassociation is within the parity band).
+            for (int g = 0; g < groups; g++) {
+                float v = 0.0f;
+                for (int t = tid; t < T; t += 256) {
+                    float w = use_shared ? shared_scores[tile * T + t] : head_scratch[tile * T + t];
+                    v += w * tok_min[t * groups + g];
+                }
+                sdata[tid] = v;
+                __syncthreads();
+                for (unsigned int s = 128; s > 0; s >>= 1) {
+                    if ((unsigned int)tid < s) sdata[tid] += sdata[tid + s];
+                    __syncthreads();
+                }
+                if (tid == 0) vbias[g] = sdata[0];
+                __syncthreads();
+            }
+
+            // acc_c = Σ_t ws[t]·code[t,c] over this thread's token strip.
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+            for (int t = t_first; t < T; t += t_stride) {
+                float ws = ws_sh[my_g * T + t];
+                unsigned int b = codes[t * bytes_per_token + my_byte];
+                a0 += ws * (float)( b       & 0x3u);   // channel 4b+0 → bits 0..1 (PackBits2)
+                a1 += ws * (float)((b >> 2) & 0x3u);
+                a2 += ws * (float)((b >> 4) & 0x3u);
+                a3 += ws * (float)( b >> 6        );
+            }
+            float* accq = acc_pool + tid * 4;
+            accq[0] = a0; accq[1] = a1; accq[2] = a2; accq[3] = a3;
+            __syncthreads();
+
+            if (tid < head_dim) {
+                int d = tid;
+                int cb = d >> 2;                   // this channel's byte index
+                int j = d & 3;
+                float acc = 0.0f;
+                for (int k = cb; k < 256; k += bytes_per_token)
+                    acc += acc_pool[k * 4 + j];
+                rot_acc += col_scale[d] * (acc + vbias[d >> 7]);
+            }
+            __syncthreads();                       // ws_sh/acc_pool rewritten next tile
         }
     }
     __syncthreads();   // phase-2 sdata reads are done; reuse it for the IWHT
