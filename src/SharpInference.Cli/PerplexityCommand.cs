@@ -4,6 +4,7 @@ using Spectre.Console;
 using Spectre.Console.Cli;
 using SharpInference.Core;
 using SharpInference.Cpu;
+using SharpInference.Cuda;
 using SharpInference.Engine;
 
 namespace SharpInference.Cli;
@@ -62,7 +63,7 @@ public sealed class PerplexityCommand : Command<PerplexityCommand.Settings>
         public int TqWindow { get; init; }
 
         [CommandOption("--ngl|--n-gpu-layers|--gpu-layers|-g")]
-        [Description("Layers on GPU. Must be 0: the perplexity harness runs the CPU forward pass only (issue #180 P0).")]
+        [Description("Layers on GPU: 0 (default, CPU forward pass) or -1 (full CUDA offload via CudaForwardPass — issue #180 Task 5a). Partial offload is not supported.")]
         [DefaultValue(0)]
         public int NGpuLayers { get; init; }
     }
@@ -70,9 +71,11 @@ public sealed class PerplexityCommand : Command<PerplexityCommand.Settings>
     /// <summary>
     /// Validates the flag combination (no model needed) and resolves the quantizer.
     /// Mirrors the run command's --tq/--tq-mode rules: kvarn requires --tq, and the
-    /// whole harness is CPU-only so any -g != 0 is rejected outright. The window
-    /// floor is one compressed tile (128 for KVarN, 32 for Lloyd-Max FastScan) so
-    /// the cache constructor can't throw later with a less actionable message.
+    /// harness runs either the CPU forward pass (-g 0) or the full-CUDA-offload
+    /// CudaForwardPass (-g -1, issue #180 Task 5a) — any other -g is rejected
+    /// outright. The window floor is one compressed tile (128 for KVarN, 32 for
+    /// Lloyd-Max FastScan) so the cache constructor can't throw later with a less
+    /// actionable message.
     /// </summary>
     internal static bool TryValidateFlags(bool tq, string tqModeStr, int tqWindow, int nGpuLayers,
         out TqQuantizer quantizer, out string? error)
@@ -96,9 +99,9 @@ public sealed class PerplexityCommand : Command<PerplexityCommand.Settings>
             error = "--tq-mode kvarn requires --tq.";
             return false;
         }
-        if (nGpuLayers != 0)
+        if (nGpuLayers is not (0 or -1))
         {
-            error = "the perplexity harness runs the CPU forward pass only (issue #180 P0); use -g 0.";
+            error = "the perplexity harness runs either the CPU forward pass (-g 0) or full CUDA offload (-g -1); partial offload is not supported.";
             return false;
         }
         int minWindow = quantizer == TqQuantizer.KVarN ? 128 : 32;
@@ -193,7 +196,8 @@ public sealed class PerplexityCommand : Command<PerplexityCommand.Settings>
         var tokenizer = GgufTokenizer.FromGgufModel(model);
 
         // Same head-dim compatibility rules as the run command (issue #180): Lloyd-Max
-        // ships hardcoded codebooks for 128/256; KVarN accepts any power-of-2 in [8, 1024].
+        // ships hardcoded codebooks for 128/256; KVarN accepts any power-of-2 in
+        // [8, 1024] on CPU, [8, 256] on CUDA (the shared-memory WHT cap).
         if (settings.TurboQuant)
         {
             int headDim = hp.HeadDim;
@@ -204,12 +208,22 @@ public sealed class PerplexityCommand : Command<PerplexityCommand.Settings>
                     AnsiConsole.MarkupLine($"[red]Error:[/] --tq-mode kvarn requires a power-of-2 head dimension in [[8, 1024]]; this model has head dim {headDim}.");
                     return 1;
                 }
+                if (settings.NGpuLayers == -1 && headDim > 256)
+                {
+                    AnsiConsole.MarkupLine($"[red]Error:[/] --tq-mode kvarn on CUDA requires head dim ≤ 256 (shared-memory WHT cap); this model has head dim {headDim}. Use [yellow]-g 0[/].");
+                    return 1;
+                }
             }
             else if (headDim is not 128 and not 256)
             {
                 AnsiConsole.MarkupLine($"[red]Error:[/] TurboQuant requires head dimension 128 or 256; this model has head dim {headDim}.");
                 return 1;
             }
+        }
+        if (settings.NGpuLayers == -1 && settings.TurboQuant && quantizer == TqQuantizer.KVarN && hp.IsMoE)
+        {
+            AnsiConsole.MarkupLine("[red]Error:[/] --tq-mode kvarn on CUDA supports dense models only (issue #180 Task 5a); use [yellow]-g 0[/] for MoE.");
+            return 1;
         }
 
         // Raw-text tokenization (no chat template), like llama.cpp perplexity. BOS is
@@ -240,16 +254,59 @@ public sealed class PerplexityCommand : Command<PerplexityCommand.Settings>
             : quantizer == TqQuantizer.KVarN ? $"tq-kvarn-k4v2 (window={settings.TqWindow})"
             : $"tq-lloydmax-3bit (window={settings.TqWindow})";
 
-        using var cpuBackend = new CpuBackend();
-        using var fwd = new ForwardPass(model, cpuBackend, hp, maxContextLength: ctx);
-        if (settings.TurboQuant)
-        {
-            fwd.EnableTurboQuant(fp32WindowSize: settings.TqWindow, bits: 3, quantizer: quantizer);
-            if (settings.TqWindow >= n)
-                AnsiConsole.MarkupLine($"[yellow]Note:[/] --tq-window {settings.TqWindow} >= evaluated tokens ({n}); the cache never compresses, so this measures the FP32 path.");
-        }
+        if (settings.TurboQuant && settings.TqWindow >= n)
+            AnsiConsole.MarkupLine($"[yellow]Note:[/] --tq-window {settings.TqWindow} >= evaluated tokens ({n}); the cache never compresses, so this measures the FP32 path.");
 
-        AnsiConsole.MarkupLine($"[dim]Backend: [blue]CPU[/] | config: {Markup.Escape(config)} | evaluating {n} tokens[/]");
+        // Build the forward pass: CPU ForwardPass (-g 0) or the full-CUDA-offload
+        // CudaForwardPass (-g -1, issue #180 Task 5a). Both feed the same
+        // teacher-forced token-by-token Forward loop below, so with --tq every
+        // step exercises the compressed-read attention path exactly like decode.
+        CpuBackend? cpuBackend = null;
+        CudaBackend? cudaBackend = null;
+        IForwardPass fwd;
+        string backendLabel;
+        if (settings.NGpuLayers == -1)
+        {
+            if (!CudaBackend.IsAvailable())
+            {
+                AnsiConsole.MarkupLine("[red]Error:[/] -g -1 requires a CUDA device; none is available. Use [yellow]-g 0[/] for the CPU path.");
+                return 1;
+            }
+            if (hp.IsHybridSsm)
+            {
+                AnsiConsole.MarkupLine("[red]Error:[/] -g -1 perplexity uses CudaForwardPass, which does not cover hybrid GDN models; use [yellow]-g 0[/].");
+                return 1;
+            }
+            cudaBackend = CudaBackend.Create();
+            try
+            {
+                fwd = new CudaForwardPass(model, cudaBackend, hp, maxContextLength: ctx,
+                    enableTurboQuant: settings.TurboQuant, tqFp32Window: settings.TqWindow,
+                    tqQuantizer: quantizer);
+            }
+            catch
+            {
+                cudaBackend.Dispose();
+                throw;
+            }
+            backendLabel = $"[green]CUDA[/] ({cudaBackend.Name}, all {hp.NumLayers} layers)";
+        }
+        else
+        {
+            cpuBackend = new CpuBackend();
+            var cpuFwd = new ForwardPass(model, cpuBackend, hp, maxContextLength: ctx);
+            if (settings.TurboQuant)
+                cpuFwd.EnableTurboQuant(fp32WindowSize: settings.TqWindow, bits: 3, quantizer: quantizer);
+            fwd = cpuFwd;
+            backendLabel = "[blue]CPU[/]";
+        }
+        // Declared backend-first so `using` disposal (reverse order) tears down the
+        // forward pass before its backend.
+        using var _cpuDispose = cpuBackend;
+        using var _cudaDispose = cudaBackend;
+        using var _fwdDispose = (IDisposable)fwd;
+
+        AnsiConsole.MarkupLine($"[dim]Backend: {backendLabel} | config: {Markup.Escape(config)} | evaluating {n} tokens[/]");
 
         // Position buckets over the *target* position: [1, edge0) is context that always
         // fits the FP32 window, [edge0, edge1) early compressed region, [edge1, +) deep.

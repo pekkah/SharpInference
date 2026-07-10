@@ -6424,6 +6424,483 @@ extern ""C"" __global__ void llm_tq_attention(
     }
 }
 
+// ── KVarN rotate_query (issue #180) ────────────────────────────────────────
+// Normalized Walsh-Hadamard transform of each query head. Unlike the TQ
+// twin above there is NO per-layer sign flip (KVarN has no sign pattern —
+// Sinkhorn normalization replaces it as the outlier equalizer), and the
+// 1/sqrt(dim) scale is computed as 1.0f/sqrtf(dim) so it matches the CPU
+// WalshHadamard.Transform bit-for-bit (rsqrtf is only approximate).
+//
+// One block per query head, head_dim threads; head_dim must be a power of
+// two in [8, 256] (the shared-staging cap, same bound as llm_tq_rotate_query).
+extern ""C"" __global__ void llm_kvarn_rotate_query(
+    const float* __restrict__ q_input,
+    float* __restrict__ rotated_q,
+    int num_heads, int head_dim)
+{
+    __shared__ float sdata[256];
+
+    int h = (int)blockIdx.x;
+    int tid = (int)threadIdx.x;
+    if (h >= num_heads || tid >= head_dim) return;
+
+    int q_off = h * head_dim;
+    sdata[tid] = q_input[q_off + tid];
+    __syncthreads();
+
+    // WHT butterfly: dim/2 active threads per stage — the same pair
+    // enumeration as the CPU butterfly, so each stage is bit-identical.
+    for (int s = head_dim >> 1; s >= 1; s >>= 1) {
+        if (tid < (head_dim >> 1)) {
+            int pos_lo = (tid / s) * (s << 1) + (tid % s);
+            int pos_hi = pos_lo + s;
+            float a = sdata[pos_lo];
+            float b = sdata[pos_hi];
+            sdata[pos_lo] = a + b;
+            sdata[pos_hi] = a - b;
+        }
+        __syncthreads();
+    }
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+    rotated_q[q_off + tid] = sdata[tid] * scale;
+}
+
+// ── KVarN tile compression (issue #180) ────────────────────────────────────
+// Compresses the OLDEST 128 rows of a layer's linear FP32 window (row 0 =
+// oldest — the host keeps the window shifted down, mirroring the CPU
+// TurboQuantKvCache) into one packed K tile (4-bit per-channel) and one
+// packed V tile (2-bit per-token, channel groups of 128) per kv-head.
+//
+// Clean-room mirror of KVarNCompressor.CompressKeyTile/CompressValueTile:
+//   1. normalized WHT per token row (K and V both),
+//   2. Sinkhorn dual-axis RMS normalization — columns first, rows last,
+//      log-space factor accumulation, 1e-12 epsilon guard,
+//   3. asymmetric RTN (K: per-channel min/step over the 128 tokens; V:
+//      per-token min/step per 128-channel group), round-to-nearest-EVEN
+//      (__float2int_rn == MathF.Round),
+//   4. scale folding: the quantized axis's Sinkhorn factor folds into the
+//      stored step/min; the other axis's factor is stored raw.
+//
+// Numerics contract: every op that feeds the RTN codes uses correctly-rounded
+// single-precision arithmetic (__fadd_rn/__fmul_rn block FMA contraction in
+// the sum-of-squares; '/', sqrtf are IEEE-correct under the default NVRTC
+// -prec-div/-prec-sqrt), so the packed CODES are bit-identical to the CPU
+// compressor. logf/expf may differ from MathF.Log/Exp in the last ulp, which
+// only perturbs the STORED scale floats (rowScale/colScale and the folded
+// step/min), never the codes.
+//
+// The 128×head_dim working tile (64 KB at D=128) exceeds the 48 KB shared
+// ceiling, so it lives in a global scratch buffer (`work`, one slice per
+// (kv_head, K/V) block); shared memory holds only one row (WHT) and the
+// per-axis log factors. Promotion runs once per 128 decode steps per layer,
+// so the extra global traffic is amortized — correctness first (Task 5a).
+//
+// Grid: (num_kv_heads, 2) — blockIdx.y 0 = K tile, 1 = V tile. Block: 128
+// threads (covers the widest butterfly at head_dim=256 and one thread per
+// token row). head_dim: power of two in [8, 256].
+extern ""C"" __global__ void llm_kvarn_compress_tile(
+    const float* __restrict__ k_window,   // [window × kv_dim] fp32, row 0 = oldest
+    const float* __restrict__ v_window,
+    unsigned int* __restrict__ k_tiles,   // packed K tiles, KVarNCompressor layout
+    unsigned int* __restrict__ v_tiles,   // packed V tiles
+    float* __restrict__ work,             // [num_kv_heads × 2 × 128 × head_dim] f32 scratch
+    int kv_dim, int head_dim, int tile_idx,
+    int num_kv_heads, int k_tile_bytes, int v_tile_bytes,
+    int sinkhorn_iters)
+{
+    const int T = 128;                    // KVarNCompressor.TileTokens
+    const float RMS_EPS = 1e-12f;
+    __shared__ float srow[256];           // one token row for the WHT butterfly
+    __shared__ float log_row[128];        // per-token Sinkhorn log factors → exp'd in place
+    __shared__ float log_col[256];        // per-channel Sinkhorn log factors → exp'd in place
+
+    int kv_head = (int)blockIdx.x;
+    int is_v = (int)blockIdx.y;
+    int tid = (int)threadIdx.x;           // blockDim.x == 128
+    if (kv_head >= num_kv_heads) return;
+
+    const float* window = (is_v != 0) ? v_window : k_window;
+    float* tile_f = work + (long)(kv_head * 2 + is_v) * (long)(T * head_dim);
+
+    int half_dim = head_dim >> 1;         // ≤ 128 == blockDim.x
+    float wht_scale = 1.0f / sqrtf((float)head_dim);
+
+    // 1. Gather + rotate each token row (row t of the tile = window row t).
+    for (int t = 0; t < T; t++) {
+        for (int c = tid; c < head_dim; c += 128)
+            srow[c] = window[(long)t * (long)kv_dim + (long)kv_head * head_dim + c];
+        __syncthreads();
+
+        for (int s = half_dim; s >= 1; s >>= 1) {
+            if (tid < half_dim) {
+                int pos_lo = (tid / s) * (s << 1) + (tid % s);
+                int pos_hi = pos_lo + s;
+                float a = srow[pos_lo];
+                float b = srow[pos_hi];
+                srow[pos_lo] = a + b;
+                srow[pos_hi] = a - b;
+            }
+            __syncthreads();
+        }
+
+        for (int c = tid; c < head_dim; c += 128)
+            tile_f[t * head_dim + c] = srow[c] * wht_scale;
+        __syncthreads();
+    }
+
+    // 2. Sinkhorn dual-axis RMS normalization (columns first, rows last).
+    for (int i = tid; i < T; i += 128) log_row[i] = 0.0f;
+    for (int i = tid; i < head_dim; i += 128) log_col[i] = 0.0f;
+    __syncthreads();
+
+    for (int iter = 0; iter < sinkhorn_iters; iter++) {
+        // Channels (columns) first — one thread per channel; the token loop
+        // runs t = 0..127 sequentially, matching the CPU accumulation order.
+        for (int c = tid; c < head_dim; c += 128) {
+            float sum_sq = 0.0f;
+            for (int t = 0; t < T; t++) {
+                float v = tile_f[t * head_dim + c];
+                sum_sq = __fadd_rn(sum_sq, __fmul_rn(v, v));   // no FMA contraction
+            }
+            float rms = sqrtf(sum_sq / (float)T);
+            if (rms > RMS_EPS) {
+                float inv = 1.0f / rms;
+                for (int t = 0; t < T; t++)
+                    tile_f[t * head_dim + c] *= inv;
+                log_col[c] += logf(rms);
+            }
+        }
+        __syncthreads();
+
+        // ... tokens (rows) last, so per-token RMS ends exactly at 1.
+        for (int t = tid; t < T; t += 128) {
+            float sum_sq = 0.0f;
+            for (int c = 0; c < head_dim; c++) {
+                float v = tile_f[t * head_dim + c];
+                sum_sq = __fadd_rn(sum_sq, __fmul_rn(v, v));
+            }
+            float rms = sqrtf(sum_sq / (float)head_dim);
+            if (rms > RMS_EPS) {
+                float inv = 1.0f / rms;
+                for (int c = 0; c < head_dim; c++)
+                    tile_f[t * head_dim + c] *= inv;
+                log_row[t] += logf(rms);
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int i = tid; i < T; i += 128) log_row[i] = expf(log_row[i]);
+    for (int i = tid; i < head_dim; i += 128) log_col[i] = expf(log_col[i]);
+    __syncthreads();
+
+    // 3. Asymmetric RTN quantize + pack (KVarNCompressor packed layouts; both
+    //    tile strides are 4-byte multiples so the uint[] cache views stay
+    //    aligned; per-thread regions are disjoint, so plain byte stores).
+    if (is_v == 0) {
+        // K tile: [rowScale T×f32][chanStep D×f32][chanMin D×f32][codes D runs
+        // of T/2 bytes, channel-major, PackBits4: even token → low nibble].
+        long byte_off = ((long)tile_idx * num_kv_heads + kv_head) * (long)k_tile_bytes;
+        float* f32 = (float*)((unsigned char*)k_tiles + byte_off);
+        float* row_scale = f32;
+        float* chan_step = f32 + T;
+        float* chan_min  = f32 + T + head_dim;
+        unsigned char* codes = (unsigned char*)f32 + (T + 2 * head_dim) * 4;
+
+        for (int t = tid; t < T; t += 128) row_scale[t] = log_row[t];
+
+        for (int c = tid; c < head_dim; c += 128) {
+            float mn = 3.402823466e+38f, mx = -3.402823466e+38f;
+            for (int t = 0; t < T; t++) {
+                float v = tile_f[t * head_dim + c];
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+            }
+            float step = (mx - mn) / 15.0f;
+            float inv_step = (step > 0.0f) ? (1.0f / step) : 0.0f;
+            chan_step[c] = log_col[c] * step;
+            chan_min[c]  = log_col[c] * mn;
+
+            unsigned char* run = codes + c * (T / 2);
+            for (int b = 0; b < T / 2; b++) {
+                int q0 = __float2int_rn((tile_f[(b * 2)     * head_dim + c] - mn) * inv_step);
+                int q1 = __float2int_rn((tile_f[(b * 2 + 1) * head_dim + c] - mn) * inv_step);
+                if (q0 < 0) q0 = 0; else if (q0 > 15) q0 = 15;
+                if (q1 < 0) q1 = 0; else if (q1 > 15) q1 = 15;
+                run[b] = (unsigned char)(q0 | (q1 << 4));
+            }
+        }
+    } else {
+        // V tile: [colScale D×f32][tokStep T·G×f32][tokMin T·G×f32][codes T
+        // runs of D/4 bytes, token-major, PackBits2: channel c → bits (c&3)·2].
+        int groups = (head_dim + 127) >> 7;   // ValueGroupSize = 128
+        long byte_off = ((long)tile_idx * num_kv_heads + kv_head) * (long)v_tile_bytes;
+        float* f32 = (float*)((unsigned char*)v_tiles + byte_off);
+        float* col_scale = f32;
+        float* tok_step  = f32 + head_dim;
+        float* tok_min   = f32 + head_dim + T * groups;
+        unsigned char* codes = (unsigned char*)f32 + (head_dim + 2 * T * groups) * 4;
+
+        for (int c = tid; c < head_dim; c += 128) col_scale[c] = log_col[c];
+
+        int bytes_per_token = head_dim >> 2;
+        for (int t = tid; t < T; t += 128) {
+            unsigned char* run = codes + t * bytes_per_token;
+            for (int g = 0; g < groups; g++) {
+                int c0 = g << 7;
+                int c1 = c0 + 128; if (c1 > head_dim) c1 = head_dim;
+
+                float mn = 3.402823466e+38f, mx = -3.402823466e+38f;
+                for (int c = c0; c < c1; c++) {
+                    float v = tile_f[t * head_dim + c];
+                    if (v < mn) mn = v;
+                    if (v > mx) mx = v;
+                }
+                float step = (mx - mn) / 3.0f;
+                float inv_step = (step > 0.0f) ? (1.0f / step) : 0.0f;
+                tok_step[t * groups + g] = log_row[t] * step;
+                tok_min[t * groups + g]  = log_row[t] * mn;
+
+                for (int b = (c0 >> 2); b < (c1 >> 2); b++) {
+                    int c = b << 2;
+                    int q0 = __float2int_rn((tile_f[t * head_dim + c    ] - mn) * inv_step);
+                    int q1 = __float2int_rn((tile_f[t * head_dim + c + 1] - mn) * inv_step);
+                    int q2 = __float2int_rn((tile_f[t * head_dim + c + 2] - mn) * inv_step);
+                    int q3 = __float2int_rn((tile_f[t * head_dim + c + 3] - mn) * inv_step);
+                    if (q0 < 0) q0 = 0; else if (q0 > 3) q0 = 3;
+                    if (q1 < 0) q1 = 0; else if (q1 > 3) q1 = 3;
+                    if (q2 < 0) q2 = 0; else if (q2 > 3) q2 = 3;
+                    if (q3 < 0) q3 = 0; else if (q3 > 3) q3 = 3;
+                    run[b] = (unsigned char)(q0 | (q1 << 2) | (q2 << 4) | (q3 << 6));
+                }
+            }
+        }
+    }
+}
+
+// ── KVarN attention (hybrid compressed tiles + FP32 window, issue #180) ────
+// One block per query head, 256 threads. Same 3-phase structure and score
+// storage strategy as llm_tq_attention (shared scores ≤ 4096 positions,
+// global scratch above), but reads KVarN packed tiles:
+//
+//   Phase 1a — per K tile, the per-channel factors fold into the rotated
+//     query ONCE (qfold_c = rotq_c·chanStep_c, bias = Σ_c rotq_c·chanMin_c —
+//     the KVarNCompressor.KeyScores algebra), then one thread per token walks
+//     that token's channel-major nibbles:
+//       score_t = rowScale_t · (Σ_c qfold_c·code[c,t] + bias) · 1/sqrt(D)
+//   Phase 1b — FP32 window scores with the UNROTATED q (the window holds
+//     original-domain rows; the window is linear, slot 0 = oldest).
+//   Phase 2  — one softmax over [0, tq_seq_len + fp32_seq_len).
+//   Phase 3  — V aggregation: compressed tiles accumulate in the ROTATED
+//     domain (all tiles share the rotation), ONE inverse WHT per head, then
+//     the FP32-window V contribution adds on top in the original domain —
+//     the KVarNCompressor class contract (deferred inverse, w/ws skip terms
+//     contribute exact zeros so no skip branches are needed for parity).
+//
+// tq_seq_len must be a whole-tile multiple (the KVarN cache invariant: the
+// window owns everything mod 128). head_dim: power of two in [8, 256].
+extern ""C"" __global__ void llm_kvarn_attention(
+    const float* __restrict__ q,
+    const float* __restrict__ rotated_q,
+    const unsigned int* __restrict__ k_tiles,
+    const unsigned int* __restrict__ v_tiles,
+    const float* __restrict__ k_cache_fp32,
+    const float* __restrict__ v_cache_fp32,
+    float* __restrict__ out,
+    float* __restrict__ scores_scratch,    // [num_heads × max_seq_len], null when total ≤ 4096
+    int num_heads, int num_kv_heads, int head_dim,
+    int tq_seq_len, int fp32_seq_len, int max_seq_len,
+    int k_tile_bytes, int v_tile_bytes)
+{
+    const int T = 128;                     // tile tokens
+    const int MAX_SHARED_SCORES = 4096;
+    __shared__ float shared_scores[MAX_SHARED_SCORES];
+    __shared__ float sdata[256];           // reductions + the deferred inverse WHT
+    __shared__ float qfold[256];           // per-tile folded query (rotq·chanStep)
+
+    int h = (int)blockIdx.x;
+    int tid = (int)threadIdx.x;
+    if (h >= num_heads) return;
+
+    int kv_head = h / (num_heads / num_kv_heads);
+    int kv_dim  = num_kv_heads * head_dim;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    long q_off  = (long)h * (long)head_dim;
+    int total_seq = tq_seq_len + fp32_seq_len;
+    int num_tiles = tq_seq_len / T;
+
+    bool use_shared = (total_seq <= MAX_SHARED_SCORES);
+    float* head_scratch = scores_scratch + (long)h * (long)max_seq_len;
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Phase 1a: compressed-tile scores
+    // ────────────────────────────────────────────────────────────────────
+    for (int tile = 0; tile < num_tiles; tile++) {
+        const float* f32 = (const float*)((const unsigned char*)k_tiles
+            + ((long)tile * num_kv_heads + kv_head) * (long)k_tile_bytes);
+        const float* row_scale = f32;                       // [T]
+        const float* chan_step = f32 + T;                   // [D]
+        const float* chan_min  = f32 + T + head_dim;        // [D]
+        const unsigned char* codes = (const unsigned char*)f32 + (T + 2 * head_dim) * 4;
+
+        // Fold the per-channel factors into the query once per tile.
+        float partial_bias = 0.0f;
+        for (int c = tid; c < head_dim; c += 256) {
+            float rq = rotated_q[q_off + c];
+            qfold[c] = rq * chan_step[c];
+            partial_bias += rq * chan_min[c];
+        }
+        sdata[tid] = partial_bias;
+        __syncthreads();
+        for (unsigned int s = 128; s > 0; s >>= 1) {
+            if ((unsigned int)tid < s) sdata[tid] += sdata[tid + s];
+            __syncthreads();
+        }
+        float bias = sdata[0];
+        __syncthreads();
+
+        // One thread per token: walk the channel-major nibble runs.
+        for (int t = tid; t < T; t += 256) {
+            const unsigned char* col = codes + (t >> 1);
+            int shift = (t & 1) ? 4 : 0;
+            float acc = 0.0f;
+            for (int c = 0; c < head_dim; c++) {
+                int code = (col[c * (T / 2)] >> shift) & 0xF;
+                acc += qfold[c] * (float)code;
+            }
+            float score = row_scale[t] * (acc + bias) * scale;
+            int idx = tile * T + t;
+            if (use_shared) shared_scores[idx] = score;
+            else            head_scratch[idx]  = score;
+        }
+        __syncthreads();   // qfold/sdata are rewritten by the next tile
+    }
+
+    // 1b — FP32 recent window (unrotated q, linear slots).
+    for (int t = tid; t < fp32_seq_len; t += 256) {
+        float dot = 0.0f;
+        long k_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+        for (int d = 0; d < head_dim; d++)
+            dot += q[q_off + d] * k_cache_fp32[k_off + d];
+        float score = dot * scale;
+        if (use_shared) shared_scores[tq_seq_len + t] = score;
+        else            head_scratch[tq_seq_len + t]  = score;
+    }
+
+    if (use_shared) {
+        for (int t = total_seq + tid; t < MAX_SHARED_SCORES; t += 256)
+            shared_scores[t] = sharpi_neg_inf();
+    }
+    __syncthreads();
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Phase 2: in-place softmax over [0, total_seq)  (mirrors llm_tq_attention)
+    // ────────────────────────────────────────────────────────────────────
+    float local_max = sharpi_neg_inf();
+    for (int t = tid; t < total_seq; t += 256) {
+        float s = use_shared ? shared_scores[t] : head_scratch[t];
+        local_max = fmaxf(local_max, s);
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if ((unsigned int)tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < total_seq; t += 256) {
+        float s = use_shared ? shared_scores[t] : head_scratch[t];
+        float e = __expf(s - max_val);
+        if (use_shared) shared_scores[t] = e;
+        else            head_scratch[t]  = e;
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (unsigned int s = 128; s > 0; s >>= 1) {
+        if ((unsigned int)tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / sdata[0];
+    __syncthreads();
+
+    for (int t = tid; t < total_seq; t += 256) {
+        if (use_shared) shared_scores[t] *= inv_sum;
+        else            head_scratch[t]  *= inv_sum;
+    }
+    __syncthreads();
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Phase 3: V aggregation
+    // ────────────────────────────────────────────────────────────────────
+
+    // 3a — compressed tiles, rotated domain. One thread per output channel.
+    float rot_acc = 0.0f;
+    if (tid < head_dim) {
+        int d = tid;
+        int groups = (head_dim + 127) >> 7;
+        int g = d >> 7;
+        int bytes_per_token = head_dim >> 2;
+        int code_shift = (d & 3) * 2;
+        int code_byte = d >> 2;
+
+        for (int tile = 0; tile < num_tiles; tile++) {
+            const float* f32 = (const float*)((const unsigned char*)v_tiles
+                + ((long)tile * num_kv_heads + kv_head) * (long)v_tile_bytes);
+            const float* col_scale = f32;                            // [D]
+            const float* tok_step  = f32 + head_dim;                 // [T·G]
+            const float* tok_min   = f32 + head_dim + T * groups;    // [T·G]
+            const unsigned char* codes = (const unsigned char*)f32 + (head_dim + 2 * T * groups) * 4;
+
+            // acc_c = Σ_t (w_t·tokStep_tg)·code[t,c]; the min term folds once
+            // per (token, group) — same algebra as AggregateValues.
+            float acc = 0.0f, group_bias = 0.0f;
+            for (int t = 0; t < T; t++) {
+                int idx = tile * T + t;
+                float w = use_shared ? shared_scores[idx] : head_scratch[idx];
+                group_bias += w * tok_min[t * groups + g];
+                float ws = w * tok_step[t * groups + g];
+                int code = (codes[t * bytes_per_token + code_byte] >> code_shift) & 0x3;
+                acc += ws * (float)code;
+            }
+            rot_acc += col_scale[d] * (acc + group_bias);
+        }
+    }
+    __syncthreads();   // phase-2 sdata reads are done; reuse it for the IWHT
+
+    // 3b — one deferred inverse WHT per head (the normalized WHT is an
+    // involution; the 1/sqrt(D) normalization is applied at readout below).
+    if (tid < head_dim) sdata[tid] = rot_acc;
+    __syncthreads();
+    for (int s = head_dim >> 1; s >= 1; s >>= 1) {
+        if (tid < (head_dim >> 1)) {
+            int pos_lo = (tid / s) * (s << 1) + (tid % s);
+            int pos_hi = pos_lo + s;
+            float a = sdata[pos_lo];
+            float b = sdata[pos_hi];
+            sdata[pos_lo] = a + b;
+            sdata[pos_hi] = a - b;
+        }
+        __syncthreads();
+    }
+    float wht_scale = 1.0f / sqrtf((float)head_dim);
+
+    // 3c — FP32-window V contribution (original domain) + output write.
+    for (int d = tid; d < head_dim; d += 256) {
+        float acc = (num_tiles > 0) ? sdata[d] * wht_scale : 0.0f;
+        for (int t = 0; t < fp32_seq_len; t++) {
+            float w = use_shared ? shared_scores[tq_seq_len + t] : head_scratch[tq_seq_len + t];
+            long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
+            acc += w * v_cache_fp32[v_off + d];
+        }
+        out[q_off + d] = acc;
+    }
+}
+
 // ── Scaled dot-product attention with GQA ─────────────────────────────────
 // One block per query head, 256 threads.
 //

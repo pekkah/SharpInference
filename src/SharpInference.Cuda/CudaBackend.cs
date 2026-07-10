@@ -320,6 +320,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _tqRotateQueryKernel;
     private nint   _tqKvAppendKernel;
     private nint   _tqAttentionKernel;
+    // KVarN quantizer kernels (issue #180 Task 5a).
+    private nint   _kvarnRotateQueryKernel;
+    private nint   _kvarnCompressTileKernel;
+    private nint   _kvarnAttentionKernel;
 
     // qwen35moe Gated-DeltaNet (GDN) kernels.
     private nint   _siluInplaceKernel;
@@ -6057,6 +6061,118 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(tq_attention) failed: {r}");
     }
 
+    // ================================================================
+    //  KVarN KV-cache compression (issue #180 Task 5a)
+    // ================================================================
+
+    /// <summary>
+    /// Rotate query vectors for KVarN attention: the normalized Walsh-Hadamard
+    /// transform per query head, no sign flip (KVarN has none). Call once per
+    /// layer before <see cref="KvarnAttention"/>. head_dim must be a power of
+    /// two in [8, 256].
+    /// </summary>
+    public void KvarnRotateQuery(Tensor qInput, Tensor rotatedQ, int numHeads, int headDim)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint qP  = GetDevPtr(qInput);
+        nint rqP = GetDevPtr(rotatedQ);
+        int  pNH = numHeads, pHD = headDim;
+        nint* args = stackalloc nint[4]
+        {
+            (nint)(&qP), (nint)(&rqP), (nint)(&pNH), (nint)(&pHD)
+        };
+        int r = NvrtcInterop.LaunchKernel(_kvarnRotateQueryKernel,
+            (uint)numHeads, 1, 1, (uint)headDim, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kvarn_rotate_query) failed: {r}");
+    }
+
+    /// <summary>
+    /// Compress the oldest 128 rows of a layer's linear FP32 window (row 0 =
+    /// oldest) into one KVarN K tile + one V tile per kv-head, written at
+    /// <paramref name="tileIdx"/> in the packed tile stores (KVarNCompressor
+    /// byte layout, stride = tile bytes × numKvHeads per tile index).
+    /// <paramref name="work"/> must hold <c>numKvHeads × 2 × 128 × headDim</c>
+    /// floats of global scratch (the 128×headDim working tile exceeds the 48 KB
+    /// shared-memory ceiling, so normalization runs out of VRAM — promotion is
+    /// once per 128 decode steps per layer, so this is amortized).
+    /// </summary>
+    public void KvarnCompressTile(Tensor kWindow, Tensor vWindow, Tensor kTiles, Tensor vTiles,
+                                  Tensor work, int kvDim, int headDim, int tileIdx,
+                                  int numKvHeads, int kTileBytes, int vTileBytes,
+                                  int sinkhornIterations)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint kwP = GetDevPtr(kWindow);
+        nint vwP = GetDevPtr(vWindow);
+        nint ktP = GetDevPtr(kTiles);
+        nint vtP = GetDevPtr(vTiles);
+        nint wP  = GetDevPtr(work);
+        int  pKD = kvDim, pHD = headDim, pTI = tileIdx, pNKV = numKvHeads,
+             pKTB = kTileBytes, pVTB = vTileBytes, pSI = sinkhornIterations;
+        nint* args = stackalloc nint[12]
+        {
+            (nint)(&kwP), (nint)(&vwP), (nint)(&ktP), (nint)(&vtP), (nint)(&wP),
+            (nint)(&pKD), (nint)(&pHD), (nint)(&pTI), (nint)(&pNKV),
+            (nint)(&pKTB), (nint)(&pVTB), (nint)(&pSI)
+        };
+        // blockIdx.y: 0 = K tile, 1 = V tile; 128 threads cover the widest
+        // butterfly (head_dim 256 → 128 pairs) and one thread per token row.
+        int r = NvrtcInterop.LaunchKernel(_kvarnCompressTileKernel,
+            (uint)numKvHeads, 2, 1, 128, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kvarn_compress_tile) failed: {r}");
+    }
+
+    /// <summary>
+    /// Hybrid KVarN attention: scaled dot-product attention over the KVarN
+    /// compressed tiles plus the linear FP32 recent-window cache.
+    /// <paramref name="tqSeqLen"/> must be a whole multiple of 128 (the KVarN
+    /// cache invariant). Same scores-scratch contract as <see cref="TqAttention"/>:
+    /// ignored while <c>tqSeqLen + fp32SeqLen ≤ 4096</c>, required (sized
+    /// <c>numHeads × maxSeqLen</c>) above.
+    /// </summary>
+    public void KvarnAttention(Tensor q, Tensor rotatedQ, Tensor kTiles, Tensor vTiles,
+                               Tensor kCacheFp32, Tensor vCacheFp32, Tensor output,
+                               Tensor? scoresScratch,
+                               int numHeads, int numKvHeads, int headDim,
+                               int tqSeqLen, int fp32SeqLen, int maxSeqLen,
+                               int kTileBytes, int vTileBytes)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint qP   = GetDevPtr(q);
+        nint rqP  = GetDevPtr(rotatedQ);
+        nint ktP  = GetDevPtr(kTiles);
+        nint vtP  = GetDevPtr(vTiles);
+        nint kfP  = GetDevPtr(kCacheFp32);
+        nint vfP  = GetDevPtr(vCacheFp32);
+        nint oP   = GetDevPtr(output);
+        nint ssP  = scoresScratch is { } sv ? GetDevPtr(sv) : nint.Zero;
+        int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim,
+             pTQ = tqSeqLen, pFP = fp32SeqLen, pMSL = maxSeqLen,
+             pKTB = kTileBytes, pVTB = vTileBytes;
+        nint* args = stackalloc nint[16]
+        {
+            (nint)(&qP), (nint)(&rqP),
+            (nint)(&ktP), (nint)(&vtP),
+            (nint)(&kfP), (nint)(&vfP),
+            (nint)(&oP),  (nint)(&ssP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pTQ), (nint)(&pFP),  (nint)(&pMSL),
+            (nint)(&pKTB), (nint)(&pVTB)
+        };
+        int r = NvrtcInterop.LaunchKernel(_kvarnAttentionKernel,
+            (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kvarn_attention) failed: {r}");
+    }
+
     /// <summary>Look up one row from an F32 embedding table into <paramref name="output"/>.</summary>
     public void EmbedLookup(Tensor embTable, Tensor output, int tokenId, int embDim)
     {
@@ -7128,6 +7244,8 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _clearF32Kernel, _gatherRowsKernel, _scatterRowsKernel, _quantizeQ81Kernel,
             _scaleRowsKernel, _moeWeightedReduceKernel,
             _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
+            _kvarnRotateQueryKernel, _kvarnCompressTileKernel, _kvarnAttentionKernel,   // #180
+
             _siluInplaceKernel, _gdnConv1dDecodeKernel, _gdnL2NormPerHeadKernel,
             _gdnTileHeadsKernel, _gdnRecurrenceDecodeKernel,
             _gdnRecurrenceDecodeFastKernel, _gdnDecodeNormGateKernel,   // #404
@@ -7344,6 +7462,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _tqRotateQueryKernel = GetKernelFunc("llm_tq_rotate_query");
         _tqKvAppendKernel    = GetKernelFunc("llm_tq_kv_append");
         _tqAttentionKernel   = GetKernelFunc("llm_tq_attention");
+
+        // KVarN quantizer kernels (issue #180 Task 5a).
+        _kvarnRotateQueryKernel  = GetKernelFunc("llm_kvarn_rotate_query");
+        _kvarnCompressTileKernel = GetKernelFunc("llm_kvarn_compress_tile");
+        _kvarnAttentionKernel    = GetKernelFunc("llm_kvarn_attention");
 
         // qwen35moe GDN kernels.
         _siluInplaceKernel        = GetKernelFunc("llm_silu_inplace");

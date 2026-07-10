@@ -20,6 +20,8 @@ public sealed class PerplexityFlagsTests
     [InlineData(true, "kvarn", 256, 0, TqQuantizer.KVarN)]
     [InlineData(true, "KVarN", 128, 0, TqQuantizer.KVarN)]         // case-insensitive; min window
     [InlineData(true, "lloydmax", 32, 0, TqQuantizer.LloydMax)]    // Lloyd-Max min window (one FastScan tile)
+    [InlineData(false, "lloydmax", 256, -1, TqQuantizer.LloydMax)] // full CUDA offload (Task 5a): fp32 baseline
+    [InlineData(true, "kvarn", 256, -1, TqQuantizer.KVarN)]        // full CUDA offload (Task 5a): kvarn gate
     public void ValidCombos_Resolve(bool tq, string mode, int window, int ngl, TqQuantizer expected)
     {
         bool ok = PerplexityCommand.TryValidateFlags(tq, mode, window, ngl, out var quantizer, out string? error);
@@ -39,11 +41,13 @@ public sealed class PerplexityFlagsTests
     }
 
     [Theory]
-    [InlineData(-1)]
     [InlineData(1)]
     [InlineData(36)]
-    public void GpuLayers_NonZero_IsRejected(int ngl)
+    [InlineData(-2)]
+    public void GpuLayers_Partial_IsRejected(int ngl)
     {
+        // 0 (CPU) and -1 (full CUDA offload, issue #180 Task 5a) are the only
+        // supported placements; anything partial is rejected.
         bool ok = PerplexityCommand.TryValidateFlags(tq: true, "kvarn", 256, ngl, out _, out string? error);
 
         Assert.False(ok);

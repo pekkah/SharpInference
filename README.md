@@ -260,6 +260,14 @@ the IWHT defers to one call per kv-head. Combined K+V hot-path cost vs the prior
 End-to-end gain tracks the K+V share of token cost — small at short ctx, growing with length. Qwen3-8B CPU
 `--tq` decode drops only ~22% from 30→6050 ctx (12.0→9.4 t/s) — ~1.9× the per-block path at 6K.
 
+`--tq-mode kvarn` (issue #180) selects the KVarN quantizer instead of the Lloyd-Max codebooks: per-128-token-tile
+Hadamard rotation + dual-axis Sinkhorn variance normalization + asymmetric RTN — 4-bit keys / 2-bit values
+(≈4.75 + 2.75 bits/elt at `headDim` 128), calibration-free so any power-of-2 head dim quantizes. Runs on CPU
+(`-g 0`, head dim ≤ 1024) and on the full-CUDA-offload dense path (`-g -1`, head dim ≤ 256; the CUDA tiles are
+byte-compatible with the CPU compressor and the promotion cadence matches position-for-position). P0 accuracy
+gate (Qwen3-0.6B-Q8_0, wikitext-2, 3072 tokens): PPL 15.67 vs 15.47 fp32 (+1.3%). No SnapKV / Vulkan /
+partial-offload / MoE-on-GPU composition yet.
+
 ### Multi-Token Prediction (MTP)
 
 Models with native MTP heads (Qwen3.6-27B-MTP, Qwen3.5/3.6 A3B-MTP, DeepSeek V3/R1) get self-speculative

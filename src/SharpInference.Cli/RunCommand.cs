@@ -114,7 +114,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [CommandOption("--tq-mode")]
         [Description("TurboQuant quantizer for --tq: lloydmax (default; 3-bit Lloyd-Max codebooks) or kvarn " +
             "(issue #180: Sinkhorn-normalized asymmetric RTN, 4-bit K / 2-bit V, 128-token tiles; " +
-            "CPU only (-g 0), any power-of-2 head dim, no SnapKV).")]
+            "CPU (-g 0, any power-of-2 head dim ≤ 1024) or full-CUDA-offload dense (-g -1, head dim ≤ 256); no SnapKV).")]
         [DefaultValue("lloydmax")]
         public string TqModeStr { get; init; } = "lloydmax";
 
@@ -608,10 +608,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         Func<IReadOnlyList<int>, ReadOnlySpan<float>> prefill;
         Action resetCache;
 
-        // Resolve the TurboQuant quantizer (issue #180). KVarN is the CPU-only P0
-        // prototype: reject GPU offload and SnapKV up-front with actionable errors
-        // (ForwardPass.EnableTurboQuant re-checks the SnapKV combo as the config-time
-        // guard of last resort).
+        // Resolve the TurboQuant quantizer (issue #180). KVarN runs on the CPU forward
+        // pass (-g 0, P0) or on the full-CUDA-offload dense path (-g -1 / -g NumLayers,
+        // Task 5a); SnapKV, Vulkan, partial offload, and MoE-on-GPU are rejected
+        // up-front with actionable errors (ForwardPass.EnableTurboQuant and the
+        // CudaForwardPass constructor re-check as guards of last resort).
         TqQuantizer tqQuantizer;
         switch (settings.TqModeStr.Trim().ToLowerInvariant())
         {
@@ -632,21 +633,37 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 AnsiConsole.MarkupLine("[red]Error:[/] --tq-mode kvarn requires [yellow]--tq[/].");
                 return 1;
             }
-            if (effNGpuLayers != 0)
-            {
-                AnsiConsole.MarkupLine("[red]Error:[/] --tq-mode kvarn runs on the CPU forward pass only (issue #180 P0); use [yellow]-g 0[/].");
-                return 1;
-            }
             if (SnapKvConfig.FromEnvironment().Enabled)
             {
                 AnsiConsole.MarkupLine("[red]Error:[/] --tq-mode kvarn does not compose with SnapKV eviction yet (issue #180 follow-up); unset [yellow]SHARPI_SNAPKV_BUDGET[/].");
                 return 1;
             }
+            if (effNGpuLayers != 0)
+            {
+                // GPU KVarN is the CUDA full-offload dense path only (issue #180 Task 5a).
+                string kvarnBackend = (settings.Backend ?? "auto").Trim().ToLowerInvariant();
+                if (kvarnBackend == "vulkan")
+                {
+                    AnsiConsole.MarkupLine("[red]Error:[/] --tq-mode kvarn is not supported on the Vulkan backend; use [yellow]--backend cuda -g -1[/] (full offload) or [yellow]-g 0[/] (CPU).");
+                    return 1;
+                }
+                if (!CudaBackend.IsAvailable())
+                {
+                    AnsiConsole.MarkupLine("[red]Error:[/] --tq-mode kvarn with GPU offload requires a CUDA device (issue #180 Task 5a); use [yellow]-g 0[/] for the CPU path.");
+                    return 1;
+                }
+                if (hp.IsMoE)
+                {
+                    AnsiConsole.MarkupLine("[red]Error:[/] --tq-mode kvarn on CUDA supports dense models only (issue #180 Task 5a); use [yellow]-g 0[/] for MoE.");
+                    return 1;
+                }
+            }
         }
 
         // Validate TurboQuant head-dimension compatibility before any GPU allocation.
         // Lloyd-Max ships hardcoded codebooks for 128/256; KVarN is calibration-free
-        // and accepts any power-of-2 head dim in [8, 1024].
+        // and accepts any power-of-2 head dim in [8, 1024] on the CPU path, [8, 256]
+        // on CUDA (the shared-memory WHT cap — 512/1024 stay CPU-only for now).
         if (settings.TurboQuant)
         {
             int headDim = hp.HeadDim;
@@ -655,6 +672,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 if ((headDim & (headDim - 1)) != 0 || headDim is < 8 or > 1024)
                 {
                     AnsiConsole.MarkupLine($"[red]Error:[/] --tq-mode kvarn requires a power-of-2 head dimension in [[8, 1024]]; this model has head dim {headDim}.");
+                    return 1;
+                }
+                if (effNGpuLayers != 0 && headDim > 256)
+                {
+                    AnsiConsole.MarkupLine($"[red]Error:[/] --tq-mode kvarn on CUDA requires head dim ≤ 256 (shared-memory WHT cap); this model has head dim {headDim}. Use [yellow]-g 0[/] for the CPU path.");
                     return 1;
                 }
             }
@@ -694,8 +716,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     // Auto: pick CUDA when available. CudaForwardPass handles full-offload
                     // (dense + MoE); CudaHybridForwardPass handles partial-offload (dense or
                     // MoE; routed experts stream through the CudaExpertSlotManager SLRU).
-                    // TQ on CUDA requires head_dim ∈ {128, 256}.
-                    bool tqHeadDimOk = hp.HeadDim is 128 or 256;
+                    // TQ on CUDA requires head_dim ∈ {128, 256}; KVarN pow2 in [8, 256]
+                    // (already validated above, so kvarn implies CUDA-compatible here).
+                    bool tqHeadDimOk = tqQuantizer == TqQuantizer.KVarN
+                        || hp.HeadDim is 128 or 256;
                     wantCuda = (!settings.TurboQuant || tqHeadDimOk)
                         && CudaBackend.IsAvailable();
                     break;
@@ -703,7 +727,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     AnsiConsole.MarkupLine($"[red]Error:[/] Unknown --backend value '{settings.Backend}'. Expected one of: auto, vulkan, cuda.");
                     return 1;
             }
-            if (wantCuda && settings.TurboQuant && hp.HeadDim is not 128 and not 256)
+            if (wantCuda && settings.TurboQuant && tqQuantizer == TqQuantizer.LloydMax
+                && hp.HeadDim is not 128 and not 256)
             {
                 AnsiConsole.MarkupLine($"[yellow]Note:[/] --backend cuda TurboQuant requires head_dim ∈ {{128, 256}} (model head_dim={hp.HeadDim}); falling back to Vulkan.");
                 wantCuda = false;
@@ -836,6 +861,15 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 }
 
                 bool wantHybrid = (cudaGpuLayers > 0 && cudaGpuLayers < hp.NumLayers) || moeAutoNeedsHybrid;
+                if (wantHybrid && settings.TurboQuant && tqQuantizer == TqQuantizer.KVarN)
+                {
+                    // KVarN on GPU is the full-offload CudaForwardPass path only (issue
+                    // #180 Task 5a) — the hybrid pass has no KVarN ring/tile machinery.
+                    AnsiConsole.MarkupLine(
+                        $"[red]Error:[/] --tq-mode kvarn requires full CUDA offload, but only " +
+                        $"{cudaGpuLayers}/{hp.NumLayers} layers fit this GPU. Use [yellow]-g 0[/] for the CPU path.");
+                    return 1;
+                }
                 if (wantHybrid)
                 {
                     var hwProfile = HardwareProfile.Detect(cuda);
@@ -862,8 +896,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     gpuBackend = null;
                     if (settings.TurboQuant)
                     {
-                        fwd!.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
-                        AnsiConsole.MarkupLine("[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
+                        fwd!.EnableTurboQuant(fp32WindowSize: 256, bits: 3, quantizer: tqQuantizer);
+                        AnsiConsole.MarkupLine(tqQuantizer == TqQuantizer.KVarN
+                            ? "[dim]TurboQuant: [green]enabled[/] (KVarN K4V2, window=256)[/]"
+                            : "[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
                     }
                     forward = fwd!.Forward;
                     prefill = tokens => fwd.Prefill(tokens);
@@ -873,9 +909,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 else
                 {
                     var cfwd = new CudaForwardPass(model, cuda, hp, ctxSize,
-                        enableTurboQuant: settings.TurboQuant);
+                        enableTurboQuant: settings.TurboQuant, tqQuantizer: tqQuantizer);
                     if (settings.TurboQuant)
-                        AnsiConsole.MarkupLine($"[dim]TurboQuant: [green]enabled[/] (3-bit, context: {cfwd.MaxSeqLen})[/]");
+                        AnsiConsole.MarkupLine(tqQuantizer == TqQuantizer.KVarN
+                            ? $"[dim]TurboQuant: [green]enabled[/] (KVarN K4V2, window=256, context: {cfwd.MaxSeqLen})[/]"
+                            : $"[dim]TurboQuant: [green]enabled[/] (3-bit, context: {cfwd.MaxSeqLen})[/]");
                     gpuFwd = cfwd;
                     forward = cfwd.Forward;
                     prefill = tokens => cfwd.Prefill(tokens);
