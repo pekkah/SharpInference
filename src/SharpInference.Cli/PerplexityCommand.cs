@@ -53,9 +53,9 @@ public sealed class PerplexityCommand : Command<PerplexityCommand.Settings>
         public bool TurboQuant { get; init; }
 
         [CommandOption("--tq-mode")]
-        [Description("TurboQuant quantizer for --tq: lloydmax (default; 3-bit Lloyd-Max codebooks) or kvarn (issue #180: 4-bit K / 2-bit V, 128-token tiles; CPU only).")]
-        [DefaultValue("lloydmax")]
-        public string TqModeStr { get; init; } = "lloydmax";
+        [Description("TurboQuant quantizer for --tq: auto (default: kvarn where supported, else lloydmax with a quality warning), kvarn (issue #180: 4-bit K / 2-bit V, 128-token tiles), or lloydmax (3-bit codebooks; severely degrades quality on QK-norm models such as Qwen3 — issue #432).")]
+        [DefaultValue("auto")]
+        public string TqModeStr { get; init; } = "auto";
 
         [CommandOption("--tq-window")]
         [Description("FP32 recent-token window before compression kicks in (default: 256; min 128 for kvarn — one full tile). Also sets the first position-bucket edge of the report, so pass the same value to the fp32 baseline for bucket-comparable numbers.")]
@@ -75,26 +75,32 @@ public sealed class PerplexityCommand : Command<PerplexityCommand.Settings>
     /// CudaForwardPass (-g -1, issue #180 Task 5a) — any other -g is rejected
     /// outright. The window floor is one compressed tile (128 for KVarN, 32 for
     /// Lloyd-Max FastScan) so the cache constructor can't throw later with a less
-    /// actionable message.
+    /// actionable message. When <paramref name="autoMode"/> comes back true the
+    /// returned quantizer is tentative — <see cref="ResolveAutoQuantizer"/> picks the
+    /// final codec once the model hyperparams are known (issue #432).
     /// </summary>
     internal static bool TryValidateFlags(bool tq, string tqModeStr, int tqWindow, int nGpuLayers,
-        out TqQuantizer quantizer, out string? error)
+        out TqQuantizer quantizer, out bool autoMode, out string? error)
     {
         quantizer = TqQuantizer.LloydMax;
+        autoMode = false;
         switch (tqModeStr.Trim().ToLowerInvariant())
         {
-            case "" or "lloydmax" or "lloyd-max":
+            case "" or "auto":
+                autoMode = true;
+                break;
+            case "lloydmax" or "lloyd-max":
                 quantizer = TqQuantizer.LloydMax;
                 break;
             case "kvarn":
                 quantizer = TqQuantizer.KVarN;
                 break;
             default:
-                error = $"Unknown --tq-mode value '{tqModeStr}'. Expected one of: lloydmax, kvarn.";
+                error = $"Unknown --tq-mode value '{tqModeStr}'. Expected one of: auto, lloydmax, kvarn.";
                 return false;
         }
 
-        if (quantizer == TqQuantizer.KVarN && !tq)
+        if (!autoMode && quantizer == TqQuantizer.KVarN && !tq)
         {
             error = "--tq-mode kvarn requires --tq.";
             return false;
@@ -104,7 +110,9 @@ public sealed class PerplexityCommand : Command<PerplexityCommand.Settings>
             error = "the perplexity harness runs either the CPU forward pass (-g 0) or full CUDA offload (-g -1); partial offload is not supported.";
             return false;
         }
-        int minWindow = quantizer == TqQuantizer.KVarN ? 128 : 32;
+        // Auto mode only resolves to KVarN when the window fits a whole tile, so its
+        // hard floor is the Lloyd-Max one.
+        int minWindow = !autoMode && quantizer == TqQuantizer.KVarN ? 128 : 32;
         if (tq && tqWindow < minWindow)
         {
             error = $"--tq-window must be >= {minWindow} for --tq-mode {(quantizer == TqQuantizer.KVarN ? "kvarn (one full 128-token tile)" : "lloydmax (one FastScan tile)")}; got {tqWindow}.";
@@ -118,6 +126,28 @@ public sealed class PerplexityCommand : Command<PerplexityCommand.Settings>
 
         error = null;
         return true;
+    }
+
+    /// <summary>
+    /// Resolves the auto --tq-mode (issue #432): KVarN wherever it is supported,
+    /// otherwise Lloyd-Max with <paramref name="fallbackReason"/> set so the caller
+    /// can print the quality warning (Lloyd-Max 3-bit collapses on QK-norm models —
+    /// Qwen3-0.6B wikitext-2 PPL: 15.47 fp32 / 15.67 KVarN / 945.6 Lloyd-Max 3-bit).
+    /// Takes primitives instead of hyperparams so the matrix is unit-testable.
+    /// </summary>
+    internal static TqQuantizer ResolveAutoQuantizer(int tqWindow, int nGpuLayers, int headDim,
+        bool isMoE, bool snapKvEnabled, out string? fallbackReason)
+    {
+        bool headDimOk = headDim >= 8 && headDim <= 1024 && (headDim & (headDim - 1)) == 0;
+        fallbackReason =
+            snapKvEnabled ? "SnapKV eviction (SHARPI_SNAPKV_BUDGET) does not compose with KVarN yet"
+            : tqWindow < 128 ? $"KVarN needs --tq-window >= 128 (one full tile); got {tqWindow}"
+            : !headDimOk ? $"KVarN needs a power-of-2 head dim in [8, 1024]; this model has {headDim}"
+            : nGpuLayers == 0 ? null
+            : isMoE ? "KVarN on CUDA supports dense models only"
+            : headDim > 256 ? $"KVarN on CUDA requires head dim ≤ 256; this model has {headDim}"
+            : null;
+        return fallbackReason is null ? TqQuantizer.KVarN : TqQuantizer.LloydMax;
     }
 
     /// <summary>
@@ -145,12 +175,12 @@ public sealed class PerplexityCommand : Command<PerplexityCommand.Settings>
     protected override int Execute(CommandContext context, Settings settings, CancellationToken cancellation)
     {
         if (!TryValidateFlags(settings.TurboQuant, settings.TqModeStr, settings.TqWindow,
-                settings.NGpuLayers, out TqQuantizer quantizer, out string? flagError))
+                settings.NGpuLayers, out TqQuantizer quantizer, out bool tqModeIsAuto, out string? flagError))
         {
             AnsiConsole.MarkupLine($"[red]Error:[/] {Markup.Escape(flagError!)}");
             return 1;
         }
-        if (settings.TurboQuant && quantizer == TqQuantizer.KVarN && SnapKvConfig.FromEnvironment().Enabled)
+        if (!tqModeIsAuto && settings.TurboQuant && quantizer == TqQuantizer.KVarN && SnapKvConfig.FromEnvironment().Enabled)
         {
             AnsiConsole.MarkupLine("[red]Error:[/] --tq-mode kvarn does not compose with SnapKV eviction yet (issue #180 follow-up); unset [yellow]SHARPI_SNAPKV_BUDGET[/].");
             return 1;
@@ -194,6 +224,19 @@ public sealed class PerplexityCommand : Command<PerplexityCommand.Settings>
         using var model = GgufModel.Open(modelPath);
         var hp = ModelHyperparams.FromGgufMetadata(model.Metadata, model);
         var tokenizer = GgufTokenizer.FromGgufModel(model);
+
+        // Auto --tq-mode (issue #432): prefer KVarN, fall back to Lloyd-Max with a
+        // loud quality warning where KVarN is unsupported.
+        if (tqModeIsAuto && settings.TurboQuant)
+        {
+            quantizer = ResolveAutoQuantizer(settings.TqWindow, settings.NGpuLayers, hp.HeadDim,
+                hp.IsMoE, SnapKvConfig.FromEnvironment().Enabled, out string? fallbackReason);
+            if (fallbackReason is not null)
+                AnsiConsole.MarkupLine(
+                    $"[yellow]Warning:[/] --tq is falling back to the Lloyd-Max 3-bit quantizer ({Markup.Escape(fallbackReason)}). " +
+                    "Lloyd-Max severely degrades quality on QK-norm models such as Qwen3 (issue #432); " +
+                    "pass [yellow]--tq-mode lloydmax[/] explicitly to silence this warning.");
+        }
 
         // Same head-dim compatibility rules as the run command (issue #180): Lloyd-Max
         // ships hardcoded codebooks for 128/256; KVarN accepts any power-of-2 in
