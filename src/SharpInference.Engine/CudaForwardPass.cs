@@ -204,6 +204,15 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     /// </summary>
     public bool BatchedPrefillEnabled { get; set; }
     /// <summary>
+    /// Gates the issue-#180 Task 6 chunked batched KVarN prefill (tile-aligned chunks
+    /// through the batched trunk instead of the per-token Forward loop). Initialised from
+    /// <c>SHARPI_KVARN_BATCHED_PREFILL</c> (default on; <c>=0</c> reverts to the per-token
+    /// loop); settable so tests can A/B the chunked path against the per-token oracle on
+    /// the same model. Only consulted when the KVarN quantizer is active — also subject to
+    /// the master <see cref="BatchedPrefillEnabled"/> switch.
+    /// </summary>
+    public bool KvarnBatchedPrefillEnabled { get; set; }
+    /// <summary>
     /// Issue #162: window size (tokens) for chunked batched prefill of prompts longer
     /// than the non-flash 4096 cap. Each window is batched at its own startPos with flash
     /// attention streaming the prior KV, so the N-sized trunk scratch stays bounded to
@@ -397,6 +406,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     private int _bpCapacity;                 // current N the scratch is sized for (0 = none)
     private Tensor? _bpHidden, _bpResidual, _bpNorm;       // [N × embDim]
     private Tensor? _bpQ, _bpAttnOut;                      // [N × numHeads*maxHeadDim]
+    private Tensor? _bpRotQ;                               // [N × numHeads*maxHeadDim] KVarN rotated queries (#180 Task 6)
     private Tensor? _bpK, _bpV;                            // [N × numKvHeads*maxHeadDim]
     private Tensor? _bpFfnGate, _bpFfnUp;                  // [N × intermDim]
     private Tensor? _bpProjAll, _bpPleRowAll;             // [N × L*pleWidth]
@@ -550,6 +560,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
 
     // TurboQuant state (null/0 when disabled).
     private readonly bool _tqEnabled;
+    private readonly TqQuantizer _tqQuantizer;
     private readonly int _tqFp32Window;
     private readonly int _tqBits;
     private readonly int _tqBlockBytes;
@@ -561,6 +572,18 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     private Tensor? _rotatedQ;
     private Tensor? _evictK;
     private Tensor? _evictV;
+    // KVarN quantizer state (issue #180 Task 5a; only when _tqQuantizer == KVarN).
+    // In KVarN mode the per-layer _gpuKCache/_gpuVCache window is LINEAR (slot 0 =
+    // oldest, mirroring the CPU TurboQuantKvCache's shift-down window), not a ring:
+    // promotion compresses the oldest 128 rows into one packed K+V tile per kv-head
+    // and shifts the remainder down, so attention reads contiguous slots and the
+    // compress kernel reads a contiguous tile — no ring math anywhere.
+    private Tensor[]? _gpuKvarnKTiles;   // [layer] packed K tiles (uint[] view)
+    private Tensor[]? _gpuKvarnVTiles;   // [layer] packed V tiles
+    private Tensor? _kvarnWork;          // [numKvHeads × 2 × 128 × headDim] f32 compress scratch
+    private Tensor? _kvarnShiftScratch;  // [(window − 128) × kvDim] f32 window-shift bounce buffer
+    private int _kvarnKeyTileBytes;
+    private int _kvarnValueTileBytes;
     // Per-query-head softmax-scores scratch in VRAM, sized [numHeads × maxSeqLen].
     // Used by both the TQ and FP32 attention kernels when the live context exceeds
     // their shared-memory fast-path cap (4096 positions). Allocated only when
@@ -639,10 +662,39 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     /// </summary>
     internal int KvLength => _kvLength;
 
+    /// <summary>Test-only: TQ/KVarN compressed-region length (positions promoted so far).</summary>
+    internal int TqCompressedLength => _tqCompressedLen;
+
+    /// <summary>Test-only: number of FP32-window positions currently held.</summary>
+    internal int TqFp32Count => _fp32Count;
+
+    /// <summary>
+    /// Test-only: download the first <paramref name="numTiles"/> packed KVarN K or V
+    /// tiles of one layer (tile-major, <c>numTiles × numKvHeads × tileBytes</c>) for
+    /// byte-level comparison between the chunked and per-token prefill paths (#180 Task 6).
+    /// </summary>
+    internal byte[] DownloadKvarnTileBytesForTest(int layer, bool valueTiles, int numTiles)
+    {
+        if (_gpuKvarnKTiles is null)
+            throw new InvalidOperationException("KVarN tile stores are not allocated (KVarN mode inactive).");
+        var store = valueTiles ? _gpuKvarnVTiles![layer] : _gpuKvarnKTiles[layer];
+        int stride = valueTiles ? _kvarnValueTileBytes : _kvarnKeyTileBytes;
+        long bytes = (long)numTiles * _numKvHeads * stride;   // strides are 4-byte multiples
+        var view = _gpu.View(store, 0, bytes / 4);
+        var floats = new float[bytes / 4];
+        _gpu.Download(view, floats);
+        _gpu.Synchronize();
+        _gpu.Free(view);
+        var result = new byte[bytes];
+        System.Runtime.InteropServices.MemoryMarshal.AsBytes(floats.AsSpan()).CopyTo(result);
+        return result;
+    }
+
     public CudaForwardPass(GgufModel model, CudaBackend gpu, ModelHyperparams hp,
         int maxContextLength = 0,
         bool enableTurboQuant = false, int tqFp32Window = 256, int tqBits = 3,
-        bool? mmqSoa = null, bool preferBatchingOverAutoSnapKv = false)
+        bool? mmqSoa = null, bool preferBatchingOverAutoSnapKv = false,
+        TqQuantizer tqQuantizer = TqQuantizer.LloydMax)
     {
         _model = model;
         _gpu = gpu;
@@ -671,6 +723,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         // !_isMoE at upload.
         _q6kSoa = Environment.GetEnvironmentVariable("SHARPI_Q6K_SOA") != "0";
         _tqEnabled = enableTurboQuant;
+        _tqQuantizer = tqQuantizer;
         _tqBits = enableTurboQuant ? tqBits : 0;
 
         _embDim = hp.EmbeddingDim;
@@ -692,6 +745,10 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         // bit-exact per-token loop (useful for A/B and parity debugging).
         BatchedPrefillEnabled =
             Environment.GetEnvironmentVariable("SHARPI_BATCHED_PREFILL") != "0";
+        // Chunked batched KVarN prefill (issue #180 Task 6) is on by default;
+        // SHARPI_KVARN_BATCHED_PREFILL=0 reverts KVarN prompts to the per-token loop.
+        KvarnBatchedPrefillEnabled =
+            Environment.GetEnvironmentVariable("SHARPI_KVARN_BATCHED_PREFILL") != "0";
         PrefillGemmEnabled =
             Environment.GetEnvironmentVariable("SHARPI_PREFILL_GEMM") != "0";
         // Issue #141 (MMQ): default on — the int8 tensor-core MMQ beats the
@@ -720,17 +777,34 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                 if (lhdMax[i] > _maxHeadDim) _maxHeadDim = lhdMax[i];
         _ropeThetaSwa = hp.RopeThetaSwa;
 
-        if (_tqEnabled && _headDim is not 128 and not 256)
+        if (_tqEnabled && _tqQuantizer == TqQuantizer.KVarN)
+        {
+            // KVarN (issue #180): calibration-free, so any pow2 head_dim quantizes, but the
+            // CUDA WHT butterflies stage one row in 256 floats of shared memory — the same
+            // cap the TQ kernels have. Head dims 512/1024 stay CPU-only for now.
+            if (!System.Numerics.BitOperations.IsPow2(_headDim) || _headDim is < 8 or > 256)
+                throw new NotSupportedException(
+                    $"CUDA KVarN requires a power-of-2 head_dim in [8, 256] (shared-memory WHT cap; " +
+                    $"model head_dim={_headDim}). Larger head dims run on the CPU path (-g 0).");
+            // Dense-only for Task 5a: the MoE decode path is untested with the KVarN
+            // window/tile state machine — keep the exclusivity explicit rather than latent.
+            if (_isMoE)
+                throw new NotSupportedException(
+                    "CUDA KVarN supports dense models only (issue #180 Task 5a); use the CPU path for MoE.");
+        }
+        else if (_tqEnabled && _headDim is not 128 and not 256)
             throw new NotSupportedException(
                 $"CUDA TurboQuant requires head_dim ∈ {{128, 256}} (model head_dim={_headDim}).");
-        if (_tqEnabled && tqBits != 3)
+        if (_tqEnabled && _tqQuantizer == TqQuantizer.LloydMax && tqBits != 3)
             throw new NotSupportedException(
                 $"CUDA TurboQuant only ships 3-bit kernels today (requested bits={tqBits}).");
 
         if (maxContextLength > 0)
             _maxSeqLen = Math.Min(maxContextLength, hp.ContextLength);
         else if (_tqEnabled)
-            _maxSeqLen = EstimateMaxContextTq(model, gpu, hp, tqFp32Window, tqBits);
+            _maxSeqLen = _tqQuantizer == TqQuantizer.KVarN
+                ? EstimateMaxContextKvarn(model, gpu, hp, tqFp32Window)
+                : EstimateMaxContextTq(model, gpu, hp, tqFp32Window, tqBits);
         else
             // Size the auto-context for the KV dtype the operator requested (#220): a bf16/q8_0
             // KV store fits 2×/4× the positions of fp32, but EstimateMaxContext previously priced
@@ -757,7 +831,22 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         if (_tqEnabled)
         {
             _tqFp32Window = Math.Min(tqFp32Window, _maxSeqLen);
-            _tqBlockBytes = TurboQuantOps.BlockSize(tqBits, _headDim);
+            if (_tqQuantizer == TqQuantizer.KVarN)
+            {
+                // KVarN compresses whole 128-token tiles straight out of the FP32
+                // window, so the window must hold at least one tile whenever a
+                // compressed region can exist (mirrors the TurboQuantKvCache guard).
+                if (_maxSeqLen > _tqFp32Window && _tqFp32Window < KVarNCompressor.TileTokens)
+                    throw new ArgumentException(
+                        $"KVarN requires an FP32 window of at least {KVarNCompressor.TileTokens} positions " +
+                        $"(one full tile) when the context ({_maxSeqLen}) exceeds the window; " +
+                        $"got tqFp32Window={_tqFp32Window}.", nameof(tqFp32Window));
+                _tqBlockBytes = 0; // Lloyd-Max per-block sizing is unused in KVarN mode
+            }
+            else
+            {
+                _tqBlockBytes = TurboQuantOps.BlockSize(tqBits, _headDim);
+            }
             // The TQ attention kernel uses a stored-scores fast path up to 4096 positions
             // and a triple-pass recompute path above that. No per-context allocation cap.
         }
@@ -942,7 +1031,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         }
 
         string kvTag = _kvDType switch { DType.BFloat16 => " [KV bf16]", DType.Q8_0 => " [KV q8_0]", _ => "" };
-        Console.Error.WriteLine($"[CudaForwardPass] Context size: {_maxSeqLen} (model max: {hp.ContextLength}){(_tqEnabled ? " [TQ3]" : "")}{kvTag}");
+        string tqTag = !_tqEnabled ? "" : _tqQuantizer == TqQuantizer.KVarN ? " [KVarN K4V2]" : " [TQ3]";
+        Console.Error.WriteLine($"[CudaForwardPass] Context size: {_maxSeqLen} (model max: {hp.ContextLength}){tqTag}{kvTag}");
 
         bool vramTrace = Environment.GetEnvironmentVariable("SHARPI_TRACE_VRAM") == "1";
         void TraceVram(string label)
@@ -998,32 +1088,70 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                 _gpuVCache[i] = gpu.Allocate(TensorShape.D1((long)_tqFp32Window * kvDim));
             }
 
-            // TQ-compressed storage for older positions, stored as uint[] (one block per
-            // (position, kv_head) at byte offset position*numKvHeads*blockBytes + ...).
             int maxTqPositions = Math.Max(0, _maxSeqLen - _tqFp32Window);
-            long tqBytesPerPos = (long)_numKvHeads * _tqBlockBytes;
-            long tqUintsPerLayer = (maxTqPositions * tqBytesPerPos + 3) / 4;
-            _gpuTqKCache = new Tensor[hp.NumLayers];
-            _gpuTqVCache = new Tensor[hp.NumLayers];
-            _gpuSignPatterns = new Tensor[hp.NumLayers];
-            for (int i = 0; i < hp.NumLayers; i++)
+            if (_tqQuantizer == TqQuantizer.KVarN)
             {
-                _gpuTqKCache[i] = gpu.Allocate(TensorShape.D1(tqUintsPerLayer));
-                _gpuTqVCache[i] = gpu.Allocate(TensorShape.D1(tqUintsPerLayer));
-                _gpuSignPatterns[i] = UploadTqSignPatterns(i);
+                // KVarN (issue #180): packed K4/V2 tile stores, one K + one V tile per
+                // (128 promoted positions, kv-head, layer). Byte layout matches
+                // KVarNCompressor exactly (tiles can be downloaded and verified with
+                // the CPU DecompressKey/ValueTile). Strides are 4-byte multiples so
+                // the uint[]-typed tensors stay aligned. No sign patterns, codebooks,
+                // boundaries, or per-row evict scratch — promotion is whole-tile.
+                _kvarnKeyTileBytes = KVarNCompressor.KeyTileSize(_headDim);
+                _kvarnValueTileBytes = KVarNCompressor.ValueTileSize(_headDim);
+                int maxTiles = (maxTqPositions + KVarNCompressor.TileTokens - 1) / KVarNCompressor.TileTokens;
+                if (maxTiles > 0)
+                {
+                    long kUintsPerLayer = (long)maxTiles * _numKvHeads * _kvarnKeyTileBytes / 4;
+                    long vUintsPerLayer = (long)maxTiles * _numKvHeads * _kvarnValueTileBytes / 4;
+                    _gpuKvarnKTiles = new Tensor[hp.NumLayers];
+                    _gpuKvarnVTiles = new Tensor[hp.NumLayers];
+                    for (int i = 0; i < hp.NumLayers; i++)
+                    {
+                        _gpuKvarnKTiles[i] = gpu.Allocate(TensorShape.D1(kUintsPerLayer));
+                        _gpuKvarnVTiles[i] = gpu.Allocate(TensorShape.D1(vUintsPerLayer));
+                    }
+                    // Compress-kernel working tile — 128×headDim floats per (kv-head, K/V)
+                    // block; lives in VRAM because a 128×128 f32 tile (64 KB) exceeds the
+                    // 48 KB shared-memory ceiling. Shared across layers (single stream).
+                    _kvarnWork = gpu.Allocate(TensorShape.D1(
+                        (long)_numKvHeads * 2 * KVarNCompressor.TileTokens * _headDim));
+                    // Window-shift bounce buffer: after promoting the oldest 128 rows the
+                    // remaining (window − 128) rows shift down; same-buffer overlapping
+                    // memcpy is UB when window > 256, so always bounce through scratch.
+                    int shiftRows = _tqFp32Window - KVarNCompressor.TileTokens;
+                    if (shiftRows > 0)
+                        _kvarnShiftScratch = gpu.Allocate(TensorShape.D1((long)shiftRows * kvDim));
+                }
+                _rotatedQ = gpu.Allocate(TensorShape.D1((long)_numHeads * _headDim));
             }
+            else
+            {
+                // TQ-compressed storage for older positions, stored as uint[] (one block per
+                // (position, kv_head) at byte offset position*numKvHeads*blockBytes + ...).
+                long tqBytesPerPos = (long)_numKvHeads * _tqBlockBytes;
+                long tqUintsPerLayer = (maxTqPositions * tqBytesPerPos + 3) / 4;
+                _gpuTqKCache = new Tensor[hp.NumLayers];
+                _gpuTqVCache = new Tensor[hp.NumLayers];
+                _gpuSignPatterns = new Tensor[hp.NumLayers];
+                for (int i = 0; i < hp.NumLayers; i++)
+                {
+                    _gpuTqKCache[i] = gpu.Allocate(TensorShape.D1(tqUintsPerLayer));
+                    _gpuTqVCache[i] = gpu.Allocate(TensorShape.D1(tqUintsPerLayer));
+                    _gpuSignPatterns[i] = UploadTqSignPatterns(i);
+                }
 
-            // Upload TQ constants to VRAM.
-            var centroids = TurboQuantCodebooks.GetCentroids(tqBits, _headDim).ToArray();
-            _gpuCodebook = gpu.Upload(centroids, TensorShape.D1(centroids.Length));
+                // Upload TQ constants to VRAM.
+                var centroids = TurboQuantCodebooks.GetCentroids(tqBits, _headDim).ToArray();
+                _gpuCodebook = gpu.Upload(centroids, TensorShape.D1(centroids.Length));
 
-            var boundaries = TurboQuantCodebooks.GetBoundaries(tqBits, _headDim).ToArray();
-            _gpuBoundaries = gpu.Upload(boundaries, TensorShape.D1(boundaries.Length));
+                var boundaries = TurboQuantCodebooks.GetBoundaries(tqBits, _headDim).ToArray();
+                _gpuBoundaries = gpu.Upload(boundaries, TensorShape.D1(boundaries.Length));
 
-            _rotatedQ = gpu.Allocate(TensorShape.D1((long)_numHeads * _headDim));
-            _evictK   = gpu.Allocate(TensorShape.D1((long)_numKvHeads * _headDim));
-            _evictV   = gpu.Allocate(TensorShape.D1((long)_numKvHeads * _headDim));
-
+                _rotatedQ = gpu.Allocate(TensorShape.D1((long)_numHeads * _headDim));
+                _evictK   = gpu.Allocate(TensorShape.D1((long)_numKvHeads * _headDim));
+                _evictV   = gpu.Allocate(TensorShape.D1((long)_numKvHeads * _headDim));
+            }
         }
         else
         {
@@ -1518,25 +1646,54 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         else
             _gpu.EmbedLookup(_gpuEmbedding, _hidden, token, _embDim);
 
+        // KVarN whole-tile promotion (issue #180 Task 5b): hoisted OUT of the device
+        // region so the region keeps a static per-phase topology and can be captured
+        // into a CUDA graph. Once per 128 decode steps: compress + shift every layer's
+        // window with direct launches, then advance the shared host state so the region
+        // (graphed or direct) sees clean post-promotion values. All launches/copies are
+        // stream-ordered, so the region's work queues behind the promotion; numerically
+        // identical to the former in-region interleaving (each layer's promotion touches
+        // only that layer's window/tiles, which the region reads afterwards — same
+        // compress inputs, same tile index, same append slot / attention lengths).
+        if (_tqEnabled && _tqQuantizer == TqQuantizer.KVarN && _fp32Count >= _tqFp32Window)
+        {
+            int kvDimP = _numKvHeads * _headDim;
+            for (int layer = 0; layer < _hp.NumLayers; layer++)
+                PromoteKvarnTile(layer, kvDimP);
+            _tqCompressedLen += KVarNCompressor.TileTokens;
+            _fp32Count -= KVarNCompressor.TileTokens;
+        }
+
         // Transformer layers + final norm/output — static topology across tokens (only
-        // `position` varies), so optionally capture it once into a CUDA graph and replay
-        // per token to kill the ~1k-launch/token host overhead (#136/#158). The token-
-        // varying embedding ran above; the TQ ring-advance (host state) and logits
-        // download run after.
+        // `position` varies; KVarN adds three host-tracked scalars, see
+        // TryRunKvarnRegionViaGraph), so optionally capture it once into a CUDA graph
+        // and replay per token to kill the ~1k-launch/token host overhead (#136/#158).
+        // The token-varying embedding ran above; the TQ ring-advance (host state) and
+        // logits download run after.
         if (!TryRunDeviceRegionViaGraph(position))
             RunDeviceRegion(position);
 
         // After all layers have used the same FP32 indices for this token, advance the
         // TQ ring-buffer state (shared across layers). Pure host-state mutation for the
-        // NEXT token — kept outside the captured region (it would break static topology,
-        // and TQ already bails graphs off anyway).
+        // NEXT token — kept outside the captured region (it would break static topology;
+        // the Lloyd-Max ring path also still bails graphs off entirely).
         if (_tqEnabled)
         {
-            if (_fp32Count >= _tqFp32Window)
-                _tqCompressedLen++;
-            _fp32WriteIdx = (_fp32WriteIdx + 1) % _tqFp32Window;
-            if (_fp32Count < _tqFp32Window)
+            if (_tqQuantizer == TqQuantizer.KVarN)
+            {
+                // Whole-tile promotion (if due) already ran BEFORE the region (Task 5b
+                // hoist above, mirroring TurboQuantKvCache.Append's cadence); only the
+                // fresh row's append is left to count here.
                 _fp32Count++;
+            }
+            else
+            {
+                if (_fp32Count >= _tqFp32Window)
+                    _tqCompressedLen++;
+                _fp32WriteIdx = (_fp32WriteIdx + 1) % _tqFp32Window;
+                if (_fp32Count < _tqFp32Window)
+                    _fp32Count++;
+            }
         }
 
         FinishLogits();
@@ -1613,7 +1770,49 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
 
             int kvDim = _numKvHeads * _headDim;
 
-            if (_tqEnabled)
+            if (_tqEnabled && _tqQuantizer == TqQuantizer.KVarN)
+            {
+                // KVarN (issue #180 Task 5a): the FP32 window is LINEAR (slot 0 =
+                // oldest), mirroring the CPU TurboQuantKvCache exactly, so CPU and
+                // CUDA agree position-for-position:
+                //   • the fresh row appends at slot fp32Count;
+                //   • the TQ length only grows in 128-token steps.
+                // Whole-tile promotion is hoisted into Forward (Task 5b) so this
+                // block is capture-clean: appendSlot / fp32SeqLen / tqLen are pure
+                // reads of post-promotion host state, registered as graph-tracked
+                // kernel params during capture (CudaBackend.GraphKvarnTracking).
+                // _fp32Count/_tqCompressedLen advance once per token AFTER the
+                // region (all layers see identical values).
+                int appendSlot = _fp32Count;
+                _gpu.KvAppend(_k, _v, _gpuKCache[layer], _gpuVCache[layer],
+                    kvDim, appendSlot, _tqFp32Window);
+
+                int fp32SeqLen = appendSlot + 1;
+
+                if (_tqCompressedLen == 0)
+                {
+                    // Pre-promotion fast path: everything is FP32 at its natural
+                    // slot, so the plain attention kernel reads the window directly.
+                    _gpu.Attention(_q, _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                        _attnScoresScratch,
+                        _numHeads, _numKvHeads, _headDim, fp32SeqLen, _tqFp32Window);
+                }
+                else
+                {
+                    // Rotate the query (plain WHT, no sign flip) for the fused
+                    // folded-scale tile scoring.
+                    _gpu.KvarnRotateQuery(_q, _rotatedQ!, _numHeads, _headDim);
+
+                    _gpu.KvarnAttention(_q, _rotatedQ!,
+                        _gpuKvarnKTiles![layer], _gpuKvarnVTiles![layer],
+                        _gpuKCache[layer], _gpuVCache[layer], _attnOut,
+                        _attnScoresScratch,
+                        _numHeads, _numKvHeads, _headDim,
+                        _tqCompressedLen, fp32SeqLen, _maxSeqLen,
+                        _kvarnKeyTileBytes, _kvarnValueTileBytes);
+                }
+            }
+            else if (_tqEnabled)
             {
                 long rowBytes = (long)kvDim * sizeof(float);
 
@@ -1712,6 +1911,43 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         GpuMatMul(_logits, _wOutput, _hidden);
     }
 
+    /// <summary>
+    /// KVarN whole-tile promotion (issue #180): compress the oldest 128 rows of
+    /// this layer's linear FP32 window into one packed K tile + one V tile per
+    /// kv-head at tile index <c>_tqCompressedLen / 128</c>, then shift the
+    /// remaining <c>window − 128</c> rows down a whole tile so slot 0 stays the
+    /// oldest position (the CPU TurboQuantKvCache window contract). The shift
+    /// bounces through <see cref="_kvarnShiftScratch"/> because a same-buffer
+    /// overlapping memcpy is undefined once window &gt; 256. All launches/copies
+    /// are stream-ordered, so the compress kernel reads the rows before the
+    /// shift overwrites them. Runs once per 128 decode steps per layer, called
+    /// from <see cref="Forward"/> BEFORE the device region (Task 5b) so the
+    /// region itself stays CUDA-graph-capturable — always direct launches,
+    /// never inside a capture.
+    /// </summary>
+    private void PromoteKvarnTile(int layer, int kvDim)
+    {
+        int tileTokens = KVarNCompressor.TileTokens;
+        int tileIdx = _tqCompressedLen / tileTokens;
+        _gpu.KvarnCompressTile(_gpuKCache[layer], _gpuVCache[layer],
+            _gpuKvarnKTiles![layer], _gpuKvarnVTiles![layer], _kvarnWork!,
+            kvDim, _headDim, tileIdx, _numKvHeads,
+            _kvarnKeyTileBytes, _kvarnValueTileBytes,
+            KVarNCompressor.DefaultSinkhornIterations);
+
+        int shiftRows = _tqFp32Window - tileTokens;
+        if (shiftRows > 0)
+        {
+            long rowBytes = (long)kvDim * sizeof(float);
+            long shiftBytes = shiftRows * rowBytes;
+            long srcOff = tileTokens * rowBytes;
+            _gpu.CopyDeviceRegion(_kvarnShiftScratch!, 0, _gpuKCache[layer], srcOff, shiftBytes);
+            _gpu.CopyDeviceRegion(_gpuKCache[layer], 0, _kvarnShiftScratch!, 0, shiftBytes);
+            _gpu.CopyDeviceRegion(_kvarnShiftScratch!, 0, _gpuVCache[layer], srcOff, shiftBytes);
+            _gpu.CopyDeviceRegion(_gpuVCache[layer], 0, _kvarnShiftScratch!, 0, shiftBytes);
+        }
+    }
+
     // CUDA-graph capture/replay for the non-Gemma dense decode region (#158, mirrors the
     // Gemma TryRunGemma4DeviceRegionViaGraph). Returns true if the logits were produced via
     // the graph (captured on the first eligible token, replayed after); false means the
@@ -1723,10 +1959,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
             return false;
 
         // Graphs bake in the standard decode invariant (fixed topology, seqLen ==
-        // position+1, no host-varying device offsets). Three things break that and must
-        // bail to direct launches:
-        //  • TurboQuant — extra host-synced rotate/compress ops + a ring whose advance is
-        //    host state (the if/else attention branch also flips once a row evicts).
+        // position+1, no host-varying device offsets). Things that break that must
+        // bail to direct launches (or take a dedicated graph path):
+        //  • TurboQuant Lloyd-Max — extra host-synced rotate/compress ops + a ring whose
+        //    advance is host state (the if/else attention branch also flips once a row
+        //    evicts). KVarN (issue #180 Task 5b) instead dispatches to its own per-phase
+        //    graphs below: its promotion is hoisted out of the region and its three
+        //    host-varying scalars ride as tracked kernel params.
         //  • An actual SnapKV eviction — the cache is compacted, so cache-fill != absolute
         //    position. A configured-but-unevicted budget keeps _kvEvictedCount == 0 and is
         //    fine (the cache still fills sequentially).
@@ -1739,7 +1978,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         //  • Active hidden-state taps (PR #413) — the per-layer tap Download both
         //    syncs mid-region (illegal during capture) and would need a
         //    position-varying memcpy destination a replayed graph can't retarget.
-        if (_tqEnabled || _kvEvictedCount > 0 || _snapKvCaptureSlot >= 0 || _isMoE
+        if (_tqEnabled)
+            return _tqQuantizer == TqQuantizer.KVarN && TryRunKvarnRegionViaGraph(position);
+        if (_kvEvictedCount > 0 || _snapKvCaptureSlot >= 0 || _isMoE
             || _taps is not null)
             return false;
 
@@ -1782,6 +2023,104 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
             _gpu.AbortGraphCapture();
             _useCudaGraph = false;
             return false;
+        }
+    }
+
+    // Multi-graph ids for the two KVarN decode phases (issue #180 Task 5b). Negative so
+    // they can never collide with the per-layer ids the GDN-hybrid trunk capture uses.
+    // Internal (not private) so the CUDA KVarN tests can assert the graphs really engaged.
+    internal const int KvarnGraphPre = -101;     // _tqCompressedLen == 0: append + plain attention
+    internal const int KvarnGraphSteady = -102;  // _tqCompressedLen > 0: append + rotate + kvarn attention
+
+    // Instance-level capture latches (mirror _graphCaptured on the dense path): the backend's
+    // per-id graph store outlives this forward pass, so replay must be gated on THIS instance
+    // having captured the entry — a second instance sharing the backend would otherwise replay
+    // a graph whose baked device pointers belong to a disposed sibling.
+    private bool _kvarnPreGraphCaptured;
+    private bool _kvarnSteadyGraphCaptured;
+
+    // CUDA-graph capture/replay for the KVarN decode region (issue #180 Task 5b). The
+    // region has TWO static topologies keyed on the host `_tqCompressedLen == 0` branch:
+    //  • pre-promotion — byte-for-byte the plain fp32 path over the linear window
+    //    (append + plain attention), so it reuses the standard kernels;
+    //  • steady-state — append + rotate-query + hybrid KVarN attention.
+    // Each phase captures once into its own per-id graph and replays thereafter; the
+    // phase flip at the first promotion simply switches which graph replays (the pre
+    // graph stays valid for a post-ResetCache fresh sequence). Whole-tile promotion
+    // (compress + 4 D2D shifts per layer, once per 128 tokens) runs OUTSIDE the graph —
+    // Forward hoists it before this call — so the captured topology never changes.
+    //
+    // Three scalars vary per replay beyond `position` (RoPE): the append slot
+    // (= _fp32Count), the window attention length (= _fp32Count + 1), and the compressed
+    // length (_tqCompressedLen). They ride the same tracked-kernel-param mechanism as
+    // position (GraphKvarnTracking registers them during capture; SetGraphKvarnState
+    // publishes fresh values before every replay). The score-scratch question is moot:
+    // _attnScoresScratch is pre-sized to numHeads × maxSeqLen at construction whenever
+    // maxSeqLen > 4096, its pointer is baked at capture, and the shared-vs-scratch choice
+    // is a runtime branch inside the kernels on the tracked scalars — so one graph stays
+    // valid from capture through the deepest context.
+    //
+    // Returns true if the logits were produced via a graph; false → direct launches.
+    // Any capture/replay failure disables graphs for the session (mirrors the dense path).
+    private bool TryRunKvarnRegionViaGraph(int position)
+    {
+        if (!_useCudaGraph || !_gpu.GraphCaptureSupported)
+            return false;
+
+        // Defensive mirrors of the dense-path bails. All are structurally unreachable
+        // under KVarN today (SnapKV/MoE/taps/batching are rejected up front), but keep
+        // the invariants explicit so a future composition can't silently bake a bad graph.
+        if (_kvEvictedCount > 0 || _snapKvCaptureSlot >= 0 || _isMoE || _taps is not null)
+            return false;
+        if (!_activeSlotIsOwned)
+            return false;
+
+        bool steady = _tqCompressedLen > 0;
+        int graphId = steady ? KvarnGraphSteady : KvarnGraphPre;
+
+        // Publish this token's KVarN host state for the tracked-param rewrite (needed by
+        // both the replay below and the capture's own first launch).
+        _gpu.SetGraphKvarnState(_tqCompressedLen, _fp32Count);
+
+        if ((steady ? _kvarnSteadyGraphCaptured : _kvarnPreGraphCaptured)
+            && _gpu.GraphReadyFor(graphId))
+        {
+            try { _gpu.LaunchGraphForPosition(graphId, position); return true; }
+            catch
+            {
+                _useCudaGraph = false;
+                _kvarnPreGraphCaptured = _kvarnSteadyGraphCaptured = false;
+                return false;
+            }
+        }
+
+        // First token of this phase: pre-grow the Q4_K/Q8_0 dp4a Q8_1 input scratch to the
+        // widest decode matvec BEFORE capture (capture forbids cudaMalloc — mirrors the
+        // dense capture path).
+        _gpu.EnsureQ81Scratch(Math.Max(_embDim, _intermDim));
+
+        try
+        {
+            _gpu.GraphKvarnTracking = true;
+            if (!_gpu.TryBeginGraphCapture(graphId))
+                return false;
+            RunDeviceRegion(position);
+            if (!_gpu.TryEndGraphCaptureAndInstantiate(graphId))
+                return false;
+            _gpu.LaunchGraphForPosition(graphId, position);
+            if (steady) _kvarnSteadyGraphCaptured = true;
+            else _kvarnPreGraphCaptured = true;
+            return true;
+        }
+        catch
+        {
+            _gpu.AbortGraphCapture();
+            _useCudaGraph = false;
+            return false;
+        }
+        finally
+        {
+            _gpu.GraphKvarnTracking = false;
         }
     }
 
@@ -2506,6 +2845,20 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         if (_isGemma4Like)
             _gpu.EnsureQ81Scratch(Math.Max(_embDim, _intermDim));
 
+        // Chunked batched KVarN prefill (issue #180 Task 6): tile-aligned chunks through
+        // the batched trunk (batched QKV/FFN GEMMs + the streaming kvarn prefill-attention
+        // kernel) instead of the graph-replayed per-token loop (~20× on Qwen3-8B). The
+        // startPos check pins the driver's window/tile host state to the append position —
+        // it holds for fresh prefills and post-TruncateTo continuations (TruncateTo resyncs
+        // _fp32Count); anything else falls back to the per-token loop below.
+        if (_tqEnabled && _tqQuantizer == TqQuantizer.KVarN && N >= 2
+            && startPos + N <= _maxSeqLen
+            && startPos == _tqCompressedLen + _fp32Count
+            && IsKvarnBatchedPrefillSupported())
+        {
+            return PrefillKvarnChunked(tokens, startPos);
+        }
+
         // SnapKV (issue #59) gating: only run eviction when this is a fresh
         // prefill (startPos==0), the effective budget is positive (env-set or
         // VRAM-scaled auto), the prompt is long enough that eviction would drop
@@ -2673,6 +3026,90 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         return BatchableWeight(_wOutput);
     }
 
+    /// <summary>
+    /// Whether the issue-#180 Task 6 chunked batched KVarN prefill can run this model.
+    /// The dense-trunk subset of <see cref="IsBatchedPrefillSupported"/> (that gate
+    /// hard-excludes TQ), narrowed further to what the KVarN chunk shapes need:
+    /// <list type="bullet">
+    ///   <item>plain dense trunk — no MoE, no Gemma-4 features (PLE/SWA/shared-KV/
+    ///         per-layer head_dim), no attention bias, NEOX RoPE, weighted-or-no QK-norm;</item>
+    ///   <item>head_dim 64 or 128 — the streaming prefill-attention kernel's shared-memory
+    ///         budget caps at 128 (which also pins V codes to one channel group), and the
+    ///         tqLen==0 chunks ride <see cref="CudaBackend.FlashAttentionPrefillTc2"/>
+    ///         (head_dim % 64); a KVarN model outside that (e.g. head_dim 256) falls back
+    ///         to the per-token loop;</item>
+    ///   <item>the Tc2 flash path enabled (pre-promotion chunks), fp32 KV (the KVarN
+    ///         constructor already rejects narrowed KV), and batchable trunk weights.</item>
+    /// </list>
+    /// </summary>
+    private bool IsKvarnBatchedPrefillSupported()
+    {
+        if (!BatchedPrefillEnabled || !KvarnBatchedPrefillEnabled) return false;
+        if (_isMoE || _isGemma4Like || _hasAttnBias || !_hp.IsNeoxRope) return false;
+        if (_hasQkNorm && _hp.UseL2QkNorm) return false;
+        if (_hp.SlidingWindowSize > 0 || _hp.LayerHeadDim is not null
+            || _hp.KvSourceLayer is not null || _hp.HasPerLayerTokenEmbd) return false;
+        if (_headDim is not (64 or 128)) return false;
+        if (!PrefillFlashTcEnabled || _forceFlashTc1) return false;
+        if (_kvDType != DType.Float32) return false;
+        for (int i = 0; i < _hp.NumLayers; i++)
+        {
+            if (_wv[i] is null) return false;
+            if (!BatchableWeight(_wq[i]) || !BatchableWeight(_wk[i]) || !BatchableWeight(_wv[i]) ||
+                !BatchableWeight(_wo[i]) ||
+                !BatchableWeight(_wGate[i]) || !BatchableWeight(_wUp[i]) ||
+                !BatchableWeight(_wDown[i]))
+                return false;
+        }
+        return BatchableWeight(_wOutput);
+    }
+
+    /// <summary>
+    /// Chunked batched KVarN prefill driver (issue #180 Task 6). Chunks are aligned to the
+    /// whole-tile promotion cadence so every query sees EXACTLY the same tile/window split
+    /// as the per-token loop, and every tile compresses EXACTLY the same 128 window rows:
+    /// <list type="number">
+    ///   <item>while the window is filling (tqLen == 0 for chunk positions &lt; window),
+    ///         one chunk of up to <c>window − fp32Count</c> tokens appends at slots
+    ///         [fp32Count, …) and attends causally within the window (flash);</item>
+    ///   <item>once <c>_fp32Count == window</c>, promote one tile on every layer (the same
+    ///         <see cref="PromoteKvarnTile"/> + host-counter advance the per-token Forward
+    ///         hoist performs — compress inputs are the identical window rows, so tiles are
+    ///         byte-identical given identical K/V), then run the next ≤128-token chunk.</item>
+    /// </list>
+    /// Steady-state chunks are exactly 128 tokens (window − (window − 128)). Each chunk
+    /// runs the standard batched trunk (<see cref="PrefillBatchedTrunk"/>); the KVarN
+    /// append/attention branch inside <see cref="GpuLayerBatchedTrunk"/> reads the stable
+    /// per-chunk <c>_fp32Count</c>/<c>_tqCompressedLen</c>. Direct launches only — decode's
+    /// lazily-captured CUDA graphs are untouched (they capture on the first Forward).
+    /// </summary>
+    private ReadOnlySpan<float> PrefillKvarnChunked(IReadOnlyList<int> tokens, int startPos)
+    {
+        int N = tokens.Count;
+        int[] all = tokens as int[] ?? System.Linq.Enumerable.ToArray(tokens);
+        int kvDimP = _numKvHeads * _headDim;
+        ReadOnlySpan<float> logits = default;
+        int done = 0;
+        while (done < N)
+        {
+            // Whole-tile promotion when the window is full — identical cadence to the
+            // per-token Forward hoist (Task 5b): the promotion runs BEFORE the append
+            // that would overflow, i.e. before chunk position tqLen + window.
+            if (_fp32Count >= _tqFp32Window)
+            {
+                for (int layer = 0; layer < _hp.NumLayers; layer++)
+                    PromoteKvarnTile(layer, kvDimP);
+                _tqCompressedLen += KVarNCompressor.TileTokens;
+                _fp32Count -= KVarNCompressor.TileTokens;
+            }
+            int len = Math.Min(N - done, _tqFp32Window - _fp32Count);
+            logits = PrefillBatchedTrunk(new ArraySegment<int>(all, done, len), startPos + done);
+            _fp32Count += len;
+            done += len;
+        }
+        return logits;
+    }
+
     private void GpuMatMulBatched(Tensor outAll, Tensor weights, Tensor inAll, int n)
     {
         if (s_prefillProfile) { _gpu.Synchronize(); _profMmSw.Restart(); }
@@ -2785,6 +3222,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         _bpNorm     = _gpu.Allocate(TensorShape.D1(emb));
         _bpQ        = _gpu.Allocate(TensorShape.D1((long)n * _numHeads * _maxHeadDim));
         _bpAttnOut  = _gpu.Allocate(TensorShape.D1((long)n * _numHeads * _maxHeadDim));
+        if (_tqEnabled && _tqQuantizer == TqQuantizer.KVarN)
+            _bpRotQ = _gpu.Allocate(TensorShape.D1((long)n * _numHeads * _maxHeadDim));
         _bpK        = _gpu.Allocate(TensorShape.D1((long)n * _numKvHeads * _maxHeadDim));
         _bpV        = _gpu.Allocate(TensorShape.D1((long)n * _numKvHeads * _maxHeadDim));
         _bpFfnGate  = _gpu.Allocate(TensorShape.D1((long)n * _intermDim));
@@ -2812,11 +3251,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
 
     private void FreeBatchedTrunkScratch()
     {
-        foreach (var t in new[] { _bpHidden, _bpResidual, _bpNorm, _bpQ, _bpAttnOut,
+        foreach (var t in new[] { _bpHidden, _bpResidual, _bpNorm, _bpQ, _bpRotQ, _bpAttnOut,
                                   _bpK, _bpV, _bpFfnGate, _bpFfnUp,
                                   _bpProjAll, _bpPleRowAll, _bpPleGate, _bpPleY, _bpPleQuantDev })
             if (t is { } v) _gpu.Free(v);
-        _bpHidden = _bpResidual = _bpNorm = _bpQ = _bpAttnOut = _bpK = _bpV =
+        _bpHidden = _bpResidual = _bpNorm = _bpQ = _bpRotQ = _bpAttnOut = _bpK = _bpV =
             _bpFfnGate = _bpFfnUp = _bpProjAll = _bpPleRowAll = _bpPleGate = _bpPleY =
             _bpPleQuantDev = null;
         _bpPleRowHostAll = null;
@@ -3082,18 +3521,53 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
             _gpu.HeadNormPureBatched(vAll, layerKv, layerHd, N, _hp.RmsNormEps);
         ApplyRopeBatched();
 
-        // Append-target ring (this layer's own KV) and attention-source ring (the effective
-        // layer's — same as `layer` unless shared-KV aliases it). SWA layers wrap a window-
-        // sized ring; everything else is full-context.
-        int appendCtx = isSwa && window > 0 ? SwaRingSize(_maxSeqLen, window) : _maxSeqLen;
-        int effLayerCtx = (_hp.IsSwaLayer is { } swaEff && swaEff[effLayer] && window > 0)
-            ? SwaRingSize(_maxSeqLen, window) : _maxSeqLen;
-        GpuPrefillAppendAttention(
-            qAll, kAll, vAll, attnAll,
-            kvShared ? null : _gpuKCache[layer], kvShared ? null : _gpuVCache[layer],
-            _gpuKCache[effLayer], _gpuVCache[effLayer],
-            _numHeads, layerKv, layerHd, startPos, N,
-            isSwa, window, appendCtx, effLayerCtx);
+        // KVarN chunked prefill (issue #180 Task 6): the fp32 cache is the LINEAR
+        // window (slot 0 = oldest, capacity _tqFp32Window), so the chunk's rows append
+        // at slots [_fp32Count, _fp32Count + N) — the driver guarantees no overflow and
+        // no promotion inside a chunk, so both counters are stable across the layer loop.
+        // Pre-promotion chunks (tqLen == 0: window slot == absolute position) take the
+        // plain streaming flash kernel with startPos remapped to the window slot base;
+        // steady-state chunks rotate the chunk queries (plain WHT — the per-token
+        // KvarnRotateQuery kernel, launched over N·numHeads head-rows) and run the
+        // streaming tile+window kernel. Everything is a direct launch (no graphs).
+        if (_tqEnabled && _tqQuantizer == TqQuantizer.KVarN)
+        {
+            _gpu.KvAppendBatched(kAll, vAll, _gpuKCache[layer], _gpuVCache[layer],
+                kvDimL, _fp32Count, _tqFp32Window, N);
+            if (_tqCompressedLen == 0)
+            {
+                _gpu.FlashAttentionPrefillTc2(qAll, _gpuKCache[layer], _gpuVCache[layer], attnAll,
+                    _numHeads, layerKv, layerHd, _fp32Count, 0, _tqFp32Window, N,
+                    attnScale: _attnScale);
+            }
+            else
+            {
+                var rotAll = _gpu.View(_bpRotQ!, 0, (long)N * qDimL);
+                _gpu.KvarnRotateQuery(qAll, rotAll, _numHeads * N, layerHd);
+                _gpu.KvarnAttentionPrefill(qAll, rotAll,
+                    _gpuKvarnKTiles![layer], _gpuKvarnVTiles![layer],
+                    _gpuKCache[layer], _gpuVCache[layer], attnAll,
+                    _numHeads, layerKv, layerHd,
+                    _tqCompressedLen, _fp32Count, N,
+                    _kvarnKeyTileBytes, _kvarnValueTileBytes);
+                _gpu.Free(rotAll);
+            }
+        }
+        else
+        {
+            // Append-target ring (this layer's own KV) and attention-source ring (the effective
+            // layer's — same as `layer` unless shared-KV aliases it). SWA layers wrap a window-
+            // sized ring; everything else is full-context.
+            int appendCtx = isSwa && window > 0 ? SwaRingSize(_maxSeqLen, window) : _maxSeqLen;
+            int effLayerCtx = (_hp.IsSwaLayer is { } swaEff && swaEff[effLayer] && window > 0)
+                ? SwaRingSize(_maxSeqLen, window) : _maxSeqLen;
+            GpuPrefillAppendAttention(
+                qAll, kAll, vAll, attnAll,
+                kvShared ? null : _gpuKCache[layer], kvShared ? null : _gpuVCache[layer],
+                _gpuKCache[effLayer], _gpuVCache[effLayer],
+                _numHeads, layerKv, layerHd, startPos, N,
+                isSwa, window, appendCtx, effLayerCtx);
+        }
 
         GpuMatMulBatched(_bpHidden!, _wo[layer], attnAll, N);
         if (_wPostAttnNorm is not null)
@@ -3572,6 +4046,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                 $"TruncateTo({length}) cannot rewind into the TQ-compressed region " +
                 $"(tqCompressedLen={_tqCompressedLen}). Speculative decoding can only " +
                 "truncate inside the FP32 recent window.");
+        // KVarN's linear window makes an in-window rewind exact: slot == position −
+        // tqCompressedLen, so dropping the tail is just a count decrement (the ring-based
+        // Lloyd-Max mode has no equivalent resync — pre-existing behavior kept as-is).
+        if (_tqEnabled && _tqQuantizer == TqQuantizer.KVarN)
+            _fp32Count = length - _tqCompressedLen;
         _kvLength = length;
         _kvCache.TruncateTo(length);
         // _kvEvictedCount is intentionally NOT reset here. TruncateTo only rewinds *decode*
@@ -5598,6 +6077,47 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         return Math.Clamp(maxTqPositions + fp32WindowSize, 512, hp.ContextLength);
     }
 
+    /// <summary>
+    /// Context-length estimator for the KVarN quantizer (issue #180 Task 5a): the FP32
+    /// window is fixed at <paramref name="fp32WindowSize"/> positions, the remainder live
+    /// in packed 128-token K4/V2 tiles (≈4.75 + 2.75 bits/element at head_dim 128 —
+    /// ~120 bytes K+V per token per kv-head vs 1024 for FP32 K+V, ≈8.5× in the
+    /// compressed region). Mirrors <see cref="EstimateMaxContextTq"/>'s VRAM
+    /// accounting with KVarN tile pricing.
+    /// </summary>
+    public static int EstimateMaxContextKvarn(GgufModel model, CudaBackend gpu, ModelHyperparams hp,
+        int fp32WindowSize = 256)
+    {
+        long vramBytes = (long)gpu.VramBytes;
+        if (vramBytes <= 0) vramBytes = 8L * 1024 * 1024 * 1024;
+
+        int headDim = hp.HeadDim;
+        long tileBytes = KVarNCompressor.KeyTileSize(headDim) + KVarNCompressor.ValueTileSize(headDim);
+
+        long weightBytes = 0;
+        foreach (var t in model.Tensors)
+            weightBytes += EstimateGpuTensorBytes(t);
+
+        long scratchBytes = (long)(hp.EmbeddingDim * 3 + hp.NumHeads * headDim
+            + hp.NumKvHeads * headDim * 2 + hp.NumHeads * headDim
+            + hp.IntermediateDim * 2 + hp.VocabSize) * sizeof(float);
+
+        long reserved = Math.Max(vramBytes / 3, 2L * 1024 * 1024 * 1024);
+        long available = vramBytes - weightBytes - scratchBytes - reserved;
+        if (available <= 0) available = 64L * 1024 * 1024;
+
+        long fp32Bytes = 2L * hp.NumLayers * hp.NumKvHeads * headDim * sizeof(float) * fp32WindowSize;
+        long bytesPerTile = (long)hp.NumLayers * hp.NumKvHeads * tileBytes; // one K + one V tile = 128 positions
+
+        long availableForTq = available - fp32Bytes;
+        if (availableForTq <= 0) availableForTq = 64L * 1024 * 1024;
+
+        long maxTiles = availableForTq / bytesPerTile;
+        long maxTqPositions = maxTiles * KVarNCompressor.TileTokens;
+        int total = (int)Math.Min(maxTqPositions + fp32WindowSize, int.MaxValue);
+        return Math.Clamp(total, 512, hp.ContextLength);
+    }
+
     private static long EstimateGpuTensorBytes(GgufTensorInfo tensor)
     {
         // Raw-upload dtypes (no CPU dequant): tensor lives on GPU at its native byte size,
@@ -5710,7 +6230,19 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         // per-sequence caches own — nothing to free there.
         if (_raggedAttnScores is { } ras) _gpu.Free(ras);
 
-        if (_tqEnabled)
+        if (_tqEnabled && _tqQuantizer == TqQuantizer.KVarN)
+        {
+            if (_gpuKvarnKTiles is not null)
+                for (int i = 0; i < _hp.NumLayers; i++)
+                {
+                    _gpu.Free(_gpuKvarnKTiles[i]);
+                    _gpu.Free(_gpuKvarnVTiles![i]);
+                }
+            if (_kvarnWork is { } kw) _gpu.Free(kw);
+            if (_kvarnShiftScratch is { } ks) _gpu.Free(ks);
+            _gpu.Free(_rotatedQ!);
+        }
+        else if (_tqEnabled)
         {
             for (int i = 0; i < _hp.NumLayers; i++)
             {

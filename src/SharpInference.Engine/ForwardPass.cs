@@ -622,13 +622,29 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
 
     /// <summary>
     /// Enables TurboQuant KV cache compression. Must be called before any forward pass.
+    /// <paramref name="quantizer"/> selects the compressed-region codec: Lloyd-Max
+    /// FastScan (default, 3-4 bit; <paramref name="bits"/> applies) or KVarN
+    /// (issue #180: 4-bit K / 2-bit V in 128-token tiles; <paramref name="bits"/>
+    /// is ignored). KVarN does not compose with SnapKV eviction yet — the combo
+    /// is rejected here rather than corrupting the cache at Compact time.
+    /// KVarN also shrinks the guaranteed <see cref="TruncateTo"/> rewind depth to
+    /// <paramref name="fp32WindowSize"/> − 127 (whole-tile promotion): keep the
+    /// window well above the draft length when combining with speculative decoding.
     /// </summary>
-    public void EnableTurboQuant(int fp32WindowSize = 256, int bits = 3)
+    public void EnableTurboQuant(int fp32WindowSize = 256, int bits = 3,
+        TqQuantizer quantizer = TqQuantizer.LloydMax)
     {
+        if (quantizer == TqQuantizer.KVarN && _snapKvCfg.Enabled)
+            throw new NotSupportedException(
+                "SnapKV eviction (SHARPI_SNAPKV_BUDGET) is not yet supported with the KVarN quantizer " +
+                "(issue #180 follow-up: Compact-time re-quantization needs whole-tile re-assembly). " +
+                "Unset SHARPI_SNAPKV_BUDGET or use the default Lloyd-Max quantizer.");
+
         _tqKvCache = new TurboQuantKvCache(
             _hp.NumLayers, _ctxLen, _numKvHeads, _headDim,
             Math.Min(fp32WindowSize, _ctxLen), bits,
-            layerIndexBase: 0, totalLayerCountForSeeds: _hp.NumLayers);
+            layerIndexBase: 0, totalLayerCountForSeeds: _hp.NumLayers,
+            quantizer: quantizer);
         _rotatedQuery = Alloc(_numHeads * _headDim);
         _decompBuf = Alloc(_numHeads * _headDim);
     }
@@ -1919,14 +1935,17 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
             float* headRotated = rotated + h * hd;
             float* headDecomp = decomp + h * hd;
 
-            var keyCompressor = tq.GetKeyCompressor(layer, kvHead);
-            keyCompressor.RotateQuery(
+            // Rotate the query into the compressed-domain basis (Lloyd-Max:
+            // per-head sign-flip + WHT; KVarN: plain WHT — issue #180).
+            tq.RotateQuery(layer, kvHead,
                 new ReadOnlySpan<float>(qHead, hd),
                 new Span<float>(headRotated, hd));
 
-            // K-scoring via FastScan (issue #34): tile-walks full 32-position
-            // tiles through an i8-LUT pshufb kernel and falls back to per-block
-            // DequantDot on the <32 staging tail.
+            // K-scoring over the compressed region. Lloyd-Max (issue #34):
+            // tile-walks full 32-position FastScan tiles through an i8-LUT
+            // pshufb kernel and falls back to per-block DequantDot on the <32
+            // staging tail. KVarN (issue #180): whole 128-token tiles via the
+            // fused KVarNCompressor.KeyScores (no staging tail exists).
             tq.ComputeKScores(layer, kvHead, headRotated, scale, headScores);
 
             // Phase 1b: FP32 window positions
@@ -1940,10 +1959,11 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
 
             for (int d = 0; d < hd; d++) outHead[d] = 0;
 
-            // FastScan V-aggregation (issue #34 Phase 3): tile-walks the
-            // TQ-compressed positions with deferred sign-flip + IWHT, then
-            // the FP32-window loop below accumulates the recent positions
-            // on top in the original domain.
+            // V-aggregation over the compressed region: tiles accumulate in the
+            // rotated domain with ONE deferred inverse WHT per head (Lloyd-Max
+            // adds a sign-flip; KVarN uses UnrotateOutput), then the FP32-window
+            // loop below accumulates the recent positions on top in the
+            // original (un-rotated) domain — the domain contract both codecs share.
             tq.ComputeVAggregation(layer, kvHead, headScores, outHead);
 
             for (int t = fp32Start; t < seqLen; t++)

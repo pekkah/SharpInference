@@ -8,4 +8,10 @@
     <ProjectReference Include="..\SharpInference.Core\SharpInference.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- KVarNCompressor.ForceScalar test/bench hook (AVX2-vs-scalar parity + micro-bench). -->
+    <InternalsVisibleTo Include="SharpInference.Tests.TurboQuant" />
+    <InternalsVisibleTo Include="SharpInference.Bench" />
+  </ItemGroup>
+
 </Project>

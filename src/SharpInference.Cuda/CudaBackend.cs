@@ -320,6 +320,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _tqRotateQueryKernel;
     private nint   _tqKvAppendKernel;
     private nint   _tqAttentionKernel;
+    // KVarN quantizer kernels (issue #180 Task 5a; prefill twin Task 6).
+    private nint   _kvarnRotateQueryKernel;
+    private nint   _kvarnCompressTileKernel;
+    private nint   _kvarnAttentionKernel;
+    private nint   _kvarnPrefillAttentionKernel;
 
     // qwen35moe Gated-DeltaNet (GDN) kernels.
     private nint   _siluInplaceKernel;
@@ -1150,8 +1155,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private readonly List<GraphPosNode> _graphPosNodes = new();
     // Upper bound on a tracked kernel's arg count — sizes the reusable stackalloc cell/ptr
     // buffers in LaunchGraphForPosition and bounds the per-node snapshot in TrackPositionNode.
-    // The widest position-varying op (AttentionSwa) has 12 args; 16 leaves headroom.
-    private const int GraphMaxKernelArgs = 16;
+    // The widest position-varying op (llm_kvarn_attention) has 16 args; 20 leaves headroom.
+    // Exceeding this fails capture gracefully (session falls back to direct launches) but
+    // with no build-time signal — keep the widest-op note current when adding args.
+    private const int GraphMaxKernelArgs = 20;
 
     /// <summary>True while a graph capture is in progress on <see cref="Stream"/>.</summary>
     public bool GraphCapturing => _graphCapturing;
@@ -1176,7 +1183,16 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     // no capture is open or the legacy single-graph (no-arg) capture is the one in flight.
     private int _capturingGraphId = int.MinValue;
 
-    private enum GraphPosKind { Position, PositionPlus1, SwaWindowStart, SwaWindowEnd }
+    // KvarnAppendSlot / KvarnFp32SeqLen / KvarnTqLen (issue #180 Task 5b): KVarN decode
+    // params that vary per token but are NOT pure functions of position — the linear FP32
+    // window count and the compressed length advance on the host (window count drops by a
+    // whole 128-token tile at each promotion). The engine publishes them per replay via
+    // SetGraphKvarnState; the kinds resolve against those fields in LaunchGraphNodes.
+    private enum GraphPosKind
+    {
+        Position, PositionPlus1, SwaWindowStart, SwaWindowEnd,
+        KvarnAppendSlot, KvarnFp32SeqLen, KvarnTqLen,
+    }
 
     // One captured kernel node whose params carry per-token-varying position scalars.
     private sealed class GraphPosNode
@@ -1186,6 +1202,31 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         public uint Gx, Gy, Gz, Bx, By, Bz, Sh;
         public nint[] ArgValues = [];                         // snapshot of every kernel-arg cell
         public (int Slot, GraphPosKind Kind, int Window)[] Updates = [];
+    }
+
+    // ── KVarN graph state (issue #180 Task 5b) ──
+    // While a KVarN decode region is being captured, the position-varying ops it shares
+    // with the plain path (KvAppend, Attention) must register their seqLen/slot args with
+    // the Kvarn* kinds above instead of Position/PositionPlus1 — the KVarN append slot is
+    // the window fill count, not the absolute position. The engine flips GraphKvarnTracking
+    // on around capture only; replay resolves the kinds from the SetGraphKvarnState values.
+    private bool _graphKvarnTrack;
+    private int _graphKvarnTqLen;
+    private int _graphKvarnFp32Count;
+
+    /// <summary>Register KVarN-tracked (window-relative) graph params during capture —
+    /// set true only while capturing a KVarN decode region (issue #180 Task 5b).</summary>
+    public bool GraphKvarnTracking { get => _graphKvarnTrack; set => _graphKvarnTrack = value; }
+
+    /// <summary>Publish the KVarN host state a graph replay should bake into its tracked
+    /// kernel-node params: <paramref name="tqLen"/> = compressed positions (whole tiles),
+    /// <paramref name="fp32Count"/> = window rows already appended (also this token's
+    /// append slot; the attention length is <c>fp32Count + 1</c>). Call before every
+    /// <see cref="LaunchGraphForPosition(int,int)"/> of a KVarN graph.</summary>
+    public void SetGraphKvarnState(int tqLen, int fp32Count)
+    {
+        _graphKvarnTqLen = tqLen;
+        _graphKvarnFp32Count = fp32Count;
     }
 
     // Pack a float's bit pattern into an arg cell (the kernel reads its low 4 bytes).
@@ -1377,11 +1418,14 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             foreach (var u in n.Updates)
                 cells[u.Slot] = u.Kind switch
                 {
-                    GraphPosKind.Position       => position,
-                    GraphPosKind.PositionPlus1  => position + 1,
-                    GraphPosKind.SwaWindowStart => Math.Max(0, position + 1 - u.Window),
-                    GraphPosKind.SwaWindowEnd   => position + 1,
-                    _                           => cells[u.Slot],
+                    GraphPosKind.Position        => position,
+                    GraphPosKind.PositionPlus1   => position + 1,
+                    GraphPosKind.SwaWindowStart  => Math.Max(0, position + 1 - u.Window),
+                    GraphPosKind.SwaWindowEnd    => position + 1,
+                    GraphPosKind.KvarnAppendSlot => _graphKvarnFp32Count,
+                    GraphPosKind.KvarnFp32SeqLen => _graphKvarnFp32Count + 1,
+                    GraphPosKind.KvarnTqLen      => _graphKvarnTqLen,
+                    _                            => cells[u.Slot],
                 };
             for (int i = 0; i < cnt; i++) ptrs[i] = (nint)(cells + i);
 
@@ -4526,7 +4570,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             Span<nint> av = stackalloc nint[7];
             av[0] = kPtr; av[1] = vPtr; av[2] = kcP; av[3] = vcP;
             av[4] = pKD; av[5] = pPos; av[6] = pMSL;
-            TrackPositionNode(_kvAppendKernel, grid, 1, 1, 256, 1, 1, 0, av, [(5, GraphPosKind.Position, 0)]);
+            // KVarN capture (issue #180 Task 5b): the append slot is the window fill
+            // count (host state), not the absolute position — track it as such.
+            TrackPositionNode(_kvAppendKernel, grid, 1, 1, 256, 1, 1, 0, av,
+                [(5, _graphKvarnTrack ? GraphPosKind.KvarnAppendSlot : GraphPosKind.Position, 0)]);
         }
     }
 
@@ -4571,9 +4618,10 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             av[0] = qP; av[1] = kP; av[2] = vP; av[3] = oP; av[4] = ssP;
             av[5] = pNH; av[6] = pNKV; av[7] = pHD; av[8] = pSL; av[9] = pMSL;
             av[10] = GraphFloatBits(pScale);
-            // pSL = seqLen = position + 1 in the decode path.
+            // pSL = seqLen = position + 1 in the decode path; under a KVarN capture
+            // (issue #180 Task 5b) it is the window fill count + 1 instead.
             TrackPositionNode(_attentionKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, av,
-                [(8, GraphPosKind.PositionPlus1, 0)]);
+                [(8, _graphKvarnTrack ? GraphPosKind.KvarnFp32SeqLen : GraphPosKind.PositionPlus1, 0)]);
         }
     }
 
@@ -6057,6 +6105,195 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(tq_attention) failed: {r}");
     }
 
+    // ================================================================
+    //  KVarN KV-cache compression (issue #180 Task 5a)
+    // ================================================================
+
+    /// <summary>
+    /// Rotate query vectors for KVarN attention: the normalized Walsh-Hadamard
+    /// transform per query head, no sign flip (KVarN has none). Call once per
+    /// layer before <see cref="KvarnAttention"/>. head_dim must be a power of
+    /// two in [8, 256].
+    /// </summary>
+    public void KvarnRotateQuery(Tensor qInput, Tensor rotatedQ, int numHeads, int headDim)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint qP  = GetDevPtr(qInput);
+        nint rqP = GetDevPtr(rotatedQ);
+        int  pNH = numHeads, pHD = headDim;
+        nint* args = stackalloc nint[4]
+        {
+            (nint)(&qP), (nint)(&rqP), (nint)(&pNH), (nint)(&pHD)
+        };
+        int r = NvrtcInterop.LaunchKernel(_kvarnRotateQueryKernel,
+            (uint)numHeads, 1, 1, (uint)headDim, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kvarn_rotate_query) failed: {r}");
+    }
+
+    /// <summary>
+    /// Compress the oldest 128 rows of a layer's linear FP32 window (row 0 =
+    /// oldest) into one KVarN K tile + one V tile per kv-head, written at
+    /// <paramref name="tileIdx"/> in the packed tile stores (KVarNCompressor
+    /// byte layout, stride = tile bytes × numKvHeads per tile index).
+    /// <paramref name="work"/> must hold <c>numKvHeads × 2 × 128 × headDim</c>
+    /// floats of global scratch (the 128×headDim working tile exceeds the 48 KB
+    /// shared-memory ceiling, so normalization runs out of VRAM — promotion is
+    /// once per 128 decode steps per layer, so this is amortized).
+    /// </summary>
+    public void KvarnCompressTile(Tensor kWindow, Tensor vWindow, Tensor kTiles, Tensor vTiles,
+                                  Tensor work, int kvDim, int headDim, int tileIdx,
+                                  int numKvHeads, int kTileBytes, int vTileBytes,
+                                  int sinkhornIterations)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint kwP = GetDevPtr(kWindow);
+        nint vwP = GetDevPtr(vWindow);
+        nint ktP = GetDevPtr(kTiles);
+        nint vtP = GetDevPtr(vTiles);
+        nint wP  = GetDevPtr(work);
+        int  pKD = kvDim, pHD = headDim, pTI = tileIdx, pNKV = numKvHeads,
+             pKTB = kTileBytes, pVTB = vTileBytes, pSI = sinkhornIterations;
+        nint* args = stackalloc nint[12]
+        {
+            (nint)(&kwP), (nint)(&vwP), (nint)(&ktP), (nint)(&vtP), (nint)(&wP),
+            (nint)(&pKD), (nint)(&pHD), (nint)(&pTI), (nint)(&pNKV),
+            (nint)(&pKTB), (nint)(&pVTB), (nint)(&pSI)
+        };
+        // blockIdx.y: 0 = K tile, 1 = V tile; 128 threads cover the widest
+        // butterfly (head_dim 256 → 128 pairs) and one thread per token row.
+        int r = NvrtcInterop.LaunchKernel(_kvarnCompressTileKernel,
+            (uint)numKvHeads, 2, 1, 128, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kvarn_compress_tile) failed: {r}");
+    }
+
+    /// <summary>
+    /// Hybrid KVarN attention: scaled dot-product attention over the KVarN
+    /// compressed tiles plus the linear FP32 recent-window cache.
+    /// <paramref name="tqSeqLen"/> must be a whole multiple of 128 (the KVarN
+    /// cache invariant). Same scores-scratch contract as <see cref="TqAttention"/>:
+    /// ignored while <c>tqSeqLen + fp32SeqLen ≤ 4096</c>, required (sized
+    /// <c>numHeads × maxSeqLen</c>) above.
+    /// </summary>
+    public void KvarnAttention(Tensor q, Tensor rotatedQ, Tensor kTiles, Tensor vTiles,
+                               Tensor kCacheFp32, Tensor vCacheFp32, Tensor output,
+                               Tensor? scoresScratch,
+                               int numHeads, int numKvHeads, int headDim,
+                               int tqSeqLen, int fp32SeqLen, int maxSeqLen,
+                               int kTileBytes, int vTileBytes)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+
+        nint qP   = GetDevPtr(q);
+        nint rqP  = GetDevPtr(rotatedQ);
+        nint ktP  = GetDevPtr(kTiles);
+        nint vtP  = GetDevPtr(vTiles);
+        nint kfP  = GetDevPtr(kCacheFp32);
+        nint vfP  = GetDevPtr(vCacheFp32);
+        nint oP   = GetDevPtr(output);
+        nint ssP  = scoresScratch is { } sv ? GetDevPtr(sv) : nint.Zero;
+        int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim,
+             pTQ = tqSeqLen, pFP = fp32SeqLen, pMSL = maxSeqLen,
+             pKTB = kTileBytes, pVTB = vTileBytes;
+        nint* args = stackalloc nint[16]
+        {
+            (nint)(&qP), (nint)(&rqP),
+            (nint)(&ktP), (nint)(&vtP),
+            (nint)(&kfP), (nint)(&vfP),
+            (nint)(&oP),  (nint)(&ssP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pTQ), (nint)(&pFP),  (nint)(&pMSL),
+            (nint)(&pKTB), (nint)(&pVTB)
+        };
+        int r = NvrtcInterop.LaunchKernel(_kvarnAttentionKernel,
+            (uint)numHeads, 1, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kvarn_attention) failed: {r}");
+
+        // Steady-state KVarN graph capture (issue #180 Task 5b): tqSeqLen (arg 11) and
+        // fp32SeqLen (arg 12) advance on the host per token/promotion, so replay rewrites
+        // them from the SetGraphKvarnState values. Grid/shared are fixed; the shared-vs-
+        // scratch score choice is a runtime branch inside the kernel on those scalars, so
+        // a graph captured under 4096 total positions stays valid past it (the scratch
+        // pointer is pre-sized to max_seq_len at construction and baked at capture).
+        if (_graphCapturing)
+        {
+            Span<nint> av = stackalloc nint[16];
+            av[0] = qP;  av[1] = rqP; av[2] = ktP; av[3] = vtP;
+            av[4] = kfP; av[5] = vfP; av[6] = oP;  av[7] = ssP;
+            av[8] = pNH; av[9] = pNKV; av[10] = pHD;
+            av[11] = pTQ; av[12] = pFP; av[13] = pMSL;
+            av[14] = pKTB; av[15] = pVTB;
+            TrackPositionNode(_kvarnAttentionKernel, (uint)numHeads, 1, 1, 256, 1, 1, 0, av,
+                [(11, GraphPosKind.KvarnTqLen, 0), (12, GraphPosKind.KvarnFp32SeqLen, 0)]);
+        }
+    }
+
+    /// <summary>
+    /// Batched-query KVarN chunked-prefill attention (issue #180 Task 6): the
+    /// <paramref name="nTok"/> chunk queries (token-major <c>[nTok × numHeads·headDim]</c>,
+    /// already appended to the linear FP32 window at slots
+    /// <c>[fp32Base, fp32Base + nTok)</c>) each attend to ALL
+    /// <paramref name="tqSeqLen"/> compressed-tile positions plus the window slots
+    /// <c>[0, fp32Base + i]</c> (causal), via a streaming softmax — no score
+    /// storage, so there is no 4096-position cap. <paramref name="tqSeqLen"/> must
+    /// be a positive whole-tile multiple (the tqSeqLen == 0 chunk shape is the
+    /// plain flash prefill); <paramref name="headDim"/> a power of two ≤ 128 (the
+    /// kernel's shared-memory budget, which also pins the V codes to one
+    /// 128-channel group). Never captured — prefill runs outside CUDA graphs.
+    /// </summary>
+    public void KvarnAttentionPrefill(Tensor qAll, Tensor rotatedQAll, Tensor kTiles, Tensor vTiles,
+                                      Tensor kWindow, Tensor vWindow, Tensor outAll,
+                                      int numHeads, int numKvHeads, int headDim,
+                                      int tqSeqLen, int fp32Base, int nTok,
+                                      int kTileBytes, int vTileBytes)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (headDim > 128 || (headDim & (headDim - 1)) != 0)
+            throw new NotSupportedException(
+                $"KvarnAttentionPrefill requires a power-of-2 head_dim ≤ 128 (shared-memory budget); got {headDim}.");
+        if (tqSeqLen <= 0 || (tqSeqLen & 127) != 0)
+            throw new ArgumentOutOfRangeException(nameof(tqSeqLen), tqSeqLen,
+                "tqSeqLen must be a positive multiple of 128 (use the flash prefill kernel while no tile exists).");
+        if (nTok <= 0)
+            throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be > 0.");
+        if (fp32Base < 0)
+            throw new ArgumentOutOfRangeException(nameof(fp32Base), fp32Base, "fp32Base must be >= 0.");
+
+        nint qP  = GetDevPtr(qAll);
+        nint rqP = GetDevPtr(rotatedQAll);
+        nint ktP = GetDevPtr(kTiles);
+        nint vtP = GetDevPtr(vTiles);
+        nint kwP = GetDevPtr(kWindow);
+        nint vwP = GetDevPtr(vWindow);
+        nint oP  = GetDevPtr(outAll);
+        int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim,
+             pTQ = tqSeqLen, pF0 = fp32Base, pN = nTok,
+             pKTB = kTileBytes, pVTB = vTileBytes;
+        nint* args = stackalloc nint[15]
+        {
+            (nint)(&qP), (nint)(&rqP),
+            (nint)(&ktP), (nint)(&vtP),
+            (nint)(&kwP), (nint)(&vwP),
+            (nint)(&oP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pTQ), (nint)(&pF0), (nint)(&pN),
+            (nint)(&pKTB), (nint)(&pVTB)
+        };
+        uint gy = (uint)((nTok + 15) / 16);   // KPF_MQ = 16 queries per block
+        int r = NvrtcInterop.LaunchKernel(_kvarnPrefillAttentionKernel,
+            (uint)numHeads, gy, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kvarn_prefill_attention) failed: {r}");
+    }
+
     /// <summary>Look up one row from an F32 embedding table into <paramref name="output"/>.</summary>
     public void EmbedLookup(Tensor embTable, Tensor output, int tokenId, int embDim)
     {
@@ -7128,6 +7365,9 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _clearF32Kernel, _gatherRowsKernel, _scatterRowsKernel, _quantizeQ81Kernel,
             _scaleRowsKernel, _moeWeightedReduceKernel,
             _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
+            _kvarnRotateQueryKernel, _kvarnCompressTileKernel, _kvarnAttentionKernel,   // #180
+            _kvarnPrefillAttentionKernel,                                               // #180 Task 6
+
             _siluInplaceKernel, _gdnConv1dDecodeKernel, _gdnL2NormPerHeadKernel,
             _gdnTileHeadsKernel, _gdnRecurrenceDecodeKernel,
             _gdnRecurrenceDecodeFastKernel, _gdnDecodeNormGateKernel,   // #404
@@ -7344,6 +7584,12 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _tqRotateQueryKernel = GetKernelFunc("llm_tq_rotate_query");
         _tqKvAppendKernel    = GetKernelFunc("llm_tq_kv_append");
         _tqAttentionKernel   = GetKernelFunc("llm_tq_attention");
+
+        // KVarN quantizer kernels (issue #180 Task 5a).
+        _kvarnRotateQueryKernel  = GetKernelFunc("llm_kvarn_rotate_query");
+        _kvarnCompressTileKernel = GetKernelFunc("llm_kvarn_compress_tile");
+        _kvarnAttentionKernel    = GetKernelFunc("llm_kvarn_attention");
+        _kvarnPrefillAttentionKernel = GetKernelFunc("llm_kvarn_prefill_attention");
 
         // qwen35moe GDN kernels.
         _siluInplaceKernel        = GetKernelFunc("llm_silu_inplace");

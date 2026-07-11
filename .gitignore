@@ -455,3 +455,9 @@ prof/
 # Gemma 4 vision parity golden — large binary, regenerable via scripts/gemma4uv_ref.py (issue #250).
 # meta.json (the spec) stays tracked.
 tests/fixtures/gemma4uv/*.f32
+
+# KVarN P0 gate corpus + run outputs (issue #180) — fetched by scripts/kvarn-gate/get-wikitext2.ps1
+scripts/kvarn-gate/wiki.test.raw
+scripts/kvarn-gate/wikitext-2-raw-v1.zip
+scripts/kvarn-gate/.wikitext-extract/
+scripts/kvarn-gate/results/
