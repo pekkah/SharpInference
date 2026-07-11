@@ -320,10 +320,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _tqRotateQueryKernel;
     private nint   _tqKvAppendKernel;
     private nint   _tqAttentionKernel;
-    // KVarN quantizer kernels (issue #180 Task 5a).
+    // KVarN quantizer kernels (issue #180 Task 5a; prefill twin Task 6).
     private nint   _kvarnRotateQueryKernel;
     private nint   _kvarnCompressTileKernel;
     private nint   _kvarnAttentionKernel;
+    private nint   _kvarnPrefillAttentionKernel;
 
     // qwen35moe Gated-DeltaNet (GDN) kernels.
     private nint   _siluInplaceKernel;
@@ -6234,6 +6235,65 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         }
     }
 
+    /// <summary>
+    /// Batched-query KVarN chunked-prefill attention (issue #180 Task 6): the
+    /// <paramref name="nTok"/> chunk queries (token-major <c>[nTok × numHeads·headDim]</c>,
+    /// already appended to the linear FP32 window at slots
+    /// <c>[fp32Base, fp32Base + nTok)</c>) each attend to ALL
+    /// <paramref name="tqSeqLen"/> compressed-tile positions plus the window slots
+    /// <c>[0, fp32Base + i]</c> (causal), via a streaming softmax — no score
+    /// storage, so there is no 4096-position cap. <paramref name="tqSeqLen"/> must
+    /// be a positive whole-tile multiple (the tqSeqLen == 0 chunk shape is the
+    /// plain flash prefill); <paramref name="headDim"/> a power of two ≤ 128 (the
+    /// kernel's shared-memory budget, which also pins the V codes to one
+    /// 128-channel group). Never captured — prefill runs outside CUDA graphs.
+    /// </summary>
+    public void KvarnAttentionPrefill(Tensor qAll, Tensor rotatedQAll, Tensor kTiles, Tensor vTiles,
+                                      Tensor kWindow, Tensor vWindow, Tensor outAll,
+                                      int numHeads, int numKvHeads, int headDim,
+                                      int tqSeqLen, int fp32Base, int nTok,
+                                      int kTileBytes, int vTileBytes)
+    {
+        EnsureImageKernels();
+        if (!_imageKernelsAvailable)
+            throw new NotSupportedException("NVRTC kernels are not available.");
+        if (headDim > 128 || (headDim & (headDim - 1)) != 0)
+            throw new NotSupportedException(
+                $"KvarnAttentionPrefill requires a power-of-2 head_dim ≤ 128 (shared-memory budget); got {headDim}.");
+        if (tqSeqLen <= 0 || (tqSeqLen & 127) != 0)
+            throw new ArgumentOutOfRangeException(nameof(tqSeqLen), tqSeqLen,
+                "tqSeqLen must be a positive multiple of 128 (use the flash prefill kernel while no tile exists).");
+        if (nTok <= 0)
+            throw new ArgumentOutOfRangeException(nameof(nTok), nTok, "nTok must be > 0.");
+        if (fp32Base < 0)
+            throw new ArgumentOutOfRangeException(nameof(fp32Base), fp32Base, "fp32Base must be >= 0.");
+
+        nint qP  = GetDevPtr(qAll);
+        nint rqP = GetDevPtr(rotatedQAll);
+        nint ktP = GetDevPtr(kTiles);
+        nint vtP = GetDevPtr(vTiles);
+        nint kwP = GetDevPtr(kWindow);
+        nint vwP = GetDevPtr(vWindow);
+        nint oP  = GetDevPtr(outAll);
+        int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim,
+             pTQ = tqSeqLen, pF0 = fp32Base, pN = nTok,
+             pKTB = kTileBytes, pVTB = vTileBytes;
+        nint* args = stackalloc nint[15]
+        {
+            (nint)(&qP), (nint)(&rqP),
+            (nint)(&ktP), (nint)(&vtP),
+            (nint)(&kwP), (nint)(&vwP),
+            (nint)(&oP),
+            (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
+            (nint)(&pTQ), (nint)(&pF0), (nint)(&pN),
+            (nint)(&pKTB), (nint)(&pVTB)
+        };
+        uint gy = (uint)((nTok + 15) / 16);   // KPF_MQ = 16 queries per block
+        int r = NvrtcInterop.LaunchKernel(_kvarnPrefillAttentionKernel,
+            (uint)numHeads, gy, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(kvarn_prefill_attention) failed: {r}");
+    }
+
     /// <summary>Look up one row from an F32 embedding table into <paramref name="output"/>.</summary>
     public void EmbedLookup(Tensor embTable, Tensor output, int tokenId, int embDim)
     {
@@ -7306,6 +7366,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _scaleRowsKernel, _moeWeightedReduceKernel,
             _tqRotateQueryKernel, _tqKvAppendKernel, _tqAttentionKernel,
             _kvarnRotateQueryKernel, _kvarnCompressTileKernel, _kvarnAttentionKernel,   // #180
+            _kvarnPrefillAttentionKernel,                                               // #180 Task 6
 
             _siluInplaceKernel, _gdnConv1dDecodeKernel, _gdnL2NormPerHeadKernel,
             _gdnTileHeadsKernel, _gdnRecurrenceDecodeKernel,
@@ -7528,6 +7589,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _kvarnRotateQueryKernel  = GetKernelFunc("llm_kvarn_rotate_query");
         _kvarnCompressTileKernel = GetKernelFunc("llm_kvarn_compress_tile");
         _kvarnAttentionKernel    = GetKernelFunc("llm_kvarn_attention");
+        _kvarnPrefillAttentionKernel = GetKernelFunc("llm_kvarn_prefill_attention");
 
         // qwen35moe GDN kernels.
         _siluInplaceKernel        = GetKernelFunc("llm_silu_inplace");
