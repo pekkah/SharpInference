@@ -6071,7 +6071,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     /// </summary>
     public void TqAttention(Tensor q, Tensor rotatedQ, Tensor kCacheTq, Tensor vCacheTq,
                             Tensor kCacheFp32, Tensor vCacheFp32, Tensor output, Tensor codebook,
-                            Tensor? scoresScratch,
+                            Tensor signPatterns, Tensor? scoresScratch,
                             int numHeads, int numKvHeads, int headDim,
                             int tqSeqLen, int fp32SeqLen, int maxSeqLen, int blockBytes)
     {
@@ -6087,16 +6087,17 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         nint vfP  = GetDevPtr(vCacheFp32);
         nint oP   = GetDevPtr(output);
         nint cbP  = GetDevPtr(codebook);
+        nint spP  = GetDevPtr(signPatterns);
         nint ssP  = scoresScratch is { } sv ? GetDevPtr(sv) : nint.Zero;
         int  pNH = numHeads, pNKV = numKvHeads, pHD = headDim,
              pTQ = tqSeqLen, pFP = fp32SeqLen, pMSL = maxSeqLen, pBB = blockBytes;
-        nint* args = stackalloc nint[16]
+        nint* args = stackalloc nint[17]
         {
             (nint)(&qP), (nint)(&rqP),
             (nint)(&kctP), (nint)(&vctP),
             (nint)(&kfP),  (nint)(&vfP),
             (nint)(&oP),   (nint)(&cbP),
-            (nint)(&ssP),
+            (nint)(&spP),  (nint)(&ssP),
             (nint)(&pNH), (nint)(&pNKV), (nint)(&pHD),
             (nint)(&pTQ), (nint)(&pFP),  (nint)(&pMSL), (nint)(&pBB)
         };

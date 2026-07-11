@@ -2895,11 +2895,11 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
     /// </summary>
     public void TqAttention(Tensor q, Tensor rotatedQ, Tensor kCacheTq, Tensor vCacheTq,
         Tensor kCacheFp16, Tensor vCacheFp16, Tensor output, Tensor codebook,
-        Tensor scoresScratch,
+        Tensor signPatterns, Tensor scoresScratch,
         uint numHeads, uint numKvHeads, uint headDim,
         uint tqSeqLen, uint fp16SeqLen, uint maxSeqLen, uint blockBytes)
     {
-        _tqAttentionPipeline ??= new ComputePipeline(this, Shaders.TqAttention, 9, pushConstantSize: sizeof(TqAttentionParams));
+        _tqAttentionPipeline ??= new ComputePipeline(this, Shaders.TqAttention, 10, pushConstantSize: sizeof(TqAttentionParams));
         var p = new TqAttentionParams
         {
             numHeads = numHeads, numKvHeads = numKvHeads, headDim = headDim,
@@ -2908,7 +2908,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend, IImageOpsBackend, ID
         DispatchOrRecord(_tqAttentionPipeline,
             [GetBuffer(q), GetBuffer(rotatedQ), GetBuffer(kCacheTq), GetBuffer(vCacheTq),
              GetBuffer(kCacheFp16), GetBuffer(vCacheFp16), GetBuffer(output), GetBuffer(codebook),
-             GetBuffer(scoresScratch)],
+             GetBuffer(scoresScratch), GetBuffer(signPatterns)],
             numHeads, &p);
     }
 

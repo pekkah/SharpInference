@@ -4810,6 +4810,7 @@ internal static class Shaders
         layout(binding = 6) buffer Out                    { float out_data[]; };
         layout(binding = 7) readonly buffer Codebook      { float codebook[8]; };
         layout(binding = 8) buffer ScoresScratch          { float scores_scratch[]; };
+        layout(binding = 9) readonly buffer Signs         { float sign_patterns[]; };
 
         layout(push_constant) uniform Params {
             uint num_heads;
@@ -4932,10 +4933,15 @@ internal static class Shaders
             barrier();
 
             // ─── Phase 3: weighted V sum into output[head, :] ───
-            for (uint d = tid; d < head_dim; d += 256) {
-                float sum_val = 0.0;
+            // The TQ V codes are stored ROTATED (TqKvAppend applies WHT·1/sqrt(D)·sign
+            // to V), so the compressed-region aggregate is built in the rotated domain,
+            // un-rotated ONCE per head (deferred sign flip + inverse WHT — issue #435),
+            // then the FP16 recent-window contribution adds on top in the original domain.
 
-                // TQ-compressed positions.
+            // 3a — compressed-region aggregate in the rotated domain (sdata reused;
+            // head_dim ≤ 256 → one slot per output dim).
+            for (uint d = tid; d < head_dim; d += 256) {
+                float acc = 0.0;
                 for (uint t = 0; t < tq_seq_len; t++) {
                     float weight = use_shared ? scores[t] : scores_scratch[scratch_base + t];
 
@@ -4951,10 +4957,33 @@ internal static class Shaders
                     if (bit_off > 29u) raw |= v_cache_tq[word_idx + 1u] << (32u - bit_off);
                     int idx = int(raw & 0x7u);
 
-                    sum_val += weight * codebook[idx] * norm;
+                    acc += weight * codebook[idx] * norm;
                 }
+                sdata[d] = acc;
+            }
+            barrier();
 
-                // FP16 recent-window positions.
+            // 3b — deferred sign flip + inverse WHT (once per head). v = Hn·D·rot_acc:
+            // the per-head sign pattern first, then the normalized WHT (an involution;
+            // 1/sqrt(D) folded in at readout below).
+            uint sign_off = kv_head * head_dim;
+            if (tid < head_dim) sdata[tid] *= sign_patterns[sign_off + tid];
+            barrier();
+            for (uint stride = head_dim >> 1u; stride >= 1u; stride >>= 1u) {
+                if (tid < (head_dim >> 1u)) {
+                    uint pair = (tid / stride) * (stride * 2u) + (tid % stride);
+                    float a = sdata[pair];
+                    float b = sdata[pair + stride];
+                    sdata[pair] = a + b;
+                    sdata[pair + stride] = a - b;
+                }
+                barrier();
+            }
+            float wht_scale = inversesqrt(float(head_dim));
+
+            // 3c — FP16 recent-window V contribution (original domain) + output write.
+            for (uint d = tid; d < head_dim; d += 256) {
+                float sum_val = (tq_seq_len > 0u) ? sdata[d] * wht_scale : 0.0;
                 for (uint t = 0; t < fp16_seq_len; t++) {
                     float weight = use_shared
                         ? scores[tq_seq_len + t]

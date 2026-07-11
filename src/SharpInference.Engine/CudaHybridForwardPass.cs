@@ -2228,7 +2228,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             int fp32SeqLen = Math.Min(_gpuFp32Count + 1, _tqFp32Window);
             _gpu.TqAttention(_gpuQ, _gpuRotatedQ!, _gpuTqKCache![i], _gpuTqVCache![i],
                 _gpuKCache[i], _gpuVCache[i], _gpuAttnOut, _gpuCodebook!,
-                _gpuAttnScoresScratch!,
+                _gpuSignPatterns![i], _gpuAttnScoresScratch!,
                 _numHeads, _numKvHeads, _headDim,
                 _gpuTqCompressedLen, fp32SeqLen, _maxSeqLen, _tqBlockBytes);
         }

@@ -6223,6 +6223,7 @@ extern ""C"" __global__ void llm_tq_attention(
     const float* __restrict__ v_cache_fp32,
     float* __restrict__ out,
     const float* __restrict__ codebook,    // 8 centroids for 3-bit
+    const float* __restrict__ sign_patterns, // [num_kv_heads * head_dim] per-head sign flip (deferred V un-rotate)
     float* __restrict__ scores_scratch,    // [num_heads * max_seq_len], null when total_seq ≤ MAX_SHARED_SCORES
     int num_heads, int num_kv_heads, int head_dim,
     int tq_seq_len, int fp32_seq_len, int max_seq_len, int block_bytes)
@@ -6387,13 +6388,18 @@ extern ""C"" __global__ void llm_tq_attention(
 
     // ────────────────────────────────────────────────────────────────────
     //  Phase 3: weighted V sum into output[head, :]
-    //  Each thread owns output dim `d`, iterates positions, reads weight[t]
-    //  and the V value at (t, d). K is NOT re-decompressed here.
+    //  The TQ V codes are stored ROTATED (llm_tq_kv_append applies WHT·1/sqrt(D)·sign
+    //  to V), so the compressed-region aggregate accumulates in the rotated domain,
+    //  is un-rotated ONCE per head (deferred sign flip + inverse WHT — the same
+    //  contract as TurboQuantKvCache.ComputeVAggregation and llm_kvarn_attention),
+    //  then the FP32-window contribution adds on top in the original domain.
     // ────────────────────────────────────────────────────────────────────
+
+    // 3a — compressed-region aggregate in the rotated domain. Each thread owns
+    // output dim `d` (head_dim ≤ 256 → one shared slot per dim). K is NOT
+    // re-decompressed here.
     for (int d = tid; d < head_dim; d += 256) {
         float acc = 0.0f;
-
-        // TQ-compressed positions.
         for (int t = 0; t < tq_seq_len; t++) {
             float weight = use_shared ? shared_scores[t] : head_scratch[t];
 
@@ -6410,8 +6416,31 @@ extern ""C"" __global__ void llm_tq_attention(
 
             acc += weight * cbook[idx] * norm;
         }
+        sdata[d] = acc;
+    }
+    __syncthreads();
 
-        // FP32 recent-window positions.
+    // 3b — deferred sign flip + inverse WHT (once per head). v = Hn·D·rot_acc:
+    // the per-head sign pattern first, then the normalized WHT (an involution;
+    // 1/sqrt(D) folded in at readout below).
+    if (tid < head_dim) sdata[tid] *= sign_patterns[(long)kv_head * head_dim + tid];
+    __syncthreads();
+    for (int s = head_dim >> 1; s >= 1; s >>= 1) {
+        if (tid < (head_dim >> 1)) {
+            int pos_lo = (tid / s) * (s << 1) + (tid % s);
+            int pos_hi = pos_lo + s;
+            float a = sdata[pos_lo];
+            float b = sdata[pos_hi];
+            sdata[pos_lo] = a + b;
+            sdata[pos_hi] = a - b;
+        }
+        __syncthreads();
+    }
+    float wht_scale = 1.0f / sqrtf((float)head_dim);
+
+    // 3c — FP32 recent-window V contribution (original domain) + output write.
+    for (int d = tid; d < head_dim; d += 256) {
+        float acc = (tq_seq_len > 0) ? sdata[d] * wht_scale : 0.0f;
         for (int t = 0; t < fp32_seq_len; t++) {
             float weight = use_shared
                 ? shared_scores[tq_seq_len + t]
@@ -6419,7 +6448,6 @@ extern ""C"" __global__ void llm_tq_attention(
             long v_off = (long)t * (long)kv_dim + (long)kv_head * (long)head_dim;
             acc += weight * v_cache_fp32[v_off + d];
         }
-
         out[out_off + d] = acc;
     }
 }

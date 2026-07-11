@@ -2659,7 +2659,7 @@ public sealed unsafe class VulkanShaderTests
 
         gpu.TqAttention(gpuQ, gpuRotated, gpuKCacheTq, gpuVCacheTq,
             gpuKCacheFp16, gpuVCacheFp16, gpuOut, gpuCodebook,
-            scratch,
+            gpuSigns, scratch,
             (uint)numHeads, (uint)numKvHeads, (uint)headDim,
             (uint)tqLen, fp16SeqLen: 0u, (uint)tqLen, (uint)blockBytes);
 

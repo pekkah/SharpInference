@@ -213,9 +213,10 @@ public sealed unsafe class CudaTurboQuantTests
     /// (background random unit-vector dots have std ≈ 1/sqrt(d); a 30× needle ensures the
     /// softmax weight on the needle is &gt; 95% even with 32 random distractors).
     ///
-    /// The output is in the rotated/sign-flipped basis (the V-side of TqAttention does not
-    /// un-rotate — same convention as the Vulkan TqAttention shader), so we compare the
-    /// kernel output to the *rotated* needle value via cosine similarity.
+    /// The kernel un-rotates the compressed-region V aggregate (issue #435 — deferred
+    /// sign flip + inverse WHT), so the output is in the ORIGINAL basis; we compare the
+    /// kernel output to the needle value round-tripped through the same codec and inverse
+    /// transform via cosine similarity.
     /// </summary>
     [Fact]
     public void TqAttention_NeedleInHaystack()
@@ -278,21 +279,22 @@ public sealed unsafe class CudaTurboQuantTests
 
         gpu.TqAttention(gpuQ, gpuRotated, gpuKCacheTq, gpuVCacheTq,
             gpuKCacheFp32, gpuVCacheFp32, gpuOut, gpuCodebook,
-            scoresScratch: null,
+            gpuSigns, scoresScratch: null,
             NumHeads, NumKvHeads, HeadDim, TqLen, fp32Window, TqLen, blockBytes);
         gpu.Synchronize();
 
         var output = new float[NumHeads * HeadDim];
         gpu.Download(gpuOut, output);
 
-        // Output is accumulated in the rotated basis. Compare to a fresh CPU round-trip
-        // of the needle value through the same Lloyd-Max codebook so the reference reflects
-        // the actual quantization error, not the ideal rotated vector.
+        // The kernel un-rotates the V aggregate (issue #435), so the output is in the
+        // original basis. Compare to a fresh CPU round-trip of the needle value through
+        // the same Lloyd-Max codebook and the deferred inverse transform, so the reference
+        // reflects the actual quantization error, not the ideal value.
         var compressedNeedleValue = new byte[blockBytes];
         compressor.Compress(needleValue, compressedNeedleValue);
-        var rotatedQuantizedNeedleValue = ReconstructRotated(compressedNeedleValue, centroids, blockBytes);
+        var quantizedNeedleValue = ReconstructOriginal(compressedNeedleValue, centroids, blockBytes, signPatterns);
 
-        float cos = Cosine(output, rotatedQuantizedNeedleValue);
+        float cos = Cosine(output, quantizedNeedleValue);
         Assert.True(cos > 0.7f,
             $"TQ attention output does not align with the quantized needle value (cosine={cos:F3}); " +
             $"the needle should carry the dominant softmax weight at NeedleScale={NeedleScale}, TqLen={TqLen}.");
@@ -515,7 +517,7 @@ public sealed unsafe class CudaTurboQuantTests
 
         gpu.TqAttention(gpuQ, gpuRotated, gpuKCacheTq, gpuVCacheTq,
             gpuKCacheFp32, gpuVCacheFp32, gpuOut, gpuCodebook,
-            scratch,
+            gpuSigns, scratch,
             numHeads, numKvHeads, HeadDim, tqLen, 0, tqLen, blockBytes);
         gpu.Synchronize();
 
@@ -549,6 +551,21 @@ public sealed unsafe class CudaTurboQuantTests
             rotated[d] = centroids[idx] * norm;
         }
         return rotated;
+    }
+
+    /// <summary>
+    /// Reconstruct one TQ V block as the kernel produces it after phase 3's deferred
+    /// un-rotate (issue #435): the rotated-basis reconstruction, then the per-head sign
+    /// flip and the normalized inverse WHT (an involution) — i.e. the original,
+    /// un-rotated domain. Mirrors <see cref="TurboQuantKvCache.ComputeVAggregation"/>.
+    /// </summary>
+    private static float[] ReconstructOriginal(byte[] block, float[] centroids, int blockBytes, float[] signPattern)
+    {
+        var rotated = ReconstructRotated(block, centroids, blockBytes);
+        for (int d = 0; d < HeadDim; d++) rotated[d] *= signPattern[d];
+        var original = new float[HeadDim];
+        WalshHadamard.Transform(rotated, original, HeadDim);
+        return original;
     }
 
     private static void Normalize(float[] v)
