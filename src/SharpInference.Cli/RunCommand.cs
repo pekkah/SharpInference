@@ -914,7 +914,22 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     // #180 Task 5a) — the hybrid pass has no KVarN ring/tile machinery.
                     if (tqModeIsAuto)
                     {
-                        // Auto-resolved KVarN, but TierPlanner picked a partial split:
+                        // Auto-resolved KVarN, but TierPlanner picked a partial split.
+                        // The partial-offload path has no KVarN machinery, so the only
+                        // TQ codec available here is Lloyd-Max — which ships codebooks
+                        // for head dim 128/256 only. For any other (pow-2) head dim the
+                        // auto path reached here precisely because the Lloyd-Max 128/256
+                        // gate above was skipped under the KVarN assumption; downgrading
+                        // now would crash in the forward-pass constructor. Fail cleanly
+                        // instead, pointing at the CPU KVarN path that does support it.
+                        if (hp.HeadDim is not 128 and not 256)
+                        {
+                            AnsiConsole.MarkupLine(
+                                $"[red]Error:[/] --tq with head dim {hp.HeadDim} requires KVarN (Lloyd-Max has no " +
+                                $"codebook for this head dim), but KVarN needs full CUDA offload and only " +
+                                $"{cudaGpuLayers}/{hp.NumLayers} layers fit this GPU. Use [yellow]-g 0[/] for the CPU KVarN path.");
+                            return 1;
+                        }
                         // downgrade with the #432 quality warning instead of erroring.
                         tqQuantizer = TqQuantizer.LloydMax;
                         AnsiConsole.MarkupLine(
@@ -1040,14 +1055,13 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     if (nGpuLayers == 0)
                     {
                         // Hybrid GDN models were rejected before reaching this Vulkan branch.
-                        // tqQuantizer resolved to Lloyd-Max up front for the Vulkan backend
-                        // (auto mode), or was set explicitly; pass it through either way.
+                        // KVarN cannot reach the Vulkan backend (explicit --tq-mode kvarn is
+                        // rejected up front, auto falls back to Lloyd-Max), so tqQuantizer is
+                        // always Lloyd-Max here.
                         if (settings.TurboQuant)
                         {
                             fwd!.EnableTurboQuant(fp32WindowSize: 256, bits: 3, quantizer: tqQuantizer);
-                            AnsiConsole.MarkupLine(tqQuantizer == TqQuantizer.KVarN
-                                ? "[dim]TurboQuant: [green]enabled[/] (KVarN K4V2, window=256)[/]"
-                                : "[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
+                            AnsiConsole.MarkupLine("[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
                         }
 
                         forward = fwd!.Forward;
