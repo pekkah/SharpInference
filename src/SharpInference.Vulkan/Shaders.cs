@@ -4979,7 +4979,9 @@ internal static class Shaders
                 }
                 barrier();
             }
-            float wht_scale = inversesqrt(float(head_dim));
+            // Exact 1/sqrt(D) (not inversesqrt) to mirror the CPU WalshHadamard.Transform
+            // normalization this un-rotate inverts — same convention as TqRotateQuery.
+            float wht_scale = 1.0 / sqrt(float(head_dim));
 
             // 3c — FP16 recent-window V contribution (original domain) + output write.
             for (uint d = tid; d < head_dim; d += 256) {
