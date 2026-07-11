@@ -13,7 +13,12 @@ public enum TqQuantizer
 {
     /// <summary>
     /// Lloyd-Max codebooks in FastScan tiles (3-4 bit, 32-position tiles with
-    /// per-block staging) — the shipping TurboQuant path.
+    /// per-block staging) — the original TurboQuant path. Known to severely degrade
+    /// quality on QK-norm models such as Qwen3, whose attention logits are large
+    /// enough that the codec's ~7% relative K-score error (3-bit) destroys the
+    /// softmax (issue #432: Qwen3-0.6B wikitext-2 PPL 945.6 vs 15.47 fp32; 4-bit
+    /// improves to 51.8 but still degrades). Prefer <see cref="KVarN"/> — the CLI
+    /// and server default to it wherever it is supported.
     /// </summary>
     LloydMax = 0,
 

@@ -107,16 +107,18 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         public int CtxSize { get; init; }
 
         [CommandOption("--tq")]
-        [Description("Enable TurboQuant KV cache compression (3-bit, reduces VRAM ~5x)")]
+        [Description("Enable TurboQuant KV cache compression (reduces KV memory ~4-8x; quantizer picked by --tq-mode)")]
         [DefaultValue(false)]
         public bool TurboQuant { get; init; }
 
         [CommandOption("--tq-mode")]
-        [Description("TurboQuant quantizer for --tq: lloydmax (default; 3-bit Lloyd-Max codebooks) or kvarn " +
-            "(issue #180: Sinkhorn-normalized asymmetric RTN, 4-bit K / 2-bit V, 128-token tiles; " +
-            "CPU (-g 0, any power-of-2 head dim ≤ 1024) or full-CUDA-offload dense (-g -1, head dim ≤ 256); no SnapKV).")]
-        [DefaultValue("lloydmax")]
-        public string TqModeStr { get; init; } = "lloydmax";
+        [Description("TurboQuant quantizer for --tq: auto (default: kvarn where supported, else lloydmax with a " +
+            "quality warning), kvarn (issue #180: Sinkhorn-normalized asymmetric RTN, 4-bit K / 2-bit V, 128-token " +
+            "tiles; CPU (-g 0, any power-of-2 head dim ≤ 1024) or full-CUDA-offload dense (-g -1, head dim ≤ 256); " +
+            "no SnapKV), or lloydmax (3-bit Lloyd-Max codebooks; severely degrades quality on QK-norm models " +
+            "such as Qwen3 — issue #432).")]
+        [DefaultValue("auto")]
+        public string TqModeStr { get; init; } = "auto";
 
         [CommandOption("--kv-type")]
         [Description("KV-cache element type for the CUDA backend: fp32 (default), bf16 (half the KV VRAM → ~2x context), or q8_0 (quarter → ~4x). Like llama.cpp --cache-type-k/v. Env: SHARPI_KV_DTYPE.")]
@@ -613,18 +615,63 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         // Task 5a); SnapKV, Vulkan, partial offload, and MoE-on-GPU are rejected
         // up-front with actionable errors (ForwardPass.EnableTurboQuant and the
         // CudaForwardPass constructor re-check as guards of last resort).
+        // The default mode is auto (issue #432): prefer KVarN wherever it is supported
+        // and fall back to Lloyd-Max with a loud warning elsewhere — Lloyd-Max 3-bit
+        // collapses on QK-norm models (Qwen3-0.6B wikitext-2 PPL: 15.47 fp32 /
+        // 15.67 KVarN / 945.6 Lloyd-Max 3-bit).
         TqQuantizer tqQuantizer;
+        bool tqModeIsAuto = false;
         switch (settings.TqModeStr.Trim().ToLowerInvariant())
         {
-            case "" or "lloydmax" or "lloyd-max":
+            case "" or "auto":
+                tqModeIsAuto = true;
+                tqQuantizer = TqQuantizer.LloydMax; // resolved below when --tq is set
+                break;
+            case "lloydmax" or "lloyd-max":
                 tqQuantizer = TqQuantizer.LloydMax;
                 break;
             case "kvarn":
                 tqQuantizer = TqQuantizer.KVarN;
                 break;
             default:
-                AnsiConsole.MarkupLine($"[red]Error:[/] Unknown --tq-mode value '{Markup.Escape(settings.TqModeStr)}'. Expected one of: lloydmax, kvarn.");
+                AnsiConsole.MarkupLine($"[red]Error:[/] Unknown --tq-mode value '{Markup.Escape(settings.TqModeStr)}'. Expected one of: auto, lloydmax, kvarn.");
                 return 1;
+        }
+        if (tqModeIsAuto && settings.TurboQuant)
+        {
+            // Mirror the explicit-kvarn validation below: resolve to KVarN only when
+            // every precondition holds, so the auto path can never hit a kvarn error.
+            // Partial CUDA offload is only knowable after TierPlanner runs (-g -1);
+            // that branch downgrades an auto-resolved KVarN to Lloyd-Max instead of
+            // erroring like explicit --tq-mode kvarn does.
+            int autoHeadDim = hp.HeadDim;
+            bool autoHeadDimOk = (autoHeadDim & (autoHeadDim - 1)) == 0 && autoHeadDim is >= 8 and <= 1024;
+            string? kvarnBlocked =
+                SnapKvConfig.FromEnvironment().Enabled
+                    ? "SnapKV eviction (SHARPI_SNAPKV_BUDGET) does not compose with KVarN yet"
+                : !autoHeadDimOk
+                    ? $"KVarN needs a power-of-2 head dim in [8, 1024]; this model has {autoHeadDim}"
+                : effNGpuLayers == 0 ? null
+                : (settings.Backend ?? "auto").Trim().ToLowerInvariant() == "vulkan"
+                    ? "KVarN is not supported on the Vulkan backend"
+                : !CudaBackend.IsAvailable()
+                    ? "GPU KVarN requires a CUDA device"
+                : hp.IsMoE
+                    ? "KVarN on CUDA supports dense models only"
+                : autoHeadDim > 256
+                    ? $"KVarN on CUDA requires head dim ≤ 256; this model has {autoHeadDim}"
+                : null;
+            if (kvarnBlocked is null)
+            {
+                tqQuantizer = TqQuantizer.KVarN;
+            }
+            else
+            {
+                AnsiConsole.MarkupLine(
+                    $"[yellow]Warning:[/] --tq is falling back to the Lloyd-Max 3-bit quantizer ({Markup.Escape(kvarnBlocked)}). " +
+                    "Lloyd-Max severely degrades quality on QK-norm models such as Qwen3 (issue #432); " +
+                    "pass [yellow]--tq-mode lloydmax[/] explicitly to silence this warning.");
+            }
         }
         if (tqQuantizer == TqQuantizer.KVarN)
         {
@@ -865,10 +912,39 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 {
                     // KVarN on GPU is the full-offload CudaForwardPass path only (issue
                     // #180 Task 5a) — the hybrid pass has no KVarN ring/tile machinery.
-                    AnsiConsole.MarkupLine(
-                        $"[red]Error:[/] --tq-mode kvarn requires full CUDA offload, but only " +
-                        $"{cudaGpuLayers}/{hp.NumLayers} layers fit this GPU. Use [yellow]-g 0[/] for the CPU path.");
-                    return 1;
+                    if (tqModeIsAuto)
+                    {
+                        // Auto-resolved KVarN, but TierPlanner picked a partial split.
+                        // The partial-offload path has no KVarN machinery, so the only
+                        // TQ codec available here is Lloyd-Max — which ships codebooks
+                        // for head dim 128/256 only. For any other (pow-2) head dim the
+                        // auto path reached here precisely because the Lloyd-Max 128/256
+                        // gate above was skipped under the KVarN assumption; downgrading
+                        // now would crash in the forward-pass constructor. Fail cleanly
+                        // instead, pointing at the CPU KVarN path that does support it.
+                        if (hp.HeadDim is not 128 and not 256)
+                        {
+                            AnsiConsole.MarkupLine(
+                                $"[red]Error:[/] --tq with head dim {hp.HeadDim} requires KVarN (Lloyd-Max has no " +
+                                $"codebook for this head dim), but KVarN needs full CUDA offload and only " +
+                                $"{cudaGpuLayers}/{hp.NumLayers} layers fit this GPU. Use [yellow]-g 0[/] for the CPU KVarN path.");
+                            return 1;
+                        }
+                        // downgrade with the #432 quality warning instead of erroring.
+                        tqQuantizer = TqQuantizer.LloydMax;
+                        AnsiConsole.MarkupLine(
+                            $"[yellow]Warning:[/] --tq is falling back to the Lloyd-Max 3-bit quantizer (KVarN requires " +
+                            $"full CUDA offload; only {cudaGpuLayers}/{hp.NumLayers} layers fit this GPU). " +
+                            "Lloyd-Max severely degrades quality on QK-norm models such as Qwen3 (issue #432); " +
+                            "use [yellow]-g 0[/] for CPU KVarN or pass [yellow]--tq-mode lloydmax[/] to silence this warning.");
+                    }
+                    else
+                    {
+                        AnsiConsole.MarkupLine(
+                            $"[red]Error:[/] --tq-mode kvarn requires full CUDA offload, but only " +
+                            $"{cudaGpuLayers}/{hp.NumLayers} layers fit this GPU. Use [yellow]-g 0[/] for the CPU path.");
+                        return 1;
+                    }
                 }
                 if (wantHybrid)
                 {
@@ -979,9 +1055,12 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     if (nGpuLayers == 0)
                     {
                         // Hybrid GDN models were rejected before reaching this Vulkan branch.
+                        // KVarN cannot reach the Vulkan backend (explicit --tq-mode kvarn is
+                        // rejected up front, auto falls back to Lloyd-Max), so tqQuantizer is
+                        // always Lloyd-Max here.
                         if (settings.TurboQuant)
                         {
-                            fwd!.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
+                            fwd!.EnableTurboQuant(fp32WindowSize: 256, bits: 3, quantizer: tqQuantizer);
                             AnsiConsole.MarkupLine("[dim]TurboQuant: [green]enabled[/] (3-bit, window=256)[/]");
                         }
 

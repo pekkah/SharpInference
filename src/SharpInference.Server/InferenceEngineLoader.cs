@@ -85,6 +85,24 @@ public static class InferenceEngineLoader
         if (turboQuant && hp.HeadDim is not 128 and not 256)
             throw new InvalidOperationException(
                 $"TurboQuant requires head dimension 128 or 256; this model has head dim {hp.HeadDim}.");
+        bool tqModeIsAuto = false;
+        TqQuantizer tqQuantizer;
+        switch ((opts.TqMode ?? "auto").Trim().ToLowerInvariant())
+        {
+            case "" or "auto":
+                tqModeIsAuto = true;
+                tqQuantizer = TqQuantizer.LloydMax; // resolved per-path in BuildForwardPass
+                break;
+            case "lloydmax" or "lloyd-max":
+                tqQuantizer = TqQuantizer.LloydMax;
+                break;
+            case "kvarn":
+                tqQuantizer = TqQuantizer.KVarN;
+                break;
+            default:
+                throw new InvalidOperationException(
+                    $"Unknown TqMode '{opts.TqMode}'. Expected one of: auto, lloydmax, kvarn.");
+        }
 
         int ctxSize = opts.ContextSize;
         int nGpuLayers = opts.NGpuLayers;
@@ -97,7 +115,8 @@ public static class InferenceEngineLoader
 
         try
         {
-            (fwd, batchingSupported) = BuildForwardPass(model, hp, arch, ctxSize, nGpuLayers, opts.Backend, turboQuant, owned,
+            (fwd, batchingSupported) = BuildForwardPass(model, hp, arch, ctxSize, nGpuLayers, opts.Backend, turboQuant,
+                tqQuantizer, tqModeIsAuto, owned,
                 DequantCacheBytes(opts.PrefillDequantCacheMb), preferBatchingOverAutoSnapKv: opts.MaxBatchSize > 1);
             owned.Add(model);
         }
@@ -314,9 +333,34 @@ public static class InferenceEngineLoader
 
     private static (IForwardPass Fwd, bool BatchingSupported) BuildForwardPass(
         GgufModel model, ModelHyperparams hp, string arch, int ctxSize, int nGpuLayers,
-        ServerBackend backend, bool turboQuant, List<IDisposable> owned, long prefillDequantCacheBytes,
+        ServerBackend backend, bool turboQuant, TqQuantizer tqQuantizer, bool tqModeIsAuto,
+        List<IDisposable> owned, long prefillDequantCacheBytes,
         bool preferBatchingOverAutoSnapKv = false)
     {
+        // TurboQuant quantizer resolution (issue #432): TqMode "auto" prefers KVarN
+        // wherever the resolved path supports it and falls back to Lloyd-Max 3-bit —
+        // which severely degrades quality on QK-norm models such as Qwen3 — with a
+        // stderr warning. An explicit TqMode forces the codec; forcing kvarn on an
+        // unsupported path fails model load with the reason.
+        bool snapKvEnabled = SnapKvConfig.FromEnvironment().Enabled;
+        TqQuantizer ResolveTq(string? kvarnBlocked)
+        {
+            if (!turboQuant) return TqQuantizer.LloydMax; // unused — TQ is off
+            kvarnBlocked ??= snapKvEnabled
+                ? "SnapKV eviction (SHARPI_SNAPKV_BUDGET) does not compose with KVarN yet"
+                : null;
+            if (kvarnBlocked is null)
+                return tqModeIsAuto ? TqQuantizer.KVarN : tqQuantizer;
+            if (!tqModeIsAuto && tqQuantizer == TqQuantizer.KVarN)
+                throw new InvalidOperationException($"TqMode=kvarn is not supported on this path: {kvarnBlocked}.");
+            if (tqModeIsAuto)
+                Console.Error.WriteLine(
+                    $"[InferenceEngineLoader] TurboQuant is falling back to the Lloyd-Max 3-bit quantizer ({kvarnBlocked}). " +
+                    "Lloyd-Max severely degrades quality on QK-norm models such as Qwen3 (issue #432); " +
+                    "set TqMode=\"lloydmax\" to silence this warning.");
+            return TqQuantizer.LloydMax;
+        }
+
         // Resolve "auto" first so the rest of the method can treat backend as concrete.
         if (nGpuLayers != 0 && backend == ServerBackend.Auto)
         {
@@ -348,7 +392,7 @@ public static class InferenceEngineLoader
                 prefillDequantCacheBytes: prefillDequantCacheBytes);
             owned.Add(dense);
             if (turboQuant)
-                dense.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
+                dense.EnableTurboQuant(fp32WindowSize: 256, bits: 3, quantizer: ResolveTq(null));
             // ContinuousBatchingEngine doesn't yet support MoE, TurboQuant fan-out, or
             // gemma4 per-layer head_dim (PrefillWithCache / BatchForwardMulti /
             // PrefillPackedMulti all throw NotSupportedException) — those fall back to
@@ -399,7 +443,7 @@ public static class InferenceEngineLoader
             if (gpuLayers <= 0)
             {
                 // GPU planner says nothing fits — fall back to CPU dense.
-                if (turboQuant) cpuDense!.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
+                if (turboQuant) cpuDense!.EnableTurboQuant(fp32WindowSize: 256, bits: 3, quantizer: ResolveTq(null));
                 return (cpuDense!, BatchingSupported: !hp.IsMoE && !turboQuant);
             }
 
@@ -410,6 +454,7 @@ public static class InferenceEngineLoader
                 // per-sequence-eviction decode). An explicit SHARPI_SNAPKV_BUDGET>0 still wins and
                 // composes with batching via #196 Option 1.
                 var cfwd = new CudaForwardPass(model, cuda, hp, ctxSize, enableTurboQuant: turboQuant,
+                    tqQuantizer: ResolveTq(hp.IsMoE ? "KVarN on CUDA supports dense models only" : null),
                     preferBatchingOverAutoSnapKv: preferBatchingOverAutoSnapKv);
                 owned.Add(cfwd);
                 // Issue #190 (dense) / #195 (Gemma 4): CUDA full-offload supports continuous
@@ -434,6 +479,9 @@ public static class InferenceEngineLoader
 
             // pinGpuLayers (not a `with { GpuLayers = }` override) so the expert-cache budget the
             // MoE CPU-vs-SLRU auto-decision reads is priced for THIS split, not the auto one (#224).
+            // The hybrid pass has no KVarN machinery — resolve for the throw/warn side effect
+            // (the constructor itself only takes the Lloyd-Max bool).
+            _ = ResolveTq($"KVarN requires full CUDA offload; TierPlanner fit {gpuLayers}/{hp.NumLayers} layers");
             var planForHybrid = TierPlanner.Plan(model, hp, hwProfile, turboQuant, requestedCtxSize: ctxSize,
                 kvDtype: CudaForwardPass.ResolveConfiguredKvDType(), pinGpuLayers: gpuLayers);
             var chfwd = new CudaHybridForwardPass(model, cuda, hp, planForHybrid, turboQuant);
@@ -470,18 +518,21 @@ public static class InferenceEngineLoader
 
             if (gpuLayers <= 0)
             {
-                if (turboQuant) cpuDense!.EnableTurboQuant(fp32WindowSize: 256, bits: 3);
+                if (turboQuant) cpuDense!.EnableTurboQuant(fp32WindowSize: 256, bits: 3, quantizer: ResolveTq(null));
                 return (cpuDense!, BatchingSupported: !hp.IsMoE && !turboQuant);
             }
 
             if (gpuLayers >= hp.NumLayers)
             {
+                // Vulkan TQ is Lloyd-Max only — resolve for the throw/warn side effect.
+                _ = ResolveTq("KVarN is not supported on the Vulkan backend");
                 var gfwd = new GpuForwardPass(model, vulkan, hp, ctxSize, enableTurboQuant: turboQuant,
                     kvDtype: CudaForwardPass.ResolveConfiguredKvDType());
                 owned.Add(gfwd);
                 return (gfwd, BatchingSupported: false);
             }
 
+            _ = ResolveTq("KVarN is not supported on the Vulkan backend");
             var planForHybrid = TierPlanner.Plan(model, hp, hwProfile, turboQuant, requestedCtxSize: ctxSize,
                 pinGpuLayers: gpuLayers);
             var hfwd = new HybridForwardPass(model, vulkan, hp, planForHybrid, turboQuant);

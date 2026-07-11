@@ -62,6 +62,19 @@ builder.Services.AddSharpInference(builder.Configuration, opts =>
     if (!string.IsNullOrWhiteSpace(envKvType))
         opts.KvType = envKvType;
 
+    // SHARPI_TQ ∈ {1, true} enables TurboQuant KV-cache compression (mirrors --tq);
+    // SHARPI_TQ_MODE ∈ {auto, kvarn, lloydmax} picks the quantizer (mirrors --tq-mode,
+    // default auto — issue #432: KVarN where supported, Lloyd-Max fallback with warning).
+    var envTq = Environment.GetEnvironmentVariable("SHARPI_TQ");
+    if (!string.IsNullOrWhiteSpace(envTq)
+        && (envTq == "1" || envTq.Equals("true", StringComparison.OrdinalIgnoreCase)))
+    {
+        opts.TurboQuant = true;
+    }
+    var envTqMode = Environment.GetEnvironmentVariable("SHARPI_TQ_MODE");
+    if (!string.IsNullOrWhiteSpace(envTqMode))
+        opts.TqMode = envTqMode;
+
     // SHARPI_NO_THINKING ∈ {1, true} globally disables reasoning (server-side --no-thinking),
     // for agentic clients that never send the per-request opt-out.
     var envNoThink = Environment.GetEnvironmentVariable("SHARPI_NO_THINKING");

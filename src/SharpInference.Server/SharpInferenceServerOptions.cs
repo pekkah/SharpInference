@@ -140,10 +140,22 @@ public sealed class SharpInferenceServerOptions
     public int ContextSize { get; set; } = 0;
 
     /// <summary>
-    /// Enable TurboQuant 3-bit KV-cache compression. Mirrors <c>--tq</c>. Requires head
-    /// dimension ∈ {128, 256}; the loader falls back to non-TQ otherwise.
+    /// Enable TurboQuant KV-cache compression. Mirrors <c>--tq</c>. Requires head
+    /// dimension ∈ {128, 256}; the loader falls back to non-TQ otherwise. The
+    /// quantizer is selected by <see cref="TqMode"/>.
     /// </summary>
     public bool TurboQuant { get; set; } = false;
+
+    /// <summary>
+    /// TurboQuant quantizer for <see cref="TurboQuant"/>. Mirrors the CLI's
+    /// <c>--tq-mode</c>: <c>"auto"</c> (default) picks KVarN (4-bit K / 2-bit V,
+    /// issue #180) wherever the resolved forward pass supports it and falls back to
+    /// Lloyd-Max 3-bit with a stderr warning elsewhere (Vulkan, partial CUDA offload,
+    /// MoE-on-GPU, SnapKV); <c>"kvarn"</c> and <c>"lloydmax"</c> force a codec —
+    /// forcing kvarn on an unsupported path fails model load. Lloyd-Max 3-bit is known
+    /// to severely degrade quality on QK-norm models such as Qwen3 (issue #432).
+    /// </summary>
+    public string TqMode { get; set; } = "auto";
 
     /// <summary>
     /// KV-cache element type for the CUDA dense path. Mirrors the CLI's <c>--kv-type</c> /

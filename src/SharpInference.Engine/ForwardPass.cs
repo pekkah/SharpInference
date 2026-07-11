@@ -623,10 +623,14 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
     /// <summary>
     /// Enables TurboQuant KV cache compression. Must be called before any forward pass.
     /// <paramref name="quantizer"/> selects the compressed-region codec: Lloyd-Max
-    /// FastScan (default, 3-4 bit; <paramref name="bits"/> applies) or KVarN
-    /// (issue #180: 4-bit K / 2-bit V in 128-token tiles; <paramref name="bits"/>
-    /// is ignored). KVarN does not compose with SnapKV eviction yet — the combo
-    /// is rejected here rather than corrupting the cache at Compact time.
+    /// FastScan (this method's default, 3-4 bit; <paramref name="bits"/> applies) or
+    /// KVarN (issue #180: 4-bit K / 2-bit V in 128-token tiles; <paramref name="bits"/>
+    /// is ignored). Prefer KVarN when it fits your configuration — Lloyd-Max 3-bit
+    /// severely degrades quality on QK-norm models such as Qwen3 (issue #432:
+    /// Qwen3-0.6B wikitext-2 PPL 15.47 fp32 / 15.67 KVarN / 945.6 Lloyd-Max 3-bit;
+    /// the CLI and server default to KVarN where supported). KVarN does not compose
+    /// with SnapKV eviction yet — the combo is rejected here rather than corrupting
+    /// the cache at Compact time.
     /// KVarN also shrinks the guaranteed <see cref="TruncateTo"/> rewind depth to
     /// <paramref name="fp32WindowSize"/> − 127 (whole-tile promotion): keep the
     /// window well above the draft length when combining with speculative decoding.
@@ -638,7 +642,7 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
             throw new NotSupportedException(
                 "SnapKV eviction (SHARPI_SNAPKV_BUDGET) is not yet supported with the KVarN quantizer " +
                 "(issue #180 follow-up: Compact-time re-quantization needs whole-tile re-assembly). " +
-                "Unset SHARPI_SNAPKV_BUDGET or use the default Lloyd-Max quantizer.");
+                "Unset SHARPI_SNAPKV_BUDGET or use the Lloyd-Max quantizer.");
 
         _tqKvCache = new TurboQuantKvCache(
             _hp.NumLayers, _ctxLen, _numKvHeads, _headDim,
