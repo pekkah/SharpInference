@@ -715,7 +715,7 @@ public sealed unsafe class HybridForwardPass : IForwardPass
             uint fp32SeqLen = (uint)Math.Min(_gpuFp32Count + 1, _tqFp32Window);
             _gpu.TqAttention(_gpuQ, _gpuRotatedQ!, _gpuTqKCache![i], _gpuTqVCache![i],
                 _gpuKCache[i], _gpuVCache[i], _gpuAttnOut, _gpuCodebook!,
-                _gpuAttnScoresScratch!,
+                _gpuSignPatterns![i], _gpuAttnScoresScratch!,
                 (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
                 (uint)_gpuTqCompressedLen, fp32SeqLen, (uint)_maxSeqLen, (uint)_tqBlockBytes);
         }

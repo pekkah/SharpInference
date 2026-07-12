@@ -1235,7 +1235,7 @@ public sealed unsafe class GpuForwardPass : IForwardPass
                 uint fp32SeqLen = (uint)Math.Min(_fp32Count + 1, _tqFp32Window);
                 _gpu.TqAttention(_q, _rotatedQ!, _gpuTqKCache![layer], _gpuTqVCache![layer],
                     _gpuKCache[layer], _gpuVCache[layer], _attnOut, _gpuCodebook!,
-                    _attnScoresScratch!,
+                    _gpuSignPatterns![layer], _attnScoresScratch!,
                     (uint)_numHeads, (uint)_numKvHeads, (uint)_headDim,
                     (uint)_tqCompressedLen, fp32SeqLen, (uint)_maxSeqLen, (uint)_tqBlockBytes);
             }

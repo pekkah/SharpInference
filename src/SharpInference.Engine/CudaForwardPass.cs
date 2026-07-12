@@ -1858,7 +1858,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                     _gpu.TqAttention(_q, _rotatedQ!,
                         _gpuTqKCache![layer], _gpuTqVCache![layer],
                         _gpuKCache[layer], _gpuVCache[layer], _attnOut, _gpuCodebook!,
-                        _attnScoresScratch,
+                        _gpuSignPatterns![layer], _attnScoresScratch,
                         _numHeads, _numKvHeads, _headDim,
                         _tqCompressedLen, fp32SeqLen, _maxSeqLen, _tqBlockBytes);
                 }

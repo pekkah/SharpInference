@@ -82,9 +82,6 @@ public static class InferenceEngineLoader
         if (turboQuant && hp.IsHybridSsm)
             throw new InvalidOperationException(
                 "TurboQuant is not supported for hybrid GDN models (no KV cache on GDN layers).");
-        if (turboQuant && hp.HeadDim is not 128 and not 256)
-            throw new InvalidOperationException(
-                $"TurboQuant requires head dimension 128 or 256; this model has head dim {hp.HeadDim}.");
         bool tqModeIsAuto = false;
         TqQuantizer tqQuantizer;
         switch ((opts.TqMode ?? "auto").Trim().ToLowerInvariant())
@@ -102,6 +99,29 @@ public static class InferenceEngineLoader
             default:
                 throw new InvalidOperationException(
                     $"Unknown TqMode '{opts.TqMode}'. Expected one of: auto, lloydmax, kvarn.");
+        }
+
+        // An explicit TqMode=kvarn is meaningless without TurboQuant — reject it up front
+        // like the CLI does (issue #437) rather than silently ignoring it.
+        if (!turboQuant && !tqModeIsAuto && tqQuantizer == TqQuantizer.KVarN)
+            throw new InvalidOperationException("TqMode=kvarn requires TurboQuant=true.");
+
+        // Head-dim gate, codec-aware (issue #437): KVarN accepts any power-of-2 head dim in
+        // [8, 1024] (CPU) / [8, 256] (CUDA) — the resolved path is validated in ResolveTq
+        // below; Lloyd-Max ships codebooks for 128/256 only. An explicit lloydmax therefore
+        // needs 128/256 up front; auto / explicit kvarn need only a valid KVarN head dim
+        // here (a path that can't run KVarN falls back or errors in ResolveTq). This relaxes
+        // the old hard {128,256} reject so KVarN's broader head dims (32/64/512/1024) are
+        // reachable on the server's CPU path, as they already are on the CLI.
+        if (turboQuant)
+        {
+            bool explicitLloydMax = !tqModeIsAuto && tqQuantizer == TqQuantizer.LloydMax;
+            if (explicitLloydMax && !TqSupport.IsLloydMaxHeadDim(hp.HeadDim))
+                throw new InvalidOperationException(
+                    $"TurboQuant Lloyd-Max requires head dimension 128 or 256; this model has head dim {hp.HeadDim}.");
+            if (!explicitLloydMax && !TqSupport.IsKVarNHeadDim(hp.HeadDim))
+                throw new InvalidOperationException(
+                    $"TurboQuant requires a power-of-2 head dimension in [8, 1024]; this model has head dim {hp.HeadDim}.");
         }
 
         int ctxSize = opts.ContextSize;
@@ -346,25 +366,35 @@ public static class InferenceEngineLoader
         TqQuantizer ResolveTq(string? kvarnBlocked)
         {
             if (!turboQuant) return TqQuantizer.LloydMax; // unused — TQ is off
-            kvarnBlocked ??= snapKvEnabled
-                ? "SnapKV eviction (SHARPI_SNAPKV_BUDGET) does not compose with KVarN yet"
-                : null;
+            kvarnBlocked ??= snapKvEnabled ? TqSupport.SnapKvReason : null;
             if (kvarnBlocked is null)
                 return tqModeIsAuto ? TqQuantizer.KVarN : tqQuantizer;
+            // KVarN is unavailable on this resolved path. An explicit kvarn → hard error.
             if (!tqModeIsAuto && tqQuantizer == TqQuantizer.KVarN)
                 throw new InvalidOperationException($"TqMode=kvarn is not supported on this path: {kvarnBlocked}.");
+            // Auto (and explicit lloydmax) fall back to Lloyd-Max — but it ships codebooks
+            // for 128/256 only. A non-{128,256} head dim reached here under the relaxed KVarN
+            // envelope, so the downgrade would crash in the forward-pass ctor; fail cleanly
+            // and point at the CPU KVarN path instead (issue #437, mirrors the CLI).
+            if (!TqSupport.IsLloydMaxHeadDim(hp.HeadDim))
+                throw new InvalidOperationException(
+                    $"TurboQuant with head dim {hp.HeadDim} requires KVarN ({kvarnBlocked}), but Lloyd-Max — the " +
+                    "only codec available on this path — ships codebooks for head dim 128/256 only. " +
+                    "Use nGpuLayers=0 for the CPU KVarN path.");
             if (tqModeIsAuto)
                 Console.Error.WriteLine(
                     $"[InferenceEngineLoader] TurboQuant is falling back to the Lloyd-Max 3-bit quantizer ({kvarnBlocked}). " +
-                    "Lloyd-Max severely degrades quality on QK-norm models such as Qwen3 (issue #432); " +
-                    "set TqMode=\"lloydmax\" to silence this warning.");
+                    $"{TqSupport.QualityWarningReason}; set TqMode=\"lloydmax\" to silence this warning.");
             return TqQuantizer.LloydMax;
         }
 
         // Resolve "auto" first so the rest of the method can treat backend as concrete.
         if (nGpuLayers != 0 && backend == ServerBackend.Auto)
         {
-            bool tqOk = !turboQuant || hp.HeadDim is 128 or 256;
+            // CUDA can run TQ for any KVarN CUDA head dim (pow-2 [8,256]; 128/256 also cover
+            // Lloyd-Max) — issue #437 relaxed this from the old hard {128,256}. Larger/other
+            // head dims fall through to Vulkan (Lloyd-Max) or the CPU KVarN path.
+            bool tqOk = !turboQuant || TqSupport.IsKVarNCudaHeadDim(hp.HeadDim);
             if (tqOk && CudaBackend.IsAvailable())
                 backend = ServerBackend.Cuda;
             else
@@ -454,7 +484,9 @@ public static class InferenceEngineLoader
                 // per-sequence-eviction decode). An explicit SHARPI_SNAPKV_BUDGET>0 still wins and
                 // composes with batching via #196 Option 1.
                 var cfwd = new CudaForwardPass(model, cuda, hp, ctxSize, enableTurboQuant: turboQuant,
-                    tqQuantizer: ResolveTq(hp.IsMoE ? "KVarN on CUDA supports dense models only" : null),
+                    tqQuantizer: ResolveTq(hp.IsMoE ? TqSupport.CudaMoeReason
+                        : !TqSupport.IsKVarNCudaHeadDim(hp.HeadDim) ? TqSupport.CudaHeadDimReason(hp.HeadDim)
+                        : null),
                     preferBatchingOverAutoSnapKv: preferBatchingOverAutoSnapKv);
                 owned.Add(cfwd);
                 // Issue #190 (dense) / #195 (Gemma 4): CUDA full-offload supports continuous
@@ -525,14 +557,14 @@ public static class InferenceEngineLoader
             if (gpuLayers >= hp.NumLayers)
             {
                 // Vulkan TQ is Lloyd-Max only — resolve for the throw/warn side effect.
-                _ = ResolveTq("KVarN is not supported on the Vulkan backend");
+                _ = ResolveTq(TqSupport.VulkanReason);
                 var gfwd = new GpuForwardPass(model, vulkan, hp, ctxSize, enableTurboQuant: turboQuant,
                     kvDtype: CudaForwardPass.ResolveConfiguredKvDType());
                 owned.Add(gfwd);
                 return (gfwd, BatchingSupported: false);
             }
 
-            _ = ResolveTq("KVarN is not supported on the Vulkan backend");
+            _ = ResolveTq(TqSupport.VulkanReason);
             var planForHybrid = TierPlanner.Plan(model, hp, hwProfile, turboQuant, requestedCtxSize: ctxSize,
                 pinGpuLayers: gpuLayers);
             var hfwd = new HybridForwardPass(model, vulkan, hp, planForHybrid, turboQuant);

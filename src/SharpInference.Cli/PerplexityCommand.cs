@@ -138,15 +138,11 @@ public sealed class PerplexityCommand : Command<PerplexityCommand.Settings>
     internal static TqQuantizer ResolveAutoQuantizer(int tqWindow, int nGpuLayers, int headDim,
         bool isMoE, bool snapKvEnabled, out string? fallbackReason)
     {
-        bool headDimOk = headDim >= 8 && headDim <= 1024 && (headDim & (headDim - 1)) == 0;
-        fallbackReason =
-            snapKvEnabled ? "SnapKV eviction (SHARPI_SNAPKV_BUDGET) does not compose with KVarN yet"
-            : tqWindow < 128 ? $"KVarN needs --tq-window >= 128 (one full tile); got {tqWindow}"
-            : !headDimOk ? $"KVarN needs a power-of-2 head dim in [8, 1024]; this model has {headDim}"
-            : nGpuLayers == 0 ? null
-            : isMoE ? "KVarN on CUDA supports dense models only"
-            : headDim > 256 ? $"KVarN on CUDA requires head dim ≤ 256; this model has {headDim}"
-            : null;
+        // Perplexity offloads only to CUDA (never Vulkan), so isVulkan=false and CUDA is
+        // assumed available on the GPU branch — TqSupport is the shared matrix (issue #437).
+        fallbackReason = TqSupport.KVarNBlockedReason(
+            headDim, snapKvEnabled, onGpu: nGpuLayers != 0,
+            isVulkan: false, cudaAvailable: true, isMoE, window: tqWindow);
         return fallbackReason is null ? TqQuantizer.KVarN : TqQuantizer.LloydMax;
     }
 
@@ -234,7 +230,7 @@ public sealed class PerplexityCommand : Command<PerplexityCommand.Settings>
             if (fallbackReason is not null)
                 AnsiConsole.MarkupLine(
                     $"[yellow]Warning:[/] --tq is falling back to the Lloyd-Max 3-bit quantizer ({Markup.Escape(fallbackReason)}). " +
-                    "Lloyd-Max severely degrades quality on QK-norm models such as Qwen3 (issue #432); " +
+                    $"{Markup.Escape(TqSupport.QualityWarningReason)}; " +
                     "pass [yellow]--tq-mode lloydmax[/] explicitly to silence this warning.");
         }
 
@@ -246,18 +242,18 @@ public sealed class PerplexityCommand : Command<PerplexityCommand.Settings>
             int headDim = hp.HeadDim;
             if (quantizer == TqQuantizer.KVarN)
             {
-                if ((headDim & (headDim - 1)) != 0 || headDim is < 8 or > 1024)
+                if (!TqSupport.IsKVarNHeadDim(headDim))
                 {
                     AnsiConsole.MarkupLine($"[red]Error:[/] --tq-mode kvarn requires a power-of-2 head dimension in [[8, 1024]]; this model has head dim {headDim}.");
                     return 1;
                 }
-                if (settings.NGpuLayers == -1 && headDim > 256)
+                if (settings.NGpuLayers == -1 && headDim > TqSupport.KVarNCudaMaxHeadDim)
                 {
                     AnsiConsole.MarkupLine($"[red]Error:[/] --tq-mode kvarn on CUDA requires head dim ≤ 256 (shared-memory WHT cap); this model has head dim {headDim}. Use [yellow]-g 0[/].");
                     return 1;
                 }
             }
-            else if (headDim is not 128 and not 256)
+            else if (!TqSupport.IsLloydMaxHeadDim(headDim))
             {
                 AnsiConsole.MarkupLine($"[red]Error:[/] TurboQuant requires head dimension 128 or 256; this model has head dim {headDim}.");
                 return 1;
