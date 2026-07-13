@@ -217,9 +217,13 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     // reduce runs in top-k order) — but the Q8_KS int8 tier AUTO-ENABLES per expert
     // dtype (see _q3kQ8KEnabled et al.) and is argmax-stable, NOT byte-exact: pin
     // SHARPI_Q3K_Q8K=0 / SHARPI_Q8_0_Q8K=0 / SHARPI_Q4K_Q8K=0 for byte parity with
-    // the per-token oracle. Default OFF until validated (issue #410 constraint).
+    // the per-token oracle. Default ON after the desktop validation (issue #416):
+    // batched routed-MoE prefill is 3.65× over per-token on Coder-30B once the Q6_K
+    // down-projection stopped re-quantizing its input per weight row (the #416 fix
+    // hoists the Q8K prepack); byte-exact on AVX-512 (Q8_KS tier off), argmax-stable
+    // where the int8 tier auto-enables. Kill-switch: SHARPI_HYBRID_BATCHED_MOE=0.
     internal static bool BatchedCpuMoePrefillEnabled =
-        Environment.GetEnvironmentVariable("SHARPI_HYBRID_BATCHED_MOE") == "1";
+        CudaHybridGdnForwardPass.ResolveGate("SHARPI_HYBRID_BATCHED_MOE", true);
 
     // Test observable (issue #410): whether the last Prefill's FFN stage ran the batched
     // CPU-MoE path (vs the per-token loop). Non-vacuous parity assertions, same idea as
@@ -296,6 +300,13 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
     private byte* _bmNormAllQ8K;       // [N × _bmQ8KEmbStride] — prepacked norm rows
     private byte* _bmGateAllQ8K;       // [N × numActive × _bmQ8KExpStride] — prepacked silu'd gates
     private readonly int _bmQ8KEmbStride, _bmQ8KExpStride;
+    // Issue #410: Q6_K down projection — the single Q6_K dot always quantizes its input to
+    // Q8_K (no float Q6_K dot exists), so the batched down projection hoists that prepack out
+    // of the per-row loop whenever a routed down weight is Q6_K, independent of the SHARPI_*
+    // gates above (which drive the distinct Q8_KS scheme). Scratch is one Q8_K row per slot.
+    private readonly bool _hasQ6KDownExp;
+    private byte* _bmGateAllQ6KQ8K;    // [N × numActive × _bmQ6KExpStride] — Q8_K-packed silu'd gates
+    private readonly int _bmQ6KExpStride;
 
     // Non-transactional fault latch (mirror of CudaHybridGdnForwardPass._faulted):
     // set at batched-prefill entry, cleared only after the KV/position counters have
@@ -470,6 +481,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                     $"(Q3_K:{_q3kQ8KEnabled} Q8_0:{_q8_0Q8KEnabled} Q4_K:{_q4kQ8KEnabled}). " +
                     "Override with SHARPI_Q3K_Q8K=0 / SHARPI_Q8_0_Q8K=0 / SHARPI_Q4K_Q8K=0.");
             }
+            // Q6_K down experts always dot via Q8_K input; hoist the prepack unconditionally.
+            _hasQ6KDownExp = CudaHybridGdnForwardPass.HasRoutedDownExpertsOfDType(model, hp, DType.Q6_K);
+            if (_hasQ6KDownExp)
+                _bmQ6KExpStride = SimdKernels.Q8KScratchBytes(_expertDim);
         }
 
         string kvTag = _kvDType switch { DType.BFloat16 => " [KV bf16]", DType.Q8_0 => " [KV q8_0]", _ => "" };
@@ -1435,6 +1450,8 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 _bmNormAllQ8K = (byte*)NativeMemory.Alloc((nuint)((long)n * _bmQ8KEmbStride));
                 _bmGateAllQ8K = (byte*)NativeMemory.Alloc((nuint)(sel * _bmQ8KExpStride));
             }
+            if (_hasQ6KDownExp)
+                _bmGateAllQ6KQ8K = (byte*)NativeMemory.Alloc((nuint)(sel * _bmQ6KExpStride));
             _bmPinnedNorm   = _gpu.AllocatePinned(TensorShape.D1((long)n * _embDim));
             _bmPinnedRouted = _gpu.AllocatePinned(TensorShape.D1((long)n * _embDim));
             _bmCapN = n;
@@ -1452,6 +1469,7 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         if (_bmDownPartial != null) { NativeMemory.Free(_bmDownPartial); _bmDownPartial = null; }
         if (_bmNormAllQ8K  != null) { NativeMemory.Free(_bmNormAllQ8K);  _bmNormAllQ8K = null; }
         if (_bmGateAllQ8K  != null) { NativeMemory.Free(_bmGateAllQ8K);  _bmGateAllQ8K = null; }
+        if (_bmGateAllQ6KQ8K != null) { NativeMemory.Free(_bmGateAllQ6KQ8K); _bmGateAllQ6KQ8K = null; }
         if (_bmPinnedNorm is { } pn)   { _gpu.Free(pn); _bmPinnedNorm = null; }
         if (_bmPinnedRouted is { } pr) { _gpu.Free(pr); _bmPinnedRouted = null; }
         _bmCapN = 0;
@@ -1553,6 +1571,10 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
         bool useQ8KDown = (_q3kQ8KEnabled && downDt == DType.Q3_K) || (_q8_0Q8KEnabled && downDt == DType.Q8_0) || (_q4kQ8KEnabled && downDt == DType.Q4_K);
         byte* normAllQ8K = _bmNormAllQ8K; byte* gateAllQ8K = _bmGateAllQ8K;
         int q8kEmbStride = _bmQ8KEmbStride, q8kExpStride = _bmQ8KExpStride;
+        // Issue #410: Q6_K down projection hoists its Q8_K input prepack (see _bmGateAllQ6KQ8K).
+        // Engages whenever the down dtype is Q6_K, independent of the SHARPI_*_Q8K gates.
+        bool downQ6K = downDt == DType.Q6_K;
+        byte* gateAllQ6KQ8K = _bmGateAllQ6KQ8K; int q6kExpStride = _bmQ6KExpStride;
 
         // Bucket (token, slot) pairs by selected expert (CSR layout).
         int* expStart = _bmExpStart!; int* cursor = _bmExpCursor!; int* used = _bmUsedExperts!;
@@ -1690,6 +1712,12 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
             Parallel.For(0, (int)totalSel, s_moeParallelOpts, s =>
                 SimdKernels.QuantizeRowToQ8KS(gateAll + (long)s * expertDim, expertDim,
                     gateAllQ8K + (long)s * q8kExpStride));
+        // Q6_K (issue #410): prepack each silu'd gate slice to Q8_K ONCE, reused across the
+        // expert's down rows below (was re-quantized per down row inside DispatchDot→DotQ6K).
+        else if (downQ6K)
+            Parallel.For(0, (int)totalSel, s_moeParallelOpts, s =>
+                SimdKernels.QuantizeRowToQ8K(gateAll + (long)s * expertDim, expertDim,
+                    gateAllQ6KQ8K + (long)s * q6kExpStride));
 
         // Phase C: down. Parallelize over (used expert, emb-row BLOCK); same row-block
         // structure as Phase A — a quad's 4 silu'd-gate slices are reused across every
@@ -1725,6 +1753,20 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                         downPartial[s3 * embDimL + r] = d3;
                     }
                 }
+                else if (downQ6K)
+                {
+                    byte* q0 = gateAllQ6KQ8K + s0 * q6kExpStride, q1 = gateAllQ6KQ8K + s1 * q6kExpStride;
+                    byte* q2 = gateAllQ6KQ8K + s2 * q6kExpStride, q3 = gateAllQ6KQ8K + s3 * q6kExpStride;
+                    for (int r = rStart; r < rEnd; r++)
+                    {
+                        SimdKernels.DotQ6K_Q8K_4In(downBase + (long)r * bprD, q0, q1, q2, q3, expertDimL,
+                            out float d0, out float d1, out float d2, out float d3);
+                        downPartial[s0 * embDimL + r] = d0;
+                        downPartial[s1 * embDimL + r] = d1;
+                        downPartial[s2 * embDimL + r] = d2;
+                        downPartial[s3 * embDimL + r] = d3;
+                    }
+                }
                 else
                 {
                     float* g0 = gateAll + s0 * expertDimL, g1 = gateAll + s1 * expertDimL;
@@ -1750,6 +1792,9 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                     if (useQ8KDown)
                         DispatchDotQ8K2In(downBase + (long)r * bprD, gateAllQ8K + s0 * q8kExpStride,
                             gateAllQ8K + s1 * q8kExpStride, expertDimL, downDt, out d0, out d1);
+                    else if (downQ6K)
+                        SimdKernels.DotQ6K_Q8K_2In(downBase + (long)r * bprD, gateAllQ6KQ8K + s0 * q6kExpStride,
+                            gateAllQ6KQ8K + s1 * q6kExpStride, expertDimL, out d0, out d1);
                     else
                         DispatchDot2In(downBase + (long)r * bprD, gateAll + s0 * expertDimL,
                             gateAll + s1 * expertDimL, expertDimL, downDt, out d0, out d1);
@@ -1763,7 +1808,9 @@ public sealed unsafe class CudaHybridForwardPass : IForwardPass
                 for (int r = rStart; r < rEnd; r++)
                     downPartial[slot * embDimL + r] = useQ8KDown
                         ? DispatchDotQ8K(downBase + (long)r * bprD, gateAllQ8K + slot * q8kExpStride, expertDimL, downDt)
-                        : DispatchDot(downBase + (long)r * bprD, gateAll + slot * expertDimL, expertDimL, downDt);
+                        : downQ6K
+                            ? SimdKernels.DotQ6K_Q8K(downBase + (long)r * bprD, gateAllQ6KQ8K + slot * q6kExpStride, expertDimL)
+                            : DispatchDot(downBase + (long)r * bprD, gateAll + slot * expertDimL, expertDimL, downDt);
             }
         });
 

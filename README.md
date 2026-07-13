@@ -119,7 +119,7 @@ sharpi-cli -m models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf -g -1 \
 
 | Backend | Prefill t/s | Decode t/s | Notes |
 |---|---:|---:|---|
-| **CUDA** `-g -1` (hybrid) | **29.4** | **28.0** | 29 GPU + 19 CPU layers; routed experts stream through `CudaExpertSlotManager` SLRU (#72/#77). Batched-trunk prefill (#123, bit-identical; `SHARPI_BATCHED_PREFILL=0` to bisect); `SHARPI_EXPERT_STATS=path` for hit rates |
+| **CUDA** `-g -1` (hybrid) | **102.6** | **28.0** | 48-layer trunk on GPU; routed experts auto-select to CPU mmap (expert cache too small for full SLRU offload — `SHARPI_CPU_MOE=0` forces GPU SLRU streaming). Prefill: batched CPU-MoE (#416/#440, bit-identical, default-on) — **3.5× over the per-token path** (29.4); the Q6_K down-projection no longer re-quantizes its input per weight row. `SHARPI_HYBRID_BATCHED_MOE=0` to bisect; `SHARPI_EXPERT_STATS=path` for hit rates |
 | CPU `--tq` | 19.6 | 22.6 | 3-bit KV; FastScan (#34) → 15.5 t/s decode @ 3.2K ctx |
 | CPU | 19.8 | 22.4 | 128 experts / 8 active |
 | Vulkan `-g -1` (hybrid) | 1.2 | 4.9 | 29 GPU + 19 CPU layers, SLRU expert cache + predictive prefetch (`--no-moe-predict-prefetch` to disable). PCIe/expert-stream bound; short-ctx values |
@@ -173,8 +173,8 @@ sharpi-cli -m models/Qwen3.6-27B-MTP-Q4_K_M.gguf -g -1 \
 
 | Backend | Size | Prefill t/s | Decode t/s | Notes |
 |---|---:|---:|---:|---|
-| **CUDA** `-g -1 --no-thinking` (hybrid) | 16 GB | **10.0** | **12.3** | GDN/attn KV resident on GPU, dense FFN on CPU mmap (the k=4 ring reclaims the VRAM the old k=2 default spent on 22 GPU FFN layers). 84% acceptance; 4-input CPU-FFN `MatVec4In` (#209) moves the verify optimum from k=2 → k=4 — **1.9× over MTP-off (6.5)**, +22% over the old k=2 default (10.1) |
-| **CUDA** `-g -1 --no-thinking` `Q5_K_M` (hybrid) | 19 GB | 6.2 | **5.5** | 13/64 FFN on GPU, 51/64 CPU mmap. 98% acceptance; batched trunk (#119) bit-identical |
+| **CUDA** `-g -1 --no-thinking` (hybrid) | 16 GB | **22.0** | **12.3** | GDN/attn KV resident on GPU, dense FFN on CPU mmap (20/64 FFN on GPU, 44 CPU; the k=4 ring reclaims the VRAM the old k=2 default spent on GPU FFN). Prefill: batched CPU dense-FFN (#416/#440, bit-identical, default-on) — **2.2× over the per-token path** (10.0) once the Q6_K down-projection stopped re-quantizing per weight row. Decode: 84% acceptance; 4-input CPU-FFN `MatVec4In` (#209) moves the verify optimum from k=2 → k=4 — **1.9× over MTP-off (6.5)** |
+| **CUDA** `-g -1 --no-thinking` `Q5_K_M` (hybrid) | 19 GB | 9.6 | **5.5** | 12/64 FFN on GPU, 52/64 CPU mmap. Prefill: batched CPU dense-FFN (#416/#440) — **1.5× over per-token** (6.2; smaller than Q4_K_M — only the Q6_K down-proj benefits, the Q5_K gate/up were already fused). 98% acceptance; batched trunk (#119) bit-identical |
 | Vulkan `-g -1 --no-thinking` (hybrid) | 16 GB | 7.6 | **3.9** | GDN/attn + MTP head on GPU, dense FFN CPU mmap. MTP self-spec runs on Vulkan (#357), greedy **byte-identical** to MTP-off — but currently a **slight loss** on throughput (3.9 @ 54% accept vs **4.9 MTP-off**; only wins at very high acceptance, ~5.8 @ 98%) because the dense CPU FFN isn't amortized in batched verify (#371) |
 | CPU `--no-thinking` | 16 GB | 3.0 | **3.6** | dense 27B GDN/attn + native MTP head; auto MTP self-spec (#25) at greedy + `--no-thinking`. 90% draft acceptance; folded k-token batched verify (#30/#207) — 1.2× over MTP-off (3.0) |
 | CPU `--no-thinking` `Q5_K_M` | 19 GB | 2.8 | **3.5** | ~10% slower than Q4_K_M; 100% acceptance |
