@@ -431,8 +431,9 @@ FodyWeavers.xsd
 # JetBrains Rider / IntelliJ
 .idea/
 
-# Claude Code
-.claude/
+# Claude Code — shared config (agents/skills/settings.json) is committed;
+# only per-user local settings are ignored.
+.claude/settings.local.json
 
 # SharpInference specific
 shaders/*.spv
