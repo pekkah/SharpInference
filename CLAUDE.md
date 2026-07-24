@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+Context is layered: this file holds only the always-relevant core. Directory-level
+`CLAUDE.md` files (`src/SharpInference.Engine/`, `src/SharpInference.Vulkan/`,
+`src/SharpInference.TurboQuant/`) load automatically when working in those subtrees,
+and model-specific CLI run recipes live in the `run-models` skill.
+
 ## Project Overview
 
 SharpInference is a high-performance LLM inference engine and image generation pipeline in C# 14 / .NET 10. It reads GGUF model files and runs transformer inference on CPU (AVX2/AVX-512 SIMD), Vulkan compute shaders, and CUDA/cuBLAS. Architectures supported include `llama`/`llama4`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35moe` (hybrid Gated-DeltaNet + attention + MoE), `gemma`/`gemma2`/`gemma3`/`gemma4`, `phi2`/`phi3`, `deepseek2`, and OLMoE. It also supports text-to-image generation (Z-Image-Turbo and FLUX.1), 4× image upscaling via RRDBNet (Real-ESRGAN), and Gemma 4 encoder-free multimodal vision. Targets NativeAOT for single-binary deployment.
@@ -20,130 +25,58 @@ dotnet run --project src/SharpInference.Cli -c Release -- \
   -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -p "prompt" --temp 0
 
 # GPU backend (all layers offloaded; -g/-1 = all layers, --backend cuda|vulkan|auto)
-dotnet run --project src/SharpInference.Cli -c Release -- \
-  -m models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf -p "prompt" --temp 0 -g -1
+# Append: -g -1
 
 # Inspect a GGUF file
 dotnet run --project src/SharpInference.Cli -c Release -- list-metadata -m model.gguf
 dotnet run --project src/SharpInference.Cli -c Release -- list-tensors  -m model.gguf
 
-# Perplexity over a corpus (accuracy gate for KV compression, issue #180). Supports
-# --tq/--tq-mode exactly like the run command (auto = KVarN where supported, else Lloyd-Max).
-dotnet run --project src/SharpInference.Cli -c Release -- \
-  perplexity -m model.gguf -f corpus.txt -c 2048 --tq
-
-# Whole-turn structured output (grammar-constrained decoding, issues #423/#425). Mirrors
-# llama.cpp's -j/--json-schema; the entire response is constrained to the schema. The root
-# must be an object schema with at least one property; --json-schema-ordered emits keys in
-# declared order. Server exposes the same via OpenAI/Anthropic response_format:json_schema.
-dotnet run --project src/SharpInference.Cli -c Release -- \
-  -m model.gguf --temp 0 -p "Extract name and age from: Alice is 30." \
-  -j '{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"]}'
-
-# VibeThinker-1.5B (Qwen2-based math/reasoning, issue #282). Loads as a standard
-# qwen2 GGUF (QKV bias but no output-projection bias, no QK-norm, 28 layers / 2 KV
-# heads, ChatML, tied embeddings). `download-model.ps1 -Model vibethinker` fetches the
-# default Q8_0 (near-lossless); `-Model vibethinker-q4` is the smaller quant. Recommended
-# sampling: temp 0.6, top_p 0.95, top_k 0, and no system prompt (the chat template supplies
-# the math one). Emits a long <think> chain-of-thought then a \boxed{} answer.
-dotnet run --project src/SharpInference.Cli -c Release -- \
-  -m models/VibeThinker-1.5B.Q8_0.gguf -g -1 \
-  --temp 0.6 --top-p 0.95 --top-k 0 \
-  -p "If 5x + 3 = 2x + 18, what is x? Show your reasoning."
-
-# Gemma 4 encoder-free vision (issue #250): pass one or more PNGs with --image and
-# --mmproj (the gemma4uv projector GGUF). CPU-only single-prompt path for now (-g 0).
-dotnet run --project src/SharpInference.Cli -c Release -- \
-  -m models/gemma-4-E4B-it.gguf --mmproj models/gemma4-mmproj.gguf -g 0 \
-  --image photo.png -p "Describe <image>"
-
-# Start API server (OpenAI + Anthropic compatible). SharpInference.Server is the
-# ASP.NET Core library that ships AddSharpInference() / MapSharpInference();
-# SharpInference.Server.Host is the runnable demo host you'd publish.
+# Start API server (OpenAI + Anthropic compatible; Server = library, Server.Host = demo host)
 SHARPI_MODEL=models/SmolLM2-1.7B-Instruct-Q4_K_M.gguf \
   dotnet run --project src/SharpInference.Server.Host -c Release
 
-# NativeAOT publish (the three packable frontends + libraries)
+# NativeAOT publish (packable frontends)
 dotnet publish src/SharpInference.Cli -c Release -r win-x64
 dotnet publish src/SharpInference.Server.Host -c Release -r win-x64
 
 # Benchmarks
 dotnet run --project benchmarks/SharpInference.Bench -c Release -- --filter '*'
 
-# Models: scripts/download-model.ps1 fetches known presets (smollm2, vibethinker,
-# qwen3-8b, olmoe-1b-7b, qwen3-coder-30b-a3b, qwen36-35b-a3b[-mtp], ornith-9b/-35b,
-# gemma4-12b-qat, gemma4-e4b-qat, llama4-scout, z-image-turbo[-q8], realesrgan-x4, ...).
-# Run with `-Model <name>` (PowerShell). See the script header for the full ValidateSet.
-
-# Ornith-1.0 (DeepReinforce, MIT) — agentic-coding "self-scaffolding" RL finetunes of
-# Qwen3.5 / Gemma 4 bases, NOT a new architecture. Self-scaffolding is a training-time
-# technique; at inference they're ordinary transformers. GGUF arches reduce to ones
-# already dispatched: 9B = `qwen35`, 35B/397B = `qwen35moe`. Validated end-to-end
-# (issue #411): the bartowski 9B Q4_K_M GGUF actually ships GDN tensors, so
-# `_sharpi.is_hybrid_ssm` auto-activates and it takes the SAME hybrid Gated-DeltaNet +
-# attention path as the 35B/397B MoE variants (24 GDN + 8 full-attention layers,
-# full_attention_interval=4) — not a plain dense transformer as the arch name alone
-# suggests. Full CUDA offload (-g -1) fits comfortably in 8 GB VRAM (~3 GB weights
-# uploaded; GDN state + dense FFN run on CPU by design of CudaHybridGdnForwardPass).
-# Chat template loads via JinjaChatTemplate and tool calls parse via the qwen35moe-style
-# QwenToolCallAdapter (Qwen3.6 XML `<function=..><parameter=..>` inside `<tool_call>`).
-# They're tagged image-text-to-text, but the Qwen3.5 vision projector is unimplemented —
-# the text GGUF path is text-only, which is what the coding use case needs.
-# `download-model.ps1 -Model ornith-9b` (Q4_K_M, 5.5 GB).
-dotnet run --project src/SharpInference.Cli -c Release -- \
-  -m models/deepreinforce-ai_Ornith-1.0-9B-Q4_K_M.gguf -g -1 \
-  --temp 0.6 --top-p 0.95 --top-k 20 -p "Write a Python LRU cache."
-
-# Image generation with upscaling (Z-Image-Turbo + RRDBNet). ImageCommand auto-detects
-# Z-Image vs FLUX from the model. Z-Image uses a Qwen3-4B text encoder; FLUX uses CLIP-L + T5.
-dotnet run --project src/SharpInference.Cli -c Release -- image \
-  -m models/z_image_turbo-Q5_K_M.gguf \
-  --vae models/z-image-turbo/vae \
-  --qwen-encoder models/Z-Image-AbliteratedV1.Q5_K_M.gguf \
-  --qwen-tokenizer models/z-image-turbo/tokenizer/tokenizer.json \
-  --upscaler models/RealESRGAN_x4plus.safetensors \
-  --upscale-blend 0.8 \
-  -p "a serene mountain lake at sunrise" -W 512 -H 512 --steps 4 -o out.png
-
-# Image generation micro-benchmarks
-dotnet run --project benchmarks/SharpInference.ImageBench -c Release -- --bench --filter '*'
+# Models: pwsh scripts/download-model.ps1 -Model <preset>  (see script header for presets)
 ```
+
+Model-specific recipes — VibeThinker, Ornith-1.0, Gemma 4 vision (`--image`/`--mmproj`),
+image generation + upscaling, perplexity gating (`perplexity`), whole-turn JSON-schema
+structured output (`-j`), DSpark speculative decoding — live in the `run-models` skill
+(`.claude/skills/run-models/SKILL.md`).
 
 ## Architecture
 
 The solution (`SharpInference.slnx`) is a four-layer stack, bottom-up:
 
-1. **Core** (`SharpInference.Core`) — GGUF parser (memory-mapped), BPE/SPM tokenizer (`Microsoft.ML.Tokenizers`), Jinja chat templates (`JinjaChatTemplate`), tool-call adapter, UTF-8 stream decoder, tensor types, model graph, and grammar-constrained decoding (`Grammar/`: `ITokenConstraint` + `JsonSchemaOutputConstraint` for whole-turn JSON-schema structured output, `JsonToolArgumentConstraint` and the per-family tool-argument constraints — Qwen/Gemma — plus `ToolSchemaCompiler`, issues #423/#425). Everything depends on this. Defines the central interfaces (`IComputeBackend`, `IImageOpsBackend`, `IForwardPass`, `ITokenizer`, `ITokenConstraint`).
-2. **Compute Backends** — Three implementations of `IComputeBackend`; `CudaBackend` and `VulkanBackend` also implement `IImageOpsBackend` for convolutional image ops:
+1. **Core** (`SharpInference.Core`) — GGUF parser (memory-mapped), BPE/SPM tokenizer (`Microsoft.ML.Tokenizers`), Jinja chat templates (`JinjaChatTemplate`), tool-call adapter, UTF-8 stream decoder, tensor types, model graph (`ModelGraph.cs` — architecture dispatch), and grammar-constrained decoding (`Grammar/`: `ITokenConstraint`, `JsonSchemaOutputConstraint` for whole-turn structured output, per-family tool-argument constraints, `ToolSchemaCompiler` — issues #423/#425). Everything depends on this. Defines the central interfaces (`IComputeBackend`, `IImageOpsBackend`, `IForwardPass`, `ITokenizer`, `ITokenConstraint`).
+2. **Compute Backends** — three implementations of `IComputeBackend` (`CudaBackend` and `VulkanBackend` also implement `IImageOpsBackend` for convolutional image ops):
    - `SharpInference.Cpu` — AVX2/AVX-512 SIMD kernels (`SimdKernels`), Q4_K_M/Q6_K/Q8 dequantization (`Dequantize`), Gated-DeltaNet kernels (`GdnKernels`), optional OpenBLAS GEMM (`BlasInterop`)
-   - `SharpInference.Vulkan` — Vulkan compute via `Vortice.Vulkan`, SPIR-V shaders, GPU buffer pool
-   - `SharpInference.Cuda` — cuBLAS GEMM + NVRTC runtime-compiled kernels. `CudaTextKernels` (RMSNorm/RoPE/softmax/GQA attention/Q4_K-Q6_K-F32 matvecs/KV-append), `CudaKernels` (im2col + conv for DiT/RRDBNet), `CudaWsKernels` (weight-stationary batched-decode matvecs, issue #194), `CudaRaggedKernels` (ragged batched decode for SnapKV-evicted caches), plus `GpuBufferPool` to eliminate per-GEMM `cudaMalloc`/`cudaFree` overhead
-3. **Engine** (`SharpInference.Engine`) — Forward-pass orchestration, KV cache, sampling, speculative decoding, MoE expert offloading, continuous batching. Depends on Core + backends.
+   - `SharpInference.Vulkan` — Vulkan compute via `Vortice.Vulkan`, SPIR-V shaders (precompiled — see that project's CLAUDE.md), GPU buffer pool
+   - `SharpInference.Cuda` — cuBLAS GEMM + NVRTC runtime-compiled kernels (`CudaTextKernels`, `CudaKernels` for image ops, `CudaWsKernels` weight-stationary batched decode, `CudaRaggedKernels` for SnapKV-evicted caches, `GpuBufferPool`)
+3. **Engine** (`SharpInference.Engine`) — forward-pass orchestration, KV caches, sampling, speculative decoding, MoE expert offloading, continuous batching. See `src/SharpInference.Engine/CLAUDE.md` for the type-level map.
 4. **Frontends** —
-   - **CLI** (`SharpInference.Cli`, `Spectre.Console.Cli`, llama.cpp-compatible flags): `RunCommand` (default text/vision inference; also whole-turn JSON-schema structured output via `-j`/`--json-schema`/`--json-schema-file`), `ImageCommand` (`image` subcommand), `PerplexityCommand` (`perplexity` — accuracy gate over a corpus, honours `--tq`/`--tq-mode`), `ListMetadataCommand` (`list-metadata`), `ListTensorsCommand` (`list-tensors`).
-   - **API Server**: `SharpInference.Server` is an ASP.NET Core class library exposing `AddSharpInference()` / `MapSharpInference()` with the `SharpInferenceServerOptions` options pattern (OpenAI `/v1/chat/completions` + `/v1/models`, Anthropic `/v1/messages`, OpenAI Responses, `/health`, `/metrics`). `SharpInference.Server.Host` is the runnable demo host (one `Program.cs`, AOT-published) that consumes it.
+   - **CLI** (`SharpInference.Cli`, `Spectre.Console.Cli`, llama.cpp-compatible flags): `RunCommand` (default; text/vision + `-j` structured output), `ImageCommand`, `PerplexityCommand`, `ListMetadataCommand`, `ListTensorsCommand`.
+   - **API Server**: `SharpInference.Server` (ASP.NET Core library — `AddSharpInference()` / `MapSharpInference()`, OpenAI `/v1/chat/completions` + `/v1/models`, Anthropic `/v1/messages`, OpenAI Responses, `/health`, `/metrics`); `SharpInference.Server.Host` is the runnable AOT-published demo host.
 
-Supporting libraries:
-- **SharpInference.Diffusion** — Native image-generation pipelines. `ZImagePipeline` (Z-Image-Turbo: `ZImageDiT` single-stream S3-DiT + Qwen3-4B encoder + FLUX VAE) and `ImagePipeline` (`FluxDiT` multi-stream MMDiT + CLIP-L/T5 encoders). Includes `VaeDecoder`, `RRDBNet` (Real-ESRGAN 4× upscaler), `EulerFlowScheduler`, 2D RoPE, FP8 conversion, and Safetensors/GGUF weight loaders. Text encoders live in `TextEncoders/`.
-- **SharpInference.Vision** — Gemma 4 encoder-free vision projector (`gemma4uv`). `VisionModel` loads the mmproj GGUF; `GemmaUvVisionEmbedder` does im2col patches → projection → soft tokens; `ImagePreprocessor`/`ImageIO` handle image loading.
-- **SharpInference.TurboQuant** — KV cache compression. Two codecs: KVarN (Hadamard + dual-axis Sinkhorn variance normalization + asymmetric RTN, 4-bit K / 2-bit V, 128-token tiles — issue #180) and Lloyd-Max codebooks (3-4 bit; severely degrades quality on QK-norm models such as Qwen3, issue #432). `--tq-mode` defaults to `auto`: KVarN where supported, else Lloyd-Max fallback with a quality warning (#436). Lloyd-Max remains the fallback for Vulkan / partial-offload / MoE-on-GPU / SnapKV. KVarN runs on CPU (AVX2 fused read kernels) and the CUDA decode path (CUDA-graph decode + chunked prefill). Codebook data lives in `codebooks/`.
-- **SharpInference.Pipeline** — 3-tier memory hierarchy (VRAM → pinned RAM → NVMe), SLRU expert cache, async prefetcher.
+Supporting libraries: **SharpInference.Diffusion** (Z-Image-Turbo `ZImagePipeline` and FLUX `ImagePipeline` DiTs, `VaeDecoder`, `RRDBNet` upscaler, `EulerFlowScheduler`, text encoders); **SharpInference.Vision** (Gemma 4 `gemma4uv` encoder-free vision projector); **SharpInference.TurboQuant** (KV cache compression — KVarN + Lloyd-Max; see that project's CLAUDE.md); **SharpInference.Pipeline** (3-tier VRAM→RAM→NVMe memory hierarchy, SLRU expert cache, async prefetcher).
 
 ## Key Interfaces & Patterns
 
-- `IComputeBackend` (in Core) is the central abstraction — defines MatMul, RmsNorm, RoPE, Softmax, SiLU, Attention, and memory management. CPU, Vulkan, and CUDA backends implement it.
-- `IImageOpsBackend` (in Core) — extends `IComputeBackend` with convolutional image ops (Conv2d, LeakyRelu, CatChannels, PixelShuffle, Upsample2x). Implemented by `CudaBackend` and `VulkanBackend` for the RRDBNet upscaler and VAE.
-- `IForwardPass` (in Core) — per-token forward pass. Implementations in Engine: `ForwardPass` (CPU dense), `GpuForwardPass` (Vulkan), `CudaForwardPass` (CUDA dense), `HybridForwardPass`/`CudaHybridForwardPass` (dense + MoE expert offload), `HybridGdnForwardPass`/`CudaHybridGdnForwardPass` (qwen35moe hybrid Gated-DeltaNet + MoE). Has `Forward`, `Prefill`, `TruncateTo`, `ResetCache`, `VocabSize`, `MaxSeqLen`.
-- `IBatchedForwardPass` (in Engine) — multi-token batched prefill/decode used by continuous batching.
-- `PagedKvCache` (in Engine) — lazily allocated paged KV cache used by `ForwardPass`. Pages (16 positions) allocated on first write; `TruncateTo` is a soft operation (enables prefix reuse); `Reset` returns pages to a warm pool. Other cache types: `KvCache` (simple), `CudaSequenceKvCache` (per-sequence GPU), `TurboQuantKvCache` (KVarN 4/2-bit or Lloyd-Max 3-4 bit compressed). `IMultiSlotKvCache` abstracts per-sequence/multi-slot caches. `SnapKvSelector` does prefill-time SnapKV eviction; `GdnStateCache` snapshots Gated-DeltaNet state for MTP rollback.
-- `IInferenceEngine` (in Engine) — top-level generation interface used by the server: `GenerateAsync(prompt, sp, ct) → IAsyncEnumerable<string>`. Implemented by `InferenceEngine` (single-user, prefix caching) and `ContinuousBatchingEngine` (multi-user batching, activated via `SHARPI_MAX_BATCH`).
-- `ForwardPass.BatchForwardMulti(tokens[], positions[], caches[])` — batched multi-sequence decode; amortizes weight reads N× across concurrent users. Each sequence has its own `PagedKvCache`. Not supported for MoE or TurboQuant.
-- `ForwardPass.PrefillWithCache(tokens, cache, startPos)` — prefills a per-sequence cache (used by `ContinuousBatchingEngine` during request admission). Admission is chunked (`SHARPI_PREFILL_CHUNK`, default 256 tokens) and interleaved with decode steps; multiple in-flight prompts prefill as one packed pass via `ForwardPass.PrefillPackedMulti` and admission is gated by a KV token budget (`SHARPI_KV_BUDGET_MB`) — issue #183.
-- **Speculative decoding** — `SpeculativeDecoder` (general draft-model speculation), `MtpDecoder` + `MtpBatchTail` (self-speculative Multi-Token Prediction / NEXTN heads, e.g. Qwen3.6-27B-MTP, with folded k-token batched verify, issue #207), `PromptLookupDraft` (prompt-lookup draft), and `DSparkDecoder` + `DSparkDraftModel`/`CudaDSparkDraftModel` (DeepSeek DSpark block-parallel safetensors draft heads, docs/dspark-plan.md / PR #413: EAGLE-3-style backbone conditioned on target hidden-state taps via `IForwardPass.EnableHiddenTaps` — CPU and dense-CUDA targets both capture; rank-256 Markov re-bias + confidence-trimmed verify on the host (`DSparkHostHeads`); greedy only — `--dspark-model <safetensors-or-dir> --temp 0` with `-g 0` or `-g -1`, placement via `DSparkPlacementPlanner` / `--dspark-place` / `SHARPI_DSPARK_*` (GPU draft needs a CUDA target and free VRAM — pass `-c` to bound the target's KV solve); fetch heads with `download-model.ps1 -Model dspark-qwen3-4b`; server: `SHARPI_DSPARK_MODEL` on the single-user engine (`MaxBatchSize` 1), engaging on greedy `enable_thinking:false` requests. On a 4B target the un-graphed verify pass caps DSpark below plain graph-replayed decode — see the plan doc's Phase-4 numbers before benchmarking). Toggle from the CLI (`--mtp`, `--draft-model`) or server (`SpecType`).
-- `Sampler` (in Engine) — temperature, top-k, top-p (nucleus), min-p, repetition penalty, logit bias, and grammar-constrained decoding (applies an `ITokenConstraint` token mask per step — used for tool-argument grammars and whole-turn JSON-schema structured output).
-- MoE expert offload: `ExpertSlotManager`/`CudaExpertSlotManager` (SLRU VRAM expert cache), `MoEPrefetcher` (async SSD→RAM→VRAM), `TierPlanner` + `HardwareProfile` (three-tier placement), `MmapPrefault`, `WarmPinConfig`. `--cpu-moe` / `SHARPI_CPU_MOE` keeps routed experts on the CPU (issues #80/#93).
-- Hot paths use `NativeMemory`, `Span<T>`, and GPU buffers — no managed heap allocations.
-- Unsafe code is used throughout for performance. `AllowUnsafeBlocks` is enabled globally.
+- `IComputeBackend` (Core) — the central abstraction: MatMul, RmsNorm, RoPE, Softmax, SiLU, Attention, memory management. `IImageOpsBackend` extends it with Conv2d/LeakyRelu/CatChannels/PixelShuffle/Upsample2x for the upscaler and VAE.
+- `IForwardPass` (Core) — per-token forward pass (`Forward`, `Prefill`, `TruncateTo`, `ResetCache`). Engine implementations: `ForwardPass` (CPU), `GpuForwardPass` (Vulkan), `CudaForwardPass` (CUDA), `Hybrid*`/`CudaHybrid*` (MoE expert offload), `HybridGdnForwardPass`/`CudaHybridGdnForwardPass` (hybrid Gated-DeltaNet). A numeric change in one usually needs the siblings updated too.
+- `IInferenceEngine` (Engine) — `GenerateAsync(prompt, sp, ct) → IAsyncEnumerable<string>`; `InferenceEngine` (single-user, prefix caching) and `ContinuousBatchingEngine` (multi-user, `SHARPI_MAX_BATCH`).
+- KV caches: `PagedKvCache` (default, lazily paged), `KvCache`, `CudaSequenceKvCache`, `TurboQuantKvCache` (compressed), behind `IMultiSlotKvCache`; `SnapKvSelector` (prefill eviction), `GdnStateCache` (MTP rollback).
+- Speculative decoding: `SpeculativeDecoder` (draft model), `MtpDecoder` (self-speculative MTP/NEXTN), `PromptLookupDraft`, `DSparkDecoder` (DeepSeek DSpark heads). CLI toggles `--mtp` / `--draft-model` / `--dspark-model`; server `SpecType`.
+- `Sampler` (Engine) — temperature, top-k/top-p/min-p, repetition penalty, logit bias, and per-step `ITokenConstraint` masking for grammar-constrained output.
+- Hot paths use `NativeMemory`, `Span<T>`, and GPU buffers — no managed heap allocations. Unsafe code is normal; `AllowUnsafeBlocks` is global.
+
+Full detail: `src/SharpInference.Engine/CLAUDE.md` (type-level engine map) and `docs/SharpInference-Design.md` (authoritative subsystem reference).
 
 ## Build Constraints
 
@@ -152,7 +85,7 @@ Shared settings live in `Directory.Build.props` (net10.0, LangVersion 14, Nullab
 - **TreatWarningsAsErrors** is enabled globally — all warnings must be resolved.
 - **Trim and AOT analyzers** are enabled (`IsTrimmable`, `EnableTrimAnalyzer`, `EnableAotAnalyzer`, warnings not suppressed) — code must be NativeAOT-compatible (no reflection-heavy patterns, no dynamic code generation). Server JSON uses a source-generated `SharpInferenceJsonContext`.
 - **InvariantGlobalization** is on — no culture-specific string operations.
-- Vulkan shaders are GLSL `const string`s in `src/SharpInference.Vulkan/Shaders.cs`, precompiled to SPIR-V committed in `Shaders.Precompiled.g.cs` (keyed by an FNV-1a `ShaderCompiler.StableHash`) so the NativeAOT binary needs no glslc at runtime; `ShaderCompiler.Compile` falls back to glslc only on a table miss. After adding/editing/removing a shader const, regenerate the table with `scripts/gen-spirv.ps1` (runs `tools/SpirvGen`, needs the Vulkan SDK) — `VulkanPrecompiledShaderTests` fails on drift. Shaders needing extensions the bundled glslc lacks (`SgemmBf16`, `SgemmFp8`) are recorded in `SkippedShaders` and fall back at runtime by design.
+- Vulkan shaders are precompiled to a committed SPIR-V table; editing any GLSL const in `src/SharpInference.Vulkan/Shaders.cs` requires regenerating it with `scripts/gen-spirv.ps1` or `VulkanPrecompiledShaderTests` fails on drift. Details in `src/SharpInference.Vulkan/CLAUDE.md`.
 - Versioning is MinVer-derived from git tags (`v*`); only the `SharpInference` meta-package, `SharpInference.Server`, and `SharpInference.Cli` are packable.
 
 ## Test Projects
@@ -171,13 +104,9 @@ Over 1,000 tests across 7 projects (xUnit, `[Fact]`/`[Theory]`):
 
 Shared test data lives in `tests/fixtures/`.
 
-## Samples & Scripts
+## Samples, Scripts & Docs
 
-- `samples/SharpInference.Sample.Chat` — minimal streaming chat using the library directly.
-- `samples/SharpInference.Sample.ToolCall` — tool/function-calling flow.
-- `benchmarks/` — `SharpInference.Bench` (text-inference BenchmarkDotNet suite), `SharpInference.ImageBench` (image-generation micro-benchmarks), and `SnapKvEval` (SnapKV eviction quality/accuracy evaluation harness).
-- `scripts/` — PowerShell benchmark drivers (`bench-*.ps1`), `download-model.ps1` (model fetcher), `setup-openblas.ps1` / `setup-llamacpp.ps1`, and Python reference-generation helpers for llama.cpp cross-checking (`gemma4uv_ref.py`, `extract_reference.py`, `compare_tokens.py`).
-
-## Design Documentation
-
-Detailed architecture doc at `docs/SharpInference-Design.md` covering all subsystems, algorithms, data layouts, and the (mostly completed) implementation phases. `docs/research/` and the various `docs/*-plan.md` files hold per-feature design notes (Gemma 4, qwen35moe, MoE offloading, KV-compression feasibility).
+- `samples/` — `Sample.Chat` (streaming chat via the library), `Sample.ToolCall` (function-calling flow).
+- `benchmarks/` — `SharpInference.Bench` (text), `SharpInference.ImageBench` (image), `SnapKvEval` (eviction quality harness).
+- `scripts/` — benchmark drivers (`bench-*.ps1`), `download-model.ps1`, `setup-openblas.ps1` / `setup-llamacpp.ps1`, llama.cpp cross-check helpers (see the `parity-check` skill).
+- `docs/SharpInference-Design.md` — authoritative architecture doc; `docs/*-plan.md` + `docs/research/` hold per-feature design notes.

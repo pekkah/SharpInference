@@ -39,6 +39,16 @@ main-thread model, so both modes work without touching the agent files.
 | `vulkan-shaders` | auto on `src/SharpInference.Vulkan/**` | gen-spirv.ps1 regen workflow; prevents precompiled-table drift |
 | `parity-check` | auto/manual | llama.cpp cross-check + reference logits + perplexity gate, in escalation order |
 | `new-arch` | auto/manual | End-to-end checklist for new GGUF architecture bring-up |
+| `run-models` | auto/manual | Model-specific CLI recipes (VibeThinker, Ornith, vision, image gen, DSpark, …) moved out of CLAUDE.md |
+
+## Context layering
+
+Root `CLAUDE.md` holds only always-relevant core (~10 KB). Deep detail lives in
+directory-level CLAUDE.md files that load only when working in that subtree:
+`src/SharpInference.Engine/` (type-level engine map), `src/SharpInference.Vulkan/`
+(shader table workflow), `src/SharpInference.TurboQuant/` (KVarN/Lloyd-Max notes).
+Keep it that way — new always-on facts go in root only if they apply to most
+sessions; otherwise extend a directory file or a skill.
 
 ## GitHub issues are the work intake
 
