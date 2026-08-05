@@ -125,6 +125,17 @@ public static class AnthropicEndpoints
                     SharpInferenceJsonContext.Default.AErrorResponse), ctx.RequestAborted);
             return;
         }
+        catch (ChatTemplateException ex)
+        {
+            // See the matching handler in OpenAiEndpoints: a template that rejects its message
+            // list is reporting bad input, not a server fault.
+            ctx.Response.StatusCode = 400;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(
+                JsonSerializer.Serialize(new AErrorResponse("invalid_request_error", ex.Message),
+                    SharpInferenceJsonContext.Default.AErrorResponse), ctx.RequestAborted);
+            return;
+        }
 
         if (images.Count > 0 && !engine.SupportsImageInput)
         {
