@@ -44,6 +44,15 @@ public sealed class JinjaChatTemplate
     /// </summary>
     public string? BosToken { get; init; }
 
+    /// <summary>
+    /// EOS token string for this model (e.g. <c>&lt;/s&gt;</c>), or null if unknown. Seeded by
+    /// <see cref="GgufTokenizer"/> at construction, exactly like <see cref="BosToken"/>. Mistral
+    /// and Llama templates close every assistant turn with <c>{{ message["content"] + eos_token }}</c>;
+    /// with no value the variable renders empty, so multi-turn history arrives with no turn
+    /// boundaries at all and the model cannot tell where one reply ended and the next began.
+    /// </summary>
+    public string? EosToken { get; init; }
+
     public JinjaChatTemplate(string source) => _nodes = ParseTemplate(source);
 
     /// <summary>
@@ -58,6 +67,8 @@ public sealed class JinjaChatTemplate
         // from the model metadata unless the caller passed its own — otherwise the prompt gets no BOS.
         if (BosToken != null && !ctx.ContainsKey("bos_token"))
             ctx["bos_token"] = BosToken;
+        if (EosToken != null && !ctx.ContainsKey("eos_token"))
+            ctx["eos_token"] = EosToken;
         var sb  = new StringBuilder();
         EvalNodes(_nodes, ctx, sb);
         return sb.ToString();
@@ -70,7 +81,7 @@ public sealed class JinjaChatTemplate
     private sealed record OutputNode(IExpr Expr) : INode;
     private sealed record IfNode(IExpr Cond, List<INode> Then,
         List<(IExpr Cond, List<INode> Body)> ElseIfs, List<INode>? Else) : INode;
-    private sealed record ForNode(string Var, IExpr Iter, List<INode> Body) : INode;
+    private sealed record ForNode(string Var, IExpr Iter, List<INode> Body, IExpr? Filter = null) : INode;
     private sealed record SetNode(string[] Path, IExpr Value) : INode;
     private sealed record BlockSetNode(string[] Path, List<INode> Body) : INode;
     private sealed record MacroNode(string Name, MacroDef Def) : INode;
@@ -94,7 +105,7 @@ public sealed class JinjaChatTemplate
     private sealed record CallExpr(string Name, List<IExpr> Args, List<(string Key, IExpr Val)> Kwargs) : IExpr;
     private sealed record MethodExpr(IExpr Obj, string Method, List<IExpr> Args) : IExpr;
     private sealed record FilterExpr(IExpr Value, string Filter, List<IExpr>? Args = null) : IExpr;
-    private sealed record IsTestExpr(IExpr Value, string Test, bool Negated) : IExpr;
+    private sealed record IsTestExpr(IExpr Value, string Test, bool Negated, IExpr? Arg = null) : IExpr;
 
     // ── Lexer ─────────────────────────────────────────────────────────────
 
@@ -384,11 +395,26 @@ public sealed class JinjaChatTemplate
         int inIdx = FindWordBoundary(spec, "in");
         if (inIdx < 0) throw new FormatException($"Invalid for spec: {spec}");
         string varName = spec[..inIdx].Trim();
-        var iter = ParseExpr(spec[(inIdx + 2)..].Trim());
+        string iterSpec = spec[(inIdx + 2)..].Trim();
+
+        // Jinja's loop filter: `{% for k, v in tool.items() if k != "return" %}` keeps only the
+        // items passing the condition, with the loop variables in scope. Handing the whole
+        // remainder to ParseExpr instead parsed it as a ternary (`else` is optional), which
+        // evaluated the condition ONCE before the loop with the loop variables still undefined —
+        // so the filter never excluded anything. Split it off and evaluate it per item.
+        IExpr? filter = null;
+        int ifIdx = FindWordBoundary(iterSpec, "if");
+        if (ifIdx >= 0)
+        {
+            filter = ParseExpr(iterSpec[(ifIdx + 2)..].Trim());
+            iterSpec = iterSpec[..ifIdx].Trim();
+        }
+
+        var iter = ParseExpr(iterSpec);
         var body = ParseNodes(tokens, ref pos);
         if (pos < tokens.Count && tokens[pos].Kind == TokenKind.Block && tokens[pos].Content == "endfor")
             pos++;
-        return new ForNode(varName, iter, body);
+        return new ForNode(varName, iter, body, filter);
     }
 
     private static void AssignSet(string[] path, object? val, Dictionary<string, object?> ctx)
@@ -421,7 +447,25 @@ public sealed class JinjaChatTemplate
 
     // ── Expression Parser ─────────────────────────────────────────────────
 
-    private static IExpr ParseExpr(string s) => new ExprParser(s).Parse();
+    /// <summary>
+    /// Parses a complete expression, warning once if the parser stopped early.
+    ///
+    /// <para>Nothing previously checked that the input was fully consumed, so an unsupported
+    /// operator silently truncated the expression and left a plausible-looking but wrong AST —
+    /// which is how a missing <c>%</c> turned Mistral's alternation guard into a condition that
+    /// always fired. This stays a warning rather than a throw: a hard failure would lose the
+    /// whole template (and the model with it) for any construct not yet supported, whereas the
+    /// diagnostic makes the gap visible without regressing templates that render acceptably
+    /// today.</para>
+    /// </summary>
+    private static IExpr ParseExpr(string s)
+    {
+        var parser = new ExprParser(s);
+        var expr = parser.Parse();
+        if (parser.Pos < s.Length && !string.IsNullOrWhiteSpace(s[parser.Pos..]))
+            WarnUnsupportedOnce("expression", $"{s} (stopped at '{s[parser.Pos..]}')");
+        return expr;
+    }
 
     private sealed class ExprParser(string src)
     {
@@ -501,7 +545,18 @@ public sealed class JinjaChatTemplate
                 if (MatchWord("not")) negated = true;
                 Skip();
                 string test = ReadIdent();
-                return new IsTestExpr(left, test, negated);
+                // Parameterised tests: `x is equalto("user")`, `x is gt(3)`. Without this the
+                // argument list was left unconsumed and silently discarded along with whatever
+                // followed it.
+                Skip();
+                IExpr? testArg = null;
+                if (Pos < _s.Length && _s[Pos] == '(')
+                {
+                    Pos++;
+                    var testArgs = ParseArgList(')');
+                    if (testArgs.Count > 0) testArg = testArgs[0];
+                }
+                return new IsTestExpr(left, test, negated, testArg);
             }
 
             string op = "";
@@ -526,15 +581,54 @@ public sealed class JinjaChatTemplate
 
         private IExpr ParseAdd()
         {
-            var left = ParseUnary();
+            var left = ParseMul();
             Skip();
             while (Pos < _s.Length && (_s[Pos] == '+' || _s[Pos] == '-' || _s[Pos] == '~'))
             {
                 // Don't eat '-' that starts a negative number following whitespace (ambiguous)
                 char op = _s[Pos++];
                 Skip();
-                var right = ParseUnary();
+                var right = ParseMul();
                 left = new BinExpr(op == '~' ? "~" : op.ToString(), left, right);
+                Skip();
+            }
+            return left;
+        }
+
+        /// <summary>
+        /// Multiplicative operators, binding tighter than <c>+</c>/<c>-</c>: <c>*</c>, <c>/</c>
+        /// (true division), <c>//</c> (floor division) and <c>%</c> (modulo).
+        ///
+        /// <para>Modulo is what Mistral's v3 template needs — <c>(message["role"] == "user") !=
+        /// (ns.index % 2 == 0)</c> is its user/assistant alternation check. Without these
+        /// operators the parser stopped at the <c>%</c> and, because nothing verified that the
+        /// expression was fully consumed, silently discarded the rest — turning the condition into
+        /// <c>… != ns.index</c>, which fires the template's raise_exception on the first message.
+        /// </para>
+        /// </summary>
+        private IExpr ParseMul()
+        {
+            var left = ParseUnary();
+            Skip();
+            while (Pos < _s.Length)
+            {
+                string op;
+                if (_s[Pos] == '*') { op = "*"; Pos++; }
+                else if (_s[Pos] == '%')
+                {
+                    // `%` also closes a block tag (`%}`) — never treat that as an operator.
+                    if (Pos + 1 < _s.Length && _s[Pos + 1] == '}') break;
+                    op = "%"; Pos++;
+                }
+                else if (_s[Pos] == '/')
+                {
+                    if (Pos + 1 < _s.Length && _s[Pos + 1] == '/') { op = "//"; Pos += 2; }
+                    else { op = "/"; Pos++; }
+                }
+                else break;
+
+                Skip();
+                left = new BinExpr(op, left, ParseUnary());
                 Skip();
             }
             return left;
@@ -818,22 +912,28 @@ public sealed class JinjaChatTemplate
                     string[]? tupleVarNames = isTupleFor
                         ? fn.Var.Split(',').Select(v => v.Trim()).ToArray()
                         : null;
+
+                    // Apply `{% for x in xs if cond %}` up front so loop.index/length/last all
+                    // describe the filtered sequence, as Jinja does.
+                    if (fn.Filter is not null)
+                    {
+                        var kept = new List<object?>(items.Count);
+                        foreach (var item in items)
+                        {
+                            var testCtx = new Dictionary<string, object?>(ctx, StringComparer.Ordinal);
+                            BindLoopVars(testCtx, fn.Var, tupleVarNames, item);
+                            if (Truthy(Eval(fn.Filter, testCtx))) kept.Add(item);
+                        }
+                        items = kept;
+                    }
+
                     for (int i = 0; i < items.Count; i++)
                     {
                         var loopCtx = new Dictionary<string, object?>(ctx, StringComparer.Ordinal)
                         {
                             ["loop"] = new LoopCtx(i, items.Count, items)
                         };
-                        if (tupleVarNames != null)
-                        {
-                            var pair = AsList(items[i]);
-                            for (int j = 0; j < tupleVarNames.Length; j++)
-                                loopCtx[tupleVarNames[j]] = j < pair.Count ? pair[j] : null;
-                        }
-                        else
-                        {
-                            loopCtx[fn.Var] = items[i];
-                        }
+                        BindLoopVars(loopCtx, fn.Var, tupleVarNames, items[i]);
                         EvalNodes(fn.Body, loopCtx, sb);
                         // Propagate NamespaceObj mutations back to outer scope
                         foreach (var kv in loopCtx)
@@ -856,6 +956,23 @@ public sealed class JinjaChatTemplate
                     break;
             }
         }
+    }
+
+    /// <summary>
+    /// Binds a loop's variable(s) for one item — a single name, or the tuple form
+    /// <c>{% for k, v in … %}</c>, which unpacks the item positionally.
+    /// </summary>
+    private static void BindLoopVars(
+        Dictionary<string, object?> ctx, string varName, string[]? tupleVarNames, object? item)
+    {
+        if (tupleVarNames is null)
+        {
+            ctx[varName] = item;
+            return;
+        }
+        var parts = AsList(item);
+        for (int j = 0; j < tupleVarNames.Length; j++)
+            ctx[tupleVarNames[j]] = j < parts.Count ? parts[j] : null;
     }
 
     private static object? Eval(IExpr expr, Dictionary<string, object?> ctx)
@@ -888,7 +1005,9 @@ public sealed class JinjaChatTemplate
                 return ov is long il ? -il : -(long)Convert.ToInt64(ov);
 
             case IsTestExpr it:
-                bool r = EvalIsTest(Eval(it.Value, ctx), it.Test, ctx);
+                bool r = it.Arg is null
+                    ? EvalIsTest(Eval(it.Value, ctx), it.Test, ctx)
+                    : TestValue(Eval(it.Value, ctx), it.Test, Eval(it.Arg, ctx));
                 return it.Negated ? !r : r;
 
             case FilterExpr f:
@@ -921,6 +1040,12 @@ public sealed class JinjaChatTemplate
             "+"  => (l is string || r is string) ? Stringify(l) + Stringify(r)
                     : (object)(ToLong(l) + ToLong(r)),
             "-"  => (object)(ToLong(l) - ToLong(r)),
+            "*"  => (object)(ToLong(l) * ToLong(r)),
+            // Python/Jinja semantics: `%` and `//` floor toward negative infinity, unlike C#'s
+            // truncating `%` and `/`. Matters for the negative-index arithmetic templates do.
+            "%"  => ToLong(r) == 0 ? null : (object)FloorMod(ToLong(l), ToLong(r)),
+            "//" => ToLong(r) == 0 ? null : (object)FloorDiv(ToLong(l), ToLong(r)),
+            "/"  => ToLong(r) == 0 ? null : (object)((double)ToLong(l) / ToLong(r)),
             "~"  => Stringify(l) + Stringify(r),
             "==" => EqValues(l, r),
             "!=" => !EqValues(l, r),
@@ -932,6 +1057,20 @@ public sealed class JinjaChatTemplate
             "not in" => !ContainsOp(l, r),
             _ => null
         };
+    }
+
+    /// <summary>Floor division (Python <c>//</c>), which rounds toward negative infinity.</summary>
+    private static long FloorDiv(long a, long b)
+    {
+        long q = a / b;
+        return (a % b != 0 && (a < 0) != (b < 0)) ? q - 1 : q;
+    }
+
+    /// <summary>Floor modulo (Python <c>%</c>), whose result takes the sign of the divisor.</summary>
+    private static long FloorMod(long a, long b)
+    {
+        long m = a % b;
+        return (m != 0 && (m < 0) != (b < 0)) ? m + b : m;
     }
 
     private static bool EvalIsTest(object? val, string test, Dictionary<string, object?> ctx) =>
@@ -991,6 +1130,13 @@ public sealed class JinjaChatTemplate
                 if (i < 0) i += list.Count;
                 return i >= 0 && i < list.Count ? list[i] : null;
             }
+            // Strings index by character, with Python's negative-from-the-end convention.
+            case string s:
+            {
+                int i = (int)ToLong(idx);
+                if (i < 0) i += s.Length;
+                return i >= 0 && i < s.Length ? s[i].ToString() : null;
+            }
             case Dictionary<string, object?> d:
                 return idx is string k && d.TryGetValue(k, out var v) ? v : null;
             case IReadOnlyDictionary<string, object?> rd:
@@ -1001,6 +1147,16 @@ public sealed class JinjaChatTemplate
 
     private static object? GetSlice(object? obj, object? start, object? stop, object? step)
     {
+        // Strings slice like sequences and return a string, not a list. Mistral's v3 template
+        // relies on `tool_call.function|tojson` then `out[:-1]` to reopen the JSON object and
+        // splice in the call id; without this the slice yielded null and the whole tool-call
+        // body rendered as an empty string.
+        if (obj is string str)
+        {
+            var chars = GetSlice(str.Select(c => (object?)c.ToString()).ToList(), start, stop, step);
+            return chars is List<object?> cl ? string.Concat(cl.Select(Stringify)) : null;
+        }
+
         // See GetIndex (#131): match the non-generic IList so List<Dictionary<…>> and
         // arrays slice correctly, not just List<object?>.
         if (obj is not System.Collections.IList list) return null;
@@ -1036,7 +1192,14 @@ public sealed class JinjaChatTemplate
         "reverse"   => val is List<object?> lr ? (object)Enumerable.Reverse(lr).ToList() : val,
         "sort"      => val is List<object?> ls ? (object)ls.OrderBy(Stringify).ToList() : val,
         "unique"    => val is List<object?> lu ? (object)lu.Distinct().ToList() : val,
-        "list"      => val is List<object?> ? val : (val is string sv2 ? sv2.Select(c => (object?)(string.Concat(c))).ToList() : null),
+        // Materialise any sequence, not just List<object?> — a caller-built
+        // List<Dictionary<string,object?>> is the natural message-list shape and is NOT a
+        // List<object?> (generic invariance), so the narrow check returned null and silently
+        // emptied the pipeline it was part of.
+        "list"      => val is List<object?> ? val
+                     : val is string sv2 ? sv2.Select(c => (object?)string.Concat(c)).ToList()
+                     : val is System.Collections.IEnumerable le ? le.Cast<object?>().ToList()
+                     : null,
         "string"    => (object?)Stringify(val),
         "int"       => (object?)ToLong(val),
         "float"     => Convert.ToDouble(val),
@@ -1067,7 +1230,53 @@ public sealed class JinjaChatTemplate
                     ? string.Join(args.Count > 0 ? Stringify(args[0]) : "",
                                   en.Cast<object?>().Select(Stringify))
                     : val,
+        // `seq | selectattr('role', 'equalto', 'user')` — keep items whose attribute passes a
+        // named test; `rejectattr` drops them. Mistral's v3 template uses this to find the last
+        // user message so it can attach the tool list to that turn. Previously this fell through
+        // to UnknownArgFilter and returned the list unnarrowed, so "the last user message"
+        // resolved to whatever message came last, of any role.
+        "selectattr" => AttrFilter(val, args, keep: true),
+        "rejectattr" => AttrFilter(val, args, keep: false),
         _ => UnknownArgFilter(val, filter),
+    };
+
+    /// <summary>
+    /// Backs <c>selectattr</c>/<c>rejectattr</c>. One argument tests the attribute for truthiness;
+    /// two or more name a test and its operand, e.g. <c>('role', 'equalto', 'user')</c>.
+    /// </summary>
+    private static object? AttrFilter(object? val, List<object?> args, bool keep)
+    {
+        if (val is not System.Collections.IEnumerable seq || val is string || args.Count == 0)
+            return val;
+
+        string attr = Stringify(args[0]);
+        string? test = args.Count > 1 ? Stringify(args[1]) : null;
+        object? operand = args.Count > 2 ? args[2] : null;
+
+        var result = new List<object?>();
+        foreach (var item in seq)
+        {
+            var av = GetAttr(item, attr);
+            bool pass = test is null ? Truthy(av) : TestValue(av, test, operand);
+            if (pass == keep) result.Add(item);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Named comparison tests usable both as <c>selectattr</c> arguments and as parameterised
+    /// <c>is</c> tests (<c>x is equalto(y)</c>). Jinja's own aliases are kept.
+    /// </summary>
+    private static bool TestValue(object? val, string test, object? operand) => test switch
+    {
+        "equalto" or "eq" or "==" => EqValues(val, operand),
+        "ne" or "!=" => !EqValues(val, operand),
+        "gt" or "greaterthan" or ">" => Compare(val, operand) > 0,
+        "ge" or ">=" => Compare(val, operand) >= 0,
+        "lt" or "lessthan" or "<" => Compare(val, operand) < 0,
+        "le" or "<=" => Compare(val, operand) <= 0,
+        "in" => ContainsOp(val, operand),
+        _ => EvalIsTest(val, test, new()),
     };
 
     private static object? UnknownArgFilter(object? val, string filter)
@@ -1194,7 +1403,10 @@ public sealed class JinjaChatTemplate
         if (name is "raise_exception" or "raise")
         {
             string msg = args.Count > 0 ? Stringify(args[0]) : "Template error";
-            throw new InvalidOperationException($"Template error: {msg}");
+            // ChatTemplateException (an InvalidOperationException) marks this as the template
+            // rejecting its INPUT rather than an engine fault, so endpoints can answer 400
+            // instead of 500. See ChatTemplateException for why the distinction matters.
+            throw new ChatTemplateException($"Template error: {msg}");
         }
         if (name == "range")
         {

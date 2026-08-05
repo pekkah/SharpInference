@@ -118,12 +118,47 @@ public sealed class ToolGrammarConstraintTests(ITestOutputHelper output)
 
         Feed(c, tok, "Berlin");
         c.Accept(quote);                              // close the string
-        // location satisfied → `}` and `,` both legal now.
+        // The only required key is satisfied, so `}` closes the object.
         Assert.True(Allowed(c, tok, vocab.VocabSize, Id(tok, "}")));
-        Assert.True(Allowed(c, tok, vocab.VocabSize, Id(tok, ",")));
+        // …but `,` is refused: it commits to another key and this schema declares none, which
+        // would strand the machine in OExpectKey where only whitespace is legal and `}` is no
+        // longer accepted. See the comma gate in GemmaToolArgumentConstraint.StepObject.
+        Assert.False(Allowed(c, tok, vocab.VocabSize, Id(tok, ",")));
 
         c.Accept(Id(tok, "}"));
         Assert.False(c.IsConstraining);               // object closed → back to watching
+    }
+
+    [Fact]
+    public void CommaAllowedOnlyWhileAnotherKeyRemains()
+    {
+        var tok = Tok();
+        if (tok is null) { output.WriteLine("missing model — skip"); return; }
+        var vocab = new GrammarVocabulary(tok);
+        int quote = vocab.TryGetSpecialToken("<|\"|>", out int q) ? q : -1;
+        Assert.True(quote > 0);
+
+        // Two declared keys, so after the first value a second key genuinely can follow.
+        var schema = Schema("get_weather",
+            """{"type":"object","properties":{"location":{"type":"string"},"unit":{"type":"string"}},"required":["location"]}""");
+        var c = new Gemma4ToolCallAdapter().BuildArgumentConstraint([schema], vocab)!;
+
+        Feed(c, tok, "<|tool_call>call:get_weather{location:");
+        c.Accept(quote);
+        Feed(c, tok, "Berlin");
+        c.Accept(quote);
+
+        // `unit` is still unemitted → `,` is legal here, and `}` too (only location is required).
+        Assert.True(Allowed(c, tok, vocab.VocabSize, Id(tok, ",")));
+        Assert.True(Allowed(c, tok, vocab.VocabSize, Id(tok, "}")));
+
+        // Emit the second pair; now every declared key is spent and `,` closes off.
+        Feed(c, tok, ",unit:");
+        c.Accept(quote);
+        Feed(c, tok, "celsius");
+        c.Accept(quote);
+        Assert.False(Allowed(c, tok, vocab.VocabSize, Id(tok, ",")));
+        Assert.True(Allowed(c, tok, vocab.VocabSize, Id(tok, "}")));
     }
 
     [Fact]

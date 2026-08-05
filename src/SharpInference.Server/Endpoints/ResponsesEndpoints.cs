@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.Options;
+using SharpInference.Core;
 using SharpInference.Engine;
 
 namespace SharpInference.Server.Endpoints;
@@ -54,7 +55,19 @@ public static class ResponsesEndpoints
         // forces it off globally. /v1/responses has no per-request thinking flag, so the family
         // default + the server kill-switch are the whole decision.
         bool enableThinking = !chatTemplate.ModelDefaultsThinkingOff && !opts.DisableThinking;
-        var prompt = chatTemplate.Format(messages, enableThinking);
+        string prompt;
+        try
+        {
+            prompt = chatTemplate.Format(messages, enableThinking);
+        }
+        catch (ChatTemplateException)
+        {
+            // The template rejected the message list (e.g. non-alternating roles) — bad input,
+            // not a server fault. This endpoint reports plain status codes, matching the JSON
+            // handling directly above.
+            ctx.Response.StatusCode = 400;
+            return;
+        }
 
         var sp = SamplingParamsBuilder.Build(opts,
             temperature: req.Temperature,
