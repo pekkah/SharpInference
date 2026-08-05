@@ -199,17 +199,30 @@ public sealed unsafe class CudaKvarnPrefillTests(ITestOutputHelper output)
     // ─────────────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Full-path A/B on Qwen3-0.6B (window 256, prompt 640 → promotions at positions
-    /// 256/384/512 → 3 compressed tiles): the chunked driver must land the SAME
-    /// promotion cadence and tile position ranges as the per-token loop, produce
-    /// near-identical packed tiles (codes ±1 step under batched-GEMM/flash noise),
-    /// parity logits at the last prompt position, and the same greedy continuation.
+    /// Full-path A/B (window 256, prompt 640 → promotions at positions 256/384/512 → 3
+    /// compressed tiles): the chunked driver must land the SAME promotion cadence and tile
+    /// position ranges as the per-token loop, produce near-identical packed tiles (codes ±1
+    /// step under batched-GEMM/flash noise), parity logits at the last prompt position, and
+    /// the same greedy continuation.
+    ///
+    /// <para>
+    /// Run over both RoPE conventions. Qwen3-0.6B is NEOX (head_dim 128); SmolLM2-1.7B is
+    /// `llama`-arch NORM/interleaved (head_dim 64) and only reaches this driver because the
+    /// #407 follow-up dropped the NEOX-only gate — the chunk trunk's RoPE already dispatched
+    /// on the model's convention, so the gate, not the kernels, was what forced every
+    /// llama-arch KVarN prompt onto the per-token loop. Covering NORM here is what keeps a
+    /// future edit from silently mis-rotating those chunks (the failure #407 found latent in
+    /// PrefillPackedTrunkMulti): a wrong rotation moves K/V into different tiles entirely,
+    /// which the tile-content and continuation asserts below catch loudly.
+    /// </para>
     /// </summary>
-    [Fact]
-    public void CudaForwardPass_KvarnChunkedPrefill_MatchesPerToken()
+    [Theory]
+    [InlineData("Qwen3-0.6B-Q8_0.gguf")]                // NEOX rope, head_dim 128
+    [InlineData("SmolLM2-1.7B-Instruct-Q4_K_M.gguf")]   // NORM/interleaved rope, head_dim 64
+    public void CudaForwardPass_KvarnChunkedPrefill_MatchesPerToken(string modelFile)
     {
         if (!CudaBackend.IsAvailable()) return;
-        var path = FindModelPath();
+        var path = FindModelPath(modelFile);
         if (path is null) return;
 
         const int PromptLen = 640;
@@ -318,6 +331,18 @@ public sealed unsafe class CudaKvarnPrefillTests(ITestOutputHelper output)
     /// no cross-path dp4a-vs-MMQ noise), the packed tiles must match BYTE-EXACTLY.
     /// This is the strongest schedule check: any off-by-one in the promotion
     /// cadence or append slots would shift a whole row into the wrong tile.
+    ///
+    /// <para>
+    /// Deliberately pinned to the Q8_0 fixture. Byte-exactness across chunk plans needs a
+    /// chunk-size-INVARIANT trunk matmul, which the Q8_0 MMQ path gives and the Q4_K one does
+    /// not: re-running this comparison on Q4_K models lands ~5-7% of tile codes off by a step
+    /// or two purely from the different per-launch N (measured at 5.2% on Qwen3-8B-Q4_K_M,
+    /// NEOX, and 7.1% on SmolLM2-1.7B-Q4_K_M, NORM — the dtype, not the rope convention).
+    /// That is the same argmax-stable band the cross-path A/B above tolerates, so it is noise
+    /// rather than a schedule bug — but it means a Q4_K case added here would assert a
+    /// property the kernels never promised. NORM-rope schedule coverage lives in that A/B
+    /// test instead, where the thresholds are calibrated for it.
+    /// </para>
     /// </summary>
     [Fact]
     public void CudaForwardPass_KvarnChunkedPrefill_SplitCall_MatchesSingleShot()

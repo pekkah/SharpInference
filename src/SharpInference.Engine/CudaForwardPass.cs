@@ -1224,6 +1224,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         if (hp.HasLayerOutputScale) _layerOutputScale = new float[L];
 
         TraceVram("before per-layer weight upload");
+        WarnIfWeightsWontFit(model, gpu);
         Console.Error.Write($"[CudaForwardPass] Uploading {L} layers to VRAM...");
         for (int i = 0; i < L; i++)
         {
@@ -3042,7 +3043,8 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     /// hard-excludes TQ), narrowed further to what the KVarN chunk shapes need:
     /// <list type="bullet">
     ///   <item>plain dense trunk — no MoE, no Gemma-4 features (PLE/SWA/shared-KV/
-    ///         per-layer head_dim), no attention bias, NEOX RoPE, weighted-or-no QK-norm;</item>
+    ///         per-layer head_dim), no attention bias, weighted-or-no QK-norm, and a RoPE
+    ///         convention the batched trunk can rotate (see the freq-factor note below);</item>
     ///   <item>head_dim 64 or 128 — the streaming prefill-attention kernel's shared-memory
     ///         budget caps at 128 (which also pins V codes to one channel group), and the
     ///         tqLen==0 chunks ride <see cref="CudaBackend.FlashAttentionPrefillTc2"/>
@@ -3055,7 +3057,16 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     private bool IsKvarnBatchedPrefillSupported()
     {
         if (!BatchedPrefillEnabled || !KvarnBatchedPrefillEnabled) return false;
-        if (_isMoE || _isGemma4Like || _hasAttnBias || !_hp.IsNeoxRope) return false;
+        if (_isMoE || _isGemma4Like || _hasAttnBias) return false;
+        // Same relaxation the dense gate took in #407, for the same reason: this driver
+        // runs its chunks through PrefillBatchedTrunk, whose ApplyRopeBatched dispatches
+        // on _hp.IsNeoxRope, so llm_rope_norm_partial_batched already rotates NORM models
+        // here. Without it a `llama`-arch KVarN prompt fell back to the per-token loop —
+        // measured on Rocinante-X-12B, that was the difference between ~52 t/s and the
+        // batched trunk. The llama3 rope-scaling path still routes through the NEOX-only
+        // RoPEWithFactorsBatched, so a NORM model carrying a freq-factor table keeps
+        // falling back until that kernel gets an interleaved variant.
+        if (!_hp.IsNeoxRope && _gpuRopeFreqs is not null) return false;
         if (_hasQkNorm && _hp.UseL2QkNorm) return false;
         if (_hp.SlidingWindowSize > 0 || _hp.LayerHeadDim is not null
             || _hp.KvSourceLayer is not null || _hp.HasPerLayerTokenEmbd) return false;
@@ -5809,6 +5820,74 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     }
 
     /// <summary>
+    /// Bytes of model weights this pass uploads to the device. Gemma 4's per-layer-embedding
+    /// table (~4.2 GB at Q8_0) is loaded mmap-only and never reaches VRAM, so it is subtracted
+    /// out — otherwise the KV budget below would reserve >8 GB of phantom space and clamp the
+    /// context window to a uselessly small number. Shared by the KV budget estimator and the
+    /// headroom warning (<see cref="WarnIfWeightsWontFit"/>) so the two can't drift.
+    /// </summary>
+    internal static long EstimateGpuWeightBytes(GgufModel model, ModelHyperparams hp)
+    {
+        long weightBytes = 0;
+        foreach (var t in model.Tensors)
+            weightBytes += EstimateGpuTensorBytes(t);
+
+        if (hp.HasPerLayerTokenEmbd
+            && model.FindTensor("per_layer_token_embd.weight") is { } pleInfo)
+        {
+            weightBytes -= EstimateGpuTensorBytes(pleInfo);
+        }
+
+        return weightBytes;
+    }
+
+    /// <summary>
+    /// Device-side scratch the forward pass still needs after the weights land: activation
+    /// buffers, the cuBLAS workspace, and captured CUDA graphs. Kept out of the headroom
+    /// budget so a "just barely fits" upload isn't reported as healthy.
+    /// </summary>
+    internal const long VramUploadReserveBytes = 256L * 1024 * 1024;
+
+    /// <summary>
+    /// Whether the weights (plus <see cref="VramUploadReserveBytes"/>) exceed the VRAM left
+    /// after the KV cache has been allocated. Pure predicate so the threshold is testable
+    /// without a CUDA device. A non-positive <paramref name="freeVramBytes"/> means the driver
+    /// query failed — never warn on an unknown, since a false alarm on every load is worse
+    /// than a missed one.
+    /// </summary>
+    internal static bool WeightsWontFit(
+        long freeVramBytes, long weightBytes, long reserveBytes = VramUploadReserveBytes) =>
+        freeVramBytes > 0 && weightBytes + reserveBytes > freeVramBytes;
+
+    /// <summary>
+    /// Warns when the KV cache just allocated leaves too little VRAM for the weights about to
+    /// be uploaded. The auto-narrow heuristic (issue #185) sizes the KV store against the same
+    /// budget, but it runs only when BOTH the context and the KV dtype are left to us — a
+    /// pinned <c>-c</c> or an explicit <c>--kv-type</c> bypasses it, and the allocation then
+    /// runs right up to the driver's limit. On Windows/WDDM that does not fail: the driver
+    /// backs the overflow with shared host memory, so every kernel reads over PCIe and the
+    /// model still answers, just an order of magnitude slower (measured on a 12 GB card at
+    /// context 32768: prefill 1404 → 67 t/s, decode 43 → 9 t/s). Nothing else in the pipeline
+    /// reports this, so say it here rather than let it read as normal throughput.
+    /// </summary>
+    private void WarnIfWeightsWontFit(GgufModel model, CudaBackend gpu)
+    {
+        long freeBytes = (long)gpu.FreeVramBytes;
+        long weightBytes = EstimateGpuWeightBytes(model, _hp);
+        if (!WeightsWontFit(freeBytes, weightBytes)) return;
+
+        const double Mib = 1024.0 * 1024.0;
+        string kvHint = _kvDType == DType.Float32 ? "narrow the KV store (--kv-type bf16/q8_0), " : "";
+        Console.Error.WriteLine(
+            $"[CudaForwardPass] Low VRAM headroom: the KV cache for context {_maxSeqLen} leaves " +
+            $"~{freeBytes / Mib:F0} MiB free, but the weights need ~{weightBytes / Mib:F0} MiB " +
+            $"(plus ~{VramUploadReserveBytes / Mib:F0} MiB scratch). The driver will back the " +
+            "overflow with shared host memory instead of failing, which costs roughly an order of " +
+            $"magnitude in prefill and decode throughput. Lower the context (-c), {kvHint}" +
+            "or offload fewer layers (-g).");
+    }
+
+    /// <summary>
     /// VRAM left for the KV cache after weights, attention/FFN scratch, and the driver
     /// reserve. This is the budget the context estimator divides by per-token KV bytes,
     /// and the budget the auto-narrow heuristic (issue #185) compares the fp32 KV
@@ -5819,19 +5898,7 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         long vramBytes = (long)gpu.VramBytes;
         if (vramBytes <= 0) vramBytes = 8L * 1024 * 1024 * 1024; // fallback assumption: 8 GB
 
-        long weightBytes = 0;
-        foreach (var t in model.Tensors)
-            weightBytes += EstimateGpuTensorBytes(t);
-
-        // Gemma 4: the per-layer-embedding table (~4.2 GB at Q8_0) is loaded
-        // mmap-only and never reaches VRAM. Subtract it out of the weight budget
-        // before computing free VRAM — otherwise we'd reserve >8 GB of phantom
-        // space and clamp the context window to a uselessly small number.
-        if (hp.HasPerLayerTokenEmbd
-            && model.FindTensor("per_layer_token_embd.weight") is { } pleInfo)
-        {
-            weightBytes -= EstimateGpuTensorBytes(pleInfo);
-        }
+        long weightBytes = EstimateGpuWeightBytes(model, hp);
 
         int headDim = hp.HeadDim;
         long scratchBytes = (long)(hp.EmbeddingDim * 3 + hp.NumHeads * headDim
