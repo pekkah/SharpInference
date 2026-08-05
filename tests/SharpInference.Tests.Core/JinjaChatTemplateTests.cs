@@ -7,6 +7,66 @@ public sealed class JinjaChatTemplateTests
     private static string Render(string source, IReadOnlyDictionary<string, object?>? ctx = null) =>
         new JinjaChatTemplate(source).Render(ctx ?? new Dictionary<string, object?>());
 
+    // ── List displays ────────────────────────────────────────────────────────
+    // Gemma's chat template gates its system-message handling on
+    // `messages[0]['role'] in ['system', 'developer']`. The parser had no '[' case in
+    // primary position, so it stopped at the bracket, warned "Unsupported expression",
+    // and let the test fall through unevaluated.
+
+    [Fact]
+    public void ListLiteral_AsInOperand_MatchesMember() =>
+        Assert.Equal("yes", Render("{% if 'system' in ['system', 'developer'] %}yes{% else %}no{% endif %}"));
+
+    [Fact]
+    public void ListLiteral_AsInOperand_RejectsNonMember() =>
+        Assert.Equal("no", Render("{% if 'user' in ['system', 'developer'] %}yes{% else %}no{% endif %}"));
+
+    [Fact]
+    public void ListLiteral_NotIn_Negates() =>
+        Assert.Equal("yes", Render("{% if 'user' not in ['system', 'developer'] %}yes{% else %}no{% endif %}"));
+
+    /// <summary>The exact Gemma shape: a subscripted message role tested against a list display.</summary>
+    [Fact]
+    public void ListLiteral_GemmaRoleGate_Evaluates()
+    {
+        var ctx = new Dictionary<string, object?>
+        {
+            ["messages"] = new List<object?>
+            {
+                new Dictionary<string, object?> { ["role"] = "developer", ["content"] = "x" },
+            },
+        };
+        Assert.Equal("sys", Render(
+            "{% if messages[0]['role'] in ['system', 'developer'] %}sys{% else %}other{% endif %}", ctx));
+    }
+
+    [Fact]
+    public void ListLiteral_Empty_IsFalsyAndContainsNothing()
+    {
+        Assert.Equal("no", Render("{% if 'a' in [] %}yes{% else %}no{% endif %}"));
+        Assert.Equal("empty", Render("{% if [] %}full{% else %}empty{% endif %}"));
+    }
+
+    [Fact]
+    public void ListLiteral_Iterates_InOrder() =>
+        Assert.Equal("a,b,c,", Render("{% for x in ['a', 'b', 'c'] %}{{ x }},{% endfor %}"));
+
+    [Fact]
+    public void ListLiteral_SupportsExpressionElementsAndTrailingComma()
+    {
+        var ctx = new Dictionary<string, object?> { ["r"] = "system" };
+        Assert.Equal("yes", Render("{% if 'system' in [r, 'developer',] %}yes{% else %}no{% endif %}", ctx));
+    }
+
+    /// <summary>Postfix subscripting must still win on a name — `messages[0]` is an index, not a display.</summary>
+    [Fact]
+    public void ListLiteral_DoesNotShadowSubscript()
+    {
+        var ctx = new Dictionary<string, object?> { ["xs"] = new List<object?> { "a", "b" } };
+        Assert.Equal("b", Render("{{ xs[1] }}", ctx));
+        Assert.Equal("2", Render("{{ ['a', 'b'] | length }}"));
+    }
+
     [Fact]
     public void Range_Stop_ProducesZeroToStopExclusive() =>
         Assert.Equal("0,1,2,3,", Render("{% for i in range(4) %}{{ i }},{% endfor %}"));

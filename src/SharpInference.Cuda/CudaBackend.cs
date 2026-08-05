@@ -274,6 +274,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     private nint   _headNormQkBatchedKernel;
     private nint   _splitQgBatchedKernel;
     private nint   _ropeNeoxPartialBatchedKernel;
+    private nint   _ropeNormPartialBatchedKernel;   // #407: batched NORM/interleaved RoPE
     private nint   _ropeNeoxPartialBatchedQkKernel;
     private nint   _dsparkGatherW1Kernel;
     private nint   _dsparkConfidenceKernel;
@@ -4305,10 +4306,14 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
     }
 
     /// <summary>
-    /// Batched partial NEOX RoPE over <paramref name="nTok"/> rows (issue #111). Token t
+    /// Batched partial RoPE over <paramref name="nTok"/> rows (issue #111). Token t
     /// rotates at position <paramref name="basePosition"/> + t (prefill assigns contiguous
     /// positions). <paramref name="x"/> is <c>[nTok × numHeads × headDim]</c>. Bit-identical
-    /// to nTok sequential <see cref="RoPEPartial"/> calls at the matching positions.
+    /// to nTok sequential <see cref="RoPEPartial"/> calls at the matching positions when
+    /// <paramref name="neox"/> is true, and to nTok sequential <see cref="RoPE"/>
+    /// (<c>neox: false</c>) calls when it is false and <paramref name="ropeDim"/> equals
+    /// <paramref name="headDim"/> — the NORM/interleaved case added for issue #407 so
+    /// llama-arch models can take the batched-trunk prefill.
     /// </summary>
     public void RoPEPartialBatched(Tensor x, int basePosition, int headDim, int ropeDim,
         float ropeTheta, int numHeads, int nTok, bool neox)
@@ -4316,8 +4321,6 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         EnsureImageKernels();
         if (!_imageKernelsAvailable)
             throw new NotSupportedException("NVRTC kernels are not available.");
-        if (!neox)
-            throw new ArgumentException("RoPEPartialBatched currently supports only neox=true.", nameof(neox));
         if (ropeDim <= 0 || (ropeDim & 1) != 0)
             throw new ArgumentException("ropeDim must be a positive even number.", nameof(ropeDim));
         if (ropeDim > headDim)
@@ -4333,8 +4336,11 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             (nint)(&pNH), (nint)(&pHD), (nint)(&pRD), (nint)(&pPos), (nint)(&pT), (nint)(&pNT)
         };
         uint grid = (uint)((totalPairs + 255) / 256);
-        int r = NvrtcInterop.LaunchKernel(_ropeNeoxPartialBatchedKernel, grid, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
-        if (r != 0) throw new InvalidOperationException($"cuLaunchKernel(rope_neox_partial_batched) failed: {r}");
+        nint kernel = neox ? _ropeNeoxPartialBatchedKernel : _ropeNormPartialBatchedKernel;
+        int r = NvrtcInterop.LaunchKernel(kernel, grid, (uint)nTok, 1, 256, 1, 1, 0, _stream, args, null);
+        if (r != 0)
+            throw new InvalidOperationException(
+                $"cuLaunchKernel(rope_{(neox ? "neox" : "norm")}_partial_batched) failed: {r}");
     }
 
     /// <summary>
@@ -7357,7 +7363,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
             _mmqQ40Kernel, _q40RepackSoaKernel, _mmqQ40SoaKernel, _matvecQ40SoaKernel,   // #124/#173
             _matvecQ40Dp4aSoaKernel, _dequantQ40F16SoaKernel,   // #124/#173
             _rmsNormBatchedKernel, _headNormBatchedKernel, _headNormQkKernel, _headNormQkBatchedKernel,
-            _splitQgBatchedKernel, _ropeNeoxPartialBatchedKernel,
+            _splitQgBatchedKernel, _ropeNeoxPartialBatchedKernel, _ropeNormPartialBatchedKernel,
             _ropeNeoxPartialBatchedQkKernel, _dsparkGatherW1Kernel, _dsparkConfidenceKernel,   // #428
             _attentionKernel, _attentionBf16Kernel, _attentionSwaKernel, _attentionSwaBatchedKernel,
             _attentionSwaBf16Kernel, _attentionSwaBatchedBf16Kernel,
@@ -7540,6 +7546,7 @@ public sealed unsafe class CudaBackend : IComputeBackend, IImageOpsBackend, IDis
         _headNormQkBatchedKernel = GetKernelFunc("llm_head_norm_qk_batched");
         _splitQgBatchedKernel  = GetKernelFunc("llm_split_qg_batched");
         _ropeNeoxPartialBatchedKernel = GetKernelFunc("llm_rope_neox_partial_batched");
+        _ropeNormPartialBatchedKernel = GetKernelFunc("llm_rope_norm_partial_batched");
         _ropeNeoxPartialBatchedQkKernel = GetKernelFunc("llm_rope_neox_partial_batched_qk");
         _dsparkGatherW1Kernel = GetKernelFunc("llm_dspark_gather_w1");
         _dsparkConfidenceKernel = GetKernelFunc("llm_dspark_confidence");
