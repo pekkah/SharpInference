@@ -533,6 +533,75 @@ public sealed unsafe class CudaMatMulBatchedTests
         }
     }
 
+    /// <summary>
+    /// Issue #407: the batched NORM/interleaved RoPE must be bit-identical to n_tok
+    /// sequential per-token <see cref="CudaBackend.RoPE"/> (neox: false) launches — the
+    /// oracle the per-token fallback loop runs. ropeDim == headDim, matching the only
+    /// shape the prefill gate admits for NORM models.
+    /// </summary>
+    [Fact]
+    public void RoPEPartialBatchedNorm_BitwiseMatchesSingle()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        // Mistral-Nemo geometry: 32 heads × 128, theta 1e6.
+        int numHeads = 32, headDim = 128;
+        int qDim = numHeads * headDim;
+        float theta = 1000000f;
+        foreach ((int basePos, int nTok) in new[] { (0, 3), (37, 17), (512, 64) })
+        {
+            var rng = new Random(407 + basePos + nTok);
+            var xAll = Rand(nTok * qDim, rng);
+            var gpuX = gpu.Upload(xAll, TensorShape.D1((long)nTok * qDim));
+            gpu.RoPEPartialBatched(gpuX, basePos, headDim, headDim, theta, numHeads, nTok, neox: false);
+            gpu.Synchronize();
+            var bat = new float[(long)nTok * qDim]; gpu.Download(gpuX, bat);
+
+            var refs = new float[nTok][];
+            for (int t = 0; t < nTok; t++)
+            {
+                var xt = new float[qDim]; Array.Copy(xAll, (long)t * qDim, xt, 0, qDim);
+                var gx = gpu.Upload(xt, TensorShape.D1(qDim));
+                gpu.RoPE(gx, basePos + t, headDim, theta, neox: false);
+                gpu.Synchronize();
+                refs[t] = new float[qDim]; gpu.Download(gx, refs[t]);
+                gpu.Free(gx);
+            }
+            gpu.Free(gpuX);
+            AssertRowsBitIdentical($"RoPE-norm basePos={basePos} nTok={nTok}", qDim, nTok, bat, refs);
+        }
+    }
+
+    /// <summary>
+    /// The NORM and NEOX batched kernels must not be aliases of one another — a wiring
+    /// slip that pointed both at the NEOX kernel would leave
+    /// <see cref="RoPEPartialBatchedNorm_BitwiseMatchesSingle"/> passing only if the
+    /// per-token oracle were mis-wired the same way. Asserts they genuinely differ.
+    /// </summary>
+    [Fact]
+    public void RoPEPartialBatchedNorm_DiffersFromNeox()
+    {
+        using var gpu = TryCreate();
+        if (gpu is null) return;
+        int numHeads = 4, headDim = 128, nTok = 8, basePos = 5;
+        int qDim = numHeads * headDim;
+        float theta = 1000000f;
+        var x = Rand(nTok * qDim, new Random(4071));
+
+        var gn = gpu.Upload(x, TensorShape.D1((long)nTok * qDim));
+        gpu.RoPEPartialBatched(gn, basePos, headDim, headDim, theta, numHeads, nTok, neox: false);
+        gpu.Synchronize();
+        var norm = new float[(long)nTok * qDim]; gpu.Download(gn, norm); gpu.Free(gn);
+
+        var gx = gpu.Upload(x, TensorShape.D1((long)nTok * qDim));
+        gpu.RoPEPartialBatched(gx, basePos, headDim, headDim, theta, numHeads, nTok, neox: true);
+        gpu.Synchronize();
+        var neox = new float[(long)nTok * qDim]; gpu.Download(gx, neox); gpu.Free(gx);
+
+        Assert.False(norm.AsSpan().SequenceEqual(neox),
+            "NORM and NEOX batched RoPE produced identical output — the norm kernel is likely mis-wired to the NEOX one (#407).");
+    }
+
     [Fact]
     public void HeadNormQk_BitwiseMatchesSeparate()
     {

@@ -5974,6 +5974,45 @@ extern ""C"" __global__ void llm_rope_neox_partial_batched(
     x[b] = x0 * s + x1 * c;
 }
 
+// Partial NORM/interleaved RoPE over N tokens (issue #407). NORM-rope architectures
+// — `llama` (the Mistral-Nemo family) and everything else absent from ModelGraph's
+// NEOX list — had no batched RoPE kernel, which forced IsBatchedPrefillSupported to
+// reject them and dropped their entire prefill onto the per-token loop (~100× slower
+// than llama.cpp; see docs/benchmarks/cuda-vs-llamacpp-2026-06-26.md).
+//
+// Pair layout is the interleaved (2i, 2i+1) within each head, vs NEOX's
+// (i, i + rope_half_dim). The frequency exponent uses `rope_dim` — matching
+// llm_rope_neox_partial and the CPU reference — so at rope_dim == head_dim (the
+// llama case, the only one the prefill gate admits) this is bit-identical to n_tok
+// sequential llm_rope_interleaved launches at base_position + t.
+extern ""C"" __global__ void llm_rope_norm_partial_batched(
+    float* __restrict__ x,
+    int num_heads, int head_dim, int rope_dim, int base_position, float theta, int n_tok)
+{
+    int pair_idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int rope_half_dim = rope_dim / 2;
+    int total_pairs = num_heads * rope_half_dim;
+    int token = (int)blockIdx.y;
+    if (pair_idx >= total_pairs || token >= n_tok) return;
+
+    int h = pair_idx / rope_half_dim;
+    int i = pair_idx % rope_half_dim;
+    int position = base_position + token;
+
+    float freq = 1.0f / powf(theta, 2.0f * (float)i / (float)rope_dim);
+    float angle = (float)position * freq;
+    float c = cosf(angle);
+    float s = sinf(angle);
+
+    long head_base = (long)token * (long)num_heads * (long)head_dim + (long)h * head_dim;
+    long a = head_base + 2 * i;
+    float x0 = x[a];
+    float x1 = x[a + 1];
+    x[a]     = x0 * c - x1 * s;
+    x[a + 1] = x0 * s + x1 * c;
+    // Dims [rope_dim, head_dim) pass through untouched.
+}
+
 // Fused q+k partial NEOX RoPE over N tokens (DSpark GPU draft, issue #428):
 // one launch rotates both the query rows (q, [n_tok × num_q_heads*head_dim])
 // and the key rows (k, [n_tok × num_kv_heads*head_dim]) at position

@@ -95,6 +95,13 @@ public sealed class JinjaChatTemplate
 
     private interface IExpr { }
     private sealed record LiteralExpr(object? Val) : IExpr;
+    /// <summary>
+    /// List display: <c>['system', 'developer']</c>. Gemma's template uses one as the
+    /// right operand of <c>in</c> (<c>messages[0]['role'] in ['system', 'developer']</c>);
+    /// without it the parser stopped at the '[' and warned "Unsupported expression",
+    /// silently passing the test through unevaluated.
+    /// </summary>
+    private sealed record ListExpr(List<IExpr> Items) : IExpr;
     private sealed record NameExpr(string Name) : IExpr;
     private sealed record AttrExpr(IExpr Obj, string Attr) : IExpr;
     private sealed record IndexExpr(IExpr Obj, IExpr Idx) : IExpr;
@@ -751,6 +758,14 @@ public sealed class JinjaChatTemplate
                 return inner;
             }
 
+            // List display. ParseArgList already handles the comma-separated,
+            // trailing-comma-tolerant element list and consumes the closing bracket.
+            if (c == '[')
+            {
+                Pos++;
+                return new ListExpr(ParseArgList(']'));
+            }
+
             if (c is '\'' or '"')
                 return new LiteralExpr(ReadString());
 
@@ -980,6 +995,15 @@ public sealed class JinjaChatTemplate
         switch (expr)
         {
             case LiteralExpr l: return l.Val;
+            // A fresh list per evaluation: ContainsOp/AsList treat List<object?> as the
+            // native sequence, and the mutating filters (append/extend) must never be able
+            // to write back into a shared literal.
+            case ListExpr le:
+            {
+                var items = new List<object?>(le.Items.Count);
+                foreach (var it in le.Items) items.Add(Eval(it, ctx));
+                return items;
+            }
             case NameExpr n:    return ctx.TryGetValue(n.Name, out var v) ? v : null;
             case AttrExpr a:    return GetAttr(Eval(a.Obj, ctx), a.Attr);
             case IndexExpr ix:  return GetIndex(Eval(ix.Obj, ctx), Eval(ix.Idx, ctx));

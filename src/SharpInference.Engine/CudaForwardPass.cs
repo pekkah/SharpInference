@@ -2968,10 +2968,13 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
 
     /// <summary>
     /// Whether the issue-#136/#156 batched-trunk prefill can run this model. Requires a
-    /// dense model with NEOX RoPE, non-L2 QK-norm, no attention bias, TQ off, and every
-    /// trunk (+ optional Gemma PLE) weight in a GEMM-N-batchable dtype. Gemma 4 satisfies
-    /// these; so do dense Qwen3/Llama-style models (the batched body skips the Gemma-only
-    /// PLE / shared-KV / SWA / post-norm steps via their null/flag guards).
+    /// dense model with non-L2 QK-norm, no attention bias, TQ off, and every trunk
+    /// (+ optional Gemma PLE) weight in a GEMM-N-batchable dtype. Either RoPE convention
+    /// is fine since #407 added the batched NORM kernel — except that a NORM model
+    /// carrying a rope-freqs table is still excluded (see the inline note).
+    /// Gemma 4 satisfies this; so do dense Qwen3 (NEOX) and `llama`-arch / Mistral-Nemo
+    /// (NORM) models — the batched body skips the Gemma-only PLE / shared-KV / SWA /
+    /// post-norm steps via their null/flag guards.
     /// </summary>
     // Narrowed KV (#179): true when every layer would take the Tc2 flash kernel for the
     // active narrowed dtype (bf16/q8_0), so the batched trunk streams K/V and can chunk a
@@ -2997,7 +3000,14 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
         // fp32-only, so the prefill gate forces canChunkPast4096=false under bf16 —
         // prompts past 4096 fall back to the per-token loop (also bf16-aware) until the
         // bf16 flash port (1.5b) lands.
-        if (_isMoE || _tqEnabled || _hasAttnBias || !_hp.IsNeoxRope) return false;
+        if (_isMoE || _tqEnabled || _hasAttnBias) return false;
+        // Issue #407: NORM/interleaved RoPE now has a batched kernel
+        // (llm_rope_norm_partial_batched), so `llama`-arch models (Mistral-Nemo and
+        // friends) take the batched trunk too instead of dropping to the per-token loop.
+        // The llama3 rope-scaling path in ApplyRopeBatched still routes through the
+        // NEOX-only RoPEWithFactorsBatched, so a NORM model carrying a freq-factor table
+        // must keep falling back until that kernel gets an interleaved variant.
+        if (!_hp.IsNeoxRope && _gpuRopeFreqs is not null) return false;
         if (_hasQkNorm && _hp.UseL2QkNorm) return false;
 
         for (int i = 0; i < _hp.NumLayers; i++)
@@ -3501,9 +3511,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
             }
             else
             {
-                _gpu.RoPEPartialBatched(qAll, startPos, layerHd, layerHd, ropeTheta, _numHeads, N, neox: true);
+                // ropeDim == headDim, so the NORM branch (#407) is bit-identical to the
+                // per-token llm_rope_interleaved oracle the fallback loop runs.
+                _gpu.RoPEPartialBatched(qAll, startPos, layerHd, layerHd, ropeTheta, _numHeads, N, neox: _hp.IsNeoxRope);
                 if (!kvShared)
-                    _gpu.RoPEPartialBatched(kAll, startPos, layerHd, layerHd, ropeTheta, layerKv, N, neox: true);
+                    _gpu.RoPEPartialBatched(kAll, startPos, layerHd, layerHd, ropeTheta, layerKv, N, neox: _hp.IsNeoxRope);
             }
         }
 
@@ -3754,8 +3766,11 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
                     }
                     else
                     {
-                        _gpu.RoPEPartialBatched(qS, startPos[s], _headDim, _headDim, ropeTheta, _numHeads, len, neox: true);
-                        _gpu.RoPEPartialBatched(kS, startPos[s], _headDim, _headDim, ropeTheta, _numKvHeads, len, neox: true);
+                        // #407: NORM-rope models now clear DenseBatchedDecodeSupported, so this
+                        // must follow the model's convention — hardcoding NEOX here would
+                        // silently mis-rotate every llama-arch packed prefill.
+                        _gpu.RoPEPartialBatched(qS, startPos[s], _headDim, _headDim, ropeTheta, _numHeads, len, neox: _hp.IsNeoxRope);
+                        _gpu.RoPEPartialBatched(kS, startPos[s], _headDim, _headDim, ropeTheta, _numKvHeads, len, neox: _hp.IsNeoxRope);
                     }
                 }
                 var kc = caches[s].K[layer];
