@@ -90,6 +90,9 @@ public sealed unsafe class GpuForwardPass : IForwardPass
     /// <inheritdoc />
     public bool SupportsPartialRewind => true;
 
+    /// <inheritdoc />
+    public int MinRewindLength => _tqEnabled ? _tqCompressedLen : 0;
+
     // ── Speculative-decode batched verify (issue #308) ───────────────────────────────────
 
     /// <summary>Maximum k for the batched-trunk verify path (matches MatMulBatched's nTok cap of 8

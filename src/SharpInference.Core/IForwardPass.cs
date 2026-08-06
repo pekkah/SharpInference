@@ -101,6 +101,21 @@ public interface IForwardPass : IDisposable, IThreadAffineBackend
     bool SupportsPartialRewind => false;
 
     /// <summary>
+    /// Lowest length <see cref="TruncateTo"/> can rewind to. <c>0</c> for plain KV caches,
+    /// where any length in <c>[0, currentLength]</c> is representable.
+    /// <para>
+    /// TurboQuant-enabled passes compress the oldest KV in place once it leaves the FP32
+    /// recent window; those positions cannot be undone, so they report the compressed-region
+    /// length here and reject any smaller <see cref="TruncateTo"/> argument. Callers that pick
+    /// an arbitrary rewind point — prefix-cache reuse, speculative-decode rollback — must
+    /// clamp against this and fall back to <see cref="ResetCache"/> + a full prefill when the
+    /// point they want lies below it. The value grows as decoding proceeds, so read it
+    /// immediately before the rewind rather than caching it.
+    /// </para>
+    /// </summary>
+    int MinRewindLength => 0;
+
+    /// <summary>
     /// Length (in tokens) of the most recently captured end-of-decode snapshot, or
     /// <c>-1</c> when no snapshot is held. Used by <see cref="InferenceEngine"/> to
     /// reuse cached state across chat-continuation turns on forward passes that don't

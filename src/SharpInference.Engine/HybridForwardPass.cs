@@ -157,6 +157,14 @@ public sealed unsafe class HybridForwardPass : IForwardPass
     /// <inheritdoc />
     public bool SupportsPartialRewind => true;
 
+    /// <inheritdoc />
+    /// <remarks>
+    /// GPU-resident and CPU-resident layers compress independently, so the floor is the
+    /// higher of the two: rewinding below either one discards compressed KV.
+    /// </remarks>
+    public int MinRewindLength =>
+        Math.Max(_gpuTqCompressedLen, _cpuTqKvCache?.MaxTqLength ?? 0);
+
     public HybridForwardPass(GgufModel model, VulkanBackend gpu, ModelHyperparams hp,
         LayerPlacement placement, bool enableTq = false, int tqFp32Window = 256, int tqBits = 3,
         int expertSlotCapacity = -1)

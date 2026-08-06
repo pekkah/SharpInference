@@ -95,6 +95,24 @@ public sealed unsafe class TurboQuantKvCache : IDisposable
     /// <summary>Number of FP32 positions.</summary>
     public int Fp32Length => _totalLength - TqLength;
 
+    /// <summary>
+    /// Largest compressed-region length across all layers — the floor below which a rewind
+    /// would discard compressed data. Batched prefill advances each layer's counter
+    /// independently (see <see cref="ResetTotalLengthForBatchedPrefill"/>), so this can
+    /// exceed <see cref="TqLength"/> (layer 0's view) mid-prefill. Callers gating a rewind
+    /// must use this, not <see cref="TqLength"/>.
+    /// </summary>
+    public int MaxTqLength
+    {
+        get
+        {
+            int max = 0;
+            foreach (int len in _layerTqLengths)
+                if (len > max) max = len;
+            return max;
+        }
+    }
+
     /// <summary>FP32 window size.</summary>
     public int Fp32WindowSize => _fp32WindowSize;
 

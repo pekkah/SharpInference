@@ -512,6 +512,36 @@ public sealed class InferenceEnginePrefixCacheTests
         Assert.Equal(reusedBefore, engine.PrefillTokensReused);
     }
 
+    /// <summary>
+    /// A TurboQuant pass is rewindable only down to its FP32 recent window; older KV is
+    /// compressed in place and <c>TruncateTo</c> throws for it. The engine must clamp the
+    /// prefix candidate against <see cref="IForwardPass.MinRewindLength"/>: below the floor
+    /// (a long chat whose system prompt carries injected memory or a timestamp, so the
+    /// prompt diverges early) it falls back to a full reset instead of letting the throw
+    /// reach the user; at or above it, reuse stays on — so the fix can't degenerate into
+    /// "TurboQuant disables the prefix cache". turn1/turn2 share a 32-token prefix.
+    /// </summary>
+    [Theory]
+    // floor, truncate (-1 = never called), prefill len, prefill startPos, tokens reused
+    [InlineData(64, -1, 48, 0,  0)]   // below floor  → full re-prefill of turn 2
+    [InlineData(16, 32, 16, 32, 32)]  // above floor  → suffix-only prefill
+    public async Task GenerateAsync_TqRewindFloor_ClampsPrefixReuse(
+        int floor, int expectTruncate, int expectPrefillLen, int expectPrefillStart, long expectReused)
+    {
+        var fwd = new TqCompressedForwardPass(compressedLen: floor);
+        using var engine = new InferenceEngine(
+            fwd, new MultiTurnTokenizer(), "mock", thinkTokenId: -1, endThinkTokenId: -1);
+        var sp = new SamplingParams { Temperature = 0f, MaxNewTokens = 1 };
+
+        await Drain(engine.GenerateAsync("turn1", sp));
+        await Drain(engine.GenerateAsync("turn2", sp));
+
+        Assert.Equal(expectTruncate, fwd.LastTruncateLength);
+        Assert.Equal(expectPrefillLen, fwd.LastPrefillLength);
+        Assert.Equal(expectPrefillStart, fwd.LastPrefillStartPos);
+        Assert.Equal(expectReused, engine.PrefillTokensReused);
+    }
+
     private static IAsyncEnumerable<string> GenerateAsync(
         InferenceEngine engine, string prompt, string canonical, SamplingParams sp)
     {
@@ -953,6 +983,59 @@ public sealed class InferenceEnginePrefixCacheTests
         }
 
         public void TruncateTo(int length) => LastTruncateLength = length;
+        public void ResetCache() { }
+        public void Dispose() { }
+
+        private ReadOnlySpan<float> EosLogits()
+        {
+            Array.Clear(_logits);
+            _logits[Eos] = 1.0f;
+            return _logits;
+        }
+    }
+
+    /// <summary>
+    /// Models the TurboQuant rewind contract shared by the CUDA/Vulkan dense passes and
+    /// <c>TurboQuantKvCache</c>: partial rewind is supported, but positions below
+    /// <see cref="IForwardPass.MinRewindLength"/> are compressed in place and cannot be
+    /// restored, so <see cref="TruncateTo"/> throws for them — a below-floor call fails
+    /// the test by propagating, no tracking flag needed. The floor stays pinned across
+    /// turns (the real passes clear it in ResetCache); holding it constant keeps the
+    /// fixture on the one axis under test.
+    /// </summary>
+    private sealed class TqCompressedForwardPass(int compressedLen) : IForwardPass
+    {
+        private readonly float[] _logits = new float[200];
+
+        // Sentinel -1 means "never called".
+        public int LastTruncateLength { get; private set; } = -1;
+        public int LastPrefillLength { get; private set; } = -1;
+        public int LastPrefillStartPos { get; private set; } = -1;
+
+        public bool SupportsPartialRewind => true;
+        public int MinRewindLength => compressedLen;
+
+        public int VocabSize => 200;
+        public int MaxSeqLen => 4096;
+
+        public ReadOnlySpan<float> Forward(int token, int position) => EosLogits();
+
+        public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0)
+        {
+            LastPrefillLength = tokens.Count;
+            LastPrefillStartPos = startPos;
+            return EosLogits();
+        }
+
+        public void TruncateTo(int length)
+        {
+            LastTruncateLength = length;
+            if (length < compressedLen)
+                throw new NotSupportedException(
+                    $"TruncateTo({length}) cannot rewind into the TQ-compressed region " +
+                    $"(tqCompressedLen={compressedLen}).");
+        }
+
         public void ResetCache() { }
         public void Dispose() { }
 

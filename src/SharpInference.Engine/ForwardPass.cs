@@ -612,6 +612,9 @@ public sealed unsafe class ForwardPass : IForwardPass, IBatchedForwardPass
     /// <inheritdoc />
     public bool SupportsPartialRewind => true;
 
+    /// <inheritdoc />
+    public int MinRewindLength => _tqKvCache?.MaxTqLength ?? 0;
+
     public void ResetCache()
     {
         if (_tqKvCache != null)
