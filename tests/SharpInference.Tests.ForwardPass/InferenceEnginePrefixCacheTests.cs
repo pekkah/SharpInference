@@ -513,6 +513,46 @@ public sealed class InferenceEnginePrefixCacheTests
     }
 
     /// <summary>
+    /// A request cancelled mid-decode must leave the prefix it reused still reusable. The
+    /// engine invalidates the token shadow before mutating KV, but only positions
+    /// &gt;= prefixLen are ever overwritten — so the shadow is downgraded to
+    /// <c>tokens[..prefixLen]</c>, not cleared. Clearing it (the previous behavior) charged
+    /// the next request a full re-prefill of a prompt whose KV was still intact, which is
+    /// the common agentic-client pattern: disconnect mid-generation, immediately retry.
+    /// </summary>
+    [Fact]
+    public async Task GenerateAsync_CancelledMidDecode_KeepsReusedPrefixForNextRequest()
+    {
+        var tokenizer = new MultiTurnTokenizer();
+        // Non-stop decode token so the decode loop keeps running until cancellation.
+        var fwd = new RewindCapableForwardPass { DecodeTokenId = 50 };
+        using var engine = new InferenceEngine(fwd, tokenizer, "mock", thinkTokenId: -1, endThinkTokenId: -1);
+
+        // Turn 1 (cold): 32-token prompt + 1 decoded token becomes the cached sequence.
+        await Drain(engine.GenerateAsync("turn1", new SamplingParams { Temperature = 0f, MaxNewTokens = 1 }));
+
+        // Turn 2: 48-token prompt sharing turn 1's 32-token prefix. It reuses that prefix,
+        // prefills the 16-token suffix, then is cancelled from inside the first decode
+        // Forward — so it never reaches the end-of-decode shadow write.
+        using var cts = new CancellationTokenSource();
+        fwd.CancelOnDecode = cts;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => Drain(engine.GenerateAsync("turn2", new SamplingParams { Temperature = 0f, MaxNewTokens = 64 }, cts.Token)));
+        fwd.CancelOnDecode = null;
+
+        long reusedAfterCancel = engine.PrefillTokensReused;
+
+        // Turn 3: the retry. KV positions [0, 32) were never touched by turn 2, so the
+        // same 32-token prefix must still be reused — suffix-only prefill, not 48 @ 0.
+        await Drain(engine.GenerateAsync("turn2", new SamplingParams { Temperature = 0f, MaxNewTokens = 1 }));
+
+        Assert.Equal(32, fwd.LastTruncateLength);
+        Assert.Equal(16, fwd.LastPrefillLength);
+        Assert.Equal(32, fwd.LastPrefillStartPos);
+        Assert.Equal(reusedAfterCancel + 32, engine.PrefillTokensReused);
+    }
+
+    /// <summary>
     /// A TurboQuant pass is rewindable only down to its FP32 recent window; older KV is
     /// compressed in place and <c>TruncateTo</c> throws for it. The engine must clamp the
     /// prefix candidate against <see cref="IForwardPass.MinRewindLength"/>: below the floor
@@ -968,28 +1008,40 @@ public sealed class InferenceEnginePrefixCacheTests
         public int LastPrefillLength { get; private set; } = -1;
         public int LastPrefillStartPos { get; private set; } = -1;
 
+        /// Token the greedy sampler will pick. Defaults to EOS so decode stops after one
+        /// step; set to a non-stop id to keep the decode loop running.
+        public int DecodeTokenId { get; init; } = Eos;
+
+        /// When set, the first decode <see cref="Forward"/> trips this source — the
+        /// deterministic way to land a cancellation mid-decode.
+        public CancellationTokenSource? CancelOnDecode { get; set; }
+
         public bool SupportsPartialRewind => true;
 
         public int VocabSize => 200;
         public int MaxSeqLen => 4096;
 
-        public ReadOnlySpan<float> Forward(int token, int position) => EosLogits();
+        public ReadOnlySpan<float> Forward(int token, int position)
+        {
+            CancelOnDecode?.Cancel();
+            return NextLogits();
+        }
 
         public ReadOnlySpan<float> Prefill(IReadOnlyList<int> tokens, int startPos = 0)
         {
             LastPrefillLength = tokens.Count;
             LastPrefillStartPos = startPos;
-            return EosLogits();
+            return NextLogits();
         }
 
         public void TruncateTo(int length) => LastTruncateLength = length;
         public void ResetCache() { }
         public void Dispose() { }
 
-        private ReadOnlySpan<float> EosLogits()
+        private ReadOnlySpan<float> NextLogits()
         {
             Array.Clear(_logits);
-            _logits[Eos] = 1.0f;
+            _logits[DecodeTokenId] = 1.0f;
             return _logits;
         }
     }
