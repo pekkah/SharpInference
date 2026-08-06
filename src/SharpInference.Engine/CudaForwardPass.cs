@@ -4089,6 +4089,9 @@ public sealed unsafe class CudaForwardPass : IForwardPass, IBatchedForwardPass, 
     /// <inheritdoc />
     public bool SupportsPartialRewind => true;
 
+    /// <inheritdoc />
+    public int MinRewindLength => _tqEnabled ? _tqCompressedLen : 0;
+
     // ── Hidden-state taps (DSpark draft conditioning, PR #413 Phase 4a) ──
 
     /// <summary>

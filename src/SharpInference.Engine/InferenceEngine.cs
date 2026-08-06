@@ -875,7 +875,16 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         if (_fwd.SupportsPartialRewind)
                         {
                             int candidate = FindCacheablePrefix(tokens);
-                            if (candidate > 0)
+                            // TurboQuant compresses KV in place once it leaves the FP32 recent
+                            // window, so a rewind below MinRewindLength is unrepresentable and
+                            // TruncateTo throws. A shared prefix shorter than the compressed
+                            // region therefore means no reuse at all: fall through to the
+                            // ResetCache + full-prefill path below. (Plain caches report 0 and
+                            // are unaffected.) Without this, a long conversation whose prompt
+                            // diverges early — a system prompt carrying injected memory or a
+                            // timestamp — crashed the request once the compressed region grew
+                            // past the divergence point.
+                            if (candidate > 0 && candidate >= _fwd.MinRewindLength)
                             {
                                 _fwd.TruncateTo(candidate);
                                 prefixLen = candidate;
