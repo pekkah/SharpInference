@@ -918,24 +918,27 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                             Interlocked.Add(ref _prefillTokensReused, prefixLen);
                         }
 
-                        // Issue #212: from here the active slot's KV is mutated (ResetCache wiped
-                        // it, or the upcoming prefill overwrites positions >= prefixLen). _prevTokens
-                        // was already read above for the prefix match, so null the active slot's
-                        // shadow now — a mid-decode throw/cancel skips the end-of-decode shadow
-                        // write, and a stale shadow would let the next request SelectSlot-match a
-                        // prefix whose KV was destroyed. Re-populated only on a complete decode.
+                        // Issue #212 / PR #413 Phase 6: from here the request mutates KV —
+                        // ResetCache wiped it, or the upcoming prefill overwrites positions
+                        // >= prefixLen. A mid-prefill/mid-decode throw or cancel skips the
+                        // end-of-decode write, so a token shadow left describing the PRIOR
+                        // sequence would let the next request TruncateTo into KV (and, under
+                        // DSpark, replay tap rows) that this request already overwrote — a
+                        // silent prefix-reuse corruption.
+                        //
+                        // Only positions >= prefixLen are ever touched, though, so downgrade
+                        // the shadows to the retained prefix instead of clearing them: what
+                        // TruncateTo(prefixLen) kept is exactly tokens[..prefixLen], and it
+                        // stays valid for the rest of this request no matter how it ends. An
+                        // aborted request therefore leaves the next one the prefix it started
+                        // from rather than nothing — the unconditional null forced a full
+                        // re-prefill on every retry after a client disconnect. prefixLen == 0
+                        // means ResetCache wiped everything, so there is nothing to retain.
+                        // A complete decode re-pairs the shadows with the full transcript.
+                        int[]? retainedPrefix = prefixLen > 0 ? tokens[..prefixLen] : null;
                         if (_slotTokens is not null && activeSlotIdx >= 0)
-                            _slotTokens[activeSlotIdx] = null;
-
-                        // Same hazard for the single-slot _prevTokens itself (PR #413 Phase 6
-                        // review): a request cancelled mid-decode skips the end-of-decode
-                        // _prevTokens write, and a stale value describing the PRIOR sequence
-                        // would let the next request TruncateTo into KV (and, under DSpark,
-                        // replay tap rows) that this request already overwrote — a silent
-                        // prefix-reuse corruption. Invalidate before mutating; every complete
-                        // decode path (DSpark / MTP / plain, canonical or end-of-decode)
-                        // re-pairs it with the cache state it describes.
-                        _prevTokens = null;
+                            _slotTokens[activeSlotIdx] = retainedPrefix;
+                        _prevTokens = retainedPrefix;
 
                         // Prefill: process all prompt tokens (or just the suffix after the cached prefix).
                         //
