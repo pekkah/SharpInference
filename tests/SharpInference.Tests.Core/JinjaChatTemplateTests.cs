@@ -435,4 +435,119 @@ public sealed class JinjaChatTemplateTests
         };
         Assert.Equal("", Render("{{ messages[5].content }}", ctx));
     }
+
+    // ── Delimiters inside string literals ────────────────────────────────────
+    // The lexer located the closing delimiter with a plain IndexOf, so a `}}` or `%}`
+    // sitting inside a quoted literal ended the tag: the expression was truncated and
+    // the tail of the literal leaked into the output as raw text. Mistral's template
+    // closes every [AVAILABLE_TOOLS] entry with `{{- "}}" }}`, so every tool definition
+    // shipped a stray `"` where its braces belonged — invalid JSON, no exception, and
+    // the only visible symptom was the model quietly no longer calling tools.
+
+    [Theory]
+    [InlineData("""{{ "}}" }}""", "}}")]
+    [InlineData("""{{ "a}}b" }}""", "a}}b")]
+    [InlineData("""{{- "}}" }}""", "}}")]
+    [InlineData("""{{ '}}' }}""", "}}")]
+    [InlineData("""{{ "%}" }}""", "%}")]
+    [InlineData("""{{ "}" }}""", "}")]        // single brace was never affected
+    [InlineData("""{{ "{{" }}""", "{{")]      // opening delimiter was never affected
+    public void ClosingDelimiter_InsideStringLiteral_DoesNotEndExpression(string template, string expected) =>
+        Assert.Equal(expected, Render(template));
+
+    [Fact]
+    public void BlockDelimiter_InsideStringLiteral_DoesNotEndBlock() =>
+        Assert.Equal("A", Render("""{% if x == "%}" %}A{% endif %}""",
+                                 new Dictionary<string, object?> { ["x"] = "%}" }));
+
+    [Fact]
+    public void EscapedQuote_InsideLiteralContainingDelimiter_IsSkipped() =>
+        Assert.Equal("""a"}}b""", Render(""" {{ "a\"}}b" }}""".Trim()));
+
+    [Fact]
+    public void UnterminatedLiteral_StillReportsUnclosedTag() =>
+        Assert.Throws<FormatException>(() => Render("""{{ "abc }}"""));
+
+    [Fact]
+    public void Comment_IsNotQuoteAware()
+    {
+        // Jinja2's comment state has no string rules: {# … #} ends at the first #},
+        // and an apostrophe in prose must stay inert rather than swallowing the rest.
+        Assert.Equal("", Render("{# don't quote-scan this #}"));
+        Assert.Equal("x", Render("{# a \" b #}x"));
+    }
+
+    [Fact]
+    public void MistralToolBlock_RendersParseableJson()
+    {
+        // End-to-end over the construct from Mistral's own chat template. Descriptions are
+        // deliberately quote-free: the template interpolates string values with no escaping
+        // (`'"' + key + '": "' + val + '"'`), which breaks the block independently of the
+        // lexer — that is the template's flaw, not one this fix can address.
+        const string template = """
+            {{- "[AVAILABLE_TOOLS] [" }}
+            {%- for tool in tools %}
+                {%- set tool = tool.function %}
+                {{- '{"type": "function", "function": {' }}
+                {%- for key, val in tool.items() %}
+                    {%- if val is string %}
+                        {{- '"' + key + '": "' + val + '"' }}
+                    {%- else %}
+                        {{- '"' + key + '": ' + val|tojson }}
+                    {%- endif %}
+                    {%- if not loop.last %}
+                        {{- ", " }}
+                    {%- endif %}
+                {%- endfor %}
+                {{- "}}" }}
+                {%- if not loop.last %}
+                    {{- ", " }}
+                {%- else %}
+                    {{- "]" }}
+                {%- endif %}
+            {%- endfor %}
+            {{- "[/AVAILABLE_TOOLS]" }}
+            """;
+
+        var ctx = new Dictionary<string, object?>
+        {
+            ["tools"] = new List<Dictionary<string, object?>>
+            {
+                new()
+                {
+                    ["function"] = new Dictionary<string, object?>
+                    {
+                        ["name"] = "get_weather",
+                        ["description"] = "Get the current weather in a location",
+                        ["parameters"] = new Dictionary<string, object?> { ["type"] = "object" },
+                    },
+                },
+                new()
+                {
+                    ["function"] = new Dictionary<string, object?>
+                    {
+                        ["name"] = "list_files",
+                        ["description"] = "List files under a path",
+                        ["parameters"] = new Dictionary<string, object?> { ["type"] = "object" },
+                    },
+                },
+            },
+        };
+
+        string rendered = Render(template, ctx);
+
+        const string open = "[AVAILABLE_TOOLS] ";
+        const string close = "[/AVAILABLE_TOOLS]";
+        int start = rendered.IndexOf(open, StringComparison.Ordinal) + open.Length;
+        int end = rendered.IndexOf(close, StringComparison.Ordinal);
+        Assert.True(end > start, $"tool block markers missing in: {rendered}");
+
+        string json = rendered[start..end];
+        using var doc = System.Text.Json.JsonDocument.Parse(json);
+        Assert.Equal(2, doc.RootElement.GetArrayLength());
+        Assert.Equal("get_weather",
+            doc.RootElement[0].GetProperty("function").GetProperty("name").GetString());
+        Assert.Equal("list_files",
+            doc.RootElement[1].GetProperty("function").GetProperty("name").GetString());
+    }
 }

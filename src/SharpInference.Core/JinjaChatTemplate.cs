@@ -144,7 +144,7 @@ public sealed class JinjaChatTemplate
 
             if (next == bi)
             {
-                int end = src.IndexOf("%}", next + 2, StringComparison.Ordinal);
+                int end = FindTagEnd(src, next + 2, "%}");
                 if (end < 0) throw new FormatException("Unclosed {%");
                 bool sl = src[next + 2] == '-', sr = src[end - 1] == '-';
                 string inner = src[(next + 2 + (sl ? 1 : 0))..(end - (sr ? 1 : 0))].Trim();
@@ -153,7 +153,7 @@ public sealed class JinjaChatTemplate
             }
             else if (next == ei)
             {
-                int end = src.IndexOf("}}", next + 2, StringComparison.Ordinal);
+                int end = FindTagEnd(src, next + 2, "}}");
                 if (end < 0) throw new FormatException("Unclosed {{");
                 bool sl = src[next + 2] == '-', sr = src[end - 1] == '-';
                 string inner = src[(next + 2 + (sl ? 1 : 0))..(end - (sr ? 1 : 0))].Trim();
@@ -172,6 +172,40 @@ public sealed class JinjaChatTemplate
 
         ApplyStripping(tokens);
         return tokens;
+    }
+
+    /// <summary>
+    /// Finds the closing delimiter of a <c>{{ … }}</c> or <c>{% … %}</c> tag, skipping over
+    /// single- and double-quoted string literals (honouring backslash escapes) so a delimiter
+    /// *inside* a literal does not terminate the tag — matching Jinja2, which lexes the tag body.
+    /// Returns -1 if no closing delimiter is found (including when a literal is left unterminated).
+    /// </summary>
+    /// <remarks>
+    /// Mistral's chat template closes every <c>[AVAILABLE_TOOLS]</c> entry with <c>{{- "}}" }}</c>;
+    /// a plain IndexOf ends the tag inside that literal, truncating the expression and leaking the
+    /// rest of the literal into the prompt as text. The result is a tool block that is not valid
+    /// JSON — silently, with the only symptom being that the model stops calling tools.
+    /// Comments are deliberately NOT handled here: Jinja2's comment state has no string rules, so
+    /// <c>{# … #}</c> ends at the first <c>#}</c> and an apostrophe in prose stays inert.
+    /// </remarks>
+    private static int FindTagEnd(string src, int from, string close)
+    {
+        for (int i = from; i + close.Length <= src.Length; i++)
+        {
+            char c = src[i];
+            if (c is '\'' or '"')
+            {
+                char quote = c;
+                for (i++; i < src.Length; i++)
+                {
+                    if (src[i] == '\\') { i++; continue; }
+                    if (src[i] == quote) break;
+                }
+                continue;
+            }
+            if (string.CompareOrdinal(src, i, close, 0, close.Length) == 0) return i;
+        }
+        return -1;
     }
 
     private static void ApplyStripping(List<Token> tokens)

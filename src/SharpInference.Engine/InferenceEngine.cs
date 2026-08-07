@@ -656,6 +656,17 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                 // when no non-owned slot is active (single-slot mode, or this request stayed on
                 // the owned slot). -1 keeps the finally's DeactivateSlot a no-op.
                 int activeSlotIdx = -1;
+                // Issues #451/#452: index of the slot whose KV this request actually MUTATES,
+                // which is NOT always the one it bound. The MTP path deliberately skips
+                // SelectSlot and runs on the owned slot 0, leaving activeSlotIdx at -1; keying
+                // the shadow invalidate/write pair off activeSlotIdx therefore skipped MTP
+                // entirely (#452) while DSpark, which DOES bind a slot, hard-coded slot 0 on the
+                // write side (#451). Both directions produce the same failure: a token shadow
+                // that describes a sequence the slot's KV no longer holds, which the next
+                // request SelectSlot-matches and TruncateTo's into. Set once the request knows
+                // which slot it runs on; -1 means "no slot shadow to maintain" (image path,
+                // whose KV sits at expanded positions and is invalidated separately).
+                int mutatedSlotIdx = -1;
                 try
                 {
                     // Issue #302: bind the backend's thread-affine context (CUDA) to this thread
@@ -935,9 +946,19 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         // re-prefill on every retry after a client disconnect. prefixLen == 0
                         // means ResetCache wiped everything, so there is nothing to retain.
                         // A complete decode re-pairs the shadows with the full transcript.
+                        //
+                        // Issue #452: invalidate the shadow of the slot this request MUTATES, not
+                        // the one it bound. On the MTP path no bind happens (activeSlotIdx == -1)
+                        // yet slot 0's KV is reset/overwritten all the same, so the old
+                        // `activeSlotIdx >= 0` gate left _slotTokens[0] describing the PRIOR
+                        // sequence. _prevTokens was downgraded correctly, but the next MTP request
+                        // reads the stale _slotTokens[0] straight back into _prevTokens (the
+                        // realign above), resurrecting a prefix whose KV this request destroyed.
+                        // Reaching here with a slot table but no bind means MTP, which always runs
+                        // on the owned slot — hence OwnedSlotIdx as the fallback.
+                        mutatedSlotIdx = activeSlotIdx >= 0 ? activeSlotIdx : OwnedSlotIdx;
                         int[]? retainedPrefix = prefixLen > 0 ? tokens[..prefixLen] : null;
-                        if (_slotTokens is not null && activeSlotIdx >= 0)
-                            _slotTokens[activeSlotIdx] = retainedPrefix;
+                        if (_slotTokens is not null) _slotTokens[mutatedSlotIdx] = retainedPrefix;
                         _prevTokens = retainedPrefix;
 
                         // Prefill: process all prompt tokens (or just the suffix after the cached prefix).
@@ -979,6 +1000,25 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                                 logits = PrefillChunked(tokens, prefixLen, tokens.Length, ct);
                             else
                                 logits = _fwd.Forward(tokens[^1], tokens.Length - 1);
+
+                            // Issue #450: prefill completed, so KV [0, tokens.Length) is now valid
+                            // and decode only ever appends at positions >= tokens.Length. Widen the
+                            // shadows from the retained prefix to the WHOLE prompt: a request
+                            // aborted mid-decode — the overwhelmingly common abort point, since the
+                            // client either got enough tokens or disconnected — then hands the next
+                            // request the full prompt instead of just the prefix it happened to
+                            // inherit. For a long agentic conversation that is the difference
+                            // between re-prefilling one turn's suffix and re-prefilling nothing.
+                            // A prefill that throws or cancels part-way never reaches this line, so
+                            // the conservative retainedPrefix above still covers that case.
+                            //
+                            // Deliberately NOT applied on the useCanonicalSnapshot branch: that
+                            // path pins _prevTokens at the canonical boundary to stay paired with
+                            // the snapshot captured there (issue #102), and widening past the
+                            // boundary would change what a COMPLETED decode leaves behind on
+                            // snapshot backends — a different blast radius than this abort-path fix.
+                            _prevTokens = tokens;
+                            if (_slotTokens is not null) _slotTokens[mutatedSlotIdx] = tokens;
                         }
                         startPos = tokens.Length;
                     }
@@ -1039,7 +1079,15 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                             _fwd.CaptureSnapshot();
                             var snapDs = fullSeq.ToArray();
                             _prevTokens = snapDs;
-                            if (_slotTokens is not null) _slotTokens[0] = snapDs;
+                            // Issue #451: DSpark is NOT exempt from the slot bind the way MTP is —
+                            // it goes through SelectSlot like any other rewindable request, so a
+                            // short DSpark request can run entirely in the bounded scratch slot.
+                            // The old hard-coded [0] then claimed slot 0 held this transcript when
+                            // slot 0 was never touched, and left slot 1 understating what it really
+                            // held. The next request's SelectSlot scored that bogus slot-0 shadow
+                            // and TruncateTo'd into a different sequence's KV.
+                            if (_slotTokens is not null && mutatedSlotIdx >= 0)
+                                _slotTokens[mutatedSlotIdx] = snapDs;
                         }
                         // DSparkDecoder.Decode never emits the stop token itself, so
                         // decodeTokens reaching MaxNewTokens means budget exhaustion.
@@ -1103,9 +1151,12 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                             _fwd.CaptureSnapshot();
                             var snapMtp = fullSeq.ToArray();
                             _prevTokens = snapMtp;
-                            // Issue #212: MTP ran single-slot on slot 0 (owned) — record the
-                            // transcript against slot 0 so the next turn's SelectSlot can rematch.
-                            if (_slotTokens is not null) _slotTokens[0] = snapMtp;
+                            // Issue #212: MTP ran single-slot on the owned slot — record the
+                            // transcript against it so the next turn's SelectSlot can rematch.
+                            // mutatedSlotIdx resolves to OwnedSlotIdx here (no bind); using it
+                            // rather than a literal keeps this paired with the invalidate above.
+                            if (_slotTokens is not null && mutatedSlotIdx >= 0)
+                                _slotTokens[mutatedSlotIdx] = snapMtp;
                         }
                         // MtpDecoder.Decode never invokes emitToken for the stop token itself
                         // (documented contract), so decodeTokens reaching MaxNewTokens here means
@@ -1280,11 +1331,13 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         _fwd.CaptureSnapshot();
                         var snap = fullSeq.ToArray();
                         _prevTokens = snap;
-                        // Issue #212: record the transcript against the active slot so the next
-                        // turn's SelectSlot can rematch it (slot 0 = owned long prefix, slot 1 =
-                        // scratch). When no non-owned slot is bound (single-slot, MTP), this is
-                        // skipped and _prevTokens carries the state as before.
-                        if (activeSlotIdx >= 0) _slotTokens![activeSlotIdx] = snap;
+                        // Issue #212: record the transcript against the slot this request ran on so
+                        // the next turn's SelectSlot can rematch it (slot 0 = owned long prefix,
+                        // slot 1 = scratch). In single-slot mode _slotTokens is null and
+                        // _prevTokens carries the state as before; on the image path
+                        // mutatedSlotIdx stays -1, but that case is already excluded above.
+                        if (_slotTokens is not null && mutatedSlotIdx >= 0)
+                            _slotTokens[mutatedSlotIdx] = snap;
                     }
 
                     channel.Writer.TryWrite(new GenerateChunk(GenerateChunkKind.Stop, "", TruncatedByMaxTokens: hitMaxTokens));
