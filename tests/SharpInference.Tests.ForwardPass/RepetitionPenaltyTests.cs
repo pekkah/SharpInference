@@ -159,10 +159,16 @@ public sealed class RepetitionPenaltyTests
         Assert.Equal(new string('a', n), unpenalised);
         Assert.Equal(n - 1, AdjacentRepeats(unpenalised));
 
-        // Penalised: 'a' is demoted below 'b' as soon as it is emitted, and the two alternate.
-        Assert.Equal("ababababab", penalised[..10]);
-        Assert.Equal(0, AdjacentRepeats(penalised));
-        Assert.True(AdjacentRepeats(penalised) < AdjacentRepeats(unpenalised));
+        // Penalised: 'a' is demoted below 'b' once emitted, so 'b' breaks the run. It then settles
+        // back onto 'a' — with the penalty applied once per distinct token (#457), both candidates
+        // are in the window from step 3 on, which scales them both and restores the original
+        // ordering (a: 2.0/1.5 = 1.33 > b: 1.5/1.5 = 1.0). That settle-back is the llama.cpp
+        // contract, and an artifact of a two-candidate mock; a real vocabulary has thousands of
+        // alternatives for the freed mass. What matters here is that the penalty demonstrably
+        // changes the output and cuts the repeat rate, which it could not do at all before #454.
+        Assert.Equal("abaaaaaaaaaa", penalised);
+        Assert.True(AdjacentRepeats(penalised) < AdjacentRepeats(unpenalised),
+            $"penalised={AdjacentRepeats(penalised)} unpenalised={AdjacentRepeats(unpenalised)}");
     }
 
     [Fact]
@@ -192,8 +198,9 @@ public sealed class RepetitionPenaltyTests
             RepetitionPenalty = 1.0f,
         });
 
-        Assert.Equal("ababababab", penalised);
+        Assert.Equal("abaaaaaaaa", penalised);   // see ReducesRepeatedTokens for the settle-back
         Assert.Equal(new string('a', n), unpenalised);
+        Assert.True(AdjacentRepeats(penalised) < AdjacentRepeats(unpenalised));
     }
 
     [Fact]
@@ -288,8 +295,97 @@ public sealed class RepetitionPenaltyTests
 
         string[] results = await Task.WhenAll(penalised, plain);
 
-        Assert.Equal("ababababab", results[0]);
-        Assert.Equal("aaaaaaaaaa", results[1]);
+        Assert.Equal("abaaaaaaaa", results[0]);   // penalty applied to this sequence
+        Assert.Equal("aaaaaaaaaa", results[1]);   // co-tenant, penalty off — window never shared
+    }
+
+    // ── Once per distinct token, not per occurrence (#457) ───────────────
+
+    /// <summary>
+    /// Materialises the post-penalty, post-filter distribution the sampler would draw from.
+    /// </summary>
+    private static float[] Distribution(float[] logits, SamplingParams sp)
+    {
+        var probs = new float[logits.Length];
+        Sampler.BuildFilteredDistribution(logits, sp, probs);
+        return probs;
+    }
+
+    [Theory]
+    [InlineData(0)]      // slow path
+    [InlineData(8)]      // top-k fast path (separate penalty implementation)
+    public void Penalty_AppliesOncePerDistinctToken_NotPerOccurrence(int topK)
+    {
+        // The reported defect: the effective penalty was penalty^occurrences, so a token that
+        // recurs ~10 times in a 256-token window took ~3.5x at a nominal 1.15. llama.cpp applies
+        // the repeat penalty exactly once however high the occurrence count (the count feeds only
+        // its separate frequency/presence terms), and that is the contract these paths now hold to.
+        float[] logits = [3.0f, 2.5f, 2.0f, -1.0f, -2.0f, 1.0f, 0.5f, 0.25f];
+
+        var once = new SamplingParams
+        {
+            Temperature = 1f, TopK = topK, MinP = 0f, TopP = 1f,
+            RepetitionPenalty = 1.15f,
+            PreviousTokens = new List<int> { 0, 3 },
+        };
+        // Same two distinct tokens, each repeated many times — the shape a real 256-token chat
+        // window has, and the input that used to compound.
+        var many = once with
+        {
+            PreviousTokens = new List<int> { 0, 3, 0, 0, 3, 0, 3, 3, 0, 0, 3, 0, 0, 3, 0 },
+        };
+
+        Assert.Equal(Distribution(logits, once), Distribution(logits, many));
+    }
+
+    [Fact]
+    public void Penalty_WindowSize_ChangesCoverage_NotStrength()
+    {
+        // The property that makes PenaltyLastN = 256 a safe default: widening the window brings
+        // more tokens into scope but must never deepen the penalty on a token already in it.
+        // Token 0 is in scope in both cases; token 5 only in the wider one.
+        float[] logits = [3.0f, 2.5f, 2.0f, -1.0f, -2.0f, 1.0f];
+        var baseSp = new SamplingParams { Temperature = 1f, MinP = 0f, TopP = 1f, RepetitionPenalty = 1.2f };
+
+        var narrow = baseSp with { PreviousTokens = new List<int> { 0 } };
+        var wide = baseSp with { PreviousTokens = new List<int> { 0, 0, 0, 0, 5 } };
+
+        var dNarrow = Distribution(logits, narrow);
+        var dWide = Distribution(logits, wide);
+
+        // Token 5 entered scope, so the distributions are not identical...
+        Assert.NotEqual(dNarrow, dWide);
+        // ...but token 0's demotion relative to the untouched token 1 is unchanged: the extra
+        // occurrences bought nothing. (Compare ratios — adding token 5 renormalises the whole
+        // distribution, so the absolute probabilities shift even for untouched tokens.)
+        Assert.Equal(dNarrow[0] / dNarrow[1], dWide[0] / dWide[1], 5);
+    }
+
+    [Fact]
+    public async Task GenerateAsync_RepeatedTokenRate_IsMonotonicInPenalty()
+    {
+        // Suggestion from the report: the repeated-token rate should never INCREASE as the penalty
+        // rises. Per-occurrence compounding could reverse that curve, because the exponent grew
+        // with the window as generation proceeded.
+        int[] repeats = new int[5];
+        float[] penalties = [1.0f, 1.05f, 1.1f, 1.2f, 1.5f];
+
+        for (int i = 0; i < penalties.Length; i++)
+        {
+            using var engine = new InferenceEngine(new ConstantForwardPass(), new CharTokenizer(), "mock");
+            string text = await Run(engine, "prompt", new SamplingParams
+            {
+                Temperature = SharpTemp,
+                MaxNewTokens = 16,
+                RepetitionPenalty = penalties[i],
+            });
+            repeats[i] = AdjacentRepeats(text);
+        }
+
+        for (int i = 1; i < repeats.Length; i++)
+            Assert.True(repeats[i] <= repeats[i - 1],
+                $"penalty {penalties[i]} repeated more than {penalties[i - 1]}: " +
+                $"[{string.Join(", ", repeats)}]");
     }
 
     // ── PenaltyWindow unit behaviour ─────────────────────────────────────

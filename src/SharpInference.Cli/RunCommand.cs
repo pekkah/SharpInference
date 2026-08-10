@@ -187,12 +187,12 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         public long PrefillDequantCacheMb { get; init; }
 
         [CommandOption("--repeat-penalty|--rep-penalty")]
-        [Description("Repetition penalty (1.0 = disabled, >1.0 penalizes repeated tokens, default: 1.1). Mirrors llama.cpp's --repeat-penalty.")]
+        [Description("Repetition penalty (1.0 = disabled, >1.0 penalizes repeated tokens, default: 1.1). Mirrors llama.cpp's --repeat-penalty: applied once per distinct token in the --repeat-last-n window, not once per occurrence.")]
         [DefaultValue(1.1f)]
         public float RepPenalty { get; init; }
 
         [CommandOption("--repeat-last-n")]
-        [Description("Tokens the repetition penalty looks back over (0 = the whole context, default: 256). Mirrors llama.cpp's --repeat-last-n, whose default is 64; the larger default here covers the previous turns of a chat, where cross-turn repetition shows up. The window is seeded from the prompt tail, so the penalty applies from the first generated token.")]
+        [Description("Tokens the repetition penalty looks back over (0 = the whole context, default: 256). Mirrors llama.cpp's --repeat-last-n, whose default is 64; the larger default here covers the previous turns of a chat, where cross-turn repetition shows up. Widening this changes coverage, not penalty strength. The window is seeded from the prompt tail, so the penalty applies from the first generated token.")]
         [DefaultValue(256)]
         public int RepeatLastN { get; init; }
 
