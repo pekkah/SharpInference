@@ -191,6 +191,11 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [DefaultValue(1.1f)]
         public float RepPenalty { get; init; }
 
+        [CommandOption("--repeat-last-n")]
+        [Description("Tokens the repetition penalty looks back over (0 = the whole context, default: 256). Mirrors llama.cpp's --repeat-last-n, whose default is 64; the larger default here covers the previous turns of a chat, where cross-turn repetition shows up. The window is seeded from the prompt tail, so the penalty applies from the first generated token.")]
+        [DefaultValue(256)]
+        public int RepeatLastN { get; init; }
+
         [CommandOption("--backend")]
         [Description("GPU backend: auto, vulkan, cuda. Default: auto (prefers CUDA when -g is set and CUDA is available, otherwise Vulkan).")]
         [DefaultValue("auto")]
@@ -1188,6 +1193,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 ? [.. BuildStopTokenIds(tokenizer), .. toolBoundaryStops]
                 : [.. BuildStopTokenIds(tokenizer)],
             RepetitionPenalty = settings.RepPenalty,
+            PenaltyLastN = settings.RepeatLastN,
             SpecType = ParseSpecType(settings.SpecTypeStr),
             SpecDraftNMax = settings.SpecDraftNMax,
             SpecDraftNMin = settings.SpecDraftNMin,
@@ -1227,7 +1233,12 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             // and target must agree on the distribution), and bypassable via SHARPI_SPEC_SAMPLE=0.
             bool sampledSpec = settings.Temperature > 0f;
             bool specSampleDisabled = Environment.GetEnvironmentVariable("SHARPI_SPEC_SAMPLE") == "0";
-            bool hasPenalty = sp.RepetitionPenalty != 1f && sp.PreviousTokens is { Count: > 0 };
+            // Gate on the penalty being REQUESTED, not on a populated window: the window is built
+            // inside the decode loop (PenaltyWindow, issue #454), so sp.PreviousTokens is always
+            // null here. The old conjunction made this branch dead — a sampled --draft-model run
+            // silently kept speculating and dropped --repeat-penalty on the floor instead of
+            // falling back to the normal decode path, which does honour it.
+            bool hasPenalty = sp.RepetitionPenalty != 1f;
             bool hasBias = sp.LogitBias is { Count: > 0 };
             if (settings.DraftModelPath is not null && settings.DraftLookup)
             {
@@ -1254,7 +1265,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             }
             else if (sampledSpec && (hasPenalty || hasBias))
             {
-                AnsiConsole.MarkupLine("[yellow]Warning:[/] sampled speculative decoding does not yet support --repeat-penalty / logit bias (draft and target must share the same distribution); falling back to normal generation.");
+                AnsiConsole.MarkupLine("[yellow]Warning:[/] sampled speculative decoding does not yet support --repeat-penalty / logit bias (draft and target must share the same distribution); falling back to normal generation, which applies the penalty. Note --repeat-penalty defaults to 1.1 — pass [bold]--repeat-penalty 1.0[/] to disable it and keep speculating.");
             }
             else if (settings.DraftLookup)
             {
@@ -1855,7 +1866,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         else
         {
             (generated, totalDecoded) =
-                DecodeLoop(forward, logits, tokens.Count, tok, sp, rng, s.VerbosePrompt, s.HideThinking, s.MaxThinkingTokens, toolCapture);
+                DecodeLoop(forward, logits, tokens.Count, tok, sp, rng, s.VerbosePrompt, s.HideThinking, s.MaxThinkingTokens, toolCapture, tokens);
         }
         var decodeMs = sw.Elapsed.TotalMilliseconds;
 
@@ -1994,7 +2005,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
 
         sw.Restart();
         var (generated, totalDecoded) =
-            DecodeLoop(fwd.Forward, logits, pos, tok, sp, rng, s.VerbosePrompt, s.HideThinking, s.MaxThinkingTokens);
+            DecodeLoop(fwd.Forward, logits, pos, tok, sp, rng, s.VerbosePrompt, s.HideThinking, s.MaxThinkingTokens,
+                promptTokens: allTokens);
         var decodeMs = sw.Elapsed.TotalMilliseconds;
 
         Console.WriteLine();
@@ -2165,7 +2177,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             var logits = prefill(tokens);
 
             sw.Restart();
-            var (generated, totalDecoded) = DecodeLoop(forward, logits, tokens.Count, tok, sp, rng, hideThinking: s.HideThinking, maxThinkingTokens: s.MaxThinkingTokens);
+            var (generated, totalDecoded) = DecodeLoop(forward, logits, tokens.Count, tok, sp, rng, hideThinking: s.HideThinking, maxThinkingTokens: s.MaxThinkingTokens,
+                promptTokens: tokens);
             var decodeMs = sw.Elapsed.TotalMilliseconds;
 
             Console.WriteLine();
@@ -2188,23 +2201,27 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         bool verbosePromptLogging = false,
         bool hideThinking = false,
         int maxThinkingTokens = 0,
-        List<int>? captureTokens = null)
+        List<int>? captureTokens = null,
+        IReadOnlyList<int>? promptTokens = null)
     {
         var logits = initialLogits;
         int generated = 0;
         int totalDecoded = 0;
         bool inThinking = false;
         int thinkingTokenCount = 0;
-        var recentTokens = new List<int>(64);
+        // Repetition-penalty window (issue #454): the same engine-owned PenaltyWindow the
+        // InferenceEngine/ContinuousBatchingEngine decode loops use, replacing this loop's
+        // hand-rolled 64-token list so there is one implementation of the window. Sized by
+        // sp.PenaltyLastN and seeded from the prompt tail, so --repeat-penalty now sees across
+        // chat turns rather than starting empty at every response.
+        var penaltyWindow = PenaltyWindow.ForRequest(sp, promptTokens);
+        var spSample = PenaltyWindow.Bind(sp, penaltyWindow);
         var streamDec = new Utf8StreamDecoder();
         // Tool-call grammar constraint (issue #374): start each response from the watching state so
         // a reused instance serves this generation fresh. No-op when no constraint is attached.
         sp.Constraint?.Reset();
         for (int i = 0; i < sp.MaxNewTokens; i++)
         {
-            var spWithHistory = sp.RepetitionPenalty != 1.0f && recentTokens.Count > 0
-                ? sp with { PreviousTokens = recentTokens }
-                : sp;
             int next;
             if (inThinking && maxThinkingTokens > 0 && thinkingTokenCount >= maxThinkingTokens && s_endThinkTokenId > 0)
             {
@@ -2217,7 +2234,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 // While the grammar is restricting the vocabulary, sample from the masked logits so
                 // only a grammar-legal token can be chosen; otherwise sample exactly as before.
                 var sampleLogits = sp.Constraint is { IsConstraining: true } ctr ? ctr.Filter(logits) : logits;
-                next = sp.Temperature <= 0 ? Sampler.Greedy(sampleLogits) : Sampler.Sample(sampleLogits, spWithHistory, rng);
+                next = sp.Temperature <= 0 ? Sampler.Greedy(sampleLogits) : Sampler.Sample(sampleLogits, spSample, rng);
             }
             if (verbosePromptLogging)
             {
@@ -2236,8 +2253,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             else if (inThinking) thinkingTokenCount++;
             if (EmitToken(next, tok, streamDec, ref inThinking, hideThinking)) generated++;
             totalDecoded++;
-            recentTokens.Add(next);
-            if (recentTokens.Count > 64) recentTokens.RemoveAt(0);
+            penaltyWindow?.Add(next);
             logits = forward(next, startPos + i);
         }
         // When hiding reasoning, the decoder may still hold an in-thinking tail —

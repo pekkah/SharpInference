@@ -96,6 +96,11 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         // Filter before sampling — forcing tool-call arguments to satisfy the schema. The instance is
         // built per request (ChatTemplateRenderer.BuildToolArgumentConstraint) and is single-request.
         public ITokenConstraint? Constraint;
+        // Per-sequence repetition-penalty window (issue #454), bound into Sp above as
+        // PreviousTokens and advanced with every token this sequence emits. Null = no penalty for
+        // this request (or the caller supplied its own window), in which case Sp is the request's
+        // SamplingParams unchanged. Single-request state — never shared between sequences.
+        public PenaltyWindow? Penalty;
         public int TokenCount;
         // Per-sequence stateful UTF-8 decoders: reassembles multi-byte characters
         // split across tokens (CJK, emoji, smart quotes). Independent decoders for
@@ -380,6 +385,11 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
                 // argmax-tail and force-close paths, so it can detect a tool-call boundary and
                 // begin/end constraining). No-op when this sequence has no constraint.
                 seq.Constraint?.Accept(next);
+
+                // Advance this sequence's repetition-penalty window (issue #454) so the next step
+                // demotes what it just emitted. Per sequence, so concurrent requests never share a
+                // window. No-op when this request has no penalty.
+                seq.Penalty?.Add(next);
 
                 bool stoppedByStopToken = seq.StopIds.Contains(next);
                 bool cancelled = seq.Ct.IsCancellationRequested;
@@ -728,13 +738,21 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
         var constraint = req.Sp.Constraint;
         constraint?.Reset();
 
+        // Per-request repetition-penalty window (issue #454), seeded from this prompt and carried on
+        // the ActiveSeq for the decode loop to advance. Binding it into the sampling params once
+        // here means the per-step sampling call needs no per-token record allocation. Null (and so
+        // sp == req.Sp) when the penalty is off or the caller supplied its own window.
+        var penalty = PenaltyWindow.ForRequest(req.Sp, p.Tokens);
+        var sp = PenaltyWindow.Bind(req.Sp, penalty);
+
         var firstLogits = constraint is { IsConstraining: true } ctr
             ? ctr.Filter(logits)
             : (ReadOnlySpan<float>)logits;
-        int firstToken = req.Sp.Temperature <= 0f
+        int firstToken = sp.Temperature <= 0f
             ? Sampler.Greedy(firstLogits)
-            : Sampler.Sample(firstLogits, req.Sp, rng);
+            : Sampler.Sample(firstLogits, sp, rng);
         constraint?.Accept(firstToken);
+        penalty?.Add(firstToken);
 
         if (stopIds.Contains(firstToken))
         {
@@ -764,13 +782,14 @@ public sealed class ContinuousBatchingEngine : IInferenceEngine, IDisposable
             CurrentToken = firstToken,
             Position = p.Tokens.Length,
             Cache = p.Cache,
-            Sp = req.Sp,
+            Sp = sp,
             Output = req.Output,
             StopIds = stopIds,
             Rng = rng,
             Ct = req.Ct,
             ProjectedTokens = p.ProjectedTokens,
             Constraint = constraint,
+            Penalty = penalty,
             TokenCount = 1,
             InThinking = promptInThinking,
         };

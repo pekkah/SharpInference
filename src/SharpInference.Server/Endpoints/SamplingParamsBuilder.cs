@@ -32,6 +32,9 @@ internal static class SamplingParamsBuilder
             TopK              = topK        ?? d.TopK,
             MinP              = minP        ?? d.MinP,
             RepetitionPenalty = repPenalty  ?? d.RepetitionPenalty,
+            // Window size for the above; host-level only (the OpenAI/Anthropic wire formats
+            // have no per-request equivalent). The engine maintains the window itself.
+            PenaltyLastN      = d.PenaltyLastN,
             MaxNewTokens      = maxTokens   ?? d.MaxNewTokens,
             MaxThinkingTokens = maxThinking ?? d.MaxThinkingTokens,
             LogitBias         = logitBias,
