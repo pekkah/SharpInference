@@ -21,16 +21,25 @@ public static class Sampler
         int vocabSize = logits.Length;
 
         bool hasBias = p.LogitBias is { Count: > 0 };
-        bool hasPenalty = p.RepetitionPenalty != 1.0f && p.PreviousTokens is { Count: > 0 };
+        bool hasPenalty = p.HasPenalties && p.PreviousTokens is { Count: > 0 };
 
         // Fast path: top-k bounds the candidate set to a handful of tokens, so there is
         // no need to softmax/normalize/sort the whole vocabulary (262144 for Gemma 4) —
         // the dominant decode-time sampling cost. Select the top-k logits in a single
         // pass, then run temperature / softmax / min-p / top-p over just those k. This is
-        // the llama.cpp ordering (top-k → softmax(survivors) → top-p). Repetition penalty
-        // only *demotes* the recent tokens, so it is folded in by over-selecting (see
-        // SampleTopK). Logit bias can promote *arbitrary* tokens, so it keeps the full path.
-        if (p.TopK > 0 && p.TopK < vocabSize && !hasBias)
+        // the llama.cpp ordering (top-k → softmax(survivors) → top-p). Penalties that only
+        // *demote* recent tokens are folded in by over-selecting (see SampleTopK). Logit bias
+        // can promote *arbitrary* tokens, so it keeps the full path.
+        //
+        // Penalties can also run backwards and PROMOTE a seen token: a repetition penalty below
+        // 1 divides a positive logit by a fraction, and frequency/presence accept negatives
+        // (OpenAI's range is -2..2, "encourage this"). The over-select cannot see a token that
+        // was outside the top-(k+W) raw logits and got boosted into contention, so those
+        // configurations take the full-vocabulary path instead of silently sampling from a
+        // truncated candidate set.
+        bool promotingPenalty = hasPenalty
+            && (p.RepetitionPenalty < 1.0f || p.FrequencyPenalty < 0f || p.PresencePenalty < 0f);
+        if (p.TopK > 0 && p.TopK < vocabSize && !hasBias && !promotingPenalty)
             return SampleTopK(logits, p, rng, hasPenalty);
 
         // Copy logits so we can modify them
@@ -47,24 +56,15 @@ public static class Sampler
                     probs[id] += bias;
         }
 
-        // Repetition penalty (applied in logit space before temperature), once per DISTINCT token
-        // in the window — see DistinctTokens for why compounding per occurrence is wrong.
-        if (p.RepetitionPenalty != 1.0f && p.PreviousTokens is { Count: > 0 } prev)
+        // Window penalties (repetition / frequency / presence), in logit space before temperature.
+        // The repetition penalty lands once per DISTINCT token — see DistinctTokens for why
+        // compounding per occurrence is wrong; occurrence counts feed frequency instead.
+        if (p.HasPenalties && p.PreviousTokens is { Count: > 0 } prev)
         {
-            Span<int> scratch = prev.Count <= 512 ? stackalloc int[prev.Count] : new int[prev.Count];
-            int nd = DistinctTokens(prev, scratch);
-            for (int t = 0; t < nd; t++)
-            {
-                int id = scratch[t];
-                if ((uint)id < (uint)vocabSize)
-                {
-                    // Positive logits are divided; negative logits are multiplied
-                    if (probs[id] > 0f)
-                        probs[id] /= p.RepetitionPenalty;
-                    else
-                        probs[id] *= p.RepetitionPenalty;
-                }
-            }
+            Span<int> ids = prev.Count <= 512 ? stackalloc int[prev.Count] : new int[prev.Count];
+            Span<int> counts = prev.Count <= 512 ? stackalloc int[prev.Count] : new int[prev.Count];
+            int nd = DistinctTokens(prev, ids, counts);
+            ApplyPenalties(probs, p, ids[..nd], counts[..nd], vocabSize);
         }
 
         // Temperature scaling
@@ -142,18 +142,13 @@ public static class Sampler
                 if ((uint)id < (uint)vocabSize)
                     probs[id] += bias;
 
-        // Repetition penalty (in logit space, before temperature) — once per distinct token,
-        // mirroring Sample's slow path.
-        if (p.RepetitionPenalty != 1.0f && p.PreviousTokens is { Count: > 0 } prev)
+        // Window penalties (in logit space, before temperature) — same helper as Sample's slow path.
+        if (p.HasPenalties && p.PreviousTokens is { Count: > 0 } prev)
         {
-            Span<int> scratch = prev.Count <= 512 ? stackalloc int[prev.Count] : new int[prev.Count];
-            int nd = DistinctTokens(prev, scratch);
-            for (int t = 0; t < nd; t++)
-            {
-                int id = scratch[t];
-                if ((uint)id < (uint)vocabSize)
-                    probs[id] = probs[id] > 0f ? probs[id] / p.RepetitionPenalty : probs[id] * p.RepetitionPenalty;
-            }
+            Span<int> ids = prev.Count <= 512 ? stackalloc int[prev.Count] : new int[prev.Count];
+            Span<int> counts = prev.Count <= 512 ? stackalloc int[prev.Count] : new int[prev.Count];
+            int nd = DistinctTokens(prev, ids, counts);
+            ApplyPenalties(probs, p, ids[..nd], counts[..nd], vocabSize);
         }
 
         if (p.Temperature != 1.0f)
@@ -269,17 +264,27 @@ public static class Sampler
         if (hasPenalty)
         {
             var prev = p.PreviousTokens!;
+            float rep = p.RepetitionPenalty;
+            float freq = p.FrequencyPenalty;
+            float pres = p.PresencePenalty;
+            // The repetition penalty only needs membership, so it can stop at the first hit;
+            // frequency needs the full count. Only pay for the full scan when it is asked for.
+            bool needCount = freq != 0f;
             for (int t = 0; t < sel; t++)
             {
                 if (idx[t] < 0) continue;
-                // Membership, not occurrence count: the penalty applies once however many times
-                // the candidate appears in the window (see DistinctTokens). Indexed rather than
-                // foreach — prev is an interface, so foreach would box an enumerator per candidate.
-                bool seen = false;
+                // Indexed rather than foreach — prev is an interface, so foreach would box an
+                // enumerator per candidate per sampled token.
+                int occ = 0;
                 for (int w = 0; w < prev.Count; w++)
-                    if (prev[w] == idx[t]) { seen = true; break; }
-                if (!seen) continue;
-                vals[t] = vals[t] > 0f ? vals[t] / p.RepetitionPenalty : vals[t] * p.RepetitionPenalty;
+                    if (prev[w] == idx[t]) { occ++; if (!needCount) break; }
+                if (occ == 0) continue;
+
+                // Same order as the slow path's ApplyPenalties: scale once, then subtract.
+                if (rep != 1.0f)
+                    vals[t] = vals[t] > 0f ? vals[t] / rep : vals[t] * rep;
+                if (freq != 0f || pres != 0f)
+                    vals[t] -= occ * freq + pres;
             }
             // Insertion re-sort (sel is small: k + PreviousTokens.Count).
             for (int a = 1; a < sel; a++)
@@ -364,21 +369,57 @@ public static class Sampler
     /// Sorting to deduplicate keeps this allocation-free and O(W log W); a hash set would allocate
     /// on a per-token hot path.
     /// </summary>
-    private static int DistinctTokens(IReadOnlyList<int> prev, Span<int> dest)
+    private static int DistinctTokens(IReadOnlyList<int> prev, Span<int> ids, Span<int> counts)
     {
         int n = prev.Count;
         for (int i = 0; i < n; i++)
-            dest[i] = prev[i];
+            ids[i] = prev[i];
 
-        var used = dest[..n];
+        var used = ids[..n];
         used.Sort();
 
         // In-place compaction: the write index never overtakes the read index.
         int w = 0;
         for (int i = 0; i < n; i++)
-            if (i == 0 || used[i] != used[i - 1])
-                dest[w++] = used[i];
+        {
+            if (i > 0 && used[i] == used[i - 1])
+            {
+                counts[w - 1]++;
+                continue;
+            }
+            counts[w] = 1;
+            ids[w++] = used[i];
+        }
         return w;
+    }
+
+    /// <summary>
+    /// Applies the three window penalties to <paramref name="logits"/> in place, in llama.cpp's
+    /// order: the repetition penalty scales the logit (divide if positive, multiply if negative)
+    /// exactly once, then the frequency and presence penalties subtract. Shared by
+    /// <see cref="Sample"/>'s slow path and <see cref="BuildFilteredDistribution"/> so the two
+    /// cannot drift.
+    /// </summary>
+    private static void ApplyPenalties(
+        Span<float> logits, SamplingParams p, ReadOnlySpan<int> ids, ReadOnlySpan<int> counts, int vocabSize)
+    {
+        float rep = p.RepetitionPenalty;
+        float freq = p.FrequencyPenalty;
+        float pres = p.PresencePenalty;
+        bool subtractive = freq != 0f || pres != 0f;
+
+        for (int t = 0; t < ids.Length; t++)
+        {
+            int id = ids[t];
+            if ((uint)id >= (uint)vocabSize) continue;
+
+            if (rep != 1.0f)
+                logits[id] = logits[id] > 0f ? logits[id] / rep : logits[id] * rep;
+
+            // Every id here occurs at least once, so the presence term applies unconditionally.
+            if (subtractive)
+                logits[id] -= counts[t] * freq + pres;
+        }
     }
 
     public static int Greedy(ReadOnlySpan<float> logits)
@@ -616,6 +657,36 @@ public sealed record SamplingParams
     /// </para>
     /// </summary>
     public float RepetitionPenalty { get; init; } = 1.0f;
+
+    /// <summary>
+    /// Occurrence-scaled suppression: subtracts <c>occurrences × FrequencyPenalty</c> from the logit
+    /// of every token in the <see cref="PenaltyLastN"/> window. <c>0</c> (default) = disabled.
+    /// Mirrors llama.cpp's <c>--frequency-penalty</c> and OpenAI's <c>frequency_penalty</c>.
+    /// <para>
+    /// This is the dial for "the more often it appeared, the harder to say again" —
+    /// <see cref="RepetitionPenalty"/> deliberately does not scale with occurrence count
+    /// (issue #457). Subtractive in logit space, so unlike the repetition penalty its effect does
+    /// not depend on the sign of the logit.
+    /// </para>
+    /// </summary>
+    public float FrequencyPenalty { get; init; } = 0f;
+
+    /// <summary>
+    /// Flat suppression of anything already seen: subtracts <see cref="PresencePenalty"/> from the
+    /// logit of every token in the <see cref="PenaltyLastN"/> window, once, regardless of how often
+    /// it occurred. <c>0</c> (default) = disabled. Mirrors llama.cpp's <c>--presence-penalty</c>
+    /// and OpenAI's <c>presence_penalty</c>.
+    /// </summary>
+    public float PresencePenalty { get; init; } = 0f;
+
+    /// <summary>
+    /// True when any of the three window-based penalties is active, i.e. when the engine needs to
+    /// maintain a <see cref="PreviousTokens"/> window and the sampler needs to run the penalty pass.
+    /// Gate on this rather than on <see cref="RepetitionPenalty"/> alone — that is what made the
+    /// frequency/presence knobs easy to leave as silent no-ops (the issue #454 failure mode).
+    /// </summary>
+    public bool HasPenalties =>
+        RepetitionPenalty != 1.0f || FrequencyPenalty != 0f || PresencePenalty != 0f;
     public int MaxNewTokens { get; init; } = 512;
 
     /// <summary>

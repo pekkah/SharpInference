@@ -196,6 +196,16 @@ public sealed class RunCommand : Command<RunCommand.Settings>
         [DefaultValue(256)]
         public int RepeatLastN { get; init; }
 
+        [CommandOption("--frequency-penalty")]
+        [Description("Frequency penalty (0 = disabled, default: 0): subtracts occurrences x this value from each repeated token's logit, so suppression scales with how often it appeared. Mirrors llama.cpp's --frequency-penalty. Unlike --repeat-penalty, this one IS occurrence-scaled. Negative values encourage repetition.")]
+        [DefaultValue(0f)]
+        public float FrequencyPenalty { get; init; }
+
+        [CommandOption("--presence-penalty")]
+        [Description("Presence penalty (0 = disabled, default: 0): subtracts this value from the logit of every token already seen in the --repeat-last-n window, once, regardless of count. Mirrors llama.cpp's --presence-penalty. Negative values encourage repetition.")]
+        [DefaultValue(0f)]
+        public float PresencePenalty { get; init; }
+
         [CommandOption("--backend")]
         [Description("GPU backend: auto, vulkan, cuda. Default: auto (prefers CUDA when -g is set and CUDA is available, otherwise Vulkan).")]
         [DefaultValue("auto")]
@@ -1193,6 +1203,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 ? [.. BuildStopTokenIds(tokenizer), .. toolBoundaryStops]
                 : [.. BuildStopTokenIds(tokenizer)],
             RepetitionPenalty = settings.RepPenalty,
+            FrequencyPenalty = settings.FrequencyPenalty,
+            PresencePenalty = settings.PresencePenalty,
             PenaltyLastN = settings.RepeatLastN,
             SpecType = ParseSpecType(settings.SpecTypeStr),
             SpecDraftNMax = settings.SpecDraftNMax,
@@ -1233,12 +1245,14 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             // and target must agree on the distribution), and bypassable via SHARPI_SPEC_SAMPLE=0.
             bool sampledSpec = settings.Temperature > 0f;
             bool specSampleDisabled = Environment.GetEnvironmentVariable("SHARPI_SPEC_SAMPLE") == "0";
-            // Gate on the penalty being REQUESTED, not on a populated window: the window is built
+            // Gate on a penalty being REQUESTED, not on a populated window: the window is built
             // inside the decode loop (PenaltyWindow, issue #454), so sp.PreviousTokens is always
             // null here. The old conjunction made this branch dead — a sampled --draft-model run
             // silently kept speculating and dropped --repeat-penalty on the floor instead of
-            // falling back to the normal decode path, which does honour it.
-            bool hasPenalty = sp.RepetitionPenalty != 1f;
+            // falling back to the normal decode path, which does honour it. HasPenalties covers
+            // --frequency-penalty and --presence-penalty too; the draft model cannot reproduce
+            // any of the three, so all of them force the fallback.
+            bool hasPenalty = sp.HasPenalties;
             bool hasBias = sp.LogitBias is { Count: > 0 };
             if (settings.DraftModelPath is not null && settings.DraftLookup)
             {
@@ -1265,7 +1279,7 @@ public sealed class RunCommand : Command<RunCommand.Settings>
             }
             else if (sampledSpec && (hasPenalty || hasBias))
             {
-                AnsiConsole.MarkupLine("[yellow]Warning:[/] sampled speculative decoding does not yet support --repeat-penalty / logit bias (draft and target must share the same distribution); falling back to normal generation, which applies the penalty. Note --repeat-penalty defaults to 1.1 — pass [bold]--repeat-penalty 1.0[/] to disable it and keep speculating.");
+                AnsiConsole.MarkupLine("[yellow]Warning:[/] sampled speculative decoding does not yet support --repeat-penalty / --frequency-penalty / --presence-penalty / logit bias (draft and target must share the same distribution); falling back to normal generation, which applies them. Note --repeat-penalty defaults to 1.1 — pass [bold]--repeat-penalty 1.0[/] (and zero the others) to keep speculating.");
             }
             else if (settings.DraftLookup)
             {

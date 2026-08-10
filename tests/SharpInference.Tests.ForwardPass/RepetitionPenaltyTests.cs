@@ -60,7 +60,11 @@ public sealed class RepetitionPenaltyTests
 
     private static float[] Row()
     {
+        // The rest of the vocabulary sits far below, not at zero: FrequencyPenalty subtracts
+        // without bound, so a zero floor would let arbitrary unseen tokens overtake the two real
+        // candidates after a few occurrences and turn these assertions into noise.
         var r = new float[Vocab];
+        Array.Fill(r, -20f);
         r[TokA] = 2.0f;
         r[TokB] = 1.5f;
         return r;
@@ -386,6 +390,124 @@ public sealed class RepetitionPenaltyTests
             Assert.True(repeats[i] <= repeats[i - 1],
                 $"penalty {penalties[i]} repeated more than {penalties[i - 1]}: " +
                 $"[{string.Join(", ", repeats)}]");
+    }
+
+    // ── Frequency / presence penalties (#459) ────────────────────────────
+
+    [Theory]
+    [InlineData(0)]      // slow path
+    [InlineData(8)]      // top-k fast path
+    public void FrequencyPenalty_ScalesWithOccurrenceCount(int topK)
+    {
+        // The dial RepetitionPenalty deliberately is NOT (#457): frequency subtracts
+        // occurrences x value, so three occurrences must demote three times as far as one.
+        float[] logits = [3.0f, 2.5f, 2.0f, 1.0f, 0.5f, 0.25f, 0.1f, 0.05f];
+        var baseSp = new SamplingParams
+        {
+            Temperature = 1f, TopK = topK, MinP = 0f, TopP = 1f, FrequencyPenalty = 0.5f,
+        };
+
+        var once = Distribution(logits, baseSp with { PreviousTokens = new List<int> { 0 } });
+        var thrice = Distribution(logits, baseSp with { PreviousTokens = new List<int> { 0, 0, 0 } });
+        var none = Distribution(logits, baseSp with { FrequencyPenalty = 0f, PreviousTokens = new List<int> { 0 } });
+
+        // Token 0 loses ground each time it recurs; the untouched token 1 gains it.
+        Assert.True(once[0] < none[0], $"once={once[0]} none={none[0]}");
+        Assert.True(thrice[0] < once[0], $"thrice={thrice[0]} once={once[0]}");
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(8)]
+    public void PresencePenalty_IsFlat_RegardlessOfOccurrenceCount(int topK)
+    {
+        // Presence is the binary dial: seen at all → one flat subtraction. Repeating the token
+        // must change nothing, which is what distinguishes it from FrequencyPenalty above.
+        float[] logits = [3.0f, 2.5f, 2.0f, 1.0f, 0.5f, 0.25f, 0.1f, 0.05f];
+        var baseSp = new SamplingParams
+        {
+            Temperature = 1f, TopK = topK, MinP = 0f, TopP = 1f, PresencePenalty = 0.5f,
+        };
+
+        var once = Distribution(logits, baseSp with { PreviousTokens = new List<int> { 0 } });
+        var many = Distribution(logits, baseSp with { PreviousTokens = new List<int> { 0, 0, 0, 0 } });
+        var none = Distribution(logits, baseSp with { PresencePenalty = 0f, PreviousTokens = new List<int> { 0 } });
+
+        Assert.True(once[0] < none[0]);
+        Assert.Equal(once, many);
+    }
+
+    [Fact]
+    public async Task GenerateAsync_FrequencyPenalty_AloneBuildsTheWindow()
+    {
+        // The #454 trap, re-armed: the engine used to build a penalty window only when
+        // RepetitionPenalty != 1, so a request setting ONLY frequency/presence would have sailed
+        // through with an empty window and been silently ignored. Both must work standalone.
+        using var freqEngine = new InferenceEngine(new ConstantForwardPass(), new CharTokenizer(), "mock");
+        string freq = await Run(freqEngine, "prompt", new SamplingParams
+        {
+            Temperature = SharpTemp,
+            MaxNewTokens = 8,
+            RepetitionPenalty = 1.0f,      // untouched
+            FrequencyPenalty = 0.75f,      // 'a' (2.0) drops below 'b' (1.5) after one occurrence
+        });
+
+        using var presEngine = new InferenceEngine(new ConstantForwardPass(), new CharTokenizer(), "mock");
+        string pres = await Run(presEngine, "prompt", new SamplingParams
+        {
+            Temperature = SharpTemp,
+            MaxNewTokens = 8,
+            RepetitionPenalty = 1.0f,
+            PresencePenalty = 0.75f,
+        });
+
+        Assert.NotEqual(new string('a', 8), freq);
+        Assert.NotEqual(new string('a', 8), pres);
+        // Frequency compounds with each occurrence, presence does not, so they diverge: after both
+        // candidates are in the window presence restores the original ordering (a stays ahead),
+        // while frequency keeps pushing whichever token was used more.
+        Assert.Equal("ababababab"[..8], freq);
+        Assert.Equal("abaaaaaa", pres);
+    }
+
+    [Fact]
+    public void HasPenalties_CoversAllThreeDials()
+    {
+        // The gate every consumer keys off — PenaltyWindow.ForRequest, the sampler's fast-path
+        // choice, and the CLI's speculative-decoding fallback.
+        Assert.False(new SamplingParams().HasPenalties);
+        Assert.True(new SamplingParams { RepetitionPenalty = 1.1f }.HasPenalties);
+        Assert.True(new SamplingParams { FrequencyPenalty = 0.1f }.HasPenalties);
+        Assert.True(new SamplingParams { PresencePenalty = 0.1f }.HasPenalties);
+        Assert.True(new SamplingParams { FrequencyPenalty = -0.1f }.HasPenalties);
+
+        // ...and the window follows it, not RepetitionPenalty alone.
+        Assert.NotNull(PenaltyWindow.ForRequest(new SamplingParams { FrequencyPenalty = 0.1f }, [1, 2]));
+        Assert.NotNull(PenaltyWindow.ForRequest(new SamplingParams { PresencePenalty = 0.1f }, [1, 2]));
+        Assert.Null(PenaltyWindow.ForRequest(new SamplingParams(), [1, 2]));
+    }
+
+    [Fact]
+    public void NegativePenalty_PromotesSeenTokens_OnBothPaths()
+    {
+        // OpenAI's range is -2..2: a negative frequency penalty ENCOURAGES repetition. That
+        // breaks the top-k fast path's over-select assumption (it only reserves room for
+        // demotions), so such a request must take the full-vocabulary path and still promote.
+        // Token 5 starts last; a negative penalty should lift it above its unpenalised self.
+        float[] logits = [3.0f, 2.5f, 2.0f, 1.0f, 0.5f, 0.25f, 0.1f, 0.05f];
+        var sp = new SamplingParams
+        {
+            Temperature = 1f, TopK = 4, MinP = 0f, TopP = 1f,
+            FrequencyPenalty = -1.0f,
+            PreviousTokens = new List<int> { 5, 5 },
+        };
+
+        var boosted = Distribution(logits, sp);
+        var plain = Distribution(logits, sp with { FrequencyPenalty = 0f });
+
+        Assert.True(boosted[5] > plain[5], $"boosted={boosted[5]} plain={plain[5]}");
+        // Promoted from outside the raw top-4 into contention — which the fast path could not see.
+        Assert.True(boosted[5] > 0f);
     }
 
     // ── PenaltyWindow unit behaviour ─────────────────────────────────────
