@@ -20,6 +20,7 @@ internal static class SamplingParamsBuilder
         float? repPenalty   = null,
         float? freqPenalty  = null,
         float? presPenalty  = null,
+        int?   penaltyLastN = null,
         int?   maxTokens    = null,
         int?   maxThinking  = null,
         IReadOnlyDictionary<int, float>? logitBias = null,
@@ -38,9 +39,10 @@ internal static class SamplingParamsBuilder
             // Anthropic wire format, which falls back to the host defaults.
             FrequencyPenalty  = freqPenalty ?? d.FrequencyPenalty,
             PresencePenalty   = presPenalty ?? d.PresencePenalty,
-            // Window size for all three; host-level only (no wire format has a per-request
-            // equivalent). The engine maintains the window itself.
-            PenaltyLastN      = d.PenaltyLastN,
+            // Window all three penalties look back over. The engine maintains the window itself;
+            // this only sizes it. 0 = unbounded (the whole request), which is why the request
+            // value is taken whenever it is present rather than when it is non-zero.
+            PenaltyLastN      = penaltyLastN ?? d.PenaltyLastN,
             MaxNewTokens      = maxTokens   ?? d.MaxNewTokens,
             MaxThinkingTokens = maxThinking ?? d.MaxThinkingTokens,
             LogitBias         = logitBias,

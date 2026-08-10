@@ -159,6 +159,8 @@ public static class AnthropicEndpoints
             temperature: req.Temperature,
             topP:        req.TopP,
             topK:        req.TopK,
+            repPenalty:  req.RepetitionPenalty,
+            penaltyLastN: req.PenaltyLastN,
             maxTokens:   req.MaxTokens,
             maxThinking: req.Thinking?.BudgetTokens,
             thinkingDisabled: !enableThinking);
@@ -963,7 +965,14 @@ public sealed record AnthropicMessageRequest(
     // ChatTemplate.ScrubAssistantThinking behavior — and the pre-existing behavior of silently
     // dropping `thinking` blocks entirely on the tool-active path. Maps to the wire field
     // `preserve_thinking` via the server's snake_case JSON naming policy.
-    bool? PreserveThinking = null);
+    bool? PreserveThinking = null,
+    // Repetition penalty and the window all three penalties look back over. Not part of
+    // Anthropic's schema — an extension mirroring the OpenAI surface, previously reachable only
+    // as a host-level default. 1.0 disables the penalty; PenaltyLastN 0 means the whole request.
+    // Absent = the host default. Wire fields `repetition_penalty` / `penalty_last_n` via the
+    // snake_case naming policy.
+    float? RepetitionPenalty = null,
+    int? PenaltyLastN = null);
 
 public sealed record AnthropicThinking(string? Type, int? BudgetTokens);
 

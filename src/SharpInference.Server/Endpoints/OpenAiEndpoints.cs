@@ -170,8 +170,10 @@ public static class OpenAiEndpoints
         var sp = SamplingParamsBuilder.Build(opts,
             temperature: req.Temperature,
             topP:        req.TopP,
+            repPenalty:  req.RepetitionPenalty,
             freqPenalty: req.FrequencyPenalty,
             presPenalty: req.PresencePenalty,
+            penaltyLastN: req.PenaltyLastN,
             maxTokens:   req.MaxTokens,
             maxThinking: req.MaxThinkingTokens,
             logitBias:   logitBias,
@@ -784,7 +786,14 @@ public sealed record ChatCompletionRequest(
     // -2..2 range; negatives encourage repetition. Absent = the host default. Appended rather
     // than slotted next to top_p so positional construction of this record stays source-compatible.
     [property: JsonPropertyName("frequency_penalty")] float? FrequencyPenalty = null,
-    [property: JsonPropertyName("presence_penalty")] float? PresencePenalty = null);
+    [property: JsonPropertyName("presence_penalty")] float? PresencePenalty = null,
+    // Repetition penalty and the window all three penalties look back over. Not part of OpenAI's
+    // schema — these follow the vLLM / llama.cpp-server extension convention, and were previously
+    // reachable only as host-level defaults. 1.0 disables the penalty; penalty_last_n 0 means the
+    // whole request. Absent = the host default. Appended so positional construction stays
+    // source-compatible.
+    [property: JsonPropertyName("repetition_penalty")] float? RepetitionPenalty = null,
+    [property: JsonPropertyName("penalty_last_n")] int? PenaltyLastN = null);
 
 /// <summary>
 /// Message in an OpenAI <c>/v1/chat/completions</c> request. Both single-string
