@@ -394,9 +394,15 @@ public sealed class SamplingDefaults
     /// seeded from the tail of the rendered prompt, so at the first generated token of a new turn
     /// it holds the last N tokens of <em>prompt</em> — the trailing part of the previous reply,
     /// then the new user message and the assistant header. If the previous reply is longer than
-    /// roughly <c>N − |user message|</c>, its opening falls outside the window, which is exactly
-    /// where a repeated reply opening is chosen. Size this to span a full turn if identical
-    /// openings are the symptom.
+    /// roughly <c>N − |user message|</c>, its opening falls outside the window — so widening this
+    /// is what brings a whole prior turn into scope.
+    /// </para>
+    /// <para>
+    /// Do not expect that to cure verbatim reply replay. That was measured on a 12B roleplay model
+    /// repeating an identical user message, and the penalties were not the lever: replay occurred
+    /// in roughly half of conversations <em>with no penalty active at all</em>, and neither raising
+    /// the penalty, widening this window, nor disabling <c>PenaltySeedFromPrompt</c> moved it. The
+    /// penalty family demotes tokens, not sequences.
     /// </para>
     /// </summary>
     public int PenaltyLastN { get; set; } = 256;

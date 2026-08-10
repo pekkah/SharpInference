@@ -12,7 +12,9 @@ namespace SharpInference.Tests.ForwardPass;
 ///     the surviving support fits inside k, and the slow path's support must never be
 ///     <em>narrower</em> than the fast path's when it does not. Reported against 0.17.0 as a
 ///     suspected source of penalty-only degeneration on the slow path; it is not one — the paths
-///     agree exactly.
+///     agree exactly, and the report was later retracted (the degeneration was model behaviour
+///     with the same incidence at <em>zero</em> penalty). The pins are kept because the property
+///     is worth holding on its own.
 ///   </item>
 ///   <item>
 ///     <b>Shift dependence.</b> Softmax is shift-invariant, so adding a constant to every logit
@@ -285,10 +287,12 @@ public sealed class PenaltyPathEquivalenceTests
     /// attributed to <c>TopK</c>.
     /// </para>
     /// <para>
-    /// Context: a report of penalty-only repetition lock-in on 0.16.x/0.17.0, isolated to
-    /// <c>topK: 0</c>. This test exists so nobody "fixes" the stream difference — it is inherent
-    /// to sampling the same distribution in a different order — or repeats that experiment
-    /// believing a shared seed makes the two configs comparable.
+    /// This test exists so nobody "fixes" the stream difference — it is inherent to sampling the
+    /// same distribution in a different order — or runs a seeded A/B across <c>TopK</c> believing
+    /// the shared seed makes the two configs comparable. The property holds only where token-id
+    /// order and probability order actually disagree, which is why the fixture below is built to
+    /// reverse them; on a real vocabulary the high-probability tokens are scattered across the id
+    /// space, so they disagree in practice.
     /// </para>
     /// </summary>
     [Fact]
