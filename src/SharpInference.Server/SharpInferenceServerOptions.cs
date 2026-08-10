@@ -366,7 +366,11 @@ public sealed class SamplingDefaults
     /// <summary>Min-p cutoff. <c>0</c> = disabled. Mirrors <c>--min-p</c>.</summary>
     public float MinP { get; set; } = 0f;
 
-    /// <summary>Repetition penalty. <c>1.0</c> = disabled. Mirrors <c>--rep-penalty</c>.</summary>
+    /// <summary>
+    /// Repetition penalty. <c>1.0</c> = disabled. Mirrors <c>--rep-penalty</c>; overridden per
+    /// request by <c>repetition_penalty</c> on both the OpenAI and Anthropic surfaces (an
+    /// extension to both wire formats, following vLLM / llama.cpp-server).
+    /// </summary>
     public float RepetitionPenalty { get; set; } = 1f;
 
     /// <summary>
@@ -383,7 +387,17 @@ public sealed class SamplingDefaults
 
     /// <summary>
     /// Tokens the penalties look back over. <c>0</c> = the whole context. Mirrors
-    /// <c>--repeat-last-n</c>. Ignored when no penalty is active.
+    /// <c>--repeat-last-n</c>. Ignored when no penalty is active; overridden per request by
+    /// <c>penalty_last_n</c> on both the OpenAI and Anthropic surfaces.
+    /// <para>
+    /// This is the knob that decides whether a penalty spans a previous chat turn. The window is
+    /// seeded from the tail of the rendered prompt, so at the first generated token of a new turn
+    /// it holds the last N tokens of <em>prompt</em> — the trailing part of the previous reply,
+    /// then the new user message and the assistant header. If the previous reply is longer than
+    /// roughly <c>N − |user message|</c>, its opening falls outside the window, which is exactly
+    /// where a repeated reply opening is chosen. Size this to span a full turn if identical
+    /// openings are the symptom.
+    /// </para>
     /// </summary>
     public int PenaltyLastN { get; set; } = 256;
 

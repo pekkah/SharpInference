@@ -259,8 +259,13 @@ public static class Sampler
 
         // Apply repetition penalty to the selected candidates, then re-sort so the top-k
         // reflects the post-penalty order. Penalty is in logit space: positive logits are
-        // divided, negative ones multiplied, once per occurrence in PreviousTokens (the
-        // same per-occurrence compounding as the slow path).
+        // divided, negative ones multiplied, once per candidate present in the window —
+        // matching the slow path's once-per-distinct-token contract (issue #457).
+        //
+        // This block duplicates ApplyPenalties for the hot path. The sign-dependent form is
+        // deliberate llama.cpp/HF/vLLM parity (see SamplingParams.RepetitionPenalty); any
+        // change to it must land here, in ApplyPenalties, and in PenaltyPathEquivalenceTests
+        // together.
         if (hasPenalty)
         {
             var prev = p.PreviousTokens!;
@@ -399,6 +404,12 @@ public static class Sampler
     /// exactly once, then the frequency and presence penalties subtract. Shared by
     /// <see cref="Sample"/>'s slow path and <see cref="BuildFilteredDistribution"/> so the two
     /// cannot drift.
+    /// <para>
+    /// The sign-dependent scaling is deliberate cross-engine parity — see
+    /// <see cref="SamplingParams.RepetitionPenalty"/> for why it is not shift-invariant and why
+    /// that is accepted. Do not "fix" it here without updating the duplicated block in
+    /// <see cref="SampleTopK"/> and the pins in <c>PenaltyPathEquivalenceTests</c> in lockstep.
+    /// </para>
     /// </summary>
     private static void ApplyPenalties(
         Span<float> logits, SamplingParams p, ReadOnlySpan<int> ids, ReadOnlySpan<int> counts, int vocabSize)
@@ -650,6 +661,27 @@ public sealed record SamplingParams
     /// to compound as <c>penalty^occurrences</c>, so over a 256-token window a nominal 1.15 landed
     /// as ~3.5× on common tokens. If you tuned a value against a build before that fix, it will now
     /// be substantially milder — which is the point, but it does mean re-tuning.
+    /// </para>
+    /// <para>
+    /// The divide-if-positive / multiply-if-negative form is llama.cpp's, HuggingFace
+    /// transformers' and vLLM's exact formula. It descends from the CTRL paper (Keskar et al.
+    /// 2019), whose pure division <em>promotes</em> a token with a negative logit — dividing a
+    /// negative number by a value above 1 moves it toward zero. The sign split is the standard
+    /// fix, and it is kept here for cross-engine parity even though it costs shift-invariance:
+    /// because the scaling pivots on logit zero, the penalty's effect on distribution
+    /// <em>sharpness</em> depends on where the model's head sits relative to zero. A positive
+    /// head (effectively every real model) widens under penalty; an all-negative head sharpens
+    /// instead, because scaling spreads the gaps between the penalised tokens rather than
+    /// compressing them. What holds in <b>both</b> regimes — and is the invariant callers
+    /// actually rely on — is that a penalised token never gains probability relative to an
+    /// unpenalised one as this value rises.
+    /// </para>
+    /// <para>
+    /// For a flat, shift-invariant demotion instead, use <see cref="PresencePenalty"/>: it
+    /// subtracts a constant, so its effect does not depend on the sign or magnitude of the logit.
+    /// (Subtracting <c>Temperature × ln(rep)</c> there is the shift-invariant analogue of a
+    /// repetition penalty of <c>rep</c> — it divides the post-temperature probability by
+    /// <c>rep</c> exactly.)
     /// </para>
     /// <para>
     /// Ignored at <see cref="Temperature"/> ≤ 0: greedy decoding takes the argmax without running

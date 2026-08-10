@@ -229,6 +229,109 @@ public sealed class SamplingDefaultsTests
     }
 
     [Fact]
+    public async Task RepetitionPenaltyAndWindow_ReachSamplingParams_OpenAi()
+    {
+        // Both were host-level only: a client could set frequency/presence per request but not
+        // the repetition penalty, nor the window all three look back over. PenaltyLastN in
+        // particular is what decides whether the penalty spans a previous chat turn or only the
+        // prompt tail, so it has to be per-request to be tunable at all.
+        var fake = new FakeInferenceEngine("m");
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s =>
+            {
+                s.Configure<SharpInferenceServerOptions>(o =>
+                {
+                    o.Sampling.RepetitionPenalty = 1.05f;
+                    o.Sampling.PenaltyLastN      = 256;
+                });
+                s.AddSingleton<IInferenceEngine>(fake);
+            }));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "m",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            repetition_penalty = 1.15f,   // overrides 1.05
+            penalty_last_n = 1024,        // overrides 256
+            stream = false,
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+
+        Assert.NotNull(fake.LastSamplingParams);
+        Assert.Equal(1.15f, fake.LastSamplingParams!.RepetitionPenalty);
+        Assert.Equal(1024,  fake.LastSamplingParams.PenaltyLastN);
+        Assert.True(fake.LastSamplingParams.HasPenalties);
+    }
+
+    [Fact]
+    public async Task RepetitionPenaltyAndWindow_ReachSamplingParams_Anthropic()
+    {
+        var fake = new FakeInferenceEngine("m");
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s =>
+            {
+                s.Configure<SharpInferenceServerOptions>(o =>
+                {
+                    o.Sampling.RepetitionPenalty = 1.05f;
+                    o.Sampling.PenaltyLastN      = 256;
+                });
+                s.AddSingleton<IInferenceEngine>(fake);
+            }));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "m",
+            max_tokens = 16,
+            messages = new[] { new { role = "user", content = "Hi" } },
+            repetition_penalty = 1.15f,
+            penalty_last_n = 1024,
+            stream = false,
+        };
+        var response = await client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+
+        Assert.NotNull(fake.LastSamplingParams);
+        Assert.Equal(1.15f, fake.LastSamplingParams!.RepetitionPenalty);
+        Assert.Equal(1024,  fake.LastSamplingParams.PenaltyLastN);
+    }
+
+    [Fact]
+    public async Task PenaltyLastN_Zero_IsHonouredAsUnbounded()
+    {
+        // 0 means "the whole request", not "unset" — a `?? default` on the nullable request field
+        // gets this right, but a `!= 0` guard would silently substitute the host default and cap
+        // the window at 256.
+        var fake = new FakeInferenceEngine("m");
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s =>
+            {
+                s.Configure<SharpInferenceServerOptions>(o =>
+                {
+                    o.Sampling.RepetitionPenalty = 1.15f;
+                    o.Sampling.PenaltyLastN      = 256;
+                });
+                s.AddSingleton<IInferenceEngine>(fake);
+            }));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "m",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            penalty_last_n = 0,
+            stream = false,
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+
+        Assert.NotNull(fake.LastSamplingParams);
+        Assert.Equal(0, fake.LastSamplingParams!.PenaltyLastN);
+    }
+
+    [Fact]
     public async Task SpecDecodeOptions_ReachSamplingParams()
     {
         var fake = new FakeInferenceEngine("m");
