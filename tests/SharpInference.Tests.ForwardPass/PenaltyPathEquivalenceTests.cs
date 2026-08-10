@@ -270,4 +270,60 @@ public sealed class PenaltyPathEquivalenceTests
             previousRatio = ratio;
         }
     }
+
+    /// <summary>
+    /// The corollary of <see cref="SlowAndFastPathsAgreeWhenSupportFitsInK"/>, and the reason a
+    /// seeded A/B across <see cref="SamplingParams.TopK"/> is <b>not</b> a controlled experiment:
+    /// equal distributions do not imply equal token streams from equal seeds.
+    /// <para>
+    /// The two paths consume the same uniform draw differently. <c>SampleFromDistribution</c>
+    /// walks the full vocabulary in <em>token-id</em> order; <c>SampleTopK</c> walks its
+    /// candidates in <em>descending-probability</em> order, scaled by the kept mass. Both are
+    /// unbiased, but a given <c>r</c> lands on different tokens, so two runs that differ only in
+    /// <c>TopK</c> diverge at the first token and never reconverge — and any downstream
+    /// difference in behaviour (a model falling into verbatim self-copying, say) gets falsely
+    /// attributed to <c>TopK</c>.
+    /// </para>
+    /// <para>
+    /// Context: a report of penalty-only repetition lock-in on 0.16.x/0.17.0, isolated to
+    /// <c>topK: 0</c>. This test exists so nobody "fixes" the stream difference — it is inherent
+    /// to sampling the same distribution in a different order — or repeats that experiment
+    /// believing a shared seed makes the two configs comparable.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void EqualDistributionsStillYieldDifferentStreamsFromTheSameSeed()
+    {
+        // A dedicated fixture, because the shared MakeLogits lays its band out in descending
+        // probability order by token id — which makes id order and probability order coincide, and
+        // the two streams agree for that reason alone. Here the 40 survivors ASCEND in probability
+        // as the id rises, so the two traversal orders are exactly reversed.
+        var logits = new float[Vocab];
+        Array.Fill(logits, -20f);
+        for (int i = 0; i < 40; i++)
+            logits[1000 + i * 37] = 4.0f + 0.02f * i;
+
+        var slowParams = Params(topK: 0, rep: 1.0f, minP: 0.05f);
+        var fastParams = Params(topK: 64, rep: 1.0f, minP: 0.05f);
+
+        // Premise: every survivor fits inside k, so the two paths are distribution-equal here
+        // (pinned by SlowAndFastPathsAgreeWhenSupportFitsInK).
+        var slowDist = Distribution(logits, slowParams);
+        var fastDist = Distribution(logits, fastParams);
+        Assert.Equal(40, Support(slowDist));
+        for (int i = 0; i < Vocab; i++)
+            Assert.Equal(slowDist[i], fastDist[i], 6);
+
+        static int[] Draw(float[] logits, SamplingParams p)
+        {
+            var rng = new Random(42);
+            var stream = new int[64];
+            for (int i = 0; i < stream.Length; i++)
+                stream[i] = Sampler.Sample(logits, p, rng);
+            return stream;
+        }
+
+        // Same seed, same distribution — different tokens, from the first draw onward.
+        Assert.NotEqual(Draw(logits, slowParams), Draw(logits, fastParams));
+    }
 }

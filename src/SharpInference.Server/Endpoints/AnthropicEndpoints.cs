@@ -159,6 +159,7 @@ public static class AnthropicEndpoints
             temperature: req.Temperature,
             topP:        req.TopP,
             topK:        req.TopK,
+            minP:        req.MinP,
             repPenalty:  req.RepetitionPenalty,
             penaltyLastN: req.PenaltyLastN,
             maxTokens:   req.MaxTokens,
@@ -972,7 +973,13 @@ public sealed record AnthropicMessageRequest(
     // Absent = the host default. Wire fields `repetition_penalty` / `penalty_last_n` via the
     // snake_case naming policy.
     float? RepetitionPenalty = null,
-    int? PenaltyLastN = null);
+    int? PenaltyLastN = null,
+    // Min-p cutoff. Anthropic has top_k natively (above) but no min_p; this is the same extension
+    // convention as the penalties. 0 disables, and is honoured rather than treated as unset.
+    // Absent = the host default. Wire field `min_p` via the snake_case naming policy.
+    // frequency/presence penalties are deliberately NOT mirrored here: they are OpenAI-native
+    // semantics with no Anthropic client precedent — use repetition_penalty instead.
+    float? MinP = null);
 
 public sealed record AnthropicThinking(string? Type, int? BudgetTokens);
 

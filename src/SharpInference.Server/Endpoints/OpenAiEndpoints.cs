@@ -170,6 +170,8 @@ public static class OpenAiEndpoints
         var sp = SamplingParamsBuilder.Build(opts,
             temperature: req.Temperature,
             topP:        req.TopP,
+            topK:        req.TopK,
+            minP:        req.MinP,
             repPenalty:  req.RepetitionPenalty,
             freqPenalty: req.FrequencyPenalty,
             presPenalty: req.PresencePenalty,
@@ -793,7 +795,14 @@ public sealed record ChatCompletionRequest(
     // whole request. Absent = the host default. Appended so positional construction stays
     // source-compatible.
     [property: JsonPropertyName("repetition_penalty")] float? RepetitionPenalty = null,
-    [property: JsonPropertyName("penalty_last_n")] int? PenaltyLastN = null);
+    [property: JsonPropertyName("penalty_last_n")] int? PenaltyLastN = null,
+    // Top-k truncation and min-p cutoff — the same vLLM / llama.cpp-server extension convention
+    // as the penalties above, neither being part of OpenAI's schema. top_k 0 disables top-k
+    // (full-vocabulary sampling); min_p 0 disables min-p. Both are honoured at 0 rather than
+    // treated as unset, so a request can explicitly turn off a knob the host default enables.
+    // Absent = the host default. Appended so positional construction stays source-compatible.
+    [property: JsonPropertyName("top_k")] int? TopK = null,
+    [property: JsonPropertyName("min_p")] float? MinP = null);
 
 /// <summary>
 /// Message in an OpenAI <c>/v1/chat/completions</c> request. Both single-string
