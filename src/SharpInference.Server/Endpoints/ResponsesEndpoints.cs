@@ -234,6 +234,11 @@ public sealed record ResponsesRequest(
     JsonElement? Input,
     string? Instructions,
     int? MaxOutputTokens,
+    // Sampling coverage here is deliberately limited to OpenAI's official Responses schema.
+    // The extension knobs the chat-completions surface carries (top_k, min_p,
+    // repetition_penalty, penalty_last_n — see ChatCompletionRequest) have far less client
+    // precedent on Responses, so they are not mirrored until there is demand; requests fall back
+    // to the host-level SamplingDefaults for all of them.
     float? Temperature,
     float? TopP,
     bool? Stream);

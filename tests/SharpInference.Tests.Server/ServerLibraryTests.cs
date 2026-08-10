@@ -332,6 +332,103 @@ public sealed class SamplingDefaultsTests
     }
 
     [Fact]
+    public async Task TopKAndMinP_ReachSamplingParams_OpenAi()
+    {
+        // Neither is in OpenAI's schema, so both were host-level only — leaving an OpenAI-surface
+        // client unable to A/B top-k without restarting the host, while the Anthropic surface has
+        // had top_k per request all along.
+        var fake = new FakeInferenceEngine("m");
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s =>
+            {
+                s.Configure<SharpInferenceServerOptions>(o =>
+                {
+                    o.Sampling.TopK = 40;
+                    o.Sampling.MinP = 0.01f;
+                });
+                s.AddSingleton<IInferenceEngine>(fake);
+            }));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "m",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            top_k = 64,       // overrides 40
+            min_p = 0.07f,    // overrides 0.01
+            stream = false,
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+
+        Assert.NotNull(fake.LastSamplingParams);
+        Assert.Equal(64,    fake.LastSamplingParams!.TopK);
+        Assert.Equal(0.07f, fake.LastSamplingParams.MinP);
+    }
+
+    [Fact]
+    public async Task TopKZero_ExplicitlyDisablesTopK_OverridingNonzeroHostDefault()
+    {
+        // 0 means "no top-k truncation", not "unset" — the same presence-vs-nonzero trap as
+        // penalty_last_n. A `!= 0` merge would silently leave the host's 40 in place, which is
+        // precisely the config the slow-path repetition report was run under.
+        var fake = new FakeInferenceEngine("m");
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s =>
+            {
+                s.Configure<SharpInferenceServerOptions>(o => o.Sampling.TopK = 40);
+                s.AddSingleton<IInferenceEngine>(fake);
+            }));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "m",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            top_k = 0,
+            stream = false,
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+
+        Assert.NotNull(fake.LastSamplingParams);
+        Assert.Equal(0, fake.LastSamplingParams!.TopK);
+    }
+
+    [Fact]
+    public async Task MinP_ReachesSamplingParams_Anthropic()
+    {
+        var fake = new FakeInferenceEngine("m");
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s =>
+            {
+                s.Configure<SharpInferenceServerOptions>(o =>
+                {
+                    o.Sampling.TopK = 40;
+                    o.Sampling.MinP = 0.01f;
+                });
+                s.AddSingleton<IInferenceEngine>(fake);
+            }));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "m",
+            max_tokens = 16,
+            messages = new[] { new { role = "user", content = "Hi" } },
+            top_k = 64,       // native Anthropic field — passthrough guard
+            min_p = 0.07f,    // extension
+            stream = false,
+        };
+        var response = await client.PostAsJsonAsync("/v1/messages", req);
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+
+        Assert.NotNull(fake.LastSamplingParams);
+        Assert.Equal(64,    fake.LastSamplingParams!.TopK);
+        Assert.Equal(0.07f, fake.LastSamplingParams.MinP);
+    }
+
+    [Fact]
     public async Task SpecDecodeOptions_ReachSamplingParams()
     {
         var fake = new FakeInferenceEngine("m");
