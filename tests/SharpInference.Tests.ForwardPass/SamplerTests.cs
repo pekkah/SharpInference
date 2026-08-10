@@ -272,11 +272,13 @@ public sealed class SamplerTests
     }
 
     [Fact]
-    public void SampleTopK_Penalty_DuplicateOccurrences_Compound()
+    public void SampleTopK_Penalty_DuplicateOccurrences_DoNotCompound()
     {
-        // Token 1 (logit 8) sits 2nd; token 2 has logit 6.5. One penalty occurrence:
-        // 8/1.2 = 6.67 > 6.5, so token 1 stays in the top-2. Three occurrences (compounded):
-        // 8/1.2^3 = 4.63 < 6.5, so token 1 is demoted below token 2.
+        // Issue #457: the penalty lands once per DISTINCT token, so repeating a token in the
+        // window must not deepen its demotion. Token 1 (logit 8) sits 2nd; token 2 has logit 6.5.
+        // 8/1.2 = 6.67 > 6.5, so token 1 keeps the second top-2 slot however often it recurs.
+        // (Before the fix, three occurrences compounded to 8/1.2^3 = 4.63 and demoted it — which
+        // is what made a nominal penalty land far harder than the same number in llama.cpp.)
         float[] logits = [9f, 8f, 6.5f, 1f];
         var once = new SamplingParams
         {
@@ -288,9 +290,9 @@ public sealed class SamplerTests
         var reachOnce = ReachableSet(logits, once, seed: 9, trials: 500);
         var reachThrice = ReachableSet(logits, thrice, seed: 9, trials: 500);
 
-        Assert.Contains(1, reachOnce);            // single occurrence keeps it in the top-2
-        Assert.DoesNotContain(1, reachThrice);    // compounded penalty demotes it
-        Assert.Contains(2, reachThrice);          // token 2 takes the freed slot
+        Assert.Contains(1, reachOnce);
+        Assert.Equal(reachOnce, reachThrice);     // occurrence count changes nothing
+        Assert.DoesNotContain(2, reachThrice);    // token 2 never takes the slot
     }
 
     [Fact]

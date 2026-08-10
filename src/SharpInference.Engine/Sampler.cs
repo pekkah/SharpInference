@@ -47,14 +47,15 @@ public static class Sampler
                     probs[id] += bias;
         }
 
-        // Repetition penalty (applied in logit space before temperature)
+        // Repetition penalty (applied in logit space before temperature), once per DISTINCT token
+        // in the window — see DistinctTokens for why compounding per occurrence is wrong.
         if (p.RepetitionPenalty != 1.0f && p.PreviousTokens is { Count: > 0 } prev)
         {
-            // Indexed rather than foreach: PreviousTokens is an interface, so a foreach would box
-            // the enumerator on every sampled token.
-            for (int t = 0; t < prev.Count; t++)
+            Span<int> scratch = prev.Count <= 512 ? stackalloc int[prev.Count] : new int[prev.Count];
+            int nd = DistinctTokens(prev, scratch);
+            for (int t = 0; t < nd; t++)
             {
-                int id = prev[t];
+                int id = scratch[t];
                 if ((uint)id < (uint)vocabSize)
                 {
                     // Positive logits are divided; negative logits are multiplied
@@ -141,14 +142,19 @@ public static class Sampler
                 if ((uint)id < (uint)vocabSize)
                     probs[id] += bias;
 
-        // Repetition penalty (in logit space, before temperature).
+        // Repetition penalty (in logit space, before temperature) — once per distinct token,
+        // mirroring Sample's slow path.
         if (p.RepetitionPenalty != 1.0f && p.PreviousTokens is { Count: > 0 } prev)
-            for (int t = 0; t < prev.Count; t++)
+        {
+            Span<int> scratch = prev.Count <= 512 ? stackalloc int[prev.Count] : new int[prev.Count];
+            int nd = DistinctTokens(prev, scratch);
+            for (int t = 0; t < nd; t++)
             {
-                int id = prev[t];
+                int id = scratch[t];
                 if ((uint)id < (uint)vocabSize)
                     probs[id] = probs[id] > 0f ? probs[id] / p.RepetitionPenalty : probs[id] * p.RepetitionPenalty;
             }
+        }
 
         if (p.Temperature != 1.0f)
         {
@@ -216,9 +222,11 @@ public static class Sampler
     ///
     /// Repetition penalty (<paramref name="hasPenalty"/>) only ever *lowers* the logits of
     /// recently seen tokens, so it cannot promote a token from outside the top-(k+W) raw
-    /// logits into the post-penalty top-k (W = number of penalised tokens, bounded above by
-    /// <c>PreviousTokens.Count</c>). We therefore over-select the top-(k+W) raw candidates,
-    /// apply the penalty to that small set, re-sort, and keep the top-k.
+    /// logits into the post-penalty top-k (W = number of penalised tokens — the DISTINCT tokens
+    /// in the window, bounded above by <c>PreviousTokens.Count</c>). We therefore over-select the
+    /// top-(k+W) raw candidates, apply the penalty to that small set, re-sort, and keep the top-k.
+    /// The penalty lands once per candidate regardless of how often it recurs in the window
+    /// (issue #457); see <see cref="DistinctTokens"/>.
     /// </summary>
     private static int SampleTopK(ReadOnlySpan<float> logits, SamplingParams p, Random rng, bool hasPenalty)
     {
@@ -264,14 +272,14 @@ public static class Sampler
             for (int t = 0; t < sel; t++)
             {
                 if (idx[t] < 0) continue;
-                int occ = 0;
-                // Indexed rather than foreach: prev is an interface, and this runs once per
-                // candidate per sampled token — a boxed enumerator each pass would be pure garbage.
+                // Membership, not occurrence count: the penalty applies once however many times
+                // the candidate appears in the window (see DistinctTokens). Indexed rather than
+                // foreach — prev is an interface, so foreach would box an enumerator per candidate.
+                bool seen = false;
                 for (int w = 0; w < prev.Count; w++)
-                    if (prev[w] == idx[t]) occ++;
-                if (occ == 0) continue;
-                float pen = MathF.Pow(p.RepetitionPenalty, occ);
-                vals[t] = vals[t] > 0f ? vals[t] / pen : vals[t] * pen;
+                    if (prev[w] == idx[t]) { seen = true; break; }
+                if (!seen) continue;
+                vals[t] = vals[t] > 0f ? vals[t] / p.RepetitionPenalty : vals[t] * p.RepetitionPenalty;
             }
             // Insertion re-sort (sel is small: k + PreviousTokens.Count).
             for (int a = 1; a < sel; a++)
@@ -337,6 +345,42 @@ public static class Sampler
     /// <summary>
     /// Greedy decoding: return the token with the highest logit.
     /// </summary>
+    /// <summary>
+    /// Copies the <b>distinct</b> token ids of <paramref name="prev"/> into <paramref name="dest"/>
+    /// (which must be at least <c>prev.Count</c> long) and returns how many there are.
+    /// <para>
+    /// The repetition penalty applies once per distinct token, never once per occurrence. This is
+    /// llama.cpp's contract (<c>llama_sampler_penalties_apply</c> looks up an occurrence count but
+    /// uses it only for the separate frequency/presence terms — the repeat penalty itself is applied
+    /// a single time), and it is what makes a nominal penalty value mean the same thing at any
+    /// <see cref="SamplingParams.PenaltyLastN"/>: the window controls *coverage*, not *strength*.
+    /// </para>
+    /// <para>
+    /// Issue #457: compounding per occurrence made the effective penalty
+    /// <c>penalty^occurrences</c>. Over a 256-token window of ordinary chat a common token recurs
+    /// ~10 times, so a nominal 1.15 landed as ~3.5× — far harsher than the same number in
+    /// llama.cpp, and harsh enough to push a model off its persona.
+    /// </para>
+    /// Sorting to deduplicate keeps this allocation-free and O(W log W); a hash set would allocate
+    /// on a per-token hot path.
+    /// </summary>
+    private static int DistinctTokens(IReadOnlyList<int> prev, Span<int> dest)
+    {
+        int n = prev.Count;
+        for (int i = 0; i < n; i++)
+            dest[i] = prev[i];
+
+        var used = dest[..n];
+        used.Sort();
+
+        // In-place compaction: the write index never overtakes the read index.
+        int w = 0;
+        for (int i = 0; i < n; i++)
+            if (i == 0 || used[i] != used[i - 1])
+                dest[w++] = used[i];
+        return w;
+    }
+
     public static int Greedy(ReadOnlySpan<float> logits)
     {
         int maxIdx = 0;
@@ -555,6 +599,22 @@ public sealed record SamplingParams
     public int TopK { get; init; } = 0;
     public float TopP { get; init; } = 1.0f;
     public float MinP { get; init; } = 0.0f;
+    /// <summary>
+    /// Repetition penalty applied in logit space before temperature. <c>1.0</c> = disabled;
+    /// above 1 demotes tokens seen in the last <see cref="PenaltyLastN"/> tokens (positive logits
+    /// divided, negative logits multiplied).
+    /// <para>
+    /// Applied <b>once per distinct token</b>, never once per occurrence — llama.cpp's contract,
+    /// and what keeps a given value meaning the same thing at any window size. Issue #457: it used
+    /// to compound as <c>penalty^occurrences</c>, so over a 256-token window a nominal 1.15 landed
+    /// as ~3.5× on common tokens. If you tuned a value against a build before that fix, it will now
+    /// be substantially milder — which is the point, but it does mean re-tuning.
+    /// </para>
+    /// <para>
+    /// Ignored at <see cref="Temperature"/> ≤ 0: greedy decoding takes the argmax without running
+    /// the penalty pipeline.
+    /// </para>
+    /// </summary>
     public float RepetitionPenalty { get; init; } = 1.0f;
     public int MaxNewTokens { get; init; } = 512;
 
@@ -605,6 +665,11 @@ public sealed record SamplingParams
     /// <see cref="RepetitionPenalty"/>. Defaults to 256 — larger than llama.cpp's <c>--repeat-last-n</c>
     /// default of 64, because the repetition that chat users actually notice spans turns (an assistant
     /// reply that opens like the previous one) rather than a single sentence.
+    /// <para>
+    /// The window controls <b>coverage, not strength</b>: since the penalty lands once per distinct
+    /// token (issue #457), widening it brings more tokens into scope but never makes the penalty on
+    /// any one of them harsher. That is what makes a 256 default safe.
+    /// </para>
     /// <para>
     /// <c>0</c> = unbounded: the window grows over the whole request. Note this is not free —
     /// the top-k sampling fast path over-selects candidates in proportion to the window size
