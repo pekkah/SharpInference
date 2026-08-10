@@ -166,6 +166,37 @@ public sealed class RepetitionPenaltyTests
     }
 
     [Fact]
+    public async Task GenerateAsync_RepetitionPenalty_AppliesOnTopKFastPath()
+    {
+        // TopK > 0 routes sampling through Sampler.SampleTopK, which implements the penalty
+        // separately from the slow path (it over-selects top-(k+W) raw candidates, penalises that
+        // small set, and re-sorts). Every other test here leaves TopK at 0 and so exercises only
+        // the slow path — but top-k is set in most real configs, and the over-select is sized off
+        // the window this change introduced, so the engine-built window has to be covered here too.
+        const int n = 10;
+        using var penalisedEngine = new InferenceEngine(new ConstantForwardPass(), new CharTokenizer(), "mock");
+        string penalised = await Run(penalisedEngine, "prompt", new SamplingParams
+        {
+            Temperature = SharpTemp,
+            MaxNewTokens = n,
+            TopK = 2,
+            RepetitionPenalty = 1.5f,
+        });
+
+        using var baseline = new InferenceEngine(new ConstantForwardPass(), new CharTokenizer(), "mock");
+        string unpenalised = await Run(baseline, "prompt", new SamplingParams
+        {
+            Temperature = SharpTemp,
+            MaxNewTokens = n,
+            TopK = 2,
+            RepetitionPenalty = 1.0f,
+        });
+
+        Assert.Equal("ababababab", penalised);
+        Assert.Equal(new string('a', n), unpenalised);
+    }
+
+    [Fact]
     public async Task GenerateAsync_PenaltyWindow_IsBoundedByPenaltyLastN()
     {
         // PenaltyLastN = 1 keeps only the previous token, so the penalty can never compound:
