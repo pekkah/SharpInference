@@ -1190,6 +1190,15 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                     }
                     int thinkingCount = 0;
 
+                    // Repetition-penalty window (issue #454). The engine owns the sliding window so
+                    // a library caller only has to set SamplingParams.RepetitionPenalty; previously
+                    // nothing here populated PreviousTokens, so the penalty was silently dropped for
+                    // every consumer of GenerateAsync (only the CLI's own decode loop built one).
+                    // Null when the penalty is off or the caller supplied its own window — spSample
+                    // is then sp itself and this path allocates nothing and samples identically.
+                    var penaltyWindow = PenaltyWindow.ForRequest(sp, tokens);
+                    var spSample = PenaltyWindow.Bind(sp, penaltyWindow);
+
                     // #219: on the pure-greedy path (temp 0, no logit bias) with a pass that can
                     // argmax on-device, carry just the next token id instead of downloading the full
                     // vocab logits every step. gpuNext holds the argmax of the most recent forward;
@@ -1235,7 +1244,7 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                                 : logits;
                             next = sp.Temperature <= 0f
                                 ? Sampler.Greedy(sampleLogits)
-                                : Sampler.Sample(sampleLogits, sp, rng);
+                                : Sampler.Sample(sampleLogits, spSample, rng);
                         }
 
                         // Advance the grammar constraint with the just-chosen token (every token,
@@ -1247,6 +1256,9 @@ public sealed class InferenceEngine : IInferenceEngine, IDisposable, IAsyncDispo
                         // Issue #21: chat-continuation prompts for turn N+1 typically extend
                         // turn N's full transcript, not just turn N's prompt.
                         fullSeq.Add(next);
+                        // Advance the penalty window alongside the transcript, so the next step
+                        // demotes what this one emitted. No-op when the penalty is disabled.
+                        penaltyWindow?.Add(next);
                         if (ttftMs < 0) ttftMs = swReq.ElapsedMilliseconds;
                         decodeTokens++;
 

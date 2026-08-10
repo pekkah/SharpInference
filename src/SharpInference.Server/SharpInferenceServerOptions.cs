@@ -370,6 +370,12 @@ public sealed class SamplingDefaults
     public float RepetitionPenalty { get; set; } = 1f;
 
     /// <summary>
+    /// Tokens the repetition penalty looks back over. <c>0</c> = the whole context.
+    /// Mirrors <c>--repeat-last-n</c>. Ignored when <see cref="RepetitionPenalty"/> is 1.
+    /// </summary>
+    public int PenaltyLastN { get; set; } = 256;
+
+    /// <summary>
     /// Cap on generated tokens when the request doesn't specify <c>max_tokens</c>.
     /// Mirrors <c>--n-predict</c>.
     /// </summary>
@@ -393,6 +399,7 @@ public sealed class SamplingDefaults
         TopP              = TopP,
         MinP              = MinP,
         RepetitionPenalty = RepetitionPenalty,
+        PenaltyLastN      = PenaltyLastN,
         MaxNewTokens      = MaxNewTokens,
         MaxThinkingTokens = MaxThinkingTokens,
     };

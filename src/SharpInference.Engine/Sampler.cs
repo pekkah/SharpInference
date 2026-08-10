@@ -48,10 +48,13 @@ public static class Sampler
         }
 
         // Repetition penalty (applied in logit space before temperature)
-        if (p.RepetitionPenalty != 1.0f && p.PreviousTokens is { Count: > 0 })
+        if (p.RepetitionPenalty != 1.0f && p.PreviousTokens is { Count: > 0 } prev)
         {
-            foreach (int id in p.PreviousTokens)
+            // Indexed rather than foreach: PreviousTokens is an interface, so a foreach would box
+            // the enumerator on every sampled token.
+            for (int t = 0; t < prev.Count; t++)
             {
+                int id = prev[t];
                 if ((uint)id < (uint)vocabSize)
                 {
                     // Positive logits are divided; negative logits are multiplied
@@ -139,10 +142,13 @@ public static class Sampler
                     probs[id] += bias;
 
         // Repetition penalty (in logit space, before temperature).
-        if (p.RepetitionPenalty != 1.0f && p.PreviousTokens is { Count: > 0 })
-            foreach (int id in p.PreviousTokens)
+        if (p.RepetitionPenalty != 1.0f && p.PreviousTokens is { Count: > 0 } prev)
+            for (int t = 0; t < prev.Count; t++)
+            {
+                int id = prev[t];
                 if ((uint)id < (uint)vocabSize)
                     probs[id] = probs[id] > 0f ? probs[id] / p.RepetitionPenalty : probs[id] * p.RepetitionPenalty;
+            }
 
         if (p.Temperature != 1.0f)
         {
@@ -226,8 +232,11 @@ public static class Sampler
         int sel = Math.Min(vocab, k + prevCount);
 
         // Select the top-`sel` (idx, logit) descending by logit via threshold insertion.
-        Span<int>   idx  = sel <= 256 ? stackalloc int[sel]   : new int[sel];
-        Span<float> vals = sel <= 256 ? stackalloc float[sel] : new float[sel];
+        // The stack bound covers k plus a default-sized penalty window (SamplingParams.PenaltyLastN
+        // = 256) so the common penalised path stays allocation-free; only an unusually large or
+        // unbounded window spills to the heap.
+        Span<int>   idx  = sel <= 1024 ? stackalloc int[sel]   : new int[sel];
+        Span<float> vals = sel <= 1024 ? stackalloc float[sel] : new float[sel];
         vals.Fill(float.NegativeInfinity);
         idx.Fill(-1);
         for (int i = 0; i < vocab; i++)
@@ -251,17 +260,20 @@ public static class Sampler
         // same per-occurrence compounding as the slow path).
         if (hasPenalty)
         {
+            var prev = p.PreviousTokens!;
             for (int t = 0; t < sel; t++)
             {
                 if (idx[t] < 0) continue;
                 int occ = 0;
-                foreach (int id in p.PreviousTokens!)
-                    if (id == idx[t]) occ++;
+                // Indexed rather than foreach: prev is an interface, and this runs once per
+                // candidate per sampled token — a boxed enumerator each pass would be pure garbage.
+                for (int w = 0; w < prev.Count; w++)
+                    if (prev[w] == idx[t]) occ++;
                 if (occ == 0) continue;
                 float pen = MathF.Pow(p.RepetitionPenalty, occ);
                 vals[t] = vals[t] > 0f ? vals[t] / pen : vals[t] * pen;
             }
-            // Insertion re-sort (sel is tiny: k + PreviousTokens.Count).
+            // Insertion re-sort (sel is small: k + PreviousTokens.Count).
             for (int a = 1; a < sel; a++)
             {
                 float v = vals[a]; int id = idx[a]; int b = a - 1;
@@ -572,10 +584,50 @@ public sealed record SamplingParams
     public IReadOnlyDictionary<int, float>? LogitBias { get; init; }
 
     /// <summary>
-    /// Recently generated token IDs for repetition penalty.
-    /// Typically a sliding window of the last N generated tokens.
+    /// Recently seen token IDs that <see cref="RepetitionPenalty"/> demotes — a sliding window of
+    /// the last <see cref="PenaltyLastN"/> tokens.
+    /// <para>
+    /// <b>Leave this null.</b> Both engines maintain the window themselves (a <see cref="PenaltyWindow"/>
+    /// seeded per <see cref="PenaltySeedFromPrompt"/> and advanced with every emitted token), so
+    /// setting <see cref="RepetitionPenalty"/> alone is enough. Before issue #454 the window was the
+    /// caller's responsibility and no engine built one, which made the penalty a silent no-op for
+    /// every consumer of <c>GenerateAsync</c>.
+    /// </para>
+    /// <para>
+    /// A non-null value means the caller owns the window: the engine leaves it untouched and never
+    /// appends to it, so the penalty then covers exactly the tokens supplied here.
+    /// </para>
     /// </summary>
     public IReadOnlyList<int>? PreviousTokens { get; init; }
+
+    /// <summary>
+    /// Size of the sliding <see cref="PreviousTokens"/> window the engine maintains for
+    /// <see cref="RepetitionPenalty"/>. Defaults to 256 — larger than llama.cpp's <c>--repeat-last-n</c>
+    /// default of 64, because the repetition that chat users actually notice spans turns (an assistant
+    /// reply that opens like the previous one) rather than a single sentence.
+    /// <para>
+    /// <c>0</c> = unbounded: the window grows over the whole request. Note this is not free —
+    /// the top-k sampling fast path over-selects candidates in proportion to the window size
+    /// (see <c>SampleTopK</c>), so an unbounded window makes per-token sampling cost grow with
+    /// the generation length.
+    /// </para>
+    /// Ignored when <see cref="RepetitionPenalty"/> is 1 (no penalty) or the caller supplied its own
+    /// <see cref="PreviousTokens"/>.
+    /// </summary>
+    public int PenaltyLastN { get; init; } = 256;
+
+    /// <summary>
+    /// Whether the penalty window starts seeded with the tail of the prompt (default <c>true</c>,
+    /// matching llama.cpp, whose penalty ring covers the last N tokens of context rather than of the
+    /// generation). Seeding is what lets the penalty see across chat turns: a generation-only window
+    /// is empty at token 0, which is exactly where an identical reply opening is chosen.
+    /// <para>
+    /// Set <c>false</c> to penalise only what this request generates — useful when the prompt carries
+    /// text that should not be demoted, e.g. a roleplay persona card whose character names would
+    /// otherwise be penalised out of the reply.
+    /// </para>
+    /// </summary>
+    public bool PenaltySeedFromPrompt { get; init; } = true;
 
     /// <summary>
     /// Optional grammar/FSM constraint applied during decoding (issue #374). The engine advances it
