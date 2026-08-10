@@ -370,8 +370,8 @@ public sealed class SamplingDefaultsTests
     public async Task TopKZero_ExplicitlyDisablesTopK_OverridingNonzeroHostDefault()
     {
         // 0 means "no top-k truncation", not "unset" — the same presence-vs-nonzero trap as
-        // penalty_last_n. A `!= 0` merge would silently leave the host's 40 in place, which is
-        // precisely the config the slow-path repetition report was run under.
+        // penalty_last_n. A `!= 0` merge would silently leave the host's 40 in place, giving a
+        // client that asked for full-vocabulary sampling something else entirely.
         var fake = new FakeInferenceEngine("m");
         var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
             b.ConfigureServices(s =>
