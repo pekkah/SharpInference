@@ -114,11 +114,12 @@ public sealed class PenaltyWindow : IReadOnlyList<int>
     }
 
     /// <summary>
-    /// Builds the penalty window for a request, or <c>null</c> when none is needed — the penalty is
-    /// disabled (<c>RepetitionPenalty == 1</c>), or the caller supplied its own
-    /// <see cref="SamplingParams.PreviousTokens"/> and therefore owns the window. A <c>null</c>
-    /// return means the caller should sample with <paramref name="sp"/> unchanged, keeping the
-    /// default path byte-identical to the pre-#454 behaviour.
+    /// Builds the penalty window for a request, or <c>null</c> when none is needed — no penalty is
+    /// active (<see cref="SamplingParams.HasPenalties"/>, which covers repetition, frequency and
+    /// presence), or the caller supplied its own <see cref="SamplingParams.PreviousTokens"/> and
+    /// therefore owns the window. A <c>null</c> return means the caller should sample with
+    /// <paramref name="sp"/> unchanged, keeping the default path byte-identical to the pre-#454
+    /// behaviour.
     /// </summary>
     /// <param name="sp">Request sampling parameters.</param>
     /// <param name="promptTokens">
@@ -128,7 +129,7 @@ public sealed class PenaltyWindow : IReadOnlyList<int>
     public static PenaltyWindow? ForRequest(SamplingParams sp, ReadOnlySpan<int> promptTokens)
     {
         ArgumentNullException.ThrowIfNull(sp);
-        if (sp.RepetitionPenalty == 1.0f || sp.PreviousTokens is not null)
+        if (!sp.HasPenalties || sp.PreviousTokens is not null)
             return null;
 
         var window = new PenaltyWindow(sp.PenaltyLastN);
@@ -141,7 +142,7 @@ public sealed class PenaltyWindow : IReadOnlyList<int>
     public static PenaltyWindow? ForRequest(SamplingParams sp, IReadOnlyList<int>? promptTokens)
     {
         ArgumentNullException.ThrowIfNull(sp);
-        if (sp.RepetitionPenalty == 1.0f || sp.PreviousTokens is not null)
+        if (!sp.HasPenalties || sp.PreviousTokens is not null)
             return null;
 
         var window = new PenaltyWindow(sp.PenaltyLastN);

@@ -170,6 +170,8 @@ public static class OpenAiEndpoints
         var sp = SamplingParamsBuilder.Build(opts,
             temperature: req.Temperature,
             topP:        req.TopP,
+            freqPenalty: req.FrequencyPenalty,
+            presPenalty: req.PresencePenalty,
             maxTokens:   req.MaxTokens,
             maxThinking: req.MaxThinkingTokens,
             logitBias:   logitBias,
@@ -777,7 +779,12 @@ public sealed record ChatCompletionRequest(
     // block instead of being stripped (SharpInferenceServerOptions.PreserveThinking is the
     // server-wide default when this is absent). Off by default, matching the pre-existing
     // ChatTemplate.ScrubAssistantThinking behavior.
-    [property: JsonPropertyName("preserve_thinking")] bool? PreserveThinking = null);
+    [property: JsonPropertyName("preserve_thinking")] bool? PreserveThinking = null,
+    // OpenAI's occurrence-scaled and flat repetition controls (issue #459). Both take OpenAI's
+    // -2..2 range; negatives encourage repetition. Absent = the host default. Appended rather
+    // than slotted next to top_p so positional construction of this record stays source-compatible.
+    [property: JsonPropertyName("frequency_penalty")] float? FrequencyPenalty = null,
+    [property: JsonPropertyName("presence_penalty")] float? PresencePenalty = null);
 
 /// <summary>
 /// Message in an OpenAI <c>/v1/chat/completions</c> request. Both single-string

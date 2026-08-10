@@ -18,6 +18,8 @@ internal static class SamplingParamsBuilder
         int?   topK         = null,
         float? minP         = null,
         float? repPenalty   = null,
+        float? freqPenalty  = null,
+        float? presPenalty  = null,
         int?   maxTokens    = null,
         int?   maxThinking  = null,
         IReadOnlyDictionary<int, float>? logitBias = null,
@@ -32,8 +34,12 @@ internal static class SamplingParamsBuilder
             TopK              = topK        ?? d.TopK,
             MinP              = minP        ?? d.MinP,
             RepetitionPenalty = repPenalty  ?? d.RepetitionPenalty,
-            // Window size for the above; host-level only (the OpenAI/Anthropic wire formats
-            // have no per-request equivalent). The engine maintains the window itself.
+            // OpenAI's frequency_penalty / presence_penalty (issue #459). No equivalent in the
+            // Anthropic wire format, which falls back to the host defaults.
+            FrequencyPenalty  = freqPenalty ?? d.FrequencyPenalty,
+            PresencePenalty   = presPenalty ?? d.PresencePenalty,
+            // Window size for all three; host-level only (no wire format has a per-request
+            // equivalent). The engine maintains the window itself.
             PenaltyLastN      = d.PenaltyLastN,
             MaxNewTokens      = maxTokens   ?? d.MaxNewTokens,
             MaxThinkingTokens = maxThinking ?? d.MaxThinkingTokens,

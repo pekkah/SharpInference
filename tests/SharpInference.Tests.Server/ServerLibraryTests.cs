@@ -189,6 +189,46 @@ public sealed class SamplingDefaultsTests
     }
 
     [Fact]
+    public async Task FrequencyAndPresencePenalty_ReachSamplingParams()
+    {
+        // Issue #459: the OpenAI wire fields were not accepted at all, so a client sending them
+        // got them dropped. They must override the host defaults like any other sampling field,
+        // and the penalty window must be built for them (issue #454's failure mode was gating
+        // the window on RepetitionPenalty alone).
+        var fake = new FakeInferenceEngine("m");
+        var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+            b.ConfigureServices(s =>
+            {
+                s.Configure<SharpInferenceServerOptions>(o =>
+                {
+                    o.Sampling.FrequencyPenalty = 0.1f;
+                    o.Sampling.PresencePenalty  = 0.2f;
+                    o.Sampling.PenaltyLastN     = 128;
+                });
+                s.AddSingleton<IInferenceEngine>(fake);
+            }));
+        var client = factory.CreateClient();
+
+        var req = new
+        {
+            model = "m",
+            messages = new[] { new { role = "user", content = "Hi" } },
+            frequency_penalty = 0.9f,   // overrides 0.1
+            // presence_penalty omitted → host default applies
+            stream = false,
+        };
+        var response = await client.PostAsJsonAsync("/v1/chat/completions", req);
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+
+        Assert.NotNull(fake.LastSamplingParams);
+        Assert.Equal(0.9f, fake.LastSamplingParams!.FrequencyPenalty);  // request wins
+        Assert.Equal(0.2f, fake.LastSamplingParams.PresencePenalty);    // host default
+        Assert.Equal(128,  fake.LastSamplingParams.PenaltyLastN);
+        // Either dial alone must be enough to make the engine maintain a window.
+        Assert.True(fake.LastSamplingParams.HasPenalties);
+    }
+
+    [Fact]
     public async Task SpecDecodeOptions_ReachSamplingParams()
     {
         var fake = new FakeInferenceEngine("m");

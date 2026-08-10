@@ -370,8 +370,20 @@ public sealed class SamplingDefaults
     public float RepetitionPenalty { get; set; } = 1f;
 
     /// <summary>
-    /// Tokens the repetition penalty looks back over. <c>0</c> = the whole context.
-    /// Mirrors <c>--repeat-last-n</c>. Ignored when <see cref="RepetitionPenalty"/> is 1.
+    /// Frequency penalty: occurrence-scaled suppression. <c>0</c> = disabled. Mirrors
+    /// <c>--frequency-penalty</c>; overridden per request by OpenAI's <c>frequency_penalty</c>.
+    /// </summary>
+    public float FrequencyPenalty { get; set; } = 0f;
+
+    /// <summary>
+    /// Presence penalty: flat suppression of anything already seen. <c>0</c> = disabled. Mirrors
+    /// <c>--presence-penalty</c>; overridden per request by OpenAI's <c>presence_penalty</c>.
+    /// </summary>
+    public float PresencePenalty { get; set; } = 0f;
+
+    /// <summary>
+    /// Tokens the penalties look back over. <c>0</c> = the whole context. Mirrors
+    /// <c>--repeat-last-n</c>. Ignored when no penalty is active.
     /// </summary>
     public int PenaltyLastN { get; set; } = 256;
 
@@ -399,6 +411,8 @@ public sealed class SamplingDefaults
         TopP              = TopP,
         MinP              = MinP,
         RepetitionPenalty = RepetitionPenalty,
+        FrequencyPenalty  = FrequencyPenalty,
+        PresencePenalty   = PresencePenalty,
         PenaltyLastN      = PenaltyLastN,
         MaxNewTokens      = MaxNewTokens,
         MaxThinkingTokens = MaxThinkingTokens,
