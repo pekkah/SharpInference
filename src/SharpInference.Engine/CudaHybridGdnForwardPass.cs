@@ -25,8 +25,12 @@ namespace SharpInference.Engine;
 ///         are served by <see cref="CudaExpertSlotManager"/> (SLRU lazy load);
 ///         the shared expert and its per-token sigmoid gate run on GPU with
 ///         eager-resident weights.</item>
-///   <item>Embedding / output projection: GPU if VRAM permits (mirrors
-///         <c>CudaHybridForwardPass.ShouldKeepFixedWeightsOnCpu</c>); else CPU.</item>
+///   <item>Embedding / output projection: each placed independently by
+///         <see cref="PlanVram"/>, which prices every mandatory GPU tenant from GGUF
+///         metadata and demotes the embedding (cheap) then the output projection
+///         (expensive) to CPU in turn if the budget doesn't fit — unlike
+///         <c>CudaHybridForwardPass.ShouldKeepFixedWeightsOnCpu</c>, which ties the two
+///         together and only checks the 2 GiB single-allocation cap.</item>
 ///   <item>KV cache for the 10 attention layers: VRAM (<c>_gpuKCache[layer]</c>,
 ///         <c>_gpuVCache[layer]</c>) — same flat layout as
 ///         <see cref="CudaHybridForwardPass"/>.</item>
@@ -63,6 +67,11 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     private readonly ModelHyperparams _hp;
     private readonly GdnConfig _gdn;
     private readonly LayerPlacement _placement;
+    // -g N here caps GPU-resident dense-FFN trunk layers, NOT a trunk (GDN/attention) split —
+    // this pass has no CPU attention block or CPU KV storage, so GDN+attn+KV are always
+    // GPU-resident and the only elastic dimension is the dense FFN (TryUploadDenseFfnLayers).
+    // MoE models ignore this cap (no dense-FFN-on-GPU path); a stderr note fires when clamped.
+    private readonly int _denseFfnGpuCap;
     private readonly int _maxSeqLen;
     private readonly int _ctxLen;
 
@@ -150,11 +159,34 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // restores the legacy fp32 path for bisecting any precision regression.
     private readonly DType _kvDType;
 
-    // Embedding + output
-    private readonly Tensor? _gpuEmbedding;
-    private readonly DType _embDType;  // dtype of the on-GPU embedding bytes (Q4_K, Q5_K, or Float32)
-    private readonly Tensor? _gpuOutputNorm;
-    private readonly Tensor? _gpuOutputWeight;
+    // Embedding + output. Placement (GPU vs CPU) is decided independently per PlanVram
+    // (issue: partial GPU offload) — a CPU embedding costs ~5 KiB/token (one dequantized row);
+    // a CPU lm_head costs a full vocab×embDim mmap read per token, so it is demoted only when
+    // the embedding alone isn't enough to make the fixed weights fit.
+    private readonly Tensor? _gpuEmbedding;      // null when the embedding was demoted to CPU
+    private readonly DType _embDType;  // dtype of the on-GPU embedding bytes (Q4_K, Q5_K, Q6_K, Q8_0, or Float32)
+    private readonly Tensor? _gpuOutputNorm;     // null when the output projection was demoted to CPU
+    private readonly Tensor? _gpuOutputWeight;   // null when the output projection was demoted to CPU
+
+    // CPU-resident mmap refs for the embedding / output projection, resolved unconditionally
+    // (mmap refs are free) so the GPU-null-ness above is the single dispatch signal. _cpuOutputWeight
+    // aliases _cpuEmbedding when output.weight is absent (tied embeddings).
+    private readonly CpuWeightRef _cpuEmbedding;
+    private readonly CpuWeightRef _cpuOutputWeight;
+    // output_norm.weight / nextn.shared_head_norm.weight as F32, only loaded when the output
+    // projection is CPU-resident (the GPU path keeps _gpuOutputNorm instead).
+    private readonly float* _cpuOutputNormW;
+    private readonly float* _cpuMtpSharedHeadNormW;
+    // Pinned scratch for the CPU embedding / CPU output fallback paths (issue #48-style direct
+    // Download/UploadInto, skipping the staging-buffer hop). Only allocated when the corresponding
+    // demotion fires.
+    private readonly float* _pinnedEmbedRow;   // [embDim] — CpuEmbedToken's dequant target
+    private readonly float* _pinnedOutHidden;  // [embDim] — pre-norm hidden downloaded for ComputeCpuOutput
+    private readonly float* _cpuOutNormBuf;    // [embDim] — post-RmsNorm scratch for ComputeCpuOutput
+    // Grow-only multi-token staging buffer for the batched CPU-embed paths (EnsurePinnedEmbedAll);
+    // not readonly since it's (re)allocated lazily on first use / on growth, not in the constructor.
+    private float* _pinnedEmbedAll;
+    private int _pinnedEmbedAllCap;
 
     // Dtype map shared with CudaExpertSlotManager so MatMul dispatch picks
     // the right matvec variant for SLRU-loaded expert tensors.
@@ -264,6 +296,12 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     // bisecting parity bugs and confirming the GPU kernels match CPU output.
     private readonly bool _cpuGdn =
         Environment.GetEnvironmentVariable("SHARPI_CPU_GDN") == "1";
+
+    // Keeps Q6_K/Q8_0 embedding tables packed in VRAM using CudaBackend.EmbedLookupQ6K /
+    // EmbedLookupQ8_0 instead of the F32 expansion that blows the 2 GiB single-allocation
+    // cap (the qwen35moe 35B token_embd.weight is Q8_0, 515 MiB packed / 2034 MiB F32).
+    // =0 restores legacy expansion for bisecting.
+    private readonly bool _rawEmbedEnabled;
 
     // Q3_K / Q8_0 routed-expert MoE rows can run through the int-domain
     // DotQ3K_Q8KS / DotQ8_0_Q8KS kernels instead of the FP dequant-FMA path.
@@ -951,6 +989,16 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     public int MaxSeqLen => _maxSeqLen;
     public LayerPlacement Placement => _placement;
 
+    /// <summary>True unless <see cref="PlanVram"/> demoted the embedding table to CPU.</summary>
+    internal bool EmbeddingOnGpu => _gpuEmbedding is not null;
+
+    /// <summary>True unless <see cref="PlanVram"/> demoted the output (lm_head) projection to CPU.</summary>
+    internal bool OutputOnGpu => _gpuOutputWeight is not null;
+
+    /// <summary>Count of dense-FFN trunk layers currently GPU-resident (mirrors <c>-g N</c>'s cap
+    /// intersected with what actually fit in VRAM). 0 for MoE models (no dense-FFN-on-GPU path).</summary>
+    internal int DenseFfnGpuLayers => _denseFfnGpuLayers;
+
     /// <summary>
     /// Bind this pass's CUDA context to the calling thread (issue #302). The engine calls it on
     /// the worker thread that drives the forward pass before any CUDA work, so a non-interactive
@@ -1023,6 +1071,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         int qDim = _numHeads * _headDim;        // 4096
         int kvDim = _numKvHeads * _headDim;     // 512
 
+        // Negative GpuLayers (e.g. -1, the CLI's "auto") means no cap; 0 means zero dense-FFN
+        // layers on GPU (all CPU); any other value clamps to [0, L]. This matches the throw
+        // message elsewhere in this class that advises "-g 0" for CPU-only dense-FFN placement.
+        _denseFfnGpuCap = placement.GpuLayers < 0 ? L : Math.Min(placement.GpuLayers, L);
+        if (hp.IsMoE && _denseFfnGpuCap < L)
+            Console.Error.WriteLine(
+                $"[CudaHybridGdnForwardPass] -g {_denseFfnGpuCap} requested a dense-FFN GPU cap, but "
+                + "this model is MoE (no dense-FFN-on-GPU path) — the cap is a no-op here.");
+
         // #388: per-layer decode-trunk graph readiness, only when the gate is on.
         _layerGraphCaptured = _decodeCudaGraph ? new bool[L] : null;
 
@@ -1071,6 +1128,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         Console.Error.WriteLine($"[CudaHybridGdnForwardPass] layers={L} embDim={_embDim} headDim={_headDim} numHeads={_numHeads} ropeDim={_ropeDim} ctx={_ctxLen} kvDType={_kvDType}");
         Console.Error.WriteLine($"[CudaHybridGdnForwardPass] GDN: heads={_gdnNumVHeads}v×{_gdnNumKHeads}k headDim={_gdnHeadDim} conv={_gdnConvChannels}×{_gdnConvKernel} MoE: {_numExperts}exp×{_numActiveExperts}active dim={_expertDim}");
+        {
+            int bannerNumAttn = 0;
+            for (int i = 0; i < L; i++)
+                if (hp.LayerTypes![i] == LayerType.Attention) bannerNumAttn++;
+            int bannerNumGdn = L - bannerNumAttn;
+            Console.Error.WriteLine(
+                $"[CudaHybridGdnForwardPass] Trunk: {bannerNumGdn} GDN + {bannerNumAttn} attention layers, all GPU-resident. "
+                + $"-g maps to a dense-FFN GPU-residency cap on this pass: cap={_denseFfnGpuCap}/{L}.");
+        }
 
         bool vramTrace = Environment.GetEnvironmentVariable("SHARPI_TRACE_VRAM") == "1";
         void TraceVram(string label)
@@ -1175,32 +1241,65 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _kvCache = new PagedKvCache(L, _numKvHeads, _headDim);
         _gdnStateCache = new GdnStateCache(hp.LayerTypes, _gdn);
 
-        // ── Decide embedding/output placement (mirrors CudaHybridForwardPass.ShouldKeepFixedWeightsOnCpu) ──
-        bool cpuFixedWeights = ShouldKeepFixedWeightsOnCpu(
-            model.FindTensor("token_embd.weight")!.Value,
-            model.FindTensor("output.weight"));
+        _rawEmbedEnabled = ResolveGate("SHARPI_GDN_RAW_EMBED", true);
 
-        if (!cpuFixedWeights)
+        // Decided here (not at the head-upload block below) so PlanVram can price the MTP head
+        // and its batched-verify ring before deciding embedding/output residency.
+        _hasMtp = hp.NumMtpLayers > 0
+                  && model.FindTensor($"blk.{hp.NumLayers}.nextn.eh_proj.weight") is not null;
+
+        // ── VRAM budget plan + embedding/output placement ──
+        // Prices every mandatory (non-elastic-FFN) GPU tenant from GGUF metadata before any of
+        // it is uploaded, then decides embedding/output residency against what's left. See
+        // PlanVram's doc comment for the demotion order.
+        var vramPlan = PlanVram(gpu, hp, L, _hasMtp);
+        Console.Error.WriteLine(vramPlan.Summary());
+
+        _cpuEmbedding = ResolveCpuWeight("token_embd.weight");
+        _cpuOutputWeight = model.FindTensor("output.weight") is not null
+            ? ResolveCpuWeight("output.weight")
+            : _cpuEmbedding;
+
+        if (vramPlan.EmbedOnGpu)
         {
             TraceVram("before embedding upload");
-            _gpuEmbedding = UploadEmbeddingWeight("token_embd.weight", out _embDType);
+            _gpuEmbedding = UploadEmbeddingWeight("token_embd.weight", vramPlan.Tied, out _embDType);
             TraceVram("after embedding upload");
+        }
+        else
+        {
+            long bytesPerRowEstimate = (_embDim / DTypeInfo.BlockSize(_cpuEmbedding.DType))
+                                      * (long)DTypeInfo.BytesPerBlock(_cpuEmbedding.DType);
+            Console.Error.WriteLine(
+                $"[CudaHybridGdnForwardPass] Embedding demoted to CPU (dtype={_cpuEmbedding.DType}, "
+                + $"~{bytesPerRowEstimate} B/token mmap read). Reduce -c / -g N to leave it more "
+                + "VRAM headroom.");
+            _pinnedEmbedRow = AllocPinned(_embDim);
+            _embDType = DType.Float32; // unused when _gpuEmbedding is null; keep a defined value
+        }
+
+        if (vramPlan.OutputOnGpu)
+        {
             _gpuOutputNorm = UploadWeight("output_norm.weight");
-            _gpuOutputWeight = model.FindTensor("output.weight") is not null
-                ? UploadWeight("output.weight")
-                : _gpuEmbedding;
+            _gpuOutputWeight = vramPlan.Tied
+                ? _gpuEmbedding
+                : UploadWeight("output.weight");
             TraceVram("after output.weight upload");
         }
         else
         {
-            // Phase 6 limitation: this class assumes embedding+output fit on GPU.
-            // The qwen35moe model with Q8_0 embedding has F32-expanded footprint
-            // that may exceed the 2GB single-allocation limit on some drivers.
-            // If we hit this, the CPU-embedding fallback path mirrors CudaHybridForwardPass.
-            throw new NotSupportedException(
-                "CudaHybridGdnForwardPass: embedding/output do not fit on GPU; " +
-                "CPU embedding fallback is not implemented in v1. Reduce ctx size or " +
-                "use HybridGdnForwardPass for CPU-only execution.");
+            _cpuOutputNormW = LoadF32Tensor("output_norm.weight", _embDim);
+            _pinnedOutHidden = AllocPinned(_embDim);
+            _cpuOutNormBuf = Alloc(_embDim);
+            Console.Error.WriteLine(
+                $"[CudaHybridGdnForwardPass] WARNING: output (lm_head) demoted to CPU "
+                + $"(dtype={_cpuOutputWeight.DType}, ~{_cpuOutputWeight.Info.ByteSize / (1024 * 1024)} MiB "
+                + "mmap read PER TOKEN — every decode step reads the whole projection). MTP batched "
+                + "verify is disabled; MtpDecoder falls back to sequential Forward+MtpForward. Reduce "
+                + "-c / -g N to leave it more VRAM headroom.");
+            if (_hasMtp)
+                _cpuMtpSharedHeadNormW = LoadF32Tensor(
+                    $"blk.{hp.NumLayers}.nextn.shared_head_norm.weight", _embDim);
         }
 
         // ── Auto-detect CPU-MoE vs GPU SLRU MoE ─────────────────────────
@@ -1498,14 +1597,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // We're conservative — most of the remaining budget is reserved for the
         // attention KV cache (10 layers × maxSeqLen × kvDim × 4 B × 2) and various
         // scratch. Use the GpuKvBytes from placement when the planner sized it.
-        // ── MTP detection + GDN snapshot ring reservation (issues #30/#207) ──
+        // ── GDN snapshot ring reservation (issues #30/#207) ──
         // Decided HERE (not at the head-upload block below) because the ring must
         // be carved out of VRAM BEFORE TryUploadDenseFfnLayers greedily fills it
         // to a 64 MiB margin — a later allocation would land in WDDM-paged memory
         // and 5-10× every verify phase. SHARPI_DISABLE_MTP=1 skips the ring so
-        // MTP-off baseline runs keep the VRAM for FFN layers.
-        _hasMtp = hp.NumMtpLayers > 0
-                  && model.FindTensor($"blk.{hp.NumLayers}.nextn.eh_proj.weight") is not null;
+        // MTP-off baseline runs keep the VRAM for FFN layers. _hasMtp itself is
+        // decided earlier (before the embedding/output PlanVram decision) so the
+        // plan can price the ring's intended size.
         if (_hasMtp && !_cpuGdn && _gdnStateCache.NumGdnLayers > 0
             && Environment.GetEnvironmentVariable("SHARPI_DISABLE_MTP") != "1")
         {
@@ -1559,7 +1658,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             // below after we know real free VRAM. Reads via GpuDenseFfn / CpuDenseFfn
             // depending on whether the layer's _gpuWFfn* slot was populated.
             _expertSlotManager = null;
-            TryUploadDenseFfnLayers(gpu, hp, L);
+            // Reserve plan.MtpBytes so the greedy fill doesn't starve the MTP head uploaded
+            // right after this call (it used to — the fill would consume all remaining VRAM
+            // to its 64 MiB margin, leaving nothing for the MTP tensors below).
+            TryUploadDenseFfnLayers(gpu, hp, L, _denseFfnGpuCap, vramPlan.MtpBytes);
         }
         else if (_cpuMoe)
         {
@@ -1636,9 +1738,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _gpuMtpEnorm          = UploadWeight($"blk.{mtpLayerIdx}.nextn.enorm.weight");
             _gpuMtpHnorm          = UploadWeight($"blk.{mtpLayerIdx}.nextn.hnorm.weight");
             _gpuMtpSharedHeadNorm = UploadWeight($"blk.{mtpLayerIdx}.nextn.shared_head_norm.weight");
-            // eh_proj is Q8_0 in GGUF; UploadWeight dequants to F32 on the path
-            // for any dtype not in {F32, Q4_K, Q5_K, Q6_K}, so this lands as F32
-            // and the CudaBackend.MatMul fp32 path serves it. ~200 MiB residence.
+            // eh_proj is Q8_0 in GGUF; UploadWeight keeps it packed (raw Q8_0 matvec) when
+            // RawQ80WeightsEnabled (the default, ~53 MiB residence), else F32-expands it
+            // (~200 MiB) via the fp32 CudaBackend.MatMul path.
             _gpuMtpEhProj         = UploadWeight($"blk.{mtpLayerIdx}.nextn.eh_proj.weight");
 
             // MTP attention KV cache on GPU (one slot; same layout as trunk KV).
@@ -1670,17 +1772,10 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             // norm. Pinned for the same queued-D2H reason as _lastHidden.
             _mtpSelfHidden = AllocPinned(_embDim);
 
-            // GPU dense FFN scratch is allocated by TryUploadDenseFfnLayers only
-            // when at least one trunk FFN layer lands on GPU. For MTP we need it
-            // regardless — the MTP block's dense FFN runs on GPU even if all
-            // trunk FFN layers stayed on CPU (which is unusual but possible
-            // under tight VRAM). Allocate here when missing; the cost is
-            // 2 × intermDim × 4 B = 140 KiB for 27B's intermDim=17408.
-            if (!hp.IsMoE && _gpuFfnGateBufDense is null)
-            {
-                _gpuFfnGateBufDense = gpu.Allocate(TensorShape.D1(_intermDim));
-                _gpuFfnUpBufDense   = gpu.Allocate(TensorShape.D1(_intermDim));
-            }
+            // GPU dense FFN scratch (_gpuFfnGateBufDense/_gpuFfnUpBufDense) is now allocated
+            // unconditionally by TryUploadDenseFfnLayers (WP3), even for a 0-layer fill — the
+            // MTP block's dense FFN needs it regardless of how many trunk FFN layers landed on
+            // GPU, so no rescue allocation is needed here anymore.
 
             // Issue #30 / #45 batched-verify scratch. Token 2 gets its own residual
             // stream + norm + logits + a token-1 hidden snapshot for the MTP commit
@@ -2635,12 +2730,29 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _faulted = true;
 
         // 1. Embed every token into the residual-stream buffer + reserve KV blocks.
-        for (int i = 0; i < N; i++)
+        if (_gpuEmbedding is null)
         {
-            EmbedToken(_gpuHidden, tokens[i]);
-            _gpu.CopyDeviceRegion(_gpuStreamAll!, (long)i * embDim * sizeof(float),
-                                  _gpuHidden, 0, (long)embDim * sizeof(float));
-            _kvCache.ReserveBlockAt(startPos + i);
+            // CPU-resident embedding: stage ALL N rows into one pinned block, then a single
+            // async H2D into the stream — the per-token EmbedToken path reuses a single-row
+            // pinned buffer, which would race the next token's CPU write against this token's
+            // still-in-flight cudaMemcpyAsync (issue: WAR hazard, mirrors CudaHybridForwardPass's
+            // #218 fix). See EnsurePinnedEmbedAll.
+            float* hostAll = EnsurePinnedEmbedAll(N);
+            for (int i = 0; i < N; i++)
+                CpuEmbedToken(tokens[i], hostAll + (long)i * embDim);
+            _gpu.UploadInto(_gpuStreamAll!, (nint)hostAll, (int)((long)N * embDim));
+            for (int i = 0; i < N; i++)
+                _kvCache.ReserveBlockAt(startPos + i);
+        }
+        else
+        {
+            for (int i = 0; i < N; i++)
+            {
+                EmbedToken(_gpuHidden, tokens[i]);
+                _gpu.CopyDeviceRegion(_gpuStreamAll!, (long)i * embDim * sizeof(float),
+                                      _gpuHidden, 0, (long)embDim * sizeof(float));
+                _kvCache.ReserveBlockAt(startPos + i);
+            }
         }
 
         // Chunk-start reset for the GPU op-offload double-buffer: drain any stale prefetch
@@ -2778,10 +2890,17 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // 5. Last token: output norm + lm_head → logits.
         _gpu.CopyDeviceRegion(_gpuHidden, 0, _gpuStreamAll!,
                               (long)(N - 1) * embDim * sizeof(float), (long)embDim * sizeof(float));
-        _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuOutputNorm!, _hp.RmsNormEps);
-        _gpu.MatMul(_gpuLogits, _gpuOutputWeight!, _gpuHidden,
-            _gpuWeightDTypes.TryGetValue(_gpuOutputWeight!.Handle, out var outDt) ? outDt : DType.Float32);
-        _gpu.Download(_gpuLogits, _logitsBuf);
+        if (_gpuOutputWeight is null)
+        {
+            ComputeCpuOutput(_gpuHidden, _cpuOutputNormW, _logitsBuf);
+        }
+        else
+        {
+            _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuOutputNorm!, _hp.RmsNormEps);
+            _gpu.MatMul(_gpuLogits, _gpuOutputWeight, _gpuHidden,
+                _gpuWeightDTypes.TryGetValue(_gpuOutputWeight.Handle, out var outDt) ? outDt : DType.Float32);
+            _gpu.Download(_gpuLogits, _logitsBuf);
+        }
 
         if (_prefillProfile)
         {
@@ -2846,12 +2965,27 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         _faulted = true;
 
         // 1. Embed every token into the residual-stream buffer + reserve KV blocks.
-        for (int i = 0; i < N; i++)
+        if (_gpuEmbedding is null)
         {
-            EmbedToken(_gpuHidden, tokens[i]);
-            _gpu.CopyDeviceRegion(_gpuStreamAll!, (long)i * embDim * sizeof(float),
-                                  _gpuHidden, 0, (long)embDim * sizeof(float));
-            _kvCache.ReserveBlockAt(startPos + i);
+            // CPU-resident embedding: see PrefillBatchedCpuMoe's identical comment — stage all
+            // N rows before issuing one bulk H2D to avoid racing the next token's CPU write
+            // against a still-in-flight per-row cudaMemcpyAsync.
+            float* hostAll = EnsurePinnedEmbedAll(N);
+            for (int i = 0; i < N; i++)
+                CpuEmbedToken(tokens[i], hostAll + (long)i * embDim);
+            _gpu.UploadInto(_gpuStreamAll!, (nint)hostAll, (int)((long)N * embDim));
+            for (int i = 0; i < N; i++)
+                _kvCache.ReserveBlockAt(startPos + i);
+        }
+        else
+        {
+            for (int i = 0; i < N; i++)
+            {
+                EmbedToken(_gpuHidden, tokens[i]);
+                _gpu.CopyDeviceRegion(_gpuStreamAll!, (long)i * embDim * sizeof(float),
+                                      _gpuHidden, 0, (long)embDim * sizeof(float));
+                _kvCache.ReserveBlockAt(startPos + i);
+            }
         }
 
         bool isMoe = _hp.IsMoE;
@@ -2969,10 +3103,17 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // 5. Last token: output norm + lm_head → logits.
         _gpu.CopyDeviceRegion(_gpuHidden, 0, stream,
                               (long)(N - 1) * embDim * sizeof(float), (long)embDim * sizeof(float));
-        _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuOutputNorm!, _hp.RmsNormEps);
-        _gpu.MatMul(_gpuLogits, _gpuOutputWeight!, _gpuHidden,
-            _gpuWeightDTypes.TryGetValue(_gpuOutputWeight!.Handle, out var outDt) ? outDt : DType.Float32);
-        _gpu.Download(_gpuLogits, _logitsBuf);
+        if (_gpuOutputWeight is null)
+        {
+            ComputeCpuOutput(_gpuHidden, _cpuOutputNormW, _logitsBuf);
+        }
+        else
+        {
+            _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuOutputNorm!, _hp.RmsNormEps);
+            _gpu.MatMul(_gpuLogits, _gpuOutputWeight, _gpuHidden,
+                _gpuWeightDTypes.TryGetValue(_gpuOutputWeight.Handle, out var outDt) ? outDt : DType.Float32);
+            _gpu.Download(_gpuLogits, _logitsBuf);
+        }
 
         if (_prefillProfile)
         {
@@ -4553,25 +4694,91 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     }
 
     /// <summary>
-    /// Dispatch the per-token embedding lookup into <paramref name="dst"/> based on
-    /// the on-GPU embedding table's dtype. Q4_K + Q5_K both have direct-read NVRTC
-    /// kernels (issue #39); other dtypes are F32-expanded at load time and read via
-    /// the F32 path.
+    /// Dispatch the per-token embedding lookup into <paramref name="dst"/>. When the embedding
+    /// was demoted to CPU (<see cref="PlanVram"/>), dequantizes one row from the mmap'd table and
+    /// uploads it — otherwise dispatches on the on-GPU table's dtype. Q4_K/Q5_K/Q6_K/Q8_0 all have
+    /// direct-read NVRTC kernels (issues #25/#39, WP1); other dtypes are F32-expanded at load time
+    /// and read via the F32 path. Single choke point for every embed site (Forward, batched
+    /// prefills, BatchForward2, BatchVerify, MtpForward) — the CUDA-graph-captured decode trunk
+    /// never reaches this (embedding happens once per token, before the graphed trunk).
     /// </summary>
     private void EmbedToken(Tensor dst, int token)
     {
+        if (_gpuEmbedding is null)
+        {
+            CpuEmbedToken(token, _pinnedEmbedRow);
+            _gpu.UploadInto(dst, (nint)_pinnedEmbedRow, _embDim);
+            return;
+        }
         switch (_embDType)
         {
             case DType.Q4_K:
-                _gpu.EmbedLookupQ4K(_gpuEmbedding!, dst, token, _embDim);
+                _gpu.EmbedLookupQ4K(_gpuEmbedding, dst, token, _embDim);
                 break;
             case DType.Q5_K:
-                _gpu.EmbedLookupQ5K(_gpuEmbedding!, dst, token, _embDim);
+                _gpu.EmbedLookupQ5K(_gpuEmbedding, dst, token, _embDim);
+                break;
+            case DType.Q6_K:
+                _gpu.EmbedLookupQ6K(_gpuEmbedding, dst, token, _embDim);
+                break;
+            case DType.Q8_0:
+                _gpu.EmbedLookupQ8_0(_gpuEmbedding, dst, token, _embDim);
                 break;
             default:
-                _gpu.EmbedLookup(_gpuEmbedding!, dst, token, _embDim);
+                _gpu.EmbedLookup(_gpuEmbedding, dst, token, _embDim);
                 break;
         }
+    }
+
+    private void CpuEmbedToken(int token, float* dest)
+    {
+        int bytesPerRow = (_embDim / DTypeInfo.BlockSize(_cpuEmbedding.DType))
+                        * DTypeInfo.BytesPerBlock(_cpuEmbedding.DType);
+        byte* rowPtr = _cpuEmbedding.DataPtr + (long)token * bytesPerRow;
+        if (_cpuEmbedding.DType == DType.Float32)
+        {
+            new ReadOnlySpan<float>((float*)rowPtr, _embDim).CopyTo(new Span<float>(dest, _embDim));
+        }
+        else
+        {
+            Dequantize.ToFloat32(
+                new ReadOnlySpan<byte>(rowPtr, bytesPerRow),
+                new Span<float>(dest, _embDim),
+                _cpuEmbedding.DType,
+                _embDim);
+        }
+    }
+
+    /// <summary>
+    /// Grow-only pinned staging buffer for batched CPU-resident embedding lookups
+    /// (<see cref="CpuEmbedToken"/>). Multi-token embed loops must fully write ALL N rows
+    /// into this buffer BEFORE issuing any H2D copy — reusing a single-row buffer
+    /// (<see cref="_pinnedEmbedRow"/>) per token inside a loop would let the next token's
+    /// CPU write race the previous token's outstanding async cudaMemcpyAsync, since
+    /// UploadInto/CopyDevice return before the DMA has actually drained the source
+    /// buffer. Mirrors <c>CudaHybridForwardPass</c>'s issue #218 fix.
+    /// </summary>
+    private float* EnsurePinnedEmbedAll(int n)
+    {
+        if (_pinnedEmbedAll != null && _pinnedEmbedAllCap >= n) return _pinnedEmbedAll;
+        if (_pinnedEmbedAll != null) CudaBackend.FreePinnedHost((nint)_pinnedEmbedAll);
+        _pinnedEmbedAll = AllocPinnedL((long)n * _embDim);
+        _pinnedEmbedAllCap = n;
+        return _pinnedEmbedAll;
+    }
+
+    /// <summary>Downloads <paramref name="gpuHidden"/> into the pinned CPU-output scratch, runs the
+    /// final RmsNorm + lm_head MatVec on the CPU-mmap'd <see cref="_cpuOutputWeight"/>, and writes
+    /// logits into <paramref name="dest"/>. Leaves the pre-norm hidden state in
+    /// <see cref="_pinnedOutHidden"/> for MTP callers (mirrors the GPU path's <c>_gpuLastHidden</c>
+    /// snapshot). <see cref="SimdKernels.MatVec"/> dispatch on <c>_cpuOutputWeight.DType</c> is the
+    /// exact call the CPU-only <see cref="HybridGdnForwardPass"/> uses for this same lm_head.</summary>
+    private void ComputeCpuOutput(Tensor gpuHidden, float* normWeight, float[] dest)
+    {
+        _gpu.Download(gpuHidden, (nint)_pinnedOutHidden, _embDim);
+        SimdKernels.RmsNorm(_cpuOutNormBuf, _pinnedOutHidden, normWeight, _embDim, _hp.RmsNormEps);
+        fixed (float* l = dest)
+            SimdKernels.MatVec(l, _cpuOutputWeight.DataPtr, _cpuOutNormBuf, _hp.VocabSize, _embDim, _cpuOutputWeight.DType);
     }
 
     /// <summary>
@@ -4773,17 +4980,28 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (_hasMtp)
             _gpu.CopyDevice(_gpuLastHidden, _gpuHidden);
 
-        // 6. Final norm + output projection on GPU
-        _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuOutputNorm!, _hp.RmsNormEps);
-        _gpu.MatMul(_gpuLogits, _gpuOutputWeight!, _gpuHidden,
-            _gpuWeightDTypes.TryGetValue(_gpuOutputWeight!.Handle, out var outDt) ? outDt : DType.Float32);
+        // 6. Final norm + output projection.
+        if (_gpuOutputWeight is null)
+        {
+            // ComputeCpuOutput downloads _gpuHidden (pre-norm) into _pinnedOutHidden; reuse that
+            // download instead of a separate GPU snapshot D2H for the MTP LastHidden buffer.
+            ComputeCpuOutput(_gpuHidden, _cpuOutputNormW, _logitsBuf);
+            if (_hasMtp)
+                new ReadOnlySpan<float>(_pinnedOutHidden, _embDim).CopyTo(new Span<float>(_lastHidden, _embDim));
+        }
+        else
+        {
+            _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuOutputNorm!, _hp.RmsNormEps);
+            _gpu.MatMul(_gpuLogits, _gpuOutputWeight, _gpuHidden,
+                _gpuWeightDTypes.TryGetValue(_gpuOutputWeight.Handle, out var outDt) ? outDt : DType.Float32);
 
-        if (_hasMtp)
-            _gpu.DownloadAsync(_gpuLastHidden, (nint)_lastHidden, _embDim);
+            if (_hasMtp)
+                _gpu.DownloadAsync(_gpuLastHidden, (nint)_lastHidden, _embDim);
 
-        // 6. Download logits to host (Download self-syncs the stream — also
-        // drains the _lastHidden async D2H above).
-        _gpu.Download(_gpuLogits, _logitsBuf);
+            // Download logits to host (Download self-syncs the stream — also
+            // drains the _lastHidden async D2H above).
+            _gpu.Download(_gpuLogits, _logitsBuf);
+        }
 
         // Issue #106: mirror the host _lastHidden into the absolute-position
         // hidden history buffer so future snapshot-restore + PrefillMtp(startPos =
@@ -4853,10 +5071,15 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     /// position stays at the prompt length N. We gate off when the cache is compacted
     /// so MtpDecoder falls back to the eviction-safe sequential Forward path; making
     /// batched-verify coexist with eviction is the #130 follow-up.
+    // BatchForward2/BatchVerify produce k×vocab logits on-device via a single GPU lm_head MatMul;
+    // there is no CPU-output equivalent, so a demoted output projection (PlanVram) disables batched
+    // verify — MtpDecoder falls back to sequential N=1 decode (Forward + MtpForward), both of which
+    // have a CPU-output branch.
     public bool SupportsBatchVerify => _hasMtp
         && (!_hp.IsMoE || _cpuMoe)
         && (_cpuGdn || _gdnRingSlots >= 1)
         && !KvCacheCompacted
+        && _gpuOutputWeight is not null
         && Environment.GetEnvironmentVariable("SHARPI_DISABLE_BATCH_VERIFY") != "1";
 
     /// <inheritdoc/>
@@ -4904,8 +5127,24 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
                 $"BatchForward2: _gdnStateCache.Length={_gdnStateCache.Length} != startPos={startPos}.");
 
         // 1. Embed both tokens into independent residual streams.
-        EmbedToken(_gpuHidden,  t1);
-        EmbedToken(_gpuHidden2, t2);
+        if (_gpuEmbedding is null)
+        {
+            // CPU-resident embedding: stage BOTH rows into one pinned block before issuing
+            // either H2D — calling EmbedToken(_gpuHidden, t1) then EmbedToken(_gpuHidden2, t2)
+            // would reuse the shared single-row _pinnedEmbedRow buffer and overwrite t1's row
+            // with t2's before t1's async cudaMemcpyAsync has drained it, even though the two
+            // destination tensors differ (same WAR hazard as the batched-prefill loops).
+            float* hostAll = EnsurePinnedEmbedAll(2);
+            CpuEmbedToken(t1, hostAll);
+            CpuEmbedToken(t2, hostAll + _embDim);
+            _gpu.UploadInto(_gpuHidden,  (nint)hostAll, _embDim);
+            _gpu.UploadInto(_gpuHidden2, (nint)(hostAll + _embDim), _embDim);
+        }
+        else
+        {
+            EmbedToken(_gpuHidden,  t1);
+            EmbedToken(_gpuHidden2, t2);
+        }
 
         // 2. Reserve KV blocks covering both positions on the CPU-side block table.
         _kvCache.ReserveBlockAt(startPos);
@@ -5271,11 +5510,26 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         var stream = _gpuStreamAll!;
 
         // 1. Embed every token into the residual-stream buffer + reserve KV blocks.
-        for (int i = 0; i < k; i++)
+        if (_gpuEmbedding is null)
         {
-            EmbedToken(_gpuHidden, tokens[i]);
-            _gpu.CopyDeviceRegion(stream, i * embBytes, _gpuHidden, 0, embBytes);
-            _kvCache.ReserveBlockAt(startPos + i);
+            // CPU-resident embedding: see PrefillBatchedCpuMoe's identical comment — stage all
+            // k rows before issuing one bulk H2D to avoid racing the next token's CPU write
+            // against a still-in-flight per-row cudaMemcpyAsync.
+            float* hostAll = EnsurePinnedEmbedAll(k);
+            for (int i = 0; i < k; i++)
+                CpuEmbedToken(tokens[i], hostAll + (long)i * embDim);
+            _gpu.UploadInto(stream, (nint)hostAll, (int)((long)k * embDim));
+            for (int i = 0; i < k; i++)
+                _kvCache.ReserveBlockAt(startPos + i);
+        }
+        else
+        {
+            for (int i = 0; i < k; i++)
+            {
+                EmbedToken(_gpuHidden, tokens[i]);
+                _gpu.CopyDeviceRegion(stream, i * embBytes, _gpuHidden, 0, embBytes);
+                _kvCache.ReserveBlockAt(startPos + i);
+            }
         }
 
         // 2. Trunk (batched, ring-capturing) + FFN stage, layer by layer.
@@ -5770,19 +6024,31 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // 11. Residual add.
         _gpu.AddInPlace(_gpuHidden, _gpuResidual);
 
-        // 11b. Capture the MTP block's residual output BEFORE the in-place
-        //      shared-head norm (issue #30 chained drafting). Queued D2H into the
-        //      pinned _mtpSelfHidden; stream order serializes it ahead of the norm
-        //      kernel, and the logits Download below syncs/drains it.
-        _gpu.DownloadAsync(_gpuHidden, (nint)_mtpSelfHidden, _embDim);
+        // 12/13. shared_head_norm (NOT main output_norm) → output.weight (shared lm_head).
+        if (_gpuOutputWeight is null)
+        {
+            // ComputeCpuOutput downloads _gpuHidden (the pre-shared-head-norm residual) into
+            // _pinnedOutHidden; reuse that download instead of a separate GPU D2H for the MTP
+            // self-chaining hidden (issue #30 chained drafting) — same content as the GPU path's
+            // queued DownloadAsync into _mtpSelfHidden below.
+            ComputeCpuOutput(_gpuHidden, _cpuMtpSharedHeadNormW, _logitsBuf);
+            new ReadOnlySpan<float>(_pinnedOutHidden, _embDim).CopyTo(new Span<float>(_mtpSelfHidden, _embDim));
+        }
+        else
+        {
+            // 11b. Capture the MTP block's residual output BEFORE the in-place
+            //      shared-head norm (issue #30 chained drafting). Queued D2H into the
+            //      pinned _mtpSelfHidden; stream order serializes it ahead of the norm
+            //      kernel, and the logits Download below syncs/drains it.
+            _gpu.DownloadAsync(_gpuHidden, (nint)_mtpSelfHidden, _embDim);
 
-        // 12. shared_head_norm (NOT main output_norm) → output.weight (shared lm_head).
-        _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuMtpSharedHeadNorm, _hp.RmsNormEps);
-        _gpu.MatMul(_gpuLogits, _gpuOutputWeight!, _gpuHidden,
-            _gpuWeightDTypes.TryGetValue(_gpuOutputWeight!.Handle, out var outDt) ? outDt : DType.Float32);
+            _gpu.RmsNorm(_gpuHidden, _gpuHidden, _gpuMtpSharedHeadNorm, _hp.RmsNormEps);
+            _gpu.MatMul(_gpuLogits, _gpuOutputWeight, _gpuHidden,
+                _gpuWeightDTypes.TryGetValue(_gpuOutputWeight.Handle, out var outDt) ? outDt : DType.Float32);
 
-        // 13. Download logits to host (Download self-syncs the stream).
-        _gpu.Download(_gpuLogits, _logitsBuf);
+            // 13. Download logits to host (Download self-syncs the stream).
+            _gpu.Download(_gpuLogits, _logitsBuf);
+        }
         return _logitsBuf;
     }
 
@@ -6536,8 +6802,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
     //  Layers not uploaded fall back to CpuDenseFfn (mmap reads per token).
     // =================================================================
 
-    private void TryUploadDenseFfnLayers(CudaBackend gpu, ModelHyperparams hp, int L)
+    private void TryUploadDenseFfnLayers(CudaBackend gpu, ModelHyperparams hp, int L, int maxLayers, long postFillReserveBytes)
     {
+        // Allocate GPU FFN scratch (intermDim floats × 2 = 17408 × 8 ≈ 140 KB) unconditionally —
+        // even a 0-layer fill needs it for the MTP head's dense FFN (issue: latent
+        // InvalidOperationException when no trunk FFN layer landed on GPU under tight VRAM).
+        _gpuFfnGateBufDense = gpu.Allocate(TensorShape.D1(_intermDim));
+        _gpuFfnUpBufDense   = gpu.Allocate(TensorShape.D1(_intermDim));
+
         // Probe per-layer FFN cost from layer 0.
         var gateInfo = _model.FindTensor("blk.0.ffn_gate.weight");
         var upInfo   = _model.FindTensor("blk.0.ffn_up.weight");
@@ -6552,28 +6824,23 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         // Allocator overhead per upload is ~50 MiB (alignment/pool), already accounted
         // for by the per-iteration FreeVramBytes re-check inside the upload loop.
         // Override via SHARPI_DENSE_FFN_GPU_MARGIN_MB env var (set 0 to push to the wall).
-        long safetyMarginBytes = 64L * 1024 * 1024;
-        var marginOverride = Environment.GetEnvironmentVariable("SHARPI_DENSE_FFN_GPU_MARGIN_MB");
-        if (marginOverride is not null && int.TryParse(marginOverride, out int marginMb) && marginMb >= 0)
-            safetyMarginBytes = (long)marginMb * 1024 * 1024;
+        // postFillReserveBytes additionally reserves the MTP head's GPU footprint (uploaded
+        // right after this call) so the greedy fill doesn't starve it.
+        long safetyMarginBytes = ResolveGpuMarginBytes(64L * 1024 * 1024) + postFillReserveBytes;
 
         ulong freeNow = gpu.FreeVramBytes;
         long budget = (long)freeNow - safetyMarginBytes;
         if (budget < perLayerBytes)
         {
             Console.Error.WriteLine(
-                $"[CudaHybridGdnForwardPass] Dense FFN-on-GPU: free VRAM {freeNow / (1024 * 1024)} MiB < safety {safetyMarginBytes / (1024 * 1024)} MiB + per-layer {perLayerBytes / (1024 * 1024)} MiB. All FFN stays on CPU.");
+                $"[CudaHybridGdnForwardPass] Dense FFN-on-GPU: free VRAM {freeNow / (1024 * 1024)} MiB < safety {safetyMarginBytes / (1024 * 1024)} MiB (incl. {postFillReserveBytes / (1024 * 1024)} MiB MTP reserve) + per-layer {perLayerBytes / (1024 * 1024)} MiB. All FFN stays on CPU.");
             return;
         }
-        int canUpload = (int)Math.Min(L, budget / perLayerBytes);
+        int canUpload = (int)Math.Min(Math.Min(L, maxLayers), budget / perLayerBytes);
 
         _gpuWFfnGate = new Tensor?[L];
         _gpuWFfnUp   = new Tensor?[L];
         _gpuWFfnDown = new Tensor?[L];
-
-        // Allocate GPU FFN scratch (intermDim floats × 2 = 17408 × 8 ≈ 140 KB).
-        _gpuFfnGateBufDense = gpu.Allocate(TensorShape.D1(_intermDim));
-        _gpuFfnUpBufDense   = gpu.Allocate(TensorShape.D1(_intermDim));
 
         int uploaded = 0;
         for (int i = 0; i < L; i++)
@@ -6601,7 +6868,9 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         }
         _denseFfnGpuLayers = uploaded;
         Console.Error.WriteLine(
-            $"[CudaHybridGdnForwardPass] Dense FFN-on-GPU: uploaded {uploaded}/{L} layers ({uploaded * perLayerBytes / (1024 * 1024)} MiB); {L - uploaded} stay on CPU. Free VRAM after: {gpu.FreeVramBytes / (1024 * 1024)} MiB.");
+            $"[CudaHybridGdnForwardPass] Dense FFN-on-GPU: uploaded {uploaded}/{L} layers ({uploaded * perLayerBytes / (1024 * 1024)} MiB); "
+            + $"{L - uploaded} stay on CPU. Cap={maxLayers}/{L} (-g), MTP reserve={postFillReserveBytes / (1024 * 1024)} MiB. "
+            + $"Free VRAM after: {gpu.FreeVramBytes / (1024 * 1024)} MiB.");
     }
 
     // =================================================================
@@ -7214,6 +7483,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             foreach (var w in arr) Add1(w);
         }
 
+        // Embedding/output mmap refs are read at inference only when PlanVram demoted them off
+        // GPU (_gpu* null). Skipping the GiB-scale token_embd / output.weight when it lives on
+        // the GPU avoids a large pointless read. _cpuOutputNormW/_cpuMtpSharedHeadNormW are
+        // excluded — LoadF32Tensor already dequantized them into separate buffers, not the mmap.
+        if (_gpuEmbedding is null) Add1(_cpuEmbedding);
+        if (_gpuOutputWeight is null && _cpuOutputWeight.DataPtr != _cpuEmbedding.DataPtr)
+            Add1(_cpuOutputWeight); // tied weights alias _cpuEmbedding, already added above
+
         // Trunk: CPU-MoE routed experts, or dense FFN weights (Qwen3.6-27B-MTP).
         Add(_cpuFfnGateInp); Add(_cpuFfnGateExps); Add(_cpuFfnUpExps); Add(_cpuFfnDownExps);
         Add(_cpuWFfnGate); Add(_cpuWFfnUp); Add(_cpuWFfnDown);
@@ -7268,7 +7545,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         return result;
     }
 
-    private Tensor UploadEmbeddingWeight(string name, out DType embDType)
+    private Tensor UploadEmbeddingWeight(string name, bool tied, out DType embDType)
     {
         var info = _model.FindTensor(name)
             ?? throw new InvalidOperationException($"Missing tensor: {name}");
@@ -7276,7 +7553,7 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
 
         // Raw-bytes upload path for quants we can decode on-device. Q4_K and Q5_K
         // both have NVRTC embedding-lookup kernels (issues #25 fix, #39); other
-        // dtypes fall through to F32 expansion (capped by ShouldKeepFixedWeightsOnCpu).
+        // dtypes fall through to F32 expansion (capped by PlanVram's residency decision).
         if (info.DType == DType.Q4_K || info.DType == DType.Q5_K)
         {
             int floatCount = data.Length / 4;
@@ -7289,6 +7566,18 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             _gpuWeightDTypes[result.Handle] = info.DType;
             embDType = info.DType;
             return result;
+        }
+        // SHARPI_GDN_RAW_EMBED (default on): Q6_K/Q8_0 also have direct-read NVRTC embedding-lookup
+        // kernels (EmbedLookupQ6K / EmbedLookupQ8_0). ResolveEmbedGpuDType is the single source of
+        // truth for whether this dtype+tied combination stays raw — mirror it exactly rather than
+        // re-deriving the condition here.
+        if (ResolveEmbedGpuDType(info, tied) == info.DType
+            && (info.DType == DType.Q6_K || info.DType == DType.Q8_0))
+        {
+            var raw = _gpu.UploadRaw(data, TensorShape.D1(data.Length), info.DType, exact: true);
+            _gpuWeightDTypes[raw.Handle] = info.DType;
+            embDType = info.DType;
+            return raw;
         }
         int count = (int)info.ElementCount;
         var f32 = new float[count];
@@ -7384,30 +7673,329 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
             $"SHARPI_KV_DTYPE must be 'bf16' or 'fp32' (got '{other}').", nameof(envValue)),
     };
 
-    private static bool ShouldKeepFixedWeightsOnCpu(GgufTensorInfo embedding, GgufTensorInfo? output)
-    {
-        const long maxStorageBufferBytes = 2L * 1024 * 1024 * 1024 - 1;
-        if (EstimateGpuEmbeddingBytes(embedding) > maxStorageBufferBytes)
-            return true;
-        if (output is not null && EstimateGpuTensorBytes(output.Value) > maxStorageBufferBytes)
-            return true;
-        return false;
-    }
-
+    /// <summary>On-GPU byte size of <paramref name="tensor"/> after <see cref="UploadWeight"/> —
+    /// the shared pricing helper for both <see cref="PlanVram"/> and any other residency check, so
+    /// the estimate can never diverge from what UploadWeight actually does. Q4_K/Q5_K/Q6_K (and
+    /// Q8_0 when <see cref="RawQ80WeightsEnabled"/>) stay raw; everything else (incl. BFloat16/
+    /// Float16, e.g. this model's output.weight) F32-expands to <c>ElementCount * 4</c>.</summary>
     private static long EstimateGpuTensorBytes(GgufTensorInfo tensor)
     {
         if (tensor.DType == DType.Float32 || tensor.DType == DType.Q4_K
-            || tensor.DType == DType.Q5_K || tensor.DType == DType.Q6_K)
+            || tensor.DType == DType.Q5_K || tensor.DType == DType.Q6_K
+            || (tensor.DType == DType.Q8_0 && RawQ80WeightsEnabled))
             return (tensor.ByteSize + 3) & ~3L;
         return tensor.ElementCount * sizeof(float);
     }
 
-    private static long EstimateGpuEmbeddingBytes(GgufTensorInfo tensor)
+    /// <summary>Dtype the embedding table would be kept in on GPU: raw when a direct-read
+    /// embedding kernel exists (Q4_K/Q5_K always; Q6_K/Q8_0 when <paramref name="rawEmbedEnabled"/>)
+    /// and <paramref name="embDim"/> is a multiple of 256 (kernel requirement); Float32 otherwise.
+    /// When <paramref name="tied"/> (no separate output.weight — this buffer also serves as the
+    /// lm_head), Q6_K/Q8_0 additionally require the dtype to be in <see cref="UploadWeight"/>'s raw
+    /// set (Q8_0 further gated on <see cref="RawQ80WeightsEnabled"/>) so the lm_head MatMul dispatch
+    /// never silently changes dtype from what UploadWeight would have produced for a standalone
+    /// output.weight.</summary>
+    internal static DType ResolveEmbedGpuDType(GgufTensorInfo emb, bool tied, int embDim, bool rawEmbedEnabled)
     {
-        // Quants with a direct-read embedding kernel stay raw on the GPU.
-        if (tensor.DType == DType.Q4_K || tensor.DType == DType.Q5_K)
-            return (tensor.ByteSize + 3) & ~3L;
-        return tensor.ElementCount * sizeof(float);
+        bool directKernel = emb.DType == DType.Q4_K || emb.DType == DType.Q5_K
+            || (rawEmbedEnabled && (emb.DType == DType.Q6_K || emb.DType == DType.Q8_0));
+        if (!directKernel || embDim % 256 != 0)
+            return DType.Float32;
+        if (tied)
+        {
+            bool uploadWeightKeepsRaw = emb.DType == DType.Q4_K || emb.DType == DType.Q5_K
+                || emb.DType == DType.Q6_K || (emb.DType == DType.Q8_0 && RawQ80WeightsEnabled);
+            if (!uploadWeightKeepsRaw)
+                return DType.Float32;
+        }
+        return emb.DType;
+    }
+
+    /// <summary>On-GPU byte size the embedding table would occupy, per <see cref="ResolveEmbedGpuDType"/>.</summary>
+    internal static long EstimateEmbedGpuBytes(GgufTensorInfo emb, bool tied, int embDim, bool rawEmbedEnabled)
+    {
+        var dtype = ResolveEmbedGpuDType(emb, tied, embDim, rawEmbedEnabled);
+        return dtype == DType.Float32 ? emb.ElementCount * sizeof(float) : (emb.ByteSize + 3) & ~3L;
+    }
+
+    private DType ResolveEmbedGpuDType(GgufTensorInfo emb, bool tied) =>
+        ResolveEmbedGpuDType(emb, tied, _embDim, _rawEmbedEnabled);
+
+    private long EstimateEmbedGpuBytes(GgufTensorInfo emb, bool tied) =>
+        EstimateEmbedGpuBytes(emb, tied, _embDim, _rawEmbedEnabled);
+
+    /// <summary>Resolves the dense-FFN-fill safety margin, reused by <see cref="PlanVram"/> and
+    /// <see cref="TryUploadDenseFfnLayers"/> so the two never disagree on how much headroom to
+    /// leave. SHARPI_DENSE_FFN_GPU_MARGIN_MB overrides (0 pushes to the wall).</summary>
+    private static long ResolveGpuMarginBytes(long defaultBytes)
+    {
+        var marginOverride = Environment.GetEnvironmentVariable("SHARPI_DENSE_FFN_GPU_MARGIN_MB");
+        if (marginOverride is not null && int.TryParse(marginOverride, out int marginMb) && marginMb >= 0)
+            return (long)marginMb * 1024 * 1024;
+        return defaultBytes;
+    }
+
+    /// <summary>Sum of every <c>blk.{hp.NumLayers}.*</c> MTP/NEXTN head tensor's on-GPU size (per
+    /// <see cref="EstimateGpuTensorBytes"/> — including <c>nextn.eh_proj</c>, which the MTP-head
+    /// upload path uploads via the same generic <c>UploadWeight</c> raw-quant-set logic as every
+    /// other weight: Q8_0 stays packed when <see cref="RawQ80WeightsEnabled"/>, the default),
+    /// plus the MTP attention KV cache and per-step scratch. 0 when the model has no MTP head.</summary>
+    internal static long EstimateMtpHeadGpuBytes(GgufModel model, ModelHyperparams hp, int maxSeqLen, DType kvDType)
+    {
+        if (hp.NumMtpLayers <= 0) return 0;
+        int mtpLayerIdx = hp.NumLayers;
+        var ehProj = model.FindTensor($"blk.{mtpLayerIdx}.nextn.eh_proj.weight");
+        if (ehProj is null) return 0;
+
+        long total = 0;
+        foreach (var suffix in s_mtpCommonTensorSuffixes)
+        {
+            var info = model.FindTensor($"blk.{mtpLayerIdx}.{suffix}");
+            if (info is not null) total += EstimateGpuTensorBytes(info.Value);
+        }
+        total += EstimateGpuTensorBytes(ehProj.Value);
+
+        bool mtpIsMoe = model.FindTensor($"blk.{mtpLayerIdx}.ffn_gate_exps.weight") is not null;
+        string[] ffnSuffixes = mtpIsMoe
+            ? ["ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"]
+            : ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"];
+        foreach (var suffix in ffnSuffixes)
+        {
+            var info = model.FindTensor($"blk.{mtpLayerIdx}.{suffix}");
+            if (info is not null) total += EstimateGpuTensorBytes(info.Value);
+        }
+
+        int kvDim = hp.NumKvHeads * hp.HeadDim;
+        total += 2L * maxSeqLen * kvDim * DTypeInfo.BytesPerElement(kvDType);
+        // Per-step scratch: embed/enorm/hnorm buffers + concat (2×embDim) + last-hidden snapshot.
+        total += 5L * hp.EmbeddingDim * sizeof(float);
+        return total;
+    }
+
+    private static readonly string[] s_mtpCommonTensorSuffixes =
+    [
+        "attn_norm.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+        "attn_q_norm.weight", "attn_k_norm.weight", "post_attention_norm.weight",
+        "nextn.enorm.weight", "nextn.hnorm.weight", "nextn.shared_head_norm.weight",
+    ];
+
+    /// <summary>Prices every mandatory (non-elastic-FFN) GPU tenant — the GDN/attention trunk,
+    /// KV cache, MTP head, its batched-verify ring, and fixed scratch — from GGUF metadata before
+    /// any of it is uploaded, then decides embedding/output residency against what's left. Demotes
+    /// the embedding first (cheap: one dequantized row per token), then the output projection
+    /// (expensive: a full vocab×embDim mmap read per token), then throws with a byte-accurate
+    /// summary if even the mandatory tenants don't fit. SHARPI_GDN_CPU_EMBED / SHARPI_GDN_CPU_OUTPUT
+    /// force a demotion regardless of budget (test/bench hooks).</summary>
+    private GdnVramPlan PlanVram(CudaBackend gpu, ModelHyperparams hp, int L, bool hasMtp)
+    {
+        long inelastic = 0;
+        int kvDim = _numKvHeads * _headDim;
+        int kvBytesPerElem = DTypeInfo.BytesPerElement(_kvDType);
+        for (int i = 0; i < L; i++)
+        {
+            var attnNorm = _model.FindTensor($"blk.{i}.attn_norm.weight");
+            var postNorm = _model.FindTensor($"blk.{i}.post_attention_norm.weight");
+            if (attnNorm is not null) inelastic += EstimateGpuTensorBytes(attnNorm.Value);
+            if (postNorm is not null) inelastic += EstimateGpuTensorBytes(postNorm.Value);
+
+            if (hp.IsMoE)
+            {
+                // Per-layer MoE weights the constructor's upload loop puts on GPU unconditionally
+                // (ffn_gate_shexp/up_shexp/down_shexp) or in every case but one narrow combination
+                // (ffn_gate_inp: skipped only when SHARPI_CPU_MOE routes CPU AND
+                // SHARPI_MOE_GPU_ROUTER=0; ffn_gate_inp_shexp: skipped only on the CPU-MoE path,
+                // where it becomes a tiny CPU F32 buffer instead). _cpuMoe itself isn't decided
+                // until after PlanVram runs, so price all five as GPU tenants — the safe upper
+                // bound that fixes the crash-mid-constructor gap without needing to predict
+                // _cpuMoe here (the router/shexp-gate tensors are small; a rare overprice when
+                // CPU-MoE actually gets picked just means slightly less elastic FFN headroom).
+                foreach (var suffix in s_moeSharedPerLayerTensorSuffixes)
+                {
+                    var info = _model.FindTensor($"blk.{i}.{suffix}");
+                    if (info is not null) inelastic += EstimateGpuTensorBytes(info.Value);
+                }
+            }
+
+            if (hp.LayerTypes![i] == LayerType.Attention)
+            {
+                foreach (var suffix in s_attnLayerTensorSuffixes)
+                {
+                    var info = _model.FindTensor($"blk.{i}.{suffix}");
+                    if (info is not null) inelastic += EstimateGpuTensorBytes(info.Value);
+                }
+                inelastic += 2L * _maxSeqLen * kvDim * kvBytesPerElem;
+            }
+            else if (!_cpuGdn)
+            {
+                foreach (var suffix in s_gdnLayerTensorSuffixes)
+                {
+                    var info = _model.FindTensor($"blk.{i}.{suffix}");
+                    if (info is not null) inelastic += EstimateGpuTensorBytes(info.Value);
+                }
+                // ssm_conv1d is transposed to F32 on upload regardless of its GGUF dtype.
+                var conv = _model.FindTensor($"blk.{i}.ssm_conv1d.weight");
+                if (conv is not null) inelastic += conv.Value.ElementCount * sizeof(float);
+                // Per-layer GDN recurrent state (scan matrix + conv ring), F32.
+                inelastic += ((long)_gdnNumVHeads * _gdnHeadDim * _gdnHeadDim
+                            + (long)(_gdnConvKernel - 1) * _gdnConvChannels) * sizeof(float);
+            }
+        }
+
+        long mtpBytes = hasMtp ? EstimateMtpHeadGpuBytes(_model, hp, _maxSeqLen, _kvDType) : 0;
+
+        long ringBytes = 0;
+        if (hasMtp && !_cpuGdn && _gdnStateCache.NumGdnLayers > 0
+            && Environment.GetEnvironmentVariable("SHARPI_DISABLE_MTP") != "1")
+        {
+            int numGdn = _gdnStateCache.NumGdnLayers;
+            int scanF = _gdnStateCache.ScanStateFloatsPerLayer;
+            int convF = _gdnStateCache.ConvStateFloatsPerLayer;
+            int want = _mtpBatchMax - 1;
+            ringBytes = (long)want * numGdn * (scanF + convF) * sizeof(float);
+        }
+
+        long scratchBytes = (long)hp.VocabSize * sizeof(float); // logits
+        if (_snapKvEffectiveBudget > 0)
+            scratchBytes += (long)_numAttnLayers * _snapKvCfg.Window * (_numHeads * _headDim) * sizeof(float)
+                          + (long)_maxSeqLen * sizeof(float);
+        scratchBytes += 64L * 1024 * 1024; // cuBLAS/driver allowance
+
+        long marginBytes = ResolveGpuMarginBytes(64L * 1024 * 1024);
+
+        var embInfo = _model.FindTensor("token_embd.weight")!.Value;
+        var outInfo = _model.FindTensor("output.weight");
+        bool tied = outInfo is null;
+
+        bool forceCpuEmbed = ResolveGate("SHARPI_GDN_CPU_EMBED", false);
+        bool forceCpuOutput = ResolveGate("SHARPI_GDN_CPU_OUTPUT", false);
+        bool tiedForceCpu = forceCpuEmbed || forceCpuOutput;
+
+        long embedGpuBytes = EstimateEmbedGpuBytes(embInfo, tied);
+        long outputGpuBytes = tied ? 0 : EstimateGpuTensorBytes(outInfo!.Value);
+
+        long freeNow = (long)gpu.FreeVramBytes;
+        long budget = freeNow - inelastic - mtpBytes - ringBytes - scratchBytes - marginBytes;
+
+        var placement = DecideEmbedOutputPlacement(
+            embedGpuBytes, outputGpuBytes, budget, tied, forceCpuEmbed, forceCpuOutput);
+        bool embedOnGpu = placement.EmbedOnGpu;
+        bool outputOnGpu = placement.OutputOnGpu;
+        long cost = placement.Cost;
+
+        var plan = new GdnVramPlan(inelastic, mtpBytes, ringBytes, scratchBytes, marginBytes, freeNow,
+            tied, embedOnGpu, embedOnGpu ? embedGpuBytes : 0, outputOnGpu, (!tied && outputOnGpu) ? outputGpuBytes : 0);
+
+        if (cost > budget)
+        {
+            throw new InvalidOperationException(
+                "CudaHybridGdnForwardPass: insufficient VRAM even with embedding and output demoted to CPU.\n"
+                + plan.Summary() + "\n"
+                + "Reduce context size (-c), cap the dense-FFN GPU layers (-g N), or force full CPU-only "
+                + "trunk placement (-g 0) / use HybridGdnForwardPass for CPU-only execution.");
+        }
+        return plan;
+    }
+
+    /// <summary>Result of <see cref="DecideEmbedOutputPlacement"/>: the embedding/output GPU-residency
+    /// decision plus the resulting fixed-weight GPU cost (bytes) given that decision.</summary>
+    internal readonly record struct EmbedOutputPlacement(bool EmbedOnGpu, bool OutputOnGpu, long Cost);
+
+    /// <summary>
+    /// Pure decision core of <see cref="PlanVram"/>'s embedding/output residency cascade — factored
+    /// out so it's unit-testable without a live model/GPU. Order: (1) tentatively GPU unless a force
+    /// flag says otherwise; (2) demote anything over the 2 GiB single-allocation cap (unconditional —
+    /// force-CPU-only knobs never bypass this, see <see cref="PlanVram"/>'s comment); (3) demote the
+    /// embedding first if the combined cost exceeds <paramref name="budget"/> (cheap: one dequantized
+    /// row per token); (4) demote the output too if still over (expensive: a full mmap read per
+    /// token); (5) re-check whether demoting the output alone freed enough budget to re-promote the
+    /// embedding — skipped when the embedding was force-demoted or hard-capped, since neither of
+    /// those is a budget decision this re-check should override.
+    /// </summary>
+    internal static EmbedOutputPlacement DecideEmbedOutputPlacement(
+        long embedGpuBytes, long outputGpuBytes, long budget,
+        bool tied, bool forceCpuEmbed, bool forceCpuOutput)
+    {
+        const long maxStorageBufferBytes = 2L * 1024 * 1024 * 1024 - 1;
+        bool tiedForceCpu = forceCpuEmbed || forceCpuOutput;
+
+        bool embedOnGpu = tied ? !tiedForceCpu : !forceCpuEmbed;
+        bool outputOnGpu = tied ? embedOnGpu : !forceCpuOutput;
+
+        bool embedHardCapped = false;
+        if (embedOnGpu && embedGpuBytes > maxStorageBufferBytes)
+        {
+            embedOnGpu = false;
+            embedHardCapped = true;
+            if (tied) outputOnGpu = false;
+        }
+        if (!tied && outputOnGpu && outputGpuBytes > maxStorageBufferBytes)
+            outputOnGpu = false;
+
+        long cost = (embedOnGpu ? embedGpuBytes : 0) + (!tied && outputOnGpu ? outputGpuBytes : 0);
+        if (embedOnGpu && cost > budget)
+        {
+            embedOnGpu = false;
+            if (tied) outputOnGpu = false;
+            cost = (embedOnGpu ? embedGpuBytes : 0) + (!tied && outputOnGpu ? outputGpuBytes : 0);
+        }
+        if (!tied && outputOnGpu && cost > budget)
+        {
+            outputOnGpu = false;
+            cost = (embedOnGpu ? embedGpuBytes : 0) + (!tied && outputOnGpu ? outputGpuBytes : 0);
+
+            // Demoting the output alone may free enough budget to re-promote the embedding
+            // (untied weights only — a tied buffer never reaches this block). Example this
+            // fixes: budget 1.0 GiB, embed 0.5 GiB, output 1.5 GiB — both used to end on CPU
+            // even though embed=GPU+output=CPU fits.
+            if (!embedOnGpu && !forceCpuEmbed && !embedHardCapped && embedGpuBytes <= budget)
+            {
+                embedOnGpu = true;
+                cost = embedGpuBytes;
+            }
+        }
+
+        return new EmbedOutputPlacement(embedOnGpu, outputOnGpu, cost);
+    }
+
+    private static readonly string[] s_attnLayerTensorSuffixes =
+        ["attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight"];
+
+    private static readonly string[] s_gdnLayerTensorSuffixes =
+        ["attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "ssm_alpha.weight", "ssm_beta.weight",
+         "ssm_a", "ssm_dt.bias", "ssm_norm.weight"];
+
+    private static readonly string[] s_moeSharedPerLayerTensorSuffixes =
+        ["ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+         "ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight"];
+
+    /// <summary>VRAM budget plan produced by <see cref="PlanVram"/>: byte cost of every mandatory
+    /// GPU tenant outside the elastic dense-FFN fill, plus the resulting embedding/output
+    /// placement decision.</summary>
+    private readonly record struct GdnVramPlan(
+        long InelasticBytes,
+        long MtpBytes,
+        long RingBytes,
+        long ScratchBytes,
+        long MarginBytes,
+        long FreeVramBytesAtPlan,
+        bool Tied,
+        bool EmbedOnGpu,
+        long EmbedGpuBytes,
+        bool OutputOnGpu,
+        long OutputGpuBytes)
+    {
+        public string Summary()
+        {
+            long fixedBudget = FreeVramBytesAtPlan - InelasticBytes - MtpBytes - RingBytes - ScratchBytes - MarginBytes;
+            const long MiB = 1024 * 1024;
+            return $"[CudaHybridGdnForwardPass] VRAM plan: free={FreeVramBytesAtPlan / MiB} MiB "
+                + $"trunk(GDN+attn+KV)={InelasticBytes / MiB} MiB mtp={MtpBytes / MiB} MiB ring={RingBytes / MiB} MiB "
+                + $"scratch={ScratchBytes / MiB} MiB margin={MarginBytes / MiB} MiB "
+                + $"→ fixed-weight budget={fixedBudget / MiB} MiB; "
+                + $"embed={(EmbedOnGpu ? "GPU" : "CPU")} ({EmbedGpuBytes / MiB} MiB), "
+                + $"output={(OutputOnGpu ? "GPU" : Tied ? "CPU (tied)" : "CPU")} "
+                + (Tied ? "" : $"({OutputGpuBytes / MiB} MiB)");
+        }
     }
 
     private long EstimateUploadedVram()
@@ -7773,6 +8361,14 @@ public sealed unsafe class CudaHybridGdnForwardPass : IForwardPass
         if (_gpuOutputNorm is not null) _gpu.Free(_gpuOutputNorm);
         if (_gpuOutputWeight is not null && _gpuOutputWeight.Handle != _gpuEmbedding?.Handle)
             _gpu.Free(_gpuOutputWeight);
+
+        // CPU embedding/output fallback scratch (PlanVram). Pinned buffers (issue #48-style).
+        if (_pinnedEmbedRow != null) CudaBackend.FreePinnedHost((nint)_pinnedEmbedRow);
+        if (_pinnedOutHidden != null) CudaBackend.FreePinnedHost((nint)_pinnedOutHidden);
+        if (_cpuOutNormBuf != null) NativeMemory.Free(_cpuOutNormBuf);
+        if (_cpuOutputNormW != null) NativeMemory.Free(_cpuOutputNormW);
+        if (_cpuMtpSharedHeadNormW != null) NativeMemory.Free(_cpuMtpSharedHeadNormW);
+        if (_pinnedEmbedAll != null) CudaBackend.FreePinnedHost((nint)_pinnedEmbedAll);
 
         if (_expertSlotManager is not null)
         {

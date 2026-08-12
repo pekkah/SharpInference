@@ -63,6 +63,9 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
     private readonly ModelHyperparams _hp;
     private readonly GdnConfig _gdn;
     private readonly LayerPlacement _placement;
+    // -g N caps GPU-resident dense-FFN trunk layers on this pass, not a trunk split (mirrors
+    // CudaHybridGdnForwardPass._denseFfnGpuCap — GDN/attention stay GPU-resident regardless).
+    private readonly int _denseFfnGpuCap;
     private readonly int _maxSeqLen;
 
     // ── Dimensions (mirror CudaHybridGdnForwardPass.cs:69-87) ───────────
@@ -423,6 +426,15 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         int qDim = _numHeads * _headDim;        // 4096
         int kvDim = _numKvHeads * _headDim;     // 512
 
+        // Negative GpuLayers (e.g. -1, the CLI's "auto") means no cap; 0 means zero dense-FFN
+        // layers on GPU (all CPU); any other value clamps to [0, L] — mirrors
+        // CudaHybridGdnForwardPass._denseFfnGpuCap.
+        _denseFfnGpuCap = placement.GpuLayers < 0 ? L : Math.Min(placement.GpuLayers, L);
+        if (hp.IsMoE && _denseFfnGpuCap < L)
+            Console.Error.WriteLine(
+                $"[VulkanHybridGdnForwardPass] -g {_denseFfnGpuCap} requested a dense-FFN GPU cap, but "
+                + "this model is MoE (no dense-FFN-on-GPU path) — the cap is a no-op here.");
+
         Console.Error.WriteLine($"[VulkanHybridGdnForwardPass] layers={L} embDim={_embDim} headDim={_headDim} numHeads={_numHeads} ropeDim={_ropeDim} ctx={_maxSeqLen}");
         if (hp.IsMoE)
             Console.Error.WriteLine($"[VulkanHybridGdnForwardPass] GDN: heads={_gdnNumVHeads}v×{_gdnNumKHeads}k headDim={_gdnHeadDim} conv={_gdnConvChannels}×{_gdnConvKernel}  MoE: {_numExperts}exp×{_numActiveExperts}active dim={_expertDim} (CPU-MoE or GPU-SLRU per VRAM).");
@@ -536,11 +548,21 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         else
         {
             // Keep the throw (27B/35B Q4_K fit; the 2 GB single-storage-buffer limit is the
-            // only failure mode and CPU embedding fallback is out of scope for v1).
+            // only failure mode and CPU embedding fallback is out of scope for v1 — the CUDA
+            // sibling's PlanVram CPU fallback needs a GLSL EmbedLookup/matvec kernel suite this
+            // pass doesn't have; see src/SharpInference.Vulkan/CLAUDE.md for the SPIR-V workflow).
+            var embInfo = model.FindTensor("token_embd.weight")!.Value;
+            var outInfo = model.FindTensor("output.weight");
+            long embBytes = EstimateEmbeddingGpuBytes(embInfo);
+            long outBytes = outInfo is not null ? EstimateWeightGpuBytes(outInfo.Value) : 0;
             throw new NotSupportedException(
-                "VulkanHybridGdnForwardPass: embedding/output do not fit in a single GPU storage " +
-                "buffer (2 GB limit); CPU embedding fallback is not implemented in v1. Reduce ctx " +
-                "size or use HybridGdnForwardPass for CPU-only execution.");
+                $"VulkanHybridGdnForwardPass: embedding (dtype={embInfo.DType}, ~{embBytes / (1024 * 1024)} MiB) "
+                + (outInfo is not null
+                    ? $"and/or output (dtype={outInfo.Value.DType}, ~{outBytes / (1024 * 1024)} MiB) "
+                    : "(tied output) ")
+                + "do not fit in a single 2 GiB GPU storage buffer; CPU embedding/output fallback is not "
+                + "implemented on this backend. Use --backend cuda (which has a CPU fallback via PlanVram), "
+                + "-g 0 for CPU-only execution, or reduce ctx size.");
         }
 
         // ── Per-layer tensor arrays (mirror :1009-1045) ────────────────
@@ -2663,7 +2685,7 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
                 $"{_uploadedVramBytes / (1024 * 1024)} MiB − margin {safetyMarginBytes / (1024 * 1024)} MiB). All FFN stays on CPU.");
             return;
         }
-        int canUpload = (int)Math.Min(L, budget / perLayerBytes);
+        int canUpload = (int)Math.Min(Math.Min(L, _denseFfnGpuCap), budget / perLayerBytes);
 
         _gpuWFfnGate = new Tensor?[L];
         _gpuWFfnUp   = new Tensor?[L];
@@ -2693,7 +2715,8 @@ public sealed unsafe class VulkanHybridGdnForwardPass : IForwardPass
         }
         _denseFfnGpuLayers = uploaded;
         Console.Error.WriteLine(
-            $"[VulkanHybridGdnForwardPass] Dense FFN-on-GPU: uploaded {uploaded}/{L} layers ({uploaded * perLayerBytes / (1024 * 1024)} MiB); {L - uploaded} stay on CPU.");
+            $"[VulkanHybridGdnForwardPass] Dense FFN-on-GPU: uploaded {uploaded}/{L} layers ({uploaded * perLayerBytes / (1024 * 1024)} MiB); "
+            + $"{L - uploaded} stay on CPU. Cap={_denseFfnGpuCap}/{L} (-g).");
     }
 
     // ================================================================
