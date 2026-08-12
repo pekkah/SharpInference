@@ -446,12 +446,13 @@ public static class InferenceEngineLoader
 
             if (hp.IsHybridSsm)
             {
-                // Layer placement for hybrid GDN is driven by hp.LayerTypes, not VRAM
-                // budget — so TierPlanner is skipped and we always claim "all layers
-                // on GPU" (the GDN/MoE routing is implicit per-layer).
+                // Layer placement for hybrid GDN is driven by hp.LayerTypes, not VRAM budget — so
+                // TierPlanner is skipped. GpuLayers maps to the dense-FFN-on-GPU cap (GDN/attention
+                // trunk stays GPU-resident regardless); see ResolveHybridGdnLayerSplit.
+                var (gdnSplitGpu, gdnSplitCpu) = ResolveHybridGdnLayerSplit(hp.NumLayers, nGpuLayers);
                 var placement = new LayerPlacement(
-                    GpuLayers: hp.NumLayers,
-                    CpuLayers: 0,
+                    GpuLayers: gdnSplitGpu,
+                    CpuLayers: gdnSplitCpu,
                     GpuWeightBytes: 0,
                     GpuKvBytes: 0,
                     RecommendedCtxSize: ctxSize > 0 ? ctxSize : Math.Min(hp.ContextLength, 4096));
@@ -528,13 +529,14 @@ public static class InferenceEngineLoader
 
             if (hp.IsHybridSsm)
             {
-                // Layer placement for hybrid GDN is driven by hp.LayerTypes, not VRAM budget —
-                // so TierPlanner is skipped and we claim "all layers on GPU" (GDN/attn routing
-                // is implicit; FFN is per-layer GPU/CPU). Mirrors the CUDA loader branch.
-                // (PR4 Round 1 — dense FFN; Round 2 — MoE FFN via CPU-MoE / GPU-SLRU.)
+                // Layer placement for hybrid GDN is driven by hp.LayerTypes, not VRAM budget — so
+                // TierPlanner is skipped. GpuLayers maps to the dense-FFN-on-GPU cap (GDN/attention
+                // trunk stays GPU-resident regardless); see ResolveHybridGdnLayerSplit. Mirrors the
+                // CUDA loader branch. (PR4 Round 1 — dense FFN; Round 2 — MoE FFN via CPU-MoE / GPU-SLRU.)
+                var (gdnSplitGpu, gdnSplitCpu) = ResolveHybridGdnLayerSplit(hp.NumLayers, nGpuLayers);
                 var placement = new LayerPlacement(
-                    GpuLayers: hp.NumLayers,
-                    CpuLayers: 0,
+                    GpuLayers: gdnSplitGpu,
+                    CpuLayers: gdnSplitCpu,
                     GpuWeightBytes: 0,
                     GpuKvBytes: 0,
                     RecommendedCtxSize: ctxSize > 0 ? ctxSize : Math.Min(hp.ContextLength, 4096));
@@ -635,6 +637,22 @@ public static class InferenceEngineLoader
             return hp.NumLayers;
         }
         return gpuLayers;
+    }
+
+    /// <summary>
+    /// Maps <c>nGpuLayers</c> onto the CUDA/Vulkan hybrid-GDN forward passes' <see cref="LayerPlacement"/>
+    /// split. Unlike the dense/hybrid-MoE passes, GDN/attention trunk layers are always GPU-resident
+    /// on this pass (only the dense FFN is elastic — see <c>CudaHybridGdnForwardPass._denseFfnGpuCap</c>),
+    /// so <c>CpuLayers</c> here is informational only (never read by the pass) and <c>GpuLayers</c>
+    /// doubles as the dense-FFN-on-GPU cap. <c>-1</c> (auto) or any value &gt;= <paramref name="numLayers"/>
+    /// maps to no cap (all layers). Duplicated from <c>SharpInference.Cli.RunCommand.ResolveHybridGdnLayerSplit</c>
+    /// (no Server → Cli project reference exists).
+    /// </summary>
+    private static (int GpuLayers, int CpuLayers) ResolveHybridGdnLayerSplit(int numLayers, int nGpuLayers)
+    {
+        if (numLayers <= 0) return (0, 0);
+        int g = (nGpuLayers < 0 || nGpuLayers > numLayers) ? numLayers : nGpuLayers;
+        return (g, numLayers - g);
     }
 
     /// <summary>

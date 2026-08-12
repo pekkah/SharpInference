@@ -623,3 +623,108 @@ The dense-FFN generalization (11.2–11.3) and the snapshot ring (11.7) are the 
 - Vulkan hybrid path (separate issue; qwen35moe-Vulkan is a known-broken row).
 - Multimodal vision path (the `mmproj` files are not bundled with `qwen36-27b-mtp`).
 - `ContinuousBatchingEngine` integration (single-sequence only, same restriction as qwen35moe).
+
+## Phase 12 — partial offload + CPU fixed-weight fallback (CUDA hybrid GDN)
+
+Landed: `-g N` now caps GPU-resident dense-FFN trunk layers on `CudaHybridGdnForwardPass`
+(previously silently ignored — the constructor always claimed `GpuLayers: hp.NumLayers`), and
+the embedding/output projection each independently fall back to CPU when VRAM doesn't fit,
+instead of throwing `NotSupportedException`. Fixes `--backend cuda -g N` for the
+Qwen3.6-27B-Fable-Fus class (dense hybrid GDN, 64 layers, 48 GDN + 16 attention, 1 MTP block,
+vocab 248320, embDim 5120) on a 12 GB card, where `output.weight` is BFloat16 (2.37 GiB — well
+past the 2 GiB single-allocation cap once F32-expanded).
+
+### -g N semantics on this pass
+
+There is no per-layer GDN/attention trunk split: attention layers appear every 4th index, this
+class has no CPU attention block and no CPU KV storage (`PagedKvCache` here is bookkeeping only
+— K/V data lives in `_gpuKCache`/`_gpuVCache`), so GDN + attention + KV cache + GDN state are
+always GPU-resident. The only elastic dimension is the dense FFN
+(`TryUploadDenseFfnLayers`, 165.3 MiB/layer × 64 = 10.3 GiB for the 27B). `-g N` therefore caps
+the number of GPU-resident dense-FFN layers (`_denseFfnGpuCap`); `-g -1`/`-g <NumLayers>` keeps
+the old greedy-fill behaviour. MoE models (qwen35moe 35B-A3B) ignore the cap — no dense-FFN-
+on-GPU path exists there — and log a stderr note when a cap is requested anyway.
+`CudaHybridGdnForwardPass.ResolveHybridGdnLayerSplit`-equivalent mapping lives in
+`RunCommand.ResolveHybridGdnLayerSplit` / `InferenceEngineLoader`'s private duplicate (no
+Cli→Server project reference): `-1` or `>= NumLayers` → no cap; otherwise the explicit count.
+
+### Embedding / output residency policy (`PlanVram`)
+
+Decided independently, unlike the dense/MoE-hybrid sibling which ties them: a CPU embedding
+costs ~5 KiB/token (one dequantized row); a CPU lm_head costs a full vocab×embDim mmap read
+*per token* (the whole matrix, not one row — `SimdKernels.MatVec` walks every weight byte once
+per decode step). `PlanVram` prices every mandatory (non-elastic-FFN) GPU tenant — the GDN/
+attention trunk, KV cache, MTP head, its batched-verify ring, and fixed scratch — from GGUF
+metadata *before* any of it is uploaded, then decides against what's left:
+
+1. Embedding stays packed on GPU when its dtype has a direct-read kernel: Q4_K, Q5_K (existing),
+   plus **Q6_K, Q8_0 (new, `SHARPI_GDN_RAW_EMBED`, default on)** via `CudaBackend.EmbedLookupQ6K`
+   / `EmbedLookupQ8_0` — both kernels already existed (used elsewhere); this pass just started
+   dispatching to them instead of always F32-expanding.
+2. If the fixed-weight budget is exceeded, demote the embedding to CPU first (cheap) — logs the
+   per-token mmap cost.
+3. If still over, demote the output projection to CPU too — logs a loud `WARNING` with the
+   per-token mmap byte cost (computed from the tensor, not hard-coded — e.g. ~2.4 GiB/token for
+   this model's BFloat16 `output.weight`) and disables MTP batched verify
+   (`SupportsBatchVerify` now requires `_gpuOutputWeight is not null` — `BatchForward2`/
+   `BatchVerify` produce k×vocab logits on-device in one GEMM; there's no CPU-output
+   equivalent, so `MtpDecoder` falls back to sequential `Forward`+`MtpForward`, both of which
+   gained a CPU-output branch).
+4. If still over (the mandatory trunk alone doesn't fit), throws with a byte-accurate
+   `GdnVramPlan.Summary()` naming `-c`, `-g N`, and `-g 0`.
+
+Tied-embedding guard (no separate `output.weight`): the shared buffer stays raw for Q6_K/Q8_0
+only when `UploadWeight` would *also* keep that dtype raw for a standalone `output.weight`
+(Q8_0 additionally gated on `SHARPI_GDN_RAW_Q8_0`/`RawQ80WeightsEnabled`), so the lm_head
+`MatMul` dispatch never silently changes dtype from what a real `output.weight` upload would
+have produced.
+
+`EstimateGpuTensorBytes(GgufTensorInfo)` is the single pricing helper shared by `PlanVram` and
+`ResolveEmbedGpuDType`/`EstimateEmbedGpuBytes` — it mirrors `UploadWeight`'s raw-quant set
+exactly (Q4_K/Q5_K/Q6_K always, Q8_0 when `RawQ80WeightsEnabled`), so BFloat16/Float16 (this
+model's `output.weight`) fall through to `ElementCount * 4` (F32-expand) both in the plan and
+in the actual upload — pricing can never diverge from what `UploadWeight` does.
+
+### Env knobs
+
+| Var | Default | Effect |
+|---|---|---|
+| `SHARPI_GDN_RAW_EMBED` | on (`!= "0"`) | Keep Q6_K/Q8_0 embedding tables packed on GPU (new direct-read dispatch); `=0` restores legacy F32 expansion for bisecting. |
+| `SHARPI_GDN_CPU_EMBED` | auto (`PlanVram`) | `=1` forces the embedding table to CPU regardless of budget (test/bench hook). Force-CPU-only: unset/`=0` both mean "let `PlanVram` decide" (`ResolveGate`'s three-state parsing has no force-GPU signal). |
+| `SHARPI_GDN_CPU_OUTPUT` | auto (`PlanVram`) | `=1` forces the output projection to CPU regardless of budget (test/bench hook). Force-CPU-only, same as above. |
+| `SHARPI_DENSE_FFN_GPU_MARGIN_MB` | 64 (CUDA) | Reused by both `PlanVram`'s fixed-weight budget and `TryUploadDenseFfnLayers`'s greedy-fill margin, so the two never disagree on how much headroom to leave. `0` pushes to the wall. |
+
+### Qwen3.6-27B budget (Q4_K_M, ctx 4096, bf16 KV, 12 GB card, free ≈ 10696 MiB)
+
+Inelastic: 48 GDN layers ≈ 4018 MiB + 16 attention layers ≈ 966 MiB + KV ≈ 256 MiB + embedding
+(Q4_K, packed, ≈ 715 MiB) + MTP head ≈ 442 MiB + MTP ring ≈ 150 MiB + SnapKV/scratch ≈ 82 MiB.
+`output.weight` is **BFloat16** (2.37 GiB packed; BFloat16/Float16 are not in `UploadWeight`'s
+raw set, so it F32-expands to 4.74 GiB — well past the 2 GiB single-allocation cap) — demoted
+to CPU by `PlanVram` for this model. Headroom (whatever remains after the above, minus the 64
+MiB margin) goes to the dense FFN fill at 165.3 MiB/layer. SnapKV is *not* a VRAM lever — the
+cache is allocated at full `_maxSeqLen` regardless of the eviction budget.
+
+### qwen35moe (35B-A3B) blast-radius control
+
+The 35B's `token_embd.weight` is Q8_0 (515 MiB packed / 2034 MiB F32-expanded) — Phase 12 flips
+it to packed, freeing ~1.5 GiB. Q8_0 dequant is `(float)(Half)d * qs[i]` identical on host and
+device (bit-identical, not just argmax-stable). To guarantee the CPU-MoE-vs-SLRU auto decision
+does not shift, `PredictSlruSlots`/`EstimateUploadedVram` were deliberately **not** touched —
+they keep charging `VocabSize * EmbeddingDim * 4` for the embedding regardless of its actual
+on-GPU size, i.e. conservative post-Phase-12.
+
+### Not landed (with reasons)
+
+- **Real GDN/attention trunk offload.** Rejected by design: attention layers land every 4th
+  index and this pass has no CPU attention block or CPU KV storage, so a genuine trunk split
+  would need a much larger rewrite (mirroring `CudaHybridForwardPass`'s CPU/GPU layer split) —
+  out of scope here. `TierPlanner.Plan` was also rejected as a driver: its `MeasureLayerBytes`
+  knows nothing about `attn_qkv`/`ssm_*`/GDN state.
+- **`VulkanHybridGdnForwardPass` CPU embedding/output fallback.** Kept as a throw (now naming
+  the dtype, the F32-expanded MiB, and pointing at `--backend cuda` / `-g 0`) — a CPU fallback
+  needs a GLSL `EmbedLookup`/matvec kernel suite this backend doesn't have, which means editing
+  `Shaders.cs` and regenerating the precompiled SPIR-V table (`scripts/gen-spirv.ps1`); deferred.
+  It only gained the numerically-inert `-g` dense-FFN-cap plumbing.
+- **New CUDA kernels.** None added — `EmbedLookupQ6K`/`EmbedLookupQ8_0` and the raw-Q8_0
+  `UploadWeight` path already existed (used by other forward passes); Phase 12 only wired this
+  pass to use them.

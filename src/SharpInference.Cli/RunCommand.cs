@@ -330,6 +330,21 @@ public sealed class RunCommand : Command<RunCommand.Settings>
     }
 
     /// <summary>
+    /// Maps <c>-g</c> (<paramref name="nGpuLayers"/>) onto the CUDA/Vulkan hybrid-GDN forward
+    /// passes' <see cref="LayerPlacement"/> split. Unlike the dense/hybrid-MoE passes, GDN/attention
+    /// trunk layers are always GPU-resident on this pass (only the dense FFN is elastic — see
+    /// <c>CudaHybridGdnForwardPass._denseFfnGpuCap</c>), so <c>CpuLayers</c> here is informational
+    /// only (never read by the pass) and <c>GpuLayers</c> doubles as the dense-FFN-on-GPU cap.
+    /// <c>-1</c> (auto) or any value &gt;= <paramref name="numLayers"/> maps to no cap (all layers).
+    /// </summary>
+    public static (int GpuLayers, int CpuLayers) ResolveHybridGdnLayerSplit(int numLayers, int nGpuLayers)
+    {
+        if (numLayers <= 0) return (0, 0);
+        int g = (nGpuLayers < 0 || nGpuLayers > numLayers) ? numLayers : nGpuLayers;
+        return (g, numLayers - g);
+    }
+
+    /// <summary>
     /// Builds a whole-turn <see cref="JsonSchemaOutputConstraint"/> (issue #423 follow-up) from
     /// <c>--json-schema</c> (inline) or <c>--json-schema-file</c>/<c>--jf</c> (file), or leaves
     /// <paramref name="constraint"/> <c>null</c> when neither flag is given.
@@ -824,9 +839,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 {
                     var hwProfile = HardwareProfile.Detect(cuda);
                     AnsiConsole.MarkupLine($"[dim]Hardware: {hwProfile.Summary()}[/]");
+                    var (gdnSplitGpu, gdnSplitCpu) = ResolveHybridGdnLayerSplit(hp.NumLayers, nGpuLayers);
                     var placement = new LayerPlacement(
-                        GpuLayers: hp.NumLayers,
-                        CpuLayers: 0,
+                        GpuLayers: gdnSplitGpu,
+                        CpuLayers: gdnSplitCpu,
                         GpuWeightBytes: 0,
                         GpuKvBytes: 0,
                         RecommendedCtxSize: ctxSize > 0 ? ctxSize : Math.Min(hp.ContextLength, 4096));
@@ -842,7 +858,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     string ffnKind = hp.IsMoE
                         ? (chgdn.IsMoeOnCpu ? "MoE on CPU" : "MoE on GPU")
                         : "dense FFN on CPU";
-                    AnsiConsole.MarkupLine($"[dim]Backend: [green]CUDA hybrid GDN[/] ({cuda.Name}, {gdnLayers} GDN + {attnLayers} attn on GPU + {ffnKind})[/]");
+                    string ffnCapNote = gdnSplitGpu < hp.NumLayers ? $", FFN cap {gdnSplitGpu}/{hp.NumLayers}" : "";
+                    AnsiConsole.MarkupLine($"[dim]Backend: [green]CUDA hybrid GDN[/] ({cuda.Name}, {gdnLayers} GDN + {attnLayers} attn on GPU + {ffnKind}{ffnCapNote})[/]");
                 }
                 else
                 {
@@ -1026,9 +1043,10 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                 // (PR4 Round 1 — dense FFN; Round 2 — MoE FFN via CPU-MoE / GPU-SLRU.)
                 if (hp.IsHybridSsm)
                 {
+                    var (gdnSplitGpu, gdnSplitCpu) = ResolveHybridGdnLayerSplit(hp.NumLayers, nGpuLayers);
                     var placement = new LayerPlacement(
-                        GpuLayers: hp.NumLayers,
-                        CpuLayers: 0,
+                        GpuLayers: gdnSplitGpu,
+                        CpuLayers: gdnSplitCpu,
                         GpuWeightBytes: 0,
                         GpuKvBytes: 0,
                         RecommendedCtxSize: ctxSize > 0 ? ctxSize : Math.Min(hp.ContextLength, 4096));
@@ -1045,7 +1063,8 @@ public sealed class RunCommand : Command<RunCommand.Settings>
                     for (int i = 0; i < hp.NumLayers; i++)
                         if (hp.LayerTypes![i] == LayerType.Attention) attnLayers++; else gdnLayers++;
                     string vkFfnKind = hp.IsMoE ? "MoE FFN (CPU/SLRU)" : "dense FFN GPU/CPU";
-                    AnsiConsole.MarkupLine($"[dim]Backend: [green]Vulkan hybrid GDN[/] ({gpu.Name}, {gdnLayers} GDN + {attnLayers} attn on GPU + {vkFfnKind})[/]");
+                    string vkFfnCapNote = gdnSplitGpu < hp.NumLayers ? $", FFN cap {gdnSplitGpu}/{hp.NumLayers}" : "";
+                    AnsiConsole.MarkupLine($"[dim]Backend: [green]Vulkan hybrid GDN[/] ({gpu.Name}, {gdnLayers} GDN + {attnLayers} attn on GPU + {vkFfnKind}{vkFfnCapNote})[/]");
                     goto backendConfigured;
                 }
 
